@@ -1,5 +1,7 @@
 # ShareCraft
 
+Website: [share.thinecraft.io](https://share.thinecraft.io)
+
 ShareCraft is the planned open-source SharePoint alternative in the ThineCraft family. Its purpose is to provide a shared workspace for organizations to create intranet sites, team portals, knowledge bases, and other collaborative content experiences.
 
 ## Planned scope
