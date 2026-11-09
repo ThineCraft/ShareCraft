@@ -8,6 +8,7 @@ ShareCraft is intended to bring together the core capabilities commonly associat
 
 - Team sites, communication sites, intranets, and departmental portals
 - Document libraries with folders, metadata, version history, and collaborative access
+- Real-time co-authoring and presence support for WordCraft, GridCraft, PdfCraft, SolidCraft, DeckCraft, and other compatible ThineCraft applications
 - Lists for structured information, lightweight tracking, and shared operational records
 - Pages, news, navigation, and reusable content for publishing internal information
 - Search and discovery across sites, documents, lists, and people-related content
