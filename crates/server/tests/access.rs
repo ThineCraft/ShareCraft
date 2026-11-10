@@ -294,4 +294,88 @@ async fn joined_reports_saved_through() {
         "{:?}",
         b.received
     );
+
+    // Someone joining after a checkpoint finds everything saved.
+    let server = spawn_server().await;
+    let doc = new_doc();
+    let mut a = TestClient::connect(&server, doc, "Ann").await;
+    a.type_at(0, "abc").await;
+    a.pump_until(|c| c.pending() == 0 && c.seq() == Seq(1))
+        .await;
+    a.wait_saved(Seq(1)).await;
+    let b = TestClient::connect(&server, doc, "Bob").await;
+    assert!(
+        matches!(
+            b.received.first(),
+            Some(ServerMsg::Joined {
+                seq: Seq(1),
+                saved_through: Seq(1),
+                ..
+            })
+        ),
+        "{:?}",
+        b.received
+    );
+}
+
+#[tokio::test]
+async fn join_with_another_persons_client_id_is_refused() {
+    let server = spawn_server().await;
+    let doc = new_doc();
+    let mut ann = TestClient::connect(&server, doc, "Ann").await;
+    ann.type_at(0, "abc").await;
+    ann.pump_until(|c| c.pending() == 0 && c.seq() == Seq(1))
+        .await;
+    let bob = server.user("Bob").await;
+    server
+        .db
+        .db
+        .set_access(ann.user.id, doc, bob.id, Some(Role::Viewer))
+        .await
+        .unwrap();
+
+    // Bob's page claims Ann's client id, which everyone sees in the people list.
+    let mut socket = common::open_socket(server.addr, doc, &bob).await;
+    let join = ClientMsg::<TextOp>::Join {
+        client: ann.client(),
+        resume: None,
+    };
+    socket
+        .send(Message::text(serde_json::to_string(&join).unwrap()))
+        .await
+        .unwrap();
+    let mut got = Vec::new();
+    let closed = tokio::time::timeout(common::TIMEOUT, async {
+        loop {
+            match socket.next().await {
+                Some(Ok(Message::Text(text))) => got.push(text.to_string()),
+                Some(Ok(Message::Close(_)) | Err(_)) | None => return,
+                Some(Ok(_)) => {}
+            }
+        }
+    })
+    .await;
+    assert!(closed.is_ok(), "Bob's socket stayed open");
+    assert!(got.is_empty(), "{got:?}");
+
+    // Ann is still connected and still typing.
+    ann.type_at(3, "def").await;
+    ann.pump_until(|c| c.pending() == 0 && c.seq() == Seq(2))
+        .await;
+    assert_eq!(ann.text(), "abcdef");
+    assert!(!ann.closed);
+    let bob_seen = ann.received.iter().any(|m| match m {
+        ServerMsg::People { participants } | ServerMsg::Joined { participants, .. } => {
+            participants.iter().any(|p| p.user == bob.id)
+        }
+        _ => false,
+    });
+    assert!(!bob_seen, "{:?}", ann.received);
+    assert_eq!(
+        ann.participants()
+            .iter()
+            .map(|p| (p.client, p.user))
+            .collect::<Vec<_>>(),
+        vec![(ann.client(), ann.user.id)]
+    );
 }

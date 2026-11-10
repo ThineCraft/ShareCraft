@@ -57,7 +57,8 @@ const READ_ONLY: &str = "read_only";
 pub(crate) enum JoinReply {
     /// The connection is in the room.
     Accepted,
-    /// The room could not load its document; the connection should close.
+    /// The room could not load its document, or the client id belongs to another account;
+    /// the connection should close.
     Refused,
 }
 
@@ -147,6 +148,10 @@ pub(crate) struct Room {
     /// Each client's last committed change, so a resend is recognised however much of the log
     /// is kept.
     last_committed: HashMap<ClientId, OpId>,
+    /// The account that first joined with each client id. A client id stays with that account
+    /// for the room's lifetime, also after they leave, so nobody else can take over a
+    /// connection's place, its resume position or its record of committed changes.
+    client_owners: HashMap<ClientId, UserId>,
 }
 
 impl Room {
@@ -161,6 +166,7 @@ impl Room {
             schedule: Schedule::new(initial.revision, Seq(0), timing),
             members: Vec::new(),
             last_committed: HashMap::new(),
+            client_owners: HashMap::new(),
         }
     }
 
@@ -242,9 +248,15 @@ impl Room {
                     name,
                     role,
                 };
-                self.join(conn, client, joiner, resume, tx);
+                let owner = *self.client_owners.entry(client).or_insert(user);
+                let reply = if owner == user {
+                    self.join(conn, client, joiner, resume, tx);
+                    JoinReply::Accepted
+                } else {
+                    JoinReply::Refused
+                };
                 // The connection may have gone away meanwhile; nothing to do then.
-                let _ = accepted.send(JoinReply::Accepted);
+                let _ = accepted.send(reply);
             }
             Command::Submit {
                 conn,
@@ -744,18 +756,30 @@ mod tests {
         join_as(room, conn, client, Role::Editor)
     }
 
+    /// Joins `client` as an account of its own (the same one for every join with `client`).
     fn join_as(
         room: &mut Room,
         conn: ConnId,
         client: ClientId,
         role: Role,
     ) -> mpsc::Receiver<Outbound> {
+        join_user(room, conn, client, UserId(client.0), role).0
+    }
+
+    /// Joins `client` as `user`; returns the connection's queue and the room's answer.
+    fn join_user(
+        room: &mut Room,
+        conn: ConnId,
+        client: ClientId,
+        user: UserId,
+        role: Role,
+    ) -> (mpsc::Receiver<Outbound>, JoinReply) {
         let (tx, rx) = mpsc::channel(OUTBOUND_CAPACITY);
-        let (accepted, _) = oneshot::channel();
+        let (accepted, mut reply) = oneshot::channel();
         room.handle(Command::Join {
             conn,
             client,
-            user: UserId(Uuid::from_u128(500 + u128::from(conn))),
+            user,
             session: SessionId(Uuid::from_u128(600 + u128::from(conn))),
             name: "A".into(),
             role,
@@ -763,7 +787,7 @@ mod tests {
             tx,
             accepted,
         });
-        rx
+        (rx, reply.try_recv().unwrap())
     }
 
     fn frames(rx: &mut mpsc::Receiver<Outbound>) -> Vec<ServerMsg<TextOp>> {
@@ -940,5 +964,45 @@ mod tests {
                 if *id == op_id && reason == "read_only"),
             "{got:?}"
         );
+    }
+
+    #[test]
+    fn client_id_stays_with_the_account_that_first_used_it() {
+        let mut room = new_room();
+        let ann = UserId(Uuid::from_u128(10));
+        let bob = UserId(Uuid::from_u128(11));
+        let client = ClientId(Uuid::from_u128(1));
+        let (mut ann_rx, reply) = join_user(&mut room, 1, client, ann, Role::Editor);
+        assert_eq!(reply, JoinReply::Accepted);
+        frames(&mut ann_rx);
+
+        // While Ann is here, Bob cannot take her place.
+        let (mut bob_rx, reply) = join_user(&mut room, 2, client, bob, Role::Owner);
+        assert_eq!(reply, JoinReply::Refused);
+        assert!(frames(&mut bob_rx).is_empty());
+        assert_eq!(room.members.len(), 1);
+        assert_eq!(room.members[0].conn, 1);
+        assert!(
+            frames(&mut ann_rx).is_empty(),
+            "nobody is told of a refused join"
+        );
+
+        // Nor after she has left.
+        room.handle(Command::Leave { conn: 1, client });
+        assert!(room.members.is_empty());
+        let (mut bob_rx, reply) = join_user(&mut room, 3, client, bob, Role::Owner);
+        assert_eq!(reply, JoinReply::Refused);
+        assert!(frames(&mut bob_rx).is_empty());
+        assert!(room.members.is_empty());
+
+        // Ann herself comes back with it.
+        let (mut ann_rx, reply) = join_user(&mut room, 4, client, ann, Role::Editor);
+        assert_eq!(reply, JoinReply::Accepted);
+        assert!(matches!(
+            frames(&mut ann_rx).first(),
+            Some(ServerMsg::Joined { .. })
+        ));
+        assert_eq!(room.members.len(), 1);
+        assert_eq!(room.members[0].user, ann);
     }
 }
