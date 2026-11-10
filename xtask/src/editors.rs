@@ -18,16 +18,9 @@ use crate::{Result, run, workspace_root};
 const EDITORS_TOML: &str = "editors.toml";
 /// The name of an installed editor's manifest.
 const MANIFEST: &str = "editor.json";
-/// Licence and attribution files of a fork that are copied into its build.
-const LICENCE_FILES: [&str; 7] = [
-    "LICENSE-MIT",
-    "LICENSE-APACHE",
-    "NOTICE",
-    "ATTRIBUTION.md",
-    "ATTRIBUTION.toml",
-    "LICENSES.toml",
-    "THIRD-PARTY-LICENSES.txt",
-];
+/// Name prefixes (compared without regard to case) of the licence and attribution files in a
+/// fork's root that are copied into its build.
+const LICENCE_PREFIXES: [&str; 5] = ["licen", "notice", "attribution", "copying", "third-party"];
 /// How to install the build tool.
 const TRUNK_INSTALL: &str = "cargo install trunk --locked";
 
@@ -258,9 +251,16 @@ struct InlineHashes {
     styles: Vec<String>,
 }
 
-/// `sha256-<base64>` of `body`, the bytes exactly as they lie between the tags.
+/// `body` as a browser holds it once parsed: CRLF and a lone CR are read as LF. Nothing else
+/// changes; leading and trailing newlines stay.
+fn normalise_newlines(body: &str) -> String {
+    body.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+/// `sha256-<base64>` of `body` as a browser hashes it for a Content-Security-Policy: the text
+/// between the tags, with newlines normalised as in [`normalise_newlines`].
 fn csp_hash(body: &str) -> String {
-    let digest = Sha256::digest(body.as_bytes());
+    let digest = Sha256::digest(normalise_newlines(body).as_bytes());
     format!(
         "sha256-{}",
         base64::engine::general_purpose::STANDARD.encode(digest)
@@ -629,13 +629,33 @@ impl Drop for Worktree {
 }
 
 /// The first folder above `path` (or `path` itself) with a Cargo configuration in it.
-fn cargo_config_above(path: &Path) -> Option<PathBuf> {
+fn cargo_config_above(path: &Path, cargo_home: Option<&Path>) -> Option<PathBuf> {
     path.ancestors().find_map(|dir| {
+        let cargo_dir = dir.join(".cargo");
+        // Cargo reads its own home for every build, so that one is not a surprise.
+        if cargo_home == Some(cargo_dir.as_path()) {
+            return None;
+        }
         ["config.toml", "config"]
             .iter()
-            .map(|name| dir.join(".cargo").join(name))
+            .map(|name| cargo_dir.join(name))
             .find(|candidate| candidate.is_file())
     })
+}
+
+/// Cargo's home folder: `CARGO_HOME`, else `.cargo` in the user's home folder.
+fn cargo_home() -> Option<PathBuf> {
+    if let Some(home) = std::env::var_os("CARGO_HOME") {
+        return Some(PathBuf::from(home));
+    }
+    let user = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
+    Some(PathBuf::from(user).join(".cargo"))
+}
+
+/// Whether `text` could be a commit id: 7 to 40 hexadecimal characters. Anything else, such as a
+/// word that starts with `-`, is not given to `git`.
+fn is_commit_id(text: &str) -> bool {
+    (7..=40).contains(&text.len()) && text.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// Where Cargo's output goes for the builds of editor `id`: one folder per editor, so that
@@ -656,6 +676,11 @@ fn build(root: &Path, id: &str) -> Result<()> {
         .ok_or_else(|| format!("{id} is not an editor in {EDITORS_TOML}"))?;
 
     // Refuse before touching anything.
+    if !is_commit_id(&spec.base) {
+        return Err(format!(
+            "{EDITORS_TOML}: the base of {id} is not a commit id (7 to 40 hexadecimal characters)"
+        ));
+    }
     let checkout = root.join(&spec.checkout);
     if !checkout.is_dir() {
         return Err(format!(
@@ -720,13 +745,15 @@ fn build(root: &Path, id: &str) -> Result<()> {
     let temp = std::env::temp_dir();
     let tag = format!("{id}-{}", short(&head));
     let worktree_path = temp.join(format!("sharecraft-editor-build-{tag}"));
-    if let Some(config) = cargo_config_above(&worktree_path) {
+    if let Some(config) = cargo_config_above(&worktree_path, cargo_home().as_deref()) {
         return Err(format!(
             "{} exists, and Cargo would apply it to the build; the build would not be the \
              fork's own. Set TMP and TEMP to a folder outside it and run again.",
             config.display()
         ));
     }
+    // A killed build can leave a registration whose folder is gone.
+    let _ = git(&checkout, &["worktree", "prune"]);
     if worktree_path.exists() {
         // Left behind by a build that was killed.
         let _ = git(
@@ -828,20 +855,69 @@ fn finish_build(
     std::fs::write(dist.join(MANIFEST), json)
         .map_err(|e| format!("cannot write {MANIFEST}: {e}"))?;
 
-    let licences = dist.join("licenses");
-    for name in LICENCE_FILES {
-        let from = worktree.join(name);
-        if !from.is_file() {
-            continue;
-        }
-        std::fs::create_dir_all(&licences)
-            .map_err(|e| format!("cannot create {}: {e}", licences.display()))?;
-        let to = licences.join(name);
-        if !to.exists() {
-            std::fs::copy(&from, &to).map_err(|e| format!("cannot copy {name}: {e}"))?;
-        }
+    for name in collect_licences(worktree, dist)? {
+        println!("xtask: the build has its own licenses/{name}, which differs; kept it");
     }
     Ok(data)
+}
+
+/// The licence and attribution files among `names`, found by [`LICENCE_PREFIXES`].
+fn licence_files(names: &[String]) -> Vec<String> {
+    names
+        .iter()
+        .filter(|name| {
+            let lower = name.to_ascii_lowercase();
+            LICENCE_PREFIXES
+                .iter()
+                .any(|prefix| lower.starts_with(prefix))
+        })
+        .cloned()
+        .collect()
+}
+
+/// Copies the licence and attribution files in the root of `worktree` into `<dist>/licenses/`,
+/// and returns the names of those the build already had, with other content, which are kept.
+/// Fails unless a LICENSE (or LICENCE) file and a NOTICE file were found.
+fn collect_licences(worktree: &Path, dist: &Path) -> Result<Vec<String>> {
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(worktree)
+        .map_err(|e| format!("cannot list {}: {e}", worktree.display()))?
+    {
+        let entry = entry.map_err(|e| format!("cannot list {}: {e}", worktree.display()))?;
+        if entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            names.push(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    names.sort();
+    let found = licence_files(&names);
+    let has = |prefixes: &[&str]| {
+        found.iter().any(|name| {
+            let lower = name.to_ascii_lowercase();
+            prefixes.iter().any(|prefix| lower.starts_with(prefix))
+        })
+    };
+    if !has(&["license", "licence"]) {
+        return Err("the fork has no LICENSE file in its root; the build needs one".to_owned());
+    }
+    if !has(&["notice"]) {
+        return Err("the fork has no NOTICE file in its root; the build needs one".to_owned());
+    }
+    let licences = dist.join("licenses");
+    std::fs::create_dir_all(&licences)
+        .map_err(|e| format!("cannot create {}: {e}", licences.display()))?;
+    let mut kept = Vec::new();
+    for name in found {
+        let from = worktree.join(&name);
+        let to = licences.join(&name);
+        if to.exists() {
+            if std::fs::read(&from).ok() != std::fs::read(&to).ok() {
+                kept.push(name);
+            }
+            continue;
+        }
+        std::fs::copy(&from, &to).map_err(|e| format!("cannot copy {name}: {e}"))?;
+    }
+    Ok(kept)
 }
 
 /// Replaces `./editors/<id>` with the folder `built`: the new editor is written beside the old
@@ -864,9 +940,9 @@ fn install(root: &Path, id: &str, built: &Path) -> Result<()> {
         return Err(e);
     }
     let had_old = target.exists();
-    if had_old {
-        std::fs::rename(&target, &old)
-            .map_err(|e| format!("cannot move {} aside: {e}", target.display()))?;
+    if had_old && let Err(e) = std::fs::rename(&target, &old) {
+        let _ = std::fs::remove_dir_all(&new);
+        return Err(format!("cannot move {} aside: {e}", target.display()));
     }
     if let Err(e) = std::fs::rename(&new, &target) {
         if had_old {
@@ -875,13 +951,11 @@ fn install(root: &Path, id: &str, built: &Path) -> Result<()> {
         let _ = std::fs::remove_dir_all(&new);
         return Err(format!("cannot install {}: {e}", target.display()));
     }
-    if had_old {
-        std::fs::remove_dir_all(&old).map_err(|e| {
-            format!(
-                "installed, but cannot delete the old build {}: {e}",
-                old.display()
-            )
-        })?;
+    if had_old && let Err(e) = std::fs::remove_dir_all(&old) {
+        eprintln!(
+            "xtask: warning: installed, but cannot delete the old build {}: {e}",
+            old.display()
+        );
     }
     Ok(())
 }
@@ -971,11 +1045,16 @@ mod tests {
             hashes.styles,
             ["sha256-8e/a53E8pD0reBM7qquiWvKITpZgFpBiFcZDadvq2JA="]
         );
-        let crlf = inline_hashes("<script>\r\nx\r\n</script>").unwrap();
-        assert_eq!(
-            crlf.scripts,
-            ["sha256-cTA2VEpkgi9zRTfQP8iB3dgJlqSOY8w+CuDSSCP4szk="]
-        );
+        // A browser turns CRLF and a lone CR into LF before the text exists; the newlines at the
+        // start and end are kept. Hash of "\nx\n" from Python's hashlib.
+        let lf = "sha256-0j+bQHb1Xx5lDFk/gPRR8glNxZzORwwGPrIq6mPkyzk=";
+        for page in [
+            "<script>\nx\n</script>",
+            "<script>\r\nx\r\n</script>",
+            "<script>\rx\r</script>",
+        ] {
+            assert_eq!(inline_hashes(page).unwrap().scripts, [lf], "{page:?}");
+        }
     }
 
     #[test]
@@ -1131,21 +1210,147 @@ checkout = "../GridCraft"
         assert_eq!(problems.len(), 2, "{problems:?}");
     }
 
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("xtask-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     #[test]
     fn a_cargo_config_above_the_build_folder_is_found() {
-        let dir = std::env::temp_dir().join(format!("xtask-cargo-config-{}", std::process::id()));
+        let dir = scratch("cargo-config");
         let inner = dir.join("a").join("b");
         std::fs::create_dir_all(&inner).unwrap();
-        assert_eq!(
-            cargo_config_above(&inner).filter(|p| p.starts_with(&dir)),
-            None
-        );
+        let ours = |found: Option<PathBuf>| found.filter(|p| p.starts_with(&dir));
+        assert_eq!(ours(cargo_config_above(&inner, None)), None);
         std::fs::create_dir_all(dir.join(".cargo")).unwrap();
         std::fs::write(dir.join(".cargo").join("config.toml"), "").unwrap();
         assert_eq!(
-            cargo_config_above(&inner),
+            cargo_config_above(&inner, None),
             Some(dir.join(".cargo").join("config.toml"))
         );
+        // The user's own cargo home is read by every build anyway, so it is not a reason.
+        assert_eq!(
+            ours(cargo_config_above(&inner, Some(&dir.join(".cargo")))),
+            None
+        );
+        // Another folder's .cargo still counts.
+        std::fs::create_dir_all(dir.join("a").join(".cargo")).unwrap();
+        std::fs::write(dir.join("a").join(".cargo").join("config"), "").unwrap();
+        assert_eq!(
+            cargo_config_above(&inner, Some(&dir.join(".cargo"))),
+            Some(dir.join("a").join(".cargo").join("config"))
+        );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_base_that_could_be_an_option_is_refused() {
+        assert!(is_commit_id("e9addf52fe68847e6c1310fcfa5d42b7aa8b9650"));
+        assert!(is_commit_id("e9addf5"));
+        for bad in ["", "e9addf", "--all", "-h", "e9addf5 --x", "zzzzzzzz"] {
+            assert!(!is_commit_id(bad), "{bad}");
+        }
+    }
+
+    fn write_files(dir: &Path, names: &[&str]) {
+        for name in names {
+            std::fs::write(dir.join(name), name).unwrap();
+        }
+    }
+
+    #[test]
+    fn licence_files_are_found_by_prefix() {
+        let names: Vec<String> = [
+            "LICENSE-MIT",
+            "license.txt",
+            "Licence",
+            "NOTICE.md",
+            "notice",
+            "ATTRIBUTION.toml",
+            "COPYING",
+            "LICENSES.toml",
+            "THIRD-PARTY-LICENSES.txt",
+            "README.md",
+            "Cargo.toml",
+            "unlicensed.txt",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        assert_eq!(
+            licence_files(&names),
+            [
+                "LICENSE-MIT",
+                "license.txt",
+                "Licence",
+                "NOTICE.md",
+                "notice",
+                "ATTRIBUTION.toml",
+                "COPYING",
+                "LICENSES.toml",
+                "THIRD-PARTY-LICENSES.txt"
+            ]
+        );
+    }
+
+    #[test]
+    fn licences_are_copied_and_a_missing_one_fails_the_build() {
+        let tree = scratch("licences-tree");
+        let dist = scratch("licences-dist");
+        write_files(
+            &tree,
+            &["LICENSE-MIT", "NOTICE", "ATTRIBUTION.md", "Cargo.toml"],
+        );
+        std::fs::create_dir(tree.join("LICENSES")).unwrap();
+        // The build already has a different NOTICE: it is kept.
+        std::fs::create_dir_all(dist.join("licenses")).unwrap();
+        std::fs::write(dist.join("licenses").join("NOTICE"), "from the build").unwrap();
+        let kept = collect_licences(&tree, &dist).unwrap();
+        assert_eq!(kept, ["NOTICE"]);
+        let copied = |name: &str| std::fs::read_to_string(dist.join("licenses").join(name));
+        assert_eq!(copied("LICENSE-MIT").unwrap(), "LICENSE-MIT");
+        assert_eq!(copied("ATTRIBUTION.md").unwrap(), "ATTRIBUTION.md");
+        assert_eq!(copied("NOTICE").unwrap(), "from the build");
+        assert!(!dist.join("licenses").join("LICENSES").exists());
+        assert!(!dist.join("licenses").join("Cargo.toml").exists());
+
+        std::fs::remove_file(tree.join("NOTICE")).unwrap();
+        let error = collect_licences(&tree, &dist).unwrap_err();
+        assert!(error.contains("NOTICE"), "{error}");
+        std::fs::remove_file(tree.join("LICENSE-MIT")).unwrap();
+        std::fs::write(tree.join("NOTICE"), "n").unwrap();
+        let error = collect_licences(&tree, &dist).unwrap_err();
+        assert!(error.contains("LICENSE"), "{error}");
+        std::fs::remove_dir_all(&tree).unwrap();
+        std::fs::remove_dir_all(&dist).unwrap();
+    }
+
+    #[test]
+    fn install_replaces_the_old_build_and_clears_leftovers() {
+        let root = scratch("install-root");
+        let built = scratch("install-built");
+        std::fs::write(built.join("index.html"), "new").unwrap();
+        let editors = root.join("editors");
+        std::fs::create_dir_all(editors.join("gridcraft")).unwrap();
+        std::fs::write(editors.join("gridcraft").join("index.html"), "old").unwrap();
+        std::fs::write(editors.join("gridcraft").join("only-old.txt"), "old").unwrap();
+        // Left by an earlier run that failed.
+        std::fs::create_dir_all(editors.join("gridcraft.new")).unwrap();
+        std::fs::write(editors.join("gridcraft.new").join("stale.txt"), "stale").unwrap();
+
+        install(&root, "gridcraft", &built).unwrap();
+        let read = |name: &str| std::fs::read_to_string(editors.join("gridcraft").join(name));
+        assert_eq!(read("index.html").unwrap(), "new");
+        assert!(read("only-old.txt").is_err());
+        assert!(read("stale.txt").is_err());
+        assert!(!editors.join("gridcraft.new").exists());
+        assert!(!editors.join("gridcraft.old").exists());
+
+        // And a first install, with nothing to replace.
+        install(&root, "wordcraft", &built).unwrap();
+        assert!(editors.join("wordcraft").join("index.html").is_file());
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::remove_dir_all(&built).unwrap();
     }
 }
