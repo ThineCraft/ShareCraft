@@ -57,7 +57,7 @@ impl fmt::Debug for NewUser<'_> {
 }
 
 /// The secret held in a browser cookie that proves a sign-in. Only its SHA-256 is stored.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct SessionToken([u8; 32]);
 
 impl SessionToken {
@@ -237,22 +237,31 @@ async fn verify_password(password: &str, hash: String) -> Result<bool, DbError> 
 
 /// A hash nobody knows the password of, made with the same parameters as real hashes. An
 /// unknown email is checked against it so that it costs the same as a wrong password.
-fn dummy_hash() -> &'static str {
-    static DUMMY: OnceLock<String> = OnceLock::new();
-    DUMMY.get_or_init(|| {
-        let mut secret = [0u8; 32];
-        // Without system randomness the fixed bytes still give a hash of the right cost.
-        let _ = getrandom::fill(&mut secret);
-        Argon2::default()
-            .hash_password(&secret)
-            .map(|hash| hash.to_string())
-            .unwrap_or_default()
-    })
+///
+/// If it cannot be made this is an error, never an empty hash that would make unknown emails
+/// return instantly.
+fn dummy_hash() -> Result<&'static str, DbError> {
+    static DUMMY: OnceLock<Result<String, String>> = OnceLock::new();
+    DUMMY
+        .get_or_init(|| {
+            let mut secret = [0u8; 32];
+            getrandom::fill(&mut secret).map_err(|e| e.to_string())?;
+            Argon2::default()
+                .hash_password(&secret)
+                .map(|hash| hash.to_string())
+                .map_err(|e| e.to_string())
+        })
+        .as_deref()
+        .map_err(hash_failure)
 }
 
-/// Computes the dummy hash now, so the first sign-in is not slower than the rest.
-pub(crate) async fn warm_up() {
-    let _ = tokio::task::spawn_blocking(dummy_hash).await;
+/// Computes the dummy hash now, so the first sign-in is not slower than the rest, and fails
+/// if it cannot be made.
+pub(crate) async fn warm_up() -> Result<(), DbError> {
+    tokio::task::spawn_blocking(dummy_hash)
+        .await
+        .map_err(hash_failure)??;
+    Ok(())
 }
 
 fn user_from_row(row: &PgRow) -> Result<User, sqlx::Error> {
@@ -385,6 +394,19 @@ impl Db {
     ) -> Result<(), AccountError> {
         let mut tx = self.pool().begin().await?;
         require_admin(&mut tx, actor).await?;
+        // Lock order is always: every enabled administrator by id, then the target. Two
+        // simultaneous disables therefore take turns and cannot deadlock, and the count of
+        // enabled administrators below cannot change under us.
+        let enabled_admins: Vec<Uuid> = if disabled {
+            sqlx::query_scalar(
+                "select id from users where is_admin and disabled_at is null \
+                 order by id for update",
+            )
+            .fetch_all(&mut *tx)
+            .await?
+        } else {
+            Vec::new()
+        };
         let target: Option<(bool, bool)> = sqlx::query_as(
             "select is_admin, disabled_at is not null from users where id = $1 for update",
         )
@@ -399,16 +421,8 @@ impl Db {
         }
         let mut sessions_ended = 0u64;
         if disabled {
-            if is_admin {
-                // Locking every enabled administrator makes two simultaneous disables take turns.
-                let enabled_admins: Vec<Uuid> = sqlx::query_scalar(
-                    "select id from users where is_admin and disabled_at is null for update",
-                )
-                .fetch_all(&mut *tx)
-                .await?;
-                if enabled_admins.len() <= 1 {
-                    return Err(AccountError::LastAdmin);
-                }
+            if is_admin && enabled_admins.len() <= 1 {
+                return Err(AccountError::LastAdmin);
             }
             sessions_ended = sqlx::query(
                 "update sessions set ended_at = now() where user_id = $1 and ended_at is null",
@@ -459,13 +473,22 @@ impl Db {
             .bind(email.trim())
             .fetch_optional(self.pool())
             .await?;
+        let dummy = dummy_hash()?.to_owned();
+        // A password no account could have is checked against the dummy hash, so it costs
+        // the same as any other wrong password and never reaches Argon2 at full length.
+        let too_long = password.chars().count() > MAX_PASSWORD_CHARS;
         let Some(row) = row else {
-            verify_password(password, dummy_hash().to_owned()).await?;
+            verify_password(if too_long { "" } else { password }, dummy).await?;
             return Err(SignInError::Invalid);
         };
         let user = user_from_row(&row)?;
         let hash: String = row.try_get("password_hash")?;
-        let matches = verify_password(password, hash).await?;
+        let matches = if too_long {
+            verify_password("", dummy).await?;
+            false
+        } else {
+            verify_password(password, hash).await?
+        };
         if !matches || user.disabled {
             let reason = if matches {
                 "disabled"
@@ -492,16 +515,23 @@ impl Db {
         let id = SessionId(Uuid::new_v4());
         let wanted_expiry = OffsetDateTime::now_utc() + SESSION_LIFETIME;
         let mut tx = self.pool().begin().await?;
-        let expires_at: OffsetDateTime = sqlx::query_scalar(
+        // The account may have been disabled while the password was being checked. Sharing its
+        // row lock makes a concurrent disable either finish first (no row is inserted) or wait
+        // and then end this session too.
+        let expires_at: Option<OffsetDateTime> = sqlx::query_scalar(
             "insert into sessions (id, token_hash, user_id, expires_at) \
-             values ($1, $2, $3, $4) returning expires_at",
+             select $1::uuid, $2::bytea, u.id, $4::timestamptz from users u where u.id = $3 and u.disabled_at is null \
+             for share of u returning expires_at",
         )
         .bind(id.0)
         .bind(token.digest())
         .bind(user.id.0)
         .bind(wanted_expiry)
-        .fetch_one(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await?;
+        let Some(expires_at) = expires_at else {
+            return Err(SignInError::Invalid);
+        };
         record(
             &mut tx,
             NewEvent {

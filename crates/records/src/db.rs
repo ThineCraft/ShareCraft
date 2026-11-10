@@ -56,7 +56,7 @@ impl Db {
             .acquire_timeout(ACQUIRE_TIMEOUT)
             .connect(url)
             .await?;
-        crate::accounts::warm_up().await;
+        crate::accounts::warm_up().await?;
         Ok(Db { pool })
     }
 

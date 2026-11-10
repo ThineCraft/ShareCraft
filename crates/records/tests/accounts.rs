@@ -350,3 +350,107 @@ async fn account_changes_are_recorded() {
         .get::<String, _>(0);
     assert!(!all.contains(PASSWORD) && !all.contains("argon2"));
 }
+
+#[tokio::test]
+async fn ten_character_password_is_accepted() {
+    let test = TestDb::create().await;
+    let password = "0123456789";
+    test.db
+        .create_user(
+            None,
+            NewUser {
+                email: "a@x.test",
+                name: "A",
+                password,
+                is_admin: false,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(test.db.sign_in("a@x.test", password).await.is_ok());
+}
+
+#[tokio::test]
+async fn unknown_email_and_overlong_password_sign_in_fail_cleanly() {
+    let test = TestDb::create().await;
+    let ann = test
+        .db
+        .create_user(None, new_user("ann@x.test", "Ann", false))
+        .await
+        .unwrap();
+    let count = || async {
+        sqlx::query_scalar::<_, i64>("select count(*) from events")
+            .fetch_one(test.db.test_pool())
+            .await
+            .unwrap()
+    };
+    let before = count().await;
+    let unknown = test.db.sign_in("nobody@x.test", PASSWORD).await;
+    assert!(matches!(unknown, Err(SignInError::Invalid)));
+    assert_eq!(count().await, before, "an unknown email writes no event");
+
+    let long = "p".repeat(100_000);
+    let result = test.db.sign_in("ann@x.test", &long).await;
+    assert!(matches!(result, Err(SignInError::Invalid)));
+    let result = test.db.sign_in("nobody@x.test", &long).await;
+    assert!(matches!(result, Err(SignInError::Invalid)));
+    let failures = test.db.events_about(ann.id).await.unwrap();
+    assert_eq!(
+        failures
+            .iter()
+            .filter(|e| e.kind == "sign_in.failed")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn simultaneous_disables_of_different_admins_do_not_deadlock() {
+    let test = TestDb::create().await;
+    let pool = test.db.test_pool();
+    let mut ids = Vec::new();
+    for email in ["one@x.test", "two@x.test"] {
+        let id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "insert into users (id, email, name, password_hash, is_admin) \
+             values ($1, $2, 'Admin', 'unused', true)",
+        )
+        .bind(id)
+        .bind(email)
+        .execute(pool)
+        .await
+        .unwrap();
+        ids.push(UserId(id));
+    }
+    let (one, two) = (ids[0], ids[1]);
+    for round in 0..10 {
+        sqlx::query("update users set disabled_at = null")
+            .execute(pool)
+            .await
+            .unwrap();
+        let first = test.db.clone();
+        let second = test.db.clone();
+        let (a, b) = tokio::join!(
+            tokio::spawn(async move { first.set_disabled(one, two, true).await }),
+            tokio::spawn(async move { second.set_disabled(two, one, true).await }),
+        );
+        for result in [a.unwrap(), b.unwrap()] {
+            assert!(
+                matches!(
+                    result,
+                    Ok(()) | Err(AccountError::LastAdmin | AccountError::Forbidden)
+                ),
+                "round {round}: {result:?}"
+            );
+        }
+        let enabled: i64 =
+            sqlx::query_scalar("select count(*) from users where is_admin and disabled_at is null")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert!(
+            enabled >= 1,
+            "round {round}: no enabled administrator is left"
+        );
+    }
+}
