@@ -19,7 +19,7 @@
 <p class="eyebrow">ThineCraft / Product definition</p>
 <h1>ShareCraft</h1>
 <p class="lede">Scope of Works<br>A shared-content, collaboration and application platform extending beyond the SharePoint baseline.</p>
-<div class="meta"><span>Version 0.4 · Draft for review</span><span>9 November 2026</span><span>Product scope · Delivery framework</span></div>
+<div class="meta"><span>Version 0.5 · Draft for review</span><span>9 November 2026</span><span>Product scope · Delivery framework</span></div>
 </header>
 <div class="layout">
 <nav aria-label="Document contents"><p>In this document</p>
@@ -46,6 +46,7 @@
 <tr><td>D10</td><td>Authorized users can break permission inheritance regardless of library file count. A navigable inheritance explorer must show exactly where inheritance is broken.</td><td>Explicit user permissions requirement, 9 November 2026.</td></tr>
 <tr><td>D11</td><td>Provide a dedicated, documented ShareCraft API supporting DriveCraft desktop clients, migration and organization-controlled offline mirrors.</td><td>Explicit user API requirement, 9 November 2026. Contract detail proposed in SC-23.</td></tr>
 <tr><td>D12</td><td>ShareCraft must open WordCraft, GridCraft, PdfCraft and SolidCraft files in the browser with live collaboration. Fork their designated upstream repositories and extend those applications to support co-authoring.</td><td>Explicit user browser-editor and fork requirement, 9 November 2026. Upstream sources verified: storytold/wordcraft, storytold/gridcraft, storytold/pdfcraft and tangency-labs/solidcraft; see SC-24.</td></tr>
+<tr><td>D13</td><td>Provide configurable organization and site branding. ShareCraft must have its own visual identity rather than reproducing SharePoint branding or prescribing a green/teal theme.</td><td>Explicit user branding requirement and UI feedback, 9 November 2026; detailed controls proposed in SC-25.</td></tr>
 </tbody></table></div>
 <p class="small">Git, PostgreSQL and JSON metadata are confirmed architecture requirements. Binary storage, repository layout and user-facing branching behavior still require detailed design; see SC-21 and the decision register.</p>
 </section>
@@ -140,6 +141,14 @@
 <li>Maintain upstream provenance, required notices, a documented upstream-update procedure and a clear separation of local changes where practical. Provide reproducible builds, integration documentation and compatibility tests for each fork.</li>
 <li>Acceptance requires a working browser-to-ShareCraft-to-editor collaboration path for all four named applications. Creating a fork or deploying a static preview alone does not complete this work. No editor forks or working co-authoring are claimed by this scope update.</li>
 </ul></article>
+<article class="module" id="sc25"><span class="tag">Site branding explicit · Control detail proposed</span><h3>SC-25 · Organization &amp; site branding</h3><ul>
+<li><strong>Independent identity:</strong> retain familiar content-management navigation patterns while giving ShareCraft its own typography, spacing, components and product identity. A green/teal SharePoint-style application bar is not the default design requirement.</li>
+<li><strong>Brand layers — proposed:</strong> distinguish ShareCraft product chrome, organization branding and individual site branding. Provide neutral application chrome so a department, client, project or public portal can express its own identity without recoloring every application control.</li>
+<li><strong>Site controls — proposed:</strong> configure site name, logo/wordmark, thumbnail/favicon where applicable, accent palette, approved font package, header layout, optional banner/background, navigation placement and footer. Keep site identity visible in libraries, lists, access views and browser-editor context.</li>
+<li><strong>Reusable themes — proposed:</strong> support organization-approved brand kits, inheritance from organization/hub defaults, permitted site overrides and reusable templates. Allow different sites to use different brands without changing content, permissions or application behavior.</li>
+<li><strong>Safe administration — proposed:</strong> provide an authorized branding editor with responsive preview, draft/apply/cancel, version history and reset/rollback. Record branding configuration as Git-versioned JSON with the PostgreSQL representation governed by SC-21.</li>
+<li><strong>Accessibility — proposed:</strong> check foreground/background contrast, keyboard focus, readable typography, logo alternatives, mobile layout and light/dark appearance. Brand choices must not hide status, controls or permission warnings; prevent unsafe script/style injection through branding inputs.</li>
+</ul></article>
 </div></section>
 <section id="ecosystem"><h2>05 / Application boundaries</h2><div class="table-wrap"><table><thead><tr><th>Application</th><th>Primary responsibility</th><th>ShareCraft integration boundary</th></tr></thead><tbody>
 <tr><td>ShareCraft</td><td>Sites, shared content, metadata, governance, publishing and collaboration infrastructure.</td><td>Canonical record identity, permissions, history, search and content APIs.</td></tr>
@@ -184,6 +193,7 @@
 <tr><td>A15 · Inheritance explorer</td><td>Create multiple nested permission breaks; find every break through the tree and exceptions-only view without guessing its location. Verify paths, counts, direct/effective permissions, nearest permission source, filtering, export and restoration preview. Confirm reports are restricted to the viewer’s authorized scope.</td></tr>
 <tr><td>A16 · DriveCraft API interoperability</td><td>Connect an authorized client to hosted and self-hosted test deployments; enumerate more than 100,000 files with paging, resume interrupted uploads/downloads and verify checksums. Change content/metadata during initial enumeration and verify delta handoff without missed changes; replay notifications, retry writes and recover from an expired cursor without duplicates or silent loss. Validate JSON/Git/PostgreSQL updates, revision conflicts, permission revocation, inheritance operations, tombstones and mirror checkpoints. Verify tenant isolation and the published contract/examples.</td></tr>
 <tr><td>A17 · Editor fork delivery</td><td>For each of WordCraft, GridCraft, PdfCraft and SolidCraft, verify the selected upstream-to-fork mapping and base revision, retained notices, reproducible browser build, deployed collaboration components and ShareCraft launch adapter. Demonstrate A07 with two independent browser sessions and inspect the resulting content revision and JSON metadata. Provide update/maintenance instructions and a supported-format/capability matrix.</td></tr>
+<tr><td>A18 · Independent site branding</td><td>Apply distinct logos, palettes and header treatments to two sites while preserving neutral ShareCraft chrome and consistent navigation. Verify branded home, library, access and editor-launch contexts on desktop/mobile and in light/dark appearance. Check preview/cancel, allowed overrides, accessibility feedback, Git/JSON history and rollback without changing content or permissions.</td></tr>
 </tbody></table></div></section>
 <section id="decisions"><h2>08 / Decisions to resolve</h2><p>These remain open rather than being silently chosen by this document.</p><ol>
 <li><strong>Release breadth:</strong> which baseline and extension modules belong in the first usable release, and which are later deliverables?</li>
@@ -205,6 +215,6 @@
 <p class="small" style="margin-top:18px">Source limitation: the original chat reader exposed five recent exchanges and no older-page cursor. This draft supplements those exchanges with the accessible continuation and repository materials. It does not claim that inaccessible earlier discussions were exhaustively recovered. Later source recovery may add requirements.</p>
 <h3>For AI contributors and implementers</h3><ul><li>This repository file is the current scope record. Publishing it does not turn every proposed implementation detail into an approved design. Git version control, JSON metadata, PostgreSQL, inheritance breaks independent of library size and an inheritance explorer are explicit user requirements; do not downgrade them to optional ideas or reintroduce count-based restrictions.</li><li>Preserve the distinction between explicit user direction, proposed detail and unresolved design choices. Do not label planned features as implemented.</li><li>Keep editors, sync clients, workflows and specialized services within their stated application boundaries. Record agreed changes in HTML.</li><li>Use stable requirement IDs in implementation plans, issues and acceptance evidence. Do not claim SharePoint parity, regulatory compliance or production readiness without defined criteria and verification.</li></ul>
 </section>
-<footer>ShareCraft · ThineCraft · Scope of Works v0.4 · Updated 9 November 2026<br>This HTML document is self-contained and can be viewed offline or printed to PDF.</footer>
+<footer>ShareCraft · ThineCraft · Scope of Works v0.5 · Updated 9 November 2026<br>This HTML document is self-contained and can be viewed offline or printed to PDF.</footer>
 </main></div>
 </body></html>
