@@ -7,10 +7,15 @@
 
 mod common;
 
-use collab_core::ids::{OpId, Seq};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+
+use collab_core::ids::{DocId, OpId, Seq};
 use collab_text::{Component, TextOp};
-use common::{TestClient, new_doc, spawn_server};
-use protocol::{ClientMsg, Resume, RoomEpoch, ServerMsg};
+use common::{TestClient, new_doc, spawn_server, spawn_server_with};
+use protocol::{ClientMsg, Resume, RoomEpoch, SaveState, ServerMsg};
+use revisions::{Checkpoint, CheckpointError, Outcome, RevisionStore, Stored};
+use server::Checkpointer;
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
@@ -148,11 +153,12 @@ async fn resume_into_a_new_room_gets_reset() {
         }
         c.close().await;
     };
-    assert_eq!(c.text(), "");
-    c.type_at(0, "12").await;
+    // The old room saved A's text before ending; the new one loads it.
+    assert_eq!(c.text(), "xy");
+    c.type_at(2, "12").await;
     c.pump_until(|c| c.seq() == Seq(1) && c.pending() == 0)
         .await;
-    c.type_at(2, "34").await;
+    c.type_at(4, "34").await;
     c.pump_until(|c| c.seq() == Seq(2) && c.pending() == 0)
         .await;
 
@@ -165,7 +171,7 @@ async fn resume_into_a_new_room_gets_reset() {
         &a.received[before..]
     );
     assert_eq!(a.text(), c.text());
-    assert_eq!(a.text(), "1234");
+    assert_eq!(a.text(), "xy1234");
     assert_eq!(a.seq(), Seq(2));
 }
 
@@ -351,6 +357,374 @@ async fn healthz_answers_ok() {
         .unwrap();
     assert!(body.starts_with("HTTP/1.1 200"), "{body}");
     assert!(body.ends_with("ok"), "{body}");
+}
+
+// ---- Checkpoints ----
+
+fn stored_text(stored: &Stored) -> String {
+    String::from_utf8(stored.bytes.clone()).unwrap()
+}
+
+fn open_store(path: &std::path::Path) -> RevisionStore {
+    RevisionStore::open(path).unwrap()
+}
+
+#[tokio::test]
+async fn idle_session_is_checkpointed() {
+    let server = spawn_server().await;
+    let doc = new_doc();
+    let mut a = TestClient::connect(server.addr, doc, "Ann").await;
+    let mut b = TestClient::connect(server.addr, doc, "Bob").await;
+    a.type_at(0, "hello ").await;
+    b.type_at(0, "world").await;
+    a.pump_until(|c| c.pending() == 0 && c.seq() == Seq(2))
+        .await;
+    b.pump_until(|c| c.pending() == 0 && c.seq() == Seq(2))
+        .await;
+
+    let rev_a = a.wait_saved(Seq(2)).await;
+    let rev_b = b.wait_saved(Seq(2)).await;
+    assert_eq!(rev_a, rev_b);
+
+    let stored = server.store().read(doc, None).unwrap().unwrap();
+    assert_eq!(stored.revision.to_string(), rev_a);
+    assert_eq!(stored_text(&stored), a.text());
+    assert_eq!(stored.meta.file_name, format!("{}.txt", doc.0));
+    let mut names: Vec<_> = stored
+        .meta
+        .contributors
+        .iter()
+        .map(|p| p.name.clone())
+        .collect();
+    names.sort();
+    assert_eq!(names, vec!["Ann".to_owned(), "Bob".to_owned()]);
+    let mut ids: Vec<_> = stored
+        .meta
+        .contributors
+        .iter()
+        .map(|p| p.id.clone())
+        .collect();
+    ids.sort();
+    let mut expected = vec![a.client().0.to_string(), b.client().0.to_string()];
+    expected.sort();
+    assert_eq!(ids, expected);
+}
+
+/// Two clients type, the room saves, both leave; returns the saved text and revision.
+async fn type_save_and_leave(server: &common::TestServer, doc: DocId) -> (String, String) {
+    let mut a = TestClient::connect(server.addr, doc, "Ann").await;
+    let mut b = TestClient::connect(server.addr, doc, "Bob").await;
+    a.type_at(0, "abc").await;
+    a.pump_until(|c| c.pending() == 0 && c.seq() == Seq(1))
+        .await;
+    b.pump_until(|c| c.seq() == Seq(1)).await;
+    b.type_at(3, "def").await;
+    b.pump_until(|c| c.pending() == 0 && c.seq() == Seq(2))
+        .await;
+    let rev = b.wait_saved(Seq(2)).await;
+    let text = b.text();
+    a.close().await;
+    b.close().await;
+    (text, rev)
+}
+
+#[tokio::test]
+async fn reopening_loads_the_saved_text() {
+    let server = spawn_server().await;
+    let doc = new_doc();
+    let (text, rev) = type_save_and_leave(&server, doc).await;
+    assert_eq!(text, "abcdef");
+
+    let c = TestClient::connect(server.addr, doc, "Cy").await;
+    assert_eq!(c.text(), "abcdef");
+    assert!(
+        matches!(
+            c.received.first(),
+            Some(ServerMsg::Joined { snapshot: Some(s), revision: Some(r), .. })
+                if s == "abcdef" && *r == rev
+        ),
+        "{:?}",
+        c.received
+    );
+}
+
+#[tokio::test]
+async fn typing_resumes_from_saved_revision() {
+    let server = spawn_server().await;
+    let doc = new_doc();
+    let (_, first) = type_save_and_leave(&server, doc).await;
+
+    let mut c = TestClient::connect(server.addr, doc, "Cy").await;
+    assert_eq!(c.joined_revision(), Some(first.clone()));
+    let end = c.text().chars().count();
+    c.type_at(end, "!").await;
+    c.pump_until(|c| c.pending() == 0 && c.seq() == Seq(1))
+        .await;
+    let second = c.wait_saved(Seq(1)).await;
+    assert_ne!(second, first);
+
+    let commits = server.doc_commits(doc);
+    assert_eq!(commits.first(), Some(&second));
+    assert!(commits.contains(&first), "{commits:?}");
+    let stored = server.store().read(doc, None).unwrap().unwrap();
+    assert_eq!(stored_text(&stored), "abcdef!");
+}
+
+/// Fails the first `failures` writes, then stores normally.
+struct Flaky {
+    inner: RevisionStore,
+    failures: AtomicUsize,
+}
+
+impl Checkpointer for Flaky {
+    fn write(&self, c: &Checkpoint<'_>) -> Result<Outcome, CheckpointError> {
+        let left = self.failures.load(Ordering::SeqCst);
+        if left > 0 {
+            self.failures.store(left - 1, Ordering::SeqCst);
+            return Err(CheckpointError::Git(git2::Error::from_str("disk on fire")));
+        }
+        self.inner.write(c)
+    }
+
+    fn load(&self, doc: DocId) -> Result<Option<Stored>, CheckpointError> {
+        self.inner.load(doc)
+    }
+}
+
+#[tokio::test]
+async fn failed_checkpoint_is_retried_and_reported() {
+    let server = spawn_server_with(|path| {
+        Arc::new(Flaky {
+            inner: open_store(path),
+            failures: AtomicUsize::new(1),
+        })
+    })
+    .await;
+    let doc = new_doc();
+    let mut a = TestClient::connect(server.addr, doc, "Ann").await;
+    let mut b = TestClient::connect(server.addr, doc, "Bob").await;
+    a.type_at(0, "one").await;
+    a.pump_until(|c| c.pending() == 0 && c.seq() == Seq(1))
+        .await;
+    let failed = |c: &TestClient| c.saves().iter().any(|s| s.0 == SaveState::Failed);
+    a.pump_until(failed).await;
+
+    // Typed between the failure and the retry.
+    a.type_at(3, " two").await;
+    a.pump_until(|c| c.pending() == 0 && c.seq() == Seq(2))
+        .await;
+    let rev = a.wait_saved(Seq(2)).await;
+    b.wait_saved(Seq(2)).await;
+
+    for c in [&a, &b] {
+        let states: Vec<_> = c.saves().iter().map(|s| s.0).collect();
+        let failed_at = states.iter().position(|s| *s == SaveState::Failed);
+        let saved_at = states.iter().position(|s| *s == SaveState::Saved);
+        assert!(failed_at.is_some() && failed_at < saved_at, "{states:?}");
+    }
+    let first_saved = a
+        .saves()
+        .into_iter()
+        .find(|s| s.0 == SaveState::Saved)
+        .unwrap();
+    assert_eq!(
+        first_saved.2,
+        Seq(2),
+        "first save after the failure covers the retry"
+    );
+    let stored = server.store().read(doc, None).unwrap().unwrap();
+    assert_eq!(stored.revision.to_string(), rev);
+    assert_eq!(stored_text(&stored), "one two");
+}
+
+#[tokio::test]
+async fn no_commit_per_change() {
+    let server = spawn_server().await;
+    let doc = new_doc();
+    let mut a = TestClient::connect(server.addr, doc, "Ann").await;
+    for n in 0..50u64 {
+        a.type_at(usize::try_from(n).unwrap(), "x").await;
+        a.pump_until(|c| c.pending() == 0 && c.seq() == Seq(n + 1))
+            .await;
+    }
+    a.wait_saved(Seq(50)).await;
+    assert_eq!(server.doc_commits(doc).len(), 1);
+    let stored = server.store().read(doc, None).unwrap().unwrap();
+    assert_eq!(stored_text(&stored), "x".repeat(50));
+}
+
+#[tokio::test]
+async fn brief_disconnect_after_checkpoint_resumes_without_reset() {
+    let server = spawn_server().await;
+    let doc = new_doc();
+    let mut a = TestClient::connect(server.addr, doc, "A").await;
+    let mut b = TestClient::connect(server.addr, doc, "B").await;
+    a.type_at(0, "abc").await;
+    // A has not read the confirmation, so it still resumes from seq 0.
+    b.pump_until(|c| c.text() == "abc").await;
+    b.wait_saved(Seq(1)).await;
+    assert_eq!(a.pending(), 1);
+    a.disconnect();
+
+    let before = a.received.len();
+    a.reconnect().await;
+    assert!(
+        matches!(a.received.get(before), Some(ServerMsg::Joined { .. })),
+        "{:?}",
+        &a.received[before..]
+    );
+    a.pump_until(|c| c.pending() == 0).await;
+    assert_eq!(a.text(), "abc");
+}
+
+/// Every load fails; counts loads and writes.
+#[derive(Default)]
+struct BrokenLoad {
+    loads: AtomicUsize,
+    writes: AtomicUsize,
+}
+
+impl Checkpointer for BrokenLoad {
+    fn write(&self, _c: &Checkpoint<'_>) -> Result<Outcome, CheckpointError> {
+        self.writes.fetch_add(1, Ordering::SeqCst);
+        Err(CheckpointError::Git(git2::Error::from_str("not expected")))
+    }
+
+    fn load(&self, _doc: DocId) -> Result<Option<Stored>, CheckpointError> {
+        self.loads.fetch_add(1, Ordering::SeqCst);
+        Err(CheckpointError::Git(git2::Error::from_str("unreadable")))
+    }
+}
+
+#[tokio::test]
+async fn load_failure_refuses_join_and_does_not_overwrite() {
+    let broken = Arc::new(BrokenLoad::default());
+    let shared = Arc::clone(&broken);
+    let server = spawn_server_with(move |_| shared).await;
+    let doc = new_doc();
+    for attempt in 1..=2 {
+        let mut c = TestClient::connect_with_resume(server.addr, doc, "C", None).await;
+        c.wait_closed().await;
+        assert!(!c.joined, "{:?}", c.received);
+        assert!(
+            !c.received
+                .iter()
+                .any(|m| matches!(m, ServerMsg::Joined { .. } | ServerMsg::Reset { .. })),
+            "{:?}",
+            c.received
+        );
+        // The failed room is gone, so the next join tries the load again.
+        assert_eq!(broken.loads.load(Ordering::SeqCst), attempt);
+    }
+    assert_eq!(broken.writes.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn awkward_display_name_does_not_block_saving() {
+    let server = spawn_server().await;
+    let doc = new_doc();
+    // "<Ann>\nX", percent-encoded in the query string.
+    let mut a = TestClient::connect(server.addr, doc, "%3CAnn%3E%0AX").await;
+    assert_eq!(a.people(), vec!["AnnX".to_owned()]);
+    a.type_at(0, "hi").await;
+    a.pump_until(|c| c.pending() == 0 && c.seq() == Seq(1))
+        .await;
+    a.wait_saved(Seq(1)).await;
+    assert!(
+        !a.saves().iter().any(|s| s.0 == SaveState::Failed),
+        "{:?}",
+        a.saves()
+    );
+    let stored = server.store().read(doc, None).unwrap().unwrap();
+    let names: Vec<_> = stored
+        .meta
+        .contributors
+        .iter()
+        .map(|p| p.name.as_str())
+        .collect();
+    assert_eq!(names, vec!["AnnX"]);
+}
+
+/// Holds every write until released, and reports when one starts.
+struct Gated {
+    inner: RevisionStore,
+    released: Mutex<bool>,
+    open: Condvar,
+    started: tokio::sync::mpsc::UnboundedSender<()>,
+}
+
+impl Gated {
+    fn release(&self) {
+        *self.released.lock().unwrap() = true;
+        self.open.notify_all();
+    }
+}
+
+impl Checkpointer for Gated {
+    fn write(&self, c: &Checkpoint<'_>) -> Result<Outcome, CheckpointError> {
+        let _ = self.started.send(());
+        let mut released = self.released.lock().unwrap();
+        while !*released {
+            released = self.open.wait(released).unwrap();
+        }
+        drop(released);
+        self.inner.write(c)
+    }
+
+    fn load(&self, doc: DocId) -> Result<Option<Stored>, CheckpointError> {
+        self.inner.load(doc)
+    }
+}
+
+/// Opens the gate when dropped, so a failing test does not leave a write blocked.
+struct ReleaseOnDrop(Arc<Gated>);
+
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+#[tokio::test]
+async fn rejoin_during_final_checkpoint_sees_latest_text() {
+    let (started_tx, mut started) = tokio::sync::mpsc::unbounded_channel();
+    let slot: Arc<Mutex<Option<Arc<Gated>>>> = Arc::default();
+    let keep = Arc::clone(&slot);
+    let server = spawn_server_with(move |path| {
+        let gated = Arc::new(Gated {
+            inner: open_store(path),
+            released: Mutex::new(false),
+            open: Condvar::new(),
+            started: started_tx,
+        });
+        *keep.lock().unwrap() = Some(Arc::clone(&gated));
+        gated
+    })
+    .await;
+    let gate = ReleaseOnDrop(slot.lock().unwrap().clone().unwrap());
+    let doc = new_doc();
+
+    let mut a = TestClient::connect(server.addr, doc, "A").await;
+    a.type_at(0, "hello").await;
+    a.pump_until(|c| c.pending() == 0 && c.seq() == Seq(1))
+        .await;
+    a.close().await;
+    // The last participant has left and the room's checkpoint is held mid-write.
+    tokio::time::timeout(common::TIMEOUT, started.recv())
+        .await
+        .expect("no checkpoint started")
+        .unwrap();
+
+    let mut b = TestClient::connect(server.addr, doc, "B").await;
+    assert_eq!(b.text(), "hello");
+    gate.0.release();
+    b.wait_saved(Seq(1)).await;
+    b.close().await;
+
+    let c = TestClient::connect(server.addr, doc, "C").await;
+    assert_eq!(c.text(), "hello");
+    let stored = server.store().read(doc, None).unwrap().unwrap();
+    assert_eq!(stored_text(&stored), "hello");
 }
 
 #[test]

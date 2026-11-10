@@ -9,14 +9,17 @@
 )]
 
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use collab_core::client_state::{ClientState, Outgoing};
 use collab_core::ids::{ClientId, DocId, OpId, Seq};
 use collab_text::{TextDoc, TextOp};
 use futures_util::{SinkExt, StreamExt};
-use protocol::{ClientMsg, Participant, Resume, RoomEpoch, ServerMsg};
-use server::Config;
+use protocol::{ClientMsg, Participant, Resume, RoomEpoch, SaveState, ServerMsg};
+use revisions::RevisionStore;
+use server::{AppState, Checkpointer, Config};
 use tempfile::TempDir;
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
@@ -32,19 +35,57 @@ pub struct TestServer {
     pub data_dir: TempDir,
 }
 
-/// Starts a server on an ephemeral loopback port with its own data directory.
-pub async fn spawn_server() -> TestServer {
-    let data_dir = tempfile::tempdir().unwrap();
-    let config = Config {
+impl TestServer {
+    /// The library repository the server stores documents in.
+    pub fn library(&self) -> PathBuf {
+        server::library_path(self.data_dir.path())
+    }
+
+    /// Opens the server's library repository.
+    pub fn store(&self) -> RevisionStore {
+        RevisionStore::open(&self.library()).unwrap()
+    }
+
+    /// The commits that changed `doc`, newest first.
+    pub fn doc_commits(&self, doc: DocId) -> Vec<String> {
+        let repo = git2::Repository::open_bare(self.library()).unwrap();
+        let mut walk = repo.revwalk().unwrap();
+        walk.push_ref(&format!("refs/sharecraft/docs/{}", doc.0))
+            .unwrap();
+        walk.map(|oid| oid.unwrap().to_string()).collect()
+    }
+}
+
+fn test_config(data_dir: &TempDir) -> Config {
+    Config {
         addr: "127.0.0.1:0".parse().unwrap(),
         data_dir: data_dir.path().to_path_buf(),
         web_dir: data_dir.path().join("web"),
         checkpoint_idle: Duration::from_millis(100),
         checkpoint_max: Duration::from_secs(30),
-    };
+    }
+}
+
+/// Starts a server on an ephemeral loopback port with its own data directory.
+pub async fn spawn_server() -> TestServer {
+    let data_dir = tempfile::tempdir().unwrap();
+    let config = test_config(&data_dir);
     let listener = tokio::net::TcpListener::bind(config.addr).await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(server::serve(config, listener));
+    TestServer { addr, data_dir }
+}
+
+/// Starts a server whose rooms load and save through the checkpointer `make` builds from the
+/// library repository path.
+pub async fn spawn_server_with(make: impl FnOnce(&Path) -> Arc<dyn Checkpointer>) -> TestServer {
+    let data_dir = tempfile::tempdir().unwrap();
+    let config = test_config(&data_dir);
+    let checkpointer = make(&server::library_path(data_dir.path()));
+    let listener = tokio::net::TcpListener::bind(config.addr).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let state = AppState::new(config, checkpointer);
+    tokio::spawn(server::serve_state(state, listener));
     TestServer { addr, data_dir }
 }
 
@@ -191,6 +232,50 @@ impl TestClient {
                 Some(Ok(_)) => {}
             }
         }
+    }
+
+    /// The `Save` messages received, in order.
+    pub fn saves(&self) -> Vec<(SaveState, Option<String>, Seq)> {
+        self.received
+            .iter()
+            .filter_map(|m| match m {
+                ServerMsg::Save {
+                    state,
+                    revision,
+                    through,
+                } => Some((*state, revision.clone(), *through)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The revision of the latest `Save{Saved}` covering `through`, if one has arrived.
+    pub fn saved_revision(&self, through: Seq) -> Option<String> {
+        self.saves()
+            .into_iter()
+            .rev()
+            .find_map(|(state, revision, t)| {
+                (state == SaveState::Saved && t >= through)
+                    .then_some(revision)
+                    .flatten()
+            })
+    }
+
+    /// Waits for a `Save{Saved}` covering `through` and returns its revision.
+    pub async fn wait_saved(&mut self, through: Seq) -> String {
+        self.pump_until(|c| c.saved_revision(through).is_some())
+            .await;
+        self.saved_revision(through).unwrap()
+    }
+
+    /// The revision named by the last `Joined` or `Reset`.
+    pub fn joined_revision(&self) -> Option<String> {
+        self.received.iter().rev().find_map(|m| match m {
+            ServerMsg::Joined { revision, .. } | ServerMsg::Reset { revision, .. } => {
+                Some(revision.clone())
+            }
+            _ => None,
+        })?
     }
 
     /// Waits until the server closes this socket.

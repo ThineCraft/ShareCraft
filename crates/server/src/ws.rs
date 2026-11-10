@@ -19,7 +19,7 @@ use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::AppState;
-use crate::room::{Command, ConnId, OUTBOUND_CAPACITY, Outbound};
+use crate::room::{Command, ConnId, DEFAULT_NAME, JoinReply, OUTBOUND_CAPACITY, Outbound};
 
 /// Largest frame or message accepted from a client.
 const MAX_MESSAGE: usize = 1024 * 1024;
@@ -29,8 +29,6 @@ const JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 const JOIN_ATTEMPTS: usize = 3;
 /// Longest display name, in characters.
 const MAX_NAME: usize = 60;
-/// Name used when none is given.
-const DEFAULT_NAME: &str = "Guest";
 
 /// Query parameters of `/ws/docs/{doc_id}`.
 #[derive(Debug, Deserialize)]
@@ -175,8 +173,14 @@ async fn join_room(
             tx,
             accepted,
         };
-        if room.send(join).await.is_ok() && was_accepted.await.is_ok() {
-            return Some((room, out_rx));
+        if room.send(join).await.is_err() {
+            continue;
+        }
+        match was_accepted.await {
+            Ok(JoinReply::Accepted) => return Some((room, out_rx)),
+            Ok(JoinReply::Refused) => return None,
+            // The room ended before handling the join.
+            Err(_) => {}
         }
     }
     None

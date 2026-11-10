@@ -1,5 +1,8 @@
 //! One room per open document: a single task owns the document's change log and everyone
 //! connected to it, and receives commands from the connections over a channel.
+//!
+//! The room loads its document when it opens and writes checkpoints while it runs (see
+//! [`Schedule`]). It ends once nobody is connected and everything is saved.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -10,9 +13,14 @@ use collab_core::document::Submitted;
 use collab_core::ids::{ClientId, DocId, OpId, Seq};
 use collab_core::server_log::ServerLog;
 use collab_text::{TextDoc, TextOp};
-use protocol::{Participant, Resume, RoomEpoch, ServerMsg};
+use protocol::{Participant, Resume, RoomEpoch, SaveState, ServerMsg};
+use revisions::{Author, CheckpointError, Outcome, RevisionId};
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use uuid::Uuid;
+
+use crate::checkpoint::{Checkpointer, Finished, SaveJob, Schedule, Timing};
 
 /// Identifies one WebSocket connection, so a replaced connection's late messages are ignored.
 pub(crate) type ConnId = u64;
@@ -32,6 +40,20 @@ pub(crate) const OUTBOUND_CAPACITY: usize = 256;
 const COMMAND_CAPACITY: usize = 1024;
 /// Largest cursor position relayed; anything larger is dropped.
 const MAX_CURSOR: usize = 10_000_000;
+/// Log entries kept behind the last checkpoint, so a client that drops briefly can still
+/// resume (and keep its unconfirmed typing) instead of being reset.
+const KEPT_ENTRIES: u64 = 1000;
+/// Name used when none is usable.
+pub(crate) const DEFAULT_NAME: &str = "Guest";
+
+/// How a room answers a join.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum JoinReply {
+    /// The connection is in the room.
+    Accepted,
+    /// The room could not load its document; the connection should close.
+    Refused,
+}
 
 /// What a connection asks of its room.
 #[derive(Debug)]
@@ -43,8 +65,9 @@ pub(crate) enum Command {
         name: String,
         resume: Option<Resume>,
         tx: mpsc::Sender<Outbound>,
-        /// Answered once the join is handled; dropped if the room closed first.
-        accepted: oneshot::Sender<()>,
+        /// Answered once the join is handled; dropped if the room ended first, in which case
+        /// the connection asks again.
+        accepted: oneshot::Sender<JoinReply>,
     },
     /// Propose a change.
     Submit {
@@ -70,7 +93,7 @@ pub(crate) struct Initial {
     /// The document's text.
     pub doc: TextDoc,
     /// The stored revision the text came from, if any.
-    pub revision: Option<String>,
+    pub revision: Option<RevisionId>,
 }
 
 struct Member {
@@ -84,10 +107,11 @@ struct Member {
 /// The state of one open document. Handling a command never blocks: frames are queued with
 /// `try_send` and a connection whose queue is full or closed is dropped.
 pub(crate) struct Room {
+    doc: DocId,
     /// This lifetime of the room; log positions only mean something within it.
     epoch: RoomEpoch,
     log: ServerLog<TextDoc>,
-    revision: Option<String>,
+    schedule: Schedule,
     /// In joining order.
     members: Vec<Member>,
     /// Each client's last committed change, so a resend is recognised however much of the log
@@ -97,19 +121,68 @@ pub(crate) struct Room {
 
 impl Room {
     /// A room holding `initial`, with its log at `Seq(0)` and a fresh random epoch.
-    pub(crate) fn new(initial: Initial) -> Self {
+    pub(crate) fn new(doc: DocId, initial: Initial, timing: Timing) -> Self {
         Self {
+            doc,
             epoch: RoomEpoch(Uuid::new_v4()),
             log: ServerLog::new(initial.doc, Seq(0)),
-            revision: initial.revision,
+            schedule: Schedule::new(initial.revision, Seq(0), timing),
             members: Vec::new(),
             last_committed: HashMap::new(),
         }
     }
 
-    /// Whether nobody is connected.
-    pub(crate) fn is_empty(&self) -> bool {
-        self.members.is_empty()
+    /// When the next checkpoint should start, if one is needed and none is running.
+    fn checkpoint_due(&self) -> Option<Instant> {
+        self.schedule.due(self.log.head(), self.members.is_empty())
+    }
+
+    /// Starts a checkpoint of the current document and tells everyone.
+    fn start_checkpoint(&mut self) -> Option<SaveJob> {
+        let head = self.log.head();
+        let job = self
+            .schedule
+            .start(head, self.log.doc().as_str().to_owned())?;
+        self.broadcast_save(SaveState::Saving, None, head);
+        Some(job)
+    }
+
+    /// Records how the running checkpoint ended and tells everyone.
+    fn finish_checkpoint(&mut self, result: Result<Outcome, String>) {
+        let head = self.log.head();
+        let finished = self.schedule.finish(result, head, self.members.is_empty());
+        match finished {
+            Some(Finished::Saved { revision, through }) => {
+                self.log
+                    .truncate_through(Seq(through.0.saturating_sub(KEPT_ENTRIES)));
+                self.broadcast_save(SaveState::Saved, Some(revision.to_string()), through);
+            }
+            Some(Finished::Failed {
+                through,
+                error,
+                gave_up,
+            }) => {
+                eprintln!(
+                    "sharecraft-server: checkpoint of document {} failed: {error}",
+                    self.doc.0
+                );
+                if gave_up {
+                    eprintln!(
+                        "sharecraft-server: giving up on document {}; changes after its last \
+                         saved revision are lost",
+                        self.doc.0
+                    );
+                }
+                self.broadcast_save(SaveState::Failed, None, through);
+            }
+            None => {}
+        }
+    }
+
+    /// Whether the room can end: nobody is connected and everything is saved (or saving was
+    /// given up).
+    fn may_end(&self) -> bool {
+        self.members.is_empty() && self.schedule.may_end(self.log.head())
     }
 
     /// Carries out one command.
@@ -123,9 +196,9 @@ impl Room {
                 tx,
                 accepted,
             } => {
-                self.join(conn, client, name, resume, tx);
+                self.join(conn, client, &name, resume, tx);
                 // The connection may have gone away meanwhile; nothing to do then.
-                let _ = accepted.send(());
+                let _ = accepted.send(JoinReply::Accepted);
             }
             Command::Submit {
                 conn,
@@ -143,17 +216,18 @@ impl Room {
         &mut self,
         conn: ConnId,
         client: ClientId,
-        name: String,
+        name: &str,
         resume: Option<Resume>,
         tx: mpsc::Sender<Outbound>,
     ) {
         let member = Member {
             conn,
             client,
-            name,
+            name: credited_name(name),
             cursor: None,
             tx,
         };
+        self.schedule.joined();
         // Replacing the member drops the older connection's queue, which closes it.
         match self.members.iter_mut().find(|m| m.client == client) {
             Some(existing) => *existing = member,
@@ -163,7 +237,7 @@ impl Room {
         let epoch = self.epoch;
         let seq = self.log.head();
         let text = self.log.doc().as_str().to_owned();
-        let revision = self.revision.clone();
+        let revision = self.schedule.revision().map(ToString::to_string);
         let mut msgs = Vec::new();
         // A position from another lifetime of this room means nothing here.
         let missed = resume
@@ -213,6 +287,17 @@ impl Room {
         match self.log.submit(client, op_id, base, op) {
             Ok(Submitted::Committed(entry)) => {
                 self.last_committed.insert(client, op_id);
+                // `is_current` above guarantees the member is here.
+                let name = self
+                    .members
+                    .iter()
+                    .find(|m| m.client == client)
+                    .map_or_else(|| DEFAULT_NAME.to_owned(), |m| m.name.clone());
+                let author = Author {
+                    id: client.0.to_string(),
+                    name,
+                };
+                self.schedule.changed(author, entry.seq);
                 if let Some(frame) = encode(&ServerMsg::Committed { entry }) {
                     self.send(None, &Outbound::One(frame));
                 }
@@ -283,6 +368,17 @@ impl Room {
         }
     }
 
+    fn broadcast_save(&mut self, state: SaveState, revision: Option<String>, through: Seq) {
+        let save = ServerMsg::<TextOp>::Save {
+            state,
+            revision,
+            through,
+        };
+        if let Some(frame) = encode(&save) {
+            self.send(None, &Outbound::One(frame));
+        }
+    }
+
     /// Queues `out` for `to`, or for everyone when `to` is `None`. A member whose queue is full
     /// or closed is removed (it reconnects and catches up), and the others are told.
     fn send(&mut self, to: Option<ClientId>, out: &Outbound) {
@@ -306,6 +402,19 @@ fn encode(msg: &ServerMsg<TextOp>) -> Option<Utf8Bytes> {
     serde_json::to_string(msg).ok().map(Utf8Bytes::from)
 }
 
+/// `name` without control characters, `<` or `>`, and trimmed; "Guest" if nothing is left.
+/// The revision store accepts any such name as an author name.
+fn credited_name(name: &str) -> String {
+    let kept: String = name
+        .chars()
+        .filter(|c| !c.is_control() && !matches!(c, '<' | '>'))
+        .collect();
+    match kept.trim() {
+        "" => DEFAULT_NAME.to_owned(),
+        trimmed => trimmed.to_owned(),
+    }
+}
+
 struct RoomHandle {
     tx: mpsc::Sender<Command>,
     generation: u64,
@@ -319,14 +428,17 @@ pub(crate) struct Rooms {
 }
 
 impl Rooms {
-    /// The command channel of `doc`'s room, starting the room from `load` if it is not open.
+    /// The command channel of `doc`'s room, starting the room if it is not open. A new room
+    /// loads its document from `store` before handling commands; commands wait in its channel
+    /// meanwhile.
     ///
     /// The channel can be closed by the time it is used, if the room ended meanwhile; the
     /// caller then asks again.
     pub(crate) fn open(
         self: &Arc<Self>,
         doc: DocId,
-        load: impl FnOnce(DocId) -> Initial,
+        store: &Arc<dyn Checkpointer>,
+        timing: Timing,
     ) -> mpsc::Sender<Command> {
         let mut open = self.open.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(handle) = open.get(&doc)
@@ -336,8 +448,12 @@ impl Rooms {
         }
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel(COMMAND_CAPACITY);
-        let room = Room::new(load(doc));
-        tokio::spawn(run(room, rx, Arc::clone(self), doc, generation));
+        let place = Place {
+            rooms: Arc::clone(self),
+            doc,
+            generation,
+        };
+        tokio::spawn(run(place, rx, Arc::clone(store), timing));
         open.insert(
             doc,
             RoomHandle {
@@ -356,25 +472,113 @@ impl Rooms {
     }
 }
 
-/// Handles commands until the last participant leaves.
-async fn run(
-    mut room: Room,
-    mut rx: mpsc::Receiver<Command>,
+/// Which registry entry a room task owns.
+struct Place {
     rooms: Arc<Rooms>,
     doc: DocId,
     generation: u64,
+}
+
+type Running = JoinHandle<Result<Outcome, CheckpointError>>;
+
+/// Loads the document, then handles commands and writes checkpoints until nobody is connected
+/// and everything is saved.
+async fn run(
+    place: Place,
+    mut rx: mpsc::Receiver<Command>,
+    store: Arc<dyn Checkpointer>,
+    timing: Timing,
 ) {
-    while let Some(cmd) = rx.recv().await {
-        room.handle(cmd);
-        if room.is_empty() {
+    let doc = place.doc;
+    let initial = match load(&store, doc).await {
+        Ok(initial) => initial,
+        Err(err) => {
+            eprintln!("sharecraft-server: cannot open document {}: {err}", doc.0);
+            // Starting empty would later overwrite the stored document. Refuse everyone who
+            // is waiting; a later join opens a fresh room that tries the load again.
+            place.rooms.close(doc, place.generation);
+            rx.close();
+            while let Ok(cmd) = rx.try_recv() {
+                if let Command::Join { accepted, .. } = cmd {
+                    let _ = accepted.send(JoinReply::Refused);
+                }
+            }
+            return;
+        }
+    };
+
+    let mut room = Room::new(doc, initial, timing);
+    let mut running: Option<Running> = None;
+    loop {
+        let due = match running {
+            Some(_) => None,
+            None => room.checkpoint_due(),
+        };
+        tokio::select! {
+            cmd = rx.recv() => match cmd {
+                Some(cmd) => room.handle(cmd),
+                // The registry holds a sender until this task removes it, so this does not
+                // happen; there is nobody left to serve if it does.
+                None => break,
+            },
+            result = finished(&mut running) => {
+                running = None;
+                room.finish_checkpoint(result);
+            }
+            () = sleep_until(due) => {
+                if let Some(job) = room.start_checkpoint() {
+                    let store = Arc::clone(&store);
+                    running = Some(tokio::task::spawn_blocking(move || job.write(doc, &*store)));
+                }
+            }
+        }
+        if running.is_none() && room.may_end() {
             break;
         }
     }
-    rooms.close(doc, generation);
+    place.rooms.close(doc, place.generation);
     rx.close();
     // Joins queued after the room decided to end are dropped unanswered, so those
-    // connections open a fresh room.
+    // connections open a fresh room, which loads what this one saved.
     while rx.try_recv().is_ok() {}
+}
+
+/// Reads the document's current revision without blocking the async workers.
+async fn load(store: &Arc<dyn Checkpointer>, doc: DocId) -> Result<Initial, String> {
+    let store = Arc::clone(store);
+    let loaded = tokio::task::spawn_blocking(move || store.load(doc))
+        .await
+        .map_err(|e| format!("load task failed: {e}"))?
+        .map_err(|e| e.to_string())?;
+    let Some(stored) = loaded else {
+        return Ok(Initial::default());
+    };
+    let text = String::from_utf8(stored.bytes)
+        .map_err(|_| format!("revision {} is not valid UTF-8 text", stored.revision))?;
+    Ok(Initial {
+        doc: TextDoc::new(text),
+        revision: Some(stored.revision),
+    })
+}
+
+/// The result of the running checkpoint; never ready when none is running. A panic in the
+/// write counts as a failed checkpoint.
+async fn finished(running: &mut Option<Running>) -> Result<Outcome, String> {
+    match running {
+        Some(handle) => match handle.await {
+            Ok(result) => result.map_err(|e| e.to_string()),
+            Err(e) => Err(format!("checkpoint task failed: {e}")),
+        },
+        None => std::future::pending().await,
+    }
+}
+
+/// Waits until `due`; never ready when there is nothing due.
+async fn sleep_until(due: Option<Instant>) {
+    match due {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
 }
 
 #[cfg(test)]
@@ -386,7 +590,60 @@ async fn run(
 )]
 mod tests {
     use super::*;
+    use std::time::Duration;
     use uuid::Uuid;
+
+    fn new_room() -> Room {
+        let timing = Timing {
+            idle: Duration::from_millis(100),
+            max: Duration::from_secs(30),
+        };
+        Room::new(DocId(Uuid::from_u128(77)), Initial::default(), timing)
+    }
+
+    #[test]
+    fn names_are_made_valid_authors() {
+        assert_eq!(credited_name("<Ann>\nX"), "AnnX");
+        assert_eq!(credited_name(" <> \t"), "Guest");
+        assert_eq!(credited_name("Bob"), "Bob");
+    }
+
+    #[test]
+    fn saving_keeps_recent_entries_for_resume() {
+        let mut room = new_room();
+        let a = ClientId(Uuid::from_u128(1));
+        let mut rx = join(&mut room, 1, a);
+        for n in 0..1005u64 {
+            frames(&mut rx);
+            let len = room.log.doc().len_chars();
+            room.handle(Command::Submit {
+                conn: 1,
+                client: a,
+                op_id: OpId(Uuid::from_u128(1000 + u128::from(n))),
+                base: room.log.head(),
+                op: TextOp::replace(len, len, 0, "x").unwrap(),
+            });
+        }
+        room.start_checkpoint().unwrap();
+        room.finish_checkpoint(Ok(Outcome::Written(
+            "0123456789012345678901234567890123456789".parse().unwrap(),
+        )));
+        assert_eq!(room.log.head(), Seq(1005));
+        assert!(room.log.since(Seq(4)).is_none());
+        assert_eq!(room.log.since(Seq(5)).unwrap().len(), 1000);
+        let saved = frames(&mut rx);
+        assert!(
+            saved.iter().any(|m| matches!(
+                m,
+                ServerMsg::Save {
+                    state: SaveState::Saved,
+                    revision: Some(_),
+                    through: Seq(1005)
+                }
+            )),
+            "{saved:?}"
+        );
+    }
 
     fn join(room: &mut Room, conn: ConnId, client: ClientId) -> mpsc::Receiver<Outbound> {
         let (tx, rx) = mpsc::channel(OUTBOUND_CAPACITY);
@@ -429,7 +686,7 @@ mod tests {
 
     #[test]
     fn resend_after_log_truncation_is_not_applied_twice() {
-        let mut room = Room::new(Initial::default());
+        let mut room = new_room();
         let client = ClientId(Uuid::from_u128(1));
         let op_id = OpId(Uuid::from_u128(2));
         let mut rx = join(&mut room, 1, client);
@@ -447,7 +704,7 @@ mod tests {
 
     #[test]
     fn resend_of_kept_entry_is_dropped_silently() {
-        let mut room = Room::new(Initial::default());
+        let mut room = new_room();
         let a = ClientId(Uuid::from_u128(1));
         let b = ClientId(Uuid::from_u128(3));
         let first = OpId(Uuid::from_u128(2));
@@ -477,7 +734,7 @@ mod tests {
 
     #[test]
     fn resume_from_another_epoch_is_reset() {
-        let mut room = Room::new(Initial::default());
+        let mut room = new_room();
         let a = ClientId(Uuid::from_u128(1));
         let _rx_a = join(&mut room, 1, a);
         submit(&mut room, a, OpId(Uuid::from_u128(2)), Seq(0), "abc");
@@ -505,7 +762,7 @@ mod tests {
 
     #[test]
     fn full_queue_drops_that_member_only() {
-        let mut room = Room::new(Initial::default());
+        let mut room = new_room();
         let slow = ClientId(Uuid::from_u128(1));
         let fast = ClientId(Uuid::from_u128(2));
         let _slow_rx = join(&mut room, 1, slow);
@@ -529,7 +786,7 @@ mod tests {
 
     #[test]
     fn stale_connection_cannot_act_after_replacement() {
-        let mut room = Room::new(Initial::default());
+        let mut room = new_room();
         let a = ClientId(Uuid::from_u128(1));
         let _old = join(&mut room, 1, a);
         let mut new = join(&mut room, 2, a);
