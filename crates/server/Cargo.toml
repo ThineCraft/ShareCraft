@@ -34,3 +34,4 @@ git2 = { version = "0.21.0", default-features = false }
 tempfile = "3.27.0"
 tokio-tungstenite = "0.30.0"
 uuid = { version = "1.29.2", features = ["v4"] }
+web-client = { path = "../web-client" }

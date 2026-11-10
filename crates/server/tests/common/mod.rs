@@ -57,10 +57,14 @@ impl TestServer {
 }
 
 fn test_config(data_dir: &TempDir) -> Config {
+    config_at(data_dir.path())
+}
+
+fn config_at(data_dir: &Path) -> Config {
     Config {
         addr: "127.0.0.1:0".parse().unwrap(),
-        data_dir: data_dir.path().to_path_buf(),
-        web_dir: data_dir.path().join("web"),
+        data_dir: data_dir.to_path_buf(),
+        web_dir: data_dir.join("web"),
         checkpoint_idle: Duration::from_millis(100),
         checkpoint_max: Duration::from_secs(30),
         room_grace: LONG_GRACE,
@@ -94,11 +98,62 @@ pub async fn spawn_server_config(edit: impl FnOnce(&mut Config)) -> TestServer {
     TestServer { addr, data_dir }
 }
 
+/// A server on its own runtime. Stopping it ends every connection, room and task at once, as
+/// stopping the server process would, and leaves its data directory for a new server.
+pub struct StoppableServer {
+    pub addr: SocketAddr,
+    runtime: Option<tokio::runtime::Runtime>,
+}
+
+impl StoppableServer {
+    /// Starts a server on an ephemeral loopback port storing documents under `data_dir`, with
+    /// its settings adjusted by `edit`.
+    pub fn start(data_dir: &Path, edit: impl FnOnce(&mut Config)) -> StoppableServer {
+        let mut config = config_at(data_dir);
+        edit(&mut config);
+        let listener = std::net::TcpListener::bind(config.addr).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.spawn(async move {
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            server::serve(config, listener).await
+        });
+        StoppableServer {
+            addr,
+            runtime: Some(runtime),
+        }
+    }
+
+    /// Stops the server without saving anything further.
+    pub fn stop(&mut self) {
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_background();
+        }
+    }
+}
+
+impl Drop for StoppableServer {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 /// Waits until the stored text of `doc` in `server`'s library is `text`.
 pub async fn wait_stored(server: &TestServer, doc: DocId, text: &str) {
+    wait_stored_in(&server.library(), doc, text).await;
+}
+
+/// Waits until the stored text of `doc` in the library repository at `library` is `text`.
+pub async fn wait_stored_in(library: &Path, doc: DocId, text: &str) {
     let deadline = tokio::time::Instant::now() + TIMEOUT;
+    let store = RevisionStore::open(library).unwrap();
     loop {
-        let stored = server.store().read(doc, None).unwrap();
+        let stored = store.read(doc, None).unwrap();
         if stored.is_some_and(|s| s.bytes == text.as_bytes()) {
             return;
         }
