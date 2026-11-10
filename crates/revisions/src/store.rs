@@ -96,6 +96,37 @@ fn doc_head(repo: &Repository, doc: DocId) -> Result<Option<Oid>, git2::Error> {
     }
 }
 
+/// Points `main` and the document ref at `oid` in one transaction.
+///
+/// The transaction cannot express "still at the tip we read", so after locking both refs and
+/// before setting anything, `main` and the document ref are re-read and compared with the
+/// tips seen at the start of the checkpoint. On any difference nothing is set.
+fn move_refs(
+    repo: &Repository,
+    doc: DocId,
+    oid: Oid,
+    expected_main: Option<Oid>,
+    expected_doc: Option<Oid>,
+    signature: &Signature<'_>,
+) -> Result<(), CheckpointError> {
+    let doc_ref_name = doc_ref(doc);
+    let mut tx = repo.transaction()?;
+    tx.lock_ref(MAIN)?;
+    tx.lock_ref(&doc_ref_name)?;
+    let main_now = match repo.find_reference(MAIN) {
+        Ok(r) => r.target(),
+        Err(e) if e.code() == git2::ErrorCode::NotFound => None,
+        Err(e) => return Err(e.into()),
+    };
+    if main_now != expected_main || doc_head(repo, doc)? != expected_doc {
+        return Err(git2::Error::from_str("refs moved during checkpoint").into());
+    }
+    tx.set_target(MAIN, oid, Some(signature), "checkpoint")?;
+    tx.set_target(&doc_ref_name, oid, Some(signature), "checkpoint")?;
+    tx.commit()?;
+    Ok(())
+}
+
 impl RevisionStore {
     /// Opens the repository at `repo_path`, creating a bare one if absent.
     ///
@@ -238,16 +269,81 @@ impl RevisionStore {
         }
 
         let parents: Vec<&git2::Commit<'_>> = parent.iter().collect();
-        // Fails if `main` moved since we read it, rather than dropping a concurrent commit.
-        let oid = repo.commit(
-            Some(MAIN),
+        let oid = repo.commit(None, &signature, &signature, &message, &tree, &parents)?;
+        move_refs(
+            &repo,
+            c.doc,
+            oid,
+            parent.as_ref().map(git2::Commit::id),
+            current,
             &signature,
-            &signature,
-            &message,
-            &tree,
-            &parents,
         )?;
-        repo.reference(&doc_ref(c.doc), oid, true, "checkpoint")?;
         Ok(Outcome::Written(RevisionId::from_oid(oid)))
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+mod tests {
+    use super::*;
+    use crate::{Author, Checkpoint};
+    use serde_json::Map;
+
+    #[test]
+    fn moved_main_aborts_without_touching_document_ref() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RevisionStore::open(&dir.path().join("lib.git")).unwrap();
+        let doc = DocId(uuid::Uuid::new_v4());
+        let authors = [Author {
+            id: "u1".into(),
+            name: "Ann".into(),
+        }];
+        let fields = Map::new();
+        let cp = Checkpoint {
+            doc,
+            file_name: "n.txt",
+            bytes: b"x",
+            base: None,
+            authors: &authors,
+            fields: &fields,
+        };
+        let Outcome::Written(first) = store.checkpoint(&cp).unwrap() else {
+            panic!("expected Written");
+        };
+        let first_oid = first.to_oid().unwrap();
+
+        let repo = store.repo().unwrap();
+        let sig = Signature::now("Ann", "u1@sharecraft.invalid").unwrap();
+        let tree = repo.find_commit(first_oid).unwrap().tree().unwrap();
+        let other = repo.commit(None, &sig, &sig, "other", &tree, &[]).unwrap();
+        let new = repo.commit(None, &sig, &sig, "new", &tree, &[]).unwrap();
+        let tips = |repo: &Repository| {
+            (
+                repo.refname_to_id(MAIN).unwrap(),
+                repo.refname_to_id(&doc_ref(doc)).unwrap(),
+            )
+        };
+
+        // Another writer moved `main` after we read `first` as its tip.
+        repo.reference(MAIN, other, true, "other writer").unwrap();
+        let err = move_refs(&repo, doc, new, Some(first_oid), Some(first_oid), &sig);
+        assert!(err.is_err());
+        assert_eq!(tips(&repo), (other, first_oid), "both refs untouched");
+
+        // The document ref moved instead.
+        repo.reference(MAIN, first_oid, true, "reset").unwrap();
+        repo.reference(&doc_ref(doc), other, true, "other writer")
+            .unwrap();
+        assert!(move_refs(&repo, doc, new, Some(first_oid), Some(first_oid), &sig).is_err());
+        assert_eq!(tips(&repo), (first_oid, other), "both refs untouched");
+
+        // Matching tips: both move together.
+        move_refs(&repo, doc, new, Some(first_oid), Some(other), &sig).unwrap();
+        assert_eq!(tips(&repo), (new, new));
     }
 }
