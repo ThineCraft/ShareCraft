@@ -12,7 +12,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
-use super::{ApiError, JsonBody, after_access_change, parse_id};
+use super::{ApiError, JsonBody, after_access_change, parse_id, to_completion};
 use crate::AppState;
 use crate::auth::Signed;
 
@@ -196,9 +196,25 @@ pub(crate) async fn share(
         .await
         .map_err(|e| ApiError::unavailable(&e))?
         .ok_or(ApiError::NoSuchUser)?;
-    db.set_access(actor, doc, user.id, Some(role)).await?;
-    after_access_change(&state, doc, user.id).await;
+    change_access(state, actor, doc, user.id, Some(role)).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Stores `actor`'s change of `user`'s access to `doc` (`None` removes their grant) and tells
+/// the document's room, finishing both even if the request is cancelled.
+pub(super) async fn change_access(
+    state: AppState,
+    actor: UserId,
+    doc: DocId,
+    user: UserId,
+    role: Option<Role>,
+) -> Result<(), ApiError> {
+    to_completion(async move {
+        state.db().set_access(actor, doc, user, role).await?;
+        after_access_change(&state, doc, user).await;
+        Ok(())
+    })
+    .await
 }
 
 /// `DELETE /api/docs/{id}/access/{user_id}`: removes a person's grant.
@@ -209,11 +225,7 @@ pub(crate) async fn unshare(
 ) -> Result<StatusCode, ApiError> {
     let doc = DocId(parse_id(&id)?);
     let user = UserId(parse_id(&user_id)?);
-    state
-        .db()
-        .set_access(signed.session.user.id, doc, user, None)
-        .await?;
-    after_access_change(&state, doc, user).await;
+    change_access(state, signed.session.user.id, doc, user, None).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

@@ -10,7 +10,7 @@ use axum::response::{IntoResponse, Response};
 use records::SignInError;
 use serde::{Deserialize, Serialize};
 
-use super::{ApiError, JsonBody, after_sign_out};
+use super::{ApiError, JsonBody, after_sign_out, to_completion};
 use crate::AppState;
 use crate::auth::{Signed, Throttle, cleared_cookie, session_cookie};
 
@@ -66,12 +66,19 @@ pub(crate) async fn sign_out(
     State(state): State<AppState>,
     signed: Signed,
 ) -> Result<Response, ApiError> {
-    state
-        .db()
-        .end_session(signed.session.id)
-        .await
-        .map_err(|e| ApiError::unavailable(&e))?;
-    after_sign_out(&state, signed.session.id);
+    let session = signed.session.id;
+    // On its own task, so that the session's connections close even if the request is
+    // cancelled once the session has ended.
+    to_completion(async move {
+        state
+            .db()
+            .end_session(session)
+            .await
+            .map_err(|e| ApiError::unavailable(&e))?;
+        after_sign_out(&state, session);
+        Ok(())
+    })
+    .await?;
     Ok((StatusCode::NO_CONTENT, [(SET_COOKIE, cleared_cookie())]).into_response())
 }
 

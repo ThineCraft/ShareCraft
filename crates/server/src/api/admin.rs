@@ -8,7 +8,7 @@ use collab_core::ids::UserId;
 use records::NewUser;
 use serde::{Deserialize, Serialize};
 
-use super::{ApiError, JsonBody, after_account_disabled, parse_id};
+use super::{ApiError, JsonBody, after_account_disabled, parse_id, to_completion};
 use crate::AppState;
 use crate::auth::Signed;
 
@@ -97,11 +97,14 @@ pub(crate) async fn disable(
 ) -> Result<StatusCode, ApiError> {
     require_admin(&signed)?;
     let user = UserId(parse_id(&id)?);
-    state
-        .db()
-        .set_disabled(signed.session.user.id, user, true)
-        .await?;
-    after_account_disabled(&state, user);
+    let actor = signed.session.user.id;
+    // On its own task, so that a disabled account is removed even if the request is cancelled.
+    to_completion(async move {
+        state.db().set_disabled(actor, user, true).await?;
+        after_account_disabled(&state, user);
+        Ok(())
+    })
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

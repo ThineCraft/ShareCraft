@@ -172,6 +172,22 @@ fn parse_id(text: &str) -> Result<Uuid, ApiError> {
     Uuid::parse_str(text).map_err(|_| ApiError::InvalidRequest)
 }
 
+/// Runs `change` (a database write and the hook that tells the rooms about it) on a task of its
+/// own and waits for it. A request whose caller goes away is dropped at its next `.await`; the
+/// task is not, so a write that was stored always reaches the rooms. A task that fails to finish
+/// answers `503`.
+async fn to_completion<T: Send + 'static>(
+    change: impl Future<Output = Result<T, ApiError>> + Send + 'static,
+) -> Result<T, ApiError> {
+    match tokio::spawn(change).await {
+        Ok(result) => result,
+        Err(e) => {
+            eprintln!("sharecraft-server: a change to access did not finish: {e}");
+            Err(ApiError::Unavailable)
+        }
+    }
+}
+
 /// Called after `user`'s access to `doc` was granted, changed or removed, once the change is
 /// stored. Reads their role afresh, so an administrator who loses a grant stays an owner, and
 /// tells the document's room: connections that lost access are removed, the others get their
@@ -273,6 +289,93 @@ mod tests {
         .id
     }
 
+    /// A server's state on `test`'s database, storing documents under `dir`; no listener.
+    fn state_for(test: &TestDb, dir: &std::path::Path) -> AppState {
+        let config = Config {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            data_dir: dir.to_path_buf(),
+            web_dir: dir.join("web"),
+            checkpoint_idle: Duration::from_secs(600),
+            checkpoint_max: Duration::from_secs(600),
+            room_grace: Duration::from_secs(60),
+            database_url: DatabaseUrl::new(test.url()),
+        };
+        let store = RevisionStore::open(&crate::library_path(dir)).unwrap();
+        AppState::new(config, Arc::new(store), test.db.clone())
+    }
+
+    /// The owner's request to remove Bob's grant is cancelled (its future dropped) after the
+    /// grant is deleted but while its hook waits to tell the room. Bob must still be removed.
+    #[tokio::test]
+    async fn cancelled_revoke_still_removes_the_person() {
+        let test = TestDb::create().await;
+        let db = test.db.clone();
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_for(&test, dir.path());
+        let ann = account(&db, "Ann").await;
+        let bob = account(&db, "Bob").await;
+        let doc = DocId(Uuid::new_v4());
+        db.create_document(ann, doc, "Plan.txt").await.unwrap();
+        db.set_access(ann, doc, bob, Some(Role::Editor))
+            .await
+            .unwrap();
+        let room = state.open_room(doc, "Plan.txt".into());
+        let (tx, mut out) = mpsc::channel(OUTBOUND_CAPACITY);
+        let (accepted, reply) = oneshot::channel();
+        room.commands
+            .send(Command::Join {
+                conn: 1,
+                client: ClientId(Uuid::new_v4()),
+                user: bob,
+                session: SessionId(Uuid::new_v4()),
+                name: "Bob".into(),
+                role: Role::Editor,
+                resume: None,
+                tx,
+                accepted,
+            })
+            .await
+            .unwrap();
+        assert_eq!(reply.await.unwrap(), JoinReply::Accepted);
+
+        // Held so that the hook waits after the grant is deleted.
+        let held = state.rooms().order_access(doc).await;
+        let mut request = Box::pin(docs::change_access(state.clone(), ann, doc, bob, None));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            tokio::select! {
+                _ = &mut request => panic!("the request finished while the hook could not run"),
+                () = tokio::time::sleep(Duration::from_millis(20)) => {}
+            }
+            if db.role(bob, doc).await.unwrap().is_none() {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "the grant was never deleted");
+        }
+        // The caller goes away.
+        drop(request);
+        drop(held);
+
+        let removed = encode_removed(protocol::RemovedReason::AccessRevoked);
+        loop {
+            let next = tokio::time::timeout(Duration::from_secs(5), out.recv())
+                .await
+                .expect("Bob was not removed");
+            let frames = match next {
+                Some(Outbound::One(f)) => vec![f],
+                Some(Outbound::Many(fs)) => fs,
+                None => panic!("Bob's connection ended without Removed"),
+            };
+            if frames.iter().any(|f| f.as_str() == removed) {
+                break;
+            }
+        }
+    }
+
+    fn encode_removed(reason: protocol::RemovedReason) -> String {
+        serde_json::to_string(&ServerMsg::<TextOp>::Removed { reason }).unwrap()
+    }
+
     /// Two changes to Bob's role are stored one after the other, but the hook of the first
     /// is slower: it has read the role and not yet told the room when the second change is
     /// stored and its hook runs. The room must end with the role stored last.
@@ -281,17 +384,7 @@ mod tests {
         let test = TestDb::create().await;
         let db = test.db.clone();
         let dir = tempfile::tempdir().unwrap();
-        let config = Config {
-            addr: "127.0.0.1:0".parse().unwrap(),
-            data_dir: dir.path().to_path_buf(),
-            web_dir: dir.path().join("web"),
-            checkpoint_idle: Duration::from_secs(600),
-            checkpoint_max: Duration::from_secs(600),
-            room_grace: Duration::from_secs(60),
-            database_url: DatabaseUrl::new(test.url()),
-        };
-        let store = RevisionStore::open(&crate::library_path(dir.path())).unwrap();
-        let state = AppState::new(config, Arc::new(store), db.clone());
+        let state = state_for(&test, dir.path());
         let ann = account(&db, "Ann").await;
         let bob = account(&db, "Bob").await;
         let doc = DocId(Uuid::new_v4());
