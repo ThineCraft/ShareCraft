@@ -38,6 +38,12 @@ let refused = false;    // a change was refused and the socket is being renewed
 let pendingClose = null; // a socket that closed during a composition, handled when it ends
 let canEdit = false;   // the server says this person may change the text
 let removedReason = ''; // set once the server removed this page: no reconnecting
+// Declared here, before anything below runs: setRole() is called while the module is still
+// loading, and it reaches showAccess().
+let roleCheck = 0;      // the latest role request; older answers are dropped
+let accessCheck = 0;    // the latest access-list request; older answers are dropped
+let checking = false;   // a still-allowed check is in flight
+let closedBeforeJoin = 0; // closes in a row, before joining, while the document stayed open
 
 // Another document was chosen by editing the address.
 addEventListener('hashchange', () => location.reload());
@@ -97,7 +103,6 @@ function setRole(role) {
 
 // Asks the server what this person's role is now (their rights changed) and shows or hides
 // the Share panel to match.
-let roleCheck = 0;
 async function refreshRole() {
   const check = ++roleCheck;
   const result = await api('GET', `/docs/${seg(docId)}`);
@@ -110,7 +115,6 @@ async function refreshRole() {
   }
 }
 
-let accessCheck = 0;
 async function showAccess() {
   const check = ++accessCheck;
   const result = await api('GET', `/docs/${seg(docId)}/access`);
@@ -268,8 +272,6 @@ function closed(ws) {
 }
 
 // A reconnect that fails before joining may mean the access or session is gone.
-let checking = false;
-let closedBeforeJoin = 0; // closes in a row, before joining, while the document stayed open
 async function checkStillAllowed() {
   if (checking) return;
   checking = true;
