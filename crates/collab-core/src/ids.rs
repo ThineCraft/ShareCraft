@@ -8,6 +8,16 @@ use uuid::Uuid;
 #[serde(transparent)]
 pub struct DocId(pub Uuid);
 
+/// Identifies one account.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct UserId(pub Uuid);
+
+/// Identifies one sign-in session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SessionId(pub Uuid);
+
 /// Identifies one client instance (in the browser, one page load), kept across its
 /// reconnects; chosen by the client.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -52,6 +62,14 @@ mod tests {
     fn ids_serialize_as_plain_strings() {
         assert_eq!(
             serde_json::to_string(&DocId(Uuid::nil())).unwrap(),
+            "\"00000000-0000-0000-0000-000000000000\""
+        );
+        assert_eq!(
+            serde_json::to_string(&UserId(Uuid::nil())).unwrap(),
+            "\"00000000-0000-0000-0000-000000000000\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SessionId(Uuid::nil())).unwrap(),
             "\"00000000-0000-0000-0000-000000000000\""
         );
         assert_eq!(serde_json::to_string(&Seq(7)).unwrap(), "7");
