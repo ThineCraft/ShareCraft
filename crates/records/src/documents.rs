@@ -296,9 +296,9 @@ impl Db {
     /// `actor` must be an owner. Returns the person's role before and after, as `role` would
     /// report it (an administrator stays `Owner` either way).
     ///
-    /// The actor's permission is judged on the data as it was when the call began; the change
-    /// itself runs with the document locked, so concurrent changes take turns and the last
-    /// owner grant cannot be removed by two calls at once.
+    /// The actor's permission is decided with the document locked, so concurrent changes take
+    /// turns, an owner removed by an earlier change gets `NotFound`, and the last owner grant
+    /// cannot be removed by two calls at once.
     pub async fn set_access(
         &self,
         actor: UserId,
@@ -307,6 +307,8 @@ impl Db {
         role: Option<Role>,
     ) -> Result<(Option<Role>, Option<Role>), AccessError> {
         let mut tx = self.pool().begin().await?;
+        // Cheap early refusal so that people with no access never wait for the lock. Not
+        // authoritative: the check under the lock below is.
         require_owner(&mut tx, actor, doc).await?;
         // The document row is the one lock every access change takes first, so changes to
         // one document are serialised and cannot deadlock.
@@ -318,6 +320,9 @@ impl Db {
         if locked.is_none() {
             return Err(AccessError::NotFound);
         }
+        // Authoritative: judged with the document locked, so an owner removed by a call that
+        // just committed cannot make one more change.
+        require_owner(&mut tx, actor, doc).await?;
         let exists: Option<Uuid> = sqlx::query_scalar("select id from users where id = $1")
             .bind(user.0)
             .fetch_optional(&mut *tx)

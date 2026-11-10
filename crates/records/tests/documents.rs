@@ -268,8 +268,8 @@ async fn two_removals_racing_leave_one_owner() {
         .await
         .unwrap();
     for round in 0..10 {
-        // Hold the document's lock while both calls start, so that both have passed their
-        // permission check and are queued behind it; they then run strictly one after the
+        // Hold the document's lock while both calls start, so that both have started
+        // and are queued behind it; they then run strictly one after the
         // other, whatever the scheduler does.
         let mut gate = test.db.test_pool().begin().await.unwrap();
         sqlx::query("select id from documents where id = $1 for update")
@@ -297,11 +297,14 @@ async fn two_removals_racing_leave_one_owner() {
         assert!(waiting >= 2, "round {round}: both calls should be waiting");
         gate.commit().await.unwrap();
         let results = [a.await.unwrap(), b.await.unwrap()];
+        // The calls take turns. The loser was an owner when it started, but the winner has
+        // removed it by the time it holds the lock, so it is refused as someone with no access
+        // (it must not get to make one more change). LastOwner would also be acceptable.
+        let allowed = results.iter().filter(|r| r.is_ok()).count();
         let refused = results
             .iter()
-            .filter(|r| **r == Err(AccessError::LastOwner))
+            .filter(|r| matches!(r, Err(AccessError::NotFound | AccessError::LastOwner)))
             .count();
-        let allowed = results.iter().filter(|r| r.is_ok()).count();
         assert_eq!((allowed, refused), (1, 1), "round {round}: {results:?}");
         let ann_has = test.db.role(ann.id, id).await.unwrap().is_some();
         let bob_has = test.db.role(bob.id, id).await.unwrap().is_some();
