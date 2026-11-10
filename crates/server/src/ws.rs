@@ -4,21 +4,22 @@
 use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use collab_core::ids::{ClientId, DocId};
+use collab_core::ids::{ClientId, DocId, SessionId, UserId};
 use collab_text::TextOp;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use protocol::{ClientMsg, Resume};
-use serde::Deserialize;
+use records::Role;
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::AppState;
-use crate::auth::same_origin;
-use crate::room::{Command, ConnId, DEFAULT_NAME, JoinReply, OUTBOUND_CAPACITY, Outbound};
+use crate::api::ApiError;
+use crate::auth::{Signed, same_origin};
+use crate::room::{Command, ConnId, JoinReply, OUTBOUND_CAPACITY, Outbound};
 
 /// Largest frame or message accepted from a client.
 const MAX_MESSAGE: usize = 1024 * 1024;
@@ -26,21 +27,27 @@ const MAX_MESSAGE: usize = 1024 * 1024;
 const JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often a join is retried when the room it found was just ending.
 const JOIN_ATTEMPTS: usize = 3;
-/// Longest display name, in characters.
-const MAX_NAME: usize = 60;
 
-/// Query parameters of `/ws/docs/{doc_id}`.
-#[derive(Debug, Deserialize)]
-pub(crate) struct JoinParams {
-    name: Option<String>,
+/// Who a connection belongs to and what they may do, decided before the upgrade.
+struct Visitor {
+    user: UserId,
+    session: SessionId,
+    /// The account's name, shown to the others and credited in checkpoints.
+    name: String,
+    role: Role,
+    /// The document's name, which a room opened for this connection stores checkpoints under.
+    doc_name: String,
 }
 
-/// `GET /ws/docs/{doc_id}?name=...`: upgrades to a WebSocket connected to that document.
+/// `GET /ws/docs/{doc_id}`: upgrades to a WebSocket connected to that document. The caller is
+/// the signed-in person (`401` without a session) and needs a role on the document; a document
+/// that does not exist and one they have no role on are both `404`. Any query string, such as
+/// the `name` older pages send, is ignored.
 pub(crate) async fn upgrade(
     State(state): State<AppState>,
     Path(doc_id): Path<String>,
-    Query(params): Query<JoinParams>,
     headers: HeaderMap,
+    signed: Result<Signed, ApiError>,
     ws: WebSocketUpgrade,
 ) -> Response {
     if !same_origin(&headers) {
@@ -53,31 +60,51 @@ pub(crate) async fn upgrade(
     let Ok(id) = Uuid::parse_str(&doc_id) else {
         return (StatusCode::BAD_REQUEST, "invalid document id").into_response();
     };
-    let name = display_name(params.name.as_deref());
+    let doc = DocId(id);
+    let visitor = match visitor(&state, signed, doc).await {
+        Ok(visitor) => visitor,
+        Err(e) => return e.into_response(),
+    };
     ws.max_message_size(MAX_MESSAGE)
         .max_frame_size(MAX_MESSAGE)
-        .on_upgrade(move |socket| connection(state, DocId(id), name, socket))
+        .on_upgrade(move |socket| connection(state, doc, visitor, socket))
 }
 
-/// Trims `raw`, keeps at most 60 characters and falls back to "Guest".
-fn display_name(raw: Option<&str>) -> String {
-    let kept: String = raw.unwrap_or("").trim().chars().take(MAX_NAME).collect();
-    let kept = kept.trim_end();
-    if kept.is_empty() {
-        DEFAULT_NAME.to_owned()
-    } else {
-        kept.to_owned()
-    }
+/// The signed-in caller with their role on `doc` and the document's name.
+async fn visitor(
+    state: &AppState,
+    signed: Result<Signed, ApiError>,
+    doc: DocId,
+) -> Result<Visitor, ApiError> {
+    let session = signed?.session;
+    let db = state.db();
+    let role = db
+        .role(session.user.id, doc)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?
+        .ok_or(ApiError::NotFound)?;
+    let document = db
+        .document(doc)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?
+        .ok_or(ApiError::NotFound)?;
+    Ok(Visitor {
+        user: session.user.id,
+        session: session.id,
+        name: session.user.name,
+        role,
+        doc_name: document.name,
+    })
 }
 
 type Sink = SplitSink<WebSocket, Message>;
 type Stream = SplitStream<WebSocket>;
 
-async fn connection(state: AppState, doc: DocId, name: String, socket: WebSocket) {
+async fn connection(state: AppState, doc: DocId, visitor: Visitor, socket: WebSocket) {
     let (mut sink, mut stream) = socket.split();
     if let Some((client, resume)) = first_join(&mut stream).await {
         let conn = state.next_conn();
-        if let Some((room, out_rx)) = join_room(&state, doc, conn, client, name, resume).await {
+        if let Some((room, out_rx)) = join_room(&state, doc, conn, client, &visitor, resume).await {
             relay(&mut sink, &mut stream, &room, out_rx, conn, client).await;
             // The room ignores this if it already dropped or replaced the connection.
             let _ = room.send(Command::Leave { conn, client }).await;
@@ -113,17 +140,20 @@ async fn join_room(
     doc: DocId,
     conn: ConnId,
     client: ClientId,
-    name: String,
+    visitor: &Visitor,
     resume: Option<Resume>,
 ) -> Option<(mpsc::Sender<Command>, mpsc::Receiver<Outbound>)> {
     for _ in 0..JOIN_ATTEMPTS {
-        let room = state.open_room(doc);
+        let room = state.open_room(doc, visitor.doc_name.clone());
         let (tx, out_rx) = mpsc::channel(OUTBOUND_CAPACITY);
         let (accepted, was_accepted) = oneshot::channel();
         let join = Command::Join {
             conn,
             client,
-            name: name.clone(),
+            user: visitor.user,
+            session: visitor.session,
+            name: visitor.name.clone(),
+            role: visitor.role,
             resume,
             tx,
             accepted,
@@ -196,25 +226,5 @@ async fn write(sink: &mut Sink, out: Outbound) -> Result<(), axum::Error> {
             }
             sink.flush().await
         }
-    }
-}
-
-#[cfg(test)]
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing
-)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn names_are_trimmed_limited_and_defaulted() {
-        assert_eq!(display_name(None), "Guest");
-        assert_eq!(display_name(Some("   ")), "Guest");
-        assert_eq!(display_name(Some("  Ann  ")), "Ann");
-        let long = "é".repeat(80);
-        assert_eq!(display_name(Some(&long)).chars().count(), 60);
     }
 }

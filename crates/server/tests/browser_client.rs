@@ -11,55 +11,51 @@
 
 mod common;
 
-use std::net::SocketAddr;
-
 use collab_core::ids::{ClientId, DocId};
-use common::{StoppableServer, TIMEOUT, new_doc, spawn_server, wait_stored, wait_stored_in};
+use common::{
+    Site, Socket, StoppableServer, TIMEOUT, TestUser, new_doc, open_socket, spawn_server,
+    wait_stored, wait_stored_in,
+};
 use futures_util::{SinkExt, StreamExt};
 use revisions::RevisionStore;
-use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use uuid::Uuid;
 use web_client::{ClientInner, ResetKind, Update};
-
-type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 /// One page: a socket plus the browser's client.
 struct Page {
     client: ClientInner,
     doc: DocId,
-    name: String,
+    /// The signed-in account; its cookie goes with every socket the page opens.
+    user: TestUser,
     socket: Option<Socket>,
     /// Every update the client produced, in order.
     updates: Vec<Update>,
 }
 
 impl Page {
-    /// Opens the page on `doc` at `addr` and waits for the join to be answered.
-    async fn open(addr: SocketAddr, doc: DocId, name: &str) -> Page {
+    /// Signs in the account named `name`, makes sure it has a role on `doc`, opens the page
+    /// on `site` and waits for the join to be answered.
+    async fn open(site: &Site, doc: DocId, name: &str) -> Page {
+        let user = site.user(name).await;
+        site.give_access(doc, &user).await;
         let mut page = Page {
             client: ClientInner::new(ClientId(Uuid::new_v4())),
             doc,
-            name: name.to_owned(),
+            user,
             socket: None,
             updates: Vec::new(),
         };
-        page.connect(addr).await;
+        page.connect(site).await;
         page
     }
 
-    /// Opens a socket to `addr`, sends the client's join as the page does on `open`, and
-    /// waits for the answer. Returns the update the answer produced.
-    async fn connect(&mut self, addr: SocketAddr) -> Update {
-        let url = format!("ws://{addr}/ws/docs/{}?name={}", self.doc.0, self.name);
-        let (socket, _) = tokio::time::timeout(TIMEOUT, tokio_tungstenite::connect_async(url))
-            .await
-            .expect("connect timed out")
-            .unwrap();
-        self.socket = Some(socket);
+    /// Opens a socket to `site` with the page's cookie, sends the client's join as the page
+    /// does on `open`, and waits for the answer. Returns the update the answer produced.
+    async fn connect(&mut self, site: &Site) -> Update {
+        self.socket = Some(open_socket(site.addr, self.doc, &self.user).await);
         let join = self.client.join_message().unwrap();
-        self.send(Some(join)).await;
+        self.send(join).await;
         let before = self.updates.len();
         self.pump_until(|p| p.client.joined()).await;
         self.updates[before].clone()
@@ -121,8 +117,8 @@ fn utf16_after(text: &str, needle: &str) -> usize {
 async fn browser_clients_converge_on_concurrent_typing_with_emoji() {
     let server = spawn_server().await;
     let doc = new_doc();
-    let mut a = Page::open(server.addr, doc, "Ann").await;
-    let mut b = Page::open(server.addr, doc, "Bob").await;
+    let mut a = Page::open(&server, doc, "Ann").await;
+    let mut b = Page::open(&server, doc, "Bob").await;
     a.edit(0, 0, "a😀b").await;
     b.edit(0, 0, "hi").await;
     a.pump_until(|p| p.client.pending() == 0 && p.text().contains("hi"))
@@ -144,7 +140,7 @@ async fn browser_clients_converge_on_concurrent_typing_with_emoji() {
 async fn browser_solo_disconnect_resumes_without_losing_typing() {
     let server = spawn_server().await;
     let doc = new_doc();
-    let mut a = Page::open(server.addr, doc, "Ann").await;
+    let mut a = Page::open(&server, doc, "Ann").await;
     a.edit(0, 0, "abc").await;
     a.pump_until(|p| p.client.pending() == 0).await;
     a.disconnect();
@@ -155,13 +151,13 @@ async fn browser_solo_disconnect_resumes_without_losing_typing() {
     a.edit(3, 0, "def").await;
     a.edit(6, 0, "!").await;
     assert_eq!(a.client.pending(), 2);
-    let answer = a.connect(server.addr).await;
+    let answer = a.connect(&server).await;
     assert_eq!(answer.reset, None, "{answer:?}");
     assert_eq!(answer.dropped, 0);
     a.pump_until(|p| p.client.pending() == 0).await;
     assert_eq!(a.text(), "abcdef!");
 
-    let b = Page::open(server.addr, doc, "Bob").await;
+    let b = Page::open(&server, doc, "Bob").await;
     assert_eq!(b.text(), "abcdef!");
 }
 
@@ -175,14 +171,14 @@ async fn browser_reports_text_lost_in_a_server_restart() {
     let slow = |c: &mut server::Config| c.checkpoint_idle = std::time::Duration::from_secs(600);
     let mut first = StoppableServer::start(data_dir.path(), &db, slow);
     let doc = new_doc();
-    let mut a = Page::open(first.addr, doc, "Ann").await;
+    let mut a = Page::open(&first, doc, "Ann").await;
     a.edit(0, 0, "saved").await;
     a.pump_until(|p| p.client.pending() == 0).await;
     a.disconnect();
     wait_stored_in(&library, doc, "saved").await;
 
     // Back in the same room: this text is confirmed but never saved.
-    let answer = a.connect(first.addr).await;
+    let answer = a.connect(&first).await;
     assert_eq!(answer.reset, None, "{answer:?}");
     a.edit(5, 0, " and lost").await;
     a.pump_until(|p| p.client.pending() == 0).await;
@@ -191,7 +187,7 @@ async fn browser_reports_text_lost_in_a_server_restart() {
     first.stop();
     a.disconnect();
     let second = StoppableServer::start(data_dir.path(), &db, slow);
-    let answer = a.connect(second.addr).await;
+    let answer = a.connect(&second).await;
     assert_eq!(
         answer.reset,
         Some(ResetKind::ReopenedLostText),

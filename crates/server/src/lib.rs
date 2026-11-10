@@ -85,15 +85,21 @@ impl AppState {
         self.shared.next_conn.fetch_add(1, Ordering::Relaxed)
     }
 
-    fn open_room(&self, doc: DocId) -> mpsc::Sender<Command> {
+    /// The command channel of `doc`'s room, opening it if needed; `name` is the document's
+    /// name, which a newly opened room stores its checkpoints under.
+    fn open_room(&self, doc: DocId, name: String) -> mpsc::Sender<Command> {
         let config = &self.shared.config;
         let timing = Timing {
             idle: config.checkpoint_idle,
             max: config.checkpoint_max,
         };
-        self.shared
-            .rooms
-            .open(doc, &self.shared.checkpointer, timing, config.room_grace)
+        self.shared.rooms.open(
+            doc,
+            name,
+            &self.shared.checkpointer,
+            timing,
+            config.room_grace,
+        )
     }
 }
 
@@ -101,7 +107,8 @@ impl AppState {
 /// - `GET /healthz` answers `ok`;
 /// - `POST /api/session` signs in, `DELETE /api/session` signs out, `GET /api/me` names the
 ///   signed-in account;
-/// - `GET /ws/docs/{doc_id}?name=<display name>` opens a document session;
+/// - `GET /ws/docs/{doc_id}` opens a document session for a signed-in person with a role on
+///   the document;
 /// - anything else is a static file from `web_dir`.
 pub fn router(state: AppState) -> Router {
     let files = ServeDir::new(&state.config().web_dir);

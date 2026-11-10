@@ -26,8 +26,8 @@ use uuid::Uuid;
 async fn two_clients_see_each_other() {
     let server = spawn_server().await;
     let doc = new_doc();
-    let mut a = TestClient::connect(server.addr, doc, "Ann").await;
-    let mut b = TestClient::connect(server.addr, doc, "Bob").await;
+    let mut a = TestClient::connect(&server, doc, "Ann").await;
+    let mut b = TestClient::connect(&server, doc, "Bob").await;
     a.pump_until(|c| c.people().len() == 2).await;
     b.pump_until(|c| c.people().len() == 2).await;
     let mut names = a.people();
@@ -39,8 +39,8 @@ async fn two_clients_see_each_other() {
 async fn concurrent_typing_converges() {
     let server = spawn_server().await;
     let doc = new_doc();
-    let mut a = TestClient::connect(server.addr, doc, "A").await;
-    let mut b = TestClient::connect(server.addr, doc, "B").await;
+    let mut a = TestClient::connect(&server, doc, "A").await;
+    let mut b = TestClient::connect(&server, doc, "B").await;
     a.type_at(0, "hello ").await;
     b.type_at(0, "world").await;
     a.pump_until(|c| c.pending() == 0 && c.seq() == Seq(2))
@@ -56,8 +56,8 @@ async fn concurrent_typing_converges() {
 async fn astral_text_round_trips() {
     let server = spawn_server().await;
     let doc = new_doc();
-    let mut a = TestClient::connect(server.addr, doc, "A").await;
-    let mut b = TestClient::connect(server.addr, doc, "B").await;
+    let mut a = TestClient::connect(&server, doc, "A").await;
+    let mut b = TestClient::connect(&server, doc, "B").await;
     a.type_at(0, "😀").await;
     b.pump_until(|c| c.seq() == Seq(1)).await;
     assert_eq!(b.text(), "😀");
@@ -71,8 +71,8 @@ async fn astral_text_round_trips() {
 async fn reconnect_resends_without_duplicating() {
     let server = spawn_server().await;
     let doc = new_doc();
-    let mut a = TestClient::connect(server.addr, doc, "A").await;
-    let mut b = TestClient::connect(server.addr, doc, "B").await;
+    let mut a = TestClient::connect(&server, doc, "A").await;
+    let mut b = TestClient::connect(&server, doc, "B").await;
     a.type_at(0, "abc").await;
     // Once B sees the change the server has committed it; A has not read its confirmation.
     b.pump_until(|c| c.text() == "abc").await;
@@ -116,7 +116,7 @@ async fn unknown_since_gets_reset() {
         epoch: RoomEpoch(Uuid::new_v4()),
         seq: Seq(40),
     };
-    let mut c = TestClient::connect_with_resume(server.addr, new_doc(), "C", Some(resume)).await;
+    let mut c = TestClient::connect_with_resume(&server, new_doc(), "C", Some(resume)).await;
     c.pump_until(|c| c.joined).await;
     assert!(
         matches!(
@@ -132,7 +132,7 @@ async fn unknown_since_gets_reset() {
 async fn solo_disconnect_resumes_without_losing_typing() {
     let server = spawn_server().await;
     let doc = new_doc();
-    let mut a = TestClient::connect(server.addr, doc, "A").await;
+    let mut a = TestClient::connect(&server, doc, "A").await;
     a.type_at(0, "abc").await;
     a.pump_until(|c| c.seq() == Seq(1) && c.pending() == 0)
         .await;
@@ -155,7 +155,7 @@ async fn solo_disconnect_resumes_without_losing_typing() {
         .await;
     assert_eq!(a.text(), "abcdef!");
 
-    let c = TestClient::connect(server.addr, doc, "C").await;
+    let c = TestClient::connect(&server, doc, "C").await;
     assert_eq!(c.text(), "abcdef!");
 }
 
@@ -163,7 +163,7 @@ async fn solo_disconnect_resumes_without_losing_typing() {
 async fn room_ends_after_grace_period() {
     let server = spawn_server_config(|c| c.room_grace = SHORT_GRACE).await;
     let doc = new_doc();
-    let mut a = TestClient::connect(server.addr, doc, "A").await;
+    let mut a = TestClient::connect(&server, doc, "A").await;
     a.type_at(0, "abc").await;
     a.pump_until(|c| c.seq() == Seq(1) && c.pending() == 0)
         .await;
@@ -186,7 +186,7 @@ async fn room_ends_after_grace_period() {
 async fn resume_into_a_new_room_gets_reset() {
     let server = spawn_server_config(|c| c.room_grace = SHORT_GRACE).await;
     let doc = new_doc();
-    let mut a = TestClient::connect(server.addr, doc, "A").await;
+    let mut a = TestClient::connect(&server, doc, "A").await;
     a.type_at(0, "x").await;
     a.pump_until(|c| c.seq() == Seq(1) && c.pending() == 0)
         .await;
@@ -200,7 +200,7 @@ async fn resume_into_a_new_room_gets_reset() {
     // period.
     wait_stored(&server, doc, "xy").await;
     wait_out_grace().await;
-    let mut c = TestClient::connect(server.addr, doc, "C").await;
+    let mut c = TestClient::connect(&server, doc, "C").await;
     assert_ne!(c.epoch, old_epoch, "old room never ended");
     // The old room saved A's text before ending; the new one loads it.
     assert_eq!(c.text(), "xy");
@@ -227,7 +227,7 @@ async fn resume_into_a_new_room_gets_reset() {
 #[tokio::test]
 async fn cross_site_origin_is_refused() {
     let server = spawn_server().await;
-    let status = handshake_status(server.addr, &[("Origin", "http://evil.example")]).await;
+    let status = handshake_status(&server, &[("Origin", "http://evil.example")]).await;
     assert_eq!(status, 403);
 }
 
@@ -235,45 +235,41 @@ async fn cross_site_origin_is_refused() {
 async fn same_origin_is_accepted() {
     let server = spawn_server().await;
     let origin = format!("http://{}", server.addr);
-    let status = handshake_status(server.addr, &[("Origin", &origin)]).await;
+    let status = handshake_status(&server, &[("Origin", &origin)]).await;
     assert_eq!(status, 101);
 }
 
 #[tokio::test]
 async fn non_loopback_host_header_is_refused() {
     let server = spawn_server().await;
-    let status = handshake_status(server.addr, &[("Host", "evil.example:8787")]).await;
+    let status = handshake_status(&server, &[("Host", "evil.example:8787")]).await;
     assert_eq!(status, 403);
 }
 
-/// Attempts a WebSocket handshake with extra headers and returns the HTTP status.
-async fn handshake_status(addr: std::net::SocketAddr, headers: &[(&str, &str)]) -> u16 {
-    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+/// Attempts a WebSocket handshake to a document a signed-in person may open, with their cookie
+/// and the extra headers, and returns the HTTP status.
+async fn handshake_status(server: &common::TestServer, headers: &[(&str, &str)]) -> u16 {
     use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
-    let url = format!("ws://{addr}/ws/docs/{}?name=X", new_doc().0);
-    let mut request = url.into_client_request().unwrap();
+    let ann = server.user("Ann").await;
+    let doc = new_doc();
+    server.give_access(doc, &ann).await;
+    let path = format!("/ws/docs/{}", doc.0);
+    let mut request = common::ws_request(server.addr, &path, Some(&ann.cookie));
     for (name, value) in headers {
         request.headers_mut().insert(
             HeaderName::from_bytes(name.as_bytes()).unwrap(),
             HeaderValue::from_str(value).unwrap(),
         );
     }
-    let result = tokio::time::timeout(common::TIMEOUT, tokio_tungstenite::connect_async(request))
-        .await
-        .unwrap();
-    match result {
-        Ok((_, response)) => response.status().as_u16(),
-        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => response.status().as_u16(),
-        Err(other) => panic!("unexpected error {other:?}"),
-    }
+    common::handshake_status(request).await
 }
 
 #[tokio::test]
 async fn invalid_op_is_refused_and_room_survives() {
     let server = spawn_server().await;
     let doc = new_doc();
-    let mut a = TestClient::connect(server.addr, doc, "A").await;
-    let mut b = TestClient::connect(server.addr, doc, "B").await;
+    let mut a = TestClient::connect(&server, doc, "A").await;
+    let mut b = TestClient::connect(&server, doc, "B").await;
     let bad = OpId(Uuid::new_v4());
     // Expects a five-character document; the document is empty.
     a.send(&ClientMsg::Submit {
@@ -301,8 +297,8 @@ async fn invalid_op_is_refused_and_room_survives() {
 async fn garbage_frame_closes_only_that_connection() {
     let server = spawn_server().await;
     let doc = new_doc();
-    let mut a = TestClient::connect(server.addr, doc, "A").await;
-    let mut b = TestClient::connect(server.addr, doc, "B").await;
+    let mut a = TestClient::connect(&server, doc, "A").await;
+    let mut b = TestClient::connect(&server, doc, "B").await;
     a.send_raw(Message::text("not json")).await;
     a.wait_closed().await;
 
@@ -317,8 +313,8 @@ async fn garbage_frame_closes_only_that_connection() {
 async fn oversized_frame_closes_only_that_connection() {
     let server = spawn_server().await;
     let doc = new_doc();
-    let mut a = TestClient::connect(server.addr, doc, "A").await;
-    let mut b = TestClient::connect(server.addr, doc, "B").await;
+    let mut a = TestClient::connect(&server, doc, "A").await;
+    let mut b = TestClient::connect(&server, doc, "B").await;
     let big = "x".repeat(1024 * 1024 + 1);
     // The server may reset the connection while the frame is still being written.
     let socket_send = tokio::time::timeout(common::TIMEOUT, a.send_raw_lossy(Message::text(big)));
@@ -333,8 +329,10 @@ async fn oversized_frame_closes_only_that_connection() {
 #[tokio::test]
 async fn message_before_join_closes_connection() {
     let server = spawn_server().await;
-    let url = format!("ws://{}/ws/docs/{}?name=X", server.addr, new_doc().0);
-    let (mut socket, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let ann = server.user("Ann").await;
+    let doc = new_doc();
+    server.give_access(doc, &ann).await;
+    let mut socket = common::open_socket(server.addr, doc, &ann).await;
     let cursor = serde_json::to_string(&ClientMsg::<TextOp>::Cursor { at: Some(1) }).unwrap();
     futures_util::SinkExt::send(&mut socket, Message::text(cursor))
         .await
@@ -355,8 +353,8 @@ async fn message_before_join_closes_connection() {
 async fn cursor_is_relayed_and_oversized_cursor_dropped() {
     let server = spawn_server().await;
     let doc = new_doc();
-    let mut a = TestClient::connect(server.addr, doc, "A").await;
-    let mut b = TestClient::connect(server.addr, doc, "B").await;
+    let mut a = TestClient::connect(&server, doc, "A").await;
+    let mut b = TestClient::connect(&server, doc, "B").await;
     let a_id = a.client();
     a.send(&ClientMsg::Cursor {
         at: Some(10_000_001),
@@ -422,8 +420,8 @@ fn open_store(path: &std::path::Path) -> RevisionStore {
 async fn idle_session_is_checkpointed() {
     let server = spawn_server().await;
     let doc = new_doc();
-    let mut a = TestClient::connect(server.addr, doc, "Ann").await;
-    let mut b = TestClient::connect(server.addr, doc, "Bob").await;
+    let mut a = TestClient::connect(&server, doc, "Ann").await;
+    let mut b = TestClient::connect(&server, doc, "Bob").await;
     a.type_at(0, "hello ").await;
     b.type_at(0, "world").await;
     a.pump_until(|c| c.pending() == 0 && c.seq() == Seq(2))
@@ -454,15 +452,15 @@ async fn idle_session_is_checkpointed() {
         .map(|p| p.id.clone())
         .collect();
     ids.sort();
-    let mut expected = vec![a.client().0.to_string(), b.client().0.to_string()];
+    let mut expected = vec![a.user.id.0.to_string(), b.user.id.0.to_string()];
     expected.sort();
     assert_eq!(ids, expected);
 }
 
 /// Two clients type, the room saves, both leave; returns the saved text and revision.
 async fn type_save_and_leave(server: &common::TestServer, doc: DocId) -> (String, String) {
-    let mut a = TestClient::connect(server.addr, doc, "Ann").await;
-    let mut b = TestClient::connect(server.addr, doc, "Bob").await;
+    let mut a = TestClient::connect(server, doc, "Ann").await;
+    let mut b = TestClient::connect(server, doc, "Bob").await;
     a.type_at(0, "abc").await;
     a.pump_until(|c| c.pending() == 0 && c.seq() == Seq(1))
         .await;
@@ -486,7 +484,7 @@ async fn reopening_loads_the_saved_text() {
     // The room ends, so the next join opens a new one that loads the saved revision.
     wait_out_grace().await;
 
-    let c = TestClient::connect(server.addr, doc, "Cy").await;
+    let c = TestClient::connect(&server, doc, "Cy").await;
     assert_eq!(c.text(), "abcdef");
     assert!(
         matches!(
@@ -506,7 +504,7 @@ async fn typing_resumes_from_saved_revision() {
     let (_, first) = type_save_and_leave(&server, doc).await;
     wait_out_grace().await;
 
-    let mut c = TestClient::connect(server.addr, doc, "Cy").await;
+    let mut c = TestClient::connect(&server, doc, "Cy").await;
     assert_eq!(c.joined_revision(), Some(first.clone()));
     let end = c.text().chars().count();
     c.type_at(end, "!").await;
@@ -555,8 +553,8 @@ async fn failed_checkpoint_is_retried_and_reported() {
     })
     .await;
     let doc = new_doc();
-    let mut a = TestClient::connect(server.addr, doc, "Ann").await;
-    let mut b = TestClient::connect(server.addr, doc, "Bob").await;
+    let mut a = TestClient::connect(&server, doc, "Ann").await;
+    let mut b = TestClient::connect(&server, doc, "Bob").await;
     a.type_at(0, "one").await;
     a.pump_until(|c| c.pending() == 0 && c.seq() == Seq(1))
         .await;
@@ -606,14 +604,14 @@ async fn final_checkpoint_outlasts_grace_period() {
     )
     .await;
     let doc = new_doc();
-    let mut a = TestClient::connect(server.addr, doc, "Ann").await;
+    let mut a = TestClient::connect(&server, doc, "Ann").await;
     a.type_at(0, "keep").await;
     a.pump_until(|c| c.pending() == 0 && c.seq() == Seq(1))
         .await;
     a.close().await;
     wait_stored(&server, doc, "keep").await;
     wait_out_grace().await;
-    let b = TestClient::connect(server.addr, doc, "Bob").await;
+    let b = TestClient::connect(&server, doc, "Bob").await;
     assert_eq!(b.text(), "keep");
 }
 
@@ -621,7 +619,7 @@ async fn final_checkpoint_outlasts_grace_period() {
 async fn no_commit_per_change() {
     let server = spawn_server().await;
     let doc = new_doc();
-    let mut a = TestClient::connect(server.addr, doc, "Ann").await;
+    let mut a = TestClient::connect(&server, doc, "Ann").await;
     for n in 0..50u64 {
         a.type_at(usize::try_from(n).unwrap(), "x").await;
         a.pump_until(|c| c.pending() == 0 && c.seq() == Seq(n + 1))
@@ -637,8 +635,8 @@ async fn no_commit_per_change() {
 async fn brief_disconnect_after_checkpoint_resumes_without_reset() {
     let server = spawn_server().await;
     let doc = new_doc();
-    let mut a = TestClient::connect(server.addr, doc, "A").await;
-    let mut b = TestClient::connect(server.addr, doc, "B").await;
+    let mut a = TestClient::connect(&server, doc, "A").await;
+    let mut b = TestClient::connect(&server, doc, "B").await;
     a.type_at(0, "abc").await;
     // A has not read the confirmation, so it still resumes from seq 0.
     b.pump_until(|c| c.text() == "abc").await;
@@ -685,7 +683,7 @@ async fn load_failure_refuses_join_and_does_not_overwrite() {
     let server = spawn_server_with(move |_| shared).await;
     let doc = new_doc();
     for attempt in 1..=2 {
-        let mut c = TestClient::connect_with_resume(server.addr, doc, "C", None).await;
+        let mut c = TestClient::connect_with_resume(&server, doc, "C", None).await;
         c.wait_closed().await;
         assert!(!c.joined, "{:?}", c.received);
         assert!(
@@ -705,9 +703,11 @@ async fn load_failure_refuses_join_and_does_not_overwrite() {
 async fn awkward_display_name_does_not_block_saving() {
     let server = spawn_server().await;
     let doc = new_doc();
-    // "<Ann>\nX", percent-encoded in the query string.
-    let mut a = TestClient::connect(server.addr, doc, "%3CAnn%3E%0AX").await;
-    assert_eq!(a.people(), vec!["AnnX".to_owned()]);
+    // The least name the account rules allow: one letter, wrapped in everything Git trims
+    // from the ends of a signature name.
+    let awkward = r#""';:\, x ,\:;'""#;
+    let mut a = TestClient::connect(&server, doc, awkward).await;
+    assert_eq!(a.people(), vec![awkward.to_owned()]);
     a.type_at(0, "hi").await;
     a.pump_until(|c| c.pending() == 0 && c.seq() == Seq(1))
         .await;
@@ -724,26 +724,7 @@ async fn awkward_display_name_does_not_block_saving() {
         .iter()
         .map(|p| p.name.as_str())
         .collect();
-    assert_eq!(names, vec!["AnnX"]);
-
-    // Names Git would trim to nothing are credited as "Guest", so saving still works.
-    // `;`, `'`, `"`, `\` and `:`, percent-encoded.
-    for encoded in ["%3B", "%27", "%22", "%5C", "%3A"] {
-        let doc = new_doc();
-        let mut a = TestClient::connect(server.addr, doc, encoded).await;
-        assert_eq!(a.people(), vec!["Guest".to_owned()], "{encoded}");
-        a.type_at(0, "hi").await;
-        a.pump_until(|c| c.pending() == 0 && c.seq() == Seq(1))
-            .await;
-        a.wait_saved(Seq(1)).await;
-        assert!(
-            !a.saves().iter().any(|s| s.0 == SaveState::Failed),
-            "{encoded}: {:?}",
-            a.saves()
-        );
-        let stored = server.store().read(doc, None).unwrap().unwrap();
-        assert_eq!(stored.meta.contributors[0].name, "Guest", "{encoded}");
-    }
+    assert_eq!(names, vec![awkward]);
 }
 
 /// Holds every write until released, and reports when one starts.
@@ -805,7 +786,7 @@ async fn rejoin_during_final_checkpoint_sees_latest_text() {
     let gate = ReleaseOnDrop(slot.lock().unwrap().clone().unwrap());
     let doc = new_doc();
 
-    let mut a = TestClient::connect(server.addr, doc, "A").await;
+    let mut a = TestClient::connect(&server, doc, "A").await;
     a.type_at(0, "hello").await;
     a.pump_until(|c| c.pending() == 0 && c.seq() == Seq(1))
         .await;
@@ -816,13 +797,13 @@ async fn rejoin_during_final_checkpoint_sees_latest_text() {
         .expect("no checkpoint started")
         .unwrap();
 
-    let mut b = TestClient::connect(server.addr, doc, "B").await;
+    let mut b = TestClient::connect(&server, doc, "B").await;
     assert_eq!(b.text(), "hello");
     gate.0.release();
     b.wait_saved(Seq(1)).await;
     b.close().await;
 
-    let c = TestClient::connect(server.addr, doc, "C").await;
+    let c = TestClient::connect(&server, doc, "C").await;
     assert_eq!(c.text(), "hello");
     let stored = server.store().read(doc, None).unwrap().unwrap();
     assert_eq!(stored_text(&stored), "hello");

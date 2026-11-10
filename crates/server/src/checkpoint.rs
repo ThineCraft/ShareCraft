@@ -64,17 +64,17 @@ pub(crate) struct SaveJob {
 }
 
 impl SaveJob {
-    /// Writes the checkpoint. Blocks.
+    /// Writes the checkpoint of `doc`, stored under the document's name `file_name`. Blocks.
     pub(crate) fn write(
         &self,
         doc: DocId,
+        file_name: &str,
         store: &dyn Checkpointer,
     ) -> Result<Outcome, CheckpointError> {
-        let file_name = format!("{}.txt", doc.0);
         let fields = Map::new();
         store.write(&Checkpoint {
             doc,
-            file_name: &file_name,
+            file_name,
             bytes: self.text.as_bytes(),
             base: self.base.as_ref(),
             authors: &self.authors,
@@ -148,6 +148,11 @@ impl Schedule {
     /// The revision last loaded or written.
     pub(crate) fn revision(&self) -> Option<&RevisionId> {
         self.revision.as_ref()
+    }
+
+    /// The log position the stored revision covers.
+    pub(crate) fn saved_through(&self) -> Seq {
+        self.saved_through
     }
 
     fn unsaved(&self, head: Seq) -> bool {
@@ -329,10 +334,36 @@ mod tests {
             })
         ));
         assert_eq!(s.revision(), Some(&rev(1)));
+        assert_eq!(s.saved_through(), Seq(1));
         assert!(s.due(Seq(2), false).is_some());
         let job = s.start(Seq(2), "xy".into()).unwrap();
         assert_eq!(job.authors, vec![author("b")]);
         assert_eq!(job.base, Some(rev(1)));
+    }
+
+    #[test]
+    fn one_author_is_credited_once_under_their_latest_name() {
+        let mut s = Schedule::new(None, Seq(0), timing());
+        s.changed(author("a"), Seq(1));
+        s.changed(author("b"), Seq(2));
+        s.changed(
+            Author {
+                id: "a".into(),
+                name: "A2".into(),
+            },
+            Seq(3),
+        );
+        let job = s.start(Seq(3), "x".into()).unwrap();
+        assert_eq!(
+            job.authors,
+            vec![
+                Author {
+                    id: "a".into(),
+                    name: "A2".into()
+                },
+                author("b")
+            ]
+        );
     }
 
     #[test]

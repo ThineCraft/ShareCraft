@@ -13,10 +13,11 @@ use std::time::Duration;
 
 use axum::extract::ws::Utf8Bytes;
 use collab_core::document::Submitted;
-use collab_core::ids::{ClientId, DocId, OpId, Seq};
+use collab_core::ids::{ClientId, DocId, OpId, Seq, SessionId, UserId};
 use collab_core::server_log::ServerLog;
 use collab_text::{TextDoc, TextOp};
 use protocol::{Participant, Resume, RoomEpoch, SaveState, ServerMsg};
+use records::Role;
 use revisions::{Author, CheckpointError, Outcome, RevisionId};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -46,8 +47,10 @@ const MAX_CURSOR: usize = 10_000_000;
 /// Log entries kept behind the last checkpoint, so a client that drops briefly can still
 /// resume (and keep its unconfirmed typing) instead of being reset.
 const KEPT_ENTRIES: u64 = 1000;
-/// Name used when none is usable.
-pub(crate) const DEFAULT_NAME: &str = "Guest";
+/// Name credited when an account's name is not one the revision store accepts.
+const DEFAULT_NAME: &str = "Guest";
+/// Why a `Submit` from someone who may not edit is refused.
+const READ_ONLY: &str = "read_only";
 
 /// How a room answers a join.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,11 +64,16 @@ pub(crate) enum JoinReply {
 /// What a connection asks of its room.
 #[derive(Debug)]
 pub(crate) enum Command {
-    /// Enter the room, replacing any connection with the same client id.
+    /// Enter the room, replacing any connection with the same client id. The connection has
+    /// looked up who is joining and their role on the document.
     Join {
         conn: ConnId,
         client: ClientId,
+        user: UserId,
+        session: SessionId,
+        /// The account's name.
         name: String,
+        role: Role,
         resume: Option<Resume>,
         tx: mpsc::Sender<Outbound>,
         /// Answered once the join is handled; dropped if the room ended first, in which case
@@ -99,10 +107,27 @@ pub(crate) struct Initial {
     pub revision: Option<RevisionId>,
 }
 
+/// The person joining: who they are and what they may do.
+struct Joiner {
+    user: UserId,
+    session: SessionId,
+    name: String,
+    role: Role,
+}
+
 struct Member {
     conn: ConnId,
     client: ClientId,
+    user: UserId,
+    /// The sign-in session the connection belongs to.
+    #[expect(
+        dead_code,
+        reason = "kept so signing out can close that session's connections"
+    )]
+    session: SessionId,
     name: String,
+    /// What this person may do; it can change while they are connected.
+    role: Role,
     cursor: Option<usize>,
     tx: mpsc::Sender<Outbound>,
 }
@@ -111,6 +136,8 @@ struct Member {
 /// `try_send` and a connection whose queue is full or closed is dropped.
 pub(crate) struct Room {
     doc: DocId,
+    /// The document's name when the room opened; checkpoints are stored under it.
+    name: String,
     /// This lifetime of the room; log positions only mean something within it.
     epoch: RoomEpoch,
     log: ServerLog<TextDoc>,
@@ -123,10 +150,12 @@ pub(crate) struct Room {
 }
 
 impl Room {
-    /// A room holding `initial`, with its log at `Seq(0)` and a fresh random epoch.
-    pub(crate) fn new(doc: DocId, initial: Initial, timing: Timing) -> Self {
+    /// A room for the document `doc` named `name`, holding `initial`, with its log at
+    /// `Seq(0)` and a fresh random epoch.
+    pub(crate) fn new(doc: DocId, name: String, initial: Initial, timing: Timing) -> Self {
         Self {
             doc,
+            name,
             epoch: RoomEpoch(Uuid::new_v4()),
             log: ServerLog::new(initial.doc, Seq(0)),
             schedule: Schedule::new(initial.revision, Seq(0), timing),
@@ -199,12 +228,21 @@ impl Room {
             Command::Join {
                 conn,
                 client,
+                user,
+                session,
                 name,
+                role,
                 resume,
                 tx,
                 accepted,
             } => {
-                self.join(conn, client, &name, resume, tx);
+                let joiner = Joiner {
+                    user,
+                    session,
+                    name,
+                    role,
+                };
+                self.join(conn, client, joiner, resume, tx);
                 // The connection may have gone away meanwhile; nothing to do then.
                 let _ = accepted.send(JoinReply::Accepted);
             }
@@ -224,14 +262,18 @@ impl Room {
         &mut self,
         conn: ConnId,
         client: ClientId,
-        name: &str,
+        joiner: Joiner,
         resume: Option<Resume>,
         tx: mpsc::Sender<Outbound>,
     ) {
+        let can_edit = joiner.role.can_edit();
         let member = Member {
             conn,
             client,
-            name: credited_name(name),
+            user: joiner.user,
+            session: joiner.session,
+            name: credited_name(&joiner.name),
+            role: joiner.role,
             cursor: None,
             tx,
         };
@@ -246,6 +288,7 @@ impl Room {
         let seq = self.log.head();
         let text = self.log.doc().as_str().to_owned();
         let revision = self.schedule.revision().map(ToString::to_string);
+        let saved_through = self.schedule.saved_through();
         let mut msgs = Vec::new();
         // A position from another lifetime of this room means nothing here.
         let missed = resume
@@ -258,6 +301,8 @@ impl Room {
                 snapshot: Some(text),
                 revision,
                 participants: self.participants(),
+                can_edit,
+                saved_through,
             }),
             (Some(_), Some(missed)) => {
                 msgs.push(ServerMsg::Joined {
@@ -266,6 +311,8 @@ impl Room {
                     snapshot: None,
                     revision,
                     participants: self.participants(),
+                    can_edit,
+                    saved_through,
                 });
                 msgs.extend(missed.iter().map(|entry| ServerMsg::Committed {
                     entry: entry.clone(),
@@ -276,6 +323,8 @@ impl Room {
                 seq,
                 snapshot: text,
                 revision,
+                can_edit,
+                saved_through,
             }),
         }
         let frames = msgs.iter().filter_map(encode).collect();
@@ -284,42 +333,44 @@ impl Room {
     }
 
     fn submit(&mut self, conn: ConnId, client: ClientId, op_id: OpId, base: Seq, op: TextOp) {
-        if !self.is_current(conn, client) {
+        let Some(member) = self
+            .members
+            .iter()
+            .find(|m| m.conn == conn && m.client == client)
+        else {
             return;
-        }
+        };
         // A resend of a committed change is dropped silently: this connection has already
         // received the entry through its snapshot, its catch-up or the broadcast.
         if self.last_committed.get(&client) == Some(&op_id) {
             return;
         }
+        if !member.role.can_edit() {
+            self.refuse(client, op_id, READ_ONLY.to_owned());
+            return;
+        }
+        // Credited by account, so one person in two tabs is one author.
+        let author = Author {
+            id: member.user.0.to_string(),
+            name: member.name.clone(),
+        };
         match self.log.submit(client, op_id, base, op) {
             Ok(Submitted::Committed(entry)) => {
                 self.last_committed.insert(client, op_id);
-                // `is_current` above guarantees the member is here.
-                let name = self
-                    .members
-                    .iter()
-                    .find(|m| m.client == client)
-                    .map_or_else(|| DEFAULT_NAME.to_owned(), |m| m.name.clone());
-                let author = Author {
-                    id: client.0.to_string(),
-                    name,
-                };
                 self.schedule.changed(author, entry.seq);
                 if let Some(frame) = encode(&ServerMsg::Committed { entry }) {
                     self.send(None, &Outbound::One(frame));
                 }
             }
             Ok(Submitted::Duplicate(_)) => {}
-            Err(err) => {
-                let refused = ServerMsg::Refused {
-                    op_id,
-                    reason: err.to_string(),
-                };
-                if let Some(frame) = encode(&refused) {
-                    self.send(Some(client), &Outbound::One(frame));
-                }
-            }
+            Err(err) => self.refuse(client, op_id, err.to_string()),
+        }
+    }
+
+    /// Tells `client` its change `op_id` was refused.
+    fn refuse(&mut self, client: ClientId, op_id: OpId, reason: String) {
+        if let Some(frame) = encode(&ServerMsg::Refused { op_id, reason }) {
+            self.send(Some(client), &Outbound::One(frame));
         }
     }
 
@@ -350,18 +401,14 @@ impl Room {
         }
     }
 
-    fn is_current(&self, conn: ConnId, client: ClientId) -> bool {
-        self.members
-            .iter()
-            .any(|m| m.conn == conn && m.client == client)
-    }
-
     fn participants(&self) -> Vec<Participant> {
         self.members
             .iter()
             .map(|m| Participant {
                 client: m.client,
+                user: m.user,
                 name: m.name.clone(),
+                can_edit: m.role.can_edit(),
                 cursor: m.cursor,
             })
             .collect()
@@ -439,14 +486,16 @@ pub(crate) struct Rooms {
 
 impl Rooms {
     /// The command channel of `doc`'s room, starting the room if it is not open. A new room
-    /// loads its document from `store` before handling commands; commands wait in its channel
-    /// meanwhile. Once empty, the room stays open for `grace`.
+    /// stores its checkpoints under `name`, the document's name, and loads its document from
+    /// `store` before handling commands; commands wait in its channel meanwhile. Once empty,
+    /// the room stays open for `grace`.
     ///
     /// The channel can be closed by the time it is used, if the room ended meanwhile; the
     /// caller then asks again.
     pub(crate) fn open(
         self: &Arc<Self>,
         doc: DocId,
+        name: String,
         store: &Arc<dyn Checkpointer>,
         timing: Timing,
         grace: Duration,
@@ -464,7 +513,7 @@ impl Rooms {
             doc,
             generation,
         };
-        tokio::spawn(run(place, rx, Arc::clone(store), timing, grace));
+        tokio::spawn(run(place, name, rx, Arc::clone(store), timing, grace));
         open.insert(
             doc,
             RoomHandle {
@@ -496,6 +545,7 @@ type Running = JoinHandle<Result<Outcome, CheckpointError>>;
 /// connected for `grace` and everything is saved.
 async fn run(
     place: Place,
+    name: String,
     mut rx: mpsc::Receiver<Command>,
     store: Arc<dyn Checkpointer>,
     timing: Timing,
@@ -519,7 +569,7 @@ async fn run(
         }
     };
 
-    let mut room = Room::new(doc, initial, timing);
+    let mut room = Room::new(doc, name, initial, timing);
     let mut running: Option<Running> = None;
     // The room opens for a join waiting in its channel; until that is handled it is empty.
     let mut empty_since = Some(Instant::now());
@@ -550,7 +600,10 @@ async fn run(
             () = sleep_until(due) => {
                 if let Some(job) = room.start_checkpoint() {
                     let store = Arc::clone(&store);
-                    running = Some(tokio::task::spawn_blocking(move || job.write(doc, &*store)));
+                    let file_name = room.name.clone();
+                    running = Some(tokio::task::spawn_blocking(move || {
+                        job.write(doc, &file_name, &*store)
+                    }));
                 }
             }
             () = sleep_until(grace_ends) => {}
@@ -631,7 +684,12 @@ mod tests {
             idle: Duration::from_millis(100),
             max: Duration::from_secs(30),
         };
-        Room::new(DocId(Uuid::from_u128(77)), Initial::default(), timing)
+        Room::new(
+            DocId(Uuid::from_u128(77)),
+            "Notes.txt".into(),
+            Initial::default(),
+            timing,
+        )
     }
 
     #[test]
@@ -683,12 +741,24 @@ mod tests {
     }
 
     fn join(room: &mut Room, conn: ConnId, client: ClientId) -> mpsc::Receiver<Outbound> {
+        join_as(room, conn, client, Role::Editor)
+    }
+
+    fn join_as(
+        room: &mut Room,
+        conn: ConnId,
+        client: ClientId,
+        role: Role,
+    ) -> mpsc::Receiver<Outbound> {
         let (tx, rx) = mpsc::channel(OUTBOUND_CAPACITY);
         let (accepted, _) = oneshot::channel();
         room.handle(Command::Join {
             conn,
             client,
+            user: UserId(Uuid::from_u128(500 + u128::from(conn))),
+            session: SessionId(Uuid::from_u128(600 + u128::from(conn))),
             name: "A".into(),
+            role,
             resume: None,
             tx,
             accepted,
@@ -781,7 +851,10 @@ mod tests {
         room.handle(Command::Join {
             conn: 2,
             client: ClientId(Uuid::from_u128(5)),
+            user: UserId(Uuid::from_u128(6)),
+            session: SessionId(Uuid::from_u128(7)),
             name: "B".into(),
+            role: Role::Editor,
             resume: Some(Resume {
                 epoch: RoomEpoch(Uuid::from_u128(99)),
                 seq: Seq(1),
@@ -839,5 +912,33 @@ mod tests {
             op: TextOp::replace(0, 0, 0, "z").unwrap(),
         });
         assert_eq!(room.log.head(), Seq(0));
+    }
+
+    #[test]
+    fn viewer_submit_is_refused_as_read_only() {
+        let mut room = new_room();
+        let viewer = ClientId(Uuid::from_u128(1));
+        let mut rx = join_as(&mut room, 1, viewer, Role::Viewer);
+        let joined = frames(&mut rx);
+        assert!(
+            matches!(
+                joined.first(),
+                Some(ServerMsg::Joined {
+                    can_edit: false,
+                    ..
+                })
+            ),
+            "{joined:?}"
+        );
+        let op_id = OpId(Uuid::from_u128(2));
+        submit(&mut room, viewer, op_id, Seq(0), "x");
+        assert_eq!(room.log.head(), Seq(0));
+        assert!(room.checkpoint_due().is_none());
+        let got = frames(&mut rx);
+        assert!(
+            matches!(got.as_slice(), [ServerMsg::Refused { op_id: id, reason }]
+                if *id == op_id && reason == "read_only"),
+            "{got:?}"
+        );
     }
 }

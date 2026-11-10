@@ -99,6 +99,12 @@ pub struct Update {
     pub reset: Option<ResetKind>,
     /// Why the server refused a change, if it did.
     pub refused: Option<String>,
+    /// Whether this person may change the text, when the server said so (on joining and
+    /// when their rights change).
+    pub can_edit: Option<bool>,
+    /// Present when the server removed this client, saying why (`access_revoked`,
+    /// `signed_out` or `account_disabled`). The page must not reconnect.
+    pub removed: Option<String>,
 }
 
 /// What a reset from the server means for the person. Text the server had confirmed is
@@ -141,6 +147,9 @@ pub enum ClientError {
     /// A change could not be built.
     #[error("{0}")]
     Text(#[from] TextError),
+    /// The server removed this client; it takes no more changes.
+    #[error("removed from the document")]
+    Removed,
 }
 
 /// The session logic behind [`Client`].
@@ -159,7 +168,11 @@ pub struct ClientInner {
     /// Highest sequence known to be stored.
     saved_through: Seq,
     save_failed: bool,
+    /// The server reported that the stored document changed elsewhere; it no longer saves.
+    save_conflict: bool,
     revision: Option<String>,
+    /// The server removed this client.
+    removed: bool,
 }
 
 impl ClientInner {
@@ -173,16 +186,22 @@ impl ClientInner {
             joined: false,
             saved_through: Seq(0),
             save_failed: false,
+            save_conflict: false,
             revision: None,
+            removed: false,
         }
     }
 
     /// The `Join` to send on a new connection, resuming where the client left off once it has
     /// been in a room. Calling it means it is being sent: changes are held until the reply.
+    /// `None` once the server has removed this client: it must not join again.
     ///
     /// # Errors
     /// Only if the message cannot be encoded.
-    pub fn join_message(&mut self) -> Result<String, ClientError> {
+    pub fn join_message(&mut self) -> Result<Option<String>, ClientError> {
+        if self.removed {
+            return Ok(None);
+        }
         self.joined = false;
         let resume = self.epoch.map(|epoch| Resume {
             epoch,
@@ -192,6 +211,7 @@ impl ClientInner {
             client: self.state.client(),
             resume,
         })
+        .map(Some)
     }
 
     /// The text box replaced `removed_utf16` units at `start_utf16` with `inserted`. Returns
@@ -200,13 +220,17 @@ impl ClientInner {
     ///
     /// # Errors
     /// `BadPosition` if an offset splits a character or is past the end; `TooLarge` if the
-    /// change would not fit in one `Submit` of at most [`MAX_SUBMIT_BYTES`]. Nothing changes.
+    /// change would not fit in one `Submit` of at most [`MAX_SUBMIT_BYTES`]; `Removed` once the
+    /// server has removed this client. Nothing changes.
     pub fn local_replace(
         &mut self,
         start_utf16: usize,
         removed_utf16: usize,
         inserted: &str,
     ) -> Result<Option<String>, ClientError> {
+        if self.removed {
+            return Err(ClientError::Removed);
+        }
         let text = self.state.doc().as_str();
         let start =
             utf16_to_char(text, start_utf16).ok_or(ClientError::BadPosition(start_utf16))?;
@@ -251,6 +275,8 @@ impl ClientInner {
                 snapshot,
                 revision,
                 participants,
+                can_edit,
+                saved_through,
             } => {
                 match snapshot {
                     Some(text) => self.adopt(&mut update, text, seq),
@@ -258,14 +284,17 @@ impl ClientInner {
                     // arrived. The server drops it if it was already committed.
                     None => update.send = self.resend_message()?,
                 }
-                self.joined_room(epoch, seq, revision);
+                self.joined_room(epoch, saved_through, revision);
                 update.people = Some(self.people(participants));
+                update.can_edit = Some(can_edit);
             }
             ServerMsg::Reset {
                 epoch,
                 seq,
                 snapshot,
                 revision,
+                can_edit,
+                saved_through,
             } => {
                 let same_text = self.confirmed.as_str() == snapshot;
                 update.reset = Some(match (self.epoch == Some(epoch), same_text) {
@@ -274,7 +303,8 @@ impl ClientInner {
                     (false, false) => ResetKind::ReopenedLostText,
                 });
                 self.adopt(&mut update, snapshot, seq);
-                self.joined_room(epoch, seq, revision);
+                self.joined_room(epoch, saved_through, revision);
+                update.can_edit = Some(can_edit);
             }
             ServerMsg::Committed { entry } => {
                 let before = self.state.doc().as_str().to_owned();
@@ -309,6 +339,7 @@ impl ClientInner {
                 }
                 SaveState::Saving => self.save_failed = false,
                 SaveState::Failed => self.save_failed = true,
+                SaveState::Conflict => self.save_conflict = true,
             },
             ServerMsg::Refused { op_id, reason } => {
                 // The refused change stays unconfirmed and would block every later one; the
@@ -317,6 +348,12 @@ impl ClientInner {
                     self.epoch = None;
                 }
                 update.refused = Some(reason);
+            }
+            ServerMsg::Access { can_edit } => update.can_edit = Some(can_edit),
+            ServerMsg::Removed { reason } => {
+                self.removed = true;
+                self.joined = false;
+                update.removed = Some(snake_case(&reason)?);
             }
         }
         update.text = self.text();
@@ -364,13 +401,14 @@ impl ClientInner {
         }
     }
 
-    fn joined_room(&mut self, epoch: RoomEpoch, seq: Seq, revision: Option<String>) {
+    fn joined_room(&mut self, epoch: RoomEpoch, saved_through: Seq, revision: Option<String>) {
         self.epoch = Some(epoch);
         self.joined = true;
-        // Anything the room held when we arrived is either stored or checkpointed shortly,
-        // with a `Save` message saying so.
-        self.saved_through = seq;
+        // What the room holds after `saved_through` is checkpointed shortly, with a `Save`
+        // message saying so.
+        self.saved_through = saved_through;
         self.save_failed = false;
+        self.save_conflict = false;
         self.revision = revision;
     }
 
@@ -386,7 +424,9 @@ impl ClientInner {
     }
 
     fn save_view(&self) -> SaveView {
-        let state = if self.save_failed {
+        let state = if self.save_conflict {
+            SaveState::Conflict
+        } else if self.save_failed {
             SaveState::Failed
         } else if self.state.pending() > 0 || self.state.seq() > self.saved_through {
             SaveState::Saving
@@ -402,6 +442,14 @@ impl ClientInner {
 
 fn encode(msg: &ClientMsg<TextOp>) -> Result<String, ClientError> {
     Ok(serde_json::to_string(msg)?)
+}
+
+/// A unit variant's serialized name, such as `access_revoked`.
+fn snake_case(value: &impl Serialize) -> Result<String, ClientError> {
+    match serde_json::to_value(value)? {
+        serde_json::Value::String(name) => Ok(name),
+        other => Ok(other.to_string()),
+    }
 }
 
 fn submit(out: &Outgoing<TextOp>) -> Result<String, ClientError> {
@@ -505,11 +553,12 @@ impl Client {
         }
     }
 
-    /// The `Join` to send as soon as a connection opens.
+    /// The `Join` to send as soon as a connection opens, or `undefined` once the server has
+    /// removed this client (it must not reconnect).
     ///
     /// # Errors
     /// Only if the message cannot be encoded.
-    pub fn join_message(&mut self) -> Result<String, JsError> {
+    pub fn join_message(&mut self) -> Result<Option<String>, JsError> {
         Ok(self.inner.join_message()?)
     }
 
@@ -576,9 +625,9 @@ fn units(n: u32) -> usize {
 mod tests {
     use super::*;
     use collab_core::document::{Document, Entry};
-    use collab_core::ids::{ClientId, OpId, Seq};
+    use collab_core::ids::{ClientId, OpId, Seq, UserId};
     use collab_text::{TextDoc, TextOp};
-    use protocol::{ClientMsg, Resume, RoomEpoch, SaveState, ServerMsg};
+    use protocol::{ClientMsg, RemovedReason, Resume, RoomEpoch, SaveState, ServerMsg};
     use uuid::Uuid;
 
     fn me() -> ClientId {
@@ -600,6 +649,8 @@ mod tests {
             snapshot: snapshot.map(str::to_owned),
             revision: None,
             participants: vec![],
+            can_edit: true,
+            saved_through: Seq(seq),
         })
     }
     fn committed(seq: u64, client: ClientId, op_id: OpId, op: TextOp) -> String {
@@ -732,6 +783,8 @@ mod tests {
                 seq: Seq(5),
                 snapshot: "zz".into(),
                 revision: None,
+                can_edit: true,
+                saved_through: Seq(5),
             }))
             .unwrap();
         assert_eq!(update.dropped, 1);
@@ -749,6 +802,8 @@ mod tests {
             seq: Seq(seq),
             snapshot: snapshot.into(),
             revision: None,
+            can_edit: true,
+            saved_through: Seq(seq),
         })
     }
 
@@ -872,7 +927,7 @@ mod tests {
     fn join_message_resumes_once_joined() {
         let mut c = ClientInner::new(me());
         assert_eq!(
-            parse(&c.join_message().unwrap()),
+            parse(&c.join_message().unwrap().unwrap()),
             ClientMsg::Join {
                 client: me(),
                 resume: None
@@ -880,7 +935,7 @@ mod tests {
         );
         c.receive(&joined(epoch(7), 4, Some("abcd"))).unwrap();
         assert_eq!(
-            parse(&c.join_message().unwrap()),
+            parse(&c.join_message().unwrap().unwrap()),
             ClientMsg::Join {
                 client: me(),
                 resume: Some(Resume {
@@ -998,12 +1053,16 @@ mod tests {
                 participants: vec![
                     protocol::Participant {
                         client: me(),
+                        user: UserId(Uuid::from_u128(11)),
                         name: "Ann".into(),
+                        can_edit: true,
                         cursor: None,
                     },
                     protocol::Participant {
                         client: other(),
+                        user: UserId(Uuid::from_u128(12)),
                         name: "Bo".into(),
+                        can_edit: false,
                         cursor: Some(1),
                     },
                 ],
@@ -1032,7 +1091,7 @@ mod tests {
             .unwrap();
         assert_eq!(update.refused.as_deref(), Some("no"));
         assert_eq!(
-            parse(&c.join_message().unwrap()),
+            parse(&c.join_message().unwrap().unwrap()),
             ClientMsg::Join {
                 client: me(),
                 resume: None
@@ -1041,5 +1100,86 @@ mod tests {
         let update = c.receive(&joined(epoch(7), 0, Some("ab"))).unwrap();
         assert_eq!(update.dropped, 1);
         assert_eq!(c.text(), "ab");
+    }
+
+    #[test]
+    fn access_message_updates_can_edit() {
+        let mut c = ClientInner::new(me());
+        c.join_message().unwrap();
+        let update = c
+            .receive(&frame(&ServerMsg::Joined {
+                epoch: epoch(7),
+                seq: Seq(0),
+                snapshot: Some("ab".into()),
+                revision: None,
+                participants: vec![],
+                can_edit: false,
+                saved_through: Seq(0),
+            }))
+            .unwrap();
+        assert_eq!(update.can_edit, Some(false));
+        let update = c
+            .receive(&frame(&ServerMsg::Access { can_edit: true }))
+            .unwrap();
+        assert_eq!(update.can_edit, Some(true));
+        assert_eq!(serde_json::to_value(&update).unwrap()["can_edit"], true);
+        // Other messages leave it unsaid.
+        let update = c
+            .receive(&frame(&ServerMsg::People {
+                participants: vec![],
+            }))
+            .unwrap();
+        assert_eq!(update.can_edit, None);
+        let update = c.receive(&reset(epoch(8), 0, "ab")).unwrap();
+        assert_eq!(update.can_edit, Some(true));
+    }
+
+    #[test]
+    fn removed_stops_the_client() {
+        let mut c = joined_client("ab");
+        let update = c
+            .receive(&frame(&ServerMsg::Removed {
+                reason: RemovedReason::AccessRevoked,
+            }))
+            .unwrap();
+        assert_eq!(update.removed.as_deref(), Some("access_revoked"));
+        assert_eq!(
+            serde_json::to_value(&update).unwrap()["removed"],
+            "access_revoked"
+        );
+        assert!(!c.joined());
+        assert!(matches!(
+            c.local_replace(0, 0, "x"),
+            Err(ClientError::Removed)
+        ));
+        assert_eq!(c.text(), "ab");
+        assert_eq!(c.pending(), 0);
+        assert_eq!(c.join_message().unwrap(), None);
+    }
+
+    #[test]
+    fn save_state_on_joining_reflects_saved_through() {
+        let mut c = ClientInner::new(me());
+        c.join_message().unwrap();
+        let update = c
+            .receive(&frame(&ServerMsg::Joined {
+                epoch: epoch(7),
+                seq: Seq(3),
+                snapshot: Some("abc".into()),
+                revision: Some("r1".into()),
+                participants: vec![],
+                can_edit: true,
+                saved_through: Seq(1),
+            }))
+            .unwrap();
+        assert_eq!(update.save.unwrap().state, SaveState::Saving);
+        let update = c
+            .receive(&frame(&ServerMsg::Save {
+                state: SaveState::Saved,
+                revision: Some("r2".into()),
+                through: Seq(3),
+            }))
+            .unwrap();
+        assert_eq!(update.save.unwrap().state, SaveState::Saved);
     }
 }

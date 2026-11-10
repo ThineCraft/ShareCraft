@@ -5,7 +5,7 @@
 //! over the change type `Op` so this crate knows nothing about what a change means.
 
 use collab_core::document::Entry;
-use collab_core::ids::{ClientId, OpId, Seq};
+use collab_core::ids::{ClientId, OpId, Seq, UserId};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -27,10 +27,14 @@ pub struct Resume {
 /// Someone connected to a document.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Participant {
-    /// The connection.
+    /// The connection. One person with the document open in two tabs is two participants.
     pub client: ClientId,
-    /// Display name.
+    /// The account.
+    pub user: UserId,
+    /// The account's name.
     pub name: String,
+    /// Whether they may change the text.
+    pub can_edit: bool,
     /// Cursor position in Unicode scalar values, if they have one.
     pub cursor: Option<usize>,
 }
@@ -45,6 +49,20 @@ pub enum SaveState {
     Saving,
     /// The last checkpoint failed.
     Failed,
+    /// The stored document was changed somewhere else; this room no longer saves.
+    Conflict,
+}
+
+/// Why the server ended a connection with `Removed`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemovedReason {
+    /// The person no longer has a role on the document.
+    AccessRevoked,
+    /// The session was signed out or expired.
+    SignedOut,
+    /// The account was disabled.
+    AccountDisabled,
 }
 
 /// Browser to server.
@@ -91,6 +109,10 @@ pub enum ServerMsg<Op> {
         revision: Option<String>,
         /// Who is here.
         participants: Vec<Participant>,
+        /// Whether this connection may change the text.
+        can_edit: bool,
+        /// The log position the stored revision covers; anything after it is not saved yet.
+        saved_through: Seq,
     },
     /// `resume` could not be honoured; replace local state.
     Reset {
@@ -102,6 +124,10 @@ pub enum ServerMsg<Op> {
         snapshot: String,
         /// Stored revision the document is based on.
         revision: Option<String>,
+        /// Whether this connection may change the text.
+        can_edit: bool,
+        /// The log position the stored revision covers; anything after it is not saved yet.
+        saved_through: Seq,
     },
     /// A change was committed.
     Committed {
@@ -128,6 +154,16 @@ pub enum ServerMsg<Op> {
         op_id: OpId,
         /// Why.
         reason: String,
+    },
+    /// This person's rights on the document changed while connected.
+    Access {
+        /// Whether they may now change the text.
+        can_edit: bool,
+    },
+    /// The last frame before the server closes the connection; the page must not reconnect.
+    Removed {
+        /// Why.
+        reason: RemovedReason,
     },
 }
 
@@ -189,6 +225,27 @@ mod tests {
             serde_json::to_string(&SaveState::Failed).unwrap(),
             "\"failed\""
         );
+        assert_eq!(
+            serde_json::to_string(&SaveState::Conflict).unwrap(),
+            "\"conflict\""
+        );
+    }
+
+    #[test]
+    fn removed_reason_is_snake_case() {
+        let json = serde_json::to_string(&ServerMsg::<u32>::Removed {
+            reason: RemovedReason::AccessRevoked,
+        })
+        .unwrap();
+        assert_eq!(json, "{\"type\":\"removed\",\"reason\":\"access_revoked\"}");
+        assert_eq!(
+            serde_json::to_string(&RemovedReason::SignedOut).unwrap(),
+            "\"signed_out\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RemovedReason::AccountDisabled).unwrap(),
+            "\"account_disabled\""
+        );
     }
 
     #[test]
@@ -201,15 +258,21 @@ mod tests {
                 revision: Some("abc".into()),
                 participants: vec![Participant {
                     client: ClientId(Uuid::nil()),
+                    user: UserId(Uuid::from_u128(9)),
                     name: "A".into(),
+                    can_edit: false,
                     cursor: Some(2),
                 }],
+                can_edit: true,
+                saved_through: Seq(0),
             },
             ServerMsg::Reset {
                 epoch: RoomEpoch(Uuid::from_u128(6)),
                 seq: Seq(2),
                 snapshot: "x".into(),
                 revision: None,
+                can_edit: false,
+                saved_through: Seq(1),
             },
             ServerMsg::Committed {
                 entry: Entry {
@@ -230,6 +293,15 @@ mod tests {
             ServerMsg::Refused {
                 op_id: OpId(Uuid::nil()),
                 reason: "no".into(),
+            },
+            ServerMsg::Save {
+                state: SaveState::Conflict,
+                revision: None,
+                through: Seq(4),
+            },
+            ServerMsg::Access { can_edit: false },
+            ServerMsg::Removed {
+                reason: RemovedReason::SignedOut,
             },
         ];
         for m in msgs {

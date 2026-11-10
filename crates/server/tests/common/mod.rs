@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -19,32 +20,37 @@ use collab_core::ids::{ClientId, DocId, OpId, Seq, UserId};
 use collab_text::{TextDoc, TextOp};
 use futures_util::{SinkExt, StreamExt};
 use protocol::{ClientMsg, Participant, Resume, RoomEpoch, SaveState, ServerMsg};
-use records::NewUser;
 use records::test_support::TestDb;
+use records::{Db, NewUser, Role};
 use reqwest::header::{COOKIE, HeaderMap, HeaderValue, ORIGIN, SET_COOKIE};
 use revisions::RevisionStore;
 use server::{AppState, Checkpointer, Config};
 use tempfile::TempDir;
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::handshake::client::Request;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use uuid::Uuid;
 
 /// How long any wait in a test may take before it fails.
 pub const TIMEOUT: Duration = Duration::from_secs(5);
 
-/// A server running in this test's runtime, with its own data directory and database schema.
-pub struct TestServer {
+/// The email of the administrator the harness acts as when it grants access directly.
+const HARNESS_ADMIN_EMAIL: &str = "harness-admin@test.invalid";
+
+/// A running server as tests reach it: its address, its database, and the accounts the
+/// harness made on it.
+pub struct Site {
     pub addr: SocketAddr,
-    pub data_dir: TempDir,
-    pub db: TestDb,
-    /// Accounts made by [`TestServer::user`] and [`TestServer::admin`], by name.
+    records: Db,
+    /// Accounts made by [`Site::user`] and [`Site::admin`], by name.
     accounts: Mutex<HashMap<String, Account>>,
 }
 
 /// An account the harness created, with the password it chose and keeps to itself.
 #[derive(Clone)]
-struct Account {
+pub struct Account {
     id: UserId,
     email: String,
     password: String,
@@ -69,29 +75,13 @@ impl std::fmt::Debug for TestUser {
     }
 }
 
-impl TestServer {
-    /// The library repository the server stores documents in.
-    pub fn library(&self) -> PathBuf {
-        server::library_path(self.data_dir.path())
-    }
-
-    /// Opens the server's library repository.
-    pub fn store(&self) -> RevisionStore {
-        RevisionStore::open(&self.library()).unwrap()
-    }
-
-    /// The commits that changed `doc`, newest first.
-    pub fn doc_commits(&self, doc: DocId) -> Vec<String> {
-        let repo = gix::open(self.library()).unwrap();
-        let tip = repo
-            .find_reference(&format!("refs/sharecraft/docs/{}", doc.0))
-            .unwrap()
-            .id();
-        repo.rev_walk([tip])
-            .all()
-            .unwrap()
-            .map(|info| info.unwrap().id.to_string())
-            .collect()
+impl Site {
+    fn new(addr: SocketAddr, records: Db) -> Site {
+        Site {
+            addr,
+            records,
+            accounts: Mutex::default(),
+        }
     }
 
     /// `http://<addr>`, the origin of pages this server serves.
@@ -104,12 +94,13 @@ impl TestServer {
         format!("http://{}{path}", self.addr)
     }
 
-    /// The account `<slug of name>@test.invalid`, created on first use, freshly signed in.
+    /// The account `<slug of name>@test.invalid`, named `name`, created on first use, freshly
+    /// signed in.
     pub async fn user(&self, name: &str) -> TestUser {
         self.signed_in(name, false).await
     }
 
-    /// Like [`TestServer::user`], for an administrator account.
+    /// Like [`Site::user`], for an administrator account.
     pub async fn admin(&self, name: &str) -> TestUser {
         self.signed_in(name, true).await
     }
@@ -126,6 +117,45 @@ impl TestServer {
             .timeout(TIMEOUT)
             .build()
             .unwrap()
+    }
+
+    /// Makes sure `user` has a role on `doc`, writing the records directly: creates the
+    /// document, named `<doc id>.txt` and owned by `user`, if it has no record; otherwise grants
+    /// `user` Editor if they have no role.
+    pub async fn give_access(&self, doc: DocId, user: &TestUser) {
+        let db = &self.records;
+        if db.document(doc).await.unwrap().is_none() {
+            db.create_document(user.id, doc, &format!("{}.txt", doc.0))
+                .await
+                .unwrap();
+        } else if db.role(user.id, doc).await.unwrap().is_none() {
+            let admin = self.harness_admin().await;
+            db.set_access(admin, doc, user.id, Some(Role::Editor))
+                .await
+                .unwrap();
+        }
+    }
+
+    /// The administrator the harness grants access as, created on first use. It never signs
+    /// in, so it is never anyone's participant.
+    async fn harness_admin(&self) -> UserId {
+        let db = &self.records;
+        if let Some(user) = db.user_by_email(HARNESS_ADMIN_EMAIL).await.unwrap() {
+            return user.id;
+        }
+        let password = Uuid::new_v4().simple().to_string();
+        db.create_user(
+            None,
+            NewUser {
+                email: HARNESS_ADMIN_EMAIL,
+                name: "Harness Admin",
+                password: &password,
+                is_admin: true,
+            },
+        )
+        .await
+        .unwrap()
+        .id
     }
 
     async fn signed_in(&self, name: &str, is_admin: bool) -> TestUser {
@@ -158,8 +188,7 @@ impl TestServer {
         };
         let password = Uuid::new_v4().simple().to_string();
         let user = self
-            .db
-            .db
+            .records
             .create_user(
                 None,
                 NewUser {
@@ -181,6 +210,47 @@ impl TestServer {
             .unwrap()
             .insert(name.to_owned(), account.clone());
         account
+    }
+}
+
+/// A server running in this test's runtime, with its own data directory and database schema.
+pub struct TestServer {
+    site: Site,
+    pub data_dir: TempDir,
+    pub db: TestDb,
+}
+
+impl Deref for TestServer {
+    type Target = Site;
+
+    fn deref(&self) -> &Site {
+        &self.site
+    }
+}
+
+impl TestServer {
+    /// The library repository the server stores documents in.
+    pub fn library(&self) -> PathBuf {
+        server::library_path(self.data_dir.path())
+    }
+
+    /// Opens the server's library repository.
+    pub fn store(&self) -> RevisionStore {
+        RevisionStore::open(&self.library()).unwrap()
+    }
+
+    /// The commits that changed `doc`, newest first.
+    pub fn doc_commits(&self, doc: DocId) -> Vec<String> {
+        let repo = gix::open(self.library()).unwrap();
+        let tip = repo
+            .find_reference(&format!("refs/sharecraft/docs/{}", doc.0))
+            .unwrap()
+            .id();
+        repo.rev_walk([tip])
+            .all()
+            .unwrap()
+            .map(|info| info.unwrap().id.to_string())
+            .collect()
     }
 }
 
@@ -267,18 +337,25 @@ pub async fn spawn_server_config(edit: impl FnOnce(&mut Config)) -> TestServer {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(fail_loudly(server::serve(config, listener)));
     TestServer {
-        addr,
+        site: Site::new(addr, db.db.clone()),
         data_dir,
         db,
-        accounts: Mutex::default(),
     }
 }
 
 /// A server on its own runtime. Stopping it ends every connection, room and task at once, as
 /// stopping the server process would, and leaves its data directory for a new server.
 pub struct StoppableServer {
-    pub addr: SocketAddr,
+    site: Site,
     runtime: Option<tokio::runtime::Runtime>,
+}
+
+impl Deref for StoppableServer {
+    type Target = Site;
+
+    fn deref(&self) -> &Site {
+        &self.site
+    }
 }
 
 impl StoppableServer {
@@ -300,7 +377,7 @@ impl StoppableServer {
             fail_loudly(server::serve(config, listener)).await;
         });
         StoppableServer {
-            addr,
+            site: Site::new(addr, db.db.clone()),
             runtime: Some(runtime),
         }
     }
@@ -362,20 +439,62 @@ pub async fn spawn_server_with_grace(
     let state = AppState::new(config, checkpointer, db.db.clone());
     tokio::spawn(fail_loudly(server::serve_state(state, listener)));
     TestServer {
-        addr,
+        site: Site::new(addr, db.db.clone()),
         data_dir,
         db,
-        accounts: Mutex::default(),
     }
 }
 
-type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+pub type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+/// A WebSocket handshake request for `ws://<addr><path>` from a page this server served
+/// (same-origin `Origin`), carrying `cookie` if given.
+pub fn ws_request(addr: SocketAddr, path: &str, cookie: Option<&str>) -> Request {
+    let mut request = format!("ws://{addr}{path}").into_client_request().unwrap();
+    let headers = request.headers_mut();
+    headers.insert(
+        ORIGIN,
+        HeaderValue::from_str(&format!("http://{addr}")).unwrap(),
+    );
+    if let Some(cookie) = cookie {
+        headers.insert(COOKIE, HeaderValue::from_str(cookie).unwrap());
+    }
+    request
+}
+
+/// Opens a socket at `path` with `cookie`; fails the test unless the handshake succeeds.
+pub async fn open_socket_at(addr: SocketAddr, path: &str, cookie: &str) -> Socket {
+    let request = ws_request(addr, path, Some(cookie));
+    let (socket, _) = tokio::time::timeout(TIMEOUT, tokio_tungstenite::connect_async(request))
+        .await
+        .expect("connect timed out")
+        .unwrap();
+    socket
+}
+
+/// Opens a socket to `doc` as `user`.
+pub async fn open_socket(addr: SocketAddr, doc: DocId, user: &TestUser) -> Socket {
+    open_socket_at(addr, &format!("/ws/docs/{}", doc.0), &user.cookie).await
+}
+
+/// The HTTP status a WebSocket handshake `request` is answered with: 101 when it upgrades.
+pub async fn handshake_status(request: Request) -> u16 {
+    let result = tokio::time::timeout(TIMEOUT, tokio_tungstenite::connect_async(request))
+        .await
+        .expect("handshake timed out");
+    match result {
+        Ok((_, response)) => response.status().as_u16(),
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => response.status().as_u16(),
+        Err(other) => panic!("unexpected error {other:?}"),
+    }
+}
 
 /// One browser session: a socket plus the client half of the protocol.
 pub struct TestClient {
     addr: SocketAddr,
     doc: DocId,
-    name: String,
+    /// The signed-in account this session belongs to.
+    pub user: TestUser,
     socket: Option<Socket>,
     state: ClientState<TextDoc>,
     people: Vec<Participant>,
@@ -389,36 +508,50 @@ pub struct TestClient {
     pub epoch: Option<RoomEpoch>,
 }
 
-async fn open(addr: SocketAddr, doc: DocId, name: &str) -> Socket {
-    let url = format!("ws://{addr}/ws/docs/{}?name={name}", doc.0);
-    let (socket, _) = tokio::time::timeout(TIMEOUT, tokio_tungstenite::connect_async(url))
-        .await
-        .expect("connect timed out")
-        .unwrap();
-    socket
-}
-
 impl TestClient {
-    /// Opens a socket to `doc` and joins it for the first time.
-    pub async fn connect(addr: SocketAddr, doc: DocId, name: &str) -> TestClient {
-        let mut c = TestClient::connect_with_resume(addr, doc, name, None).await;
+    /// Signs in the account named `name`, makes sure it has a role on `doc` (see
+    /// [`Site::give_access`]), opens a socket and joins for the first time.
+    pub async fn connect(site: &Site, doc: DocId, name: &str) -> TestClient {
+        let mut c = TestClient::connect_with_resume(site, doc, name, None).await;
         c.pump_until(|c| c.joined).await;
         c
     }
 
-    /// Opens a socket and sends `Join` with the given `resume`, without waiting for a reply.
+    /// Opens a socket to `doc` as `user` and joins for the first time. No record or grant is
+    /// made.
+    pub async fn connect_as(site: &Site, doc: DocId, user: &TestUser) -> TestClient {
+        let mut c = TestClient::open_as(site.addr, doc, user.clone(), None).await;
+        c.pump_until(|c| c.joined).await;
+        c
+    }
+
+    /// Like [`TestClient::connect`], sending `Join` with the given `resume` and not waiting
+    /// for a reply.
     pub async fn connect_with_resume(
-        addr: SocketAddr,
+        site: &Site,
         doc: DocId,
         name: &str,
         resume: Option<Resume>,
     ) -> TestClient {
+        let user = site.user(name).await;
+        site.give_access(doc, &user).await;
+        TestClient::open_as(site.addr, doc, user, resume).await
+    }
+
+    /// Opens a socket as `user` and sends `Join` with `resume`, without waiting for a reply.
+    async fn open_as(
+        addr: SocketAddr,
+        doc: DocId,
+        user: TestUser,
+        resume: Option<Resume>,
+    ) -> TestClient {
         let client = ClientId(Uuid::new_v4());
+        let socket = open_socket(addr, doc, &user).await;
         let mut c = TestClient {
             addr,
             doc,
-            name: name.to_owned(),
-            socket: Some(open(addr, doc, name).await),
+            user,
+            socket: Some(socket),
             state: ClientState::new(client, TextDoc::default(), Seq(0)),
             people: Vec::new(),
             received: Vec::new(),
@@ -604,7 +737,10 @@ impl TestClient {
                 }
             }
             ServerMsg::People { participants } => self.people = participants,
-            ServerMsg::Save { .. } | ServerMsg::Refused { .. } => {}
+            ServerMsg::Save { .. }
+            | ServerMsg::Refused { .. }
+            | ServerMsg::Access { .. }
+            | ServerMsg::Removed { .. } => {}
         }
     }
 
@@ -632,7 +768,7 @@ impl TestClient {
     /// `Joined` or `Reset`. After `Joined` the change in flight is resent (the server drops it
     /// if it was already committed); after `Reset` it has been discarded.
     pub async fn reconnect(&mut self) {
-        self.socket = Some(open(self.addr, self.doc, &self.name).await);
+        self.socket = Some(open_socket(self.addr, self.doc, &self.user).await);
         self.joined = false;
         self.closed = false;
         let client = self.state.client();
