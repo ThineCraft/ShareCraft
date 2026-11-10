@@ -94,13 +94,39 @@ pub struct Update {
     pub save: Option<SaveView>,
     /// Unconfirmed local changes thrown away because the server could not take them back.
     pub dropped: usize,
+    /// Present when the server reset this client to its text, saying what that cost.
+    pub reset: Option<ResetKind>,
     /// Why the server refused a change, if it did.
     pub refused: Option<String>,
 }
 
+/// What a reset from the server means for the person, compared with the text they had,
+/// including their unconfirmed changes. Serialized as `restarted_lost_text`, `restarted` or
+/// `resynced`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResetKind {
+    /// The room is a new one (the server restarted, or the room ended) and its text differs
+    /// from what the person had: text they saw is gone.
+    RestartedLostText,
+    /// The room is a new one, with exactly the text the person had.
+    Restarted,
+    /// The same room, which no longer had the history to resume this client.
+    Resynced,
+}
+
+/// Largest `Submit` frame the client sends, in bytes; the server closes the connection on a
+/// frame over 1 MiB.
+pub const MAX_SUBMIT_BYTES: usize = 512 * 1024;
+/// How the message of [`ClientError::TooLarge`] begins, so the page can recognise it.
+pub const TOO_LARGE: &str = "change_too_large";
+
 /// Why the client could not do what it was asked.
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
+    /// The change would make a `Submit` larger than [`MAX_SUBMIT_BYTES`]; nothing changed.
+    #[error("{TOO_LARGE}: the change takes {0} bytes to send, more than {MAX_SUBMIT_BYTES}")]
+    TooLarge(usize),
     /// The frame is not a server message.
     #[error("unreadable message from the server: {0}")]
     BadFrame(#[from] serde_json::Error),
@@ -167,7 +193,8 @@ impl ClientInner {
     /// join reply.
     ///
     /// # Errors
-    /// `BadPosition` if an offset splits a character or is past the end; nothing changes.
+    /// `BadPosition` if an offset splits a character or is past the end; `TooLarge` if the
+    /// change would not fit in one `Submit` of at most [`MAX_SUBMIT_BYTES`]. Nothing changes.
     pub fn local_replace(
         &mut self,
         start_utf16: usize,
@@ -185,7 +212,17 @@ impl ClientInner {
             end.saturating_sub(start),
             inserted,
         )?;
-        let out = self.state.local(OpId(Uuid::new_v4()), op)?;
+        let op_id = OpId(Uuid::new_v4());
+        let size = submit(&Outgoing {
+            op_id,
+            base: self.state.seq(),
+            op: op.clone(),
+        })?
+        .len();
+        if size > MAX_SUBMIT_BYTES {
+            return Err(ClientError::TooLarge(size));
+        }
+        let out = self.state.local(op_id, op)?;
         match out {
             Some(out) if self.joined => Ok(Some(submit(&out)?)),
             _ => Ok(None),
@@ -224,6 +261,12 @@ impl ClientInner {
                 snapshot,
                 revision,
             } => {
+                let same_text = self.state.doc().as_str() == snapshot;
+                update.reset = Some(match (self.epoch == Some(epoch), same_text) {
+                    (true, _) => ResetKind::Resynced,
+                    (false, true) => ResetKind::Restarted,
+                    (false, false) => ResetKind::RestartedLostText,
+                });
                 self.adopt(&mut update, snapshot, seq);
                 self.joined_room(epoch, seq, revision);
             }
@@ -292,6 +335,12 @@ impl ClientInner {
     #[must_use]
     pub fn pending(&self) -> usize {
         self.state.pending()
+    }
+
+    /// Whether the server has answered the join sent on the current connection.
+    #[must_use]
+    pub fn joined(&self) -> bool {
+        self.joined
     }
 
     /// Replaces the document with the server's, dropping unconfirmed changes.
@@ -458,7 +507,9 @@ impl Client {
     /// `Submit` to send now, or `undefined`.
     ///
     /// # Errors
-    /// If an offset splits a character or is past the end; nothing changes.
+    /// If an offset splits a character or is past the end, or if the change is too large to
+    /// send in one piece (the error message then starts with `change_too_large`); nothing
+    /// changes.
     pub fn local_replace(
         &mut self,
         start_utf16: u32,
@@ -680,6 +731,91 @@ mod tests {
         assert_eq!(c.text(), "zz");
         assert_eq!(c.pending(), 0);
         assert_eq!(c.resend_message().unwrap(), None);
+    }
+
+    fn reset(epoch: RoomEpoch, seq: u64, snapshot: &str) -> String {
+        frame(&ServerMsg::Reset {
+            epoch,
+            seq: Seq(seq),
+            snapshot: snapshot.into(),
+            revision: None,
+        })
+    }
+
+    fn reset_json(update: &Update) -> serde_json::Value {
+        serde_json::to_value(update).unwrap()["reset"].clone()
+    }
+
+    #[test]
+    fn reset_with_new_epoch_and_different_text_reports_lost_text() {
+        // Confirmed text the restarted server never saved, plus a change typed while away.
+        let mut c = joined_client("saved, then more");
+        c.local_replace(0, 0, "x").unwrap();
+        c.join_message().unwrap();
+        let update = c.receive(&reset(epoch(8), 0, "saved")).unwrap();
+        assert_eq!(update.reset, Some(ResetKind::RestartedLostText));
+        assert_eq!(reset_json(&update), "restarted_lost_text");
+        assert_eq!(update.dropped, 1);
+        assert_eq!(c.text(), "saved");
+    }
+
+    #[test]
+    fn reset_with_new_epoch_and_same_text_reports_no_loss() {
+        let mut c = joined_client("abc");
+        c.join_message().unwrap();
+        let update = c.receive(&reset(epoch(8), 0, "abc")).unwrap();
+        assert_eq!(update.reset, Some(ResetKind::Restarted));
+        assert_eq!(reset_json(&update), "restarted");
+        assert_eq!(update.dropped, 0);
+        assert!(!update.text_changed);
+    }
+
+    #[test]
+    fn reset_with_same_epoch_reports_resynced() {
+        let mut c = joined_client("abc");
+        c.local_replace(3, 0, "d").unwrap();
+        c.join_message().unwrap();
+        let update = c.receive(&reset(epoch(7), 1500, "abc!")).unwrap();
+        assert_eq!(update.reset, Some(ResetKind::Resynced));
+        assert_eq!(reset_json(&update), "resynced");
+        assert_eq!(update.dropped, 1);
+        assert_eq!(c.text(), "abc!");
+        // A resumed join is not a reset.
+        c.join_message().unwrap();
+        let update = c.receive(&joined(epoch(7), 1500, None)).unwrap();
+        assert_eq!(update.reset, None);
+        assert_eq!(reset_json(&update), serde_json::Value::Null);
+    }
+
+    #[test]
+    fn oversized_change_is_refused_and_state_unchanged() {
+        let mut c = joined_client("ab");
+        let state = |c: &mut ClientInner| {
+            (
+                c.text(),
+                c.pending(),
+                c.resend_message().unwrap(),
+                c.join_message().unwrap(),
+            )
+        };
+        let before = state(&mut c);
+        c.receive(&joined(epoch(7), 0, None)).unwrap();
+        // Too large as typed, and too large once quotes are escaped in the frame.
+        for big in [
+            "x".repeat(MAX_SUBMIT_BYTES),
+            "\"".repeat(MAX_SUBMIT_BYTES / 2 + 1),
+        ] {
+            let err = c.local_replace(1, 0, &big).unwrap_err();
+            assert!(matches!(err, ClientError::TooLarge(_)), "{err:?}");
+            assert!(err.to_string().starts_with(TOO_LARGE), "{err}");
+            assert_eq!(state(&mut c), before);
+            c.receive(&joined(epoch(7), 0, None)).unwrap();
+        }
+        // A change that fits is still sent whole.
+        let fits = "x".repeat(MAX_SUBMIT_BYTES - 1024);
+        let msg = c.local_replace(1, 0, &fits).unwrap().unwrap();
+        assert!(msg.len() <= MAX_SUBMIT_BYTES);
+        assert_eq!(c.text().len(), 2 + fits.len());
     }
 
     #[test]

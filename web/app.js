@@ -147,10 +147,15 @@ function handleFrame(data) {
   }
   if (update.people) showPeople(update.people);
   if (update.save) save = update.save;
-  if (update.dropped > 0) {
-    const n = update.dropped;
-    const kept = `${n} ${n === 1 ? 'change' : 'changes'} could not be kept.`;
-    notice = notice.startsWith('A change was refused') ? `${notice} ${kept}` : `The server restarted. ${kept}`;
+  const n = update.dropped;
+  const changes = `${n} ${n === 1 ? 'change' : 'changes'}`;
+  if (update.reset === 'restarted_lost_text') {
+    // The new room's text differs from what the person had: unsaved text is gone.
+    notice = 'The server restarted. Changes made since the last save were lost.';
+    if (n > 0) notice += ` ${changes} you typed while disconnected could not be kept.`;
+  } else if (n > 0) {
+    const kept = `${changes} could not be kept.`;
+    notice = notice.startsWith('A change was refused') ? `${notice} ${kept}` : kept;
   }
   if (update.refused) {
     notice = `A change was refused (${update.refused}).`;
@@ -188,15 +193,22 @@ function syncLocal() {
   if (value === shown) return;
   const { start, removed, inserted } = difference(shown, value);
   let message;
+  let tooLarge = false;
   try {
     message = client.local_replace(start, removed, inserted);
   } catch (err) {
-    console.error(err);
+    // The client refused the change and is unchanged; the text box goes back to its text.
+    tooLarge = String(err?.message ?? err).startsWith('change_too_large');
+    if (!tooLarge) console.error(err);
     message = undefined;
   }
   shown = client.text();
-  if (shown !== value) area.value = shown;
-  notice = '';
+  if (shown !== value) {
+    area.value = shown;
+    // The caret goes where the refused change began.
+    if (tooLarge) area.setSelectionRange(start, start);
+  }
+  notice = tooLarge ? 'That change is too large to send in one piece. Paste it in smaller parts.' : '';
   send(message);
   render();
 }
@@ -292,10 +304,11 @@ function render() {
     setStatus('offline', `Connection lost. ${waiting}`);
   } else if (!joined) {
     setStatus('connecting', everJoined ? `Reconnecting… ${waiting}` : 'Connecting…');
+  } else if (save?.state === 'failed') {
+    // A failing save is never hidden by a notice; both are shown.
+    setStatus('failed', notice ? `Saving failed, retrying. ${notice}` : 'Saving failed, retrying');
   } else if (notice) {
     setStatus('notice', notice);
-  } else if (save?.state === 'failed') {
-    setStatus('failed', 'Saving failed, retrying');
   } else if (n > 0 || save?.state === 'saving') {
     setStatus('saving', 'Saving…');
   } else {
