@@ -274,6 +274,14 @@ pub(crate) fn user_from_row(row: &PgRow) -> Result<User, sqlx::Error> {
     })
 }
 
+fn session_from_row(row: &PgRow) -> Result<Session, DbError> {
+    Ok(Session {
+        id: SessionId(row.try_get("session_id")?),
+        user: user_from_row(row)?,
+        expires_at: row.try_get("expires_at")?,
+    })
+}
+
 /// Fails with `Forbidden` unless `actor` is an enabled administrator.
 async fn require_admin(conn: &mut PgConnection, actor: UserId) -> Result<(), AccountError> {
     let allowed: Option<bool> =
@@ -567,12 +575,23 @@ impl Db {
         .bind(token.digest())
         .fetch_optional(self.pool())
         .await?;
-        let Some(row) = row else { return Ok(None) };
-        Ok(Some(Session {
-            id: SessionId(row.try_get("session_id")?),
-            user: user_from_row(&row)?,
-            expires_at: row.try_get("expires_at")?,
-        }))
+        row.as_ref().map(session_from_row).transpose()
+    }
+
+    /// The live session with this id, by the same rules as [`Db::session`]: `None` if unknown,
+    /// ended or expired, or if the account is disabled.
+    pub async fn session_by_id(&self, id: SessionId) -> Result<Option<Session>, DbError> {
+        let row = sqlx::query(
+            "select s.id as session_id, s.expires_at, \
+                    u.id, u.email, u.name, u.is_admin, (u.disabled_at is not null) as disabled \
+             from sessions s join users u on u.id = s.user_id \
+             where s.id = $1 and s.ended_at is null and s.expires_at > now() \
+               and u.disabled_at is null",
+        )
+        .bind(id.0)
+        .fetch_optional(self.pool())
+        .await?;
+        row.as_ref().map(session_from_row).transpose()
     }
 
     /// Ends a session (signing out). Ending one that is already over does nothing.

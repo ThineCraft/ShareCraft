@@ -16,7 +16,7 @@ use collab_core::document::Submitted;
 use collab_core::ids::{ClientId, DocId, OpId, Seq, SessionId, UserId};
 use collab_core::server_log::ServerLog;
 use collab_text::{TextDoc, TextOp};
-use protocol::{Participant, Resume, RoomEpoch, SaveState, ServerMsg};
+use protocol::{Participant, RemovedReason, Resume, RoomEpoch, SaveState, ServerMsg};
 use records::Role;
 use revisions::{Author, CheckpointError, Outcome, RevisionId};
 use tokio::sync::{mpsc, oneshot};
@@ -42,6 +42,9 @@ pub(crate) enum Outbound {
 pub(crate) const OUTBOUND_CAPACITY: usize = 256;
 /// Commands queued for a room before connections wait to send more.
 const COMMAND_CAPACITY: usize = 1024;
+/// How long an access change waits for room in a full command queue before the wait is
+/// handed to a task of its own (see [`deliver`]).
+const ACCESS_SEND_WAIT: Duration = Duration::from_secs(1);
 /// Largest cursor position relayed; anything larger is dropped.
 const MAX_CURSOR: usize = 10_000_000;
 /// Log entries kept behind the last checkpoint, so a client that drops briefly can still
@@ -97,6 +100,15 @@ pub(crate) enum Command {
     },
     /// The connection ended.
     Leave { conn: ConnId, client: ClientId },
+    /// `user`'s role on the document is now `role`. `None` removes every connection of theirs
+    /// with `Removed { access_revoked }`; a role sends `Access` to each of their connections
+    /// whose `can_edit` changes.
+    SetAccess { user: UserId, role: Option<Role> },
+    /// The sign-in `session` ended: its connections are removed with `Removed { signed_out }`.
+    EndSession { session: SessionId },
+    /// `user`'s account was disabled: their connections are removed with
+    /// `Removed { account_disabled }`.
+    RemoveUser { user: UserId },
 }
 
 /// The state a room starts from.
@@ -121,10 +133,6 @@ struct Member {
     client: ClientId,
     user: UserId,
     /// The sign-in session the connection belongs to.
-    #[expect(
-        dead_code,
-        reason = "kept so signing out can close that session's connections"
-    )]
     session: SessionId,
     name: String,
     /// What this person may do; it can change while they are connected.
@@ -267,6 +275,16 @@ impl Room {
             } => self.submit(conn, client, op_id, base, op),
             Command::Cursor { conn, client, at } => self.cursor(conn, client, at),
             Command::Leave { conn, client } => self.leave(conn, client),
+            Command::SetAccess { user, role } => match role {
+                Some(role) => self.change_role(user, role),
+                None => self.remove(|m| m.user == user, RemovedReason::AccessRevoked),
+            },
+            Command::EndSession { session } => {
+                self.remove(|m| m.session == session, RemovedReason::SignedOut);
+            }
+            Command::RemoveUser { user } => {
+                self.remove(|m| m.user == user, RemovedReason::AccountDisabled);
+            }
         }
     }
 
@@ -413,6 +431,54 @@ impl Room {
         }
     }
 
+    /// Gives every connection of `user` the role `role`. Each connection whose `can_edit`
+    /// changes is told; everyone gets a new people list if any role changed.
+    fn change_role(&mut self, user: UserId, role: Role) {
+        let mut told = Vec::new();
+        let mut changed = false;
+        for member in self.members.iter_mut().filter(|m| m.user == user) {
+            if member.role == role {
+                continue;
+            }
+            changed = true;
+            if member.role.can_edit() != role.can_edit() {
+                told.push(member.client);
+            }
+            member.role = role;
+        }
+        if let Some(frame) = encode(&ServerMsg::Access {
+            can_edit: role.can_edit(),
+        }) {
+            for client in told {
+                self.send(Some(client), &Outbound::One(frame.clone()));
+            }
+        }
+        if changed {
+            self.broadcast_people();
+        }
+    }
+
+    /// Removes every member `which` selects: queues `Removed { reason }` as the connection's
+    /// last frame and drops its queue, which ends the connection once the frame is written.
+    /// Anything the connection sends afterwards is ignored, as it is no longer a member.
+    fn remove(&mut self, which: impl Fn(&Member) -> bool, reason: RemovedReason) {
+        let Some(frame) = encode(&ServerMsg::Removed { reason }) else {
+            return;
+        };
+        let before = self.members.len();
+        self.members.retain(|m| {
+            if !which(m) {
+                return true;
+            }
+            // A full or closed queue cannot take the frame; the connection still ends.
+            let _ = m.tx.try_send(Outbound::One(frame.clone()));
+            false
+        });
+        if self.members.len() != before {
+            self.broadcast_people();
+        }
+    }
+
     fn participants(&self) -> Vec<Participant> {
         self.members
             .iter()
@@ -536,11 +602,56 @@ impl Rooms {
         tx
     }
 
+    /// Sends `cmd` to `doc`'s room. Nothing happens if the room is not open or is ending. Waits
+    /// at most [`ACCESS_SEND_WAIT`] for room in its queue (see [`deliver`]).
+    pub(crate) async fn send_to(&self, doc: DocId, cmd: Command) {
+        let Some(tx) = self.sender(doc) else { return };
+        deliver(doc, &tx, cmd).await;
+    }
+
+    /// Sends a command made by `make` to every open room, waiting on them together.
+    pub(crate) async fn send_all(&self, make: impl Fn() -> Command) {
+        let open: Vec<(DocId, mpsc::Sender<Command>)> = {
+            let open = self.open.lock().unwrap_or_else(PoisonError::into_inner);
+            open.iter()
+                .map(|(doc, handle)| (*doc, handle.tx.clone()))
+                .collect()
+        };
+        futures_util::future::join_all(open.iter().map(|(doc, tx)| deliver(*doc, tx, make())))
+            .await;
+    }
+
+    /// The command channel of `doc`'s room, if it is open.
+    pub(crate) fn sender(&self, doc: DocId) -> Option<mpsc::Sender<Command>> {
+        let open = self.open.lock().unwrap_or_else(PoisonError::into_inner);
+        open.get(&doc).map(|handle| handle.tx.clone())
+    }
+
     fn close(&self, doc: DocId, generation: u64) {
         let mut open = self.open.lock().unwrap_or_else(PoisonError::into_inner);
         if open.get(&doc).is_some_and(|h| h.generation == generation) {
             open.remove(&doc);
         }
+    }
+}
+
+/// Queues `cmd` for `doc`'s room on `tx`, waiting at most [`ACCESS_SEND_WAIT`] for room. A room
+/// that has ended needs nothing: whoever joins next is checked afresh. If the room is still
+/// busy after the wait, the command is handed to a task that keeps waiting, so the change
+/// arrives late rather than never, and the caller is not held up.
+async fn deliver(doc: DocId, tx: &mpsc::Sender<Command>, cmd: Command) {
+    if let Err(mpsc::error::SendTimeoutError::Timeout(cmd)) =
+        tx.send_timeout(cmd, ACCESS_SEND_WAIT).await
+    {
+        eprintln!(
+            "sharecraft-server: room of document {} is not keeping up; an access change is              delivered late",
+            doc.0
+        );
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            // The room may end meanwhile, which needs nothing.
+            let _ = tx.send(cmd).await;
+        });
     }
 }
 
@@ -964,6 +1075,108 @@ mod tests {
                 if *id == op_id && reason == "read_only"),
             "{got:?}"
         );
+    }
+
+    #[test]
+    fn set_access_for_someone_absent_does_nothing() {
+        let mut room = new_room();
+        let a = ClientId(Uuid::from_u128(1));
+        let mut rx = join(&mut room, 1, a);
+        frames(&mut rx);
+        let absent = UserId(Uuid::from_u128(99));
+        for role in [None, Some(Role::Viewer), Some(Role::Owner)] {
+            room.handle(Command::SetAccess { user: absent, role });
+        }
+        room.handle(Command::EndSession {
+            session: SessionId(Uuid::from_u128(99)),
+        });
+        room.handle(Command::RemoveUser { user: absent });
+        assert_eq!(room.members.len(), 1);
+        assert_eq!(room.members[0].role, Role::Editor);
+        assert!(frames(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn removed_is_the_last_frame_queued() {
+        let mut room = new_room();
+        let a = ClientId(Uuid::from_u128(1));
+        let b = ClientId(Uuid::from_u128(2));
+        let mut rx_a = join(&mut room, 1, a);
+        let mut rx_b = join(&mut room, 2, b);
+        frames(&mut rx_a);
+        room.handle(Command::SetAccess {
+            user: UserId(b.0),
+            role: None,
+        });
+        let got = frames(&mut rx_b);
+        assert!(
+            matches!(
+                got.last(),
+                Some(ServerMsg::Removed {
+                    reason: RemovedReason::AccessRevoked
+                })
+            ),
+            "{got:?}"
+        );
+        // The room let go of the queue, so the connection ends after that frame.
+        assert!(matches!(
+            rx_b.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ));
+        let seen = frames(&mut rx_a);
+        assert!(
+            matches!(seen.as_slice(), [ServerMsg::People { participants }]
+                if participants.len() == 1 && participants[0].client == a),
+            "{seen:?}"
+        );
+
+        // A change the removed connection sends afterwards is ignored.
+        room.handle(Command::Submit {
+            conn: 2,
+            client: b,
+            op_id: OpId(Uuid::from_u128(5)),
+            base: Seq(0),
+            op: TextOp::replace(0, 0, 0, "late").unwrap(),
+        });
+        assert_eq!(room.log.head(), Seq(0));
+    }
+
+    #[test]
+    fn role_change_tells_only_when_editing_changes() {
+        let mut room = new_room();
+        let a = ClientId(Uuid::from_u128(1));
+        let mut rx = join(&mut room, 1, a);
+        frames(&mut rx);
+        let user = UserId(a.0);
+
+        // Editor to owner: nothing visible to them changes, but the list is sent again.
+        room.handle(Command::SetAccess {
+            user,
+            role: Some(Role::Owner),
+        });
+        let got = frames(&mut rx);
+        assert!(
+            matches!(got.as_slice(), [ServerMsg::People { .. }]),
+            "{got:?}"
+        );
+
+        room.handle(Command::SetAccess {
+            user,
+            role: Some(Role::Viewer),
+        });
+        let got = frames(&mut rx);
+        assert!(
+            matches!(got.as_slice(), [ServerMsg::Access { can_edit: false }, ServerMsg::People { participants }]
+                if !participants[0].can_edit),
+            "{got:?}"
+        );
+
+        // The same role again changes nothing.
+        room.handle(Command::SetAccess {
+            user,
+            role: Some(Role::Viewer),
+        });
+        assert!(frames(&mut rx).is_empty());
     }
 
     #[test]

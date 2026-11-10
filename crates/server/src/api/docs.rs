@@ -191,7 +191,7 @@ pub(crate) async fn share(
         .map_err(|e| ApiError::unavailable(&e))?
         .ok_or(ApiError::NoSuchUser)?;
     db.set_access(actor, doc, user.id, Some(role)).await?;
-    after_access_change(&state, doc, user.id);
+    after_access_change(&state, doc, user.id).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -207,6 +207,6 @@ pub(crate) async fn unshare(
         .db()
         .set_access(signed.session.user.id, doc, user, None)
         .await?;
-    after_access_change(&state, doc, user);
+    after_access_change(&state, doc, user).await;
     Ok(StatusCode::NO_CONTENT)
 }

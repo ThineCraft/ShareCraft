@@ -19,7 +19,7 @@ use collab_core::client_state::{ClientState, Outgoing};
 use collab_core::ids::{ClientId, DocId, OpId, Seq, UserId};
 use collab_text::{TextDoc, TextOp};
 use futures_util::{SinkExt, StreamExt};
-use protocol::{ClientMsg, Participant, Resume, RoomEpoch, SaveState, ServerMsg};
+use protocol::{ClientMsg, Participant, RemovedReason, Resume, RoomEpoch, SaveState, ServerMsg};
 use records::test_support::TestDb;
 use records::{Db, NewUser, Role};
 use reqwest::header::{COOKIE, HeaderMap, HeaderValue, ORIGIN, SET_COOKIE};
@@ -418,6 +418,25 @@ pub async fn wait_stored_in(library: &Path, doc: DocId, text: &str) {
     }
 }
 
+/// Starts a server like [`spawn_server`], and returns its state too, for the test hooks on
+/// [`AppState`].
+pub async fn spawn_server_with_state() -> (TestServer, AppState) {
+    let data_dir = tempfile::tempdir().unwrap();
+    let db = TestDb::create().await;
+    let config = config_at(data_dir.path(), &db);
+    let store = RevisionStore::open(&server::library_path(data_dir.path())).unwrap();
+    let listener = tokio::net::TcpListener::bind(config.addr).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let state = AppState::new(config, Arc::new(store), db.db.clone());
+    tokio::spawn(fail_loudly(server::serve_state(state.clone(), listener)));
+    let server = TestServer {
+        site: Site::new(addr, db.db.clone()),
+        data_dir,
+        db,
+    };
+    (server, state)
+}
+
 /// Starts a server whose rooms load and save through the checkpointer `make` builds from the
 /// library repository path.
 pub async fn spawn_server_with(make: impl FnOnce(&Path) -> Arc<dyn Checkpointer>) -> TestServer {
@@ -506,6 +525,12 @@ pub struct TestClient {
     pub closed: bool,
     /// The room lifetime from the last `Joined` or `Reset`.
     pub epoch: Option<RoomEpoch>,
+    /// Why the server removed this session, once it has. A page that is removed does not
+    /// reconnect, and neither does this client: [`TestClient::reconnect`] refuses.
+    pub removed: Option<RemovedReason>,
+    /// Whether this connection may change the text, from the last `Joined`, `Reset` or
+    /// `Access`.
+    pub can_edit: bool,
 }
 
 impl TestClient {
@@ -558,6 +583,8 @@ impl TestClient {
             joined: false,
             closed: false,
             epoch: None,
+            removed: None,
+            can_edit: false,
         };
         c.send(&ClientMsg::Join { client, resume }).await;
         c
@@ -707,6 +734,7 @@ impl TestClient {
                 seq,
                 snapshot,
                 participants,
+                can_edit,
                 ..
             } => {
                 if let Some(text) = snapshot {
@@ -714,16 +742,19 @@ impl TestClient {
                 }
                 self.people = participants;
                 self.epoch = Some(epoch);
+                self.can_edit = can_edit;
                 self.joined = true;
             }
             ServerMsg::Reset {
                 epoch,
                 seq,
                 snapshot,
+                can_edit,
                 ..
             } => {
                 self.state.reset(TextDoc::new(snapshot), seq);
                 self.epoch = Some(epoch);
+                self.can_edit = can_edit;
                 self.joined = true;
             }
             ServerMsg::Committed { entry } => {
@@ -737,10 +768,9 @@ impl TestClient {
                 }
             }
             ServerMsg::People { participants } => self.people = participants,
-            ServerMsg::Save { .. }
-            | ServerMsg::Refused { .. }
-            | ServerMsg::Access { .. }
-            | ServerMsg::Removed { .. } => {}
+            ServerMsg::Access { can_edit } => self.can_edit = can_edit,
+            ServerMsg::Removed { reason } => self.removed = Some(reason),
+            ServerMsg::Save { .. } | ServerMsg::Refused { .. } => {}
         }
     }
 
@@ -768,6 +798,11 @@ impl TestClient {
     /// `Joined` or `Reset`. After `Joined` the change in flight is resent (the server drops it
     /// if it was already committed); after `Reset` it has been discarded.
     pub async fn reconnect(&mut self) {
+        assert!(
+            self.removed.is_none(),
+            "a removed session does not reconnect ({:?})",
+            self.removed
+        );
         self.socket = Some(open_socket(self.addr, self.doc, &self.user).await);
         self.joined = false;
         self.closed = false;

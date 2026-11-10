@@ -22,6 +22,7 @@ use uuid::Uuid;
 
 use crate::AppState;
 use crate::auth::same_origin;
+use crate::room::Command;
 
 /// Largest request body accepted.
 const MAX_BODY: usize = 16 * 1024;
@@ -160,14 +161,41 @@ fn parse_id(text: &str) -> Result<Uuid, ApiError> {
     Uuid::parse_str(text).map_err(|_| ApiError::InvalidRequest)
 }
 
-/// Called after `user`'s access to `doc` was granted, changed or removed. Does nothing yet.
-fn after_access_change(_state: &AppState, _doc: DocId, _user: UserId) {}
+/// Called after `user`'s access to `doc` was granted, changed or removed, once the change is
+/// stored. Reads their role afresh, so an administrator who loses a grant stays an owner, and
+/// tells the document's room: connections that lost access are removed, the others get their
+/// new rights. If the role cannot be read, their connections are removed, as access can no
+/// longer be confirmed.
+async fn after_access_change(state: &AppState, doc: DocId, user: UserId) {
+    let role = match state.db().role(user, doc).await {
+        Ok(role) => role,
+        Err(e) => {
+            eprintln!("sharecraft-server: database failure: {e}");
+            None
+        }
+    };
+    state
+        .rooms()
+        .send_to(doc, Command::SetAccess { user, role })
+        .await;
+}
 
-/// Called after `user`'s account was disabled. Does nothing yet.
-fn after_account_disabled(_state: &AppState, _user: UserId) {}
+/// Called after `user`'s account was disabled: their connections to every document are removed.
+async fn after_account_disabled(state: &AppState, user: UserId) {
+    state
+        .rooms()
+        .send_all(|| Command::RemoveUser { user })
+        .await;
+}
 
-/// Called after `session` was ended by its owner signing out. Does nothing yet.
-fn after_sign_out(_state: &AppState, _session: SessionId) {}
+/// Called after `session` was ended by its owner signing out: that session's connections are
+/// removed; the same person's other sign-ins stay.
+async fn after_sign_out(state: &AppState, session: SessionId) {
+    state
+        .rooms()
+        .send_all(|| Command::EndSession { session })
+        .await;
+}
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {

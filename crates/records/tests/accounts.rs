@@ -212,6 +212,44 @@ async fn ended_and_expired_sessions_are_not_found() {
 }
 
 #[tokio::test]
+async fn session_by_id_follows_the_same_rules_as_by_token() {
+    let test = TestDb::create().await;
+    let root = admin(&test).await;
+    let ann = test
+        .db
+        .create_user(Some(root.id), new_user("ann@x.test", "Ann", false))
+        .await
+        .unwrap();
+    let (session, token) = test.db.sign_in("ann@x.test", PASSWORD).await.unwrap();
+    let found = test.db.session_by_id(session.id).await.unwrap().unwrap();
+    assert_eq!(found, test.db.session(&token).await.unwrap().unwrap());
+    assert_eq!(found.user, ann);
+
+    // Ended.
+    test.db.end_session(session.id).await.unwrap();
+    assert!(test.db.session_by_id(session.id).await.unwrap().is_none());
+
+    // Expired.
+    let (session, _) = test.db.sign_in("ann@x.test", PASSWORD).await.unwrap();
+    sqlx::query("update sessions set expires_at = now() - interval '1 second' where id = $1")
+        .bind(session.id.0)
+        .execute(test.db.test_pool())
+        .await
+        .unwrap();
+    assert!(test.db.session_by_id(session.id).await.unwrap().is_none());
+
+    // The account disabled.
+    let (session, _) = test.db.sign_in("ann@x.test", PASSWORD).await.unwrap();
+    assert!(test.db.session_by_id(session.id).await.unwrap().is_some());
+    test.db.set_disabled(root.id, ann.id, true).await.unwrap();
+    assert!(test.db.session_by_id(session.id).await.unwrap().is_none());
+
+    // Unknown.
+    let unknown = collab_core::ids::SessionId(uuid::Uuid::new_v4());
+    assert!(test.db.session_by_id(unknown).await.unwrap().is_none());
+}
+
+#[tokio::test]
 async fn disabling_ends_sessions_and_blocks_sign_in() {
     let test = TestDb::create().await;
     let root = admin(&test).await;
