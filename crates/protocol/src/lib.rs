@@ -7,6 +7,22 @@
 use collab_core::document::Entry;
 use collab_core::ids::{ClientId, OpId, Seq};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+/// Identifies one lifetime of a document's room. Log positions restart whenever a room is
+/// created, so a position only means something together with the epoch it was issued in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RoomEpoch(pub Uuid);
+
+/// Where a reconnecting client left off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Resume {
+    /// The room lifetime the client was in.
+    pub epoch: RoomEpoch,
+    /// Last sequence the client applied in that room.
+    pub seq: Seq,
+}
 
 /// Someone connected to a document.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -35,12 +51,12 @@ pub enum SaveState {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMsg<Op> {
-    /// Enter a document. `since` is the last sequence applied, when reconnecting.
+    /// Enter a document. `resume` says where the client left off, when reconnecting.
     Join {
         /// The connection's identifier.
         client: ClientId,
-        /// Last sequence the client applied, if reconnecting.
-        since: Option<Seq>,
+        /// The room lifetime and last sequence the client applied, if reconnecting.
+        resume: Option<Resume>,
     },
     /// Propose a change.
     Submit {
@@ -62,20 +78,24 @@ pub enum ClientMsg<Op> {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMsg<Op> {
-    /// Join accepted. `snapshot` is `None` when `since` was honoured; the missed entries follow
-    /// as `Committed` messages.
+    /// Join accepted. `snapshot` is `None` when `resume` was honoured; the missed entries
+    /// follow as `Committed` messages.
     Joined {
+        /// The room's lifetime; send it back in `resume` when reconnecting.
+        epoch: RoomEpoch,
         /// Current sequence.
         seq: Seq,
-        /// Full text, unless `since` was honoured.
+        /// Full text, unless `resume` was honoured.
         snapshot: Option<String>,
         /// Stored revision the document is based on.
         revision: Option<String>,
         /// Who is here.
         participants: Vec<Participant>,
     },
-    /// `since` could not be honoured; replace local state.
+    /// `resume` could not be honoured; replace local state.
     Reset {
+        /// The room's lifetime; send it back in `resume` when reconnecting.
+        epoch: RoomEpoch,
         /// Current sequence.
         seq: Seq,
         /// Full text.
@@ -137,6 +157,25 @@ mod tests {
     }
 
     #[test]
+    fn join_carries_epoch_and_seq() {
+        let msg = ClientMsg::<TextOp>::Join {
+            client: ClientId(Uuid::nil()),
+            resume: Some(Resume {
+                epoch: RoomEpoch(Uuid::nil()),
+                seq: Seq(4),
+            }),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(
+            json,
+            "{\"type\":\"join\",\"client\":\"00000000-0000-0000-0000-000000000000\",\
+             \"resume\":{\"epoch\":\"00000000-0000-0000-0000-000000000000\",\"seq\":4}}"
+        );
+        let back: ClientMsg<TextOp> = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, msg);
+    }
+
+    #[test]
     fn save_state_is_snake_case() {
         assert_eq!(
             serde_json::to_string(&SaveState::Saved).unwrap(),
@@ -156,6 +195,7 @@ mod tests {
     fn server_messages_round_trip() {
         let msgs: Vec<ServerMsg<u32>> = vec![
             ServerMsg::Joined {
+                epoch: RoomEpoch(Uuid::from_u128(5)),
                 seq: Seq(1),
                 snapshot: None,
                 revision: Some("abc".into()),
@@ -166,6 +206,7 @@ mod tests {
                 }],
             },
             ServerMsg::Reset {
+                epoch: RoomEpoch(Uuid::from_u128(6)),
                 seq: Seq(2),
                 snapshot: "x".into(),
                 revision: None,

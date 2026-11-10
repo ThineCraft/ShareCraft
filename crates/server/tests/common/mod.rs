@@ -15,7 +15,7 @@ use collab_core::client_state::{ClientState, Outgoing};
 use collab_core::ids::{ClientId, DocId, OpId, Seq};
 use collab_text::{TextDoc, TextOp};
 use futures_util::{SinkExt, StreamExt};
-use protocol::{ClientMsg, Participant, ServerMsg};
+use protocol::{ClientMsg, Participant, Resume, RoomEpoch, ServerMsg};
 use server::Config;
 use tempfile::TempDir;
 use tokio::net::TcpStream;
@@ -64,6 +64,8 @@ pub struct TestClient {
     pub joined: bool,
     /// Set when the server closed the current socket.
     pub closed: bool,
+    /// The room lifetime from the last `Joined` or `Reset`.
+    pub epoch: Option<RoomEpoch>,
 }
 
 async fn open(addr: SocketAddr, doc: DocId, name: &str) -> Socket {
@@ -78,17 +80,17 @@ async fn open(addr: SocketAddr, doc: DocId, name: &str) -> Socket {
 impl TestClient {
     /// Opens a socket to `doc` and joins it for the first time.
     pub async fn connect(addr: SocketAddr, doc: DocId, name: &str) -> TestClient {
-        let mut c = TestClient::connect_with_since(addr, doc, name, None).await;
+        let mut c = TestClient::connect_with_resume(addr, doc, name, None).await;
         c.pump_until(|c| c.joined).await;
         c
     }
 
-    /// Opens a socket and sends `Join` with the given `since`, without waiting for a reply.
-    pub async fn connect_with_since(
+    /// Opens a socket and sends `Join` with the given `resume`, without waiting for a reply.
+    pub async fn connect_with_resume(
         addr: SocketAddr,
         doc: DocId,
         name: &str,
-        since: Option<Seq>,
+        resume: Option<Resume>,
     ) -> TestClient {
         let client = ClientId(Uuid::new_v4());
         let mut c = TestClient {
@@ -101,8 +103,9 @@ impl TestClient {
             received: Vec::new(),
             joined: false,
             closed: false,
+            epoch: None,
         };
-        c.send(&ClientMsg::Join { client, since }).await;
+        c.send(&ClientMsg::Join { client, resume }).await;
         c
     }
 
@@ -199,6 +202,7 @@ impl TestClient {
         self.received.push(msg.clone());
         match msg {
             ServerMsg::Joined {
+                epoch,
                 seq,
                 snapshot,
                 participants,
@@ -208,18 +212,25 @@ impl TestClient {
                     self.state.reset(TextDoc::new(text), seq);
                 }
                 self.people = participants;
+                self.epoch = Some(epoch);
                 self.joined = true;
             }
-            ServerMsg::Reset { seq, snapshot, .. } => {
+            ServerMsg::Reset {
+                epoch,
+                seq,
+                snapshot,
+                ..
+            } => {
                 self.state.reset(TextDoc::new(snapshot), seq);
+                self.epoch = Some(epoch);
                 self.joined = true;
             }
             ServerMsg::Committed { entry } => {
-                // A resent confirmation of something already applied is ignored.
-                if entry.seq <= self.state.seq() {
-                    return;
-                }
-                let applied = self.state.committed(&entry).unwrap();
+                // Every entry must be the next one; a duplicate or gap fails the test.
+                let applied = self
+                    .state
+                    .committed(&entry)
+                    .unwrap_or_else(|e| panic!("bad committed entry {entry:?}: {e}"));
                 if let Some(out) = applied.send_next {
                     self.submit(&out).await;
                 }
@@ -229,25 +240,46 @@ impl TestClient {
         }
     }
 
+    /// Closes the socket politely and waits for the server to finish the close.
+    pub async fn close(&mut self) {
+        let Some(mut socket) = self.socket.take() else {
+            return;
+        };
+        let _ = socket.close(None).await;
+        let drained = tokio::time::timeout(TIMEOUT, async {
+            while let Some(Ok(_)) = socket.next().await {}
+        })
+        .await;
+        assert!(drained.is_ok(), "server did not finish closing");
+        self.joined = false;
+    }
+
     /// Drops the socket without reading anything further or closing politely.
     pub fn disconnect(&mut self) {
         self.socket = None;
         self.joined = false;
     }
 
-    /// Opens a new socket, joins with the last applied sequence, resends the change in
-    /// flight and waits for `Joined` or `Reset`.
+    /// Opens a new socket, joins with the room epoch and last applied sequence, and waits for
+    /// `Joined` or `Reset`. After `Joined` the change in flight is resent (the server drops it
+    /// if it was already committed); after `Reset` it has been discarded.
     pub async fn reconnect(&mut self) {
         self.socket = Some(open(self.addr, self.doc, &self.name).await);
         self.joined = false;
         self.closed = false;
         let client = self.state.client();
-        let since = Some(self.state.seq());
-        self.send(&ClientMsg::Join { client, since }).await;
-        if let Some(out) = self.state.in_flight() {
+        let resume = self.epoch.map(|epoch| Resume {
+            epoch,
+            seq: self.state.seq(),
+        });
+        let in_flight = self.state.in_flight();
+        let before = self.received.len();
+        self.send(&ClientMsg::Join { client, resume }).await;
+        self.pump_until(|c| c.joined).await;
+        let resumed = matches!(self.received.get(before), Some(ServerMsg::Joined { .. }));
+        if resumed && let Some(out) = in_flight {
             self.submit(&out).await;
         }
-        self.pump_until(|c| c.joined).await;
     }
 }
 

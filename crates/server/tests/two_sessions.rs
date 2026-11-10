@@ -10,7 +10,7 @@ mod common;
 use collab_core::ids::{OpId, Seq};
 use collab_text::{Component, TextOp};
 use common::{TestClient, new_doc, spawn_server};
-use protocol::{ClientMsg, ServerMsg};
+use protocol::{ClientMsg, Resume, RoomEpoch, ServerMsg};
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
@@ -71,42 +71,146 @@ async fn reconnect_resends_without_duplicating() {
     assert_eq!(a.pending(), 1);
     a.disconnect();
 
+    // The catch-up confirms the change; the resend that follows is dropped by the server.
+    // `TestClient` fails on any entry that is not the next one, so a duplicate would panic.
     a.reconnect().await;
     a.pump_until(|c| c.pending() == 0).await;
     assert_eq!(a.text(), "abc");
+    assert_eq!(b.text(), "abc");
     assert_eq!(a.seq(), Seq(1));
-    // The resend is answered with the existing entry again, not a new one.
-    a.pump_until(|c| {
-        c.received
-            .iter()
-            .filter(|m| matches!(m, ServerMsg::Committed { entry } if entry.seq == Seq(1)))
-            .count()
-            == 2
-    })
-    .await;
 
-    // A further change lands at seq 2, so the resend was not committed a second time.
+    // A further change lands at seq 2, so the resend was not committed a second time, and it
+    // is the next thing A receives, so no duplicate entry was delivered in between.
     b.type_at(3, "!").await;
     a.pump_until(|c| c.seq() == Seq(2)).await;
     b.pump_until(|c| c.seq() == Seq(2) && c.pending() == 0)
         .await;
     assert_eq!(a.text(), "abc!");
     assert_eq!(b.text(), "abc!");
+    assert_eq!(committed_seqs(&a), vec![1, 2]);
+    assert_eq!(committed_seqs(&b), vec![1, 2]);
+}
+
+fn committed_seqs(c: &TestClient) -> Vec<u64> {
+    c.received
+        .iter()
+        .filter_map(|m| match m {
+            ServerMsg::Committed { entry } => Some(entry.seq.0),
+            _ => None,
+        })
+        .collect()
 }
 
 #[tokio::test]
 async fn unknown_since_gets_reset() {
     let server = spawn_server().await;
-    let mut c = TestClient::connect_with_since(server.addr, new_doc(), "C", Some(Seq(40))).await;
+    let resume = Resume {
+        epoch: RoomEpoch(Uuid::new_v4()),
+        seq: Seq(40),
+    };
+    let mut c = TestClient::connect_with_resume(server.addr, new_doc(), "C", Some(resume)).await;
     c.pump_until(|c| c.joined).await;
     assert!(
         matches!(
             c.received.first(),
-            Some(ServerMsg::Reset { seq: Seq(0), snapshot, revision: None }) if snapshot.is_empty()
+            Some(ServerMsg::Reset { seq: Seq(0), snapshot, revision: None, .. }) if snapshot.is_empty()
         ),
         "{:?}",
         c.received
     );
+}
+
+#[tokio::test]
+async fn resume_into_a_new_room_gets_reset() {
+    let server = spawn_server().await;
+    let doc = new_doc();
+    let mut a = TestClient::connect(server.addr, doc, "A").await;
+    a.type_at(0, "x").await;
+    a.pump_until(|c| c.seq() == Seq(1) && c.pending() == 0)
+        .await;
+    a.type_at(1, "y").await;
+    a.pump_until(|c| c.seq() == Seq(2) && c.pending() == 0)
+        .await;
+    let old_epoch = a.epoch;
+    a.disconnect();
+
+    // A was alone, so its room ends once the server sees it leave. Join until a client lands
+    // in a new room (a client that lands in the old one leaves again, which also ends it).
+    let deadline = tokio::time::Instant::now() + common::TIMEOUT;
+    let mut c = loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "old room never ended"
+        );
+        let mut c = TestClient::connect(server.addr, doc, "C").await;
+        if c.epoch != old_epoch {
+            break c;
+        }
+        c.close().await;
+    };
+    assert_eq!(c.text(), "");
+    c.type_at(0, "12").await;
+    c.pump_until(|c| c.seq() == Seq(1) && c.pending() == 0)
+        .await;
+    c.type_at(2, "34").await;
+    c.pump_until(|c| c.seq() == Seq(2) && c.pending() == 0)
+        .await;
+
+    // A's position (seq 2) exists in the new room too, but belongs to the old one.
+    let before = a.received.len();
+    a.reconnect().await;
+    assert!(
+        matches!(a.received.get(before), Some(ServerMsg::Reset { .. })),
+        "{:?}",
+        &a.received[before..]
+    );
+    assert_eq!(a.text(), c.text());
+    assert_eq!(a.text(), "1234");
+    assert_eq!(a.seq(), Seq(2));
+}
+
+#[tokio::test]
+async fn cross_site_origin_is_refused() {
+    let server = spawn_server().await;
+    let status = handshake_status(server.addr, &[("Origin", "http://evil.example")]).await;
+    assert_eq!(status, 403);
+}
+
+#[tokio::test]
+async fn same_origin_is_accepted() {
+    let server = spawn_server().await;
+    let origin = format!("http://{}", server.addr);
+    let status = handshake_status(server.addr, &[("Origin", &origin)]).await;
+    assert_eq!(status, 101);
+}
+
+#[tokio::test]
+async fn non_loopback_host_header_is_refused() {
+    let server = spawn_server().await;
+    let status = handshake_status(server.addr, &[("Host", "evil.example:8787")]).await;
+    assert_eq!(status, 403);
+}
+
+/// Attempts a WebSocket handshake with extra headers and returns the HTTP status.
+async fn handshake_status(addr: std::net::SocketAddr, headers: &[(&str, &str)]) -> u16 {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
+    let url = format!("ws://{addr}/ws/docs/{}?name=X", new_doc().0);
+    let mut request = url.into_client_request().unwrap();
+    for (name, value) in headers {
+        request.headers_mut().insert(
+            HeaderName::from_bytes(name.as_bytes()).unwrap(),
+            HeaderValue::from_str(value).unwrap(),
+        );
+    }
+    let result = tokio::time::timeout(common::TIMEOUT, tokio_tungstenite::connect_async(request))
+        .await
+        .unwrap();
+    match result {
+        Ok((_, response)) => response.status().as_u16(),
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => response.status().as_u16(),
+        Err(other) => panic!("unexpected error {other:?}"),
+    }
 }
 
 #[tokio::test]

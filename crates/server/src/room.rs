@@ -10,8 +10,9 @@ use collab_core::document::Submitted;
 use collab_core::ids::{ClientId, DocId, OpId, Seq};
 use collab_core::server_log::ServerLog;
 use collab_text::{TextDoc, TextOp};
-use protocol::{Participant, ServerMsg};
+use protocol::{Participant, Resume, RoomEpoch, ServerMsg};
 use tokio::sync::{mpsc, oneshot};
+use uuid::Uuid;
 
 /// Identifies one WebSocket connection, so a replaced connection's late messages are ignored.
 pub(crate) type ConnId = u64;
@@ -40,7 +41,7 @@ pub(crate) enum Command {
         conn: ConnId,
         client: ClientId,
         name: String,
-        since: Option<Seq>,
+        resume: Option<Resume>,
         tx: mpsc::Sender<Outbound>,
         /// Answered once the join is handled; dropped if the room closed first.
         accepted: oneshot::Sender<()>,
@@ -83,19 +84,22 @@ struct Member {
 /// The state of one open document. Handling a command never blocks: frames are queued with
 /// `try_send` and a connection whose queue is full or closed is dropped.
 pub(crate) struct Room {
+    /// This lifetime of the room; log positions only mean something within it.
+    epoch: RoomEpoch,
     log: ServerLog<TextDoc>,
     revision: Option<String>,
     /// In joining order.
     members: Vec<Member>,
     /// Each client's last committed change, so a resend is recognised however much of the log
     /// is kept.
-    last_committed: HashMap<ClientId, (OpId, Seq)>,
+    last_committed: HashMap<ClientId, OpId>,
 }
 
 impl Room {
-    /// A room holding `initial`, with its log at `Seq(0)`.
+    /// A room holding `initial`, with its log at `Seq(0)` and a fresh random epoch.
     pub(crate) fn new(initial: Initial) -> Self {
         Self {
+            epoch: RoomEpoch(Uuid::new_v4()),
             log: ServerLog::new(initial.doc, Seq(0)),
             revision: initial.revision,
             members: Vec::new(),
@@ -115,11 +119,11 @@ impl Room {
                 conn,
                 client,
                 name,
-                since,
+                resume,
                 tx,
                 accepted,
             } => {
-                self.join(conn, client, name, since, tx);
+                self.join(conn, client, name, resume, tx);
                 // The connection may have gone away meanwhile; nothing to do then.
                 let _ = accepted.send(());
             }
@@ -140,7 +144,7 @@ impl Room {
         conn: ConnId,
         client: ClientId,
         name: String,
-        since: Option<Seq>,
+        resume: Option<Resume>,
         tx: mpsc::Sender<Outbound>,
     ) {
         let member = Member {
@@ -156,35 +160,41 @@ impl Room {
             None => self.members.push(member),
         }
 
+        let epoch = self.epoch;
         let seq = self.log.head();
         let text = self.log.doc().as_str().to_owned();
         let revision = self.revision.clone();
         let mut msgs = Vec::new();
-        match since {
-            None => msgs.push(ServerMsg::Joined {
+        // A position from another lifetime of this room means nothing here.
+        let missed = resume
+            .filter(|r| r.epoch == epoch)
+            .and_then(|r| self.log.since(r.seq));
+        match (resume, missed) {
+            (None, _) => msgs.push(ServerMsg::Joined {
+                epoch,
                 seq,
                 snapshot: Some(text),
                 revision,
                 participants: self.participants(),
             }),
-            Some(since) => match self.log.since(since) {
-                Some(missed) => {
-                    msgs.push(ServerMsg::Joined {
-                        seq,
-                        snapshot: None,
-                        revision,
-                        participants: self.participants(),
-                    });
-                    msgs.extend(missed.iter().map(|entry| ServerMsg::Committed {
-                        entry: entry.clone(),
-                    }));
-                }
-                None => msgs.push(ServerMsg::Reset {
+            (Some(_), Some(missed)) => {
+                msgs.push(ServerMsg::Joined {
+                    epoch,
                     seq,
-                    snapshot: text,
+                    snapshot: None,
                     revision,
-                }),
-            },
+                    participants: self.participants(),
+                });
+                msgs.extend(missed.iter().map(|entry| ServerMsg::Committed {
+                    entry: entry.clone(),
+                }));
+            }
+            (Some(_), None) => msgs.push(ServerMsg::Reset {
+                epoch,
+                seq,
+                snapshot: text,
+                revision,
+            }),
         }
         let frames = msgs.iter().filter_map(encode).collect();
         self.send(Some(client), &Outbound::Many(frames));
@@ -195,20 +205,19 @@ impl Room {
         if !self.is_current(conn, client) {
             return;
         }
-        if let Some(&(last_op, last_seq)) = self.last_committed.get(&client)
-            && last_op == op_id
-        {
-            self.resend(client, last_seq);
+        // A resend of a committed change is dropped silently: this connection has already
+        // received the entry through its snapshot, its catch-up or the broadcast.
+        if self.last_committed.get(&client) == Some(&op_id) {
             return;
         }
         match self.log.submit(client, op_id, base, op) {
             Ok(Submitted::Committed(entry)) => {
-                self.last_committed.insert(client, (op_id, entry.seq));
+                self.last_committed.insert(client, op_id);
                 if let Some(frame) = encode(&ServerMsg::Committed { entry }) {
                     self.send(None, &Outbound::One(frame));
                 }
             }
-            Ok(Submitted::Duplicate(seq)) => self.resend(client, seq),
+            Ok(Submitted::Duplicate(_)) => {}
             Err(err) => {
                 let refused = ServerMsg::Refused {
                     op_id,
@@ -218,22 +227,6 @@ impl Room {
                     self.send(Some(client), &Outbound::One(frame));
                 }
             }
-        }
-    }
-
-    /// Sends `client` the entry at `seq` again, if the log still holds it.
-    fn resend(&mut self, client: ClientId, seq: Seq) {
-        let Some(before) = seq.0.checked_sub(1) else {
-            return;
-        };
-        let entry = self
-            .log
-            .since(Seq(before))
-            .and_then(<[_]>::first)
-            .filter(|e| e.seq == seq)
-            .cloned();
-        if let Some(frame) = entry.and_then(|entry| encode(&ServerMsg::Committed { entry })) {
-            self.send(Some(client), &Outbound::One(frame));
         }
     }
 
@@ -402,7 +395,7 @@ mod tests {
             conn,
             client,
             name: "A".into(),
-            since: None,
+            resume: None,
             tx,
             accepted,
         });
@@ -448,30 +441,66 @@ mod tests {
         submit(&mut room, client, op_id, Seq(0), "abc");
         assert_eq!(room.log.doc().as_str(), "abc");
         assert_eq!(room.log.head(), Seq(1));
-        // The entry is gone from the log, so nothing is resent and nothing is refused.
+        // The entry is gone from the log; the resend is still recognised and dropped silently.
         assert!(frames(&mut rx).is_empty());
     }
 
     #[test]
-    fn resend_of_kept_entry_is_confirmed_again_to_sender_only() {
+    fn resend_of_kept_entry_is_dropped_silently() {
         let mut room = Room::new(Initial::default());
         let a = ClientId(Uuid::from_u128(1));
         let b = ClientId(Uuid::from_u128(3));
-        let op_id = OpId(Uuid::from_u128(2));
+        let first = OpId(Uuid::from_u128(2));
+        let second = OpId(Uuid::from_u128(4));
         let mut rx_a = join(&mut room, 1, a);
         let mut rx_b = join(&mut room, 2, b);
-        submit(&mut room, a, op_id, Seq(0), "abc");
+        submit(&mut room, a, first, Seq(0), "abc");
+        room.handle(Command::Submit {
+            conn: 1,
+            client: a,
+            op_id: second,
+            base: Seq(1),
+            op: TextOp::replace(3, 3, 0, "d").unwrap(),
+        });
         frames(&mut rx_a);
         frames(&mut rx_b);
 
-        submit(&mut room, a, op_id, Seq(0), "abc");
-        assert_eq!(room.log.head(), Seq(1));
-        let again = frames(&mut rx_a);
-        assert!(
-            matches!(again.as_slice(), [ServerMsg::Committed { entry }] if entry.seq == Seq(1)),
-            "{again:?}"
-        );
+        // The last change is caught by the room's own record ...
+        submit(&mut room, a, second, Seq(1), "x");
+        // ... and an earlier one by the log's duplicate check.
+        submit(&mut room, a, first, Seq(0), "abc");
+        assert_eq!(room.log.head(), Seq(2));
+        assert_eq!(room.log.doc().as_str(), "abcd");
+        assert!(frames(&mut rx_a).is_empty());
         assert!(frames(&mut rx_b).is_empty());
+    }
+
+    #[test]
+    fn resume_from_another_epoch_is_reset() {
+        let mut room = Room::new(Initial::default());
+        let a = ClientId(Uuid::from_u128(1));
+        let _rx_a = join(&mut room, 1, a);
+        submit(&mut room, a, OpId(Uuid::from_u128(2)), Seq(0), "abc");
+
+        let (tx, mut rx) = mpsc::channel(OUTBOUND_CAPACITY);
+        let (accepted, _) = oneshot::channel();
+        room.handle(Command::Join {
+            conn: 2,
+            client: ClientId(Uuid::from_u128(5)),
+            name: "B".into(),
+            resume: Some(Resume {
+                epoch: RoomEpoch(Uuid::from_u128(99)),
+                seq: Seq(1),
+            }),
+            tx,
+            accepted,
+        });
+        let got = frames(&mut rx);
+        assert!(
+            matches!(got.first(), Some(ServerMsg::Reset { epoch, seq: Seq(1), snapshot, .. })
+                if *epoch == room.epoch && snapshot == "abc"),
+            "{got:?}"
+        );
     }
 
     #[test]

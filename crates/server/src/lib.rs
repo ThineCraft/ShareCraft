@@ -1,4 +1,4 @@
-﻿#![forbid(unsafe_code)]
+#![forbid(unsafe_code)]
 //! The ShareCraft session server: one room per open document, reached over WebSocket.
 //!
 //! Each room owns its document's ordered change log, commits changes in arrival order and
@@ -84,7 +84,42 @@ pub fn router(state: AppState) -> Router {
 /// Serves `config` on `listener` until the process ends.
 ///
 /// # Errors
-/// Returns an error if accepting connections fails.
+/// Returns an error if the listener is not on a loopback address, or if accepting connections
+/// fails.
 pub async fn serve(config: Config, listener: TcpListener) -> std::io::Result<()> {
+    require_loopback(listener.local_addr()?)?;
     axum::serve(listener, router(AppState::new(config))).await
+}
+
+/// There is no sign-in yet, so the server only ever listens on a loopback address.
+fn require_loopback(addr: std::net::SocketAddr) -> std::io::Result<()> {
+    if addr.ip().is_loopback() {
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!("refusing to serve on {addr}: only loopback addresses are allowed"),
+    ))
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+mod tests {
+    use super::*;
+
+    // `serve` applies this to the listener's address. A real non-loopback listener is not
+    // bound in tests: on Windows that raises a firewall prompt.
+    #[test]
+    fn non_loopback_listener_is_refused() {
+        let err = require_loopback("0.0.0.0:8787".parse().unwrap()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(require_loopback("192.168.1.5:80".parse().unwrap()).is_err());
+        assert!(require_loopback("127.0.0.1:0".parse().unwrap()).is_ok());
+        assert!(require_loopback("[::1]:0".parse().unwrap()).is_ok());
+    }
 }

@@ -11,6 +11,7 @@ workspace = true
 [dependencies]
 collab-core = { path = "../collab-core" }
 serde = { version = "1.0.229", features = ["derive"] }
+uuid = { version = "1.29.2", features = ["serde"] }
 
 [dev-dependencies]
 collab-text = { path = "../collab-text" }

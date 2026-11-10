@@ -1,4 +1,4 @@
-﻿#![forbid(unsafe_code)]
+#![forbid(unsafe_code)]
 //! `sharecraft-server`: reads its settings from the environment and serves until stopped.
 
 use std::process::ExitCode;
