@@ -24,13 +24,16 @@ pub struct Config {
     pub checkpoint_idle: Duration,
     /// A checkpoint is written at the latest this long after the first unsaved change.
     pub checkpoint_max: Duration,
+    /// How long a document's room stays open after its last participant leaves, so a browser
+    /// that reconnects within this time resumes where it left off.
+    pub room_grace: Duration,
 }
 
 /// Why the settings could not be used.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ConfigError {
     /// The address could not be parsed.
-    #[error("SHARECRAFT_ADDR {0:?} is not an address of the form host:port")]
+    #[error("SHARECRAFT_ADDR {0:?} is not an IP address and port, for example 127.0.0.1:8787")]
     BadAddr(String),
     /// The address is reachable from other machines; there is no sign-in yet.
     #[error("SHARECRAFT_ADDR {0} is not a loopback address; only local connections are allowed")]
@@ -69,6 +72,7 @@ impl Config {
             web_dir: PathBuf::from(web_dir.unwrap_or(DEFAULT_WEB)),
             checkpoint_idle: Duration::from_secs(2),
             checkpoint_max: Duration::from_secs(30),
+            room_grace: Duration::from_secs(60),
         })
     }
 }
@@ -76,7 +80,8 @@ impl Config {
 /// Parses a listening address and refuses any that is not loopback.
 ///
 /// # Errors
-/// `BadAddr` if `s` is not `host:port`, `NotLoopback` if the host is not a loopback address.
+/// `BadAddr` if `s` is not an IP address and port, `NotLoopback` if the host is not a loopback
+/// address.
 pub fn parse_addr(s: &str) -> Result<SocketAddr, ConfigError> {
     let addr: SocketAddr = s
         .trim()
@@ -114,6 +119,7 @@ mod tests {
         assert_eq!(c.web_dir, PathBuf::from("./web"));
         assert_eq!(c.checkpoint_idle, Duration::from_secs(2));
         assert_eq!(c.checkpoint_max, Duration::from_secs(30));
+        assert_eq!(c.room_grace, Duration::from_secs(60));
     }
 
     #[test]

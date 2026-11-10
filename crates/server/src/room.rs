@@ -2,11 +2,14 @@
 //! connected to it, and receives commands from the connections over a channel.
 //!
 //! The room loads its document when it opens and writes checkpoints while it runs (see
-//! [`Schedule`]). It ends once nobody is connected and everything is saved.
+//! [`Schedule`]). When the last participant leaves it saves at once, then stays open for a
+//! grace period so a browser that reconnects resumes where it left off. It ends once nobody
+//! has been connected for the grace period and everything is saved (or saving was given up).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use axum::extract::ws::Utf8Bytes;
 use collab_core::document::Submitted;
@@ -177,6 +180,11 @@ impl Room {
             }
             None => {}
         }
+    }
+
+    /// Whether nobody is connected.
+    fn is_empty(&self) -> bool {
+        self.members.is_empty()
     }
 
     /// Whether the room can end: nobody is connected and everything is saved (or saving was
@@ -432,7 +440,7 @@ pub(crate) struct Rooms {
 impl Rooms {
     /// The command channel of `doc`'s room, starting the room if it is not open. A new room
     /// loads its document from `store` before handling commands; commands wait in its channel
-    /// meanwhile.
+    /// meanwhile. Once empty, the room stays open for `grace`.
     ///
     /// The channel can be closed by the time it is used, if the room ended meanwhile; the
     /// caller then asks again.
@@ -441,6 +449,7 @@ impl Rooms {
         doc: DocId,
         store: &Arc<dyn Checkpointer>,
         timing: Timing,
+        grace: Duration,
     ) -> mpsc::Sender<Command> {
         let mut open = self.open.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(handle) = open.get(&doc)
@@ -455,7 +464,7 @@ impl Rooms {
             doc,
             generation,
         };
-        tokio::spawn(run(place, rx, Arc::clone(store), timing));
+        tokio::spawn(run(place, rx, Arc::clone(store), timing, grace));
         open.insert(
             doc,
             RoomHandle {
@@ -483,13 +492,14 @@ struct Place {
 
 type Running = JoinHandle<Result<Outcome, CheckpointError>>;
 
-/// Loads the document, then handles commands and writes checkpoints until nobody is connected
-/// and everything is saved.
+/// Loads the document, then handles commands and writes checkpoints until nobody has been
+/// connected for `grace` and everything is saved.
 async fn run(
     place: Place,
     mut rx: mpsc::Receiver<Command>,
     store: Arc<dyn Checkpointer>,
     timing: Timing,
+    grace: Duration,
 ) {
     let doc = place.doc;
     let initial = match load(&store, doc).await {
@@ -511,12 +521,22 @@ async fn run(
 
     let mut room = Room::new(doc, initial, timing);
     let mut running: Option<Running> = None;
+    // The room opens for a join waiting in its channel; until that is handled it is empty.
+    let mut empty_since = Some(Instant::now());
     loop {
         let due = match running {
             Some(_) => None,
             None => room.checkpoint_due(),
         };
+        let now = Instant::now();
+        // Only a grace period still running needs a wake-up; once it is over, the room ends
+        // as soon as everything is saved, which a finishing checkpoint reports.
+        let grace_ends = empty_since
+            .map(|since| grace_end(since, grace))
+            .filter(|end| *end > now);
         tokio::select! {
+            // A waiting join is handled before the room can decide to end.
+            biased;
             cmd = rx.recv() => match cmd {
                 Some(cmd) => room.handle(cmd),
                 // The registry holds a sender until this task removes it, so this does not
@@ -533,8 +553,14 @@ async fn run(
                     running = Some(tokio::task::spawn_blocking(move || job.write(doc, &*store)));
                 }
             }
+            () = sleep_until(grace_ends) => {}
         }
-        if running.is_none() && room.may_end() {
+        empty_since = match (room.is_empty(), empty_since) {
+            (false, _) => None,
+            (true, since) => since.or_else(|| Some(Instant::now())),
+        };
+        let grace_over = empty_since.is_some_and(|since| grace_end(since, grace) <= Instant::now());
+        if grace_over && running.is_none() && room.may_end() {
             break;
         }
     }
@@ -543,6 +569,11 @@ async fn run(
     // Joins queued after the room decided to end are dropped unanswered, so those
     // connections open a fresh room, which loads what this one saved.
     while rx.try_recv().is_ok() {}
+}
+
+/// When the grace period of a room empty since `since` ends.
+fn grace_end(since: Instant, grace: Duration) -> Instant {
+    since.checked_add(grace).unwrap_or(since)
 }
 
 /// Reads the document's current revision without blocking the async workers.

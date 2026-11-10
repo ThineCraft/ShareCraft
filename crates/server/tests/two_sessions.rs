@@ -12,7 +12,10 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use collab_core::ids::{DocId, OpId, Seq};
 use collab_text::{Component, TextOp};
-use common::{TestClient, new_doc, spawn_server, spawn_server_with};
+use common::{
+    SHORT_GRACE, TestClient, new_doc, spawn_server, spawn_server_config, spawn_server_with,
+    wait_out_grace, wait_stored,
+};
 use protocol::{ClientMsg, Resume, RoomEpoch, SaveState, ServerMsg};
 use revisions::{Checkpoint, CheckpointError, Outcome, RevisionStore, Stored};
 use server::Checkpointer;
@@ -126,8 +129,62 @@ async fn unknown_since_gets_reset() {
 }
 
 #[tokio::test]
-async fn resume_into_a_new_room_gets_reset() {
+async fn solo_disconnect_resumes_without_losing_typing() {
     let server = spawn_server().await;
+    let doc = new_doc();
+    let mut a = TestClient::connect(server.addr, doc, "A").await;
+    a.type_at(0, "abc").await;
+    a.pump_until(|c| c.seq() == Seq(1) && c.pending() == 0)
+        .await;
+    a.disconnect();
+    // The room has seen A leave once it saves, which an empty room does at once.
+    wait_stored(&server, doc, "abc").await;
+
+    // Typed while disconnected.
+    a.type_at(3, "def").await;
+    a.type_at(6, "!").await;
+    assert_eq!(a.pending(), 2);
+    let before = a.received.len();
+    a.reconnect().await;
+    assert!(
+        matches!(a.received.get(before), Some(ServerMsg::Joined { .. })),
+        "{:?}",
+        &a.received[before..]
+    );
+    a.pump_until(|c| c.pending() == 0 && c.seq() == Seq(3))
+        .await;
+    assert_eq!(a.text(), "abcdef!");
+
+    let c = TestClient::connect(server.addr, doc, "C").await;
+    assert_eq!(c.text(), "abcdef!");
+}
+
+#[tokio::test]
+async fn room_ends_after_grace_period() {
+    let server = spawn_server_config(|c| c.room_grace = SHORT_GRACE).await;
+    let doc = new_doc();
+    let mut a = TestClient::connect(server.addr, doc, "A").await;
+    a.type_at(0, "abc").await;
+    a.pump_until(|c| c.seq() == Seq(1) && c.pending() == 0)
+        .await;
+    a.disconnect();
+    wait_stored(&server, doc, "abc").await;
+    wait_out_grace().await;
+
+    // The room that knew A's epoch has ended; the new one loaded the saved text.
+    let before = a.received.len();
+    a.reconnect().await;
+    assert!(
+        matches!(a.received.get(before), Some(ServerMsg::Reset { .. })),
+        "{:?}",
+        &a.received[before..]
+    );
+    assert_eq!(a.text(), "abc");
+}
+
+#[tokio::test]
+async fn resume_into_a_new_room_gets_reset() {
+    let server = spawn_server_config(|c| c.room_grace = SHORT_GRACE).await;
     let doc = new_doc();
     let mut a = TestClient::connect(server.addr, doc, "A").await;
     a.type_at(0, "x").await;
@@ -139,20 +196,12 @@ async fn resume_into_a_new_room_gets_reset() {
     let old_epoch = a.epoch;
     a.disconnect();
 
-    // A was alone, so its room ends once the server sees it leave. Join until a client lands
-    // in a new room (a client that lands in the old one leaves again, which also ends it).
-    let deadline = tokio::time::Instant::now() + common::TIMEOUT;
-    let mut c = loop {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "old room never ended"
-        );
-        let mut c = TestClient::connect(server.addr, doc, "C").await;
-        if c.epoch != old_epoch {
-            break c;
-        }
-        c.close().await;
-    };
+    // A was alone, so its room saves once the server sees it leave and ends after the grace
+    // period.
+    wait_stored(&server, doc, "xy").await;
+    wait_out_grace().await;
+    let mut c = TestClient::connect(server.addr, doc, "C").await;
+    assert_ne!(c.epoch, old_epoch, "old room never ended");
     // The old room saved A's text before ending; the new one loads it.
     assert_eq!(c.text(), "xy");
     c.type_at(2, "12").await;
@@ -430,10 +479,12 @@ async fn type_save_and_leave(server: &common::TestServer, doc: DocId) -> (String
 
 #[tokio::test]
 async fn reopening_loads_the_saved_text() {
-    let server = spawn_server().await;
+    let server = spawn_server_config(|c| c.room_grace = SHORT_GRACE).await;
     let doc = new_doc();
     let (text, rev) = type_save_and_leave(&server, doc).await;
     assert_eq!(text, "abcdef");
+    // The room ends, so the next join opens a new one that loads the saved revision.
+    wait_out_grace().await;
 
     let c = TestClient::connect(server.addr, doc, "Cy").await;
     assert_eq!(c.text(), "abcdef");
@@ -450,9 +501,10 @@ async fn reopening_loads_the_saved_text() {
 
 #[tokio::test]
 async fn typing_resumes_from_saved_revision() {
-    let server = spawn_server().await;
+    let server = spawn_server_config(|c| c.room_grace = SHORT_GRACE).await;
     let doc = new_doc();
     let (_, first) = type_save_and_leave(&server, doc).await;
+    wait_out_grace().await;
 
     let mut c = TestClient::connect(server.addr, doc, "Cy").await;
     assert_eq!(c.joined_revision(), Some(first.clone()));
@@ -535,6 +587,32 @@ async fn failed_checkpoint_is_retried_and_reported() {
     let stored = server.store().read(doc, None).unwrap().unwrap();
     assert_eq!(stored.revision.to_string(), rev);
     assert_eq!(stored_text(&stored), "one two");
+}
+
+#[tokio::test]
+async fn final_checkpoint_outlasts_grace_period() {
+    // Three failures with a 100 ms idle time: attempts at about 0, 100, 300 and 700 ms, so the
+    // fourth, which succeeds, comes after the 300 ms grace period.
+    let server = common::spawn_server_with_grace(
+        |path| {
+            Arc::new(Flaky {
+                inner: open_store(path),
+                failures: AtomicUsize::new(3),
+            })
+        },
+        SHORT_GRACE,
+    )
+    .await;
+    let doc = new_doc();
+    let mut a = TestClient::connect(server.addr, doc, "Ann").await;
+    a.type_at(0, "keep").await;
+    a.pump_until(|c| c.pending() == 0 && c.seq() == Seq(1))
+        .await;
+    a.close().await;
+    wait_stored(&server, doc, "keep").await;
+    wait_out_grace().await;
+    let b = TestClient::connect(server.addr, doc, "Bob").await;
+    assert_eq!(b.text(), "keep");
 }
 
 #[tokio::test]

@@ -10,8 +10,10 @@ use tokio::time::Instant;
 
 /// The single library every document lives in until libraries can be chosen.
 const LIBRARY: &str = "00000000-0000-0000-0000-000000000001";
-/// How many more times an empty room tries its final checkpoint after the first attempt fails.
-const FINAL_RETRIES: u32 = 3;
+/// How many times in all an empty room tries its final checkpoint before giving up.
+const FINAL_ATTEMPTS: u32 = 10;
+/// Longest wait between attempts at an empty room's final checkpoint.
+const MAX_FINAL_DELAY: Duration = Duration::from_secs(30);
 
 /// Stores and reads document revisions on behalf of rooms. Calls block, so rooms make them
 /// from a blocking task.
@@ -86,7 +88,8 @@ impl SaveJob {
 pub(crate) enum Finished {
     /// Everything through `through` is stored as `revision`.
     Saved { revision: RevisionId, through: Seq },
-    /// Nothing was stored; it is retried after the idle time.
+    /// Nothing was stored; it is retried after the idle time, or in an empty room after a wait
+    /// that doubles with each failure (see [`final_delay`]).
     Failed {
         through: Seq,
         error: String,
@@ -237,12 +240,15 @@ impl Schedule {
                 Some(Finished::Saved { revision, through })
             }
             Err(error) => {
-                let now = Instant::now();
-                self.retry_at = Some(now.checked_add(self.timing.idle).unwrap_or(now));
-                if empty {
+                let delay = if empty {
                     self.final_failures = self.final_failures.saturating_add(1);
-                    self.gave_up = self.final_failures > FINAL_RETRIES;
-                }
+                    self.gave_up = self.final_failures >= FINAL_ATTEMPTS;
+                    final_delay(self.timing.idle, self.final_failures)
+                } else {
+                    self.timing.idle
+                };
+                let now = Instant::now();
+                self.retry_at = Some(now.checked_add(delay).unwrap_or(now));
                 Some(Finished::Failed {
                     through,
                     error,
@@ -257,6 +263,17 @@ impl Schedule {
     pub(crate) fn may_end(&self, head: Seq) -> bool {
         self.running.is_none() && (self.gave_up || !self.unsaved(head))
     }
+}
+
+/// The wait after an empty room's `failures`-th failed final checkpoint: `idle`, doubled for
+/// each earlier failure, at most [`MAX_FINAL_DELAY`].
+fn final_delay(idle: Duration, failures: u32) -> Duration {
+    let factor = 1u32
+        .checked_shl(failures.saturating_sub(1))
+        .unwrap_or(u32::MAX);
+    idle.checked_mul(factor)
+        .unwrap_or(MAX_FINAL_DELAY)
+        .min(MAX_FINAL_DELAY)
 }
 
 #[cfg(test)]
@@ -319,23 +336,42 @@ mod tests {
     }
 
     #[test]
-    fn empty_room_gives_up_after_its_final_retries() {
+    fn empty_room_gives_up_after_its_final_attempts() {
         let mut s = Schedule::new(None, Seq(0), timing());
         s.changed(author("a"), Seq(1));
-        for attempt in 0..=FINAL_RETRIES {
+        for attempt in 1..=FINAL_ATTEMPTS {
             assert!(!s.may_end(Seq(1)));
             s.start(Seq(1), "x".into()).unwrap();
+            let before = Instant::now();
             let done = s.finish(Err("no".into()), Seq(1), true).unwrap();
             let Finished::Failed { gave_up, .. } = done else {
                 panic!("expected failure");
             };
-            assert_eq!(gave_up, attempt == FINAL_RETRIES);
+            assert_eq!(gave_up, attempt == FINAL_ATTEMPTS);
+            if !gave_up {
+                // The next attempt waits for the delay, which doubles with each failure.
+                let due = s.due(Seq(1), true).unwrap();
+                assert!(due >= before + final_delay(timing().idle, attempt));
+            }
         }
         assert!(s.may_end(Seq(1)));
         assert!(s.due(Seq(1), true).is_none());
         s.joined();
         assert!(!s.may_end(Seq(1)));
         assert!(s.due(Seq(1), false).is_some());
+    }
+
+    #[test]
+    fn final_delay_doubles_from_idle_up_to_thirty_seconds() {
+        let idle = Duration::from_secs(2);
+        let delays: Vec<u64> = (1..=FINAL_ATTEMPTS)
+            .map(|n| final_delay(idle, n).as_secs())
+            .collect();
+        assert_eq!(delays, vec![2, 4, 8, 16, 30, 30, 30, 30, 30, 30]);
+        let quick = Duration::from_millis(100);
+        assert_eq!(final_delay(quick, 1), quick);
+        assert_eq!(final_delay(quick, 3), Duration::from_millis(400));
+        assert_eq!(final_delay(quick, 40), MAX_FINAL_DELAY);
     }
 
     #[test]

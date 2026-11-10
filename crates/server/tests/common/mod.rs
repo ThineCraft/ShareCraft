@@ -63,24 +63,67 @@ fn test_config(data_dir: &TempDir) -> Config {
         web_dir: data_dir.path().join("web"),
         checkpoint_idle: Duration::from_millis(100),
         checkpoint_max: Duration::from_secs(30),
+        room_grace: LONG_GRACE,
     }
 }
 
-/// Starts a server on an ephemeral loopback port with its own data directory.
+/// A grace period no test waits out: an empty room stays open for the whole test.
+pub const LONG_GRACE: Duration = Duration::from_secs(60);
+/// A grace period tests wait out (see [`wait_out_grace`]) when they need a room to end.
+pub const SHORT_GRACE: Duration = Duration::from_millis(300);
+
+/// Waits until a room that became empty with [`SHORT_GRACE`] has certainly ended.
+pub async fn wait_out_grace() {
+    tokio::time::sleep(SHORT_GRACE * 3).await;
+}
+
+/// Starts a server on an ephemeral loopback port with its own data directory; empty rooms
+/// stay open for [`LONG_GRACE`].
 pub async fn spawn_server() -> TestServer {
+    spawn_server_config(|_| {}).await
+}
+
+/// Starts a server like [`spawn_server`], with its settings adjusted by `edit`.
+pub async fn spawn_server_config(edit: impl FnOnce(&mut Config)) -> TestServer {
     let data_dir = tempfile::tempdir().unwrap();
-    let config = test_config(&data_dir);
+    let mut config = test_config(&data_dir);
+    edit(&mut config);
     let listener = tokio::net::TcpListener::bind(config.addr).await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(server::serve(config, listener));
     TestServer { addr, data_dir }
 }
 
+/// Waits until the stored text of `doc` in `server`'s library is `text`.
+pub async fn wait_stored(server: &TestServer, doc: DocId, text: &str) {
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    loop {
+        let stored = server.store().read(doc, None).unwrap();
+        if stored.is_some_and(|s| s.bytes == text.as_bytes()) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{text:?} was never stored"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// Starts a server whose rooms load and save through the checkpointer `make` builds from the
 /// library repository path.
 pub async fn spawn_server_with(make: impl FnOnce(&Path) -> Arc<dyn Checkpointer>) -> TestServer {
+    spawn_server_with_grace(make, LONG_GRACE).await
+}
+
+/// Like [`spawn_server_with`], with empty rooms staying open for `grace`.
+pub async fn spawn_server_with_grace(
+    make: impl FnOnce(&Path) -> Arc<dyn Checkpointer>,
+    grace: Duration,
+) -> TestServer {
     let data_dir = tempfile::tempdir().unwrap();
-    let config = test_config(&data_dir);
+    let mut config = test_config(&data_dir);
+    config.room_grace = grace;
     let checkpointer = make(&server::library_path(data_dir.path()));
     let listener = tokio::net::TcpListener::bind(config.addr).await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -178,10 +221,13 @@ impl TestClient {
         &self.people
     }
 
-    /// Inserts `s` at character position `pos` and sends it if nothing is in flight.
+    /// Inserts `s` at character position `pos` and sends it if nothing is in flight. While
+    /// disconnected the change is kept, as a page keeps it, and sent after reconnecting.
     pub async fn type_at(&mut self, pos: usize, s: &str) {
         let op = TextOp::replace(self.state.doc().len_chars(), pos, 0, s).unwrap();
-        if let Some(out) = self.state.local(OpId(Uuid::new_v4()), op).unwrap() {
+        if let Some(out) = self.state.local(OpId(Uuid::new_v4()), op).unwrap()
+            && self.socket.is_some()
+        {
             self.submit(&out).await;
         }
     }

@@ -72,7 +72,7 @@ impl AppState {
         };
         self.shared
             .rooms
-            .open(doc, &self.shared.checkpointer, timing)
+            .open(doc, &self.shared.checkpointer, timing, config.room_grace)
     }
 }
 
