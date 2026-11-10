@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="ShareCraft Stage 0: readiness of the WordCraft, GridCraft, PdfCraft and SolidCraft upstream sources for browser opening and live co-authoring.">
+<title>ShareCraft — Editor Readiness Report</title>
+<style>
+:root{--ink:#172f38;--muted:#536b72;--line:#d7e2e3;--accent:#086959;--paper:#fff;--wash:#f2f6f5;font-family:Segoe UI,Arial,sans-serif;color:var(--ink);background:var(--wash);line-height:1.65}
+*{box-sizing:border-box}body{margin:0}a{color:var(--accent);text-underline-offset:3px}a:focus-visible,button:focus-visible{outline:3px solid #b66e00;outline-offset:4px}.skip{position:absolute;left:1rem;top:-5rem;background:white;padding:1rem;z-index:20}.skip:focus{top:1rem}
+.cover{background:#123e3b;color:#fff;padding:66px max(24px,calc((100vw - 1160px)/2));border-bottom:8px solid #71d8b5}.eyebrow{text-transform:uppercase;letter-spacing:.17em;font-size:.76rem;font-weight:700;color:#a7e7d1}.cover h1{font-size:clamp(2.6rem,6vw,4.6rem);letter-spacing:-.05em;line-height:1.05;margin:18px 0}.cover .lede{font-size:1.2rem;max-width:770px;color:#e0eee9}.meta{display:flex;flex-wrap:wrap;gap:10px 28px;color:#c4ded5;font-size:.88rem}.layout{display:grid;grid-template-columns:225px minmax(0,1fr);gap:48px;max-width:1210px;margin:auto;padding:40px 25px 80px}nav{position:sticky;top:24px;align-self:start;max-height:90vh;overflow:auto;font-size:.88rem}nav p{font-weight:700;margin:0 0 12px}nav a{display:block;padding:7px 0;text-decoration:none;color:var(--muted)}nav a:hover{color:var(--accent)}main{min-width:0}section{scroll-margin-top:25px;margin:0 0 38px}h2{font-size:1.7rem;line-height:1.25;letter-spacing:-.025em;margin:0 0 18px}h3{font-size:1.13rem;line-height:1.4;margin:0 0 12px}p{margin:0 0 16px}.note{padding:20px 23px;border-left:4px solid var(--accent);background:#e5f0ec}.note p:last-child{margin-bottom:0}.cards{display:grid;gap:17px}.module{background:var(--paper);padding:25px;border:1px solid var(--line);border-radius:9px;break-inside:avoid}.tag{display:inline-block;font-size:.7rem;letter-spacing:.05em;text-transform:uppercase;border-radius:4px;padding:3px 7px;background:#e2f1e9;color:#155438;margin:0 0 12px}ul,ol{padding-left:22px;margin:0}li{margin:0 0 9px}li:last-child{margin-bottom:0}code{font-family:Consolas,Menlo,monospace;font-size:.9em;background:#eaf0ef;padding:1px 5px;border-radius:3px;overflow-wrap:anywhere}table{border-collapse:collapse;width:100%;font-size:.91rem;background:white}th,td{border:1px solid var(--line);padding:12px 14px;text-align:left;vertical-align:top}th{background:#e8efed}.table-wrap{overflow-x:auto}.small{font-size:.88rem;color:var(--muted)}.toolbar{display:flex;justify-content:space-between;align-items:center;gap:20px;margin-bottom:26px}button{background:var(--accent);color:white;border:0;border-radius:5px;padding:10px 15px;font:inherit;cursor:pointer}footer{border-top:1px solid var(--line);padding-top:22px;font-size:.86rem;color:var(--muted)}
+@media(max-width:850px){.layout{grid-template-columns:1fr;gap:28px}nav{position:static;max-height:none;display:flex;flex-wrap:wrap;gap:3px 18px;border-bottom:1px solid var(--line);padding-bottom:20px}nav p{width:100%;margin-bottom:0}.cover{padding:40px 25px}.module{padding:20px}}
+@media print{@page{size:A4;margin:17mm}html,body{background:white;font-size:10pt}.cover{padding:12mm 0;background:white;color:var(--ink);border-bottom:3px solid var(--accent)}.cover .lede,.meta,.eyebrow{color:var(--ink)}.layout{display:block;padding:10mm 0;margin:0;max-width:none}nav,.toolbar button,.skip{display:none}.module{border-radius:0;padding:5mm}.note{background:#f4f4f4}h2,h3{break-after:avoid}a{color:inherit}tr{break-inside:avoid}.table-wrap{overflow:visible}}
+</style>
+</head>
+<body data-project="ShareCraft" data-status="stage-0-finding">
+<a class="skip" href="#main">Skip to report</a>
+<header class="cover">
+<p class="eyebrow">ThineCraft / ShareCraft Stage 0</p>
+<h1>Editor readiness</h1>
+<p class="lede">What the four upstream editors already provide for browser opening and live co-authoring, and what has to be built.</p>
+<div class="meta"><span>Version 0.1 · Finding</span><span>Source read 9 November 2026</span><span>Companion to <a href="sequencing.html" style="color:inherit">sequencing.html</a> and <a href="scope.html" style="color:inherit">scope.html</a> (SC-15, SC-24)</span></div>
+</header>
+<div class="layout">
+<nav aria-label="Document contents"><p>In this document</p>
+<a href="#summary">01 · Summary</a><a href="#method">02 · Method &amp; confidence</a><a href="#common">03 · What all four share</a><a href="#editors">04 · Each editor</a><a href="#work">05 · Work that follows</a><a href="#approach">06 · Merge approach</a><a href="#forks">07 · Fork obligations</a><a href="#open">08 · Not yet checked</a>
+</nav>
+<main id="main">
+<div class="toolbar"><span class="small">Standalone HTML · Print-ready · No external assets</span><button type="button" onclick="window.print()">Print / Save PDF</button></div>
+
+<section id="summary"><h2>01 / Summary</h2>
+<ul>
+<li><strong>All four editors are written in Rust and already run in a browser.</strong> Each has a WebAssembly build of the full editor, so the "open in the browser" requirement (D12) is largely met upstream.</li>
+<li><strong>All four can already be embedded by a host page</strong> that supplies the document and receives saves as bytes. Launching an editor from a ShareCraft library and saving back through ShareCraft is integration work, not editor development.</li>
+<li><strong>None has any co-authoring code.</strong> WordCraft and GridCraft list it as a known gap awaiting an owner decision; PdfCraft has marked shared review out of scope; SolidCraft has no plans recorded.</li>
+<li><strong>The same three things are missing in every editor:</strong> lasting identities for the things being edited, a record of each change that can be sent to other people, and an undo that reverses one person's work without discarding everyone else's.</li>
+<li><strong>Every editor routes changes through a single entry point,</strong> which is the one place co-authoring needs to attach. That is the most favourable finding for the co-authoring-first plan.</li>
+</ul>
+<div class="note"><p><strong>Effect on the plan.</strong> No editor needs to be rewritten or ported to the browser. Real editors can be opened from ShareCraft, one person at a time, much earlier than planned. The co-authoring work is the same shape four times, which supports one shared Rust collaboration library used by all four forks.</p></div>
+</section>
+
+<section id="method"><h2>02 / Method and confidence</h2>
+<p>Each repository was shallow-cloned at the commit below and its source read. Nothing was built, run, forked or modified. Four separate read-only inspections were made, one per editor; their main claims were then spot-checked directly against the source (web apps present, licence, host bridge, single entry point, snapshot undo, brand terms, stated gaps) and held.</p>
+<div class="table-wrap"><table><thead><tr><th>Editor</th><th>Upstream</th><th>Commit read</th></tr></thead><tbody>
+<tr><td>WordCraft</td><td>storytold/wordcraft</td><td><code>2922fe566b575794f896077467cf92825ccba7c9</code></td></tr>
+<tr><td>GridCraft</td><td>storytold/gridcraft</td><td><code>e9addf52fe68847e6c1310fcfa5d42b7aa8b9650</code></td></tr>
+<tr><td>PdfCraft</td><td>storytold/pdfcraft</td><td><code>a71b5124bc388e6b86ec0ee5ec16d31fa1955117</code></td></tr>
+<tr><td>SolidCraft</td><td>tangency-labs/solidcraft</td><td><code>f232e4a40c9d1d3088c758e393b7db43048eac22</code></td></tr>
+</tbody></table></div>
+<p class="small">Limits: these are large codebases (roughly 11 to 55 MB of Rust each) read selectively, not exhaustively. Whether each web build actually works well in a browser was not tested. All four projects were pushed to within the previous day, so they are moving quickly and details will drift.</p>
+</section>
+
+<section id="common"><h2>03 / What all four share</h2>
+<div class="table-wrap"><table><thead><tr><th>Aspect</th><th>Finding</th><th>Meaning for ShareCraft</th></tr></thead><tbody>
+<tr><td>Language and UI</td><td>Rust. Interface built with egui 0.37, drawn to a browser canvas (WebGPU or WebGL). The three storytold editors use the same patched egui fork; SolidCraft uses the stock release.</td><td>A Rust collaboration library can be linked directly into each editor. No JavaScript editor code to integrate with.</td></tr>
+<tr><td>Browser build</td><td>Each has an <code>apps/&lt;name&gt;-web</code> app built with Trunk into a static site with no server code.</td><td>ShareCraft can serve each editor as static files.</td></tr>
+<tr><td>Host embedding</td><td>Each can be embedded by a page that passes a document in and takes saves and "unsaved changes" signals back. WordCraft and PdfCraft accept an author name from the host.</td><td>The launch-from-library path in SC-15 can use this as it stands.</td></tr>
+<tr><td>Load and save</td><td>All read and write documents as in-memory bytes.</td><td>Checkpoints to ShareCraft's revision service need no file-system workarounds.</td></tr>
+<tr><td>Single entry point</td><td>All changes go through one function: <code>Session::run</code> (WordCraft), <code>Session::execute</code> (GridCraft, SolidCraft), <code>Session::apply</code> (PdfCraft).</td><td>One place per editor to capture changes and to apply other people's.</td></tr>
+<tr><td>Undo</td><td>All four keep whole-document snapshots and swap them.</td><td>Must be rebuilt in every editor: a snapshot swap would erase other people's concurrent work.</td></tr>
+<tr><td>Change events</td><td>None publishes what changed. Each has only a revision counter and an unsaved-changes flag.</td><td>Change capture has to be added at the entry point.</td></tr>
+<tr><td>Outside control</td><td>Each has a command-line tool, an MCP server and a JavaScript page interface.</td><td>Useful for automated co-authoring tests without driving the screen.</td></tr>
+<tr><td>Licence</td><td>MIT or Apache 2.0, at the user's choice. No contributor agreement found in any.</td><td>Forking and extending is permitted. See section 07.</td></tr>
+</tbody></table></div>
+</section>
+
+<section id="editors"><h2>04 / Each editor</h2>
+<div class="cards">
+<article class="module"><span class="tag">WordCraft</span><h3>Word processor</h3><ul>
+<li><strong>Document:</strong> a list of blocks (paragraphs and tables); a paragraph is a text string plus formatting runs. Positions are a path of indexes plus a byte offset. No block has a lasting identity.</li>
+<li><strong>Changes:</strong> over a thousand commands (per the project's own documentation) that alter the document directly and leave no description of what changed.</li>
+<li><strong>Helps:</strong> blocks are shared between snapshots, so finding which blocks a command touched is cheap. Comments, tracked changes with authors, and document compare already exist. The native format is plain structured data.</li>
+<li><strong>Hardest part:</strong> two people typing in the same paragraph. Byte offsets shift with every keystroke, so text needs either lasting character positions or position adjustment.</li>
+<li><strong>Formats:</strong> opens and saves DOCX, DOC, ODT, RTF, Markdown, HTML, plain text and others; exports PDF.</li></ul></article>
+
+<article class="module"><span class="tag">GridCraft</span><h3>Spreadsheet</h3><ul>
+<li><strong>Document:</strong> workbook, sheets, cells. Cells, rows and columns are coordinates only. Formulas refer to cells by coordinate and to sheets by name. Charts, images and tables do have identifiers.</li>
+<li><strong>Changes:</strong> commands are named and carry structured parameters, with a command journal already present. Many read their target from the current selection, which differs per person and must be made explicit.</li>
+<li><strong>Helps:</strong> inserting and deleting rows and columns is already represented as data, and the code that adjusts every formula reference after such a change exists. That is most of what is needed to reconcile one person's edit against another's structural change. Recalculation is incremental.</li>
+<li><strong>Hardest part:</strong> concurrent structural changes, such as two people inserting rows at once.</li>
+<li><strong>Formats:</strong> XLSX, XLSB, ODS, CSV and others; XLS import only.</li>
+<li><strong>Upstream's own estimate</strong> for co-authoring and related review features is 35 to 55 hours, with scope left to the owner. That figure is theirs and was not assessed here.</li></ul></article>
+
+<article class="module"><span class="tag">PdfCraft</span><h3>PDF reader and editor</h3><ul>
+<li><strong>Document:</strong> the original file plus an overlay of changed objects keyed by PDF object number. Saves are normally appended to the file.</li>
+<li><strong>Changes:</strong> one command type with 118 kinds of edit. Commands address pages and annotations by position, and the type cannot yet be written out as data.</li>
+<li><strong>Helps:</strong> object numbers are a lasting identity the other editors lack, and code to merge one set of changed objects into another already exists. Annotations already receive a unique name when created. Comment threads with replies and status exist.</li>
+<li><strong>Hardest part:</strong> edits can run embedded form scripts and regenerate appearances as side effects, so the same edit must produce the same result for every participant.</li>
+<li><strong>Gaps against the scope:</strong> QR-code fields are only planned upstream (SC-19 depends on them). One signing method is unavailable in the browser build (relevant to SC-20). Scanner hardware support is not done; camera-photo straightening and text recognition are present.</li></ul></article>
+
+<article class="module"><span class="tag">SolidCraft</span><h3>Parametric CAD</h3><ul>
+<li><strong>Document:</strong> parameters plus a timeline of features that is replayed to produce geometry. Saved as structured data inside a ZIP container.</li>
+<li><strong>Changes:</strong> about 580 named commands with structured parameters, shared by the interface, command line and automation.</li>
+<li><strong>Helps:</strong> features have identifiers; references to edges and faces use persistent names that survive a rebuild; the embedded mode already has export, import and "saved" messages for a host page; a change notification exists, though it does not say what changed. A scheme for collision-free identifiers is written and awaiting adoption upstream.</li>
+<li><strong>Hardest parts:</strong> identifiers are currently handed out by counters, so two people adding features at once would collide. Rebuilding is done inside each command on a single thread in the browser, so another person's change early in the timeline would freeze everyone's screen while it replays.</li></ul></article>
+</div>
+</section>
+
+<section id="work"><h2>05 / Work that follows from the findings</h2>
+<div class="table-wrap"><table><thead><tr><th>Work</th><th>WordCraft</th><th>GridCraft</th><th>PdfCraft</th><th>SolidCraft</th></tr></thead><tbody>
+<tr><td>Browser build</td><td>Exists</td><td>Exists</td><td>Exists</td><td>Exists</td></tr>
+<tr><td>Open and save through ShareCraft</td><td>Connect existing bridge</td><td>Connect existing bridge</td><td>Connect existing bridge</td><td>Connect existing bridge</td></tr>
+<tr><td>Lasting identities</td><td>Add to blocks and text</td><td>Add to sheets, rows, columns</td><td>Use object numbers and annotation names</td><td>Adopt the collision-free scheme</td></tr>
+<tr><td>Changes as sendable data</td><td>Derive from before/after, or rework commands</td><td>Mostly present; remove dependence on selection</td><td>Make the edit type writable as data</td><td>Present</td></tr>
+<tr><td>Reconciling concurrent changes</td><td>Build</td><td>Build on existing reference adjustment</td><td>Build on existing object merge</td><td>Build; ordering matters most</td></tr>
+<tr><td>Per-person undo</td><td>Build</td><td>Build</td><td>Build</td><td>Build</td></tr>
+<tr><td>Presence (other people's cursors and selections)</td><td>Build</td><td>Build</td><td>Build</td><td>Build; an "agent cursor" exists to adapt</td></tr>
+<tr><td>Editor-specific concern</td><td>Same-paragraph typing</td><td>Concurrent row and column changes</td><td>Side effects of form scripts</td><td>Rebuild time on one thread</td></tr>
+</tbody></table></div>
+</section>
+
+<section id="approach"><h2>06 / Consequence for the merge approach</h2>
+<p>This is a recommendation for the Stage 0 decision, not a decision.</p>
+<p>All four editors are built the same way: a document that changes only through commands, with cheap snapshots. None stores its document in a form designed for automatic merging, so adopting a ready-made merging library would mean rebuilding each editor's document model around it. The findings instead favour a <strong>shared ordered change log</strong>: the collaboration service puts every participant's changes into one agreed order, each editor applies them in that order, and a participant's own not-yet-confirmed changes are adjusted when someone else's change arrives first.</p>
+<ul>
+<li>It uses what the editors already have: the single entry point, commands as data, and snapshots to roll back and reapply.</li>
+<li>It keeps the spine unaware of what the changes mean (spine rule S6); each editor supplies only its own adjustment rule.</li>
+<li>GridCraft already contains its adjustment rule for structural changes; PdfCraft's object overlay makes most changes independent of each other.</li>
+<li>It requires a connection to the service to edit together. Editing while disconnected and merging later would be limited to what each editor's adjustment rule can handle, which bears on the offline decision in SC-16.</li>
+</ul>
+<p><strong>Suggested editor order:</strong> GridCraft, WordCraft, PdfCraft, SolidCraft. GridCraft moves ahead of WordCraft because its commands are already structured data and its adjustment rule largely exists, making it the lowest-risk first proof on a real editor. The owner approved this order on 9 November 2026 and the sequencing plan (v0.3) now follows it.</p>
+</section>
+
+<section id="forks"><h2>07 / Fork obligations</h2>
+<ul>
+<li><strong>Licence:</strong> all four are MIT or Apache 2.0. Keep the licence files, each <code>NOTICE</code>, and the attribution files (<code>ATTRIBUTION.md</code>; PdfCraft's <code>LICENSES.toml</code>; SolidCraft's <code>THIRD-PARTY-LICENSES.txt</code>).</li>
+<li><strong>ArtCraft brand (WordCraft, GridCraft, PdfCraft):</strong> the ArtCraft name and logos in <code>docs/brand/</code> are trademarks and are not open source. A distributed fork must remove them and must not present itself as ArtCraft. It may state in plain text that it is "based on WordCraft by the ArtCraft team", and likewise for the others.</li>
+<li><strong>Product names:</strong> no rule was found restricting the names WordCraft, GridCraft, PdfCraft or SolidCraft themselves. That is an absence of a stated rule, not legal clearance.</li>
+<li><strong>SolidCraft:</strong> its geometry kernel in <code>solidcore/</code> is Apache 2.0 with its own notice that must be kept. Its disclaimer forbids using the Tangency Labs name to imply endorsement.</li>
+<li><strong>Contributor terms:</strong> no contributor licence agreement or sign-off requirement was found in any of the four.</li>
+<li><strong>Dependencies:</strong> the storytold projects forbid copyleft dependencies. A fork that wants to send changes back upstream should hold to the same rule in the collaboration library.</li>
+</ul>
+<p class="small">The ThineCraft "Craft" names sit alongside ArtCraft's own "Craft" product family. Whether that needs any agreement with the upstream teams is a question for the owner, not something the source answers.</p>
+</section>
+
+<section id="open"><h2>08 / Not yet checked</h2>
+<ul>
+<li><strong>Accessibility.</strong> All four draw their interface to a canvas. How well that works with screen readers and keyboard-only use in a browser was not examined, and it bears directly on the WCAG 2.2 AA target in the scope.</li>
+<li><strong>Performance in the browser:</strong> download size (PdfCraft's is reported as about 13 MB), start-up time, large documents, and SolidCraft rebuild times.</li>
+<li><strong>Whether the web builds work</strong> as well as the desktop ones. Nothing was run.</li>
+<li><strong>DeckCraft.</strong> The scope names it for co-authoring but no upstream source has been identified.</li>
+<li><strong>Upstream intentions.</strong> Whether the upstream teams would accept co-authoring changes, which would greatly reduce the cost of keeping forks current.</li>
+<li><strong>Phone scanning.</strong> The streamed capture workflow in SC-19 was not traced in PdfCraft beyond noting camera-photo straightening.</li>
+</ul>
+</section>
+
+<footer>ShareCraft · ThineCraft · Editor Readiness Report v0.1 · 9 November 2026<br>A finding from reading source. No forks have been created and no editor code has been changed.</footer>
+</main></div>
+</body></html>

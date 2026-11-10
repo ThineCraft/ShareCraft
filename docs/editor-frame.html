@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="ShareCraft concept: the frame around a browser editor and the states of live co-authoring.">
+<title>ShareCraft — Editor frame concept</title>
+<style>
+:root{color-scheme:light dark;
+--bg:light-dark(#f5f7f8,#141c20);--paper:light-dark(#fff,#202a2e);--sheet:light-dark(#fff,#172023);--text:light-dark(#233239,#e7edf0);--muted:light-dark(#5d6d75,#afbdc4);--line:light-dark(#dfe6e9,#39474e);
+--accent:#3156c9;--accent-ink:light-dark(#3156c9,#9db4ff);--soft:color-mix(in srgb,var(--accent) 11%,var(--paper));
+--ok:light-dark(#1d6b47,#7fd3a6);--warn-bg:light-dark(#fdf1dc,#43351c);--warn-ink:light-dark(#7a4a05,#f1c98a);--stop-bg:light-dark(#fde8e6,#472523);--stop-ink:light-dark(#9a2a20,#f3a9a1);
+--p1:light-dark(#7546bb,#b79af0);--p2:light-dark(#a84b27,#eb9c79);--p3:light-dark(#0b7a75,#6fd0ca);--p4:light-dark(#b0347d,#ef95c6);
+font:14px/1.5 Inter,ui-sans-serif,system-ui,'Segoe UI',sans-serif;color:var(--text);background:var(--bg)}
+*{box-sizing:border-box}body{margin:0;padding:20px 16px 60px}button,select{font:inherit;color:inherit}button{cursor:pointer}
+:focus-visible{outline:2px solid var(--accent-ink);outline-offset:2px}
+.wrap{max-width:1180px;margin:0 auto}
+.page-head{display:flex;flex-wrap:wrap;align-items:baseline;gap:6px 18px;margin-bottom:6px}.page-head h1{font-size:20px;letter-spacing:-.4px;margin:0}.page-head a{color:var(--accent-ink);margin-left:auto;font-size:13px}
+.lede{color:var(--muted);max-width:74ch;margin:0 0 18px}
+.controls{display:flex;flex-wrap:wrap;gap:12px 22px;align-items:center;margin-bottom:14px}
+.controls fieldset{border:0;padding:0;margin:0;display:flex;flex-wrap:wrap;align-items:center;gap:6px}.controls legend{float:left;font-size:12px;color:var(--muted);margin-right:8px;padding:0}
+.seg{border:1px solid var(--line);background:var(--paper);border-radius:7px;padding:6px 11px;font-size:12px;min-height:32px}.seg[aria-pressed=true]{background:var(--accent);border-color:var(--accent);color:#fff}
+
+/* ---- the frame ---- */
+.frame{background:var(--paper);border:1px solid var(--line);border-radius:12px;overflow:clip;display:flex;flex-direction:column;min-height:640px}
+.bar{display:flex;align-items:center;gap:10px;min-height:52px;padding:6px 12px;border-bottom:1px solid var(--line);box-shadow:inset 0 3px var(--accent)}
+.back{display:flex;align-items:center;gap:8px;border:0;background:none;padding:6px 8px 6px 4px;border-radius:7px;min-height:36px;font-size:12px;color:var(--muted)}.back:hover{background:var(--soft)}
+.mono{display:grid;place-items:center;width:26px;height:26px;border-radius:7px;background:var(--accent);color:#fff;font-weight:600;font-size:12px;flex:none}
+.doc{min-width:0;display:flex;flex-direction:column;line-height:1.25;padding-left:10px;border-left:1px solid var(--line)}.doc strong{font-size:14px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.doc span{font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.status{display:inline-flex;align-items:center;gap:6px;font-size:12px;padding:4px 9px;border-radius:20px;border:1px solid var(--line);white-space:nowrap;color:var(--ok)}
+.status i{width:8px;height:8px;border-radius:50%;background:currentColor;flex:none}
+.frame[data-state=saving] .status{color:var(--muted)}.frame[data-state=saving] .status i{animation:pulse 1s infinite}
+.frame[data-state=offline] .status,.frame[data-state=changed] .status{color:var(--warn-ink);background:var(--warn-bg);border-color:transparent}
+.frame[data-state=revoked] .status{color:var(--stop-ink);background:var(--stop-bg);border-color:transparent}
+.frame:is([data-state=view],[data-state=locked]) .status{color:var(--muted)}
+@keyframes pulse{50%{opacity:.25}}@media(prefers-reduced-motion:reduce){.status i{animation:none!important}}
+.spacer{flex:1}
+.people{display:flex;align-items:center;border:0;background:none;padding:3px 6px;border-radius:20px;min-height:36px}.people:hover{background:var(--soft)}
+.av{display:grid;place-items:center;width:28px;height:28px;border-radius:50%;font-size:10px;font-weight:600;background:var(--paper);color:var(--c);border:2px solid var(--c);margin-left:-6px;flex:none}.av:first-child{margin-left:0}
+.av.me{--c:var(--accent-ink)}.av.away{border-style:dashed;opacity:.55}
+.people small{font-size:11px;color:var(--muted);margin-left:7px;white-space:nowrap}
+.mode{font-size:11px;padding:3px 8px;border-radius:5px;background:var(--soft);color:var(--accent-ink);white-space:nowrap}
+.frame:is([data-state=view],[data-state=locked],[data-state=revoked]) .mode{background:var(--bg);color:var(--muted)}
+.btn{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);background:var(--paper);border-radius:7px;padding:6px 11px;font-size:12px;min-height:34px;white-space:nowrap}.btn:hover{background:var(--soft)}.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}.btn[aria-pressed=true]{background:var(--soft);border-color:var(--accent-ink)}
+.banner{display:none;align-items:center;flex-wrap:wrap;gap:8px 14px;padding:10px 16px;font-size:13px;border-bottom:1px solid var(--line)}.banner b{font-weight:600}.banner .btn{min-height:30px;padding:4px 10px}
+.banner.info{background:var(--soft)}.banner.warn{background:var(--warn-bg);color:var(--warn-ink)}
+.frame[data-state=view] .b-view,.frame[data-state=locked] .b-locked,.frame[data-state=offline] .b-offline,.frame[data-state=changed] .b-changed{display:flex}
+.body{flex:1;display:grid;grid-template-columns:minmax(0,1fr);min-height:0}.frame.panel-open .body{grid-template-columns:minmax(0,1fr) 268px}
+.canvas{position:relative;background:var(--bg);padding:22px;min-width:0;overflow:auto}
+.owner{position:absolute;top:8px;left:12px;font-size:10px;letter-spacing:.9px;text-transform:uppercase;color:var(--muted)}
+.tools{display:flex;gap:6px;margin:14px auto 14px;max-width:560px;opacity:.75}.tools span{height:26px;border-radius:5px;background:var(--paper);border:1px solid var(--line);flex:1}.tools span:first-child{flex:2.2}
+.page{max-width:560px;margin:0 auto;background:var(--sheet);border:1px solid var(--line);border-radius:3px;padding:34px 38px;min-height:400px}.page h2{font-size:22px;letter-spacing:-.4px;margin:0 0 14px}.page p{margin:0 0 14px;line-height:1.75}
+.cur{display:inline-block;position:relative;width:2px;height:1.15em;background:var(--c);vertical-align:text-bottom;margin:0 1px}
+.cur::after,.cellmark::after{content:attr(data-name);position:absolute;left:0;bottom:100%;background:var(--c);color:light-dark(#fff,#10181b);font-size:10px;font-weight:600;line-height:1.5;padding:0 5px;border-radius:3px 3px 3px 0;white-space:nowrap}
+.sel{background:color-mix(in srgb,var(--c) 22%,transparent);border-radius:2px;color:inherit}
+.grid{border-collapse:collapse;margin:0 auto;background:var(--sheet);font-size:12px}.grid th,.grid td{border:1px solid var(--line);height:30px;min-width:74px;padding:0 8px;text-align:right}.grid th{background:var(--paper);color:var(--muted);font-weight:400;text-align:center;min-width:34px}.grid td:first-of-type{text-align:left}
+.cellmark{position:relative;outline:2px solid var(--c);outline-offset:-2px}.cellmark::after{left:-2px}
+.frame[data-editor=word] .grid-view,.frame[data-editor=grid] .word-view{display:none}
+.frame[data-state=alone] .remote,.frame[data-state=revoked] .remote{display:none}
+.frame[data-state=alone] .sel,.frame[data-state=revoked] .sel{background:none}.frame[data-state=alone] .cellmark,.frame[data-state=revoked] .cellmark{outline:0}.frame[data-state=alone] .cellmark::after{display:none}
+.frame[data-state=offline] .cur,.frame[data-state=offline] .cellmark{opacity:.4}
+.gate{display:none;position:absolute;inset:0;background:var(--bg);place-items:center;padding:24px;text-align:center}.frame[data-state=revoked] .gate{display:grid}.frame[data-state=revoked] .editor-area{visibility:hidden}
+.gate div{max-width:400px}.gate h2{font-size:19px;margin:0 0 8px}.gate p{color:var(--muted);margin:0 0 16px}.gate .btn{margin:0 4px}
+.panel{display:none;border-left:1px solid var(--line);min-width:0;flex-direction:column}.frame.panel-open .panel{display:flex}.frame[data-state=revoked] .panel{visibility:hidden}
+.tabs{display:flex;border-bottom:1px solid var(--line)}.tabs button{flex:1;border:0;background:none;padding:11px 6px;font-size:12px;color:var(--muted);border-bottom:2px solid transparent;min-height:42px}.tabs button[aria-selected=true]{color:var(--text);font-weight:600;border-bottom-color:var(--accent-ink)}
+.pane{padding:6px 14px 14px;overflow:auto}.pane[hidden]{display:none}
+.row{display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid var(--line);font-size:13px}.row:last-child{border-bottom:0}.row small{display:block;font-size:11px;color:var(--muted)}.row .av{margin:0}.row .btn{margin-left:auto;min-height:28px;padding:2px 9px;font-size:11px}
+.ver{padding:11px 0;border-bottom:1px solid var(--line);font-size:13px}.ver:last-child{border-bottom:0}.ver small{display:block;font-size:11px;color:var(--muted)}.ver .tag{font-size:10px;padding:1px 6px;border-radius:4px;background:var(--soft);color:var(--accent-ink);margin-left:6px}
+.frame[data-state=revoked] :is(.share,#panelbtn,.people){display:none}
+.frame[data-state=alone] .others,.frame[data-state=alone] .alone-hide{display:none}.only-alone{display:none}.frame[data-state=alone] .only-alone{display:inline}
+
+/* ---- library presence ---- */
+h2.sec{font-size:16px;margin:34px 0 4px}.sec-note{color:var(--muted);margin:0 0 12px;max-width:74ch}
+.lib{background:var(--paper);border:1px solid var(--line);border-radius:10px;overflow:auto}.lib table{width:100%;border-collapse:collapse;font-size:13px;min-width:520px}.lib th{text-align:left;font-weight:400;color:var(--muted);font-size:12px;padding:11px 14px;border-bottom:1px solid var(--line)}.lib td{padding:9px 14px;border-bottom:1px solid var(--line);height:48px}.lib tr:last-child td{border-bottom:0}
+.ft{display:inline-grid;place-items:center;width:22px;height:25px;border:1px solid currentColor;border-radius:3px;font-size:10px;color:var(--accent-ink);background:var(--soft);margin-right:9px}
+.live{display:flex;align-items:center}.live small{margin-left:7px;color:var(--muted);font-size:12px}
+.notes{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px;margin-top:34px}.notes section{background:var(--paper);border:1px solid var(--line);border-radius:10px;padding:18px 20px}.notes h2{font-size:15px;margin:0 0 10px}.notes ul{margin:0;padding-left:18px}.notes li{margin-bottom:8px}.notes li:last-child{margin:0}
+.foot{color:var(--muted);font-size:12px;margin-top:22px}
+
+@media(max-width:760px){
+ .frame.panel-open .body{grid-template-columns:1fr}.panel{border-left:0;border-top:1px solid var(--line)}
+ .back span,.people small,.mode,.hide-sm{display:none}.doc span{display:none}.canvas{padding:18px 10px}.page{padding:24px 18px}
+ .bar{gap:6px;padding:6px 8px;flex-wrap:wrap}.status{order:5;flex-basis:100%;justify-content:center;border-radius:6px}
+ .back,.people,.btn{min-height:44px}.tabs button{min-height:44px}
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+<div class="page-head"><h1>Editor frame &amp; co-authoring states</h1><span>Concept preview · Sample data · Not a working editor</span><a href="/">Back to ShareCraft</a></div>
+<p class="lede">What surrounds WordCraft, GridCraft, PdfCraft or SolidCraft when a file is opened from a library, and what people see while they work on it together. Choose an editor and a state.</p>
+
+<div class="controls">
+<fieldset><legend>Editor</legend><button class="seg" data-editor="word" aria-pressed="true">WordCraft</button><button class="seg" data-editor="grid" aria-pressed="false">GridCraft</button></fieldset>
+<fieldset><legend>State</legend>
+<button class="seg" data-state="together" aria-pressed="true">Editing together</button>
+<button class="seg" data-state="alone" aria-pressed="false">On your own</button>
+<button class="seg" data-state="saving" aria-pressed="false">Saving</button>
+<button class="seg" data-state="view" aria-pressed="false">View only</button>
+<button class="seg" data-state="locked" aria-pressed="false">Checked out</button>
+<button class="seg" data-state="offline" aria-pressed="false">Connection lost</button>
+<button class="seg" data-state="changed" aria-pressed="false">Changed elsewhere</button>
+<button class="seg" data-state="revoked" aria-pressed="false">Access removed</button>
+</fieldset>
+</div>
+
+<div class="frame panel-open" id="frame" data-state="together" data-editor="word">
+ <header class="bar">
+  <button class="back" type="button" data-say="Returns to Operations / Documents, where you opened the file."><span aria-hidden="true">←</span><i class="mono" aria-hidden="true">O</i><span>Documents</span></button>
+  <div class="doc"><strong id="docname">Remote work policy</strong><span id="docpath">Operations / Documents · WordCraft</span></div>
+  <span class="status" id="status" role="status"><i aria-hidden="true"></i><span id="statustext">Saved · Version 3.2</span></span>
+  <span class="spacer"></span>
+  <button class="people" type="button" id="peoplebtn" aria-label="People in this document">
+   <span class="av me" title="You">You</span><span class="av others remote" style="--c:var(--p1)" title="Maya James">MJ</span><span class="av others remote" style="--c:var(--p2)" title="Tom Okafor">TO</span><span class="av others remote" style="--c:var(--p3)" title="Priya Nair">PN</span>
+   <small id="peoplecount">4 here</small>
+  </button>
+  <span class="mode" id="mode">Editing</span>
+  <button class="btn hide-sm share" type="button" data-say="Opens sharing for this document, using the library's permissions.">Share</button>
+  <button class="btn" type="button" id="panelbtn" aria-pressed="true">People &amp; history</button>
+ </header>
+
+ <div class="banner info b-view"><span><b>You can view this document.</b> Editing is limited to the Operations policy owners.</span><button class="btn" type="button" data-say="Sends an access request to the document's owners.">Request edit access</button></div>
+ <div class="banner info b-locked"><span><b>Tom Okafor has this checked out.</b> You can read it now. Editing together reopens when he checks it in.</span><button class="btn" type="button" data-say="Tom is told you are waiting; you are notified when the document is checked in.">Notify me</button></div>
+ <div class="banner warn b-offline"><span><b>Connection lost.</b> Keep working: your 4 changes are kept on this device and sent when you are back. Others cannot see them yet.</span><button class="btn" type="button" data-say="Tries to reconnect now.">Try now</button></div>
+ <div class="banner warn b-changed"><span><b>Priya Nair uploaded a newer version from DriveCraft.</b> It does not include what is being edited here.</span><button class="btn" type="button" data-say="Shows the two versions side by side so the differences can be brought across.">Review differences</button><button class="btn" type="button" data-say="Keeps this session as the current version; the upload is kept in history as its own version.">Keep ours</button></div>
+
+ <div class="body">
+  <div class="canvas">
+   <span class="owner" id="owner">WordCraft draws everything in this area</span>
+   <div class="editor-area">
+    <div class="tools" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span></div>
+    <div class="word-view"><div class="page">
+     <h2>Remote work policy</h2>
+     <p>Our shared approach to flexible, connected work. This policy applies to everyone in Operations<span class="cur remote" style="--c:var(--p1)" data-name="Maya"></span> and is reviewed every February.</p>
+     <p>Team members agree their working pattern with their lead. <mark class="sel" style="--c:var(--p2)">Core hours are 10:00 to 15:00 local time</mark><span class="cur remote" style="--c:var(--p2)" data-name="Tom"></span>, and meetings are scheduled inside them wherever possible.</p>
+     <p>Equipment requests go through the Equipment request form in this library.</p>
+    </div></div>
+    <div class="grid-view"><table class="grid" aria-label="Sample spreadsheet">
+     <tr><th></th><th>A</th><th>B</th><th>C</th><th>D</th></tr>
+     <tr><th>1</th><td>Category</td><td>Q1</td><td>Q2</td><td>Q3</td></tr>
+     <tr><th>2</th><td>Equipment</td><td class="cellmark remote-cell" style="--c:var(--p1)" data-name="Maya">18,400</td><td>12,250</td><td>9,800</td></tr>
+     <tr><th>3</th><td>Travel</td><td>6,100</td><td>7,450</td><td class="cellmark remote-cell" style="--c:var(--p2)" data-name="Tom">5,900</td></tr>
+     <tr><th>4</th><td>Training</td><td>3,000</td><td>3,000</td><td>4,500</td></tr>
+     <tr><th>5</th><td>Total</td><td>27,500</td><td>22,700</td><td>20,200</td></tr>
+    </table></div>
+   </div>
+   <div class="gate" role="alert"><div><h2>Your access to this document was removed</h2><p>Everything you changed up to Version 3.2 was saved. The document is no longer shown here.</p><button class="btn primary" type="button" data-say="Returns to Operations / Documents.">Back to Documents</button><button class="btn" type="button" data-say="Sends an access request to the document's owners.">Request access</button></div></div>
+  </div>
+
+  <aside class="panel" aria-label="People and history">
+   <div class="tabs" role="tablist"><button role="tab" aria-selected="true" data-tab="people">People</button><button role="tab" aria-selected="false" data-tab="history">History</button></div>
+   <div class="pane" id="pane-people">
+    <div class="row"><span class="av me">You</span><span>You<small id="merole">Editing</small></span></div>
+    <div class="row others"><span class="av" style="--c:var(--p1)">MJ</span><span>Maya James<small id="mayarole">Editing · paragraph 1</small></span><button class="btn" type="button" data-say="Your view follows Maya's position until you scroll or type.">Follow</button></div>
+    <div class="row others"><span class="av" style="--c:var(--p2)">TO</span><span>Tom Okafor<small id="tomrole">Editing · paragraph 2</small></span><button class="btn" type="button" data-say="Your view follows Tom's position until you scroll or type.">Follow</button></div>
+    <div class="row others"><span class="av" style="--c:var(--p3)">PN</span><span>Priya Nair<small>Viewing</small></span></div>
+    <p class="only-alone" style="color:var(--muted);font-size:12px">Nobody else is here. Anyone with edit access who opens this file joins you.</p>
+   </div>
+   <div class="pane" id="pane-history" hidden>
+    <div class="ver">Version 3.2 <span class="tag">Current</span><small><span class="alone-hide">Maya James, Tom Okafor, </span>You · 2 minutes ago</small></div>
+    <div class="ver">Version 3.1<small>Maya James · Today 10:14</small></div>
+    <div class="ver">Version 3.0 <span class="tag">Approved</span><small>Tom Okafor · 6 November</small></div>
+    <div class="ver">Version 2.4<small>Priya Nair · 30 October</small></div>
+    <button class="btn" type="button" style="margin-top:12px" data-say="Opens full version history, with compare and restore.">All versions</button>
+   </div>
+  </aside>
+ </div>
+</div>
+<p class="foot" id="say" role="status" aria-live="polite">Buttons in the frame describe what they would do here.</p>
+
+<h2 class="sec">In the library</h2>
+<p class="sec-note">People should be able to see that a file is being worked on before they open it, and join with one click.</p>
+<div class="lib"><table><thead><tr><th>Name</th><th>In it now</th><th>Modified</th><th></th></tr></thead><tbody>
+<tr><td><span class="ft">W</span>Remote work policy</td><td><span class="live"><span class="av" style="--c:var(--p1)">MJ</span><span class="av" style="--c:var(--p2)">TO</span><span class="av" style="--c:var(--p3)">PN</span><small>2 editing · 1 viewing</small></span></td><td>2 min ago</td><td><button class="btn primary" type="button" data-say="Opens the document and joins the people already editing.">Join</button></td></tr>
+<tr><td><span class="ft">G</span>Operating budget</td><td><span class="live"><span class="av" style="--c:var(--p2)">TO</span><small>Checked out</small></span></td><td>45 min ago</td><td><button class="btn" type="button" data-say="Opens the workbook to read; editing reopens on check-in.">View</button></td></tr>
+<tr><td><span class="ft">P</span>Equipment request</td><td><span class="live"><small>Nobody</small></span></td><td>Today</td><td><button class="btn" type="button" data-say="Opens the form in PdfCraft.">Open</button></td></tr>
+</tbody></table></div>
+
+<div class="notes">
+<section><h2>What this concept decides</h2><ul>
+<li><strong>The editor takes the whole window.</strong> Site navigation is left behind; one slim bar keeps the way back, the document name and the site's accent and mark.</li>
+<li><strong>ShareCraft owns the bar, the banners and the side panel.</strong> The editor owns everything in the canvas, including other people's cursors, which it draws in colours ShareCraft assigns.</li>
+<li><strong>Saving is automatic and always visible.</strong> One status, in the same place, in the same words in every editor. There is no save button.</li>
+<li><strong>A person is never identified by colour alone.</strong> Initials sit in every marker, and names on every cursor.</li>
+<li><strong>Removed access hides the document at once.</strong> The message says what was kept and offers the way back.</li>
+<li><strong>Problems appear as one banner</strong> under the bar, with at most two actions, and never as a pop-up over the work.</li>
+</ul></section>
+<section><h2>Still to settle</h2><ul>
+<li>Whether "Version" is the right word for a saved point, and when a new one is made during a long session.</li>
+<li>What "Changed elsewhere" should offer by default. This depends on the hybrid and offline decision in the scope (SC-16).</li>
+<li>Whether working while disconnected is allowed at all, or the editor becomes read-only until the connection returns.</li>
+<li>Comments and mentions: in the side panel here, or left to each editor.</li>
+<li>How many people are shown before the row collapses to a count.</li>
+<li>Whether the editors' own menus need hiding or changing so two "save" or "open" paths do not exist.</li>
+</ul></section>
+</div>
+<p class="foot">ShareCraft · Editor frame concept · Drafted 9 November 2026 · Relates to SC-15, SC-08, SC-11 and SC-25 in the scope of works.</p>
+</div>
+<script>
+(()=>{
+const f=document.getElementById('frame'),$=id=>document.getElementById(id);
+const docs={word:{name:'Remote work policy',path:'Operations / Documents · WordCraft',owner:'WordCraft draws everything in this area'},grid:{name:'Operating budget',path:'Operations / Documents · GridCraft',owner:'GridCraft draws everything in this area'}};
+const states={
+ together:{status:'Saved · Version 3.2',mode:'Editing',count:'4 here',me:'Editing',tom:'Editing · paragraph 2'},
+ alone:{status:'Saved · Version 3.2',mode:'Editing',count:'Only you',me:'Editing',tom:''},
+ saving:{status:'Saving…',mode:'Editing',count:'4 here',me:'Editing',tom:'Editing · paragraph 2'},
+ view:{status:'Up to date · Version 3.2',mode:'Viewing',count:'4 here',me:'Viewing',tom:'Editing · paragraph 2'},
+ locked:{status:'Up to date · Version 3.2',mode:'Viewing',count:'4 here',me:'Viewing',tom:'Checked out · editing'},
+ offline:{status:'Offline · 4 changes waiting',mode:'Editing',count:'Last seen 20 s ago',me:'Editing · not connected',tom:'Editing · paragraph 2'},
+ changed:{status:'Newer version uploaded',mode:'Editing',count:'4 here',me:'Editing',tom:'Editing · paragraph 2'},
+ revoked:{status:'Access removed',mode:'No access',count:'',me:'',tom:''}
+};
+function render(){
+ const s=states[f.dataset.state],d=docs[f.dataset.editor];
+ $('statustext').textContent=s.status;$('mode').textContent=s.mode;$('peoplecount').textContent=s.count;$('merole').textContent=s.me;$('tomrole').textContent=s.tom;
+ const grid=f.dataset.editor==='grid';$('mayarole').textContent='Editing · '+(grid?'cell B2':'paragraph 1');if(s.tom.includes('paragraph'))$('tomrole').textContent='Editing · '+(grid?'cell D3':'paragraph 2');
+ $('docname').textContent=d.name;$('docpath').textContent=d.path;$('owner').textContent=d.owner;
+ document.querySelectorAll('.others.av').forEach(a=>a.classList.toggle('away',f.dataset.state==='offline'));
+ document.querySelectorAll('.seg[data-state]').forEach(b=>b.setAttribute('aria-pressed',b.dataset.state===f.dataset.state));
+ document.querySelectorAll('.seg[data-editor]').forEach(b=>b.setAttribute('aria-pressed',b.dataset.editor===f.dataset.editor));
+}
+document.querySelectorAll('.seg').forEach(b=>b.addEventListener('click',()=>{if(b.dataset.state)f.dataset.state=b.dataset.state;if(b.dataset.editor)f.dataset.editor=b.dataset.editor;render();}));
+function panel(open){f.classList.toggle('panel-open',open);$('panelbtn').setAttribute('aria-pressed',open);}
+$('panelbtn').addEventListener('click',()=>panel(!f.classList.contains('panel-open')));
+$('peoplebtn').addEventListener('click',()=>{panel(true);tab('people');});
+function tab(name){document.querySelectorAll('[data-tab]').forEach(t=>t.setAttribute('aria-selected',t.dataset.tab===name));$('pane-people').hidden=name!=='people';$('pane-history').hidden=name!=='history';}
+document.querySelectorAll('[data-tab]').forEach(t=>t.addEventListener('click',()=>tab(t.dataset.tab)));
+document.querySelectorAll('[data-say]').forEach(b=>b.addEventListener('click',()=>{$('say').textContent='Concept: '+b.dataset.say;}));
+if(matchMedia('(max-width:760px)').matches)panel(false);
+render();
+})();
+</script>
+</body>
+</html>

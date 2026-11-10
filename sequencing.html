@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="ShareCraft sequencing plan: live co-authoring is built first as the spine of the platform, in Rust, and every other module forms alongside it.">
+<title>ShareCraft — Sequencing Plan</title>
+<style>
+:root{--ink:#172f38;--muted:#536b72;--line:#d7e2e3;--accent:#086959;--paper:#fff;--wash:#f2f6f5;font-family:Segoe UI,Arial,sans-serif;color:var(--ink);background:var(--wash);line-height:1.65}
+*{box-sizing:border-box}body{margin:0}a{color:var(--accent);text-underline-offset:3px}a:focus-visible,button:focus-visible{outline:3px solid #b66e00;outline-offset:4px}.skip{position:absolute;left:1rem;top:-5rem;background:white;padding:1rem;z-index:20}.skip:focus{top:1rem}
+.cover{background:#123e3b;color:#fff;padding:66px max(24px,calc((100vw - 1160px)/2));border-bottom:8px solid #71d8b5}.eyebrow{text-transform:uppercase;letter-spacing:.17em;font-size:.76rem;font-weight:700;color:#a7e7d1}.cover h1{font-size:clamp(2.6rem,6vw,4.6rem);letter-spacing:-.05em;line-height:1.05;margin:18px 0}.cover .lede{font-size:1.2rem;max-width:770px;color:#e0eee9}.meta{display:flex;flex-wrap:wrap;gap:10px 28px;color:#c4ded5;font-size:.88rem}.layout{display:grid;grid-template-columns:225px minmax(0,1fr);gap:48px;max-width:1210px;margin:auto;padding:40px 25px 80px}nav{position:sticky;top:24px;align-self:start;max-height:90vh;overflow:auto;font-size:.88rem}nav p{font-weight:700;margin:0 0 12px}nav a{display:block;padding:7px 0;text-decoration:none;color:var(--muted)}nav a:hover{color:var(--accent)}main{min-width:0}section{scroll-margin-top:25px;margin:0 0 38px}h2{font-size:1.7rem;line-height:1.25;letter-spacing:-.025em;margin:0 0 18px}h3{font-size:1.13rem;line-height:1.4;margin:0 0 12px}p{margin:0 0 16px}.note{padding:20px 23px;border-left:4px solid var(--accent);background:#e5f0ec}.note p:last-child{margin-bottom:0}.cards{display:grid;gap:17px}.module{background:var(--paper);padding:25px;border:1px solid var(--line);border-radius:9px;break-inside:avoid}.tag{display:inline-block;font-size:.7rem;letter-spacing:.05em;text-transform:uppercase;border-radius:4px;padding:3px 7px;background:#e2f1e9;color:#155438;margin:0 0 12px}.spine{background:#fff0d5;color:#775110}.parallel{background:#e8ecfb;color:#344e91}ul,ol{padding-left:22px;margin:0}li{margin:0 0 9px}li:last-child{margin-bottom:0}.rid{font-weight:700;color:var(--accent);white-space:nowrap}table{border-collapse:collapse;width:100%;font-size:.91rem;background:white}th,td{border:1px solid var(--line);padding:12px 14px;text-align:left;vertical-align:top}th{background:#e8efed}caption{text-align:left;font-weight:700;padding:0 0 10px}.table-wrap{overflow-x:auto}.small{font-size:.88rem;color:var(--muted)}.toolbar{display:flex;justify-content:space-between;align-items:center;gap:20px;margin-bottom:26px}button{background:var(--accent);color:white;border:0;border-radius:5px;padding:10px 15px;font:inherit;cursor:pointer}footer{border-top:1px solid var(--line);padding-top:22px;font-size:.86rem;color:var(--muted)}
+@media(max-width:850px){.layout{grid-template-columns:1fr;gap:28px}nav{position:static;max-height:none;display:flex;flex-wrap:wrap;gap:3px 18px;border-bottom:1px solid var(--line);padding-bottom:20px}nav p{width:100%;margin-bottom:0}.cover{padding:40px 25px}.module{padding:20px}}
+@media print{@page{size:A4;margin:17mm}html,body{background:white;font-size:10pt}.cover{padding:12mm 0;background:white;color:var(--ink);border-bottom:3px solid var(--accent)}.cover .lede,.meta,.eyebrow{color:var(--ink)}.layout{display:block;padding:10mm 0;margin:0;max-width:none}nav,.toolbar button,.skip{display:none}.module{border-radius:0;padding:5mm}.note{background:#f4f4f4}h2,h3{break-after:avoid}a{color:inherit}tr{break-inside:avoid}.table-wrap{overflow:visible}}
+</style>
+</head>
+<body data-project="ShareCraft" data-status="draft-sequencing">
+<a class="skip" href="#main">Skip to plan</a>
+<header class="cover">
+<p class="eyebrow">ThineCraft / Delivery sequencing</p>
+<h1>ShareCraft build order</h1>
+<p class="lede">Live co-authoring is the main feature. Its plumbing is built first, in Rust, and every other part of the platform forms alongside it.</p>
+<div class="meta"><span>Version 0.3 · Draft for review</span><span>9 November 2026</span><span>Companion to <a href="scope.html" style="color:inherit">Scope of Works v0.7</a></span></div>
+</header>
+<div class="layout">
+<nav aria-label="Document contents"><p>In this document</p>
+<a href="#principle">01 · Principle</a><a href="#rust">02 · Built in Rust</a><a href="#spine">03 · The collaboration spine</a><a href="#stages">04 · Stages</a><a href="#proof">05 · The standing proof</a><a href="#risks">06 · Risks</a><a href="#decisions">07 · Decisions by stage</a><a href="#changes">08 · Changes</a>
+</nav>
+<main id="main">
+<div class="toolbar"><span class="small">Standalone HTML · Print-ready · No external assets</span><button type="button" onclick="window.print()">Print / Save PDF</button></div>
+
+<section id="principle"><h2>01 / Principle</h2>
+<p>Co-authoring is the single most important feature of ShareCraft, so it is the first thing that works and the thing everything else is shaped around. The first stage builds the collaboration plumbing end to end: two people editing the same document in two browsers, with the result saved as a Git revision. Sites, libraries, metadata, permissions, search, governance and the rest are then built onto that working core, never beside it.</p>
+<p>The consequence that keeps the system simple: <strong>there is only one way to edit anything.</strong> A person editing alone is a shared session with one participant. Saving is a session checkpoint. No second, single-user save path exists to be reconciled with co-authoring later, which removes the rework risk at its source.</p>
+<div class="note"><p><strong>Status.</strong> Two things here are the owner's explicit direction of 9 November 2026: ShareCraft is built in Rust like the other Craft applications, and co-authoring is built first as the main feature with the rest formed alongside it. The stage boundaries, spine rules and pairings below are proposed detail and are not yet approved. Nothing here is implemented. No dates, costs or release commitments are implied.</p></div>
+</section>
+
+<section id="rust"><h2>02 / Built in Rust</h2>
+<ul>
+<li><strong>Explicit direction:</strong> ShareCraft's server, collaboration service and storage layer are written in Rust.</li>
+<li><strong>Proposed:</strong> one Cargo workspace with separate crates for the collaboration core, the revision service (Git, JSON, PostgreSQL), permissions, the HTTP API and the web server, so each can be tested on its own.</li>
+<li><strong>Proposed:</strong> the part of the collaboration core that merges edits is compiled both for the server and to WebAssembly for the browser, so the same code decides the result on both sides. The browser editors link to that one client library.</li>
+<li><strong>Established by inspection:</strong> all four upstream editors are written in Rust and already have WebAssembly browser builds, so the collaboration library can be linked into each directly. See <a href="editor-readiness.html">editor-readiness.html</a>.</li>
+<li><strong>Open:</strong> the Rust libraries for Git access, PostgreSQL, the web framework and edit merging. Mature Rust options exist for each; they are selected in Stage 0 and Stage 1, not by this document.</li>
+</ul>
+</section>
+
+<section id="spine"><h2>03 / The collaboration spine</h2>
+<p>The spine is the plumbing built in Stage 1. These rules hold from the first stage onward, and every later module is built to them.</p>
+<div class="table-wrap"><table><thead><tr><th>Ref.</th><th>Rule</th><th>What it gives the rest of the platform</th></tr></thead><tbody>
+<tr><td class="rid">S1</td><td>Every editable thing (file, list item, page, metadata record) has an identifier that does not depend on its name or location.</td><td>Rename and move never break a session, a link or a sync client.</td></tr>
+<tr><td class="rid">S2</td><td>Every edit happens inside a session. A session has one or more participants, each with read-only or edit rights.</td><td>Single-user editing, co-authoring and exclusive check-out are the same mechanism with different limits on who may join.</td></tr>
+<tr><td class="rid">S3</td><td>Live session state lives outside Git. A checkpoint turns it into one Git revision with its JSON metadata, crediting everyone who contributed.</td><td>Version history (SC-08) and Git-backed metadata (SC-21) come from the same save path. No commit per keystroke.</td></tr>
+<tr><td class="rid">S4</td><td>Every checkpoint states the revision it was based on. A stale checkpoint is refused with an explicit conflict.</td><td>API writes, DriveCraft sync and offline reconciliation all meet edits through one conflict rule.</td></tr>
+<tr><td class="rid">S5</td><td>Joining and staying in a session depends on a permission check that is repeated when permissions change.</td><td>Revoking access removes a person from a session in progress (A04), for every kind of content.</td></tr>
+<tr><td class="rid">S6</td><td>The spine carries edits without understanding them. Each editor defines what its edits mean and how two of them combine.</td><td>Text, spreadsheet, PDF and CAD editors plug in without the spine changing. New Craft applications join the same way.</td></tr>
+<tr><td class="rid">S7</td><td>Session start, join, leave, removal and checkpoint are published as events.</td><td>Audit, the change feed, notifications and search indexing subscribe to one stream.</td></tr>
+</tbody></table></div>
+<p class="small">Extending sessions to list items, pages and metadata (S1, S2) is a proposal. It means two people editing the same list row or page see each other's changes too. The scope requires co-authoring only for the named editors; if this is not wanted, those content types still save through S3 and S4 as sessions of one.</p>
+</section>
+
+<section id="stages"><h2>04 / Stages</h2>
+<p>Two tracks run together from Stage 2: the <strong>editor track</strong> adds one co-authoring editor at a time, and the <strong>platform track</strong> adds the SharePoint-baseline modules onto the spine. Scope references (SC) and acceptance tests (A) are from <a href="scope.html">scope.html</a>.</p>
+<div class="cards">
+<article class="module"><span class="tag">Stage 0 · No product code</span><h3>Definition and editor inspection</h3><ul>
+<li>Settle the decisions Stage 1 cannot start without (section 07), including the approach to merging concurrent edits, which now comes first instead of last.</li>
+<li><strong>Done 9 November 2026:</strong> the source of WordCraft, GridCraft, PdfCraft and SolidCraft was read and reported in <a href="editor-readiness.html">editor-readiness.html</a>. All four are Rust, run in a browser, can be embedded by a host page and route changes through one entry point; none has co-authoring code.</li>
+<li>Draft the editor integration contract (SC-15) from what is found.</li>
+<li><strong>Exit:</strong> decisions recorded in the scope; a readiness report per editor; spine rules S1–S7 confirmed or amended.</li></ul></article>
+
+<article class="module"><span class="tag spine">Stage 1 · The spine</span><h3>Co-authoring working end to end</h3><ul>
+<li>Rust workspace and build. Document identity. Session service: join, presence, attribution, transport, save status, reconnect after interruption.</li>
+<li>Revision service: checkpoint to Git revision, JSON metadata and PostgreSQL record, with stale-write conflicts (the core of SC-21).</li>
+<li>Minimal identity and a per-document permission check, including removal from a live session when access is revoked.</li>
+<li>A deliberately plain built-in text editor in the browser as the first client. It exists to prove the spine and becomes the basis for simple text fields later.</li>
+<li><strong>Real editors, one person at a time:</strong> create the four forks, remove the upstream brand assets, record provenance (SC-24), and serve each editor's existing browser build. Connect each editor's existing host bridge so a file opens from ShareCraft and saves back as a checkpoint, as a session of one.</li>
+<li><strong>Exit:</strong> two browser sessions edit the same plain-text document at once, see each other, reach the same result, survive a disconnect, lose access on revocation, and reopen the saved Git revision. This is A07 in miniature, plus the save and conflict parts of A13. Separately, a WordCraft, GridCraft, PdfCraft and SolidCraft file each opens in the browser from ShareCraft and saves back as a Git revision, which is the fork, build and launch part of A17.</li></ul></article>
+
+<article class="module"><span class="tag">Stage 2</span><h3>Libraries and access · GridCraft</h3><ul>
+<li><strong>Platform:</strong> SC-01 organizations, sites and navigation; SC-02 libraries and file operations; SC-11 identity, permissions, sharing, inheritance without size limits, inheritance explorer; SC-25 site branding and brand management.</li>
+<li><strong>Editor:</strong> live co-authoring in the GridCraft fork: lasting identities for sheets, rows and columns, changes sent through the spine, reconciliation built on its existing reference adjustment, per-person undo and presence. A GridCraft file clicked in a library opens in the browser with live co-authoring. The parts that are not spreadsheet-specific go into the shared collaboration library for the editors that follow.</li>
+<li><strong>Exit:</strong> A14, A15, A04, A18; A07 and the rest of A17 for GridCraft.</li></ul></article>
+
+<article class="module"><span class="tag">Stage 3</span><h3>Metadata and history · WordCraft</h3><ul>
+<li><strong>Platform:</strong> SC-03 lists; SC-04 columns; SC-05 taxonomy; SC-06 content types; SC-07 views and forms; SC-08 versions, publishing, check-out and locking, defined in terms of sessions and checkpoints.</li>
+<li><strong>Editor:</strong> live co-authoring in the WordCraft fork, including two people typing in the same paragraph.</li>
+<li><strong>Exit:</strong> A01, A02, A03, the rest of A13; A07 and the rest of A17 for WordCraft.</li></ul></article>
+
+<article class="module"><span class="tag">Stage 4</span><h3>API and change feed · PdfCraft</h3><ul>
+<li><strong>Platform:</strong> SC-14 administration and extensibility; SC-23 DriveCraft integration API. The change feed is built on the spine's event stream and reports when a file is in a live session.</li>
+<li><strong>Editor:</strong> live co-authoring in the PdfCraft fork.</li>
+<li><strong>Exit:</strong> A16, including a sync client behaving correctly against a file in a live session; A07 and A17 for PdfCraft.</li></ul></article>
+
+<article class="module"><span class="tag">Stage 5</span><h3>Knowledge and governance · SolidCraft</h3><ul>
+<li><strong>Platform:</strong> SC-09 pages and news; SC-10 search; SC-12 retention, records and audit; SC-13 FlowCraft workflows; SC-16 hybrid continuity; SC-17 migration.</li>
+<li><strong>Editor:</strong> live co-authoring in the SolidCraft fork. DeckCraft per its established scope and release allocation.</li>
+<li><strong>Exit:</strong> A05, A06, A08, A09; A07 and A17 complete for all four editors.</li></ul></article>
+
+<article class="module"><span class="tag parallel">Stage 6 · Can run alongside Stage 5</span><h3>Intake, forms, evidence and services</h3><ul>
+<li>SC-18 public portals; SC-19 forms and paper capture; SC-20 signatures and timestamp evidence; SC-22 services on the platform.</li>
+<li><strong>Exit:</strong> A10, A11.</li></ul></article>
+
+<article class="module"><span class="tag">Final gate · Not a feature stage</span><h3>Production readiness</h3><ul>
+<li>Migration rehearsal, security, accessibility and performance checks, recovery exercise and handover.</li>
+<li><strong>Exit:</strong> A12.</li></ul></article>
+</div>
+<p class="small" style="margin-top:16px">The pairing of each editor with a platform stage shows roughly when it lands, not a dependency. The editor track moves at the pace each codebase allows. Its order (GridCraft, WordCraft, PdfCraft, SolidCraft) follows the <a href="editor-readiness.html">editor readiness report</a> and was approved by the owner on 9 November 2026: GridCraft's changes are already structured data and its rule for reconciling row and column changes largely exists, so it is the lowest-risk first proof on a real editor; SolidCraft, where one person's change can invalidate another's and rebuilds block the screen, stays last. Opening real editors in Stage 1 was approved at the same time, because it needs only the host bridge each editor already has.</p>
+</section>
+
+<section id="proof"><h2>05 / The standing proof</h2>
+<p>From the end of Stage 1, an automated two-session test runs on every build: two participants edit one document at once, one disconnects and returns, one has access revoked, and the checkpoint is reopened from Git. It starts with the plain text editor and gains a case for each real editor as it joins.</p>
+<p>Each platform module must pass with that test still green. A change to storage, permissions, locking or the API that breaks co-authoring is caught on the day it is made, which is the practical meaning of forming everything alongside the main feature.</p>
+</section>
+
+<section id="risks"><h2>06 / Risks</h2>
+<div class="table-wrap"><table><thead><tr><th>Risk</th><th>Consequence</th><th>How this plan answers it</th></tr></thead><tbody>
+<tr><td>Every upstream editor lacks lasting identities, a sendable record of changes, and per-person undo.</td><td>Each fork needs the same three pieces of work before it can co-author. Confirmed by inspection; none needs porting to the browser.</td><td>Build the three once in a shared Rust library where possible. The spine and the other editors are unaffected by any one editor (S6).</td></tr>
+<tr><td>The editors draw to a canvas, and their accessibility in a browser has not been examined.</td><td>The scope's accessibility target may not be reachable inside the editors without further work.</td><td>Check before Stage 2; listed as not yet checked in the readiness report.</td></tr>
+<tr><td>The approach to merging edits is chosen in Stage 0 and later proves wrong for spreadsheets or CAD.</td><td>The spine's core would need changing with content already stored.</td><td>S6 keeps edit meaning in the editors. Stored history is Git revisions, not merge data, so the merge layer can change without touching saved content. Stage 0 inspection checks the choice against all four editors, not only text.</td></tr>
+<tr><td>The spine is built before the content model, permissions and governance are fully known.</td><td>Later modules could demand something the spine cannot do.</td><td>The spine rules are written from the whole scope, and each later stage is built onto the spine with the standing proof running.</td></tr>
+<tr><td>Stage 1 produces nothing a SharePoint user would recognise.</td><td>Visible breadth arrives later than in a storage-first plan.</td><td>Accepted trade for having the main feature proven first. Stage 2 delivers libraries and a real editor together.</td></tr>
+<tr><td>SolidCraft co-authoring proves much harder than the others.</td><td>It delays completion of A07 for all four editors.</td><td>It is last on the editor track, so three editors are complete first and release allocation can be decided on evidence.</td></tr>
+<tr><td>Writable offline copies (SC-16) are chosen.</td><td>Offline edits must be reconciled with live sessions.</td><td>S4 gives both the same conflict mechanism. The hybrid-authority decision is needed before Stage 5.</td></tr>
+</tbody></table></div>
+</section>
+
+<section id="decisions"><h2>07 / Decisions by stage</h2>
+<p>From the scope's decision register (section 08), placed at the latest point each can be made without blocking work.</p>
+<div class="table-wrap"><table><thead><tr><th>Needed before</th><th>Decision</th></tr></thead><tbody>
+<tr><td>Stage 1</td><td>Approach to merging concurrent edits and the session transport (decision 5). Repository layout, JSON schema, binary storage and checkpoint boundaries (decision 3). Tenancy model (decision 2). Open-source license (decision 10). Rust library choices. Fork names and base revisions for all four editors; editor hosting and embedding model (decision 5).</td></tr>
+<tr><td>Stage 2</td><td>Identity provider and external users (decision 2). GridCraft's rule for concurrent row and column changes (decision 5). Whether the editors' canvas interface can meet the accessibility target.</td></tr>
+<tr><td>Stage 3</td><td>Whether list items, pages and metadata are live-shared or sessions of one (section 03).</td></tr>
+<tr><td>Stage 4</td><td>DriveCraft API authentication, cursors, tombstone retention and notification transport (decision 6).</td></tr>
+<tr><td>Stage 5</td><td>Hybrid authority (decision 4); SharePoint compatibility coverage (decision 7).</td></tr>
+<tr><td>Stage 6</td><td>Trust and evidence providers (decision 8).</td></tr>
+<tr><td>Final gate</td><td>Scale, availability and recovery targets (decision 9), agreed early enough to be measured.</td></tr>
+</tbody></table></div>
+<p class="small">Release breadth (decision 1) is not placed here: this plan orders the whole scope and does not say which stages make up a first release.</p>
+</section>
+
+<section id="changes"><h2>08 / Changes</h2>
+<p>Version 0.1 built co-authoring as the last feature stage, with earlier stages reserving room for it and a test stand-in imitating it. The owner reversed that order on 9 November 2026: co-authoring is built first and the platform forms around it. The stand-in is replaced by the real collaboration core, and the reservations became the spine rules. Rust was recorded as the implementation language in the same instruction.</p>
+<p>Version 0.3 applies two findings from the editor inspection, approved by the owner on 9 November 2026: GridCraft moves ahead of WordCraft on the editor track, and all four editors are forked and opened from ShareCraft, one person at a time, in Stage 1.</p>
+<p class="small">Scope of Works v0.7 records both instructions as D14 (Rust) and D15 (co-authoring first), and its delivery order now matches this plan.</p>
+</section>
+
+<footer>ShareCraft · ThineCraft · Sequencing Plan v0.3 · Updated 9 November 2026<br>Proposed order, not an approved design. Read with Scope of Works v0.7.</footer>
+</main></div>
+</body></html>

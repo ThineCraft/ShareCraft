@@ -1,0 +1,388 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ShareCraft — Collaboration Spine Implementation Plan (Stage 1, part 1)</title>
+<style>
+:root{color-scheme:light dark;--ink:light-dark(#172f38,#e4ecef);--muted:light-dark(#536b72,#a9b9bf);--line:light-dark(#d7e2e3,#36454b);--paper:light-dark(#fff,#1d272b);--wash:light-dark(#f2f6f5,#141b1e);--accent:light-dark(#3156c9,#9db4ff);font:15px/1.6 Segoe UI,system-ui,sans-serif;color:var(--ink);background:var(--wash)}
+*{box-sizing:border-box}body{margin:0;padding:28px 18px 80px}main{max-width:940px;margin:auto}
+h1{font-size:1.9rem;letter-spacing:-.03em;line-height:1.2;margin:0 0 14px}h2{font-size:1.3rem;margin:38px 0 12px;padding-top:18px;border-top:1px solid var(--line)}h3{font-size:1.08rem;margin:30px 0 8px}h4{font-size:.95rem;margin:16px 0 6px}
+p{margin:0 0 12px}ul,ol{margin:0 0 12px;padding-left:22px}li{margin-bottom:6px}a{color:var(--accent)}
+code{font-family:Consolas,Menlo,monospace;font-size:.88em;background:light-dark(#e9efee,#263238);padding:1px 5px;border-radius:3px;overflow-wrap:anywhere}
+pre{background:var(--paper);border:1px solid var(--line);border-radius:7px;padding:12px 14px;overflow-x:auto;font:13px/1.5 Consolas,Menlo,monospace;margin:0 0 12px}pre code{background:none;padding:0;font-size:inherit}
+.note{border-left:4px solid var(--accent);background:var(--paper);padding:12px 16px;margin:0 0 14px}.note p:last-child{margin:0}
+.task{background:var(--paper);border:1px solid var(--line);border-radius:9px;padding:6px 20px 14px;margin:18px 0}
+ol.steps{list-style:none;padding-left:0}ol.steps>li{padding-left:28px;position:relative;margin-bottom:10px}ol.steps>li::before{content:"☐";position:absolute;left:2px;color:var(--muted)}
+table{border-collapse:collapse;width:100%;font-size:.9rem;background:var(--paper);margin-bottom:14px}th,td{border:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top}th{background:light-dark(#e8efed,#263238)}
+.small{font-size:.88rem;color:var(--muted)}
+</style>
+</head>
+<body><main>
+<h1>Collaboration Spine Implementation Plan</h1>
+<p class="small">ShareCraft · Stage 1, part 1 of 3 · Written 9 November 2026</p>
+
+<div class="note"><p><strong>For agentic workers:</strong> REQUIRED SUB-SKILL: use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task by task. Each step below is a checkbox item; tick it by changing ☐ to ☑ in this file as you complete it.</p></div>
+
+<p><strong>Goal:</strong> two people edit the same plain-text document at once from two browsers, see who else is there, reach the same text, survive a dropped connection, and have the result saved as a Git revision with a JSON metadata file.</p>
+<p><strong>Architecture:</strong> a Rust server holds one ordered change log per open document. Every client change is sent with the log position it was based on; the server adjusts it against changes committed since, appends it, and broadcasts it to everyone, including the sender. Clients apply changes in log order and adjust their own unconfirmed changes when others arrive first. The same Rust merging code runs in the server and, compiled to WebAssembly, in the browser. When a document goes quiet the server writes a checkpoint: one Git commit with the content and its JSON metadata.</p>
+<p><strong>Tech stack:</strong> Rust (stable, edition 2024), Cargo workspace; <code>tokio</code>, <code>axum</code> (WebSocket), <code>serde</code>/<code>serde_json</code>, <code>uuid</code>, <code>thiserror</code>, <code>git2</code> (default features off), <code>proptest</code>, <code>tokio-tungstenite</code> (tests), <code>wasm-bindgen</code> + <code>wasm-bindgen-cli</code>. Add each with <code>cargo add</code> at its current stable release; <code>Cargo.lock</code> records the versions.</p>
+<p><strong>Spec:</strong> <a href="../scope.html">scope.html</a> (D09, D14–D18, SC-15, SC-21, A07, A13) and <a href="../sequencing.html">sequencing.html</a> (Stage 1, spine rules S1–S7). Read both before starting.</p>
+
+<h2>What this plan does not cover</h2>
+<p>Stage 1 is three plans. This is the first; each ends in working, tested software.</p>
+<table><tr><th>Plan</th><th>Covers</th></tr>
+<tr><td>1 (this one)</td><td>Merging core, session server, browser plain-text client, Git and JSON checkpoints.</td></tr>
+<tr><td>2</td><td>PostgreSQL records and rebuild (rest of A13), real sign-in, per-document permission checks, removal from a live session on revocation (S5), audit events (S7).</td></tr>
+<tr><td>3</td><td>The four editor forks and opening each from ShareCraft through its host bridge, one person at a time (SC-24).</td></tr></table>
+<p>Until plan 2, identity is a name typed into the page and anyone who can reach the server can edit. The server therefore binds to <code>127.0.0.1</code> only and prints a warning at start. Do not add a way to bind to other addresses in this plan.</p>
+
+<h2>Global constraints</h2>
+<ul>
+<li>Language: Rust only for server and merging code (D14). No JavaScript merging logic; the page script only wires the text box to the WebAssembly client.</li>
+<li>Licence: every crate has <code>license = "MIT OR Apache-2.0"</code> (D17). No copyleft dependencies (GPL, LGPL, AGPL, MPL): the merging crates will be linked into the editor forks, whose upstreams forbid them.</li>
+<li>One organization per installation (D18). Do not add organization or tenant identifiers to types, paths or messages.</li>
+<li>One write path (S2, S3): content reaches Git only through <code>RevisionStore::checkpoint</code>. No other code writes to a repository.</li>
+<li>Live changes never go to Git individually (S3). No commit per change.</li>
+<li>Every checkpoint states the revision it was based on and is refused if stale (S4).</li>
+<li>The merging core does not know what a change means (S6): <code>collab-core</code> must not depend on <code>collab-text</code> or mention text.</li>
+<li>Library crates (<code>collab-core</code>, <code>collab-text</code>, <code>protocol</code>, <code>revisions</code>): <code>#![forbid(unsafe_code)]</code>, and no <code>unwrap</code>, <code>expect</code>, <code>panic!</code> or indexing that can panic outside <code>#[cfg(test)]</code>. Input from a client must never be able to stop the server.</li>
+<li><code>collab-core</code>, <code>collab-text</code> and <code>protocol</code> must compile for <code>wasm32-unknown-unknown</code>: no <code>tokio</code>, file or clock use in them.</li>
+<li>Text positions are counted in Unicode scalar values (Rust <code>char</code>), never bytes or UTF-16 units. Conversion from the browser's UTF-16 offsets happens inside the WebAssembly client.</li>
+<li>Work on branch <code>stage-1-spine</code>, created from <code>main</code> before Task 1. Commit after each task with the message given. Do not push.</li>
+<li><code>.gitignore</code> and <code>.env</code> may be edited by another session installing PostgreSQL. Append to <code>.gitignore</code>; never rewrite it. Do not touch <code>.env</code>.</li>
+</ul>
+
+<h2>Review focus</h2>
+<p>Conditions the spec implies that are most likely to hurt a real user. Each has a test in the task named.</p>
+<ol>
+<li><strong>Text beyond ASCII:</strong> emoji and combining characters typed by two people at the same spot must converge and never split a character. Task 3 (<code>converges_with_astral_and_combining_chars</code>) and Task 8 (<code>utf16_offsets_convert_at_astral_chars</code>).</li>
+<li><strong>Reconnect with unconfirmed changes:</strong> a client that drops and returns must not lose or duplicate what it typed. Task 2 (<code>duplicate_op_id_is_not_applied_twice</code>) and Task 6 (<code>reconnect_resends_without_duplicating</code>).</li>
+<li><strong>Malformed or hostile change from a client:</strong> wrong length, position past the end, base position in the future. The server refuses it, tells that client, and every other participant is unaffected. Task 2 (<code>rejects_base_ahead_of_log</code>), Task 3 (<code>apply_rejects_length_mismatch</code>), Task 6 (<code>invalid_op_is_refused_and_room_survives</code>).</li>
+<li><strong>Checkpoint cannot be written</strong> (repository locked, disk full): editing continues, the save status says saving failed, and the next checkpoint includes everything. Task 7 (<code>failed_checkpoint_is_retried_and_reported</code>).</li>
+<li><strong>Server restarts mid-session:</strong> changes after the last checkpoint are gone; returning clients must be told plainly and reset to the saved text, not left silently diverged. Task 6 (<code>unknown_since_gets_reset</code>) and Task 8 (page shows the count of changes that could not be kept).</li>
+</ol>
+
+<h2>File structure</h2>
+<pre><code>Cargo.toml                      workspace, shared package fields, lints
+LICENSE-MIT, LICENSE-APACHE
+crates/collab-core/             ids, Document trait, ServerLog, ClientState. No knowledge of text.
+  src/lib.rs  src/ids.rs  src/document.rs  src/server_log.rs  src/client_state.rs
+crates/collab-text/             TextDoc and TextOp: apply and transform for plain text
+  src/lib.rs  src/op.rs  src/transform.rs  tests/convergence.rs
+crates/protocol/                wire messages shared by server and clients
+  src/lib.rs
+crates/revisions/               the only code that writes to Git
+  src/lib.rs  src/store.rs  src/meta.rs  tests/checkpoint.rs
+crates/server/                  binary sharecraft-server: rooms, WebSocket, checkpoint scheduling
+  src/main.rs  src/config.rs  src/room.rs  src/ws.rs  src/checkpoint.rs  tests/two_sessions.rs  tests/common/mod.rs
+crates/web-client/              WebAssembly wrapper around ClientState&lt;TextDoc&gt;
+  src/lib.rs
+web/                            index.html, app.js, pkg/ (generated, ignored)
+xtask/                          cargo xtask check | web
+  src/main.rs</code></pre>
+
+<h2>Tasks</h2>
+
+<div class="task"><h3>Task 1: Workspace and identifiers</h3>
+<p><strong>Files:</strong> create <code>Cargo.toml</code>, <code>LICENSE-MIT</code>, <code>LICENSE-APACHE</code>, <code>crates/collab-core/{Cargo.toml,src/lib.rs,src/ids.rs}</code>; append <code>/target</code>, <code>/data</code>, <code>/web/pkg</code> to <code>.gitignore</code>.</p>
+<p><strong>Produces:</strong></p>
+<pre><code>// collab_core::ids — all Copy, Eq, Hash, Ord, Serialize, Deserialize
+pub struct DocId(pub Uuid);      // serde: plain UUID string
+pub struct ClientId(pub Uuid);   // one per connection lifetime, chosen by the client
+pub struct OpId(pub Uuid);       // chosen by the client per change
+pub struct Seq(pub u64);         // position in a document's log; Seq(0) = nothing committed
+impl Seq { pub fn next(self) -> Seq }</code></pre>
+<ol class="steps">
+<li>Create branch <code>stage-1-spine</code> from <code>main</code>.</li>
+<li>Write the workspace <code>Cargo.toml</code>: <code>resolver = "3"</code>, <code>members = ["crates/*", "xtask"]</code>, <code>[workspace.package]</code> with <code>edition = "2024"</code>, <code>license = "MIT OR Apache-2.0"</code>, <code>repository = "https://github.com/ThineCraft/ShareCraft"</code>; <code>[workspace.lints.rust] unsafe_code = "forbid"</code>; <code>[workspace.lints.clippy]</code> with <code>unwrap_used</code>, <code>expect_used</code>, <code>panic</code>, <code>indexing_slicing = "deny"</code>. Add the standard MIT and Apache 2.0 licence texts, copyright "ShareCraft contributors".</li>
+<li>Write the failing test in <code>ids.rs</code>: <code>seq_next_increments</code> (<code>Seq(4).next() == Seq(5)</code>) and <code>ids_serialize_as_plain_strings</code> (<code>serde_json::to_string(&amp;DocId(Uuid::nil()))</code> equals <code>"\"00000000-0000-0000-0000-000000000000\""</code>; <code>Seq(7)</code> serializes as <code>7</code>).</li>
+<li>Run <code>cargo test -p collab-core</code>. Expected: fails to compile, types missing.</li>
+<li>Implement the four types with <code>#[serde(transparent)]</code>. Allow the denied clippy lints inside <code>#[cfg(test)]</code> modules only.</li>
+<li>Run <code>cargo test -p collab-core</code> (pass) and <code>cargo build -p collab-core --target wasm32-unknown-unknown</code> (succeeds; enable <code>uuid</code>'s <code>js</code> feature only if <code>v4</code> generation is needed, which it is not in this crate).</li>
+<li>Commit: <code>chore: scaffold Rust workspace and collaboration identifiers</code>.</li>
+</ol></div>
+
+<div class="task"><h3>Task 2: Document trait and server log</h3>
+<p><strong>Files:</strong> create <code>crates/collab-core/src/document.rs</code>, <code>src/server_log.rs</code>; modify <code>src/lib.rs</code>.</p>
+<p><strong>Consumes:</strong> Task 1 ids. <strong>Produces:</strong></p>
+<pre><code>pub trait Document: Clone {
+    type Op: Clone + PartialEq + std::fmt::Debug + Serialize + DeserializeOwned;
+    type Error: std::error::Error + Send + Sync + 'static;
+    fn apply(&amp;mut self, op: &amp;Self::Op) -> Result&lt;(), Self::Error>;
+    /// `first` and `second` were both made against the same state. Returns (first2, second2) such that
+    /// applying first then second2 gives the same state as applying second then first2.
+    /// Where the two compete for the same place, `first` takes it.
+    fn transform(first: &amp;Self::Op, second: &amp;Self::Op) -> Result&lt;(Self::Op, Self::Op), Self::Error>;
+}
+
+pub struct Entry&lt;Op> { pub seq: Seq, pub client: ClientId, pub op_id: OpId, pub op: Op }   // Clone, Serialize, Deserialize
+pub enum Submitted&lt;Op> { Committed(Entry&lt;Op>), Duplicate(Seq) }
+pub enum SubmitError { BaseAhead { base: Seq, head: Seq }, BaseTooOld { base: Seq, oldest: Seq }, Invalid(String) }
+
+impl&lt;D: Document> ServerLog&lt;D> {
+    pub fn new(doc: D, head: Seq) -> Self;        // log starts empty at `head`
+    pub fn head(&amp;self) -> Seq;
+    pub fn doc(&amp;self) -> &amp;D;
+    pub fn submit(&amp;mut self, client: ClientId, op_id: OpId, base: Seq, op: D::Op) -> Result&lt;Submitted&lt;D::Op>, SubmitError>;
+    pub fn since(&amp;self, seq: Seq) -> Option&lt;&amp;[Entry&lt;D::Op>]>;   // None if `seq` is older than the oldest kept entry or ahead of head
+    pub fn truncate_through(&amp;mut self, seq: Seq);  // forget entries with seq &lt;= given; head unchanged
+}</code></pre>
+<p><code>submit</code>: if an entry with the same <code>client</code> and <code>op_id</code> is still in the log, return <code>Duplicate(its seq)</code> and change nothing. Otherwise transform the incoming op against each entry after <code>base</code>, in order, with the logged entry as <code>first</code>; apply the result; append it with <code>seq = head.next()</code>. A transform or apply error becomes <code>SubmitError::Invalid</code> and leaves the log and document exactly as they were.</p>
+<ol class="steps">
+<li>Write failing tests in <code>server_log.rs</code> using a private test document <code>Counter(Vec&lt;u32>)</code> whose op is <code>Push(u32)</code>, apply appends, transform returns both unchanged, and apply fails on <code>Push(0)</code>:
+ <ul><li><code>commits_in_arrival_order</code>: two submits at base 0 give seqs 1 and 2 and <code>doc() == [a, b]</code>.</li>
+ <li><code>duplicate_op_id_is_not_applied_twice</code>: same client and op id submitted twice gives <code>Committed</code> then <code>Duplicate(Seq(1))</code>; document has one element.</li>
+ <li><code>rejects_base_ahead_of_log</code>: base 5 on an empty log gives <code>BaseAhead</code>.</li>
+ <li><code>rejects_base_older_than_kept_history</code>: after three commits and <code>truncate_through(Seq(2))</code>, base 1 gives <code>BaseTooOld</code>; base 2 is accepted.</li>
+ <li><code>invalid_op_leaves_state_untouched</code>: <code>Push(0)</code> gives <code>Invalid</code>; head and doc unchanged.</li>
+ <li><code>since_returns_entries_after_seq</code>: after three commits, <code>since(Seq(1))</code> has two entries; <code>since(Seq(9))</code> is <code>None</code>.</li></ul></li>
+<li>Run <code>cargo test -p collab-core</code>. Expected: compile failure.</li>
+<li>Implement the trait and <code>ServerLog</code>.</li>
+<li>Run <code>cargo test -p collab-core</code>. Expected: all pass.</li>
+<li>Commit: <code>feat(collab-core): document trait and ordered server log</code>.</li>
+</ol></div>
+
+<div class="task"><h3>Task 3: Plain-text document</h3>
+<p><strong>Files:</strong> create <code>crates/collab-text/{Cargo.toml,src/lib.rs,src/op.rs,src/transform.rs,tests/convergence.rs}</code>.</p>
+<p><strong>Consumes:</strong> <code>collab_core::Document</code>. <strong>Produces:</strong></p>
+<pre><code>pub struct TextDoc(String);     // Clone, Default, PartialEq, Debug
+impl TextDoc { pub fn new(s: impl Into&lt;String>) -> Self; pub fn as_str(&amp;self) -> &amp;str; pub fn len_chars(&amp;self) -> usize }
+
+pub enum Component { Retain(usize), Insert(String), Delete(usize) }   // counts are chars; serde: {"retain":3} | {"insert":"x"} | {"delete":2}
+pub struct TextOp { /* private Vec&lt;Component>, kept normalized */ }   // serde: JSON array of components
+impl TextOp {
+    pub fn builder() -> TextOpBuilder;                 // .retain(n) .insert(s) .delete(n) .build()
+    pub fn replace(doc_len: usize, at: usize, remove: usize, insert: &amp;str) -> Result&lt;TextOp, TextError>;
+    pub fn base_len(&amp;self) -> usize;                    // chars the op expects: retains + deletes
+    pub fn target_len(&amp;self) -> usize;                  // chars after: retains + inserted chars
+    pub fn components(&amp;self) -> &amp;[Component];
+}
+pub enum TextError { LengthMismatch { expected: usize, actual: usize }, OutOfRange }
+impl Document for TextDoc { type Op = TextOp; type Error = TextError; .. }</code></pre>
+<p>Normalized means: no zero-length components, adjacent components of the same kind merged, and an insert next to a delete ordered insert first. Deserialization normalizes, so two spellings of the same change compare equal. An op covers the whole document: <code>apply</code> fails with <code>LengthMismatch</code> unless <code>base_len() == len_chars()</code>. <code>transform(first, second)</code> requires equal <code>base_len</code>; when both insert at the same position, <code>first</code>'s text comes before <code>second</code>'s. This is the standard retain/insert/delete operation transform; walk both component lists together.</p>
+<ol class="steps">
+<li>Write failing unit tests in <code>op.rs</code> and <code>transform.rs</code>:
+ <ul><li><code>apply_inserts_and_deletes</code>: "hello world" with retain 6, delete 5, insert "there" gives "hello there".</li>
+ <li><code>apply_rejects_length_mismatch</code>: an op with <code>base_len</code> 3 on "hello" gives <code>LengthMismatch{expected:3, actual:5}</code> and the text is unchanged.</li>
+ <li><code>replace_rejects_out_of_range</code>: <code>replace(5, 4, 3, "")</code> is <code>OutOfRange</code>.</li>
+ <li><code>builder_normalizes</code>: retain 0, insert "a", insert "b", retain 2 builds to components <code>[Insert("ab"), Retain(2)]</code>.</li>
+ <li><code>same_position_inserts_first_wins_place</code>: on "ab", first inserts "X" at 1, second inserts "Y" at 1; both orders give "aXYb".</li>
+ <li><code>overlapping_deletes_remove_each_char_once</code>: on "abcdef", first deletes chars 1..4, second deletes 2..5; both orders give "af".</li>
+ <li><code>insert_inside_deleted_range_survives</code>: on "abcdef", first deletes 1..5, second inserts "Z" at 3; both orders give "aZf".</li>
+ <li><code>transform_rejects_different_base_len</code>.</li>
+ <li><code>counts_chars_not_bytes</code>: on "a😀b", <code>replace(3, 2, 0, "é")</code> gives "a😀éb".</li></ul></li>
+<li>Write failing property tests in <code>tests/convergence.rs</code> with <code>proptest</code>. Generate a starting string and two random valid ops against it, drawing characters from ASCII letters, "é", "😀", "👩‍👧" and U+0301:
+ <ul><li><code>transform_converges</code>: applying first then second2 equals applying second then first2.</li>
+ <li><code>converges_with_astral_and_combining_chars</code>: the same property with strings drawn only from the non-ASCII set, and the result is valid when iterated by <code>char</code> with length equal to <code>target_len</code>.</li>
+ <li><code>three_clients_converge_through_server_log</code>: three ops made against the same base, submitted to a <code>ServerLog&lt;TextDoc></code> in any order; replaying <code>since(Seq(0))</code> onto a fresh copy of the start reproduces <code>doc()</code>.</li></ul></li>
+<li>Run <code>cargo test -p collab-text</code>. Expected: compile failure.</li>
+<li>Implement <code>TextDoc</code>, <code>TextOp</code>, the builder and <code>transform</code>.</li>
+<li>Run <code>cargo test -p collab-text</code>. Expected: all pass, property tests at the default 256 cases.</li>
+<li>Run <code>cargo build -p collab-text --target wasm32-unknown-unknown</code>. Expected: succeeds.</li>
+<li>Commit: <code>feat(collab-text): plain-text operations with transform</code>.</li>
+</ol></div>
+
+<div class="task"><h3>Task 4: Client state</h3>
+<p><strong>Files:</strong> create <code>crates/collab-core/src/client_state.rs</code>; modify <code>src/lib.rs</code>.</p>
+<p><strong>Consumes:</strong> <code>Document</code>, <code>Entry</code>, ids. <strong>Produces:</strong></p>
+<pre><code>pub struct Outgoing&lt;Op> { pub op_id: OpId, pub base: Seq, pub op: Op }      // Clone, PartialEq, Debug
+pub enum ClientError&lt;E> { Document(E), OutOfOrder { expected: Seq, got: Seq } }
+
+impl&lt;D: Document> ClientState&lt;D> {
+    pub fn new(client: ClientId, doc: D, seq: Seq) -> Self;
+    pub fn client(&amp;self) -> ClientId;
+    pub fn doc(&amp;self) -> &amp;D;                 // includes unconfirmed local changes
+    pub fn seq(&amp;self) -> Seq;                // last log position applied
+    pub fn pending(&amp;self) -> usize;          // unconfirmed local changes (in flight + waiting)
+    /// Apply a local change. Returns what to send now, or None if one is already in flight.
+    pub fn local(&amp;mut self, op_id: OpId, op: D::Op) -> Result&lt;Option&lt;Outgoing&lt;D::Op>>, ClientError&lt;D::Error>>;
+    /// Handle one committed entry from the server, in order. If it is this client's in-flight change it is
+    /// confirmed; otherwise it is adjusted past local unconfirmed changes and applied.
+    pub fn committed(&amp;mut self, entry: &amp;Entry&lt;D::Op>) -> Result&lt;Applied&lt;D::Op>, ClientError&lt;D::Error>>;
+    pub fn in_flight(&amp;self) -> Option&lt;Outgoing&lt;D::Op>>;   // to resend after reconnecting
+    /// Drop unconfirmed changes and adopt a server snapshot. Returns how many were dropped.
+    pub fn reset(&amp;mut self, doc: D, seq: Seq) -> usize;
+}
+pub struct Applied&lt;Op> { pub remote: Option&lt;Op>, pub send_next: Option&lt;Outgoing&lt;Op>> }
+// remote: the change as it must be applied to the caller's own view (None when it was our own confirmation)</code></pre>
+<p>State: at most one change in flight, plus a queue of changes waiting. A remote entry is transformed past the in-flight change and then each waiting change in order, with the remote entry as <code>first</code>; each local change is replaced by its transformed form. When the in-flight change is confirmed, the next waiting change goes in flight with <code>base</code> equal to the confirming entry's seq. <code>committed</code> with <code>entry.seq != seq().next()</code> returns <code>OutOfOrder</code> and changes nothing.</p>
+<ol class="steps">
+<li>Write failing tests in <code>client_state.rs</code> using a small test document where order matters (a <code>Vec&lt;char></code> with op <code>InsertAt(usize, char)</code>, first-wins transform):
+ <ul><li><code>first_local_change_is_sent_with_current_seq</code>.</li>
+ <li><code>second_local_change_waits_until_confirmation</code>: second <code>local</code> returns <code>None</code>; after confirming the first, <code>send_next</code> carries the second with <code>base == Seq(1)</code>.</li>
+ <li><code>remote_change_is_adjusted_past_pending</code>: client typed 'x' at 0 unconfirmed; remote inserts 'y' at 0; <code>Applied.remote</code> inserts at 0 and the client's document reads "yx".</li>
+ <li><code>own_entry_confirms_and_returns_no_remote</code>.</li>
+ <li><code>out_of_order_entry_is_refused</code>: an entry with seq 3 when <code>seq()</code> is 1 gives <code>OutOfOrder{expected: Seq(2), got: Seq(3)}</code>.</li>
+ <li><code>reset_reports_dropped_changes</code>: two unconfirmed changes, <code>reset</code> returns 2 and <code>pending() == 0</code>.</li>
+ <li><code>two_clients_and_server_converge</code>: two <code>ClientState</code>s and a <code>ServerLog</code>, each client makes two changes before seeing the other's; deliver all entries; both documents equal the server's.</li></ul></li>
+<li>Run <code>cargo test -p collab-core</code>. Expected: compile failure.</li>
+<li>Implement <code>ClientState</code>.</li>
+<li>Run <code>cargo test -p collab-core</code>, then add to <code>crates/collab-text/tests/convergence.rs</code> the property test <code>random_interleaving_converges</code>: two <code>ClientState&lt;TextDoc></code> and a <code>ServerLog&lt;TextDoc></code>, a random sequence of "client A types", "client B types", "deliver next entry to A", "deliver next entry to B", then drain; all three texts are equal. Run <code>cargo test --workspace</code>. Expected: all pass.</li>
+<li>Commit: <code>feat(collab-core): client state with pending-change adjustment</code>.</li>
+</ol></div>
+
+<div class="task"><h3>Task 5: Wire protocol and revision store</h3>
+<p>Two small crates with no dependency on each other; both are needed before the server.</p>
+<p><strong>Files:</strong> create <code>crates/protocol/{Cargo.toml,src/lib.rs}</code>, <code>crates/revisions/{Cargo.toml,src/lib.rs,src/store.rs,src/meta.rs,tests/checkpoint.rs}</code>.</p>
+<p><strong>Produces (protocol):</strong> JSON text frames, each an object with a <code>type</code> field in <code>snake_case</code>.</p>
+<pre><code>pub struct Participant { pub client: ClientId, pub name: String, pub cursor: Option&lt;usize> }
+pub enum SaveState { Saved, Saving, Failed }                         // snake_case strings
+pub enum ClientMsg&lt;Op> {
+    Join { client: ClientId, since: Option&lt;Seq> },                    // since = last seq applied, when reconnecting
+    Submit { op_id: OpId, base: Seq, op: Op },
+    Cursor { at: Option&lt;usize> },
+}
+pub enum ServerMsg&lt;Op> {
+    Joined { seq: Seq, snapshot: Option&lt;String>, revision: Option&lt;String>, participants: Vec&lt;Participant> },
+        // snapshot is None when `since` was honoured; the missed entries follow as Committed messages
+    Reset { seq: Seq, snapshot: String, revision: Option&lt;String> },   // `since` could not be honoured
+    Committed { entry: Entry&lt;Op> },
+    People { participants: Vec&lt;Participant> },
+    Save { state: SaveState, revision: Option&lt;String>, through: Seq },
+    Refused { op_id: OpId, reason: String },
+}</code></pre>
+<p><strong>Produces (revisions):</strong></p>
+<pre><code>pub struct RevisionId(String);          // 40 lowercase hex chars; FromStr validates; Display
+pub struct Author { pub id: String, pub name: String }
+pub struct Checkpoint&lt;'a> { pub doc: DocId, pub file_name: &amp;'a str, pub bytes: &amp;'a [u8],
+    pub base: Option&lt;&amp;'a RevisionId>, pub authors: &amp;'a [Author], pub fields: &amp;'a serde_json::Map&lt;String, Value> }
+pub enum Outcome { Written(RevisionId), Unchanged(RevisionId) }
+pub enum CheckpointError { Stale { current: Option&lt;RevisionId> }, NoAuthors, InvalidFileName, Git(git2::Error), Json(serde_json::Error) }
+pub struct Stored { pub revision: RevisionId, pub bytes: Vec&lt;u8>, pub meta: Meta }
+pub struct Meta { pub schema: u32, pub doc_id: DocId, pub file_name: String,
+    pub fields: serde_json::Map&lt;String, Value>, pub contributors: Vec&lt;Author> }   // schema is 1
+
+impl RevisionStore {
+    pub fn open(repo_path: &amp;Path) -> Result&lt;Self, git2::Error>;        // creates a bare repository if absent
+    pub fn checkpoint(&amp;self, c: &amp;Checkpoint&lt;'_>) -> Result&lt;Outcome, CheckpointError>;
+    pub fn head(&amp;self, doc: DocId) -> Result&lt;Option&lt;RevisionId>, git2::Error>;
+    pub fn read(&amp;self, doc: DocId, at: Option&lt;&amp;RevisionId>) -> Result&lt;Option&lt;Stored>, CheckpointError>;
+}</code></pre>
+<p>Repository layout (one bare repository per library; this plan has one library): branch <code>refs/heads/main</code>; content at <code>docs/&lt;doc_id&gt;/content</code>; metadata at <code>docs/&lt;doc_id&gt;/meta.json</code>, pretty-printed with a trailing newline; and a per-document reference <code>refs/sharecraft/docs/&lt;doc_id&gt;</code> pointing at the last commit that changed that document. Paths use the document identifier so renames never move content (S1). <code>checkpoint</code>: compare <code>base</code> with the per-document reference and return <code>Stale</code> if they differ (a missing reference matches <code>base: None</code>). If the content bytes, file name and fields equal what is stored, return <code>Unchanged</code> and write nothing. Otherwise commit on top of <code>main</code>'s tip: author and committer are the first author, signature email <code>&lt;id&gt;@sharecraft.invalid</code>; message is <code>Checkpoint &lt;file_name&gt;</code>, a blank line, then one <code>Co-authored-by: Name &lt;id@sharecraft.invalid&gt;</code> line per further author. <code>contributors</code> in <code>meta.json</code> is the stored list plus any new authors, in first-seen order. Update both references. <code>file_name</code> must be non-empty with no <code>/</code>, <code>\</code> or control characters.</p>
+<ol class="steps">
+<li>Write failing protocol tests: <code>submit_serializes_with_type_tag</code> (JSON of a <code>Submit</code> has <code>"type":"submit"</code> and round-trips) and <code>save_state_is_snake_case</code>.</li>
+<li>Write failing tests in <code>crates/revisions/tests/checkpoint.rs</code>, each on a repository in a <code>tempfile</code> directory:
+ <ul><li><code>first_checkpoint_writes_content_and_meta</code>: <code>read(doc, None)</code> returns the bytes; <code>meta.schema == 1</code>; one contributor.</li>
+ <li><code>stale_base_is_refused</code>: after one checkpoint, a second with <code>base: None</code> gives <code>Stale{current: Some(first)}</code> and <code>head</code> is unchanged.</li>
+ <li><code>unchanged_content_writes_no_commit</code>: same bytes and fields again gives <code>Unchanged(first)</code>; commit count on <code>main</code> is still 1.</li>
+ <li><code>metadata_only_change_is_a_revision</code>: same bytes, a changed field, gives <code>Written</code> with a new id (A13).</li>
+ <li><code>several_authors_are_credited</code>: the commit message contains a <code>Co-authored-by:</code> line for the second author and <code>meta.contributors</code> has both.</li>
+ <li><code>documents_do_not_block_each_other</code>: a checkpoint of document B does not make a checkpoint of document A based on A's own head stale.</li>
+ <li><code>read_at_earlier_revision_returns_earlier_bytes</code>.</li>
+ <li><code>rejects_file_name_with_separator</code> and <code>rejects_empty_authors</code>.</li></ul></li>
+<li>Run <code>cargo test -p protocol -p revisions</code>. Expected: compile failure.</li>
+<li>Implement both crates. Add <code>git2</code> with <code>default-features = false</code>.</li>
+<li>Run <code>cargo test -p protocol -p revisions</code> (pass) and <code>cargo build -p protocol --target wasm32-unknown-unknown</code> (succeeds).</li>
+<li>Commit: <code>feat: wire protocol and Git-backed revision store</code>.</li>
+</ol></div>
+
+<div class="task"><h3>Task 6: Session server</h3>
+<p><strong>Files:</strong> create <code>crates/server/{Cargo.toml,src/main.rs,src/config.rs,src/room.rs,src/ws.rs,tests/two_sessions.rs,tests/common/mod.rs}</code>. The crate is a library plus a thin <code>main.rs</code> so tests can start it in-process.</p>
+<p><strong>Consumes:</strong> <code>ServerLog&lt;TextDoc></code>, <code>ClientState&lt;TextDoc></code> (tests), protocol messages. <strong>Produces:</strong></p>
+<pre><code>pub struct Config { pub addr: SocketAddr, pub data_dir: PathBuf, pub web_dir: PathBuf,
+                    pub checkpoint_idle: Duration, pub checkpoint_max: Duration }
+impl Config { pub fn from_env() -> Result&lt;Self, ConfigError> }
+// SHARECRAFT_ADDR (default 127.0.0.1:8787; any non-loopback address is a ConfigError),
+// SHARECRAFT_DATA (default ./data), SHARECRAFT_WEB (default ./web); idle 2 s, max 30 s
+pub async fn serve(config: Config, listener: TcpListener) -> std::io::Result&lt;()>;
+pub fn router(state: AppState) -> axum::Router;
+// GET /healthz -> 200 "ok"
+// GET /ws/docs/{doc_id}?name=&lt;display name> -> WebSocket speaking ClientMsg&lt;TextOp> / ServerMsg&lt;TextOp>
+// GET /* -> static files from web_dir</code></pre>
+<p>One room per open document, owned by a single task that receives commands over a channel, so the log is never touched concurrently. A room is created on first join, loading the document from the revision store or starting empty, with the log at <code>Seq(0)</code>. Log positions restart at 0 whenever a room is created; that is why a returning client can be asked to reset. <code>name</code> is trimmed, limited to 60 characters, and defaults to "Guest". On <code>Join</code>: with <code>since</code> the room can honour (<code>ServerLog::since</code> is <code>Some</code>), send <code>Joined</code> with no snapshot and then the missed entries; otherwise, for a first join send <code>Joined</code> with the snapshot, and for a reconnect send <code>Reset</code>. Every committed entry is sent to every participant including its sender. <code>SubmitError</code> produces <code>Refused</code> to that client only. A second <code>Join</code> with a <code>ClientId</code> already in the room replaces the older connection. Send <code>People</code> to all on join, leave and cursor change. Frames over 1 MiB, non-text frames and unparseable JSON close that connection only. The room ends when its last participant leaves (Task 7 adds a final checkpoint first).</p>
+<p><code>tests/common/mod.rs</code> provides <code>spawn_server() -> TestServer { addr, data_dir (TempDir) }</code> on port 0 with <code>checkpoint_idle</code> 100 ms, and <code>TestClient</code> wrapping a <code>tokio-tungstenite</code> socket and a <code>ClientState&lt;TextDoc></code> with <code>connect(addr, doc, name)</code>, <code>type_at(pos, &amp;str)</code>, <code>pump_until(|c| ..)</code> with a 5 s timeout, <code>text()</code>, <code>people()</code>, <code>disconnect()</code>, <code>reconnect()</code>.</p>
+<ol class="steps">
+<li>Write failing integration tests in <code>tests/two_sessions.rs</code>:
+ <ul><li><code>two_clients_see_each_other</code>: after both join, each <code>people()</code> has two names.</li>
+ <li><code>concurrent_typing_converges</code>: A types "hello " at 0 and B types "world" at 0 before either pumps; after both pump until <code>pending() == 0</code> and seq 2, both texts are equal and contain both words.</li>
+ <li><code>astral_text_round_trips</code>: A types "😀"; B's text is "😀".</li>
+ <li><code>reconnect_resends_without_duplicating</code>: A types "abc", the socket is dropped before the confirmation is read, A reconnects with <code>since</code> and resends <code>in_flight()</code>; final text on A and B is exactly "abc".</li>
+ <li><code>unknown_since_gets_reset</code>: a client joins a new document with <code>since: Some(Seq(40))</code> and receives <code>Reset</code>.</li>
+ <li><code>invalid_op_is_refused_and_room_survives</code>: A sends a raw <code>Submit</code> whose op has the wrong base length and receives <code>Refused</code>; B then types and both converge.</li>
+ <li><code>garbage_frame_closes_only_that_connection</code>: A sends "not json"; A's socket closes; B can still type and gets confirmations.</li>
+ <li><code>non_loopback_address_is_refused</code>: <code>Config</code> built from <code>SHARECRAFT_ADDR=0.0.0.0:8787</code> is an error.</li></ul></li>
+<li>Run <code>cargo test -p server</code>. Expected: compile failure.</li>
+<li>Implement config, room task, WebSocket handler and router. <code>main.rs</code> prints the address and the line <code>WARNING: development mode, no sign-in, local connections only</code>.</li>
+<li>Run <code>cargo test -p server</code>. Expected: all pass.</li>
+<li>Commit: <code>feat(server): document rooms over WebSocket with ordered change log</code>.</li>
+</ol></div>
+
+<div class="task"><h3>Task 7: Checkpoints from live sessions</h3>
+<p><strong>Files:</strong> create <code>crates/server/src/checkpoint.rs</code>; modify <code>src/room.rs</code>; add tests to <code>tests/two_sessions.rs</code>.</p>
+<p><strong>Consumes:</strong> <code>RevisionStore</code>, room internals. <strong>Produces:</strong></p>
+<pre><code>pub trait Checkpointer: Send + Sync + 'static {
+    fn write(&amp;self, c: &amp;Checkpoint&lt;'_>) -> Result&lt;Outcome, CheckpointError>;
+    fn load(&amp;self, doc: DocId) -> Result&lt;Option&lt;Stored>, CheckpointError>;
+}
+impl Checkpointer for RevisionStore { .. }   // AppState holds Arc&lt;dyn Checkpointer></code></pre>
+<p>The repository is <code>&lt;data_dir&gt;/libraries/00000000-0000-0000-0000-000000000001.git</code>. A document's file name is <code>&lt;doc_id&gt;.txt</code>; content is the text as UTF-8. The room tracks who has contributed since the last checkpoint (author <code>id</code> is the client id as a string, <code>name</code> the display name) and the revision it last wrote or loaded. A checkpoint is written when the log has changes not yet saved and either no change has arrived for <code>checkpoint_idle</code>, or <code>checkpoint_max</code> has passed since the first unsaved change, or the last participant leaves. Git work runs under <code>tokio::task::spawn_blocking</code>; the room keeps accepting changes meanwhile and at most one checkpoint runs at a time. Send <code>Save{Saving}</code> when it starts and <code>Save{Saved, revision, through}</code> when it finishes, then <code>truncate_through(through)</code>. On error send <code>Save{Failed}</code>, keep the contributors and the log, and retry after <code>checkpoint_idle</code>. <code>Stale</code> counts as an error here: plan 2 decides what a room does when a newer revision arrives by another route.</p>
+<ol class="steps">
+<li>Write failing tests:
+ <ul><li><code>idle_session_is_checkpointed</code>: A and B each type; both receive <code>Save{Saved}</code> with the same revision; opening the repository with <code>RevisionStore</code> and reading the document gives the converged text and two contributors.</li>
+ <li><code>reopening_loads_the_saved_text</code>: both leave; a new client joining the same document gets the saved text as snapshot and the revision in <code>Joined</code>.</li>
+ <li><code>typing_resumes_from_saved_revision</code>: after reopening, a further change produces a second revision whose parent chain includes the first.</li>
+ <li><code>failed_checkpoint_is_retried_and_reported</code>: with a test <code>Checkpointer</code> that fails once then delegates, clients receive <code>Save{Failed}</code> then <code>Save{Saved}</code>, and the saved text includes changes typed between the two.</li>
+ <li><code>no_commit_per_change</code>: 50 changes typed within the idle window produce exactly one commit.</li></ul></li>
+<li>Run <code>cargo test -p server</code>. Expected: the new tests fail.</li>
+<li>Implement the scheduler and wire it into the room.</li>
+<li>Run <code>cargo test --workspace</code>. Expected: all pass.</li>
+<li>Commit: <code>feat(server): checkpoint live sessions to Git revisions</code>.</li>
+</ol></div>
+
+<div class="task"><h3>Task 8: Browser client</h3>
+<p><strong>Files:</strong> create <code>crates/web-client/{Cargo.toml,src/lib.rs}</code>, <code>web/index.html</code>, <code>web/app.js</code>, <code>xtask/{Cargo.toml,src/main.rs}</code>, <code>.cargo/config.toml</code> (alias <code>xtask = "run -p xtask --"</code>).</p>
+<p><strong>Consumes:</strong> <code>ClientState&lt;TextDoc></code>, protocol messages. <strong>Produces</strong> (WebAssembly, via <code>wasm-bindgen</code>; <code>crate-type = ["cdylib", "rlib"]</code>):</p>
+<pre><code>#[wasm_bindgen] pub struct Client;
+impl Client {
+    #[wasm_bindgen(constructor)] pub fn new() -> Client;               // fresh ClientId
+    pub fn join_message(&amp;self) -> String;                               // ClientMsg::Join as JSON, with `since` once joined
+    /// The text box changed. Arguments are UTF-16 offsets as the browser reports them.
+    /// Returns a JSON ClientMsg::Submit to send now, or undefined.
+    pub fn local_replace(&amp;mut self, start_utf16: u32, removed_utf16: u32, inserted: &amp;str) -> Result&lt;Option&lt;String>, JsError>;
+    /// A frame arrived. Returns a JSON Update for the page.
+    pub fn receive(&amp;mut self, frame: &amp;str) -> Result&lt;String, JsError>;
+    pub fn resend_message(&amp;self) -> Option&lt;String>;
+    pub fn text(&amp;self) -> String;
+    pub fn pending(&amp;self) -> u32;
+}
+// Update: { text_changed: bool, text: String, edits: [{ start_utf16, removed_utf16, inserted_utf16 }],
+//           send: Option&lt;String>, people: Option&lt;[..]>, save: Option&lt;{state, revision}>, dropped: u32, refused: Option&lt;String> }
+// edits describe remote changes in UTF-16 units so the page can keep the caret in place.
+pub fn utf16_to_char(text: &amp;str, utf16: usize) -> Option&lt;usize>;       // None inside a surrogate pair or past the end
+pub fn char_to_utf16(text: &amp;str, chars: usize) -> Option&lt;usize>;</code></pre>
+<p>The page: a name field, a document identifier taken from the URL fragment (a new UUID is generated and written there if absent, so the address can be shared), a <code>&lt;textarea></code>, a people list, and a status line. On <code>input</code>, the script compares the previous and current values, takes the common prefix and suffix (not splitting a surrogate pair), and calls <code>local_replace</code>. On a remote update it sets the value and moves the selection using <code>edits</code>. Status wording follows <a href="../docs/editor-frame.html">the editor frame concept</a>: "Saved", "Saving…", "Saving failed, retrying", "Connection lost. N changes waiting", and after a reset "The server restarted. N changes could not be kept." The socket reconnects with a delay doubling from 0.5 s to 8 s. <code>cargo xtask web</code> builds the crate for <code>wasm32-unknown-unknown</code> in release mode and runs <code>wasm-bindgen --target web --out-dir web/pkg</code>; if <code>wasm-bindgen</code> is not installed it prints <code>cargo install wasm-bindgen-cli --version &lt;the wasm-bindgen version in Cargo.lock&gt;</code> and exits non-zero. <code>cargo xtask check</code> runs <code>cargo fmt --check</code>, <code>cargo clippy --workspace --all-targets -- -D warnings</code>, <code>cargo test --workspace</code>, and the three wasm builds.</p>
+<ol class="steps">
+<li>Write failing native tests in <code>crates/web-client/src/lib.rs</code> for the conversion helpers and a non-wasm inner type <code>ClientInner</code> that <code>Client</code> wraps:
+ <ul><li><code>utf16_offsets_convert_at_astral_chars</code>: in "a😀b", UTF-16 offset 3 is char 2; offset 2 is <code>None</code>; char 3 is UTF-16 offset 4.</li>
+ <li><code>local_replace_builds_submit</code>: after a <code>Joined</code> frame with snapshot "ab", <code>local_replace(1, 0, "X")</code> returns a <code>Submit</code> whose op turns "ab" into "aXb".</li>
+ <li><code>remote_edit_reports_utf16_ranges</code>: a remote insert of "😀" at char 1 yields <code>edits == [{start_utf16:1, removed_utf16:0, inserted_utf16:2}]</code>.</li>
+ <li><code>reset_reports_dropped_count</code>: one unconfirmed change, then a <code>Reset</code> frame, gives <code>dropped == 1</code> and the snapshot text.</li></ul></li>
+<li>Run <code>cargo test -p web-client</code>. Expected: compile failure.</li>
+<li>Implement <code>ClientInner</code>, the <code>wasm_bindgen</code> wrapper, <code>xtask</code>, <code>web/index.html</code> and <code>web/app.js</code>.</li>
+<li>Run <code>cargo test -p web-client</code> (pass). Install <code>wasm-bindgen-cli</code> at the matching version if absent, then run <code>cargo xtask web</code>. Expected: <code>web/pkg/web_client.js</code> and <code>web/pkg/web_client_bg.wasm</code> exist.</li>
+<li>Start <code>cargo run -p server</code> and open <code>http://127.0.0.1:8787/</code> in two browser tabs on the same fragment. Verify, and record the result of each in the commit body: both names listed; typing in each tab appears in the other; typing "😀" in one appears intact in the other; status reaches "Saved"; stop the server, type in one tab, and the status reads "Connection lost. N changes waiting"; restart the server and the tab reports that changes could not be kept, or resends them if the room still exists; reload both tabs and the saved text is shown.</li>
+<li>Run <code>cargo xtask check</code>. Expected: exits 0.</li>
+<li>Commit: <code>feat(web): plain-text co-editing page on the WebAssembly client</code>.</li>
+</ol></div>
+
+<div class="task"><h3>Task 9: Record the result</h3>
+<p><strong>Files:</strong> create <code>BUILDING.html</code>; modify <code>sequencing.html</code> (Stage 1 card) and <code>README.md</code> (one line linking to <code>BUILDING.html</code>).</p>
+<ol class="steps">
+<li>Write <code>BUILDING.html</code>: prerequisites (Rust stable, <code>wasm32-unknown-unknown</code> target, <code>wasm-bindgen-cli</code>), the commands <code>cargo xtask check</code>, <code>cargo xtask web</code>, <code>cargo run -p server</code>, the three environment variables with defaults, where data is stored, and the statement that this build has no sign-in and accepts local connections only.</li>
+<li>In <code>sequencing.html</code>, add to the Stage 1 card a dated line stating which parts of the Stage 1 exit are now met (two-session plain-text editing, convergence, reconnect, Git revision reopened) and which wait for plans 2 and 3 (removal on revocation, PostgreSQL records, the four editors). Do not mark Stage 1 complete.</li>
+<li>Run <code>cargo xtask check</code>. Expected: exits 0.</li>
+<li>Commit: <code>docs: build instructions and Stage 1 progress</code>.</li>
+</ol></div>
+
+<h2>Decisions made in this plan</h2>
+<p>These were not specified by the scope and were chosen here. Change them before execution if they are wrong.</p>
+<ul>
+<li>Changes are adjusted against each other by operation transform on a retain/insert/delete form, with one change in flight per client.</li>
+<li>Text positions are Unicode scalar values.</li>
+<li>One bare Git repository per library; content and metadata are stored under the document identifier, with a per-document reference used for the stale-write check.</li>
+<li>Checkpoints are written 2 seconds after typing stops, at least every 30 seconds while it continues, and when the last person leaves. Changes made after the last checkpoint are lost if the server stops.</li>
+<li>Git is accessed through <code>git2</code> (libgit2). Web framework is <code>axum</code>.</li>
+<li>The browser is tested by hand in Task 8; the automated two-session test drives the same Rust client code over real WebSockets without a browser. Automated browser testing is left to a later plan.</li>
+</ul>
+</main></body></html>
