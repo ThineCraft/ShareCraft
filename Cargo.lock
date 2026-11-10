@@ -2099,6 +2099,7 @@ dependencies = [
  "collab-core",
  "getrandom 0.4.3",
  "records",
+ "serde",
  "serde_json",
  "sha2 0.11.1",
  "sqlx",

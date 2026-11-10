@@ -4,6 +4,7 @@
 
 mod accounts;
 mod db;
+mod documents;
 mod events;
 #[cfg(feature = "test-support")]
 pub mod test_support;
@@ -12,4 +13,5 @@ pub use accounts::{
     AccountError, NewUser, SESSION_LIFETIME, Session, SessionToken, SignInError, User,
 };
 pub use db::{Db, DbError};
+pub use documents::{AccessError, Document, Grant, Role};
 pub use events::Event;

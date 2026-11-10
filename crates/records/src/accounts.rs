@@ -264,7 +264,7 @@ pub(crate) async fn warm_up() -> Result<(), DbError> {
     Ok(())
 }
 
-fn user_from_row(row: &PgRow) -> Result<User, sqlx::Error> {
+pub(crate) fn user_from_row(row: &PgRow) -> Result<User, sqlx::Error> {
     Ok(User {
         id: UserId(row.try_get("id")?),
         email: row.try_get("email")?,
