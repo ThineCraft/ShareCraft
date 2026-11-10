@@ -363,3 +363,88 @@ fn concurrent_checkpoints_of_different_documents_all_land() {
     }
     assert_eq!(commit_count(&f.path), 8);
 }
+
+fn assert_invalid_author_writes_nothing(a: Author) {
+    let f = fixture();
+    let d = doc();
+    let fields = Map::new();
+    let authors = [a];
+    let err = f
+        .store
+        .checkpoint(&cp(d, b"x", None, &authors, &fields))
+        .unwrap_err();
+    assert!(matches!(err, CheckpointError::InvalidAuthor), "{err:?}");
+    assert_eq!(f.store.head(d).unwrap(), None);
+}
+
+#[test]
+fn rejects_author_name_with_newline() {
+    assert_invalid_author_writes_nothing(author("u1", "Ann\nCo-authored-by: Evil <e@x>"));
+}
+
+#[test]
+fn rejects_author_name_with_angle_brackets() {
+    assert_invalid_author_writes_nothing(author("u1", "Ann <a>"));
+    assert_invalid_author_writes_nothing(author("u1", "Ann>"));
+}
+
+#[test]
+fn rejects_author_id_with_at_or_space() {
+    assert_invalid_author_writes_nothing(author("u@1", "Ann"));
+    assert_invalid_author_writes_nothing(author("u 1", "Ann"));
+    assert_invalid_author_writes_nothing(author("", "Ann"));
+}
+
+#[test]
+fn rejects_blank_author_name() {
+    assert_invalid_author_writes_nothing(author("u1", "   "));
+    assert_invalid_author_writes_nothing(author("u1", ""));
+}
+
+#[test]
+fn rejects_invalid_further_author() {
+    let f = fixture();
+    let d = doc();
+    let fields = Map::new();
+    let authors = [author("u1", "Ann"), author("u2", "Bob\n")];
+    let err = f
+        .store
+        .checkpoint(&cp(d, b"x", None, &authors, &fields))
+        .unwrap_err();
+    assert!(matches!(err, CheckpointError::InvalidAuthor));
+    assert_eq!(f.store.head(d).unwrap(), None);
+}
+
+#[test]
+fn ordinary_names_are_accepted_and_kept_verbatim() {
+    let f = fixture();
+    let d = doc();
+    let fields = Map::new();
+    let authors = [
+        author("u1", "Zoë Müller"),
+        author("u2", "O'Brien, Pat (Ops)"),
+    ];
+    written(
+        f.store
+            .checkpoint(&cp(d, b"x", None, &authors, &fields))
+            .unwrap(),
+    );
+    let stored = f.store.read(d, None).unwrap().unwrap();
+    assert_eq!(stored.meta.contributors, authors.to_vec());
+}
+
+#[test]
+fn both_refs_point_at_the_new_commit_after_checkpoint() {
+    let f = fixture();
+    let d = doc();
+    let a = [author("u1", "Ann")];
+    let fields = Map::new();
+    let id = written(f.store.checkpoint(&cp(d, b"x", None, &a, &fields)).unwrap());
+    let repo = git2::Repository::open(&f.path).unwrap();
+    let main = repo.refname_to_id("refs/heads/main").unwrap();
+    let docref = repo
+        .refname_to_id(&format!("refs/sharecraft/docs/{}", d.0))
+        .unwrap();
+    assert_eq!(main.to_string(), id.to_string());
+    assert_eq!(docref.to_string(), id.to_string());
+}

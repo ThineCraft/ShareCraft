@@ -38,6 +38,20 @@ fn valid_file_name(name: &str) -> bool {
             .any(|c| c == '/' || c == '\\' || c.is_control())
 }
 
+fn valid_author(a: &Author) -> bool {
+    let id_ok = !a.id.is_empty()
+        && !a
+            .id
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '<' | '>' | '@'));
+    let name_ok = !a.name.trim().is_empty()
+        && !a
+            .name
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '<' | '>'));
+    id_ok && name_ok
+}
+
 fn email(author: &Author) -> String {
     format!("{}@sharecraft.invalid", author.id)
 }
@@ -140,6 +154,9 @@ impl RevisionStore {
         let Some(first) = c.authors.first() else {
             return Err(CheckpointError::NoAuthors);
         };
+        if !c.authors.iter().all(valid_author) {
+            return Err(CheckpointError::InvalidAuthor);
+        }
         if !valid_file_name(c.file_name) {
             return Err(CheckpointError::InvalidFileName);
         }

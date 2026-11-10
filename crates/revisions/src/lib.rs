@@ -108,6 +108,9 @@ pub enum CheckpointError {
     /// `authors` was empty.
     #[error("a checkpoint needs at least one author")]
     NoAuthors,
+    /// An author's `id` or `name` is empty or contains forbidden characters.
+    #[error("invalid author")]
+    InvalidAuthor,
     /// `file_name` was empty or contained a separator or control character.
     #[error("invalid file name")]
     InvalidFileName,
