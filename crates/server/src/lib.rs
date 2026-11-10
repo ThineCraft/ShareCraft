@@ -26,8 +26,8 @@ use axum::http::header::{CONTENT_SECURITY_POLICY, REFERRER_POLICY, X_CONTENT_TYP
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::get;
-use collab_core::ids::{DocId, SessionId, UserId};
-use records::{Db, Role};
+use collab_core::ids::DocId;
+use records::Db;
 use revisions::RevisionStore;
 use tokio::net::TcpListener;
 use tower_http::services::ServeDir;
@@ -97,33 +97,6 @@ impl AppState {
 
     fn next_conn(&self) -> u64 {
         self.shared.next_conn.fetch_add(1, Ordering::Relaxed)
-    }
-
-    /// For tests only: runs the check a connection makes right after its join was accepted
-    /// (`recheck_after_join`) for a connection of `user`, signed in as `session`, that was let
-    /// into `doc` as `role`. This lets a test change the records between the check before the
-    /// upgrade and this one, which a real connection passes through too quickly to interrupt.
-    /// Returns `false` if `doc` has no open room or the records could not be read.
-    #[doc(hidden)]
-    pub async fn recheck_after_join_for_test(
-        &self,
-        doc: DocId,
-        user: UserId,
-        session: SessionId,
-        role: Role,
-    ) -> bool {
-        let Some(room) = self.rooms().link(doc) else {
-            return false;
-        };
-        let visitor = ws::Visitor {
-            user,
-            session,
-            expires_at: time::OffsetDateTime::now_utc(),
-            name: String::new(),
-            role,
-            doc_name: String::new(),
-        };
-        ws::recheck_after_join(self, doc, &room, &visitor).await
     }
 
     /// The command channel of `doc`'s room, opening it if needed; `name` is the document's

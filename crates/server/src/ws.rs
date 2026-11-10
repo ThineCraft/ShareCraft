@@ -11,7 +11,7 @@ use collab_core::ids::{ClientId, DocId, SessionId, UserId};
 use collab_text::TextOp;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
-use protocol::{ClientMsg, Resume};
+use protocol::{ClientMsg, RemovedReason, Resume, ServerMsg};
 use records::Role;
 use time::OffsetDateTime;
 use tokio::sync::{mpsc, oneshot};
@@ -123,16 +123,33 @@ type Stream = SplitStream<WebSocket>;
 async fn connection(state: AppState, doc: DocId, visitor: Visitor, socket: WebSocket) {
     let (mut sink, mut stream) = socket.split();
     let mut stalled = false;
+    // The queue of a connection removed right after its join: never read, so that nothing the
+    // room queued for it (its snapshot above all) reaches the client. Kept until the
+    // connection ends, so the room sees it open while it removes the member.
+    let mut _unread = None;
     if let Some((client, resume)) = first_join(&mut stream).await {
         let conn = state.next_conn();
         if let Some((room, out_rx)) = join_room(&state, doc, conn, client, &visitor, resume).await {
-            if recheck_after_join(&state, doc, &room, &visitor).await {
-                let ends = Ending {
-                    session: visitor.session,
-                    at: deadline(visitor.expires_at, OffsetDateTime::now_utc()),
-                };
-                let ended = relay(&mut sink, &mut stream, &room, out_rx, conn, client, ends).await;
-                stalled = ended == Ended::WriteTimedOut;
+            match recheck_after_join(&state, doc, &room, &visitor).await {
+                Recheck::Keep => {
+                    let ends = Ending {
+                        session: visitor.session,
+                        at: deadline(visitor.expires_at, OffsetDateTime::now_utc()),
+                    };
+                    let ended =
+                        relay(&mut sink, &mut stream, &room, out_rx, conn, client, ends).await;
+                    stalled = ended == Ended::WriteTimedOut;
+                }
+                Recheck::Removed(reason) => {
+                    _unread = Some(out_rx);
+                    let removed = ServerMsg::<TextOp>::Removed { reason };
+                    if let Ok(frame) = serde_json::to_string(&removed) {
+                        let written = write(&mut sink, Outbound::One(frame.into())).await;
+                        stalled = matches!(written, Err(WriteError::TimedOut));
+                    }
+                }
+                // Nothing queued is written; the page reconnects and is checked again.
+                Recheck::Unavailable => drop(out_rx),
             }
             // The room ignores this if it already dropped or replaced the connection.
             let _ = room.commands.send(Command::Leave { conn, client }).await;
@@ -224,14 +241,15 @@ async fn join_room(
 /// read and sent under the document's access lock, like the API's changes, so the room hears
 /// the readings in database order.
 ///
-/// Returns `false` when the records could not be read; the connection then leaves quietly,
-/// and the page reconnects and is checked again.
-pub(crate) async fn recheck_after_join(
+/// Says whether the connection stays, was removed (the room has been told), or could not be
+/// checked because the records could not be read; it then leaves quietly, and the page
+/// reconnects and is checked again.
+async fn recheck_after_join(
     state: &AppState,
     doc: DocId,
     room: &RoomLink,
     visitor: &Visitor,
-) -> bool {
+) -> Recheck {
     let _in_order = state.rooms().order_access(doc).await;
     let db = state.db();
     let cmd = match db.session_by_id(visitor.session).await {
@@ -242,7 +260,7 @@ pub(crate) async fn recheck_after_join(
             }),
             Err(e) => {
                 eprintln!("sharecraft-server: database failure: {e}");
-                return false;
+                return Recheck::Unavailable;
             }
         },
         Ok(Some(_)) => match db.role(visitor.user, doc).await {
@@ -253,19 +271,37 @@ pub(crate) async fn recheck_after_join(
             }),
             Err(e) => {
                 eprintln!("sharecraft-server: database failure: {e}");
-                return false;
+                return Recheck::Unavailable;
             }
         },
         Err(e) => {
             eprintln!("sharecraft-server: database failure: {e}");
-            return false;
+            return Recheck::Unavailable;
         }
     };
-    if let Some(cmd) = cmd {
-        // A room that has ended has dropped this connection already.
-        let _ = room.access.send(cmd);
-    }
-    true
+    let Some(cmd) = cmd else {
+        return Recheck::Keep;
+    };
+    let outcome = match cmd {
+        Command::RemoveUser { .. } => Recheck::Removed(RemovedReason::AccountDisabled),
+        Command::EndSession { .. } => Recheck::Removed(RemovedReason::SignedOut),
+        Command::SetAccess { role: None, .. } => Recheck::Removed(RemovedReason::AccessRevoked),
+        _ => Recheck::Keep,
+    };
+    // The room drops the member and records the removal. A room that has ended has dropped
+    // this connection already.
+    let _ = room.access.send(cmd);
+    outcome
+}
+
+/// What [`recheck_after_join`] decided about a connection.
+enum Recheck {
+    /// Access is unchanged, or changed but not ended: the connection carries on.
+    Keep,
+    /// Access has ended: the connection gets this one `Removed` frame and nothing else.
+    Removed(RemovedReason),
+    /// The records could not be read.
+    Unavailable,
 }
 
 /// When and how a connection's sign-in runs out.

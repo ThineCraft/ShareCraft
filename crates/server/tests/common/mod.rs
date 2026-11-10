@@ -418,25 +418,6 @@ pub async fn wait_stored_in(library: &Path, doc: DocId, text: &str) {
     }
 }
 
-/// Starts a server like [`spawn_server`], and returns its state too, for the test hooks on
-/// [`AppState`].
-pub async fn spawn_server_with_state() -> (TestServer, AppState) {
-    let data_dir = tempfile::tempdir().unwrap();
-    let db = TestDb::create().await;
-    let config = config_at(data_dir.path(), &db);
-    let store = RevisionStore::open(&server::library_path(data_dir.path())).unwrap();
-    let listener = tokio::net::TcpListener::bind(config.addr).await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let state = AppState::new(config, Arc::new(store), db.db.clone());
-    tokio::spawn(fail_loudly(server::serve_state(state.clone(), listener)));
-    let server = TestServer {
-        site: Site::new(addr, db.db.clone()),
-        data_dir,
-        db,
-    };
-    (server, state)
-}
-
 /// Starts a server whose rooms load and save through the checkpointer `make` builds from the
 /// library repository path.
 pub async fn spawn_server_with(make: impl FnOnce(&Path) -> Arc<dyn Checkpointer>) -> TestServer {

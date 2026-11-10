@@ -10,17 +10,23 @@
 
 mod common;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use collab_core::ids::{DocId, OpId, Seq, SessionId, UserId};
 use collab_text::TextOp;
 use common::{
-    Site, TestClient, TestServer, TestUser, handshake_status, new_doc, spawn_server,
-    spawn_server_config, spawn_server_with_state, wait_stored, ws_request,
+    SHORT_GRACE, Site, TestClient, TestServer, TestUser, handshake_status, new_doc, spawn_server,
+    spawn_server_config, spawn_server_with_grace, wait_out_grace, wait_stored, ws_request,
 };
 use protocol::{ClientMsg, RemovedReason, ServerMsg};
 use records::{Role, SessionToken};
 use reqwest::StatusCode;
+use revisions::{
+    Checkpoint, CheckpointError, GitError, Outcome, RevisionId, RevisionInfo, RevisionStore, Stored,
+};
+use server::Checkpointer;
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
@@ -512,87 +518,186 @@ async fn standing_proof() {
     assert_eq!(String::from_utf8(stored.bytes).unwrap(), text);
 }
 
-#[tokio::test]
-async fn access_ended_during_join_is_caught() {
-    let (server, state) = spawn_server_with_state().await;
-    let doc = new_doc();
-    let mut ann = TestClient::connect(&server, doc, "Ann").await;
-    let mut bob = TestClient::connect(&server, doc, "Bob").await;
-    let mut cat = TestClient::connect(&server, doc, "Cat").await;
-    let mut dan = TestClient::connect(&server, doc, "Dan").await;
-    let mut eve = TestClient::connect(&server, doc, "Eve").await;
-    let root = server.admin("Root").await;
-    ann.pump_until(|c| c.people().len() == 5).await;
-    let db = &server.db.db;
+/// What `doc` holds in the tests below; no frame sent to someone removed may contain it.
+const SECRET: &str = "the launch moves to Tuesday";
 
-    // Each change lands in the records while the person's join is on its way: the API's
-    // message to the room went out before they were in it, so the room was never told.
-    // Bob's grant is deleted; Cat signs out; Dan becomes a viewer; Eve's account is disabled.
-    db.set_access(ann.user.id, doc, bob.user.id, None)
-        .await
-        .unwrap();
-    let cat_session = session_of(&server, &cat.user).await;
-    db.end_session(cat_session).await.unwrap();
-    db.set_access(ann.user.id, doc, dan.user.id, Some(Role::Viewer))
-        .await
-        .unwrap();
-    let eve_session = session_of(&server, &eve.user).await;
-    db.set_disabled(root.id, eve.user.id, true).await.unwrap();
-    // The room still has them as they were.
-    ann.type_at(0, "x").await;
-    for c in [&mut bob, &mut cat, &mut dan, &mut eve] {
-        c.pump_until(|c| c.seq() == Seq(1)).await;
-        assert!(c.removed.is_none() && c.can_edit);
+/// Holds the next load of a document, once armed, until released, and reports when it starts.
+/// A join that opens a room waits in that room while its load is held: after the check before
+/// the upgrade, and before the room accepts it.
+struct HeldLoad {
+    inner: RevisionStore,
+    armed: AtomicBool,
+    released: Mutex<bool>,
+    open: Condvar,
+    started: tokio::sync::mpsc::UnboundedSender<()>,
+}
+
+impl HeldLoad {
+    fn release(&self) {
+        *self.released.lock().unwrap() = true;
+        self.open.notify_all();
+    }
+}
+
+impl Checkpointer for HeldLoad {
+    fn write(&self, c: &Checkpoint<'_>) -> Result<Outcome, CheckpointError> {
+        self.inner.write(c)
     }
 
-    // The check each connection makes once the room has accepted its join catches all four.
-    let bob_session = session_of(&server, &bob.user).await;
-    assert!(
-        state
-            .recheck_after_join_for_test(doc, bob.user.id, bob_session, Role::Editor)
-            .await
-    );
-    assert_eq!(
-        removed_promptly(&mut bob).await,
-        RemovedReason::AccessRevoked
-    );
+    fn load(&self, doc: DocId) -> Result<Option<Stored>, CheckpointError> {
+        if self.armed.swap(false, Ordering::SeqCst) {
+            let _ = self.started.send(());
+            let mut released = self.released.lock().unwrap();
+            while !*released {
+                released = self.open.wait(released).unwrap();
+            }
+        }
+        self.inner.load(doc)
+    }
 
-    assert!(
-        state
-            .recheck_after_join_for_test(doc, cat.user.id, cat_session, Role::Editor)
-            .await
-    );
-    assert_eq!(removed_promptly(&mut cat).await, RemovedReason::SignedOut);
+    fn describe(
+        &self,
+        doc: DocId,
+        revision: &RevisionId,
+    ) -> Result<Option<RevisionInfo>, CheckpointError> {
+        self.inner.describe(doc, revision)
+    }
 
-    let dan_session = session_of(&server, &dan.user).await;
-    assert!(
-        state
-            .recheck_after_join_for_test(doc, dan.user.id, dan_session, Role::Editor)
-            .await
-    );
-    tokio::time::timeout(PROMPTLY, dan.pump_until(|c| !c.can_edit))
+    fn history(&self, doc: DocId) -> Result<Vec<RevisionInfo>, CheckpointError> {
+        self.inner.history(doc)
+    }
+
+    fn documents(&self) -> Result<Vec<DocId>, GitError> {
+        self.inner.documents()
+    }
+}
+
+/// Opens the gate when dropped, so a failing test does not leave a load blocked.
+struct ReleaseOnDrop(Arc<HeldLoad>);
+
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+/// A server whose loads can be held, with a document Ann created holding [`SECRET`]. Its room
+/// has ended, and the load of the next room opened for it is held until released. Returns
+/// Ann's account too.
+async fn held_document() -> (
+    TestServer,
+    ReleaseOnDrop,
+    tokio::sync::mpsc::UnboundedReceiver<()>,
+    DocId,
+    TestUser,
+) {
+    let (started_tx, started) = tokio::sync::mpsc::unbounded_channel();
+    let slot: Arc<Mutex<Option<Arc<HeldLoad>>>> = Arc::default();
+    let keep = Arc::clone(&slot);
+    let server = spawn_server_with_grace(
+        move |path| {
+            let held = Arc::new(HeldLoad {
+                inner: RevisionStore::open(path).unwrap(),
+                armed: AtomicBool::new(false),
+                released: Mutex::new(false),
+                open: Condvar::new(),
+                started: started_tx,
+            });
+            *keep.lock().unwrap() = Some(Arc::clone(&held));
+            held
+        },
+        SHORT_GRACE,
+    )
+    .await;
+    let held = ReleaseOnDrop(slot.lock().unwrap().clone().unwrap());
+    let doc = new_doc();
+    let mut ann = TestClient::connect(&server, doc, "Ann").await;
+    ann.type_at(0, SECRET).await;
+    ann.pump_until(|c| c.pending() == 0 && c.seq() == Seq(1))
+        .await;
+    ann.close().await;
+    wait_stored(&server, doc, SECRET).await;
+    wait_out_grace().await;
+    held.0.armed.store(true, Ordering::SeqCst);
+    let owner = ann.user.clone();
+    (server, held, started, doc, owner)
+}
+
+/// Waits until the held load has started: the room is open and every join waits in it.
+async fn load_started(started: &mut tokio::sync::mpsc::UnboundedReceiver<()>) {
+    tokio::time::timeout(common::TIMEOUT, started.recv())
+        .await
+        .expect("no load started")
+        .unwrap();
+}
+
+/// Waits for `c` to be removed and closed, and checks that `Removed { reason }` is the only
+/// thing it was sent: nothing of the document reached it.
+async fn removed_before_seeing_anything(c: &mut TestClient, reason: RemovedReason) {
+    c.pump_until(|c| c.removed.is_some()).await;
+    assert_eq!(c.received, vec![ServerMsg::Removed { reason }]);
+    c.wait_closed().await;
+    assert_eq!(c.received, vec![ServerMsg::Removed { reason }]);
+}
+
+/// Bob's grant is removed through the API while his join waits in a room still loading: the
+/// API's message reaches the room before he is in it, so only the check made after his join
+/// was accepted can catch it. He must get `Removed` and nothing of the text.
+#[tokio::test]
+async fn revoked_while_joining_gets_no_text() {
+    let (server, held, mut started, doc, ann) = held_document().await;
+    let mut bob = TestClient::connect_with_resume(&server, doc, "Bob", None).await;
+    load_started(&mut started).await;
+
+    revoke(&server, &ann, doc, bob.user.id).await;
+    held.0.release();
+    removed_before_seeing_anything(&mut bob, RemovedReason::AccessRevoked).await;
+
+    let path = format!("/ws/docs/{}", doc.0);
+    let again = ws_request(server.addr, &path, Some(&bob.user.cookie));
+    assert_eq!(handshake_status(again).await, 404);
+}
+
+/// Changes land in the records while four joins wait in a room still loading, and no room is
+/// told of them: Bob's grant is deleted, Cat signs out, Dan becomes a viewer, Eve's account is
+/// disabled. The check each connection makes once the room has accepted its join catches all
+/// four.
+#[tokio::test]
+async fn access_ended_during_join_is_caught() {
+    let (server, held, mut started, doc, ann) = held_document().await;
+    let root = server.admin("Root").await;
+    let mut bob = TestClient::connect_with_resume(&server, doc, "Bob", None).await;
+    let mut cat = TestClient::connect_with_resume(&server, doc, "Cat", None).await;
+    let mut dan = TestClient::connect_with_resume(&server, doc, "Dan", None).await;
+    let mut eve = TestClient::connect_with_resume(&server, doc, "Eve", None).await;
+    load_started(&mut started).await;
+
+    let db = &server.db.db;
+    db.set_access(ann.id, doc, bob.user.id, None).await.unwrap();
+    let cat_session = session_of(&server, &cat.user).await;
+    db.end_session(cat_session).await.unwrap();
+    db.set_access(ann.id, doc, dan.user.id, Some(Role::Viewer))
+        .await
+        .unwrap();
+    db.set_disabled(root.id, eve.user.id, true).await.unwrap();
+    held.0.release();
+
+    removed_before_seeing_anything(&mut bob, RemovedReason::AccessRevoked).await;
+    removed_before_seeing_anything(&mut cat, RemovedReason::SignedOut).await;
+    removed_before_seeing_anything(&mut eve, RemovedReason::AccountDisabled).await;
+
+    // Dan stays, read-only, without reconnecting.
+    tokio::time::timeout(PROMPTLY, dan.pump_until(|c| c.joined && !c.can_edit))
         .await
         .expect("not told within one second");
-    assert!(dan.removed.is_none() && !dan.closed);
-
-    assert!(
-        state
-            .recheck_after_join_for_test(doc, eve.user.id, eve_session, Role::Editor)
-            .await
-    );
-    assert_eq!(
-        removed_promptly(&mut eve).await,
-        RemovedReason::AccountDisabled
-    );
-
-    wait_gone(&mut ann, bob.user.id).await;
-    wait_gone(&mut ann, cat.user.id).await;
-    wait_gone(&mut ann, eve.user.id).await;
+    assert_eq!(dan.text(), SECRET);
     let dan_id = dan.user.id;
-    ann.pump_until(|c| {
+    dan.pump_until(|c| {
         c.participants()
             .iter()
             .any(|p| p.user == dan_id && !p.can_edit)
     })
     .await;
+    assert!(dan.removed.is_none() && !dan.closed);
 }
+
