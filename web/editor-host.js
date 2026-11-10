@@ -154,7 +154,9 @@ export function nextStatus(state, event) {
  * behind it (a newer save replaces the waiting one). `upload(bytes)` resolves to `{ok: true}`
  * once the server stored them, or to `{ok: false, status}`; a rejection counts as a network
  * failure (status 0). Bytes are kept until the server stored them; a refused save stays kept
- * until `retry()` or a newer save. `onEvent` hears "saving", "stored" and "not_stored".
+ * until `retry()` or a newer save. A `409` means the file moved on: the queue stops for good,
+ * and later saves are kept (the newest replacing the older) but never uploaded. `onEvent`
+ * hears "saving", "stored" and "not_stored".
  */
 export class SaveQueue {
   #upload;
@@ -163,6 +165,7 @@ export class SaveQueue {
   #waiting = null;  // the newest bytes not yet sent
   #failed = null;   // { bytes, result } of the last refused upload
   #paused = false;
+  #stopped = false; // a conflict: nothing more is uploaded
   #dropped = false;
 
   constructor(upload, onEvent = () => {}) {
@@ -180,6 +183,11 @@ export class SaveQueue {
     return this.#failed?.result ?? null;
   }
 
+  /** Whether the queue stopped uploading for good (after a conflict, or `stop()`). */
+  get stopped() {
+    return this.#stopped;
+  }
+
   /** Whether an upload is under way. */
   get busy() {
     return this.#inFlight !== null;
@@ -195,7 +203,7 @@ export class SaveQueue {
 
   /** Uploads the refused bytes again. */
   retry() {
-    if (this.#dropped || !this.#failed) return;
+    if (this.#dropped || this.#stopped || !this.#failed) return;
     if (this.#waiting === null) this.#waiting = this.#failed.bytes;
     this.#failed = null;
     this.#next();
@@ -211,6 +219,11 @@ export class SaveQueue {
     this.#next();
   }
 
+  /** Uploads nothing more; saves offered from now on are only kept. */
+  stop() {
+    this.#stopped = true;
+  }
+
   /** Forgets every kept byte and takes nothing more. */
   drop() {
     this.#dropped = true;
@@ -220,7 +233,7 @@ export class SaveQueue {
   }
 
   #next() {
-    if (this.#dropped || this.#paused || this.#inFlight !== null || this.#waiting === null) return;
+    if (this.#dropped || this.#paused || this.#stopped || this.#inFlight !== null || this.#waiting === null) return;
     const bytes = this.#waiting;
     this.#waiting = null;
     this.#inFlight = bytes;
@@ -239,6 +252,7 @@ export class SaveQueue {
   #settled(bytes, result) {
     if (this.#dropped || this.#inFlight !== bytes) return;
     this.#inFlight = null;
+    if (result.status === 409) this.#stopped = true;
     if (result.ok) {
       this.#onEvent({ type: 'stored', result });
     } else if (this.#waiting === null) {
@@ -250,6 +264,41 @@ export class SaveQueue {
       this.#onEvent({ type: 'not_stored', result });
     }
     this.#next();
+  }
+}
+
+/**
+ * What the banner says about a refused upload (`result` as SaveQueue reports it), and whether
+ * the page stops saving. `canRetry`: the queue holds a refused save it could send again.
+ * Returns `{ stop, text, actions }`, actions among "retry", "mycopy" and "reload".
+ */
+export function saveFailure(result, canRetry) {
+  const notStored = 'so your last save was not stored.';
+  const retry = canRetry ? ['retry', 'mycopy'] : ['mycopy'];
+  switch (result?.status) {
+    case 409:
+      return {
+        stop: true,
+        text: `This file was changed somewhere else, ${notStored} Download your copy, then reload.`,
+        actions: ['mycopy', 'reload'],
+      };
+    case 403:
+      return { stop: false, text: `You cannot save this file now, ${notStored}`, actions: ['mycopy'] };
+    case 413:
+      return { stop: false, text: `This file is too large to store, ${notStored}`, actions: ['mycopy'] };
+    case 503:
+      return {
+        stop: false,
+        text:
+          result.error === 'busy'
+            ? `The server is still storing an earlier save, ${notStored}`
+            : `The server could not store the file, ${notStored}`,
+        actions: retry,
+      };
+    case 0:
+      return { stop: false, text: `Could not reach the server, ${notStored}`, actions: retry };
+    default:
+      return { stop: false, text: `Something went wrong, ${notStored}`, actions: retry };
   }
 }
 
@@ -281,7 +330,8 @@ function craftWebHost(frame, bridge, handlers) {
   const win = frame.ownerDocument.defaultView;
   const origin = win.location.origin;
   const listener = (event) => {
-    if (event.source !== frame.contentWindow || event.origin !== origin) return;
+    const source = frame.contentWindow;
+    if (source === null || event.source !== source || event.origin !== origin) return;
     const message = parseHostMessage(bridge.prefix, event.data);
     if (message) handlers[message.kind]?.(message);
   };

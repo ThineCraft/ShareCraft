@@ -11,6 +11,7 @@ import {
   connect as connectEditor,
   editorUrl,
   nextStatus,
+  saveFailure,
 } from './editor-host.js';
 import {
   MISSING_DOCUMENT,
@@ -27,6 +28,7 @@ import {
 const FIRST_DELAY = 500;
 const MAX_DELAY = 8000;
 const READY_TIMEOUT = 60_000;
+const COPY_TIMEOUT = 10_000; // how long a requested copy waits for the editor's save
 const VIEW_ONLY = 'View only. Changes you make here are not saved.';
 const SEAT_GONE =
   'Someone else is editing this file now, so changes you make here are not saved. Download your copy, then reload.';
@@ -78,13 +80,16 @@ let readyTimer = 0;
 let initialBytes = null;    // the stored bytes, until the editor has them
 let mine = null;            // the editor's last save that this page will not upload
 let downloadNext = false;   // the editor's next save goes to the person as their copy
+let downloadNextTimer = 0;
+const objectUrls = new Set(); // blob: URLs of downloads not yet revoked
 let notice = null;          // a banner that stays until what it is about is over
 let bannerKey = '';
 const queue = new SaveQueue(upload, onQueue);
 
 addEventListener('beforeunload', (event) => {
   if (removed) return;
-  if (editorDirty || queue.kept || (savingStopped && mine)) {
+  // Unsaved changes in the editor, or a copy the server has not stored.
+  if (editorDirty || queue.kept || mine) {
     event.preventDefault();
     event.returnValue = '';
   }
@@ -200,6 +205,9 @@ function stopRemoved(reason) {
   mine = null;
   initialBytes = null;
   downloadNext = false;
+  clearTimeout(downloadNextTimer);
+  for (const url of objectUrls) URL.revokeObjectURL(url);
+  objectUrls.clear();
   editorDirty = false;
   seatToken = null;
   seat = null;
@@ -391,7 +399,7 @@ function stopSaving(text) {
   savingStopped = text;
   holder = false;
   seatToken = null;
-  queue.pause();
+  queue.stop();
   updateStatus({ type: 'not_stored' });
   setNotice({ kind: 'stopped', text, actions: ['mycopy', 'reload'] });
 }
@@ -479,16 +487,25 @@ function editorFailed(text) {
 
 function onEditorSave({ name, bytes }) {
   if (removed) return;
-  // The editor counts its document saved once it hands the bytes over.
-  editorDirty = false;
   if (downloadNext) {
     downloadNext = false;
+    clearTimeout(downloadNextTimer);
+    editorDirty = false;
     mine = bytes;
     downloadBytes(bytes, doc.name);
     return;
   }
   if (classifySave(EDITORS[doc.editor]?.extension, name) === 'export') {
+    // An export leaves the document as it was: its own `dirty` messages still count.
     downloadBytes(bytes, name || 'export');
+    return;
+  }
+  // The editor counts its document saved once it hands the bytes over.
+  editorDirty = false;
+  if (savingStopped) {
+    // The stopped queue keeps it as the newest copy and uploads nothing.
+    queue.offer(bytes);
+    repeatBanner();
     return;
   }
   if (!canSave()) {
@@ -528,7 +545,10 @@ async function upload(bytes) {
     }
     return { ok: true };
   }
-  return { ok: false, status: response.ok ? 0 : response.status, error };
+  // The seat was given to this page again (a rejoin) while the upload was under way: the old
+  // token was refused, the new one may not be.
+  const staleSeat = response.status === 403 && seatToken !== null && seatToken !== token;
+  return { ok: false, status: response.ok ? 0 : response.status, error, staleSeat };
 }
 
 function onQueue(event) {
@@ -540,44 +560,24 @@ function onQueue(event) {
     if (!savingStopped) updateStatus({ type: 'stored' });
     if (notice?.kind === 'save') setNotice(null);
   } else if (event.type === 'not_stored') {
-    if (!savingStopped) {
-      updateStatus({ type: 'not_stored' });
-      setNotice(saveFailure(event.result));
+    if (event.result.staleSeat && canSave()) {
+      // Sent again with the new token: the refused save, or the newer one already waiting.
+      if (queue.failure) queue.retry();
+    } else if (!savingStopped) {
+      const failure = saveFailure(event.result, queue.failure !== null);
+      if (failure.stop) {
+        // The file moved on: this page load does not save again.
+        stopSaving(failure.text);
+      } else {
+        updateStatus({ type: 'not_stored' });
+        setNotice({ kind: 'save', text: failure.text, actions: failure.actions });
+      }
     }
   }
   // Revisions announced during the upload can be judged now.
   const later = laterRevisions;
   laterRevisions = [];
   for (const [revision, newer] of later) judgeRevision(revision, newer);
-}
-
-function saveFailure(result) {
-  const notStored = 'so your last save was not stored.';
-  switch (result.status) {
-    case 409:
-      return {
-        kind: 'save',
-        text: `This file was changed somewhere else, ${notStored}`,
-        actions: ['retry', 'mycopy'],
-      };
-    case 403:
-      return { kind: 'save', text: `You cannot save this file now, ${notStored}`, actions: ['mycopy'] };
-    case 413:
-      return { kind: 'save', text: `This file is too large to store, ${notStored}`, actions: ['mycopy'] };
-    case 503:
-      return {
-        kind: 'save',
-        text:
-          result.error === 'busy'
-            ? `The server is still storing an earlier save, ${notStored}`
-            : `The server could not store the file, ${notStored}`,
-        actions: ['retry', 'mycopy'],
-      };
-    case 0:
-      return { kind: 'save', text: `Could not reach the server, ${notStored}`, actions: ['retry', 'mycopy'] };
-    default:
-      return { kind: 'save', text: `Something went wrong, ${notStored}`, actions: ['retry', 'mycopy'] };
-  }
 }
 
 // The bytes the editor saved and the server does not have, downloaded under the document's
@@ -589,6 +589,9 @@ function downloadMyCopy() {
     return;
   }
   downloadNext = Boolean(bridge?.requestSave());
+  clearTimeout(downloadNextTimer);
+  // An editor that posts no save does not leave a later real save diverted to a download.
+  if (downloadNext) downloadNextTimer = setTimeout(() => (downloadNext = false), COPY_TIMEOUT);
 }
 
 function downloadBytes(bytes, name) {
@@ -597,7 +600,11 @@ function downloadBytes(bytes, name) {
   document.body.append(link);
   link.click();
   link.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 60_000);
+  objectUrls.add(url);
+  setTimeout(() => {
+    URL.revokeObjectURL(url);
+    objectUrls.delete(url);
+  }, 60_000);
 }
 
 // ---- status and banner ----

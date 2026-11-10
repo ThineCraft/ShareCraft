@@ -7,6 +7,7 @@ import {
   editorUrl,
   nextStatus,
   parseHostMessage,
+  saveFailure,
   withExtension,
 } from './editor-host.js';
 
@@ -150,10 +151,11 @@ test('refused_save_keeps_the_bytes', async () => {
   assert.equal(calls[0].bytes, first);
   assert.equal(queue.kept, first);
 
-  calls[0].answer({ ok: false, status: 409 });
+  // (A 409 stops saving instead: see a_conflict_stops_saving.)
+  calls[0].answer({ ok: false, status: 503 });
   await settle();
   assert.equal(queue.kept, first, 'a refused save keeps its bytes');
-  assert.equal(queue.failure.status, 409);
+  assert.equal(queue.failure.status, 503);
   assert.equal(calls.length, 1, 'nothing is uploaded again by itself');
 
   queue.retry();
@@ -210,4 +212,63 @@ test('a_paused_queue_waits_and_a_dropped_one_forgets', async () => {
   await settle();
   assert.equal(failing.kept, b);
   assert.equal(failing.failure.status, 0);
+});
+
+test('the_in_flight_save_fails_while_a_newer_one_waits', async () => {
+  const { calls, upload } = standIn();
+  const events = [];
+  const queue = new SaveQueue(upload, (event) => events.push(event.type));
+  const [a, b] = [new Uint8Array([1]), new Uint8Array([2])];
+  queue.offer(a);
+  queue.offer(b);
+  calls[0].answer({ ok: false, status: 503 });
+  await settle();
+  assert.equal(calls.length, 2, 'the newer save is sent');
+  assert.equal(calls[1].bytes, b);
+  assert.equal(queue.kept, b, 'the newer bytes are the ones kept');
+  assert.equal(queue.failure, null, 'nothing is left to retry: the newer save carries it all');
+  calls[1].answer({ ok: true });
+  await settle();
+  assert.equal(queue.kept, null);
+  assert.deepEqual(events, ['saving', 'not_stored', 'saving', 'stored']);
+});
+
+test('a_conflict_stops_saving', async () => {
+  const { calls, upload } = standIn();
+  const queue = new SaveQueue(upload);
+  const [a, b] = [new Uint8Array([1]), new Uint8Array([2])];
+  queue.offer(a);
+  calls[0].answer({ ok: false, status: 409, current: 'elsewhere' });
+  await settle();
+  assert.equal(queue.stopped, true);
+  assert.equal(queue.kept, a);
+  queue.retry();
+  queue.resume();
+  assert.equal(calls.length, 1, 'nothing is uploaded after a conflict');
+  queue.offer(b);
+  assert.equal(calls.length, 1, 'a later save is kept, not uploaded');
+  assert.equal(queue.kept, b, 'the newest copy is the one kept');
+});
+
+test('failures_say_what_happened_and_what_can_be_done', () => {
+  const conflict = saveFailure({ status: 409 }, true);
+  assert.equal(conflict.stop, true);
+  assert.deepEqual(conflict.actions, ['mycopy', 'reload']);
+  assert.match(conflict.text, /changed somewhere else/);
+  for (const status of [403, 413]) {
+    const failure = saveFailure({ status }, true);
+    assert.equal(failure.stop, false);
+    assert.deepEqual(failure.actions, ['mycopy'], String(status));
+  }
+  for (const result of [{ status: 503 }, { status: 503, error: 'busy' }, { status: 0 }, { status: 500 }]) {
+    const failure = saveFailure(result, true);
+    assert.equal(failure.stop, false);
+    assert.deepEqual(failure.actions, ['retry', 'mycopy'], JSON.stringify(result));
+    // Without anything the queue can retry, Try again is not offered.
+    assert.deepEqual(saveFailure(result, false).actions, ['mycopy'], JSON.stringify(result));
+  }
+  assert.notEqual(saveFailure({ status: 503, error: 'busy' }, true).text, saveFailure({ status: 503 }, true).text);
+  for (const failure of [409, 403, 413, 503, 0].map((status) => saveFailure({ status }, true))) {
+    assert.match(failure.text, /not stored/);
+  }
 });
