@@ -19,7 +19,7 @@ use collab_core::ids::{ClientId, DocId, OpId, Seq, SessionId, UserId};
 use collab_core::server_log::ServerLog;
 use collab_text::{TextDoc, TextOp};
 use protocol::{Participant, RemovedReason, Resume, RoomEpoch, SaveState, ServerMsg};
-use records::{Db, Role};
+use records::{Db, NewEvent, Role};
 use revisions::{Author, CheckpointError, Outcome, RevisionId};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -27,6 +27,7 @@ use tokio::time::Instant;
 use uuid::Uuid;
 
 use crate::checkpoint::{Checkpointer, Finished, SaveJob, Schedule, Timing, WriteError};
+use crate::events::{EventSink, error_text};
 use crate::projection::Recorder;
 
 /// Identifies one WebSocket connection, so a replaced connection's late messages are ignored.
@@ -162,6 +163,12 @@ pub(crate) struct Room {
     /// for the room's lifetime, also after they leave, so nobody else can take over a
     /// connection's place, its resume position or its record of committed changes.
     client_owners: HashMap<ClientId, UserId>,
+    /// Where the room reports who joined, left and was removed, and how saving went.
+    events: EventSink,
+    /// The people credited in the running checkpoint.
+    saving_authors: Vec<String>,
+    /// A failed checkpoint was reported and none has succeeded since.
+    failure_reported: bool,
 }
 
 impl Room {
@@ -177,7 +184,44 @@ impl Room {
             members: Vec::new(),
             last_committed: HashMap::new(),
             client_owners: HashMap::new(),
+            events: EventSink::discard(),
+            saving_authors: Vec::new(),
+            failure_reported: false,
         }
+    }
+
+    /// The room reports its events to `events`.
+    pub(crate) fn with_events(mut self, events: EventSink) -> Self {
+        self.events = events;
+        self
+    }
+
+    /// An event of this room's document about `subject`, done by `actor`.
+    fn emit(
+        &self,
+        kind: &'static str,
+        actor: Option<UserId>,
+        subject: UserId,
+        detail: serde_json::Value,
+    ) {
+        self.events.emit(NewEvent {
+            kind,
+            actor,
+            subject: Some(subject),
+            document: Some(self.doc),
+            detail,
+        });
+    }
+
+    /// An event of this room's document about saving, with no person involved.
+    fn emit_save(&self, kind: &'static str, detail: serde_json::Value) {
+        self.events.emit(NewEvent {
+            kind,
+            actor: None,
+            subject: None,
+            document: Some(self.doc),
+            detail,
+        });
     }
 
     /// When the next checkpoint should start, if one is needed and none is running.
@@ -191,6 +235,7 @@ impl Room {
         let job = self
             .schedule
             .start(head, self.log.doc().as_str().to_owned())?;
+        self.saving_authors = job.author_ids();
         self.broadcast_save(SaveState::Saving, None, head);
         Some(job)
     }
@@ -198,11 +243,20 @@ impl Room {
     /// Records how the running checkpoint ended and tells everyone.
     fn finish_checkpoint(&mut self, result: Result<Outcome, WriteError>) {
         let head = self.log.head();
+        let wrote_commit = matches!(result, Ok(Outcome::Written(_)));
         let finished = self.schedule.finish(result, head, self.members.is_empty());
         match finished {
             Some(Finished::Saved { revision, through }) => {
                 self.log
                     .truncate_through(Seq(through.0.saturating_sub(KEPT_ENTRIES)));
+                self.failure_reported = false;
+                let authors = std::mem::take(&mut self.saving_authors);
+                if wrote_commit {
+                    self.emit_save(
+                        "revision.saved",
+                        serde_json::json!({ "revision": revision.to_string(), "authors": authors }),
+                    );
+                }
                 self.broadcast_save(SaveState::Saved, Some(revision.to_string()), through);
             }
             Some(Finished::Failed {
@@ -221,9 +275,20 @@ impl Room {
                         self.doc.0
                     );
                 }
+                if !self.failure_reported {
+                    self.failure_reported = true;
+                    self.emit_save(
+                        "revision.save_failed",
+                        serde_json::json!({ "error": error_text(&error) }),
+                    );
+                }
                 self.broadcast_save(SaveState::Failed, None, through);
             }
-            Some(Finished::Conflict { through }) => {
+            Some(Finished::Conflict { through, current }) => {
+                self.emit_save(
+                    "revision.conflict",
+                    serde_json::json!({ "current": current.map(|r| r.to_string()) }),
+                );
                 eprintln!(
                     "sharecraft-server: document {} was saved from elsewhere; its room stops \
                      saving, and changes after its last saved revision are lost",
@@ -324,11 +389,18 @@ impl Room {
             tx,
         };
         self.schedule.joined();
+        let user = member.user;
         // Replacing the member drops the older connection's queue, which closes it.
-        match self.members.iter_mut().find(|m| m.client == client) {
-            Some(existing) => *existing = member,
-            None => self.members.push(member),
-        }
+        let replaced = match self.members.iter_mut().find(|m| m.client == client) {
+            Some(existing) => {
+                *existing = member;
+                true
+            }
+            None => {
+                self.members.push(member);
+                false
+            }
+        };
 
         let epoch = self.epoch;
         let seq = self.log.head();
@@ -340,6 +412,16 @@ impl Room {
         let missed = resume
             .filter(|r| r.epoch == epoch)
             .and_then(|r| self.log.since(r.seq));
+        // Replacing one's own older connection, or resuming where one left off, is not a new
+        // arrival.
+        if !replaced && missed.is_none() {
+            self.emit(
+                "editing.joined",
+                Some(user),
+                user,
+                serde_json::json!({ "can_edit": can_edit }),
+            );
+        }
         match (resume, missed) {
             (None, _) => msgs.push(ServerMsg::Joined {
                 epoch,
@@ -450,10 +532,15 @@ impl Room {
     }
 
     fn leave(&mut self, conn: ConnId, client: ClientId) {
-        let before = self.members.len();
+        let left = self
+            .members
+            .iter()
+            .find(|m| m.conn == conn && m.client == client)
+            .map(|m| m.user);
         self.members
             .retain(|m| !(m.conn == conn && m.client == client));
-        if self.members.len() != before {
+        if let Some(user) = left {
+            self.emit("editing.left", Some(user), user, serde_json::json!({}));
             self.broadcast_people();
         }
     }
@@ -493,11 +580,20 @@ impl Room {
             return;
         };
         let doc = self.doc;
+        let events = &self.events;
+        let detail = serde_json::json!({ "reason": reason });
         let before = self.members.len();
         self.members.retain(|m| {
             if !which(m) {
                 return true;
             }
+            events.emit(NewEvent {
+                kind: "editing.removed",
+                actor: None,
+                subject: Some(m.user),
+                document: Some(doc),
+                detail: detail.clone(),
+            });
             // A closed queue means the connection is already gone. A full one cannot take the
             // frame; the connection still ends, but the page is not told why.
             if let Err(mpsc::error::TrySendError::Full(_)) =
@@ -553,11 +649,22 @@ impl Room {
     /// or closed is removed (it reconnects and catches up), and the others are told.
     fn send(&mut self, to: Option<ClientId>, out: &Outbound) {
         let mut dropped = false;
+        let events = &self.events;
+        let doc = self.doc;
         self.members.retain(|m| {
             if to.is_some_and(|c| c != m.client) {
                 return true;
             }
             let delivered = m.tx.try_send(out.clone()).is_ok();
+            if !delivered {
+                events.emit(NewEvent {
+                    kind: "editing.left",
+                    actor: Some(m.user),
+                    subject: Some(m.user),
+                    document: Some(doc),
+                    detail: serde_json::json!({}),
+                });
+            }
             dropped |= !delivered;
             delivered
         });
@@ -619,7 +726,8 @@ impl Rooms {
     /// The command channel of `doc`'s room, starting the room if it is not open. A new room
     /// stores its checkpoints under `name`, the document's name, and loads its document from
     /// `store` before handling commands; commands wait in its channel meanwhile. Each revision
-    /// it writes is recorded in `db`, if given. Once empty, the room stays open for `grace`.
+    /// it writes is recorded in `storage.db`, if given, and the room reports what happens in it
+    /// to `storage.events`. Once empty, the room stays open for `grace`.
     ///
     /// The channel can be closed by the time it is used, if the room ended meanwhile; the
     /// caller then asks again.
@@ -627,8 +735,7 @@ impl Rooms {
         self: &Arc<Self>,
         doc: DocId,
         name: String,
-        store: &Arc<dyn Checkpointer>,
-        db: Option<Db>,
+        storage: Storage,
         timing: Timing,
         grace: Duration,
     ) -> RoomLink {
@@ -647,10 +754,6 @@ impl Rooms {
             generation,
         };
         let channels = Channels { rx, access_rx };
-        let storage = Storage {
-            store: Arc::clone(store),
-            db,
-        };
         tokio::spawn(run(place, name, channels, storage, timing, grace));
         let link = RoomLink { commands, access };
         open.insert(
@@ -724,10 +827,12 @@ struct Place {
     generation: u64,
 }
 
-/// Where a room's document is stored, and where its revisions are recorded, if anywhere.
-struct Storage {
-    store: Arc<dyn Checkpointer>,
-    db: Option<Db>,
+/// Where a room's document is stored, where its revisions are recorded, if anywhere, and where
+/// it reports what happens in it.
+pub(crate) struct Storage {
+    pub store: Arc<dyn Checkpointer>,
+    pub db: Option<Db>,
+    pub events: EventSink,
 }
 
 type Running = JoinHandle<Result<Outcome, CheckpointError>>;
@@ -747,7 +852,7 @@ async fn run(
         mut rx,
         mut access_rx,
     } = channels;
-    let Storage { store, db } = storage;
+    let Storage { store, db, events } = storage;
     let initial = match load(&store, doc).await {
         Ok(initial) => initial,
         Err(err) => {
@@ -766,10 +871,10 @@ async fn run(
         }
     };
 
-    let mut room = Room::new(doc, name, initial, timing);
+    let mut room = Room::new(doc, name, initial, timing).with_events(events.clone());
     // Revisions are recorded off this task, in the order they are written: the blocking task
     // that writes one queues it before the room learns of it, and one checkpoint runs at a time.
-    let recorder = db.map(|db| Recorder::start(doc, Arc::clone(&store), db));
+    let recorder = db.map(|db| Recorder::start(doc, Arc::clone(&store), db, events));
     let mut running: Option<Running> = None;
     // The room opens for a join waiting in its channel; until that is handled it is empty.
     let mut empty_since = Some(Instant::now());
@@ -1180,7 +1285,7 @@ mod tests {
         submit(&mut room, a, OpId(Uuid::from_u128(2)), Seq(0), "abc");
         room.start_checkpoint().unwrap();
         frames(&mut rx);
-        room.finish_checkpoint(Err(WriteError::Stale));
+        room.finish_checkpoint(Err(WriteError::Stale { current: None }));
         let got = frames(&mut rx);
         assert!(
             matches!(
@@ -1327,8 +1432,11 @@ mod tests {
         let link = rooms.open(
             doc,
             "Notes.txt".into(),
-            &store,
-            None,
+            Storage {
+                store: Arc::clone(&store),
+                db: None,
+                events: EventSink::discard(),
+            },
             timing,
             Duration::from_secs(60),
         );

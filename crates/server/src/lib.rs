@@ -11,6 +11,7 @@ mod auth;
 mod checkpoint;
 pub mod cli;
 pub mod config;
+mod events;
 mod projection;
 mod room;
 mod ws;
@@ -32,7 +33,8 @@ pub use projection::{Report, rebuild, reconcile};
 
 use auth::Throttle;
 use checkpoint::Timing;
-use room::{RoomLink, Rooms};
+use events::EventSink;
+use room::{RoomLink, Rooms, Storage};
 
 /// Shared state of a running server.
 #[derive(Clone)]
@@ -45,6 +47,7 @@ struct Shared {
     rooms: Arc<Rooms>,
     checkpointer: Arc<dyn Checkpointer>,
     db: Db,
+    events: EventSink,
     throttle: Throttle,
     next_conn: AtomicU64,
 }
@@ -59,6 +62,7 @@ impl AppState {
                 config,
                 rooms: Arc::new(Rooms::default()),
                 checkpointer,
+                events: EventSink::start(db.clone()),
                 db,
                 throttle: Throttle::default(),
                 next_conn: AtomicU64::new(1),
@@ -128,8 +132,11 @@ impl AppState {
         self.shared.rooms.open(
             doc,
             name,
-            &self.shared.checkpointer,
-            Some(self.shared.db.clone()),
+            Storage {
+                store: Arc::clone(&self.shared.checkpointer),
+                db: Some(self.shared.db.clone()),
+                events: self.shared.events.clone(),
+            },
             timing,
             config.room_grace,
         )

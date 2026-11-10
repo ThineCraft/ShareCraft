@@ -6,13 +6,14 @@ use std::fmt;
 use std::sync::Arc;
 
 use collab_core::ids::DocId;
-use records::{Db, RevisionRecord};
+use records::{Db, NewEvent, RevisionRecord};
 use revisions::{GitError, RevisionId, RevisionInfo};
 use serde_json::Value;
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
 
 use crate::checkpoint::Checkpointer;
+use crate::events::{EventSink, error_text};
 
 /// How many times a document's list is replaced from Git in a row when Git moves on while it
 /// is being replaced.
@@ -73,7 +74,13 @@ async fn sync(store: &Arc<dyn Checkpointer>, db: &Db, all: bool) -> Result<Repor
         match sync_one(store, db, doc, all).await {
             Ok(true) => report.updated = report.updated.saturating_add(1),
             Ok(false) => {}
-            Err(error) => report.failed.push((doc, error)),
+            Err(error) => {
+                let event = index_failed(doc, &error);
+                if let Err(e) = db.append_event(&event).await {
+                    eprintln!("sharecraft-server: could not record an index failure: {e}");
+                }
+                report.failed.push((doc, error));
+            }
         }
     }
     Ok(report)
@@ -103,6 +110,18 @@ async fn sync_one(
     Ok(true)
 }
 
+/// The event for a failure to bring `doc`'s index up to date. `error` is about ids, paths, Git
+/// and SQL, never document text.
+fn index_failed(doc: DocId, error: &str) -> NewEvent {
+    NewEvent {
+        kind: "revision.index_failed",
+        actor: None,
+        subject: None,
+        document: Some(doc),
+        detail: serde_json::json!({ "error": error_text(error) }),
+    }
+}
+
 /// Records revisions of one document as its room writes them, in the order written, on a task
 /// of its own. Cloning shares that task; it ends once every clone is dropped and what was sent
 /// is recorded.
@@ -118,8 +137,14 @@ struct Written {
 }
 
 impl Recorder {
-    /// Starts the task that records `doc`'s revisions, read from `store`, in `db`.
-    pub(crate) fn start(doc: DocId, store: Arc<dyn Checkpointer>, db: Db) -> Recorder {
+    /// Starts the task that records `doc`'s revisions, read from `store`, in `db`. A revision
+    /// that cannot be recorded is reported to `events`.
+    pub(crate) fn start(
+        doc: DocId,
+        store: Arc<dyn Checkpointer>,
+        db: Db,
+        events: EventSink,
+    ) -> Recorder {
         let (written, mut queue) = mpsc::unbounded_channel::<Written>();
         tokio::spawn(async move {
             while let Some(w) = queue.recv().await {
@@ -130,6 +155,7 @@ impl Recorder {
                          be recorded in the database: {error}",
                         w.revision, doc.0
                     );
+                    events.emit(index_failed(doc, &error));
                 }
             }
         });

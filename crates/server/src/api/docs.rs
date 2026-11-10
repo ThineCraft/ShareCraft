@@ -210,3 +210,53 @@ pub(crate) async fn unshare(
     after_access_change(&state, doc, user).await;
     Ok(StatusCode::NO_CONTENT)
 }
+
+/// Most events  returns.
+const MAX_EVENTS: i64 = 200;
+
+/// One row of .
+#[derive(Serialize)]
+pub(crate) struct EventRow {
+    id: i64,
+    at: Option<String>,
+    kind: String,
+    actor: Option<String>,
+    subject: Option<String>,
+    detail: Value,
+}
+
+/// `GET /api/docs/{id}/events`: the latest events of the document, oldest first. Owners only.
+pub(crate) async fn events(
+    State(state): State<AppState>,
+    signed: Signed,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<EventRow>>, ApiError> {
+    let doc = DocId(parse_id(&id)?);
+    let db = state.db();
+    let held = db
+        .role(signed.session.user.id, doc)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?;
+    match held {
+        None => return Err(ApiError::NotFound),
+        Some(held) if !held.can_manage() => return Err(ApiError::Forbidden),
+        Some(_) => {}
+    }
+    let events = db
+        .recent_events_for(doc, MAX_EVENTS)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?;
+    Ok(Json(
+        events
+            .into_iter()
+            .map(|event| EventRow {
+                id: event.id,
+                at: rfc3339(Some(event.at)),
+                kind: event.kind,
+                actor: event.actor.map(|u| u.0.to_string()),
+                subject: event.subject.map(|u| u.0.to_string()),
+                detail: event.detail,
+            })
+            .collect(),
+    ))
+}

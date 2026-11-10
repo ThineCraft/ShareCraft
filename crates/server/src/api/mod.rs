@@ -36,6 +36,7 @@ pub(crate) fn router() -> Router<AppState> {
         .route("/docs", get(docs::list).post(docs::create))
         .route("/docs/{id}", get(docs::open))
         .route("/docs/{id}/access", get(docs::access).put(docs::share))
+        .route("/docs/{id}/events", get(docs::events))
         .route("/docs/{id}/access/{user_id}", delete(docs::unshare))
         .route("/admin/users", get(admin::users).post(admin::create))
         .route("/admin/users/{id}/disable", post(admin::disable))

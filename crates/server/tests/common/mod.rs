@@ -826,3 +826,25 @@ impl TestClient {
 pub fn new_doc() -> DocId {
     DocId(Uuid::new_v4())
 }
+
+/// Polls `db` for `doc`'s events until `done` holds for them or [`TIMEOUT`] passes (the writer
+/// that records them is asynchronous), and returns them.
+pub async fn wait_events(
+    db: &Db,
+    doc: DocId,
+    done: impl Fn(&[records::Event]) -> bool,
+) -> Vec<records::Event> {
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    loop {
+        let events = db.events_for(doc).await.unwrap();
+        if done(&events) {
+            return events;
+        }
+        let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the expected events were not recorded; recorded: {kinds:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}

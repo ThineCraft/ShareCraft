@@ -574,6 +574,7 @@ async fn unsigned_caller_gets_401_from_every_route() {
         (Method::POST, "/api/docs".into(), Some(json!({}))),
         (Method::GET, format!("/api/docs/{id}"), None),
         (Method::GET, docs_access.clone(), None),
+        (Method::GET, format!("/api/docs/{id}/events"), None),
         (
             Method::PUT,
             docs_access,

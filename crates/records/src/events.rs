@@ -24,19 +24,25 @@ pub struct Event {
 }
 
 /// An event to write.
-pub(crate) struct NewEvent<'a> {
-    pub kind: &'a str,
+#[derive(Clone, Debug, PartialEq)]
+pub struct NewEvent {
+    /// What happened, such as `editing.joined`.
+    pub kind: &'static str,
+    /// Who did it; `None` for the server or the command line.
     pub actor: Option<UserId>,
+    /// The account acted on, if any.
     pub subject: Option<UserId>,
     pub document: Option<DocId>,
+    /// Details of the event. Never document text, passwords or tokens.
     pub detail: serde_json::Value,
 }
 
 /// Writes `event` on `conn`, normally a transaction, so the event commits with the change.
-pub(crate) async fn record(
-    conn: &mut PgConnection,
-    event: NewEvent<'_>,
-) -> Result<(), sqlx::Error> {
+pub(crate) async fn record(conn: &mut PgConnection, event: NewEvent) -> Result<(), sqlx::Error> {
+    insert(conn, &event).await
+}
+
+async fn insert(conn: &mut PgConnection, event: &NewEvent) -> Result<(), sqlx::Error> {
     sqlx::query(
         "insert into events (kind, actor, subject, document_id, detail) \
          values ($1, $2, $3, $4, $5)",
@@ -45,13 +51,35 @@ pub(crate) async fn record(
     .bind(event.actor.map(|u| u.0))
     .bind(event.subject.map(|u| u.0))
     .bind(event.document.map(|d| d.0))
-    .bind(event.detail)
+    .bind(&event.detail)
     .execute(conn)
     .await?;
     Ok(())
 }
 
 impl Db {
+    /// Writes `event` on its own, outside any other change.
+    pub async fn append_event(&self, event: &NewEvent) -> Result<(), DbError> {
+        let mut conn = self.pool().acquire().await?;
+        insert(&mut conn, event).await?;
+        Ok(())
+    }
+
+    /// The latest `limit` events about document `doc`, oldest first.
+    pub async fn recent_events_for(&self, doc: DocId, limit: i64) -> Result<Vec<Event>, DbError> {
+        let rows = sqlx::query(
+            "select id, at, kind, actor, subject, document_id, detail from (                  select id, at, kind, actor, subject, document_id, detail                  from events where document_id = $1 order by id desc limit $2              ) latest order by id",
+        )
+        .bind(doc.0)
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await?;
+        rows.iter()
+            .map(event_from_row)
+            .collect::<Result<_, sqlx::Error>>()
+            .map_err(DbError::from)
+    }
+
     /// The events whose subject is `subject`, oldest first.
     pub async fn events_about(&self, subject: UserId) -> Result<Vec<Event>, DbError> {
         let rows = sqlx::query(

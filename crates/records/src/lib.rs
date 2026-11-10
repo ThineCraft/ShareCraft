@@ -15,5 +15,5 @@ pub use accounts::{
 };
 pub use db::{Db, DbError};
 pub use documents::{AccessError, Document, Grant, Role};
-pub use events::Event;
+pub use events::{Event, NewEvent};
 pub use revisions::{RevisionRecord, RevisionRow};

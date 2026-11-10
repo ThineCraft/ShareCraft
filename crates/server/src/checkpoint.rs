@@ -110,6 +110,11 @@ impl SaveJob {
         self.base.as_ref()
     }
 
+    /// The ids of the people credited with this checkpoint, in first-seen order.
+    pub(crate) fn author_ids(&self) -> Vec<String> {
+        self.authors.iter().map(|a| a.id.clone()).collect()
+    }
+
     /// Writes the checkpoint of `doc`, stored under the document's name `file_name`. Blocks.
     pub(crate) fn write(
         &self,
@@ -133,7 +138,10 @@ impl SaveJob {
 #[derive(Debug)]
 pub(crate) enum WriteError {
     /// The document has a revision the checkpoint was not based on: someone else saved it.
-    Stale,
+    Stale {
+        /// The document's current revision, if it has one.
+        current: Option<RevisionId>,
+    },
     /// Anything else; worth trying again.
     Failed(String),
 }
@@ -141,7 +149,7 @@ pub(crate) enum WriteError {
 impl From<CheckpointError> for WriteError {
     fn from(e: CheckpointError) -> Self {
         match e {
-            CheckpointError::Stale { .. } => WriteError::Stale,
+            CheckpointError::Stale { current } => WriteError::Stale { current },
             other => WriteError::Failed(other.to_string()),
         }
     }
@@ -162,7 +170,11 @@ pub(crate) enum Finished {
     },
     /// Nothing was stored because the document was saved from elsewhere. No checkpoint is
     /// tried again: the room is in conflict for the rest of its life.
-    Conflict { through: Seq },
+    Conflict {
+        through: Seq,
+        /// The document's current revision, if it has one.
+        current: Option<RevisionId>,
+    },
 }
 
 struct Contributor {
@@ -319,9 +331,9 @@ impl Schedule {
                 self.final_failures = 0;
                 Some(Finished::Saved { revision, through })
             }
-            Err(WriteError::Stale) => {
+            Err(WriteError::Stale { current }) => {
                 self.conflict = true;
-                Some(Finished::Conflict { through })
+                Some(Finished::Conflict { through, current })
             }
             Err(WriteError::Failed(error)) => {
                 let delay = if empty {
@@ -491,8 +503,14 @@ mod tests {
         let mut s = Schedule::new(Some(rev(1)), Seq(0), timing());
         s.changed(author("a"), Seq(1));
         s.start(Seq(1), "x".into()).unwrap();
-        let done = s.finish(Err(WriteError::Stale), Seq(1), false);
-        assert!(matches!(done, Some(Finished::Conflict { through: Seq(1) })));
+        let done = s.finish(Err(WriteError::Stale { current: None }), Seq(1), false);
+        assert!(matches!(
+            done,
+            Some(Finished::Conflict {
+                through: Seq(1),
+                ..
+            })
+        ));
         assert!(s.in_conflict());
         assert_eq!(s.revision(), Some(&rev(1)), "nothing was saved");
         s.changed(author("a"), Seq(2));
