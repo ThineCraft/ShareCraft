@@ -35,7 +35,8 @@ let queued = [];        // frames that arrived during composition, with their so
 let save = null;        // { state, revision } from the client
 let notice = '';        // a message that stays until the person edits again
 let refused = false;    // a change was refused and the socket is being renewed
-let canEdit = false;    // the server says this person may change the text
+let pendingClose = null; // a socket that closed during a composition, handled when it ends
+let canEdit = false;   // the server says this person may change the text
 let removedReason = ''; // set once the server removed this page: no reconnecting
 
 // Another document was chosen by editing the address.
@@ -109,9 +110,11 @@ async function refreshRole() {
   }
 }
 
+let accessCheck = 0;
 async function showAccess() {
+  const check = ++accessCheck;
   const result = await api('GET', `/docs/${seg(docId)}/access`);
-  if (removedReason) return;
+  if (check !== accessCheck || removedReason) return;
   if (!result.ok) {
     shareMessage(messageFor(result.error), true);
     return;
@@ -197,6 +200,13 @@ function stopRemoved(reason) {
   applyEditable();
   peopleList.replaceChildren();
   sharePanel.hidden = true;
+  accessCheck++;
+  roleCheck++;
+  $('access').replaceChildren();
+  shareMessage('', false);
+  $('title').textContent = 'Document';
+  $('docline').textContent = '';
+  document.title = 'ShareCraft — Document';
   const old = socket;
   socket = null;
   joined = false;
@@ -229,16 +239,42 @@ function connect() {
   };
   ws.onclose = () => {
     if (ws !== socket) return;
-    socket = null;
-    joined = false;
-    if (removedReason) return;
-    lost = !refused;
-    refused = false;
-    retryTimer = setTimeout(connect, lost ? delay : 0);
-    if (lost) delay = Math.min(delay * 2, MAX_DELAY);
-    render();
+    // Frames held back for a composition may say the server removed this page; they are
+    // handled when the composition ends, and only then does the close take effect.
+    if (composing && queued.some(([w]) => w === ws)) {
+      pendingClose = ws;
+      return;
+    }
+    closed(ws);
   };
   render();
+}
+
+// The socket `ws` is gone: reconnect, unless the page was removed.
+function closed(ws) {
+  if (ws !== socket) return;
+  const hadJoined = joined;
+  socket = null;
+  joined = false;
+  if (removedReason) return;
+  lost = !refused;
+  refused = false;
+  retryTimer = setTimeout(connect, lost ? delay : 0);
+  if (lost) delay = Math.min(delay * 2, MAX_DELAY);
+  render();
+  if (!hadJoined && lost) checkStillAllowed();
+}
+
+// A reconnect that fails before joining may mean the access or session is gone.
+let checking = false;
+async function checkStillAllowed() {
+  if (checking) return;
+  checking = true;
+  const result = await api('GET', `/docs/${seg(docId)}`); // 401 goes to the sign-in page
+  checking = false;
+  if (removedReason || result.ok || result.status !== 404) return;
+  stopRemoved('missing');
+  showProblem(MISSING);
 }
 
 function send(message) {
@@ -311,6 +347,11 @@ area.addEventListener('compositionend', () => {
   queued = [];
   for (const [ws, data] of frames) {
     if (ws === socket) handleFrame(data);
+  }
+  if (pendingClose) {
+    const ws = pendingClose;
+    pendingClose = null;
+    closed(ws);
   }
 });
 

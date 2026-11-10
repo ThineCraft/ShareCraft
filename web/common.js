@@ -61,14 +61,25 @@ export function goToSignIn() {
 }
 
 /**
- * The page to open after signing in: `next` only if it is a path on this site (one leading
- * slash, not followed by another slash or a backslash), otherwise the home page.
+ * The page to open after signing in: `next` only if it is a path on this site, otherwise the
+ * home page. It must start with one slash (not followed by another slash or a backslash),
+ * hold no control or space characters (browsers drop tabs and line breaks, which can turn
+ * "/" + tab + "/host" into "//host"), and resolve to `origin`. Pure: `origin` is passed in.
  */
-export function safeNext(next) {
-  if (typeof next === 'string' && next.startsWith('/') && next[1] !== '/' && next[1] !== '\\') {
-    return next;
+export function safeNext(next, origin = globalThis.location?.origin) {
+  if (typeof next !== 'string' || !next.startsWith('/')) return '/';
+  if (next[1] === '/' || next[1] === '\\') return '/';
+  for (const ch of next) {
+    const code = ch.codePointAt(0);
+    if (code <= 0x20 || code === 0x7f) return '/';
   }
-  return '/';
+  try {
+    const url = new URL(next, origin);
+    if (url.origin !== origin) return '/';
+    return url.pathname + url.search + url.hash;
+  } catch {
+    return '/';
+  }
 }
 
 /**
@@ -93,8 +104,7 @@ export function h(tag, attributes = {}, ...children) {
   return element;
 }
 
-/** Shows `text` in the error paragraph `element`, or hides it when `text` is empty. */
+/** Puts `text` in a message paragraph, which stays in the page (empty) so readers announce changes. */
 export function showMessage(element, text) {
   element.textContent = text;
-  element.hidden = text === '';
 }
