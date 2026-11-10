@@ -77,6 +77,15 @@ $env:SHARECRAFT_ADDR = "127.0.0.1:9000"
 $env:SHARECRAFT_DATA = "C:\sharecraft-data"
 cargo run -p server</code></pre>
 <p>If you change the port, open the page at that port instead of 8787, still using <code>127.0.0.1</code> or <code>localhost</code>.</p>
+<p>These values are fixed in this build and cannot be changed through the environment:</p>
+<div class="table-wrap"><table><caption>Fixed settings</caption>
+<thead><tr><th>Setting</th><th>Value</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td>Checkpoint idle time</td><td>2 seconds</td><td>A checkpoint is written once no change has arrived for this long (section 05).</td></tr>
+<tr><td>Longest time unsaved</td><td>30 seconds</td><td>A checkpoint is written at the latest this long after the first unsaved change.</td></tr>
+<tr><td>Grace period</td><td>60 seconds</td><td>How long a document stays open on the server after the last person leaves it, so a browser that reconnects within this time carries on without losing its typing.</td></tr>
+<tr><td>Largest single change</td><td>512 KiB</td><td>The largest change a page sends in one piece, measured as sent. A larger paste is refused and the page shows <strong>That change is too large to send in one piece. Paste it in smaller parts.</strong></td></tr>
+</tbody></table></div>
 </section>
 
 <section id="data"><h2>05 / Where data is kept</h2>
@@ -94,14 +103,21 @@ git --git-dir=data/libraries/00000000-0000-0000-0000-000000000001.git show main:
 git --git-dir=data/libraries/00000000-0000-0000-0000-000000000001.git show main:docs/&lt;doc_id&gt;/meta.json</code></pre>
 <p>Replace <code>&lt;doc_id&gt;</code> with the identifier. Only read from the repository this way. Content must reach it through the server, which is the only thing that writes to it.</p>
 <h3>When a checkpoint is written</h3>
-<p>Live changes are not committed one by one. The server writes a checkpoint when no change has arrived for 2 seconds, or at the latest 30 seconds after the first change that has not been saved yet, whichever comes first. When the last person leaves a document, it is saved straight away. If that final save fails the server tries again up to three more times, then gives up and prints a message to the server's console. A save that fails while people are connected is retried after the idle time.</p>
+<p>Live changes are not committed one by one. The server writes a checkpoint when no change has arrived for 2 seconds, or at the latest 30 seconds after the first change that has not been saved yet, whichever comes first. When the last person leaves a document, it is saved straight away. If that final save fails, the server tries again after 2 seconds, doubling the wait each time up to 30 seconds, for up to 10 attempts in all (about three minutes); then it gives up and prints a message to the server's console. The document stays open on the server while it is still trying, even after the grace period. A save that fails while people are connected is retried after the idle time.</p>
 <p>The page shows the state next to the document title: Saving…, Saved, or Saving failed, retrying.</p>
-<p>The server keeps the most recent 1000 log entries behind the last checkpoint, so a browser that drops for a short time can catch up and resend its changes.</p>
+<p>The server keeps the most recent 1000 log entries behind the last checkpoint, and keeps a document open for a grace period of 60 seconds after the last person leaves it. A browser that drops for a short time therefore catches up, resends its changes and keeps the typing it did while disconnected, including when it was the only one there, as long as it is back within the grace period. After that, or after a server restart, it is reset to the saved text (section 06).</p>
 </section>
 
 <section id="stop"><h2>06 / Stopping the server</h2>
 <p>Stopping the server (for example with Ctrl+C) ends it at once. <strong>The server loses any changes made since the last checkpoint</strong>, which can be up to 30 seconds of typing. Everything up to the last saved revision is kept in the Git repository and is loaded again the next time the document is opened.</p>
-<p>A tab that is still open shows <strong>Connection lost. N changes waiting</strong> and keeps that status for the whole outage while the page retries in the background (first after 0.5 seconds, with the wait doubling up to 8 seconds between tries). When the server is back, the status returns to <strong>Saved</strong>. If the server was restarted, the tab instead shows <strong>The server restarted. N changes could not be kept.</strong>, telling you how many of its changes did not survive. Wait for the status to read <strong>Saved</strong> before you stop the server.</p>
+<p>A tab that is still open shows <strong>Connection lost. N changes waiting</strong> and keeps that status for the whole outage while the page retries in the background (first after 0.5 seconds, with the wait doubling up to 8 seconds between tries). When the server is back, the status returns to <strong>Saved</strong>.</p>
+<p>If the server was restarted, the tab is reset to the last saved text, and the status says what that cost:</p>
+<ul>
+<li>If the saved text differs from what the tab showed, it reads <strong>The server restarted. Changes made since the last save were lost.</strong> If changes typed while the connection was lost were also thrown away, it adds <strong>N changes you typed while disconnected could not be kept.</strong></li>
+<li>If the saved text is exactly what the tab showed, nothing was lost and the status simply returns to <strong>Saved</strong>.</li>
+</ul>
+<p>If the server kept running but could no longer take the tab back where it left off, the tab is brought up to date with the server's text and, if it had to throw away changes, reads <strong>N changes could not be kept.</strong> These messages stay until you next type. If saving is failing at the same time, the status reads <strong>Saving failed, retrying.</strong> followed by the message.</p>
+<p>Wait for the status to read <strong>Saved</strong> before you stop the server.</p>
 </section>
 
 <section id="limits"><h2>07 / Known limits of this build</h2>
@@ -109,6 +125,7 @@ git --git-dir=data/libraries/00000000-0000-0000-0000-000000000001.git show main:
 <li><strong>No sign-in.</strong> Anyone who can open the page on this computer can read and change every document. The page and the server console both say so.</li>
 <li><strong>Identity is a typed name.</strong> The name box is a label for other people in the session. It proves nothing, and two people can type the same name.</li>
 <li><strong>Local connections only.</strong> The server will not listen on a non-loopback address and refuses connections that do not come from the page it served (section 03).</li>
+<li><strong>Large pastes go in pieces.</strong> One change can be at most 512 KiB as sent (section 04); a larger paste is refused with a message asking for smaller parts.</li>
 <li><strong>Plain text only.</strong> There is no formatting, and no spreadsheet, document, PDF or 3D editing yet.</li>
 <li><strong>PostgreSQL is not used yet.</strong> Nothing in the server reads or writes a database. A local development database is configured through <code>.env</code> for the next plan: copy <code>.env.example</code> to <code>.env</code> and fill in the values. <code>.env</code> is not kept in Git.</li>
 <li><strong>The four editors are not connected yet.</strong> WordCraft, GridCraft, PdfCraft and SolidCraft do not open files from ShareCraft in this build.</li>
@@ -121,7 +138,7 @@ git --git-dir=data/libraries/00000000-0000-0000-0000-000000000001.git show main:
 <p>The <code>revisions</code> crate stores documents in Git using the <code>git2</code> library, which bundles libgit2. libgit2 is licensed GPL-2.0 with a linking exception. <code>revisions</code> is a server-only crate: it is not linked into the editor forks, and the browser-side crates (<code>collab-core</code>, <code>collab-text</code>, <code>protocol</code>, <code>web-client</code>) do not depend on it.</p>
 </section>
 
-<footer>ShareCraft · ThineCraft · Building and running · Updated 9 November 2026<br>Describes the development build of the first Stage 1 plan, not a release.</footer>
+<footer>ShareCraft · ThineCraft · Building and running · Updated 10 November 2026<br>Describes the development build of the first Stage 1 plan, not a release.</footer>
 </main></div>
 </body>
 </html>

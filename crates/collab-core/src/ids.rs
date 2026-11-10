@@ -8,7 +8,8 @@ use uuid::Uuid;
 #[serde(transparent)]
 pub struct DocId(pub Uuid);
 
-/// Identifies one connection lifetime; chosen by the client.
+/// Identifies one client instance (in the browser, one page load), kept across its
+/// reconnects; chosen by the client.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ClientId(pub Uuid);
