@@ -1,0 +1,34 @@
+[package]
+name = "server"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "sharecraft-server"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "0.8.9", features = ["ws"] }
+collab-core = { path = "../collab-core" }
+collab-text = { path = "../collab-text" }
+futures-util = "0.3.34"
+protocol = { path = "../protocol" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
+tower-http = { version = "0.7.1", features = ["fs"] }
+uuid = "1.29.2"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tokio-tungstenite = "0.30.0"
+uuid = { version = "1.29.2", features = ["v4"] }
