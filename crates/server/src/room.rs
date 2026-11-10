@@ -548,21 +548,19 @@ impl Room {
         }
     }
 
-    /// Gives every connection of `user` the role `role`. Each connection whose `can_edit`
-    /// changes is told; everyone gets a new people list if any role changed.
+    /// Gives every connection of `user` the role `role`. Each connection whose role changes is
+    /// told with `Access`, even when it may edit as before (an owner becoming an editor, say),
+    /// so the page can read the role again; everyone gets a new people list if any role changed.
     fn change_role(&mut self, user: UserId, role: Role) {
         let mut told = Vec::new();
-        let mut changed = false;
         for member in self.members.iter_mut().filter(|m| m.user == user) {
             if member.role == role {
                 continue;
             }
-            changed = true;
-            if member.role.can_edit() != role.can_edit() {
-                told.push(member.client);
-            }
+            told.push(member.client);
             member.role = role;
         }
+        let changed = !told.is_empty();
         if let Some(frame) = encode(&ServerMsg::Access {
             can_edit: role.can_edit(),
         }) {
@@ -1695,21 +1693,32 @@ mod tests {
     }
 
     #[test]
-    fn role_change_tells_only_when_editing_changes() {
+    fn every_role_change_is_told() {
         let mut room = new_room();
         let a = ClientId(Uuid::from_u128(1));
         let mut rx = join(&mut room, 1, a);
         frames(&mut rx);
         let user = UserId(a.0);
 
-        // Editor to owner: nothing visible to them changes, but the list is sent again.
+        // Editor to owner: they may still edit, and are told, so the page can offer sharing.
         room.handle(Command::SetAccess {
             user,
             role: Some(Role::Owner),
         });
         let got = frames(&mut rx);
         assert!(
-            matches!(got.as_slice(), [ServerMsg::People { .. }]),
+            matches!(got.as_slice(), [ServerMsg::Access { can_edit: true }, ServerMsg::People { .. }]),
+            "{got:?}"
+        );
+
+        // Owner to editor: told again, so the page can take sharing away.
+        room.handle(Command::SetAccess {
+            user,
+            role: Some(Role::Editor),
+        });
+        let got = frames(&mut rx);
+        assert!(
+            matches!(got.as_slice(), [ServerMsg::Access { can_edit: true }, ServerMsg::People { .. }]),
             "{got:?}"
         );
 

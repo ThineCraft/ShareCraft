@@ -293,6 +293,48 @@ async fn concurrent_role_changes_end_as_the_database_says() {
     assert!(bob.removed.is_none() && !bob.closed);
 }
 
+/// The `Access` messages `c` has received.
+fn access_messages(c: &TestClient) -> usize {
+    c.received
+        .iter()
+        .filter(|m| matches!(m, ServerMsg::Access { .. }))
+        .count()
+}
+
+/// A role change that leaves editing as it was is still told, so the page can show or take
+/// away sharing: an editor made owner, then the owner made editor again.
+#[tokio::test]
+async fn role_changes_that_keep_editing_are_told() {
+    let server = spawn_server().await;
+    let doc = new_doc();
+    let ann = TestClient::connect(&server, doc, "Ann").await;
+    let mut bob = TestClient::connect(&server, doc, "Bob").await;
+    assert!(bob.can_edit);
+
+    share(&server, &ann.user, doc, &bob.user, "owner").await;
+    tokio::time::timeout(PROMPTLY, bob.pump_until(|c| access_messages(c) == 1))
+        .await
+        .expect("promotion not told within one second");
+    share(&server, &ann.user, doc, &bob.user, "editor").await;
+    tokio::time::timeout(PROMPTLY, bob.pump_until(|c| access_messages(c) == 2))
+        .await
+        .expect("demotion not told within one second");
+    let told: Vec<_> = bob
+        .received
+        .iter()
+        .filter(|m| matches!(m, ServerMsg::Access { .. }))
+        .collect();
+    assert_eq!(
+        told,
+        vec![
+            &ServerMsg::Access { can_edit: true },
+            &ServerMsg::Access { can_edit: true }
+        ]
+    );
+    assert!(bob.can_edit && bob.removed.is_none() && !bob.closed);
+    assert_eq!(joins(&bob), 1);
+}
+
 #[tokio::test]
 async fn revoking_one_person_leaves_the_others_typing() {
     let server = spawn_server().await;
@@ -451,10 +493,11 @@ async fn admin_keeps_access_when_their_grant_is_removed() {
     r.pump_until(|c| c.seq() == Seq(1)).await;
     assert_eq!(r.text(), "still yours");
     assert!(r.removed.is_none() && !r.closed && r.can_edit);
+    // Editor to owner: they may still edit, and nothing ever said otherwise.
     assert!(
         !r.received
             .iter()
-            .any(|m| matches!(m, ServerMsg::Access { .. })),
+            .any(|m| matches!(m, ServerMsg::Access { can_edit: false })),
         "{:?}",
         r.received
     );
