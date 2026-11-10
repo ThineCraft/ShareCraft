@@ -1,10 +1,24 @@
+//! The server's commands other than serving.
+//!
 //! `sharecraft-server add-user --email <email> --name <name> [--admin]`: creates an account
 //! from the command line. The password is read without echo from the terminal, or as one line
 //! from standard input when it is piped. It is never shown or logged.
+//!
+//! `sharecraft-server rebuild`: replaces the revisions recorded in the database for every
+//! document in Git with what Git holds.
 
 use std::io::{BufRead, IsTerminal};
+use std::sync::Arc;
 
 use records::{Db, NewUser};
+use revisions::RevisionStore;
+
+use crate::checkpoint::{Checkpointer, library_path};
+use crate::config::Config;
+use crate::projection::{Report, rebuild as rebuild_revisions};
+
+/// How to call `rebuild`.
+pub const REBUILD_USAGE: &str = "usage: sharecraft-server rebuild";
 
 /// How to call `add-user`.
 pub const ADD_USER_USAGE: &str =
@@ -86,6 +100,37 @@ pub async fn add_user(args: &[String]) -> Result<String, String> {
         "account"
     };
     Ok(format!("created {kind} {} ({})", user.email, user.id.0))
+}
+
+/// Runs `rebuild` with the arguments that follow it (there are none): connects to
+/// `DATABASE_URL`, brings the schema up to date, opens the library repository under the data
+/// directory and replaces the revision list of every document in it. Returns the report, whose
+/// `failed` lists the documents that could not be rebuilt.
+///
+/// # Errors
+/// A message for the user when the arguments, the settings, the database or the repository
+/// are unusable. It never contains the database URL.
+pub async fn rebuild(args: &[String]) -> Result<Report, String> {
+    if let Some(arg) = args.first() {
+        return Err(format!("unexpected argument {arg:?}\n{REBUILD_USAGE}"));
+    }
+    let config = Config::from_env().map_err(|e| e.to_string())?;
+    let db = Db::connect(config.database_url.expose())
+        .await
+        .map_err(|e| format!("cannot connect to the database: {e}"))?;
+    db.migrate()
+        .await
+        .map_err(|e| format!("cannot migrate the database: {e}"))?;
+    let path = library_path(&config.data_dir);
+    let opened = tokio::task::spawn_blocking(move || {
+        RevisionStore::open(&path).map_err(|e| format!("cannot open {}: {e}", path.display()))
+    })
+    .await
+    .map_err(|e| format!("cannot open the library: {e}"))??;
+    let store: Arc<dyn Checkpointer> = Arc::new(opened);
+    rebuild_revisions(store, &db)
+        .await
+        .map_err(|e| format!("cannot list the documents in Git: {e}"))
 }
 
 /// The password, typed without echo at a terminal, or the first line of piped input.

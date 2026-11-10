@@ -17,7 +17,9 @@ use common::{
     wait_out_grace, wait_stored,
 };
 use protocol::{ClientMsg, Resume, RoomEpoch, SaveState, ServerMsg};
-use revisions::{Checkpoint, CheckpointError, Outcome, RevisionStore, Stored};
+use revisions::{
+    Checkpoint, CheckpointError, GitError, Outcome, RevisionId, RevisionInfo, RevisionStore, Stored,
+};
 use server::Checkpointer;
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
@@ -541,6 +543,22 @@ impl Checkpointer for Flaky {
     fn load(&self, doc: DocId) -> Result<Option<Stored>, CheckpointError> {
         self.inner.load(doc)
     }
+
+    fn describe(
+        &self,
+        doc: DocId,
+        revision: &RevisionId,
+    ) -> Result<Option<RevisionInfo>, CheckpointError> {
+        self.inner.describe(doc, revision)
+    }
+
+    fn history(&self, doc: DocId) -> Result<Vec<RevisionInfo>, CheckpointError> {
+        self.inner.history(doc)
+    }
+
+    fn documents(&self) -> Result<Vec<DocId>, GitError> {
+        self.inner.documents()
+    }
 }
 
 #[tokio::test]
@@ -674,6 +692,22 @@ impl Checkpointer for BrokenLoad {
         self.loads.fetch_add(1, Ordering::SeqCst);
         Err(CheckpointError::Git(revisions::GitError::new("unreadable")))
     }
+
+    fn describe(
+        &self,
+        _doc: DocId,
+        _revision: &RevisionId,
+    ) -> Result<Option<RevisionInfo>, CheckpointError> {
+        Err(CheckpointError::Git(GitError::new("unreadable")))
+    }
+
+    fn history(&self, _doc: DocId) -> Result<Vec<RevisionInfo>, CheckpointError> {
+        Err(CheckpointError::Git(GitError::new("unreadable")))
+    }
+
+    fn documents(&self) -> Result<Vec<DocId>, GitError> {
+        Err(GitError::new("unreadable"))
+    }
 }
 
 #[tokio::test]
@@ -755,6 +789,22 @@ impl Checkpointer for Gated {
 
     fn load(&self, doc: DocId) -> Result<Option<Stored>, CheckpointError> {
         self.inner.load(doc)
+    }
+
+    fn describe(
+        &self,
+        doc: DocId,
+        revision: &RevisionId,
+    ) -> Result<Option<RevisionInfo>, CheckpointError> {
+        self.inner.describe(doc, revision)
+    }
+
+    fn history(&self, doc: DocId) -> Result<Vec<RevisionInfo>, CheckpointError> {
+        self.inner.history(doc)
+    }
+
+    fn documents(&self) -> Result<Vec<DocId>, GitError> {
+        self.inner.documents()
     }
 }
 

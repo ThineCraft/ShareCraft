@@ -5,6 +5,8 @@
 //! [`Schedule`]). When the last participant leaves it saves at once, then stays open for a
 //! grace period so a browser that reconnects resumes where it left off. It ends once nobody
 //! has been connected for the grace period and everything is saved (or saving was given up).
+//! If a checkpoint finds the document saved from elsewhere, the room is in conflict: it saves
+//! nothing more, refuses every change, and ends as soon as it is empty.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,14 +19,15 @@ use collab_core::ids::{ClientId, DocId, OpId, Seq, SessionId, UserId};
 use collab_core::server_log::ServerLog;
 use collab_text::{TextDoc, TextOp};
 use protocol::{Participant, RemovedReason, Resume, RoomEpoch, SaveState, ServerMsg};
-use records::Role;
+use records::{Db, Role};
 use revisions::{Author, CheckpointError, Outcome, RevisionId};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use uuid::Uuid;
 
-use crate::checkpoint::{Checkpointer, Finished, SaveJob, Schedule, Timing};
+use crate::checkpoint::{Checkpointer, Finished, SaveJob, Schedule, Timing, WriteError};
+use crate::projection::Recorder;
 
 /// Identifies one WebSocket connection, so a replaced connection's late messages are ignored.
 pub(crate) type ConnId = u64;
@@ -51,6 +54,8 @@ const KEPT_ENTRIES: u64 = 1000;
 const DEFAULT_NAME: &str = "Guest";
 /// Why a `Submit` from someone who may not edit is refused.
 const READ_ONLY: &str = "read_only";
+/// Why a `Submit` is refused once the document was saved from elsewhere.
+const CONFLICT: &str = "conflict";
 
 /// How a room answers a join.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -191,7 +196,7 @@ impl Room {
     }
 
     /// Records how the running checkpoint ended and tells everyone.
-    fn finish_checkpoint(&mut self, result: Result<Outcome, String>) {
+    fn finish_checkpoint(&mut self, result: Result<Outcome, WriteError>) {
         let head = self.log.head();
         let finished = self.schedule.finish(result, head, self.members.is_empty());
         match finished {
@@ -218,6 +223,14 @@ impl Room {
                 }
                 self.broadcast_save(SaveState::Failed, None, through);
             }
+            Some(Finished::Conflict { through }) => {
+                eprintln!(
+                    "sharecraft-server: document {} was saved from elsewhere; its room stops \
+                     saving, and changes after its last saved revision are lost",
+                    self.doc.0
+                );
+                self.broadcast_save(SaveState::Conflict, None, through);
+            }
             None => {}
         }
     }
@@ -225,6 +238,12 @@ impl Room {
     /// Whether nobody is connected.
     fn is_empty(&self) -> bool {
         self.members.is_empty()
+    }
+
+    /// Whether a checkpoint was refused because the document was saved from elsewhere. Such a
+    /// room saves nothing more, refuses every change and ends as soon as it is empty.
+    fn in_conflict(&self) -> bool {
+        self.schedule.in_conflict()
     }
 
     /// Whether the room can end: nobody is connected and everything is saved (or saving was
@@ -354,6 +373,13 @@ impl Room {
                 saved_through,
             }),
         }
+        if self.in_conflict() {
+            msgs.push(ServerMsg::Save {
+                state: SaveState::Conflict,
+                revision: None,
+                through: saved_through,
+            });
+        }
         let frames = msgs.iter().filter_map(encode).collect();
         self.send(Some(client), &Outbound::Many(frames));
         self.broadcast_people();
@@ -370,6 +396,10 @@ impl Room {
         // A resend of a committed change is dropped silently: this connection has already
         // received the entry through its snapshot, its catch-up or the broadcast.
         if self.last_committed.get(&client) == Some(&op_id) {
+            return;
+        }
+        if self.in_conflict() {
+            self.refuse(client, op_id, CONFLICT.to_owned());
             return;
         }
         if !member.role.can_edit() {
@@ -588,8 +618,8 @@ pub(crate) struct Rooms {
 impl Rooms {
     /// The command channel of `doc`'s room, starting the room if it is not open. A new room
     /// stores its checkpoints under `name`, the document's name, and loads its document from
-    /// `store` before handling commands; commands wait in its channel meanwhile. Once empty,
-    /// the room stays open for `grace`.
+    /// `store` before handling commands; commands wait in its channel meanwhile. Each revision
+    /// it writes is recorded in `db`, if given. Once empty, the room stays open for `grace`.
     ///
     /// The channel can be closed by the time it is used, if the room ended meanwhile; the
     /// caller then asks again.
@@ -598,6 +628,7 @@ impl Rooms {
         doc: DocId,
         name: String,
         store: &Arc<dyn Checkpointer>,
+        db: Option<Db>,
         timing: Timing,
         grace: Duration,
     ) -> RoomLink {
@@ -616,7 +647,11 @@ impl Rooms {
             generation,
         };
         let channels = Channels { rx, access_rx };
-        tokio::spawn(run(place, name, channels, Arc::clone(store), timing, grace));
+        let storage = Storage {
+            store: Arc::clone(store),
+            db,
+        };
+        tokio::spawn(run(place, name, channels, storage, timing, grace));
         let link = RoomLink { commands, access };
         open.insert(
             doc,
@@ -689,15 +724,21 @@ struct Place {
     generation: u64,
 }
 
+/// Where a room's document is stored, and where its revisions are recorded, if anywhere.
+struct Storage {
+    store: Arc<dyn Checkpointer>,
+    db: Option<Db>,
+}
+
 type Running = JoinHandle<Result<Outcome, CheckpointError>>;
 
 /// Loads the document, then handles commands and writes checkpoints until nobody has been
-/// connected for `grace` and everything is saved.
+/// connected for `grace` and everything is saved, or at once when empty once in conflict.
 async fn run(
     place: Place,
     name: String,
     channels: Channels,
-    store: Arc<dyn Checkpointer>,
+    storage: Storage,
     timing: Timing,
     grace: Duration,
 ) {
@@ -706,6 +747,7 @@ async fn run(
         mut rx,
         mut access_rx,
     } = channels;
+    let Storage { store, db } = storage;
     let initial = match load(&store, doc).await {
         Ok(initial) => initial,
         Err(err) => {
@@ -725,6 +767,9 @@ async fn run(
     };
 
     let mut room = Room::new(doc, name, initial, timing);
+    // Revisions are recorded off this task, in the order they are written: the blocking task
+    // that writes one queues it before the room learns of it, and one checkpoint runs at a time.
+    let recorder = db.map(|db| Recorder::start(doc, Arc::clone(&store), db));
     let mut running: Option<Running> = None;
     // The room opens for a join waiting in its channel; until that is handled it is empty.
     let mut empty_since = Some(Instant::now());
@@ -763,8 +808,15 @@ async fn run(
                 if let Some(job) = room.start_checkpoint() {
                     let store = Arc::clone(&store);
                     let file_name = room.name.clone();
+                    let recorder = recorder.clone();
                     running = Some(tokio::task::spawn_blocking(move || {
-                        job.write(doc, &file_name, &*store)
+                        let result = job.write(doc, &file_name, &*store);
+                        if let (Ok(Outcome::Written(revision)), Some(recorder)) =
+                            (&result, &recorder)
+                        {
+                            recorder.written(job.base(), revision);
+                        }
+                        result
                     }));
                 }
             }
@@ -774,7 +826,9 @@ async fn run(
             (false, _) => None,
             (true, since) => since.or_else(|| Some(Instant::now())),
         };
-        let grace_over = empty_since.is_some_and(|since| grace_end(since, grace) <= Instant::now());
+        // A room in conflict has nothing to resume, so it does not wait out the grace period.
+        let grace_over = empty_since
+            .is_some_and(|since| room.in_conflict() || grace_end(since, grace) <= Instant::now());
         if grace_over && running.is_none() && room.may_end() {
             break;
         }
@@ -813,11 +867,11 @@ async fn load(store: &Arc<dyn Checkpointer>, doc: DocId) -> Result<Initial, Stri
 
 /// The result of the running checkpoint; never ready when none is running. A panic in the
 /// write counts as a failed checkpoint.
-async fn finished(running: &mut Option<Running>) -> Result<Outcome, String> {
+async fn finished(running: &mut Option<Running>) -> Result<Outcome, WriteError> {
     match running {
         Some(handle) => match handle.await {
-            Ok(result) => result.map_err(|e| e.to_string()),
-            Err(e) => Err(format!("checkpoint task failed: {e}")),
+            Ok(result) => result.map_err(WriteError::from),
+            Err(e) => Err(WriteError::Failed(format!("checkpoint task failed: {e}"))),
         },
         None => std::future::pending().await,
     }
@@ -1119,6 +1173,55 @@ mod tests {
     }
 
     #[test]
+    fn stale_checkpoint_refuses_every_later_change() {
+        let mut room = new_room();
+        let a = ClientId(Uuid::from_u128(1));
+        let mut rx = join(&mut room, 1, a);
+        submit(&mut room, a, OpId(Uuid::from_u128(2)), Seq(0), "abc");
+        room.start_checkpoint().unwrap();
+        frames(&mut rx);
+        room.finish_checkpoint(Err(WriteError::Stale));
+        let got = frames(&mut rx);
+        assert!(
+            matches!(
+                got.as_slice(),
+                [ServerMsg::Save {
+                    state: SaveState::Conflict,
+                    revision: None,
+                    through: Seq(1)
+                }]
+            ),
+            "{got:?}"
+        );
+
+        let op_id = OpId(Uuid::from_u128(3));
+        submit(&mut room, a, op_id, Seq(1), "x");
+        assert_eq!(room.log.head(), Seq(1));
+        let got = frames(&mut rx);
+        assert!(
+            matches!(got.as_slice(), [ServerMsg::Refused { op_id: id, reason }]
+                if *id == op_id && reason == "conflict"),
+            "{got:?}"
+        );
+        assert!(room.checkpoint_due().is_none());
+        assert!(room.start_checkpoint().is_none());
+
+        // Whoever joins now is told at once; once empty, the room may end unsaved.
+        let b = ClientId(Uuid::from_u128(4));
+        let mut rx_b = join(&mut room, 2, b);
+        assert!(frames(&mut rx_b).iter().any(|m| matches!(
+            m,
+            ServerMsg::Save {
+                state: SaveState::Conflict,
+                ..
+            }
+        )));
+        room.handle(Command::Leave { conn: 1, client: a });
+        room.handle(Command::Leave { conn: 2, client: b });
+        assert!(room.may_end());
+    }
+
+    #[test]
     fn set_access_for_someone_absent_does_nothing() {
         let mut room = new_room();
         let a = ClientId(Uuid::from_u128(1));
@@ -1193,6 +1296,22 @@ mod tests {
         fn load(&self, _doc: DocId) -> Result<Option<revisions::Stored>, CheckpointError> {
             Ok(None)
         }
+
+        fn describe(
+            &self,
+            _doc: DocId,
+            _revision: &RevisionId,
+        ) -> Result<Option<revisions::RevisionInfo>, CheckpointError> {
+            Ok(None)
+        }
+
+        fn history(&self, _doc: DocId) -> Result<Vec<revisions::RevisionInfo>, CheckpointError> {
+            Ok(Vec::new())
+        }
+
+        fn documents(&self) -> Result<Vec<DocId>, revisions::GitError> {
+            Ok(Vec::new())
+        }
     }
 
     // The test runtime has one thread, so the room task runs only while the test awaits.
@@ -1209,6 +1328,7 @@ mod tests {
             doc,
             "Notes.txt".into(),
             &store,
+            None,
             timing,
             Duration::from_secs(60),
         );

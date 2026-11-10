@@ -11,6 +11,7 @@ mod auth;
 mod checkpoint;
 pub mod cli;
 pub mod config;
+mod projection;
 mod room;
 mod ws;
 
@@ -27,6 +28,7 @@ use tower_http::services::ServeDir;
 
 pub use checkpoint::{Checkpointer, library_path};
 pub use config::{Config, ConfigError};
+pub use projection::{Report, rebuild, reconcile};
 
 use auth::Throttle;
 use checkpoint::Timing;
@@ -127,6 +129,7 @@ impl AppState {
             doc,
             name,
             &self.shared.checkpointer,
+            Some(self.shared.db.clone()),
             timing,
             config.room_grace,
         )
@@ -152,12 +155,14 @@ pub fn router(state: AppState) -> Router {
 
 /// Serves `config` on `listener` until the process ends, storing documents in the library
 /// repository under `config.data_dir` (see [`library_path`]) and records in the database at
-/// `config.database_url`, whose schema it brings up to date first.
+/// `config.database_url`, whose schema it brings up to date first. Before accepting
+/// connections it reconciles the revisions recorded in the database with Git (see
+/// [`reconcile`]) and prints one line with the counts.
 ///
 /// # Errors
 /// Returns an error if the listener is not on a loopback address, if the database cannot be
-/// reached or migrated, if the library repository cannot be opened or created, or if accepting
-/// connections fails.
+/// reached or migrated, if the library repository cannot be opened, created or listed, or if
+/// accepting connections fails.
 pub async fn serve(config: Config, listener: TcpListener) -> std::io::Result<()> {
     require_loopback(listener.local_addr()?)?;
     let db = Db::connect(config.database_url.expose())
@@ -173,7 +178,18 @@ pub async fn serve(config: Config, listener: TcpListener) -> std::io::Result<()>
     })
     .await
     .map_err(std::io::Error::other)??;
-    serve_state(AppState::new(config, Arc::new(opened), db), listener).await
+    let store: Arc<dyn Checkpointer> = Arc::new(opened);
+    let report = reconcile(Arc::clone(&store), &db)
+        .await
+        .map_err(|e| std::io::Error::other(format!("cannot list the documents in Git: {e}")))?;
+    println!("Reconciled revisions with Git: {report}");
+    for (doc, error) in &report.failed {
+        eprintln!(
+            "sharecraft-server: revisions of document {} not reconciled: {error}",
+            doc.0
+        );
+    }
+    serve_state(AppState::new(config, store, db), listener).await
 }
 
 /// Serves `state` on `listener` until the process ends.

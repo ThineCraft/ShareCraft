@@ -3,7 +3,8 @@
 //! serves until stopped.
 //!
 //! `sharecraft-server add-user --email <email> --name <name> [--admin]` creates an account
-//! instead; see [`server::cli`].
+//! instead, and `sharecraft-server rebuild` rebuilds the revisions recorded in the database
+//! from Git; see [`server::cli`].
 
 use std::process::ExitCode;
 
@@ -29,10 +30,28 @@ async fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Some((command, rest)) if command == "rebuild" => match cli::rebuild(rest).await {
+            Ok(report) => {
+                println!("Rebuilt revisions from Git: {report}");
+                for (doc, error) in &report.failed {
+                    eprintln!("sharecraft-server: document {} failed: {error}", doc.0);
+                }
+                if report.failed.is_empty() {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::FAILURE
+                }
+            }
+            Err(message) => {
+                eprintln!("sharecraft-server: {message}");
+                ExitCode::FAILURE
+            }
+        },
         Some((other, _)) => {
             eprintln!("sharecraft-server: unknown command {other:?}");
             eprintln!(
-                "usage: sharecraft-server [add-user --email <email> --name <name> [--admin]]"
+                "usage: sharecraft-server [add-user --email <email> --name <name> [--admin] \
+                 | rebuild]"
             );
             ExitCode::FAILURE
         }

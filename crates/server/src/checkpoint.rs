@@ -4,7 +4,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use collab_core::ids::{DocId, Seq};
-use revisions::{Author, Checkpoint, CheckpointError, Outcome, RevisionId, RevisionStore, Stored};
+use revisions::{
+    Author, Checkpoint, CheckpointError, GitError, Outcome, RevisionId, RevisionInfo,
+    RevisionStore, Stored,
+};
 use serde_json::Map;
 use tokio::time::Instant;
 
@@ -29,6 +32,28 @@ pub trait Checkpointer: Send + Sync + 'static {
     /// # Errors
     /// Whatever the store reports when it cannot be read.
     fn load(&self, doc: DocId) -> Result<Option<Stored>, CheckpointError>;
+
+    /// Describes the revision `revision` of `doc`; `None` if it is not one.
+    ///
+    /// # Errors
+    /// Whatever the store reports, including `Corrupt` for unreadable metadata.
+    fn describe(
+        &self,
+        doc: DocId,
+        revision: &RevisionId,
+    ) -> Result<Option<RevisionInfo>, CheckpointError>;
+
+    /// Every revision of `doc`, oldest first.
+    ///
+    /// # Errors
+    /// Whatever the store reports, including `Corrupt` for unreadable metadata.
+    fn history(&self, doc: DocId) -> Result<Vec<RevisionInfo>, CheckpointError>;
+
+    /// Every document with a revision.
+    ///
+    /// # Errors
+    /// Whatever the store reports when it cannot be read.
+    fn documents(&self) -> Result<Vec<DocId>, GitError>;
 }
 
 impl Checkpointer for RevisionStore {
@@ -38,6 +63,22 @@ impl Checkpointer for RevisionStore {
 
     fn load(&self, doc: DocId) -> Result<Option<Stored>, CheckpointError> {
         self.read(doc, None)
+    }
+
+    fn describe(
+        &self,
+        doc: DocId,
+        revision: &RevisionId,
+    ) -> Result<Option<RevisionInfo>, CheckpointError> {
+        RevisionStore::describe(self, doc, revision)
+    }
+
+    fn history(&self, doc: DocId) -> Result<Vec<RevisionInfo>, CheckpointError> {
+        RevisionStore::history(self, doc)
+    }
+
+    fn documents(&self) -> Result<Vec<DocId>, GitError> {
+        RevisionStore::documents(self)
     }
 }
 
@@ -64,6 +105,11 @@ pub(crate) struct SaveJob {
 }
 
 impl SaveJob {
+    /// The revision this checkpoint is based on.
+    pub(crate) fn base(&self) -> Option<&RevisionId> {
+        self.base.as_ref()
+    }
+
     /// Writes the checkpoint of `doc`, stored under the document's name `file_name`. Blocks.
     pub(crate) fn write(
         &self,
@@ -83,6 +129,24 @@ impl SaveJob {
     }
 }
 
+/// Why a checkpoint stored nothing.
+#[derive(Debug)]
+pub(crate) enum WriteError {
+    /// The document has a revision the checkpoint was not based on: someone else saved it.
+    Stale,
+    /// Anything else; worth trying again.
+    Failed(String),
+}
+
+impl From<CheckpointError> for WriteError {
+    fn from(e: CheckpointError) -> Self {
+        match e {
+            CheckpointError::Stale { .. } => WriteError::Stale,
+            other => WriteError::Failed(other.to_string()),
+        }
+    }
+}
+
 /// How a checkpoint ended.
 #[derive(Debug)]
 pub(crate) enum Finished {
@@ -96,6 +160,9 @@ pub(crate) enum Finished {
         /// The room is empty and has used up its final attempts.
         gave_up: bool,
     },
+    /// Nothing was stored because the document was saved from elsewhere. No checkpoint is
+    /// tried again: the room is in conflict for the rest of its life.
+    Conflict { through: Seq },
 }
 
 struct Contributor {
@@ -125,6 +192,8 @@ pub(crate) struct Schedule {
     /// Failed attempts since the room became empty.
     final_failures: u32,
     gave_up: bool,
+    /// A checkpoint was refused as stale; nothing is saved any more.
+    conflict: bool,
 }
 
 impl Schedule {
@@ -142,7 +211,13 @@ impl Schedule {
             retry_at: None,
             final_failures: 0,
             gave_up: false,
+            conflict: false,
         }
+    }
+
+    /// Whether a checkpoint was refused because the document was saved from elsewhere.
+    pub(crate) fn in_conflict(&self) -> bool {
+        self.conflict
     }
 
     /// The revision last loaded or written.
@@ -189,7 +264,7 @@ impl Schedule {
     /// When the next checkpoint should start, if one is needed and none is running. An empty
     /// room saves straight away.
     pub(crate) fn due(&self, head: Seq, empty: bool) -> Option<Instant> {
-        if self.running.is_some() || self.gave_up || !self.unsaved(head) {
+        if self.running.is_some() || self.gave_up || self.conflict || !self.unsaved(head) {
             return None;
         }
         let now = Instant::now();
@@ -205,10 +280,10 @@ impl Schedule {
         Some(self.retry_at.map_or(due, |retry| due.max(retry)))
     }
 
-    /// Starts a checkpoint of `text`, the document at `head`, unless one is running or nothing
-    /// is unsaved.
+    /// Starts a checkpoint of `text`, the document at `head`, unless one is running, nothing
+    /// is unsaved or the room is in conflict.
     pub(crate) fn start(&mut self, head: Seq, text: String) -> Option<SaveJob> {
-        if self.running.is_some() || !self.unsaved(head) {
+        if self.running.is_some() || self.conflict || !self.unsaved(head) {
             return None;
         }
         self.running = Some(head);
@@ -224,7 +299,7 @@ impl Schedule {
     /// `None` if no checkpoint was running.
     pub(crate) fn finish(
         &mut self,
-        result: Result<Outcome, String>,
+        result: Result<Outcome, WriteError>,
         head: Seq,
         empty: bool,
     ) -> Option<Finished> {
@@ -244,7 +319,11 @@ impl Schedule {
                 self.final_failures = 0;
                 Some(Finished::Saved { revision, through })
             }
-            Err(error) => {
+            Err(WriteError::Stale) => {
+                self.conflict = true;
+                Some(Finished::Conflict { through })
+            }
+            Err(WriteError::Failed(error)) => {
                 let delay = if empty {
                     self.final_failures = self.final_failures.saturating_add(1);
                     self.gave_up = self.final_failures >= FINAL_ATTEMPTS;
@@ -264,9 +343,9 @@ impl Schedule {
     }
 
     /// Whether an empty room may end: nothing is running and everything is saved, or it gave
-    /// up trying.
+    /// up trying, or it is in conflict.
     pub(crate) fn may_end(&self, head: Seq) -> bool {
-        self.running.is_none() && (self.gave_up || !self.unsaved(head))
+        self.running.is_none() && (self.gave_up || self.conflict || !self.unsaved(head))
     }
 }
 
@@ -374,7 +453,9 @@ mod tests {
             assert!(!s.may_end(Seq(1)));
             s.start(Seq(1), "x".into()).unwrap();
             let before = Instant::now();
-            let done = s.finish(Err("no".into()), Seq(1), true).unwrap();
+            let done = s
+                .finish(Err(WriteError::Failed("no".into())), Seq(1), true)
+                .unwrap();
             let Finished::Failed { gave_up, .. } = done else {
                 panic!("expected failure");
             };
@@ -406,12 +487,30 @@ mod tests {
     }
 
     #[test]
+    fn stale_checkpoint_stops_saving_for_good() {
+        let mut s = Schedule::new(Some(rev(1)), Seq(0), timing());
+        s.changed(author("a"), Seq(1));
+        s.start(Seq(1), "x".into()).unwrap();
+        let done = s.finish(Err(WriteError::Stale), Seq(1), false);
+        assert!(matches!(done, Some(Finished::Conflict { through: Seq(1) })));
+        assert!(s.in_conflict());
+        assert_eq!(s.revision(), Some(&rev(1)), "nothing was saved");
+        s.changed(author("a"), Seq(2));
+        s.joined();
+        assert!(s.in_conflict(), "joining does not end a conflict");
+        assert!(s.due(Seq(2), false).is_none());
+        assert!(s.due(Seq(2), true).is_none());
+        assert!(s.start(Seq(2), "xy".into()).is_none());
+        assert!(s.may_end(Seq(2)), "unsaved changes do not keep it open");
+    }
+
+    #[test]
     fn failure_delays_the_next_attempt() {
         let mut s = Schedule::new(None, Seq(0), timing());
         s.changed(author("a"), Seq(1));
         s.start(Seq(1), "x".into()).unwrap();
         let before = Instant::now();
-        s.finish(Err("no".into()), Seq(1), true);
+        s.finish(Err(WriteError::Failed("no".into())), Seq(1), true);
         let due = s.due(Seq(1), true).unwrap();
         assert!(due >= before + timing().idle);
     }

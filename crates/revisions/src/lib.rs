@@ -143,9 +143,36 @@ pub enum CheckpointError {
     /// Git failed.
     #[error("git error: {0}")]
     Git(#[from] GitError),
-    /// Metadata could not be encoded or decoded.
+    /// Metadata could not be encoded.
     #[error("metadata error: {0}")]
     Json(#[from] serde_json::Error),
+    /// The commit `revision` holds part of the document but not both a content file and a
+    /// readable metadata file.
+    #[error("revision {revision} is corrupt: {reason}")]
+    Corrupt {
+        /// The unreadable commit.
+        revision: RevisionId,
+        /// What is wrong with it.
+        reason: String,
+    },
+}
+
+/// What one revision of a document is: who made it, when, and the metadata it stored.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RevisionInfo {
+    /// The commit.
+    pub revision: RevisionId,
+    /// The document.
+    pub doc: DocId,
+    /// When it was committed, in seconds since the Unix epoch.
+    pub committed_at: i64,
+    /// Everyone credited on this revision: the commit author, then each `Co-authored-by`
+    /// trailer, in order.
+    pub authors: Vec<Author>,
+    /// The display file name stored with it.
+    pub file_name: String,
+    /// The document fields stored with it.
+    pub fields: Map<String, Value>,
 }
 
 /// A stored revision of a document.

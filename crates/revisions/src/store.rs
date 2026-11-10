@@ -11,7 +11,7 @@ use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 use gix::{ObjectId, Repository};
 
 use crate::meta::{Author, Meta};
-use crate::{Checkpoint, CheckpointError, GitError, Outcome, RevisionId, Stored};
+use crate::{Checkpoint, CheckpointError, GitError, Outcome, RevisionId, RevisionInfo, Stored};
 
 const MAIN: &str = "refs/heads/main";
 const SCHEMA: u32 = 1;
@@ -30,8 +30,10 @@ pub struct RevisionStore {
     write_lock: Mutex<()>,
 }
 
+const DOC_REFS: &str = "refs/sharecraft/docs/";
+
 fn doc_ref(doc: DocId) -> String {
-    format!("refs/sharecraft/docs/{}", doc.0)
+    format!("{DOC_REFS}{}", doc.0)
 }
 
 fn valid_file_name(name: &str) -> bool {
@@ -97,21 +99,98 @@ fn read_at(
     doc: DocId,
     oid: ObjectId,
 ) -> Result<Option<Stored>, CheckpointError> {
-    let Some(object) = repo.try_find_object(oid)? else {
-        return Ok(None);
-    };
-    let tree = object.try_into_commit().map_err(GitError::new)?.tree()?;
+    match find_commit(repo, oid)? {
+        Some(commit) => read_commit(doc, &commit),
+        None => Ok(None),
+    }
+}
+
+/// The commit `oid`, or `None` if the repository has no such object.
+fn find_commit(repo: &Repository, oid: ObjectId) -> Result<Option<gix::Commit<'_>>, GitError> {
+    match repo.try_find_object(oid)? {
+        Some(object) => Ok(Some(object.try_into_commit().map_err(GitError::new)?)),
+        None => Ok(None),
+    }
+}
+
+fn corrupt(commit: &gix::Commit<'_>, reason: impl Into<String>) -> CheckpointError {
+    CheckpointError::Corrupt {
+        revision: RevisionId::from_oid(commit.id),
+        reason: reason.into(),
+    }
+}
+
+/// The document as `commit` stores it; `None` if the commit holds nothing of it, `Corrupt` if
+/// it holds only part of it or metadata that cannot be read.
+fn read_commit(doc: DocId, commit: &gix::Commit<'_>) -> Result<Option<Stored>, CheckpointError> {
+    let tree = commit.tree()?;
     let dir = format!("docs/{}", doc.0);
     let content = read_blob(&tree, &format!("{dir}/content"))?;
     let meta = read_blob(&tree, &format!("{dir}/meta.json"))?;
     match (content, meta) {
-        (Some(bytes), Some(meta)) => Ok(Some(Stored {
-            revision: RevisionId::from_oid(oid),
-            bytes,
-            meta: serde_json::from_slice(&meta)?,
-        })),
-        _ => Ok(None),
+        (None, None) => Ok(None),
+        (Some(bytes), Some(meta)) => match serde_json::from_slice(&meta) {
+            Ok(meta) => Ok(Some(Stored {
+                revision: RevisionId::from_oid(commit.id),
+                bytes,
+                meta,
+            })),
+            Err(e) => Err(corrupt(
+                commit,
+                format!("its meta.json cannot be read: {e}"),
+            )),
+        },
+        (Some(_), None) => Err(corrupt(commit, "it has content but no meta.json")),
+        (None, Some(_)) => Err(corrupt(commit, "it has a meta.json but no content")),
     }
+}
+
+/// The id of the document's folder `dir` in `commit`'s tree, if the commit holds the document.
+fn folder_id(commit: &gix::Commit<'_>, dir: &str) -> Result<Option<ObjectId>, GitError> {
+    Ok(commit
+        .tree()?
+        .lookup_entry_by_path(dir)?
+        .map(|entry| entry.object_id()))
+}
+
+/// The person a signature or trailer names: the id is the part of the email before `@`.
+fn author_from(name: &[u8], email: &[u8]) -> Author {
+    let email = String::from_utf8_lossy(email);
+    let id = email.split('@').next().unwrap_or_default();
+    Author {
+        id: id.to_owned(),
+        name: String::from_utf8_lossy(name).into_owned(),
+    }
+}
+
+/// The author a `Co-authored-by: Name <email>` trailer line names, if it is one.
+fn co_author(line: &str) -> Option<Author> {
+    let rest = line.strip_prefix("Co-authored-by: ")?;
+    let (name, email) = rest.trim_end().rsplit_once(" <")?;
+    let email = email.strip_suffix('>')?;
+    Some(author_from(name.as_bytes(), email.as_bytes()))
+}
+
+/// Describes `commit` as a revision of `doc`; `None` if it holds nothing of the document.
+fn describe_commit(
+    doc: DocId,
+    commit: &gix::Commit<'_>,
+) -> Result<Option<RevisionInfo>, CheckpointError> {
+    let Some(stored) = read_commit(doc, commit)? else {
+        return Ok(None);
+    };
+    let signature = commit.author()?;
+    let mut authors = vec![author_from(signature.name, signature.email)];
+    let message = String::from_utf8_lossy(commit.message_raw()?);
+    authors.extend(message.lines().filter_map(co_author));
+    Ok(Some(RevisionInfo {
+        revision: stored.revision,
+        doc,
+        committed_at: commit.time()?.seconds,
+        authors,
+        file_name: stored.meta.file_name,
+        fields: stored.meta.fields,
+    }))
 }
 
 /// The commit `name` points at directly, or `None` if there is no such ref.
@@ -206,7 +285,8 @@ impl RevisionStore {
     /// Returns `None` when the document or revision does not exist.
     ///
     /// # Errors
-    /// Returns an error if Git fails or the stored metadata is malformed.
+    /// `Corrupt` if the revision holds the document's content without readable metadata,
+    /// otherwise the Git error.
     pub fn read(
         &self,
         doc: DocId,
@@ -221,6 +301,87 @@ impl RevisionStore {
             Some(oid) => read_at(&repo, doc, oid),
             None => Ok(None),
         }
+    }
+
+    /// Describes the revision `revision` of `doc`. `None` if there is no such commit or it does
+    /// not hold the document.
+    ///
+    /// # Errors
+    /// `Corrupt` if the commit holds the document's content without readable metadata,
+    /// otherwise the Git error.
+    pub fn describe(
+        &self,
+        doc: DocId,
+        revision: &RevisionId,
+    ) -> Result<Option<RevisionInfo>, CheckpointError> {
+        let repo = self.repo()?;
+        match find_commit(&repo, revision.to_oid()?)? {
+            Some(commit) => describe_commit(doc, &commit),
+            None => Ok(None),
+        }
+    }
+
+    /// Every revision of `doc`, oldest first: the commits reachable from the document's ref
+    /// whose `docs/<doc>` folder differs from their parent's.
+    ///
+    /// # Errors
+    /// `Corrupt` if any of them holds the document's content without readable metadata,
+    /// otherwise the Git error.
+    pub fn history(&self, doc: DocId) -> Result<Vec<RevisionInfo>, CheckpointError> {
+        let repo = self.repo()?;
+        let Some(head) = doc_head(&repo, doc)? else {
+            return Ok(Vec::new());
+        };
+        let dir = format!("docs/{}", doc.0);
+        let mut newest_first = Vec::new();
+        let mut commit = repo.find_commit(head)?;
+        let mut folder = folder_id(&commit, &dir)?;
+        // A folder is never removed once written, so the walk can stop at the commit that
+        // created it.
+        while folder.is_some() {
+            let parent = match commit.parent_ids().next() {
+                Some(id) => Some(repo.find_commit(id.detach())?),
+                None => None,
+            };
+            let parent_folder = match &parent {
+                Some(p) => folder_id(p, &dir)?,
+                None => None,
+            };
+            if folder != parent_folder
+                && let Some(info) = describe_commit(doc, &commit)?
+            {
+                newest_first.push(info);
+            }
+            let Some(parent) = parent else {
+                break;
+            };
+            commit = parent;
+            folder = parent_folder;
+        }
+        newest_first.reverse();
+        Ok(newest_first)
+    }
+
+    /// Every document with a revision, from the `refs/sharecraft/docs/<doc>` refs, in no
+    /// particular order. A ref whose name is not a document id is skipped.
+    ///
+    /// # Errors
+    /// Returns the Git error if the refs cannot be read.
+    pub fn documents(&self) -> Result<Vec<DocId>, GitError> {
+        let repo = self.repo()?;
+        let refs = repo.references()?;
+        let mut docs = Vec::new();
+        for reference in refs.prefixed(DOC_REFS)? {
+            let reference = reference?;
+            let name = reference.name().as_bstr().to_string();
+            if let Some(id) = name
+                .strip_prefix(DOC_REFS)
+                .and_then(|id| uuid::Uuid::parse_str(id).ok())
+            {
+                docs.push(DocId(id));
+            }
+        }
+        Ok(docs)
     }
 
     /// Stores the document state as one commit, unless it equals what is stored.

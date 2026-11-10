@@ -8,6 +8,7 @@
 use collab_core::ids::DocId;
 use revisions::{Author, Checkpoint, CheckpointError, Outcome, RevisionId, RevisionStore};
 use serde_json::{Map, Value};
+use std::str::FromStr;
 use uuid::Uuid;
 
 fn author(id: &str, name: &str) -> Author {
@@ -470,4 +471,188 @@ fn both_refs_point_at_the_new_commit_after_checkpoint() {
         .id();
     assert_eq!(main.to_string(), id.to_string());
     assert_eq!(docref.to_string(), id.to_string());
+}
+
+fn oid(id: &RevisionId) -> gix::ObjectId {
+    gix::ObjectId::from_hex(id.to_string().as_bytes()).unwrap()
+}
+
+#[test]
+fn history_lists_only_this_documents_revisions_oldest_first() {
+    let f = fixture();
+    let (da, db) = (doc(), doc());
+    let a = [author("u1", "Ann")];
+    let fields = Map::new();
+    let a1 = written(
+        f.store
+            .checkpoint(&cp(da, b"a1", None, &a, &fields))
+            .unwrap(),
+    );
+    let b1 = written(
+        f.store
+            .checkpoint(&cp(db, b"b1", None, &a, &fields))
+            .unwrap(),
+    );
+    let a2 = written(
+        f.store
+            .checkpoint(&cp(da, b"a2", Some(&a1), &a, &fields))
+            .unwrap(),
+    );
+    let b2 = written(
+        f.store
+            .checkpoint(&cp(db, b"b2", Some(&b1), &a, &fields))
+            .unwrap(),
+    );
+    let a3 = written(
+        f.store
+            .checkpoint(&cp(da, b"a3", Some(&a2), &a, &fields))
+            .unwrap(),
+    );
+
+    let history = f.store.history(da).unwrap();
+    let ids: Vec<_> = history.iter().map(|r| r.revision.clone()).collect();
+    assert_eq!(ids, vec![a1, a2, a3]);
+    assert!(
+        history
+            .iter()
+            .all(|r| r.doc == da && r.file_name == "notes.txt")
+    );
+    let ids: Vec<_> = f
+        .store
+        .history(db)
+        .unwrap()
+        .into_iter()
+        .map(|r| r.revision)
+        .collect();
+    assert_eq!(ids, vec![b1, b2]);
+    assert!(f.store.history(doc()).unwrap().is_empty());
+}
+
+#[test]
+fn describe_reports_all_credited_authors() {
+    let f = fixture();
+    let d = doc();
+    let a = [author("u1", "Ann Lee"), author("u2", "O'Brien, Pat")];
+    let mut fields = Map::new();
+    fields.insert("title".into(), Value::String("Plan".into()));
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let id = written(f.store.checkpoint(&cp(d, b"x", None, &a, &fields)).unwrap());
+    let info = f.store.describe(d, &id).unwrap().unwrap();
+    assert_eq!(info.revision, id);
+    assert_eq!(info.doc, d);
+    assert_eq!(info.authors, a.to_vec());
+    assert_eq!(info.file_name, "notes.txt");
+    assert_eq!(info.fields, fields);
+    let committed = u64::try_from(info.committed_at).unwrap();
+    assert!(
+        committed + 1 >= before && committed <= before + 60,
+        "{committed}"
+    );
+    // A revision of another document, or one that does not exist, describes nothing.
+    assert_eq!(f.store.describe(doc(), &id).unwrap(), None);
+    let bogus: RevisionId = "0123456789abcdef0123456789abcdef01234567".parse().unwrap();
+    assert_eq!(f.store.describe(d, &bogus).unwrap(), None);
+}
+
+#[test]
+fn documents_lists_every_saved_document() {
+    let f = fixture();
+    assert!(f.store.documents().unwrap().is_empty());
+    let a = [author("u1", "Ann")];
+    let fields = Map::new();
+    let mut docs: Vec<DocId> = (0..3).map(|_| doc()).collect();
+    for &d in &docs {
+        written(f.store.checkpoint(&cp(d, b"x", None, &a, &fields)).unwrap());
+    }
+    let mut listed = f.store.documents().unwrap();
+    listed.sort();
+    docs.sort();
+    assert_eq!(listed, docs);
+}
+
+/// Replaces `doc`'s folder at its head with one holding `content` and, if given, `meta`, as a
+/// new commit both refs point at.
+fn tamper(f: &Fixture, d: DocId, meta: Option<&[u8]>) -> RevisionId {
+    let repo = gix::open(&f.path).unwrap();
+    let head = f.store.head(d).unwrap().unwrap();
+    let tip = repo.find_commit(oid(&head)).unwrap();
+    let dir = format!("docs/{}", d.0);
+    let mut editor = repo.edit_tree(tip.tree_id().unwrap()).unwrap();
+    editor.remove(dir.as_str()).unwrap();
+    let content = repo.write_blob(b"content").unwrap().detach();
+    editor
+        .upsert(
+            format!("{dir}/content"),
+            gix::object::tree::EntryKind::Blob,
+            content,
+        )
+        .unwrap();
+    if let Some(meta) = meta {
+        let blob = repo.write_blob(meta).unwrap().detach();
+        editor
+            .upsert(
+                format!("{dir}/meta.json"),
+                gix::object::tree::EntryKind::Blob,
+                blob,
+            )
+            .unwrap();
+    }
+    let tree = editor.write().unwrap().detach();
+    let sig = gix::actor::Signature {
+        name: "Ann".into(),
+        email: "u1@sharecraft.invalid".into(),
+        time: gix::date::Time::now_utc(),
+    };
+    let commit = gix::objs::Commit {
+        tree,
+        parents: [tip.id].into_iter().collect(),
+        author: sig.clone(),
+        committer: sig,
+        encoding: None,
+        message: "Checkpoint notes.txt\n".into(),
+        extra_headers: Vec::new(),
+    };
+    let new = repo.write_object(&commit).unwrap().detach();
+    for name in [
+        "refs/heads/main".to_owned(),
+        format!("refs/sharecraft/docs/{}", d.0),
+    ] {
+        repo.reference(
+            name.as_str(),
+            new,
+            gix::refs::transaction::PreviousValue::Any,
+            "test",
+        )
+        .unwrap();
+    }
+    RevisionId::from_str(&new.to_string()).unwrap()
+}
+
+fn assert_corrupt<T: std::fmt::Debug>(result: Result<T, CheckpointError>, at: &RevisionId) {
+    match result {
+        Err(CheckpointError::Corrupt { revision, reason }) => {
+            assert_eq!(&revision, at);
+            assert!(!reason.is_empty());
+        }
+        other => panic!("expected Corrupt at {at}, got {other:?}"),
+    }
+}
+
+#[test]
+fn content_without_metadata_is_corrupt() {
+    for meta in [None, Some(&b"{ not json"[..])] {
+        let f = fixture();
+        let d = doc();
+        let a = [author("u1", "Ann")];
+        let fields = Map::new();
+        written(f.store.checkpoint(&cp(d, b"x", None, &a, &fields)).unwrap());
+        let bad = tamper(&f, d, meta);
+        assert_corrupt(f.store.read(d, None), &bad);
+        assert_corrupt(f.store.read(d, Some(&bad)), &bad);
+        assert_corrupt(f.store.describe(d, &bad), &bad);
+        assert_corrupt(f.store.history(d), &bad);
+    }
 }
