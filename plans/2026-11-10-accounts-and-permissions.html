@@ -1,0 +1,527 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ShareCraft — Accounts and Permissions Implementation Plan (Stage 1, part 2)</title>
+<style>
+:root{color-scheme:light dark;--ink:light-dark(#172f38,#e4ecef);--muted:light-dark(#536b72,#a9b9bf);--line:light-dark(#d7e2e3,#36454b);--paper:light-dark(#fff,#1d272b);--wash:light-dark(#f2f6f5,#141b1e);--accent:light-dark(#3156c9,#9db4ff);font:15px/1.6 Segoe UI,system-ui,sans-serif;color:var(--ink);background:var(--wash)}
+*{box-sizing:border-box}body{margin:0;padding:28px 18px 80px}main{max-width:940px;margin:auto}
+h1{font-size:1.9rem;letter-spacing:-.03em;line-height:1.2;margin:0 0 14px}h2{font-size:1.3rem;margin:38px 0 12px;padding-top:18px;border-top:1px solid var(--line)}h3{font-size:1.08rem;margin:30px 0 8px}h4{font-size:.95rem;margin:16px 0 6px}
+p{margin:0 0 12px}ul,ol{margin:0 0 12px;padding-left:22px}li{margin-bottom:6px}a{color:var(--accent)}
+code{font-family:Consolas,Menlo,monospace;font-size:.88em;background:light-dark(#e9efee,#263238);padding:1px 5px;border-radius:3px;overflow-wrap:anywhere}
+pre{background:var(--paper);border:1px solid var(--line);border-radius:7px;padding:12px 14px;overflow-x:auto;font:13px/1.5 Consolas,Menlo,monospace;margin:0 0 12px}pre code{background:none;padding:0;font-size:inherit}
+.note{border-left:4px solid var(--accent);background:var(--paper);padding:12px 16px;margin:0 0 14px}.note p:last-child{margin:0}
+.task{background:var(--paper);border:1px solid var(--line);border-radius:9px;padding:6px 20px 14px;margin:18px 0}
+ol.steps{list-style:none;padding-left:0}ol.steps>li{padding-left:28px;position:relative;margin-bottom:10px}ol.steps>li::before{content:"☐";position:absolute;left:2px;color:var(--muted)}
+table{border-collapse:collapse;width:100%;font-size:.9rem;background:var(--paper);margin-bottom:14px}th,td{border:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top}th{background:light-dark(#e8efed,#263238)}
+.small{font-size:.88rem;color:var(--muted)}
+</style>
+</head>
+<body><main>
+<h1>Accounts and Permissions Implementation Plan</h1>
+<p class="small">ShareCraft · Stage 1, part 2 of 3 · Written 10 November 2026</p>
+
+<div class="note"><p><strong>For agentic workers:</strong> REQUIRED SUB-SKILL: use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task by task. Steps are checkbox items. Do not tick them in this file; the execution ledger is the record.</p></div>
+
+<p><strong>Goal:</strong> people sign in with their own account, a document can be opened only by the people it is shared with, someone whose access is removed is put out of a live session at once, and every saved revision and every access change is recorded in PostgreSQL.</p>
+<p><strong>Architecture:</strong> a new <code>records</code> crate owns PostgreSQL: accounts, sign-in sessions, documents, access grants, the revision index and the event log. The server signs people in with a cookie, checks the cookie and the person's role when a WebSocket opens, and keeps each connection's account and role in the document's room. Access changes are written to PostgreSQL first and then sent to the open room as a command, so the room removes or demotes the person without anyone reconnecting. Git stays the record of content; the PostgreSQL revision index is derived from Git and can be rebuilt from it.</p>
+<p><strong>Tech stack (added):</strong> <code>sqlx</code> (PostgreSQL, tokio runtime, no TLS feature, no compile-time query macros), <code>argon2</code>, <code>sha2</code>, <code>getrandom</code>, <code>time</code>, <code>rpassword</code>, <code>dotenvy</code>, <code>reqwest</code> (tests only, default features off). Add each with <code>cargo add</code> at its current stable release with the fewest features that work. PostgreSQL 18 is installed locally on port 5433.</p>
+<p><strong>Spec:</strong> <a href="../scope.html">scope.html</a> (D09, D14–D18, SC-11, SC-21, A04, A07, A13) and <a href="../sequencing.html">sequencing.html</a> (Stage 1, spine rules S2, S4, S5, S7). Read both, and <a href="../BUILDING.html">BUILDING.html</a>, before starting.</p>
+
+<h2>What this plan does not cover</h2>
+<table><tr><th>Left out</th><th>Why, and where it goes</th></tr>
+<tr><td>Reaching the server from another machine</td><td>Needs TLS, a reverse-proxy story and rate limiting. The server stays on loopback addresses; a later deployment plan lifts that.</td></tr>
+<tr><td>Single sign-on, MFA, guests, groups, password reset and change</td><td>SC-11 in full is Stage 2. This plan builds ShareCraft's own accounts with a password, created by an administrator.</td></tr>
+<tr><td>Sites, libraries, folders, inheritance</td><td>Stage 2. Access here is granted per document, to one person at a time.</td></tr>
+<tr><td>Renaming a document, editing metadata fields</td><td>Stage 2 (lists and metadata). The name is set when the document is created.</td></tr>
+<tr><td>The four editor forks</td><td>Plan 3.</td></tr></table>
+
+<h2>Global constraints</h2>
+<ul>
+<li>Rust only for server code (D14). Page scripts call the API and wire the WebAssembly client; they hold no merging or permission logic.</li>
+<li>Licence <code>MIT OR Apache-2.0</code> on every crate (D17). No copyleft dependencies (GPL, LGPL, AGPL, MPL). Task 1 adds a check that enforces this; if a dependency this plan names fails it, stop and report instead of adding an exception.</li>
+<li>One organization per installation (D18): no organization or tenant identifiers in tables, types, paths or messages.</li>
+<li>Secrets: never print, log, commit or put in a report the contents of <code>.env</code>, a database URL, a password, a password hash or a session token. Refer to them by variable name. Do not edit <code>.env</code>. Types holding them must not show them through <code>Debug</code> or <code>Display</code>.</li>
+<li>SQL is written with bind parameters only. The one exception is the generated schema name in the test helper, which is hexadecimal it produced itself.</li>
+<li>Authorization at every boundary (SC-11): every <code>/api</code> route and the WebSocket route identify the caller through the one <code>Signed</code> extractor, and decide access through <code>Db::role</code>. No handler reads the cookie or the grants table on its own.</li>
+<li>A person with no access to a document gets the same answer as for a document that does not exist: <code>404</code>.</li>
+<li>Events never contain document text, passwords or tokens.</li>
+<li>Git stays the only store of content and <code>RevisionStore::checkpoint</code> the only code that writes it (S3). PostgreSQL holds an index of revisions, never the content.</li>
+<li>The server keeps listening on loopback addresses only, and the <code>Host</code> and <code>Origin</code> checks stay. Do not add a way to bind elsewhere.</li>
+<li><code>collab-core</code>, <code>collab-text</code>, <code>protocol</code> and <code>web-client</code> must still build for <code>wasm32-unknown-unknown</code> and must not depend on <code>records</code>, <code>sqlx</code> or <code>tokio</code>.</li>
+<li>Workspace lints apply to all non-test code: no <code>unsafe</code>, <code>unwrap</code>, <code>expect</code>, <code>panic!</code> or indexing that can panic. Input from a client or a database row must never stop the server.</li>
+<li>Tests use the real PostgreSQL named by <code>TEST_DATABASE_URL</code>, each in its own schema. A test that needs the database and finds the variable unset fails with a message saying so; it is never skipped.</li>
+<li>Work on branch <code>stage-1-accounts</code>. Run <code>cargo xtask check</code> before each commit. Commit after each task with the message given. Do not push.</li>
+</ul>
+
+<h2>Review focus</h2>
+<p>Conditions the scope implies that are most likely to hurt a real person. Each has a test in the task named.</p>
+<ol>
+<li><strong>Access removed while the person is connected or connecting.</strong> They must be out within a second, their open tab must stop showing the text, a change they send afterwards must not be committed, and a join that was already under way must not slip through. The same person in a second tab or a second sign-in is handled too. Task 7 (<code>revoked_editor_is_removed_within_one_second</code>, <code>access_ended_during_join_is_caught</code>, <code>sign_out_closes_that_sessions_sockets_only</code>).</li>
+<li><strong>Guessing passwords and cross-site requests.</strong> A wrong password and an unknown email get the same answer; repeated failures are refused; another website open in the same browser cannot sign out, share or open a socket. Task 4 (<code>wrong_password_and_unknown_email_look_the_same</code>, <code>sixth_failed_attempt_is_refused</code>, <code>cross_origin_post_is_refused</code>).</li>
+<li><strong>Git and PostgreSQL disagree.</strong> The server stops between writing a commit and recording it, or the record cannot be written. The save must still count as saved and the index must catch up without duplicates. Task 8 (<code>index_failure_does_not_fail_the_save</code>, <code>reconcile_at_start_reads_revisions_written_while_stopped</code>, <code>rebuild_reproduces_live_records</code>).</li>
+<li><strong>Awkward names and emails.</strong> A display name with <code>&lt;</code>, control characters or only punctuation, a 300-character email, two emails differing only in case. None may break saving, credit the wrong person or run as markup in a page. Task 2 (<code>hostile_names_and_emails_are_refused</code>, <code>email_is_unique_ignoring_case</code>) and Task 10 (names are written with <code>textContent</code>).</li>
+<li><strong>Someone else changed the document underneath a session.</strong> A checkpoint refused as stale must tell the people in the room once, stop accepting changes and never overwrite the other revision or retry forever. Task 8 (<code>stale_checkpoint_stops_the_room_with_a_conflict</code>).</li>
+</ol>
+
+<h2>File structure</h2>
+<pre><code>crates/records/                 PostgreSQL: the only crate that runs SQL
+  migrations/0001_initial.sql
+  src/lib.rs  src/db.rs  src/accounts.rs  src/documents.rs  src/revisions.rs  src/events.rs
+  src/test_support.rs           behind feature "test-support"
+  tests/accounts.rs  tests/documents.rs  tests/revisions.rs
+crates/collab-core/src/ids.rs   + UserId, SessionId
+crates/protocol/src/lib.rs      + can_edit, saved_through, Access, Removed, SaveState::Conflict
+crates/revisions/src/store.rs   + describe, history, documents
+crates/server/src/
+  api/mod.rs  api/session.rs  api/docs.rs  api/admin.rs     JSON routes
+  auth.rs                       Signed extractor, cookie, origin check, sign-in throttle
+  projection.rs                 Git revisions into PostgreSQL; reconcile and rebuild
+  events.rs                     event sink for rooms
+  cli.rs                        add-user, rebuild
+  room.rs  ws.rs  checkpoint.rs  config.rs  lib.rs  main.rs  (changed)
+crates/server/tests/            accounts.rs  documents.rs  access.rs  revocation.rs  projection.rs  events.rs
+                                common/mod.rs  two_sessions.rs  browser_client.rs  (changed)
+web/                            signin.html  index.html (home)  doc.html (editor)  people.html
+                                common.js  signin.js  home.js  doc.js (was app.js)  people.js  style.css
+xtask/src/main.rs               + .env loading, test subcommand, licence check</code></pre>
+
+<h2>Tasks</h2>
+
+<div class="task"><h3>Task 1: The records crate and database plumbing</h3>
+<p><strong>Files:</strong> create <code>crates/records/{Cargo.toml,src/lib.rs,src/db.rs,src/test_support.rs,migrations/0001_initial.sql,tests/db.rs}</code>; modify <code>xtask/src/main.rs</code>, <code>xtask/Cargo.toml</code>.</p>
+<p><strong>Produces:</strong></p>
+<pre><code>// records
+pub struct Db { /* PgPool */ }                         // Clone; Debug prints no URL
+pub struct DbError(String);                            // thiserror, text only, like revisions::GitError
+impl Db {
+    pub async fn connect(url: &amp;str) -> Result&lt;Db, DbError>;   // at most 10 connections, 5 s acquire timeout
+    pub async fn migrate(&amp;self) -> Result&lt;(), DbError>;       // sqlx::migrate!("./migrations")
+}
+// records::test_support (feature "test-support"; dev use only)
+pub struct TestDb { pub db: Db, /* schema name, base url */ }
+impl TestDb {
+    pub async fn create() -> TestDb;   // TEST_DATABASE_URL; schema t_&lt;unix seconds>_&lt;16 hex>; search_path set; migrated
+    pub fn url(&amp;self) -> String;       // a URL selecting the same schema, for a second pool
+    pub async fn connect_again(&amp;self) -> Db;
+}
+
+// xtask
+cargo xtask check                      // now loads .env first and runs the licence check
+cargo xtask test [cargo test args]     // loads .env, then cargo test
+fn licence_allowed(expr: &amp;str) -> bool // true if some OR-alternative names no GPL, LGPL, AGPL, MPL, EUPL, CDDL or SSPL licence</code></pre>
+<p><code>TestDb::create</code> also drops schemas named <code>t_&lt;seconds>_…</code> more than one hour old, so runs that crashed leave nothing behind. The database account may create schemas but not databases.</p>
+<p><strong>Migration <code>0001_initial.sql</code></strong> (the whole schema for this plan):</p>
+<pre><code>create table users (
+  id uuid primary key,
+  email text not null,
+  name text not null,
+  password_hash text not null,
+  is_admin boolean not null default false,
+  disabled_at timestamptz,
+  created_at timestamptz not null default now()
+);
+create unique index users_email on users (lower(email));
+
+create table sessions (
+  id uuid primary key,
+  token_hash bytea not null unique,
+  user_id uuid not null references users(id),
+  created_at timestamptz not null default now(),
+  expires_at timestamptz not null,
+  ended_at timestamptz
+);
+
+create table documents (
+  id uuid primary key,
+  name text not null,
+  created_by uuid references users(id),
+  created_at timestamptz not null default now(),
+  revision text,                       -- current Git revision; null until first saved
+  revised_at timestamptz,
+  fields jsonb not null default '{}'
+);
+
+create table document_access (
+  document_id uuid not null references documents(id),
+  user_id uuid not null references users(id),
+  role text not null check (role in ('viewer','editor','owner')),
+  granted_by uuid references users(id),
+  granted_at timestamptz not null default now(),
+  primary key (document_id, user_id)
+);
+create index document_access_user on document_access (user_id);
+
+create table revisions (
+  revision text primary key,           -- Git commit id
+  document_id uuid not null references documents(id),
+  position integer not null,           -- 1 for the document's first revision
+  parent text,                         -- the document's previous revision
+  committed_at timestamptz not null,
+  authors jsonb not null,              -- [{"id": "...", "name": "..."}], commit author first
+  unique (document_id, position)
+);
+
+create table events (
+  id bigint generated always as identity primary key,
+  at timestamptz not null default now(),
+  kind text not null,
+  actor uuid,                          -- who did it; null for the server itself
+  subject uuid,                        -- the account acted on, if any
+  document_id uuid,
+  detail jsonb not null default '{}'
+);
+create index events_document on events (document_id, id);</code></pre>
+<ol class="steps">
+<li>Write failing tests. In <code>crates/records/tests/db.rs</code>: <code>migrated_schema_has_every_table</code> (the six table names are present in the test schema), <code>two_test_databases_do_not_see_each_other</code> (a row inserted in one is absent from the other), <code>debug_output_hides_the_url</code>. In xtask: <code>licence_expressions_are_judged</code> with <code>"MIT OR Apache-2.0"</code> allowed, <code>"MPL-2.0"</code> refused, <code>"MPL-2.0 OR MIT"</code> allowed, <code>"(MIT OR Apache-2.0) AND Unicode-3.0"</code> allowed, <code>"MIT AND LGPL-2.1-or-later"</code> refused, <code>""</code> refused.</li>
+<li>Run <code>cargo xtask test -p records</code>. Expected: does not compile.</li>
+<li>Implement. The licence check reads <code>cargo metadata --format-version 1</code> and fails naming each non-workspace package whose licence is refused.</li>
+<li>Run <code>cargo xtask check</code>. Expected: passes, including the licence check over the new dependencies.</li>
+<li>Commit: <code>feat(records): PostgreSQL schema, test databases and a licence check</code>.</li>
+</ol></div>
+
+<div class="task"><h3>Task 2: Accounts and sign-in sessions</h3>
+<p><strong>Files:</strong> modify <code>crates/collab-core/src/ids.rs</code>; create <code>crates/records/src/{accounts.rs,events.rs}</code>, <code>crates/records/tests/accounts.rs</code>.</p>
+<p><strong>Produces:</strong></p>
+<pre><code>// collab_core::ids — same derives and plain-string serde as DocId
+pub struct UserId(pub Uuid);
+pub struct SessionId(pub Uuid);
+
+// records
+pub struct User { pub id: UserId, pub email: String, pub name: String, pub is_admin: bool, pub disabled: bool }
+pub struct NewUser&lt;'a> { pub email: &amp;'a str, pub name: &amp;'a str, pub password: &amp;'a str, pub is_admin: bool }
+pub struct SessionToken(/* 32 random bytes */);        // as_cookie_value() -> 64 hex chars; parse(&amp;str); Debug redacted
+pub struct Session { pub id: SessionId, pub user: User, pub expires_at: OffsetDateTime }
+pub const SESSION_LIFETIME: Duration = 30 days;
+pub enum AccountError { EmailTaken, InvalidEmail, InvalidName, WeakPassword, NotFound, Forbidden, LastAdmin, Db(DbError) }
+pub enum SignInError { Invalid, Db(DbError) }          // Invalid covers unknown email, wrong password and disabled account
+
+impl Db {
+    // actor None is the command line; otherwise the actor must be an enabled administrator
+    pub async fn create_user(&amp;self, actor: Option&lt;UserId>, new: NewUser&lt;'_>) -> Result&lt;User, AccountError>;
+    pub async fn user(&amp;self, id: UserId) -> Result&lt;Option&lt;User>, DbError>;
+    pub async fn user_by_email(&amp;self, email: &amp;str) -> Result&lt;Option&lt;User>, DbError>;
+    pub async fn users(&amp;self) -> Result&lt;Vec&lt;User>, DbError>;                      // by email
+    pub async fn set_disabled(&amp;self, actor: UserId, id: UserId, disabled: bool) -> Result&lt;(), AccountError>;
+    pub async fn sign_in(&amp;self, email: &amp;str, password: &amp;str) -> Result&lt;(Session, SessionToken), SignInError>;
+    pub async fn session(&amp;self, token: &amp;SessionToken) -> Result&lt;Option&lt;Session>, DbError>;
+    pub async fn end_session(&amp;self, id: SessionId) -> Result&lt;(), DbError>;
+    pub async fn events_about(&amp;self, subject: UserId) -> Result&lt;Vec&lt;Event>, DbError>; // oldest first
+}
+pub struct Event { pub id: i64, pub at: OffsetDateTime, pub kind: String, pub actor: Option&lt;UserId>,
+                   pub subject: Option&lt;UserId>, pub document: Option&lt;DocId>, pub detail: serde_json::Value }</code></pre>
+<p><strong>Rules:</strong></p>
+<ul>
+<li>Email: trimmed; one <code>@</code> with text on both sides; no whitespace or control characters; at most 254 characters; unique ignoring case.</li>
+<li>Name: trimmed; 1 to 60 characters; no control characters, <code>&lt;</code> or <code>></code>; at least one letter or digit.</li>
+<li>Password: 10 to 256 characters. Stored as an Argon2id hash in PHC string form with the crate's default parameters. Hashing and verifying run in <code>spawn_blocking</code>.</li>
+<li><code>sign_in</code> verifies against a fixed dummy hash when the email is unknown, so both cases take the same work.</li>
+<li>A session row stores the SHA-256 of the token, never the token. <code>session</code> returns <code>None</code> for an unknown, ended or expired session and for a disabled account.</li>
+<li><code>set_disabled(true)</code> ends all of that account's sessions in the same transaction and refuses to disable the last enabled administrator (<code>LastAdmin</code>).</li>
+<li>Each change writes its event in the same transaction: <code>user.created</code>, <code>user.disabled</code>, <code>user.enabled</code>, <code>session.started</code>, <code>session.ended</code>, and <code>sign_in.failed</code> (only for an email that belongs to an account, with that account as subject).</li>
+</ul>
+<ol class="steps">
+<li>Write failing tests in <code>tests/accounts.rs</code>: <code>created_user_can_sign_in</code>; <code>email_is_unique_ignoring_case</code> (<code>Ann@x.test</code> then <code>ann@X.test</code> is <code>EmailTaken</code>); <code>hostile_names_and_emails_are_refused</code> (names <code>""</code>, <code>"&lt;b>"</code>, <code>"a\u{0}b"</code>, <code>";:,"</code>, 61 characters; emails <code>"a"</code>, <code>"a@"</code>, <code>"a b@x.test"</code>, 300 characters); <code>short_password_is_weak</code>; <code>wrong_password_unknown_email_and_disabled_account_are_all_invalid</code>; <code>stored_hash_is_argon2id_and_token_is_not_stored</code> (the hash column starts <code>$argon2id$</code>; no column of the session row equals the cookie value); <code>ended_and_expired_sessions_are_not_found</code>; <code>disabling_ends_sessions_and_blocks_sign_in</code>; <code>last_admin_cannot_be_disabled</code>; <code>non_admin_cannot_create_or_disable</code> (<code>Forbidden</code>); <code>account_changes_are_recorded</code> (the kinds above, in order, with actor and subject).</li>
+<li>Run <code>cargo xtask test -p records</code>. Expected: does not compile.</li>
+<li>Implement.</li>
+<li>Run <code>cargo xtask check</code>. Expected: passes.</li>
+<li>Commit: <code>feat(records): accounts, password sign-in and sessions</code>.</li>
+</ol></div>
+
+<div class="task"><h3>Task 3: Documents and access grants</h3>
+<p><strong>Files:</strong> create <code>crates/records/src/documents.rs</code>, <code>crates/records/tests/documents.rs</code>.</p>
+<p><strong>Produces:</strong></p>
+<pre><code>pub enum Role { Viewer, Editor, Owner }               // ordered; serde and SQL text "viewer" | "editor" | "owner"
+impl Role { pub fn can_edit(self) -> bool; pub fn can_manage(self) -> bool }   // Editor and Owner edit; Owner manages
+pub struct Document { pub id: DocId, pub name: String, pub created_by: Option&lt;UserId>,
+                      pub revision: Option&lt;String>, pub revised_at: Option&lt;OffsetDateTime> }
+pub struct Grant { pub user: User, pub role: Role }
+pub enum AccessError { NotFound, NoSuchUser, Forbidden, LastOwner, InvalidName, Exists, Db(DbError) }
+
+impl Db {
+    pub async fn create_document(&amp;self, actor: UserId, id: DocId, name: &amp;str) -> Result&lt;Document, AccessError>;
+    pub async fn document(&amp;self, id: DocId) -> Result&lt;Option&lt;Document>, DbError>;
+    pub async fn role(&amp;self, user: UserId, doc: DocId) -> Result&lt;Option&lt;Role>, DbError>;
+    pub async fn documents_for(&amp;self, user: UserId) -> Result&lt;Vec&lt;(Document, Role)>, DbError>;  // newest first
+    pub async fn grants(&amp;self, actor: UserId, doc: DocId) -> Result&lt;Vec&lt;Grant>, AccessError>;
+    // role None removes the grant. Returns the person's role before and after, as Db::role would report it.
+    pub async fn set_access(&amp;self, actor: UserId, doc: DocId, user: UserId, role: Option&lt;Role>)
+        -> Result&lt;(Option&lt;Role>, Option&lt;Role>), AccessError>;
+    pub async fn events_for(&amp;self, doc: DocId) -> Result&lt;Vec&lt;Event>, DbError>;   // oldest first
+}</code></pre>
+<p><strong>Rules:</strong></p>
+<ul>
+<li><code>role</code> is the single access decision: <code>None</code> for a disabled or unknown account or a document that does not exist; <code>Owner</code> for an enabled administrator on every document; otherwise the grant, if any.</li>
+<li>The creator is granted <code>Owner</code> in the same transaction. Name: trimmed, 1 to 120 characters, no <code>/</code>, <code>\</code> or control characters.</li>
+<li><code>grants</code> and <code>set_access</code> need the actor's role to be <code>Owner</code>: <code>NotFound</code> if the actor has no role on the document, <code>Forbidden</code> if it is lower.</li>
+<li><code>set_access</code> locks the document's grants, and refuses a change that would leave no <code>Owner</code> grant (<code>LastOwner</code>). Setting the role a person already has changes nothing and records nothing.</li>
+<li>Events in the same transaction: <code>document.created</code>, <code>access.granted</code>, <code>access.changed</code>, <code>access.revoked</code>, with actor, subject, document and <code>{"role": …}</code> or <code>{"from": …, "to": …}</code>.</li>
+</ul>
+<ol class="steps">
+<li>Write failing tests: <code>creator_is_owner</code>; <code>stranger_has_no_role_and_does_not_list_the_document</code>; <code>grant_change_and_revoke_are_reflected_by_role</code>; <code>admin_is_owner_everywhere_and_lists_everything</code>; <code>disabled_account_has_no_role</code>; <code>editor_cannot_manage</code> (<code>Forbidden</code>); <code>stranger_cannot_tell_the_document_exists</code> (<code>NotFound</code> from <code>grants</code> and <code>set_access</code>); <code>last_owner_cannot_be_removed_or_demoted</code>; <code>two_removals_racing_leave_one_owner</code> (two owners remove each other concurrently; exactly one call is <code>LastOwner</code>); <code>same_role_again_records_nothing</code>; <code>bad_document_names_are_refused</code>; <code>access_changes_are_recorded</code>.</li>
+<li>Run <code>cargo xtask test -p records</code>. Expected: does not compile.</li>
+<li>Implement.</li>
+<li>Run <code>cargo xtask check</code>. Expected: passes.</li>
+<li>Commit: <code>feat(records): documents and per-document access grants</code>.</li>
+</ol></div>
+
+<div class="task"><h3>Task 4: Signing in over HTTP</h3>
+<p><strong>Files:</strong> create <code>crates/server/src/{auth.rs,cli.rs,api/mod.rs,api/session.rs}</code>, <code>crates/server/tests/accounts.rs</code>; modify <code>crates/server/src/{lib.rs,config.rs,main.rs,ws.rs}</code>, <code>crates/server/tests/common/mod.rs</code>, <code>crates/server/Cargo.toml</code>.</p>
+<p><strong>Consumes:</strong> <code>Db</code>, <code>Session</code>, <code>SessionToken</code>, <code>TestDb</code>. <strong>Produces:</strong></p>
+<pre><code>// config: DATABASE_URL is required
+pub struct Config { /* existing fields */ pub database_url: DatabaseUrl }      // DatabaseUrl: Debug prints "[hidden]"
+ConfigError::NoDatabase                                                          // "DATABASE_URL is not set"
+impl AppState { pub fn new(config: Config, checkpointer: Arc&lt;dyn Checkpointer>, db: Db) -> Self; pub fn db(&amp;self) -> &amp;Db }
+// serve() connects to config.database_url and runs the migrations before listening
+
+// auth.rs
+pub(crate) struct Signed { pub session: Session }      // axum extractor: 401 {"error":"not_signed_in"} without a valid cookie
+pub(crate) fn same_origin(headers: &amp;HeaderMap) -> bool // loopback Host; Origin, if present, is http://&lt;Host>, compared ignoring case
+pub(crate) const COOKIE: &amp;str = "sharecraft_session";
+
+POST   /api/session   {"email","password"} -> 204, Set-Cookie: sharecraft_session=&lt;token>; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000
+                      401 {"error":"invalid_credentials"}   429 {"error":"too_many_attempts"}
+DELETE /api/session   -> 204, cookie cleared, session ended
+GET    /api/me        -> {"id","email","name","is_admin"}
+
+sharecraft-server add-user --email &lt;email> --name &lt;name> [--admin]   // password read without echo, or from stdin when piped
+// tests/common
+pub struct TestServer { pub addr, pub data_dir, pub db: TestDb }
+pub struct TestUser { pub id: UserId, pub email: String, pub cookie: String }    // cookie is "sharecraft_session=&lt;token>"
+impl TestServer { pub async fn user(&amp;self, name: &amp;str) -> TestUser;             // account &lt;name>@test.invalid, created once, signed in
+                  pub async fn admin(&amp;self, name: &amp;str) -> TestUser;
+                  pub fn http(&amp;self, as_user: Option&lt;&amp;TestUser>) -> reqwest::Client }  // sends Origin and the cookie</code></pre>
+<p><strong>Rules:</strong></p>
+<ul>
+<li>Every <code>/api</code> request must pass <code>same_origin</code>; a request that is not <code>GET</code> must also carry an <code>Origin</code> header. Otherwise <code>403 {"error":"forbidden"}</code>. The WebSocket route uses the same function, replacing <code>is_local_request</code>.</li>
+<li>Sign-in throttle, in memory: after 5 failures for one email (ignoring case) within 15 minutes, further attempts for it answer <code>429</code> without checking the password, until the oldest of the 5 is 15 minutes old. A success clears the count. The table holds at most 10,000 emails; expired entries are dropped first.</li>
+<li>Errors are JSON <code>{"error": "&lt;code>"}</code>. A database failure answers <code>503 {"error":"unavailable"}</code> and logs the cause to standard error without the URL.</li>
+<li>Bodies must be <code>application/json</code> and at most 16 KiB.</li>
+<li><code>main.rs</code> loads <code>.env</code> if present, dispatches <code>add-user</code> to <code>cli.rs</code>, and its start-up warning becomes <code>WARNING: development mode, local connections only</code>.</li>
+<li>Until Task 6 the WebSocket route still admits anyone on the local machine. Existing tests keep passing with only the harness changed.</li>
+</ul>
+<ol class="steps">
+<li>Write failing tests in <code>tests/accounts.rs</code>: <code>sign_in_sets_an_http_only_cookie_and_me_answers</code>; <code>me_without_cookie_is_401</code>; <code>wrong_password_and_unknown_email_look_the_same</code> (same status and body); <code>sign_out_ends_the_session</code> (the old cookie then gets 401); <code>disabled_account_loses_its_session</code>; <code>expired_session_is_401</code> (the test moves <code>expires_at</code> into the past); <code>sixth_failed_attempt_is_refused</code> (429 even with the right password); <code>success_clears_failed_attempts</code>; <code>post_without_origin_is_refused</code>; <code>cross_origin_post_is_refused</code> (<code>Origin: http://evil.example</code>, valid cookie, 403, session still valid); <code>origin_host_case_is_ignored</code>; <code>oversized_or_non_json_body_is_refused</code>; <code>missing_database_url_is_a_config_error</code>; <code>config_debug_hides_the_database_url</code>. Unit test in <code>cli.rs</code>: <code>add_user_arguments_are_parsed</code>.</li>
+<li>Run <code>cargo xtask test -p server</code>. Expected: does not compile.</li>
+<li>Implement, and move the test harness to <code>TestDb</code>: <code>spawn_server</code>, <code>spawn_server_config</code> and <code>StoppableServer::start</code> take or create a <code>TestDb</code> and pass its URL in the config.</li>
+<li>Run <code>cargo xtask check</code>. Expected: passes; all earlier tests still pass.</li>
+<li>Commit: <code>feat(server): sign in and out with a session cookie</code>.</li>
+</ol></div>
+
+<div class="task"><h3>Task 5: Documents, sharing and people over HTTP</h3>
+<p><strong>Files:</strong> create <code>crates/server/src/api/{docs.rs,admin.rs}</code>, <code>crates/server/tests/documents.rs</code>; modify <code>crates/server/src/api/mod.rs</code>.</p>
+<p><strong>Consumes:</strong> <code>Signed</code>, Task 3's functions. <strong>Produces:</strong> (all need a signed-in caller)</p>
+<pre><code>GET    /api/docs                     -> [{"id","name","role","revised_at"}]            documents the caller can open
+POST   /api/docs  {"name"?}          -> 201 {"id","name","role":"owner"}               name defaults to "Untitled"
+GET    /api/docs/{id}                -> {"id","name","role","revision"}                404 without a role
+GET    /api/docs/{id}/access         -> [{"user":{"id","email","name"},"role"}]        owners only
+PUT    /api/docs/{id}/access {"email","role"} -> 204                                   404 {"error":"no_such_user"}
+DELETE /api/docs/{id}/access/{user_id}        -> 204                                   409 {"error":"last_owner"}
+GET    /api/admin/users              -> [{"id","email","name","is_admin","disabled"}]  administrators only
+POST   /api/admin/users {"email","name","password","is_admin"} -> 201 {"id"}           409 email_taken, 422 invalid_email | invalid_name | weak_password
+POST   /api/admin/users/{id}/disable | /enable -> 204                                  409 {"error":"last_admin"}</code></pre>
+<p>Status mapping: <code>NotFound</code> 404 <code>not_found</code>; <code>Forbidden</code> 403 <code>forbidden</code>; <code>InvalidName</code> 422 <code>invalid_name</code>; an unknown role or malformed id 422 <code>invalid_request</code>. Someone who is not an administrator gets 403 from every <code>/api/admin</code> route.</p>
+<ol class="steps">
+<li>Write failing tests in <code>tests/documents.rs</code>: <code>creator_owns_and_lists_the_new_document</code>; <code>stranger_gets_404_for_document_and_its_access_list</code>; <code>owner_shares_by_email_and_the_grantee_lists_the_document</code>; <code>editor_gets_403_managing_access</code>; <code>unknown_email_is_no_such_user</code>; <code>last_owner_cannot_be_removed</code>; <code>admin_can_open_and_share_any_document</code>; <code>admin_adds_and_disables_a_person</code>; <code>non_admin_gets_403_from_admin_routes</code>; <code>unsigned_caller_gets_401_from_every_route</code> (one request per route above).</li>
+<li>Run <code>cargo xtask test -p server</code>. Expected: fails, routes missing.</li>
+<li>Implement. Handlers stay thin: parse, call <code>Db</code>, map the result. Leave a single function <code>after_access_change(state, doc, user)</code> and <code>after_account_disabled(state, user)</code> and <code>after_sign_out(state, session)</code> that do nothing yet; Task 7 fills them.</li>
+<li>Run <code>cargo xtask check</code>. Expected: passes.</li>
+<li>Commit: <code>feat(server): create, list and share documents; manage people</code>.</li>
+</ol></div>
+
+<div class="task"><h3>Task 6: Sessions know who is editing</h3>
+<p>The WebSocket takes its identity from the sign-in cookie and its rights from the person's role. The typed-in name goes away.</p>
+<p><strong>Files:</strong> modify <code>crates/protocol/src/lib.rs</code>, <code>crates/server/src/{ws.rs,room.rs,checkpoint.rs,lib.rs}</code>, <code>crates/web-client/src/lib.rs</code>, <code>crates/server/tests/{common/mod.rs,two_sessions.rs,browser_client.rs}</code>; create <code>crates/server/tests/access.rs</code>.</p>
+<p><strong>Produces (protocol):</strong></p>
+<pre><code>pub struct Participant { pub client: ClientId, pub user: UserId, pub name: String, pub can_edit: bool, pub cursor: Option&lt;usize> }
+pub enum SaveState { Saved, Saving, Failed, Conflict }               // Conflict is used from Task 8
+pub enum RemovedReason { AccessRevoked, SignedOut, AccountDisabled } // snake_case
+ServerMsg::Joined { /* existing */ can_edit: bool, saved_through: Seq }
+ServerMsg::Reset  { /* existing */ can_edit: bool, saved_through: Seq }
+ServerMsg::Access  { can_edit: bool }          // the person's rights changed while connected (sent from Task 7)
+ServerMsg::Removed { reason: RemovedReason }   // the last frame before the server closes the socket (sent from Task 7)</code></pre>
+<p><strong>Produces (server):</strong></p>
+<pre><code>GET /ws/docs/{doc_id}        401 without a session; 404 if the document has no record or the caller has no role
+Command::Join { conn, client, user: UserId, session: SessionId, name: String, role: Role, resume, tx, accepted }
+Rooms::open(doc, name: String /* the document's name */, checkpointer, timing, grace)
+// tests/common
+TestClient::connect(&amp;server, doc, name)                // signs in &lt;name>, creates the document record owned by them
+                                                        // if it has none, otherwise grants them Editor if they have no role
+TestClient::connect_as(&amp;server, doc, &amp;TestUser)        // no record or grant is made</code></pre>
+<p><strong>Rules:</strong></p>
+<ul>
+<li>The <code>name</code> query parameter is ignored. A participant's name is the account's name; the checkpoint author is <code>Author { id: &lt;user id>, name }</code>, so the commit email is <code>&lt;user id>@sharecraft.invalid</code>.</li>
+<li>The checkpoint's <code>file_name</code> is the document's name from its record, replacing <code>&lt;id>.txt</code>.</li>
+<li>A <code>Submit</code> from a member who cannot edit is answered <code>Refused { reason: "read_only" }</code> and nothing is committed. Viewers receive every change, appear in the people list with <code>can_edit: false</code>, and may send a cursor.</li>
+<li><code>saved_through</code> is the log position the stored revision covers, so a page can show “Saving…” on joining a room with unsaved changes.</li>
+<li><code>web-client</code>: <code>Update</code> gains <code>can_edit: Option&lt;bool></code> (set by <code>Joined</code>, <code>Reset</code>, <code>Access</code>) and <code>removed: Option&lt;String></code>; after <code>Removed</code> the client refuses local changes and <code>join_message</code> returns nothing. The save state on joining reflects <code>saved_through</code>.</li>
+<li>The page in <code>web/</code> is not updated until Task 10 and does not work in between; say so in the commit body.</li>
+</ul>
+<ol class="steps">
+<li>Write failing tests in <code>tests/access.rs</code>: <code>socket_without_session_is_401</code>; <code>socket_for_unknown_document_is_404</code>; <code>socket_without_a_role_is_404</code>; <code>participants_carry_account_names_and_ids</code>; <code>name_query_parameter_is_ignored</code>; <code>viewer_receives_changes_but_cannot_edit</code> (viewer's raw <code>Submit</code> is refused with <code>read_only</code>, the editor's text is unchanged, the viewer sees the editor's typing); <code>checkpoint_credits_accounts_and_uses_the_document_name</code> (commit author email, <code>meta.json</code> contributors and <code>file_name</code>); <code>same_account_in_two_tabs_is_two_participants_one_author</code>; <code>joined_reports_saved_through</code>. In <code>protocol</code>: extend <code>server_messages_round_trip</code> with the new messages and add <code>removed_reason_is_snake_case</code>. In <code>web-client</code>: <code>access_message_updates_can_edit</code>, <code>removed_stops_the_client</code>.</li>
+<li>Run <code>cargo xtask test -p server</code>. Expected: does not compile.</li>
+<li>Implement, then move every existing test to <code>TestClient::connect(&amp;server, …)</code>. Their assertions do not change, except that <code>awkward_display_name_does_not_block_saving</code> now sets the awkward name through an account (use the least valid name the account rules allow) and the origin tests send a cookie.</li>
+<li>Run <code>cargo xtask check</code>. Expected: passes.</li>
+<li>Commit: <code>feat(server): sessions require sign-in and a role; viewers are read-only</code>.</li>
+</ol></div>
+
+<div class="task"><h3>Task 7: Removal from a live session</h3>
+<p>Spine rule S5 and the “active editor access” part of A04.</p>
+<p><strong>Files:</strong> modify <code>crates/server/src/{room.rs,ws.rs,lib.rs,api/mod.rs}</code>, <code>crates/server/tests/common/mod.rs</code>; create <code>crates/server/tests/revocation.rs</code>.</p>
+<p><strong>Produces:</strong></p>
+<pre><code>Command::SetAccess  { user: UserId, role: Option&lt;Role> }           // None: remove every connection of that person
+Command::EndSession { session: SessionId }                         // remove that sign-in's connections: SignedOut
+Command::RemoveUser { user: UserId }                               // AccountDisabled
+impl Rooms { fn send_to(&amp;self, doc: DocId, cmd: Command);          // nothing happens if the room is not open
+             fn send_all(&amp;self, make: impl Fn() -> Command); }
+// tests/common: TestClient gains  pub removed: Option&lt;RemovedReason>,  pub can_edit: bool</code></pre>
+<p><strong>Rules:</strong></p>
+<ul>
+<li>Order is always: write to PostgreSQL, then tell the room. <code>after_access_change</code> reads <code>Db::role(user, doc)</code> afresh and sends <code>SetAccess</code> with it, so an administrator who loses a grant stays an owner.</li>
+<li>Removing a member queues <code>Removed { reason }</code> as that connection's last frame and drops its queue, which closes the socket after the frame is written. The others get a new people list.</li>
+<li>A role change that keeps access sends that person <code>Access { can_edit }</code> and everyone a new people list. Nobody reconnects.</li>
+<li>Text a person committed before losing access stays, and stays credited to them at the next checkpoint. A <code>Submit</code> that arrives after the removal is ignored, because the connection is no longer current.</li>
+<li>The join race: after the room accepts a join, the connection reads the session and the role again. If the session is gone it leaves; if the role differs it sends <code>SetAccess</code> itself. Put this in one function, <code>recheck_after_join</code>.</li>
+<li>A connection closes itself with <code>Removed { SignedOut }</code> when its session's <code>expires_at</code> passes.</li>
+<li>A page that receives <code>Removed</code> must not reconnect; the test client records the reason and stops.</li>
+</ul>
+<ol class="steps">
+<li>Write failing tests in <code>tests/revocation.rs</code>: <code>revoked_editor_is_removed_within_one_second</code> (receives <code>Removed { access_revoked }</code>, the socket closes, the other person's list no longer has them, a new socket gets 404); <code>revoked_editors_committed_text_is_kept_and_credited</code>; <code>change_sent_after_removal_is_not_committed</code>; <code>demoted_editor_becomes_read_only_without_reconnecting</code>; <code>promoted_viewer_can_type_without_reconnecting</code>; <code>revoking_one_person_leaves_the_others_typing</code>; <code>both_tabs_of_a_revoked_person_close</code>; <code>sign_out_closes_that_sessions_sockets_only</code> (one account signed in twice); <code>disabled_account_is_removed_from_every_document</code>; <code>expired_session_closes_the_socket</code>; <code>admin_keeps_access_when_their_grant_is_removed</code>; <code>standing_proof</code> (the test sequencing.html asks for on every build: two people type at once and converge, one drops and returns without losing typing, one has access revoked and is removed, and the checkpoint read back from Git holds the converged text); <code>access_ended_during_join_is_caught</code> (call <code>recheck_after_join</code> for a member whose grant was deleted after the first check; the member is removed). Unit tests in <code>room.rs</code>: <code>set_access_for_someone_absent_does_nothing</code>, <code>removed_is_the_last_frame_queued</code>.</li>
+<li>Run <code>cargo xtask test -p server</code>. Expected: fails.</li>
+<li>Implement.</li>
+<li>Run <code>cargo xtask check</code>. Expected: passes.</li>
+<li>Commit: <code>feat(server): remove people from live sessions when access ends</code>.</li>
+</ol></div>
+
+<div class="task"><h3>Task 8: Revisions in PostgreSQL, rebuild, and stale saves</h3>
+<p>The PostgreSQL half of SC-21 and A13 for content revisions, and spine rule S4's explicit conflict.</p>
+<p><strong>Files:</strong> modify <code>crates/revisions/src/{lib.rs,store.rs}</code>, <code>crates/revisions/tests/checkpoint.rs</code>, <code>crates/server/src/{checkpoint.rs,room.rs,lib.rs,cli.rs,main.rs}</code>; create <code>crates/records/src/revisions.rs</code>, <code>crates/records/tests/revisions.rs</code>, <code>crates/server/src/projection.rs</code>, <code>crates/server/tests/projection.rs</code>.</p>
+<p><strong>Produces:</strong></p>
+<pre><code>// revisions
+pub struct RevisionInfo { pub revision: RevisionId, pub doc: DocId, pub committed_at: i64 /* Unix seconds */,
+                          pub authors: Vec&lt;Author>, pub file_name: String, pub fields: Map&lt;String, Value> }
+impl RevisionStore {
+    pub fn describe(&amp;self, doc: DocId, revision: &amp;RevisionId) -> Result&lt;Option&lt;RevisionInfo>, CheckpointError>;
+    pub fn history(&amp;self, doc: DocId) -> Result&lt;Vec&lt;RevisionInfo>, CheckpointError>;  // oldest first
+    pub fn documents(&amp;self) -> Result&lt;Vec&lt;DocId>, GitError>;                         // from refs/sharecraft/docs/*
+}
+CheckpointError::Corrupt { revision: RevisionId, reason: String }
+// records
+pub struct RevisionRecord { pub doc: DocId, pub revision: String, pub committed_at: OffsetDateTime,
+                            pub authors: Vec&lt;(String, String)> /* id, name */, pub name: String, pub fields: Value }
+impl Db {
+    // Appends after `parent`. Returns false, changing nothing, if `parent` is not the document's recorded head.
+    pub async fn append_revision(&amp;self, parent: Option&lt;&amp;str>, r: &amp;RevisionRecord) -> Result&lt;bool, DbError>;
+    // Replaces the document's whole revision list, in one transaction.
+    pub async fn replace_revisions(&amp;self, doc: DocId, history: &amp;[RevisionRecord]) -> Result&lt;(), DbError>;
+    pub async fn revisions(&amp;self, doc: DocId) -> Result&lt;Vec&lt;RevisionRow>, DbError>;   // by position
+}
+pub struct RevisionRow { pub revision: String, pub position: i32, pub parent: Option&lt;String>,
+                         pub committed_at: OffsetDateTime, pub authors: Vec&lt;(String, String)> }
+// server
+trait Checkpointer { /* existing */ fn describe(..); fn history(..); fn documents(..); }
+pub async fn reconcile(store: Arc&lt;dyn Checkpointer>, db: &amp;Db) -> Report { documents, updated, failed: Vec&lt;(DocId, String)> }
+sharecraft-server rebuild      // replaces the revision list of every document in Git, prints the Report, exit 1 if any failed</code></pre>
+<p><strong>Rules:</strong></p>
+<ul>
+<li><code>history</code> lists the commits reachable from the document's reference whose tree under <code>docs/&lt;doc></code> differs from their parent's. Authors are the commit author followed by its <code>Co-authored-by</code> trailers; an author's id is the part of the email before <code>@</code>.</li>
+<li>Both write paths set the document's <code>revision</code>, <code>revised_at</code>, <code>name</code> and <code>fields</code> from the newest revision, and create the document row, with no creator and no grants, when Git has a document PostgreSQL does not. Only an administrator can then open it.</li>
+<li>After each checkpoint that wrote a commit, the server records it off the room's task: <code>append_revision</code>, and if that returns false, <code>replace_revisions</code> from <code>history</code>. A failure is logged and never changes the save status: the content is safe in Git.</li>
+<li><code>serve</code> runs <code>reconcile</code> before listening and prints one line with the counts. A document whose head in PostgreSQL equals its head in Git is left alone. One unreadable document does not stop the others.</li>
+<li>A commit that holds a document's content but no readable <code>meta.json</code> is <code>Corrupt</code>, from <code>read</code>, <code>describe</code> and <code>history</code> alike; <code>read</code> no longer answers <code>None</code> for it.</li>
+<li>Stale save: when a checkpoint is refused as <code>Stale</code>, the room sends <code>Save { state: Conflict }</code> once, stops scheduling checkpoints, answers every later <code>Submit</code> with <code>Refused { reason: "conflict" }</code>, and ends without a final checkpoint once it is empty. It never retries and never overwrites.</li>
+</ul>
+<ol class="steps">
+<li>Write failing tests. <code>revisions/tests/checkpoint.rs</code>: <code>history_lists_only_this_documents_revisions_oldest_first</code> (two documents saved alternately); <code>describe_reports_all_credited_authors</code>; <code>documents_lists_every_saved_document</code>; <code>content_without_metadata_is_corrupt</code>. <code>records/tests/revisions.rs</code>: <code>append_requires_the_recorded_head</code>; <code>append_twice_records_once</code>; <code>replace_is_all_or_nothing</code>; <code>git_only_document_gets_a_record_only_admins_can_open</code>. <code>server/tests/projection.rs</code>: <code>checkpoint_is_recorded_in_postgresql</code>; <code>rebuild_reproduces_live_records</code> (the rows after <code>replace_revisions</code> from <code>history</code> equal the rows recorded live, for a document with three revisions and two authors); <code>reconcile_at_start_reads_revisions_written_while_stopped</code>; <code>metadata_only_revision_updates_fields</code> (a checkpoint with the same bytes and new <code>fields</code>, written to the store while the server is stopped); <code>index_failure_does_not_fail_the_save</code> (the test drops the <code>revisions</code> table, types, and still receives <code>Save { Saved }</code>; the text is in Git); <code>corrupt_document_is_reported_and_the_others_reconcile</code>; <code>stale_checkpoint_stops_the_room_with_a_conflict</code> (the test checkpoints the document directly behind the room; both people get exactly one <code>Conflict</code>, a new change is refused, the other revision is still the head, and after the room ends a new join gets the other revision's text).</li>
+<li>Run <code>cargo xtask test</code>. Expected: does not compile.</li>
+<li>Implement. Every test double that implements <code>Checkpointer</code> gains the three reading methods by delegation.</li>
+<li>Run <code>cargo xtask check</code>. Expected: passes.</li>
+<li>Commit: <code>feat: record revisions in PostgreSQL, rebuild from Git, stop on stale saves</code>.</li>
+</ol></div>
+
+<div class="task"><h3>Task 9: Session and save events</h3>
+<p>Spine rule S7 for what happens inside a room. Account and access events already exist from Tasks 2 and 3.</p>
+<p><strong>Files:</strong> create <code>crates/server/src/events.rs</code>, <code>crates/server/tests/events.rs</code>; modify <code>crates/records/src/events.rs</code>, <code>crates/server/src/{room.rs,lib.rs,projection.rs,api/docs.rs}</code>.</p>
+<p><strong>Produces:</strong></p>
+<pre><code>// records
+pub struct NewEvent { pub kind: &amp;'static str, pub actor: Option&lt;UserId>, pub subject: Option&lt;UserId>,
+                      pub document: Option&lt;DocId>, pub detail: serde_json::Value }
+impl Db { pub async fn append_event(&amp;self, e: &amp;NewEvent) -> Result&lt;(), DbError>; }
+// server
+pub(crate) struct EventSink { /* unbounded sender */ }  // emit(&amp;self, NewEvent) never blocks; one task writes in order
+GET /api/docs/{id}/events -> [{"id","at","kind","actor","subject","detail"}]   owners only; the latest 200, oldest first</code></pre>
+<table><tr><th>Kind</th><th>When</th><th>Detail</th></tr>
+<tr><td><code>editing.joined</code></td><td>A connection enters a room (not on a resume within the same room)</td><td><code>{"can_edit"}</code></td></tr>
+<tr><td><code>editing.left</code></td><td>A connection leaves or is dropped</td><td><code>{}</code></td></tr>
+<tr><td><code>editing.removed</code></td><td>A connection is removed</td><td><code>{"reason"}</code></td></tr>
+<tr><td><code>revision.saved</code></td><td>A checkpoint wrote a commit</td><td><code>{"revision","authors":[ids]}</code></td></tr>
+<tr><td><code>revision.save_failed</code></td><td>The first failure after a success</td><td><code>{"error"}</code></td></tr>
+<tr><td><code>revision.conflict</code></td><td>A checkpoint was stale</td><td><code>{"current"}</code></td></tr>
+<tr><td><code>revision.index_failed</code></td><td>A commit could not be recorded, or reconcile failed for a document</td><td><code>{"error"}</code></td></tr></table>
+<p>For <code>editing.*</code> the subject is the person; the actor is the same person for joined and left and empty for removed (the access event names who did it). If an event cannot be written it is logged and dropped; rooms never wait for it.</p>
+<ol class="steps">
+<li>Write failing tests in <code>tests/events.rs</code>: <code>join_edit_save_and_leave_are_recorded_in_order</code>; <code>removal_is_recorded_after_the_revocation_that_caused_it</code>; <code>repeated_save_failures_record_one_event</code>; <code>events_hold_no_document_text</code> (type a marker string, save, and assert no event's JSON contains it); <code>only_owners_read_a_documents_events</code>; <code>events_route_returns_at_most_200</code>.</li>
+<li>Run <code>cargo xtask test -p server</code>. Expected: fails.</li>
+<li>Implement.</li>
+<li>Run <code>cargo xtask check</code>. Expected: passes.</li>
+<li>Commit: <code>feat(server): record session and save events</code>.</li>
+</ol></div>
+
+<div class="task"><h3>Task 10: Pages for signing in, documents, sharing and people</h3>
+<p>Plain pages, as in plan 1: enough to use and demonstrate the server. The real interface follows the UI concepts in a later stage.</p>
+<p><strong>Files:</strong> create <code>web/{signin.html,doc.html,people.html,common.js,signin.js,home.js,people.js,style.css}</code>; rewrite <code>web/index.html</code> as the home page; move <code>web/app.js</code> to <code>web/doc.js</code>; modify <code>crates/server/src/lib.rs</code> (response headers), <code>crates/server/tests/browser_client.rs</code>, <code>crates/server/tests/two_sessions.rs</code>.</p>
+<p><strong>Behaviour:</strong></p>
+<ul>
+<li>Every page first calls <code>GET /api/me</code>. On 401 it goes to <code>/signin.html?next=&lt;path and hash></code>. After signing in, <code>next</code> is followed only if it begins with one <code>/</code> and its second character is not <code>/</code> or <code>\</code>; otherwise the home page opens.</li>
+<li><strong>Sign in:</strong> email, password, a button. Messages: “That email and password do not match.” and “Too many attempts. Try again in a few minutes.”</li>
+<li><strong>Home:</strong> the person's name, Sign out, a People link for administrators, a New document form (name), and the list of documents with the person's role and when each was last saved. Empty state: “No documents yet.”</li>
+<li><strong>Document (<code>doc.html#&lt;id></code>):</strong> calls <code>GET /api/docs/{id}</code> before opening the socket. On 404: “This document does not exist, or you do not have access to it.” A hash that is not an identifier shows the same message; the page no longer invents one. Viewers get a read-only text box and the line “You can read this document but not change it.” Owners get a Share panel: each person with a role selector and a Remove button, and a form to add someone by email with a role. The name field is gone.</li>
+<li>On <code>Access</code> the text box switches between editable and read-only without reloading. On <code>Removed</code> the text box is emptied and made read-only, the people list is cleared, no reconnect is attempted, and the status reads “Your access to this document was removed.”, “You were signed out.” or “Your account was disabled.” On save state <code>conflict</code>: “This document was changed somewhere else. Copy anything you need, then reload.”</li>
+<li><strong>People:</strong> administrators only. The list of accounts with Disable or Enable, and a form to add one (email, name, password, administrator).</li>
+<li>All text from the server is put on the page with <code>textContent</code>. No inline scripts or styles. Every control has a label, the status line is a live region, and the pages work at phone width and by keyboard alone.</li>
+<li>The server adds to every response: <code>Content-Security-Policy: default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; frame-ancestors 'none'</code>, <code>X-Content-Type-Options: nosniff</code>, <code>Referrer-Policy: same-origin</code>; and <code>Cache-Control: no-store</code> on <code>/api</code>.</li>
+</ul>
+<ol class="steps">
+<li>Write failing tests. <code>browser_client.rs</code> (the real WebAssembly client code against the real server): <code>browser_viewer_is_read_only</code>; <code>browser_demotion_arrives_without_reconnecting</code>; <code>browser_removed_client_stops_and_reports_why</code>. <code>two_sessions.rs</code>: <code>responses_carry_security_headers</code>; <code>pages_are_served_without_signing_in_and_hold_no_data</code> (each page is 200 and contains no email address).</li>
+<li>Run <code>cargo xtask test -p server</code>. Expected: fails.</li>
+<li>Implement the pages and headers. Run <code>cargo xtask web</code>.</li>
+<li>Run <code>cargo xtask check</code>. Expected: passes.</li>
+<li>Commit: <code>feat(web): sign-in, document list, sharing and people pages</code>.</li>
+</ol></div>
+
+<div class="task"><h3>Task 11: Items carried over from plan 1</h3>
+<p><strong>Files:</strong> modify <code>crates/server/src/{ws.rs,room.rs,checkpoint.rs}</code>, <code>crates/collab-text/src/op.rs</code>, <code>crates/revisions/src/lib.rs</code>, <code>crates/protocol/src/lib.rs</code>, <code>crates/web-client/src/lib.rs</code>, <code>crates/server/Cargo.toml</code>.</p>
+<ol class="steps">
+<li>Socket writes time out after 10 seconds, after which the connection is dropped, so a client that stopped reading cannot hold its task and room open. Test <code>stalled_reader_is_dropped</code> (a client that never reads while another types more than the queue holds).</li>
+<li>The room's <code>select!</code> is <code>biased</code> so a waiting join is handled before the room gives up its final checkpoint. Test at the room level: <code>pending_join_wins_over_giving_up</code>.</li>
+<li><code>TextError::LengthMismatch</code> says which length was expected and which was given without claiming the document's length when <code>transform</code> raised it. Test the two messages.</li>
+<li>Missing tests: <code>revision_id_rejects_wrong_length_uppercase_and_non_hex</code>; <code>message_type_tags_are_pinned</code> (the exact <code>type</code> string of every <code>ClientMsg</code> and <code>ServerMsg</code> variant); <code>update_field_names_are_pinned</code> (the JSON keys of <code>web-client</code>'s <code>Update</code> that <code>doc.js</code> reads); <code>checkpoint_is_due_at_max_while_typing_continues</code>.</li>
+<li>Fix the spacing of the <code>serde</code> line in <code>crates/server/Cargo.toml</code>.</li>
+<li>Run <code>cargo xtask check</code>. Expected: passes. Commit: <code>fix: socket write timeout, join priority and carried-over tests</code>.</li>
+</ol></div>
+
+<div class="task"><h3>Task 12: Record the result</h3>
+<p><strong>Files:</strong> modify <code>BUILDING.html</code>, <code>sequencing.html</code>, <code>README.md</code>.</p>
+<ol class="steps">
+<li><code>BUILDING.html</code>: what is needed (PostgreSQL, <code>.env</code> from <code>.env.example</code>); creating the first administrator with <code>add-user</code>; signing in, creating and sharing a document, roles, what a removed person sees; the revision index, <code>rebuild</code> and start-up reconcile; the events and how an owner reads them; that Git holds content while accounts, grants and events are in PostgreSQL only and need their own backup; what is still not built (the list in “What this plan does not cover”). Remove every statement that there is no sign-in.</li>
+<li><code>sequencing.html</code>: update the Stage 1 progress note. Met after this plan: sign-in, per-document permission, removal on revocation, PostgreSQL records. Not yet met: the four editors opening from ShareCraft.</li>
+<li>Run <code>cargo xtask check</code>. Commit: <code>docs: describe accounts, sharing and the revision index</code>.</li>
+<li>Controller, in a browser: sign in as two people in two tabs, one at <code>http://localhost:8787</code> and one at <code>http://127.0.0.1:8787</code> (separate cookies). Share a document, type in both, change one person to viewer, then remove them, then disable an account, then sign out. Check each message, the phone-width layout, keyboard use, and that <code>git log</code> credits the two accounts. Record what was and was not checked in the ledger.</li>
+</ol></div>
+
+<h2>Decisions made in this plan</h2>
+<p>These were not specified by the scope and were chosen here. Change them before execution if they are wrong.</p>
+<table><tr><th>Decision</th><th>Reason</th><th>If it is wrong</th></tr>
+<tr><td>ShareCraft's own accounts with a password; no outside sign-in provider yet.</td><td>Runs and tests with no outside service. A provider can be added beside it.</td><td>Sign-in is replaced; sessions, roles and removal are unaffected.</td></tr>
+<tr><td>Accounts are created by an administrator. The first one comes from the command line. Nobody can register themselves or change a password yet.</td><td>The smallest thing that gives real identities. One organization per installation (D18) means no public sign-up.</td><td>Add self-service pages later.</td></tr>
+<tr><td>Three roles per document: viewer, editor, owner. Administrators are owners of everything.</td><td>Read-only access is in A07; someone must be able to recover a document with no owner.</td><td>Roles become configurable in Stage 2 (SC-11) anyway.</td></tr>
+<tr><td>Access is granted per document to one person at a time. No groups, folders or inheritance.</td><td>Stage 1 asks for a per-document check. Inheritance belongs with sites and libraries.</td><td>Stage 2 adds the levels above; this check stays as the lowest one.</td></tr>
+<tr><td>Accounts, grants and events live in PostgreSQL only. The revision index is derived from Git.</td><td>Git holds what is versioned; who may open a document is not content.</td><td>Losing PostgreSQL without a backup loses accounts and sharing, not documents.</td></tr>
+<tr><td>Removal is sent to rooms inside the server process, not through the database.</td><td>One server process exists. It is immediate and simple.</td><td>Running several server processes needs database notifications instead.</td></tr>
+<tr><td>A removed person's tab is emptied.</td><td>They may no longer read the document.</td><td>One line in the page.</td></tr>
+<tr><td>A stale save stops the room with a conflict; nothing is merged.</td><td>S4 asks for an explicit conflict and no silent loss. It cannot happen through the server alone.</td><td>Offline and API writes (Stages 4 and 5) will need a real reconciliation rule.</td></tr>
+<tr><td>Sessions last 30 days. Five failed sign-ins per email in 15 minutes are refused.</td><td>Conventional values.</td><td>Constants.</td></tr>
+<tr><td>The server still listens on the local machine only.</td><td>Passwords must not cross a network without TLS, which is a deployment plan of its own.</td><td>Two people on two machines cannot co-author until that plan.</td></tr>
+<tr><td>D18's open consequence (ThineWedding, ThineMemorial, ThineCapture as separate installations or as sites) is not settled here.</td><td>Nothing in this plan depends on it: there are no organization identifiers either way.</td><td>None for this plan.</td></tr></table>
+</main></body></html>
