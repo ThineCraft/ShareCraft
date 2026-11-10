@@ -1,6 +1,8 @@
 //! The JSON API under `/api`. Every request must pass [`same_origin`], and any request other
 //! than `GET` must also carry `Origin`. Errors are `{"error": "<code>"}`.
 
+mod admin;
+mod docs;
 mod session;
 
 use std::fmt;
@@ -10,10 +12,13 @@ use axum::http::header::ORIGIN;
 use axum::http::{Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use collab_core::ids::{DocId, SessionId, UserId};
+use records::{AccessError, AccountError};
 use serde::de::DeserializeOwned;
 use serde_json::json;
+use uuid::Uuid;
 
 use crate::AppState;
 use crate::auth::same_origin;
@@ -27,6 +32,13 @@ pub(crate) fn router() -> Router<AppState> {
     Router::new()
         .route("/session", post(session::sign_in).delete(session::sign_out))
         .route("/me", get(session::me))
+        .route("/docs", get(docs::list).post(docs::create))
+        .route("/docs/{id}", get(docs::open))
+        .route("/docs/{id}/access", get(docs::access).put(docs::share))
+        .route("/docs/{id}/access/{user_id}", delete(docs::unshare))
+        .route("/admin/users", get(admin::users).post(admin::create))
+        .route("/admin/users/{id}/disable", post(admin::disable))
+        .route("/admin/users/{id}/enable", post(admin::enable))
         .fallback(|| async { ApiError::NotFound })
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .layer(middleware::from_fn(require_same_origin))
@@ -53,8 +65,25 @@ pub(crate) enum ApiError {
     InvalidCredentials,
     /// 403: the request failed the same-origin check.
     Forbidden,
-    /// 404: no such API route.
+    /// 404: no such API route, document or account, or none the caller may see.
     NotFound,
+    /// 404: no account has the email given.
+    NoSuchUser,
+    /// 409: the email is already in use.
+    EmailTaken,
+    /// 409: a document must keep one owner.
+    LastOwner,
+    /// 409: one administrator must stay enabled.
+    LastAdmin,
+    /// 422: a well-formed request with a value that makes no sense, such as an unknown role or
+    /// an id that is not an id.
+    InvalidRequest,
+    /// 422: not an acceptable document or person name.
+    InvalidName,
+    /// 422: not an acceptable email address.
+    InvalidEmail,
+    /// 422: the password is too short or too long.
+    WeakPassword,
     /// 413: the body is larger than 16 KiB.
     TooLarge,
     /// 415: the body is not `application/json`.
@@ -81,6 +110,14 @@ impl ApiError {
             ApiError::InvalidCredentials => (StatusCode::UNAUTHORIZED, "invalid_credentials"),
             ApiError::Forbidden => (StatusCode::FORBIDDEN, "forbidden"),
             ApiError::NotFound => (StatusCode::NOT_FOUND, "not_found"),
+            ApiError::NoSuchUser => (StatusCode::NOT_FOUND, "no_such_user"),
+            ApiError::EmailTaken => (StatusCode::CONFLICT, "email_taken"),
+            ApiError::LastOwner => (StatusCode::CONFLICT, "last_owner"),
+            ApiError::LastAdmin => (StatusCode::CONFLICT, "last_admin"),
+            ApiError::InvalidRequest => (StatusCode::UNPROCESSABLE_ENTITY, "invalid_request"),
+            ApiError::InvalidName => (StatusCode::UNPROCESSABLE_ENTITY, "invalid_name"),
+            ApiError::InvalidEmail => (StatusCode::UNPROCESSABLE_ENTITY, "invalid_email"),
+            ApiError::WeakPassword => (StatusCode::UNPROCESSABLE_ENTITY, "weak_password"),
             ApiError::TooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "too_large"),
             ApiError::NotJson => (StatusCode::UNSUPPORTED_MEDIA_TYPE, "not_json"),
             ApiError::TooManyAttempts => (StatusCode::TOO_MANY_REQUESTS, "too_many_attempts"),
@@ -88,6 +125,49 @@ impl ApiError {
         }
     }
 }
+
+impl From<AccessError> for ApiError {
+    fn from(e: AccessError) -> Self {
+        match e {
+            AccessError::NotFound => ApiError::NotFound,
+            AccessError::NoSuchUser => ApiError::NoSuchUser,
+            AccessError::Forbidden => ApiError::Forbidden,
+            AccessError::LastOwner => ApiError::LastOwner,
+            AccessError::InvalidName => ApiError::InvalidName,
+            // The server picks a fresh random id, so a clash is not the caller's doing.
+            AccessError::Exists | AccessError::Db(_) => ApiError::unavailable(&e),
+        }
+    }
+}
+
+impl From<AccountError> for ApiError {
+    fn from(e: AccountError) -> Self {
+        match e {
+            AccountError::EmailTaken => ApiError::EmailTaken,
+            AccountError::InvalidEmail => ApiError::InvalidEmail,
+            AccountError::InvalidName => ApiError::InvalidName,
+            AccountError::WeakPassword => ApiError::WeakPassword,
+            AccountError::NotFound => ApiError::NotFound,
+            AccountError::Forbidden => ApiError::Forbidden,
+            AccountError::LastAdmin => ApiError::LastAdmin,
+            AccountError::Db(_) => ApiError::unavailable(&e),
+        }
+    }
+}
+
+/// An id from a path, or `422 invalid_request` when it is not one.
+fn parse_id(text: &str) -> Result<Uuid, ApiError> {
+    Uuid::parse_str(text).map_err(|_| ApiError::InvalidRequest)
+}
+
+/// Called after `user`'s access to `doc` was granted, changed or removed. Does nothing yet.
+fn after_access_change(_state: &AppState, _doc: DocId, _user: UserId) {}
+
+/// Called after `user`'s account was disabled. Does nothing yet.
+fn after_account_disabled(_state: &AppState, _user: UserId) {}
+
+/// Called after `session` was ended by its owner signing out. Does nothing yet.
+fn after_sign_out(_state: &AppState, _session: SessionId) {}
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
