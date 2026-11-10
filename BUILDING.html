@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="How to build and run the ShareCraft development build: prerequisites, commands, where data is kept, and what this build does not do yet.">
+<title>ShareCraft — Building and Running</title>
+<style>
+:root{--ink:#172f38;--muted:#536b72;--line:#d7e2e3;--accent:#086959;--paper:#fff;--wash:#f2f6f5;font-family:Segoe UI,Arial,sans-serif;color:var(--ink);background:var(--wash);line-height:1.65}
+*{box-sizing:border-box}body{margin:0}a{color:var(--accent);text-underline-offset:3px}a:focus-visible,button:focus-visible{outline:3px solid #b66e00;outline-offset:4px}.skip{position:absolute;left:1rem;top:-5rem;background:white;padding:1rem;z-index:20}.skip:focus{top:1rem}
+.cover{background:#123e3b;color:#fff;padding:66px max(24px,calc((100vw - 1160px)/2));border-bottom:8px solid #71d8b5}.eyebrow{text-transform:uppercase;letter-spacing:.17em;font-size:.76rem;font-weight:700;color:#a7e7d1}.cover h1{font-size:clamp(2.6rem,6vw,4.6rem);letter-spacing:-.05em;line-height:1.05;margin:18px 0}.cover .lede{font-size:1.2rem;max-width:770px;color:#e0eee9}.meta{display:flex;flex-wrap:wrap;gap:10px 28px;color:#c4ded5;font-size:.88rem}.layout{display:grid;grid-template-columns:225px minmax(0,1fr);gap:48px;max-width:1210px;margin:auto;padding:40px 25px 80px}nav{position:sticky;top:24px;align-self:start;max-height:90vh;overflow:auto;font-size:.88rem}nav p{font-weight:700;margin:0 0 12px}nav a{display:block;padding:7px 0;text-decoration:none;color:var(--muted)}nav a:hover{color:var(--accent)}main{min-width:0}section{scroll-margin-top:25px;margin:0 0 38px}h2{font-size:1.7rem;line-height:1.25;letter-spacing:-.025em;margin:0 0 18px}h3{font-size:1.13rem;line-height:1.4;margin:0 0 12px}p{margin:0 0 16px}.note{padding:20px 23px;border-left:4px solid var(--accent);background:#e5f0ec}.note p:last-child{margin-bottom:0}.cards{display:grid;gap:17px}.module{background:var(--paper);padding:25px;border:1px solid var(--line);border-radius:9px;break-inside:avoid}.tag{display:inline-block;font-size:.7rem;letter-spacing:.05em;text-transform:uppercase;border-radius:4px;padding:3px 7px;background:#e2f1e9;color:#155438;margin:0 0 12px}.spine{background:#fff0d5;color:#775110}.parallel{background:#e8ecfb;color:#344e91}ul,ol{padding-left:22px;margin:0}li{margin:0 0 9px}li:last-child{margin-bottom:0}.rid{font-weight:700;color:var(--accent);white-space:nowrap}table{border-collapse:collapse;width:100%;font-size:.91rem;background:white}th,td{border:1px solid var(--line);padding:12px 14px;text-align:left;vertical-align:top}th{background:#e8efed}caption{text-align:left;font-weight:700;padding:0 0 10px}.table-wrap{overflow-x:auto}.small{font-size:.88rem;color:var(--muted)}.toolbar{display:flex;justify-content:space-between;align-items:center;gap:20px;margin-bottom:26px}button{background:var(--accent);color:white;border:0;border-radius:5px;padding:10px 15px;font:inherit;cursor:pointer}footer{border-top:1px solid var(--line);padding-top:22px;font-size:.86rem;color:var(--muted)}
+@media(max-width:850px){.layout{grid-template-columns:1fr;gap:28px}nav{position:static;max-height:none;display:flex;flex-wrap:wrap;gap:3px 18px;border-bottom:1px solid var(--line);padding-bottom:20px}nav p{width:100%;margin-bottom:0}.cover{padding:40px 25px}.module{padding:20px}}
+@media print{@page{size:A4;margin:17mm}html,body{background:white;font-size:10pt}.cover{padding:12mm 0;background:white;color:var(--ink);border-bottom:3px solid var(--accent)}.cover .lede,.meta,.eyebrow{color:var(--ink)}.layout{display:block;padding:10mm 0;margin:0;max-width:none}nav,.toolbar button,.skip{display:none}.module{border-radius:0;padding:5mm}.note{background:#f4f4f4}h2,h3{break-after:avoid}a{color:inherit}tr{break-inside:avoid}.table-wrap{overflow:visible}}
+pre{background:#0f2a2c;color:#e6f2ee;border-radius:6px;padding:14px 16px;margin:0 0 16px;overflow-x:auto;font-size:.88rem;line-height:1.5}code{font-family:Consolas,"Cascadia Mono",monospace;font-size:.92em}p code,li code,td code{background:#e8efed;border-radius:3px;padding:1px 5px}pre code{background:none;padding:0;font-size:inherit}
+@media print{pre{background:#f4f4f4;color:#000;border:1px solid #999;white-space:pre-wrap}}
+</style>
+</head>
+<body data-project="ShareCraft" data-status="build-instructions">
+<a class="skip" href="#main">Skip to instructions</a>
+<header class="cover">
+<p class="eyebrow">ThineCraft / Development build</p>
+<h1>Building and running ShareCraft</h1>
+<p class="lede">How to build the first working piece of ShareCraft, a plain-text document that two browser tabs edit together, and what it does and does not do yet.</p>
+<div class="meta"><span>Stage 1 · First plan</span><span>9 November 2026</span><span>Companion to <a href="sequencing.html" style="color:inherit">Sequencing Plan</a></span></div>
+</header>
+<div class="layout">
+<nav aria-label="Document contents"><p>In this document</p>
+<a href="#need">01 · What you need</a><a href="#build">02 · Build and check</a><a href="#run">03 · Run it</a><a href="#settings">04 · Settings</a><a href="#data">05 · Where data is kept</a><a href="#stop">06 · Stopping the server</a><a href="#limits">07 · Known limits</a><a href="#licences">08 · Licences</a>
+</nav>
+<main id="main">
+<div class="toolbar"><span class="small">Standalone HTML · Print-ready · No external assets</span><button type="button" onclick="window.print()">Print / Save PDF</button></div>
+
+<section id="need"><h2>01 / What you need</h2>
+<ul>
+<li><strong>Rust, stable channel</strong>, installed with <code>rustup</code>. The project uses the 2024 edition.</li>
+<li><strong>The WebAssembly target</strong>, which lets Rust build the part that runs in the browser:</li>
+</ul>
+<pre><code>rustup target add wasm32-unknown-unknown</code></pre>
+<ul>
+<li><strong><code>wasm-bindgen-cli</code> version 0.2.130, exactly.</strong> It must match the <code>wasm-bindgen</code> version recorded in <code>Cargo.lock</code>. If it is missing or a different version, <code>cargo xtask web</code> stops and prints the command to run:</li>
+</ul>
+<pre><code>cargo install wasm-bindgen-cli --version 0.2.130 --locked</code></pre>
+<p>If a later change to <code>Cargo.lock</code> moves <code>wasm-bindgen</code> to another version, the command printed by <code>cargo xtask web</code> shows the version then needed.</p>
+<p>Git does not need to be installed to run ShareCraft, because the Git library is built in. You only need it to look at saved documents (section 05).</p>
+</section>
+
+<section id="build"><h2>02 / Build and check</h2>
+<p>Run every command from the repository root, the folder that holds <code>Cargo.toml</code>.</p>
+<p>This runs formatting, lints, all tests, and a WebAssembly build of each browser-side crate. It prints <code>xtask: all checks passed</code> and exits with code 0 when everything is in order:</p>
+<pre><code>cargo xtask check</code></pre>
+<p>This builds the browser client and writes the page's script package to <code>web/pkg</code>. The folder is not kept in Git, so do this once after a fresh checkout and again after changing the browser client:</p>
+<pre><code>cargo xtask web</code></pre>
+</section>
+
+<section id="run"><h2>03 / Run it</h2>
+<p>Start the server, still from the repository root:</p>
+<pre><code>cargo run -p server</code></pre>
+<p>It prints the address it listens on and a reminder that this is a development build with no sign-in. Then open the page in a browser at exactly one of these addresses:</p>
+<pre><code>http://127.0.0.1:8787/
+http://localhost:8787/</code></pre>
+<p>The page adds a document identifier after a <code>#</code> in the address. To edit the same document in a second tab or window, copy the whole address, including the part after <code>#</code>, and open it there. Type a name in the name box so you can tell the sessions apart.</p>
+<div class="note"><p><strong>Use those addresses only.</strong> The server refuses a WebSocket connection when its <code>Host</code> is not a loopback name (<code>127.0.0.1</code>, <code>localhost</code> or <code>[::1]</code>), or when the page's <code>Origin</code> differs from the address it was loaded from. In this build the page therefore cannot be reached through another hostname, another computer or a proxy.</p></div>
+</section>
+
+<section id="settings"><h2>04 / Settings</h2>
+<p>The server reads three environment variables. All are optional.</p>
+<div class="table-wrap"><table><caption>Environment variables</caption>
+<thead><tr><th>Variable</th><th>Default</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td><code>SHARECRAFT_ADDR</code></td><td><code>127.0.0.1:8787</code></td><td>Address and port to listen on, as <code>host:port</code>. Must be a loopback address; the server refuses to start otherwise.</td></tr>
+<tr><td><code>SHARECRAFT_DATA</code></td><td><code>./data</code></td><td>Folder where documents are stored.</td></tr>
+<tr><td><code>SHARECRAFT_WEB</code></td><td><code>./web</code></td><td>Folder of page files served at <code>/</code>.</td></tr>
+</tbody></table></div>
+<p>The default folders are relative to the folder you start the server from, which is why the commands above are run from the repository root. Example with a different port and data folder:</p>
+<pre><code># PowerShell
+$env:SHARECRAFT_ADDR = "127.0.0.1:9000"
+$env:SHARECRAFT_DATA = "C:\sharecraft-data"
+cargo run -p server</code></pre>
+<p>If you change the port, open the page at that port instead of 8787, still using <code>127.0.0.1</code> or <code>localhost</code>.</p>
+</section>
+
+<section id="data"><h2>05 / Where data is kept</h2>
+<p>Documents are stored in one bare Git repository under the data folder:</p>
+<pre><code>&lt;data folder&gt;/libraries/00000000-0000-0000-0000-000000000001.git</code></pre>
+<p>With the defaults that is <code>data/libraries/00000000-0000-0000-0000-000000000001.git</code>. The <code>data</code> folder is not kept in Git. Every document lives in that one library for now.</p>
+<p>Inside the repository, the <code>main</code> branch holds, for each document identifier:</p>
+<ul>
+<li><code>docs/&lt;doc_id&gt;/content</code>: the document text.</li>
+<li><code>docs/&lt;doc_id&gt;/meta.json</code>: the metadata for that revision, as JSON.</li>
+</ul>
+<p>Each saved checkpoint is one Git commit. The document identifier is the one after the <code>#</code> in the page's address. To look at a saved document with plain <code>git</code>, run these from the repository root:</p>
+<pre><code>git --git-dir=data/libraries/00000000-0000-0000-0000-000000000001.git log main
+git --git-dir=data/libraries/00000000-0000-0000-0000-000000000001.git show main:docs/&lt;doc_id&gt;/content
+git --git-dir=data/libraries/00000000-0000-0000-0000-000000000001.git show main:docs/&lt;doc_id&gt;/meta.json</code></pre>
+<p>Replace <code>&lt;doc_id&gt;</code> with the identifier. Only read from the repository this way. Content must reach it through the server, which is the only thing that writes to it.</p>
+<h3>When a checkpoint is written</h3>
+<p>Live changes are not committed one by one. The server writes a checkpoint when no change has arrived for 2 seconds, or at the latest 30 seconds after the first change that has not been saved yet, whichever comes first. When the last person leaves a document, it is saved straight away. If that final save fails the server tries again up to three more times, then gives up and prints a message to the server's console. A save that fails while people are connected is retried after the idle time.</p>
+<p>The page shows the state next to the document title: Saving…, Saved, or Saving failed, retrying.</p>
+<p>The server keeps the most recent 1000 log entries behind the last checkpoint, so a browser that drops for a short time can catch up and resend its changes.</p>
+</section>
+
+<section id="stop"><h2>06 / Stopping the server</h2>
+<p>Stopping the server (for example with Ctrl+C) ends it at once. <strong>Changes made since the last checkpoint are lost</strong>, and that can be up to 30 seconds of typing. Everything up to the last saved revision is kept in the Git repository and is loaded again the next time the document is opened.</p>
+<p>In the browser, the status reads <strong>Connection lost</strong> with the number of changes still waiting, and then <strong>Reconnecting…</strong>. The page keeps trying until the server is back. Wait for the status to read <strong>Saved</strong> before you stop the server.</p>
+</section>
+
+<section id="limits"><h2>07 / Known limits of this build</h2>
+<ul>
+<li><strong>No sign-in.</strong> Anyone who can open the page on this computer can read and change every document. The page and the server console both say so.</li>
+<li><strong>Identity is a typed name.</strong> The name box is a label for other people in the session. It proves nothing, and two people can type the same name.</li>
+<li><strong>Local connections only.</strong> The server will not listen on a non-loopback address and refuses connections that do not come from the page it served (section 03).</li>
+<li><strong>Plain text only.</strong> There is no formatting, and no spreadsheet, document, PDF or 3D editing yet.</li>
+<li><strong>PostgreSQL is not used yet.</strong> Nothing in the server reads or writes a database. A local development database is configured through <code>.env</code> for the next plan: copy <code>.env.example</code> to <code>.env</code> and fill in the values. <code>.env</code> is not kept in Git.</li>
+<li><strong>The four editors are not connected yet.</strong> WordCraft, GridCraft, PdfCraft and SolidCraft do not open files from ShareCraft in this build.</li>
+<li><strong>Access removal is not built.</strong> There are no permissions, so there is nothing to revoke.</li>
+</ul>
+</section>
+
+<section id="licences"><h2>08 / Licences</h2>
+<p>ShareCraft is licensed <strong>MIT OR Apache-2.0</strong>; the texts are in <code>LICENSE-MIT</code> and <code>LICENSE-APACHE</code>.</p>
+<p>The <code>revisions</code> crate stores documents in Git using the <code>git2</code> library, which bundles libgit2. libgit2 is licensed GPL-2.0 with a linking exception. <code>revisions</code> is a server-only crate: it is not linked into the editor forks, and the browser-side crates (<code>collab-core</code>, <code>collab-text</code>, <code>protocol</code>, <code>web-client</code>) do not depend on it.</p>
+</section>
+
+<footer>ShareCraft · ThineCraft · Building and running · Updated 9 November 2026<br>Describes the development build of the first Stage 1 plan, not a release.</footer>
+</main></div>
+</body>
+</html>
