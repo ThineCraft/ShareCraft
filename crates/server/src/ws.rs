@@ -251,7 +251,8 @@ async fn text_session(s: &mut Session<'_>, first: &str) -> bool {
 }
 
 /// A file document's connection: joins its file session with `first`, which must be a file
-/// client's `Join`, and relays until the connection ends. A file client sends nothing after
+/// client's `Join`, confirms the join once access is checked again, and relays until the
+/// connection ends. A file client sends nothing after
 /// its `Join`. Returns whether a write timed out.
 async fn file_session(s: &mut Session<'_>, first: &str) -> bool {
     let Ok(FileClientMsg::Join { client }) = serde_json::from_str::<FileClientMsg>(first) else {
@@ -262,10 +263,20 @@ async fn file_session(s: &mut Session<'_>, first: &str) -> bool {
         return false;
     };
     let stalled = match recheck_after_join(s.state, s.doc, &room.access, s.visitor).await {
-        Recheck::Keep => {
-            let ended = relay(s, &room.commands, &room.access, out_rx, |_| None).await;
-            ended == Ended::WriteTimedOut
-        }
+        // Only now is the connection let in: it is sent `Joined` and may take the seat. One
+        // whose access ended meanwhile never was, and nobody saw it come and go.
+        Recheck::Keep => match room
+            .commands
+            .send(FileCommand::Confirm { conn, client })
+            .await
+        {
+            Ok(()) => {
+                let ended = relay(s, &room.commands, &room.access, out_rx, |_| None).await;
+                ended == Ended::WriteTimedOut
+            }
+            // The session ended meanwhile; the page joins again.
+            Err(_) => false,
+        },
         Recheck::Removed(reason) => {
             *s.unread = Some(out_rx);
             write_removed(s, &FileServerMsg::Removed { reason }).await
@@ -294,31 +305,19 @@ async fn write_removed(s: &mut Session<'_>, removed: &impl serde::Serialize) -> 
     }
 }
 
-/// Joins the document's room, opening a fresh room if the one found was just ending.
-async fn join_room(
-    state: &AppState,
-    doc: DocId,
-    conn: ConnId,
-    client: ClientId,
-    visitor: &Visitor,
-    resume: Option<Resume>,
-) -> Option<(RoomLink, mpsc::Receiver<Outbound>)> {
+/// Joins a room, opening a fresh one (with `open`) if the one found was just ending. `join`
+/// makes the join command from the connection's queue and the slot for the room's answer;
+/// `commands` is the room's command channel.
+async fn join_with<L, C>(
+    open: impl Fn() -> L,
+    commands: impl Fn(&L) -> &mpsc::Sender<C>,
+    join: impl Fn(mpsc::Sender<Outbound>, oneshot::Sender<JoinReply>) -> C,
+) -> Option<(L, mpsc::Receiver<Outbound>)> {
     for _ in 0..JOIN_ATTEMPTS {
-        let room = state.open_room(doc, visitor.doc_name.clone());
+        let room = open();
         let (tx, out_rx) = mpsc::channel(OUTBOUND_CAPACITY);
         let (accepted, was_accepted) = oneshot::channel();
-        let join = Command::Join {
-            conn,
-            client,
-            user: visitor.user,
-            session: visitor.session,
-            name: visitor.name.clone(),
-            role: visitor.role,
-            resume,
-            tx,
-            accepted,
-        };
-        if room.commands.send(join).await.is_err() {
+        if commands(&room).send(join(tx, accepted)).await.is_err() {
             continue;
         }
         match was_accepted.await {
@@ -331,7 +330,34 @@ async fn join_room(
     None
 }
 
-/// Joins the document's file session, opening a fresh one if the one found was just ending.
+/// Joins the document's text room.
+async fn join_room(
+    state: &AppState,
+    doc: DocId,
+    conn: ConnId,
+    client: ClientId,
+    visitor: &Visitor,
+    resume: Option<Resume>,
+) -> Option<(RoomLink, mpsc::Receiver<Outbound>)> {
+    join_with(
+        || state.open_room(doc, visitor.doc_name.clone()),
+        |room| &room.commands,
+        |tx, accepted| Command::Join {
+            conn,
+            client,
+            user: visitor.user,
+            session: visitor.session,
+            name: visitor.name.clone(),
+            role: visitor.role,
+            resume,
+            tx,
+            accepted,
+        },
+    )
+    .await
+}
+
+/// Joins the document's file session; the join waits there until confirmed.
 async fn join_file_room(
     state: &AppState,
     doc: DocId,
@@ -339,11 +365,10 @@ async fn join_file_room(
     client: ClientId,
     visitor: &Visitor,
 ) -> Option<(FileLink, mpsc::Receiver<Outbound>)> {
-    for _ in 0..JOIN_ATTEMPTS {
-        let room = state.open_file_room(doc, visitor.doc_name.clone());
-        let (tx, out_rx) = mpsc::channel(OUTBOUND_CAPACITY);
-        let (accepted, was_accepted) = oneshot::channel();
-        let join = FileCommand::Join {
+    join_with(
+        || state.open_file_room(doc, visitor.doc_name.clone()),
+        |room| &room.commands,
+        |tx, accepted| FileCommand::Join {
             conn,
             client,
             user: visitor.user,
@@ -352,18 +377,9 @@ async fn join_file_room(
             role: visitor.role,
             tx,
             accepted,
-        };
-        if room.commands.send(join).await.is_err() {
-            continue;
-        }
-        match was_accepted.await {
-            Ok(JoinReply::Accepted) => return Some((room, out_rx)),
-            Ok(JoinReply::Refused) => return None,
-            // The session ended before handling the join.
-            Err(_) => {}
-        }
-    }
-    None
+        },
+    )
+    .await
 }
 
 /// Closes the gap between the access check before the upgrade and the room accepting the

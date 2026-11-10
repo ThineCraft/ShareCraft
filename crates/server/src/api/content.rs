@@ -205,6 +205,12 @@ pub(crate) async fn save(
         )
             .into_response(),
         SaveReply::Failed => ApiError::Unavailable.into_response(),
+        // Distinct from a failed write: nothing was tried, and trying again later may work.
+        SaveReply::Busy => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "busy" })),
+        )
+            .into_response(),
     })
 }
 
@@ -292,7 +298,8 @@ fn content_disposition(name: &str) -> String {
     let fallback: String = name
         .chars()
         .map(|c| {
-            if c.is_ascii() && !c.is_ascii_control() && c != '"' && c != '\\' {
+            // `%` too: some browsers percent-decode the plain `filename`.
+            if c.is_ascii() && !c.is_ascii_control() && !matches!(c, '"' | '\\' | '%') {
                 c
             } else {
                 '_'
@@ -361,6 +368,10 @@ mod tests {
     #[test]
     fn extended_value_keeps_only_the_characters_the_rfc_allows() {
         let header = content_disposition("a;b,c=d'e(f)%.pdf");
+        assert!(
+            header.starts_with("attachment; filename=\"a;b,c=d'e(f)_.pdf\"; "),
+            "{header}"
+        );
         assert!(
             header.ends_with("filename*=UTF-8''a%3Bb%2Cc%3Dd%27e%28f%29%25.pdf"),
             "{header}"

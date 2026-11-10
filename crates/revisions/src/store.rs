@@ -105,10 +105,11 @@ fn read_at(
     }
 }
 
-/// The commit `oid`, or `None` if the repository has no such object.
+/// The commit `oid`, or `None` if the repository has no such object or it is not a commit (a
+/// blob or tree id names no revision).
 fn find_commit(repo: &Repository, oid: ObjectId) -> Result<Option<gix::Commit<'_>>, GitError> {
     match repo.try_find_object(oid)? {
-        Some(object) => Ok(Some(object.try_into_commit().map_err(GitError::new)?)),
+        Some(object) => Ok(object.try_into_commit().ok()),
         None => Ok(None),
     }
 }
@@ -577,6 +578,43 @@ mod tests {
         // Matching tips: both move together.
         move_refs(&repo, doc, new, Some(first_oid), Some(other), &sig).unwrap();
         assert_eq!(tips(&repo), (new, new));
+    }
+
+    /// The id of a blob or a tree is no revision: reading or describing it finds nothing,
+    /// rather than failing.
+    #[test]
+    fn object_that_is_not_a_commit_is_no_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RevisionStore::open(&dir.path().join("lib.git")).unwrap();
+        let doc = DocId(uuid::Uuid::new_v4());
+        let authors = [Author {
+            id: "u1".into(),
+            name: "Ann".into(),
+        }];
+        let fields = Map::new();
+        let Outcome::Written(first) = store
+            .checkpoint(&Checkpoint {
+                doc,
+                file_name: "n.txt",
+                bytes: b"x",
+                base: None,
+                authors: &authors,
+                fields: &fields,
+            })
+            .unwrap()
+        else {
+            panic!("expected Written");
+        };
+        let repo = store.repo().unwrap();
+        let commit = repo.find_commit(first.to_oid().unwrap()).unwrap();
+        let tree = commit.tree_id().unwrap().detach();
+        let blob = repo.write_blob(b"x").unwrap().detach();
+        for oid in [tree, blob] {
+            let id = RevisionId::from_oid(oid);
+            assert!(store.read(doc, Some(&id)).unwrap().is_none(), "{id}");
+            assert!(store.describe(doc, &id).unwrap().is_none(), "{id}");
+        }
+        assert!(store.read(doc, Some(&first)).unwrap().is_some());
     }
 
     #[test]

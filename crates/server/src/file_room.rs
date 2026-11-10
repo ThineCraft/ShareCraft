@@ -13,7 +13,6 @@
 //! room (see [`AccessChange`]). If a save finds the document saved from elsewhere, the session
 //! is in conflict: every later save is refused, and it ends as soon as it is empty.
 
-use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,10 +27,11 @@ use tokio::time::Instant;
 
 use crate::checkpoint::{Checkpointer, WriteError};
 use crate::events::{EventSink, error_text};
+use crate::members::{self, AccessRules, Admission, Frames, Member, Members};
 use crate::projection::Recorder;
 use crate::room::{
     AccessChange, ConnId, JoinReply, Link, Outbound, Place, Rooms, Running, Storage, credited_name,
-    finished, grace_end, sleep_until,
+    finished, grace_end, refuse_waiting, sleep_until,
 };
 
 /// Commands queued for a session before connections wait to send more.
@@ -42,8 +42,10 @@ const TOKEN_BYTES: usize = 32;
 /// What a connection, or a save, asks of a file session. Not `Debug`: a save carries the seat
 /// token.
 pub(crate) enum FileCommand {
-    /// Enter the session, replacing any connection with the same client id. The connection has
-    /// looked up who is joining and their role on the document.
+    /// Ask to enter the session. An accepted join waits, sent nothing and seen by nobody,
+    /// until the connection has checked access once more and sends `Confirm`; then it replaces
+    /// any connection with the same client id. The connection has looked up who is joining
+    /// and their role on the document.
     Join {
         conn: ConnId,
         client: ClientId,
@@ -57,6 +59,8 @@ pub(crate) enum FileCommand {
         /// case the connection asks again.
         accepted: oneshot::Sender<JoinReply>,
     },
+    /// The connection whose join was accepted still has access: it enters the session.
+    Confirm { conn: ConnId, client: ClientId },
     /// The connection ended.
     Leave { conn: ConnId, client: ClientId },
     /// Store `bytes` as the document's next revision, on behalf of the seat holder.
@@ -85,6 +89,8 @@ pub(crate) enum SaveReply {
     Conflict { current: Option<RevisionId> },
     /// The store failed; nothing was written.
     Failed,
+    /// A save is being written and another is already waiting; nothing was done.
+    Busy,
 }
 
 /// The ways into one file session.
@@ -145,19 +151,6 @@ impl Rooms {
     }
 }
 
-/// Someone connected.
-struct Member {
-    conn: ConnId,
-    client: ClientId,
-    user: UserId,
-    /// The sign-in session the connection belongs to.
-    session: SessionId,
-    name: String,
-    /// What this person may do; it can change while they are connected.
-    role: Role,
-    tx: mpsc::Sender<Outbound>,
-}
-
 /// The editing seat: the connection holding it and the token that proves it.
 struct Seat {
     client: ClientId,
@@ -212,15 +205,18 @@ struct FileRoom {
     revision: Option<RevisionId>,
     /// The document fields stored with the loaded revision; every save keeps them.
     fields: Map<String, Value>,
-    /// In joining order.
-    members: Vec<Member>,
+    /// Who is connected, in joining order.
+    members: Members<FileFrames>,
+    /// Connections whose join was accepted but not yet confirmed (see
+    /// [`FileCommand::Confirm`]). They are sent nothing, are not listed, and cannot take the
+    /// seat; access changes still reach them.
+    pending: Vec<Member>,
     seat: Option<Seat>,
-    /// The account that first joined with each client id, kept for the session's lifetime, so
-    /// nobody else can take over a connection's place.
-    client_owners: HashMap<ClientId, UserId>,
+    /// Where the session reports the seat and saving (its members report who joined, left and
+    /// was removed).
     events: EventSink,
-    /// Saves that arrived while another was being written, in arrival order.
-    waiting: VecDeque<Waiting>,
+    /// The one save allowed to wait while another is being written.
+    waiting: Option<Waiting>,
     /// The answer owed for the save being written, and who is credited with it.
     writing: Option<(oneshot::Sender<SaveReply>, String)>,
     /// Set once a save found the document saved from elsewhere, to the revision found then.
@@ -228,24 +224,24 @@ struct FileRoom {
 }
 
 impl FileRoom {
-    fn new(doc: DocId, revision: Option<RevisionId>, fields: Map<String, Value>) -> Self {
+    fn new(
+        doc: DocId,
+        revision: Option<RevisionId>,
+        fields: Map<String, Value>,
+        events: EventSink,
+    ) -> Self {
         Self {
             doc,
             revision,
             fields,
-            members: Vec::new(),
+            members: Members::new(doc, events.clone()),
+            pending: Vec::new(),
             seat: None,
-            client_owners: HashMap::new(),
-            events: EventSink::discard(),
-            waiting: VecDeque::new(),
+            events,
+            waiting: None,
             writing: None,
             conflict: None,
         }
-    }
-
-    fn with_events(mut self, events: EventSink) -> Self {
-        self.events = events;
-        self
     }
 
     /// An event of this document about `subject`, done by `actor`.
@@ -270,8 +266,9 @@ impl FileRoom {
         });
     }
 
+    /// Whether nobody is connected, nor waiting to be confirmed.
     fn is_empty(&self) -> bool {
-        self.members.is_empty()
+        self.members.is_empty() && self.pending.is_empty()
     }
 
     fn in_conflict(&self) -> bool {
@@ -280,7 +277,7 @@ impl FileRoom {
 
     /// Whether no save is being written or waiting.
     fn idle(&self) -> bool {
-        self.writing.is_none() && self.waiting.is_empty()
+        self.writing.is_none() && self.waiting.is_none()
     }
 
     fn handle(&mut self, cmd: FileCommand) {
@@ -295,18 +292,19 @@ impl FileRoom {
                 tx,
                 accepted,
             } => {
-                let owner = *self.client_owners.entry(client).or_insert(user);
-                let reply = if owner == user {
-                    let member = Member {
+                let reply = if self.members.claim(client, user) {
+                    // A connection of the same client still waiting is replaced.
+                    self.pending.retain(|m| m.client != client);
+                    self.pending.push(Member {
                         conn,
                         client,
                         user,
                         session,
                         name: credited_name(&name),
                         role,
+                        cursor: None,
                         tx,
-                    };
-                    self.join(member);
+                    });
                     JoinReply::Accepted
                 } else {
                     JoinReply::Refused
@@ -314,6 +312,7 @@ impl FileRoom {
                 // The connection may have gone away meanwhile; nothing to do then.
                 let _ = accepted.send(reply);
             }
+            FileCommand::Confirm { conn, client } => self.confirm(conn, client),
             FileCommand::Leave { conn, client } => self.leave(conn, client),
             FileCommand::Save {
                 user,
@@ -321,7 +320,7 @@ impl FileRoom {
                 base,
                 bytes,
                 reply,
-            } => self.waiting.push_back(Waiting {
+            } => self.save(Waiting {
                 user,
                 token,
                 base,
@@ -332,43 +331,26 @@ impl FileRoom {
     }
 
     fn apply_access(&mut self, change: AccessChange) {
-        match change {
-            AccessChange::SetAccess { user, role } => match role {
-                Some(role) => self.change_role(user, role),
-                None => self.remove(|m| m.user == user, RemovedReason::AccessRevoked),
-            },
-            AccessChange::EndSession { session } => {
-                self.remove(|m| m.session == session, RemovedReason::SignedOut);
-            }
-            AccessChange::RemoveUser { user } => {
-                self.remove(|m| m.user == user, RemovedReason::AccountDisabled);
-            }
-        }
+        members::apply_access(self, change);
     }
 
-    fn join(&mut self, member: Member) {
-        let (client, user) = (member.client, member.user);
-        let can_edit = member.role.can_edit();
-        let name = member.name.clone();
-        // Replacing the member drops the older connection's queue, which closes it.
-        let replaced = match self.members.iter_mut().find(|m| m.client == client) {
-            Some(existing) => {
-                *existing = member;
-                true
-            }
-            None => {
-                self.members.push(member);
-                false
-            }
+    /// The pending connection `conn` with `client` passed its check: it becomes a member, takes
+    /// the seat if it is free and it may edit, and is sent `Joined`.
+    fn confirm(&mut self, conn: ConnId, client: ClientId) {
+        let Some(at) = self
+            .pending
+            .iter()
+            .position(|m| m.conn == conn && m.client == client)
+        else {
+            // Removed, or replaced by a newer connection, meanwhile.
+            return;
         };
-        if !replaced {
-            self.emit(
-                "editing.joined",
-                Some(user),
-                user,
-                serde_json::json!({ "can_edit": can_edit }),
-            );
-        }
+        let member = self.pending.remove(at);
+        let (user, name, can_edit) = (member.user, member.name.clone(), member.role.can_edit());
+        let Admission::Joined { replaced } = self.members.admit(member) else {
+            // The client id was claimed for this account when the join was accepted.
+            return;
+        };
         // A connection that joins again in place of its own gives up the seat its older
         // connection held, and takes it again below, with a new token, if it still may edit.
         let freed = replaced && self.seat.as_ref().is_some_and(|s| s.client == client);
@@ -380,7 +362,7 @@ impl FileRoom {
 
         let mut frames = Vec::new();
         frames.extend(encode(&FileServerMsg::Joined {
-            participants: self.participants(),
+            participants: self.members.participants(),
             revision: self.revision.as_ref().map(ToString::to_string),
             can_edit,
             seat: self.seat_for(client),
@@ -435,7 +417,8 @@ impl FileRoom {
     /// The seat as everyone but its holder sees it.
     fn seat_for_others(&self) -> SeatState {
         let holder = self.seat.as_ref().and_then(|seat| {
-            self.participants()
+            self.members
+                .participants()
                 .into_iter()
                 .find(|p| p.client == seat.client)
         });
@@ -446,83 +429,33 @@ impl FileRoom {
     }
 
     fn leave(&mut self, conn: ConnId, client: ClientId) {
-        let left = self
-            .members
-            .iter()
-            .find(|m| m.conn == conn && m.client == client)
-            .map(|m| m.user);
-        self.members
+        self.pending
             .retain(|m| !(m.conn == conn && m.client == client));
-        if let Some(user) = left {
-            self.emit("editing.left", Some(user), user, serde_json::json!({}));
+        if let Some(user) = self.members.leave(conn, client) {
             self.members_left(Some(user));
         }
     }
 
-    /// Gives every connection of `user` the role `role`, telling each whose role changes with
-    /// `Access`. A holder who may no longer edit loses the seat.
-    fn change_role(&mut self, user: UserId, role: Role) {
-        let mut told = Vec::new();
-        for member in self.members.iter_mut().filter(|m| m.user == user) {
-            if member.role == role {
-                continue;
-            }
-            told.push(member.client);
-            member.role = role;
-        }
-        if told.is_empty() {
-            return;
-        }
-        if let Some(frame) = encode(&FileServerMsg::Access {
-            can_edit: role.can_edit(),
-        }) {
-            for client in told {
-                self.send(Some(client), &Outbound::One(frame.clone()));
-            }
-        }
-        if !role.can_edit() && self.seat.as_ref().is_some_and(|s| s.user == user) {
-            self.free_seat(None);
-        }
-        self.broadcast_people();
+    /// Whether `user` holds the seat with `token`, compared in constant time.
+    fn holds_seat(&self, user: UserId, token: &str) -> bool {
+        self.seat
+            .as_ref()
+            .is_some_and(|s| s.user == user && same_token(&s.token, token))
     }
 
-    /// Removes every member `which` selects: queues `Removed { reason }` as the connection's
-    /// last frame and drops its queue, which ends the connection once the frame is written.
-    fn remove(&mut self, which: impl Fn(&Member) -> bool, reason: RemovedReason) {
-        let Some(frame) = encode(&FileServerMsg::Removed { reason }) else {
+    /// A save arrived. One from someone not holding the seat with that token is answered
+    /// `NotHolder` at once; one behind a save already waiting is answered `Busy`. Otherwise
+    /// it waits for its turn, when it is checked again (see [`FileRoom::next_write`]).
+    fn save(&mut self, save: Waiting) {
+        if !self.holds_seat(save.user, &save.token) {
+            let _ = save.reply.send(SaveReply::NotHolder);
             return;
-        };
-        let doc = self.doc;
-        let events = &self.events;
-        let detail = serde_json::json!({ "reason": reason });
-        let before = self.members.len();
-        self.members.retain(|m| {
-            if !which(m) {
-                return true;
-            }
-            events.emit(NewEvent {
-                kind: "editing.removed",
-                actor: None,
-                subject: Some(m.user),
-                document: Some(doc),
-                detail: detail.clone(),
-            });
-            // A closed queue means the connection is already gone. A full one cannot take the
-            // frame; the connection still ends, but the page is not told why.
-            if let Err(mpsc::error::TrySendError::Full(_)) =
-                m.tx.try_send(Outbound::One(frame.clone()))
-            {
-                eprintln!(
-                    "sharecraft-server: could not tell user {} they were removed from document \
-                     {}: their connection was not keeping up",
-                    m.user.0, doc.0
-                );
-            }
-            false
-        });
-        if self.members.len() != before {
-            self.members_left(None);
         }
+        if self.waiting.is_some() {
+            let _ = save.reply.send(SaveReply::Busy);
+            return;
+        }
+        self.waiting = Some(save);
     }
 
     /// After members left: frees the seat if its holder was among them, crediting `actor`, and
@@ -549,49 +482,48 @@ impl FileRoom {
         }
     }
 
-    /// The next waiting save that may be written, once nothing is being written. Each save
-    /// passed over on the way is answered: one from someone not holding the seat with that
-    /// token is `NotHolder`; once in conflict, or on a revision other than the current one,
-    /// it is `Conflict`.
+    /// The save waiting, if it may be written and nothing is being written. A save that may not
+    /// is answered: one from someone no longer holding the seat with that token is
+    /// `NotHolder`; once in conflict, or on a revision other than the current one, it is
+    /// `Conflict`.
     fn next_write(&mut self) -> Option<WriteJob> {
         if self.writing.is_some() {
             return None;
         }
-        while let Some(save) = self.waiting.pop_front() {
-            let holder = self
-                .seat
-                .as_ref()
-                .filter(|s| s.user == save.user && same_token(&s.token, &save.token));
-            let Some(holder) = holder else {
-                let _ = save.reply.send(SaveReply::NotHolder);
-                continue;
-            };
-            if let Some(current) = &self.conflict {
-                let _ = save.reply.send(SaveReply::Conflict {
-                    current: current.clone(),
-                });
-                continue;
-            }
-            if save.base != self.revision {
-                let _ = save.reply.send(SaveReply::Conflict {
-                    current: self.revision.clone(),
-                });
-                continue;
-            }
-            let author = Author {
-                id: holder.user.0.to_string(),
-                name: holder.name.clone(),
-            };
-            self.writing = Some((save.reply, author.id.clone()));
-            self.broadcast_save(SaveState::Saving, None);
-            return Some(WriteJob {
-                bytes: save.bytes,
-                base: save.base,
-                author,
-                fields: self.fields.clone(),
+        let save = self.waiting.take()?;
+        let holder = self
+            .seat
+            .as_ref()
+            .filter(|s| s.user == save.user && same_token(&s.token, &save.token));
+        let Some(holder) = holder else {
+            let _ = save.reply.send(SaveReply::NotHolder);
+            return None;
+        };
+        if let Some(current) = &self.conflict {
+            let _ = save.reply.send(SaveReply::Conflict {
+                current: current.clone(),
             });
+            return None;
         }
-        None
+        // A save made from another revision is refused; the session carries on.
+        if save.base != self.revision {
+            let _ = save.reply.send(SaveReply::Conflict {
+                current: self.revision.clone(),
+            });
+            return None;
+        }
+        let author = Author {
+            id: holder.user.0.to_string(),
+            name: holder.name.clone(),
+        };
+        self.writing = Some((save.reply, author.id.clone()));
+        self.broadcast_save(SaveState::Saving, None);
+        Some(WriteJob {
+            bytes: save.bytes,
+            base: save.base,
+            author,
+            fields: self.fields.clone(),
+        })
     }
 
     /// Records how the save being written ended, tells everyone and answers it.
@@ -645,25 +577,9 @@ impl FileRoom {
         let _ = reply.send(answer);
     }
 
-    fn participants(&self) -> Vec<Participant> {
-        self.members
-            .iter()
-            .map(|m| Participant {
-                client: m.client,
-                user: m.user,
-                name: m.name.clone(),
-                can_edit: m.role.can_edit(),
-                cursor: None,
-            })
-            .collect()
-    }
-
     fn broadcast_people(&mut self) {
-        let people = FileServerMsg::People {
-            participants: self.participants(),
-        };
-        if let Some(frame) = encode(&people) {
-            self.send(None, &Outbound::One(frame));
+        if self.members.broadcast_people().any() {
+            self.members_left(None);
         }
     }
 
@@ -690,32 +606,74 @@ impl FileRoom {
     }
 
     /// Queues `out` for `to`, or for everyone when `to` is `None`. A member whose queue is full
-    /// or closed is dropped (it joins again), and the others are told.
+    /// or closed is dropped (it joins again), and the others are told; each round removes at
+    /// least one member, so this ends.
     fn send(&mut self, to: Option<ClientId>, out: &Outbound) {
-        let mut dropped = false;
-        let events = &self.events;
-        let doc = self.doc;
-        self.members.retain(|m| {
-            if to.is_some_and(|c| c != m.client) {
-                return true;
-            }
-            let delivered = m.tx.try_send(out.clone()).is_ok();
-            if !delivered {
-                events.emit(NewEvent {
-                    kind: "editing.left",
-                    actor: Some(m.user),
-                    subject: Some(m.user),
-                    document: Some(doc),
-                    detail: serde_json::json!({}),
-                });
-            }
-            dropped |= !delivered;
-            delivered
-        });
-        // Each round removes at least one member, so this ends.
-        if dropped {
+        if self.members.send(to, out).any() {
             self.members_left(None);
         }
+    }
+}
+
+impl AccessRules for FileRoom {
+    /// Each connection whose role changes is told with `Access`. A holder who may no longer
+    /// edit loses the seat. A connection still waiting to be confirmed takes the role, which
+    /// its `Joined` will carry.
+    fn change_role(&mut self, user: UserId, role: Role) {
+        for member in self.pending.iter_mut().filter(|m| m.user == user) {
+            member.role = role;
+        }
+        let change = self.members.change_role(user, role);
+        if change.departed.any() {
+            self.members_left(None);
+        }
+        if !change.changed {
+            return;
+        }
+        if !role.can_edit() && self.seat.as_ref().is_some_and(|s| s.user == user) {
+            self.free_seat(None);
+        }
+        self.broadcast_people();
+    }
+
+    /// A connection still waiting to be confirmed is dropped without a word: its connection
+    /// tells the page itself. It is reported as removed all the same.
+    fn remove(&mut self, which: &dyn Fn(&Member) -> bool, reason: RemovedReason) {
+        let doc = self.doc;
+        let events = &self.events;
+        self.pending.retain(|m| {
+            if !which(m) {
+                return true;
+            }
+            events.emit(NewEvent {
+                kind: "editing.removed",
+                actor: None,
+                subject: Some(m.user),
+                document: Some(doc),
+                detail: serde_json::json!({ "reason": reason }),
+            });
+            false
+        });
+        if self.members.remove(which, reason).any() {
+            self.members_left(None);
+        }
+    }
+}
+
+/// The file session's frames, for its members.
+struct FileFrames;
+
+impl Frames for FileFrames {
+    fn people(participants: Vec<Participant>) -> Option<Utf8Bytes> {
+        encode(&FileServerMsg::People { participants })
+    }
+
+    fn access(can_edit: bool) -> Option<Utf8Bytes> {
+        encode(&FileServerMsg::Access { can_edit })
+    }
+
+    fn removed(reason: RemovedReason) -> Option<Utf8Bytes> {
+        encode(&FileServerMsg::Removed { reason })
     }
 }
 
@@ -763,16 +721,14 @@ async fn run(
             // Saves waiting are dropped, which answers them `NotHolder`.
             place.close();
             access_rx.close();
-            rx.close();
-            while let Ok(cmd) = rx.try_recv() {
-                if let FileCommand::Join { accepted, .. } = cmd {
-                    let _ = accepted.send(JoinReply::Refused);
-                }
-            }
+            refuse_waiting(&mut rx, |cmd| match cmd {
+                FileCommand::Join { accepted, .. } => Some(accepted),
+                _ => None,
+            });
             return;
         }
     };
-    let mut room = FileRoom::new(doc, revision, fields).with_events(events.clone());
+    let mut room = FileRoom::new(doc, revision, fields, events.clone());
     // Revisions are recorded off this task, in the order written: one save is written at a
     // time, and the blocking task that writes it queues it before the session learns of it.
     let recorder = db.map(|db| Recorder::start(doc, Arc::clone(&store), db, events));
@@ -1004,12 +960,22 @@ mod tests {
     async fn join(
         link: &FileLink,
         conn: ConnId,
+        person: (UserId, &str),
+        role: Role,
+    ) -> (Tab, Option<String>) {
+        join_client(link, conn, ClientId(Uuid::new_v4()), person, role).await
+    }
+
+    /// Like [`join`], with the client id `client`.
+    async fn join_client(
+        link: &FileLink,
+        conn: ConnId,
+        client: ClientId,
         (user, name): (UserId, &str),
         role: Role,
     ) -> (Tab, Option<String>) {
         let (tx, out) = mpsc::channel(OUTBOUND_CAPACITY);
         let (accepted, reply) = oneshot::channel();
-        let client = ClientId(Uuid::new_v4());
         link.commands
             .send(FileCommand::Join {
                 conn,
@@ -1024,6 +990,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reply.await.unwrap(), JoinReply::Accepted);
+        link.commands
+            .send(FileCommand::Confirm { conn, client })
+            .await
+            .unwrap();
         let mut tab = Tab {
             client,
             out,
@@ -1300,6 +1270,14 @@ mod tests {
             Ok(None)
         }
 
+        fn load_at(
+            &self,
+            _doc: DocId,
+            _revision: &RevisionId,
+        ) -> Result<Option<Stored>, CheckpointError> {
+            Ok(None)
+        }
+
         fn describe(
             &self,
             _doc: DocId,
@@ -1388,6 +1366,333 @@ mod tests {
         );
         bob.until(|m| is_save(m, SaveState::Saved)).await;
         drop(started);
+    }
+
+    /// A session on a [`Gated`] store: every write waits for a release. Returns the link, the
+    /// channel saying a write started and the one releasing it.
+    fn gated(
+        f: &Fixture,
+    ) -> (
+        FileLink,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (started_tx, started) = std::sync::mpsc::channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        let link = f.open_with(
+            Arc::new(Gated {
+                started: std::sync::Mutex::new(started_tx),
+                gate: std::sync::Mutex::new(gate),
+            }),
+            None,
+        );
+        (link, started, release)
+    }
+
+    /// Waits until the gated store has started a write.
+    async fn write_started(
+        started: std::sync::mpsc::Receiver<()>,
+    ) -> std::sync::mpsc::Receiver<()> {
+        tokio::task::spawn_blocking(move || {
+            started.recv_timeout(Duration::from_secs(5)).unwrap();
+            started
+        })
+        .await
+        .unwrap()
+    }
+
+    /// Starts `user`'s save with `token` on its own task.
+    fn spawn_save(
+        f: &Fixture,
+        user: UserId,
+        token: &str,
+        base: Option<RevisionId>,
+    ) -> tokio::task::JoinHandle<SaveReply> {
+        let rooms = Arc::clone(&f.rooms);
+        let doc = f.doc;
+        let token = token.to_owned();
+        tokio::spawn(async move {
+            rooms
+                .save_file(doc, user, &token, base, b"x".to_vec())
+                .await
+        })
+    }
+
+    /// The revision the gated store answers every write with.
+    fn gated_revision() -> RevisionId {
+        format!("{:040x}", 1).parse().unwrap()
+    }
+
+    /// While a write is held: someone else's save is answered at once and never queued; one
+    /// more save of the holder's waits; a third is answered `Busy`. The two then complete in
+    /// order.
+    #[tokio::test]
+    async fn saves_wait_one_at_a_time_and_strangers_are_answered_at_once() {
+        let f = fixture().await;
+        let (link, started, release) = gated(&f);
+        let (_ann, token) = join(&link, 1, (f.ann, "Ann"), Role::Owner).await;
+        let token = token.unwrap();
+        let (_bob, _) = join(&link, 2, (f.bob, "Bob"), Role::Editor).await;
+
+        let first = spawn_save(&f, f.ann, &token, None);
+        let started = write_started(started).await;
+        let second = spawn_save(&f, f.ann, &token, Some(gated_revision()));
+        // Let the second save reach the session first.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Bob's save is answered while the write is still held.
+        let stranger = f
+            .rooms
+            .save_file(f.doc, f.bob, &token, None, b"x".to_vec())
+            .await;
+        assert_eq!(stranger, SaveReply::NotHolder);
+        let third = f
+            .rooms
+            .save_file(f.doc, f.ann, &token, Some(gated_revision()), b"x".to_vec())
+            .await;
+        assert_eq!(third, SaveReply::Busy);
+        assert!(!first.is_finished() && !second.is_finished());
+
+        release.send(()).unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(5), first)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, SaveReply::Saved(gated_revision()));
+        let started = write_started(started).await;
+        assert!(!second.is_finished(), "the second save is being written");
+        release.send(()).unwrap();
+        let second = tokio::time::timeout(Duration::from_secs(5), second)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second, SaveReply::Saved(gated_revision()));
+        drop(started);
+    }
+
+    /// A save waiting behind a write is checked again when its turn comes: the holder was
+    /// removed meanwhile, so it is `NotHolder` and never written.
+    #[tokio::test]
+    async fn waiting_save_of_a_removed_holder_is_refused() {
+        let f = fixture().await;
+        let (link, started, release) = gated(&f);
+        let (_ann, token) = join(&link, 1, (f.ann, "Ann"), Role::Owner).await;
+        let token = token.unwrap();
+
+        let first = spawn_save(&f, f.ann, &token, None);
+        let started = write_started(started).await;
+        let second = spawn_save(&f, f.ann, &token, Some(gated_revision()));
+        // Let the second save reach the session before Ann is demoted.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        f.rooms.send_to(
+            f.doc,
+            AccessChange::SetAccess {
+                user: f.ann,
+                role: Some(Role::Viewer),
+            },
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        release.send(()).unwrap();
+
+        let first = tokio::time::timeout(Duration::from_secs(5), first)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, SaveReply::Saved(gated_revision()));
+        let second = tokio::time::timeout(Duration::from_secs(5), second)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second, SaveReply::NotHolder);
+        // No second write was started.
+        let started = tokio::task::spawn_blocking(move || {
+            started.recv_timeout(Duration::from_millis(200)).is_err()
+        })
+        .await
+        .unwrap();
+        assert!(started, "the refused save was written");
+    }
+
+    /// A store that fails its first write, then writes to the library.
+    struct FailsOnce {
+        inner: RevisionStore,
+        failed: std::sync::atomic::AtomicBool,
+    }
+
+    impl Checkpointer for FailsOnce {
+        fn write(&self, c: &Checkpoint<'_>) -> Result<Outcome, CheckpointError> {
+            if !self.failed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return Err(CheckpointError::Git(revisions::GitError::new(
+                    "disk on fire",
+                )));
+            }
+            self.inner.write(c)
+        }
+
+        fn load(&self, doc: DocId) -> Result<Option<Stored>, CheckpointError> {
+            self.inner.load(doc)
+        }
+
+        fn load_at(
+            &self,
+            doc: DocId,
+            revision: &RevisionId,
+        ) -> Result<Option<Stored>, CheckpointError> {
+            self.inner.load_at(doc, revision)
+        }
+
+        fn describe(
+            &self,
+            doc: DocId,
+            revision: &RevisionId,
+        ) -> Result<Option<RevisionInfo>, CheckpointError> {
+            Checkpointer::describe(&self.inner, doc, revision)
+        }
+
+        fn history(&self, doc: DocId) -> Result<Vec<RevisionInfo>, CheckpointError> {
+            Checkpointer::history(&self.inner, doc)
+        }
+
+        fn documents(&self) -> Result<Vec<DocId>, revisions::GitError> {
+            Checkpointer::documents(&self.inner)
+        }
+    }
+
+    /// A store error other than a conflict answers `Failed`, everyone is told, and the session
+    /// carries on: the next save is stored.
+    #[tokio::test]
+    async fn failed_write_is_reported_and_the_next_save_succeeds() {
+        let f = fixture().await;
+        let link = f.open_with(
+            Arc::new(FailsOnce {
+                inner: f.library(),
+                failed: std::sync::atomic::AtomicBool::new(false),
+            }),
+            None,
+        );
+        let (mut ann, token) = join(&link, 1, (f.ann, "Ann"), Role::Owner).await;
+        let token = token.unwrap();
+        let reply = f
+            .rooms
+            .save_file(f.doc, f.ann, &token, None, b"one".to_vec())
+            .await;
+        assert_eq!(reply, SaveReply::Failed);
+        ann.until(|m| is_save(m, SaveState::Failed)).await;
+        assert!(f.library().read(f.doc, None).unwrap().is_none());
+
+        let reply = f
+            .rooms
+            .save_file(f.doc, f.ann, &token, None, b"one".to_vec())
+            .await;
+        assert!(matches!(reply, SaveReply::Saved(_)), "{reply:?}");
+        assert_eq!(
+            f.library().read(f.doc, None).unwrap().unwrap().bytes,
+            b"one"
+        );
+    }
+
+    /// Joining again gives a new token; the one from before no longer saves, even for the
+    /// same person.
+    #[tokio::test]
+    async fn token_from_before_a_rejoin_is_refused() {
+        let f = fixture().await;
+        let link = f.open();
+        let client = ClientId(Uuid::new_v4());
+        let (_old, before) = join_client(&link, 1, client, (f.ann, "Ann"), Role::Owner).await;
+        let before = before.unwrap();
+        let (_new, after) = join_client(&link, 2, client, (f.ann, "Ann"), Role::Owner).await;
+        let after = after.expect("Ann took the seat again");
+        assert_ne!(before, after);
+
+        let reply = f
+            .rooms
+            .save_file(f.doc, f.ann, &before, None, b"x".to_vec())
+            .await;
+        assert_eq!(reply, SaveReply::NotHolder);
+        let reply = f
+            .rooms
+            .save_file(f.doc, f.ann, &after, None, b"x".to_vec())
+            .await;
+        assert!(matches!(reply, SaveReply::Saved(_)), "{reply:?}");
+    }
+
+    /// A join is accepted but kept apart until confirmed: nobody hears of it, it gets nothing
+    /// and takes no seat. Removed before it is confirmed, it never was in the session.
+    #[tokio::test]
+    async fn unconfirmed_join_is_not_seen_and_takes_no_seat() {
+        let (events, mut recorded) = EventSink::channel();
+        let f = fixture().await;
+        let link = f.rooms.open_file(
+            f.doc,
+            NAME.into(),
+            Storage {
+                store: Arc::new(f.library()),
+                db: None,
+                events,
+            },
+            Duration::from_secs(60),
+        );
+        let vic_id = UserId(Uuid::new_v4());
+        let (mut vic, _) = join(&link, 1, (vic_id, "Vic"), Role::Viewer).await;
+
+        let (tx, mut out) = mpsc::channel(OUTBOUND_CAPACITY);
+        let (accepted, reply) = oneshot::channel();
+        link.commands
+            .send(FileCommand::Join {
+                conn: 2,
+                client: ClientId(Uuid::new_v4()),
+                user: f.bob,
+                session: SessionId(Uuid::new_v4()),
+                name: "Bob".into(),
+                role: Role::Editor,
+                tx,
+                accepted,
+            })
+            .await
+            .unwrap();
+        assert_eq!(reply.await.unwrap(), JoinReply::Accepted);
+        f.rooms.send_to(
+            f.doc,
+            AccessChange::SetAccess {
+                user: f.bob,
+                role: None,
+            },
+        );
+        // A marker after both: Vic's own second tab joins and Vic sees it.
+        let (_vic2, _) = join(&link, 3, (vic_id, "Vic"), Role::Viewer).await;
+        vic.until(
+            |m| matches!(m, FileServerMsg::People { participants } if participants.len() == 2),
+        )
+        .await;
+
+        assert!(
+            !vic.seen
+                .iter()
+                .any(|m| matches!(m, FileServerMsg::Seat { .. })),
+            "{:?}",
+            vic.seen
+        );
+        assert!(
+            vic.seen.iter().all(|m| match m {
+                FileServerMsg::People { participants }
+                | FileServerMsg::Joined { participants, .. } =>
+                    participants.iter().all(|p| p.user != f.bob),
+                _ => true,
+            }),
+            "{:?}",
+            vic.seen
+        );
+        // Bob's queue got nothing and was let go.
+        assert!(matches!(
+            out.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ));
+        let mut kinds = Vec::new();
+        while let Ok(event) = recorded.try_recv() {
+            if event.subject == Some(f.bob) {
+                kinds.push(event.kind);
+            }
+        }
+        assert_eq!(kinds, vec!["editing.removed"]);
     }
 
     #[test]

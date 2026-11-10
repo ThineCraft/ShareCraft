@@ -74,6 +74,14 @@ impl server::Checkpointer for Flaky {
         self.inner.load(doc)
     }
 
+    fn load_at(
+        &self,
+        doc: DocId,
+        revision: &RevisionId,
+    ) -> Result<Option<Stored>, CheckpointError> {
+        self.inner.load_at(doc, revision)
+    }
+
     fn describe(
         &self,
         doc: DocId,

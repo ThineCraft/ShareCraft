@@ -188,9 +188,9 @@ fn parse_id(text: &str) -> Result<Uuid, ApiError> {
 }
 
 /// Runs `change` (a database write and the hook that tells the rooms about it, or a save) on a
-/// task of its own and waits for it. A request whose caller goes away is dropped at its next `.await`; the
-/// task is not, so a write that was stored always reaches the rooms. A task that fails to finish
-/// answers `503`.
+/// task of its own and waits for it. A request whose caller goes away is dropped at its next
+/// `.await`; the task is not, so a write that was stored always reaches the rooms. A task that
+/// fails to finish answers `503`.
 async fn to_completion<T: Send + 'static>(
     change: impl Future<Output = Result<T, ApiError>> + Send + 'static,
 ) -> Result<T, ApiError> {

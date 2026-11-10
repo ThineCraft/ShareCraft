@@ -283,6 +283,7 @@ async fn an_older_revision_can_be_downloaded() {
     assert_eq!(response.status(), StatusCode::OK);
 
     let old = download(&server, Some(&ann), doc, Some(&first)).await;
+    assert_safe_headers(&old);
     assert_eq!(revision_of(&old), first);
     assert_eq!(old.bytes().await.unwrap().as_ref(), b"one");
     let current = download(&server, Some(&ann), doc, None).await;
@@ -395,7 +396,22 @@ async fn save_on_an_old_revision_is_a_conflict() {
     let current = download(&server, Some(&ann), doc, None).await;
     assert_eq!(revision_of(&current), first);
     assert_eq!(current.bytes().await.unwrap().as_ref(), b"one");
-    assert_eq!(server.doc_commits(doc), vec![first]);
+    assert_eq!(server.doc_commits(doc), vec![first.clone()]);
+
+    // Refusing those saves did not stop the session: one made from the current revision is
+    // stored.
+    let response = save(
+        &server,
+        &ann,
+        doc,
+        Some(&first),
+        Some(&token),
+        b"two".to_vec(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let current = download(&server, Some(&ann), doc, None).await;
+    assert_eq!(current.bytes().await.unwrap().as_ref(), b"two");
 }
 
 #[tokio::test]
@@ -654,5 +670,140 @@ async fn failed_upload_keeps_the_empty_document() {
     assert_eq!(
         download(&server, Some(&ann), doc, None).await.status(),
         StatusCode::NO_CONTENT
+    );
+}
+
+/// A Git object that is a tree or a blob is no revision: asking for it is `404`, not a failure.
+#[tokio::test]
+async fn object_that_is_not_a_revision_is_not_found() {
+    let server = spawn_server().await;
+    let ann = server.user("Ann").await;
+    let doc = uploaded(&server, &ann, "A.xlsx", b"first".to_vec()).await;
+    let revision = revision_of(&download(&server, Some(&ann), doc, None).await);
+
+    let repo = gix::open(server.library()).unwrap();
+    let commit = repo
+        .find_commit(gix::ObjectId::from_hex(revision.as_bytes()).unwrap())
+        .unwrap();
+    let tree = commit.tree().unwrap();
+    let blob = tree
+        .lookup_entry_by_path(format!("docs/{}/content", doc.0))
+        .unwrap()
+        .unwrap()
+        .object_id();
+    for object in [tree.id.to_string(), blob.to_string()] {
+        let response = download(&server, Some(&ann), doc, Some(&object)).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{object}");
+    }
+}
+
+/// Files far larger than the API's 16 KiB body limit for JSON pass the content routes, up to
+/// `max_file_bytes`; one byte more is refused, whether or not the request says its length.
+#[tokio::test]
+async fn files_up_to_the_limit_pass_and_larger_ones_do_not() {
+    const LIMIT: usize = 64 * 1024;
+    let server = spawn_server_config(|config| config.max_file_bytes = LIMIT).await;
+    let ann = server.user("Ann").await;
+
+    let first: Vec<u8> = (0..40 * 1024).map(|n| (n % 251) as u8).collect();
+    let response = upload(&server, &ann, "Big.xlsx", first.clone()).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let json: Value = response.json().await.unwrap();
+    let doc = DocId(json["id"].as_str().unwrap().parse().unwrap());
+    let response = download(&server, Some(&ann), doc, None).await;
+    let base = revision_of(&response);
+    assert_eq!(response.bytes().await.unwrap().to_vec(), first);
+
+    let seat = FileClient::connect_as(&server, doc, &ann).await;
+    let token = seat.token().unwrap();
+    let second: Vec<u8> = (0..40 * 1024).map(|n| (n % 241) as u8).collect();
+    let response = save(
+        &server,
+        &ann,
+        doc,
+        Some(&base),
+        Some(&token),
+        second.clone(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = download(&server, Some(&ann), doc, None).await;
+    assert_eq!(response.bytes().await.unwrap().to_vec(), second);
+
+    // One byte over the limit.
+    let response = upload(&server, &ann, "Over.xlsx", vec![7; LIMIT + 1]).await;
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let current = revision_of(&download(&server, Some(&ann), doc, None).await);
+    let response = save(
+        &server,
+        &ann,
+        doc,
+        Some(&current),
+        Some(&token),
+        vec![7; LIMIT + 1],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(documents_of(&server, &ann).await, 1);
+
+    // Sent in chunks, with no length given up front.
+    let chunks: Vec<Result<Vec<u8>, std::io::Error>> = (0..(LIMIT / 1024 + 2))
+        .map(|_| Ok(vec![7u8; 1024]))
+        .collect();
+    let response = server
+        .http(Some(&ann))
+        .post(server.url("/api/docs/upload"))
+        .query(&[("name", "Chunked.xlsx")])
+        .body(reqwest::Body::wrap_stream(futures_util::stream::iter(
+            chunks,
+        )))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(documents_of(&server, &ann).await, 1);
+}
+
+/// A file session's events: who joined and took the seat, the save credited to them, and the
+/// person gone and the seat freed when they leave, each with its actor.
+#[tokio::test]
+async fn file_session_events_are_recorded() {
+    let server = spawn_server().await;
+    let ann = server.user("Ann").await;
+    let doc = new_doc();
+    server.create_file_document(doc, &ann).await;
+    let mut seat = FileClient::connect_as(&server, doc, &ann).await;
+    let token = seat.token().unwrap();
+    let response = save(&server, &ann, doc, None, Some(&token), b"one".to_vec()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let json: Value = response.json().await.unwrap();
+    let revision = json["revision"].as_str().unwrap().to_owned();
+    seat.close().await;
+
+    let events = wait_events(&server.db.db, doc, |e| {
+        e.iter().any(|e| e.kind == "seat.freed")
+    })
+    .await;
+    let session: Vec<(&str, Option<_>, Option<_>)> = events
+        .iter()
+        .filter(|e| e.kind != "document.created")
+        .map(|e| (e.kind.as_str(), e.actor, e.subject))
+        .collect();
+    let ann_id = Some(ann.id);
+    assert_eq!(
+        session,
+        vec![
+            ("editing.joined", ann_id, ann_id),
+            ("seat.taken", ann_id, ann_id),
+            ("revision.saved", None, None),
+            ("editing.left", ann_id, ann_id),
+            ("seat.freed", ann_id, ann_id),
+        ]
+    );
+    let saved = events.iter().find(|e| e.kind == "revision.saved").unwrap();
+    assert_eq!(saved.detail["revision"], revision.as_str());
+    assert_eq!(
+        saved.detail["authors"],
+        serde_json::json!([ann.id.0.to_string()])
     );
 }

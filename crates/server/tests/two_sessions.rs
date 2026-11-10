@@ -544,6 +544,14 @@ impl Checkpointer for Flaky {
         self.inner.load(doc)
     }
 
+    fn load_at(
+        &self,
+        doc: DocId,
+        revision: &RevisionId,
+    ) -> Result<Option<Stored>, CheckpointError> {
+        self.inner.load_at(doc, revision)
+    }
+
     fn describe(
         &self,
         doc: DocId,
@@ -693,6 +701,14 @@ impl Checkpointer for BrokenLoad {
         Err(CheckpointError::Git(revisions::GitError::new("unreadable")))
     }
 
+    fn load_at(
+        &self,
+        _doc: DocId,
+        _revision: &RevisionId,
+    ) -> Result<Option<Stored>, CheckpointError> {
+        Err(CheckpointError::Git(revisions::GitError::new("unreadable")))
+    }
+
     fn describe(
         &self,
         _doc: DocId,
@@ -789,6 +805,14 @@ impl Checkpointer for Gated {
 
     fn load(&self, doc: DocId) -> Result<Option<Stored>, CheckpointError> {
         self.inner.load(doc)
+    }
+
+    fn load_at(
+        &self,
+        doc: DocId,
+        revision: &RevisionId,
+    ) -> Result<Option<Stored>, CheckpointError> {
+        self.inner.load_at(doc, revision)
     }
 
     fn describe(

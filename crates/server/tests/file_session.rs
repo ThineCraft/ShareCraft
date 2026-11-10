@@ -342,6 +342,14 @@ impl Checkpointer for HeldLoad {
         self.inner.load(doc)
     }
 
+    fn load_at(
+        &self,
+        doc: DocId,
+        revision: &RevisionId,
+    ) -> Result<Option<Stored>, CheckpointError> {
+        self.inner.load_at(doc, revision)
+    }
+
     fn describe(
         &self,
         doc: DocId,
@@ -394,7 +402,11 @@ async fn join_racing_a_removal_gets_only_removed() {
     .await;
     let held = ReleaseOnDrop(slot.lock().unwrap().clone().unwrap());
     let (doc, ann, bob) = shared_file(&server).await;
+    let vic = server.user("Vic").await;
+    share(&server, &ann, doc, &vic, "viewer").await;
 
+    // Vic, a viewer, waits in the loading session too, and watches.
+    let mut v = FileClient::open_as(&server, doc, &vic).await;
     let mut b = FileClient::open_as(&server, doc, &bob).await;
     tokio::time::timeout(common::TIMEOUT, started.recv())
         .await
@@ -411,4 +423,30 @@ async fn join_racing_a_removal_gets_only_removed() {
             reason: RemovedReason::AccessRevoked
         }]
     );
+
+    // Nobody saw Bob come and go, nor take the seat. Ann joining marks the end of what Vic
+    // was sent.
+    v.pump_until(|c| c.joined).await;
+    let _a = FileClient::connect_as(&server, doc, &ann).await;
+    v.pump_until(|c| taken_by(c.seat.as_ref(), ann.id)).await;
+    assert_eq!(v.seat_messages().len(), 1, "{:?}", v.received);
+    assert!(
+        v.received.iter().all(|m| match m {
+            FileServerMsg::Joined { participants, .. } | FileServerMsg::People { participants } =>
+                participants.iter().all(|p| p.user != bob.id),
+            _ => true,
+        }),
+        "{:?}",
+        v.received
+    );
+    let events = common::wait_events(&server.db.db, doc, |e| {
+        e.iter().any(|e| e.kind == "seat.taken")
+    })
+    .await;
+    let bobs: Vec<&str> = events
+        .iter()
+        .filter(|e| e.subject == Some(bob.id) && e.kind != "access.granted")
+        .map(|e| e.kind.as_str())
+        .collect();
+    assert_eq!(bobs, vec!["access.revoked", "editing.removed"]);
 }

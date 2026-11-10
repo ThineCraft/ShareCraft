@@ -215,6 +215,20 @@ mod tests {
         assert_eq!(back, msg);
     }
 
+    /// A text `join` always names `resume`, as `null` when not resuming. The server tells a
+    /// text client's `join` from a file client's (`protocol::file`) by this key, so `resume`
+    /// must never gain `skip_serializing_if`.
+    #[test]
+    fn join_without_resume_still_names_it() {
+        let json = serde_json::to_string(&ClientMsg::<TextOp>::Join {
+            client: ClientId(Uuid::nil()),
+            resume: None,
+        })
+        .unwrap();
+        assert!(json.contains("\"resume\":null"), "{json}");
+        assert!(serde_json::from_str::<FileClientMsg>(&json).is_err());
+    }
+
     #[test]
     fn save_state_is_snake_case() {
         assert_eq!(

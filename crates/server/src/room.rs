@@ -30,18 +30,29 @@ use uuid::Uuid;
 use crate::checkpoint::{Checkpointer, Finished, SaveJob, Schedule, Timing, WriteError};
 use crate::events::{EventSink, error_text};
 use crate::file_room::{self, FileLink};
+use crate::members::{self, AccessRules, Admission, Frames, Member, Members};
 use crate::projection::Recorder;
 
 /// Identifies one WebSocket connection, so a replaced connection's late messages are ignored.
 pub(crate) type ConnId = u64;
 
-/// Messages a room queues for one connection's writer.
-#[derive(Clone, Debug)]
+/// Messages a room queues for one connection's writer. Its `Debug` form leaves the frames out:
+/// a frame can carry document text or a seat token.
+#[derive(Clone)]
 pub(crate) enum Outbound {
     /// One frame.
     One(Utf8Bytes),
     /// Several frames that must arrive together and in order (a join and its catch-up).
     Many(Vec<Utf8Bytes>),
+}
+
+impl std::fmt::Debug for Outbound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Outbound::One(_) => f.write_str("One(<frame>)"),
+            Outbound::Many(frames) => write!(f, "Many(<{} frames>)", frames.len()),
+        }
+    }
 }
 
 /// Frames queued per connection before the room gives up on it.
@@ -133,27 +144,6 @@ pub(crate) struct Initial {
     pub fields: Map<String, Value>,
 }
 
-/// The person joining: who they are and what they may do.
-struct Joiner {
-    user: UserId,
-    session: SessionId,
-    name: String,
-    role: Role,
-}
-
-struct Member {
-    conn: ConnId,
-    client: ClientId,
-    user: UserId,
-    /// The sign-in session the connection belongs to.
-    session: SessionId,
-    name: String,
-    /// What this person may do; it can change while they are connected.
-    role: Role,
-    cursor: Option<usize>,
-    tx: mpsc::Sender<Outbound>,
-}
-
 /// The state of one open document. Handling a command never blocks: frames are queued with
 /// `try_send` and a connection whose queue is full or closed is dropped.
 pub(crate) struct Room {
@@ -164,16 +154,15 @@ pub(crate) struct Room {
     epoch: RoomEpoch,
     log: ServerLog<TextDoc>,
     schedule: Schedule,
-    /// In joining order.
-    members: Vec<Member>,
+    /// Who is connected, in joining order. A client id stays with the account that first used
+    /// it, so nobody else can take over a connection's place, its resume position or its
+    /// record of committed changes.
+    members: Members<TextFrames>,
     /// Each client's last committed change, so a resend is recognised however much of the log
     /// is kept.
     last_committed: HashMap<ClientId, OpId>,
-    /// The account that first joined with each client id. A client id stays with that account
-    /// for the room's lifetime, also after they leave, so nobody else can take over a
-    /// connection's place, its resume position or its record of committed changes.
-    client_owners: HashMap<ClientId, UserId>,
-    /// Where the room reports who joined, left and was removed, and how saving went.
+    /// Where the room reports how saving went (its members report who joined, left and was
+    /// removed).
     events: EventSink,
     /// The people credited in the running checkpoint.
     saving_authors: Vec<String>,
@@ -191,9 +180,8 @@ impl Room {
             epoch: RoomEpoch(Uuid::new_v4()),
             log: ServerLog::new(initial.doc, Seq(0)),
             schedule: Schedule::new(initial.revision, Seq(0), timing).with_fields(initial.fields),
-            members: Vec::new(),
+            members: Members::new(doc, EventSink::discard()),
             last_committed: HashMap::new(),
-            client_owners: HashMap::new(),
             events: EventSink::discard(),
             saving_authors: Vec::new(),
             failure_reported: false,
@@ -202,25 +190,9 @@ impl Room {
 
     /// The room reports its events to `events`.
     pub(crate) fn with_events(mut self, events: EventSink) -> Self {
+        self.members = Members::new(self.doc, events.clone());
         self.events = events;
         self
-    }
-
-    /// An event of this room's document about `subject`, done by `actor`.
-    fn emit(
-        &self,
-        kind: &'static str,
-        actor: Option<UserId>,
-        subject: UserId,
-        detail: serde_json::Value,
-    ) {
-        self.events.emit(NewEvent {
-            kind,
-            actor,
-            subject: Some(subject),
-            document: Some(self.doc),
-            detail,
-        });
     }
 
     /// An event of this room's document about saving, with no person involved.
@@ -341,18 +313,22 @@ impl Room {
                 tx,
                 accepted,
             } => {
-                let joiner = Joiner {
+                let member = Member {
+                    conn,
+                    client,
                     user,
                     session,
-                    name,
+                    name: credited_name(&name),
                     role,
+                    cursor: None,
+                    tx,
                 };
-                let owner = *self.client_owners.entry(client).or_insert(user);
-                let reply = if owner == user {
-                    self.join(conn, client, joiner, resume, tx);
-                    JoinReply::Accepted
-                } else {
-                    JoinReply::Refused
+                let reply = match self.members.admit(member) {
+                    Admission::Joined { .. } => {
+                        self.join(client, role.can_edit(), resume);
+                        JoinReply::Accepted
+                    }
+                    Admission::Refused => JoinReply::Refused,
                 };
                 // The connection may have gone away meanwhile; nothing to do then.
                 let _ = accepted.send(reply);
@@ -371,53 +347,13 @@ impl Room {
 
     /// Carries out one access change.
     pub(crate) fn apply_access(&mut self, change: AccessChange) {
-        match change {
-            AccessChange::SetAccess { user, role } => match role {
-                Some(role) => self.change_role(user, role),
-                None => self.remove(|m| m.user == user, RemovedReason::AccessRevoked),
-            },
-            AccessChange::EndSession { session } => {
-                self.remove(|m| m.session == session, RemovedReason::SignedOut);
-            }
-            AccessChange::RemoveUser { user } => {
-                self.remove(|m| m.user == user, RemovedReason::AccountDisabled);
-            }
-        }
+        members::apply_access(self, change);
     }
 
-    fn join(
-        &mut self,
-        conn: ConnId,
-        client: ClientId,
-        joiner: Joiner,
-        resume: Option<Resume>,
-        tx: mpsc::Sender<Outbound>,
-    ) {
-        let can_edit = joiner.role.can_edit();
-        let member = Member {
-            conn,
-            client,
-            user: joiner.user,
-            session: joiner.session,
-            name: credited_name(&joiner.name),
-            role: joiner.role,
-            cursor: None,
-            tx,
-        };
+    /// Sends `client`, just admitted, the document (or what it missed) and everyone the new
+    /// people list.
+    fn join(&mut self, client: ClientId, can_edit: bool, resume: Option<Resume>) {
         self.schedule.joined();
-        let user = member.user;
-        // Replacing the member drops the older connection's queue, which closes it.
-        let replaced = match self.members.iter_mut().find(|m| m.client == client) {
-            Some(existing) => {
-                *existing = member;
-                true
-            }
-            None => {
-                self.members.push(member);
-                false
-            }
-        };
-
         let epoch = self.epoch;
         let seq = self.log.head();
         let text = self.log.doc().as_str().to_owned();
@@ -428,16 +364,6 @@ impl Room {
         let missed = resume
             .filter(|r| r.epoch == epoch)
             .and_then(|r| self.log.since(r.seq));
-        // Replacing one's own live connection is not a new arrival. Anything else is, whether
-        // or not the resume is honoured: the person was away, and `editing.left` said so.
-        if !replaced {
-            self.emit(
-                "editing.joined",
-                Some(user),
-                user,
-                serde_json::json!({ "can_edit": can_edit }),
-            );
-        }
         match (resume, missed) {
             (None, _) => msgs.push(ServerMsg::Joined {
                 epoch,
@@ -548,103 +474,19 @@ impl Room {
     }
 
     fn leave(&mut self, conn: ConnId, client: ClientId) {
-        let left = self
-            .members
-            .iter()
-            .find(|m| m.conn == conn && m.client == client)
-            .map(|m| m.user);
-        self.members
-            .retain(|m| !(m.conn == conn && m.client == client));
-        if let Some(user) = left {
-            self.emit("editing.left", Some(user), user, serde_json::json!({}));
-            self.broadcast_people();
-        }
-    }
-
-    /// Gives every connection of `user` the role `role`. Each connection whose role changes is
-    /// told with `Access`, even when it may edit as before (an owner becoming an editor, say),
-    /// so the page can read the role again; everyone gets a new people list if any role changed.
-    fn change_role(&mut self, user: UserId, role: Role) {
-        let mut told = Vec::new();
-        for member in self.members.iter_mut().filter(|m| m.user == user) {
-            if member.role == role {
-                continue;
-            }
-            told.push(member.client);
-            member.role = role;
-        }
-        let changed = !told.is_empty();
-        if let Some(frame) = encode(&ServerMsg::Access {
-            can_edit: role.can_edit(),
-        }) {
-            for client in told {
-                self.send(Some(client), &Outbound::One(frame.clone()));
-            }
-        }
-        if changed {
-            self.broadcast_people();
-        }
-    }
-
-    /// Removes every member `which` selects: queues `Removed { reason }` as the connection's
-    /// last frame and drops its queue, which ends the connection once the frame is written.
-    /// Anything the connection sends afterwards is ignored, as it is no longer a member.
-    fn remove(&mut self, which: impl Fn(&Member) -> bool, reason: RemovedReason) {
-        let Some(frame) = encode(&ServerMsg::Removed { reason }) else {
-            return;
-        };
-        let doc = self.doc;
-        let events = &self.events;
-        let detail = serde_json::json!({ "reason": reason });
-        let before = self.members.len();
-        self.members.retain(|m| {
-            if !which(m) {
-                return true;
-            }
-            events.emit(NewEvent {
-                kind: "editing.removed",
-                actor: None,
-                subject: Some(m.user),
-                document: Some(doc),
-                detail: detail.clone(),
-            });
-            // A closed queue means the connection is already gone. A full one cannot take the
-            // frame; the connection still ends, but the page is not told why.
-            if let Err(mpsc::error::TrySendError::Full(_)) =
-                m.tx.try_send(Outbound::One(frame.clone()))
-            {
-                eprintln!(
-                    "sharecraft-server: could not tell user {} they were removed from document \
-                     {}: their connection was not keeping up",
-                    m.user.0, doc.0
-                );
-            }
-            false
-        });
-        if self.members.len() != before {
+        if self.members.leave(conn, client).is_some() {
             self.broadcast_people();
         }
     }
 
     fn participants(&self) -> Vec<Participant> {
-        self.members
-            .iter()
-            .map(|m| Participant {
-                client: m.client,
-                user: m.user,
-                name: m.name.clone(),
-                can_edit: m.role.can_edit(),
-                cursor: m.cursor,
-            })
-            .collect()
+        self.members.participants()
     }
 
+    /// Sends everyone the people list.
     fn broadcast_people(&mut self) {
-        let people = ServerMsg::<TextOp>::People {
-            participants: self.participants(),
-        };
-        if let Some(frame) = encode(&people) {
-            self.send(None, &Outbound::One(frame));
+        if self.members.broadcast_people().any() {
+            self.members_left();
         }
     }
 
@@ -662,30 +504,52 @@ impl Room {
     /// Queues `out` for `to`, or for everyone when `to` is `None`. A member whose queue is full
     /// or closed is removed (it reconnects and catches up), and the others are told.
     fn send(&mut self, to: Option<ClientId>, out: &Outbound) {
-        let mut dropped = false;
-        let events = &self.events;
-        let doc = self.doc;
-        self.members.retain(|m| {
-            if to.is_some_and(|c| c != m.client) {
-                return true;
-            }
-            let delivered = m.tx.try_send(out.clone()).is_ok();
-            if !delivered {
-                events.emit(NewEvent {
-                    kind: "editing.left",
-                    actor: Some(m.user),
-                    subject: Some(m.user),
-                    document: Some(doc),
-                    detail: serde_json::json!({}),
-                });
-            }
-            dropped |= !delivered;
-            delivered
-        });
-        // Each round removes at least one member, so this ends.
-        if dropped {
+        if self.members.send(to, out).any() {
+            self.members_left();
+        }
+    }
+
+    /// After members left: the others are told who is here. Each round removes at least one
+    /// member, so this ends.
+    fn members_left(&mut self) {
+        self.broadcast_people();
+    }
+}
+
+impl AccessRules for Room {
+    /// Each connection whose role changes is told with `Access`; everyone gets a new people
+    /// list if any role changed.
+    fn change_role(&mut self, user: UserId, role: Role) {
+        let change = self.members.change_role(user, role);
+        if change.departed.any() {
+            self.members_left();
+        }
+        if change.changed {
             self.broadcast_people();
         }
+    }
+
+    fn remove(&mut self, which: &dyn Fn(&Member) -> bool, reason: RemovedReason) {
+        if self.members.remove(which, reason).any() {
+            self.members_left();
+        }
+    }
+}
+
+/// The text room's frames, for its members.
+struct TextFrames;
+
+impl Frames for TextFrames {
+    fn people(participants: Vec<Participant>) -> Option<Utf8Bytes> {
+        encode(&ServerMsg::People { participants })
+    }
+
+    fn access(can_edit: bool) -> Option<Utf8Bytes> {
+        encode(&ServerMsg::Access { can_edit })
+    }
+
+    fn removed(reason: RemovedReason) -> Option<Utf8Bytes> {
+        encode(&ServerMsg::Removed { reason })
     }
 }
 
@@ -963,12 +827,10 @@ async fn run(
             // is waiting; a later join opens a fresh room that tries the load again.
             place.close();
             access_rx.close();
-            rx.close();
-            while let Ok(cmd) = rx.try_recv() {
-                if let Command::Join { accepted, .. } = cmd {
-                    let _ = accepted.send(JoinReply::Refused);
-                }
-            }
+            refuse_waiting(&mut rx, |cmd| match cmd {
+                Command::Join { accepted, .. } => Some(accepted),
+                _ => None,
+            });
             return;
         }
     };
@@ -1053,6 +915,21 @@ async fn run(
     // Joins queued after the room decided to end are dropped unanswered, so those
     // connections open a fresh room, which loads what this one saved.
     while rx.try_recv().is_ok() {}
+}
+
+/// Closes `rx`, the command channel of a room that could not load its document, and refuses
+/// every join waiting in it (`join_reply` finds a command's answer, if it is a join); a later
+/// join opens a fresh room that tries the load again. Other commands are dropped.
+pub(crate) fn refuse_waiting<C>(
+    rx: &mut mpsc::Receiver<C>,
+    join_reply: impl Fn(C) -> Option<oneshot::Sender<JoinReply>>,
+) {
+    rx.close();
+    while let Ok(cmd) = rx.try_recv() {
+        if let Some(accepted) = join_reply(cmd) {
+            let _ = accepted.send(JoinReply::Refused);
+        }
+    }
 }
 
 /// When the grace period of a room empty since `since` ends.
@@ -1548,6 +1425,14 @@ mod tests {
             Ok(None)
         }
 
+        fn load_at(
+            &self,
+            _doc: DocId,
+            _revision: &RevisionId,
+        ) -> Result<Option<revisions::Stored>, CheckpointError> {
+            Ok(None)
+        }
+
         fn describe(
             &self,
             _doc: DocId,
@@ -1666,6 +1551,14 @@ mod tests {
         }
 
         fn load(&self, _doc: DocId) -> Result<Option<revisions::Stored>, CheckpointError> {
+            Ok(None)
+        }
+
+        fn load_at(
+            &self,
+            _doc: DocId,
+            _revision: &RevisionId,
+        ) -> Result<Option<revisions::Stored>, CheckpointError> {
             Ok(None)
         }
 

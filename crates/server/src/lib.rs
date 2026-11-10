@@ -14,6 +14,7 @@ pub mod config;
 pub mod editors;
 mod events;
 mod file_room;
+mod members;
 mod projection;
 mod room;
 mod ws;
