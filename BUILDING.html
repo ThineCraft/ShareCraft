@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="description" content="How to build and run the ShareCraft development build: prerequisites, commands, where data is kept, and what this build does not do yet.">
+<meta name="description" content="How to build and run the ShareCraft development build: prerequisites, commands, accounts and sharing, where data is kept, and what this build does not do yet.">
 <title>ShareCraft — Building and Running</title>
 <style>
 :root{--ink:#172f38;--muted:#536b72;--line:#d7e2e3;--accent:#086959;--paper:#fff;--wash:#f2f6f5;font-family:Segoe UI,Arial,sans-serif;color:var(--ink);background:var(--wash);line-height:1.65}
@@ -20,15 +20,17 @@ pre{background:#0f2a2c;color:#e6f2ee;border-radius:6px;padding:14px 16px;margin:
 <header class="cover">
 <p class="eyebrow">ThineCraft / Development build</p>
 <h1>Building and running ShareCraft</h1>
-<p class="lede">How to build the first working piece of ShareCraft, a plain-text document that two browser tabs edit together, and what it does and does not do yet.</p>
-<div class="meta"><span>Stage 1 · First plan</span><span>9 November 2026</span><span>Companion to <a href="sequencing.html" style="color:inherit">Sequencing Plan</a></span></div>
+<p class="lede">How to build and run the development build of ShareCraft: people sign in with their own accounts, share plain-text documents with each other, and edit them together in browser tabs. This page also says what the build does not do yet.</p>
+<div class="meta"><span>Stage 1 · Second plan</span><span>10 November 2026</span><span>Companion to <a href="sequencing.html" style="color:inherit">Sequencing Plan</a></span></div>
 </header>
 <div class="layout">
 <nav aria-label="Document contents"><p>In this document</p>
-<a href="#need">01 · What you need</a><a href="#build">02 · Build and check</a><a href="#run">03 · Run it</a><a href="#settings">04 · Settings</a><a href="#data">05 · Where data is kept</a><a href="#stop">06 · Stopping the server</a><a href="#limits">07 · Known limits</a><a href="#licences">08 · Licences</a>
+<a href="#need">01 · What you need</a><a href="#build">02 · Build and check</a><a href="#admin">03 · The first administrator</a><a href="#run">04 · Run it and sign in</a><a href="#settings">05 · Settings</a><a href="#accounts">06 · Accounts and signing in</a><a href="#sharing">07 · Sharing and roles</a><a href="#removed">08 · What a removed person sees</a><a href="#data">09 · Where data is kept</a><a href="#index">10 · The revision index</a><a href="#events">11 · Events</a><a href="#stop">12 · Stopping the server, and notices</a><a href="#limits">13 · Known limits</a><a href="#licences">14 · Licences</a>
 </nav>
 <main id="main">
 <div class="toolbar"><span class="small">Standalone HTML · Print-ready · No external assets</span><button type="button" onclick="window.print()">Print / Save PDF</button></div>
+
+<div class="note" id="status"><p><strong>Status of this build, and what has been checked.</strong> This is a development build, not a release. The server is covered by automated tests, which run against a real PostgreSQL database (section 02). The scripts of the web pages have one automated test file, which covers only the check that a sign-in redirect stays on this site; the rest of the page scripts are not covered by automated tests. A hands-on check of the pages in a browser is recorded separately by the project owner's assistant, not in this document, so nothing here should be read as saying that check has been done. The sections below describe what the code does.</p></div>
 
 <section id="need"><h2>01 / What you need</h2>
 <ul>
@@ -41,63 +43,160 @@ pre{background:#0f2a2c;color:#e6f2ee;border-radius:6px;padding:14px 16px;margin:
 </ul>
 <pre><code>cargo install wasm-bindgen-cli --version 0.2.130 --locked</code></pre>
 <p>If a later change to <code>Cargo.lock</code> moves <code>wasm-bindgen</code> to another version, the command printed by <code>cargo xtask web</code> shows the version then needed.</p>
-<p>Git does not need to be installed to run ShareCraft, because the Git library is built in. You only need it to look at saved documents (section 05).</p>
+<ul>
+<li><strong>PostgreSQL.</strong> The server keeps accounts, sign-in sessions, sharing, the revision index and events in a PostgreSQL database and will not start without one. Development has used PostgreSQL 18 on the local machine. Create an empty database and an account that may create tables in it. For the tests (section 02) create a second, separate database and give the same account permission to create schemas in it; the tests do not create databases.</li>
+<li><strong>A <code>.env</code> file</strong> in the repository root, made by copying <code>.env.example</code> and replacing its placeholder values. It names the databases by variable (<code>DATABASE_URL</code> for the server, <code>TEST_DATABASE_URL</code> for the tests). <code>.env</code> is not kept in Git. Keep real values only there: never put a database address or password in a command that is saved, in a commit or in a message.</li>
+<li><strong>Node.js</strong>, only if you want to run the one automated test file for the page scripts (section 02).</li>
+</ul>
+<p>Git does not need to be installed to run ShareCraft, because the Git library is built in. You only need it to look at saved documents (section 09).</p>
 </section>
 
 <section id="build"><h2>02 / Build and check</h2>
 <p>Run every command from the repository root, the folder that holds <code>Cargo.toml</code>.</p>
-<p>This runs formatting, lints, all tests, and a WebAssembly build of each browser-side crate. It prints <code>xtask: all checks passed</code> and exits with code 0 when everything is in order:</p>
+<p>This loads <code>.env</code>, then checks that no dependency has a copyleft licence, checks formatting, runs the lints with warnings treated as errors, runs all tests in the workspace, and builds each browser-side crate for WebAssembly. It prints <code>xtask: all checks passed</code> and exits with code 0 when everything is in order:</p>
 <pre><code>cargo xtask check</code></pre>
+<p>This loads <code>.env</code> and then runs <code>cargo test</code> with whatever arguments you add, for example <code>cargo xtask test -p server</code>:</p>
+<pre><code>cargo xtask test</code></pre>
+<p><strong>The tests need <code>TEST_DATABASE_URL</code>.</strong> Every test that uses the database creates its own schema in that database, drops it afterwards, and also drops leftover test schemas more than an hour old. A test that needs the variable and finds it unset fails with a message saying so; it is never skipped. That is why you run the tests through <code>cargo xtask check</code> or <code>cargo xtask test</code>, which load <code>.env</code>, and not through plain <code>cargo test</code>.</p>
 <p>This builds the browser client and writes the page's script package to <code>web/pkg</code>. The folder is not kept in Git, so do this once after a fresh checkout and again after changing the browser client:</p>
 <pre><code>cargo xtask web</code></pre>
+<p>The scripts of the web pages (the <code>.js</code> files in <code>web</code>) have one automated test file, <code>web/common.test.mjs</code>. It tests the function that decides where to go after signing in, so that a crafted link cannot send someone to another site. It is not part of <code>cargo xtask check</code>. Run it with Node:</p>
+<pre><code>node --test web/*.test.mjs</code></pre>
 </section>
 
-<section id="run"><h2>03 / Run it</h2>
-<p>Start the server, still from the repository root:</p>
+<section id="admin"><h2>03 / The first administrator</h2>
+<p>There is no public sign-up, and nobody can sign in until an account exists. The first account, an administrator, is made from the command line. <code>DATABASE_URL</code> must be set (in <code>.env</code> or the environment). The command brings the database schema up to date, then creates the account:</p>
+<pre><code>cargo run -p server -- add-user --email &lt;email&gt; --name &lt;name&gt; --admin</code></pre>
+<p>Leave out <code>--admin</code> to make an ordinary account. The password is not a command-line option, so that it never appears in a process list or a saved command history. The command asks for it with <code>Password:</code> and does not show what you type. If its input is piped instead of typed, it reads the first line of that input as the password. It prints <code>created administrator &lt;email&gt; (&lt;account id&gt;)</code>, or <code>created account ...</code> for an ordinary account. The password and the database address are never printed.</p>
+<p>After the first administrator exists, further accounts are made on the People page (section 06); the command line stays available for the same job.</p>
+</section>
+
+<section id="run"><h2>04 / Run it and sign in</h2>
+<p>Start the server, still from the repository root. It needs <code>DATABASE_URL</code>, which it reads from <code>.env</code> in the current folder or a parent. It brings the database schema up to date, compares the revision index with Git (section 10), then starts listening:</p>
 <pre><code>cargo run -p server</code></pre>
-<p>It prints the address it listens on and a reminder that this is a development build with no sign-in. Then open the page in a browser at exactly one of these addresses:</p>
+<p>It prints the revision-index line, the address it listens on, and <code>WARNING: development mode, local connections only</code>. Then open the site in a browser at exactly one of these addresses:</p>
 <pre><code>http://127.0.0.1:8787/
 http://localhost:8787/</code></pre>
-<p>The page adds a document identifier after a <code>#</code> in the address. To edit the same document in a second tab or window, copy the whole address, including the part after <code>#</code>, and open it there. Type a name in the name box so you can tell the sessions apart.</p>
-<div class="note"><p><strong>Use those addresses only.</strong> The server refuses a WebSocket connection when its <code>Host</code> is not a loopback name (<code>127.0.0.1</code>, <code>localhost</code> or <code>[::1]</code>), or when the page's <code>Origin</code> differs from the address it was loaded from. In this build the page therefore cannot be reached through another hostname, another computer or a proxy.</p></div>
+<p>A person who is not signed in is sent to the sign-in page, and after signing in comes back to the page they asked for. After signing in the documents page lists the documents the person can open and has a <strong>New document</strong> form. A document opens at an address such as <code>/doc.html#&lt;document id&gt;</code>; the part after <code>#</code> is the document's identifier, and anyone with access can use the same address.</p>
+<p>The pages the server provides:</p>
+<div class="table-wrap"><table><caption>Pages</caption>
+<thead><tr><th>Page</th><th>Who</th><th>What it does</th></tr></thead>
+<tbody>
+<tr><td><code>/signin.html</code></td><td>Everyone</td><td>Email and password form.</td></tr>
+<tr><td><code>/</code> (documents)</td><td>Signed-in people</td><td>Lists your documents with your role and last save time, creates a new one, and has the <strong>Sign out</strong> button. Administrators also see a link to People.</td></tr>
+<tr><td><code>/doc.html#&lt;id&gt;</code></td><td>People with a role on the document</td><td>The text box, who is in the document, the save status, and, for owners, the Sharing panel (section 07).</td></tr>
+<tr><td><code>/people.html</code></td><td>Administrators</td><td>Lists every account, adds an account, disables or enables one (section 06). Other people see <strong>Only administrators can manage people.</strong></td></tr>
+</tbody></table></div>
+<div class="note"><p><strong>Use those addresses only.</strong> The server refuses a WebSocket connection, and every <code>/api</code> request, when its <code>Host</code> is not a loopback name (<code>127.0.0.1</code>, <code>localhost</code> or <code>[::1]</code>), or when the page's <code>Origin</code> differs from the address it was loaded from. In this build the site therefore cannot be reached through another hostname, another computer or a proxy.</p></div>
+<p>Browsers keep cookies separately for <code>127.0.0.1</code> and <code>localhost</code>. To try two people at once on one computer, sign in as one at <code>http://127.0.0.1:8787/</code> and as the other at <code>http://localhost:8787/</code>.</p>
 </section>
 
-<section id="settings"><h2>04 / Settings</h2>
-<p>The server reads three environment variables. All are optional.</p>
+<section id="settings"><h2>05 / Settings</h2>
+<p>The server reads these environment variables. <code>DATABASE_URL</code> is required; the others are optional. Before reading them, the server and its commands load <code>.env</code> from the current folder or a parent, if there is one; a variable already set in the environment wins over <code>.env</code>.</p>
 <div class="table-wrap"><table><caption>Environment variables</caption>
 <thead><tr><th>Variable</th><th>Default</th><th>Meaning</th></tr></thead>
 <tbody>
+<tr><td><code>DATABASE_URL</code></td><td>none (required)</td><td>The PostgreSQL database that holds accounts, sessions, sharing, the revision index and events. The server will not start without it. Its value usually contains a password, so it is never printed or logged.</td></tr>
 <tr><td><code>SHARECRAFT_ADDR</code></td><td><code>127.0.0.1:8787</code></td><td>IP address and port to listen on, for example <code>127.0.0.1:9000</code>. Must be a loopback address; the server refuses to start otherwise. A hostname such as <code>localhost</code> is not accepted for this setting (the page itself can still be opened at <code>http://localhost:8787/</code>).</td></tr>
-<tr><td><code>SHARECRAFT_DATA</code></td><td><code>./data</code></td><td>Folder where documents are stored.</td></tr>
+<tr><td><code>SHARECRAFT_DATA</code></td><td><code>./data</code></td><td>Folder where document content is stored (the Git repository, section 09).</td></tr>
 <tr><td><code>SHARECRAFT_WEB</code></td><td><code>./web</code></td><td>Folder of page files served at <code>/</code>.</td></tr>
 </tbody></table></div>
+<p><code>TEST_DATABASE_URL</code> is read only by the tests. <code>.env.example</code> also lists <code>POSTGRES_SUPERUSER_PASSWORD</code>, which the server does not read; it is there for database administration tasks you do yourself.</p>
 <p>The default folders are relative to the folder you start the server from, which is why the commands above are run from the repository root. Example with a different port and data folder:</p>
 <pre><code># PowerShell
 $env:SHARECRAFT_ADDR = "127.0.0.1:9000"
 $env:SHARECRAFT_DATA = "C:\sharecraft-data"
 cargo run -p server</code></pre>
-<p>If you change the port, open the page at that port instead of 8787, still using <code>127.0.0.1</code> or <code>localhost</code>.</p>
+<p>If you change the port, open the site at that port instead of 8787, still using <code>127.0.0.1</code> or <code>localhost</code>.</p>
 <p>These values are fixed in this build and cannot be changed through the environment:</p>
 <div class="table-wrap"><table><caption>Fixed settings</caption>
 <thead><tr><th>Setting</th><th>Value</th><th>Meaning</th></tr></thead>
 <tbody>
-<tr><td>Checkpoint idle time</td><td>2 seconds</td><td>A checkpoint is written once no change has arrived for this long (section 05).</td></tr>
+<tr><td>Checkpoint idle time</td><td>2 seconds</td><td>A checkpoint is written once no change has arrived for this long (section 09).</td></tr>
 <tr><td>Longest time unsaved</td><td>30 seconds</td><td>A checkpoint is written at the latest this long after the first unsaved change.</td></tr>
 <tr><td>Grace period</td><td>60 seconds</td><td>How long a document stays open on the server after the last person leaves it, so a browser that reconnects within this time carries on without losing its typing.</td></tr>
 <tr><td>Largest single change</td><td>512 KiB</td><td>The largest change a page sends in one piece, measured as sent. A larger paste is refused and the page shows <strong>That change is too large to send in one piece. Paste it in smaller parts.</strong></td></tr>
+<tr><td>Sign-in session length</td><td>30 days</td><td>How long a sign-in lasts (section 06).</td></tr>
+<tr><td>Failed sign-in limit</td><td>5 per email in 15 minutes</td><td>After that the email is refused until the oldest failure is 15 minutes old (section 06).</td></tr>
+<tr><td>Socket write timeout</td><td>10 seconds</td><td>If a write to a browser's connection does not finish in this time, the server drops the connection, because the browser has stopped reading. The page then reconnects as it does after any lost connection.</td></tr>
+<tr><td>Largest API request</td><td>16 KiB</td><td>Larger request bodies to <code>/api</code> are refused.</td></tr>
 </tbody></table></div>
 </section>
 
-<section id="data"><h2>05 / Where data is kept</h2>
+<section id="accounts"><h2>06 / Accounts and signing in</h2>
+<p>An <strong>account</strong> is one person: an email address, a display name, a password, and a flag saying whether they are an <strong>administrator</strong>. Accounts are created by an administrator, on the command line (section 03) or on the People page, where an administrator also chooses whether the new person is one. Nobody can register themselves, and nobody can change their own password yet.</p>
+<div class="table-wrap"><table><caption>What an account may contain</caption>
+<thead><tr><th>Field</th><th>Rule</th></tr></thead>
+<tbody>
+<tr><td>Email</td><td>At most 254 characters, no spaces or control characters, one <code>@</code> with something on each side. Case is ignored: two emails that differ only by case are the same account. Each email can have one account.</td></tr>
+<tr><td>Name</td><td>1 to 60 characters, at least one letter or digit, no control characters and no <code>&lt;</code> or <code>&gt;</code>. Names are shown to other people in a document and are credited in saved revisions.</td></tr>
+<tr><td>Password</td><td>10 to 256 characters. Nothing else is required. It is stored only as an Argon2id hash.</td></tr>
+</tbody></table></div>
+<h3>Signing in</h3>
+<p>The sign-in page sends the email and password to the server. When they match, the server starts a <strong>session</strong> that lasts 30 days and sets a cookie named <code>sharecraft_session</code> holding a random token. The cookie is marked <code>HttpOnly</code> (page scripts cannot read it) and <code>SameSite=Lax</code>. The server stores only a hash of the token. It is not marked <code>Secure</code>, because the build only serves plain HTTP on the local machine.</p>
+<p>A wrong password, an unknown email and a disabled account all get the same answer, <strong>That email and password do not match.</strong>, so the page does not reveal which emails have accounts. After 5 failed attempts for one email within 15 minutes, further attempts for it are refused with <strong>Too many attempts. Try again in a few minutes.</strong> The count is kept in the server's memory, so restarting the server resets it.</p>
+<h3>Signing out</h3>
+<p>The <strong>Sign out</strong> button is on the documents page. It ends that session and clears the cookie, and any open document pages of that session are removed (section 08). The same person's other sign-ins, in other browsers, stay signed in. A session also ends on its own after 30 days.</p>
+<h3>Managing people (administrators)</h3>
+<p>The People page lists every account with its email, whether it is an administrator and whether it is disabled. An administrator can add a person (email, name, password, administrator or not) and disable or enable an account.</p>
+<ul>
+<li><strong>Disabling</strong> an account ends all of its sessions at once and removes it from every open document. It cannot sign in again until an administrator enables it. Its documents and grants are kept.</li>
+<li>At least one administrator must stay enabled: disabling the last one is refused with <strong>At least one administrator must stay enabled.</strong></li>
+<li>An administrator is treated as an owner of every document (section 07).</li>
+</ul>
+</section>
+
+<section id="sharing"><h2>07 / Sharing and roles</h2>
+<p>A person with an account can create a document on the documents page. The name is optional (it defaults to <strong>Untitled</strong>); it can be 1 to 120 characters and cannot contain control characters, <code>/</code> or <code>\</code>. The creator becomes its owner. A name cannot be changed afterwards yet.</p>
+<p>Access is granted <strong>per document, to one person at a time</strong>. A person with no grant on a document cannot see it in their list and cannot open it. The server answers the same way for a document that does not exist and one you may not open, so you cannot find out that a document exists by guessing its address; the page says <strong>This document does not exist, or you do not have access to it.</strong></p>
+<div class="table-wrap"><table><caption>Roles</caption>
+<thead><tr><th>Role</th><th>Read</th><th>Change the text</th><th>Share and see events</th></tr></thead>
+<tbody>
+<tr><td>Viewer</td><td>Yes</td><td>No</td><td>No</td></tr>
+<tr><td>Editor</td><td>Yes</td><td>Yes</td><td>No</td></tr>
+<tr><td>Owner</td><td>Yes</td><td>Yes</td><td>Yes</td></tr>
+</tbody></table></div>
+<p>A viewer sees the live text and who else is there, but the text box is read-only and the page shows <strong>You can read this document but not change it.</strong> The server also refuses changes from a viewer, whatever the page does.</p>
+<p><strong>Administrators</strong> are owners of every document without needing a grant, so someone can always recover a document whose owners are gone. They appear in the Sharing list only if they were granted a role explicitly.</p>
+<h3>Sharing a document</h3>
+<p>Owners see a <strong>Sharing</strong> panel under the text. It lists everyone who has been granted access, each with a role menu and a <strong>Remove</strong> button. To add someone, type their email, choose a role and press <strong>Share</strong>. Choosing another role in a person's menu changes their role at once. Sharing is by the email of an existing account: <strong>No account has that email address.</strong> appears if there is none, and only owners can learn this. A document must keep at least one owner; removing or demoting the last one is refused with <strong>A document must keep at least one owner.</strong></p>
+<p>A change takes effect for people who have the document open straight away, without them reloading (next section).</p>
+</section>
+
+<section id="removed"><h2>08 / What a removed person sees</h2>
+<p>When a person's access to a document ends while they have it open, the server removes their connection at once instead of waiting for them to reconnect. The page then empties the text box and the list of people, hides the Sharing panel, stops trying to reconnect, and shows one of these in the status line:</p>
+<div class="table-wrap"><table><caption>Why a page was removed</caption>
+<thead><tr><th>Cause</th><th>Status shown</th></tr></thead>
+<tbody>
+<tr><td>An owner removed their access</td><td><strong>Your access to this document was removed.</strong></td></tr>
+<tr><td>They signed out (in this or another tab of the same session), or the session reached 30 days</td><td><strong>You were signed out.</strong></td></tr>
+<tr><td>An administrator disabled their account</td><td><strong>Your account was disabled.</strong></td></tr>
+</tbody></table></div>
+<p>Reopening the document after losing access shows <strong>This document does not exist, or you do not have access to it.</strong> Opening any page when the session is over sends the person to the sign-in page.</p>
+<p>Lowering a role from editor to viewer does not remove the person. Their text box becomes read-only, they are marked <em>read only</em> in the list of people, and if they had typed something the server had not yet accepted, it is refused and the status reads <strong>A change was refused because you can no longer edit this document.</strong> Raising a role makes the text box editable the same way; an owner's Sharing panel appears or goes accordingly.</p>
+<p>These changes are made in PostgreSQL first and then sent to the open document inside the server process. This works because there is one server process. If the role cannot be read at that moment, the person's connections are removed rather than left open.</p>
+</section>
+
+<section id="data"><h2>09 / Where data is kept</h2>
+<p>ShareCraft keeps two stores, and they hold different things.</p>
+<div class="table-wrap"><table><caption>Git and PostgreSQL</caption>
+<thead><tr><th>Store</th><th>Holds</th><th>If it is lost</th></tr></thead>
+<tbody>
+<tr><td><strong>Git</strong>, the library repository under the data folder</td><td>The content of every document and its metadata, one Git commit per saved checkpoint. Only the server writes to it.</td><td>Documents and their history are lost. Back up the data folder.</td></tr>
+<tr><td><strong>PostgreSQL</strong>, the database named by <code>DATABASE_URL</code></td><td>Accounts and password hashes, sign-in sessions, who has access to which document, the index of revisions, and events (sections 10 and 11).</td><td>Nobody can sign in, and who may open which document is forgotten. The documents themselves are safe in Git. See below.</td></tr>
+</tbody></table></div>
+<p><strong>PostgreSQL needs its own backup.</strong> Backing up the data folder does not back up accounts, sharing or events, and backing up the database does not back up document content. Keep both, taken at about the same time. Only the revision index in PostgreSQL can be rebuilt from Git (section 10).</p>
+<p>If PostgreSQL is lost and you start with an empty database, you must create the first administrator again (section 03). Starting the server then re-creates a record for each document found in Git, with no creator and no grants, so only administrators can open them until they share them again. Accounts, passwords, sharing and events are not recovered by this.</p>
+<h3>The Git repository</h3>
 <p>Documents are stored in one bare Git repository under the data folder:</p>
 <pre><code>&lt;data folder&gt;/libraries/00000000-0000-0000-0000-000000000001.git</code></pre>
 <p>With the defaults that is <code>data/libraries/00000000-0000-0000-0000-000000000001.git</code>. The <code>data</code> folder is not kept in Git. Every document lives in that one library for now.</p>
 <p>Inside the repository, the <code>main</code> branch holds, for each document identifier:</p>
 <ul>
 <li><code>docs/&lt;doc_id&gt;/content</code>: the document text.</li>
-<li><code>docs/&lt;doc_id&gt;/meta.json</code>: the metadata for that revision, as JSON.</li>
+<li><code>docs/&lt;doc_id&gt;/meta.json</code>: the metadata for that revision, as JSON: the document's name, free-form fields, and the people credited so far.</li>
 </ul>
-<p>Each saved checkpoint is one Git commit. The document identifier is the one after the <code>#</code> in the page's address. To look at a saved document with plain <code>git</code>, run these from the repository root:</p>
+<p>Each saved checkpoint is one Git commit. The commit's author is the account that made the change; if several accounts contributed since the last checkpoint, the others are named on <code>Co-authored-by</code> lines. Their addresses are of the form <code>&lt;account id&gt;@sharecraft.invalid</code>, not real email addresses. The document identifier is the one after the <code>#</code> in the page's address. To look at a saved document with plain <code>git</code>, run these from the repository root:</p>
 <pre><code>git --git-dir=data/libraries/00000000-0000-0000-0000-000000000001.git log main
 git --git-dir=data/libraries/00000000-0000-0000-0000-000000000001.git show main:docs/&lt;doc_id&gt;/content
 git --git-dir=data/libraries/00000000-0000-0000-0000-000000000001.git show main:docs/&lt;doc_id&gt;/meta.json</code></pre>
@@ -105,11 +204,45 @@ git --git-dir=data/libraries/00000000-0000-0000-0000-000000000001.git show main:
 <h3>When a checkpoint is written</h3>
 <p>Live changes are not committed one by one. The server writes a checkpoint when no change has arrived for 2 seconds, or at the latest 30 seconds after the first change that has not been saved yet, whichever comes first. When the last person leaves a document, it is saved straight away. If that final save fails, the server tries again after 2 seconds, doubling the wait each time up to 30 seconds, for up to 10 attempts in all (about three minutes); then it gives up and prints a message to the server's console. The document stays open on the server while it is still trying, even after the grace period. A save that fails while people are connected is retried after the idle time.</p>
 <p>The page shows the state next to the document title: Saving…, Saved, or Saving failed, retrying.</p>
-<p>The server keeps the most recent 1000 log entries behind the last checkpoint, and keeps a document open for a grace period of 60 seconds after the last person leaves it. A browser that drops for a short time therefore catches up, resends its changes and keeps the typing it did while disconnected, including when it was the only one there, as long as it is back within the grace period. After that, the document is closed and saved; a tab that comes back later is given the saved text, and any typing it did while disconnected cannot be kept (section 06). The same happens after a server restart.</p>
+<p>The server keeps the most recent 1000 log entries behind the last checkpoint, and keeps a document open for a grace period of 60 seconds after the last person leaves it. A browser that drops for a short time therefore catches up, resends its changes and keeps the typing it did while disconnected, including when it was the only one there, as long as it is back within the grace period. After that, the document is closed and saved; a tab that comes back later is given the saved text, and any typing it did while disconnected cannot be kept (section 12). The same happens after a server restart.</p>
 </section>
 
-<section id="stop"><h2>06 / Stopping the server</h2>
-<p>Stopping the server (for example with Ctrl+C) ends it at once. <strong>The server loses any changes made since the last checkpoint</strong>, which can be up to 30 seconds of typing. Everything up to the last saved revision is kept in the Git repository and is loaded again the next time the document is opened.</p>
+<section id="index"><h2>10 / The revision index, start-up reconcile and rebuild</h2>
+<p>PostgreSQL holds a list of each document's revisions: the Git commit id, its position in the document's history, its parent, when it was committed and who is credited. The documents page uses it to show each document's last save time. The list is an <strong>index</strong>: Git is the authority, and the index can always be replaced from it.</p>
+<ul>
+<li><strong>After each checkpoint</strong> the server adds the new revision to the index in the background. If this fails, the content is still safe in Git, the failure is printed to the server's console and recorded as an event, and the next start repairs the index.</li>
+<li><strong>At every start</strong> the server reconciles: for each document in Git it compares the newest revision in the index with Git's, and replaces the document's list from Git when they differ. It prints one line before it begins listening, for example <code>Reconciled revisions with Git: 3 documents in Git, 1 updated, 0 failed</code>. A document that cannot be read is listed on the console and the server still starts.</li>
+<li><strong><code>rebuild</code></strong> replaces the list of every document in Git, whether or not it looks out of date. Use it if you suspect the index is wrong. It needs <code>DATABASE_URL</code> and the data folder, brings the schema up to date, prints <code>Rebuilt revisions from Git: ...</code> with the same counts, names any document it could not rebuild, and exits with a failure code if there was one:</li>
+</ul>
+<pre><code>cargo run -p server -- rebuild</code></pre>
+<p>Neither reconcile nor rebuild writes to Git. If Git was changed by something other than the server, the next checkpoint of that document stops with a conflict (section 12) instead of merging.</p>
+</section>
+
+<section id="events"><h2>11 / Events and how an owner reads them</h2>
+<p>The server writes an <strong>event</strong> to PostgreSQL for each notable thing that happens: who did it, who or what it was done to, which document, when, and a few details. Events never contain document text, passwords or tokens. There is no automatic deletion: the log only grows.</p>
+<div class="table-wrap"><table><caption>Event kinds</caption>
+<thead><tr><th>Kind</th><th>When</th><th>Belongs to a document</th></tr></thead>
+<tbody>
+<tr><td><code>document.created</code></td><td>A document was created (its name is in the details).</td><td>Yes</td></tr>
+<tr><td><code>access.granted</code>, <code>access.changed</code>, <code>access.revoked</code></td><td>An owner gave someone a role, changed it (old and new role in the details), or removed it.</td><td>Yes</td></tr>
+<tr><td><code>editing.joined</code>, <code>editing.left</code></td><td>Someone opened the document in a tab, or their connection ended.</td><td>Yes</td></tr>
+<tr><td><code>editing.removed</code></td><td>The server removed someone's connection; the reason (<code>access_revoked</code>, <code>signed_out</code>, <code>account_disabled</code>) is in the details.</td><td>Yes</td></tr>
+<tr><td><code>revision.saved</code></td><td>A checkpoint was written to Git (the commit id and the people credited are in the details).</td><td>Yes</td></tr>
+<tr><td><code>revision.save_failed</code>, <code>revision.conflict</code></td><td>A save failed, or Git held a newer revision than the server expected.</td><td>Yes</td></tr>
+<tr><td><code>revision.index_failed</code></td><td>A revision could not be added to the index (section 10).</td><td>Yes</td></tr>
+<tr><td><code>user.created</code>, <code>user.disabled</code>, <code>user.enabled</code></td><td>An account was created, disabled or enabled. The actor is empty when the command line did it.</td><td>No</td></tr>
+<tr><td><code>session.started</code>, <code>session.ended</code></td><td>Someone signed in, or signed out.</td><td>No</td></tr>
+<tr><td><code>sign_in.failed</code></td><td>A sign-in for an existing account failed; the reason is <code>wrong_password</code> or <code>disabled</code>. Attempts with an unknown email are not recorded.</td><td>No</td></tr>
+</tbody></table></div>
+<p><strong>How an owner reads them.</strong> There is no events page yet. An owner of a document (or an administrator) who is signed in reads that document's events by opening this address in the same browser:</p>
+<pre><code>http://127.0.0.1:8787/api/docs/&lt;doc_id&gt;/events</code></pre>
+<p>The answer is JSON: the latest 200 events of that document, oldest first, each with an id, a time, the kind, the account ids of the actor and the subject (null when there is none), and the details. People appear as account ids, not names. To match an id to a person, open <code>/api/docs/&lt;doc_id&gt;/access</code> (owners only; it lists everyone granted access, with names and emails) or, as an administrator, <code>/api/admin/users</code>. Someone with no role on the document gets <code>404</code>, and a viewer or editor gets <code>403</code>.</p>
+<p>The events that belong to no document (accounts, sign-ins, failed sign-ins) cannot be read through the site. They are in the <code>events</code> table in PostgreSQL, readable by whoever runs the database.</p>
+</section>
+
+<section id="stop"><h2>12 / Stopping the server, and notices on the document page</h2>
+<p>Stopping the server (for example with Ctrl+C) ends it at once. <strong>The server loses any changes made since the last checkpoint</strong>, which can be up to 30 seconds of typing. Everything up to the last saved revision is kept in the Git repository and is loaded again the next time the document is opened. Accounts, sessions and sharing are in PostgreSQL and are unaffected; people stay signed in across a restart.</p>
+<h3>Notices about the connection and saving</h3>
 <p>A tab that is still open shows <strong>Connection lost. N changes waiting</strong> and keeps that status for the whole outage while the page retries in the background (first after 0.5 seconds, with the wait doubling up to 8 seconds between tries). When the server is back, the status returns to <strong>Saved</strong>.</p>
 <p>If the server was restarted, or the document was closed after its grace period and opened again, the tab is reset to the last saved text, and the status says what that cost:</p>
 <ul>
@@ -119,27 +252,42 @@ git --git-dir=data/libraries/00000000-0000-0000-0000-000000000001.git show main:
 </ul>
 <p>If the server kept running but could no longer take the tab back where it left off, the tab is brought up to date with the server's text and, if it had to throw away changes, reads <strong>N changes could not be kept.</strong> These messages stay until you next type. If saving is failing at the same time, the status reads <strong>Saving failed, retrying.</strong> followed by the message.</p>
 <p>Wait for the status to read <strong>Saved</strong> before you stop the server.</p>
+<h3>Notices about access, conflicts and missing documents</h3>
+<div class="table-wrap"><table><caption>Other notices on the document page</caption>
+<thead><tr><th>Notice</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td><strong>You can read this document but not change it.</strong></td><td>Read-only: the person's role is viewer.</td></tr>
+<tr><td><strong>A change was refused because you can no longer edit this document.</strong></td><td>Their role was lowered while they were typing (section 08).</td></tr>
+<tr><td><strong>Your access to this document was removed.</strong></td><td>Removed by an owner (section 08).</td></tr>
+<tr><td><strong>You were signed out.</strong></td><td>Signed out or the session ended (section 08).</td></tr>
+<tr><td><strong>Your account was disabled.</strong></td><td>Disabled by an administrator (section 08).</td></tr>
+<tr><td><strong>This document does not exist, or you do not have access to it.</strong> (status: <strong>Not available</strong>)</td><td>The address is not a document, the person has no role on it, or access was lost while the page was reconnecting. The two cases are not told apart.</td></tr>
+<tr><td><strong>This document was changed somewhere else. Copy anything you need, then reload.</strong></td><td>Conflict: when the server went to save, Git held a revision it did not expect. The server stops saving that document and nothing is merged; changes after the last saved revision are lost. This cannot happen through the server alone, only if the Git repository is changed by something else.</td></tr>
+<tr><td><strong>The editor could not be loaded. Run "cargo xtask web" and reload.</strong></td><td><code>web/pkg</code> is missing (section 02).</td></tr>
+</tbody></table></div>
 </section>
 
-<section id="limits"><h2>07 / Known limits of this build</h2>
+<section id="limits"><h2>13 / Known limits of this build</h2>
 <ul>
-<li><strong>No sign-in.</strong> Anyone who can open the page on this computer can read and change every document. The page and the server console both say so.</li>
-<li><strong>Identity is a typed name.</strong> The name box is a label for other people in the session. It proves nothing, and two people can type the same name.</li>
-<li><strong>Local connections only.</strong> The server will not listen on a non-loopback address and refuses connections that do not come from the page it served (section 03).</li>
-<li><strong>Large pastes go in pieces.</strong> One change can be at most 512 KiB as sent (section 04); a larger paste is refused with a message asking for smaller parts.</li>
+<li><strong>Local connections only.</strong> The server will not listen on a non-loopback address and refuses connections that do not come from a page it served (section 04). Two people on two computers cannot use it together. Passwords must not cross a network without encryption, and encryption (TLS) is a separate piece of work.</li>
+<li><strong>Accounts are made by an administrator.</strong> There is no sign-up, and <strong>nobody can change their own password yet</strong>, nor reset a forgotten one.</li>
+<li><strong>No single sign-on, multi-factor sign-in, guests or groups.</strong> Access is a password account, granted to one person at a time for one document.</li>
+<li><strong>No sites, libraries, folders or inheritance.</strong> Every document is a separate item with its own list of people. Documents cannot be renamed or have their metadata edited after creation.</li>
+<li><strong>No page for events</strong> (section 11), and no way to see the document's saved revisions from the site: use Git (section 09).</li>
+<li><strong>One server process.</strong> Removal from live sessions is sent inside the process; running several server processes would need a different mechanism.</li>
+<li><strong>Large pastes go in pieces.</strong> One change can be at most 512 KiB as sent (section 05); a larger paste is refused with a message asking for smaller parts.</li>
 <li><strong>Plain text only.</strong> There is no formatting, and no spreadsheet, document, PDF or 3D editing yet.</li>
-<li><strong>PostgreSQL is not used yet.</strong> Nothing in the server reads or writes a database. A local development database is configured through <code>.env</code> for the next plan: copy <code>.env.example</code> to <code>.env</code> and fill in the values. <code>.env</code> is not kept in Git.</li>
 <li><strong>The four editors are not connected yet.</strong> WordCraft, GridCraft, PdfCraft and SolidCraft do not open files from ShareCraft in this build.</li>
-<li><strong>Access removal is not built.</strong> There are no permissions, so there is nothing to revoke.</li>
+<li><strong>PostgreSQL needs its own backup</strong> (section 09), and the event log is never trimmed.</li>
 </ul>
 </section>
 
-<section id="licences"><h2>08 / Licences</h2>
-<p>ShareCraft is licensed <strong>MIT OR Apache-2.0</strong>; the texts are in <code>LICENSE-MIT</code> and <code>LICENSE-APACHE</code>.</p>
+<section id="licences"><h2>14 / Licences</h2>
+<p>ShareCraft is licensed <strong>MIT OR Apache-2.0</strong>; the texts are in <code>LICENSE-MIT</code> and <code>LICENSE-APACHE</code>. <code>cargo xtask check</code> refuses any dependency whose licence has no non-copyleft option (GPL, LGPL, AGPL, MPL, EUPL, CDDL, SSPL).</p>
 <p>The <code>revisions</code> crate stores documents in Git using <code>gix</code> (gitoxide), a Git implementation written in Rust and licensed MIT or Apache 2.0. No C library is involved and no copyleft code is linked. Repositories it writes are ordinary Git repositories: the <code>git</code> command line reads them as usual.</p>
 </section>
 
-<footer>ShareCraft · ThineCraft · Building and running · Updated 10 November 2026<br>Describes the development build of the first Stage 1 plan, not a release.</footer>
+<footer>ShareCraft · ThineCraft · Building and running · Updated 10 November 2026<br>Describes the development build after the second Stage 1 plan (accounts and permissions), not a release.</footer>
 </main></div>
 </body>
 </html>

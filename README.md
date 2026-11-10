@@ -2,7 +2,7 @@
 
 Website: [share.thinecraft.io](https://share.thinecraft.io)
 
-To build and run the current development build, see [BUILDING.html](BUILDING.html).
+To build and run the current development build, and for what it does and does not do, see [BUILDING.html](BUILDING.html). It needs a PostgreSQL database (configured through `.env`, copied from `.env.example`).
 
 ShareCraft is the planned open-source SharePoint alternative in the ThineCraft family. Its purpose is to provide a shared workspace for organizations to create intranet sites, team portals, knowledge bases, and other collaborative content experiences.
 
@@ -22,4 +22,4 @@ ShareCraft is intended to bring together the core capabilities commonly associat
 
 ShareCraft may support services such as ThineWedding, ThineMemorial, and ThineCapture, but those are applications built on top of the platform rather than ShareCraft's primary purpose.
 
-> **Status:** Placeholder repository. This README describes the intended direction only; no working implementation is provided or implied.
+> **Status:** Early development build. It is not a release and is not a SharePoint replacement yet. What exists today: people sign in with accounts an administrator creates; plain-text documents are shared per document as viewer, editor or owner; several people edit one document together in the browser; someone whose access is removed is put out of the live session at once; content is saved as Git revisions, and accounts, sharing, a revision index and an event log are kept in PostgreSQL. The server listens on the local machine only, and the sites, libraries, lists, search and editor integrations described above are not built. [BUILDING.html](BUILDING.html) lists the limits in full.
