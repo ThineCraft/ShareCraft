@@ -2,20 +2,25 @@
 // moves frames between the socket and the client and reports what the person typed.
 
 import init, { Client } from './pkg/web_client.js';
+import { api, h, messageFor, requireMe, seg, showMessage } from './common.js';
 
-const NAME_KEY = 'sharecraft.name';
 const FIRST_DELAY = 500;
 const MAX_DELAY = 8000;
+const MISSING = 'This document does not exist, or you do not have access to it.';
+const REMOVED = Object.assign(Object.create(null), {
+  access_revoked: 'Your access to this document was removed.',
+  signed_out: 'You were signed out.',
+  account_disabled: 'Your account was disabled.',
+});
+const CONFLICT = 'This document was changed somewhere else. Copy anything you need, then reload.';
 
 const $ = (id) => document.getElementById(id);
 const frame = $('frame');
 const area = $('text');
-const nameInput = $('name');
 const statusLine = $('status');
 const peopleList = $('people');
-
-const docId = documentId();
-$('docline').textContent = `ShareCraft development build · Document ${docId}`;
+const readonlyNote = $('readonly-note');
+const sharePanel = $('share-panel');
 
 let client = null;
 let socket = null;
@@ -30,8 +35,26 @@ let queued = [];        // frames that arrived during composition, with their so
 let save = null;        // { state, revision } from the client
 let notice = '';        // a message that stays until the person edits again
 let refused = false;    // a change was refused and the socket is being renewed
+let canEdit = false;    // the server says this person may change the text
+let removedReason = ''; // set once the server removed this page: no reconnecting
 
-nameInput.value = loadName();
+// Another document was chosen by editing the address.
+addEventListener('hashchange', () => location.reload());
+
+await requireMe();
+const docId = documentId();
+if (!docId) {
+  showProblem(MISSING);
+  throw new Error('no document');
+}
+const detail = await api('GET', `/docs/${seg(docId)}`);
+if (!detail.ok) {
+  showProblem(detail.status === 404 ? MISSING : messageFor(detail.error));
+  throw new Error(`cannot open the document (${detail.error})`);
+}
+showDetail(detail.data);
+$('editor').hidden = false;
+setRole(detail.data.role);
 
 try {
   await init();
@@ -43,52 +66,158 @@ try {
 }
 connect();
 
-// ---- document and name ----
+// ---- document and sharing ----
 
+// The document id in the address, or '' when the address holds anything else.
 function documentId() {
   const id = location.hash.slice(1).toLowerCase();
-  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(id)) return id;
-  const bytes = crypto.getRandomValues(new Uint8Array(16));
-  bytes[6] = (bytes[6] & 0x0f) | 0x40;
-  bytes[8] = (bytes[8] & 0x3f) | 0x80;
-  const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
-  const fresh = `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
-  history.replaceState(null, '', `#${fresh}`);
-  return fresh;
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(id) ? id : '';
 }
 
-// Another document was chosen by editing the address.
-addEventListener('hashchange', () => location.reload());
+function showProblem(text) {
+  $('editor').hidden = true;
+  sharePanel.hidden = true;
+  showMessage($('problem'), text);
+  setStatus('failed', 'Not available');
+}
 
-function loadName() {
-  try {
-    return localStorage.getItem(NAME_KEY) ?? '';
-  } catch {
-    return '';
+function showDetail(info) {
+  $('title').textContent = info.name;
+  $('docline').textContent = `Your role: ${info.role}`;
+  document.title = `${info.name} — ShareCraft`;
+}
+
+// Owners get the Share panel; everyone else does not.
+function setRole(role) {
+  const owner = role === 'owner' && removedReason === '';
+  sharePanel.hidden = !owner;
+  if (owner) showAccess();
+}
+
+// Asks the server what this person's role is now (their rights changed) and shows or hides
+// the Share panel to match.
+let roleCheck = 0;
+async function refreshRole() {
+  const check = ++roleCheck;
+  const result = await api('GET', `/docs/${seg(docId)}`);
+  if (check !== roleCheck || removedReason) return;
+  if (result.ok) {
+    showDetail(result.data);
+    setRole(result.data.role);
+  } else {
+    sharePanel.hidden = true;
   }
 }
 
-nameInput.addEventListener('change', () => {
-  try {
-    localStorage.setItem(NAME_KEY, nameInput.value.trim());
-  } catch {
-    // Storage may be unavailable; the name still applies to this tab.
+async function showAccess() {
+  const result = await api('GET', `/docs/${seg(docId)}/access`);
+  if (removedReason) return;
+  if (!result.ok) {
+    shareMessage(messageFor(result.error), true);
+    return;
   }
-  if (client) reconnectNow();
+  $('access').replaceChildren(
+    ...result.data.map(({ user, role }) => {
+      const select = h('select', { 'aria-label': `Role of ${user.name}` });
+      for (const value of ['viewer', 'editor', 'owner']) {
+        const option = h('option', { value }, value[0].toUpperCase() + value.slice(1));
+        option.selected = value === role;
+        select.append(option);
+      }
+      select.addEventListener('change', () => changeAccess(user.email, select.value));
+      const remove = h(
+        'button',
+        { type: 'button', class: 'plain', 'aria-label': `Remove ${user.name}` },
+        'Remove',
+      );
+      remove.addEventListener('click', () => removeAccess(user));
+      return h(
+        'li',
+        {},
+        h('span', { class: 'grow' }, user.name, h('br'), h('small', {}, user.email)),
+        select,
+        remove,
+      );
+    }),
+  );
+}
+
+async function changeAccess(email, role) {
+  shareMessage('', false);
+  const result = await api('PUT', `/docs/${seg(docId)}/access`, { email, role });
+  if (!result.ok) shareMessage(messageFor(result.error), true);
+  else shareMessage('Saved.', false);
+  await showAccess();
+}
+
+async function removeAccess(user) {
+  shareMessage('', false);
+  const result = await api('DELETE', `/docs/${seg(docId)}/access/${seg(user.id)}`);
+  if (!result.ok) shareMessage(messageFor(result.error), true);
+  else shareMessage(`${user.name} was removed.`, false);
+  await showAccess();
+}
+
+$('share-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const email = $('share-email').value.trim();
+  const result = await api('PUT', `/docs/${seg(docId)}/access`, {
+    email,
+    role: $('share-role').value,
+  });
+  if (result.ok) {
+    $('share-email').value = '';
+    shareMessage('Shared.', false);
+  } else {
+    shareMessage(messageFor(result.error), true);
+  }
+  await showAccess();
 });
+
+function shareMessage(text, isError) {
+  const line = $('share-status');
+  line.classList.toggle('ok', !isError);
+  showMessage(line, text);
+}
+
+// What the text box allows, from what the server last said.
+function applyEditable() {
+  area.readOnly = !(everJoined && canEdit) || removedReason !== '';
+  readonlyNote.hidden = canEdit || !everJoined || removedReason !== '';
+}
+
+// The server removed this page: it shows nothing, takes nothing and does not reconnect.
+function stopRemoved(reason) {
+  removedReason = reason;
+  clearTimeout(retryTimer);
+  queued = [];
+  canEdit = false;
+  area.value = '';
+  shown = '';
+  applyEditable();
+  peopleList.replaceChildren();
+  sharePanel.hidden = true;
+  const old = socket;
+  socket = null;
+  joined = false;
+  old?.close();
+  render();
+}
 
 // ---- socket ----
 
 function connect() {
   clearTimeout(retryTimer);
+  if (removedReason) return;
   const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
-  const name = encodeURIComponent(nameInput.value.trim());
-  const ws = new WebSocket(`${scheme}://${location.host}/ws/docs/${docId}?name=${name}`);
+  const ws = new WebSocket(`${scheme}://${location.host}/ws/docs/${docId}`);
   socket = ws;
   joined = false;
   ws.onopen = () => {
     if (ws !== socket) return;
-    ws.send(client.join_message());
+    const join = client.join_message();
+    if (join == null) return; // the server removed this page: it must not join again
+    ws.send(join);
   };
   ws.onmessage = (event) => {
     if (ws !== socket) return;
@@ -102,6 +231,7 @@ function connect() {
     if (ws !== socket) return;
     socket = null;
     joined = false;
+    if (removedReason) return;
     lost = !refused;
     refused = false;
     retryTimer = setTimeout(connect, lost ? delay : 0);
@@ -111,19 +241,12 @@ function connect() {
   render();
 }
 
-function reconnectNow() {
-  const old = socket;
-  socket = null;
-  lost = false;
-  old?.close();
-  connect();
-}
-
 function send(message) {
   if (message && joined && socket?.readyState === WebSocket.OPEN) socket.send(message);
 }
 
 function handleFrame(data) {
+  if (removedReason) return;
   syncLocal();
   let update;
   try {
@@ -139,12 +262,18 @@ function handleFrame(data) {
     lost = false;
     delay = FIRST_DELAY;
   }
+  if (update.removed != null) {
+    stopRemoved(update.removed);
+    return;
+  }
   if (update.send) send(update.send);
   if (update.text_changed) showRemote(update.text, update.edits);
-  if (!everJoined) {
-    everJoined = true;
-    area.readOnly = false;
-  }
+  const firstJoin = !everJoined;
+  everJoined = true;
+  if (update.can_edit != null) canEdit = update.can_edit;
+  applyEditable();
+  // Their rights changed while the page was open: the Share panel may have to appear or go.
+  if (update.can_edit != null && !firstJoin) refreshRole();
   if (update.people) showPeople(update.people);
   if (update.save) save = update.save;
   const n = update.dropped;
@@ -159,7 +288,10 @@ function handleFrame(data) {
     notice = notice.startsWith('A change was refused') ? `${notice} ${kept}` : kept;
   }
   if (update.refused) {
-    notice = `A change was refused (${update.refused}).`;
+    notice =
+      update.refused === 'read_only'
+        ? 'A change was refused because you can no longer edit this document.'
+        : `A change was refused (${update.refused}).`;
     refused = true;
     socket?.close();
   }
@@ -189,7 +321,7 @@ area.addEventListener('input', (event) => {
 
 // Reports the difference between what the client knows and what the text box shows.
 function syncLocal() {
-  if (!client || composing || !everJoined) return;
+  if (!client || composing || !everJoined || removedReason) return;
   const value = area.value;
   if (value === shown) return;
   const { start, removed, inserted } = difference(shown, value);
@@ -274,11 +406,12 @@ function showPeople(people) {
       const name = document.createElement('span');
       name.textContent = person.name;
       item.append(badge, name);
-      if (person.me) {
-        item.classList.add('me');
-        const you = document.createElement('small');
-        you.textContent = ' (you)';
-        name.append(you);
+      const tags = [person.me ? 'you' : '', person.can_edit ? '' : 'read only'].filter(Boolean);
+      if (person.me) item.classList.add('me');
+      if (tags.length > 0) {
+        const small = document.createElement('small');
+        small.textContent = ` (${tags.join(', ')})`;
+        name.append(small);
       }
       return item;
     }),
@@ -300,11 +433,17 @@ function initials(name) {
 function render() {
   if (!client) return;
   const n = client.pending();
+  if (removedReason) {
+    setStatus('failed', REMOVED[removedReason] ?? 'Your access to this document ended.');
+    return;
+  }
   const waiting = `${n} ${n === 1 ? 'change' : 'changes'} waiting`;
   if (!joined && lost && everJoined) {
     setStatus('offline', `Connection lost. ${waiting}`);
   } else if (!joined) {
     setStatus('connecting', everJoined ? `Reconnecting… ${waiting}` : 'Connecting…');
+  } else if (save?.state === 'conflict') {
+    setStatus('failed', CONFLICT);
   } else if (save?.state === 'failed') {
     // A failing save is never hidden by a notice; both are shown.
     setStatus('failed', notice ? `Saving failed, retrying. ${notice}` : 'Saving failed, retrying');

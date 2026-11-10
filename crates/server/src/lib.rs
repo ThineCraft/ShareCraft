@@ -20,6 +20,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::Router;
+use axum::extract::Request;
+use axum::http::HeaderValue;
+use axum::http::header::{CONTENT_SECURITY_POLICY, REFERRER_POLICY, X_CONTENT_TYPE_OPTIONS};
+use axum::middleware::{self, Next};
+use axum::response::Response;
 use axum::routing::get;
 use collab_core::ids::{DocId, SessionId, UserId};
 use records::{Db, Role};
@@ -151,6 +156,9 @@ impl AppState {
 ///   the document;
 /// - `GET /api/docs/{id}/events` lists a document's latest events, for its owners;
 /// - anything else is a static file from `web_dir`.
+///
+/// Every response carries the security headers (see [`security_headers`]); `/api` answers are
+/// never cached.
 pub fn router(state: AppState) -> Router {
     let files = ServeDir::new(&state.config().web_dir);
     Router::new()
@@ -158,7 +166,25 @@ pub fn router(state: AppState) -> Router {
         .nest("/api", api::router())
         .route("/ws/docs/{doc_id}", get(ws::upgrade))
         .fallback_service(files)
+        .layer(middleware::from_fn(security_headers))
         .with_state(state)
+}
+
+/// What a page may load: its own files only, no inline script or style, and WebAssembly.
+const CONTENT_SECURITY_POLICY_VALUE: &str =
+    "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; frame-ancestors 'none'";
+
+/// Adds the security headers to every response: pages, API, WebSocket handshake and errors.
+async fn security_headers(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(
+        CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(CONTENT_SECURITY_POLICY_VALUE),
+    );
+    headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    headers.insert(REFERRER_POLICY, HeaderValue::from_static("same-origin"));
+    response
 }
 
 /// Serves `config` on `listener` until the process ends, storing documents in the library

@@ -39,6 +39,11 @@ impl Page {
     async fn open(site: &Site, doc: DocId, name: &str) -> Page {
         let user = site.user(name).await;
         site.give_access(doc, &user).await;
+        Page::open_as(site, doc, user).await
+    }
+
+    /// Opens the page for `user` as they are, with whatever role the records give them.
+    async fn open_as(site: &Site, doc: DocId, user: TestUser) -> Page {
         let mut page = Page {
             client: ClientInner::new(ClientId(Uuid::new_v4())),
             doc,
@@ -84,6 +89,11 @@ impl Page {
         self.client.text()
     }
 
+    /// The latest `can_edit` the client reported: what the page gives the text box.
+    fn can_edit(&self) -> Option<bool> {
+        self.updates.iter().rev().find_map(|u| u.can_edit)
+    }
+
     /// Hands frames to the client until `cond` holds. Fails after five seconds.
     async fn pump_until(&mut self, cond: impl Fn(&Page) -> bool) {
         let deadline = tokio::time::Instant::now() + TIMEOUT;
@@ -105,6 +115,18 @@ impl Page {
             }
         }
     }
+}
+
+/// `owner` gives `user` the role `role` on `doc` through the API, as the Share panel does.
+async fn share(site: &Site, owner: &TestUser, doc: DocId, user: &TestUser, role: &str) {
+    let response = site
+        .http(Some(owner))
+        .put(site.url(&format!("/api/docs/{}/access", doc.0)))
+        .json(&serde_json::json!({ "email": user.email, "role": role }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
 }
 
 /// The UTF-16 offset just after the first `needle` in `text`.
@@ -205,4 +227,102 @@ async fn browser_reports_text_lost_in_a_server_restart() {
         .unwrap();
     assert_eq!(stored.bytes, b"saved");
     assert_eq!(a.text(), "saved");
+}
+
+#[tokio::test]
+async fn browser_viewer_is_read_only() {
+    let server = spawn_server().await;
+    let doc = new_doc();
+    let mut ann = Page::open(&server, doc, "Ann").await;
+    ann.edit(0, 0, "hello").await;
+    ann.pump_until(|p| p.client.pending() == 0).await;
+    let bob = server.user("Bob").await;
+    share(&server, &ann.user, doc, &bob, "viewer").await;
+
+    let mut bob = Page::open_as(&server, doc, bob).await;
+    // The page gives its text box the rights the join reported, and shows the text.
+    assert_eq!(bob.can_edit(), Some(false));
+    assert_eq!(bob.text(), "hello");
+    // The people list says who may not edit, so the page can say "(read only)".
+    let people = serde_json::to_value(bob.updates[0].people.as_ref().unwrap()).unwrap();
+    let flags: Vec<(String, bool)> = people
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| {
+            (
+                p["name"].as_str().unwrap().to_owned(),
+                p["can_edit"].as_bool().unwrap(),
+            )
+        })
+        .collect();
+    assert!(flags.contains(&("Bob".to_owned(), false)), "{flags:?}");
+    assert!(flags.contains(&("Ann".to_owned(), true)), "{flags:?}");
+
+    // Even if a change got out, the server refuses it and the text stays as it was.
+    bob.edit(5, 0, "!").await;
+    bob.pump_until(|p| {
+        p.updates
+            .iter()
+            .any(|u| u.refused.as_deref() == Some("read_only"))
+    })
+    .await;
+    ann.edit(5, 0, "?").await;
+    ann.pump_until(|p| p.client.pending() == 0).await;
+    assert_eq!(ann.text(), "hello?");
+}
+
+#[tokio::test]
+async fn browser_demotion_arrives_without_reconnecting() {
+    let server = spawn_server().await;
+    let doc = new_doc();
+    let ann = Page::open(&server, doc, "Ann").await;
+    let mut bob = Page::open(&server, doc, "Bob").await;
+    assert_eq!(bob.can_edit(), Some(true));
+    let joins_before = bob.updates.iter().filter(|u| u.can_edit.is_some()).count();
+    assert_eq!(joins_before, 1);
+
+    share(&server, &ann.user, doc, &bob.user, "viewer").await;
+    bob.pump_until(|p| p.can_edit() == Some(false)).await;
+    // The same socket and the same client carried the news: no second join was made.
+    assert!(bob.socket.is_some());
+    assert!(bob.client.joined());
+    let last = bob.updates.last().unwrap();
+    assert_eq!(last.can_edit, Some(false));
+    assert!(last.removed.is_none());
+
+    share(&server, &ann.user, doc, &bob.user, "editor").await;
+    bob.pump_until(|p| p.can_edit() == Some(true)).await;
+    bob.edit(0, 0, "back").await;
+    bob.pump_until(|p| p.client.pending() == 0).await;
+    assert_eq!(bob.text(), "back");
+}
+
+#[tokio::test]
+async fn browser_removed_client_stops_and_reports_why() {
+    let server = spawn_server().await;
+    let doc = new_doc();
+    let ann = Page::open(&server, doc, "Ann").await;
+    let mut bob = Page::open(&server, doc, "Bob").await;
+    bob.edit(0, 0, "mine").await;
+    bob.pump_until(|p| p.client.pending() == 0).await;
+
+    let response = server
+        .http(Some(&ann.user))
+        .delete(server.url(&format!("/api/docs/{}/access/{}", doc.0, bob.user.id.0)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+    bob.pump_until(|p| p.updates.iter().any(|u| u.removed.is_some()))
+        .await;
+    let last = bob.updates.last().unwrap();
+    assert_eq!(last.removed.as_deref(), Some("access_revoked"));
+    assert_eq!(
+        serde_json::to_value(last).unwrap()["removed"],
+        "access_revoked"
+    );
+    // The page must not join again, and further typing is refused locally.
+    assert_eq!(bob.client.join_message().unwrap(), None);
+    assert!(bob.client.local_replace(0, 0, "x").is_err());
 }

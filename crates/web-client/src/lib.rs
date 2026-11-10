@@ -66,6 +66,8 @@ pub struct Person {
     pub name: String,
     /// Whether this is the person using this client.
     pub me: bool,
+    /// Whether they may change the text.
+    pub can_edit: bool,
 }
 
 /// Whether this client's view of the document has reached Git.
@@ -418,6 +420,7 @@ impl ClientInner {
             .into_iter()
             .map(|p| Person {
                 me: p.client == me,
+                can_edit: p.can_edit,
                 name: p.name,
             })
             .collect()
@@ -1072,9 +1075,9 @@ mod tests {
         assert_eq!(
             people
                 .iter()
-                .map(|p| (p.name.as_str(), p.me))
+                .map(|p| (p.name.as_str(), p.me, p.can_edit))
                 .collect::<Vec<_>>(),
-            vec![("Ann", true), ("Bo", false)]
+            vec![("Ann", true, true), ("Bo", false, false)]
         );
     }
 

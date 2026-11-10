@@ -8,8 +8,8 @@ mod session;
 use std::fmt;
 
 use axum::extract::{DefaultBodyLimit, FromRequest, Request};
-use axum::http::header::ORIGIN;
-use axum::http::{Method, StatusCode};
+use axum::http::header::{CACHE_CONTROL, ORIGIN};
+use axum::http::{HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -44,6 +44,16 @@ pub(crate) fn router() -> Router<AppState> {
         .fallback(|| async { ApiError::NotFound })
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .layer(middleware::from_fn(require_same_origin))
+        .layer(middleware::from_fn(no_store))
+}
+
+/// Keeps every `/api` answer, errors included, out of caches.
+async fn no_store(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 /// Refuses requests from other origins, and requests that change something without `Origin`.

@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ShareCraft — Document</title>
+<link rel="stylesheet" href="./style.css">
+</head>
+<body>
+<div class="frame" id="frame" data-state="connecting">
+ <header class="bar">
+  <a class="mono" href="/" aria-label="ShareCraft documents">S</a>
+  <div class="doc"><h1 id="title">Document</h1><span id="docline"></span></div>
+  <span class="spacer"></span>
+  <span class="status" role="status" aria-live="polite"><i aria-hidden="true"></i><span id="status">Loading…</span></span>
+ </header>
+ <p id="problem" role="alert" class="problem" hidden></p>
+ <div class="body" id="editor" hidden>
+  <main class="main">
+   <p id="readonly-note" class="note" hidden>You can read this document but not change it.</p>
+   <label for="text" class="label">Document text</label>
+   <textarea id="text" spellcheck="true" readonly></textarea>
+  </main>
+  <aside aria-labelledby="people-heading">
+   <h2 id="people-heading">People here</h2>
+   <ul id="people"></ul>
+  </aside>
+ </div>
+ <section id="share-panel" class="share" aria-labelledby="share-heading" hidden>
+  <h2 id="share-heading">Sharing</h2>
+  <ul id="access" class="list"></ul>
+  <form id="share-form" class="row">
+   <div class="field">
+    <label for="share-email">Add someone by email</label>
+    <input type="email" id="share-email" autocomplete="off" required>
+   </div>
+   <div class="field">
+    <label for="share-role">Role</label>
+    <select id="share-role">
+     <option value="viewer">Viewer</option>
+     <option value="editor" selected>Editor</option>
+     <option value="owner">Owner</option>
+    </select>
+   </div>
+   <button type="submit">Share</button>
+  </form>
+  <p id="share-status" role="status" aria-live="polite" class="msg ok" hidden></p>
+ </section>
+</div>
+<script type="module" src="./doc.js"></script>
+</body>
+</html>

@@ -869,3 +869,149 @@ fn non_loopback_address_is_refused() {
         server::Config::from_values(Some("0.0.0.0:8787"), None, None, Some("postgres://unused"));
     assert!(built.is_err());
 }
+
+const CSP: &str =
+    "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; frame-ancestors 'none'";
+
+fn assert_security_headers(headers: &reqwest::header::HeaderMap, what: &str) {
+    let get = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    assert_eq!(get("content-security-policy"), Some(CSP), "{what}");
+    assert_eq!(get("x-content-type-options"), Some("nosniff"), "{what}");
+    assert_eq!(get("referrer-policy"), Some("same-origin"), "{what}");
+}
+
+/// The directory of the pages the repository ships.
+fn web_dir() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../web")
+}
+
+#[tokio::test]
+async fn responses_carry_security_headers() {
+    let server = spawn_server_config(|c| c.web_dir = web_dir()).await;
+    let user = server.user("Ann").await;
+    let doc = new_doc();
+    server.give_access(doc, &user).await;
+
+    // A page, an API answer, an API error, an unknown path and a health check.
+    for path in ["/", "/signin.html", "/healthz", "/nothing-here"] {
+        let response = server
+            .http(None)
+            .get(server.url(path))
+            .send()
+            .await
+            .unwrap();
+        assert_security_headers(response.headers(), path);
+        assert_eq!(
+            response
+                .headers()
+                .get("cache-control")
+                .map(|v| v.as_bytes()),
+            None,
+            "{path} is a static page or health check and may be cached"
+        );
+    }
+    for (path, cookie) in [
+        ("/api/me", Some(&user)),
+        ("/api/me", None),
+        ("/api/nothing", None),
+    ] {
+        let response = server
+            .http(cookie)
+            .get(server.url(path))
+            .send()
+            .await
+            .unwrap();
+        assert_security_headers(response.headers(), path);
+        assert_eq!(
+            response
+                .headers()
+                .get("cache-control")
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store"),
+            "{path}"
+        );
+    }
+    let response = server
+        .http(None)
+        .post(server.url("/api/session"))
+        .json(&serde_json::json!({ "email": "x@test.invalid", "password": "wrong" }))
+        .send()
+        .await
+        .unwrap();
+    assert_security_headers(response.headers(), "POST /api/session");
+    assert_eq!(
+        response
+            .headers()
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store")
+    );
+
+    // The WebSocket handshake response.
+    let request = common::ws_request(
+        server.addr,
+        &format!("/ws/docs/{}", doc.0),
+        Some(&user.cookie),
+    );
+    let (_socket, response) = tokio_tungstenite::connect_async(request).await.unwrap();
+    assert_eq!(response.status().as_u16(), 101);
+    let get = |name: &str| response.headers().get(name).and_then(|v| v.to_str().ok());
+    assert_eq!(get("content-security-policy"), Some(CSP));
+    assert_eq!(get("x-content-type-options"), Some("nosniff"));
+    assert_eq!(get("referrer-policy"), Some("same-origin"));
+}
+
+#[tokio::test]
+async fn pages_are_served_without_signing_in_and_hold_no_data() {
+    let server = spawn_server_config(|c| c.web_dir = web_dir()).await;
+    // Accounts exist, so a page that leaked one would be caught.
+    let user = server.user("Ann").await;
+    let admin = server.admin("Root").await;
+    for page in [
+        "/",
+        "/index.html",
+        "/signin.html",
+        "/doc.html",
+        "/people.html",
+    ] {
+        let response = server
+            .http(None)
+            .get(server.url(page))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "{page}");
+        let body = response.text().await.unwrap();
+        for email in [&user.email, &admin.email] {
+            assert!(
+                !body.contains(email.as_str()),
+                "{page} contains an email address"
+            );
+        }
+        assert!(!body.contains('@'), "{page} contains an email address");
+        assert!(
+            !body.contains("<style") && !body.contains(" style="),
+            "{page} has inline style"
+        );
+        assert!(
+            !body.contains(" onclick=") && !body.contains(" onsubmit="),
+            "{page} has inline handlers"
+        );
+    }
+    for asset in [
+        "/style.css",
+        "/common.js",
+        "/signin.js",
+        "/home.js",
+        "/people.js",
+        "/doc.js",
+    ] {
+        let response = server
+            .http(None)
+            .get(server.url(asset))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "{asset}");
+    }
+}
