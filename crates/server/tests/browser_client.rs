@@ -192,12 +192,12 @@ async fn browser_reports_text_lost_in_a_server_restart() {
     let answer = a.connect(second.addr).await;
     assert_eq!(
         answer.reset,
-        Some(ResetKind::RestartedLostText),
+        Some(ResetKind::ReopenedLostText),
         "{answer:?}"
     );
     assert_eq!(
         serde_json::to_value(&answer).unwrap()["reset"],
-        "restarted_lost_text"
+        "reopened_lost_text"
     );
     assert_eq!(answer.dropped, 0);
     let stored = RevisionStore::open(&library)

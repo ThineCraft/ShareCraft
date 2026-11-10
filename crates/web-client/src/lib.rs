@@ -7,6 +7,7 @@
 //! browser uses, and are converted here to the Unicode scalar values the protocol counts in.
 
 use collab_core::client_state::{ClientError as StateError, ClientState, Outgoing};
+use collab_core::document::Document;
 use collab_core::ids::{ClientId, OpId, Seq};
 use collab_text::{Component, TextDoc, TextError, TextOp};
 use protocol::{ClientMsg, Participant, Resume, RoomEpoch, SaveState, ServerMsg};
@@ -100,17 +101,18 @@ pub struct Update {
     pub refused: Option<String>,
 }
 
-/// What a reset from the server means for the person, compared with the text they had,
-/// including their unconfirmed changes. Serialized as `restarted_lost_text`, `restarted` or
-/// `resynced`.
+/// What a reset from the server means for the person. Text the server had confirmed is
+/// compared with the text it now sends; changes it never confirmed are counted separately in
+/// [`Update::dropped`]. Serialized as `reopened_lost_text`, `reopened` or `resynced`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResetKind {
-    /// The room is a new one (the server restarted, or the room ended) and its text differs
-    /// from what the person had: text they saw is gone.
-    RestartedLostText,
-    /// The room is a new one, with exactly the text the person had.
-    Restarted,
+    /// The room is a new one (the server restarted, or the room ended and the document was
+    /// opened again from its last save) and its text differs from the text the old room had
+    /// confirmed: changes everyone saw as accepted are gone.
+    ReopenedLostText,
+    /// The room is a new one, with exactly the text the old room had confirmed.
+    Reopened,
     /// The same room, which no longer had the history to resume this client.
     Resynced,
 }
@@ -145,6 +147,9 @@ pub enum ClientError {
 #[derive(Clone, Debug)]
 pub struct ClientInner {
     state: ClientState<TextDoc>,
+    /// The text as the server has confirmed it: `state`'s document without this client's
+    /// unconfirmed changes.
+    confirmed: TextDoc,
     /// The room lifetime from the last `Joined` or `Reset`; `None` until then, or after a
     /// refusal, so the next join starts afresh.
     epoch: Option<RoomEpoch>,
@@ -163,6 +168,7 @@ impl ClientInner {
     pub fn new(client: ClientId) -> Self {
         Self {
             state: ClientState::new(client, TextDoc::default(), Seq(0)),
+            confirmed: TextDoc::default(),
             epoch: None,
             joined: false,
             saved_through: Seq(0),
@@ -261,11 +267,11 @@ impl ClientInner {
                 snapshot,
                 revision,
             } => {
-                let same_text = self.state.doc().as_str() == snapshot;
+                let same_text = self.confirmed.as_str() == snapshot;
                 update.reset = Some(match (self.epoch == Some(epoch), same_text) {
                     (true, _) => ResetKind::Resynced,
-                    (false, true) => ResetKind::Restarted,
-                    (false, false) => ResetKind::RestartedLostText,
+                    (false, true) => ResetKind::Reopened,
+                    (false, false) => ResetKind::ReopenedLostText,
                 });
                 self.adopt(&mut update, snapshot, seq);
                 self.joined_room(epoch, seq, revision);
@@ -274,6 +280,8 @@ impl ClientInner {
                 let before = self.state.doc().as_str().to_owned();
                 let mut next = self.state.clone();
                 let applied = next.committed(&entry)?;
+                let mut confirmed = self.confirmed.clone();
+                confirmed.apply(&entry.op)?;
                 if let Some(remote) = &applied.remote {
                     update.edits = utf16_edits(&before, remote)?;
                     update.text_changed = true;
@@ -282,6 +290,7 @@ impl ClientInner {
                     update.send = Some(submit(out)?);
                 }
                 self.state = next;
+                self.confirmed = confirmed;
             }
             ServerMsg::People { participants } => {
                 update.people = Some(self.people(participants));
@@ -346,6 +355,7 @@ impl ClientInner {
     /// Replaces the document with the server's, dropping unconfirmed changes.
     fn adopt(&mut self, update: &mut Update, snapshot: String, seq: Seq) {
         let before = self.text();
+        self.confirmed = TextDoc::new(snapshot.clone());
         update.dropped = self.state.reset(TextDoc::new(snapshot), seq);
         let after = self.state.doc().as_str();
         if before != after {
@@ -753,8 +763,8 @@ mod tests {
         c.local_replace(0, 0, "x").unwrap();
         c.join_message().unwrap();
         let update = c.receive(&reset(epoch(8), 0, "saved")).unwrap();
-        assert_eq!(update.reset, Some(ResetKind::RestartedLostText));
-        assert_eq!(reset_json(&update), "restarted_lost_text");
+        assert_eq!(update.reset, Some(ResetKind::ReopenedLostText));
+        assert_eq!(reset_json(&update), "reopened_lost_text");
         assert_eq!(update.dropped, 1);
         assert_eq!(c.text(), "saved");
     }
@@ -764,10 +774,50 @@ mod tests {
         let mut c = joined_client("abc");
         c.join_message().unwrap();
         let update = c.receive(&reset(epoch(8), 0, "abc")).unwrap();
-        assert_eq!(update.reset, Some(ResetKind::Restarted));
-        assert_eq!(reset_json(&update), "restarted");
+        assert_eq!(update.reset, Some(ResetKind::Reopened));
+        assert_eq!(reset_json(&update), "reopened");
         assert_eq!(update.dropped, 0);
         assert!(!update.text_changed);
+    }
+
+    #[test]
+    fn reset_with_new_epoch_losing_only_unsent_typing_reports_no_lost_text() {
+        // The room ended after its grace period with everything confirmed already saved.
+        // Only the typing done while away is gone, and `dropped` reports that.
+        let mut c = joined_client("abc");
+        c.local_replace(0, 0, "x").unwrap();
+        c.join_message().unwrap();
+        let update = c.receive(&reset(epoch(8), 0, "abc")).unwrap();
+        assert_eq!(update.reset, Some(ResetKind::Reopened));
+        assert_eq!(update.dropped, 1);
+        assert_eq!(c.text(), "abc");
+    }
+
+    #[test]
+    fn reset_compares_against_text_confirmed_by_committed_entries() {
+        let mut c = joined_client("ab");
+        // Someone else's change, then our own, both confirmed.
+        let theirs = TextOp::replace(2, 2, 0, "c").unwrap();
+        c.receive(&committed(1, other(), OpId(Uuid::from_u128(50)), theirs))
+            .unwrap();
+        let sent = c.local_replace(0, 0, "x").unwrap().unwrap();
+        let (op_id, _, op) = submitted(&sent);
+        c.receive(&committed(2, me(), op_id, op)).unwrap();
+        assert_eq!(c.text(), "xabc");
+        // Unsent typing on top.
+        c.local_replace(0, 0, "y").unwrap();
+        c.join_message().unwrap();
+
+        // A new room holding exactly the confirmed text: nothing confirmed was lost.
+        let mut same = c.clone();
+        let update = same.receive(&reset(epoch(8), 0, "xabc")).unwrap();
+        assert_eq!(update.reset, Some(ResetKind::Reopened));
+        assert_eq!(update.dropped, 1);
+
+        // A new room holding older text: confirmed text was lost.
+        let update = c.receive(&reset(epoch(8), 0, "ab")).unwrap();
+        assert_eq!(update.reset, Some(ResetKind::ReopenedLostText));
+        assert_eq!(update.dropped, 1);
     }
 
     #[test]

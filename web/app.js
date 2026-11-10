@@ -149,9 +149,10 @@ function handleFrame(data) {
   if (update.save) save = update.save;
   const n = update.dropped;
   const changes = `${n} ${n === 1 ? 'change' : 'changes'}`;
-  if (update.reset === 'restarted_lost_text') {
-    // The new room's text differs from what the person had: unsaved text is gone.
-    notice = 'The server restarted. Changes made since the last save were lost.';
+  if (update.reset === 'reopened_lost_text') {
+    // The document was opened again from its last save, which is older than the text the
+    // server had confirmed: accepted changes are gone.
+    notice = 'This document was reopened from its last save. Changes made after that save were lost.';
     if (n > 0) notice += ` ${changes} you typed while disconnected could not be kept.`;
   } else if (n > 0) {
     const kept = `${changes} could not be kept.`;
