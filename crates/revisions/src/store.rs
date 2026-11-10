@@ -5,10 +5,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use collab_core::ids::DocId;
-use git2::{ObjectType, Oid, Repository, RepositoryInitOptions, Signature, Tree};
+use gix::object::tree::EntryKind;
+use gix::refs::Target;
+use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
+use gix::{ObjectId, Repository};
 
 use crate::meta::{Author, Meta};
-use crate::{Checkpoint, CheckpointError, Outcome, RevisionId, Stored};
+use crate::{Checkpoint, CheckpointError, GitError, Outcome, RevisionId, Stored};
 
 const MAIN: &str = "refs/heads/main";
 const SCHEMA: u32 = 1;
@@ -48,7 +51,7 @@ fn valid_author(a: &Author) -> bool {
 }
 
 /// Whether `name` can be stored as an author name: no control characters, `<` or `>`, and
-/// something left after trimming what libgit2 trims from both ends of a signature name.
+/// something left after trimming what Git trims from both ends of a signature name.
 #[must_use]
 pub fn is_valid_author_name(name: &str) -> bool {
     !name.trim_matches(trimmed_from_signature).is_empty()
@@ -57,8 +60,9 @@ pub fn is_valid_author_name(name: &str) -> bool {
             .any(|c| c.is_control() || matches!(c, '<' | '>'))
 }
 
-/// Characters libgit2 strips from the ends of a signature name (`is_crud` in its
-/// `signature.c`: bytes up to space and `, : ; < > " \ '`), plus any other whitespace.
+/// Characters trimmed from the ends of a signature name before it is stored: bytes up to
+/// space and `, : ; < > " \ '`, plus any other whitespace. Git tools clean names the same
+/// way, so a stored name reads back unchanged whichever tool reads it.
 fn trimmed_from_signature(c: char) -> bool {
     c <= ' ' || c.is_whitespace() || matches!(c, ',' | ':' | ';' | '<' | '>' | '"' | '\\' | '\'')
 }
@@ -67,28 +71,39 @@ fn email(author: &Author) -> String {
     format!("{}@sharecraft.invalid", author.id)
 }
 
-fn read_blob(
-    repo: &Repository,
-    tree: &Tree<'_>,
-    path: &str,
-) -> Result<Option<Vec<u8>>, git2::Error> {
-    match tree.get_path(Path::new(path)) {
-        Ok(entry) => Ok(Some(repo.find_blob(entry.id())?.content().to_vec())),
-        Err(e) if e.code() == git2::ErrorCode::NotFound => Ok(None),
-        Err(e) => Err(e),
+fn signature(author: &Author) -> gix::actor::Signature {
+    gix::actor::Signature {
+        name: author.name.trim_matches(trimmed_from_signature).into(),
+        email: email(author).into(),
+        time: gix::date::Time::now_local_or_utc(),
     }
 }
 
-fn read_at(repo: &Repository, doc: DocId, oid: Oid) -> Result<Option<Stored>, CheckpointError> {
-    let commit = match repo.find_commit(oid) {
-        Ok(c) => c,
-        Err(e) if e.code() == git2::ErrorCode::NotFound => return Ok(None),
-        Err(e) => return Err(e.into()),
+/// Options that ignore the machine's and the user's Git configuration, so the store behaves
+/// the same wherever the server runs.
+fn open_options() -> gix::open::Options {
+    gix::open::Options::isolated()
+}
+
+fn read_blob(tree: &gix::Tree<'_>, path: &str) -> Result<Option<Vec<u8>>, GitError> {
+    match tree.lookup_entry_by_path(path)? {
+        Some(entry) => Ok(Some(entry.object()?.detach().data)),
+        None => Ok(None),
+    }
+}
+
+fn read_at(
+    repo: &Repository,
+    doc: DocId,
+    oid: ObjectId,
+) -> Result<Option<Stored>, CheckpointError> {
+    let Some(object) = repo.try_find_object(oid)? else {
+        return Ok(None);
     };
-    let tree = commit.tree()?;
+    let tree = object.try_into_commit().map_err(GitError::new)?.tree()?;
     let dir = format!("docs/{}", doc.0);
-    let content = read_blob(repo, &tree, &format!("{dir}/content"))?;
-    let meta = read_blob(repo, &tree, &format!("{dir}/meta.json"))?;
+    let content = read_blob(&tree, &format!("{dir}/content"))?;
+    let meta = read_blob(&tree, &format!("{dir}/meta.json"))?;
     match (content, meta) {
         (Some(bytes), Some(meta)) => Ok(Some(Stored {
             revision: RevisionId::from_oid(oid),
@@ -99,42 +114,55 @@ fn read_at(repo: &Repository, doc: DocId, oid: Oid) -> Result<Option<Stored>, Ch
     }
 }
 
-fn doc_head(repo: &Repository, doc: DocId) -> Result<Option<Oid>, git2::Error> {
-    match repo.find_reference(&doc_ref(doc)) {
-        Ok(r) => Ok(r.target()),
-        Err(e) if e.code() == git2::ErrorCode::NotFound => Ok(None),
-        Err(e) => Err(e),
-    }
+/// The commit `name` points at directly, or `None` if there is no such ref.
+fn ref_target(repo: &Repository, name: &str) -> Result<Option<ObjectId>, GitError> {
+    Ok(repo
+        .try_find_reference(name)?
+        .and_then(|r| r.try_id().map(gix::Id::detach)))
+}
+
+fn doc_head(repo: &Repository, doc: DocId) -> Result<Option<ObjectId>, GitError> {
+    ref_target(repo, &doc_ref(doc))
+}
+
+/// An edit that points `name` at `new`, allowed only while the ref is still at `expected`.
+fn ref_edit(name: &str, new: ObjectId, expected: Option<ObjectId>) -> Result<RefEdit, GitError> {
+    Ok(RefEdit {
+        change: Change::Update {
+            log: LogChange {
+                mode: RefLog::AndReference,
+                force_create_reflog: false,
+                message: "checkpoint".into(),
+            },
+            expected: match expected {
+                Some(id) => PreviousValue::MustExistAndMatch(Target::Object(id)),
+                None => PreviousValue::MustNotExist,
+            },
+            new: Target::Object(new),
+        },
+        name: name.try_into().map_err(GitError::new)?,
+        deref: false,
+    })
 }
 
 /// Points `main` and the document ref at `oid` in one transaction.
 ///
-/// The transaction cannot express "still at the tip we read", so after locking both refs and
-/// before setting anything, `main` and the document ref are re-read and compared with the
-/// tips seen at the start of the checkpoint. On any difference nothing is set.
+/// Each edit names the tip seen at the start of the checkpoint. Both refs are locked and
+/// compared with those tips before either is written; on any difference nothing is set.
 fn move_refs(
     repo: &Repository,
     doc: DocId,
-    oid: Oid,
-    expected_main: Option<Oid>,
-    expected_doc: Option<Oid>,
-    signature: &Signature<'_>,
+    oid: ObjectId,
+    expected_main: Option<ObjectId>,
+    expected_doc: Option<ObjectId>,
+    signature: &gix::actor::Signature,
 ) -> Result<(), CheckpointError> {
-    let doc_ref_name = doc_ref(doc);
-    let mut tx = repo.transaction()?;
-    tx.lock_ref(MAIN)?;
-    tx.lock_ref(&doc_ref_name)?;
-    let main_now = match repo.find_reference(MAIN) {
-        Ok(r) => r.target(),
-        Err(e) if e.code() == git2::ErrorCode::NotFound => None,
-        Err(e) => return Err(e.into()),
-    };
-    if main_now != expected_main || doc_head(repo, doc)? != expected_doc {
-        return Err(git2::Error::from_str("refs moved during checkpoint").into());
-    }
-    tx.set_target(MAIN, oid, Some(signature), "checkpoint")?;
-    tx.set_target(&doc_ref_name, oid, Some(signature), "checkpoint")?;
-    tx.commit()?;
+    let edits = [
+        ref_edit(MAIN, oid, expected_main)?,
+        ref_edit(&doc_ref(doc), oid, expected_doc)?,
+    ];
+    let mut time = gix::date::parse::TimeBuf::default();
+    repo.edit_references_as(edits, Some(signature.to_ref(&mut time)))?;
     Ok(())
 }
 
@@ -143,25 +171,33 @@ impl RevisionStore {
     ///
     /// # Errors
     /// Returns the Git error if the repository cannot be opened or created.
-    pub fn open(repo_path: &Path) -> Result<Self, git2::Error> {
-        let mut opts = RepositoryInitOptions::new();
-        opts.bare(true).initial_head("main").mkpath(true);
-        Repository::init_opts(repo_path, &opts)?;
+    pub fn open(repo_path: &Path) -> Result<Self, GitError> {
+        if repo_path.join("HEAD").is_file() {
+            gix::open_opts(repo_path, open_options())?;
+        } else {
+            std::fs::create_dir_all(repo_path).map_err(GitError::new)?;
+            gix::ThreadSafeRepository::init_opts(
+                repo_path,
+                gix::create::Kind::Bare,
+                gix::create::Options::default(),
+                open_options(),
+            )?;
+        }
         Ok(RevisionStore {
             path: repo_path.to_path_buf(),
             write_lock: Mutex::new(()),
         })
     }
 
-    fn repo(&self) -> Result<Repository, git2::Error> {
-        Repository::open_bare(&self.path)
+    fn repo(&self) -> Result<Repository, GitError> {
+        Ok(gix::open_opts(self.path.as_path(), open_options())?)
     }
 
     /// The document's current revision, if it has one.
     ///
     /// # Errors
     /// Returns the Git error if the repository cannot be read.
-    pub fn head(&self, doc: DocId) -> Result<Option<RevisionId>, git2::Error> {
+    pub fn head(&self, doc: DocId) -> Result<Option<RevisionId>, GitError> {
         let repo = self.repo()?;
         Ok(doc_head(&repo, doc)?.map(RevisionId::from_oid))
     }
@@ -247,29 +283,26 @@ impl RevisionStore {
         };
         let meta_bytes = meta.to_file_bytes()?;
 
-        let parent = match repo.find_reference(MAIN) {
-            Ok(r) => Some(r.peel_to_commit()?),
-            Err(e) if e.code() == git2::ErrorCode::NotFound => None,
-            Err(e) => return Err(e.into()),
+        let parent = match repo.try_find_reference(MAIN)? {
+            Some(mut r) => Some(r.peel_to_commit()?),
+            None => None,
         };
-        let root = parent.as_ref().map(git2::Commit::tree).transpose()?;
-        let docs = match root.as_ref().and_then(|t| t.get_name("docs")) {
-            Some(e) if e.kind() == Some(ObjectType::Tree) => Some(repo.find_tree(e.id())?),
-            _ => None,
+        let root = match &parent {
+            Some(commit) => commit.tree_id()?.detach(),
+            None => ObjectId::empty_tree(repo.object_hash()),
         };
 
-        let mut doc_tree = repo.treebuilder(None)?;
-        doc_tree.insert("content", repo.blob(c.bytes)?, 0o100_644)?;
-        doc_tree.insert("meta.json", repo.blob(&meta_bytes)?, 0o100_644)?;
-        let doc_tree_id = doc_tree.write()?;
-        let mut docs_builder = repo.treebuilder(docs.as_ref())?;
-        docs_builder.insert(c.doc.0.to_string(), doc_tree_id, 0o040_000)?;
-        let docs_id = docs_builder.write()?;
-        let mut root_builder = repo.treebuilder(root.as_ref())?;
-        root_builder.insert("docs", docs_id, 0o040_000)?;
-        let tree = repo.find_tree(root_builder.write()?)?;
+        // The document's folder is rebuilt from scratch: it holds these two files only.
+        let dir = format!("docs/{}", c.doc.0);
+        let content = repo.write_blob(c.bytes)?.detach();
+        let meta_blob = repo.write_blob(&meta_bytes)?.detach();
+        let mut editor = repo.edit_tree(root)?;
+        editor.remove(dir.as_str())?;
+        editor.upsert(format!("{dir}/content"), EntryKind::Blob, content)?;
+        editor.upsert(format!("{dir}/meta.json"), EntryKind::Blob, meta_blob)?;
+        let tree = editor.write()?.detach();
 
-        let signature = Signature::now(&first.name, &email(first))?;
+        let signature = signature(first);
         let mut message = format!("Checkpoint {}\n", c.file_name);
         for (i, a) in credited.iter().skip(1).enumerate() {
             if i == 0 {
@@ -279,16 +312,18 @@ impl RevisionStore {
             let _ = writeln!(message, "Co-authored-by: {} <{}>", a.name, email(a));
         }
 
-        let parents: Vec<&git2::Commit<'_>> = parent.iter().collect();
-        let oid = repo.commit(None, &signature, &signature, &message, &tree, &parents)?;
-        move_refs(
-            &repo,
-            c.doc,
-            oid,
-            parent.as_ref().map(git2::Commit::id),
-            current,
-            &signature,
-        )?;
+        let parent_id = parent.as_ref().map(|p| p.id().detach());
+        let commit = gix::objs::Commit {
+            tree,
+            parents: parent_id.into_iter().collect(),
+            author: signature.clone(),
+            committer: signature.clone(),
+            encoding: None,
+            message: message.into(),
+            extra_headers: Vec::new(),
+        };
+        let oid = repo.write_object(&commit)?.detach();
+        move_refs(&repo, c.doc, oid, parent_id, current, &signature)?;
         Ok(Outcome::Written(RevisionId::from_oid(oid)))
     }
 }
@@ -329,28 +364,53 @@ mod tests {
         let first_oid = first.to_oid().unwrap();
 
         let repo = store.repo().unwrap();
-        let sig = Signature::now("Ann", "u1@sharecraft.invalid").unwrap();
-        let tree = repo.find_commit(first_oid).unwrap().tree().unwrap();
-        let other = repo.commit(None, &sig, &sig, "other", &tree, &[]).unwrap();
-        let new = repo.commit(None, &sig, &sig, "new", &tree, &[]).unwrap();
+        let sig = signature(&authors[0]);
+        let tree = repo
+            .find_commit(first_oid)
+            .unwrap()
+            .tree_id()
+            .unwrap()
+            .detach();
+        let commit = |message: &str| {
+            let commit = gix::objs::Commit {
+                tree,
+                parents: Default::default(),
+                author: sig.clone(),
+                committer: sig.clone(),
+                encoding: None,
+                message: message.into(),
+                extra_headers: Vec::new(),
+            };
+            repo.write_object(&commit).unwrap().detach()
+        };
+        let other = commit("other");
+        let new = commit("new");
         let tips = |repo: &Repository| {
             (
-                repo.refname_to_id(MAIN).unwrap(),
-                repo.refname_to_id(&doc_ref(doc)).unwrap(),
+                ref_target(repo, MAIN).unwrap().unwrap(),
+                doc_head(repo, doc).unwrap().unwrap(),
             )
+        };
+        let force = |name: &str, to: ObjectId| {
+            repo.reference(name, to, PreviousValue::Any, "test")
+                .unwrap();
         };
 
         // Another writer moved `main` after we read `first` as its tip.
-        repo.reference(MAIN, other, true, "other writer").unwrap();
+        force(MAIN, other);
         let err = move_refs(&repo, doc, new, Some(first_oid), Some(first_oid), &sig);
         assert!(err.is_err());
         assert_eq!(tips(&repo), (other, first_oid), "both refs untouched");
 
         // The document ref moved instead.
-        repo.reference(MAIN, first_oid, true, "reset").unwrap();
-        repo.reference(&doc_ref(doc), other, true, "other writer")
-            .unwrap();
+        force(MAIN, first_oid);
+        force(&doc_ref(doc), other);
         assert!(move_refs(&repo, doc, new, Some(first_oid), Some(first_oid), &sig).is_err());
+        assert_eq!(tips(&repo), (first_oid, other), "both refs untouched");
+
+        // A ref expected to be absent that exists is also a difference.
+        assert!(move_refs(&repo, doc, new, None, Some(other), &sig).is_err());
+        assert!(move_refs(&repo, doc, new, Some(first_oid), None, &sig).is_err());
         assert_eq!(tips(&repo), (first_oid, other), "both refs untouched");
 
         // Matching tips: both move together.

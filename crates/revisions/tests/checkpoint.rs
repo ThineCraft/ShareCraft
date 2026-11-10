@@ -63,10 +63,9 @@ fn written(o: Outcome) -> RevisionId {
 }
 
 fn commit_count(path: &std::path::Path) -> usize {
-    let repo = git2::Repository::open(path).unwrap();
-    let mut walk = repo.revwalk().unwrap();
-    walk.push_ref("refs/heads/main").unwrap();
-    walk.count()
+    let repo = gix::open(path).unwrap();
+    let main = repo.find_reference("refs/heads/main").unwrap().id();
+    repo.rev_walk([main]).all().unwrap().count()
 }
 
 #[test]
@@ -98,17 +97,18 @@ fn meta_json_is_pretty_with_trailing_newline() {
     let mut fields = Map::new();
     fields.insert("title".into(), Value::String("T".into()));
     written(f.store.checkpoint(&cp(d, b"x", None, &a, &fields)).unwrap());
-    let repo = git2::Repository::open(&f.path).unwrap();
+    let repo = gix::open(&f.path).unwrap();
     let tree = repo
-        .revparse_single("refs/heads/main")
+        .find_reference("refs/heads/main")
         .unwrap()
         .peel_to_tree()
         .unwrap();
     let entry = tree
-        .get_path(std::path::Path::new(&format!("docs/{}/meta.json", d.0)))
+        .lookup_entry_by_path(format!("docs/{}/meta.json", d.0))
+        .unwrap()
         .unwrap();
-    let blob = repo.find_blob(entry.id()).unwrap();
-    let text = std::str::from_utf8(blob.content()).unwrap();
+    let blob = entry.object().unwrap();
+    let text = std::str::from_utf8(&blob.data).unwrap();
     let expected = format!(
         "{{\n  \"schema\": 1,\n  \"doc_id\": \"{}\",\n  \"file_name\": \"notes.txt\",\n  \"fields\": {{\n    \"title\": \"T\"\n  }},\n  \"contributors\": [\n    {{\n      \"id\": \"u1\",\n      \"name\": \"Ann\"\n    }}\n  ]\n}}\n",
         d.0
@@ -203,19 +203,19 @@ fn several_authors_are_credited() {
     let a = [author("u1", "Ann"), author("u2", "Bob")];
     let fields = Map::new();
     let id = written(f.store.checkpoint(&cp(d, b"x", None, &a, &fields)).unwrap());
-    let repo = git2::Repository::open(&f.path).unwrap();
+    let repo = gix::open(&f.path).unwrap();
     let commit = repo
-        .find_commit(git2::Oid::from_str(&id.to_string()).unwrap())
+        .find_commit(gix::ObjectId::from_hex(id.to_string().as_bytes()).unwrap())
         .unwrap();
-    let msg = commit.message().unwrap();
+    let msg = commit.message_raw().unwrap();
     assert_eq!(
         msg,
         "Checkpoint notes.txt\n\nCo-authored-by: Bob <u2@sharecraft.invalid>\n"
     );
-    let sig = commit.author();
-    assert_eq!(sig.email().unwrap(), "u1@sharecraft.invalid");
-    let committer = commit.committer();
-    assert_eq!(committer.name().unwrap(), "Ann");
+    let sig = commit.author().unwrap();
+    assert_eq!(sig.email, "u1@sharecraft.invalid");
+    let committer = commit.committer().unwrap();
+    assert_eq!(committer.name, "Ann");
     let stored = f.store.read(d, None).unwrap().unwrap();
     assert_eq!(stored.meta.contributors, a.to_vec());
 }
@@ -402,13 +402,13 @@ fn rejects_blank_author_name() {
 }
 
 #[test]
-fn rejects_author_name_libgit2_would_empty() {
-    // libgit2 trims these from both ends of a signature name and refuses an empty result.
+fn rejects_author_name_git_would_empty() {
+    // Git trims these from both ends of a signature name, which would leave nothing.
     for name in [";", "'", "\"", ",", ":", "\\", " ;: ", "'\"'"] {
         assert_invalid_author_writes_nothing(author("u1", name));
         assert!(!revisions::is_valid_author_name(name), "{name:?}");
     }
-    // Trimmed by libgit2 but not to nothing, so these are kept.
+    // Not trimmed to nothing, so these are kept.
     for name in [".", "...", ":)"] {
         assert!(revisions::is_valid_author_name(name), "{name:?}");
         let f = fixture();
@@ -462,11 +462,12 @@ fn both_refs_point_at_the_new_commit_after_checkpoint() {
     let a = [author("u1", "Ann")];
     let fields = Map::new();
     let id = written(f.store.checkpoint(&cp(d, b"x", None, &a, &fields)).unwrap());
-    let repo = git2::Repository::open(&f.path).unwrap();
-    let main = repo.refname_to_id("refs/heads/main").unwrap();
+    let repo = gix::open(&f.path).unwrap();
+    let main = repo.find_reference("refs/heads/main").unwrap().id();
     let docref = repo
-        .refname_to_id(&format!("refs/sharecraft/docs/{}", d.0))
-        .unwrap();
+        .find_reference(&format!("refs/sharecraft/docs/{}", d.0))
+        .unwrap()
+        .id();
     assert_eq!(main.to_string(), id.to_string());
     assert_eq!(docref.to_string(), id.to_string());
 }

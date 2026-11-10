@@ -48,11 +48,16 @@ impl TestServer {
 
     /// The commits that changed `doc`, newest first.
     pub fn doc_commits(&self, doc: DocId) -> Vec<String> {
-        let repo = git2::Repository::open_bare(self.library()).unwrap();
-        let mut walk = repo.revwalk().unwrap();
-        walk.push_ref(&format!("refs/sharecraft/docs/{}", doc.0))
-            .unwrap();
-        walk.map(|oid| oid.unwrap().to_string()).collect()
+        let repo = gix::open(self.library()).unwrap();
+        let tip = repo
+            .find_reference(&format!("refs/sharecraft/docs/{}", doc.0))
+            .unwrap()
+            .id();
+        repo.rev_walk([tip])
+            .all()
+            .unwrap()
+            .map(|info| info.unwrap().id.to_string())
+            .collect()
     }
 }
 

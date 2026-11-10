@@ -28,12 +28,12 @@ pub struct RevisionId(String);
 pub struct ParseRevisionIdError;
 
 impl RevisionId {
-    pub(crate) fn from_oid(oid: git2::Oid) -> Self {
+    pub(crate) fn from_oid(oid: gix::ObjectId) -> Self {
         RevisionId(oid.to_string())
     }
 
-    pub(crate) fn to_oid(&self) -> Result<git2::Oid, git2::Error> {
-        git2::Oid::from_str(&self.0)
+    pub(crate) fn to_oid(&self) -> Result<gix::ObjectId, GitError> {
+        gix::ObjectId::from_hex(self.0.as_bytes()).map_err(GitError::new)
     }
 }
 
@@ -67,6 +67,32 @@ impl From<RevisionId> for String {
 impl fmt::Display for RevisionId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
+    }
+}
+
+/// The Git storage layer failed.
+///
+/// Carries the underlying error as text, so callers do not depend on the Git library used.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
+pub struct GitError(String);
+
+impl GitError {
+    /// A Git failure described by `cause`.
+    pub fn new(cause: impl fmt::Display) -> Self {
+        GitError(cause.to_string())
+    }
+}
+
+impl From<gix::Error> for GitError {
+    fn from(e: gix::Error) -> Self {
+        GitError::new(e)
+    }
+}
+
+impl From<gix::Error> for CheckpointError {
+    fn from(e: gix::Error) -> Self {
+        CheckpointError::Git(e.into())
     }
 }
 
@@ -116,7 +142,7 @@ pub enum CheckpointError {
     InvalidFileName,
     /// Git failed.
     #[error("git error: {0}")]
-    Git(#[from] git2::Error),
+    Git(#[from] GitError),
     /// Metadata could not be encoded or decoded.
     #[error("metadata error: {0}")]
     Json(#[from] serde_json::Error),

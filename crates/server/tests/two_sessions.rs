@@ -533,7 +533,9 @@ impl Checkpointer for Flaky {
         let left = self.failures.load(Ordering::SeqCst);
         if left > 0 {
             self.failures.store(left - 1, Ordering::SeqCst);
-            return Err(CheckpointError::Git(git2::Error::from_str("disk on fire")));
+            return Err(CheckpointError::Git(revisions::GitError::new(
+                "disk on fire",
+            )));
         }
         self.inner.write(c)
     }
@@ -665,12 +667,14 @@ struct BrokenLoad {
 impl Checkpointer for BrokenLoad {
     fn write(&self, _c: &Checkpoint<'_>) -> Result<Outcome, CheckpointError> {
         self.writes.fetch_add(1, Ordering::SeqCst);
-        Err(CheckpointError::Git(git2::Error::from_str("not expected")))
+        Err(CheckpointError::Git(revisions::GitError::new(
+            "not expected",
+        )))
     }
 
     fn load(&self, _doc: DocId) -> Result<Option<Stored>, CheckpointError> {
         self.loads.fetch_add(1, Ordering::SeqCst);
-        Err(CheckpointError::Git(git2::Error::from_str("unreadable")))
+        Err(CheckpointError::Git(revisions::GitError::new("unreadable")))
     }
 }
 
@@ -722,7 +726,7 @@ async fn awkward_display_name_does_not_block_saving() {
         .collect();
     assert_eq!(names, vec!["AnnX"]);
 
-    // Names libgit2 would trim to nothing are credited as "Guest", so saving still works.
+    // Names Git would trim to nothing are credited as "Guest", so saving still works.
     // `;`, `'`, `"`, `\` and `:`, percent-encoded.
     for encoded in ["%3B", "%27", "%22", "%5C", "%3A"] {
         let doc = new_doc();
