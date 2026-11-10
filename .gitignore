@@ -1,1 +1,5 @@
 .env
+
+/target
+/data
+/web/pkg
