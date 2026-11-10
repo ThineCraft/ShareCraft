@@ -46,21 +46,21 @@ pre{background:#0f2a2c;color:#e6f2ee;border-radius:6px;padding:14px 16px;margin:
 <ul>
 <li><strong>PostgreSQL.</strong> The server keeps accounts, sign-in sessions, sharing, the revision index and events in a PostgreSQL database and will not start without one. Development has used PostgreSQL 18 on the local machine. Create an empty database and an account that may create tables in it. For the tests (section 02) create a second, separate database and give the same account permission to create schemas in it; the tests do not create databases.</li>
 <li><strong>A <code>.env</code> file</strong> in the repository root, made by copying <code>.env.example</code> and replacing its placeholder values. It names the databases by variable (<code>DATABASE_URL</code> for the server, <code>TEST_DATABASE_URL</code> for the tests). <code>.env</code> is not kept in Git. Keep real values only there: never put a database address or password in a command that is saved, in a commit or in a message.</li>
-<li><strong>Node.js</strong>, only if you want to run the one automated test file for the page scripts (section 02).</li>
+<li><strong>Node.js</strong>, to run the automated test file for the page scripts, which <code>cargo xtask check</code> runs (section 02). Without it the check stops and says that Node.js is needed.</li>
 </ul>
 <p>Git does not need to be installed to run ShareCraft, because the Git library is built in. You only need it to look at saved documents (section 09).</p>
 </section>
 
 <section id="build"><h2>02 / Build and check</h2>
 <p>Run every command from the repository root, the folder that holds <code>Cargo.toml</code>.</p>
-<p>This loads <code>.env</code>, then checks that no dependency has a copyleft licence, checks formatting, runs the lints with warnings treated as errors, runs all tests in the workspace, and builds each browser-side crate for WebAssembly. It prints <code>xtask: all checks passed</code> and exits with code 0 when everything is in order:</p>
+<p>This loads <code>.env</code>, then checks that no dependency has a copyleft licence, checks formatting, runs the lints with warnings treated as errors, runs all tests in the workspace, builds each browser-side crate for WebAssembly, and runs the page script tests with Node (below). It prints <code>xtask: all checks passed</code> and exits with code 0 when everything is in order:</p>
 <pre><code>cargo xtask check</code></pre>
 <p>This loads <code>.env</code> and then runs <code>cargo test</code> with whatever arguments you add, for example <code>cargo xtask test -p server</code>:</p>
 <pre><code>cargo xtask test</code></pre>
 <p><strong>The tests need <code>TEST_DATABASE_URL</code>.</strong> Every test that uses the database creates its own schema in that database, drops it afterwards, and also drops leftover test schemas more than an hour old. A test that needs the variable and finds it unset fails with a message saying so; it is never skipped. That is why you run the tests through <code>cargo xtask check</code> or <code>cargo xtask test</code>, which load <code>.env</code>, and not through plain <code>cargo test</code>.</p>
 <p>This builds the browser client and writes the page's script package to <code>web/pkg</code>. The folder is not kept in Git, so do this once after a fresh checkout and again after changing the browser client:</p>
 <pre><code>cargo xtask web</code></pre>
-<p>The scripts of the web pages (the <code>.js</code> files in <code>web</code>) have one automated test file, <code>web/common.test.mjs</code>. It tests the function that decides where to go after signing in, so that a crafted link cannot send someone to another site. It is not part of <code>cargo xtask check</code>. Run it with Node:</p>
+<p>The scripts of the web pages (the <code>.js</code> files in <code>web</code>) have one automated test file, <code>web/common.test.mjs</code>. It tests the function that decides where to go after signing in, so that a crafted link cannot send someone to another site. <code>cargo xtask check</code> runs it, and fails with a message saying so when Node.js is not installed; it never skips it. To run it on its own:</p>
 <pre><code>node --test web/*.test.mjs</code></pre>
 </section>
 
@@ -72,9 +72,9 @@ pre{background:#0f2a2c;color:#e6f2ee;border-radius:6px;padding:14px 16px;margin:
 </section>
 
 <section id="run"><h2>04 / Run it and sign in</h2>
-<p>Start the server, still from the repository root. It needs <code>DATABASE_URL</code>, which it reads from <code>.env</code> in the current folder or a parent. It brings the database schema up to date, compares the revision index with Git (section 10), then starts listening:</p>
+<p>Start the server, still from the repository root. It needs <code>DATABASE_URL</code>, which it reads from <code>.env</code> in the current folder or a parent. It takes its address first, so an address already in use is reported at once. It then brings the database schema up to date and compares the revision index with Git (section 10). Only then does it say where it listens and start accepting connections:</p>
 <pre><code>cargo run -p server</code></pre>
-<p>It prints the revision-index line, the address it listens on, and <code>WARNING: development mode, local connections only</code>. Then open the site in a browser at exactly one of these addresses:</p>
+<p>It prints the revision-index line, then the address it listens on and <code>WARNING: development mode, local connections only</code>. If the database cannot be reached or brought up to date, it prints why and exits without printing the address. Once the address is shown, open the site in a browser at exactly one of these addresses:</p>
 <pre><code>http://127.0.0.1:8787/
 http://localhost:8787/</code></pre>
 <p>A person who is not signed in is sent to the sign-in page, and after signing in comes back to the page they asked for. After signing in the documents page lists the documents the person can open and has a <strong>New document</strong> form. A document opens at an address such as <code>/doc.html#&lt;document id&gt;</code>; the part after <code>#</code> is the document's identifier, and anyone with access can use the same address.</p>
@@ -173,7 +173,7 @@ cargo run -p server</code></pre>
 <tr><td>An administrator disabled their account</td><td><strong>Your account was disabled.</strong></td></tr>
 </tbody></table></div>
 <p>Reopening the document after losing access shows <strong>This document does not exist, or you do not have access to it.</strong> Opening any page when the session is over sends the person to the sign-in page.</p>
-<p>Lowering a role from editor to viewer does not remove the person. Their text box becomes read-only, they are marked <em>read only</em> in the list of people, and if they had typed something the server had not yet accepted, it is refused and the status reads <strong>A change was refused because you can no longer edit this document.</strong> Raising a role makes the text box editable the same way; an owner's Sharing panel appears or goes accordingly.</p>
+<p>Lowering a role from editor to viewer does not remove the person. Their text box becomes read-only, they are marked <em>read only</em> in the list of people, and if they had typed something the server had not yet accepted, it is refused and the status reads <strong>A change was refused because you can no longer edit this document.</strong> Raising a role makes the text box editable the same way. Every change of role is sent to the open page, including one that does not change whether the person may edit: a person made owner gets the Sharing panel, and an owner made editor or viewer loses it, without reloading.</p>
 <p>These changes are made in PostgreSQL first and then sent to the open document inside the server process. This works because there is one server process. If the role cannot be read at that moment, the person's connections are removed rather than left open.</p>
 </section>
 
@@ -211,7 +211,7 @@ git --git-dir=data/libraries/00000000-0000-0000-0000-000000000001.git show main:
 <p>PostgreSQL holds a list of each document's revisions: the Git commit id, its position in the document's history, its parent, when it was committed and who is credited. The documents page uses it to show each document's last save time. The list is an <strong>index</strong>: Git is the authority, and the index can always be replaced from it.</p>
 <ul>
 <li><strong>After each checkpoint</strong> the server adds the new revision to the index in the background. If this fails, the content is still safe in Git, the failure is printed to the server's console and recorded as an event, and the next start repairs the index.</li>
-<li><strong>At every start</strong> the server reconciles: for each document in Git it compares the newest revision in the index with Git's, and replaces the document's list from Git when they differ. It prints one line before it begins listening, for example <code>Reconciled revisions with Git: 3 documents in Git, 1 updated, 0 failed</code>. A document that cannot be read is listed on the console and the server still starts.</li>
+<li><strong>At every start</strong> the server reconciles: for each document in Git it compares the newest revision in the index with Git's, and replaces the document's list from Git when they differ. It prints one line before it prints its address and begins accepting connections, for example <code>Reconciled revisions with Git: 3 documents in Git, 1 updated, 0 failed</code>. A document that cannot be read is listed on the console and the server still starts.</li>
 <li><strong><code>rebuild</code></strong> replaces the list of every document in Git, whether or not it looks out of date. Use it if you suspect the index is wrong. It needs <code>DATABASE_URL</code> and the data folder, brings the schema up to date, prints <code>Rebuilt revisions from Git: ...</code> with the same counts, names any document it could not rebuild, and exits with a failure code if there was one:</li>
 </ul>
 <pre><code>cargo run -p server -- rebuild</code></pre>
@@ -262,7 +262,7 @@ git --git-dir=data/libraries/00000000-0000-0000-0000-000000000001.git show main:
 <tr><td><strong>You were signed out.</strong></td><td>Signed out or the session ended (section 08).</td></tr>
 <tr><td><strong>Your account was disabled.</strong></td><td>Disabled by an administrator (section 08).</td></tr>
 <tr><td><strong>This document does not exist, or you do not have access to it.</strong> (status: <strong>Not available</strong>)</td><td>The address is not a document, the person has no role on it, or access was lost while the page was reconnecting. The two cases are not told apart.</td></tr>
-<tr><td><strong>This document was changed somewhere else. Copy anything you need, then reload.</strong></td><td>Conflict: when the server went to save, Git held a revision it did not expect. The server stops saving that document and nothing is merged; changes after the last saved revision are lost. This cannot happen through the server alone, only if the Git repository is changed by something else.</td></tr>
+<tr><td><strong>This document was changed somewhere else. Copy anything you need, then reload.</strong></td><td>Conflict: when the server went to save, Git held a revision it did not expect. The server stops saving that document and nothing is merged; changes after the last saved revision are lost. The text box becomes read-only, so that nothing more is typed that could not be kept; the text in it can still be selected and copied. This cannot happen through the server alone, only if the Git repository is changed by something else.</td></tr>
 <tr><td><strong>The editor could not be loaded. Run "cargo xtask web" and reload.</strong></td><td><code>web/pkg</code> is missing (section 02).</td></tr>
 </tbody></table></div>
 </section>
