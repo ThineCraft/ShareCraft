@@ -101,7 +101,7 @@ pub(crate) async fn disable(
         .db()
         .set_disabled(signed.session.user.id, user, true)
         .await?;
-    after_account_disabled(&state, user).await;
+    after_account_disabled(&state, user);
     Ok(StatusCode::NO_CONTENT)
 }
 

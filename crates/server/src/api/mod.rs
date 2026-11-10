@@ -166,7 +166,12 @@ fn parse_id(text: &str) -> Result<Uuid, ApiError> {
 /// tells the document's room: connections that lost access are removed, the others get their
 /// new rights. If the role cannot be read, their connections are removed, as access can no
 /// longer be confirmed.
+///
+/// The read and the message to the room happen under the document's access lock, so that of
+/// two changes made at once the room hears the later reading last.
 async fn after_access_change(state: &AppState, doc: DocId, user: UserId) {
+    let rooms = state.rooms();
+    let _in_order = rooms.order_access(doc).await;
     let role = match state.db().role(user, doc).await {
         Ok(role) => role,
         Err(e) => {
@@ -174,27 +179,19 @@ async fn after_access_change(state: &AppState, doc: DocId, user: UserId) {
             None
         }
     };
-    state
-        .rooms()
-        .send_to(doc, Command::SetAccess { user, role })
-        .await;
+    rooms.send_to(doc, Command::SetAccess { user, role });
 }
 
 /// Called after `user`'s account was disabled: their connections to every document are removed.
-async fn after_account_disabled(state: &AppState, user: UserId) {
-    state
-        .rooms()
-        .send_all(|| Command::RemoveUser { user })
-        .await;
+/// Removal is final, so it needs no ordering with other access changes.
+fn after_account_disabled(state: &AppState, user: UserId) {
+    state.rooms().send_all(|| Command::RemoveUser { user });
 }
 
 /// Called after `session` was ended by its owner signing out: that session's connections are
 /// removed; the same person's other sign-ins stay.
-async fn after_sign_out(state: &AppState, session: SessionId) {
-    state
-        .rooms()
-        .send_all(|| Command::EndSession { session })
-        .await;
+fn after_sign_out(state: &AppState, session: SessionId) {
+    state.rooms().send_all(|| Command::EndSession { session });
 }
 
 impl IntoResponse for ApiError {
@@ -224,5 +221,177 @@ where
                 _ => ApiError::BadRequest,
             }),
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use collab_core::ids::ClientId;
+    use collab_text::TextOp;
+    use protocol::ServerMsg;
+    use records::test_support::TestDb;
+    use records::{NewUser, Role};
+    use revisions::RevisionStore;
+    use tokio::sync::{mpsc, oneshot};
+
+    use super::*;
+    use crate::config::{Config, DatabaseUrl};
+    use crate::room::{JoinReply, OUTBOUND_CAPACITY, Outbound};
+
+    async fn account(db: &records::Db, name: &str) -> UserId {
+        db.create_user(
+            None,
+            NewUser {
+                email: &format!("{name}@test.invalid"),
+                name,
+                password: "a long enough password",
+                is_admin: false,
+            },
+        )
+        .await
+        .unwrap()
+        .id
+    }
+
+    /// Two changes to Bob's role are stored one after the other, but the hook of the first
+    /// is slower: it has read the role and not yet told the room when the second change is
+    /// stored and its hook runs. The room must end with the role stored last.
+    #[tokio::test]
+    async fn access_changes_reach_the_room_in_database_order() {
+        let test = TestDb::create().await;
+        let db = test.db.clone();
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            data_dir: dir.path().to_path_buf(),
+            web_dir: dir.path().join("web"),
+            checkpoint_idle: Duration::from_secs(600),
+            checkpoint_max: Duration::from_secs(600),
+            room_grace: Duration::from_secs(60),
+            database_url: DatabaseUrl::new(test.url()),
+        };
+        let store = RevisionStore::open(&crate::library_path(dir.path())).unwrap();
+        let state = AppState::new(config, Arc::new(store), db.clone());
+        let ann = account(&db, "Ann").await;
+        let bob = account(&db, "Bob").await;
+        let doc = DocId(Uuid::new_v4());
+        db.create_document(ann, doc, "Plan.txt").await.unwrap();
+        db.set_access(ann, doc, bob, Some(Role::Viewer))
+            .await
+            .unwrap();
+
+        // Bob is in the room as a viewer.
+        let room = state.open_room(doc, "Plan.txt".into());
+        let client = ClientId(Uuid::new_v4());
+        let (tx, mut out) = mpsc::channel(OUTBOUND_CAPACITY);
+        let (accepted, reply) = oneshot::channel();
+        room.commands
+            .send(Command::Join {
+                conn: 1,
+                client,
+                user: bob,
+                session: SessionId(Uuid::new_v4()),
+                name: "Bob".into(),
+                role: Role::Viewer,
+                resume: None,
+                tx,
+                accepted,
+            })
+            .await
+            .unwrap();
+        assert_eq!(reply.await.unwrap(), JoinReply::Accepted);
+
+        // The first change, made the way `after_access_change` makes it, paused between
+        // reading the role and telling the room.
+        let first = state.rooms().order_access(doc).await;
+        db.set_access(ann, doc, bob, Some(Role::Editor))
+            .await
+            .unwrap();
+        let first_read = db.role(bob, doc).await.unwrap();
+        assert_eq!(first_read, Some(Role::Editor));
+
+        // The second change is stored and its hook runs meanwhile.
+        db.set_access(ann, doc, bob, Some(Role::Viewer))
+            .await
+            .unwrap();
+        let mut second = tokio::spawn({
+            let state = state.clone();
+            async move { after_access_change(&state, doc, bob).await }
+        });
+        // Long enough for the second hook to finish if nothing holds it back.
+        let finished_early = tokio::time::timeout(Duration::from_millis(500), &mut second)
+            .await
+            .is_ok();
+
+        // The first hook carries on.
+        state.rooms().send_to(
+            doc,
+            Command::SetAccess {
+                user: bob,
+                role: first_read,
+            },
+        );
+        drop(first);
+        if !finished_early {
+            second.await.unwrap();
+        }
+
+        // A cursor move after both changes marks where they end in Bob's frames.
+        room.commands
+            .send(Command::Cursor {
+                conn: 1,
+                client,
+                at: Some(1),
+            })
+            .await
+            .unwrap();
+        let mut can_edit = None;
+        let mut listed = None;
+        loop {
+            let frames = match tokio::time::timeout(Duration::from_secs(5), out.recv())
+                .await
+                .unwrap()
+                .unwrap()
+            {
+                Outbound::One(f) => vec![f],
+                Outbound::Many(fs) => fs,
+            };
+            let mut marked = false;
+            for frame in frames {
+                match serde_json::from_str::<ServerMsg<TextOp>>(frame.as_str()).unwrap() {
+                    ServerMsg::Joined { can_edit: c, .. } | ServerMsg::Access { can_edit: c } => {
+                        can_edit = Some(c);
+                    }
+                    ServerMsg::People { participants } => {
+                        if let Some(p) = participants.iter().find(|p| p.client == client) {
+                            listed = Some(p.can_edit);
+                            marked |= p.cursor == Some(1);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if marked {
+                break;
+            }
+        }
+        let stored = db.role(bob, doc).await.unwrap().unwrap();
+        assert_eq!(stored, Role::Viewer);
+        assert_eq!(
+            can_edit,
+            Some(stored.can_edit()),
+            "Bob's rights in the room"
+        );
+        assert_eq!(listed, Some(stored.can_edit()), "Bob in the people list");
+        assert!(!finished_early, "the later change was not held back");
     }
 }

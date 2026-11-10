@@ -42,9 +42,6 @@ pub(crate) enum Outbound {
 pub(crate) const OUTBOUND_CAPACITY: usize = 256;
 /// Commands queued for a room before connections wait to send more.
 const COMMAND_CAPACITY: usize = 1024;
-/// How long an access change waits for room in a full command queue before the wait is
-/// handed to a task of its own (see [`deliver`]).
-const ACCESS_SEND_WAIT: Duration = Duration::from_secs(1);
 /// Largest cursor position relayed; anything larger is dropped.
 const MAX_CURSOR: usize = 10_000_000;
 /// Log entries kept behind the last checkpoint, so a client that drops briefly can still
@@ -465,13 +462,23 @@ impl Room {
         let Some(frame) = encode(&ServerMsg::Removed { reason }) else {
             return;
         };
+        let doc = self.doc;
         let before = self.members.len();
         self.members.retain(|m| {
             if !which(m) {
                 return true;
             }
-            // A full or closed queue cannot take the frame; the connection still ends.
-            let _ = m.tx.try_send(Outbound::One(frame.clone()));
+            // A closed queue means the connection is already gone. A full one cannot take the
+            // frame; the connection still ends, but the page is not told why.
+            if let Err(mpsc::error::TrySendError::Full(_)) =
+                m.tx.try_send(Outbound::One(frame.clone()))
+            {
+                eprintln!(
+                    "sharecraft-server: could not tell user {} they were removed from document \
+                     {}: their connection was not keeping up",
+                    m.user.0, doc.0
+                );
+            }
             false
         });
         if self.members.len() != before {
@@ -550,8 +557,22 @@ fn credited_name(name: &str) -> String {
     }
 }
 
+/// The ways into one room.
+#[derive(Clone, Debug)]
+pub(crate) struct RoomLink {
+    /// Commands from connections, handled in arrival order. Bounded: senders wait when the room
+    /// falls behind.
+    pub commands: mpsc::Sender<Command>,
+    /// Access changes (`SetAccess`, `EndSession`, `RemoveUser`), handled before anything else
+    /// waiting, in the order sent. Unbounded, so that sending one never waits and is never
+    /// refused while the room is open: an access change that could be delayed, dropped or
+    /// overtaken would leave someone with rights they no longer have. They are rare: each
+    /// follows a database change or a join.
+    pub access: mpsc::UnboundedSender<Command>,
+}
+
 struct RoomHandle {
-    tx: mpsc::Sender<Command>,
+    link: RoomLink,
     generation: u64,
 }
 
@@ -560,6 +581,8 @@ struct RoomHandle {
 pub(crate) struct Rooms {
     open: Mutex<HashMap<DocId, RoomHandle>>,
     next_generation: AtomicU64,
+    /// One lock per document with an access change under way; see [`Rooms::order_access`].
+    access_order: Mutex<HashMap<DocId, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl Rooms {
@@ -577,54 +600,72 @@ impl Rooms {
         store: &Arc<dyn Checkpointer>,
         timing: Timing,
         grace: Duration,
-    ) -> mpsc::Sender<Command> {
+    ) -> RoomLink {
         let mut open = self.open.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(handle) = open.get(&doc)
-            && !handle.tx.is_closed()
+            && !handle.link.commands.is_closed()
         {
-            return handle.tx.clone();
+            return handle.link.clone();
         }
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = mpsc::channel(COMMAND_CAPACITY);
+        let (commands, rx) = mpsc::channel(COMMAND_CAPACITY);
+        let (access, access_rx) = mpsc::unbounded_channel();
         let place = Place {
             rooms: Arc::clone(self),
             doc,
             generation,
         };
-        tokio::spawn(run(place, name, rx, Arc::clone(store), timing, grace));
+        let channels = Channels { rx, access_rx };
+        tokio::spawn(run(place, name, channels, Arc::clone(store), timing, grace));
+        let link = RoomLink { commands, access };
         open.insert(
             doc,
             RoomHandle {
-                tx: tx.clone(),
+                link: link.clone(),
                 generation,
             },
         );
-        tx
+        link
     }
 
-    /// Sends `cmd` to `doc`'s room. Nothing happens if the room is not open or is ending. Waits
-    /// at most [`ACCESS_SEND_WAIT`] for room in its queue (see [`deliver`]).
-    pub(crate) async fn send_to(&self, doc: DocId, cmd: Command) {
-        let Some(tx) = self.sender(doc) else { return };
-        deliver(doc, &tx, cmd).await;
+    /// Sends the access change `cmd` to `doc`'s room. Nothing happens if the room is not open:
+    /// whoever joins next is checked afresh. Never waits.
+    pub(crate) fn send_to(&self, doc: DocId, cmd: Command) {
+        if let Some(link) = self.link(doc) {
+            // An error means the room has just ended, with nobody left in it.
+            let _ = link.access.send(cmd);
+        }
     }
 
-    /// Sends a command made by `make` to every open room, waiting on them together.
-    pub(crate) async fn send_all(&self, make: impl Fn() -> Command) {
-        let open: Vec<(DocId, mpsc::Sender<Command>)> = {
-            let open = self.open.lock().unwrap_or_else(PoisonError::into_inner);
-            open.iter()
-                .map(|(doc, handle)| (*doc, handle.tx.clone()))
-                .collect()
-        };
-        futures_util::future::join_all(open.iter().map(|(doc, tx)| deliver(*doc, tx, make())))
-            .await;
-    }
-
-    /// The command channel of `doc`'s room, if it is open.
-    pub(crate) fn sender(&self, doc: DocId) -> Option<mpsc::Sender<Command>> {
+    /// Sends an access change made by `make` to every open room. Never waits.
+    pub(crate) fn send_all(&self, make: impl Fn() -> Command) {
         let open = self.open.lock().unwrap_or_else(PoisonError::into_inner);
-        open.get(&doc).map(|handle| handle.tx.clone())
+        for handle in open.values() {
+            let _ = handle.link.access.send(make());
+        }
+    }
+
+    /// The ways into `doc`'s room, if it is open.
+    pub(crate) fn link(&self, doc: DocId) -> Option<RoomLink> {
+        let open = self.open.lock().unwrap_or_else(PoisonError::into_inner);
+        open.get(&doc).map(|handle| handle.link.clone())
+    }
+
+    /// Waits for, and then holds, the lock that keeps `doc`'s access changes in database order.
+    /// Whoever reads a role to send it to the room as `SetAccess` holds it from the read until
+    /// the command is sent, so the room never receives an older reading after a newer one.
+    pub(crate) async fn order_access(&self, doc: DocId) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut order = self
+                .access_order
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            // A lock that nobody holds or waits for is referenced only here; dropping it keeps
+            // the map to the documents with a change under way.
+            order.retain(|_, lock| Arc::strong_count(lock) > 1);
+            Arc::clone(order.entry(doc).or_default())
+        };
+        lock.lock_owned().await
     }
 
     fn close(&self, doc: DocId, generation: u64) {
@@ -635,24 +676,10 @@ impl Rooms {
     }
 }
 
-/// Queues `cmd` for `doc`'s room on `tx`, waiting at most [`ACCESS_SEND_WAIT`] for room. A room
-/// that has ended needs nothing: whoever joins next is checked afresh. If the room is still
-/// busy after the wait, the command is handed to a task that keeps waiting, so the change
-/// arrives late rather than never, and the caller is not held up.
-async fn deliver(doc: DocId, tx: &mpsc::Sender<Command>, cmd: Command) {
-    if let Err(mpsc::error::SendTimeoutError::Timeout(cmd)) =
-        tx.send_timeout(cmd, ACCESS_SEND_WAIT).await
-    {
-        eprintln!(
-            "sharecraft-server: room of document {} is not keeping up; an access change is              delivered late",
-            doc.0
-        );
-        let tx = tx.clone();
-        tokio::spawn(async move {
-            // The room may end meanwhile, which needs nothing.
-            let _ = tx.send(cmd).await;
-        });
-    }
+/// The receiving ends of a room's channels.
+struct Channels {
+    rx: mpsc::Receiver<Command>,
+    access_rx: mpsc::UnboundedReceiver<Command>,
 }
 
 /// Which registry entry a room task owns.
@@ -669,12 +696,16 @@ type Running = JoinHandle<Result<Outcome, CheckpointError>>;
 async fn run(
     place: Place,
     name: String,
-    mut rx: mpsc::Receiver<Command>,
+    channels: Channels,
     store: Arc<dyn Checkpointer>,
     timing: Timing,
     grace: Duration,
 ) {
     let doc = place.doc;
+    let Channels {
+        mut rx,
+        mut access_rx,
+    } = channels;
     let initial = match load(&store, doc).await {
         Ok(initial) => initial,
         Err(err) => {
@@ -682,6 +713,7 @@ async fn run(
             // Starting empty would later overwrite the stored document. Refuse everyone who
             // is waiting; a later join opens a fresh room that tries the load again.
             place.rooms.close(doc, place.generation);
+            access_rx.close();
             rx.close();
             while let Ok(cmd) = rx.try_recv() {
                 if let Command::Join { accepted, .. } = cmd {
@@ -696,6 +728,8 @@ async fn run(
     let mut running: Option<Running> = None;
     // The room opens for a join waiting in its channel; until that is handled it is empty.
     let mut empty_since = Some(Instant::now());
+    // The registry holds an access sender until this task removes it, so this stays true.
+    let mut access_open = true;
     loop {
         let due = match running {
             Some(_) => None,
@@ -710,6 +744,11 @@ async fn run(
         tokio::select! {
             // A waiting join is handled before the room can decide to end.
             biased;
+            // Access changes go first, so nobody keeps rights while other commands wait.
+            cmd = access_rx.recv(), if access_open => match cmd {
+                Some(cmd) => room.handle(cmd),
+                None => access_open = false,
+            },
             cmd = rx.recv() => match cmd {
                 Some(cmd) => room.handle(cmd),
                 // The registry holds a sender until this task removes it, so this does not
@@ -741,6 +780,8 @@ async fn run(
         }
     }
     place.rooms.close(doc, place.generation);
+    // Nobody is left to remove or adjust.
+    access_rx.close();
     rx.close();
     // Joins queued after the room decided to end are dropped unanswered, so those
     // connections open a fresh room, which loads what this one saved.
@@ -1139,6 +1180,118 @@ mod tests {
             op: TextOp::replace(0, 0, 0, "late").unwrap(),
         });
         assert_eq!(room.log.head(), Seq(0));
+    }
+
+    /// Loads every document as empty; never asked to write in these tests.
+    struct Blank;
+
+    impl Checkpointer for Blank {
+        fn write(&self, _c: &revisions::Checkpoint<'_>) -> Result<Outcome, CheckpointError> {
+            panic!("nothing is written in this test");
+        }
+
+        fn load(&self, _doc: DocId) -> Result<Option<revisions::Stored>, CheckpointError> {
+            Ok(None)
+        }
+    }
+
+    // The test runtime has one thread, so the room task runs only while the test awaits.
+    #[tokio::test]
+    async fn access_change_gets_through_a_full_command_queue() {
+        let rooms = Arc::new(Rooms::default());
+        let store: Arc<dyn Checkpointer> = Arc::new(Blank);
+        let doc = DocId(Uuid::from_u128(77));
+        let timing = Timing {
+            idle: Duration::from_millis(100),
+            max: Duration::from_secs(30),
+        };
+        let link = rooms.open(
+            doc,
+            "Notes.txt".into(),
+            &store,
+            timing,
+            Duration::from_secs(60),
+        );
+        let bob = UserId(Uuid::from_u128(2));
+        let (tx, mut out) = mpsc::channel(OUTBOUND_CAPACITY);
+        let (accepted, reply) = oneshot::channel();
+        link.commands
+            .send(Command::Join {
+                conn: 1,
+                client: ClientId(Uuid::from_u128(1)),
+                user: bob,
+                session: SessionId(Uuid::from_u128(3)),
+                name: "Bob".into(),
+                role: Role::Editor,
+                resume: None,
+                tx,
+                accepted,
+            })
+            .await
+            .unwrap();
+        assert_eq!(reply.await.unwrap(), JoinReply::Accepted);
+
+        // Fill the room's command queue without letting the room run.
+        let other = ClientId(Uuid::from_u128(9));
+        while link
+            .commands
+            .try_send(Command::Cursor {
+                conn: 9,
+                client: other,
+                at: None,
+            })
+            .is_ok()
+        {}
+        // The change is handed over without waiting for room in that queue ...
+        rooms.send_to(
+            doc,
+            Command::SetAccess {
+                user: bob,
+                role: None,
+            },
+        );
+        assert_eq!(link.commands.capacity(), 0, "the room ran meanwhile");
+
+        // ... and once the room runs, Bob is removed rather than left with his old rights.
+        let mut got = Vec::new();
+        while let Some(o) = tokio::time::timeout(Duration::from_secs(5), out.recv())
+            .await
+            .unwrap()
+        {
+            let list = match o {
+                Outbound::One(f) => vec![f],
+                Outbound::Many(fs) => fs,
+            };
+            got.extend(
+                list.iter()
+                    .map(|f| serde_json::from_str::<ServerMsg<TextOp>>(f.as_str()).unwrap()),
+            );
+        }
+        assert!(
+            matches!(
+                got.last(),
+                Some(ServerMsg::Removed {
+                    reason: RemovedReason::AccessRevoked
+                })
+            ),
+            "{got:?}"
+        );
+    }
+
+    #[test]
+    fn access_locks_are_dropped_once_unused() {
+        let rooms = Rooms::default();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for n in 0..10u128 {
+                drop(rooms.order_access(DocId(Uuid::from_u128(n))).await);
+            }
+            let held = rooms.order_access(DocId(Uuid::from_u128(99))).await;
+            assert_eq!(rooms.access_order.lock().unwrap().len(), 1);
+            drop(held);
+        });
     }
 
     #[test]

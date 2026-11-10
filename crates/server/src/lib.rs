@@ -23,7 +23,6 @@ use collab_core::ids::{DocId, SessionId, UserId};
 use records::{Db, Role};
 use revisions::RevisionStore;
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
 use tower_http::services::ServeDir;
 
 pub use checkpoint::{Checkpointer, library_path};
@@ -31,7 +30,7 @@ pub use config::{Config, ConfigError};
 
 use auth::Throttle;
 use checkpoint::Timing;
-use room::{Command, Rooms};
+use room::{RoomLink, Rooms};
 
 /// Shared state of a running server.
 #[derive(Clone)]
@@ -102,7 +101,7 @@ impl AppState {
         session: SessionId,
         role: Role,
     ) -> bool {
-        let Some(room) = self.rooms().sender(doc) else {
+        let Some(room) = self.rooms().link(doc) else {
             return false;
         };
         let visitor = ws::Visitor {
@@ -118,7 +117,7 @@ impl AppState {
 
     /// The command channel of `doc`'s room, opening it if needed; `name` is the document's
     /// name, which a newly opened room stores its checkpoints under.
-    fn open_room(&self, doc: DocId, name: String) -> mpsc::Sender<Command> {
+    fn open_room(&self, doc: DocId, name: String) -> RoomLink {
         let config = &self.shared.config;
         let timing = Timing {
             idle: config.checkpoint_idle,

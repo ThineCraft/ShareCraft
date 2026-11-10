@@ -21,7 +21,7 @@ use uuid::Uuid;
 use crate::AppState;
 use crate::api::ApiError;
 use crate::auth::{Signed, same_origin};
-use crate::room::{Command, ConnId, JoinReply, OUTBOUND_CAPACITY, Outbound};
+use crate::room::{Command, ConnId, JoinReply, OUTBOUND_CAPACITY, Outbound, RoomLink};
 
 /// Largest frame or message accepted from a client.
 const MAX_MESSAGE: usize = 1024 * 1024;
@@ -120,7 +120,7 @@ async fn connection(state: AppState, doc: DocId, visitor: Visitor, socket: WebSo
                 relay(&mut sink, &mut stream, &room, out_rx, conn, client, ends).await;
             }
             // The room ignores this if it already dropped or replaced the connection.
-            let _ = room.send(Command::Leave { conn, client }).await;
+            let _ = room.commands.send(Command::Leave { conn, client }).await;
         }
     }
     // The client may already be gone; there is nothing more to do either way.
@@ -166,7 +166,7 @@ async fn join_room(
     client: ClientId,
     visitor: &Visitor,
     resume: Option<Resume>,
-) -> Option<(mpsc::Sender<Command>, mpsc::Receiver<Outbound>)> {
+) -> Option<(RoomLink, mpsc::Receiver<Outbound>)> {
     for _ in 0..JOIN_ATTEMPTS {
         let room = state.open_room(doc, visitor.doc_name.clone());
         let (tx, out_rx) = mpsc::channel(OUTBOUND_CAPACITY);
@@ -182,7 +182,7 @@ async fn join_room(
             tx,
             accepted,
         };
-        if room.send(join).await.is_err() {
+        if room.commands.send(join).await.is_err() {
             continue;
         }
         match was_accepted.await {
@@ -198,23 +198,33 @@ async fn join_room(
 /// Closes the gap between the access check before the upgrade and the room accepting the
 /// join: access may have ended in between, and the hooks that tell rooms about it may have run
 /// before this connection was a member. Reads the session and the role again; a session that
-/// has ended removes its connections (`Removed { signed_out }`), and a role that differs is
-/// handed to the room as an access change, which removes or adjusts every connection of that
-/// person.
+/// has ended removes its connections (`Removed { signed_out }`, or `account_disabled` for every
+/// connection of the account when that is why), and a role that differs is handed to the room
+/// as an access change, which removes or adjusts every connection of that person. The role is
+/// read and sent under the document's access lock, like the API's changes, so the room hears
+/// the readings in database order.
 ///
 /// Returns `false` when the records could not be read; the connection then leaves quietly,
 /// and the page reconnects and is checked again.
 pub(crate) async fn recheck_after_join(
     state: &AppState,
     doc: DocId,
-    room: &mpsc::Sender<Command>,
+    room: &RoomLink,
     visitor: &Visitor,
 ) -> bool {
+    let _in_order = state.rooms().order_access(doc).await;
     let db = state.db();
     let cmd = match db.session_by_id(visitor.session).await {
-        Ok(None) => Some(Command::EndSession {
-            session: visitor.session,
-        }),
+        Ok(None) => match db.user(visitor.user).await {
+            Ok(Some(user)) if user.disabled => Some(Command::RemoveUser { user: user.id }),
+            Ok(_) => Some(Command::EndSession {
+                session: visitor.session,
+            }),
+            Err(e) => {
+                eprintln!("sharecraft-server: database failure: {e}");
+                return false;
+            }
+        },
         Ok(Some(_)) => match db.role(visitor.user, doc).await {
             Ok(role) if role == Some(visitor.role) => None,
             Ok(role) => Some(Command::SetAccess {
@@ -233,7 +243,7 @@ pub(crate) async fn recheck_after_join(
     };
     if let Some(cmd) = cmd {
         // A room that has ended has dropped this connection already.
-        let _ = room.send(cmd).await;
+        let _ = room.access.send(cmd);
     }
     true
 }
@@ -258,7 +268,7 @@ fn deadline(expires_at: OffsetDateTime, now: OffsetDateTime) -> Option<Instant> 
 async fn relay(
     sink: &mut Sink,
     stream: &mut Stream,
-    room: &mpsc::Sender<Command>,
+    room: &RoomLink,
     mut out_rx: mpsc::Receiver<Outbound>,
     conn: ConnId,
     client: ClientId,
@@ -276,7 +286,7 @@ async fn relay(
             }
             () = sleep_until(ends.at) => {
                 ends.at = None;
-                if room.send(Command::EndSession { session: ends.session }).await.is_err() {
+                if room.access.send(Command::EndSession { session: ends.session }).is_err() {
                     return;
                 }
             }
@@ -300,7 +310,7 @@ async fn relay(
                     // Binary frames, close, oversized frames and transport errors.
                     Some(Ok(Message::Binary(_) | Message::Close(_)) | Err(_)) | None => return,
                 };
-                if room.send(cmd).await.is_err() {
+                if room.commands.send(cmd).await.is_err() {
                     return;
                 }
             }

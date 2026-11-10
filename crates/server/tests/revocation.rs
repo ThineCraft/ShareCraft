@@ -248,6 +248,45 @@ async fn promoted_viewer_can_type_without_reconnecting() {
     assert!(v.removed.is_none() && !v.closed);
 }
 
+/// Two owners change Bob's role at the same moment, over and over. Whichever change is stored
+/// last, the room must end up agreeing with the database.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_role_changes_end_as_the_database_says() {
+    let server = spawn_server().await;
+    let doc = new_doc();
+    let mut ann = TestClient::connect(&server, doc, "Ann").await;
+    let mut bob = TestClient::connect(&server, doc, "Bob").await;
+    let bob_id = bob.user.id;
+    for round in 0..30 {
+        let (first, second) = if round % 2 == 0 {
+            ("editor", "viewer")
+        } else {
+            ("viewer", "editor")
+        };
+        tokio::join!(
+            share(&server, &ann.user, doc, &bob.user, first),
+            share(&server, &ann.user, doc, &bob.user, second),
+        );
+        // Both changes reached the room before the API answered; Ann's change comes after
+        // them, so once Bob has it the room has dealt with both.
+        let end = ann.text().chars().count();
+        ann.type_at(end, "x").await;
+        ann.pump_until(|c| c.pending() == 0).await;
+        let seq = ann.seq();
+        bob.pump_until(|c| c.seq() == seq).await;
+
+        let stored = server.db.db.role(bob_id, doc).await.unwrap().unwrap();
+        assert_eq!(bob.can_edit, stored.can_edit(), "round {round}");
+        let listed = ann
+            .participants()
+            .iter()
+            .find(|p| p.user == bob_id)
+            .map(|p| p.can_edit);
+        assert_eq!(listed, Some(stored.can_edit()), "round {round}");
+    }
+    assert!(bob.removed.is_none() && !bob.closed);
+}
+
 #[tokio::test]
 async fn revoking_one_person_leaves_the_others_typing() {
     let server = spawn_server().await;
@@ -481,12 +520,14 @@ async fn access_ended_during_join_is_caught() {
     let mut bob = TestClient::connect(&server, doc, "Bob").await;
     let mut cat = TestClient::connect(&server, doc, "Cat").await;
     let mut dan = TestClient::connect(&server, doc, "Dan").await;
-    ann.pump_until(|c| c.people().len() == 4).await;
+    let mut eve = TestClient::connect(&server, doc, "Eve").await;
+    let root = server.admin("Root").await;
+    ann.pump_until(|c| c.people().len() == 5).await;
     let db = &server.db.db;
 
     // Each change lands in the records while the person's join is on its way: the API's
     // message to the room went out before they were in it, so the room was never told.
-    // Bob's grant is deleted; Cat signs out; Dan becomes a viewer.
+    // Bob's grant is deleted; Cat signs out; Dan becomes a viewer; Eve's account is disabled.
     db.set_access(ann.user.id, doc, bob.user.id, None)
         .await
         .unwrap();
@@ -495,14 +536,16 @@ async fn access_ended_during_join_is_caught() {
     db.set_access(ann.user.id, doc, dan.user.id, Some(Role::Viewer))
         .await
         .unwrap();
+    let eve_session = session_of(&server, &eve.user).await;
+    db.set_disabled(root.id, eve.user.id, true).await.unwrap();
     // The room still has them as they were.
     ann.type_at(0, "x").await;
-    for c in [&mut bob, &mut cat, &mut dan] {
+    for c in [&mut bob, &mut cat, &mut dan, &mut eve] {
         c.pump_until(|c| c.seq() == Seq(1)).await;
         assert!(c.removed.is_none() && c.can_edit);
     }
 
-    // The check each connection makes once the room has accepted its join catches all three.
+    // The check each connection makes once the room has accepted its join catches all four.
     let bob_session = session_of(&server, &bob.user).await;
     assert!(
         state
@@ -532,8 +575,19 @@ async fn access_ended_during_join_is_caught() {
         .expect("not told within one second");
     assert!(dan.removed.is_none() && !dan.closed);
 
+    assert!(
+        state
+            .recheck_after_join_for_test(doc, eve.user.id, eve_session, Role::Editor)
+            .await
+    );
+    assert_eq!(
+        removed_promptly(&mut eve).await,
+        RemovedReason::AccountDisabled
+    );
+
     wait_gone(&mut ann, bob.user.id).await;
     wait_gone(&mut ann, cat.user.id).await;
+    wait_gone(&mut ann, eve.user.id).await;
     let dan_id = dan.user.id;
     ann.pump_until(|c| {
         c.participants()

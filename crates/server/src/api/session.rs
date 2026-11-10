@@ -71,7 +71,7 @@ pub(crate) async fn sign_out(
         .end_session(signed.session.id)
         .await
         .map_err(|e| ApiError::unavailable(&e))?;
-    after_sign_out(&state, signed.session.id).await;
+    after_sign_out(&state, signed.session.id);
     Ok((StatusCode::NO_CONTENT, [(SET_COOKIE, cleared_cookie())]).into_response())
 }
 
