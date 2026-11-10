@@ -1,6 +1,7 @@
 //! A private schema per test, in the database named by `TEST_DATABASE_URL`. For tests only.
 #![allow(clippy::expect_used, clippy::panic)]
 
+use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sqlx::{AssertSqlSafe, Row};
@@ -13,11 +14,19 @@ const URL_VARIABLE: &str = "TEST_DATABASE_URL";
 const STALE_AFTER: Duration = Duration::from_secs(60 * 60);
 
 /// A freshly migrated schema that only this test uses.
-#[derive(Debug)]
 pub struct TestDb {
     pub db: Db,
     schema: String,
     base_url: String,
+}
+
+impl fmt::Debug for TestDb {
+    /// Shows the schema only: the base URL holds the password.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TestDb")
+            .field("schema", &self.schema)
+            .finish_non_exhaustive()
+    }
 }
 
 impl TestDb {
@@ -112,12 +121,13 @@ async fn drop_stale_schemas(db: &Db, now: u64) {
         };
         if now.saturating_sub(created) > STALE_AFTER.as_secs() {
             // `schema_created_at` only accepts names made of `t`, digits, hex and underscores.
-            sqlx::query(AssertSqlSafe(format!(
+            // Tests starting together all sweep the same schemas, so a drop can lose a race with
+            // another test's drop. The schema is then gone or going, which is all that matters.
+            let _ = sqlx::query(AssertSqlSafe(format!(
                 "drop schema if exists {name} cascade"
             )))
             .execute(db.pool())
-            .await
-            .expect("cannot drop a stale test schema");
+            .await;
         }
     }
 }

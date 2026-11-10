@@ -65,8 +65,17 @@ impl Db {
         Ok(())
     }
 
-    /// The underlying pool, for the queries in this crate and its tests.
-    pub fn pool(&self) -> &PgPool {
+    /// The underlying pool, for the queries in this crate.
+    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
+    pub(crate) fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl Db {
+    /// The underlying pool, for tests that inspect the database directly.
+    pub fn test_pool(&self) -> &PgPool {
         &self.pool
     }
 }

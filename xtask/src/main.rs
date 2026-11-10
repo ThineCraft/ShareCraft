@@ -77,8 +77,12 @@ fn load_env(root: &Path) -> Result<()> {
     match dotenvy::from_path(root.join(".env")) {
         Ok(()) => Ok(()),
         Err(e) if e.not_found() => Ok(()),
-        // The message names the line, never the value.
-        Err(e) => Err(format!("cannot read .env: {e}")),
+        // Never show the error itself: for a malformed line it prints the line, and so a secret.
+        Err(dotenvy::Error::LineParse(_, index)) => {
+            Err(format!("cannot read .env: line {index} is malformed"))
+        }
+        Err(dotenvy::Error::Io(e)) => Err(format!("cannot read .env: {}", e.kind())),
+        Err(_) => Err("cannot read .env".to_owned()),
     }
 }
 

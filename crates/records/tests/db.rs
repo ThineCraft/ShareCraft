@@ -19,7 +19,7 @@ const TABLES: [&str; 6] = [
 ];
 
 async fn pool(db: &records::Db) -> sqlx::PgPool {
-    db.pool().clone()
+    db.test_pool().clone()
 }
 
 #[tokio::test]
@@ -48,11 +48,11 @@ async fn two_test_databases_do_not_see_each_other() {
         .bind("a@example.com")
         .bind("A")
         .bind("not a real hash")
-        .execute(first.db.pool())
+        .execute(first.db.test_pool())
         .await
         .unwrap();
     let count = |db: &records::Db| {
-        let pool = db.pool().clone();
+        let pool = db.test_pool().clone();
         async move {
             sqlx::query("select count(*) as n from users")
                 .fetch_one(&pool)
@@ -73,6 +73,9 @@ async fn debug_output_hides_the_url() {
     let test = TestDb::create().await;
     let shown = format!("{:?}", test.db);
     let url = test.url();
+    assert!(!shown.contains(&url));
+    assert!(!shown.contains("postgres://"));
+    let shown = format!("{test:?}");
     assert!(!shown.contains(&url));
     assert!(!shown.contains("postgres://"));
     let error = records::Db::connect("postgres://nobody:hunter2@127.0.0.1:1/none")
