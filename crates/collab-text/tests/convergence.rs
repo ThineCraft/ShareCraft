@@ -5,6 +5,7 @@
     clippy::indexing_slicing
 )]
 
+use collab_core::client_state::ClientState;
 use collab_core::document::{Document, Submitted};
 use collab_core::ids::{ClientId, OpId, Seq};
 use collab_core::server_log::ServerLog;
@@ -106,5 +107,132 @@ proptest! {
             replay.apply(&entry.op).unwrap();
         }
         prop_assert_eq!(&replay, log.doc());
+    }
+}
+
+/// One step of a random local change: retain, delete or insert.
+#[derive(Clone, Debug)]
+enum Step {
+    Retain(usize),
+    Delete(usize),
+    Insert(String),
+}
+
+/// Lengths biased towards 0 and "to the end" so both clients often type at the same place.
+fn span() -> impl Strategy<Value = usize> {
+    prop_oneof![3 => Just(0usize), 3 => Just(usize::MAX), 4 => 0usize..6]
+}
+
+fn steps() -> impl Strategy<Value = Vec<Step>> {
+    prop::collection::vec(
+        prop_oneof![
+            span().prop_map(Step::Retain),
+            span().prop_map(Step::Delete),
+            text(NON_ASCII, 3).prop_map(Step::Insert),
+        ],
+        0..=5,
+    )
+}
+
+/// Builds a valid change for a document of `len` chars, clipping each step to what remains.
+fn build_op(len: usize, steps: &[Step]) -> TextOp {
+    let mut left = len;
+    let mut b = TextOp::builder();
+    for step in steps {
+        match step {
+            Step::Retain(n) => {
+                let n = (*n).min(left);
+                left -= n;
+                b = b.retain(n);
+            }
+            Step::Delete(n) => {
+                let n = (*n).min(left);
+                left -= n;
+                b = b.delete(n);
+            }
+            Step::Insert(s) => b = b.insert(s.clone()),
+        }
+    }
+    b.retain(left).build()
+}
+
+#[derive(Clone, Debug)]
+enum Action {
+    TypeA(Vec<Step>),
+    TypeB(Vec<Step>),
+    DeliverA,
+    DeliverB,
+}
+
+fn action() -> impl Strategy<Value = Action> {
+    prop_oneof![
+        steps().prop_map(Action::TypeA),
+        steps().prop_map(Action::TypeB),
+        Just(Action::DeliverA),
+        Just(Action::DeliverB),
+    ]
+}
+
+/// Sends a change to the server log as soon as a client puts it in flight.
+fn submit(
+    log: &mut ServerLog<TextDoc>,
+    who: ClientId,
+    out: collab_core::client_state::Outgoing<TextOp>,
+) {
+    let result = log.submit(who, out.op_id, out.base, out.op).unwrap();
+    assert!(matches!(result, Submitted::Committed(_)));
+}
+
+/// Hands the next entry the client has not seen to it, sending what that releases.
+/// Returns false when the client is up to date.
+fn deliver(log: &mut ServerLog<TextDoc>, client: &mut ClientState<TextDoc>) -> bool {
+    let Some(entry) = log.since(client.seq()).unwrap().first().cloned() else {
+        return false;
+    };
+    let applied = client.committed(&entry).unwrap();
+    if let Some(out) = applied.send_next {
+        submit(log, client.client(), out);
+    }
+    true
+}
+
+proptest! {
+    #[test]
+    fn random_interleaving_converges(
+        start in text(NON_ASCII, 6),
+        actions in prop::collection::vec(action(), 0..40),
+    ) {
+        let (id_a, id_b) = (ClientId(Uuid::from_u128(1)), ClientId(Uuid::from_u128(2)));
+        let mut log = ServerLog::new(TextDoc::new(start.clone()), Seq(0));
+        let mut a = ClientState::new(id_a, TextDoc::new(start.clone()), Seq(0));
+        let mut b = ClientState::new(id_b, TextDoc::new(start), Seq(0));
+        let mut next_op = 100u128;
+
+        for act in actions {
+            match act {
+                Action::TypeA(s) => {
+                    next_op += 1;
+                    let op = build_op(a.doc().len_chars(), &s);
+                    if let Some(out) = a.local(OpId(Uuid::from_u128(next_op)), op).unwrap() {
+                        submit(&mut log, id_a, out);
+                    }
+                }
+                Action::TypeB(s) => {
+                    next_op += 1;
+                    let op = build_op(b.doc().len_chars(), &s);
+                    if let Some(out) = b.local(OpId(Uuid::from_u128(next_op)), op).unwrap() {
+                        submit(&mut log, id_b, out);
+                    }
+                }
+                Action::DeliverA => { deliver(&mut log, &mut a); }
+                Action::DeliverB => { deliver(&mut log, &mut b); }
+            }
+        }
+        while deliver(&mut log, &mut a) | deliver(&mut log, &mut b) {}
+
+        prop_assert_eq!(a.pending(), 0);
+        prop_assert_eq!(b.pending(), 0);
+        prop_assert_eq!(a.doc(), log.doc());
+        prop_assert_eq!(b.doc(), log.doc());
     }
 }
