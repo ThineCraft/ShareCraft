@@ -380,3 +380,79 @@ async fn stale_checkpoint_stops_the_room_with_a_conflict() {
         other
     );
 }
+
+#[tokio::test]
+async fn live_save_keeps_fields_set_by_a_metadata_only_revision() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let db = TestDb::create().await;
+    let library = server::library_path(data_dir.path());
+    let mut first = StoppableServer::start(data_dir.path(), &db, |_| {});
+    let doc = new_doc();
+    let mut a = TestClient::connect(&first, doc, "Ann").await;
+    let saved = type_and_save(&mut a, "text").await;
+    wait_recorded(&db.db, doc, &saved).await;
+    first.stop();
+
+    let mut fields = Map::new();
+    fields.insert("status".into(), json!("draft"));
+    write_behind(&library, doc, b"text", &saved, &fields);
+    let second = StoppableServer::start(data_dir.path(), &db, |_| {});
+    // A new account: the first server's harness made Ann in this database already.
+    let mut b = TestClient::connect(&second, doc, "Bob").await;
+    assert_eq!(b.text(), "text");
+    let live = type_and_save(&mut b, " more").await;
+
+    let stored = RevisionStore::open(&library)
+        .unwrap()
+        .read(doc, None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.revision.to_string(), live);
+    assert_eq!(stored.bytes, b"text more");
+    assert_eq!(stored.meta.fields, fields);
+    wait_recorded(&db.db, doc, &live).await;
+    assert_eq!(fields_of(&db.db, doc).await, json!({ "status": "draft" }));
+}
+
+#[tokio::test]
+async fn recording_recovers_after_a_failed_append() {
+    let server = spawn_server().await;
+    let pool = server.db.db.test_pool();
+    let doc = new_doc();
+    let mut a = TestClient::connect(&server, doc, "Ann").await;
+    let first = type_and_save(&mut a, "one").await;
+    wait_recorded(&server.db.db, doc, &first).await;
+
+    // Recording the next save fails: the table is out of the way.
+    sqlx::query("alter table revisions rename to revisions_away")
+        .execute(pool)
+        .await
+        .unwrap();
+    type_and_save(&mut a, " two").await;
+    // Long enough for that recording to have been tried and failed.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    sqlx::query("alter table revisions_away rename to revisions")
+        .execute(pool)
+        .await
+        .unwrap();
+    assert_eq!(server.db.db.revisions(doc).await.unwrap().len(), 1);
+
+    // The next save's append finds the recorded head behind it and replaces the list from Git.
+    let third = type_and_save(&mut a, " three").await;
+    let rows = wait_recorded(&server.db.db, doc, &third).await;
+    let history: Vec<String> = server
+        .store()
+        .history(doc)
+        .unwrap()
+        .into_iter()
+        .map(|r| r.revision.to_string())
+        .collect();
+    assert_eq!(history.len(), 3);
+    let recorded: Vec<String> = rows.iter().map(|r| r.revision.clone()).collect();
+    assert_eq!(recorded, history);
+    for (i, row) in rows.iter().enumerate() {
+        assert_eq!(row.position, i32::try_from(i + 1).unwrap());
+        let parent = i.checked_sub(1).map(|p| history[p].clone());
+        assert_eq!(row.parent, parent);
+    }
+}

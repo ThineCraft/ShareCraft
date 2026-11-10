@@ -8,7 +8,7 @@ use revisions::{
     Author, Checkpoint, CheckpointError, GitError, Outcome, RevisionId, RevisionInfo,
     RevisionStore, Stored,
 };
-use serde_json::Map;
+use serde_json::{Map, Value};
 use tokio::time::Instant;
 
 /// The single library every document lives in until libraries can be chosen.
@@ -102,6 +102,8 @@ pub(crate) struct SaveJob {
     text: String,
     base: Option<RevisionId>,
     authors: Vec<Author>,
+    /// The document fields, carried forward unchanged from the revision the room loaded.
+    fields: Map<String, Value>,
 }
 
 impl SaveJob {
@@ -122,14 +124,13 @@ impl SaveJob {
         file_name: &str,
         store: &dyn Checkpointer,
     ) -> Result<Outcome, CheckpointError> {
-        let fields = Map::new();
         store.write(&Checkpoint {
             doc,
             file_name,
             bytes: self.text.as_bytes(),
             base: self.base.as_ref(),
             authors: &self.authors,
-            fields: &fields,
+            fields: &self.fields,
         })
     }
 }
@@ -206,6 +207,8 @@ pub(crate) struct Schedule {
     gave_up: bool,
     /// A checkpoint was refused as stale; nothing is saved any more.
     conflict: bool,
+    /// The document fields every checkpoint stores: those of the revision the room loaded.
+    fields: Map<String, Value>,
 }
 
 impl Schedule {
@@ -224,7 +227,14 @@ impl Schedule {
             final_failures: 0,
             gave_up: false,
             conflict: false,
+            fields: Map::new(),
         }
+    }
+
+    /// The same schedule, storing `fields` with every checkpoint instead of none.
+    pub(crate) fn with_fields(mut self, fields: Map<String, Value>) -> Self {
+        self.fields = fields;
+        self
     }
 
     /// Whether a checkpoint was refused because the document was saved from elsewhere.
@@ -304,6 +314,7 @@ impl Schedule {
             text,
             base: self.revision.clone(),
             authors: self.contributors.iter().map(|c| c.author.clone()).collect(),
+            fields: self.fields.clone(),
         })
     }
 
@@ -496,6 +507,18 @@ mod tests {
         assert_eq!(final_delay(quick, 1), quick);
         assert_eq!(final_delay(quick, 3), Duration::from_millis(400));
         assert_eq!(final_delay(quick, 40), MAX_FINAL_DELAY);
+    }
+
+    #[test]
+    fn every_checkpoint_keeps_the_loaded_fields() {
+        let mut fields = Map::new();
+        fields.insert("status".into(), Value::String("draft".into()));
+        let mut s = Schedule::new(Some(rev(1)), Seq(0), timing()).with_fields(fields.clone());
+        s.changed(author("a"), Seq(1));
+        assert_eq!(s.start(Seq(1), "x".into()).unwrap().fields, fields);
+        s.finish(Ok(Outcome::Written(rev(2))), Seq(2), false);
+        s.changed(author("a"), Seq(2));
+        assert_eq!(s.start(Seq(2), "xy".into()).unwrap().fields, fields);
     }
 
     #[test]

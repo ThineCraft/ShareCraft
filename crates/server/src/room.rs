@@ -21,6 +21,7 @@ use collab_text::{TextDoc, TextOp};
 use protocol::{Participant, RemovedReason, Resume, RoomEpoch, SaveState, ServerMsg};
 use records::{Db, NewEvent, Role};
 use revisions::{Author, CheckpointError, Outcome, RevisionId};
+use serde_json::{Map, Value};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -121,6 +122,8 @@ pub(crate) struct Initial {
     pub doc: TextDoc,
     /// The stored revision the text came from, if any.
     pub revision: Option<RevisionId>,
+    /// The document fields stored with that revision; every checkpoint keeps them.
+    pub fields: Map<String, Value>,
 }
 
 /// The person joining: who they are and what they may do.
@@ -180,7 +183,7 @@ impl Room {
             name,
             epoch: RoomEpoch(Uuid::new_v4()),
             log: ServerLog::new(initial.doc, Seq(0)),
-            schedule: Schedule::new(initial.revision, Seq(0), timing),
+            schedule: Schedule::new(initial.revision, Seq(0), timing).with_fields(initial.fields),
             members: Vec::new(),
             last_committed: HashMap::new(),
             client_owners: HashMap::new(),
@@ -967,6 +970,7 @@ async fn load(store: &Arc<dyn Checkpointer>, doc: DocId) -> Result<Initial, Stri
     Ok(Initial {
         doc: TextDoc::new(text),
         revision: Some(stored.revision),
+        fields: stored.meta.fields,
     })
 }
 
