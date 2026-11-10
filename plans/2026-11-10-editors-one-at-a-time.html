@@ -1,0 +1,410 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ShareCraft — Editors, One Person at a Time: Implementation Plan (Stage 1, part 3)</title>
+<style>
+:root{color-scheme:light dark;--ink:light-dark(#172f38,#e4ecef);--muted:light-dark(#536b72,#a9b9bf);--line:light-dark(#d7e2e3,#36454b);--paper:light-dark(#fff,#1d272b);--wash:light-dark(#f2f6f5,#141b1e);--accent:light-dark(#3156c9,#9db4ff);font:15px/1.6 Segoe UI,system-ui,sans-serif;color:var(--ink);background:var(--wash)}
+*{box-sizing:border-box}body{margin:0;padding:28px 18px 80px}main{max-width:940px;margin:auto}
+h1{font-size:1.9rem;letter-spacing:-.03em;line-height:1.2;margin:0 0 14px}h2{font-size:1.3rem;margin:38px 0 12px;padding-top:18px;border-top:1px solid var(--line)}h3{font-size:1.08rem;margin:30px 0 8px}h4{font-size:.95rem;margin:16px 0 6px}
+p{margin:0 0 12px}ul,ol{margin:0 0 12px;padding-left:22px}li{margin-bottom:6px}a{color:var(--accent)}
+code{font-family:Consolas,Menlo,monospace;font-size:.88em;background:light-dark(#e9efee,#263238);padding:1px 5px;border-radius:3px;overflow-wrap:anywhere}
+pre{background:var(--paper);border:1px solid var(--line);border-radius:7px;padding:12px 14px;overflow-x:auto;font:13px/1.5 Consolas,Menlo,monospace;margin:0 0 12px}pre code{background:none;padding:0;font-size:inherit}
+.note{border-left:4px solid var(--accent);background:var(--paper);padding:12px 16px;margin:0 0 14px}.note p:last-child{margin:0}
+.task{background:var(--paper);border:1px solid var(--line);border-radius:9px;padding:6px 20px 14px;margin:18px 0}
+ol.steps{list-style:none;padding-left:0}ol.steps>li{padding-left:28px;position:relative;margin-bottom:10px}ol.steps>li::before{content:"☐";position:absolute;left:2px;color:var(--muted)}
+table{border-collapse:collapse;width:100%;font-size:.9rem;background:var(--paper);margin-bottom:14px}th,td{border:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top}th{background:light-dark(#e8efed,#263238)}
+.small{font-size:.88rem;color:var(--muted)}
+</style>
+</head>
+<body><main>
+<h1>Editors, One Person at a Time: Implementation Plan</h1>
+<p class="small">ShareCraft · Stage 1, part 3 of 3 · Written 10 November 2026</p>
+
+<div class="note"><p><strong>For agentic workers:</strong> REQUIRED SUB-SKILL: use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task by task. Steps are checkbox items. Do not tick them in this file; the execution ledger is the record.</p></div>
+
+<div class="note"><p><strong>Needs the owner's go-ahead before execution.</strong> This plan does three things outside the ShareCraft repository: it creates four public forks in the ThineCraft organization on GitHub (Tasks 7 to 10), pushes a <code>sharecraft</code> branch to each, and installs the <code>trunk</code> build tool for the current user with <code>cargo install</code> (Task 6, no administrator rights). Approving the plan approves these and nothing else outside the repository.</p></div>
+
+<p><strong>Goal:</strong> a GridCraft, WordCraft, PdfCraft and SolidCraft file each opens in the browser from ShareCraft, in the real editor, and saves back as a Git revision credited to the person who saved it. One person edits at a time. Removing someone's access closes the file on their screen at once.</p>
+<p><strong>Architecture:</strong> a document gains an <em>editor</em>: the built-in text editor, or one of the four forks. A file document's content is opaque bytes to ShareCraft. Opening one joins a <em>file session</em> over the same WebSocket route, account check and access commands as a text document; the session has one editing seat and holds no content. Bytes travel over HTTP: the page downloads the current revision, and a save is an upload that the document's room accepts only from the seat holder, based on the room's current revision. Each editor is the fork's own browser build, served by ShareCraft as static files from the same origin, inside a frame page that ShareCraft owns. The frame page talks to the editor through the bridge the editor already has.</p>
+<p><strong>Tech stack (added):</strong> <code>trunk</code> (builds the editors; not a dependency of the server), <code>toml</code> in <code>xtask</code>. No new server dependencies are expected; if one is needed, add it with <code>cargo add</code> at its current stable release with the fewest features that work.</p>
+<p><strong>Spec:</strong> <a href="../scope.html">scope.html</a> (D12, D14 to D19, SC-15, SC-24, A17), <a href="../sequencing.html">sequencing.html</a> (Stage 1; spine rules S3, S4, S6), <a href="../editor-readiness.html">editor-readiness.html</a> and <a href="../docs/editor-frame.html">docs/editor-frame.html</a>. Read them, and <a href="../BUILDING.html">BUILDING.html</a>, before starting.</p>
+
+<h2>What was found in the editors' source</h2>
+<p>Read on 10 November 2026 at the commits in the table in Task 6. Nothing was built or run. Facts every task relies on:</p>
+<table><tr><th>Finding</th><th>Consequence here</th></tr>
+<tr><td>GridCraft, WordCraft and PdfCraft share one bridge (the <code>craft-web-host</code> crate, contract version 1). It is switched on by <code>?host=parent</code> and only when the parent page has the <strong>same origin</strong> as the editor.</td><td>ShareCraft serves the editors itself, under <code>/editors/</code>. One adapter drives three editors.</td></tr>
+<tr><td>Messages are <code>{type: "&lt;app&gt;:&lt;kind&gt;", …}</code> by <code>postMessage</code>: the editor sends <code>ready</code>, <code>save {name, bytes}</code>, <code>dirty {dirty}</code>, <code>failed {error}</code>; the page sends <code>open {name, bytes}</code> after <code>ready</code>. <code>bytes</code> is an <code>ArrayBuffer</code>.</td><td>The adapter in Task 5.</td></tr>
+<tr><td>The editor sends <code>save</code> for exports as well (PDF, CSV, HTML, PNG), and marks the document as saved the moment it sends, with no confirmation from the page.</td><td>The page decides by file extension what is a save. If ShareCraft refuses a save, the page must say so and keep the bytes, because the editor now believes it is saved.</td></tr>
+<tr><td>Each editor has a page interface (<code>window.gridcraft</code>, <code>window.wordcraft</code>, <code>window.pdfcraft</code> with <code>?control</code>) with <code>execute(command, params)</code>, and a <code>file.save</code> command.</td><td>The frame's Save button and the automated checks use it.</td></tr>
+<tr><td>SolidCraft uses its own bridge: <code>?embed=editor</code>, then the page calls <code>frame.contentWindow.solidcraft.request("document.import" | "document.export" | "document.saved", …)</code>. The document travels as JSON text. Nothing is pushed; the page polls.</td><td>A second adapter (Task 10). SolidCraft documents are stored as that JSON text.</td></tr>
+<tr><td>No editor has a view-only mode.</td><td>Someone without the seat sees the editor under a banner saying changes are not saved; nothing they do can be saved.</td></tr>
+<tr><td>Each editor's <code>index.html</code> has inline scripts and styles. None needs cross-origin isolation headers. PdfCraft starts workers; SolidCraft registers a service worker.</td><td>Editor pages get their own content security policy built from hashes (Task 2).</td></tr>
+<tr><td>The storytold editors build against storytold's forks of egui and winit and its <code>craft-libs</code> repository, by Git revision.</td><td>The ThineCraft forks depend on those staying reachable. Recorded as a risk in Task 11.</td></tr></table>
+
+<h2>What this plan does not cover</h2>
+<table><tr><th>Left out</th><th>Why, and where it goes</th></tr>
+<tr><td>Two people editing one file together in a real editor</td><td>Stage 2 onward, one editor at a time, GridCraft first.</td></tr>
+<tr><td>Saving automatically</td><td>The editors offer no save the page can rely on without the person's action except <code>file.save</code>, and a session of one loses nothing by saving on demand. Stage 2 sends changes as they happen, which replaces saving.</td></tr>
+<tr><td>A true view-only mode in the editors</td><td>Needs a change in each fork. Stage 2, with presence.</td></tr>
+<tr><td>Libraries, folders, renaming, moving, deleting, replacing a file by upload</td><td>Stage 2 (SC-02).</td></tr>
+<tr><td>Binary SolidCraft <code>.sc</code> files; formats other than each editor's native one as the stored form</td><td>The editor can still import and export other formats; ShareCraft stores the native one only.</td></tr>
+<tr><td>Hiding or changing the editors' own menus; site branding on the frame</td><td>Open in the frame concept; SC-25 is Stage 2.</td></tr>
+<tr><td>Accessibility of the editors' canvas</td><td>Still to be checked before Stage 2 (sequencing, section 06). The frame page itself meets the same standard as the other pages.</td></tr>
+<tr><td>Reaching the server from another machine</td><td>Unchanged from plan 2.</td></tr></table>
+
+<h2>Global constraints</h2>
+<ul>
+<li>Everything in plan 2's global constraints still holds: Rust for server code (D14); <code>MIT OR Apache-2.0</code> and no copyleft dependencies (D17); no organization identifiers (D18); secrets never printed, logged or committed; SQL with bind parameters only; every route through the <code>Signed</code> extractor and <code>Db::role</code>; <code>404</code> for no access; loopback only; workspace lints (no <code>unsafe</code>, <code>unwrap</code>, <code>expect</code>, <code>panic!</code> or panicking indexing outside tests); tests use the real PostgreSQL in <code>TEST_DATABASE_URL</code> and are never skipped.</li>
+<li>No save path around the spine (D15): after a document is created, its content changes only through its room. <code>RevisionStore::checkpoint</code> stays the only code that writes content (S3), and every write states the revision it was based on (S4).</li>
+<li>ShareCraft never interprets a file document's bytes (S6). It never serves them in a way a browser will render: always <code>Content-Type: application/octet-stream</code>, <code>Content-Disposition: attachment</code>, <code>X-Content-Type-Options: nosniff</code>, <code>Content-Security-Policy: sandbox</code> and <code>Cache-Control: no-store</code>.</li>
+<li>Events never contain file content.</li>
+<li>Editor builds are not committed to ShareCraft. They live in <code>editors/</code> at the repository root, which is git-ignored. Fork source is not copied into ShareCraft.</li>
+<li>In the forks: work on a branch named <code>sharecraft</code> cut from the base commit in Task 6; leave the fork's default branch equal to upstream. Keep <code>LICENSE-MIT</code>, <code>LICENSE-APACHE</code>, <code>NOTICE</code>, <code>ATTRIBUTION.md</code> and every other licence or attribution file. Change as little as the task names. Never push to, or open a pull request against, an upstream repository. Follow each fork's own lint and test commands for the files touched.</li>
+<li>Fork changes are stated in the fork's <code>NOTICE</code> under a heading <code>Changes made for ShareCraft</code>: one line per change, with the date. Apache 2.0 asks that modified files be marked; this is where.</li>
+<li>A fork must not present itself as ArtCraft or imply endorsement by Tangency Labs. Plain text "based on GridCraft by the ArtCraft team" (and likewise) is allowed and is used.</li>
+<li>Page scripts hold no permission logic: what a person may do is decided by the server and told to the page.</li>
+<li>Work in ShareCraft on branch <code>stage-1-editors</code>. Run <code>cargo xtask check</code> before each commit. Commit after each task with the message given. Do not push ShareCraft; push a fork's <code>sharecraft</code> branch only in the step that says so.</li>
+<li>Editor builds are slow and large. Use one shared <code>CARGO_TARGET_DIR</code> per fork outside the repository, build one editor at a time, and run builds in the background.</li>
+</ul>
+
+<h2>Review focus</h2>
+<p>Conditions the scope implies that are most likely to hurt a real person. Each has a test in the task named.</p>
+<ol>
+<li><strong>A save that ShareCraft refuses after the editor has marked the file saved.</strong> The person must be told, the bytes must be kept in the page, and they must be able to try again or download their copy. Leaving the page must warn. (Task 5: <code>refused_save_keeps_the_bytes</code>; browser check in Task 7.)</li>
+<li><strong>Access removed while the file is open.</strong> The editor must leave the screen within a second, a later save with the old seat must be refused, and the content must answer <code>404</code>. (Task 3: <code>removed_holder_loses_the_seat</code>; Task 4: <code>save_after_removal_is_refused</code>.)</li>
+<li><strong>Two people, or one person in two tabs, with the same file open.</strong> Only the seat holder's save is accepted; a save based on an older revision is refused and overwrites nothing. (Task 3: <code>second_editor_does_not_get_the_seat</code>; Task 4: <code>save_without_the_seat_is_refused</code>, <code>save_on_an_old_revision_is_a_conflict</code>.)</li>
+<li><strong>An export mistaken for a save.</strong> A PDF or CSV the editor "saves" must become a download, never the stored workbook. (Task 5: <code>exports_are_not_saves</code>.)</li>
+<li><strong>A hostile or oversized file.</strong> An uploaded HTML or SVG file must never run on ShareCraft's origin; a file over the limit is refused before it is stored; a bad name is refused. (Task 4: <code>content_is_never_rendered</code>, <code>oversized_upload_is_refused</code>, <code>bad_file_names_are_refused</code>.)</li>
+</ol>
+
+<h2>File structure</h2>
+<pre><code>crates/records/migrations/0002_editors.sql   documents.editor
+crates/records/src/documents.rs              + Editor, editor on Document and create_document
+crates/protocol/src/file.rs                  file-session messages
+crates/server/src/
+  editors.rs                                 installed editors: manifests, static files, their security policy
+  file_room.rs                               the file session: seat, saves, access commands
+  api/content.rs                             download, save, upload
+  room.rs  ws.rs  api/docs.rs  api/mod.rs  config.rs  lib.rs   (changed)
+crates/server/tests/
+  editors.rs  file_session.rs  content.rs
+  fixtures/editors/stub/{index.html,editor.json}   a stand-in editor
+web/
+  file.html  file.js                         the frame around an editor
+  editor-host.js  editor-host.test.mjs       the two bridges; pure parts tested with node
+  index.html  home.js  style.css             (changed: new file, upload, open in the right page)
+xtask/src/editors.rs                         cargo xtask editors …
+editors.toml                                 which fork and commit each editor is built from
+editors.html                                 provenance, formats, how to update a fork (A17)
+editors/                                     built editors (git-ignored)
+
+In each fork (separate repositories, cloned beside ShareCraft):
+  NOTICE                                     + "Changes made for ShareCraft"
+  the files each task names</code></pre>
+
+<h2>Tasks</h2>
+
+<div class="task"><h3>Task 1: A document has an editor</h3>
+<p><strong>Files:</strong> create <code>crates/records/migrations/0002_editors.sql</code>; modify <code>crates/records/src/documents.rs</code>, <code>crates/records/tests/documents.rs</code>, <code>crates/server/src/api/docs.rs</code>, <code>crates/server/tests/documents.rs</code>, <code>crates/server/tests/common/mod.rs</code>.</p>
+<p><strong>Produces:</strong></p>
+<pre><code>-- 0002: alter table documents add column editor text not null default 'text'
+--       check (editor in ('text','gridcraft','wordcraft','pdfcraft','solidcraft'));
+
+pub enum Editor { Text, GridCraft, WordCraft, PdfCraft, SolidCraft }   // serde and SQL text: the lower-case id
+impl Editor {
+    pub const ALL: [Editor; 5];
+    pub fn id(self) -> &amp;'static str;
+    pub fn from_id(id: &amp;str) -> Option&lt;Editor>;
+    pub fn native_extension(self) -> Option&lt;&amp;'static str>;  // None, ".xlsx", ".docx", ".pdf", ".solidcraft.json"
+    pub fn for_file_name(name: &amp;str) -> Option&lt;Editor>;     // by native extension, ASCII case-insensitive; never Text
+    pub fn is_file(self) -> bool;                             // everything but Text
+}
+pub struct Document { /* existing */ pub editor: Editor }
+AccessError::WrongExtension
+impl Db { pub async fn create_document(&amp;self, actor: UserId, id: DocId, name: &amp;str, editor: Editor) -> … }</code></pre>
+<p><strong>Rules:</strong></p>
+<ul>
+<li>A file document's name must end with its editor's native extension and have at least one character before it; otherwise <code>WrongExtension</code>. A text document's name is unchanged from plan 2.</li>
+<li><code>POST /api/docs</code> takes <code>{"name": …, "editor": …}</code>; <code>editor</code> is optional and defaults to <code>"text"</code>. An unknown editor or a wrong extension is <code>400</code> with a message naming the extension expected. <code>"pdfcraft"</code> is refused here with <code>400</code> ("upload a PDF instead"): an empty PDF is not a file.</li>
+<li>Every document in the JSON of <code>GET /api/docs</code> and <code>GET /api/docs/{id}</code> carries <code>"editor"</code>.</li>
+<li>The <code>document.created</code> event's detail gains <code>{"editor": …}</code>.</li>
+</ul>
+<ol class="steps">
+<li>Write failing tests. In <code>records</code>: <code>existing_documents_are_text</code> (a row inserted without the column reads back as <code>Text</code>); <code>editor_is_chosen_by_extension</code> (<code>Budget.XLSX</code> is GridCraft, <code>a.docx</code>, <code>a.pdf</code>, <code>a.solidcraft.json</code>, and <code>notes.txt</code> is <code>None</code>); <code>file_name_must_match_its_editor</code> (<code>.xlsx</code> alone and <code>Budget.docx</code> for GridCraft are <code>WrongExtension</code>). In <code>server</code>: <code>creating_a_spreadsheet_records_its_editor</code>; <code>unknown_editor_is_refused</code>; <code>an_empty_pdf_cannot_be_created</code>; <code>text_documents_still_default</code>.</li>
+<li>Run <code>cargo xtask test -p records</code>. Expected: does not compile.</li>
+<li>Implement.</li>
+<li>Run <code>cargo xtask check</code>. Expected: passes.</li>
+<li>Commit: <code>feat(records): a document names the editor that opens it</code>.</li>
+</ol></div>
+
+<div class="task"><h3>Task 2: Serving installed editors</h3>
+<p><strong>Files:</strong> create <code>crates/server/src/editors.rs</code>, <code>crates/server/tests/editors.rs</code>, <code>crates/server/tests/fixtures/editors/stub/index.html</code>, <code>…/stub/editor.json</code>; modify <code>crates/server/src/{lib.rs,config.rs,api/mod.rs}</code>, <code>crates/server/tests/common/mod.rs</code>, <code>.gitignore</code> (add <code>/editors</code>).</p>
+<p><strong>Produces:</strong></p>
+<pre><code>// config: SHARECRAFT_EDITORS_DIR, default "./editors"
+pub struct Config { /* existing */ pub editors_dir: PathBuf, pub max_file_bytes: usize }   // SHARECRAFT_MAX_FILE_BYTES, default 64 MiB
+
+// &lt;editors_dir>/&lt;id>/editor.json, written by `cargo xtask editors build` (Task 6)
+pub struct Manifest {
+    pub id: String,                 // must equal the folder name and be an Editor id other than "text"
+    pub version: String,            // the editor's own version
+    pub fork: Source, pub upstream: Source,          // Source { repository: String, commit: String }
+    pub built: String,              // date, YYYY-MM-DD
+    pub script_hashes: Vec&lt;String>, // "sha256-…" of each inline &lt;script> in index.html
+    pub style_hashes: Vec&lt;String>,  // "sha256-…" of each inline &lt;style>
+}
+pub struct Editors { /* read once at start */ }
+impl Editors { pub fn load(dir: &amp;Path) -> Editors; pub fn get(&amp;self, id: &amp;str) -> Option&lt;&amp;Manifest>; pub fn list(&amp;self) -> Vec&lt;&amp;Manifest> }
+impl AppState { pub fn editors(&amp;self) -> &amp;Editors }
+
+GET /editors/{id}/…        static files of an installed editor; 404 for one that is not
+GET /api/editors           [{ "id", "version", "built" }] for a signed-in caller</code></pre>
+<p><strong>Rules:</strong></p>
+<ul>
+<li><code>Editors::load</code> never fails the server: a missing directory means no editors; a folder whose manifest is missing, unreadable or names another id is skipped with one warning line naming the folder.</li>
+<li>Files under <code>/editors/{id}/</code> need a signed-in caller (<code>404</code> otherwise, as elsewhere) and are served with <code>Cache-Control: no-cache</code>, <code>nosniff</code> and this policy in place of the site's: <code>default-src 'self'; script-src 'self' 'wasm-unsafe-eval' &lt;script_hashes>; style-src 'self' &lt;style_hashes>; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; worker-src 'self' blob:; frame-src 'self' blob:; frame-ancestors 'self'</code>. Hashes come from the manifest only after checking each is <code>sha256-</code> followed by base64 characters; anything else drops the manifest. <code>.wasm</code> is served as <code>application/wasm</code>.</li>
+<li>No path can leave the editor's folder (<code>..</code>, absolute paths, encoded separators): <code>404</code>.</li>
+<li>All other pages gain <code>frame-src 'self'</code> in the site policy (the frame page embeds the editor) and keep <code>frame-ancestors 'none'</code>. Static files from <code>web_dir</code> gain <code>Cache-Control: no-cache</code>; plan 2's browser check found a stale script being run after an upgrade.</li>
+<li>The stub editor is a test fixture: a page of under 60 lines that speaks the <code>craft-web-host</code> contract under whatever editor id it is installed as. It takes the id from its own address (<code>/editors/&lt;id>/</code>) and uses it as the message prefix and the name of its page interface. It posts <code>&lt;id>:ready</code>, shows the text of the bytes it is opened with in a <code>&lt;textarea></code>, posts <code>&lt;id>:dirty</code> on input, posts <code>&lt;id>:save</code> named <code>Book.xlsx</code> when its Save button is pressed or <code>window[id].execute("file.save")</code> is called, and has a second button that posts an export named <code>export.pdf</code>. Its script and style are inline, so its manifest carries real hashes. The tests copy it into a temporary editors folder as <code>gridcraft</code>; the server has no code that knows about it.</li>
+</ul>
+<ol class="steps">
+<li>Write failing tests: <code>installed_editor_is_served_with_its_policy</code> (the header contains each hash and <code>frame-ancestors 'self'</code>); <code>editor_files_need_sign_in</code>; <code>unknown_editor_is_not_found</code>; <code>paths_cannot_leave_the_editor_folder</code> (<code>/editors/gridcraft/../../.env</code>, <code>%2e%2e</code>, a backslash form); <code>bad_manifest_is_skipped_and_the_server_starts</code>; <code>bad_hash_drops_the_manifest</code>; <code>wasm_has_its_media_type</code>; <code>editors_are_listed</code>; <code>site_pages_are_not_cached</code>.</li>
+<li>Run <code>cargo xtask test -p sharecraft-server --test editors</code>. Expected: does not compile.</li>
+<li>Implement.</li>
+<li>Run <code>cargo xtask check</code>. Expected: passes.</li>
+<li>Commit: <code>feat(server): serve installed editors from the same origin</code>.</li>
+</ol></div>
+
+<div class="task"><h3>Task 3: The file session</h3>
+<p><strong>Files:</strong> create <code>crates/protocol/src/file.rs</code>, <code>crates/server/src/file_room.rs</code>, <code>crates/server/tests/file_session.rs</code>; modify <code>crates/protocol/src/lib.rs</code>, <code>crates/server/src/{room.rs,ws.rs,lib.rs,api/mod.rs}</code>, <code>crates/server/tests/common/mod.rs</code>.</p>
+<p><strong>Consumes:</strong> <code>Rooms</code>, <code>RoomLink</code>, the access commands, <code>order_access</code>, <code>recheck_after_join</code>, <code>Storage</code>, <code>EventSink</code>, <code>Participant</code>, <code>SaveState</code>, <code>RemovedReason</code>. <strong>Produces:</strong></p>
+<pre><code>// protocol::file — JSON, tagged by "type" in snake_case like the text messages
+pub enum FileClientMsg { Join { client: ClientId } }
+pub enum FileServerMsg {
+    Joined  { participants: Vec&lt;Participant>, revision: Option&lt;String>, can_edit: bool, seat: SeatState },
+    People  { participants: Vec&lt;Participant> },
+    Seat    { seat: SeatState },
+    Save    { state: SaveState, revision: Option&lt;String> },
+    Access  { can_edit: bool },
+    Removed { reason: RemovedReason },
+}
+pub enum SeatState {                         // "state": "yours" | "taken" | "free"
+    Yours { token: String },                 // 32 random bytes, hex; only ever sent to the holder's connection
+    Taken { by: Participant },
+    Free,
+}
+
+// server
+pub(crate) enum SaveReply { Saved(RevisionId), Unchanged(RevisionId), NotHolder, Conflict { current: Option&lt;RevisionId> }, Failed }
+impl Rooms {
+    // Asks doc's room to store `bytes`. NotHolder if no room is open.
+    pub(crate) async fn save_file(&amp;self, doc: DocId, user: UserId, token: &amp;str,
+                                  base: Option&lt;RevisionId>, bytes: Vec&lt;u8>) -> SaveReply;
+}</code></pre>
+<p><strong>Rules:</strong></p>
+<ul>
+<li>One WebSocket route, <code>/ws/docs/{id}</code>. The connection looks the document up as it does now and starts a file session when <code>editor.is_file()</code>. A text client's messages on a file document, and the reverse, close the connection.</li>
+<li>The registry stays one entry per document: <code>Rooms</code> opens either kind, and <code>send_to</code>, <code>send_all</code>, <code>link</code>, <code>order_access</code> and the three access commands work on both without the callers knowing which. The hooks in <code>api/mod.rs</code> are not duplicated. Restructure <code>room.rs</code> as little as that needs; the text room's behaviour and tests do not change.</li>
+<li>The room holds the document's current revision and stored fields, never its bytes. It reads them when it starts, as the text room does.</li>
+<li><strong>The seat.</strong> At most one connection holds it. A joining connection whose role can edit takes it if it is free. When the holder leaves, is removed, or loses the right to edit, the seat becomes free and everyone is sent <code>Seat { free }</code>; nobody is given it. A connection takes a free seat only by joining again, because its copy of the file may be old. The token changes every time the seat is given.</li>
+<li><strong>Saving.</strong> <code>save_file</code> is answered <code>NotHolder</code> unless <code>user</code> and <code>token</code> are the current holder's (compare the token in constant time). <code>base</code> must equal the room's revision, else <code>Conflict</code>. The write is one <code>Checkpoint</code> with the holder as the only author, run on a blocking task; everyone is sent <code>Save { saving }</code>, then <code>Save { saved, revision }</code>, and the revision is recorded as the text room records it. A store answer of <code>Stale</code> puts the room in conflict exactly as the text room: <code>Save { conflict }</code>, every later save <code>Conflict</code>, and the room ends when empty. Any other error is <code>Save { failed }</code> and <code>Failed</code>; the room carries on.</li>
+<li>While a write runs, access commands are still handled at once and further saves wait their turn. A write that has started finishes even if the holder is removed meanwhile; its reply still goes back.</li>
+<li>Access commands behave as in the text room: removal sends <code>Removed</code> as the last frame and drops the connection; a role change sends <code>Access</code> on every change of role. A join that races a removal gets <code>Removed</code> and no <code>Joined</code> (plan 2, finding F2).</li>
+<li>Events: <code>editing.joined</code>, <code>editing.left</code>, <code>save.written</code>, <code>save.failed</code>, <code>save.conflict</code> as the text room reports them, plus <code>seat.taken</code> and <code>seat.freed</code> with the actor.</li>
+<li>The room stays open for the configured grace period after the last connection leaves, then ends. There is nothing to save at the end.</li>
+</ul>
+<ol class="steps">
+<li>Write failing tests. Unit, in <code>protocol</code>: <code>file_message_tags_are_pinned</code>; <code>seat_token_is_only_in_yours</code>. Integration, over a real socket (seats and removal; no test-only route is added to the server): <code>first_editor_gets_the_seat</code>; <code>second_editor_does_not_get_the_seat</code>; <code>viewer_never_gets_the_seat</code>; <code>seat_is_freed_when_the_holder_leaves_and_not_handed_on</code>; <code>rejoining_takes_a_free_seat_with_a_new_token</code>; <code>demoted_holder_loses_the_seat</code>; <code>removed_holder_loses_the_seat</code> (<code>Removed</code> is their last frame; the others get <code>Seat { free }</code>); <code>join_racing_a_removal_gets_only_removed</code>; <code>text_client_on_a_file_document_is_closed</code>; <code>signing_out_closes_the_file_session</code>. Unit, inside <code>file_room.rs</code>, driving the room with commands as <code>room.rs</code>'s tests do: <code>save_by_the_holder_is_stored_and_credited</code> (read back from Git: bytes equal, author is the holder; the revision row exists); <code>save_with_a_wrong_token_is_refused</code>; <code>save_on_an_old_revision_is_a_conflict</code>; <code>same_bytes_again_is_unchanged</code>; <code>stale_store_puts_the_room_in_conflict</code> (write to the store behind the room's back first); <code>removal_during_a_write_still_removes</code> (a <code>Checkpointer</code> double whose <code>write</code> blocks until released).</li>
+<li>Run <code>cargo xtask test -p sharecraft-server --test file_session</code>. Expected: does not compile.</li>
+<li>Implement.</li>
+<li>Run <code>cargo xtask check</code>. Expected: passes, with every plan 2 test unchanged and passing.</li>
+<li>Commit: <code>feat(server): file sessions with one editing seat</code>.</li>
+</ol></div>
+
+<div class="task"><h3>Task 4: Content over HTTP</h3>
+<p><strong>Files:</strong> create <code>crates/server/src/api/content.rs</code>, <code>crates/server/tests/content.rs</code>; modify <code>crates/server/src/{api/mod.rs,lib.rs}</code>.</p>
+<p><strong>Consumes:</strong> <code>Rooms::save_file</code>, <code>SaveReply</code>, <code>Checkpointer</code>, <code>Editor</code>, <code>Config::max_file_bytes</code>. <strong>Produces:</strong></p>
+<pre><code>GET  /api/docs/{id}/content[?revision=&lt;id>]
+     200 bytes; headers from the global constraints, plus X-ShareCraft-Revision and a
+     Content-Disposition file name taken from the stored name (RFC 6266, filename* for non-ASCII)
+     204 when the document has no revision yet
+PUT  /api/docs/{id}/content?base=&lt;id>          header X-ShareCraft-Seat: &lt;token>; body: the bytes
+     200 {"revision": …, "changed": bool} | 403 not the seat holder | 409 {"current": …}
+     | 413 over the limit | 503 the write failed
+POST /api/docs/upload?name=&lt;file name>           body: the bytes
+     201 the document, as POST /api/docs answers</code></pre>
+<p><strong>Rules:</strong></p>
+<ul>
+<li>Download needs any role on the document; a <code>revision</code> that is not one of this document's is <code>404</code>. It works for text documents too.</li>
+<li>Save needs a role that can edit, checked before the body is read, then goes through <code>Rooms::save_file</code> and nothing else. <code>base</code> absent means "no revision yet". It is refused with <code>400</code> for a text document. The handler's work runs to completion if the caller disconnects (plan 2, finding F1): the room owns the write, and the handler only waits for its answer.</li>
+<li>Upload creates a new document and its first revision in one request: the editor comes from the name (<code>400</code> if no editor opens it), the caller becomes owner, and the bytes are written with <code>base: None</code> through <code>Checkpointer::write</code>. This is creation, not an edit: nobody can have the document open. If the write fails after the row is made, the document stays, empty, and the answer is <code>503</code> naming it; an empty body is <code>400</code>.</li>
+<li>The body limit is <code>max_file_bytes</code> on these two routes only and is enforced while reading, not after. Other routes keep their limit.</li>
+<li>Events: <code>content.downloaded</code> is not recorded (too frequent); upload records <code>document.created</code> with <code>{"editor": …, "uploaded": true, "bytes": n}</code>.</li>
+</ul>
+<ol class="steps">
+<li>Write failing tests: <code>upload_then_download_round_trips</code> (bytes with every value 0 to 255); <code>content_is_never_rendered</code> (upload <code>x.docx</code> whose bytes are an HTML page with a script: the download has <code>application/octet-stream</code>, <code>attachment</code>, <code>nosniff</code> and <code>sandbox</code>); <code>download_needs_access</code> (<code>404</code> for a stranger and when signed out); <code>revision_of_another_document_is_not_found</code>; <code>empty_document_answers_no_content</code>; <code>save_with_the_seat_writes_a_revision</code> (open a socket, take the token, save, download); <code>save_without_the_seat_is_refused</code> (no socket; a second editor; a viewer); <code>save_on_an_old_revision_is_a_conflict</code> (the answer names the current revision and nothing is written); <code>save_after_removal_is_refused</code> (revoke, then save with the token just held: <code>404</code>, and the content answers <code>404</code>); <code>oversized_upload_is_refused</code> and <code>oversized_save_is_refused</code> (limit set to 1 KiB by the harness; <code>413</code>; no document or revision made); <code>bad_file_names_are_refused</code> (no extension, an unknown one, a separator, 300 characters); <code>non_ascii_file_name_survives_download</code>; <code>save_is_refused_for_a_text_document</code>; <code>cross_origin_save_is_refused</code>.</li>
+<li>Run <code>cargo xtask test -p sharecraft-server --test content</code>. Expected: does not compile.</li>
+<li>Implement.</li>
+<li>Run <code>cargo xtask check</code>. Expected: passes.</li>
+<li>Commit: <code>feat(server): download, save and upload file content</code>.</li>
+</ol></div>
+
+<div class="task"><h3>Task 5: The frame around an editor</h3>
+<p><strong>Files:</strong> create <code>web/file.html</code>, <code>web/file.js</code>, <code>web/editor-host.js</code>, <code>web/editor-host.test.mjs</code>; modify <code>web/index.html</code>, <code>web/home.js</code>, <code>web/style.css</code>, <code>web/common.js</code>.</p>
+<p><strong>Consumes:</strong> the routes of Tasks 2 to 4, <code>FileServerMsg</code>, the stub editor. <strong>Produces:</strong></p>
+<pre><code>// editor-host.js — no DOM access in the exported pure functions
+export const BRIDGES = {                       // by editor id
+  gridcraft: { kind: "craft-web-host", prefix: "gridcraft", query: "host=parent" },
+  wordcraft: { kind: "craft-web-host", prefix: "wordcraft", query: "host=parent" },
+  pdfcraft:  { kind: "craft-web-host", prefix: "pdfcraft",  query: "host=parent&amp;control" },
+  solidcraft:{ kind: "solidcraft-request",                  query: "embed=editor" },   // Task 10
+};
+export function editorUrl(id, authorName)      // "/editors/&lt;id>/index.html?&lt;query>&amp;author=&lt;encoded>"
+export function classifySave(nativeExtension, name)   // "save" | "export"
+export function parseHostMessage(prefix, data) // {kind: "ready"|"save"|"dirty"|"failed", …} or null
+export function nextStatus(state, event)       // the frame's status line; see the table below
+export function connect(frame, bridge, handlers)   // -> { open(name, bytes), requestSave() }</code></pre>
+<p><strong>Rules:</strong></p>
+<ul>
+<li><code>file.html?doc=&lt;id></code> is the frame from <a href="../docs/editor-frame.html">the concept</a>, reduced to what a session of one needs: a slim bar with the way back, the document name, one status, a Save button, a Download link, and Share for owners (the Sharing panel from <code>doc.js</code>, moved to <code>common.js</code> so both pages use one copy); one banner line under it; the editor in an <code>&lt;iframe></code> filling the rest, with <code>allow="clipboard-read; clipboard-write"</code>. The home page opens a file document here and a text document in <code>doc.html</code>.</li>
+<li><strong>Order of opening:</strong> fetch the document; if its editor is not in <code>GET /api/editors</code>, say "The … editor is not installed on this server." and offer Download only. Otherwise open the socket and join; on <code>Joined</code> download the content at <code>revision</code> (none if there is no revision); load the editor; on its <code>ready</code>, send <code>open</code> with the document's name and the bytes (no <code>open</code> for a document with no revision: the editor starts empty). An editor that sends <code>failed</code>, or no <code>ready</code> within 60 seconds, gets a banner with its error and Download.</li>
+<li><strong>Messages from the editor</strong> are accepted only when <code>event.source</code> is the frame's window and <code>event.origin</code> is the page's origin. The page posts to that origin only.</li>
+<li><strong>A save from the editor:</strong> <code>classifySave</code> is <code>"save"</code> only when the name ends with the document's native extension (ASCII case-insensitive); the editor's name is otherwise ignored. An export becomes a browser download under the editor's name and never touches the document. A save is uploaded with the seat token and the revision the page last knew; while it is in flight a newer save from the editor replaces any one waiting, so at most one waits.</li>
+<li><strong>The page keeps the last bytes the editor saved until the server has stored them.</strong> On <code>409</code>, <code>403</code>, <code>413</code>, <code>503</code> or a network failure the banner says what happened and offers "Try again" (not for <code>403</code> or <code>413</code>) and "Download my copy". <code>beforeunload</code> warns while the editor reports unsaved changes or bytes are unstored.</li>
+<li><strong>Without the seat</strong> (a viewer, or the seat is taken): the banner says "View only. Changes you make here are not saved." or "… is editing this file. You can read it; changes you make here are not saved.", the Save button is hidden, and saves from the editor are not uploaded (the banner repeats; an export still downloads). On <code>Seat { free }</code> for someone who can edit: "This file is free to edit. Reload to edit it." with a Reload action. On <code>Save { saved }</code> with a revision the page does not have: "A newer version was saved. Reload to see it."</li>
+<li><strong>On <code>Removed</code>, or the socket closing with the document then answering <code>404</code>:</strong> remove the <code>&lt;iframe></code> from the page at once, drop any kept bytes, and show the same messages <code>doc.js</code> shows. On <code>Access</code>: reload the page, so the seat is decided afresh.</li>
+<li><strong>Connection lost:</strong> the editor stays; the status says "Connection lost. Saving is paused."; the page reconnects as <code>doc.js</code> does and joins again. If the seat it held is gone or the revision moved on, it says so and offers Download my copy and Reload; it does not upload.</li>
+<li>Status wording, one place (<code>nextStatus</code>): "Opening…", "Saved", "Unsaved changes", "Saving…", "Not saved", "View only", "Connection lost. Saving is paused.". Never colour alone.</li>
+<li>The home page gains "New" with a choice of Text document, Spreadsheet (<code>.xlsx</code>), Document (<code>.docx</code>) and Design (<code>.solidcraft.json</code>), which appends the extension, and "Upload a file", which posts the chosen file to the upload route and reports <code>400</code> and <code>413</code> in words. Each row shows the editor's name.</li>
+<li>Keyboard: every control in the bar is reachable and has a visible focus; the bar comes before the frame in tab order; the banner is a live region. The layout holds at 375 px wide.</li>
+</ul>
+<ol class="steps">
+<li>Write failing node tests in <code>editor-host.test.mjs</code>: <code>exports_are_not_saves</code> (<code>Book.xlsx</code> and <code>BOOK.XLSX</code> are saves for <code>.xlsx</code>; <code>Book.pdf</code>, <code>Book.csv</code>, <code>Book.xlsx.html</code>, an empty name and a missing name are exports); <code>messages_with_another_prefix_are_ignored</code>; <code>malformed_messages_are_ignored</code> (no type, a non-object, bytes that are not an <code>ArrayBuffer</code> or <code>Uint8Array</code>); <code>editor_url_encodes_the_author</code> (a name with <code>&amp;</code>, <code>#</code> and non-ASCII); <code>status_follows_events</code> (a table of state, event, expected words covering every status above); <code>refused_save_keeps_the_bytes</code> (drive the save queue with a stand-in upload that answers 409, then 200: the bytes are offered both times and released only after 200; a newer save replaces a waiting one).</li>
+<li>Run <code>node --test web/</code>. Expected: fails.</li>
+<li>Implement the module and the pages.</li>
+<li>Run <code>cargo xtask check</code>. Expected: passes.</li>
+<li>Browser check with the stub editor, copied to <code>editors/gridcraft</code> with its manifest's id set to match, and removed again afterwards (Task 7 installs the real one). Two accounts, a new spreadsheet: open, save, reload and see the saved text; a refused save (stop the server mid-save) shows the banner and Download my copy returns the bytes; the export button downloads and leaves the document alone; a second person sees "… is editing this file"; removal empties the screen; the seat becomes free and a reload takes it; 375 px wide; tab order. Record what was and was not checked in the ledger.</li>
+<li>Commit: <code>feat(web): the frame that opens a file in its editor</code>.</li>
+</ol></div>
+
+<div class="task"><h3>Task 6: Building an editor from its fork</h3>
+<p><strong>Files:</strong> create <code>xtask/src/editors.rs</code>, <code>editors.toml</code>; modify <code>xtask/src/main.rs</code>, <code>xtask/Cargo.toml</code>.</p>
+<p><strong>Produces:</strong></p>
+<pre><code># editors.toml — one table per editor; the record of what ShareCraft is built against
+[gridcraft]
+upstream = "https://github.com/storytold/gridcraft"
+base     = "e9addf52fe68847e6c1310fcfa5d42b7aa8b9650"
+fork     = "https://github.com/ThineCraft/GridCraft"
+branch   = "sharecraft"
+commit   = ""            # the fork commit last built and checked; set by Tasks 7 to 10
+app      = "apps/gridcraft-web"
+checkout = "../GridCraft"
+
+cargo xtask editors list                 # each editor: fork commit recorded, checkout state, installed build
+cargo xtask editors build &lt;id>           # build the checkout and install it into ./editors/&lt;id>
+cargo xtask editors verify               # every installed manifest matches editors.toml</code></pre>
+<table><tr><th>Editor</th><th>Upstream</th><th>Base commit</th><th>Fork</th></tr>
+<tr><td>gridcraft</td><td>storytold/gridcraft</td><td><code>e9addf52fe68847e6c1310fcfa5d42b7aa8b9650</code></td><td>ThineCraft/GridCraft</td></tr>
+<tr><td>wordcraft</td><td>storytold/wordcraft</td><td><code>2922fe566b575794f896077467cf92825ccba7c9</code></td><td>ThineCraft/WordCraft</td></tr>
+<tr><td>pdfcraft</td><td>storytold/pdfcraft</td><td><code>a71b5124bc388e6b86ec0ee5ec16d31fa1955117</code></td><td>ThineCraft/PdfCraft</td></tr>
+<tr><td>solidcraft</td><td>tangency-labs/solidcraft</td><td><code>f232e4a40c9d1d3088c758e393b7db43048eac22</code></td><td>ThineCraft/SolidCraft</td></tr></table>
+<p><strong>Rules:</strong></p>
+<ul>
+<li><code>build</code> refuses, with a message saying which, when: the checkout is missing; it is not on <code>branch</code>; it has uncommitted changes; <code>base</code> is not an ancestor of its head; <code>trunk</code> is not installed (say how to install it; never install it itself).</li>
+<li>It runs <code>trunk build --release --public-url ./ --dist &lt;temporary folder></code> in <code>&lt;checkout>/&lt;app></code>, then refuses a build whose <code>index.html</code> has a root-absolute <code>src</code> or <code>href</code>, computes the SHA-256 of every inline <code>&lt;script></code> and <code>&lt;style></code> body exactly as a browser hashes it (the bytes between the tags, unmodified), writes <code>editor.json</code> (Task 2's <code>Manifest</code>, with the checkout's head as <code>fork.commit</code> and the editor's version from its app crate), copies the fork's licence, <code>NOTICE</code> and attribution files into the build, and only then replaces <code>./editors/&lt;id></code>. A failed build leaves the installed one untouched.</li>
+<li><code>verify</code> fails if an installed manifest's fork commit differs from <code>commit</code> in <code>editors.toml</code>, and is part of <code>cargo xtask check</code> only for editors that are installed: a machine with no editors built still passes.</li>
+<li>Parsing <code>index.html</code> needs no HTML library: the files are Trunk's output. Fail loudly on a <code>&lt;script></code> with both <code>src</code> and a body, or an unclosed tag.</li>
+</ul>
+<ol class="steps">
+<li>Write failing unit tests in <code>xtask</code>: <code>inline_hashes_match_known_values</code> (a fixed page; hashes computed once by hand and pinned, including a script with leading and trailing newlines and one with non-ASCII text); <code>external_scripts_are_not_hashed</code>; <code>root_absolute_links_are_refused</code>; <code>editors_toml_parses</code>; <code>manifest_round_trips_through_the_server_type</code> (the JSON <code>xtask</code> writes is read by <code>sharecraft_server</code>'s <code>Manifest</code>, as a dev-dependency or a shared fixture file checked by both).</li>
+<li>Run <code>cargo test -p xtask</code>. Expected: fails.</li>
+<li>Implement.</li>
+<li>Install the build tool for the current user: <code>cargo install trunk --locked</code>. Confirm <code>trunk --version</code>. (Owner go-ahead given with the plan; no administrator rights.)</li>
+<li>Run <code>cargo xtask check</code>. Expected: passes.</li>
+<li>Commit: <code>feat(xtask): build and install an editor from its fork</code>.</li>
+</ol></div>
+
+<div class="task"><h3>Task 7: GridCraft</h3>
+<p><strong>Files, in the fork:</strong> <code>crates/ui-egui/src/dialogs/about.rs</code> and its translation strings, <code>docs/brand/</code> (removed), <code>NOTICE</code>. <strong>In ShareCraft:</strong> <code>editors.toml</code>.</p>
+<ol class="steps">
+<li>Create the fork: <code>gh repo fork storytold/gridcraft --org ThineCraft --fork-name GridCraft --clone=false</code>. Clone it to <code>../GridCraft</code>, add <code>upstream</code> as a remote, and create branch <code>sharecraft</code> at the base commit in Task 6. Do not change the fork's default branch.</li>
+<li>Remove the upstream brand: delete <code>docs/brand/</code>; change the About dialog's "Part of ArtCraft." to "Based on GridCraft by the ArtCraft team." in every language file that has it (leave untranslated ones in English), and remove the links to the ArtCraft site and chat from About. Search the web build's sources for any other use of the ArtCraft name or marks and list what is found in the report; change only what is displayed to a person.</li>
+<li>Add the <code>Changes made for ShareCraft</code> section to <code>NOTICE</code>.</li>
+<li>Run the fork's own checks for the crates touched. Commit in the fork: <code>ShareCraft fork: remove ArtCraft marks, state origin</code>. Push <code>sharecraft</code> to the fork.</li>
+<li>In ShareCraft: set <code>commit</code> for <code>gridcraft</code> in <code>editors.toml</code>; run <code>cargo xtask editors build gridcraft</code> (background; expect tens of minutes the first time). Record the build's size on disk and compressed.</li>
+<li>Browser check, two accounts, recorded in the ledger. New spreadsheet: type in A1, Save in the frame, reload, the value is there; Ctrl+S in the editor saves; Git shows two commits credited to the saver and <code>git fsck</code> on the library repository is clean. Upload a real <code>.xlsx</code> with a formula and a second sheet: it opens, edits and saves, and the downloaded file opens again. Export PDF from the editor: a download, and the stored file is still a workbook. Second person: view-only banner, their Save does nothing. Remove the second person: their editor leaves the screen. Stop the server during a save: the banner offers Try again and Download my copy. Console: no policy violations; if the editor is blocked by the policy of Task 2, fix the policy there with a test, never by adding <code>'unsafe-inline'</code> or <code>'unsafe-eval'</code>. Use <code>window.gridcraft.execute("cell.set", {cell: "A1", input: "…"})</code> and <code>docInspect()</code> to drive and read the editor instead of clicking the canvas.</li>
+<li>Run <code>cargo xtask check</code>. Commit in ShareCraft: <code>feat(editors): GridCraft opens from ShareCraft</code>.</li>
+</ol></div>
+
+<div class="task"><h3>Task 8: WordCraft</h3>
+<p><strong>Files, in the fork:</strong> <code>crates/ui-egui/src/dialogs/dispatch.rs</code> (the About text) and its translation strings, <code>docs/brand/</code>, <code>NOTICE</code>. <strong>In ShareCraft:</strong> <code>editors.toml</code>.</p>
+<ol class="steps">
+<li>Fork <code>storytold/wordcraft</code> as <code>ThineCraft/WordCraft</code>, clone to <code>../WordCraft</code>, branch <code>sharecraft</code> at the base commit, as in Task 7.</li>
+<li>Remove the brand: delete <code>docs/brand/</code>; the About text "Part of the Crafting Apps from the ArtCraft team" becomes "Based on WordCraft by the ArtCraft team."; remove the ArtCraft site and chat links. List any other displayed use found.</li>
+<li><code>NOTICE</code> section, the fork's checks, commit <code>ShareCraft fork: remove ArtCraft marks, state origin</code>, push <code>sharecraft</code>.</li>
+<li>Set <code>commit</code>; <code>cargo xtask editors build wordcraft</code>.</li>
+<li>Browser check as Task 7, with a new document and an uploaded real <code>.docx</code> containing a heading, a table and non-Latin text. Also: what a new, empty document shows (the editor's start screen is expected; record it); an export to PDF downloads and does not replace the document.</li>
+<li><code>cargo xtask check</code>. Commit: <code>feat(editors): WordCraft opens from ShareCraft</code>.</li>
+</ol></div>
+
+<div class="task"><h3>Task 9: PdfCraft</h3>
+<p><strong>Files, in the fork:</strong> the widgets that draw the ArtCraft wordmark and mark (<code>include_bytes!</code> from <code>docs/brand/</code>, in the UI crate's <code>widgets.rs</code>), the Help links in <code>crates/engine/src/links.rs</code>, <code>docs/brand/</code>, <code>NOTICE</code>. <strong>In ShareCraft:</strong> <code>editors.toml</code>.</p>
+<ol class="steps">
+<li>Fork <code>storytold/pdfcraft</code> as <code>ThineCraft/PdfCraft</code>, clone to <code>../PdfCraft</code>, branch <code>sharecraft</code> at the base commit.</li>
+<li>Remove the brand: the wordmark and mark are compiled into Home and About. Replace each with the plain text "PdfCraft" and, in About, "Based on PdfCraft by the ArtCraft team."; remove the ArtCraft Help links; delete <code>docs/brand/</code> including its licence file, which covered only those marks. Keep <code>ATTRIBUTION.toml</code> and <code>licenses/</code>.</li>
+<li><code>NOTICE</code> section, the fork's checks, commit, push <code>sharecraft</code>.</li>
+<li>Set <code>commit</code>; <code>cargo xtask editors build pdfcraft</code>. The build has a post-build step for its text-recognition worker; the recognition models are not installed (text recognition will report that it is unavailable; record the message).</li>
+<li>Browser check as Task 7 with an uploaded PDF: add a comment or highlight, Save, reload, it is there; the saved file opens in another PDF reader. The home page offers no "new PDF". Confirm the worker loads under the policy.</li>
+<li><code>cargo xtask check</code>. Commit: <code>feat(editors): PdfCraft opens from ShareCraft</code>.</li>
+</ol></div>
+
+<div class="task"><h3>Task 10: SolidCraft</h3>
+<p><strong>Files, in the fork:</strong> <code>apps/solidcraft-web/index.html</code> (service worker registration, social-preview tags, loading logo), the icon and manifest names, <code>NOTICE</code>. <strong>In ShareCraft:</strong> <code>web/editor-host.js</code>, <code>web/editor-host.test.mjs</code>, <code>editors.toml</code>.</p>
+<p><strong>Produces:</strong> the <code>"solidcraft-request"</code> bridge behind the same <code>connect(frame, bridge, handlers)</code> interface, so <code>file.js</code> does not change.</p>
+<p><strong>Rules:</strong></p>
+<ul>
+<li>Ready: poll for <code>frame.contentWindow.solidcraft</code> every 250 ms, up to the same 60 seconds.</li>
+<li>Open: <code>request("document.import", {text, name})</code> with the stored bytes decoded as UTF-8; bytes that are not UTF-8 are an error shown in the banner, not sent.</li>
+<li>Unsaved changes: poll <code>request("document.export")</code> every 2 seconds while the tab is visible and report its <code>dirty</code>; do not keep the text from these polls.</li>
+<li>Save (the frame's Save button; this editor's own Save is switched off when embedded): <code>export</code>, upload the text as UTF-8 bytes, and only after the server stored it call <code>request("document.saved", {revision})</code> with the revision the export carried. If that is refused because the design changed meanwhile, the status stays "Unsaved changes". This editor therefore never believes it is saved when it is not.</li>
+<li>In the fork: do not register the service worker when the page is opened with <code>embed</code> (a cached editor would outlive an upgrade); remove the social-preview tags pointing at the upstream site; replace the loading logo and the icon files named for Tangency Labs with plain ones, keeping <code>ATTRIBUTION.md</code>, <code>THIRD-PARTY-LICENSES.txt</code>, the kernel's own notice in <code>solidcore/</code> and the font licences. About says "Based on SolidCraft by Tangency Labs." only if that wording does not imply endorsement under its disclaimer; read the disclaimer and, if in doubt, write "Based on the SolidCraft source code." and report it.</li>
+</ul>
+<ol class="steps">
+<li>Write failing node tests with a stand-in <code>solidcraft</code> object: <code>import_is_sent_after_the_interface_appears</code>; <code>save_confirms_only_after_the_upload</code> (the upload fails: <code>document.saved</code> is never called); <code>a_refused_confirmation_leaves_it_unsaved</code>; <code>non_utf8_content_is_an_error</code>; <code>polling_stops_when_disconnected</code>.</li>
+<li>Run <code>node --test web/</code>. Expected: fails. Implement the bridge. Expected: passes.</li>
+<li>Fork <code>tangency-labs/solidcraft</code> as <code>ThineCraft/SolidCraft</code>, clone to <code>../SolidCraft</code>, branch <code>sharecraft</code> at the base commit. Make the fork changes, <code>NOTICE</code> section, the fork's checks (it has <code>cargo xtask web-api-test --site dist/web</code>), commit, push <code>sharecraft</code>.</li>
+<li>Set <code>commit</code>; <code>cargo xtask editors build solidcraft</code>.</li>
+<li>Browser check as Task 7 with a new design: add a box through <code>window.solidcraft.execute</code>, Save, reload, it is there; download the stored JSON and import it again. Confirm no service worker is registered for <code>/editors/solidcraft/</code>.</li>
+<li><code>cargo xtask check</code>. Commit: <code>feat(editors): SolidCraft opens from ShareCraft</code>.</li>
+</ol></div>
+
+<div class="task"><h3>Task 11: Documentation and records</h3>
+<p><strong>Files:</strong> create <code>editors.html</code>; modify <code>BUILDING.html</code>, <code>sequencing.html</code>, <code>scope.html</code>, <code>README.md</code>, <code>docs/index.html</code> only if it lists the documents.</p>
+<ul>
+<li><code>editors.html</code> (A17, SC-24), in the style of the other documents: for each editor the upstream, base commit, fork, fork commit, every change made and why, the notices kept, the build command, measured build size, the formats it opens and saves and the one ShareCraft stores, what works and what does not when opened from ShareCraft (from the browser checks, including anything not checked), and how to bring a fork up to date with its upstream (fetch, rebase <code>sharecraft</code>, rebuild, repeat the browser check, update <code>editors.toml</code>). State the dependency on storytold's egui, winit and <code>craft-libs</code> repositories as a risk, with the revisions used.</li>
+<li><code>BUILDING.html</code>: installing <code>trunk</code>; cloning and building the editors; the new settings; the file session, the seat and the save path; the content routes and their headers; the editor pages' policy and why it is built from hashes.</li>
+<li><code>scope.html</code>, new decisions with today's date and "proposed in this plan, approved by the owner on execution": <strong>D20</strong> the editors are served by ShareCraft from its own origin, inside a frame page ShareCraft owns; <strong>D21</strong> the forks are <code>ThineCraft/GridCraft</code>, <code>WordCraft</code>, <code>PdfCraft</code>, <code>SolidCraft</code>, each with a <code>sharecraft</code> branch on the base commits above. Bump the version. Update the open-decisions entry that lists fork names and the hosting model.</li>
+<li><code>sequencing.html</code>: the Stage 1 progress note, saying exactly which exit conditions are now met and which are not; if all are, say Stage 1 is complete except for what the note lists as unchecked.</li>
+</ul>
+<ol class="steps">
+<li>Write the documents from the ledger and the reports, not from this plan: where a browser check found something different, the document says what was found.</li>
+<li>Run <code>cargo xtask check</code>. Expected: passes.</li>
+<li>Commit: <code>docs: editors opened from ShareCraft, forks and provenance</code>.</li>
+</ol></div>
+
+<h2>Decisions made in this plan</h2>
+<p>These were not specified by the scope and were chosen here. Change them before execution if they are wrong.</p>
+<table><tr><th>Decision</th><th>Reason</th><th>If it is wrong</th></tr>
+<tr><td>ShareCraft serves the editors from its own origin (D20).</td><td>Three of the four editors switch their bridge on only for a same-origin parent. The alternative is changing that check in every fork.</td><td>The editors run with the signed-in person's rights on ShareCraft. They are code ThineCraft builds from its own forks, and the page policy stops injected script; a separate origin would be safer still and needs the fork change.</td></tr>
+<tr><td>Fork names <code>ThineCraft/GridCraft</code>, <code>WordCraft</code>, <code>PdfCraft</code>, <code>SolidCraft</code>; work on a <code>sharecraft</code> branch; default branch left equal to upstream (D21).</td><td>Matches the organization's other repositories. Keeping the default branch untouched makes updating from upstream a fetch and a rebase.</td><td>Renaming a GitHub repository is one setting; <code>editors.toml</code> is the only place the name is used.</td></tr>
+<tr><td>One editing seat per file; others read under a banner; the seat is not handed on automatically.</td><td>"A session of one" in the sequencing plan. Handing the seat to someone whose copy is old would let them overwrite newer work.</td><td>Stage 2 replaces the seat with co-authoring, editor by editor.</td></tr>
+<tr><td>The session runs over the existing WebSocket and access commands; bytes go over HTTP, and a save is accepted only by the room.</td><td>Keeps one path for removal and one for writing (D15), without pushing files of many megabytes through a message channel.</td><td>None foreseen; Stage 2's change messages use the socket as text does.</td></tr>
+<tr><td>Saving is on demand: the frame's Save button, or the editor's own Save.</td><td>See "does not cover". The frame concept's "no save button" describes co-authoring, where changes are sent as they happen.</td><td>A timer calling the same Save is a few lines in <code>file.js</code>.</td></tr>
+<tr><td>People without the seat get the full editor under a banner, not a locked one.</td><td>No editor has a view-only mode. Nothing they do can be stored.</td><td>Someone may type for a while before reading the banner. A view-only switch in each fork is the fix, planned with Stage 2.</td></tr>
+<tr><td>Stored formats: <code>.xlsx</code>, <code>.docx</code>, <code>.pdf</code>, and SolidCraft's JSON export as <code>.solidcraft.json</code>.</td><td>Each is what its editor's bridge hands over without loss of what the editor itself keeps. SolidCraft's bridge carries JSON text only.</td><td>Binary <code>.sc</code> files cannot be uploaded until the fork's bridge carries bytes.</td></tr>
+<tr><td>The person's name is passed to the editor in the frame's address (<code>?author=</code>).</td><td>It is the only way the editors accept it; they use it for comments. The address is same-origin and is not logged by the server.</td><td>It appears in the browser's history for that frame. A message-based way is a small fork change for later.</td></tr>
+<tr><td>Uploads create new documents only; files up to 64 MiB.</td><td>Replacing an open file's content by upload is an edit and belongs with libraries (Stage 2). The limit is a setting.</td><td>Raise <code>SHARECRAFT_MAX_FILE_BYTES</code>.</td></tr>
+<tr><td>Editor builds are made on this machine and git-ignored, not published.</td><td>Reproducible from <code>editors.toml</code>; hundreds of megabytes do not belong in Git.</td><td>A release process that publishes builds is a deployment matter.</td></tr>
+<tr><td>The editors' own menus are left as they are.</td><td>Open in the frame concept. Their Open and Save As still work and do no harm: Save As in the native format is treated as a save of this document; anything else is a download.</td><td>GridCraft already has <code>?chrome=nofiletab</code>; hiding menus is a query flag or a small fork change.</td></tr></table>
+</main></body></html>
