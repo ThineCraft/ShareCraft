@@ -794,6 +794,14 @@ impl TestClient {
         self.joined = false;
     }
 
+    /// Like [`TestClient::reconnect`], but the old socket stays open and is returned, so the
+    /// new connection replaces a live one.
+    pub async fn reconnect_keeping_old(&mut self) -> Option<Socket> {
+        let old = self.socket.take();
+        self.reconnect().await;
+        old
+    }
+
     /// Opens a new socket, joins with the room epoch and last applied sequence, and waits for
     /// `Joined` or `Reset`. After `Joined` the change in flight is resent (the server drops it
     /// if it was already committed); after `Reset` it has been discarded.

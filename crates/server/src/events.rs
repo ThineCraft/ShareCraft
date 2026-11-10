@@ -33,6 +33,13 @@ impl EventSink {
         Self { queue: Some(queue) }
     }
 
+    /// A sink and the receiver that reads what is emitted into it, for tests of rooms.
+    #[cfg(test)]
+    pub(crate) fn channel() -> (Self, mpsc::UnboundedReceiver<NewEvent>) {
+        let (queue, events) = mpsc::unbounded_channel();
+        (Self { queue: Some(queue) }, events)
+    }
+
     /// A sink that drops every event.
     pub(crate) fn discard() -> Self {
         Self { queue: None }

@@ -68,7 +68,10 @@ impl Db {
     /// The latest `limit` events about document `doc`, oldest first.
     pub async fn recent_events_for(&self, doc: DocId, limit: i64) -> Result<Vec<Event>, DbError> {
         let rows = sqlx::query(
-            "select id, at, kind, actor, subject, document_id, detail from (                  select id, at, kind, actor, subject, document_id, detail                  from events where document_id = $1 order by id desc limit $2              ) latest order by id",
+            "select id, at, kind, actor, subject, document_id, detail from ( \
+                 select id, at, kind, actor, subject, document_id, detail \
+                 from events where document_id = $1 order by id desc limit $2 \
+             ) latest order by id",
         )
         .bind(doc.0)
         .bind(limit)

@@ -5,7 +5,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use collab_core::ids::{DocId, UserId};
-use records::Role;
+use records::{Db, Role};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use time::OffsetDateTime;
@@ -155,6 +155,20 @@ pub(crate) async fn access(
     ))
 }
 
+/// Succeeds if `user` may manage `doc`: `NotFound` when they have no role on it, `Forbidden`
+/// when their role is lower.
+async fn require_owner(db: &Db, user: UserId, doc: DocId) -> Result<(), ApiError> {
+    match db
+        .role(user, doc)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?
+    {
+        None => Err(ApiError::NotFound),
+        Some(held) if !held.can_manage() => Err(ApiError::Forbidden),
+        Some(_) => Ok(()),
+    }
+}
+
 /// The body of `PUT /api/docs/{id}/access`.
 #[derive(Deserialize)]
 pub(crate) struct Share {
@@ -176,15 +190,7 @@ pub(crate) async fn share(
     let db = state.db();
     // The email is looked up only for someone who may manage access, so that nobody else can
     // learn which emails have accounts. The records layer decides again when it makes the change.
-    let held = db
-        .role(actor, doc)
-        .await
-        .map_err(|e| ApiError::unavailable(&e))?;
-    match held {
-        None => return Err(ApiError::NotFound),
-        Some(held) if !held.can_manage() => return Err(ApiError::Forbidden),
-        Some(_) => {}
-    }
+    require_owner(db, actor, doc).await?;
     let user = db
         .user_by_email(&share.email)
         .await
@@ -211,10 +217,10 @@ pub(crate) async fn unshare(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Most events  returns.
+/// Most events `GET /api/docs/{id}/events` returns.
 const MAX_EVENTS: i64 = 200;
 
-/// One row of .
+/// One row of `GET /api/docs/{id}/events`.
 #[derive(Serialize)]
 pub(crate) struct EventRow {
     id: i64,
@@ -233,15 +239,7 @@ pub(crate) async fn events(
 ) -> Result<Json<Vec<EventRow>>, ApiError> {
     let doc = DocId(parse_id(&id)?);
     let db = state.db();
-    let held = db
-        .role(signed.session.user.id, doc)
-        .await
-        .map_err(|e| ApiError::unavailable(&e))?;
-    match held {
-        None => return Err(ApiError::NotFound),
-        Some(held) if !held.can_manage() => return Err(ApiError::Forbidden),
-        Some(_) => {}
-    }
+    require_owner(db, signed.session.user.id, doc).await?;
     let events = db
         .recent_events_for(doc, MAX_EVENTS)
         .await

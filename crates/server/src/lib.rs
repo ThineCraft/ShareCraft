@@ -149,6 +149,7 @@ impl AppState {
 ///   signed-in account;
 /// - `GET /ws/docs/{doc_id}` opens a document session for a signed-in person with a role on
 ///   the document;
+/// - `GET /api/docs/{id}/events` lists a document's latest events, for its owners;
 /// - anything else is a static file from `web_dir`.
 pub fn router(state: AppState) -> Router {
     let files = ServeDir::new(&state.config().web_dir);

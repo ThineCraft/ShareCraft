@@ -34,6 +34,8 @@ fn count(events: &[Event], kind: &str) -> usize {
 struct Flaky {
     inner: RevisionStore,
     failures: AtomicUsize,
+    /// `describe` fails, so no revision can be recorded in the index.
+    describe_fails: bool,
 }
 
 impl Flaky {
@@ -42,6 +44,17 @@ impl Flaky {
             Arc::new(Flaky {
                 inner: RevisionStore::open(path).unwrap(),
                 failures: AtomicUsize::new(failures),
+                describe_fails: false,
+            })
+        }
+    }
+
+    fn unindexable() -> impl FnOnce(&std::path::Path) -> Arc<dyn server::Checkpointer> {
+        |path| {
+            Arc::new(Flaky {
+                inner: RevisionStore::open(path).unwrap(),
+                failures: AtomicUsize::new(0),
+                describe_fails: true,
             })
         }
     }
@@ -66,6 +79,9 @@ impl server::Checkpointer for Flaky {
         doc: DocId,
         revision: &RevisionId,
     ) -> Result<Option<RevisionInfo>, CheckpointError> {
+        if self.describe_fails {
+            return Err(CheckpointError::Git(GitError::new("index on fire")));
+        }
         self.inner.describe(doc, revision)
     }
 
@@ -112,16 +128,169 @@ async fn join_edit_save_and_leave_are_recorded_in_order() {
     assert_eq!(ours[2].detail, json!({}));
 }
 
+/// Asserts that for each person the presence events alternate, starting with a join, and end
+/// balanced: every `editing.joined` is followed by exactly one `editing.left` or
+/// `editing.removed` before the next join.
+fn assert_presence_pairs_up(events: &[Event]) {
+    let mut people: Vec<_> = events.iter().filter_map(|e| e.subject).collect();
+    people.sort_by_key(|u| u.0);
+    people.dedup();
+    for person in people {
+        let mut inside = false;
+        for e in events.iter().filter(|e| e.subject == Some(person)) {
+            match e.kind.as_str() {
+                "editing.joined" => {
+                    assert!(!inside, "joined twice in a row: {:?}", kinds(events));
+                    inside = true;
+                }
+                "editing.left" | "editing.removed" => {
+                    assert!(inside, "left without joining: {:?}", kinds(events));
+                    inside = false;
+                }
+                _ => {}
+            }
+        }
+        assert!(!inside, "never left: {:?}", kinds(events));
+    }
+}
+
+/// Waits for exactly `joined` and `left` presence events on `doc`, lets any more arrive, and
+/// checks the counts still hold.
+async fn settled_presence(
+    server: &common::TestServer,
+    doc: DocId,
+    joined: usize,
+    left: usize,
+) -> Vec<Event> {
+    wait_events(&server.db.db, doc, |e| {
+        count(e, "editing.joined") == joined && count(e, "editing.left") == left
+    })
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let events = server.db.db.events_for(doc).await.unwrap();
+    assert_eq!(
+        count(&events, "editing.joined"),
+        joined,
+        "{:?}",
+        kinds(&events)
+    );
+    assert_eq!(count(&events, "editing.left"), left, "{:?}", kinds(&events));
+    events
+}
+
 #[tokio::test]
-async fn reconnecting_with_resume_records_no_new_join() {
+async fn joins_and_leaves_pair_up_across_reconnects() {
+    let server = spawn_server().await;
+
+    // A new connection replaces the old one while it is still open: no extra events.
+    let doc = new_doc();
+    let mut ann = TestClient::connect(&server, doc, "Ann").await;
+    let old = ann.reconnect_keeping_old().await;
+    ann.close().await;
+    drop(old);
+    let events = settled_presence(&server, doc, 1, 1).await;
+    assert_presence_pairs_up(&events);
+
+    // The old connection ended first, and the client resumes: left, then joined again.
+    let doc = new_doc();
+    let mut bob = TestClient::connect(&server, doc, "Bob").await;
+    bob.disconnect();
+    wait_events(&server.db.db, doc, |e| count(e, "editing.left") == 1).await;
+    bob.reconnect().await;
+    assert!(
+        bob.received
+            .iter()
+            .all(|m| !matches!(m, protocol::ServerMsg::Reset { .. })),
+        "the resume was meant to be honoured"
+    );
+    bob.close().await;
+    let events = settled_presence(&server, doc, 2, 2).await;
+    assert_presence_pairs_up(&events);
+
+    // The old connection ended first, and the client's position is from another lifetime of
+    // the room, so it gets a Reset: left, then joined again.
+    let doc = new_doc();
+    let mut cy = TestClient::connect(&server, doc, "Cy").await;
+    cy.disconnect();
+    wait_events(&server.db.db, doc, |e| count(e, "editing.left") == 1).await;
+    cy.epoch = Some(protocol::RoomEpoch(uuid::Uuid::new_v4()));
+    cy.reconnect().await;
+    assert!(
+        cy.received
+            .iter()
+            .any(|m| matches!(m, protocol::ServerMsg::Reset { .. })),
+        "the resume was meant to be refused"
+    );
+    cy.close().await;
+    let events = settled_presence(&server, doc, 2, 2).await;
+    assert_presence_pairs_up(&events);
+}
+
+#[tokio::test]
+async fn a_stale_save_records_one_conflict_with_the_current_revision() {
     let server = spawn_server().await;
     let doc = new_doc();
     let mut ann = TestClient::connect(&server, doc, "Ann").await;
-    ann.reconnect().await;
-    ann.close().await;
+    ann.type_at(0, "abc").await;
+    ann.pump_until(|c| c.pending() == 0 && c.seq() == Seq(1))
+        .await;
+    let saved: RevisionId = ann.wait_saved(Seq(1)).await.parse().unwrap();
 
-    let events = wait_events(&server.db.db, doc, |e| count(e, "editing.left") >= 1).await;
-    assert_eq!(count(&events, "editing.joined"), 1, "{:?}", kinds(&events));
+    // Another writer saves the document behind the room's back.
+    let other = server
+        .store()
+        .checkpoint(&Checkpoint {
+            doc,
+            file_name: "other.txt",
+            bytes: b"other text",
+            base: Some(&saved),
+            authors: &[revisions::Author {
+                id: "someone-else".into(),
+                name: "Someone Else".into(),
+            }],
+            fields: &serde_json::Map::new(),
+        })
+        .unwrap();
+    let Outcome::Written(other) = other else {
+        panic!("expected a new revision");
+    };
+    ann.type_at(3, "!").await;
+    ann.pump_until(|c| c.pending() == 0 && c.seq() == Seq(2))
+        .await;
+
+    let events = wait_events(&server.db.db, doc, |e| count(e, "revision.conflict") == 1).await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let later = server.db.db.events_for(doc).await.unwrap();
+    assert_eq!(count(&later, "revision.conflict"), 1);
+    let conflict = events
+        .iter()
+        .find(|e| e.kind == "revision.conflict")
+        .unwrap();
+    assert_eq!(conflict.detail, json!({ "current": other.to_string() }));
+}
+
+#[tokio::test]
+async fn a_revision_that_cannot_be_indexed_records_an_index_failure() {
+    let server = spawn_server_with(Flaky::unindexable()).await;
+    let doc = new_doc();
+    let mut ann = TestClient::connect(&server, doc, "Ann").await;
+    ann.type_at(0, "abc").await;
+    ann.pump_until(|c| c.pending() == 0 && c.seq() == Seq(1))
+        .await;
+    ann.wait_saved(Seq(1)).await;
+
+    let events = wait_events(&server.db.db, doc, |e| {
+        count(e, "revision.index_failed") == 1
+    })
+    .await;
+    let failed = events
+        .iter()
+        .find(|e| e.kind == "revision.index_failed")
+        .unwrap();
+    assert_eq!(failed.actor, None);
+    assert_eq!(failed.subject, None);
+    let error = failed.detail["error"].as_str().unwrap();
+    assert!(error.contains("index on fire"), "{error}");
 }
 
 #[tokio::test]

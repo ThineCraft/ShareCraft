@@ -415,9 +415,9 @@ impl Room {
         let missed = resume
             .filter(|r| r.epoch == epoch)
             .and_then(|r| self.log.since(r.seq));
-        // Replacing one's own older connection, or resuming where one left off, is not a new
-        // arrival.
-        if !replaced && missed.is_none() {
+        // Replacing one's own live connection is not a new arrival. Anything else is, whether
+        // or not the resume is honoured: the person was away, and `editing.left` said so.
+        if !replaced {
             self.emit(
                 "editing.joined",
                 Some(user),
@@ -1231,6 +1231,43 @@ mod tests {
         }
         assert_eq!(room.members.len(), 1);
         assert_eq!(room.members[0].client, fast);
+    }
+
+    #[test]
+    fn dropped_member_is_recorded_as_having_left() {
+        let (events, mut recorded) = EventSink::channel();
+        let mut room = new_room().with_events(events);
+        let slow = ClientId(Uuid::from_u128(1));
+        let fast = ClientId(Uuid::from_u128(2));
+        let _slow_rx = join(&mut room, 1, slow);
+        let mut fast_rx = join(&mut room, 2, fast);
+        for n in 0..OUTBOUND_CAPACITY {
+            frames(&mut fast_rx);
+            let op_id = OpId(Uuid::from_u128(100 + n as u128));
+            let base = room.log.head();
+            let len = room.log.doc().len_chars();
+            room.handle(Command::Submit {
+                conn: 2,
+                client: fast,
+                op_id,
+                base,
+                op: TextOp::replace(len, len, 0, "x").unwrap(),
+            });
+        }
+        let mut kinds = Vec::new();
+        while let Ok(event) = recorded.try_recv() {
+            kinds.push((event.kind, event.subject));
+        }
+        let slow_user = Some(UserId(slow.0));
+        let fast_user = Some(UserId(fast.0));
+        assert_eq!(
+            kinds,
+            vec![
+                ("editing.joined", slow_user),
+                ("editing.joined", fast_user),
+                ("editing.left", slow_user),
+            ]
+        );
     }
 
     #[test]
