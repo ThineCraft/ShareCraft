@@ -76,3 +76,24 @@ select{padding:6px 8px;min-height:36px;background:var(--paper);border:1px solid 
 .share{padding:14px 16px;border-top:1px solid var(--line)}
 .share h2{font-size:13px;margin:0 0 8px}
 .msg:empty,.problem:empty{padding:0}
+/* the frame around an editor (file.html): the bar, one banner line, the editor filling the rest */
+body.full{padding:0;height:100vh;height:100dvh;overflow:hidden}
+.frame.full{max-width:none;height:100%;border:0;border-radius:0;display:flex;flex-direction:column}
+.frame.full>*{flex:none}
+.back{display:flex;align-items:center;gap:8px;padding:4px 8px 4px 2px;border-radius:7px;min-height:36px;font-size:12px;color:var(--muted);text-decoration:none}
+.back:hover{background:var(--soft)}
+.frame.full .doc{flex:0 1 auto;padding-left:10px;border-left:1px solid var(--line)}
+.frame.full .doc h1,.frame.full .doc span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.frame[data-state=view] .status{color:var(--muted)}
+.banner{display:flex;flex-wrap:wrap;align-items:center;gap:8px 14px;padding:10px 16px;font-size:13px;border-bottom:1px solid var(--line);background:var(--warn-bg);color:var(--warn-ink)}
+.banner.idle{padding:0;border:0}
+.banner .actions{display:flex;flex-wrap:wrap;gap:8px}
+.banner .button,.banner button{min-height:32px;padding:4px 10px;background:var(--paper)}
+.frame.full .share{max-height:50vh;overflow:auto;border-top:0;border-bottom:1px solid var(--line)}
+.frame.full .editor-area{flex:1 1 auto;min-height:0;display:flex;background:var(--bg)}
+.editor-area iframe{flex:1;display:block;width:100%;height:100%;border:0;background:var(--sheet)}
+@media (max-width:760px){
+ .back span:last-child{display:none}
+ .frame.full .doc span{display:none}
+ .back,.banner .button,.banner button{min-height:44px}
+}

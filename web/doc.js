@@ -2,16 +2,19 @@
 // moves frames between the socket and the client and reports what the person typed.
 
 import init, { Client } from './pkg/web_client.js';
-import { api, h, messageFor, requireMe, seg, showMessage } from './common.js';
+import {
+  MISSING_DOCUMENT as MISSING,
+  api,
+  messageFor,
+  removedMessage,
+  requireMe,
+  seg,
+  sharing,
+  showMessage,
+} from './common.js';
 
 const FIRST_DELAY = 500;
 const MAX_DELAY = 8000;
-const MISSING = 'This document does not exist, or you do not have access to it.';
-const REMOVED = Object.assign(Object.create(null), {
-  access_revoked: 'Your access to this document was removed.',
-  signed_out: 'You were signed out.',
-  account_disabled: 'Your account was disabled.',
-});
 const CONFLICT = 'This document was changed somewhere else. Copy anything you need, then reload.';
 
 const $ = (id) => document.getElementById(id);
@@ -39,9 +42,9 @@ let pendingClose = null; // a socket that closed during a composition, handled w
 let canEdit = false;   // the server says this person may change the text
 let removedReason = ''; // set once the server removed this page: no reconnecting
 // Declared here, before anything below runs: setRole() is called while the module is still
-// loading, and it reaches showAccess().
+// loading, and it reaches the Sharing panel.
 let roleCheck = 0;      // the latest role request; older answers are dropped
-let accessCheck = 0;    // the latest access-list request; older answers are dropped
+let share = null;       // the Sharing panel, once the document id is known
 let checking = false;   // a still-allowed check is in flight
 let closedBeforeJoin = 0; // closes in a row, before joining, while the document stayed open
 
@@ -54,10 +57,16 @@ if (!docId) {
   showProblem(MISSING);
   throw new Error('no document');
 }
+share = sharing(docId);
 const detail = await api('GET', `/docs/${seg(docId)}`);
 if (!detail.ok) {
   showProblem(detail.status === 404 ? MISSING : messageFor(detail.error));
   throw new Error(`cannot open the document (${detail.error})`);
+}
+if (detail.data.editor !== 'text') {
+  // A file document opens in its editor, on the frame page.
+  location.replace(`/file.html?doc=${seg(docId)}`);
+  await new Promise(() => {});
 }
 showDetail(detail.data);
 $('editor').hidden = false;
@@ -96,9 +105,7 @@ function showDetail(info) {
 
 // Owners get the Share panel; everyone else does not.
 function setRole(role) {
-  const owner = role === 'owner' && removedReason === '';
-  sharePanel.hidden = !owner;
-  if (owner) showAccess();
+  sharePanel.hidden = !(removedReason === '' && share.setRole(role));
 }
 
 // Asks the server what this person's role is now (their rights changed) and shows or hides
@@ -113,78 +120,6 @@ async function refreshRole() {
   } else {
     sharePanel.hidden = true;
   }
-}
-
-async function showAccess() {
-  const check = ++accessCheck;
-  const result = await api('GET', `/docs/${seg(docId)}/access`);
-  if (check !== accessCheck || removedReason) return;
-  if (!result.ok) {
-    shareMessage(messageFor(result.error), true);
-    return;
-  }
-  $('access').replaceChildren(
-    ...result.data.map(({ user, role }) => {
-      const select = h('select', { 'aria-label': `Role of ${user.name}` });
-      for (const value of ['viewer', 'editor', 'owner']) {
-        const option = h('option', { value }, value[0].toUpperCase() + value.slice(1));
-        option.selected = value === role;
-        select.append(option);
-      }
-      select.addEventListener('change', () => changeAccess(user.email, select.value));
-      const remove = h(
-        'button',
-        { type: 'button', class: 'plain', 'aria-label': `Remove ${user.name}` },
-        'Remove',
-      );
-      remove.addEventListener('click', () => removeAccess(user));
-      return h(
-        'li',
-        {},
-        h('span', { class: 'grow' }, user.name, h('br'), h('small', {}, user.email)),
-        select,
-        remove,
-      );
-    }),
-  );
-}
-
-async function changeAccess(email, role) {
-  shareMessage('', false);
-  const result = await api('PUT', `/docs/${seg(docId)}/access`, { email, role });
-  if (!result.ok) shareMessage(messageFor(result.error), true);
-  else shareMessage('Saved.', false);
-  await showAccess();
-}
-
-async function removeAccess(user) {
-  shareMessage('', false);
-  const result = await api('DELETE', `/docs/${seg(docId)}/access/${seg(user.id)}`);
-  if (!result.ok) shareMessage(messageFor(result.error), true);
-  else shareMessage(`${user.name} was removed.`, false);
-  await showAccess();
-}
-
-$('share-form').addEventListener('submit', async (event) => {
-  event.preventDefault();
-  const email = $('share-email').value.trim();
-  const result = await api('PUT', `/docs/${seg(docId)}/access`, {
-    email,
-    role: $('share-role').value,
-  });
-  if (result.ok) {
-    $('share-email').value = '';
-    shareMessage('Shared.', false);
-  } else {
-    shareMessage(messageFor(result.error), true);
-  }
-  await showAccess();
-});
-
-function shareMessage(text, isError) {
-  const line = $('share-status');
-  line.classList.toggle('ok', !isError);
-  showMessage(line, text);
 }
 
 // What the text box allows, from what the server last said. In conflict nothing typed can be
@@ -206,10 +141,8 @@ function stopRemoved(reason) {
   applyEditable();
   peopleList.replaceChildren();
   sharePanel.hidden = true;
-  accessCheck++;
+  share?.stop();
   roleCheck++;
-  $('access').replaceChildren();
-  shareMessage('', false);
   $('title').textContent = 'Document';
   $('docline').textContent = '';
   document.title = 'ShareCraft — Document';
@@ -501,7 +434,7 @@ function render() {
   if (!client) return;
   const n = client.pending();
   if (removedReason) {
-    setStatus('failed', REMOVED[removedReason] ?? 'Your access to this document ended.');
+    setStatus('failed', removedMessage(removedReason));
     return;
   }
   const waiting = `${n} ${n === 1 ? 'change' : 'changes'} waiting`;

@@ -19,10 +19,26 @@
  <h1>Documents</h1>
  <form id="new-doc" class="row">
   <div class="field">
-   <label for="doc-name">New document name (optional)</label>
+   <label for="doc-kind">Kind</label>
+   <select id="doc-kind">
+    <option value="text" selected>Text document</option>
+    <option value="gridcraft">Spreadsheet (.xlsx)</option>
+    <option value="wordcraft">Document (.docx)</option>
+    <option value="solidcraft">Design (.solidcraft.json)</option>
+   </select>
+  </div>
+  <div class="field">
+   <label for="doc-name">Name (optional)</label>
    <input type="text" id="doc-name" maxlength="120" autocomplete="off">
   </div>
-  <button type="submit">New document</button>
+  <button type="submit">New</button>
+ </form>
+ <form id="upload-doc" class="row">
+  <div class="field">
+   <label for="upload-file">Upload a file (.xlsx, .docx, .pdf or .solidcraft.json)</label>
+   <input type="file" id="upload-file" accept=".xlsx,.docx,.pdf,.json" required>
+  </div>
+  <button type="submit">Upload</button>
  </form>
  <p id="error" role="alert" class="msg"></p>
  <h2>Your documents</h2>
