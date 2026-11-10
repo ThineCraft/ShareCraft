@@ -321,4 +321,23 @@ mod tests {
         assert_eq!(split_path("/editors/gridcraft"), Some(("gridcraft", "")));
         assert_eq!(split_path("/other"), None);
     }
+
+    /// The manifest `cargo xtask editors build` writes (a fixture shared with xtask's tests) is
+    /// accepted by the server.
+    #[test]
+    fn the_manifest_xtask_writes_is_accepted() {
+        let folder = std::env::temp_dir().join(format!("manifest-fixture-{}", std::process::id()));
+        let editor = folder.join("gridcraft");
+        std::fs::create_dir_all(&editor).unwrap();
+        std::fs::write(
+            editor.join(MANIFEST),
+            include_str!("../../../xtask/tests/fixtures/editor.json"),
+        )
+        .unwrap();
+        let manifest = read_manifest(&editor, "gridcraft");
+        std::fs::remove_dir_all(&folder).unwrap();
+        let manifest = manifest.unwrap();
+        assert_eq!(manifest.id, "gridcraft");
+        assert_eq!(manifest.script_hashes.len(), 1);
+    }
 }

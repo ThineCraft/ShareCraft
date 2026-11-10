@@ -1,0 +1,19 @@
+{
+  "built": "2026-11-10",
+  "fork": {
+    "commit": "1111111111111111111111111111111111111111",
+    "repository": "https://github.com/ThineCraft/GridCraft"
+  },
+  "id": "gridcraft",
+  "script_hashes": [
+    "sha256-O5JTT//82Kx49BrvVhdpg+8xboXFwBQ1Tq7v8lYWyX4="
+  ],
+  "style_hashes": [
+    "sha256-IAdwN3biDCQ3brrgp1m8kBEsPQYyqfREKOEfeoREopc="
+  ],
+  "upstream": {
+    "commit": "e9addf52fe68847e6c1310fcfa5d42b7aa8b9650",
+    "repository": "https://github.com/storytold/gridcraft"
+  },
+  "version": "0.3.1"
+}

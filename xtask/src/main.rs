@@ -2,8 +2,12 @@
 //!
 //! - `web` builds the browser client for WebAssembly and writes the page's package to `web/pkg`;
 //! - `check` loads `.env`, then runs the licence check, formatting, lints, tests, the
-//!   WebAssembly builds and the page script tests (with Node);
-//! - `test` loads `.env`, then runs `cargo test` with the arguments given.
+//!   WebAssembly builds, the page script tests (with Node) and the check of installed editors;
+//! - `test` loads `.env`, then runs `cargo test` with the arguments given;
+//! - `editors <list|build|verify>` builds an editor from its fork and installs it into
+//!   `editors/<id>`.
+
+mod editors;
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -21,7 +25,8 @@ fn main() -> ExitCode {
         Some("web") => web(),
         Some("check") => check(),
         Some("test") => test(std::env::args_os().skip(2)),
-        _ => Err("usage: cargo xtask <web|check|test>".to_owned()),
+        Some("editors") => editors::dispatch(&std::env::args().skip(2).collect::<Vec<_>>()),
+        _ => Err("usage: cargo xtask <web|check|test|editors>".to_owned()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -114,6 +119,8 @@ fn check() -> Result<()> {
         run(cargo(&root).args(["build", "-p", krate, "--target", WASM_TARGET]))?;
     }
     check_page_scripts(&root)?;
+    // Only editors that are installed are checked; a machine with none passes.
+    editors::verify_installed(&root)?;
     println!("xtask: all checks passed");
     Ok(())
 }

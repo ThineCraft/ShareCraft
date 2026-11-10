@@ -1,0 +1,38 @@
+# One table per editor: the record of what ShareCraft is built against.
+# `commit` is the fork commit last built and checked; it is empty until it is recorded.
+
+[gridcraft]
+upstream = "https://github.com/storytold/gridcraft"
+base     = "e9addf52fe68847e6c1310fcfa5d42b7aa8b9650"
+fork     = "https://github.com/ThineCraft/GridCraft"
+branch   = "sharecraft"
+commit   = ""
+app      = "apps/gridcraft-web"
+checkout = "../GridCraft"
+
+[wordcraft]
+upstream = "https://github.com/storytold/wordcraft"
+base     = "2922fe566b575794f896077467cf92825ccba7c9"
+fork     = "https://github.com/ThineCraft/WordCraft"
+branch   = "sharecraft"
+commit   = ""
+app      = "apps/wordcraft-web"
+checkout = "../WordCraft"
+
+[pdfcraft]
+upstream = "https://github.com/storytold/pdfcraft"
+base     = "a71b5124bc388e6b86ec0ee5ec16d31fa1955117"
+fork     = "https://github.com/ThineCraft/PdfCraft"
+branch   = "sharecraft"
+commit   = ""
+app      = "apps/pdfcraft-web"
+checkout = "../PdfCraft"
+
+[solidcraft]
+upstream = "https://github.com/tangency-labs/solidcraft"
+base     = "f232e4a40c9d1d3088c758e393b7db43048eac22"
+fork     = "https://github.com/ThineCraft/SolidCraft"
+branch   = "sharecraft"
+commit   = ""
+app      = "apps/solidcraft-web"
+checkout = "../SolidCraft"
