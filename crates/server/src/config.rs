@@ -3,7 +3,6 @@
 use std::fmt;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 /// Address used when `SHARECRAFT_ADDR` is not set.
@@ -12,24 +11,6 @@ pub const DEFAULT_ADDR: &str = "127.0.0.1:8787";
 pub const DEFAULT_DATA: &str = "./data";
 /// Static file directory used when `SHARECRAFT_WEB` is not set.
 pub const DEFAULT_WEB: &str = "./web";
-/// How long one write to a client's socket may take before the connection is dropped, in
-/// milliseconds: 10 seconds. Only tests change it.
-static WRITE_TIMEOUT_MS: AtomicU64 = AtomicU64::new(10_000);
-
-/// How long one write to a client's socket may take. A client that stopped reading would
-/// otherwise keep its connection task, and its place in the room, forever.
-pub(crate) fn write_timeout() -> Duration {
-    Duration::from_millis(WRITE_TIMEOUT_MS.load(Ordering::Relaxed))
-}
-
-/// For tests only: shortens (or restores, with 10_000 milliseconds) the limit on a write for every connection in
-/// this process. The setting is process-wide, so a test binary that uses it should not run
-/// tests that need the default beside it.
-#[doc(hidden)]
-pub fn set_write_timeout_for_test(timeout: Duration) {
-    let millis = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
-    WRITE_TIMEOUT_MS.store(millis, Ordering::Relaxed);
-}
 
 /// How the server runs.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,6 +28,10 @@ pub struct Config {
     /// How long a document's room stays open after its last participant leaves, so a browser
     /// that reconnects within this time resumes where it left off.
     pub room_grace: Duration,
+    /// How long one write to a client's socket may take before the connection is dropped. A
+    /// client that stopped reading would otherwise keep its connection task, and its place in
+    /// the room, forever.
+    pub write_timeout: Duration,
     /// The PostgreSQL database holding accounts, sessions and access grants.
     pub database_url: DatabaseUrl,
 }
@@ -133,6 +118,7 @@ impl Config {
             checkpoint_idle: Duration::from_secs(2),
             checkpoint_max: Duration::from_secs(30),
             room_grace: Duration::from_secs(60),
+            write_timeout: Duration::from_secs(10),
             database_url,
         })
     }
@@ -200,6 +186,7 @@ mod tests {
         assert_eq!(c.checkpoint_idle, Duration::from_secs(2));
         assert_eq!(c.checkpoint_max, Duration::from_secs(30));
         assert_eq!(c.room_grace, Duration::from_secs(60));
+        assert_eq!(c.write_timeout, Duration::from_secs(10));
     }
 
     #[test]

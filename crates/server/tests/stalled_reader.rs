@@ -5,8 +5,7 @@
     clippy::indexing_slicing
 )]
 //! A client that stops reading must not hold its connection, and so its place in the room,
-//! forever. This file has its own test binary because it shortens the socket write timeout for
-//! every connection in the process.
+//! forever.
 
 mod common;
 
@@ -27,9 +26,9 @@ const CHANGES: usize = 80;
 
 #[tokio::test]
 async fn stalled_reader_is_dropped() {
-    server::config::set_write_timeout_for_test(WRITE_TIMEOUT);
     // Nothing is saved while the test types: saving megabytes of text is not what is tested.
     let server = spawn_server_config(|c| {
+        c.write_timeout = WRITE_TIMEOUT;
         c.checkpoint_idle = Duration::from_secs(600);
         c.checkpoint_max = Duration::from_secs(600);
     })

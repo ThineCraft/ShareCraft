@@ -1707,7 +1707,13 @@ mod tests {
         });
         let got = frames(&mut rx);
         assert!(
-            matches!(got.as_slice(), [ServerMsg::Access { can_edit: true }, ServerMsg::People { .. }]),
+            matches!(
+                got.as_slice(),
+                [
+                    ServerMsg::Access { can_edit: true },
+                    ServerMsg::People { .. }
+                ]
+            ),
             "{got:?}"
         );
 
@@ -1718,7 +1724,13 @@ mod tests {
         });
         let got = frames(&mut rx);
         assert!(
-            matches!(got.as_slice(), [ServerMsg::Access { can_edit: true }, ServerMsg::People { .. }]),
+            matches!(
+                got.as_slice(),
+                [
+                    ServerMsg::Access { can_edit: true },
+                    ServerMsg::People { .. }
+                ]
+            ),
             "{got:?}"
         );
 

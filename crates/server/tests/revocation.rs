@@ -743,4 +743,3 @@ async fn access_ended_during_join_is_caught() {
     .await;
     assert!(dan.removed.is_none() && !dan.closed);
 }
-

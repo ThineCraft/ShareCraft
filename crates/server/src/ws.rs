@@ -21,7 +21,6 @@ use uuid::Uuid;
 use crate::AppState;
 use crate::api::ApiError;
 use crate::auth::{Signed, same_origin};
-use crate::config::write_timeout;
 use crate::room::{Command, ConnId, JoinReply, OUTBOUND_CAPACITY, Outbound, RoomLink};
 
 /// Largest frame or message accepted from a client.
@@ -32,8 +31,7 @@ const JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 const CLOSE_WAIT: Duration = Duration::from_secs(2);
 /// How often a join is retried when the room it found was just ending.
 const JOIN_ATTEMPTS: usize = 3;
-// How long one write to the socket may take is `config::write_timeout()`, 10 seconds unless a
-// test shortens it.
+// How long one write to the socket may take is `Config::write_timeout`.
 
 /// Why the relay ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -122,6 +120,7 @@ type Stream = SplitStream<WebSocket>;
 
 async fn connection(state: AppState, doc: DocId, visitor: Visitor, socket: WebSocket) {
     let (mut sink, mut stream) = socket.split();
+    let limit = state.config().write_timeout;
     let mut stalled = false;
     // The queue of a connection removed right after its join: never read, so that nothing the
     // room queued for it (its snapshot above all) reaches the client. Kept until the
@@ -136,15 +135,24 @@ async fn connection(state: AppState, doc: DocId, visitor: Visitor, socket: WebSo
                         session: visitor.session,
                         at: deadline(visitor.expires_at, OffsetDateTime::now_utc()),
                     };
-                    let ended =
-                        relay(&mut sink, &mut stream, &room, out_rx, conn, client, ends).await;
+                    let ended = relay(
+                        &mut sink,
+                        &mut stream,
+                        &room,
+                        out_rx,
+                        conn,
+                        client,
+                        ends,
+                        limit,
+                    )
+                    .await;
                     stalled = ended == Ended::WriteTimedOut;
                 }
                 Recheck::Removed(reason) => {
                     _unread = Some(out_rx);
                     let removed = ServerMsg::<TextOp>::Removed { reason };
                     if let Ok(frame) = serde_json::to_string(&removed) {
-                        let written = write(&mut sink, Outbound::One(frame.into())).await;
+                        let written = write(&mut sink, Outbound::One(frame.into()), limit).await;
                         stalled = matches!(written, Err(WriteError::TimedOut));
                     }
                 }
@@ -161,7 +169,7 @@ async fn connection(state: AppState, doc: DocId, visitor: Visitor, socket: WebSo
         return;
     }
     // The client may already be gone; there is nothing more to do either way.
-    let _ = tokio::time::timeout(write_timeout(), sink.send(Message::Close(None))).await;
+    let _ = tokio::time::timeout(limit, sink.send(Message::Close(None))).await;
     // Read until the client answers the close. Frames it sent meanwhile are then consumed: left
     // unread, they make the transport reset the connection, which can discard the frames just
     // written to the client, such as `Removed`.
@@ -320,7 +328,9 @@ fn deadline(expires_at: OffsetDateTime, now: OffsetDateTime) -> Option<Instant> 
 
 /// Moves frames between the socket and the room until either side ends the connection. When
 /// the session expires, asks the room to end the session's connections; the room then queues
-/// `Removed { signed_out }` and lets go, which ends this loop once the frame is written.
+/// `Removed { signed_out }` and lets go, which ends this loop once the frame is written. Each
+/// write has `limit` to finish.
+#[allow(clippy::too_many_arguments)]
 async fn relay(
     sink: &mut Sink,
     stream: &mut Stream,
@@ -329,6 +339,7 @@ async fn relay(
     conn: ConnId,
     client: ClientId,
     mut ends: Ending,
+    limit: Duration,
 ) -> Ended {
     loop {
         tokio::select! {
@@ -336,7 +347,7 @@ async fn relay(
                 // `None`: the room dropped, replaced or removed this connection, after every
                 // frame it queued (such as `Removed`) has been written.
                 let Some(out) = out else { return Ended::Normally };
-                match write(sink, out).await {
+                match write(sink, out, limit).await {
                     Ok(()) => {}
                     Err(WriteError::TimedOut) => return Ended::WriteTimedOut,
                     Err(WriteError::Socket) => return Ended::Normally,
@@ -388,17 +399,16 @@ async fn sleep_until(at: Option<Instant>) {
 
 /// Why a frame could not be written.
 enum WriteError {
-    /// The socket did not take the frame within [`write_timeout`].
+    /// The socket did not take the frame within the time allowed.
     TimedOut,
     /// The socket failed.
     Socket,
 }
 
-/// Writes `out` to the socket. Each step (a frame, the final flush) has [`write_timeout`] to
+/// Writes `out` to the socket. Each step (a frame, the final flush) has `limit` to
 /// finish, so a client that stopped reading cannot hold this task, and with it a place in the
 /// room, forever.
-async fn write(sink: &mut Sink, out: Outbound) -> Result<(), WriteError> {
-    let limit = write_timeout();
+async fn write(sink: &mut Sink, out: Outbound, limit: Duration) -> Result<(), WriteError> {
     async fn step(
         limit: Duration,
         done: impl std::future::Future<Output = Result<(), axum::Error>>,

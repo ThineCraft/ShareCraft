@@ -1,8 +1,8 @@
 //! Project tasks, run as `cargo xtask <task>`:
 //!
 //! - `web` builds the browser client for WebAssembly and writes the page's package to `web/pkg`;
-//! - `check` loads `.env`, then runs the licence check, formatting, lints, tests and the
-//!   WebAssembly builds;
+//! - `check` loads `.env`, then runs the licence check, formatting, lints, tests, the
+//!   WebAssembly builds and the page script tests (with Node);
 //! - `test` loads `.env`, then runs `cargo test` with the arguments given.
 
 use std::ffi::OsString;
@@ -113,8 +113,43 @@ fn check() -> Result<()> {
     for krate in WASM_CRATES {
         run(cargo(&root).args(["build", "-p", krate, "--target", WASM_TARGET]))?;
     }
+    check_page_scripts(&root)?;
     println!("xtask: all checks passed");
     Ok(())
+}
+
+/// Runs the tests of the page scripts, `web/*.test.mjs`, with Node. Fails, never skips, when
+/// Node is not installed.
+fn check_page_scripts(root: &Path) -> Result<()> {
+    let web = root.join("web");
+    let entries =
+        std::fs::read_dir(&web).map_err(|e| format!("cannot list {}: {e}", web.display()))?;
+    let mut files = Vec::new();
+    for entry in entries {
+        let path = entry
+            .map_err(|e| format!("cannot list {}: {e}", web.display()))?
+            .path();
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".test.mjs"))
+        {
+            files.push(path);
+        }
+    }
+    files.sort();
+    let found = Command::new("node").arg("--version").output();
+    if !found.is_ok_and(|out| out.status.success()) {
+        return Err(
+            "Node.js is not installed or not on the path; the page script tests \
+                    (web/*.test.mjs) need it. Install Node.js and run the check again."
+                .to_owned(),
+        );
+    }
+    run(Command::new("node")
+        .current_dir(root)
+        .arg("--test")
+        .args(&files))
 }
 
 /// Fails naming every package outside this workspace whose licence is not allowed.
@@ -137,10 +172,9 @@ fn check_licences(root: &Path) -> Result<()> {
         Ok(())
     } else {
         Err(format!(
-            "these packages have a licence that is not allowed (no GPL, LGPL, AGPL, MPL, EUPL,              CDDL or SSPL):
-  {}",
-            refused.join("
-  ")
+            "these packages have a licence that is not allowed (no GPL, LGPL, AGPL, MPL, EUPL, \
+             CDDL or SSPL):\n  {}",
+            refused.join("\n  ")
         ))
     }
 }

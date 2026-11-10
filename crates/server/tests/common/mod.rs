@@ -298,6 +298,7 @@ fn config_at(data_dir: &Path, db: &TestDb) -> Config {
         checkpoint_idle: Duration::from_millis(100),
         checkpoint_max: Duration::from_secs(30),
         room_grace: LONG_GRACE,
+        write_timeout: Duration::from_secs(10),
         database_url: server::config::DatabaseUrl::new(db.url()),
     }
 }

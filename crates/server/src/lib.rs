@@ -164,14 +164,16 @@ async fn security_headers(request: Request, next: Next) -> Response {
 /// repository under `config.data_dir` (see [`library_path`]) and records in the database at
 /// `config.database_url`, whose schema it brings up to date first. Before accepting
 /// connections it reconciles the revisions recorded in the database with Git (see
-/// [`reconcile`]) and prints one line with the counts.
+/// [`reconcile`]) and prints one line with the counts. Once ready, it prints the address it
+/// listens on and that it runs in development mode, then accepts connections.
 ///
 /// # Errors
 /// Returns an error if the listener is not on a loopback address, if the database cannot be
 /// reached or migrated, if the library repository cannot be opened, created or listed, or if
 /// accepting connections fails.
 pub async fn serve(config: Config, listener: TcpListener) -> std::io::Result<()> {
-    require_loopback(listener.local_addr()?)?;
+    let addr = listener.local_addr()?;
+    require_loopback(addr)?;
     let db = Db::connect(config.database_url.expose())
         .await
         .map_err(|e| std::io::Error::other(format!("cannot connect to the database: {e}")))?;
@@ -196,6 +198,8 @@ pub async fn serve(config: Config, listener: TcpListener) -> std::io::Result<()>
             doc.0
         );
     }
+    println!("ShareCraft server listening on http://{addr}");
+    println!("WARNING: development mode, local connections only");
     serve_state(AppState::new(config, store, db), listener).await
 }
 

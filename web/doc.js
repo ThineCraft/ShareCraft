@@ -183,9 +183,11 @@ function shareMessage(text, isError) {
   showMessage(line, text);
 }
 
-// What the text box allows, from what the server last said.
+// What the text box allows, from what the server last said. In conflict nothing typed can be
+// kept, so nothing can be typed.
 function applyEditable() {
-  area.readOnly = !(everJoined && canEdit) || removedReason !== '';
+  area.readOnly =
+    !(everJoined && canEdit) || removedReason !== '' || save?.state === 'conflict';
   readonlyNote.hidden = canEdit || !everJoined || removedReason !== '';
 }
 
@@ -267,14 +269,35 @@ function closed(ws) {
 
 // A reconnect that fails before joining may mean the access or session is gone.
 let checking = false;
+let closedBeforeJoin = 0; // closes in a row, before joining, while the document stayed open
 async function checkStillAllowed() {
   if (checking) return;
   checking = true;
   const result = await api('GET', `/docs/${seg(docId)}`); // 401 goes to the sign-in page
   checking = false;
-  if (removedReason || result.ok || result.status !== 404) return;
+  if (removedReason) return;
+  if (result.ok && ++closedBeforeJoin >= 2) startOver();
+  if (result.ok || result.status !== 404) return;
   stopRemoved('missing');
   showProblem(MISSING);
+}
+
+// The server keeps closing the connection before the join although this person may open the
+// document: the room refuses this page's client id, which another account used there first.
+// Start again with a fresh client, as after a reset: the text comes again from the server, and
+// typing it had not accepted is not kept.
+function startOver() {
+  closedBeforeJoin = 0;
+  const n = client.pending();
+  client.free();
+  client = new Client();
+  everJoined = false;
+  area.value = '';
+  shown = '';
+  save = null;
+  applyEditable();
+  if (n > 0) notice = `${n} ${n === 1 ? 'change' : 'changes'} could not be kept.`;
+  render();
 }
 
 function send(message) {
@@ -297,6 +320,7 @@ function handleFrame(data) {
     joined = true;
     lost = false;
     delay = FIRST_DELAY;
+    closedBeforeJoin = 0;
   }
   if (update.removed != null) {
     stopRemoved(update.removed);
@@ -307,11 +331,11 @@ function handleFrame(data) {
   const firstJoin = !everJoined;
   everJoined = true;
   if (update.can_edit != null) canEdit = update.can_edit;
+  if (update.save) save = update.save;
   applyEditable();
   // Their rights changed while the page was open: the Share panel may have to appear or go.
   if (update.can_edit != null && !firstJoin) refreshRole();
   if (update.people) showPeople(update.people);
-  if (update.save) save = update.save;
   const n = update.dropped;
   const changes = `${n} ${n === 1 ? 'change' : 'changes'}`;
   if (update.reset === 'reopened_lost_text') {

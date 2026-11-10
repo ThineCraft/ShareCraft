@@ -298,6 +298,7 @@ mod tests {
             checkpoint_idle: Duration::from_secs(600),
             checkpoint_max: Duration::from_secs(600),
             room_grace: Duration::from_secs(60),
+            write_timeout: Duration::from_secs(10),
             database_url: DatabaseUrl::new(test.url()),
         };
         let store = RevisionStore::open(&crate::library_path(dir)).unwrap();
@@ -350,7 +351,10 @@ mod tests {
             if db.role(bob, doc).await.unwrap().is_none() {
                 break;
             }
-            assert!(tokio::time::Instant::now() < deadline, "the grant was never deleted");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the grant was never deleted"
+            );
         }
         // The caller goes away.
         drop(request);

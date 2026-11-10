@@ -88,9 +88,7 @@ async fn run_server() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let addr = listener.local_addr().unwrap_or(config.addr);
-    println!("ShareCraft server listening on http://{addr}");
-    println!("WARNING: development mode, local connections only");
+    // `serve` says where it listens once the database is ready and the revisions reconciled.
     match serve(config, listener).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
