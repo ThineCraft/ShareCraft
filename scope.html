@@ -1,80 +1,159 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="Authoritative project scope and AI onboarding brief for ShareCraft.">
-  <title>ShareCraft — Scope of Work</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="ShareCraft scope of works: SharePoint baseline, broader ThineCraft capabilities, integrations, delivery and acceptance.">
+<title>ShareCraft — Scope of Works</title>
+<style>
+:root{--ink:#172f38;--muted:#536b72;--line:#d7e2e3;--accent:#086959;--paper:#fff;--wash:#f2f6f5;font-family:Segoe UI,Arial,sans-serif;color:var(--ink);background:var(--wash);line-height:1.65}
+*{box-sizing:border-box}body{margin:0}a{color:var(--accent);text-underline-offset:3px}a:focus-visible,button:focus-visible{outline:3px solid #b66e00;outline-offset:4px}.skip{position:absolute;left:1rem;top:-5rem;background:white;padding:1rem;z-index:20}.skip:focus{top:1rem}
+.cover{background:#123e3b;color:#fff;padding:66px max(24px,calc((100vw - 1160px)/2));border-bottom:8px solid #71d8b5}.eyebrow{text-transform:uppercase;letter-spacing:.17em;font-size:.76rem;font-weight:700;color:#a7e7d1}.cover h1{font-size:clamp(3.1rem,7vw,5.7rem);letter-spacing:-.055em;line-height:1.05;margin:18px 0}.cover .lede{font-size:1.25rem;max-width:770px;color:#e0eee9}.meta{display:flex;flex-wrap:wrap;gap:10px 28px;color:#c4ded5;font-size:.88rem}.layout{display:grid;grid-template-columns:225px minmax(0,1fr);gap:48px;max-width:1210px;margin:auto;padding:40px 25px 80px}nav{position:sticky;top:24px;align-self:start;max-height:90vh;overflow:auto;font-size:.88rem}nav p{font-weight:700;margin:0 0 12px}nav a{display:block;padding:7px 0;text-decoration:none;color:var(--muted)}nav a:hover{color:var(--accent)}main{min-width:0}section{scroll-margin-top:25px;margin:0 0 38px}h2{font-size:1.7rem;line-height:1.25;letter-spacing:-.025em;margin:0 0 18px}h3{font-size:1.13rem;line-height:1.4;margin:0 0 12px}p{margin:0 0 16px}.note{padding:20px 23px;border-left:4px solid var(--accent);background:#e5f0ec}.note p:last-child{margin-bottom:0}.cards{display:grid;gap:17px}.module{background:var(--paper);padding:25px;border:1px solid var(--line);border-radius:9px;break-inside:avoid}.tag{display:inline-block;font-size:.7rem;letter-spacing:.05em;text-transform:uppercase;border-radius:4px;padding:3px 7px;background:#e2f1e9;color:#155438;margin:0 0 12px}.proposal{background:#fff0d5;color:#775110}.integration{background:#e8ecfb;color:#344e91}ul,ol{padding-left:22px;margin:0}li{margin:0 0 9px}li:last-child{margin-bottom:0}.rid{font-weight:700;color:var(--accent);font-size:.85em;white-space:nowrap}table{border-collapse:collapse;width:100%;font-size:.91rem;background:white}th,td{border:1px solid var(--line);padding:12px 14px;text-align:left;vertical-align:top}th{background:#e8efed}caption{text-align:left;font-weight:700;padding:0 0 10px}.table-wrap{overflow-x:auto}.small{font-size:.88rem;color:var(--muted)}.rule{border-top:1px solid var(--line);padding-top:28px}.toolbar{display:flex;justify-content:space-between;align-items:center;gap:20px;margin-bottom:26px}button{background:var(--accent);color:white;border:0;border-radius:5px;padding:10px 15px;font:inherit;cursor:pointer}footer{border-top:1px solid var(--line);padding-top:22px;font-size:.86rem;color:var(--muted)}
+@media(max-width:850px){.layout{grid-template-columns:1fr;gap:28px}nav{position:static;max-height:none;display:flex;flex-wrap:wrap;gap:3px 18px;border-bottom:1px solid var(--line);padding-bottom:20px}nav p{width:100%;margin-bottom:0}.cover{padding:40px 25px}.module{padding:20px}}
+@media print{@page{size:A4;margin:17mm}html,body{background:white;font-size:10pt}.cover{padding:12mm 0;background:white;color:var(--ink);border-bottom:3px solid var(--accent)}.cover h1{font-size:42pt}.cover .lede,.meta,.eyebrow{color:var(--ink)}.layout{display:block;padding:10mm 0;margin:0;max-width:none}nav,.toolbar button,.skip{display:none}.module{border-radius:0;padding:5mm}.note{background:#f4f4f4}h2,h3{break-after:avoid}a{color:inherit}section{margin-bottom:8mm}tr{break-inside:avoid}.table-wrap{overflow:visible}}
+</style>
 </head>
-<body data-project="ShareCraft" data-status="placeholder">
-  <main>
-    <header>
-      <p>ThineCraft project scope</p>
-      <h1>ShareCraft</h1>
-      <p><strong>Status:</strong> Placeholder project. This document describes intended direction; it does not claim that working functionality exists.</p>
-      <p><a href="https://share.thinecraft.io">Project website</a></p>
-    </header>
-
-    <section id="purpose">
-      <h2>Purpose</h2>
-      <p>ShareCraft is the planned open-source SharePoint alternative and shared-content foundation of the ThineCraft family. It is intended to help organizations publish, govern, search, collaborate on, and retain ownership of organizational knowledge.</p>
-    </section>
-
-    <section id="confirmed-direction">
-      <h2>Confirmed direction</h2>
-      <ul>
-        <li>Team sites, communication sites, intranets, departmental portals, pages, news, and navigation.</li>
-        <li>Document libraries with folders, managed metadata, versions, search, permissions, sharing, retention, auditability, and governance.</li>
-        <li>Lists for structured information, lightweight tracking, and operational records.</li>
-        <li>Controlled public submission surfaces that can receive records without exposing private workspaces.</li>
-        <li>Workflow and integration points for FlowCraft and other compatible systems.</li>
-        <li>Presence and co-authoring support for WordCraft, GridCraft, PdfCraft, SolidCraft, DeckCraft, and future compatible applications.</li>
-        <li>Portable data, open interfaces, hosted deployment, self-hosting, and hybrid continuity.</li>
-      </ul>
-    </section>
-
-    <section id="boundaries">
-      <h2>Boundaries and non-goals</h2>
-      <ul>
-        <li>ShareCraft is a general SharePoint replacement, not an event-specific product.</li>
-        <li>ThineWedding, ThineMemorial, and ThineCapture are services built on ShareCraft; they are not separate ShareCraft core projects and do not define its architecture.</li>
-        <li>Document editors and CAD tools remain separate applications. ShareCraft provides shared content, identity, governance, presence, and co-authoring infrastructure.</li>
-        <li>No implementation, compatibility level, release date, or production readiness is currently promised.</li>
-      </ul>
-    </section>
-
-    <section id="integrations">
-      <h2>Expected integrations</h2>
-      <ul>
-        <li>DriveCraft for synchronization, migration, metadata visibility, and offline continuity.</li>
-        <li>FlowCraft for inspectable workflows, approvals, and integrations.</li>
-        <li>TeamCraft, GanttCraft, ShowCraft, and FormCraft for context-linked collaboration.</li>
-        <li>WordCraft, GridCraft, PdfCraft, SolidCraft, and DeckCraft for co-authoring.</li>
-        <li>Microsoft SharePoint and Microsoft Graph where migration or interoperability requires them.</li>
-      </ul>
-    </section>
-
-    <section id="open-decisions">
-      <h2>Open decisions</h2>
-      <ul>
-        <li>Identity, tenancy, permissions, federation, and policy model.</li>
-        <li>Canonical content, metadata, versioning, search, and event schemas.</li>
-        <li>Storage architecture and the division between hosted, self-hosted, and hybrid services.</li>
-        <li>Co-authoring protocol, conflict resolution, presence, and offline reconciliation.</li>
-        <li>Migration guarantees and compatibility boundaries with Microsoft 365.</li>
-      </ul>
-    </section>
-
-    <section id="ai-guidance">
-      <h2>Guidance for AI contributors</h2>
-      <ol>
-        <li>Treat this file as the current product-scope authority and the README as a concise introduction.</li>
-        <li>Keep planned capabilities labeled as planned until code and verification demonstrate otherwise.</li>
-        <li>Do not narrow ShareCraft around ThineWedding, ThineMemorial, ThineCapture, or any single service.</li>
-        <li>Prefer open formats, portable records, inspectable behavior, and organization-controlled infrastructure.</li>
-        <li>Record new product decisions in this file before presenting them as settled scope.</li>
-      </ol>
-    </section>
-  </main>
-</body>
-</html>
+<body data-project="ShareCraft" data-status="draft-scope">
+<a class="skip" href="#main">Skip to scope</a>
+<header class="cover">
+<p class="eyebrow">ThineCraft / Product definition</p>
+<h1>ShareCraft</h1>
+<p class="lede">Scope of Works<br>A shared-content, collaboration and application platform extending beyond the SharePoint baseline.</p>
+<div class="meta"><span>Version 0.1 · Draft for review</span><span>9 November 2026</span><span>Product scope · Delivery framework</span></div>
+</header>
+<div class="layout">
+<nav aria-label="Document contents"><p>In this document</p>
+<a href="#purpose">01 · Purpose &amp; scope status</a><a href="#direction">02 · Established direction</a><a href="#baseline">03 · SharePoint baseline</a><a href="#beyond">04 · Beyond SharePoint</a><a href="#ecosystem">05 · Application boundaries</a><a href="#quality">06 · Quality &amp; operations</a><a href="#delivery">07 · Delivery &amp; acceptance</a><a href="#decisions">08 · Decisions to resolve</a><a href="#sources">09 · Sources &amp; AI guidance</a>
+</nav>
+<main id="main">
+<div class="toolbar"><span class="small">Standalone HTML · Print-ready · No external assets</span><button type="button" onclick="window.print()">Print / Save PDF</button></div>
+<section id="purpose"><h2>01 / Purpose &amp; scope status</h2>
+<p>Develop ShareCraft as the open-source shared-content foundation of ThineCraft: a platform for sites, intranets, libraries, structured records, publishing, knowledge, governance and collaboration. Organizations must be able to own their information, deploy the platform on infrastructure they control, and connect it to other applications.</p>
+<p>The SharePoint capability catalogue below establishes breadth. ShareCraft also includes cross-application co-authoring, hybrid continuity, controlled public intake and a foundation for specialized services.</p>
+<div class="note"><p><strong>This is a proposed scope of works, not an implementation claim or a fixed-price agreement.</strong> Established product direction is distinguished from newly proposed detail. All functionality remains planned until implemented and verified. Release allocation, costs, dates and service levels require separate agreement.</p><p>“Comprehensive” means a broad functional baseline with explicit boundaries. It does not promise every historical SharePoint feature, every Microsoft 365 service, or automatic Microsoft API compatibility.</p></div>
+</section>
+<section id="direction"><h2>02 / Established direction</h2>
+<div class="table-wrap"><table><caption>Requirements recovered from the referenced chats and existing project materials</caption><thead><tr><th>Ref.</th><th>Direction</th><th>Basis</th></tr></thead><tbody>
+<tr><td>D01</td><td>General SharePoint replacement: sites, portals, libraries, lists, pages, search, permissions, governance and workflow integrations.</td><td>Current request; continuation chat; existing scope.</td></tr>
+<tr><td>D02</td><td>Content types, site columns, metadata, managed metadata and version history are explicit requirements.</td><td>Current request.</td></tr>
+<tr><td>D03</td><td>Presence and co-authoring for WordCraft, GridCraft, PdfCraft, SolidCraft, DeckCraft and future compatible applications.</td><td>Continuation chat, explicit user instruction.</td></tr>
+<tr><td>D04</td><td>Hosted, self-hosted and hybrid operation; organization-controlled offline copies through DriveCraft.</td><td>Existing scope; continuation chat.</td></tr>
+<tr><td>D05</td><td>DriveCraft integration for ShareCraft and SharePoint connectivity, migration, metadata visibility and offline continuity.</td><td>Continuation chat. DriveCraft owns the desktop clients and local inventory.</td></tr>
+<tr><td>D06</td><td>Controlled public submission surfaces, including FormCraft/PdfCraft electronic and scanned-paper form workflows.</td><td>Existing scope; continuation chat.</td></tr>
+<tr><td>D07</td><td>ThineWedding, ThineMemorial and ThineCapture are services built on ShareCraft. They must not constrain its general platform architecture.</td><td>Referenced original chat, explicit user clarification.</td></tr>
+<tr><td>D08</td><td>Open interfaces, portable data and integration with FlowCraft, TeamCraft, GanttCraft, ShowCraft and FormCraft.</td><td>Referenced chat; existing scope.</td></tr>
+</tbody></table></div>
+<p class="small">Git-backed document management appears in the original chat’s project summary. Its exact architecture, binary storage strategy and user-facing branching behavior were not specified in the accessible messages; see SC-21 and the decision register.</p>
+</section>
+<section id="baseline"><h2>03 / SharePoint functional baseline</h2>
+<p>The following modules expand the requested baseline into reviewable requirements. Detailed behaviors are proposed unless explicitly established above. These are ShareCraft requirements, not assertions that every listed behavior is native to every SharePoint edition.</p>
+<div class="cards">
+<article class="module" id="sc01"><span class="tag proposal">Proposed baseline detail</span><h3>SC-01 · Organizations, sites &amp; navigation</h3><ul>
+<li>Create and administer organizations, site collections or equivalent boundaries, team sites, communication sites, departmental portals and hub-style groupings.</li><li>Provide site templates, reusable provisioning packages, branding, logos, themes, language settings, time zones, global navigation, local navigation, breadcrumbs and site discovery.</li><li>Manage site ownership, lifecycle, quotas, archival, restoration and deletion. Audience targeting personalizes navigation; permissions independently control access.</li></ul></article>
+<article class="module" id="sc02"><span class="tag proposal">Proposed baseline detail</span><h3>SC-02 · Libraries &amp; file operations</h3><ul>
+<li>Create document, asset, image and template libraries; support folders, optional folder-free organization and document sets with shared metadata.</li><li>Provide drag-and-drop and resumable uploads, bulk operations, new-from-template, preview, download, rename, copy, move and deletion with documented permission and history behavior.</li><li>Use durable content identifiers and links; handle duplicates, invalid names, interrupted transfers, checksums, quotas, large files, malware quarantine and unsupported previews.</li><li>Provide metadata panels, missing-information views, library settings, upload validation and configurable file policies.</li></ul></article>
+<article class="module" id="sc03"><span class="tag proposal">Proposed baseline detail</span><h3>SC-03 · Lists &amp; structured information</h3><ul>
+<li>Create custom lists and reusable list templates for contacts, tasks, issues, assets, registers, events and operational records.</li><li>Support item creation, editing, attachments, comments, bulk grid editing, CSV import/export, relationships, uniqueness and validation.</li><li>Support indexed columns, paging, large datasets, calculated values with a documented formula subset, and safe handling of referenced or deleted records.</li></ul></article>
+<article class="module" id="sc04"><span class="tag">Explicit requirement</span><h3>SC-04 · Site columns &amp; metadata</h3><ul>
+<li>Define reusable organization/site columns and local list/library columns, with stable internal identifiers, descriptions, grouping and controlled display names.</li><li>Cover text, rich text, number, currency, date/time, Boolean, choice, multiple choice, person/group, lookup, hyperlink, image, calculated and managed-metadata fields.</li><li>Configure required/optional/hidden fields, defaults, validation, unique values, indexing, display formatting and column-level edit behavior where authorized.</li><li>Support bulk metadata editing and folder/location defaults. Plan schema changes, field conversion and deletion without silently losing existing values.</li></ul></article>
+<article class="module" id="sc05"><span class="tag">Explicit requirement</span><h3>SC-05 · Managed metadata &amp; taxonomy</h3><ul>
+<li>Provide a term store with groups, term sets, hierarchical terms, stable IDs, descriptions, synonyms, multilingual labels and taxonomy owners.</li><li>Support closed and open term sets, single/multiple term selection, enterprise keywords and scoped reuse across sites and content types.</li><li>Allow authorized import/export, reparenting, merging, deprecation and replacement. Preserve references when labels change; expose affected content before destructive changes.</li><li>Use taxonomy consistently in forms, navigation, filtering, search and DriveCraft metadata displays. Record taxonomy changes in an audit trail.</li></ul></article>
+<article class="module" id="sc06"><span class="tag">Explicit requirement</span><h3>SC-06 · Content types</h3><ul>
+<li>Provide a content-type gallery with inheritance, stable identifiers, names, descriptions, categories, document templates and reusable site-column assignments.</li><li>Allow multiple content types per library/list; configure defaults, field ordering, required/optional/hidden fields and type-specific forms.</li><li>Support publication across selected sites and controlled propagation of parent changes. Preview downstream effects, preserve local overrides according to policy and support rollback.</li><li>Associate workflow, retention and document-generation behavior with content types through explicit rules. Include document-set types and reusable business record types.</li></ul></article>
+<article class="module" id="sc07"><span class="tag proposal">Proposed baseline detail</span><h3>SC-07 · Views, forms &amp; everyday usability</h3><ul>
+<li>Provide personal/public saved views with column selection, sorting, filtering, grouping, totals and metadata navigation.</li><li>Include table, grid, gallery, calendar and board views where compatible with the schema; provide reusable, accessible formatting rules.</li><li>Provide configurable create/edit/display forms with conditional fields, validation, help text and read-only states; integrate richer forms through FormCraft.</li><li>Preserve keyboard navigation, responsive layouts, clear empty/error states, bulk-selection feedback and localization.</li></ul></article>
+<article class="module" id="sc08"><span class="tag">Explicit requirement</span><h3>SC-08 · Version history, publishing &amp; locking</h3><ul>
+<li>Version files, metadata, list items and pages with actor, timestamp, change comment and revision ID. Define which changes create a version.</li><li>Support major/minor document revisions, drafts, publication, approval status, draft visibility and configurable version limits/expiry.</li><li>Inspect historical metadata and retrieve prior file bytes; restoration creates a new current version while preserving the historical record. Show text/field differences where supported; binary comparison depends on the editor.</li><li>Provide check-out/check-in, exclusive locks, lock expiry/recovery and optimistic concurrency. Exclusive editing and live co-authoring require explicit coordination.</li><li>Keep version pruning subordinate to retention and hold rules. Document history behavior for moves, copies, migration and deletion.</li></ul><p class="small">SharePoint reference: <a href="https://support.microsoft.com/en-us/sharepoint/lists/documents-and-library/how-versioning-works-in-lists-and-libraries">Microsoft’s versioning, draft visibility and checkout documentation</a>.</p></article>
+<article class="module" id="sc09"><span class="tag proposal">Proposed baseline detail</span><h3>SC-09 · Pages, news &amp; knowledge publishing</h3><ul>
+<li>Provide a visual page editor with sections, layouts, templates and reusable components for text, images, files, links, lists, libraries, news, events, people and approved embeds.</li><li>Support draft saving, preview, version history, review, scheduling, publish/unpublish, page ownership, translations and expiry/review reminders.</li><li>Provide home pages, knowledge articles, news posts, announcements, comments, reactions and aggregated content rollups subject to permissions.</li><li>Maintain asset references and navigation links; sanitize authored content and embedded components. Public publishing requires deliberate configuration.</li></ul></article>
+<article class="module" id="sc10"><span class="tag proposal">Proposed baseline detail</span><h3>SC-10 · Search &amp; discovery</h3><ul>
+<li>Search sites, pages, list records, document metadata and supported file contents, with scoped queries, refiners, sorting, highlights and saved searches.</li><li>Map site columns/content types into a configurable search schema, with indexed/queryable/refinable fields and taxonomy-aware filtering.</li><li>Enforce current access rights for results, counts, snippets, suggestions and previews; handle permission revocation and index delays without exposing content.</li><li>Provide crawl/index status, extraction failures, rebuild controls and relevance configuration. OCR and people-directory search are separately configurable extensions.</li></ul><p class="small">Reference baseline: <a href="https://learn.microsoft.com/en-us/sharepoint/overview-of-search">Microsoft’s SharePoint search overview</a>.</p></article>
+<article class="module" id="sc11"><span class="tag proposal">Proposed baseline detail</span><h3>SC-11 · Identity, permissions &amp; sharing</h3><ul>
+<li>Support users, guests, groups, service identities, owners/members/visitors and configurable permission roles, with delegated administration.</li><li>Provide inheritance at site, library/list, folder and item levels; show effective access, broken inheritance and the reason access was granted.</li><li>Support access requests, authenticated sharing links, expiry, revocation, domain restrictions and configurable anonymous sharing. Apply authorization consistently to APIs, downloads, previews and co-authoring.</li><li>Integrate an agreed identity provider and single sign-on; define session revocation, MFA responsibility, account deactivation and tenant isolation.</li></ul></article>
+<article class="module" id="sc12"><span class="tag proposal">Proposed baseline detail</span><h3>SC-12 · Retention, records &amp; audit</h3><ul>
+<li>Define retention schedules, record declaration, preservation holds, archival and authorized disposition review for files, items and associated versions.</li><li>Ensure normal deletion, version cleanup and administrator actions cannot silently bypass active preservation rules; define hold release and post-hold disposal.</li><li>Record content, permission, sharing, administrative and workflow changes in an access-controlled audit trail with export and integrity controls.</li><li>Provide classification labels, review reminders, retention reports and case-based search/export. Specify jurisdictional rules before claiming regulatory compliance.</li></ul><p class="small">Microsoft 365 reference: <a href="https://learn.microsoft.com/en-us/purview/retention-policies-sharepoint">Purview retention for SharePoint</a>. Equivalent ShareCraft controls are separate implementation work; a Microsoft Purview dependency is not implied.</p></article>
+<article class="module" id="sc13"><span class="tag integration">FlowCraft integration</span><h3>SC-13 · Workflows, approvals &amp; notifications</h3><ul>
+<li>Expose triggers for creation, content changes, metadata changes, submission, publication, approval, deadlines and permission changes.</li><li>Support serial/parallel approval, delegation, escalation, rejection, resubmission, reminders and an auditable decision history through FlowCraft.</li><li>Provide in-app notifications, subscriptions, mentions and configurable email delivery; links must recheck permissions when opened.</li><li>Specify retry, idempotency, cancellation, timeout, workflow versioning and service-identity permissions. A published approval must reference the exact approved revision.</li></ul></article>
+<article class="module" id="sc14"><span class="tag proposal">Proposed baseline detail</span><h3>SC-14 · Administration &amp; extensibility</h3><ul>
+<li>Provide organization and site administration for settings, storage, identities, sharing, content types, taxonomy, search, workflows, audit and lifecycle.</li><li>Expose documented, versioned APIs, event subscriptions, webhooks and scoped application credentials with paging, rate controls and change tracking.</li><li>Provide reusable templates and approved extension points for page components, content handlers and business applications; isolate extensions from privileged operations.</li><li>Report storage, activity, stale content, orphaned ownership, sharing exposure and failed background jobs. Provide import/export of configuration.</li></ul></article>
+</div></section>
+<section id="beyond"><h2>04 / Beyond SharePoint</h2>
+<p>These capabilities express ShareCraft’s broader role in ThineCraft. The product direction is established; protocols and detailed acceptance behavior below are proposed.</p><div class="cards">
+<article class="module" id="sc15"><span class="tag">Established direction · Detail proposed</span><h3>SC-15 · Cross-application co-authoring</h3><ul>
+<li>Provide shared document identity, editing sessions, participant presence, authorization, reconnect behavior and revision checkpoints for WordCraft, GridCraft, PdfCraft, SolidCraft and DeckCraft.</li><li>Define an editor integration contract covering capabilities, supported formats, autosave, comments, user attribution, conflicts and durable saves.</li><li>Negotiate collaboration by content type: text operations, cells, slide objects, PDF annotations or CAD operations require appropriate application-specific strategies. Generic file storage does not merge arbitrary binaries.</li><li>Show session state and save status; preserve concurrent work during disconnects and enforce revocation during active sessions. Editors own rendering and document semantics.</li></ul></article>
+<article class="module" id="sc16"><span class="tag integration">DriveCraft · Established direction</span><h3>SC-16 · Hybrid continuity &amp; organization-owned copies</h3><ul>
+<li>Support hosted, self-hosted and hybrid deployments with organization-controlled server/NAS copies of organizational files and their necessary metadata, identities and permissions.</li><li>Expose incremental synchronization, checkpoints, checksums, tombstones and conflict information to DriveCraft. Show mirror coverage, last successful sync, missing data and recovery readiness.</li><li>Define whether offline copies are recovery-only, readable during outages, or writable with later reconciliation. Writable offline operation is an open decision, not an assumed guarantee.</li><li>Provide authorized export and recovery without depending solely on the hosted service. Synchronization is not a substitute for independent backups and tested restoration.</li></ul></article>
+<article class="module" id="sc17"><span class="tag integration">DriveCraft / Microsoft interoperability</span><h3>SC-17 · Migration &amp; coexistence</h3><ul>
+<li>Inventory source files, sites, libraries, schemas, content types, taxonomy, users, permissions and versions before transfer. Produce a supported/unsupported mapping report.</li><li>Support resumable migration, dry runs, staged batches, throttling, delta passes, checksums, reconciliation and exception reports through DriveCraft.</li><li>Preserve content and metadata to the extent supported by each source/destination API; explicitly report unpreserved author identities, timestamps, versions, links and permissions.</li><li>Use Microsoft Graph where supported; define additional supported APIs or tools for gaps. Do not promise complete SharePoint migration or continuous two-way sync before a connector capability assessment.</li></ul></article>
+<article class="module" id="sc18"><span class="tag">Established direction · Detail proposed</span><h3>SC-18 · Controlled public portals &amp; submission</h3><ul>
+<li>Provide branded public/guest submission surfaces that write into a controlled intake boundary without granting access to private libraries or administrative functions.</li><li>Support authenticated or anonymous submissions by policy, file uploads, validation, consent capture, receipts, tracking references and permitted status updates.</li><li>Separate incoming/quarantined records from approved internal content, with abuse controls, upload inspection, workflow routing and owner review.</li><li>Provide public read-only previews where explicitly authorized. Prevent visitors from enumerating other submissions or resolving private document links.</li></ul></article>
+<article class="module" id="sc19"><span class="tag integration">FormCraft / PdfCraft · Established direction</span><h3>SC-19 · Electronic forms &amp; paper-to-digital records</h3><ul>
+<li>Store and publish form templates, template revisions, fillable PDFs, browser views, submissions and source evidence. FormCraft owns field logic; PdfCraft owns PDF viewing/editing and capture.</li><li>Resolve a QR-coded document-instance identifier to its authorized template, template version and field map; distinguish instance identity from a human or cryptographic signature.</li><li>Receive progressively extracted fields, assembled page imagery, confidence information and capture history from PdfCraft’s streamed phone-scanning workflow.</li><li>Support human review of uncertain extraction, correction history, finalization and controlled read-only access to completed records. Define evidence/video retention separately; do not assume indefinite raw-stream storage.</li></ul></article>
+<article class="module" id="sc20"><span class="tag integration">Requested ecosystem extension · Design open</span><h3>SC-20 · Signatures, integrity &amp; timestamp evidence</h3><ul>
+<li>Store finalized document bytes, cryptographic hashes, detached signatures, signer-key information, verification results and optional public-ledger timestamp proof bundles.</li><li>Associate evidence with an exact immutable revision; any edited document becomes a different revision requiring its own evidence.</li><li>Keep signer identity verification separate from proof of document integrity and time of existence. Bitcoin timestamping alone does not identify the signer.</li><li>Define provider, privacy, pending/confirmed/failed states, verification tooling, key revocation and retention before implementation. OpenTimestamps was proposed in the continuation, but provider and signing roles remain unresolved.</li></ul></article>
+<article class="module" id="sc21"><span class="tag proposal">Historical direction · Architecture open</span><h3>SC-21 · Git-oriented history &amp; portable storage</h3><ul>
+<li>Evaluate Git-backed history as part of the document-management direction while maintaining a normal library experience for nontechnical users.</li><li>Specify how content, metadata, permissions, schemas and revision identifiers map into repositories or an equivalent portable history model.</li><li>Resolve binary/object storage, large files, repository growth, encryption, tenancy isolation, retention, deletion and recovery before selecting Git, Git LFS or another design.</li><li>Branching, forks, pull requests and automated merges are candidate extensions requiring explicit scope decisions; they are not implied by Git storage.</li></ul></article>
+<article class="module" id="sc22"><span class="tag">Established platform direction</span><h3>SC-22 · Services assembled on the platform</h3><ul>
+<li>Provide reusable site, library, content-type, form, permission and workflow packages that can be assembled into specialized services.</li><li>Allow ThineWedding, ThineMemorial and ThineCapture to use independent branding, URLs, users and service-specific configuration on ShareCraft.</li><li>Keep service-specific schemas and behavior modular. Their detailed commercial/event workflows require separate scopes and do not redefine ShareCraft core.</li></ul></article>
+</div></section>
+<section id="ecosystem"><h2>05 / Application boundaries</h2><div class="table-wrap"><table><thead><tr><th>Application</th><th>Primary responsibility</th><th>ShareCraft integration boundary</th></tr></thead><tbody>
+<tr><td>ShareCraft</td><td>Sites, shared content, metadata, governance, publishing and collaboration infrastructure.</td><td>Canonical record identity, permissions, history, search and content APIs.</td></tr>
+<tr><td>DriveCraft</td><td>Desktop sync, migration, managed-metadata visibility, local PostgreSQL inventory and offline copies; Windows, macOS and Zorin OS/Linux; tracking beyond 100,000 files.</td><td>Delta feeds, content transfer, schema mapping, conflicts and continuity reporting. The inventory target belongs to DriveCraft, not an established ShareCraft throughput guarantee.</td></tr>
+<tr><td>FlowCraft</td><td>Workflow execution, approvals and automation.</td><td>Content events, scoped actions, approval records and process links.</td></tr>
+<tr><td>FormCraft / PdfCraft</td><td>Forms, fillable PDFs, browser rendering, mobile scanning and extraction.</td><td>Templates, instance resolution, intake, evidence storage and governed results.</td></tr>
+<tr><td>WordCraft / GridCraft / DeckCraft / SolidCraft</td><td>Document, spreadsheet, presentation and CAD editing.</td><td>Authorized content, presence, collaboration sessions and durable revisions.</td></tr>
+<tr><td>TeamCraft</td><td>Messaging, meetings and communication.</td><td>Context links, notifications, governed attachments and meeting records.</td></tr>
+<tr><td>GanttCraft</td><td>Project scheduling and resource management.</td><td>Project workspaces, deliverables, record links and schedule metadata.</td></tr>
+<tr><td>ShowCraft</td><td>Diagrams, animation, BI and digital-twin experiences.</td><td>Governed source data, embedded outputs and versioned assets.</td></tr>
+<tr><td>ThineCraft shared layer</td><td>Shared architecture, protocols and integration libraries.</td><td>Common identity, contracts and interoperability conventions.</td></tr>
+</tbody></table></div>
+<p class="small">TradeCraft remains excluded, following the continuation chat. Existing marketing-site hosting choices do not select the runtime architecture for ShareCraft’s application servers, storage or collaboration services.</p></section>
+<section id="quality"><h2>06 / Quality, security &amp; operations</h2><p>The following are proposed delivery requirements. Numerical targets must be approved before performance or availability acceptance can be meaningful.</p>
+<div class="table-wrap"><table><thead><tr><th>Area</th><th>Required work</th></tr></thead><tbody>
+<tr><td>Security</td><td>Threat model; authorization at every boundary; tenant isolation; encryption in transit/at rest; secret management; secure upload processing; protected exports; service credentials; dependency review; auditable administrator access.</td></tr>
+<tr><td>Accessibility &amp; clients</td><td>Proposed WCAG 2.2 AA target; keyboard and screen-reader verification; responsive mobile/desktop layouts; agreed browser matrix; accessible page-authoring components.</td></tr>
+<tr><td>Performance &amp; scale</td><td>Agree organization/user/site/file counts, file sizes, concurrent editors, metadata complexity, indexing delay and response-time targets. Benchmark realistic datasets and permission models.</td></tr>
+<tr><td>Availability &amp; recovery</td><td>Agree uptime, recovery point and recovery time targets; backup content plus metadata, permissions, taxonomies and configuration; test complete and granular restoration and outage procedures.</td></tr>
+<tr><td>Deployment &amp; upgrades</td><td>Document hosted, self-hosted and hybrid reference deployments; repeatable installation; configuration and secrets; schema migration; rollback; release packaging and upgrade verification.</td></tr>
+<tr><td>Observability &amp; support</td><td>Health checks, metrics, structured logs, job queues, alerts, sync/index status, diagnostics, storage growth and administrative recovery tools. Define operational ownership and support response separately.</td></tr>
+<tr><td>Portability &amp; ownership</td><td>Document export formats and stable IDs. Export files, metadata, content types, taxonomy, permissions, versions and evidence according to authorization; verify re-import into a clean environment.</td></tr>
+</tbody></table></div></section>
+<section id="delivery"><h2>07 / Delivery framework &amp; acceptance</h2><p>Recommended delivery order; no phase is yet assigned a contractual date, cost or release commitment.</p>
+<ol><li><strong>Definition:</strong> approved requirements register, feature classification, compatibility matrix, information architecture, sample schemas, tenancy/security model, deployment choices and measurable service targets.</li><li><strong>Content foundation:</strong> identities, sites, libraries, lists, reusable columns, content types, taxonomy, permissions, history and APIs.</li><li><strong>Knowledge &amp; governance:</strong> pages, search, publishing, approval integration, retention, audit, administration, migration and backup/restore.</li><li><strong>Broader platform:</strong> editor co-authoring, DriveCraft hybrid continuity, public intake, form capture integration, evidence verification and service templates.</li><li><strong>Production readiness:</strong> realistic migration rehearsal, accessibility/security/performance checks, disaster recovery exercise, operational documentation, administrator training and release handover.</li></ol>
+<h3 class="rule">Required handover outputs</h3><p>Application source and build/deployment instructions; schema and API documentation; configured sample sites/libraries/lists/content types/taxonomies; migration and reconciliation reports; verification evidence; security and recovery runbooks; user/admin guidance; known limitations; dependency/license inventory; and an HTML requirements register mapping each scope item to its release and acceptance evidence.</p>
+<h3>Acceptance scenarios</h3><div class="table-wrap"><table><thead><tr><th>Test</th><th>Demonstrable result</th></tr></thead><tbody>
+<tr><td>A01 · Information architecture</td><td>Create a site, library, list, reusable column, inherited content type and term set; verify reuse and validation across two sites.</td></tr>
+<tr><td>A02 · Metadata changes</td><td>Rename a column and taxonomy label without breaking stored references; propagate a content-type change and report exceptions.</td></tr>
+<tr><td>A03 · Version integrity</td><td>Edit file bytes and metadata, inspect history, approve a specific revision and restore an earlier revision as a new current version.</td></tr>
+<tr><td>A04 · Permission enforcement</td><td>Demonstrate inheritance and unique access; revoke a user and confirm blocked download, preview, search and active editor access within the agreed window.</td></tr>
+<tr><td>A05 · Publishing</td><td>Draft, review, schedule, publish and unpublish a page; readers see only the version they are authorized to read.</td></tr>
+<tr><td>A06 · Records preservation</td><td>Apply a hold, attempt deletion/pruning, verify preservation, release the hold and perform authorized disposition with audit evidence.</td></tr>
+<tr><td>A07 · Co-authoring</td><td>Two users edit in each release-supported editor; reconnect after interruption without silent loss, with attributable durable revisions and documented conflict behavior.</td></tr>
+<tr><td>A08 · Hybrid continuity</td><td>Verify mirror completeness, simulate hosted-service loss and recover authorized content and metadata; test reconciliation only if offline writing is included.</td></tr>
+<tr><td>A09 · Migration</td><td>Reconcile source/destination counts, checksums, schemas and supported history; produce explicit exceptions for unmapped information.</td></tr>
+<tr><td>A10 · Public intake</td><td>Submit a form/upload as a visitor, receive a receipt and route the record internally without exposing other records or private workspaces.</td></tr>
+<tr><td>A11 · Paper &amp; evidence</td><td>Resolve the correct QR instance, receive reviewed extraction and source evidence, finalize a revision and detect modification during evidence verification.</td></tr>
+<tr><td>A12 · Operational readiness</td><td>Restore into a clean environment; meet agreed scale, latency, accessibility and recovery targets; hand over reproducible evidence and limitations.</td></tr>
+</tbody></table></div></section>
+<section id="decisions"><h2>08 / Decisions to resolve</h2><p>These remain open rather than being silently chosen by this document.</p><ol>
+<li><strong>Release breadth:</strong> which baseline and extension modules belong in the first usable release, and which are later deliverables?</li>
+<li><strong>Tenancy &amp; identity:</strong> single organization or multitenant service; identity provider; federation; external users; delegated administration.</li>
+<li><strong>Storage &amp; Git:</strong> canonical content model, metadata database, object storage, Git role, binary history and recoverable deletion versus permanent erasure.</li>
+<li><strong>Hybrid authority:</strong> recovery mirror, offline read service or fully writable offline deployment; conflict ownership and reconciliation policy.</li>
+<li><strong>Co-authoring:</strong> editor protocol, supported formats, per-editor collaboration semantics and release order.</li>
+<li><strong>Compatibility:</strong> modern SharePoint baseline, selected classic capabilities, import/export guarantees and supported Microsoft API coverage.</li>
+<li><strong>Trust &amp; evidence:</strong> signing parties, verified identity, timestamp provider, key management, public verification and evidence retention.</li>
+<li><strong>Scale &amp; operations:</strong> infrastructure, volume, concurrency, availability, indexing, backups, recovery, support and accessibility targets.</li>
+<li><strong>Commercial handover:</strong> budget, milestones, acceptance owner, support period, open-source license and change-control procedure.</li>
+</ol><div class="note" style="margin-top:20px"><p><strong>Additional features:</strong> record each requested addition with an ID, user outcome, owner application, data/permission impact, dependencies, acceptance scenario and release assignment. AI-assisted tagging/search, mandatory data-loss prevention, native mobile clients, Microsoft Office integration and legacy SharePoint runtime compatibility are not silently included by the phrase “everything”; each needs an explicit scope entry.</p></div></section>
+<section id="sources"><h2>09 / Sources &amp; contributor guidance</h2>
+<ol><li><a href="https://chatgpt.com/c/6af12459-d404-83e9-a85c-142b4def330d">ThineCraft - Open Source O365 Alternatives</a> — accessible recent messages establish project roles, the Git-oriented summary and the separation of services from core applications.</li>
+<li><a href="codex://threads/01a1c0fe-d3c9-7ac2-8746-5e6995d27088">Create ThineCraft repositories</a> — continuation reviewed for explicit ShareCraft clarification, named editor co-authoring, DriveCraft hybrid requirements and FormCraft/PdfCraft workflows.</li>
+<li><a href="https://github.com/ThineCraft/ShareCraft/blob/main/scope.html">Existing ShareCraft scope</a> and <a href="https://github.com/ThineCraft/ShareCraft/blob/main/README.md">README</a> — existing confirmed-direction and boundary statements.</li>
+<li><a href="https://learn.microsoft.com/en-us/sharepoint/managed-metadata">Microsoft managed metadata</a> and <a href="https://learn.microsoft.com/en-us/sharepoint/add-columns-content-type">content-type columns</a> — reference concepts for taxonomy and reusable metadata.</li></ol>
+<p class="small" style="margin-top:18px">Source limitation: the original chat reader exposed five recent exchanges and no older-page cursor. This draft supplements those exchanges with the accessible continuation and repository materials. It does not claim that inaccessible earlier discussions were exhaustively recovered. Later source recovery may add requirements.</p>
+<h3>For AI contributors and implementers</h3><ul><li>Treat this local draft as a proposed expansion of the existing repository scope. Do not imply that it has already replaced the published authority or been approved.</li><li>Preserve the distinction between explicit user direction, proposed detail and unresolved design choices. Do not label planned features as implemented.</li><li>Keep editors, sync clients, workflows and specialized services within their stated application boundaries. Record agreed changes in HTML.</li><li>Use stable requirement IDs in implementation plans, issues and acceptance evidence. Do not claim SharePoint parity, regulatory compliance or production readiness without defined criteria and verification.</li></ul>
+</section>
+<footer>ShareCraft · ThineCraft · Scope of Works v0.1 · Draft prepared 9 November 2026<br>This HTML document is self-contained and can be viewed offline or printed to PDF.</footer>
+</main></div>
+</body></html>
