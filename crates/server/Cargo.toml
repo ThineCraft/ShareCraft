@@ -21,6 +21,7 @@ collab-core = { path = "../collab-core" }
 collab-text = { path = "../collab-text" }
 dotenvy = "0.15.7"
 futures-util = "0.3.34"
+getrandom = "0.4.3"
 protocol = { path = "../protocol" }
 records = { path = "../records" }
 revisions = { path = "../revisions" }

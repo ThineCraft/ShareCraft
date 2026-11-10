@@ -22,7 +22,7 @@ use uuid::Uuid;
 
 use crate::AppState;
 use crate::auth::same_origin;
-use crate::room::Command;
+use crate::room::AccessChange;
 
 /// Largest request body accepted.
 const MAX_BODY: usize = 16 * 1024;
@@ -209,19 +209,21 @@ async fn after_access_change(state: &AppState, doc: DocId, user: UserId) {
             None
         }
     };
-    rooms.send_to(doc, Command::SetAccess { user, role });
+    rooms.send_to(doc, AccessChange::SetAccess { user, role });
 }
 
 /// Called after `user`'s account was disabled: their connections to every document are removed.
 /// Removal is final, so it needs no ordering with other access changes.
 fn after_account_disabled(state: &AppState, user: UserId) {
-    state.rooms().send_all(|| Command::RemoveUser { user });
+    state.rooms().send_all(|| AccessChange::RemoveUser { user });
 }
 
 /// Called after `session` was ended by its owner signing out: that session's connections are
 /// removed; the same person's other sign-ins stay.
 fn after_sign_out(state: &AppState, session: SessionId) {
-    state.rooms().send_all(|| Command::EndSession { session });
+    state
+        .rooms()
+        .send_all(|| AccessChange::EndSession { session });
 }
 
 impl IntoResponse for ApiError {
@@ -275,7 +277,7 @@ mod tests {
 
     use super::*;
     use crate::config::{Config, DatabaseUrl};
-    use crate::room::{JoinReply, OUTBOUND_CAPACITY, Outbound};
+    use crate::room::{Command, JoinReply, OUTBOUND_CAPACITY, Outbound};
 
     async fn account(db: &records::Db, name: &str) -> UserId {
         db.create_user(
@@ -452,7 +454,7 @@ mod tests {
         // The first hook carries on.
         state.rooms().send_to(
             doc,
-            Command::SetAccess {
+            AccessChange::SetAccess {
                 user: bob,
                 role: first_read,
             },

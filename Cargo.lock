@@ -2345,6 +2345,7 @@ dependencies = [
  "collab-text",
  "dotenvy",
  "futures-util",
+ "getrandom 0.4.3",
  "gix",
  "protocol",
  "records",

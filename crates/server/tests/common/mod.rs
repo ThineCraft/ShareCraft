@@ -19,7 +19,10 @@ use collab_core::client_state::{ClientState, Outgoing};
 use collab_core::ids::{ClientId, DocId, OpId, Seq, UserId};
 use collab_text::{TextDoc, TextOp};
 use futures_util::{SinkExt, StreamExt};
-use protocol::{ClientMsg, Participant, RemovedReason, Resume, RoomEpoch, SaveState, ServerMsg};
+use protocol::{
+    ClientMsg, FileClientMsg, FileServerMsg, Participant, RemovedReason, Resume, RoomEpoch,
+    SaveState, SeatState, ServerMsg,
+};
 use records::test_support::TestDb;
 use records::{Db, Editor, NewUser, Role};
 use reqwest::header::{COOKIE, HeaderMap, HeaderValue, ORIGIN, SET_COOKIE};
@@ -134,6 +137,15 @@ impl Site {
                 .await
                 .unwrap();
         }
+    }
+
+    /// Creates `doc` as a file document opened in GridCraft, named `<doc id>.xlsx` and owned
+    /// by `owner`, writing the record directly.
+    pub async fn create_file_document(&self, doc: DocId, owner: &TestUser) {
+        self.records
+            .create_document(owner.id, doc, &format!("{}.xlsx", doc.0), Editor::GridCraft)
+            .await
+            .unwrap();
     }
 
     /// The administrator the harness grants access as, created on first use. It never signs
@@ -835,6 +847,160 @@ impl TestClient {
         if resumed && let Some(out) = in_flight {
             self.submit(&out).await;
         }
+    }
+}
+
+/// One browser tab in a file session: a socket speaking the file messages.
+pub struct FileClient {
+    addr: SocketAddr,
+    doc: DocId,
+    client: ClientId,
+    /// The signed-in account this tab belongs to.
+    pub user: TestUser,
+    socket: Option<Socket>,
+    /// Every message received, in order, over every connection of this tab.
+    pub received: Vec<FileServerMsg>,
+    /// Set when `Joined` arrives for the current socket.
+    pub joined: bool,
+    /// Set when the server closed the current socket.
+    pub closed: bool,
+    /// Why the server removed this tab, once it has.
+    pub removed: Option<RemovedReason>,
+    /// From the last `Joined` or `Access`.
+    pub can_edit: bool,
+    /// The seat as this tab last heard of it, from `Joined` or `Seat`.
+    pub seat: Option<SeatState>,
+    /// Who is here, from the last `Joined` or `People`.
+    pub participants: Vec<Participant>,
+}
+
+impl FileClient {
+    /// Opens a socket to `doc` as `user`, joins and waits for `Joined`.
+    pub async fn connect_as(site: &Site, doc: DocId, user: &TestUser) -> FileClient {
+        let mut c = FileClient::open_as(site, doc, user).await;
+        c.pump_until(|c| c.joined).await;
+        c
+    }
+
+    /// Opens a socket to `doc` as `user` and sends `Join`, without waiting for a reply.
+    pub async fn open_as(site: &Site, doc: DocId, user: &TestUser) -> FileClient {
+        let mut c = FileClient {
+            addr: site.addr,
+            doc,
+            client: ClientId(Uuid::new_v4()),
+            user: user.clone(),
+            socket: None,
+            received: Vec::new(),
+            joined: false,
+            closed: false,
+            removed: None,
+            can_edit: false,
+            seat: None,
+            participants: Vec::new(),
+        };
+        c.open().await;
+        c
+    }
+
+    async fn open(&mut self) {
+        self.socket = Some(open_socket(self.addr, self.doc, &self.user).await);
+        self.joined = false;
+        self.closed = false;
+        let join = serde_json::to_string(&FileClientMsg::Join {
+            client: self.client,
+        })
+        .unwrap();
+        let socket = self.socket.as_mut().unwrap();
+        socket.send(Message::text(join)).await.unwrap();
+    }
+
+    /// The seat token this tab holds, if it holds the seat.
+    pub fn token(&self) -> Option<String> {
+        match &self.seat {
+            Some(SeatState::Yours { token }) => Some(token.clone()),
+            _ => None,
+        }
+    }
+
+    /// The `Seat` messages received, in order.
+    pub fn seat_messages(&self) -> Vec<SeatState> {
+        self.received
+            .iter()
+            .filter_map(|m| match m {
+                FileServerMsg::Seat { seat } => Some(seat.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Reads and handles messages until `cond` holds. Fails after five seconds, or if the
+    /// socket closes while `cond` is still false.
+    pub async fn pump_until(&mut self, cond: impl Fn(&FileClient) -> bool) {
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        while !cond(self) {
+            assert!(!self.closed, "socket closed while waiting");
+            let socket = self.socket.as_mut().expect("not connected");
+            let next = tokio::time::timeout_at(deadline, socket.next())
+                .await
+                .expect("timed out waiting for condition");
+            match next {
+                Some(Ok(Message::Text(text))) => {
+                    let msg: FileServerMsg = serde_json::from_str(&text).unwrap();
+                    self.handle(msg);
+                }
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => self.closed = true,
+                Some(Ok(_)) => {}
+            }
+        }
+    }
+
+    fn handle(&mut self, msg: FileServerMsg) {
+        self.received.push(msg.clone());
+        match msg {
+            FileServerMsg::Joined {
+                participants,
+                can_edit,
+                seat,
+                ..
+            } => {
+                self.participants = participants;
+                self.can_edit = can_edit;
+                self.seat = Some(seat);
+                self.joined = true;
+            }
+            FileServerMsg::People { participants } => self.participants = participants,
+            FileServerMsg::Seat { seat } => self.seat = Some(seat),
+            FileServerMsg::Access { can_edit } => self.can_edit = can_edit,
+            FileServerMsg::Removed { reason } => self.removed = Some(reason),
+            FileServerMsg::Save { .. } => {}
+        }
+    }
+
+    /// Waits until the server closes this socket.
+    pub async fn wait_closed(&mut self) {
+        self.pump_until(|c| c.closed).await;
+    }
+
+    /// Closes the socket politely and waits for the server to finish the close.
+    pub async fn close(&mut self) {
+        let Some(mut socket) = self.socket.take() else {
+            return;
+        };
+        let _ = socket.close(None).await;
+        let drained = tokio::time::timeout(TIMEOUT, async {
+            while let Some(Ok(_)) = socket.next().await {}
+        })
+        .await;
+        assert!(drained.is_ok(), "server did not finish closing");
+        self.joined = false;
+    }
+
+    /// Closes the socket, opens a new one with the same client id, joins and waits for
+    /// `Joined`, as a page that joins again does.
+    pub async fn rejoin(&mut self) {
+        self.close().await;
+        self.open().await;
+        self.pump_until(|c| c.joined).await;
     }
 }
 

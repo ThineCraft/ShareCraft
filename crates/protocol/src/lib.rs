@@ -9,6 +9,10 @@ use collab_core::ids::{ClientId, OpId, Seq, UserId};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+pub mod file;
+
+pub use file::{FileClientMsg, FileServerMsg, SeatState};
+
 /// Identifies one lifetime of a document's room. Log positions restart whenever a room is
 /// created, so a position only means something together with the epoch it was issued in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

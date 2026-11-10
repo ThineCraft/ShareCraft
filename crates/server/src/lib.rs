@@ -13,6 +13,7 @@ pub mod cli;
 pub mod config;
 pub mod editors;
 mod events;
+mod file_room;
 mod projection;
 mod room;
 mod ws;
@@ -43,6 +44,7 @@ use auth::Throttle;
 use checkpoint::Timing;
 use editors::Editors;
 use events::EventSink;
+use file_room::FileLink;
 use room::{RoomLink, Rooms, Storage};
 
 /// Shared state of a running server.
@@ -130,6 +132,21 @@ impl AppState {
             },
             timing,
             config.room_grace,
+        )
+    }
+
+    /// The command channel of `doc`'s file session, opening it if needed; `name` is the
+    /// document's name, which a newly opened session stores revisions under.
+    fn open_file_room(&self, doc: DocId, name: String) -> FileLink {
+        self.shared.rooms.open_file(
+            doc,
+            name,
+            Storage {
+                store: Arc::clone(&self.shared.checkpointer),
+                db: Some(self.shared.db.clone()),
+                events: self.shared.events.clone(),
+            },
+            self.shared.config.room_grace,
         )
     }
 }

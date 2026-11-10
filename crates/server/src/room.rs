@@ -29,6 +29,7 @@ use uuid::Uuid;
 
 use crate::checkpoint::{Checkpointer, Finished, SaveJob, Schedule, Timing, WriteError};
 use crate::events::{EventSink, error_text};
+use crate::file_room::{self, FileLink};
 use crate::projection::Recorder;
 
 /// Identifies one WebSocket connection, so a replaced connection's late messages are ignored.
@@ -104,9 +105,15 @@ pub(crate) enum Command {
     },
     /// The connection ended.
     Leave { conn: ConnId, client: ClientId },
+}
+
+/// A change to who may be in a room, sent on the room's access channel. Rooms of every kind
+/// take the same changes.
+#[derive(Debug)]
+pub(crate) enum AccessChange {
     /// `user`'s role on the document is now `role`. `None` removes every connection of theirs
     /// with `Removed { access_revoked }`; a role sends `Access` to each of their connections
-    /// whose `can_edit` changes.
+    /// whose role changes.
     SetAccess { user: UserId, role: Option<Role> },
     /// The sign-in `session` ended: its connections are removed with `Removed { signed_out }`.
     EndSession { session: SessionId },
@@ -359,14 +366,20 @@ impl Room {
             } => self.submit(conn, client, op_id, base, op),
             Command::Cursor { conn, client, at } => self.cursor(conn, client, at),
             Command::Leave { conn, client } => self.leave(conn, client),
-            Command::SetAccess { user, role } => match role {
+        }
+    }
+
+    /// Carries out one access change.
+    pub(crate) fn apply_access(&mut self, change: AccessChange) {
+        match change {
+            AccessChange::SetAccess { user, role } => match role {
                 Some(role) => self.change_role(user, role),
                 None => self.remove(|m| m.user == user, RemovedReason::AccessRevoked),
             },
-            Command::EndSession { session } => {
+            AccessChange::EndSession { session } => {
                 self.remove(|m| m.session == session, RemovedReason::SignedOut);
             }
-            Command::RemoveUser { user } => {
+            AccessChange::RemoveUser { user } => {
                 self.remove(|m| m.user == user, RemovedReason::AccountDisabled);
             }
         }
@@ -682,7 +695,7 @@ fn encode(msg: &ServerMsg<TextOp>) -> Option<Utf8Bytes> {
 
 /// `name` without control characters, `<` or `>`, and trimmed; "Guest" if what is left is not
 /// a name the revision store accepts as an author name.
-fn credited_name(name: &str) -> String {
+pub(crate) fn credited_name(name: &str) -> String {
     let kept: String = name
         .chars()
         .filter(|c| !c.is_control() && !matches!(c, '<' | '>'))
@@ -695,26 +708,61 @@ fn credited_name(name: &str) -> String {
     }
 }
 
-/// The ways into one room.
+/// The ways into one text room.
 #[derive(Clone, Debug)]
 pub(crate) struct RoomLink {
     /// Commands from connections, handled in arrival order. Bounded: senders wait when the room
     /// falls behind.
     pub commands: mpsc::Sender<Command>,
-    /// Access changes (`SetAccess`, `EndSession`, `RemoveUser`), handled before anything else
-    /// waiting, in the order sent. Unbounded, so that sending one never waits and is never
-    /// refused while the room is open: an access change that could be delayed, dropped or
-    /// overtaken would leave someone with rights they no longer have. They are rare: each
-    /// follows a database change or a join.
-    pub access: mpsc::UnboundedSender<Command>,
+    /// Access changes, handled before anything else waiting, in the order sent. Unbounded, so
+    /// that sending one never waits and is never refused while the room is open: an access
+    /// change that could be delayed, dropped or overtaken would leave someone with rights they
+    /// no longer have. They are rare: each follows a database change or a join.
+    pub access: mpsc::UnboundedSender<AccessChange>,
+}
+
+impl RoomLink {
+    /// A link whose room has ended: every send to it fails.
+    fn closed() -> Self {
+        let (commands, _) = mpsc::channel(1);
+        let (access, _) = mpsc::unbounded_channel();
+        Self { commands, access }
+    }
+}
+
+/// The ways into an open room of either kind.
+#[derive(Clone, Debug)]
+pub(crate) enum Link {
+    /// A text document's room.
+    Text(RoomLink),
+    /// A file document's session.
+    File(FileLink),
+}
+
+impl Link {
+    /// The room's access channel.
+    pub(crate) fn access(&self) -> &mpsc::UnboundedSender<AccessChange> {
+        match self {
+            Link::Text(link) => &link.access,
+            Link::File(link) => &link.access,
+        }
+    }
+
+    /// Whether the room has stopped taking commands.
+    fn is_closed(&self) -> bool {
+        match self {
+            Link::Text(link) => link.commands.is_closed(),
+            Link::File(link) => link.commands.is_closed(),
+        }
+    }
 }
 
 struct RoomHandle {
-    link: RoomLink,
+    link: Link,
     generation: u64,
 }
 
-/// The open rooms, by document.
+/// The open rooms, by document: one room per document, a text room or a file session.
 #[derive(Default)]
 pub(crate) struct Rooms {
     open: Mutex<HashMap<DocId, RoomHandle>>,
@@ -731,7 +779,8 @@ impl Rooms {
     /// to `storage.events`. Once empty, the room stays open for `grace`.
     ///
     /// The channel can be closed by the time it is used, if the room ended meanwhile; the
-    /// caller then asks again.
+    /// caller then asks again. It is closed from the start if a file session is open for
+    /// `doc`, which then is no text document.
     pub(crate) fn open(
         self: &Arc<Self>,
         doc: DocId,
@@ -742,9 +791,12 @@ impl Rooms {
     ) -> RoomLink {
         let mut open = self.open.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(handle) = open.get(&doc)
-            && !handle.link.commands.is_closed()
+            && !handle.link.is_closed()
         {
-            return handle.link.clone();
+            return match &handle.link {
+                Link::Text(link) => link.clone(),
+                Link::File(_) => RoomLink::closed(),
+            };
         }
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         let (commands, rx) = mpsc::channel(COMMAND_CAPACITY);
@@ -760,32 +812,68 @@ impl Rooms {
         open.insert(
             doc,
             RoomHandle {
-                link: link.clone(),
+                link: Link::Text(link.clone()),
                 generation,
             },
         );
         link
     }
 
-    /// Sends the access change `cmd` to `doc`'s room. Nothing happens if the room is not open:
-    /// whoever joins next is checked afresh. Never waits.
-    pub(crate) fn send_to(&self, doc: DocId, cmd: Command) {
+    /// The command channel of `doc`'s file session, starting it if it is not open; see
+    /// [`crate::file_room`]. Like [`Rooms::open`], the channel can be closed by the time it is
+    /// used, and is closed from the start if a text room is open for `doc`.
+    pub(crate) fn open_file(
+        self: &Arc<Self>,
+        doc: DocId,
+        name: String,
+        storage: Storage,
+        grace: Duration,
+    ) -> FileLink {
+        let mut open = self.open.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(handle) = open.get(&doc)
+            && !handle.link.is_closed()
+        {
+            return match &handle.link {
+                Link::File(link) => link.clone(),
+                Link::Text(_) => FileLink::closed(),
+            };
+        }
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        let place = Place {
+            rooms: Arc::clone(self),
+            doc,
+            generation,
+        };
+        let link = file_room::start(place, name, storage, grace);
+        open.insert(
+            doc,
+            RoomHandle {
+                link: Link::File(link.clone()),
+                generation,
+            },
+        );
+        link
+    }
+
+    /// Sends the access change `change` to `doc`'s room. Nothing happens if the room is not
+    /// open: whoever joins next is checked afresh. Never waits.
+    pub(crate) fn send_to(&self, doc: DocId, change: AccessChange) {
         if let Some(link) = self.link(doc) {
             // An error means the room has just ended, with nobody left in it.
-            let _ = link.access.send(cmd);
+            let _ = link.access().send(change);
         }
     }
 
     /// Sends an access change made by `make` to every open room. Never waits.
-    pub(crate) fn send_all(&self, make: impl Fn() -> Command) {
+    pub(crate) fn send_all(&self, make: impl Fn() -> AccessChange) {
         let open = self.open.lock().unwrap_or_else(PoisonError::into_inner);
         for handle in open.values() {
-            let _ = handle.link.access.send(make());
+            let _ = handle.link.access().send(make());
         }
     }
 
     /// The ways into `doc`'s room, if it is open.
-    pub(crate) fn link(&self, doc: DocId) -> Option<RoomLink> {
+    pub(crate) fn link(&self, doc: DocId) -> Option<Link> {
         let open = self.open.lock().unwrap_or_else(PoisonError::into_inner);
         open.get(&doc).map(|handle| handle.link.clone())
     }
@@ -818,14 +906,26 @@ impl Rooms {
 /// The receiving ends of a room's channels.
 struct Channels {
     rx: mpsc::Receiver<Command>,
-    access_rx: mpsc::UnboundedReceiver<Command>,
+    access_rx: mpsc::UnboundedReceiver<AccessChange>,
 }
 
 /// Which registry entry a room task owns.
-struct Place {
+pub(crate) struct Place {
     rooms: Arc<Rooms>,
     doc: DocId,
     generation: u64,
+}
+
+impl Place {
+    /// The document the room is for.
+    pub(crate) fn doc(&self) -> DocId {
+        self.doc
+    }
+
+    /// Removes the room's registry entry, unless a newer room has taken it.
+    pub(crate) fn close(&self) {
+        self.rooms.close(self.doc, self.generation);
+    }
 }
 
 /// Where a room's document is stored, where its revisions are recorded, if anywhere, and where
@@ -836,7 +936,8 @@ pub(crate) struct Storage {
     pub events: EventSink,
 }
 
-type Running = JoinHandle<Result<Outcome, CheckpointError>>;
+/// A checkpoint being written on a blocking task.
+pub(crate) type Running = JoinHandle<Result<Outcome, CheckpointError>>;
 
 /// Loads the document, then handles commands and writes checkpoints until nobody has been
 /// connected for `grace` and everything is saved, or at once when empty once in conflict.
@@ -860,7 +961,7 @@ async fn run(
             eprintln!("sharecraft-server: cannot open document {}: {err}", doc.0);
             // Starting empty would later overwrite the stored document. Refuse everyone who
             // is waiting; a later join opens a fresh room that tries the load again.
-            place.rooms.close(doc, place.generation);
+            place.close();
             access_rx.close();
             rx.close();
             while let Ok(cmd) = rx.try_recv() {
@@ -896,8 +997,8 @@ async fn run(
             // A waiting join is handled before the room can decide to end.
             biased;
             // Access changes go first, so nobody keeps rights while other commands wait.
-            cmd = access_rx.recv(), if access_open => match cmd {
-                Some(cmd) => room.handle(cmd),
+            change = access_rx.recv(), if access_open => match change {
+                Some(change) => room.apply_access(change),
                 None => access_open = false,
             },
             cmd = rx.recv() => match cmd {
@@ -945,7 +1046,7 @@ async fn run(
             break;
         }
     }
-    place.rooms.close(doc, place.generation);
+    place.close();
     // Nobody is left to remove or adjust.
     access_rx.close();
     rx.close();
@@ -955,7 +1056,7 @@ async fn run(
 }
 
 /// When the grace period of a room empty since `since` ends.
-fn grace_end(since: Instant, grace: Duration) -> Instant {
+pub(crate) fn grace_end(since: Instant, grace: Duration) -> Instant {
     since.checked_add(grace).unwrap_or(since)
 }
 
@@ -980,7 +1081,7 @@ async fn load(store: &Arc<dyn Checkpointer>, doc: DocId) -> Result<Initial, Stri
 
 /// The result of the running checkpoint; never ready when none is running. A panic in the
 /// write counts as a failed checkpoint.
-async fn finished(running: &mut Option<Running>) -> Result<Outcome, WriteError> {
+pub(crate) async fn finished(running: &mut Option<Running>) -> Result<Outcome, WriteError> {
     match running {
         Some(handle) => match handle.await {
             Ok(result) => result.map_err(WriteError::from),
@@ -991,7 +1092,7 @@ async fn finished(running: &mut Option<Running>) -> Result<Outcome, WriteError> 
 }
 
 /// Waits until `due`; never ready when there is nothing due.
-async fn sleep_until(due: Option<Instant>) {
+pub(crate) async fn sleep_until(due: Option<Instant>) {
     match due {
         Some(at) => tokio::time::sleep_until(at).await,
         None => std::future::pending().await,
@@ -1379,12 +1480,12 @@ mod tests {
         frames(&mut rx);
         let absent = UserId(Uuid::from_u128(99));
         for role in [None, Some(Role::Viewer), Some(Role::Owner)] {
-            room.handle(Command::SetAccess { user: absent, role });
+            room.apply_access(AccessChange::SetAccess { user: absent, role });
         }
-        room.handle(Command::EndSession {
+        room.apply_access(AccessChange::EndSession {
             session: SessionId(Uuid::from_u128(99)),
         });
-        room.handle(Command::RemoveUser { user: absent });
+        room.apply_access(AccessChange::RemoveUser { user: absent });
         assert_eq!(room.members.len(), 1);
         assert_eq!(room.members[0].role, Role::Editor);
         assert!(frames(&mut rx).is_empty());
@@ -1398,7 +1499,7 @@ mod tests {
         let mut rx_a = join(&mut room, 1, a);
         let mut rx_b = join(&mut room, 2, b);
         frames(&mut rx_a);
-        room.handle(Command::SetAccess {
+        room.apply_access(AccessChange::SetAccess {
             user: UserId(b.0),
             role: None,
         });
@@ -1518,7 +1619,7 @@ mod tests {
         // The change is handed over without waiting for room in that queue ...
         rooms.send_to(
             doc,
-            Command::SetAccess {
+            AccessChange::SetAccess {
                 user: bob,
                 role: None,
             },
@@ -1701,7 +1802,7 @@ mod tests {
         let user = UserId(a.0);
 
         // Editor to owner: they may still edit, and are told, so the page can offer sharing.
-        room.handle(Command::SetAccess {
+        room.apply_access(AccessChange::SetAccess {
             user,
             role: Some(Role::Owner),
         });
@@ -1718,7 +1819,7 @@ mod tests {
         );
 
         // Owner to editor: told again, so the page can take sharing away.
-        room.handle(Command::SetAccess {
+        room.apply_access(AccessChange::SetAccess {
             user,
             role: Some(Role::Editor),
         });
@@ -1734,7 +1835,7 @@ mod tests {
             "{got:?}"
         );
 
-        room.handle(Command::SetAccess {
+        room.apply_access(AccessChange::SetAccess {
             user,
             role: Some(Role::Viewer),
         });
@@ -1746,7 +1847,7 @@ mod tests {
         );
 
         // The same role again changes nothing.
-        room.handle(Command::SetAccess {
+        room.apply_access(AccessChange::SetAccess {
             user,
             role: Some(Role::Viewer),
         });
