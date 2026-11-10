@@ -11,6 +11,10 @@ pub const DEFAULT_ADDR: &str = "127.0.0.1:8787";
 pub const DEFAULT_DATA: &str = "./data";
 /// Static file directory used when `SHARECRAFT_WEB` is not set.
 pub const DEFAULT_WEB: &str = "./web";
+/// Directory of installed editors used when `SHARECRAFT_EDITORS_DIR` is not set.
+pub const DEFAULT_EDITORS: &str = "./editors";
+/// Largest file a document may hold, in bytes, when `SHARECRAFT_MAX_FILE_BYTES` is not set.
+pub const DEFAULT_MAX_FILE_BYTES: usize = 64 * 1024 * 1024;
 
 /// How the server runs.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -34,6 +38,10 @@ pub struct Config {
     pub write_timeout: Duration,
     /// The PostgreSQL database holding accounts, sessions and access grants.
     pub database_url: DatabaseUrl,
+    /// Where the built editors are installed, one folder per editor, served at `/editors`.
+    pub editors_dir: PathBuf,
+    /// The largest file, in bytes, a file document may hold.
+    pub max_file_bytes: usize,
 }
 
 /// A database URL. It usually holds a password, so `Debug` never shows it.
@@ -75,42 +83,60 @@ pub enum ConfigError {
     /// `DATABASE_URL` is unset or empty.
     #[error("DATABASE_URL is not set")]
     NoDatabase,
+    /// The file size limit is not a whole number of bytes above zero.
+    #[error("SHARECRAFT_MAX_FILE_BYTES {0:?} is not a number of bytes above zero")]
+    BadMaxFileBytes(String),
 }
 
 impl Config {
-    /// Reads `SHARECRAFT_ADDR`, `SHARECRAFT_DATA` and `SHARECRAFT_WEB`, using the defaults for
-    /// any that are unset, and `DATABASE_URL`, which is required.
+    /// Reads `SHARECRAFT_ADDR`, `SHARECRAFT_DATA`, `SHARECRAFT_WEB`, `SHARECRAFT_EDITORS_DIR` and
+    /// `SHARECRAFT_MAX_FILE_BYTES`, using the defaults for any that are unset, and
+    /// `DATABASE_URL`, which is required.
     ///
     /// # Errors
-    /// `BadAddr` or `NotLoopback` for an unusable address, `NotUnicode` for an unreadable
-    /// variable, `NoDatabase` when `DATABASE_URL` is unset or empty.
+    /// `BadAddr` or `NotLoopback` for an unusable address, `BadMaxFileBytes` for an unusable
+    /// limit, `NotUnicode` for an unreadable variable, `NoDatabase` when `DATABASE_URL` is unset
+    /// or empty.
     pub fn from_env() -> Result<Self, ConfigError> {
         let addr = read_var("SHARECRAFT_ADDR")?;
         let data = read_var("SHARECRAFT_DATA")?;
         let web = read_var("SHARECRAFT_WEB")?;
+        let editors = read_var("SHARECRAFT_EDITORS_DIR")?;
+        let max_file_bytes = read_var("SHARECRAFT_MAX_FILE_BYTES")?;
         let database = read_var(DATABASE_VARIABLE)?;
         Self::from_values(
             addr.as_deref(),
             data.as_deref(),
             web.as_deref(),
             database.as_deref(),
+            editors.as_deref(),
+            max_file_bytes.as_deref(),
         )
     }
 
-    /// Builds the settings from the given values, using the defaults for any of the first three
-    /// that are `None`. The database URL has no default.
+    /// Builds the settings from the given values, using the defaults for any that are `None`,
+    /// except the database URL, which has none.
     ///
     /// # Errors
     /// `BadAddr` or `NotLoopback` for an unusable address, `NoDatabase` for a missing or empty
-    /// database URL.
+    /// database URL, `BadMaxFileBytes` for a limit that is not a number above zero.
     pub fn from_values(
         addr: Option<&str>,
         data_dir: Option<&str>,
         web_dir: Option<&str>,
         database_url: Option<&str>,
+        editors_dir: Option<&str>,
+        max_file_bytes: Option<&str>,
     ) -> Result<Self, ConfigError> {
         let addr = parse_addr(addr.unwrap_or(DEFAULT_ADDR))?;
         let database_url = database_url_from(database_url)?;
+        let max_file_bytes = match max_file_bytes {
+            None => DEFAULT_MAX_FILE_BYTES,
+            Some(text) => match text.trim().parse::<usize>() {
+                Ok(bytes) if bytes > 0 => bytes,
+                _ => return Err(ConfigError::BadMaxFileBytes(text.to_owned())),
+            },
+        };
         Ok(Self {
             addr,
             data_dir: PathBuf::from(data_dir.unwrap_or(DEFAULT_DATA)),
@@ -120,6 +146,8 @@ impl Config {
             room_grace: Duration::from_secs(60),
             write_timeout: Duration::from_secs(10),
             database_url,
+            editors_dir: PathBuf::from(editors_dir.unwrap_or(DEFAULT_EDITORS)),
+            max_file_bytes,
         })
     }
 }
@@ -179,7 +207,8 @@ mod tests {
 
     #[test]
     fn defaults_are_local() {
-        let c = Config::from_values(None, None, None, Some("postgres://local")).unwrap();
+        let c =
+            Config::from_values(None, None, None, Some("postgres://local"), None, None).unwrap();
         assert_eq!(c.addr, "127.0.0.1:8787".parse().unwrap());
         assert_eq!(c.data_dir, PathBuf::from("./data"));
         assert_eq!(c.web_dir, PathBuf::from("./web"));
@@ -187,6 +216,32 @@ mod tests {
         assert_eq!(c.checkpoint_max, Duration::from_secs(30));
         assert_eq!(c.room_grace, Duration::from_secs(60));
         assert_eq!(c.write_timeout, Duration::from_secs(10));
+        assert_eq!(c.editors_dir, PathBuf::from("./editors"));
+        assert_eq!(c.max_file_bytes, 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn editors_directory_and_file_limit_can_be_set() {
+        let c = Config::from_values(
+            None,
+            None,
+            None,
+            Some("postgres://local"),
+            Some("/srv/editors"),
+            Some(" 1048576 "),
+        )
+        .unwrap();
+        assert_eq!(c.editors_dir, PathBuf::from("/srv/editors"));
+        assert_eq!(c.max_file_bytes, 1_048_576);
+    }
+
+    #[test]
+    fn unusable_file_limit_is_an_error() {
+        for bad in ["", "0", "-5", "lots", "1.5"] {
+            let result =
+                Config::from_values(None, None, None, Some("postgres://local"), None, Some(bad));
+            assert_eq!(result, Err(ConfigError::BadMaxFileBytes(bad.into())));
+        }
     }
 
     #[test]

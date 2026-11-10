@@ -865,13 +865,18 @@ fn non_loopback_address_is_refused() {
     assert!(server::config::parse_addr("192.168.1.5:8787").is_err());
     assert!(server::config::parse_addr("127.0.0.1:8787").is_ok());
     assert!(server::config::parse_addr("[::1]:8787").is_ok());
-    let built =
-        server::Config::from_values(Some("0.0.0.0:8787"), None, None, Some("postgres://unused"));
+    let built = server::Config::from_values(
+        Some("0.0.0.0:8787"),
+        None,
+        None,
+        Some("postgres://unused"),
+        None,
+        None,
+    );
     assert!(built.is_err());
 }
 
-const CSP: &str =
-    "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; frame-ancestors 'none'";
+const CSP: &str = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; frame-src 'self'; frame-ancestors 'none'";
 
 fn assert_security_headers(headers: &reqwest::header::HeaderMap, what: &str) {
     let get = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
@@ -901,13 +906,19 @@ async fn responses_carry_security_headers() {
             .await
             .unwrap();
         assert_security_headers(response.headers(), path);
+        // Static files are revalidated, so an upgrade never runs a stale script.
+        let expected: Option<&[u8]> = if path == "/healthz" {
+            None
+        } else {
+            Some(b"no-cache")
+        };
         assert_eq!(
             response
                 .headers()
                 .get("cache-control")
                 .map(|v| v.as_bytes()),
-            None,
-            "{path} is a static page or health check and may be cached"
+            expected,
+            "{path}"
         );
     }
     for (path, cookie) in [

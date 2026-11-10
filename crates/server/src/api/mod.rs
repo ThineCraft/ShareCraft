@@ -33,6 +33,7 @@ pub(crate) fn router() -> Router<AppState> {
     Router::new()
         .route("/session", post(session::sign_in).delete(session::sign_out))
         .route("/me", get(session::me))
+        .route("/editors", get(crate::editors::list))
         .route("/docs", get(docs::list).post(docs::create))
         .route("/docs/{id}", get(docs::open))
         .route("/docs/{id}/access", get(docs::access).put(docs::share))
@@ -302,6 +303,8 @@ mod tests {
             room_grace: Duration::from_secs(60),
             write_timeout: Duration::from_secs(10),
             database_url: DatabaseUrl::new(test.url()),
+            editors_dir: dir.join("editors"),
+            max_file_bytes: 64 << 20,
         };
         let store = RevisionStore::open(&crate::library_path(dir)).unwrap();
         AppState::new(config, Arc::new(store), test.db.clone())

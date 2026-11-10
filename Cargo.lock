@@ -2340,6 +2340,7 @@ name = "server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64 0.23.1",
  "collab-core",
  "collab-text",
  "dotenvy",
@@ -2352,6 +2353,7 @@ dependencies = [
  "rpassword",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
  "sqlx",
  "tempfile",
  "thiserror",

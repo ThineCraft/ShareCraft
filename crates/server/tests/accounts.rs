@@ -400,17 +400,24 @@ async fn oversized_or_non_json_body_is_refused() {
 
 #[test]
 fn missing_database_url_is_a_config_error() {
-    let err = Config::from_values(None, None, None, None).unwrap_err();
+    let err = Config::from_values(None, None, None, None, None, None).unwrap_err();
     assert_eq!(err, ConfigError::NoDatabase);
     assert_eq!(err.to_string(), "DATABASE_URL is not set");
-    let blank = Config::from_values(None, None, None, Some("  "));
+    let blank = Config::from_values(None, None, None, Some("  "), None, None);
     assert_eq!(blank, Err(ConfigError::NoDatabase));
 }
 
 #[test]
 fn config_debug_hides_the_database_url() {
-    let config =
-        Config::from_values(None, None, None, Some("postgres://ann:s3cret@db.invalid/x")).unwrap();
+    let config = Config::from_values(
+        None,
+        None,
+        None,
+        Some("postgres://ann:s3cret@db.invalid/x"),
+        None,
+        None,
+    )
+    .unwrap();
     let shown = format!("{config:?}");
     assert!(!shown.contains("s3cret"), "{shown}");
     assert!(!shown.contains("db.invalid"), "{shown}");

@@ -300,7 +300,33 @@ fn config_at(data_dir: &Path, db: &TestDb) -> Config {
         room_grace: LONG_GRACE,
         write_timeout: Duration::from_secs(10),
         database_url: server::config::DatabaseUrl::new(db.url()),
+        editors_dir: data_dir.join("editors"),
+        max_file_bytes: 64 << 20,
     }
+}
+
+/// Where the stub editor fixture is.
+pub fn stub_editor_fixture() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/editors/stub")
+}
+
+/// Installs a copy of the stub editor under `config.editors_dir` as editor `id`, with its
+/// manifest rewritten to name that id, and returns its folder. Call it from the `edit` closure
+/// of [`spawn_server_config`]: the server reads its editors when it starts.
+pub fn install_stub_editor(config: &Config, id: &str) -> PathBuf {
+    let folder = config.editors_dir.join(id);
+    std::fs::create_dir_all(&folder).unwrap();
+    let fixture = stub_editor_fixture();
+    std::fs::copy(fixture.join("index.html"), folder.join("index.html")).unwrap();
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(fixture.join("editor.json")).unwrap()).unwrap();
+    manifest["id"] = serde_json::Value::String(id.to_owned());
+    std::fs::write(
+        folder.join("editor.json"),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    folder
 }
 
 /// A grace period no test waits out: an empty room stays open for the whole test.

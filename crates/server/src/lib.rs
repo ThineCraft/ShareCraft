@@ -11,6 +11,7 @@ mod auth;
 mod checkpoint;
 pub mod cli;
 pub mod config;
+pub mod editors;
 mod events;
 mod projection;
 mod room;
@@ -22,7 +23,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use axum::Router;
 use axum::extract::Request;
 use axum::http::HeaderValue;
-use axum::http::header::{CONTENT_SECURITY_POLICY, REFERRER_POLICY, X_CONTENT_TYPE_OPTIONS};
+use axum::http::header::{
+    CACHE_CONTROL, CONTENT_SECURITY_POLICY, REFERRER_POLICY, X_CONTENT_TYPE_OPTIONS,
+};
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::get;
@@ -38,6 +41,7 @@ pub use projection::{Report, rebuild, reconcile};
 
 use auth::Throttle;
 use checkpoint::Timing;
+use editors::Editors;
 use events::EventSink;
 use room::{RoomLink, Rooms, Storage};
 
@@ -52,6 +56,7 @@ struct Shared {
     rooms: Arc<Rooms>,
     checkpointer: Arc<dyn Checkpointer>,
     db: Db,
+    editors: Editors,
     events: EventSink,
     throttle: Throttle,
     next_conn: AtomicU64,
@@ -62,12 +67,14 @@ impl AppState {
     /// `checkpointer` and keeping accounts and sessions in `db`.
     #[must_use]
     pub fn new(config: Config, checkpointer: Arc<dyn Checkpointer>, db: Db) -> Self {
+        let editors_dir = config.editors_dir.clone();
         Self {
             shared: Arc::new(Shared {
                 config,
                 rooms: Arc::new(Rooms::default()),
                 checkpointer,
                 events: EventSink::start(db.clone()),
+                editors: Editors::load(&editors_dir),
                 db,
                 throttle: Throttle::default(),
                 next_conn: AtomicU64::new(1),
@@ -85,6 +92,12 @@ impl AppState {
     #[must_use]
     pub fn db(&self) -> &Db {
         &self.shared.db
+    }
+
+    /// The editors installed when the server started.
+    #[must_use]
+    pub fn editors(&self) -> &Editors {
+        &self.shared.editors
     }
 
     fn throttle(&self) -> &Throttle {
@@ -128,33 +141,50 @@ impl AppState {
 /// - `GET /ws/docs/{doc_id}` opens a document session for a signed-in person with a role on
 ///   the document;
 /// - `GET /api/docs/{id}/events` lists a document's latest events, for its owners;
+/// - `GET /api/editors` lists the installed editors, and `GET /editors/{id}/*` serves an
+///   installed editor's files, for a signed-in caller;
 /// - anything else is a static file from `web_dir`.
 ///
 /// Every response carries the security headers (see [`security_headers`]); `/api` answers are
 /// never cached.
 pub fn router(state: AppState) -> Router {
-    let files = ServeDir::new(&state.config().web_dir);
+    let files = Router::new()
+        .fallback_service(ServeDir::new(&state.config().web_dir))
+        .layer(middleware::from_fn(no_cache));
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .nest("/api", api::router())
         .route("/ws/docs/{doc_id}", get(ws::upgrade))
+        .merge(editors::router(state.clone()))
         .fallback_service(files)
         .layer(middleware::from_fn(security_headers))
         .with_state(state)
 }
 
-/// What a page may load: its own files only, no inline script or style, and WebAssembly.
-const CONTENT_SECURITY_POLICY_VALUE: &str =
-    "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; frame-ancestors 'none'";
+/// What a page may load: its own files only, no inline script or style, and WebAssembly. It may
+/// frame its own pages (the frame page embeds an editor) and is framed by none.
+const CONTENT_SECURITY_POLICY_VALUE: &str = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; frame-src 'self'; frame-ancestors 'none'";
 
-/// Adds the security headers to every response: pages, API, WebSocket handshake and errors.
+/// Makes browsers ask again before using a static file, so an upgrade never runs a stale script.
+async fn no_cache(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    response
+}
+
+/// Adds the security headers to every response: pages, API, WebSocket handshake and errors. An
+/// answer that already carries a Content-Security-Policy (an editor's) keeps it.
 async fn security_headers(request: Request, next: Next) -> Response {
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
-    headers.insert(
-        CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static(CONTENT_SECURITY_POLICY_VALUE),
-    );
+    if !headers.contains_key(CONTENT_SECURITY_POLICY) {
+        headers.insert(
+            CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static(CONTENT_SECURITY_POLICY_VALUE),
+        );
+    }
     headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
     headers.insert(REFERRER_POLICY, HeaderValue::from_static("same-origin"));
     response

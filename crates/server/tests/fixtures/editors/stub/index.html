@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Stub editor</title>
+<style>
+body { font-family: sans-serif; margin: 1rem; }
+textarea { display: block; width: 30rem; height: 8rem; margin-bottom: 0.5rem; }
+</style>
+</head>
+<body>
+<textarea id="text" aria-label="Document text"></textarea>
+<button id="save">Save</button>
+<button id="export">Export</button>
+<script>
+const id = location.pathname.split("/")[2];
+const text = document.getElementById("text");
+const post = (kind, fields) =>
+  window.parent.postMessage({ type: id + ":" + kind, ...fields }, location.origin);
+const bytes = () => new TextEncoder().encode(text.value).buffer;
+const save = (name) => { const b = bytes(); post("save", { name, bytes: b }); };
+window[id] = {
+  execute(command) {
+    if (command !== "file.save") return false;
+    save("Book.xlsx");
+    return true;
+  },
+};
+window.addEventListener("message", (event) => {
+  if (event.origin !== location.origin || event.source !== window.parent) return;
+  const data = event.data || {};
+  if (data.type === id + ":open" && data.bytes) {
+    text.value = new TextDecoder().decode(data.bytes);
+  }
+});
+text.addEventListener("input", () => post("dirty", { dirty: true }));
+document.getElementById("save").addEventListener("click", () => save("Book.xlsx"));
+document.getElementById("export").addEventListener("click", () => save("export.pdf"));
+post("ready", { version: "1", appVersion: "stub", file: false });
+</script>
+</body>
+</html>

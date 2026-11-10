@@ -1,0 +1,19 @@
+{
+  "id": "stub",
+  "version": "0.0.0-stub",
+  "fork": {
+    "repository": "https://example.invalid/stub-fork",
+    "commit": "0000000000000000000000000000000000000001"
+  },
+  "upstream": {
+    "repository": "https://example.invalid/stub-upstream",
+    "commit": "0000000000000000000000000000000000000002"
+  },
+  "built": "2026-11-10",
+  "script_hashes": [
+    "sha256-cv+fPievrWEkiz6QQCkuqMqXZBo7oEwlwRRrbk5nsGo="
+  ],
+  "style_hashes": [
+    "sha256-mpvZvGqKIlfoxBbCqrDP204Djk79TmCol4zwyuTedtY="
+  ]
+}
