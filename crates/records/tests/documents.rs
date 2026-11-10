@@ -284,7 +284,8 @@ async fn two_removals_racing_leave_one_owner() {
         let mut waiting = 0i64;
         for _ in 0..200 {
             waiting = sqlx::query_scalar(
-                "select count(*) from pg_stat_activity                  where wait_event_type = 'Lock' and query like '%for update%'",
+                "select count(*) from pg_stat_activity \
+                 where wait_event_type = 'Lock' and query like '%for update%'",
             )
             .fetch_one(test.db.test_pool())
             .await

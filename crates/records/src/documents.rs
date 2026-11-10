@@ -274,7 +274,10 @@ impl Db {
         let mut conn = self.pool().acquire().await?;
         require_owner(&mut conn, actor, doc).await?;
         let rows = sqlx::query(
-            "select u.id, u.email, u.name, u.is_admin, (u.disabled_at is not null) as disabled,                     a.role              from document_access a join users u on u.id = a.user_id              where a.document_id = $1 order by u.name, u.id",
+            "select u.id, u.email, u.name, u.is_admin, (u.disabled_at is not null) as disabled, \
+             a.role \
+             from document_access a join users u on u.id = a.user_id \
+             where a.document_id = $1 order by u.name, u.id",
         )
         .bind(doc.0)
         .fetch_all(&mut *conn)

@@ -937,7 +937,13 @@ async fn run(
         // A room in conflict has nothing to resume, so it does not wait out the grace period.
         let grace_over = empty_since
             .is_some_and(|since| room.in_conflict() || grace_end(since, grace) <= Instant::now());
-        if grace_over && running.is_none() && room.may_end() {
+        // A command that arrived meanwhile, a join above all, is handled before the room ends.
+        if grace_over
+            && running.is_none()
+            && room.may_end()
+            && rx.is_empty()
+            && access_rx.is_empty()
+        {
             break;
         }
     }
@@ -1545,6 +1551,131 @@ mod tests {
             ),
             "{got:?}"
         );
+    }
+
+    /// A checkpoint that waits until the test lets it finish.
+    struct Gated {
+        started: std::sync::Mutex<std::sync::mpsc::Sender<()>>,
+        gate: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl Checkpointer for Gated {
+        fn write(&self, _c: &revisions::Checkpoint<'_>) -> Result<Outcome, CheckpointError> {
+            self.started.lock().unwrap().send(()).unwrap();
+            self.gate.lock().unwrap().recv().unwrap();
+            Ok(Outcome::Written(format!("{:040x}", 1).parse().unwrap()))
+        }
+
+        fn load(&self, _doc: DocId) -> Result<Option<revisions::Stored>, CheckpointError> {
+            Ok(None)
+        }
+
+        fn describe(
+            &self,
+            _doc: DocId,
+            _revision: &RevisionId,
+        ) -> Result<Option<revisions::RevisionInfo>, CheckpointError> {
+            Ok(None)
+        }
+
+        fn history(&self, _doc: DocId) -> Result<Vec<revisions::RevisionInfo>, CheckpointError> {
+            Ok(Vec::new())
+        }
+
+        fn documents(&self) -> Result<Vec<DocId>, revisions::GitError> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// An empty room whose grace period is over only waits for its last checkpoint. When that
+    /// checkpoint finishes in the same moment a join is waiting, the join is accepted and the
+    /// room stays; it does not give up and end, leaving the join unanswered. The test thread
+    /// is the room's only thread, so the room sees the join and the finished checkpoint
+    /// together.
+    #[tokio::test]
+    async fn pending_join_wins_over_giving_up() {
+        let (started_tx, started) = std::sync::mpsc::channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        let store: Arc<dyn Checkpointer> = Arc::new(Gated {
+            started: std::sync::Mutex::new(started_tx),
+            gate: std::sync::Mutex::new(gate),
+        });
+        let rooms = Arc::new(Rooms::default());
+        let doc = DocId(Uuid::from_u128(78));
+        let link = rooms.open(
+            doc,
+            "Notes.txt".into(),
+            Storage {
+                store,
+                db: None,
+                events: EventSink::discard(),
+            },
+            Timing {
+                idle: Duration::from_millis(100),
+                max: Duration::from_secs(30),
+            },
+            Duration::from_millis(20),
+        );
+        let join = |n: u128| {
+            let (tx, out) = mpsc::channel(OUTBOUND_CAPACITY);
+            let (accepted, reply) = oneshot::channel();
+            let cmd = Command::Join {
+                conn: u64::try_from(n).unwrap(),
+                client: ClientId(Uuid::from_u128(n)),
+                user: UserId(Uuid::from_u128(2)),
+                session: SessionId(Uuid::from_u128(3)),
+                name: "Bob".into(),
+                role: Role::Editor,
+                resume: None,
+                tx,
+                accepted,
+            };
+            (cmd, reply, out)
+        };
+
+        // Bob types and leaves: the empty room has an unsaved change and starts saving at once.
+        let (first, first_reply, _first_out) = join(1);
+        link.commands.send(first).await.unwrap();
+        assert_eq!(first_reply.await.unwrap(), JoinReply::Accepted);
+        let bob = ClientId(Uuid::from_u128(1));
+        link.commands
+            .send(Command::Submit {
+                conn: 1,
+                client: bob,
+                op_id: OpId(Uuid::from_u128(5)),
+                base: Seq(0),
+                op: TextOp::replace(0, 0, 0, "x").unwrap(),
+            })
+            .await
+            .unwrap();
+        link.commands
+            .send(Command::Leave {
+                conn: 1,
+                client: bob,
+            })
+            .await
+            .unwrap();
+        tokio::task::spawn_blocking(move || {
+            started.recv_timeout(Duration::from_secs(5)).unwrap();
+            started
+        })
+        .await
+        .unwrap();
+
+        // The grace period ends while the checkpoint is still being written. With the room not
+        // running, a join queues up and the checkpoint is let go; both wait for the room.
+        std::thread::sleep(Duration::from_millis(100));
+        let (second, second_reply, _second_out) = join(4);
+        link.commands.send(second).await.unwrap();
+        release.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+
+        let reply = tokio::time::timeout(Duration::from_secs(5), second_reply)
+            .await
+            .expect("the join was not answered in time")
+            .expect("the room ended and dropped the join unanswered");
+        assert_eq!(reply, JoinReply::Accepted);
+        assert!(rooms.link(doc).is_some(), "the room ended despite the join");
     }
 
     #[test]

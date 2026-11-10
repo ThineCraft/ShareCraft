@@ -77,12 +77,20 @@ fn load_env(root: &Path) -> Result<()> {
     match dotenvy::from_path(root.join(".env")) {
         Ok(()) => Ok(()),
         Err(e) if e.not_found() => Ok(()),
-        // Never show the error itself: for a malformed line it prints the line, and so a secret.
-        Err(dotenvy::Error::LineParse(_, index)) => {
-            Err(format!("cannot read .env: line {index} is malformed"))
+        Err(e) => Err(env_error_message(&e)),
+    }
+}
+
+/// What to say about a `.env` that could not be read. Never shows the error itself: for a
+/// malformed line it prints the line, and so a secret.
+fn env_error_message(error: &dotenvy::Error) -> String {
+    match error {
+        // The index counts characters into the offending line; dotenvy does not say which line.
+        dotenvy::Error::LineParse(_, index) => {
+            format!("cannot read .env: a line is malformed, at character {index} of that line")
         }
-        Err(dotenvy::Error::Io(e)) => Err(format!("cannot read .env: {}", e.kind())),
-        Err(_) => Err("cannot read .env".to_owned()),
+        dotenvy::Error::Io(e) => format!("cannot read .env: {}", e.kind()),
+        _ => "cannot read .env".to_owned(),
     }
 }
 
@@ -333,6 +341,21 @@ mod tests {
         assert!(licence_allowed("(MIT OR Apache-2.0) AND Unicode-3.0"));
         assert!(!licence_allowed("MIT AND LGPL-2.1-or-later"));
         assert!(!licence_allowed(""));
+    }
+
+    #[test]
+    fn malformed_env_line_is_reported_by_position_without_its_content() {
+        let error = dotenvy::Error::LineParse("PASSWORD=\"hunter2".to_owned(), 9);
+        let message = env_error_message(&error);
+        assert_eq!(
+            message,
+            "cannot read .env: a line is malformed, at character 9 of that line"
+        );
+        assert!(!message.contains("hunter2") && !message.contains("PASSWORD"));
+        assert!(
+            !message.contains("line 9"),
+            "the index is not a line number"
+        );
     }
 
     #[test]

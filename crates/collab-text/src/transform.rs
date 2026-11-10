@@ -29,9 +29,9 @@ fn remainder(c: Component, used: usize) -> Option<Component> {
 /// [`collab_core::document::Document::transform`]; `first` wins ties between inserts.
 pub(crate) fn transform(first: &TextOp, second: &TextOp) -> Result<(TextOp, TextOp), TextError> {
     if first.base_len() != second.base_len() {
-        return Err(TextError::LengthMismatch {
-            expected: first.base_len(),
-            actual: second.base_len(),
+        return Err(TextError::BaseLengthsDiffer {
+            first: first.base_len(),
+            second: second.base_len(),
         });
     }
     let mut a_iter = first.components().iter().cloned();
@@ -140,12 +140,18 @@ mod tests {
     fn transform_rejects_different_base_len() {
         let a = TextOp::builder().retain(3).build();
         let b = TextOp::builder().retain(4).build();
+        let err = TextDoc::transform(&a, &b).unwrap_err();
         assert_eq!(
-            TextDoc::transform(&a, &b),
-            Err(TextError::LengthMismatch {
-                expected: 3,
-                actual: 4
-            })
+            err,
+            TextError::BaseLengthsDiffer {
+                first: 3,
+                second: 4
+            }
+        );
+        // It does not claim to know the document's length.
+        assert_eq!(
+            err.to_string(),
+            "the two operations expect different document lengths (3 and 4 characters)"
         );
     }
 }

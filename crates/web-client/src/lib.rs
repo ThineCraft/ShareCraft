@@ -1185,4 +1185,69 @@ mod tests {
             .unwrap();
         assert_eq!(update.save.unwrap().state, SaveState::Saved);
     }
+
+    /// The keys web/doc.js reads from the JSON of an [`Update`] (`handleFrame`, `showRemote`,
+    /// `moveThrough`, `showPeople` and `render`). Renaming any of them silently breaks the page,
+    /// so the names are pinned here; change doc.js and this test together.
+    #[test]
+    fn update_field_names_are_pinned() {
+        let update = Update {
+            text_changed: true,
+            text: "t".into(),
+            edits: vec![Edit {
+                start_utf16: 1,
+                removed_utf16: 2,
+                inserted_utf16: 3,
+            }],
+            send: Some("m".into()),
+            people: Some(vec![Person {
+                name: "Ann".into(),
+                me: true,
+                can_edit: false,
+            }]),
+            save: Some(SaveView {
+                state: SaveState::Saving,
+                revision: None,
+            }),
+            dropped: 4,
+            reset: Some(ResetKind::ReopenedLostText),
+            refused: Some("read_only".into()),
+            can_edit: Some(true),
+            removed: Some("signed_out".into()),
+        };
+        let json = serde_json::to_value(&update).unwrap();
+        let has = |value: &serde_json::Value, wanted: &[&str]| {
+            let object = value.as_object().unwrap();
+            for key in wanted {
+                assert!(object.contains_key(*key), "missing {key} in {value}");
+            }
+        };
+        has(
+            &json,
+            &[
+                "can_edit",
+                "dropped",
+                "edits",
+                "people",
+                "refused",
+                "removed",
+                "reset",
+                "save",
+                "send",
+                "text",
+                "text_changed",
+            ],
+        );
+        has(
+            &json["edits"][0],
+            &["start_utf16", "removed_utf16", "inserted_utf16"],
+        );
+        has(&json["people"][0], &["name", "me", "can_edit"]);
+        has(&json["save"], &["state"]);
+        // The values doc.js compares against.
+        assert_eq!(json["save"]["state"], "saving");
+        assert_eq!(json["reset"], "reopened_lost_text");
+        assert_eq!(json["removed"], "signed_out");
+        assert_eq!(json["refused"], "read_only");
+    }
 }

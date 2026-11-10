@@ -310,4 +310,99 @@ mod tests {
             assert_eq!(back, m);
         }
     }
+
+    /// The `type` string of every message, which the page and the server both rely on. Each
+    /// `match` is exhaustive, so adding a variant fails to compile until it is listed here.
+    #[test]
+    fn message_type_tags_are_pinned() {
+        fn client_tag(msg: &ClientMsg<u32>) -> &'static str {
+            match msg {
+                ClientMsg::Join { .. } => "join",
+                ClientMsg::Submit { .. } => "submit",
+                ClientMsg::Cursor { .. } => "cursor",
+            }
+        }
+        fn server_tag(msg: &ServerMsg<u32>) -> &'static str {
+            match msg {
+                ServerMsg::Joined { .. } => "joined",
+                ServerMsg::Reset { .. } => "reset",
+                ServerMsg::Committed { .. } => "committed",
+                ServerMsg::People { .. } => "people",
+                ServerMsg::Save { .. } => "save",
+                ServerMsg::Refused { .. } => "refused",
+                ServerMsg::Access { .. } => "access",
+                ServerMsg::Removed { .. } => "removed",
+            }
+        }
+        let tag_of = |json: String| -> String {
+            let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+            value["type"].as_str().unwrap().to_owned()
+        };
+        let epoch = RoomEpoch(Uuid::nil());
+        let client: Vec<ClientMsg<u32>> = vec![
+            ClientMsg::Join {
+                client: ClientId(Uuid::nil()),
+                resume: None,
+            },
+            ClientMsg::Submit {
+                op_id: OpId(Uuid::nil()),
+                base: Seq(0),
+                op: 1,
+            },
+            ClientMsg::Cursor { at: None },
+        ];
+        for msg in &client {
+            assert_eq!(tag_of(serde_json::to_string(msg).unwrap()), client_tag(msg));
+        }
+        let server: Vec<ServerMsg<u32>> = vec![
+            ServerMsg::Joined {
+                epoch,
+                seq: Seq(0),
+                snapshot: None,
+                revision: None,
+                participants: vec![],
+                can_edit: true,
+                saved_through: Seq(0),
+            },
+            ServerMsg::Reset {
+                epoch,
+                seq: Seq(0),
+                snapshot: String::new(),
+                revision: None,
+                can_edit: true,
+                saved_through: Seq(0),
+            },
+            ServerMsg::Committed {
+                entry: Entry {
+                    seq: Seq(1),
+                    client: ClientId(Uuid::nil()),
+                    op_id: OpId(Uuid::nil()),
+                    op: 1,
+                },
+            },
+            ServerMsg::People {
+                participants: vec![],
+            },
+            ServerMsg::Save {
+                state: SaveState::Saved,
+                revision: None,
+                through: Seq(0),
+            },
+            ServerMsg::Refused {
+                op_id: OpId(Uuid::nil()),
+                reason: String::new(),
+            },
+            ServerMsg::Access { can_edit: true },
+            ServerMsg::Removed {
+                reason: RemovedReason::SignedOut,
+            },
+        ];
+        for msg in &server {
+            assert_eq!(tag_of(serde_json::to_string(msg).unwrap()), server_tag(msg));
+        }
+        // The strings are written out in the matches above; this checks they are the
+        // strings on the wire, and that no sample was dropped from the lists.
+        assert_eq!(client.len(), 3);
+        assert_eq!(server.len(), 8);
+    }
 }

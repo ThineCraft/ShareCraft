@@ -578,4 +578,27 @@ mod tests {
         move_refs(&repo, doc, new, Some(first_oid), Some(other), &sig).unwrap();
         assert_eq!(tips(&repo), (new, new));
     }
+
+    #[test]
+    fn revision_id_rejects_wrong_length_uppercase_and_non_hex() {
+        let good = "0123456789abcdef0123456789abcdef01234567";
+        assert!(good.parse::<RevisionId>().is_ok());
+        for bad in [
+            String::new(),
+            good[..39].to_owned(),
+            format!("{good}0"),
+            good.to_uppercase(),
+            "ABCDEF0123456789ABCDEF0123456789ABCDEF01".to_owned(),
+            format!("g{}", &good[1..]),
+            format!("{} ", &good[..39]),
+        ] {
+            assert!(bad.parse::<RevisionId>().is_err(), "{bad:?}");
+            assert!(RevisionId::try_from(bad.clone()).is_err(), "{bad:?}");
+            let json = serde_json::to_string(&bad).unwrap();
+            assert!(
+                serde_json::from_str::<RevisionId>(&json).is_err(),
+                "{bad:?}"
+            );
+        }
+    }
 }

@@ -555,4 +555,33 @@ mod tests {
         let due = s.due(Seq(1), true).unwrap();
         assert!(due >= before + timing().idle);
     }
+
+    /// Typing that never pauses keeps pushing the idle deadline back, but the checkpoint is
+    /// still due `max` after the first unsaved change.
+    #[tokio::test(start_paused = true)]
+    async fn checkpoint_is_due_at_max_while_typing_continues() {
+        let t = Timing {
+            idle: Duration::from_millis(100),
+            max: Duration::from_secs(1),
+        };
+        let mut s = Schedule::new(None, Seq(0), t);
+        let first = Instant::now();
+        s.changed(author("a"), Seq(1));
+        let mut seq = 1;
+        // A change every 50 ms, never leaving the 100 ms idle gap.
+        while Instant::now() < first + Duration::from_millis(950) {
+            tokio::time::advance(Duration::from_millis(50)).await;
+            seq += 1;
+            s.changed(author("a"), Seq(seq));
+            let due = s.due(Seq(seq), false).unwrap();
+            assert!(due <= first + t.max, "due after max");
+            // While the idle gap ends before `max` it is the one in force.
+            assert_eq!(due, (Instant::now() + t.idle).min(first + t.max));
+        }
+        // The idle deadline is now past `max`: the checkpoint is due exactly at max.
+        assert!(Instant::now() + t.idle > first + t.max);
+        assert_eq!(s.due(Seq(seq), false), Some(first + t.max));
+        tokio::time::advance(first + t.max - Instant::now()).await;
+        assert!(s.due(Seq(seq), false).unwrap() <= Instant::now());
+    }
 }

@@ -68,13 +68,24 @@ impl From<TextOp> for Vec<Component> {
 /// Why a text change could not be built or applied.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum TextError {
-    /// The change expects a different document length.
+    /// The change was made for a document of a different length than the one it is applied to.
     #[error("operation expects {expected} characters but the document has {actual}")]
     LengthMismatch {
         /// Characters the change expects.
         expected: usize,
-        /// Characters the document (or the other change) has.
+        /// Characters the document has.
         actual: usize,
+    },
+    /// Two changes that should start from the same document expect different lengths, so they
+    /// cannot be transformed against each other.
+    #[error(
+        "the two operations expect different document lengths ({first} and {second} characters)"
+    )]
+    BaseLengthsDiffer {
+        /// Characters the first change expects.
+        first: usize,
+        /// Characters the second change expects.
+        second: usize,
     },
     /// A range reaches past the end of the document.
     #[error("range is outside the document")]
@@ -286,6 +297,10 @@ mod tests {
             }
         );
         assert_eq!(doc.as_str(), "hello");
+        assert_eq!(
+            err.to_string(),
+            "operation expects 3 characters but the document has 5"
+        );
     }
 
     #[test]

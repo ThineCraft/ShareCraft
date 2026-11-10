@@ -3,6 +3,7 @@
 use std::fmt;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 /// Address used when `SHARECRAFT_ADDR` is not set.
@@ -11,6 +12,24 @@ pub const DEFAULT_ADDR: &str = "127.0.0.1:8787";
 pub const DEFAULT_DATA: &str = "./data";
 /// Static file directory used when `SHARECRAFT_WEB` is not set.
 pub const DEFAULT_WEB: &str = "./web";
+/// How long one write to a client's socket may take before the connection is dropped, in
+/// milliseconds: 10 seconds. Only tests change it.
+static WRITE_TIMEOUT_MS: AtomicU64 = AtomicU64::new(10_000);
+
+/// How long one write to a client's socket may take. A client that stopped reading would
+/// otherwise keep its connection task, and its place in the room, forever.
+pub(crate) fn write_timeout() -> Duration {
+    Duration::from_millis(WRITE_TIMEOUT_MS.load(Ordering::Relaxed))
+}
+
+/// For tests only: shortens (or restores, with 10_000 milliseconds) the limit on a write for every connection in
+/// this process. The setting is process-wide, so a test binary that uses it should not run
+/// tests that need the default beside it.
+#[doc(hidden)]
+pub fn set_write_timeout_for_test(timeout: Duration) {
+    let millis = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+    WRITE_TIMEOUT_MS.store(millis, Ordering::Relaxed);
+}
 
 /// How the server runs.
 #[derive(Clone, Debug, PartialEq, Eq)]

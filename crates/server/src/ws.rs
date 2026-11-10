@@ -21,6 +21,7 @@ use uuid::Uuid;
 use crate::AppState;
 use crate::api::ApiError;
 use crate::auth::{Signed, same_origin};
+use crate::config::write_timeout;
 use crate::room::{Command, ConnId, JoinReply, OUTBOUND_CAPACITY, Outbound, RoomLink};
 
 /// Largest frame or message accepted from a client.
@@ -31,6 +32,18 @@ const JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 const CLOSE_WAIT: Duration = Duration::from_secs(2);
 /// How often a join is retried when the room it found was just ending.
 const JOIN_ATTEMPTS: usize = 3;
+// How long one write to the socket may take is `config::write_timeout()`, 10 seconds unless a
+// test shortens it.
+
+/// Why the relay ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ended {
+    /// The client left, the room let go of the connection or a socket error ended it.
+    Normally,
+    /// A write did not finish in time: the client has stopped reading, so nothing more can be
+    /// sent to it, not even a close.
+    WriteTimedOut,
+}
 
 /// Who a connection belongs to and what they may do, decided before the upgrade.
 pub(crate) struct Visitor {
@@ -109,6 +122,7 @@ type Stream = SplitStream<WebSocket>;
 
 async fn connection(state: AppState, doc: DocId, visitor: Visitor, socket: WebSocket) {
     let (mut sink, mut stream) = socket.split();
+    let mut stalled = false;
     if let Some((client, resume)) = first_join(&mut stream).await {
         let conn = state.next_conn();
         if let Some((room, out_rx)) = join_room(&state, doc, conn, client, &visitor, resume).await {
@@ -117,14 +131,20 @@ async fn connection(state: AppState, doc: DocId, visitor: Visitor, socket: WebSo
                     session: visitor.session,
                     at: deadline(visitor.expires_at, OffsetDateTime::now_utc()),
                 };
-                relay(&mut sink, &mut stream, &room, out_rx, conn, client, ends).await;
+                let ended = relay(&mut sink, &mut stream, &room, out_rx, conn, client, ends).await;
+                stalled = ended == Ended::WriteTimedOut;
             }
             // The room ignores this if it already dropped or replaced the connection.
             let _ = room.commands.send(Command::Leave { conn, client }).await;
         }
     }
+    if stalled {
+        // The client is not reading, so a close would wait as long as the frame that timed
+        // out, and the client is not going to answer it. The socket closes as it is dropped.
+        return;
+    }
     // The client may already be gone; there is nothing more to do either way.
-    let _ = sink.send(Message::Close(None)).await;
+    let _ = tokio::time::timeout(write_timeout(), sink.send(Message::Close(None))).await;
     // Read until the client answers the close. Frames it sent meanwhile are then consumed: left
     // unread, they make the transport reset the connection, which can discard the frames just
     // written to the client, such as `Removed`.
@@ -273,21 +293,23 @@ async fn relay(
     conn: ConnId,
     client: ClientId,
     mut ends: Ending,
-) {
+) -> Ended {
     loop {
         tokio::select! {
             out = out_rx.recv() => {
                 // `None`: the room dropped, replaced or removed this connection, after every
                 // frame it queued (such as `Removed`) has been written.
-                let Some(out) = out else { return };
-                if write(sink, out).await.is_err() {
-                    return;
+                let Some(out) = out else { return Ended::Normally };
+                match write(sink, out).await {
+                    Ok(()) => {}
+                    Err(WriteError::TimedOut) => return Ended::WriteTimedOut,
+                    Err(WriteError::Socket) => return Ended::Normally,
                 }
             }
             () = sleep_until(ends.at) => {
                 ends.at = None;
                 if room.access.send(Command::EndSession { session: ends.session }).is_err() {
-                    return;
+                    return Ended::Normally;
                 }
             }
             frame = stream.next() => {
@@ -303,15 +325,17 @@ async fn relay(
                             },
                             Ok(ClientMsg::Cursor { at }) => Command::Cursor { conn, client, at },
                             // A second `Join` on one socket, or anything unparseable.
-                            Ok(ClientMsg::Join { .. }) | Err(_) => return,
+                            Ok(ClientMsg::Join { .. }) | Err(_) => return Ended::Normally,
                         }
                     }
                     Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
                     // Binary frames, close, oversized frames and transport errors.
-                    Some(Ok(Message::Binary(_) | Message::Close(_)) | Err(_)) | None => return,
+                    Some(Ok(Message::Binary(_) | Message::Close(_)) | Err(_)) | None => {
+                        return Ended::Normally;
+                    }
                 };
                 if room.commands.send(cmd).await.is_err() {
-                    return;
+                    return Ended::Normally;
                 }
             }
         }
@@ -326,14 +350,36 @@ async fn sleep_until(at: Option<Instant>) {
     }
 }
 
-async fn write(sink: &mut Sink, out: Outbound) -> Result<(), axum::Error> {
+/// Why a frame could not be written.
+enum WriteError {
+    /// The socket did not take the frame within [`write_timeout`].
+    TimedOut,
+    /// The socket failed.
+    Socket,
+}
+
+/// Writes `out` to the socket. Each step (a frame, the final flush) has [`write_timeout`] to
+/// finish, so a client that stopped reading cannot hold this task, and with it a place in the
+/// room, forever.
+async fn write(sink: &mut Sink, out: Outbound) -> Result<(), WriteError> {
+    let limit = write_timeout();
+    async fn step(
+        limit: Duration,
+        done: impl std::future::Future<Output = Result<(), axum::Error>>,
+    ) -> Result<(), WriteError> {
+        match tokio::time::timeout(limit, done).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(WriteError::Socket),
+            Err(_) => Err(WriteError::TimedOut),
+        }
+    }
     match out {
-        Outbound::One(frame) => sink.send(Message::Text(frame)).await,
+        Outbound::One(frame) => step(limit, sink.send(Message::Text(frame))).await,
         Outbound::Many(frames) => {
             for frame in frames {
-                sink.feed(Message::Text(frame)).await?;
+                step(limit, sink.feed(Message::Text(frame))).await?;
             }
-            sink.flush().await
+            step(limit, sink.flush()).await
         }
     }
 }
