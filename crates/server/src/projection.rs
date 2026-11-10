@@ -173,6 +173,26 @@ impl Recorder {
     }
 }
 
+/// Records `revision`, the first of `doc`, before returning. A failure is reported to `events`
+/// and standard error, not to the caller: the content is safe in Git, and the next start
+/// reconciles the index.
+pub(crate) async fn record_first(
+    store: &Arc<dyn Checkpointer>,
+    db: &Db,
+    events: &EventSink,
+    doc: DocId,
+    revision: &RevisionId,
+) {
+    if let Err(error) = record(store, db, doc, None, revision).await {
+        eprintln!(
+            "sharecraft-server: revision {revision} of document {} is saved but could not be \
+             recorded in the database: {error}",
+            doc.0
+        );
+        events.emit(index_failed(doc, &error));
+    }
+}
+
 /// Appends `revision` after `parent`; if the recorded head is not `parent`, replaces the
 /// document's list from Git instead.
 async fn record(

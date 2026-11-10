@@ -108,6 +108,17 @@ impl Site {
         self.signed_in(name, true).await
     }
 
+    /// The database the server records in.
+    pub fn records_db(&self) -> Db {
+        self.records.clone()
+    }
+
+    /// The revisions the database has recorded for `doc`, oldest first.
+    pub async fn records_revisions(&self, doc: DocId) -> Vec<String> {
+        let rows = self.records.revisions(doc).await.unwrap();
+        rows.into_iter().map(|row| row.revision).collect()
+    }
+
     /// A client that sends this server's `Origin` on every request, and `as_user`'s cookie.
     pub fn http(&self, as_user: Option<&TestUser>) -> reqwest::Client {
         let mut headers = HeaderMap::new();

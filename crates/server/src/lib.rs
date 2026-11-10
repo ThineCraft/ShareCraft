@@ -102,6 +102,14 @@ impl AppState {
         &self.shared.editors
     }
 
+    fn checkpointer(&self) -> &Arc<dyn Checkpointer> {
+        &self.shared.checkpointer
+    }
+
+    fn events(&self) -> &EventSink {
+        &self.shared.events
+    }
+
     fn throttle(&self) -> &Throttle {
         &self.shared.throttle
     }
@@ -170,7 +178,7 @@ pub fn router(state: AppState) -> Router {
         .layer(middleware::from_fn(no_cache));
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
-        .nest("/api", api::router())
+        .nest("/api", api::router(state.config().max_file_bytes))
         .route("/ws/docs/{doc_id}", get(ws::upgrade))
         .merge(editors::router(state.clone()))
         .fallback_service(files)

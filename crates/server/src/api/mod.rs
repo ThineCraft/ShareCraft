@@ -2,6 +2,7 @@
 //! than `GET` must also carry `Origin`. Errors are `{"error": "<code>"}`.
 
 mod admin;
+mod content;
 mod docs;
 mod session;
 
@@ -28,14 +29,25 @@ use crate::room::AccessChange;
 const MAX_BODY: usize = 16 * 1024;
 
 /// The `/api` routes, to be nested under `/api`. Unknown paths answer `404 {"error":"not_found"}`
-/// and pass the same guard as the others.
-pub(crate) fn router() -> Router<AppState> {
+/// and pass the same guard as the others. File content (`max_file_bytes` at most per request) is
+/// the only thing allowed a body larger than [`MAX_BODY`].
+pub(crate) fn router(max_file_bytes: usize) -> Router<AppState> {
     Router::new()
         .route("/session", post(session::sign_in).delete(session::sign_out))
         .route("/me", get(session::me))
         .route("/editors", get(crate::editors::list))
         .route("/docs", get(docs::list).post(docs::create))
+        .route(
+            "/docs/upload",
+            post(content::upload).layer(DefaultBodyLimit::max(max_file_bytes)),
+        )
         .route("/docs/{id}", get(docs::open))
+        .route(
+            "/docs/{id}/content",
+            get(content::download)
+                .put(content::save)
+                .layer(DefaultBodyLimit::max(max_file_bytes)),
+        )
         .route("/docs/{id}/access", get(docs::access).put(docs::share))
         .route("/docs/{id}/events", get(docs::events))
         .route("/docs/{id}/access/{user_id}", delete(docs::unshare))
@@ -97,7 +109,7 @@ pub(crate) enum ApiError {
     InvalidEmail,
     /// 422: the password is too short or too long.
     WeakPassword,
-    /// 413: the body is larger than 16 KiB.
+    /// 413: the body is larger than the route allows (16 KiB; file content, `max_file_bytes`).
     TooLarge,
     /// 415: the body is not `application/json`.
     NotJson,
@@ -175,8 +187,8 @@ fn parse_id(text: &str) -> Result<Uuid, ApiError> {
     Uuid::parse_str(text).map_err(|_| ApiError::InvalidRequest)
 }
 
-/// Runs `change` (a database write and the hook that tells the rooms about it) on a task of its
-/// own and waits for it. A request whose caller goes away is dropped at its next `.await`; the
+/// Runs `change` (a database write and the hook that tells the rooms about it, or a save) on a
+/// task of its own and waits for it. A request whose caller goes away is dropped at its next `.await`; the
 /// task is not, so a write that was stored always reaches the rooms. A task that fails to finish
 /// answers `503`.
 async fn to_completion<T: Send + 'static>(
@@ -185,7 +197,7 @@ async fn to_completion<T: Send + 'static>(
     match tokio::spawn(change).await {
         Ok(result) => result,
         Err(e) => {
-            eprintln!("sharecraft-server: a change to access did not finish: {e}");
+            eprintln!("sharecraft-server: a change did not finish: {e}");
             Err(ApiError::Unavailable)
         }
     }

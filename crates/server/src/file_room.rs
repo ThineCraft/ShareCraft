@@ -60,7 +60,6 @@ pub(crate) enum FileCommand {
     /// The connection ended.
     Leave { conn: ConnId, client: ClientId },
     /// Store `bytes` as the document's next revision, on behalf of the seat holder.
-    #[allow(dead_code)] // used by Task 4's content route
     Save {
         user: UserId,
         token: String,
@@ -120,7 +119,6 @@ impl Rooms {
     /// Asks `doc`'s file session to store `bytes`, made from the revision `base`, for `user`
     /// holding the seat with `token`. `NotHolder` if no session is open (none is opened for
     /// this), or if it ends before answering.
-    #[allow(dead_code)] // used by Task 4's content route
     pub(crate) async fn save_file(
         &self,
         doc: DocId,

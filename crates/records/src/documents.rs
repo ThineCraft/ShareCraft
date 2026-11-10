@@ -290,6 +290,30 @@ impl Db {
         name: &str,
         editor: Editor,
     ) -> Result<Document, AccessError> {
+        self.create(actor, id, name, editor, None).await
+    }
+
+    /// Like [`Db::create_document`], for a document made from a file of `bytes` bytes that
+    /// `actor` uploaded: its `document.created` event says so.
+    pub async fn create_uploaded_document(
+        &self,
+        actor: UserId,
+        id: DocId,
+        name: &str,
+        editor: Editor,
+        bytes: usize,
+    ) -> Result<Document, AccessError> {
+        self.create(actor, id, name, editor, Some(bytes)).await
+    }
+
+    async fn create(
+        &self,
+        actor: UserId,
+        id: DocId,
+        name: &str,
+        editor: Editor,
+        uploaded: Option<usize>,
+    ) -> Result<Document, AccessError> {
         let name = validate_name(name)?;
         check_extension(name, editor)?;
         let mut tx = self.pool().begin().await?;
@@ -336,7 +360,15 @@ impl Db {
                 actor: Some(actor),
                 subject: None,
                 document: Some(id),
-                detail: json!({ "name": name, "editor": editor.id() }),
+                detail: match uploaded {
+                    Some(bytes) => json!({
+                        "name": name,
+                        "editor": editor.id(),
+                        "uploaded": true,
+                        "bytes": bytes,
+                    }),
+                    None => json!({ "name": name, "editor": editor.id() }),
+                },
             },
         )
         .await?;

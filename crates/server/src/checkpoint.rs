@@ -33,6 +33,23 @@ pub trait Checkpointer: Send + Sync + 'static {
     /// Whatever the store reports when it cannot be read.
     fn load(&self, doc: DocId) -> Result<Option<Stored>, CheckpointError>;
 
+    /// The content of `doc` as it was at `revision`; `None` if `revision` is not one of the
+    /// document's. Implementations that can read history must override this; the default
+    /// refuses.
+    ///
+    /// # Errors
+    /// Whatever the store reports when it cannot be read.
+    fn load_at(
+        &self,
+        doc: DocId,
+        revision: &RevisionId,
+    ) -> Result<Option<Stored>, CheckpointError> {
+        let _ = (doc, revision);
+        Err(CheckpointError::Git(GitError::new(
+            "this store cannot read an older revision",
+        )))
+    }
+
     /// Describes the revision `revision` of `doc`; `None` if it is not one.
     ///
     /// # Errors
@@ -63,6 +80,14 @@ impl Checkpointer for RevisionStore {
 
     fn load(&self, doc: DocId) -> Result<Option<Stored>, CheckpointError> {
         self.read(doc, None)
+    }
+
+    fn load_at(
+        &self,
+        doc: DocId,
+        revision: &RevisionId,
+    ) -> Result<Option<Stored>, CheckpointError> {
+        self.read(doc, Some(revision))
     }
 
     fn describe(
