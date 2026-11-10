@@ -1,10 +1,15 @@
 #![forbid(unsafe_code)]
-//! The ShareCraft session server: one room per open document, reached over WebSocket.
+//! The ShareCraft session server: one room per open document, reached over WebSocket, and a
+//! JSON API for signing in.
 //!
 //! Each room owns its document's ordered change log, commits changes in arrival order and
-//! sends every committed change to everyone in the room.
+//! sends every committed change to everyone in the room. Accounts and sessions live in
+//! PostgreSQL (see the `records` crate).
 
+mod api;
+mod auth;
 mod checkpoint;
+pub mod cli;
 pub mod config;
 mod room;
 mod ws;
@@ -15,6 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use axum::Router;
 use axum::routing::get;
 use collab_core::ids::DocId;
+use records::Db;
 use revisions::RevisionStore;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -23,6 +29,7 @@ use tower_http::services::ServeDir;
 pub use checkpoint::{Checkpointer, library_path};
 pub use config::{Config, ConfigError};
 
+use auth::Throttle;
 use checkpoint::Timing;
 use room::{Command, Rooms};
 
@@ -36,19 +43,23 @@ struct Shared {
     config: Config,
     rooms: Arc<Rooms>,
     checkpointer: Arc<dyn Checkpointer>,
+    db: Db,
+    throttle: Throttle,
     next_conn: AtomicU64,
 }
 
 impl AppState {
     /// State for a server with no rooms open yet, loading and saving documents through
-    /// `checkpointer`.
+    /// `checkpointer` and keeping accounts and sessions in `db`.
     #[must_use]
-    pub fn new(config: Config, checkpointer: Arc<dyn Checkpointer>) -> Self {
+    pub fn new(config: Config, checkpointer: Arc<dyn Checkpointer>, db: Db) -> Self {
         Self {
             shared: Arc::new(Shared {
                 config,
                 rooms: Arc::new(Rooms::default()),
                 checkpointer,
+                db,
+                throttle: Throttle::default(),
                 next_conn: AtomicU64::new(1),
             }),
         }
@@ -58,6 +69,16 @@ impl AppState {
     #[must_use]
     pub fn config(&self) -> &Config {
         &self.shared.config
+    }
+
+    /// The database of accounts, sessions and access grants.
+    #[must_use]
+    pub fn db(&self) -> &Db {
+        &self.shared.db
+    }
+
+    fn throttle(&self) -> &Throttle {
+        &self.shared.throttle
     }
 
     fn next_conn(&self) -> u64 {
@@ -78,25 +99,36 @@ impl AppState {
 
 /// The HTTP routes:
 /// - `GET /healthz` answers `ok`;
+/// - `POST /api/session` signs in, `DELETE /api/session` signs out, `GET /api/me` names the
+///   signed-in account;
 /// - `GET /ws/docs/{doc_id}?name=<display name>` opens a document session;
 /// - anything else is a static file from `web_dir`.
 pub fn router(state: AppState) -> Router {
     let files = ServeDir::new(&state.config().web_dir);
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
+        .merge(api::router())
         .route("/ws/docs/{doc_id}", get(ws::upgrade))
         .fallback_service(files)
         .with_state(state)
 }
 
 /// Serves `config` on `listener` until the process ends, storing documents in the library
-/// repository under `config.data_dir` (see [`library_path`]).
+/// repository under `config.data_dir` (see [`library_path`]) and records in the database at
+/// `config.database_url`, whose schema it brings up to date first.
 ///
 /// # Errors
-/// Returns an error if the listener is not on a loopback address, if the library repository
-/// cannot be opened or created, or if accepting connections fails.
+/// Returns an error if the listener is not on a loopback address, if the database cannot be
+/// reached or migrated, if the library repository cannot be opened or created, or if accepting
+/// connections fails.
 pub async fn serve(config: Config, listener: TcpListener) -> std::io::Result<()> {
     require_loopback(listener.local_addr()?)?;
+    let db = Db::connect(config.database_url.expose())
+        .await
+        .map_err(|e| std::io::Error::other(format!("cannot connect to the database: {e}")))?;
+    db.migrate()
+        .await
+        .map_err(|e| std::io::Error::other(format!("cannot migrate the database: {e}")))?;
     let path = library_path(&config.data_dir);
     let opened = tokio::task::spawn_blocking(move || {
         RevisionStore::open(&path)
@@ -104,7 +136,7 @@ pub async fn serve(config: Config, listener: TcpListener) -> std::io::Result<()>
     })
     .await
     .map_err(std::io::Error::other)??;
-    serve_state(AppState::new(config, Arc::new(opened)), listener).await
+    serve_state(AppState::new(config, Arc::new(opened), db), listener).await
 }
 
 /// Serves `state` on `listener` until the process ends.
@@ -117,7 +149,7 @@ pub async fn serve_state(state: AppState, listener: TcpListener) -> std::io::Res
     axum::serve(listener, router(state)).await
 }
 
-/// There is no sign-in yet, so the server only ever listens on a loopback address.
+/// The server only ever listens on a loopback address.
 fn require_loopback(addr: std::net::SocketAddr) -> std::io::Result<()> {
     if addr.ip().is_loopback() {
         return Ok(());

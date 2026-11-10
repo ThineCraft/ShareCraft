@@ -168,10 +168,12 @@ async fn browser_solo_disconnect_resumes_without_losing_typing() {
 #[tokio::test]
 async fn browser_reports_text_lost_in_a_server_restart() {
     let data_dir = tempfile::tempdir().unwrap();
+    // Both servers use one database schema, as one installation does across a restart.
+    let db = records::test_support::TestDb::create().await;
     let library = server::library_path(data_dir.path());
     // Nothing is saved while someone is connected; an empty room still saves at once.
     let slow = |c: &mut server::Config| c.checkpoint_idle = std::time::Duration::from_secs(600);
-    let mut first = StoppableServer::start(data_dir.path(), slow);
+    let mut first = StoppableServer::start(data_dir.path(), &db, slow);
     let doc = new_doc();
     let mut a = Page::open(first.addr, doc, "Ann").await;
     a.edit(0, 0, "saved").await;
@@ -188,7 +190,7 @@ async fn browser_reports_text_lost_in_a_server_restart() {
 
     first.stop();
     a.disconnect();
-    let second = StoppableServer::start(data_dir.path(), slow);
+    let second = StoppableServer::start(data_dir.path(), &db, slow);
     let answer = a.connect(second.addr).await;
     assert_eq!(
         answer.reset,

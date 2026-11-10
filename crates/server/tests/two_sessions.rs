@@ -834,6 +834,7 @@ fn non_loopback_address_is_refused() {
     assert!(server::config::parse_addr("192.168.1.5:8787").is_err());
     assert!(server::config::parse_addr("127.0.0.1:8787").is_ok());
     assert!(server::config::parse_addr("[::1]:8787").is_ok());
-    let built = server::Config::from_values(Some("0.0.0.0:8787"), None, None);
+    let built =
+        server::Config::from_values(Some("0.0.0.0:8787"), None, None, Some("postgres://unused"));
     assert!(built.is_err());
 }

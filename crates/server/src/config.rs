@@ -1,5 +1,6 @@
 //! Server settings, read from the environment.
 
+use std::fmt;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -27,6 +28,32 @@ pub struct Config {
     /// How long a document's room stays open after its last participant leaves, so a browser
     /// that reconnects within this time resumes where it left off.
     pub room_grace: Duration,
+    /// The PostgreSQL database holding accounts, sessions and access grants.
+    pub database_url: DatabaseUrl,
+}
+
+/// A database URL. It usually holds a password, so `Debug` never shows it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct DatabaseUrl(String);
+
+impl DatabaseUrl {
+    /// Wraps `url`.
+    #[must_use]
+    pub fn new(url: impl Into<String>) -> Self {
+        DatabaseUrl(url.into())
+    }
+
+    /// The URL itself, for connecting. Never print it.
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for DatabaseUrl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("[hidden]")
+    }
 }
 
 /// Why the settings could not be used.
@@ -41,38 +68,56 @@ pub enum ConfigError {
     /// A variable is set but is not valid Unicode.
     #[error("{0} is not valid Unicode")]
     NotUnicode(&'static str),
+    /// `DATABASE_URL` is unset or empty.
+    #[error("DATABASE_URL is not set")]
+    NoDatabase,
 }
 
 impl Config {
     /// Reads `SHARECRAFT_ADDR`, `SHARECRAFT_DATA` and `SHARECRAFT_WEB`, using the defaults for
-    /// any that are unset.
+    /// any that are unset, and `DATABASE_URL`, which is required.
     ///
     /// # Errors
     /// `BadAddr` or `NotLoopback` for an unusable address, `NotUnicode` for an unreadable
-    /// variable.
+    /// variable, `NoDatabase` when `DATABASE_URL` is unset or empty.
     pub fn from_env() -> Result<Self, ConfigError> {
         let addr = read_var("SHARECRAFT_ADDR")?;
         let data = read_var("SHARECRAFT_DATA")?;
         let web = read_var("SHARECRAFT_WEB")?;
-        Self::from_values(addr.as_deref(), data.as_deref(), web.as_deref())
+        let database = read_var("DATABASE_URL")?;
+        Self::from_values(
+            addr.as_deref(),
+            data.as_deref(),
+            web.as_deref(),
+            database.as_deref(),
+        )
     }
 
-    /// Builds the settings from the given values, using the defaults for any that are `None`.
+    /// Builds the settings from the given values, using the defaults for any of the first three
+    /// that are `None`. The database URL has no default.
     ///
     /// # Errors
-    /// `BadAddr` or `NotLoopback` for an unusable address.
+    /// `BadAddr` or `NotLoopback` for an unusable address, `NoDatabase` for a missing or empty
+    /// database URL.
     pub fn from_values(
         addr: Option<&str>,
         data_dir: Option<&str>,
         web_dir: Option<&str>,
+        database_url: Option<&str>,
     ) -> Result<Self, ConfigError> {
+        let addr = parse_addr(addr.unwrap_or(DEFAULT_ADDR))?;
+        let database_url = match database_url.map(str::trim) {
+            Some(url) if !url.is_empty() => DatabaseUrl::new(url),
+            _ => return Err(ConfigError::NoDatabase),
+        };
         Ok(Self {
-            addr: parse_addr(addr.unwrap_or(DEFAULT_ADDR))?,
+            addr,
             data_dir: PathBuf::from(data_dir.unwrap_or(DEFAULT_DATA)),
             web_dir: PathBuf::from(web_dir.unwrap_or(DEFAULT_WEB)),
             checkpoint_idle: Duration::from_secs(2),
             checkpoint_max: Duration::from_secs(30),
             room_grace: Duration::from_secs(60),
+            database_url,
         })
     }
 }
@@ -113,7 +158,7 @@ mod tests {
 
     #[test]
     fn defaults_are_local() {
-        let c = Config::from_values(None, None, None).unwrap();
+        let c = Config::from_values(None, None, None, Some("postgres://local")).unwrap();
         assert_eq!(c.addr, "127.0.0.1:8787".parse().unwrap());
         assert_eq!(c.data_dir, PathBuf::from("./data"));
         assert_eq!(c.web_dir, PathBuf::from("./web"));

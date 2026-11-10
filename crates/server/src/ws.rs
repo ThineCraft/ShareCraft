@@ -1,12 +1,10 @@
 //! The WebSocket endpoint: one connection per browser tab, relaying between the socket and the
 //! document's room.
 
-use std::net::IpAddr;
 use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
-use axum::http::header::{HOST, ORIGIN};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use collab_core::ids::{ClientId, DocId};
@@ -19,6 +17,7 @@ use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::AppState;
+use crate::auth::same_origin;
 use crate::room::{Command, ConnId, DEFAULT_NAME, JoinReply, OUTBOUND_CAPACITY, Outbound};
 
 /// Largest frame or message accepted from a client.
@@ -44,7 +43,7 @@ pub(crate) async fn upgrade(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    if !is_local_request(&headers) {
+    if !same_origin(&headers) {
         return (
             StatusCode::FORBIDDEN,
             "only local, same-origin connections are allowed",
@@ -58,50 +57,6 @@ pub(crate) async fn upgrade(
     ws.max_message_size(MAX_MESSAGE)
         .max_frame_size(MAX_MESSAGE)
         .on_upgrade(move |socket| connection(state, DocId(id), name, socket))
-}
-
-/// Whether the request names a loopback host and, if it comes from a page, that page was served
-/// by this server. Without sign-in, this keeps other websites open in the user's browser (and
-/// DNS-rebinding hosts) away from documents.
-fn is_local_request(headers: &HeaderMap) -> bool {
-    let Some(host) = headers.get(HOST).and_then(|h| h.to_str().ok()) else {
-        return false;
-    };
-    if !host_part(host).is_some_and(is_loopback_host) {
-        return false;
-    }
-    match headers.get(ORIGIN) {
-        None => true,
-        Some(origin) => origin
-            .to_str()
-            .is_ok_and(|origin| origin == format!("http://{host}")),
-    }
-}
-
-/// The host of a `Host` header value (`host`, `host:port`, `[v6]` or `[v6]:port`).
-fn host_part(value: &str) -> Option<&str> {
-    let (host, port) = match value.strip_prefix('[') {
-        Some(rest) => {
-            let (host, after) = rest.split_once(']')?;
-            match after {
-                "" => (host, None),
-                _ => (host, Some(after.strip_prefix(':')?)),
-            }
-        }
-        None => match value.split_once(':') {
-            Some((host, port)) => (host, Some(port)),
-            None => (value, None),
-        },
-    };
-    if port.is_some_and(|p| p.parse::<u16>().is_err()) || host.is_empty() {
-        return None;
-    }
-    Some(host)
-}
-
-fn is_loopback_host(host: &str) -> bool {
-    host.eq_ignore_ascii_case("localhost")
-        || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 /// Trims `raw`, keeps at most 60 characters and falls back to "Guest".
@@ -253,21 +208,6 @@ async fn write(sink: &mut Sink, out: Outbound) -> Result<(), axum::Error> {
 )]
 mod tests {
     use super::*;
-
-    #[test]
-    fn host_header_forms_are_parsed() {
-        assert_eq!(host_part("127.0.0.1:8787"), Some("127.0.0.1"));
-        assert_eq!(host_part("localhost"), Some("localhost"));
-        assert_eq!(host_part("[::1]:8787"), Some("::1"));
-        assert_eq!(host_part("[::1]"), Some("::1"));
-        assert_eq!(host_part("evil.example:8787"), Some("evil.example"));
-        assert_eq!(host_part("localhost:99999"), None);
-        assert_eq!(host_part("[::1]x"), None);
-        assert!(is_loopback_host("::1"));
-        assert!(is_loopback_host("LocalHost"));
-        assert!(!is_loopback_host("evil.example"));
-        assert!(!is_loopback_host("0.0.0.0"));
-    }
 
     #[test]
     fn names_are_trimmed_limited_and_defaulted() {

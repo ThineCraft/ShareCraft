@@ -1,4 +1,4 @@
-//! Helpers for driving a real server over WebSocket from tests.
+//! Helpers for driving a real server over HTTP and WebSocket from tests.
 
 #![allow(
     clippy::unwrap_used,
@@ -8,16 +8,20 @@
     dead_code
 )]
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use collab_core::client_state::{ClientState, Outgoing};
-use collab_core::ids::{ClientId, DocId, OpId, Seq};
+use collab_core::ids::{ClientId, DocId, OpId, Seq, UserId};
 use collab_text::{TextDoc, TextOp};
 use futures_util::{SinkExt, StreamExt};
 use protocol::{ClientMsg, Participant, Resume, RoomEpoch, SaveState, ServerMsg};
+use records::NewUser;
+use records::test_support::TestDb;
+use reqwest::header::{COOKIE, HeaderMap, HeaderValue, ORIGIN, SET_COOKIE};
 use revisions::RevisionStore;
 use server::{AppState, Checkpointer, Config};
 use tempfile::TempDir;
@@ -29,10 +33,40 @@ use uuid::Uuid;
 /// How long any wait in a test may take before it fails.
 pub const TIMEOUT: Duration = Duration::from_secs(5);
 
-/// A server running in this test's runtime.
+/// A server running in this test's runtime, with its own data directory and database schema.
 pub struct TestServer {
     pub addr: SocketAddr,
     pub data_dir: TempDir,
+    pub db: TestDb,
+    /// Accounts made by [`TestServer::user`] and [`TestServer::admin`], by name.
+    accounts: Mutex<HashMap<String, Account>>,
+}
+
+/// An account the harness created, with the password it chose and keeps to itself.
+#[derive(Clone)]
+struct Account {
+    id: UserId,
+    email: String,
+    password: String,
+}
+
+/// A signed-in account.
+#[derive(Clone)]
+pub struct TestUser {
+    pub id: UserId,
+    pub email: String,
+    /// The `Cookie` header value: `sharecraft_session=<token>`.
+    pub cookie: String,
+}
+
+impl std::fmt::Debug for TestUser {
+    /// Leaves the cookie out: it holds the session token.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TestUser")
+            .field("id", &self.id)
+            .field("email", &self.email)
+            .finish_non_exhaustive()
+    }
 }
 
 impl TestServer {
@@ -59,13 +93,133 @@ impl TestServer {
             .map(|info| info.unwrap().id.to_string())
             .collect()
     }
+
+    /// `http://<addr>`, the origin of pages this server serves.
+    pub fn origin(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    /// `http://<addr><path>`.
+    pub fn url(&self, path: &str) -> String {
+        format!("http://{}{path}", self.addr)
+    }
+
+    /// The account `<slug of name>@test.invalid`, created on first use, freshly signed in.
+    pub async fn user(&self, name: &str) -> TestUser {
+        self.signed_in(name, false).await
+    }
+
+    /// Like [`TestServer::user`], for an administrator account.
+    pub async fn admin(&self, name: &str) -> TestUser {
+        self.signed_in(name, true).await
+    }
+
+    /// A client that sends this server's `Origin` on every request, and `as_user`'s cookie.
+    pub fn http(&self, as_user: Option<&TestUser>) -> reqwest::Client {
+        let mut headers = HeaderMap::new();
+        headers.insert(ORIGIN, HeaderValue::from_str(&self.origin()).unwrap());
+        if let Some(user) = as_user {
+            headers.insert(COOKIE, HeaderValue::from_str(&user.cookie).unwrap());
+        }
+        reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .unwrap()
+    }
+
+    async fn signed_in(&self, name: &str, is_admin: bool) -> TestUser {
+        let account = self.account(name, is_admin).await;
+        let response = self
+            .http(None)
+            .post(self.url("/api/session"))
+            .json(&serde_json::json!({
+                "email": account.email,
+                "password": account.password,
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+        TestUser {
+            id: account.id,
+            email: account.email,
+            cookie: session_cookie(response.headers()).expect("sign-in set no session cookie"),
+        }
+    }
+
+    async fn account(&self, name: &str, is_admin: bool) -> Account {
+        let email = {
+            let accounts = self.accounts.lock().unwrap();
+            if let Some(account) = accounts.get(name) {
+                return account.clone();
+            }
+            unused_email(name, &accounts)
+        };
+        let password = Uuid::new_v4().simple().to_string();
+        let user = self
+            .db
+            .db
+            .create_user(
+                None,
+                NewUser {
+                    email: &email,
+                    name,
+                    password: &password,
+                    is_admin,
+                },
+            )
+            .await
+            .unwrap();
+        let account = Account {
+            id: user.id,
+            email,
+            password,
+        };
+        self.accounts
+            .lock()
+            .unwrap()
+            .insert(name.to_owned(), account.clone());
+        account
+    }
 }
 
-fn test_config(data_dir: &TempDir) -> Config {
-    config_at(data_dir.path())
+/// `<slug>@test.invalid` for `name`, with a number added if another name has that slug.
+fn unused_email(name: &str, accounts: &HashMap<String, Account>) -> String {
+    let mut slug = String::new();
+    for c in name.chars().flat_map(char::to_lowercase) {
+        if c.is_ascii_alphanumeric() {
+            slug.push(c);
+        } else if !slug.is_empty() && !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    let slug = match slug.trim_end_matches('-') {
+        "" => "user",
+        trimmed => trimmed,
+    };
+    let taken = |email: &str| accounts.values().any(|a| a.email == email);
+    let mut email = format!("{slug}@test.invalid");
+    let mut n = 2;
+    while taken(&email) {
+        email = format!("{slug}-{n}@test.invalid");
+        n += 1;
+    }
+    email
 }
 
-fn config_at(data_dir: &Path) -> Config {
+/// The `sharecraft_session=<token>` pair from a response's `Set-Cookie`, if it sets one.
+pub fn session_cookie(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get_all(SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .filter_map(|v| v.split(';').next())
+        .map(str::trim)
+        .find(|pair| pair.starts_with("sharecraft_session="))
+        .map(str::to_owned)
+}
+
+fn config_at(data_dir: &Path, db: &TestDb) -> Config {
     Config {
         addr: "127.0.0.1:0".parse().unwrap(),
         data_dir: data_dir.to_path_buf(),
@@ -73,6 +227,7 @@ fn config_at(data_dir: &Path) -> Config {
         checkpoint_idle: Duration::from_millis(100),
         checkpoint_max: Duration::from_secs(30),
         room_grace: LONG_GRACE,
+        database_url: server::config::DatabaseUrl::new(db.url()),
     }
 }
 
@@ -86,8 +241,8 @@ pub async fn wait_out_grace() {
     tokio::time::sleep(SHORT_GRACE * 3).await;
 }
 
-/// Starts a server on an ephemeral loopback port with its own data directory; empty rooms
-/// stay open for [`LONG_GRACE`].
+/// Starts a server on an ephemeral loopback port with its own data directory and database
+/// schema; empty rooms stay open for [`LONG_GRACE`].
 pub async fn spawn_server() -> TestServer {
     spawn_server_config(|_| {}).await
 }
@@ -95,12 +250,18 @@ pub async fn spawn_server() -> TestServer {
 /// Starts a server like [`spawn_server`], with its settings adjusted by `edit`.
 pub async fn spawn_server_config(edit: impl FnOnce(&mut Config)) -> TestServer {
     let data_dir = tempfile::tempdir().unwrap();
-    let mut config = test_config(&data_dir);
+    let db = TestDb::create().await;
+    let mut config = config_at(data_dir.path(), &db);
     edit(&mut config);
     let listener = tokio::net::TcpListener::bind(config.addr).await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(server::serve(config, listener));
-    TestServer { addr, data_dir }
+    TestServer {
+        addr,
+        data_dir,
+        db,
+        accounts: Mutex::default(),
+    }
 }
 
 /// A server on its own runtime. Stopping it ends every connection, room and task at once, as
@@ -111,10 +272,10 @@ pub struct StoppableServer {
 }
 
 impl StoppableServer {
-    /// Starts a server on an ephemeral loopback port storing documents under `data_dir`, with
-    /// its settings adjusted by `edit`.
-    pub fn start(data_dir: &Path, edit: impl FnOnce(&mut Config)) -> StoppableServer {
-        let mut config = config_at(data_dir);
+    /// Starts a server on an ephemeral loopback port storing documents under `data_dir` and
+    /// records in `db`'s schema, with its settings adjusted by `edit`.
+    pub fn start(data_dir: &Path, db: &TestDb, edit: impl FnOnce(&mut Config)) -> StoppableServer {
+        let mut config = config_at(data_dir, db);
         edit(&mut config);
         let listener = std::net::TcpListener::bind(config.addr).unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -182,14 +343,20 @@ pub async fn spawn_server_with_grace(
     grace: Duration,
 ) -> TestServer {
     let data_dir = tempfile::tempdir().unwrap();
-    let mut config = test_config(&data_dir);
+    let db = TestDb::create().await;
+    let mut config = config_at(data_dir.path(), &db);
     config.room_grace = grace;
     let checkpointer = make(&server::library_path(data_dir.path()));
     let listener = tokio::net::TcpListener::bind(config.addr).await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let state = AppState::new(config, checkpointer);
+    let state = AppState::new(config, checkpointer, db.db.clone());
     tokio::spawn(server::serve_state(state, listener));
-    TestServer { addr, data_dir }
+    TestServer {
+        addr,
+        data_dir,
+        db,
+        accounts: Mutex::default(),
+    }
 }
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
