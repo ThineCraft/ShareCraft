@@ -17,7 +17,7 @@ use common::{
 };
 use futures_util::{SinkExt, StreamExt};
 use protocol::{ClientMsg, ServerMsg};
-use records::Role;
+use records::{Editor, Role};
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
@@ -187,7 +187,9 @@ async fn checkpoint_credits_accounts_and_uses_the_document_name() {
     let bob = server.user("Bob").await;
     let doc = new_doc();
     let db = &server.db.db;
-    db.create_document(ann.id, doc, "Plan.txt").await.unwrap();
+    db.create_document(ann.id, doc, "Plan.txt", Editor::Text)
+        .await
+        .unwrap();
     db.set_access(ann.id, doc, bob.id, Some(Role::Editor))
         .await
         .unwrap();

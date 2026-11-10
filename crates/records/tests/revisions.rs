@@ -7,7 +7,7 @@
 
 use collab_core::ids::DocId;
 use records::test_support::TestDb;
-use records::{NewUser, RevisionRecord, Role, User};
+use records::{Editor, NewUser, RevisionRecord, Role, User};
 use serde_json::json;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -61,7 +61,10 @@ async fn append_requires_the_recorded_head() {
     let test = TestDb::create().await;
     let ann = user(&test, "Ann", false).await;
     let doc = doc_id();
-    test.db.create_document(ann.id, doc, "Notes").await.unwrap();
+    test.db
+        .create_document(ann.id, doc, "Notes", Editor::Text)
+        .await
+        .unwrap();
     let (r1, r2, r3) = (record(doc, 1), record(doc, 2), record(doc, 3));
 
     // The first revision has no parent; naming one is refused.

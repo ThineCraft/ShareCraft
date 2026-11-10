@@ -7,7 +7,7 @@
 
 use collab_core::ids::{DocId, UserId};
 use records::test_support::TestDb;
-use records::{AccessError, NewUser, Role, User};
+use records::{AccessError, Editor, NewUser, Role, User};
 use serde_json::json;
 use uuid::Uuid;
 
@@ -34,7 +34,10 @@ fn doc_id() -> DocId {
 
 async fn document(test: &TestDb, owner: UserId) -> DocId {
     let id = doc_id();
-    test.db.create_document(owner, id, "Notes").await.unwrap();
+    test.db
+        .create_document(owner, id, "Notes", Editor::Text)
+        .await
+        .unwrap();
     id
 }
 
@@ -45,7 +48,7 @@ async fn creator_is_owner() {
     let id = doc_id();
     let created = test
         .db
-        .create_document(ann.id, id, "  Plan  ")
+        .create_document(ann.id, id, "  Plan  ", Editor::Text)
         .await
         .unwrap();
     assert_eq!(created.id, id);
@@ -57,7 +60,10 @@ async fn creator_is_owner() {
     let grants = test.db.grants(ann.id, id).await.unwrap();
     assert_eq!(grants.len(), 1);
     assert_eq!((grants[0].user.id, grants[0].role), (ann.id, Role::Owner));
-    let again = test.db.create_document(ann.id, id, "Other").await;
+    let again = test
+        .db
+        .create_document(ann.id, id, "Other", Editor::Text)
+        .await;
     assert_eq!(again, Err(AccessError::Exists));
     assert_eq!(test.db.document(doc_id()).await.unwrap(), None);
 }
@@ -167,7 +173,9 @@ async fn disabled_account_has_no_role() {
         .unwrap();
     assert_eq!(test.db.role(root.id, id).await.unwrap(), None);
     assert_eq!(
-        test.db.create_document(ann.id, doc_id(), "X").await,
+        test.db
+            .create_document(ann.id, doc_id(), "X", Editor::Text)
+            .await,
         Err(AccessError::Forbidden)
     );
     test.db
@@ -360,14 +368,17 @@ async fn bad_document_names_are_refused() {
     let ann = user(&test, "Ann", false).await;
     let long = "n".repeat(121);
     for name in ["", "   ", "a/b", "a\\b", "a\u{0}b", "a\nb", long.as_str()] {
-        let result = test.db.create_document(ann.id, doc_id(), name).await;
+        let result = test
+            .db
+            .create_document(ann.id, doc_id(), name, Editor::Text)
+            .await;
         assert_eq!(result, Err(AccessError::InvalidName), "{name:?}");
     }
     assert!(test.db.documents_for(ann.id).await.unwrap().is_empty());
     let longest = "n".repeat(120);
     assert!(
         test.db
-            .create_document(ann.id, doc_id(), &longest)
+            .create_document(ann.id, doc_id(), &longest, Editor::Text)
             .await
             .is_ok()
     );
@@ -409,7 +420,7 @@ async fn access_changes_are_recorded() {
                 Some(ann.id),
                 None,
                 Some(id),
-                json!({"name": "Notes"})
+                json!({"name": "Notes", "editor": "text"})
             ),
             (
                 "access.granted",
@@ -436,4 +447,72 @@ async fn access_changes_are_recorded() {
     );
     let about_bob = test.db.events_about(bob.id).await.unwrap();
     assert!(about_bob.iter().any(|e| e.kind == "access.revoked"));
+}
+
+#[tokio::test]
+async fn existing_documents_are_text() {
+    let test = TestDb::create().await;
+    let id = doc_id();
+    sqlx::query("insert into documents (id, name) values ($1, 'Old notes')")
+        .bind(id.0)
+        .execute(test.db.test_pool())
+        .await
+        .unwrap();
+    let read = test.db.document(id).await.unwrap().unwrap();
+    assert_eq!(read.editor, Editor::Text);
+}
+
+#[test]
+fn editor_is_chosen_by_extension() {
+    assert_eq!(
+        Editor::for_file_name("Budget.XLSX"),
+        Some(Editor::GridCraft)
+    );
+    assert_eq!(Editor::for_file_name("a.docx"), Some(Editor::WordCraft));
+    assert_eq!(Editor::for_file_name("a.pdf"), Some(Editor::PdfCraft));
+    assert_eq!(
+        Editor::for_file_name("a.solidcraft.json"),
+        Some(Editor::SolidCraft)
+    );
+    assert_eq!(Editor::for_file_name("notes.txt"), None);
+    assert_eq!(Editor::for_file_name("a.json"), None);
+    assert_eq!(Editor::for_file_name("é"), None);
+    for editor in Editor::ALL {
+        assert_eq!(Editor::from_id(editor.id()), Some(editor));
+        assert_eq!(editor.is_file(), editor != Editor::Text);
+    }
+    assert_eq!(Editor::from_id("excel"), None);
+}
+
+#[tokio::test]
+async fn file_name_must_match_its_editor() {
+    let test = TestDb::create().await;
+    let ann = user(&test, "Ann", false).await;
+    for name in [".xlsx", "Budget.docx", "Budget", "xlsx"] {
+        let result = test
+            .db
+            .create_document(ann.id, doc_id(), name, Editor::GridCraft)
+            .await;
+        assert_eq!(result, Err(AccessError::WrongExtension), "{name:?}");
+    }
+    let made = test
+        .db
+        .create_document(ann.id, doc_id(), "Budget.XLSX", Editor::GridCraft)
+        .await
+        .unwrap();
+    assert_eq!(made.editor, Editor::GridCraft);
+    assert_eq!(test.db.document(made.id).await.unwrap(), Some(made));
+    // A file's name obeys the ordinary name rule too.
+    let result = test
+        .db
+        .create_document(ann.id, doc_id(), "a/b.xlsx", Editor::GridCraft)
+        .await;
+    assert_eq!(result, Err(AccessError::InvalidName));
+    // A text document may have any extension.
+    assert!(
+        test.db
+            .create_document(ann.id, doc_id(), "Budget.docx", Editor::Text)
+            .await
+            .is_ok()
+    );
 }

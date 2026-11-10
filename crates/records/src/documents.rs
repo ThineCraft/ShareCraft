@@ -55,11 +55,90 @@ impl Role {
     }
 }
 
+/// The editor that opens a document. `Text` is the built-in plain-text editor; every other
+/// editor works on a file whose bytes ShareCraft never interprets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Editor {
+    Text,
+    GridCraft,
+    WordCraft,
+    PdfCraft,
+    SolidCraft,
+}
+
+impl Editor {
+    /// Every editor.
+    pub const ALL: [Editor; 5] = [
+        Editor::Text,
+        Editor::GridCraft,
+        Editor::WordCraft,
+        Editor::PdfCraft,
+        Editor::SolidCraft,
+    ];
+
+    /// The lower-case id, as stored and as written in JSON.
+    #[must_use]
+    pub fn id(self) -> &'static str {
+        match self {
+            Editor::Text => "text",
+            Editor::GridCraft => "gridcraft",
+            Editor::WordCraft => "wordcraft",
+            Editor::PdfCraft => "pdfcraft",
+            Editor::SolidCraft => "solidcraft",
+        }
+    }
+
+    /// The editor with this id.
+    #[must_use]
+    pub fn from_id(id: &str) -> Option<Editor> {
+        Editor::ALL.into_iter().find(|editor| editor.id() == id)
+    }
+
+    /// The file extension (with its dot) of the files this editor opens; `None` for `Text`.
+    #[must_use]
+    pub fn native_extension(self) -> Option<&'static str> {
+        match self {
+            Editor::Text => None,
+            Editor::GridCraft => Some(".xlsx"),
+            Editor::WordCraft => Some(".docx"),
+            Editor::PdfCraft => Some(".pdf"),
+            Editor::SolidCraft => Some(".solidcraft.json"),
+        }
+    }
+
+    /// The editor whose native extension ends `name`, ignoring ASCII case. Never `Text`.
+    #[must_use]
+    pub fn for_file_name(name: &str) -> Option<Editor> {
+        Editor::ALL.into_iter().find(|editor| {
+            editor
+                .native_extension()
+                .is_some_and(|ext| ends_with(name, ext))
+        })
+    }
+
+    /// Whether the document is a file ShareCraft keeps without interpreting: every editor but
+    /// `Text`.
+    #[must_use]
+    pub fn is_file(self) -> bool {
+        self != Editor::Text
+    }
+}
+
+/// Whether `name` ends with `suffix`, ignoring ASCII case.
+fn ends_with(name: &str, suffix: &str) -> bool {
+    name.len()
+        .checked_sub(suffix.len())
+        .and_then(|start| name.get(start..))
+        .is_some_and(|tail| tail.eq_ignore_ascii_case(suffix))
+}
+
 /// A document's record. The content lives in Git.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Document {
     pub id: DocId,
     pub name: String,
+    pub editor: Editor,
     pub created_by: Option<UserId>,
     /// The current Git revision; `None` until first saved.
     pub revision: Option<String>,
@@ -87,6 +166,8 @@ pub enum AccessError {
     LastOwner,
     #[error("that is not a valid document name")]
     InvalidName,
+    #[error("the name of this kind of document must end with its file extension")]
+    WrongExtension,
     #[error("a document with that id already exists")]
     Exists,
     #[error(transparent)]
@@ -113,6 +194,21 @@ fn validate_name(name: &str) -> Result<&str, AccessError> {
     }
 }
 
+/// A file document's name must be the editor's extension with something before it.
+fn check_extension(name: &str, editor: Editor) -> Result<(), AccessError> {
+    match editor.native_extension() {
+        Some(ext) if !(ends_with(name, ext) && name.len() > ext.len()) => {
+            Err(AccessError::WrongExtension)
+        }
+        _ => Ok(()),
+    }
+}
+
+fn parse_editor(text: &str) -> Result<Editor, sqlx::Error> {
+    Editor::from_id(text)
+        .ok_or_else(|| sqlx::Error::Decode(format!("unknown editor {text:?}").into()))
+}
+
 fn parse_role(text: &str) -> Result<Role, sqlx::Error> {
     Role::parse(text).ok_or_else(|| sqlx::Error::Decode(format!("unknown role {text:?}").into()))
 }
@@ -121,6 +217,7 @@ fn document_from_row(row: &PgRow) -> Result<Document, sqlx::Error> {
     Ok(Document {
         id: DocId(row.try_get("id")?),
         name: row.try_get("name")?,
+        editor: parse_editor(&row.try_get::<String, _>("editor")?)?,
         created_by: row.try_get::<Option<Uuid>, _>("created_by")?.map(UserId),
         revision: row.try_get("revision")?,
         revised_at: row.try_get("revised_at")?,
@@ -137,7 +234,7 @@ async fn reachable(
     only: Option<DocId>,
 ) -> Result<Vec<(Document, Role)>, sqlx::Error> {
     let rows = sqlx::query(
-        "select d.id, d.name, d.created_by, d.revision, d.revised_at, \
+        "select d.id, d.name, d.editor, d.created_by, d.revision, d.revised_at, \
                 case when u.is_admin then 'owner' else a.role end as role \
          from users u \
          cross join documents d \
@@ -191,8 +288,10 @@ impl Db {
         actor: UserId,
         id: DocId,
         name: &str,
+        editor: Editor,
     ) -> Result<Document, AccessError> {
         let name = validate_name(name)?;
+        check_extension(name, editor)?;
         let mut tx = self.pool().begin().await?;
         let disabled: Option<bool> =
             sqlx::query_scalar("select disabled_at is not null from users where id = $1")
@@ -205,11 +304,12 @@ impl Db {
             Some(false) => {}
         }
         let inserted = sqlx::query(
-            "insert into documents (id, name, created_by) values ($1, $2, $3) \
-             returning id, name, created_by, revision, revised_at",
+            "insert into documents (id, name, editor, created_by) values ($1, $2, $3, $4) \
+             returning id, name, editor, created_by, revision, revised_at",
         )
         .bind(id.0)
         .bind(name)
+        .bind(editor.id())
         .bind(actor.0)
         .fetch_one(&mut *tx)
         .await;
@@ -236,7 +336,7 @@ impl Db {
                 actor: Some(actor),
                 subject: None,
                 document: Some(id),
-                detail: json!({ "name": name }),
+                detail: json!({ "name": name, "editor": editor.id() }),
             },
         )
         .await?;
@@ -247,7 +347,7 @@ impl Db {
     /// The document with this id, whoever may see it. Callers check `role` first.
     pub async fn document(&self, id: DocId) -> Result<Option<Document>, DbError> {
         let row = sqlx::query(
-            "select id, name, created_by, revision, revised_at from documents where id = $1",
+            "select id, name, editor, created_by, revision, revised_at from documents where id = $1",
         )
         .bind(id.0)
         .fetch_optional(self.pool())

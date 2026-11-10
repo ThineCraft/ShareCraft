@@ -14,6 +14,6 @@ pub use accounts::{
     AccountError, NewUser, SESSION_LIFETIME, Session, SessionToken, SignInError, User,
 };
 pub use db::{Db, DbError};
-pub use documents::{AccessError, Document, Grant, Role};
+pub use documents::{AccessError, Document, Editor, Grant, Role};
 pub use events::{Event, NewEvent};
 pub use revisions::{RevisionRecord, RevisionRow};

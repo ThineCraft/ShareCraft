@@ -21,7 +21,7 @@ use collab_text::{TextDoc, TextOp};
 use futures_util::{SinkExt, StreamExt};
 use protocol::{ClientMsg, Participant, RemovedReason, Resume, RoomEpoch, SaveState, ServerMsg};
 use records::test_support::TestDb;
-use records::{Db, NewUser, Role};
+use records::{Db, Editor, NewUser, Role};
 use reqwest::header::{COOKIE, HeaderMap, HeaderValue, ORIGIN, SET_COOKIE};
 use revisions::RevisionStore;
 use server::{AppState, Checkpointer, Config};
@@ -125,7 +125,7 @@ impl Site {
     pub async fn give_access(&self, doc: DocId, user: &TestUser) {
         let db = &self.records;
         if db.document(doc).await.unwrap().is_none() {
-            db.create_document(user.id, doc, &format!("{}.txt", doc.0))
+            db.create_document(user.id, doc, &format!("{}.txt", doc.0), Editor::Text)
                 .await
                 .unwrap();
         } else if db.role(user.id, doc).await.unwrap().is_none() {

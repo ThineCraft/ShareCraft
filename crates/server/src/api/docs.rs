@@ -5,7 +5,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use collab_core::ids::{DocId, UserId};
-use records::{Db, Role};
+use records::{AccessError, Db, Editor, Role};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use time::OffsetDateTime;
@@ -29,6 +29,7 @@ fn rfc3339(time: Option<OffsetDateTime>) -> Option<String> {
 pub(crate) struct DocSummary {
     id: String,
     name: String,
+    editor: Editor,
     role: Role,
     revised_at: Option<String>,
 }
@@ -49,6 +50,7 @@ pub(crate) async fn list(
             .map(|(document, role)| DocSummary {
                 id: document.id.0.to_string(),
                 name: document.name,
+                editor: document.editor,
                 role,
                 revised_at: rfc3339(document.revised_at),
             })
@@ -60,6 +62,14 @@ pub(crate) async fn list(
 #[derive(Deserialize)]
 pub(crate) struct NewDoc {
     name: Option<String>,
+    /// An editor id; `text` when absent.
+    editor: Option<String>,
+}
+
+/// `400` with a code and a sentence saying what to do.
+fn refused(code: &str, message: &str) -> Response {
+    let body = Json(serde_json::json!({ "error": code, "message": message }));
+    (StatusCode::BAD_REQUEST, body).into_response()
 }
 
 /// `POST /api/docs`: creates a document owned by the caller.
@@ -68,15 +78,41 @@ pub(crate) async fn create(
     signed: Signed,
     JsonBody(new): JsonBody<NewDoc>,
 ) -> Result<Response, ApiError> {
+    let editor = match new.editor.as_deref() {
+        None => Editor::Text,
+        Some(text) => match Editor::from_id(text) {
+            Some(editor) => editor,
+            None => return Ok(refused("unknown_editor", "that editor does not exist")),
+        },
+    };
+    if editor == Editor::PdfCraft {
+        return Ok(refused(
+            "upload_required",
+            "an empty PDF is not a file: upload a PDF instead",
+        ));
+    }
     let id = DocId(Uuid::new_v4());
     let name = new.name.as_deref().unwrap_or(DEFAULT_NAME);
-    let document = state
+    let document = match state
         .db()
-        .create_document(signed.session.user.id, id, name)
-        .await?;
+        .create_document(signed.session.user.id, id, name, editor)
+        .await
+    {
+        Ok(document) => document,
+        Err(AccessError::WrongExtension) => {
+            let message = format!(
+                "the name of a {} document must end with {}",
+                editor.id(),
+                editor.native_extension().unwrap_or_default()
+            );
+            return Ok(refused("wrong_extension", &message));
+        }
+        Err(e) => return Err(e.into()),
+    };
     let body = Json(serde_json::json!({
         "id": document.id.0.to_string(),
         "name": document.name,
+        "editor": document.editor,
         "role": Role::Owner,
     }));
     Ok((StatusCode::CREATED, body).into_response())
@@ -87,6 +123,7 @@ pub(crate) async fn create(
 pub(crate) struct DocDetail {
     id: String,
     name: String,
+    editor: Editor,
     role: Role,
     revision: Option<String>,
 }
@@ -112,6 +149,7 @@ pub(crate) async fn open(
     Ok(Json(DocDetail {
         id: document.id.0.to_string(),
         name: document.name,
+        editor: document.editor,
         role,
         revision: document.revision,
     }))

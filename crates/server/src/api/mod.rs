@@ -146,6 +146,8 @@ impl From<AccessError> for ApiError {
             AccessError::Forbidden => ApiError::Forbidden,
             AccessError::LastOwner => ApiError::LastOwner,
             AccessError::InvalidName => ApiError::InvalidName,
+            // `POST /api/docs` answers this itself, naming the extension expected.
+            AccessError::WrongExtension => ApiError::InvalidRequest,
             // The server picks a fresh random id, so a clash is not the caller's doing.
             AccessError::Exists | AccessError::Db(_) => ApiError::unavailable(&e),
         }
@@ -266,7 +268,7 @@ mod tests {
     use collab_text::TextOp;
     use protocol::ServerMsg;
     use records::test_support::TestDb;
-    use records::{NewUser, Role};
+    use records::{Editor, NewUser, Role};
     use revisions::RevisionStore;
     use tokio::sync::{mpsc, oneshot};
 
@@ -316,7 +318,9 @@ mod tests {
         let ann = account(&db, "Ann").await;
         let bob = account(&db, "Bob").await;
         let doc = DocId(Uuid::new_v4());
-        db.create_document(ann, doc, "Plan.txt").await.unwrap();
+        db.create_document(ann, doc, "Plan.txt", Editor::Text)
+            .await
+            .unwrap();
         db.set_access(ann, doc, bob, Some(Role::Editor))
             .await
             .unwrap();
@@ -392,7 +396,9 @@ mod tests {
         let ann = account(&db, "Ann").await;
         let bob = account(&db, "Bob").await;
         let doc = DocId(Uuid::new_v4());
-        db.create_document(ann, doc, "Plan.txt").await.unwrap();
+        db.create_document(ann, doc, "Plan.txt", Editor::Text)
+            .await
+            .unwrap();
         db.set_access(ann, doc, bob, Some(Role::Viewer))
             .await
             .unwrap();

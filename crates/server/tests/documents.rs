@@ -118,7 +118,7 @@ async fn creator_owns_and_lists_the_new_document() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         doc,
-        json!({ "id": id, "name": "Plans", "role": "owner", "revision": null })
+        json!({ "id": id, "name": "Plans", "editor": "text", "role": "owner", "revision": null })
     );
 
     // Names the records layer refuses, and ids that are not ids.
@@ -600,4 +600,122 @@ async fn unsigned_caller_gets_401_from_every_route() {
             "{method} {path}"
         );
     }
+}
+
+#[tokio::test]
+async fn creating_a_spreadsheet_records_its_editor() {
+    let server = spawn_server().await;
+    let ann = server.user("ann").await;
+    let (status, body) = call(
+        &server,
+        Some(&ann),
+        Method::POST,
+        "/api/docs",
+        Some(json!({ "name": "Budget.xlsx", "editor": "gridcraft" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["editor"], "gridcraft");
+    let id = body["id"].as_str().unwrap().to_owned();
+
+    let (_, doc) = call(
+        &server,
+        Some(&ann),
+        Method::GET,
+        &format!("/api/docs/{id}"),
+        None,
+    )
+    .await;
+    assert_eq!(doc["editor"], "gridcraft");
+    let (_, list) = call(&server, Some(&ann), Method::GET, "/api/docs", None).await;
+    assert_eq!(list[0]["editor"], "gridcraft");
+    let (_, events) = call(
+        &server,
+        Some(&ann),
+        Method::GET,
+        &format!("/api/docs/{id}/events"),
+        None,
+    )
+    .await;
+    let created = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "document.created")
+        .unwrap();
+    assert_eq!(created["detail"]["editor"], "gridcraft");
+
+    // The extension must match, and the message says which one.
+    let (status, body) = call(
+        &server,
+        Some(&ann),
+        Method::POST,
+        "/api/docs",
+        Some(json!({ "name": "Budget.docx", "editor": "gridcraft" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["message"].as_str().unwrap().contains(".xlsx"));
+}
+
+#[tokio::test]
+async fn unknown_editor_is_refused() {
+    let server = spawn_server().await;
+    let ann = server.user("ann").await;
+    let (status, body) = call(
+        &server,
+        Some(&ann),
+        Method::POST,
+        "/api/docs",
+        Some(json!({ "name": "A", "editor": "excel" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "unknown_editor");
+    let (_, list) = call(&server, Some(&ann), Method::GET, "/api/docs", None).await;
+    assert!(list.as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn an_empty_pdf_cannot_be_created() {
+    let server = spawn_server().await;
+    let ann = server.user("ann").await;
+    let (status, body) = call(
+        &server,
+        Some(&ann),
+        Method::POST,
+        "/api/docs",
+        Some(json!({ "name": "A.pdf", "editor": "pdfcraft" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["message"].as_str().unwrap().contains("upload a PDF"));
+    let (_, list) = call(&server, Some(&ann), Method::GET, "/api/docs", None).await;
+    assert!(list.as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn text_documents_still_default() {
+    let server = spawn_server().await;
+    let ann = server.user("ann").await;
+    let (status, body) = call(
+        &server,
+        Some(&ann),
+        Method::POST,
+        "/api/docs",
+        Some(json!({ "name": "Notes.txt" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["editor"], "text");
+    let (status, body) = call(
+        &server,
+        Some(&ann),
+        Method::POST,
+        "/api/docs",
+        Some(json!({ "name": "Whatever.xlsx", "editor": "text" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["editor"], "text");
 }
