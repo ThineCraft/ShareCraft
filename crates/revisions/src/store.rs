@@ -44,12 +44,23 @@ fn valid_author(a: &Author) -> bool {
             .id
             .chars()
             .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '<' | '>' | '@'));
-    let name_ok = !a.name.trim().is_empty()
-        && !a
-            .name
+    id_ok && is_valid_author_name(&a.name)
+}
+
+/// Whether `name` can be stored as an author name: no control characters, `<` or `>`, and
+/// something left after trimming what libgit2 trims from both ends of a signature name.
+#[must_use]
+pub fn is_valid_author_name(name: &str) -> bool {
+    !name.trim_matches(trimmed_from_signature).is_empty()
+        && !name
             .chars()
-            .any(|c| c.is_control() || matches!(c, '<' | '>'));
-    id_ok && name_ok
+            .any(|c| c.is_control() || matches!(c, '<' | '>'))
+}
+
+/// Characters libgit2 strips from the ends of a signature name (`is_crud` in its
+/// `signature.c`: bytes up to space and `, : ; < > " \ '`), plus any other whitespace.
+fn trimmed_from_signature(c: char) -> bool {
+    c <= ' ' || c.is_whitespace() || matches!(c, ',' | ':' | ';' | '<' | '>' | '"' | '\\' | '\'')
 }
 
 fn email(author: &Author) -> String {

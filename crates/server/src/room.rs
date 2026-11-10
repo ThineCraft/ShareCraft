@@ -402,16 +402,18 @@ fn encode(msg: &ServerMsg<TextOp>) -> Option<Utf8Bytes> {
     serde_json::to_string(msg).ok().map(Utf8Bytes::from)
 }
 
-/// `name` without control characters, `<` or `>`, and trimmed; "Guest" if nothing is left.
-/// The revision store accepts any such name as an author name.
+/// `name` without control characters, `<` or `>`, and trimmed; "Guest" if what is left is not
+/// a name the revision store accepts as an author name.
 fn credited_name(name: &str) -> String {
     let kept: String = name
         .chars()
         .filter(|c| !c.is_control() && !matches!(c, '<' | '>'))
         .collect();
-    match kept.trim() {
-        "" => DEFAULT_NAME.to_owned(),
-        trimmed => trimmed.to_owned(),
+    let trimmed = kept.trim();
+    if revisions::is_valid_author_name(trimmed) {
+        trimmed.to_owned()
+    } else {
+        DEFAULT_NAME.to_owned()
     }
 }
 
@@ -606,6 +608,10 @@ mod tests {
         assert_eq!(credited_name("<Ann>\nX"), "AnnX");
         assert_eq!(credited_name(" <> \t"), "Guest");
         assert_eq!(credited_name("Bob"), "Bob");
+        for unusable in [";", "'", "\"", "\\", ":", " ,; "] {
+            assert_eq!(credited_name(unusable), "Guest", "{unusable:?}");
+        }
+        assert_eq!(credited_name(":)"), ":)");
     }
 
     #[test]

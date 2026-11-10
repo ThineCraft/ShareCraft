@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 pub use meta::{Author, Meta};
-pub use store::RevisionStore;
+pub use store::{RevisionStore, is_valid_author_name};
 
 /// A Git commit identifier: 40 lowercase hexadecimal characters.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

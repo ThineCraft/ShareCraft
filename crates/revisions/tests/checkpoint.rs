@@ -402,6 +402,28 @@ fn rejects_blank_author_name() {
 }
 
 #[test]
+fn rejects_author_name_libgit2_would_empty() {
+    // libgit2 trims these from both ends of a signature name and refuses an empty result.
+    for name in [";", "'", "\"", ",", ":", "\\", " ;: ", "'\"'"] {
+        assert_invalid_author_writes_nothing(author("u1", name));
+        assert!(!revisions::is_valid_author_name(name), "{name:?}");
+    }
+    // Trimmed by libgit2 but not to nothing, so these are kept.
+    for name in [".", "...", ":)"] {
+        assert!(revisions::is_valid_author_name(name), "{name:?}");
+        let f = fixture();
+        let d = doc();
+        let fields = Map::new();
+        let authors = [author("u1", name)];
+        written(
+            f.store
+                .checkpoint(&cp(d, b"x", None, &authors, &fields))
+                .unwrap(),
+        );
+    }
+}
+
+#[test]
 fn rejects_invalid_further_author() {
     let f = fixture();
     let d = doc();

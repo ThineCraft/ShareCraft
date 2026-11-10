@@ -643,6 +643,25 @@ async fn awkward_display_name_does_not_block_saving() {
         .map(|p| p.name.as_str())
         .collect();
     assert_eq!(names, vec!["AnnX"]);
+
+    // Names libgit2 would trim to nothing are credited as "Guest", so saving still works.
+    // `;`, `'`, `"`, `\` and `:`, percent-encoded.
+    for encoded in ["%3B", "%27", "%22", "%5C", "%3A"] {
+        let doc = new_doc();
+        let mut a = TestClient::connect(server.addr, doc, encoded).await;
+        assert_eq!(a.people(), vec!["Guest".to_owned()], "{encoded}");
+        a.type_at(0, "hi").await;
+        a.pump_until(|c| c.pending() == 0 && c.seq() == Seq(1))
+            .await;
+        a.wait_saved(Seq(1)).await;
+        assert!(
+            !a.saves().iter().any(|s| s.0 == SaveState::Failed),
+            "{encoded}: {:?}",
+            a.saves()
+        );
+        let stored = server.store().read(doc, None).unwrap().unwrap();
+        assert_eq!(stored.meta.contributors[0].name, "Guest", "{encoded}");
+    }
 }
 
 /// Holds every write until released, and reports when one starts.
