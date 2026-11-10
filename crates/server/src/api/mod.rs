@@ -21,14 +21,13 @@ use crate::auth::same_origin;
 /// Largest request body accepted.
 const MAX_BODY: usize = 16 * 1024;
 
-/// The `/api` routes.
+/// The `/api` routes, to be nested under `/api`. Unknown paths answer `404 {"error":"not_found"}`
+/// and pass the same guard as the others.
 pub(crate) fn router() -> Router<AppState> {
     Router::new()
-        .route(
-            "/api/session",
-            post(session::sign_in).delete(session::sign_out),
-        )
-        .route("/api/me", get(session::me))
+        .route("/session", post(session::sign_in).delete(session::sign_out))
+        .route("/me", get(session::me))
+        .fallback(|| async { ApiError::NotFound })
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .layer(middleware::from_fn(require_same_origin))
 }
@@ -54,6 +53,8 @@ pub(crate) enum ApiError {
     InvalidCredentials,
     /// 403: the request failed the same-origin check.
     Forbidden,
+    /// 404: no such API route.
+    NotFound,
     /// 413: the body is larger than 16 KiB.
     TooLarge,
     /// 415: the body is not `application/json`.
@@ -79,6 +80,7 @@ impl ApiError {
             ApiError::NotSignedIn => (StatusCode::UNAUTHORIZED, "not_signed_in"),
             ApiError::InvalidCredentials => (StatusCode::UNAUTHORIZED, "invalid_credentials"),
             ApiError::Forbidden => (StatusCode::FORBIDDEN, "forbidden"),
+            ApiError::NotFound => (StatusCode::NOT_FOUND, "not_found"),
             ApiError::TooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "too_large"),
             ApiError::NotJson => (StatusCode::UNSUPPORTED_MEDIA_TYPE, "not_json"),
             ApiError::TooManyAttempts => (StatusCode::TOO_MANY_REQUESTS, "too_many_attempts"),

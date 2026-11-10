@@ -123,6 +123,7 @@ impl TestServer {
         }
         reqwest::Client::builder()
             .default_headers(headers)
+            .timeout(TIMEOUT)
             .build()
             .unwrap()
     }
@@ -241,6 +242,15 @@ pub async fn wait_out_grace() {
     tokio::time::sleep(SHORT_GRACE * 3).await;
 }
 
+/// Runs a server, panicking with its error if it stops, for example because it could not reach
+/// or migrate the database after the listener was bound. The panic is printed with the test's
+/// output, and the test's next request fails after [`TIMEOUT`] instead of hanging.
+async fn fail_loudly(serving: impl std::future::Future<Output = std::io::Result<()>>) {
+    if let Err(e) = serving.await {
+        panic!("the test server stopped: {e}");
+    }
+}
+
 /// Starts a server on an ephemeral loopback port with its own data directory and database
 /// schema; empty rooms stay open for [`LONG_GRACE`].
 pub async fn spawn_server() -> TestServer {
@@ -255,7 +265,7 @@ pub async fn spawn_server_config(edit: impl FnOnce(&mut Config)) -> TestServer {
     edit(&mut config);
     let listener = tokio::net::TcpListener::bind(config.addr).await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(server::serve(config, listener));
+    tokio::spawn(fail_loudly(server::serve(config, listener)));
     TestServer {
         addr,
         data_dir,
@@ -287,7 +297,7 @@ impl StoppableServer {
             .unwrap();
         runtime.spawn(async move {
             let listener = tokio::net::TcpListener::from_std(listener).unwrap();
-            server::serve(config, listener).await
+            fail_loudly(server::serve(config, listener)).await;
         });
         StoppableServer {
             addr,
@@ -350,7 +360,7 @@ pub async fn spawn_server_with_grace(
     let listener = tokio::net::TcpListener::bind(config.addr).await.unwrap();
     let addr = listener.local_addr().unwrap();
     let state = AppState::new(config, checkpointer, db.db.clone());
-    tokio::spawn(server::serve_state(state, listener));
+    tokio::spawn(fail_loudly(server::serve_state(state, listener)));
     TestServer {
         addr,
         data_dir,

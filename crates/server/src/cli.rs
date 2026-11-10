@@ -60,17 +60,9 @@ pub fn parse_add_user(args: &[String]) -> Result<AddUser, String> {
 /// are unusable. It never contains the password or the database URL.
 pub async fn add_user(args: &[String]) -> Result<String, String> {
     let wanted = parse_add_user(args)?;
-    let url = match std::env::var("DATABASE_URL") {
-        Ok(url) if !url.trim().is_empty() => url,
-        Ok(_) | Err(std::env::VarError::NotPresent) => {
-            return Err("DATABASE_URL is not set".to_owned());
-        }
-        Err(std::env::VarError::NotUnicode(_)) => {
-            return Err("DATABASE_URL is not valid Unicode".to_owned());
-        }
-    };
+    let url = crate::config::database_url_from_env().map_err(|e| e.to_string())?;
     let password = read_password().map_err(|e| format!("cannot read the password: {e}"))?;
-    let db = Db::connect(url.trim())
+    let db = Db::connect(url.expose())
         .await
         .map_err(|e| format!("cannot connect to the database: {e}"))?;
     db.migrate()

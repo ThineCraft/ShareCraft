@@ -36,16 +36,17 @@ pub(crate) async fn sign_in(
     JsonBody(credentials): JsonBody<Credentials>,
 ) -> Result<Response, ApiError> {
     let key = Throttle::key(&credentials.email);
-    if !state.throttle().allows(&key, Instant::now()) {
+    // Held until this attempt ends, also if the request is cancelled mid-check.
+    let Some(attempt) = state.throttle().try_begin(&key, Instant::now()) else {
         return Err(ApiError::TooManyAttempts);
-    }
+    };
     match state
         .db()
         .sign_in(&credentials.email, &credentials.password)
         .await
     {
         Ok((_, token)) => {
-            state.throttle().succeeded(&key);
+            attempt.succeeded();
             Ok((
                 StatusCode::NO_CONTENT,
                 [(SET_COOKIE, session_cookie(&token))],
@@ -53,7 +54,7 @@ pub(crate) async fn sign_in(
                 .into_response())
         }
         Err(SignInError::Invalid) => {
-            state.throttle().failed(&key, Instant::now());
+            attempt.failed(Instant::now());
             Err(ApiError::InvalidCredentials)
         }
         Err(SignInError::Db(e)) => Err(ApiError::unavailable(&e)),

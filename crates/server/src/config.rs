@@ -84,7 +84,7 @@ impl Config {
         let addr = read_var("SHARECRAFT_ADDR")?;
         let data = read_var("SHARECRAFT_DATA")?;
         let web = read_var("SHARECRAFT_WEB")?;
-        let database = read_var("DATABASE_URL")?;
+        let database = read_var(DATABASE_VARIABLE)?;
         Self::from_values(
             addr.as_deref(),
             data.as_deref(),
@@ -106,10 +106,7 @@ impl Config {
         database_url: Option<&str>,
     ) -> Result<Self, ConfigError> {
         let addr = parse_addr(addr.unwrap_or(DEFAULT_ADDR))?;
-        let database_url = match database_url.map(str::trim) {
-            Some(url) if !url.is_empty() => DatabaseUrl::new(url),
-            _ => return Err(ConfigError::NoDatabase),
-        };
+        let database_url = database_url_from(database_url)?;
         Ok(Self {
             addr,
             data_dir: PathBuf::from(data_dir.unwrap_or(DEFAULT_DATA)),
@@ -119,6 +116,25 @@ impl Config {
             room_grace: Duration::from_secs(60),
             database_url,
         })
+    }
+}
+
+/// The variable naming the database.
+const DATABASE_VARIABLE: &str = "DATABASE_URL";
+
+/// Reads `DATABASE_URL` alone, for commands that need only the database.
+///
+/// # Errors
+/// `NoDatabase` when it is unset or empty, `NotUnicode` when it is unreadable.
+pub fn database_url_from_env() -> Result<DatabaseUrl, ConfigError> {
+    database_url_from(read_var(DATABASE_VARIABLE)?.as_deref())
+}
+
+/// The database URL from `value`, trimmed; `NoDatabase` when it is missing or empty.
+fn database_url_from(value: Option<&str>) -> Result<DatabaseUrl, ConfigError> {
+    match value.map(str::trim) {
+        Some(url) if !url.is_empty() => Ok(DatabaseUrl::new(url)),
+        _ => Err(ConfigError::NoDatabase),
     }
 }
 

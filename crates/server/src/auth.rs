@@ -117,11 +117,68 @@ const MAX_EMAILS: usize = 10_000;
 /// Longest email address an account can have; longer keys are cut to this.
 const MAX_KEY_CHARS: usize = 254;
 
-/// Recent failed sign-ins per email, in memory. After [`MAX_FAILURES`] failures within
-/// [`WINDOW`], an email is refused until the oldest of them is [`WINDOW`] old.
+/// Recent failed sign-ins per email, in memory. Attempts still being checked count against the
+/// limit too, so simultaneous requests cannot get past it: after [`MAX_FAILURES`] failures and
+/// attempts in progress within [`WINDOW`], an email is refused until the oldest failure is
+/// [`WINDOW`] old.
 #[derive(Default)]
 pub(crate) struct Throttle {
-    failures: Mutex<HashMap<String, VecDeque<Instant>>>,
+    entries: Mutex<HashMap<String, Entry>>,
+}
+
+/// What the throttle knows about one email.
+#[derive(Default)]
+struct Entry {
+    /// Times of recent failures, oldest first.
+    failures: VecDeque<Instant>,
+    /// Attempts begun and not yet finished.
+    in_flight: usize,
+}
+
+impl Entry {
+    fn is_idle(&self) -> bool {
+        self.failures.is_empty() && self.in_flight == 0
+    }
+}
+
+/// A sign-in attempt holding one of its email's slots. Dropping it, also when the request is
+/// cancelled, gives the slot back; [`Attempt::failed`] first records a failure.
+pub(crate) struct Attempt<'a> {
+    throttle: &'a Throttle,
+    key: String,
+}
+
+impl Attempt<'_> {
+    /// Counts this attempt as a failed sign-in at `now`.
+    pub(crate) fn failed(self, now: Instant) {
+        let mut entries = self.throttle.lock();
+        if let Some(entry) = entries.get_mut(&self.key) {
+            forget_expired(&mut entry.failures, now);
+            entry.failures.push_back(now);
+            while entry.failures.len() > MAX_FAILURES {
+                entry.failures.pop_front();
+            }
+        }
+    }
+
+    /// Forgets the email's failures after a successful sign-in.
+    pub(crate) fn succeeded(self) {
+        if let Some(entry) = self.throttle.lock().get_mut(&self.key) {
+            entry.failures.clear();
+        }
+    }
+}
+
+impl Drop for Attempt<'_> {
+    fn drop(&mut self) {
+        let mut entries = self.throttle.lock();
+        if let Some(entry) = entries.get_mut(&self.key) {
+            entry.in_flight = entry.in_flight.saturating_sub(1);
+            if entry.is_idle() {
+                entries.remove(&self.key);
+            }
+        }
+    }
 }
 
 impl Throttle {
@@ -136,42 +193,31 @@ impl Throttle {
             .collect()
     }
 
-    /// Whether a sign-in for `key` may be attempted at `now`.
-    pub(crate) fn allows(&self, key: &str, now: Instant) -> bool {
-        let mut failures = self.lock();
-        let Some(times) = failures.get_mut(key) else {
-            return true;
-        };
-        forget_expired(times, now);
-        if times.is_empty() {
-            failures.remove(key);
-            return true;
+    /// Starts a sign-in attempt for `key` at `now`, or `None` when recent failures plus
+    /// attempts in progress already reach the limit.
+    pub(crate) fn try_begin(&self, key: &str, now: Instant) -> Option<Attempt<'_>> {
+        let mut entries = self.lock();
+        if !entries.contains_key(key) && entries.len() >= MAX_EMAILS {
+            make_room(&mut entries, now);
         }
-        times.len() < MAX_FAILURES
+        let entry = entries.entry(key.to_owned()).or_default();
+        forget_expired(&mut entry.failures, now);
+        if entry.failures.len() + entry.in_flight >= MAX_FAILURES {
+            if entry.is_idle() {
+                entries.remove(key);
+            }
+            return None;
+        }
+        entry.in_flight += 1;
+        Some(Attempt {
+            throttle: self,
+            key: key.to_owned(),
+        })
     }
 
-    /// Counts a failed sign-in for `key` at `now`.
-    pub(crate) fn failed(&self, key: &str, now: Instant) {
-        let mut failures = self.lock();
-        if !failures.contains_key(key) && failures.len() >= MAX_EMAILS {
-            make_room(&mut failures, now);
-        }
-        let times = failures.entry(key.to_owned()).or_default();
-        forget_expired(times, now);
-        times.push_back(now);
-        while times.len() > MAX_FAILURES {
-            times.pop_front();
-        }
-    }
-
-    /// Forgets the failures for `key` after a successful sign-in.
-    pub(crate) fn succeeded(&self, key: &str) {
-        self.lock().remove(key);
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, VecDeque<Instant>>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Entry>> {
         // The map holds no invariant a panic elsewhere could break.
-        self.failures.lock().unwrap_or_else(PoisonError::into_inner)
+        self.entries.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -184,22 +230,28 @@ fn forget_expired(times: &mut VecDeque<Instant>, now: Instant) {
     }
 }
 
-/// Drops every email whose failures have all expired; if none has, drops the email whose
-/// latest failure is oldest.
-fn make_room(failures: &mut HashMap<String, VecDeque<Instant>>, now: Instant) {
-    failures.retain(|_, times| {
-        forget_expired(times, now);
-        !times.is_empty()
+/// Drops every email with no unexpired failure and no attempt in progress. If that frees
+/// nothing, drops the idle email whose latest failure is oldest.
+///
+/// This is a trade-off: someone who fails sign-ins for 10,000 other emails within the window
+/// can push out, and so reset, another email's count. The alternative, refusing new emails
+/// while the table is full, would let the same flood lock everyone out. The count is a brake
+/// on guessing, and Argon2 keeps each guess slow either way.
+fn make_room(entries: &mut HashMap<String, Entry>, now: Instant) {
+    entries.retain(|_, entry| {
+        forget_expired(&mut entry.failures, now);
+        !entry.is_idle()
     });
-    if failures.len() < MAX_EMAILS {
+    if entries.len() < MAX_EMAILS {
         return;
     }
-    let stalest = failures
+    let stalest = entries
         .iter()
-        .min_by_key(|(_, times)| times.back().copied())
+        .filter(|(_, entry)| entry.in_flight == 0)
+        .min_by_key(|(_, entry)| entry.failures.back().copied())
         .map(|(key, _)| key.clone());
     if let Some(key) = stalest {
-        failures.remove(&key);
+        entries.remove(&key);
     }
 }
 
@@ -285,6 +337,15 @@ mod tests {
         assert!(session_token(&HeaderMap::new()).is_none());
     }
 
+    /// Whether an attempt may start; the attempt is given back at once.
+    fn allows(throttle: &Throttle, key: &str, now: Instant) -> bool {
+        throttle.try_begin(key, now).is_some()
+    }
+
+    fn fail(throttle: &Throttle, key: &str, now: Instant) {
+        throttle.try_begin(key, now).unwrap().failed(now);
+    }
+
     #[test]
     fn throttle_refuses_after_five_failures_until_the_oldest_expires() {
         let throttle = Throttle::default();
@@ -292,17 +353,38 @@ mod tests {
         let key = Throttle::key(" Ann@X.test ");
         assert_eq!(key, "ann@x.test");
         for i in 0..5 {
-            assert!(throttle.allows(&key, start));
-            throttle.failed(&key, start + Duration::from_secs(i * 60));
+            fail(&throttle, &key, start + Duration::from_secs(i * 60));
         }
         let later = start + Duration::from_secs(5 * 60);
-        assert!(!throttle.allows(&key, later));
-        assert!(throttle.allows("bob@x.test", later));
+        assert!(!allows(&throttle, &key, later));
+        assert!(allows(&throttle, "bob@x.test", later));
         // The first failure expires at start + WINDOW.
-        assert!(!throttle.allows(&key, start + WINDOW - Duration::from_secs(1)));
-        assert!(throttle.allows(&key, start + WINDOW));
-        throttle.succeeded(&key);
-        assert!(throttle.allows(&key, later));
+        assert!(!allows(
+            &throttle,
+            &key,
+            start + WINDOW - Duration::from_secs(1)
+        ));
+        let attempt = throttle.try_begin(&key, start + WINDOW).unwrap();
+        attempt.succeeded();
+        assert!(allows(&throttle, &key, later));
+        // Nothing is left behind once the email is idle.
+        assert!(throttle.lock().is_empty());
+    }
+
+    #[test]
+    fn attempts_in_progress_count_against_the_limit() {
+        let throttle = Throttle::default();
+        let now = Instant::now();
+        fail(&throttle, "ann@x.test", now);
+        let held: Vec<Attempt<'_>> = (0..4)
+            .map(|_| throttle.try_begin("ann@x.test", now).unwrap())
+            .collect();
+        assert!(throttle.try_begin("ann@x.test", now).is_none());
+        // Dropping an attempt (a cancelled request, or a database error) gives its slot back.
+        drop(held);
+        assert!(allows(&throttle, "ann@x.test", now));
+        assert_eq!(throttle.lock()["ann@x.test"].in_flight, 0);
+        assert_eq!(throttle.lock()["ann@x.test"].failures.len(), 1);
     }
 
     #[test]
@@ -310,13 +392,13 @@ mod tests {
         let throttle = Throttle::default();
         let start = Instant::now();
         for i in 0..MAX_EMAILS {
-            throttle.failed(&format!("u{i}@x.test"), start);
+            fail(&throttle, &format!("u{i}@x.test"), start);
         }
         // Nothing has expired: the stalest email makes room.
-        throttle.failed("late@x.test", start + Duration::from_secs(1));
+        fail(&throttle, "late@x.test", start + Duration::from_secs(1));
         assert_eq!(throttle.lock().len(), MAX_EMAILS);
         // Everything older than the window is dropped at once.
-        throttle.failed("later@x.test", start + WINDOW);
+        fail(&throttle, "later@x.test", start + WINDOW);
         assert_eq!(throttle.lock().len(), 2);
     }
 }

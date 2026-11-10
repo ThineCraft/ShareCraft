@@ -214,6 +214,56 @@ async fn sixth_failed_attempt_is_refused() {
 }
 
 #[tokio::test]
+async fn simultaneous_attempts_cannot_pass_the_limit() {
+    let server = spawn_server().await;
+    create(&server, "ann@x.test").await;
+    let attempts = (0..10).map(|_| {
+        let server = &server;
+        async move { sign_in(server, "ann@x.test", WRONG).await.status() }
+    });
+    let statuses = futures_util::future::join_all(attempts).await;
+    let refused = statuses
+        .iter()
+        .filter(|s| **s == StatusCode::TOO_MANY_REQUESTS)
+        .count();
+    let checked = statuses
+        .iter()
+        .filter(|s| **s == StatusCode::UNAUTHORIZED)
+        .count();
+    assert!(checked <= 5, "{statuses:?}");
+    assert_eq!(checked + refused, 10, "{statuses:?}");
+    let answer = status_and_body(sign_in(&server, "ann@x.test", PASSWORD).await).await;
+    assert_eq!(
+        answer,
+        (StatusCode::TOO_MANY_REQUESTS, error("too_many_attempts"))
+    );
+}
+
+#[tokio::test]
+async fn unknown_api_path_is_a_json_404() {
+    let server = spawn_server().await;
+    let answer = status_and_body(
+        server
+            .http(None)
+            .get(server.url("/api/nothing-here"))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(answer, (StatusCode::NOT_FOUND, error("not_found")));
+
+    // It passes the same guard as every other API path.
+    let response = reqwest::Client::new()
+        .post(server.url("/api/nothing-here"))
+        .send()
+        .await
+        .unwrap();
+    let answer = status_and_body(response).await;
+    assert_eq!(answer, (StatusCode::FORBIDDEN, error("forbidden")));
+}
+
+#[tokio::test]
 async fn success_clears_failed_attempts() {
     let server = spawn_server().await;
     create(&server, "ann@x.test").await;
@@ -255,6 +305,16 @@ async fn post_without_origin_is_refused() {
 async fn cross_origin_post_is_refused() {
     let server = spawn_server().await;
     let ann = server.user("Ann").await;
+    let response = reqwest::Client::new()
+        .post(server.url("/api/session"))
+        .header(ORIGIN, "http://evil.example")
+        .json(&json!({ "email": ann.email, "password": PASSWORD }))
+        .send()
+        .await
+        .unwrap();
+    let answer = status_and_body(response).await;
+    assert_eq!(answer, (StatusCode::FORBIDDEN, error("forbidden")));
+
     let response = reqwest::Client::new()
         .delete(server.url("/api/session"))
         .header(ORIGIN, "http://evil.example")

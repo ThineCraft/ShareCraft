@@ -107,7 +107,7 @@ pub fn router(state: AppState) -> Router {
     let files = ServeDir::new(&state.config().web_dir);
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
-        .merge(api::router())
+        .nest("/api", api::router())
         .route("/ws/docs/{doc_id}", get(ws::upgrade))
         .fallback_service(files)
         .with_state(state)
