@@ -1,0 +1,291 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="The four editors ShareCraft opens files in: where each comes from, what was changed in each fork and why, how each is built, what it stores, what was checked in a browser and what was not, and how to bring a fork up to date.">
+<title>ShareCraft — Editors and Their Forks</title>
+<style>
+:root{--ink:#172f38;--muted:#536b72;--line:#d7e2e3;--accent:#086959;--paper:#fff;--wash:#f2f6f5;font-family:Segoe UI,Arial,sans-serif;color:var(--ink);background:var(--wash);line-height:1.65}
+*{box-sizing:border-box}body{margin:0}a{color:var(--accent);text-underline-offset:3px}a:focus-visible,button:focus-visible{outline:3px solid #b66e00;outline-offset:4px}.skip{position:absolute;left:1rem;top:-5rem;background:white;padding:1rem;z-index:20}.skip:focus{top:1rem}
+.cover{background:#123e3b;color:#fff;padding:66px max(24px,calc((100vw - 1160px)/2));border-bottom:8px solid #71d8b5}.eyebrow{text-transform:uppercase;letter-spacing:.17em;font-size:.76rem;font-weight:700;color:#a7e7d1}.cover h1{font-size:clamp(2.6rem,6vw,4.6rem);letter-spacing:-.05em;line-height:1.05;margin:18px 0}.cover .lede{font-size:1.2rem;max-width:770px;color:#e0eee9}.meta{display:flex;flex-wrap:wrap;gap:10px 28px;color:#c4ded5;font-size:.88rem}.layout{display:grid;grid-template-columns:225px minmax(0,1fr);gap:48px;max-width:1210px;margin:auto;padding:40px 25px 80px}nav{position:sticky;top:24px;align-self:start;max-height:90vh;overflow:auto;font-size:.88rem}nav p{font-weight:700;margin:0 0 12px}nav a{display:block;padding:7px 0;text-decoration:none;color:var(--muted)}nav a:hover{color:var(--accent)}main{min-width:0}section{scroll-margin-top:25px;margin:0 0 38px}h2{font-size:1.7rem;line-height:1.25;letter-spacing:-.025em;margin:0 0 18px}h3{font-size:1.13rem;line-height:1.4;margin:0 0 12px}h4{font-size:1rem;margin:20px 0 8px}p{margin:0 0 16px}.note{padding:20px 23px;border-left:4px solid var(--accent);background:#e5f0ec}.note p:last-child{margin-bottom:0}.cards{display:grid;gap:17px}.module{background:var(--paper);padding:25px;border:1px solid var(--line);border-radius:9px;break-inside:avoid}.tag{display:inline-block;font-size:.7rem;letter-spacing:.05em;text-transform:uppercase;border-radius:4px;padding:3px 7px;background:#e2f1e9;color:#155438;margin:0 0 12px}.spine{background:#fff0d5;color:#775110}.parallel{background:#e8ecfb;color:#344e91}ul,ol{padding-left:22px;margin:0 0 16px}li{margin:0 0 9px}li:last-child{margin-bottom:0}.rid{font-weight:700;color:var(--accent);white-space:nowrap}table{border-collapse:collapse;width:100%;font-size:.91rem;background:white}th,td{border:1px solid var(--line);padding:12px 14px;text-align:left;vertical-align:top}th{background:#e8efed}caption{text-align:left;font-weight:700;padding:0 0 10px}.table-wrap{overflow-x:auto;margin:0 0 16px}.small{font-size:.88rem;color:var(--muted)}.toolbar{display:flex;justify-content:space-between;align-items:center;gap:20px;margin-bottom:26px}button{background:var(--accent);color:white;border:0;border-radius:5px;padding:10px 15px;font:inherit;cursor:pointer}footer{border-top:1px solid var(--line);padding-top:22px;font-size:.86rem;color:var(--muted)}
+.pending{padding:14px 18px;border-left:4px solid #b66e00;background:#fff0d5;margin:0 0 16px}.pending p:last-child{margin-bottom:0}.hash{font-family:Consolas,"Cascadia Mono",monospace;font-size:.85em;word-break:break-all}
+@media(max-width:850px){.layout{grid-template-columns:1fr;gap:28px}nav{position:static;max-height:none;display:flex;flex-wrap:wrap;gap:3px 18px;border-bottom:1px solid var(--line);padding-bottom:20px}nav p{width:100%;margin-bottom:0}.cover{padding:40px 25px}.module{padding:20px}}
+@media print{@page{size:A4;margin:17mm}html,body{background:white;font-size:10pt}.cover{padding:12mm 0;background:white;color:var(--ink);border-bottom:3px solid var(--accent)}.cover .lede,.meta,.eyebrow{color:var(--ink)}.layout{display:block;padding:10mm 0;margin:0;max-width:none}nav,.toolbar button,.skip{display:none}.module{border-radius:0;padding:5mm}.note,.pending{background:#f4f4f4}h2,h3{break-after:avoid}a{color:inherit}tr{break-inside:avoid}.table-wrap{overflow:visible}}
+pre{background:#0f2a2c;color:#e6f2ee;border-radius:6px;padding:14px 16px;margin:0 0 16px;overflow-x:auto;font-size:.88rem;line-height:1.5}code{font-family:Consolas,"Cascadia Mono",monospace;font-size:.92em}p code,li code,td code{background:#e8efed;border-radius:3px;padding:1px 5px}pre code{background:none;padding:0;font-size:inherit}
+@media print{pre{background:#f4f4f4;color:#000;border:1px solid #999;white-space:pre-wrap}}
+</style>
+</head>
+<body data-project="ShareCraft" data-status="editor-records">
+<a class="skip" href="#main">Skip to the editors</a>
+<header class="cover">
+<p class="eyebrow">ThineCraft / Editor forks</p>
+<h1>The editors ShareCraft opens files in</h1>
+<p class="lede">ShareCraft opens spreadsheets, word documents, PDFs and 3D designs in four editors: GridCraft, WordCraft, PdfCraft and SolidCraft. Each one is a copy (a fork) of another project's open-source editor, changed a little for ShareCraft. This page records where each comes from, what was changed and why, how it is built, what it stores, and what has been checked in a browser.</p>
+<div class="meta"><span>Stage 1 · Third plan</span><span>10 November 2026</span><span>Companion to <a href="BUILDING.html" style="color:inherit">Building and Running</a></span></div>
+</header>
+<div class="layout">
+<nav aria-label="Document contents"><p>In this document</p>
+<a href="#status">00 · Where things stand</a><a href="#how">01 · How an editor opens</a><a href="#glance">02 · The four at a glance</a><a href="#gridcraft">03 · GridCraft</a><a href="#wordcraft">04 · WordCraft</a><a href="#pdfcraft">05 · PdfCraft</a><a href="#solidcraft">06 · SolidCraft</a><a href="#found">07 · Found in the browser checks</a><a href="#unchecked">08 · Not checked yet</a><a href="#brand">09 · Brand mentions left in the forks</a><a href="#update">10 · Updating a fork from upstream</a><a href="#risks">11 · Risks</a><a href="#notices">12 · Licences and notices</a>
+</nav>
+<main id="main">
+<div class="toolbar"><span class="small">Standalone HTML · Print-ready · No external assets</span><button type="button" onclick="window.print()">Print / Save PDF</button></div>
+
+<section id="status"><h2>00 / Where things stand</h2>
+<div class="note"><p><strong>All four editors open from ShareCraft and save back as Git revisions.</strong> On 10 November 2026, GridCraft, WordCraft, PdfCraft and SolidCraft were each built from their fork, opened from ShareCraft in a browser, edited, saved, and reopened from the saved Git revision. Each check covered the main path only; section 08 lists what was not checked, and sections 03 to 07 what does not work yet. This describes the <code>stage-1-editors</code> branch, which still has a final review to pass before it is merged.</p>
+<p>The browser checks were done by the project owner's assistant using the browser built into its tools, one browser engine only. Section 08 lists what was not checked. One person edits a file at a time; editing a file together is Stage 2 work.</p></div>
+</section>
+
+<section id="how"><h2>01 / How an editor opens from ShareCraft</h2>
+<p>This is the short version; <a href="BUILDING.html#files">BUILDING.html</a> has the detail.</p>
+<ul>
+<li><strong>ShareCraft serves the editor itself.</strong> Each editor is built on the ShareCraft machine into a folder of web files (<code>editors/&lt;id&gt;/</code>) and served by the ShareCraft server under <code>/editors/&lt;id&gt;/</code>, from the same address as the rest of the site. This matters because three of the editors only talk to a page that comes from their own address (decision D20 in <a href="scope.html">scope.html</a>).</li>
+<li><strong>A ShareCraft page holds the editor.</strong> Opening a file document goes to <code>/file.html?doc=&lt;id&gt;</code>, the <em>frame page</em>. It has a slim bar (back to documents, the file name, a status, Save, Download and, for owners, Share) and shows the editor inside it in an <code>&lt;iframe&gt;</code>.</li>
+<li><strong>The page and the editor talk through a bridge the editor already had.</strong> GridCraft, WordCraft and PdfCraft share one bridge (the <code>craft-web-host</code> crate from storytold's <code>craft-libs</code>): the page hands the editor the file, and the editor hands back what it saves. SolidCraft has a different one: the page asks it for its design as JSON text and tells it when the server has stored it.</li>
+<li><strong>One person edits at a time.</strong> The first person who may edit and opens the file holds the one <em>editing seat</em>. Everyone else sees the editor under a banner saying their changes are not saved. The editors have no read-only mode, so they can still type; nothing they do is stored.</li>
+<li><strong>Saving is on demand.</strong> The person presses Save in the frame bar (or the editor's own Save). The page uploads the whole file; the server stores it as a new Git revision credited to that person.</li>
+<li><strong>ShareCraft never looks inside the file.</strong> It stores the bytes as they come and serves them back only as a download.</li>
+</ul>
+</section>
+
+<section id="glance"><h2>02 / The four at a glance</h2>
+<p>An <em>upstream</em> is the original project. The <em>base commit</em> is the exact version of it the fork started from. The <em>fork commit</em> is the version of the fork that was built. The same record is kept in <code>editors.toml</code> in the ShareCraft repository, which the build tool reads.</p>
+<div class="table-wrap"><table><caption>Where each editor comes from</caption>
+<thead><tr><th>Editor</th><th>Upstream and base commit</th><th>Fork, branch and fork commit</th><th>Version</th></tr></thead>
+<tbody>
+<tr><td>GridCraft (spreadsheets)</td><td><a href="https://github.com/storytold/gridcraft">storytold/gridcraft</a><br><span class="hash">e9addf52fe68847e6c1310fcfa5d42b7aa8b9650</span></td><td><a href="https://github.com/ThineCraft/GridCraft">ThineCraft/GridCraft</a>, branch <code>sharecraft</code><br><span class="hash">2bb15166be565e872691a3f2632f2583fef6c5c6</span></td><td>0.16.0</td></tr>
+<tr><td>WordCraft (word documents)</td><td><a href="https://github.com/storytold/wordcraft">storytold/wordcraft</a><br><span class="hash">2922fe566b575794f896077467cf92825ccba7c9</span></td><td><a href="https://github.com/ThineCraft/WordCraft">ThineCraft/WordCraft</a>, branch <code>sharecraft</code><br><span class="hash">338b94b75b31e0366de0dd729bde44c5c569f659</span></td><td>0.15.1</td></tr>
+<tr><td>PdfCraft (PDFs)</td><td><a href="https://github.com/storytold/pdfcraft">storytold/pdfcraft</a><br><span class="hash">a71b5124bc388e6b86ec0ee5ec16d31fa1955117</span></td><td><a href="https://github.com/ThineCraft/PdfCraft">ThineCraft/PdfCraft</a>, branch <code>sharecraft</code><br><span class="hash">b53339e5a5f88ea4c2a9a4a32c2387b54cfd5118</span></td><td>0.18.1</td></tr>
+<tr><td>SolidCraft (3D designs)</td><td><a href="https://github.com/tangency-labs/solidcraft">tangency-labs/solidcraft</a><br><span class="hash">f232e4a40c9d1d3088c758e393b7db43048eac22</span></td><td><a href="https://github.com/ThineCraft/SolidCraft">ThineCraft/SolidCraft</a>, branch <code>sharecraft</code><br><span class="hash">dd8724aeaa10d50de232d7be44864683fdfc508f</span></td><td>0.40.0-rc.3</td></tr>
+</tbody></table></div>
+<p>In each fork the default branch (<code>main</code>) is left as the upstream had it; ShareCraft's changes are only on <code>sharecraft</code>. All four <code>sharecraft</code> branches were pushed to the forks on 10 November 2026. Nothing was pushed to, or proposed to, any upstream project.</p>
+<div class="table-wrap"><table><caption>Build, size and stored format</caption>
+<thead><tr><th>Editor</th><th>Build time</th><th>Installed size</th><th>ShareCraft stores</th><th>Opened from ShareCraft</th></tr></thead>
+<tbody>
+<tr><td>GridCraft</td><td>About 10 minutes</td><td>26.3 MB; the WebAssembly file is 26.0 MB, its script 174 KB</td><td><code>.xlsx</code></td><td>Yes, checked 10 November 2026</td></tr>
+<tr><td>WordCraft</td><td>About 40 minutes, most of it the optimiser</td><td>51.0 MB; the WebAssembly file is 50.7 MB</td><td><code>.docx</code></td><td>Yes, checked 10 November 2026</td></tr>
+<tr><td>PdfCraft</td><td>About 16 minutes</td><td>50.4 MB; the WebAssembly file is 46.6 MB, plus a 3.4 MB text-recognition worker. The recognition models are not installed.</td><td><code>.pdf</code></td><td>Yes, checked 10 November 2026</td></tr>
+<tr><td>SolidCraft</td><td>About 50 minutes: 17 compiling, the rest the optimiser, which used up to 5.6 GB of memory</td><td>160.0 MB; the WebAssembly file is 153.1 MB, because the fork's release settings keep debugging information in it</td><td><code>.solidcraft.json</code></td><td>Yes, checked 10 November 2026</td></tr>
+</tbody></table></div>
+<p class="small">Sizes are in millions of bytes, read from the installed folders. <code>du -sh</code> shows 26M, 49M, 49M and 153M for the same folders, because it counts in units of 1,048,576 bytes. ShareCraft sends these files uncompressed. Compressed with gzip, the main WebAssembly files would be 9.5 MB (GridCraft), 18.4 MB (WordCraft), 17.7 MB (PdfCraft) and 48.2 MB (SolidCraft). A browser downloads the editor the first time it opens it; after that it asks the server whether the files changed.</p>
+<p class="small">Each installed editor has a manifest, <code>editor.json</code>, that records its version, its fork and upstream commits and its build date. The build date is written in UTC, so the PdfCraft, WordCraft and SolidCraft builds made on the evening of 10 November 2026 are dated 2026-11-11 there.</p>
+<p>The build command is the same for each editor, run from the ShareCraft repository with the fork cloned beside it: <code>cargo xtask editors build gridcraft</code> (or <code>wordcraft</code>, <code>pdfcraft</code>, <code>solidcraft</code>). <a href="BUILDING.html#editors">BUILDING.html</a> explains what it needs and what it does.</p>
+</section>
+
+<section id="gridcraft"><h2>03 / GridCraft</h2>
+<div class="cards">
+<article class="module"><span class="tag">Opens and saves from ShareCraft</span><h3>Where it comes from and what was changed</h3>
+<p>Upstream <a href="https://github.com/storytold/gridcraft">storytold/gridcraft</a> by the ArtCraft team, base <span class="hash">e9addf52fe68847e6c1310fcfa5d42b7aa8b9650</span>. Fork <a href="https://github.com/ThineCraft/GridCraft">ThineCraft/GridCraft</a>, branch <code>sharecraft</code>, one commit: <span class="hash">2bb15166be565e872691a3f2632f2583fef6c5c6</span>.</p>
+<p>Why there are changes at all: the fork must not present itself as ArtCraft's product or suggest ArtCraft endorses it, but it must still credit where it came from. So the changes remove the upstream brand from what a person sees, and say plainly what the fork is based on.</p>
+<ul>
+<li>The About dialog said "Part of ArtCraft." It now says "Based on GridCraft by the ArtCraft team." Its links to the ArtCraft website and chat server were removed, with the translations used only by those links.</li>
+<li>The ArtCraft logo and mark files and their licence text (<code>docs/brand/</code>) were deleted, with their rows in <code>ATTRIBUTION.md</code> and their references in <code>README.md</code> and <code>AGENTS.md</code>.</li>
+<li><code>NOTICE</code> gained a section "Changes made for ShareCraft" saying this is a modified version maintained by ThineCraft, not the original and not endorsed by the ArtCraft team or Tangency Labs, with one dated line per change.</li>
+</ul>
+<p>Nothing was changed in how GridCraft edits or saves.</p>
+<h4>Formats</h4>
+<p>According to the fork's README, GridCraft's own format is <code>.xlsx</code>, it also reads and writes CSV and TSV, opens older <code>.xls</code> workbooks with values, formulas and number formats, imports data from <code>.xlsb</code> and <code>.ods</code>, and exports PDF. ShareCraft stores a GridCraft document only as <code>.xlsx</code>. A save from the editor whose name ends in <code>.xlsx</code> becomes a new revision; anything else it saves (CSV, PDF and so on) is treated as an export and becomes a download for the person, leaving the stored file as it was. New spreadsheets can be made from the home page, and <code>.xlsx</code> files can be uploaded.</p>
+<h4>What was checked in the browser, 10 November 2026</h4>
+<ul>
+<li>"New" with the kind Spreadsheet made <code>Budget.xlsx</code> and opened the frame page. The editor loaded inside it under its security policy, with no policy violations in the browser console.</li>
+<li>Typing a label in A1 and the formula <code>=40+2</code> in B1 (through the editor's page interface) changed the status to "Unsaved changes". The frame's Save changed it to "Saved" and stored a new revision. The stored file was a real <code>.xlsx</code> (4,066 bytes), served as a download with the protective headers. After a reload the sheet showed Total and 42, and the editor's title was <code>Budget.xlsx</code>.</li>
+<li>Exporting CSV from the editor's own File menu downloaded <code>Budget.csv</code>. The stored revision did not change and the status stayed "Unsaved changes", which is right: the spreadsheet itself was not saved.</li>
+<li>Git held two commits named "Checkpoint Budget.xlsx", both credited to the person who saved, and <code>git fsck</code> on the library repository was clean.</li>
+<li>A second person with the editor role opening the same file saw "View only" and "Ann Tester is editing this file. You can read it; changes you make here are not saved.", and no Save button.</li>
+<li>When the owner removed that second person, within about a second the editor disappeared from their screen, the page said "Your access to this document was removed.", the file's content answered 404, and no name was left on the page.</li>
+<li>With the server stopped, the status read "Connection lost. Saving is paused." and the editor stayed. A Save made then was held. When the server came back, the held save was stored as a further commit (4,100 bytes).</li>
+</ul>
+<h4>What does not work, or works differently</h4>
+<ul>
+<li>The frame's Save button does nothing while the browser tab is hidden (section 07).</li>
+<li>GridCraft's own File tab still offers New, Open and Close. Using them replaces the workbook inside the frame, and a later Save stores that other workbook as this document (section 07).</li>
+<li>Not checked: see section 08.</li>
+</ul>
+</article>
+</div>
+</section>
+
+<section id="wordcraft"><h2>04 / WordCraft</h2>
+<div class="cards">
+<article class="module"><span class="tag">Opens and saves from ShareCraft</span><h3>Where it comes from and what was changed</h3>
+<p>Upstream <a href="https://github.com/storytold/wordcraft">storytold/wordcraft</a> by the ArtCraft team, base <span class="hash">2922fe566b575794f896077467cf92825ccba7c9</span>. Fork <a href="https://github.com/ThineCraft/WordCraft">ThineCraft/WordCraft</a>, branch <code>sharecraft</code>, two commits, ending at <span class="hash">338b94b75b31e0366de0dd729bde44c5c569f659</span>.</p>
+<ul>
+<li>The About dialog now ends "Based on WordCraft by the ArtCraft team." Its links to the ArtCraft site and chat server were removed. The link to the upstream source code and the copyright line were kept, as credit.</li>
+<li>The ArtCraft brand files (<code>docs/brand/</code>) were deleted, with their rows in <code>ATTRIBUTION.md</code>. In <code>README.md</code> the logo and mark images were removed, and the trademark paragraph was replaced by a note that this is a modified version maintained by ThineCraft that includes no ArtCraft marks.</li>
+<li>A "Join the ArtCraft community on Discord" button, shown by default in the title bar, the File (backstage) menu and the Review ribbon, was removed with its command, its keyboard tip and its Options checkbox. Why: people using ShareCraft would see it and be sent to the upstream's chat as if it were this product's. The setting behind the checkbox is kept but does nothing, so settings saved by an earlier version still load.</li>
+<li><code>NOTICE</code>: the trademark paragraph now says this version includes no ArtCraft marks, and a "Changes made for ShareCraft" section lists each change with its date.</li>
+</ul>
+<h4>Formats</h4>
+<p>According to the fork's README, WordCraft's own format is <code>.docx</code>; it also opens and saves <code>.odt</code>, <code>.rtf</code>, <code>.html</code>, <code>.md</code>, <code>.tex</code> and <code>.txt</code>, opens older <code>.doc</code> files and exports PDF. ShareCraft stores a WordCraft document only as <code>.docx</code>; any other save from the editor becomes a download. New documents can be made from the home page, and <code>.docx</code> files can be uploaded.</p>
+<h4>What was checked in the browser, 10 November 2026</h4>
+<ul>
+<li>A new <code>Policy.docx</code> opened the editor in the frame with no policy violations.</li>
+<li>Text in Latin script, with accents, and in Japanese was typed in (through the editor's page interface). The status changed to "Unsaved changes"; the frame's Save changed it to "Saved" and stored a real <code>.docx</code> (6,620 bytes).</li>
+<li>After a reload the document reopened with its text intact, and its "last modified by" property was the signed-in person's name, which the frame passes to the editor.</li>
+<li>The community button no longer appears in the title bar.</li>
+</ul>
+<h4>What does not work, or works differently</h4>
+<ul>
+<li><strong>A new, empty document shows WordCraft's start screen</strong> (New, Open and templates) instead of a blank page. The plan expected this. A fix is planned: when a document has no stored content, the page will ask the editor to start a new blank document.</li>
+<li><strong>The web build has no font for Chinese, Japanese or Korean text.</strong> Japanese text was stored correctly but drawn as empty boxes, and the editor reported "1 font not installed". The upstream's optional extra font set was not built in.</li>
+<li>The frame's Save button does nothing while the tab is hidden (section 07).</li>
+<li>WordCraft's File tab offers New and Open as GridCraft's does (its start screen shows them). Using them would most likely replace the document in the frame the same way, so that a later Save stores the other document; this was seen in GridCraft and not checked in WordCraft.</li>
+<li>Not checked: see section 08.</li>
+</ul>
+</article>
+</div>
+</section>
+
+<section id="pdfcraft"><h2>05 / PdfCraft</h2>
+<div class="cards">
+<article class="module"><span class="tag">Opens and saves from ShareCraft</span><h3>Where it comes from and what was changed</h3>
+<p>Upstream <a href="https://github.com/storytold/pdfcraft">storytold/pdfcraft</a> by the ArtCraft team, base <span class="hash">a71b5124bc388e6b86ec0ee5ec16d31fa1955117</span>. Fork <a href="https://github.com/ThineCraft/PdfCraft">ThineCraft/PdfCraft</a>, branch <code>sharecraft</code>, one commit: <span class="hash">b53339e5a5f88ea4c2a9a4a32c2387b54cfd5118</span>.</p>
+<p>PdfCraft drew the ArtCraft wordmark and mark from image files compiled into the program, on its home screen and in About, and promoted the ArtCraft community in several places. The changes:</p>
+<ul>
+<li>The wordmark and mark were removed from About and the home screen; About now says "Based on PdfCraft by the ArtCraft team." The home screen's community card, the title bar's Discord button and the Discord and website links in the Help menu, the command list and the command-line tool were removed. The Help menu keeps a link to the upstream source code, as credit.</li>
+<li>The brand files (<code>docs/brand/</code>) and the licence that covered only them were deleted, with their entries in <code>ATTRIBUTION.toml</code>, <code>ATTRIBUTION.md</code> and <code>LICENSES.toml</code> and their images in <code>README.md</code>.</li>
+<li>The upstream's tests for the removed buttons and links were replaced by tests that they are gone.</li>
+<li><code>NOTICE</code>: the paragraph about the marks now says this version does not include them, and a "Changes made for ShareCraft" section says it is a modified version, not made or endorsed by the ArtCraft team or Tangency Labs, and lists each change with its date.</li>
+</ul>
+<h4>Formats</h4>
+<p>PdfCraft opens and saves PDF. ShareCraft stores a PdfCraft document only as <code>.pdf</code>. The home page cannot make a new, empty PDF (an empty PDF is not a file); a PDF has to be uploaded.</p>
+<h4>What was checked in the browser, 10 November 2026</h4>
+<ul>
+<li>Uploading a PDF made a new document. Uploading a file named <code>evil.html</code> was refused.</li>
+<li>The PDF was drawn by the editor inside the frame. Duplicating a page (through the editor's page interface) changed the status to "Unsaved changes"; Save changed it to "Saved" and stored a new revision, a PDF with two pages.</li>
+</ul>
+<h4>What does not work, or works differently</h4>
+<ul>
+<li>Text recognition (OCR) cannot work: its worker is built and installed, but the recognition models are not installed.</li>
+<li>The frame's Save button does nothing while the tab is hidden (section 07).</li>
+<li>Not checked: see section 08.</li>
+</ul>
+</article>
+</div>
+</section>
+
+<section id="solidcraft"><h2>06 / SolidCraft</h2>
+<div class="cards">
+<article class="module"><span class="tag">Opens and saves from ShareCraft</span><h3>Where it comes from and what was changed</h3>
+<p>Upstream <a href="https://github.com/tangency-labs/solidcraft">tangency-labs/solidcraft</a> by Tangency Labs, base <span class="hash">f232e4a40c9d1d3088c758e393b7db43048eac22</span>. Fork <a href="https://github.com/ThineCraft/SolidCraft">ThineCraft/SolidCraft</a>, branch <code>sharecraft</code>, one commit: <span class="hash">dd8724aeaa10d50de232d7be44864683fdfc508f</span>.</p>
+<ul>
+<li>The web page no longer registers its service worker (an offline cache) when it is opened inside ShareCraft. Why: a cached copy of the editor could outlive an upgrade and keep running an old version.</li>
+<li>The social-preview tags (used when a link is shared on social media) that pointed at the upstream's website were removed.</li>
+<li>The loading animation of the SolidCraft mark was replaced by a plain pulsing square, drawn for the fork. The original file stays in the repository.</li>
+<li>About gained the line "Based on SolidCraft by Tangency Labs. This is a modified version, not endorsed by Tangency Labs." Upstream's <code>DISCLAIMER.md</code> forbids using Tangency Labs' name to suggest endorsement; a plain statement of origin with an explicit "not endorsed" does not do that. The line is in English only for now.</li>
+<li><code>NOTICE</code> gained a "Changes made for ShareCraft" section, with one dated line per change.</li>
+</ul>
+<p>The product icons were kept: they show the generic SolidCraft cube, not a company mark. Their file names contain the application id <code>io.tangencylabs.solidcraft</code>; renaming them would break the packaging files that use that id.</p>
+<h4>How ShareCraft talks to it</h4>
+<p>SolidCraft does not use the shared bridge. The frame opens it at <code>/editors/solidcraft/index.html?embed=editor</code> and calls its page interface: it hands over the stored design with <code>document.import</code>, asks every 2 seconds (only while the tab is shown) whether there are unsaved changes, and on Save asks for the design with <code>document.export</code>, uploads it, and only after the server has stored it tells the editor with <code>document.saved</code>. So the editor never believes it is saved when it is not. A request that gets no answer within 15 seconds shows "The editor did not answer. Show this tab and try again." This part of ShareCraft has automated tests that use a stand-in for the editor, and its main path was checked against the real editor (below).</p>
+<h4>Formats</h4>
+<p>According to the fork's README, SolidCraft reads and writes STEP, IGES, 3MF, STL, OBJ and glTF where supported, and has its own <code>.sc</code> design files. ShareCraft stores a SolidCraft document as the design's JSON text, in a file named <code>.solidcraft.json</code>, because that is what the editor's page interface hands over. A stored file that is not UTF-8 text is reported as an error and not sent to the editor. New designs can be made from the home page, and <code>.solidcraft.json</code> files can be uploaded. Binary <code>.sc</code> files cannot be stored.</p>
+<h4>Build</h4>
+<p>Version 0.40.0-rc.3. The build took about 50 minutes: 17 minutes compiling and the rest in the optimiser, which used up to 5.6 GB of memory. The installed editor is 160.0 MB, almost all of it one 153.1 MB WebAssembly file. It is this large because the fork's release settings keep debugging information in the file; building without it, or having the optimiser strip it, would make it far smaller, and is a candidate change in the fork. On the local machine it loaded in under 20 seconds. It was built from the clean temporary copy described in section 11, so the owner's local override of SolidCraft's geometry kernel was not used.</p>
+<h4>What was checked in the browser, 10 November 2026</h4>
+<ul>
+<li>A new <code>Bracket.solidcraft.json</code> opened the editor in the frame (at <code>?embed=editor</code>, with no name in the address), with no policy violations, and no service worker was registered.</li>
+<li>Adding a 40 × 30 × 20 box through the editor's page interface changed the status to "Unsaved changes" (found by the 2-second check).</li>
+<li>The frame's Save changed it to "Saved" and stored a new Git revision holding the design as JSON text (694 bytes). The editor then reported itself saved, so the confirmation step worked.</li>
+<li>After a reload the design was imported again: the box was drawn, it was listed in the editor's browser tree, and the editor's document name was "Bracket".</li>
+</ul>
+<h4>What does not work, or was not checked</h4>
+<ul>
+<li>Not checked: a confirmation refused because the design changed during a save; the "did not answer" banner after 15 seconds; what happens while the tab is hidden; downloading the stored file and importing it again by hand; large designs; how long the 153 MB file takes to load from a cold cache over a real network. See also section 08.</li>
+</ul>
+</article>
+</div>
+</section>
+
+<section id="found"><h2>07 / Found in the browser checks</h2>
+<p>These were found on 10 November 2026 and apply to more than one editor.</p>
+<ul>
+<li><strong>The editor answers the frame's Save button only while its tab is being shown.</strong> The editors do their work as they draw the screen, and a browser does not draw a hidden tab. So pressing Save in another way while the tab is hidden (for example from a script or an extension) does nothing until the tab is shown again; the upstream code says this in its own timeout message. Saving with the editor's own Ctrl+S is not affected, because the person is then looking at it. For SolidCraft the page is written to wait 15 seconds and then say the editor did not answer; that was not checked in a browser.</li>
+<li><strong>Built files contain the builder's local folder paths.</strong> The WebAssembly files hold paths such as <code>C:\Users\&lt;name&gt;\.cargo\…</code> inside log messages. Builds are made on the machine that runs ShareCraft and are not published, so this stays local today. Before any build is published, it must be rebuilt with path remapping (Rust's <code>--remap-path-prefix</code>), so that it does not carry a user name or folder layout.</li>
+<li><strong>The editors' own File menus still offer New, Open and Close.</strong> Seen in GridCraft: using them replaces the document inside the frame, and a later Save stores that other document as this one, as a new revision. The plan chose to leave the editors' menus as they are; this needs the owner's decision (hide them, or turn them off in each fork). GridCraft already has an address option that hides its File tab.</li>
+<li><strong>Narrow windows.</strong> At about 680 pixels wide the frame bar wraps and the Share button moves to a second row. It still works.</li>
+<li><strong>An empty lock file is installed with each editor.</strong> The build tool used by the editors (Trunk) leaves an empty <code>.trunk-lock</code> file in the installed folder. It is harmless and is served only to signed-in people.</li>
+</ul>
+</section>
+
+<section id="unchecked"><h2>08 / Not checked yet</h2>
+<p>These have not been tried in a browser. Some have automated tests (named in <a href="BUILDING.html">BUILDING.html</a> where relevant); none of that replaces a check with the real editors.</p>
+<div class="table-wrap"><table><caption>Not checked with the real editors, 10 November 2026</caption>
+<thead><tr><th>Editor</th><th>Not checked</th></tr></thead>
+<tbody>
+<tr><td>All</td><td>The banners for a refused save: someone else saved first (409), the file is too large (413), the server is busy or failed (503). "Download my copy" and "Try again". A seat becoming free and a reload taking it. The page at 375 pixels wide. Moving through the frame bar with the keyboard. A screen reader. Browsers other than the one built into the assistant's tools (no Firefox or Safari). Copy and paste through the clipboard. Whether the editor draws with WebGPU or WebGL. Saving with the editor's own Ctrl+S.</td></tr>
+<tr><td>GridCraft</td><td>Uploading a real <code>.xlsx</code> with formulas and a second sheet. Exporting PDF.</td></tr>
+<tr><td>WordCraft</td><td>Uploading a real <code>.docx</code> with a heading and a table. Exporting PDF. A second person opening the document. Removing someone while it is open (this uses the same page code as GridCraft, where it was checked).</td></tr>
+<tr><td>PdfCraft</td><td>Comments or highlights. Whether the saved file opens in another PDF reader. Whether the text-recognition worker loads under the editor's security policy, and what it says without its models. A second person and removal.</td></tr>
+<tr><td>SolidCraft</td><td>A refused confirmation (the design changed during a save). The "did not answer" banner. Behaviour while the tab is hidden. Downloading the stored file and importing it again by hand. Large designs. Loading the 153 MB file from a cold cache over a real network. A second person and removal.</td></tr>
+</tbody></table></div>
+</section>
+
+<section id="brand">
+<h2>09 / Brand mentions left in the forks</h2>
+<p>Each fork changed only what a person sees in the web build ShareCraft serves. The upstream brand is still mentioned elsewhere, on purpose: some mentions are credit or licence text that must stay, and the rest belong to the desktop app, its installers or the project's own documents, which ShareCraft does not use.</p>
+<div class="table-wrap"><table><caption>Left deliberately</caption>
+<thead><tr><th>Fork</th><th>Still mentions the upstream</th></tr></thead>
+<tbody>
+<tr><td>All four</td><td>Copyright lines in <code>LICENSE-MIT</code> and <code>NOTICE</code>, and credit lines in the README. These are credit and stay.</td></tr>
+<tr><td>GridCraft</td><td>The desktop app's Help menu links to the ArtCraft site and chat. Windows and Linux installers install into an "ArtCraft" folder and carry ArtCraft links. A <code>NOTICE</code> paragraph still describes the deleted logo files (<code>NOTICE</code> is only added to). The README body links to ArtCraft.</td></tr>
+<tr><td>WordCraft</td><td>The sample document links to the ArtCraft website. The program's built-in agent server (MCP) names the ArtCraft site and chat. An unused chat-server icon is left in the code. The README, installers and project documents mention ArtCraft.</td></tr>
+<tr><td>PdfCraft</td><td>The README still promotes the ArtCraft chat and website. Installer metadata carries ArtCraft links and an "ArtCraft" install folder. The documentation screenshots still show the old home screen with the ArtCraft mark; they are regenerated by the fork's own tooling, which was not run.</td></tr>
+<tr><td>SolidCraft</td><td>The desktop app's update check and issue reporter point at the upstream. Packaging uses the application id <code>io.tangencylabs.solidcraft</code>. Workflows, contribution and disclaimer files name Tangency Labs.</td></tr>
+</tbody></table></div>
+<div class="note"><p><strong>Before any desktop build of a fork is distributed,</strong> its installers, Help links, update check and issue reporter must be changed so that it does not present itself as the upstream's product or send people to the upstream's support. Nothing in Stage 1 builds or distributes a desktop app.</p></div>
+</section>
+
+<section id="update"><h2>10 / Bringing a fork up to date with its upstream</h2>
+<p>The upstream projects keep changing. To take their newer work into a fork, move the fork's few changes onto a newer upstream commit (a <em>rebase</em>), rebuild, and check again. The fork's changes are listed in its <code>NOTICE</code>, so it is clear what has to survive. Run these in the fork's folder, beside ShareCraft (for example <code>../GridCraft</code>):</p>
+<ol>
+<li>Fetch the upstream: <code>git fetch upstream</code>. (When the fork was cloned, the original project was added as the remote <code>upstream</code>.) Choose the new base, usually the newest commit on <code>upstream/main</code>.</li>
+<li>Keep the old commit reachable, so that a build made from it can still be traced: <code>git tag sharecraft-&lt;date&gt; sharecraft</code>.</li>
+<li>Move the changes: <code>git switch sharecraft</code>, then <code>git rebase &lt;new base&gt;</code>. Resolve any conflict so that every line under "Changes made for ShareCraft" in <code>NOTICE</code> is still true.</li>
+<li>Look again for the upstream brand in what the web build shows (About, title bar, Help, home screen, loading screen), since the upstream may have added some. Change only what a person sees, and add a dated line to <code>NOTICE</code> for each new change.</li>
+<li>Run the fork's own checks for the crates touched (its formatter and <code>cargo check</code> for the user-interface crate, as the fork's README or <code>AGENTS.md</code> describes).</li>
+<li>Push the branch and the tag to the fork, never to the upstream: <code>git push --force-with-lease origin sharecraft</code> and <code>git push origin sharecraft-&lt;date&gt;</code>.</li>
+<li>In ShareCraft, update the editor's table in <code>editors.toml</code>: <code>base</code> becomes the new upstream commit, <code>commit</code> the new head of <code>sharecraft</code>.</li>
+<li>Rebuild and install: <code>cargo xtask editors build &lt;id&gt;</code>, then <code>cargo xtask editors verify</code>.</li>
+<li>Repeat the browser check for that editor (sections 03 to 06 list what was checked), and record what was and was not checked.</li>
+<li>Update this page (commits, version, size, what works) and commit <code>editors.toml</code> and this page together in ShareCraft.</li>
+</ol>
+<p class="small">Step 2 and the use of tags are a suggestion of this page, not something the build tool needs.</p>
+</section>
+
+<section id="risks"><h2>11 / Risks</h2>
+<h3>The forks depend on storytold's own copies of other projects</h3>
+<p>GridCraft, WordCraft and PdfCraft are built against storytold's modified copies of two libraries, egui (drawing the user interface) and winit (windows and input), and against storytold's <code>craft-libs</code> repository, which holds shared pieces including the bridge the frame talks to (<code>craft-web-host</code>). They are fetched from GitHub by exact commit when an editor is built. If storytold deletes, renames or rewrites those repositories, the forks can no longer be built from a clean machine, even though their own code is unchanged. A machine that has built them before keeps copies in Cargo's cache. Mirroring the repositories into the ThineCraft organization would remove the risk; that is not done and needs the owner's decision.</p>
+<div class="table-wrap"><table><caption>Revisions used, from each fork's Cargo.toml files on its sharecraft branch</caption>
+<thead><tr><th>Repository</th><th>Revision</th><th>Used by</th></tr></thead>
+<tbody>
+<tr><td><code>github.com/storytold/egui</code></td><td class="hash">6d518fc799681571963842f95b55a6b68431b15a</td><td>GridCraft, WordCraft, PdfCraft</td></tr>
+<tr><td><code>github.com/storytold/winit</code></td><td class="hash">a517b3846ee8457d84ee4975110bfda6797c44dc</td><td>GridCraft, WordCraft, PdfCraft</td></tr>
+<tr><td rowspan="7"><code>github.com/storytold/craft-libs</code></td><td class="hash">fd5e2feff6ea25bed371a99cc732b3968d621505</td><td>GridCraft, WordCraft, PdfCraft (the web apps; this revision holds <code>craft-web-host</code>)</td></tr>
+<tr><td class="hash">1b34eba41e62138fc2438d2734523b302840b45d</td><td>GridCraft, WordCraft, PdfCraft</td></tr>
+<tr><td class="hash">01315d9c92b5b0e69082d35ca56099461a1efd45</td><td>WordCraft</td></tr>
+<tr><td class="hash">762a06a4c6b48b522b7d4de84a87917ef90265e6</td><td>WordCraft</td></tr>
+<tr><td class="hash">92d392cff132eaf53e13afff77f38b5c11b73aa0, a3e0b5a9440d18f19422a9dca13516747b7d3181</td><td>WordCraft</td></tr>
+<tr><td class="hash">787a7a0f972fd1d7a7618fdbeca3a5267a0407ff</td><td>PdfCraft</td></tr>
+<tr><td class="hash">b6b8a55b2c52bb83d0580216cbecb532af01970d</td><td>PdfCraft</td></tr>
+</tbody></table></div>
+<p>SolidCraft's <code>Cargo.toml</code> names none of these: it uses the published egui and keeps its own copies of winit, egui-wgpu and its geometry kernel inside its repository.</p>
+<h3>Other risks</h3>
+<ul>
+<li><strong>The editors run with the signed-in person's rights.</strong> Because ShareCraft serves them from its own address, an editor's code could call ShareCraft's interface as the person using it. They are code ThineCraft builds from its own forks, and their security policy stops injected scripts from running (BUILDING.html, section 17). Serving them from a separate address would be safer still but needs a change in three forks (decision D20).</li>
+<li><strong>A developer's Cargo settings in a parent folder would change a build.</strong> Cargo applies a configuration file found in any folder above the one it builds in. One such file exists on the owner's machine, above the repositories folder, and points one of SolidCraft's libraries at a local copy. The build tool therefore builds each editor from a clean temporary copy of the fork outside the repositories folder, and refuses to build if it finds such a file above that copy (BUILDING.html, section 13).</li>
+<li><strong>Published builds must be rebuilt with path remapping</strong> (section 07).</li>
+<li><strong>Desktop builds would carry the upstream brand</strong> (section 09).</li>
+<li><strong>The person's name is passed to the editor in the frame's address</strong> (<code>?author=</code>), for GridCraft, WordCraft and PdfCraft, which use it to credit comments and changes. It is not logged by the server, but it is in the browser's history for that frame.</li>
+</ul>
+</section>
+
+<section id="notices"><h2>12 / Licences and notices</h2>
+<p>All four editors are licensed MIT or Apache 2.0, like ShareCraft. Apache 2.0 asks that changed files be marked; each fork does this in the "Changes made for ShareCraft" section of its <code>NOTICE</code>. Every licence and attribution file was kept: <code>LICENSE-MIT</code>, <code>LICENSE-APACHE</code>, <code>NOTICE</code> and <code>ATTRIBUTION.md</code> in each fork, and also <code>ATTRIBUTION.toml</code>, <code>LICENSES.toml</code> and <code>licenses/</code> in PdfCraft and <code>DISCLAIMER.md</code> and the geometry kernel's own notice in SolidCraft. The only licence file removed is PdfCraft's licence for the brand files, which covered nothing else once they were deleted.</p>
+<p>The build tool copies each fork's licence, notice and attribution files into the installed editor's <code>licenses/</code> folder, and refuses to install a build without a licence and a notice file.</p>
+</section>
+
+<footer>ShareCraft · ThineCraft · Editors and their forks · Updated 10 November 2026<br>Written from the execution ledger of the third Stage 1 plan, the fork reports and the code. All four editors were built and checked on 10 November 2026; the branch has still to pass its final review.</footer>
+</main></div>
+</body>
+</html>

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="description" content="How to build and run the ShareCraft development build: prerequisites, commands, accounts and sharing, where data is kept, and what this build does not do yet.">
+<meta name="description" content="How to build and run the ShareCraft development build: prerequisites, commands, accounts and sharing, where data is kept, the four file editors and how they are built, and what this build does not do yet.">
 <title>ShareCraft — Building and Running</title>
 <style>
 :root{--ink:#172f38;--muted:#536b72;--line:#d7e2e3;--accent:#086959;--paper:#fff;--wash:#f2f6f5;font-family:Segoe UI,Arial,sans-serif;color:var(--ink);background:var(--wash);line-height:1.65}
@@ -20,17 +20,17 @@ pre{background:#0f2a2c;color:#e6f2ee;border-radius:6px;padding:14px 16px;margin:
 <header class="cover">
 <p class="eyebrow">ThineCraft / Development build</p>
 <h1>Building and running ShareCraft</h1>
-<p class="lede">How to build and run the development build of ShareCraft: people sign in with their own accounts, share plain-text documents with each other, and edit them together in browser tabs. This page also says what the build does not do yet.</p>
-<div class="meta"><span>Stage 1 · Second plan</span><span>10 November 2026</span><span>Companion to <a href="sequencing.html" style="color:inherit">Sequencing Plan</a></span></div>
+<p class="lede">How to build and run the development build of ShareCraft: people sign in with their own accounts, share documents with each other, edit plain text together in browser tabs, and open spreadsheets, word documents, PDFs and 3D designs in their editors, one person at a time. This page also says what the build does not do yet.</p>
+<div class="meta"><span>Stage 1 · Third plan</span><span>10 November 2026</span><span>Companion to <a href="sequencing.html" style="color:inherit">Sequencing Plan</a></span></div>
 </header>
 <div class="layout">
 <nav aria-label="Document contents"><p>In this document</p>
-<a href="#need">01 · What you need</a><a href="#build">02 · Build and check</a><a href="#admin">03 · The first administrator</a><a href="#run">04 · Run it and sign in</a><a href="#settings">05 · Settings</a><a href="#accounts">06 · Accounts and signing in</a><a href="#sharing">07 · Sharing and roles</a><a href="#removed">08 · What a removed person sees</a><a href="#data">09 · Where data is kept</a><a href="#index">10 · The revision index</a><a href="#events">11 · Events</a><a href="#stop">12 · Stopping the server, and notices</a><a href="#limits">13 · Known limits</a><a href="#licences">14 · Licences</a>
+<a href="#need">01 · What you need</a><a href="#build">02 · Build and check</a><a href="#admin">03 · The first administrator</a><a href="#run">04 · Run it and sign in</a><a href="#settings">05 · Settings</a><a href="#accounts">06 · Accounts and signing in</a><a href="#sharing">07 · Sharing and roles</a><a href="#removed">08 · What a removed person sees</a><a href="#data">09 · Where data is kept</a><a href="#index">10 · The revision index</a><a href="#events">11 · Events</a><a href="#stop">12 · Stopping the server, and notices</a><a href="#editors">13 · Building the editors</a><a href="#files">14 · Opening a file document</a><a href="#session">15 · File session, seat and saving</a><a href="#content">16 · Content routes</a><a href="#policy">17 · The editor pages' policy</a><a href="#limits">18 · Known limits</a><a href="#licences">19 · Licences</a>
 </nav>
 <main id="main">
 <div class="toolbar"><span class="small">Standalone HTML · Print-ready · No external assets</span><button type="button" onclick="window.print()">Print / Save PDF</button></div>
 
-<div class="note" id="status"><p><strong>Status of this build, and what has been checked.</strong> This is a development build, not a release. The server is covered by automated tests, which run against a real PostgreSQL database (section 02). The scripts of the web pages have one automated test file, which covers only the check that a sign-in redirect stays on this site; the rest of the page scripts are not covered by automated tests. A hands-on check of the pages in a browser is recorded separately by the project owner's assistant, not in this document, so nothing here should be read as saying that check has been done. The sections below describe what the code does.</p></div>
+<div class="note" id="status"><p><strong>Status of this build, and what has been checked.</strong> This is a development build, not a release. The server is covered by automated tests, which run against a real PostgreSQL database (section 02). The scripts of the web pages have one automated test file, which covers only the check that a sign-in redirect stays on this site; the rest of the page scripts are not covered by automated tests. A hands-on check of the pages in a browser is recorded separately by the project owner's assistant, not in this document, so nothing here should be read as saying that check has been done; for the four file editors, what was and was not checked in a browser is listed in <a href="editors.html">editors.html</a>. The frame page's pure parts (the editor bridges, the save queue, the status wording) have their own automated test file, <code>web/editor-host.test.mjs</code>. The sections below describe what the code does.</p></div>
 
 <section id="need"><h2>01 / What you need</h2>
 <ul>
@@ -46,7 +46,8 @@ pre{background:#0f2a2c;color:#e6f2ee;border-radius:6px;padding:14px 16px;margin:
 <ul>
 <li><strong>PostgreSQL.</strong> The server keeps accounts, sign-in sessions, sharing, the revision index and events in a PostgreSQL database and will not start without one. Development has used PostgreSQL 18 on the local machine. Create an empty database and an account that may create tables in it. For the tests (section 02) create a second, separate database and give the same account permission to create schemas in it; the tests do not create databases.</li>
 <li><strong>A <code>.env</code> file</strong> in the repository root, made by copying <code>.env.example</code> and replacing its placeholder values. It names the databases by variable (<code>DATABASE_URL</code> for the server, <code>TEST_DATABASE_URL</code> for the tests). <code>.env</code> is not kept in Git. Keep real values only there: never put a database address or password in a command that is saved, in a commit or in a message.</li>
-<li><strong>Node.js</strong>, to run the automated test file for the page scripts, which <code>cargo xtask check</code> runs (section 02). Without it the check stops and says that Node.js is needed.</li>
+<li><strong>Node.js</strong>, to run the automated test files for the page scripts, which <code>cargo xtask check</code> runs (section 02). Without it the check stops and says that Node.js is needed.</li>
+<li><strong>Only for the file editors:</strong> Trunk and the editors' source, described in section 13.</li>
 </ul>
 <p>Git does not need to be installed to run ShareCraft, because the Git library is built in. You only need it to look at saved documents (section 09).</p>
 </section>
@@ -60,8 +61,9 @@ pre{background:#0f2a2c;color:#e6f2ee;border-radius:6px;padding:14px 16px;margin:
 <p><strong>The tests need <code>TEST_DATABASE_URL</code>.</strong> Every test that uses the database creates its own schema in that database, drops it afterwards, and also drops leftover test schemas more than an hour old. A test that needs the variable and finds it unset fails with a message saying so; it is never skipped. That is why you run the tests through <code>cargo xtask check</code> or <code>cargo xtask test</code>, which load <code>.env</code>, and not through plain <code>cargo test</code>.</p>
 <p>This builds the browser client and writes the page's script package to <code>web/pkg</code>. The folder is not kept in Git, so do this once after a fresh checkout and again after changing the browser client:</p>
 <pre><code>cargo xtask web</code></pre>
-<p>The scripts of the web pages (the <code>.js</code> files in <code>web</code>) have one automated test file, <code>web/common.test.mjs</code>. It tests the function that decides where to go after signing in, so that a crafted link cannot send someone to another site. <code>cargo xtask check</code> runs it, and fails with a message saying so when Node.js is not installed; it never skips it. To run it on its own:</p>
+<p>The scripts of the web pages (the <code>.js</code> files in <code>web</code>) have two automated test files. <code>web/common.test.mjs</code> tests the function that decides where to go after signing in, so that a crafted link cannot send someone to another site. <code>web/editor-host.test.mjs</code> tests the frame page's pure parts: telling a save from an export, the save queue, the status wording and the two editor bridges, against stand-in editors. <code>cargo xtask check</code> runs them, and fails with a message saying so when Node.js is not installed; it never skips them. It also checks any installed editors against <code>editors.toml</code> (section 13). To run the page tests on their own:</p>
 <pre><code>node --test web/*.test.mjs</code></pre>
+<div class="note"><p><strong>Database migrations keep LF line endings.</strong> The server identifies each database migration by a checksum of the file's exact bytes. With Git's <code>core.autocrlf</code> on (common on Windows), checking out a branch once rewrote a migration file with Windows line endings, and the server then refused to start on an existing database with <code>migration 1 was previously applied but has been modified</code>. <code>.gitattributes</code> now pins the migration files to LF on every checkout. If you see that message after an older checkout, check the migration files out again (for example <code>git checkout -- crates/records/migrations</code>).</p></div>
 </section>
 
 <section id="admin"><h2>03 / The first administrator</h2>
@@ -83,8 +85,9 @@ http://localhost:8787/</code></pre>
 <thead><tr><th>Page</th><th>Who</th><th>What it does</th></tr></thead>
 <tbody>
 <tr><td><code>/signin.html</code></td><td>Everyone</td><td>Email and password form.</td></tr>
-<tr><td><code>/</code> (documents)</td><td>Signed-in people</td><td>Lists your documents with your role and last save time, creates a new one, and has the <strong>Sign out</strong> button. Administrators also see a link to People.</td></tr>
+<tr><td><code>/</code> (documents)</td><td>Signed-in people</td><td>Lists your documents with your role, their editor and last save time, creates a new one or uploads a file (section 14), and has the <strong>Sign out</strong> button. Administrators also see a link to People.</td></tr>
 <tr><td><code>/doc.html#&lt;id&gt;</code></td><td>People with a role on the document</td><td>The text box, who is in the document, the save status, and, for owners, the Sharing panel (section 07).</td></tr>
+<tr><td><code>/file.html?doc=&lt;id&gt;</code></td><td>People with a role on the document</td><td>A spreadsheet, word document, PDF or design in its editor, inside the frame page (section 14).</td></tr>
 <tr><td><code>/people.html</code></td><td>Administrators</td><td>Lists every account, adds an account, disables or enables one (section 06). Other people see <strong>Only administrators can manage people.</strong></td></tr>
 </tbody></table></div>
 <div class="note"><p><strong>Use those addresses only.</strong> The server refuses a WebSocket connection, and every <code>/api</code> request, when its <code>Host</code> is not a loopback name (<code>127.0.0.1</code>, <code>localhost</code> or <code>[::1]</code>), or when the page's <code>Origin</code> differs from the address it was loaded from. In this build the site therefore cannot be reached through another hostname, another computer or a proxy.</p></div>
@@ -100,8 +103,10 @@ http://localhost:8787/</code></pre>
 <tr><td><code>SHARECRAFT_ADDR</code></td><td><code>127.0.0.1:8787</code></td><td>IP address and port to listen on, for example <code>127.0.0.1:9000</code>. Must be a loopback address; the server refuses to start otherwise. A hostname such as <code>localhost</code> is not accepted for this setting (the page itself can still be opened at <code>http://localhost:8787/</code>).</td></tr>
 <tr><td><code>SHARECRAFT_DATA</code></td><td><code>./data</code></td><td>Folder where document content is stored (the Git repository, section 09).</td></tr>
 <tr><td><code>SHARECRAFT_WEB</code></td><td><code>./web</code></td><td>Folder of page files served at <code>/</code>.</td></tr>
+<tr><td><code>SHARECRAFT_EDITORS_DIR</code></td><td><code>./editors</code></td><td>Folder of installed editors, one folder each, served at <code>/editors</code> (section 13). Read once at start.</td></tr>
+<tr><td><code>SHARECRAFT_MAX_FILE_BYTES</code></td><td><code>67108864</code> (64 MiB)</td><td>The largest file, in bytes, that can be uploaded or saved as a file document. Must be a whole number above zero, or the server refuses to start.</td></tr>
 </tbody></table></div>
-<p><code>TEST_DATABASE_URL</code> is read only by the tests. <code>.env.example</code> also lists <code>POSTGRES_SUPERUSER_PASSWORD</code>, which the server does not read; it is there for database administration tasks you do yourself.</p>
+<p><code>SHARECRAFT_EDITOR_TARGET_DIR</code> is read only by <code>cargo xtask editors build</code>: where Cargo keeps the compiled pieces of each editor (section 13). <code>TEST_DATABASE_URL</code> is read only by the tests. <code>.env.example</code> also lists <code>POSTGRES_SUPERUSER_PASSWORD</code>, which the server does not read; it is there for database administration tasks you do yourself.</p>
 <p>The default folders are relative to the folder you start the server from, which is why the commands above are run from the repository root. Example with a different port and data folder:</p>
 <pre><code># PowerShell
 $env:SHARECRAFT_ADDR = "127.0.0.1:9000"
@@ -119,7 +124,8 @@ cargo run -p server</code></pre>
 <tr><td>Sign-in session length</td><td>30 days</td><td>How long a sign-in lasts (section 06).</td></tr>
 <tr><td>Failed sign-in limit</td><td>5 per email in 15 minutes</td><td>After that the email is refused until the oldest failure is 15 minutes old (section 06).</td></tr>
 <tr><td>Socket write timeout</td><td>10 seconds</td><td>If a write to a browser's connection does not finish in this time, the server drops the connection, because the browser has stopped reading. The page then reconnects as it does after any lost connection.</td></tr>
-<tr><td>Largest API request</td><td>16 KiB</td><td>Larger request bodies to <code>/api</code> are refused.</td></tr>
+<tr><td>Largest API request</td><td>16 KiB</td><td>Larger request bodies to <code>/api</code> are refused, except the file upload and save routes, which take up to <code>SHARECRAFT_MAX_FILE_BYTES</code> (section 16).</td></tr>
+<tr><td>Editor start time</td><td>60 seconds</td><td>An editor that has not said it is ready by then gets a banner saying it did not start.</td></tr>
 </tbody></table></div>
 </section>
 
@@ -193,7 +199,7 @@ cargo run -p server</code></pre>
 <p>With the defaults that is <code>data/libraries/00000000-0000-0000-0000-000000000001.git</code>. The <code>data</code> folder is not kept in Git. Every document lives in that one library for now.</p>
 <p>Inside the repository, the <code>main</code> branch holds, for each document identifier:</p>
 <ul>
-<li><code>docs/&lt;doc_id&gt;/content</code>: the document text.</li>
+<li><code>docs/&lt;doc_id&gt;/content</code>: the document text, or for a file document the file's bytes exactly as saved.</li>
 <li><code>docs/&lt;doc_id&gt;/meta.json</code>: the metadata for that revision, as JSON: the document's name, free-form fields, and the people credited so far.</li>
 </ul>
 <p>Each saved checkpoint is one Git commit. The commit's author is the account that made the change; if several accounts contributed since the last checkpoint, the others are named on <code>Co-authored-by</code> lines. Their addresses are of the form <code>&lt;account id&gt;@sharecraft.invalid</code>, not real email addresses. The document identifier is the one after the <code>#</code> in the page's address. To look at a saved document with plain <code>git</code>, run these from the repository root:</p>
@@ -223,11 +229,12 @@ git --git-dir=data/libraries/00000000-0000-0000-0000-000000000001.git show main:
 <div class="table-wrap"><table><caption>Event kinds</caption>
 <thead><tr><th>Kind</th><th>When</th><th>Belongs to a document</th></tr></thead>
 <tbody>
-<tr><td><code>document.created</code></td><td>A document was created (its name is in the details).</td><td>Yes</td></tr>
+<tr><td><code>document.created</code></td><td>A document was created (its name and editor are in the details; for an upload also <code>"uploaded": true</code> and its size in bytes).</td><td>Yes</td></tr>
 <tr><td><code>access.granted</code>, <code>access.changed</code>, <code>access.revoked</code></td><td>An owner gave someone a role, changed it (old and new role in the details), or removed it.</td><td>Yes</td></tr>
-<tr><td><code>editing.joined</code>, <code>editing.left</code></td><td>Someone opened the document in a tab, or their connection ended.</td><td>Yes</td></tr>
+<tr><td><code>editing.joined</code>, <code>editing.left</code></td><td>Someone opened the document in a tab, or their connection ended. Text and file documents alike.</td><td>Yes</td></tr>
 <tr><td><code>editing.removed</code></td><td>The server removed someone's connection; the reason (<code>access_revoked</code>, <code>signed_out</code>, <code>account_disabled</code>) is in the details.</td><td>Yes</td></tr>
-<tr><td><code>revision.saved</code></td><td>A checkpoint was written to Git (the commit id and the people credited are in the details).</td><td>Yes</td></tr>
+<tr><td><code>seat.taken</code>, <code>seat.freed</code></td><td>Someone took the editing seat of a file document, or it was freed (section 15).</td><td>Yes</td></tr>
+<tr><td><code>revision.saved</code></td><td>A checkpoint was written to Git, or a file save was stored (the commit id and the people credited are in the details).</td><td>Yes</td></tr>
 <tr><td><code>revision.save_failed</code>, <code>revision.conflict</code></td><td>A save failed, or Git held a newer revision than the server expected.</td><td>Yes</td></tr>
 <tr><td><code>revision.index_failed</code></td><td>A revision could not be added to the index (section 10).</td><td>Yes</td></tr>
 <tr><td><code>user.created</code>, <code>user.disabled</code>, <code>user.enabled</code></td><td>An account was created, disabled or enabled. The actor is empty when the command line did it.</td><td>No</td></tr>
@@ -267,7 +274,158 @@ git --git-dir=data/libraries/00000000-0000-0000-0000-000000000001.git show main:
 </tbody></table></div>
 </section>
 
-<section id="limits"><h2>13 / Known limits of this build</h2>
+<section id="editors"><h2>13 / The editors: building and installing them</h2>
+<p>Spreadsheets, word documents, PDFs and 3D designs open in four editors: GridCraft, WordCraft, PdfCraft and SolidCraft. Each is a fork of another project's open-source editor. ShareCraft does not contain them: each is built on this machine from its fork into <code>editors/&lt;id&gt;/</code> in the repository root, and the server serves it from there. That folder is not kept in Git. Where each fork comes from, what was changed in it, and what was checked, is in <a href="editors.html">editors.html</a>. Text documents need none of this.</p>
+<h3>What you need</h3>
+<ul>
+<li><strong>Trunk</strong>, the tool the editors use to build their web version. Install it for your own user (no administrator rights are needed). Development used trunk 0.22.1:</li>
+</ul>
+<pre><code>cargo install trunk --locked</code></pre>
+<ul>
+<li><strong>The WebAssembly target</strong> (section 01) and <strong>Git</strong>.</li>
+<li><strong>Time, memory and disk space.</strong> A build takes from about 10 minutes (GridCraft) to about 50 minutes (SolidCraft); most of the time goes into the optimiser, which used up to 5.6 GB of memory for SolidCraft. The installed editors take 26 MB to 160 MB each, and the build's intermediate files several gigabytes more.</li>
+</ul>
+<div class="note"><p><strong>A Windows Firewall prompt for <code>trunk.exe</code>.</strong> During one build Windows asked whether to let <code>trunk.exe</code> accept network connections. The process was <code>trunk build --release</code>, which serves nothing, and it held no network connections when it was looked at; why the prompt appeared was not established. The build needs no incoming connections, so choosing <strong>Cancel</strong> is safe. No firewall setting was changed.</p></div>
+<h3>Cloning the forks</h3>
+<p>The build tool expects each fork in a folder beside the ShareCraft repository, on its <code>sharecraft</code> branch. From the folder that holds <code>ShareCraft</code>:</p>
+<pre><code>git clone --branch sharecraft https://github.com/ThineCraft/GridCraft GridCraft
+git clone --branch sharecraft https://github.com/ThineCraft/WordCraft WordCraft
+git clone --branch sharecraft https://github.com/ThineCraft/PdfCraft PdfCraft
+git clone --branch sharecraft https://github.com/ThineCraft/SolidCraft SolidCraft</code></pre>
+<p>To update a fork from its original project later, also add that project as a remote named <code>upstream</code> (for example <code>git -C GridCraft remote add upstream https://github.com/storytold/gridcraft</code>); <a href="editors.html#update">editors.html</a> gives the steps.</p>
+<h3>The build tool</h3>
+<p><code>editors.toml</code> in the repository root records, for each editor, its original project and base commit, its fork, branch and folder, and the fork commit last built and checked. From the ShareCraft repository root:</p>
+<pre><code>cargo xtask editors list               # each editor: commit recorded, state of its folder, installed build
+cargo xtask editors build gridcraft    # build one editor (gridcraft, wordcraft, pdfcraft, solidcraft) and install it
+cargo xtask editors verify             # every installed editor matches editors.toml</code></pre>
+<p><strong>What <code>build</code> does.</strong> It first refuses, with a message saying why, if the fork's folder is missing, is not on the recorded branch, has uncommitted changes, was not cut from the recorded base commit, or if Trunk is not installed (it says how to install it and never installs it itself). It then:</p>
+<ol>
+<li>makes a clean temporary copy of the fork's committed head (a Git <em>worktree</em>) in the system's temporary folder, outside the repositories folder;</li>
+<li>runs <code>trunk build --release --public-url ./</code> in the editor's web app folder of that copy;</li>
+<li>refuses a build whose <code>index.html</code> points at addresses outside its own folder;</li>
+<li>computes a fingerprint (a SHA-256 hash) of each script and style written inside <code>index.html</code>, for the security policy (section 17);</li>
+<li>writes <code>editor.json</code>, the manifest: the editor's id and version, its fork and upstream commits, the build date (in UTC) and those fingerprints;</li>
+<li>copies the fork's licence, notice and attribution files into <code>licenses/</code>, and refuses if there is no licence or notice file;</li>
+<li>only then replaces <code>editors/&lt;id&gt;</code>. A failed build leaves the installed editor as it was. The temporary copy is removed in every case.</li>
+</ol>
+<p><strong>Why a clean temporary copy.</strong> Cargo applies a configuration file (<code>.cargo/config.toml</code>) found in any folder above the one it builds in. A developer's own settings there would silently change what is built; one such file on the owner's machine points one of SolidCraft's libraries at a local copy. Building from a copy outside the repositories folder means only the fork's own settings apply, and the fork's folder is never changed by the build. If <code>build</code> finds a Cargo configuration above the temporary folder (other than Cargo's own home folder), it refuses and says to set <code>TMP</code> and <code>TEMP</code> to a folder outside it.</p>
+<p><strong>Where the compiled pieces go.</strong> Cargo's intermediate files go to one folder per editor under <code>SHARECRAFT_EDITOR_TARGET_DIR</code>, or under <code>sharecraft-editor-target</code> in the system's temporary folder when it is not set. Keeping them makes a rebuild faster.</p>
+<p><strong><code>verify</code></strong> checks each installed editor against <code>editors.toml</code>: the fork commit it was built from must be the recorded <code>commit</code>, its upstream commit the recorded <code>base</code>, and the fingerprints in its manifest must match its <code>index.html</code>. <code>cargo xtask check</code> runs it too, for installed editors only, so a machine with no editors built still passes.</p>
+<p><strong>Restart the server after installing an editor.</strong> The server reads the installed editors once, when it starts. A folder whose manifest is missing or wrong is skipped with one warning line, and the server still starts.</p>
+<p class="small">Built editors contain the builder's local folder paths, and must be rebuilt with path remapping before they are published; see <a href="editors.html#found">editors.html</a>.</p>
+</section>
+
+<section id="files"><h2>14 / Opening a file document</h2>
+<p>A document is either a text document, edited in <code>doc.html</code> as before, or a <strong>file document</strong>: a spreadsheet (<code>.xlsx</code>, GridCraft), a word document (<code>.docx</code>, WordCraft), a PDF (<code>.pdf</code>, PdfCraft) or a 3D design (<code>.solidcraft.json</code>, SolidCraft). ShareCraft stores a file document's bytes as they are and never looks inside them.</p>
+<ul>
+<li><strong>New.</strong> The documents page's <strong>Kind</strong> menu offers Text document, Spreadsheet (.xlsx), Document (.docx) and Design (.solidcraft.json). The extension is added to the name if it is not there. A file document's name must end with its editor's extension and have something before it. A new PDF cannot be made, because an empty PDF is not a file: upload one instead.</li>
+<li><strong>Upload a file.</strong> The documents page uploads a <code>.xlsx</code>, <code>.docx</code>, <code>.pdf</code> or <code>.solidcraft.json</code> file as a new document, owned by the person who uploads it. The editor is chosen by how the name ends. An empty file, or a name no editor opens, is refused with <strong>That file cannot be uploaded. Upload a .xlsx, .docx, .pdf or .solidcraft.json file that is not empty.</strong>; a file over the limit (section 05) with <strong>That file is too large to upload.</strong> Upload only makes new documents; it cannot replace an existing one.</li>
+</ul>
+<p>A file document opens at <code>/file.html?doc=&lt;document id&gt;</code>, the <strong>frame page</strong>. It has a bar with the way back to the documents, the name, a status, <strong>Save</strong>, <strong>Download</strong> and, for owners, <strong>Share</strong> (the same Sharing panel as a text document); a banner line under it; and the editor, filling the rest of the page in an <code>&lt;iframe&gt;</code>.</p>
+<p>Opening goes in this order. The page reads the document. If its editor is not installed, it says <strong>The … editor is not installed on this server.</strong> and offers only Download. Otherwise it joins the document's file session (section 15), downloads the current revision, loads the editor, and hands the editor the file once the editor says it is ready. A document with no revision yet opens the editor empty. An editor that reports a problem, or is not ready within 60 seconds, gets a banner saying so.</p>
+<div class="table-wrap"><table><caption>The status in the frame bar</caption>
+<thead><tr><th>Status</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td><strong>Opening…</strong></td><td>The page is joining the session and loading the editor.</td></tr>
+<tr><td><strong>Saved</strong></td><td>What the editor shows is what is stored.</td></tr>
+<tr><td><strong>Unsaved changes</strong></td><td>The editor says there are changes not yet saved.</td></tr>
+<tr><td><strong>Saving…</strong></td><td>A save is being uploaded and stored.</td></tr>
+<tr><td><strong>Not saved</strong></td><td>The last save was refused; the banner says why.</td></tr>
+<tr><td><strong>View only</strong></td><td>This page does not hold the editing seat; nothing it does is stored.</td></tr>
+<tr><td><strong>Connection lost. Saving is paused.</strong></td><td>The connection to the server dropped. The editor stays, and a save made now is held and sent when the connection is back.</td></tr>
+</tbody></table></div>
+<p><strong>Save.</strong> The Save button in the bar asks the editor to save; the editor's own Save does the same. Only a save whose name ends with the document's extension is stored. Anything else the editor saves, such as a CSV or a PDF export, is a download for the person and leaves the stored file alone. The editors save only while their browser tab is shown: in a hidden tab, Save does nothing until the tab is shown again.</p>
+<p><strong>Download</strong> gives the stored file. Leaving the page warns while the editor has unsaved changes or a save has not been stored.</p>
+<div class="table-wrap"><table><caption>Banners on the frame page</caption>
+<thead><tr><th>Banner</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td><strong>View only. Changes you make here are not saved.</strong></td><td>The person's role is viewer. The editors have no read-only mode, so they can still type; nothing is stored, and Save is hidden.</td></tr>
+<tr><td><strong>&lt;name&gt; is editing this file. You can read it; changes you make here are not saved.</strong></td><td>Someone else holds the editing seat.</td></tr>
+<tr><td><strong>This file is free to edit. Reload to edit it.</strong></td><td>The person holding the seat left. Reloading takes the seat, with the latest saved file.</td></tr>
+<tr><td><strong>A newer version was saved. Reload to see it.</strong></td><td>Someone else saved; this page shows an older copy.</td></tr>
+<tr><td><strong>Someone else is editing this file now, so changes you make here are not saved. Download your copy, then reload.</strong></td><td>After a lost connection, the seat this page held had gone to someone else.</td></tr>
+<tr><td><strong>A newer version was saved while the connection was lost, so changes you make here are not saved. Download your copy, then reload.</strong></td><td>After a lost connection, the stored file had moved on.</td></tr>
+<tr><td>The removal messages of section 08</td><td>The editor is taken off the screen at once and nothing the page held is kept.</td></tr>
+</tbody></table></div>
+<p>If the person's role changes while the page is open, the page reloads, so that the seat is decided afresh.</p>
+</section>
+
+<section id="session"><h2>15 / The file session, the editing seat and saving</h2>
+<p>A <strong>file session</strong> is the server's record of who has a file document open. It uses the same WebSocket address (<code>/ws/docs/&lt;id&gt;</code>), the same sign-in and role checks and the same removal as a text document (section 08). Unlike a text document's session it holds no content: only who is there, the current revision, and who holds the editing seat. The file's bytes travel over HTTP (section 16).</p>
+<h3>Joining, in two steps</h3>
+<p>When a page asks to join, the server accepts the request but does not yet let the page in. It checks the person's access once more, and only then admits the page: it is sent the list of people, the current revision and the seat, and may take the seat. Someone whose access ended between the two steps is sent the removal message instead, and nobody else ever sees them come and go.</p>
+<h3>The editing seat</h3>
+<ul>
+<li>At most one page holds the seat. A page whose person may edit (editor or owner) takes it when it joins while the seat is free. Viewers never take it.</li>
+<li>The holder's page is given a <strong>seat token</strong>: 32 random bytes, sent only to that page, new each time the seat is given. A save must carry it.</li>
+<li>The seat is freed when its holder leaves, is removed, or loses the right to edit. It is <strong>not handed on</strong>: the others are told it is free, and a page takes it only by joining again, because its copy of the file may be old.</li>
+<li>One exception, chosen on purpose: a page whose connection dropped and that joins again while the seat is free takes it without reloading. If its copy is older than the stored file, its first save is refused as a conflict, and the page stops saving (below).</li>
+</ul>
+<h3>The save path</h3>
+<ol>
+<li>The editor hands the page the whole file. The page uploads it with <code>PUT /api/docs/&lt;id&gt;/content?base=&lt;revision&gt;</code>, carrying the seat token and the revision its copy was made from.</li>
+<li>The server checks the person's role before it reads the upload (no role is <code>404</code>; a viewer is <code>403</code>), then hands the bytes to the file session. Nothing else can write a file document's content.</li>
+<li>The session refuses the save unless it comes from the seat holder with the current token (<code>403</code>), and unless it was made from the current revision (<code>409</code>, naming the current one).</li>
+<li>It writes the bytes as one Git commit, credited to the seat holder alone, and tells everyone in the session it is saving and then that it is saved. A write that has started finishes even if the person goes away or is removed meanwhile.</li>
+<li>One save is written at a time, and one more may wait behind it. A further save arriving then is answered <code>503</code> with <code>{"error":"busy"}</code> and nothing is done. The page itself never sends more than one save plus one waiting.</li>
+</ol>
+<p>Saving the same bytes again answers the current revision with <code>"changed": false</code> and writes nothing.</p>
+<p><strong>After a <code>409</code> the page stops saving for that page load.</strong> With one seat, a conflict means the stored file moved past the page's copy, so trying again could never succeed, and guessing a newer base would overwrite someone's save. The banner reads <strong>This file was changed somewhere else, so your last save was not stored. Download your copy, then reload.</strong> with <strong>Download my copy</strong> and <strong>Reload</strong>. Later saves from the editor are kept in the page for Download my copy but not uploaded.</p>
+<div class="table-wrap"><table><caption>When a save is refused</caption>
+<thead><tr><th>Answer</th><th>Banner</th><th>Offered</th></tr></thead>
+<tbody>
+<tr><td><code>409</code></td><td><strong>This file was changed somewhere else, so your last save was not stored. Download your copy, then reload.</strong></td><td>Download my copy, Reload. Saving stops.</td></tr>
+<tr><td><code>403</code></td><td><strong>You cannot save this file now, so your last save was not stored.</strong></td><td>Download my copy</td></tr>
+<tr><td><code>413</code></td><td><strong>This file is too large to store, so your last save was not stored.</strong></td><td>Download my copy</td></tr>
+<tr><td><code>503</code> busy</td><td><strong>The server is still storing an earlier save, so your last save was not stored.</strong></td><td>Try again, Download my copy</td></tr>
+<tr><td><code>503</code></td><td><strong>The server could not store the file, so your last save was not stored.</strong></td><td>Try again, Download my copy</td></tr>
+<tr><td>No answer</td><td><strong>Could not reach the server, so your last save was not stored.</strong></td><td>Try again, Download my copy</td></tr>
+</tbody></table></div>
+<p>The editors count a file as saved the moment they hand it over, so after a refusal the page keeps the bytes until they are stored or downloaded. SolidCraft is the exception: it is told it is saved only after the server has stored the file.</p>
+<p>If the Git repository was changed by something other than the server, the next save finds a revision it did not expect. The session then refuses every later save and ends once everyone has left, as a text document does (section 12).</p>
+<p>A file session stays open for the grace period (60 seconds) after the last person leaves. There is nothing to save when it ends: every save was already written.</p>
+<h3>Events</h3>
+<p>A file session records <code>editing.joined</code>, <code>editing.left</code> and <code>editing.removed</code> as a text document does; <code>seat.taken</code> and <code>seat.freed</code>; <code>revision.saved</code> (the revision and the person credited), <code>revision.conflict</code> and <code>revision.save_failed</code>. An upload records <code>document.created</code> with <code>"uploaded": true</code> and the size in bytes; its first revision has no <code>revision.saved</code> event. Events never contain file content.</p>
+</section>
+
+<section id="content"><h2>16 / The content routes and their headers</h2>
+<div class="table-wrap"><table><caption>Content routes</caption>
+<thead><tr><th>Route</th><th>Who</th><th>Answers</th></tr></thead>
+<tbody>
+<tr><td><code>GET /api/docs/&lt;id&gt;/content</code>, optionally <code>?revision=&lt;id&gt;</code></td><td>Anyone with a role on the document</td><td><code>200</code> with the bytes of the current (or given) revision, and its id in <code>X-ShareCraft-Revision</code>. <code>204</code> if the document has no revision yet. <code>404</code> for no role, or a revision that is not one of this document's. Works for text documents too.</td></tr>
+<tr><td><code>PUT /api/docs/&lt;id&gt;/content?base=&lt;id&gt;</code>, header <code>X-ShareCraft-Seat</code>, the file as the body</td><td>The seat holder</td><td><code>200</code> <code>{"revision": …, "changed": true|false}</code>. <code>400</code> for a text document or a malformed base. <code>403</code> for a viewer, or without the seat and its token. <code>404</code> for no role. <code>409</code> <code>{"current": …}</code>. <code>413</code> over the limit. <code>503</code> busy or failed (section 15). Leave out <code>base</code> only when the document has no revision yet.</td></tr>
+<tr><td><code>POST /api/docs/upload?name=&lt;file name&gt;</code>, the file as the body</td><td>Any signed-in person</td><td><code>201</code> with the new document (<code>id</code>, <code>name</code>, <code>editor</code>, <code>role</code>). <code>400</code> for a missing name, a name no editor opens, a bad name or an empty file. <code>413</code> over the limit. <code>503</code> <code>{"error":"unavailable","document": …}</code> if the document was made but its bytes could not be stored; it stays, empty.</td></tr>
+</tbody></table></div>
+<p>All three need a signed-in person and a request from a page of this site, like every <code>/api</code> route; signed out, the answer is <code>401</code>. The size limit (<code>SHARECRAFT_MAX_FILE_BYTES</code>, 64 MiB by default) applies to these two upload routes only, and is enforced while the body is read, not after. Every other <code>/api</code> route keeps its 16 KiB limit.</p>
+<p><strong>A download can never run as a page.</strong> Whatever the file holds, even a web page with a script in it, the download is sent with these headers, so the browser saves it instead of showing it:</p>
+<div class="table-wrap"><table><caption>Headers on every download</caption>
+<thead><tr><th>Header</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td><code>Content-Type: application/octet-stream</code></td><td>Says "unknown bytes", which a browser does not display.</td></tr>
+<tr><td><code>Content-Disposition: attachment; filename="…"; filename*=UTF-8''…</code></td><td>Save as a file, under the document's name. The second form carries names with non-English characters; the first is a plain fallback.</td></tr>
+<tr><td><code>X-Content-Type-Options: nosniff</code></td><td>Stops the browser guessing the type from the content.</td></tr>
+<tr><td><code>Content-Security-Policy: sandbox</code></td><td>If it were displayed anyway, it could run nothing and reach nothing.</td></tr>
+<tr><td><code>Cache-Control: no-store</code></td><td>Not kept in the browser's cache, so it is gone once someone's access is removed.</td></tr>
+</tbody></table></div>
+</section>
+
+<section id="policy"><h2>17 / The editor pages' security policy, and why it is built from hashes</h2>
+<p>A <strong>Content Security Policy</strong> is a header that tells the browser what a page may load and run. The site's own pages allow only scripts from this site and WebAssembly, may hold a frame from this site (<code>frame-src 'self'</code>, for the frame page), and may not be put inside anyone's frame (<code>frame-ancestors 'none'</code>).</p>
+<p>The editors' files, under <code>/editors/&lt;id&gt;/</code>, get their own policy instead:</p>
+<pre><code>default-src 'self'; script-src 'self' 'wasm-unsafe-eval' &lt;script hashes&gt;; style-src 'self' &lt;style hashes&gt;;
+img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self';
+worker-src 'self' blob:; frame-src 'self' blob:; frame-ancestors 'self'</code></pre>
+<ul>
+<li><code>frame-ancestors 'self'</code> lets the editor be shown inside ShareCraft's frame page, and nowhere else.</li>
+<li><code>'wasm-unsafe-eval'</code> lets the browser compile the editor's WebAssembly. Despite the name, it does not allow scripts to run text as code.</li>
+<li><strong>The hashes.</strong> Each editor's <code>index.html</code>, as its build tool writes it, has a few small scripts and styles written inside the page. A policy that blocks scripts written into a page is what stops an injected script from running, and allowing all of them (<code>'unsafe-inline'</code>) would undo that. Instead the policy names each allowed piece by its fingerprint, a SHA-256 hash of its exact text. The browser runs a piece only if its text has exactly that hash. The hashes are computed when the editor is built and kept in its manifest; the server checks each is a well-formed hash before using it, and drops a manifest that has a bad one.</li>
+<li><strong>Line endings.</strong> Browsers turn Windows line endings (CR LF) into plain LF before they compute a hash. A Windows checkout of a fork has CR LF in its files, so the build tool does the same before hashing. Without this, GridCraft's first build had a hash the browser did not accept; the tool was fixed, and that editor rebuilt.</li>
+</ul>
+<p>The editors' files are served only to signed-in people, from a page of this site, with <code>Cache-Control: no-cache</code> (the browser asks whether a file changed before using its copy) and <code>X-Content-Type-Options: nosniff</code>. Anything else, including a path that tries to leave the editor's folder in any spelling, is <code>404</code>. Every file in an installed editor's folder is served this way, including <code>editor.json</code> and an empty <code>.trunk-lock</code> file.</p>
+<p>Because the editors come from ShareCraft's own address, they run with the rights of the person using them; that is why they are built only from ThineCraft's own forks (decision D20 in <a href="scope.html">scope.html</a>).</p>
+</section>
+
+<section id="limits"><h2>18 / Known limits of this build</h2>
 <ul>
 <li><strong>Local connections only.</strong> The server will not listen on a non-loopback address and refuses connections that do not come from a page it served (section 04). Two people on two computers cannot use it together. Passwords must not cross a network without encryption, and encryption (TLS) is a separate piece of work.</li>
 <li><strong>Accounts are made by an administrator.</strong> There is no sign-up, and <strong>nobody can change their own password yet</strong>, nor reset a forgotten one.</li>
@@ -276,18 +434,22 @@ git --git-dir=data/libraries/00000000-0000-0000-0000-000000000001.git show main:
 <li><strong>No page for events</strong> (section 11), and no way to see the document's saved revisions from the site: use Git (section 09).</li>
 <li><strong>One server process.</strong> Removal from live sessions is sent inside the process; running several server processes would need a different mechanism.</li>
 <li><strong>Large pastes go in pieces.</strong> One change can be at most 512 KiB as sent (section 05); a larger paste is refused with a message asking for smaller parts.</li>
-<li><strong>Plain text only.</strong> There is no formatting, and no spreadsheet, document, PDF or 3D editing yet.</li>
-<li><strong>The four editors are not connected yet.</strong> WordCraft, GridCraft, PdfCraft and SolidCraft do not open files from ShareCraft in this build.</li>
+<li><strong>One person edits a file at a time.</strong> GridCraft, WordCraft, PdfCraft and SolidCraft files open from ShareCraft and save back as Git revisions, but only the holder of the editing seat can save; others read under a banner. Editing a file together is Stage 2 work. Saving is on demand, never automatic.</li>
+<li><strong>The editors' own menus are unchanged.</strong> Their File menus still offer New, Open and Close; using them replaces the document inside the frame, and a later Save stores that other document as this one. A new, empty WordCraft document shows the editor's start screen. The editors save only while their tab is shown. See <a href="editors.html#found">editors.html</a>.</li>
+<li><strong>Editors are built on this machine</strong> (section 13), take tens of minutes each, and are not published. A build to be published must first be rebuilt with path remapping.</li>
+<li><strong>No compression.</strong> The editors' files are sent uncompressed: 26 MB to 160 MB the first time each editor opens.</li>
+<li><strong>Uploads only make new documents.</strong> A file cannot be replaced by uploading, renamed or deleted.</li>
 <li><strong>PostgreSQL needs its own backup</strong> (section 09), and the event log is never trimmed.</li>
 </ul>
 </section>
 
-<section id="licences"><h2>14 / Licences</h2>
+<section id="licences"><h2>19 / Licences</h2>
 <p>ShareCraft is licensed <strong>MIT OR Apache-2.0</strong>; the texts are in <code>LICENSE-MIT</code> and <code>LICENSE-APACHE</code>. <code>cargo xtask check</code> refuses any dependency whose licence has no non-copyleft option (GPL, LGPL, AGPL, MPL, EUPL, CDDL, SSPL).</p>
 <p>The <code>revisions</code> crate stores documents in Git using <code>gix</code> (gitoxide), a Git implementation written in Rust and licensed MIT or Apache 2.0. No C library is involved and no copyleft code is linked. Repositories it writes are ordinary Git repositories: the <code>git</code> command line reads them as usual.</p>
+<p>The four editors are licensed MIT or Apache 2.0, by their original authors. They are not part of ShareCraft's code and are not compiled into the server. The build tool copies each fork's licence, notice and attribution files into the installed editor's <code>licenses/</code> folder; what each fork changed is listed in its <code>NOTICE</code> and in <a href="editors.html">editors.html</a>.</p>
 </section>
 
-<footer>ShareCraft · ThineCraft · Building and running · Updated 10 November 2026<br>Describes the development build after the second Stage 1 plan (accounts and permissions), not a release.</footer>
+<footer>ShareCraft · ThineCraft · Building and running · Updated 10 November 2026<br>Describes the development build after the third Stage 1 plan (editors, one person at a time), on the <code>stage-1-editors</code> branch, not a release.</footer>
 </main></div>
 </body>
 </html>
