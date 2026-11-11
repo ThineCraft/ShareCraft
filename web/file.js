@@ -525,8 +525,7 @@ function onReady() {
   editorReady = true;
   clearTimeout(readyTimer);
   clearNotReady();
-  // A document that was never saved has no bytes: the editor starts empty (one that opens on
-  // a start screen is asked for a blank document).
+  // A document that was never saved has no bytes: the editor starts empty on its own.
   bridge.start(doc.name, initialBytes);
   initialBytes = null;
   updateStatus({ type: 'opened', canSave: editing() });

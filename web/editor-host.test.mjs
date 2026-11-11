@@ -416,99 +416,35 @@ function recordingEditor(answer) {
   };
 }
 
-test('a_new_empty_document_asks_for_a_blank_one', () => {
-  assert.equal(BRIDGES.wordcraft.blank, 'file.new');
-  assert.equal(BRIDGES.gridcraft.blank, undefined, 'GridCraft starts with an empty workbook');
-  assert.equal(BRIDGES.pdfcraft.blank, undefined, 'a PDF cannot be made empty');
+test('wordcraft has no blank or dismiss', async () => {
+  for (const id of Object.keys(BRIDGES)) {
+    assert.equal(BRIDGES[id].blank, undefined, `${id} has no blank command`);
+    assert.equal(BRIDGES[id].dismiss, undefined, `${id} has no dismiss key`);
+  }
 
-  // Never saved: no bytes, so the editor is asked for a blank document and nothing is opened.
+  // Never saved: the editor starts blank on its own, so nothing is sent and nothing is opened.
   const empty = recordingEditor(undefined);
   const fresh = craftFrame('wordcraft', empty.app);
-  connect(fresh.frame, BRIDGES.wordcraft, {}).start('Letter.docx', null);
-  assert.deepEqual(empty.executed, [{ command: 'file.new', params: {} }]);
+  let pressed = 0;
+  fresh.frame.contentWindow.document = {
+    querySelector: () => ({ dispatchEvent: () => void pressed++ }),
+  };
+  fresh.frame.contentWindow.KeyboardEvent = class {};
+  await connect(fresh.frame, BRIDGES.wordcraft, {}).start('Letter.docx', null);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.deepEqual(empty.executed, []);
   assert.deepEqual(fresh.posted, []);
+  assert.equal(pressed, 0);
 
-  // Saved before: the bytes are opened and no blank document is made.
+  // Saved before: the bytes are opened.
   const stored = recordingEditor(undefined);
   const saved = craftFrame('wordcraft', stored.app);
   const bytes = new Uint8Array([1, 2, 3]);
-  connect(saved.frame, BRIDGES.wordcraft, {}).start('Letter.docx', bytes);
+  await connect(saved.frame, BRIDGES.wordcraft, {}).start('Letter.docx', bytes);
   assert.deepEqual(stored.executed, []);
   assert.equal(saved.posted.length, 1);
   assert.equal(saved.posted[0].type, 'wordcraft:open');
   assert.equal(saved.posted[0].bytes, bytes);
-
-  // An editor without a blank command: neither.
-  const grid = recordingEditor(undefined);
-  const sheet = craftFrame('gridcraft', grid.app);
-  connect(sheet.frame, BRIDGES.gridcraft, {}).start('Book.xlsx', null);
-  assert.deepEqual(grid.executed, []);
-  assert.deepEqual(sheet.posted, []);
-});
-
-// A stand-in WordCraft window with a canvas that records the key events sent to it, and an
-// editor whose commands answer with a promise. `log` keeps the order of both.
-function wordcraftWindow({ canvas = true } = {}) {
-  const log = [];
-  class KeyboardEvent {
-    constructor(type, init) {
-      this.type = type;
-      Object.assign(this, init);
-    }
-  }
-  const element = {
-    dispatchEvent(event) {
-      log.push(`${event.type}:${event.key}:${event.keyCode}:${event.bubbles}`);
-      return true;
-    },
-  };
-  const app = {
-    execute(command) {
-      return new Promise((resolve) =>
-        setTimeout(() => {
-          log.push(`execute:${command}`);
-          resolve(true);
-        }, 5),
-      );
-    },
-  };
-  const { frame, posted } = craftFrame('wordcraft', app);
-  frame.contentWindow.KeyboardEvent = KeyboardEvent;
-  frame.contentWindow.document = { querySelector: (selector) => (selector === 'canvas' && canvas ? element : null) };
-  return { frame, posted, log };
-}
-
-test('the_start_screen_is_dismissed_after_the_blank_document', async () => {
-  assert.equal(BRIDGES.wordcraft.dismiss, 'Escape');
-  assert.equal(BRIDGES.gridcraft.dismiss, undefined);
-  const quick = { ...BRIDGES.wordcraft, dismissAfter: 5 };
-
-  // Blank first, then Escape pressed and released on the editor's canvas.
-  const blank = wordcraftWindow();
-  await connect(blank.frame, quick, {}).start('Letter.docx', null);
-  assert.deepEqual(blank.log, ['execute:file.new', 'keydown:Escape:27:true', 'keyup:Escape:27:true']);
-
-  // Bytes opened: no blank document, so nothing is dismissed.
-  const opened = wordcraftWindow();
-  await connect(opened.frame, quick, {}).start('Letter.docx', new Uint8Array([1]));
-  await new Promise((resolve) => setTimeout(resolve, 20));
-  assert.deepEqual(opened.log, []);
-  assert.equal(opened.posted.length, 1);
-
-  // No canvas: nothing is sent and nothing is thrown.
-  const bare = wordcraftWindow({ canvas: false });
-  await connect(bare.frame, quick, {}).start('Letter.docx', null);
-  assert.deepEqual(bare.log, ['execute:file.new']);
-
-  // A document that cannot be read is no failure either.
-  const locked = wordcraftWindow();
-  Object.defineProperty(locked.frame.contentWindow, 'document', {
-    get() {
-      throw new Error('SecurityError');
-    },
-  });
-  await connect(locked.frame, quick, {}).start('Letter.docx', null);
-  assert.deepEqual(locked.log, ['execute:file.new']);
 });
 
 test('a_save_request_needs_the_editor_interface', () => {
