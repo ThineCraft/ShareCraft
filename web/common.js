@@ -6,11 +6,12 @@ const MESSAGES = {
   too_many_attempts: 'Too many attempts. Try again in a few minutes.',
   not_signed_in: 'You are not signed in.',
   no_such_user: 'No account has that email address.',
-  last_owner: 'A document must keep at least one owner.',
+  last_owner: 'There must be at least one owner. Make someone else an owner first.',
   last_admin: 'At least one administrator must stay enabled.',
   email_taken: 'An account with that email address already exists.',
   invalid_email: 'That is not a usable email address.',
-  invalid_name: 'That name is not allowed. Use 1 to 60 plain characters.',
+  invalid_name:
+    'That name is not allowed. Use 1 to 120 characters, without / \\ : * ? " < > | and not ending in a dot.',
   weak_password: 'That password is too short or too long.',
   not_found: 'That could not be found.',
   forbidden: 'That request was refused. Reload the page and try again.',
@@ -19,6 +20,15 @@ const MESSAGES = {
   unknown_editor: 'That kind of document cannot be made here.',
   upload_required: 'A PDF cannot be made empty. Upload a PDF file instead.',
   wrong_extension: 'That name does not end with the extension of this kind of document.',
+  name_taken: 'Something here already has that name. Choose a different name.',
+  not_empty: 'That folder still has items in it. Move or delete them first.',
+  into_itself: 'A folder cannot be moved into itself or into a folder inside it.',
+  wrong_place: 'That cannot go there. Choose a library or a folder.',
+  is_site: 'A site cannot be moved, deleted or made to inherit.',
+  invalid_request: 'That change is not allowed. A file keeps its extension when renamed.',
+  unavailable: 'The server is busy or its database is unavailable. Try again in a moment.',
+  bad_request: 'The server could not read that request. Reload the page and try again.',
+  not_json: 'The server could not read that request. Reload the page and try again.',
 };
 
 /** What a document page says when the document is missing or the person has no access. */
@@ -28,6 +38,7 @@ const REMOVED = Object.assign(Object.create(null), {
   access_revoked: 'Your access to this document was removed.',
   signed_out: 'You were signed out.',
   account_disabled: 'Your account was disabled.',
+  deleted: 'This document was deleted.',
 });
 
 /** What a document page says when the server removed it, for the server's reason. */
@@ -118,7 +129,7 @@ export function h(tag, attributes = {}, ...children) {
     if (value === false || value == null) continue;
     element.setAttribute(name, value === true ? '' : String(value));
   }
-  element.append(...children);
+  element.append(...children.filter((child) => child != null && child !== false));
   return element;
 }
 
@@ -127,105 +138,167 @@ export function showMessage(element, text) {
   element.textContent = text;
 }
 
-/**
- * The Sharing panel of document `docId`, used by every document page. The page holds the
- * elements `access`, `share-form`, `share-email`, `share-role` and `share-status`, and decides
- * where and when the panel shows. Returns:
- * - `setRole(role)`: loads the access list for an owner; returns whether the person is one.
- * - `stop()`: empties the panel for good (the page was removed); late answers are dropped.
- */
-export function sharing(docId) {
-  const $ = (id) => document.getElementById(id);
-  let stopped = false;
-  let accessCheck = 0; // the latest access-list request; older answers are dropped
 
-  async function showAccess() {
-    const check = ++accessCheck;
-    const result = await api('GET', `/docs/${seg(docId)}/access`);
-    if (check !== accessCheck || stopped) return;
-    if (!result.ok) {
-      shareMessage(messageFor(result.error), true);
-      return;
-    }
-    $('access').replaceChildren(
-      ...result.data.map(({ user, role }) => {
-        const select = h('select', { 'aria-label': `Role of ${user.name}` });
-        for (const value of ['viewer', 'editor', 'owner']) {
-          const option = h('option', { value }, value[0].toUpperCase() + value.slice(1));
-          option.selected = value === role;
-          select.append(option);
-        }
-        select.addEventListener('change', () => changeAccess(user.email, select.value));
-        const remove = h(
-          'button',
-          { type: 'button', class: 'plain', 'aria-label': `Remove ${user.name}` },
-          'Remove',
-        );
-        remove.addEventListener('click', () => removeAccess(user));
-        return h(
+/** The roles that may change things in a place. */
+export const canEdit = (role) => role === 'editor' || role === 'owner';
+
+/**
+ * The page that opens a node, by its kind. `editor` is a file's editor id; when it is not known
+ * (a breadcrumb does not carry it) the file page opens and sends text documents on.
+ */
+export function pageFor(kind, id, editor) {
+  switch (kind) {
+    case 'site':
+      return `/site.html?id=${seg(id)}`;
+    case 'library':
+    case 'folder':
+      return `/library.html?id=${seg(id)}`;
+    default:
+      return editor === 'text' ? `/doc.html#${seg(id)}` : `/file.html?doc=${seg(id)}`;
+  }
+}
+
+/**
+ * The steps of a breadcrumb for `path` (site first, as `GET /api/nodes/{id}` answers it):
+ * `{ id, name, href }`. `href` is null where the person has no role of their own (limited
+ * access: the name is shown, not linked) and, unless `linkLast`, on the last step: the page
+ * being shown.
+ */
+export function breadcrumbParts(path, { linkLast = true } = {}) {
+  return path.map((crumb, at) => ({
+    id: crumb.id,
+    name: crumb.name,
+    href:
+      crumb.role && (linkLast || at < path.length - 1)
+        ? pageFor(crumb.kind, crumb.id, crumb.editor)
+        : null,
+  }));
+}
+
+/** An ordered list of the steps of `path`: links where `breadcrumbParts` has an address. */
+export function breadcrumbs(path, options) {
+  const parts = breadcrumbParts(path, options);
+  return h(
+    'ol',
+    {},
+    ...parts.map((part, at) =>
+      h(
+        'li',
+        at === parts.length - 1 ? { 'aria-current': 'page' } : {},
+        part.href ? h('a', { href: part.href }, part.name) : h('span', {}, part.name),
+      ),
+    ),
+  );
+}
+
+/**
+ * Fills `target` (a `nav` element) with the breadcrumb of node `id` and returns what the page
+ * needs: `{ path, role, folder }`, `folder` being the step above (where closing goes), or null
+ * when there is none the person can open. Returns null, leaving `target` as it was, on failure.
+ */
+export async function showCrumbs(target, id, options) {
+  const result = await api('GET', `/nodes/${seg(id)}`);
+  if (!result.ok) return null;
+  const path = result.data.path;
+  target.replaceChildren(breadcrumbs(path, options));
+  const above = path.length > 1 ? path[path.length - 2] : null;
+  return { path, role: result.data.role, folder: above?.role ? above : null };
+}
+
+/** Roles a person can be given, lowest first. */
+export const ROLES = Object.freeze(['viewer', 'editor', 'owner']);
+
+/** `viewer` as `Viewer`. */
+export const roleName = (role) => (role ? role[0].toUpperCase() + role.slice(1) : '');
+
+/**
+ * What the move dialog offers inside one place: sites, libraries and folders except `movingId`
+ * itself, which is never offered, so nothing below it can be reached. Each has `canChoose`,
+ * true only for a library or folder where the person is an editor or owner.
+ */
+export function moveChoices(items, movingId) {
+  return items
+    .filter((item) => item.id !== movingId && ['site', 'library', 'folder'].includes(item.kind))
+    .map((item) => ({
+      id: item.id,
+      kind: item.kind,
+      name: item.name,
+      role: item.role ?? null,
+      canChoose: item.kind !== 'site' && canEdit(item.role),
+    }));
+}
+
+/**
+ * Whether "Move here" is offered at the end of `trail` (the steps from the site to where the
+ * dialog is): a library or folder the person can edit, which is not the item itself or below
+ * it, and not the place the item is in already (`currentParentId`).
+ */
+export function canMoveHere(trail, movingId, currentParentId) {
+  const here = trail[trail.length - 1];
+  if (!here || !['library', 'folder'].includes(here.kind) || !canEdit(here.role)) return false;
+  if (trail.some((step) => step.id === movingId)) return false;
+  return here.id !== currentParentId;
+}
+
+/** A time from the server as the person's local date and time. */
+export function formatTime(text) {
+  const date = new Date(text);
+  return Number.isNaN(date.getTime()) ? text : date.toLocaleString();
+}
+
+/** The id in the address's query (`?id=`), lowercased, or '' unless it is an id. */
+export function queryId(search, name = 'id') {
+  const id = (new URLSearchParams(search).get(name) ?? '').toLowerCase();
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(id) ? id : '';
+}
+
+/**
+ * Fills the account bar of a page: who is signed in, the People link for administrators and
+ * Sign out. The page holds `who`, `people-link` and `sign-out`; `error` receives failures.
+ */
+export function setupTopbar(me, error) {
+  const $ = (id) => document.getElementById(id);
+  $('who').textContent = `Signed in as ${me.name}`;
+  $('people-link').hidden = !me.is_admin;
+  $('sign-out').addEventListener('click', async () => {
+    const result = await api('DELETE', '/session');
+    if (result.ok) location.assign('/signin.html');
+    else showMessage(error, messageFor(result.error));
+  });
+}
+
+/**
+ * The site navigation: the libraries of site `siteId` as links in `target` (a `nav` element),
+ * the one with id `currentId` marked as the current page.
+ */
+export async function showSiteNav(target, siteId, currentId) {
+  const result = await api('GET', `/nodes/${seg(siteId)}/children?limit=500`);
+  if (!result.ok) return;
+  const libraries = result.data.items.filter((item) => item.kind === 'library');
+  target.replaceChildren(
+    h(
+      'ul',
+      {},
+      ...libraries.map((library) =>
+        h(
           'li',
           {},
-          h('span', { class: 'grow' }, user.name, h('br'), h('small', {}, user.email)),
-          select,
-          remove,
-        );
-      }),
-    );
+          h(
+            'a',
+            { href: pageFor('library', library.id), 'aria-current': library.id === currentId ? 'page' : null },
+            library.name,
+          ),
+        ),
+      ),
+    ),
+  );
+  target.hidden = libraries.length === 0;
+}
+
+/** Puts `text` in `element`, followed by a link to `folder` (a crumb) when there is one. */
+export function showProblemWithFolder(element, text, folder) {
+  element.textContent = text;
+  if (folder) {
+    element.append(' ', h('a', { href: pageFor(folder.kind, folder.id) }, `Go to ${folder.name}`));
   }
-
-  async function changeAccess(email, role) {
-    shareMessage('', false);
-    const result = await api('PUT', `/docs/${seg(docId)}/access`, { email, role });
-    if (stopped) return;
-    if (!result.ok) shareMessage(messageFor(result.error), true);
-    else shareMessage('Saved.', false);
-    await showAccess();
-  }
-
-  async function removeAccess(user) {
-    shareMessage('', false);
-    const result = await api('DELETE', `/docs/${seg(docId)}/access/${seg(user.id)}`);
-    if (stopped) return;
-    if (!result.ok) shareMessage(messageFor(result.error), true);
-    else shareMessage(`${user.name} was removed.`, false);
-    await showAccess();
-  }
-
-  $('share-form').addEventListener('submit', async (event) => {
-    event.preventDefault();
-    const email = $('share-email').value.trim();
-    const result = await api('PUT', `/docs/${seg(docId)}/access`, {
-      email,
-      role: $('share-role').value,
-    });
-    if (stopped) return;
-    if (result.ok) {
-      $('share-email').value = '';
-      shareMessage('Shared.', false);
-    } else {
-      shareMessage(messageFor(result.error), true);
-    }
-    await showAccess();
-  });
-
-  function shareMessage(text, isError) {
-    const line = $('share-status');
-    line.classList.toggle('ok', !isError);
-    showMessage(line, text);
-  }
-
-  return {
-    setRole(role) {
-      const owner = role === 'owner' && !stopped;
-      if (owner) showAccess();
-      return owner;
-    },
-    stop() {
-      stopped = true;
-      accessCheck++;
-      $('access').replaceChildren();
-      $('share-email').value = '';
-      shareMessage('', false);
-    },
-  };
 }

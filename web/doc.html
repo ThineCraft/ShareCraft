@@ -9,10 +9,12 @@
 <body>
 <div class="frame" id="frame" data-state="connecting">
  <header class="bar">
-  <a class="mono" href="/" aria-label="ShareCraft documents">S</a>
+  <a class="back" id="back" href="/" aria-label="Back to sites"><span class="mono" aria-hidden="true">S</span><span id="back-text">Sites</span></a>
   <div class="doc"><h1 id="title">Document</h1><span id="docline"></span></div>
   <span class="spacer"></span>
+  <a id="access-link" class="button plain" href="#" hidden>Access</a>
   <span class="status" role="status" aria-live="polite"><i aria-hidden="true"></i><span id="status">Loading…</span></span>
+  <nav id="crumbs" class="crumbs" aria-label="Breadcrumb"></nav>
  </header>
  <p id="problem" role="alert" class="problem"></p>
  <div class="body" id="editor" hidden>
@@ -26,26 +28,6 @@
    <ul id="people"></ul>
   </aside>
  </div>
- <section id="share-panel" class="share" aria-labelledby="share-heading" hidden>
-  <h2 id="share-heading">Sharing</h2>
-  <ul id="access" class="list"></ul>
-  <form id="share-form" class="row">
-   <div class="field">
-    <label for="share-email">Add someone by email</label>
-    <input type="email" id="share-email" autocomplete="off" required>
-   </div>
-   <div class="field">
-    <label for="share-role">Role</label>
-    <select id="share-role">
-     <option value="viewer">Viewer</option>
-     <option value="editor" selected>Editor</option>
-     <option value="owner">Owner</option>
-    </select>
-   </div>
-   <button type="submit">Share</button>
-  </form>
-  <p id="share-status" role="status" aria-live="polite" class="msg ok"></p>
- </section>
 </div>
 <script type="module" src="./doc.js"></script>
 </body>

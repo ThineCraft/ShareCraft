@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ShareCraft — Library</title>
+<link rel="stylesheet" href="./style.css">
+</head>
+<body>
+<div class="page">
+ <nav class="topbar" aria-label="Account">
+  <a href="/">Sites</a>
+  <span id="who" class="meta"></span>
+  <span class="spacer"></span>
+  <a id="people-link" class="button plain" href="/people.html" hidden>People</a>
+  <button type="button" id="sign-out" class="plain">Sign out</button>
+ </nav>
+ <nav id="sitenav" class="sitenav" aria-label="Libraries of this site" hidden></nav>
+ <nav id="crumbs" class="crumbs" aria-label="Breadcrumb"></nav>
+ <p id="status" role="status" aria-live="polite" class="meta"></p>
+ <h1 id="title">Library</h1>
+ <p id="kind" class="kind"></p>
+ <div id="top-tools" class="toolbar" hidden>
+  <a id="access-link" class="button plain" href="#">Access</a>
+ </div>
+ <p id="error" role="alert" class="msg"></p>
+ <div id="edit-tools" hidden>
+  <form id="new-folder" class="row">
+   <div class="field">
+    <label for="folder-name">New folder</label>
+    <input type="text" id="folder-name" maxlength="120" autocomplete="off" required>
+   </div>
+   <button type="submit">New folder</button>
+  </form>
+  <form id="new-doc" class="row">
+   <div class="field">
+    <label for="doc-kind">New document</label>
+    <select id="doc-kind">
+     <option value="text" selected>Text document</option>
+     <option value="gridcraft">Spreadsheet (.xlsx)</option>
+     <option value="wordcraft">Document (.docx)</option>
+     <option value="solidcraft">Design (.solidcraft.json)</option>
+    </select>
+   </div>
+   <div class="field">
+    <label for="doc-name">Name (optional)</label>
+    <input type="text" id="doc-name" maxlength="120" autocomplete="off">
+   </div>
+   <button type="submit">New document</button>
+  </form>
+  <form id="upload-doc" class="row">
+   <div class="field">
+    <label for="upload-file">Upload a file (.xlsx, .docx, .pdf or .solidcraft.json)</label>
+    <input type="file" id="upload-file" accept=".xlsx,.docx,.pdf,.json" required>
+   </div>
+   <button type="submit">Upload</button>
+  </form>
+ </div>
+ <h2 id="items-heading">Contents</h2>
+ <ul id="items" class="list" aria-labelledby="items-heading"></ul>
+ <p id="empty" hidden>There is nothing here yet.</p>
+ <p><button type="button" id="more" class="plain" hidden>Show more</button></p>
+</div>
+
+<dialog id="rename-dialog" aria-labelledby="rename-title">
+ <form id="rename-form" method="dialog">
+  <h2 id="rename-title">Rename</h2>
+  <div class="field">
+   <label for="rename-name">New name</label>
+   <input type="text" id="rename-name" maxlength="120" autocomplete="off" required aria-describedby="rename-hint">
+  </div>
+  <p id="rename-hint" class="meta"></p>
+  <p id="rename-error" role="alert" class="msg"></p>
+  <div class="row end">
+   <button type="button" id="rename-cancel" class="plain">Cancel</button>
+   <button type="submit">Rename</button>
+  </div>
+ </form>
+</dialog>
+
+<dialog id="delete-dialog" aria-labelledby="delete-title">
+ <form id="delete-form" method="dialog">
+  <h2 id="delete-title">Delete</h2>
+  <p id="delete-text"></p>
+  <p id="delete-error" role="alert" class="msg"></p>
+  <div class="row end">
+   <button type="button" id="delete-cancel" class="plain">Cancel</button>
+   <button type="submit">Delete</button>
+  </div>
+ </form>
+</dialog>
+
+<dialog id="move-dialog" aria-labelledby="move-title">
+ <h2 id="move-title">Move</h2>
+ <nav id="move-crumbs" class="crumbs" aria-label="Where you are looking"></nav>
+ <p id="move-error" role="alert" class="msg"></p>
+ <ul id="move-list" class="list"></ul>
+ <p id="move-empty" hidden>There are no libraries or folders here.</p>
+ <div class="row end">
+  <button type="button" id="move-cancel" class="plain">Cancel</button>
+  <button type="button" id="move-here" disabled>Move here</button>
+ </div>
+</dialog>
+<script type="module" src="./library.js"></script>
+</body>
+</html>

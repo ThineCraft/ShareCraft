@@ -9,36 +9,17 @@
 <body class="full">
 <div class="frame full" id="frame" data-state="connecting">
  <header class="bar">
-  <a class="back" href="/" aria-label="Back to documents"><span class="mono" aria-hidden="true">S</span><span>Documents</span></a>
+  <a class="back" id="back" href="/" aria-label="Back to sites"><span class="mono" aria-hidden="true">S</span><span id="back-text">Sites</span></a>
   <div class="doc"><h1 id="title">Document</h1><span id="docline"></span></div>
   <span class="spacer"></span>
   <span class="status" role="status" aria-live="polite"><i aria-hidden="true"></i><span id="status">Loading…</span></span>
   <button type="button" id="save" hidden>Save</button>
   <a id="download" class="button plain" download hidden>Download</a>
-  <button type="button" id="share-toggle" class="plain" aria-expanded="false" aria-controls="share-panel" hidden>Share</button>
+  <a id="access-link" class="button plain" href="#" hidden>Access</a>
+  <nav id="crumbs" class="crumbs" aria-label="Breadcrumb"></nav>
  </header>
  <div id="banner" class="banner idle" role="status" aria-live="polite"><span id="banner-text"></span><span id="banner-actions" class="actions"></span></div>
  <p id="problem" role="alert" class="problem"></p>
- <section id="share-panel" class="share" aria-labelledby="share-heading" hidden>
-  <h2 id="share-heading">Sharing</h2>
-  <ul id="access" class="list"></ul>
-  <form id="share-form" class="row">
-   <div class="field">
-    <label for="share-email">Add someone by email</label>
-    <input type="email" id="share-email" autocomplete="off" required>
-   </div>
-   <div class="field">
-    <label for="share-role">Role</label>
-    <select id="share-role">
-     <option value="viewer">Viewer</option>
-     <option value="editor" selected>Editor</option>
-     <option value="owner">Owner</option>
-    </select>
-   </div>
-   <button type="submit">Share</button>
-  </form>
-  <p id="share-status" role="status" aria-live="polite" class="msg ok"></p>
- </section>
  <main id="editor-area" class="editor-area"></main>
 </div>
 <script type="module" src="./file.js"></script>

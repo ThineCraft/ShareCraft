@@ -6,11 +6,13 @@ import {
   MISSING_DOCUMENT as MISSING,
   api,
   messageFor,
+  pageFor,
   removedMessage,
   requireMe,
   seg,
-  sharing,
+  showCrumbs,
   showMessage,
+  showProblemWithFolder,
 } from './common.js';
 
 const FIRST_DELAY = 500;
@@ -23,7 +25,7 @@ const area = $('text');
 const statusLine = $('status');
 const peopleList = $('people');
 const readonlyNote = $('readonly-note');
-const sharePanel = $('share-panel');
+const accessLink = $('access-link');
 
 let client = null;
 let socket = null;
@@ -41,10 +43,8 @@ let refused = false;    // a change was refused and the socket is being renewed
 let pendingClose = null; // a socket that closed during a composition, handled when it ends
 let canEdit = false;   // the server says this person may change the text
 let removedReason = ''; // set once the server removed this page: no reconnecting
-// Declared here, before anything below runs: setRole() is called while the module is still
-// loading, and it reaches the Sharing panel.
 let roleCheck = 0;      // the latest role request; older answers are dropped
-let share = null;       // the Sharing panel, once the document id is known
+let folder = null;      // the step above the document in its breadcrumb, where closing goes
 let checking = false;   // a still-allowed check is in flight
 let closedBeforeJoin = 0; // closes in a row, before joining, while the document stayed open
 
@@ -57,7 +57,6 @@ if (!docId) {
   showProblem(MISSING);
   throw new Error('no document');
 }
-share = sharing(docId);
 const detail = await api('GET', `/docs/${seg(docId)}`);
 if (!detail.ok) {
   showProblem(detail.status === 404 ? MISSING : messageFor(detail.error));
@@ -69,6 +68,7 @@ if (detail.data.editor !== 'text') {
   await new Promise(() => {});
 }
 showDetail(detail.data);
+await showPlace();
 $('editor').hidden = false;
 setRole(detail.data.role);
 
@@ -90,9 +90,21 @@ function documentId() {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(id) ? id : '';
 }
 
+// The breadcrumb, and the link back to the folder the document is in.
+async function showPlace() {
+  const here = await showCrumbs($('crumbs'), docId, { linkLast: false });
+  if (!here) return;
+  folder = here.folder;
+  if (folder) {
+    $('back').href = pageFor(folder.kind, folder.id);
+    $('back').setAttribute('aria-label', `Back to ${folder.name}`);
+    $('back-text').textContent = folder.name;
+  }
+}
+
 function showProblem(text) {
   $('editor').hidden = true;
-  sharePanel.hidden = true;
+  accessLink.hidden = true;
   showMessage($('problem'), text);
   setStatus('failed', 'Not available');
 }
@@ -103,13 +115,14 @@ function showDetail(info) {
   document.title = `${info.name} — ShareCraft`;
 }
 
-// Owners get the Share panel; everyone else does not.
+// Owners get the Access link; everyone else does not.
 function setRole(role) {
-  sharePanel.hidden = !(removedReason === '' && share.setRole(role));
+  accessLink.hidden = !(removedReason === '' && role === 'owner');
+  accessLink.href = `/access.html?id=${seg(docId)}`;
 }
 
 // Asks the server what this person's role is now (their rights changed) and shows or hides
-// the Share panel to match.
+// the Access link to match.
 async function refreshRole() {
   const check = ++roleCheck;
   const result = await api('GET', `/docs/${seg(docId)}`);
@@ -118,7 +131,7 @@ async function refreshRole() {
     showDetail(result.data);
     setRole(result.data.role);
   } else {
-    sharePanel.hidden = true;
+    accessLink.hidden = true;
   }
 }
 
@@ -140,8 +153,7 @@ function stopRemoved(reason) {
   shown = '';
   applyEditable();
   peopleList.replaceChildren();
-  sharePanel.hidden = true;
-  share?.stop();
+  accessLink.hidden = true;
   roleCheck++;
   $('title').textContent = 'Document';
   $('docline').textContent = '';
@@ -150,6 +162,10 @@ function stopRemoved(reason) {
   socket = null;
   joined = false;
   old?.close();
+  if (reason === 'deleted') {
+    $('editor').hidden = true;
+    showProblemWithFolder($('problem'), removedMessage(reason), folder);
+  }
   render();
 }
 
@@ -268,7 +284,7 @@ function handleFrame(data) {
   if (update.can_edit != null) canEdit = update.can_edit;
   if (update.save) save = update.save;
   applyEditable();
-  // Their rights changed while the page was open: the Share panel may have to appear or go.
+  // Their rights changed while the page was open: the Access link may have to appear or go.
   if (update.can_edit != null && !firstJoin) refreshRole();
   if (update.people) showPeople(update.people);
   const n = update.dropped;

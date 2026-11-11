@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ShareCraft — Access</title>
+<link rel="stylesheet" href="./style.css">
+</head>
+<body>
+<div class="page">
+ <nav class="topbar" aria-label="Account">
+  <a href="/">Sites</a>
+  <span id="who" class="meta"></span>
+  <span class="spacer"></span>
+  <a id="people-link" class="button plain" href="/people.html" hidden>People</a>
+  <button type="button" id="sign-out" class="plain">Sign out</button>
+ </nav>
+ <nav id="crumbs" class="crumbs" aria-label="Breadcrumb"></nav>
+ <p id="status" role="status" aria-live="polite" class="meta"></p>
+ <h1 id="title">Access</h1>
+ <p id="error" role="alert" class="msg"></p>
+ <div id="content" hidden>
+  <section aria-labelledby="source-heading">
+   <h2 id="source-heading">Where access comes from</h2>
+   <p id="source"></p>
+   <p id="inherit-note" class="meta"></p>
+   <p><button type="button" id="inherit-toggle" class="plain"></button></p>
+  </section>
+  <section aria-labelledby="people-heading">
+   <h2 id="people-heading">People</h2>
+   <ul id="grants" class="list" aria-labelledby="people-heading"></ul>
+   <form id="share-form" class="row">
+    <div class="field">
+     <label for="share-email">Add someone by email</label>
+     <input type="email" id="share-email" autocomplete="off" required>
+    </div>
+    <div class="field">
+     <label for="share-role">Role</label>
+     <select id="share-role">
+      <option value="viewer">Viewer</option>
+      <option value="editor" selected>Editor</option>
+      <option value="owner">Owner</option>
+     </select>
+    </div>
+    <button type="submit">Add</button>
+   </form>
+   <p id="share-hint" class="meta" hidden>Adding or changing someone here stops this item inheriting first, so the people above stay as they are and this item keeps a list of its own.</p>
+  </section>
+ </div>
+</div>
+
+<dialog id="inherit-dialog" aria-labelledby="inherit-title">
+ <form id="inherit-form" method="dialog">
+  <h2 id="inherit-title">Inherit again?</h2>
+  <p id="inherit-text"></p>
+  <p id="inherit-error" role="alert" class="msg"></p>
+  <div class="row end">
+   <button type="button" id="inherit-cancel" class="plain">Cancel</button>
+   <button type="submit">Inherit again</button>
+  </div>
+ </form>
+</dialog>
+<script type="module" src="./access.js"></script>
+</body>
+</html>

@@ -21,10 +21,12 @@ import {
   goToSignIn,
   h,
   messageFor,
+  pageFor,
   removedMessage,
   requireMe,
   seg,
-  sharing,
+  showCrumbs,
+  showProblemWithFolder,
 } from './common.js';
 
 const FIRST_DELAY = 500;
@@ -45,8 +47,7 @@ const statusPill = frameBox.querySelector('.status');
 const statusText = $('status');
 const saveButton = $('save');
 const downloadLink = $('download');
-const shareToggle = $('share-toggle');
-const sharePanel = $('share-panel');
+const accessLink = $('access-link');
 const banner = $('banner');
 const bannerText = $('banner-text');
 const bannerActions = $('banner-actions');
@@ -57,8 +58,7 @@ const clientId = crypto.randomUUID(); // this page load's connection
 let me = null;
 let docId = '';
 let doc = null;             // { id, name, editor, role, revision } from the server
-let share = null;           // the Sharing panel
-let shareOpen = false;
+let folder = null;          // the step above the file in its breadcrumb, where closing goes
 let socket = null;
 let joined = false;         // the server answered the join on the current socket
 let everJoined = false;
@@ -105,12 +105,6 @@ saveButton.addEventListener('click', () => {
   if (!bridge?.requestSave()) notReady();
 });
 
-shareToggle.addEventListener('click', () => {
-  shareOpen = !shareOpen;
-  sharePanel.hidden = !shareOpen;
-  shareToggle.setAttribute('aria-expanded', String(shareOpen));
-});
-
 main().catch((err) => showProblem(err?.message || messageFor('unknown')));
 
 async function main() {
@@ -120,7 +114,6 @@ async function main() {
     showProblem(MISSING_DOCUMENT);
     return;
   }
-  share = sharing(docId);
   const detail = await api('GET', `/docs/${seg(docId)}`);
   if (!detail.ok) {
     showProblem(detail.status === 404 ? MISSING_DOCUMENT : messageFor(detail.error));
@@ -132,6 +125,7 @@ async function main() {
     return;
   }
   doc = detail.data;
+  await showPlace();
   knownRevision = doc.revision ?? null;
   showDetail();
   setRole(doc.role);
@@ -175,15 +169,22 @@ function showDetail() {
   document.title = `${doc.name} — ShareCraft`;
 }
 
-// Owners get Share; everyone else does not.
-function setRole(role) {
-  const owner = !removed && share.setRole(role);
-  shareToggle.hidden = !owner;
-  if (!owner) {
-    shareOpen = false;
-    sharePanel.hidden = true;
-    shareToggle.setAttribute('aria-expanded', 'false');
+// The breadcrumb, and closing the file goes back to the folder it is in.
+async function showPlace() {
+  const here = await showCrumbs($('crumbs'), docId, { linkLast: false });
+  if (!here) return;
+  folder = here.folder;
+  if (folder) {
+    $('back').href = pageFor(folder.kind, folder.id);
+    $('back').setAttribute('aria-label', `Back to ${folder.name}`);
+    $('back-text').textContent = folder.name;
   }
+}
+
+// Owners get the Access link; everyone else does not.
+function setRole(role) {
+  accessLink.hidden = removed || role !== 'owner';
+  accessLink.href = `/access.html?id=${seg(docId)}`;
 }
 
 function contentUrl(revision) {
@@ -197,10 +198,10 @@ function showDownload() {
   else downloadLink.removeAttribute('href');
 }
 
-function showProblem(text) {
+function showProblem(text, linkFolder = null) {
   statusPill.hidden = true;
   editorArea.replaceChildren();
-  $('problem').textContent = text;
+  showProblemWithFolder($('problem'), text, linkFolder);
 }
 
 // The server removed this page, or the document is gone: nothing of it stays on the screen or
@@ -225,7 +226,6 @@ function stopRemoved(reason) {
   bridge = null;
   frame?.remove();
   frame = null;
-  share?.stop();
   setRole('');
   saveButton.hidden = true;
   showDownload();
@@ -237,7 +237,10 @@ function stopRemoved(reason) {
   socket = null;
   joined = false;
   old?.close();
-  showProblem(reason === 'missing' ? MISSING_DOCUMENT : removedMessage(reason));
+  showProblem(
+    reason === 'missing' ? MISSING_DOCUMENT : removedMessage(reason),
+    reason === 'deleted' ? folder : null,
+  );
 }
 
 // ---- socket ----
@@ -390,7 +393,7 @@ function loseSeat(next) {
 const somethingToLose = () => editorDirty || queue.kept !== null || mine !== null;
 
 // This person's rights changed while connected. The page stays as it is: the role line and the
-// Share button follow the server's answer, and the seat follows the server's `seat` message (a
+// Access link follow the server's answer, and the seat follows the server's `seat` message (a
 // holder who may no longer edit is sent `seat: free` next, which stops saving).
 function onAccess(can) {
   canEdit = can;

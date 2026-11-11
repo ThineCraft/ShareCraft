@@ -68,7 +68,7 @@ select{padding:6px 8px;min-height:36px;background:var(--paper);border:1px solid 
 .problem{margin:0;padding:16px;background:var(--stop-bg);color:var(--stop-ink)}
 .note{margin:0 0 10px;padding:8px 12px;border-radius:7px;background:var(--warn-bg);color:var(--warn-ink);font-size:13px}
 .list{list-style:none;margin:0 0 12px;padding:0;border-top:1px solid var(--line)}
-.list li{display:flex;flex-wrap:wrap;align-items:center;gap:6px 12px;padding:10px 0;border-bottom:1px solid var(--line);overflow-wrap:anywhere}
+.list li{display:flex;flex-wrap:wrap;align-items:center;gap:6px 12px;padding:10px 8px;border-bottom:1px solid var(--line);overflow-wrap:anywhere}
 .list .grow{flex:1;min-width:160px}
 .list small,.meta{color:var(--muted);font-size:12px}
 .topbar{display:flex;flex-wrap:wrap;align-items:center;gap:8px 16px;padding:12px 0;border-bottom:1px solid var(--line)}
@@ -96,4 +96,36 @@ body.full{padding:0;height:100vh;height:100dvh;overflow:hidden}
  .back span:last-child{display:none}
  .frame.full .doc span{display:none}
  .back,.banner .button,.banner button{min-height:44px}
+}
+/* colour banding: every second row of a list is shaded, in light and in dark mode */
+:root{--band:color-mix(in srgb,var(--text) 6%,transparent)}
+.list li:nth-child(even){background:var(--band)}
+.list a{font-weight:600}
+.list .actions{display:flex;flex-wrap:wrap;gap:6px}
+.list button,.list .button{min-height:32px;padding:2px 10px}
+.mark{display:inline-block;padding:0 8px;border:1px solid var(--line);border-radius:20px;font-size:11px;color:var(--muted)}
+.crumbs ol{list-style:none;display:flex;flex-wrap:wrap;gap:2px 0;margin:0;padding:0;font-size:12px}
+.crumbs li+li::before{content:"›" / "";margin:0 6px;color:var(--muted)}
+.crumbs [aria-current]{font-weight:600}
+.crumbs span{color:var(--muted)}
+.crumbs [aria-current] span{color:var(--text)}
+.bar .crumbs{flex-basis:100%}
+.page .crumbs{margin:12px 0 0}
+.sitenav ul{list-style:none;display:flex;flex-wrap:wrap;gap:6px;margin:12px 0 0;padding:0}
+.sitenav a{display:block;padding:4px 12px;border:1px solid var(--line);border-radius:20px;text-decoration:none}
+.sitenav a[aria-current]{background:var(--soft);font-weight:600}
+.kind{font-size:12px;color:var(--muted);margin:0}
+.toolbar{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0}
+.toolbar form{display:contents}
+dialog{max-width:min(520px,calc(100vw - 32px));width:100%;border:1px solid var(--line);border-radius:12px;background:var(--paper);color:var(--text);padding:16px}
+dialog::backdrop{background:rgb(0 0 0/.45)}
+dialog h2{margin:0 0 8px;font-size:16px}
+dialog .list{max-height:40vh;overflow:auto}
+dialog .row.end{justify-content:flex-end;margin-top:12px}
+dialog .field{max-width:none}
+dialog input:is([type=text],[type=email]){width:100%}
+.stack-wide{display:flex;flex-direction:column;gap:12px}
+@media (max-width:760px){
+ .list button,.list .button,dialog button{min-height:44px}
+ .sitenav a{padding:10px 14px}
 }
