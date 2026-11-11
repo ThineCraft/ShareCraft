@@ -2,14 +2,12 @@
 
 use collab_core::ids::{DocId, UserId};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use sqlx::Row;
 use sqlx::postgres::PgRow;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::accounts::User;
-use crate::events::{NewEvent, record};
 use crate::tree::validate_node_name;
 use crate::{Db, DbError};
 
@@ -184,6 +182,10 @@ pub enum AccessError {
     /// wait until it is.
     #[error("the content tree is being repaired; try again shortly")]
     OutOfStep,
+    /// The database failed before a tree change was judged (see [`crate::NodeChange`]):
+    /// nothing was written, and the change was not found to be allowed.
+    #[error("the change could not be judged: {0}")]
+    Unjudged(DbError),
     #[error(transparent)]
     Db(#[from] DbError),
 }
@@ -233,8 +235,10 @@ pub(crate) fn document_from_row(row: &PgRow) -> Result<Document, sqlx::Error> {
 }
 
 impl Db {
-    /// Records a document. It has no access of its own: it takes its access from the node it
-    /// is placed at in the tree.
+    /// Records a document with no node, for tests only: the server makes documents through the
+    /// content tree, which records the node and the document together. It has no access of
+    /// its own: it takes its access from the node it is placed at in the tree, once placed.
+    #[cfg(feature = "test-support")]
     pub async fn create_document(
         &self,
         actor: UserId,
@@ -242,16 +246,9 @@ impl Db {
         name: &str,
         editor: Editor,
     ) -> Result<Document, AccessError> {
-        self.create(actor, id, name, editor).await
-    }
+        use crate::events::{NewEvent, record};
+        use serde_json::json;
 
-    async fn create(
-        &self,
-        actor: UserId,
-        id: DocId,
-        name: &str,
-        editor: Editor,
-    ) -> Result<Document, AccessError> {
         let name = validate_document_name(name, editor)?;
         let mut tx = self.pool().begin().await?;
         let disabled: Option<bool> =

@@ -131,6 +131,14 @@ impl fmt::Display for Adopted {
     }
 }
 
+/// The take-back of a refused change that could not be written to Git. It is written before
+/// the next reconcile, which would otherwise copy the refused change from Git into PostgreSQL.
+pub(crate) struct PendingUndo {
+    author: Author,
+    message: String,
+    records: Vec<TreeRecord>,
+}
+
 /// A change worked out and judged, ready to be committed and mirrored.
 struct Plan {
     /// The node the change is about.
@@ -450,12 +458,15 @@ pub async fn adopt_flat_documents(
     }))
 }
 
-/// Refuses tree changes while the tree is out of step, unless a reconcile of the whole tree
-/// now succeeds.
+/// Refuses tree changes while the tree is out of step, unless the take-backs that could not be
+/// written now are, and a reconcile of the whole tree then succeeds.
 async fn ensure_in_step(state: &AppState) -> Result<(), AccessError> {
     let flag = state.tree_out_of_step();
     if !flag.load(Ordering::SeqCst) {
         return Ok(());
+    }
+    if !write_pending_undos(state).await {
+        return Err(AccessError::OutOfStep);
     }
     match reconcile(Arc::clone(state.checkpointer()), state.db()).await {
         Ok(report) if report.failed.is_empty() => {
@@ -474,10 +485,13 @@ async fn ensure_in_step(state: &AppState) -> Result<(), AccessError> {
 }
 
 /// Writes `plan` to Git, then mirrors it into PostgreSQL. If PostgreSQL refuses it (the
-/// person's role changed meanwhile, or a name was taken outside this server's lock), the
-/// commit is taken back by a second one and the refusal answered. If the database fails, the
-/// nodes are reconciled from Git once (a new file is first taken back, as Git does not hold
-/// its editor); if that fails too, the tree is marked out of step.
+/// person's role changed meanwhile, or a name was taken outside this server's lock), or the
+/// database fails before the change was judged allowed (`Unjudged`), the commit is taken back
+/// by a second one and the error answered; nothing is repaired from Git. If the database fails
+/// after the change was judged allowed, the nodes are reconciled from Git once (a new file is
+/// first taken back, as Git does not hold its editor); if that fails too, the tree is marked
+/// out of step. A take-back that cannot be written also marks it out of step, and is kept to
+/// be written before the next reconcile (see [`ensure_in_step`]).
 async fn commit(state: &AppState, actor: &User, plan: Plan) -> Result<(), AccessError> {
     let store = state.checkpointer();
     let rows = plan
@@ -523,6 +537,13 @@ async fn commit(state: &AppState, actor: &User, plan: Plan) -> Result<(), Access
             Err(AccessError::Db(error))
         }
         Err(refused) => {
+            if let AccessError::Unjudged(error) = &refused {
+                eprintln!(
+                    "sharecraft-server: tree change to node {} could not be judged, so it is \
+                     taken back: {error}",
+                    plan.id.0
+                );
+            }
             if !take_back(state, actor, &plan.message, plan.undo).await {
                 state.tree_out_of_step().store(true, Ordering::SeqCst);
             }
@@ -532,22 +553,59 @@ async fn commit(state: &AppState, actor: &User, plan: Plan) -> Result<(), Access
 }
 
 /// Writes `undo` as a second commit, taking back the change `message` describes. Returns
-/// whether it was written.
+/// whether it was written; if not, it is kept to be written before the next reconcile.
 async fn take_back(state: &AppState, actor: &User, message: &str, undo: Vec<TreeRecord>) -> bool {
-    match write_tree(
-        state.checkpointer(),
-        author_of(actor),
-        format!("Undo: {message}"),
-        undo,
-    )
-    .await
-    {
+    let pending = PendingUndo {
+        author: author_of(actor),
+        message: format!("Undo: {message}"),
+        records: undo,
+    };
+    match write_undo(state, &pending).await {
         Ok(()) => true,
         Err(e) => {
             eprintln!("sharecraft-server: could not take back a tree change in Git: {e}");
+            pending_undos(state).push(pending);
             false
         }
     }
+}
+
+/// Writes the take-backs kept by [`take_back`], oldest first. Returns whether all were written;
+/// the first that fails and those after it stay kept.
+async fn write_pending_undos(state: &AppState) -> bool {
+    let kept = std::mem::take(&mut *pending_undos(state));
+    let mut kept = kept.into_iter();
+    while let Some(pending) = kept.next() {
+        if let Err(e) = write_undo(state, &pending).await {
+            eprintln!("sharecraft-server: still could not take back a tree change in Git: {e}");
+            let mut queue = pending_undos(state);
+            let later = std::mem::take(&mut *queue);
+            queue.push(pending);
+            queue.extend(kept);
+            queue.extend(later);
+            return false;
+        }
+    }
+    true
+}
+
+/// Writes one take-back as a commit.
+async fn write_undo(state: &AppState, pending: &PendingUndo) -> Result<(), CheckpointError> {
+    write_tree(
+        state.checkpointer(),
+        pending.author.clone(),
+        pending.message.clone(),
+        pending.records.clone(),
+    )
+    .await
+}
+
+/// The take-backs not yet written.
+fn pending_undos(state: &AppState) -> std::sync::MutexGuard<'_, Vec<PendingUndo>> {
+    state
+        .tree_undos()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Reconciles the nodes `ids` from Git once. Returns whether every one is now in step.
@@ -889,7 +947,7 @@ async fn plan_delete(state: &AppState, actor: &User, id: NodeId) -> Result<Plan,
     })
 }
 
-/// The undeleted records below `id` in `tree`, parents before children.
+/// Every record below `id` in `tree`, deleted ones included, parents before children.
 fn below(tree: &[TreeRecord], id: Uuid) -> Vec<&TreeRecord> {
     let mut children: HashMap<Uuid, Vec<&TreeRecord>> = HashMap::new();
     for record in tree {

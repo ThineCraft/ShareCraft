@@ -57,14 +57,19 @@ fn stored_authors(authors: &[(String, String)]) -> Json<Vec<StoredAuthor>> {
     )
 }
 
-/// Creates `doc`'s record if it has none, named `name`, with no creator and no grants, then
-/// locks it, so writers of one document's revisions take turns.
+/// Creates `doc`'s record if it has none, with no creator and no grants, then locks it, so
+/// writers of one document's revisions take turns. The record is named after the document's
+/// node if it has one, otherwise `name`.
 async fn lock_document(conn: &mut PgConnection, doc: DocId, name: &str) -> Result<(), sqlx::Error> {
-    sqlx::query("insert into documents (id, name) values ($1, $2) on conflict (id) do nothing")
-        .bind(doc.0)
-        .bind(name)
-        .execute(&mut *conn)
-        .await?;
+    sqlx::query(
+        "insert into documents (id, name) \
+         values ($1, coalesce((select name from nodes where id = $1 and kind = 'document'), $2)) \
+         on conflict (id) do nothing",
+    )
+    .bind(doc.0)
+    .bind(name)
+    .execute(&mut *conn)
+    .await?;
     sqlx::query("select id from documents where id = $1 for update")
         .bind(doc.0)
         .fetch_one(&mut *conn)
@@ -93,10 +98,14 @@ async fn insert(
     Ok(())
 }
 
-/// Makes the document's record describe `newest`, its latest revision.
+/// Makes the document's record describe `newest`, its latest revision. Its name is the name of
+/// the document's node if it has one (the tree is where a document is renamed, and a rename
+/// writes no revision), otherwise the name in `newest`.
 async fn set_current(conn: &mut PgConnection, newest: &RevisionRecord) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "update documents set revision = $2, revised_at = $3, name = $4, fields = $5 \
+        "update documents set revision = $2, revised_at = $3, \
+             name = coalesce((select name from nodes where id = $1 and kind = 'document'), $4), \
+             fields = $5 \
          where id = $1",
     )
     .bind(newest.doc.0)

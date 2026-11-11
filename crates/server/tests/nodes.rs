@@ -1292,3 +1292,36 @@ async fn rename_open_file_then_checkpoint_uses_new_name() {
     assert_eq!(stored.bytes, b"abcdef");
     assert!(a.removed.is_none());
 }
+
+#[tokio::test]
+async fn delete_repaired_after_a_database_failure_still_removes_everyone() {
+    let w = world().await;
+    let doc = w.doc(&w.root, &w.library, "Plan").await;
+    let mut root = TestClient::connect_as(&w.server, doc_id(&doc), &w.root).await;
+    // The database fails on the delete's own event, after Git recorded it; the repair from Git
+    // (whose event is marked as a repair) then deletes the node in PostgreSQL.
+    let pool = w.server.records_db();
+    sqlx::raw_sql(
+        "create function refuse_events() returns trigger language plpgsql as $$ \
+         begin if new.kind = 'node.deleted' and not (new.detail ? 'repaired') then \
+         raise exception 'database down'; end if; return new; end $$; \
+         create trigger refuse_events before insert on events \
+         for each row execute function refuse_events();",
+    )
+    .execute(pool.test_pool())
+    .await
+    .unwrap();
+
+    let (status, _) = w
+        .call(&w.root, Method::DELETE, &format!("/api/nodes/{doc}"), None)
+        .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        pool.node(doc_id(&doc).into())
+            .await
+            .unwrap()
+            .unwrap()
+            .deleted
+    );
+    assert_eq!(removed_promptly(&mut root).await, RemovedReason::Deleted);
+}

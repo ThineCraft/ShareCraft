@@ -196,7 +196,9 @@ impl From<AccessError> for ApiError {
             AccessError::NotEmpty => ApiError::NotEmpty,
             AccessError::IsSite => ApiError::IsSite,
             // The server picks a fresh random id, so a clash is not the caller's doing.
-            AccessError::Exists | AccessError::Db(_) => ApiError::unavailable(&e),
+            AccessError::Exists | AccessError::Db(_) | AccessError::Unjudged(_) => {
+                ApiError::unavailable(&e)
+            }
             // The tree is being repaired; a later attempt can succeed.
             AccessError::OutOfStep => ApiError::Unavailable,
         }

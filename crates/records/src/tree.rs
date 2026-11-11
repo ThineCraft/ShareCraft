@@ -241,18 +241,15 @@ impl Db {
     /// they are no longer an enabled administrator when that is needed), records the new
     /// document if any (`Exists` if its id is taken), applies each row as
     /// [`Db::apply_node`] does, gives the owner assignment if asked, and writes the events.
+    ///
+    /// A database failure before the change was judged allowed (the connection lost while
+    /// locking, or the tree changing on every attempt) is `Unjudged`: nothing was written, and
+    /// the change must be treated as refused. `Db` is a failure after it was judged allowed.
     pub async fn apply_nodes(&self, change: NodeChange<'_>) -> Result<(), AccessError> {
-        let mut judged = None;
-        for _ in 0..LOCK_ATTEMPTS {
-            let mut tx = self.pool().begin().await?;
-            if judge(&mut tx, &change).await? {
-                judged = Some(tx);
-                break;
-            }
-            tx.rollback().await?;
-        }
-        let mut tx = judged
-            .ok_or_else(|| DbError::new("the tree kept changing while a change was judged"))?;
+        let mut tx = self.judged(&change).await.map_err(|e| match e {
+            AccessError::Db(e) => AccessError::Unjudged(e),
+            other => other,
+        })?;
         if let (Some(editor), Some(first)) = (change.document, change.rows.first()) {
             let inserted = sqlx::query(
                 "insert into documents (id, name, editor, created_by) values ($1, $2, $3, $4)",
@@ -291,6 +288,21 @@ impl Db {
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    /// A transaction in which `change` has been judged allowed, with what it needs locked.
+    async fn judged(
+        &self,
+        change: &NodeChange<'_>,
+    ) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, AccessError> {
+        for _ in 0..LOCK_ATTEMPTS {
+            let mut tx = self.pool().begin().await?;
+            if judge(&mut tx, change).await? {
+                return Ok(tx);
+            }
+            tx.rollback().await?;
+        }
+        Err(DbError::new("the tree kept changing while a change was judged").into())
     }
 
     /// Every node as PostgreSQL holds it, deleted or not, for comparing with Git.

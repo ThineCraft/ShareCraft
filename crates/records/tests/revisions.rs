@@ -102,11 +102,12 @@ async fn append_requires_the_recorded_head() {
     assert_eq!(rows[1].committed_at, r2.committed_at);
     assert_eq!(rows[1].authors, r2.authors);
 
-    // The document record follows the newest revision; its creator and access stay.
+    // The document record follows the newest revision; its creator and access stay, and its
+    // name stays its node's.
     let document = test.db.document(doc).await.unwrap().unwrap();
     assert_eq!(document.revision.as_deref(), Some(r2.revision.as_str()));
     assert_eq!(document.revised_at, Some(r2.committed_at));
-    assert_eq!(document.name, "notes-2.txt");
+    assert_eq!(document.name, "Notes");
     assert_eq!(document.created_by, Some(ann.id));
     assert_eq!(test.db.role(ann.id, doc).await.unwrap(), Some(Role::Owner));
     let fields: serde_json::Value =
@@ -193,6 +194,41 @@ async fn replace_is_all_or_nothing() {
     let document = test.db.document(doc).await.unwrap().unwrap();
     assert_eq!(document.revision.as_deref(), Some(r3.revision.as_str()));
     assert_eq!(document.name, "notes-3.txt");
+}
+
+#[tokio::test]
+async fn recovered_document_takes_its_node_name_not_the_revision_name() {
+    // As after PostgreSQL was lost: the tree reconcile wrote the node (renamed after the last
+    // revision was written), and the documents rows are made again from Git's revisions.
+    let test = TestDb::create().await;
+    let site = site(&test, "Site", None).await;
+    let (replaced, appended) = (doc_id(), doc_id());
+    for (doc, name) in [(replaced, "Renamed.txt"), (appended, "Other.txt")] {
+        put(
+            &test,
+            doc.into(),
+            NodeKind::Document,
+            Some(site),
+            site,
+            name,
+        )
+        .await;
+    }
+    test.db
+        .replace_revisions(replaced, &[record(replaced, 1)])
+        .await
+        .unwrap();
+    assert!(
+        test.db
+            .append_revision(None, &record(appended, 2))
+            .await
+            .unwrap()
+    );
+    for (doc, name) in [(replaced, "Renamed.txt"), (appended, "Other.txt")] {
+        let document = test.db.document(doc).await.unwrap().unwrap();
+        assert_eq!(document.name, name);
+        assert!(document.revision.is_some());
+    }
 }
 
 #[tokio::test]

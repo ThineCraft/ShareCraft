@@ -69,6 +69,9 @@ struct Shared {
     /// Set when PostgreSQL's tree could not be brought back in step with Git after a change;
     /// tree changes are refused until a reconcile of the whole tree succeeds.
     tree_out_of_step: AtomicBool,
+    /// Take-backs of refused tree changes that could not be written to Git yet; written before
+    /// the reconcile that brings the tree back in step.
+    tree_undos: std::sync::Mutex<Vec<tree::PendingUndo>>,
 }
 
 impl AppState {
@@ -89,6 +92,7 @@ impl AppState {
                 next_conn: AtomicU64::new(1),
                 tree_lock: tokio::sync::Mutex::new(()),
                 tree_out_of_step: AtomicBool::new(false),
+                tree_undos: std::sync::Mutex::new(Vec::new()),
             }),
         }
     }
@@ -133,6 +137,10 @@ impl AppState {
 
     fn tree_out_of_step(&self) -> &AtomicBool {
         &self.shared.tree_out_of_step
+    }
+
+    fn tree_undos(&self) -> &std::sync::Mutex<Vec<tree::PendingUndo>> {
+        &self.shared.tree_undos
     }
 
     fn next_conn(&self) -> u64 {

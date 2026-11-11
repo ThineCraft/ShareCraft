@@ -337,7 +337,20 @@ pub(crate) async fn remove(
     let id = node_id(&id)?;
     let actor = signed.session.user;
     to_completion(async move {
-        let deleted = tree::apply(&state, &actor, TreeOp::Delete { id }).await?;
+        let deleted = match tree::apply(&state, &actor, TreeOp::Delete { id }).await {
+            Ok(node) => node,
+            Err(e) => {
+                // A delete that failed after Git recorded it may still have been repaired into
+                // PostgreSQL from Git: then the file is gone, and so must its room be.
+                if let Ok(Some(node)) = state.db().node(id).await
+                    && node.deleted
+                    && node.kind == NodeKind::Document
+                {
+                    state.rooms().send_to(DocId(id.0), AccessChange::Deleted);
+                }
+                return Err(e.into());
+            }
+        };
         if deleted.kind == NodeKind::Document {
             // Removal is final, so it needs no ordering with other access changes.
             state.rooms().send_to(DocId(id.0), AccessChange::Deleted);

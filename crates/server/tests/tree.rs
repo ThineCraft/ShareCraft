@@ -10,6 +10,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use collab_core::ids::{DocId, NodeId, UserId};
@@ -17,7 +18,7 @@ use records::test_support::TestDb;
 use records::{AccessError, Db, Document, Editor, NewUser, Node, NodeKind, Role, User};
 use revisions::{
     Author, Checkpoint, CheckpointError, GitError, Outcome, RevisionId, RevisionInfo,
-    RevisionStore, Stored,
+    RevisionStore, Stored, TreeChange, TreeRecord,
 };
 use serde_json::Map;
 use server::tree::{self, Adopted, TreeError, TreeOp};
@@ -36,10 +37,15 @@ struct Env {
 
 impl Env {
     async fn new() -> Env {
+        Env::with(|store| store).await
+    }
+
+    /// As [`Env::new`], with the server reaching the library through `wrap`.
+    async fn with(wrap: impl FnOnce(Arc<RevisionStore>) -> Arc<dyn Checkpointer>) -> Env {
         let dir = tempfile::tempdir().unwrap();
         let test = TestDb::create().await;
         let store = Arc::new(RevisionStore::open(&library(dir.path())).unwrap());
-        let checkpointer: Arc<dyn Checkpointer> = store.clone();
+        let checkpointer = wrap(store.clone());
         let state = AppState::new(config(dir.path(), &test), checkpointer, test.db.clone());
         Env {
             dir,
@@ -1389,6 +1395,224 @@ async fn refused_after_commit_is_taken_back_in_git() {
 
     assert_eq!(renaming.await.unwrap(), Err(AccessError::Forbidden));
     // A second commit put the previous record back.
+    assert_eq!(env.commits(), commits + 2);
+    assert_eq!(
+        env.store.read_tree_record(folder.0).unwrap().unwrap().name,
+        "Plans"
+    );
+    assert_eq!(env.db().node(folder).await.unwrap().unwrap().name, "Plans");
+    assert!(env.events("node.renamed").await.is_empty());
+    env.assert_agree().await;
+    // Nothing is out of step.
+    env.folder(&admin, library, "Next").await;
+}
+
+/// A library store whose take-backs (the "Undo: …" commits) fail while `failing` is above
+/// zero, one failure each time.
+struct FlakyUndo {
+    store: Arc<RevisionStore>,
+    failing: Arc<AtomicUsize>,
+}
+
+impl Checkpointer for FlakyUndo {
+    fn write(&self, c: &Checkpoint<'_>) -> Result<Outcome, CheckpointError> {
+        Checkpointer::write(&*self.store, c)
+    }
+
+    fn load(&self, doc: DocId) -> Result<Option<Stored>, CheckpointError> {
+        Checkpointer::load(&*self.store, doc)
+    }
+
+    fn load_at(
+        &self,
+        doc: DocId,
+        revision: &RevisionId,
+    ) -> Result<Option<Stored>, CheckpointError> {
+        Checkpointer::load_at(&*self.store, doc, revision)
+    }
+
+    fn describe(
+        &self,
+        doc: DocId,
+        revision: &RevisionId,
+    ) -> Result<Option<RevisionInfo>, CheckpointError> {
+        Checkpointer::describe(&*self.store, doc, revision)
+    }
+
+    fn history(&self, doc: DocId) -> Result<Vec<RevisionInfo>, CheckpointError> {
+        Checkpointer::history(&*self.store, doc)
+    }
+
+    fn documents(&self) -> Result<Vec<DocId>, GitError> {
+        Checkpointer::documents(&*self.store)
+    }
+
+    fn write_tree(&self, change: &TreeChange<'_>) -> Result<RevisionId, CheckpointError> {
+        let fail = change.message.starts_with("Undo: ")
+            && self
+                .failing
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok();
+        if fail {
+            return Err(CheckpointError::Git(GitError::new("disk full")));
+        }
+        Checkpointer::write_tree(&*self.store, change)
+    }
+
+    fn read_tree(&self) -> Result<Vec<TreeRecord>, CheckpointError> {
+        Checkpointer::read_tree(&*self.store)
+    }
+
+    fn read_tree_record(&self, id: Uuid) -> Result<Option<TreeRecord>, CheckpointError> {
+        Checkpointer::read_tree_record(&*self.store, id)
+    }
+}
+
+/// Makes PostgreSQL refuse the name `name` for any node as already taken, as a name taken
+/// outside the server's lock would be.
+async fn refuse_name(env: &Env, name: &str) {
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "create function refuse_name() returns trigger language plpgsql as $$ \
+         begin if new.name = '{name}' then \
+         raise exception using errcode = 'unique_violation', message = 'name taken'; end if; \
+         return new; end $$; \
+         create trigger refuse_name before insert or update on nodes \
+         for each row execute function refuse_name();"
+    )))
+    .execute(env.db().test_pool())
+    .await
+    .unwrap();
+}
+
+async fn accept_names(env: &Env) {
+    sqlx::raw_sql("drop trigger refuse_name on nodes; drop function refuse_name();")
+        .execute(env.db().test_pool())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn failed_take_back_is_written_before_the_tree_is_reconciled() {
+    let failing = Arc::new(AtomicUsize::new(0));
+    let flaky = Arc::clone(&failing);
+    let env = Env::with(move |store| {
+        Arc::new(FlakyUndo {
+            store,
+            failing: flaky,
+        })
+    })
+    .await;
+    let admin = env.user("Ada", true).await;
+    let (_, library) = env.site(&admin, "Team").await;
+    let folder = env.folder(&admin, library, "Plans").await;
+    refuse_name(&env, "Mine").await;
+    failing.store(2, Ordering::SeqCst);
+
+    let renamed = env
+        .apply(
+            &admin,
+            TreeOp::Rename {
+                id: folder,
+                name: "Mine".into(),
+            },
+        )
+        .await;
+    assert_eq!(renamed, Err(AccessError::NameTaken));
+    // The refused change is in Git, and could not be taken back yet.
+    assert_eq!(
+        env.store.read_tree_record(folder.0).unwrap().unwrap().name,
+        "Mine"
+    );
+    assert_eq!(env.db().node(folder).await.unwrap().unwrap().name, "Plans");
+
+    // From here PostgreSQL would accept the refused name, so a reconcile alone would copy it.
+    accept_names(&env).await;
+    // The take-back fails again: changes stay refused, and nothing is reconciled.
+    assert_eq!(
+        env.create(&admin, Some(library), NodeKind::Folder, "Other")
+            .await,
+        Err(AccessError::OutOfStep)
+    );
+    assert_eq!(env.db().node(folder).await.unwrap().unwrap().name, "Plans");
+
+    // Now the take-back is written first, then the tree reconciled: the refused change never
+    // reaches PostgreSQL.
+    env.folder(&admin, library, "Other").await;
+    assert_eq!(
+        env.store.read_tree_record(folder.0).unwrap().unwrap().name,
+        "Plans"
+    );
+    assert_eq!(env.db().node(folder).await.unwrap().unwrap().name, "Plans");
+    assert!(env.events("node.renamed").await.is_empty());
+    env.assert_agree().await;
+}
+
+#[tokio::test]
+async fn change_that_could_not_be_judged_is_taken_back_not_repaired() {
+    let env = Env::new().await;
+    let admin = env.user("Ada", true).await;
+    let xan = env.user("Xan", false).await;
+    let (_, library) = env.site(&admin, "Team").await;
+    let folder = env.folder(&admin, library, "Plans").await;
+    env.grant(&admin, folder, &xan, Role::Editor).await;
+    let commits = env.commits();
+
+    // Hold the folder's row, so the change is committed to Git and then waits to be judged.
+    let mut gate = sqlx::PgConnection::connect(&env.test.url()).await.unwrap();
+    let pid: i32 = sqlx::query_scalar("select pg_backend_pid()")
+        .fetch_one(&mut gate)
+        .await
+        .unwrap();
+    sqlx::query("begin").execute(&mut gate).await.unwrap();
+    sqlx::query("select id from nodes where id = $1 for update")
+        .bind(folder.0)
+        .execute(&mut gate)
+        .await
+        .unwrap();
+    let state = env.state.clone();
+    let actor = xan.clone();
+    let renaming = tokio::spawn(async move {
+        tree::apply(
+            &state,
+            &actor,
+            TreeOp::Rename {
+                id: folder,
+                name: "Mine".into(),
+            },
+        )
+        .await
+    });
+    let mut waiting: Option<i32> = None;
+    for _ in 0..400 {
+        waiting = sqlx::query_scalar(
+            "select pid from pg_stat_activity where $1 = any(pg_blocking_pids(pid))",
+        )
+        .bind(pid)
+        .fetch_optional(env.db().test_pool())
+        .await
+        .unwrap();
+        if waiting.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let waiting = waiting.expect("the rename never waited to be judged");
+    assert_eq!(env.commits(), commits + 1);
+    // The connection judging it is lost while it locks.
+    let ended: bool = sqlx::query_scalar("select pg_terminate_backend($1)")
+        .bind(waiting)
+        .fetch_one(env.db().test_pool())
+        .await
+        .unwrap();
+    assert!(ended);
+
+    let renamed = renaming.await.unwrap();
+    assert!(
+        matches!(renamed, Err(AccessError::Unjudged(_))),
+        "{renamed:?}"
+    );
+    sqlx::query("commit").execute(&mut gate).await.unwrap();
+    // Taken back in Git, and not repaired into PostgreSQL from Git.
     assert_eq!(env.commits(), commits + 2);
     assert_eq!(
         env.store.read_tree_record(folder.0).unwrap().unwrap().name,
