@@ -182,7 +182,11 @@ pub(crate) async fn list(
 
 /// `GET /editors/{id}/…`: the static files of an installed editor, for a signed-in caller.
 pub(crate) fn router(state: AppState) -> Router<AppState> {
-    let files = ServeDir::new(&state.config().editors_dir);
+    // `<file>.br` and `<file>.gz` copies, which `cargo xtask editors build` writes beside each
+    // file, go to browsers that accept them; the answer keeps the file's own type.
+    let files = ServeDir::new(&state.config().editors_dir)
+        .precompressed_br()
+        .precompressed_gzip();
     Router::new()
         .nest_service("/editors", files)
         .layer(middleware::from_fn_with_state(state, guard))

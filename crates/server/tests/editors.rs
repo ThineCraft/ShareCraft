@@ -21,7 +21,9 @@ use common::{
 };
 use reqwest::StatusCode;
 use reqwest::header::{
-    CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, HeaderMap, X_CONTENT_TYPE_OPTIONS,
+    ACCEPT_ENCODING, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE,
+    CONTENT_SECURITY_POLICY, CONTENT_TYPE, ETAG, HeaderMap, IF_MODIFIED_SINCE, IF_NONE_MATCH,
+    RANGE, VARY, X_CONTENT_TYPE_OPTIONS,
 };
 use sha2::{Digest, Sha256};
 
@@ -398,4 +400,198 @@ fn stub_fixture_hashes_match_its_page() {
     assert_eq!(hashes(&manifest, "script_hashes"), scripts);
     assert_eq!(hashes(&manifest, "style_hashes"), styles);
     assert!(page.lines().count() < 60);
+}
+
+/// The stand-in WebAssembly file and its two compressed copies. The server hands the copies
+/// over as they are, so they need not be real Brotli or gzip.
+const WASM: &[u8] = b"plain wasm bytes, plain wasm bytes, plain wasm bytes";
+const WASM_BR: &[u8] = b"brotli copy bytes";
+const WASM_GZ: &[u8] = b"gzip copy bytes, a little longer";
+
+/// A server with the stub editor as `gridcraft` plus `app.wasm`, with its compressed copies if
+/// `copies`.
+async fn server_with_wasm(copies: bool) -> TestServer {
+    spawn_server_config(|config| {
+        let folder = install_stub_editor(config, "gridcraft");
+        std::fs::write(folder.join("app.wasm"), WASM).unwrap();
+        if copies {
+            std::fs::write(folder.join("app.wasm.br"), WASM_BR).unwrap();
+            std::fs::write(folder.join("app.wasm.gz"), WASM_GZ).unwrap();
+        }
+    })
+    .await
+}
+
+/// `GET /editors/gridcraft/app.wasm`, sending `Accept-Encoding: encodings` if given.
+async fn get_wasm(
+    server: &TestServer,
+    user: &TestUser,
+    encodings: Option<&str>,
+) -> reqwest::Response {
+    let mut request = server
+        .http(Some(user))
+        .get(server.url("/editors/gridcraft/app.wasm"));
+    if let Some(encodings) = encodings {
+        request = request.header(ACCEPT_ENCODING, encodings);
+    }
+    request.send().await.unwrap()
+}
+
+/// The headers every editor answer carries, compressed or not.
+fn assert_editor_headers(headers: &HeaderMap) {
+    assert_eq!(policies(headers).len(), 1);
+    assert!(policies(headers)[0].contains("frame-ancestors 'self'"));
+    assert_eq!(headers[CACHE_CONTROL], "no-cache");
+    assert_eq!(headers[X_CONTENT_TYPE_OPTIONS], "nosniff");
+}
+
+#[tokio::test]
+async fn editor_files_are_served_brotli_when_accepted() {
+    let server = server_with_wasm(true).await;
+    let ann = server.user("Ann").await;
+    let response = get_wasm(&server, &ann, Some("br, gzip")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let headers = response.headers().clone();
+    assert_eq!(headers[CONTENT_ENCODING], "br");
+    assert_eq!(headers[CONTENT_TYPE], "application/wasm");
+    assert!(
+        headers.get_all(VARY).iter().any(|v| v
+            .to_str()
+            .unwrap()
+            .to_ascii_lowercase()
+            .contains("accept-encoding")),
+        "{headers:?}"
+    );
+    assert_editor_headers(&headers);
+    assert_eq!(response.bytes().await.unwrap().as_ref(), WASM_BR);
+}
+
+#[tokio::test]
+async fn editor_files_fall_back_to_gzip() {
+    let server = server_with_wasm(true).await;
+    let ann = server.user("Ann").await;
+    let response = get_wasm(&server, &ann, Some("gzip")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let headers = response.headers().clone();
+    assert_eq!(headers[CONTENT_ENCODING], "gzip");
+    assert_eq!(headers[CONTENT_TYPE], "application/wasm");
+    assert_editor_headers(&headers);
+    assert_eq!(response.bytes().await.unwrap().as_ref(), WASM_GZ);
+}
+
+#[tokio::test]
+async fn editor_files_are_plain_without_accept_encoding() {
+    let server = server_with_wasm(true).await;
+    let ann = server.user("Ann").await;
+    for encodings in [None, Some("identity")] {
+        let response = get_wasm(&server, &ann, encodings).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let headers = response.headers().clone();
+        assert!(headers.get(CONTENT_ENCODING).is_none(), "{encodings:?}");
+        assert_eq!(headers[CONTENT_TYPE], "application/wasm");
+        assert_editor_headers(&headers);
+        assert_eq!(response.bytes().await.unwrap().as_ref(), WASM);
+    }
+}
+
+#[tokio::test]
+async fn editor_without_copies_is_served_plain() {
+    let server = server_with_wasm(false).await;
+    let ann = server.user("Ann").await;
+    let response = get_wasm(&server, &ann, Some("br, gzip")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let headers = response.headers().clone();
+    assert!(headers.get(CONTENT_ENCODING).is_none());
+    assert_eq!(headers[CONTENT_TYPE], "application/wasm");
+    assert_editor_headers(&headers);
+    assert_eq!(response.bytes().await.unwrap().as_ref(), WASM);
+}
+
+/// A copy asked for by name is a file of the editor like any other: it stays behind the guard
+/// and cannot reach outside the editor's folder.
+#[tokio::test]
+async fn compressed_copies_asked_for_by_name_stay_inside_the_editor() {
+    let server = server_with_wasm(true).await;
+    let ann = server.user("Ann").await;
+    let named = server
+        .http(Some(&ann))
+        .get(server.url("/editors/gridcraft/app.wasm.br"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(named.status(), StatusCode::OK);
+    assert_editor_headers(named.headers());
+    assert_eq!(named.bytes().await.unwrap().as_ref(), WASM_BR);
+
+    let signed_out = server
+        .http(None)
+        .get(server.url("/editors/gridcraft/app.wasm.br"))
+        .header(ACCEPT_ENCODING, "br")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(signed_out.status(), StatusCode::NOT_FOUND);
+    for path in [
+        "/editors/gridcraft/../app.wasm.br",
+        "/editors/gridcraft/%2e%2e/app.wasm.br",
+        "/editors/gridcraft/..%2fapp.wasm.gz",
+    ] {
+        let (status, _) = raw_get(server.addr, path, &ann).await;
+        assert_eq!(status, 404, "{path}");
+    }
+}
+
+/// Range and revalidation answer for the copy actually sent.
+#[tokio::test]
+async fn compressed_answers_support_ranges_and_revalidation() {
+    let server = server_with_wasm(true).await;
+    let ann = server.user("Ann").await;
+
+    let first = get_wasm(&server, &ann, Some("br")).await;
+    let headers = first.headers().clone();
+    println!("first headers: {headers:?}");
+
+    let ranged = server
+        .http(Some(&ann))
+        .get(server.url("/editors/gridcraft/app.wasm"))
+        .header(ACCEPT_ENCODING, "br")
+        .header(RANGE, "bytes=0-4")
+        .send()
+        .await
+        .unwrap();
+    println!("range: {} {:?}", ranged.status(), ranged.headers());
+    assert_eq!(ranged.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(ranged.headers()[CONTENT_ENCODING], "br");
+    assert_eq!(ranged.headers()[CONTENT_LENGTH], "5");
+    let range = ranged.headers()[CONTENT_RANGE].to_str().unwrap().to_owned();
+    assert_eq!(range, format!("bytes 0-4/{}", WASM_BR.len()));
+    assert_eq!(ranged.bytes().await.unwrap().as_ref(), &WASM_BR[..5]);
+
+    if let Some(etag) = headers.get(ETAG) {
+        let answer = server
+            .http(Some(&ann))
+            .get(server.url("/editors/gridcraft/app.wasm"))
+            .header(ACCEPT_ENCODING, "br")
+            .header(IF_NONE_MATCH, etag)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(answer.status(), StatusCode::NOT_MODIFIED);
+    }
+    let modified = headers.get("last-modified").expect("Last-Modified");
+    let answer = server
+        .http(Some(&ann))
+        .get(server.url("/editors/gridcraft/app.wasm"))
+        .header(ACCEPT_ENCODING, "br")
+        .header(IF_MODIFIED_SINCE, modified)
+        .send()
+        .await
+        .unwrap();
+    println!(
+        "if-modified-since: {} {:?}",
+        answer.status(),
+        answer.headers()
+    );
+    assert_eq!(answer.status(), StatusCode::NOT_MODIFIED);
+    assert_editor_headers(answer.headers());
 }
