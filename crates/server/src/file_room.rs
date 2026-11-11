@@ -42,9 +42,9 @@ const TOKEN_BYTES: usize = 32;
 /// What a connection, or a save, asks of a file session. Not `Debug`: a save carries the seat
 /// token.
 pub(crate) enum FileCommand {
-    /// Ask to enter the session. An accepted join waits, sent nothing and seen by nobody,
-    /// until the connection has checked access once more and sends `Confirm`; then it replaces
-    /// any connection with the same client id. The connection has looked up who is joining
+    /// Ask to enter the session. An accepted join waits, seen by nobody and sent nothing unless
+    /// it is removed, until the connection has checked access once more and sends `Confirm`;
+    /// then it replaces any connection with the same client id. The connection has looked up who is joining
     /// and their role on the document.
     Join {
         conn: ConnId,
@@ -208,8 +208,8 @@ struct FileRoom {
     /// Who is connected, in joining order.
     members: Members<FileFrames>,
     /// Connections whose join was accepted but not yet confirmed (see
-    /// [`FileCommand::Confirm`]). They are sent nothing, are not listed, and cannot take the
-    /// seat; access changes still reach them.
+    /// [`FileCommand::Confirm`]). They are sent nothing but a `Removed` if an access change
+    /// removes them, are not listed, and cannot take the seat.
     pending: Vec<Member>,
     seat: Option<Seat>,
     /// Where the session reports the seat and saving (its members report who joined, left and
@@ -636,11 +636,14 @@ impl AccessRules for FileRoom {
         self.broadcast_people();
     }
 
-    /// A connection still waiting to be confirmed is dropped without a word: its connection
-    /// tells the page itself. It is reported as removed all the same.
+    /// A connection still waiting to be confirmed is queued `Removed` and dropped. It may have
+    /// passed its own access check already and be about to read its queue, which then holds
+    /// this one frame. One whose own check found the access gone parks the queue unread and
+    /// writes its own `Removed`, so the page is never told twice.
     fn remove(&mut self, which: &dyn Fn(&Member) -> bool, reason: RemovedReason) {
         let doc = self.doc;
         let events = &self.events;
+        let frame = FileFrames::removed(reason);
         self.pending.retain(|m| {
             if !which(m) {
                 return true;
@@ -652,6 +655,11 @@ impl AccessRules for FileRoom {
                 document: Some(doc),
                 detail: serde_json::json!({ "reason": reason }),
             });
+            // Nothing else is ever queued for a pending connection, so there is room; a closed
+            // queue means the connection is already gone.
+            if let Some(frame) = &frame {
+                let _ = m.tx.try_send(Outbound::One(frame.clone()));
+            }
             false
         });
         if self.members.remove(which, reason).any() {
@@ -1616,7 +1624,8 @@ mod tests {
     }
 
     /// A join is accepted but kept apart until confirmed: nobody hears of it, it gets nothing
-    /// and takes no seat. Removed before it is confirmed, it never was in the session.
+    /// and takes no seat. Removed before it is confirmed, it never was in the session; it is
+    /// only told why.
     #[tokio::test]
     async fn unconfirmed_join_is_not_seen_and_takes_no_seat() {
         let (events, mut recorded) = EventSink::channel();
@@ -1681,7 +1690,16 @@ mod tests {
             "{:?}",
             vic.seen
         );
-        // Bob's queue got nothing and was let go.
+        // Bob's queue got only why he was removed, and was let go.
+        let Ok(Outbound::One(frame)) = out.try_recv() else {
+            panic!("Bob's queue does not hold one frame");
+        };
+        assert_eq!(
+            serde_json::from_str::<FileServerMsg>(frame.as_str()).unwrap(),
+            FileServerMsg::Removed {
+                reason: RemovedReason::AccessRevoked
+            }
+        );
         assert!(matches!(
             out.try_recv(),
             Err(mpsc::error::TryRecvError::Disconnected)
@@ -1693,6 +1711,61 @@ mod tests {
             }
         }
         assert_eq!(kinds, vec!["editing.removed"]);
+    }
+
+    /// A join removed while it waits to be confirmed is sent exactly one frame, `Removed` with
+    /// the reason, whichever access change removed it: its connection may already have passed
+    /// its own check and be about to read the queue.
+    #[tokio::test]
+    async fn a_pending_join_removed_is_told_why_once() {
+        let f = fixture().await;
+        let link = f.open();
+        let session = SessionId(Uuid::new_v4());
+        let changes = [
+            (
+                AccessChange::SetAccess {
+                    user: f.bob,
+                    role: None,
+                },
+                RemovedReason::AccessRevoked,
+            ),
+            (
+                AccessChange::EndSession { session },
+                RemovedReason::SignedOut,
+            ),
+            (
+                AccessChange::RemoveUser { user: f.bob },
+                RemovedReason::AccountDisabled,
+            ),
+        ];
+        for (conn, (change, reason)) in (10..).zip(changes) {
+            let (tx, out) = mpsc::channel(OUTBOUND_CAPACITY);
+            let (accepted, reply) = oneshot::channel();
+            let client = ClientId(Uuid::new_v4());
+            link.commands
+                .send(FileCommand::Join {
+                    conn,
+                    client,
+                    user: f.bob,
+                    session,
+                    name: "Bob".into(),
+                    role: Role::Editor,
+                    tx,
+                    accepted,
+                })
+                .await
+                .unwrap();
+            assert_eq!(reply.await.unwrap(), JoinReply::Accepted);
+            f.rooms.send_to(f.doc, change);
+
+            let mut tab = Tab {
+                client,
+                out,
+                seen: Vec::new(),
+            };
+            let got = tab.rest().await;
+            assert_eq!(got, vec![FileServerMsg::Removed { reason }], "{reason:?}");
+        }
     }
 
     #[test]
