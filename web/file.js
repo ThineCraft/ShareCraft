@@ -33,9 +33,8 @@ const READY_TIMEOUT = 60_000;
 const COPY_TIMEOUT = 10_000; // how long a requested copy waits for the editor's save
 const SEAT_GONE =
   'Someone else is editing this file now, so changes you make here are not saved. Download your copy, then reload.';
-const EDIT_GONE =
-  'You can no longer edit this file, so changes you make here are not saved. Download your copy.';
 const NOT_READY = 'The editor is not ready yet.';
+const NOT_READY_FOR = 5000; // how long "not ready yet" stays at most, in milliseconds
 const MOVED_ON =
   'A newer version was saved while the connection was lost, so changes you make here are not saved. Download your copy, then reload.';
 const NEWER = 'A newer version was saved. Reload to see it.';
@@ -72,6 +71,7 @@ let seat = null;            // the seat as the server last described it, without
 let seatToken = null;       // proves the seat when saving; never written anywhere else
 let holder = false;         // this page holds the editing seat
 let savingStopped = '';     // why this page stopped saving for good ('' while it may save)
+let lostEdit = false;       // it stopped because it held the seat and lost the right to edit
 let knownRevision = null;   // the revision the editor's content is based on
 const ours = new Set();     // revisions this page stored
 let laterRevisions = [];    // revisions announced while an upload was under way, judged after it
@@ -89,6 +89,7 @@ const objectUrls = new Set(); // blob: URLs of downloads not yet revoked
 let notice = null;          // a banner that stays until what it is about is over
 let bannerKey = '';
 let roleCheck = 0;          // the latest role request; older answers are dropped
+let notReadyTimer = 0;
 const queue = new SaveQueue(upload, onQueue);
 
 addEventListener('beforeunload', (event) => {
@@ -328,12 +329,12 @@ function onJoined(message) {
   }
   if (savingStopped) {
     seat = withoutToken(message.seat);
+    render();
     return;
   }
   const wasHolder = holder;
   if (wasHolder && message.seat?.state !== 'yours') {
-    seat = withoutToken(message.seat);
-    stopSaving(seatGone());
+    loseSeat(message.seat);
     return;
   }
   takeSeat(message.seat);
@@ -354,20 +355,39 @@ function onJoined(message) {
 
 function onSeat(next) {
   if (savingStopped) {
+    // A page that lost the right to edit says who has the seat once it may edit again.
     seat = withoutToken(next);
+    render();
     return;
   }
   if (holder && next?.state !== 'yours') {
-    seat = withoutToken(next);
-    stopSaving(seatGone());
+    loseSeat(next);
     return;
   }
   takeSeat(next);
   render();
 }
 
-// Why this page lost the seat: the right to edit, or someone else editing.
-const seatGone = () => (canEdit ? SEAT_GONE : EDIT_GONE);
+// This page held the seat and no longer does: someone else took it, or the right to edit was
+// taken away. Either way it never saves again without a reload. A lost right is told by the
+// seat banner, which follows the right to edit if it comes back.
+function loseSeat(next) {
+  seat = withoutToken(next);
+  if (canEdit) {
+    stopSaving(SEAT_GONE);
+    return;
+  }
+  savingStopped = 'lost the right to edit';
+  lostEdit = true;
+  holder = false;
+  seatToken = null;
+  queue.stop();
+  render();
+}
+
+// Whether leaving the page now would lose work: unsaved changes in the editor, or a copy the
+// server has not stored.
+const somethingToLose = () => editorDirty || queue.kept !== null || mine !== null;
 
 // This person's rights changed while connected. The page stays as it is: the role line and the
 // Share button follow the server's answer, and the seat follows the server's `seat` message (a
@@ -424,8 +444,8 @@ function takeSeat(next) {
 
 const canSave = () => holder && !savingStopped && !removed;
 // Whether this page is the one editing, for the status: a page that stopped saving says
-// "Not saved", not "View only".
-const editing = () => (holder || savingStopped !== '') && !removed;
+// "Not saved", not "View only", unless it lost the right to edit with nothing to lose.
+const editing = () => (holder || (savingStopped !== '' && (!lostEdit || somethingToLose()))) && !removed;
 
 // The page will not upload again: it says why and offers the person's copy and a reload.
 function stopSaving(text) {
@@ -504,6 +524,7 @@ function onReady() {
   if (editorReady || removed) return;
   editorReady = true;
   clearTimeout(readyTimer);
+  clearNotReady();
   // A document that was never saved has no bytes: the editor starts empty (one that opens on
   // a start screen is asked for a blank document).
   bridge.start(doc.name, initialBytes);
@@ -516,6 +537,8 @@ function onDirty({ dirty }) {
   if (removed) return;
   editorDirty = dirty;
   updateStatus({ type: 'dirty', dirty });
+  // The editor is answering; and whether there is a copy to offer may have changed.
+  if (!clearNotReady()) render();
 }
 
 function editorFailed(text) {
@@ -638,8 +661,20 @@ function downloadMyCopy() {
 }
 
 // The editor could not be asked to save: its interface is not there yet.
+// It goes once the editor next reports in, a save starts, or after a few seconds, so that it
+// never stays over the banner about the seat.
 function notReady() {
   setNotice(noticeAfter(notice, { kind: 'not_ready', text: NOT_READY }));
+  clearTimeout(notReadyTimer);
+  notReadyTimer = setTimeout(clearNotReady, NOT_READY_FOR);
+}
+
+// Takes a "not ready yet" notice away; returns whether there was one.
+function clearNotReady() {
+  clearTimeout(notReadyTimer);
+  if (notice?.kind !== 'not_ready') return false;
+  setNotice(null);
+  return true;
 }
 
 function downloadBytes(bytes, name) {
@@ -671,17 +706,21 @@ function setNotice(next) {
 function render() {
   if (removed) return;
   saveButton.hidden = !(canSave() && editorReady);
+  // A page that lost the right to edit with something still to lose says "Not saved".
+  if (lostEdit && somethingToLose() && !status.failed) updateStatus({ type: 'not_stored' });
   if (editorReady) updateStatus({ type: 'seat', canSave: editing() });
-  // When nothing else needs saying: why this page does not save, with the person's copy if the
-  // editor saved one here.
+  // When nothing else needs saying: why this page does not save, with the person's copy when
+  // there is one to lose.
   const quiet = seatBanner({
     joined: everJoined,
     holder,
     stopped: savingStopped !== '',
+    lostEdit,
     canEdit,
     seat,
     me: typeof me?.id === 'string' ? me.id : '',
-    mine: mine !== null,
+    mine: mine !== null || queue.kept !== null,
+    unsaved: editorDirty,
   });
   setBanner(notice ?? quiet);
 }

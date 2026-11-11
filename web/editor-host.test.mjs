@@ -323,6 +323,41 @@ test('a_kept_copy_is_offered_on_every_banner', () => {
   assert.deepEqual(seatBanner(page({ mine: true })).actions, ['mycopy', 'reload']);
 });
 
+const LOST = 'You can no longer edit this file.';
+const LOST_WITH_COPY =
+  'You can no longer edit this file, so changes you make here are not saved. Download your copy, then reload.';
+
+test('a_demoted_holder_is_told_what_it_costs', () => {
+  const demoted = (over) => page({ stopped: true, lostEdit: true, canEdit: false, ...over });
+  // Nothing to lose: no copy is offered, only a reload.
+  assert.deepEqual(seatBanner(demoted()), { text: LOST, actions: ['reload'] });
+  // Unsaved changes in the editor, or a copy the page keeps: the copy comes first.
+  for (const over of [{ unsaved: true }, { mine: true }]) {
+    assert.deepEqual(seatBanner(demoted(over)), { text: LOST_WITH_COPY, actions: ['mycopy', 'reload'] });
+  }
+  // A page that stopped for another reason says so itself.
+  assert.equal(seatBanner(page({ stopped: true, canEdit: false })), null);
+  assert.equal(seatBanner(page({ stopped: true })), null);
+});
+
+test('a_holder_given_the_right_back_is_offered_the_seat', () => {
+  // Holding the seat: nothing to say. Demoted: told so.
+  assert.equal(seatBanner(page({ holder: true })), null);
+  const lost = { stopped: true, lostEdit: true };
+  assert.equal(seatBanner(page({ ...lost, canEdit: false })).text, LOST);
+  // Promoted again while the seat is free: a reload takes it.
+  assert.deepEqual(seatBanner(page({ ...lost, canEdit: true })), {
+    text: 'This file is free to edit. Reload to edit it.',
+    actions: ['reload'],
+  });
+  assert.deepEqual(seatBanner(page({ ...lost, canEdit: true, unsaved: true })).actions, ['mycopy', 'reload']);
+  // Promoted again while someone else took it: told who.
+  const bob = seatBanner(page({ ...lost, canEdit: true, seat: taken(OTHER) }));
+  assert.match(bob.text, /^Bob is editing this file\./);
+  assert.deepEqual(bob.actions, []);
+  assert.deepEqual(seatBanner(page({ ...lost, canEdit: true, seat: taken(OTHER), mine: true })).actions, ['mycopy']);
+});
+
 test('a_second_tab_of_the_holder_is_told_so', () => {
   const own = seatBanner(page({ seat: taken(ME, 'Ann') }));
   assert.equal(
@@ -409,6 +444,71 @@ test('a_new_empty_document_asks_for_a_blank_one', () => {
   connect(sheet.frame, BRIDGES.gridcraft, {}).start('Book.xlsx', null);
   assert.deepEqual(grid.executed, []);
   assert.deepEqual(sheet.posted, []);
+});
+
+// A stand-in WordCraft window with a canvas that records the key events sent to it, and an
+// editor whose commands answer with a promise. `log` keeps the order of both.
+function wordcraftWindow({ canvas = true } = {}) {
+  const log = [];
+  class KeyboardEvent {
+    constructor(type, init) {
+      this.type = type;
+      Object.assign(this, init);
+    }
+  }
+  const element = {
+    dispatchEvent(event) {
+      log.push(`${event.type}:${event.key}:${event.keyCode}:${event.bubbles}`);
+      return true;
+    },
+  };
+  const app = {
+    execute(command) {
+      return new Promise((resolve) =>
+        setTimeout(() => {
+          log.push(`execute:${command}`);
+          resolve(true);
+        }, 5),
+      );
+    },
+  };
+  const { frame, posted } = craftFrame('wordcraft', app);
+  frame.contentWindow.KeyboardEvent = KeyboardEvent;
+  frame.contentWindow.document = { querySelector: (selector) => (selector === 'canvas' && canvas ? element : null) };
+  return { frame, posted, log };
+}
+
+test('the_start_screen_is_dismissed_after_the_blank_document', async () => {
+  assert.equal(BRIDGES.wordcraft.dismiss, 'Escape');
+  assert.equal(BRIDGES.gridcraft.dismiss, undefined);
+  const quick = { ...BRIDGES.wordcraft, dismissAfter: 5 };
+
+  // Blank first, then Escape pressed and released on the editor's canvas.
+  const blank = wordcraftWindow();
+  await connect(blank.frame, quick, {}).start('Letter.docx', null);
+  assert.deepEqual(blank.log, ['execute:file.new', 'keydown:Escape:27:true', 'keyup:Escape:27:true']);
+
+  // Bytes opened: no blank document, so nothing is dismissed.
+  const opened = wordcraftWindow();
+  await connect(opened.frame, quick, {}).start('Letter.docx', new Uint8Array([1]));
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.deepEqual(opened.log, []);
+  assert.equal(opened.posted.length, 1);
+
+  // No canvas: nothing is sent and nothing is thrown.
+  const bare = wordcraftWindow({ canvas: false });
+  await connect(bare.frame, quick, {}).start('Letter.docx', null);
+  assert.deepEqual(bare.log, ['execute:file.new']);
+
+  // A document that cannot be read is no failure either.
+  const locked = wordcraftWindow();
+  Object.defineProperty(locked.frame.contentWindow, 'document', {
+    get() {
+      throw new Error('SecurityError');
+    },
+  });
+  await connect(locked.frame, quick, {}).start('Letter.docx', null);
+  assert.deepEqual(locked.log, ['execute:file.new']);
 });
 
 test('a_save_request_needs_the_editor_interface', () => {

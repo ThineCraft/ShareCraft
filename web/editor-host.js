@@ -14,7 +14,8 @@ export const EDITORS = Object.freeze({
 /**
  * How the page talks to each editor, by editor id. `blank` is the command that gives an editor
  * which opens on a start screen an empty document, for a document never saved (GridCraft
- * starts with an empty workbook; a PDF cannot be made empty).
+ * starts with an empty workbook; a PDF cannot be made empty). `dismiss` is the key that then
+ * takes the start screen away (a stopgap: see `blankDocument`).
  */
 export const BRIDGES = Object.freeze({
   gridcraft: Object.freeze({ kind: 'craft-web-host', prefix: 'gridcraft', query: 'host=parent', author: true }),
@@ -24,6 +25,7 @@ export const BRIDGES = Object.freeze({
     query: 'host=parent',
     author: true,
     blank: 'file.new',
+    dismiss: 'Escape',
   }),
   pdfcraft: Object.freeze({ kind: 'craft-web-host', prefix: 'pdfcraft', query: 'host=parent&control', author: true }),
   // SolidCraft takes no author. Times in milliseconds: how often to look for its interface and
@@ -332,21 +334,31 @@ export function saveFailure(result, canRetry) {
 const VIEW_ONLY = 'View only. Changes you make here are not saved.';
 const OWN_TAB =
   'This file is open for editing in another tab or window of yours. Changes you make here are not saved.';
+const LOST_EDIT = 'You can no longer edit this file.';
+const LOST_EDIT_COPY =
+  'You can no longer edit this file, so changes you make here are not saved. Download your copy, then reload.';
 
 /**
  * What the banner says when nothing else needs saying: why this page does not save, from what
  * the server said. `page`:
  * - `joined`: the server has answered a join; `holder`: this page holds the seat;
- *   `stopped`: this page stopped saving for good (it says so itself);
+ *   `stopped`: this page stopped saving for good; `lostEdit`: it stopped because it held the
+ *   seat and the right to edit was taken away (any other stop says why itself);
  * - `canEdit`: the server says this person may edit; `seat`: the seat as the server last
  *   described it (`{state: "taken", by: {name, user}}`, `{state: "free"}`, …);
- * - `me`: the signed-in person's account id; `mine`: the page keeps a copy the editor saved
- *   that the server does not have.
- * Returns null, or `{text, actions}` with actions among "mycopy" and "reload".
+ * - `me`: the signed-in person's account id; `mine`: the page keeps a copy the server does not
+ *   have; `unsaved`: the editor reports unsaved changes.
+ * Returns null, or `{text, actions}` with actions among "mycopy" and "reload". A page that
+ * stopped saving never saves again without a reload, even when the right to edit comes back:
+ * it is then offered the seat as any other page is.
  */
-export function seatBanner({ joined, holder, stopped, canEdit, seat, me, mine }) {
-  if (!joined || holder || stopped) return null;
-  const copy = mine ? ['mycopy'] : [];
+export function seatBanner({ joined, holder, stopped, lostEdit, canEdit, seat, me, mine, unsaved }) {
+  if (!joined || holder || (stopped && !lostEdit)) return null;
+  const keep = Boolean(mine || unsaved);
+  const copy = keep ? ['mycopy'] : [];
+  if (stopped && !canEdit) {
+    return keep ? { text: LOST_EDIT_COPY, actions: ['mycopy', 'reload'] } : { text: LOST_EDIT, actions: ['reload'] };
+  }
   if (!canEdit) return { text: VIEW_ONLY, actions: copy };
   if (seat?.state === 'taken') {
     if (typeof me === 'string' && me !== '' && seat.by?.user === me) return { text: OWN_TAB, actions: copy };
@@ -384,6 +396,7 @@ export function noticeAfter(current, next) {
  * - `open(name, bytes)`: hands the editor the stored file, after `ready`;
  * - `start(name, bytes)`: after `ready`, hands the editor the stored file, or with no bytes
  *   (a document never saved) gives an editor that has a `blank` command an empty document;
+ *   returns a promise that never rejects;
  * - `requestSave()`: asks the editor to save (its save arrives through `handlers.save`);
  *   returns whether it was asked: false while the editor's interface is not there;
  * - `stored(bytes)`: the server stored these bytes, which came through `handlers.save`;
@@ -402,7 +415,7 @@ const BRIDGE_KINDS = Object.freeze({
 
 function notAvailable(_frame, _bridge, handlers) {
   queueMicrotask(() => handlers.failed?.({ error: "This editor's bridge is not available yet." }));
-  return { open() {}, start() {}, requestSave: () => false, stored() {}, close() {} };
+  return { open() {}, async start() {}, requestSave: () => false, stored() {}, close() {} };
 }
 
 // The craft-web-host contract: messages `{type: "<prefix>:<kind>", …}` through postMessage,
@@ -417,34 +430,77 @@ function craftWebHost(frame, bridge, handlers) {
     if (message) handlers[message.kind]?.(message);
   };
   win.addEventListener('message', listener);
-  // Runs `command` through the editor's page interface; false if the interface is not there
-  // (or cannot be read yet) or the editor refused it.
-  const execute = (command) => {
+  let closed = false;
+  // Runs `command` through the editor's page interface. Returns `{asked, answer}`: `asked` is
+  // false if the interface is not there (or cannot be read yet) or the editor refused at once;
+  // `answer` is what `execute` returned (a promise, for these editors).
+  const run = (command) => {
     try {
       const app = frame.contentWindow?.[bridge.prefix];
-      if (typeof app?.execute !== 'function') return false;
-      return app.execute(command, {}) !== false;
+      if (typeof app?.execute !== 'function') return { asked: false };
+      const answer = app.execute(command, {});
+      return { asked: answer !== false, answer };
     } catch {
-      return false;
+      return { asked: false };
     }
   };
   const open = (name, bytes) => {
     // Posted as a copy: the page keeps its own bytes.
     frame.contentWindow?.postMessage({ type: `${bridge.prefix}:open`, name, bytes }, origin);
   };
+  // A blank document for a document never saved. Stopgap until the fork starts with a blank
+  // document when hosted: WordCraft's `file.new` makes one underneath its start screen, which
+  // no command dismisses, so once it is made the page presses the editor's `dismiss` key
+  // (Escape) on its canvas. Any failure is ignored: the person then sees the start screen.
+  async function blankDocument() {
+    const { asked, answer } = run(bridge.blank);
+    if (!asked || typeof bridge.dismiss !== 'string') return;
+    try {
+      await answer;
+    } catch {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, bridge.dismissAfter ?? DISMISS_AFTER));
+    if (!closed) pressKey(frame, bridge.dismiss);
+  }
   return {
     open,
-    start(name, bytes) {
+    // Returns a promise that settles once the editor was handed its document.
+    async start(name, bytes) {
       if (bytes) open(name, bytes);
-      else if (typeof bridge.blank === 'string') execute(bridge.blank);
+      else if (typeof bridge.blank === 'string') await blankDocument();
     },
-    requestSave: () => execute('file.save'),
+    requestSave: () => run('file.save').asked,
     // The editor counts a save done once it posts it; nothing to tell it.
     stored() {},
     close() {
+      closed = true;
       win.removeEventListener('message', listener);
     },
   };
+}
+
+// How long after its blank document an editor's start screen is dismissed, in milliseconds:
+// time for the editor to draw the new document first.
+const DISMISS_AFTER = 300;
+const KEY_CODES = Object.freeze({ Escape: 27 });
+
+// Presses and releases `key` on the editor's canvas, with the editor window's own event type.
+// Does nothing, and never throws, when the window, its canvas or its event type is not there.
+function pressKey(frame, key) {
+  try {
+    const view = frame.contentWindow;
+    const canvas = view?.document?.querySelector('canvas');
+    if (!canvas || typeof view.KeyboardEvent !== 'function') return;
+    const keyCode = KEY_CODES[key] ?? 0;
+    for (const type of ['keydown', 'keyup']) {
+      canvas.dispatchEvent(
+        new view.KeyboardEvent(type, { key, code: key, keyCode, which: keyCode, bubbles: true, cancelable: true }),
+      );
+    }
+  } catch {
+    // The start screen stays; nothing is lost.
+  }
 }
 
 const NOT_ANSWERING = 'The editor did not answer. Show this tab and try again.';
@@ -583,7 +639,7 @@ function solidcraftRequest(frame, bridge, handlers) {
   return {
     open,
     // A design never saved: the editor already shows an empty one.
-    start(name, bytes) {
+    async start(name, bytes) {
       if (bytes) open(name, bytes);
     },
     requestSave() {
