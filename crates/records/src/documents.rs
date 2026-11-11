@@ -10,10 +10,10 @@ use uuid::Uuid;
 
 use crate::accounts::{User, user_from_row};
 use crate::events::{NewEvent, record};
+use crate::tree::validate_node_name;
 use crate::{Db, DbError};
 
-const MAX_NAME_CHARS: usize = 120;
-const UNIQUE_VIOLATION: &str = "23505";
+pub(crate) const UNIQUE_VIOLATION: &str = "23505";
 
 /// What a person may do with a document. Ordered from least to most.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -170,6 +170,16 @@ pub enum AccessError {
     WrongExtension,
     #[error("a document with that id already exists")]
     Exists,
+    #[error("something with that name is already in that place")]
+    NameTaken,
+    #[error("that kind of item cannot go there")]
+    WrongPlace,
+    #[error("an item cannot be moved into itself")]
+    IntoItself,
+    #[error("that folder is not empty")]
+    NotEmpty,
+    #[error("a site cannot do that")]
+    IsSite,
     #[error(transparent)]
     Db(#[from] DbError),
 }
@@ -177,20 +187,6 @@ pub enum AccessError {
 impl From<sqlx::Error> for AccessError {
     fn from(e: sqlx::Error) -> Self {
         AccessError::Db(e.into())
-    }
-}
-
-fn validate_name(name: &str) -> Result<&str, AccessError> {
-    let name = name.trim();
-    let length = name.chars().count();
-    let well_formed = (1..=MAX_NAME_CHARS).contains(&length)
-        && !name
-            .chars()
-            .any(|c| c.is_control() || c == '/' || c == '\\');
-    if well_formed {
-        Ok(name)
-    } else {
-        Err(AccessError::InvalidName)
     }
 }
 
@@ -314,7 +310,7 @@ impl Db {
         editor: Editor,
         uploaded: Option<usize>,
     ) -> Result<Document, AccessError> {
-        let name = validate_name(name)?;
+        let name = validate_node_name(name)?;
         check_extension(name, editor)?;
         let mut tx = self.pool().begin().await?;
         let disabled: Option<bool> =
@@ -360,6 +356,7 @@ impl Db {
                 actor: Some(actor),
                 subject: None,
                 document: Some(id),
+                node: Some(id.into()),
                 detail: match uploaded {
                     Some(bytes) => json!({
                         "name": name,
@@ -535,6 +532,7 @@ impl Db {
                 actor: Some(actor),
                 subject: Some(user),
                 document: Some(doc),
+                node: Some(doc.into()),
                 detail,
             },
         )

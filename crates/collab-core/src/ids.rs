@@ -8,6 +8,18 @@ use uuid::Uuid;
 #[serde(transparent)]
 pub struct DocId(pub Uuid);
 
+/// Identifies one node of the content tree: a site, library, folder or file. A file's node
+/// identifier is its [`DocId`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct NodeId(pub Uuid);
+
+impl From<DocId> for NodeId {
+    fn from(doc: DocId) -> Self {
+        NodeId(doc.0)
+    }
+}
+
 /// Identifies one account.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]

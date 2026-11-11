@@ -346,6 +346,7 @@ impl Db {
                 actor,
                 subject: Some(id),
                 document: None,
+                node: None,
                 detail: json!({ "is_admin": new.is_admin }),
             },
         )
@@ -458,6 +459,7 @@ impl Db {
                 actor: Some(actor),
                 subject: Some(id),
                 document: None,
+                node: None,
                 detail: json!({ "sessions_ended": sessions_ended }),
             },
         )
@@ -511,6 +513,7 @@ impl Db {
                     actor: None,
                     subject: Some(user.id),
                     document: None,
+                    node: None,
                     detail: json!({ "reason": reason }),
                 },
             )
@@ -547,6 +550,7 @@ impl Db {
                 actor: Some(user.id),
                 subject: Some(user.id),
                 document: None,
+                node: None,
                 detail: json!({ "session": id }),
             },
         )
@@ -613,6 +617,7 @@ impl Db {
                     actor: Some(owner),
                     subject: Some(owner),
                     document: None,
+                    node: None,
                     detail: json!({ "session": id }),
                 },
             )

@@ -149,6 +149,7 @@ impl<F: Frames> Members<F> {
                 actor: Some(user),
                 subject: Some(user),
                 document: Some(self.doc),
+                node: Some(self.doc.into()),
                 detail: serde_json::json!({ "can_edit": can_edit }),
             });
         }
@@ -172,6 +173,7 @@ impl<F: Frames> Members<F> {
                 actor: Some(user),
                 subject: Some(user),
                 document: Some(self.doc),
+                node: Some(self.doc.into()),
                 detail: serde_json::json!({}),
             });
         }
@@ -225,6 +227,7 @@ impl<F: Frames> Members<F> {
                 actor: None,
                 subject: Some(m.user),
                 document: Some(doc),
+                node: Some(doc.into()),
                 detail: detail.clone(),
             });
             // A closed queue means the connection is already gone. A full one cannot take the
@@ -282,6 +285,7 @@ impl<F: Frames> Members<F> {
                     actor: Some(m.user),
                     subject: Some(m.user),
                     document: Some(doc),
+                    node: Some(doc.into()),
                     detail: serde_json::json!({}),
                 });
             }

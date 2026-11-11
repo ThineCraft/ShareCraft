@@ -118,6 +118,7 @@ fn index_failed(doc: DocId, error: &str) -> NewEvent {
         actor: None,
         subject: None,
         document: Some(doc),
+        node: Some(doc.into()),
         detail: serde_json::json!({ "error": error_text(error) }),
     }
 }

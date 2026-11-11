@@ -202,6 +202,7 @@ impl Room {
             actor: None,
             subject: None,
             document: Some(self.doc),
+            node: Some(self.doc.into()),
             detail,
         });
     }

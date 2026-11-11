@@ -1,6 +1,6 @@
 //! The event log: who did what, when. Events never hold document text, passwords or tokens.
 
-use collab_core::ids::{DocId, UserId};
+use collab_core::ids::{DocId, NodeId, UserId};
 use sqlx::postgres::PgRow;
 use sqlx::{PgConnection, Row};
 use time::OffsetDateTime;
@@ -33,6 +33,8 @@ pub struct NewEvent {
     /// The account acted on, if any.
     pub subject: Option<UserId>,
     pub document: Option<DocId>,
+    /// The tree node the event is about, if any; a document's node is its document id.
+    pub node: Option<NodeId>,
     /// Details of the event. Never document text, passwords or tokens.
     pub detail: serde_json::Value,
 }
@@ -44,13 +46,14 @@ pub(crate) async fn record(conn: &mut PgConnection, event: NewEvent) -> Result<(
 
 async fn insert(conn: &mut PgConnection, event: &NewEvent) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "insert into events (kind, actor, subject, document_id, detail) \
-         values ($1, $2, $3, $4, $5)",
+        "insert into events (kind, actor, subject, document_id, node_id, detail) \
+         values ($1, $2, $3, $4, $5, $6)",
     )
     .bind(event.kind)
     .bind(event.actor.map(|u| u.0))
     .bind(event.subject.map(|u| u.0))
     .bind(event.document.map(|d| d.0))
+    .bind(event.node.map(|n| n.0))
     .bind(&event.detail)
     .execute(conn)
     .await?;

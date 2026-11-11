@@ -457,6 +457,7 @@ async fn events_route_returns_at_most_200() {
                 actor: Some(ann.id),
                 subject: Some(ann.id),
                 document: Some(doc),
+                node: Some(doc.into()),
                 detail: json!({ "n": n }),
             })
             .await

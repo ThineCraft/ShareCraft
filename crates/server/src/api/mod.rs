@@ -161,6 +161,12 @@ impl From<AccessError> for ApiError {
             AccessError::InvalidName => ApiError::InvalidName,
             // `POST /api/docs` answers this itself, naming the extension expected.
             AccessError::WrongExtension => ApiError::InvalidRequest,
+            // Tree changes arrive with the tree routes; until then nothing produces these.
+            AccessError::NameTaken
+            | AccessError::WrongPlace
+            | AccessError::IntoItself
+            | AccessError::NotEmpty
+            | AccessError::IsSite => ApiError::InvalidRequest,
             // The server picks a fresh random id, so a clash is not the caller's doing.
             AccessError::Exists | AccessError::Db(_) => ApiError::unavailable(&e),
         }

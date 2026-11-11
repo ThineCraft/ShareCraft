@@ -251,6 +251,7 @@ impl FileRoom {
             actor,
             subject: Some(subject),
             document: Some(self.doc),
+            node: Some(self.doc.into()),
             detail,
         });
     }
@@ -262,6 +263,7 @@ impl FileRoom {
             actor: None,
             subject: None,
             document: Some(self.doc),
+            node: Some(self.doc.into()),
             detail,
         });
     }
@@ -653,6 +655,7 @@ impl AccessRules for FileRoom {
                 actor: None,
                 subject: Some(m.user),
                 document: Some(doc),
+                node: Some(doc.into()),
                 detail: serde_json::json!({ "reason": reason }),
             });
             // Nothing else is ever queued for a pending connection, so there is room; a closed
