@@ -68,6 +68,27 @@ async fn two_test_databases_do_not_see_each_other() {
     assert_eq!(count(&again).await, 1);
 }
 
+/// A migration is recognised by a checksum of its bytes, so a carriage return picked up from a
+/// checkout changes it and a database migrated from the LF copy refuses to start.
+#[test]
+fn migration_files_have_no_carriage_returns() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    let mut checked = 0;
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let path = entry.unwrap().path();
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(
+            !bytes.contains(&b'\r'),
+            "{} contains a carriage return: check that .gitattributes pins \
+             crates/records/migrations/*.sql to eol=lf, then check the file out again \
+             (git rm --cached and git checkout)",
+            path.display()
+        );
+        checked += 1;
+    }
+    assert!(checked > 0, "no migrations found in {}", dir.display());
+}
+
 #[tokio::test]
 async fn debug_output_hides_the_url() {
     let test = TestDb::create().await;
