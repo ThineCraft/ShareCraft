@@ -7,8 +7,10 @@ import {
   classifySave,
   editorUrl,
   nextStatus,
+  noticeAfter,
   parseHostMessage,
   saveFailure,
+  seatBanner,
   withExtension,
 } from './editor-host.js';
 
@@ -74,7 +76,7 @@ test('saves_carry_a_copy_of_the_bytes', () => {
   const fromView = parseHostMessage('gridcraft', { type: 'gridcraft:save', bytes: view, saveAs: true });
   assert.deepEqual([...fromView.bytes], [6, 7]);
   assert.equal(fromView.name, '', 'a missing name is empty');
-  assert.equal(fromView.saveAs, true);
+  assert.deepEqual(Object.keys(fromView).sort(), ['bytes', 'kind', 'name'], 'nothing unused is carried');
 });
 
 test('editor_url_encodes_the_author', () => {
@@ -273,6 +275,161 @@ test('failures_say_what_happened_and_what_can_be_done', () => {
   for (const failure of [409, 403, 413, 503, 0].map((status) => saveFailure({ status }, true))) {
     assert.match(failure.text, /not stored/);
   }
+});
+
+// ---- the banner and notices ----
+
+const ME = '6f1c1a52-6a43-4b8e-9d0e-3c3f6c1d2b10';
+const OTHER = '0b7d9a4e-1111-4c2a-8f00-5a5a5a5a5a5a';
+const page = (over = {}) => ({
+  joined: true,
+  holder: false,
+  stopped: false,
+  canEdit: true,
+  seat: { state: 'free' },
+  me: ME,
+  mine: false,
+  ...over,
+});
+const taken = (user, name = 'Bob') => ({ state: 'taken', by: { name, user } });
+
+test('the_banner_follows_the_seat_and_the_right_to_edit', () => {
+  // Nothing to say before the first join, for the holder, or once the page said it stopped.
+  for (const over of [{ joined: false }, { holder: true }, { stopped: true }]) {
+    assert.equal(seatBanner(page(over)), null, JSON.stringify(over));
+  }
+  assert.deepEqual(seatBanner(page({ canEdit: false })), {
+    text: 'View only. Changes you make here are not saved.',
+    actions: [],
+  });
+  // Given the right to edit while the seat is free: offered a reload to take it.
+  assert.deepEqual(seatBanner(page()), { text: 'This file is free to edit. Reload to edit it.', actions: ['reload'] });
+  // Given it while someone edits: told who.
+  const bob = seatBanner(page({ seat: taken(OTHER) }));
+  assert.match(bob.text, /^Bob is editing this file\./);
+  assert.deepEqual(bob.actions, []);
+  assert.match(seatBanner(page({ seat: taken(OTHER, '') })).text, /^Someone is editing/);
+  // The right to edit taken away: view only, whatever the seat.
+  assert.match(seatBanner(page({ canEdit: false, seat: taken(OTHER) })).text, /^View only/);
+  assert.match(seatBanner(page({ seat: { state: 'unknown' } })).text, /^View only/);
+});
+
+test('a_kept_copy_is_offered_on_every_banner', () => {
+  for (const over of [{ canEdit: false }, { seat: taken(OTHER) }, { seat: taken(ME) }, { seat: { state: 'free' } }]) {
+    const banner = seatBanner(page({ ...over, mine: true }));
+    assert.ok(banner.actions.includes('mycopy'), JSON.stringify(over));
+    assert.ok(!seatBanner(page(over)).actions.includes('mycopy'), JSON.stringify(over));
+  }
+  assert.deepEqual(seatBanner(page({ mine: true })).actions, ['mycopy', 'reload']);
+});
+
+test('a_second_tab_of_the_holder_is_told_so', () => {
+  const own = seatBanner(page({ seat: taken(ME, 'Ann') }));
+  assert.equal(
+    own.text,
+    'This file is open for editing in another tab or window of yours. Changes you make here are not saved.',
+  );
+  // Someone else with the same name is someone else.
+  assert.match(seatBanner(page({ seat: taken(OTHER, 'Ann') })).text, /^Ann is editing/);
+  // Without a known account id nobody is taken for the signed-in person.
+  assert.match(seatBanner(page({ me: '', seat: taken('', 'Ann') })).text, /^Ann is editing/);
+});
+
+test('not_answering_keeps_a_stop_or_save_failure', () => {
+  const late = { kind: 'not_answering', text: 'The editor did not answer. Show this tab and try again.' };
+  for (const current of [
+    { kind: 'stopped', text: 'Someone else is editing this file now.', actions: ['mycopy', 'reload'] },
+    { kind: 'save', text: 'Could not reach the server.', actions: ['retry', 'mycopy'] },
+  ]) {
+    const shown = noticeAfter(current, late);
+    assert.equal(shown.kind, current.kind);
+    assert.deepEqual(shown.actions, current.actions, 'its actions stay');
+    assert.equal(shown.text, `${current.text} ${late.text}`);
+    assert.equal(noticeAfter(shown, late), shown, 'said once');
+  }
+  // Nothing showing, or a notice without actions to keep: as before.
+  assert.equal(noticeAfter(null, late), late);
+  assert.equal(noticeAfter({ kind: 'newer', text: 'A newer version was saved.', actions: ['reload'] }, late), late);
+  assert.equal(noticeAfter({ kind: 'not_answering', text: late.text }, late), late);
+});
+
+// ---- the craft-web-host bridge, with a stand-in editor ----
+
+// A stand-in frame whose window may hold `<prefix>.execute`, recording what is posted to it.
+function craftFrame(prefix, app) {
+  const posted = [];
+  const contentWindow = { postMessage: (message) => posted.push(message) };
+  if (app) contentWindow[prefix] = app;
+  const defaultView = {
+    location: { origin: 'https://sharecraft.test' },
+    addEventListener() {},
+    removeEventListener() {},
+  };
+  return { frame: { contentWindow, ownerDocument: { defaultView } }, posted };
+}
+
+function recordingEditor(answer) {
+  const executed = [];
+  return {
+    executed,
+    app: {
+      execute(command, params) {
+        executed.push({ command, params });
+        return answer;
+      },
+    },
+  };
+}
+
+test('a_new_empty_document_asks_for_a_blank_one', () => {
+  assert.equal(BRIDGES.wordcraft.blank, 'file.new');
+  assert.equal(BRIDGES.gridcraft.blank, undefined, 'GridCraft starts with an empty workbook');
+  assert.equal(BRIDGES.pdfcraft.blank, undefined, 'a PDF cannot be made empty');
+
+  // Never saved: no bytes, so the editor is asked for a blank document and nothing is opened.
+  const empty = recordingEditor(undefined);
+  const fresh = craftFrame('wordcraft', empty.app);
+  connect(fresh.frame, BRIDGES.wordcraft, {}).start('Letter.docx', null);
+  assert.deepEqual(empty.executed, [{ command: 'file.new', params: {} }]);
+  assert.deepEqual(fresh.posted, []);
+
+  // Saved before: the bytes are opened and no blank document is made.
+  const stored = recordingEditor(undefined);
+  const saved = craftFrame('wordcraft', stored.app);
+  const bytes = new Uint8Array([1, 2, 3]);
+  connect(saved.frame, BRIDGES.wordcraft, {}).start('Letter.docx', bytes);
+  assert.deepEqual(stored.executed, []);
+  assert.equal(saved.posted.length, 1);
+  assert.equal(saved.posted[0].type, 'wordcraft:open');
+  assert.equal(saved.posted[0].bytes, bytes);
+
+  // An editor without a blank command: neither.
+  const grid = recordingEditor(undefined);
+  const sheet = craftFrame('gridcraft', grid.app);
+  connect(sheet.frame, BRIDGES.gridcraft, {}).start('Book.xlsx', null);
+  assert.deepEqual(grid.executed, []);
+  assert.deepEqual(sheet.posted, []);
+});
+
+test('a_save_request_needs_the_editor_interface', () => {
+  const ask = (frame) => connect(frame, BRIDGES.gridcraft, {}).requestSave();
+  // No interface, an interface without `execute`, or a window that cannot be read: not asked.
+  assert.equal(ask(craftFrame('gridcraft', null).frame), false);
+  assert.equal(ask(craftFrame('gridcraft', { execute: 'no' }).frame), false);
+  const throwing = craftFrame('gridcraft', null).frame;
+  Object.defineProperty(throwing, 'contentWindow', {
+    get() {
+      throw new Error('SecurityError');
+    },
+  });
+  assert.equal(ask(throwing), false);
+  // The editor refused.
+  assert.equal(ask(craftFrame('gridcraft', recordingEditor(false).app).frame), false);
+  // Asked: the editor answers nothing in particular, or true.
+  const editor = recordingEditor(undefined);
+  assert.equal(ask(craftFrame('gridcraft', editor.app).frame), true);
+  assert.deepEqual(editor.executed, [{ command: 'file.save', params: {} }]);
+  assert.equal(ask(craftFrame('gridcraft', recordingEditor(true).app).frame), true);
 });
 
 // ---- the SolidCraft bridge, with a stand-in editor and frame ----
@@ -610,20 +767,35 @@ test('a_retried_save_still_confirms', async () => {
     'document.saved': (p) => ({ revision: p.revision, dirty: false }),
   });
   appear(editor.solidcraft);
-  const host = connect(frame, { ...FAST, pollEvery: 100000 }, handlers);
+  // Wired as the page wires it: saves go to a queue, and a stored save is reported back.
+  const { calls, upload } = standIn();
+  const events = [];
+  let host = null;
+  const queue = new SaveQueue(upload, (event) => {
+    events.push(event.type);
+    if (event.type === 'stored') host.stored(event.bytes);
+  });
+  host = connect(frame, { ...FAST, pollEvery: 100000 }, { ...handlers, save: ({ bytes }) => queue.offer(bytes) });
   await wait(20);
   host.requestSave();
   await wait(20);
-  // The first upload of these bytes failed; the queue sends the same bytes object again,
-  // and that one is stored.
-  const bytes = seen.save[0].bytes;
+  assert.equal(calls.length, 1, 'the export was uploaded');
+  // The first upload fails: the editor is not told it is saved.
+  calls[0].answer({ ok: false, status: 503 });
   await wait(20);
-  host.stored(bytes);
+  assert.equal(editor.count('document.saved'), 0);
+  // The retry sends the same bytes and is stored: now it is told, with that export's revision.
+  queue.retry();
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].bytes, calls[0].bytes, 'the same bytes are sent again');
+  calls[1].answer({ ok: true });
   await wait(20);
+  assert.deepEqual(events, ['saving', 'not_stored', 'saving', 'stored']);
   assert.deepEqual(
     editor.calls.filter((c) => c.method === 'document.saved').map((c) => c.params),
     [{ revision: 11 }],
   );
+  assert.equal(seen.save.length, 0, 'every save went to the queue');
   host.close();
 });
 

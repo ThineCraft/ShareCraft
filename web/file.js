@@ -11,7 +11,9 @@ import {
   connect as connectEditor,
   editorUrl,
   nextStatus,
+  noticeAfter,
   saveFailure,
+  seatBanner,
 } from './editor-host.js';
 import {
   MISSING_DOCUMENT,
@@ -29,9 +31,11 @@ const FIRST_DELAY = 500;
 const MAX_DELAY = 8000;
 const READY_TIMEOUT = 60_000;
 const COPY_TIMEOUT = 10_000; // how long a requested copy waits for the editor's save
-const VIEW_ONLY = 'View only. Changes you make here are not saved.';
 const SEAT_GONE =
   'Someone else is editing this file now, so changes you make here are not saved. Download your copy, then reload.';
+const EDIT_GONE =
+  'You can no longer edit this file, so changes you make here are not saved. Download your copy.';
+const NOT_READY = 'The editor is not ready yet.';
 const MOVED_ON =
   'A newer version was saved while the connection was lost, so changes you make here are not saved. Download your copy, then reload.';
 const NEWER = 'A newer version was saved. Reload to see it.';
@@ -84,6 +88,7 @@ let downloadNextTimer = 0;
 const objectUrls = new Set(); // blob: URLs of downloads not yet revoked
 let notice = null;          // a banner that stays until what it is about is over
 let bannerKey = '';
+let roleCheck = 0;          // the latest role request; older answers are dropped
 const queue = new SaveQueue(upload, onQueue);
 
 addEventListener('beforeunload', (event) => {
@@ -95,7 +100,9 @@ addEventListener('beforeunload', (event) => {
   }
 });
 
-saveButton.addEventListener('click', () => bridge?.requestSave());
+saveButton.addEventListener('click', () => {
+  if (!bridge?.requestSave()) notReady();
+});
 
 shareToggle.addEventListener('click', () => {
   shareOpen = !shareOpen;
@@ -293,8 +300,7 @@ function handle(message) {
       if (message.state === 'saved') onSaved(message.revision ?? null);
       break;
     case 'access':
-      // Rights changed: the seat is decided afresh.
-      location.reload();
+      onAccess(message.can_edit === true);
       break;
     case 'removed':
       stopRemoved(message.reason);
@@ -327,7 +333,7 @@ function onJoined(message) {
   const wasHolder = holder;
   if (wasHolder && message.seat?.state !== 'yours') {
     seat = withoutToken(message.seat);
-    stopSaving(SEAT_GONE);
+    stopSaving(seatGone());
     return;
   }
   takeSeat(message.seat);
@@ -353,11 +359,36 @@ function onSeat(next) {
   }
   if (holder && next?.state !== 'yours') {
     seat = withoutToken(next);
-    stopSaving(SEAT_GONE);
+    stopSaving(seatGone());
     return;
   }
   takeSeat(next);
   render();
+}
+
+// Why this page lost the seat: the right to edit, or someone else editing.
+const seatGone = () => (canEdit ? SEAT_GONE : EDIT_GONE);
+
+// This person's rights changed while connected. The page stays as it is: the role line and the
+// Share button follow the server's answer, and the seat follows the server's `seat` message (a
+// holder who may no longer edit is sent `seat: free` next, which stops saving).
+function onAccess(can) {
+  canEdit = can;
+  refreshRole();
+  render();
+}
+
+async function refreshRole() {
+  const check = ++roleCheck;
+  const result = await api('GET', `/docs/${seg(docId)}`); // 401 goes to the sign-in page
+  if (check !== roleCheck || removed) return;
+  if (result.ok) {
+    doc = { ...doc, name: result.data.name, role: result.data.role };
+    showDetail();
+    setRole(doc.role);
+  } else if (result.status === 404) {
+    stopRemoved('missing');
+  }
 }
 
 function onSaved(revision) {
@@ -379,7 +410,9 @@ function judgeRevision(revision, newer) {
 }
 
 function withoutToken(next) {
-  if (next?.state === 'taken') return { state: 'taken', by: { name: String(next.by?.name ?? '') } };
+  if (next?.state === 'taken') {
+    return { state: 'taken', by: { name: String(next.by?.name ?? ''), user: String(next.by?.user ?? '') } };
+  }
   return { state: next?.state === 'yours' ? 'yours' : next?.state === 'free' ? 'free' : 'unknown' };
 }
 
@@ -455,8 +488,9 @@ function startEditor() {
     dirty: onDirty,
     failed: ({ error, notAnswering }) => {
       if (removed) return;
-      // Not answering in time passes: a later save that goes through settles it.
-      if (notAnswering) setNotice({ kind: 'not_answering', text: error });
+      // Not answering in time passes: a later save that goes through settles it. A stop or a
+      // save failure stays on the screen with its actions.
+      if (notAnswering) setNotice(noticeAfter(notice, { kind: 'not_answering', text: error }));
       else editorFailed(error ? `The editor reported a problem: ${error}` : 'The editor reported a problem.');
     },
   });
@@ -470,8 +504,9 @@ function onReady() {
   if (editorReady || removed) return;
   editorReady = true;
   clearTimeout(readyTimer);
-  // A document that was never saved has no bytes: the editor starts empty.
-  if (initialBytes) bridge.open(doc.name, initialBytes);
+  // A document that was never saved has no bytes: the editor starts empty (one that opens on
+  // a start screen is asked for a blank document).
+  bridge.start(doc.name, initialBytes);
   initialBytes = null;
   updateStatus({ type: 'opened', canSave: editing() });
   render();
@@ -559,7 +594,7 @@ function onQueue(event) {
   if (removed) return;
   if (event.type === 'saving') {
     if (!savingStopped) updateStatus({ type: 'saving' });
-    if (notice?.kind === 'save') setNotice(null);
+    if (notice?.kind === 'save' || notice?.kind === 'not_ready') setNotice(null);
   } else if (event.type === 'stored') {
     if (!savingStopped) updateStatus({ type: 'stored' });
     // The editor hears that its save is stored (an editor that needs telling); a save that
@@ -599,6 +634,12 @@ function downloadMyCopy() {
   clearTimeout(downloadNextTimer);
   // An editor that posts no save does not leave a later real save diverted to a download.
   if (downloadNext) downloadNextTimer = setTimeout(() => (downloadNext = false), COPY_TIMEOUT);
+  else notReady();
+}
+
+// The editor could not be asked to save: its interface is not there yet.
+function notReady() {
+  setNotice(noticeAfter(notice, { kind: 'not_ready', text: NOT_READY }));
 }
 
 function downloadBytes(bytes, name) {
@@ -627,25 +668,22 @@ function setNotice(next) {
   render();
 }
 
-// What the banner says when nothing else needs saying: why this page does not save.
-function seatBanner() {
-  if (!everJoined || holder || savingStopped) return null;
-  if (!canEdit) return { text: VIEW_ONLY };
-  if (seat?.state === 'taken') {
-    const name = seat.by.name || 'Someone';
-    return { text: `${name} is editing this file. You can read it; changes you make here are not saved.` };
-  }
-  if (seat?.state === 'free') {
-    return { text: 'This file is free to edit. Reload to edit it.', actions: ['reload'] };
-  }
-  return { text: VIEW_ONLY };
-}
-
 function render() {
   if (removed) return;
   saveButton.hidden = !(canSave() && editorReady);
   if (editorReady) updateStatus({ type: 'seat', canSave: editing() });
-  setBanner(notice ?? seatBanner());
+  // When nothing else needs saying: why this page does not save, with the person's copy if the
+  // editor saved one here.
+  const quiet = seatBanner({
+    joined: everJoined,
+    holder,
+    stopped: savingStopped !== '',
+    canEdit,
+    seat,
+    me: typeof me?.id === 'string' ? me.id : '',
+    mine: mine !== null,
+  });
+  setBanner(notice ?? quiet);
 }
 
 // Says the banner again, so that it is announced again.

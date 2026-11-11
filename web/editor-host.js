@@ -11,10 +11,20 @@ export const EDITORS = Object.freeze({
   solidcraft: Object.freeze({ name: 'SolidCraft', extension: '.solidcraft.json' }),
 });
 
-/** How the page talks to each editor, by editor id. */
+/**
+ * How the page talks to each editor, by editor id. `blank` is the command that gives an editor
+ * which opens on a start screen an empty document, for a document never saved (GridCraft
+ * starts with an empty workbook; a PDF cannot be made empty).
+ */
 export const BRIDGES = Object.freeze({
   gridcraft: Object.freeze({ kind: 'craft-web-host', prefix: 'gridcraft', query: 'host=parent', author: true }),
-  wordcraft: Object.freeze({ kind: 'craft-web-host', prefix: 'wordcraft', query: 'host=parent', author: true }),
+  wordcraft: Object.freeze({
+    kind: 'craft-web-host',
+    prefix: 'wordcraft',
+    query: 'host=parent',
+    author: true,
+    blank: 'file.new',
+  }),
   pdfcraft: Object.freeze({ kind: 'craft-web-host', prefix: 'pdfcraft', query: 'host=parent&control', author: true }),
   // SolidCraft takes no author. Times in milliseconds: how often to look for its interface and
   // for how long, how often to ask whether it has unsaved changes, and how long one request may
@@ -90,7 +100,7 @@ export function parseHostMessage(prefix, data) {
       const bytes = copyBytes(data.bytes);
       if (!bytes) return null;
       const name = typeof data.name === 'string' ? data.name : '';
-      return { kind, name, bytes, saveAs: data.saveAs === true };
+      return { kind, name, bytes };
     }
     case 'dirty':
       return typeof data.dirty === 'boolean' ? { kind, dirty: data.dirty } : null;
@@ -319,14 +329,63 @@ export function saveFailure(result, canRetry) {
   }
 }
 
+const VIEW_ONLY = 'View only. Changes you make here are not saved.';
+const OWN_TAB =
+  'This file is open for editing in another tab or window of yours. Changes you make here are not saved.';
+
+/**
+ * What the banner says when nothing else needs saying: why this page does not save, from what
+ * the server said. `page`:
+ * - `joined`: the server has answered a join; `holder`: this page holds the seat;
+ *   `stopped`: this page stopped saving for good (it says so itself);
+ * - `canEdit`: the server says this person may edit; `seat`: the seat as the server last
+ *   described it (`{state: "taken", by: {name, user}}`, `{state: "free"}`, …);
+ * - `me`: the signed-in person's account id; `mine`: the page keeps a copy the editor saved
+ *   that the server does not have.
+ * Returns null, or `{text, actions}` with actions among "mycopy" and "reload".
+ */
+export function seatBanner({ joined, holder, stopped, canEdit, seat, me, mine }) {
+  if (!joined || holder || stopped) return null;
+  const copy = mine ? ['mycopy'] : [];
+  if (!canEdit) return { text: VIEW_ONLY, actions: copy };
+  if (seat?.state === 'taken') {
+    if (typeof me === 'string' && me !== '' && seat.by?.user === me) return { text: OWN_TAB, actions: copy };
+    const name = seat.by?.name || 'Someone';
+    return {
+      text: `${name} is editing this file. You can read it; changes you make here are not saved.`,
+      actions: copy,
+    };
+  }
+  if (seat?.state === 'free') {
+    return { text: 'This file is free to edit. Reload to edit it.', actions: [...copy, 'reload'] };
+  }
+  return { text: VIEW_ONLY, actions: copy };
+}
+
+// Notices whose actions (Download my copy, Reload, Try again) must stay on the screen.
+const KEPT_NOTICES = new Set(['stopped', 'save']);
+
+/**
+ * The notice to show when `next` (a passing notice, such as "the editor did not answer") comes
+ * while `current` is showing. A stop or a save failure stays, with `next`'s sentence added
+ * once; anything else gives way to `next`.
+ */
+export function noticeAfter(current, next) {
+  if (!current || !KEPT_NOTICES.has(current.kind)) return next;
+  if (!next?.text || current.text.includes(next.text)) return current;
+  return { ...current, text: `${current.text} ${next.text}` };
+}
+
 /**
  * Wires `frame` (an <iframe> whose page has not started loading yet) to its editor through
  * `bridge` (one of BRIDGES). `handlers` are called with the parsed messages: ready, save,
  * dirty and failed (`{error}`, with `notAnswering: true` when the editor did not answer a
  * request in time, which a later successful save settles). Returns:
  * - `open(name, bytes)`: hands the editor the stored file, after `ready`;
+ * - `start(name, bytes)`: after `ready`, hands the editor the stored file, or with no bytes
+ *   (a document never saved) gives an editor that has a `blank` command an empty document;
  * - `requestSave()`: asks the editor to save (its save arrives through `handlers.save`);
- *   returns whether it was asked;
+ *   returns whether it was asked: false while the editor's interface is not there;
  * - `stored(bytes)`: the server stored these bytes, which came through `handlers.save`;
  * - `close()`: stops listening and polling, for good.
  * New kinds of bridge are added to BRIDGE_KINDS; callers do not change.
@@ -343,7 +402,7 @@ const BRIDGE_KINDS = Object.freeze({
 
 function notAvailable(_frame, _bridge, handlers) {
   queueMicrotask(() => handlers.failed?.({ error: "This editor's bridge is not available yet." }));
-  return { open() {}, requestSave: () => false, stored() {}, close() {} };
+  return { open() {}, start() {}, requestSave: () => false, stored() {}, close() {} };
 }
 
 // The craft-web-host contract: messages `{type: "<prefix>:<kind>", …}` through postMessage,
@@ -358,18 +417,28 @@ function craftWebHost(frame, bridge, handlers) {
     if (message) handlers[message.kind]?.(message);
   };
   win.addEventListener('message', listener);
+  // Runs `command` through the editor's page interface; false if the interface is not there
+  // (or cannot be read yet) or the editor refused it.
+  const execute = (command) => {
+    try {
+      const app = frame.contentWindow?.[bridge.prefix];
+      if (typeof app?.execute !== 'function') return false;
+      return app.execute(command, {}) !== false;
+    } catch {
+      return false;
+    }
+  };
+  const open = (name, bytes) => {
+    // Posted as a copy: the page keeps its own bytes.
+    frame.contentWindow?.postMessage({ type: `${bridge.prefix}:open`, name, bytes }, origin);
+  };
   return {
-    open(name, bytes) {
-      // Posted as a copy: the page keeps its own bytes.
-      frame.contentWindow?.postMessage({ type: `${bridge.prefix}:open`, name, bytes }, origin);
+    open,
+    start(name, bytes) {
+      if (bytes) open(name, bytes);
+      else if (typeof bridge.blank === 'string') execute(bridge.blank);
     },
-    requestSave() {
-      try {
-        return frame.contentWindow?.[bridge.prefix]?.execute('file.save', {}) !== false;
-      } catch {
-        return false;
-      }
-    },
+    requestSave: () => execute('file.save'),
     // The editor counts a save done once it posts it; nothing to tell it.
     stored() {},
     close() {
@@ -484,7 +553,7 @@ function solidcraftRequest(frame, bridge, handlers) {
     // The page uploads at most one save while one more waits: older exports are never stored.
     while (exports.size > KEPT_EXPORTS) exports.delete(exports.keys().next().value);
     const stem = typeof kept.name === 'string' && kept.name.trim() ? kept.name.trim() : 'Design';
-    handlers.save?.({ kind: 'save', name: `${stem}${bridge.extension}`, bytes, saveAs: false });
+    handlers.save?.({ kind: 'save', name: `${stem}${bridge.extension}`, bytes });
   }
 
   async function confirm(revision) {
@@ -499,17 +568,23 @@ function solidcraftRequest(frame, bridge, handlers) {
 
   readyTimer = setTimeout(lookForInterface, 0);
 
+  function open(name, bytes) {
+    if (closed || !app) return;
+    let text;
+    try {
+      text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    } catch {
+      failed('The stored file is not a SolidCraft design: it is not UTF-8 text.');
+      return;
+    }
+    request('document.import', { text, name: designName(name, bridge.extension) }).catch(failed);
+  }
+
   return {
-    open(name, bytes) {
-      if (closed || !app) return;
-      let text;
-      try {
-        text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
-      } catch {
-        failed('The stored file is not a SolidCraft design: it is not UTF-8 text.');
-        return;
-      }
-      request('document.import', { text, name: designName(name, bridge.extension) }).catch(failed);
+    open,
+    // A design never saved: the editor already shows an empty one.
+    start(name, bytes) {
+      if (bytes) open(name, bytes);
     },
     requestSave() {
       if (closed || !app) return false;
