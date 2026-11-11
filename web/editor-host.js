@@ -13,19 +13,36 @@ export const EDITORS = Object.freeze({
 
 /** How the page talks to each editor, by editor id. */
 export const BRIDGES = Object.freeze({
-  gridcraft: Object.freeze({ kind: 'craft-web-host', prefix: 'gridcraft', query: 'host=parent' }),
-  wordcraft: Object.freeze({ kind: 'craft-web-host', prefix: 'wordcraft', query: 'host=parent' }),
-  pdfcraft: Object.freeze({ kind: 'craft-web-host', prefix: 'pdfcraft', query: 'host=parent&control' }),
-  solidcraft: Object.freeze({ kind: 'solidcraft-request', query: 'embed=editor' }),
+  gridcraft: Object.freeze({ kind: 'craft-web-host', prefix: 'gridcraft', query: 'host=parent', author: true }),
+  wordcraft: Object.freeze({ kind: 'craft-web-host', prefix: 'wordcraft', query: 'host=parent', author: true }),
+  pdfcraft: Object.freeze({ kind: 'craft-web-host', prefix: 'pdfcraft', query: 'host=parent&control', author: true }),
+  // SolidCraft takes no author. Times in milliseconds: how often to look for its interface and
+  // for how long, how often to ask whether it has unsaved changes, and how long one request may
+  // take before the editor counts as not answering (a hidden tab does not draw, so it does not
+  // answer).
+  solidcraft: Object.freeze({
+    kind: 'solidcraft-request',
+    query: 'embed=editor',
+    extension: '.solidcraft.json',
+    readyEvery: 250,
+    readyWithin: 60_000,
+    pollEvery: 2000,
+    answerWithin: 15_000,
+  }),
 });
 
 const own = (object, key) => typeof key === 'string' && Object.hasOwn(object, key);
 
-/** The address of editor `id`, hosted by this page, with the author's name; null for no editor. */
+/**
+ * The address of editor `id`, hosted by this page, with the author's name for an editor that
+ * uses it; null for no editor.
+ */
 export function editorUrl(id, authorName) {
   if (!own(BRIDGES, id)) return null;
-  const author = encodeURIComponent(String(authorName ?? ''));
-  return `/editors/${encodeURIComponent(id)}/index.html?${BRIDGES[id].query}&author=${author}`;
+  const bridge = BRIDGES[id];
+  const base = `/editors/${encodeURIComponent(id)}/index.html?${bridge.query}`;
+  if (!bridge.author) return base;
+  return `${base}&author=${encodeURIComponent(String(authorName ?? ''))}`;
 }
 
 // Lower-cases ASCII letters only, so that no other character can turn into one.
@@ -254,7 +271,7 @@ export class SaveQueue {
     this.#inFlight = null;
     if (result.status === 409) this.#stopped = true;
     if (result.ok) {
-      this.#onEvent({ type: 'stored', result });
+      this.#onEvent({ type: 'stored', result, bytes });
     } else if (this.#waiting === null) {
       this.#failed = { bytes, result };
       this.#onEvent({ type: 'not_stored', result });
@@ -305,7 +322,12 @@ export function saveFailure(result, canRetry) {
 /**
  * Wires `frame` (an <iframe> whose page has not started loading yet) to its editor through
  * `bridge` (one of BRIDGES). `handlers` are called with the parsed messages: ready, save,
- * dirty and failed (`{error}`). Returns `{ open(name, bytes), requestSave(), close() }`.
+ * dirty and failed (`{error}`). Returns:
+ * - `open(name, bytes)`: hands the editor the stored file, after `ready`;
+ * - `requestSave()`: asks the editor to save (its save arrives through `handlers.save`);
+ *   returns whether it was asked;
+ * - `stored(bytes)`: the server stored these bytes, which came through `handlers.save`;
+ * - `close()`: stops listening and polling, for good.
  * New kinds of bridge are added to BRIDGE_KINDS; callers do not change.
  */
 export function connect(frame, bridge, handlers) {
@@ -315,13 +337,12 @@ export function connect(frame, bridge, handlers) {
 
 const BRIDGE_KINDS = Object.freeze({
   'craft-web-host': craftWebHost,
-  // Task 10 brings SolidCraft's own bridge.
-  'solidcraft-request': notAvailable,
+  'solidcraft-request': solidcraftRequest,
 });
 
 function notAvailable(_frame, _bridge, handlers) {
   queueMicrotask(() => handlers.failed?.({ error: "This editor's bridge is not available yet." }));
-  return { open() {}, requestSave: () => false, close() {} };
+  return { open() {}, requestSave: () => false, stored() {}, close() {} };
 }
 
 // The craft-web-host contract: messages `{type: "<prefix>:<kind>", …}` through postMessage,
@@ -348,8 +369,158 @@ function craftWebHost(frame, bridge, handlers) {
         return false;
       }
     },
+    // The editor counts a save done once it posts it; nothing to tell it.
+    stored() {},
     close() {
       win.removeEventListener('message', listener);
     },
   };
+}
+
+const NOT_ANSWERING = 'The editor did not answer. Show this tab and try again.';
+class NotAnswering extends Error {}
+
+// SolidCraft's control requests: the page calls `frame.contentWindow.solidcraft.request(method,
+// params)`, which returns a Promise, and moves the design as JSON text. The editor keeps nothing
+// itself and its own Save is off, so it counts as saved only when the page says the server
+// stored the export (`document.saved` with the export's revision).
+function solidcraftRequest(frame, bridge, handlers) {
+  let closed = false;
+  let app = null;        // the editor's `solidcraft` object, once it appeared
+  let polling = false;   // a dirty poll is under way
+  let pollTimer = 0;
+  let readyTimer = 0;
+  const exports = new Map(); // bytes handed to the page -> the revision their export carried
+  const started = Date.now();
+  const visible = () => frame.ownerDocument?.visibilityState !== 'hidden';
+
+  // One request, refused after `answerWithin` without an answer.
+  function request(method, params) {
+    let timer = 0;
+    const late = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new NotAnswering(NOT_ANSWERING)), bridge.answerWithin);
+    });
+    let call;
+    try {
+      call = Promise.resolve(app.request(method, params));
+    } catch (err) {
+      call = Promise.reject(err);
+    }
+    return Promise.race([call, late]).finally(() => clearTimeout(timer));
+  }
+
+  const failed = (err) => {
+    if (!closed) handlers.failed?.({ error: String(err?.message ?? err ?? '') });
+  };
+
+  function lookForInterface() {
+    if (closed) return;
+    const found = frame.contentWindow?.solidcraft;
+    if (found && typeof found.request === 'function') {
+      app = found;
+      handlers.ready?.({ kind: 'ready', version: '1' });
+      schedulePoll();
+      return;
+    }
+    // The page's own ready timeout reports an editor that never appears.
+    if (Date.now() - started < bridge.readyWithin) {
+      readyTimer = setTimeout(lookForInterface, bridge.readyEvery);
+    }
+  }
+
+  // Asks whether the design has unsaved changes, one request at a time, only while the tab is
+  // shown (a hidden tab does not answer). The text of the answer is not kept.
+  function schedulePoll() {
+    if (!closed) pollTimer = setTimeout(poll, bridge.pollEvery);
+  }
+
+  async function poll() {
+    if (closed || polling) return;
+    if (!visible()) {
+      schedulePoll();
+      return;
+    }
+    polling = true;
+    try {
+      const answer = await request('document.export');
+      if (!closed && typeof answer?.dirty === 'boolean') {
+        handlers.dirty?.({ kind: 'dirty', dirty: answer.dirty });
+      }
+    } catch {
+      // A missed poll is asked again at the next turn.
+    } finally {
+      polling = false;
+      schedulePoll();
+    }
+  }
+
+  async function save() {
+    let kept;
+    try {
+      kept = await request('document.export');
+    } catch (err) {
+      failed(err);
+      return;
+    }
+    if (closed || typeof kept?.text !== 'string') return;
+    const bytes = new TextEncoder().encode(kept.text);
+    exports.set(bytes, kept.revision);
+    const stem = typeof kept.name === 'string' && kept.name.trim() ? kept.name.trim() : 'Design';
+    handlers.save?.({ kind: 'save', name: `${stem}${bridge.extension}`, bytes, saveAs: false });
+  }
+
+  async function confirm(revision) {
+    try {
+      await request('document.saved', { revision });
+    } catch (err) {
+      // The design changed since the export (or the editor did not answer): it is not saved.
+      if (!closed) handlers.dirty?.({ kind: 'dirty', dirty: true });
+      if (err instanceof NotAnswering) failed(err);
+    }
+  }
+
+  readyTimer = setTimeout(lookForInterface, 0);
+
+  return {
+    open(name, bytes) {
+      if (closed || !app) return;
+      let text;
+      try {
+        text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+      } catch {
+        failed('The stored file is not a SolidCraft design: it is not UTF-8 text.');
+        return;
+      }
+      request('document.import', { text, name: designName(name, bridge.extension) }).catch(failed);
+    },
+    requestSave() {
+      if (closed || !app) return false;
+      save();
+      return true;
+    },
+    stored(bytes) {
+      if (closed || !exports.has(bytes)) return;
+      const revision = exports.get(bytes);
+      // This export and every older one are settled.
+      for (const key of exports.keys()) {
+        exports.delete(key);
+        if (key === bytes) break;
+      }
+      confirm(revision);
+    },
+    close() {
+      closed = true;
+      app = null;
+      exports.clear();
+      clearTimeout(readyTimer);
+      clearTimeout(pollTimer);
+    },
+  };
+}
+
+// The design's name: the document's name without the native extension.
+function designName(name, extension) {
+  const text = String(name ?? '');
+  if (classifySave(extension, text) !== 'save') return text;
+  return text.slice(0, text.length - extension.length) || text;
 }

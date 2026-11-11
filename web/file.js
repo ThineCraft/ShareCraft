@@ -558,7 +558,10 @@ function onQueue(event) {
     if (notice?.kind === 'save') setNotice(null);
   } else if (event.type === 'stored') {
     if (!savingStopped) updateStatus({ type: 'stored' });
-    if (notice?.kind === 'save') setNotice(null);
+    // The editor hears that its save is stored (an editor that needs telling); a save that
+    // went through also settles an earlier save problem or an editor that did not answer.
+    bridge?.stored(event.bytes);
+    if (notice?.kind === 'save' || notice?.kind === 'editor') setNotice(null);
   } else if (event.type === 'not_stored') {
     if (event.result.staleSeat && canSave()) {
       // Sent again with the new token: the refused save, or the newer one already waiting.

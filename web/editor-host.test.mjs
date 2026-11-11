@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   BRIDGES,
   SaveQueue,
+  connect,
   classifySave,
   editorUrl,
   nextStatus,
@@ -82,7 +83,8 @@ test('editor_url_encodes_the_author', () => {
     '/editors/gridcraft/index.html?host=parent&author=Ann%20%26%20Bob%20%231%20J%C3%BCrgen',
   );
   assert.equal(editorUrl('pdfcraft', 'Zoë'), '/editors/pdfcraft/index.html?host=parent&control&author=Zo%C3%AB');
-  assert.equal(editorUrl('solidcraft', 'A'), '/editors/solidcraft/index.html?embed=editor&author=A');
+  // SolidCraft takes no author: the name stays out of an address where it does nothing.
+  assert.equal(editorUrl('solidcraft', 'Ann & Bob'), '/editors/solidcraft/index.html?embed=editor');
   assert.equal(editorUrl('text', 'A'), null);
   assert.equal(editorUrl('__proto__', 'A'), null);
   assert.equal(BRIDGES.solidcraft.kind, 'solidcraft-request');
@@ -271,4 +273,208 @@ test('failures_say_what_happened_and_what_can_be_done', () => {
   for (const failure of [409, 403, 413, 503, 0].map((status) => saveFailure({ status }, true))) {
     assert.match(failure.text, /not stored/);
   }
+});
+
+// ---- the SolidCraft bridge, with a stand-in editor and frame ----
+
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const FAST = { ...BRIDGES.solidcraft, readyEvery: 5, readyWithin: 2000, pollEvery: 10, answerWithin: 200 };
+
+// A stand-in `window.solidcraft`: `answers[method]` decides each request's answer (a value, a
+// function of the params that may throw, or "hang" for a request that never settles).
+function standInEditor(answers = {}) {
+  const calls = [];
+  const solidcraft = {
+    request(method, params) {
+      calls.push({ method, params });
+      const answer = answers[method];
+      if (answer === 'hang') return new Promise(() => {});
+      return new Promise((resolve, reject) => {
+        setTimeout(() => {
+          try {
+            resolve(typeof answer === 'function' ? answer(params) : answer);
+          } catch (err) {
+            reject(err);
+          }
+        }, 1);
+      });
+    },
+  };
+  const count = (method) => calls.filter((call) => call.method === method).length;
+  return { solidcraft, calls, count };
+}
+
+function standInFrame() {
+  const contentWindow = {};
+  const frame = { contentWindow, ownerDocument: { visibilityState: 'visible', defaultView: globalThis } };
+  return { frame, appear: (solidcraft) => (contentWindow.solidcraft = solidcraft) };
+}
+
+function recorder() {
+  const seen = { ready: 0, save: [], dirty: [], failed: [] };
+  const handlers = {
+    ready: () => seen.ready++,
+    save: (message) => seen.save.push(message),
+    dirty: (message) => seen.dirty.push(message.dirty),
+    failed: (message) => seen.failed.push(message.error),
+  };
+  return { seen, handlers };
+}
+
+const DESIGN = '{"design":"é"}';
+const exported = (revision, dirty = true) => ({ name: 'Bracket', revision, dirty, format: 'json', text: DESIGN });
+
+test('import_is_sent_after_the_interface_appears', async () => {
+  const { frame, appear } = standInFrame();
+  const { seen, handlers } = recorder();
+  const editor = standInEditor({ 'document.import': { revision: 1 }, 'document.export': exported(1, false) });
+  const host = connect(frame, FAST, handlers);
+  await wait(30);
+  assert.equal(seen.ready, 0, 'not ready before the interface exists');
+  appear(editor.solidcraft);
+  await wait(30);
+  assert.equal(seen.ready, 1);
+  host.open('Bracket.solidcraft.json', new TextEncoder().encode(DESIGN));
+  await wait(20);
+  const imported = editor.calls.find((call) => call.method === 'document.import');
+  assert.deepEqual(imported.params, { text: DESIGN, name: 'Bracket' });
+  assert.deepEqual(seen.failed, []);
+  host.close();
+});
+
+test('save_confirms_only_after_the_upload', async () => {
+  const { frame, appear } = standInFrame();
+  const { seen, handlers } = recorder();
+  const editor = standInEditor({
+    'document.export': exported(7),
+    'document.saved': (p) => ({ revision: p.revision, dirty: false }),
+  });
+  appear(editor.solidcraft);
+  const host = connect(frame, { ...FAST, pollEvery: 100000 }, handlers);
+  await wait(20);
+  assert.equal(host.requestSave(), true);
+  await wait(20);
+  assert.equal(seen.save.length, 1);
+  const save = seen.save[0];
+  assert.equal(classifySave('.solidcraft.json', save.name), 'save');
+  assert.equal(new TextDecoder().decode(save.bytes), DESIGN);
+  // The upload fails (the page never says it was stored): the editor is not told it is saved.
+  await wait(20);
+  assert.equal(editor.count('document.saved'), 0);
+  // Stored: now it is told, with the revision the export carried.
+  host.stored(save.bytes);
+  await wait(20);
+  assert.deepEqual(
+    editor.calls.filter((c) => c.method === 'document.saved').map((c) => c.params),
+    [{ revision: 7 }],
+  );
+  // Bytes it did not hand over confirm nothing.
+  host.stored(new Uint8Array([1]));
+  await wait(20);
+  assert.equal(editor.count('document.saved'), 1);
+  host.close();
+});
+
+test('a_refused_confirmation_leaves_it_unsaved', async () => {
+  const { frame, appear } = standInFrame();
+  const { seen, handlers } = recorder();
+  const editor = standInEditor({
+    'document.export': exported(3),
+    'document.saved': () => {
+      throw new Error('the design changed since revision 3 (now 4)');
+    },
+  });
+  appear(editor.solidcraft);
+  const host = connect(frame, { ...FAST, pollEvery: 100000 }, handlers);
+  await wait(20);
+  host.requestSave();
+  await wait(20);
+  host.stored(seen.save[0].bytes);
+  await wait(20);
+  assert.equal(editor.count('document.saved'), 1);
+  assert.deepEqual(seen.dirty, [true], 'the page hears it still has unsaved changes');
+  assert.deepEqual(seen.failed, [], 'a design changed meanwhile is not an editor failure');
+  host.close();
+});
+
+test('non_utf8_content_is_an_error', async () => {
+  const { frame, appear } = standInFrame();
+  const { seen, handlers } = recorder();
+  const editor = standInEditor({ 'document.import': { revision: 1 }, 'document.export': exported(1, false) });
+  appear(editor.solidcraft);
+  const host = connect(frame, FAST, handlers);
+  await wait(20);
+  host.open('Bracket.solidcraft.json', new Uint8Array([0x7b, 0xff, 0xfe, 0x7d]));
+  await wait(20);
+  assert.equal(seen.failed.length, 1);
+  assert.equal(editor.count('document.import'), 0, 'not sent');
+  host.close();
+});
+
+test('polling_stops_when_disconnected', async () => {
+  const { frame, appear } = standInFrame();
+  const { seen, handlers } = recorder();
+  const editor = standInEditor({ 'document.export': exported(2, true) });
+  appear(editor.solidcraft);
+  const host = connect(frame, FAST, handlers);
+  await wait(80);
+  const polls = editor.count('document.export');
+  assert.ok(polls >= 2, `polled ${polls} times`);
+  assert.ok(seen.dirty.includes(true), 'dirty is reported');
+  host.close();
+  const before = editor.calls.length;
+  await wait(60);
+  assert.equal(editor.calls.length, before, 'no request after close');
+
+  // A hidden tab is not polled.
+  const hidden = standInFrame();
+  const quiet = standInEditor({ 'document.export': exported(2, true) });
+  hidden.appear(quiet.solidcraft);
+  hidden.frame.ownerDocument.visibilityState = 'hidden';
+  const other = connect(hidden.frame, FAST, recorder().handlers);
+  await wait(60);
+  assert.equal(quiet.calls.length, 0);
+  other.close();
+});
+
+test('polls_never_overlap', async () => {
+  const { frame, appear } = standInFrame();
+  const { handlers } = recorder();
+  // Each export takes longer than the polling interval.
+  const slow = { calls: 0, running: 0, most: 0 };
+  appear({
+    request(method) {
+      if (method !== 'document.export') return Promise.resolve({});
+      slow.calls++;
+      slow.running++;
+      slow.most = Math.max(slow.most, slow.running);
+      return new Promise((resolve) =>
+        setTimeout(() => {
+          slow.running--;
+          resolve(exported(1, false));
+        }, 30),
+      );
+    },
+  });
+  const host = connect(frame, { ...FAST, pollEvery: 5 }, handlers);
+  await wait(150);
+  host.close();
+  assert.ok(slow.calls >= 2, `polled ${slow.calls} times`);
+  assert.equal(slow.most, 1);
+});
+
+test('a_request_timeout_is_reported_and_marks_nothing_stored', async () => {
+  const { frame, appear } = standInFrame();
+  const { seen, handlers } = recorder();
+  const editor = standInEditor({ 'document.export': 'hang' });
+  appear(editor.solidcraft);
+  const host = connect(frame, { ...FAST, pollEvery: 100000, answerWithin: 30 }, handlers);
+  await wait(20);
+  host.requestSave();
+  await wait(80);
+  assert.equal(seen.save.length, 0, 'nothing reaches the save path');
+  assert.equal(seen.failed.length, 1);
+  assert.match(seen.failed[0], /did not answer/);
+  assert.equal(editor.count('document.saved'), 0);
+  host.close();
 });
