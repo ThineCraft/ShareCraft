@@ -5,44 +5,36 @@
     clippy::indexing_slicing
 )]
 
+mod common;
+
 use collab_core::ids::{DocId, UserId};
+use common::{document_in, new_id, put, site, user};
 use records::test_support::TestDb;
-use records::{AccessError, Editor, NewUser, Role, User};
+use records::{AccessError, Editor, NodeKind, Role};
 use serde_json::json;
 use uuid::Uuid;
-
-const PASSWORD: &str = "correct horse battery";
-
-async fn user(test: &TestDb, name: &str, is_admin: bool) -> User {
-    test.db
-        .create_user(
-            None,
-            NewUser {
-                email: &format!("{}@x.test", name.to_lowercase()),
-                name,
-                password: PASSWORD,
-                is_admin,
-            },
-        )
-        .await
-        .unwrap()
-}
 
 fn doc_id() -> DocId {
     DocId(Uuid::new_v4())
 }
 
+/// A text document "Notes" in the library of a new site that `owner` owns.
 async fn document(test: &TestDb, owner: UserId) -> DocId {
-    let id = doc_id();
-    test.db
-        .create_document(owner, id, "Notes", Editor::Text)
-        .await
-        .unwrap();
-    id
+    let site = site(test, "Site", Some(owner)).await;
+    let library = put(
+        test,
+        new_id(),
+        NodeKind::Library,
+        Some(site),
+        site,
+        "Documents",
+    )
+    .await;
+    document_in(test, owner, library, site, "Notes").await
 }
 
 #[tokio::test]
-async fn creator_is_owner() {
+async fn created_document_takes_its_access_from_the_tree() {
     let test = TestDb::create().await;
     let ann = user(&test, "Ann", false).await;
     let id = doc_id();
@@ -56,6 +48,27 @@ async fn creator_is_owner() {
     assert_eq!(created.created_by, Some(ann.id));
     assert_eq!(created.revision, None);
     assert_eq!(test.db.document(id).await.unwrap(), Some(created.clone()));
+    // Not yet in the tree: nobody has a role on it.
+    assert_eq!(test.db.role(ann.id, id).await.unwrap(), None);
+    let site = site(&test, "Site", Some(ann.id)).await;
+    let library = put(
+        &test,
+        new_id(),
+        NodeKind::Library,
+        Some(site),
+        site,
+        "Documents",
+    )
+    .await;
+    put(
+        &test,
+        id.into(),
+        NodeKind::Document,
+        Some(library),
+        site,
+        "Plan",
+    )
+    .await;
     assert_eq!(test.db.role(ann.id, id).await.unwrap(), Some(Role::Owner));
     let grants = test.db.grants(ann.id, id).await.unwrap();
     assert_eq!(grants.len(), 1);
@@ -276,35 +289,16 @@ async fn two_removals_racing_leave_one_owner() {
         .await
         .unwrap();
     for round in 0..10 {
-        // Hold the document's lock while both calls start, so that both have started
+        // Hold the document's node while both calls start, so that both have started
         // and are queued behind it; they then run strictly one after the
         // other, whatever the scheduler does.
-        let mut gate = test.db.test_pool().begin().await.unwrap();
-        sqlx::query("select id from documents where id = $1 for update")
-            .bind(id.0)
-            .execute(&mut *gate)
-            .await
-            .unwrap();
+        let held = common::gate(&test, id.into()).await;
         let first = test.db.clone();
         let second = test.db.clone();
         let a = tokio::spawn(async move { first.set_access(ann.id, id, bob.id, None).await });
         let b = tokio::spawn(async move { second.set_access(bob.id, id, ann.id, None).await });
-        let mut waiting = 0i64;
-        for _ in 0..200 {
-            waiting = sqlx::query_scalar(
-                "select count(*) from pg_stat_activity \
-                 where wait_event_type = 'Lock' and query like '%for update%'",
-            )
-            .fetch_one(test.db.test_pool())
-            .await
-            .unwrap();
-            if waiting >= 2 {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-        assert!(waiting >= 2, "round {round}: both calls should be waiting");
-        gate.commit().await.unwrap();
+        common::wait_blocked(&test, held.pid, 2).await;
+        held.open().await;
         let results = [a.await.unwrap(), b.await.unwrap()];
         // The calls take turns. The loser was an owner when it started, but the winner has
         // removed it by the time it holds the lock, so it is refused as someone with no access
@@ -390,6 +384,7 @@ async fn access_changes_are_recorded() {
     let ann = user(&test, "Ann", false).await;
     let bob = user(&test, "Bob", false).await;
     let id = document(&test, ann.id).await;
+    let site = test.db.node(id.into()).await.unwrap().unwrap().site;
     test.db
         .set_access(ann.id, id, bob.id, Some(Role::Viewer))
         .await
@@ -421,6 +416,13 @@ async fn access_changes_are_recorded() {
                 None,
                 Some(id),
                 json!({"name": "Notes", "editor": "text"})
+            ),
+            (
+                "inheritance.broken",
+                Some(ann.id),
+                None,
+                Some(id),
+                json!({"from": site.0, "copied": 1})
             ),
             (
                 "access.granted",

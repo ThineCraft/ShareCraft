@@ -7,6 +7,7 @@ mod db;
 mod documents;
 mod events;
 mod revisions;
+mod scopes;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 mod tree;
@@ -18,4 +19,5 @@ pub use db::{Db, DbError};
 pub use documents::{AccessError, Document, Editor, Grant, Role};
 pub use events::{Event, NewEvent};
 pub use revisions::{RevisionRecord, RevisionRow};
+pub use scopes::{Crumb, Cursor, Listed, NodeAccess};
 pub use tree::{Node, NodeKind, NodeRow, validate_node_name};

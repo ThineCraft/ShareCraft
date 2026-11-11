@@ -1,15 +1,16 @@
-//! Documents, roles and per-document access grants.
+//! Documents and roles. Access to a document is access to its node of the content tree.
 
 use collab_core::ids::{DocId, UserId};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sqlx::Row;
 use sqlx::postgres::PgRow;
-use sqlx::{PgConnection, Row};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::accounts::{User, user_from_row};
+use crate::accounts::User;
 use crate::events::{NewEvent, record};
+use crate::scopes::REACH;
 use crate::tree::validate_node_name;
 use crate::{Db, DbError};
 
@@ -37,7 +38,7 @@ impl Role {
         self == Role::Owner
     }
 
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Role::Viewer => "viewer",
             Role::Editor => "editor",
@@ -200,12 +201,12 @@ fn check_extension(name: &str, editor: Editor) -> Result<(), AccessError> {
     }
 }
 
-fn parse_editor(text: &str) -> Result<Editor, sqlx::Error> {
+pub(crate) fn parse_editor(text: &str) -> Result<Editor, sqlx::Error> {
     Editor::from_id(text)
         .ok_or_else(|| sqlx::Error::Decode(format!("unknown editor {text:?}").into()))
 }
 
-fn parse_role(text: &str) -> Result<Role, sqlx::Error> {
+pub(crate) fn parse_role(text: &str) -> Result<Role, sqlx::Error> {
     Role::parse(text).ok_or_else(|| sqlx::Error::Decode(format!("unknown role {text:?}").into()))
 }
 
@@ -220,65 +221,9 @@ fn document_from_row(row: &PgRow) -> Result<Document, sqlx::Error> {
     })
 }
 
-/// The one access decision. The documents `user` can reach, with the role each gives: nothing
-/// for a disabled or unknown account; owner of everything for an enabled administrator;
-/// otherwise the grant. `only` narrows it to one document. Everything else that needs a
-/// role (`role`, `documents_for`, `set_access`, `grants`) goes through here.
-async fn reachable(
-    conn: &mut PgConnection,
-    user: UserId,
-    only: Option<DocId>,
-) -> Result<Vec<(Document, Role)>, sqlx::Error> {
-    let rows = sqlx::query(
-        "select d.id, d.name, d.editor, d.created_by, d.revision, d.revised_at, \
-                case when u.is_admin then 'owner' else a.role end as role \
-         from users u \
-         cross join documents d \
-         left join document_access a on a.document_id = d.id and a.user_id = u.id \
-         where u.id = $1 and u.disabled_at is null \
-           and ($2::uuid is null or d.id = $2) \
-           and (u.is_admin or a.role is not null) \
-         order by d.created_at desc, d.id desc",
-    )
-    .bind(user.0)
-    .bind(only.map(|d| d.0))
-    .fetch_all(conn)
-    .await?;
-    rows.iter()
-        .map(|row| {
-            let role: String = row.try_get("role")?;
-            Ok((document_from_row(row)?, parse_role(&role)?))
-        })
-        .collect()
-}
-
-async fn role_on(
-    conn: &mut PgConnection,
-    user: UserId,
-    doc: DocId,
-) -> Result<Option<Role>, sqlx::Error> {
-    Ok(reachable(conn, user, Some(doc))
-        .await?
-        .into_iter()
-        .next()
-        .map(|(_, role)| role))
-}
-
-/// Fails with `NotFound` if `actor` has no role on `doc`, `Forbidden` if it is not owner.
-async fn require_owner(
-    conn: &mut PgConnection,
-    actor: UserId,
-    doc: DocId,
-) -> Result<(), AccessError> {
-    match role_on(conn, actor, doc).await? {
-        None => Err(AccessError::NotFound),
-        Some(role) if role.can_manage() => Ok(()),
-        Some(_) => Err(AccessError::Forbidden),
-    }
-}
-
 impl Db {
-    /// Creates a document and makes `actor` its owner.
+    /// Records a document. It has no access of its own: it takes its access from the node it
+    /// is placed at in the tree.
     pub async fn create_document(
         &self,
         actor: UserId,
@@ -341,14 +286,6 @@ impl Db {
             Err(e) => return Err(e.into()),
         };
         let document = document_from_row(&row)?;
-        sqlx::query(
-            "insert into document_access (document_id, user_id, role, granted_by) \
-             values ($1, $2, 'owner', $2)",
-        )
-        .bind(id.0)
-        .bind(actor.0)
-        .execute(&mut *tx)
-        .await?;
         record(
             &mut tx,
             NewEvent {
@@ -384,53 +321,56 @@ impl Db {
         Ok(row.as_ref().map(document_from_row).transpose()?)
     }
 
-    /// What `user` may do with `doc`: the single access decision. `None` for a disabled or
-    /// unknown account or a missing document; `Owner` for an enabled administrator; otherwise
-    /// the grant, if any.
+    /// What `user` may do with `doc`: [`Db::effective_role`] on the document's node. `None`
+    /// for a document not yet placed in the tree.
     pub async fn role(&self, user: UserId, doc: DocId) -> Result<Option<Role>, DbError> {
-        let mut conn = self.pool().acquire().await?;
-        Ok(role_on(&mut conn, user, doc).await?)
+        self.effective_role(user, doc.into()).await
     }
 
-    /// The documents `user` has a role on, newest first.
+    /// The documents `user` can open, with the role each gives, newest first. Walks down from
+    /// the person's live scopes (from every site for an administrator), so a document outside
+    /// the tree is never listed. Kept for the flat list until the tree pages replace it.
     pub async fn documents_for(&self, user: UserId) -> Result<Vec<(Document, Role)>, DbError> {
-        let mut conn = self.pool().acquire().await?;
-        Ok(reachable(&mut conn, user, None).await?)
-    }
-
-    /// Who has been granted access to `doc`. `actor` must be an owner of it.
-    pub async fn grants(&self, actor: UserId, doc: DocId) -> Result<Vec<Grant>, AccessError> {
-        let mut conn = self.pool().acquire().await?;
-        require_owner(&mut conn, actor, doc).await?;
-        let rows = sqlx::query(
-            "select u.id, u.email, u.name, u.is_admin, (u.disabled_at is not null) as disabled, \
-             a.role \
-             from document_access a join users u on u.id = a.user_id \
-             where a.document_id = $1 order by u.name, u.id",
-        )
-        .bind(doc.0)
-        .fetch_all(&mut *conn)
-        .await?;
-        let grants = rows
-            .iter()
+        let query = format!(
+            "with recursive {REACH}, \
+             me(is_admin) as (select is_admin from users where id = $1 and disabled_at is null), \
+             starts(id, role) as ( \
+                 select s.id, 'owner'::text from nodes s, me \
+                 where me.is_admin and s.parent_id is null and s.deleted_at is null \
+                 union \
+                 select g.node_id, g.role from grants g, me \
+                 where not me.is_admin and g.node_id in (select origin from live)), \
+             down(id, role) as ( \
+                 select id, role from starts \
+                 union \
+                 select n.id, down.role from nodes n join down on n.parent_id = down.id \
+                 where n.deleted_at is null \
+                   and (not n.unique_scope or exists (select 1 from me where me.is_admin))) \
+             select d.id, d.name, d.editor, d.created_by, d.revision, d.revised_at, down.role \
+             from down join nodes n on n.id = down.id and n.kind = 'document' \
+             join documents d on d.id = n.id \
+             order by d.created_at desc, d.id desc"
+        );
+        let rows = sqlx::query(sqlx::AssertSqlSafe(query))
+            .bind(user.0)
+            .fetch_all(self.pool())
+            .await?;
+        rows.iter()
             .map(|row| {
                 let role: String = row.try_get("role")?;
-                Ok(Grant {
-                    user: user_from_row(row)?,
-                    role: parse_role(&role)?,
-                })
+                Ok((document_from_row(row)?, parse_role(&role)?))
             })
-            .collect::<Result<_, sqlx::Error>>()?;
-        Ok(grants)
+            .collect::<Result<_, sqlx::Error>>()
+            .map_err(DbError::from)
     }
 
-    /// Gives `user` the role `role` on `doc`, or removes their grant when it is `None`.
-    /// `actor` must be an owner. Returns the person's role before and after, as `role` would
-    /// report it (an administrator stays `Owner` either way).
-    ///
-    /// The actor's permission is decided with the document locked, so concurrent changes take
-    /// turns, an owner removed by an earlier change gets `NotFound`, and the last owner grant
-    /// cannot be removed by two calls at once.
+    /// Who has been granted access to `doc`: the assignments on the scope that decides it.
+    /// `actor` must be an owner of it.
+    pub async fn grants(&self, actor: UserId, doc: DocId) -> Result<Vec<Grant>, AccessError> {
+        Ok(self.access(actor, doc.into()).await?.grants)
+    }
+
+    /// [`Db::set_node_access`] on the document's node.
     pub async fn set_access(
         &self,
         actor: UserId,
@@ -438,107 +378,6 @@ impl Db {
         user: UserId,
         role: Option<Role>,
     ) -> Result<(Option<Role>, Option<Role>), AccessError> {
-        let mut tx = self.pool().begin().await?;
-        // Cheap early refusal so that people with no access never wait for the lock. Not
-        // authoritative: the check under the lock below is.
-        require_owner(&mut tx, actor, doc).await?;
-        // The document row is the one lock every access change takes first, so changes to
-        // one document are serialised and cannot deadlock.
-        let locked: Option<Uuid> =
-            sqlx::query_scalar("select id from documents where id = $1 for update")
-                .bind(doc.0)
-                .fetch_optional(&mut *tx)
-                .await?;
-        if locked.is_none() {
-            return Err(AccessError::NotFound);
-        }
-        // Authoritative: judged with the document locked, so an owner removed by a call that
-        // just committed cannot make one more change.
-        require_owner(&mut tx, actor, doc).await?;
-        let exists: Option<Uuid> = sqlx::query_scalar("select id from users where id = $1")
-            .bind(user.0)
-            .fetch_optional(&mut *tx)
-            .await?;
-        if exists.is_none() {
-            return Err(AccessError::NoSuchUser);
-        }
-        let current: Option<String> = sqlx::query_scalar(
-            "select role from document_access where document_id = $1 and user_id = $2",
-        )
-        .bind(doc.0)
-        .bind(user.0)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let current = current.as_deref().map(parse_role).transpose()?;
-        let before = role_on(&mut tx, user, doc).await?;
-        if current == role {
-            return Ok((before, before));
-        }
-        if current == Some(Role::Owner) && role != Some(Role::Owner) {
-            let owners: i64 = sqlx::query_scalar(
-                "select count(*) from document_access where document_id = $1 and role = 'owner'",
-            )
-            .bind(doc.0)
-            .fetch_one(&mut *tx)
-            .await?;
-            if owners <= 1 {
-                return Err(AccessError::LastOwner);
-            }
-        }
-        let (kind, detail) = match (current, role) {
-            (None, Some(new)) => {
-                sqlx::query(
-                    "insert into document_access (document_id, user_id, role, granted_by) \
-                     values ($1, $2, $3, $4)",
-                )
-                .bind(doc.0)
-                .bind(user.0)
-                .bind(new.as_str())
-                .bind(actor.0)
-                .execute(&mut *tx)
-                .await?;
-                ("access.granted", json!({ "role": new.as_str() }))
-            }
-            (Some(old), Some(new)) => {
-                sqlx::query(
-                    "update document_access set role = $3, granted_by = $4, granted_at = now() \
-                     where document_id = $1 and user_id = $2",
-                )
-                .bind(doc.0)
-                .bind(user.0)
-                .bind(new.as_str())
-                .bind(actor.0)
-                .execute(&mut *tx)
-                .await?;
-                (
-                    "access.changed",
-                    json!({ "from": old.as_str(), "to": new.as_str() }),
-                )
-            }
-            (Some(old), None) => {
-                sqlx::query("delete from document_access where document_id = $1 and user_id = $2")
-                    .bind(doc.0)
-                    .bind(user.0)
-                    .execute(&mut *tx)
-                    .await?;
-                ("access.revoked", json!({ "role": old.as_str() }))
-            }
-            (None, None) => return Ok((before, before)),
-        };
-        record(
-            &mut tx,
-            NewEvent {
-                kind,
-                actor: Some(actor),
-                subject: Some(user),
-                document: Some(doc),
-                node: Some(doc.into()),
-                detail,
-            },
-        )
-        .await?;
-        let after = role_on(&mut tx, user, doc).await?;
-        tx.commit().await?;
-        Ok((before, after))
+        self.set_node_access(actor, doc.into(), user, role).await
     }
 }

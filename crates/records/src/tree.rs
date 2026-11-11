@@ -94,7 +94,7 @@ pub fn validate_node_name(name: &str) -> Result<&str, AccessError> {
     }
 }
 
-fn node_from_row(row: &PgRow) -> Result<Node, sqlx::Error> {
+pub(crate) fn node_from_row(row: &PgRow) -> Result<Node, sqlx::Error> {
     let kind: String = row.try_get("kind")?;
     Ok(Node {
         id: NodeId(row.try_get("id")?),
@@ -179,11 +179,12 @@ impl Db {
     }
 
     /// Whether `node` is `ancestor` or lies anywhere below it. False if `node` does not exist.
+    /// The walk ends even if the data held a cycle.
     pub async fn is_at_or_below(&self, node: NodeId, ancestor: NodeId) -> Result<bool, DbError> {
         let found: bool = sqlx::query_scalar(
             "with recursive up(id, parent_id) as ( \
                  select id, parent_id from nodes where id = $1 \
-                 union all \
+                 union \
                  select n.id, n.parent_id from nodes n join up on n.id = up.parent_id \
              ) select exists (select 1 from up where id = $2)",
         )
