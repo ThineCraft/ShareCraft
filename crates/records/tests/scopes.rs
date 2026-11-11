@@ -773,3 +773,77 @@ async fn cycle_in_the_data_ends_every_walk() {
     assert_eq!(test.db.sites_for(ann.id).await.unwrap().len(), 1);
     assert!(test.db.documents_for(ann.id).await.unwrap().is_empty());
 }
+
+/// A rename of `t.file` to `name` by `actor`, as the server mirrors one after its commit.
+async fn rename_file(
+    db: records::Db,
+    actor: UserId,
+    t_file: NodeId,
+    name: &str,
+) -> Result<(), AccessError> {
+    let node = db.node(t_file).await.unwrap().unwrap();
+    let row = records::NodeRow {
+        id: node.id,
+        kind: node.kind,
+        parent: node.parent,
+        site: node.site,
+        name: name.to_owned(),
+        deleted_at: None,
+        deleted_by: None,
+        created_by: node.created_by,
+        created_at: node.created_at,
+    };
+    db.apply_nodes(records::NodeChange {
+        rows: std::slice::from_ref(&row),
+        actor: Some(actor),
+        needs: &[(t_file, Role::Editor)],
+        ..records::NodeChange::default()
+    })
+    .await
+}
+
+#[tokio::test]
+async fn revoke_above_and_tree_change_take_turns() {
+    let test = TestDb::create().await;
+    let ann = user(&test, "Ann", false).await;
+    let xan = user(&test, "Xan", false).await;
+    let t = tree(&test, ann.id).await;
+    // Xan's only role on the file comes from folder A, two levels above it.
+    test.db
+        .set_node_access(ann.id, t.a, xan.id, Some(Role::Editor))
+        .await
+        .unwrap();
+    assert_eq!(role(&test, xan.id, t.file).await, Some(Role::Editor));
+
+    // The revoke queues first: the rename waits for it, then sees it and is refused.
+    let held = gate(&test, t.a).await;
+    let first = test.db.clone();
+    let removal =
+        tokio::spawn(async move { first.set_node_access(ann.id, t.a, xan.id, None).await });
+    wait_blocked(&test, held.pid, 1).await;
+    let renaming = tokio::spawn(rename_file(test.db.clone(), xan.id, t.file, "Late"));
+    wait_blocked(&test, held.pid, 2).await;
+    held.open().await;
+    assert_eq!(removal.await.unwrap(), Ok((Some(Role::Editor), None)));
+    assert_eq!(renaming.await.unwrap(), Err(AccessError::NotFound));
+    assert_eq!(test.db.node(t.file).await.unwrap().unwrap().name, "Notes");
+
+    // The rename queues first: it is judged before the revoke, which waits for it.
+    test.db
+        .set_node_access(ann.id, t.a, xan.id, Some(Role::Editor))
+        .await
+        .unwrap();
+    let held = gate(&test, t.file).await;
+    let renaming = tokio::spawn(rename_file(test.db.clone(), xan.id, t.file, "Early"));
+    wait_blocked(&test, held.pid, 1).await;
+    let second = test.db.clone();
+    let removal =
+        tokio::spawn(async move { second.set_node_access(ann.id, t.a, xan.id, None).await });
+    // The revoke waits behind the rename, which holds folder A while it waits for the file.
+    wait_blocked(&test, held.pid, 2).await;
+    held.open().await;
+    assert_eq!(renaming.await.unwrap(), Ok(()));
+    assert_eq!(removal.await.unwrap(), Ok((Some(Role::Editor), None)));
+    assert_eq!(test.db.node(t.file).await.unwrap().unwrap().name, "Early");
+    assert_eq!(role(&test, xan.id, t.file).await, None);
+}

@@ -19,7 +19,7 @@ use crate::{AccessError, Db, DbError, Editor, Grant, Node, NodeKind, Role};
 
 /// How many times an access change reads and locks its chain before giving up because the
 /// tree kept moving under it.
-const LOCK_ATTEMPTS: usize = 10;
+pub(crate) const LOCK_ATTEMPTS: usize = 10;
 
 /// The nodes `$1` can reach through their assignments: every node at or above a scope where
 /// they have a row, leaving out scopes with a deleted node at or above them. Starts from the
@@ -709,28 +709,47 @@ impl Db {
     ) -> Result<(Transaction<'static, Postgres>, Vec<Link>), AccessError> {
         for _ in 0..LOCK_ATTEMPTS {
             let mut tx = self.pool().begin().await?;
-            let seen = chain(&mut tx, actor, node)
-                .await?
-                .ok_or(AccessError::NotFound)?;
-            let wanted = segment(&seen, above);
-            for (id, _) in &wanted {
-                let statement = if *id == node {
-                    "select id from nodes where id = $1 for update"
-                } else {
-                    "select id from nodes where id = $1 for share"
-                };
-                sqlx::query(statement).bind(id.0).execute(&mut *tx).await?;
-            }
-            let now = chain(&mut tx, actor, node)
-                .await?
-                .ok_or(AccessError::NotFound)?;
-            if segment(&now, above) == wanted {
+            if let Some(now) = lock_segment(&mut tx, actor, node, above, true).await? {
                 return Ok((tx, now));
             }
             tx.rollback().await?;
         }
         Err(DbError::new("the tree kept changing while access was being changed").into())
     }
+}
+
+/// Locks, on `conn`, the chain from `node`'s source scope down to `node`, top-down: `node`
+/// `FOR UPDATE` when `write` (`FOR SHARE` otherwise), the rest `FOR SHARE`. With `above`, the
+/// source is the nearest scope strictly above `node`. Reads the chain again under the locks
+/// and returns it, as `actor` sees it; `None` if it changed meanwhile, when the caller starts
+/// over in a new transaction. `NotFound` if `node` does not lead up to a site for `actor`.
+/// Everyone locks ancestors before descendants, so these locks cannot deadlock one another.
+pub(crate) async fn lock_segment(
+    conn: &mut PgConnection,
+    actor: UserId,
+    node: NodeId,
+    above: bool,
+    write: bool,
+) -> Result<Option<Vec<Link>>, AccessError> {
+    let seen = chain(conn, actor, node)
+        .await?
+        .ok_or(AccessError::NotFound)?;
+    let wanted = segment(&seen, above);
+    for (id, _) in &wanted {
+        let statement = if *id == node && write {
+            "select id from nodes where id = $1 for update"
+        } else {
+            "select id from nodes where id = $1 for share"
+        };
+        sqlx::query(statement)
+            .bind(id.0)
+            .execute(&mut *conn)
+            .await?;
+    }
+    let now = chain(conn, actor, node)
+        .await?
+        .ok_or(AccessError::NotFound)?;
+    Ok((segment(&now, above) == wanted).then_some(now))
 }
 
 /// The assignments on scope `node`, by name.

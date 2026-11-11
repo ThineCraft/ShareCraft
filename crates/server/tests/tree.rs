@@ -22,6 +22,7 @@ use revisions::{
 use serde_json::Map;
 use server::tree::{self, Adopted, TreeError, TreeOp};
 use server::{AppState, Checkpointer, Config};
+use sqlx::Connection;
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -1222,4 +1223,180 @@ async fn store_without_tree_is_reported() {
         ),
         "{reconciled:?}"
     );
+}
+
+/// Makes the database refuse every event of `kind` (and, with `repairs`, the repairs too),
+/// as a failing database would, after the Git commit is written.
+async fn refuse_events(env: &Env, kind: &str, repairs: bool) {
+    let condition = if repairs {
+        format!("new.kind = '{kind}'")
+    } else {
+        format!("new.kind = '{kind}' and not (new.detail ? 'repaired')")
+    };
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "create function refuse_events() returns trigger language plpgsql as $$ \
+         begin if {condition} then raise exception 'database down'; end if; \
+         return new; end $$; \
+         create trigger refuse_events before insert on events \
+         for each row execute function refuse_events();"
+    )))
+    .execute(env.db().test_pool())
+    .await
+    .unwrap();
+}
+
+async fn accept_events(env: &Env) {
+    sqlx::raw_sql("drop trigger refuse_events on events; drop function refuse_events();")
+        .execute(env.db().test_pool())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn database_failure_after_commit_is_repaired_from_git() {
+    let env = Env::new().await;
+    let admin = env.user("Ada", true).await;
+    let (_, library) = env.site(&admin, "Team").await;
+    let folder = env.folder(&admin, library, "Plans").await;
+    refuse_events(&env, "node.renamed", false).await;
+    let renamed = env
+        .apply(
+            &admin,
+            TreeOp::Rename {
+                id: folder,
+                name: "Budgets".into(),
+            },
+        )
+        .await;
+    assert!(matches!(renamed, Err(AccessError::Db(_))), "{renamed:?}");
+    // Git holds the change, and the repair from Git put it into PostgreSQL.
+    assert_eq!(
+        env.db().node(folder).await.unwrap().unwrap().name,
+        "Budgets"
+    );
+    let repaired = env.events("node.renamed").await;
+    assert_eq!(repaired.len(), 1);
+    assert_eq!(repaired[0].2["repaired"], true);
+    env.assert_agree().await;
+    // The tree is in step: the next change goes through.
+    accept_events(&env).await;
+    env.folder(&admin, library, "Next").await;
+    env.assert_agree().await;
+}
+
+#[tokio::test]
+async fn failed_repair_marks_the_tree_out_of_step_until_reconciled() {
+    let env = Env::new().await;
+    let admin = env.user("Ada", true).await;
+    let (_, library) = env.site(&admin, "Team").await;
+    let folder = env.folder(&admin, library, "Plans").await;
+    refuse_events(&env, "node.renamed", true).await;
+    let renamed = env
+        .apply(
+            &admin,
+            TreeOp::Rename {
+                id: folder,
+                name: "Budgets".into(),
+            },
+        )
+        .await;
+    assert!(matches!(renamed, Err(AccessError::Db(_))), "{renamed:?}");
+    assert_eq!(env.db().node(folder).await.unwrap().unwrap().name, "Plans");
+    let commits = env.commits();
+
+    // Every tree change is refused while the reconcile still fails, and writes nothing.
+    assert_eq!(
+        env.create(&admin, Some(library), NodeKind::Folder, "Other")
+            .await,
+        Err(AccessError::OutOfStep)
+    );
+    assert_eq!(
+        env.file(&admin, library, "Plan.xlsx").await,
+        Err(AccessError::OutOfStep)
+    );
+    assert_eq!(env.commits(), commits);
+
+    // Once the database works, the next change reconciles the whole tree first.
+    accept_events(&env).await;
+    env.folder(&admin, library, "Other").await;
+    assert_eq!(
+        env.db().node(folder).await.unwrap().unwrap().name,
+        "Budgets"
+    );
+    env.assert_agree().await;
+    env.folder(&admin, library, "Third").await;
+}
+
+#[tokio::test]
+async fn refused_after_commit_is_taken_back_in_git() {
+    let env = Env::new().await;
+    let admin = env.user("Ada", true).await;
+    let xan = env.user("Xan", false).await;
+    let (_, library) = env.site(&admin, "Team").await;
+    let folder = env.folder(&admin, library, "Plans").await;
+    env.grant(&admin, folder, &xan, Role::Editor).await;
+    let commits = env.commits();
+
+    // Hold the folder's row, so the change is committed to Git and then waits to be judged.
+    let mut gate = sqlx::PgConnection::connect(&env.test.url()).await.unwrap();
+    let pid: i32 = sqlx::query_scalar("select pg_backend_pid()")
+        .fetch_one(&mut gate)
+        .await
+        .unwrap();
+    sqlx::query("begin").execute(&mut gate).await.unwrap();
+    sqlx::query("select id from nodes where id = $1 for update")
+        .bind(folder.0)
+        .execute(&mut gate)
+        .await
+        .unwrap();
+    let state = env.state.clone();
+    let actor = xan.clone();
+    let renaming = tokio::spawn(async move {
+        tree::apply(
+            &state,
+            &actor,
+            TreeOp::Rename {
+                id: folder,
+                name: "Mine".into(),
+            },
+        )
+        .await
+    });
+    let mut blocked = 0i64;
+    for _ in 0..400 {
+        blocked = sqlx::query_scalar(
+            "select count(*) from pg_stat_activity where $1 = any(pg_blocking_pids(pid))",
+        )
+        .bind(pid)
+        .fetch_one(env.db().test_pool())
+        .await
+        .unwrap();
+        if blocked > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(blocked, 1, "the rename never waited to be judged");
+    assert_eq!(env.commits(), commits + 1);
+    // Meanwhile Xan becomes a viewer.
+    sqlx::query("update scope_access set role = 'viewer' where node_id = $1 and user_id = $2")
+        .bind(folder.0)
+        .bind(xan.id.0)
+        .execute(&mut gate)
+        .await
+        .unwrap();
+    sqlx::query("commit").execute(&mut gate).await.unwrap();
+
+    assert_eq!(renaming.await.unwrap(), Err(AccessError::Forbidden));
+    // A second commit put the previous record back.
+    assert_eq!(env.commits(), commits + 2);
+    assert_eq!(
+        env.store.read_tree_record(folder.0).unwrap().unwrap().name,
+        "Plans"
+    );
+    assert_eq!(env.db().node(folder).await.unwrap().unwrap().name, "Plans");
+    assert!(env.events("node.renamed").await.is_empty());
+    env.assert_agree().await;
+    // Nothing is out of step.
+    env.folder(&admin, library, "Next").await;
 }
