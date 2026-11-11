@@ -15,3 +15,11 @@ unwrap_used = "deny"
 expect_used = "deny"
 panic = "deny"
 indexing_slicing = "deny"
+
+# The editors' compressed copies are made by xtask, which runs unoptimised; the compressors
+# must not be (Brotli on a 150 MB file is minutes slower otherwise).
+[profile.dev.package.brotli]
+opt-level = 3
+
+[profile.dev.package.miniz_oxide]
+opt-level = 3

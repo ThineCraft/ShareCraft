@@ -4,8 +4,9 @@
 //! - `check` loads `.env`, then runs the licence check, formatting, lints, tests, the
 //!   WebAssembly builds, the page script tests (with Node) and the check of installed editors;
 //! - `test` loads `.env`, then runs `cargo test` with the arguments given;
-//! - `editors <list|build|verify>` builds an editor from its fork and installs it into
-//!   `editors/<id>`.
+//! - `editors <list|build|compress|verify>` builds an editor from its fork and installs it into
+//!   `editors/<id>`, with Brotli and gzip copies of its files; `compress` adds the copies to an
+//!   editor already installed.
 
 mod editors;
 

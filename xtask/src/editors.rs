@@ -23,15 +23,37 @@ const MANIFEST: &str = "editor.json";
 const LICENCE_PREFIXES: [&str; 5] = ["licen", "notice", "attribution", "copying", "third-party"];
 /// How to install the build tool.
 const TRUNK_INSTALL: &str = "cargo install trunk --locked";
+/// The extensions of the files that get compressed copies (`.br` and `.gz`).
+const COMPRESSIBLE: [&str; 9] = [
+    "wasm",
+    "js",
+    "mjs",
+    "css",
+    "html",
+    "json",
+    "svg",
+    "txt",
+    "webmanifest",
+];
+/// Files smaller than this are not worth a compressed copy.
+const MIN_COMPRESS_BYTES: u64 = 1024;
+/// Brotli's best quality is very slow on big files; from this size up a lower one is used.
+const BROTLI_BEST_LIMIT: u64 = 20 * 1024 * 1024;
+const BROTLI_BEST: u32 = 11;
+const BROTLI_LARGE: u32 = 9;
 
-/// Runs `cargo xtask editors <list|build|verify>`.
+/// Runs `cargo xtask editors <list|build|compress|verify>`.
 pub fn dispatch(args: &[String]) -> Result<()> {
     let root = workspace_root()?;
     match args {
         [action] if action == "list" => list(&root),
         [action, id] if action == "build" => build(&root, id),
         [action] if action == "verify" => verify_installed(&root),
-        _ => Err("usage: cargo xtask editors <list | build <id> | verify>".to_owned()),
+        [action] if action == "compress" => compress(&root, None),
+        [action, id] if action == "compress" => compress(&root, Some(id)),
+        _ => Err(
+            "usage: cargo xtask editors <list | build <id> | compress [id] | verify>".to_owned(),
+        ),
     }
 }
 
@@ -959,7 +981,176 @@ fn install(root: &Path, id: &str, built: &Path) -> Result<()> {
             old.display()
         );
     }
+    write_compressed_copies(&target)?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// compressed copies
+
+/// Whether `path` is a file that gets compressed copies, by its extension.
+fn is_compressible_name(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| COMPRESSIBLE.contains(&e.to_ascii_lowercase().as_str()))
+}
+
+/// `path` with `suffix` (such as ".br") added to its file name.
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// Every file under `dir`, at any depth, except dot files and dot folders.
+fn files_under(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    let failed = |e: std::io::Error| format!("cannot read {}: {e}", dir.display());
+    for entry in std::fs::read_dir(dir).map_err(failed)? {
+        let entry = entry.map_err(failed)?;
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+        if entry.file_type().map_err(failed)?.is_dir() {
+            files_under(&entry.path(), out)?;
+        } else {
+            out.push(entry.path());
+        }
+    }
+    Ok(())
+}
+
+/// Whether a file of `len` bytes at `path` gets compressed copies.
+fn wants_copies(path: &Path, len: u64) -> bool {
+    is_compressible_name(path) && len >= MIN_COMPRESS_BYTES
+}
+
+/// The Brotli form of `bytes`.
+fn brotli_bytes(bytes: &[u8]) -> Result<Vec<u8>> {
+    use std::io::Write;
+    let quality = if bytes.len() as u64 >= BROTLI_BEST_LIMIT {
+        BROTLI_LARGE
+    } else {
+        BROTLI_BEST
+    };
+    let mut out = Vec::new();
+    {
+        let mut writer = brotli::CompressorWriter::new(&mut out, 64 * 1024, quality, 24);
+        writer
+            .write_all(bytes)
+            .and_then(|()| writer.flush())
+            .map_err(|e| format!("brotli: {e}"))?;
+    }
+    Ok(out)
+}
+
+/// The gzip form of `bytes`, at level 9.
+fn gzip_bytes(bytes: &[u8]) -> Result<Vec<u8>> {
+    use std::io::Write;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+    encoder.write_all(bytes).map_err(|e| format!("gzip: {e}"))?;
+    encoder.finish().map_err(|e| format!("gzip: {e}"))
+}
+
+/// Writes `bytes` to `path` by way of a temporary name, so a copy is never half written.
+fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
+    let temporary = with_suffix(path, ".tmp");
+    std::fs::write(&temporary, bytes)
+        .map_err(|e| format!("cannot write {}: {e}", temporary.display()))?;
+    std::fs::rename(&temporary, path).map_err(|e| {
+        let _ = std::fs::remove_file(&temporary);
+        format!("cannot write {}: {e}", path.display())
+    })
+}
+
+/// Writes `<name>.br` (Brotli) and `<name>.gz` (gzip) beside every compressible file of at least
+/// 1 KiB under `dir`, from the file itself, replacing any copy already there; and removes the
+/// copies whose file is gone (or no longer qualifies). The server hands these to browsers that
+/// accept them.
+fn write_compressed_copies(dir: &Path) -> Result<()> {
+    let mut files = Vec::new();
+    files_under(dir, &mut files)?;
+    for path in &files {
+        let Some(extension) = path.extension().and_then(|e| e.to_str()) else {
+            continue;
+        };
+        if extension != "br" && extension != "gz" {
+            continue;
+        }
+        let source = path.with_extension("");
+        if !is_compressible_name(&source) {
+            continue;
+        }
+        let qualifies =
+            std::fs::metadata(&source).is_ok_and(|m| m.is_file() && wants_copies(&source, m.len()));
+        if !qualifies {
+            std::fs::remove_file(path)
+                .map_err(|e| format!("cannot remove {}: {e}", path.display()))?;
+        }
+    }
+    for path in files.iter().filter(|p| is_compressible_name(p)) {
+        let len = std::fs::metadata(path)
+            .map_err(|e| format!("cannot read {}: {e}", path.display()))?
+            .len();
+        if !wants_copies(path, len) {
+            continue;
+        }
+        let bytes =
+            std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        write_atomically(&with_suffix(path, ".br"), &brotli_bytes(&bytes)?)?;
+        write_atomically(&with_suffix(path, ".gz"), &gzip_bytes(&bytes)?)?;
+    }
+    Ok(())
+}
+
+/// The total bytes of the compressible files under `dir`, of their `.br` copies and of their
+/// `.gz` copies.
+fn compressed_sizes(dir: &Path) -> Result<(u64, u64, u64)> {
+    let mut files = Vec::new();
+    files_under(dir, &mut files)?;
+    let size = |path: &Path| std::fs::metadata(path).map_or(0, |m| m.len());
+    let (mut plain, mut br, mut gz) = (0, 0, 0);
+    for path in files.iter().filter(|p| wants_copies(p, size(p))) {
+        plain += size(path);
+        br += size(&with_suffix(path, ".br"));
+        gz += size(&with_suffix(path, ".gz"));
+    }
+    Ok((plain, br, gz))
+}
+
+/// `cargo xtask editors compress [id]`: adds the compressed copies to one installed editor, or
+/// to all of them, and prints the sizes before and after.
+fn compress(root: &Path, id: Option<&str>) -> Result<()> {
+    let ids: Vec<String> = match id {
+        Some(id) => vec![id.to_owned()],
+        None => read_editors(root)?.into_iter().map(|s| s.id).collect(),
+    };
+    let named = id.is_some();
+    for id in ids {
+        let dir = editors_dir(root).join(&id);
+        if !dir.is_dir() {
+            if named {
+                return Err(format!("{id} is not installed"));
+            }
+            println!("{id}: not installed");
+            continue;
+        }
+        let started = std::time::Instant::now();
+        write_compressed_copies(&dir)?;
+        let (plain, br, gz) = compressed_sizes(&dir)?;
+        println!(
+            "{id}: {} MB plain, {} MB gzip, {} MB brotli ({:.1}s)",
+            megabytes(plain),
+            megabytes(gz),
+            megabytes(br),
+            started.elapsed().as_secs_f64()
+        );
+    }
+    Ok(())
+}
+
+/// Bytes as megabytes, to one decimal place.
+fn megabytes(bytes: u64) -> String {
+    format!("{:.1}", bytes as f64 / 1_048_576.0)
 }
 
 /// Copies the folder `from`, with everything in it except dot files and dot folders (trunk's
@@ -1358,6 +1549,114 @@ checkout = "../GridCraft"
         assert!(editors.join("wordcraft").join("index.html").is_file());
         std::fs::remove_dir_all(&root).unwrap();
         std::fs::remove_dir_all(&built).unwrap();
+    }
+
+    /// A folder with the files the compression tests use.
+    fn compressible_tree(dir: &Path) {
+        let big = |n: usize| "abcdefgh".repeat(n);
+        std::fs::write(dir.join("a.wasm"), big(2000)).unwrap();
+        std::fs::write(dir.join("b.js"), big(300)).unwrap();
+        std::fs::write(dir.join("c.css"), big(200)).unwrap();
+        std::fs::write(dir.join("index.html"), big(150)).unwrap();
+        std::fs::write(dir.join("d.png"), big(2000)).unwrap();
+        std::fs::write(dir.join("e.js"), "x".repeat(100)).unwrap();
+    }
+
+    fn unbrotli(path: &Path) -> Vec<u8> {
+        use std::io::Read;
+        let mut out = Vec::new();
+        brotli::Decompressor::new(std::fs::File::open(path).unwrap(), 4096)
+            .read_to_end(&mut out)
+            .unwrap();
+        out
+    }
+
+    fn ungzip(path: &Path) -> Vec<u8> {
+        use std::io::Read;
+        let mut out = Vec::new();
+        flate2::read::GzDecoder::new(std::fs::File::open(path).unwrap())
+            .read_to_end(&mut out)
+            .unwrap();
+        out
+    }
+
+    fn assert_copies_match(dir: &Path, name: &str) {
+        let plain = std::fs::read(dir.join(name)).unwrap();
+        assert_eq!(
+            unbrotli(&dir.join(format!("{name}.br"))),
+            plain,
+            "{name}.br"
+        );
+        assert_eq!(ungzip(&dir.join(format!("{name}.gz"))), plain, "{name}.gz");
+    }
+
+    #[test]
+    fn install_writes_compressed_copies() {
+        let root = scratch("compress-root");
+        let built = scratch("compress-built");
+        compressible_tree(&built);
+        install(&root, "gridcraft", &built).unwrap();
+        let installed = root.join("editors").join("gridcraft");
+        for name in ["a.wasm", "b.js", "c.css", "index.html"] {
+            assert_copies_match(&installed, name);
+        }
+        for name in ["d.png.br", "d.png.gz", "e.js.br", "e.js.gz"] {
+            assert!(!installed.join(name).exists(), "{name} exists");
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::remove_dir_all(&built).unwrap();
+    }
+
+    #[test]
+    fn compress_adds_copies_to_an_installed_editor() {
+        let root = scratch("compress-add-root");
+        let dir = root.join("editors").join("gridcraft");
+        std::fs::create_dir_all(dir.join("assets")).unwrap();
+        compressible_tree(&dir);
+        std::fs::write(dir.join("assets").join("app.js"), "abcdefgh".repeat(300)).unwrap();
+        assert!(!dir.join("a.wasm.br").exists());
+        compress(&root, Some("gridcraft")).unwrap();
+        assert_copies_match(&dir, "a.wasm");
+        assert_copies_match(&dir.join("assets"), "app.js");
+        assert!(compress(&root, Some("nothing")).is_err());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn compress_replaces_stale_copies() {
+        let dir = scratch("compress-stale");
+        compressible_tree(&dir);
+        std::fs::write(dir.join("a.wasm.br"), "old").unwrap();
+        std::fs::write(dir.join("a.wasm.gz"), "old").unwrap();
+        // Copies whose file is gone, or has become too small.
+        std::fs::write(dir.join("gone.js.br"), "old").unwrap();
+        std::fs::write(dir.join("gone.js.gz"), "old").unwrap();
+        std::fs::write(dir.join("e.js.br"), "old").unwrap();
+        write_compressed_copies(&dir).unwrap();
+        assert_copies_match(&dir, "a.wasm");
+        for name in ["gone.js.br", "gone.js.gz", "e.js.br"] {
+            assert!(!dir.join(name).exists(), "{name} survived");
+        }
+        // Compressing twice gives the same copies, and leaves no temporary files.
+        let first = std::fs::read(dir.join("b.js.br")).unwrap();
+        write_compressed_copies(&dir).unwrap();
+        assert_eq!(std::fs::read(dir.join("b.js.br")).unwrap(), first);
+        assert!(!dir.join("b.js.br.tmp").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn verify_ignores_compressed_copies() {
+        let root = scratch("compress-verify");
+        let dir = root.join("editors").join("gridcraft");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(root.join(EDITORS_TOML), "").unwrap();
+        // No editor in editors.toml is installed here, so only the copies' presence is at stake:
+        // verify must pass with copies beside every file.
+        compressible_tree(&dir);
+        write_compressed_copies(&dir).unwrap();
+        verify_installed(&root).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// Trunk leaves a `.trunk-lock` (and could leave other dot files) in its output; none of
