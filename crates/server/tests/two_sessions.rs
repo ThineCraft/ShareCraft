@@ -1007,6 +1007,7 @@ async fn pages_are_served_without_signing_in_and_hold_no_data() {
         "/index.html",
         "/signin.html",
         "/doc.html",
+        "/file.html",
         "/people.html",
     ] {
         let response = server
