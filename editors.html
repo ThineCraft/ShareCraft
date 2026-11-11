@@ -22,7 +22,7 @@ pre{background:#0f2a2c;color:#e6f2ee;border-radius:6px;padding:14px 16px;margin:
 <p class="eyebrow">ThineCraft / Editor forks</p>
 <h1>The editors ShareCraft opens files in</h1>
 <p class="lede">ShareCraft opens spreadsheets, word documents, PDFs and 3D designs in four editors: GridCraft, WordCraft, PdfCraft and SolidCraft. Each one is a copy (a fork) of another project's open-source editor, changed a little for ShareCraft. This page records where each comes from, what was changed and why, how it is built, what it stores, and what has been checked in a browser.</p>
-<div class="meta"><span>Stage 1 · Third plan</span><span>10 November 2026</span><span>Companion to <a href="BUILDING.html" style="color:inherit">Building and Running</a></span></div>
+<div class="meta"><span>Stage 1 · Third plan</span><span>10 and 11 November 2026</span><span>Companion to <a href="BUILDING.html" style="color:inherit">Building and Running</a></span></div>
 </header>
 <div class="layout">
 <nav aria-label="Document contents"><p>In this document</p>
@@ -32,7 +32,8 @@ pre{background:#0f2a2c;color:#e6f2ee;border-radius:6px;padding:14px 16px;margin:
 <div class="toolbar"><span class="small">Standalone HTML · Print-ready · No external assets</span><button type="button" onclick="window.print()">Print / Save PDF</button></div>
 
 <section id="status"><h2>00 / Where things stand</h2>
-<div class="note"><p><strong>All four editors open from ShareCraft and save back as Git revisions.</strong> On 10 November 2026, GridCraft, WordCraft, PdfCraft and SolidCraft were each built from their fork, opened from ShareCraft in a browser, edited, saved, and reopened from the saved Git revision. Each check covered the main path only; section 08 lists what was not checked, and sections 03 to 07 what does not work yet. This describes the <code>stage-1-editors</code> branch, which still has a final review to pass before it is merged.</p>
+<div class="note"><p><strong>All four editors open from ShareCraft and save back as Git revisions.</strong> On 10 November 2026, GridCraft, WordCraft, PdfCraft and SolidCraft were each built from their fork, opened from ShareCraft in a browser, edited, saved, and reopened from the saved Git revision. Each check covered the main path only; section 08 lists what was not checked, and sections 03 to 07 what does not work yet. Stage 1 was merged into <code>main</code> on 10 November 2026 (commit <code>28479e7</code>).</p>
+<p><strong>Since then, on 11 November 2026, each editor was changed to keep the document ShareCraft opened.</strong> When an editor is hosted by ShareCraft, its own New, Open and Close are refused, so a person cannot swap the document inside the frame and have a later Save store the other one. This is on the <code>stage-1-followups</code> branch of ShareCraft, which is not merged. The new GridCraft, WordCraft and PdfCraft commits are on a local branch named <code>sharecraft-followups</code> in each fork and are not pushed. Sections 02 to 07 give the detail, and section 08 what was not checked.</p>
 <p>The browser checks were done by the project owner's assistant using the browser built into its tools, one browser engine only. Section 08 lists what was not checked. One person edits a file at a time; editing a file together is Stage 2 work.</p></div>
 </section>
 
@@ -53,21 +54,22 @@ pre{background:#0f2a2c;color:#e6f2ee;border-radius:6px;padding:14px 16px;margin:
 <div class="table-wrap"><table><caption>Where each editor comes from</caption>
 <thead><tr><th>Editor</th><th>Upstream and base commit</th><th>Fork, branch and fork commit</th><th>Version</th></tr></thead>
 <tbody>
-<tr><td>GridCraft (spreadsheets)</td><td><a href="https://github.com/storytold/gridcraft">storytold/gridcraft</a><br><span class="hash">e9addf52fe68847e6c1310fcfa5d42b7aa8b9650</span></td><td><a href="https://github.com/ThineCraft/GridCraft">ThineCraft/GridCraft</a>, branch <code>sharecraft</code><br><span class="hash">2bb15166be565e872691a3f2632f2583fef6c5c6</span></td><td>0.16.0</td></tr>
-<tr><td>WordCraft (word documents)</td><td><a href="https://github.com/storytold/wordcraft">storytold/wordcraft</a><br><span class="hash">2922fe566b575794f896077467cf92825ccba7c9</span></td><td><a href="https://github.com/ThineCraft/WordCraft">ThineCraft/WordCraft</a>, branch <code>sharecraft</code><br><span class="hash">338b94b75b31e0366de0dd729bde44c5c569f659</span></td><td>0.15.1</td></tr>
-<tr><td>PdfCraft (PDFs)</td><td><a href="https://github.com/storytold/pdfcraft">storytold/pdfcraft</a><br><span class="hash">a71b5124bc388e6b86ec0ee5ec16d31fa1955117</span></td><td><a href="https://github.com/ThineCraft/PdfCraft">ThineCraft/PdfCraft</a>, branch <code>sharecraft</code><br><span class="hash">b53339e5a5f88ea4c2a9a4a32c2387b54cfd5118</span></td><td>0.18.1</td></tr>
+<tr><td>GridCraft (spreadsheets)</td><td><a href="https://github.com/storytold/gridcraft">storytold/gridcraft</a><br><span class="hash">e9addf52fe68847e6c1310fcfa5d42b7aa8b9650</span></td><td><a href="https://github.com/ThineCraft/GridCraft">ThineCraft/GridCraft</a>, branch <code>sharecraft</code><br><span class="hash">2bb15166be565e872691a3f2632f2583fef6c5c6</span><br>Follow-up, local branch <code>sharecraft-followups</code>, not pushed:<br><span class="hash">d6a0012a547930aedc3552324a97b8bec17f898d</span></td><td>0.16.0</td></tr>
+<tr><td>WordCraft (word documents)</td><td><a href="https://github.com/storytold/wordcraft">storytold/wordcraft</a><br><span class="hash">2922fe566b575794f896077467cf92825ccba7c9</span></td><td><a href="https://github.com/ThineCraft/WordCraft">ThineCraft/WordCraft</a>, branch <code>sharecraft</code><br><span class="hash">338b94b75b31e0366de0dd729bde44c5c569f659</span><br>Follow-up, local branch <code>sharecraft-followups</code>, not pushed:<br><span class="hash">0a89f6d5b4b5cfdb13355d1230a0c79b19b37dda</span></td><td>0.15.1</td></tr>
+<tr><td>PdfCraft (PDFs)</td><td><a href="https://github.com/storytold/pdfcraft">storytold/pdfcraft</a><br><span class="hash">a71b5124bc388e6b86ec0ee5ec16d31fa1955117</span></td><td><a href="https://github.com/ThineCraft/PdfCraft">ThineCraft/PdfCraft</a>, branch <code>sharecraft</code><br><span class="hash">b53339e5a5f88ea4c2a9a4a32c2387b54cfd5118</span><br>Follow-up, local branch <code>sharecraft-followups</code>, not pushed:<br><span class="hash">e69bf487bbb0090b67a4dc638f3b9efb30fdeedd</span></td><td>0.18.1</td></tr>
 <tr><td>SolidCraft (3D designs)</td><td><a href="https://github.com/tangency-labs/solidcraft">tangency-labs/solidcraft</a><br><span class="hash">f232e4a40c9d1d3088c758e393b7db43048eac22</span></td><td><a href="https://github.com/ThineCraft/SolidCraft">ThineCraft/SolidCraft</a>, branch <code>sharecraft</code><br><span class="hash">dd8724aeaa10d50de232d7be44864683fdfc508f</span></td><td>0.40.0-rc.3</td></tr>
 </tbody></table></div>
 <p>In each fork the default branch (<code>main</code>) is left as the upstream had it; ShareCraft's changes are only on <code>sharecraft</code>. All four <code>sharecraft</code> branches were pushed to the forks on 10 November 2026. Nothing was pushed to, or proposed to, any upstream project.</p>
+<p>On 11 November 2026 GridCraft, WordCraft and PdfCraft each gained follow-up commits that lock the editor to the document it was given when ShareCraft hosts it (sections 03 to 05). They are on a local branch named <code>sharecraft-followups</code> in each fork and have not been pushed. <code>editors.toml</code> names that branch for those three forks, and the build tool refuses to build a fork that is not on the branch it names, until the owner approves moving them onto <code>sharecraft</code>. SolidCraft needed no change and is still at its pushed <code>sharecraft</code> commit. The commits in this table are the ones last built and checked.</p>
 <div class="table-wrap"><table><caption>Build, size and stored format</caption>
 <thead><tr><th>Editor</th><th>Build time</th><th>Installed size</th><th>ShareCraft stores</th><th>Opened from ShareCraft</th></tr></thead>
 <tbody>
-<tr><td>GridCraft</td><td>About 10 minutes</td><td>26.3 MB; the WebAssembly file is 26.0 MB, its script 174 KB</td><td><code>.xlsx</code></td><td>Yes, checked 10 November 2026</td></tr>
-<tr><td>WordCraft</td><td>About 40 minutes, most of it the optimiser</td><td>51.0 MB; the WebAssembly file is 50.7 MB</td><td><code>.docx</code></td><td>Yes, checked 10 November 2026</td></tr>
-<tr><td>PdfCraft</td><td>About 16 minutes</td><td>50.4 MB; the WebAssembly file is 46.6 MB, plus a 3.4 MB text-recognition worker. The recognition models are not installed.</td><td><code>.pdf</code></td><td>Yes, checked 10 November 2026</td></tr>
-<tr><td>SolidCraft</td><td>About 50 minutes: 17 compiling, the rest the optimiser, which used up to 5.6 GB of memory</td><td>160.0 MB; the WebAssembly file is 153.1 MB, because the fork's release settings keep debugging information in it</td><td><code>.solidcraft.json</code></td><td>Yes, checked 10 November 2026</td></tr>
+<tr><td>GridCraft</td><td>About 10 minutes</td><td>26.4 MB after the follow-up build (26.3 MB on 10 November)</td><td><code>.xlsx</code></td><td>Yes, checked 10 November 2026, and again with the follow-up build on 11 November</td></tr>
+<tr><td>WordCraft</td><td>About 40 minutes, most of it the optimiser</td><td>51.2 MB after the follow-up build (51.0 MB on 10 November)</td><td><code>.docx</code></td><td>Yes, checked 10 November 2026, and again with the follow-up build on 11 November</td></tr>
+<tr><td>PdfCraft</td><td>About 16 minutes</td><td>50.4 MB; on 10 November the WebAssembly file was 46.6 MB, plus a 3.4 MB text-recognition worker. The recognition models are not installed.</td><td><code>.pdf</code></td><td>Yes, checked 10 November 2026, and again with the follow-up build on 11 November</td></tr>
+<tr><td>SolidCraft</td><td>About 50 minutes: 17 compiling, the rest the optimiser, which used up to 5.6 GB of memory</td><td>160.0 MB; the WebAssembly file is 153.1 MB, all compiled code and data (see section 06)</td><td><code>.solidcraft.json</code></td><td>Yes, checked 10 November 2026, and again on 11 November (the editor was not changed)</td></tr>
 </tbody></table></div>
-<p class="small">Sizes are in millions of bytes, read from the installed folders. <code>du -sh</code> shows 26M, 49M, 49M and 153M for the same folders, because it counts in units of 1,048,576 bytes. ShareCraft sends these files uncompressed. Compressed with gzip, the main WebAssembly files would be 9.5 MB (GridCraft), 18.4 MB (WordCraft), 17.7 MB (PdfCraft) and 48.2 MB (SolidCraft). A browser downloads the editor the first time it opens it; after that it asks the server whether the files changed.</p>
+<p class="small">Sizes are in millions of bytes, read from the installed folders. The <code>du -sh</code> and gzip figures below are from the 10 November builds. <code>du -sh</code> shows 26M, 49M, 49M and 153M for the same folders, because it counts in units of 1,048,576 bytes. ShareCraft sends these files uncompressed. Compressed with gzip, the main WebAssembly files would be 9.5 MB (GridCraft), 18.4 MB (WordCraft), 17.7 MB (PdfCraft) and 48.2 MB (SolidCraft). A browser downloads the editor the first time it opens it; after that it asks the server whether the files changed.</p>
 <p class="small">Each installed editor has a manifest, <code>editor.json</code>, that records its version, its fork and upstream commits and its build date. The build date is written in UTC, so the PdfCraft, WordCraft and SolidCraft builds made on the evening of 10 November 2026 are dated 2026-11-11 there.</p>
 <p>The build command is the same for each editor, run from the ShareCraft repository with the fork cloned beside it: <code>cargo xtask editors build gridcraft</code> (or <code>wordcraft</code>, <code>pdfcraft</code>, <code>solidcraft</code>). <a href="BUILDING.html#editors">BUILDING.html</a> explains what it needs and what it does.</p>
 </section>
@@ -75,14 +77,22 @@ pre{background:#0f2a2c;color:#e6f2ee;border-radius:6px;padding:14px 16px;margin:
 <section id="gridcraft"><h2>03 / GridCraft</h2>
 <div class="cards">
 <article class="module"><span class="tag">Opens and saves from ShareCraft</span><h3>Where it comes from and what was changed</h3>
-<p>Upstream <a href="https://github.com/storytold/gridcraft">storytold/gridcraft</a> by the ArtCraft team, base <span class="hash">e9addf52fe68847e6c1310fcfa5d42b7aa8b9650</span>. Fork <a href="https://github.com/ThineCraft/GridCraft">ThineCraft/GridCraft</a>, branch <code>sharecraft</code>, one commit: <span class="hash">2bb15166be565e872691a3f2632f2583fef6c5c6</span>.</p>
+<p>Upstream <a href="https://github.com/storytold/gridcraft">storytold/gridcraft</a> by the ArtCraft team, base <span class="hash">e9addf52fe68847e6c1310fcfa5d42b7aa8b9650</span>. Fork <a href="https://github.com/ThineCraft/GridCraft">ThineCraft/GridCraft</a>, branch <code>sharecraft</code>, one commit: <span class="hash">2bb15166be565e872691a3f2632f2583fef6c5c6</span>. The follow-up change (below) is on the local branch <code>sharecraft-followups</code>, ending at <span class="hash">d6a0012a547930aedc3552324a97b8bec17f898d</span>, and is not pushed.</p>
 <p>Why there are changes at all: the fork must not present itself as ArtCraft's product or suggest ArtCraft endorses it, but it must still credit where it came from. So the changes remove the upstream brand from what a person sees, and say plainly what the fork is based on.</p>
 <ul>
 <li>The About dialog said "Part of ArtCraft." It now says "Based on GridCraft by the ArtCraft team." Its links to the ArtCraft website and chat server were removed, with the translations used only by those links.</li>
 <li>The ArtCraft logo and mark files and their licence text (<code>docs/brand/</code>) were deleted, with their rows in <code>ATTRIBUTION.md</code> and their references in <code>README.md</code> and <code>AGENTS.md</code>.</li>
 <li><code>NOTICE</code> gained a section "Changes made for ShareCraft" saying this is a modified version maintained by ThineCraft, not the original and not endorsed by the ArtCraft team or Tangency Labs, with one dated line per change.</li>
 </ul>
-<p>Nothing was changed in how GridCraft edits or saves.</p>
+<h4>Locked to its document when hosted (11 November 2026)</h4>
+<p>Why: GridCraft's own File tab offered New, Open and Close, and using them replaced the workbook inside the frame, so a later Save stored that other workbook as this document. Now, when the host bridge is present:</p>
+<ul>
+<li>There is no File tab. New, Open and Close are refused from the menus, from Ctrl+N, Ctrl+O and Ctrl+W, from the keytips and from command search. A short "not available here" note appears.</li>
+<li>Files dropped on the sheet are ignored.</li>
+<li>Save, Save As, Print and Export stay. ShareCraft's own open, which hands the editor the stored file, still works.</li>
+<li>GridCraft opened on its own, without the host bridge, behaves as before.</li>
+</ul>
+<p>Nothing else was changed in how GridCraft edits or saves.</p>
 <h4>Formats</h4>
 <p>According to the fork's README, GridCraft's own format is <code>.xlsx</code>, it also reads and writes CSV and TSV, opens older <code>.xls</code> workbooks with values, formulas and number formats, imports data from <code>.xlsb</code> and <code>.ods</code>, and exports PDF. ShareCraft stores a GridCraft document only as <code>.xlsx</code>. A save from the editor whose name ends in <code>.xlsx</code> becomes a new revision; anything else it saves (CSV, PDF and so on) is treated as an export and becomes a download for the person, leaving the stored file as it was. New spreadsheets can be made from the home page, and <code>.xlsx</code> files can be uploaded.</p>
 <h4>What was checked in the browser, 10 November 2026</h4>
@@ -95,10 +105,17 @@ pre{background:#0f2a2c;color:#e6f2ee;border-radius:6px;padding:14px 16px;margin:
 <li>When the owner removed that second person, within about a second the editor disappeared from their screen, the page said "Your access to this document was removed.", the file's content answered 404, and no name was left on the page.</li>
 <li>With the server stopped, the status read "Connection lost. Saving is paused." and the editor stayed. A Save made then was held. When the server came back, the held save was stored as a further commit (4,100 bytes).</li>
 </ul>
+<h4>What was checked in the browser, 11 November 2026</h4>
+<p>With the follow-up build, opening <code>Budget.xlsx</code> from ShareCraft (signed in as an owner, in the browser built into the assistant's tools):</p>
+<ul>
+<li>There was no File tab. The title bar's "More commands" menu listed Save As, Sort, Calculate and Print, and no New or Open.</li>
+<li>Ctrl+N, Ctrl+W and Ctrl+O were each refused with "not available here", and the workbook was unchanged. Pressing Alt then F opened nothing (the F was typed into the cell).</li>
+<li>Editing cell D6 to "Lock check" and pressing Save gave "Saved", and after a reload the cell showed it.</li>
+</ul>
 <h4>What does not work, or works differently</h4>
 <ul>
 <li>The frame's Save button does nothing while the browser tab is hidden (section 07).</li>
-<li>GridCraft's own File tab still offers New, Open and Close. Using them replaces the workbook inside the frame, and a later Save stores that other workbook as this document (section 07).</li>
+<li>The File menu finding of 10 November 2026 is fixed when hosted (section 07). Not tried in a browser: dropping a file on the sheet, which the browser tools cannot do.</li>
 <li>Not checked: see section 08.</li>
 </ul>
 </article>
@@ -108,12 +125,21 @@ pre{background:#0f2a2c;color:#e6f2ee;border-radius:6px;padding:14px 16px;margin:
 <section id="wordcraft"><h2>04 / WordCraft</h2>
 <div class="cards">
 <article class="module"><span class="tag">Opens and saves from ShareCraft</span><h3>Where it comes from and what was changed</h3>
-<p>Upstream <a href="https://github.com/storytold/wordcraft">storytold/wordcraft</a> by the ArtCraft team, base <span class="hash">2922fe566b575794f896077467cf92825ccba7c9</span>. Fork <a href="https://github.com/ThineCraft/WordCraft">ThineCraft/WordCraft</a>, branch <code>sharecraft</code>, two commits, ending at <span class="hash">338b94b75b31e0366de0dd729bde44c5c569f659</span>.</p>
+<p>Upstream <a href="https://github.com/storytold/wordcraft">storytold/wordcraft</a> by the ArtCraft team, base <span class="hash">2922fe566b575794f896077467cf92825ccba7c9</span>. Fork <a href="https://github.com/ThineCraft/WordCraft">ThineCraft/WordCraft</a>, branch <code>sharecraft</code>, two commits, ending at <span class="hash">338b94b75b31e0366de0dd729bde44c5c569f659</span>. The follow-up change (below) is on the local branch <code>sharecraft-followups</code>, ending at <span class="hash">0a89f6d5b4b5cfdb13355d1230a0c79b19b37dda</span>, and is not pushed.</p>
 <ul>
 <li>The About dialog now ends "Based on WordCraft by the ArtCraft team." Its links to the ArtCraft site and chat server were removed. The link to the upstream source code and the copyright line were kept, as credit.</li>
 <li>The ArtCraft brand files (<code>docs/brand/</code>) were deleted, with their rows in <code>ATTRIBUTION.md</code>. In <code>README.md</code> the logo and mark images were removed, and the trademark paragraph was replaced by a note that this is a modified version maintained by ThineCraft that includes no ArtCraft marks.</li>
 <li>A "Join the ArtCraft community on Discord" button, shown by default in the title bar, the File (backstage) menu and the Review ribbon, was removed with its command, its keyboard tip and its Options checkbox. Why: people using ShareCraft would see it and be sent to the upstream's chat as if it were this product's. The setting behind the checkbox is kept but does nothing, so settings saved by an earlier version still load.</li>
 <li><code>NOTICE</code>: the trademark paragraph now says this version includes no ArtCraft marks, and a "Changes made for ShareCraft" section lists each change with its date.</li>
+</ul>
+<h4>Blank start and locked to its document when hosted (11 November 2026)</h4>
+<p>Why: a new, empty document showed WordCraft's start screen, and its File tab offered New, Open and Close, which could swap the document inside the frame. Now, when the host bridge is present:</p>
+<ul>
+<li>WordCraft starts on a blank page, with no start screen. This is the fork's own behaviour; ShareCraft no longer sends <code>file.new</code> or presses Escape for it.</li>
+<li>The File tab keeps Info, Save, Save As, Print, Export and Options. It hides Home, New, Open, Close, Recover and the recent-documents list.</li>
+<li>New, Open and Close are refused from shortcuts, the toolbar and command search. Mail merges that would open a new document are refused. Documents dropped on the page or picked in a file dialog are refused. Pictures, fonts and recipient lists still work.</li>
+<li>The stored file always replaces the blank page when ShareCraft opens it, even if someone typed on the blank page first. That typing is lost.</li>
+<li>WordCraft opened on its own, without the host bridge, behaves as before.</li>
 </ul>
 <h4>Formats</h4>
 <p>According to the fork's README, WordCraft's own format is <code>.docx</code>; it also opens and saves <code>.odt</code>, <code>.rtf</code>, <code>.html</code>, <code>.md</code>, <code>.tex</code> and <code>.txt</code>, opens older <code>.doc</code> files and exports PDF. ShareCraft stores a WordCraft document only as <code>.docx</code>; any other save from the editor becomes a download. New documents can be made from the home page, and <code>.docx</code> files can be uploaded.</p>
@@ -124,13 +150,20 @@ pre{background:#0f2a2c;color:#e6f2ee;border-radius:6px;padding:14px 16px;margin:
 <li>After a reload the document reopened with its text intact, and its "last modified by" property was the signed-in person's name, which the frame passes to the editor.</li>
 <li>The community button no longer appears in the title bar.</li>
 </ul>
+<h4>What was checked in the browser, 11 November 2026</h4>
+<p>With the follow-up build, opening a new <code>Lock test.docx</code> from ShareCraft:</p>
+<ul>
+<li>It opened on a blank page with no start screen. The File tab showed only Info, Save, Save As, Print, Export and Options.</li>
+<li>Ctrl+N, Ctrl+W and Ctrl+O changed nothing. Typed text saved ("Saved"), and after a reload one document reopened under its stored name with the text.</li>
+<li>A small finding: the first typing right after the three refused shortcuts did not land. One click on the page restored input. This was not investigated.</li>
+</ul>
 <h4>What does not work, or works differently</h4>
 <ul>
-<li><strong>A new, empty document showed WordCraft's start screen</strong> (New, Open and templates) instead of a blank page. The plan expected this. Since 10 November 2026, when a document has no stored content, the frame asks WordCraft for a new blank document (its <code>file.new</code> command). That alone was not enough: the blank document was made underneath, but the start screen stayed in front, and WordCraft has no command that closes it. So the frame then presses Escape on the editor's drawing surface, which closes it (checked in the browser by sending that key by hand). This is a stopgap until the fork starts with a blank document when it is hosted by ShareCraft. If the key does not reach the editor, the person simply sees the start screen. The whole path, from a new document to its first save, still needs a browser check.</li>
-<li><strong>The start screen lists recent documents by name.</strong> WordCraft keeps a "Recent" list in the browser's own storage, and since every editor is served from ShareCraft's address, that list holds the names of other documents opened in WordCraft in the same browser, whoever opened them. Only names are kept there, not content, and with the start screen closed at once it is seen only briefly or by choosing Open.</li>
+<li><strong>A new, empty document showed WordCraft's start screen</strong> (New, Open and templates) instead of a blank page. <strong>Fixed 11 November 2026:</strong> hosted, WordCraft starts on a blank page (see above). On 10 November the frame had worked around it by asking for a new document and pressing Escape; that stopgap was removed, and ShareCraft sends neither. Not tried in a browser: a host open after typing on the blank page (covered by an automated test only).</li>
+<li><strong>The start screen lists recent documents by name.</strong> WordCraft keeps a "Recent" list in the browser's own storage, and since every editor is served from ShareCraft's address, that list holds the names of other documents opened in WordCraft in the same browser, whoever opened them. Only names are kept there, not content. <strong>This no longer applies while hosted:</strong> the start screen and the File tab's recent list are not shown. WordCraft opened on its own still keeps and shows the list.</li>
 <li><strong>The web build has no font for Chinese, Japanese or Korean text.</strong> Japanese text was stored correctly but drawn as empty boxes, and the editor reported "1 font not installed". The upstream's optional extra font set was not built in.</li>
 <li>The frame's Save button does nothing while the tab is hidden (section 07).</li>
-<li>WordCraft's File tab offers New and Open as GridCraft's does (its start screen shows them). Using them would most likely replace the document in the frame the same way, so that a later Save stores the other document; this was seen in GridCraft and not checked in WordCraft.</li>
+<li>The File tab's New, Open and Close finding of 10 November 2026 is fixed when hosted (section 07). Not tried in a browser: the mail merge buttons, Insert Picture with a <code>.docx</code> chosen in the picker, and dropping a file on the page.</li>
 <li>Not checked: see section 08.</li>
 </ul>
 </article>
@@ -140,13 +173,21 @@ pre{background:#0f2a2c;color:#e6f2ee;border-radius:6px;padding:14px 16px;margin:
 <section id="pdfcraft"><h2>05 / PdfCraft</h2>
 <div class="cards">
 <article class="module"><span class="tag">Opens and saves from ShareCraft</span><h3>Where it comes from and what was changed</h3>
-<p>Upstream <a href="https://github.com/storytold/pdfcraft">storytold/pdfcraft</a> by the ArtCraft team, base <span class="hash">a71b5124bc388e6b86ec0ee5ec16d31fa1955117</span>. Fork <a href="https://github.com/ThineCraft/PdfCraft">ThineCraft/PdfCraft</a>, branch <code>sharecraft</code>, one commit: <span class="hash">b53339e5a5f88ea4c2a9a4a32c2387b54cfd5118</span>.</p>
+<p>Upstream <a href="https://github.com/storytold/pdfcraft">storytold/pdfcraft</a> by the ArtCraft team, base <span class="hash">a71b5124bc388e6b86ec0ee5ec16d31fa1955117</span>. Fork <a href="https://github.com/ThineCraft/PdfCraft">ThineCraft/PdfCraft</a>, branch <code>sharecraft</code>, one commit: <span class="hash">b53339e5a5f88ea4c2a9a4a32c2387b54cfd5118</span>. The follow-up change (below) is on the local branch <code>sharecraft-followups</code>, ending at <span class="hash">e69bf487bbb0090b67a4dc638f3b9efb30fdeedd</span>, and is not pushed.</p>
 <p>PdfCraft drew the ArtCraft wordmark and mark from image files compiled into the program, on its home screen and in About, and promoted the ArtCraft community in several places. The changes:</p>
 <ul>
 <li>The wordmark and mark were removed from About and the home screen; About now says "Based on PdfCraft by the ArtCraft team." The home screen's community card, the title bar's Discord button and the Discord and website links in the Help menu, the command list and the command-line tool were removed. The Help menu keeps a link to the upstream source code, as credit.</li>
 <li>The brand files (<code>docs/brand/</code>) and the licence that covered only them were deleted, with their entries in <code>ATTRIBUTION.toml</code>, <code>ATTRIBUTION.md</code> and <code>LICENSES.toml</code> and their images in <code>README.md</code>.</li>
 <li>The upstream's tests for the removed buttons and links were replaced by tests that they are gone.</li>
 <li><code>NOTICE</code>: the paragraph about the marks now says this version does not include them, and a "Changes made for ShareCraft" section says it is a modified version, not made or endorsed by the ArtCraft team or Tangency Labs, and lists each change with its date.</li>
+</ul>
+<h4>Locked to its document when hosted (11 November 2026)</h4>
+<p>Why: PdfCraft opens extra documents in extra tabs, and its Save stores the tab in front, so a second tab's bytes could be stored as this document. Now, when the host bridge is present, PdfCraft has one tab:</p>
+<ul>
+<li>Open, New blank PDF, Open Recent, Create, Close file and Close all are greyed out or refused: in the menus, from shortcuts, in the command palette, on the tab strip, in the recent list on the home screen, and for dropped files.</li>
+<li>Some views may still open as extra tabs: attachments, portfolios, revisions, signed versions, comment summaries and Combine results. They can be closed.</li>
+<li>Save always stores the document ShareCraft opened, whichever tab is in front. On such an extra tab, Save and Save As store the original document and show no message. Export is the way to keep the view as a file.</li>
+<li>PdfCraft opened on its own, without the host bridge, behaves as before.</li>
 </ul>
 <h4>Formats</h4>
 <p>PdfCraft opens and saves PDF. ShareCraft stores a PdfCraft document only as <code>.pdf</code>. The home page cannot make a new, empty PDF (an empty PDF is not a file); a PDF has to be uploaded.</p>
@@ -155,9 +196,17 @@ pre{background:#0f2a2c;color:#e6f2ee;border-radius:6px;padding:14px 16px;margin:
 <li>Uploading a PDF made a new document. Uploading a file named <code>evil.html</code> was refused.</li>
 <li>The PDF was drawn by the editor inside the frame. Duplicating a page (through the editor's page interface) changed the status to "Unsaved changes"; Save changed it to "Saved" and stored a new revision, a PDF with two pages.</li>
 </ul>
+<h4>What was checked in the browser, 11 November 2026</h4>
+<p>With the follow-up build, opening <code>Test page.pdf</code> from ShareCraft:</p>
+<ul>
+<li>There was one tab and no Open button. The File menu greyed New blank PDF, Open, Open Recent, Create, Close file and Close all. Save, Save as, Export, Print and Combine files stayed.</li>
+<li>Ctrl+W, Ctrl+O and Ctrl+N changed nothing.</li>
+<li>Rotating a page (through the editor's page interface) showed "Unsaved changes"; the frame's Save gave "Saved", and after a reload the page was rotated.</li>
+</ul>
 <h4>What does not work, or works differently</h4>
 <ul>
 <li>Text recognition (OCR) cannot work: its worker is built and installed, but the recognition models are not installed.</li>
+<li>The File menu finding of 10 November 2026 is fixed when hosted (section 07). Extra tabs for derived views are still possible (above). Not tried in a browser: a Combine result tab and saving from it, and closing a derived tab. If the close prompt of a changed derived tab is answered with Save, nothing happens and the tab stays changed, with no message.</li>
 <li>The frame's Save button does nothing while the tab is hidden (section 07).</li>
 <li>Not checked: see section 08.</li>
 </ul>
@@ -183,7 +232,7 @@ pre{background:#0f2a2c;color:#e6f2ee;border-radius:6px;padding:14px 16px;margin:
 <h4>Formats</h4>
 <p>According to the fork's README, SolidCraft reads and writes STEP, IGES, 3MF, STL, OBJ and glTF where supported, and has its own <code>.sc</code> design files. ShareCraft stores a SolidCraft document as the design's JSON text, in a file named <code>.solidcraft.json</code>, because that is what the editor's page interface hands over. A stored file that is not UTF-8 text is reported as an error and not sent to the editor. New designs can be made from the home page, and <code>.solidcraft.json</code> files can be uploaded. Binary <code>.sc</code> files cannot be stored.</p>
 <h4>Build</h4>
-<p>Version 0.40.0-rc.3. The build took about 50 minutes: 17 minutes compiling and the rest in the optimiser, which used up to 5.6 GB of memory. The installed editor is 160.0 MB, almost all of it one 153.1 MB WebAssembly file. It is this large because the fork's release settings keep debugging information in the file; building without it, or having the optimiser strip it, would make it far smaller, and is a candidate change in the fork. On the local machine it loaded in under 20 seconds. It was built from the clean temporary copy described in section 11, so the owner's local override of SolidCraft's geometry kernel was not used.</p>
+<p>Version 0.40.0-rc.3. The build took about 50 minutes: 17 minutes compiling and the rest in the optimiser, which used up to 5.6 GB of memory. The installed editor is 160.0 MB, almost all of it one 153.1 MB WebAssembly file: about 122.9 MB of compiled code and 30.0 MB of data. <strong>Correction, 11 November 2026:</strong> this page first said the file was large because the release build kept debugging information in it. That was wrong. A rebuild on 11 November 2026 with release debug information turned off gave the same 153.1 MB file, and the file holds no debug information at all. Making it smaller would need size-oriented compiler settings (for example optimising for size, whole-program optimisation or one code-generation unit) or finding which libraries take the space. That has not been done, and the build tool was not changed for this. On the local machine it loaded in under 20 seconds. It was built from the clean temporary copy described in section 11, so the owner's local override of SolidCraft's geometry kernel was not used.</p>
 <h4>What was checked in the browser, 10 November 2026</h4>
 <ul>
 <li>A new <code>Bracket.solidcraft.json</code> opened the editor in the frame (at <code>?embed=editor</code>, with no name in the address), with no policy violations, and no service worker was registered.</li>
@@ -191,6 +240,8 @@ pre{background:#0f2a2c;color:#e6f2ee;border-radius:6px;padding:14px 16px;margin:
 <li>The frame's Save changed it to "Saved" and stored a new Git revision holding the design as JSON text (694 bytes). The editor then reported itself saved, so the confirmation step worked.</li>
 <li>After a reload the design was imported again: the box was drawn, it was listed in the editor's browser tree, and the editor's document name was "Bracket".</li>
 </ul>
+<h4>What was checked in the browser again, 11 November 2026</h4>
+<p>SolidCraft was not changed. It already ignores New, Open and Close and clears dropped files under <code>?embed=editor</code>. It was opened again from the rebuilt ShareCraft: <code>Bracket.solidcraft.json</code> loaded, and Ctrl+N, Ctrl+W and Ctrl+O left the design and the status unchanged. Dropping a file was not tried.</p>
 <h4>What does not work, or was not checked</h4>
 <ul>
 <li>Not checked: a confirmation refused because the design changed during a save; the "did not answer" banner after 15 seconds; what happens while the tab is hidden; downloading the stored file and importing it again by hand; large designs; how long the 153 MB file takes to load from a cold cache over a real network. See also section 08.</li>
@@ -200,11 +251,12 @@ pre{background:#0f2a2c;color:#e6f2ee;border-radius:6px;padding:14px 16px;margin:
 </section>
 
 <section id="found"><h2>07 / Found in the browser checks</h2>
-<p>These were found on 10 November 2026 and apply to more than one editor.</p>
+<p>These were found on 10 and 11 November 2026 and apply to more than one editor.</p>
 <ul>
 <li><strong>The editor answers the frame's Save button only while its tab is being shown.</strong> The editors do their work as they draw the screen, and a browser does not draw a hidden tab. So pressing Save in another way while the tab is hidden (for example from a script or an extension) does nothing until the tab is shown again; the upstream code says this in its own timeout message. Saving with the editor's own Ctrl+S is not affected, because the person is then looking at it. For SolidCraft the page is written to wait 15 seconds and then say the editor did not answer; that was not checked in a browser.</li>
 <li><strong>Built files contain the builder's local folder paths.</strong> The WebAssembly files hold paths such as <code>C:\Users\&lt;name&gt;\.cargo\…</code> inside log messages. Builds are made on the machine that runs ShareCraft and are not published, so this stays local today. Before any build is published, it must be rebuilt with path remapping (Rust's <code>--remap-path-prefix</code>), so that it does not carry a user name or folder layout.</li>
-<li><strong>The editors' own File menus still offer New, Open and Close.</strong> Seen in GridCraft: using them replaces the document inside the frame, and a later Save stores that other document as this one, as a new revision. The plan chose to leave the editors' menus as they are; this needs the owner's decision (hide them, or turn them off in each fork). GridCraft already has an address option that hides its File tab.</li>
+<li><strong>The editors' own File menus offered New, Open and Close. Fixed 11 November 2026.</strong> Seen in GridCraft on 10 November: using them replaced the document inside the frame, and a later Save stored that other document as this one, as a new revision. The owner chose to turn them off in each fork, and the follow-up builds do (sections 03 to 05; SolidCraft already did). When hosted, New, Open and Close are refused, including from shortcuts, keytips and search, and dropped files are ignored or refused. Save, Save As, Print and Export stay. What stays reachable: PdfCraft may still open some views (attachments, portfolios, revisions, signed versions, comment summaries, Combine results) as extra tabs, but Save always stores the document ShareCraft opened. The forks' changes are on local branches that are not pushed. Checked in a browser for all four editors; dropping files was not (section 08).</li>
+<li><strong>WordCraft: the first typing after the refused shortcuts did not land.</strong> Found on 11 November 2026: after Ctrl+N, Ctrl+W and Ctrl+O were refused, the first typing did not appear until the page was clicked once. Not investigated.</li>
 <li><strong>Narrow windows.</strong> At about 680 pixels wide the frame bar wraps and the Share button moves to a second row. It still works.</li>
 <li><strong>An empty lock file was installed with each editor.</strong> The build tool used by the editors (Trunk) leaves an empty <code>.trunk-lock</code> file in its output. Since 10 November 2026 the install step leaves out files whose names start with a dot, so the next build of each editor no longer has it. The four editors installed before then still do; it is harmless and is served only to signed-in people.</li>
 <li><strong>The editors are trusted code.</strong> Each editor is served from ShareCraft's own address, so that its bridge to the frame page works. A page from the same address can do anything the signed-in person can do on ShareCraft: read their documents, save, share. So the forks' code must be trusted as much as ShareCraft's own. The editors' security policy (BUILDING.html, section 17) stops a script that someone manages to inject from running, but it does not confine the editor itself. The real fix is to serve the editors from a separate address; that needs a change in each fork, and is left for later.</li>
@@ -213,13 +265,13 @@ pre{background:#0f2a2c;color:#e6f2ee;border-radius:6px;padding:14px 16px;margin:
 
 <section id="unchecked"><h2>08 / Not checked yet</h2>
 <p>These have not been tried in a browser. Some have automated tests (named in <a href="BUILDING.html">BUILDING.html</a> where relevant); none of that replaces a check with the real editors.</p>
-<div class="table-wrap"><table><caption>Not checked with the real editors, 10 November 2026</caption>
+<div class="table-wrap"><table><caption>Not checked with the real editors, 10 and 11 November 2026</caption>
 <thead><tr><th>Editor</th><th>Not checked</th></tr></thead>
 <tbody>
-<tr><td>All</td><td>The banners for a refused save: someone else saved first (409), the file is too large (413), the server is busy or failed (503). "Download my copy" and "Try again". A seat becoming free and a reload taking it. The page at 375 pixels wide. Moving through the frame bar with the keyboard. A screen reader. Browsers other than the one built into the assistant's tools (no Firefox or Safari). Copy and paste through the clipboard. Whether the editor draws with WebGPU or WebGL. Saving with the editor's own Ctrl+S. Printing from any editor: WordCraft and PdfCraft print through a PDF shown in a hidden frame, which has not been tried in any browser.</td></tr>
-<tr><td>GridCraft</td><td>Uploading a real <code>.xlsx</code> with formulas and a second sheet. Exporting PDF.</td></tr>
-<tr><td>WordCraft</td><td>Uploading a real <code>.docx</code> with a heading and a table. Exporting PDF. A second person opening the document. Removing someone while it is open (this uses the same page code as GridCraft, where it was checked).</td></tr>
-<tr><td>PdfCraft</td><td>Comments or highlights. Whether the saved file opens in another PDF reader. Whether the text-recognition worker loads under the editor's security policy, and what it says without its models. A second person and removal.</td></tr>
+<tr><td>All</td><td>The banners for a refused save: someone else saved first (409), the file is too large (413), the server is busy or failed (503). "Download my copy" and "Try again". A seat becoming free and a reload taking it. The page at 375 pixels wide. Moving through the frame bar with the keyboard. A screen reader. Browsers other than the one built into the assistant's tools (no Firefox or Safari). Copy and paste through the clipboard. Whether the editor draws with WebGPU or WebGL. Saving with the editor's own Ctrl+S. Printing from any editor: WordCraft and PdfCraft print through a PDF shown in a hidden frame, which has not been tried in any browser. Dropping files on any editor's canvas while hosted: the browser tools cannot drop files, so the drop locks were not tried.</td></tr>
+<tr><td>GridCraft</td><td>Uploading a real <code>.xlsx</code> with formulas and a second sheet. Exporting PDF. Dropping a file on the sheet while hosted.</td></tr>
+<tr><td>WordCraft</td><td>Uploading a real <code>.docx</code> with a heading and a table. Exporting PDF. A second person opening the document. Removing someone while it is open (this uses the same page code as GridCraft, where it was checked). The mail merge buttons while hosted. Insert Picture with a <code>.docx</code> chosen in the picker. A host open after someone typed on the blank page. Dropping a file on the page.</td></tr>
+<tr><td>PdfCraft</td><td>Comments or highlights. Whether the saved file opens in another PDF reader. Whether the text-recognition worker loads under the editor's security policy, and what it says without its models. A second person and removal. A Combine result tab and saving from it, and closing a derived tab, while hosted.</td></tr>
 <tr><td>SolidCraft</td><td>A refused confirmation (the design changed during a save). The "did not answer" banner. Behaviour while the tab is hidden. Downloading the stored file and importing it again by hand. Large designs. Loading the 153 MB file from a cold cache over a real network. A second person and removal.</td></tr>
 </tbody></table></div>
 </section>
@@ -288,7 +340,7 @@ pre{background:#0f2a2c;color:#e6f2ee;border-radius:6px;padding:14px 16px;margin:
 <p>The build tool copies each fork's licence, notice and attribution files into the installed editor's <code>licenses/</code> folder, and refuses to install a build without a licence and a notice file.</p>
 </section>
 
-<footer>ShareCraft · ThineCraft · Editors and their forks · Updated 10 November 2026<br>Written from the execution ledger of the third Stage 1 plan, the fork reports and the code. All four editors were built and checked on 10 November 2026; the branch has still to pass its final review.</footer>
+<footer>ShareCraft · ThineCraft · Editors and their forks · Updated 11 November 2026<br>Written from the execution ledgers of the third Stage 1 plan and the follow-up plan, the fork reports and the code. All four editors were built and checked on 10 November 2026 and again on 11 November 2026. Stage 1 is merged; the follow-up work is not.</footer>
 </main></div>
 </body>
 </html>
