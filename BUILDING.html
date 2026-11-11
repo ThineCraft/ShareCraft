@@ -294,7 +294,6 @@ git --git-dir=data/libraries/00000000-0000-0000-0000-000000000001.git show main:
 git clone --branch sharecraft https://github.com/ThineCraft/WordCraft WordCraft
 git clone --branch sharecraft https://github.com/ThineCraft/PdfCraft PdfCraft
 git clone --branch sharecraft https://github.com/ThineCraft/SolidCraft SolidCraft</code></pre>
-<p>The follow-up commits for GridCraft, WordCraft and PdfCraft (11 November 2026) are on a local branch named <code>sharecraft-followups</code> in each fork and are not pushed. Until the owner approves moving them onto <code>sharecraft</code>, <code>editors.toml</code> names <code>sharecraft-followups</code> for those three, and the build tool refuses a fork that is not on the branch it names. A fresh clone of <code>sharecraft</code> from GitHub therefore has the 10 November code, not the hosted lock (editors.html, section 02).</p>
 <p>To update a fork from its original project later, also add that project as a remote named <code>upstream</code> (for example <code>git -C GridCraft remote add upstream https://github.com/storytold/gridcraft</code>); <a href="editors.html#update">editors.html</a> gives the steps.</p>
 <h3>The build tool</h3>
 <p><code>editors.toml</code> in the repository root records, for each editor, its original project and base commit, its fork, branch and folder, and the fork commit last built and checked. From the ShareCraft repository root:</p>
@@ -316,6 +315,8 @@ cargo xtask editors verify             # every installed editor matches editors.
 <p><strong>Where the compiled pieces go.</strong> Cargo's intermediate files go to one folder per editor under <code>SHARECRAFT_EDITOR_TARGET_DIR</code>, or under <code>sharecraft-editor-target</code> in the system's temporary folder when it is not set. Keeping them makes a rebuild faster.</p>
 <p><strong><code>verify</code></strong> checks each installed editor against <code>editors.toml</code>: the fork commit it was built from must be the recorded <code>commit</code>, its upstream commit the recorded <code>base</code>, and the fingerprints in its manifest must match its <code>index.html</code>. <code>cargo xtask check</code> runs it too, for installed editors only, so a machine with no editors built still passes.</p>
 <p><strong>Restart the server after <code>cargo xtask editors build</code>.</strong> The server reads the installed editors once, when it starts, so until it is restarted it keeps serving the build it found then; the build tool's last line says so. A folder whose manifest is missing or wrong is skipped with one warning line, and the server still starts.</p>
+<h3>Known problem: restarting after a killed build</h3>
+<p>If a build is killed (for example by a reboot), the temporary copy it made can be left behind. The next <code>build</code> may then refuse to start, with the "Cargo config above" message, when the leftover copy holds the fork's own Cargo settings file (WordCraft commits one; the check trips before the leftover is cleared). Clear it by hand with <code>git worktree remove</code> (give it the leftover folder, with <code>--force</code> if Git asks), run from the fork's folder, then build again.</p>
 <p class="small">Built editors contain the builder's local folder paths, and must be rebuilt with path remapping before they are published; see <a href="editors.html#found">editors.html</a>.</p>
 </section>
 
@@ -461,7 +462,7 @@ base-uri 'none'; form-action 'none'</code></pre>
 <p>The four editors are licensed MIT or Apache 2.0, by their original authors. They are not part of ShareCraft's code and are not compiled into the server. The build tool copies each fork's licence, notice and attribution files into the installed editor's <code>licenses/</code> folder; what each fork changed is listed in its <code>NOTICE</code> and in <a href="editors.html">editors.html</a>.</p>
 </section>
 
-<footer>ShareCraft · ThineCraft · Building and running · Updated 11 November 2026<br>Describes the development build after the third Stage 1 plan (editors, one person at a time; merged into <code>main</code> on 10 November 2026) and the follow-up on the <code>stage-1-followups</code> branch (editors keep their document when hosted; not yet merged). Not a release.</footer>
+<footer>ShareCraft · ThineCraft · Building and running · Updated 11 November 2026<br>Describes the development build after the third Stage 1 plan (editors, one person at a time; merged into <code>main</code> on 10 November 2026) and the follow-up (editors keep their document when hosted). Not a release.</footer>
 </main></div>
 </body>
 </html>

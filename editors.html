@@ -33,7 +33,7 @@ pre{background:#0f2a2c;color:#e6f2ee;border-radius:6px;padding:14px 16px;margin:
 
 <section id="status"><h2>00 / Where things stand</h2>
 <div class="note"><p><strong>All four editors open from ShareCraft and save back as Git revisions.</strong> On 10 November 2026, GridCraft, WordCraft, PdfCraft and SolidCraft were each built from their fork, opened from ShareCraft in a browser, edited, saved, and reopened from the saved Git revision. Each check covered the main path only; section 08 lists what was not checked, and sections 03 to 07 what does not work yet. Stage 1 was merged into <code>main</code> on 10 November 2026 (commit <code>28479e7</code>).</p>
-<p><strong>Since then, on 11 November 2026, each editor was changed to keep the document ShareCraft opened.</strong> When an editor is hosted by ShareCraft, its own New, Open and Close are refused, so a person cannot swap the document inside the frame and have a later Save store the other one. This is on the <code>stage-1-followups</code> branch of ShareCraft, which is not merged. The new GridCraft, WordCraft and PdfCraft commits are on a local branch named <code>sharecraft-followups</code> in each fork and are not pushed. Sections 02 to 07 give the detail, and section 08 what was not checked.</p>
+<p><strong>Since then, on 11 November 2026, each editor was changed to keep the document ShareCraft opened.</strong> When an editor is hosted by ShareCraft, its own New, Open and Close are refused, so a person cannot swap the document inside the frame and have a later Save store the other one. The new GridCraft, WordCraft and PdfCraft commits were pushed to the <code>sharecraft</code> branch of each fork on 11 November 2026. Sections 02 to 07 give the detail, and section 08 what was not checked.</p>
 <p>The browser checks were done by the project owner's assistant using the browser built into its tools, one browser engine only. Section 08 lists what was not checked. One person edits a file at a time; editing a file together is Stage 2 work.</p></div>
 </section>
 
@@ -54,13 +54,13 @@ pre{background:#0f2a2c;color:#e6f2ee;border-radius:6px;padding:14px 16px;margin:
 <div class="table-wrap"><table><caption>Where each editor comes from</caption>
 <thead><tr><th>Editor</th><th>Upstream and base commit</th><th>Fork, branch and fork commit</th><th>Version</th></tr></thead>
 <tbody>
-<tr><td>GridCraft (spreadsheets)</td><td><a href="https://github.com/storytold/gridcraft">storytold/gridcraft</a><br><span class="hash">e9addf52fe68847e6c1310fcfa5d42b7aa8b9650</span></td><td><a href="https://github.com/ThineCraft/GridCraft">ThineCraft/GridCraft</a>, branch <code>sharecraft</code><br><span class="hash">2bb15166be565e872691a3f2632f2583fef6c5c6</span><br>Follow-up, local branch <code>sharecraft-followups</code>, not pushed:<br><span class="hash">d6a0012a547930aedc3552324a97b8bec17f898d</span></td><td>0.16.0</td></tr>
-<tr><td>WordCraft (word documents)</td><td><a href="https://github.com/storytold/wordcraft">storytold/wordcraft</a><br><span class="hash">2922fe566b575794f896077467cf92825ccba7c9</span></td><td><a href="https://github.com/ThineCraft/WordCraft">ThineCraft/WordCraft</a>, branch <code>sharecraft</code><br><span class="hash">338b94b75b31e0366de0dd729bde44c5c569f659</span><br>Follow-up, local branch <code>sharecraft-followups</code>, not pushed:<br><span class="hash">0a89f6d5b4b5cfdb13355d1230a0c79b19b37dda</span></td><td>0.15.1</td></tr>
-<tr><td>PdfCraft (PDFs)</td><td><a href="https://github.com/storytold/pdfcraft">storytold/pdfcraft</a><br><span class="hash">a71b5124bc388e6b86ec0ee5ec16d31fa1955117</span></td><td><a href="https://github.com/ThineCraft/PdfCraft">ThineCraft/PdfCraft</a>, branch <code>sharecraft</code><br><span class="hash">b53339e5a5f88ea4c2a9a4a32c2387b54cfd5118</span><br>Follow-up, local branch <code>sharecraft-followups</code>, not pushed:<br><span class="hash">e69bf487bbb0090b67a4dc638f3b9efb30fdeedd</span></td><td>0.18.1</td></tr>
+<tr><td>GridCraft (spreadsheets)</td><td><a href="https://github.com/storytold/gridcraft">storytold/gridcraft</a><br><span class="hash">e9addf52fe68847e6c1310fcfa5d42b7aa8b9650</span></td><td><a href="https://github.com/ThineCraft/GridCraft">ThineCraft/GridCraft</a>, branch <code>sharecraft</code><br><span class="hash">017d0b9d5d167096bcba7d7216569476f80b9046</span></td><td>0.16.0</td></tr>
+<tr><td>WordCraft (word documents)</td><td><a href="https://github.com/storytold/wordcraft">storytold/wordcraft</a><br><span class="hash">2922fe566b575794f896077467cf92825ccba7c9</span></td><td><a href="https://github.com/ThineCraft/WordCraft">ThineCraft/WordCraft</a>, branch <code>sharecraft</code><br><span class="hash">35551cebbaa854a9cfd9bf7da66a49505ec39ad2</span></td><td>0.15.1</td></tr>
+<tr><td>PdfCraft (PDFs)</td><td><a href="https://github.com/storytold/pdfcraft">storytold/pdfcraft</a><br><span class="hash">a71b5124bc388e6b86ec0ee5ec16d31fa1955117</span></td><td><a href="https://github.com/ThineCraft/PdfCraft">ThineCraft/PdfCraft</a>, branch <code>sharecraft</code><br><span class="hash">343edd8045970651a37bafaf78ac7a747cfdda2a</span></td><td>0.18.1</td></tr>
 <tr><td>SolidCraft (3D designs)</td><td><a href="https://github.com/tangency-labs/solidcraft">tangency-labs/solidcraft</a><br><span class="hash">f232e4a40c9d1d3088c758e393b7db43048eac22</span></td><td><a href="https://github.com/ThineCraft/SolidCraft">ThineCraft/SolidCraft</a>, branch <code>sharecraft</code><br><span class="hash">dd8724aeaa10d50de232d7be44864683fdfc508f</span></td><td>0.40.0-rc.3</td></tr>
 </tbody></table></div>
-<p>In each fork the default branch (<code>main</code>) is left as the upstream had it; ShareCraft's changes are only on <code>sharecraft</code>. All four <code>sharecraft</code> branches were pushed to the forks on 10 November 2026. Nothing was pushed to, or proposed to, any upstream project.</p>
-<p>On 11 November 2026 GridCraft, WordCraft and PdfCraft each gained follow-up commits that lock the editor to the document it was given when ShareCraft hosts it (sections 03 to 05). They are on a local branch named <code>sharecraft-followups</code> in each fork and have not been pushed. <code>editors.toml</code> names that branch for those three forks, and the build tool refuses to build a fork that is not on the branch it names, until the owner approves moving them onto <code>sharecraft</code>. SolidCraft needed no change and is still at its pushed <code>sharecraft</code> commit. The commits in this table are the ones last built and checked.</p>
+<p>In each fork the default branch (<code>main</code>) is left as the upstream had it; ShareCraft's changes are only on <code>sharecraft</code>. All four <code>sharecraft</code> branches were first pushed to the forks on 10 November 2026; on 11 November 2026 the GridCraft, WordCraft and PdfCraft branches were moved forward and pushed again. Nothing was pushed to, or proposed to, any upstream project.</p>
+<p>On 11 November 2026 GridCraft, WordCraft and PdfCraft each gained commits that lock the editor to the document it was given when ShareCraft hosts it (sections 03 to 05). SolidCraft needed no change and is still at its <code>sharecraft</code> commit of 10 November. The commits in this table are the ones the installed editors are built from; <code>editors.toml</code> records them.</p>
 <div class="table-wrap"><table><caption>Build, size and stored format</caption>
 <thead><tr><th>Editor</th><th>Build time</th><th>Installed size</th><th>ShareCraft stores</th><th>Opened from ShareCraft</th></tr></thead>
 <tbody>
@@ -77,7 +77,7 @@ pre{background:#0f2a2c;color:#e6f2ee;border-radius:6px;padding:14px 16px;margin:
 <section id="gridcraft"><h2>03 / GridCraft</h2>
 <div class="cards">
 <article class="module"><span class="tag">Opens and saves from ShareCraft</span><h3>Where it comes from and what was changed</h3>
-<p>Upstream <a href="https://github.com/storytold/gridcraft">storytold/gridcraft</a> by the ArtCraft team, base <span class="hash">e9addf52fe68847e6c1310fcfa5d42b7aa8b9650</span>. Fork <a href="https://github.com/ThineCraft/GridCraft">ThineCraft/GridCraft</a>, branch <code>sharecraft</code>, one commit: <span class="hash">2bb15166be565e872691a3f2632f2583fef6c5c6</span>. The follow-up change (below) is on the local branch <code>sharecraft-followups</code>, ending at <span class="hash">d6a0012a547930aedc3552324a97b8bec17f898d</span>, and is not pushed.</p>
+<p>Upstream <a href="https://github.com/storytold/gridcraft">storytold/gridcraft</a> by the ArtCraft team, base <span class="hash">e9addf52fe68847e6c1310fcfa5d42b7aa8b9650</span>. Fork <a href="https://github.com/ThineCraft/GridCraft">ThineCraft/GridCraft</a>, branch <code>sharecraft</code>, ending at <span class="hash">017d0b9d5d167096bcba7d7216569476f80b9046</span>. The hosted lock (below) was added on 11 November 2026.</p>
 <p>Why there are changes at all: the fork must not present itself as ArtCraft's product or suggest ArtCraft endorses it, but it must still credit where it came from. So the changes remove the upstream brand from what a person sees, and say plainly what the fork is based on.</p>
 <ul>
 <li>The About dialog said "Part of ArtCraft." It now says "Based on GridCraft by the ArtCraft team." Its links to the ArtCraft website and chat server were removed, with the translations used only by those links.</li>
@@ -88,7 +88,9 @@ pre{background:#0f2a2c;color:#e6f2ee;border-radius:6px;padding:14px 16px;margin:
 <p>Why: GridCraft's own File tab offered New, Open and Close, and using them replaced the workbook inside the frame, so a later Save stored that other workbook as this document. Now, when the host bridge is present:</p>
 <ul>
 <li>There is no File tab. New, Open and Close are refused from the menus, from Ctrl+N, Ctrl+O and Ctrl+W, from the keytips and from command search. A short "not available here" note appears.</li>
-<li>Files dropped on the sheet are ignored.</li>
+<li>Files dropped on the sheet are ignored, and a workbook picked in a file dialog is refused.</li>
+<li>Data &#9656; Get Data is refused with the same note (the button is still drawn). The start dialog shows no Open&hellip;; its Blank workbook and template buttons are refused with the "not available here" note.</li>
+<li>ShareCraft's file always ends as the one workbook shown, even if the blank workbook was edited first, and also after a password prompt for a protected file. Anything typed on the blank is lost.</li>
 <li>Save, Save As, Print and Export stay. ShareCraft's own open, which hands the editor the stored file, still works.</li>
 <li>GridCraft opened on its own, without the host bridge, behaves as before.</li>
 </ul>
@@ -112,10 +114,16 @@ pre{background:#0f2a2c;color:#e6f2ee;border-radius:6px;padding:14px 16px;margin:
 <li>Ctrl+N, Ctrl+W and Ctrl+O were each refused with "not available here", and the workbook was unchanged. Pressing Alt then F opened nothing (the F was typed into the cell).</li>
 <li>Editing cell D6 to "Lock check" and pressing Save gave "Saved", and after a reload the cell showed it.</li>
 </ul>
+<p>After the final fix on 11 November 2026, with the build made just before the commits were pushed (the files in the pushed commits are the same):</p>
+<ul>
+<li>The start dialog had no Open&hellip;. Its Blank workbook and template buttons were refused with "not available here", and one workbook remained.</li>
+<li>Data &#9656; Get Data was refused with the same note, and no file picker appeared. Opening the open dialog through the editor's page interface returned no dialog, and file.open and file.new through its command interface were refused.</li>
+</ul>
 <h4>What does not work, or works differently</h4>
 <ul>
 <li>The frame's Save button does nothing while the browser tab is hidden (section 07).</li>
 <li>The File menu finding of 10 November 2026 is fixed when hosted (section 07). Not tried in a browser: dropping a file on the sheet, which the browser tools cannot do.</li>
+<li><strong>Cancelling the password prompt, then saving, stores an empty file.</strong> If the stored file is password protected and the person cancels the prompt, the blank workbook stays, and Save stores it as a new revision of the document. The earlier revision stays in Git history. Known, not fixed.</li>
 <li>Not checked: see section 08.</li>
 </ul>
 </article>
@@ -125,7 +133,7 @@ pre{background:#0f2a2c;color:#e6f2ee;border-radius:6px;padding:14px 16px;margin:
 <section id="wordcraft"><h2>04 / WordCraft</h2>
 <div class="cards">
 <article class="module"><span class="tag">Opens and saves from ShareCraft</span><h3>Where it comes from and what was changed</h3>
-<p>Upstream <a href="https://github.com/storytold/wordcraft">storytold/wordcraft</a> by the ArtCraft team, base <span class="hash">2922fe566b575794f896077467cf92825ccba7c9</span>. Fork <a href="https://github.com/ThineCraft/WordCraft">ThineCraft/WordCraft</a>, branch <code>sharecraft</code>, two commits, ending at <span class="hash">338b94b75b31e0366de0dd729bde44c5c569f659</span>. The follow-up change (below) is on the local branch <code>sharecraft-followups</code>, ending at <span class="hash">0a89f6d5b4b5cfdb13355d1230a0c79b19b37dda</span>, and is not pushed.</p>
+<p>Upstream <a href="https://github.com/storytold/wordcraft">storytold/wordcraft</a> by the ArtCraft team, base <span class="hash">2922fe566b575794f896077467cf92825ccba7c9</span>. Fork <a href="https://github.com/ThineCraft/WordCraft">ThineCraft/WordCraft</a>, branch <code>sharecraft</code>, ending at <span class="hash">35551cebbaa854a9cfd9bf7da66a49505ec39ad2</span>. The blank start and hosted lock (below) were added on 11 November 2026.</p>
 <ul>
 <li>The About dialog now ends "Based on WordCraft by the ArtCraft team." Its links to the ArtCraft site and chat server were removed. The link to the upstream source code and the copyright line were kept, as credit.</li>
 <li>The ArtCraft brand files (<code>docs/brand/</code>) were deleted, with their rows in <code>ATTRIBUTION.md</code>. In <code>README.md</code> the logo and mark images were removed, and the trademark paragraph was replaced by a note that this is a modified version maintained by ThineCraft that includes no ArtCraft marks.</li>
@@ -138,7 +146,7 @@ pre{background:#0f2a2c;color:#e6f2ee;border-radius:6px;padding:14px 16px;margin:
 <li>WordCraft starts on a blank page, with no start screen. This is the fork's own behaviour; ShareCraft no longer sends <code>file.new</code> or presses Escape for it.</li>
 <li>The File tab keeps Info, Save, Save As, Print, Export and Options. It hides Home, New, Open, Close, Recover and the recent-documents list.</li>
 <li>New, Open and Close are refused from shortcuts, the toolbar and command search. Mail merges that would open a new document are refused. Documents dropped on the page or picked in a file dialog are refused. Pictures, fonts and recipient lists still work.</li>
-<li>The stored file always replaces the blank page when ShareCraft opens it, even if someone typed on the blank page first. That typing is lost.</li>
+<li>The stored file always replaces the blank page when ShareCraft opens it, even if someone typed on the blank page first, and also after a password prompt for a protected file. That typing is lost.</li>
 <li>WordCraft opened on its own, without the host bridge, behaves as before.</li>
 </ul>
 <h4>Formats</h4>
@@ -157,6 +165,11 @@ pre{background:#0f2a2c;color:#e6f2ee;border-radius:6px;padding:14px 16px;margin:
 <li>Ctrl+N, Ctrl+W and Ctrl+O changed nothing. Typed text saved ("Saved"), and after a reload one document reopened under its stored name with the text.</li>
 <li>A small finding: the first typing right after the three refused shortcuts did not land. One click on the page restored input. This was not investigated.</li>
 </ul>
+<p>After the final fix on 11 November 2026 (build made just before the commits were pushed; the files are the same):</p>
+<ul>
+<li>A stored <code>Lock test.docx</code> opened as one document with its stored text.</li>
+<li>A new <code>Blank two.docx</code>, never saved, opened as one blank document (Document1), with no start screen and no dialog.</li>
+</ul>
 <h4>What does not work, or works differently</h4>
 <ul>
 <li><strong>A new, empty document showed WordCraft's start screen</strong> (New, Open and templates) instead of a blank page. <strong>Fixed 11 November 2026:</strong> hosted, WordCraft starts on a blank page (see above). On 10 November the frame had worked around it by asking for a new document and pressing Escape; that stopgap was removed, and ShareCraft sends neither. Not tried in a browser: a host open after typing on the blank page (covered by an automated test only).</li>
@@ -164,6 +177,7 @@ pre{background:#0f2a2c;color:#e6f2ee;border-radius:6px;padding:14px 16px;margin:
 <li><strong>The web build has no font for Chinese, Japanese or Korean text.</strong> Japanese text was stored correctly but drawn as empty boxes, and the editor reported "1 font not installed". The upstream's optional extra font set was not built in.</li>
 <li>The frame's Save button does nothing while the tab is hidden (section 07).</li>
 <li>The File tab's New, Open and Close finding of 10 November 2026 is fixed when hosted (section 07). Not tried in a browser: the mail merge buttons, Insert Picture with a <code>.docx</code> chosen in the picker, and dropping a file on the page.</li>
+<li><strong>Cancelling the password prompt, then saving, stores an empty file.</strong> Found in GridCraft and likely the same here (not tried): if the stored file is password protected and the person cancels the prompt, the blank document stays, and Save stores it as a new revision. The earlier revision stays in Git history. Known, not fixed.</li>
 <li>Not checked: see section 08.</li>
 </ul>
 </article>
@@ -173,7 +187,7 @@ pre{background:#0f2a2c;color:#e6f2ee;border-radius:6px;padding:14px 16px;margin:
 <section id="pdfcraft"><h2>05 / PdfCraft</h2>
 <div class="cards">
 <article class="module"><span class="tag">Opens and saves from ShareCraft</span><h3>Where it comes from and what was changed</h3>
-<p>Upstream <a href="https://github.com/storytold/pdfcraft">storytold/pdfcraft</a> by the ArtCraft team, base <span class="hash">a71b5124bc388e6b86ec0ee5ec16d31fa1955117</span>. Fork <a href="https://github.com/ThineCraft/PdfCraft">ThineCraft/PdfCraft</a>, branch <code>sharecraft</code>, one commit: <span class="hash">b53339e5a5f88ea4c2a9a4a32c2387b54cfd5118</span>. The follow-up change (below) is on the local branch <code>sharecraft-followups</code>, ending at <span class="hash">e69bf487bbb0090b67a4dc638f3b9efb30fdeedd</span>, and is not pushed.</p>
+<p>Upstream <a href="https://github.com/storytold/pdfcraft">storytold/pdfcraft</a> by the ArtCraft team, base <span class="hash">a71b5124bc388e6b86ec0ee5ec16d31fa1955117</span>. Fork <a href="https://github.com/ThineCraft/PdfCraft">ThineCraft/PdfCraft</a>, branch <code>sharecraft</code>, ending at <span class="hash">343edd8045970651a37bafaf78ac7a747cfdda2a</span>. The hosted lock (below) was added on 11 November 2026.</p>
 <p>PdfCraft drew the ArtCraft wordmark and mark from image files compiled into the program, on its home screen and in About, and promoted the ArtCraft community in several places. The changes:</p>
 <ul>
 <li>The wordmark and mark were removed from About and the home screen; About now says "Based on PdfCraft by the ArtCraft team." The home screen's community card, the title bar's Discord button and the Discord and website links in the Help menu, the command list and the command-line tool were removed. The Help menu keeps a link to the upstream source code, as credit.</li>
@@ -255,7 +269,7 @@ pre{background:#0f2a2c;color:#e6f2ee;border-radius:6px;padding:14px 16px;margin:
 <ul>
 <li><strong>The editor answers the frame's Save button only while its tab is being shown.</strong> The editors do their work as they draw the screen, and a browser does not draw a hidden tab. So pressing Save in another way while the tab is hidden (for example from a script or an extension) does nothing until the tab is shown again; the upstream code says this in its own timeout message. Saving with the editor's own Ctrl+S is not affected, because the person is then looking at it. For SolidCraft the page is written to wait 15 seconds and then say the editor did not answer; that was not checked in a browser.</li>
 <li><strong>Built files contain the builder's local folder paths.</strong> The WebAssembly files hold paths such as <code>C:\Users\&lt;name&gt;\.cargo\…</code> inside log messages. Builds are made on the machine that runs ShareCraft and are not published, so this stays local today. Before any build is published, it must be rebuilt with path remapping (Rust's <code>--remap-path-prefix</code>), so that it does not carry a user name or folder layout.</li>
-<li><strong>The editors' own File menus offered New, Open and Close. Fixed 11 November 2026.</strong> Seen in GridCraft on 10 November: using them replaced the document inside the frame, and a later Save stored that other document as this one, as a new revision. The owner chose to turn them off in each fork, and the follow-up builds do (sections 03 to 05; SolidCraft already did). When hosted, New, Open and Close are refused, including from shortcuts, keytips and search, and dropped files are ignored or refused. Save, Save As, Print and Export stay. What stays reachable: PdfCraft may still open some views (attachments, portfolios, revisions, signed versions, comment summaries, Combine results) as extra tabs, but Save always stores the document ShareCraft opened. The forks' changes are on local branches that are not pushed. Checked in a browser for all four editors; dropping files was not (section 08).</li>
+<li><strong>The editors' own File menus offered New, Open and Close. Fixed 11 November 2026.</strong> Seen in GridCraft on 10 November: using them replaced the document inside the frame, and a later Save stored that other document as this one, as a new revision. The owner chose to turn them off in each fork, and the follow-up builds do (sections 03 to 05; SolidCraft already did). When hosted, New, Open and Close are refused, including from shortcuts, keytips and search, and dropped or picked files are ignored or refused (in GridCraft also Data &#9656; Get Data and the start dialog's buttons). Save, Save As, Print and Export stay. What stays reachable: PdfCraft may still open some views (attachments, portfolios, revisions, signed versions, comment summaries, Combine results) as extra tabs, but Save always stores the document ShareCraft opened. The forks' changes are on each fork's <code>sharecraft</code> branch, pushed on 11 November 2026. Checked in a browser for all four editors; dropping files was not (section 08).</li>
 <li><strong>WordCraft: the first typing after the refused shortcuts did not land.</strong> Found on 11 November 2026: after Ctrl+N, Ctrl+W and Ctrl+O were refused, the first typing did not appear until the page was clicked once. Not investigated.</li>
 <li><strong>Narrow windows.</strong> At about 680 pixels wide the frame bar wraps and the Share button moves to a second row. It still works.</li>
 <li><strong>An empty lock file was installed with each editor.</strong> The build tool used by the editors (Trunk) leaves an empty <code>.trunk-lock</code> file in its output. Since 10 November 2026 the install step leaves out files whose names start with a dot, so the next build of each editor no longer has it. The four editors installed before then still do; it is harmless and is served only to signed-in people.</li>
@@ -274,6 +288,7 @@ pre{background:#0f2a2c;color:#e6f2ee;border-radius:6px;padding:14px 16px;margin:
 <tr><td>PdfCraft</td><td>Comments or highlights. Whether the saved file opens in another PDF reader. Whether the text-recognition worker loads under the editor's security policy, and what it says without its models. A second person and removal. A Combine result tab and saving from it, and closing a derived tab, while hosted.</td></tr>
 <tr><td>SolidCraft</td><td>A refused confirmation (the design changed during a save). The "did not answer" banner. Behaviour while the tab is hidden. Downloading the stored file and importing it again by hand. Large designs. Loading the 153 MB file from a cold cache over a real network. A second person and removal.</td></tr>
 </tbody></table></div>
+<div class="note"><p><strong>Known, not fixed.</strong> If a person cancels the password prompt for a password-protected stored file and then saves, an empty file is stored as a new revision of the document (the earlier revision stays in Git history). Found in GridCraft; WordCraft and PdfCraft are likely the same and were not tried.</p></div>
 </section>
 
 <section id="brand">
@@ -340,7 +355,7 @@ pre{background:#0f2a2c;color:#e6f2ee;border-radius:6px;padding:14px 16px;margin:
 <p>The build tool copies each fork's licence, notice and attribution files into the installed editor's <code>licenses/</code> folder, and refuses to install a build without a licence and a notice file.</p>
 </section>
 
-<footer>ShareCraft · ThineCraft · Editors and their forks · Updated 11 November 2026<br>Written from the execution ledgers of the third Stage 1 plan and the follow-up plan, the fork reports and the code. All four editors were built and checked on 10 November 2026 and again on 11 November 2026. Stage 1 is merged; the follow-up work is not.</footer>
+<footer>ShareCraft · ThineCraft · Editors and their forks · Updated 11 November 2026<br>Written from the execution ledgers of the third Stage 1 plan and the follow-up plan, the fork reports and the code. All four editors were built and checked on 10 November 2026 and again on 11 November 2026. The forks' commits were pushed on 11 November 2026.</footer>
 </main></div>
 </body>
 </html>
