@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ShareCraft — Content Tree and Inherited Permissions: Implementation Plan</title>
+<style>
+:root{color-scheme:light dark;--ink:light-dark(#172f38,#e4ecef);--muted:light-dark(#536b72,#a9b9bf);--line:light-dark(#d7e2e3,#36454b);--paper:light-dark(#fff,#1d272b);--wash:light-dark(#f2f6f5,#141b1e);--accent:light-dark(#3156c9,#9db4ff);font:15px/1.6 Segoe UI,system-ui,sans-serif;color:var(--ink);background:var(--wash)}
+*{box-sizing:border-box}body{margin:0;padding:28px 18px 80px}main{max-width:940px;margin:auto}
+h1{font-size:1.9rem;letter-spacing:-.03em;line-height:1.2;margin:0 0 14px}h2{font-size:1.3rem;margin:38px 0 12px;padding-top:18px;border-top:1px solid var(--line)}h3{font-size:1.08rem;margin:30px 0 8px}h4{font-size:.95rem;margin:16px 0 6px}
+p{margin:0 0 12px}ul,ol{margin:0 0 12px;padding-left:22px}li{margin-bottom:6px}a{color:var(--accent)}
+code{font-family:Consolas,Menlo,monospace;font-size:.88em;background:light-dark(#e9efee,#263238);padding:1px 5px;border-radius:3px;overflow-wrap:anywhere}
+pre{background:var(--paper);border:1px solid var(--line);border-radius:7px;padding:12px 14px;overflow-x:auto;font:13px/1.5 Consolas,Menlo,monospace;margin:0 0 12px}pre code{background:none;padding:0;font-size:inherit}
+.note{border-left:4px solid var(--accent);background:var(--paper);padding:12px 16px;margin:0 0 14px}.note p:last-child{margin:0}
+.task{background:var(--paper);border:1px solid var(--line);border-radius:9px;padding:6px 20px 14px;margin:18px 0}
+ol.steps{list-style:none;padding-left:0}ol.steps>li{padding-left:28px;position:relative;margin-bottom:10px}ol.steps>li::before{content:"☐";position:absolute;left:2px;color:var(--muted)}
+table{border-collapse:collapse;width:100%;font-size:.9rem;background:var(--paper);margin-bottom:14px}th,td{border:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top}th{background:light-dark(#e8efed,#263238)}
+.small{font-size:.88rem;color:var(--muted)}
+tbody tr:nth-child(even) td{background:light-dark(#f4f8f7,#212b30)}
+ol.steps>li:nth-child(even),ul.band>li:nth-child(even),ol.band>li:nth-child(even){background:light-dark(#f4f8f7,#212b30);border-radius:4px}
+</style>
+</head>
+<body><main>
+<h1>Content tree and inherited permissions: implementation plan</h1>
+<p class="small">ShareCraft &middot; Stage 2, platform plan 1 of 4 &middot; Written 11 November 2026</p>
+<div class="note"><p><strong>For agentic workers:</strong> REQUIRED SUB-SKILL: use superpowers:subagent-driven-development or superpowers:executing-plans. Steps are checkboxes.</p></div>
+
+<p><strong>Goal:</strong> ShareCraft's flat list of documents becomes a tree of sites, libraries, folders and files. Permissions are given at any level and inherited downwards; inheritance can be broken and restored at any level, whatever the size of the library. One access check serves every route, including downloads, the editors and live sessions. People can create folders, create and upload files into them, rename, move and delete, and find their way with site navigation and breadcrumbs. Existing documents move into a default site without losing anyone's access.</p>
+<p><strong>Architecture:</strong> every site, library, folder and file is a <em>node</em> with a lasting identifier (a file's node identifier is its existing document identifier). The tree is recorded in Git as one small JSON file per node, <code>tree/&lt;id&gt;.json</code>, and mirrored into a PostgreSQL <code>nodes</code> table; Git is the authority and the table is rebuilt from it on start. Permissions are kept only in PostgreSQL: a node either inherits or is a <em>scope</em> with its own assignments; a person's role on a node is the assignment on the nearest scope at or above it, found by walking up the parent chain. Breaking inheritance copies the parent's assignments onto the node; restoring deletes them. Neither touches the node's descendants, so neither depends on how many files are below.</p>
+<p><strong>Tech stack:</strong> the existing workspace: axum server, sqlx and PostgreSQL (<code>records</code>), gix (<code>revisions</code>), plain HTML and JavaScript pages in <code>web/</code>. No new dependencies.</p>
+<p><strong>Spec:</strong> <a href="../scope.html">scope.html</a> SC-01, SC-02, SC-11, decisions D10, D18 and D19; <a href="../sequencing.html">sequencing.html</a> Stage 2 and spine rules S1&ndash;S7. Owner decisions of 11 November 2026: Stage 2 begins with the platform track, in four plans (this one; groups, roles, sharing links, access requests, the inheritance explorer and the 100,000-file test; the rest of libraries and sites; branding), with single sign-on and guests after an identity provider is chosen; the tree is recorded in Git and mirrored into PostgreSQL, permissions are recorded in PostgreSQL only, with every change in the event log.</p>
+
+<h2>Not in this plan</h2>
+<ul class="band">
+<li>Groups, configurable roles, sharing links, access requests, the inheritance explorer, background processing and the 100,000-file test (plan 2). Roles stay viewer, editor and owner.</li>
+<li>Copy, recycle bin and restore, resumable uploads, previews, templates, document sets, metadata panels, quotas, site types, site templates, hubs, site archive and deletion, library deletion (plan 3). Delete here only marks a node deleted in Git and PostgreSQL; plan 3 lists and restores them.</li>
+<li>Branding (plan 4). Single sign-on and guests (after the identity provider decision). Search.</li>
+</ul>
+
+<h2>Global constraints</h2>
+<ul class="band">
+<li><strong>Lasting identity (S1).</strong> A node's identifier never changes. A file's node identifier is its <code>DocId</code>. Rename and move never change an identifier, never break a link, and never end a live session.</li>
+<li><strong>Git for the tree, PostgreSQL for access</strong> (owner decision, 11 November 2026). Every tree change (create, rename, move, delete) is one Git commit on <code>main</code> credited to the person who made it, then mirrored into PostgreSQL. Permission changes are written only to PostgreSQL, each with an event.</li>
+<li><strong>Checkpoints are unaffected (S4).</strong> A tree commit never moves a document's ref <code>refs/sharecraft/docs/&lt;id&gt;</code>, so a live session's next checkpoint is never refused because the file was renamed or moved.</li>
+<li><strong>No size limit on inheritance (D10).</strong> Breaking and restoring inheritance cost the same for an empty folder and for a library of 100,000 files: they read and write only the node's own assignments. Nothing is done per descendant.</li>
+<li><strong>One access decision.</strong> <code>Db::effective_role</code> is the only code that decides a role. Disabled or unknown accounts get nothing; an enabled administrator is owner of everything (today's rule); a node with a deleted ancestor-or-self is not found.</li>
+<li><strong>Revocation is immediate (S5).</strong> Any change that lowers someone's role on an open file (an assignment, break, restore, move or delete anywhere above it) reaches that file's live session before the request answers.</li>
+<li><strong>Every change is an event (S7):</strong> <code>node.created</code>, <code>node.renamed</code>, <code>node.moved</code>, <code>node.deleted</code>, <code>inheritance.broken</code>, <code>inheritance.restored</code>, <code>access.granted</code>, <code>access.changed</code>, <code>access.revoked</code>, <code>tree.adopted</code>.</li>
+<li><strong>Names:</strong> 1 to 120 characters after trimming; no control characters and none of <code>" * : &lt; &gt; ? / \ |</code>; no trailing dot. Unique among a node's undeleted siblings, ignoring case. A file's name keeps its editor's extension (existing rule).</li>
+<li><strong>One installation is one organization (D18):</strong> no organization table; sites are the top level.</li>
+<li>Never print <code>.env</code>, database addresses or passwords. Documents are HTML with colour banding on tables and long lists.</li>
+</ul>
+
+<h2>Who may do what</h2>
+<table>
+<thead><tr><th>Action</th><th>Needs</th></tr></thead>
+<tbody>
+<tr><td>Create a site</td><td>Administrator. The creator becomes the site's owner; the site gets a library named <em>Documents</em>.</td></tr>
+<tr><td>Create a library</td><td>Owner of the site.</td></tr>
+<tr><td>Create a folder or file, upload</td><td>Editor of the library or folder it goes into.</td></tr>
+<tr><td>Rename</td><td>Editor of the folder or file; owner of a library or site.</td></tr>
+<tr><td>Move a folder or file</td><td>Editor of it and of the destination, which must be a library or folder (in any site) and not the node itself or below it.</td></tr>
+<tr><td>Delete</td><td>Editor of a file, or of a folder with no undeleted children. Libraries and sites are not deleted in this plan.</td></tr>
+<tr><td>See or change access, break or restore inheritance</td><td>Owner of the node. A site cannot inherit. Every scope keeps at least one owner assignment.</td></tr>
+<tr><td>Known and intended</td><td>Deleting a folder that holds only items the person cannot see answers <code>not_empty</code>, so they learn something is there. Moving a file from a restricted folder to a widely shared one needs only editor at both ends, so an editor can widen who sees it (as in SharePoint). A file that inherits takes its new place's permissions when moved; a file with its own permissions keeps them.</td></tr>
+<tr><td>See a node in a listing or a breadcrumb</td><td>A role on it, or a role somewhere below it (<em>limited access</em>: the name is shown and the person can go through it, but sees only the children that lead to what they can reach).</td></tr>
+</tbody></table>
+
+<h2>Review focus</h2>
+<ol class="band">
+<li>A person whose only grant is on one file deep inside a library: they open it by link, reach it from the sites list through each level, and never see the names of siblings they have no role on. (Task 2, <code>limited_access_shows_only_the_path</code>; Task 5, <code>file_reached_only_through_its_path</code>.)</li>
+<li>Two people renaming or moving into the same folder at once with the same name: one succeeds and the other gets <code>409 name_taken</code>; Git and PostgreSQL agree afterwards. (Task 4, <code>concurrent_same_name_one_wins</code>.)</li>
+<li>Moving a folder into itself or below itself is refused, and a move never makes a cycle even when two moves cross. (Task 4, <code>move_into_descendant_refused</code>, <code>crossing_moves_make_no_cycle</code>.)</li>
+<li>A file is open in a live session by someone whose role comes from a folder grant; the folder's inheritance is restored, or the file is moved out of the folder: they are removed or made read-only at once. (Task 5, <code>restore_above_open_file_removes_member</code>, <code>move_out_of_granted_folder_removes_member</code>.)</li>
+<li>Upgrading an existing installation: duplicate names, names with characters now refused, documents shared with several people, running the adoption twice, and a crash between the Git commit and the database update. (Task 4, the <code>adopt_*</code> tests.)</li>
+</ol>
+
+<div class="task">
+<h3>Task 1: nodes in PostgreSQL</h3>
+<p><strong>Files:</strong> create <code>crates/records/migrations/0003_tree.sql</code>, <code>crates/records/src/tree.rs</code>, <code>crates/records/tests/tree.rs</code>; modify <code>crates/collab-core/src/ids.rs</code>, <code>crates/records/src/lib.rs</code>, <code>crates/records/src/documents.rs</code> (name rule, error variants).</p>
+<p><strong>Interfaces produced:</strong></p>
+<ul class="band">
+<li><code>collab_core::ids::NodeId(pub Uuid)</code>, same derives as <code>DocId</code>, with <code>From&lt;DocId&gt; for NodeId</code>.</li>
+<li><code>records::NodeKind { Site, Library, Folder, Document }</code>, serialised lowercase.</li>
+<li><code>records::Node { id: NodeId, kind: NodeKind, parent: Option&lt;NodeId&gt;, site: NodeId, name: String, unique_scope: bool, deleted: bool, created_by: Option&lt;UserId&gt;, created_at: OffsetDateTime }</code>.</li>
+<li><code>records::NodeRow { id, kind, parent, site, name, deleted_at: Option&lt;OffsetDateTime&gt;, deleted_by: Option&lt;UserId&gt;, created_by, created_at }</code>: what Git holds, as the projection writes it.</li>
+<li><code>records::validate_node_name(name: &amp;str) -&gt; Result&lt;&amp;str, AccessError&gt;</code> (the rule in Global constraints; used for every new or changed name, including documents).</li>
+<li><code>NewEvent</code> gains <code>node: Option&lt;NodeId&gt;</code>, written to <code>events.node_id</code>; every existing call site sets it (<code>None</code>, or the document's node for document events).</li>
+<li><code>AccessError</code> gains <code>NameTaken</code>, <code>WrongPlace</code> (a kind under a parent of the wrong kind), <code>IntoItself</code>, <code>NotEmpty</code>, <code>IsSite</code>.</li>
+<li><code>Db::apply_node(&amp;self, row: &amp;NodeRow, event: Option&lt;NewEvent&gt;) -&gt; Result&lt;(), AccessError&gt;</code>: in one transaction, the row, its event (events stay recorded only inside <code>records</code>), and for a document node the <code>documents.name</code> it mirrors, so rooms, downloads and saves use the new name. It does: insert or update kind, parent, site, name, deleted. A new site row gets <code>unique_scope = true</code>; other new rows <code>false</code>; an update never changes <code>unique_scope</code>. Maps the sibling-name index violation to <code>NameTaken</code>.</li>
+<li><code>Db::node(&amp;self, id: NodeId) -&gt; Result&lt;Option&lt;Node&gt;, DbError&gt;</code>; <code>Db::is_at_or_below(&amp;self, node: NodeId, ancestor: NodeId) -&gt; Result&lt;bool, DbError&gt;</code>; <code>Db::has_live_children(&amp;self, id: NodeId) -&gt; Result&lt;bool, DbError&gt;</code>; <code>Db::name_free(&amp;self, parent: NodeId, name: &amp;str, except: Option&lt;NodeId&gt;) -&gt; Result&lt;bool, DbError&gt;</code>.</li>
+</ul>
+<p>Schema (<code>0003_tree.sql</code>): table <code>nodes</code> (<code>id uuid pk</code>; <code>kind text check in ('site','library','folder','document')</code>; <code>parent_id uuid references nodes</code>, null exactly when kind is site (check); <code>site_id uuid not null references nodes</code>; <code>name text not null</code>; <code>unique_scope boolean not null default false</code>; <code>deleted_at timestamptz</code>; <code>deleted_by uuid</code>; <code>created_by uuid</code>; <code>created_at timestamptz not null</code>); unique index on <code>(parent_id, lower(name)) where deleted_at is null</code>; index on <code>parent_id</code>. Table <code>scope_access</code> (<code>node_id</code>, <code>user_id</code>, <code>role</code> with today's check, <code>granted_by</code>, <code>granted_at</code>, primary key <code>(node_id, user_id)</code>; index on <code>user_id</code>). <code>events</code> gains <code>node_id uuid</code> with an index on <code>(node_id, id)</code>. <code>document_access</code> stays until Task 4 empties it.</p>
+<ol class="steps">
+<li>Write failing tests in <code>crates/records/tests/tree.rs</code>: <code>upsert_creates_and_updates_a_node</code>; <code>site_rows_start_as_scopes</code>; <code>sibling_names_unique_ignoring_case</code> (second "Report.xlsx" beside "report.xlsx" gives <code>NameTaken</code>; allowed once the first is deleted, and in another folder); <code>update_keeps_unique_scope</code>; <code>is_at_or_below_walks_parents</code>; <code>validate_node_name_rules</code> (each refused character, trailing dot, 121 characters, blank; accepts "Q3 report (final).xlsx").</li>
+<li>Run <code>cargo test -p records --test tree</code>: fails to compile.</li>
+<li>Write the migration, <code>NodeId</code>, and <code>tree.rs</code> with the interfaces above.</li>
+<li>Run <code>cargo test -p records</code>: all pass, including the existing tests.</li>
+<li>Commit <code>feat(records): nodes of the content tree</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 2: inherited access</h3>
+<p><strong>Files:</strong> create <code>crates/records/src/scopes.rs</code>, <code>crates/records/tests/scopes.rs</code>; modify <code>crates/records/src/documents.rs</code> (<code>reachable</code>, <code>role</code>, <code>grants</code>, <code>set_access</code> go through the tree; <code>documents_for</code> is removed), <code>crates/records/tests/documents.rs</code>.</p>
+<p><strong>Interfaces consumed:</strong> Task 1. <strong>Produced:</strong></p>
+<ul class="band">
+<li><code>Db::effective_role(&amp;self, user: UserId, node: NodeId) -&gt; Result&lt;Option&lt;Role&gt;, DbError&gt;</code>: the one access decision (Global constraints). Finds the nearest node at or above with <code>unique_scope</code> by a recursive walk up <code>parent_id</code>, then the person's row in <code>scope_access</code>. <code>Db::role(user, doc)</code> calls it.</li>
+<li><code>records::Crumb { id: NodeId, kind: NodeKind, name: String, role: Option&lt;Role&gt; }</code>; <code>Db::path(&amp;self, user: UserId, node: NodeId) -&gt; Result&lt;Option&lt;Vec&lt;Crumb&gt;&gt;, DbError&gt;</code>: the site down to the node; <code>None</code> unless the person has a role on the node or limited access to it.</li>
+<li><code>Db::sites_for(&amp;self, user: UserId) -&gt; Result&lt;Vec&lt;(Node, Option&lt;Role&gt;)&gt;, DbError&gt;</code>: sites with a role, and sites with limited access (<code>None</code>), by name.</li>
+<li><code>records::Listed { node: Node, role: Option&lt;Role&gt;, editor: Option&lt;Editor&gt;, revised_at: Option&lt;OffsetDateTime&gt; }</code>; <code>records::Cursor { kind_rank: i16, name: String, id: NodeId }</code> (folders before files, then name ignoring case, then id); <code>Db::children(&amp;self, user: UserId, parent: NodeId, after: Option&lt;&amp;Cursor&gt;, limit: u32) -&gt; Result&lt;Option&lt;(Vec&lt;Listed&gt;, Option&lt;Cursor&gt;)&gt;, DbError&gt;</code>: <code>None</code> if the parent is not reachable; otherwise the visible undeleted children, keyset-paged. With a role on the parent, every child that inherits is visible with the parent's role, and a child that is a scope is visible if the person has a role on it or below it. With limited access to the parent, only the children that lead to something the person can reach.</li>
+<li><code>records::NodeAccess { inherits: bool, source: Crumb, grants: Vec&lt;Grant&gt; }</code>; <code>Db::access(&amp;self, actor: UserId, node: NodeId) -&gt; Result&lt;NodeAccess, AccessError&gt;</code> (owner only; <code>grants</code> are those of <code>source</code>).</li>
+<li><code>Db::set_node_access(&amp;self, actor: UserId, node: NodeId, user: UserId, role: Option&lt;Role&gt;) -&gt; Result&lt;(Option&lt;Role&gt;, Option&lt;Role&gt;), AccessError&gt;</code>: as today's <code>set_access</code> (lock, re-check under the lock, last owner, events, before and after), but on a node; if the node inherits, it first breaks inheritance in the same transaction. <code>Db::set_access(actor, doc, ...)</code> becomes a call to it.</li>
+<li><code>Db::break_inheritance(&amp;self, actor: UserId, node: NodeId) -&gt; Result&lt;bool, AccessError&gt;</code> and <code>Db::restore_inheritance(&amp;self, actor: UserId, node: NodeId) -&gt; Result&lt;bool, AccessError&gt;</code>: <code>false</code> when already so; restore on a site is <code>IsSite</code>. Both lock the node row and judge the actor under the lock. Restore needs the actor to be owner of the node and of the parent's scope (otherwise <code>Forbidden</code>), so nobody can restore themselves out of their own access by accident without owning above.</li>
+<li><strong>Locking.</strong> Every access change (<code>set_node_access</code>, break, restore) locks the chain from the node up to its source scope, top-down: <code>FOR UPDATE</code> on the scope it writes and <code>FOR SHARE</code> on the rest, then judges the actor under those locks. A move or delete locks the moved node's row <code>FOR UPDATE</code> the same way, so a move cannot change the chain while an access change is judged. The chain is a handful of rows, whatever the library size.</li>
+<li><code>Db::scope_users(&amp;self, node: NodeId) -&gt; Result&lt;Vec&lt;UserId&gt;, DbError&gt;</code>: everyone with a grant on the node's scope (used in Task 5).</li>
+</ul>
+<p>Limited access is computed from the person's grants: the set of nodes at or above any scope where they have a row. The number of a person's grants is small; nothing scans a library. Write it as one recursive query from <code>scope_access where user_id = $1</code> upwards, skipping scopes with a deleted node at or above them, so a grant inside a deleted folder exposes no names.</p>
+<ol class="steps">
+<li>Write failing tests in <code>crates/records/tests/scopes.rs</code> on a tree site &rarr; library &rarr; folder A &rarr; folder B &rarr; file: <code>role_inherits_from_site</code>; <code>break_copies_parent_assignments</code>; <code>break_then_change_does_not_touch_parent</code>; <code>restore_returns_to_parent_roles</code>; <code>restore_on_site_is_refused</code>; <code>last_owner_kept_per_scope</code>; <code>set_access_on_inheriting_node_breaks_first</code>; <code>nested_breaks_nearest_wins</code>; <code>administrator_owns_everything</code>; <code>disabled_account_has_nothing</code>; <code>deleted_ancestor_hides_everything_below</code> (also: a grant inside the deleted folder gives no limited access to its parents); <code>removed_above_while_breaking_below</code> (owner X removed on folder A while X breaks inheritance on a file under A, started together: X never ends up with a grant on the file); <code>limited_access_shows_only_the_path</code> (grant only on the file: <code>sites_for</code> gives the site with <code>None</code>, <code>children</code> of the library lists only folder A, of A only B, <code>path</code> of the file lists all five with roles <code>None</code> except the file); <code>children_page_in_order</code> (folders first, names ignoring case, cursor continues without repeats or gaps over 250 children with limit 100); <code>break_cost_does_not_grow_with_descendants</code> (break on a library holding 2,000 files issues the same number of statements as on an empty one: count rows written, which must equal the number of copied assignments).</li>
+<li>Update <code>crates/records/tests/documents.rs</code>: documents are created under a library; grants tests go through nodes; remove tests of <code>documents_for</code>.</li>
+<li>Run <code>cargo test -p records</code>: new tests fail.</li>
+<li>Implement <code>scopes.rs</code> and route <code>documents.rs</code> through it.</li>
+<li>Run <code>cargo test -p records</code>: all pass.</li>
+<li>Commit <code>feat(records): inherited access on the content tree</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 3: the tree in Git</h3>
+<p><strong>Files:</strong> create <code>crates/revisions/src/tree.rs</code>; modify <code>crates/revisions/src/lib.rs</code>, <code>crates/revisions/src/store.rs</code> (layout comment, shared commit helper), <code>crates/server/src/checkpoint.rs</code> (the trait).</p>
+<p><strong>Interfaces produced:</strong></p>
+<ul class="band">
+<li><code>revisions::TreeRecord { schema: u32, id: Uuid, kind: String, parent: Option&lt;Uuid&gt;, site: Uuid, name: String, created: Stamp, deleted: Option&lt;Stamp&gt; }</code> and <code>revisions::Stamp { at: String /* RFC 3339 */, by: Author }</code>. Stored at <code>tree/&lt;id&gt;.json</code>, schema 1, pretty-printed with a trailing newline like <code>meta.json</code>; field order as listed.</li>
+<li><code>revisions::TreeChange&lt;'a&gt; { author: &amp;'a Author, message: &amp;'a str, records: &amp;'a [TreeRecord] }</code>.</li>
+<li><code>RevisionStore::write_tree(&amp;self, change: &amp;TreeChange&lt;'_&gt;) -&gt; Result&lt;RevisionId, CheckpointError&gt;</code>: one commit on <code>main</code> writing every record, taken under the same mutex as <code>checkpoint</code>; moves <code>refs/sharecraft/tree</code>; moves no <code>refs/sharecraft/docs/*</code> ref. An empty <code>records</code> writes nothing and is an error.</li>
+<li><code>RevisionStore::read_tree(&amp;self) -&gt; Result&lt;Vec&lt;TreeRecord&gt;, CheckpointError&gt;</code>: every record on <code>main</code>; a record that does not parse is <code>Corrupt</code> with main's commit as the revision and the path in the reason. <code>RevisionStore::read_tree_record(&amp;self, id: Uuid) -&gt; Result&lt;Option&lt;TreeRecord&gt;, CheckpointError&gt;</code>: one record.</li>
+<li>The server reaches the store only through <code>Arc&lt;dyn Checkpointer&gt;</code> (<code>crates/server/src/checkpoint.rs</code>). The trait gains <code>write_tree</code>, <code>read_tree</code> and <code>read_tree_record</code> with the same signatures, each with a default implementation that returns an error, so the existing test checkpointers still compile; the real one forwards to <code>RevisionStore</code>.</li>
+</ul>
+<ol class="steps">
+<li>Write failing unit tests in <code>tree.rs</code>: <code>write_then_read_round_trips</code>; <code>tree_commit_keeps_document_refs</code> (checkpoint a document, write a tree record, the document's <code>head</code> is unchanged and a checkpoint based on it still succeeds); <code>checkpoint_keeps_tree_records</code>; <code>one_commit_per_change</code> with the author and message; <code>record_bytes_are_stable</code> (exact expected JSON text for one record); <code>unreadable_record_is_reported</code>.</li>
+<li>Run <code>cargo test -p revisions</code>: fails.</li>
+<li>Implement, sharing the tree-building and ref-moving code with <code>checkpoint</code> rather than copying it.</li>
+<li>Run <code>cargo test -p revisions</code>: all pass.</li>
+<li>Commit <code>feat(revisions): record the content tree in Git</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 4: tree changes, start-up reconcile and adopting existing documents</h3>
+<p><strong>Files:</strong> create <code>crates/server/src/tree.rs</code>, <code>crates/server/tests/tree.rs</code>; modify <code>crates/server/src/lib.rs</code> (<code>AppState</code> holds the tree lock; <code>serve</code> runs reconcile and adoption before the revisions reconcile), <code>crates/server/src/projection.rs</code> if shared code fits there.</p>
+<p><strong>Interfaces consumed:</strong> Tasks 1&ndash;3. <strong>Produced</strong> (all in <code>crate::tree</code>):</p>
+<ul class="band">
+<li><code>TreeOp { Create { parent: Option&lt;NodeId&gt;, kind: NodeKind, name: String, id: NodeId }, Rename { id: NodeId, name: String }, Move { id: NodeId, parent: NodeId }, Delete { id: NodeId } }</code>.</li>
+<li><code>async fn apply(state: &amp;AppState, actor: &amp;User, op: TreeOp) -&gt; Result&lt;Node, AccessError&gt;</code>: takes the tree lock; checks the rule in <em>Who may do what</em>, the name rule, sibling names (<code>name_free</code>), kinds (site has no parent; library under a site; folder and document under a library or folder; else <code>WrongPlace</code>), moves (<code>IntoItself</code> if the destination is at or below the node), deletes (<code>NotEmpty</code>); writes the Git record(s) with <code>write_tree</code>; then <code>apply_node</code> with its event. Creating a site also writes its <em>Documents</em> library in the same commit and gives the creator an owner row on the site. Each new record is built from the node's current record in Git (<code>read_tree_record</code>), never from PostgreSQL. If the database step fails after the commit, it reconciles that node from Git once; if that fails too, the tree is marked out of step and every tree change answers <code>503</code> until a reconcile of the whole tree succeeds (tried again on the next tree change). It then answers the database error.</li>
+<li><code>async fn create_document(state: &amp;AppState, actor: &amp;User, parent: NodeId, id: DocId, name: &amp;str, editor: Editor, uploaded: Option&lt;usize&gt;) -&gt; Result&lt;Document, AccessError&gt;</code>: the tree record plus the <code>documents</code> row, which no longer gets an owner grant (the file inherits). Replaces the calls to <code>Db::create_document</code> and <code>create_uploaded_document</code>. It records the existing <code>document.created</code> event (with both <code>document</code> and <code>node</code> set), not a separate <code>node.created</code>; the document events route shows it as today.</li>
+<li><code>async fn reconcile(store: Arc&lt;dyn Checkpointer&gt;, db: &amp;Db) -&gt; Result&lt;TreeReport, ...&gt;</code> with <code>TreeReport { nodes: usize, updated: usize, failed: Vec&lt;(Uuid, String)&gt; }</code>: upserts every Git record whose row differs, parents before children, and records the matching <code>node.*</code> event with <code>"repaired": true</code> for each row it changes (S7).</li>
+<li><code>async fn adopt_flat_documents(store: Arc&lt;dyn Checkpointer&gt;, db: &amp;Db) -&gt; Result&lt;Option&lt;Adopted&gt;, ...&gt;</code> with <code>Adopted { site: NodeId, library: NodeId, documents: usize, renamed: usize }</code>: runs when any <code>documents</code> row has no node <em>or</em> <code>document_access</code> still has rows. Before writing anything it checks that an enabled administrator exists (none: it stops with a message saying to add one with <code>sharecraft-server add-user --admin</code>, and nothing is written). For documents without a node it writes in one Git commit (author "ShareCraft") a site named <em>Home</em>, its <em>Documents</em> library, and a record for each such document. A name now refused has each refused character replaced by <code>_</code>; a name already taken in the library gets <code> (2)</code>, <code> (3)</code> &hellip; before its extension; the <code>documents</code> row takes the new name. Then, in one transaction: the nodes; every enabled administrator becomes owner of the site; every document with <code>document_access</code> rows becomes a scope and its rows are copied to <code>scope_access</code> (<code>on conflict do nothing</code>) and then deleted; one <code>tree.adopted</code> event with the counts. Running it again finds nothing and returns <code>None</code>. If the commit was written and the transaction was not, the next start's reconcile creates the nodes and copies their names into <code>documents.name</code>, and adoption, finding <code>document_access</code> rows, moves the grants.</li>
+</ul>
+<ol class="steps">
+<li>Write failing tests in <code>crates/server/tests/tree.rs</code> (temporary repository and test database, as the existing tests do): <code>create_site_makes_documents_library_and_owner</code>; <code>only_administrators_create_sites</code>; <code>library_needs_site_owner</code>; <code>folder_needs_editor</code>; <code>wrong_place_refused</code> (folder under a site, library under a folder, anything under a file); <code>rename_writes_one_commit_and_event</code>; <code>rename_keeps_document_head</code>; <code>move_needs_editor_both_ends</code>; <code>move_into_descendant_refused</code>; <code>crossing_moves_make_no_cycle</code> (A into B and B into A started together: exactly one succeeds); <code>concurrent_same_name_one_wins</code> (two creates of "Plan.xlsx" in one folder at once, and a create racing a rename to the same name: one <code>NameTaken</code> each time; <code>read_tree</code> and <code>nodes</code> agree); <code>delete_non_empty_folder_refused</code>; <code>deleted_file_is_not_found</code>; <code>reconcile_restores_missing_rows</code>; <code>reconcile_fixes_changed_names</code>; <code>adopt_moves_documents_and_grants</code>; <code>adopt_renames_duplicates_and_refused_characters</code> ("a.xlsx", "A.xlsx", "x:y.docx" become "a.xlsx", "A (2).xlsx", "x_y.docx"); <code>adopt_twice_does_nothing</code>; <code>adopt_after_crash_between_git_and_database</code>; <code>adopt_without_administrator_stops_with_message</code>.</li>
+<li>Run <code>cargo test -p server --test tree</code>: fails.</li>
+<li>Implement <code>tree.rs</code> and the start-up steps in <code>serve</code>; print one line with the reconcile and adoption counts, in the style of the existing revisions line.</li>
+<li>Run <code>cargo test -p server</code>: all pass.</li>
+<li>Commit <code>feat(server): tree changes, reconcile and adoption of existing documents</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 5: API and live sessions</h3>
+<p><strong>Files:</strong> create <code>crates/server/src/api/nodes.rs</code>, <code>crates/server/src/api/sites.rs</code>, <code>crates/server/tests/nodes.rs</code>; modify <code>crates/server/src/api/mod.rs</code> (routes, error codes), <code>api/docs.rs</code> and <code>api/content.rs</code> (create and upload take a parent; access routes become aliases), <code>crates/server/src/room.rs</code> and <code>file_room.rs</code> (new access-channel variants), <code>crates/server/src/members.rs</code> and <code>crates/server/src/ws.rs</code> (they match <code>AccessChange</code>), <code>crates/protocol/src/lib.rs</code> (<code>RemovedReason::Deleted</code>), the existing server tests that create documents or call <code>GET /api/docs</code>.</p>
+<p><strong>Routes</strong> (all need sign-in; an unreachable node is <code>404 not_found</code>, as today):</p>
+<table>
+<thead><tr><th>Route</th><th>Does</th></tr></thead>
+<tbody>
+<tr><td><code>GET /api/sites</code></td><td><code>[{id, name, role}]</code>, <code>role</code> null for limited access.</td></tr>
+<tr><td><code>POST /api/sites {name}</code></td><td>Creates a site; <code>201</code> with the node.</td></tr>
+<tr><td><code>GET /api/nodes/{id}</code></td><td><code>{id, kind, name, role, editor?, path: [{id, kind, name, role}]}</code>.</td></tr>
+<tr><td><code>GET /api/nodes/{id}/children?after=&amp;limit=</code></td><td><code>{items: [{id, kind, name, role, editor?, revised_at?, inherits}], next}</code>; <code>limit</code> 1 to 500, default 100; <code>after</code> is the opaque <code>next</code> of the previous page.</td></tr>
+<tr><td><code>POST /api/nodes/{id}/children {kind, name}</code></td><td>Creates a library or folder.</td></tr>
+<tr><td><code>PATCH /api/nodes/{id} {name?, parent?}</code></td><td>Rename and/or move.</td></tr>
+<tr><td><code>DELETE /api/nodes/{id}</code></td><td>Delete; <code>204</code>.</td></tr>
+<tr><td><code>GET /api/nodes/{id}/access</code>, <code>PUT</code> <code>{email, role}</code>, <code>DELETE /api/nodes/{id}/access/{user_id}</code></td><td>As today's document routes, on any node; <code>GET</code> answers <code>{inherits, source, grants}</code>.</td></tr>
+<tr><td><code>POST /api/nodes/{id}/inheritance {inherit}</code></td><td><code>false</code> breaks, <code>true</code> restores; <code>204</code>.</td></tr>
+<tr><td><code>POST /api/docs {parent, name?, editor?}</code>, <code>POST /api/docs/upload?parent=</code></td><td><code>parent</code> required (a library or folder).</td></tr>
+<tr><td><code>/api/docs/{id}/access&hellip;</code></td><td>Kept, answering exactly as the node routes for that file.</td></tr>
+<tr><td><code>GET /api/docs</code></td><td>Removed; the home page lists sites.</td></tr>
+</tbody></table>
+<p>New error codes: <code>name_taken</code> (409), <code>not_empty</code> (409), <code>into_itself</code> (400), <code>wrong_place</code> (400), <code>is_site</code> (400); <code>invalid_name</code>, <code>last_owner</code>, <code>forbidden</code> and <code>not_found</code> as today.</p>
+<p><strong>Live sessions.</strong> Interfaces produced: <code>Rooms::open_documents(&amp;self) -&gt; Vec&lt;DocId&gt;</code>; <code>Rooms::connected_users(&amp;self, doc: DocId) -&gt; impl Future&lt;Output = Vec&lt;UserId&gt;&gt;</code> (asked of the room over its access channel with a reply channel; empty if the room has closed; a room still loading its document answers too); <code>AccessChange::Renamed { name: String }</code> (the room stores later checkpoints under the new name); <code>AccessChange::Deleted</code> (every connection removed with <code>RemovedReason::Deleted</code>). In <code>crate::api</code>: <code>async fn recheck_below(state: &amp;AppState, node: NodeId)</code>: for every open document at or below <code>node</code>, one document at a time in id order (never holding two guards), take <code>order_access</code>, and send each connected user's fresh <code>effective_role</code> as <code>SetAccess</code>. It runs inside <code>to_completion</code>, as <code>after_access_change</code> does, so a cancelled request still revokes; and before the request answers, after an access change, break or restore on <code>node</code>, and after a move of <code>node</code>. A delete sends <code>Deleted</code> to the file's room; a rename of a file sends <code>Renamed</code>. A room that opens while the rename is written could miss it, so the join path in <code>ws.rs</code>, once the room is registered, re-reads the document's name and sends <code>Renamed</code> if it differs.</p>
+<ol class="steps">
+<li>Write failing tests in <code>crates/server/tests/nodes.rs</code>: one per route for success and each refusal in the table; <code>children_paging_over_http</code>; <code>file_reached_only_through_its_path</code> (Review focus 1, over HTTP); <code>site_grant_reaches_open_file</code> (a viewer added on the site joins a file session as viewer); <code>site_revoke_removes_member</code> (removed with <code>access_revoked</code> before the response); <code>restore_above_open_file_removes_member</code>; <code>move_out_of_granted_folder_removes_member</code>; <code>move_into_granted_folder_upgrades_member</code>; <code>delete_open_file_removes_everyone</code> (reason <code>deleted</code>); <code>rename_open_file_then_checkpoint_uses_new_name</code> (and the checkpoint is not refused as stale); <code>doc_access_alias_matches_node_route</code>.</li>
+<li>Update existing server tests to create a site and library first and pass <code>parent</code>.</li>
+<li>Run <code>cargo test -p server</code>: the new tests fail.</li>
+<li>Implement the routes, the room variants and <code>recheck_below</code>.</li>
+<li>Run <code>cargo xtask check</code>: passes.</li>
+<li>Commit <code>feat(server): sites, folders and inherited access over the API</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 6: pages</h3>
+<p><strong>Files:</strong> modify <code>web/index.html</code> and <code>web/home.js</code> (the sites list); create <code>web/site.html</code>/<code>site.js</code>, <code>web/library.html</code>/<code>library.js</code>, <code>web/access.html</code>/<code>access.js</code>; modify <code>web/common.js</code> (breadcrumbs and site navigation helpers; the sharing panel moves to <code>access.html</code>), <code>web/doc.html</code>, <code>web/file.html</code> and their scripts (breadcrumbs; a link to Access for owners), <code>web/style.css</code>, <code>web/common.test.mjs</code>.</p>
+<ul class="band">
+<li><strong>Home</strong> (<code>index.html</code>): the person's sites, with limited-access sites marked; administrators get a <em>New site</em> form.</li>
+<li><strong>Site</strong> (<code>site.html?id=</code>): site name as the heading; the site's libraries as the site navigation (also shown on library pages); owners get <em>New library</em> and <em>Site access</em>.</li>
+<li><strong>Library or folder</strong> (<code>library.html?id=</code>): breadcrumbs; folders then files, with kind, last saved time and a mark on items with their own permissions; <em>Show more</em> for the next page; <em>New folder</em>, <em>New document</em> (the four kinds and plain text), <em>Upload</em>; per item <em>Rename</em>, <em>Move&hellip;</em> (a dialog that browses libraries and folders of the sites the person can edit), <em>Delete</em> (with a confirmation naming the item), and <em>Access</em> for owners. Errors from the codes above are shown in plain sentences.</li>
+<li><strong>Access</strong> (<code>access.html?id=</code>): whether the item inherits and from where (linked); the people and roles of its scope; add, change and remove; <em>Stop inheriting</em> and <em>Inherit again</em>, the latter saying how many people would lose their own entry.</li>
+<li><strong>Files and text documents</strong>: breadcrumbs in the bar; closing a file goes back to its folder; a session ended with reason <code>deleted</code> says "This document was deleted." and links to its folder.</li>
+<li>Pages work at 375 pixels wide and in light and dark mode; long lists use colour banding; headings, labels and focus order follow the existing pages.</li>
+</ul>
+<ol class="steps">
+<li>Write failing tests in <code>web/common.test.mjs</code> for the helpers: <code>breadcrumbs</code> renders links only where <code>role</code> is set; <code>messageFor</code> covers each new error code; the move dialog never offers the item itself or anything below it.</li>
+<li>Run <code>node --test web/</code>: fails.</li>
+<li>Implement the pages.</li>
+<li>Run <code>node --test web/</code> and <code>cargo xtask check</code>: pass.</li>
+<li>Commit <code>feat(web): sites, libraries, folders and access pages</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 7 (controller): browser check and documents</h3>
+<ol class="steps">
+<li>Build the server into this session's own target folder; repoint <code>sharecraft-server</code> in <code>H:\Source\repos\.claude\launch.json</code>; start it on a copy of the current development database and repository, so adoption runs on the real data.</li>
+<li>In the browser, record each as checked or not: existing documents appear in <em>Home &rsaquo; Documents</em> and open; an administrator creates a site; a site owner creates a library and a folder; a file is created, uploaded, renamed, moved and deleted; a second account given access only on one file finds it from Home and sees no siblings; a site-level grant then revoke reaches an open GridCraft session at once; breaking and restoring inheritance on a folder; the pages at 375 pixels and in dark mode.</li>
+<li>Update <code>BUILDING.html</code> (API routes, the <code>tree/</code> layout in Git, adoption on upgrade), <code>sequencing.html</code> (Stage 2 progress note, with what was and was not checked), and record the two owner decisions of 11 November 2026 in <code>scope.html</code>'s decision register. Banding on new tables. Commit <code>docs: the content tree and inherited permissions</code>.</li>
+</ol></div>
+</main></body>
+
+</html>
