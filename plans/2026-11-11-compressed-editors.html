@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ShareCraft — Serve the Editors Compressed: Implementation Plan</title>
+<style>
+:root{color-scheme:light dark;--ink:light-dark(#172f38,#e4ecef);--muted:light-dark(#536b72,#a9b9bf);--line:light-dark(#d7e2e3,#36454b);--paper:light-dark(#fff,#1d272b);--wash:light-dark(#f2f6f5,#141b1e);--accent:light-dark(#3156c9,#9db4ff);font:15px/1.6 Segoe UI,system-ui,sans-serif;color:var(--ink);background:var(--wash)}
+*{box-sizing:border-box}body{margin:0;padding:28px 18px 80px}main{max-width:940px;margin:auto}
+h1{font-size:1.9rem;letter-spacing:-.03em;line-height:1.2;margin:0 0 14px}h2{font-size:1.3rem;margin:38px 0 12px;padding-top:18px;border-top:1px solid var(--line)}h3{font-size:1.08rem;margin:30px 0 8px}h4{font-size:.95rem;margin:16px 0 6px}
+p{margin:0 0 12px}ul,ol{margin:0 0 12px;padding-left:22px}li{margin-bottom:6px}a{color:var(--accent)}
+code{font-family:Consolas,Menlo,monospace;font-size:.88em;background:light-dark(#e9efee,#263238);padding:1px 5px;border-radius:3px;overflow-wrap:anywhere}
+pre{background:var(--paper);border:1px solid var(--line);border-radius:7px;padding:12px 14px;overflow-x:auto;font:13px/1.5 Consolas,Menlo,monospace;margin:0 0 12px}pre code{background:none;padding:0;font-size:inherit}
+.note{border-left:4px solid var(--accent);background:var(--paper);padding:12px 16px;margin:0 0 14px}.note p:last-child{margin:0}
+.task{background:var(--paper);border:1px solid var(--line);border-radius:9px;padding:6px 20px 14px;margin:18px 0}
+ol.steps{list-style:none;padding-left:0}ol.steps>li{padding-left:28px;position:relative;margin-bottom:10px}ol.steps>li::before{content:"☐";position:absolute;left:2px;color:var(--muted)}
+table{border-collapse:collapse;width:100%;font-size:.9rem;background:var(--paper);margin-bottom:14px}th,td{border:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top}th{background:light-dark(#e8efed,#263238)}
+.small{font-size:.88rem;color:var(--muted)}
+tbody tr:nth-child(even) td{background:light-dark(#f4f8f7,#212b30)}
+ol.steps>li:nth-child(even),ul.band>li:nth-child(even),ol.band>li:nth-child(even){background:light-dark(#f4f8f7,#212b30);border-radius:4px}
+</style>
+</head>
+<body><main>
+<h1>Serve the editors compressed: implementation plan</h1>
+<p class="small">ShareCraft &middot; after Stage 1 &middot; Written 11 November 2026</p>
+<div class="note"><p><strong>For agentic workers:</strong> REQUIRED SUB-SKILL: use superpowers:subagent-driven-development or superpowers:executing-plans. Steps are checkboxes.</p></div>
+<p><strong>Goal:</strong> a browser downloads each editor compressed, not raw: SolidCraft's 153&nbsp;MB WebAssembly file arrives as about 48&nbsp;MB (gzip) or less (Brotli), and the other editors shrink by about two thirds. No change to any editor fork, and no slower editor.</p>
+<p><strong>Approach:</strong> compress once, when an editor is installed: <code>cargo xtask editors build</code> writes a Brotli copy (<code>.br</code>) and a gzip copy (<code>.gz</code>) beside each compressible file. The server's static file service (tower-http <code>ServeDir</code>) is told to serve those copies, with <code>Content-Encoding</code> and <code>Vary: Accept-Encoding</code>, to browsers that accept them, and the plain file otherwise. Nothing is compressed per request. A new <code>cargo xtask editors compress</code> adds the copies to editors already installed, so no rebuild is needed.</p>
+<p><strong>Owner decision:</strong> 11 November 2026, after the SolidCraft size experiment showed size-oriented compiler settings make SolidCraft about twice as slow: keep today's builds and serve them compressed.</p>
+
+<h2>Global constraints</h2>
+<ul class="band">
+<li>New dependencies only with permissive licences (MIT, Apache-2.0, BSD, zlib); no copyleft (D17). Preferred: <code>flate2</code> (MIT/Apache) and <code>brotli</code> (BSD-3-Clause/MIT), in <code>xtask</code> only; the server needs none (ServeDir reads the copies).</li>
+<li>The editor guard stays exactly as it is: sign-in, same origin, installed editor, path inside its folder, the editor's security policy, <code>no-cache</code>, <code>nosniff</code>. Compressed answers carry the same headers.</li>
+<li>The compressed copies always match the file beside them: written from it at install, in the same step, never edited by hand.</li>
+<li><code>editors verify</code> and the editor manifest keep working; the copies are not listed as editor files of their own.</li>
+<li>Never print <code>.env</code>, database addresses or passwords.</li>
+</ul>
+
+<h2>Review focus</h2>
+<ol class="band">
+<li>A browser that sends no <code>Accept-Encoding</code> (or only <code>identity</code>) still gets the plain file, byte for byte.</li>
+<li>An editor installed before this change (no copies) is served exactly as before.</li>
+<li>A request for <code>file.wasm.br</code> or <code>file.wasm.gz</code> by name never leaks anything outside the editor folder.</li>
+<li>The Content-Type of a compressed answer is the original file's type (<code>application/wasm</code> must stay, or the browser's streaming compile fails).</li>
+<li>Range requests and revalidation (<code>If-None-Match</code>, <code>If-Modified-Since</code>) still answer correctly with compression on.</li>
+</ol>
+
+<div class="task">
+<h3>Task 1: precompressed copies at install, and a compress command</h3>
+<p><strong>Files:</strong> <code>xtask/src/editors.rs</code>, <code>xtask/src/main.rs</code> (new subcommand), <code>xtask/Cargo.toml</code>.</p>
+<ol class="steps">
+<li>Write failing tests: <code>install_writes_compressed_copies</code> (a built folder with <code>a.wasm</code>, <code>b.js</code>, <code>c.css</code>, <code>index.html</code>, <code>d.png</code> and a 100-byte <code>e.js</code>: after install, <code>.br</code> and <code>.gz</code> exist beside a.wasm, b.js, c.css and index.html, none beside d.png or the tiny e.js, and each copy decompresses to its file's bytes); <code>compress_adds_copies_to_an_installed_editor</code>; <code>compress_replaces_stale_copies</code>; <code>verify_ignores_compressed_copies</code>.</li>
+<li>Implement <code>fn write_compressed_copies(dir: &amp;Path) -&gt; Result&lt;()&gt;</code>: for files with extension wasm, js, mjs, css, html, json, svg, txt or webmanifest and at least 1024 bytes, write <code>&lt;name&gt;.br</code> (Brotli; quality 11 below 20 MB, a lower quality above to keep install time reasonable; report the measured time) and <code>&lt;name&gt;.gz</code> (gzip level 9), each to a temporary name and then renamed. Remove copies whose source file no longer exists. Call it at the end of <code>install</code>.</li>
+<li>Add <code>cargo xtask editors compress [id]</code>: runs it for one or all installed editors and prints sizes before and after.</li>
+<li>Run the xtask tests; commit <code>feat(xtask): write compressed copies of editor files at install</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 2: the server serves the copies</h3>
+<p><strong>Files:</strong> <code>crates/server/src/editors.rs</code> and the tests that already exercise the editor route with a temporary editors folder.</p>
+<ol class="steps">
+<li>Write failing tests: <code>editor_files_are_served_brotli_when_accepted</code> (Accept-Encoding "br, gzip": Content-Encoding br, body equals the .br copy, Content-Type application/wasm, Vary includes Accept-Encoding, and the editor policy, no-cache and nosniff present); <code>editor_files_fall_back_to_gzip</code>; <code>editor_files_are_plain_without_accept_encoding</code>; <code>editor_without_copies_is_served_plain</code>.</li>
+<li>Implement: <code>ServeDir::new(..).precompressed_br().precompressed_gzip()</code>.</li>
+<li>Run <code>cargo xtask check</code>; commit <code>feat(server): serve editors' compressed copies</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 3 (controller): compress the installed editors, check in the browser, documents</h3>
+<ol class="steps">
+<li><code>cargo xtask editors compress</code>; record before and after sizes for all four editors; restart the server.</li>
+<li>In the browser: open one document per editor; confirm the wasm arrived with <code>Content-Encoding: br</code> and its transferred size; edit, save and reload once per editor.</li>
+<li>BUILDING.html (sections 13 and 18: drop "No compression"; describe the copies and the compress command) and editors.html (section 02: the measured compressed download sizes), with colour banding on any new table. Commit <code>docs: editors are served compressed</code>.</li>
+</ol></div>
+</main></body>
+</html>
