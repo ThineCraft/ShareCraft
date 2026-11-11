@@ -571,9 +571,33 @@ fn list(root: &Path) -> Result<()> {
 /// Checks every installed editor against `editors.toml`. Editors that are not installed are not
 /// checked, so a machine with no `./editors` folder passes.
 pub fn verify_installed(root: &Path) -> Result<()> {
+    verify_specs(root, read_editors(root)?)
+}
+
+/// The copies under `dir` that are older than the file beside them: the file changed after they
+/// were made, so a browser would get the old content.
+fn stale_copies(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    files_under(dir, &mut files)?;
+    let modified = |path: &Path| std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    let mut stale = Vec::new();
+    for path in files.iter().filter(|p| is_compressible_name(p)) {
+        for suffix in [".br", ".gz"] {
+            let copy = with_suffix(path, suffix);
+            if let (Some(file), Some(made)) = (modified(path), modified(&copy))
+                && made < file
+            {
+                stale.push(copy);
+            }
+        }
+    }
+    Ok(stale)
+}
+
+fn verify_specs(root: &Path, specs: Vec<EditorSpec>) -> Result<()> {
     let mut problems = Vec::new();
     let mut checked = 0;
-    for spec in read_editors(root)? {
+    for spec in specs {
         let Some(manifest) = installed_manifest(root, &spec.id)? else {
             continue;
         };
@@ -583,6 +607,14 @@ pub fn verify_installed(root: &Path) -> Result<()> {
             .map_err(|e| format!("cannot read {}: {e}", index.display()))?;
         for problem in manifest_problems(&spec, &manifest, &html) {
             problems.push(format!("{}: {problem}", spec.id));
+        }
+        for copy in stale_copies(&editors_dir(root).join(&spec.id))? {
+            problems.push(format!(
+                "{}: {} is older than its file; run `cargo xtask editors compress {}`",
+                spec.id,
+                copy.display(),
+                spec.id
+            ));
         }
     }
     if problems.is_empty() {
@@ -959,7 +991,7 @@ fn install(root: &Path, id: &str, built: &Path) -> Result<()> {
                 .map_err(|e| format!("cannot clear {}: {e}", leftover.display()))?;
         }
     }
-    if let Err(e) = copy_dir(built, &new) {
+    if let Err(e) = copy_dir(built, &new).and_then(|()| compress_and_report(id, &new)) {
         let _ = std::fs::remove_dir_all(&new);
         return Err(e);
     }
@@ -981,7 +1013,6 @@ fn install(root: &Path, id: &str, built: &Path) -> Result<()> {
             old.display()
         );
     }
-    write_compressed_copies(&target)?;
     Ok(())
 }
 
@@ -1064,28 +1095,33 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
 
 /// Writes `<name>.br` (Brotli) and `<name>.gz` (gzip) beside every compressible file of at least
 /// 1 KiB under `dir`, from the file itself, replacing any copy already there; and removes the
-/// copies whose file is gone (or no longer qualifies). The server hands these to browsers that
-/// accept them.
+/// pair of copies whose file is gone (or no longer qualifies), and any temporary file an
+/// interrupted run left. A lone `.br` or `.gz` is the editor's own file and is left alone. The
+/// server hands the copies to browsers that accept them.
 fn write_compressed_copies(dir: &Path) -> Result<()> {
     let mut files = Vec::new();
     files_under(dir, &mut files)?;
+    // Decide first what is ours to remove: removing one copy of a pair would hide the other.
+    let mut remove = Vec::new();
     for path in &files {
-        let Some(extension) = path.extension().and_then(|e| e.to_str()) else {
-            continue;
+        let name = path.to_string_lossy();
+        // A temporary file left by an interrupted run.
+        let leftover = name.ends_with(".br.tmp") || name.ends_with(".gz.tmp");
+        // A pair of copies is ours; a lone `.gz` or `.br` is a file the editor ships.
+        let orphan = path.extension().is_some_and(|e| e == "br" || e == "gz") && {
+            let source = path.with_extension("");
+            is_compressible_name(&source)
+                && with_suffix(&source, ".br").is_file()
+                && with_suffix(&source, ".gz").is_file()
+                && !std::fs::metadata(&source)
+                    .is_ok_and(|m| m.is_file() && wants_copies(&source, m.len()))
         };
-        if extension != "br" && extension != "gz" {
-            continue;
+        if leftover || orphan {
+            remove.push(path);
         }
-        let source = path.with_extension("");
-        if !is_compressible_name(&source) {
-            continue;
-        }
-        let qualifies =
-            std::fs::metadata(&source).is_ok_and(|m| m.is_file() && wants_copies(&source, m.len()));
-        if !qualifies {
-            std::fs::remove_file(path)
-                .map_err(|e| format!("cannot remove {}: {e}", path.display()))?;
-        }
+    }
+    for path in remove {
+        std::fs::remove_file(path).map_err(|e| format!("cannot remove {}: {e}", path.display()))?;
     }
     for path in files.iter().filter(|p| is_compressible_name(p)) {
         let len = std::fs::metadata(path)
@@ -1134,17 +1170,23 @@ fn compress(root: &Path, id: Option<&str>) -> Result<()> {
             println!("{id}: not installed");
             continue;
         }
-        let started = std::time::Instant::now();
-        write_compressed_copies(&dir)?;
-        let (plain, br, gz) = compressed_sizes(&dir)?;
-        println!(
-            "{id}: {} MB plain, {} MB gzip, {} MB brotli ({:.1}s)",
-            megabytes(plain),
-            megabytes(gz),
-            megabytes(br),
-            started.elapsed().as_secs_f64()
-        );
+        compress_and_report(&id, &dir)?;
     }
+    Ok(())
+}
+
+/// Writes the compressed copies under `dir` and prints the sizes and the time taken.
+fn compress_and_report(id: &str, dir: &Path) -> Result<()> {
+    let started = std::time::Instant::now();
+    write_compressed_copies(dir)?;
+    let (plain, br, gz) = compressed_sizes(dir)?;
+    println!(
+        "{id}: {} MB plain, {} MB gzip, {} MB brotli ({:.1}s)",
+        megabytes(plain),
+        megabytes(gz),
+        megabytes(br),
+        started.elapsed().as_secs_f64()
+    );
     Ok(())
 }
 
@@ -1632,9 +1674,17 @@ checkout = "../GridCraft"
         std::fs::write(dir.join("gone.js.br"), "old").unwrap();
         std::fs::write(dir.join("gone.js.gz"), "old").unwrap();
         std::fs::write(dir.join("e.js.br"), "old").unwrap();
+        std::fs::write(dir.join("e.js.gz"), "old").unwrap();
+        // A leftover of an interrupted run.
+        std::fs::write(dir.join("b.js.br.tmp"), "half").unwrap();
+        // A file the editor ships: a lone `.gz` with no file, and one beside a file that has
+        // no `.br`.
+        std::fs::write(dir.join("shipped.json.gz"), "mine").unwrap();
         write_compressed_copies(&dir).unwrap();
+        assert_eq!(std::fs::read(dir.join("shipped.json.gz")).unwrap(), b"mine");
+        assert!(!dir.join("b.js.br.tmp").exists());
         assert_copies_match(&dir, "a.wasm");
-        for name in ["gone.js.br", "gone.js.gz", "e.js.br"] {
+        for name in ["gone.js.br", "gone.js.gz", "e.js.br", "e.js.gz"] {
             assert!(!dir.join(name).exists(), "{name} survived");
         }
         // Compressing twice gives the same copies, and leaves no temporary files.
@@ -1645,18 +1695,79 @@ checkout = "../GridCraft"
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    #[test]
-    fn verify_ignores_compressed_copies() {
-        let root = scratch("compress-verify");
+    /// An installed `gridcraft` that matches `editors.toml`, with the first spec of `EDITORS`.
+    fn installed_gridcraft(name: &str) -> (PathBuf, PathBuf, EditorSpec) {
+        let root = scratch(name);
         let dir = root.join("editors").join("gridcraft");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(root.join(EDITORS_TOML), "").unwrap();
-        // No editor in editors.toml is installed here, so only the copies' presence is at stake:
-        // verify must pass with copies beside every file.
-        compressible_tree(&dir);
+        let mut spec = parse_editors(EDITORS).unwrap().remove(0);
+        spec.commit = "1111111111111111111111111111111111111111".to_owned();
+        std::fs::write(
+            dir.join(MANIFEST),
+            manifest_json(&fixed_manifest()).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("index.html"),
+            "<style>body{margin:0}</style>\n<script>\nimport init from './app.js';\ninit();\n</script>",
+        )
+        .unwrap();
+        (root, dir, spec)
+    }
+
+    #[test]
+    fn verify_ignores_compressed_copies() {
+        let (root, dir, spec) = installed_gridcraft("compress-verify");
+        std::fs::write(dir.join("a.wasm"), "abcdefgh".repeat(300)).unwrap();
+        std::fs::write(dir.join("big.js"), "abcdefgh".repeat(300)).unwrap();
+        // Without copies, with copies, and the editor really was checked each time.
+        verify_specs(&root, vec![spec.clone()]).unwrap();
         write_compressed_copies(&dir).unwrap();
-        verify_installed(&root).unwrap();
+        assert!(dir.join("big.js.br").is_file());
+        verify_specs(&root, vec![spec]).unwrap();
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn verify_flags_a_copy_older_than_its_file() {
+        let (root, dir, spec) = installed_gridcraft("compress-verify-stale");
+        std::fs::write(dir.join("big.js"), "abcdefgh".repeat(300)).unwrap();
+        write_compressed_copies(&dir).unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(dir.join("big.js.br"))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let error = verify_specs(&root, vec![spec]).unwrap_err();
+        assert!(error.contains("big.js.br"), "{error}");
+        assert!(!error.contains("big.js.gz"), "{error}");
+        assert!(error.contains("editors compress gridcraft"), "{error}");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Copies are made before the swap: a failing compression leaves the old editor alone.
+    #[test]
+    fn a_failed_compression_leaves_the_old_editor_installed() {
+        let root = scratch("install-fail-root");
+        let built = scratch("install-fail-built");
+        let editors = root.join("editors");
+        std::fs::create_dir_all(editors.join("gridcraft")).unwrap();
+        std::fs::write(editors.join("gridcraft").join("index.html"), "old").unwrap();
+        std::fs::write(built.join("index.html"), "new").unwrap();
+        // A directory where a copy must go makes writing it fail.
+        std::fs::write(built.join("a.js"), "abcdefgh".repeat(300)).unwrap();
+        std::fs::create_dir_all(built.join("a.js.br.tmp")).unwrap();
+        std::fs::write(built.join("a.js.br.tmp").join("x"), "x").unwrap();
+        assert!(install(&root, "gridcraft", &built).is_err());
+        assert_eq!(
+            std::fs::read_to_string(editors.join("gridcraft").join("index.html")).unwrap(),
+            "old"
+        );
+        assert!(!editors.join("gridcraft.new").exists());
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::remove_dir_all(&built).unwrap();
     }
 
     /// Trunk leaves a `.trunk-lock` (and could leave other dot files) in its output; none of

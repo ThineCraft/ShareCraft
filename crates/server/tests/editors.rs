@@ -549,7 +549,6 @@ async fn compressed_answers_support_ranges_and_revalidation() {
 
     let first = get_wasm(&server, &ann, Some("br")).await;
     let headers = first.headers().clone();
-    println!("first headers: {headers:?}");
 
     let ranged = server
         .http(Some(&ann))
@@ -559,7 +558,6 @@ async fn compressed_answers_support_ranges_and_revalidation() {
         .send()
         .await
         .unwrap();
-    println!("range: {} {:?}", ranged.status(), ranged.headers());
     assert_eq!(ranged.status(), StatusCode::PARTIAL_CONTENT);
     assert_eq!(ranged.headers()[CONTENT_ENCODING], "br");
     assert_eq!(ranged.headers()[CONTENT_LENGTH], "5");
@@ -567,17 +565,19 @@ async fn compressed_answers_support_ranges_and_revalidation() {
     assert_eq!(range, format!("bytes 0-4/{}", WASM_BR.len()));
     assert_eq!(ranged.bytes().await.unwrap().as_ref(), &WASM_BR[..5]);
 
-    if let Some(etag) = headers.get(ETAG) {
-        let answer = server
-            .http(Some(&ann))
-            .get(server.url("/editors/gridcraft/app.wasm"))
-            .header(ACCEPT_ENCODING, "br")
-            .header(IF_NONE_MATCH, etag)
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(answer.status(), StatusCode::NOT_MODIFIED);
-    }
+    let etag = headers.get(ETAG).expect("an ETag");
+    let answer = server
+        .http(Some(&ann))
+        .get(server.url("/editors/gridcraft/app.wasm"))
+        .header(ACCEPT_ENCODING, "br")
+        .header(IF_NONE_MATCH, etag)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(answer.status(), StatusCode::NOT_MODIFIED);
+    // The plain file has its own validator: the br one does not match it.
+    let plain = get_wasm(&server, &ann, None).await;
+    assert_ne!(plain.headers()[ETAG], *etag);
     let modified = headers.get("last-modified").expect("Last-Modified");
     let answer = server
         .http(Some(&ann))
@@ -587,11 +587,61 @@ async fn compressed_answers_support_ranges_and_revalidation() {
         .send()
         .await
         .unwrap();
-    println!(
-        "if-modified-since: {} {:?}",
-        answer.status(),
-        answer.headers()
-    );
     assert_eq!(answer.status(), StatusCode::NOT_MODIFIED);
     assert_editor_headers(answer.headers());
+}
+
+/// The page itself, not only the wasm, is served compressed and keeps its policy.
+#[tokio::test]
+async fn the_editor_page_is_served_compressed() {
+    let server = spawn_server_config(|config| {
+        let folder = install_stub_editor(config, "gridcraft");
+        std::fs::write(folder.join("index.html.br"), b"page brotli copy").unwrap();
+        std::fs::write(folder.join("index.html.gz"), b"page gzip copy").unwrap();
+    })
+    .await;
+    let ann = server.user("Ann").await;
+    let response = server
+        .http(Some(&ann))
+        .get(server.url("/editors/gridcraft/index.html"))
+        .header(ACCEPT_ENCODING, "br, gzip")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let headers = response.headers().clone();
+    assert_eq!(headers[CONTENT_ENCODING], "br");
+    assert!(
+        headers[CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("text/html")
+    );
+    assert_editor_headers(&headers);
+    assert!(policies(&headers)[0].contains("'sha256-"));
+    assert_eq!(
+        response.bytes().await.unwrap().as_ref(),
+        b"page brotli copy"
+    );
+}
+
+/// HEAD answers with the headers of the copy a GET would send, and no body.
+#[tokio::test]
+async fn head_requests_describe_the_compressed_copy() {
+    let server = server_with_wasm(true).await;
+    let ann = server.user("Ann").await;
+    let response = server
+        .http(Some(&ann))
+        .head(server.url("/editors/gridcraft/app.wasm"))
+        .header(ACCEPT_ENCODING, "br")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let headers = response.headers().clone();
+    assert_eq!(headers[CONTENT_ENCODING], "br");
+    assert_eq!(headers[CONTENT_TYPE], "application/wasm");
+    assert_eq!(headers[CONTENT_LENGTH], WASM_BR.len().to_string().as_str());
+    assert_editor_headers(&headers);
+    assert!(response.bytes().await.unwrap().is_empty());
 }
