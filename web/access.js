@@ -5,6 +5,7 @@ import {
   ROLES,
   api,
   h,
+  inheritAgainMessage,
   messageFor,
   queryId,
   requireMe,
@@ -136,7 +137,7 @@ $('inherit-toggle').addEventListener('click', async () => {
   }
   const count = state.grants.length;
   const people = `${count} ${count === 1 ? 'person has' : 'people have'}`;
-  const from = above ? `“${above.name}”` : 'the place above';
+  const from = `“${await sourceAbove()}”`;
   $('inherit-text').textContent =
     `${people} an entry of their own on “${self.name}”. Inheriting again removes ` +
     `${count === 1 ? 'that entry' : 'those entries'}, and access comes from ${from} instead.`;
@@ -147,11 +148,19 @@ $('inherit-toggle').addEventListener('click', async () => {
 $('inherit-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   const result = await api('POST', `/nodes/${seg(nodeId)}/inheritance`, { inherit: true });
-  if (!result.ok) return showMessage($('inherit-error'), messageFor(result.error));
+  if (!result.ok) return showMessage($('inherit-error'), inheritAgainMessage(result.error));
   $('inherit-dialog').close();
   note('This item inherits its access again.', false);
   await refresh();
 });
+
+// The name of the scope access would come from after inheriting again: the place above, or the
+// place it inherits from in turn. Falls back to the place above if its access cannot be read.
+async function sourceAbove() {
+  if (!above) return 'the place above';
+  const result = await api('GET', `/nodes/${seg(above.id)}/access`);
+  return result.ok && result.data?.source?.name ? result.data.source.name : above.name;
+}
 
 function fail(text) {
   showMessage(error, text);

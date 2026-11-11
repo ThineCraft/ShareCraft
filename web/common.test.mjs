@@ -4,10 +4,12 @@ import {
   breadcrumbParts,
   breadcrumbs,
   canMoveHere,
+  inheritAgainMessage,
   messageFor,
   moveChoices,
   pageFor,
   removedMessage,
+  removedReasonOf,
   safeNext,
 } from './common.js';
 
@@ -129,6 +131,26 @@ test('every error code of the tree and access routes has its own sentence', () =
 test('a document that was deleted has its own removal message', () => {
   assert.equal(removedMessage('deleted'), 'This document was deleted.');
   assert.notEqual(removedMessage('access_revoked'), removedMessage('deleted'));
+});
+
+test('a removed frame is read as a removal even when the client cannot read it', () => {
+  assert.equal(removedReasonOf('{"type":"removed","reason":"deleted"}'), 'deleted');
+  assert.equal(removedReasonOf('{"type":"removed","reason":"something_new"}'), 'something_new');
+  assert.equal(removedReasonOf('{"type":"removed"}'), 'unknown');
+  assert.equal(removedReasonOf('{"type":"removed","reason":7}'), 'unknown');
+  assert.equal(removedReasonOf('{"type":"people","participants":[]}'), null);
+  assert.equal(removedReasonOf('not json'), null);
+  assert.equal(removedReasonOf('null'), null);
+  // An unknown reason still gets a sentence, never the missing-document one.
+  assert.equal(removedMessage('something_new'), 'Your access to this document ended.');
+});
+
+test('a refused "Inherit again" names who may do it', () => {
+  assert.equal(
+    inheritAgainMessage('forbidden'),
+    'Only an owner of the place above can make this inherit again.',
+  );
+  assert.equal(inheritAgainMessage('unavailable'), messageFor('unavailable'));
 });
 
 test('the move dialog never offers the item itself', () => {

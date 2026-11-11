@@ -61,7 +61,8 @@ a{color:var(--accent-ink)}
 .check input{width:18px;height:18px}
 button,.button{display:inline-flex;align-items:center;justify-content:center;min-height:36px;padding:6px 14px;border:1px solid var(--accent);border-radius:7px;background:var(--accent);color:#fff;cursor:pointer;text-decoration:none}
 button.plain,.button.plain{background:transparent;color:var(--accent-ink);border-color:var(--line)}
-button:disabled{opacity:.6;cursor:default}
+/* a disabled button is greyed in light and dark mode, whatever kind it is (plain, in a banner) */
+button:disabled,button.plain:disabled,.banner button:disabled{background:var(--band);border-color:var(--line);color:var(--muted);cursor:not-allowed}
 select{padding:6px 8px;min-height:36px;background:var(--paper);border:1px solid var(--line);border-radius:7px}
 .msg{margin:0;padding:8px 12px;border-radius:7px;background:var(--stop-bg);color:var(--stop-ink);font-size:13px}
 .msg.ok{background:var(--soft);color:var(--text)}

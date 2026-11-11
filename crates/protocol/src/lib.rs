@@ -69,6 +69,10 @@ pub enum RemovedReason {
     AccountDisabled,
     /// The document was deleted.
     Deleted,
+    /// A reason this build does not know, sent by a newer server. Never sent; a client reads
+    /// it as a removal all the same, so an unknown reason never looks like a broken frame.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Browser to server.
@@ -269,6 +273,27 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&RemovedReason::Deleted).unwrap(),
             "\"deleted\""
+        );
+    }
+
+    #[test]
+    fn unknown_removed_reason_is_still_a_removal() {
+        let msg: ServerMsg<u32> =
+            serde_json::from_str("{\"type\":\"removed\",\"reason\":\"moved_to_the_moon\"}")
+                .unwrap();
+        assert_eq!(
+            msg,
+            ServerMsg::Removed {
+                reason: RemovedReason::Unknown
+            }
+        );
+        let known: ServerMsg<u32> =
+            serde_json::from_str("{\"type\":\"removed\",\"reason\":\"deleted\"}").unwrap();
+        assert_eq!(
+            known,
+            ServerMsg::Removed {
+                reason: RemovedReason::Deleted
+            }
         );
     }
 

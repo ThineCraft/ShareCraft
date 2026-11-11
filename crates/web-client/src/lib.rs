@@ -1161,6 +1161,17 @@ mod tests {
     }
 
     #[test]
+    fn removed_for_an_unknown_reason_still_stops_the_client() {
+        let mut c = joined_client("ab");
+        let update = c
+            .receive(r#"{"type":"removed","reason":"a_reason_from_a_newer_server"}"#)
+            .unwrap();
+        assert_eq!(update.removed.as_deref(), Some("unknown"));
+        assert!(!c.joined());
+        assert_eq!(c.join_message().unwrap(), None);
+    }
+
+    #[test]
     fn save_state_on_joining_reflects_saved_through() {
         let mut c = ClientInner::new(me());
         c.join_message().unwrap();

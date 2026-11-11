@@ -46,9 +46,32 @@ export function removedMessage(reason) {
   return REMOVED[reason] ?? 'Your access to this document ended.';
 }
 
+/**
+ * The reason in a `removed` frame from the server, read without the text client: a frame the
+ * client could not read must still end the page as a removal, not as a broken connection.
+ * `'unknown'` when the reason is missing; `null` unless `data` is a `removed` frame.
+ */
+export function removedReasonOf(data) {
+  let message;
+  try {
+    message = JSON.parse(data);
+  } catch {
+    return null;
+  }
+  if (message?.type !== 'removed') return null;
+  return typeof message.reason === 'string' && message.reason !== '' ? message.reason : 'unknown';
+}
+
 /** The sentence for an API error code; unknown codes get a general one. */
 export function messageFor(code) {
   return Object.hasOwn(MESSAGES, code) ? MESSAGES[code] : 'Something went wrong. Try again.';
+}
+
+/** The sentence for a refused "Inherit again": only an owner of the place above may do it. */
+export function inheritAgainMessage(code) {
+  return code === 'forbidden'
+    ? 'Only an owner of the place above can make this inherit again.'
+    : messageFor(code);
 }
 
 /**

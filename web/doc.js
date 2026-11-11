@@ -8,6 +8,7 @@ import {
   messageFor,
   pageFor,
   removedMessage,
+  removedReasonOf,
   requireMe,
   seg,
   showCrumbs,
@@ -262,8 +263,14 @@ function handleFrame(data) {
   try {
     update = JSON.parse(client.receive(data));
   } catch (err) {
-    // Nothing changed in the client; joining again resumes or resets it.
     console.error(err);
+    // A removal the client could not read (a reason it does not know) is still a removal.
+    const reason = removedReasonOf(data);
+    if (reason != null) {
+      stopRemoved(reason);
+      return;
+    }
+    // Nothing changed in the client; joining again resumes or resets it.
     socket?.close();
     return;
   }
