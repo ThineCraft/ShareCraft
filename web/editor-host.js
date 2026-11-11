@@ -322,7 +322,8 @@ export function saveFailure(result, canRetry) {
 /**
  * Wires `frame` (an <iframe> whose page has not started loading yet) to its editor through
  * `bridge` (one of BRIDGES). `handlers` are called with the parsed messages: ready, save,
- * dirty and failed (`{error}`). Returns:
+ * dirty and failed (`{error}`, with `notAnswering: true` when the editor did not answer a
+ * request in time, which a later successful save settles). Returns:
  * - `open(name, bytes)`: hands the editor the stored file, after `ready`;
  * - `requestSave()`: asks the editor to save (its save arrives through `handlers.save`);
  *   returns whether it was asked;
@@ -379,6 +380,7 @@ function craftWebHost(frame, bridge, handlers) {
 
 const NOT_ANSWERING = 'The editor did not answer. Show this tab and try again.';
 class NotAnswering extends Error {}
+const KEPT_EXPORTS = 2;
 
 // SolidCraft's control requests: the page calls `frame.contentWindow.solidcraft.request(method,
 // params)`, which returns a Promise, and moves the design as JSON text. The editor keeps nothing
@@ -409,14 +411,28 @@ function solidcraftRequest(frame, bridge, handlers) {
     return Promise.race([call, late]).finally(() => clearTimeout(timer));
   }
 
+  // A request that was not answered in time is marked, so the page can say just that.
   const failed = (err) => {
-    if (!closed) handlers.failed?.({ error: String(err?.message ?? err ?? '') });
+    if (closed) return;
+    const error = String(err?.message ?? err ?? '');
+    handlers.failed?.(err instanceof NotAnswering ? { error, notAnswering: true } : { error });
   };
+
+  // The editor's interface, or null while it is not there or cannot be read yet (a window that
+  // is still being replaced may refuse to be read).
+  function editorInterface() {
+    try {
+      const found = frame.contentWindow?.solidcraft;
+      return found && typeof found.request === 'function' ? found : null;
+    } catch {
+      return null;
+    }
+  }
 
   function lookForInterface() {
     if (closed) return;
-    const found = frame.contentWindow?.solidcraft;
-    if (found && typeof found.request === 'function') {
+    const found = editorInterface();
+    if (found) {
       app = found;
       handlers.ready?.({ kind: 'ready', version: '1' });
       schedulePoll();
@@ -465,6 +481,8 @@ function solidcraftRequest(frame, bridge, handlers) {
     if (closed || typeof kept?.text !== 'string') return;
     const bytes = new TextEncoder().encode(kept.text);
     exports.set(bytes, kept.revision);
+    // The page uploads at most one save while one more waits: older exports are never stored.
+    while (exports.size > KEPT_EXPORTS) exports.delete(exports.keys().next().value);
     const stem = typeof kept.name === 'string' && kept.name.trim() ? kept.name.trim() : 'Design';
     handlers.save?.({ kind: 'save', name: `${stem}${bridge.extension}`, bytes, saveAs: false });
   }

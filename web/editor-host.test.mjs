@@ -478,3 +478,179 @@ test('a_request_timeout_is_reported_and_marks_nothing_stored', async () => {
   assert.equal(editor.count('document.saved'), 0);
   host.close();
 });
+
+test('ready_survives_a_window_that_throws_or_is_not_there_yet', async () => {
+  const { seen, handlers } = recorder();
+  const editor = standInEditor({ 'document.import': { revision: 1 }, 'document.export': exported(1, false) });
+  let reads = 0;
+  const frame = {
+    ownerDocument: { visibilityState: 'visible', defaultView: globalThis },
+    get contentWindow() {
+      reads++;
+      if (reads === 1) throw new Error('SecurityError: a cross-origin window');
+      if (reads === 2) return null;
+      return { solidcraft: editor.solidcraft };
+    },
+  };
+  const host = connect(frame, FAST, handlers);
+  await wait(60);
+  assert.equal(seen.ready, 1, 'found once the window lets it be read');
+  host.open('Bracket.solidcraft.json', new TextEncoder().encode(DESIGN));
+  await wait(20);
+  assert.equal(editor.count('document.import'), 1, 'the import is still sent');
+  host.close();
+});
+
+test('ready_detection_gives_up_after_its_time', async () => {
+  const { seen, handlers } = recorder();
+  let reads = 0;
+  const frame = {
+    ownerDocument: { visibilityState: 'visible', defaultView: globalThis },
+    get contentWindow() {
+      reads++;
+      throw new Error('SecurityError');
+    },
+  };
+  const host = connect(frame, { ...FAST, readyWithin: 40 }, handlers);
+  await wait(80);
+  const after = reads;
+  assert.ok(after >= 2, `looked ${after} times`);
+  await wait(40);
+  assert.equal(reads, after, 'it stopped looking');
+  assert.equal(seen.ready, 0);
+  assert.deepEqual(seen.failed, [], "the page's own ready timeout reports it");
+  host.close();
+});
+
+test('the_not_answering_failure_is_marked', async () => {
+  const { frame, appear } = standInFrame();
+  const failures = [];
+  const editor = standInEditor({ 'document.export': 'hang' });
+  appear(editor.solidcraft);
+  const host = connect(frame, { ...FAST, pollEvery: 100000, answerWithin: 20 }, {
+    failed: (message) => failures.push(message),
+  });
+  await wait(20);
+  host.requestSave();
+  await wait(60);
+  assert.equal(failures.length, 1);
+  assert.equal(failures[0].notAnswering, true);
+  assert.equal(failures[0].error, 'The editor did not answer. Show this tab and try again.');
+  host.close();
+});
+
+test('overlapping_saves_confirm_their_own_revisions', async () => {
+  const { frame, appear } = standInFrame();
+  const { seen, handlers } = recorder();
+  let revision = 4;
+  const editor = standInEditor({
+    'document.export': () => exported(++revision),
+    'document.saved': (p) => {
+      if (p.revision === 5) throw new Error('the design changed since revision 5 (now 6)');
+      return { revision: p.revision, dirty: false };
+    },
+  });
+  appear(editor.solidcraft);
+  const host = connect(frame, { ...FAST, pollEvery: 100000 }, handlers);
+  await wait(20);
+  host.requestSave();
+  host.requestSave();
+  await wait(20);
+  assert.equal(seen.save.length, 2);
+  host.stored(seen.save[0].bytes);
+  await wait(20);
+  host.stored(seen.save[1].bytes);
+  await wait(20);
+  assert.deepEqual(
+    editor.calls.filter((c) => c.method === 'document.saved').map((c) => c.params.revision),
+    [5, 6],
+  );
+  assert.deepEqual(seen.dirty, [true], 'the refused first confirmation reports unsaved');
+  host.close();
+});
+
+test('a_late_export_after_a_timeout_is_not_saved', async () => {
+  const { frame, appear } = standInFrame();
+  const { seen, handlers } = recorder();
+  appear({
+    request: (method) =>
+      method === 'document.export'
+        ? new Promise((resolve) => setTimeout(() => resolve(exported(9)), 60))
+        : Promise.resolve({}),
+  });
+  const host = connect(frame, { ...FAST, pollEvery: 100000, answerWithin: 20 }, handlers);
+  await wait(20);
+  host.requestSave();
+  await wait(120);
+  assert.equal(seen.failed.length, 1);
+  assert.equal(seen.save.length, 0, 'the late answer is never handed to the save path');
+  host.close();
+});
+
+test('polling_resumes_when_the_tab_is_shown', async () => {
+  const { frame, appear } = standInFrame();
+  const { handlers } = recorder();
+  const editor = standInEditor({ 'document.export': exported(2, true) });
+  appear(editor.solidcraft);
+  frame.ownerDocument.visibilityState = 'hidden';
+  const host = connect(frame, FAST, handlers);
+  await wait(50);
+  assert.equal(editor.count('document.export'), 0);
+  frame.ownerDocument.visibilityState = 'visible';
+  await wait(50);
+  assert.ok(editor.count('document.export') >= 1, 'polled again once shown');
+  host.close();
+});
+
+test('a_retried_save_still_confirms', async () => {
+  const { frame, appear } = standInFrame();
+  const { seen, handlers } = recorder();
+  const editor = standInEditor({
+    'document.export': exported(11),
+    'document.saved': (p) => ({ revision: p.revision, dirty: false }),
+  });
+  appear(editor.solidcraft);
+  const host = connect(frame, { ...FAST, pollEvery: 100000 }, handlers);
+  await wait(20);
+  host.requestSave();
+  await wait(20);
+  // The first upload of these bytes failed; the queue sends the same bytes object again,
+  // and that one is stored.
+  const bytes = seen.save[0].bytes;
+  await wait(20);
+  host.stored(bytes);
+  await wait(20);
+  assert.deepEqual(
+    editor.calls.filter((c) => c.method === 'document.saved').map((c) => c.params),
+    [{ revision: 11 }],
+  );
+  host.close();
+});
+
+test('only_the_two_newest_exports_are_kept', async () => {
+  const { frame, appear } = standInFrame();
+  const { seen, handlers } = recorder();
+  let revision = 0;
+  const editor = standInEditor({
+    'document.export': () => exported(++revision),
+    'document.saved': (p) => ({ revision: p.revision, dirty: false }),
+  });
+  appear(editor.solidcraft);
+  const host = connect(frame, { ...FAST, pollEvery: 100000 }, handlers);
+  await wait(20);
+  for (let i = 0; i < 3; i++) {
+    host.requestSave();
+    await wait(10);
+  }
+  assert.equal(seen.save.length, 3);
+  host.stored(seen.save[0].bytes); // dropped: older than the two kept
+  await wait(20);
+  assert.equal(editor.count('document.saved'), 0);
+  host.stored(seen.save[2].bytes);
+  await wait(20);
+  assert.deepEqual(
+    editor.calls.filter((c) => c.method === 'document.saved').map((c) => c.params.revision),
+    [3],
+  );
+  host.close();
+});

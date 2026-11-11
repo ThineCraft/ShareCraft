@@ -453,8 +453,12 @@ function startEditor() {
     ready: onReady,
     save: onEditorSave,
     dirty: onDirty,
-    failed: ({ error }) =>
-      editorFailed(error ? `The editor reported a problem: ${error}` : 'The editor reported a problem.'),
+    failed: ({ error, notAnswering }) => {
+      if (removed) return;
+      // Not answering in time passes: a later save that goes through settles it.
+      if (notAnswering) setNotice({ kind: 'not_answering', text: error });
+      else editorFailed(error ? `The editor reported a problem: ${error}` : 'The editor reported a problem.');
+    },
   });
   readyTimer = setTimeout(() => editorFailed('The editor did not start within 60 seconds.'), READY_TIMEOUT);
   element.src = editorUrl(doc.editor, me.name);
@@ -561,7 +565,7 @@ function onQueue(event) {
     // The editor hears that its save is stored (an editor that needs telling); a save that
     // went through also settles an earlier save problem or an editor that did not answer.
     bridge?.stored(event.bytes);
-    if (notice?.kind === 'save' || notice?.kind === 'editor') setNotice(null);
+    if (notice?.kind === 'save' || notice?.kind === 'not_answering') setNotice(null);
   } else if (event.type === 'not_stored') {
     if (event.result.staleSeat && canSave()) {
       // Sent again with the new token: the refused save, or the newer one already waiting.
