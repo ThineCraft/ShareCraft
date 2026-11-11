@@ -17,10 +17,11 @@ mod file_room;
 mod members;
 mod projection;
 mod room;
+pub mod tree;
 mod ws;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use axum::Router;
 use axum::extract::Request;
@@ -63,6 +64,11 @@ struct Shared {
     events: EventSink,
     throttle: Throttle,
     next_conn: AtomicU64,
+    /// Held for the whole of each tree change, so changes are judged and written one at a time.
+    tree_lock: tokio::sync::Mutex<()>,
+    /// Set when PostgreSQL's tree could not be brought back in step with Git after a change;
+    /// tree changes are refused until a reconcile of the whole tree succeeds.
+    tree_out_of_step: AtomicBool,
 }
 
 impl AppState {
@@ -81,6 +87,8 @@ impl AppState {
                 db,
                 throttle: Throttle::default(),
                 next_conn: AtomicU64::new(1),
+                tree_lock: tokio::sync::Mutex::new(()),
+                tree_out_of_step: AtomicBool::new(false),
             }),
         }
     }
@@ -117,6 +125,14 @@ impl AppState {
 
     fn rooms(&self) -> &Rooms {
         &self.shared.rooms
+    }
+
+    fn tree_lock(&self) -> &tokio::sync::Mutex<()> {
+        &self.shared.tree_lock
+    }
+
+    fn tree_out_of_step(&self) -> &AtomicBool {
+        &self.shared.tree_out_of_step
     }
 
     fn next_conn(&self) -> u64 {
@@ -219,14 +235,17 @@ async fn security_headers(request: Request, next: Next) -> Response {
 /// Serves `config` on `listener` until the process ends, storing documents in the library
 /// repository under `config.data_dir` (see [`library_path`]) and records in the database at
 /// `config.database_url`, whose schema it brings up to date first. Before accepting
-/// connections it reconciles the revisions recorded in the database with Git (see
-/// [`reconcile`]) and prints one line with the counts. Once ready, it prints the address it
+/// connections it reconciles the content tree in the database with Git (see
+/// [`tree::reconcile`]), adopts documents recorded before the tree (see
+/// [`tree::adopt_flat_documents`]), reconciles the revisions recorded in the database with Git
+/// (see [`reconcile`]), and prints one line with the counts of each. Once ready, it prints the address it
 /// listens on and that it runs in development mode, then accepts connections.
 ///
 /// # Errors
 /// Returns an error if the listener is not on a loopback address, if the database cannot be
-/// reached or migrated, if the library repository cannot be opened, created or listed, or if
-/// accepting connections fails.
+/// reached or migrated, if the library repository cannot be opened, created or listed, if the
+/// tree cannot be read or the adoption fails (a missing administrator is only reported: the
+/// documents wait for a start with one), or if accepting connections fails.
 pub async fn serve(config: Config, listener: TcpListener) -> std::io::Result<()> {
     let addr = listener.local_addr()?;
     require_loopback(addr)?;
@@ -244,6 +263,26 @@ pub async fn serve(config: Config, listener: TcpListener) -> std::io::Result<()>
     .await
     .map_err(std::io::Error::other)??;
     let store: Arc<dyn Checkpointer> = Arc::new(opened);
+    let tree_report = tree::reconcile(Arc::clone(&store), &db)
+        .await
+        .map_err(|e| std::io::Error::other(format!("cannot reconcile the content tree: {e}")))?;
+    match tree::adopt_flat_documents(Arc::clone(&store), &db).await {
+        Ok(Some(adopted)) => println!("Reconciled the tree with Git: {tree_report}; {adopted}"),
+        Ok(None) => println!("Reconciled the tree with Git: {tree_report}; nothing to adopt"),
+        // Nothing was written; the documents wait, unseen, for a start with an administrator.
+        Err(e @ tree::TreeError::NoAdministrator) => {
+            println!("Reconciled the tree with Git: {tree_report}; nothing adopted");
+            eprintln!("sharecraft-server: existing documents not adopted: {e}");
+        }
+        Err(e) => {
+            return Err(std::io::Error::other(format!(
+                "cannot adopt the existing documents: {e}"
+            )));
+        }
+    }
+    for (node, error) in &tree_report.failed {
+        eprintln!("sharecraft-server: node {node} of the content tree not reconciled: {error}");
+    }
     let report = reconcile(Arc::clone(&store), &db)
         .await
         .map_err(|e| std::io::Error::other(format!("cannot list the documents in Git: {e}")))?;

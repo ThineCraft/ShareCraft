@@ -2,14 +2,15 @@
 
 use collab_core::ids::{NodeId, UserId};
 use serde::{Deserialize, Serialize};
-use sqlx::Row;
 use sqlx::postgres::PgRow;
+use sqlx::{PgConnection, Row};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::documents::UNIQUE_VIOLATION;
 use crate::events::{NewEvent, record};
-use crate::{AccessError, Db, DbError};
+use crate::scopes::role_in;
+use crate::{AccessError, Db, DbError, Editor, Role};
 
 const MAX_NAME_CHARS: usize = 120;
 const REFUSED_CHARS: [char; 9] = ['"', '*', ':', '<', '>', '?', '/', '\\', '|'];
@@ -110,6 +111,109 @@ pub(crate) fn node_from_row(row: &PgRow) -> Result<Node, sqlx::Error> {
     })
 }
 
+/// A change to the tree as PostgreSQL applies it once Git has recorded it: the rows, their
+/// events, and what the person making it must still be allowed to do, judged in the same
+/// transaction with the rows concerned locked.
+#[derive(Clone, Debug, Default)]
+pub struct NodeChange<'a> {
+    /// The nodes as Git now holds them, each parent before its children.
+    pub rows: &'a [NodeRow],
+    /// The events to record with the change.
+    pub events: Vec<NewEvent>,
+    /// Who makes the change; `None` for the server itself.
+    pub actor: Option<UserId>,
+    /// Whether `actor` must be an enabled administrator.
+    pub needs_admin: bool,
+    /// Nodes `actor` must have at least the given role on. Each is locked in this order, `FOR
+    /// UPDATE` if it is one of `rows` and `FOR SHARE` otherwise, before the roles are judged:
+    /// list ancestors before descendants, as access changes lock them.
+    pub needs: &'a [(NodeId, Role)],
+    /// Gives `actor` an owner assignment on the first row's node (a new site).
+    pub owner: bool,
+    /// Records the first row's node as a new document opened in this editor, created by
+    /// `actor`.
+    pub document: Option<Editor>,
+}
+
+/// Inserts or updates `row`, and for a document node the name of its `documents` row.
+pub(crate) async fn upsert_node(conn: &mut PgConnection, row: &NodeRow) -> Result<(), AccessError> {
+    let result = sqlx::query(
+        "insert into nodes \
+             (id, kind, parent_id, site_id, name, unique_scope, deleted_at, deleted_by, \
+              created_by, created_at) \
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+         on conflict (id) do update set \
+             kind = excluded.kind, parent_id = excluded.parent_id, \
+             site_id = excluded.site_id, name = excluded.name, \
+             deleted_at = excluded.deleted_at, deleted_by = excluded.deleted_by",
+    )
+    .bind(row.id.0)
+    .bind(row.kind.as_str())
+    .bind(row.parent.map(|p| p.0))
+    .bind(row.site.0)
+    .bind(&row.name)
+    .bind(row.kind == NodeKind::Site)
+    .bind(row.deleted_at)
+    .bind(row.deleted_by.map(|u| u.0))
+    .bind(row.created_by.map(|u| u.0))
+    .bind(row.created_at)
+    .execute(&mut *conn)
+    .await;
+    match result {
+        Ok(_) => {}
+        Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some(UNIQUE_VIOLATION) => {
+            return Err(AccessError::NameTaken);
+        }
+        Err(e) => return Err(e.into()),
+    }
+    if row.kind == NodeKind::Document {
+        sqlx::query("update documents set name = $2 where id = $1")
+            .bind(row.id.0)
+            .bind(&row.name)
+            .execute(&mut *conn)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Locks the nodes `change` needs, in its order, and judges its actor's roles on them.
+async fn judge(conn: &mut PgConnection, change: &NodeChange<'_>) -> Result<(), AccessError> {
+    if !change.needs_admin && change.needs.is_empty() {
+        return Ok(());
+    }
+    let actor = change.actor.ok_or(AccessError::Forbidden)?;
+    if change.needs_admin {
+        let admin: Option<bool> = sqlx::query_scalar(
+            "select is_admin and disabled_at is null from users where id = $1 for share",
+        )
+        .bind(actor.0)
+        .fetch_optional(&mut *conn)
+        .await?;
+        if admin != Some(true) {
+            return Err(AccessError::Forbidden);
+        }
+    }
+    for (id, _) in change.needs {
+        let statement = if change.rows.iter().any(|row| row.id == *id) {
+            "select id from nodes where id = $1 for update"
+        } else {
+            "select id from nodes where id = $1 for share"
+        };
+        sqlx::query(statement)
+            .bind(id.0)
+            .execute(&mut *conn)
+            .await?;
+    }
+    for (id, needed) in change.needs {
+        match role_in(&mut *conn, actor, *id).await? {
+            None => return Err(AccessError::NotFound),
+            Some(role) if role < *needed => return Err(AccessError::Forbidden),
+            Some(_) => {}
+        }
+    }
+    Ok(())
+}
+
 impl Db {
     /// Applies one node as Git holds it, in one transaction: inserts or updates the row (kind,
     /// parent, site, name, deleted), writes `event` if given, and for a document node updates
@@ -121,48 +225,107 @@ impl Db {
         row: &NodeRow,
         event: Option<NewEvent>,
     ) -> Result<(), AccessError> {
+        self.apply_nodes(NodeChange {
+            rows: std::slice::from_ref(row),
+            events: event.into_iter().collect(),
+            ..NodeChange::default()
+        })
+        .await
+    }
+
+    /// Applies `change` in one transaction: locks and judges what it needs (`NotFound` if the
+    /// actor no longer has a role on a node it needs, `Forbidden` if the role is too low or
+    /// they are no longer an enabled administrator when that is needed), records the new
+    /// document if any (`Exists` if its id is taken), applies each row as
+    /// [`Db::apply_node`] does, gives the owner assignment if asked, and writes the events.
+    pub async fn apply_nodes(&self, change: NodeChange<'_>) -> Result<(), AccessError> {
         let mut tx = self.pool().begin().await?;
-        let result = sqlx::query(
-            "insert into nodes \
-                 (id, kind, parent_id, site_id, name, unique_scope, deleted_at, deleted_by, \
-                  created_by, created_at) \
-             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
-             on conflict (id) do update set \
-                 kind = excluded.kind, parent_id = excluded.parent_id, \
-                 site_id = excluded.site_id, name = excluded.name, \
-                 deleted_at = excluded.deleted_at, deleted_by = excluded.deleted_by",
-        )
-        .bind(row.id.0)
-        .bind(row.kind.as_str())
-        .bind(row.parent.map(|p| p.0))
-        .bind(row.site.0)
-        .bind(&row.name)
-        .bind(row.kind == NodeKind::Site)
-        .bind(row.deleted_at)
-        .bind(row.deleted_by.map(|u| u.0))
-        .bind(row.created_by.map(|u| u.0))
-        .bind(row.created_at)
-        .execute(&mut *tx)
-        .await;
-        match result {
-            Ok(_) => {}
-            Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some(UNIQUE_VIOLATION) => {
-                return Err(AccessError::NameTaken);
+        judge(&mut tx, &change).await?;
+        if let (Some(editor), Some(first)) = (change.document, change.rows.first()) {
+            let inserted = sqlx::query(
+                "insert into documents (id, name, editor, created_by) values ($1, $2, $3, $4)",
+            )
+            .bind(first.id.0)
+            .bind(&first.name)
+            .bind(editor.id())
+            .bind(change.actor.map(|u| u.0))
+            .execute(&mut *tx)
+            .await;
+            match inserted {
+                Ok(_) => {}
+                Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some(UNIQUE_VIOLATION) => {
+                    return Err(AccessError::Exists);
+                }
+                Err(e) => return Err(e.into()),
             }
-            Err(e) => return Err(e.into()),
         }
-        if row.kind == NodeKind::Document {
-            sqlx::query("update documents set name = $2 where id = $1")
-                .bind(row.id.0)
-                .bind(&row.name)
-                .execute(&mut *tx)
-                .await?;
+        for row in change.rows {
+            upsert_node(&mut tx, row).await?;
         }
-        if let Some(event) = event {
+        if let (true, Some(actor), Some(first)) = (change.owner, change.actor, change.rows.first())
+        {
+            sqlx::query(
+                "insert into scope_access (node_id, user_id, role, granted_by) \
+                 values ($1, $2, 'owner', $2) \
+                 on conflict (node_id, user_id) do update set role = 'owner'",
+            )
+            .bind(first.id.0)
+            .bind(actor.0)
+            .execute(&mut *tx)
+            .await?;
+        }
+        for event in change.events {
             record(&mut tx, event).await?;
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Every node as PostgreSQL holds it, deleted or not, for comparing with Git.
+    pub async fn node_rows(&self) -> Result<Vec<NodeRow>, DbError> {
+        let rows = sqlx::query(
+            "select id, kind, parent_id, site_id, name, deleted_at, deleted_by, created_by, \
+                    created_at from nodes",
+        )
+        .fetch_all(self.pool())
+        .await?;
+        rows.iter()
+            .map(|row| {
+                let kind: String = row.try_get("kind")?;
+                Ok(NodeRow {
+                    id: NodeId(row.try_get("id")?),
+                    kind: NodeKind::parse(&kind).ok_or_else(|| {
+                        sqlx::Error::Decode(format!("unknown node kind {kind:?}").into())
+                    })?,
+                    parent: row.try_get::<Option<Uuid>, _>("parent_id")?.map(NodeId),
+                    site: NodeId(row.try_get("site_id")?),
+                    name: row.try_get("name")?,
+                    deleted_at: row.try_get("deleted_at")?,
+                    deleted_by: row.try_get::<Option<Uuid>, _>("deleted_by")?.map(UserId),
+                    created_by: row.try_get::<Option<Uuid>, _>("created_by")?.map(UserId),
+                    created_at: row.try_get("created_at")?,
+                })
+            })
+            .collect::<Result<_, sqlx::Error>>()
+            .map_err(DbError::from)
+    }
+
+    /// Whether no undeleted site other than `except` is named `name`, ignoring case.
+    pub async fn site_name_free(
+        &self,
+        name: &str,
+        except: Option<NodeId>,
+    ) -> Result<bool, DbError> {
+        let taken: bool = sqlx::query_scalar(
+            "select exists (select 1 from nodes \
+                 where parent_id is null and lower(name) = lower($1) and deleted_at is null \
+                   and ($2::uuid is null or id <> $2))",
+        )
+        .bind(name)
+        .bind(except.map(|e| e.0))
+        .fetch_one(self.pool())
+        .await?;
+        Ok(!taken)
     }
 
     /// The node with this id, deleted or not, whoever may see it.

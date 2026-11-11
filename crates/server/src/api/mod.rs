@@ -169,6 +169,8 @@ impl From<AccessError> for ApiError {
             | AccessError::IsSite => ApiError::InvalidRequest,
             // The server picks a fresh random id, so a clash is not the caller's doing.
             AccessError::Exists | AccessError::Db(_) => ApiError::unavailable(&e),
+            // The tree is being repaired; a later attempt can succeed.
+            AccessError::OutOfStep => ApiError::Unavailable,
         }
     }
 }

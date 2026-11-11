@@ -181,6 +181,10 @@ pub enum AccessError {
     NotEmpty,
     #[error("a site cannot do that")]
     IsSite,
+    /// The tree in PostgreSQL no longer matches Git and could not be repaired yet; tree changes
+    /// wait until it is.
+    #[error("the content tree is being repaired; try again shortly")]
+    OutOfStep,
     #[error(transparent)]
     Db(#[from] DbError),
 }
@@ -189,6 +193,14 @@ impl From<sqlx::Error> for AccessError {
     fn from(e: sqlx::Error) -> Self {
         AccessError::Db(e.into())
     }
+}
+
+/// Checks a document's name: the rule for every node's name (see [`validate_node_name`]), and
+/// for a file, its editor's extension with something before it. Returns the trimmed name.
+pub fn validate_document_name(name: &str, editor: Editor) -> Result<&str, AccessError> {
+    let name = validate_node_name(name)?;
+    check_extension(name, editor)?;
+    Ok(name)
 }
 
 /// A file document's name must be the editor's extension with something before it.
@@ -210,7 +222,7 @@ pub(crate) fn parse_role(text: &str) -> Result<Role, sqlx::Error> {
     Role::parse(text).ok_or_else(|| sqlx::Error::Decode(format!("unknown role {text:?}").into()))
 }
 
-fn document_from_row(row: &PgRow) -> Result<Document, sqlx::Error> {
+pub(crate) fn document_from_row(row: &PgRow) -> Result<Document, sqlx::Error> {
     Ok(Document {
         id: DocId(row.try_get("id")?),
         name: row.try_get("name")?,
@@ -255,8 +267,7 @@ impl Db {
         editor: Editor,
         uploaded: Option<usize>,
     ) -> Result<Document, AccessError> {
-        let name = validate_node_name(name)?;
-        check_extension(name, editor)?;
+        let name = validate_document_name(name, editor)?;
         let mut tx = self.pool().begin().await?;
         let disabled: Option<bool> =
             sqlx::query_scalar("select disabled_at is not null from users where id = $1")
