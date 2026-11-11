@@ -1,1 +1,4 @@
 crates/server/tests/fixtures/editors/** text eol=lf
+# A migration is identified by a checksum of its bytes, so its line endings must not depend on
+# the checkout: with CRLF a database migrated from an LF copy refuses to start.
+crates/records/migrations/*.sql text eol=lf
