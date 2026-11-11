@@ -796,7 +796,6 @@ fn build(root: &Path, id: &str) -> Result<()> {
     run(Command::new("trunk")
         .current_dir(worktree.path.join(&spec.app))
         .env("CARGO_TARGET_DIR", &target)
-        .envs(trunk_env())
         .args(["build", "--release", "--public-url", "./", "--dist"])
         .arg(&dist.0))?;
 
@@ -963,13 +962,6 @@ fn install(root: &Path, id: &str, built: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Environment variables every editor build gets besides `CARGO_TARGET_DIR`. SolidCraft's release
-/// profile keeps line tables for desktop crash reports, which a browser build has no use for (the
-/// other forks already build with none), so the build turns release debug information off.
-fn trunk_env() -> [(&'static str, &'static str); 1] {
-    [("CARGO_PROFILE_RELEASE_DEBUG", "false")]
-}
-
 /// Copies the folder `from`, with everything in it except dot files and dot folders (trunk's
 /// `.trunk-lock` among them, which the server has no use for), to `to`.
 fn copy_dir(from: &Path, to: &Path) -> Result<()> {
@@ -1000,11 +992,6 @@ fn copy_dir(from: &Path, to: &Path) -> Result<()> {
 )]
 mod tests {
     use super::*;
-
-    #[test]
-    fn trunk_env_turns_off_release_debug_information() {
-        assert!(trunk_env().contains(&("CARGO_PROFILE_RELEASE_DEBUG", "false")));
-    }
 
     const MODULE_SCRIPT: &str = "\nimport init from './app.js';\ninit();\n";
     const NON_ASCII_SCRIPT: &str = "caf\u{e9} \u{2603} \u{65e5}\u{672c}\u{8a9e}";
