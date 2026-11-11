@@ -18,9 +18,11 @@ use common::{TestClient, new_doc, spawn_server, spawn_server_with, wait_events};
 use records::{Event, NewEvent};
 use reqwest::StatusCode;
 use revisions::{
-    Checkpoint, CheckpointError, GitError, Outcome, RevisionId, RevisionInfo, RevisionStore, Stored,
+    Checkpoint, CheckpointError, GitError, Outcome, RevisionId, RevisionInfo, RevisionStore,
+    Stored, TreeChange, TreeRecord,
 };
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 fn kinds(events: &[Event]) -> Vec<&str> {
     events.iter().map(|e| e.kind.as_str()).collect()
@@ -99,6 +101,18 @@ impl server::Checkpointer for Flaky {
 
     fn documents(&self) -> Result<Vec<DocId>, GitError> {
         self.inner.documents()
+    }
+
+    fn write_tree(&self, change: &TreeChange<'_>) -> Result<RevisionId, CheckpointError> {
+        self.inner.write_tree(change)
+    }
+
+    fn read_tree(&self) -> Result<Vec<TreeRecord>, CheckpointError> {
+        self.inner.read_tree()
+    }
+
+    fn read_tree_record(&self, id: Uuid) -> Result<Option<TreeRecord>, CheckpointError> {
+        self.inner.read_tree_record(id)
     }
 }
 

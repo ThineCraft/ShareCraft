@@ -25,10 +25,12 @@ use reqwest::header::{
     X_CONTENT_TYPE_OPTIONS,
 };
 use revisions::{
-    Checkpoint, CheckpointError, GitError, Outcome, RevisionId, RevisionInfo, RevisionStore, Stored,
+    Checkpoint, CheckpointError, GitError, Outcome, RevisionId, RevisionInfo, RevisionStore,
+    Stored, TreeChange, TreeRecord,
 };
 use serde_json::Value;
 use server::Checkpointer;
+use uuid::Uuid;
 
 const SEAT: &str = "x-sharecraft-seat";
 const REVISION: &str = "x-sharecraft-revision";
@@ -42,10 +44,12 @@ fn every_byte() -> Vec<u8> {
 const HTML_PAGE: &[u8] =
     b"<!doctype html><html><body><script>alert(document.cookie)</script></body></html>";
 
+/// Uploads `body` as `name` into `user`'s own folder.
 async fn upload(site: &Site, user: &TestUser, name: &str, body: Vec<u8>) -> reqwest::Response {
+    let parent = home(site, user).await;
     site.http(Some(user))
         .post(site.url("/api/docs/upload"))
-        .query(&[("name", name)])
+        .query(&[("parent", parent.as_str()), ("name", name)])
         .body(body)
         .send()
         .await
@@ -127,16 +131,28 @@ async fn shared_file(server: &TestServer) -> (DocId, TestUser, TestUser, TestUse
     (doc, ann, bob, vic)
 }
 
-/// How many documents `user` can see.
-async fn documents_of(site: &Site, user: &TestUser) -> usize {
+/// The id of `user`'s own folder, where their uploads go.
+async fn home(site: &Site, user: &TestUser) -> String {
+    site.home_of(user).await.0.to_string()
+}
+
+/// The documents in `user`'s own folder, as they list it.
+async fn listed(site: &Site, user: &TestUser) -> Vec<Value> {
+    let folder = home(site, user).await;
     let response = site
         .http(Some(user))
-        .get(site.url("/api/docs"))
+        .get(site.url(&format!("/api/nodes/{folder}/children")))
         .send()
         .await
         .unwrap();
-    let list: Vec<Value> = response.json().await.unwrap();
-    list.len()
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: Value = response.json().await.unwrap();
+    page["items"].as_array().unwrap().clone()
+}
+
+/// How many documents `user` has in their own folder, where their uploads go.
+async fn documents_of(site: &Site, user: &TestUser) -> usize {
+    listed(site, user).await.len()
 }
 
 /// Asserts that `response` carries each header of a download once.
@@ -502,9 +518,11 @@ async fn bad_file_names_are_refused() {
         );
     }
     // No name at all.
+    let parent = home(&server, &ann).await;
     let response = server
         .http(Some(&ann))
         .post(server.url("/api/docs/upload"))
+        .query(&[("parent", parent.as_str())])
         .body(b"data".to_vec())
         .send()
         .await
@@ -542,15 +560,7 @@ async fn non_ascii_file_name_survives_download() {
          filename*=UTF-8''B%C3%BCdget%20%E2%80%93%20%E6%97%A5%E6%9C%AC.xlsx"
     );
     // The name the document list shows is the one given.
-    let list: Vec<Value> = server
-        .http(Some(&ann))
-        .get(server.url("/api/docs"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let list = listed(&server, &ann).await;
     assert_eq!(
         list[0]["name"],
         "B\u{fc}dget \u{2013} \u{65e5}\u{672c}.xlsx"
@@ -597,9 +607,10 @@ async fn cross_origin_save_is_refused() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let parent = home(&server, &ann).await;
     let response = client
         .post(server.url("/api/docs/upload"))
-        .query(&[("name", "Cross.xlsx")])
+        .query(&[("parent", parent.as_str()), ("name", "Cross.xlsx")])
         .header(ORIGIN, "http://evil.example")
         .body(b"cross".to_vec())
         .send()
@@ -648,6 +659,18 @@ impl Checkpointer for CannotWrite {
 
     fn documents(&self) -> Result<Vec<DocId>, GitError> {
         self.0.documents()
+    }
+
+    fn write_tree(&self, change: &TreeChange<'_>) -> Result<RevisionId, CheckpointError> {
+        self.0.write_tree(change)
+    }
+
+    fn read_tree(&self) -> Result<Vec<TreeRecord>, CheckpointError> {
+        self.0.read_tree()
+    }
+
+    fn read_tree_record(&self, id: Uuid) -> Result<Option<TreeRecord>, CheckpointError> {
+        self.0.read_tree_record(id)
     }
 }
 
@@ -750,10 +773,11 @@ async fn files_up_to_the_limit_pass_and_larger_ones_do_not() {
     let chunks: Vec<Result<Vec<u8>, std::io::Error>> = (0..(LIMIT / 1024 + 2))
         .map(|_| Ok(vec![7u8; 1024]))
         .collect();
+    let parent = home(&server, &ann).await;
     let response = server
         .http(Some(&ann))
         .post(server.url("/api/docs/upload"))
-        .query(&[("name", "Chunked.xlsx")])
+        .query(&[("parent", parent.as_str()), ("name", "Chunked.xlsx")])
         .body(reqwest::Body::wrap_stream(futures_util::stream::iter(
             chunks,
         )))

@@ -9,6 +9,7 @@
 
 mod common;
 
+use collab_core::ids::NodeId;
 use common::{TestServer, TestUser, spawn_server};
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
@@ -41,16 +42,49 @@ async fn call(
     (status, body)
 }
 
-/// Creates a document owned by `user` and returns its id.
-async fn create_doc(server: &TestServer, user: &TestUser, name: &str) -> String {
+/// `POST /api/docs` with `body`, as `user`, into their own folder unless `body` names a
+/// parent.
+async fn post_doc(server: &TestServer, user: &TestUser, mut body: Value) -> (StatusCode, Value) {
+    if body.get("parent").is_none() {
+        body["parent"] = json!(server.home_of(user).await.0.to_string());
+    }
+    call(server, Some(user), Method::POST, "/api/docs", Some(body)).await
+}
+
+/// The children of `folder` that `user` can see; none when they can reach nothing there.
+async fn listed_in(server: &TestServer, user: &TestUser, folder: NodeId) -> Value {
     let (status, body) = call(
         server,
         Some(user),
-        Method::POST,
-        "/api/docs",
-        Some(json!({ "name": name })),
+        Method::GET,
+        &format!("/api/nodes/{}/children", folder.0),
+        None,
     )
     .await;
+    if status == StatusCode::NOT_FOUND {
+        return json!([]);
+    }
+    assert_eq!(status, StatusCode::OK);
+    body["items"].clone()
+}
+
+/// The grants on the scope that decides access to `doc`, as its owner `user` sees them.
+async fn grants(server: &TestServer, user: &TestUser, doc: &str) -> Value {
+    let (status, body) = call(
+        server,
+        Some(user),
+        Method::GET,
+        &format!("/api/docs/{doc}/access"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    body["grants"].clone()
+}
+
+/// Creates a document in `user`'s own folder (so they own it) and returns its id.
+async fn create_doc(server: &TestServer, user: &TestUser, name: &str) -> String {
+    let (status, body) = post_doc(server, user, json!({ "name": name })).await;
     assert_eq!(status, StatusCode::CREATED);
     body["id"].as_str().unwrap().to_owned()
 }
@@ -73,33 +107,18 @@ async fn creator_owns_and_lists_the_new_document() {
     let server = spawn_server().await;
     let ann = server.user("ann").await;
 
-    let (status, body) = call(
-        &server,
-        Some(&ann),
-        Method::POST,
-        "/api/docs",
-        Some(json!({ "name": "  Plans " })),
-    )
-    .await;
+    let (status, body) = post_doc(&server, &ann, json!({ "name": "  Plans " })).await;
     assert_eq!(status, StatusCode::CREATED);
     assert_eq!(body["name"], "Plans");
     assert_eq!(body["role"], "owner");
     let id = body["id"].as_str().unwrap().to_owned();
 
     // The name is optional.
-    let (status, body) = call(
-        &server,
-        Some(&ann),
-        Method::POST,
-        "/api/docs",
-        Some(json!({})),
-    )
-    .await;
+    let (status, body) = post_doc(&server, &ann, json!({})).await;
     assert_eq!(status, StatusCode::CREATED);
     assert_eq!(body["name"], "Untitled");
 
-    let (status, list) = call(&server, Some(&ann), Method::GET, "/api/docs", None).await;
-    assert_eq!(status, StatusCode::OK);
+    let list = listed_in(&server, &ann, server.home_of(&ann).await).await;
     let list = list.as_array().unwrap();
     assert_eq!(list.len(), 2);
     let plans = list.iter().find(|d| d["id"] == id.as_str()).unwrap();
@@ -122,14 +141,7 @@ async fn creator_owns_and_lists_the_new_document() {
     );
 
     // Names the records layer refuses, and ids that are not ids.
-    let (status, body) = call(
-        &server,
-        Some(&ann),
-        Method::POST,
-        "/api/docs",
-        Some(json!({ "name": "a/b" })),
-    )
-    .await;
+    let (status, body) = post_doc(&server, &ann, json!({ "name": "a/b" })).await;
     assert_eq!(
         (status, body),
         (StatusCode::UNPROCESSABLE_ENTITY, error("invalid_name"))
@@ -194,7 +206,9 @@ async fn stranger_gets_404_for_document_and_its_access_list() {
     .await;
     assert_eq!((status, body), (StatusCode::NOT_FOUND, error("not_found")));
 
-    let (_, list) = call(&server, Some(&bob), Method::GET, "/api/docs", None).await;
+    let (_, sites) = call(&server, Some(&bob), Method::GET, "/api/sites", None).await;
+    assert_eq!(sites, json!([]));
+    let list = listed_in(&server, &bob, server.home_of(&ann).await).await;
     assert_eq!(list, json!([]));
 }
 
@@ -206,7 +220,8 @@ async fn owner_shares_by_email_and_the_grantee_lists_the_document() {
     let id = create_doc(&server, &ann, "Shared").await;
 
     share(&server, &ann, &id, &bob.email, "viewer").await;
-    let (_, list) = call(&server, Some(&bob), Method::GET, "/api/docs", None).await;
+    let home = server.home_of(&ann).await;
+    let list = listed_in(&server, &bob, home).await;
     assert_eq!(list.as_array().unwrap().len(), 1);
     assert_eq!(list[0]["id"], id.as_str());
     assert_eq!(list[0]["role"], "viewer");
@@ -223,14 +238,7 @@ async fn owner_shares_by_email_and_the_grantee_lists_the_document() {
 
     // Changing the role replaces it.
     share(&server, &ann, &id, &bob.email, "editor").await;
-    let (_, access) = call(
-        &server,
-        Some(&ann),
-        Method::GET,
-        &format!("/api/docs/{id}/access"),
-        None,
-    )
-    .await;
+    let access = grants(&server, &ann, &id).await;
     let access = access.as_array().unwrap();
     assert_eq!(access.len(), 2);
     let row = access
@@ -251,7 +259,7 @@ async fn owner_shares_by_email_and_the_grantee_lists_the_document() {
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
-    let (_, list) = call(&server, Some(&bob), Method::GET, "/api/docs", None).await;
+    let list = listed_in(&server, &bob, home).await;
     assert_eq!(list, json!([]));
 
     // An unknown role is not a request we understand.
@@ -377,7 +385,7 @@ async fn admin_can_open_and_share_any_document() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(doc["role"], "owner");
     share(&server, &root, &id, &bob.email, "viewer").await;
-    let (_, list) = call(&server, Some(&bob), Method::GET, "/api/docs", None).await;
+    let list = listed_in(&server, &bob, server.home_of(&ann).await).await;
     assert_eq!(list[0]["id"], id.as_str());
 }
 
@@ -566,12 +574,48 @@ async fn unsigned_caller_gets_401_from_every_route() {
     let server = spawn_server().await;
     let id = uuid::Uuid::new_v4();
     let docs_access = format!("/api/docs/{id}/access");
+    let node = format!("/api/nodes/{id}");
     // One row per route; add new routes here.
     let routes: Vec<(Method, String, Option<Value>)> = vec![
         (Method::GET, "/api/me".into(), None),
         (Method::DELETE, "/api/session".into(), None),
-        (Method::GET, "/api/docs".into(), None),
-        (Method::POST, "/api/docs".into(), Some(json!({}))),
+        (Method::GET, "/api/sites".into(), None),
+        (
+            Method::POST,
+            "/api/sites".into(),
+            Some(json!({ "name": "S" })),
+        ),
+        (Method::GET, node.clone(), None),
+        (Method::PATCH, node.clone(), Some(json!({ "name": "N" }))),
+        (Method::DELETE, node.clone(), None),
+        (Method::GET, format!("{node}/children"), None),
+        (
+            Method::POST,
+            format!("{node}/children"),
+            Some(json!({ "kind": "folder", "name": "F" })),
+        ),
+        (Method::GET, format!("{node}/access"), None),
+        (
+            Method::PUT,
+            format!("{node}/access"),
+            Some(json!({ "email": "a@test.invalid", "role": "viewer" })),
+        ),
+        (Method::DELETE, format!("{node}/access/{id}"), None),
+        (
+            Method::POST,
+            format!("{node}/inheritance"),
+            Some(json!({ "inherit": false })),
+        ),
+        (
+            Method::POST,
+            "/api/docs".into(),
+            Some(json!({ "parent": id.to_string() })),
+        ),
+        (
+            Method::POST,
+            format!("/api/docs/upload?parent={id}&name=A.xlsx"),
+            None,
+        ),
         (Method::GET, format!("/api/docs/{id}"), None),
         (Method::GET, docs_access.clone(), None),
         (Method::GET, format!("/api/docs/{id}/events"), None),
@@ -606,12 +650,10 @@ async fn unsigned_caller_gets_401_from_every_route() {
 async fn creating_a_spreadsheet_records_its_editor() {
     let server = spawn_server().await;
     let ann = server.user("ann").await;
-    let (status, body) = call(
+    let (status, body) = post_doc(
         &server,
-        Some(&ann),
-        Method::POST,
-        "/api/docs",
-        Some(json!({ "name": "Budget.xlsx", "editor": "gridcraft" })),
+        &ann,
+        json!({ "name": "Budget.xlsx", "editor": "gridcraft" }),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED);
@@ -627,7 +669,7 @@ async fn creating_a_spreadsheet_records_its_editor() {
     )
     .await;
     assert_eq!(doc["editor"], "gridcraft");
-    let (_, list) = call(&server, Some(&ann), Method::GET, "/api/docs", None).await;
+    let list = listed_in(&server, &ann, server.home_of(&ann).await).await;
     assert_eq!(list[0]["editor"], "gridcraft");
     let (_, events) = call(
         &server,
@@ -646,12 +688,10 @@ async fn creating_a_spreadsheet_records_its_editor() {
     assert_eq!(created["detail"]["editor"], "gridcraft");
 
     // The extension must match, and the message says which one.
-    let (status, body) = call(
+    let (status, body) = post_doc(
         &server,
-        Some(&ann),
-        Method::POST,
-        "/api/docs",
-        Some(json!({ "name": "Budget.docx", "editor": "gridcraft" })),
+        &ann,
+        json!({ "name": "Budget.docx", "editor": "gridcraft" }),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -662,17 +702,10 @@ async fn creating_a_spreadsheet_records_its_editor() {
 async fn unknown_editor_is_refused() {
     let server = spawn_server().await;
     let ann = server.user("ann").await;
-    let (status, body) = call(
-        &server,
-        Some(&ann),
-        Method::POST,
-        "/api/docs",
-        Some(json!({ "name": "A", "editor": "excel" })),
-    )
-    .await;
+    let (status, body) = post_doc(&server, &ann, json!({ "name": "A", "editor": "excel" })).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["error"], "unknown_editor");
-    let (_, list) = call(&server, Some(&ann), Method::GET, "/api/docs", None).await;
+    let list = listed_in(&server, &ann, server.home_of(&ann).await).await;
     assert!(list.as_array().unwrap().is_empty());
 }
 
@@ -680,17 +713,15 @@ async fn unknown_editor_is_refused() {
 async fn an_empty_pdf_cannot_be_created() {
     let server = spawn_server().await;
     let ann = server.user("ann").await;
-    let (status, body) = call(
+    let (status, body) = post_doc(
         &server,
-        Some(&ann),
-        Method::POST,
-        "/api/docs",
-        Some(json!({ "name": "A.pdf", "editor": "pdfcraft" })),
+        &ann,
+        json!({ "name": "A.pdf", "editor": "pdfcraft" }),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(body["message"].as_str().unwrap().contains("upload a PDF"));
-    let (_, list) = call(&server, Some(&ann), Method::GET, "/api/docs", None).await;
+    let list = listed_in(&server, &ann, server.home_of(&ann).await).await;
     assert!(list.as_array().unwrap().is_empty());
 }
 
@@ -698,22 +729,13 @@ async fn an_empty_pdf_cannot_be_created() {
 async fn text_documents_still_default() {
     let server = spawn_server().await;
     let ann = server.user("ann").await;
-    let (status, body) = call(
-        &server,
-        Some(&ann),
-        Method::POST,
-        "/api/docs",
-        Some(json!({ "name": "Notes.txt" })),
-    )
-    .await;
+    let (status, body) = post_doc(&server, &ann, json!({ "name": "Notes.txt" })).await;
     assert_eq!(status, StatusCode::CREATED);
     assert_eq!(body["editor"], "text");
-    let (status, body) = call(
+    let (status, body) = post_doc(
         &server,
-        Some(&ann),
-        Method::POST,
-        "/api/docs",
-        Some(json!({ "name": "Whatever.xlsx", "editor": "text" })),
+        &ann,
+        json!({ "name": "Whatever.xlsx", "editor": "text" }),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED);

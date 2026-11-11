@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use collab_core::client_state::{ClientState, Outgoing};
-use collab_core::ids::{ClientId, DocId, OpId, Seq, UserId};
+use collab_core::ids::{ClientId, DocId, NodeId, OpId, Seq, UserId};
 use collab_text::{TextDoc, TextOp};
 use futures_util::{SinkExt, StreamExt};
 use protocol::{
@@ -24,9 +24,10 @@ use protocol::{
     SaveState, SeatState, ServerMsg,
 };
 use records::test_support::TestDb;
-use records::{Db, Editor, NewUser, Role};
+use records::{Db, Editor, NewUser, NodeKind, Role, User};
 use reqwest::header::{COOKIE, HeaderMap, HeaderValue, ORIGIN, SET_COOKIE};
 use revisions::RevisionStore;
+use server::tree::{self, TreeOp};
 use server::{AppState, Checkpointer, Config};
 use tempfile::TempDir;
 use tokio::net::TcpStream;
@@ -49,6 +50,19 @@ pub struct Site {
     records: Db,
     /// Accounts made by [`Site::user`] and [`Site::admin`], by name.
     accounts: Mutex<HashMap<String, Account>>,
+    /// The running server's own state, through which the harness changes the tree, so its
+    /// changes take turns with the server's. Filled from `coming` on first use.
+    state: tokio::sync::OnceCell<AppState>,
+    coming: Mutex<Option<tokio::sync::oneshot::Receiver<AppState>>>,
+    /// The places the harness made in the tree.
+    places: tokio::sync::Mutex<Places>,
+}
+
+/// The harness's site library, and a folder of each person's own in it.
+#[derive(Default)]
+struct Places {
+    library: Option<NodeId>,
+    homes: HashMap<UserId, NodeId>,
 }
 
 /// An account the harness created, with the password it chose and keeps to itself.
@@ -79,12 +93,135 @@ impl std::fmt::Debug for TestUser {
 }
 
 impl Site {
-    fn new(addr: SocketAddr, records: Db) -> Site {
+    fn new(
+        addr: SocketAddr,
+        records: Db,
+        coming: tokio::sync::oneshot::Receiver<AppState>,
+    ) -> Site {
         Site {
             addr,
             records,
             accounts: Mutex::default(),
+            state: tokio::sync::OnceCell::new(),
+            coming: Mutex::new(Some(coming)),
+            places: tokio::sync::Mutex::default(),
         }
+    }
+
+    /// A site for a server whose state is `state`.
+    fn ready(addr: SocketAddr, records: Db, state: AppState) -> Site {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = tx.send(state);
+        Site::new(addr, records, rx)
+    }
+
+    /// The running server's state.
+    async fn state(&self) -> &AppState {
+        self.state
+            .get_or_init(|| async {
+                let coming = self.coming.lock().unwrap().take();
+                coming
+                    .expect("the server's state was taken")
+                    .await
+                    .expect("the server stopped before it was ready")
+            })
+            .await
+    }
+
+    /// The account `id` as the records hold it.
+    async fn account_record(&self, id: UserId) -> User {
+        self.records
+            .user(id)
+            .await
+            .unwrap()
+            .expect("no such account")
+    }
+
+    /// The Documents library of a site the harness makes, as its administrator, on first use.
+    pub async fn library(&self) -> NodeId {
+        let mut places = self.places.lock().await;
+        self.library_in(&mut places).await
+    }
+
+    async fn library_in(&self, places: &mut Places) -> NodeId {
+        if let Some(library) = places.library {
+            return library;
+        }
+        let admin = self.account_record(self.harness_admin().await).await;
+        let state = self.state().await;
+        let site = tree::apply(
+            state,
+            &admin,
+            TreeOp::Create {
+                parent: None,
+                kind: NodeKind::Site,
+                name: format!("Test site {}", Uuid::new_v4().simple()),
+                id: NodeId(Uuid::new_v4()),
+            },
+        )
+        .await
+        .unwrap();
+        let (children, _) = self
+            .records
+            .children(admin.id, site.id, None, 10)
+            .await
+            .unwrap()
+            .unwrap();
+        let library = children
+            .iter()
+            .find(|child| child.node.kind == NodeKind::Library)
+            .expect("a new site has a library")
+            .node
+            .id;
+        places.library = Some(library);
+        library
+    }
+
+    /// A folder of `user`'s own in the harness's library, made on first use: they own it, and
+    /// nobody else has an assignment there. What they create in
+    /// it is theirs alone, as a document was its creator's before the tree.
+    pub async fn home_of(&self, user: &TestUser) -> NodeId {
+        let mut places = self.places.lock().await;
+        if let Some(home) = places.homes.get(&user.id) {
+            return *home;
+        }
+        let library = self.library_in(&mut places).await;
+        let admin = self.harness_admin().await;
+        let admin_record = self.account_record(admin).await;
+        let folder = tree::apply(
+            self.state().await,
+            &admin_record,
+            TreeOp::Create {
+                parent: Some(library),
+                kind: NodeKind::Folder,
+                name: format!("Home of {}", user.id.0),
+                id: NodeId(Uuid::new_v4()),
+            },
+        )
+        .await
+        .unwrap();
+        self.records
+            .set_node_access(admin, folder.id, user.id, Some(Role::Owner))
+            .await
+            .unwrap();
+        // The administrator's copied assignment goes, so the folder's people are its owner
+        // alone (the administrator stays owner of everything as an administrator).
+        self.records
+            .set_node_access(admin, folder.id, admin, None)
+            .await
+            .unwrap();
+        places.homes.insert(user.id, folder.id);
+        folder.id
+    }
+
+    /// Creates the document `doc` named `name`, opened in `editor`, in `owner`'s own folder
+    /// (see [`Site::home_of`]), as `owner`.
+    pub async fn create_document(&self, doc: DocId, name: &str, editor: Editor, owner: &TestUser) {
+        let home = self.home_of(owner).await;
+        let actor = self.account_record(owner.id).await;
+        tree::create_document(self.state().await, &actor, home, doc, name, editor, None)
+            .await
+            .unwrap();
     }
 
     /// `http://<addr>`, the origin of pages this server serves.
@@ -133,15 +270,14 @@ impl Site {
             .unwrap()
     }
 
-    /// Makes sure `user` has a role on `doc`, writing the records directly: creates the
-    /// document, named `<doc id>.txt` and owned by `user`, if it has no record; otherwise grants
-    /// `user` Editor if they have no role.
+    /// Makes sure `user` has a role on `doc`: creates the document, named `<doc id>.txt`, in
+    /// `user`'s own folder (so they own it) if it has no record; otherwise grants `user` Editor
+    /// on it, writing the records directly, if they have no role.
     pub async fn give_access(&self, doc: DocId, user: &TestUser) {
         let db = &self.records;
         if db.document(doc).await.unwrap().is_none() {
-            db.create_document(user.id, doc, &format!("{}.txt", doc.0), Editor::Text)
-                .await
-                .unwrap();
+            self.create_document(doc, &format!("{}.txt", doc.0), Editor::Text, user)
+                .await;
         } else if db.role(user.id, doc).await.unwrap().is_none() {
             let admin = self.harness_admin().await;
             db.set_access(admin, doc, user.id, Some(Role::Editor))
@@ -150,13 +286,11 @@ impl Site {
         }
     }
 
-    /// Creates `doc` as a file document opened in GridCraft, named `<doc id>.xlsx` and owned
-    /// by `owner`, writing the record directly.
+    /// Creates `doc` as a file document opened in GridCraft, named `<doc id>.xlsx`, in
+    /// `owner`'s own folder (so they own it).
     pub async fn create_file_document(&self, doc: DocId, owner: &TestUser) {
-        self.records
-            .create_document(owner.id, doc, &format!("{}.xlsx", doc.0), Editor::GridCraft)
-            .await
-            .unwrap();
+        self.create_document(doc, &format!("{}.xlsx", doc.0), Editor::GridCraft, owner)
+            .await;
     }
 
     /// The administrator the harness grants access as, created on first use. It never signs
@@ -262,17 +396,33 @@ impl TestServer {
         RevisionStore::open(&self.library()).unwrap()
     }
 
-    /// The commits that changed `doc`, newest first.
+    /// The commits that changed `doc`, newest first. Its ref's history also holds the other
+    /// commits on `main` (other documents' and the content tree's), which are left out.
     pub fn doc_commits(&self, doc: DocId) -> Vec<String> {
         let repo = gix::open(self.library()).unwrap();
         let tip = repo
             .find_reference(&format!("refs/sharecraft/docs/{}", doc.0))
             .unwrap()
             .id();
+        let dir = format!("docs/{}", doc.0);
+        let folder = |id: gix::ObjectId| {
+            repo.find_commit(id)
+                .unwrap()
+                .tree()
+                .unwrap()
+                .lookup_entry_by_path(&dir)
+                .unwrap()
+                .map(|entry| entry.object_id())
+        };
         repo.rev_walk([tip])
             .all()
             .unwrap()
-            .map(|info| info.unwrap().id.to_string())
+            .map(|info| info.unwrap())
+            .filter(|info| {
+                let before = info.parent_ids.first().and_then(|parent| folder(*parent));
+                folder(info.id) != before
+            })
+            .map(|info| info.id.to_string())
             .collect()
     }
 }
@@ -385,9 +535,10 @@ pub async fn spawn_server_config(edit: impl FnOnce(&mut Config)) -> TestServer {
     edit(&mut config);
     let listener = tokio::net::TcpListener::bind(config.addr).await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(fail_loudly(server::serve(config, listener)));
+    let state = server::prepare(config).await.unwrap();
+    tokio::spawn(fail_loudly(server::serve_state(state.clone(), listener)));
     TestServer {
-        site: Site::new(addr, db.db.clone()),
+        site: Site::ready(addr, db.db.clone(), state),
         data_dir,
         db,
     }
@@ -422,12 +573,18 @@ impl StoppableServer {
             .enable_all()
             .build()
             .unwrap();
+        let (ready, coming) = tokio::sync::oneshot::channel();
         runtime.spawn(async move {
             let listener = tokio::net::TcpListener::from_std(listener).unwrap();
-            fail_loudly(server::serve(config, listener)).await;
+            let state = match server::prepare(config).await {
+                Ok(state) => state,
+                Err(e) => panic!("the test server stopped: {e}"),
+            };
+            let _ = ready.send(state.clone());
+            fail_loudly(server::serve_state(state, listener)).await;
         });
         StoppableServer {
-            site: Site::new(addr, db.db.clone()),
+            site: Site::new(addr, db.db.clone(), coming),
             runtime: Some(runtime),
         }
     }
@@ -487,9 +644,9 @@ pub async fn spawn_server_with_grace(
     let listener = tokio::net::TcpListener::bind(config.addr).await.unwrap();
     let addr = listener.local_addr().unwrap();
     let state = AppState::new(config, checkpointer, db.db.clone());
-    tokio::spawn(fail_loudly(server::serve_state(state, listener)));
+    tokio::spawn(fail_loudly(server::serve_state(state.clone(), listener)));
     TestServer {
-        site: Site::new(addr, db.db.clone()),
+        site: Site::ready(addr, db.db.clone(), state),
         data_dir,
         db,
     }

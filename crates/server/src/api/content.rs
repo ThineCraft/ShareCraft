@@ -18,8 +18,8 @@ use axum::http::header::{
 };
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use collab_core::ids::DocId;
-use records::{AccessError, Editor, Role};
+use collab_core::ids::{DocId, NodeId};
+use records::{AccessError, Editor};
 use revisions::{Author, Checkpoint, CheckpointError, Outcome, RevisionId};
 use serde::Deserialize;
 use serde_json::{Map, json};
@@ -30,6 +30,7 @@ use crate::checkpoint::Checkpointer;
 use crate::file_room::SaveReply;
 use crate::projection::record_first;
 use crate::room::credited_name;
+use crate::tree;
 use crate::{AppState, auth::Signed};
 
 /// The request header carrying the seat token. It is never logged, stored or echoed.
@@ -52,6 +53,8 @@ pub(crate) struct SaveQuery {
 /// Query of `POST /api/docs/upload`.
 #[derive(Deserialize)]
 pub(crate) struct UploadQuery {
+    /// The library or folder the new document goes into.
+    parent: Option<String>,
     name: Option<String>,
 }
 
@@ -219,17 +222,20 @@ fn saved(revision: &RevisionId, changed: bool) -> Response {
     Json(json!({ "revision": revision.to_string(), "changed": changed })).into_response()
 }
 
-/// `POST /api/docs/upload?name=<file name>`: creates a document from the bytes sent, owned by
-/// the caller, with them as its first revision. The editor is the one whose extension ends the
-/// name. If the bytes cannot be stored after the document was made, the document stays, empty,
-/// and the answer is `503` naming it.
+/// `POST /api/docs/upload?parent=<id>&name=<file name>`: creates a document from the bytes
+/// sent in the library or folder `parent` (of which the caller must be an editor), with them as
+/// its first revision. The document inherits its access from there. The editor is the one
+/// whose extension ends the name. If the bytes cannot be stored after the document was made,
+/// the document stays, empty, and the answer is `503` naming it.
 pub(crate) async fn upload(
     State(state): State<AppState>,
     signed: Signed,
     query: Result<Query<UploadQuery>, QueryRejection>,
     request: Request,
 ) -> Result<Response, ApiError> {
-    let name = query_of(query)?.name.ok_or(ApiError::BadRequest)?;
+    let query = query_of(query)?;
+    let parent = NodeId(parse_id(&query.parent.ok_or(ApiError::BadRequest)?)?);
+    let name = query.name.ok_or(ApiError::BadRequest)?;
     let editor = Editor::for_file_name(name.trim()).ok_or(ApiError::BadRequest)?;
     let bytes = body_bytes(request, &state).await?;
     if bytes.is_empty() {
@@ -239,16 +245,20 @@ pub(crate) async fn upload(
 
     to_completion(async move {
         let id = DocId(Uuid::new_v4());
-        let document = match state
-            .db()
-            .create_uploaded_document(user.id, id, &name, editor, bytes.len())
-            .await
-        {
+        let created =
+            tree::create_document(&state, &user, parent, id, &name, editor, Some(bytes.len()))
+                .await;
+        let document = match created {
             Ok(document) => document,
             // The name is only an extension.
             Err(AccessError::WrongExtension) => return Err(ApiError::BadRequest),
             Err(e) => return Err(e.into()),
         };
+        let role = state
+            .db()
+            .role(user.id, id)
+            .await
+            .map_err(|e| ApiError::unavailable(&e))?;
         let author = Author {
             id: user.id.0.to_string(),
             name: credited_name(&user.name),
@@ -285,7 +295,7 @@ pub(crate) async fn upload(
             "id": document.id.0.to_string(),
             "name": document.name,
             "editor": document.editor,
-            "role": Role::Owner,
+            "role": role,
         }));
         Ok((StatusCode::CREATED, body).into_response())
     })

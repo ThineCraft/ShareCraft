@@ -303,10 +303,27 @@ pub(crate) trait AccessRules {
     fn change_role(&mut self, user: UserId, role: Role);
     /// The connections `which` selects are removed with `Removed { reason }`.
     fn remove(&mut self, which: &dyn Fn(&Member) -> bool, reason: RemovedReason);
+    /// The document is now named `name`; later revisions are stored under it.
+    fn rename(&mut self, name: String);
+    /// Everyone connected, each once, including connections still being let in.
+    fn connected_users(&self) -> Vec<UserId>;
+}
+
+/// The accounts of `members`, each once, in the order first seen.
+pub(crate) fn users_of<'a>(members: impl IntoIterator<Item = &'a Member>) -> Vec<UserId> {
+    let mut users = Vec::new();
+    for member in members {
+        if !users.contains(&member.user) {
+            users.push(member.user);
+        }
+    }
+    users
 }
 
 /// Carries out one access change in `room`: a role adjusts every connection of that person;
-/// no role, an ended sign-in or a disabled account removes the connections concerned.
+/// no role, an ended sign-in or a disabled account removes the connections concerned; a
+/// deleted document removes everyone; a rename changes the name later revisions are stored
+/// under; a question about who is connected is answered.
 pub(crate) fn apply_access(room: &mut impl AccessRules, change: AccessChange) {
     match change {
         AccessChange::SetAccess { user, role } => match role {
@@ -318,6 +335,12 @@ pub(crate) fn apply_access(room: &mut impl AccessRules, change: AccessChange) {
         }
         AccessChange::RemoveUser { user } => {
             room.remove(&|m| m.user == user, RemovedReason::AccountDisabled);
+        }
+        AccessChange::Deleted => room.remove(&|_| true, RemovedReason::Deleted),
+        AccessChange::Renamed { name } => room.rename(name),
+        AccessChange::ConnectedUsers { reply } => {
+            // The asker may have gone away; nothing to do then.
+            let _ = reply.send(room.connected_users());
         }
     }
 }

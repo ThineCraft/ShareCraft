@@ -82,21 +82,17 @@ async fn created_document_takes_its_access_from_the_tree() {
 }
 
 #[tokio::test]
-async fn stranger_has_no_role_and_does_not_list_the_document() {
+async fn stranger_has_no_role() {
     let test = TestDb::create().await;
     let ann = user(&test, "Ann", false).await;
     let bob = user(&test, "Bob", false).await;
     let id = document(&test, ann.id).await;
     assert_eq!(test.db.role(bob.id, id).await.unwrap(), None);
-    assert!(test.db.documents_for(bob.id).await.unwrap().is_empty());
     assert_eq!(
         test.db.role(UserId(Uuid::new_v4()), id).await.unwrap(),
         None
     );
     assert_eq!(test.db.role(ann.id, doc_id()).await.unwrap(), None);
-    let listed = test.db.documents_for(ann.id).await.unwrap();
-    assert_eq!(listed.len(), 1);
-    assert_eq!((listed[0].0.id, listed[0].1), (id, Role::Owner));
 }
 
 #[tokio::test]
@@ -112,8 +108,6 @@ async fn grant_change_and_revoke_are_reflected_by_role() {
         .await;
     assert_eq!(result, Ok((None, Some(Role::Viewer))));
     assert_eq!(test.db.role(bob.id, id).await.unwrap(), Some(Role::Viewer));
-    let listed = test.db.documents_for(bob.id).await.unwrap();
-    assert_eq!((listed[0].0.id, listed[0].1), (id, Role::Viewer));
 
     let result = test
         .db
@@ -125,7 +119,6 @@ async fn grant_change_and_revoke_are_reflected_by_role() {
     let result = test.db.set_access(ann.id, id, bob.id, None).await;
     assert_eq!(result, Ok((Some(Role::Editor), None)));
     assert_eq!(test.db.role(bob.id, id).await.unwrap(), None);
-    assert!(test.db.documents_for(bob.id).await.unwrap().is_empty());
 
     let missing = test
         .db
@@ -140,7 +133,7 @@ async fn grant_change_and_revoke_are_reflected_by_role() {
 }
 
 #[tokio::test]
-async fn admin_is_owner_everywhere_and_lists_everything() {
+async fn admin_is_owner_everywhere() {
     let test = TestDb::create().await;
     let root = user(&test, "Root", true).await;
     let ann = user(&test, "Ann", false).await;
@@ -150,10 +143,10 @@ async fn admin_is_owner_everywhere_and_lists_everything() {
         test.db.role(root.id, first).await.unwrap(),
         Some(Role::Owner)
     );
-    let listed = test.db.documents_for(root.id).await.unwrap();
-    let ids: Vec<DocId> = listed.iter().map(|(d, _)| d.id).collect();
-    assert_eq!(ids, vec![second, first], "newest first");
-    assert!(listed.iter().all(|(_, role)| *role == Role::Owner));
+    assert_eq!(
+        test.db.role(root.id, second).await.unwrap(),
+        Some(Role::Owner)
+    );
     // The administrator may manage access without holding a grant.
     let result = test
         .db
@@ -178,7 +171,6 @@ async fn disabled_account_has_no_role() {
     let id = document(&test, ann.id).await;
     test.db.set_disabled(root.id, ann.id, true).await.unwrap();
     assert_eq!(test.db.role(ann.id, id).await.unwrap(), None);
-    assert!(test.db.documents_for(ann.id).await.unwrap().is_empty());
     assert_eq!(test.db.grants(ann.id, id).await, Err(AccessError::NotFound));
     test.db
         .set_disabled(admin2.id, root.id, true)
@@ -368,7 +360,6 @@ async fn bad_document_names_are_refused() {
             .await;
         assert_eq!(result, Err(AccessError::InvalidName), "{name:?}");
     }
-    assert!(test.db.documents_for(ann.id).await.unwrap().is_empty());
     let longest = "n".repeat(120);
     assert!(
         test.db

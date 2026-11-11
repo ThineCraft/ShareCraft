@@ -131,6 +131,13 @@ pub(crate) enum AccessChange {
     /// `user`'s account was disabled: their connections are removed with
     /// `Removed { account_disabled }`.
     RemoveUser { user: UserId },
+    /// The document was renamed: revisions written from now on are stored under `name`.
+    Renamed { name: String },
+    /// The document was deleted: every connection is removed with `Removed { deleted }`.
+    Deleted,
+    /// Asks who is connected: the room answers on `reply` with every account connected (or
+    /// being let in), each once. A room still loading its document answers with nobody.
+    ConnectedUsers { reply: oneshot::Sender<Vec<UserId>> },
 }
 
 /// The state a room starts from.
@@ -148,7 +155,8 @@ pub(crate) struct Initial {
 /// `try_send` and a connection whose queue is full or closed is dropped.
 pub(crate) struct Room {
     doc: DocId,
-    /// The document's name when the room opened; checkpoints are stored under it.
+    /// The document's name, as of the room opening or the last rename it was told of;
+    /// checkpoints are stored under it.
     name: String,
     /// This lifetime of the room; log positions only mean something within it.
     epoch: RoomEpoch,
@@ -535,6 +543,14 @@ impl AccessRules for Room {
             self.members_left();
         }
     }
+
+    fn rename(&mut self, name: String) {
+        self.name = name;
+    }
+
+    fn connected_users(&self) -> Vec<UserId> {
+        members::users_of(self.members.iter())
+    }
 }
 
 /// The text room's frames, for its members.
@@ -737,6 +753,38 @@ impl Rooms {
         }
     }
 
+    /// The documents with a room open, in no particular order.
+    pub(crate) fn open_documents(&self) -> Vec<DocId> {
+        let open = self.open.lock().unwrap_or_else(PoisonError::into_inner);
+        open.iter()
+            .filter(|(_, handle)| !handle.link.is_closed())
+            .map(|(doc, _)| *doc)
+            .collect()
+    }
+
+    /// Everyone connected to `doc`'s room (or being let in), each once, asked of the room over
+    /// its access channel, so the answer comes after every access change sent before. Nobody if
+    /// no room is open or it ends before answering; a room still loading its document answers
+    /// with nobody, as joins wait until it has loaded.
+    pub(crate) fn connected_users(
+        &self,
+        doc: DocId,
+    ) -> impl Future<Output = Vec<UserId>> + Send + 'static {
+        let (reply, answer) = oneshot::channel();
+        let asked = self.link(doc).is_some_and(|link| {
+            link.access()
+                .send(AccessChange::ConnectedUsers { reply })
+                .is_ok()
+        });
+        async move {
+            if asked {
+                answer.await.unwrap_or_default()
+            } else {
+                Vec::new()
+            }
+        }
+    }
+
     /// The ways into `doc`'s room, if it is open.
     pub(crate) fn link(&self, doc: DocId) -> Option<Link> {
         let open = self.open.lock().unwrap_or_else(PoisonError::into_inner);
@@ -808,7 +856,7 @@ pub(crate) type Running = JoinHandle<Result<Outcome, CheckpointError>>;
 /// connected for `grace` and everything is saved, or at once when empty once in conflict.
 async fn run(
     place: Place,
-    name: String,
+    mut name: String,
     channels: Channels,
     storage: Storage,
     timing: Timing,
@@ -820,7 +868,7 @@ async fn run(
         mut access_rx,
     } = channels;
     let Storage { store, db, events } = storage;
-    let initial = match load(&store, doc).await {
+    let initial = match load_serving(load(&store, doc), &mut access_rx, &mut name).await {
         Ok(initial) => initial,
         Err(err) => {
             eprintln!("sharecraft-server: cannot open document {}: {err}", doc.0);
@@ -929,6 +977,39 @@ pub(crate) fn refuse_waiting<C>(
     while let Ok(cmd) = rx.try_recv() {
         if let Some(accepted) = join_reply(cmd) {
             let _ = accepted.send(JoinReply::Refused);
+        }
+    }
+}
+
+/// Waits for `loading`, a room's load of its document, while taking the access changes sent
+/// meanwhile, and returns what it loaded. Nobody is connected yet (joins wait in the command
+/// channel until the document is loaded, and each is checked again once in), so a change about
+/// people has nothing to act on; a question about who is connected is answered with nobody, and
+/// a rename changes `name`, the name the room will store revisions under.
+pub(crate) async fn load_serving<T>(
+    loading: impl Future<Output = T>,
+    access_rx: &mut mpsc::UnboundedReceiver<AccessChange>,
+    name: &mut String,
+) -> T {
+    tokio::pin!(loading);
+    loop {
+        tokio::select! {
+            biased;
+            change = access_rx.recv() => match change {
+                Some(AccessChange::Renamed { name: new }) => *name = new,
+                Some(AccessChange::ConnectedUsers { reply }) => {
+                    let _ = reply.send(Vec::new());
+                }
+                Some(
+                    AccessChange::SetAccess { .. }
+                    | AccessChange::EndSession { .. }
+                    | AccessChange::RemoveUser { .. }
+                    | AccessChange::Deleted,
+                ) => {}
+                // The registry holds a sender until the room ends, so this does not happen.
+                None => return loading.await,
+            },
+            loaded = &mut loading => return loaded,
         }
     }
 }
@@ -1669,6 +1750,126 @@ mod tests {
             .expect("the room ended and dropped the join unanswered");
         assert_eq!(reply, JoinReply::Accepted);
         assert!(rooms.link(doc).is_some(), "the room ended despite the join");
+    }
+
+    /// Loads only once the test lets it; records the file name of each checkpoint written.
+    struct HeldLoad {
+        gate: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        written: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl Checkpointer for HeldLoad {
+        fn write(&self, c: &revisions::Checkpoint<'_>) -> Result<Outcome, CheckpointError> {
+            self.written.lock().unwrap().push(c.file_name.to_owned());
+            Ok(Outcome::Written(format!("{:040x}", 1).parse().unwrap()))
+        }
+
+        fn load(&self, _doc: DocId) -> Result<Option<revisions::Stored>, CheckpointError> {
+            self.gate.lock().unwrap().recv().unwrap();
+            Ok(None)
+        }
+
+        fn load_at(
+            &self,
+            _doc: DocId,
+            _revision: &RevisionId,
+        ) -> Result<Option<revisions::Stored>, CheckpointError> {
+            Ok(None)
+        }
+
+        fn describe(
+            &self,
+            _doc: DocId,
+            _revision: &RevisionId,
+        ) -> Result<Option<revisions::RevisionInfo>, CheckpointError> {
+            Ok(None)
+        }
+
+        fn history(&self, _doc: DocId) -> Result<Vec<revisions::RevisionInfo>, CheckpointError> {
+            Ok(Vec::new())
+        }
+
+        fn documents(&self) -> Result<Vec<DocId>, revisions::GitError> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// A room still loading its document answers who is connected (nobody) and takes a rename;
+    /// once loaded it names who joined, and stores its checkpoint under the new name.
+    #[tokio::test]
+    async fn loading_room_answers_and_takes_a_rename() {
+        let (release, gate) = std::sync::mpsc::channel();
+        let store = Arc::new(HeldLoad {
+            gate: std::sync::Mutex::new(gate),
+            written: std::sync::Mutex::default(),
+        });
+        let rooms = Arc::new(Rooms::default());
+        let doc = DocId(Uuid::from_u128(79));
+        let link = rooms.open(
+            doc,
+            "Plan.txt".into(),
+            Storage {
+                store: Arc::clone(&store) as Arc<dyn Checkpointer>,
+                db: None,
+                events: EventSink::discard(),
+            },
+            Timing {
+                idle: Duration::from_millis(10),
+                max: Duration::from_secs(30),
+            },
+            Duration::from_secs(60),
+        );
+        assert_eq!(rooms.open_documents(), vec![doc]);
+        let asked = tokio::time::timeout(Duration::from_secs(5), rooms.connected_users(doc));
+        assert_eq!(asked.await.expect("a loading room did not answer"), vec![]);
+        rooms.send_to(
+            doc,
+            AccessChange::Renamed {
+                name: "Notes.txt".into(),
+            },
+        );
+
+        let bob = UserId(Uuid::from_u128(2));
+        let (tx, _out) = mpsc::channel(OUTBOUND_CAPACITY);
+        let (accepted, reply) = oneshot::channel();
+        link.commands
+            .send(Command::Join {
+                conn: 1,
+                client: ClientId(Uuid::from_u128(1)),
+                user: bob,
+                session: SessionId(Uuid::from_u128(3)),
+                name: "Bob".into(),
+                role: Role::Editor,
+                resume: None,
+                tx,
+                accepted,
+            })
+            .await
+            .unwrap();
+        release.send(()).unwrap();
+        assert_eq!(reply.await.unwrap(), JoinReply::Accepted);
+        assert_eq!(rooms.connected_users(doc).await, vec![bob]);
+        assert_eq!(
+            rooms.connected_users(DocId(Uuid::from_u128(80))).await,
+            vec![]
+        );
+
+        link.commands
+            .send(Command::Submit {
+                conn: 1,
+                client: ClientId(Uuid::from_u128(1)),
+                op_id: OpId(Uuid::from_u128(5)),
+                base: Seq(0),
+                op: TextOp::replace(0, 0, 0, "x").unwrap(),
+            })
+            .await
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while store.written.lock().unwrap().is_empty() {
+            assert!(Instant::now() < deadline, "nothing was saved");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(*store.written.lock().unwrap(), vec!["Notes.txt".to_owned()]);
     }
 
     #[test]

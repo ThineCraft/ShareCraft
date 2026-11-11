@@ -18,7 +18,8 @@ use common::{
 };
 use protocol::{ClientMsg, Resume, RoomEpoch, SaveState, ServerMsg};
 use revisions::{
-    Checkpoint, CheckpointError, GitError, Outcome, RevisionId, RevisionInfo, RevisionStore, Stored,
+    Checkpoint, CheckpointError, GitError, Outcome, RevisionId, RevisionInfo, RevisionStore,
+    Stored, TreeChange, TreeRecord,
 };
 use server::Checkpointer;
 use tokio_tungstenite::tungstenite::Message;
@@ -567,6 +568,18 @@ impl Checkpointer for Flaky {
     fn documents(&self) -> Result<Vec<DocId>, GitError> {
         self.inner.documents()
     }
+
+    fn write_tree(&self, change: &TreeChange<'_>) -> Result<RevisionId, CheckpointError> {
+        self.inner.write_tree(change)
+    }
+
+    fn read_tree(&self) -> Result<Vec<TreeRecord>, CheckpointError> {
+        self.inner.read_tree()
+    }
+
+    fn read_tree_record(&self, id: Uuid) -> Result<Option<TreeRecord>, CheckpointError> {
+        self.inner.read_tree_record(id)
+    }
 }
 
 #[tokio::test]
@@ -681,11 +694,12 @@ async fn brief_disconnect_after_checkpoint_resumes_without_reset() {
     assert_eq!(a.text(), "abc");
 }
 
-/// Every load fails; counts loads and writes.
+/// Every load fails; counts loads and writes. The content tree is kept in `tree`, once set.
 #[derive(Default)]
 struct BrokenLoad {
     loads: AtomicUsize,
     writes: AtomicUsize,
+    tree: std::sync::OnceLock<RevisionStore>,
 }
 
 impl Checkpointer for BrokenLoad {
@@ -724,13 +738,38 @@ impl Checkpointer for BrokenLoad {
     fn documents(&self) -> Result<Vec<DocId>, GitError> {
         Err(GitError::new("unreadable"))
     }
+
+    fn write_tree(&self, change: &TreeChange<'_>) -> Result<RevisionId, CheckpointError> {
+        self.tree
+            .get()
+            .ok_or(CheckpointError::Unsupported)?
+            .write_tree(change)
+    }
+
+    fn read_tree(&self) -> Result<Vec<TreeRecord>, CheckpointError> {
+        self.tree
+            .get()
+            .ok_or(CheckpointError::Unsupported)?
+            .read_tree()
+    }
+
+    fn read_tree_record(&self, id: Uuid) -> Result<Option<TreeRecord>, CheckpointError> {
+        self.tree
+            .get()
+            .ok_or(CheckpointError::Unsupported)?
+            .read_tree_record(id)
+    }
 }
 
 #[tokio::test]
 async fn load_failure_refuses_join_and_does_not_overwrite() {
     let broken = Arc::new(BrokenLoad::default());
     let shared = Arc::clone(&broken);
-    let server = spawn_server_with(move |_| shared).await;
+    let server = spawn_server_with(move |path| {
+        let _ = shared.tree.set(RevisionStore::open(path).unwrap());
+        shared
+    })
+    .await;
     let doc = new_doc();
     for attempt in 1..=2 {
         let mut c = TestClient::connect_with_resume(&server, doc, "C", None).await;
@@ -829,6 +868,18 @@ impl Checkpointer for Gated {
 
     fn documents(&self) -> Result<Vec<DocId>, GitError> {
         self.inner.documents()
+    }
+
+    fn write_tree(&self, change: &TreeChange<'_>) -> Result<RevisionId, CheckpointError> {
+        self.inner.write_tree(change)
+    }
+
+    fn read_tree(&self) -> Result<Vec<TreeRecord>, CheckpointError> {
+        self.inner.read_tree()
+    }
+
+    fn read_tree_record(&self, id: Uuid) -> Result<Option<TreeRecord>, CheckpointError> {
+        self.inner.read_tree_record(id)
     }
 }
 

@@ -221,8 +221,6 @@ async fn git_only_document_gets_a_record_nobody_can_open_until_placed() {
             Err(AccessError::NotFound)
         );
     }
-    assert!(test.db.documents_for(ann.id).await.unwrap().is_empty());
-    assert!(test.db.documents_for(ada.id).await.unwrap().is_empty());
     let site = site(&test, "Site", None).await;
     put(
         &test,

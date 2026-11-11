@@ -1,20 +1,23 @@
-//! Documents: create, list, open, and who may access them.
+//! Documents: create, open, and their events. Who may access a document is served by the node
+//! routes (see [`super::nodes`]).
 
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use collab_core::ids::{DocId, UserId};
-use records::{AccessError, Db, Editor, Role};
+use collab_core::ids::{DocId, NodeId};
+use records::{AccessError, Editor, Role};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
-use super::{ApiError, JsonBody, after_access_change, parse_id, to_completion};
+use super::nodes::require_owner;
+use super::{ApiError, JsonBody, parse_id, to_completion};
 use crate::AppState;
 use crate::auth::Signed;
+use crate::tree;
 
 /// The name a document gets when the request gives none.
 const DEFAULT_NAME: &str = "Untitled";
@@ -24,43 +27,11 @@ fn rfc3339(time: Option<OffsetDateTime>) -> Option<String> {
     time.and_then(|time| time.format(&Rfc3339).ok())
 }
 
-/// One row of `GET /api/docs`.
-#[derive(Serialize)]
-pub(crate) struct DocSummary {
-    id: String,
-    name: String,
-    editor: Editor,
-    role: Role,
-    revised_at: Option<String>,
-}
-
-/// `GET /api/docs`: the documents the caller can open.
-pub(crate) async fn list(
-    State(state): State<AppState>,
-    signed: Signed,
-) -> Result<Json<Vec<DocSummary>>, ApiError> {
-    let documents = state
-        .db()
-        .documents_for(signed.session.user.id)
-        .await
-        .map_err(|e| ApiError::unavailable(&e))?;
-    Ok(Json(
-        documents
-            .into_iter()
-            .map(|(document, role)| DocSummary {
-                id: document.id.0.to_string(),
-                name: document.name,
-                editor: document.editor,
-                role,
-                revised_at: rfc3339(document.revised_at),
-            })
-            .collect(),
-    ))
-}
-
 /// The body of `POST /api/docs`.
 #[derive(Deserialize)]
 pub(crate) struct NewDoc {
+    /// The library or folder the document goes into.
+    parent: String,
     name: Option<String>,
     /// An editor id; `text` when absent.
     editor: Option<String>,
@@ -72,12 +43,15 @@ fn refused(code: &str, message: &str) -> Response {
     (StatusCode::BAD_REQUEST, body).into_response()
 }
 
-/// `POST /api/docs`: creates a document owned by the caller.
+/// `POST /api/docs {parent, name?, editor?}`: creates a document in the library or folder
+/// `parent`, of which the caller must be an editor. The document inherits its access from
+/// there. `201` with the document and the caller's role on it.
 pub(crate) async fn create(
     State(state): State<AppState>,
     signed: Signed,
     JsonBody(new): JsonBody<NewDoc>,
 ) -> Result<Response, ApiError> {
+    let parent = NodeId(parse_id(&new.parent)?);
     let editor = match new.editor.as_deref() {
         None => Editor::Text,
         Some(text) => match Editor::from_id(text) {
@@ -92,12 +66,18 @@ pub(crate) async fn create(
         ));
     }
     let id = DocId(Uuid::new_v4());
-    let name = new.name.as_deref().unwrap_or(DEFAULT_NAME);
-    let document = match state
-        .db()
-        .create_document(signed.session.user.id, id, name, editor)
-        .await
-    {
+    let name = new.name.unwrap_or_else(|| DEFAULT_NAME.to_owned());
+    let actor = signed.session.user;
+    let user = actor.id;
+    let created =
+        to_completion({
+            let state = state.clone();
+            async move {
+                Ok(tree::create_document(&state, &actor, parent, id, &name, editor, None).await)
+            }
+        })
+        .await?;
+    let document = match created {
         Ok(document) => document,
         Err(AccessError::WrongExtension) => {
             let message = format!(
@@ -109,11 +89,16 @@ pub(crate) async fn create(
         }
         Err(e) => return Err(e.into()),
     };
+    let role = state
+        .db()
+        .role(user, id)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?;
     let body = Json(serde_json::json!({
         "id": document.id.0.to_string(),
         "name": document.name,
         "editor": document.editor,
-        "role": Role::Owner,
+        "role": role,
     }));
     Ok((StatusCode::CREATED, body).into_response())
 }
@@ -155,118 +140,6 @@ pub(crate) async fn open(
     }))
 }
 
-/// A person in `GET /api/docs/{id}/access`.
-#[derive(Serialize)]
-pub(crate) struct Person {
-    id: String,
-    email: String,
-    name: String,
-}
-
-/// One row of `GET /api/docs/{id}/access`.
-#[derive(Serialize)]
-pub(crate) struct AccessRow {
-    user: Person,
-    role: Role,
-}
-
-/// `GET /api/docs/{id}/access`: who has been granted access. Owners only.
-pub(crate) async fn access(
-    State(state): State<AppState>,
-    signed: Signed,
-    Path(id): Path<String>,
-) -> Result<Json<Vec<AccessRow>>, ApiError> {
-    let doc = DocId(parse_id(&id)?);
-    let grants = state.db().grants(signed.session.user.id, doc).await?;
-    Ok(Json(
-        grants
-            .into_iter()
-            .map(|grant| AccessRow {
-                user: Person {
-                    id: grant.user.id.0.to_string(),
-                    email: grant.user.email,
-                    name: grant.user.name,
-                },
-                role: grant.role,
-            })
-            .collect(),
-    ))
-}
-
-/// Succeeds if `user` may manage `doc`: `NotFound` when they have no role on it, `Forbidden`
-/// when their role is lower.
-async fn require_owner(db: &Db, user: UserId, doc: DocId) -> Result<(), ApiError> {
-    match db
-        .role(user, doc)
-        .await
-        .map_err(|e| ApiError::unavailable(&e))?
-    {
-        None => Err(ApiError::NotFound),
-        Some(held) if !held.can_manage() => Err(ApiError::Forbidden),
-        Some(_) => Ok(()),
-    }
-}
-
-/// The body of `PUT /api/docs/{id}/access`.
-#[derive(Deserialize)]
-pub(crate) struct Share {
-    email: String,
-    role: String,
-}
-
-/// `PUT /api/docs/{id}/access`: gives the person with this email a role.
-pub(crate) async fn share(
-    State(state): State<AppState>,
-    signed: Signed,
-    Path(id): Path<String>,
-    JsonBody(share): JsonBody<Share>,
-) -> Result<StatusCode, ApiError> {
-    let doc = DocId(parse_id(&id)?);
-    let role: Role =
-        serde_json::from_value(Value::String(share.role)).map_err(|_| ApiError::InvalidRequest)?;
-    let actor = signed.session.user.id;
-    let db = state.db();
-    // The email is looked up only for someone who may manage access, so that nobody else can
-    // learn which emails have accounts. The records layer decides again when it makes the change.
-    require_owner(db, actor, doc).await?;
-    let user = db
-        .user_by_email(&share.email)
-        .await
-        .map_err(|e| ApiError::unavailable(&e))?
-        .ok_or(ApiError::NoSuchUser)?;
-    change_access(state, actor, doc, user.id, Some(role)).await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-/// Stores `actor`'s change of `user`'s access to `doc` (`None` removes their grant) and tells
-/// the document's room, finishing both even if the request is cancelled.
-pub(super) async fn change_access(
-    state: AppState,
-    actor: UserId,
-    doc: DocId,
-    user: UserId,
-    role: Option<Role>,
-) -> Result<(), ApiError> {
-    to_completion(async move {
-        state.db().set_access(actor, doc, user, role).await?;
-        after_access_change(&state, doc, user).await;
-        Ok(())
-    })
-    .await
-}
-
-/// `DELETE /api/docs/{id}/access/{user_id}`: removes a person's grant.
-pub(crate) async fn unshare(
-    State(state): State<AppState>,
-    signed: Signed,
-    Path((id, user_id)): Path<(String, String)>,
-) -> Result<StatusCode, ApiError> {
-    let doc = DocId(parse_id(&id)?);
-    let user = UserId(parse_id(&user_id)?);
-    change_access(state, signed.session.user.id, doc, user, None).await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
 /// Most events `GET /api/docs/{id}/events` returns.
 const MAX_EVENTS: i64 = 200;
 
@@ -289,7 +162,7 @@ pub(crate) async fn events(
 ) -> Result<Json<Vec<EventRow>>, ApiError> {
     let doc = DocId(parse_id(&id)?);
     let db = state.db();
-    require_owner(db, signed.session.user.id, doc).await?;
+    require_owner(db, signed.session.user.id, doc.into()).await?;
     let events = db
         .recent_events_for(doc, MAX_EVENTS)
         .await

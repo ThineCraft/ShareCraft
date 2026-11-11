@@ -10,7 +10,6 @@ use uuid::Uuid;
 
 use crate::accounts::User;
 use crate::events::{NewEvent, record};
-use crate::scopes::REACH;
 use crate::tree::validate_node_name;
 use crate::{Db, DbError};
 
@@ -243,20 +242,7 @@ impl Db {
         name: &str,
         editor: Editor,
     ) -> Result<Document, AccessError> {
-        self.create(actor, id, name, editor, None).await
-    }
-
-    /// Like [`Db::create_document`], for a document made from a file of `bytes` bytes that
-    /// `actor` uploaded: its `document.created` event says so.
-    pub async fn create_uploaded_document(
-        &self,
-        actor: UserId,
-        id: DocId,
-        name: &str,
-        editor: Editor,
-        bytes: usize,
-    ) -> Result<Document, AccessError> {
-        self.create(actor, id, name, editor, Some(bytes)).await
+        self.create(actor, id, name, editor).await
     }
 
     async fn create(
@@ -265,7 +251,6 @@ impl Db {
         id: DocId,
         name: &str,
         editor: Editor,
-        uploaded: Option<usize>,
     ) -> Result<Document, AccessError> {
         let name = validate_document_name(name, editor)?;
         let mut tx = self.pool().begin().await?;
@@ -305,15 +290,7 @@ impl Db {
                 subject: None,
                 document: Some(id),
                 node: Some(id.into()),
-                detail: match uploaded {
-                    Some(bytes) => json!({
-                        "name": name,
-                        "editor": editor.id(),
-                        "uploaded": true,
-                        "bytes": bytes,
-                    }),
-                    None => json!({ "name": name, "editor": editor.id() }),
-                },
+                detail: json!({ "name": name, "editor": editor.id() }),
             },
         )
         .await?;
@@ -336,43 +313,6 @@ impl Db {
     /// for a document not yet placed in the tree.
     pub async fn role(&self, user: UserId, doc: DocId) -> Result<Option<Role>, DbError> {
         self.effective_role(user, doc.into()).await
-    }
-
-    /// The documents `user` can open, with the role each gives, newest first. Walks down from
-    /// the person's live scopes (from every site for an administrator), so a document outside
-    /// the tree is never listed. Kept for the flat list until the tree pages replace it.
-    pub async fn documents_for(&self, user: UserId) -> Result<Vec<(Document, Role)>, DbError> {
-        let query = format!(
-            "with recursive {REACH}, \
-             me(is_admin) as (select is_admin from users where id = $1 and disabled_at is null), \
-             starts(id, role) as ( \
-                 select s.id, 'owner'::text from nodes s, me \
-                 where me.is_admin and s.parent_id is null and s.deleted_at is null \
-                 union \
-                 select g.node_id, g.role from grants g, me \
-                 where not me.is_admin and g.node_id in (select origin from live)), \
-             down(id, role) as ( \
-                 select id, role from starts \
-                 union \
-                 select n.id, down.role from nodes n join down on n.parent_id = down.id \
-                 where n.deleted_at is null \
-                   and (not n.unique_scope or exists (select 1 from me where me.is_admin))) \
-             select d.id, d.name, d.editor, d.created_by, d.revision, d.revised_at, down.role \
-             from down join nodes n on n.id = down.id and n.kind = 'document' \
-             join documents d on d.id = n.id \
-             order by d.created_at desc, d.id desc"
-        );
-        let rows = sqlx::query(sqlx::AssertSqlSafe(query))
-            .bind(user.0)
-            .fetch_all(self.pool())
-            .await?;
-        rows.iter()
-            .map(|row| {
-                let role: String = row.try_get("role")?;
-                Ok((document_from_row(row)?, parse_role(&role)?))
-            })
-            .collect::<Result<_, sqlx::Error>>()
-            .map_err(DbError::from)
     }
 
     /// Who has been granted access to `doc`: the assignments on the scope that decides it.

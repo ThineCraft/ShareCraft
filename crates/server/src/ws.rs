@@ -391,6 +391,10 @@ async fn join_file_room(
 /// connection of that person. The role is read and sent under the document's access lock, like
 /// the API's changes, so the room hears the readings in database order.
 ///
+/// A room opened for this connection stores revisions under the name read before the upgrade;
+/// a rename written meanwhile may have found no room to tell. So the document's name is read
+/// again too, and the room told if it differs.
+///
 /// Says whether the connection stays, was removed (the room has been told), or could not be
 /// checked because the records could not be read; it then leaves quietly, and the page
 /// reconnects and is checked again.
@@ -402,6 +406,18 @@ async fn recheck_after_join(
 ) -> Recheck {
     let _in_order = state.rooms().order_access(doc).await;
     let db = state.db();
+    match db.document(doc).await {
+        Ok(Some(document)) if document.name != visitor.doc_name => {
+            let _ = access.send(AccessChange::Renamed {
+                name: document.name,
+            });
+        }
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("sharecraft-server: database failure: {e}");
+            return Recheck::Unavailable;
+        }
+    }
     let change = match db.session_by_id(visitor.session).await {
         Ok(None) => match db.user(visitor.user).await {
             Ok(Some(user)) if user.disabled => Some(AccessChange::RemoveUser { user: user.id }),
@@ -415,6 +431,7 @@ async fn recheck_after_join(
         },
         Ok(Some(_)) => match db.role(visitor.user, doc).await {
             Ok(role) if role == Some(visitor.role) => None,
+            Ok(None) if is_deleted(state, doc).await => Some(AccessChange::Deleted),
             Ok(role) => Some(AccessChange::SetAccess {
                 user: visitor.user,
                 role,
@@ -438,12 +455,21 @@ async fn recheck_after_join(
         AccessChange::SetAccess { role: None, .. } => {
             Recheck::Removed(RemovedReason::AccessRevoked)
         }
-        AccessChange::SetAccess { role: Some(_), .. } => Recheck::Keep,
+        AccessChange::Deleted => Recheck::Removed(RemovedReason::Deleted),
+        AccessChange::SetAccess { role: Some(_), .. }
+        | AccessChange::Renamed { .. }
+        | AccessChange::ConnectedUsers { .. } => Recheck::Keep,
     };
     // The room drops the member and records the removal. A room that has ended has dropped
     // this connection already.
     let _ = access.send(change);
     outcome
+}
+
+/// Whether the node of `doc` is deleted. A database failure counts as not deleted: the caller
+/// then removes the connection as one whose access ended.
+async fn is_deleted(state: &AppState, doc: DocId) -> bool {
+    matches!(state.db().node(doc.into()).await, Ok(Some(node)) if node.deleted)
 }
 
 /// What [`recheck_after_join`] decided about a connection.

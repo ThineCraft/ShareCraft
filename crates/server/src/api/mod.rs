@@ -4,7 +4,9 @@
 mod admin;
 mod content;
 mod docs;
+mod nodes;
 mod session;
+mod sites;
 
 use std::fmt;
 
@@ -15,7 +17,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
-use collab_core::ids::{DocId, SessionId, UserId};
+use collab_core::ids::{NodeId, SessionId, UserId};
 use records::{AccessError, AccountError};
 use serde::de::DeserializeOwned;
 use serde_json::json;
@@ -36,7 +38,19 @@ pub(crate) fn router(max_file_bytes: usize) -> Router<AppState> {
         .route("/session", post(session::sign_in).delete(session::sign_out))
         .route("/me", get(session::me))
         .route("/editors", get(crate::editors::list))
-        .route("/docs", get(docs::list).post(docs::create))
+        .route("/sites", get(sites::list).post(sites::create))
+        .route(
+            "/nodes/{id}",
+            get(nodes::show).patch(nodes::change).delete(nodes::remove),
+        )
+        .route(
+            "/nodes/{id}/children",
+            get(nodes::children).post(nodes::create),
+        )
+        .route("/nodes/{id}/access", get(nodes::access).put(nodes::share))
+        .route("/nodes/{id}/access/{user_id}", delete(nodes::unshare))
+        .route("/nodes/{id}/inheritance", post(nodes::inheritance))
+        .route("/docs", post(docs::create))
         .route(
             "/docs/upload",
             post(content::upload).layer(DefaultBodyLimit::max(max_file_bytes)),
@@ -48,9 +62,9 @@ pub(crate) fn router(max_file_bytes: usize) -> Router<AppState> {
                 .put(content::save)
                 .layer(DefaultBodyLimit::max(max_file_bytes)),
         )
-        .route("/docs/{id}/access", get(docs::access).put(docs::share))
+        .route("/docs/{id}/access", get(nodes::access).put(nodes::share))
         .route("/docs/{id}/events", get(docs::events))
-        .route("/docs/{id}/access/{user_id}", delete(docs::unshare))
+        .route("/docs/{id}/access/{user_id}", delete(nodes::unshare))
         .route("/admin/users", get(admin::users).post(admin::create))
         .route("/admin/users/{id}/disable", post(admin::disable))
         .route("/admin/users/{id}/enable", post(admin::enable))
@@ -96,8 +110,18 @@ pub(crate) enum ApiError {
     NoSuchUser,
     /// 409: the email is already in use.
     EmailTaken,
-    /// 409: a document must keep one owner.
+    /// 409: a scope must keep one owner.
     LastOwner,
+    /// 409: another item in the same place already has that name (ignoring case).
+    NameTaken,
+    /// 409: a folder still holds items.
+    NotEmpty,
+    /// 400: a folder cannot be moved into itself or below itself.
+    IntoItself,
+    /// 400: that kind of item cannot go there, or cannot be moved or deleted.
+    WrongPlace,
+    /// 400: a site cannot be deleted, and cannot inherit.
+    IsSite,
     /// 409: one administrator must stay enabled.
     LastAdmin,
     /// 422: a well-formed request with a value that makes no sense, such as an unknown role or
@@ -138,6 +162,11 @@ impl ApiError {
             ApiError::NoSuchUser => (StatusCode::NOT_FOUND, "no_such_user"),
             ApiError::EmailTaken => (StatusCode::CONFLICT, "email_taken"),
             ApiError::LastOwner => (StatusCode::CONFLICT, "last_owner"),
+            ApiError::NameTaken => (StatusCode::CONFLICT, "name_taken"),
+            ApiError::NotEmpty => (StatusCode::CONFLICT, "not_empty"),
+            ApiError::IntoItself => (StatusCode::BAD_REQUEST, "into_itself"),
+            ApiError::WrongPlace => (StatusCode::BAD_REQUEST, "wrong_place"),
+            ApiError::IsSite => (StatusCode::BAD_REQUEST, "is_site"),
             ApiError::LastAdmin => (StatusCode::CONFLICT, "last_admin"),
             ApiError::InvalidRequest => (StatusCode::UNPROCESSABLE_ENTITY, "invalid_request"),
             ApiError::InvalidName => (StatusCode::UNPROCESSABLE_ENTITY, "invalid_name"),
@@ -161,12 +190,11 @@ impl From<AccessError> for ApiError {
             AccessError::InvalidName => ApiError::InvalidName,
             // `POST /api/docs` answers this itself, naming the extension expected.
             AccessError::WrongExtension => ApiError::InvalidRequest,
-            // Tree changes arrive with the tree routes; until then nothing produces these.
-            AccessError::NameTaken
-            | AccessError::WrongPlace
-            | AccessError::IntoItself
-            | AccessError::NotEmpty
-            | AccessError::IsSite => ApiError::InvalidRequest,
+            AccessError::NameTaken => ApiError::NameTaken,
+            AccessError::WrongPlace => ApiError::WrongPlace,
+            AccessError::IntoItself => ApiError::IntoItself,
+            AccessError::NotEmpty => ApiError::NotEmpty,
+            AccessError::IsSite => ApiError::IsSite,
             // The server picks a fresh random id, so a clash is not the caller's doing.
             AccessError::Exists | AccessError::Db(_) => ApiError::unavailable(&e),
             // The tree is being repaired; a later attempt can succeed.
@@ -211,25 +239,41 @@ async fn to_completion<T: Send + 'static>(
     }
 }
 
-/// Called after `user`'s access to `doc` was granted, changed or removed, once the change is
-/// stored. Reads their role afresh, so an administrator who loses a grant stays an owner, and
-/// tells the document's room: connections that lost access are removed, the others get their
-/// new rights. If the role cannot be read, their connections are removed, as access can no
-/// longer be confirmed.
+/// Called once a change that can alter roles at or below `node` is stored: an assignment,
+/// a break or restore of inheritance on `node`, or a move of `node`. For every open document
+/// at or below `node`, one at a time in id order, reads the role of each person connected to
+/// it afresh (so an administrator who loses a grant stays an owner) and tells the room:
+/// connections that lost access are removed, the others get their new rights. If a role cannot
+/// be read, that person's connections are removed, as access can no longer be confirmed; if it
+/// cannot be told whether a document is below `node`, it is checked anyway.
 ///
-/// The read and the message to the room happen under the document's access lock, so that of
-/// two changes made at once the room hears the later reading last.
-async fn after_access_change(state: &AppState, doc: DocId, user: UserId) {
+/// Each document's readings and messages happen under its access lock, so that of two changes
+/// made at once the room hears the later reading last. One lock is held at a time.
+///
+/// Callers run it inside [`to_completion`], so a cancelled request still revokes.
+pub(crate) async fn recheck_below(state: &AppState, node: NodeId) {
     let rooms = state.rooms();
-    let _in_order = rooms.order_access(doc).await;
-    let role = match state.db().role(user, doc).await {
-        Ok(role) => role,
-        Err(e) => {
-            eprintln!("sharecraft-server: database failure: {e}");
-            None
+    let db = state.db();
+    let mut open = rooms.open_documents();
+    open.sort_by_key(|doc| doc.0);
+    for doc in open {
+        match db.is_at_or_below(doc.into(), node).await {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(e) => eprintln!("sharecraft-server: database failure: {e}"),
         }
-    };
-    rooms.send_to(doc, AccessChange::SetAccess { user, role });
+        let _in_order = rooms.order_access(doc).await;
+        for user in rooms.connected_users(doc).await {
+            let role = match db.effective_role(user, doc.into()).await {
+                Ok(role) => role,
+                Err(e) => {
+                    eprintln!("sharecraft-server: database failure: {e}");
+                    None
+                }
+            };
+            rooms.send_to(doc, AccessChange::SetAccess { user, role });
+        }
+    }
 }
 
 /// Called after `user`'s account was disabled: their connections to every document are removed.
@@ -287,31 +331,68 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use collab_core::ids::ClientId;
+    use collab_core::ids::{ClientId, DocId};
     use collab_text::TextOp;
     use protocol::ServerMsg;
     use records::test_support::TestDb;
-    use records::{Editor, NewUser, Role};
+    use records::{Editor, NewUser, NodeKind, Role};
     use revisions::RevisionStore;
     use tokio::sync::{mpsc, oneshot};
 
     use super::*;
     use crate::config::{Config, DatabaseUrl};
     use crate::room::{Command, JoinReply, OUTBOUND_CAPACITY, Outbound};
+    use crate::tree::{self, TreeOp};
 
     async fn account(db: &records::Db, name: &str) -> UserId {
+        user(db, name, false).await.id
+    }
+
+    async fn user(db: &records::Db, name: &str, is_admin: bool) -> records::User {
         db.create_user(
             None,
             NewUser {
                 email: &format!("{name}@test.invalid"),
                 name,
                 password: "a long enough password",
-                is_admin: false,
+                is_admin,
             },
         )
         .await
         .unwrap()
-        .id
+    }
+
+    /// A text document named Plan.txt in the library of a new site, which an administrator
+    /// made; `owner` owns the document.
+    async fn placed_document(state: &AppState, owner: UserId) -> DocId {
+        let db = state.db();
+        let root = user(db, "Root", true).await;
+        let site = tree::apply(
+            state,
+            &root,
+            TreeOp::Create {
+                parent: None,
+                kind: NodeKind::Site,
+                name: "Site".into(),
+                id: NodeId(Uuid::new_v4()),
+            },
+        )
+        .await
+        .unwrap();
+        let (children, _) = db
+            .children(root.id, site.id, None, 10)
+            .await
+            .unwrap()
+            .unwrap();
+        let library = children[0].node.id;
+        let doc = DocId(Uuid::new_v4());
+        tree::create_document(state, &root, library, doc, "Plan.txt", Editor::Text, None)
+            .await
+            .unwrap();
+        db.set_access(root.id, doc, owner, Some(Role::Owner))
+            .await
+            .unwrap();
+        doc
     }
 
     /// A server's state on `test`'s database, storing documents under `dir`; no listener.
@@ -342,10 +423,7 @@ mod tests {
         let state = state_for(&test, dir.path());
         let ann = account(&db, "Ann").await;
         let bob = account(&db, "Bob").await;
-        let doc = DocId(Uuid::new_v4());
-        db.create_document(ann, doc, "Plan.txt", Editor::Text)
-            .await
-            .unwrap();
+        let doc = placed_document(&state, ann).await;
         db.set_access(ann, doc, bob, Some(Role::Editor))
             .await
             .unwrap();
@@ -370,7 +448,13 @@ mod tests {
 
         // Held so that the hook waits after the grant is deleted.
         let held = state.rooms().order_access(doc).await;
-        let mut request = Box::pin(docs::change_access(state.clone(), ann, doc, bob, None));
+        let mut request = Box::pin(nodes::change_access(
+            state.clone(),
+            ann,
+            doc.into(),
+            bob,
+            None,
+        ));
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             tokio::select! {
@@ -420,10 +504,7 @@ mod tests {
         let state = state_for(&test, dir.path());
         let ann = account(&db, "Ann").await;
         let bob = account(&db, "Bob").await;
-        let doc = DocId(Uuid::new_v4());
-        db.create_document(ann, doc, "Plan.txt", Editor::Text)
-            .await
-            .unwrap();
+        let doc = placed_document(&state, ann).await;
         db.set_access(ann, doc, bob, Some(Role::Viewer))
             .await
             .unwrap();
@@ -449,7 +530,7 @@ mod tests {
             .unwrap();
         assert_eq!(reply.await.unwrap(), JoinReply::Accepted);
 
-        // The first change, made the way `after_access_change` makes it, paused between
+        // The first change, made the way `recheck_below` makes it, paused between
         // reading the role and telling the room.
         let first = state.rooms().order_access(doc).await;
         db.set_access(ann, doc, bob, Some(Role::Editor))
@@ -464,7 +545,7 @@ mod tests {
             .unwrap();
         let mut second = tokio::spawn({
             let state = state.clone();
-            async move { after_access_change(&state, doc, bob).await }
+            async move { recheck_below(&state, doc.into()).await }
         });
         // Long enough for the second hook to finish if nothing holds it back.
         let finished_early = tokio::time::timeout(Duration::from_millis(500), &mut second)

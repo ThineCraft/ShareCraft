@@ -187,9 +187,9 @@ async fn checkpoint_credits_accounts_and_uses_the_document_name() {
     let bob = server.user("Bob").await;
     let doc = new_doc();
     let db = &server.db.db;
-    db.create_document(ann.id, doc, "Plan.txt", Editor::Text)
-        .await
-        .unwrap();
+    server
+        .create_document(doc, "Plan.txt", Editor::Text, &ann)
+        .await;
     db.set_access(ann.id, doc, bob.id, Some(Role::Editor))
         .await
         .unwrap();

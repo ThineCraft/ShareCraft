@@ -183,6 +183,8 @@ impl AppState {
 /// - `GET /ws/docs/{doc_id}` opens a document session for a signed-in person with a role on
 ///   the document;
 /// - `GET /api/docs/{id}/events` lists a document's latest events, for its owners;
+/// - `/api/sites` and `/api/nodes/{id}…` list and change the content tree and who may access
+///   each node (see the `api` module);
 /// - `GET /api/editors` lists the installed editors, and `GET /editors/{id}/*` serves an
 ///   installed editor's files, for a signed-in caller;
 /// - anything else is a static file from `web_dir`.
@@ -232,23 +234,34 @@ async fn security_headers(request: Request, next: Next) -> Response {
     response
 }
 
-/// Serves `config` on `listener` until the process ends, storing documents in the library
-/// repository under `config.data_dir` (see [`library_path`]) and records in the database at
-/// `config.database_url`, whose schema it brings up to date first. Before accepting
-/// connections it reconciles the content tree in the database with Git (see
-/// [`tree::reconcile`]), adopts documents recorded before the tree (see
-/// [`tree::adopt_flat_documents`]), reconciles the revisions recorded in the database with Git
-/// (see [`reconcile`]), and prints one line with the counts of each. Once ready, it prints the address it
-/// listens on and that it runs in development mode, then accepts connections.
+/// Serves `config` on `listener` until the process ends: checks that the listener is on a
+/// loopback address, makes the server's state with [`prepare`], prints the address it listens
+/// on and that it runs in development mode, then accepts connections.
 ///
 /// # Errors
-/// Returns an error if the listener is not on a loopback address, if the database cannot be
-/// reached or migrated, if the library repository cannot be opened, created or listed, if the
-/// tree cannot be read or the adoption fails (a missing administrator is only reported: the
-/// documents wait for a start with one), or if accepting connections fails.
+/// Returns an error if the listener is not on a loopback address, if [`prepare`] fails, or if
+/// accepting connections fails.
 pub async fn serve(config: Config, listener: TcpListener) -> std::io::Result<()> {
     let addr = listener.local_addr()?;
     require_loopback(addr)?;
+    let state = prepare(config).await?;
+    println!("ShareCraft server listening on http://{addr}");
+    println!("WARNING: development mode, local connections only");
+    serve_state(state, listener).await
+}
+
+/// The state of a server about to accept connections, storing documents in the library
+/// repository under `config.data_dir` (see [`library_path`]) and records in the database at
+/// `config.database_url`, whose schema it brings up to date first. It reconciles the content
+/// tree in the database with Git (see [`tree::reconcile`]), adopts documents recorded before
+/// the tree (see [`tree::adopt_flat_documents`]), reconciles the revisions recorded in the
+/// database with Git (see [`reconcile`]), and prints one line with the counts of each.
+///
+/// # Errors
+/// Returns an error if the database cannot be reached or migrated, if the library repository
+/// cannot be opened, created or listed, or if the tree cannot be read or the adoption fails (a
+/// missing administrator is only reported: the documents wait for a start with one).
+pub async fn prepare(config: Config) -> std::io::Result<AppState> {
     let db = Db::connect(config.database_url.expose())
         .await
         .map_err(|e| std::io::Error::other(format!("cannot connect to the database: {e}")))?;
@@ -293,9 +306,7 @@ pub async fn serve(config: Config, listener: TcpListener) -> std::io::Result<()>
             doc.0
         );
     }
-    println!("ShareCraft server listening on http://{addr}");
-    println!("WARNING: development mode, local connections only");
-    serve_state(AppState::new(config, store, db), listener).await
+    Ok(AppState::new(config, store, db))
 }
 
 /// Serves `state` on `listener` until the process ends.

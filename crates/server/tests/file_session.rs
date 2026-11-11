@@ -26,7 +26,8 @@ use futures_util::{SinkExt, StreamExt};
 use protocol::{ClientMsg, FileClientMsg, FileServerMsg, RemovedReason, SeatState};
 use reqwest::StatusCode;
 use revisions::{
-    Checkpoint, CheckpointError, GitError, Outcome, RevisionId, RevisionInfo, RevisionStore, Stored,
+    Checkpoint, CheckpointError, GitError, Outcome, RevisionId, RevisionInfo, RevisionStore,
+    Stored, TreeChange, TreeRecord,
 };
 use server::Checkpointer;
 use tokio_tungstenite::tungstenite::Message;
@@ -364,6 +365,18 @@ impl Checkpointer for HeldLoad {
 
     fn documents(&self) -> Result<Vec<DocId>, GitError> {
         self.inner.documents()
+    }
+
+    fn write_tree(&self, change: &TreeChange<'_>) -> Result<RevisionId, CheckpointError> {
+        self.inner.write_tree(change)
+    }
+
+    fn read_tree(&self) -> Result<Vec<TreeRecord>, CheckpointError> {
+        self.inner.read_tree()
+    }
+
+    fn read_tree_record(&self, id: Uuid) -> Result<Option<TreeRecord>, CheckpointError> {
+        self.inner.read_tree_record(id)
     }
 }
 

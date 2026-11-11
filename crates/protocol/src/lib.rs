@@ -67,6 +67,8 @@ pub enum RemovedReason {
     SignedOut,
     /// The account was disabled.
     AccountDisabled,
+    /// The document was deleted.
+    Deleted,
 }
 
 /// Browser to server.
@@ -263,6 +265,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&RemovedReason::AccountDisabled).unwrap(),
             "\"account_disabled\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RemovedReason::Deleted).unwrap(),
+            "\"deleted\""
         );
     }
 

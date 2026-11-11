@@ -771,7 +771,6 @@ async fn cycle_in_the_data_ends_every_walk() {
     assert!(!test.db.is_at_or_below(t.file, t.site).await.unwrap());
     assert!(test.db.scope_users(t.file).await.unwrap().is_empty());
     assert_eq!(test.db.sites_for(ann.id).await.unwrap().len(), 1);
-    assert!(test.db.documents_for(ann.id).await.unwrap().is_empty());
 }
 
 /// A rename of `t.file` to `name` by `actor`, as the server mirrors one after its commit.

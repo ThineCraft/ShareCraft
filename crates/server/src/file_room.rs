@@ -31,7 +31,7 @@ use crate::members::{self, AccessRules, Admission, Frames, Member, Members};
 use crate::projection::Recorder;
 use crate::room::{
     AccessChange, ConnId, JoinReply, Link, Outbound, Place, Rooms, Running, Storage, credited_name,
-    finished, grace_end, refuse_waiting, sleep_until,
+    finished, grace_end, load_serving, refuse_waiting, sleep_until,
 };
 
 /// Commands queued for a session before connections wait to send more.
@@ -201,6 +201,9 @@ impl WriteJob {
 /// with `try_send` and a connection whose queue is full or closed is dropped.
 struct FileRoom {
     doc: DocId,
+    /// The document's name, as of the session opening or the last rename it was told of;
+    /// revisions are stored under it.
+    name: String,
     /// The current revision: loaded when the session started, then each one saved.
     revision: Option<RevisionId>,
     /// The document fields stored with the loaded revision; every save keeps them.
@@ -226,12 +229,14 @@ struct FileRoom {
 impl FileRoom {
     fn new(
         doc: DocId,
+        name: String,
         revision: Option<RevisionId>,
         fields: Map<String, Value>,
         events: EventSink,
     ) -> Self {
         Self {
             doc,
+            name,
             revision,
             fields,
             members: Members::new(doc, events.clone()),
@@ -669,6 +674,15 @@ impl AccessRules for FileRoom {
             self.members_left(None);
         }
     }
+
+    fn rename(&mut self, name: String) {
+        self.name = name;
+    }
+
+    /// Members, and connections still waiting to be confirmed.
+    fn connected_users(&self) -> Vec<UserId> {
+        members::users_of(self.members.iter().chain(self.pending.iter()))
+    }
 }
 
 /// The file session's frames, for its members.
@@ -716,7 +730,7 @@ fn same_token(a: &str, b: &str) -> bool {
 /// empty once in conflict.
 async fn run(
     place: Place,
-    name: String,
+    mut name: String,
     mut rx: mpsc::Receiver<FileCommand>,
     mut access_rx: mpsc::UnboundedReceiver<AccessChange>,
     storage: Storage,
@@ -724,7 +738,8 @@ async fn run(
 ) {
     let doc = place.doc();
     let Storage { store, db, events } = storage;
-    let (revision, fields) = match load(&store, doc).await {
+    let (revision, fields) = match load_serving(load(&store, doc), &mut access_rx, &mut name).await
+    {
         Ok(loaded) => loaded,
         Err(err) => {
             eprintln!("sharecraft-server: cannot open document {}: {err}", doc.0);
@@ -739,7 +754,7 @@ async fn run(
             return;
         }
     };
-    let mut room = FileRoom::new(doc, revision, fields, events.clone());
+    let mut room = FileRoom::new(doc, name, revision, fields, events.clone());
     // Revisions are recorded off this task, in the order written: one save is written at a
     // time, and the blocking task that writes it queues it before the session learns of it.
     let recorder = db.map(|db| Recorder::start(doc, Arc::clone(&store), db, events));
@@ -753,7 +768,7 @@ async fn run(
             && let Some(job) = room.next_write()
         {
             let store = Arc::clone(&store);
-            let file_name = name.clone();
+            let file_name = room.name.clone();
             let recorder = recorder.clone();
             running = Some(tokio::task::spawn_blocking(move || {
                 let result = job.write(doc, &file_name, &*store);
@@ -843,7 +858,8 @@ mod tests {
 
     const NAME: &str = "Plan.xlsx";
 
-    /// A file document in a fresh database and library: Ann owns it, Bob may edit it.
+    /// A file document in a fresh database and library, which Ann and Bob join with the roles
+    /// each test gives them.
     struct Fixture {
         _test: TestDb,
         db: Db,
@@ -875,10 +891,9 @@ mod tests {
         let ann = account(&db, "Ann").await;
         let bob = account(&db, "Bob").await;
         let doc = DocId(Uuid::new_v4());
+        // The record that revisions are recorded against. A session takes each person's role
+        // from their join, so nobody needs a role in the records.
         db.create_document(ann, doc, NAME, Editor::GridCraft)
-            .await
-            .unwrap();
-        db.set_access(ann, doc, bob, Some(Role::Editor))
             .await
             .unwrap();
         Fixture {
