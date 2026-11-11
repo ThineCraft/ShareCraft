@@ -12,6 +12,7 @@
 @media(max-width:850px){.layout{grid-template-columns:1fr;gap:28px}nav{position:static;max-height:none;display:flex;flex-wrap:wrap;gap:3px 18px;border-bottom:1px solid var(--line);padding-bottom:20px}nav p{width:100%;margin-bottom:0}.cover{padding:40px 25px}.module{padding:20px}}
 @media print{@page{size:A4;margin:17mm}html,body{background:white;font-size:10pt}.cover{padding:12mm 0;background:white;color:var(--ink);border-bottom:3px solid var(--accent)}.cover .lede,.meta,.eyebrow{color:var(--ink)}.layout{display:block;padding:10mm 0;margin:0;max-width:none}nav,.toolbar button,.skip{display:none}.module{border-radius:0;padding:5mm}.note{background:#f4f4f4}h2,h3{break-after:avoid}a{color:inherit}tr{break-inside:avoid}.table-wrap{overflow:visible}}
 pre{background:#0f2a2c;color:#e6f2ee;border-radius:6px;padding:14px 16px;margin:0 0 16px;overflow-x:auto;font-size:.88rem;line-height:1.5}code{font-family:Consolas,"Cascadia Mono",monospace;font-size:.92em}p code,li code,td code{background:#e8efed;border-radius:3px;padding:1px 5px}pre code{background:none;padding:0;font-size:inherit}
+table.banded tbody tr:nth-child(even)>td{background:light-dark(#f4f8f7,#212b30)}
 @media print{pre{background:#f4f4f4;color:#000;border:1px solid #999;white-space:pre-wrap}}
 </style>
 </head>
@@ -21,11 +22,11 @@ pre{background:#0f2a2c;color:#e6f2ee;border-radius:6px;padding:14px 16px;margin:
 <p class="eyebrow">ThineCraft / Development build</p>
 <h1>Building and running ShareCraft</h1>
 <p class="lede">How to build and run the development build of ShareCraft: people sign in with their own accounts, share documents with each other, edit plain text together in browser tabs, and open spreadsheets, word documents, PDFs and 3D designs in their editors, one person at a time. This page also says what the build does not do yet.</p>
-<div class="meta"><span>Stage 1 · Third plan</span><span>10 November 2026</span><span>Companion to <a href="sequencing.html" style="color:inherit">Sequencing Plan</a></span></div>
+<div class="meta"><span>Stage 2 · First platform plan</span><span>11 November 2026</span><span>Companion to <a href="sequencing.html" style="color:inherit">Sequencing Plan</a></span></div>
 </header>
 <div class="layout">
 <nav aria-label="Document contents"><p>In this document</p>
-<a href="#need">01 · What you need</a><a href="#build">02 · Build and check</a><a href="#admin">03 · The first administrator</a><a href="#run">04 · Run it and sign in</a><a href="#settings">05 · Settings</a><a href="#accounts">06 · Accounts and signing in</a><a href="#sharing">07 · Sharing and roles</a><a href="#removed">08 · What a removed person sees</a><a href="#data">09 · Where data is kept</a><a href="#index">10 · The revision index</a><a href="#events">11 · Events</a><a href="#stop">12 · Stopping the server, and notices</a><a href="#editors">13 · Building the editors</a><a href="#files">14 · Opening a file document</a><a href="#session">15 · File session, seat and saving</a><a href="#content">16 · Content routes</a><a href="#policy">17 · The editor pages' policy</a><a href="#limits">18 · Known limits</a><a href="#licences">19 · Licences</a>
+<a href="#need">01 · What you need</a><a href="#build">02 · Build and check</a><a href="#admin">03 · The first administrator</a><a href="#run">04 · Run it and sign in</a><a href="#settings">05 · Settings</a><a href="#accounts">06 · Accounts and signing in</a><a href="#sharing">07 · Sharing and roles</a><a href="#removed">08 · What a removed person sees</a><a href="#data">09 · Where data is kept</a><a href="#index">10 · The revision index</a><a href="#events">11 · Events</a><a href="#stop">12 · Stopping the server, and notices</a><a href="#editors">13 · Building the editors</a><a href="#files">14 · Opening a file document</a><a href="#session">15 · File session, seat and saving</a><a href="#content">16 · Content routes</a><a href="#tree">17 · The content tree and routes</a><a href="#treegit">18 · The tree in Git and PostgreSQL</a><a href="#upgrade">19 · Upgrading</a><a href="#policy">20 · The editor pages' policy</a><a href="#limits">21 · Known limits</a><a href="#licences">22 · Licences</a>
 </nav>
 <main id="main">
 <div class="toolbar"><span class="small">Standalone HTML · Print-ready · No external assets</span><button type="button" onclick="window.print()">Print / Save PDF</button></div>
@@ -78,16 +79,18 @@ pre{background:#0f2a2c;color:#e6f2ee;border-radius:6px;padding:14px 16px;margin:
 <section id="run"><h2>04 / Run it and sign in</h2>
 <p>Start the server, still from the repository root. It needs <code>DATABASE_URL</code>, which it reads from <code>.env</code> in the current folder or a parent. It takes its address first, so an address already in use is reported at once. It then brings the database schema up to date and compares the revision index with Git (section 10). Only then does it say where it listens and start accepting connections:</p>
 <pre><code>cargo run -p server</code></pre>
-<p>It prints the revision-index line, then the address it listens on and <code>WARNING: development mode, local connections only</code>. If the database cannot be reached or brought up to date, it prints why and exits without printing the address. Once the address is shown, open the site in a browser at exactly one of these addresses:</p>
+<p>It prints the content-tree line (section 19) and the revision-index line, then the address it listens on and <code>WARNING: development mode, local connections only</code>. If the database cannot be reached or brought up to date, it prints why and exits without printing the address. Once the address is shown, open the site in a browser at exactly one of these addresses:</p>
 <pre><code>http://127.0.0.1:8787/
 http://localhost:8787/</code></pre>
-<p>A person who is not signed in is sent to the sign-in page, and after signing in comes back to the page they asked for. After signing in the documents page lists the documents the person can open and has a <strong>New document</strong> form. A document opens at an address such as <code>/doc.html#&lt;document id&gt;</code>; the part after <code>#</code> is the document's identifier, and anyone with access can use the same address.</p>
+<p>A person who is not signed in is sent to the sign-in page, and after signing in comes back to the page they asked for. After signing in the first page lists the sites the person can see; a site opens to its libraries, and a library or folder lists its folders and files, with a <strong>New document</strong> form and an upload (section 17). A document opens at an address such as <code>/doc.html#&lt;document id&gt;</code>; the part after <code>#</code> is the document's identifier, and anyone with access can use the same address.</p>
 <p>The pages the server provides:</p>
 <div class="table-wrap"><table><caption>Pages</caption>
 <thead><tr><th>Page</th><th>Who</th><th>What it does</th></tr></thead>
 <tbody>
 <tr><td><code>/signin.html</code></td><td>Everyone</td><td>Email and password form.</td></tr>
-<tr><td><code>/</code> (documents)</td><td>Signed-in people</td><td>Lists your documents with your role, their editor and last save time, creates a new one or uploads a file (section 14), and has the <strong>Sign out</strong> button. Administrators also see a link to People.</td></tr>
+<tr><td><code>/</code> (sites)</td><td>Signed-in people</td><td>Lists the sites you can see with your role (administrators can add a site), and has the <strong>Sign out</strong> button. Administrators also see a link to People.</td></tr>
+<tr><td><code>/site.html?id=&lt;id&gt;</code>, <code>/library.html?id=&lt;id&gt;</code></td><td>People with a role on the item or below it</td><td>A site's libraries; a library's or folder's folders and files, with their role and last save time. Create, rename, move, delete and upload (section 17; section 14 for files).</td></tr>
+<tr><td><code>/access.html?id=&lt;id&gt;</code></td><td>Owners</td><td>Who has access to an item and where it comes from; give or remove access; break inheritance or inherit again (section 17).</td></tr>
 <tr><td><code>/doc.html#&lt;id&gt;</code></td><td>People with a role on the document</td><td>The text box, who is in the document, the save status, and, for owners, the Sharing panel (section 07).</td></tr>
 <tr><td><code>/file.html?doc=&lt;id&gt;</code></td><td>People with a role on the document</td><td>A spreadsheet, word document, PDF or design in its editor, inside the frame page (section 14).</td></tr>
 <tr><td><code>/people.html</code></td><td>Administrators</td><td>Lists every account, adds an account, disables or enables one (section 06). Other people see <strong>Only administrators can manage people.</strong></td></tr>
@@ -155,8 +158,8 @@ cargo run -p server</code></pre>
 </section>
 
 <section id="sharing"><h2>07 / Sharing and roles</h2>
-<p>A person with an account can create a document on the documents page. The name is optional (it defaults to <strong>Untitled</strong>); it can be 1 to 120 characters and cannot contain control characters, <code>/</code> or <code>\</code>. The creator becomes its owner. A name cannot be changed afterwards yet.</p>
-<p>Access is granted <strong>per document, to one person at a time</strong>. A person with no grant on a document cannot see it in their list and cannot open it. The server answers the same way for a document that does not exist and one you may not open, so you cannot find out that a document exists by guessing its address; the page says <strong>This document does not exist, or you do not have access to it.</strong></p>
+<p>A person who is an editor of a library or folder can create a document in it. The name is optional (it defaults to <strong>Untitled</strong>). Names follow the rules in section 17, and a document can be renamed and moved. A new document takes its access from the place it is in, as section 17 describes.</p>
+<p>Access is granted <strong>to one person at a time</strong>, on a site, library, folder or file, and passes down to what is inside it (section 17). A person with no role on a document cannot see it in a list and cannot open it. The server answers the same way for a document that does not exist and one you may not open, so you cannot find out that a document exists by guessing its address; the page says <strong>This document does not exist, or you do not have access to it.</strong></p>
 <div class="table-wrap"><table><caption>Roles</caption>
 <thead><tr><th>Role</th><th>Read</th><th>Change the text</th><th>Share and see events</th></tr></thead>
 <tbody>
@@ -167,7 +170,7 @@ cargo run -p server</code></pre>
 <p>A viewer sees the live text and who else is there, but the text box is read-only and the page shows <strong>You can read this document but not change it.</strong> The server also refuses changes from a viewer, whatever the page does.</p>
 <p><strong>Administrators</strong> are owners of every document without needing a grant, so someone can always recover a document whose owners are gone. They appear in the Sharing list only if they were granted a role explicitly.</p>
 <h3>Sharing a document</h3>
-<p>Owners see a <strong>Sharing</strong> panel under the text. It lists everyone who has been granted access, each with a role menu and a <strong>Remove</strong> button. To add someone, type their email, choose a role and press <strong>Share</strong>. Choosing another role in a person's menu changes their role at once. Sharing is by the email of an existing account: <strong>No account has that email address.</strong> appears if there is none, and only owners can learn this. A document must keep at least one owner; removing or demoting the last one is refused with <strong>A document must keep at least one owner.</strong></p>
+<p>Owners see a <strong>Sharing</strong> panel under the text. It lists everyone who has access to the document, whether it is its own or inherited, each with a role menu and a <strong>Remove</strong> button. To add someone, type their email, choose a role and press <strong>Share</strong>. Choosing another role in a person's menu changes their role at once. Sharing is by the email of an existing account: <strong>No account has that email address.</strong> appears if there is none, and only owners can learn this. A document must keep at least one owner; removing or demoting the last one is refused with <strong>A document must keep at least one owner.</strong></p>
 <p>A change takes effect for people who have the document open straight away, without them reloading (next section).</p>
 </section>
 
@@ -194,7 +197,7 @@ cargo run -p server</code></pre>
 <tr><td><strong>PostgreSQL</strong>, the database named by <code>DATABASE_URL</code></td><td>Accounts and password hashes, sign-in sessions, who has access to which document, the index of revisions, and events (sections 10 and 11).</td><td>Nobody can sign in, and who may open which document is forgotten. The documents themselves are safe in Git. See below.</td></tr>
 </tbody></table></div>
 <p><strong>PostgreSQL needs its own backup.</strong> Backing up the data folder does not back up accounts, sharing or events, and backing up the database does not back up document content. Keep both, taken at about the same time. Only the revision index in PostgreSQL can be rebuilt from Git (section 10).</p>
-<p>If PostgreSQL is lost and you start with an empty database, you must create the first administrator again (section 03). Starting the server then re-creates a record for each document found in Git, with no creator and no grants, so only administrators can open them until they share them again. Accounts, passwords, sharing and events are not recovered by this.</p>
+<p>If PostgreSQL is lost and you start with an empty database, you must create the first administrator again (section 03). Starting the server then re-creates a record for each document found in Git, with no creator and no grants, so only administrators can open them until they share them again. Accounts, passwords, sharing and events are not recovered by this. The content tree is rebuilt from Git as well (section 18).</p>
 <h3>The Git repository</h3>
 <p>Documents are stored in one bare Git repository under the data folder:</p>
 <pre><code>&lt;data folder&gt;/libraries/00000000-0000-0000-0000-000000000001.git</code></pre>
@@ -316,7 +319,7 @@ cargo xtask editors verify             # every installed editor matches editors.
 <p><strong>Why a clean temporary copy.</strong> Cargo applies a configuration file (<code>.cargo/config.toml</code>) found in any folder above the one it builds in. A developer's own settings there would silently change what is built; one such file on the owner's machine points one of SolidCraft's libraries at a local copy. Building from a copy outside the repositories folder means only the fork's own settings apply, and the fork's folder is never changed by the build. If <code>build</code> finds a Cargo configuration above the temporary folder (other than Cargo's own home folder), it refuses and says to set <code>TMP</code> and <code>TEMP</code> to a folder outside it.</p>
 <p><strong>Where the compiled pieces go.</strong> Cargo's intermediate files go to one folder per editor under <code>SHARECRAFT_EDITOR_TARGET_DIR</code>, or under <code>sharecraft-editor-target</code> in the system's temporary folder when it is not set. Keeping them makes a rebuild faster.</p>
 <p><strong><code>verify</code></strong> checks each installed editor against <code>editors.toml</code>: the fork commit it was built from must be the recorded <code>commit</code>, its upstream commit the recorded <code>base</code>, and the fingerprints in its manifest must match its <code>index.html</code>. It also reports any compressed copy that is older than the file beside it (the file changed after the copy was made), naming the editor and saying to run <code>cargo xtask editors compress &lt;id&gt;</code>. <code>cargo xtask check</code> runs it too, for installed editors only, so a machine with no editors built still passes.</p>
-<p><strong>The compressed copies.</strong> The editors' WebAssembly files are tens of megabytes, so the server sends a compressed copy where it can. The build tool writes the copies at install time, so the server does no compression work while it runs. A browser that accepts Brotli gets the <code>.br</code> copy, one that accepts only gzip gets the <code>.gz</code> copy, and any other request gets the plain file; the answer keeps the plain file's content type. The sign-in check, the same-origin check, the editor policy, <code>no-cache</code> and <code>nosniff</code> are the same for all three (section 17). A file that is not worth compressing (under 1,024 bytes, or a kind not listed above, such as images) has no copies.</p>
+<p><strong>The compressed copies.</strong> The editors' WebAssembly files are tens of megabytes, so the server sends a compressed copy where it can. The build tool writes the copies at install time, so the server does no compression work while it runs. A browser that accepts Brotli gets the <code>.br</code> copy, one that accepts only gzip gets the <code>.gz</code> copy, and any other request gets the plain file; the answer keeps the plain file's content type. The sign-in check, the same-origin check, the editor policy, <code>no-cache</code> and <code>nosniff</code> are the same for all three (section 20). A file that is not worth compressing (under 1,024 bytes, or a kind not listed above, such as images) has no copies.</p>
 <p><code>cargo xtask editors compress</code> (give an editor's id to do just one) adds or refreshes the copies in editors that are already installed, so an editor built before this change does not have to be rebuilt. It prints, for each editor, the sizes of the compressible files plain, with gzip and with Brotli, and the time taken; Brotli is slow on large files, so it takes from about 20 seconds (GridCraft) to nearly 2 minutes (SolidCraft). An editor that is not installed is reported as such. The copies are made from the plain files and replace any copies already there.</p>
 <p><strong>Never edit a copy by hand, and compress after any change made outside the build tool.</strong> The server serves a copy without comparing it to its file, so a copy that is out of date is what browsers get. If you change an editor's files in any way other than <code>cargo xtask editors build</code>, run <code>cargo xtask editors compress &lt;id&gt;</code> afterwards. A lone <code>.gz</code> or <code>.br</code> that has no partner is taken to be a file the editor itself ships and is left alone.</p>
 <p>Measured on 11 November 2026, the Brotli copies of an editor's compressible files are about 22 to 27 per cent of their plain size. The figures for each editor, and what was and was not checked in the browser, are in <a href="editors.html#glance">editors.html</a>, section 02.</p>
@@ -425,7 +428,125 @@ cargo xtask editors verify             # every installed editor matches editors.
 </tbody></table></div>
 </section>
 
-<section id="policy"><h2>17 / The editor pages' security policy, and why it is built from hashes</h2>
+<section id="tree"><h2>17 / The content tree and its routes</h2>
+<p>Content is kept as a tree: a <strong>site</strong> holds <strong>libraries</strong>, a library holds <strong>folders</strong> and <strong>files</strong>, and a folder holds more folders and files. Every item has an identifier that does not change when it is renamed or moved; a file's identifier is its document identifier. Only an administrator can create a site, and every new site gets a library named <strong>Documents</strong>. A site cannot be moved or deleted, and a library cannot be moved or deleted either.</p>
+<p>The pages are <code>/</code> (the sites a person can see), <code>/site.html?id=&lt;id&gt;</code>, <code>/library.html?id=&lt;id&gt;</code> (a library or a folder) and <code>/access.html?id=&lt;id&gt;</code> (who has access to an item, and where that access comes from).</p>
+<h3>Who may do what</h3>
+<div class="table-wrap"><table class="banded"><caption>Rights needed for each change</caption>
+<thead><tr><th>Change</th><th>Who</th></tr></thead>
+<tbody>
+<tr><td>Create a site</td><td>An administrator. The creator becomes an owner of the site.</td></tr>
+<tr><td>Create a library in a site</td><td>An owner of the site.</td></tr>
+<tr><td>Create a folder, or a file (a new document or an upload), in a library or folder</td><td>An editor of that library or folder.</td></tr>
+<tr><td>Rename</td><td>A site or library: an owner of it. A folder or file: an editor of it.</td></tr>
+<tr><td>Move a folder or file into another library or folder (also in another site)</td><td>An editor of the item and of the place it goes into. A folder cannot go into itself or below itself.</td></tr>
+<tr><td>Delete a file, or an empty folder</td><td>An editor of it.</td></tr>
+<tr><td>See who has access, give or remove access, break inheritance or inherit again</td><td>An owner. To inherit again, also an owner of the scope above.</td></tr>
+</tbody></table></div>
+<p><strong>Names.</strong> A name is 1 to 120 characters after spaces at either end are removed. It cannot contain control characters or any of <code>" * : &lt; &gt; ? / \ |</code>, and cannot end with a dot. No two items in the same place can have the same name, ignoring case; the second is refused with <code>name_taken</code>. The name of a file must end with the extension of its editor, where the editor has one (for example <code>.xlsx</code> for GridCraft). A deleted item frees its name.</p>
+<h3>Inherited access</h3>
+<p>Access is given on a site, library, folder or file, to one person at a time, as viewer, editor or owner (the roles in section 07). An item <strong>inherits</strong> its access from the nearest item above it that has access of its own; that item is its <strong>scope</strong>. A site is always a scope. Giving someone access on an item that inherits, or removing someone from it, first <strong>breaks inheritance</strong>: the item becomes a scope of its own, starting with a copy of the assignments it inherited, and then the change is made. <strong>Inherit again</strong> deletes the item's own assignments, so it follows the scope above once more. Nothing below the item is read or written when either happens, so the cost does not grow with the number of files.</p>
+<p>A person who has a role only somewhere below an item sees that item on the way down, with <strong>limited access</strong> (no role of their own on it), and sees only the path to what they were given. Administrators are owners of everything, as in section 07. When a change alters who may open a file that is open, the server works out each connected person's role again straight away: connections that lost access are removed (<strong>Your access to this document was removed.</strong>), and the others get their new rights. A file that is deleted removes everyone connected to it. Section 08 describes what the person sees.</p>
+<h3>The routes</h3>
+<p>All of them need a signed-in person and a request from a page of this site, like every <code>/api</code> route. A person who has no role on an item, or anywhere below it, gets <code>404</code> as if it did not exist.</p>
+<div class="table-wrap"><table class="banded"><caption>Routes for sites and nodes</caption>
+<thead><tr><th>Route</th><th>Who</th><th>Answers</th></tr></thead>
+<tbody>
+<tr><td><code>GET /api/sites</code></td><td>Any signed-in person</td><td><code>200</code>, a list of <code>{id, name, role}</code> for the sites the person can see, by name. <code>role</code> is null for limited access.</td></tr>
+<tr><td><code>POST /api/sites</code> <code>{name}</code></td><td>Administrators</td><td><code>201</code> with the new site; its Documents library is made with it.</td></tr>
+<tr><td><code>GET /api/nodes/&lt;id&gt;</code></td><td>A role on it or below it</td><td><code>200</code> <code>{id, kind, name, role, editor, path}</code>. <code>editor</code> is given for a file. <code>path</code> runs from the site down to the item, each step with its kind, name and the person's role there (null for limited access).</td></tr>
+<tr><td><code>GET /api/nodes/&lt;id&gt;/children?after=&amp;limit=</code></td><td>A role on it or below it</td><td><code>200</code> <code>{items, next}</code>: the children the person can see, folders before files, then by name. Each has <code>id, kind, name, role, inherits</code>, and for a file <code>editor</code> and <code>revised_at</code>. <code>limit</code> is 1 to 500 (100 if left out); pass <code>next</code> as <code>after</code> for the following page. <code>next</code> is null on the last page. A bad <code>limit</code> or <code>after</code> gives <code>422 invalid_request</code>.</td></tr>
+<tr><td><code>POST /api/nodes/&lt;id&gt;/children</code> <code>{kind, name}</code></td><td>See the table above</td><td><code>201</code> with the new <code>library</code> or <code>folder</code>. Files are made through <code>POST /api/docs</code>, not here.</td></tr>
+<tr><td><code>PATCH /api/nodes/&lt;id&gt;</code> <code>{name?, parent?}</code></td><td>See the table above</td><td><code>200</code> with the item as it now is. With both, the rename is made first; if the move is then refused, the rename stays and the error is returned. Neither given gives <code>422 invalid_request</code>.</td></tr>
+<tr><td><code>DELETE /api/nodes/&lt;id&gt;</code></td><td>An editor</td><td><code>204</code>. Anyone connected to a deleted file is removed before the answer is sent.</td></tr>
+<tr><td><code>GET /api/nodes/&lt;id&gt;/access</code></td><td>Owners</td><td><code>200</code> <code>{inherits, source, grants}</code>: whether the item inherits, the scope its access comes from (the item itself if it does not inherit), and the people with a role there, each with name, email and role.</td></tr>
+<tr><td><code>PUT /api/nodes/&lt;id&gt;/access</code> <code>{email, role}</code></td><td>Owners</td><td><code>204</code>. Breaks inheritance first if the item inherits. <code>no_such_user</code> is told only to owners, so nobody else can learn which emails have accounts.</td></tr>
+<tr><td><code>DELETE /api/nodes/&lt;id&gt;/access/&lt;user_id&gt;</code></td><td>Owners</td><td><code>204</code>. Breaks inheritance first if the item inherits. The last owner cannot be removed (<code>last_owner</code>).</td></tr>
+<tr><td><code>POST /api/nodes/&lt;id&gt;/inheritance</code> <code>{inherit}</code></td><td>Owners (to inherit again, also owners of the scope above)</td><td><code>204</code>, also when the item already was as asked. <code>true</code> inherits again; <code>false</code> breaks inheritance.</td></tr>
+</tbody></table></div>
+<p>The routes <code>/api/docs/&lt;id&gt;/access</code> and <code>/api/docs/&lt;id&gt;/access/&lt;user_id&gt;</code> still work for files and are served by the same code.</p>
+<div class="table-wrap"><table class="banded"><caption>Document routes that changed</caption>
+<thead><tr><th>Route</th><th>What changed</th></tr></thead>
+<tbody>
+<tr><td><code>POST /api/docs</code> <code>{parent, name?, editor?}</code></td><td><code>parent</code> is now required: the library or folder the document goes into, of which the person must be an editor. The document inherits its access from there; the creator is not given a grant of their own. <code>201</code> with <code>{id, name, editor, role}</code>. Three answers carry a sentence (<code>message</code>) as well as a code, all <code>400</code>: <code>unknown_editor</code>, <code>upload_required</code> (an empty PDF is not a file; upload one) and <code>wrong_extension</code> (the name must end with the editor's extension). The other codes are in the table below.</td></tr>
+<tr><td><code>POST /api/docs/upload?parent=&lt;id&gt;&amp;name=&lt;file name&gt;</code></td><td><code>parent</code> is now required, with the same rule. A missing <code>parent</code> or <code>name</code>, a name no editor opens, or an empty file gives <code>400 bad_request</code>. The document inherits its access. If the bytes cannot be stored after the document was made, the answer is <code>503</code> naming the document, which stays, empty. Section 16 has the rest.</td></tr>
+<tr><td><code>GET /api/docs</code></td><td>Removed. It answers <code>405</code>. What a person can open is now found through <code>GET /api/sites</code> and the children of each item.</td></tr>
+</tbody></table></div>
+<div class="table-wrap"><table class="banded"><caption>Error codes of these routes (<code>{"error": "&lt;code&gt;"}</code>)</caption>
+<thead><tr><th>Code</th><th>Status</th><th>When</th></tr></thead>
+<tbody>
+<tr><td><code>not_found</code></td><td>404</td><td>No such item, or the person has no role on it or below it.</td></tr>
+<tr><td><code>forbidden</code></td><td>403</td><td>The person's role is too low for the change, or an administrator is needed (a new site).</td></tr>
+<tr><td><code>no_such_user</code></td><td>404</td><td>No account has the email given (owners only).</td></tr>
+<tr><td><code>name_taken</code></td><td>409</td><td>Another item in the same place has that name, ignoring case.</td></tr>
+<tr><td><code>not_empty</code></td><td>409</td><td>A folder that still holds items cannot be deleted.</td></tr>
+<tr><td><code>last_owner</code></td><td>409</td><td>A site, library, folder or file must keep one owner.</td></tr>
+<tr><td><code>into_itself</code></td><td>400</td><td>A folder cannot be moved into itself or below itself.</td></tr>
+<tr><td><code>wrong_place</code></td><td>400</td><td>That kind of item cannot go there, or cannot be moved or deleted: a library outside a site, a folder or file directly in a site, a moved site or library, a deleted library, or a file made through the children route.</td></tr>
+<tr><td><code>is_site</code></td><td>400</td><td>A site cannot be deleted, and cannot inherit.</td></tr>
+<tr><td><code>invalid_name</code></td><td>422</td><td>The name breaks the rules above.</td></tr>
+<tr><td><code>invalid_request</code></td><td>422</td><td>An unknown role or kind, an id that is not an id, a bad <code>limit</code> or <code>after</code>, an empty <code>PATCH</code>, or a file renamed to a name its editor does not open.</td></tr>
+<tr><td><code>bad_request</code></td><td>400</td><td>The body or query is not what the route expects.</td></tr>
+<tr><td><code>unavailable</code></td><td>503</td><td>The database failed, or the tree is being brought back in step with Git (section 18); trying again later can work.</td></tr>
+</tbody></table></div>
+<p>The other codes (sign-in, size limit and so on) are as before.</p>
+</section>
+
+<section id="treegit"><h2>18 / The content tree in Git and in PostgreSQL</h2>
+<p>The tree is recorded in the same repository as the documents (section 09), <strong>one JSON file per item</strong>, beside <code>docs/</code> on the <code>main</code> branch:</p>
+<ul>
+<li><code>docs/&lt;doc_id&gt;/content</code> and <code>docs/&lt;doc_id&gt;/meta.json</code>: as before.</li>
+<li><code>tree/&lt;node_id&gt;.json</code>: one item of the tree (a site, library, folder or file). The file is named after the item's identifier, which for a file is its document identifier.</li>
+<li><code>refs/sharecraft/docs/&lt;doc_id&gt;</code>: the last commit that changed that document, as before.</li>
+<li><code>refs/sharecraft/tree</code>: the last commit that changed <code>tree/</code>.</li>
+</ul>
+<p>A record looks like this (two-space indent, one line per field):</p>
+<pre><code>{
+  "schema": 1,
+  "id": "&lt;node id&gt;",
+  "kind": "document",
+  "parent": "&lt;id of the library or folder it is in; null for a site&gt;",
+  "site": "&lt;id of its site; a site's own id for the site&gt;",
+  "name": "Budget 2028.xlsx",
+  "created": { "at": "&lt;RFC 3339 time&gt;", "by": { "id": "&lt;account id&gt;", "name": "&lt;name&gt;" } },
+  "deleted": null
+}</code></pre>
+<p><code>kind</code> is <code>site</code>, <code>library</code>, <code>folder</code> or <code>document</code>. A deleted item is not removed from Git: its record stays with <code>deleted</code> set to the time and person, so its history is kept and its name is free again.</p>
+<p><strong>One change, one commit.</strong> Each create, rename, move or delete is one Git commit on <code>main</code>, credited to the person who made it. A change that touches several items writes them in the same commit: moving a folder to another site rewrites the <code>site</code> of everything below it. A tree commit does not move any document's ref, so a checkpoint of a file open at that moment is never refused because of it. To look at the tree with plain <code>git</code>, from the repository root (read only, as in section 09):</p>
+<pre><code>git --git-dir=data/libraries/00000000-0000-0000-0000-000000000001.git ls-tree main tree/
+git --git-dir=data/libraries/00000000-0000-0000-0000-000000000001.git show main:tree/&lt;node_id&gt;.json
+git --git-dir=data/libraries/00000000-0000-0000-0000-000000000001.git log refs/sharecraft/tree</code></pre>
+<p><strong>PostgreSQL mirrors it.</strong> After the commit, the server writes the same facts to PostgreSQL in one transaction with the event, and the pages read the tree from there. Git is the authority for the tree, as it is for documents. If the database write fails after the commit, the server tries to repair that item from Git, and if it cannot, it refuses further tree changes with <code>503 unavailable</code> until a repair of the whole tree succeeds. At every start the server compares every record in Git with its row and rewrites the rows that differ (section 19).</p>
+<p><strong>Permissions are not in Git.</strong> Who has access to what, and which items take it from above, is kept only in PostgreSQL, and every change of it is written to the event log: <code>access.granted</code>, <code>access.changed</code> and <code>access.revoked</code> (section 11), now for any item, not only documents. Tree changes are events too: <code>node.created</code>, <code>node.renamed</code>, <code>node.moved</code> and <code>node.deleted</code>, with <code>document.created</code> as before for a file, and <code>tree.adopted</code> once for an upgrade (section 19). Git alone can therefore give back the tree and the content, but not who may open them. This is why PostgreSQL needs its own backup (section 09). If PostgreSQL is lost and the database is empty, the next start rebuilds the tree from Git, and every enabled administrator becomes owner of each site that has no owner; they then share the items again.</p>
+</section>
+
+<section id="upgrade"><h2>19 / Upgrading an installation that already has documents</h2>
+<p>Before the content tree, every document stood alone, with its own list of people. On the first start after upgrading, the server puts each existing document into the tree and moves its list of people onto it. <strong>Back up both stores first</strong> (section 09): the data folder and the PostgreSQL database.</p>
+<h3>What the start does, in order</h3>
+<ol>
+<li><strong>Reconciles the tree.</strong> Every <code>tree/</code> record in Git is compared with its row in PostgreSQL, and the rows that differ are written. On a first upgrade there are no records yet.</li>
+<li><strong>Adopts existing documents.</strong> This runs only if some document has no place in the tree, some grant is still recorded the old way (per document), or some site has no owner. Otherwise nothing is done.</li>
+<li><strong>Reconciles the revision index</strong> (section 10), as before.</li>
+</ol>
+<h3>What adoption does</h3>
+<ul>
+<li><strong>Home &gt; Documents.</strong> A site named <strong>Home</strong> with a library named <strong>Documents</strong> is made, by the account name <em>ShareCraft</em>, in the same Git commit that records the documents. Every document without a place goes into that library. Each keeps its creation time, and is credited to its creator where there is one. Every enabled administrator becomes an owner of Home (and of any other site that has no owner).</li>
+<li><strong>Renames.</strong> Names now follow the rules in section 17, so a name can change. Each refused character (control characters and <code>" * : &lt; &gt; ? / \ |</code>) becomes <code>_</code>, as does a trailing dot; a name that ends up empty becomes <code>Untitled</code>; a name over 120 characters is shortened, keeping its extension. A name already used in the library, ignoring case, gets <code>(2)</code>, <code>(3)</code> and so on before the extension: two documents called <code>Notes.txt</code> become <code>Notes.txt</code> and <code>Notes (2).txt</code>. The new name is stored on the document as well as in the tree. The number renamed is on the start-up line.</li>
+<li><strong>Grants move to per-document permissions.</strong> Each document that had people granted keeps exactly those people and roles, as access of its own: it becomes a scope that does not inherit from Home. A document shared with only some people therefore stays visible to only them (and to administrators). The number of grants moved is on the start-up line.</li>
+<li><strong>One event.</strong> <code>tree.adopted</code> records the counts (documents, renamed, grants moved). Nothing is lost if the start is interrupted: if the Git commit was written and the database change was not, the next start's reconcile writes the items and adoption moves the grants.</li>
+</ul>
+<h3>An enabled administrator is needed</h3>
+<p>Someone has to own the new site, so adoption needs at least one enabled administrator. If there is none, <strong>nothing is written</strong>, the server still starts, and it prints this on the console, naming the command to run:</p>
+<pre><code>sharecraft-server: existing documents not adopted: existing documents need an administrator to own them, and there is no enabled administrator; add one with `sharecraft-server add-user --admin --email &lt;email&gt; --name &lt;name&gt;` and start the server again</code></pre>
+<p>Until the server is started again with an administrator, the existing documents have no place in the tree and nobody can open them.</p>
+<h3>The start-up line</h3>
+<p>The server prints one line for the tree before the line for the revision index (section 10), and before it prints its address. After an upgrade it reads like this (the numbers are examples):</p>
+<pre><code>Reconciled the tree with Git: 0 nodes in Git, 0 updated, 0 failed; 12 documents adopted into Home, 3 renamed, 11 grants moved</code></pre>
+<p>On later starts it ends <code>; nothing to adopt</code>. When there is no enabled administrator it ends <code>; nothing adopted</code>, followed by the message above on standard error. Each node that could not be reconciled is listed on standard error with the reason, and the server still starts. If the tree cannot be read from Git at all, or the adoption fails for another reason, the server prints why and exits without printing its address.</p>
+<p><strong>Anything that used <code>GET /api/docs</code></strong> to list documents must change: it now answers <code>405</code> (section 17).</p>
+</section>
+
+<section id="policy"><h2>20 / The editor pages' security policy, and why it is built from hashes</h2>
 <p>A <strong>Content Security Policy</strong> is a header that tells the browser what a page may load and run. The site's own pages allow only scripts from this site and WebAssembly, may hold a frame from this site (<code>frame-src 'self'</code>, for the frame page), and may not be put inside anyone's frame (<code>frame-ancestors 'none'</code>).</p>
 <p>The editors' files, under <code>/editors/&lt;id&gt;/</code>, get their own policy instead:</p>
 <pre><code>default-src 'self'; script-src 'self' 'wasm-unsafe-eval' &lt;script hashes&gt;; style-src 'self' &lt;style hashes&gt;;
@@ -444,12 +565,12 @@ base-uri 'none'; form-action 'none'</code></pre>
 <p>Because the editors come from ShareCraft's own address, they run with the rights of the person using them; that is why they are built only from ThineCraft's own forks (decision D20 in <a href="scope.html">scope.html</a>).</p>
 </section>
 
-<section id="limits"><h2>18 / Known limits of this build</h2>
+<section id="limits"><h2>21 / Known limits of this build</h2>
 <ul>
 <li><strong>Local connections only.</strong> The server will not listen on a non-loopback address and refuses connections that do not come from a page it served (section 04). Two people on two computers cannot use it together. Passwords must not cross a network without encryption, and encryption (TLS) is a separate piece of work.</li>
 <li><strong>Accounts are made by an administrator.</strong> There is no sign-up, and <strong>nobody can change their own password yet</strong>, nor reset a forgotten one.</li>
-<li><strong>No single sign-on, multi-factor sign-in, guests or groups.</strong> Access is a password account, granted to one person at a time for one document.</li>
-<li><strong>No sites, libraries, folders or inheritance.</strong> Every document is a separate item with its own list of people. Documents cannot be renamed or have their metadata edited after creation.</li>
+<li><strong>No single sign-on, multi-factor sign-in, guests or groups.</strong> Access is a password account, granted to one person at a time on a site, library, folder or file.</li>
+<li><strong>Only the first part of sites and libraries.</strong> The tree and inherited access are built (sections 17 to 19). Not built yet: groups, sharing links, access requests, the inheritance explorer, a test with 100,000 files, branding, and metadata edited after creation.</li>
 <li><strong>No page for events</strong> (section 11), and no way to see the document's saved revisions from the site: use Git (section 09).</li>
 <li><strong>One server process.</strong> Removal from live sessions is sent inside the process; running several server processes would need a different mechanism.</li>
 <li><strong>Large pastes go in pieces.</strong> One change can be at most 512 KiB as sent (section 05); a larger paste is refused with a message asking for smaller parts.</li>
@@ -457,18 +578,18 @@ base-uri 'none'; form-action 'none'</code></pre>
 <li><strong>The editors save only while their tab is shown.</strong> A Save sent while the browser tab is hidden waits until the tab is shown again. While hosted, the editors refuse New, Open and Close and keep the document they were given; PdfCraft may still open some views as extra tabs. See <a href="editors.html#found">editors.html</a>.</li>
 <li><strong>Editors are built on this machine</strong> (section 13), take tens of minutes each, and are not published. A build to be published must first be rebuilt with path remapping.</li>
 <li><strong>The first open of an editor is still a large download.</strong> The editors are sent compressed (section 13), but SolidCraft's WebAssembly file still arrives as about 34.5 MB the first time it opens, and the others as 7 MB to 13 MB. A browser keeps them afterwards. Sizes are in <a href="editors.html#glance">editors.html</a>. Opening and editing in each editor after compression was added has not been checked.</li>
-<li><strong>Uploads only make new documents.</strong> A file cannot be replaced by uploading, renamed or deleted.</li>
+<li><strong>Uploads only make new documents.</strong> A file cannot be replaced by uploading.</li>
 <li><strong>PostgreSQL needs its own backup</strong> (section 09), and the event log is never trimmed.</li>
 </ul>
 </section>
 
-<section id="licences"><h2>19 / Licences</h2>
+<section id="licences"><h2>22 / Licences</h2>
 <p>ShareCraft is licensed <strong>MIT OR Apache-2.0</strong>; the texts are in <code>LICENSE-MIT</code> and <code>LICENSE-APACHE</code>. <code>cargo xtask check</code> refuses any dependency whose licence has no non-copyleft option (GPL, LGPL, AGPL, MPL, EUPL, CDDL, SSPL).</p>
 <p>The <code>revisions</code> crate stores documents in Git using <code>gix</code> (gitoxide), a Git implementation written in Rust and licensed MIT or Apache 2.0. No C library is involved and no copyleft code is linked. Repositories it writes are ordinary Git repositories: the <code>git</code> command line reads them as usual.</p>
 <p>The four editors are licensed MIT or Apache 2.0, by their original authors. They are not part of ShareCraft's code and are not compiled into the server. The build tool copies each fork's licence, notice and attribution files into the installed editor's <code>licenses/</code> folder; what each fork changed is listed in its <code>NOTICE</code> and in <a href="editors.html">editors.html</a>.</p>
 </section>
 
-<footer>ShareCraft · ThineCraft · Building and running · Updated 11 November 2026<br>Describes the development build after the third Stage 1 plan (editors, one person at a time; merged into <code>main</code> on 10 November 2026) and the follow-up (editors keep their document when hosted). Not a release.</footer>
+<footer>ShareCraft · ThineCraft · Building and running · Updated 11 November 2026<br>Describes the development build after the third Stage 1 plan (editors, one person at a time; merged into <code>main</code> on 10 November 2026) and the follow-up (editors keep their document when hosted), and the first Stage 2 plan (the content tree and inherited permissions; on the branch <code>platform-tree</code>, not yet merged). Not a release.</footer>
 </main></div>
 </body>
 </html>
