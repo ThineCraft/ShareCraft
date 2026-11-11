@@ -813,6 +813,8 @@ fn build(root: &Path, id: &str) -> Result<()> {
             spec.commit
         );
     }
+    // The server reads the installed editors once, when it starts.
+    println!("xtask: restart the ShareCraft server to serve this build");
     Ok(())
 }
 
@@ -920,8 +922,8 @@ fn collect_licences(worktree: &Path, dist: &Path) -> Result<Vec<String>> {
     Ok(kept)
 }
 
-/// Replaces `./editors/<id>` with the folder `built`: the new editor is written beside the old
-/// one first, so a failure leaves the old one in place.
+/// Replaces `./editors/<id>` with the folder `built`, without its dot files: the new editor is
+/// written beside the old one first, so a failure leaves the old one in place.
 fn install(root: &Path, id: &str, built: &Path) -> Result<()> {
     let editors = editors_dir(root);
     std::fs::create_dir_all(&editors)
@@ -960,13 +962,17 @@ fn install(root: &Path, id: &str, built: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Copies the folder `from`, with everything in it, to `to`.
+/// Copies the folder `from`, with everything in it except dot files and dot folders (trunk's
+/// `.trunk-lock` among them, which the server has no use for), to `to`.
 fn copy_dir(from: &Path, to: &Path) -> Result<()> {
     let failed =
         |e: std::io::Error| format!("cannot copy {} to {}: {e}", from.display(), to.display());
     std::fs::create_dir_all(to).map_err(failed)?;
     for entry in std::fs::read_dir(from).map_err(failed)? {
         let entry = entry.map_err(failed)?;
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
         let destination = to.join(entry.file_name());
         if entry.file_type().map_err(failed)?.is_dir() {
             copy_dir(&entry.path(), &destination)?;
@@ -1350,6 +1356,30 @@ checkout = "../GridCraft"
         // And a first install, with nothing to replace.
         install(&root, "wordcraft", &built).unwrap();
         assert!(editors.join("wordcraft").join("index.html").is_file());
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::remove_dir_all(&built).unwrap();
+    }
+
+    /// Trunk leaves a `.trunk-lock` (and could leave other dot files) in its output; none of
+    /// them is installed, at any depth. Everything else is.
+    #[test]
+    fn dot_files_in_the_build_are_not_installed() {
+        let root = scratch("install-dots-root");
+        let built = scratch("install-dots-built");
+        write_files(&built, &["index.html", ".trunk-lock", ".DS_Store"]);
+        std::fs::create_dir_all(built.join("assets")).unwrap();
+        std::fs::write(built.join("assets").join("app.wasm"), "wasm").unwrap();
+        std::fs::write(built.join("assets").join(".hidden"), "x").unwrap();
+        std::fs::create_dir_all(built.join(".cache")).unwrap();
+        std::fs::write(built.join(".cache").join("a"), "x").unwrap();
+
+        install(&root, "gridcraft", &built).unwrap();
+        let installed = root.join("editors").join("gridcraft");
+        assert!(installed.join("index.html").is_file());
+        assert!(installed.join("assets").join("app.wasm").is_file());
+        for dot in [".trunk-lock", ".DS_Store", "assets/.hidden", ".cache"] {
+            assert!(!installed.join(dot).exists(), "{dot} was installed");
+        }
         std::fs::remove_dir_all(&root).unwrap();
         std::fs::remove_dir_all(&built).unwrap();
     }
