@@ -2,10 +2,11 @@
 //! The revision store: the only code that writes to Git.
 //!
 //! A [`Checkpoint`] of one document becomes one Git commit holding its content and a JSON
-//! metadata file. See [`RevisionStore`] for the repository layout.
+//! metadata file; a [`TreeChange`] becomes one commit of node records. See [`RevisionStore`] for the repository layout.
 
 mod meta;
 mod store;
+mod tree;
 
 use std::fmt;
 use std::str::FromStr;
@@ -16,6 +17,7 @@ use serde_json::{Map, Value};
 
 pub use meta::{Author, Meta};
 pub use store::{RevisionStore, is_valid_author_name};
+pub use tree::{Stamp, TreeChange, TreeRecord};
 
 /// A Git commit identifier: 40 lowercase hexadecimal characters.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -140,6 +142,12 @@ pub enum CheckpointError {
     /// `file_name` was empty or contained a separator or control character.
     #[error("invalid file name")]
     InvalidFileName,
+    /// A tree change had no records, or a record with an unknown schema or kind.
+    #[error("invalid tree change: {0}")]
+    InvalidTreeChange(String),
+    /// The checkpointer does not keep a content tree.
+    #[error("this checkpointer does not support the content tree")]
+    Unsupported,
     /// Git failed.
     #[error("git error: {0}")]
     Git(#[from] GitError),

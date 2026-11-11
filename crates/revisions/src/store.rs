@@ -1,4 +1,4 @@
-//! Git-backed storage of document checkpoints.
+//! Git-backed storage of document checkpoints and of the content tree.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -13,16 +13,18 @@ use gix::{ObjectId, Repository};
 use crate::meta::{Author, Meta};
 use crate::{Checkpoint, CheckpointError, GitError, Outcome, RevisionId, RevisionInfo, Stored};
 
-const MAIN: &str = "refs/heads/main";
+pub(crate) const MAIN: &str = "refs/heads/main";
 const SCHEMA: u32 = 1;
 
 /// Stores document checkpoints in one bare Git repository.
 ///
 /// Layout: branch `refs/heads/main`; content at `docs/<doc_id>/content`; metadata at
 /// `docs/<doc_id>/meta.json`; and `refs/sharecraft/docs/<doc_id>` pointing at the last commit
-/// that changed that document.
+/// that changed that document. The content tree is recorded beside the documents, one file per
+/// node at `tree/<node_id>.json`, with `refs/sharecraft/tree` pointing at the last commit that
+/// changed `tree/`.
 ///
-/// Checkpoints are serialized through a mutex, so concurrent callers never race on `main`.
+/// Checkpoints and tree changes are serialized through a mutex, so concurrent callers never race on `main`.
 /// Each call opens the repository itself, so the store is `Send + Sync`.
 #[derive(Debug)]
 pub struct RevisionStore {
@@ -31,6 +33,7 @@ pub struct RevisionStore {
 }
 
 const DOC_REFS: &str = "refs/sharecraft/docs/";
+pub(crate) const TREE_REF: &str = "refs/sharecraft/tree";
 
 fn doc_ref(doc: DocId) -> String {
     format!("{DOC_REFS}{}", doc.0)
@@ -43,7 +46,7 @@ fn valid_file_name(name: &str) -> bool {
             .any(|c| c == '/' || c == '\\' || c.is_control())
 }
 
-fn valid_author(a: &Author) -> bool {
+pub(crate) fn valid_author(a: &Author) -> bool {
     let id_ok = !a.id.is_empty()
         && !a
             .id
@@ -69,11 +72,11 @@ fn trimmed_from_signature(c: char) -> bool {
     c <= ' ' || c.is_whitespace() || matches!(c, ',' | ':' | ';' | '<' | '>' | '"' | '\\' | '\'')
 }
 
-fn email(author: &Author) -> String {
+pub(crate) fn email(author: &Author) -> String {
     format!("{}@sharecraft.invalid", author.id)
 }
 
-fn signature(author: &Author) -> gix::actor::Signature {
+pub(crate) fn signature(author: &Author) -> gix::actor::Signature {
     gix::actor::Signature {
         name: author.name.trim_matches(trimmed_from_signature).into(),
         email: email(author).into(),
@@ -87,7 +90,7 @@ fn open_options() -> gix::open::Options {
     gix::open::Options::isolated()
 }
 
-fn read_blob(tree: &gix::Tree<'_>, path: &str) -> Result<Option<Vec<u8>>, GitError> {
+pub(crate) fn read_blob(tree: &gix::Tree<'_>, path: &str) -> Result<Option<Vec<u8>>, GitError> {
     match tree.lookup_entry_by_path(path)? {
         Some(entry) => Ok(Some(entry.object()?.detach().data)),
         None => Ok(None),
@@ -114,7 +117,7 @@ fn find_commit(repo: &Repository, oid: ObjectId) -> Result<Option<gix::Commit<'_
     }
 }
 
-fn corrupt(commit: &gix::Commit<'_>, reason: impl Into<String>) -> CheckpointError {
+pub(crate) fn corrupt(commit: &gix::Commit<'_>, reason: impl Into<String>) -> CheckpointError {
     CheckpointError::Corrupt {
         revision: RevisionId::from_oid(commit.id),
         reason: reason.into(),
@@ -195,7 +198,7 @@ fn describe_commit(
 }
 
 /// The commit `name` points at directly, or `None` if there is no such ref.
-fn ref_target(repo: &Repository, name: &str) -> Result<Option<ObjectId>, GitError> {
+pub(crate) fn ref_target(repo: &Repository, name: &str) -> Result<Option<ObjectId>, GitError> {
     Ok(repo
         .try_find_reference(name)?
         .and_then(|r| r.try_id().map(gix::Id::detach)))
@@ -225,25 +228,66 @@ fn ref_edit(name: &str, new: ObjectId, expected: Option<ObjectId>) -> Result<Ref
     })
 }
 
-/// Points `main` and the document ref at `oid` in one transaction.
-///
-/// Each edit names the tip seen at the start of the checkpoint. Both refs are locked and
-/// compared with those tips before either is written; on any difference nothing is set.
-fn move_refs(
+/// Points `main` and the ref `other` at `oid` in one transaction, each allowed only while it
+/// is still at the tip expected.
+fn move_main_and(
     repo: &Repository,
-    doc: DocId,
+    other: &str,
     oid: ObjectId,
     expected_main: Option<ObjectId>,
-    expected_doc: Option<ObjectId>,
+    expected_other: Option<ObjectId>,
     signature: &gix::actor::Signature,
 ) -> Result<(), CheckpointError> {
     let edits = [
         ref_edit(MAIN, oid, expected_main)?,
-        ref_edit(&doc_ref(doc), oid, expected_doc)?,
+        ref_edit(other, oid, expected_other)?,
     ];
     let mut time = gix::date::parse::TimeBuf::default();
     repo.edit_references_as(edits, Some(signature.to_ref(&mut time)))?;
     Ok(())
+}
+
+/// What `main` is at the start of a write: its tip commit, if it has one.
+pub(crate) fn main_tip(repo: &Repository) -> Result<Option<gix::Commit<'_>>, GitError> {
+    Ok(match repo.try_find_reference(MAIN)? {
+        Some(mut r) => Some(r.peel_to_commit()?),
+        None => None,
+    })
+}
+
+/// Makes one commit on top of `parent`: `edit` changes a copy of its tree, `message` is the
+/// commit message and `signature` both its author and committer. Then points `main` and
+/// `other` at it, each only if still at the tip expected. Returns the new commit.
+pub(crate) fn commit_on_main(
+    repo: &Repository,
+    parent: Option<&gix::Commit<'_>>,
+    signature: &gix::actor::Signature,
+    message: String,
+    other: &str,
+    expected_other: Option<ObjectId>,
+    edit: impl FnOnce(&mut gix::object::tree::Editor<'_>) -> Result<(), CheckpointError>,
+) -> Result<ObjectId, CheckpointError> {
+    let root = match parent {
+        Some(commit) => commit.tree_id()?.detach(),
+        None => ObjectId::empty_tree(repo.object_hash()),
+    };
+    let mut editor = repo.edit_tree(root)?;
+    edit(&mut editor)?;
+    let tree = editor.write()?.detach();
+
+    let parent_id = parent.map(|p| p.id().detach());
+    let commit = gix::objs::Commit {
+        tree,
+        parents: parent_id.into_iter().collect(),
+        author: signature.clone(),
+        committer: signature.clone(),
+        encoding: None,
+        message: message.into(),
+        extra_headers: Vec::new(),
+    };
+    let oid = repo.write_object(&commit)?.detach();
+    move_main_and(repo, other, oid, parent_id, expected_other, signature)?;
+    Ok(oid)
 }
 
 impl RevisionStore {
@@ -269,7 +313,14 @@ impl RevisionStore {
         })
     }
 
-    fn repo(&self) -> Result<Repository, GitError> {
+    /// Takes the write lock, which serializes every commit on `main`.
+    pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.write_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub(crate) fn repo(&self) -> Result<Repository, GitError> {
         Ok(gix::open_opts(self.path.as_path(), open_options())?)
     }
 
@@ -400,10 +451,7 @@ impl RevisionStore {
         if !valid_file_name(c.file_name) {
             return Err(CheckpointError::InvalidFileName);
         }
-        let _guard = self
-            .write_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = self.lock();
         let repo = self.repo()?;
 
         let current = doc_head(&repo, c.doc)?;
@@ -445,25 +493,10 @@ impl RevisionStore {
         };
         let meta_bytes = meta.to_file_bytes()?;
 
-        let parent = match repo.try_find_reference(MAIN)? {
-            Some(mut r) => Some(r.peel_to_commit()?),
-            None => None,
-        };
-        let root = match &parent {
-            Some(commit) => commit.tree_id()?.detach(),
-            None => ObjectId::empty_tree(repo.object_hash()),
-        };
+        let parent = main_tip(&repo)?;
 
         // The document's folder is rebuilt from scratch: it holds these two files only.
         let dir = format!("docs/{}", c.doc.0);
-        let content = repo.write_blob(c.bytes)?.detach();
-        let meta_blob = repo.write_blob(&meta_bytes)?.detach();
-        let mut editor = repo.edit_tree(root)?;
-        editor.remove(dir.as_str())?;
-        editor.upsert(format!("{dir}/content"), EntryKind::Blob, content)?;
-        editor.upsert(format!("{dir}/meta.json"), EntryKind::Blob, meta_blob)?;
-        let tree = editor.write()?.detach();
-
         let signature = signature(first);
         let mut message = format!("Checkpoint {}\n", c.file_name);
         for (i, a) in credited.iter().skip(1).enumerate() {
@@ -473,19 +506,22 @@ impl RevisionStore {
             // Writing to a String cannot fail.
             let _ = writeln!(message, "Co-authored-by: {} <{}>", a.name, email(a));
         }
-
-        let parent_id = parent.as_ref().map(|p| p.id().detach());
-        let commit = gix::objs::Commit {
-            tree,
-            parents: parent_id.into_iter().collect(),
-            author: signature.clone(),
-            committer: signature.clone(),
-            encoding: None,
-            message: message.into(),
-            extra_headers: Vec::new(),
-        };
-        let oid = repo.write_object(&commit)?.detach();
-        move_refs(&repo, c.doc, oid, parent_id, current, &signature)?;
+        let oid = commit_on_main(
+            &repo,
+            parent.as_ref(),
+            &signature,
+            message,
+            &doc_ref(c.doc),
+            current,
+            |editor| {
+                let content = repo.write_blob(c.bytes)?.detach();
+                let meta_blob = repo.write_blob(&meta_bytes)?.detach();
+                editor.remove(dir.as_str())?;
+                editor.upsert(format!("{dir}/content"), EntryKind::Blob, content)?;
+                editor.upsert(format!("{dir}/meta.json"), EntryKind::Blob, meta_blob)?;
+                Ok(())
+            },
+        )?;
         Ok(Outcome::Written(RevisionId::from_oid(oid)))
     }
 }
@@ -501,6 +537,25 @@ mod tests {
     use super::*;
     use crate::{Author, Checkpoint};
     use serde_json::Map;
+
+    /// Points `main` and the document ref at `oid` in one transaction.
+    fn move_refs(
+        repo: &Repository,
+        doc: DocId,
+        oid: ObjectId,
+        expected_main: Option<ObjectId>,
+        expected_doc: Option<ObjectId>,
+        signature: &gix::actor::Signature,
+    ) -> Result<(), CheckpointError> {
+        move_main_and(
+            repo,
+            &doc_ref(doc),
+            oid,
+            expected_main,
+            expected_doc,
+            signature,
+        )
+    }
 
     #[test]
     fn moved_main_aborts_without_touching_document_ref() {

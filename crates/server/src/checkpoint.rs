@@ -6,10 +6,11 @@ use std::time::Duration;
 use collab_core::ids::{DocId, Seq};
 use revisions::{
     Author, Checkpoint, CheckpointError, GitError, Outcome, RevisionId, RevisionInfo,
-    RevisionStore, Stored,
+    RevisionStore, Stored, TreeChange, TreeRecord,
 };
 use serde_json::{Map, Value};
 use tokio::time::Instant;
+use uuid::Uuid;
 
 /// The single library every document lives in until libraries can be chosen.
 const LIBRARY: &str = "00000000-0000-0000-0000-000000000001";
@@ -62,6 +63,32 @@ pub trait Checkpointer: Send + Sync + 'static {
     /// # Errors
     /// Whatever the store reports when it cannot be read.
     fn documents(&self) -> Result<Vec<DocId>, GitError>;
+
+    /// Records one change to the content tree as one commit credited to its author.
+    ///
+    /// # Errors
+    /// Whatever the store reports; `Unsupported` unless the implementation keeps a tree.
+    fn write_tree(&self, _change: &TreeChange<'_>) -> Result<RevisionId, CheckpointError> {
+        Err(CheckpointError::Unsupported)
+    }
+
+    /// Every record of the content tree.
+    ///
+    /// # Errors
+    /// Whatever the store reports, including `Corrupt` for an unreadable record; `Unsupported`
+    /// unless the implementation keeps a tree.
+    fn read_tree(&self) -> Result<Vec<TreeRecord>, CheckpointError> {
+        Err(CheckpointError::Unsupported)
+    }
+
+    /// The record of one node; `None` if there is none.
+    ///
+    /// # Errors
+    /// Whatever the store reports, including `Corrupt` for an unreadable record; `Unsupported`
+    /// unless the implementation keeps a tree.
+    fn read_tree_record(&self, _id: Uuid) -> Result<Option<TreeRecord>, CheckpointError> {
+        Err(CheckpointError::Unsupported)
+    }
 }
 
 impl Checkpointer for RevisionStore {
@@ -95,6 +122,18 @@ impl Checkpointer for RevisionStore {
 
     fn documents(&self) -> Result<Vec<DocId>, GitError> {
         RevisionStore::documents(self)
+    }
+
+    fn write_tree(&self, change: &TreeChange<'_>) -> Result<RevisionId, CheckpointError> {
+        RevisionStore::write_tree(self, change)
+    }
+
+    fn read_tree(&self) -> Result<Vec<TreeRecord>, CheckpointError> {
+        RevisionStore::read_tree(self)
+    }
+
+    fn read_tree_record(&self, id: Uuid) -> Result<Option<TreeRecord>, CheckpointError> {
+        RevisionStore::read_tree_record(self, id)
     }
 }
 
