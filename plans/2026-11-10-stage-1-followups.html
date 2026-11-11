@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ShareCraft — Stage 1 Follow-ups: Implementation Plan</title>
+<style>
+:root{color-scheme:light dark;--ink:light-dark(#172f38,#e4ecef);--muted:light-dark(#536b72,#a9b9bf);--line:light-dark(#d7e2e3,#36454b);--paper:light-dark(#fff,#1d272b);--wash:light-dark(#f2f6f5,#141b1e);--accent:light-dark(#3156c9,#9db4ff);font:15px/1.6 Segoe UI,system-ui,sans-serif;color:var(--ink);background:var(--wash)}
+*{box-sizing:border-box}body{margin:0;padding:28px 18px 80px}main{max-width:940px;margin:auto}
+h1{font-size:1.9rem;letter-spacing:-.03em;line-height:1.2;margin:0 0 14px}h2{font-size:1.3rem;margin:38px 0 12px;padding-top:18px;border-top:1px solid var(--line)}h3{font-size:1.08rem;margin:30px 0 8px}h4{font-size:.95rem;margin:16px 0 6px}
+p{margin:0 0 12px}ul,ol{margin:0 0 12px;padding-left:22px}li{margin-bottom:6px}a{color:var(--accent)}
+code{font-family:Consolas,Menlo,monospace;font-size:.88em;background:light-dark(#e9efee,#263238);padding:1px 5px;border-radius:3px;overflow-wrap:anywhere}
+pre{background:var(--paper);border:1px solid var(--line);border-radius:7px;padding:12px 14px;overflow-x:auto;font:13px/1.5 Consolas,Menlo,monospace;margin:0 0 12px}pre code{background:none;padding:0;font-size:inherit}
+.note{border-left:4px solid var(--accent);background:var(--paper);padding:12px 16px;margin:0 0 14px}.note p:last-child{margin:0}
+.task{background:var(--paper);border:1px solid var(--line);border-radius:9px;padding:6px 20px 14px;margin:18px 0}
+ol.steps{list-style:none;padding-left:0}ol.steps>li{padding-left:28px;position:relative;margin-bottom:10px}ol.steps>li::before{content:"☐";position:absolute;left:2px;color:var(--muted)}
+table{border-collapse:collapse;width:100%;font-size:.9rem;background:var(--paper);margin-bottom:14px}th,td{border:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top}th{background:light-dark(#e8efed,#263238)}
+.small{font-size:.88rem;color:var(--muted)}
+</style>
+</head>
+<body><main>
+<h1>Stage 1 Follow-ups: Implementation Plan</h1>
+<p class="small">ShareCraft · after Stage 1 · Written 10 November 2026</p>
+
+<div class="note"><p><strong>For agentic workers:</strong> REQUIRED SUB-SKILL: use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task by task. Steps are checkboxes for tracking.</p></div>
+
+<div class="note"><p><strong>Outside the ShareCraft repository.</strong> Tasks 1 to 3 commit to the GridCraft, WordCraft and PdfCraft forks, on a local branch <code>sharecraft-followups</code> made from each fork's <code>sharecraft</code> branch. Nothing is pushed. Moving <code>sharecraft</code> forward and pushing the forks waits for the owner's go-ahead, as does merging this ShareCraft branch.</p></div>
+
+<p><strong>Goal:</strong> before anyone else uses the editors, (1) the editors' own New, Open and Close can no longer put a different document into the ShareCraft frame, (2) WordCraft starts on a blank page when ShareCraft hosts it, and (3) the SolidCraft build is no longer 153 MB.</p>
+<p><strong>Architecture:</strong> each <code>craft-web-host</code> editor (GridCraft, WordCraft, PdfCraft) gains a <em>files locked</em> state, switched on in its web build whenever the host bridge is present. While it is on, every way a <em>person</em> can create, open, close or replace a document is turned off, but the host's own path (the bridge's <code>open</code> and <code>save</code>, and <code>execute</code> from the page) keeps working. SolidCraft already does this under <code>?embed=editor</code>. WordCraft, when hosted, skips its start screen, so ShareCraft drops its blank-then-Escape stopgap. ShareCraft's build tool turns release debug information off for every editor build.</p>
+<p><strong>Tech stack:</strong> unchanged. Rust in the forks (egui), JavaScript in <code>web/</code> with node tests, Rust in <code>xtask</code>.</p>
+<p><strong>Spec:</strong> <a href="../editors.html">editors.html</a> section 07 (File menus) and 02 (SolidCraft size); the plan-3 ledger's ruling on WordCraft's blank start. Owner's decisions of 10 November 2026: lock files whenever hosted (no address option); turn debug information off in ShareCraft's build tool, not in the SolidCraft fork; WordCraft's blank start is done now, while WordCraft is being rebuilt anyway.</p>
+
+<h2>What was found in the forks</h2>
+<p>Read on 10 November 2026 at the fork commits in <code>editors.toml</code>. Line numbers are a guide; confirm them before editing.</p>
+<table><tr><th>Editor</th><th>Ways a person swaps the document</th><th>Host path that must keep working</th></tr>
+<tr><td>GridCraft</td><td>File tab and Backstage (New, Open, Close, recent, samples); title-bar "More commands" New Workbook and Open (<code>ribbon/title_bar.rs</code> ~105); Ctrl+N, Ctrl+O, Ctrl+W (<code>ribbon/shortcuts.rs</code> ~18); keytips Alt F N, Alt F O; command search; files dropped on the canvas (<code>apps/gridcraft-web/src/web.rs</code> <code>WebShell::logic</code>, pushed into the inbox). The existing <code>?chrome=nofiletab</code> hides the File tab only; ShareCraft does not pass it.</td><td>The host's <code>open</code> goes into the same inbox as drops, then <code>poll_async_opens</code> runs <code>self.run("file.open", …)</code>. <code>file.save</code> from the bridge and from <code>window.gridcraft.execute</code>.</td></tr>
+<tr><td>WordCraft</td><td>Backstage: Home, New, templates (<code>file.newFromTemplate</code>), Open, Browse (<code>ui.openFileDialog</code>), Close, and the recent list (<code>backstage::open_recent</code>, which calls <code>open_file</code> directly, not <code>run</code>); Ctrl+N, Ctrl+O, Ctrl+F12, Ctrl+W; Quick Access Toolbar New and Open; command search; files dropped (inbox, <code>drain_inbox</code>). At start-up <code>web.rs</code> calls <code>app.start_screen()</code> whenever there is no sample, hosted or not.</td><td><code>WordApp::run</code> is the person's path; <code>WordApp::execute</code> is the control and host path. The host's <code>open</code> reaches <code>drain_inbox</code>, like drops.</td></tr>
+<tr><td>PdfCraft</td><td>Opens extra tabs rather than replacing: tab-strip Open button (<code>chrome.rs</code> ~240, calls <code>open_dialog</code> directly); File menu <code>create.blank</code>, <code>create.*</code>, <code>file.open</code>, <code>file.open_recent</code>, <code>file.close</code>, <code>file.close_all</code>; recent list on Home (<code>open_recent</code>); closing a tab (<code>request_close_tab</code>); shortcuts and palette through <code>dispatch_command</code>; files dropped (<code>app.rs</code> ~575, <code>open_dropped</code>). Its <code>file.save</code> saves the <em>active</em> tab, so a second tab's bytes would be stored as this document.</td><td>The host's <code>open</code> arrives in the startup inbox and <code>open_bytes</code>. ShareCraft sends <code>file.save</code> through <code>window.pdfcraft.execute</code> (<code>?control</code>), reaching <code>PdfCraftApp::execute</code>. Hosted is known by <code>host_save.is_some()</code>.</td></tr>
+<tr><td>SolidCraft</td><td>Already locked under <code>?embed=editor</code>: app bar and Home not drawn, Ctrl+N/O/W ignored, drops cleared.</td><td>No change planned; Task 5 checks it in the browser.</td></tr>
+</table>
+
+<h2>What this plan does not cover</h2>
+<ul>
+<li>Pushing the forks or moving their <code>sharecraft</code> branches: owner's go-ahead.</li>
+<li>Path remapping in editor builds (<code>--remap-path-prefix</code>): needed only before a build is published. It changes <code>RUSTFLAGS</code> and so throws away every build cache; left for the publishing work.</li>
+<li>Serving the editors compressed, a true view-only mode, WordCraft CJK fonts, the editors saving while their tab is hidden: unchanged, still recorded in editors.html.</li>
+<li>The other items in the plan-3 ledger's "not checked" lists, except where Task 5 happens to cover them.</li>
+</ul>
+
+<h2>Global constraints</h2>
+<ul>
+<li>Fork changes stay small and self-contained, in the fork's own style and with its own tests (each fork has an <code>AGENTS.md</code> or <code>CLAUDE.md</code>; follow it). No ShareCraft names in fork code: the state is "hosted", not "ShareCraft".</li>
+<li>Locking applies only when the host bridge is present. A fork opened on its own (no <code>?host=parent</code>) behaves exactly as before.</li>
+<li>Locked means the person's path is refused quietly or with the editor's usual "not available" handling. No new dialogs. Save, Save As (as a download), Print and Export stay.</li>
+<li>Builds use the personal cargo override rule from BUILDING.html section 13: build editors only through <code>cargo xtask editors build</code>, never <code>trunk</code> in the fork checkout.</li>
+<li>Never print <code>.env</code>, database addresses or passwords.</li>
+</ul>
+
+<h2>Review focus</h2>
+<ol>
+<li>The host's own open must still work while locked, in every fork: a lock placed on the shared <code>file.open</code> command would break opening the stored file. Each fork task has a test that the host path opens a document while locked.</li>
+<li>Keyboard shortcuts and keytips reach commands without the menu: hiding a menu item is not enough. Each fork task tests Ctrl+N, Ctrl+O and Ctrl+W while locked.</li>
+<li>A dropped file and a dropped picture: GridCraft and PdfCraft ignore all drops while locked; WordCraft still inserts dropped pictures (they do not replace the document) but opens no dropped document.</li>
+<li>WordCraft hosted with stored content: the host's <code>open</code> must replace the untouched blank document, not open beside it as Document2.</li>
+<li>Unhosted behaviour unchanged: each fork task has a test that New and Open still work with the lock off.</li>
+</ol>
+
+<div class="task">
+<h3>Task 1: GridCraft locks files when hosted</h3>
+<p><strong>Files:</strong> modify <code>crates/ui-egui/src/app.rs</code> (or wherever <code>SheetApp</code>'s fields live), <code>crates/ui-egui/src/app/commands.rs</code>, <code>crates/ui-egui/src/app/files.rs</code>, <code>crates/ui-egui/src/ribbon/title_bar.rs</code>, <code>apps/gridcraft-web/src/web.rs</code>. Test: new <code>crates/ui-egui/tests/it/files_locked.rs</code>, registered beside <code>host_chrome.rs</code>.</p>
+<p><strong>Produces:</strong> <code>pub files_locked: bool</code> on <code>SheetApp</code>, default <code>false</code>.</p>
+<ol class="steps">
+<li>In the fork, <code>git switch -c sharecraft-followups sharecraft</code>.</li>
+<li>Write failing tests in <code>files_locked.rs</code>, using the harness <code>host_chrome.rs</code> uses:
+<code>locked_shortcuts_do_not_new_open_or_close</code> (Ctrl+N, Ctrl+O, Ctrl+W leave the document count and the active document unchanged);
+<code>locked_run_refuses_document_swaps</code> (<code>run("file.new"|"file.open"|"file.close", …)</code> returns <code>Err</code>);
+<code>locked_keytips_do_not_open_backstage</code> (Alt, F leaves <code>backstage</code> <code>None</code>);
+<code>locked_host_open_still_opens</code> (bytes pushed into the inbox, then a frame: the workbook is the new one);
+<code>locked_save_still_runs</code> (<code>run("file.save", …)</code> is not refused);
+<code>unlocked_new_still_works</code>.</li>
+<li>Run <code>cargo test -p gridcraft-ui-egui --test it files_locked</code> (adjust to the crate's test target name). Expected: fail (no field).</li>
+<li>Implement: add the field. Setting it also sets <code>chrome.file_tab = false</code> (Backstage closes and cannot open). In <code>run</code> (the person's path), refuse <code>file.new</code>, <code>file.open</code>, <code>file.close</code> and any other id that creates or opens a workbook (check the command registry for <code>file.*</code> sample or template ids) with <code>Err("not available here")</code> while locked. Give <code>poll_async_opens</code> a way past the lock (call <code>run_command</code>, or an internal flag), since only the host can fill the inbox once drops are ignored. Leave New Workbook and Open out of the title-bar "More commands" list while locked.</li>
+<li>In <code>apps/gridcraft-web/src/web.rs</code>: set <code>app.files_locked = true</code> when <code>app_bridge.is_some()</code>; in <code>WebShell::logic</code>, discard <code>dropped_files</code> while hosted (the shell knows the bridge is present; store a <code>bool</code> on <code>WebShell</code>).</li>
+<li>Run the new tests and the crate's whole suite (the fork's own <code>cargo xtask</code> or CI command if it has one). Expected: pass.</li>
+<li>Commit: <code>feat(web): hosted pages cannot new, open or close a workbook</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 2: WordCraft locks files and starts blank when hosted</h3>
+<p><strong>Files:</strong> modify <code>crates/ui-egui/src/app/commands.rs</code> (<code>WordApp::run</code>), <code>crates/ui-egui/src/app/files.rs</code> (<code>drain_inbox</code>), <code>crates/ui-egui/src/backstage.rs</code> (<code>open_recent</code>), the Quick Access Toolbar drawing, <code>apps/wordcraft-web/src/web.rs</code>. Test: a new file under <code>crates/ui-egui/tests/it/</code>.</p>
+<p><strong>Produces:</strong> <code>pub files_locked: bool</code> on <code>WordApp</code>, default <code>false</code>.</p>
+<ol class="steps">
+<li>In the fork, <code>git switch -c sharecraft-followups sharecraft</code>.</li>
+<li>Write failing tests: <code>locked_run_refuses_document_swaps</code> (<code>run</code> with <code>file.new</code>, <code>file.newFromTemplate</code>, <code>file.open</code>, <code>file.close</code>, <code>file.recover</code>, <code>ui.openFileDialog</code> returns <code>Err</code>; the same ids through <code>execute</code> are not refused);
+<code>locked_shortcuts_do_not_new_open_or_close</code> (Ctrl+N, Ctrl+O, Ctrl+W);
+<code>locked_backstage_is_never_shown</code> (opening the File tab leaves <code>ui.backstage</code> false);
+<code>locked_recent_does_not_open</code>;
+<code>locked_inbox_opens_host_document_in_place_of_blank</code> (a blank untouched document, then a .docx pushed into the inbox: one document, the pushed one);
+<code>locked_inbox_still_inserts_pictures</code>;
+<code>unlocked_new_still_works</code>.</li>
+<li>Run them. Expected: fail.</li>
+<li>Implement: the field; refusal in <code>run</code> for the ids above; <code>open_recent</code> and the Quick Access Toolbar New and Open do nothing or are not drawn while locked; Backstage cannot be opened while locked (hosted Save As, Print and Export stay reachable through their ribbon or shortcut routes, check this; if Export is only in Backstage, keep Backstage but hide its Home, New, Open, Close and recent pages instead, and say which in the report).</li>
+<li>In <code>apps/wordcraft-web/src/web.rs</code>: when <code>app_bridge.is_some()</code>, set <code>files_locked</code>, and do not call <code>app.start_screen()</code>, so the blank document it already makes is shown. Files the shell receives by drop while hosted: pictures go to the inbox as now; documents are discarded. Keep the host's <code>open</code> path into <code>drain_inbox</code> unaffected.</li>
+<li>Run the new tests and the crate's suite. Expected: pass.</li>
+<li>Commit: <code>feat(web): hosted pages start blank and cannot new, open or close a document</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 3: PdfCraft locks files when hosted</h3>
+<p><strong>Files:</strong> modify <code>crates/ui-egui/src/lib.rs</code> (field beside <code>host_save</code>), <code>crates/ui-egui/src/commands.rs</code> (<code>dispatch_command</code>), <code>crates/ui-egui/src/chrome.rs</code> (tab strip), <code>crates/ui-egui/src/app.rs</code> (drops), <code>crates/ui-egui/src/app/files.rs</code> (<code>open_recent</code>, <code>open_dialog</code>), <code>crates/ui-egui/src/editing/close.rs</code>, <code>apps/pdfcraft-web/src/main.rs</code>. Test: a new file under <code>crates/ui-egui/tests/it/</code>.</p>
+<p><strong>Produces:</strong> <code>pub files_locked: bool</code> on <code>PdfCraftApp</code>, default <code>false</code>.</p>
+<ol class="steps">
+<li>In the fork, <code>git switch -c sharecraft-followups sharecraft</code>.</li>
+<li>Write failing tests: <code>locked_dispatch_refuses_tab_changes</code> (<code>dispatch_command</code> with <code>file.open</code>, <code>file.open_recent</code>, <code>file.close</code>, <code>file.close_all</code>, <code>create.blank</code> and each other <code>create.*</code> id leaves the tab count and active tab unchanged);
+<code>locked_open_dialog_and_recent_do_nothing</code>;
+<code>locked_tab_cannot_be_closed</code> (<code>request_close_tab(0)</code>);
+<code>locked_host_open_still_opens</code> (bytes in the inbox open as the one tab);
+<code>locked_execute_save_still_runs</code> (<code>execute("file.save")</code> reaches <code>host_save</code>);
+<code>unlocked_open_dialog_still_works</code>.</li>
+<li>Run them. Expected: fail.</li>
+<li>Implement: the field; refusal at the top of <code>dispatch_command</code> for those ids (the palette and shortcuts route through it); <code>open_dialog</code>, <code>open_recent</code> and <code>request_close_tab</code> return early while locked; the tab strip draws no Open button and no tab close button while locked; the Home recent list is not drawn; drops in <code>app.rs</code> are cleared while locked.</li>
+<li>In <code>apps/pdfcraft-web/src/main.rs</code>: set <code>files_locked</code> where the host bridge connects (where <code>host_save</code> is set).</li>
+<li>Run the new tests and the crate's suite. Expected: pass.</li>
+<li>Commit: <code>feat(web): hosted pages keep one document: no open, create or close</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 4: ShareCraft drops the WordCraft stopgap and builds editors without debug information</h3>
+<p><strong>Files:</strong> modify <code>web/editor-host.js</code> (the WordCraft <code>BRIDGES</code> entry, <code>blankDocument</code>, <code>pressKey</code>, <code>DISMISS_AFTER</code>), <code>web/editor-host.test.mjs</code>, <code>xtask/src/editors.rs</code>.</p>
+<ol class="steps">
+<li>Write failing tests. Node: <code>wordcraft has no blank or dismiss</code> (the WordCraft bridge entry has neither, and a never-saved WordCraft document sends no command and presses no key). Rust in <code>xtask/src/editors.rs</code>'s tests: <code>trunk_env_turns_off_release_debug_information</code> asserting <code>trunk_env()</code> contains <code>("CARGO_PROFILE_RELEASE_DEBUG", "false")</code>.</li>
+<li>Run <code>node --test web/</code> and <code>cargo test -p xtask</code>. Expected: the two new tests fail.</li>
+<li>Implement: remove <code>blank</code> and <code>dismiss</code> from WordCraft's entry. If no other editor has <code>dismiss</code>, remove <code>pressKey</code>, <code>DISMISS_AFTER</code> and the dismiss part of <code>blankDocument</code> and its tests; keep the <code>blank</code> mechanism only if another entry still uses it, otherwise remove it as well. Add <code>fn trunk_env() -&gt; [(&amp;'static str, &amp;'static str); 1]</code> and apply it to the <code>trunk</code> command beside <code>CARGO_TARGET_DIR</code>, with a comment: SolidCraft's release profile keeps line tables for desktop crash reports, which a browser build has no use for; the other forks already build with none.</li>
+<li>Run <code>cargo xtask check</code>. Expected: exit 0, node and Rust tests pass (the new tests among them).</li>
+<li>Commit: <code>fix(web,xtask): WordCraft starts blank on its own; no debug information in editor builds</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 5 (controller): rebuild, install and check in the browser</h3>
+<ol class="steps">
+<li>Build in the background, one at a time, with <code>SHARECRAFT_EDITOR_TARGET_DIR</code> set to the warm cache if it still exists: <code>cargo xtask editors build gridcraft</code>, then <code>pdfcraft</code>, <code>wordcraft</code>, <code>solidcraft</code>. The fork checkouts must be on <code>sharecraft-followups</code>. SolidCraft's fork is unchanged; it is rebuilt only for the debug setting.</li>
+<li>Record each fork's new commit in <code>editors.toml</code> (SolidCraft's stays). <code>cargo xtask editors verify</code>: four installed editors match. Note each installed size.</li>
+<li>Build the server into this session's own target folder and repoint <code>sharecraft-server</code> in <code>H:\Source\repos\.claude\launch.json</code>; start it after the builds.</li>
+<li>For each editor, in a new and in an existing document: no New, Open, Close, recent list or File-tab start screen is reachable; Ctrl+N, Ctrl+O, Ctrl+W do nothing; an edit, Save and reload still store and reopen a revision. WordCraft: a new document opens on a blank page with no start screen and no second document; an existing .docx opens as one document. SolidCraft: loads and saves as before at the smaller size.</li>
+<li>Not expected to be checkable with the browser tools: dropping a real file onto the canvas (covered by the fork tests). Record it as not checked.</li>
+<li>Commit <code>editors.toml</code>: <code>chore(editors): record the follow-up fork commits</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 6: documents</h3>
+<p><strong>Files:</strong> <code>editors.html</code>, <code>BUILDING.html</code>, <code>sequencing.html</code>.</p>
+<ol class="steps">
+<li>editors.html: section 00 and sequencing.html's Stage 1 progress note no longer speak of the <code>stage-1-editors</code> branch awaiting review: Stage 1 is merged (28479e7). Section 02: new fork commits, SolidCraft's measured size and build note. Each editor's "what was changed": the hosted lock. Section 07: the File-menu finding becomes "fixed", with what stays reachable. WordCraft: blank start is the fork's own; the Recent-names finding no longer applies while hosted.</li>
+<li>BUILDING.html section 13: the build tool turns release debug information off; section 18: drop the "editors' own menus are unchanged" limit, keep the hidden-tab one.</li>
+<li>Check tag balance and links with a script, as before.</li>
+<li>Commit: <code>docs: editors keep their document when hosted; Stage 1 merged</code>.</li>
+</ol></div>
+
+<h2>Order and models</h2>
+<p>Tasks 1 to 3 are independent (one fork each) and can be implemented one after another by Sonnet or Opus subagents, each followed by a review on Opus. Task 4 is small (Sonnet). Task 5 is the controller's. Task 6 by Sonnet, read by the controller. A whole-branch review on the most capable model looks at the three fork diffs and the ShareCraft diff together before the owner is asked to merge and push.</p>
+</main></body>
+</html>
