@@ -107,9 +107,11 @@ async fn installed_editor_is_served_with_its_policy() {
     }
     assert!(policy.contains("frame-ancestors 'self'"), "{policy}");
     assert!(!policy.contains("frame-ancestors 'none'"), "{policy}");
-    for directive in ["object-src 'none'", "base-uri 'none'", "form-action 'none'"] {
+    for directive in ["base-uri 'none'", "form-action 'none'"] {
         assert!(policy.contains(directive), "{directive} in {policy}");
     }
+    // Printing goes through a PDF in a frame, which this policy also covers.
+    assert!(!policy.contains("object-src"), "{policy}");
     assert!(policy.contains("script-src 'self' 'wasm-unsafe-eval' 'sha256-"));
     assert_eq!(headers[CACHE_CONTROL], "no-cache");
     assert_eq!(headers[X_CONTENT_TYPE_OPTIONS], "nosniff");

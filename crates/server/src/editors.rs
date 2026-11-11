@@ -55,8 +55,10 @@ pub struct Manifest {
 
 impl Manifest {
     /// The Content-Security-Policy of this editor's files: its own files, WebAssembly, and the
-    /// inline scripts and styles its manifest names by hash; no plugins, no `<base>` and no
-    /// form submissions.
+    /// inline scripts and styles its manifest names by hash; no `<base>` and no form submissions.
+    /// `object-src` is left to `default-src 'self'`: the editors print through a `blob:` PDF in
+    /// a hidden frame, which inherits this policy, and the browser's PDF viewer may count as a
+    /// plug-in.
     fn policy(&self) -> String {
         let quoted = |hashes: &[String]| {
             hashes
@@ -68,7 +70,7 @@ impl Manifest {
             "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'{}; style-src 'self'{}; \
              img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; \
              worker-src 'self' blob:; frame-src 'self' blob:; frame-ancestors 'self'; \
-             object-src 'none'; base-uri 'none'; form-action 'none'",
+             base-uri 'none'; form-action 'none'",
             quoted(&self.script_hashes),
             quoted(&self.style_hashes),
         )
