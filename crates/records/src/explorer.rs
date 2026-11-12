@@ -173,8 +173,9 @@ fn step(kind: NodeKind, name: &str, id: NodeId) -> Step {
 }
 
 /// Every live scope in `root`'s site with every node above it, up to `root` (walking stops
-/// there) or the site. Reads the live scopes through their index, then one row per ancestor:
-/// nothing that is not a scope or above one.
+/// there) or the site. Reads the site's live scopes through their index (`nodes_site_scopes`,
+/// so no other site's scopes are read), then one row per ancestor: nothing that is not a scope
+/// or above one.
 const WALK: &str = "\
     with recursive up(origin, id, parent_id, kind, name, unique_scope, deleted) as ( \
         select n.id, n.id, n.parent_id, n.kind, n.name, n.unique_scope, false \
@@ -530,6 +531,21 @@ pub(crate) async fn breaks_in(
     after: Option<&str>,
     limit: u32,
 ) -> Result<Option<(Vec<Break>, Option<String>)>, DbError> {
+    let page = usize::try_from(limit.max(1)).unwrap_or(usize::MAX);
+    breaks_window(conn, viewer, root, filter, after, Some(page)).await
+}
+
+/// The breaks of [`Db::breaks`] after `after`: at most `limit` of them and the cursor of the
+/// next page, or every one (and no cursor) when `limit` is `None`. Walks the scopes once; reads
+/// the assignments of every scope only to filter by principal, otherwise of those returned.
+async fn breaks_window(
+    conn: &mut PgConnection,
+    viewer: UserId,
+    root: NodeId,
+    filter: &ExplorerFilter,
+    after: Option<&str>,
+    limit: Option<usize>,
+) -> Result<Option<(Vec<Break>, Option<String>)>, DbError> {
     let after: Option<Vec<Step>> = after
         .map(serde_json::from_str)
         .transpose()
@@ -551,9 +567,10 @@ pub(crate) async fn breaks_in(
         .filter(|found| found.managed())
         .filter(|found| filter.kinds.is_empty() || filter.kinds.contains(&found.node.kind))
         .collect();
-    let ids: Vec<NodeId> = shown.iter().map(|found| found.node.id).collect();
-    let mut assignments = assignments_on(&mut *conn, viewer, &ids).await?;
+    let mut assignments = HashMap::new();
     if let Some(wanted) = filter.principal {
+        let ids: Vec<NodeId> = shown.iter().map(|found| found.node.id).collect();
+        assignments = assignments_on(&mut *conn, viewer, &ids).await?;
         let through = match wanted {
             Principal::User(user) => groups_seen_through(&mut *conn, viewer, user).await?,
             Principal::Group(_) => HashSet::new(),
@@ -589,8 +606,9 @@ pub(crate) async fn breaks_in(
             found.key.as_slice().cmp(after.as_slice()) != Ordering::Greater
         })
     });
-    let page = usize::try_from(limit.max(1)).unwrap_or(usize::MAX);
-    let end = start.saturating_add(page).min(shown.len());
+    let end = limit.map_or(shown.len(), |page| {
+        start.saturating_add(page).min(shown.len())
+    });
     let next = (end < shown.len())
         .then(|| {
             shown
@@ -604,6 +622,9 @@ pub(crate) async fn breaks_in(
         .iter()
         .map(|found| found.node.id)
         .collect();
+    if filter.principal.is_none() {
+        assignments = assignments_on(&mut *conn, viewer, &page_ids).await?;
+    }
     let mut events = events_on(&mut *conn, &page_ids).await?;
     // The scope each would inherit from, when it is above the root.
     let above_root = (links.len() > 1)
@@ -808,6 +829,23 @@ async fn changes_on_restore(
             .collect(),
     ))
 }
+#[cfg(feature = "test-support")]
+impl Db {
+    /// The plan PostgreSQL chooses for the explorer's walk of the live scopes of `site` and the
+    /// nodes above them, up to `root`, one plan line per line. For tests of its index.
+    pub async fn explain_walk(&self, site: NodeId, root: NodeId) -> Result<String, DbError> {
+        let lines: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("explain {WALK}")))
+            .bind(site.0)
+            .bind(root.0)
+            .fetch_all(self.pool())
+            .await?;
+        Ok(lines.join(
+            "
+",
+        ))
+    }
+}
+
 impl Db {
     /// One page of the breaks the explorer shows from `root`: every live scope strictly below
     /// `root`, and `root` itself when it is a scope, that `viewer` has `manage_access` on, kept
@@ -828,6 +866,21 @@ impl Db {
     ) -> Result<Option<(Vec<Break>, Option<String>)>, DbError> {
         let mut conn = self.pool().acquire().await?;
         breaks_in(&mut conn, viewer, root, filter, after, limit).await
+    }
+
+    /// Every break of [`Db::breaks`] from `root` with `filter`, in the order of the tree, read
+    /// at once: for the CSV export, whose cost then follows the number of breaks once rather
+    /// than once per page. `None` when the viewer lacks `manage_access` on `root`.
+    pub async fn all_breaks(
+        &self,
+        viewer: UserId,
+        root: NodeId,
+        filter: &ExplorerFilter,
+    ) -> Result<Option<Vec<Break>>, DbError> {
+        let mut conn = self.pool().acquire().await?;
+        Ok(breaks_window(&mut conn, viewer, root, filter, None, None)
+            .await?
+            .map(|(breaks, _)| breaks))
     }
 
     /// For the explorer's tree: for each child of `parent` with breaks at or below it that

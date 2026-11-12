@@ -436,6 +436,51 @@ async fn export_is_csv_attachment() {
     );
 }
 
+/// The export holds every break, in the order of the tree, however many pages the listing
+/// takes: here the listing needs three pages of two.
+#[tokio::test]
+async fn export_holds_every_page() {
+    let w = world().await;
+    let mut listed = Vec::new();
+    let mut after: Option<String> = None;
+    let mut pages = 0;
+    loop {
+        let path = match &after {
+            Some(after) => format!(
+                "/api/explorer/{}?limit=2&after={}",
+                w.site,
+                urlencode(after)
+            ),
+            None => format!("/api/explorer/{}?limit=2", w.site),
+        };
+        let (status, page) = w.get(&w.root, &path).await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        pages += 1;
+        listed.extend(World::names(&page));
+        match page["next"].as_str() {
+            Some(next) => after = Some(next.to_owned()),
+            None => break,
+        }
+    }
+    assert_eq!(pages, 3);
+    let csv = text(&w, &w.root, &format!("/api/explorer/{}/export.csv", w.site)).await;
+    let mut exported: Vec<String> = Vec::new();
+    for line in csv
+        .split_terminator(
+            "
+",
+        )
+        .skip(1)
+    {
+        let path = line.split(',').next().unwrap();
+        let name = path.rsplit(" / ").next().unwrap().to_owned();
+        if exported.last() != Some(&name) {
+            exported.push(name);
+        }
+    }
+    assert_eq!(exported, listed, "{csv}");
+}
+
 #[tokio::test]
 async fn restore_preview_says_what_would_change() {
     let w = world().await;

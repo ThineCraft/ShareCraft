@@ -26,7 +26,7 @@ use crate::auth::Signed;
 
 /// Breaks listed when the request names no limit.
 const DEFAULT_LIMIT: u32 = 100;
-/// Most breaks listed at once, and the size of each page the export reads.
+/// Most breaks listed at once.
 const MAX_LIMIT: u32 = 500;
 
 /// A person named for display.
@@ -272,16 +272,13 @@ pub(crate) async fn export(
     let filter = filter_of(&query)?;
     let user = signed.session.user.id;
     require_explorer(&state, user, root).await?;
-    let mut all = Vec::new();
-    let mut after: Option<String> = None;
-    loop {
-        let (found, next) = page(&state, user, root, &filter, after.as_deref(), MAX_LIMIT).await?;
-        all.extend(found);
-        match next {
-            Some(next) => after = Some(next),
-            None => break,
-        }
-    }
+    // Every break at once: paging would walk the scopes again for every page.
+    let all = state
+        .db()
+        .all_breaks(user, root, &filter)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?
+        .ok_or(ApiError::Forbidden)?;
     let csv = records::breaks_csv(&all);
     Ok((
         [

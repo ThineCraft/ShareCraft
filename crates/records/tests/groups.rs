@@ -1437,3 +1437,49 @@ async fn group_assigned_only_where_deleted_can_be_deleted() {
         )]
     );
 }
+
+/// The `group.created` events of the groups of `site`, by group id.
+async fn group_created(test: &TestDb, site: NodeId) -> Vec<(Uuid, serde_json::Value)> {
+    sqlx::query_as(
+        "select g.id, e.detail from groups g \
+         join events e on e.kind = 'group.created' and e.detail->>'id' = g.id::text \
+         where g.site_id = $1 order by g.id, e.id",
+    )
+    .bind(site.0)
+    .fetch_all(test.db.test_pool())
+    .await
+    .unwrap()
+}
+
+/// The upgrade that made the groups of every site recorded none; migration 0007 records one
+/// `group.created` for each site group that has none, and none twice.
+#[tokio::test]
+async fn upgrade_records_the_groups_it_made() {
+    let test = TestDb::create_at(Some(4)).await;
+    let old = plan1_node(&test, NodeKind::Site, None, None, "Old", false).await;
+    test.db.migrate_to(6).await.unwrap();
+    assert!(group_created(&test, old).await.is_empty());
+    // A site made after the upgrade records its groups as it makes them.
+    let new = common::site(&test, "New", None).await;
+    let recorded = group_created(&test, new).await;
+    assert_eq!(recorded.len(), 3, "{recorded:?}");
+
+    test.db.migrate().await.unwrap();
+    let groups = site_groups(&test, old).await;
+    let mut expected: Vec<(Uuid, serde_json::Value)> = [
+        (groups.owners, "owners"),
+        (groups.members, "members"),
+        (groups.visitors, "visitors"),
+    ]
+    .into_iter()
+    .map(|(group, purpose)| {
+        (
+            group.0,
+            json!({ "id": group.0, "site": old.0, "purpose": purpose, "upgrade": true }),
+        )
+    })
+    .collect();
+    expected.sort_by_key(|(id, _)| *id);
+    assert_eq!(group_created(&test, old).await, expected);
+    assert_eq!(group_created(&test, new).await, recorded);
+}

@@ -16,8 +16,23 @@ use records::{
 };
 use uuid::Uuid;
 
-/// Every break `viewer` sees from `root` with `filter`, all pages of two.
+/// Every break `viewer` sees from `root` with `filter`, all pages of two; checked to be what
+/// [`records::Db::all_breaks`] reads at once (as the CSV export does), across every page
+/// boundary.
 async fn all_breaks(
+    test: &TestDb,
+    viewer: UserId,
+    root: NodeId,
+    filter: &ExplorerFilter,
+) -> Option<Vec<Break>> {
+    let at_once = test.db.all_breaks(viewer, root, filter).await.unwrap();
+    let paged = paged_breaks(test, viewer, root, filter).await;
+    assert_eq!(paged, at_once, "pages of two and the whole list differ");
+    paged
+}
+
+/// Every break `viewer` sees from `root` with `filter`, all pages of two.
+async fn paged_breaks(
     test: &TestDb,
     viewer: UserId,
     root: NodeId,
@@ -878,4 +893,48 @@ async fn explorer_cost_follows_breaks() {
         "read {read_50k} rows of nodes with 50,000 files, {read_5k} with 5,000"
     );
     println!("rows of nodes read: {read_5k} with 5,000 files, {read_50k} with 50,000");
+}
+
+/// The explorer's walk starts from the live scopes of the explorer's own site, through their
+/// index: another site's scopes, however many, are never read.
+#[tokio::test]
+async fn explorer_reads_only_its_own_sites_scopes() {
+    let test = TestDb::create().await;
+    let owner = user(&test, "Owner", false).await;
+    let Tree {
+        site, library, a, ..
+    } = tree(&test, owner.id).await;
+    // Twenty other sites of 250 files each: enough rows that every read goes through an index.
+    for i in 0..20 {
+        let other = common::site(&test, &format!("Site {i}"), None).await;
+        add_files(&test, other, &[other], 1, 250).await;
+    }
+    break_at(&test, owner.id, library).await;
+    break_at(&test, owner.id, a).await;
+    let plan = test.db.explain_walk(site, site).await.unwrap();
+    assert!(
+        plan.contains("Index Scan using nodes_site_scopes on nodes n"),
+        "{plan}"
+    );
+    let (before, listed) = explorer_reads(&test, owner.id, site, library).await;
+    assert_eq!(listed, 3);
+
+    // Another site with 5,000 scopes of its own.
+    let other = common::site(&test, "Other", None).await;
+    sqlx::query(
+        "insert into nodes (id, kind, parent_id, site_id, name, unique_scope, created_at) \
+         select gen_random_uuid(), 'document', $1, $1, 'g' || i || '.txt', true, now() \
+         from generate_series(1, 5000) i",
+    )
+    .bind(other.0)
+    .execute(test.db.test_pool())
+    .await
+    .unwrap();
+    sqlx::query("analyze nodes")
+        .execute(test.db.test_pool())
+        .await
+        .unwrap();
+    let (after, listed) = explorer_reads(&test, owner.id, site, library).await;
+    assert_eq!(listed, 3);
+    assert_eq!(after, before, "the explorer read another site's scopes");
 }
