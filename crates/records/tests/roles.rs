@@ -1026,3 +1026,104 @@ async fn role_change_keeps_a_manager_per_scope() {
             .can_manage_access()
     );
 }
+
+/// A role given only on scopes below a deleted node is not in use: deleting it removes those
+/// assignments, each recorded.
+#[tokio::test]
+async fn role_given_only_where_deleted_can_be_deleted() {
+    let test = TestDb::create().await;
+    let root = user(&test, "Root", true).await;
+    let ann = user(&test, "Ann", false).await;
+    let cy = user(&test, "Cy", false).await;
+    let t = tree(&test, ann.id).await;
+    let role = test
+        .db
+        .create_role(root.id, "Contributor", contributor())
+        .await
+        .unwrap();
+    test.db
+        .set_node_access(ann.id, t.b, Principal::User(cy.id), Some(&role.id))
+        .await
+        .unwrap();
+    test.db.break_inheritance(ann.id, t.file).await.unwrap();
+    // The file and folder B both give the role; deleting folder A puts both below a deleted
+    // node.
+    common::delete(&test, t.a).await;
+
+    assert_eq!(test.db.delete_role(root.id, &role.id).await, Ok(()));
+    let left: i64 = sqlx::query_scalar("select count(*) from assignments where role_id = $1")
+        .bind(&role.id)
+        .fetch_one(test.db.test_pool())
+        .await
+        .unwrap();
+    assert_eq!(left, 0);
+    let revoked: Vec<(Option<uuid::Uuid>, Option<uuid::Uuid>, serde_json::Value)> = sqlx::query_as(
+        "select node_id, subject, detail from events where kind = 'access.revoked' \
+             and detail->>'reason' = 'role deleted' order by node_id",
+    )
+    .fetch_all(test.db.test_pool())
+    .await
+    .unwrap();
+    let mut expected = vec![
+        (
+            Some(t.b.0),
+            Some(cy.id.0),
+            json!({ "role": role.id, "reason": "role deleted" }),
+        ),
+        (
+            Some(t.file.0),
+            Some(cy.id.0),
+            json!({ "role": role.id, "reason": "role deleted" }),
+        ),
+    ];
+    expected.sort_by_key(|(node, _, _)| *node);
+    assert_eq!(revoked, expected);
+    let document: Option<uuid::Uuid> = sqlx::query_scalar(
+        "select document_id from events where kind = 'access.revoked' and node_id = $1",
+    )
+    .bind(t.file.0)
+    .fetch_one(test.db.test_pool())
+    .await
+    .unwrap();
+    assert_eq!(document, Some(t.file.0));
+}
+
+/// A scope below a deleted node needs no manager: a role that is its only manager there may
+/// lose `manage_access`.
+#[tokio::test]
+async fn role_change_ignores_scopes_below_deleted_nodes() {
+    let test = TestDb::create().await;
+    let root = user(&test, "Root", true).await;
+    let ann = user(&test, "Ann", false).await;
+    let gus = user(&test, "Gus", false).await;
+    let t = tree(&test, ann.id).await;
+    without_groups(&test, t.site).await;
+    let keeper = test
+        .db
+        .create_role(root.id, "Gatekeeper", gatekeeper())
+        .await
+        .unwrap();
+    // Folder B's only manager is Gus's Gatekeeper role.
+    test.db
+        .set_node_access(ann.id, t.b, Principal::User(gus.id), Some(&keeper.id))
+        .await
+        .unwrap();
+    test.db
+        .set_node_access(ann.id, t.b, Principal::User(ann.id), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        test.db
+            .change_role(root.id, &keeper.id, None, Some(Perms::VIEW))
+            .await,
+        Err(AccessError::LastManager)
+    );
+
+    common::delete(&test, t.a).await;
+    let changed = test
+        .db
+        .change_role(root.id, &keeper.id, None, Some(Perms::VIEW))
+        .await
+        .unwrap();
+    assert_eq!(changed.perms, Perms::VIEW);
+}

@@ -1367,3 +1367,73 @@ async fn upgrade_keeps_everyones_access() {
     assert_eq!(upgraded.len(), 10);
     assert!(upgraded.iter().all(|(_, d)| d["upgrade"] == json!(true)));
 }
+
+/// Every break copies the site's groups; once the broken file is deleted, its copies grant
+/// nothing, and they no longer stand in the way of a site owner adding members.
+#[tokio::test]
+async fn deleted_break_does_not_block_adding_members() {
+    let test = TestDb::create().await;
+    let ann = user(&test, "Ann", false).await;
+    let bob = user(&test, "Bob", false).await;
+    let (site, library) = new_site(&test, ann.id, "Alpha").await;
+    let groups = site_groups(&test, site).await;
+    let file = put(
+        &test,
+        new_id(),
+        NodeKind::Document,
+        Some(library),
+        site,
+        "Notes",
+    )
+    .await;
+    assert!(test.db.break_inheritance(ann.id, file).await.unwrap());
+    common::delete(&test, file).await;
+
+    assert_eq!(
+        test.db.add_member(ann.id, groups.members, bob.id).await,
+        Ok(true)
+    );
+    assert_eq!(role(&test, bob.id, library).await, Some(Role::Editor));
+    assert_eq!(
+        test.db.add_member(ann.id, groups.owners, bob.id).await,
+        Ok(true)
+    );
+}
+
+/// An organisation group assigned only on deleted scopes is not in use: deleting it removes
+/// those assignments, each recorded.
+#[tokio::test]
+async fn group_assigned_only_where_deleted_can_be_deleted() {
+    let test = TestDb::create().await;
+    let admin = user(&test, "Root", true).await;
+    let t = tree(&test, admin.id).await;
+    let writers = test.db.create_group(admin.id, "Writers").await.unwrap();
+    test.db
+        .set_node_access(admin.id, t.b, Principal::Group(writers.id), Some("editor"))
+        .await
+        .unwrap();
+    // Deleting folder A leaves folder B's scope below a deleted node.
+    common::delete(&test, t.a).await;
+
+    test.db.delete_group(admin.id, writers.id).await.unwrap();
+    let left: i64 = sqlx::query_scalar(
+        "select count(*) from assignments where principal_kind = 'group' and principal_id = $1",
+    )
+    .bind(writers.id.0)
+    .fetch_one(test.db.test_pool())
+    .await
+    .unwrap();
+    assert_eq!(left, 0);
+    let revoked: Vec<(String, serde_json::Value)> = node_events(&test, t.b)
+        .await
+        .into_iter()
+        .filter(|(kind, _)| kind == "access.revoked")
+        .collect();
+    assert_eq!(
+        revoked,
+        [(
+            "access.revoked".to_owned(),
+            json!({ "role": "editor", "group": writers.id.0, "reason": "group deleted" })
+        )]
+    );
+}

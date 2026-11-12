@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use crate::documents::UNIQUE_VIOLATION;
 use crate::events::{NewEvent, record};
-use crate::scopes::scopes_managed_only_by;
+use crate::scopes::{DEAD, DeadOf, remove_dead_assignments, scopes_managed_only_by};
 use crate::{AccessError, Db, DbError};
 
 const MAX_ROLE_NAME_CHARS: usize = 60;
@@ -560,19 +560,24 @@ impl Db {
 
     /// Deletes the role `id`. `actor` must be an enabled administrator (`Forbidden`);
     /// `NoSuchRole` for an unknown id, `BuiltinRole` for a built-in role, `RoleInUse` while any
-    /// assignment gives it. Records `role.deleted`.
+    /// assignment on a live scope gives it. Its assignments on scopes with a deleted node at or
+    /// above them grant nothing and are deleted with it, each recording `access.revoked` with
+    /// the reason `role deleted`. Records `role.deleted`.
     pub async fn delete_role(&self, actor: UserId, id: &str) -> Result<(), AccessError> {
         let mut tx = self.pool().begin().await?;
         require_admin(&mut tx, actor).await?;
         let role = locked_custom_role(&mut tx, id).await?;
-        let in_use: bool =
-            sqlx::query_scalar("select exists (select 1 from assignments where role_id = $1)")
-                .bind(id)
-                .fetch_one(&mut *tx)
-                .await?;
+        let query = format!(
+            "with recursive held(node_id) as (select node_id from assignments where role_id = $1),              {DEAD}              select exists (select 1 from held where node_id not in (select origin from dead))"
+        );
+        let in_use: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(query))
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
         if in_use {
             return Err(AccessError::RoleInUse);
         }
+        remove_dead_assignments(&mut tx, actor, DeadOf::Role(id), "role deleted").await?;
         sqlx::query("delete from roles where id = $1")
             .bind(id)
             .execute(&mut *tx)

@@ -22,8 +22,8 @@ use crate::documents::UNIQUE_VIOLATION;
 use crate::events::{NewEvent, record};
 use crate::roles::lock_roles;
 use crate::scopes::{
-    LOCK_ATTEMPTS, MANAGE_ACCESS_BIT, MANAGE_SITE_BIT, REACH, Standing, access_in, judged_roles,
-    lock_top_down, standing,
+    DEAD, DeadOf, LOCK_ATTEMPTS, MANAGE_ACCESS_BIT, MANAGE_SITE_BIT, REACH, Standing, access_in,
+    judged_roles, lock_top_down, remove_dead_assignments, standing,
 };
 use crate::{AccessError, Db, DbError, Perms, User};
 
@@ -289,18 +289,23 @@ async fn group_place(
 }
 
 /// The scopes where the group `id` has an assignment, with the permissions of its role there,
-/// by node id.
+/// by node id. Scopes with a deleted node at or above them (see [`DEAD`]) are left out: the
+/// assignment grants nothing there.
 async fn assigned_scopes(
     conn: &mut PgConnection,
     id: GroupId,
 ) -> Result<Vec<(NodeId, String, Perms)>, sqlx::Error> {
-    let rows: Vec<(Uuid, String, i32)> = sqlx::query_as(
-        "select a.node_id, r.id, r.perms from assignments a join roles r on r.id = a.role_id \
-         where a.principal_kind = 'group' and a.principal_id = $1 order by a.node_id",
-    )
-    .bind(id.0)
-    .fetch_all(conn)
-    .await?;
+    let query = format!(
+        "with recursive held(node_id, role_id, perms) as ( \
+             select a.node_id, r.id, r.perms from assignments a join roles r on r.id = a.role_id \
+             where a.principal_kind = 'group' and a.principal_id = $1), {DEAD} \
+         select node_id, role_id, perms from held \
+         where node_id not in (select origin from dead) order by node_id"
+    );
+    let rows: Vec<(Uuid, String, i32)> = sqlx::query_as(sqlx::AssertSqlSafe(query))
+        .bind(id.0)
+        .fetch_all(conn)
+        .await?;
     rows.into_iter()
         .map(|(node, role, perms)| Ok((NodeId(node), role, Perms::from_column(perms)?)))
         .collect()
@@ -456,8 +461,10 @@ impl Db {
 
     /// Deletes the organisation group `group` and its memberships. `actor` must be an enabled
     /// administrator (`Forbidden`); `NoSuchGroup` for an unknown group, `SiteGroup` for a
-    /// site's group, `GroupInUse` while any assignment names it. Takes the group's row
-    /// `FOR UPDATE`, so an assignment being given to it either finishes first (and the group is
+    /// site's group, `GroupInUse` while any assignment on a live scope names it; its
+    /// assignments on scopes with a deleted node at or above them grant nothing and are deleted
+    /// with it, each recording `access.revoked` with the reason `group deleted`. Takes the
+    /// group's row `FOR UPDATE`, so an assignment being given to it either finishes first (and the group is
     /// in use) or waits and finds it gone. Records `group.deleted`.
     pub async fn delete_group(&self, actor: UserId, group: GroupId) -> Result<(), AccessError> {
         let mut tx = self.pool().begin().await?;
@@ -473,16 +480,20 @@ impl Db {
         if site.is_some() {
             return Err(AccessError::SiteGroup);
         }
-        let in_use: bool = sqlx::query_scalar(
-            "select exists (select 1 from assignments \
-                            where principal_kind = 'group' and principal_id = $1)",
-        )
-        .bind(group.0)
-        .fetch_one(&mut *tx)
-        .await?;
+        let query = format!(
+            "with recursive held(node_id) as ( \
+                 select node_id from assignments \
+                 where principal_kind = 'group' and principal_id = $1), {DEAD} \
+             select exists (select 1 from held where node_id not in (select origin from dead))"
+        );
+        let in_use: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(query))
+            .bind(group.0)
+            .fetch_one(&mut *tx)
+            .await?;
         if in_use {
             return Err(AccessError::GroupInUse);
         }
+        remove_dead_assignments(&mut tx, actor, DeadOf::Group(group), "group deleted").await?;
         let members = sqlx::query("delete from group_members where group_id = $1")
             .bind(group.0)
             .execute(&mut *tx)
@@ -511,8 +522,9 @@ impl Db {
     /// Makes `user` a member of `group`; `false` if they already were one. `actor` must be an
     /// enabled administrator, or have `manage_site` on the site of a site group (`Forbidden`;
     /// `NotFound` if they cannot see the site). Someone who is not an administrator may only
-    /// add a person to a group whose role, on every scope where the group is assigned, has no
-    /// permission they do not hold there themselves (`BeyondYourAccess`). `NoSuchGroup` or
+    /// add a person to a group whose role, on every live scope where the group is assigned,
+    /// has no permission they do not hold there themselves (`BeyondYourAccess`); a scope with a
+    /// deleted node at or above it grants nothing and is not judged. `NoSuchGroup` or
     /// `NoSuchUser` for an unknown group or person. Records `group.member_added`.
     pub async fn add_member(
         &self,
@@ -621,10 +633,10 @@ impl Db {
 
 /// Locks and judges a membership change of the site group `group` by `actor`, who is not an
 /// administrator, in the one locking order: the site's chain (the site, `FOR SHARE`) and, when
-/// adding, every other scope where the group is assigned (`FOR SHARE`, by id); then, in one
+/// adding, every other live scope where the group is assigned (`FOR SHARE`, by id); then, in one
 /// pass by id, `group` `FOR UPDATE` and the groups `actor` is judged through on those scopes
 /// `FOR SHARE`; then the roles involved. Then works the decision out again: `manage_site` on
-/// the site and, when adding, the subset rule on every scope. Returns `false` if what it
+/// the site and, when adding, the subset rule on every live scope. Returns `false` if what it
 /// locked changed meanwhile: the caller starts over.
 async fn judge_membership(
     conn: &mut PgConnection,

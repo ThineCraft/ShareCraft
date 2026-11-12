@@ -101,6 +101,85 @@ pub(crate) const REACH: &str = concat!(
     reach(id) as (select distinct id from up where origin in (select origin from live))"
 );
 
+/// Of the nodes listed by `held(node_id)`, a CTE the query defines before this one (after
+/// `with recursive`), those with a deleted node at or above them: the CTEs `held_up` and
+/// `dead(origin)`. The same test as [`REACH`]'s `live`, the other way round: an assignment on
+/// such a scope grants nothing, and it counts for nothing either (nothing in use, no manager
+/// to keep). Nothing is ever undeleted, so a scope found dead stays so.
+pub(crate) const DEAD: &str = "\
+    held_up(origin, id, parent_id, deleted) as ( \
+        select n.id, n.id, n.parent_id, n.deleted_at is not null \
+        from nodes n where n.id in (select node_id from held) \
+        union \
+        select h.origin, n.id, n.parent_id, n.deleted_at is not null \
+        from held_up h join nodes n on n.id = h.parent_id), \
+    dead(origin) as (select origin from held_up group by origin having bool_or(deleted))";
+
+/// Whose assignments on dead scopes [`remove_dead_assignments`] removes.
+pub(crate) enum DeadOf<'a> {
+    /// Every assignment of this role.
+    Role(&'a str),
+    /// Every assignment naming this group.
+    Group(GroupId),
+}
+
+/// Deletes the assignments of `of` on scopes with a deleted node at or above them (see
+/// [`DEAD`]), recording `access.revoked` by `actor` for each, its detail saying `reason`.
+/// Returns how many it deleted. For deleting a role or group: such an assignment grants
+/// nothing, but its row would still name what is being deleted.
+pub(crate) async fn remove_dead_assignments(
+    conn: &mut PgConnection,
+    actor: UserId,
+    of: DeadOf<'_>,
+    reason: &str,
+) -> Result<usize, sqlx::Error> {
+    let which = match of {
+        DeadOf::Role(_) => "a.role_id = $1::text",
+        DeadOf::Group(_) => "a.principal_kind = 'group' and a.principal_id = $1::text::uuid",
+    };
+    let query = format!(
+        "with recursive held(node_id) as (select a.node_id from assignments a where {which}), \
+         {DEAD} \
+         delete from assignments a using dead d join nodes n on n.id = d.origin \
+         where a.node_id = d.origin and {which} \
+         returning a.node_id, n.kind, a.principal_kind, a.principal_id, a.role_id"
+    );
+    let key = match of {
+        DeadOf::Role(role) => role.to_owned(),
+        DeadOf::Group(group) => group.0.to_string(),
+    };
+    let mut removed: Vec<(uuid::Uuid, String, String, uuid::Uuid, String)> =
+        sqlx::query_as(sqlx::AssertSqlSafe(query))
+            .bind(key)
+            .fetch_all(&mut *conn)
+            .await?;
+    removed.sort();
+    for (node, kind, principal_kind, principal_id, role) in &removed {
+        let principal = if principal_kind == "group" {
+            Principal::Group(GroupId(*principal_id))
+        } else {
+            Principal::User(UserId(*principal_id))
+        };
+        let subject = match principal {
+            Principal::User(user) => Some(user),
+            Principal::Group(_) => None,
+        };
+        record(
+            conn,
+            NewEvent {
+                kind: "access.revoked",
+                actor: Some(actor),
+                subject,
+                document: (kind == "document").then_some(DocId(*node)),
+                node: Some(NodeId(*node)),
+                detail: with_principal(principal, json!({ "role": role, "reason": reason })),
+            },
+        )
+        .await?;
+    }
+    Ok(removed.len())
+}
+
 /// `node` ($2) and everything above it; each scope once per assignment of `$1`'s on it (see
 /// [`mine!`]) with that assignment's role, or once with nulls if there is none.
 const CHAIN: &str = concat!(
@@ -541,15 +620,18 @@ async fn managers_on(conn: &mut PgConnection, node: NodeId) -> Result<i64, sqlx:
 /// How many scopes hold an assignment of the role `role` and no other assignment whose role
 /// has `manage_access`: the scopes that would be left without a manager if `role` lost it.
 /// Like [`managers_on`] it reads `assigned!`, per scope; its cost follows the role's
-/// assignments, not the tree's size.
+/// assignments, not the tree's size. Scopes with a deleted node at or above them (see
+/// [`DEAD`]) are left out: nobody manages anything there.
 pub(crate) async fn scopes_managed_only_by(
     conn: &mut PgConnection,
     role: &str,
 ) -> Result<i64, sqlx::Error> {
     let query = format!(
-        "with {ASSIGNED} select count(*) \
-         from (select distinct node_id from assigned where role_id = $1) held \
-         where not exists (select 1 from assigned other \
+        "with recursive {ASSIGNED}, \
+         held(node_id) as (select distinct node_id from assigned where role_id = $1), {DEAD} \
+         select count(*) from held \
+         where held.node_id not in (select origin from dead) \
+           and not exists (select 1 from assigned other \
                            where other.node_id = held.node_id and other.role_id <> $1 \
                              and other.perms & {MANAGE_ACCESS_BIT} <> 0)"
     );
