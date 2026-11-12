@@ -288,7 +288,7 @@ impl fmt::Display for Moved {
         if duplicates > 0 {
             write!(
                 f,
-                ", {duplicates} found at both places kept from their sub-folders"
+                ", {duplicates} found at both places, the later of each kept"
             )?;
         }
         Ok(())
