@@ -5,12 +5,12 @@
 //! anything below the node, whatever lies there.
 //!
 //! One locking order for everyone: the node chain from the top down, then the groups involved
-//! by id (once groups exist), then the roles involved by id; each row once, in the strongest
+//! by id, then the roles involved by id; each row once, in the strongest
 //! mode the transaction needs. A decision is worked out again once every lock is held.
 
 use std::collections::HashMap;
 
-use collab_core::ids::{DocId, NodeId, UserId};
+use collab_core::ids::{DocId, GroupId, NodeId, UserId};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::{PgConnection, Postgres, Row, Transaction};
@@ -19,6 +19,7 @@ use time::OffsetDateTime;
 use crate::accounts::user_from_row;
 use crate::documents::parse_editor;
 use crate::events::{NewEvent, record};
+use crate::groups::{all_locked, groups_judged_by, lock_groups};
 use crate::roles::{lock_roles, role_by_id};
 use crate::tree::node_from_row;
 use crate::{
@@ -40,8 +41,7 @@ macro_rules! assigned {
 }
 
 /// "My assignments", the one place that says which assignments apply to a person: those naming
-/// the person `$1` (and, once groups exist, those of the groups they belong to), each with its
-/// role. Everything that works out a person's access reads it: the chain, reach, sites and
+/// the person `$1` and those naming a group they are a member of, each with its role. Everything that works out a person's access reads it: the chain, reach, sites and
 /// listings. Defines the CTEs `assigned` and `mine(node_id, role_id, role_name, perms)`.
 macro_rules! mine {
     () => {
@@ -49,7 +49,9 @@ macro_rules! mine {
             assigned!(),
             ", mine(node_id, role_id, role_name, perms) as ( \
                 select node_id, role_id, role_name, perms from assigned \
-                where principal_kind = 'user' and principal_id = $1)"
+                where (principal_kind = 'user' and principal_id = $1) \
+                   or (principal_kind = 'group' and principal_id in ( \
+                           select gm.group_id from group_members gm where gm.user_id = $1)))"
         )
     };
 }
@@ -162,13 +164,16 @@ pub(crate) struct Link {
 
 /// Whether an account may have any access, and whether it is an administrator.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Standing {
+pub(crate) enum Standing {
     Nobody,
     Member,
     Admin,
 }
 
-async fn standing(conn: &mut PgConnection, user: UserId) -> Result<Standing, sqlx::Error> {
+pub(crate) async fn standing(
+    conn: &mut PgConnection,
+    user: UserId,
+) -> Result<Standing, sqlx::Error> {
     let row: Option<(bool, bool)> =
         sqlx::query_as("select is_admin, disabled_at is null from users where id = $1")
             .bind(user.0)
@@ -301,7 +306,7 @@ fn source_index(links: &[Link], above: bool) -> usize {
 
 /// The nodes from the source scope down to the node, as an access change locks them, with
 /// whether each is a scope.
-fn segment(links: &[Link], above: bool) -> Vec<(NodeId, bool)> {
+pub(crate) fn segment(links: &[Link], above: bool) -> Vec<(NodeId, bool)> {
     links
         .get(source_index(links, above)..)
         .unwrap_or_default()
@@ -645,7 +650,11 @@ impl Db {
             let mut conn = self.pool().acquire().await?;
             manager(chain(&mut conn, actor, node).await?)?;
         }
-        let (mut tx, links) = self.lock_chain(actor, node, false, role).await?;
+        let group = match principal {
+            Principal::Group(group) => Some(group),
+            Principal::User(_) => None,
+        };
+        let (mut tx, links) = self.lock_chain(actor, node, false, role, group).await?;
         let links = manager(Some(links))?;
         match principal {
             Principal::User(user) => {
@@ -658,8 +667,17 @@ impl Db {
                     return Err(AccessError::NoSuchUser);
                 }
             }
-            // No group exists before groups are introduced.
-            Principal::Group(_) => return Err(AccessError::NoSuchGroup),
+            // Locked `FOR SHARE` by `lock_chain`, so it cannot be deleted before the commit.
+            Principal::Group(group) => {
+                let exists: Option<bool> =
+                    sqlx::query_scalar("select true from groups where id = $1")
+                        .bind(group.0)
+                        .fetch_optional(&mut *tx)
+                        .await?;
+                if exists.is_none() {
+                    return Err(AccessError::NoSuchGroup);
+                }
+            }
         }
         let new = match role {
             Some(id) => Some(
@@ -772,7 +790,7 @@ impl Db {
             let mut conn = self.pool().acquire().await?;
             manager(chain(&mut conn, actor, node).await?)?;
         }
-        let (mut tx, links) = self.lock_chain(actor, node, false, None).await?;
+        let (mut tx, links) = self.lock_chain(actor, node, false, None, None).await?;
         let links = manager(Some(links))?;
         let (Some(target), Some(source)) = (links.last(), links.get(source_index(&links, false)))
         else {
@@ -799,7 +817,7 @@ impl Db {
             let mut conn = self.pool().acquire().await?;
             manager(chain(&mut conn, actor, node).await?)?;
         }
-        let (mut tx, links) = self.lock_chain(actor, node, true, None).await?;
+        let (mut tx, links) = self.lock_chain(actor, node, true, None, None).await?;
         let links = manager(Some(links))?;
         let Some(target) = links.last() else {
             return Err(AccessError::NotFound);
@@ -844,7 +862,8 @@ impl Db {
         Ok(true)
     }
 
-    /// Everyone with an assignment of their own on the scope that decides access to `node`.
+    /// Everyone with an assignment on the scope that decides access to `node`: of their own, or
+    /// through a group they are a member of.
     pub async fn scope_users(&self, node: NodeId) -> Result<Vec<UserId>, DbError> {
         let users: Vec<uuid::Uuid> = sqlx::query_scalar(
             "with recursive up(id, parent_id, unique_scope) as ( \
@@ -853,7 +872,12 @@ impl Db {
                  select n.id, n.parent_id, n.unique_scope from nodes n \
                  join up on n.id = up.parent_id where not up.unique_scope \
              ) select a.principal_id from up join assignments a on a.node_id = up.id \
-               where up.unique_scope and a.principal_kind = 'user' order by a.principal_id",
+               where up.unique_scope and a.principal_kind = 'user' \
+               union \
+               select m.user_id from up join assignments a on a.node_id = up.id \
+               join group_members m \
+                 on a.principal_kind = 'group' and m.group_id = a.principal_id \
+               where up.unique_scope order by 1",
         )
         .bind(node.0)
         .fetch_all(self.pool())
@@ -863,8 +887,10 @@ impl Db {
 
     /// Opens a transaction and locks, in the one locking order, the chain from `node`'s source
     /// scope down to `node` (top-down: `node` `FOR UPDATE`, the rest `FOR SHARE`), then, by id
-    /// and `FOR SHARE`, the roles involved: those giving `actor` access along the chain, those
-    /// of the assignments on the source scope, and `role` if given. With `above`, the source is
+    /// and `FOR SHARE`, the groups involved: those with an assignment on a scope of that chain
+    /// that `actor` is a member of, and `group` if given; then, by id and `FOR SHARE`, the roles
+    /// involved: those giving `actor` access along the chain, those of the assignments on the
+    /// source scope, and `role` if given. With `above`, the source is
     /// the nearest scope strictly above `node` (restoring is judged there). Reads the chain
     /// again once everything is locked, and starts over if it changed meanwhile, so the chain
     /// returned, as `actor` sees it, holds until the transaction ends. The chain is a handful
@@ -875,11 +901,15 @@ impl Db {
         node: NodeId,
         above: bool,
         role: Option<&str>,
+        group: Option<GroupId>,
     ) -> Result<(Transaction<'static, Postgres>, Vec<Link>), AccessError> {
         for _ in 0..LOCK_ATTEMPTS {
             let mut tx = self.pool().begin().await?;
             if let Some(seen) = lock_segment(&mut tx, actor, node, above, true).await? {
                 let wanted = segment(&seen, above);
+                let scopes = scopes_of(&wanted);
+                let judged = groups_judged_by(&mut tx, actor, &scopes).await?;
+                lock_groups(&mut tx, judged.iter().copied().chain(group), None).await?;
                 let source = wanted.first().map_or(node, |(id, _)| *id);
                 let on_source: Vec<String> = sqlx::query_scalar(
                     "select distinct role_id from assignments where node_id = $1",
@@ -896,7 +926,8 @@ impl Db {
                 let now = chain(&mut tx, actor, node)
                     .await?
                     .ok_or(AccessError::NotFound)?;
-                if segment(&now, above) == wanted {
+                let now_judged = groups_judged_by(&mut tx, actor, &scopes).await?;
+                if segment(&now, above) == wanted && all_locked(&now_judged, &judged) {
                     return Ok((tx, now));
                 }
             }
@@ -906,13 +937,23 @@ impl Db {
     }
 }
 
+/// The scopes among the nodes of a segment.
+pub(crate) fn scopes_of(segment: &[(NodeId, bool)]) -> Vec<NodeId> {
+    segment
+        .iter()
+        .filter(|(_, scope)| *scope)
+        .map(|(id, _)| *id)
+        .collect()
+}
+
 /// Locks, on `conn`, the chain from `node`'s source scope down to `node`, top-down: `node`
 /// `FOR UPDATE` when `write` (`FOR SHARE` otherwise), the rest `FOR SHARE`. With `above`, the
 /// source is the nearest scope strictly above `node`. Reads the chain again under the locks
 /// and returns it, as `actor` sees it; `None` if it changed meanwhile, when the caller starts
 /// over in a new transaction. `NotFound` if `node` does not lead up to a site for `actor`.
 /// Everyone locks ancestors before descendants, so these locks cannot deadlock one another.
-/// Roles are not locked here: the caller locks them once every chain it needs is locked.
+/// Groups and roles are not locked here: the caller locks them once every chain it needs is
+/// locked.
 pub(crate) async fn lock_segment(
     conn: &mut PgConnection,
     actor: UserId,

@@ -8,6 +8,7 @@ use time::OffsetDateTime;
 
 use crate::documents::document_from_row;
 use crate::events::{NewEvent, record};
+use crate::groups::ensure_site_groups;
 use crate::tree::upsert_node;
 use crate::{AccessError, Db, DbError, Document, NodeRow};
 
@@ -25,22 +26,21 @@ pub struct Adoption {
     pub scopes: u64,
     /// Grants moved from `document_access` to `assignments`.
     pub grants: u64,
-    /// Owner assignments given to administrators on sites that had no owner.
-    pub owners: u64,
+    /// Site groups made for sites that did not have all three.
+    pub groups: u64,
 }
 
 impl Db {
     /// Whether anything is left to adopt: a document with no node, a grant still in
-    /// `document_access`, or an undeleted site without an owner assignment.
+    /// `document_access`, or a site, deleted or not, without its three groups.
     pub async fn adoption_pending(&self) -> Result<bool, DbError> {
         let pending: bool = sqlx::query_scalar(
             "select exists (select 1 from documents d \
                             where not exists (select 1 from nodes n where n.id = d.id)) \
                  or exists (select 1 from document_access) \
                  or exists (select 1 from nodes s \
-                            where s.parent_id is null and s.deleted_at is null \
-                              and not exists (select 1 from assignments o \
-                                              where o.node_id = s.id and o.role_id = 'owner'))",
+                            where s.parent_id is null \
+                              and (select count(*) from groups g where g.site_id = s.id) < 3)",
         )
         .fetch_one(self.pool())
         .await?;
@@ -68,9 +68,9 @@ impl Db {
     }
 
     /// Finishes an adoption in one transaction: applies `rows` (as Git holds them, parents
-    /// first; their names are copied into `documents.name`); makes every enabled
-    /// administrator owner of `site`, if given, and of every undeleted site with no owner
-    /// assignment; makes every placed document with grants in `document_access` a scope,
+    /// first; their names are copied into `documents.name`); gives every site, deleted or not,
+    /// the groups it does not have yet, with no members (administrators fill them); makes every
+    /// placed document with grants in `document_access` a scope,
     /// copies those grants to `assignments` (keeping any already there) and deletes them; and
     /// records one `tree.adopted` event with the counts.
     pub async fn finish_adoption(
@@ -84,19 +84,16 @@ impl Db {
         for row in rows {
             upsert_node(&mut tx, row).await?;
         }
-        let owners = sqlx::query(
-            "insert into assignments (node_id, principal_kind, principal_id, role_id) \
-             select s.id, 'user', u.id, 'owner' from nodes s cross join users u \
-             where s.parent_id is null and s.deleted_at is null \
-               and u.is_admin and u.disabled_at is null \
-               and (s.id = $1 or not exists (select 1 from assignments o \
-                                             where o.node_id = s.id and o.role_id = 'owner')) \
-             on conflict (node_id, principal_kind, principal_id) do update set role_id = 'owner'",
+        let lacking: Vec<uuid::Uuid> = sqlx::query_scalar(
+            "select s.id from nodes s where s.parent_id is null \
+               and (select count(*) from groups g where g.site_id = s.id) < 3 order by s.id",
         )
-        .bind(site.map(|s| s.0))
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut groups = 0u64;
+        for id in lacking {
+            groups = groups.saturating_add(ensure_site_groups(&mut tx, NodeId(id)).await?);
+        }
         let scopes = sqlx::query(
             "update nodes set unique_scope = true \
              where kind = 'document' and not unique_scope \
@@ -135,7 +132,7 @@ impl Db {
                     "renamed": renamed,
                     "scopes": scopes,
                     "grants": grants,
-                    "owners": owners,
+                    "groups": groups,
                 }),
             },
         )
@@ -144,7 +141,7 @@ impl Db {
         Ok(Adoption {
             scopes,
             grants,
-            owners,
+            groups,
         })
     }
 }

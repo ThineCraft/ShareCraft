@@ -135,6 +135,11 @@ pub enum AccessError {
     RoleInUse,
     #[error("a built-in role cannot be changed or deleted")]
     BuiltinRole,
+    #[error("that group is still assigned")]
+    GroupInUse,
+    /// A site's groups belong to it: they cannot be deleted or renamed.
+    #[error("a site's groups cannot be deleted")]
+    SiteGroup,
     #[error("that is not a valid document name")]
     InvalidName,
     #[error("the name of this kind of document must end with its file extension")]

@@ -119,6 +119,10 @@ pub(crate) enum ApiError {
     RoleInUse,
     /// 400: a built-in role cannot be changed or deleted.
     BuiltinRole,
+    /// 409: the group is still assigned somewhere.
+    GroupInUse,
+    /// 400: a site's groups cannot be deleted.
+    SiteGroup,
     /// 409: another item in the same place already has that name (ignoring case).
     NameTaken,
     /// 409: a folder still holds items.
@@ -172,6 +176,8 @@ impl ApiError {
             ApiError::BeyondYourAccess => (StatusCode::FORBIDDEN, "beyond_your_access"),
             ApiError::RoleInUse => (StatusCode::CONFLICT, "role_in_use"),
             ApiError::BuiltinRole => (StatusCode::BAD_REQUEST, "builtin_role"),
+            ApiError::GroupInUse => (StatusCode::CONFLICT, "group_in_use"),
+            ApiError::SiteGroup => (StatusCode::BAD_REQUEST, "site_group"),
             ApiError::NameTaken => (StatusCode::CONFLICT, "name_taken"),
             ApiError::NotEmpty => (StatusCode::CONFLICT, "not_empty"),
             ApiError::IntoItself => (StatusCode::BAD_REQUEST, "into_itself"),
@@ -203,6 +209,8 @@ impl From<AccessError> for ApiError {
             AccessError::BeyondYourAccess => ApiError::BeyondYourAccess,
             AccessError::RoleInUse => ApiError::RoleInUse,
             AccessError::BuiltinRole => ApiError::BuiltinRole,
+            AccessError::GroupInUse => ApiError::GroupInUse,
+            AccessError::SiteGroup => ApiError::SiteGroup,
             AccessError::InvalidName => ApiError::InvalidName,
             // `POST /api/docs` answers this itself, naming the extension expected.
             AccessError::WrongExtension => ApiError::InvalidRequest,

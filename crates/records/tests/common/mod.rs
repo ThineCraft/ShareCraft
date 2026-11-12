@@ -10,7 +10,7 @@
 
 use std::time::Duration;
 
-use collab_core::ids::{DocId, NodeId, UserId};
+use collab_core::ids::{DocId, GroupId, NodeId, UserId};
 use records::test_support::TestDb;
 use records::{Access, AccessError, Editor, NewUser, NodeKind, NodeRow, RoleRef, User};
 use sqlx::Connection;
@@ -125,6 +125,41 @@ pub async fn put(
     id
 }
 
+/// Writes one node row directly, as plan 1 held it (a site is a scope), without the code of
+/// later plans: for building a database migrated only part of the way. Deleted if `deleted`.
+pub async fn raw_node(
+    test: &TestDb,
+    id: NodeId,
+    kind: NodeKind,
+    parent: Option<NodeId>,
+    site: NodeId,
+    name: &str,
+    deleted: bool,
+) -> NodeId {
+    let kind = match kind {
+        NodeKind::Site => "site",
+        NodeKind::Library => "library",
+        NodeKind::Folder => "folder",
+        NodeKind::Document => "document",
+    };
+    sqlx::query(
+        "insert into nodes (id, kind, parent_id, site_id, name, unique_scope, deleted_at, \
+                            created_at) \
+         values ($1, $2, $3, $4, $5, $6, case when $7 then now() end, now())",
+    )
+    .bind(id.0)
+    .bind(kind)
+    .bind(parent.map(|p| p.0))
+    .bind(site.0)
+    .bind(name)
+    .bind(kind == "site")
+    .bind(deleted)
+    .execute(test.db.test_pool())
+    .await
+    .unwrap();
+    id
+}
+
 /// Marks a node deleted, as the projection would.
 pub async fn delete(test: &TestDb, id: NodeId) {
     let node = test.db.node(id).await.unwrap().unwrap();
@@ -166,7 +201,19 @@ pub async fn grant_role(test: &TestDb, node: NodeId, user: UserId, role_id: &str
     .unwrap();
 }
 
-/// A site named `name`, owned by `owner` if given.
+/// Takes every group's assignment off `node`, so that only people are assigned there, as in
+/// plan 1: for tests of the rules on people's assignments (such as keeping a manager) that a
+/// site's Owners group, which manages too, would otherwise answer.
+pub async fn without_groups(test: &TestDb, node: NodeId) {
+    sqlx::query("delete from assignments where node_id = $1 and principal_kind = 'group'")
+        .bind(node.0)
+        .execute(test.db.test_pool())
+        .await
+        .unwrap();
+}
+
+/// A site named `name`, owned by `owner` if given. Written as reconcile writes a site, so it
+/// also has its three groups, with nobody in them.
 pub async fn site(test: &TestDb, name: &str, owner: Option<UserId>) -> NodeId {
     let id = new_id();
     put(test, id, NodeKind::Site, None, id, name).await;
@@ -268,6 +315,18 @@ pub async fn role_gate(test: &TestDb, id: &str) -> Gate {
     let mut gate = open_gate(test).await;
     sqlx::query("select id from roles where id = $1 for update")
         .bind(id)
+        .execute(&mut gate.conn)
+        .await
+        .unwrap();
+    gate
+}
+
+/// Opens a connection, begins a transaction on it and locks the row of the group `id`
+/// `FOR UPDATE`.
+pub async fn group_gate(test: &TestDb, id: GroupId) -> Gate {
+    let mut gate = open_gate(test).await;
+    sqlx::query("select id from groups where id = $1 for update")
+        .bind(id.0)
         .execute(&mut gate.conn)
         .await
         .unwrap();

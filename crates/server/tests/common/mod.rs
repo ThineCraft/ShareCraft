@@ -204,12 +204,17 @@ impl Site {
             .set_node_access(admin, folder.id, Principal::User(user.id), Some("owner"))
             .await
             .unwrap();
-        // The administrator's copied assignment goes, so the folder's people are its owner
-        // alone (the administrator stays owner of everything as an administrator).
-        self.records
-            .set_node_access(admin, folder.id, Principal::User(admin), None)
-            .await
-            .unwrap();
+        // The copies of the site's groups' assignments go, so the folder's owner is the only one
+        // assigned there (the administrator, a member of the site's Owners group as its
+        // creator, stays owner of everything as an administrator).
+        let site = self.records.node(folder.id).await.unwrap().unwrap().site;
+        let groups = self.records.groups_visible_to(admin).await.unwrap();
+        for group in groups.iter().filter(|g| g.site == Some(site)) {
+            self.records
+                .set_node_access(admin, folder.id, Principal::Group(group.id), None)
+                .await
+                .unwrap();
+        }
         places.homes.insert(user.id, folder.id);
         folder.id
     }

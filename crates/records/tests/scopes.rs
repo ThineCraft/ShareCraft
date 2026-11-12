@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use collab_core::ids::{NodeId, UserId};
 use common::{
     Role, Tree, changed, delete, document_in, gate, grant, new_id, node_events, put, role_of, site,
-    tree, user, wait_blocked,
+    tree, user, wait_blocked, without_groups,
 };
 use records::test_support::TestDb;
 use records::{AccessError, Cursor, NodeKind, Perms, Principal};
@@ -242,6 +242,8 @@ async fn last_owner_kept_per_scope() {
     let ann = user(&test, "Ann", false).await;
     let pat = user(&test, "Pat", false).await;
     let t = tree(&test, ann.id).await;
+    // Only people assigned on the site: its Owners group would also count as a manager.
+    without_groups(&test, t.site).await;
     assert_eq!(
         test.db
             .set_node_access(ann.id, t.site, Principal::User(ann.id), None)
@@ -841,7 +843,8 @@ async fn break_cost_does_not_grow_with_descendants() {
                 .unwrap();
         written.push(rows);
     }
-    let copied = 3;
+    // The people assigned on the site and its three groups.
+    let copied = 6;
     assert_eq!(
         written[0],
         vec![

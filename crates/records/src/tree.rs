@@ -9,8 +9,11 @@ use uuid::Uuid;
 
 use crate::documents::UNIQUE_VIOLATION;
 use crate::events::{NewEvent, record};
+use crate::groups::{
+    add_site_owner, all_locked, ensure_site_groups, groups_judged_by, lock_groups,
+};
 use crate::roles::lock_roles;
-use crate::scopes::{LOCK_ATTEMPTS, access_in, judged_roles, lock_segment};
+use crate::scopes::{LOCK_ATTEMPTS, access_in, judged_roles, lock_segment, scopes_of, segment};
 use crate::{AccessError, Db, DbError, Editor, Perms};
 
 const MAX_NAME_CHARS: usize = 120;
@@ -127,18 +130,21 @@ pub struct NodeChange<'a> {
     pub needs_admin: bool,
     /// Nodes `actor` must hold the given permissions on. Each node's chain, from the scope
     /// that decides its access down to it, is locked in this order (the node itself
-    /// `FOR UPDATE` if it is one of `rows`, everything else `FOR SHARE`), then the roles giving
-    /// the access, before it is judged: list ancestors before descendants, as access changes
-    /// lock them.
+    /// `FOR UPDATE` if it is one of `rows`, everything else `FOR SHARE`), then the groups and
+    /// the roles giving the access, before it is judged: list ancestors before descendants, as
+    /// access changes lock them.
     pub needs: &'a [(NodeId, Perms)],
-    /// Gives `actor` an owner assignment on the first row's node (a new site).
-    pub owner: bool,
+    /// The first row's node is a new site: makes this person (its creator) a member of its
+    /// Owners group. Every site row gets its three groups, with their assignments, in the same
+    /// transaction, whether or not this is given.
+    pub site_groups: Option<UserId>,
     /// Records the first row's node as a new document opened in this editor, created by
     /// `actor`.
     pub document: Option<Editor>,
 }
 
-/// Inserts or updates `row`, and for a document node the name of its `documents` row.
+/// Inserts or updates `row`, and for a document node the name of its `documents` row. A site
+/// gets the groups it does not have yet (see [`ensure_site_groups`]).
 pub(crate) async fn upsert_node(conn: &mut PgConnection, row: &NodeRow) -> Result<(), AccessError> {
     let result = sqlx::query(
         "insert into nodes \
@@ -169,6 +175,9 @@ pub(crate) async fn upsert_node(conn: &mut PgConnection, row: &NodeRow) -> Resul
         }
         Err(e) => return Err(e.into()),
     }
+    if row.kind == NodeKind::Site {
+        ensure_site_groups(&mut *conn, row.id).await?;
+    }
     if row.kind == NodeKind::Document {
         sqlx::query("update documents set name = $2 where id = $1")
             .bind(row.id.0)
@@ -181,11 +190,12 @@ pub(crate) async fn upsert_node(conn: &mut PgConnection, row: &NodeRow) -> Resul
 
 /// Locks what `change` needs and judges its actor's access. Each needed node's chain is locked
 /// from its source scope down, as access changes lock it (ancestors `FOR SHARE`, a node the
-/// change writes `FOR UPDATE`), in `needs` order; then the roles giving that access, by id,
-/// `FOR SHARE`; then the access is worked out again and judged. So an assignment changed
-/// anywhere above a needed node, or a role changed that gives the access, either waits for this
-/// change or is seen by it. Returns `false` if a chain moved while it was being locked: the
-/// caller starts over.
+/// change writes `FOR UPDATE`), in `needs` order; then the groups the actor is a member of that
+/// are assigned on those chains' scopes, by id, `FOR SHARE`; then the roles giving that access,
+/// by id, `FOR SHARE`; then the access is worked out again and judged. So an assignment changed
+/// anywhere above a needed node, a membership ended of a group giving the access, or a role
+/// changed that gives it, either waits for this change or is seen by it. Returns `false` if a
+/// chain or the groups moved while they were being locked: the caller starts over.
 async fn judge(conn: &mut PgConnection, change: &NodeChange<'_>) -> Result<bool, AccessError> {
     if !change.needs_admin && change.needs.is_empty() {
         return Ok(true);
@@ -203,14 +213,24 @@ async fn judge(conn: &mut PgConnection, change: &NodeChange<'_>) -> Result<bool,
         }
     }
     let mut involved = Vec::new();
+    let mut scopes = Vec::new();
     for (id, _) in change.needs {
         let written = change.rows.iter().any(|row| row.id == *id);
         let Some(links) = lock_segment(&mut *conn, actor, *id, false, written).await? else {
             return Ok(false);
         };
+        scopes.extend(scopes_of(&segment(&links, false)));
         involved.extend(judged_roles(&links));
     }
+    let judged = groups_judged_by(&mut *conn, actor, &scopes).await?;
+    lock_groups(&mut *conn, judged.iter().copied(), None).await?;
     lock_roles(&mut *conn, involved).await?;
+    if !all_locked(
+        &groups_judged_by(&mut *conn, actor, &scopes).await?,
+        &judged,
+    ) {
+        return Ok(false);
+    }
     // Every chain and role is locked now, so none of this access can change before the commit.
     for (id, needed) in change.needs {
         match access_in(&mut *conn, actor, *id).await? {
@@ -247,7 +267,8 @@ impl Db {
     /// actor no longer has access to a node it needs, `Forbidden` if it lacks a permission or
     /// they are no longer an enabled administrator when that is needed), records the new
     /// document if any (`Exists` if its id is taken), applies each row as
-    /// [`Db::apply_node`] does, gives the owner assignment if asked, and writes the events.
+    /// [`Db::apply_node`] does (a site row gets its three groups), makes the new site's creator a
+    /// member of its Owners group if asked, and writes the events.
     ///
     /// A database failure before the change was judged allowed (the connection lost while
     /// locking, or the tree changing on every attempt) is `Unjudged`: nothing was written, and
@@ -278,19 +299,8 @@ impl Db {
         for row in change.rows {
             upsert_node(&mut tx, row).await?;
         }
-        if let (true, Some(actor), Some(first)) = (change.owner, change.actor, change.rows.first())
-        {
-            sqlx::query(
-                "insert into assignments \
-                     (node_id, principal_kind, principal_id, role_id, granted_by) \
-                 values ($1, 'user', $2, 'owner', $2) \
-                 on conflict (node_id, principal_kind, principal_id) \
-                 do update set role_id = 'owner'",
-            )
-            .bind(first.id.0)
-            .bind(actor.0)
-            .execute(&mut *tx)
-            .await?;
+        if let (Some(creator), Some(first)) = (change.site_groups, change.rows.first()) {
+            add_site_owner(&mut tx, first.id, creator, change.actor).await?;
         }
         for event in change.events {
             record(&mut tx, event).await?;

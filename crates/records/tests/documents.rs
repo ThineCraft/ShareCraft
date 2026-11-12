@@ -8,7 +8,7 @@
 mod common;
 
 use collab_core::ids::{DocId, UserId};
-use common::{Role, changed, document_in, new_id, put, role_of, site, user};
+use common::{Role, changed, document_in, new_id, put, role_of, site, user, without_groups};
 use records::test_support::TestDb;
 use records::{AccessError, Editor, NodeKind, Perms, Principal, RoleDef};
 use serde_json::json;
@@ -18,9 +18,11 @@ fn doc_id() -> DocId {
     DocId(Uuid::new_v4())
 }
 
-/// A text document "Notes" in the library of a new site that `owner` owns.
+/// A text document "Notes" in the library of a new site that `owner` owns, as its only
+/// manager: the site's groups are not assigned there, as in plan 1.
 async fn document(test: &TestDb, owner: UserId) -> DocId {
     let site = site(test, "Site", Some(owner)).await;
+    without_groups(test, site).await;
     let library = put(
         test,
         new_id(),

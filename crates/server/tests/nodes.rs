@@ -92,6 +92,20 @@ async fn world() -> World {
 }
 
 impl World {
+    /// The groups of the site, as the administrator sees them.
+    async fn site_groups(&self) -> Vec<records::Group> {
+        let site = uuid::Uuid::parse_str(&self.site).unwrap();
+        self.server
+            .db
+            .db
+            .groups_visible_to(self.root.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|g| g.site.map(|s| s.0) == Some(site))
+            .collect()
+    }
+
     async fn call(
         &self,
         user: &TestUser,
@@ -855,9 +869,24 @@ async fn access_is_seen_and_changed_by_owners_on_any_node() {
         .iter()
         .map(|g| g["user"]["email"].as_str().unwrap().to_owned())
         .collect();
+    // The site's creator owns it as a member of its Owners group, not by a grant of their own.
+    assert_eq!(emails, HashSet::from([ed.email.clone()]));
+    let groups = w.site_groups().await;
+    let owners = groups
+        .iter()
+        .find(|g| g.purpose == Some(records::SiteGroup::Owners))
+        .unwrap();
+    let (_, members) = w
+        .server
+        .db
+        .db
+        .group(w.root.id, owners.id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
-        emails,
-        HashSet::from([w.root.email.clone(), ed.email.clone()])
+        members.iter().map(|u| u.id).collect::<Vec<_>>(),
+        [w.root.id]
     );
 
     // Granting on the folder breaks its inheritance.
@@ -865,7 +894,7 @@ async fn access_is_seen_and_changed_by_owners_on_any_node() {
     let (_, access) = w.call(&ann, Method::GET, &path, None).await;
     assert_eq!(access["inherits"], false);
     assert_eq!(access["source"]["id"], folder.as_str());
-    assert_eq!(access["grants"].as_array().unwrap().len(), 3);
+    assert_eq!(access["grants"].as_array().unwrap().len(), 2);
 
     // Editors cannot see or change it; others cannot find it.
     let forbidden = (StatusCode::FORBIDDEN, error("forbidden"));
@@ -896,20 +925,21 @@ async fn access_is_seen_and_changed_by_owners_on_any_node() {
         (StatusCode::NOT_FOUND, error("no_such_user"))
     );
 
-    // Removing an assignment; the last owner stays.
+    // Removing an assignment; the last owner stays. The copies of the site's groups go too
+    // (through the records: until the API speaks of groups, it names people only).
     let (status, _) = w
         .call(&ann, Method::DELETE, &format!("{path}/{}", ed.id.0), None)
         .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
-    let (status, _) = w
-        .call(
-            &ann,
-            Method::DELETE,
-            &format!("{path}/{}", w.root.id.0),
-            None,
-        )
-        .await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
+    let folder_id = collab_core::ids::NodeId(uuid::Uuid::parse_str(&folder).unwrap());
+    for group in &groups {
+        w.server
+            .db
+            .db
+            .set_node_access(ann.id, folder_id, records::Principal::Group(group.id), None)
+            .await
+            .unwrap();
+    }
     assert_eq!(
         w.call(&ann, Method::DELETE, &format!("{path}/{}", ann.id.0), None)
             .await,

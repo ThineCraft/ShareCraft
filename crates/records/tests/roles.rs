@@ -8,7 +8,10 @@
 mod common;
 
 use collab_core::ids::{NodeId, UserId};
-use common::{Role, changed, grant, new_id, put, role_gate, role_of, tree, user, wait_blocked};
+use common::{
+    Role, changed, grant, new_id, put, raw_node, role_gate, role_of, tree, user, wait_blocked,
+    without_groups,
+};
 use records::test_support::TestDb;
 use records::{
     Access, AccessError, Db, NodeChange, NodeKind, NodeRow, Perms, Principal, RoleDef, RoleRef,
@@ -502,6 +505,8 @@ async fn last_manager_kept_per_scope() {
     let gus = user(&test, "Gus", false).await;
     let cy = user(&test, "Cy", false).await;
     let t = tree(&test, ann.id).await;
+    // Only people assigned on the site: its Owners group would also count as a manager.
+    without_groups(&test, t.site).await;
     let keeper = test
         .db
         .create_role(root.id, "Gatekeeper", gatekeeper())
@@ -831,23 +836,34 @@ async fn listings_follow_assignments() {
 
 #[tokio::test]
 async fn upgrade_copies_scope_access() {
-    // A database as plan 1 left it: migrated up to its last migration, with grants.
+    // A database as plan 1 left it: migrated up to its last migration, with grants. Its nodes
+    // are written directly: this code needs tables plan 1 did not have.
     let test = TestDb::create_at(Some(3)).await;
     let ann = user(&test, "Ann", false).await;
     let vic = user(&test, "Vic", false).await;
     let wes = user(&test, "Wes", false).await;
     let site = new_id();
-    put(&test, site, NodeKind::Site, None, site, "Site").await;
-    let library = put(
+    raw_node(&test, site, NodeKind::Site, None, site, "Site", false).await;
+    let library = raw_node(
         &test,
         new_id(),
         NodeKind::Library,
         Some(site),
         site,
         "Documents",
+        false,
     )
     .await;
-    let folder = put(&test, new_id(), NodeKind::Folder, Some(library), site, "A").await;
+    let folder = raw_node(
+        &test,
+        new_id(),
+        NodeKind::Folder,
+        Some(library),
+        site,
+        "A",
+        false,
+    )
+    .await;
     sqlx::query("update nodes set unique_scope = true where id = $1")
         .bind(folder.0)
         .execute(test.db.test_pool())
@@ -873,7 +889,8 @@ async fn upgrade_copies_scope_access() {
         .unwrap();
     }
 
-    test.db.migrate().await.unwrap();
+    // This migration only: the next moves site grants into the site's groups.
+    test.db.migrate_to(4).await.unwrap();
 
     let copied: Vec<(
         uuid::Uuid,
@@ -916,7 +933,8 @@ async fn upgrade_copies_scope_access() {
         .await
         .unwrap();
     assert_eq!(old, None);
-    // Everyone keeps the access they had.
+    // Everyone keeps the access they had, after every later migration too.
+    test.db.migrate().await.unwrap();
     let file = put(&test, new_id(), NodeKind::Document, Some(folder), site, "f").await;
     assert_eq!(
         role_of(access(&test, ann.id, file).await),
@@ -942,6 +960,8 @@ async fn role_change_keeps_a_manager_per_scope() {
     let gus = user(&test, "Gus", false).await;
     let cy = user(&test, "Cy", false).await;
     let t = tree(&test, ann.id).await;
+    // Only people assigned on the site: its Owners group would also count as a manager.
+    without_groups(&test, t.site).await;
     let keeper = test
         .db
         .create_role(root.id, "Gatekeeper", gatekeeper())

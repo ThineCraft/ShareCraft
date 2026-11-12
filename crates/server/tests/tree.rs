@@ -16,7 +16,8 @@ use std::time::Duration;
 use collab_core::ids::{DocId, NodeId, UserId};
 use records::test_support::TestDb;
 use records::{
-    Access, AccessError, Db, Document, Editor, NewUser, Node, NodeKind, Principal, User,
+    Access, AccessError, Db, Document, Editor, Group, NewUser, Node, NodeKind, Principal,
+    SiteGroup, User,
 };
 use revisions::{
     Author, Checkpoint, CheckpointError, GitError, Outcome, RevisionId, RevisionInfo,
@@ -327,6 +328,17 @@ fn config(data_dir: &Path, db: &TestDb) -> Config {
     }
 }
 
+/// The groups of `site`, as the administrator `admin` sees them.
+async fn site_groups(env: &Env, admin: &User, site: NodeId) -> Vec<Group> {
+    env.db()
+        .groups_visible_to(admin.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|g| g.site == Some(site))
+        .collect()
+}
+
 #[tokio::test]
 async fn create_site_makes_documents_library_and_owner() {
     let env = Env::new().await;
@@ -343,10 +355,18 @@ async fn create_site_makes_documents_library_and_owner() {
     assert_eq!(lib.site, site);
     assert!(!lib.unique_scope);
 
+    // The creator owns the site as the one member of its Owners group, which the site's
+    // transaction made with its Members and Visitors groups; nobody has a grant of their own.
     let access = env.db().access(admin.id, site).await.unwrap();
-    assert_eq!(access.grants.len(), 1);
-    assert_eq!(access.grants[0].user.id, admin.id);
-    assert_eq!(access.grants[0].role.id, Role::Owner.id());
+    assert!(access.grants.is_empty());
+    let groups = site_groups(&env, &admin, site).await;
+    assert_eq!(groups.len(), 3);
+    let owners = groups
+        .iter()
+        .find(|g| g.purpose == Some(SiteGroup::Owners))
+        .unwrap();
+    let (_, members) = env.db().group(admin.id, owners.id).await.unwrap().unwrap();
+    assert_eq!(members.iter().map(|u| u.id).collect::<Vec<_>>(), [admin.id]);
 
     // One commit holds both records.
     assert_eq!(env.commits(), 1);
@@ -1026,19 +1046,23 @@ async fn adopt_moves_documents_and_grants() {
             .unique_scope
     );
 
-    // Every enabled administrator owns the site.
-    let owners: Vec<UserId> = env
-        .db()
-        .access(admin.id, site)
-        .await
-        .unwrap()
-        .grants
-        .into_iter()
-        .filter(|g| g.role.id == Role::Owner.id())
-        .map(|g| g.user.id)
-        .collect();
-    assert_eq!(owners.len(), 2);
-    assert!(owners.contains(&admin.id) && owners.contains(&second.id));
+    // The site has its three groups, with nobody in them and nobody assigned on it: enabled
+    // administrators (who have every permission everywhere) fill them.
+    assert!(
+        env.db()
+            .access(admin.id, site)
+            .await
+            .unwrap()
+            .grants
+            .is_empty()
+    );
+    let groups = site_groups(&env, &admin, site).await;
+    assert_eq!(groups.len(), 3);
+    assert!(groups.iter().all(|g| g.member_count == 0));
+    assert_eq!(
+        Role::of(env.db().effective_access(second.id, site).await.unwrap()),
+        Some(Role::Owner)
+    );
 
     let events = env.events("tree.adopted").await;
     assert_eq!(events.len(), 1);
@@ -1147,12 +1171,15 @@ async fn adopt_after_crash_between_git_and_database() {
         Some(Role::Editor)
     );
     assert_eq!(env.db().doc_access(bob.id, second).await.unwrap(), None);
-    let owners = env.db().access(admin.id, site).await.unwrap().grants;
-    assert_eq!(owners.len(), 1);
-    assert_eq!(
-        (owners[0].user.id, owners[0].role.id.as_str()),
-        (admin.id, Role::Owner.id())
+    assert!(
+        env.db()
+            .access(admin.id, site)
+            .await
+            .unwrap()
+            .grants
+            .is_empty()
     );
+    assert_eq!(site_groups(&env, &admin, site).await.len(), 3);
     assert_eq!(env.adopt().await.unwrap(), None);
     env.assert_agree().await;
 

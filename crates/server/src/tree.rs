@@ -106,7 +106,7 @@ impl fmt::Display for TreeReport {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Adopted {
     /// The Home site the documents are in; `None` if there is none (the run only moved grants
-    /// or gave owners to sites that had none).
+    /// or gave groups to sites that had none).
     pub site: Option<NodeId>,
     /// The Home site's Documents library; `None` as for `site`.
     pub library: Option<NodeId>,
@@ -150,7 +150,8 @@ struct Plan {
     undo: Vec<TreeRecord>,
     needs_admin: bool,
     needs: Vec<(NodeId, Perms)>,
-    owner: bool,
+    /// A new site: its creator becomes a member of its Owners group.
+    site_groups: bool,
     document: Option<Editor>,
     events: Vec<NewEvent>,
 }
@@ -255,7 +256,7 @@ pub async fn create_document(
         records: vec![record],
         needs_admin: false,
         needs: vec![(parent, Perms::ADD)],
-        owner: false,
+        site_groups: false,
         document: Some(editor),
         events: vec![NewEvent {
             kind: "document.created",
@@ -323,15 +324,16 @@ pub async fn reconcile(store: Arc<dyn Checkpointer>, db: &Db) -> Result<TreeRepo
 
 /// Places the documents recorded before the content tree into it, and moves their grants onto
 /// it. Runs only when a document has no node, a grant is still in `document_access`, or a site
-/// has no owner; otherwise returns `None`.
+/// lacks its three groups; otherwise returns `None`.
 ///
 /// Documents without a node go into the Documents library of the Home site, both created (by
 /// "ShareCraft", in the same commit as the documents' records) unless an earlier adoption made
 /// them. A refused character in a name becomes `_`; a name already used in the library gets
 /// ` (2)`, ` (3)` … before its extension; the `documents` row takes the new name. Then, in one
-/// transaction, the nodes are written, every enabled administrator becomes owner of the site
-/// (and of any site with no owner), every document with grants of its own becomes a scope with
-/// those grants, and one `tree.adopted` event records the counts.
+/// transaction, the nodes are written, every site lacking its groups gets them (with no
+/// members: administrators, who have every permission, fill them), every document with grants
+/// of its own becomes a scope with those grants, and one `tree.adopted` event records the
+/// counts.
 ///
 /// If the commit was written and the transaction was not, the next start's [`reconcile`]
 /// writes the nodes and this moves the grants.
@@ -517,7 +519,7 @@ async fn commit(state: &AppState, actor: &User, plan: Plan) -> Result<(), Access
             actor: Some(actor.id),
             needs_admin: plan.needs_admin,
             needs: &plan.needs,
-            owner: plan.owner,
+            site_groups: plan.site_groups.then_some(actor.id),
             document: plan.document,
         })
         .await;
@@ -748,7 +750,7 @@ async fn plan_create(
             undo,
             needs_admin: true,
             needs: Vec::new(),
-            owner: true,
+            site_groups: true,
             document: None,
             events,
         }));
@@ -788,7 +790,7 @@ async fn plan_create(
         records: vec![record],
         needs_admin: false,
         needs: vec![(parent, needed)],
-        owner: false,
+        site_groups: false,
         document: None,
     }))
 }
@@ -841,7 +843,7 @@ async fn plan_rename(
         undo: vec![before],
         needs_admin: false,
         needs: vec![(id, needed)],
-        owner: false,
+        site_groups: false,
         document: None,
     }))
 }
@@ -909,7 +911,7 @@ async fn plan_move(
         undo,
         needs_admin: false,
         needs: vec![(destination, Perms::ADD), (id, Perms::EDIT)],
-        owner: false,
+        site_groups: false,
         document: None,
     }))
 }
@@ -943,7 +945,7 @@ async fn plan_delete(state: &AppState, actor: &User, id: NodeId) -> Result<Plan,
         undo: vec![before],
         needs_admin: false,
         needs: vec![(id, Perms::DELETE)],
-        owner: false,
+        site_groups: false,
         document: None,
     })
 }
