@@ -4,7 +4,9 @@ import {
   messageFor,
   pageFor,
   queryId,
+  can,
   requireMe,
+  roleLine,
   seg,
   setupTopbar,
   showCrumbs,
@@ -25,10 +27,17 @@ if (!here) fail(MISSING);
 const site = here.path[here.path.length - 1];
 $('title').textContent = site.name;
 document.title = `${site.name} — ShareCraft`;
-$('role').textContent = here.role ? `Your role: ${here.role}` : 'Limited access: you can open only what was shared with you.';
-const owner = here.role === 'owner';
-$('owner-tools').hidden = !owner;
+$('role').textContent = roleLine(here.access);
+const manageSite = can(here.access, 'manage_site');
+const manageAccess = can(here.access, 'manage_access');
+$('new-library').hidden = !manageSite;
+$('groups-link').hidden = !manageSite;
+$('access-link').hidden = !manageAccess;
+$('explorer-link').hidden = !manageAccess;
+$('site-tools').hidden = !(manageSite || manageAccess);
 $('access-link').href = `/access.html?id=${seg(siteId)}`;
+$('explorer-link').href = `/explorer.html?root=${seg(siteId)}`;
+$('groups-link').href = `/groups.html?site=${seg(siteId)}`;
 
 $('new-library').addEventListener('submit', async (event) => {
   event.preventDefault();
@@ -57,7 +66,7 @@ async function showLibraries() {
         'li',
         {},
         h('span', { class: 'grow' }, h('a', { href: pageFor('library', library.id) }, library.name)),
-        library.role ? h('small', {}, `Your role: ${library.role}`) : h('small', { class: 'mark' }, 'Limited access'),
+        library.access ? h('small', {}, roleLine(library.access)) : h('small', { class: 'mark' }, 'Limited access'),
         library.inherits ? null : h('small', { class: 'mark' }, 'Own permissions'),
       ),
     ),

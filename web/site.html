@@ -20,8 +20,8 @@
  <h1 id="title">Site</h1>
  <p id="role" class="kind"></p>
  <p id="error" role="alert" class="msg"></p>
- <div id="owner-tools" class="toolbar" hidden>
-  <form id="new-library" class="row">
+ <div id="site-tools" class="toolbar" hidden>
+  <form id="new-library" class="row" hidden>
    <div class="field">
     <label for="library-name">New library</label>
     <input type="text" id="library-name" maxlength="120" autocomplete="off" required>
@@ -29,6 +29,8 @@
    <button type="submit">New library</button>
   </form>
   <a id="access-link" class="button plain" href="#">Site access</a>
+  <a id="explorer-link" class="button plain" href="#">Inheritance explorer</a>
+  <a id="groups-link" class="button plain" href="#">Groups</a>
  </div>
  <h2>Libraries</h2>
  <ul id="libraries" class="list"></ul>

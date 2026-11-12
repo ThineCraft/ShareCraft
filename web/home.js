@@ -1,4 +1,4 @@
-import { api, h, messageFor, pageFor, requireMe, setupTopbar, showMessage } from './common.js';
+import { api, h, messageFor, pageFor, requireMe, roleLine, setupTopbar, showMessage } from './common.js';
 
 const $ = (id) => document.getElementById(id);
 const error = $('error');
@@ -33,8 +33,8 @@ if (!result.ok) {
         'li',
         {},
         h('span', { class: 'grow' }, h('a', { href: pageFor('site', site.id) }, site.name)),
-        site.role
-          ? h('small', {}, `Your role: ${site.role}`)
+        site.access
+          ? h('small', {}, roleLine(site.access))
           : h('small', { class: 'mark' }, 'Limited access'),
       ),
     ),

@@ -18,12 +18,14 @@ import {
 import {
   MISSING_DOCUMENT,
   api,
+  can,
   goToSignIn,
   h,
   messageFor,
   pageFor,
   removedMessage,
   requireMe,
+  roleLine,
   seg,
   showCrumbs,
   showProblemWithFolder,
@@ -57,7 +59,7 @@ const editorArea = $('editor-area');
 const clientId = crypto.randomUUID(); // this page load's connection
 let me = null;
 let docId = '';
-let doc = null;             // { id, name, editor, role, revision } from the server
+let doc = null;             // { id, name, editor, access, revision } from the server
 let folder = null;          // the step above the file in its breadcrumb, where closing goes
 let socket = null;
 let joined = false;         // the server answered the join on the current socket
@@ -128,7 +130,7 @@ async function main() {
   await showPlace();
   knownRevision = doc.revision ?? null;
   showDetail();
-  setRole(doc.role);
+  setRole(doc.access);
   showDownload();
 
   const editors = await api('GET', '/editors');
@@ -165,7 +167,7 @@ function editorName() {
 
 function showDetail() {
   $('title').textContent = doc.name;
-  $('docline').textContent = `${editorName()} · Your role: ${doc.role}`;
+  $('docline').textContent = `${editorName()} · ${roleLine(doc.access)}`;
   document.title = `${doc.name} — ShareCraft`;
 }
 
@@ -181,9 +183,9 @@ async function showPlace() {
   }
 }
 
-// Owners get the Access link; everyone else does not.
-function setRole(role) {
-  accessLink.hidden = removed || role !== 'owner';
+// Those who manage access get the Access link; everyone else does not.
+function setRole(access) {
+  accessLink.hidden = removed || !can(access, 'manage_access');
   accessLink.href = `/access.html?id=${seg(docId)}`;
 }
 
@@ -226,7 +228,7 @@ function stopRemoved(reason) {
   bridge = null;
   frame?.remove();
   frame = null;
-  setRole('');
+  setRole(null);
   saveButton.hidden = true;
   showDownload();
   $('title').textContent = 'Document';
@@ -406,9 +408,9 @@ async function refreshRole() {
   const result = await api('GET', `/docs/${seg(docId)}`); // 401 goes to the sign-in page
   if (check !== roleCheck || removed) return;
   if (result.ok) {
-    doc = { ...doc, name: result.data.name, role: result.data.role };
+    doc = { ...doc, name: result.data.name, access: result.data.access };
     showDetail();
-    setRole(doc.role);
+    setRole(doc.access);
   } else if (result.status === 404) {
     stopRemoved('missing');
   }

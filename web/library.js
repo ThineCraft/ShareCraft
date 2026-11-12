@@ -5,16 +5,18 @@
 import { EDITORS, withExtension } from './editor-host.js';
 import {
   api,
-  canEdit,
+  can,
   canMoveHere,
   formatTime,
   goToSignIn,
   h,
+  itemActions,
   messageFor,
   moveChoices,
   pageFor,
   queryId,
   requireMe,
+  roleLine,
   seg,
   setupTopbar,
   showCrumbs,
@@ -42,9 +44,10 @@ $('title').textContent = self.name;
 document.title = `${self.name} — ShareCraft`;
 $('kind').textContent =
   (self.kind === 'library' ? 'Library' : 'Folder') +
-  (here.role ? ` · Your role: ${here.role}` : ' · Limited access');
-$('edit-tools').hidden = !canEdit(here.role);
-$('top-tools').hidden = here.role !== 'owner';
+  (here.access ? ` · ${roleLine(here.access)}` : ' · Limited access');
+$('edit-tools').hidden = !can(here.access, 'add');
+$('top-tools').hidden = !can(here.access, 'manage_access');
+$('explorer-link').href = `/explorer.html?root=${seg(nodeId)}`;
 $('access-link').href = `/access.html?id=${seg(nodeId)}`;
 showSiteNav($('sitenav'), here.path[0].id, here.path.find((step) => step.kind === 'library')?.id);
 
@@ -88,12 +91,11 @@ function kindLabel(item) {
 
 function row(item) {
   const buttons = [];
-  const editable = canEdit(item.role) && item.kind !== 'library';
-  const renamable = item.kind === 'library' ? item.role === 'owner' : editable;
-  if (renamable) buttons.push(action('Rename', item, askRename));
-  if (editable) buttons.push(action('Move…', item, askMove));
-  if (editable) buttons.push(action('Delete', item, askDelete));
-  if (item.role === 'owner') {
+  const allowed = itemActions(item);
+  if (allowed.rename) buttons.push(action('Rename', item, askRename));
+  if (allowed.move) buttons.push(action('Move…', item, askMove));
+  if (allowed.remove) buttons.push(action('Delete', item, askDelete));
+  if (allowed.access) {
     buttons.push(
       h(
         'a',
@@ -118,7 +120,7 @@ function row(item) {
     h('span', { class: 'grow' }, h('a', { href: pageFor(item.kind, item.id, item.editor) }, item.name)),
     h('small', {}, kindLabel(item)),
     saved && h('small', {}, saved),
-    item.role ? null : h('small', { class: 'mark' }, 'Limited access'),
+    item.access ? null : h('small', { class: 'mark' }, 'Limited access'),
     item.inherits || item.kind === 'library' ? null : h('small', { class: 'mark' }, 'Own permissions'),
     buttons.length ? h('span', { class: 'actions' }, ...buttons) : null,
   );
@@ -288,7 +290,7 @@ $('move-cancel').addEventListener('click', () => moveDialog.close());
 
 function askMove(item) {
   moving = item;
-  trail = here.path.map(({ id, kind, name, role }) => ({ id, kind, name, role }));
+  trail = here.path.map(({ id, kind, name, access }) => ({ id, kind, name, access }));
   $('move-title').textContent = `Move “${item.name}”`;
   showMessage($('move-error'), '');
   moveDialog.showModal();
@@ -327,7 +329,7 @@ async function browse() {
       const open = h('button', { type: 'button', class: 'plain' }, choice.name);
       open.addEventListener('click', () => {
         trail = trail.concat([
-          { id: choice.id, kind: choice.kind, name: choice.name, role: choice.role },
+          { id: choice.id, kind: choice.kind, name: choice.name, access: choice.access },
         ]);
         browse();
       });
@@ -337,7 +339,7 @@ async function browse() {
         {},
         h('span', { class: 'grow' }, open),
         h('small', {}, label),
-        choice.role || choice.kind === 'site' ? null : h('small', { class: 'mark' }, 'Limited access'),
+        choice.access || choice.kind === 'site' ? null : h('small', { class: 'mark' }, 'Limited access'),
       );
     }),
   );

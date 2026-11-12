@@ -2,8 +2,22 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   breadcrumbParts,
+  breaksBelow,
+  exceptionTree,
   breadcrumbs,
   canMoveHere,
+  explorerQuery,
+  explorerRows,
+  groupLabel,
+  itemActions,
+  permsText,
+  previewSections,
+  principalParts,
+  principalText,
+  roleLine,
+  rolesText,
+  toggleOpen,
+  visibleTree,
   inheritAgainMessage,
   messageFor,
   moveChoices,
@@ -193,4 +207,167 @@ test('the move dialog never lets the item go into itself or below itself', () =>
   const editOnly = { perms: ['view', 'edit'], roles: [{ id: 'x', name: 'Edit only' }] };
   assert.equal(canMoveHere([site, { ...lib, access: editOnly }], DIR, FILE), false, 'needs add');
   assert.equal(canMoveHere([], DIR, FILE), false);
+});
+
+test('the new error codes have their own sentences', () => {
+  const general = messageFor('something_nobody_made_up');
+  for (const code of ['role_in_use', 'builtin_role', 'group_in_use', 'last_manager', 'site_group']) {
+    assert.notEqual(messageFor(code), general, code);
+  }
+  assert.equal(messageFor('beyond_your_access'), 'You can only give access you have yourself.');
+});
+
+test('permissions and roles read as words', () => {
+  assert.equal(permsText([]), 'none');
+  assert.equal(permsText(['view']), 'view');
+  assert.equal(permsText(['edit', 'view', 'manage_access']), 'view, edit, manage access');
+  assert.equal(rolesText(OWNER), 'Owner');
+  assert.equal(
+    rolesText({ perms: ['view'], roles: [{ id: 'a', name: 'Auditor' }, { id: 'viewer', name: 'Viewer' }] }),
+    'Auditor, Viewer',
+  );
+  assert.equal(roleLine(EDITOR), 'Your role: Editor');
+  assert.match(roleLine(null), /^Limited access/);
+});
+
+test('people and groups are named without guessing', () => {
+  const person = { kind: 'user', id: 'u', name: 'Ann', email: 'ann@example.com' };
+  assert.deepEqual(principalParts(person), { name: 'Ann', note: 'ann@example.com', hidden: false });
+  const siteGroup = { kind: 'group', id: 'g', name: 'Site Owners', site: { id: SITE, name: 'Sales' } };
+  assert.equal(principalText(siteGroup), 'Site Owners (site: Sales)');
+  const orgGroup = { kind: 'group', id: 'g2', name: 'Site Owners', site: null };
+  assert.equal(principalText(orgGroup), 'Site Owners (organisation group)');
+  assert.notEqual(principalText(siteGroup), principalText(orgGroup));
+  const hidden = { kind: 'group', id: 'g3', name: null, hidden: true };
+  assert.equal(principalText(hidden), 'A group you cannot see');
+  assert.equal(principalParts(hidden).hidden, true);
+  assert.equal(groupLabel({ name: 'Staff', site: null }), 'Staff (organisation group)');
+});
+
+test('each item offers only the actions its access allows', () => {
+  const none = { rename: false, move: false, remove: false, access: false };
+  assert.deepEqual(itemActions({ kind: 'folder', access: VIEWER }), none);
+  assert.deepEqual(itemActions({ kind: 'folder', access: null }), none);
+  assert.deepEqual(itemActions({ kind: 'folder', access: EDITOR }), {
+    rename: true, move: true, remove: true, access: false,
+  });
+  assert.equal(itemActions({ kind: 'folder', access: OWNER }).access, true);
+  const renameOnly = { perms: ['view', 'edit'], roles: [{ id: 'x', name: 'X' }] };
+  assert.deepEqual(itemActions({ kind: 'document', access: renameOnly }), {
+    rename: true, move: true, remove: false, access: false,
+  });
+  // A library is renamed with manage_site and never moved or deleted here.
+  assert.deepEqual(itemActions({ kind: 'library', access: EDITOR }), none);
+  assert.deepEqual(itemActions({ kind: 'library', access: OWNER }), {
+    rename: true, move: false, remove: false, access: true,
+  });
+});
+
+const child = (id, kind, inherits, access = OWNER) => ({ id, kind, name: id, inherits, access });
+
+test('explorer rows show only what the viewer manages, with break counts', () => {
+  const items = [
+    child('a', 'folder', true),
+    child('b', 'folder', false),
+    child('c', 'folder', true, EDITOR),
+    child('d', 'folder', true, null),
+    child('e', 'document', true),
+  ];
+  const counts = new Map([['a', 2]]);
+  const rows = explorerRows(items, counts, { onlyExceptions: false });
+  assert.deepEqual(rows.map((r) => r.id), ['a', 'b', 'e']);
+  assert.deepEqual(rows.map((r) => r.unique), [false, true, false]);
+  assert.deepEqual(rows.map((r) => r.count), [2, 0, 0]);
+  assert.deepEqual(rows.map((r) => r.expandable), [true, true, false]);
+  const only = explorerRows(items, counts, { onlyExceptions: true });
+  assert.deepEqual(only.map((r) => r.id), ['a', 'b'], 'the paths to breaks, and the breaks');
+});
+
+test('the visible tree follows what is open and loaded', () => {
+  const root = { id: 'r', kind: 'site', name: 'r', unique: true, count: 3, expandable: true };
+  const a = { id: 'a', kind: 'library', name: 'a', unique: false, count: 1, expandable: true };
+  const b = { id: 'b', kind: 'folder', name: 'b', unique: true, count: 0, expandable: true };
+  const loaded = new Map([['r', [a]], ['a', [b]]]);
+  assert.deepEqual(visibleTree(root, loaded, new Set()).map((n) => n.row.id), ['r']);
+  let open = toggleOpen(new Set(), 'r');
+  assert.deepEqual(visibleTree(root, loaded, open).map((n) => [n.row.id, n.depth]), [['r', 0], ['a', 1]]);
+  open = toggleOpen(open, 'a');
+  assert.deepEqual(visibleTree(root, loaded, open).map((n) => n.row.id), ['r', 'a', 'b']);
+  assert.equal(visibleTree(root, loaded, open)[1].open, true);
+  // An open folder whose children have not loaded yet shows no children.
+  assert.deepEqual(visibleTree(root, new Map(), open).map((n) => n.row.id), ['r']);
+  assert.equal(toggleOpen(open, 'a').has('a'), false);
+  assert.equal(open.has('a'), true, 'toggling leaves the old set alone');
+});
+
+test('explorer filters become a query', () => {
+  assert.equal(explorerQuery({}), '');
+  assert.equal(explorerQuery({ principal: 'user:u1' }), '?principal=user%3Au1');
+  assert.equal(
+    explorerQuery({ principal: 'group:g1', kinds: ['folder', 'document'] }),
+    '?principal=group%3Ag1&kind=folder%2Cdocument',
+  );
+  assert.equal(explorerQuery({ kinds: [], limit: 50, after: 'ab' }), '?limit=50&after=ab');
+});
+
+test('the restore preview is worded as changes from entries the viewer can see', () => {
+  const preview = {
+    node: { id: DIR, kind: 'folder', name: 'Plans', access: OWNER },
+    inherit_from: { id: LIB, kind: 'library', name: 'Documents', access: OWNER },
+    people: [
+      { user: { id: 'u1', name: 'Ann' }, before: ['view', 'add', 'edit'], after: ['view'] },
+      { user: { id: 'u2', name: 'Bo' }, before: ['view'], after: [] },
+      { user: { id: 'u3', name: 'Cy' }, before: [], after: ['view', 'edit'] },
+    ],
+    groups: [
+      { group: { kind: 'group', id: 'g', name: null, hidden: true }, before: ['view'], after: [] },
+      { group: { kind: 'group', id: 'h', name: 'Staff', site: null }, before: [], after: ['view'] },
+    ],
+    unchanged_breaks_below: 2,
+  };
+  const s = previewSections(preview);
+  assert.equal(s.source, 'Documents');
+  assert.match(s.peopleHeading, /who lose or gain access/);
+  assert.match(s.peopleHeading, /entries you can see/);
+  assert.deepEqual(s.people, [
+    'Ann: view, add, edit → view',
+    'Bo: view → none',
+    'Cy: none → view, edit',
+  ]);
+  assert.deepEqual(s.groups, [
+    'Members of a group you cannot see: view → none',
+    'Members of Staff (organisation group): none → view',
+  ]);
+  assert.match(s.below, /2 places below keep their own access/);
+  assert.doesNotMatch(s.peopleHeading, /all access/i);
+  const quiet = previewSections({ ...preview, people: [], groups: [], unchanged_breaks_below: 0 });
+  assert.match(quiet.peopleEmpty, /No one/);
+  assert.match(quiet.below, /No places below/);
+  assert.match(previewSections({ ...preview, unchanged_breaks_below: 1 }).below, /1 place below keeps/);
+});
+
+test('the exceptions tree is built from the breaks alone', () => {
+  const crumb = (id, kind) => ({ id, kind, name: id, access: OWNER });
+  const site = crumb('s', 'site');
+  const lib = crumb('l', 'library');
+  const brk = (node, path) => ({ node, path, assignments: [] });
+  const tree = exceptionTree([
+    brk(site, []),
+    brk(crumb('f1', 'folder'), [site, lib]),
+    brk(crumb('f2', 'folder'), [site, lib]),
+    brk(crumb('d', 'document'), [site, lib, crumb('f2', 'folder')]),
+  ]);
+  assert.equal(tree.root.id, 's');
+  assert.equal(tree.root.unique, true);
+  assert.equal(tree.root.count, 4);
+  assert.equal(breaksBelow(tree.root), 3);
+  assert.deepEqual(tree.loaded.get('s').map((r) => r.id), ['l']);
+  const lower = tree.loaded.get('l');
+  assert.deepEqual(lower.map((r) => r.id), ['f1', 'f2']);
+  assert.equal(lower[0].unique, true);
+  assert.equal(tree.loaded.get('s')[0].unique, false, 'a path step is not a break');
+  assert.equal(tree.loaded.get('s')[0].count, 3);
+  assert.equal(tree.loaded.get('f2')[0].expandable, false);
+  assert.equal(tree.breaks.size, 4);
+  assert.equal(exceptionTree([]).root, null);
 });

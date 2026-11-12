@@ -9,7 +9,11 @@ const MESSAGES = {
   last_owner: 'There must be at least one owner. Make someone else an owner first.',
   last_manager:
     'Someone must still be able to manage access here. Give someone else that first.',
-  beyond_your_access: 'You cannot give a role with permissions you do not have here.',
+  beyond_your_access: 'You can only give access you have yourself.',
+  role_in_use: 'That role is still given somewhere. Change those entries first, then delete it.',
+  builtin_role: 'Viewer, Editor and Owner are built in and cannot be changed or deleted.',
+  group_in_use: 'That group still has access somewhere. Remove those entries first, then delete it.',
+  site_group: 'A site always keeps its Owners, Members and Visitors groups.',
   last_admin: 'At least one administrator must stay enabled.',
   email_taken: 'An account with that email address already exists.',
   invalid_email: 'That is not a usable email address.',
@@ -237,11 +241,174 @@ export async function showCrumbs(target, id, options) {
   return { path, access: result.data.access, folder: above?.access ? above : null };
 }
 
-/** Roles a person can be given, lowest first. */
-export const ROLES = Object.freeze(['viewer', 'editor', 'owner']);
+/** The permissions, in the order they are listed. `view` is part of every other one. */
+export const PERMS = Object.freeze(['view', 'add', 'edit', 'delete', 'manage_access', 'manage_site']);
 
-/** `viewer` as `Viewer`. */
-export const roleName = (role) => (role ? role[0].toUpperCase() + role.slice(1) : '');
+const PERM_LABELS = Object.freeze({
+  view: 'view',
+  add: 'add',
+  edit: 'edit',
+  delete: 'delete',
+  manage_access: 'manage access',
+  manage_site: 'manage site',
+});
+
+/** `manage_access` as `manage access`. */
+export const permLabel = (perm) => PERM_LABELS[perm] ?? perm;
+
+/** The permissions in `perms` as words in the order of [`PERMS`], or `none`. */
+export function permsText(perms) {
+  const held = PERMS.filter((perm) => Array.isArray(perms) && perms.includes(perm));
+  return held.length ? held.map(permLabel).join(', ') : 'none';
+}
+
+/** The names of the roles in `access`, joined; '' for limited access. */
+export const rolesText = (access) => (access?.roles ?? []).map((role) => role.name).join(', ');
+
+/** "Your role: Owner" for `access`, or the line for limited access. */
+export const roleLine = (access) =>
+  access ? `Your role: ${rolesText(access)}` : 'Limited access: you can open only what was shared with you.';
+
+/** What is shown for a group the person may not see. */
+export const HIDDEN_GROUP = 'A group you cannot see';
+
+/**
+ * A person or group as the server names it in an assignment, as `{ name, note, hidden }`: the
+ * note is a person's email, a site group's site (`site: Sales`: a site group can share its name
+ * with an organisation group) or `organisation group`. A hidden group has no name to show.
+ */
+export function principalParts(principal) {
+  if (principal.hidden) return { name: HIDDEN_GROUP, note: '', hidden: true };
+  if (principal.kind === 'user') {
+    return { name: principal.name, note: principal.email ?? '', hidden: false };
+  }
+  const note = principal.site ? `site: ${principal.site.name}` : 'organisation group';
+  return { name: principal.name, note, hidden: false };
+}
+
+/** [`principalParts`] as one line: `Site Owners (site: Sales)`. */
+export function principalText(principal) {
+  const { name, note } = principalParts(principal);
+  return note ? `${name} (${note})` : name;
+}
+
+/** A group from `GET /api/groups` (`{ name, site }`) as one line, as for an assignment. */
+export const groupLabel = (group) => principalText({ kind: 'group', ...group });
+
+/**
+ * What the library page offers for one item, from the person's access to it: Rename (`edit`;
+ * for a library `manage_site`), Move and Delete (`edit` and `delete`; never for a library) and
+ * the Access link (`manage_access`).
+ */
+export function itemActions({ kind, access }) {
+  const library = kind === 'library';
+  return {
+    rename: library ? can(access, 'manage_site') : can(access, 'edit'),
+    move: !library && can(access, 'edit'),
+    remove: !library && can(access, 'delete'),
+    access: can(access, 'manage_access'),
+  };
+}
+
+/**
+ * The rows the explorer shows for the children `items` of one place (as `GET
+ * /api/nodes/{id}/children` lists them): only those the person manages access on, each with its
+ * break count from `counts` (a Map of id to count). `unique` says the item has permissions of
+ * its own. With `onlyExceptions`, only breaks and the places with a break below them.
+ */
+export function explorerRows(items, counts, { onlyExceptions = false } = {}) {
+  return items
+    .filter((item) => can(item.access, 'manage_access'))
+    .map((item) => ({
+      id: item.id,
+      kind: item.kind,
+      name: item.name,
+      access: item.access,
+      unique: item.inherits === false,
+      count: counts.get(item.id) ?? 0,
+      expandable: item.kind !== 'document',
+    }))
+    .filter((row) => !onlyExceptions || row.unique || row.count > 0);
+}
+
+/** `open` (a Set of ids) with `id` shown or hidden: a new Set. */
+export function toggleOpen(open, id) {
+  const next = new Set(open);
+  if (!next.delete(id)) next.add(id);
+  return next;
+}
+
+/**
+ * The rows on screen, in order, as `{ row, depth, open }`: `root` first, then the children of
+ * every open row in `loaded` (a Map of id to rows), their own open rows below them in turn.
+ */
+export function visibleTree(root, loaded, open, depth = 0) {
+  const isOpen = open.has(root.id);
+  const out = [{ row: root, depth, open: isOpen }];
+  if (isOpen) {
+    for (const child of loaded.get(root.id) ?? []) out.push(...visibleTree(child, loaded, open, depth + 1));
+  }
+  return out;
+}
+
+/**
+ * The query string of an explorer request: `principal` (`user:<id>` or `group:<id>`), `kinds`
+ * (node kinds), `limit` and `after`; '' when none is given.
+ */
+export function explorerQuery({ principal, kinds, limit, after } = {}) {
+  const query = new URLSearchParams();
+  if (principal) query.set('principal', principal);
+  if (kinds?.length) query.set('kind', kinds.join(','));
+  if (limit) query.set('limit', String(limit));
+  if (after) query.set('after', after);
+  const text = query.toString();
+  return text ? `?${text}` : '';
+}
+
+const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
+
+/**
+ * The words of a restore preview (`GET /api/nodes/{id}/inheritance/preview`): where access would
+ * come from, who loses or gains access (only from the entries the person can see, which the
+ * heading says), the groups whose members cannot be named, and the breaks below that stay.
+ */
+export function previewSections(preview) {
+  const change = (name, item) => `${name}: ${permsText(item.before)} → ${permsText(item.after)}`;
+  const below = preview.unchanged_breaks_below;
+  return {
+    source: preview.inherit_from.name,
+    peopleHeading: 'People who lose or gain access (changes from entries you can see)',
+    peopleEmpty: 'No one you can see would lose or gain access.',
+    people: preview.people.map((item) => change(item.user.name, item)),
+    groupsHeading: 'Groups whose members are not listed',
+    groups: preview.groups.map((item) => {
+      const named = item.group.hidden ? 'a group you cannot see' : principalText(item.group);
+      return change(`Members of ${named}`, item);
+    }),
+    below:
+      below === 0
+        ? 'No places below this one have access of their own.'
+        : `${plural(below, 'place below keeps', 'places below keep')} their own access and ${
+            below === 1 ? 'is' : 'are'
+          } not changed.`,
+  };
+}
+
+/** The preview as elements: a heading and a banded list for people, then groups, then a note. */
+export function previewView(preview) {
+  const s = previewSections(preview);
+  const list = (items) => h('ul', { class: 'list' }, ...items.map((text) => h('li', {}, text)));
+  return h(
+    'div',
+    {},
+    h('p', {}, 'Access would come from ', h('strong', {}, s.source), ' instead.'),
+    h('h3', {}, s.peopleHeading),
+    s.people.length ? list(s.people) : h('p', { class: 'meta' }, s.peopleEmpty),
+    s.groups.length ? h('h3', {}, s.groupsHeading) : null,
+    s.groups.length ? list(s.groups) : null,
+    h('p', { class: 'meta' }, s.below),
+  );
+}
 
 /**
  * What the move dialog offers inside one place: sites, libraries and folders except `movingId`
@@ -333,4 +500,48 @@ export function showProblemWithFolder(element, text, folder) {
   if (folder) {
     element.append(' ', h('a', { href: pageFor(folder.kind, folder.id) }, `Go to ${folder.name}`));
   }
+}
+
+/** How many breaks lie below an explorer row: its count, without the row itself if it is one. */
+export const breaksBelow = (row) => Math.max(0, row.count - (row.unique ? 1 : 0));
+
+/**
+ * The explorer's "only exceptions" tree, built from the breaks themselves (never from the files
+ * between them): `{ root, loaded, breaks }`. `root` is the row of the explorer's root, `loaded`
+ * maps each row's id to its child rows (every row is open-able at once), `breaks` maps the id of
+ * each break to what the server said about it. Rows are `{ id, kind, name, access, unique,
+ * count, expandable }` as [`explorerRows`] makes them: `unique` is true for a break; `count` is
+ * the breaks at or below it among those given. `root` is null when there are none.
+ */
+export function exceptionTree(breaks) {
+  const rows = new Map();
+  const loaded = new Map();
+  const found = new Map();
+  let root = null;
+  for (const item of breaks) {
+    const chain = [...item.path, item.node];
+    let parent = null;
+    chain.forEach((crumb, at) => {
+      let row = rows.get(crumb.id);
+      if (!row) {
+        row = {
+          id: crumb.id,
+          kind: crumb.kind,
+          name: crumb.name,
+          access: crumb.access,
+          unique: false,
+          count: 0,
+          expandable: crumb.kind !== 'document',
+        };
+        rows.set(crumb.id, row);
+        if (parent) loaded.set(parent.id, [...(loaded.get(parent.id) ?? []), row]);
+        else root ??= row;
+      }
+      row.count += 1;
+      if (at === chain.length - 1) row.unique = true;
+      parent = row;
+    });
+    found.set(item.node.id, item);
+  }
+  return { root, loaded, breaks: found };
 }

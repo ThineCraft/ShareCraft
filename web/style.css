@@ -130,3 +130,39 @@ dialog input:is([type=text],[type=email]){width:100%}
  .list button,.list .button,dialog button{min-height:44px}
  .sitenav a{padding:10px 14px}
 }
+/* groups, roles and the inheritance explorer */
+.page.wide{max-width:1040px}
+.page h3{font-size:13px;margin:16px 0 6px}
+.page small.meta{font-weight:400}
+.perms,.kinds{border:1px solid var(--line);border-radius:7px;margin:0;padding:6px 12px 8px;min-width:0}
+.perms legend,.kinds legend{font-size:12px;color:var(--muted);padding:0 4px}
+.perms,.kinds{display:flex;flex-wrap:wrap;gap:2px 16px}
+.perms legend,.kinds legend{flex-basis:100%}
+.perms .check{min-height:32px}
+.list li.role{display:block}
+.role-form{display:flex;flex-wrap:wrap;align-items:flex-end;gap:8px 16px}
+.role-form .field{margin:0}
+.role-form .actions{display:flex;gap:6px}
+.filters{display:flex;flex-wrap:wrap;align-items:flex-end;gap:8px 16px;margin:12px 0}
+.filters .field{margin:0}
+.split{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:16px;align-items:start}
+.tree-row{padding-left:calc(8px + var(--depth,0)*18px)!important}
+.twist{display:inline-flex;align-items:center;justify-content:center;width:28px;min-height:28px!important;padding:0!important;flex:none}
+.mark.own{border-color:var(--accent-ink);color:var(--accent-ink)}
+.scroll{overflow-x:auto;margin:0 0 12px}
+table.banded{border-collapse:collapse;width:100%;min-width:280px}
+table.banded th,table.banded td{text-align:left;vertical-align:top;padding:8px;border-bottom:1px solid var(--line);overflow-wrap:anywhere}
+table.banded th{font-size:12px;color:var(--muted);font-weight:600}
+table.banded tbody tr:nth-child(even){background:var(--band)}
+.crumbs-line{list-style:none;display:flex;flex-wrap:wrap;gap:2px 0;margin:0 0 8px;padding:0;font-size:12px}
+.crumbs-line li+li::before{content:"›" / "";margin:0 6px;color:var(--muted)}
+.crumbs-line [aria-current]{font-weight:600}
+.facts{display:grid;grid-template-columns:max-content minmax(0,1fr);gap:4px 16px;margin:0 0 12px}
+.facts dt{color:var(--muted);font-size:12px}
+.facts dd{margin:0;overflow-wrap:anywhere}
+@media (max-width:760px){
+ .split{grid-template-columns:minmax(0,1fr)}
+ .facts{grid-template-columns:minmax(0,1fr)}
+ .twist{width:44px;min-height:44px!important}
+ .perms .check{min-height:44px}
+}

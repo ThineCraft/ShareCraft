@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ShareCraft — Inheritance explorer</title>
+<link rel="stylesheet" href="./style.css">
+</head>
+<body>
+<div class="page wide">
+ <nav class="topbar" aria-label="Account">
+  <a href="/">Sites</a>
+  <span id="who" class="meta"></span>
+  <span class="spacer"></span>
+  <a id="people-link" class="button plain" href="/people.html" hidden>People</a>
+  <button type="button" id="sign-out" class="plain">Sign out</button>
+ </nav>
+ <nav id="crumbs" class="crumbs" aria-label="Breadcrumb"></nav>
+ <p id="status" role="status" aria-live="polite" class="meta"></p>
+ <h1 id="title">Inheritance explorer</h1>
+ <p id="error" role="alert" class="msg"></p>
+ <div id="content" hidden>
+  <p class="meta">Every place here that has access of its own, instead of taking it from the place above. You see only the places you manage access on.</p>
+  <form id="filters" class="filters">
+   <div class="field">
+    <label for="place">Place</label>
+    <select id="place"></select>
+   </div>
+   <div class="field">
+    <label for="principal">Person or group</label>
+    <select id="principal"></select>
+   </div>
+   <fieldset class="kinds">
+    <legend>Kind</legend>
+    <label class="check"><input type="checkbox" name="kind" value="site"> Site</label>
+    <label class="check"><input type="checkbox" name="kind" value="library"> Library</label>
+    <label class="check"><input type="checkbox" name="kind" value="folder"> Folder</label>
+    <label class="check"><input type="checkbox" name="kind" value="document"> File</label>
+   </fieldset>
+   <label class="check"><input type="checkbox" id="only"> Only exceptions</label>
+   <a id="export" class="button plain" href="#" download="inheritance.csv">Export CSV</a>
+  </form>
+  <p id="filter-note" class="meta" hidden>With a person, group or kind chosen, only the places that match are shown.</p>
+  <div class="split">
+   <section aria-labelledby="tree-heading">
+    <h2 id="tree-heading">Places</h2>
+    <ul id="tree" class="list tree" aria-labelledby="tree-heading"></ul>
+    <p id="tree-empty" class="meta" hidden>No place here has access of its own.</p>
+    <p><button type="button" id="more-breaks" class="plain" hidden>Show more places</button></p>
+   </section>
+   <section id="detail" aria-labelledby="detail-heading" hidden>
+    <h2 id="detail-heading">Place</h2>
+    <div id="detail-body"></div>
+   </section>
+  </div>
+ </div>
+</div>
+
+<dialog id="restore-dialog" aria-labelledby="restore-title">
+ <form id="restore-form" method="dialog">
+  <h2 id="restore-title">Inherit again?</h2>
+  <div id="restore-text"></div>
+  <p id="restore-error" role="alert" class="msg"></p>
+  <div class="row end">
+   <button type="button" id="restore-cancel" class="plain">Close</button>
+   <button type="submit" id="restore-go">Inherit again</button>
+  </div>
+ </form>
+</dialog>
+<script type="module" src="./explorer.js"></script>
+</body>
+</html>

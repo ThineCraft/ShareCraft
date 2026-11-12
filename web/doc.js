@@ -5,11 +5,13 @@ import init, { Client } from './pkg/web_client.js';
 import {
   MISSING_DOCUMENT as MISSING,
   api,
+  can,
   messageFor,
   pageFor,
   removedMessage,
   removedReasonOf,
   requireMe,
+  roleLine,
   seg,
   showCrumbs,
   showMessage,
@@ -71,7 +73,7 @@ if (detail.data.editor !== 'text') {
 showDetail(detail.data);
 await showPlace();
 $('editor').hidden = false;
-setRole(detail.data.role);
+setRole(detail.data.access);
 
 try {
   await init();
@@ -112,13 +114,13 @@ function showProblem(text) {
 
 function showDetail(info) {
   $('title').textContent = info.name;
-  $('docline').textContent = `Your role: ${info.role}`;
+  $('docline').textContent = roleLine(info.access);
   document.title = `${info.name} — ShareCraft`;
 }
 
-// Owners get the Access link; everyone else does not.
-function setRole(role) {
-  accessLink.hidden = !(removedReason === '' && role === 'owner');
+// Those who manage access get the Access link; everyone else does not.
+function setRole(access) {
+  accessLink.hidden = !(removedReason === '' && can(access, 'manage_access'));
   accessLink.href = `/access.html?id=${seg(docId)}`;
 }
 
@@ -130,7 +132,7 @@ async function refreshRole() {
   if (check !== roleCheck || removedReason) return;
   if (result.ok) {
     showDetail(result.data);
-    setRole(result.data.role);
+    setRole(result.data.access);
   } else {
     accessLink.hidden = true;
   }

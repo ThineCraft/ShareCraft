@@ -24,25 +24,33 @@
    <h2 id="source-heading">Where access comes from</h2>
    <p id="source"></p>
    <p id="inherit-note" class="meta"></p>
-   <p><button type="button" id="inherit-toggle" class="plain"></button></p>
+   <p class="toolbar"><button type="button" id="inherit-toggle" class="plain"></button> <a id="explorer-link" class="button plain" href="#">Inheritance explorer</a></p>
   </section>
   <section aria-labelledby="people-heading">
-   <h2 id="people-heading">People</h2>
-   <ul id="grants" class="list" aria-labelledby="people-heading"></ul>
+   <h2 id="people-heading">People and groups</h2>
+   <ul id="assignments" class="list" aria-labelledby="people-heading"></ul>
+   <p id="no-assignments" class="meta" hidden>Nobody has access here yet.</p>
    <form id="share-form" class="row">
     <div class="field">
-     <label for="share-email">Add someone by email</label>
+     <label for="share-email">Add a person by email</label>
      <input type="email" id="share-email" autocomplete="off" required>
     </div>
     <div class="field">
      <label for="share-role">Role</label>
-     <select id="share-role">
-      <option value="viewer">Viewer</option>
-      <option value="editor" selected>Editor</option>
-      <option value="owner">Owner</option>
-     </select>
+     <select id="share-role"></select>
     </div>
-    <button type="submit">Add</button>
+    <button type="submit">Add person</button>
+   </form>
+   <form id="group-form" class="row" hidden>
+    <div class="field">
+     <label for="group-pick">Add a group</label>
+     <select id="group-pick" required></select>
+    </div>
+    <div class="field">
+     <label for="group-role">Role</label>
+     <select id="group-role"></select>
+    </div>
+    <button type="submit">Add group</button>
    </form>
    <p id="share-hint" class="meta" hidden>Adding or changing someone here stops this item inheriting first, so the people above stay as they are and this item keeps a list of its own.</p>
   </section>
@@ -52,7 +60,7 @@
 <dialog id="inherit-dialog" aria-labelledby="inherit-title">
  <form id="inherit-form" method="dialog">
   <h2 id="inherit-title">Inherit again?</h2>
-  <p id="inherit-text"></p>
+  <div id="inherit-text"></div>
   <p id="inherit-error" role="alert" class="msg"></p>
   <div class="row end">
    <button type="button" id="inherit-cancel" class="plain">Cancel</button>
