@@ -113,8 +113,14 @@ pub struct RestorePreview {
     pub inherit_from: Crumb,
     /// Every person whose permissions on the node would change, by name, with their
     /// permissions now and after restoring. Everything below the node that inherits follows the
-    /// node.
+    /// node. Worked out from their direct assignments and the groups whose members the viewer
+    /// may see; what other groups give is in `groups` instead, so that their members are never
+    /// named.
     pub people: Vec<(UserRef, Perms, Perms)>,
+    /// Every group whose members the viewer may not see whose role on the node would change,
+    /// by name, with the permissions its role gives now and after restoring (`NONE` for no
+    /// role).
+    pub groups: Vec<(PrincipalView, Perms, Perms)>,
     /// How many breaks below the node (that the viewer manages access on) keep their own
     /// assignments, unaffected.
     pub unchanged_breaks_below: i64,
@@ -324,26 +330,7 @@ async fn assignments_on(
             named_groups.push(GroupId(row.try_get("principal_id")?));
         }
     }
-    named_groups.sort_unstable();
-    named_groups.dedup();
-    let mut groups = HashMap::new();
-    let mut sites = HashMap::new();
-    if !named_groups.is_empty() {
-        for group in visible_groups(&mut *conn, viewer, Some(&named_groups)).await? {
-            groups.insert(group.id, group);
-        }
-        let site_ids: Vec<Uuid> = groups
-            .values()
-            .filter_map(|g| g.site)
-            .map(|s| s.0)
-            .collect();
-        let named: Vec<(Uuid, String)> =
-            sqlx::query_as("select id, name from nodes where id = any($1)")
-                .bind(&site_ids)
-                .fetch_all(&mut *conn)
-                .await?;
-        sites.extend(named.into_iter().map(|(id, name)| (NodeId(id), name)));
-    }
+    let groups = group_views(&mut *conn, viewer, named_groups).await?;
     let mut by_scope: HashMap<NodeId, Vec<(String, AssignmentView)>> = HashMap::new();
     for row in &rows {
         let id: Uuid = row.try_get("principal_id")?;
@@ -356,16 +343,10 @@ async fn assignments_on(
                     .unwrap_or_default(),
             })
         } else {
-            match groups.get(&GroupId(id)) {
-                Some(group) => PrincipalView::Group {
-                    id: group.id,
-                    name: group.name.clone(),
-                    site: group
-                        .site
-                        .and_then(|s| sites.get(&s).map(|name| (s, name.clone()))),
-                },
-                None => PrincipalView::HiddenGroup(GroupId(id)),
-            }
+            groups
+                .get(&GroupId(id))
+                .cloned()
+                .unwrap_or(PrincipalView::HiddenGroup(GroupId(id)))
         };
         let order = match &principal {
             PrincipalView::User(user) => user.name.to_lowercase(),
@@ -396,8 +377,49 @@ async fn assignments_on(
         .collect())
 }
 
-/// The groups `user` is a member of whose members `viewer` may see: every group for an
-/// administrator; otherwise the groups of the sites where `viewer` manages the site's groups.
+/// How `viewer` is shown each of `ids`: by name (a site group with its site) when they may see
+/// the group, [`PrincipalView::HiddenGroup`] otherwise.
+async fn group_views(
+    conn: &mut PgConnection,
+    viewer: UserId,
+    mut ids: Vec<GroupId>,
+) -> Result<HashMap<GroupId, PrincipalView>, sqlx::Error> {
+    ids.sort_unstable();
+    ids.dedup();
+    let mut views: HashMap<GroupId, PrincipalView> = ids
+        .iter()
+        .map(|id| (*id, PrincipalView::HiddenGroup(*id)))
+        .collect();
+    if ids.is_empty() {
+        return Ok(views);
+    }
+    let groups = visible_groups(&mut *conn, viewer, Some(&ids)).await?;
+    let site_ids: Vec<Uuid> = groups.iter().filter_map(|g| g.site).map(|s| s.0).collect();
+    let named: Vec<(Uuid, String)> =
+        sqlx::query_as("select id, name from nodes where id = any($1)")
+            .bind(&site_ids)
+            .fetch_all(&mut *conn)
+            .await?;
+    let sites: HashMap<NodeId, String> = named
+        .into_iter()
+        .map(|(id, name)| (NodeId(id), name))
+        .collect();
+    for group in groups {
+        views.insert(
+            group.id,
+            PrincipalView::Group {
+                id: group.id,
+                name: group.name,
+                site: group
+                    .site
+                    .and_then(|s| sites.get(&s).map(|name| (s, name.clone()))),
+            },
+        );
+    }
+    Ok(views)
+}
+
+/// The groups `user` is a member of whose members `viewer` may see (see [`members_visible`]).
 async fn groups_seen_through(
     conn: &mut PgConnection,
     viewer: UserId,
@@ -410,6 +432,18 @@ async fn groups_seen_through(
     .bind(user.0)
     .fetch_all(&mut *conn)
     .await?;
+    members_visible(conn, viewer, member_of).await
+}
+
+/// Those of `groups` (each with its site, `None` for an organisation group) whose members
+/// `viewer` may see: every group for an administrator; otherwise the groups of the sites where
+/// `viewer` manages the site's groups (the rule of [`Db::group`]).
+async fn members_visible(
+    conn: &mut PgConnection,
+    viewer: UserId,
+    groups: Vec<(Uuid, Option<Uuid>)>,
+) -> Result<HashSet<GroupId>, sqlx::Error> {
+    let member_of = groups;
     let mut decided: HashMap<Option<Uuid>, bool> = HashMap::new();
     let mut seen = HashSet::new();
     for (group, site) in member_of {
@@ -631,9 +665,10 @@ pub(crate) async fn break_counts_in(
         .collect())
 }
 
-/// Everyone named on either of the scopes `$1` (an array), directly or through a group, with
-/// their standing and the permissions the assignments that apply to them (see `applies_to!`)
-/// give on the scope `$2` and on the scope `$3`.
+/// Everyone named on either of the scopes `$1` (an array) directly or through one of the groups
+/// `$4` (an array), with their standing and the permissions the assignments that apply to them
+/// (see `applies_to!`), among those naming them directly or one of `$4`, give on the scope `$2`
+/// and on the scope `$3`.
 const PEOPLE_ON_TWO_SCOPES: &str = concat!(
     "with named(user_id) as ( \
          select a.principal_id from assignments a \
@@ -641,20 +676,21 @@ const PEOPLE_ON_TWO_SCOPES: &str = concat!(
          union \
          select m.user_id from assignments a \
          join group_members m on a.principal_kind = 'group' and m.group_id = a.principal_id \
-         where a.node_id = any($1)) \
+         where a.node_id = any($1) and a.principal_id = any($4)) \
      select u.id, u.name, u.is_admin, (u.disabled_at is null) as enabled, \
             (select bit_or(r.perms) from assignments a join roles r on r.id = a.role_id \
-             where a.node_id = $2 and ",
+             where a.node_id = $2 and (a.principal_kind = 'user' or a.principal_id = any($4)) \
+               and ",
     applies_to!("u.id"),
     ") as before, \
             (select bit_or(r.perms) from assignments a join roles r on r.id = a.role_id \
-             where a.node_id = $3 and ",
+             where a.node_id = $3 and (a.principal_kind = 'user' or a.principal_id = any($4)) \
+               and ",
     applies_to!("u.id"),
     ") as after \
      from named join users u on u.id = named.user_id \
      order by lower(u.name), u.id"
 );
-
 /// The permissions a person of `standing` has on a scope where the assignments that apply to
 /// them give `given` (a `bit_or` of their roles' permissions, `None` for no assignment).
 fn on_scope(standing: Standing, given: Option<i32>) -> Result<Perms, sqlx::Error> {
@@ -668,21 +704,49 @@ fn on_scope(standing: Standing, given: Option<i32>) -> Result<Perms, sqlx::Error
     Ok(access_step(standing, true, own, None).map_or(Perms::NONE, |access| access.perms))
 }
 
-/// Every person whose permissions on the scope `node` would change if it took the assignments of
-/// the scope `from` instead, with their permissions before and after, by name.
-async fn people_changing(
+/// What would change on the scope `node` if it took the assignments of the scope `from`
+/// instead, as `viewer` may see it: every person whose permissions would change, by name, with
+/// their permissions before and after; and every group whose members `viewer` may not see whose
+/// role would change, with its permissions before and after (`NONE` where it has none), by
+/// name. A person's permissions are worked out from their direct assignments and the groups
+/// whose members `viewer` may see; what a hidden group gives them is reported only as that
+/// group's change, so that no member of it is named.
+async fn changes_on_restore(
     conn: &mut PgConnection,
+    viewer: UserId,
     node: NodeId,
     from: NodeId,
-) -> Result<Vec<(UserRef, Perms, Perms)>, sqlx::Error> {
-    let rows = sqlx::query(PEOPLE_ON_TWO_SCOPES)
+) -> Result<
+    (
+        Vec<(UserRef, Perms, Perms)>,
+        Vec<(PrincipalView, Perms, Perms)>,
+    ),
+    sqlx::Error,
+> {
+    let rows: Vec<(Uuid, Uuid, Option<Uuid>, i32)> = sqlx::query_as(
+        "select a.node_id, a.principal_id, g.site_id, r.perms \
+         from assignments a join roles r on r.id = a.role_id \
+         join groups g on g.id = a.principal_id \
+         where a.node_id = any($1) and a.principal_kind = 'group' order by a.principal_id",
+    )
+    .bind(vec![node.0, from.0])
+    .fetch_all(&mut *conn)
+    .await?;
+    let groups: Vec<(Uuid, Option<Uuid>)> = rows
+        .iter()
+        .map(|(_, group, site, _)| (*group, *site))
+        .collect();
+    let seen = members_visible(&mut *conn, viewer, groups).await?;
+    let seen_ids: Vec<Uuid> = seen.iter().map(|g| g.0).collect();
+    let people_rows = sqlx::query(PEOPLE_ON_TWO_SCOPES)
         .bind(vec![node.0, from.0])
         .bind(node.0)
         .bind(from.0)
-        .fetch_all(conn)
+        .bind(&seen_ids)
+        .fetch_all(&mut *conn)
         .await?;
     let mut people = Vec::new();
-    for row in &rows {
+    for row in &people_rows {
         let standing = Standing::of(row.try_get("is_admin")?, row.try_get("enabled")?);
         let before = on_scope(standing, row.try_get("before")?)?;
         let after = on_scope(standing, row.try_get("after")?)?;
@@ -697,9 +761,45 @@ async fn people_changing(
             ));
         }
     }
-    Ok(people)
+    let mut hidden: HashMap<GroupId, (Perms, Perms)> = HashMap::new();
+    for (scope, group, _, perms) in rows {
+        let group = GroupId(group);
+        if seen.contains(&group) {
+            continue;
+        }
+        let perms = Perms::from_column(perms)?;
+        let entry = hidden.entry(group).or_insert((Perms::NONE, Perms::NONE));
+        if scope == node.0 {
+            entry.0 = perms;
+        } else {
+            entry.1 = perms;
+        }
+    }
+    hidden.retain(|_, (before, after)| before != after);
+    let views = group_views(&mut *conn, viewer, hidden.keys().copied().collect()).await?;
+    let mut changed: Vec<(String, PrincipalView, Perms, Perms)> = hidden
+        .into_iter()
+        .map(|(group, (before, after))| {
+            let view = views
+                .get(&group)
+                .cloned()
+                .unwrap_or(PrincipalView::HiddenGroup(group));
+            let order = match &view {
+                PrincipalView::Group { name, .. } => name.to_lowercase(),
+                _ => String::new(),
+            };
+            (format!("{order}\u{0}{}", group.0), view, before, after)
+        })
+        .collect();
+    changed.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok((
+        people,
+        changed
+            .into_iter()
+            .map(|(_, view, before, after)| (view, before, after))
+            .collect(),
+    ))
 }
-
 impl Db {
     /// One page of the breaks the explorer shows from `root`: every live scope strictly below
     /// `root`, and `root` itself when it is a scope, that `viewer` has `manage_access` on, kept
@@ -738,7 +838,9 @@ impl Db {
     /// What restoring inheritance on `node` would change: every person named on the node or on
     /// the scope it would inherit from, directly or through a group, whose permissions would
     /// change, with their permissions now and after (a person in two groups is judged by the
-    /// union of both, as access is). Everything below the node that inherits follows it; the
+    /// union of both, as access is). Only groups whose members `viewer` may see count towards a
+    /// person; any other group whose role would change is listed as a group, its members never
+    /// named. Everything below the node that inherits follows it; the
     /// breaks below keep their own assignments and are counted as unaffected. `viewer` must
     /// manage access to the node and to the scope above it, as restoring requires (`NotFound`
     /// or `Forbidden`); `IsSite` for a site. For a node that inherits nothing changes.
@@ -768,10 +870,10 @@ impl Db {
         let from = links
             .get(source_index(&links, true))
             .ok_or(AccessError::NotFound)?;
-        let people = if target.node.unique_scope {
-            people_changing(&mut conn, node, from.node.id).await?
+        let (people, groups) = if target.node.unique_scope {
+            changes_on_restore(&mut conn, viewer, node, from.node.id).await?
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
         let below = scopes_under(&mut conn, viewer, standing, &links)
             .await?
@@ -782,6 +884,7 @@ impl Db {
             node: crumb(target),
             inherit_from: crumb(from),
             people,
+            groups,
             unchanged_breaks_below: i64::try_from(below).unwrap_or(i64::MAX),
         })
     }

@@ -511,7 +511,8 @@ async fn restore_preview_lists_losers_gainers_and_independent_breaks() {
     break_at(&test, owner.id, t.b).await;
     break_at(&test, owner.id, t.file).await;
 
-    let preview = test.db.restore_preview(owner.id, t.a).await.unwrap();
+    // An administrator sees every group's members: Erin gains through Readers.
+    let preview = test.db.restore_preview(admin.id, t.a).await.unwrap();
     assert_eq!(preview.node.id, t.a);
     assert_eq!(preview.inherit_from.id, t.library);
     let people: Vec<(&str, Perms, Perms)> = preview
@@ -527,6 +528,28 @@ async fn restore_preview_lists_losers_gainers_and_independent_breaks() {
             ("Dave", Perms::NONE, editor_perms()),
             ("Erin", Perms::NONE, Perms::VIEW),
         ]
+    );
+    assert!(preview.groups.is_empty());
+    assert_eq!(preview.unchanged_breaks_below, 2);
+    // The site's owner may not see Readers' members: the group's change is listed instead.
+    let preview = test.db.restore_preview(owner.id, t.a).await.unwrap();
+    let people: Vec<&str> = preview
+        .people
+        .iter()
+        .map(|(u, _, _)| u.name.as_str())
+        .collect();
+    assert_eq!(people, ["Alice", "Carol", "Dave"]);
+    assert_eq!(
+        preview.groups,
+        [(
+            PrincipalView::Group {
+                id: readers.id,
+                name: "Readers".to_owned(),
+                site: None,
+            },
+            Perms::NONE,
+            Perms::VIEW
+        )]
     );
     assert_eq!(preview.unchanged_breaks_below, 2);
     // The preview changes nothing.
@@ -581,14 +604,73 @@ async fn restore_preview_counts_people_not_principals() {
     .await;
     give(&test, admin.id, t.a, Principal::Group(writers.id), "editor").await;
 
-    // Writers lose their role on A; Frank keeps editing through Editors, Gina does not.
-    let preview = test.db.restore_preview(owner.id, t.a).await.unwrap();
+    // Writers lose their role on A; Frank keeps editing through Editors, Gina does not. An
+    // administrator sees both groups' members.
+    let preview = test.db.restore_preview(admin.id, t.a).await.unwrap();
     let people: Vec<(UserId, Perms, Perms)> = preview
         .people
         .iter()
         .map(|(user, before, after)| (user.id, *before, *after))
         .collect();
     assert_eq!(people, [(gina.id, editor_perms(), Perms::NONE)]);
+}
+
+#[tokio::test]
+async fn restore_preview_hides_members_of_hidden_groups() {
+    let test = TestDb::create().await;
+    let admin = user(&test, "Admin", true).await;
+    let owner = user(&test, "Owner", false).await;
+    let erin = user(&test, "Erin", false).await;
+    let hal = user(&test, "Hal", false).await;
+    let t = tree(&test, owner.id).await;
+    let readers = test.db.create_group(admin.id, "Readers").await.unwrap();
+    for person in [erin.id, hal.id] {
+        test.db
+            .add_member(admin.id, readers.id, person)
+            .await
+            .unwrap();
+    }
+    // Readers view A only; Hal is also given view on A directly.
+    give(&test, admin.id, t.a, Principal::Group(readers.id), "viewer").await;
+    give(&test, owner.id, t.a, Principal::User(hal.id), "viewer").await;
+
+    // The site's owner (not an administrator) sees "Readers: view -> none" and no member,
+    // not even Hal, whose own assignment is all that is counted for him.
+    let preview = test.db.restore_preview(owner.id, t.a).await.unwrap();
+    let people: Vec<(UserId, Perms, Perms)> = preview
+        .people
+        .iter()
+        .map(|(user, before, after)| (user.id, *before, *after))
+        .collect();
+    assert_eq!(people, [(hal.id, Perms::VIEW, Perms::NONE)]);
+    assert!(!preview.people.iter().any(|(u, _, _)| u.id == erin.id));
+    assert_eq!(
+        preview.groups,
+        [(
+            PrincipalView::Group {
+                id: readers.id,
+                name: "Readers".to_owned(),
+                site: None,
+            },
+            Perms::VIEW,
+            Perms::NONE
+        )]
+    );
+    // An administrator sees the people, and no group entry.
+    let preview = test.db.restore_preview(admin.id, t.a).await.unwrap();
+    let people: Vec<(UserId, Perms, Perms)> = preview
+        .people
+        .iter()
+        .map(|(user, before, after)| (user.id, *before, *after))
+        .collect();
+    assert_eq!(
+        people,
+        [
+            (erin.id, Perms::VIEW, Perms::NONE),
+            (hal.id, Perms::VIEW, Perms::NONE)
+        ]
+    );
+    assert!(preview.groups.is_empty());
 }
 
 #[test]
