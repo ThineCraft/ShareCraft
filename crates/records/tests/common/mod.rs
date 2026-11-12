@@ -321,6 +321,33 @@ pub async fn role_gate(test: &TestDb, id: &str) -> Gate {
     gate
 }
 
+/// Opens a connection, begins a transaction on it and locks `node`'s row `FOR SHARE`: a writer
+/// of the row waits behind it, a reader sharing it does not.
+pub async fn share_gate(test: &TestDb, node: NodeId) -> Gate {
+    let mut gate = open_gate(test).await;
+    sqlx::query("select id from nodes where id = $1 for share")
+        .bind(node.0)
+        .execute(&mut gate.conn)
+        .await
+        .unwrap();
+    gate
+}
+
+/// The number of backends blocked, directly or through one another, behind the backend `pid`.
+pub async fn blocked_behind(test: &TestDb, pid: i32) -> i64 {
+    sqlx::query_scalar(
+        "with recursive w(pid) as ( \
+             select pid from pg_stat_activity where $1 = any(pg_blocking_pids(pid)) \
+             union \
+             select a.pid from pg_stat_activity a join w on w.pid = any(pg_blocking_pids(a.pid)) \
+         ) select count(*) from w",
+    )
+    .bind(pid)
+    .fetch_one(test.db.test_pool())
+    .await
+    .unwrap()
+}
+
 /// Opens a connection, begins a transaction on it and locks the row of the group `id`
 /// `FOR UPDATE`.
 pub async fn group_gate(test: &TestDb, id: GroupId) -> Gate {

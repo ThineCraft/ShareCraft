@@ -933,6 +933,69 @@ async fn membership_and_cross_site_move_do_not_deadlock() {
 }
 
 #[tokio::test]
+async fn member_moving_while_their_group_grows_do_not_deadlock() {
+    let test = TestDb::create().await;
+    let ann = user(&test, "Ann", false).await;
+    let bob = user(&test, "Bob", false).await;
+    let xan = user(&test, "Xan", false).await;
+    // Ann is in the Owners groups of both sites; A's Owners group is assigned on the site (on
+    // the move's chain) and, copied by a break, on folder F1 inside the folder M she moves.
+    let (a, a_lib) = new_site(&test, ann.id, "A").await;
+    let (b, b_lib) = new_site(&test, ann.id, "B").await;
+    let owners = site_groups(&test, a).await.owners;
+    let m = put(&test, new_id(), NodeKind::Folder, Some(a_lib), a, "M").await;
+    let f1 = put(&test, new_id(), NodeKind::Folder, Some(m), a, "F1").await;
+    test.db
+        .set_node_access(ann.id, f1, Principal::User(bob.id), Some("viewer"))
+        .await
+        .unwrap();
+
+    // A gate shares F1: the move, which writes F1, waits for it; Ann's adding Xan to Owners,
+    // which only shares F1, does not. Were the move to lock its group before the rows it
+    // writes, it would wait for F1 holding Owners, while the addition, holding F1, waited for
+    // Owners: a deadlock once the gate opened.
+    let held = common::share_gate(&test, f1).await;
+    let rows = [
+        row(m, NodeKind::Folder, Some(b_lib), b, "M"),
+        row(f1, NodeKind::Folder, Some(m), b, "F1"),
+    ];
+    let first = test.db.clone();
+    let moving = tokio::spawn(async move {
+        first
+            .apply_nodes(NodeChange {
+                rows: &rows,
+                actor: Some(ann.id),
+                needs: &[(m, Perms::EDIT), (b_lib, Perms::ADD)],
+                ..NodeChange::default()
+            })
+            .await
+    });
+    wait_blocked(&test, held.pid, 1).await;
+    let second = test.db.clone();
+    let adding = tokio::spawn(async move { second.add_member(ann.id, owners, xan.id).await });
+    // The addition either finishes behind the gate or is caught waiting behind it.
+    for _ in 0..400 {
+        if adding.is_finished() || common::blocked_behind(&test, held.pid).await >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    held.open().await;
+    let moved = tokio::time::timeout(Duration::from_secs(10), moving)
+        .await
+        .expect("the move finishes")
+        .unwrap();
+    let added = tokio::time::timeout(Duration::from_secs(10), adding)
+        .await
+        .expect("the membership change finishes")
+        .unwrap();
+    assert_eq!(moved, Ok(()));
+    assert_eq!(added, Ok(true));
+    assert_eq!(test.db.node(f1).await.unwrap().unwrap().site, b);
+    assert_eq!(role(&test, xan.id, f1).await, Some(Role::Owner));
+}
+
+#[tokio::test]
 async fn cannot_add_to_a_group_beyond_own_access() {
     let test = TestDb::create().await;
     let admin = user(&test, "Root", true).await;

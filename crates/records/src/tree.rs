@@ -192,14 +192,22 @@ pub(crate) async fn upsert_node(conn: &mut PgConnection, row: &NodeRow) -> Resul
 
 /// Locks what `change` needs and judges its actor's access. Each needed node's chain is locked
 /// from its source scope down, as access changes lock it (ancestors `FOR SHARE`, a node the
-/// change writes `FOR UPDATE`), in `needs` order; then the groups the actor is a member of that
+/// change writes `FOR UPDATE`), in `needs` order; then every row the change writes,
+/// `FOR UPDATE`, ancestors first (see `lock_top_down`); then the groups the actor is a member of that
 /// are assigned on those chains' scopes, by id, `FOR SHARE`; then the roles giving that access,
 /// by id, `FOR SHARE`; then the access is worked out again and judged. So an assignment changed
 /// anywhere above a needed node, a membership ended of a group giving the access, or a role
 /// changed that gives it, either waits for this change or is seen by it. Returns `false` if a
 /// chain or the groups moved while they were being locked: the caller starts over.
 async fn judge(conn: &mut PgConnection, change: &NodeChange<'_>) -> Result<bool, AccessError> {
+    // The rows written are locked in the one order for several nodes (see `lock_top_down`)
+    // before any is written, whatever order they come in (a move's subtree is read parents
+    // first, otherwise in any order), and before any group or role: every transaction takes
+    // all the node rows it needs before a group, so none can hold a group while waiting for a
+    // node that another holds while waiting for that group.
+    let written: Vec<NodeId> = change.rows.iter().map(|row| row.id).collect();
     if !change.needs_admin && change.needs.is_empty() {
+        lock_top_down(&mut *conn, &written, true).await?;
         return Ok(true);
     }
     let actor = change.actor.ok_or(AccessError::Forbidden)?;
@@ -224,6 +232,7 @@ async fn judge(conn: &mut PgConnection, change: &NodeChange<'_>) -> Result<bool,
         scopes.extend(scopes_of(&segment(&links, false)));
         involved.extend(judged_roles(&links));
     }
+    lock_top_down(&mut *conn, &written, true).await?;
     let judged = groups_judged_by(&mut *conn, actor, &scopes).await?;
     lock_groups(&mut *conn, judged.iter().copied(), None).await?;
     lock_roles(&mut *conn, involved).await?;
@@ -298,10 +307,7 @@ impl Db {
                 Err(e) => return Err(e.into()),
             }
         }
-        // The rows written are locked in the one order for several nodes before any is written:
-        // the order they come in (parents first, as a move's subtree is read) need not be it.
-        let written: Vec<NodeId> = change.rows.iter().map(|row| row.id).collect();
-        lock_top_down(&mut tx, &written, true).await?;
+        // `judge` has locked every row written, in the one order, before any group or role.
         for row in change.rows {
             upsert_node(&mut tx, row).await?;
         }

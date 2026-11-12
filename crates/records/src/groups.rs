@@ -635,9 +635,11 @@ async fn judge_membership(
     );
     // Ancestors first, as every chain and every tree change writing several rows locks them:
     // ordered by id alone, this could hold a folder while a move held its parent and waited
-    // for it. These are `FOR SHARE`, after the group's site, also `FOR SHARE`: only a writer of
-    // several rows could wait on one of them while holding another, and every such writer
-    // locks in this same order and never writes a site row with them.
+    // for it. All node rows (the site's chain, then these, `FOR SHARE`) are taken before any
+    // group, as every transaction takes them: a tree change locks its chains and every row it
+    // writes before the groups it is judged through, so it never holds a group while waiting
+    // for one of these, and a writer of several rows locks them in this same order and never
+    // writes a site row with them.
     lock_top_down(&mut *conn, scopes.get(1..).unwrap_or_default(), false).await?;
     let judged = groups_judged_by(&mut *conn, actor, &scopes).await?;
     lock_groups(&mut *conn, judged.iter().copied(), Some(group)).await?;
