@@ -5,10 +5,13 @@
 //! before that lived at `tree/<id>.json`; they are read from either place until
 //! [`RevisionStore::move_tree_records`] moves them, once, into their sub-folders.
 
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap};
 
 use gix::object::tree::EntryKind;
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
 use crate::meta::Author;
@@ -94,8 +97,23 @@ pub struct TreeChange<'a> {
 pub struct TreeMove {
     /// Records moved from `tree/` into their sub-folders.
     pub moved: usize,
-    /// Records found at both places; the one in the sub-folder was kept, the other dropped.
+    /// Records found at both places; the one with the later stamp was kept (the sub-folder's
+    /// on equal stamps), the other dropped.
     pub duplicates: usize,
+}
+
+/// The latest moment `record` speaks of: when it was deleted, if it was, or created. `None` if
+/// neither can be read as RFC 3339.
+fn latest(record: &TreeRecord) -> Option<OffsetDateTime> {
+    let at = |stamp: &Stamp| OffsetDateTime::parse(&stamp.at, &Rfc3339).ok();
+    at(&record.created).max(record.deleted.as_ref().and_then(at))
+}
+
+/// Of the two records of one node, `flat` at `tree/<id>.json` and `sharded` in its sub-folder,
+/// whether to keep `flat`: only when its latest stamp (see [`latest`]) is later. On equal
+/// stamps, or stamps that cannot be read, the sub-folder's copy wins.
+fn keeps_flat(flat: &TreeRecord, sharded: &TreeRecord) -> bool {
+    latest(flat) > latest(sharded)
 }
 
 /// The sub-folder of `tree/` that holds the record of `id`: its first two hex digits.
@@ -200,8 +218,8 @@ impl RevisionStore {
 
     /// Every record of the content tree on `main`, in no particular order; none if `main` does
     /// not exist or holds no tree. Records are read from their sub-folders and from `tree/`
-    /// itself, where they were before the sub-folders; a node recorded at both places is read
-    /// from its sub-folder.
+    /// itself, where they were before the sub-folders; of a node recorded at both places, the
+    /// record with the later stamp is read, the sub-folder's on equal stamps.
     ///
     /// # Errors
     /// `Corrupt`, naming `main`'s commit and the file, if a record cannot be read, has an
@@ -243,13 +261,23 @@ impl RevisionStore {
             }
         }
         for record in flat {
-            sharded.entry(record.id).or_insert(record);
+            match sharded.entry(record.id) {
+                Entry::Vacant(place) => {
+                    place.insert(record);
+                }
+                Entry::Occupied(mut place) => {
+                    if keeps_flat(&record, place.get()) {
+                        place.insert(record);
+                    }
+                }
+            }
         }
         Ok(sharded.into_values().collect())
     }
 
-    /// The record of node `id` on `main`, from its sub-folder or, failing that, from its place
-    /// before the sub-folders; `None` if there is none.
+    /// The record of node `id` on `main`, from its sub-folder or its place before the
+    /// sub-folders; from both, the one with the later stamp, the sub-folder's on equal stamps.
+    /// `None` if there is none.
     ///
     /// # Errors
     /// `Corrupt` if the record cannot be read, otherwise the Git error.
@@ -259,20 +287,26 @@ impl RevisionStore {
             return Ok(None);
         };
         let root = commit.tree()?;
-        for path in [record_path(id), flat_path(id)] {
-            if let Some(bytes) = read_blob(&root, &path)? {
-                return Ok(Some(parse_record(&commit, &path, &bytes)?));
-            }
-        }
-        Ok(None)
+        let mut read = |path: String| -> Result<Option<TreeRecord>, CheckpointError> {
+            read_blob(&root, &path)?
+                .map(|bytes| parse_record(&commit, &path, &bytes))
+                .transpose()
+        };
+        let sharded = read(record_path(id))?;
+        let flat = read(flat_path(id))?;
+        Ok(match (sharded, flat) {
+            (Some(sharded), Some(flat)) if keeps_flat(&flat, &sharded) => Some(flat),
+            (Some(sharded), _) => Some(sharded),
+            (None, flat) => flat,
+        })
     }
 
     /// Moves every record still at `tree/<id>.json`, where records were written before the
     /// sub-folders, to `tree/<xx>/<id>.json`, in one commit on `main` credited to `author`
     /// with the message [`TREE_MOVE_MESSAGE`]; only `refs/sharecraft/tree` moves with `main`.
-    /// A record found at both places keeps the copy in its sub-folder. Nothing is written when
-    /// no record is at the old place, so a second call does nothing. The files move as they
-    /// are, unread.
+    /// Of a record found at both places the copy with the later stamp is kept, the sub-folder's
+    /// on equal stamps (only such pairs are read). Nothing is written when no record is at the
+    /// old place, so a second call does nothing. The files move as they are.
     ///
     /// The move is one way: a server from before the sub-folders would find no tree.
     ///
@@ -313,7 +347,21 @@ impl RevisionStore {
         let mut done = TreeMove::default();
         for (id, entry) in old {
             let sub = shards.entry(shard(id)).or_default();
-            if sub.entries.iter().any(|e| e.filename == entry.filename) {
+            if let Some(there) = sub
+                .entries
+                .iter_mut()
+                .find(|e| e.filename == entry.filename)
+            {
+                let flat_path = flat_path(id);
+                let flat = repo.find_object(entry.oid).map_err(GitError::new)?;
+                let flat = parse_record(&parent, &flat_path, &flat.data)?;
+                let sharded_path = record_path(id);
+                let sharded = repo.find_object(there.oid).map_err(GitError::new)?;
+                let sharded = parse_record(&parent, &sharded_path, &sharded.data)?;
+                if keeps_flat(&flat, &sharded) {
+                    there.oid = entry.oid;
+                    there.mode = entry.mode;
+                }
                 done.duplicates = done.duplicates.saturating_add(1);
             } else {
                 sub.entries.push(entry);
@@ -956,6 +1004,81 @@ mod tests {
             ref_target(&store.repo().unwrap(), MAIN).unwrap(),
             Some(after)
         );
+    }
+
+    /// Of a node recorded at both places, the record with the later stamp is read and kept,
+    /// wherever it is; on equal stamps the sub-folder's copy.
+    #[test]
+    fn duplicate_with_the_later_stamp_wins() {
+        let (_dir, store) = store();
+        let site = Uuid::new_v4();
+        let lib = Uuid::new_v4();
+        let flat_newer = Uuid::new_v4();
+        let sub_newer = Uuid::new_v4();
+        // Deleted after it was copied into its sub-folder: the old place is newer.
+        let mut deleted = record(flat_newer, "folder", Some(lib), site, "Deleted later");
+        deleted.deleted = Some(Stamp {
+            at: "2026-11-11T11:00:00.5+01:00".into(),
+            by: ann(),
+        });
+        let mut renamed = record(sub_newer, "folder", Some(lib), site, "Renamed later");
+        renamed.created.at = "2026-11-11T09:30:00.25Z".into();
+        let flat = vec![
+            record(site, "site", None, site, "Head office"),
+            record(lib, "library", Some(site), site, "Documents"),
+            deleted.clone(),
+            record(sub_newer, "folder", Some(lib), site, "Older"),
+        ];
+        write_flat(&store, &flat);
+        let stale = record(flat_newer, "folder", Some(lib), site, "Not yet deleted");
+        let repo = store.repo().unwrap();
+        let tip = main_tip(&repo).unwrap().unwrap();
+        commit_on_main(
+            &repo,
+            Some(&tip),
+            &signature(&ann()),
+            "Damage
+"
+            .into(),
+            TREE_REF,
+            ref_target(&repo, TREE_REF).unwrap(),
+            |editor| {
+                for r in [&stale, &renamed] {
+                    let blob = repo.write_blob(r.to_file_bytes()?)?.detach();
+                    editor.upsert(record_path(r.id), EntryKind::Blob, blob)?;
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        let expected = sorted(vec![
+            flat[0].clone(),
+            flat[1].clone(),
+            deleted.clone(),
+            renamed.clone(),
+        ]);
+        assert_eq!(sorted(store.read_tree().unwrap()), expected);
+        assert_eq!(
+            store.read_tree_record(flat_newer).unwrap(),
+            Some(deleted.clone())
+        );
+        assert_eq!(
+            store.read_tree_record(sub_newer).unwrap(),
+            Some(renamed.clone())
+        );
+
+        let done = store.move_tree_records(&ann()).unwrap();
+        assert_eq!(
+            done,
+            TreeMove {
+                moved: 2,
+                duplicates: 2
+            }
+        );
+        assert_eq!(sorted(store.read_tree().unwrap()), expected);
+        assert_eq!(store.read_tree_record(flat_newer).unwrap(), Some(deleted));
+        assert_eq!(store.read_tree_record(sub_newer).unwrap(), Some(renamed));
+        assert_eq!(object_at(&store, &flat_path(flat_newer)), None);
     }
 
     #[test]
