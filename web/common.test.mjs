@@ -8,6 +8,7 @@ import {
   canMoveHere,
   explorerQuery,
   explorerRows,
+  filterChoices,
   groupLabel,
   itemActions,
   permsText,
@@ -392,4 +393,31 @@ test('a missing source is a site only when it is one', () => {
   assert.match(noSourceText('site'), /site always has its own/);
   assert.doesNotMatch(noSourceText('folder'), /site/);
   assert.match(noSourceText('folder'), /do not manage access on/);
+});
+
+test('the explorer filter offers everyone named on a break loaded, once each, by name', () => {
+  const ann = { kind: 'user', id: 'u1', name: 'Ann' };
+  const zed = { kind: 'user', id: 'u2', name: 'Zed' };
+  const bea = { kind: 'user', id: 'u3', name: 'Bea' };
+  const staff = { kind: 'group', id: 'g1', name: 'Staff', site: null };
+  const hidden = { kind: 'group', id: 'g2', name: null, hidden: true };
+  const choices = filterChoices({
+    assignments: [{ principal: zed }],
+    breaks: [
+      { assignments: [{ principal: bea }, { principal: hidden }] },
+      { assignments: [{ principal: ann }, { principal: zed }, { principal: staff }] },
+    ],
+    groups: [{ id: 'g3', name: 'Alpha Owners', site: { id: 's', name: 'Alpha' } }],
+    members: [{ id: 'u1', name: 'Ann' }],
+  });
+  assert.deepEqual(choices.people, [
+    ['u1', 'Ann'],
+    ['u3', 'Bea'],
+    ['u2', 'Zed'],
+  ]);
+  assert.deepEqual(choices.groups, [
+    ['g3', 'Alpha Owners (site: Alpha)'],
+    ['g1', 'Staff (organisation group)'],
+  ]);
+  assert.deepEqual(filterChoices({}), { people: [], groups: [] });
 });

@@ -10,8 +10,8 @@ import {
   exceptionTree,
   explorerQuery,
   explorerRows,
+  filterChoices,
   formatTime,
-  groupLabel,
   h,
   inheritAgainMessage,
   messageFor,
@@ -71,7 +71,11 @@ const accessResult = await api('GET', `/nodes/${seg(rootId)}/access`);
 const rootUnique = accessResult.ok ? !accessResult.data.inherits : true;
 
 fillPlaces();
-await fillPrincipals(accessResult.ok ? accessResult.data.assignments : []);
+// What the "who" filter is built from: the root's assignments, the groups listed and the members
+// of those the person manages; every break loaded adds the people and groups named on it.
+const known = { assignments: accessResult.ok ? accessResult.data.assignments : [], groups: [], members: [] };
+await loadGroups();
+fillPrincipals();
 $('filters').addEventListener('submit', (event) => event.preventDefault());
 $('place').addEventListener('change', () => location.assign(`/explorer.html?root=${seg($('place').value)}`));
 $('principal').addEventListener('change', changeFilter);
@@ -100,35 +104,33 @@ function fillPlaces() {
   );
 }
 
-/** Offers the people and groups the person can name: those on this place, groups, their members. */
-async function fillPrincipals(assignments) {
-  const people = new Map();
-  const groups = new Map();
-  for (const { principal } of assignments) {
-    if (principal.hidden) continue;
-    if (principal.kind === 'user') people.set(principal.id, principal.name);
-    else groups.set(principal.id, groupLabel(principal));
-  }
+/** Loads the groups the person can see, and the members of those they manage. */
+async function loadGroups() {
   const listed = await api('GET', '/groups');
-  if (listed.ok) {
-    for (const group of listed.data) {
-      groups.set(group.id, groupLabel(group));
-      if (!group.can_manage) continue;
-      const detail = await api('GET', `/groups/${seg(group.id)}`);
-      if (!detail.ok) continue;
-      for (const member of detail.data.members) people.set(member.id, member.name);
-    }
+  if (!listed.ok) return;
+  known.groups = listed.data;
+  for (const group of listed.data) {
+    if (!group.can_manage) continue;
+    const detail = await api('GET', `/groups/${seg(group.id)}`);
+    if (detail.ok) known.members = known.members.concat(detail.data.members);
   }
-  const byName = ([, a], [, b]) => a.localeCompare(b);
+}
+
+/**
+ * Offers the people and groups the person can name: those on this place, groups, their members,
+ * and everyone named on a break loaded so far. Keeps the current choice.
+ */
+function fillPrincipals() {
+  const { people, groups } = filterChoices({ ...known, breaks: broken.items.concat(everything.items) });
+  const chosen = $('principal').value;
   const group = (label, entries, kind) =>
-    entries.length
-      ? h('optgroup', { label }, ...entries.sort(byName).map(([id, name]) => h('option', { value: `${kind}:${id}` }, name)))
-      : null;
+    entries.length ? h('optgroup', { label }, ...entries.map(([id, name]) => h('option', { value: `${kind}:${id}` }, name))) : null;
   $('principal').replaceChildren(
     h('option', { value: '' }, 'Anyone'),
-    group('People', [...people], 'user'),
-    group('Groups', [...groups], 'group'),
+    group('People', people, 'user'),
+    group('Groups', groups, 'group'),
   );
+  $('principal').value = chosen;
 }
 
 async function changeFilter() {
@@ -172,6 +174,7 @@ async function loadBreaks() {
   if (!result.ok) return note(messageFor(result.error), true);
   broken.items = broken.items.concat(result.data.items);
   broken.next = result.data.next;
+  fillPrincipals();
   broken.tree = exceptionTree(broken.items);
   const fresh = broken.tree.root ? [broken.tree.root.id, ...broken.tree.loaded.keys()] : [];
   for (const id of fresh) {
@@ -301,6 +304,7 @@ async function findBreak(id) {
     everything.items = everything.items.concat(result.data.items);
     everything.next = result.data.next;
   }
+  fillPrincipals();
   return seen() ?? null;
 }
 

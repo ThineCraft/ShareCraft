@@ -311,6 +311,30 @@ export function itemActions({ kind, access }) {
 }
 
 /**
+ * What the explorer's "who" filter offers: the people and groups named on `assignments` (the
+ * explorer's root) and on every break in `breaks` (as `GET /api/explorer/{root}` lists them),
+ * the `groups` listed (`GET /api/groups`) and `members` (people seen as members of groups,
+ * `{ id, name }`). Groups hidden from the person are left out. `{ people, groups }`, each a list
+ * of `[id, label]` with every id once, sorted by label.
+ */
+export function filterChoices({ assignments = [], breaks = [], groups = [], members = [] }) {
+  const people = new Map();
+  const named = new Map();
+  const take = (principal) => {
+    if (principal.hidden) return;
+    if (principal.kind === 'user') people.set(principal.id, principal.name);
+    else named.set(principal.id, groupLabel(principal));
+  };
+  for (const { principal } of assignments) take(principal);
+  for (const found of breaks) for (const { principal } of found.assignments ?? []) take(principal);
+  for (const group of groups) named.set(group.id, groupLabel(group));
+  for (const member of members) people.set(member.id, member.name);
+  const sorted = (map) =>
+    [...map].sort(([idA, a], [idB, b]) => a.localeCompare(b) || (idA < idB ? -1 : idA > idB ? 1 : 0));
+  return { people: sorted(people), groups: sorted(named) };
+}
+
+/**
  * The rows the explorer shows for the children `items` of one place (as `GET
  * /api/nodes/{id}/children` lists them): only those the person manages access on, each with its
  * break count from `counts` (a Map of id to count). `unique` says the item has permissions of
