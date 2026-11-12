@@ -165,8 +165,14 @@ export function showMessage(element, text) {
 }
 
 
-/** The roles that may change things in a place. */
-export const canEdit = (role) => role === 'editor' || role === 'owner';
+/**
+ * Whether `access` (`{ perms, roles }` as the server answers it, or null for limited access)
+ * holds the permission `perm`: `view`, `add`, `edit`, `delete`, `manage_access` or `manage_site`.
+ */
+export const can = (access, perm) => Array.isArray(access?.perms) && access.perms.includes(perm);
+
+/** Whether `access` lets the person change content and rename. */
+export const canEdit = (access) => can(access, 'edit');
 
 /**
  * The page that opens a node, by its kind. `editor` is a file's editor id; when it is not known
@@ -186,7 +192,7 @@ export function pageFor(kind, id, editor) {
 
 /**
  * The steps of a breadcrumb for `path` (site first, as `GET /api/nodes/{id}` answers it):
- * `{ id, name, href }`. `href` is null where the person has no role of their own (limited
+ * `{ id, name, href }`. `href` is null where the person has no access of their own (limited
  * access: the name is shown, not linked) and, unless `linkLast`, on the last step: the page
  * being shown.
  */
@@ -195,7 +201,7 @@ export function breadcrumbParts(path, { linkLast = true } = {}) {
     id: crumb.id,
     name: crumb.name,
     href:
-      crumb.role && (linkLast || at < path.length - 1)
+      crumb.access && (linkLast || at < path.length - 1)
         ? pageFor(crumb.kind, crumb.id, crumb.editor)
         : null,
   }));
@@ -219,7 +225,7 @@ export function breadcrumbs(path, options) {
 
 /**
  * Fills `target` (a `nav` element) with the breadcrumb of node `id` and returns what the page
- * needs: `{ path, role, folder }`, `folder` being the step above (where closing goes), or null
+ * needs: `{ path, access, folder }`, `folder` being the step above (where closing goes), or null
  * when there is none the person can open. Returns null, leaving `target` as it was, on failure.
  */
 export async function showCrumbs(target, id, options) {
@@ -228,7 +234,7 @@ export async function showCrumbs(target, id, options) {
   const path = result.data.path;
   target.replaceChildren(breadcrumbs(path, options));
   const above = path.length > 1 ? path[path.length - 2] : null;
-  return { path, role: result.data.role, folder: above?.role ? above : null };
+  return { path, access: result.data.access, folder: above?.access ? above : null };
 }
 
 /** Roles a person can be given, lowest first. */
@@ -240,7 +246,7 @@ export const roleName = (role) => (role ? role[0].toUpperCase() + role.slice(1) 
 /**
  * What the move dialog offers inside one place: sites, libraries and folders except `movingId`
  * itself, which is never offered, so nothing below it can be reached. Each has `canChoose`,
- * true only for a library or folder where the person is an editor or owner.
+ * true only for a library or folder where the person may add (`add`).
  */
 export function moveChoices(items, movingId) {
   return items
@@ -249,19 +255,19 @@ export function moveChoices(items, movingId) {
       id: item.id,
       kind: item.kind,
       name: item.name,
-      role: item.role ?? null,
-      canChoose: item.kind !== 'site' && canEdit(item.role),
+      access: item.access ?? null,
+      canChoose: item.kind !== 'site' && can(item.access, 'add'),
     }));
 }
 
 /**
  * Whether "Move here" is offered at the end of `trail` (the steps from the site to where the
- * dialog is): a library or folder the person can edit, which is not the item itself or below
+ * dialog is): a library or folder the person may add to, which is not the item itself or below
  * it, and not the place the item is in already (`currentParentId`).
  */
 export function canMoveHere(trail, movingId, currentParentId) {
   const here = trail[trail.length - 1];
-  if (!here || !['library', 'folder'].includes(here.kind) || !canEdit(here.role)) return false;
+  if (!here || !['library', 'folder'].includes(here.kind) || !can(here.access, 'add')) return false;
   if (trail.some((step) => step.id === movingId)) return false;
   return here.id !== currentParentId;
 }

@@ -306,7 +306,7 @@ async fn scopes_under(
 }
 
 /// The assignments on each of `scopes`, as `viewer` may see them, by the principal's name.
-async fn assignments_on(
+pub(crate) async fn assignments_on(
     conn: &mut PgConnection,
     viewer: UserId,
     scopes: &[NodeId],
@@ -511,6 +511,14 @@ async fn events_on(
 /// The cursor for the page after the scope with `key`.
 fn cursor_of(key: &[Step]) -> String {
     serde_json::to_string(key).unwrap_or_default()
+}
+
+/// Whether `text` is a cursor of the inheritance explorer, as [`Db::breaks`] hands one out. A
+/// cursor that is not one is refused by [`Db::breaks`] with an error, which callers taking the
+/// cursor from a request can tell apart from a database failure by asking this first.
+#[must_use]
+pub fn is_explorer_cursor(text: &str) -> bool {
+    serde_json::from_str::<Vec<Step>>(text).is_ok()
 }
 
 /// See [`Db::breaks`]; on `conn`.

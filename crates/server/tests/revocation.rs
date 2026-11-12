@@ -38,7 +38,7 @@ const PROMPTLY: Duration = Duration::from_secs(1);
 async fn revoke(site: &Site, owner: &TestUser, doc: DocId, user: UserId) {
     let response = site
         .http(Some(owner))
-        .delete(site.url(&format!("/api/docs/{}/access/{}", doc.0, user.0)))
+        .delete(site.url(&format!("/api/docs/{}/access/user/{}", doc.0, user.0)))
         .send()
         .await
         .unwrap();

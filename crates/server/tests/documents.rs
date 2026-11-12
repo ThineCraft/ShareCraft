@@ -68,7 +68,7 @@ async fn listed_in(server: &TestServer, user: &TestUser, folder: NodeId) -> Valu
     body["items"].clone()
 }
 
-/// The grants on the scope that decides access to `doc`, as its owner `user` sees them.
+/// The assignments on the scope that decides access to `doc`, as its owner `user` sees them.
 async fn grants(server: &TestServer, user: &TestUser, doc: &str) -> Value {
     let (status, body) = call(
         server,
@@ -79,7 +79,7 @@ async fn grants(server: &TestServer, user: &TestUser, doc: &str) -> Value {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    body["grants"].clone()
+    body["assignments"].clone()
 }
 
 /// Creates a document in `user`'s own folder (so they own it) and returns its id.
@@ -110,7 +110,7 @@ async fn creator_owns_and_lists_the_new_document() {
     let (status, body) = post_doc(&server, &ann, json!({ "name": "  Plans " })).await;
     assert_eq!(status, StatusCode::CREATED);
     assert_eq!(body["name"], "Plans");
-    assert_eq!(body["role"], "owner");
+    assert_eq!(body["access"], common::role_access("owner"));
     let id = body["id"].as_str().unwrap().to_owned();
 
     // The name is optional.
@@ -123,7 +123,7 @@ async fn creator_owns_and_lists_the_new_document() {
     assert_eq!(list.len(), 2);
     let plans = list.iter().find(|d| d["id"] == id.as_str()).unwrap();
     assert_eq!(plans["name"], "Plans");
-    assert_eq!(plans["role"], "owner");
+    assert_eq!(plans["access"], common::role_access("owner"));
     assert_eq!(plans["revised_at"], Value::Null);
 
     let (status, doc) = call(
@@ -137,7 +137,13 @@ async fn creator_owns_and_lists_the_new_document() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         doc,
-        json!({ "id": id, "name": "Plans", "editor": "text", "role": "owner", "revision": null })
+        json!({
+            "id": id,
+            "name": "Plans",
+            "editor": "text",
+            "access": common::role_access("owner"),
+            "revision": null
+        })
     );
 
     // Names the records layer refuses, and ids that are not ids.
@@ -224,7 +230,7 @@ async fn owner_shares_by_email_and_the_grantee_lists_the_document() {
     let list = listed_in(&server, &bob, home).await;
     assert_eq!(list.as_array().unwrap().len(), 1);
     assert_eq!(list[0]["id"], id.as_str());
-    assert_eq!(list[0]["role"], "viewer");
+    assert_eq!(list[0]["access"], common::role_access("viewer"));
     let (status, doc) = call(
         &server,
         Some(&bob),
@@ -234,7 +240,7 @@ async fn owner_shares_by_email_and_the_grantee_lists_the_document() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(doc["role"], "viewer");
+    assert_eq!(doc["access"], common::role_access("viewer"));
 
     // Changing the role replaces it.
     share(&server, &ann, &id, &bob.email, "editor").await;
@@ -243,18 +249,19 @@ async fn owner_shares_by_email_and_the_grantee_lists_the_document() {
     assert_eq!(access.len(), 2);
     let row = access
         .iter()
-        .find(|r| r["user"]["email"] == bob.email.as_str())
+        .find(|r| r["principal"]["email"] == bob.email.as_str())
         .unwrap();
-    assert_eq!(row["role"], "editor");
-    assert_eq!(row["user"]["id"], bob.id.0.to_string());
-    assert!(row["user"]["name"].is_string());
+    assert_eq!(row["role"], json!({ "id": "editor", "name": "Editor" }));
+    assert_eq!(row["principal"]["kind"], "user");
+    assert_eq!(row["principal"]["id"], bob.id.0.to_string());
+    assert!(row["principal"]["name"].is_string());
 
     // Removing it takes the document away again.
     let (status, _) = call(
         &server,
         Some(&ann),
         Method::DELETE,
-        &format!("/api/docs/{id}/access/{}", bob.id.0),
+        &format!("/api/docs/{id}/access/user/{}", bob.id.0),
         None,
     )
     .await;
@@ -313,7 +320,7 @@ async fn editor_gets_403_managing_access() {
         &server,
         Some(&bob),
         Method::DELETE,
-        &format!("{path}/{}", ann.id.0),
+        &format!("{path}/user/{}", ann.id.0),
         None,
     )
     .await;
@@ -346,7 +353,7 @@ async fn last_owner_cannot_be_removed() {
     let bob = server.user("bob").await;
     let id = create_doc(&server, &ann, "Mine").await;
 
-    let remove_ann = format!("/api/docs/{id}/access/{}", ann.id.0);
+    let remove_ann = format!("/api/docs/{id}/access/user/{}", ann.id.0);
     let (status, body) = call(&server, Some(&ann), Method::DELETE, &remove_ann, None).await;
     assert_eq!(
         (status, body),
@@ -389,7 +396,7 @@ async fn admin_can_open_and_share_any_document() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(doc["role"], "owner");
+    assert_eq!(doc["access"], common::role_access("owner"));
     share(&server, &root, &id, &bob.email, "viewer").await;
     let list = listed_in(&server, &bob, server.home_of(&ann).await).await;
     assert_eq!(list[0]["id"], id.as_str());
@@ -606,7 +613,7 @@ async fn unsigned_caller_gets_401_from_every_route() {
             format!("{node}/access"),
             Some(json!({ "email": "a@test.invalid", "role": "viewer" })),
         ),
-        (Method::DELETE, format!("{node}/access/{id}"), None),
+        (Method::DELETE, format!("{node}/access/user/{id}"), None),
         (
             Method::POST,
             format!("{node}/inheritance"),
@@ -630,7 +637,11 @@ async fn unsigned_caller_gets_401_from_every_route() {
             docs_access,
             Some(json!({ "email": "a@test.invalid", "role": "viewer" })),
         ),
-        (Method::DELETE, format!("/api/docs/{id}/access/{id}"), None),
+        (
+            Method::DELETE,
+            format!("/api/docs/{id}/access/user/{id}"),
+            None,
+        ),
         (Method::GET, "/api/admin/users".into(), None),
         (
             Method::POST,

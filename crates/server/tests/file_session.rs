@@ -52,7 +52,7 @@ async fn share(site: &Site, owner: &TestUser, doc: DocId, user: &TestUser, role:
 async fn revoke(site: &Site, owner: &TestUser, doc: DocId, user: UserId) {
     let response = site
         .http(Some(owner))
-        .delete(site.url(&format!("/api/docs/{}/access/{}", doc.0, user.0)))
+        .delete(site.url(&format!("/api/docs/{}/access/user/{}", doc.0, user.0)))
         .send()
         .await
         .unwrap();

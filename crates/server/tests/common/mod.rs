@@ -1203,3 +1203,25 @@ pub async fn wait_events(
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
+
+/// The access, as the API answers it (`{perms, roles}`), that the built-in role `id`
+/// (`viewer`, `editor` or `owner`) alone gives.
+pub fn role_access(id: &str) -> serde_json::Value {
+    let (name, perms): (&str, &[&str]) = match id {
+        "viewer" => ("Viewer", &["view"]),
+        "editor" => ("Editor", &["view", "add", "edit", "delete"]),
+        "owner" => (
+            "Owner",
+            &[
+                "view",
+                "add",
+                "edit",
+                "delete",
+                "manage_access",
+                "manage_site",
+            ],
+        ),
+        other => panic!("not a built-in role: {other}"),
+    };
+    serde_json::json!({ "perms": perms, "roles": [{ "id": id, "name": name }] })
+}

@@ -15,6 +15,17 @@ import {
 
 const origin = 'http://127.0.0.1:8787';
 
+/** Access as the server answers it for each built-in role. */
+const VIEWER = Object.freeze({ perms: ['view'], roles: [{ id: 'viewer', name: 'Viewer' }] });
+const EDITOR = Object.freeze({
+  perms: ['view', 'add', 'edit', 'delete'],
+  roles: [{ id: 'editor', name: 'Editor' }],
+});
+const OWNER = Object.freeze({
+  perms: ['view', 'add', 'edit', 'delete', 'manage_access', 'manage_site'],
+  roles: [{ id: 'owner', name: 'Owner' }],
+});
+
 test('a path on this site is kept', () => {
   assert.equal(safeNext('/doc.html#abc', origin), '/doc.html#abc');
   assert.equal(safeNext('/people.html?x=1#y', origin), '/people.html?x=1#y');
@@ -52,12 +63,12 @@ test('pages open by kind', () => {
   assert.equal(pageFor('document', FILE, 'gridcraft'), `/file.html?doc=${FILE}`);
 });
 
-test('breadcrumbs link only the steps with a role', () => {
+test('breadcrumbs link only the steps with access', () => {
   const path = [
-    { id: SITE, kind: 'site', name: 'Site', role: null },
-    { id: LIB, kind: 'library', name: 'Documents', role: null },
-    { id: DIR, kind: 'folder', name: 'Plans', role: 'viewer' },
-    { id: FILE, kind: 'document', name: 'Plan.txt', role: 'viewer' },
+    { id: SITE, kind: 'site', name: 'Site', access: null },
+    { id: LIB, kind: 'library', name: 'Documents', access: null },
+    { id: DIR, kind: 'folder', name: 'Plans', access: VIEWER },
+    { id: FILE, kind: 'document', name: 'Plan.txt', access: VIEWER },
   ];
   const parts = breadcrumbParts(path);
   assert.deepEqual(
@@ -90,13 +101,13 @@ function fakeDocument() {
   };
 }
 
-test('rendered breadcrumbs hold links only where there is a role', () => {
+test('rendered breadcrumbs hold links only where there is access', () => {
   fakeDocument();
   try {
     const list = breadcrumbs([
-      { id: SITE, kind: 'site', name: 'Site', role: null },
-      { id: LIB, kind: 'library', name: 'Documents', role: 'owner' },
-      { id: DIR, kind: 'folder', name: 'Plans', role: 'owner' },
+      { id: SITE, kind: 'site', name: 'Site', access: null },
+      { id: LIB, kind: 'library', name: 'Documents', access: OWNER },
+      { id: DIR, kind: 'folder', name: 'Plans', access: OWNER },
     ], { linkLast: false });
     const tags = list.children.map((li) => li.children[0].tag);
     assert.deepEqual(tags, ['span', 'a', 'span']);
@@ -157,10 +168,10 @@ test('a refused "Inherit again" names who may do it', () => {
 
 test('the move dialog never offers the item itself', () => {
   const items = [
-    { id: DIR, kind: 'folder', name: 'Plans', role: 'editor' },
-    { id: LIB, kind: 'folder', name: 'Other', role: 'owner' },
-    { id: FILE, kind: 'document', name: 'Plan.txt', role: 'editor' },
-    { id: SITE, kind: 'library', name: 'Limited', role: null },
+    { id: DIR, kind: 'folder', name: 'Plans', access: EDITOR },
+    { id: LIB, kind: 'folder', name: 'Other', access: OWNER },
+    { id: FILE, kind: 'document', name: 'Plan.txt', access: EDITOR },
+    { id: SITE, kind: 'library', name: 'Limited', access: null },
   ];
   const offered = moveChoices(items, DIR);
   assert.deepEqual(offered.map((o) => o.id), [LIB, SITE]);
@@ -169,15 +180,17 @@ test('the move dialog never offers the item itself', () => {
 });
 
 test('the move dialog never lets the item go into itself or below itself', () => {
-  const site = { id: SITE, kind: 'site', name: 'S', role: 'owner' };
-  const lib = { id: LIB, kind: 'library', name: 'L', role: 'owner' };
-  const moving = { id: DIR, kind: 'folder', name: 'D', role: 'editor' };
-  const below = { id: FILE, kind: 'folder', name: 'Below', role: 'editor' };
+  const site = { id: SITE, kind: 'site', name: 'S', access: OWNER };
+  const lib = { id: LIB, kind: 'library', name: 'L', access: OWNER };
+  const moving = { id: DIR, kind: 'folder', name: 'D', access: EDITOR };
+  const below = { id: FILE, kind: 'folder', name: 'Below', access: EDITOR };
   assert.equal(canMoveHere([site, lib], DIR, FILE), true);
   assert.equal(canMoveHere([site, lib, moving], DIR, FILE), false, 'into itself');
   assert.equal(canMoveHere([site, lib, moving, below], DIR, FILE), false, 'below itself');
   assert.equal(canMoveHere([site, lib], DIR, LIB), false, 'where it already is');
   assert.equal(canMoveHere([site], DIR, LIB), false, 'a site is not a place for a folder');
-  assert.equal(canMoveHere([site, { ...lib, role: 'viewer' }], DIR, FILE), false);
+  assert.equal(canMoveHere([site, { ...lib, access: VIEWER }], DIR, FILE), false);
+  const editOnly = { perms: ['view', 'edit'], roles: [{ id: 'x', name: 'Edit only' }] };
+  assert.equal(canMoveHere([site, { ...lib, access: editOnly }], DIR, FILE), false, 'needs add');
   assert.equal(canMoveHere([], DIR, FILE), false);
 });

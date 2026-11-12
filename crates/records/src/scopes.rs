@@ -19,6 +19,7 @@ use time::OffsetDateTime;
 use crate::accounts::user_from_row;
 use crate::documents::parse_editor;
 use crate::events::{NewEvent, record};
+use crate::explorer::{AssignmentView, assignments_on};
 use crate::groups::{all_locked, groups_judged_by, lock_groups};
 use crate::roles::{lock_roles, role_by_id};
 use crate::tree::node_from_row;
@@ -175,6 +176,9 @@ pub struct NodeAccess {
     pub source: Crumb,
     /// The people's assignments on `source`, by name.
     pub grants: Vec<Grant>,
+    /// Every assignment on `source`, to people and groups, by the principal's name, as the
+    /// caller may see it: a group they may not see by its id only.
+    pub assignments: Vec<AssignmentView>,
 }
 
 /// One node of a chain from a site down, with someone's access to it.
@@ -514,6 +518,24 @@ impl Db {
         Ok(access_in(&mut conn, user, node).await?)
     }
 
+    /// Whether `user` may manage access somewhere: an enabled administrator, or an enabled
+    /// account with `manage_access` on some live node. A disabled or unknown account may not.
+    pub async fn manages_access_anywhere(&self, user: UserId) -> Result<bool, DbError> {
+        let mut conn = self.pool().acquire().await?;
+        match standing(&mut conn, user).await? {
+            Standing::Nobody => return Ok(false),
+            Standing::Admin => return Ok(true),
+            Standing::Member => {}
+        }
+        let query = format!(
+            "with recursive {REACH}              select exists (select 1 from mine m                             where m.perms & {MANAGE_ACCESS_BIT} <> 0                               and m.node_id in (select origin from live))"
+        );
+        Ok(sqlx::query_scalar(sqlx::AssertSqlSafe(query))
+            .bind(user.0)
+            .fetch_one(&mut *conn)
+            .await?)
+    }
+
     /// The breadcrumb from the site down to `node`, with `user`'s access to each step. `None`
     /// unless the person has access to the node or limited access to it (access somewhere
     /// below it).
@@ -668,10 +690,15 @@ impl Db {
             .ok_or(AccessError::NotFound)?;
         let inherits = links.last().is_some_and(|link| !link.node.unique_scope);
         let grants = grants_on(&mut conn, source.node.id).await?;
+        let assignments = assignments_on(&mut conn, actor, &[source.node.id])
+            .await?
+            .remove(&source.node.id)
+            .unwrap_or_default();
         Ok(NodeAccess {
             inherits,
             source: crumb(source),
             grants,
+            assignments,
         })
     }
 

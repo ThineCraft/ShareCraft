@@ -91,6 +91,9 @@ pub struct Group {
     pub name: String,
     /// The site of a site group; `None` for an organisation group.
     pub site: Option<NodeId>,
+    /// The current name of the site of a site group; `None` for an organisation group. A site
+    /// group's name can equal an organisation group's, so it is shown with its site.
+    pub site_name: Option<String>,
     /// What a site group is for; `None` for an organisation group.
     pub purpose: Option<SiteGroup>,
     /// How many people are members.
@@ -104,7 +107,7 @@ const GROUP_FROM: &str = "groups g left join nodes s on s.id = g.site_id \
                         else 'Visitors' end) as display_name) gn";
 
 /// The columns [`group_from_row`] reads, from [`GROUP_FROM`].
-const GROUP_COLUMNS: &str = "g.id, g.site_id, g.purpose, gn.display_name, \
+const GROUP_COLUMNS: &str = "g.id, g.site_id, s.name as site_name, g.purpose, gn.display_name, \
      (select count(*) from group_members m where m.group_id = g.id) as member_count";
 
 fn group_from_row(row: &PgRow) -> Result<Group, sqlx::Error> {
@@ -119,6 +122,7 @@ fn group_from_row(row: &PgRow) -> Result<Group, sqlx::Error> {
         id: GroupId(row.try_get("id")?),
         name: row.try_get("display_name")?,
         site: row.try_get::<Option<Uuid>, _>("site_id")?.map(NodeId),
+        site_name: row.try_get("site_name")?,
         purpose,
         member_count: row.try_get("member_count")?,
     })
@@ -382,6 +386,15 @@ impl Db {
         Ok(Some((group, members)))
     }
 
+    /// Whether `user` manages the members of `group`: an enabled administrator manages every
+    /// group, someone with `manage_site` on a site its groups. `NoSuchGroup` if there is no such
+    /// group. [`Db::add_member`] and [`Db::remove_member`] decide again under their locks.
+    pub async fn manages_group(&self, user: UserId, group: GroupId) -> Result<bool, AccessError> {
+        let mut conn = self.pool().acquire().await?;
+        let (site, _) = group_place(&mut conn, group).await?;
+        Ok(manages(&mut conn, user, site).await?)
+    }
+
     /// The groups `user` is a member of, by id.
     pub async fn groups_of(&self, user: UserId) -> Result<Vec<GroupId>, DbError> {
         let ids: Vec<Uuid> = sqlx::query_scalar(
@@ -434,6 +447,7 @@ impl Db {
             id: GroupId(id),
             name: name.to_owned(),
             site: None,
+            site_name: None,
             purpose: None,
             member_count: 0,
         })

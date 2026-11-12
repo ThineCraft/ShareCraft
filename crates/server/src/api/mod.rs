@@ -4,7 +4,10 @@
 mod admin;
 mod content;
 mod docs;
+mod explorer;
+mod groups;
 mod nodes;
+mod roles;
 mod session;
 mod sites;
 
@@ -15,11 +18,10 @@ use axum::http::header::{CACHE_CONTROL, ORIGIN};
 use axum::http::{HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
-use collab_core::ids::{NodeId, SessionId, UserId};
-use records::{Access, AccessError, AccountError, Perms};
-use serde::Serialize;
+use collab_core::ids::{DocId, NodeId, SessionId, UserId};
+use records::{AccessError, AccountError};
 use serde::de::DeserializeOwned;
 use serde_json::json;
 use uuid::Uuid;
@@ -40,6 +42,16 @@ pub(crate) fn router(max_file_bytes: usize) -> Router<AppState> {
         .route("/me", get(session::me))
         .route("/editors", get(crate::editors::list))
         .route("/sites", get(sites::list).post(sites::create))
+        .route("/sites/{id}/groups", get(sites::groups))
+        .route("/roles", get(roles::list).post(roles::create))
+        .route("/roles/{id}", patch(roles::change).delete(roles::remove))
+        .route("/groups", get(groups::list).post(groups::create))
+        .route("/groups/{id}", get(groups::show).delete(groups::remove))
+        .route("/groups/{id}/members", post(groups::add_by_email))
+        .route(
+            "/groups/{id}/members/{user_id}",
+            put(groups::add_member).delete(groups::remove_member),
+        )
         .route(
             "/nodes/{id}",
             get(nodes::show).patch(nodes::change).delete(nodes::remove),
@@ -49,8 +61,15 @@ pub(crate) fn router(max_file_bytes: usize) -> Router<AppState> {
             get(nodes::children).post(nodes::create),
         )
         .route("/nodes/{id}/access", get(nodes::access).put(nodes::share))
-        .route("/nodes/{id}/access/{user_id}", delete(nodes::unshare))
+        .route(
+            "/nodes/{id}/access/{kind}/{principal_id}",
+            delete(nodes::unshare),
+        )
         .route("/nodes/{id}/inheritance", post(nodes::inheritance))
+        .route("/nodes/{id}/inheritance/preview", get(explorer::preview))
+        .route("/explorer/{root}", get(explorer::breaks))
+        .route("/explorer/{root}/counts", get(explorer::counts))
+        .route("/explorer/{root}/export.csv", get(explorer::export))
         .route("/docs", post(docs::create))
         .route(
             "/docs/upload",
@@ -65,7 +84,10 @@ pub(crate) fn router(max_file_bytes: usize) -> Router<AppState> {
         )
         .route("/docs/{id}/access", get(nodes::access).put(nodes::share))
         .route("/docs/{id}/events", get(docs::events))
-        .route("/docs/{id}/access/{user_id}", delete(nodes::unshare))
+        .route(
+            "/docs/{id}/access/{kind}/{principal_id}",
+            delete(nodes::unshare),
+        )
         .route("/admin/users", get(admin::users).post(admin::create))
         .route("/admin/users/{id}/disable", post(admin::disable))
         .route("/admin/users/{id}/enable", post(admin::enable))
@@ -244,34 +266,6 @@ impl From<AccountError> for ApiError {
     }
 }
 
-/// The plan-1 name of a set of permissions, which responses keep until the API speaks of roles
-/// and permissions: `owner` with `manage_access`, else `editor` with `edit`, else `viewer`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum LegacyRole {
-    Viewer,
-    Editor,
-    Owner,
-}
-
-impl LegacyRole {
-    /// The name of `perms`.
-    pub(crate) fn of_perms(perms: Perms) -> LegacyRole {
-        if perms.contains(Perms::MANAGE_ACCESS) {
-            LegacyRole::Owner
-        } else if perms.contains(Perms::EDIT) {
-            LegacyRole::Editor
-        } else {
-            LegacyRole::Viewer
-        }
-    }
-
-    /// The name of `access`'s permissions.
-    pub(crate) fn of(access: &Access) -> LegacyRole {
-        LegacyRole::of_perms(access.perms)
-    }
-}
-
 /// An id from a path, or `422 invalid_request` when it is not one.
 fn parse_id(text: &str) -> Result<Uuid, ApiError> {
     Uuid::parse_str(text).map_err(|_| ApiError::InvalidRequest)
@@ -294,30 +288,64 @@ async fn to_completion<T: Send + 'static>(
 }
 
 /// Called once a change that can alter access at or below `node` is stored: an assignment,
-/// a break or restore of inheritance on `node`, or a move of `node`. For every open document
-/// at or below `node`, one at a time in id order, reads the access of each person connected
-/// to it afresh (so an administrator who loses a grant keeps every permission) and tells the
-/// room: connections that lost access are removed, the others get their new rights. If access
-/// cannot be read, that person's connections are removed, as it can no longer be confirmed; if it
-/// cannot be told whether a document is below `node`, it is checked anyway.
-///
-/// Each document's readings and messages happen under its access lock, so that of two changes
-/// made at once the room hears the later reading last. One lock is held at a time.
+/// a break or restore of inheritance on `node`, or a move of `node`. Rechecks (see
+/// [`recheck`]) every open document at or below `node`; if it cannot be told whether a
+/// document is below `node`, it is checked anyway.
 ///
 /// Callers run it inside [`to_completion`], so a cancelled request still revokes.
 pub(crate) async fn recheck_below(state: &AppState, node: NodeId) {
+    let db = state.db();
+    let mut below = Vec::new();
+    for doc in state.rooms().open_documents() {
+        match db.is_at_or_below(doc.into(), node).await {
+            Ok(true) => below.push(doc),
+            Ok(false) => {}
+            Err(e) => {
+                eprintln!("sharecraft-server: database failure: {e}");
+                below.push(doc);
+            }
+        }
+    }
+    recheck(state, below, None).await;
+}
+
+/// Called once a change of `user`'s memberships is stored: rechecks (see [`recheck`]) `user`
+/// in every open document, wherever they are connected.
+///
+/// Callers run it inside [`to_completion`], so a cancelled request still revokes.
+pub(crate) async fn recheck_person(state: &AppState, user: UserId) {
+    let open = state.rooms().open_documents();
+    recheck(state, open, Some(user)).await;
+}
+
+/// Called once a change of a role's permissions is stored: the role may be held anywhere, so
+/// everyone in every open document is rechecked (see [`recheck`]).
+///
+/// Callers run it inside [`to_completion`], so a cancelled request still revokes.
+pub(crate) async fn recheck_everyone(state: &AppState) {
+    let open = state.rooms().open_documents();
+    recheck(state, open, None).await;
+}
+
+/// For each of `docs`, one at a time in id order, reads the access of each person connected
+/// to it (only of `only`, when given) afresh (so an administrator who loses a grant keeps every
+/// permission) and tells the room: connections that lost access are removed, the others get
+/// their new rights. If access cannot be read, that person's connections are removed, as it
+/// can no longer be confirmed.
+///
+/// Each document's readings and messages happen under its access lock, so that of two changes
+/// made at once the room hears the later reading last. One lock is held at a time.
+async fn recheck(state: &AppState, mut docs: Vec<DocId>, only: Option<UserId>) {
     let rooms = state.rooms();
     let db = state.db();
-    let mut open = rooms.open_documents();
-    open.sort_by_key(|doc| doc.0);
-    for doc in open {
-        match db.is_at_or_below(doc.into(), node).await {
-            Ok(true) => {}
-            Ok(false) => continue,
-            Err(e) => eprintln!("sharecraft-server: database failure: {e}"),
-        }
+    docs.sort_by_key(|doc| doc.0);
+    docs.dedup();
+    for doc in docs {
         let _in_order = rooms.order_access(doc).await;
         for user in rooms.connected_users(doc).await {
+            if only.is_some_and(|only| only != user) {
+                continue;
+            }
             let access = match db.effective_access(user, doc.into()).await {
                 Ok(access) => access,
                 Err(e) => {
@@ -507,7 +535,7 @@ mod tests {
             state.clone(),
             ann,
             doc.into(),
-            bob,
+            Principal::User(bob),
             None,
         ));
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);

@@ -325,7 +325,10 @@ async fn removal_is_recorded_after_the_revocation_that_caused_it() {
 
     let response = server
         .http(Some(&ann.user))
-        .delete(server.url(&format!("/api/docs/{}/access/{}", doc.0, bob.user.id.0)))
+        .delete(server.url(&format!(
+            "/api/docs/{}/access/user/{}",
+            doc.0, bob.user.id.0
+        )))
         .send()
         .await
         .unwrap();

@@ -6,7 +6,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use collab_core::ids::{DocId, NodeId};
-use records::{AccessError, Editor};
+use records::{Access, AccessError, Editor};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use time::OffsetDateTime;
@@ -14,7 +14,7 @@ use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
 use super::nodes::require_manager;
-use super::{ApiError, JsonBody, LegacyRole, parse_id, to_completion};
+use super::{ApiError, JsonBody, parse_id, to_completion};
 use crate::AppState;
 use crate::auth::Signed;
 use crate::tree;
@@ -45,7 +45,7 @@ fn refused(code: &str, message: &str) -> Response {
 
 /// `POST /api/docs {parent, name?, editor?}`: creates a document in the library or folder
 /// `parent`, of which the caller must be an editor. The document inherits its access from
-/// there. `201` with the document and the caller's role on it.
+/// there. `201` with the document and the caller's access to it.
 pub(crate) async fn create(
     State(state): State<AppState>,
     signed: Signed,
@@ -89,18 +89,16 @@ pub(crate) async fn create(
         }
         Err(e) => return Err(e.into()),
     };
-    let role = state
+    let access = state
         .db()
         .doc_access(user, id)
         .await
-        .map_err(|e| ApiError::unavailable(&e))?
-        .as_ref()
-        .map(LegacyRole::of);
+        .map_err(|e| ApiError::unavailable(&e))?;
     let body = Json(serde_json::json!({
         "id": document.id.0.to_string(),
         "name": document.name,
         "editor": document.editor,
-        "role": role,
+        "access": access,
     }));
     Ok((StatusCode::CREATED, body).into_response())
 }
@@ -111,11 +109,12 @@ pub(crate) struct DocDetail {
     id: String,
     name: String,
     editor: Editor,
-    role: LegacyRole,
+    /// The caller's access: `{perms, roles}`.
+    access: Access,
     revision: Option<String>,
 }
 
-/// `GET /api/docs/{id}`: the document, if the caller has a role on it.
+/// `GET /api/docs/{id}`: the document, if the caller has access to it.
 pub(crate) async fn open(
     State(state): State<AppState>,
     signed: Signed,
@@ -123,12 +122,10 @@ pub(crate) async fn open(
 ) -> Result<Json<DocDetail>, ApiError> {
     let doc = DocId(parse_id(&id)?);
     let db = state.db();
-    let role = db
+    let access = db
         .doc_access(signed.session.user.id, doc)
         .await
         .map_err(|e| ApiError::unavailable(&e))?
-        .as_ref()
-        .map(LegacyRole::of)
         .ok_or(ApiError::NotFound)?;
     let document = db
         .document(doc)
@@ -139,7 +136,7 @@ pub(crate) async fn open(
         id: document.id.0.to_string(),
         name: document.name,
         editor: document.editor,
-        role,
+        access,
         revision: document.revision,
     }))
 }

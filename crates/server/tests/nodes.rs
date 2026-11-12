@@ -230,7 +230,7 @@ async fn sites_are_listed_and_created_by_administrators() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         sites,
-        json!([{ "id": w.site, "name": "Team", "role": "owner" }])
+        json!([{ "id": w.site, "name": "Team", "access": common::role_access("owner") }])
     );
 
     // Only an administrator creates one.
@@ -286,7 +286,7 @@ async fn sites_are_listed_and_created_by_administrators() {
     let (_, sites) = w.call(&ann, Method::GET, "/api/sites", None).await;
     assert_eq!(
         sites,
-        json!([{ "id": w.site, "name": "Team", "role": null }])
+        json!([{ "id": w.site, "name": "Team", "access": null }])
     );
     let (_, sites) = w.call(&bob, Method::GET, "/api/sites", None).await;
     assert_eq!(sites, json!([]));
@@ -319,13 +319,13 @@ async fn node_shows_its_role_editor_and_path() {
             "id": doc,
             "kind": "document",
             "name": "Budget.xlsx",
-            "role": "editor",
+            "access": common::role_access("editor"),
             "editor": "gridcraft",
             "path": [
-                { "id": w.site, "kind": "site", "name": "Team", "role": null },
-                { "id": w.library, "kind": "library", "name": "Documents", "role": null },
-                { "id": folder, "kind": "folder", "name": "Plans", "role": "editor" },
-                { "id": doc, "kind": "document", "name": "Budget.xlsx", "role": "editor" },
+                { "id": w.site, "kind": "site", "name": "Team", "access": null },
+                { "id": w.library, "kind": "library", "name": "Documents", "access": null },
+                { "id": folder, "kind": "folder", "name": "Plans", "access": common::role_access("editor") },
+                { "id": doc, "kind": "document", "name": "Budget.xlsx", "access": common::role_access("editor") },
             ],
         })
     );
@@ -379,9 +379,9 @@ async fn children_are_listed_with_their_details() {
         page,
         json!({
             "items": [
-                { "id": folder, "kind": "folder", "name": "B folder", "role": "owner",
+                { "id": folder, "kind": "folder", "name": "B folder", "access": common::role_access("owner"),
                   "inherits": true },
-                { "id": doc, "kind": "document", "name": "A note", "role": "owner",
+                { "id": doc, "kind": "document", "name": "A note", "access": common::role_access("owner"),
                   "editor": "text", "inherits": false },
             ],
             "next": null,
@@ -399,7 +399,7 @@ async fn children_are_listed_with_their_details() {
         .await;
     assert_eq!(page["items"].as_array().unwrap().len(), 1);
     assert_eq!(page["items"][0]["id"], doc.as_str());
-    assert_eq!(page["items"][0]["role"], "viewer");
+    assert_eq!(page["items"][0]["access"], common::role_access("viewer"));
 
     // Refusals: no reach, a limit out of range, a cursor that is not one.
     let bob = w.server.user("Bob").await;
@@ -598,7 +598,7 @@ async fn documents_are_created_and_uploaded_into_a_parent() {
         .await;
     assert_eq!(status, StatusCode::CREATED);
     // The document inherits: its creator has the role they have on the library.
-    assert_eq!(body["role"], "editor");
+    assert_eq!(body["access"], common::role_access("editor"));
 
     let refused = [
         (
@@ -652,7 +652,7 @@ async fn documents_are_created_and_uploaded_into_a_parent() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::CREATED);
     let body: Value = response.json().await.unwrap();
-    assert_eq!(body["role"], "editor");
+    assert_eq!(body["access"], common::role_access("editor"));
     let response = upload(&ed, "name=Other.xlsx".into()).await.unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let response = upload(&vic, format!("parent={}&name=Other.xlsx", w.library))
@@ -861,13 +861,14 @@ async fn access_is_seen_and_changed_by_owners_on_any_node() {
     assert_eq!(access["inherits"], true);
     assert_eq!(
         access["source"],
-        json!({ "id": w.site, "kind": "site", "name": "Team", "role": "owner" })
+        json!({ "id": w.site, "kind": "site", "name": "Team", "access": common::role_access("owner") })
     );
-    let emails: HashSet<_> = access["grants"]
+    let emails: HashSet<_> = access["assignments"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|g| g["user"]["email"].as_str().unwrap().to_owned())
+        .filter(|a| a["principal"]["kind"] == "user")
+        .map(|a| a["principal"]["email"].as_str().unwrap().to_owned())
         .collect();
     // The site's creator owns it as a member of its Owners group, not by a grant of their own.
     assert_eq!(emails, HashSet::from([ed.email.clone()]));
@@ -894,7 +895,8 @@ async fn access_is_seen_and_changed_by_owners_on_any_node() {
     let (_, access) = w.call(&ann, Method::GET, &path, None).await;
     assert_eq!(access["inherits"], false);
     assert_eq!(access["source"]["id"], folder.as_str());
-    assert_eq!(access["grants"].as_array().unwrap().len(), 2);
+    // Ann, and the copies of Ed's assignment and of the site's three groups'.
+    assert_eq!(access["assignments"].as_array().unwrap().len(), 5);
 
     // Editors cannot see or change it; others cannot find it.
     let forbidden = (StatusCode::FORBIDDEN, error("forbidden"));
@@ -925,24 +927,35 @@ async fn access_is_seen_and_changed_by_owners_on_any_node() {
         (StatusCode::NOT_FOUND, error("no_such_user"))
     );
 
-    // Removing an assignment; the last owner stays. The copies of the site's groups go too
-    // (through the records: until the API speaks of groups, it names people only).
+    // Removing an assignment; the last owner stays. The copies of the site's groups go too.
     let (status, _) = w
-        .call(&ann, Method::DELETE, &format!("{path}/{}", ed.id.0), None)
+        .call(
+            &ann,
+            Method::DELETE,
+            &format!("{path}/user/{}", ed.id.0),
+            None,
+        )
         .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
-    let folder_id = collab_core::ids::NodeId(uuid::Uuid::parse_str(&folder).unwrap());
     for group in &groups {
-        w.server
-            .db
-            .db
-            .set_node_access(ann.id, folder_id, records::Principal::Group(group.id), None)
-            .await
-            .unwrap();
+        let (status, body) = w
+            .call(
+                &ann,
+                Method::DELETE,
+                &format!("{path}/group/{}", group.id.0),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
     }
     assert_eq!(
-        w.call(&ann, Method::DELETE, &format!("{path}/{}", ann.id.0), None)
-            .await,
+        w.call(
+            &ann,
+            Method::DELETE,
+            &format!("{path}/user/{}", ann.id.0),
+            None
+        )
+        .await,
         (StatusCode::CONFLICT, error("last_manager"))
     );
 }
@@ -985,7 +998,7 @@ async fn inheritance_is_broken_and_restored_by_owners() {
     let (_, node) = w
         .call(&ann, Method::GET, &format!("/api/nodes/{folder}"), None)
         .await;
-    assert_eq!(node["role"], "editor");
+    assert_eq!(node["access"], common::role_access("editor"));
     // Asking again changes nothing.
     assert_eq!(
         inherit(&w.root, &folder, false).await,
@@ -1051,18 +1064,18 @@ async fn doc_access_alias_matches_node_route() {
     let (_, access) = same(&w.root).await;
     assert_eq!(access["inherits"], false);
     assert!(
-        access["grants"]
+        access["assignments"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|g| g["user"]["id"] == ann.id.0.to_string() && g["role"] == "editor")
+            .any(|a| a["principal"]["id"] == ann.id.0.to_string() && a["role"]["id"] == "editor")
     );
     assert_eq!(same(&ann).await.1, error("forbidden"));
     let (status, _) = w
         .call(
             &w.root,
             Method::DELETE,
-            &format!("{doc_path}/{}", ann.id.0),
+            &format!("{doc_path}/user/{}", ann.id.0),
             None,
         )
         .await;
@@ -1087,13 +1100,13 @@ async fn file_reached_only_through_its_path() {
         .call(&bob, Method::GET, &format!("/api/docs/{file}"), None)
         .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(doc["role"], "viewer");
+    assert_eq!(doc["access"], common::role_access("viewer"));
 
     // From the sites list down, one level at a time, never seeing a sibling.
     let (_, sites) = w.call(&bob, Method::GET, "/api/sites", None).await;
     assert_eq!(
         sites,
-        json!([{ "id": w.site, "name": "Team", "role": null }])
+        json!([{ "id": w.site, "name": "Team", "access": null }])
     );
     assert_eq!(w.names(&bob, &w.site).await.unwrap(), vec!["Documents"]);
     assert_eq!(w.names(&bob, &w.library).await.unwrap(), vec!["A"]);
@@ -1102,11 +1115,11 @@ async fn file_reached_only_through_its_path() {
     let (_, page) = w
         .call(&bob, Method::GET, &format!("/api/nodes/{b}/children"), None)
         .await;
-    assert_eq!(page["items"][0]["role"], "viewer");
+    assert_eq!(page["items"][0]["access"], common::role_access("viewer"));
     let (_, page) = w
         .call(&bob, Method::GET, &format!("/api/nodes/{a}/children"), None)
         .await;
-    assert_eq!(page["items"][0]["role"], Value::Null);
+    assert_eq!(page["items"][0]["access"], Value::Null);
 
     // The breadcrumb names the way there, with no role above the file.
     let (_, node) = w
@@ -1116,7 +1129,7 @@ async fn file_reached_only_through_its_path() {
         .as_array()
         .unwrap()
         .iter()
-        .map(|crumb| (crumb["name"].clone(), crumb["role"].clone()))
+        .map(|crumb| (crumb["name"].clone(), crumb["access"].clone()))
         .collect();
     assert_eq!(
         roles,
@@ -1125,7 +1138,7 @@ async fn file_reached_only_through_its_path() {
             (json!("Documents"), Value::Null),
             (json!("A"), Value::Null),
             (json!("B"), Value::Null),
-            (json!("Target"), json!("viewer")),
+            (json!("Target"), common::role_access("viewer")),
         ]
     );
     // Limited access gives no way to change anything on the way.
@@ -1180,7 +1193,7 @@ async fn site_revoke_removes_member() {
         .call(
             &w.root,
             Method::DELETE,
-            &format!("/api/nodes/{}/access/{}", w.site, bob.id.0),
+            &format!("/api/nodes/{}/access/user/{}", w.site, bob.id.0),
             None,
         )
         .await;

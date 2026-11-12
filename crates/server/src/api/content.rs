@@ -25,7 +25,7 @@ use serde::Deserialize;
 use serde_json::{Map, json};
 use uuid::Uuid;
 
-use super::{ApiError, LegacyRole, parse_id, to_completion};
+use super::{ApiError, parse_id, to_completion};
 use crate::checkpoint::Checkpointer;
 use crate::file_room::SaveReply;
 use crate::projection::record_first;
@@ -254,13 +254,11 @@ pub(crate) async fn upload(
             Err(AccessError::WrongExtension) => return Err(ApiError::BadRequest),
             Err(e) => return Err(e.into()),
         };
-        let role = state
+        let access = state
             .db()
             .doc_access(user.id, id)
             .await
-            .map_err(|e| ApiError::unavailable(&e))?
-            .as_ref()
-            .map(LegacyRole::of);
+            .map_err(|e| ApiError::unavailable(&e))?;
         let author = Author {
             id: user.id.0.to_string(),
             name: credited_name(&user.name),
@@ -297,7 +295,7 @@ pub(crate) async fn upload(
             "id": document.id.0.to_string(),
             "name": document.name,
             "editor": document.editor,
-            "role": role,
+            "access": access,
         }));
         Ok((StatusCode::CREATED, body).into_response())
     })

@@ -186,7 +186,7 @@ async fn upload_then_download_round_trips() {
     let json: Value = response.json().await.unwrap();
     assert_eq!(json["name"], "Budget.xlsx");
     assert_eq!(json["editor"], "gridcraft");
-    assert_eq!(json["role"], "owner");
+    assert_eq!(json["access"], common::role_access("owner"));
     let doc = DocId(json["id"].as_str().unwrap().parse().unwrap());
 
     let response = download(&server, Some(&ann), doc, None).await;
@@ -439,7 +439,7 @@ async fn save_after_removal_is_refused() {
 
     let response = server
         .http(Some(&ann))
-        .delete(server.url(&format!("/api/docs/{}/access/{}", doc.0, bob.id.0)))
+        .delete(server.url(&format!("/api/docs/{}/access/user/{}", doc.0, bob.id.0)))
         .send()
         .await
         .unwrap();

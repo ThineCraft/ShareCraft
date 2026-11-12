@@ -25,6 +25,7 @@ pub use documents::{AccessError, Document, Editor, Grant, validate_document_name
 pub use events::{Event, NewEvent};
 pub use explorer::{
     AssignmentView, Break, ExplorerFilter, PrincipalView, RestorePreview, UserRef, breaks_csv,
+    is_explorer_cursor,
 };
 pub use groups::{Group, SiteGroup};
 pub use revisions::{RevisionRecord, RevisionRow};

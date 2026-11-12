@@ -309,7 +309,10 @@ async fn browser_removed_client_stops_and_reports_why() {
 
     let response = server
         .http(Some(&ann.user))
-        .delete(server.url(&format!("/api/docs/{}/access/{}", doc.0, bob.user.id.0)))
+        .delete(server.url(&format!(
+            "/api/docs/{}/access/user/{}",
+            doc.0, bob.user.id.0
+        )))
         .send()
         .await
         .unwrap();
