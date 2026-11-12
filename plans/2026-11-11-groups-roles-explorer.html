@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ShareCraft — Groups, Roles and the Inheritance Explorer: Implementation Plan</title>
+<style>
+:root{color-scheme:light dark;--ink:light-dark(#172f38,#e4ecef);--muted:light-dark(#536b72,#a9b9bf);--line:light-dark(#d7e2e3,#36454b);--paper:light-dark(#fff,#1d272b);--wash:light-dark(#f2f6f5,#141b1e);--accent:light-dark(#3156c9,#9db4ff);font:15px/1.6 Segoe UI,system-ui,sans-serif;color:var(--ink);background:var(--wash)}
+*{box-sizing:border-box}body{margin:0;padding:28px 18px 80px}main{max-width:940px;margin:auto}
+h1{font-size:1.9rem;letter-spacing:-.03em;line-height:1.2;margin:0 0 14px}h2{font-size:1.3rem;margin:38px 0 12px;padding-top:18px;border-top:1px solid var(--line)}h3{font-size:1.08rem;margin:30px 0 8px}h4{font-size:.95rem;margin:16px 0 6px}
+p{margin:0 0 12px}ul,ol{margin:0 0 12px;padding-left:22px}li{margin-bottom:6px}a{color:var(--accent)}
+code{font-family:Consolas,Menlo,monospace;font-size:.88em;background:light-dark(#e9efee,#263238);padding:1px 5px;border-radius:3px;overflow-wrap:anywhere}
+pre{background:var(--paper);border:1px solid var(--line);border-radius:7px;padding:12px 14px;overflow-x:auto;font:13px/1.5 Consolas,Menlo,monospace;margin:0 0 12px}pre code{background:none;padding:0;font-size:inherit}
+.note{border-left:4px solid var(--accent);background:var(--paper);padding:12px 16px;margin:0 0 14px}.note p:last-child{margin:0}
+.task{background:var(--paper);border:1px solid var(--line);border-radius:9px;padding:6px 20px 14px;margin:18px 0}
+ol.steps{list-style:none;padding-left:0}ol.steps>li{padding-left:28px;position:relative;margin-bottom:10px}ol.steps>li::before{content:"☐";position:absolute;left:2px;color:var(--muted)}
+table{border-collapse:collapse;width:100%;font-size:.9rem;background:var(--paper);margin-bottom:14px}th,td{border:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top}th{background:light-dark(#e8efed,#263238)}
+.small{font-size:.88rem;color:var(--muted)}
+tbody tr:nth-child(even) td{background:light-dark(#f4f8f7,#212b30)}
+ol.steps>li:nth-child(even),ul.band>li:nth-child(even),ol.band>li:nth-child(even){background:light-dark(#f4f8f7,#212b30);border-radius:4px}
+</style>
+</head>
+<body><main>
+<h1>Groups, roles and the inheritance explorer: implementation plan</h1>
+<p class="small">ShareCraft &middot; Stage 2, platform plan 2A &middot; Written 11 November 2026</p>
+<div class="note"><p><strong>For agentic workers:</strong> REQUIRED SUB-SKILL: use superpowers:subagent-driven-development or superpowers:executing-plans. Steps are checkboxes.</p></div>
+
+<p><strong>Goal:</strong> access can be given to groups as well as people; roles are named sets of permissions that administrators can define; every site has Owners, Members and Visitors groups; an inheritance explorer shows every place where inheritance is broken, with its path, who has access and why, and what restoring it would change; and a library of more than 100,000 files is shown to behave: breaking and restoring inheritance at library, folder and file level stays fast and correct.</p>
+<p><strong>Architecture:</strong> an <em>assignment</em> gives a <em>principal</em> (a person or a group) a <em>role</em> on a scope. A role is a set of permissions from a fixed list. A person's access on a node is the union of the permissions of every assignment on its source scope that names them or a group they belong to. Groups, roles and assignments are kept in PostgreSQL only, like all permissions (D24). The explorer reads only scopes (nodes with their own permissions), never the files between them, so its cost follows the number of breaks, not the size of the library. The Git tree records move into 256 sub-folders so that a change to one node no longer rewrites a folder of 100,000 entries.</p>
+<p><strong>Tech stack:</strong> the existing workspace: axum, sqlx and PostgreSQL (<code>records</code>), gix (<code>revisions</code>), plain HTML and JavaScript in <code>web/</code>. No new dependencies.</p>
+<p><strong>Spec:</strong> <a href="../scope.html">scope.html</a> SC-11 (groups, configurable permission roles, delegated administration, inheritance at every level, the inheritance explorer, no size threshold), D10, D18, D23, D24; acceptance tests A04, A14, A15. Plan 1 (<a href="2026-11-11-content-tree-and-permissions.html">content tree and inherited permissions</a>) is the base. Owner decisions of 11 November 2026: plan 2 is split into 2A (this plan) and 2B (sharing links and access requests); roles are permission sets that administrators define, with Viewer, Editor and Owner built in; anyone-links are built in 2B, off by default.</p>
+
+<h2>Not in this plan</h2>
+<ul class="band">
+<li>Sharing links, anyone-links, expiry, domain restrictions and access requests (plan 2B).</li>
+<li>Service identities and application credentials (SC-14, with the API work). Guests and single sign-on (after the identity provider decision).</li>
+<li>Groups inside groups. Audience targeting. Search.</li>
+</ul>
+
+<h2>Global constraints</h2>
+<ul class="band">
+<li><strong>Permissions live in PostgreSQL only (D24).</strong> Roles, groups, memberships and assignments are database rows; every change records an event. Nothing in this plan writes permissions to Git.</li>
+<li><strong>The permission list is fixed:</strong> <code>view</code> (list, open, download, join a session read-only), <code>add</code> (create folders and files, upload, move into), <code>edit</code> (change content, rename, move out, take the editing seat), <code>delete</code>, <code>manage_access</code> (see and change access, break and restore inheritance, use the explorer), <code>manage_site</code> (create and rename libraries, rename the site, manage the site's groups). Every permission except <code>view</code> includes <code>view</code>.</li>
+<li><strong>Built-in roles</strong> have fixed ids and cannot be changed or deleted: <code>viewer</code> {view}; <code>editor</code> {view, add, edit, delete}; <code>owner</code> {all six}. Custom roles have generated ids, a unique name (ignoring case, 1&ndash;60 characters) and at least <code>view</code>. Only administrators create, change or delete roles. A role in use cannot be deleted (<code>role_in_use</code>).</li>
+<li><strong>Access is a union.</strong> A person's permissions on a node are the union over every assignment on its source scope naming them or a group they are a member of. An enabled administrator has every permission everywhere; a disabled account has none (plan 1's rules stand).</li>
+<li><strong>Nobody raises their own access.</strong> A person may assign a role, or add someone to a group, only if that role's (or that group's role's) permissions on the scope are a subset of their own there. Administrators are exempt. Refused with <code>beyond_your_access</code>.</li>
+<li><strong>One locking order:</strong> the node chain top-down (plan 1), then the groups involved in one pass ordered by id, then the roles involved ordered by id; each row once, in the strongest mode the transaction needs (<code>FOR UPDATE</code> for what it writes, <code>FOR SHARE</code> for what it judges by). An access decision made under locks is worked out again after all of them are held. A role change takes the role row <code>FOR UPDATE</code>; a membership change takes the group row <code>FOR UPDATE</code>.</li>
+<li><strong>Every scope keeps a manager:</strong> at least one assignment whose role includes <code>manage_access</code>. An administrator can always repair a scope whose managing group has been emptied; this is stated, not prevented.</li>
+<li><strong>Site groups:</strong> every site, deleted or not, has three groups, shown as "<em>Site</em> Owners", "<em>Site</em> Members" and "<em>Site</em> Visitors", assigned Owner, Editor and Viewer on the site. A site group stores its site and purpose, not a name: its name is built from the site's current name when read, so it follows renames and never collides. Organisation groups (no site) have stored names, unique ignoring case. People with <code>manage_site</code> on a site manage its groups' members; administrators manage every group and create organisation groups (groups with no site).</li>
+<li><strong>Revocation is immediate (S5).</strong> A change of membership, of an assignment, or of a role's permissions reaches every open session it affects before the request answers, as in plan 1.</li>
+<li><strong>Cost follows breaks, not files (D10, A14).</strong> Breaking and restoring inheritance, the explorer, its counts and its export read and write only scopes and their assignments.</li>
+<li><strong>Names and visibility:</strong> a person who manages access somewhere sees organisation groups and the groups of sites they can reach (never a site name they could not otherwise see); a group's member list only to people who manage that group and administrators. The explorer's person filter matches direct assignments and memberships of groups whose members the viewer may see. The explorer shows only nodes the viewer has <code>manage_access</code> on, and counts only what it shows.</li>
+<li>Never print <code>.env</code>, database addresses or passwords. Documents are HTML with colour banding on tables and long lists.</li>
+</ul>
+
+<h2>Who may do what</h2>
+<table>
+<thead><tr><th>Action</th><th>Needs</th></tr></thead>
+<tbody>
+<tr><td>Open, list, download, join a session</td><td><code>view</code></td></tr>
+<tr><td>Create a folder or file, upload; move something in</td><td><code>add</code> on the destination</td></tr>
+<tr><td>Save, rename, take the editing seat; move something out</td><td><code>edit</code> on the item</td></tr>
+<tr><td>Delete</td><td><code>delete</code> on the item</td></tr>
+<tr><td>Access page, break and restore inheritance, explorer</td><td><code>manage_access</code> on the node (explorer: on the root it starts from)</td></tr>
+<tr><td>Create or rename a library, rename a site, manage the site's groups</td><td><code>manage_site</code> on the site</td></tr>
+<tr><td>Create a site, manage roles, create organisation groups</td><td>Administrator</td></tr>
+</tbody></table>
+
+<h2>Review focus</h2>
+<ol class="band">
+<li>A person in two groups with different roles on the same scope has the union of both; removed from one group, they keep the other's permissions, in an open session too. (Task 2, <code>union_over_groups</code>; Task 4, <code>leaving_one_group_keeps_the_other</code>.)</li>
+<li>Changing a custom role's permissions changes the access of everyone holding it, everywhere, including open sessions (an editor whose role loses <code>edit</code> becomes read-only at once). (Task 4, <code>role_change_reaches_open_sessions</code>.)</li>
+<li>The explorer never shows a node, name or count outside the viewer's <code>manage_access</code> scope: an owner of one folder sees only that folder's subtree. (Task 3, <code>explorer_stays_inside_the_viewers_scope</code>.)</li>
+<li>Upgrading from plan 1: site-level grants become memberships of the site's groups; every other grant stays a direct assignment with the same role; nobody gains or loses access. (Task 2, <code>upgrade_keeps_everyones_access</code>.)</li>
+<li>In a library of 100,000 files, breaking inheritance on the library while someone has a file open in it: their access is correct before, during and after, and nothing is processed per file. (Task 5, <code>large_library_break_while_open</code>.)</li>
+</ol>
+
+<div class="task">
+<h3>Task 1: roles as permission sets</h3>
+<p><strong>Files:</strong> create <code>crates/records/migrations/0004_roles.sql</code>, <code>crates/records/src/roles.rs</code>, <code>crates/records/tests/roles.rs</code>; modify <code>crates/records/src/scopes.rs</code> (the CHAIN and REACH queries, <code>sites_for</code>, <code>children</code>, <code>lock_segment</code>), <code>crates/records/src/tree.rs</code> (<code>NodeChange.needs</code> becomes <code>Perms</code>; <code>judge</code> tests <code>contains</code>, not <code>role &lt; needed</code>; the site owner row), <code>crates/records/src/adoption.rs</code> (reads and writes assignments, not <code>scope_access</code>), <code>documents.rs</code>, <code>lib.rs</code>, and every server use of <code>Role</code> (rooms, members, api, <code>tree.rs</code> including its <code>Role</code> needs) so the workspace compiles.</p>
+<p><strong>Interfaces produced:</strong></p>
+<ul class="band">
+<li><code>records::Perms(u16)</code> with constants <code>VIEW</code>, <code>ADD</code>, <code>EDIT</code>, <code>DELETE</code>, <code>MANAGE_ACCESS</code>, <code>MANAGE_SITE</code>, <code>ALL</code>; <code>contains</code>, <code>union</code>; serialised as a sorted list of the names in Global constraints. Construction always adds <code>VIEW</code> to a non-empty set.</li>
+<li><code>records::RoleDef { id: String, name: String, perms: Perms, builtin: bool }</code>; built-in ids <code>viewer</code>, <code>editor</code>, <code>owner</code>.</li>
+<li><code>records::Access { perms: Perms, roles: Vec&lt;RoleRef&gt; }</code> (<code>RoleRef { id, name }</code>: the roles that gave it, for display) with <code>can_view()</code>, <code>can_add()</code>, <code>can_edit()</code>, <code>can_delete()</code>, <code>can_manage_access()</code>, <code>can_manage_site()</code>. An administrator's access is <code>ALL</code> with the role list <code>[owner]</code>.</li>
+<li><code>Db::effective_access(&amp;self, user: UserId, node: NodeId) -&gt; Result&lt;Option&lt;Access&gt;, DbError&gt;</code> replaces <code>effective_role</code> as the one access decision. <code>Crumb.role</code>, <code>Listed.role</code>, <code>sites_for</code> and the rest carry <code>Option&lt;Access&gt;</code>. Rooms and members take <code>Option&lt;Access&gt;</code> where they took <code>Option&lt;Role&gt;</code>; the editing seat needs <code>can_edit()</code>.</li>
+<li><code>Db::roles(&amp;self) -&gt; Result&lt;Vec&lt;RoleDef&gt;, DbError&gt;</code>; <code>Db::create_role(&amp;self, actor: UserId, name: &amp;str, perms: Perms) -&gt; Result&lt;RoleDef, AccessError&gt;</code>; <code>Db::change_role(&amp;self, actor, id: &amp;str, name: Option&lt;&amp;str&gt;, perms: Option&lt;Perms&gt;) -&gt; Result&lt;RoleDef, AccessError&gt;</code>; <code>Db::delete_role(&amp;self, actor, id: &amp;str) -&gt; Result&lt;(), AccessError&gt;</code>. Administrator only (<code>Forbidden</code>); built-ins refused (<code>BuiltinRole</code>); in use refused (<code>RoleInUse</code>); duplicate name <code>NameTaken</code>. Events <code>role.created</code>, <code>role.changed</code> (with before and after permissions), <code>role.deleted</code>.</li>
+<li>Assignments: table <code>assignments (node_id, principal_kind text check in ('user','group'), principal_id uuid, role_id text references roles, granted_by, granted_at, primary key (node_id, principal_kind, principal_id))</code>, index on <code>(principal_kind, principal_id)</code>. The migration copies every <code>scope_access</code> row as a user assignment with the role of the same name and renames <code>scope_access</code> to <code>scope_access_plan1</code> (kept unread for a later plan to drop, so an upgrade can be inspected and undone). In this task only user principals are written; groups come in Task 2.</li>
+<li><strong>"My assignments" in one place:</strong> one SQL fragment yields the assignments that apply to a person (their own, and from Task 2 on those of their groups); CHAIN, REACH, <code>sites_for</code>, <code>children</code> and the last-manager count all use it, so no listing works out access a second way.</li>
+<li><code>Db::set_node_access</code> takes <code>(actor, node, principal: Principal, role: Option&lt;&amp;str&gt;)</code> with <code>Principal::{User(UserId), Group(GroupId)}</code> (<code>GroupId</code> is declared here, used in Task 2); the last-manager rule replaces the last-owner rule (<code>LastManager</code>, answered <code>last_manager</code>); the subset rule of Global constraints applies (<code>BeyondYourAccess</code>).</li>
+</ul>
+<ol class="steps">
+<li>Write failing tests in <code>crates/records/tests/roles.rs</code>: <code>builtin_roles_exist_and_cannot_change</code>; <code>perms_always_include_view</code>; <code>custom_role_crud_by_administrator_only</code>; <code>role_names_unique_ignoring_case</code>; <code>role_in_use_cannot_be_deleted</code>; <code>custom_role_grants_exactly_its_permissions</code> (a "Contributor" {view, add, edit} can create and save but <code>can_delete()</code> is false); <code>last_manager_kept_per_scope</code> (a custom role with <code>manage_access</code> counts as a manager); <code>cannot_assign_beyond_own_access</code>; <code>role_change_and_decision_take_turns</code> (a role losing <code>edit</code> while a rename judged by it is held in its transaction: consistent either way, as plan 1's race tests); <code>listings_follow_assignments</code> (<code>sites_for</code>, <code>children</code>, <code>path</code> unchanged in meaning after the switch); <code>upgrade_copies_scope_access</code> (rows of plan 1's table become user assignments with the same role).</li>
+<li>Run <code>cargo xtask test -p records</code>: fails.</li>
+<li>Implement; route plan 1's access tests through <code>effective_access</code> unchanged in meaning; update the server to compile and keep <code>cargo xtask check</code> passing (rooms keep their behaviour: <code>can_edit()</code> where they asked <code>role.can_edit()</code>).</li>
+<li>Run <code>cargo xtask check</code>: passes.</li>
+<li>Commit <code>feat(records): roles as permission sets</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 2: groups</h3>
+<p><strong>Files:</strong> create <code>crates/records/migrations/0005_groups.sql</code>, <code>crates/records/src/groups.rs</code>, <code>crates/records/tests/groups.rs</code>; modify <code>scopes.rs</code> (union over groups), <code>crates/server/src/tree.rs</code> (a new site creates its groups).</p>
+<p><strong>Interfaces produced:</strong></p>
+<ul class="band">
+<li><code>collab_core::ids::GroupId(pub Uuid)</code>; <code>records::Group { id, name, site: Option&lt;NodeId&gt;, purpose: Option&lt;SiteGroup&gt;, member_count: i64 }</code> with <code>SiteGroup::{Owners, Members, Visitors}</code>.</li>
+<li>Tables <code>groups (id, name nullable, site_id nullable references nodes, purpose text nullable check in ('owners','members','visitors'), created_by, created_at)</code>, with a check that exactly one of <code>name</code> and <code>(site_id, purpose)</code> is set, unique <code>lower(name) where site_id is null</code>, unique <code>(site_id, purpose)</code>; <code>group_members (group_id, user_id, added_by, added_at, primary key (group_id, user_id))</code>, index on <code>user_id</code>.</li>
+<li>Site groups are made inside <code>records::Db::apply_nodes</code>: <code>NodeChange.owner</code> becomes a <code>site_groups: Option&lt;UserId&gt;</code> flag (the creator, made a member of Owners), so the three groups and their assignments are written in the same transaction as the site's node rows. A site row created by reconcile or adoption also gets its groups (with no members; administrators repair). Plan 1's adoption step "site without an owner" becomes "site without its three groups"; it no longer adds administrators as direct owners on every start.</li>
+<li><code>Db::groups_visible_to(&amp;self, user) -&gt; Result&lt;Vec&lt;Group&gt;, DbError&gt;</code> (empty unless the person has <code>manage_access</code> somewhere or is an administrator; then organisation groups and the groups of sites they can reach); <code>Db::group(&amp;self, user, id) -&gt; Result&lt;Option&lt;(Group, Vec&lt;User&gt;)&gt;, DbError&gt;</code> (members only for those who manage it); <code>Db::create_group(&amp;self, actor, name) -&gt; Result&lt;Group, AccessError&gt;</code> (administrator; organisation group); <code>Db::add_member</code> / <code>Db::remove_member(&amp;self, actor, group, user) -&gt; Result&lt;bool, AccessError&gt;</code> (administrator, or <code>manage_site</code> on the group's site, and for adding the subset rule); <code>Db::delete_group(&amp;self, actor, group)</code> (administrator; site groups refused; assigned groups refused with <code>GroupInUse</code>); <code>Db::groups_of(&amp;self, user) -&gt; Result&lt;Vec&lt;GroupId&gt;, DbError&gt;</code>. Events <code>group.created</code>, <code>group.member_added</code>, <code>group.member_removed</code>, <code>group.deleted</code>.</li>
+<li>The "my assignments" fragment now includes group assignments through <code>group_members</code>, so <code>effective_access</code>, listings, sites and the explorer all see them. Locking follows the single order of Global constraints: after the chain, the groups that have assignments on the locked source scopes and contain the actor, by id, then their roles; access is worked out again under those locks. A membership change locks the site chain first, then the target group and any group the actor judges by in one id-ordered pass, each once in its strongest mode, so it cannot deadlock with an access change on the site.</li>
+<li><strong>Upgrade</strong> (in the migration, SQL only): for every site, deleted or not, the three groups and their assignments; every user assignment on a site moves into the matching group (owner &rarr; Owners, editor &rarr; Members, viewer &rarr; Visitors; a custom role cannot exist yet); each moved person gets a <code>group.member_added</code> event with <code>{"upgrade": true}</code>; assignments below sites are unchanged.</li>
+</ul>
+<ol class="steps">
+<li>Write failing tests in <code>crates/records/tests/groups.rs</code>: <code>new_site_has_three_groups_and_creator_is_owner</code>; <code>union_over_groups</code>; <code>member_added_gains_and_removed_loses</code>; <code>site_owner_manages_site_groups_only</code>; <code>organisation_groups_by_administrator_only</code>; <code>group_names_hidden_without_manage_access</code>; <code>members_hidden_from_non_managers</code>; <code>assigned_group_cannot_be_deleted</code>; <code>emptied_manager_group_leaves_scope_to_administrators</code>; <code>removal_while_deciding_takes_turns</code> (membership removal and a tree change judged on that group, started together; as plan 1's race tests); <code>upgrade_keeps_everyones_access</code> (build a plan-1-shaped database including a deleted site and two sites of the same name, one deleted; migrate; compare every person's permissions on every node, and their <code>sites_for</code>, <code>path</code> and <code>children</code>, before and after); <code>site_names_never_collide_with_groups</code> (a site named like an organisation group, a site renamed, a site re-created with a deleted site's name); <code>membership_and_site_access_change_do_not_deadlock</code>; <code>cannot_add_to_a_group_beyond_own_access</code>.</li>
+<li>Run <code>cargo xtask test -p records</code>: fails.</li>
+<li>Implement.</li>
+<li>Run <code>cargo xtask check</code>: passes.</li>
+<li>Commit <code>feat(records): groups and site groups</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 3: the inheritance explorer</h3>
+<p><strong>Files:</strong> create <code>crates/records/src/explorer.rs</code>, <code>crates/records/tests/explorer.rs</code>, <code>crates/records/migrations/0006_indexes.sql</code> (an index <code>nodes (id) where unique_scope and deleted_at is null</code> for finding breaks, and the children index of Task 5, so the explorer never scans files).</p>
+<p><strong>Interfaces produced:</strong></p>
+<ul class="band">
+<li><code>records::Break { node: Crumb, path: Vec&lt;Crumb&gt;, kind: NodeKind, assignments: Vec&lt;AssignmentView&gt;, inherited_from: Option&lt;Crumb&gt; /* the scope it would inherit from */, broken_by: Option&lt;(UserRef, OffsetDateTime)&gt;, changed_by: Option&lt;(UserRef, OffsetDateTime)&gt;, breaks_below: i64 }</code>; <code>AssignmentView { principal: PrincipalView /* user or group with name */, role: RoleRef, perms: Perms }</code>. <code>broken_by</code> is the latest <code>inheritance.broken</code> event on the node; <code>changed_by</code> the latest access event on it.</li>
+<li><code>records::ExplorerFilter { principal: Option&lt;Principal&gt;, kinds: Vec&lt;NodeKind&gt; }</code> (the place is the <code>root</code>).</li>
+<li><code>Db::breaks(&amp;self, viewer: UserId, root: NodeId, filter: &amp;ExplorerFilter, after: Option&lt;&amp;str&gt;, limit: u32) -&gt; Result&lt;Option&lt;(Vec&lt;Break&gt;, Option&lt;String&gt;)&gt;, DbError&gt;</code>: every scope strictly below <code>root</code> (and <code>root</code> itself when it is a scope) that the viewer has <code>manage_access</code> on, in path order, paged. <code>None</code> when the viewer lacks <code>manage_access</code> on <code>root</code>. A <code>principal</code> filter keeps breaks with an assignment to that principal (for a person: to them directly or to a group whose members the viewer may see).</li>
+<li><code>Db::break_counts(&amp;self, viewer, parent: NodeId) -&gt; Result&lt;Vec&lt;(NodeId, i64)&gt;, DbError&gt;</code>: for each child of <code>parent</code> the number of breaks at or below it, for the explorer's tree; built from the list of scopes and their ancestors, not by walking files.</li>
+<li><code>records::RestorePreview { node: Crumb, inherit_from: Crumb, people: Vec&lt;(UserRef, Perms /* before */, Perms /* after */)&gt;, unchanged_breaks_below: i64 }</code>; <code>Db::restore_preview(&amp;self, viewer, node) -&gt; Result&lt;RestorePreview, AccessError&gt;</code>: for every person named on either scope, directly or through a group, their permissions now and after restoring, listing only those that change; descendants that inherit follow; breaks below are listed as unaffected.</li>
+<li><code>records::breaks_csv(breaks: &amp;[Break]) -&gt; String</code>: one row per assignment (path, kind, principal kind, principal, role, permissions, broken by, broken at), RFC 4180 quoting, cells starting with <code>= + - @</code> prefixed with an apostrophe.</li>
+</ul>
+<ol class="steps">
+<li>Write failing tests in <code>crates/records/tests/explorer.rs</code>: <code>finds_every_nested_break</code> (breaks at library, folder, sub-folder and file, nested); <code>exceptions_keep_ancestor_paths</code>; <code>counts_match_the_list</code>; <code>filter_by_principal_kind_and_place</code> (a person matches through a group); <code>explorer_stays_inside_the_viewers_scope</code>; <code>broken_by_and_changed_by_from_events</code>; <code>restore_preview_lists_losers_gainers_and_independent_breaks</code>; <code>csv_quotes_and_neutralises_formulas</code>; <code>explorer_cost_follows_breaks</code> (with 5,000 files and 10 breaks, the rows of <code>nodes</code> read, taken from <code>pg_stat_xact_user_tables</code> before and after or from <code>EXPLAIN (ANALYZE)</code> row counts, stay within the scopes and their ancestors; the same with 50,000 files reads no more); <code>restore_preview_counts_people_not_principals</code> (a person in two groups, one losing access, is not reported as losing).</li>
+<li>Run <code>cargo xtask test -p records</code>: fails.</li>
+<li>Implement.</li>
+<li>Run <code>cargo xtask test -p records</code>: passes.</li>
+<li>Commit <code>feat(records): the inheritance explorer</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 4: API and live sessions</h3>
+<p><strong>Files:</strong> create <code>crates/server/src/api/roles.rs</code>, <code>crates/server/src/api/groups.rs</code>, <code>crates/server/src/api/explorer.rs</code>, <code>crates/server/tests/groups_roles.rs</code>, <code>crates/server/tests/explorer.rs</code>; modify <code>api/mod.rs</code>, <code>api/nodes.rs</code> (access routes), <code>api/sites.rs</code>.</p>
+<table>
+<thead><tr><th>Route</th><th>Does</th></tr></thead>
+<tbody>
+<tr><td><code>GET /api/roles</code>; <code>POST /api/roles {name, perms}</code>; <code>PATCH /api/roles/{id} {name?, perms?}</code>; <code>DELETE /api/roles/{id}</code></td><td>List (any signed-in person who manages access somewhere, or an administrator); change (administrator).</td></tr>
+<tr><td><code>GET /api/groups</code>; <code>POST /api/groups {name}</code>; <code>GET /api/groups/{id}</code>; <code>PUT</code>/<code>DELETE /api/groups/{id}/members/{user_id}</code>, <code>POST /api/groups/{id}/members {email}</code>; <code>DELETE /api/groups/{id}</code></td><td>As Task 2's rules.</td></tr>
+<tr><td><code>GET /api/sites/{id}/groups</code></td><td>The site's three groups (for its Groups page).</td></tr>
+<tr><td><code>GET /api/nodes/{id}/access</code></td><td><code>{inherits, source, assignments: [{principal: {kind, id, name, email?}, role: {id, name}, perms}]}</code>.</td></tr>
+<tr><td><code>PUT /api/nodes/{id}/access {email | group, role}</code>; <code>DELETE /api/nodes/{id}/access/{kind}/{principal_id}</code></td><td><code>role</code> is a role id (<code>viewer</code>, <code>editor</code>, <code>owner</code> or a custom id). The old person-only routes are removed; the pages ship with the server and no outside client exists yet.</td></tr>
+<tr><td><code>GET /api/nodes/{id}/inheritance/preview</code></td><td>The restore preview.</td></tr>
+<tr><td><code>GET /api/explorer/{root}?principal=&amp;kind=&amp;after=&amp;limit=</code>; <code>GET /api/explorer/{root}/counts?parent=</code>; <code>GET /api/explorer/{root}/export.csv?&hellip;</code></td><td>Breaks, counts, CSV (<code>text/csv</code>, attachment, every page).</td></tr>
+</tbody></table>
+<p>New error codes: <code>role_in_use</code> (409), <code>builtin_role</code> (400), <code>group_in_use</code> (409), <code>last_manager</code> (409, replacing <code>last_owner</code>), <code>site_group</code> (400), <code>beyond_your_access</code> (403). <strong>Live sessions:</strong> a membership change rechecks every open document where the person is connected; a role change rechecks every open document; an assignment to a group rechecks below the node as plan 1 does. All inside <code>to_completion</code>, one <code>order_access</code> guard at a time.</p>
+<ol class="steps">
+<li>Write failing tests: one per route for success and each refusal; <code>leaving_one_group_keeps_the_other</code>; <code>removed_from_group_leaves_open_session</code>; <code>role_change_reaches_open_sessions</code>; <code>site_creation_returns_groups</code>; <code>explorer_over_http_stays_in_scope</code>; <code>export_is_csv_attachment</code>; <code>group_list_never_names_unreachable_sites</code>.</li>
+<li>Run: fails. Implement. Run <code>cargo xtask check</code>: passes.</li>
+<li>Commit <code>feat(server): groups, roles and the explorer over the API</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 5: a library of 100,000 files</h3>
+<p><strong>Files:</strong> modify <code>crates/revisions/src/tree.rs</code> (layout), <code>crates/server/src/tree.rs</code> (start-up layout move), <code>crates/records/src/scopes.rs</code> (the children query), the workspace <code>Cargo.toml</code> (dev <code>opt-level</code> for the SHA-1 and gix hashing crates); create <code>crates/server/tests/scale.rs</code>; modify <code>xtask</code> (a <code>scale</code> test command) and <code>BUILDING.html</code>.</p>
+<ul class="band">
+<li><strong>Sharded tree records:</strong> <code>tree/&lt;first two hex digits of the id&gt;/&lt;id&gt;.json</code>. <code>write_tree</code> writes the new place; <code>read_tree</code> and <code>read_tree_record</code> accept both places (the path check allows either) until the move is done. On start, if any record is at the old place, one commit through <code>commit_on_main</code> moving <code>refs/sharecraft/tree</code> only (author ShareCraft, message "tree: move records into sub-folders") moves them all; the start-up line says so. The move is one-way: an older server would see an empty tree, so <code>BUILDING.html</code> says to back up before upgrading.</li>
+<li><strong>Children index</strong> (in Task 3's <code>0006_indexes.sql</code>): on <code>nodes (parent_id, (case when kind = 'document' then 1 else 0 end), lower(name), id) where deleted_at is null</code>, the identical expression the listing orders by; the listing uses separate statements for the first page and later pages, so a later page is a range scan from the cursor, not a filter from the start.</li>
+<li><strong>Scale test</strong> (<code>#[ignore]</code>, run by <code>cargo xtask scale</code>): a test-support bulk loader writes one library holding a folder of 100,000 files (and a small library for comparison) in one Git commit and one database transaction, inserting rows with <code>unnest</code> or <code>generate_series</code>; the loader is timed but has no threshold. Then, timing each: break and restore on the library, the folder and one file, in both libraries; the first and a middle page of the folder's listing; the explorer and its counts with 50 breaks; a person with a file open in the folder while the library's inheritance is broken and restored (<code>large_library_break_while_open</code>); a rename in the folder (one Git commit); the server's start-up reconcile. Thresholds in a debug build: break or restore under 1 s; a listing page under 500 ms; explorer page under 1 s; rename under 2 s; start-up reconcile under 60 s. Times are printed and written to the test's output for the report.</li>
+</ul>
+<ol class="steps">
+<li>Write the failing layout tests in <code>crates/revisions/src/tree.rs</code>: <code>records_live_in_sub_folders</code>; <code>old_layout_moves_in_one_commit</code>; then the scale test.</li>
+<li>Run <code>cargo test -p revisions</code> and <code>cargo xtask scale</code>: fail.</li>
+<li>Implement; run both and <code>cargo xtask check</code>: pass. Record the measured times in <code>BUILDING.html</code> (a banded table) with the machine noted.</li>
+<li>Commit <code>feat: a library of 100,000 files</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 6: pages</h3>
+<p><strong>Files:</strong> modify <code>web/access.html</code>/<code>access.js</code>, <code>web/site.html</code>/<code>site.js</code>, <code>web/common.js</code>, <code>web/style.css</code>, <code>web/common.test.mjs</code>; create <code>web/groups.html</code>/<code>groups.js</code>, <code>web/roles.html</code>/<code>roles.js</code>, <code>web/explorer.html</code>/<code>explorer.js</code>.</p>
+<ul class="band">
+<li><strong>Access:</strong> people and groups with their role names; add a person by email or a group from a list; the role list includes custom roles; "Inherit again" uses the preview (who loses, who gains, breaks below unaffected).</li>
+<li><strong>Site groups</strong> (<code>groups.html?site=</code>): the three groups and their members; add and remove members for those who may. <strong>Group</strong> (<code>groups.html?id=</code>) for organisation groups. Linked from the site page and People.</li>
+<li><strong>Roles</strong> (<code>roles.html</code>, administrators): built-in roles read-only; create, rename, change permissions (six check boxes, <code>view</code> always on), delete with the in-use message.</li>
+<li><strong>Explorer</strong> (<code>explorer.html?root=</code>, linked from the access page and site page for those with <code>manage_access</code>): a tree site &rarr; library &rarr; folder &rarr; file, expanded on demand, each node marked inherited or unique with its break count; an "Only exceptions" switch that shows just the paths to breaks; for a selected break: path, assignments with permissions, nearest source, who broke it and when, links to its access page and restore preview; filters by person or group, kind and place; Export CSV.</li>
+<li>375 pixels, light and dark mode, colour banding on lists and tables, names inserted as text only.</li>
+</ul>
+<ol class="steps">
+<li>Write failing tests in <code>web/common.test.mjs</code> for new helpers (permission labels, principal display, explorer tree state, preview wording).</li>
+<li>Run <code>node --test web/*.test.mjs</code>: fails. Implement. Run it and <code>cargo xtask check</code>: pass.</li>
+<li>Commit <code>feat(web): groups, roles and the inheritance explorer</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 7 (controller): browser check and documents</h3>
+<ol class="steps">
+<li>Back up the development database and data folder; build the server into this session's target folder; repoint <code>launch.json</code>; start it (migrations 0004&ndash;0006 and the tree layout move run on the real data; the backup is the only way back to plan 1's layout).</li>
+<li>In the browser, record each as checked or not: the Home and Projects sites have their three groups with the right members; a custom role "Contributor" given to a group; Bob in two groups gets the union, and leaving one keeps the other in an open session; a role change makes an open editor read-only at once; the explorer finds nested breaks, its exceptions view and counts, the filter by person, the export, and the restore preview; a folder owner sees only their subtree; 375 pixels and dark mode.</li>
+<li>Update <code>BUILDING.html</code> (routes, roles, groups, layout, scale results), <code>sequencing.html</code> (progress note), and record nothing new in <code>scope.html</code> unless a decision was taken. Commit <code>docs: groups, roles and the inheritance explorer</code>.</li>
+</ol></div>
+</main></body>
+
+</html>
