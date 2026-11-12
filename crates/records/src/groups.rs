@@ -22,8 +22,8 @@ use crate::documents::UNIQUE_VIOLATION;
 use crate::events::{NewEvent, record};
 use crate::roles::lock_roles;
 use crate::scopes::{
-    LOCK_ATTEMPTS, MANAGE_ACCESS_BIT, REACH, Standing, access_in, judged_roles, lock_top_down,
-    standing,
+    LOCK_ATTEMPTS, MANAGE_ACCESS_BIT, MANAGE_SITE_BIT, REACH, Standing, access_in, judged_roles,
+    lock_top_down, standing,
 };
 use crate::{AccessError, Db, DbError, Perms, User};
 
@@ -346,10 +346,11 @@ enum Membership {
 }
 
 impl Db {
-    /// The groups `user` may see, by name: none unless they are an enabled administrator or
-    /// have `manage_access` somewhere; then the organisation groups and the groups of the sites
-    /// they can reach (an administrator: every group). A site's name is never shown to someone
-    /// who could not otherwise see the site.
+    /// The groups `user` may see, by name: an enabled administrator sees every group; someone
+    /// with `manage_access` somewhere sees the organisation groups and the groups of the sites
+    /// they can reach; and whoever has `manage_site` on a live site sees that site's groups,
+    /// whose members they manage. A site's name is never shown to someone who could not
+    /// otherwise see the site.
     pub async fn groups_visible_to(&self, user: UserId) -> Result<Vec<Group>, DbError> {
         let mut conn = self.pool().acquire().await?;
         Ok(visible_groups(&mut conn, user, None).await?)
@@ -714,8 +715,13 @@ pub(crate) async fn visible_groups(
                                            and m.node_id in (select origin from live))) \
          select {GROUP_COLUMNS} from {GROUP_FROM} \
          where ($3::uuid[] is null or g.id = any($3)) \
-           and ($2 or ((select yes from manages) \
-                       and (g.site_id is null or g.site_id in (select id from reach)))) \
+           and ($2 \
+                or ((select yes from manages) \
+                    and (g.site_id is null or g.site_id in (select id from reach))) \
+                or g.site_id in (select m.node_id from mine m \
+                                 join nodes site on site.id = m.node_id \
+                                 where site.parent_id is null and site.deleted_at is null \
+                                   and m.perms & {MANAGE_SITE_BIT} <> 0)) \
          order by lower(gn.display_name), g.id"
     );
     let rows = sqlx::query(sqlx::AssertSqlSafe(query))

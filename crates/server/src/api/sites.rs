@@ -110,31 +110,19 @@ pub(crate) async fn create(
 }
 
 /// `GET /api/sites/{id}/groups`: the site's Owners, Members and Visitors groups, for its Groups
-/// page, each saying whether the caller may change its members. `404` unless the caller has
-/// access to the site; `403` if they may not see its groups (they manage access nowhere).
+/// page, each saying whether the caller may change its members. Decided by the same rule as
+/// `GET /api/groups` (whoever may see a site's groups there sees them here): `404` when the
+/// caller may see none of them, or there is no such site.
 pub(crate) async fn groups(
     State(state): State<AppState>,
     signed: Signed,
     Path(id): Path<String>,
 ) -> Result<Json<Vec<GroupOut>>, ApiError> {
     let site = node_id(&id)?;
-    let db = state.db();
     let user = signed.session.user;
-    let is_site = db
-        .node(site)
-        .await
-        .map_err(|e| ApiError::unavailable(&e))?
-        .is_some_and(|node| node.kind == NodeKind::Site && !node.deleted);
-    let access = db
-        .effective_access(user.id, site)
-        .await
-        .map_err(|e| ApiError::unavailable(&e))?;
-    if !is_site || access.is_none() {
-        return Err(ApiError::NotFound);
-    }
-    let groups = site_groups(db, &user, site).await?;
+    let groups = site_groups(state.db(), &user, site).await?;
     if groups.is_empty() {
-        return Err(ApiError::Forbidden);
+        return Err(ApiError::NotFound);
     }
     Ok(Json(groups))
 }

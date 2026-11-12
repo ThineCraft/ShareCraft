@@ -570,18 +570,25 @@ async fn site_groups_are_listed_for_the_site() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(groups, w.groups);
 
-    // Someone who manages access only on a folder sees the groups but may not change them.
+    // Someone who manages access only on a folder inside sees the groups, as `GET
+    // /api/groups` shows them, but may not change them.
     let ann = w.server.user("Ann").await;
     let folder = w.folder(&w.root, &w.library, "Plans").await;
     w.grant(&folder, &ann, "owner").await;
-    // Limited access to the site: nothing of its own there.
-    assert_eq!(
-        w.call(&ann, Method::GET, &path, None).await,
-        (StatusCode::NOT_FOUND, error("not_found"))
-    );
-    w.grant(&w.site, &ann, "viewer").await;
     let (status, groups) = w.call(&ann, Method::GET, &path, None).await;
     assert_eq!(status, StatusCode::OK);
+    let (_, listed) = w.call(&ann, Method::GET, "/api/groups", None).await;
+    let ids = |list: &Value| -> Vec<Value> {
+        let mut ids: Vec<_> = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|g| g["id"].clone())
+            .collect();
+        ids.sort_by_key(ToString::to_string);
+        ids
+    };
+    assert_eq!(ids(&groups), ids(&listed));
     assert!(
         groups
             .as_array()
@@ -590,18 +597,13 @@ async fn site_groups_are_listed_for_the_site() {
             .all(|g| g["can_manage"] == false)
     );
 
-    // A viewer who manages access nowhere may not see them; others cannot find the site.
+    // A viewer who manages nothing sees none of them, and neither does a stranger.
+    let not_found = (StatusCode::NOT_FOUND, error("not_found"));
     let vic = w.server.user("Vic").await;
     w.grant(&w.site, &vic, "viewer").await;
-    assert_eq!(
-        w.call(&vic, Method::GET, &path, None).await,
-        (StatusCode::FORBIDDEN, error("forbidden"))
-    );
+    assert_eq!(w.call(&vic, Method::GET, &path, None).await, not_found);
     let bob = w.server.user("Bob").await;
-    assert_eq!(
-        w.call(&bob, Method::GET, &path, None).await,
-        (StatusCode::NOT_FOUND, error("not_found"))
-    );
+    assert_eq!(w.call(&bob, Method::GET, &path, None).await, not_found);
     let (status, _) = w
         .call(
             &w.root,
@@ -802,15 +804,13 @@ async fn members_are_added_and_removed_by_site_managers() {
     assert_eq!(status, StatusCode::NO_CONTENT);
     // Adding again changes nothing.
     assert_eq!(w.add(&ann, &visitors, &bob).await.0, StatusCode::NO_CONTENT);
-    let (_, detail) = w
-        .call(
-            &w.root,
-            Method::GET,
-            &format!("/api/groups/{visitors}"),
-            None,
-        )
+    let (status, detail) = w
+        .call(&ann, Method::GET, &format!("/api/groups/{visitors}"), None)
         .await;
+    assert_eq!(status, StatusCode::OK);
     assert_eq!(detail["member_count"], 2);
+    assert_eq!(detail["can_manage"], true);
+    assert_eq!(detail["members"].as_array().unwrap().len(), 2);
     assert_eq!(
         w.remove(&ann, &visitors, &cy).await.0,
         StatusCode::NO_CONTENT
@@ -1373,4 +1373,114 @@ async fn delete_needs_delete() {
         .call(&ann, Method::DELETE, &format!("/api/nodes/{doc}"), None)
         .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn site_managers_see_and_manage_only_their_sites_groups() {
+    let w = world().await;
+    let ann = w.server.user("Ann").await;
+    let bob = w.server.user("Bob").await;
+    let (_, other) = w
+        .call(
+            &w.root,
+            Method::POST,
+            "/api/sites",
+            Some(json!({ "name": "Elsewhere" })),
+        )
+        .await;
+    w.call(
+        &w.root,
+        Method::POST,
+        "/api/groups",
+        Some(json!({ "name": "Finance" })),
+    )
+    .await;
+    // Ann holds view and manage_site on Team, and manages access nowhere.
+    let site_admin = w.role("Site admin", &["manage_site"]).await;
+    w.grant(&w.site, &ann, &site_admin).await;
+    assert_eq!(
+        w.call(&ann, Method::GET, "/api/roles", None).await,
+        (StatusCode::FORBIDDEN, error("forbidden"))
+    );
+
+    // She sees Team's groups, and only those: not the organisation's, not another site's.
+    let (status, groups) = w.call(&ann, Method::GET, "/api/groups", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = groups.to_string();
+    assert!(
+        !text.contains("Elsewhere") && !text.contains("Finance"),
+        "{text}"
+    );
+    let mut names: Vec<_> = groups
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|g| (g["name"].clone(), g["can_manage"].clone()))
+        .collect();
+    names.sort_by_key(|(name, _)| name.to_string());
+    assert_eq!(
+        names,
+        [
+            (json!("Team Members"), json!(true)),
+            (json!("Team Owners"), json!(true)),
+            (json!("Team Visitors"), json!(true)),
+        ]
+    );
+    let (status, site_groups) = w
+        .call(
+            &ann,
+            Method::GET,
+            &format!("/api/sites/{}/groups", w.site),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(site_groups.as_array().unwrap().len(), 3);
+    let elsewhere = other["id"].as_str().unwrap();
+    assert_eq!(
+        w.call(
+            &ann,
+            Method::GET,
+            &format!("/api/sites/{elsewhere}/groups"),
+            None
+        )
+        .await,
+        (StatusCode::NOT_FOUND, error("not_found"))
+    );
+    for group in other["groups"].as_array().unwrap() {
+        let id = group["id"].as_str().unwrap();
+        assert_eq!(
+            w.call(&ann, Method::GET, &format!("/api/groups/{id}"), None)
+                .await,
+            (StatusCode::NOT_FOUND, error("not_found"))
+        );
+    }
+
+    // She manages the members of Team's Visitors, and sees them.
+    let visitors = w.group("visitors");
+    let (status, _) = w
+        .call(
+            &ann,
+            Method::POST,
+            &format!("/api/groups/{visitors}/members"),
+            Some(json!({ "email": bob.email })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, detail) = w
+        .call(&ann, Method::GET, &format!("/api/groups/{visitors}"), None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        detail["members"],
+        json!([{ "id": bob.id.0.to_string(), "email": bob.email, "name": "Bob" }])
+    );
+    assert_eq!(
+        w.remove(&ann, &visitors, &bob).await.0,
+        StatusCode::NO_CONTENT
+    );
+    let (_, detail) = w
+        .call(&ann, Method::GET, &format!("/api/groups/{visitors}"), None)
+        .await;
+    assert_eq!(detail["members"], json!([]));
 }

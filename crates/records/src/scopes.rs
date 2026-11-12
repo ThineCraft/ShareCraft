@@ -134,6 +134,9 @@ pub(crate) const ASSIGNED: &str = assigned!();
 /// The bit of `manage_access` in a `perms` column.
 pub(crate) const MANAGE_ACCESS_BIT: i32 = 16;
 
+/// The bit of `manage_site` in a `perms` column.
+pub(crate) const MANAGE_SITE_BIT: i32 = 32;
+
 const NODE_COLUMNS: &str = "n.id, n.kind, n.parent_id, n.site_id, n.name, n.unique_scope, \
      (n.deleted_at is not null) as deleted, n.created_by, n.created_at";
 
@@ -528,7 +531,10 @@ impl Db {
             Standing::Member => {}
         }
         let query = format!(
-            "with recursive {REACH}              select exists (select 1 from mine m                             where m.perms & {MANAGE_ACCESS_BIT} <> 0                               and m.node_id in (select origin from live))"
+            "with recursive {REACH} \
+             select exists (select 1 from mine m \
+                            where m.perms & {MANAGE_ACCESS_BIT} <> 0 \
+                              and m.node_id in (select origin from live))"
         );
         Ok(sqlx::query_scalar(sqlx::AssertSqlSafe(query))
             .bind(user.0)
