@@ -5,12 +5,12 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use collab_core::ids::NodeId;
-use records::{NodeKind, Role};
+use records::NodeKind;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::nodes::NodeOut;
-use super::{ApiError, JsonBody, to_completion};
+use super::{ApiError, JsonBody, LegacyRole, to_completion};
 use crate::AppState;
 use crate::auth::Signed;
 use crate::tree::{self, TreeOp};
@@ -20,8 +20,8 @@ use crate::tree::{self, TreeOp};
 pub(crate) struct SiteSummary {
     id: String,
     name: String,
-    /// `None` for limited access: a role only somewhere inside the site.
-    role: Option<Role>,
+    /// `None` for limited access: access only somewhere inside the site.
+    role: Option<LegacyRole>,
 }
 
 /// `GET /api/sites`: the sites the caller can see, by name.
@@ -37,10 +37,10 @@ pub(crate) async fn list(
     Ok(Json(
         sites
             .into_iter()
-            .map(|(site, role)| SiteSummary {
+            .map(|(site, access)| SiteSummary {
                 id: site.id.0.to_string(),
                 name: site.name,
-                role,
+                role: access.as_ref().map(LegacyRole::of),
             })
             .collect(),
     ))

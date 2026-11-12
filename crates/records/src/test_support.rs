@@ -35,6 +35,12 @@ impl TestDb {
     ///
     /// Panics, saying so, when `TEST_DATABASE_URL` is not set: a database test is never skipped.
     pub async fn create() -> TestDb {
+        TestDb::create_at(None).await
+    }
+
+    /// As [`TestDb::create`], but migrated only up to and including migration `version` when
+    /// given, for testing an upgrade: [`Db::migrate`] then brings it up to date.
+    pub async fn create_at(version: Option<i64>) -> TestDb {
         let base_url = std::env::var(URL_VARIABLE).unwrap_or_else(|_| {
             panic!("{URL_VARIABLE} is not set; run the tests with `cargo xtask test`")
         });
@@ -61,7 +67,11 @@ impl TestDb {
         let db = Db::connect(&schema_url(&base_url, &schema))
             .await
             .expect("cannot connect to the test schema");
-        db.migrate().await.expect("cannot migrate the test schema");
+        match version {
+            Some(version) => db.migrate_to(version).await,
+            None => db.migrate().await,
+        }
+        .expect("cannot migrate the test schema");
         TestDb {
             db,
             schema,

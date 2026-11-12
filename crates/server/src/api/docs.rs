@@ -6,15 +6,15 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use collab_core::ids::{DocId, NodeId};
-use records::{AccessError, Editor, Role};
+use records::{AccessError, Editor};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
-use super::nodes::require_owner;
-use super::{ApiError, JsonBody, parse_id, to_completion};
+use super::nodes::require_manager;
+use super::{ApiError, JsonBody, LegacyRole, parse_id, to_completion};
 use crate::AppState;
 use crate::auth::Signed;
 use crate::tree;
@@ -91,9 +91,11 @@ pub(crate) async fn create(
     };
     let role = state
         .db()
-        .role(user, id)
+        .doc_access(user, id)
         .await
-        .map_err(|e| ApiError::unavailable(&e))?;
+        .map_err(|e| ApiError::unavailable(&e))?
+        .as_ref()
+        .map(LegacyRole::of);
     let body = Json(serde_json::json!({
         "id": document.id.0.to_string(),
         "name": document.name,
@@ -109,7 +111,7 @@ pub(crate) struct DocDetail {
     id: String,
     name: String,
     editor: Editor,
-    role: Role,
+    role: LegacyRole,
     revision: Option<String>,
 }
 
@@ -122,9 +124,11 @@ pub(crate) async fn open(
     let doc = DocId(parse_id(&id)?);
     let db = state.db();
     let role = db
-        .role(signed.session.user.id, doc)
+        .doc_access(signed.session.user.id, doc)
         .await
         .map_err(|e| ApiError::unavailable(&e))?
+        .as_ref()
+        .map(LegacyRole::of)
         .ok_or(ApiError::NotFound)?;
     let document = db
         .document(doc)
@@ -154,7 +158,8 @@ pub(crate) struct EventRow {
     detail: Value,
 }
 
-/// `GET /api/docs/{id}/events`: the latest events of the document, oldest first. Owners only.
+/// `GET /api/docs/{id}/events`: the latest events of the document, oldest first. Only for
+/// those who manage access to it.
 pub(crate) async fn events(
     State(state): State<AppState>,
     signed: Signed,
@@ -162,7 +167,7 @@ pub(crate) async fn events(
 ) -> Result<Json<Vec<EventRow>>, ApiError> {
     let doc = DocId(parse_id(&id)?);
     let db = state.db();
-    require_owner(db, signed.session.user.id, doc.into()).await?;
+    require_manager(db, signed.session.user.id, doc.into()).await?;
     let events = db
         .recent_events_for(doc, MAX_EVENTS)
         .await

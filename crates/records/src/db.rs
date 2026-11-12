@@ -75,6 +75,14 @@ impl Db {
 
 #[cfg(feature = "test-support")]
 impl Db {
+    /// Brings the schema up to migration `version` and no further, for testing an upgrade.
+    pub async fn migrate_to(&self, version: i64) -> Result<(), DbError> {
+        sqlx::migrate!("./migrations")
+            .run_to(version, &self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// The underlying pool, for tests that inspect the database directly.
     pub fn test_pool(&self) -> &PgPool {
         &self.pool

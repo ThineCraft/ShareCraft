@@ -24,7 +24,7 @@ use protocol::{
     SaveState, SeatState, ServerMsg,
 };
 use records::test_support::TestDb;
-use records::{Db, Editor, NewUser, NodeKind, Role, User};
+use records::{Db, Editor, NewUser, NodeKind, Principal, User};
 use reqwest::header::{COOKIE, HeaderMap, HeaderValue, ORIGIN, SET_COOKIE};
 use revisions::RevisionStore;
 use server::tree::{self, TreeOp};
@@ -201,13 +201,13 @@ impl Site {
         .await
         .unwrap();
         self.records
-            .set_node_access(admin, folder.id, user.id, Some(Role::Owner))
+            .set_node_access(admin, folder.id, Principal::User(user.id), Some("owner"))
             .await
             .unwrap();
         // The administrator's copied assignment goes, so the folder's people are its owner
         // alone (the administrator stays owner of everything as an administrator).
         self.records
-            .set_node_access(admin, folder.id, admin, None)
+            .set_node_access(admin, folder.id, Principal::User(admin), None)
             .await
             .unwrap();
         places.homes.insert(user.id, folder.id);
@@ -278,9 +278,9 @@ impl Site {
         if db.document(doc).await.unwrap().is_none() {
             self.create_document(doc, &format!("{}.txt", doc.0), Editor::Text, user)
                 .await;
-        } else if db.role(user.id, doc).await.unwrap().is_none() {
+        } else if db.doc_access(user.id, doc).await.unwrap().is_none() {
             let admin = self.harness_admin().await;
-            db.set_access(admin, doc, user.id, Some(Role::Editor))
+            db.set_access(admin, doc, Principal::User(user.id), Some("editor"))
                 .await
                 .unwrap();
         }

@@ -8,9 +8,9 @@
 mod common;
 
 use collab_core::ids::DocId;
-use common::{put, site, user};
+use common::{Role, put, role_of, site, user};
 use records::test_support::TestDb;
-use records::{AccessError, Editor, NodeKind, RevisionRecord, Role};
+use records::{AccessError, Editor, NodeKind, RevisionRecord};
 use serde_json::json;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -109,7 +109,10 @@ async fn append_requires_the_recorded_head() {
     assert_eq!(document.revised_at, Some(r2.committed_at));
     assert_eq!(document.name, "Notes");
     assert_eq!(document.created_by, Some(ann.id));
-    assert_eq!(test.db.role(ann.id, doc).await.unwrap(), Some(Role::Owner));
+    assert_eq!(
+        role_of(test.db.doc_access(ann.id, doc).await.unwrap()),
+        Some(Role::Owner)
+    );
     let fields: serde_json::Value =
         sqlx::query_scalar("select fields from documents where id = $1")
             .bind(doc.0)
@@ -249,9 +252,15 @@ async fn git_only_document_gets_a_record_nobody_can_open_until_placed() {
         assert_eq!(document.name, name);
         assert_eq!(document.created_by, None);
         assert!(document.revision.is_some());
-        assert_eq!(test.db.role(ann.id, doc).await.unwrap(), None);
+        assert_eq!(
+            role_of(test.db.doc_access(ann.id, doc).await.unwrap()),
+            None
+        );
         // Outside the tree there is no node to decide access, even for an administrator.
-        assert_eq!(test.db.role(ada.id, doc).await.unwrap(), None);
+        assert_eq!(
+            role_of(test.db.doc_access(ada.id, doc).await.unwrap()),
+            None
+        );
         assert_eq!(
             test.db.grants(ada.id, doc).await,
             Err(AccessError::NotFound)
@@ -267,9 +276,12 @@ async fn git_only_document_gets_a_record_nobody_can_open_until_placed() {
         "notes-1.txt",
     )
     .await;
-    assert_eq!(test.db.role(ann.id, appended).await.unwrap(), None);
     assert_eq!(
-        test.db.role(ada.id, appended).await.unwrap(),
+        role_of(test.db.doc_access(ann.id, appended).await.unwrap()),
+        None
+    );
+    assert_eq!(
+        role_of(test.db.doc_access(ada.id, appended).await.unwrap()),
         Some(Role::Owner)
     );
     assert!(test.db.grants(ada.id, appended).await.unwrap().is_empty());

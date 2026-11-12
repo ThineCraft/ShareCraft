@@ -18,7 +18,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use collab_core::ids::{NodeId, SessionId, UserId};
-use records::{AccessError, AccountError};
+use records::{Access, AccessError, AccountError, Perms};
+use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::json;
 use uuid::Uuid;
@@ -110,8 +111,14 @@ pub(crate) enum ApiError {
     NoSuchUser,
     /// 409: the email is already in use.
     EmailTaken,
-    /// 409: a scope must keep one owner.
-    LastOwner,
+    /// 409: a scope must keep someone who can manage access.
+    LastManager,
+    /// 403: the role has permissions the caller does not hold there.
+    BeyondYourAccess,
+    /// 409: the role is still assigned somewhere.
+    RoleInUse,
+    /// 400: a built-in role cannot be changed or deleted.
+    BuiltinRole,
     /// 409: another item in the same place already has that name (ignoring case).
     NameTaken,
     /// 409: a folder still holds items.
@@ -161,7 +168,10 @@ impl ApiError {
             ApiError::NotFound => (StatusCode::NOT_FOUND, "not_found"),
             ApiError::NoSuchUser => (StatusCode::NOT_FOUND, "no_such_user"),
             ApiError::EmailTaken => (StatusCode::CONFLICT, "email_taken"),
-            ApiError::LastOwner => (StatusCode::CONFLICT, "last_owner"),
+            ApiError::LastManager => (StatusCode::CONFLICT, "last_manager"),
+            ApiError::BeyondYourAccess => (StatusCode::FORBIDDEN, "beyond_your_access"),
+            ApiError::RoleInUse => (StatusCode::CONFLICT, "role_in_use"),
+            ApiError::BuiltinRole => (StatusCode::BAD_REQUEST, "builtin_role"),
             ApiError::NameTaken => (StatusCode::CONFLICT, "name_taken"),
             ApiError::NotEmpty => (StatusCode::CONFLICT, "not_empty"),
             ApiError::IntoItself => (StatusCode::BAD_REQUEST, "into_itself"),
@@ -185,8 +195,14 @@ impl From<AccessError> for ApiError {
         match e {
             AccessError::NotFound => ApiError::NotFound,
             AccessError::NoSuchUser => ApiError::NoSuchUser,
+            AccessError::NoSuchGroup => ApiError::NotFound,
+            // As an unknown role name was before roles could be defined.
+            AccessError::NoSuchRole => ApiError::InvalidRequest,
             AccessError::Forbidden => ApiError::Forbidden,
-            AccessError::LastOwner => ApiError::LastOwner,
+            AccessError::LastManager => ApiError::LastManager,
+            AccessError::BeyondYourAccess => ApiError::BeyondYourAccess,
+            AccessError::RoleInUse => ApiError::RoleInUse,
+            AccessError::BuiltinRole => ApiError::BuiltinRole,
             AccessError::InvalidName => ApiError::InvalidName,
             // `POST /api/docs` answers this itself, naming the extension expected.
             AccessError::WrongExtension => ApiError::InvalidRequest,
@@ -220,6 +236,34 @@ impl From<AccountError> for ApiError {
     }
 }
 
+/// The plan-1 name of a set of permissions, which responses keep until the API speaks of roles
+/// and permissions: `owner` with `manage_access`, else `editor` with `edit`, else `viewer`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum LegacyRole {
+    Viewer,
+    Editor,
+    Owner,
+}
+
+impl LegacyRole {
+    /// The name of `perms`.
+    pub(crate) fn of_perms(perms: Perms) -> LegacyRole {
+        if perms.contains(Perms::MANAGE_ACCESS) {
+            LegacyRole::Owner
+        } else if perms.contains(Perms::EDIT) {
+            LegacyRole::Editor
+        } else {
+            LegacyRole::Viewer
+        }
+    }
+
+    /// The name of `access`'s permissions.
+    pub(crate) fn of(access: &Access) -> LegacyRole {
+        LegacyRole::of_perms(access.perms)
+    }
+}
+
 /// An id from a path, or `422 invalid_request` when it is not one.
 fn parse_id(text: &str) -> Result<Uuid, ApiError> {
     Uuid::parse_str(text).map_err(|_| ApiError::InvalidRequest)
@@ -241,12 +285,12 @@ async fn to_completion<T: Send + 'static>(
     }
 }
 
-/// Called once a change that can alter roles at or below `node` is stored: an assignment,
+/// Called once a change that can alter access at or below `node` is stored: an assignment,
 /// a break or restore of inheritance on `node`, or a move of `node`. For every open document
-/// at or below `node`, one at a time in id order, reads the role of each person connected to
-/// it afresh (so an administrator who loses a grant stays an owner) and tells the room:
-/// connections that lost access are removed, the others get their new rights. If a role cannot
-/// be read, that person's connections are removed, as access can no longer be confirmed; if it
+/// at or below `node`, one at a time in id order, reads the access of each person connected
+/// to it afresh (so an administrator who loses a grant keeps every permission) and tells the
+/// room: connections that lost access are removed, the others get their new rights. If access
+/// cannot be read, that person's connections are removed, as it can no longer be confirmed; if it
 /// cannot be told whether a document is below `node`, it is checked anyway.
 ///
 /// Each document's readings and messages happen under its access lock, so that of two changes
@@ -266,14 +310,14 @@ pub(crate) async fn recheck_below(state: &AppState, node: NodeId) {
         }
         let _in_order = rooms.order_access(doc).await;
         for user in rooms.connected_users(doc).await {
-            let role = match db.effective_role(user, doc.into()).await {
-                Ok(role) => role,
+            let access = match db.effective_access(user, doc.into()).await {
+                Ok(access) => access,
                 Err(e) => {
                     eprintln!("sharecraft-server: database failure: {e}");
                     None
                 }
             };
-            rooms.send_to(doc, AccessChange::SetAccess { user, role });
+            rooms.send_to(doc, AccessChange::SetAccess { user, role: access });
         }
     }
 }
@@ -333,11 +377,12 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use crate::members::builtin_access;
     use collab_core::ids::{ClientId, DocId};
     use collab_text::TextOp;
     use protocol::ServerMsg;
     use records::test_support::TestDb;
-    use records::{Editor, NewUser, NodeKind, Role};
+    use records::{Editor, NewUser, NodeKind, Principal};
     use revisions::RevisionStore;
     use tokio::sync::{mpsc, oneshot};
 
@@ -391,7 +436,7 @@ mod tests {
         tree::create_document(state, &root, library, doc, "Plan.txt", Editor::Text, None)
             .await
             .unwrap();
-        db.set_access(root.id, doc, owner, Some(Role::Owner))
+        db.set_access(root.id, doc, Principal::User(owner), Some("owner"))
             .await
             .unwrap();
         doc
@@ -426,7 +471,7 @@ mod tests {
         let ann = account(&db, "Ann").await;
         let bob = account(&db, "Bob").await;
         let doc = placed_document(&state, ann).await;
-        db.set_access(ann, doc, bob, Some(Role::Editor))
+        db.set_access(ann, doc, Principal::User(bob), Some("editor"))
             .await
             .unwrap();
         let room = state.open_room(doc, "Plan.txt".into());
@@ -439,7 +484,7 @@ mod tests {
                 user: bob,
                 session: SessionId(Uuid::new_v4()),
                 name: "Bob".into(),
-                role: Role::Editor,
+                role: builtin_access("editor"),
                 resume: None,
                 tx,
                 accepted,
@@ -463,7 +508,7 @@ mod tests {
                 _ = &mut request => panic!("the request finished while the hook could not run"),
                 () = tokio::time::sleep(Duration::from_millis(20)) => {}
             }
-            if db.role(bob, doc).await.unwrap().is_none() {
+            if db.doc_access(bob, doc).await.unwrap().is_none() {
                 break;
             }
             assert!(
@@ -507,7 +552,7 @@ mod tests {
         let ann = account(&db, "Ann").await;
         let bob = account(&db, "Bob").await;
         let doc = placed_document(&state, ann).await;
-        db.set_access(ann, doc, bob, Some(Role::Viewer))
+        db.set_access(ann, doc, Principal::User(bob), Some("viewer"))
             .await
             .unwrap();
 
@@ -523,7 +568,7 @@ mod tests {
                 user: bob,
                 session: SessionId(Uuid::new_v4()),
                 name: "Bob".into(),
-                role: Role::Viewer,
+                role: builtin_access("viewer"),
                 resume: None,
                 tx,
                 accepted,
@@ -535,14 +580,14 @@ mod tests {
         // The first change, made the way `recheck_below` makes it, paused between
         // reading the role and telling the room.
         let first = state.rooms().order_access(doc).await;
-        db.set_access(ann, doc, bob, Some(Role::Editor))
+        db.set_access(ann, doc, Principal::User(bob), Some("editor"))
             .await
             .unwrap();
-        let first_read = db.role(bob, doc).await.unwrap();
-        assert_eq!(first_read, Some(Role::Editor));
+        let first_read = db.doc_access(bob, doc).await.unwrap();
+        assert_eq!(first_read, Some(builtin_access("editor")));
 
         // The second change is stored and its hook runs meanwhile.
-        db.set_access(ann, doc, bob, Some(Role::Viewer))
+        db.set_access(ann, doc, Principal::User(bob), Some("viewer"))
             .await
             .unwrap();
         let mut second = tokio::spawn({
@@ -606,8 +651,8 @@ mod tests {
                 break;
             }
         }
-        let stored = db.role(bob, doc).await.unwrap().unwrap();
-        assert_eq!(stored, Role::Viewer);
+        let stored = db.doc_access(bob, doc).await.unwrap().unwrap();
+        assert_eq!(stored, builtin_access("viewer"));
         assert_eq!(
             can_edit,
             Some(stored.can_edit()),

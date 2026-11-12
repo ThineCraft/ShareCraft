@@ -116,6 +116,8 @@ test('every error code of the tree and access routes has its own sentence', () =
     'wrong_place',
     'is_site',
     'last_owner',
+    'last_manager',
+    'beyond_your_access',
     'invalid_name',
     'invalid_request',
     'no_such_user',

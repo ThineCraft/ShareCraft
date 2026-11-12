@@ -9,8 +9,9 @@ use uuid::Uuid;
 
 use crate::documents::UNIQUE_VIOLATION;
 use crate::events::{NewEvent, record};
-use crate::scopes::{LOCK_ATTEMPTS, lock_segment};
-use crate::{AccessError, Db, DbError, Editor, Role};
+use crate::roles::lock_roles;
+use crate::scopes::{LOCK_ATTEMPTS, access_in, judged_roles, lock_segment};
+use crate::{AccessError, Db, DbError, Editor, Perms};
 
 const MAX_NAME_CHARS: usize = 120;
 const REFUSED_CHARS: [char; 9] = ['"', '*', ':', '<', '>', '?', '/', '\\', '|'];
@@ -124,11 +125,12 @@ pub struct NodeChange<'a> {
     pub actor: Option<UserId>,
     /// Whether `actor` must be an enabled administrator.
     pub needs_admin: bool,
-    /// Nodes `actor` must have at least the given role on. Each node's chain, from the scope
-    /// that decides its access down to it, is locked in this order before the roles are judged
-    /// (the node itself `FOR UPDATE` if it is one of `rows`, everything else `FOR SHARE`): list
-    /// ancestors before descendants, as access changes lock them.
-    pub needs: &'a [(NodeId, Role)],
+    /// Nodes `actor` must hold the given permissions on. Each node's chain, from the scope
+    /// that decides its access down to it, is locked in this order (the node itself
+    /// `FOR UPDATE` if it is one of `rows`, everything else `FOR SHARE`), then the roles giving
+    /// the access, before it is judged: list ancestors before descendants, as access changes
+    /// lock them.
+    pub needs: &'a [(NodeId, Perms)],
     /// Gives `actor` an owner assignment on the first row's node (a new site).
     pub owner: bool,
     /// Records the first row's node as a new document opened in this editor, created by
@@ -177,11 +179,13 @@ pub(crate) async fn upsert_node(conn: &mut PgConnection, row: &NodeRow) -> Resul
     Ok(())
 }
 
-/// Locks what `change` needs and judges its actor's roles. Each needed node's chain is locked
+/// Locks what `change` needs and judges its actor's access. Each needed node's chain is locked
 /// from its source scope down, as access changes lock it (ancestors `FOR SHARE`, a node the
-/// change writes `FOR UPDATE`), in `needs` order, so an assignment changed anywhere above a
-/// needed node either waits for this change or is seen by it. Returns `false` if a chain moved
-/// while it was being locked: the caller starts over.
+/// change writes `FOR UPDATE`), in `needs` order; then the roles giving that access, by id,
+/// `FOR SHARE`; then the access is worked out again and judged. So an assignment changed
+/// anywhere above a needed node, or a role changed that gives the access, either waits for this
+/// change or is seen by it. Returns `false` if a chain moved while it was being locked: the
+/// caller starts over.
 async fn judge(conn: &mut PgConnection, change: &NodeChange<'_>) -> Result<bool, AccessError> {
     if !change.needs_admin && change.needs.is_empty() {
         return Ok(true);
@@ -198,19 +202,22 @@ async fn judge(conn: &mut PgConnection, change: &NodeChange<'_>) -> Result<bool,
             return Err(AccessError::Forbidden);
         }
     }
-    let mut roles = Vec::with_capacity(change.needs.len());
-    for (id, needed) in change.needs {
+    let mut involved = Vec::new();
+    for (id, _) in change.needs {
         let written = change.rows.iter().any(|row| row.id == *id);
         let Some(links) = lock_segment(&mut *conn, actor, *id, false, written).await? else {
             return Ok(false);
         };
-        roles.push((links.last().and_then(|link| link.role), *needed));
+        involved.extend(judged_roles(&links));
     }
-    // Every chain is locked now, so none of these roles can change before the commit.
-    for (role, needed) in roles {
-        match role {
+    lock_roles(&mut *conn, involved).await?;
+    // Every chain and role is locked now, so none of this access can change before the commit.
+    for (id, needed) in change.needs {
+        match access_in(&mut *conn, actor, *id).await? {
             None => return Err(AccessError::NotFound),
-            Some(role) if role < needed => return Err(AccessError::Forbidden),
+            Some(access) if !access.perms.contains(*needed) => {
+                return Err(AccessError::Forbidden);
+            }
             Some(_) => {}
         }
     }
@@ -237,7 +244,7 @@ impl Db {
     }
 
     /// Applies `change` in one transaction: locks and judges what it needs (`NotFound` if the
-    /// actor no longer has a role on a node it needs, `Forbidden` if the role is too low or
+    /// actor no longer has access to a node it needs, `Forbidden` if it lacks a permission or
     /// they are no longer an enabled administrator when that is needed), records the new
     /// document if any (`Exists` if its id is taken), applies each row as
     /// [`Db::apply_node`] does, gives the owner assignment if asked, and writes the events.
@@ -274,9 +281,11 @@ impl Db {
         if let (true, Some(actor), Some(first)) = (change.owner, change.actor, change.rows.first())
         {
             sqlx::query(
-                "insert into scope_access (node_id, user_id, role, granted_by) \
-                 values ($1, $2, 'owner', $2) \
-                 on conflict (node_id, user_id) do update set role = 'owner'",
+                "insert into assignments \
+                     (node_id, principal_kind, principal_id, role_id, granted_by) \
+                 values ($1, 'user', $2, 'owner', $2) \
+                 on conflict (node_id, principal_kind, principal_id) \
+                 do update set role_id = 'owner'",
             )
             .bind(first.id.0)
             .bind(actor.0)

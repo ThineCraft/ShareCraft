@@ -19,7 +19,7 @@ use std::time::Duration;
 use axum::extract::ws::Utf8Bytes;
 use collab_core::ids::{ClientId, DocId, SessionId, UserId};
 use protocol::{FileServerMsg, Participant, RemovedReason, SaveState, SeatState};
-use records::{NewEvent, Role};
+use records::{Access, NewEvent};
 use revisions::{Author, Checkpoint, Outcome, RevisionId};
 use serde_json::{Map, Value};
 use tokio::sync::{mpsc, oneshot};
@@ -53,7 +53,7 @@ pub(crate) enum FileCommand {
         session: SessionId,
         /// The account's name.
         name: String,
-        role: Role,
+        role: Access,
         tx: mpsc::Sender<Outbound>,
         /// Answered once the join is handled; dropped if the session ended first, in which
         /// case the connection asks again.
@@ -626,9 +626,10 @@ impl AccessRules for FileRoom {
     /// Each connection whose role changes is told with `Access`. A holder who may no longer
     /// edit loses the seat. A connection still waiting to be confirmed takes the role, which
     /// its `Joined` will carry.
-    fn change_role(&mut self, user: UserId, role: Role) {
+    fn change_role(&mut self, user: UserId, role: Access) {
+        let can_edit = role.can_edit();
         for member in self.pending.iter_mut().filter(|m| m.user == user) {
-            member.role = role;
+            member.role = role.clone();
         }
         let change = self.members.change_role(user, role);
         if change.departed.any() {
@@ -637,7 +638,7 @@ impl AccessRules for FileRoom {
         if !change.changed {
             return;
         }
-        if !role.can_edit() && self.seat.as_ref().is_some_and(|s| s.user == user) {
+        if !can_edit && self.seat.as_ref().is_some_and(|s| s.user == user) {
             self.free_seat(None);
         }
         self.broadcast_people();
@@ -849,6 +850,7 @@ async fn load(
 )]
 mod tests {
     use super::*;
+    use crate::members::builtin_access;
     use records::test_support::TestDb;
     use records::{Db, Editor, NewUser};
     use revisions::{CheckpointError, RevisionInfo, RevisionStore, Stored};
@@ -987,7 +989,7 @@ mod tests {
         link: &FileLink,
         conn: ConnId,
         person: (UserId, &str),
-        role: Role,
+        role: Access,
     ) -> (Tab, Option<String>) {
         join_client(link, conn, ClientId(Uuid::new_v4()), person, role).await
     }
@@ -998,7 +1000,7 @@ mod tests {
         conn: ConnId,
         client: ClientId,
         (user, name): (UserId, &str),
-        role: Role,
+        role: Access,
     ) -> (Tab, Option<String>) {
         let (tx, out) = mpsc::channel(OUTBOUND_CAPACITY);
         let (accepted, reply) = oneshot::channel();
@@ -1046,7 +1048,7 @@ mod tests {
     async fn save_by_the_holder_is_stored_and_credited() {
         let f = fixture().await;
         let link = f.open();
-        let (mut ann, token) = join(&link, 1, (f.ann, "Ann"), Role::Owner).await;
+        let (mut ann, token) = join(&link, 1, (f.ann, "Ann"), builtin_access("owner")).await;
         let token = token.unwrap();
         let bytes = b"PK\x03\x04 not really a workbook".to_vec();
 
@@ -1109,9 +1111,9 @@ mod tests {
         assert!(f.rooms.link(f.doc).is_none());
 
         let link = f.open();
-        let (_ann, token) = join(&link, 1, (f.ann, "Ann"), Role::Owner).await;
+        let (_ann, token) = join(&link, 1, (f.ann, "Ann"), builtin_access("owner")).await;
         let token = token.unwrap();
-        let (_bob, bobs) = join(&link, 2, (f.bob, "Bob"), Role::Editor).await;
+        let (_bob, bobs) = join(&link, 2, (f.bob, "Bob"), builtin_access("editor")).await;
         assert!(bobs.is_none(), "Bob does not hold the seat");
 
         let mut wrong = token.clone().into_bytes();
@@ -1137,7 +1139,7 @@ mod tests {
     async fn save_on_an_old_revision_is_a_conflict() {
         let f = fixture().await;
         let link = f.open();
-        let (_ann, token) = join(&link, 1, (f.ann, "Ann"), Role::Owner).await;
+        let (_ann, token) = join(&link, 1, (f.ann, "Ann"), builtin_access("owner")).await;
         let token = token.unwrap();
         let SaveReply::Saved(first) = f
             .rooms
@@ -1173,7 +1175,7 @@ mod tests {
     async fn same_bytes_again_is_unchanged() {
         let f = fixture().await;
         let link = f.open();
-        let (mut ann, token) = join(&link, 1, (f.ann, "Ann"), Role::Owner).await;
+        let (mut ann, token) = join(&link, 1, (f.ann, "Ann"), builtin_access("owner")).await;
         let token = token.unwrap();
         let SaveReply::Saved(first) = f
             .rooms
@@ -1205,7 +1207,7 @@ mod tests {
     async fn stale_store_puts_the_room_in_conflict() {
         let f = fixture().await;
         let link = f.open();
-        let (mut ann, token) = join(&link, 1, (f.ann, "Ann"), Role::Owner).await;
+        let (mut ann, token) = join(&link, 1, (f.ann, "Ann"), builtin_access("owner")).await;
         let token = token.unwrap();
 
         // The document is saved behind the session's back.
@@ -1335,9 +1337,9 @@ mod tests {
             }),
             None,
         );
-        let (mut ann, token) = join(&link, 1, (f.ann, "Ann"), Role::Owner).await;
+        let (mut ann, token) = join(&link, 1, (f.ann, "Ann"), builtin_access("owner")).await;
         let token = token.unwrap();
-        let (mut bob, _) = join(&link, 2, (f.bob, "Bob"), Role::Editor).await;
+        let (mut bob, _) = join(&link, 2, (f.bob, "Bob"), builtin_access("editor")).await;
         ann.until(
             |m| matches!(m, FileServerMsg::People { participants } if participants.len() == 2),
         )
@@ -1456,9 +1458,9 @@ mod tests {
     async fn saves_wait_one_at_a_time_and_strangers_are_answered_at_once() {
         let f = fixture().await;
         let (link, started, release) = gated(&f);
-        let (_ann, token) = join(&link, 1, (f.ann, "Ann"), Role::Owner).await;
+        let (_ann, token) = join(&link, 1, (f.ann, "Ann"), builtin_access("owner")).await;
         let token = token.unwrap();
-        let (_bob, _) = join(&link, 2, (f.bob, "Bob"), Role::Editor).await;
+        let (_bob, _) = join(&link, 2, (f.bob, "Bob"), builtin_access("editor")).await;
 
         let first = spawn_save(&f, f.ann, &token, None);
         let started = write_started(started).await;
@@ -1501,7 +1503,7 @@ mod tests {
     async fn waiting_save_of_a_removed_holder_is_refused() {
         let f = fixture().await;
         let (link, started, release) = gated(&f);
-        let (_ann, token) = join(&link, 1, (f.ann, "Ann"), Role::Owner).await;
+        let (_ann, token) = join(&link, 1, (f.ann, "Ann"), builtin_access("owner")).await;
         let token = token.unwrap();
 
         let first = spawn_save(&f, f.ann, &token, None);
@@ -1513,7 +1515,7 @@ mod tests {
             f.doc,
             AccessChange::SetAccess {
                 user: f.ann,
-                role: Some(Role::Viewer),
+                role: Some(builtin_access("viewer")),
             },
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1595,7 +1597,7 @@ mod tests {
             }),
             None,
         );
-        let (mut ann, token) = join(&link, 1, (f.ann, "Ann"), Role::Owner).await;
+        let (mut ann, token) = join(&link, 1, (f.ann, "Ann"), builtin_access("owner")).await;
         let token = token.unwrap();
         let reply = f
             .rooms
@@ -1623,9 +1625,11 @@ mod tests {
         let f = fixture().await;
         let link = f.open();
         let client = ClientId(Uuid::new_v4());
-        let (_old, before) = join_client(&link, 1, client, (f.ann, "Ann"), Role::Owner).await;
+        let (_old, before) =
+            join_client(&link, 1, client, (f.ann, "Ann"), builtin_access("owner")).await;
         let before = before.unwrap();
-        let (_new, after) = join_client(&link, 2, client, (f.ann, "Ann"), Role::Owner).await;
+        let (_new, after) =
+            join_client(&link, 2, client, (f.ann, "Ann"), builtin_access("owner")).await;
         let after = after.expect("Ann took the seat again");
         assert_ne!(before, after);
 
@@ -1659,7 +1663,7 @@ mod tests {
             Duration::from_secs(60),
         );
         let vic_id = UserId(Uuid::new_v4());
-        let (mut vic, _) = join(&link, 1, (vic_id, "Vic"), Role::Viewer).await;
+        let (mut vic, _) = join(&link, 1, (vic_id, "Vic"), builtin_access("viewer")).await;
 
         let (tx, mut out) = mpsc::channel(OUTBOUND_CAPACITY);
         let (accepted, reply) = oneshot::channel();
@@ -1670,7 +1674,7 @@ mod tests {
                 user: f.bob,
                 session: SessionId(Uuid::new_v4()),
                 name: "Bob".into(),
-                role: Role::Editor,
+                role: builtin_access("editor"),
                 tx,
                 accepted,
             })
@@ -1685,7 +1689,7 @@ mod tests {
             },
         );
         // A marker after both: Vic's own second tab joins and Vic sees it.
-        let (_vic2, _) = join(&link, 3, (vic_id, "Vic"), Role::Viewer).await;
+        let (_vic2, _) = join(&link, 3, (vic_id, "Vic"), builtin_access("viewer")).await;
         vic.until(
             |m| matches!(m, FileServerMsg::People { participants } if participants.len() == 2),
         )
@@ -1767,7 +1771,7 @@ mod tests {
                     user: f.bob,
                     session,
                     name: "Bob".into(),
-                    role: Role::Editor,
+                    role: builtin_access("editor"),
                     tx,
                     accepted,
                 })

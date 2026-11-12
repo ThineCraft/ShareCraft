@@ -25,6 +25,11 @@ impl From<DocId> for NodeId {
 #[serde(transparent)]
 pub struct UserId(pub Uuid);
 
+/// Identifies one group of accounts, which can be given access like a person.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct GroupId(pub Uuid);
+
 /// Identifies one sign-in session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]

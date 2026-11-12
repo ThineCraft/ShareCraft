@@ -12,7 +12,7 @@ use collab_text::TextOp;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use protocol::{ClientMsg, FileClientMsg, FileServerMsg, RemovedReason, Resume, ServerMsg};
-use records::Role;
+use records::Access;
 use time::OffsetDateTime;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
@@ -54,7 +54,8 @@ pub(crate) struct Visitor {
     pub(crate) expires_at: OffsetDateTime,
     /// The account's name, shown to the others and credited in checkpoints.
     pub(crate) name: String,
-    pub(crate) role: Role,
+    /// What they may do with the document.
+    pub(crate) role: Access,
     /// The document's name, which a room opened for this connection stores checkpoints under.
     pub(crate) doc_name: String,
     /// Whether the document is a file, opened in a file session rather than a text room.
@@ -102,7 +103,7 @@ async fn visitor(
     let session = signed?.session;
     let db = state.db();
     let role = db
-        .role(session.user.id, doc)
+        .doc_access(session.user.id, doc)
         .await
         .map_err(|e| ApiError::unavailable(&e))?
         .ok_or(ApiError::NotFound)?;
@@ -348,7 +349,7 @@ async fn join_room(
             user: visitor.user,
             session: visitor.session,
             name: visitor.name.clone(),
-            role: visitor.role,
+            role: visitor.role.clone(),
             resume,
             tx,
             accepted,
@@ -374,7 +375,7 @@ async fn join_file_room(
             user: visitor.user,
             session: visitor.session,
             name: visitor.name.clone(),
-            role: visitor.role,
+            role: visitor.role.clone(),
             tx,
             accepted,
         },
@@ -429,8 +430,8 @@ async fn recheck_after_join(
                 return Recheck::Unavailable;
             }
         },
-        Ok(Some(_)) => match db.role(visitor.user, doc).await {
-            Ok(role) if role == Some(visitor.role) => None,
+        Ok(Some(_)) => match db.doc_access(visitor.user, doc).await {
+            Ok(role) if role.as_ref() == Some(&visitor.role) => None,
             Ok(None) if is_deleted(state, doc).await => Some(AccessChange::Deleted),
             Ok(role) => Some(AccessChange::SetAccess {
                 user: visitor.user,

@@ -12,12 +12,70 @@ use std::time::Duration;
 
 use collab_core::ids::{DocId, NodeId, UserId};
 use records::test_support::TestDb;
-use records::{Editor, NewUser, NodeKind, NodeRow, Role, User};
+use records::{Access, AccessError, Editor, NewUser, NodeKind, NodeRow, RoleRef, User};
 use sqlx::Connection;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
 const PASSWORD: &str = "correct horse battery";
+
+/// The built-in roles, by which plan 1's tests name access.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Role {
+    Viewer,
+    Editor,
+    Owner,
+}
+
+impl Role {
+    /// The built-in role's id.
+    pub fn id(self) -> &'static str {
+        match self {
+            Role::Viewer => "viewer",
+            Role::Editor => "editor",
+            Role::Owner => "owner",
+        }
+    }
+
+    /// The built-in role with this id; panics for any other.
+    pub fn from_id(id: &str) -> Role {
+        match id {
+            "viewer" => Role::Viewer,
+            "editor" => Role::Editor,
+            "owner" => Role::Owner,
+            other => panic!("{other:?} is not a built-in role"),
+        }
+    }
+
+    /// The one built-in role giving `access`; panics unless exactly one built-in role gives
+    /// it, with exactly that role's permissions.
+    pub fn of(access: &Access) -> Role {
+        let [only] = access.roles.as_slice() else {
+            panic!("expected one role, got {access:?}");
+        };
+        let role = Role::from_id(&only.id);
+        let builtin = records::RoleDef::builtin(role.id()).unwrap();
+        assert_eq!(access.perms, builtin.perms, "{access:?}");
+        role
+    }
+}
+
+/// The built-in role giving `access`, if any (see [`Role::of`]).
+pub fn role_of(access: Option<Access>) -> Option<Role> {
+    access.as_ref().map(Role::of)
+}
+
+/// A change of assignment, with the roles before and after named as built-in roles.
+pub fn changed(
+    result: Result<(Option<RoleRef>, Option<RoleRef>), AccessError>,
+) -> Result<(Option<Role>, Option<Role>), AccessError> {
+    result.map(|(before, after)| {
+        (
+            before.map(|r| Role::from_id(&r.id)),
+            after.map(|r| Role::from_id(&r.id)),
+        )
+    })
+}
 
 pub async fn user(test: &TestDb, name: &str, is_admin: bool) -> User {
     test.db
@@ -91,18 +149,21 @@ pub async fn delete(test: &TestDb, id: NodeId) {
 
 /// Writes an assignment directly, for setting up a scope that has none yet.
 pub async fn grant(test: &TestDb, node: NodeId, user: UserId, role: Role) {
-    let role = match role {
-        Role::Viewer => "viewer",
-        Role::Editor => "editor",
-        Role::Owner => "owner",
-    };
-    sqlx::query("insert into scope_access (node_id, user_id, role) values ($1, $2, $3)")
-        .bind(node.0)
-        .bind(user.0)
-        .bind(role)
-        .execute(test.db.test_pool())
-        .await
-        .unwrap();
+    grant_role(test, node, user, role.id()).await;
+}
+
+/// Writes a person's assignment of the role `role_id` directly.
+pub async fn grant_role(test: &TestDb, node: NodeId, user: UserId, role_id: &str) {
+    sqlx::query(
+        "insert into assignments (node_id, principal_kind, principal_id, role_id) \
+         values ($1, 'user', $2, $3)",
+    )
+    .bind(node.0)
+    .bind(user.0)
+    .bind(role_id)
+    .execute(test.db.test_pool())
+    .await
+    .unwrap();
 }
 
 /// A site named `name`, owned by `owner` if given.
@@ -192,17 +253,34 @@ pub struct Gate {
 
 /// Opens a connection, begins a transaction on it and locks `node`'s row `FOR UPDATE`.
 pub async fn gate(test: &TestDb, node: NodeId) -> Gate {
+    let mut gate = open_gate(test).await;
+    sqlx::query("select id from nodes where id = $1 for update")
+        .bind(node.0)
+        .execute(&mut gate.conn)
+        .await
+        .unwrap();
+    gate
+}
+
+/// Opens a connection, begins a transaction on it and locks the row of the role `id`
+/// `FOR UPDATE`.
+pub async fn role_gate(test: &TestDb, id: &str) -> Gate {
+    let mut gate = open_gate(test).await;
+    sqlx::query("select id from roles where id = $1 for update")
+        .bind(id)
+        .execute(&mut gate.conn)
+        .await
+        .unwrap();
+    gate
+}
+
+async fn open_gate(test: &TestDb) -> Gate {
     let mut conn = sqlx::PgConnection::connect(&test.url()).await.unwrap();
     let pid: i32 = sqlx::query_scalar("select pg_backend_pid()")
         .fetch_one(&mut conn)
         .await
         .unwrap();
     sqlx::query("begin").execute(&mut conn).await.unwrap();
-    sqlx::query("select id from nodes where id = $1 for update")
-        .bind(node.0)
-        .execute(&mut conn)
-        .await
-        .unwrap();
     Gate { conn, pid }
 }
 

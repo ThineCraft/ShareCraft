@@ -913,7 +913,7 @@ async fn access_is_seen_and_changed_by_owners_on_any_node() {
     assert_eq!(
         w.call(&ann, Method::DELETE, &format!("{path}/{}", ann.id.0), None)
             .await,
-        (StatusCode::CONFLICT, error("last_owner"))
+        (StatusCode::CONFLICT, error("last_manager"))
     );
 }
 

@@ -11,25 +11,29 @@ use std::collections::HashSet;
 
 use collab_core::ids::{NodeId, UserId};
 use common::{
-    Tree, delete, document_in, gate, grant, new_id, node_events, put, site, tree, user,
-    wait_blocked,
+    Role, Tree, changed, delete, document_in, gate, grant, new_id, node_events, put, role_of, site,
+    tree, user, wait_blocked,
 };
 use records::test_support::TestDb;
-use records::{AccessError, Cursor, NodeKind, Role};
+use records::{AccessError, Cursor, NodeKind, Perms, Principal};
 use uuid::Uuid;
 
 async fn role(test: &TestDb, user: UserId, node: NodeId) -> Option<Role> {
-    test.db.effective_role(user, node).await.unwrap()
+    role_of(test.db.effective_access(user, node).await.unwrap())
 }
 
 /// The (user, role) assignments the access page shows for `node`.
 async fn shown(test: &TestDb, owner: UserId, node: NodeId) -> Vec<(UserId, Role)> {
     let access = test.db.access(owner, node).await.unwrap();
-    access.grants.iter().map(|g| (g.user.id, g.role)).collect()
+    access
+        .grants
+        .iter()
+        .map(|g| (g.user.id, Role::from_id(&g.role.id)))
+        .collect()
 }
 
 async fn own_rows(test: &TestDb, node: NodeId) -> i64 {
-    sqlx::query_scalar("select count(*) from scope_access where node_id = $1")
+    sqlx::query_scalar("select count(*) from assignments where node_id = $1")
         .bind(node.0)
         .fetch_one(test.db.test_pool())
         .await
@@ -53,16 +57,21 @@ async fn role_inherits_from_site() {
     let t = tree(&test, ann.id).await;
     let result = test
         .db
-        .set_node_access(ann.id, t.site, vic.id, Some(Role::Viewer))
+        .set_node_access(
+            ann.id,
+            t.site,
+            Principal::User(vic.id),
+            Some(Role::Viewer.id()),
+        )
         .await;
-    assert_eq!(result, Ok((None, Some(Role::Viewer))));
+    assert_eq!(changed(result), Ok((None, Some(Role::Viewer))));
     for node in all(&t) {
         assert_eq!(role(&test, ann.id, node).await, Some(Role::Owner));
         assert_eq!(role(&test, vic.id, node).await, Some(Role::Viewer));
         assert_eq!(role(&test, sam.id, node).await, None);
     }
     assert_eq!(
-        test.db.role(vic.id, t.doc).await.unwrap(),
+        role_of(test.db.doc_access(vic.id, t.doc).await.unwrap()),
         Some(Role::Viewer)
     );
     assert_eq!(role(&test, ann.id, new_id()).await, None);
@@ -87,7 +96,7 @@ async fn break_copies_parent_assignments() {
     assert!(!access.inherits);
     assert_eq!(access.source.id, t.a);
     assert_eq!(access.source.kind, NodeKind::Folder);
-    assert_eq!(access.source.role, Some(Role::Owner));
+    assert_eq!(role_of(access.source.role), Some(Role::Owner));
     assert_eq!(
         shown(&test, ann.id, t.a).await,
         shown(&test, ann.id, t.site).await
@@ -125,9 +134,17 @@ async fn break_then_change_does_not_touch_parent() {
     test.db.break_inheritance(ann.id, t.a).await.unwrap();
     let result = test
         .db
-        .set_node_access(ann.id, t.a, vic.id, Some(Role::Editor))
+        .set_node_access(
+            ann.id,
+            t.a,
+            Principal::User(vic.id),
+            Some(Role::Editor.id()),
+        )
         .await;
-    assert_eq!(result, Ok((Some(Role::Viewer), Some(Role::Editor))));
+    assert_eq!(
+        changed(result),
+        Ok((Some(Role::Viewer), Some(Role::Editor)))
+    );
     assert_eq!(
         shown(&test, ann.id, t.site).await,
         vec![(ann.id, Role::Owner), (vic.id, Role::Viewer)]
@@ -148,17 +165,27 @@ async fn restore_returns_to_parent_roles() {
     grant(&test, t.site, vic.id, Role::Viewer).await;
     test.db.break_inheritance(ann.id, t.a).await.unwrap();
     test.db
-        .set_node_access(ann.id, t.a, vic.id, Some(Role::Editor))
+        .set_node_access(
+            ann.id,
+            t.a,
+            Principal::User(vic.id),
+            Some(Role::Editor.id()),
+        )
         .await
         .unwrap();
     test.db
-        .set_node_access(ann.id, t.a, wes.id, Some(Role::Viewer))
+        .set_node_access(
+            ann.id,
+            t.a,
+            Principal::User(wes.id),
+            Some(Role::Viewer.id()),
+        )
         .await
         .unwrap();
     assert_eq!(role(&test, wes.id, t.file).await, Some(Role::Viewer));
     // Someone who owns the folder but not the site cannot restore it.
     test.db
-        .set_node_access(ann.id, t.a, wes.id, Some(Role::Owner))
+        .set_node_access(ann.id, t.a, Principal::User(wes.id), Some(Role::Owner.id()))
         .await
         .unwrap();
     assert_eq!(
@@ -216,33 +243,54 @@ async fn last_owner_kept_per_scope() {
     let pat = user(&test, "Pat", false).await;
     let t = tree(&test, ann.id).await;
     assert_eq!(
-        test.db.set_node_access(ann.id, t.site, ann.id, None).await,
-        Err(AccessError::LastOwner)
+        test.db
+            .set_node_access(ann.id, t.site, Principal::User(ann.id), None)
+            .await,
+        Err(AccessError::LastManager)
     );
     test.db.break_inheritance(ann.id, t.a).await.unwrap();
     assert_eq!(
         test.db
-            .set_node_access(ann.id, t.a, ann.id, Some(Role::Editor))
+            .set_node_access(
+                ann.id,
+                t.a,
+                Principal::User(ann.id),
+                Some(Role::Editor.id())
+            )
             .await,
-        Err(AccessError::LastOwner)
+        Err(AccessError::LastManager)
     );
     // A second owner of the site is no owner of the folder's own scope.
     test.db
-        .set_node_access(ann.id, t.site, pat.id, Some(Role::Owner))
-        .await
-        .unwrap();
-    assert_eq!(
-        test.db.set_node_access(ann.id, t.a, ann.id, None).await,
-        Err(AccessError::LastOwner)
-    );
-    test.db
-        .set_node_access(ann.id, t.a, pat.id, Some(Role::Owner))
+        .set_node_access(
+            ann.id,
+            t.site,
+            Principal::User(pat.id),
+            Some(Role::Owner.id()),
+        )
         .await
         .unwrap();
     assert_eq!(
         test.db
-            .set_node_access(ann.id, t.a, ann.id, Some(Role::Editor))
+            .set_node_access(ann.id, t.a, Principal::User(ann.id), None)
             .await,
+        Err(AccessError::LastManager)
+    );
+    test.db
+        .set_node_access(ann.id, t.a, Principal::User(pat.id), Some(Role::Owner.id()))
+        .await
+        .unwrap();
+    assert_eq!(
+        changed(
+            test.db
+                .set_node_access(
+                    ann.id,
+                    t.a,
+                    Principal::User(ann.id),
+                    Some(Role::Editor.id())
+                )
+                .await
+        ),
         Ok((Some(Role::Owner), Some(Role::Editor)))
     );
     // The site keeps both owners.
@@ -252,8 +300,10 @@ async fn last_owner_kept_per_scope() {
     );
     // Removing the only owner of an inheriting node's copy is refused, and nothing is broken.
     assert_eq!(
-        test.db.set_node_access(pat.id, t.b, pat.id, None).await,
-        Err(AccessError::LastOwner)
+        test.db
+            .set_node_access(pat.id, t.b, Principal::User(pat.id), None)
+            .await,
+        Err(AccessError::LastManager)
     );
     assert!(!is_scope(&test, t.b).await);
 }
@@ -267,17 +317,32 @@ async fn set_access_on_inheriting_node_breaks_first() {
     grant(&test, t.site, vic.id, Role::Viewer).await;
     // The same role again is no change and breaks nothing.
     assert_eq!(
-        test.db
-            .set_node_access(ann.id, t.b, vic.id, Some(Role::Viewer))
-            .await,
+        changed(
+            test.db
+                .set_node_access(
+                    ann.id,
+                    t.b,
+                    Principal::User(vic.id),
+                    Some(Role::Viewer.id())
+                )
+                .await
+        ),
         Ok((Some(Role::Viewer), Some(Role::Viewer)))
     );
     assert!(!is_scope(&test, t.b).await);
     let result = test
         .db
-        .set_node_access(ann.id, t.b, vic.id, Some(Role::Editor))
+        .set_node_access(
+            ann.id,
+            t.b,
+            Principal::User(vic.id),
+            Some(Role::Editor.id()),
+        )
         .await;
-    assert_eq!(result, Ok((Some(Role::Viewer), Some(Role::Editor))));
+    assert_eq!(
+        changed(result),
+        Ok((Some(Role::Viewer), Some(Role::Editor)))
+    );
     assert!(is_scope(&test, t.b).await);
     assert_eq!(
         shown(&test, ann.id, t.b).await,
@@ -296,9 +361,14 @@ async fn set_access_on_inheriting_node_breaks_first() {
     // On a file, the alias by document id does the same.
     let result = test
         .db
-        .set_access(ann.id, t.doc, vic.id, Some(Role::Owner))
+        .set_access(
+            ann.id,
+            t.doc,
+            Principal::User(vic.id),
+            Some(Role::Owner.id()),
+        )
         .await;
-    assert_eq!(result, Ok((Some(Role::Editor), Some(Role::Owner))));
+    assert_eq!(changed(result), Ok((Some(Role::Editor), Some(Role::Owner))));
     assert!(is_scope(&test, t.file).await);
     let events = test.db.events_for(t.doc).await.unwrap();
     let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
@@ -316,11 +386,21 @@ async fn nested_breaks_nearest_wins() {
     let t = tree(&test, ann.id).await;
     grant(&test, t.site, vic.id, Role::Viewer).await;
     test.db
-        .set_node_access(ann.id, t.a, vic.id, Some(Role::Editor))
+        .set_node_access(
+            ann.id,
+            t.a,
+            Principal::User(vic.id),
+            Some(Role::Editor.id()),
+        )
         .await
         .unwrap();
     test.db
-        .set_node_access(ann.id, t.file, vic.id, Some(Role::Owner))
+        .set_node_access(
+            ann.id,
+            t.file,
+            Principal::User(vic.id),
+            Some(Role::Owner.id()),
+        )
         .await
         .unwrap();
     assert_eq!(role(&test, vic.id, t.library).await, Some(Role::Viewer));
@@ -328,7 +408,7 @@ async fn nested_breaks_nearest_wins() {
     assert_eq!(role(&test, vic.id, t.b).await, Some(Role::Editor));
     assert_eq!(role(&test, vic.id, t.file).await, Some(Role::Owner));
     test.db
-        .set_node_access(ann.id, t.b, vic.id, None)
+        .set_node_access(ann.id, t.b, Principal::User(vic.id), None)
         .await
         .unwrap();
     assert_eq!(role(&test, vic.id, t.b).await, None);
@@ -347,7 +427,10 @@ async fn administrator_owns_everything() {
     }
     let sites = test.db.sites_for(root.id).await.unwrap();
     assert_eq!(sites.len(), 1);
-    assert_eq!((sites[0].0.id, sites[0].1), (t.site, Some(Role::Owner)));
+    assert_eq!(
+        (sites[0].0.id, role_of(sites[0].1.clone())),
+        (t.site, Some(Role::Owner))
+    );
     let (children, next) = test
         .db
         .children(root.id, t.library, None, 100)
@@ -357,7 +440,7 @@ async fn administrator_owns_everything() {
     assert_eq!(next, None);
     assert_eq!(children.len(), 1);
     assert_eq!(
-        (children[0].node.id, children[0].role),
+        (children[0].node.id, role_of(children[0].role.clone())),
         (t.a, Some(Role::Owner))
     );
     // The administrator manages access without holding an assignment.
@@ -411,7 +494,12 @@ async fn deleted_ancestor_hides_everything_below() {
     let wes = user(&test, "Wes", false).await;
     let t = tree(&test, ann.id).await;
     test.db
-        .set_node_access(ann.id, t.file, wes.id, Some(Role::Editor))
+        .set_node_access(
+            ann.id,
+            t.file,
+            Principal::User(wes.id),
+            Some(Role::Editor.id()),
+        )
         .await
         .unwrap();
     assert!(test.db.path(wes.id, t.library).await.unwrap().is_some());
@@ -456,7 +544,7 @@ async fn removed_above_while_breaking_below() {
     test.db.break_inheritance(ann.id, t.a).await.unwrap();
     for round in 0..5 {
         test.db
-            .set_node_access(ann.id, t.a, xan.id, Some(Role::Owner))
+            .set_node_access(ann.id, t.a, Principal::User(xan.id), Some(Role::Owner.id()))
             .await
             .unwrap();
         assert_eq!(role(&test, xan.id, t.file).await, Some(Role::Owner));
@@ -464,8 +552,11 @@ async fn removed_above_while_breaking_below() {
         // break below A, which was allowed when it started. They then run strictly in turn.
         let held = gate(&test, t.a).await;
         let first = test.db.clone();
-        let removal =
-            tokio::spawn(async move { first.set_node_access(ann.id, t.a, xan.id, None).await });
+        let removal = tokio::spawn(async move {
+            first
+                .set_node_access(ann.id, t.a, Principal::User(xan.id), None)
+                .await
+        });
         wait_blocked(&test, held.pid, 1).await;
         let second = test.db.clone();
         let breaking = tokio::spawn(async move { second.break_inheritance(xan.id, t.file).await });
@@ -473,10 +564,14 @@ async fn removed_above_while_breaking_below() {
         held.open().await;
         let removed = removal.await.unwrap();
         let broken = breaking.await.unwrap();
-        assert_eq!(removed, Ok((Some(Role::Owner), None)), "round {round}");
+        assert_eq!(
+            changed(removed),
+            Ok((Some(Role::Owner), None)),
+            "round {round}"
+        );
         assert_eq!(broken, Err(AccessError::NotFound), "round {round}");
         let on_file: i64 = sqlx::query_scalar(
-            "select count(*) from scope_access where node_id = $1 and user_id = $2",
+            "select count(*) from assignments where node_id = $1 and principal_id = $2",
         )
         .bind(t.file.0)
         .bind(xan.id.0)
@@ -518,20 +613,28 @@ async fn limited_access_shows_only_the_path() {
     .await;
     let site2 = site(&test, "Elsewhere", Some(ann.id)).await;
     test.db
-        .set_node_access(ann.id, t.file, wes.id, Some(Role::Viewer))
+        .set_node_access(
+            ann.id,
+            t.file,
+            Principal::User(wes.id),
+            Some(Role::Viewer.id()),
+        )
         .await
         .unwrap();
 
     assert_eq!(
-        test.db.role(wes.id, t.doc).await.unwrap(),
+        role_of(test.db.doc_access(wes.id, t.doc).await.unwrap()),
         Some(Role::Viewer)
     );
     let sites = test.db.sites_for(wes.id).await.unwrap();
     assert_eq!(sites.len(), 1);
-    assert_eq!((sites[0].0.id, sites[0].1), (t.site, None));
+    assert_eq!((sites[0].0.id, sites[0].1.clone()), (t.site, None));
 
     let ids = |listed: &[records::Listed]| -> Vec<(NodeId, Option<Role>)> {
-        listed.iter().map(|l| (l.node.id, l.role)).collect()
+        listed
+            .iter()
+            .map(|l| (l.node.id, role_of(l.role.clone())))
+            .collect()
     };
     let (listed, next) = test
         .db
@@ -566,7 +669,7 @@ async fn limited_access_shows_only_the_path() {
     let path = test.db.path(wes.id, t.file).await.unwrap().unwrap();
     let crumbs: Vec<(NodeId, NodeKind, &str, Option<Role>)> = path
         .iter()
-        .map(|c| (c.id, c.kind, c.name.as_str(), c.role))
+        .map(|c| (c.id, c.kind, c.name.as_str(), role_of(c.role.clone())))
         .collect();
     assert_eq!(
         crumbs,
@@ -711,7 +814,7 @@ async fn break_cost_does_not_grow_with_descendants() {
     }
     for table in [
         "nodes",
-        "scope_access",
+        "assignments",
         "events",
         "documents",
         "document_access",
@@ -742,9 +845,9 @@ async fn break_cost_does_not_grow_with_descendants() {
     assert_eq!(
         written[0],
         vec![
+            ("assignments".to_string(), copied),
             ("events".to_string(), 1),
             ("nodes".to_string(), 1),
-            ("scope_access".to_string(), copied),
         ]
     );
     assert_eq!(written[1], written[0], "the same rows for 2,000 files");
@@ -795,7 +898,7 @@ async fn rename_file(
     db.apply_nodes(records::NodeChange {
         rows: std::slice::from_ref(&row),
         actor: Some(actor),
-        needs: &[(t_file, Role::Editor)],
+        needs: &[(t_file, Perms::EDIT)],
         ..records::NodeChange::default()
     })
     .await
@@ -809,7 +912,12 @@ async fn revoke_above_and_tree_change_take_turns() {
     let t = tree(&test, ann.id).await;
     // Xan's only role on the file comes from folder A, two levels above it.
     test.db
-        .set_node_access(ann.id, t.a, xan.id, Some(Role::Editor))
+        .set_node_access(
+            ann.id,
+            t.a,
+            Principal::User(xan.id),
+            Some(Role::Editor.id()),
+        )
         .await
         .unwrap();
     assert_eq!(role(&test, xan.id, t.file).await, Some(Role::Editor));
@@ -817,32 +925,49 @@ async fn revoke_above_and_tree_change_take_turns() {
     // The revoke queues first: the rename waits for it, then sees it and is refused.
     let held = gate(&test, t.a).await;
     let first = test.db.clone();
-    let removal =
-        tokio::spawn(async move { first.set_node_access(ann.id, t.a, xan.id, None).await });
+    let removal = tokio::spawn(async move {
+        first
+            .set_node_access(ann.id, t.a, Principal::User(xan.id), None)
+            .await
+    });
     wait_blocked(&test, held.pid, 1).await;
     let renaming = tokio::spawn(rename_file(test.db.clone(), xan.id, t.file, "Late"));
     wait_blocked(&test, held.pid, 2).await;
     held.open().await;
-    assert_eq!(removal.await.unwrap(), Ok((Some(Role::Editor), None)));
+    assert_eq!(
+        changed(removal.await.unwrap()),
+        Ok((Some(Role::Editor), None))
+    );
     assert_eq!(renaming.await.unwrap(), Err(AccessError::NotFound));
     assert_eq!(test.db.node(t.file).await.unwrap().unwrap().name, "Notes");
 
     // The rename queues first: it is judged before the revoke, which waits for it.
     test.db
-        .set_node_access(ann.id, t.a, xan.id, Some(Role::Editor))
+        .set_node_access(
+            ann.id,
+            t.a,
+            Principal::User(xan.id),
+            Some(Role::Editor.id()),
+        )
         .await
         .unwrap();
     let held = gate(&test, t.file).await;
     let renaming = tokio::spawn(rename_file(test.db.clone(), xan.id, t.file, "Early"));
     wait_blocked(&test, held.pid, 1).await;
     let second = test.db.clone();
-    let removal =
-        tokio::spawn(async move { second.set_node_access(ann.id, t.a, xan.id, None).await });
+    let removal = tokio::spawn(async move {
+        second
+            .set_node_access(ann.id, t.a, Principal::User(xan.id), None)
+            .await
+    });
     // The revoke waits behind the rename, which holds folder A while it waits for the file.
     wait_blocked(&test, held.pid, 2).await;
     held.open().await;
     assert_eq!(renaming.await.unwrap(), Ok(()));
-    assert_eq!(removal.await.unwrap(), Ok((Some(Role::Editor), None)));
+    assert_eq!(
+        changed(removal.await.unwrap()),
+        Ok((Some(Role::Editor), None))
+    );
     assert_eq!(test.db.node(t.file).await.unwrap().unwrap().name, "Early");
     assert_eq!(role(&test, xan.id, t.file).await, None);
 }

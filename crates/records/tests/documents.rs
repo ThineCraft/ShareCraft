@@ -8,9 +8,9 @@
 mod common;
 
 use collab_core::ids::{DocId, UserId};
-use common::{document_in, new_id, put, site, user};
+use common::{Role, changed, document_in, new_id, put, role_of, site, user};
 use records::test_support::TestDb;
-use records::{AccessError, Editor, NodeKind, Role};
+use records::{AccessError, Editor, NodeKind, Perms, Principal, RoleDef};
 use serde_json::json;
 use uuid::Uuid;
 
@@ -49,7 +49,7 @@ async fn created_document_takes_its_access_from_the_tree() {
     assert_eq!(created.revision, None);
     assert_eq!(test.db.document(id).await.unwrap(), Some(created.clone()));
     // Not yet in the tree: nobody has a role on it.
-    assert_eq!(test.db.role(ann.id, id).await.unwrap(), None);
+    assert_eq!(role_of(test.db.doc_access(ann.id, id).await.unwrap()), None);
     let site = site(&test, "Site", Some(ann.id)).await;
     let library = put(
         &test,
@@ -69,10 +69,16 @@ async fn created_document_takes_its_access_from_the_tree() {
         "Plan",
     )
     .await;
-    assert_eq!(test.db.role(ann.id, id).await.unwrap(), Some(Role::Owner));
+    assert_eq!(
+        role_of(test.db.doc_access(ann.id, id).await.unwrap()),
+        Some(Role::Owner)
+    );
     let grants = test.db.grants(ann.id, id).await.unwrap();
     assert_eq!(grants.len(), 1);
-    assert_eq!((grants[0].user.id, grants[0].role), (ann.id, Role::Owner));
+    assert_eq!(
+        (grants[0].user.id, Role::from_id(&grants[0].role.id)),
+        (ann.id, Role::Owner)
+    );
     let again = test
         .db
         .create_document(ann.id, id, "Other", Editor::Text)
@@ -87,12 +93,20 @@ async fn stranger_has_no_role() {
     let ann = user(&test, "Ann", false).await;
     let bob = user(&test, "Bob", false).await;
     let id = document(&test, ann.id).await;
-    assert_eq!(test.db.role(bob.id, id).await.unwrap(), None);
+    assert_eq!(role_of(test.db.doc_access(bob.id, id).await.unwrap()), None);
     assert_eq!(
-        test.db.role(UserId(Uuid::new_v4()), id).await.unwrap(),
+        role_of(
+            test.db
+                .doc_access(UserId(Uuid::new_v4()), id)
+                .await
+                .unwrap()
+        ),
         None
     );
-    assert_eq!(test.db.role(ann.id, doc_id()).await.unwrap(), None);
+    assert_eq!(
+        role_of(test.db.doc_access(ann.id, doc_id()).await.unwrap()),
+        None
+    );
 }
 
 #[tokio::test]
@@ -104,32 +118,60 @@ async fn grant_change_and_revoke_are_reflected_by_role() {
 
     let result = test
         .db
-        .set_access(ann.id, id, bob.id, Some(Role::Viewer))
+        .set_access(ann.id, id, Principal::User(bob.id), Some(Role::Viewer.id()))
         .await;
-    assert_eq!(result, Ok((None, Some(Role::Viewer))));
-    assert_eq!(test.db.role(bob.id, id).await.unwrap(), Some(Role::Viewer));
+    assert_eq!(changed(result), Ok((None, Some(Role::Viewer))));
+    assert_eq!(
+        role_of(test.db.doc_access(bob.id, id).await.unwrap()),
+        Some(Role::Viewer)
+    );
 
     let result = test
         .db
-        .set_access(ann.id, id, bob.id, Some(Role::Editor))
+        .set_access(ann.id, id, Principal::User(bob.id), Some(Role::Editor.id()))
         .await;
-    assert_eq!(result, Ok((Some(Role::Viewer), Some(Role::Editor))));
-    assert_eq!(test.db.role(bob.id, id).await.unwrap(), Some(Role::Editor));
+    assert_eq!(
+        changed(result),
+        Ok((Some(Role::Viewer), Some(Role::Editor)))
+    );
+    assert_eq!(
+        role_of(test.db.doc_access(bob.id, id).await.unwrap()),
+        Some(Role::Editor)
+    );
 
-    let result = test.db.set_access(ann.id, id, bob.id, None).await;
-    assert_eq!(result, Ok((Some(Role::Editor), None)));
-    assert_eq!(test.db.role(bob.id, id).await.unwrap(), None);
+    let result = test
+        .db
+        .set_access(ann.id, id, Principal::User(bob.id), None)
+        .await;
+    assert_eq!(changed(result), Ok((Some(Role::Editor), None)));
+    assert_eq!(role_of(test.db.doc_access(bob.id, id).await.unwrap()), None);
 
     let missing = test
         .db
-        .set_access(ann.id, id, UserId(Uuid::new_v4()), Some(Role::Viewer))
+        .set_access(
+            ann.id,
+            id,
+            Principal::User(UserId(Uuid::new_v4())),
+            Some(Role::Viewer.id()),
+        )
         .await;
     assert_eq!(missing, Err(AccessError::NoSuchUser));
 
-    assert!(!Role::Viewer.can_edit() && Role::Editor.can_edit() && Role::Owner.can_edit());
-    assert!(!Role::Editor.can_manage() && Role::Owner.can_manage());
-    assert!(Role::Viewer < Role::Editor && Role::Editor < Role::Owner);
-    assert_eq!(serde_json::to_value(Role::Editor).unwrap(), json!("editor"));
+    let perms = |id: &str| RoleDef::builtin(id).unwrap().perms;
+    assert!(
+        !perms("viewer").contains(Perms::EDIT)
+            && perms("editor").contains(Perms::EDIT)
+            && perms("owner").contains(Perms::EDIT)
+    );
+    assert!(
+        !perms("editor").contains(Perms::MANAGE_ACCESS)
+            && perms("owner").contains(Perms::MANAGE_ACCESS)
+    );
+    assert!(perms("owner").contains(perms("editor")) && perms("editor").contains(perms("viewer")));
+    assert_eq!(
+        serde_json::to_value(perms("editor")).unwrap(),
+        json!(["view", "add", "edit", "delete"])
+    );
 }
 
 #[tokio::test]
@@ -140,25 +182,35 @@ async fn admin_is_owner_everywhere() {
     let first = document(&test, ann.id).await;
     let second = document(&test, ann.id).await;
     assert_eq!(
-        test.db.role(root.id, first).await.unwrap(),
+        role_of(test.db.doc_access(root.id, first).await.unwrap()),
         Some(Role::Owner)
     );
     assert_eq!(
-        test.db.role(root.id, second).await.unwrap(),
+        role_of(test.db.doc_access(root.id, second).await.unwrap()),
         Some(Role::Owner)
     );
     // The administrator may manage access without holding a grant.
     let result = test
         .db
-        .set_access(root.id, first, ann.id, Some(Role::Editor))
+        .set_access(
+            root.id,
+            first,
+            Principal::User(ann.id),
+            Some(Role::Editor.id()),
+        )
         .await;
-    assert_eq!(result, Err(AccessError::LastOwner));
+    assert_eq!(result, Err(AccessError::LastManager));
     let bob = user(&test, "Bob", false).await;
     let result = test
         .db
-        .set_access(root.id, first, bob.id, Some(Role::Viewer))
+        .set_access(
+            root.id,
+            first,
+            Principal::User(bob.id),
+            Some(Role::Viewer.id()),
+        )
         .await;
-    assert_eq!(result, Ok((None, Some(Role::Viewer))));
+    assert_eq!(changed(result), Ok((None, Some(Role::Viewer))));
     assert_eq!(test.db.grants(root.id, first).await.unwrap().len(), 2);
 }
 
@@ -170,13 +222,16 @@ async fn disabled_account_has_no_role() {
     let admin2 = user(&test, "Zed", true).await;
     let id = document(&test, ann.id).await;
     test.db.set_disabled(root.id, ann.id, true).await.unwrap();
-    assert_eq!(test.db.role(ann.id, id).await.unwrap(), None);
+    assert_eq!(role_of(test.db.doc_access(ann.id, id).await.unwrap()), None);
     assert_eq!(test.db.grants(ann.id, id).await, Err(AccessError::NotFound));
     test.db
         .set_disabled(admin2.id, root.id, true)
         .await
         .unwrap();
-    assert_eq!(test.db.role(root.id, id).await.unwrap(), None);
+    assert_eq!(
+        role_of(test.db.doc_access(root.id, id).await.unwrap()),
+        None
+    );
     assert_eq!(
         test.db
             .create_document(ann.id, doc_id(), "X", Editor::Text)
@@ -187,7 +242,10 @@ async fn disabled_account_has_no_role() {
         .set_disabled(admin2.id, ann.id, false)
         .await
         .unwrap();
-    assert_eq!(test.db.role(ann.id, id).await.unwrap(), Some(Role::Owner));
+    assert_eq!(
+        role_of(test.db.doc_access(ann.id, id).await.unwrap()),
+        Some(Role::Owner)
+    );
 }
 
 #[tokio::test]
@@ -198,7 +256,7 @@ async fn editor_cannot_manage() {
     let cy = user(&test, "Cy", false).await;
     let id = document(&test, ann.id).await;
     test.db
-        .set_access(ann.id, id, bob.id, Some(Role::Editor))
+        .set_access(ann.id, id, Principal::User(bob.id), Some(Role::Editor.id()))
         .await
         .unwrap();
     assert_eq!(
@@ -207,10 +265,10 @@ async fn editor_cannot_manage() {
     );
     let result = test
         .db
-        .set_access(bob.id, id, cy.id, Some(Role::Viewer))
+        .set_access(bob.id, id, Principal::User(cy.id), Some(Role::Viewer.id()))
         .await;
     assert_eq!(result, Err(AccessError::Forbidden));
-    assert_eq!(test.db.role(cy.id, id).await.unwrap(), None);
+    assert_eq!(role_of(test.db.doc_access(cy.id, id).await.unwrap()), None);
 }
 
 #[tokio::test]
@@ -226,15 +284,20 @@ async fn stranger_cannot_tell_the_document_exists() {
     );
     let real = test
         .db
-        .set_access(bob.id, id, bob.id, Some(Role::Owner))
+        .set_access(bob.id, id, Principal::User(bob.id), Some(Role::Owner.id()))
         .await;
     let missing = test
         .db
-        .set_access(bob.id, doc_id(), bob.id, Some(Role::Owner))
+        .set_access(
+            bob.id,
+            doc_id(),
+            Principal::User(bob.id),
+            Some(Role::Owner.id()),
+        )
         .await;
     assert_eq!(real, Err(AccessError::NotFound));
     assert_eq!(missing, Err(AccessError::NotFound));
-    assert_eq!(test.db.role(bob.id, id).await.unwrap(), None);
+    assert_eq!(role_of(test.db.doc_access(bob.id, id).await.unwrap()), None);
 }
 
 #[tokio::test]
@@ -244,29 +307,36 @@ async fn last_owner_cannot_be_removed_or_demoted() {
     let bob = user(&test, "Bob", false).await;
     let id = document(&test, ann.id).await;
     assert_eq!(
-        test.db.set_access(ann.id, id, ann.id, None).await,
-        Err(AccessError::LastOwner)
+        test.db
+            .set_access(ann.id, id, Principal::User(ann.id), None)
+            .await,
+        Err(AccessError::LastManager)
     );
     assert_eq!(
         test.db
-            .set_access(ann.id, id, ann.id, Some(Role::Editor))
+            .set_access(ann.id, id, Principal::User(ann.id), Some(Role::Editor.id()))
             .await,
-        Err(AccessError::LastOwner)
+        Err(AccessError::LastManager)
     );
-    assert_eq!(test.db.role(ann.id, id).await.unwrap(), Some(Role::Owner));
+    assert_eq!(
+        role_of(test.db.doc_access(ann.id, id).await.unwrap()),
+        Some(Role::Owner)
+    );
     // With a second owner the first may step down.
     test.db
-        .set_access(ann.id, id, bob.id, Some(Role::Owner))
+        .set_access(ann.id, id, Principal::User(bob.id), Some(Role::Owner.id()))
         .await
         .unwrap();
     let result = test
         .db
-        .set_access(ann.id, id, ann.id, Some(Role::Editor))
+        .set_access(ann.id, id, Principal::User(ann.id), Some(Role::Editor.id()))
         .await;
-    assert_eq!(result, Ok((Some(Role::Owner), Some(Role::Editor))));
+    assert_eq!(changed(result), Ok((Some(Role::Owner), Some(Role::Editor))));
     assert_eq!(
-        test.db.set_access(bob.id, id, bob.id, None).await,
-        Err(AccessError::LastOwner)
+        test.db
+            .set_access(bob.id, id, Principal::User(bob.id), None)
+            .await,
+        Err(AccessError::LastManager)
     );
 }
 
@@ -277,7 +347,7 @@ async fn two_removals_racing_leave_one_owner() {
     let bob = user(&test, "Bob", false).await;
     let id = document(&test, ann.id).await;
     test.db
-        .set_access(ann.id, id, bob.id, Some(Role::Owner))
+        .set_access(ann.id, id, Principal::User(bob.id), Some(Role::Owner.id()))
         .await
         .unwrap();
     for round in 0..10 {
@@ -287,22 +357,30 @@ async fn two_removals_racing_leave_one_owner() {
         let held = common::gate(&test, id.into()).await;
         let first = test.db.clone();
         let second = test.db.clone();
-        let a = tokio::spawn(async move { first.set_access(ann.id, id, bob.id, None).await });
-        let b = tokio::spawn(async move { second.set_access(bob.id, id, ann.id, None).await });
+        let a = tokio::spawn(async move {
+            first
+                .set_access(ann.id, id, Principal::User(bob.id), None)
+                .await
+        });
+        let b = tokio::spawn(async move {
+            second
+                .set_access(bob.id, id, Principal::User(ann.id), None)
+                .await
+        });
         common::wait_blocked(&test, held.pid, 2).await;
         held.open().await;
         let results = [a.await.unwrap(), b.await.unwrap()];
         // The calls take turns. The loser was an owner when it started, but the winner has
         // removed it by the time it holds the lock, so it is refused as someone with no access
-        // (it must not get to make one more change). LastOwner would also be acceptable.
+        // (it must not get to make one more change). LastManager would also be acceptable.
         let allowed = results.iter().filter(|r| r.is_ok()).count();
         let refused = results
             .iter()
-            .filter(|r| matches!(r, Err(AccessError::NotFound | AccessError::LastOwner)))
+            .filter(|r| matches!(r, Err(AccessError::NotFound | AccessError::LastManager)))
             .count();
         assert_eq!((allowed, refused), (1, 1), "round {round}: {results:?}");
-        let ann_has = test.db.role(ann.id, id).await.unwrap().is_some();
-        let bob_has = test.db.role(bob.id, id).await.unwrap().is_some();
+        let ann_has = role_of(test.db.doc_access(ann.id, id).await.unwrap()).is_some();
+        let bob_has = role_of(test.db.doc_access(bob.id, id).await.unwrap()).is_some();
         assert!(
             ann_has != bob_has,
             "round {round}: exactly one owner remains"
@@ -313,7 +391,12 @@ async fn two_removals_racing_leave_one_owner() {
             (bob.id, ann.id)
         };
         test.db
-            .set_access(remaining, id, removed, Some(Role::Owner))
+            .set_access(
+                remaining,
+                id,
+                Principal::User(removed),
+                Some(Role::Owner.id()),
+            )
             .await
             .unwrap();
     }
@@ -326,23 +409,33 @@ async fn same_role_again_records_nothing() {
     let bob = user(&test, "Bob", false).await;
     let id = document(&test, ann.id).await;
     test.db
-        .set_access(ann.id, id, bob.id, Some(Role::Editor))
+        .set_access(ann.id, id, Principal::User(bob.id), Some(Role::Editor.id()))
         .await
         .unwrap();
     let before = test.db.events_for(id).await.unwrap().len();
     let result = test
         .db
-        .set_access(ann.id, id, bob.id, Some(Role::Editor))
+        .set_access(ann.id, id, Principal::User(bob.id), Some(Role::Editor.id()))
         .await;
-    assert_eq!(result, Ok((Some(Role::Editor), Some(Role::Editor))));
+    assert_eq!(
+        changed(result),
+        Ok((Some(Role::Editor), Some(Role::Editor)))
+    );
     let result = test
         .db
-        .set_access(ann.id, id, UserId(ann.id.0), Some(Role::Owner))
+        .set_access(
+            ann.id,
+            id,
+            Principal::User(UserId(ann.id.0)),
+            Some(Role::Owner.id()),
+        )
         .await;
-    assert_eq!(result, Ok((Some(Role::Owner), Some(Role::Owner))));
+    assert_eq!(changed(result), Ok((Some(Role::Owner), Some(Role::Owner))));
     let carl = user(&test, "Carl", false).await;
     assert_eq!(
-        test.db.set_access(ann.id, id, carl.id, None).await,
+        test.db
+            .set_access(ann.id, id, Principal::User(carl.id), None)
+            .await,
         Ok((None, None))
     );
     assert_eq!(test.db.events_for(id).await.unwrap().len(), before);
@@ -377,14 +470,17 @@ async fn access_changes_are_recorded() {
     let id = document(&test, ann.id).await;
     let site = test.db.node(id.into()).await.unwrap().unwrap().site;
     test.db
-        .set_access(ann.id, id, bob.id, Some(Role::Viewer))
+        .set_access(ann.id, id, Principal::User(bob.id), Some(Role::Viewer.id()))
         .await
         .unwrap();
     test.db
-        .set_access(ann.id, id, bob.id, Some(Role::Editor))
+        .set_access(ann.id, id, Principal::User(bob.id), Some(Role::Editor.id()))
         .await
         .unwrap();
-    test.db.set_access(ann.id, id, bob.id, None).await.unwrap();
+    test.db
+        .set_access(ann.id, id, Principal::User(bob.id), None)
+        .await
+        .unwrap();
     let events = test.db.events_for(id).await.unwrap();
     let summary: Vec<_> = events
         .iter()

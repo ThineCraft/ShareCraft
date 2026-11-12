@@ -23,7 +23,7 @@ pub struct Unplaced {
 pub struct Adoption {
     /// Documents that became scopes because they had grants of their own.
     pub scopes: u64,
-    /// Grants moved from `document_access` to `scope_access`.
+    /// Grants moved from `document_access` to `assignments`.
     pub grants: u64,
     /// Owner assignments given to administrators on sites that had no owner.
     pub owners: u64,
@@ -39,8 +39,8 @@ impl Db {
                  or exists (select 1 from document_access) \
                  or exists (select 1 from nodes s \
                             where s.parent_id is null and s.deleted_at is null \
-                              and not exists (select 1 from scope_access o \
-                                              where o.node_id = s.id and o.role = 'owner'))",
+                              and not exists (select 1 from assignments o \
+                                              where o.node_id = s.id and o.role_id = 'owner'))",
         )
         .fetch_one(self.pool())
         .await?;
@@ -71,7 +71,7 @@ impl Db {
     /// first; their names are copied into `documents.name`); makes every enabled
     /// administrator owner of `site`, if given, and of every undeleted site with no owner
     /// assignment; makes every placed document with grants in `document_access` a scope,
-    /// copies those grants to `scope_access` (keeping any already there) and deletes them; and
+    /// copies those grants to `assignments` (keeping any already there) and deletes them; and
     /// records one `tree.adopted` event with the counts.
     pub async fn finish_adoption(
         &self,
@@ -85,13 +85,13 @@ impl Db {
             upsert_node(&mut tx, row).await?;
         }
         let owners = sqlx::query(
-            "insert into scope_access (node_id, user_id, role) \
-             select s.id, u.id, 'owner' from nodes s cross join users u \
+            "insert into assignments (node_id, principal_kind, principal_id, role_id) \
+             select s.id, 'user', u.id, 'owner' from nodes s cross join users u \
              where s.parent_id is null and s.deleted_at is null \
                and u.is_admin and u.disabled_at is null \
-               and (s.id = $1 or not exists (select 1 from scope_access o \
-                                             where o.node_id = s.id and o.role = 'owner')) \
-             on conflict (node_id, user_id) do update set role = 'owner'",
+               and (s.id = $1 or not exists (select 1 from assignments o \
+                                             where o.node_id = s.id and o.role_id = 'owner')) \
+             on conflict (node_id, principal_kind, principal_id) do update set role_id = 'owner'",
         )
         .bind(site.map(|s| s.0))
         .execute(&mut *tx)
@@ -106,10 +106,11 @@ impl Db {
         .await?
         .rows_affected();
         let grants = sqlx::query(
-            "insert into scope_access (node_id, user_id, role, granted_by, granted_at) \
-             select da.document_id, da.user_id, da.role, da.granted_by, da.granted_at \
+            "insert into assignments \
+                 (node_id, principal_kind, principal_id, role_id, granted_by, granted_at) \
+             select da.document_id, 'user', da.user_id, da.role, da.granted_by, da.granted_at \
              from document_access da join nodes n on n.id = da.document_id \
-             on conflict (node_id, user_id) do nothing",
+             on conflict (node_id, principal_kind, principal_id) do nothing",
         )
         .execute(&mut *tx)
         .await?

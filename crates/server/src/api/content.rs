@@ -25,7 +25,7 @@ use serde::Deserialize;
 use serde_json::{Map, json};
 use uuid::Uuid;
 
-use super::{ApiError, parse_id, to_completion};
+use super::{ApiError, LegacyRole, parse_id, to_completion};
 use crate::checkpoint::Checkpointer;
 use crate::file_room::SaveReply;
 use crate::projection::record_first;
@@ -97,7 +97,7 @@ pub(crate) async fn download(
 ) -> Result<Response, ApiError> {
     let doc = DocId(parse_id(&id)?);
     let db = state.db();
-    db.role(signed.session.user.id, doc)
+    db.doc_access(signed.session.user.id, doc)
         .await
         .map_err(|e| ApiError::unavailable(&e))?
         .ok_or(ApiError::NotFound)?;
@@ -160,12 +160,12 @@ pub(crate) async fn save(
     let doc = DocId(parse_id(&id)?);
     let user = signed.session.user.id;
     let db = state.db();
-    let role = db
-        .role(user, doc)
+    let access = db
+        .doc_access(user, doc)
         .await
         .map_err(|e| ApiError::unavailable(&e))?
         .ok_or(ApiError::NotFound)?;
-    if !role.can_edit() {
+    if !access.can_edit() {
         return Err(ApiError::Forbidden);
     }
     let document = db
@@ -256,9 +256,11 @@ pub(crate) async fn upload(
         };
         let role = state
             .db()
-            .role(user.id, id)
+            .doc_access(user.id, id)
             .await
-            .map_err(|e| ApiError::unavailable(&e))?;
+            .map_err(|e| ApiError::unavailable(&e))?
+            .as_ref()
+            .map(LegacyRole::of);
         let author = Author {
             id: user.id.0.to_string(),
             name: credited_name(&user.name),

@@ -17,7 +17,7 @@ use common::{
 };
 use futures_util::{SinkExt, StreamExt};
 use protocol::{ClientMsg, ServerMsg};
-use records::{Editor, Role};
+use records::{Editor, Principal};
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
@@ -132,7 +132,7 @@ async fn viewer_receives_changes_but_cannot_edit() {
     server
         .db
         .db
-        .set_access(ann.user.id, doc, vic.id, Some(Role::Viewer))
+        .set_access(ann.user.id, doc, Principal::User(vic.id), Some("viewer"))
         .await
         .unwrap();
     let mut v = TestClient::connect_as(&server, doc, &vic).await;
@@ -190,7 +190,7 @@ async fn checkpoint_credits_accounts_and_uses_the_document_name() {
     server
         .create_document(doc, "Plan.txt", Editor::Text, &ann)
         .await;
-    db.set_access(ann.id, doc, bob.id, Some(Role::Editor))
+    db.set_access(ann.id, doc, Principal::User(bob.id), Some("editor"))
         .await
         .unwrap();
     let mut a = TestClient::connect_as(&server, doc, &ann).await;
@@ -332,7 +332,7 @@ async fn join_with_another_persons_client_id_is_refused() {
     server
         .db
         .db
-        .set_access(ann.user.id, doc, bob.id, Some(Role::Viewer))
+        .set_access(ann.user.id, doc, Principal::User(bob.id), Some("viewer"))
         .await
         .unwrap();
 

@@ -1,4 +1,4 @@
-//! Documents and roles. Access to a document is access to its node of the content tree.
+//! Documents. Access to a document is access to its node of the content tree.
 
 use collab_core::ids::{DocId, UserId};
 use serde::{Deserialize, Serialize};
@@ -9,49 +9,9 @@ use uuid::Uuid;
 
 use crate::accounts::User;
 use crate::tree::validate_node_name;
-use crate::{Db, DbError};
+use crate::{Access, Db, DbError, Perms, Principal, RoleRef};
 
 pub(crate) const UNIQUE_VIOLATION: &str = "23505";
-
-/// What a person may do with a document. Ordered from least to most.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Role {
-    Viewer,
-    Editor,
-    Owner,
-}
-
-impl Role {
-    /// Editors and owners may change the text.
-    #[must_use]
-    pub fn can_edit(self) -> bool {
-        self >= Role::Editor
-    }
-
-    /// Only owners may manage who has access.
-    #[must_use]
-    pub fn can_manage(self) -> bool {
-        self == Role::Owner
-    }
-
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Role::Viewer => "viewer",
-            Role::Editor => "editor",
-            Role::Owner => "owner",
-        }
-    }
-
-    fn parse(text: &str) -> Option<Role> {
-        match text {
-            "viewer" => Some(Role::Viewer),
-            "editor" => Some(Role::Editor),
-            "owner" => Some(Role::Owner),
-            _ => None,
-        }
-    }
-}
 
 /// The editor that opens a document. `Text` is the built-in plain-text editor; every other
 /// editor works on a file whose bytes ShareCraft never interprets.
@@ -143,11 +103,12 @@ pub struct Document {
     pub revised_at: Option<OffsetDateTime>,
 }
 
-/// One person's explicit access to a document.
+/// One person's assignment on a scope: the role it gives them and that role's permissions.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Grant {
     pub user: User,
-    pub role: Role,
+    pub role: RoleRef,
+    pub perms: Perms,
 }
 
 /// Why a document or access change failed.
@@ -158,10 +119,22 @@ pub enum AccessError {
     NotFound,
     #[error("no such account")]
     NoSuchUser,
+    #[error("no such group")]
+    NoSuchGroup,
+    #[error("no such role")]
+    NoSuchRole,
     #[error("you may not do that")]
     Forbidden,
-    #[error("a document must keep at least one owner")]
-    LastOwner,
+    /// Every scope keeps at least one assignment whose role includes `manage_access`.
+    #[error("this would leave nobody who can manage access here")]
+    LastManager,
+    /// Nobody gives anyone more permissions than they hold there themselves.
+    #[error("that role has permissions you do not have here")]
+    BeyondYourAccess,
+    #[error("that role is still assigned")]
+    RoleInUse,
+    #[error("a built-in role cannot be changed or deleted")]
+    BuiltinRole,
     #[error("that is not a valid document name")]
     InvalidName,
     #[error("the name of this kind of document must end with its file extension")]
@@ -217,10 +190,6 @@ fn check_extension(name: &str, editor: Editor) -> Result<(), AccessError> {
 pub(crate) fn parse_editor(text: &str) -> Result<Editor, sqlx::Error> {
     Editor::from_id(text)
         .ok_or_else(|| sqlx::Error::Decode(format!("unknown editor {text:?}").into()))
-}
-
-pub(crate) fn parse_role(text: &str) -> Result<Role, sqlx::Error> {
-    Role::parse(text).ok_or_else(|| sqlx::Error::Decode(format!("unknown role {text:?}").into()))
 }
 
 pub(crate) fn document_from_row(row: &PgRow) -> Result<Document, sqlx::Error> {
@@ -295,7 +264,7 @@ impl Db {
         Ok(document)
     }
 
-    /// The document with this id, whoever may see it. Callers check `role` first.
+    /// The document with this id, whoever may see it. Callers check `doc_access` first.
     pub async fn document(&self, id: DocId) -> Result<Option<Document>, DbError> {
         let row = sqlx::query(
             "select id, name, editor, created_by, revision, revised_at from documents where id = $1",
@@ -306,14 +275,14 @@ impl Db {
         Ok(row.as_ref().map(document_from_row).transpose()?)
     }
 
-    /// What `user` may do with `doc`: [`Db::effective_role`] on the document's node. `None`
+    /// What `user` may do with `doc`: [`Db::effective_access`] on the document's node. `None`
     /// for a document not yet placed in the tree.
-    pub async fn role(&self, user: UserId, doc: DocId) -> Result<Option<Role>, DbError> {
-        self.effective_role(user, doc.into()).await
+    pub async fn doc_access(&self, user: UserId, doc: DocId) -> Result<Option<Access>, DbError> {
+        self.effective_access(user, doc.into()).await
     }
 
     /// Who has been granted access to `doc`: the assignments on the scope that decides it.
-    /// `actor` must be an owner of it.
+    /// `actor` must manage access to it.
     pub async fn grants(&self, actor: UserId, doc: DocId) -> Result<Vec<Grant>, AccessError> {
         Ok(self.access(actor, doc.into()).await?.grants)
     }
@@ -323,9 +292,10 @@ impl Db {
         &self,
         actor: UserId,
         doc: DocId,
-        user: UserId,
-        role: Option<Role>,
-    ) -> Result<(Option<Role>, Option<Role>), AccessError> {
-        self.set_node_access(actor, doc.into(), user, role).await
+        principal: Principal,
+        role: Option<&str>,
+    ) -> Result<(Option<RoleRef>, Option<RoleRef>), AccessError> {
+        self.set_node_access(actor, doc.into(), principal, role)
+            .await
     }
 }

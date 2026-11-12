@@ -15,7 +15,9 @@ use std::time::Duration;
 
 use collab_core::ids::{DocId, NodeId, UserId};
 use records::test_support::TestDb;
-use records::{AccessError, Db, Document, Editor, NewUser, Node, NodeKind, Role, User};
+use records::{
+    Access, AccessError, Db, Document, Editor, NewUser, Node, NodeKind, Principal, User,
+};
 use revisions::{
     Author, Checkpoint, CheckpointError, GitError, Outcome, RevisionId, RevisionInfo,
     RevisionStore, Stored, TreeChange, TreeRecord,
@@ -26,6 +28,37 @@ use server::{AppState, Checkpointer, Config};
 use sqlx::Connection;
 use tempfile::TempDir;
 use uuid::Uuid;
+
+/// The built-in roles, by which these tests name access.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Role {
+    Viewer,
+    Editor,
+    Owner,
+}
+
+impl Role {
+    fn id(self) -> &'static str {
+        match self {
+            Role::Viewer => "viewer",
+            Role::Editor => "editor",
+            Role::Owner => "owner",
+        }
+    }
+
+    /// The one built-in role giving `access`, if any; panics for any other access.
+    fn of(access: Option<Access>) -> Option<Role> {
+        let access = access?;
+        let [only] = access.roles.as_slice() else {
+            panic!("expected one role, got {access:?}");
+        };
+        let role = [Role::Viewer, Role::Editor, Role::Owner]
+            .into_iter()
+            .find(|r| r.id() == only.id)
+            .unwrap_or_else(|| panic!("{only:?} is not a built-in role"));
+        Some(role)
+    }
+}
 
 /// A server state on a temporary library and a test schema, with nothing served.
 struct Env {
@@ -160,7 +193,7 @@ impl Env {
 
     async fn grant(&self, admin: &User, node: NodeId, user: &User, role: Role) {
         self.db()
-            .set_node_access(admin.id, node, user.id, Some(role))
+            .set_node_access(admin.id, node, Principal::User(user.id), Some(role.id()))
             .await
             .unwrap();
     }
@@ -313,7 +346,7 @@ async fn create_site_makes_documents_library_and_owner() {
     let access = env.db().access(admin.id, site).await.unwrap();
     assert_eq!(access.grants.len(), 1);
     assert_eq!(access.grants[0].user.id, admin.id);
-    assert_eq!(access.grants[0].role, Role::Owner);
+    assert_eq!(access.grants[0].role.id, Role::Owner.id());
 
     // One commit holds both records.
     assert_eq!(env.commits(), 1);
@@ -407,10 +440,12 @@ async fn folder_needs_editor() {
     let file = env.file(&ann, folder, "Plan.xlsx").await.unwrap();
     // The file inherits: no grant of its own, the folder's role.
     assert_eq!(
-        env.db()
-            .effective_role(ann.id, file.id.into())
-            .await
-            .unwrap(),
+        Role::of(
+            env.db()
+                .effective_access(ann.id, file.id.into())
+                .await
+                .unwrap()
+        ),
         Some(Role::Editor)
     );
     let node = env.db().node(file.id.into()).await.unwrap().unwrap();
@@ -709,7 +744,7 @@ async fn crossing_moves_make_no_cycle() {
         // Both folders still lead up to the site.
         for folder in [a, b] {
             assert_eq!(
-                env.db().effective_role(admin.id, folder).await.unwrap(),
+                Role::of(env.db().effective_access(admin.id, folder).await.unwrap()),
                 Some(Role::Owner)
             );
         }
@@ -834,8 +869,11 @@ async fn deleted_file_is_not_found() {
     let node: NodeId = file.id.into();
     env.apply(&ann, TreeOp::Delete { id: node }).await.unwrap();
 
-    assert_eq!(env.db().effective_role(ann.id, node).await.unwrap(), None);
-    assert_eq!(env.db().effective_role(admin.id, node).await.unwrap(), None);
+    assert_eq!(env.db().effective_access(ann.id, node).await.unwrap(), None);
+    assert_eq!(
+        env.db().effective_access(admin.id, node).await.unwrap(),
+        None
+    );
     assert!(
         env.store
             .read_tree_record(file.id.0)
@@ -892,10 +930,12 @@ async fn reconcile_restores_missing_rows() {
         .collect();
     assert_eq!(repaired, vec![folder.0, file.id.0], "parents first");
     assert_eq!(
-        env.db()
-            .effective_role(admin.id, file.id.into())
-            .await
-            .unwrap(),
+        Role::of(
+            env.db()
+                .effective_access(admin.id, file.id.into())
+                .await
+                .unwrap()
+        ),
         Some(Role::Owner)
     );
 }
@@ -970,7 +1010,8 @@ async fn adopt_moves_documents_and_grants() {
     }
 
     let db = env.db();
-    let role = |user: UserId, doc: DocId| async move { db.role(user, doc).await.unwrap() };
+    let role =
+        |user: UserId, doc: DocId| async move { Role::of(db.doc_access(user, doc).await.unwrap()) };
     assert_eq!(role(ann.id, shared).await, Some(Role::Owner));
     assert_eq!(role(bob.id, shared).await, Some(Role::Viewer));
     assert_eq!(role(ann.id, lonely).await, None);
@@ -993,7 +1034,7 @@ async fn adopt_moves_documents_and_grants() {
         .unwrap()
         .grants
         .into_iter()
-        .filter(|g| g.role == Role::Owner)
+        .filter(|g| g.role.id == Role::Owner.id())
         .map(|g| g.user.id)
         .collect();
     assert_eq!(owners.len(), 2);
@@ -1102,13 +1143,16 @@ async fn adopt_after_crash_between_git_and_database() {
     assert_eq!(env.commits(), 1);
     assert_eq!(env.old_grants().await, 0);
     assert_eq!(
-        env.db().role(bob.id, first).await.unwrap(),
+        Role::of(env.db().doc_access(bob.id, first).await.unwrap()),
         Some(Role::Editor)
     );
-    assert_eq!(env.db().role(bob.id, second).await.unwrap(), None);
+    assert_eq!(env.db().doc_access(bob.id, second).await.unwrap(), None);
     let owners = env.db().access(admin.id, site).await.unwrap().grants;
     assert_eq!(owners.len(), 1);
-    assert_eq!((owners[0].user.id, owners[0].role), (admin.id, Role::Owner));
+    assert_eq!(
+        (owners[0].user.id, owners[0].role.id.as_str()),
+        (admin.id, Role::Owner.id())
+    );
     assert_eq!(env.adopt().await.unwrap(), None);
     env.assert_agree().await;
 
@@ -1385,12 +1429,15 @@ async fn refused_after_commit_is_taken_back_in_git() {
     assert_eq!(blocked, 1, "the rename never waited to be judged");
     assert_eq!(env.commits(), commits + 1);
     // Meanwhile Xan becomes a viewer.
-    sqlx::query("update scope_access set role = 'viewer' where node_id = $1 and user_id = $2")
-        .bind(folder.0)
-        .bind(xan.id.0)
-        .execute(&mut gate)
-        .await
-        .unwrap();
+    sqlx::query(
+        "update assignments set role_id = 'viewer' \
+         where node_id = $1 and principal_kind = 'user' and principal_id = $2",
+    )
+    .bind(folder.0)
+    .bind(xan.id.0)
+    .execute(&mut gate)
+    .await
+    .unwrap();
     sqlx::query("commit").execute(&mut gate).await.unwrap();
 
     assert_eq!(renaming.await.unwrap(), Err(AccessError::Forbidden));

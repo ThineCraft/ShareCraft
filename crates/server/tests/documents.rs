@@ -348,7 +348,10 @@ async fn last_owner_cannot_be_removed() {
 
     let remove_ann = format!("/api/docs/{id}/access/{}", ann.id.0);
     let (status, body) = call(&server, Some(&ann), Method::DELETE, &remove_ann, None).await;
-    assert_eq!((status, body), (StatusCode::CONFLICT, error("last_owner")));
+    assert_eq!(
+        (status, body),
+        (StatusCode::CONFLICT, error("last_manager"))
+    );
     // Nor can she demote herself.
     let (status, body) = call(
         &server,
@@ -358,7 +361,10 @@ async fn last_owner_cannot_be_removed() {
         Some(json!({ "email": ann.email, "role": "editor" })),
     )
     .await;
-    assert_eq!((status, body), (StatusCode::CONFLICT, error("last_owner")));
+    assert_eq!(
+        (status, body),
+        (StatusCode::CONFLICT, error("last_manager"))
+    );
 
     // With a second owner she can leave.
     share(&server, &ann, &id, &bob.email, "owner").await;

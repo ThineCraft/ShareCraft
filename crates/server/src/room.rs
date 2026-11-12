@@ -19,7 +19,7 @@ use collab_core::ids::{ClientId, DocId, OpId, Seq, SessionId, UserId};
 use collab_core::server_log::ServerLog;
 use collab_text::{TextDoc, TextOp};
 use protocol::{Participant, RemovedReason, Resume, RoomEpoch, SaveState, ServerMsg};
-use records::{Db, NewEvent, Role};
+use records::{Access, Db, NewEvent};
 use revisions::{Author, CheckpointError, Outcome, RevisionId};
 use serde_json::{Map, Value};
 use tokio::sync::{mpsc, oneshot};
@@ -85,7 +85,7 @@ pub(crate) enum JoinReply {
 #[derive(Debug)]
 pub(crate) enum Command {
     /// Enter the room, replacing any connection with the same client id. The connection has
-    /// looked up who is joining and their role on the document.
+    /// looked up who is joining and their access to the document.
     Join {
         conn: ConnId,
         client: ClientId,
@@ -93,7 +93,7 @@ pub(crate) enum Command {
         session: SessionId,
         /// The account's name.
         name: String,
-        role: Role,
+        role: Access,
         resume: Option<Resume>,
         tx: mpsc::Sender<Outbound>,
         /// Answered once the join is handled; dropped if the room ended first, in which case
@@ -122,10 +122,10 @@ pub(crate) enum Command {
 /// take the same changes.
 #[derive(Debug)]
 pub(crate) enum AccessChange {
-    /// `user`'s role on the document is now `role`. `None` removes every connection of theirs
-    /// with `Removed { access_revoked }`; a role sends `Access` to each of their connections
-    /// whose role changes.
-    SetAccess { user: UserId, role: Option<Role> },
+    /// `user`'s access to the document is now `role`. `None` removes every connection of
+    /// theirs with `Removed { access_revoked }`; access sends `Access` to each of their
+    /// connections whose access changes.
+    SetAccess { user: UserId, role: Option<Access> },
     /// The sign-in `session` ended: its connections are removed with `Removed { signed_out }`.
     EndSession { session: SessionId },
     /// `user`'s account was disabled: their connections are removed with
@@ -322,6 +322,7 @@ impl Room {
                 tx,
                 accepted,
             } => {
+                let can_edit = role.can_edit();
                 let member = Member {
                     conn,
                     client,
@@ -334,7 +335,7 @@ impl Room {
                 };
                 let reply = match self.members.admit(member) {
                     Admission::Joined { .. } => {
-                        self.join(client, role.can_edit(), resume);
+                        self.join(client, can_edit, resume);
                         JoinReply::Accepted
                     }
                     Admission::Refused => JoinReply::Refused,
@@ -528,7 +529,7 @@ impl Room {
 impl AccessRules for Room {
     /// Each connection whose role changes is told with `Access`; everyone gets a new people
     /// list if any role changed.
-    fn change_role(&mut self, user: UserId, role: Role) {
+    fn change_role(&mut self, user: UserId, role: Access) {
         let change = self.members.change_role(user, role);
         if change.departed.any() {
             self.members_left();
@@ -1067,6 +1068,7 @@ pub(crate) async fn sleep_until(due: Option<Instant>) {
 )]
 mod tests {
     use super::*;
+    use crate::members::builtin_access;
     use std::time::Duration;
     use uuid::Uuid;
 
@@ -1132,7 +1134,7 @@ mod tests {
     }
 
     fn join(room: &mut Room, conn: ConnId, client: ClientId) -> mpsc::Receiver<Outbound> {
-        join_as(room, conn, client, Role::Editor)
+        join_as(room, conn, client, builtin_access("editor"))
     }
 
     /// Joins `client` as an account of its own (the same one for every join with `client`).
@@ -1140,7 +1142,7 @@ mod tests {
         room: &mut Room,
         conn: ConnId,
         client: ClientId,
-        role: Role,
+        role: Access,
     ) -> mpsc::Receiver<Outbound> {
         join_user(room, conn, client, UserId(client.0), role).0
     }
@@ -1151,7 +1153,7 @@ mod tests {
         conn: ConnId,
         client: ClientId,
         user: UserId,
-        role: Role,
+        role: Access,
     ) -> (mpsc::Receiver<Outbound>, JoinReply) {
         let (tx, rx) = mpsc::channel(OUTBOUND_CAPACITY);
         let (accepted, mut reply) = oneshot::channel();
@@ -1257,7 +1259,7 @@ mod tests {
             user: UserId(Uuid::from_u128(6)),
             session: SessionId(Uuid::from_u128(7)),
             name: "B".into(),
-            role: Role::Editor,
+            role: builtin_access("editor"),
             resume: Some(Resume {
                 epoch: RoomEpoch(Uuid::from_u128(99)),
                 seq: Seq(1),
@@ -1358,7 +1360,7 @@ mod tests {
     fn viewer_submit_is_refused_as_read_only() {
         let mut room = new_room();
         let viewer = ClientId(Uuid::from_u128(1));
-        let mut rx = join_as(&mut room, 1, viewer, Role::Viewer);
+        let mut rx = join_as(&mut room, 1, viewer, builtin_access("viewer"));
         let joined = frames(&mut rx);
         assert!(
             matches!(
@@ -1438,7 +1440,11 @@ mod tests {
         let mut rx = join(&mut room, 1, a);
         frames(&mut rx);
         let absent = UserId(Uuid::from_u128(99));
-        for role in [None, Some(Role::Viewer), Some(Role::Owner)] {
+        for role in [
+            None,
+            Some(builtin_access("viewer")),
+            Some(builtin_access("owner")),
+        ] {
             room.apply_access(AccessChange::SetAccess { user: absent, role });
         }
         room.apply_access(AccessChange::EndSession {
@@ -1446,7 +1452,7 @@ mod tests {
         });
         room.apply_access(AccessChange::RemoveUser { user: absent });
         assert_eq!(room.members.len(), 1);
-        assert_eq!(room.members[0].role, Role::Editor);
+        assert_eq!(room.members[0].role, builtin_access("editor"));
         assert!(frames(&mut rx).is_empty());
     }
 
@@ -1563,7 +1569,7 @@ mod tests {
                 user: bob,
                 session: SessionId(Uuid::from_u128(3)),
                 name: "Bob".into(),
-                role: Role::Editor,
+                role: builtin_access("editor"),
                 resume: None,
                 tx,
                 accepted,
@@ -1699,7 +1705,7 @@ mod tests {
                 user: UserId(Uuid::from_u128(2)),
                 session: SessionId(Uuid::from_u128(3)),
                 name: "Bob".into(),
-                role: Role::Editor,
+                role: builtin_access("editor"),
                 resume: None,
                 tx,
                 accepted,
@@ -1839,7 +1845,7 @@ mod tests {
                 user: bob,
                 session: SessionId(Uuid::from_u128(3)),
                 name: "Bob".into(),
-                role: Role::Editor,
+                role: builtin_access("editor"),
                 resume: None,
                 tx,
                 accepted,
@@ -1899,7 +1905,7 @@ mod tests {
         // Editor to owner: they may still edit, and are told, so the page can offer sharing.
         room.apply_access(AccessChange::SetAccess {
             user,
-            role: Some(Role::Owner),
+            role: Some(builtin_access("owner")),
         });
         let got = frames(&mut rx);
         assert!(
@@ -1916,7 +1922,7 @@ mod tests {
         // Owner to editor: told again, so the page can take sharing away.
         room.apply_access(AccessChange::SetAccess {
             user,
-            role: Some(Role::Editor),
+            role: Some(builtin_access("editor")),
         });
         let got = frames(&mut rx);
         assert!(
@@ -1932,7 +1938,7 @@ mod tests {
 
         room.apply_access(AccessChange::SetAccess {
             user,
-            role: Some(Role::Viewer),
+            role: Some(builtin_access("viewer")),
         });
         let got = frames(&mut rx);
         assert!(
@@ -1944,7 +1950,7 @@ mod tests {
         // The same role again changes nothing.
         room.apply_access(AccessChange::SetAccess {
             user,
-            role: Some(Role::Viewer),
+            role: Some(builtin_access("viewer")),
         });
         assert!(frames(&mut rx).is_empty());
     }
@@ -1955,12 +1961,12 @@ mod tests {
         let ann = UserId(Uuid::from_u128(10));
         let bob = UserId(Uuid::from_u128(11));
         let client = ClientId(Uuid::from_u128(1));
-        let (mut ann_rx, reply) = join_user(&mut room, 1, client, ann, Role::Editor);
+        let (mut ann_rx, reply) = join_user(&mut room, 1, client, ann, builtin_access("editor"));
         assert_eq!(reply, JoinReply::Accepted);
         frames(&mut ann_rx);
 
         // While Ann is here, Bob cannot take her place.
-        let (mut bob_rx, reply) = join_user(&mut room, 2, client, bob, Role::Owner);
+        let (mut bob_rx, reply) = join_user(&mut room, 2, client, bob, builtin_access("owner"));
         assert_eq!(reply, JoinReply::Refused);
         assert!(frames(&mut bob_rx).is_empty());
         assert_eq!(room.members.len(), 1);
@@ -1973,13 +1979,13 @@ mod tests {
         // Nor after she has left.
         room.handle(Command::Leave { conn: 1, client });
         assert!(room.members.is_empty());
-        let (mut bob_rx, reply) = join_user(&mut room, 3, client, bob, Role::Owner);
+        let (mut bob_rx, reply) = join_user(&mut room, 3, client, bob, builtin_access("owner"));
         assert_eq!(reply, JoinReply::Refused);
         assert!(frames(&mut bob_rx).is_empty());
         assert!(room.members.is_empty());
 
         // Ann herself comes back with it.
-        let (mut ann_rx, reply) = join_user(&mut room, 4, client, ann, Role::Editor);
+        let (mut ann_rx, reply) = join_user(&mut room, 4, client, ann, builtin_access("editor"));
         assert_eq!(reply, JoinReply::Accepted);
         assert!(matches!(
             frames(&mut ann_rx).first(),

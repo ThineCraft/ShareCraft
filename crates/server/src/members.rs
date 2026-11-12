@@ -14,11 +14,23 @@ use std::ops::{Deref, DerefMut};
 use axum::extract::ws::Utf8Bytes;
 use collab_core::ids::{ClientId, DocId, SessionId, UserId};
 use protocol::{Participant, RemovedReason};
-use records::{NewEvent, Role};
+use records::{Access, NewEvent};
 use tokio::sync::mpsc;
 
 use crate::events::EventSink;
 use crate::room::{AccessChange, ConnId, Outbound};
+
+/// The access the built-in role `id` gives, for tests.
+#[cfg(test)]
+pub(crate) fn builtin_access(id: &str) -> Access {
+    records::RoleDef::builtin(id).map_or_else(
+        || Access {
+            perms: records::Perms::NONE,
+            roles: Vec::new(),
+        },
+        |role| Access::from_role(&role),
+    )
+}
 
 /// How one room kind writes the frames [`Members`] sends on its behalf. `None` if a frame
 /// cannot be encoded; it is then not sent.
@@ -41,7 +53,7 @@ pub(crate) struct Member {
     /// The account's name, made a valid author name.
     pub name: String,
     /// What this person may do; it can change while they are connected.
-    pub role: Role,
+    pub role: Access,
     /// Cursor position in a text room; always `None` in a file session.
     pub cursor: Option<usize>,
     pub tx: mpsc::Sender<Outbound>,
@@ -180,17 +192,17 @@ impl<F: Frames> Members<F> {
         left
     }
 
-    /// Gives every connection of `user` the role `role`. Each connection whose role changes is
-    /// told with `Access`, even when it may edit as before (an owner becoming an editor, say),
-    /// so the page can read the role again.
-    pub(crate) fn change_role(&mut self, user: UserId, role: Role) -> RoleChange {
+    /// Gives every connection of `user` the access `role`. Each connection whose access changes
+    /// is told with `Access`, even when it may edit as before (an owner becoming an editor,
+    /// say), so the page can read its access again.
+    pub(crate) fn change_role(&mut self, user: UserId, role: Access) -> RoleChange {
         let mut told = Vec::new();
         for member in self.list.iter_mut().filter(|m| m.user == user) {
             if member.role == role {
                 continue;
             }
             told.push(member.client);
-            member.role = role;
+            member.role = role.clone();
         }
         let changed = !told.is_empty();
         let mut departed = Departures(false);
@@ -300,7 +312,7 @@ impl<F: Frames> Members<F> {
 /// (see [`apply_access`]).
 pub(crate) trait AccessRules {
     /// `user`'s connections now have `role`.
-    fn change_role(&mut self, user: UserId, role: Role);
+    fn change_role(&mut self, user: UserId, role: Access);
     /// The connections `which` selects are removed with `Removed { reason }`.
     fn remove(&mut self, which: &dyn Fn(&Member) -> bool, reason: RemovedReason);
     /// The document is now named `name`; later revisions are stored under it.

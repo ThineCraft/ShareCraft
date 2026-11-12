@@ -7,6 +7,9 @@ const MESSAGES = {
   not_signed_in: 'You are not signed in.',
   no_such_user: 'No account has that email address.',
   last_owner: 'There must be at least one owner. Make someone else an owner first.',
+  last_manager:
+    'Someone must still be able to manage access here. Give someone else that first.',
+  beyond_your_access: 'You cannot give a role with permissions you do not have here.',
   last_admin: 'At least one administrator must stay enabled.',
   email_taken: 'An account with that email address already exists.',
   invalid_email: 'That is not a usable email address.',

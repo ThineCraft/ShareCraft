@@ -12,12 +12,12 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use collab_core::ids::{DocId, NodeId, UserId};
-use records::{Crumb, Cursor, Db, Editor, Node, NodeKind, Role};
+use records::{Crumb, Cursor, Db, Editor, Node, NodeKind, Principal};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use super::{ApiError, JsonBody, parse_id, recheck_below, to_completion};
+use super::{ApiError, JsonBody, LegacyRole, parse_id, recheck_below, to_completion};
 use crate::AppState;
 use crate::auth::Signed;
 use crate::room::AccessChange;
@@ -73,8 +73,8 @@ pub(crate) struct CrumbOut {
     id: String,
     kind: NodeKind,
     name: String,
-    /// `None` where the person has limited access only: a role somewhere below.
-    role: Option<Role>,
+    /// `None` where the person has limited access only: access somewhere below.
+    role: Option<LegacyRole>,
 }
 
 impl From<Crumb> for CrumbOut {
@@ -83,7 +83,7 @@ impl From<Crumb> for CrumbOut {
             id: crumb.id.0.to_string(),
             kind: crumb.kind,
             name: crumb.name,
-            role: crumb.role,
+            role: crumb.role.as_ref().map(LegacyRole::of),
         }
     }
 }
@@ -95,7 +95,7 @@ pub(crate) struct NodeDetail {
     kind: NodeKind,
     name: String,
     /// `None` for limited access.
-    role: Option<Role>,
+    role: Option<LegacyRole>,
     /// For a file, the editor that opens it.
     #[serde(skip_serializing_if = "Option::is_none")]
     editor: Option<Editor>,
@@ -130,7 +130,7 @@ pub(crate) async fn show(
         id: last.id.0.to_string(),
         kind: last.kind,
         name: last.name,
-        role: last.role,
+        role: last.role.as_ref().map(LegacyRole::of),
         editor,
         path: path.into_iter().map(CrumbOut::from).collect(),
     }))
@@ -150,7 +150,7 @@ pub(crate) struct ChildOut {
     kind: NodeKind,
     name: String,
     /// `None` for limited access.
-    role: Option<Role>,
+    role: Option<LegacyRole>,
     #[serde(skip_serializing_if = "Option::is_none")]
     editor: Option<Editor>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -197,7 +197,7 @@ pub(crate) async fn children(
             id: child.node.id.0.to_string(),
             kind: child.node.kind,
             name: child.node.name,
-            role: child.role,
+            role: child.role.as_ref().map(LegacyRole::of),
             editor: child.editor,
             revised_at: rfc3339(child.revised_at),
             inherits: !child.node.unique_scope,
@@ -240,8 +240,9 @@ pub(crate) struct NewChild {
     name: String,
 }
 
-/// `POST /api/nodes/{id}/children {kind, name}`: creates a library in a site (owners of the
-/// site) or a folder in a library or folder (its editors). `201` with the node.
+/// `POST /api/nodes/{id}/children {kind, name}`: creates a library in a site (with
+/// `manage_site` on it) or a folder in a library or folder (with `add` on it). `201` with the
+/// node.
 pub(crate) async fn create(
     State(state): State<AppState>,
     signed: Signed,
@@ -373,7 +374,7 @@ pub(crate) struct Person {
 #[derive(Serialize)]
 pub(crate) struct AccessRow {
     user: Person,
-    role: Role,
+    role: LegacyRole,
 }
 
 /// `GET /api/nodes/{id}/access`.
@@ -388,7 +389,7 @@ pub(crate) struct AccessOut {
 }
 
 /// `GET /api/nodes/{id}/access` (and `/api/docs/{id}/access`): whether the node inherits, the
-/// scope its access comes from, and the assignments there. Owners only.
+/// scope its access comes from, and the assignments there. Needs `manage_access`.
 pub(crate) async fn access(
     State(state): State<AppState>,
     signed: Signed,
@@ -408,22 +409,22 @@ pub(crate) async fn access(
                     email: grant.user.email,
                     name: grant.user.name,
                 },
-                role: grant.role,
+                role: LegacyRole::of_perms(grant.perms),
             })
             .collect(),
     }))
 }
 
-/// Succeeds if `user` may manage `node`: `NotFound` when they have no role on it, `Forbidden`
-/// when their role is lower.
-pub(super) async fn require_owner(db: &Db, user: UserId, node: NodeId) -> Result<(), ApiError> {
+/// Succeeds if `user` may manage access to `node`: `NotFound` when they have no access to it,
+/// `Forbidden` when it lacks `manage_access`.
+pub(super) async fn require_manager(db: &Db, user: UserId, node: NodeId) -> Result<(), ApiError> {
     match db
-        .effective_role(user, node)
+        .effective_access(user, node)
         .await
         .map_err(|e| ApiError::unavailable(&e))?
     {
         None => Err(ApiError::NotFound),
-        Some(held) if !held.can_manage() => Err(ApiError::Forbidden),
+        Some(held) if !held.can_manage_access() => Err(ApiError::Forbidden),
         Some(_) => Ok(()),
     }
 }
@@ -444,19 +445,17 @@ pub(crate) async fn share(
     JsonBody(share): JsonBody<Share>,
 ) -> Result<StatusCode, ApiError> {
     let node = node_id(&id)?;
-    let role: Role =
-        serde_json::from_value(Value::String(share.role)).map_err(|_| ApiError::InvalidRequest)?;
     let actor = signed.session.user.id;
     let db = state.db();
     // The email is looked up only for someone who may manage access, so that nobody else can
     // learn which emails have accounts. The records layer decides again when it makes the change.
-    require_owner(db, actor, node).await?;
+    require_manager(db, actor, node).await?;
     let user = db
         .user_by_email(&share.email)
         .await
         .map_err(|e| ApiError::unavailable(&e))?
         .ok_or(ApiError::NoSuchUser)?;
-    change_access(state, actor, node, user.id, Some(role)).await?;
+    change_access(state, actor, node, user.id, Some(share.role)).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -468,10 +467,13 @@ pub(super) async fn change_access(
     actor: UserId,
     node: NodeId,
     user: UserId,
-    role: Option<Role>,
+    role: Option<String>,
 ) -> Result<(), ApiError> {
     to_completion(async move {
-        state.db().set_node_access(actor, node, user, role).await?;
+        state
+            .db()
+            .set_node_access(actor, node, Principal::User(user), role.as_deref())
+            .await?;
         recheck_below(&state, node).await;
         Ok(())
     })
@@ -499,7 +501,7 @@ pub(crate) struct Inheritance {
 
 /// `POST /api/nodes/{id}/inheritance {inherit}`: `false` makes the node a scope of its own
 /// with a copy of the assignments it inherited; `true` makes it inherit again, dropping its
-/// own. Owners only (restoring also needs owner of the scope above). `204`, also when the node
+/// own. Needs `manage_access` (restoring also on the scope above). `204`, also when the node
 /// already was as asked.
 pub(crate) async fn inheritance(
     State(state): State<AppState>,

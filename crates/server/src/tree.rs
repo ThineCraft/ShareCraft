@@ -3,7 +3,7 @@
 //!
 //! Every change is judged under the server's tree lock, recorded as one Git commit credited to
 //! the person who made it, then mirrored into PostgreSQL in one transaction that locks the
-//! rows concerned and judges the person's roles again. Git is the authority: each record is
+//! rows concerned and judges the person's access again. Git is the authority: each record is
 //! built from the node's current record in Git, never from PostgreSQL.
 
 use std::collections::{HashMap, HashSet};
@@ -13,8 +13,8 @@ use std::sync::atomic::Ordering;
 
 use collab_core::ids::{DocId, NodeId, UserId};
 use records::{
-    AccessError, Db, DbError, Document, Editor, NewEvent, Node, NodeChange, NodeKind, NodeRow,
-    Role, User, validate_document_name, validate_node_name,
+    Access, AccessError, Db, DbError, Document, Editor, NewEvent, Node, NodeChange, NodeKind,
+    NodeRow, Perms, User, validate_document_name, validate_node_name,
 };
 use revisions::{Author, CheckpointError, GitError, Stamp, TreeChange, TreeRecord};
 use serde_json::json;
@@ -149,7 +149,7 @@ struct Plan {
     /// The records that take the change back: the previous records, or the new ones deleted.
     undo: Vec<TreeRecord>,
     needs_admin: bool,
-    needs: Vec<(NodeId, Role)>,
+    needs: Vec<(NodeId, Perms)>,
     owner: bool,
     document: Option<Editor>,
     events: Vec<NewEvent>,
@@ -162,9 +162,10 @@ struct Plan {
 ///
 /// # Errors
 /// `NotFound` when the node, or a parent or destination, is missing, deleted or not visible
-/// to `actor`; `Forbidden` when their role is too low (a site needs an administrator, a library
-/// or a rename of one an owner of the site, anything else an editor of the place it goes into
-/// and of what it changes); `InvalidName`, `WrongExtension` or `NameTaken` for a name;
+/// to `actor`; `Forbidden` when they lack a permission (a site needs an administrator, a
+/// library or a rename of one `manage_site` on the site, a folder `add` on the place it goes
+/// into, a rename `edit`, a move `edit` on what moves and `add` on where it goes, a deletion
+/// `delete`); `InvalidName`, `WrongExtension` or `NameTaken` for a name;
 /// `WrongPlace` for a kind that cannot go there or cannot be moved or deleted (and for files,
 /// which [`create_document`] creates); `IntoItself` for a move into the node or below it;
 /// `NotEmpty` for a folder with undeleted children; `IsSite` for deleting a site; `Exists` for
@@ -203,7 +204,7 @@ pub async fn apply(state: &AppState, actor: &User, op: TreeOp) -> Result<Node, A
 /// The file has no grants of its own: it inherits.
 ///
 /// # Errors
-/// As [`apply`] for a create: `NotFound`, `Forbidden` unless `actor` is an editor of
+/// As [`apply`] for a create: `NotFound`, `Forbidden` unless `actor` has `add` on
 /// `parent`, `WrongPlace` unless `parent` is a library or folder, `InvalidName`,
 /// `WrongExtension`, `NameTaken`, `Exists`, `OutOfStep`, or the Git or database error.
 pub async fn create_document(
@@ -223,7 +224,7 @@ pub async fn create_document(
     if !matches!(parent_node.0.kind, NodeKind::Library | NodeKind::Folder) {
         return Err(AccessError::WrongPlace);
     }
-    require(parent_node.1, Role::Editor)?;
+    require(&parent_node.1, Perms::ADD)?;
     if !db.name_free(parent, &name, None).await? {
         return Err(AccessError::NameTaken);
     }
@@ -253,7 +254,7 @@ pub async fn create_document(
         undo: vec![deleted(&record, author_of(actor))],
         records: vec![record],
         needs_admin: false,
-        needs: vec![(parent, Role::Editor)],
+        needs: vec![(parent, Perms::ADD)],
         owner: false,
         document: Some(editor),
         events: vec![NewEvent {
@@ -485,7 +486,7 @@ async fn ensure_in_step(state: &AppState) -> Result<(), AccessError> {
 }
 
 /// Writes `plan` to Git, then mirrors it into PostgreSQL. If PostgreSQL refuses it (the
-/// person's role changed meanwhile, or a name was taken outside this server's lock), or the
+/// person's access changed meanwhile, or a name was taken outside this server's lock), or the
 /// database fails before the change was judged allowed (`Unjudged`), the commit is taken back
 /// by a second one and the error answered; nothing is repaired from Git. If the database fails
 /// after the change was judged allowed, the nodes are reconciled from Git once (a new file is
@@ -753,19 +754,19 @@ async fn plan_create(
         }));
     }
     let parent = parent.ok_or(AccessError::WrongPlace)?;
-    let (parent_node, role) = visible(db, actor, parent).await?;
+    let (parent_node, access) = visible(db, actor, parent).await?;
     let (fits, needed) = match kind {
-        NodeKind::Library => (parent_node.kind == NodeKind::Site, Role::Owner),
+        NodeKind::Library => (parent_node.kind == NodeKind::Site, Perms::MANAGE_SITE),
         NodeKind::Folder => (
             matches!(parent_node.kind, NodeKind::Library | NodeKind::Folder),
-            Role::Editor,
+            Perms::ADD,
         ),
-        NodeKind::Site | NodeKind::Document => (false, Role::Editor),
+        NodeKind::Site | NodeKind::Document => (false, Perms::ADD),
     };
     if !fits {
         return Err(AccessError::WrongPlace);
     }
-    require(role, needed)?;
+    require(&access, needed)?;
     if !db.name_free(parent, &name, None).await? {
         return Err(AccessError::NameTaken);
     }
@@ -799,12 +800,12 @@ async fn plan_rename(
     name: &str,
 ) -> Result<Option<Plan>, AccessError> {
     let db = state.db();
-    let (node, role) = visible(db, actor, id).await?;
+    let (node, access) = visible(db, actor, id).await?;
     let needed = match node.kind {
-        NodeKind::Site | NodeKind::Library => Role::Owner,
-        NodeKind::Folder | NodeKind::Document => Role::Editor,
+        NodeKind::Site | NodeKind::Library => Perms::MANAGE_SITE,
+        NodeKind::Folder | NodeKind::Document => Perms::EDIT,
     };
-    require(role, needed)?;
+    require(&access, needed)?;
     let name = match db.document(DocId(id.0)).await? {
         Some(document) if node.kind == NodeKind::Document => {
             validate_document_name(name, document.editor)?
@@ -852,16 +853,16 @@ async fn plan_move(
     destination: NodeId,
 ) -> Result<Option<Plan>, AccessError> {
     let db = state.db();
-    let (node, role) = visible(db, actor, id).await?;
+    let (node, access) = visible(db, actor, id).await?;
     if !matches!(node.kind, NodeKind::Folder | NodeKind::Document) {
         return Err(AccessError::WrongPlace);
     }
-    let (place, place_role) = visible(db, actor, destination).await?;
+    let (place, place_access) = visible(db, actor, destination).await?;
     if !matches!(place.kind, NodeKind::Library | NodeKind::Folder) {
         return Err(AccessError::WrongPlace);
     }
-    require(role, Role::Editor)?;
-    require(place_role, Role::Editor)?;
+    require(&access, Perms::EDIT)?;
+    require(&place_access, Perms::ADD)?;
     if db.is_at_or_below(destination, id).await? {
         return Err(AccessError::IntoItself);
     }
@@ -907,7 +908,7 @@ async fn plan_move(
         records,
         undo,
         needs_admin: false,
-        needs: vec![(destination, Role::Editor), (id, Role::Editor)],
+        needs: vec![(destination, Perms::ADD), (id, Perms::EDIT)],
         owner: false,
         document: None,
     }))
@@ -915,13 +916,13 @@ async fn plan_move(
 
 async fn plan_delete(state: &AppState, actor: &User, id: NodeId) -> Result<Plan, AccessError> {
     let db = state.db();
-    let (node, role) = visible(db, actor, id).await?;
+    let (node, access) = visible(db, actor, id).await?;
     match node.kind {
         NodeKind::Site => return Err(AccessError::IsSite),
         NodeKind::Library => return Err(AccessError::WrongPlace),
         NodeKind::Folder | NodeKind::Document => {}
     }
-    require(role, Role::Editor)?;
+    require(&access, Perms::DELETE)?;
     if node.kind == NodeKind::Folder && db.has_live_children(id).await? {
         return Err(AccessError::NotEmpty);
     }
@@ -941,7 +942,7 @@ async fn plan_delete(state: &AppState, actor: &User, id: NodeId) -> Result<Plan,
         records: vec![after],
         undo: vec![before],
         needs_admin: false,
-        needs: vec![(id, Role::Editor)],
+        needs: vec![(id, Perms::DELETE)],
         owner: false,
         document: None,
     })
@@ -969,19 +970,19 @@ fn below(tree: &[TreeRecord], id: Uuid) -> Vec<&TreeRecord> {
     found
 }
 
-/// The node `id` and `actor`'s role on it; `NotFound` unless they have one.
-async fn visible(db: &Db, actor: &User, id: NodeId) -> Result<(Node, Role), AccessError> {
-    let role = db
-        .effective_role(actor.id, id)
+/// The node `id` and `actor`'s access to it; `NotFound` unless they have some.
+async fn visible(db: &Db, actor: &User, id: NodeId) -> Result<(Node, Access), AccessError> {
+    let access = db
+        .effective_access(actor.id, id)
         .await?
         .ok_or(AccessError::NotFound)?;
     let node = db.node(id).await?.ok_or(AccessError::NotFound)?;
-    Ok((node, role))
+    Ok((node, access))
 }
 
-/// `Forbidden` unless `role` is at least `needed`.
-fn require(role: Role, needed: Role) -> Result<(), AccessError> {
-    if role >= needed {
+/// `Forbidden` unless `access` holds every permission of `needed`.
+fn require(access: &Access, needed: Perms) -> Result<(), AccessError> {
+    if access.perms.contains(needed) {
         Ok(())
     } else {
         Err(AccessError::Forbidden)

@@ -21,7 +21,7 @@ use common::{
     spawn_server_config, spawn_server_with_grace, wait_out_grace, wait_stored, ws_request,
 };
 use protocol::{ClientMsg, RemovedReason, ServerMsg};
-use records::{Role, SessionToken};
+use records::{Principal, SessionToken};
 use reqwest::StatusCode;
 use revisions::{
     Checkpoint, CheckpointError, GitError, Outcome, RevisionId, RevisionInfo, RevisionStore,
@@ -282,7 +282,7 @@ async fn concurrent_role_changes_end_as_the_database_says() {
         let seq = ann.seq();
         bob.pump_until(|c| c.seq() == seq).await;
 
-        let stored = server.db.db.role(bob_id, doc).await.unwrap().unwrap();
+        let stored = server.db.db.doc_access(bob_id, doc).await.unwrap().unwrap();
         assert_eq!(bob.can_edit, stored.can_edit(), "round {round}");
         let listed = ann
             .participants()
@@ -737,10 +737,12 @@ async fn access_ended_during_join_is_caught() {
     load_started(&mut started).await;
 
     let db = &server.db.db;
-    db.set_access(ann.id, doc, bob.user.id, None).await.unwrap();
+    db.set_access(ann.id, doc, Principal::User(bob.user.id), None)
+        .await
+        .unwrap();
     let cat_session = session_of(&server, &cat.user).await;
     db.end_session(cat_session).await.unwrap();
-    db.set_access(ann.id, doc, dan.user.id, Some(Role::Viewer))
+    db.set_access(ann.id, doc, Principal::User(dan.user.id), Some("viewer"))
         .await
         .unwrap();
     db.set_disabled(root.id, eve.user.id, true).await.unwrap();
