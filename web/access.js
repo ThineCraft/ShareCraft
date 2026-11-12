@@ -13,6 +13,7 @@ import {
   principalParts,
   queryId,
   requireMe,
+  rolesWithin,
   seg,
   setupTopbar,
   showCrumbs,
@@ -57,7 +58,9 @@ function note(text, isError) {
 
 /** Puts every role in `select` (the one with id `selected` chosen). */
 function fillRoleSelect(select, selected, extra) {
-  const list = extra && !roles.some((role) => role.id === extra.id) ? [...roles, extra] : roles;
+  // Only roles this person may give; an entry's current role stays visible in its own select.
+  const allowed = rolesWithin(roles, here.access);
+  const list = extra && !allowed.some((role) => role.id === extra.id) ? [...allowed, extra] : allowed;
   select.replaceChildren(
     ...list.map((role) => {
       const option = h('option', { value: role.id }, role.name);

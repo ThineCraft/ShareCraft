@@ -21,6 +21,8 @@ import {
   inheritAgainMessage,
   messageFor,
   moveChoices,
+  noSourceText,
+  rolesWithin,
   pageFor,
   removedMessage,
   removedReasonOf,
@@ -370,4 +372,24 @@ test('the exceptions tree is built from the breaks alone', () => {
   assert.equal(tree.loaded.get('f2')[0].expandable, false);
   assert.equal(tree.breaks.size, 4);
   assert.equal(exceptionTree([]).root, null);
+});
+
+test('only roles within the own access of the person are offered', () => {
+  const role = (id, perms) => ({ id, name: id, perms, builtin: false });
+  const all = [
+    role('viewer', ['view']),
+    role('editor', ['view', 'add', 'edit', 'delete']),
+    role('owner', ['view', 'add', 'edit', 'delete', 'manage_access', 'manage_site']),
+    role('auditor', ['view', 'manage_access']),
+  ];
+  assert.deepEqual(rolesWithin(all, OWNER).map((r) => r.id), ['viewer', 'editor', 'owner', 'auditor']);
+  const manager = { perms: ['view', 'manage_access'], roles: [{ id: 'm', name: 'M' }] };
+  assert.deepEqual(rolesWithin(all, manager).map((r) => r.id), ['viewer', 'auditor']);
+  assert.deepEqual(rolesWithin(all, null), []);
+});
+
+test('a missing source is a site only when it is one', () => {
+  assert.match(noSourceText('site'), /site always has its own/);
+  assert.doesNotMatch(noSourceText('folder'), /site/);
+  assert.match(noSourceText('folder'), /do not manage access on/);
 });

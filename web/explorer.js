@@ -20,6 +20,7 @@ import {
   previewView,
   principalParts,
   queryId,
+  noSourceText,
   requireMe,
   seg,
   setupTopbar,
@@ -354,7 +355,7 @@ function detailView(found) {
   );
   const source = found.inherited_from
     ? h('a', { href: `/access.html?id=${seg(found.inherited_from.id)}` }, found.inherited_from.name)
-    : 'Nothing: a site always has its own access.';
+    : noSourceText(found.kind);
   const restore = h('button', { type: 'button', class: 'plain' }, 'Restore preview');
   restore.addEventListener('click', () => openRestore(found.node));
   return h(

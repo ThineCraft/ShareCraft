@@ -502,6 +502,16 @@ export function showProblemWithFolder(element, text, folder) {
   }
 }
 
+/** The roles in `roles` whose permissions are all held in `access`: the ones this person may give. */
+export const rolesWithin = (roles, access) =>
+  roles.filter((role) => role.perms.every((perm) => can(access, perm)));
+
+/** What the explorer says a break would inherit from when the server names no place. */
+export const noSourceText = (kind) =>
+  kind === 'site'
+    ? 'Nothing: a site always has its own access.'
+    : 'The place above, which you do not manage access on.';
+
 /** How many breaks lie below an explorer row: its count, without the row itself if it is one. */
 export const breaksBelow = (row) => Math.max(0, row.count - (row.unique ? 1 : 0));
 
