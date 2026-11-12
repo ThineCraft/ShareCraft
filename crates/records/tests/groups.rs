@@ -854,6 +854,85 @@ async fn membership_and_site_access_change_do_not_deadlock() {
 }
 
 #[tokio::test]
+async fn membership_and_cross_site_move_do_not_deadlock() {
+    let test = TestDb::create().await;
+    let admin = user(&test, "Root", true).await;
+    let ann = user(&test, "Ann", false).await;
+    let bob = user(&test, "Bob", false).await;
+    let (a, a_lib) = new_site(&test, ann.id, "A").await;
+    let (b, b_lib) = new_site(&test, admin.id, "B").await;
+    let groups = site_groups(&test, a).await;
+    // Folder M holds F1, which holds F2; F2's id sorts before F1's, the opposite of their
+    // depth. Visitors is assigned on both folders' own scopes.
+    let mut ids = [Uuid::new_v4(), Uuid::new_v4()];
+    ids.sort();
+    let (f2, f1) = (NodeId(ids[0]), NodeId(ids[1]));
+    let m = put(&test, new_id(), NodeKind::Folder, Some(a_lib), a, "M").await;
+    put(&test, f1, NodeKind::Folder, Some(m), a, "F1").await;
+    put(&test, f2, NodeKind::Folder, Some(f1), a, "F2").await;
+    test.db
+        .set_node_access(
+            admin.id,
+            f1,
+            Principal::Group(groups.visitors),
+            Some("editor"),
+        )
+        .await
+        .unwrap();
+    test.db
+        .set_node_access(
+            admin.id,
+            f2,
+            Principal::Group(groups.visitors),
+            Some("viewer"),
+        )
+        .await
+        .unwrap();
+    assert!(test.db.node(f2).await.unwrap().unwrap().unique_scope);
+
+    // The move to site B queues first on F1; then Ann adds Bob to Visitors, which is judged on
+    // F1 and F2. Locking F2 before F1 would hold F2 while the move, holding F1, waits for it.
+    let held = gate(&test, f1).await;
+    let rows: Vec<NodeRow> = [
+        (m, Some(b_lib), "M"),
+        (f1, Some(m), "F1"),
+        (f2, Some(f1), "F2"),
+    ]
+    .into_iter()
+    .map(|(id, parent, name)| row(id, NodeKind::Folder, parent, b, name))
+    .collect();
+    let first = test.db.clone();
+    let moving = tokio::spawn(async move {
+        first
+            .apply_nodes(NodeChange {
+                rows: &rows,
+                actor: Some(admin.id),
+                needs: &[(m, Perms::EDIT), (b_lib, Perms::ADD)],
+                ..NodeChange::default()
+            })
+            .await
+    });
+    wait_blocked(&test, held.pid, 1).await;
+    let second = test.db.clone();
+    let adding =
+        tokio::spawn(async move { second.add_member(ann.id, groups.visitors, bob.id).await });
+    wait_blocked(&test, held.pid, 2).await;
+    held.open().await;
+    let moved = tokio::time::timeout(Duration::from_secs(10), moving)
+        .await
+        .expect("the move finishes")
+        .unwrap();
+    let added = tokio::time::timeout(Duration::from_secs(10), adding)
+        .await
+        .expect("the membership change finishes")
+        .unwrap();
+    assert_eq!(moved, Ok(()));
+    assert_eq!(added, Ok(true));
+    assert_eq!(test.db.node(f2).await.unwrap().unwrap().site, b);
+    assert_eq!(role(&test, bob.id, f2).await, Some(Role::Viewer));
+}
+
+#[tokio::test]
 async fn cannot_add_to_a_group_beyond_own_access() {
     let test = TestDb::create().await;
     let admin = user(&test, "Root", true).await;

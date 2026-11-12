@@ -109,7 +109,7 @@ const MINE_ON_N: &str = "\
 const ASSIGNED: &str = assigned!();
 
 /// The bit of `manage_access` in a `perms` column.
-const MANAGE_ACCESS_BIT: i32 = 16;
+pub(crate) const MANAGE_ACCESS_BIT: i32 = 16;
 
 const NODE_COLUMNS: &str = "n.id, n.kind, n.parent_id, n.site_id, n.name, n.unique_scope, \
      (n.deleted_at is not null) as deleted, n.created_by, n.created_at";
@@ -935,6 +935,51 @@ impl Db {
         }
         Err(DbError::new("the tree kept changing while access was being changed").into())
     }
+}
+
+/// How far up a walk for [`lock_top_down`] goes before it stops: deeper than any real tree,
+/// and an end for a walk that the data turned into a cycle.
+const MAX_DEPTH: i32 = 10_000;
+
+/// Locks the existing nodes among `ids`, each once, in the one order for locking several nodes
+/// that are not one chain: by site, then ancestors before descendants (by depth from the
+/// site), then by id; `FOR UPDATE` when `write`, `FOR SHARE` otherwise. Ids that are not nodes
+/// are passed over. A chain locked from the top down is in this order too, so two transactions
+/// locking any of the same nodes this way, or one this way and one along a chain, never hold
+/// them in opposite orders. A tree change writing several rows (a move to another site
+/// rewrites a whole subtree, parents first but otherwise in any order) locks them this way
+/// before writing, and so does a membership change judged on several scopes.
+pub(crate) async fn lock_top_down(
+    conn: &mut PgConnection,
+    ids: &[NodeId],
+    write: bool,
+) -> Result<(), sqlx::Error> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let ids: Vec<uuid::Uuid> = ids.iter().map(|id| id.0).collect();
+    let query = format!(
+        "with recursive up(origin, id, parent_id, depth) as ( \
+             select n.id, n.id, n.parent_id, 0 from nodes n where n.id = any($1) \
+             union all \
+             select up.origin, n.id, n.parent_id, up.depth + 1 \
+             from up join nodes n on n.id = up.parent_id where up.depth < {MAX_DEPTH}) \
+         select o.id from (select origin as id, max(depth) as depth from up group by origin) o \
+         join nodes n on n.id = o.id order by n.site_id, o.depth, o.id"
+    );
+    let ordered: Vec<uuid::Uuid> = sqlx::query_scalar(sqlx::AssertSqlSafe(query))
+        .bind(&ids)
+        .fetch_all(&mut *conn)
+        .await?;
+    let statement = if write {
+        "select id from nodes where id = $1 for update"
+    } else {
+        "select id from nodes where id = $1 for share"
+    };
+    for id in ordered {
+        sqlx::query(statement).bind(id).execute(&mut *conn).await?;
+    }
+    Ok(())
 }
 
 /// The scopes among the nodes of a segment.

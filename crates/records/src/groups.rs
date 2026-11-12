@@ -21,7 +21,10 @@ use crate::accounts::user_from_row;
 use crate::documents::UNIQUE_VIOLATION;
 use crate::events::{NewEvent, record};
 use crate::roles::lock_roles;
-use crate::scopes::{LOCK_ATTEMPTS, REACH, Standing, access_in, judged_roles, standing};
+use crate::scopes::{
+    LOCK_ATTEMPTS, MANAGE_ACCESS_BIT, REACH, Standing, access_in, judged_roles, lock_top_down,
+    standing,
+};
 use crate::{AccessError, Db, DbError, Perms, User};
 
 const MAX_GROUP_NAME_CHARS: usize = 60;
@@ -624,15 +627,18 @@ async fn judge_membership(
         Membership::Remove => Vec::new(),
     };
     let mut scopes = vec![site];
-    for (node, _, _) in &assigned {
-        if *node != site {
-            sqlx::query("select id from nodes where id = $1 for share")
-                .bind(node.0)
-                .execute(&mut *conn)
-                .await?;
-            scopes.push(*node);
-        }
-    }
+    scopes.extend(
+        assigned
+            .iter()
+            .map(|(node, _, _)| *node)
+            .filter(|n| *n != site),
+    );
+    // Ancestors first, as every chain and every tree change writing several rows locks them:
+    // ordered by id alone, this could hold a folder while a move held its parent and waited
+    // for it. These are `FOR SHARE`, after the group's site, also `FOR SHARE`: only a writer of
+    // several rows could wait on one of them while holding another, and every such writer
+    // locks in this same order and never writes a site row with them.
+    lock_top_down(&mut *conn, scopes.get(1..).unwrap_or_default(), false).await?;
     let judged = groups_judged_by(&mut *conn, actor, &scopes).await?;
     lock_groups(&mut *conn, judged.iter().copied(), Some(group)).await?;
     let mut roles: Vec<String> = judged_roles(&site_chain).collect();
@@ -688,7 +694,7 @@ async fn visible_groups(
     let query = format!(
         "with recursive {REACH}, \
          manages(yes) as (select exists (select 1 from mine m \
-                                         where m.perms & 16 <> 0 \
+                                         where m.perms & {MANAGE_ACCESS_BIT} <> 0 \
                                            and m.node_id in (select origin from live))) \
          select {GROUP_COLUMNS} from {GROUP_FROM} \
          where ($3::uuid is null or g.id = $3) \

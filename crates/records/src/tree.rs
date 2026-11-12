@@ -13,7 +13,9 @@ use crate::groups::{
     add_site_owner, all_locked, ensure_site_groups, groups_judged_by, lock_groups,
 };
 use crate::roles::lock_roles;
-use crate::scopes::{LOCK_ATTEMPTS, access_in, judged_roles, lock_segment, scopes_of, segment};
+use crate::scopes::{
+    LOCK_ATTEMPTS, access_in, judged_roles, lock_segment, lock_top_down, scopes_of, segment,
+};
 use crate::{AccessError, Db, DbError, Editor, Perms};
 
 const MAX_NAME_CHARS: usize = 120;
@@ -296,6 +298,10 @@ impl Db {
                 Err(e) => return Err(e.into()),
             }
         }
+        // The rows written are locked in the one order for several nodes before any is written:
+        // the order they come in (parents first, as a move's subtree is read) need not be it.
+        let written: Vec<NodeId> = change.rows.iter().map(|row| row.id).collect();
+        lock_top_down(&mut tx, &written, true).await?;
         for row in change.rows {
             upsert_node(&mut tx, row).await?;
         }
