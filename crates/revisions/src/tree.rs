@@ -287,7 +287,7 @@ impl RevisionStore {
             return Ok(None);
         };
         let root = commit.tree()?;
-        let mut read = |path: String| -> Result<Option<TreeRecord>, CheckpointError> {
+        let read = |path: String| -> Result<Option<TreeRecord>, CheckpointError> {
             read_blob(&root, &path)?
                 .map(|bytes| parse_record(&commit, &path, &bytes))
                 .transpose()
