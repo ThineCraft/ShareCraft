@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 use crate::documents::UNIQUE_VIOLATION;
 use crate::events::{NewEvent, record};
+use crate::scopes::scopes_managed_only_by;
 use crate::{AccessError, Db, DbError};
 
 const MAX_ROLE_NAME_CHARS: usize = 60;
@@ -496,7 +497,8 @@ impl Db {
     /// Renames the role `id` and changes its permissions (each when given; `view` is always
     /// kept). The change reaches everyone holding the role, everywhere, at once. `actor` must
     /// be an enabled administrator (`Forbidden`); `NoSuchRole` for an unknown id,
-    /// `BuiltinRole` for a built-in role; names as [`Db::create_role`]. Takes the role's row
+    /// `BuiltinRole` for a built-in role; names as [`Db::create_role`]; `LastManager` if the
+    /// role would lose `manage_access` while it gives the only managing assignment of a scope. Takes the role's row
     /// `FOR UPDATE`, so an access decision judged by the role either finishes before the change
     /// or sees it. Records `role.changed` with the name and permissions before and after.
     pub async fn change_role(
@@ -518,6 +520,19 @@ impl Db {
         };
         if after == before {
             return Ok(before);
+        }
+        // Every scope keeps a manager. The role's row is held `FOR UPDATE`, and every access
+        // change takes the roles assigned on the scope it changes `FOR SHARE` (after its chain),
+        // so a change removing another manager on a scope holding this role either committed
+        // before this count or waits until this transaction ends and then sees the new
+        // permissions. No deadlock: this transaction holds only the actor's row (shared) and
+        // this role's row, and waits for nothing else once it has the role; the others wait for
+        // it only on this one row.
+        if before.perms.contains(Perms::MANAGE_ACCESS)
+            && !after.perms.contains(Perms::MANAGE_ACCESS)
+            && scopes_managed_only_by(&mut tx, id).await? > 0
+        {
+            return Err(AccessError::LastManager);
         }
         sqlx::query("update roles set name = $2, perms = $3 where id = $1")
             .bind(id)

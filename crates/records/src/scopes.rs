@@ -400,7 +400,10 @@ async fn assignment_on(
         .transpose()
 }
 
-/// How many assignments on scope `node` give a role with `manage_access`.
+/// How many assignments on scope `node` give a role with `manage_access`. Deliberately reads
+/// `assigned!` (every principal's assignments on the scope), not `mine!` (one person's): the
+/// rule is that a scope keeps a managing assignment, whoever holds it, so extending "my
+/// assignments" to groups must not change this count.
 async fn managers_on(conn: &mut PgConnection, node: NodeId) -> Result<i64, sqlx::Error> {
     let query = format!(
         "with {ASSIGNED} select count(*) from assigned \
@@ -408,6 +411,27 @@ async fn managers_on(conn: &mut PgConnection, node: NodeId) -> Result<i64, sqlx:
     );
     sqlx::query_scalar(sqlx::AssertSqlSafe(query))
         .bind(node.0)
+        .fetch_one(conn)
+        .await
+}
+
+/// How many scopes hold an assignment of the role `role` and no other assignment whose role
+/// has `manage_access`: the scopes that would be left without a manager if `role` lost it.
+/// Like [`managers_on`] it reads `assigned!`, per scope; its cost follows the role's
+/// assignments, not the tree's size.
+pub(crate) async fn scopes_managed_only_by(
+    conn: &mut PgConnection,
+    role: &str,
+) -> Result<i64, sqlx::Error> {
+    let query = format!(
+        "with {ASSIGNED} select count(*) \
+         from (select distinct node_id from assigned where role_id = $1) held \
+         where not exists (select 1 from assigned other \
+                           where other.node_id = held.node_id and other.role_id <> $1 \
+                             and other.perms & {MANAGE_ACCESS_BIT} <> 0)"
+    );
+    sqlx::query_scalar(sqlx::AssertSqlSafe(query))
+        .bind(role)
         .fetch_one(conn)
         .await
 }

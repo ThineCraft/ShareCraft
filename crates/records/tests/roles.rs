@@ -933,3 +933,76 @@ async fn upgrade_copies_scope_access() {
     );
     assert_eq!(role_of(access(&test, wes.id, library).await), None);
 }
+
+#[tokio::test]
+async fn role_change_keeps_a_manager_per_scope() {
+    let test = TestDb::create().await;
+    let root = user(&test, "Root", true).await;
+    let ann = user(&test, "Ann", false).await;
+    let gus = user(&test, "Gus", false).await;
+    let cy = user(&test, "Cy", false).await;
+    let t = tree(&test, ann.id).await;
+    let keeper = test
+        .db
+        .create_role(root.id, "Gatekeeper", gatekeeper())
+        .await
+        .unwrap();
+    // On the site the role is one of two managers (Ann is owner there).
+    test.db
+        .set_node_access(ann.id, t.site, Principal::User(cy.id), Some(&keeper.id))
+        .await
+        .unwrap();
+    // On folder A it becomes the only manager once Ann leaves its own scope.
+    test.db
+        .set_node_access(ann.id, t.a, Principal::User(gus.id), Some(&keeper.id))
+        .await
+        .unwrap();
+    test.db
+        .set_node_access(ann.id, t.a, Principal::User(ann.id), None)
+        .await
+        .unwrap();
+    assert!(is_scope(&test, t.a).await);
+
+    // Losing manage_access would leave folder A with no manager.
+    let dropped = Perms::VIEW;
+    assert_eq!(
+        test.db
+            .change_role(root.id, &keeper.id, None, Some(dropped))
+            .await,
+        Err(AccessError::LastManager)
+    );
+    assert_eq!(
+        test.db.roles().await.unwrap().last().map(|r| r.perms),
+        Some(gatekeeper()),
+        "nothing changed"
+    );
+    // A rename that keeps the permissions is no loss.
+    assert!(
+        test.db
+            .change_role(root.id, &keeper.id, Some("Keeper"), None)
+            .await
+            .is_ok()
+    );
+
+    // With a second manager on folder A, the change goes through.
+    test.db
+        .set_node_access(root.id, t.a, Principal::User(ann.id), Some("owner"))
+        .await
+        .unwrap();
+    let changed = test
+        .db
+        .change_role(root.id, &keeper.id, None, Some(dropped))
+        .await
+        .unwrap();
+    assert_eq!(changed.perms, Perms::VIEW);
+    assert_eq!(
+        access(&test, gus.id, t.b).await.map(|a| a.perms),
+        Some(Perms::VIEW)
+    );
+    assert!(
+        access(&test, ann.id, t.b)
+            .await
+            .unwrap()
+            .can_manage_access()
+    );
+}
