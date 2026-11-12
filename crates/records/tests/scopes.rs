@@ -766,6 +766,75 @@ async fn children_page_in_order() {
     assert_eq!(seen, expected);
 }
 
+/// A middle page of a large folder is read from the children index, starting at the cursor:
+/// no sort of the whole folder.
+#[tokio::test]
+async fn middle_page_of_a_large_folder_uses_the_index() {
+    let test = TestDb::create().await;
+    let ann = user(&test, "Ann", false).await;
+    let t = tree(&test, ann.id).await;
+    let parent = put(
+        &test,
+        new_id(),
+        NodeKind::Folder,
+        Some(t.library),
+        t.site,
+        "Large",
+    )
+    .await;
+    sqlx::query(
+        "insert into nodes (id, kind, parent_id, site_id, name, created_at) \
+         select gen_random_uuid(), 'document', $1, $2, 'File ' || lpad(i::text, 6, '0') || '.txt', \
+                now() \
+         from generate_series(1, 20000) i",
+    )
+    .bind(parent.0)
+    .bind(t.site.0)
+    .execute(test.db.test_pool())
+    .await
+    .unwrap();
+    sqlx::query("analyze nodes")
+        .execute(test.db.test_pool())
+        .await
+        .unwrap();
+
+    // Walk to a page in the middle, then ask how its statement is run.
+    let mut after: Option<Cursor> = None;
+    for _ in 0..50 {
+        let (_, next) = test
+            .db
+            .children(ann.id, parent, after.as_ref(), 200)
+            .await
+            .unwrap()
+            .unwrap();
+        after = next;
+    }
+    let after = after.expect("the folder has more than 50 pages");
+    assert_eq!(after.name, "File 010000.txt");
+    let plan = test
+        .db
+        .explain_children_page(ann.id, parent, false, &after, 200)
+        .await
+        .unwrap();
+    assert!(
+        plan.contains("Index Scan using nodes_children on nodes n"),
+        "{plan}"
+    );
+    let cond = plan
+        .lines()
+        .skip_while(|line| !line.contains("using nodes_children"))
+        .find(|line| line.contains("Index Cond"))
+        .unwrap_or_default();
+    assert!(
+        cond.contains("parent_id =") && cond.contains("ROW(") && cond.contains(">"),
+        "the cursor is part of the index condition: {plan}"
+    );
+    assert!(
+        !plan.contains("Sort Key: (CASE"),
+        "the folder is not sorted: {plan}"
+    );
+}
+
 #[tokio::test]
 async fn break_cost_does_not_grow_with_descendants() {
     let test = TestDb::create().await;

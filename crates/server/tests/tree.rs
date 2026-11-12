@@ -21,7 +21,7 @@ use records::{
 };
 use revisions::{
     Author, Checkpoint, CheckpointError, GitError, Outcome, RevisionId, RevisionInfo,
-    RevisionStore, Stored, TreeChange, TreeRecord,
+    RevisionStore, Stamp, Stored, TreeChange, TreeMove, TreeRecord,
 };
 use serde_json::Map;
 use server::tree::{self, Adopted, TreeError, TreeOp};
@@ -995,6 +995,128 @@ async fn reconcile_fixes_changed_names() {
     assert_eq!(events.len(), 2);
     assert!(events.iter().all(|e| e.2["repaired"] == true));
     env.assert_agree().await;
+}
+
+/// Writes `records` at `tree/<id>.json`, where servers before the sub-folders wrote them: one
+/// commit on `main`, which the tree ref follows.
+fn write_flat(env: &Env, records: &[TreeRecord]) {
+    let repo = gix::open(library(env.dir.path())).unwrap();
+    let parent = repo
+        .find_reference("refs/heads/main")
+        .ok()
+        .map(|mut r| r.peel_to_id().unwrap().detach());
+    let root = match parent {
+        Some(p) => repo.find_commit(p).unwrap().tree_id().unwrap().detach(),
+        None => gix::ObjectId::empty_tree(repo.object_hash()),
+    };
+    let mut editor = repo.edit_tree(root).unwrap();
+    for record in records {
+        let mut bytes = serde_json::to_vec_pretty(record).unwrap();
+        bytes.push(b'\n');
+        let blob = repo.write_blob(&bytes).unwrap().detach();
+        editor
+            .upsert(
+                format!("tree/{}.json", record.id),
+                gix::object::tree::EntryKind::Blob,
+                blob,
+            )
+            .unwrap();
+    }
+    let tree = editor.write().unwrap().detach();
+    let signature = gix::actor::Signature {
+        name: "Old server".into(),
+        email: "old@sharecraft.invalid".into(),
+        time: gix::date::Time::now_local_or_utc(),
+    };
+    let commit = gix::objs::Commit {
+        tree,
+        parents: parent.into_iter().collect(),
+        author: signature.clone(),
+        committer: signature,
+        encoding: None,
+        message: "Old layout\n".into(),
+        extra_headers: Vec::new(),
+    };
+    let oid = repo.write_object(&commit).unwrap().detach();
+    for name in ["refs/heads/main", "refs/sharecraft/tree"] {
+        repo.reference(
+            name,
+            oid,
+            gix::refs::transaction::PreviousValue::Any,
+            "test",
+        )
+        .unwrap();
+    }
+}
+
+/// The message and author name of the commit at the tip of `main`.
+fn tip_commit(env: &Env) -> (String, String) {
+    let repo = gix::open(library(env.dir.path())).unwrap();
+    let tip = repo
+        .find_reference("refs/heads/main")
+        .unwrap()
+        .id()
+        .detach();
+    let commit = repo.find_commit(tip).unwrap();
+    (
+        String::from_utf8_lossy(commit.message_raw().unwrap()).into_owned(),
+        commit.author().unwrap().name.to_string(),
+    )
+}
+
+#[tokio::test]
+async fn old_layout_is_moved_before_the_reconcile() {
+    let env = Env::new().await;
+    let admin = env.user("Ada", true).await;
+    let (site, library) = env.site(&admin, "Team").await;
+    let folder = Uuid::new_v4();
+    let stamp = Stamp {
+        at: "2026-11-12T09:00:00Z".into(),
+        by: Author {
+            id: admin.id.0.to_string(),
+            name: "Ada".into(),
+        },
+    };
+    let old = TreeRecord {
+        schema: 1,
+        id: folder,
+        kind: "folder".into(),
+        parent: Some(library.0),
+        site: site.0,
+        name: "Old plans".into(),
+        created: stamp,
+        deleted: None,
+    };
+    write_flat(&env, std::slice::from_ref(&old));
+    let commits = env.commits();
+
+    let moved = tree::move_records(env.checkpointer()).await.unwrap();
+    assert_eq!(
+        moved.0,
+        TreeMove {
+            moved: 1,
+            duplicates: 0
+        }
+    );
+    assert_eq!(moved.to_string(), "1 records moved into sub-folders");
+    assert_eq!(env.commits(), commits + 1, "one commit");
+    assert_eq!(
+        tip_commit(&env),
+        (
+            "tree: move records into sub-folders\n".to_owned(),
+            "ShareCraft".to_owned()
+        )
+    );
+    let report = tree::reconcile(env.checkpointer(), env.db()).await.unwrap();
+    assert_eq!((report.nodes, report.updated), (3, 1));
+    assert_eq!(env.child(library, "Old plans").await, Some(NodeId(folder)));
+    env.assert_agree().await;
+
+    // A second start moves nothing and writes nothing.
+    let again = tree::move_records(env.checkpointer()).await.unwrap();
+    assert_eq!(again.0, TreeMove::default());
+    assert_eq!(again.to_string(), "no records to move into sub-folders");
+    assert_eq!(env.commits(), commits + 1);
 }
 
 #[tokio::test]

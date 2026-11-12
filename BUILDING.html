@@ -26,7 +26,7 @@ table.banded tbody tr:nth-child(even)>td{background:light-dark(#f4f8f7,#212b30)}
 </header>
 <div class="layout">
 <nav aria-label="Document contents"><p>In this document</p>
-<a href="#need">01 · What you need</a><a href="#build">02 · Build and check</a><a href="#admin">03 · The first administrator</a><a href="#run">04 · Run it and sign in</a><a href="#settings">05 · Settings</a><a href="#accounts">06 · Accounts and signing in</a><a href="#sharing">07 · Sharing and roles</a><a href="#removed">08 · What a removed person sees</a><a href="#data">09 · Where data is kept</a><a href="#index">10 · The revision index</a><a href="#events">11 · Events</a><a href="#stop">12 · Stopping the server, and notices</a><a href="#editors">13 · Building the editors</a><a href="#files">14 · Opening a file document</a><a href="#session">15 · File session, seat and saving</a><a href="#content">16 · Content routes</a><a href="#tree">17 · The content tree and routes</a><a href="#treegit">18 · The tree in Git and PostgreSQL</a><a href="#upgrade">19 · Upgrading</a><a href="#policy">20 · The editor pages' policy</a><a href="#limits">21 · Known limits</a><a href="#licences">22 · Licences</a>
+<a href="#need">01 · What you need</a><a href="#build">02 · Build and check</a><a href="#admin">03 · The first administrator</a><a href="#run">04 · Run it and sign in</a><a href="#settings">05 · Settings</a><a href="#accounts">06 · Accounts and signing in</a><a href="#sharing">07 · Sharing and roles</a><a href="#removed">08 · What a removed person sees</a><a href="#data">09 · Where data is kept</a><a href="#index">10 · The revision index</a><a href="#events">11 · Events</a><a href="#stop">12 · Stopping the server, and notices</a><a href="#editors">13 · Building the editors</a><a href="#files">14 · Opening a file document</a><a href="#session">15 · File session, seat and saving</a><a href="#content">16 · Content routes</a><a href="#tree">17 · The content tree and routes</a><a href="#treegit">18 · The tree in Git and PostgreSQL</a><a href="#upgrade">19 · Upgrading</a><a href="#policy">20 · The editor pages' policy</a><a href="#limits">21 · Known limits</a><a href="#scale">22 · A library of 100,000 files</a><a href="#licences">23 · Licences</a>
 </nav>
 <main id="main">
 <div class="toolbar"><span class="small">Standalone HTML · Print-ready · No external assets</span><button type="button" onclick="window.print()">Print / Save PDF</button></div>
@@ -60,6 +60,8 @@ table.banded tbody tr:nth-child(even)>td{background:light-dark(#f4f8f7,#212b30)}
 <p>This loads <code>.env</code> and then runs <code>cargo test</code> with whatever arguments you add, for example <code>cargo xtask test -p server</code>:</p>
 <pre><code>cargo xtask test</code></pre>
 <p><strong>The tests need <code>TEST_DATABASE_URL</code>.</strong> Every test that uses the database creates its own schema in that database, drops it afterwards, and also drops leftover test schemas more than an hour old. A test that needs the variable and finds it unset fails with a message saying so; it is never skipped. That is why you run the tests through <code>cargo xtask check</code> or <code>cargo xtask test</code>, which load <code>.env</code>, and not through plain <code>cargo test</code>.</p>
+<p>This loads <code>.env</code> and runs the scale tests, which plain test runs skip because they take minutes: a library of 100,000 files is loaded and the main operations on it are timed in a debug build (section 22). It prints each time and fails naming any time over its threshold:</p>
+<pre><code>cargo xtask scale</code></pre>
 <p>This builds the browser client and writes the page's script package to <code>web/pkg</code>. The folder is not kept in Git, so do this once after a fresh checkout and again after changing the browser client:</p>
 <pre><code>cargo xtask web</code></pre>
 <p>The scripts of the web pages (the <code>.js</code> files in <code>web</code>) have two automated test files. <code>web/common.test.mjs</code> tests the function that decides where to go after signing in, so that a crafted link cannot send someone to another site. <code>web/editor-host.test.mjs</code> tests the frame page's pure parts: telling a save from an export, the save queue, the status and banner wording and the two editor bridges, against stand-in editors. <code>cargo xtask check</code> runs them, and fails with a message saying so when Node.js is not installed; it never skips them. It also checks any installed editors against <code>editors.toml</code> (section 13). To run the page tests on their own:</p>
@@ -502,7 +504,7 @@ cargo xtask editors verify             # every installed editor matches editors.
 <p>The tree is recorded in the same repository as the documents (section 09), <strong>one JSON file per item</strong>, beside <code>docs/</code> on the <code>main</code> branch:</p>
 <ul>
 <li><code>docs/&lt;doc_id&gt;/content</code> and <code>docs/&lt;doc_id&gt;/meta.json</code>: as before.</li>
-<li><code>tree/&lt;node_id&gt;.json</code>: one item of the tree (a site, library, folder or file). The file is named after the item's identifier, which for a file is its document identifier.</li>
+<li><code>tree/&lt;xx&gt;/&lt;node_id&gt;.json</code>: one item of the tree (a site, library, folder or file). The file is named after the item's identifier, which for a file is its document identifier, and kept in the sub-folder named by the identifier's first two hexadecimal digits (<code>tree/3f/3f2a…json</code>), so <code>tree/</code> holds at most 256 sub-folders. A change to one item then rewrites only its own sub-folder of a few hundred entries, not a folder of every item: in a library of 100,000 files that is the difference between a rename taking well under a second and taking many. Servers before 12 November 2026 kept every record directly in <code>tree/</code>; the first start of a newer server moves them (section 19).</li>
 <li><code>refs/sharecraft/docs/&lt;doc_id&gt;</code>: the last commit that changed that document, as before.</li>
 <li><code>refs/sharecraft/tree</code>: the last commit that changed <code>tree/</code>.</li>
 </ul>
@@ -520,7 +522,7 @@ cargo xtask editors verify             # every installed editor matches editors.
 <p><code>kind</code> is <code>site</code>, <code>library</code>, <code>folder</code> or <code>document</code>. A deleted item is not removed from Git: its record stays with <code>deleted</code> set to the time and person, so its history is kept and its name is free again.</p>
 <p><strong>One change, one commit.</strong> Each create, rename, move or delete is one Git commit on <code>main</code>, credited to the person who made it. A change that touches several items writes them in the same commit: moving a folder to another site rewrites the <code>site</code> of everything below it. A tree commit does not move any document's ref, so a checkpoint of a file open at that moment is never refused because of it. To look at the tree with plain <code>git</code>, from the repository root (read only, as in section 09):</p>
 <pre><code>git --git-dir=data/libraries/00000000-0000-0000-0000-000000000001.git ls-tree main tree/
-git --git-dir=data/libraries/00000000-0000-0000-0000-000000000001.git show main:tree/&lt;node_id&gt;.json
+git --git-dir=data/libraries/00000000-0000-0000-0000-000000000001.git show main:tree/&lt;xx&gt;/&lt;node_id&gt;.json
 git --git-dir=data/libraries/00000000-0000-0000-0000-000000000001.git log refs/sharecraft/tree</code></pre>
 <p><strong>PostgreSQL mirrors it.</strong> After the commit, the server writes the same facts to PostgreSQL in one transaction with the event, and the pages read the tree from there. Git is the authority for the tree, as it is for documents. If the database refuses the change after the commit (the person's role changed meanwhile, or the name was taken), or fails before the change could be judged allowed, a second commit takes the change back in Git. If the database write fails after the change was judged allowed, the server tries to repair that item from Git, and if it cannot, it refuses further tree changes with <code>503 unavailable</code> until a repair of the whole tree succeeds. A take-back that cannot be written to Git also stops tree changes; it is written again before that repair, so a refused change never reaches PostgreSQL. A take-back still unwritten when the server stops is lost, and the next start copies the refused change from Git (see section 21). At every start the server compares every record in Git with its row and rewrites the rows that differ (section 19).</p>
 <p><strong>Permissions are not in Git.</strong> Who has access to what, and which items take it from above, is kept only in PostgreSQL, and every change of it is written to the event log: <code>access.granted</code>, <code>access.changed</code> and <code>access.revoked</code> (section 11), now for any item, not only documents. Tree changes are events too: <code>node.created</code>, <code>node.renamed</code>, <code>node.moved</code> and <code>node.deleted</code>, with <code>document.created</code> as before for a file, and <code>tree.adopted</code> once for an upgrade (section 19). Git alone can therefore give back the tree and the content, but not who may open them. This is why PostgreSQL needs its own backup (section 09). If PostgreSQL is lost and the database is empty, the next start rebuilds the tree from Git, and every enabled administrator becomes owner of each site that has no owner; they then share the items again.</p>
@@ -529,8 +531,10 @@ git --git-dir=data/libraries/00000000-0000-0000-0000-000000000001.git log refs/s
 <section id="upgrade"><h2>19 / Upgrading an installation that already has documents</h2>
 <p>Before the content tree, every document stood alone, with its own list of people. On the first start after upgrading, the server puts each existing document into the tree and moves its list of people onto it. <strong>Back up both stores first</strong> (section 09): the data folder and the PostgreSQL database.</p>
 <div class="note"><p><strong>Run <code>cargo xtask web</code> after every upgrade, before starting the server.</strong> The text editor's WebAssembly client in <code>web/pkg</code> is built from the source but not kept in Git, and <code>cargo xtask check</code> does not look at it, so an upgrade leaves the old one in place without any warning. An old client can misread what a newer server sends: one built before deleting files existed showed <strong>This document does not exist, or you do not have access to it.</strong> instead of <strong>This document was deleted.</strong> to people who had the file open.</p></div>
+<div class="note"><p><strong>Upgrading to a server from 12 November 2026 or later moves the tree records, one way.</strong> On its first start the server moves every record from <code>tree/&lt;node_id&gt;.json</code> into its sub-folder <code>tree/&lt;xx&gt;/&lt;node_id&gt;.json</code> (section 18), in one Git commit by <em>ShareCraft</em> with the message <code>tree: move records into sub-folders</code>. Only <code>refs/sharecraft/tree</code> moves with <code>main</code>; no document's ref does, and no document's content changes. An older server started on the repository afterwards would find no tree at all. <strong>Back up the data folder before upgrading</strong> (section 09), so that you can go back.</p></div>
 <h3>What the start does, in order</h3>
 <ol>
+<li><strong>Moves tree records into sub-folders.</strong> Only records still at their old place move; a later start finds none and writes nothing. A record found at both places, which should not happen, is kept from its sub-folder, and the start-up line says how many there were.</li>
 <li><strong>Reconciles the tree.</strong> Every <code>tree/</code> record in Git is compared with its row in PostgreSQL, and the rows that differ are written. On a first upgrade there are no records yet.</li>
 <li><strong>Adopts existing documents.</strong> This runs only if some document has no place in the tree, some grant is still recorded the old way (per document), or some site has no owner. Otherwise nothing is done.</li>
 <li><strong>Reconciles the revision index</strong> (section 10), as before.</li>
@@ -548,8 +552,8 @@ git --git-dir=data/libraries/00000000-0000-0000-0000-000000000001.git log refs/s
 <p>Until the server is started again with an administrator, the existing documents have no place in the tree and nobody can open them.</p>
 <h3>The start-up line</h3>
 <p>The server prints one line for the tree before the line for the revision index (section 10), and before it prints its address. After an upgrade it reads like this (the numbers are examples):</p>
-<pre><code>Reconciled the tree with Git: 0 nodes in Git, 0 updated, 0 failed; 12 documents adopted into Home, 3 renamed, 11 grants moved</code></pre>
-<p>On later starts it ends <code>; nothing to adopt</code>. When there is no enabled administrator it ends <code>; nothing adopted</code>, followed by the message above on standard error. Each node that could not be reconciled is listed on standard error with the reason, and the server still starts. If the tree cannot be read from Git at all, or the adoption fails for another reason, the server prints why and exits without printing its address.</p>
+<pre><code>Reconciled the tree with Git: no records to move into sub-folders; 0 nodes in Git, 0 updated, 0 failed; 12 documents adopted into Home, 3 renamed, 11 grants moved</code></pre>
+<p>The first clause says what the move did: <code>no records to move into sub-folders</code>, or for example <code>1250 records moved into sub-folders</code>, followed, if any record was at both places, by <code>, 2 found at both places kept from their sub-folders</code>. If the move cannot be written the server prints why and exits. On later starts the line ends <code>; nothing to adopt</code>. When there is no enabled administrator it ends <code>; nothing adopted</code>, followed by the message above on standard error. Each node that could not be reconciled is listed on standard error with the reason, and the server still starts. If the tree cannot be read from Git at all, or the adoption fails for another reason, the server prints why and exits without printing its address.</p>
 <p><strong>Anything that used <code>GET /api/docs</code></strong> to list documents must change: it now answers <code>405</code> (section 17).</p>
 </section>
 
@@ -577,7 +581,7 @@ base-uri 'none'; form-action 'none'</code></pre>
 <li><strong>Local connections only.</strong> The server will not listen on a non-loopback address and refuses connections that do not come from a page it served (section 04). Two people on two computers cannot use it together. Passwords must not cross a network without encryption, and encryption (TLS) is a separate piece of work.</li>
 <li><strong>Accounts are made by an administrator.</strong> There is no sign-up, and <strong>nobody can change their own password yet</strong>, nor reset a forgotten one.</li>
 <li><strong>No single sign-on, multi-factor sign-in, guests or groups.</strong> Access is a password account, granted to one person at a time on a site, library, folder or file.</li>
-<li><strong>Only the first part of sites and libraries.</strong> The tree and inherited access are built (sections 17 to 19). Not built yet: groups, sharing links, access requests, the inheritance explorer, a test with 100,000 files, branding, and metadata edited after creation.</li>
+<li><strong>Only the first part of sites and libraries.</strong> The tree and inherited access are built (sections 17 to 19). Not built yet: groups, sharing links, access requests, the inheritance explorer, branding, and metadata edited after creation. A library of 100,000 files is measured (section 22).</li>
 <li><strong>No page for events</strong> (section 11), and no way to see the document's saved revisions from the site: use Git (section 09).</li>
 <li><strong>One server process.</strong> Removal from live sessions is sent inside the process; running several server processes would need a different mechanism.</li>
 <li><strong>Large pastes go in pieces.</strong> One change can be at most 512 KiB as sent (section 05); a larger paste is refused with a message asking for smaller parts.</li>
@@ -591,13 +595,41 @@ base-uri 'none'; form-action 'none'</code></pre>
 </ul>
 </section>
 
-<section id="licences"><h2>22 / Licences</h2>
+<section id="scale"><h2>22 / A library of 100,000 files</h2>
+<p><code>cargo xtask scale</code> (section 02) runs two tests in <code>crates/server/tests/scale.rs</code> that plain test runs skip. Each loads a library with a folder of 100,000 files through a loader that exists only in the tests: the records written as one Git commit, the rows inserted in one database transaction, then the tables analysed as PostgreSQL's autovacuum soon would. The first test also loads a small library of 100 files for comparison and times each operation below over HTTP; the second, <code>large_library_break_while_open</code>, has a member editing a file in the folder while the library's inheritance is broken, checks that he keeps editing, that taking his group off the library removes him at once, and that restoring inheritance lets him back in, and that only the library itself changed (one new scope, three copied assignments): nothing is done per file.</p>
+<p>The thresholds are for a <strong>debug build</strong>, which is what the command runs. Every operation that does not read the whole tree is far under its threshold; the start-up reads all 100,000 records from Git and compares them with PostgreSQL. The bulk load writes 100,000 loose Git objects, which dominates its time; it has no threshold.</p>
+<p class="small">Measured on 12 November 2026: 12th Gen Intel Core i5-12600K (10 cores, 16 threads), 63.7 GB of memory, Windows 11 Pro 26H2 (build 26300), PostgreSQL on the same machine, debug build, SHA-1 and compression crates at <code>opt-level = 3</code> (the workspace <code>Cargo.toml</code>).</p>
+<div class="table-wrap"><table class="banded"><caption>Times measured with <code>cargo xtask scale</code></caption>
+<thead><tr><th>Operation</th><th>Time</th><th>Threshold</th></tr></thead>
+<tbody>
+<tr><td>Bulk load: 100,100 files (the large and small folders) in one Git commit and one database transaction</td><td>103,024 ms</td><td>none (test set-up)</td></tr>
+<tr><td>Bulk load: 100,000 files alone (second test)</td><td>87,428 ms</td><td>none (test set-up)</td></tr>
+<tr><td>Listing, first page of 100, as a member</td><td>11 ms</td><td>500 ms</td></tr>
+<tr><td>Listing, a middle page (after file 50,000)</td><td>5 ms</td><td>500 ms</td></tr>
+<tr><td>Break inheritance on the large library</td><td>16 ms</td><td>1 s</td></tr>
+<tr><td>Restore it</td><td>6 ms</td><td>1 s</td></tr>
+<tr><td>Break on the folder of 100,000 files</td><td>5 ms</td><td>1 s</td></tr>
+<tr><td>Restore it</td><td>8 ms</td><td>1 s</td></tr>
+<tr><td>Break on one file in that folder</td><td>8 ms</td><td>1 s</td></tr>
+<tr><td>Restore it</td><td>6 ms</td><td>1 s</td></tr>
+<tr><td>Break / restore on the small library (100 files)</td><td>6 ms / 6 ms</td><td>1 s</td></tr>
+<tr><td>Break / restore on its folder</td><td>6 ms / 6 ms</td><td>1 s</td></tr>
+<tr><td>Break / restore on one file in it</td><td>6 ms / 6 ms</td><td>1 s</td></tr>
+<tr><td>Break the large library while a member edits a file in it</td><td>23 ms</td><td>1 s</td></tr>
+<tr><td>Restore it, after taking the Members group off it</td><td>10 ms</td><td>1 s</td></tr>
+<tr><td>Explorer, page of 50 breaks among 100,000 files</td><td>15 ms</td><td>1 s</td></tr>
+<tr><td>Explorer counts with 50 breaks</td><td>4 ms</td><td>1 s</td></tr>
+<tr><td>Rename a file in the folder (one Git commit)</td><td>51 ms</td><td>2 s</td></tr>
+<tr><td>Server start-up: tree reconcile of 100,106 nodes, then the revisions</td><td>10,607 ms</td><td>60 s</td></tr>
+</tbody></table></div>
+</section>
+<section id="licences"><h2>23 / Licences</h2>
 <p>ShareCraft is licensed <strong>MIT OR Apache-2.0</strong>; the texts are in <code>LICENSE-MIT</code> and <code>LICENSE-APACHE</code>. <code>cargo xtask check</code> refuses any dependency whose licence has no non-copyleft option (GPL, LGPL, AGPL, MPL, EUPL, CDDL, SSPL).</p>
 <p>The <code>revisions</code> crate stores documents in Git using <code>gix</code> (gitoxide), a Git implementation written in Rust and licensed MIT or Apache 2.0. No C library is involved and no copyleft code is linked. Repositories it writes are ordinary Git repositories: the <code>git</code> command line reads them as usual.</p>
 <p>The four editors are licensed MIT or Apache 2.0, by their original authors. They are not part of ShareCraft's code and are not compiled into the server. The build tool copies each fork's licence, notice and attribution files into the installed editor's <code>licenses/</code> folder; what each fork changed is listed in its <code>NOTICE</code> and in <a href="editors.html">editors.html</a>.</p>
 </section>
 
-<footer>ShareCraft · ThineCraft · Building and running · Updated 11 November 2026<br>Describes the development build after the third Stage 1 plan (editors, one person at a time; merged into <code>main</code> on 10 November 2026) and the follow-up (editors keep their document when hosted), and the first Stage 2 plan (the content tree and inherited permissions; on the branch <code>platform-tree</code>, not yet merged). Not a release.</footer>
+<footer>ShareCraft · ThineCraft · Building and running · Updated 12 November 2026<br>Describes the development build after the third Stage 1 plan (editors, one person at a time; merged into <code>main</code> on 10 November 2026) and the follow-up (editors keep their document when hosted), and the first Stage 2 plan (the content tree and inherited permissions; on the branch <code>platform-tree</code>, not yet merged). Not a release.</footer>
 </main></div>
 </body>
 </html>

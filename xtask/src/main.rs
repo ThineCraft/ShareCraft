@@ -4,6 +4,8 @@
 //! - `check` loads `.env`, then runs the licence check, formatting, lints, tests, the
 //!   WebAssembly builds, the page script tests (with Node) and the check of installed editors;
 //! - `test` loads `.env`, then runs `cargo test` with the arguments given;
+//! - `scale` loads `.env`, then runs the ignored scale tests (a library of 100,000 files) in a
+//!   debug build, one at a time, printing the times they measure;
 //! - `editors <list|build|compress|verify>` builds an editor from its fork and installs it into
 //!   `editors/<id>`, with Brotli and gzip copies of its files; `compress` adds the copies to an
 //!   editor already installed.
@@ -26,8 +28,9 @@ fn main() -> ExitCode {
         Some("web") => web(),
         Some("check") => check(),
         Some("test") => test(std::env::args_os().skip(2)),
+        Some("scale") => scale(),
         Some("editors") => editors::dispatch(&std::env::args().skip(2).collect::<Vec<_>>()),
-        _ => Err("usage: cargo xtask <web|check|test|editors>".to_owned()),
+        _ => Err("usage: cargo xtask <web|check|test|scale|editors>".to_owned()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -75,6 +78,25 @@ fn test(args: impl Iterator<Item = OsString>) -> Result<()> {
     let root = workspace_root()?;
     load_env(&root)?;
     run(cargo(&root).arg("test").args(args))
+}
+
+/// Runs the scale tests in `crates/server/tests/scale.rs`, which are ignored by `cargo test`:
+/// in a debug build, as their thresholds assume, one at a time so their times do not mix,
+/// with their output shown.
+fn scale() -> Result<()> {
+    let root = workspace_root()?;
+    load_env(&root)?;
+    run(cargo(&root).args([
+        "test",
+        "-p",
+        "server",
+        "--test",
+        "scale",
+        "--",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1",
+    ]))
 }
 
 /// Loads `.env` from the workspace root into this process, and so into the commands it runs.

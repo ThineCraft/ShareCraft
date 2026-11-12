@@ -6,7 +6,7 @@ use std::time::Duration;
 use collab_core::ids::{DocId, Seq};
 use revisions::{
     Author, Checkpoint, CheckpointError, GitError, Outcome, RevisionId, RevisionInfo,
-    RevisionStore, Stored, TreeChange, TreeRecord,
+    RevisionStore, Stored, TreeChange, TreeMove, TreeRecord,
 };
 use serde_json::{Map, Value};
 use tokio::time::Instant;
@@ -89,6 +89,15 @@ pub trait Checkpointer: Send + Sync + 'static {
     fn read_tree_record(&self, _id: Uuid) -> Result<Option<TreeRecord>, CheckpointError> {
         Err(CheckpointError::Unsupported)
     }
+
+    /// Moves the tree records still at their places from before the sub-folders into them, in
+    /// one commit credited to `author`; nothing when there are none.
+    ///
+    /// # Errors
+    /// Whatever the store reports; `Unsupported` unless the implementation keeps a tree.
+    fn move_tree_records(&self, _author: &Author) -> Result<TreeMove, CheckpointError> {
+        Err(CheckpointError::Unsupported)
+    }
 }
 
 impl Checkpointer for RevisionStore {
@@ -134,6 +143,10 @@ impl Checkpointer for RevisionStore {
 
     fn read_tree_record(&self, id: Uuid) -> Result<Option<TreeRecord>, CheckpointError> {
         RevisionStore::read_tree_record(self, id)
+    }
+
+    fn move_tree_records(&self, author: &Author) -> Result<TreeMove, CheckpointError> {
+        RevisionStore::move_tree_records(self, author)
     }
 }
 

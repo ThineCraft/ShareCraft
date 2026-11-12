@@ -23,3 +23,14 @@ opt-level = 3
 
 [profile.dev.package.miniz_oxide]
 opt-level = 3
+
+# Git hashes every object it writes and reads with SHA-1 (collision-detecting), and compresses
+# each one; unoptimised, these dominate a tree of 100,000 records in a debug build.
+[profile.dev.package.sha1dc]
+opt-level = 3
+
+[profile.dev.package.gix-hash]
+opt-level = 3
+
+[profile.dev.package.zlib-rs]
+opt-level = 3

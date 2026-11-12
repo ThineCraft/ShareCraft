@@ -468,7 +468,8 @@ pub fn session_cookie(headers: &HeaderMap) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn config_at(data_dir: &Path, db: &TestDb) -> Config {
+/// The settings of a test server storing under `data_dir` and recording in `db`'s schema.
+pub fn config_at(data_dir: &Path, db: &TestDb) -> Config {
     Config {
         addr: "127.0.0.1:0".parse().unwrap(),
         data_dir: data_dir.to_path_buf(),

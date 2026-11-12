@@ -16,7 +16,7 @@ use records::{
     Access, AccessError, Db, DbError, Document, Editor, NewEvent, Node, NodeChange, NodeKind,
     NodeRow, Perms, User, validate_document_name, validate_node_name,
 };
-use revisions::{Author, CheckpointError, GitError, Stamp, TreeChange, TreeRecord};
+use revisions::{Author, CheckpointError, GitError, Stamp, TreeChange, TreeMove, TreeRecord};
 use serde_json::json;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -271,6 +271,43 @@ pub async fn create_document(
     db.document(id)
         .await?
         .ok_or_else(|| DbError::new("the new document was not recorded").into())
+}
+
+/// What moving the tree records into their sub-folders did, as the start-up line says it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Moved(pub TreeMove);
+
+impl fmt::Display for Moved {
+    /// One clause: how many records moved, and how many were found at both places.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let TreeMove { moved, duplicates } = self.0;
+        if moved == 0 && duplicates == 0 {
+            return f.write_str("no records to move into sub-folders");
+        }
+        write!(f, "{moved} records moved into sub-folders")?;
+        if duplicates > 0 {
+            write!(
+                f,
+                ", {duplicates} found at both places kept from their sub-folders"
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// Moves the tree records still at `tree/<id>.json`, where servers before the sub-folders
+/// wrote them, into `tree/<xx>/<id>.json`: one commit by "ShareCraft" that moves
+/// `refs/sharecraft/tree` and no document ref. Runs at start, before [`reconcile`]; a second
+/// start moves nothing. The move is one way: back up the library before upgrading.
+///
+/// # Errors
+/// The Git error (`Unsupported` for a store without a tree).
+pub async fn move_records(store: Arc<dyn Checkpointer>) -> Result<Moved, TreeError> {
+    let author = server_author();
+    let moved = tokio::task::spawn_blocking(move || store.move_tree_records(&author))
+        .await
+        .map_err(|e| CheckpointError::Git(GitError::new(e)))??;
+    Ok(Moved(moved))
 }
 
 /// Brings PostgreSQL's nodes up to date with Git: every record whose row is missing or

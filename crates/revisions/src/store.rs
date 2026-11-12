@@ -21,7 +21,7 @@ const SCHEMA: u32 = 1;
 /// Layout: branch `refs/heads/main`; content at `docs/<doc_id>/content`; metadata at
 /// `docs/<doc_id>/meta.json`; and `refs/sharecraft/docs/<doc_id>` pointing at the last commit
 /// that changed that document. The content tree is recorded beside the documents, one file per
-/// node at `tree/<node_id>.json`, with `refs/sharecraft/tree` pointing at the last commit that
+/// node at `tree/<first two hex digits of the id>/<node_id>.json`, with `refs/sharecraft/tree` pointing at the last commit that
 /// changed `tree/`.
 ///
 /// Checkpoints and tree changes are serialized through a mutex, so concurrent callers never race on `main`.

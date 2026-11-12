@@ -17,7 +17,7 @@ use serde_json::{Map, Value};
 
 pub use meta::{Author, Meta};
 pub use store::{RevisionStore, is_valid_author_name};
-pub use tree::{Stamp, TreeChange, TreeRecord};
+pub use tree::{Stamp, TREE_MOVE_MESSAGE, TreeChange, TreeMove, TreeRecord};
 
 /// A Git commit identifier: 40 lowercase hexadecimal characters.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

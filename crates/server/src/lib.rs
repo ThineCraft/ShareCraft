@@ -260,14 +260,15 @@ pub async fn serve(config: Config, listener: TcpListener) -> std::io::Result<()>
 
 /// The state of a server about to accept connections, storing documents in the library
 /// repository under `config.data_dir` (see [`library_path`]) and records in the database at
-/// `config.database_url`, whose schema it brings up to date first. It reconciles the content
+/// `config.database_url`, whose schema it brings up to date first. It moves tree records written
+/// before the sub-folders into them (see [`tree::move_records`]), reconciles the content
 /// tree in the database with Git (see [`tree::reconcile`]), adopts documents recorded before
 /// the tree (see [`tree::adopt_flat_documents`]), reconciles the revisions recorded in the
 /// database with Git (see [`reconcile`]), and prints one line with the counts of each.
 ///
 /// # Errors
 /// Returns an error if the database cannot be reached or migrated, if the library repository
-/// cannot be opened, created or listed, or if the tree cannot be read or the adoption fails (a
+/// cannot be opened, created or listed, or if the tree cannot be moved or read or the adoption fails (a
 /// missing administrator is only reported: the documents wait for a start with one).
 pub async fn prepare(config: Config) -> std::io::Result<AppState> {
     let db = Db::connect(config.database_url.expose())
@@ -284,15 +285,24 @@ pub async fn prepare(config: Config) -> std::io::Result<AppState> {
     .await
     .map_err(std::io::Error::other)??;
     let store: Arc<dyn Checkpointer> = Arc::new(opened);
+    let moved = tree::move_records(Arc::clone(&store)).await.map_err(|e| {
+        std::io::Error::other(format!(
+            "cannot move the tree records into sub-folders: {e}"
+        ))
+    })?;
     let tree_report = tree::reconcile(Arc::clone(&store), &db)
         .await
         .map_err(|e| std::io::Error::other(format!("cannot reconcile the content tree: {e}")))?;
     match tree::adopt_flat_documents(Arc::clone(&store), &db).await {
-        Ok(Some(adopted)) => println!("Reconciled the tree with Git: {tree_report}; {adopted}"),
-        Ok(None) => println!("Reconciled the tree with Git: {tree_report}; nothing to adopt"),
+        Ok(Some(adopted)) => {
+            println!("Reconciled the tree with Git: {moved}; {tree_report}; {adopted}");
+        }
+        Ok(None) => {
+            println!("Reconciled the tree with Git: {moved}; {tree_report}; nothing to adopt");
+        }
         // Nothing was written; the documents wait, unseen, for a start with an administrator.
         Err(e @ tree::TreeError::NoAdministrator) => {
-            println!("Reconciled the tree with Git: {tree_report}; nothing adopted");
+            println!("Reconciled the tree with Git: {moved}; {tree_report}; nothing adopted");
             eprintln!("sharecraft-server: existing documents not adopted: {e}");
         }
         Err(e) => {

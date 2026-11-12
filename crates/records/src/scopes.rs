@@ -140,6 +140,66 @@ pub(crate) const MANAGE_SITE_BIT: i32 = 32;
 const NODE_COLUMNS: &str = "n.id, n.kind, n.parent_id, n.site_id, n.name, n.unique_scope, \
      (n.deleted_at is not null) as deleted, n.created_by, n.created_at";
 
+/// The order of a folder's children, exactly as `nodes_children` (migration 0006) indexes it:
+/// folders (and libraries) before files, then by name ignoring case, then by id.
+const CHILD_ORDER: &str = "(case when n.kind = 'document' then 1 else 0 end), lower(n.name), n.id";
+
+/// The statement listing one page of `$2`'s children as `$1` sees them (`$3`: whether they are
+/// an administrator; `$4`: whether they have access to `$2`), at most `$5` rows; with `after`,
+/// only those after the cursor `($6, $7, $8)`, compared in [`CHILD_ORDER`], so that the page is
+/// a range scan of the index from the cursor.
+pub(crate) fn children_query(after: bool) -> String {
+    let from_cursor = if after {
+        format!("and ({CHILD_ORDER}) > ($6, lower($7), $8)")
+    } else {
+        String::new()
+    };
+    format!(
+        "with recursive {REACH} \
+         select {NODE_COLUMNS}, d.editor, d.revised_at, \
+                (case when n.kind = 'document' then 1 else 0 end)::int2 as kind_rank, \
+                g.perms, g.role_ids, g.role_names \
+         from nodes n \
+         {MINE_ON_N} \
+         left join documents d on d.id = n.id and n.kind = 'document' \
+         where n.parent_id = $2 and n.deleted_at is null {from_cursor} \
+           and ($3 \
+                or (case when n.unique_scope then g.perms is not null else $4 end) \
+                or n.id in (select id from reach)) \
+         order by {CHILD_ORDER} \
+         limit $5"
+    )
+}
+
+#[cfg(feature = "test-support")]
+impl Db {
+    /// The plan PostgreSQL chooses for the page of `parent`'s children after `after`, as
+    /// [`Db::children`] asks for it for `user` with access to `parent` (`admin`: whether they
+    /// are an administrator), one plan line per line. For tests of the listing's index.
+    pub async fn explain_children_page(
+        &self,
+        user: UserId,
+        parent: NodeId,
+        admin: bool,
+        after: &Cursor,
+        limit: u32,
+    ) -> Result<String, DbError> {
+        let query = format!("explain {}", children_query(true));
+        let lines: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(query))
+            .bind(user.0)
+            .bind(parent.0)
+            .bind(admin)
+            .bind(true)
+            .bind(i64::from(limit) + 1)
+            .bind(i32::from(after.kind_rank))
+            .bind(after.name.as_str())
+            .bind(after.id.0)
+            .fetch_all(self.pool())
+            .await?;
+        Ok(lines.join("\n"))
+    }
+}
+
 /// One step of a breadcrumb: a node from a site down, with the person's access to it (`None`
 /// where they have only limited access: access somewhere below).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -617,35 +677,33 @@ impl Db {
         // `chain` already refused a disabled or unknown account.
         let admin = standing(&mut conn, user).await? == Standing::Admin;
         let limit = limit.max(1);
-        let query = format!(
-            "with recursive {REACH} \
-             select {NODE_COLUMNS}, d.editor, d.revised_at, kinds.kind_rank, \
-                    g.perms, g.role_ids, g.role_names \
-             from nodes n \
-             cross join lateral (select (case when n.kind = 'document' then 1 else 0 end)::int2 \
-                                 as kind_rank) kinds \
-             {MINE_ON_N} \
-             left join documents d on d.id = n.id and n.kind = 'document' \
-             where n.parent_id = $2 and n.deleted_at is null \
-               and ($5::int2 is null \
-                    or (kinds.kind_rank, lower(n.name), n.id) > ($5, lower($6), $7)) \
-               and ($3 \
-                    or (case when n.unique_scope then g.perms is not null else $4 end) \
-                    or n.id in (select id from reach)) \
-             order by kinds.kind_rank, lower(n.name), n.id \
-             limit $8"
-        );
-        let rows = sqlx::query(sqlx::AssertSqlSafe(query))
-            .bind(user.0)
-            .bind(parent.0)
-            .bind(admin)
-            .bind(parent_access.is_some())
-            .bind(after.map(|c| c.kind_rank))
-            .bind(after.map(|c| c.name.as_str()))
-            .bind(after.map(|c| c.id.0))
-            .bind(i64::from(limit) + 1)
-            .fetch_all(&mut *conn)
-            .await?;
+        // The first page and the later ones are separate statements, so that a later page is a
+        // range scan of `nodes_children` from the cursor rather than a filter from the start.
+        let rows = match after {
+            None => {
+                sqlx::query(sqlx::AssertSqlSafe(children_query(false)))
+                    .bind(user.0)
+                    .bind(parent.0)
+                    .bind(admin)
+                    .bind(parent_access.is_some())
+                    .bind(i64::from(limit) + 1)
+                    .fetch_all(&mut *conn)
+                    .await?
+            }
+            Some(cursor) => {
+                sqlx::query(sqlx::AssertSqlSafe(children_query(true)))
+                    .bind(user.0)
+                    .bind(parent.0)
+                    .bind(admin)
+                    .bind(parent_access.is_some())
+                    .bind(i64::from(limit) + 1)
+                    .bind(i32::from(cursor.kind_rank))
+                    .bind(cursor.name.as_str())
+                    .bind(cursor.id.0)
+                    .fetch_all(&mut *conn)
+                    .await?
+            }
+        };
         let mut listed = Vec::with_capacity(rows.len());
         let mut ranks = Vec::with_capacity(rows.len());
         for row in &rows {
