@@ -317,7 +317,7 @@ fn validate_group_name(name: &str) -> Result<&str, AccessError> {
 /// Whether `user` manages the members of a group of `site` (`None` for an organisation group):
 /// an enabled administrator manages every group, and someone with `manage_site` on a site its
 /// groups.
-async fn manages(
+pub(crate) async fn manages(
     conn: &mut PgConnection,
     user: UserId,
     site: Option<NodeId>,
@@ -361,7 +361,7 @@ impl Db {
         id: GroupId,
     ) -> Result<Option<(Group, Vec<User>)>, DbError> {
         let mut conn = self.pool().acquire().await?;
-        let Some(group) = visible_groups(&mut conn, user, Some(id)).await?.pop() else {
+        let Some(group) = visible_groups(&mut conn, user, Some(&[id])).await?.pop() else {
             return Ok(None);
         };
         if !manages(&mut conn, user, group.site).await? {
@@ -681,12 +681,12 @@ async fn judge_membership(
     Ok(true)
 }
 
-/// The groups `user` may see (see [`Db::groups_visible_to`]), by name; only the group `only`
+/// The groups `user` may see (see [`Db::groups_visible_to`]), by name; only those among `only`
 /// when given.
-async fn visible_groups(
+pub(crate) async fn visible_groups(
     conn: &mut PgConnection,
     user: UserId,
-    only: Option<GroupId>,
+    only: Option<&[GroupId]>,
 ) -> Result<Vec<Group>, sqlx::Error> {
     let admin = match standing(&mut *conn, user).await? {
         Standing::Nobody => return Ok(Vec::new()),
@@ -699,7 +699,7 @@ async fn visible_groups(
                                          where m.perms & {MANAGE_ACCESS_BIT} <> 0 \
                                            and m.node_id in (select origin from live))) \
          select {GROUP_COLUMNS} from {GROUP_FROM} \
-         where ($3::uuid is null or g.id = $3) \
+         where ($3::uuid[] is null or g.id = any($3)) \
            and ($2 or ((select yes from manages) \
                        and (g.site_id is null or g.site_id in (select id from reach)))) \
          order by lower(gn.display_name), g.id"
@@ -707,7 +707,7 @@ async fn visible_groups(
     let rows = sqlx::query(sqlx::AssertSqlSafe(query))
         .bind(user.0)
         .bind(admin)
-        .bind(only.map(|g| g.0))
+        .bind(only.map(|ids| ids.iter().map(|g| g.0).collect::<Vec<Uuid>>()))
         .fetch_all(conn)
         .await?;
     rows.iter().map(group_from_row).collect()

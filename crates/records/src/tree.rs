@@ -32,7 +32,7 @@ pub enum NodeKind {
 }
 
 impl NodeKind {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             NodeKind::Site => "site",
             NodeKind::Library => "library",
@@ -41,7 +41,7 @@ impl NodeKind {
         }
     }
 
-    fn parse(text: &str) -> Option<NodeKind> {
+    pub(crate) fn parse(text: &str) -> Option<NodeKind> {
         match text {
             "site" => Some(NodeKind::Site),
             "library" => Some(NodeKind::Library),

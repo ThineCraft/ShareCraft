@@ -40,21 +40,43 @@ macro_rules! assigned {
     };
 }
 
+/// Whether an assignment, read through its unqualified columns `principal_kind` and
+/// `principal_id`, applies to the person `$who` (an SQL expression): it names them, or a group
+/// they are a member of. The one rule for which assignments apply to a person; [`mine!`] is
+/// built on it, and so is the explorer's preview of a restore, which asks it of many people.
+macro_rules! applies_to {
+    ($who:literal) => {
+        concat!(
+            "((principal_kind = 'user' and principal_id = ",
+            $who,
+            ") or (principal_kind = 'group' and principal_id in ( \
+                select gm.group_id from group_members gm where gm.user_id = ",
+            $who,
+            ")))"
+        )
+    };
+}
+pub(crate) use applies_to;
+
 /// "My assignments", the one place that says which assignments apply to a person: those naming
-/// the person `$1` and those naming a group they are a member of, each with its role. Everything that works out a person's access reads it: the chain, reach, sites and
-/// listings. Defines the CTEs `assigned` and `mine(node_id, role_id, role_name, perms)`.
+/// the person `$1` and those naming a group they are a member of (see [`applies_to!`]), each
+/// with its role. Everything that works out a person's access reads it: the chain, reach,
+/// sites, listings and the explorer. Defines the CTEs `assigned` and
+/// `mine(node_id, role_id, role_name, perms)`.
 macro_rules! mine {
     () => {
         concat!(
             assigned!(),
             ", mine(node_id, role_id, role_name, perms) as ( \
-                select node_id, role_id, role_name, perms from assigned \
-                where (principal_kind = 'user' and principal_id = $1) \
-                   or (principal_kind = 'group' and principal_id in ( \
-                           select gm.group_id from group_members gm where gm.user_id = $1)))"
+                select node_id, role_id, role_name, perms from assigned where ",
+            applies_to!("$1"),
+            ")"
         )
     };
 }
+
+/// The CTEs of [`mine!`], for a query to put after `with` (or `with recursive`).
+pub(crate) const MINE: &str = mine!();
 
 /// The nodes `$1` can reach through their assignments: every node at or above a scope where
 /// one of their assignments (see [`mine!`]) is, leaving out scopes with a deleted node at or
@@ -98,7 +120,7 @@ const CHAIN: &str = concat!(
 
 /// The access the person's assignments (see [`mine!`]) give on the node `n` of the enclosing
 /// query when it is a scope, as the columns [`Access::from_aggregate`] reads.
-const MINE_ON_N: &str = "\
+pub(crate) const MINE_ON_N: &str = "\
     left join lateral ( \
         select bit_or(m.perms) as perms, \
                array_agg(m.role_id order by m.role_id) as role_ids, \
@@ -106,7 +128,7 @@ const MINE_ON_N: &str = "\
         from mine m where m.node_id = n.id and n.unique_scope) g on true";
 
 /// Every assignment with its role (see [`assigned!`]), after `with`.
-const ASSIGNED: &str = assigned!();
+pub(crate) const ASSIGNED: &str = assigned!();
 
 /// The bit of `manage_access` in a `perms` column.
 pub(crate) const MANAGE_ACCESS_BIT: i32 = 16;
@@ -170,6 +192,18 @@ pub(crate) enum Standing {
     Admin,
 }
 
+impl Standing {
+    /// The standing of an account that is (`is_admin`) an administrator or not, and
+    /// (`enabled`) enabled or disabled.
+    pub(crate) fn of(is_admin: bool, enabled: bool) -> Standing {
+        match (is_admin, enabled) {
+            (_, false) => Standing::Nobody,
+            (true, true) => Standing::Admin,
+            (false, true) => Standing::Member,
+        }
+    }
+}
+
 pub(crate) async fn standing(
     conn: &mut PgConnection,
     user: UserId,
@@ -179,11 +213,28 @@ pub(crate) async fn standing(
             .bind(user.0)
             .fetch_optional(conn)
             .await?;
-    Ok(match row {
-        Some((true, true)) => Standing::Admin,
-        Some((false, true)) => Standing::Member,
-        _ => Standing::Nobody,
-    })
+    Ok(row.map_or(Standing::Nobody, |(admin, enabled)| {
+        Standing::of(admin, enabled)
+    }))
+}
+
+/// The one rule for a person's access to a node, given their `standing`: on a scope (`scope`),
+/// every permission for an administrator, nothing for a disabled account, and otherwise `own`,
+/// what their assignments on it give (see [`mine!`]); on any other node, `above`, their access
+/// to the node above it. [`chain`] walks it from the site down; the explorer walks it from the
+/// node it starts at.
+pub(crate) fn access_step(
+    standing: Standing,
+    scope: bool,
+    own: Option<Access>,
+    above: Option<Access>,
+) -> Option<Access> {
+    match standing {
+        Standing::Nobody => None,
+        Standing::Admin => Some(Access::administrator()),
+        Standing::Member if scope => own,
+        Standing::Member => above,
+    }
 }
 
 /// The chain from the site down to `node`, with `user`'s access to each node. `None` for a
@@ -198,11 +249,10 @@ pub(crate) async fn chain(
     user: UserId,
     node: NodeId,
 ) -> Result<Option<Vec<Link>>, sqlx::Error> {
-    let admin = match standing(conn, user).await? {
-        Standing::Nobody => return Ok(None),
-        Standing::Member => false,
-        Standing::Admin => true,
-    };
+    let standing = standing(conn, user).await?;
+    if standing == Standing::Nobody {
+        return Ok(None);
+    }
     let rows = sqlx::query(CHAIN)
         .bind(user.0)
         .bind(node.0)
@@ -250,11 +300,12 @@ pub(crate) async fn chain(
             .into_iter()
             .rev()
             .map(|(node, given)| {
-                if admin {
-                    role = Some(Access::administrator());
-                } else if node.unique_scope {
-                    role = Access::union_of(given);
-                }
+                role = access_step(
+                    standing,
+                    node.unique_scope,
+                    Access::union_of(given),
+                    role.take(),
+                );
                 Link {
                     node,
                     role: role.clone(),
@@ -291,7 +342,7 @@ async fn in_reach(
 
 /// The index in `links` of the nearest scope at or above the last node; with `above`, strictly
 /// above it. The last node itself when there is none (a site has nothing above).
-fn source_index(links: &[Link], above: bool) -> usize {
+pub(crate) fn source_index(links: &[Link], above: bool) -> usize {
     let last = links.len().saturating_sub(1);
     let searched = if above {
         links.get(..last).unwrap_or_default()
@@ -325,7 +376,7 @@ pub(crate) fn judged_roles(links: &[Link]) -> impl Iterator<Item = String> + '_ 
 
 /// `NotFound` unless the chain exists and its person has access to the last node, `Forbidden`
 /// unless that access includes `manage_access`.
-fn manager(links: Option<Vec<Link>>) -> Result<Vec<Link>, AccessError> {
+pub(crate) fn manager(links: Option<Vec<Link>>) -> Result<Vec<Link>, AccessError> {
     let links = links.ok_or(AccessError::NotFound)?;
     match links.last().and_then(|link| link.role.as_ref()) {
         None => Err(AccessError::NotFound),
@@ -339,7 +390,7 @@ fn document_of(node: &Node) -> Option<DocId> {
     (node.kind == NodeKind::Document).then_some(DocId(node.id.0))
 }
 
-fn crumb(link: &Link) -> Crumb {
+pub(crate) fn crumb(link: &Link) -> Crumb {
     Crumb {
         id: link.node.id,
         kind: link.node.kind,

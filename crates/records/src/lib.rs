@@ -7,6 +7,7 @@ mod adoption;
 mod db;
 mod documents;
 mod events;
+mod explorer;
 mod groups;
 mod revisions;
 mod roles;
@@ -22,6 +23,9 @@ pub use adoption::{Adoption, Unplaced};
 pub use db::{Db, DbError};
 pub use documents::{AccessError, Document, Editor, Grant, validate_document_name};
 pub use events::{Event, NewEvent};
+pub use explorer::{
+    AssignmentView, Break, ExplorerFilter, PrincipalView, RestorePreview, UserRef, breaks_csv,
+};
 pub use groups::{Group, SiteGroup};
 pub use revisions::{RevisionRecord, RevisionRow};
 pub use roles::{Access, Perms, Principal, RoleDef, RoleRef};

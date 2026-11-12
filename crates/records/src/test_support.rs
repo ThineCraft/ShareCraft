@@ -141,3 +141,26 @@ async fn drop_stale_schemas(db: &Db, now: u64) {
         }
     }
 }
+
+/// [`Db::breaks`] on `conn`, so that a test can measure what it reads within its own
+/// transaction.
+pub async fn breaks_on(
+    conn: &mut sqlx::PgConnection,
+    viewer: collab_core::ids::UserId,
+    root: collab_core::ids::NodeId,
+    filter: &crate::ExplorerFilter,
+    after: Option<&str>,
+    limit: u32,
+) -> Result<Option<(Vec<crate::Break>, Option<String>)>, crate::DbError> {
+    crate::explorer::breaks_in(conn, viewer, root, filter, after, limit).await
+}
+
+/// [`Db::break_counts`] on `conn`, so that a test can measure what it reads within its own
+/// transaction.
+pub async fn break_counts_on(
+    conn: &mut sqlx::PgConnection,
+    viewer: collab_core::ids::UserId,
+    parent: collab_core::ids::NodeId,
+) -> Result<Vec<(collab_core::ids::NodeId, i64)>, crate::DbError> {
+    crate::explorer::break_counts_in(conn, viewer, parent).await
+}
