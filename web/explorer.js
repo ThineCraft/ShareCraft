@@ -16,6 +16,7 @@ import {
   h,
   inheritAgainMessage,
   messageFor,
+  offerRequest,
   pageFor,
   permsText,
   previewView,
@@ -44,7 +45,10 @@ setupTopbar(me, error);
 const rootId = queryId(location.search, 'root');
 if (!rootId) fail(MISSING);
 const here = await showCrumbs($('crumbs'), rootId, { linkLast: false });
-if (!here) fail(MISSING);
+if (!here) {
+  offerRequest(error, rootId);
+  fail(MISSING);
+}
 const rootNode = here.path[here.path.length - 1];
 if (!can(here.access, 'manage_access')) fail('Only people who manage access here can use the explorer.');
 $('title').textContent = `Inheritance explorer: ${rootNode.name}`;

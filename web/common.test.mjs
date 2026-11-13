@@ -12,6 +12,7 @@ import {
   linkRoleChoices,
   liveLinks,
   requestDecisionText,
+  requestAnswer,
   requestProblem,
   withChosen,
   breadcrumbParts,
@@ -567,4 +568,14 @@ test('every new error code has its own sentence', () => {
   }
   assert.equal(LINK_NOT_WORKING, 'This link does not work. It may have expired or been turned off.');
   assert.equal(ANYONE_NOTICE, 'This address is shown only now. If you lose it, make a new link.');
+});
+
+test('a request is answered the same whatever the server said, except for the two limits', () => {
+  assert.equal(requestAnswer(null), REQUEST_SENT);
+  for (const code of ['not_found', 'forbidden', 'network', 'unavailable', 'unknown', 'link_not_found']) {
+    assert.equal(requestAnswer(code), REQUEST_SENT, code);
+  }
+  assert.equal(requestAnswer('too_many_requests'), messageFor('too_many_requests'));
+  assert.equal(requestAnswer('message_too_long'), messageFor('message_too_long'));
+  assert.notEqual(messageFor('too_many_requests'), REQUEST_SENT);
 });

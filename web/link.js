@@ -1,14 +1,32 @@
 // The landing page of a sharing link. It works without an account and without the other pages'
 // session code: an anyone link shows the shared item (a file to download or read, or a folder to
 // browse) and nothing else; a signed-in link asks the visitor to confirm before joining it.
-// The address holds the token: it is never written to the console, the title or storage.
+// The token is in the landing page's own address and nowhere else. A signed-out visitor sent to
+// sign in has it kept in sessionStorage for the trip (sign-in returns to /link.html, which holds
+// no token); it is removed as soon as it is read.
 
 import { LINK_NOT_WORKING, formatTime, h, messageFor, safeNext, seg, showMessage } from './common.js';
 
 const $ = (id) => document.getElementById(id);
 const PAGE = 50;
 
-const token = /^\/l\/([0-9a-f]{64})\/?$/.exec(location.pathname)?.[1] ?? '';
+const STASH = 'sharecraft-link';
+const TOKEN = /^[0-9a-f]{64}$/;
+
+/** The token in this page's address, or else the one kept for the sign-in trip (and forgotten). */
+function readToken() {
+  const own = /^\/l\/([0-9a-f]{64})\/?$/.exec(location.pathname)?.[1];
+  let kept = '';
+  try {
+    kept = sessionStorage.getItem(STASH) ?? '';
+    sessionStorage.removeItem(STASH);
+  } catch {
+    kept = '';
+  }
+  return own ?? (TOKEN.test(kept) ? kept : '');
+}
+
+const token = readToken();
 const base = `/api/l/${token}`;
 
 /** One call to the link routes. Never throws; unlike the pages' `api`, a 401 is not sent to sign in. */
@@ -60,8 +78,15 @@ if (!token) {
 
 function showSignInFirst() {
   only('signin');
-  // The person comes back to this address after signing in.
-  $('signin-link').href = `/signin.html?next=${encodeURIComponent(location.pathname)}`;
+  // The person comes back to /link.html after signing in; the token travels in sessionStorage,
+  // never in another address.
+  let kept = true;
+  try {
+    sessionStorage.setItem(STASH, token);
+  } catch {
+    kept = false;
+  }
+  $('signin-link').href = kept ? `/signin.html?next=${encodeURIComponent('/link.html')}` : '/signin.html';
 }
 
 function showSignedIn(link) {

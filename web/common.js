@@ -604,6 +604,15 @@ export const ANYONE_NOTICE = 'This address is shown only now. If you lose it, ma
 /** What every request for access is answered with, whether or not the item exists. */
 export const REQUEST_SENT = 'If this item exists, the people who manage it will see your request.';
 
+/**
+ * What a request for access shows after the server's answer `error` (null when it was accepted).
+ * Only the two limits have sentences of their own; every other outcome, a network failure
+ * included, reads as the accepted answer, so the page can never reveal whether the item exists.
+ */
+export function requestAnswer(error) {
+  return error === 'too_many_requests' || error === 'message_too_long' ? messageFor(error) : REQUEST_SENT;
+}
+
 /** The longest message with a request for access, or reply to one, in characters. */
 export const REQUEST_MAX = 500;
 
@@ -725,7 +734,8 @@ export function offerRequest(after, id) {
     const message = area.value.trim();
     const answer = await api('POST', `/nodes/${seg(id)}/requests`, message ? { message } : {});
     send.disabled = false;
-    if (!answer.ok) return showMessage(problem, messageFor(answer.error));
+    const shown = requestAnswer(answer.ok ? null : answer.error);
+    if (shown !== REQUEST_SENT) return showMessage(problem, shown);
     form.replaceChildren(h('p', { role: 'status' }, REQUEST_SENT));
   });
   after.after(form);
