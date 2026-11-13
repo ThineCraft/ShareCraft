@@ -159,6 +159,18 @@ pub enum AccessError {
     /// A link's expiry must be in the future.
     #[error("that expiry has already passed")]
     ExpiryInPast,
+    /// The access request was decided already, by someone else or because its item was
+    /// deleted.
+    #[error("that request has already been decided")]
+    AlreadyDecided,
+    /// Approving would give the requester nothing: their access already covers the role, or
+    /// the role would replace an assignment of theirs that gives more. Approval never
+    /// downgrades anyone.
+    #[error("they already have that access")]
+    AlreadyHas,
+    /// A reply to an access request is at most 500 characters.
+    #[error("that message is too long")]
+    MessageTooLong,
     /// An unknown setting, or a value of the wrong type or out of range for it.
     #[error("that is not a valid setting")]
     InvalidSetting,

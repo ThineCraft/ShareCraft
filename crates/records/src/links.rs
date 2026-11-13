@@ -971,6 +971,48 @@ impl Db {
         Ok(Some((listed, next)))
     }
 
+    /// Revokes, by `actor` and for the reason `item deleted`, every live link giving the role
+    /// `role` on an item with a deleted node at or above it (see [`DEAD`]): such a link grants
+    /// nothing, and deleting the role must not leave it without one. Each link in its own
+    /// transaction, locked as the expiry sweeper locks one (the item's chain, the link's row,
+    /// its group), and found dead again under the locks. The caller has checked that `actor` is
+    /// an administrator.
+    pub(crate) async fn revoke_dead_links_of_role(
+        &self,
+        actor: UserId,
+        role: &str,
+    ) -> Result<(), AccessError> {
+        let query = format!(
+            "with recursive held(node_id) as (                  select node_id from links where role_id = $1 and revoked_at is null), {DEAD}              select l.id, l.node_id, l.group_id from links l              where l.role_id = $1 and l.revoked_at is null                and l.node_id in (select origin from dead)              order by l.id"
+        );
+        let doomed: Vec<(Uuid, Uuid, Option<Uuid>)> = sqlx::query_as(sqlx::AssertSqlSafe(query))
+            .bind(role)
+            .fetch_all(self.pool())
+            .await?;
+        let still_dead = format!(
+            "with recursive held(node_id) as (select $1::uuid), {DEAD}              select exists (select 1 from dead)"
+        );
+        for (link, node, group) in doomed {
+            let mut tx = self.pool().begin().await?;
+            lock_top_down(&mut tx, &[NodeId(node)], false).await?;
+            sqlx::query("select id from links where id = $1 for update")
+                .bind(link)
+                .execute(&mut *tx)
+                .await?;
+            lock_groups(&mut tx, [], group.map(GroupId)).await?;
+            // Nothing is ever undeleted, but the check is cheap and keeps the rule local.
+            let dead: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(still_dead.clone()))
+                .bind(node)
+                .fetch_one(&mut *tx)
+                .await?;
+            if dead {
+                revoke_locked(&mut tx, Some(actor), link, "item deleted").await?;
+            }
+            tx.commit().await?;
+        }
+        Ok(())
+    }
+
     /// The live links whose expiry is at or before `now`, oldest expiry first, read without
     /// locks: the expiry sweeper revokes each with [`Db::revoke_link`] (no actor, reason
     /// `expired`), one link per transaction.

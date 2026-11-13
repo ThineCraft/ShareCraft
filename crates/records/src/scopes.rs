@@ -488,6 +488,22 @@ async fn in_reach(
         .await
 }
 
+/// [`Db::path`], on `conn`.
+pub(crate) async fn path_in(
+    conn: &mut PgConnection,
+    user: UserId,
+    node: NodeId,
+) -> Result<Option<Vec<Crumb>>, sqlx::Error> {
+    let Some(links) = chain(conn, user, node).await? else {
+        return Ok(None);
+    };
+    let has_access = links.last().and_then(|link| link.role.as_ref()).is_some();
+    if !has_access && !in_reach(conn, user, node).await? {
+        return Ok(None);
+    }
+    Ok(Some(links.iter().map(crumb).collect()))
+}
+
 /// The index in `links` of the nearest scope at or above the last node; with `above`, strictly
 /// above it. The last node itself when there is none (a site has nothing above).
 pub(crate) fn source_index(links: &[Link], above: bool) -> usize {
@@ -585,7 +601,7 @@ pub(crate) async fn break_locked(
 }
 
 /// The role `principal`'s assignment on scope `node` gives, with its permissions, if any.
-async fn assignment_on(
+pub(crate) async fn assignment_on(
     conn: &mut PgConnection,
     node: NodeId,
     principal: Principal,
@@ -694,14 +710,7 @@ impl Db {
     /// below it).
     pub async fn path(&self, user: UserId, node: NodeId) -> Result<Option<Vec<Crumb>>, DbError> {
         let mut conn = self.pool().acquire().await?;
-        let Some(links) = chain(&mut conn, user, node).await? else {
-            return Ok(None);
-        };
-        let has_access = links.last().and_then(|link| link.role.as_ref()).is_some();
-        if !has_access && !in_reach(&mut conn, user, node).await? {
-            return Ok(None);
-        }
-        Ok(Some(links.iter().map(crumb).collect()))
+        Ok(path_in(&mut conn, user, node).await?)
     }
 
     /// The sites `user` can see, by name: those they have access to, and those where they have
@@ -894,131 +903,9 @@ impl Db {
         let (mut tx, links, _) = self
             .lock_chain(actor, node, false, role, group, false)
             .await?;
-        let links = manager(Some(links))?;
-        match principal {
-            Principal::User(user) => {
-                let exists: Option<bool> =
-                    sqlx::query_scalar("select true from users where id = $1")
-                        .bind(user.0)
-                        .fetch_optional(&mut *tx)
-                        .await?;
-                if exists.is_none() {
-                    return Err(AccessError::NoSuchUser);
-                }
-            }
-            // Locked `FOR SHARE` by `lock_chain`, so it cannot be deleted before the commit.
-            Principal::Group(group) => {
-                let purpose: Option<Option<String>> =
-                    sqlx::query_scalar("select purpose from groups where id = $1")
-                        .bind(group.0)
-                        .fetch_optional(&mut *tx)
-                        .await?;
-                match purpose {
-                    None => return Err(AccessError::NoSuchGroup),
-                    Some(Some(purpose)) if purpose == "link" => {
-                        return Err(AccessError::LinkGroup);
-                    }
-                    Some(_) => {}
-                }
-            }
-        }
-        let new = match role {
-            Some(id) => Some(
-                role_by_id(&mut tx, id)
-                    .await?
-                    .ok_or(AccessError::NoSuchRole)?,
-            ),
-            None => None,
-        };
-        let (Some(target), Some(source)) = (links.last(), links.get(source_index(&links, false)))
-        else {
-            return Err(AccessError::NotFound);
-        };
-        if let (Some(new), Some(held)) = (&new, &target.role)
-            && !held.perms.contains(new.perms)
-        {
-            return Err(AccessError::BeyondYourAccess);
-        }
-        let current = assignment_on(&mut tx, source.node.id, principal).await?;
-        let before = current.as_ref().map(|(role, _)| role.clone());
-        let after = new.as_ref().map(RoleDef::role_ref);
-        if before.as_ref().map(|r| &r.id) == after.as_ref().map(|r| &r.id) {
-            return Ok((before.clone(), before));
-        }
-        if !target.node.unique_scope {
-            break_locked(&mut tx, actor, &target.node, source.node.id).await?;
-        }
-        let was_manager = current
-            .as_ref()
-            .is_some_and(|(_, perms)| perms.contains(Perms::MANAGE_ACCESS));
-        let stays_manager = new
-            .as_ref()
-            .is_some_and(|r| r.perms.contains(Perms::MANAGE_ACCESS));
-        if was_manager && !stays_manager && managers_on(&mut tx, node).await? <= 1 {
-            return Err(AccessError::LastManager);
-        }
-        let (kind, detail) = match (&before, &after) {
-            (None, Some(new)) => {
-                sqlx::query(
-                    "insert into assignments \
-                         (node_id, principal_kind, principal_id, role_id, granted_by) \
-                     values ($1, $2, $3, $4, $5)",
-                )
-                .bind(node.0)
-                .bind(principal.kind())
-                .bind(principal.id())
-                .bind(&new.id)
-                .bind(actor.0)
-                .execute(&mut *tx)
-                .await?;
-                ("access.granted", json!({ "role": new.id }))
-            }
-            (Some(old), Some(new)) => {
-                sqlx::query(
-                    "update assignments set role_id = $4, granted_by = $5, granted_at = now() \
-                     where node_id = $1 and principal_kind = $2 and principal_id = $3",
-                )
-                .bind(node.0)
-                .bind(principal.kind())
-                .bind(principal.id())
-                .bind(&new.id)
-                .bind(actor.0)
-                .execute(&mut *tx)
-                .await?;
-                ("access.changed", json!({ "from": old.id, "to": new.id }))
-            }
-            (Some(old), None) => {
-                sqlx::query(
-                    "delete from assignments \
-                     where node_id = $1 and principal_kind = $2 and principal_id = $3",
-                )
-                .bind(node.0)
-                .bind(principal.kind())
-                .bind(principal.id())
-                .execute(&mut *tx)
-                .await?;
-                ("access.revoked", json!({ "role": old.id }))
-            }
-            (None, None) => return Ok((None, None)),
-        };
-        let subject = match principal {
-            Principal::User(user) => Some(user),
-            Principal::Group(_) => None,
-        };
-        record(
-            &mut tx,
-            NewEvent {
-                kind,
-                actor: Some(actor),
-                subject,
-                document: document_of(&target.node),
-                node: Some(node),
-                detail: with_principal(principal, detail),
-            },
-        )
-        .await?;
+        let changed = assign_locked(&mut tx, actor, node, links, principal, role).await?;
         tx.commit().await?;
-        Ok((before, after))
+        Ok(changed)
     }
 
     /// Makes `node` a scope of its own, starting with a copy of the assignments it inherited.
@@ -1236,9 +1123,146 @@ impl Db {
     }
 }
 
+/// The part of [`Db::set_node_access`] after its locks: gives `principal` the role `role` on
+/// `node` (or removes their assignment), judged by `links`, `actor`'s locked chain to `node`,
+/// on `tx`, which the caller commits. `NotFound` or `Forbidden` unless `actor` manages access
+/// there; the other refusals as [`Db::set_node_access`] answers them.
+pub(crate) async fn assign_locked(
+    tx: &mut PgConnection,
+    actor: UserId,
+    node: NodeId,
+    links: Vec<Link>,
+    principal: Principal,
+    role: Option<&str>,
+) -> Result<(Option<RoleRef>, Option<RoleRef>), AccessError> {
+    let links = manager(Some(links))?;
+    match principal {
+        Principal::User(user) => {
+            let exists: Option<bool> = sqlx::query_scalar("select true from users where id = $1")
+                .bind(user.0)
+                .fetch_optional(&mut *tx)
+                .await?;
+            if exists.is_none() {
+                return Err(AccessError::NoSuchUser);
+            }
+        }
+        // Locked `FOR SHARE` by `lock_chain`, so it cannot be deleted before the commit.
+        Principal::Group(group) => {
+            let purpose: Option<Option<String>> =
+                sqlx::query_scalar("select purpose from groups where id = $1")
+                    .bind(group.0)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            match purpose {
+                None => return Err(AccessError::NoSuchGroup),
+                Some(Some(purpose)) if purpose == "link" => {
+                    return Err(AccessError::LinkGroup);
+                }
+                Some(_) => {}
+            }
+        }
+    }
+    let new = match role {
+        Some(id) => Some(
+            role_by_id(&mut *tx, id)
+                .await?
+                .ok_or(AccessError::NoSuchRole)?,
+        ),
+        None => None,
+    };
+    let (Some(target), Some(source)) = (links.last(), links.get(source_index(&links, false)))
+    else {
+        return Err(AccessError::NotFound);
+    };
+    if let (Some(new), Some(held)) = (&new, &target.role)
+        && !held.perms.contains(new.perms)
+    {
+        return Err(AccessError::BeyondYourAccess);
+    }
+    let current = assignment_on(&mut *tx, source.node.id, principal).await?;
+    let before = current.as_ref().map(|(role, _)| role.clone());
+    let after = new.as_ref().map(RoleDef::role_ref);
+    if before.as_ref().map(|r| &r.id) == after.as_ref().map(|r| &r.id) {
+        return Ok((before.clone(), before));
+    }
+    if !target.node.unique_scope {
+        break_locked(&mut *tx, actor, &target.node, source.node.id).await?;
+    }
+    let was_manager = current
+        .as_ref()
+        .is_some_and(|(_, perms)| perms.contains(Perms::MANAGE_ACCESS));
+    let stays_manager = new
+        .as_ref()
+        .is_some_and(|r| r.perms.contains(Perms::MANAGE_ACCESS));
+    if was_manager && !stays_manager && managers_on(&mut *tx, node).await? <= 1 {
+        return Err(AccessError::LastManager);
+    }
+    let (kind, detail) = match (&before, &after) {
+        (None, Some(new)) => {
+            sqlx::query(
+                "insert into assignments \
+                     (node_id, principal_kind, principal_id, role_id, granted_by) \
+                 values ($1, $2, $3, $4, $5)",
+            )
+            .bind(node.0)
+            .bind(principal.kind())
+            .bind(principal.id())
+            .bind(&new.id)
+            .bind(actor.0)
+            .execute(&mut *tx)
+            .await?;
+            ("access.granted", json!({ "role": new.id }))
+        }
+        (Some(old), Some(new)) => {
+            sqlx::query(
+                "update assignments set role_id = $4, granted_by = $5, granted_at = now() \
+                 where node_id = $1 and principal_kind = $2 and principal_id = $3",
+            )
+            .bind(node.0)
+            .bind(principal.kind())
+            .bind(principal.id())
+            .bind(&new.id)
+            .bind(actor.0)
+            .execute(&mut *tx)
+            .await?;
+            ("access.changed", json!({ "from": old.id, "to": new.id }))
+        }
+        (Some(old), None) => {
+            sqlx::query(
+                "delete from assignments \
+                 where node_id = $1 and principal_kind = $2 and principal_id = $3",
+            )
+            .bind(node.0)
+            .bind(principal.kind())
+            .bind(principal.id())
+            .execute(&mut *tx)
+            .await?;
+            ("access.revoked", json!({ "role": old.id }))
+        }
+        (None, None) => return Ok((None, None)),
+    };
+    let subject = match principal {
+        Principal::User(user) => Some(user),
+        Principal::Group(_) => None,
+    };
+    record(
+        &mut *tx,
+        NewEvent {
+            kind,
+            actor: Some(actor),
+            subject,
+            document: document_of(&target.node),
+            node: Some(node),
+            detail: with_principal(principal, detail),
+        },
+    )
+    .await?;
+    Ok((before, after))
+}
+
 /// How far up a walk for [`lock_top_down`] goes before it stops: deeper than any real tree,
 /// and an end for a walk that the data turned into a cycle.
-const MAX_DEPTH: i32 = 10_000;
+pub(crate) const MAX_DEPTH: i32 = 10_000;
 
 /// Locks the existing nodes among `ids`, each once, in the one order for locking several nodes
 /// that are not one chain: by site, then ancestors before descendants (by depth from the

@@ -10,6 +10,7 @@ mod events;
 mod explorer;
 mod groups;
 mod links;
+mod requests;
 mod revisions;
 mod roles;
 mod scopes;
@@ -31,6 +32,9 @@ pub use explorer::{
 };
 pub use groups::{Group, SiteGroup};
 pub use links::{AnyoneGrant, Link, LinkError, LinkKind, LinkToken};
+pub use requests::{
+    AccessRequest, MyRequest, REQUEST_MESSAGE_MAX, REQUESTS_PER_DAY, RequestDecision, RequestError,
+};
 pub use revisions::{RevisionRecord, RevisionRow};
 pub use roles::{Access, Perms, Principal, RoleDef, RoleRef};
 pub use scopes::{Crumb, Cursor, Listed, NodeAccess};

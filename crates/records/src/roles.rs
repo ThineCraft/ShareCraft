@@ -529,12 +529,10 @@ impl Db {
             perms.contains(Perms::MANAGE_ACCESS) || perms.contains(Perms::MANAGE_SITE)
         };
         if manages(after.perms) && !manages(before.perms) {
-            let linked: bool = sqlx::query_scalar(
-                "select exists (select 1 from links where role_id = $1 and revoked_at is null)",
-            )
-            .bind(id)
-            .fetch_one(&mut *tx)
-            .await?;
+            let linked: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(live_linked()))
+                .bind(id)
+                .fetch_one(&mut *tx)
+                .await?;
             if linked {
                 return Err(AccessError::LinkRoleTooHigh);
             }
@@ -582,6 +580,14 @@ impl Db {
     /// above them grant nothing and are deleted with it, each recording `access.revoked` with
     /// the reason `role deleted`. Records `role.deleted`.
     pub async fn delete_role(&self, actor: UserId, id: &str) -> Result<(), AccessError> {
+        // A live link under a deleted item grants nothing, but deleting its role would leave it
+        // with none: such links are revoked first (reason `item deleted`), each in its own
+        // transaction in the one locking order, before the role's row is locked.
+        {
+            let mut conn = self.pool().acquire().await?;
+            require_admin(&mut conn, actor).await?;
+        }
+        self.revoke_dead_links_of_role(actor, id).await?;
         let mut tx = self.pool().begin().await?;
         require_admin(&mut tx, actor).await?;
         let role = locked_custom_role(&mut tx, id).await?;
@@ -592,13 +598,19 @@ impl Db {
             .bind(id)
             .fetch_one(&mut *tx)
             .await?;
-        let linked: bool = sqlx::query_scalar(
+        let linked: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(live_linked()))
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+        // Live links under deleted items were revoked above; one made since (a link made as
+        // its item's ancestor was deleted) would lose its role, so it waits for another try.
+        let any_linked: bool = sqlx::query_scalar(
             "select exists (select 1 from links where role_id = $1 and revoked_at is null)",
         )
         .bind(id)
         .fetch_one(&mut *tx)
         .await?;
-        if in_use || linked {
+        if in_use || linked || any_linked {
             return Err(AccessError::RoleInUse);
         }
         remove_dead_assignments(&mut tx, actor, DeadOf::Role(id), "role deleted").await?;
@@ -618,6 +630,15 @@ impl Db {
         tx.commit().await?;
         Ok(())
     }
+}
+
+/// Whether a live link gives the role `$1` on an item with no deleted node at or above it (see
+/// [`DEAD`]): a link under a deleted item gives nothing, so it neither keeps a role in use nor
+/// stops it from changing.
+fn live_linked() -> String {
+    format!(
+        "with recursive held(node_id) as (              select node_id from links where role_id = $1 and revoked_at is null), {DEAD}          select exists (select 1 from held where node_id not in (select origin from dead))"
+    )
 }
 
 /// The custom role `id`, locked `FOR UPDATE`: `NoSuchRole` if there is none, `BuiltinRole`
