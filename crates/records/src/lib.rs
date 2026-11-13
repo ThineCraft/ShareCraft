@@ -9,9 +9,11 @@ mod documents;
 mod events;
 mod explorer;
 mod groups;
+mod links;
 mod revisions;
 mod roles;
 mod scopes;
+mod settings;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 mod tree;
@@ -28,7 +30,9 @@ pub use explorer::{
     is_explorer_cursor,
 };
 pub use groups::{Group, SiteGroup};
+pub use links::{AnyoneGrant, Link, LinkError, LinkKind, LinkToken};
 pub use revisions::{RevisionRecord, RevisionRow};
 pub use roles::{Access, Perms, Principal, RoleDef, RoleRef};
 pub use scopes::{Crumb, Cursor, Listed, NodeAccess};
+pub use settings::{ANYONE_LINK_MAX_DAYS, ANYONE_LINKS, SharingSettings};
 pub use tree::{Node, NodeChange, NodeKind, NodeRow, validate_node_name};

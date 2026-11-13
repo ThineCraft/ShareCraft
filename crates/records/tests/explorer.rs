@@ -746,6 +746,7 @@ fn csv_quotes_and_neutralises_formulas() {
             broken_by: Some((user("@admin"), at)),
             changed_by: None,
             breaks_below: 0,
+            anyone_links: 0,
         },
         Break {
             node: crumb("Notes\nv2", NodeKind::Document),
@@ -756,6 +757,7 @@ fn csv_quotes_and_neutralises_formulas() {
             broken_by: None,
             changed_by: None,
             breaks_below: 0,
+            anyone_links: 0,
         },
     ];
     let csv = breaks_csv(&breaks);

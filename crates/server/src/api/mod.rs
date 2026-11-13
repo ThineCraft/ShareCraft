@@ -233,6 +233,14 @@ impl From<AccessError> for ApiError {
             AccessError::BuiltinRole => ApiError::BuiltinRole,
             AccessError::GroupInUse => ApiError::GroupInUse,
             AccessError::SiteGroup => ApiError::SiteGroup,
+            // Answered with their own codes once the link routes exist.
+            AccessError::LinkGroup
+            | AccessError::LinkRoleTooHigh
+            | AccessError::AnyoneLinksOff
+            | AccessError::ExpiryRequired
+            | AccessError::ExpiryTooLong
+            | AccessError::ExpiryInPast
+            | AccessError::InvalidSetting => ApiError::InvalidRequest,
             AccessError::InvalidName => ApiError::InvalidName,
             // `POST /api/docs` answers this itself, naming the extension expected.
             AccessError::WrongExtension => ApiError::InvalidRequest,

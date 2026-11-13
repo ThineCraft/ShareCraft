@@ -140,6 +140,28 @@ pub enum AccessError {
     /// A site's groups belong to it: they cannot be deleted or renamed.
     #[error("a site's groups cannot be deleted")]
     SiteGroup,
+    /// A sharing link's hidden group is changed only by the link code.
+    #[error("that group belongs to a sharing link")]
+    LinkGroup,
+    /// A link never makes anyone a manager: its role may not include `manage_access` or
+    /// `manage_site`.
+    #[error("a link's role may not manage access or the site")]
+    LinkRoleTooHigh,
+    /// Anyone links are switched off for the organisation.
+    #[error("anyone links are switched off")]
+    AnyoneLinksOff,
+    /// An anyone link must expire.
+    #[error("an anyone link needs an expiry")]
+    ExpiryRequired,
+    /// An anyone link may not last longer than the organisation allows.
+    #[error("that expiry is further away than allowed")]
+    ExpiryTooLong,
+    /// A link's expiry must be in the future.
+    #[error("that expiry has already passed")]
+    ExpiryInPast,
+    /// An unknown setting, or a value of the wrong type or out of range for it.
+    #[error("that is not a valid setting")]
+    InvalidSetting,
     #[error("that is not a valid document name")]
     InvalidName,
     #[error("the name of this kind of document must end with its file extension")]

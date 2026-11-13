@@ -100,11 +100,15 @@ pub struct Group {
     pub member_count: i64,
 }
 
-/// Groups `g`, each with its site `s` (for a site group) and its name as shown, `gn`.
+/// Groups `g`, each with its site `s` (for a site group) and its name as shown, `gn`. A link's
+/// group has no name and is never listed; were one read, it would show as `Sharing link`.
 const GROUP_FROM: &str = "groups g left join nodes s on s.id = g.site_id \
      cross join lateral (select coalesce(g.name, s.name || ' ' || \
          case g.purpose when 'owners' then 'Owners' when 'members' then 'Members' \
-                        else 'Visitors' end) as display_name) gn";
+                        else 'Visitors' end, 'Sharing link') as display_name) gn";
+
+/// The purpose of a sharing link's hidden group, as stored in `groups.purpose`.
+pub(crate) const LINK_PURPOSE: &str = "link";
 
 /// The columns [`group_from_row`] reads, from [`GROUP_FROM`].
 const GROUP_COLUMNS: &str = "g.id, g.site_id, s.name as site_name, g.purpose, gn.display_name, \
@@ -113,6 +117,7 @@ const GROUP_COLUMNS: &str = "g.id, g.site_id, s.name as site_name, g.purpose, gn
 fn group_from_row(row: &PgRow) -> Result<Group, sqlx::Error> {
     let purpose = row
         .try_get::<Option<String>, _>("purpose")?
+        .filter(|text| text != LINK_PURPOSE)
         .map(|text| {
             SiteGroup::parse(&text)
                 .ok_or_else(|| sqlx::Error::Decode(format!("unknown purpose {text:?}").into()))
@@ -233,10 +238,10 @@ pub(crate) async fn groups_judged_by(
 pub(crate) async fn lock_groups(
     conn: &mut PgConnection,
     shared: impl IntoIterator<Item = GroupId>,
-    exclusive: Option<GroupId>,
+    exclusive: impl IntoIterator<Item = GroupId>,
 ) -> Result<(), sqlx::Error> {
     let mut modes: BTreeMap<GroupId, bool> = shared.into_iter().map(|g| (g, false)).collect();
-    if let Some(group) = exclusive {
+    for group in exclusive {
         modes.insert(group, true);
     }
     for (group, write) in modes {
@@ -251,6 +256,19 @@ pub(crate) async fn lock_groups(
             .await?;
     }
     Ok(())
+}
+
+/// Whether `group` is a sharing link's hidden group, which only the link code changes.
+pub(crate) async fn is_link_group(
+    conn: &mut PgConnection,
+    group: GroupId,
+) -> Result<bool, sqlx::Error> {
+    let purpose: Option<Option<String>> =
+        sqlx::query_scalar("select purpose from groups where id = $1")
+            .bind(group.0)
+            .fetch_optional(conn)
+            .await?;
+    Ok(purpose.flatten().as_deref() == Some(LINK_PURPOSE))
 }
 
 /// Whether every group in `now` is in `locked`: a decision judged through a group that was not
@@ -355,7 +373,7 @@ impl Db {
     /// with `manage_access` somewhere sees the organisation groups and the groups of the sites
     /// they can reach; and whoever has `manage_site` on a live site sees that site's groups,
     /// whose members they manage. A site's name is never shown to someone who could not
-    /// otherwise see the site.
+    /// otherwise see the site. A sharing link's hidden group is never listed.
     pub async fn groups_visible_to(&self, user: UserId) -> Result<Vec<Group>, DbError> {
         let mut conn = self.pool().acquire().await?;
         Ok(visible_groups(&mut conn, user, None).await?)
@@ -394,9 +412,13 @@ impl Db {
 
     /// Whether `user` manages the members of `group`: an enabled administrator manages every
     /// group, someone with `manage_site` on a site its groups. `NoSuchGroup` if there is no such
-    /// group. [`Db::add_member`] and [`Db::remove_member`] decide again under their locks.
+    /// group. [`Db::add_member`] and [`Db::remove_member`] decide again under their locks. `LinkGroup`
+    /// for a sharing link's group, which nobody manages but the link code.
     pub async fn manages_group(&self, user: UserId, group: GroupId) -> Result<bool, AccessError> {
         let mut conn = self.pool().acquire().await?;
+        if is_link_group(&mut conn, group).await? {
+            return Err(AccessError::LinkGroup);
+        }
         let (site, _) = group_place(&mut conn, group).await?;
         Ok(manages(&mut conn, user, site).await?)
     }
@@ -461,7 +483,8 @@ impl Db {
 
     /// Deletes the organisation group `group` and its memberships. `actor` must be an enabled
     /// administrator (`Forbidden`); `NoSuchGroup` for an unknown group, `SiteGroup` for a
-    /// site's group, `GroupInUse` while any assignment on a live scope names it; its
+    /// site's group, `LinkGroup` for a sharing link's group, `GroupInUse` while any assignment
+    /// on a live scope names it; its
     /// assignments on scopes with a deleted node at or above them grant nothing and are deleted
     /// with it, each recording `access.revoked` with the reason `group deleted`. Takes the
     /// group's row `FOR UPDATE`, so an assignment being given to it either finishes first (and the group is
@@ -471,12 +494,15 @@ impl Db {
         if !locked_admin(&mut tx, actor).await? {
             return Err(AccessError::Forbidden);
         }
-        let row: Option<(Option<String>, Option<Uuid>)> =
-            sqlx::query_as("select name, site_id from groups where id = $1 for update")
+        let row: Option<(Option<String>, Option<Uuid>, Option<String>)> =
+            sqlx::query_as("select name, site_id, purpose from groups where id = $1 for update")
                 .bind(group.0)
                 .fetch_optional(&mut *tx)
                 .await?;
-        let (name, site) = row.ok_or(AccessError::NoSuchGroup)?;
+        let (name, site, purpose) = row.ok_or(AccessError::NoSuchGroup)?;
+        if purpose.as_deref() == Some(LINK_PURPOSE) {
+            return Err(AccessError::LinkGroup);
+        }
         if site.is_some() {
             return Err(AccessError::SiteGroup);
         }
@@ -525,7 +551,8 @@ impl Db {
     /// add a person to a group whose role, on every live scope where the group is assigned,
     /// has no permission they do not hold there themselves (`BeyondYourAccess`); a scope with a
     /// deleted node at or above it grants nothing and is not judged. `NoSuchGroup` or
-    /// `NoSuchUser` for an unknown group or person. Records `group.member_added`.
+    /// `NoSuchUser` for an unknown group or person; `LinkGroup` for a sharing link's group,
+    /// which people join only by opening the link. Records `group.member_added`.
     pub async fn add_member(
         &self,
         actor: UserId,
@@ -539,7 +566,7 @@ impl Db {
     /// Ends `user`'s membership of `group`; `false` if they were not a member. `actor` must be
     /// an enabled administrator, or have `manage_site` on the site of a site group
     /// (`Forbidden`; `NotFound` if they cannot see the site). `NoSuchGroup` for an unknown
-    /// group. Emptying a group that is a scope's only manager is allowed: an administrator can
+    /// group, `LinkGroup` for a sharing link's group. Emptying a group that is a scope's only manager is allowed: an administrator can
     /// always repair the scope. Records `group.member_removed`.
     pub async fn remove_member(
         &self,
@@ -558,6 +585,13 @@ impl Db {
         user: UserId,
         change: Membership,
     ) -> Result<bool, AccessError> {
+        // A group's purpose never changes, so the answer read before the locks holds.
+        {
+            let mut conn = self.pool().acquire().await?;
+            if is_link_group(&mut conn, group).await? {
+                return Err(AccessError::LinkGroup);
+            }
+        }
         for _ in 0..LOCK_ATTEMPTS {
             let mut tx = self.pool().begin().await?;
             let (site, purpose) = group_place(&mut tx, group).await?;
@@ -709,7 +743,7 @@ async fn judge_membership(
 }
 
 /// The groups `user` may see (see [`Db::groups_visible_to`]), by name; only those among `only`
-/// when given.
+/// when given. A sharing link's group is never among them.
 pub(crate) async fn visible_groups(
     conn: &mut PgConnection,
     user: UserId,
@@ -726,7 +760,8 @@ pub(crate) async fn visible_groups(
                                          where m.perms & {MANAGE_ACCESS_BIT} <> 0 \
                                            and m.node_id in (select origin from live))) \
          select {GROUP_COLUMNS} from {GROUP_FROM} \
-         where ($3::uuid[] is null or g.id = any($3)) \
+         where g.purpose is distinct from 'link' \
+           and ($3::uuid[] is null or g.id = any($3)) \
            and ($2 \
                 or ((select yes from manages) \
                     and (g.site_id is null or g.site_id in (select id from reach))) \

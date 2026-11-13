@@ -20,7 +20,8 @@ use crate::accounts::user_from_row;
 use crate::documents::parse_editor;
 use crate::events::{NewEvent, record};
 use crate::explorer::{AssignmentView, assignments_on};
-use crate::groups::{all_locked, groups_judged_by, lock_groups};
+use crate::groups::{all_locked, groups_judged_by, is_link_group, lock_groups};
+use crate::links::{LockedLink, link_groups_on, links_assigned_on, revoke_locked};
 use crate::roles::{lock_roles, role_by_id};
 use crate::tree::node_from_row;
 use crate::{
@@ -216,12 +217,13 @@ pub(crate) const MANAGE_ACCESS_BIT: i32 = 16;
 /// The bit of `manage_site` in a `perms` column.
 pub(crate) const MANAGE_SITE_BIT: i32 = 32;
 
-const NODE_COLUMNS: &str = "n.id, n.kind, n.parent_id, n.site_id, n.name, n.unique_scope, \
+pub(crate) const NODE_COLUMNS: &str = "n.id, n.kind, n.parent_id, n.site_id, n.name, n.unique_scope, \
      (n.deleted_at is not null) as deleted, n.created_by, n.created_at";
 
 /// The order of a folder's children, exactly as `nodes_children` (migration 0006) indexes it:
 /// folders (and libraries) before files, then by name ignoring case, then by id.
-const CHILD_ORDER: &str = "(case when n.kind = 'document' then 1 else 0 end), lower(n.name), n.id";
+pub(crate) const CHILD_ORDER: &str =
+    "(case when n.kind = 'document' then 1 else 0 end), lower(n.name), n.id";
 
 /// The statement listing one page of `$2`'s children as `$1` sees them (`$3`: whether they are
 /// an administrator; `$4`: whether they have access to `$2`), at most `$5` rows; with `after`,
@@ -532,7 +534,7 @@ pub(crate) fn manager(links: Option<Vec<Link>>) -> Result<Vec<Link>, AccessError
 }
 
 /// The event's document: a file's node is its document.
-fn document_of(node: &Node) -> Option<DocId> {
+pub(crate) fn document_of(node: &Node) -> Option<DocId> {
     (node.kind == NodeKind::Document).then_some(DocId(node.id.0))
 }
 
@@ -547,7 +549,7 @@ pub(crate) fn crumb(link: &Link) -> Crumb {
 
 /// Makes `node` a scope with a copy of the assignments of `source`, and records it. Writes one
 /// row per copied assignment, the node's row and one event, whatever lies below the node.
-async fn break_locked(
+pub(crate) async fn break_locked(
     tx: &mut PgConnection,
     actor: UserId,
     node: &Node,
@@ -642,7 +644,10 @@ pub(crate) async fn scopes_managed_only_by(
 }
 
 /// `detail` with the group the assignment names, if it names one.
-fn with_principal(principal: Principal, mut detail: serde_json::Value) -> serde_json::Value {
+pub(crate) fn with_principal(
+    principal: Principal,
+    mut detail: serde_json::Value,
+) -> serde_json::Value {
     if let (Principal::Group(group), Some(map)) = (principal, detail.as_object_mut()) {
         map.insert("group".to_owned(), json!(group.0));
     }
@@ -878,7 +883,17 @@ impl Db {
             Principal::Group(group) => Some(group),
             Principal::User(_) => None,
         };
-        let (mut tx, links) = self.lock_chain(actor, node, false, role, group).await?;
+        // A link's group is changed only by the link code. Its purpose never changes, so the
+        // answer read before the locks holds.
+        if let Some(group) = group {
+            let mut conn = self.pool().acquire().await?;
+            if is_link_group(&mut conn, group).await? {
+                return Err(AccessError::LinkGroup);
+            }
+        }
+        let (mut tx, links, _) = self
+            .lock_chain(actor, node, false, role, group, false)
+            .await?;
         let links = manager(Some(links))?;
         match principal {
             Principal::User(user) => {
@@ -893,13 +908,17 @@ impl Db {
             }
             // Locked `FOR SHARE` by `lock_chain`, so it cannot be deleted before the commit.
             Principal::Group(group) => {
-                let exists: Option<bool> =
-                    sqlx::query_scalar("select true from groups where id = $1")
+                let purpose: Option<Option<String>> =
+                    sqlx::query_scalar("select purpose from groups where id = $1")
                         .bind(group.0)
                         .fetch_optional(&mut *tx)
                         .await?;
-                if exists.is_none() {
-                    return Err(AccessError::NoSuchGroup);
+                match purpose {
+                    None => return Err(AccessError::NoSuchGroup),
+                    Some(Some(purpose)) if purpose == "link" => {
+                        return Err(AccessError::LinkGroup);
+                    }
+                    Some(_) => {}
                 }
             }
         }
@@ -1014,7 +1033,9 @@ impl Db {
             let mut conn = self.pool().acquire().await?;
             manager(chain(&mut conn, actor, node).await?)?;
         }
-        let (mut tx, links) = self.lock_chain(actor, node, false, None, None).await?;
+        let (mut tx, links, _) = self
+            .lock_chain(actor, node, false, None, None, false)
+            .await?;
         let links = manager(Some(links))?;
         let (Some(target), Some(source)) = (links.last(), links.get(source_index(&links, false)))
         else {
@@ -1031,7 +1052,8 @@ impl Db {
     /// Makes `node` inherit again, deleting its own assignments. `actor` must manage access to
     /// the node and to the scope above it (`Forbidden` otherwise), so nobody restores
     /// themselves out of access by accident. `false` if the node already inherits; `IsSite`
-    /// for a site. Nothing below the node is read or written.
+    /// for a site. Nothing below the node is read or written, except that a sharing link whose
+    /// group loses its last assignment here is revoked with it (reason `inheritance restored`).
     pub async fn restore_inheritance(
         &self,
         actor: UserId,
@@ -1041,7 +1063,8 @@ impl Db {
             let mut conn = self.pool().acquire().await?;
             manager(chain(&mut conn, actor, node).await?)?;
         }
-        let (mut tx, links) = self.lock_chain(actor, node, true, None, None).await?;
+        let (mut tx, links, assigned_links) =
+            self.lock_chain(actor, node, true, None, None, true).await?;
         let links = manager(Some(links))?;
         let Some(target) = links.last() else {
             return Err(AccessError::NotFound);
@@ -1061,11 +1084,30 @@ impl Db {
         if !parent_manages {
             return Err(AccessError::Forbidden);
         }
-        let removed = sqlx::query("delete from assignments where node_id = $1")
+        let removed: i64 =
+            sqlx::query_scalar("select count(*) from assignments where node_id = $1")
+                .bind(node.0)
+                .fetch_one(&mut *tx)
+                .await?;
+        // A link whose group is assigned here and nowhere else would grant nothing once this
+        // assignment goes: it is revoked with it. Its row and group are locked already.
+        for link in &assigned_links {
+            let elsewhere: bool = sqlx::query_scalar(
+                "select exists (select 1 from assignments \
+                 where principal_kind = 'group' and principal_id = $1 and node_id <> $2)",
+            )
+            .bind(link.group.0)
+            .bind(node.0)
+            .fetch_one(&mut *tx)
+            .await?;
+            if !elsewhere {
+                revoke_locked(&mut tx, Some(actor), link.id, "inheritance restored").await?;
+            }
+        }
+        sqlx::query("delete from assignments where node_id = $1")
             .bind(node.0)
             .execute(&mut *tx)
-            .await?
-            .rows_affected();
+            .await?;
         sqlx::query("update nodes set unique_scope = false where id = $1")
             .bind(node.0)
             .execute(&mut *tx)
@@ -1110,15 +1152,19 @@ impl Db {
     }
 
     /// Opens a transaction and locks, in the one locking order, the chain from `node`'s source
-    /// scope down to `node` (top-down: `node` `FOR UPDATE`, the rest `FOR SHARE`), then, by id
-    /// and `FOR SHARE`, the groups involved: those with an assignment on a scope of that chain
-    /// that `actor` is a member of, and `group` if given; then, by id and `FOR SHARE`, the roles
-    /// involved: those giving `actor` access along the chain, those of the assignments on the
-    /// source scope, and `role` if given. With `above`, the source is
+    /// scope down to `node` (top-down: `node` `FOR UPDATE`, the rest `FOR SHARE`); then, with
+    /// `revoking`, the rows of the live links whose group is assigned on `node`, by id and
+    /// `FOR UPDATE`; then, by id, the groups involved: `FOR SHARE` those with an assignment on a
+    /// scope of that chain that `actor` is a member of, the link groups assigned on the source
+    /// scope (breaking inheritance copies their assignments, which revoking a link deletes), and
+    /// `group` if given, and `FOR UPDATE` the groups of the links locked; then, by id and
+    /// `FOR SHARE`, the roles involved: those giving `actor` access along the chain, those of
+    /// the assignments on the source scope, and `role` if given. With `above`, the source is
     /// the nearest scope strictly above `node` (restoring is judged there). Reads the chain
     /// again once everything is locked, and starts over if it changed meanwhile, so the chain
-    /// returned, as `actor` sees it, holds until the transaction ends. The chain is a handful
-    /// of rows, whatever lies below.
+    /// returned, as `actor` sees it, holds until the transaction ends, and so do the links
+    /// returned (a revoke that held one first has marked it revoked meanwhile, which
+    /// [`revoke_locked`] checks). The chain is a handful of rows, whatever lies below.
     pub(crate) async fn lock_chain(
         &self,
         actor: UserId,
@@ -1126,15 +1172,33 @@ impl Db {
         above: bool,
         role: Option<&str>,
         group: Option<GroupId>,
-    ) -> Result<(Transaction<'static, Postgres>, Vec<Link>), AccessError> {
+        revoking: bool,
+    ) -> Result<(Transaction<'static, Postgres>, Vec<Link>, Vec<LockedLink>), AccessError> {
         for _ in 0..LOCK_ATTEMPTS {
             let mut tx = self.pool().begin().await?;
             if let Some(seen) = lock_segment(&mut tx, actor, node, above, true).await? {
                 let wanted = segment(&seen, above);
                 let scopes = scopes_of(&wanted);
-                let judged = groups_judged_by(&mut tx, actor, &scopes).await?;
-                lock_groups(&mut tx, judged.iter().copied().chain(group), None).await?;
+                let doomed = if revoking {
+                    links_assigned_on(&mut tx, node, true).await?
+                } else {
+                    Vec::new()
+                };
                 let source = wanted.first().map_or(node, |(id, _)| *id);
+                let judged = groups_judged_by(&mut tx, actor, &scopes).await?;
+                let copied = link_groups_on(&mut tx, source).await?;
+                let shared: Vec<GroupId> = judged
+                    .iter()
+                    .copied()
+                    .chain(group)
+                    .chain(copied.iter().copied())
+                    .collect();
+                lock_groups(
+                    &mut tx,
+                    shared.iter().copied(),
+                    doomed.iter().map(|link| link.group),
+                )
+                .await?;
                 let on_source: Vec<String> = sqlx::query_scalar(
                     "select distinct role_id from assignments where node_id = $1",
                 )
@@ -1151,8 +1215,19 @@ impl Db {
                     .await?
                     .ok_or(AccessError::NotFound)?;
                 let now_judged = groups_judged_by(&mut tx, actor, &scopes).await?;
-                if segment(&now, above) == wanted && all_locked(&now_judged, &judged) {
-                    return Ok((tx, now));
+                let now_copied = link_groups_on(&mut tx, source).await?;
+                let links_held = if revoking {
+                    let now_doomed = links_assigned_on(&mut tx, node, false).await?;
+                    now_doomed.iter().all(|link| doomed.contains(link))
+                } else {
+                    true
+                };
+                if segment(&now, above) == wanted
+                    && all_locked(&now_judged, &judged)
+                    && all_locked(&now_copied, &shared)
+                    && links_held
+                {
+                    return Ok((tx, now, doomed));
                 }
             }
             tx.rollback().await?;

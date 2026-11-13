@@ -498,7 +498,9 @@ impl Db {
     /// kept). The change reaches everyone holding the role, everywhere, at once. `actor` must
     /// be an enabled administrator (`Forbidden`); `NoSuchRole` for an unknown id,
     /// `BuiltinRole` for a built-in role; names as [`Db::create_role`]; `LastManager` if the
-    /// role would lose `manage_access` while it gives the only managing assignment of a scope. Takes the role's row
+    /// role would lose `manage_access` while it gives the only managing assignment of a scope;
+    /// `LinkRoleTooHigh` if it would gain `manage_access` or `manage_site` while a live link
+    /// gives it. Takes the role's row
     /// `FOR UPDATE`, so an access decision judged by the role either finishes before the change
     /// or sees it. Records `role.changed` with the name and permissions before and after.
     pub async fn change_role(
@@ -520,6 +522,22 @@ impl Db {
         };
         if after == before {
             return Ok(before);
+        }
+        // A link never makes anyone a manager. Every link made with this role locked it
+        // `FOR SHARE`, so none is being made with it now.
+        let manages = |perms: Perms| {
+            perms.contains(Perms::MANAGE_ACCESS) || perms.contains(Perms::MANAGE_SITE)
+        };
+        if manages(after.perms) && !manages(before.perms) {
+            let linked: bool = sqlx::query_scalar(
+                "select exists (select 1 from links where role_id = $1 and revoked_at is null)",
+            )
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if linked {
+                return Err(AccessError::LinkRoleTooHigh);
+            }
         }
         // Every scope keeps a manager. The role's row is held `FOR UPDATE`, and every access
         // change takes the roles assigned on the scope it changes `FOR SHARE` (after its chain),
@@ -560,7 +578,7 @@ impl Db {
 
     /// Deletes the role `id`. `actor` must be an enabled administrator (`Forbidden`);
     /// `NoSuchRole` for an unknown id, `BuiltinRole` for a built-in role, `RoleInUse` while any
-    /// assignment on a live scope gives it. Its assignments on scopes with a deleted node at or
+    /// assignment on a live scope or any live link gives it (a revoked link keeps no role). Its assignments on scopes with a deleted node at or
     /// above them grant nothing and are deleted with it, each recording `access.revoked` with
     /// the reason `role deleted`. Records `role.deleted`.
     pub async fn delete_role(&self, actor: UserId, id: &str) -> Result<(), AccessError> {
@@ -574,7 +592,13 @@ impl Db {
             .bind(id)
             .fetch_one(&mut *tx)
             .await?;
-        if in_use {
+        let linked: bool = sqlx::query_scalar(
+            "select exists (select 1 from links where role_id = $1 and revoked_at is null)",
+        )
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if in_use || linked {
             return Err(AccessError::RoleInUse);
         }
         remove_dead_assignments(&mut tx, actor, DeadOf::Role(id), "role deleted").await?;

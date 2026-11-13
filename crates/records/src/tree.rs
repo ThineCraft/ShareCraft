@@ -1,6 +1,6 @@
 //! The content tree: sites, libraries, folders and files, mirrored from Git into PostgreSQL.
 
-use collab_core::ids::{NodeId, UserId};
+use collab_core::ids::{GroupId, NodeId, UserId};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgRow;
 use sqlx::{PgConnection, Row};
@@ -12,6 +12,7 @@ use crate::events::{NewEvent, record};
 use crate::groups::{
     add_site_owner, all_locked, ensure_site_groups, groups_judged_by, lock_groups,
 };
+use crate::links::{after_deletion, lock_links_below};
 use crate::roles::lock_roles;
 use crate::scopes::{
     LOCK_ATTEMPTS, access_in, judged_roles, lock_segment, lock_top_down, scopes_of, segment,
@@ -190,25 +191,48 @@ pub(crate) async fn upsert_node(conn: &mut PgConnection, row: &NodeRow) -> Resul
     Ok(())
 }
 
+/// The live links a tree change revokes because it deletes their item or a node above it, each
+/// with its group: locked by [`judge`], revoked once the rows are written.
+type Doomed = Vec<(uuid::Uuid, Option<GroupId>)>;
+
+/// The nodes `change` marks deleted, and the sites they are in.
+fn deleting(change: &NodeChange<'_>) -> (Vec<NodeId>, Vec<NodeId>) {
+    let rows = change.rows.iter().filter(|row| row.deleted_at.is_some());
+    let nodes = rows.clone().map(|row| row.id).collect();
+    let mut sites: Vec<NodeId> = rows.map(|row| row.site).collect();
+    sites.sort_unstable();
+    sites.dedup();
+    (nodes, sites)
+}
+
 /// Locks what `change` needs and judges its actor's access. Each needed node's chain is locked
 /// from its source scope down, as access changes lock it (ancestors `FOR SHARE`, a node the
 /// change writes `FOR UPDATE`), in `needs` order; then every row the change writes,
-/// `FOR UPDATE`, ancestors first (see `lock_top_down`); then the groups the actor is a member of that
-/// are assigned on those chains' scopes, by id, `FOR SHARE`; then the roles giving that access,
+/// `FOR UPDATE`, ancestors first (see `lock_top_down`); then the live links at or below a node
+/// it deletes, by id, `FOR UPDATE`; then the groups the actor is a member of that
+/// are assigned on those chains' scopes, by id, `FOR SHARE`, with those links' groups
+/// `FOR UPDATE`; then the roles giving that access,
 /// by id, `FOR SHARE`; then the access is worked out again and judged. So an assignment changed
 /// anywhere above a needed node, a membership ended of a group giving the access, or a role
-/// changed that gives it, either waits for this change or is seen by it. Returns `false` if a
-/// chain or the groups moved while they were being locked: the caller starts over.
-async fn judge(conn: &mut PgConnection, change: &NodeChange<'_>) -> Result<bool, AccessError> {
+/// changed that gives it, either waits for this change or is seen by it. Returns the links to
+/// revoke, or `None` if a chain or the groups moved while they were being locked: the caller
+/// starts over.
+async fn judge(
+    conn: &mut PgConnection,
+    change: &NodeChange<'_>,
+) -> Result<Option<Doomed>, AccessError> {
     // The rows written are locked in the one order for several nodes (see `lock_top_down`)
     // before any is written, whatever order they come in (a move's subtree is read parents
     // first, otherwise in any order), and before any group or role: every transaction takes
     // all the node rows it needs before a group, so none can hold a group while waiting for a
     // node that another holds while waiting for that group.
     let written: Vec<NodeId> = change.rows.iter().map(|row| row.id).collect();
+    let (deleted, sites) = deleting(change);
     if !change.needs_admin && change.needs.is_empty() {
         lock_top_down(&mut *conn, &written, true).await?;
-        return Ok(true);
+        let doomed = lock_links_below(&mut *conn, &deleted, &sites).await?;
+        lock_groups(&mut *conn, [], doomed.iter().filter_map(|(_, g)| *g)).await?;
+        return Ok(Some(doomed));
     }
     let actor = change.actor.ok_or(AccessError::Forbidden)?;
     if change.needs_admin {
@@ -227,20 +251,26 @@ async fn judge(conn: &mut PgConnection, change: &NodeChange<'_>) -> Result<bool,
     for (id, _) in change.needs {
         let written = change.rows.iter().any(|row| row.id == *id);
         let Some(links) = lock_segment(&mut *conn, actor, *id, false, written).await? else {
-            return Ok(false);
+            return Ok(None);
         };
         scopes.extend(scopes_of(&segment(&links, false)));
         involved.extend(judged_roles(&links));
     }
     lock_top_down(&mut *conn, &written, true).await?;
+    let doomed = lock_links_below(&mut *conn, &deleted, &sites).await?;
     let judged = groups_judged_by(&mut *conn, actor, &scopes).await?;
-    lock_groups(&mut *conn, judged.iter().copied(), None).await?;
+    lock_groups(
+        &mut *conn,
+        judged.iter().copied(),
+        doomed.iter().filter_map(|(_, g)| *g),
+    )
+    .await?;
     lock_roles(&mut *conn, involved).await?;
     if !all_locked(
         &groups_judged_by(&mut *conn, actor, &scopes).await?,
         &judged,
     ) {
-        return Ok(false);
+        return Ok(None);
     }
     // Every chain and role is locked now, so none of this access can change before the commit.
     for (id, needed) in change.needs {
@@ -252,7 +282,7 @@ async fn judge(conn: &mut PgConnection, change: &NodeChange<'_>) -> Result<bool,
             Some(_) => {}
         }
     }
-    Ok(true)
+    Ok(Some(doomed))
 }
 
 impl Db {
@@ -279,13 +309,15 @@ impl Db {
     /// they are no longer an enabled administrator when that is needed), records the new
     /// document if any (`Exists` if its id is taken), applies each row as
     /// [`Db::apply_node`] does (a site row gets its three groups), makes the new site's creator a
-    /// member of its Owners group if asked, and writes the events.
+    /// member of its Owners group if asked, and writes the events. A node it marks deleted has its
+    /// live links, and those of every node below it, revoked (reason `item deleted`), and the
+    /// open access requests on it and below it closed, in the same transaction.
     ///
     /// A database failure before the change was judged allowed (the connection lost while
     /// locking, or the tree changing on every attempt) is `Unjudged`: nothing was written, and
     /// the change must be treated as refused. `Db` is a failure after it was judged allowed.
     pub async fn apply_nodes(&self, change: NodeChange<'_>) -> Result<(), AccessError> {
-        let mut tx = self.judged(&change).await.map_err(|e| match e {
+        let (mut tx, doomed) = self.judged(&change).await.map_err(|e| match e {
             AccessError::Db(e) => AccessError::Unjudged(e),
             other => other,
         })?;
@@ -314,6 +346,10 @@ impl Db {
         if let (Some(creator), Some(first)) = (change.site_groups, change.rows.first()) {
             add_site_owner(&mut tx, first.id, creator, change.actor).await?;
         }
+        let (deleted, sites) = deleting(&change);
+        if !deleted.is_empty() {
+            after_deletion(&mut tx, change.actor, &doomed, &sites).await?;
+        }
         for event in change.events {
             record(&mut tx, event).await?;
         }
@@ -321,15 +357,16 @@ impl Db {
         Ok(())
     }
 
-    /// A transaction in which `change` has been judged allowed, with what it needs locked.
+    /// A transaction in which `change` has been judged allowed, with what it needs locked, and
+    /// the links it revokes.
     async fn judged(
         &self,
         change: &NodeChange<'_>,
-    ) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, AccessError> {
+    ) -> Result<(sqlx::Transaction<'static, sqlx::Postgres>, Doomed), AccessError> {
         for _ in 0..LOCK_ATTEMPTS {
             let mut tx = self.pool().begin().await?;
-            if judge(&mut tx, change).await? {
-                return Ok(tx);
+            if let Some(doomed) = judge(&mut tx, change).await? {
+                return Ok((tx, doomed));
             }
             tx.rollback().await?;
         }

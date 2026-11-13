@@ -70,31 +70,41 @@ impl SessionToken {
     /// The token as 64 lowercase hexadecimal characters, for the cookie.
     #[must_use]
     pub fn as_cookie_value(&self) -> String {
-        let mut out = String::with_capacity(64);
-        for byte in self.0 {
-            out.push(hex_digit(byte >> 4));
-            out.push(hex_digit(byte & 0x0f));
-        }
-        out
+        hex32(&self.0)
     }
 
     /// Reads a cookie value; `None` unless it is exactly 64 hexadecimal characters.
     #[must_use]
     pub fn parse(text: &str) -> Option<SessionToken> {
-        if text.len() != 64 {
-            return None;
-        }
-        let mut bytes = [0u8; 32];
-        let (pairs, _) = text.as_bytes().as_chunks::<2>();
-        for (slot, [high, low]) in bytes.iter_mut().zip(pairs) {
-            *slot = (hex_value(*high)? << 4) | hex_value(*low)?;
-        }
-        Some(SessionToken(bytes))
+        parse_hex32(text).map(SessionToken)
     }
 
     fn digest(&self) -> Vec<u8> {
         Sha256::digest(self.0).to_vec()
     }
+}
+
+/// 32 bytes as 64 lowercase hexadecimal characters.
+pub(crate) fn hex32(bytes: &[u8; 32]) -> String {
+    let mut out = String::with_capacity(64);
+    for byte in bytes {
+        out.push(hex_digit(byte >> 4));
+        out.push(hex_digit(byte & 0x0f));
+    }
+    out
+}
+
+/// 32 bytes from exactly 64 hexadecimal characters; `None` for anything else.
+pub(crate) fn parse_hex32(text: &str) -> Option<[u8; 32]> {
+    if text.len() != 64 {
+        return None;
+    }
+    let mut bytes = [0u8; 32];
+    let (pairs, _) = text.as_bytes().as_chunks::<2>();
+    for (slot, [high, low]) in bytes.iter_mut().zip(pairs) {
+        *slot = (hex_value(*high)? << 4) | hex_value(*low)?;
+    }
+    Some(bytes)
 }
 
 fn hex_digit(nibble: u8) -> char {

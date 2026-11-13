@@ -22,7 +22,9 @@ use crate::scopes::{
     ASSIGNED, Link, MINE, MINE_ON_N, Standing, access_step, applies_to, chain, crumb, manager,
     source_index, standing,
 };
-use crate::{Access, AccessError, Crumb, Db, DbError, NodeKind, Perms, Principal, RoleRef};
+use crate::{
+    Access, AccessError, Crumb, Db, DbError, LinkKind, NodeKind, Perms, Principal, RoleRef,
+};
 
 /// A person named for display: their id and name.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,17 +49,24 @@ pub enum PrincipalView {
     /// A group the viewer may not see (a group of a site they cannot reach): its id only, so
     /// that no site name they could not otherwise see is shown.
     HiddenGroup(GroupId),
+    /// A signed-in link's hidden group: the link, never a group with a name.
+    Link {
+        link: Uuid,
+        kind: LinkKind,
+        expires_at: Option<OffsetDateTime>,
+    },
 }
 
 impl PrincipalView {
-    /// The principal shown.
+    /// The principal shown; `None` for a link, whose group is never offered as a principal.
     #[must_use]
-    pub fn principal(&self) -> Principal {
+    pub fn principal(&self) -> Option<Principal> {
         match self {
-            PrincipalView::User(user) => Principal::User(user.id),
+            PrincipalView::User(user) => Some(Principal::User(user.id)),
             PrincipalView::Group { id, .. } | PrincipalView::HiddenGroup(id) => {
-                Principal::Group(*id)
+                Some(Principal::Group(*id))
             }
+            PrincipalView::Link { .. } => None,
         }
     }
 }
@@ -92,6 +101,9 @@ pub struct Break {
     pub changed_by: Option<(UserRef, OffsetDateTime)>,
     /// How many of the breaks the explorer shows (with the same filter) are below this one.
     pub breaks_below: i64,
+    /// How many live, unexpired anyone links are on the scope itself. Anyone links on a node
+    /// that inherits are listed on its access page, not here.
+    pub anyone_links: i64,
 }
 
 /// What the explorer lists, below the node it starts from.
@@ -352,7 +364,7 @@ pub(crate) async fn assignments_on(
         let order = match &principal {
             PrincipalView::User(user) => user.name.to_lowercase(),
             PrincipalView::Group { name, .. } => name.to_lowercase(),
-            PrincipalView::HiddenGroup(_) => String::new(),
+            PrincipalView::HiddenGroup(_) | PrincipalView::Link { .. } => String::new(),
         };
         by_scope
             .entry(NodeId(row.try_get("node_id")?))
@@ -378,8 +390,8 @@ pub(crate) async fn assignments_on(
         .collect())
 }
 
-/// How `viewer` is shown each of `ids`: by name (a site group with its site) when they may see
-/// the group, [`PrincipalView::HiddenGroup`] otherwise.
+/// How `viewer` is shown each of `ids`: a link's group as its link, by name (a site group with
+/// its site) when they may see the group, [`PrincipalView::HiddenGroup`] otherwise.
 async fn group_views(
     conn: &mut PgConnection,
     viewer: UserId,
@@ -393,6 +405,24 @@ async fn group_views(
         .collect();
     if ids.is_empty() {
         return Ok(views);
+    }
+    let raw: Vec<Uuid> = ids.iter().map(|g| g.0).collect();
+    let links: Vec<(Uuid, Uuid, String, Option<OffsetDateTime>)> =
+        sqlx::query_as("select group_id, id, kind, expires_at from links where group_id = any($1)")
+            .bind(&raw)
+            .fetch_all(&mut *conn)
+            .await?;
+    for (group, link, kind, expires_at) in links {
+        let kind = LinkKind::parse(&kind)
+            .ok_or_else(|| sqlx::Error::Decode(format!("unknown link kind {kind:?}").into()))?;
+        views.insert(
+            GroupId(group),
+            PrincipalView::Link {
+                link,
+                kind,
+                expires_at,
+            },
+        );
     }
     let groups = visible_groups(&mut *conn, viewer, Some(&ids)).await?;
     let site_ids: Vec<Uuid> = groups.iter().filter_map(|g| g.site).map(|s| s.0).collect();
@@ -421,6 +451,7 @@ async fn group_views(
 }
 
 /// The groups `user` is a member of whose members `viewer` may see (see [`members_visible`]).
+/// A link's group is never among them: it is never offered in a filter.
 async fn groups_seen_through(
     conn: &mut PgConnection,
     viewer: UserId,
@@ -428,7 +459,7 @@ async fn groups_seen_through(
 ) -> Result<HashSet<GroupId>, sqlx::Error> {
     let member_of: Vec<(Uuid, Option<Uuid>)> = sqlx::query_as(
         "select g.id, g.site_id from group_members m join groups g on g.id = m.group_id \
-         where m.user_id = $1 order by g.id",
+         where m.user_id = $1 and g.purpose is distinct from 'link' order by g.id",
     )
     .bind(user.0)
     .fetch_all(&mut *conn)
@@ -509,6 +540,28 @@ async fn events_on(
     Ok(events)
 }
 
+/// How many live, unexpired anyone links are on each of `nodes`, by node; nodes with none are
+/// left out.
+async fn anyone_links_on(
+    conn: &mut PgConnection,
+    nodes: &[NodeId],
+) -> Result<HashMap<NodeId, i64>, sqlx::Error> {
+    let ids: Vec<Uuid> = nodes.iter().map(|id| id.0).collect();
+    let rows: Vec<(Uuid, i64)> = sqlx::query_as(
+        "select node_id, count(*) from links \
+         where node_id = any($1) and kind = 'anyone' and revoked_at is null \
+           and expires_at > now() \
+         group by node_id",
+    )
+    .bind(&ids)
+    .fetch_all(conn)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(node, count)| (NodeId(node), count))
+        .collect())
+}
+
 /// The cursor for the page after the scope with `key`.
 fn cursor_of(key: &[Step]) -> String {
     serde_json::to_string(key).unwrap_or_default()
@@ -578,9 +631,9 @@ async fn breaks_window(
         shown.retain(|found| {
             assignments.get(&found.node.id).is_some_and(|list| {
                 list.iter().any(|a| match a.principal.principal() {
-                    named if named == wanted => true,
-                    Principal::Group(group) => through.contains(&group),
-                    Principal::User(_) => false,
+                    Some(named) if named == wanted => true,
+                    Some(Principal::Group(group)) => through.contains(&group),
+                    Some(Principal::User(_)) | None => false,
                 })
             })
         });
@@ -626,6 +679,7 @@ async fn breaks_window(
         assignments = assignments_on(&mut *conn, viewer, &page_ids).await?;
     }
     let mut events = events_on(&mut *conn, &page_ids).await?;
+    let mut anyone = anyone_links_on(&mut *conn, &page_ids).await?;
     // The scope each would inherit from, when it is above the root.
     let above_root = (links.len() > 1)
         .then(|| links.get(source_index(&links, true)))
@@ -653,6 +707,7 @@ async fn breaks_window(
             broken_by,
             changed_by,
             breaks_below,
+            anyone_links: anyone.remove(&found.node.id).unwrap_or(0),
             path: found.path,
             node: found.node,
         });
@@ -1002,6 +1057,13 @@ pub fn breaks_csv(breaks: &[Break]) -> String {
                     ..
                 } => ("site group", name.clone()),
                 PrincipalView::HiddenGroup(id) => ("group", id.0.hyphenated().to_string()),
+                PrincipalView::Link { kind, .. } => (
+                    "link",
+                    match kind {
+                        LinkKind::SignedIn => "signed-in link".to_owned(),
+                        LinkKind::Anyone => "anyone link".to_owned(),
+                    },
+                ),
             };
             push_row(
                 &mut out,

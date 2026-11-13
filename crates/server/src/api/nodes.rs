@@ -416,6 +416,15 @@ impl PrincipalOut {
                 site: None,
                 hidden: true,
             },
+            // Answered in full once the link routes exist: the link, never its group.
+            PrincipalView::Link { link, .. } => PrincipalOut {
+                kind: "link",
+                id: link.to_string(),
+                name: None,
+                email: None,
+                site: None,
+                hidden: false,
+            },
         }
     }
 }
