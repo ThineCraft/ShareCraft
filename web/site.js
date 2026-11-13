@@ -2,6 +2,7 @@ import {
   api,
   h,
   messageFor,
+  offerRequest,
   pageFor,
   queryId,
   can,
@@ -23,7 +24,10 @@ const MISSING = 'This site does not exist, or you do not have access to it.';
 if (!siteId) fail(MISSING);
 
 const here = await showCrumbs($('crumbs'), siteId, { linkLast: false });
-if (!here) fail(MISSING);
+if (!here) {
+  offerRequest(error, siteId);
+  fail(MISSING);
+}
 const site = here.path[here.path.length - 1];
 $('title').textContent = site.name;
 document.title = `${site.name} — ShareCraft`;

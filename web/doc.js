@@ -7,6 +7,7 @@ import {
   api,
   can,
   messageFor,
+  offerRequest,
   pageFor,
   removedMessage,
   removedReasonOf,
@@ -62,7 +63,12 @@ if (!docId) {
 }
 const detail = await api('GET', `/docs/${seg(docId)}`);
 if (!detail.ok) {
-  showProblem(detail.status === 404 ? MISSING : messageFor(detail.error));
+  if (detail.status === 404) {
+    showProblem(MISSING);
+    offerRequest($('problem'), docId);
+  } else {
+    showProblem(messageFor(detail.error));
+  }
   throw new Error(`cannot open the document (${detail.error})`);
 }
 if (detail.data.editor !== 'text') {
@@ -234,6 +240,7 @@ async function checkStillAllowed() {
   if (result.ok || result.status !== 404) return;
   stopRemoved('missing');
   showProblem(MISSING);
+  offerRequest($('problem'), docId);
 }
 
 // The server keeps closing the connection before the join although this person may open the

@@ -4,13 +4,48 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="no-referrer">
-<title>ShareCraft — Shared link</title>
+<meta name="robots" content="noindex">
+<title>Shared link — ShareCraft</title>
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
 <main class="page">
- <h1>Shared link</h1>
- <p>This page is not finished yet.</p>
+ <p id="status" role="status" aria-live="polite" class="meta">Opening the link…</p>
+
+ <section id="broken" hidden>
+  <h1>Shared link</h1>
+  <p id="problem" role="alert" class="problem"></p>
+ </section>
+
+ <section id="signin" hidden>
+  <h1>Shared link</h1>
+  <p>This link is for people with an account. Sign in to open it.</p>
+  <p><a id="signin-link" class="button" href="/signin.html">Sign in</a></p>
+ </section>
+
+ <section id="open" hidden>
+  <h1>Shared link</h1>
+  <p id="open-text"></p>
+  <p id="open-error" role="alert" class="msg"></p>
+  <p><button type="button" id="open-button">Open</button></p>
+ </section>
+
+ <section id="item" hidden>
+  <nav id="trail" aria-label="Folders" hidden></nav>
+  <h1 id="title">Shared item</h1>
+  <p id="kind" class="kind"></p>
+  <p id="error" role="alert" class="msg"></p>
+  <p id="file-tools" class="toolbar" hidden><a id="download" class="button" href="#">Download</a></p>
+  <ul id="items" class="list" aria-label="Contents" hidden></ul>
+  <p id="empty" class="meta" hidden>There is nothing here.</p>
+  <p><button type="button" id="more" class="plain" hidden>Show more</button></p>
+  <section id="text-view" aria-labelledby="text-heading" hidden>
+   <h2 id="text-heading">Text</h2>
+   <p class="meta">This is the last saved version. Changes being made now are not shown.</p>
+   <pre id="text-body" class="text"></pre>
+  </section>
+ </section>
 </main>
+<script type="module" src="/link.js"></script>
 </body>
 </html>

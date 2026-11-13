@@ -2,12 +2,19 @@
 // above. For those who manage access; the server decides, and refusals are shown as sentences.
 
 import {
+  ANYONE_NOTICE,
   api,
   can,
+  expiryFromDays,
+  expiryText,
   groupLabel,
   h,
   inheritAgainMessage,
+  linkLabel,
+  linkRoleChoices,
+  liveLinks,
   messageFor,
+  offerRequest,
   permsText,
   previewView,
   principalParts,
@@ -29,7 +36,10 @@ setupTopbar(me, error);
 const nodeId = queryId(location.search);
 if (!nodeId) fail(MISSING);
 const here = await showCrumbs($('crumbs'), nodeId);
-if (!here) fail(MISSING);
+if (!here) {
+  offerRequest(error, nodeId);
+  fail(MISSING);
+}
 const self = here.path[here.path.length - 1];
 $('title').textContent = `Access to ${self.name}`;
 document.title = `Access to ${self.name} — ShareCraft`;
@@ -48,8 +58,19 @@ fillRoleSelect($('share-role'), 'editor');
 fillRoleSelect($('group-role'), 'editor');
 fillGroupSelect();
 
+// What links may be made here: anyone links only while an administrator allows them.
+let sharing = { anyone_links: false, anyone_link_max_days: 30 };
+const sharingResult = await api('GET', '/settings/sharing');
+if (sharingResult.ok) sharing = sharingResult.data;
+if (!sharing.anyone_links) $('anyone-option').remove();
+else $('anyone-option').hidden = false;
+let links = []; // the live links of this item, as GET /api/nodes/{id}/links lists them
+let revoking = null;
+
 $('inherit-cancel').addEventListener('click', () => $('inherit-dialog').close());
+fillLinkForm();
 await refresh();
+await refreshLinks();
 
 function note(text, isError) {
   error.classList.toggle('ok', !isError);
@@ -82,6 +103,7 @@ async function refresh() {
   if (!result.ok) {
     $('content').hidden = true;
     note(result.status === 404 ? MISSING : messageFor(result.error), true);
+    if (result.status === 404) offerRequest(error, nodeId);
     return;
   }
   state = result.data;
@@ -115,6 +137,21 @@ function show() {
 }
 
 function assignmentRow({ principal, role, perms }) {
+  if (principal.kind === 'link') {
+    // A link is changed under "Share by link", never as a person or group.
+    return h(
+      'li',
+      {},
+      h(
+        'span',
+        { class: 'grow' },
+        principalParts(principal, role).name,
+        h('br'),
+        h('small', {}, `Can ${permsText(perms)}`),
+      ),
+      h('small', { class: 'meta' }, 'Revoke it under Share by link'),
+    );
+  }
   const { name, note: sub, hidden } = principalParts(principal);
   const isUser = principal.kind === 'user';
   const target = isUser ? { email: principal.email } : { group: principal.id };
@@ -206,6 +243,126 @@ $('inherit-form').addEventListener('submit', async (event) => {
   if (!result.ok) return showMessage($('inherit-error'), inheritAgainMessage(result.error));
   $('inherit-dialog').close();
   note('This item inherits its access again.', false);
+  await refresh();
+});
+
+// ---- share by link ----
+
+/** The role choices and expiry hint for the kind of link chosen. */
+function fillLinkForm() {
+  const anyone = $('link-kind').value === 'anyone';
+  const select = $('link-role');
+  if (anyone) {
+    select.replaceChildren(h('option', { value: 'viewer' }, 'Viewer'));
+    select.disabled = true;
+    $('link-days-label').textContent = 'Expires after (days, required)';
+    $('link-hint').textContent = `A link for anyone can only view and download, and lasts at most ${sharing.anyone_link_max_days} days.`;
+  } else {
+    const choices = linkRoleChoices(roles, here.access);
+    select.replaceChildren(
+      ...choices.map((role) => {
+        const option = h('option', { value: role.id }, role.name);
+        option.selected = role.id === 'viewer';
+        return option;
+      }),
+    );
+    select.disabled = false;
+    $('link-days-label').textContent = 'Expires after (days, optional)';
+    $('link-hint').textContent =
+      'Leave the days empty for a link that does not expire. A link never makes anyone a manager. Making one gives this item its own list of people if it inherited.';
+  }
+}
+
+$('link-kind').addEventListener('change', fillLinkForm);
+
+async function refreshLinks() {
+  const result = await api('GET', `/nodes/${seg(nodeId)}/links`);
+  if (!result.ok) return note(messageFor(result.error), true);
+  links = liveLinks(result.data);
+  $('no-links').hidden = links.length > 0;
+  $('links-wrap').hidden = links.length === 0;
+  $('links-body').replaceChildren(...links.map(linkRow));
+}
+
+function linkRow(link) {
+  const anyone = link.kind === 'anyone';
+  const revoke = h(
+    'button',
+    { type: 'button', class: 'plain', 'aria-label': `Revoke ${linkLabel(link, link.role)}` },
+    'Revoke',
+  );
+  revoke.addEventListener('click', () => askRevoke(link));
+  const expiry = link.expires_at == null ? 'Never' : expiryText(link.expires_at).replace(/^expires /, '');
+  return h(
+    'tr',
+    {},
+    h('td', {}, anyone ? 'Anyone' : 'Signed-in'),
+    h('td', {}, link.role?.name ?? ''),
+    h('td', {}, expiry),
+    h('td', {}, anyone ? 'Not counted' : String(link.members)),
+    h('td', {}, revoke),
+  );
+}
+
+$('link-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  note('', false);
+  const anyone = $('link-kind').value === 'anyone';
+  const { at, error: problem } = expiryFromDays($('link-days').value, {
+    maxDays: sharing.anyone_link_max_days,
+    required: anyone,
+  });
+  if (problem) return note(messageFor(problem), true);
+  if (!$('link-role').value) return note('There is no role you can give by link here.', true);
+  const body = { kind: anyone ? 'anyone' : 'signed_in', role: $('link-role').value };
+  if (at) body.expires_at = at;
+  const result = await api('POST', `/nodes/${seg(nodeId)}/links`, body);
+  if (!result.ok) return note(messageFor(result.error), true);
+  // The address is shown now and never again; it is not kept anywhere else.
+  $('link-url').value = result.data.url;
+  $('link-notice').textContent = ANYONE_NOTICE;
+  $('link-new').hidden = false;
+  $('link-url').focus();
+  $('link-url').select();
+  $('link-days').value = '';
+  await refreshLinks();
+  await refresh();
+});
+
+$('link-copy').addEventListener('click', async () => {
+  const input = $('link-url');
+  try {
+    await navigator.clipboard.writeText(input.value);
+    note('Copied.', false);
+  } catch {
+    input.focus();
+    input.select();
+    note('Press Ctrl+C to copy the address.', false);
+  }
+});
+
+function askRevoke(link) {
+  revoking = link;
+  showMessage($('revoke-error'), '');
+  $('revoke-text').textContent =
+    link.kind === 'anyone'
+      ? 'The link stops working at once for everyone who has it.'
+      : 'The link stops working at once. People who joined through it lose the access it gave, unless they have it another way.';
+  $('revoke-dialog').showModal();
+}
+
+$('revoke-cancel').addEventListener('click', () => $('revoke-dialog').close());
+$('revoke-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const link = revoking;
+  const result = await api('DELETE', `/links/${seg(link.id)}`);
+  if (!result.ok) return showMessage($('revoke-error'), messageFor(result.error));
+  $('revoke-dialog').close();
+  // The address just shown may be of the link revoked: it is of no use now.
+  $('link-new').hidden = true;
+  $('link-url').value = '';
+  note('The link was revoked.', false);
+  await refreshLinks();
   await refresh();
 });
 

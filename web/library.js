@@ -12,6 +12,7 @@ import {
   h,
   itemActions,
   messageFor,
+  offerRequest,
   moveChoices,
   pageFor,
   queryId,
@@ -34,7 +35,10 @@ setupTopbar(me, error);
 const nodeId = queryId(location.search);
 if (!nodeId) fail(MISSING);
 const here = await showCrumbs($('crumbs'), nodeId, { linkLast: false });
-if (!here) fail(MISSING);
+if (!here) {
+  offerRequest(error, nodeId);
+  fail(MISSING);
+}
 const self = here.path[here.path.length - 1];
 if (self.kind === 'site' || self.kind === 'document') {
   location.replace(pageFor(self.kind, self.id));

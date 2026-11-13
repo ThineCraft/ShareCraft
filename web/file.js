@@ -22,6 +22,7 @@ import {
   goToSignIn,
   h,
   messageFor,
+  offerRequest,
   pageFor,
   removedMessage,
   requireMe,
@@ -119,6 +120,7 @@ async function main() {
   const detail = await api('GET', `/docs/${seg(docId)}`);
   if (!detail.ok) {
     showProblem(detail.status === 404 ? MISSING_DOCUMENT : messageFor(detail.error));
+    if (detail.status === 404) offerRequest($('problem'), docId);
     return;
   }
   if (detail.data.editor === 'text') {
@@ -243,6 +245,7 @@ function stopRemoved(reason) {
     reason === 'missing' ? MISSING_DOCUMENT : removedMessage(reason),
     reason === 'deleted' ? folder : null,
   );
+  if (reason === 'missing') offerRequest($('problem'), docId);
 }
 
 // ---- socket ----

@@ -36,6 +36,18 @@ const MESSAGES = {
   unavailable: 'The server is busy or its database is unavailable. Try again in a moment.',
   bad_request: 'The server could not read that request. Reload the page and try again.',
   not_json: 'The server could not read that request. Reload the page and try again.',
+  link_not_found: 'This link does not work. It may have expired or been turned off.',
+  link_group: 'That group belongs to a sharing link. Change or revoke the link instead.',
+  link_role_too_high: 'A link cannot give the right to manage access or the site. Choose a different role.',
+  already_has: 'That person already has at least that much access here.',
+  anyone_links_off: 'Links for anyone are switched off. An administrator can switch them on.',
+  expiry_required: 'A link for anyone needs an expiry. Enter a number of days.',
+  expiry_too_long: 'That expiry is further away than the organisation allows. Choose fewer days.',
+  expiry_in_past: 'That expiry has already passed. Choose at least one day.',
+  expiry_invalid: 'Enter a whole number of days, 1 or more.',
+  too_many_requests: 'You have asked for access too many times today. Try again tomorrow.',
+  already_decided: 'Someone has already decided that request. Reload the page.',
+  message_too_long: 'That message is too long. Use 500 characters or fewer.',
 };
 
 /** What a document page says when the document is missing or the person has no access. */
@@ -277,7 +289,8 @@ export const HIDDEN_GROUP = 'A group you cannot see';
  * note is a person's email, a site group's site (`site: Sales`: a site group can share its name
  * with an organisation group) or `organisation group`. A hidden group has no name to show.
  */
-export function principalParts(principal) {
+export function principalParts(principal, role) {
+  if (principal.kind === 'link') return { name: linkLabel(principal, role), note: '', hidden: false };
   if (principal.hidden) return { name: HIDDEN_GROUP, note: '', hidden: true };
   if (principal.kind === 'user') {
     return { name: principal.name, note: principal.email ?? '', hidden: false };
@@ -287,8 +300,8 @@ export function principalParts(principal) {
 }
 
 /** [`principalParts`] as one line: `Site Owners (site: Sales)`. */
-export function principalText(principal) {
-  const { name, note } = principalParts(principal);
+export function principalText(principal, role) {
+  const { name, note } = principalParts(principal, role);
   return note ? `${name} (${note})` : name;
 }
 
@@ -321,7 +334,7 @@ export function filterChoices({ assignments = [], breaks = [], groups = [], memb
   const people = new Map();
   const named = new Map();
   const take = (principal) => {
-    if (principal.hidden) return;
+    if (principal.hidden || principal.kind === 'link') return;
     if (principal.kind === 'user') people.set(principal.id, principal.name);
     else named.set(principal.id, groupLabel(principal));
   };
@@ -578,4 +591,142 @@ export function exceptionTree(breaks) {
     found.set(item.node.id, item);
   }
   return { root, loaded, breaks: found };
+}
+
+// ---- sharing links and access requests ----
+
+/** What the link page says for any link that does not work, whatever the reason. */
+export const LINK_NOT_WORKING = 'This link does not work. It may have expired or been turned off.';
+
+/** What is said, once, beside the address of a link that was just made. */
+export const ANYONE_NOTICE = 'This address is shown only now. If you lose it, make a new link.';
+
+/** What every request for access is answered with, whether or not the item exists. */
+export const REQUEST_SENT = 'If this item exists, the people who manage it will see your request.';
+
+/** The longest message with a request for access, or reply to one, in characters. */
+export const REQUEST_MAX = 500;
+
+/** `'message_too_long'` when `text` is over [`REQUEST_MAX`] characters, otherwise null. */
+export function requestProblem(text) {
+  return [...String(text ?? '')].length > REQUEST_MAX ? 'message_too_long' : null;
+}
+
+/** The roles a link may give: within `access` (as for any sharing) and never managing access or the site. */
+export const linkRoleChoices = (roles, access) =>
+  rolesWithin(roles, access).filter(
+    (role) => !role.perms.includes('manage_access') && !role.perms.includes('manage_site'),
+  );
+
+/**
+ * The expiry of a link for people: `expires 1 December`, with the year when it is not the year of
+ * `now`; `never expires` for none. `now` (milliseconds), `timeZone` and `locale` can be passed in.
+ */
+export function expiryText(iso, { now = Date.now(), timeZone, locale = 'en-GB' } = {}) {
+  if (iso == null) return 'never expires';
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return String(iso);
+  const year = (value) => new Date(value).toLocaleDateString('en-GB', { year: 'numeric', timeZone });
+  const options = { day: 'numeric', month: 'long', timeZone };
+  if (year(date) !== year(now)) options.year = 'numeric';
+  return `expires ${date.toLocaleDateString(locale, options)}`;
+}
+
+/**
+ * A link as one phrase: `Signed-in link (Editor, expires 1 December)`. `link` is a link from
+ * `GET /api/nodes/{id}/links` (`kind`) or a link entry of an assignment (`link_kind`); `role` is
+ * `{ name }` or null.
+ */
+export function linkLabel(link, role, options) {
+  const kind = link.link_kind ?? link.kind;
+  const what = kind === 'anyone' ? 'Anyone link' : 'Signed-in link';
+  return `${what} (${role?.name ? `${role.name}, ` : ''}${expiryText(link.expires_at, options)})`;
+}
+
+/** `Anyone links: 2 live` for a break with anyone links; '' for none. */
+export const anyoneLinksText = (count) => (count > 0 ? `Anyone links: ${count} live` : '');
+
+/** The links of `links` that are neither revoked nor past their expiry at `now`. */
+export const liveLinks = (links, now = Date.now()) =>
+  links.filter((link) => !link.revoked && (link.expires_at == null || Date.parse(link.expires_at) > now));
+
+/**
+ * An expiry typed as a number of days from `now`: `{ at, error }` with `at` an RFC 3339 time (null
+ * for no expiry) and `error` null or an error code (`expiry_required`, `expiry_invalid`,
+ * `expiry_too_long`) for `messageFor`.
+ */
+export function expiryFromDays(text, { maxDays, required, now = Date.now() }) {
+  const typed = String(text ?? '').trim();
+  if (typed === '') return { at: null, error: required ? 'expiry_required' : null };
+  if (!/^[0-9]{1,5}$/.test(typed) || Number(typed) < 1) return { at: null, error: 'expiry_invalid' };
+  const days = Number(typed);
+  if (days > maxDays) return { at: null, error: 'expiry_too_long' };
+  return { at: new Date(now + days * 86400000).toISOString(), error: null };
+}
+
+/** `Approved as Editor` or `Declined` for one of the person's own decided requests. */
+export function requestDecisionText(request) {
+  if (request.decision === 'approved') {
+    return request.role?.name ? `Approved as ${request.role.name}` : 'Approved';
+  }
+  return 'Declined';
+}
+
+/** How long before `now` a time was: `just now`, `5 minutes ago`, `1 hour ago`, `3 days ago`. */
+export function ageText(iso, now = Date.now()) {
+  const seconds = Math.floor((now - Date.parse(iso)) / 1000);
+  if (!(seconds >= 60)) return 'just now';
+  const unit = (n, name) => `${n} ${name}${n === 1 ? '' : 's'} ago`;
+  if (seconds < 3600) return unit(Math.floor(seconds / 60), 'minute');
+  if (seconds < 86400) return unit(Math.floor(seconds / 3600), 'hour');
+  return unit(Math.floor(seconds / 86400), 'day');
+}
+
+/**
+ * `choices` (`{ people, groups }` as [`filterChoices`] answers) with the entry for `chosen`
+ * (`user:<id>` or `group:<id>`, '' for none) added, named `label`, if it is not there: so a
+ * filter never shows another entry than the one it filters by. A new object.
+ */
+export function withChosen(choices, chosen, label) {
+  const out = { people: [...choices.people], groups: [...choices.groups] };
+  const at = chosen.indexOf(':');
+  if (at < 0) return out;
+  const list = chosen.slice(0, at) === 'user' ? out.people : out.groups;
+  const id = chosen.slice(at + 1);
+  if (!list.some(([known]) => known === id)) list.push([id, label || id]);
+  return out;
+}
+
+/**
+ * Puts, after the element `after`, the form that asks for access to node `id`. For every "does
+ * not exist, or you do not have access" message: the answer is the same whether or not the item
+ * exists. A new call replaces an earlier form; no `id` only removes it.
+ */
+export function offerRequest(after, id) {
+  after.parentNode?.querySelector('[data-request-form]')?.remove();
+  if (!id) return;
+  const area = h('textarea', { id: 'request-message', rows: 3, maxlength: REQUEST_MAX, autocomplete: 'off' });
+  const problem = h('p', { role: 'alert', class: 'msg' });
+  const send = h('button', { type: 'submit' }, 'Request access');
+  const form = h(
+    'form',
+    { 'data-request-form': '', class: 'request-form' },
+    h('label', { for: 'request-message' }, `Ask the people who manage it for access (a message is optional, up to ${REQUEST_MAX} characters)`),
+    area,
+    h('div', {}, send),
+    problem,
+  );
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    showMessage(problem, '');
+    const bad = requestProblem(area.value);
+    if (bad) return showMessage(problem, messageFor(bad));
+    send.disabled = true;
+    const message = area.value.trim();
+    const answer = await api('POST', `/nodes/${seg(id)}/requests`, message ? { message } : {});
+    send.disabled = false;
+    if (!answer.ok) return showMessage(problem, messageFor(answer.error));
+    form.replaceChildren(h('p', { role: 'status' }, REQUEST_SENT));
+  });
+  after.after(form);
 }

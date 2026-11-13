@@ -1,6 +1,19 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  ANYONE_NOTICE,
+  LINK_NOT_WORKING,
+  REQUEST_SENT,
+  ageText,
+  anyoneLinksText,
+  expiryFromDays,
+  expiryText,
+  linkLabel,
+  linkRoleChoices,
+  liveLinks,
+  requestDecisionText,
+  requestProblem,
+  withChosen,
   breadcrumbParts,
   breaksBelow,
   exceptionTree,
@@ -420,4 +433,138 @@ test('the explorer filter offers everyone named on a break loaded, once each, by
     ['g1', 'Staff (organisation group)'],
   ]);
   assert.deepEqual(filterChoices({}), { people: [], groups: [] });
+});
+
+const NOON = Date.parse('2026-11-13T12:00:00Z');
+const EDITOR_ROLE = { id: 'editor', name: 'Editor' };
+
+test('an expiry is shown as a day, with the year only when it is not this year', () => {
+  const opts = { now: NOON, timeZone: 'UTC' };
+  assert.equal(expiryText('2026-12-01T10:00:00Z', opts), 'expires 1 December');
+  assert.equal(expiryText('2027-01-05T10:00:00Z', opts), 'expires 5 January 2027');
+  assert.equal(expiryText(null, opts), 'never expires');
+});
+
+test('a link is labelled with its kind, role and expiry', () => {
+  const opts = { now: NOON, timeZone: 'UTC' };
+  const signedIn = { kind: 'link', id: 'l1', name: null, link_kind: 'signed_in', expires_at: '2026-12-01T10:00:00Z' };
+  assert.equal(linkLabel(signedIn, EDITOR_ROLE, opts), 'Signed-in link (Editor, expires 1 December)');
+  assert.equal(
+    linkLabel({ ...signedIn, expires_at: null }, EDITOR_ROLE, opts),
+    'Signed-in link (Editor, never expires)',
+  );
+  assert.equal(
+    linkLabel({ kind: 'anyone', expires_at: '2026-12-01T10:00:00Z' }, { name: 'Viewer' }, opts),
+    'Anyone link (Viewer, expires 1 December)',
+  );
+  assert.equal(linkLabel(signedIn, null, opts), 'Signed-in link (expires 1 December)');
+  const parts = principalParts({ ...signedIn, expires_at: null }, EDITOR_ROLE);
+  assert.equal(parts.name, 'Signed-in link (Editor, never expires)');
+  assert.equal(parts.note, '');
+  assert.equal(parts.hidden, false);
+});
+
+test('the explorer filter never offers a link as a person or group', () => {
+  const link = { kind: 'link', id: 'l1', name: null, link_kind: 'signed_in', expires_at: null };
+  const choices = filterChoices({ assignments: [{ principal: link }] });
+  assert.deepEqual(choices, { people: [], groups: [] });
+});
+
+test('the person filter keeps the chosen person or group even when it is not listed', () => {
+  const choices = { people: [['u1', 'Ann']], groups: [] };
+  assert.deepEqual(withChosen(choices, 'user:u1', 'Ann'), choices);
+  assert.deepEqual(withChosen(choices, '', ''), choices);
+  assert.deepEqual(withChosen(choices, 'user:u9', 'Zed'), {
+    people: [['u1', 'Ann'], ['u9', 'Zed']],
+    groups: [],
+  });
+  assert.deepEqual(withChosen(choices, 'group:g9', 'Staff'), {
+    people: [['u1', 'Ann']],
+    groups: [['g9', 'Staff']],
+  });
+  assert.equal(choices.people.length, 1, 'the choices given are not changed');
+});
+
+test('a break says how many anyone links are live on it', () => {
+  assert.equal(anyoneLinksText(2), 'Anyone links: 2 live');
+  assert.equal(anyoneLinksText(1), 'Anyone links: 1 live');
+  assert.equal(anyoneLinksText(0), '');
+  assert.equal(anyoneLinksText(undefined), '');
+});
+
+test('links may be made only with roles within your access and without managing', () => {
+  const roles = [
+    { id: 'viewer', name: 'Viewer', perms: ['view'] },
+    { id: 'editor', name: 'Editor', perms: ['view', 'add', 'edit', 'delete'] },
+    { id: 'owner', name: 'Owner', perms: ['view', 'add', 'edit', 'delete', 'manage_access', 'manage_site'] },
+    { id: 'mgr', name: 'Access manager', perms: ['view', 'manage_access'] },
+  ];
+  assert.deepEqual(linkRoleChoices(roles, OWNER).map((r) => r.id), ['viewer', 'editor']);
+  assert.deepEqual(
+    linkRoleChoices(roles, { ...VIEWER, perms: ['view', 'manage_access'] }).map((r) => r.id),
+    ['viewer'],
+  );
+  assert.deepEqual(linkRoleChoices(roles, null), []);
+});
+
+test('only live links are listed', () => {
+  const links = [
+    { id: 'a', revoked: null, expires_at: null },
+    { id: 'b', revoked: null, expires_at: '2026-12-01T10:00:00Z' },
+    { id: 'c', revoked: null, expires_at: '2026-11-01T10:00:00Z' },
+    { id: 'd', revoked: { reason: 'manager' }, expires_at: null },
+  ];
+  assert.deepEqual(liveLinks(links, NOON).map((l) => l.id), ['a', 'b']);
+});
+
+test('an expiry in days is checked against the limit', () => {
+  const day = 86400000;
+  assert.deepEqual(expiryFromDays('7', { maxDays: 30, required: true, now: NOON }), {
+    at: new Date(NOON + 7 * day).toISOString(),
+    error: null,
+  });
+  assert.equal(expiryFromDays('30', { maxDays: 30, required: true, now: NOON }).error, null);
+  assert.equal(expiryFromDays('31', { maxDays: 30, required: true, now: NOON }).error, 'expiry_too_long');
+  assert.equal(expiryFromDays('', { maxDays: 30, required: true, now: NOON }).error, 'expiry_required');
+  assert.deepEqual(expiryFromDays(' ', { maxDays: 30, required: false, now: NOON }), { at: null, error: null });
+  for (const bad of ['0', '-1', '1.5', 'abc', '1e3']) {
+    assert.equal(expiryFromDays(bad, { maxDays: 30, required: false, now: NOON }).error, 'expiry_invalid', bad);
+  }
+});
+
+test('the words of access requests', () => {
+  assert.equal(REQUEST_SENT, 'If this item exists, the people who manage it will see your request.');
+  assert.equal(requestProblem('x'.repeat(500)), null);
+  assert.equal(requestProblem(''), null);
+  assert.equal(requestProblem('x'.repeat(501)), 'message_too_long');
+  assert.equal(requestProblem('\u{1F600}'.repeat(500)), null, 'counted in characters, not code units');
+  assert.equal(requestDecisionText({ decision: 'approved', role: EDITOR_ROLE }), 'Approved as Editor');
+  assert.equal(requestDecisionText({ decision: 'approved', role: null }), 'Approved');
+  assert.equal(requestDecisionText({ decision: 'declined' }), 'Declined');
+  assert.equal(ageText('2026-11-13T11:59:40Z', NOON), 'just now');
+  assert.equal(ageText('2026-11-13T11:55:00Z', NOON), '5 minutes ago');
+  assert.equal(ageText('2026-11-13T11:00:00Z', NOON), '1 hour ago');
+  assert.equal(ageText('2026-11-10T12:00:00Z', NOON), '3 days ago');
+  assert.equal(ageText('2026-11-13T13:00:00Z', NOON), 'just now', 'a clock a little ahead');
+});
+
+test('every new error code has its own sentence', () => {
+  for (const code of [
+    'link_not_found',
+    'link_group',
+    'link_role_too_high',
+    'already_has',
+    'anyone_links_off',
+    'expiry_required',
+    'expiry_too_long',
+    'expiry_in_past',
+    'expiry_invalid',
+    'too_many_requests',
+    'already_decided',
+    'message_too_long',
+  ]) {
+    assert.notEqual(messageFor(code), messageFor('no_such_code'), code);
+  }
+  assert.equal(LINK_NOT_WORKING, 'This link does not work. It may have expired or been turned off.');
+  assert.equal(ANYONE_NOTICE, 'This address is shown only now. If you lose it, make a new link.');
 });

@@ -12,6 +12,7 @@
   <strong>ShareCraft</strong>
   <span id="who" class="meta"></span>
   <span class="spacer"></span>
+  <a id="requests-link" class="button plain" href="/requests.html" hidden>Requests <span id="requests-count" class="badge"></span></a>
   <a id="people-link" class="button plain" href="/people.html" hidden>People</a>
   <button type="button" id="sign-out" class="plain">Sign out</button>
  </nav>
@@ -27,6 +28,11 @@
  <p id="error" role="alert" class="msg"></p>
  <ul id="sites" class="list"></ul>
  <p id="empty" hidden>You do not have access to any site yet.</p>
+ <section id="mine" aria-labelledby="mine-heading" hidden>
+  <h2 id="mine-heading">My requests</h2>
+  <p class="meta">Requests for access that someone has decided.</p>
+  <ul id="mine-list" class="list" aria-labelledby="mine-heading"></ul>
+ </section>
 </div>
 <script type="module" src="./home.js"></script>
 </body>

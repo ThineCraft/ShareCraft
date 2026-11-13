@@ -4,6 +4,7 @@
 // folders on demand. Shows only what the person manages access on; the server decides.
 
 import {
+  anyoneLinksText,
   api,
   breaksBelow,
   can,
@@ -28,6 +29,7 @@ import {
   showMessage,
   toggleOpen,
   visibleTree,
+  withChosen,
 } from './common.js';
 
 const $ = (id) => document.getElementById(id);
@@ -121,8 +123,16 @@ async function loadGroups() {
  * and everyone named on a break loaded so far. Keeps the current choice.
  */
 function fillPrincipals() {
-  const { people, groups } = filterChoices({ ...known, breaks: broken.items.concat(everything.items) });
-  const chosen = $('principal').value;
+  const select = $('principal');
+  const chosen = select.value;
+  const label = select.selectedOptions[0]?.textContent ?? '';
+  // The person or group being filtered by stays in the list, so the select never shows "Anyone"
+  // while the places are filtered.
+  const { people, groups } = withChosen(
+    filterChoices({ ...known, breaks: broken.items.concat(everything.items) }),
+    chosen,
+    label,
+  );
   const group = (label, entries, kind) =>
     entries.length ? h('optgroup', { label }, ...entries.map(([id, name]) => h('option', { value: `${kind}:${id}` }, name))) : null;
   $('principal').replaceChildren(
@@ -271,6 +281,8 @@ function treeRow({ row, depth, open }, breaksMode) {
   );
   const below = breaksBelow(row);
   if (below > 0) parts.push(h('small', { class: 'mark' }, `${below} below`));
+  const anyone = anyoneLinksText(breaksMode ? (broken.tree?.breaks.get(row.id)?.anyone_links ?? 0) : 0);
+  if (anyone) parts.push(h('small', { class: 'mark own' }, anyone));
   if (row.unique) {
     const details = h('button', { type: 'button', class: 'plain', 'aria-label': `Details of ${row.name}` }, 'Details');
     details.addEventListener('click', () => showDetail(row));
@@ -345,7 +357,7 @@ function detailView(found) {
         'tbody',
         {},
         ...found.assignments.map(({ principal, role, perms }) => {
-          const { name, note: sub } = principalParts(principal);
+          const { name, note: sub } = principalParts(principal, role);
           return h(
             'tr',
             {},
@@ -380,6 +392,8 @@ function detailView(found) {
       h('dd', {}, stamp(found.changed_by)),
       h('dt', {}, 'Places below with their own access'),
       h('dd', {}, String(found.breaks_below)),
+      h('dt', {}, 'Links for anyone'),
+      h('dd', {}, anyoneLinksText(found.anyone_links) || 'None'),
     ),
     h(
       'p',
