@@ -26,7 +26,7 @@ table.banded tbody tr:nth-child(even)>td{background:light-dark(#f4f8f7,#212b30)}
 </header>
 <div class="layout">
 <nav aria-label="Document contents"><p>In this document</p>
-<a href="#need">01 · What you need</a><a href="#build">02 · Build and check</a><a href="#admin">03 · The first administrator</a><a href="#run">04 · Run it and sign in</a><a href="#settings">05 · Settings</a><a href="#accounts">06 · Accounts and signing in</a><a href="#sharing">07 · Sharing and roles</a><a href="#removed">08 · What a removed person sees</a><a href="#data">09 · Where data is kept</a><a href="#index">10 · The revision index</a><a href="#events">11 · Events</a><a href="#stop">12 · Stopping the server, and notices</a><a href="#editors">13 · Building the editors</a><a href="#files">14 · Opening a file document</a><a href="#session">15 · File session, seat and saving</a><a href="#content">16 · Content routes</a><a href="#tree">17 · The content tree and routes</a><a href="#treegit">18 · The tree in Git and PostgreSQL</a><a href="#upgrade">19 · Upgrading</a><a href="#policy">20 · The editor pages' policy</a><a href="#limits">21 · Known limits</a><a href="#scale">22 · A library of 100,000 files</a><a href="#groups">23 · Groups, roles and the explorer</a><a href="#licences">24 · Licences</a>
+<a href="#need">01 · What you need</a><a href="#build">02 · Build and check</a><a href="#admin">03 · The first administrator</a><a href="#run">04 · Run it and sign in</a><a href="#settings">05 · Settings</a><a href="#accounts">06 · Accounts and signing in</a><a href="#sharing">07 · Sharing and roles</a><a href="#removed">08 · What a removed person sees</a><a href="#data">09 · Where data is kept</a><a href="#index">10 · The revision index</a><a href="#events">11 · Events</a><a href="#stop">12 · Stopping the server, and notices</a><a href="#editors">13 · Building the editors</a><a href="#files">14 · Opening a file document</a><a href="#session">15 · File session, seat and saving</a><a href="#content">16 · Content routes</a><a href="#tree">17 · The content tree and routes</a><a href="#treegit">18 · The tree in Git and PostgreSQL</a><a href="#upgrade">19 · Upgrading</a><a href="#policy">20 · The editor pages' policy</a><a href="#limits">21 · Known limits</a><a href="#scale">22 · A library of 100,000 files</a><a href="#groups">23 · Groups, roles and the explorer</a><a href="#links">24 · Sharing links and requests</a><a href="#licences">25 · Licences</a>
 </nav>
 <main id="main">
 <div class="toolbar"><span class="small">Standalone HTML · Print-ready · No external assets</span><button type="button" onclick="window.print()">Print / Save PDF</button></div>
@@ -171,6 +171,7 @@ cargo run -p server</code></pre>
 </tbody></table></div>
 <p>A viewer sees the live text and who else is there, but the text box is read-only and the page shows <strong>You can read this document but not change it.</strong> The server also refuses changes from a viewer, whatever the page does.</p>
 <p><strong>Administrators</strong> are owners of every document without needing a grant, so someone can always recover a document whose owners are gone. They appear in the Sharing list only if they were granted a role explicitly.</p>
+<p>People who manage access can also share by link, and a person who reaches something they cannot open can ask for access. Both are described in section 24.</p>
 <h3>Sharing a document</h3>
 <p>Owners see a <strong>Sharing</strong> panel under the text. It lists everyone who has access to the document, whether it is its own or inherited, each with a role menu and a <strong>Remove</strong> button. To add someone, type their email, choose a role and press <strong>Share</strong>. Choosing another role in a person's menu changes their role at once. Sharing is by the email of an existing account, or by choosing a group from the list: <strong>No account has that email address.</strong> appears if there is none, and only owners can learn this. A document must keep at least one manager (section 23); removing or demoting the last one is refused with <strong>A document must keep at least one owner.</strong> Nobody can give more than they hold (section 23).</p>
 <p>A change takes effect for people who have the document open straight away, without them reloading (next section).</p>
@@ -587,7 +588,8 @@ base-uri 'none'; form-action 'none'</code></pre>
 <li><strong>Local connections only.</strong> The server will not listen on a non-loopback address and refuses connections that do not come from a page it served (section 04). Two people on two computers cannot use it together. Passwords must not cross a network without encryption, and encryption (TLS) is a separate piece of work.</li>
 <li><strong>Accounts are made by an administrator.</strong> There is no sign-up, and <strong>nobody can change their own password yet</strong>, nor reset a forgotten one.</li>
 <li><strong>No single sign-on, multi-factor sign-in or guests.</strong> Access is a password account, given to a person or to a group on a site, library, folder or file. Groups cannot contain groups.</li>
-<li><strong>Only the first part of sites and libraries.</strong> The tree and inherited access are built (sections 17 to 19). Groups, roles and the inheritance explorer are built (section 23). Not built yet: sharing links, anyone-links and access requests (plan 2B), service identities, audience targeting, branding, and metadata edited after creation. A library of 100,000 files is measured (section 22).</li>
+<li><strong>Only the first part of sites and libraries.</strong> The tree and inherited access are built (sections 17 to 19). Groups, roles and the inheritance explorer are built (section 23). Sharing links, anyone links and access requests are built (section 24). Not built yet: guests, domain allow and block lists, notifications, service identities, audience targeting, branding, and metadata edited after creation. A library of 100,000 files is measured (section 22).</li>
+<li><strong>Links work on this machine only.</strong> A link's address is built from the address the person making it is using, and the server listens on the local machine only (section 04). A link opened on another computer will not reach it. Anyone links do not yet count how often they are used.</li>
 <li><strong>No page for events</strong> (section 11), and no way to see the document's saved revisions from the site: use Git (section 09).</li>
 <li><strong>One server process.</strong> Removal from live sessions is sent inside the process; running several server processes would need a different mechanism.</li>
 <li><strong>Large pastes go in pieces.</strong> One change can be at most 512 KiB as sent (section 05); a larger paste is refused with a message asking for smaller parts.</li>
@@ -731,13 +733,126 @@ base-uri 'none'; form-action 'none'</code></pre>
 <p>The move of tree records into sub-folders (sections 18 and 19) happens on the same first start. Both changes are one-way: a server from before groups and roles refuses to start on the upgraded database (it finds migrations it does not know), and with only the repository it would find no tree. <strong>Back up the PostgreSQL database and the data folder before upgrading.</strong></p>
 </section>
 
-<section id="licences"><h2>24 / Licences</h2>
+<section id="links"><h2>24 / Sharing links and access requests</h2>
+<p>Added on 13 November 2026 (plan 2B, on the branch <code>platform-links-requests</code>). Two things are new. A person who manages access can share a file or folder by link. And a person who reaches something they cannot open can ask for access. Like all permissions, both are kept in PostgreSQL only, and every change is an event (sections 11 and 18).</p>
+<div class="note"><p><strong>Links only work on the local machine while the server is in development mode.</strong> The address of a link is built from the address the person making it is using, and the server listens on the local machine only (section 04).</p></div>
+<h3>Who can share by link</h3>
+<p>Only a person with <code>manage_access</code> on the item can make, list or revoke its links. SharePoint lets ordinary members share; ShareCraft does not. The link's role must be one the person holds there themselves (<code>beyond_your_access</code>; administrators are exempt, section 23). It may never include <code>manage_access</code> or <code>manage_site</code> (<code>link_role_too_high</code>), so a link never makes anyone a manager and never counts towards the last-manager rule (section 23). The access page has a <strong>Share by link</strong> panel, and the item's live links are listed there with their kind, role, expiry and how many people used them.</p>
+<h3>Signed-in links</h3>
+<p>A signed-in link is for anyone with an account. It is a <strong>hidden link group</strong> with the link's role assigned on the item. If the item inherits its access, making the link breaks inheritance first and gives the item its own permissions, as in SharePoint. Everything in section 23 then applies unchanged: the one access decision, locking, and live sessions.</p>
+<ul>
+<li>An expiry is optional for a signed-in link.</li>
+<li>Opening the link while signed in shows <strong>Open with Editor access</strong> (or the link's role). Pressing it sends a <code>POST</code> from the page, and that adds the person to the group. A person who already holds that much is not added. A plain visit never joins anyone.</li>
+<li>A link group is never listed among groups and never offered in a group list or filter. The access, membership and group routes refuse it with <code>link_group</code>. In the explorer it shows as "Signed-in link (Editor, expires 1 December)", never as a group with a name. A break with anyone links shows "Anyone links: 2 live".</li>
+<li>Restoring inheritance on an item that removes a link group's last assignment revokes that link, with the reason "inheritance restored".</li>
+</ul>
+<h3>Anyone links</h3>
+<p>An anyone link lets a person <strong>without an account</strong> view and download. It is not a group, because such a person has no session. The link's token is checked on every request.</p>
+<ul>
+<li><strong>Off by default.</strong> An administrator switches them on in <strong>Sharing settings</strong> (<code>/sharing.html</code>, linked from People), with a plain warning. <strong>Switching them off</strong> stops every anyone link at once, on the next request. They are not revoked, and they work again if the setting is switched back on before they expire.</li>
+<li><strong>View and download only.</strong> The role is always Viewer. An anyone link never opens an editor, a session, the access page, the explorer or any other route.</li>
+<li><strong>Always expiring.</strong> An expiry is required, and it may be at most <code>anyone_link_max_days</code> away (30 unless an administrator changes it). The request itself checks the time, so it stops at the expiry instant.</li>
+<li><strong>What it reaches.</strong> The landing page; the listing of a shared folder and what is below it; downloads of files at or below the item; and the text of a plain-text document as last saved (unsaved live edits are not shown).</li>
+<li><strong>It stops at breaks.</strong> A folder or file below the item that has its own permissions is not reached, and neither is anything once it is moved out of the item or deleted, itself or through a folder above it. This is exactly what a signed-in Viewer link would reach.</li>
+<li>No anonymous answer sets a cookie.</li>
+</ul>
+<h3>Tokens and addresses</h3>
+<ul>
+<li>A token is 32 random bytes from the operating system, written as <strong>64 lowercase hex characters</strong> in the address <code>/l/&lt;token&gt;</code>.</li>
+<li><strong>Only a SHA-256 hash is stored.</strong> The address is shown <strong>once</strong>, when the link is made, in a read-only box with a Copy button: "This address is shown only now. If you lose it, make a new link." A manager who needs it again makes a new link. The list of links never carries an address.</li>
+<li>Every <code>/l/</code> page and <code>/api/l/</code> answer carries <code>Cache-Control: no-store</code> and <code>Referrer-Policy: no-referrer</code>. The sign-in page also sends no referrer.</li>
+<li>If the visitor is not signed in, the landing page keeps the token in the tab's session storage, sends them to sign in, and returns them to <code>/link.html</code>. The token is in no address except the link's own.</li>
+<li>An address that does not work shows one page, "This link does not work. It may have expired or been turned off.", whatever the reason. The server answers <code>404 link_not_found</code>.</li>
+</ul>
+<h3>Expiry, revoking and the sweeper</h3>
+<p>Revoking is immediate (S5). For a signed-in link, the group's assignments (including copies below an item that broke inheritance later) and all its members are removed in one transaction, and open documents below the item are rechecked before the answer, so a person who came in only through the link is removed or limited at once. A person who also has access another way keeps it. A revoked anyone link fails on its next request.</p>
+<p><strong>The sweeper</strong> runs every minute inside the server and revokes each expired link as a manager would: one transaction per link, an event, and a recheck of open documents. An expired signed-in link stops within a minute. An anyone link stops at the expiry instant, because the request checks the time itself. The sweeper writes one line to the log when it revokes something, and also deletes request attempts older than a day. A database error does not stop the server: the sweeper tries again the next minute. Deleting an item revokes its links with the reason "item deleted".</p>
+<h3>Access requests</h3>
+<p>Wherever the page says "This document does not exist, or you do not have access to it", it also offers a short <strong>Request access</strong> form (a message of up to 500 characters).</p>
+<ul>
+<li><strong>The answer is identical</strong> for an item that exists, one that does not, and one the person can already open: "If this item exists, the people who manage it will see your request." Nothing is recorded for the last two.</li>
+<li><strong>The limit is 20 a day per person and counts every submission</strong>, recorded or not. It is checked before anything else (<code>too_many_requests</code>), so it says nothing about the item.</li>
+<li>One open request per person per item. A second one updates the message.</li>
+<li>The request goes to everyone with <code>manage_access</code> on the item. They see it on the <strong>Requests</strong> page (<code>/requests.html</code>), with a badge on the home page. Each shows the item's path, the person, their message and its age.</li>
+<li><strong>Approve</strong> chooses a role within the approver's own access and gives it to the requester directly on the item. <strong>It never downgrades:</strong> if the requester already holds that much, the answer is <code>already_has</code> and the request stays open. <strong>Decline</strong> may carry a reply the requester sees.</li>
+<li>The requester sees their own requests <strong>only once decided</strong>, under <strong>My requests</strong> on the home page, with the decision and reply. The item is named only if they can now see it. Open requests are never listed, so the list cannot show which items exist.</li>
+</ul>
+<h3>Events</h3>
+<p><code>link.created</code>, <code>link.used</code> (first use by each person), <code>link.revoked</code> (with the reason: manager, expired, item deleted, inheritance restored), <code>request.created</code>, <code>request.approved</code>, <code>request.declined</code> and <code>setting.changed</code>.</p>
+<h3>The routes</h3>
+<p>The first table needs a signed-in person and a request from a page of this site, like every <code>/api</code> route. The second is what a link's address reaches.</p>
+<div class="table-wrap"><table class="banded"><caption>Routes for links, requests and the sharing settings</caption>
+<thead><tr><th>Route</th><th>Who</th><th>Answers</th></tr></thead>
+<tbody>
+<tr><td><code>GET /api/nodes/&lt;id&gt;/links</code></td><td><code>manage_access</code> on the item</td><td><code>200</code>, every link made on the item, live or revoked, newest first. It never includes an address.</td></tr>
+<tr><td><code>POST /api/nodes/&lt;id&gt;/links</code> <code>{kind, role, expires_at?}</code></td><td><code>manage_access</code> on the item</td><td><code>201</code> with the link and its <code>url</code>, shown only now. <code>kind</code> is <code>signed_in</code> or <code>anyone</code>. <code>expires_at</code> is a time in RFC 3339 form. Refusals: <code>403 beyond_your_access</code>, <code>400 link_role_too_high</code>, <code>400 anyone_links_off</code>, <code>400 expiry_required</code>, <code>400 expiry_too_long</code>, <code>400 expiry_in_past</code>.</td></tr>
+<tr><td><code>DELETE /api/links/&lt;id&gt;</code></td><td><code>manage_access</code> on the item</td><td><code>204</code>, also for a link already revoked. <code>404</code> for an unknown link. Open documents below the item are rechecked before the answer.</td></tr>
+<tr><td><code>POST /api/nodes/&lt;id&gt;/requests</code> <code>{message?}</code></td><td>Any signed-in person</td><td><code>202</code> with the same fixed message every time. <code>429 too_many_requests</code>; <code>400 message_too_long</code>.</td></tr>
+<tr><td><code>GET /api/requests</code></td><td>Anyone with <code>manage_access</code> on an item</td><td><code>200</code>, the open requests on items they manage, newest first, each with the item's path, the person and the message.</td></tr>
+<tr><td><code>GET /api/requests/mine</code></td><td>The requester</td><td><code>200</code>, their own decided requests only, with the decision and any reply. The item is named only if they can now see it.</td></tr>
+<tr><td><code>POST /api/requests/&lt;id&gt;/approve</code> <code>{role}</code></td><td><code>manage_access</code> on the item</td><td><code>204</code>. <code>403 beyond_your_access</code>; <code>409 already_has</code>; <code>409 already_decided</code>. <code>404</code> for a request the person cannot see.</td></tr>
+<tr><td><code>POST /api/requests/&lt;id&gt;/decline</code> <code>{reply?}</code></td><td><code>manage_access</code> on the item</td><td><code>204</code>. <code>409 already_decided</code>; <code>400 message_too_long</code>.</td></tr>
+<tr><td><code>GET /api/settings/sharing</code></td><td>Administrators, and anyone who manages access somewhere</td><td><code>200</code> <code>{anyone_links, anyone_link_max_days}</code>. <code>403</code> for anyone else.</td></tr>
+<tr><td><code>PUT /api/settings/sharing</code> <code>{anyone_links?, anyone_link_max_days?}</code></td><td>Administrators</td><td><code>200</code> with the settings as they now are. <code>422 invalid_request</code> for a value of the wrong type, out of range, or none given.</td></tr>
+<tr><td><code>GET /api/me</code></td><td>Any signed-in person</td><td>Now also carries <code>open_requests</code>, a count of the open requests the person can decide. The home page shows it as a badge.</td></tr>
+</tbody></table></div>
+<div class="table-wrap"><table class="banded"><caption>Routes a link's address reaches</caption>
+<thead><tr><th>Route</th><th>Who</th><th>Answers</th></tr></thead>
+<tbody>
+<tr><td><code>GET /l/&lt;token&gt;</code></td><td>Anyone</td><td>The landing page. It changes nothing: a plain visit, a prefetch or a link preview joins nobody.</td></tr>
+<tr><td><code>GET /api/l/&lt;token&gt;</code></td><td>Anyone with the address</td><td>What the link is. For an anyone link: the item. For a signed-in link: its role and item, or <code>401</code> to a visitor who is not signed in, so the page can ask them to sign in. A link that does not work answers <code>404 link_not_found</code>.</td></tr>
+<tr><td><code>POST /api/l/&lt;token&gt;/redeem</code></td><td>A signed-in person, from a page of this site</td><td><code>200</code> <code>{node, url}</code>: the person joins the link's group (unless they already hold that much), their open sessions are rechecked, and the answer is the page that opens the item. <code>404 link_not_found</code> for an anyone link.</td></tr>
+<tr><td><code>GET /api/l/&lt;token&gt;/children/&lt;node&gt;?after=&amp;limit=</code></td><td>Anyone with an anyone-link address</td><td>A folder's listing, limited to what the link reaches.</td></tr>
+<tr><td><code>GET /api/l/&lt;token&gt;/content/&lt;node&gt;</code></td><td>Anyone with an anyone-link address</td><td>A download, sent as an attachment with the same headers as a signed-in download. A file that was never saved answers <code>204</code>.</td></tr>
+<tr><td><code>GET /api/l/&lt;token&gt;/text/&lt;node&gt;</code></td><td>Anyone with an anyone-link address</td><td>A plain-text document's text as last saved.</td></tr>
+</tbody></table></div>
+<h3>New error codes</h3>
+<div class="table-wrap"><table class="banded"><caption>Error codes added with links and requests</caption>
+<thead><tr><th>Code</th><th>Status</th><th>When</th></tr></thead>
+<tbody>
+<tr><td><code>link_not_found</code></td><td>404</td><td>The address does not work: unknown, revoked, expired, an anyone link while the setting is off, or an item outside the link's reach. The answer is the same for every cause.</td></tr>
+<tr><td><code>link_group</code></td><td>400</td><td>A link's hidden group was addressed through the access, membership or group routes. Only the link code changes it.</td></tr>
+<tr><td><code>link_role_too_high</code></td><td>400</td><td>The role of a link includes <code>manage_access</code> or <code>manage_site</code>.</td></tr>
+<tr><td><code>already_has</code></td><td>409</td><td>Approving would give a requester no more than they already hold. The request stays open.</td></tr>
+<tr><td><code>anyone_links_off</code></td><td>400</td><td>Someone tried to make an anyone link while the setting is off.</td></tr>
+<tr><td><code>expiry_required</code></td><td>400</td><td>An anyone link was made without an expiry.</td></tr>
+<tr><td><code>expiry_too_long</code></td><td>400</td><td>The expiry is further away than <code>anyone_link_max_days</code>.</td></tr>
+<tr><td><code>expiry_in_past</code></td><td>400</td><td>The expiry is not in the future.</td></tr>
+<tr><td><code>too_many_requests</code></td><td>429</td><td>The person has made 20 access requests in the last 24 hours.</td></tr>
+<tr><td><code>already_decided</code></td><td>409</td><td>The request was already approved, declined or closed.</td></tr>
+<tr><td><code>message_too_long</code></td><td>400</td><td>A request message or a reply is over 500 characters.</td></tr>
+</tbody></table></div>
+<h3>Rulings that change behaviour</h3>
+<div class="table-wrap"><table class="banded"><caption>Rulings made while building</caption>
+<thead><tr><th>Ruling</th><th>Effect</th></tr></thead>
+<tbody>
+<tr><td>A deleted item closes its open requests with the decision <code>closed</code>.</td><td>Migration 0008 allows <code>closed</code> as well as <code>approved</code> and <code>declined</code>. Closed requests are not listed in "My requests".</td></tr>
+<tr><td>Switching anyone links off does not revoke them.</td><td>No <code>link.revoked</code> event is written. The links work again if the setting is switched back on before they expire.</td></tr>
+<tr><td>A working signed-in link answers <code>401</code> to a visitor who is not signed in.</td><td>The page needs this to ask for sign-in. Only someone who holds the address can learn that it works.</td></tr>
+<tr><td>The sign-in round trip keeps the token out of other addresses.</td><td>The token is held in the browser tab's session storage, and the sign-in page returns to <code>/link.html</code>. After signing in, reloading that page shows "This link does not work"; open the original address again.</td></tr>
+<tr><td>A message over 500 characters is refused before the daily limit is counted.</td><td>It depends only on the message, never on the item, so it reveals nothing.</td></tr>
+<tr><td>No page shows a requester their own <code>request.created</code> event.</td><td>Such an event exists only for a real item, so showing it would reveal the item.</td></tr>
+</tbody></table></div>
+<h3>The upgrade: migration 0008</h3>
+<p>It runs once, on the first start of the new server, and nobody gains or loses access. <strong>Back up the PostgreSQL database and the data folder first</strong> (sections 09 and 19). Like the earlier ones it is one-way: a server from before this plan refuses to start on the upgraded database.</p>
+<div class="table-wrap"><table class="banded"><caption>What migration 0008 changes</caption>
+<thead><tr><th>Table</th><th>What it holds</th></tr></thead>
+<tbody>
+<tr><td><code>settings</code></td><td>One row per setting: <code>anyone_links</code> (false) and <code>anyone_link_max_days</code> (30), with who changed it and when.</td></tr>
+<tr><td><code>links</code></td><td>One row per link: the item, the kind, the role, the SHA-256 hash of the token, the hidden group (signed-in links only), who made it and when, the expiry, and, once revoked, who revoked it and why. The row is kept after revoking.</td></tr>
+<tr><td><code>access_requests</code></td><td>One row per request: the item, the requester, the message, and once decided the decision, who decided, the role and the reply. One open request per person per item.</td></tr>
+<tr><td><code>request_attempts</code></td><td>One row per submission of the request form, recorded or not, for the daily limit.</td></tr>
+<tr><td><code>groups</code> (changed)</td><td>A group may now have the purpose <code>link</code>, with no name and no site.</td></tr>
+</tbody></table></div>
+</section>
+
+<section id="licences"><h2>25 / Licences</h2>
 <p>ShareCraft is licensed <strong>MIT OR Apache-2.0</strong>; the texts are in <code>LICENSE-MIT</code> and <code>LICENSE-APACHE</code>. <code>cargo xtask check</code> refuses any dependency whose licence has no non-copyleft option (GPL, LGPL, AGPL, MPL, EUPL, CDDL, SSPL).</p>
 <p>The <code>revisions</code> crate stores documents in Git using <code>gix</code> (gitoxide), a Git implementation written in Rust and licensed MIT or Apache 2.0. No C library is involved and no copyleft code is linked. Repositories it writes are ordinary Git repositories: the <code>git</code> command line reads them as usual.</p>
 <p>The four editors are licensed MIT or Apache 2.0, by their original authors. They are not part of ShareCraft's code and are not compiled into the server. The build tool copies each fork's licence, notice and attribution files into the installed editor's <code>licenses/</code> folder; what each fork changed is listed in its <code>NOTICE</code> and in <a href="editors.html">editors.html</a>.</p>
 </section>
 
-<footer>ShareCraft · ThineCraft · Building and running · Updated 12 November 2026<br>Describes the development build after the third Stage 1 plan (editors, one person at a time; merged into <code>main</code> on 10 November 2026) and the follow-up (editors keep their document when hosted), the first Stage 2 plan (the content tree and inherited permissions), and the second (groups, roles and the inheritance explorer; on the branch <code>platform-groups-roles</code>, not yet merged). Not a release.</footer>
+<footer>ShareCraft · ThineCraft · Building and running · Updated 13 November 2026<br>Describes the development build after the third Stage 1 plan (editors, one person at a time; merged into <code>main</code> on 10 November 2026) and the follow-up (editors keep their document when hosted), the first Stage 2 plan (the content tree and inherited permissions), and the second (groups, roles and the inheritance explorer; on the branch <code>platform-groups-roles</code>, not yet merged), and the third (sharing links and access requests; on the branch <code>platform-links-requests</code>, not yet merged). Not a release.</footer>
 </main></div>
 </body>
 </html>
