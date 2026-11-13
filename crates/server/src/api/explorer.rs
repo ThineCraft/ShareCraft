@@ -77,6 +77,8 @@ pub(crate) struct BreakOut {
     changed_by: Option<StampOut>,
     /// How many of the breaks shown (with the same filter) are below this one.
     breaks_below: i64,
+    /// How many live, unexpired anyone links are on the scope itself.
+    anyone_links: i64,
 }
 
 impl From<Break> for BreakOut {
@@ -95,6 +97,7 @@ impl From<Break> for BreakOut {
             kind: found.kind,
             inherited_from: found.inherited_from.map(CrumbOut::from),
             breaks_below: found.breaks_below,
+            anyone_links: found.anyone_links,
         }
     }
 }

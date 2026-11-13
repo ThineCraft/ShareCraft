@@ -481,6 +481,17 @@ impl Db {
         Ok(mine)
     }
 
+    /// The item of request `id`, whoever asks; `None` for an unknown request. For the server,
+    /// to recheck the open sessions below an item once a request on it was approved.
+    pub async fn request_node(&self, id: Uuid) -> Result<Option<NodeId>, DbError> {
+        let node: Option<Uuid> =
+            sqlx::query_scalar("select node_id from access_requests where id = $1")
+                .bind(id)
+                .fetch_optional(self.pool())
+                .await?;
+        Ok(node.map(NodeId))
+    }
+
     /// Deletes the records of submissions made at or before `now` minus a day: the daily limit
     /// no longer counts them. For the sweeper. Returns how many it deleted.
     pub async fn forget_old_attempts(&self, now: OffsetDateTime) -> Result<u64, DbError> {

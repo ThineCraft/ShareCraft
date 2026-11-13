@@ -1057,13 +1057,20 @@ pub fn breaks_csv(breaks: &[Break]) -> String {
                     ..
                 } => ("site group", name.clone()),
                 PrincipalView::HiddenGroup(id) => ("group", id.0.hyphenated().to_string()),
-                PrincipalView::Link { kind, .. } => (
-                    "link",
-                    match kind {
-                        LinkKind::SignedIn => "signed-in link".to_owned(),
-                        LinkKind::Anyone => "anyone link".to_owned(),
-                    },
-                ),
+                PrincipalView::Link {
+                    link,
+                    kind,
+                    expires_at,
+                } => {
+                    let kind = match kind {
+                        LinkKind::SignedIn => "signed-in link",
+                        LinkKind::Anyone => "anyone link",
+                    };
+                    let expires = expires_at
+                        .map(|at| format!(" expires {}", utc(at)))
+                        .unwrap_or_default();
+                    ("link", format!("{kind} {}{expires}", link.hyphenated()))
+                }
             };
             push_row(
                 &mut out,

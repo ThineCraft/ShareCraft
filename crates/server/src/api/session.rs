@@ -28,6 +28,8 @@ pub(crate) struct Me {
     email: String,
     name: String,
     is_admin: bool,
+    /// How many open requests for access the person may decide, for a badge.
+    open_requests: i64,
 }
 
 /// `POST /api/session`: checks the email and password and sets the session cookie.
@@ -82,13 +84,22 @@ pub(crate) async fn sign_out(
     Ok((StatusCode::NO_CONTENT, [(SET_COOKIE, cleared_cookie())]).into_response())
 }
 
-/// `GET /api/me`: the signed-in account.
-pub(crate) async fn me(signed: Signed) -> Json<Me> {
+/// `GET /api/me`: the signed-in account, and how many open requests for access it may decide.
+pub(crate) async fn me(
+    State(state): State<AppState>,
+    signed: Signed,
+) -> Result<Json<Me>, ApiError> {
     let user = signed.session.user;
-    Json(Me {
+    let open_requests = state
+        .db()
+        .open_request_count(user.id)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?;
+    Ok(Json(Me {
         id: user.id.0.to_string(),
         email: user.email,
         name: user.name,
         is_admin: user.is_admin,
-    })
+        open_requests,
+    }))
 }

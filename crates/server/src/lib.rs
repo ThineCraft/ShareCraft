@@ -14,6 +14,7 @@ pub mod config;
 pub mod editors;
 mod events;
 mod file_room;
+mod links;
 mod members;
 mod projection;
 mod room;
@@ -40,6 +41,7 @@ use tower_http::services::ServeDir;
 
 pub use checkpoint::{Checkpointer, library_path};
 pub use config::{Config, ConfigError};
+pub use links::sweep_once;
 pub use projection::{Report, rebuild, reconcile};
 
 use auth::Throttle;
@@ -195,10 +197,12 @@ impl AppState {
 ///   each node (see the `api` module);
 /// - `GET /api/editors` lists the installed editors, and `GET /editors/{id}/*` serves an
 ///   installed editor's files, for a signed-in caller;
+/// - `GET /l/{token}` is a sharing link's landing page, and `/api/l/{token}…` what it reaches
+///   (see the `links` module);
 /// - anything else is a static file from `web_dir`.
 ///
 /// Every response carries the security headers (see [`security_headers`]); `/api` answers are
-/// never cached.
+/// never cached, and nothing under `/l/` or `/api/l/` is cached or sent as a referrer.
 pub fn router(state: AppState) -> Router {
     let files = Router::new()
         .fallback_service(ServeDir::new(&state.config().web_dir))
@@ -207,8 +211,10 @@ pub fn router(state: AppState) -> Router {
         .route("/healthz", get(|| async { "ok" }))
         .nest("/api", api::router(state.config().max_file_bytes))
         .route("/ws/docs/{doc_id}", get(ws::upgrade))
+        .route("/l/{token}", get(links::page))
         .merge(editors::router(state.clone()))
         .fallback_service(files)
+        .layer(middleware::from_fn(links::link_headers))
         .layer(middleware::from_fn(security_headers))
         .with_state(state)
 }
@@ -226,19 +232,21 @@ async fn no_cache(request: Request, next: Next) -> Response {
     response
 }
 
-/// Adds the security headers to every response: pages, API, WebSocket handshake and errors. An
-/// answer that already carries a Content-Security-Policy (an editor's) keeps it.
+/// Adds the security headers to every response: pages, API, WebSocket handshake and errors.
+/// Each is added only where the answer does not carry its own: an editor's
+/// Content-Security-Policy, a download's sandbox and a link page's `no-referrer` stay.
 async fn security_headers(request: Request, next: Next) -> Response {
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
-    if !headers.contains_key(CONTENT_SECURITY_POLICY) {
-        headers.insert(
-            CONTENT_SECURITY_POLICY,
-            HeaderValue::from_static(CONTENT_SECURITY_POLICY_VALUE),
-        );
+    for (name, value) in [
+        (CONTENT_SECURITY_POLICY, CONTENT_SECURITY_POLICY_VALUE),
+        (X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        (REFERRER_POLICY, "same-origin"),
+    ] {
+        if !headers.contains_key(&name) {
+            headers.insert(name, HeaderValue::from_static(value));
+        }
     }
-    headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
-    headers.insert(REFERRER_POLICY, HeaderValue::from_static("same-origin"));
     response
 }
 
@@ -327,13 +335,15 @@ pub async fn prepare(config: Config) -> std::io::Result<AppState> {
     Ok(AppState::new(config, store, db))
 }
 
-/// Serves `state` on `listener` until the process ends.
+/// Serves `state` on `listener` until the process ends, with the expiry sweeper (see
+/// [`sweep_once`]) running every minute meanwhile; it stops when serving does.
 ///
 /// # Errors
 /// Returns an error if the listener is not on a loopback address, or if accepting connections
 /// fails.
 pub async fn serve_state(state: AppState, listener: TcpListener) -> std::io::Result<()> {
     require_loopback(listener.local_addr()?)?;
+    let _sweeper = links::start_sweeper(state.clone());
     axum::serve(listener, router(state)).await
 }
 

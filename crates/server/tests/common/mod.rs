@@ -128,6 +128,12 @@ impl Site {
             .await
     }
 
+    /// The running server's state, for calling the server's own functions (such as
+    /// [`server::sweep_once`]) directly.
+    pub async fn app_state(&self) -> AppState {
+        self.state().await.clone()
+    }
+
     /// The account `id` as the records hold it.
     async fn account_record(&self, id: UserId) -> User {
         self.records

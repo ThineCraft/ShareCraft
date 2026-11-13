@@ -20,7 +20,7 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use collab_core::ids::{DocId, NodeId};
 use records::{AccessError, Editor};
-use revisions::{Author, Checkpoint, CheckpointError, Outcome, RevisionId};
+use revisions::{Author, Checkpoint, CheckpointError, Outcome, RevisionId, Stored};
 use serde::Deserialize;
 use serde_json::{Map, json};
 use uuid::Uuid;
@@ -64,7 +64,7 @@ fn query_of<T>(query: Result<Query<T>, QueryRejection>) -> Result<T, ApiError> {
 }
 
 /// Runs `read` on the store without blocking the async workers.
-async fn blocking<T: Send + 'static>(
+pub(crate) async fn blocking<T: Send + 'static>(
     state: &AppState,
     read: impl FnOnce(&dyn Checkpointer) -> Result<T, CheckpointError> + Send + 'static,
 ) -> Result<T, ApiError> {
@@ -122,6 +122,13 @@ pub(crate) async fn download(
         },
     };
 
+    file_answer(&document.name, stored)
+}
+
+/// A file's bytes as every download answers them: an attachment named `name`, of type
+/// `application/octet-stream`, that a browser neither sniffs nor renders (`nosniff`, a sandbox
+/// policy), never cached, naming its revision.
+pub(crate) fn file_answer(name: &str, stored: Stored) -> Result<Response, ApiError> {
     let mut headers = HeaderMap::new();
     headers.insert(
         CONTENT_TYPE,
@@ -129,8 +136,7 @@ pub(crate) async fn download(
     );
     headers.insert(
         CONTENT_DISPOSITION,
-        HeaderValue::from_str(&content_disposition(&document.name))
-            .map_err(|e| ApiError::unavailable(&e))?,
+        HeaderValue::from_str(&content_disposition(name)).map_err(|e| ApiError::unavailable(&e))?,
     );
     headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
     headers.insert(CONTENT_SECURITY_POLICY, HeaderValue::from_static("sandbox"));

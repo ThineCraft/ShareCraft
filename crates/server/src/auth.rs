@@ -38,6 +38,32 @@ impl FromRequestParts<AppState> for Signed {
     }
 }
 
+/// A caller who may or may not be signed in: `Some` with a live session, `None` without a
+/// session cookie or with one that is unknown, ended, expired or a disabled account's. A
+/// database failure is still answered `503`, never taken for "not signed in".
+pub(crate) struct MaybeSigned(pub Option<Signed>);
+
+impl MaybeSigned {
+    /// The caller of a request with `headers`.
+    pub(crate) async fn of(headers: &HeaderMap, state: &AppState) -> Result<Self, ApiError> {
+        let Some(token) = session_token(headers) else {
+            return Ok(MaybeSigned(None));
+        };
+        match state.db().session(&token).await {
+            Ok(session) => Ok(MaybeSigned(session.map(|session| Signed { session }))),
+            Err(e) => Err(ApiError::unavailable(&e)),
+        }
+    }
+}
+
+impl FromRequestParts<AppState> for MaybeSigned {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, ApiError> {
+        MaybeSigned::of(&parts.headers, state).await
+    }
+}
+
 /// The session token in the request's cookies. Malformed values are ignored.
 fn session_token(headers: &HeaderMap) -> Option<SessionToken> {
     headers

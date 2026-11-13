@@ -87,6 +87,7 @@ async fn sign_in_sets_an_http_only_cookie_and_me_answers() {
             "email": "ann@x.test",
             "name": "Ann",
             "is_admin": false,
+            "open_requests": 0,
         })
     );
 }

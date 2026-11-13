@@ -14,8 +14,8 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use collab_core::ids::{DocId, GroupId, NodeId, UserId};
 use records::{
-    Access, AssignmentView, Crumb, Cursor, Db, Editor, Node, NodeKind, Perms, Principal,
-    PrincipalView, RoleRef,
+    Access, AssignmentView, Crumb, Cursor, Db, Editor, LinkKind, Listed, Node, NodeKind, Perms,
+    Principal, PrincipalView, RoleRef,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -34,7 +34,7 @@ const DEFAULT_LIMIT: u32 = 100;
 const MAX_LIMIT: u32 = 500;
 
 /// An RFC 3339 timestamp, or `None` when there is no time (or it cannot be written).
-fn rfc3339(time: Option<time::OffsetDateTime>) -> Option<String> {
+pub(crate) fn rfc3339(time: Option<time::OffsetDateTime>) -> Option<String> {
     time.and_then(|time| {
         time.format(&time::format_description::well_known::Rfc3339)
             .ok()
@@ -42,7 +42,7 @@ fn rfc3339(time: Option<time::OffsetDateTime>) -> Option<String> {
 }
 
 /// A node id from a path, or `422 invalid_request`.
-pub(super) fn node_id(text: &str) -> Result<NodeId, ApiError> {
+pub(crate) fn node_id(text: &str) -> Result<NodeId, ApiError> {
     parse_id(text).map(NodeId)
 }
 
@@ -149,6 +149,22 @@ pub(crate) struct ChildrenQuery {
     limit: Option<u32>,
 }
 
+impl ChildrenQuery {
+    /// The page asked for: where it starts and how many children at most. `422` for a limit
+    /// outside 1 to 500 or an `after` that is not a `next`.
+    pub(crate) fn page(&self) -> Result<(Option<Cursor>, u32), ApiError> {
+        let limit = self.limit.unwrap_or(DEFAULT_LIMIT);
+        if !(1..=MAX_LIMIT).contains(&limit) {
+            return Err(ApiError::InvalidRequest);
+        }
+        let after = match self.after.as_deref() {
+            Some(text) => Some(decode_cursor(text).ok_or(ApiError::InvalidRequest)?),
+            None => None,
+        };
+        Ok((after, limit))
+    }
+}
+
 /// One child in `GET /api/nodes/{id}/children`.
 #[derive(Serialize)]
 pub(crate) struct ChildOut {
@@ -164,12 +180,36 @@ pub(crate) struct ChildOut {
     inherits: bool,
 }
 
+impl From<Listed> for ChildOut {
+    fn from(child: Listed) -> Self {
+        ChildOut {
+            id: child.node.id.0.to_string(),
+            kind: child.node.kind,
+            name: child.node.name,
+            access: child.role,
+            editor: child.editor,
+            revised_at: rfc3339(child.revised_at),
+            inherits: !child.node.unique_scope,
+        }
+    }
+}
+
 /// `GET /api/nodes/{id}/children`.
 #[derive(Serialize)]
 pub(crate) struct ChildrenPage {
     items: Vec<ChildOut>,
     /// Passed as `after` for the next page; `None` on the last page.
     next: Option<String>,
+}
+
+impl ChildrenPage {
+    /// The page of `listed`, continuing after `next` if there is more.
+    pub(crate) fn of(listed: Vec<Listed>, next: Option<&Cursor>) -> ChildrenPage {
+        ChildrenPage {
+            items: listed.into_iter().map(ChildOut::from).collect(),
+            next: next.map(encode_cursor),
+        }
+    }
 }
 
 /// `GET /api/nodes/{id}/children?after=&limit=`: one page of the children the caller can see,
@@ -183,36 +223,14 @@ pub(crate) async fn children(
 ) -> Result<Json<ChildrenPage>, ApiError> {
     let id = node_id(&id)?;
     let Query(query) = query.map_err(|_| ApiError::BadRequest)?;
-    let limit = query.limit.unwrap_or(DEFAULT_LIMIT);
-    if !(1..=MAX_LIMIT).contains(&limit) {
-        return Err(ApiError::InvalidRequest);
-    }
-    let after = match query.after.as_deref() {
-        Some(text) => Some(decode_cursor(text).ok_or(ApiError::InvalidRequest)?),
-        None => None,
-    };
+    let (after, limit) = query.page()?;
     let (listed, next) = state
         .db()
         .children(signed.session.user.id, id, after.as_ref(), limit)
         .await
         .map_err(|e| ApiError::unavailable(&e))?
         .ok_or(ApiError::NotFound)?;
-    let items = listed
-        .into_iter()
-        .map(|child| ChildOut {
-            id: child.node.id.0.to_string(),
-            kind: child.node.kind,
-            name: child.node.name,
-            access: child.role,
-            editor: child.editor,
-            revised_at: rfc3339(child.revised_at),
-            inherits: !child.node.unique_scope,
-        })
-        .collect();
-    Ok(Json(ChildrenPage {
-        items,
-        next: next.as_ref().map(encode_cursor),
-    }))
+    Ok(Json(ChildrenPage::of(listed, next.as_ref())))
 }
 
 /// A cursor as the opaque text a page passes back: its JSON, in hexadecimal.
@@ -373,7 +391,8 @@ pub(crate) async fn remove(
 /// (`site` is `{id, name}` for a site's group, `null` for an organisation group: a site group's
 /// name can equal an organisation group's), and `{kind: "group", id, name: null, hidden: true}`
 /// for a group the caller may not see, so that no site name they could not otherwise see is
-/// shown.
+/// shown. A signed-in link is `{kind: "link", id: <link id>, name: null, link_kind, expires_at}`
+/// (`expires_at` RFC 3339 or `null`): the link, never its hidden group.
 #[derive(Serialize)]
 pub(crate) struct PrincipalOut {
     kind: &'static str,
@@ -386,6 +405,12 @@ pub(crate) struct PrincipalOut {
     site: Option<Option<SiteRef>>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     hidden: bool,
+    /// Present for a link: what kind it is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    link_kind: Option<LinkKind>,
+    /// Present for a link: when it expires, `null` for never.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expires_at: Option<Option<String>>,
 }
 
 impl PrincipalOut {
@@ -399,6 +424,8 @@ impl PrincipalOut {
                 email: emails.get(&user.id).cloned(),
                 site: None,
                 hidden: false,
+                link_kind: None,
+                expires_at: None,
             },
             PrincipalView::Group { id, name, site } => PrincipalOut {
                 kind: "group",
@@ -407,6 +434,8 @@ impl PrincipalOut {
                 email: None,
                 site: Some(site.as_ref().map(|(id, name)| SiteRef::new(*id, name))),
                 hidden: false,
+                link_kind: None,
+                expires_at: None,
             },
             PrincipalView::HiddenGroup(id) => PrincipalOut {
                 kind: "group",
@@ -415,15 +444,23 @@ impl PrincipalOut {
                 email: None,
                 site: None,
                 hidden: true,
+                link_kind: None,
+                expires_at: None,
             },
-            // Answered in full once the link routes exist: the link, never its group.
-            PrincipalView::Link { link, .. } => PrincipalOut {
+            // The link, never its group.
+            PrincipalView::Link {
+                link,
+                kind,
+                expires_at,
+            } => PrincipalOut {
                 kind: "link",
                 id: link.to_string(),
                 name: None,
                 email: None,
                 site: None,
                 hidden: false,
+                link_kind: Some(*kind),
+                expires_at: Some(rfc3339(*expires_at)),
             },
         }
     }

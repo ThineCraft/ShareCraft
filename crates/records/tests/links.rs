@@ -1139,7 +1139,18 @@ async fn explorer_lists_links_without_naming_groups() {
             .iter()
             .any(|a| matches!(a.principal, PrincipalView::Link { link: id, .. } if id == link.id))
     );
-    assert!(breaks_csv(&breaks).contains("link,signed-in link,Editor"));
+    let csv = breaks_csv(&breaks);
+    let at = expires.to_offset(time::UtcOffset::UTC);
+    assert!(csv.contains(&format!(
+        "link,signed-in link {} expires {:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z,Editor",
+        link.id.hyphenated(),
+        at.year(),
+        u8::from(at.month()),
+        at.day(),
+        at.hour(),
+        at.minute(),
+        at.second()
+    )));
     let links = test.db.links_on(ann.id, t.a).await.unwrap();
     assert_eq!(links.len(), 2);
 }

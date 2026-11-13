@@ -2,13 +2,16 @@
 //! than `GET` must also carry `Origin`. Errors are `{"error": "<code>"}`.
 
 mod admin;
-mod content;
+pub(crate) mod content;
 mod docs;
 mod explorer;
 mod groups;
-mod nodes;
+mod links;
+pub(crate) mod nodes;
+mod requests;
 mod roles;
 mod session;
+mod settings;
 mod sites;
 
 use std::fmt;
@@ -21,7 +24,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use collab_core::ids::{DocId, NodeId, SessionId, UserId};
-use records::{AccessError, AccountError};
+use records::{AccessError, AccountError, LinkError, RequestError};
 use serde::de::DeserializeOwned;
 use serde_json::json;
 use uuid::Uuid;
@@ -66,6 +69,18 @@ pub(crate) fn router(max_file_bytes: usize) -> Router<AppState> {
             delete(nodes::unshare),
         )
         .route("/nodes/{id}/inheritance", post(nodes::inheritance))
+        .route("/nodes/{id}/links", get(links::list).post(links::create))
+        .route("/links/{id}", delete(links::revoke))
+        .route("/nodes/{id}/requests", post(requests::create))
+        .route("/requests", get(requests::open))
+        .route("/requests/mine", get(requests::mine))
+        .route("/requests/{id}/approve", post(requests::approve))
+        .route("/requests/{id}/decline", post(requests::decline))
+        .route(
+            "/settings/sharing",
+            get(settings::show).put(settings::change),
+        )
+        .nest("/l", crate::links::api_router())
         .route("/nodes/{id}/inheritance/preview", get(explorer::preview))
         .route("/explorer/{root}", get(explorer::breaks))
         .route("/explorer/{root}/counts", get(explorer::counts))
@@ -172,6 +187,29 @@ pub(crate) enum ApiError {
     NotJson,
     /// 429: too many failed sign-ins for this email.
     TooManyAttempts,
+    /// 404: a link address that does not work: unknown, revoked, expired, an anyone link while
+    /// they are switched off, or one that does not reach what was asked; never distinguished.
+    LinkNotFound,
+    /// 400: a sharing link's hidden group is changed only by the link code.
+    LinkGroup,
+    /// 400: a link's role may not manage access or the site, and an anyone link only views.
+    LinkRoleTooHigh,
+    /// 409: approving would give the requester nothing they do not already have.
+    AlreadyHas,
+    /// 400: anyone links are switched off for the organisation.
+    AnyoneLinksOff,
+    /// 400: an anyone link needs an expiry.
+    ExpiryRequired,
+    /// 400: the expiry is further away than the organisation allows.
+    ExpiryTooLong,
+    /// 400: the expiry has already passed.
+    ExpiryInPast,
+    /// 429: too many requests for access in the last day.
+    TooManyRequests,
+    /// 409: the request for access was decided already.
+    AlreadyDecided,
+    /// 400: a request's message or a reply is longer than 500 characters.
+    MessageTooLong,
     /// 503: the database failed.
     Unavailable,
 }
@@ -213,6 +251,17 @@ impl ApiError {
             ApiError::TooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "too_large"),
             ApiError::NotJson => (StatusCode::UNSUPPORTED_MEDIA_TYPE, "not_json"),
             ApiError::TooManyAttempts => (StatusCode::TOO_MANY_REQUESTS, "too_many_attempts"),
+            ApiError::LinkNotFound => (StatusCode::NOT_FOUND, "link_not_found"),
+            ApiError::LinkGroup => (StatusCode::BAD_REQUEST, "link_group"),
+            ApiError::LinkRoleTooHigh => (StatusCode::BAD_REQUEST, "link_role_too_high"),
+            ApiError::AlreadyHas => (StatusCode::CONFLICT, "already_has"),
+            ApiError::AnyoneLinksOff => (StatusCode::BAD_REQUEST, "anyone_links_off"),
+            ApiError::ExpiryRequired => (StatusCode::BAD_REQUEST, "expiry_required"),
+            ApiError::ExpiryTooLong => (StatusCode::BAD_REQUEST, "expiry_too_long"),
+            ApiError::ExpiryInPast => (StatusCode::BAD_REQUEST, "expiry_in_past"),
+            ApiError::TooManyRequests => (StatusCode::TOO_MANY_REQUESTS, "too_many_requests"),
+            ApiError::AlreadyDecided => (StatusCode::CONFLICT, "already_decided"),
+            ApiError::MessageTooLong => (StatusCode::BAD_REQUEST, "message_too_long"),
             ApiError::Unavailable => (StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
         }
     }
@@ -233,17 +282,17 @@ impl From<AccessError> for ApiError {
             AccessError::BuiltinRole => ApiError::BuiltinRole,
             AccessError::GroupInUse => ApiError::GroupInUse,
             AccessError::SiteGroup => ApiError::SiteGroup,
-            // Answered with their own codes once the link and request routes exist.
-            AccessError::LinkGroup
-            | AccessError::LinkRoleTooHigh
-            | AccessError::AnyoneLinksOff
-            | AccessError::ExpiryRequired
-            | AccessError::ExpiryTooLong
-            | AccessError::ExpiryInPast
-            | AccessError::AlreadyDecided
-            | AccessError::AlreadyHas
-            | AccessError::MessageTooLong
-            | AccessError::InvalidSetting => ApiError::InvalidRequest,
+            AccessError::LinkGroup => ApiError::LinkGroup,
+            AccessError::LinkRoleTooHigh => ApiError::LinkRoleTooHigh,
+            AccessError::AnyoneLinksOff => ApiError::AnyoneLinksOff,
+            AccessError::ExpiryRequired => ApiError::ExpiryRequired,
+            AccessError::ExpiryTooLong => ApiError::ExpiryTooLong,
+            AccessError::ExpiryInPast => ApiError::ExpiryInPast,
+            AccessError::AlreadyDecided => ApiError::AlreadyDecided,
+            AccessError::AlreadyHas => ApiError::AlreadyHas,
+            AccessError::MessageTooLong => ApiError::MessageTooLong,
+            // A value that makes no sense for the setting, as any other such value.
+            AccessError::InvalidSetting => ApiError::InvalidRequest,
             AccessError::InvalidName => ApiError::InvalidName,
             // `POST /api/docs` answers this itself, naming the extension expected.
             AccessError::WrongExtension => ApiError::InvalidRequest,
@@ -258,6 +307,25 @@ impl From<AccessError> for ApiError {
             }
             // The tree is being repaired; a later attempt can succeed.
             AccessError::OutOfStep => ApiError::Unavailable,
+        }
+    }
+}
+
+impl From<LinkError> for ApiError {
+    fn from(e: LinkError) -> Self {
+        match e {
+            LinkError::NotFound => ApiError::LinkNotFound,
+            LinkError::Db(_) => ApiError::unavailable(&e),
+        }
+    }
+}
+
+impl From<RequestError> for ApiError {
+    fn from(e: RequestError) -> Self {
+        match e {
+            RequestError::TooMany => ApiError::TooManyRequests,
+            RequestError::MessageTooLong => ApiError::MessageTooLong,
+            RequestError::Db(_) => ApiError::unavailable(&e),
         }
     }
 }
@@ -286,7 +354,7 @@ fn parse_id(text: &str) -> Result<Uuid, ApiError> {
 /// task of its own and waits for it. A request whose caller goes away is dropped at its next
 /// `.await`; the task is not, so a write that was stored always reaches the rooms. A task that
 /// fails to finish answers `503`.
-async fn to_completion<T: Send + 'static>(
+pub(crate) async fn to_completion<T: Send + 'static>(
     change: impl Future<Output = Result<T, ApiError>> + Send + 'static,
 ) -> Result<T, ApiError> {
     match tokio::spawn(change).await {

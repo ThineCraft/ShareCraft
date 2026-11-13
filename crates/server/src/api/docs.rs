@@ -156,7 +156,9 @@ pub(crate) struct EventRow {
 }
 
 /// `GET /api/docs/{id}/events`: the latest events of the document, oldest first. Only for
-/// those who manage access to it.
+/// those who manage access to it. A caller's own `request.created` events are left out: a
+/// request is recorded only for an item that exists, so its event must never reach the person
+/// who asked.
 pub(crate) async fn events(
     State(state): State<AppState>,
     signed: Signed,
@@ -164,7 +166,8 @@ pub(crate) async fn events(
 ) -> Result<Json<Vec<EventRow>>, ApiError> {
     let doc = DocId(parse_id(&id)?);
     let db = state.db();
-    require_manager(db, signed.session.user.id, doc.into()).await?;
+    let caller = signed.session.user.id;
+    require_manager(db, caller, doc.into()).await?;
     let events = db
         .recent_events_for(doc, MAX_EVENTS)
         .await
@@ -172,6 +175,7 @@ pub(crate) async fn events(
     Ok(Json(
         events
             .into_iter()
+            .filter(|event| !(event.kind == "request.created" && event.subject == Some(caller)))
             .map(|event| EventRow {
                 id: event.id,
                 at: rfc3339(Some(event.at)),
