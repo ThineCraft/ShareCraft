@@ -8,7 +8,9 @@ import {
   anyoneLinksText,
   expiryFromDays,
   expiryText,
+  fileOffer,
   linkLabel,
+  linkRevokeHint,
   linkRoleChoices,
   liveLinks,
   requestDecisionText,
@@ -578,4 +580,24 @@ test('a request is answered the same whatever the server said, except for the tw
   assert.equal(requestAnswer('too_many_requests'), messageFor('too_many_requests'));
   assert.equal(requestAnswer('message_too_long'), messageFor('message_too_long'));
   assert.notEqual(messageFor('too_many_requests'), REQUEST_SENT);
+});
+
+test('a link is revoked on its own item, linked from a break below holding a copy', () => {
+  const item = { id: '11111111-1111-1111-1111-111111111111', name: 'Plans & notes' };
+  const link = { kind: 'link', id: 'l', link_kind: 'signed_in', expires_at: null, item };
+  assert.deepEqual(linkRevokeHint(link, item.id), { text: 'Revoke it under Share by link', on: null });
+  assert.deepEqual(linkRevokeHint(link, '22222222-2222-2222-2222-222222222222'), {
+    text: 'Revoke it under Share by link',
+    on: { name: 'Plans & notes', href: '/access.html?id=11111111-1111-1111-1111-111111111111' },
+  });
+  // Without its item (an older answer), the hint stays plain.
+  assert.deepEqual(linkRevokeHint({ kind: 'link', id: 'l' }, 'x'), { text: 'Revoke it under Share by link', on: null });
+});
+
+test('a file never saved offers no download', () => {
+  assert.deepEqual(fileOffer(undefined), { download: false, saved: 'Not saved yet' });
+  assert.deepEqual(fileOffer(null), { download: false, saved: 'Not saved yet' });
+  const saved = fileOffer('2026-11-13T10:00:00Z');
+  assert.equal(saved.download, true);
+  assert.match(saved.saved, /^Last saved /);
 });

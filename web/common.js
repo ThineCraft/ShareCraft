@@ -482,6 +482,17 @@ export function formatTime(text) {
   return Number.isNaN(date.getTime()) ? text : date.toLocaleString();
 }
 
+/**
+ * What an anyone link's page offers for a file with `revised_at` (as the server answers it,
+ * absent or null when never saved): `{ download, saved }`. A file never saved has nothing to
+ * download, so `download` is false and `saved` is `Not saved yet`, shown in its place; otherwise
+ * `saved` is `Last saved <local time>`.
+ */
+export function fileOffer(revisedAt) {
+  if (revisedAt == null) return { download: false, saved: 'Not saved yet' };
+  return { download: true, saved: `Last saved ${formatTime(revisedAt)}` };
+}
+
 /** The id in the address's query (`?id=`), lowercased, or '' unless it is an id. */
 export function queryId(search, name = 'id') {
   const id = (new URLSearchParams(search).get(name) ?? '').toLowerCase();
@@ -650,6 +661,19 @@ export function linkLabel(link, role, options) {
   const kind = link.link_kind ?? link.kind;
   const what = kind === 'anyone' ? 'Anyone link' : 'Signed-in link';
   return `${what} (${role?.name ? `${role.name}, ` : ''}${expiryText(link.expires_at, options)})`;
+}
+
+/**
+ * Where a link's assignment shown on the access page of `hereId` is revoked: `{ text, on }`. On
+ * the link's own item, under Share by link on this page (`on` null); on a break below that holds a
+ * copy, on the access page of the link's item (`principal.item`, `{ id, name }`): `on` is
+ * `{ name, href }`, shown as `... on <a href>name</a>`.
+ */
+export function linkRevokeHint(principal, hereId) {
+  const text = 'Revoke it under Share by link';
+  const item = principal.item;
+  if (!item || item.id === hereId) return { text, on: null };
+  return { text, on: { name: item.name, href: `/access.html?id=${seg(item.id)}` } };
 }
 
 /** `Anyone links: 2 live` for a break with anyone links; '' for none. */

@@ -411,19 +411,70 @@ async fn link_groups_cannot_be_changed_elsewhere() {
         assert!(listed.iter().all(|g| g.id != group));
         assert_eq!(test.db.group(viewer, group).await.unwrap(), None);
     }
-    for filter in [Principal::Group(group), Principal::User(bob.id)] {
-        let filter = ExplorerFilter {
-            principal: Some(filter),
-            kinds: Vec::new(),
-        };
+    let filter = ExplorerFilter {
+        principal: Some(Principal::Group(group)),
+        kinds: Vec::new(),
+    };
+    let (found, _) = test
+        .db
+        .breaks(admin.id, t.site, &filter, None, 50)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(found, Vec::new());
+}
+
+#[tokio::test]
+async fn person_filter_finds_access_through_a_link() {
+    let test = TestDb::create().await;
+    let admin = user(&test, "Admin", true).await;
+    let ann = user(&test, "Ann", false).await;
+    let bob = user(&test, "Bob", false).await;
+    let t = tree(&test, ann.id).await;
+    let (link, token) = signed_in(&test, ann.id, t.a, Role::Editor).await;
+    // Bob reaches A only through the link; a break below A holds a copy of its assignment.
+    test.db.redeem_signed_in(bob.id, &token).await.unwrap();
+    assert!(test.db.break_inheritance(ann.id, t.b).await.unwrap());
+    let group = link_group(&test, link.id).await;
+
+    let filter = ExplorerFilter {
+        principal: Some(Principal::User(bob.id)),
+        kinds: Vec::new(),
+    };
+    for viewer in [admin.id, ann.id] {
         let (found, _) = test
             .db
-            .breaks(admin.id, t.site, &filter, None, 50)
+            .breaks(viewer, t.site, &filter, None, 50)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(found, Vec::new());
+        let ids: Vec<NodeId> = found.iter().map(|b| b.node.id).collect();
+        assert_eq!(ids, vec![t.a, t.b]);
+        for found in &found {
+            // Shown as the link, with its own item, never as its group.
+            assert!(found.assignments.iter().any(|a| matches!(
+                &a.principal,
+                PrincipalView::Link { link: id, item, .. } if *id == link.id && *item == (t.a, "A".to_owned())
+            )));
+            assert!(found.assignments.iter().all(|a| match &a.principal {
+                PrincipalView::Group { id, .. } | PrincipalView::HiddenGroup(id) => *id != group,
+                _ => true,
+            }));
+        }
     }
+    // Someone who never joined is not found through it.
+    let cur = user(&test, "Cur", false).await;
+    let filter = ExplorerFilter {
+        principal: Some(Principal::User(cur.id)),
+        kinds: Vec::new(),
+    };
+    let (found, _) = test
+        .db
+        .breaks(ann.id, t.site, &filter, None, 50)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(found, Vec::new());
 }
 
 #[tokio::test]
@@ -1026,6 +1077,12 @@ async fn tokens_are_stored_hashed() {
     }
     assert_eq!(LinkToken::parse(&"a".repeat(63)), None);
     assert_eq!(LinkToken::parse(&"g".repeat(64)), None);
+    // Lower case only, as the link page accepts: the upper-case spelling of a real token is
+    // refused.
+    assert_eq!(LinkToken::parse(&"AB".repeat(32)), None);
+    assert_eq!(LinkToken::parse(&"aB".repeat(32)), None);
+    let upper = signed_token.as_url_value().to_ascii_uppercase();
+    assert_eq!(LinkToken::parse(&upper), None);
 }
 
 #[tokio::test]
@@ -1118,6 +1175,7 @@ async fn explorer_lists_links_without_naming_groups() {
                 link,
                 kind,
                 expires_at,
+                ..
             } => Some((*link, *kind, expires_at.map(|at| at.unix_timestamp()))),
             _ => None,
         })

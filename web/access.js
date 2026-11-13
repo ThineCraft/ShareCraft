@@ -11,6 +11,7 @@ import {
   h,
   inheritAgainMessage,
   linkLabel,
+  linkRevokeHint,
   linkRoleChoices,
   liveLinks,
   messageFor,
@@ -136,6 +137,13 @@ function show() {
   $('assignments').replaceChildren(...state.assignments.map(assignmentRow));
 }
 
+// Where a link is revoked: here, or (on a break below holding a copy) on its own item's page.
+function revokeHint(principal) {
+  const { text, on } = linkRevokeHint(principal, nodeId);
+  if (!on) return h('small', { class: 'meta' }, text);
+  return h('small', { class: 'meta' }, `${text} on `, h('a', { href: on.href }, on.name));
+}
+
 function assignmentRow({ principal, role, perms }) {
   if (principal.kind === 'link') {
     // A link is changed under "Share by link", never as a person or group.
@@ -149,7 +157,7 @@ function assignmentRow({ principal, role, perms }) {
         h('br'),
         h('small', {}, `Can ${permsText(perms)}`),
       ),
-      h('small', { class: 'meta' }, 'Revoke it under Share by link'),
+      revokeHint(principal),
     );
   }
   const { name, note: sub, hidden } = principalParts(principal);

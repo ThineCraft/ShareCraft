@@ -539,6 +539,9 @@ async fn signed_in_link_round_trip() {
     assert_eq!(shown["id"], link_id.as_str());
     assert_eq!(shown["link_kind"], "signed_in");
     assert!(shown["expires_at"].is_null());
+    // With its own item, where it is listed and revoked.
+    assert_eq!(shown["item"]["id"], doc.as_str());
+    assert_eq!(shown["item"]["name"], "Plan.txt");
     let group: Uuid = sqlx::query_scalar("select group_id from links where id = $1")
         .bind(uuid_of(&link_id))
         .fetch_one(server.db.db.test_pool())
@@ -1052,6 +1055,19 @@ async fn anyone_link_shows_the_last_saved_text() {
     let note = text_doc(&server, &ann, &place, "Note.txt").await;
     let (_, token) = link(&server, &ann, &note, "anyone", "viewer", Some(in_days(1))).await;
     let doc = DocId(uuid_of(&note));
+    // Never saved: no save time, so the page offers nothing to download.
+    let (status, what) =
+        status_and_json(anonymous(&server, &format!("/api/l/{token}")).await).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(what["item"].get("revised_at").is_none(), "{what}");
+    // An uploaded file is saved at once, and says when.
+    let upload = file(&server, &ann, &place, "Data.xlsx", b"bytes").await;
+    let (_, upload_token) =
+        link(&server, &ann, &upload, "anyone", "viewer", Some(in_days(1))).await;
+    let (status, what) =
+        status_and_json(anonymous(&server, &format!("/api/l/{upload_token}")).await).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(what["item"]["revised_at"].is_string(), "{what}");
     let mut writer = TestClient::connect_as(&server, doc, &ann).await;
     writer.type_at(0, "saved words").await;
     wait_stored(&server, doc, "saved words").await;

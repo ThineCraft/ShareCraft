@@ -49,11 +49,14 @@ pub enum PrincipalView {
     /// A group the viewer may not see (a group of a site they cannot reach): its id only, so
     /// that no site name they could not otherwise see is shown.
     HiddenGroup(GroupId),
-    /// A signed-in link's hidden group: the link, never a group with a name.
+    /// A signed-in link's hidden group: the link, never a group with a name. `item` is the
+    /// link's own item (id and current name), where it is listed and revoked; a break below it
+    /// may hold a copy of its assignment.
     Link {
         link: Uuid,
         kind: LinkKind,
         expires_at: Option<OffsetDateTime>,
+        item: (NodeId, String),
     },
 }
 
@@ -109,8 +112,9 @@ pub struct Break {
 /// What the explorer lists, below the node it starts from.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ExplorerFilter {
-    /// Only breaks with an assignment to this principal; for a person, to them directly or to a
-    /// group they are a member of whose members the viewer may see.
+    /// Only breaks with an assignment to this principal; for a person, to them directly, to a
+    /// group they are a member of whose members the viewer may see, or to a signed-in link they
+    /// joined (shown as the link, never as its group). A link's group is never a choice.
     pub principal: Option<Principal>,
     /// Only breaks of these kinds; every kind when empty.
     pub kinds: Vec<NodeKind>,
@@ -407,12 +411,14 @@ async fn group_views(
         return Ok(views);
     }
     let raw: Vec<Uuid> = ids.iter().map(|g| g.0).collect();
-    let links: Vec<(Uuid, Uuid, String, Option<OffsetDateTime>)> =
-        sqlx::query_as("select group_id, id, kind, expires_at from links where group_id = any($1)")
-            .bind(&raw)
-            .fetch_all(&mut *conn)
-            .await?;
-    for (group, link, kind, expires_at) in links {
+    let links: Vec<(Uuid, Uuid, String, Option<OffsetDateTime>, Uuid, String)> = sqlx::query_as(
+        "select l.group_id, l.id, l.kind, l.expires_at, l.node_id, n.name \
+         from links l join nodes n on n.id = l.node_id where l.group_id = any($1)",
+    )
+    .bind(&raw)
+    .fetch_all(&mut *conn)
+    .await?;
+    for (group, link, kind, expires_at, item, item_name) in links {
         let kind = LinkKind::parse(&kind)
             .ok_or_else(|| sqlx::Error::Decode(format!("unknown link kind {kind:?}").into()))?;
         views.insert(
@@ -421,6 +427,7 @@ async fn group_views(
                 link,
                 kind,
                 expires_at,
+                item: (NodeId(item), item_name),
             },
         );
     }
@@ -451,7 +458,8 @@ async fn group_views(
 }
 
 /// The groups `user` is a member of whose members `viewer` may see (see [`members_visible`]).
-/// A link's group is never among them: it is never offered in a filter.
+/// A link's group is never among them: it is never offered in a filter (see
+/// [`links_joined_by`]).
 async fn groups_seen_through(
     conn: &mut PgConnection,
     viewer: UserId,
@@ -465,6 +473,23 @@ async fn groups_seen_through(
     .fetch_all(&mut *conn)
     .await?;
     members_visible(conn, viewer, member_of).await
+}
+
+/// The signed-in links `user` joined (is a member of the hidden group of), by link id: the
+/// person filter matches a break where one of them is assigned, shown as the link. The viewer
+/// manages access on every break the explorer shows, and so may see whom a link there reaches.
+async fn links_joined_by(
+    conn: &mut PgConnection,
+    user: UserId,
+) -> Result<HashSet<Uuid>, sqlx::Error> {
+    let ids: Vec<Uuid> = sqlx::query_scalar(
+        "select l.id from links l join group_members m on m.group_id = l.group_id \
+         where m.user_id = $1",
+    )
+    .bind(user.0)
+    .fetch_all(conn)
+    .await?;
+    Ok(ids.into_iter().collect())
 }
 
 /// Those of `groups` (each with its site, `None` for an organisation group) whose members
@@ -624,17 +649,23 @@ async fn breaks_window(
     if let Some(wanted) = filter.principal {
         let ids: Vec<NodeId> = shown.iter().map(|found| found.node.id).collect();
         assignments = assignments_on(&mut *conn, viewer, &ids).await?;
-        let through = match wanted {
-            Principal::User(user) => groups_seen_through(&mut *conn, viewer, user).await?,
-            Principal::Group(_) => HashSet::new(),
+        let (through, joined) = match wanted {
+            Principal::User(user) => (
+                groups_seen_through(&mut *conn, viewer, user).await?,
+                links_joined_by(&mut *conn, user).await?,
+            ),
+            Principal::Group(_) => (HashSet::new(), HashSet::new()),
         };
         shown.retain(|found| {
             assignments.get(&found.node.id).is_some_and(|list| {
-                list.iter().any(|a| match a.principal.principal() {
-                    Some(named) if named == wanted => true,
-                    Some(Principal::Group(group)) => through.contains(&group),
-                    Some(Principal::User(_)) | None => false,
-                })
+                list.iter()
+                    .any(|a| match (&a.principal, a.principal.principal()) {
+                        // A link the person joined: matched, and shown as the link.
+                        (PrincipalView::Link { link, .. }, _) => joined.contains(link),
+                        (_, Some(named)) if named == wanted => true,
+                        (_, Some(Principal::Group(group))) => through.contains(&group),
+                        (_, Some(Principal::User(_)) | None) => false,
+                    })
             })
         });
     }
@@ -1061,6 +1092,7 @@ pub fn breaks_csv(breaks: &[Break]) -> String {
                     link,
                     kind,
                     expires_at,
+                    ..
                 } => {
                     let kind = match kind {
                         LinkKind::SignedIn => "signed-in link",

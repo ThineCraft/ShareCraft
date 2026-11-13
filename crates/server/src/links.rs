@@ -23,7 +23,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use collab_core::ids::{DocId, NodeId};
-use records::{Editor, LinkKind, LinkToken, Node, NodeKind};
+use records::{Document, Editor, LinkKind, LinkToken, Node, NodeKind};
 use serde::Serialize;
 use serde_json::json;
 use time::OffsetDateTime;
@@ -32,7 +32,7 @@ use tokio::time::MissedTickBehavior;
 
 use crate::AppState;
 use crate::api::content::{blocking, file_answer};
-use crate::api::nodes::{ChildrenPage, ChildrenQuery, node_id};
+use crate::api::nodes::{ChildrenPage, ChildrenQuery, node_id, rfc3339};
 use crate::api::{ApiError, recheck_below, recheck_person, to_completion};
 use crate::auth::{MaybeSigned, Signed};
 
@@ -102,18 +102,28 @@ struct ItemOut {
     /// For a file, the editor that opens it (`text` for a plain-text document).
     #[serde(skip_serializing_if = "Option::is_none")]
     editor: Option<Editor>,
+    /// For a file that has been saved, when it was last saved (RFC 3339); absent for one never
+    /// saved, which has nothing to download.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    revised_at: Option<String>,
+}
+
+/// The document of `node` when it is a file.
+async fn document_of(state: &AppState, node: &Node) -> Result<Option<Document>, ApiError> {
+    if node.kind != NodeKind::Document {
+        return Ok(None);
+    }
+    state
+        .db()
+        .document(DocId(node.id.0))
+        .await
+        .map_err(|e| ApiError::unavailable(&e))
 }
 
 /// The editor of `node` when it is a file.
 async fn editor_of(state: &AppState, node: &Node) -> Result<Option<Editor>, ApiError> {
-    if node.kind != NodeKind::Document {
-        return Ok(None);
-    }
-    Ok(state
-        .db()
-        .document(DocId(node.id.0))
-        .await
-        .map_err(|e| ApiError::unavailable(&e))?
+    Ok(document_of(state, node)
+        .await?
         .map(|document| document.editor))
 }
 
@@ -141,10 +151,12 @@ async fn what(
                 .await
                 .map_err(|e| ApiError::unavailable(&e))?
                 .ok_or(ApiError::LinkNotFound)?;
+            let document = document_of(&state, &grant.node).await?;
             let item = ItemOut {
                 id: grant.node.id.0.to_string(),
                 kind: grant.node.kind,
-                editor: editor_of(&state, &grant.node).await?,
+                editor: document.as_ref().map(|document| document.editor),
+                revised_at: rfc3339(document.and_then(|document| document.revised_at)),
                 name: grant.node.name,
             };
             Ok(Json(json!({ "kind": kind, "role": role, "item": item })).into_response())

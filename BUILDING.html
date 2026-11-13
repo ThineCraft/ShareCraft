@@ -743,7 +743,7 @@ base-uri 'none'; form-action 'none'</code></pre>
 <ul>
 <li>An expiry is optional for a signed-in link.</li>
 <li>Opening the link while signed in shows <strong>Open with Editor access</strong> (or the link's role). Pressing it sends a <code>POST</code> from the page, and that adds the person to the group. A person who already holds that much is not added. A plain visit never joins anyone.</li>
-<li>A link group is never listed among groups and never offered in a group list or filter. The access, membership and group routes refuse it with <code>link_group</code>. In the explorer it shows as "Signed-in link (Editor, expires 1 December)", never as a group with a name. A break with anyone links shows "Anyone links: 2 live".</li>
+<li>A link group is never listed among groups and never offered in a group list or filter. The access, membership and group routes refuse it with <code>link_group</code>. In the explorer it shows as "Signed-in link (Editor, expires 1 December)", never as a group with a name. Filtering the explorer by a person also finds the breaks where a signed-in link they joined is assigned, shown as the link. On a break below a link's item that holds a copy of its assignment, the access page points to the link's own item, where it is listed and revoked. A break with anyone links shows "Anyone links: 2 live".</li>
 <li>Restoring inheritance on an item that removes a link group's last assignment revokes that link, with the reason "inheritance restored".</li>
 </ul>
 <h3>Anyone links</h3>
@@ -751,14 +751,14 @@ base-uri 'none'; form-action 'none'</code></pre>
 <ul>
 <li><strong>Off by default.</strong> An administrator switches them on in <strong>Sharing settings</strong> (<code>/sharing.html</code>, linked from People), with a plain warning. <strong>Switching them off</strong> stops every anyone link at once, on the next request. They are not revoked, and they work again if the setting is switched back on before they expire.</li>
 <li><strong>View and download only.</strong> The role is always Viewer. An anyone link never opens an editor, a session, the access page, the explorer or any other route.</li>
-<li><strong>Always expiring.</strong> An expiry is required, and it may be at most <code>anyone_link_max_days</code> away (30 unless an administrator changes it). The request itself checks the time, so it stops at the expiry instant.</li>
-<li><strong>What it reaches.</strong> The landing page; the listing of a shared folder and what is below it; downloads of files at or below the item; and the text of a plain-text document as last saved (unsaved live edits are not shown).</li>
+<li><strong>Always expiring.</strong> An expiry is required, and it may be at most <code>anyone_link_max_days</code> away (30 unless an administrator changes it). The request itself checks the time, so it stops at the expiry instant. The limit is checked when a link is made: lowering it later does not shorten links that already exist, which last until their own expiry unless revoked (the settings page says so next to the field).</li>
+<li><strong>What it reaches.</strong> The landing page; the listing of a shared folder and what is below it; downloads of files at or below the item; and the text of a plain-text document as last saved (unsaved live edits are not shown). A file never saved has nothing to download: the page shows "Not saved yet" in place of Download.</li>
 <li><strong>It stops at breaks.</strong> A folder or file below the item that has its own permissions is not reached, and neither is anything once it is moved out of the item or deleted, itself or through a folder above it. This is exactly what a signed-in Viewer link would reach.</li>
 <li>No anonymous answer sets a cookie.</li>
 </ul>
 <h3>Tokens and addresses</h3>
 <ul>
-<li>A token is 32 random bytes from the operating system, written as <strong>64 lowercase hex characters</strong> in the address <code>/l/&lt;token&gt;</code>.</li>
+<li>A token is 32 random bytes from the operating system, written as <strong>64 lowercase hex characters</strong> in the address <code>/l/&lt;token&gt;</code>. Only that spelling works: the same token in capitals is not found.</li>
 <li><strong>Only a SHA-256 hash is stored.</strong> The address is shown <strong>once</strong>, when the link is made, in a read-only box with a Copy button: "This address is shown only now. If you lose it, make a new link." A manager who needs it again makes a new link. The list of links never carries an address.</li>
 <li>Every <code>/l/</code> page and <code>/api/l/</code> answer carries <code>Cache-Control: no-store</code> and <code>Referrer-Policy: no-referrer</code>. The sign-in page also sends no referrer.</li>
 <li>If the visitor is not signed in, the landing page keeps the token in the tab's session storage, sends them to sign in, and returns them to <code>/link.html</code>. The token is in no address except the link's own.</li>

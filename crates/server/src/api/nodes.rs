@@ -391,8 +391,10 @@ pub(crate) async fn remove(
 /// (`site` is `{id, name}` for a site's group, `null` for an organisation group: a site group's
 /// name can equal an organisation group's), and `{kind: "group", id, name: null, hidden: true}`
 /// for a group the caller may not see, so that no site name they could not otherwise see is
-/// shown. A signed-in link is `{kind: "link", id: <link id>, name: null, link_kind, expires_at}`
-/// (`expires_at` RFC 3339 or `null`): the link, never its hidden group.
+/// shown. A signed-in link is `{kind: "link", id: <link id>, name: null, link_kind, expires_at,
+/// item: {id, name}}` (`expires_at` RFC 3339 or `null`; `item` the link's own item, where it is
+/// listed and revoked, which for a break below holding a copy is not the node asked about): the
+/// link, never its hidden group.
 #[derive(Serialize)]
 pub(crate) struct PrincipalOut {
     kind: &'static str,
@@ -411,6 +413,16 @@ pub(crate) struct PrincipalOut {
     /// Present for a link: when it expires, `null` for never.
     #[serde(skip_serializing_if = "Option::is_none")]
     expires_at: Option<Option<String>>,
+    /// Present for a link: its own item, where it is listed and revoked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    item: Option<ItemRef>,
+}
+
+/// A link's own item as answered: `{id, name}`.
+#[derive(Serialize)]
+pub(crate) struct ItemRef {
+    id: String,
+    name: String,
 }
 
 impl PrincipalOut {
@@ -426,6 +438,7 @@ impl PrincipalOut {
                 hidden: false,
                 link_kind: None,
                 expires_at: None,
+                item: None,
             },
             PrincipalView::Group { id, name, site } => PrincipalOut {
                 kind: "group",
@@ -436,6 +449,7 @@ impl PrincipalOut {
                 hidden: false,
                 link_kind: None,
                 expires_at: None,
+                item: None,
             },
             PrincipalView::HiddenGroup(id) => PrincipalOut {
                 kind: "group",
@@ -446,12 +460,14 @@ impl PrincipalOut {
                 hidden: true,
                 link_kind: None,
                 expires_at: None,
+                item: None,
             },
             // The link, never its group.
             PrincipalView::Link {
                 link,
                 kind,
                 expires_at,
+                item,
             } => PrincipalOut {
                 kind: "link",
                 id: link.to_string(),
@@ -461,6 +477,10 @@ impl PrincipalOut {
                 hidden: false,
                 link_kind: Some(*kind),
                 expires_at: Some(rfc3339(*expires_at)),
+                item: Some(ItemRef {
+                    id: item.0.0.to_string(),
+                    name: item.1.clone(),
+                }),
             },
         }
     }

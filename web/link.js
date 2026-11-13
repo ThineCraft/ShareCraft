@@ -5,7 +5,7 @@
 // sign in has it kept in sessionStorage for the trip (sign-in returns to /link.html, which holds
 // no token); it is removed as soon as it is read.
 
-import { LINK_NOT_WORKING, formatTime, h, messageFor, safeNext, seg, showMessage } from './common.js';
+import { LINK_NOT_WORKING, fileOffer, h, messageFor, safeNext, seg, showMessage } from './common.js';
 
 const $ = (id) => document.getElementById(id);
 const PAGE = 50;
@@ -124,6 +124,10 @@ function showAnyone({ item }) {
   if (item.kind === 'document') {
     $('kind').textContent = item.editor === 'text' ? 'Text document' : 'File';
     $('file-tools').hidden = false;
+    // A file never saved has nothing to download: "Not saved yet" takes the button's place.
+    const offer = fileOffer(item.revised_at);
+    $('download').hidden = !offer.download;
+    $('not-saved').hidden = offer.download;
     $('download').href = contentUrl(item.id);
     $('download').setAttribute('aria-label', `Download ${item.name}`);
     if (item.editor === 'text') showText(item.id);
@@ -201,15 +205,19 @@ function row(child) {
     view.addEventListener('click', () => showText(child.id));
     actions.push(view);
   }
+  // A file never saved has nothing to download: "Not saved yet" takes the button's place.
+  const offer = fileOffer(child.revised_at);
   actions.push(
-    h('a', { class: 'button plain', href: contentUrl(child.id), 'aria-label': `Download ${child.name}` }, 'Download'),
+    offer.download
+      ? h('a', { class: 'button plain', href: contentUrl(child.id), 'aria-label': `Download ${child.name}` }, 'Download')
+      : h('small', {}, offer.saved),
   );
   return h(
     'li',
     {},
     h('span', { class: 'grow' }, child.name),
     h('small', {}, text ? 'Text document' : 'File'),
-    child.revised_at ? h('small', {}, `Last saved ${formatTime(child.revised_at)}`) : h('small', {}, 'Not saved yet'),
+    offer.download ? h('small', {}, offer.saved) : null,
     h('span', { class: 'actions' }, ...actions),
   );
 }

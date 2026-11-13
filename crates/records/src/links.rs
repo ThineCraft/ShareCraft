@@ -105,10 +105,14 @@ impl LinkToken {
         hex32(&self.0)
     }
 
-    /// Reads a token from a link's address; `None` unless it is exactly 64 hexadecimal
-    /// characters.
+    /// Reads a token from a link's address; `None` unless it is exactly 64 lowercase
+    /// hexadecimal characters, the one spelling [`LinkToken::as_url_value`] writes and the link
+    /// page accepts.
     #[must_use]
     pub fn parse(text: &str) -> Option<LinkToken> {
+        if text.bytes().any(|b| b.is_ascii_uppercase()) {
+            return None;
+        }
         parse_hex32(text).map(LinkToken)
     }
 
@@ -669,9 +673,11 @@ impl Db {
     /// unknown link. `None` if it was already revoked; otherwise the nodes whose assignments it
     /// removed, so that the server rechecks open sessions there. Records `link.revoked`.
     ///
-    /// Locks the item's chain, then the link's row `FOR UPDATE`, then its group `FOR UPDATE`
-    /// (with the groups and roles the actor is judged through): two revokes of one link take
-    /// turns, and the second finds it revoked. One link per transaction.
+    /// With an actor, locks the item's chain, then the link's row `FOR UPDATE`, then its group
+    /// `FOR UPDATE` (with the groups and roles the actor is judged through). Without one (the
+    /// server), it judges no one and so locks only the item's own row (not the nodes above
+    /// it), then the link's row and its group, in the same order. Either way two revokes of one
+    /// link take turns, and the second finds it revoked. One link per transaction.
     pub async fn revoke_link(
         &self,
         actor: Option<UserId>,

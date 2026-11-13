@@ -22,7 +22,8 @@
   <label class="check"><input type="checkbox" id="anyone-links"> Allow links for anyone</label>
   <div class="field">
    <label for="max-days">Longest a link for anyone may last (days, 1 to 365)</label>
-   <input type="text" inputmode="numeric" id="max-days" autocomplete="off" size="6">
+   <input type="text" inputmode="numeric" id="max-days" autocomplete="off" size="6" aria-describedby="max-days-note">
+   <small id="max-days-note" class="meta">Applies to links made from now on. Lowering it does not shorten links that already exist: they last until their own expiry unless revoked.</small>
   </div>
   <div><button type="submit">Save</button></div>
  </form>
