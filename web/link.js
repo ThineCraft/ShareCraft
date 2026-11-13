@@ -61,6 +61,15 @@ function notWorking() {
   showMessage($('problem'), LINK_NOT_WORKING);
 }
 
+// The anyone-link page's state. Declared before the start-up code below: that code awaits, then
+// calls showAnyone, which uses all of it (a `let` or `const` further down would still be unusable).
+let trail = []; // the folders opened, from the shared item down: { id, name }
+let items = [];
+let next = null;
+let loading = 0; // the latest folder load; answers to older ones are dropped
+
+const contentUrl = (id) => `${base}/content/${seg(id)}`;
+
 if (!token) {
   notWorking();
 } else {
@@ -109,13 +118,6 @@ function showSignedIn(link) {
 }
 
 // ---- an anyone link ----
-
-let trail = []; // the folders opened, from the shared item down: { id, name }
-let items = [];
-let next = null;
-let loading = 0; // the latest folder load; answers to older ones are dropped
-
-const contentUrl = (id) => `${base}/content/${seg(id)}`;
 
 function showAnyone({ item }) {
   only('item');
