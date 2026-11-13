@@ -393,8 +393,8 @@ pub(crate) async fn remove(
 /// for a group the caller may not see, so that no site name they could not otherwise see is
 /// shown. A signed-in link is `{kind: "link", id: <link id>, name: null, link_kind, expires_at,
 /// item: {id, name}}` (`expires_at` RFC 3339 or `null`; `item` the link's own item, where it is
-/// listed and revoked, which for a break below holding a copy is not the node asked about): the
-/// link, never its hidden group.
+/// listed and revoked, which for a break below holding a copy is not the node asked about, with
+/// `name` `null` when the caller may not see that item): the link, never its hidden group.
 #[derive(Serialize)]
 pub(crate) struct PrincipalOut {
     kind: &'static str,
@@ -418,11 +418,12 @@ pub(crate) struct PrincipalOut {
     item: Option<ItemRef>,
 }
 
-/// A link's own item as answered: `{id, name}`.
+/// A link's own item as answered: `{id, name}`, `name` `null` when the caller may not see the
+/// item (a break moved out from under it keeps its copy of the link's assignment).
 #[derive(Serialize)]
 pub(crate) struct ItemRef {
     id: String,
-    name: String,
+    name: Option<String>,
 }
 
 impl PrincipalOut {

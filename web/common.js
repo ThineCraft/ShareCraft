@@ -667,12 +667,14 @@ export function linkLabel(link, role, options) {
  * Where a link's assignment shown on the access page of `hereId` is revoked: `{ text, on }`. On
  * the link's own item, under Share by link on this page (`on` null); on a break below that holds a
  * copy, on the access page of the link's item (`principal.item`, `{ id, name }`): `on` is
- * `{ name, href }`, shown as `... on <a href>name</a>`.
+ * `{ name, href }`, shown as `... on <a href>name</a>`. When the item's `name` is null (the person
+ * may not see that item), plain text naming no item, with `on` null.
  */
 export function linkRevokeHint(principal, hereId) {
   const text = 'Revoke it under Share by link';
   const item = principal.item;
   if (!item || item.id === hereId) return { text, on: null };
+  if (item.name == null) return { text: `${text} on the item it was made on.`, on: null };
   return { text, on: { name: item.name, href: `/access.html?id=${seg(item.id)}` } };
 }
 

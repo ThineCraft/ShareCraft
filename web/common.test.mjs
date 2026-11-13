@@ -590,6 +590,11 @@ test('a link is revoked on its own item, linked from a break below holding a cop
     text: 'Revoke it under Share by link',
     on: { name: 'Plans & notes', href: '/access.html?id=11111111-1111-1111-1111-111111111111' },
   });
+  // An item the person may not see: plain text, no name and no link.
+  assert.deepEqual(linkRevokeHint({ ...link, item: { id: item.id, name: null } }, 'x'), {
+    text: 'Revoke it under Share by link on the item it was made on.',
+    on: null,
+  });
   // Without its item (an older answer), the hint stays plain.
   assert.deepEqual(linkRevokeHint({ kind: 'link', id: 'l' }, 'x'), { text: 'Revoke it under Share by link', on: null });
 });

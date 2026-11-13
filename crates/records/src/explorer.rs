@@ -20,7 +20,7 @@ use uuid::Uuid;
 use crate::groups::{manages, visible_groups};
 use crate::scopes::{
     ASSIGNED, Link, MINE, MINE_ON_N, Standing, access_step, applies_to, chain, crumb, manager,
-    source_index, standing,
+    path_in, source_index, standing,
 };
 use crate::{
     Access, AccessError, Crumb, Db, DbError, LinkKind, NodeKind, Perms, Principal, RoleRef,
@@ -50,13 +50,16 @@ pub enum PrincipalView {
     /// that no site name they could not otherwise see is shown.
     HiddenGroup(GroupId),
     /// A signed-in link's hidden group: the link, never a group with a name. `item` is the
-    /// link's own item (id and current name), where it is listed and revoked; a break below it
-    /// may hold a copy of its assignment.
+    /// link's own item, where it is listed and revoked (a break below it may hold a copy of its
+    /// assignment): its id, and its current name only when the viewer may see the item (has
+    /// access or limited access to it, as [`Db::path`] decides; so always for an item at or
+    /// above a node they manage). A break moved out from under the item keeps its copy, and its
+    /// new managers are not told the name of an item no path of theirs leads to.
     Link {
         link: Uuid,
         kind: LinkKind,
         expires_at: Option<OffsetDateTime>,
-        item: (NodeId, String),
+        item: (NodeId, Option<String>),
     },
 }
 
@@ -419,6 +422,11 @@ async fn group_views(
     .fetch_all(&mut *conn)
     .await?;
     for (group, link, kind, expires_at, item, item_name) in links {
+        // The item's name only for a viewer who may see the item, by the one rule of the path.
+        let item_name = path_in(&mut *conn, viewer, NodeId(item))
+            .await?
+            .is_some()
+            .then_some(item_name);
         let kind = LinkKind::parse(&kind)
             .ok_or_else(|| sqlx::Error::Decode(format!("unknown link kind {kind:?}").into()))?;
         views.insert(

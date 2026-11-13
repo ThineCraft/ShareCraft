@@ -424,6 +424,61 @@ async fn link_groups_cannot_be_changed_elsewhere() {
     assert_eq!(found, Vec::new());
 }
 
+/// The item of `link`, as `viewer` is shown it on the access page of `node`.
+async fn link_item_on(
+    test: &TestDb,
+    viewer: UserId,
+    node: NodeId,
+    link: Uuid,
+) -> Option<(NodeId, Option<String>)> {
+    let access = test.db.access(viewer, node).await.unwrap();
+    access.assignments.iter().find_map(|a| match &a.principal {
+        PrincipalView::Link { link: id, item, .. } if *id == link => Some(item.clone()),
+        _ => None,
+    })
+}
+
+#[tokio::test]
+async fn link_item_named_only_to_those_who_may_see_it() {
+    let test = TestDb::create().await;
+    let ann = user(&test, "Ann", false).await;
+    let cur = user(&test, "Cur", false).await;
+    let t = tree(&test, ann.id).await;
+    let (link, _) = signed_in(&test, ann.id, t.a, Role::Viewer).await;
+    // B, below the link's item A, breaks and holds a copy; Cur owns B only.
+    assert!(test.db.break_inheritance(ann.id, t.b).await.unwrap());
+    grant(&test, t.b, cur.id, Role::Owner).await;
+    // A is above what Cur manages, so its name is on Cur's path anyway.
+    assert_eq!(
+        link_item_on(&test, cur.id, t.b, link.id).await,
+        Some((t.a, Some("A".to_owned())))
+    );
+
+    // B moves out from under A, keeping its copy: Cur has no path to A any more.
+    let other = folder(&test, t.library, t.site, "Other").await;
+    put(&test, t.b, NodeKind::Folder, Some(other), t.site, "B").await;
+    assert_eq!(test.db.path(cur.id, t.a).await.unwrap(), None);
+    assert_eq!(
+        link_item_on(&test, cur.id, t.b, link.id).await,
+        Some((t.a, None))
+    );
+    let (found, _) = test
+        .db
+        .breaks(cur.id, t.b, &ExplorerFilter::default(), None, 50)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(found[0].assignments.iter().any(|a| matches!(
+        &a.principal,
+        PrincipalView::Link { link: id, item, .. } if *id == link.id && *item == (t.a, None)
+    )));
+    // Ann, who reaches A, still sees its name.
+    assert_eq!(
+        link_item_on(&test, ann.id, t.b, link.id).await,
+        Some((t.a, Some("A".to_owned())))
+    );
+}
+
 #[tokio::test]
 async fn person_filter_finds_access_through_a_link() {
     let test = TestDb::create().await;
@@ -454,7 +509,7 @@ async fn person_filter_finds_access_through_a_link() {
             // Shown as the link, with its own item, never as its group.
             assert!(found.assignments.iter().any(|a| matches!(
                 &a.principal,
-                PrincipalView::Link { link: id, item, .. } if *id == link.id && *item == (t.a, "A".to_owned())
+                PrincipalView::Link { link: id, item, .. } if *id == link.id && *item == (t.a, Some("A".to_owned()))
             )));
             assert!(found.assignments.iter().all(|a| match &a.principal {
                 PrincipalView::Group { id, .. } | PrincipalView::HiddenGroup(id) => *id != group,
