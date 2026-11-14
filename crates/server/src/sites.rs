@@ -56,6 +56,8 @@ pub struct SiteEdit {
 pub struct SitesReport {
     /// Sites in the tree.
     pub sites: usize,
+    /// Libraries in the tree.
+    pub libraries: usize,
     /// Saved templates in Git.
     pub templates: usize,
     /// Rows written because they differed from Git (the global navigation counts as one).
@@ -69,8 +71,9 @@ impl fmt::Display for SitesReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{} sites, {} templates, {} updated, {} failed",
+            "{} sites, {} libraries, {} templates, {} updated, {} failed",
             self.sites,
+            self.libraries,
             self.templates,
             self.updated,
             self.failed.len()
@@ -712,11 +715,12 @@ async fn repair_site(
     Ok(true)
 }
 
-/// Brings PostgreSQL's mirror of the site records, saved templates and global navigation up to
-/// date with Git: every site of the tree (not purged) whose row is missing or differs is
-/// written from its record, or for a site with none from the organisation's current defaults,
-/// with `site.changed` marked `"repaired": true` (hubs before the sites that joined them);
-/// likewise each saved template (`template.saved`) and the global navigation
+/// Brings PostgreSQL's mirror of the site records, saved templates, library records and global
+/// navigation up to date with Git: every site of the tree (not purged) whose row is missing or
+/// differs is written from its record, or for a site with none from the organisation's current
+/// defaults, with `site.changed` marked `"repaired": true` (hubs before the sites that joined
+/// them); likewise each saved template (`template.saved`), then each library, after the sites
+/// (see [`crate::libraries::reconcile`], `library.changed`), and the global navigation
 /// (`navigation.changed`). A record that cannot be written, or whose site is not in the tree,
 /// does not stop the others; it is listed in the report.
 ///
@@ -816,6 +820,12 @@ pub async fn reconcile(store: Arc<dyn Checkpointer>, db: &Db) -> Result<SitesRep
             Err(e) => report.failed.push((record.id, e.to_string())),
         }
     }
+
+    // After the sites, as a library's site comes before it.
+    let libraries = crate::libraries::reconcile(Arc::clone(&store), db).await?;
+    report.libraries = libraries.libraries;
+    report.updated = report.updated.saturating_add(libraries.updated);
+    report.failed.extend(libraries.failed);
 
     let items = navigation
         .map(|n: OrgNavigation| n.navigation)

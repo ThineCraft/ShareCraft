@@ -19,9 +19,9 @@ use records::{
     validate_template_name,
 };
 use revisions::{
-    CheckpointError, GitError, NavItem, NavTarget, SITE_SCHEMA, SiteRecord, Stamp, TemplateBody,
-    TemplateFolder, TemplateLibrary, TemplateNavItem, TemplateNavTarget, TemplateRecord,
-    TreeRecord,
+    CheckpointError, GitError, LibraryFields, NavItem, NavTarget, SITE_SCHEMA, SiteRecord, Stamp,
+    TemplateBody, TemplateFolder, TemplateLibrary, TemplateNavItem, TemplateNavTarget,
+    TemplateRecord, TreeRecord,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -107,6 +107,7 @@ pub fn built_in_body(name: &str, defaults: &RegionalDefaults) -> Option<Template
         time_zone: defaults.time_zone.clone(),
         libraries: vec![TemplateLibrary {
             name: LIBRARY_NAME.to_owned(),
+            settings: LibraryFields::default(),
             folders: Vec::new(),
         }],
         navigation: None,
@@ -478,8 +479,14 @@ fn resolve_item(
     })
 }
 
-/// The live libraries and folders of the site `site` in `tree`, by name ignoring case.
-fn site_libraries(tree: &[TreeRecord], site: Uuid) -> Vec<TemplateLibrary> {
+/// The live libraries and folders of the site `site` in `tree`, by name ignoring case, each
+/// library with its kind and settings as `settings` holds them (the defaults for a library with
+/// no record).
+fn site_libraries(
+    tree: &[TreeRecord],
+    site: Uuid,
+    settings: &HashMap<Uuid, LibraryFields>,
+) -> Vec<TemplateLibrary> {
     let mut children: HashMap<Uuid, Vec<&TreeRecord>> = HashMap::new();
     for record in tree.iter().filter(|r| {
         r.site == site && r.deleted.is_none() && matches!(r.kind.as_str(), "library" | "folder")
@@ -512,6 +519,7 @@ fn site_libraries(tree: &[TreeRecord], site: Uuid) -> Vec<TemplateLibrary> {
         .filter(|r| r.kind == "library")
         .map(|r| TemplateLibrary {
             name: r.name.clone(),
+            settings: settings.get(&r.id).cloned().unwrap_or_default(),
             folders: folders(&children, r.id),
         })
         .collect()
@@ -578,9 +586,9 @@ fn template_navigation(
 }
 
 /// Saves the shape of the site `site` as a new template named `name`, for `actor`, an
-/// administrator: its live libraries and folders (no files, nothing in its recycle bin), its
-/// kind, language, time zone and navigation (see [`template_navigation`]), as its records in
-/// Git hold them. Names made under older rules are cleaned as an imported package's are (see
+/// administrator: its live libraries, each with its kind and settings, and folders (no files,
+/// nothing in its recycle bin), its kind, language, time zone and navigation (see
+/// [`template_navigation`]), as its records in Git hold them. Names made under older rules are cleaned as an imported package's are (see
 /// [`clean_shape`]), and the links to them follow. One commit, mirrored with `template.saved`
 /// (with the names cleaned). Answers the template and the names that changed.
 ///
@@ -614,6 +622,12 @@ pub async fn save_from_site(
         None => crate::sites::new_site_record(site, &db.regional_defaults().await?),
     };
     let tree = read_tree(state.checkpointer()).await.map_err(git_failure)?;
+    let settings: HashMap<Uuid, LibraryFields> =
+        match crate::libraries::read_libraries(state.checkpointer()).await {
+            Ok(records) => records.iter().map(|r| (r.id, r.fields())).collect(),
+            Err(CheckpointError::Unsupported) => HashMap::new(),
+            Err(e) => return Err(git_failure(e)),
+        };
     let own_groups: HashMap<Uuid, SiteGroup> = db
         .site_group_ids(site)
         .await?
@@ -624,7 +638,7 @@ pub async fn save_from_site(
         kind: record.kind.clone(),
         language: record.language.clone(),
         time_zone: record.time_zone.clone(),
-        libraries: site_libraries(&tree, site.0),
+        libraries: site_libraries(&tree, site.0, &settings),
         navigation: record
             .navigation
             .as_ref()

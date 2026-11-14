@@ -73,6 +73,10 @@ const MESSAGES = {
   invalid_time_zone: 'That is not a known time zone. Use one like UTC or Europe/London.',
   invalid_navigation:
     'That navigation is not allowed. Check the labels (60 characters at most), the addresses (https:, http:, mailto: or a path) and that links go one level deep.',
+  folders_off:
+    'This library does not take folders. Its owners can switch folders on in the library settings.',
+  invalid_library_settings:
+    'Those library settings are not allowed. File types are written like .png (at most 100 of them), and an image library accepts only image types.',
   invalid_template:
     'That template cannot be used. It may be too large (at most 100 libraries, 5,000 folders and 20 levels), name things by identifier, or have a link that is not allowed.',
 };

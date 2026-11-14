@@ -8,6 +8,7 @@
 //! inline in Git and are read as before.
 
 mod blobs;
+mod libraries;
 mod meta;
 mod sites;
 mod store;
@@ -21,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 pub use blobs::{BlobError, BlobRef, BlobStore, Content, hex, parse_hex};
+pub use libraries::{LIBRARY_KINDS, LIBRARY_SCHEMA, LibraryFields, LibraryRecord};
 pub use meta::{Author, Meta};
 pub use sites::{
     HubRecord, MAX_DESCRIPTION_CHARS, MAX_TEMPLATE_NAME_CHARS, NavItem, NavTarget, OrgNavigation,

@@ -16,6 +16,7 @@ use uuid::Uuid;
 
 use crate::events::{NewEvent, record};
 use crate::groups::SiteGroup;
+use crate::libraries::validate_library_fields;
 use crate::sites::{TemplateRow, acceptable_url, validate_language, validate_time_zone};
 use crate::tree::validate_node_name;
 use crate::{AccessError, Db, DbError};
@@ -101,8 +102,9 @@ pub fn check_template_size(body: &TemplateBody) -> Result<(), AccessError> {
 /// `invalid_kind` (not `team` or `communication`), `invalid_language`, `invalid_time_zone`,
 /// `too_many_libraries` (over 100), `too_many_folders` (over 5,000 in all), `too_deep` (a
 /// folder more than 20 levels below its library), `invalid_names` (a name that is not a node
-/// name, or two alike in one place, ignoring case; cleaning names first avoids this), and
-/// `invalid_navigation` (the rules of a site's navigation, with libraries named rather than
+/// name, or two alike in one place, ignoring case; cleaning names first avoids this),
+/// `invalid_library_settings` (a library's kind or settings that break the rules of
+/// [`crate::validate_library_settings`]), and `invalid_navigation` (the rules of a site's navigation, with libraries named rather than
 /// identified, and audiences of `owners`, `members` or `visitors`).
 pub fn validate_template_body(body: &TemplateBody) -> Result<(), AccessError> {
     let refuse = |reason: &'static str| Err(AccessError::InvalidTemplate(reason));
@@ -118,6 +120,13 @@ pub fn validate_template_body(body: &TemplateBody) -> Result<(), AccessError> {
     check_template_size(body)?;
     if !names_acceptable(body) {
         return refuse("invalid_names");
+    }
+    if body
+        .libraries
+        .iter()
+        .any(|library| validate_library_fields(&library.settings).is_err())
+    {
+        return refuse("invalid_library_settings");
     }
     if let Some(items) = &body.navigation
         && !navigation_acceptable(items)
@@ -288,7 +297,7 @@ impl Db {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 mod tests {
-    use revisions::TemplateLibrary;
+    use revisions::{LibraryFields, TemplateLibrary};
 
     use super::*;
 
@@ -299,6 +308,7 @@ mod tests {
             time_zone: "UTC".into(),
             libraries: vec![TemplateLibrary {
                 name: "Documents".into(),
+                settings: LibraryFields::default(),
                 folders: Vec::new(),
             }],
             navigation: Some(vec![TemplateNavItem {
@@ -351,10 +361,21 @@ mod tests {
         libraries.libraries = (0..101)
             .map(|n| TemplateLibrary {
                 name: format!("L{n}"),
+                settings: LibraryFields::default(),
                 folders: Vec::new(),
             })
             .collect();
         assert_eq!(refused(&libraries), "too_many_libraries");
+
+        let mut image = body();
+        image.libraries[0].settings.kind = "image".into();
+        image.libraries[0].settings.allowed_types = Some(vec![".png".into()]);
+        assert_eq!(validate_template_body(&image), Ok(()));
+        image.libraries[0].settings.allowed_types = Some(vec![".exe".into()]);
+        assert_eq!(refused(&image), "invalid_library_settings");
+        let mut kind = body();
+        kind.libraries[0].settings.kind = "wiki".into();
+        assert_eq!(refused(&kind), "invalid_library_settings");
 
         let mut twice = body();
         twice.libraries[0].folders = vec![folder("A", Vec::new()), folder("a", Vec::new())];

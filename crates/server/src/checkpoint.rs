@@ -5,9 +5,9 @@ use std::time::Duration;
 
 use collab_core::ids::{DocId, Seq};
 use revisions::{
-    Author, BlobRef, Checkpoint, CheckpointError, GitError, Outcome, RevisionId, RevisionInfo,
-    RevisionStore, SiteRecord, SitesChange, Stored, TemplateRecord, TreeChange, TreeMove,
-    TreeRecord,
+    Author, BlobRef, Checkpoint, CheckpointError, GitError, LibraryRecord, Outcome, RevisionId,
+    RevisionInfo, RevisionStore, SiteRecord, SitesChange, Stored, TemplateRecord, TreeChange,
+    TreeMove, TreeRecord,
 };
 use serde_json::{Map, Value};
 use tokio::time::Instant;
@@ -115,8 +115,8 @@ pub trait Checkpointer: Send + Sync + 'static {
         Err(CheckpointError::Unsupported)
     }
 
-    /// Records one change to the site records, saved templates or global navigation, with the
-    /// tree records that go with it, as one commit (see [`RevisionStore::write_sites`]).
+    /// Records one change to the site records, library records, saved templates or global
+    /// navigation, with the tree records that go with it, as one commit (see [`RevisionStore::write_sites`]).
     ///
     /// A store that keeps no site records writes the tree records alone, as
     /// [`Checkpointer::write_tree`] does (its sites then read as having no record, with the
@@ -150,6 +150,24 @@ pub trait Checkpointer: Send + Sync + 'static {
     /// Whatever the store reports, including `Corrupt` for an unreadable record; `Unsupported`
     /// unless the implementation keeps site records.
     fn read_site_record(&self, _id: Uuid) -> Result<Option<SiteRecord>, CheckpointError> {
+        Err(CheckpointError::Unsupported)
+    }
+
+    /// Every library record.
+    ///
+    /// # Errors
+    /// Whatever the store reports, including `Corrupt` for an unreadable record; `Unsupported`
+    /// unless the implementation keeps library records.
+    fn read_libraries(&self) -> Result<Vec<LibraryRecord>, CheckpointError> {
+        Err(CheckpointError::Unsupported)
+    }
+
+    /// The record of one library; `None` if it has none.
+    ///
+    /// # Errors
+    /// Whatever the store reports, including `Corrupt` for an unreadable record; `Unsupported`
+    /// unless the implementation keeps library records.
+    fn read_library_record(&self, _id: Uuid) -> Result<Option<LibraryRecord>, CheckpointError> {
         Err(CheckpointError::Unsupported)
     }
 
@@ -238,6 +256,14 @@ impl Checkpointer for RevisionStore {
 
     fn read_site_record(&self, id: Uuid) -> Result<Option<SiteRecord>, CheckpointError> {
         RevisionStore::read_site_record(self, id)
+    }
+
+    fn read_libraries(&self) -> Result<Vec<LibraryRecord>, CheckpointError> {
+        RevisionStore::read_libraries(self)
+    }
+
+    fn read_library_record(&self, id: Uuid) -> Result<Option<LibraryRecord>, CheckpointError> {
+        RevisionStore::read_library_record(self, id)
     }
 
     fn read_templates(&self) -> Result<Vec<TemplateRecord>, CheckpointError> {

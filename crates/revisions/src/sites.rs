@@ -12,6 +12,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::libraries::{LibraryFields, LibraryRecord, library_path};
 use crate::meta::Author;
 use crate::store::{
     RevisionStore, SITES_REF, TREE_REF, commit_on_main_moving, corrupt, main_tip, read_blob,
@@ -154,12 +155,16 @@ pub struct TemplateFolder {
     pub folders: Vec<TemplateFolder>,
 }
 
-/// A library a template makes, with its folders.
+/// A library a template makes, with its kind, settings and folders.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TemplateLibrary {
     /// The library's name.
     pub name: String,
+    /// Its kind and settings; left out when they are the defaults (a document library), and
+    /// read as the defaults when a template names none.
+    #[serde(default, skip_serializing_if = "LibraryFields::is_default")]
+    pub settings: LibraryFields,
     /// The folders inside it.
     #[serde(default)]
     pub folders: Vec<TemplateFolder>,
@@ -240,7 +245,7 @@ impl OrgNavigation {
 }
 
 /// Pretty-printed with two-space indent and a trailing newline.
-fn file_bytes(value: &impl Serialize) -> Result<Vec<u8>, serde_json::Error> {
+pub(crate) fn file_bytes(value: &impl Serialize) -> Result<Vec<u8>, serde_json::Error> {
     let mut bytes = serde_json::to_vec_pretty(value)?;
     bytes.push(b'\n');
     Ok(bytes)
@@ -256,8 +261,8 @@ fn template_path(id: Uuid) -> String {
     format!("{TEMPLATES_DIR}/{}/{id}.json", shard(id))
 }
 
-/// One change to the site records, saved templates or global navigation, with any tree
-/// records that go with it, stored as one commit.
+/// One change to the site records, library records, saved templates or global navigation, with
+/// any tree records that go with it, stored as one commit.
 #[derive(Clone, Debug)]
 pub struct SitesChange<'a> {
     /// Who made the change; the commit author.
@@ -276,6 +281,10 @@ pub struct SitesChange<'a> {
     pub removed_templates: &'a [Uuid],
     /// The global navigation, if it changes.
     pub org_navigation: Option<&'a OrgNavigation>,
+    /// Library records to write, each replacing any stored for the same library.
+    pub libraries: &'a [LibraryRecord],
+    /// Libraries whose record is removed: a creation taken back.
+    pub removed_libraries: &'a [Uuid],
 }
 
 impl<'a> SitesChange<'a> {
@@ -291,12 +300,17 @@ impl<'a> SitesChange<'a> {
             templates: &[],
             removed_templates: &[],
             org_navigation: None,
+            libraries: &[],
+            removed_libraries: &[],
         }
     }
 
-    /// Whether the change writes nothing of sites, templates or the global navigation.
+    /// Whether the change writes nothing of sites, libraries, templates or the global
+    /// navigation.
     fn is_empty(&self) -> bool {
-        self.sites.is_empty()
+        self.libraries.is_empty()
+            && self.removed_libraries.is_empty()
+            && self.sites.is_empty()
             && self.removed_sites.is_empty()
             && self.templates.is_empty()
             && self.removed_templates.is_empty()
@@ -305,7 +319,7 @@ impl<'a> SitesChange<'a> {
 }
 
 /// Parses `bytes`, stored at `path` in `commit`, as a `T`.
-fn parse<T: DeserializeOwned>(
+pub(crate) fn parse<T: DeserializeOwned>(
     commit: &gix::Commit<'_>,
     path: &str,
     bytes: &[u8],
@@ -353,7 +367,7 @@ fn parse_template(
 }
 
 /// Every file in the sub-folders of `dir` on `main`'s tip `commit`, parsed by `read`.
-fn read_sharded<T>(
+pub(crate) fn read_sharded<T>(
     repo: &gix::Repository,
     commit: &gix::Commit<'_>,
     dir: &str,
@@ -389,19 +403,21 @@ fn read_sharded<T>(
 }
 
 impl RevisionStore {
-    /// Records one change to the site records, saved templates or global navigation, with the
-    /// tree records that go with it, as one commit on `main` credited to the change's author.
-    /// Points `refs/sharecraft/sites` at it, and `refs/sharecraft/tree` too when it writes tree
-    /// records. No document ref moves.
+    /// Records one change to the site records, library records, saved templates or global
+    /// navigation, with the tree records that go with it, as one commit on `main` credited to
+    /// the change's author. Points `refs/sharecraft/sites` at it, and `refs/sharecraft/tree`
+    /// too when it writes tree records. No document ref moves.
     ///
     /// # Errors
-    /// `InvalidTreeChange` if it writes nothing of sites, templates or the global navigation,
+    /// `InvalidTreeChange` if it writes nothing of sites, libraries, templates or the global
+    /// navigation,
     /// or a record is not valid; `InvalidAuthor` for a bad author; otherwise Git or encoding
     /// errors.
     pub fn write_sites(&self, change: &SitesChange<'_>) -> Result<RevisionId, CheckpointError> {
         if change.is_empty() {
             return Err(CheckpointError::InvalidTreeChange(
-                "a sites change needs at least one site, template or navigation record".into(),
+                "a sites change needs at least one site, library, template or navigation record"
+                    .into(),
             ));
         }
         if !valid_author(change.author) {
@@ -428,6 +444,12 @@ impl RevisionStore {
             }
             files.push((template_path(record.id), file_bytes(record)?));
         }
+        for record in change.libraries {
+            if let Some(problem) = record.problem() {
+                return Err(CheckpointError::InvalidTreeChange(problem));
+            }
+            files.push((library_path(record.id), file_bytes(record)?));
+        }
         if let Some(navigation) = change.org_navigation {
             if let Some(problem) = navigation.problem() {
                 return Err(CheckpointError::InvalidTreeChange(problem));
@@ -439,6 +461,7 @@ impl RevisionStore {
             .iter()
             .map(|id| site_path(*id))
             .chain(change.removed_templates.iter().map(|id| template_path(*id)))
+            .chain(change.removed_libraries.iter().map(|id| library_path(*id)))
             .collect();
 
         let _guard = self.lock();
@@ -734,6 +757,7 @@ mod tests {
                 time_zone: "UTC".into(),
                 libraries: vec![TemplateLibrary {
                     name: "Documents".into(),
+                    settings: LibraryFields::default(),
                     folders: vec![TemplateFolder {
                         name: "Plans".into(),
                         folders: Vec::new(),

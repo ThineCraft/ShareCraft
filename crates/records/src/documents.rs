@@ -195,6 +195,14 @@ pub enum AccessError {
     /// `too_deep` (see [`crate::validate_template_body`]).
     #[error("that template is not acceptable: {0}")]
     InvalidTemplate(&'static str),
+    /// A library's settings that break a rule; the reason is a short code such as
+    /// `invalid_extension` (see [`crate::validate_library_settings`]).
+    #[error("those library settings are not acceptable: {0}")]
+    InvalidLibrarySettings(&'static str),
+    /// The library's folders are off: no new folder may be made in it, nor a folder moved or
+    /// copied into it.
+    #[error("this library does not take folders")]
+    FoldersOff,
     #[error("the name of this kind of document must end with its file extension")]
     WrongExtension,
     #[error("a document with that id already exists")]

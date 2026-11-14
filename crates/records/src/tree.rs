@@ -13,6 +13,7 @@ use crate::events::{NewEvent, record, record_with_id};
 use crate::groups::{
     add_site_owner, all_locked, ensure_site_groups, groups_judged_by, lock_groups,
 };
+use crate::libraries::{LibrarySettings, ensure_library_row, lock_library_rows, upsert_library};
 use crate::links::{after_deletion, lock_links_below, revoke_locked};
 use crate::quotas::{UsageChanges, apply_usage_changes, usage_changes};
 use crate::roles::lock_roles;
@@ -203,6 +204,12 @@ pub struct NodeChange<'a> {
     /// order: chosen before the change so its navigation can aim at them. New random ids when
     /// `None`.
     pub site_group_ids: Option<[Uuid; 3]>,
+    /// Libraries whose `libraries` row the change writes: locked `FOR UPDATE`, by id, after
+    /// the `sites` rows and before the links, usage rows, groups and roles.
+    pub libraries: &'a [NodeId],
+    /// The `libraries` rows of new libraries among `rows`, written with exactly these values
+    /// (rather than the defaults), after the rows.
+    pub new_libraries: &'a [LibrarySettings],
     /// The deleted site whose purge this is (every row of it among `rows`, purged): once the
     /// rows are written, everything else the site owned goes in the same transaction (see
     /// [`crate::sites::purge_site_rows`]).
@@ -260,6 +267,9 @@ async fn upsert_node_with(
     if row.kind == NodeKind::Site && row.purged_at.is_none() {
         ensure_site_groups(&mut *conn, row.id, group_ids).await?;
         ensure_site_row(&mut *conn, row.id).await?;
+    }
+    if row.kind == NodeKind::Library && row.purged_at.is_none() {
+        ensure_library_row(&mut *conn, row.id).await?;
     }
     if row.kind == NodeKind::Document {
         sqlx::query("update documents set name = $2 where id = $1")
@@ -459,6 +469,7 @@ async fn judge(
     if !change.needs_admin && change.needs.is_empty() {
         lock_top_down(&mut *conn, &written, true).await?;
         lock_site_rows(&mut *conn, change.sites).await?;
+        lock_library_rows(&mut *conn, change.libraries).await?;
         let doomed = lock_links_below(&mut *conn, &deleted, &sites).await?;
         let purged_links = lock_links_of(&mut *conn, &purged).await?;
         let usage = usage_changes(&mut *conn, change.rows).await?;
@@ -500,6 +511,7 @@ async fn judge(
     }
     lock_top_down(&mut *conn, &written, true).await?;
     lock_site_rows(&mut *conn, change.sites).await?;
+    lock_library_rows(&mut *conn, change.libraries).await?;
     let doomed = lock_links_below(&mut *conn, &deleted, &sites).await?;
     let purged_links = lock_links_of(&mut *conn, &purged).await?;
     let usage = usage_changes(&mut *conn, change.rows).await?;
@@ -618,6 +630,9 @@ impl Db {
         }
         for site in change.new_sites {
             upsert_site(&mut tx, site).await?;
+        }
+        for library in change.new_libraries {
+            upsert_library(&mut tx, library).await?;
         }
         // A person's move into a site without room is refused; Git's own changes are mirrored.
         apply_usage_changes(&mut tx, &locked.usage, change.actor.is_some()).await?;

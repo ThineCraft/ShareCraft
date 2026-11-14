@@ -8,6 +8,7 @@ pub(crate) mod content;
 mod docs;
 mod explorer;
 mod groups;
+mod libraries;
 mod links;
 mod navigation;
 pub(crate) mod nodes;
@@ -60,6 +61,12 @@ pub(crate) fn router() -> Router<AppState> {
         .route("/sites/{id}/archive", post(sites::archive))
         .route("/sites/{id}/reactivate", post(sites::reactivate))
         .route("/sites/{id}/groups", get(sites::groups))
+        .route("/sites/{id}/libraries", post(libraries::create))
+        .route(
+            "/libraries/{id}",
+            get(libraries::show).patch(libraries::change),
+        )
+        .route("/assets", get(libraries::assets))
         .route(
             "/sites/{id}/hub",
             put(navigation::set_hub)
@@ -264,6 +271,11 @@ pub(crate) enum ApiError {
     /// 422: a template or template package that breaks one of its rules; the answer's
     /// `reason` says which.
     InvalidTemplate(&'static str),
+    /// 422: a library's kind or settings that break one of their rules; the answer's `reason`
+    /// says which.
+    InvalidLibrarySettings(&'static str),
+    /// 409: the library's folders are off: no new folder, and no folder moved or copied in.
+    FoldersOff,
     /// 422: the password is too short or too long.
     WeakPassword,
     /// 413: the body is larger than the route allows (16 KiB; file content, `max_file_bytes`).
@@ -360,6 +372,10 @@ impl ApiError {
             ApiError::InvalidTimeZone => (StatusCode::UNPROCESSABLE_ENTITY, "invalid_time_zone"),
             ApiError::InvalidNavigation => (StatusCode::UNPROCESSABLE_ENTITY, "invalid_navigation"),
             ApiError::InvalidTemplate(_) => (StatusCode::UNPROCESSABLE_ENTITY, "invalid_template"),
+            ApiError::InvalidLibrarySettings(_) => {
+                (StatusCode::UNPROCESSABLE_ENTITY, "invalid_library_settings")
+            }
+            ApiError::FoldersOff => (StatusCode::CONFLICT, "folders_off"),
             ApiError::WeakPassword => (StatusCode::UNPROCESSABLE_ENTITY, "weak_password"),
             ApiError::TooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "too_large"),
             ApiError::NotJson => (StatusCode::UNSUPPORTED_MEDIA_TYPE, "not_json"),
@@ -419,6 +435,8 @@ impl From<AccessError> for ApiError {
             AccessError::InvalidTimeZone => ApiError::InvalidTimeZone,
             AccessError::InvalidNavigation => ApiError::InvalidNavigation,
             AccessError::InvalidTemplate(reason) => ApiError::InvalidTemplate(reason),
+            AccessError::InvalidLibrarySettings(reason) => ApiError::InvalidLibrarySettings(reason),
+            AccessError::FoldersOff => ApiError::FoldersOff,
             // `POST /api/docs` answers this itself, naming the extension expected.
             AccessError::WrongExtension => ApiError::InvalidRequest,
             AccessError::NameTaken => ApiError::NameTaken,
@@ -586,7 +604,7 @@ fn after_sign_out(state: &AppState, session: SessionId) {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, code) = self.status_and_code();
-        if let ApiError::InvalidTemplate(reason) = self {
+        if let ApiError::InvalidTemplate(reason) | ApiError::InvalidLibrarySettings(reason) = self {
             return (status, Json(json!({ "error": code, "reason": reason }))).into_response();
         }
         (status, Json(json!({ "error": code }))).into_response()

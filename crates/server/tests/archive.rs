@@ -640,6 +640,16 @@ async fn archived_site_refuses_every_write() {
             ),
             write(
                 Method::POST,
+                format!("/api/sites/{site}/libraries"),
+                Some(json!({ "name": "More", "kind": "image" })),
+            ),
+            write(
+                Method::PATCH,
+                format!("/api/libraries/{library}"),
+                Some(json!({ "description": "Changed", "folders": false })),
+            ),
+            write(
+                Method::POST,
                 format!("/api/nodes/{library}/children"),
                 Some(json!({ "kind": "folder", "name": "New" })),
             ),

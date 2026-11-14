@@ -15,6 +15,7 @@ pub mod config;
 pub mod editors;
 mod events;
 mod file_room;
+pub mod libraries;
 mod links;
 mod members;
 mod projection;
@@ -366,9 +367,9 @@ pub async fn prepare(config: Config) -> std::io::Result<AppState> {
     let sites_report = sites::reconcile(Arc::clone(&store), &db)
         .await
         .map_err(|e| std::io::Error::other(format!("cannot reconcile the site records: {e}")))?;
-    println!("Reconciled the site records with Git: {sites_report}");
+    println!("Reconciled the site and library records with Git: {sites_report}");
     for (id, error) in &sites_report.failed {
-        eprintln!("sharecraft-server: site record {id} not reconciled: {error}");
+        eprintln!("sharecraft-server: site or library record {id} not reconciled: {error}");
     }
     let report = reconcile(Arc::clone(&store), &db)
         .await

@@ -12,6 +12,7 @@ mod documents;
 mod events;
 mod explorer;
 mod groups;
+mod libraries;
 mod links;
 mod navigation;
 mod quotas;
@@ -41,6 +42,10 @@ pub use explorer::{
     is_explorer_cursor,
 };
 pub use groups::{Group, SiteGroup};
+pub use libraries::{
+    IMAGE_TYPES, LibraryChange, LibraryKind, LibrarySettings, MAX_LIBRARY_TYPES, is_extension,
+    validate_library_fields, validate_library_settings,
+};
 pub use links::{AnyoneGrant, Link, LinkError, LinkKind, LinkToken};
 pub use navigation::{NavViewer, ResolvedItem, ResolvedTarget, SitesMirror};
 pub use quotas::{QUOTA_WARNING_PERCENT, QuotaError, Reservation, SiteUsage};

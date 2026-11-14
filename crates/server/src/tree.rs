@@ -15,15 +15,16 @@ use std::sync::atomic::Ordering;
 use collab_core::ids::{DocId, NodeId, UserId};
 use protocol::RemovedReason;
 use records::{
-    Access, AccessError, BinStage, ClaimId, Db, DbError, Document, Editor, NewEvent, Node,
-    NodeChange, NodeKind, NodeRow, NodesApplied, Perms, QuotaError, Reservation, SiteKind,
-    SiteSettings, User, validate_description, validate_document_name, validate_language,
-    validate_node_name, validate_template_body, validate_time_zone,
+    Access, AccessError, BinStage, ClaimId, Db, DbError, Document, Editor, LibraryKind,
+    LibrarySettings, NewEvent, Node, NodeChange, NodeKind, NodeRow, NodesApplied, Perms,
+    QuotaError, Reservation, SiteKind, SiteSettings, User, validate_description,
+    validate_document_name, validate_language, validate_node_name, validate_template_body,
+    validate_time_zone,
 };
 use revisions::{
-    Author, BlobRef, Checkpoint, CheckpointError, Content, GitError, OrgNavigation, SITE_SCHEMA,
-    SiteRecord, SitesChange, Stamp, TemplateBody, TemplateFolder, TemplateLibrary, TemplateNavItem,
-    TemplateRecord, TreeChange, TreeMove, TreeRecord,
+    Author, BlobRef, Checkpoint, CheckpointError, Content, GitError, LibraryFields, LibraryRecord,
+    OrgNavigation, SITE_SCHEMA, SiteRecord, SitesChange, Stamp, TemplateBody, TemplateFolder,
+    TemplateLibrary, TemplateNavItem, TemplateRecord, TreeChange, TreeMove, TreeRecord,
 };
 use serde_json::{Map, Value, json};
 use time::OffsetDateTime;
@@ -178,7 +179,9 @@ pub(crate) struct PendingUndo {
 
 /// What takes a change back, written as one commit: tree records, site records, sites whose
 /// record is removed (their creation taken back), saved templates put back, templates whose
-/// record is removed (their saving taken back), and the global navigation put back.
+/// record is removed (their saving taken back), the global navigation put back, library
+/// records put back and libraries whose record is removed (a creation, or the first change of
+/// a library with no record, taken back).
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Undo {
     pub(crate) records: Vec<TreeRecord>,
@@ -188,6 +191,21 @@ pub(crate) struct Undo {
     pub(crate) removed_templates: Vec<Uuid>,
     /// The global navigation put back.
     pub(crate) org_navigation: Option<OrgNavigation>,
+    pub(crate) libraries: Vec<LibraryRecord>,
+    pub(crate) removed_libraries: Vec<Uuid>,
+}
+
+impl Undo {
+    /// Whether it writes tree records alone.
+    fn tree_only(&self) -> bool {
+        self.sites.is_empty()
+            && self.removed_sites.is_empty()
+            && self.templates.is_empty()
+            && self.removed_templates.is_empty()
+            && self.org_navigation.is_none()
+            && self.libraries.is_empty()
+            && self.removed_libraries.is_empty()
+    }
 }
 
 /// A new site's shape and settings: what a template makes, with the fields given at creation
@@ -255,6 +273,12 @@ struct Plan {
     removed_sites: Vec<Uuid>,
     /// Site records the take-back writes back.
     undo_sites: Vec<SiteRecord>,
+    /// Library records written in the same commit: new libraries'.
+    libraries: Vec<LibraryRecord>,
+    /// The `libraries` rows of `libraries`, mirrored with exactly the records' values.
+    new_libraries: Vec<LibrarySettings>,
+    /// Libraries whose record the take-back removes: new libraries'.
+    undo_removed_libraries: Vec<Uuid>,
     /// Records Git already holds that are mirrored with the change: a purge's records purged
     /// before it.
     also_rows: Vec<TreeRecord>,
@@ -323,6 +347,9 @@ impl Default for Plan {
             new_sites: Vec::new(),
             removed_sites: Vec::new(),
             undo_sites: Vec::new(),
+            libraries: Vec::new(),
+            new_libraries: Vec::new(),
+            undo_removed_libraries: Vec::new(),
             also_rows: Vec::new(),
             site_rows: Vec::new(),
             purge_site: None,
@@ -358,8 +385,10 @@ impl Default for Plan {
 /// `ForbiddenBelow`) when the node's site is archived; `InvalidName`, `WrongExtension` or `NameTaken` for a name;
 /// `WrongPlace` for a kind that cannot go there or cannot be moved or deleted (and for files,
 /// which [`create_document`] creates); `IntoItself` for a move into the node or below it;
-/// `IsSite` for deleting a site; `Exists` for an identifier already used; `OutOfStep` while the
-/// tree needs repair; otherwise the Git or database error.
+/// `IsSite` for deleting a site; `Exists` for an identifier already used; `FoldersOff` for a
+/// new folder in a library whose folders are off, a folder copied into one, or a folder moved
+/// into one from elsewhere; `OutOfStep` while the tree needs repair; otherwise the Git or
+/// database error.
 ///
 /// A deletion takes a folder with every live item below it to the first stage of the site's
 /// recycle bin, as one entry, in one commit, and answers every file it deleted. The recycle
@@ -409,7 +438,7 @@ pub async fn apply(state: &AppState, actor: &User, op: TreeOp) -> Result<Applied
             kind,
             name,
             id,
-        } => plan_create(state, actor, parent, kind, &name, id).await?,
+        } => plan_create(state, actor, parent, kind, &name, id, LibraryKind::Document).await?,
         TreeOp::Rename { id, name } => plan_rename(state, actor, id, &name).await?,
         TreeOp::Move { id, parent } => plan_move(state, actor, id, parent).await?,
         TreeOp::Delete { id } => Some(plan_delete(state, actor, id).await?),
@@ -1104,8 +1133,8 @@ pub async fn adopt_flat_documents(
 }
 
 /// Refuses tree changes while the tree is out of step, unless the take-backs that could not be
-/// written now are, and a reconcile of the whole tree, then of the site records (see
-/// [`crate::sites::reconcile`]; skipped for a store that keeps none), then succeeds.
+/// written now are, and a reconcile of the whole tree, then of the site and library records
+/// (see [`crate::sites::reconcile`]; skipped for a store that keeps none), then succeeds.
 pub(crate) async fn ensure_in_step(state: &AppState) -> Result<(), AccessError> {
     let flag = state.tree_out_of_step();
     if !flag.load(Ordering::SeqCst) {
@@ -1168,27 +1197,22 @@ async fn commit(
         .collect::<Result<Vec<_>, _>>()
         .map_err(DbError::new)?;
     // A purge resumed after Git recorded it has nothing left to write there.
-    let writes =
-        !(plan.records.is_empty() && plan.sites.is_empty() && plan.removed_sites.is_empty());
+    let writes = !(plan.records.is_empty()
+        && plan.sites.is_empty()
+        && plan.removed_sites.is_empty()
+        && plan.libraries.is_empty());
     if writes {
-        if plan.sites.is_empty() && plan.removed_sites.is_empty() {
-            write_tree(
-                store,
-                author.clone(),
-                plan.message.clone(),
-                plan.records.clone(),
-            )
-            .await
+        let written = Undo {
+            records: plan.records.clone(),
+            sites: plan.sites.clone(),
+            removed_sites: plan.removed_sites.clone(),
+            libraries: plan.libraries.clone(),
+            ..Undo::default()
+        };
+        if written.tree_only() {
+            write_tree(store, author.clone(), plan.message.clone(), written.records).await
         } else {
-            write_sites(
-                store,
-                author.clone(),
-                plan.message.clone(),
-                plan.records.clone(),
-                plan.sites.clone(),
-                plan.removed_sites.clone(),
-            )
-            .await
+            write_records(store, author.clone(), plan.message.clone(), written).await
         }
         .map_err(git_failure)?;
     }
@@ -1196,9 +1220,11 @@ async fn commit(
         records: plan.undo,
         sites: plan.undo_sites,
         removed_sites: plan.undo_removed_sites,
+        removed_libraries: plan.undo_removed_libraries,
         ..Undo::default()
     };
     let site_ids: Vec<NodeId> = plan.sites.iter().map(|r| NodeId(r.id)).collect();
+    let library_ids: Vec<NodeId> = plan.libraries.iter().map(|r| NodeId(r.id)).collect();
     let actor_id = actor.map(|a| a.id);
     let applied = state
         .db()
@@ -1217,6 +1243,8 @@ async fn commit(
             new_sites: &plan.new_sites,
             site_group_ids: plan.site_group_ids,
             purge_site: plan.purge_site,
+            libraries: &[],
+            new_libraries: &plan.new_libraries,
         })
         .await;
     match applied {
@@ -1236,8 +1264,9 @@ async fn commit(
                 .chain(&plan.also_rows)
                 .map(|r| r.id)
                 .collect();
-            let repaired =
-                repair_ids(state, &ids).await && crate::sites::repair_sites(state, &site_ids).await;
+            let repaired = repair_ids(state, &ids).await
+                && crate::sites::repair_sites(state, &site_ids).await
+                && crate::libraries::repair_libraries(state, &library_ids).await;
             if !(taken_back && repaired) {
                 state.tree_out_of_step().store(true, Ordering::SeqCst);
             }
@@ -1351,12 +1380,7 @@ async fn write_pending_undos(state: &AppState) -> bool {
 /// Writes one take-back as a commit.
 async fn write_undo(state: &AppState, pending: &PendingUndo) -> Result<(), CheckpointError> {
     let undo = &pending.undo;
-    if undo.sites.is_empty()
-        && undo.removed_sites.is_empty()
-        && undo.templates.is_empty()
-        && undo.removed_templates.is_empty()
-        && undo.org_navigation.is_none()
-    {
+    if undo.tree_only() {
         return write_tree(
             state.checkpointer(),
             pending.author.clone(),
@@ -1490,6 +1514,7 @@ async fn plan_create(
     kind: NodeKind,
     name: &str,
     id: NodeId,
+    library_kind: LibraryKind,
 ) -> Result<Option<Plan>, AccessError> {
     let db = state.db();
     let name = validate_node_name(name)?.to_owned();
@@ -1517,6 +1542,14 @@ async fn plan_create(
         return Err(AccessError::WrongPlace);
     }
     require(&access, needed)?;
+    // Only administrators make an asset library.
+    let needs_admin = kind == NodeKind::Library && library_kind == LibraryKind::Asset;
+    if needs_admin && !is_admin(db, actor).await? {
+        return Err(AccessError::Forbidden);
+    }
+    if kind == NodeKind::Folder && folders_off(db, parent).await? {
+        return Err(AccessError::FoldersOff);
+    }
     if !db.name_free(parent, &name, None).await? {
         return Err(AccessError::NameTaken);
     }
@@ -1530,23 +1563,102 @@ async fn plan_create(
         &name,
         author.clone(),
     );
-    Ok(Some(Plan {
+    let mut plan = Plan {
         id,
         message: format!("Create {} {name}", kind_word(kind)),
         undo: vec![deleted(&record, author)],
         events: vec![created_event(actor.id, &record)],
         records: vec![record],
-        needs_admin: false,
+        needs_admin,
         needs: vec![(parent, needed)],
         site_groups: false,
         document: None,
         ..Plan::default()
-    }))
+    };
+    if kind == NodeKind::Library {
+        // A new library's record goes into the same commit as its tree record.
+        let library = LibraryRecord::new(
+            id.0,
+            LibraryFields {
+                kind: library_kind.as_str().to_owned(),
+                ..LibraryFields::default()
+            },
+        );
+        plan.new_libraries = vec![library_settings_of(&library)?];
+        plan.libraries = vec![library];
+        plan.undo_removed_libraries = vec![id.0];
+    }
+    Ok(Some(plan))
 }
 
-/// Creates the site `id` named `name` for `actor`, an administrator, with the libraries,
-/// folders, settings and navigation of `shape`: the site, its libraries and folders and its
-/// site record in one Git commit, then mirrored into PostgreSQL in one transaction with its
+/// The settings a library record holds, as PostgreSQL mirrors them.
+fn library_settings_of(record: &LibraryRecord) -> Result<LibrarySettings, AccessError> {
+    LibrarySettings::from_record(record).ok_or_else(|| {
+        AccessError::Db(DbError::new(format!(
+            "library {} has an unknown kind {:?}",
+            record.id, record.kind
+        )))
+    })
+}
+
+/// Whether the library that `place` is in (or is) has its folders off.
+async fn folders_off(db: &Db, place: NodeId) -> Result<bool, AccessError> {
+    let Some(library) = db.library_of(place).await? else {
+        return Ok(false);
+    };
+    Ok(db
+        .library_settings(library)
+        .await?
+        .is_some_and(|settings| !settings.folders))
+}
+
+/// `FoldersOff` when the folder `id` would go into another library, one whose folders are off,
+/// by moving into `destination`: a move of a folder within its own library is not refused, as
+/// it adds no folder to the library.
+async fn refuse_folder_into(db: &Db, id: NodeId, destination: NodeId) -> Result<(), AccessError> {
+    let into = db.library_of(destination).await?;
+    if into.is_some() && into != db.library_of(id).await? && folders_off(db, destination).await? {
+        return Err(AccessError::FoldersOff);
+    }
+    Ok(())
+}
+
+/// Creates the library `id` named `name`, of the kind `kind`, in the site `site` for `actor`,
+/// who needs `manage_site` on the site (an asset library also needs an enabled administrator):
+/// its tree record and its library record, with the defaults for the kind, in one Git commit,
+/// mirrored with `node.created` (see [`apply`]). Answers the library as PostgreSQL then holds
+/// it.
+///
+/// # Errors
+/// As [`apply`] for a library; `Forbidden` for an asset library made by anyone but an
+/// administrator.
+pub async fn create_library(
+    state: &AppState,
+    actor: &User,
+    site: NodeId,
+    id: NodeId,
+    name: &str,
+    kind: LibraryKind,
+) -> Result<Applied, AccessError> {
+    let _turn = state.tree_lock().lock().await;
+    ensure_in_step(state).await?;
+    let db = state.db();
+    let plan = plan_create(state, actor, Some(site), NodeKind::Library, name, id, kind).await?;
+    if let Some(plan) = plan {
+        let done = commit(state, Some(actor), plan).await?;
+        erase_released(state, done).await;
+    }
+    let node = db.node(id).await?.ok_or(AccessError::NotFound)?;
+    Ok(Applied {
+        node,
+        deleted: Vec::new(),
+        renamed: None,
+    })
+}
+
+/// Creates the site `id` named `name` for `actor`, an administrator, with the libraries (each
+/// of its kind, with its settings), folders, settings and navigation of `shape`: the site, its
+/// libraries and folders, its site record and its libraries' records in one Git commit, then mirrored into PostgreSQL in one transaction with its
 /// three groups (empty but for the creator, who joins Owners) and a `node.created` event for
 /// each node. The navigation's library names become the new libraries (an item naming a
 /// library the shape does not hold is left out, with its children) and its audiences the new
@@ -1610,9 +1722,11 @@ async fn plan_site(
         author.clone(),
     )];
     let mut libraries = HashMap::new();
+    let mut library_records = Vec::new();
     for library in &shape.libraries {
         let library_id = NodeId(Uuid::new_v4());
         libraries.insert(library.name.to_lowercase(), library_id.0);
+        library_records.push(LibraryRecord::new(library_id.0, library.settings.clone()));
         records.push(new_record(
             library_id,
             NodeKind::Library,
@@ -1665,6 +1779,12 @@ async fn plan_site(
         new_sites: vec![crate::sites::settings_of(&site_record).map_err(DbError::new)?],
         sites: vec![site_record],
         undo_removed_sites: vec![id.0],
+        new_libraries: library_records
+            .iter()
+            .map(library_settings_of)
+            .collect::<Result<_, _>>()?,
+        undo_removed_libraries: library_records.iter().map(|r| r.id).collect(),
+        libraries: library_records,
         site_group_ids: Some(group_ids),
         needs_admin: true,
         needs: Vec::new(),
@@ -1751,6 +1871,9 @@ async fn plan_move(
     }
     if node.parent == Some(destination) {
         return Ok(None);
+    }
+    if node.kind == NodeKind::Folder {
+        refuse_folder_into(db, id, destination).await?;
     }
     if !db.name_free(destination, &node.name, Some(id)).await? {
         return Err(AccessError::NameTaken);
@@ -2336,6 +2459,10 @@ async fn plan_copy(
     if db.is_at_or_below(destination, id).await? {
         return Err(AccessError::IntoItself);
     }
+    // A copy of a folder makes new folders, wherever it comes from.
+    if node.kind == NodeKind::Folder && folders_off(db, destination).await? {
+        return Err(AccessError::FoldersOff);
+    }
     let tree = read_tree(state.checkpointer()).await.map_err(git_failure)?;
     let source = tree
         .iter()
@@ -2822,8 +2949,8 @@ pub(crate) async fn write_sites(
     write_records(store, author, message, records).await
 }
 
-/// Writes every record of `records` (tree, site and template records, and the removals) as one
-/// commit credited to `author` (see [`crate::Checkpointer::write_sites`]).
+/// Writes every record of `records` (tree, site, library and template records, and the
+/// removals) as one commit credited to `author` (see [`crate::Checkpointer::write_sites`]).
 pub(crate) async fn write_records(
     store: &Arc<dyn Checkpointer>,
     author: Author,
@@ -2839,6 +2966,8 @@ pub(crate) async fn write_records(
         change.templates = &records.templates;
         change.removed_templates = &records.removed_templates;
         change.org_navigation = records.org_navigation.as_ref();
+        change.libraries = &records.libraries;
+        change.removed_libraries = &records.removed_libraries;
         store.write_sites(&change).map(|_| ())
     })
     .await
