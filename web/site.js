@@ -60,6 +60,7 @@ $('new-library').addEventListener('submit', async (event) => {
 
 await showLibraries();
 if (manageSite) await showStorage();
+else if (me.is_admin) showQuotaOnly();
 
 /** For people who manage the site: what it holds against its quota, warning from 90%. */
 async function showStorage() {
@@ -79,6 +80,16 @@ async function showStorage() {
   }
   $('quota-form').hidden = !me.is_admin;
   if (me.is_admin) $('quota-gb').value = quota === null ? '' : String(Math.round((quota / 1024 ** 3) * 100) / 100);
+}
+
+/**
+ * Administrators may set a quota even where they hold no manage_site role here; the server
+ * shows usage only to people who manage the site, so they get the field without the figures.
+ */
+function showQuotaOnly() {
+  $('storage').hidden = false;
+  $('storage-text').textContent = 'The current quota and usage are shown to people who manage this site.';
+  $('quota-form').hidden = false;
 }
 
 $('quota-form').addEventListener('submit', async (event) => {

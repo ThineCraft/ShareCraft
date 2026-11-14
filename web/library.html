@@ -66,6 +66,7 @@
  </div>
  <section id="upload-panel" aria-labelledby="upload-heading" hidden>
   <h2 id="upload-heading">Uploads</h2>
+  <p id="upload-summary" role="status" aria-live="polite" class="meta"></p>
   <ul id="uploads" class="list"></ul>
   <p><button type="button" id="uploads-clear" class="plain">Clear finished</button></p>
  </section>
@@ -73,6 +74,7 @@
  <div id="bulk-bar" class="toolbar" role="toolbar" aria-label="Selected items" hidden>
   <label class="check"><input type="checkbox" id="select-all"> Select all</label>
   <span id="selected-count" class="meta" role="status"></span>
+  <span id="select-note" class="meta" hidden></span>
   <button type="button" id="bulk-move" class="plain" disabled>Move…</button>
   <button type="button" id="bulk-copy" class="plain" disabled>Copy…</button>
   <button type="button" id="bulk-delete" class="plain" disabled>Delete</button>

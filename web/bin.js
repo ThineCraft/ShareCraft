@@ -189,21 +189,32 @@ async function emptyBin() {
   if (all.length === 0) return;
   const label = stage === 'second' ? 'Erase everything' : 'Empty';
   if (!(await confirmDialog(emptyBinText(stage, all.length), label))) return;
+  const verb = stage === 'second' ? 'erased' : 'moved to the second stage';
+  const button = $('empty-bin');
+  button.disabled = true;
+  $('bin-failures').hidden = true;
+  // Announced twice only: that it started, and how it ended.
+  $('bin-status').textContent = `Working on ${all.length} ${all.length === 1 ? 'item' : 'items'}…`;
   let done = 0;
   const failed = [];
-  for (const entry of all) {
-    const result = await api('DELETE', `/bin/${seg(entry.id)}`);
-    if (result.ok) done += 1;
-    else failed.push(`“${entry.name}”: ${messageFor(result.error)}`);
-    note(`Working: ${done + failed.length} of ${all.length}…`, false);
+  try {
+    for (const entry of all) {
+      const result = await api('DELETE', `/bin/${seg(entry.id)}`);
+      if (result.ok) done += 1;
+      else failed.push({ name: entry.name, text: messageFor(result.error) });
+    }
+  } finally {
+    button.disabled = false;
   }
-  const verb = stage === 'second' ? 'erased' : 'moved to the second stage';
-  note(
-    failed.length
-      ? `${done} of ${all.length} items were ${verb}. ${failed.join(' ')}`
-      : `${done} ${done === 1 ? 'item was' : 'items were'} ${verb}.`,
-    failed.length > 0,
-  );
+  $('bin-status').textContent = `${done} of ${all.length} ${all.length === 1 ? 'item was' : 'items were'} ${verb}.`;
+  if (failed.length) {
+    // The alert is for the failure summary only; the items are listed below it.
+    note(`${failed.length} ${failed.length === 1 ? 'item' : 'items'} could not be ${verb}.`, true);
+    $('bin-failures').replaceChildren(
+      ...failed.map((f) => h('li', {}, h('span', { class: 'grow' }, h('strong', {}, f.name), h('br'), h('small', {}, f.text)))),
+    );
+    $('bin-failures').hidden = false;
+  }
   await reload();
 }
 

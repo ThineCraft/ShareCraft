@@ -32,7 +32,9 @@ import {
   filesFromDrop,
   filesFromPicker,
   outcomeNote,
+  progressOf,
   progressText,
+  uploadsSummary,
 } from './upload.js';
 
 const BULK_MAX = 500;
@@ -84,6 +86,9 @@ let trail = [];
 let moveRequest = 0; // the latest listing asked for; older answers are dropped
 let deleting = [];
 let renaming = null;
+const uploadRows = new Map(); // outcome -> its list item
+const dirtyUploads = new Set(); // outcomes to redraw at the next frame
+let drawScheduled = false;
 
 $('more').addEventListener('click', () => loadPage());
 $('select-all').addEventListener('change', () => {
@@ -132,6 +137,8 @@ function showSelection() {
   $('select-all').checked = state.all;
   $('select-all').indeterminate = state.some;
   $('selected-count').textContent = state.count === 0 ? '' : `${state.count} selected`;
+  $('select-note').hidden = !next;
+  $('select-note').textContent = `Select all covers the ${choosable.length} items loaded so far. Use Show more to load the rest.`;
   const allowed = selectedItems().map(itemActions);
   $('bulk-move').disabled = state.count === 0 || !allowed.every((a) => a.move);
   $('bulk-copy').disabled = state.count === 0;
@@ -251,9 +258,10 @@ $('pick-folder').addEventListener('change', (event) => {
 });
 $('uploads-clear').addEventListener('click', () => {
   for (let at = uploads.length - 1; at >= 0; at -= 1) {
-    if (!['waiting', 'hashing', 'uploading'].includes(uploads[at].status)) uploads.splice(at, 1);
+    if (['waiting', 'hashing', 'uploading'].includes(uploads[at].status)) continue;
+    forgetUpload(uploads[at]);
   }
-  showUploads();
+  drawUploads();
 });
 
 // Files and folders dropped anywhere on the page go into this library or folder.
@@ -282,7 +290,8 @@ function startUploads(files) {
     site: siteId,
     onChange: (outcome) => {
       if (!uploads.includes(outcome)) uploads.push(outcome);
-      showUploads();
+      dirtyUploads.add(outcome);
+      scheduleDraw();
     },
     resolve: askConflict,
   });
@@ -292,34 +301,91 @@ function startUploads(files) {
     .catch(() => {});
 }
 
-function showUploads() {
+/** Redraws the panel at the next frame, once, however many changes came in (chunks arrive fast). */
+function scheduleDraw() {
+  if (drawScheduled) return;
+  drawScheduled = true;
+  const later = globalThis.requestAnimationFrame ?? ((fn) => setTimeout(fn, 50));
+  later(() => {
+    drawScheduled = false;
+    drawUploads();
+  });
+}
+
+/** Draws only the rows that changed; a row whose words are the same just moves its bar. */
+function drawUploads() {
   $('upload-panel').hidden = uploads.length === 0;
-  $('uploads').replaceChildren(...uploads.map(uploadRow));
+  for (const outcome of dirtyUploads) {
+    if (!uploads.includes(outcome)) continue;
+    const row = uploadRows.get(outcome);
+    if (!row) {
+      const made = uploadRow(outcome);
+      uploadRows.set(outcome, made);
+      $('uploads').append(made.item);
+    } else if (row.key !== uploadKey(outcome)) {
+      const made = uploadRow(outcome);
+      row.item.replaceChildren(...made.item.childNodes);
+      uploadRows.set(outcome, { ...made, item: row.item });
+    } else {
+      const bar = progressOf(outcome);
+      if (bar && row.bar) {
+        row.bar.max = bar.max;
+        row.bar.value = bar.value;
+      }
+      if (row.text) row.text.textContent = uploadText(outcome);
+    }
+  }
+  dirtyUploads.clear();
+  // Announced when the counts change, not for every chunk.
+  const summary = uploadsSummary(uploads);
+  if ($('upload-summary').textContent !== summary) $('upload-summary').textContent = summary;
+}
+
+function forgetUpload(outcome) {
+  uploads.splice(uploads.indexOf(outcome), 1);
+  uploadRows.get(outcome)?.item.remove();
+  uploadRows.delete(outcome);
+}
+
+/** What decides whether a row must be built again: anything but the bytes sent so far. */
+const uploadKey = (outcome) => `${outcome.status}|${outcome.message}|${outcome.retry}|${outcome.name}`;
+
+function uploadText(outcome) {
+  if (outcome.status === 'waiting') return 'Waiting';
+  if (outcome.status === 'hashing') return `Checking the file… ${progressText(outcome.hashed ?? 0, outcome.size)}`;
+  if (outcome.status === 'uploading') return progressText(outcome.sent, outcome.size);
+  return outcomeNote(outcome);
 }
 
 function uploadRow(outcome) {
   const path = outcome.file.path?.length ? `${outcome.file.path.join(' / ')} / ` : '';
-  const busy = ['hashing', 'uploading'].includes(outcome.status);
-  let text;
-  if (outcome.status === 'waiting') text = 'Waiting';
-  else if (outcome.status === 'hashing') text = 'Checking the file…';
-  else if (outcome.status === 'uploading') text = progressText(outcome.sent, outcome.size);
-  else text = outcomeNote(outcome);
-  const again = outcome.retry ? h('button', { type: 'button', class: 'plain' }, 'Upload again') : null;
+  const text = h('small', {}, uploadText(outcome));
+  const progress = progressOf(outcome);
+  const bar =
+    progress && progress.max > 0
+      ? h('progress', { max: progress.max, value: progress.value, 'aria-label': `Progress of ${outcome.name}` })
+      : null;
+  const again = outcome.retry
+    ? h('button', { type: 'button', class: 'plain' }, outcome.keep ? 'Try again' : 'Upload again')
+    : null;
   again?.addEventListener('click', () => {
-    uploads.splice(uploads.indexOf(outcome), 1);
-    startUploads([outcome.file]);
+    forgetUpload(outcome);
+    // A kept session only needs its finish sent again; otherwise the file goes up afresh.
+    startUploads([
+      outcome.keep
+        ? { ...outcome.file, resumeId: outcome.sessionId, resumeChoice: outcome.choice, parentId: outcome.parentId }
+        : outcome.file,
+    ]);
   });
-  return h(
+  const item = h(
     'li',
     {},
-    h('span', { class: 'grow' }, h('strong', {}, `${path}${outcome.name}`), h('br'), h('small', {}, text)),
-    busy && outcome.size > 0
-      ? h('progress', { max: outcome.size, value: outcome.sent, 'aria-label': `Progress of ${outcome.name}` })
-      : null,
+    h('span', { class: 'grow' }, h('strong', {}, `${path}${outcome.name}`), h('br'), text),
+    bar,
     outcome.status === 'failed' ? h('small', { class: 'mark' }, 'Not uploaded') : null,
     again,
   );
+  return { item, text, bar, key: uploadKey(outcome) };
 }
 
 // The question asked when a name is taken: Replace, Keep both or Skip, for this file or the rest.
@@ -328,17 +394,20 @@ function askConflict({ name, suggested }) {
   return new Promise((resolve) => {
     $('conflict-text').textContent = conflictQuestion(name, suggested);
     $('conflict-all').checked = false;
-    let choice = 'skip'; // Escape skips
+    let choice = 'skip'; // Escape skips this file only
+    let clicked = false;
     for (const { value } of CONFLICT_CHOICES) {
       const id = { replace: 'conflict-replace', keep_both: 'conflict-keep', skip: 'conflict-skip' }[value];
       $(id).onclick = () => {
         choice = value;
+        clicked = true;
         conflictDialog.close();
       };
     }
+    // "Do this for the rest" counts only when a button was clicked, never for Escape.
     conflictDialog.addEventListener(
       'close',
-      () => resolve({ choice, all: $('conflict-all').checked }),
+      () => resolve({ choice, all: clicked && $('conflict-all').checked }),
       { once: true },
     );
     conflictDialog.showModal();

@@ -10,7 +10,9 @@ import {
   contentRange,
   outcomeNote,
   planChunks,
+  progressOf,
   splitRelative,
+  uploadsSummary,
 } from './upload.js';
 
 const MIB = 1024 * 1024;
@@ -156,6 +158,7 @@ function stubServer(options = {}) {
       return json(201, { id: 'doc1', name: 'x.pdf', editor: 'pdf' });
     }
     if (url === '/api/uploads/sess' && method === 'DELETE') return json(204, null);
+    if (url.startsWith('/api/nodes/lib/children?') && options.children) return json(200, { items: options.children, next: null });
     if (url.startsWith('/api/sites/') && method === 'GET') return json(200, options.site ?? { used: 900, quota: 1000 });
     return json(404, { error: 'not_found' });
   };
@@ -406,4 +409,100 @@ test('the same folder is made once for many files', async () => {
   const queue = new UploadQueue({ fetch, hash: quickHash, sleep: noSleep, parent: 'lib', site: 's' });
   await queue.run([fileOf('a.pdf', 5, ['D']), fileOf('b.pdf', 5, ['D'])]);
   assert.equal(made, 1);
+});
+
+test('a finish whose answer was lost and whose retry finds no session looks in the folder', async () => {
+  let tries = 0;
+  const server = stubServer({
+    finish: () => {
+      tries += 1;
+      if (tries === 1) throw new TypeError('connection dropped');
+      return json(404, { error: 'not_found' });
+    },
+    children: [{ id: 'd', kind: 'document', name: 'x.pdf' }],
+  });
+  const [outcome] = await queueFor(server).run([fileOf('x.pdf', 5)]);
+  assert.equal(outcome.status, 'done');
+  assert.equal(outcomeNote(outcome), 'Uploaded.');
+  assert.ok(!server.log.some((call) => call.method === 'DELETE'));
+});
+
+test('if the file is not in the folder either, the person is told it may have finished', async () => {
+  let tries = 0;
+  const server = stubServer({
+    finish: () => {
+      tries += 1;
+      if (tries === 1) throw new TypeError('connection dropped');
+      return json(404, { error: 'not_found' });
+    },
+    children: [],
+  });
+  const [outcome] = await queueFor(server).run([fileOf('x.pdf', 5)]);
+  assert.equal(outcome.status, 'failed');
+  assert.match(outcome.message, /may have finished/);
+  assert.match(outcome.message, /check the folder/i);
+  assert.ok(!server.log.some((call) => call.method === 'DELETE'));
+});
+
+test('a 404 at the finish with no lost answer is still a failure', async () => {
+  const server = stubServer({ finish: () => json(404, { error: 'not_found' }) });
+  const [outcome] = await queueFor(server).run([fileOf('x.pdf', 5)]);
+  assert.equal(outcome.status, 'failed');
+});
+
+test('being edited at the finish keeps the session and a retry only finishes', async () => {
+  let edited = true;
+  const server = stubServer({
+    finish: (url) =>
+      url.includes('replace') && edited
+        ? json(409, { error: 'being_edited' })
+        : url.includes('replace')
+          ? json(200, { revision: 'r', changed: true })
+          : json(409, { error: 'name_taken', suggested: 'x (2).pdf' }),
+  });
+  const queue = queueFor(server, { resolve: async () => ({ choice: 'replace', all: false }) });
+  const [first] = await queue.run([fileOf('x.pdf', 5)]);
+  assert.equal(first.status, 'failed');
+  assert.equal(first.keep, true);
+  assert.equal(first.retry, true);
+  assert.equal(first.sessionId, 'sess');
+  assert.ok(!server.log.some((call) => call.method === 'DELETE'));
+  edited = false;
+  const before = server.log.length;
+  const [second] = await queueFor(server).run([
+    { ...first.file, resumeId: first.sessionId, resumeChoice: first.choice },
+  ]);
+  assert.equal(second.status, 'done');
+  const calls = server.log.slice(before).map((call) => `${call.method} ${call.url}`);
+  assert.deepEqual(calls, ['POST /api/uploads/sess/finish?on_conflict=replace']);
+});
+
+test('a busy server at the finish keeps the session and says so plainly', async () => {
+  const server = stubServer({ finish: () => json(503, { error: 'busy' }) });
+  const [outcome] = await queueFor(server).run([fileOf('x.pdf', 5)]);
+  assert.equal(outcome.keep, true);
+  assert.match(outcome.message, /busy/i);
+  assert.ok(!server.log.some((call) => call.method === 'DELETE'));
+});
+
+test('the summary counts finished and failed files, not chunks', () => {
+  const some = [
+    { status: 'done' },
+    { status: 'done' },
+    { status: 'skipped' },
+    { status: 'failed' },
+    { status: 'uploading' },
+    { status: 'waiting' },
+    { status: 'hashing' },
+    { status: 'done' },
+  ];
+  assert.equal(uploadsSummary(some), '3 of 8 uploaded, 1 skipped, 1 failed');
+  assert.equal(uploadsSummary([{ status: 'done' }]), '1 of 1 uploaded');
+  assert.equal(uploadsSummary([]), '');
+});
+
+test('the bar shows hashing progress while the file is checked, then bytes sent', () => {
+  assert.deepEqual(progressOf({ status: 'hashing', size: 100, hashed: 40, sent: 0 }), { value: 40, max: 100 });
+  assert.deepEqual(progressOf({ status: 'uploading', size: 100, hashed: 100, sent: 10 }), { value: 10, max: 100 });
+  assert.equal(progressOf({ status: 'done', size: 100, sent: 100 }), null);
 });

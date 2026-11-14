@@ -173,9 +173,12 @@ const sleepFor = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** A failure that ends one file's upload, with the sentence to show. */
 class Stop extends Error {
-  constructor(message, retry = false) {
+  /** `keep`: the session is still open and a retry can finish it; `ended`: nothing to give back. */
+  constructor(message, retry = false, { keep = false, ended = false } = {}) {
     super(message);
     this.retry = retry;
+    this.keep = keep;
+    this.ended = ended;
   }
 }
 
@@ -232,7 +235,8 @@ export class UploadQueue {
       } catch (e) {
         outcome.status = 'failed';
         outcome.message = e instanceof Stop ? e.message : messageFor('unknown');
-        outcome.retry = e instanceof Stop && e.retry;
+        outcome.retry = e instanceof Stop && (e.retry || e.keep);
+        outcome.keep = e instanceof Stop && e.keep;
       }
       this.#change(outcome);
     }
@@ -275,23 +279,34 @@ export class UploadQueue {
   async #one(outcome) {
     const { file } = outcome;
     if (file.size === 0) throw new Stop(`“${file.name}” is empty. Empty files cannot be uploaded.`);
-    this.#change(outcome, { status: 'hashing', message: 'Checking the file…' });
-    const sha256 = await this.hash(file, (done) => this.#change(outcome, { sent: 0, hashed: done }));
-    const parent = file.version ? null : await this.#folderFor(file.path ?? []);
-    const body = file.version
-      ? { doc: file.version.doc, base: file.version.base, size: file.size, sha256 }
-      : { parent, name: file.name, size: file.size, sha256 };
-    const started = await this.#start(body, file);
-    const id = started.id;
-    outcome.sessionId = id;
-    const cleaned = started.renamed ?? null;
-    this.#change(outcome, { status: 'uploading', message: '', sent: started.received ?? 0 });
+    let id = file.resumeId;
+    let cleaned = null;
+    if (id) {
+      // A kept session: everything was sent, only the finish is left.
+      outcome.parentId = file.parentId;
+      outcome.sessionId = id;
+      this.#change(outcome, { status: 'uploading', message: '', sent: file.size });
+    } else {
+      this.#change(outcome, { status: 'hashing', message: 'Checking the file…', hashed: 0 });
+      const sha256 = await this.hash(file, (done) => this.#change(outcome, { sent: 0, hashed: done }));
+      const parent = file.version ? null : await this.#folderFor(file.path ?? []);
+      outcome.parentId = parent;
+      const body = file.version
+        ? { doc: file.version.doc, base: file.version.base, size: file.size, sha256 }
+        : { parent, name: file.name, size: file.size, sha256 };
+      const started = await this.#start(body, file);
+      id = started.id;
+      outcome.sessionId = id;
+      cleaned = started.renamed ?? null;
+      this.#change(outcome, { status: 'uploading', message: '', sent: started.received ?? 0 });
+    }
     try {
-      await this.#send(outcome, id);
+      if (!file.resumeId) await this.#send(outcome, id);
       await this.#finish(outcome, id, cleaned);
     } catch (e) {
-      // A session left open keeps its size reserved against the site's quota: give it back.
-      await this.#call('DELETE', `/api/uploads/${seg(id)}`);
+      // A session left open keeps its size reserved against the site's quota: give it back,
+      // unless it ended already or is being kept for a retry.
+      if (!(e instanceof Stop && (e.keep || e.ended))) await this.#call('DELETE', `/api/uploads/${seg(id)}`);
       throw e;
     }
   }
@@ -361,9 +376,11 @@ export class UploadQueue {
   /** Finishes the session, asking what to do if the name is taken. */
   async #finish(outcome, id, cleaned) {
     const { file } = outcome;
-    let choice = this.rest;
+    let choice = file.resumeChoice ?? this.rest;
     let failures = 0;
+    let lost = false; // an answer to the finish may have been lost on the way
     for (;;) {
+      outcome.choice = choice;
       const query = choice ? `?on_conflict=${choice}` : '';
       const result = await this.#call('POST', `/api/uploads/${seg(id)}/finish${query}`);
       if (result.ok) {
@@ -379,10 +396,12 @@ export class UploadQueue {
           message: '',
         });
       }
+      if (result.error === 'network') lost = true;
       if (result.error === 'network' && (failures += 1) < this.attempts) {
         await this.sleep(this.#backoff(failures));
         continue;
       }
+      if (lost && result.status === 404) return this.#settleLost(outcome, cleaned);
       if (result.error === 'name_taken' && this.resolve && !choice) {
         const answer = await this.resolve({ name: file.name, suggested: result.data?.suggested ?? '' });
         choice = answer.choice;
@@ -391,6 +410,30 @@ export class UploadQueue {
       }
       throw await this.#problem(result, file, true);
     }
+  }
+
+  /**
+   * The finish was sent, its answer lost, and the session is gone: it probably finished. Look
+   * for the file in its folder before saying anything.
+   */
+  async #settleLost(outcome, cleaned) {
+    const name = cleaned?.to ?? outcome.file.name;
+    let after = null;
+    while (outcome.parentId) {
+      const query = `limit=500${after ? `&after=${encodeURIComponent(after)}` : ''}`;
+      const listed = await this.#call('GET', `/api/nodes/${seg(outcome.parentId)}/children?${query}`);
+      if (!listed.ok) break;
+      if (listed.data.items.some((item) => item.name === name)) {
+        return this.#change(outcome, { status: 'done', sent: outcome.size, name, renamed: cleaned, message: '' });
+      }
+      after = listed.data.next;
+      if (!after) break;
+    }
+    throw new Stop(
+      `The connection dropped while “${outcome.file.name}” was being finished, so it may have finished. Check the folder before uploading it again.`,
+      false,
+      { ended: true },
+    );
   }
 
   /** The folders `path` below the queue's parent, each made or, if it exists, found. */
@@ -430,7 +473,13 @@ export class UploadQueue {
         return new Stop(quotaRefusalText(info?.ok ? info.data : null, file));
       }
       case 'being_edited':
-        return new Stop(`Someone is editing “${file.name}” right now, so it was not replaced. Try again when they have finished.`);
+        return new Stop(
+          `Someone is editing “${file.name}” right now, so it was not replaced. The upload is kept: try again when they have finished.`,
+          true,
+          { keep: finishing },
+        );
+      case 'busy':
+        return new Stop(messageFor('busy'), true, { keep: finishing });
       case 'too_large':
         return new Stop(`“${file.name}” is larger than the largest file this server accepts.`);
       case 'bad_request':
@@ -504,3 +553,22 @@ async function walk(entry, path, found) {
 
 /** `n` bytes for the progress line: `3.0 MB of 20.0 MB`. */
 export const progressText = (sent, size) => `${bytesText(sent)} of ${bytesText(size)}`;
+
+/** One line for the whole panel: `3 of 8 uploaded, 1 skipped, 1 failed`; empty with no uploads. */
+export function uploadsSummary(outcomes) {
+  if (outcomes.length === 0) return '';
+  const count = (status) => outcomes.filter((outcome) => outcome.status === status).length;
+  const skipped = count('skipped');
+  const failed = count('failed');
+  let text = `${count('done')} of ${outcomes.length} uploaded`;
+  if (skipped) text += `, ${skipped} skipped`;
+  if (failed) text += `, ${failed} failed`;
+  return text;
+}
+
+/** What a file's progress bar shows: the file read so far while it is checked, then bytes sent. */
+export function progressOf(outcome) {
+  if (outcome.status === 'hashing') return { value: outcome.hashed ?? 0, max: outcome.size };
+  if (outcome.status === 'uploading') return { value: outcome.sent, max: outcome.size };
+  return null;
+}

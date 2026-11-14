@@ -53,6 +53,7 @@ const MESSAGES = {
   too_many_requests: 'You have asked for access too many times today. Try again tomorrow.',
   already_decided: 'Someone has already decided that request. Reload the page.',
   message_too_long: 'That message is too long. Use 500 characters or fewer.',
+  busy: 'The server is busy right now. Try again in a moment.',
   being_edited: 'Someone is editing that file right now. Try again when they have finished.',
   text_document: 'That is a text document. Open it and edit it in its own page.',
   checksum_mismatch:
