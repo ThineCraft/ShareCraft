@@ -126,7 +126,7 @@ pub(crate) fn settings_of(record: &SiteRecord) -> Result<SiteSettings, String> {
 }
 
 /// A saved template as PostgreSQL holds it.
-fn template_row(record: &TemplateRecord) -> Result<TemplateRow, String> {
+pub(crate) fn template_row(record: &TemplateRecord) -> Result<TemplateRow, String> {
     let time = |text: &str| {
         OffsetDateTime::parse(text, &Rfc3339).map_err(|e| {
             format!(
@@ -151,7 +151,7 @@ fn template_row(record: &TemplateRecord) -> Result<TemplateRow, String> {
 }
 
 /// The record of `site` in Git, if it has one.
-async fn read_site_record(
+pub(crate) async fn read_site_record(
     store: &Arc<dyn Checkpointer>,
     site: NodeId,
 ) -> Result<Option<SiteRecord>, CheckpointError> {
@@ -264,6 +264,7 @@ pub async fn change(
         } else {
             Vec::new()
         },
+        ..Undo::default()
     };
 
     let settings = settings_of(&after).map_err(DbError::new)?;

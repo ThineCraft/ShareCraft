@@ -65,6 +65,8 @@ const MESSAGES = {
   invalid_time_zone: 'That is not a known time zone. Use one like UTC or Europe/London.',
   invalid_navigation:
     'That navigation is not allowed. Check the labels (60 characters at most), the addresses (https:, http:, mailto: or a path) and that links go one level deep.',
+  invalid_template:
+    'That template cannot be used. It may be too large (at most 100 libraries, 5,000 folders and 20 levels), name things by identifier, or have a link that is not allowed.',
 };
 
 /** What a document page says when the document is missing or the person has no access. */

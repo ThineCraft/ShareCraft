@@ -20,6 +20,7 @@ mod members;
 mod projection;
 mod room;
 pub mod sites;
+pub mod templates;
 pub mod tree;
 mod ws;
 

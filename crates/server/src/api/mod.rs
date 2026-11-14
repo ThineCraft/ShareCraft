@@ -15,6 +15,7 @@ mod roles;
 mod session;
 mod settings;
 mod sites;
+mod templates;
 pub(crate) mod uploads;
 
 use std::fmt;
@@ -53,6 +54,14 @@ pub(crate) fn router() -> Router<AppState> {
         .route("/sites/{id}", get(sites::show).patch(sites::change))
         .route("/sites/{id}/quota", put(sites::set_quota))
         .route("/sites/{id}/groups", get(sites::groups))
+        .route("/sites/{id}/template", post(templates::save))
+        .route("/templates", get(templates::list))
+        .route(
+            "/templates/import",
+            post(templates::import).layer(DefaultBodyLimit::max(templates::MAX_IMPORT_BODY)),
+        )
+        .route("/templates/{id}", delete(templates::remove))
+        .route("/templates/{id}/package", get(templates::package))
         .route("/sites/{id}/bin", get(bin::list))
         .route("/bin/{id}", delete(bin::remove))
         .route("/bin/{id}/restore", post(bin::restore))
@@ -211,6 +220,9 @@ pub(crate) enum ApiError {
     InvalidTimeZone,
     /// 422: a navigation that breaks one of its rules.
     InvalidNavigation,
+    /// 422: a template or template package that breaks one of its rules; the answer's
+    /// `reason` says which.
+    InvalidTemplate(&'static str),
     /// 422: the password is too short or too long.
     WeakPassword,
     /// 413: the body is larger than the route allows (16 KiB; file content, `max_file_bytes`).
@@ -301,6 +313,7 @@ impl ApiError {
             ApiError::InvalidLanguage => (StatusCode::UNPROCESSABLE_ENTITY, "invalid_language"),
             ApiError::InvalidTimeZone => (StatusCode::UNPROCESSABLE_ENTITY, "invalid_time_zone"),
             ApiError::InvalidNavigation => (StatusCode::UNPROCESSABLE_ENTITY, "invalid_navigation"),
+            ApiError::InvalidTemplate(_) => (StatusCode::UNPROCESSABLE_ENTITY, "invalid_template"),
             ApiError::WeakPassword => (StatusCode::UNPROCESSABLE_ENTITY, "weak_password"),
             ApiError::TooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "too_large"),
             ApiError::NotJson => (StatusCode::UNSUPPORTED_MEDIA_TYPE, "not_json"),
@@ -358,6 +371,7 @@ impl From<AccessError> for ApiError {
             AccessError::InvalidLanguage => ApiError::InvalidLanguage,
             AccessError::InvalidTimeZone => ApiError::InvalidTimeZone,
             AccessError::InvalidNavigation => ApiError::InvalidNavigation,
+            AccessError::InvalidTemplate(reason) => ApiError::InvalidTemplate(reason),
             // `POST /api/docs` answers this itself, naming the extension expected.
             AccessError::WrongExtension => ApiError::InvalidRequest,
             AccessError::NameTaken => ApiError::NameTaken,
@@ -519,6 +533,9 @@ fn after_sign_out(state: &AppState, session: SessionId) {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, code) = self.status_and_code();
+        if let ApiError::InvalidTemplate(reason) = self {
+            return (status, Json(json!({ "error": code, "reason": reason }))).into_response();
+        }
         (status, Json(json!({ "error": code }))).into_response()
     }
 }

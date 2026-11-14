@@ -15,12 +15,14 @@ use std::sync::atomic::Ordering;
 use collab_core::ids::{DocId, NodeId, UserId};
 use records::{
     Access, AccessError, BinStage, ClaimId, Db, DbError, Document, Editor, NewEvent, Node,
-    NodeChange, NodeKind, NodeRow, NodesApplied, Perms, QuotaError, Reservation, SiteSettings,
-    User, validate_document_name, validate_node_name,
+    NodeChange, NodeKind, NodeRow, NodesApplied, Perms, QuotaError, Reservation, SiteKind,
+    SiteSettings, User, validate_description, validate_document_name, validate_language,
+    validate_node_name, validate_template_body, validate_time_zone,
 };
 use revisions::{
-    Author, BlobRef, Checkpoint, CheckpointError, Content, GitError, SiteRecord, SitesChange,
-    Stamp, TreeChange, TreeMove, TreeRecord,
+    Author, BlobRef, Checkpoint, CheckpointError, Content, GitError, SITE_SCHEMA, SiteRecord,
+    SitesChange, Stamp, TemplateBody, TemplateFolder, TemplateLibrary, TemplateNavItem,
+    TemplateRecord, TreeChange, TreeMove, TreeRecord,
 };
 use serde_json::{Map, Value, json};
 use time::OffsetDateTime;
@@ -35,8 +37,8 @@ use crate::room::credited_name;
 
 /// The format version of the tree records this server writes.
 const TREE_SCHEMA: u32 = 1;
-/// The name of the library every new site gets.
-const LIBRARY_NAME: &str = "Documents";
+/// The name of the library the built-in templates give a new site.
+pub(crate) const LIBRARY_NAME: &str = "Documents";
 /// The name of the site existing documents are adopted into.
 const HOME_SITE: &str = "Home";
 /// The author id of changes the server makes on its own.
@@ -170,20 +172,65 @@ impl fmt::Display for Adopted {
 pub(crate) struct PendingUndo {
     author: Author,
     message: String,
-    records: Vec<TreeRecord>,
-    /// Site records put back by the take-back.
-    sites: Vec<SiteRecord>,
-    /// Sites whose record the take-back removes: their creation is taken back.
-    removed_sites: Vec<Uuid>,
+    undo: Undo,
 }
 
-/// What takes a change back: the tree records, site records and site records to remove,
-/// written as one commit.
+/// What takes a change back, written as one commit: tree records, site records, sites whose
+/// record is removed (their creation taken back), saved templates put back, and templates
+/// whose record is removed (their saving taken back).
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Undo {
     pub(crate) records: Vec<TreeRecord>,
     pub(crate) sites: Vec<SiteRecord>,
     pub(crate) removed_sites: Vec<Uuid>,
+    pub(crate) templates: Vec<TemplateRecord>,
+    pub(crate) removed_templates: Vec<Uuid>,
+}
+
+/// A new site's shape and settings: what a template makes, with the fields given at creation
+/// in place of the template's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SiteShape {
+    /// The template it comes from: a saved template's id or a built-in name.
+    pub template: String,
+    pub kind: SiteKind,
+    /// What the site is for; 0 to 500 characters.
+    pub description: String,
+    /// A BCP 47 language tag.
+    pub language: String,
+    /// An IANA time zone name.
+    pub time_zone: String,
+    /// Its libraries, each with its folders.
+    pub libraries: Vec<TemplateLibrary>,
+    /// Its navigation, libraries named and audiences by purpose; `None` for automatic.
+    pub navigation: Option<Vec<TemplateNavItem>>,
+}
+
+impl SiteShape {
+    /// The shape the template `template` (an id or a built-in name) with `body` makes.
+    #[must_use]
+    pub fn from_body(template: &str, body: TemplateBody) -> Option<SiteShape> {
+        Some(SiteShape {
+            template: template.to_owned(),
+            kind: SiteKind::parse(&body.kind)?,
+            description: String::new(),
+            language: body.language,
+            time_zone: body.time_zone,
+            libraries: body.libraries,
+            navigation: body.navigation,
+        })
+    }
+
+    /// The body of a template that makes this shape.
+    fn body(&self) -> TemplateBody {
+        TemplateBody {
+            kind: self.kind.as_str().to_owned(),
+            language: self.language.clone(),
+            time_zone: self.time_zone.clone(),
+            libraries: self.libraries.clone(),
+            navigation: self.navigation.clone(),
+        }
+    }
 }
 
 /// A change worked out and judged, ready to be committed and mirrored.
@@ -201,6 +248,8 @@ struct Plan {
     undo_removed_sites: Vec<Uuid>,
     /// The `sites` rows of `sites`, mirrored with exactly the records' values.
     new_sites: Vec<SiteSettings>,
+    /// A new site's Owners, Members and Visitors group ids, which its navigation names.
+    site_group_ids: Option<[Uuid; 3]>,
     needs_admin: bool,
     needs: Vec<(NodeId, Perms)>,
     /// A new site: its creator becomes a member of its Owners group.
@@ -258,6 +307,7 @@ impl Default for Plan {
             sites: Vec::new(),
             undo_removed_sites: Vec::new(),
             new_sites: Vec::new(),
+            site_group_ids: None,
             needs_admin: false,
             needs: Vec::new(),
             site_groups: false,
@@ -853,8 +903,8 @@ async fn commit(
     .map_err(git_failure)?;
     let undo = Undo {
         records: plan.undo,
-        sites: Vec::new(),
         removed_sites: plan.undo_removed_sites,
+        ..Undo::default()
     };
     let site_ids: Vec<NodeId> = plan.sites.iter().map(|r| NodeId(r.id)).collect();
     let actor_id = actor.map(|a| a.id);
@@ -873,6 +923,7 @@ async fn commit(
             as_if_live: plan.as_if_live,
             sites: &[],
             new_sites: &plan.new_sites,
+            site_group_ids: plan.site_group_ids,
         })
         .await;
     match applied {
@@ -968,9 +1019,7 @@ pub(crate) async fn take_back_all(
     let pending = PendingUndo {
         author,
         message: format!("Undo: {message}"),
-        records: undo.records,
-        sites: undo.sites,
-        removed_sites: undo.removed_sites,
+        undo,
     };
     match write_undo(state, &pending).await {
         Ok(()) => true,
@@ -1003,22 +1052,25 @@ async fn write_pending_undos(state: &AppState) -> bool {
 
 /// Writes one take-back as a commit.
 async fn write_undo(state: &AppState, pending: &PendingUndo) -> Result<(), CheckpointError> {
-    if pending.sites.is_empty() && pending.removed_sites.is_empty() {
+    let undo = &pending.undo;
+    if undo.sites.is_empty()
+        && undo.removed_sites.is_empty()
+        && undo.templates.is_empty()
+        && undo.removed_templates.is_empty()
+    {
         return write_tree(
             state.checkpointer(),
             pending.author.clone(),
             pending.message.clone(),
-            pending.records.clone(),
+            undo.records.clone(),
         )
         .await;
     }
-    write_sites(
+    write_records(
         state.checkpointer(),
         pending.author.clone(),
         pending.message.clone(),
-        pending.records.clone(),
-        pending.sites.clone(),
-        pending.removed_sites.clone(),
+        undo.clone(),
     )
     .await
 }
@@ -1147,46 +1199,10 @@ async fn plan_create(
         if parent.is_some() {
             return Err(AccessError::WrongPlace);
         }
-        let current = db.user(actor.id).await?;
-        if !current.is_some_and(|u| u.is_admin && !u.disabled) {
-            return Err(AccessError::Forbidden);
-        }
-        if !db.site_name_free(&name, None).await? {
-            return Err(AccessError::NameTaken);
-        }
-        unused(state, id).await?;
         let defaults = db.regional_defaults().await?;
-        let library = NodeId(Uuid::new_v4());
-        let site = new_record(id, NodeKind::Site, None, id.0, &name, author.clone());
-        let site_record = crate::sites::new_site_record(id, &defaults);
-        let lib = new_record(
-            library,
-            NodeKind::Library,
-            Some(id),
-            id.0,
-            LIBRARY_NAME,
-            author.clone(),
-        );
-        let undo = vec![deleted(&site, author.clone()), deleted(&lib, author)];
-        let events = [&site, &lib]
-            .iter()
-            .map(|r| created_event(actor.id, r))
-            .collect();
-        return Ok(Some(Plan {
-            id,
-            message: format!("Create site {name}"),
-            records: vec![site, lib],
-            undo,
-            new_sites: vec![crate::sites::settings_of(&site_record).map_err(DbError::new)?],
-            sites: vec![site_record],
-            undo_removed_sites: vec![id.0],
-            needs_admin: true,
-            needs: Vec::new(),
-            site_groups: true,
-            document: None,
-            events,
-            ..Plan::default()
-        }));
+        let shape = crate::templates::built_in_shape(crate::templates::TEAM, &defaults)
+            .ok_or(AccessError::NotFound)?;
+        return Ok(Some(plan_site(state, actor, id, &name, shape).await?));
     }
     let parent = parent.ok_or(AccessError::WrongPlace)?;
     let (parent_node, access) = visible(db, actor, parent).await?;
@@ -1227,6 +1243,137 @@ async fn plan_create(
         document: None,
         ..Plan::default()
     }))
+}
+
+/// Creates the site `id` named `name` for `actor`, an administrator, with the libraries,
+/// folders, settings and navigation of `shape`: the site, its libraries and folders and its
+/// site record in one Git commit, then mirrored into PostgreSQL in one transaction with its
+/// three groups (empty but for the creator, who joins Owners) and a `node.created` event for
+/// each node. The navigation's library names become the new libraries (an item naming a
+/// library the shape does not hold is left out, with its children) and its audiences the new
+/// site's groups of those purposes. Answers the site as PostgreSQL then holds it.
+///
+/// # Errors
+/// `Forbidden` unless `actor` is an enabled administrator; `InvalidName`, `NameTaken`;
+/// `InvalidSetting` for a description over 500 characters, `InvalidLanguage`,
+/// `InvalidTimeZone`; `InvalidTemplate` for a shape that breaks a template's rules; `Exists`
+/// for an id already used; `OutOfStep` while the tree needs repair; otherwise the Git or
+/// database error.
+pub async fn create_site(
+    state: &AppState,
+    actor: &User,
+    id: NodeId,
+    name: &str,
+    shape: SiteShape,
+) -> Result<Applied, AccessError> {
+    let _turn = state.tree_lock().lock().await;
+    ensure_in_step(state).await?;
+    let plan = plan_site(state, actor, id, name, shape).await?;
+    let done = commit(state, Some(actor), plan).await?;
+    erase_released(state, done).await;
+    let node = state.db().node(id).await?.ok_or(AccessError::NotFound)?;
+    Ok(Applied {
+        node,
+        deleted: Vec::new(),
+        renamed: None,
+    })
+}
+
+/// Works out a new site from `shape` (see [`create_site`]).
+async fn plan_site(
+    state: &AppState,
+    actor: &User,
+    id: NodeId,
+    name: &str,
+    shape: SiteShape,
+) -> Result<Plan, AccessError> {
+    let db = state.db();
+    let name = validate_node_name(name)?.to_owned();
+    let current = db.user(actor.id).await?;
+    if !current.is_some_and(|u| u.is_admin && !u.disabled) {
+        return Err(AccessError::Forbidden);
+    }
+    validate_description(&shape.description)?;
+    validate_language(&shape.language)?;
+    validate_time_zone(&shape.time_zone)?;
+    validate_template_body(&shape.body())?;
+    if !db.site_name_free(&name, None).await? {
+        return Err(AccessError::NameTaken);
+    }
+    unused(state, id).await?;
+    let author = author_of(actor);
+    let mut records = vec![new_record(
+        id,
+        NodeKind::Site,
+        None,
+        id.0,
+        &name,
+        author.clone(),
+    )];
+    let mut libraries = HashMap::new();
+    for library in &shape.libraries {
+        let library_id = NodeId(Uuid::new_v4());
+        libraries.insert(library.name.to_lowercase(), library_id.0);
+        records.push(new_record(
+            library_id,
+            NodeKind::Library,
+            Some(id),
+            id.0,
+            &library.name,
+            author.clone(),
+        ));
+        let mut next: Vec<(NodeId, &[TemplateFolder])> = vec![(library_id, &library.folders)];
+        while let Some((parent, folders)) = next.pop() {
+            for folder in folders {
+                let folder_id = NodeId(Uuid::new_v4());
+                records.push(new_record(
+                    folder_id,
+                    NodeKind::Folder,
+                    Some(parent),
+                    id.0,
+                    &folder.name,
+                    author.clone(),
+                ));
+                next.push((folder_id, &folder.folders));
+            }
+        }
+    }
+    let group_ids = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+    let navigation = shape
+        .navigation
+        .as_ref()
+        .map(|items| crate::templates::resolve_navigation(items, &libraries, group_ids));
+    let site_record = SiteRecord {
+        schema: SITE_SCHEMA,
+        id: id.0,
+        kind: shape.kind.as_str().to_owned(),
+        description: shape.description.clone(),
+        language: shape.language.clone(),
+        time_zone: shape.time_zone.clone(),
+        template: Some(shape.template.clone()),
+        archived: None,
+        hub: None,
+        joined_hub: None,
+        navigation,
+    };
+    let undo = records.iter().map(|r| deleted(r, author.clone())).collect();
+    let events = records.iter().map(|r| created_event(actor.id, r)).collect();
+    Ok(Plan {
+        id,
+        message: format!("Create site {name}"),
+        records,
+        undo,
+        new_sites: vec![crate::sites::settings_of(&site_record).map_err(DbError::new)?],
+        sites: vec![site_record],
+        undo_removed_sites: vec![id.0],
+        site_group_ids: Some(group_ids),
+        needs_admin: true,
+        needs: Vec::new(),
+        site_groups: true,
+        document: None,
+        events,
+        ..Plan::default()
+    })
 }
 
 async fn plan_rename(
@@ -2161,7 +2308,11 @@ fn missing(id: Uuid) -> CheckpointError {
 
 /// `name`, or the first of `name (2)`, `name (3)` … that `taken` (lower-cased names) does not
 /// hold: before the extension for a file opened in `editor`, at the end for a folder.
-fn unique_node_name(name: &str, editor: Option<Editor>, taken: &HashSet<String>) -> String {
+pub(crate) fn unique_node_name(
+    name: &str,
+    editor: Option<Editor>,
+    taken: &HashSet<String>,
+) -> String {
     if let Some(editor) = editor {
         return unique_name(name, editor, taken);
     }
@@ -2247,7 +2398,9 @@ pub(crate) async fn git_record(state: &AppState, id: NodeId) -> Result<TreeRecor
 }
 
 /// Every record of the tree in Git.
-async fn read_tree(store: &Arc<dyn Checkpointer>) -> Result<Vec<TreeRecord>, CheckpointError> {
+pub(crate) async fn read_tree(
+    store: &Arc<dyn Checkpointer>,
+) -> Result<Vec<TreeRecord>, CheckpointError> {
     let store = Arc::clone(store);
     tokio::task::spawn_blocking(move || store.read_tree())
         .await
@@ -2285,12 +2438,31 @@ pub(crate) async fn write_sites(
     sites: Vec<SiteRecord>,
     removed_sites: Vec<Uuid>,
 ) -> Result<(), CheckpointError> {
+    let records = Undo {
+        records: tree,
+        sites,
+        removed_sites,
+        ..Undo::default()
+    };
+    write_records(store, author, message, records).await
+}
+
+/// Writes every record of `records` (tree, site and template records, and the removals) as one
+/// commit credited to `author` (see [`crate::Checkpointer::write_sites`]).
+pub(crate) async fn write_records(
+    store: &Arc<dyn Checkpointer>,
+    author: Author,
+    message: String,
+    records: Undo,
+) -> Result<(), CheckpointError> {
     let store = Arc::clone(store);
     tokio::task::spawn_blocking(move || {
         let mut change = SitesChange::new(&author, &message);
-        change.tree = &tree;
-        change.sites = &sites;
-        change.removed_sites = &removed_sites;
+        change.tree = &records.records;
+        change.sites = &records.sites;
+        change.removed_sites = &records.removed_sites;
+        change.templates = &records.templates;
+        change.removed_templates = &records.removed_templates;
         store.write_sites(&change).map(|_| ())
     })
     .await
@@ -2381,7 +2553,7 @@ fn not_a_device(name: &str) -> String {
 /// `name` made acceptable as a folder name: refused and control characters become `_`, as does
 /// a trailing dot (after trailing spaces are trimmed); a name Windows keeps for a device gets
 /// `_` after its first part; an empty name becomes "Untitled"; a long one is shortened.
-fn clean_folder_name(name: &str) -> String {
+pub(crate) fn clean_folder_name(name: &str) -> String {
     let replaced: String = name
         .trim()
         .chars()

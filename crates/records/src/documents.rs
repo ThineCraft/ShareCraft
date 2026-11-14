@@ -188,6 +188,10 @@ pub enum AccessError {
     /// A navigation that breaks a rule of [`crate::Db::validate_navigation`].
     #[error("that navigation is not allowed")]
     InvalidNavigation,
+    /// A template or template package that breaks a rule; the reason is a short code such as
+    /// `too_deep` (see [`crate::validate_template_body`]).
+    #[error("that template is not acceptable: {0}")]
+    InvalidTemplate(&'static str),
     #[error("the name of this kind of document must end with its file extension")]
     WrongExtension,
     #[error("a document with that id already exists")]

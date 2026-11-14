@@ -197,11 +197,24 @@ pub struct NodeChange<'a> {
     /// The `sites` rows of new sites among `rows`, written with exactly these values (rather
     /// than the organisation's defaults as they are now), after the rows.
     pub new_sites: &'a [SiteSettings],
+    /// The ids the first row's new site gives its Owners, Members and Visitors groups, in that
+    /// order: chosen before the change so its navigation can aim at them. New random ids when
+    /// `None`.
+    pub site_group_ids: Option<[Uuid; 3]>,
 }
 
 /// Inserts or updates `row`, and for a document node the name of its `documents` row. A site
 /// gets the groups it does not have yet (see [`ensure_site_groups`]).
 pub(crate) async fn upsert_node(conn: &mut PgConnection, row: &NodeRow) -> Result<(), AccessError> {
+    upsert_node_with(conn, row, None).await
+}
+
+/// [`upsert_node`], a site's missing groups made with the ids `group_ids` when given.
+async fn upsert_node_with(
+    conn: &mut PgConnection,
+    row: &NodeRow,
+    group_ids: Option<[Uuid; 3]>,
+) -> Result<(), AccessError> {
     let row = &row.normalized();
     let result = sqlx::query(
         "insert into nodes \
@@ -238,7 +251,7 @@ pub(crate) async fn upsert_node(conn: &mut PgConnection, row: &NodeRow) -> Resul
         Err(e) => return Err(e.into()),
     }
     if row.kind == NodeKind::Site {
-        ensure_site_groups(&mut *conn, row.id).await?;
+        ensure_site_groups(&mut *conn, row.id, group_ids).await?;
         ensure_site_row(&mut *conn, row.id).await?;
     }
     if row.kind == NodeKind::Document {
@@ -588,8 +601,10 @@ impl Db {
             }
         }
         // `judge` has locked every row written, in the one order, before any group or role.
+        let first = change.rows.first().map(|row| row.id);
         for row in change.rows {
-            upsert_node(&mut tx, row).await?;
+            let ids = change.site_group_ids.filter(|_| Some(row.id) == first);
+            upsert_node_with(&mut tx, row, ids).await?;
         }
         for site in change.new_sites {
             upsert_site(&mut tx, site).await?;

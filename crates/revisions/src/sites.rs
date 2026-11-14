@@ -272,6 +272,8 @@ pub struct SitesChange<'a> {
     pub removed_sites: &'a [Uuid],
     /// Saved templates to write, each replacing any stored under the same id.
     pub templates: &'a [TemplateRecord],
+    /// Saved templates whose record is removed: a save or import taken back.
+    pub removed_templates: &'a [Uuid],
     /// The global navigation, if it changes.
     pub org_navigation: Option<&'a OrgNavigation>,
 }
@@ -287,6 +289,7 @@ impl<'a> SitesChange<'a> {
             sites: &[],
             removed_sites: &[],
             templates: &[],
+            removed_templates: &[],
             org_navigation: None,
         }
     }
@@ -296,6 +299,7 @@ impl<'a> SitesChange<'a> {
         self.sites.is_empty()
             && self.removed_sites.is_empty()
             && self.templates.is_empty()
+            && self.removed_templates.is_empty()
             && self.org_navigation.is_none()
     }
 }
@@ -434,6 +438,7 @@ impl RevisionStore {
             .removed_sites
             .iter()
             .map(|id| site_path(*id))
+            .chain(change.removed_templates.iter().map(|id| template_path(*id)))
             .collect();
 
         let _guard = self.lock();
@@ -758,8 +763,15 @@ mod tests {
         change.templates = &templates;
         change.org_navigation = Some(&navigation);
         store.write_sites(&change).unwrap();
-        assert_eq!(store.read_templates().unwrap(), vec![template]);
+        assert_eq!(store.read_templates().unwrap(), vec![template.clone()]);
         assert_eq!(store.read_org_navigation().unwrap(), Some(navigation));
+
+        // A removal takes a template away.
+        let removed = [template.id];
+        let mut change = SitesChange::new(&author, "Undo: Save template Project");
+        change.removed_templates = &removed;
+        store.write_sites(&change).unwrap();
+        assert!(store.read_templates().unwrap().is_empty());
 
         // Unknown fields in a template are refused.
         let text = r#"{"kind": "team", "language": "en", "time_zone": "UTC",

@@ -776,7 +776,7 @@ pub(super) async fn create_uploaded(
 
 /// The `Content-Disposition` of a download of the file `name`: an attachment, with an ASCII
 /// fallback name for old clients and the real name in `filename*` (RFC 6266, RFC 8187).
-fn content_disposition(name: &str) -> String {
+pub(crate) fn content_disposition(name: &str) -> String {
     let fallback: String = name
         .chars()
         .map(|c| {

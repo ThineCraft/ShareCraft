@@ -170,6 +170,7 @@ test('every error code of the tree and access routes has its own sentence', () =
     'invalid_language',
     'invalid_time_zone',
     'invalid_navigation',
+    'invalid_template',
   ]) {
     assert.notEqual(messageFor(code), general, code);
   }

@@ -232,7 +232,7 @@ pub fn validate_description(text: &str) -> Result<&str, AccessError> {
 /// Whether `url` is an address a navigation link may lead to: at most 2,000 characters, no
 /// spaces or control characters, and `https:`, `http:`, `mailto:` or a path on this server
 /// (one `/`, not `//` or `/\`).
-fn acceptable_url(url: &str) -> bool {
+pub(crate) fn acceptable_url(url: &str) -> bool {
     if url.is_empty()
         || url.chars().count() > MAX_URL_CHARS
         || url.chars().any(|c| c.is_control() || c.is_whitespace())

@@ -92,7 +92,7 @@ impl Db {
         .await?;
         let mut groups = 0u64;
         for id in lacking {
-            groups = groups.saturating_add(ensure_site_groups(&mut tx, NodeId(id)).await?);
+            groups = groups.saturating_add(ensure_site_groups(&mut tx, NodeId(id), None).await?);
         }
         let scopes = sqlx::query(
             "update nodes set unique_scope = true \

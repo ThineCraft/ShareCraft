@@ -9,7 +9,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use collab_core::ids::NodeId;
-use records::{Access, Db, Group, Node, NodeKind, Perms, SiteKind, SiteSettings, User};
+use records::{Access, Db, Group, Node, Perms, SiteKind, SiteSettings, User};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use time::format_description::well_known::Rfc3339;
@@ -21,7 +21,7 @@ use super::{ApiError, JsonBody, to_completion};
 use crate::AppState;
 use crate::auth::Signed;
 use crate::sites::{self, SiteEdit};
-use crate::tree::{self, TreeOp};
+use crate::tree;
 
 /// A site named in an answer: `{id, name}`.
 #[derive(Clone, Serialize)]
@@ -165,6 +165,12 @@ pub(crate) async fn list(
 #[derive(Deserialize)]
 pub(crate) struct NewSite {
     name: String,
+    /// A built-in template's name or a saved template's id; `team` when absent.
+    template: Option<String>,
+    /// Given fields override the template's.
+    description: Option<String>,
+    language: Option<String>,
+    time_zone: Option<String>,
 }
 
 /// `POST /api/sites`: the new site, with its groups.
@@ -189,10 +195,15 @@ async fn site_groups(db: &Db, user: &User, site: NodeId) -> Result<Vec<GroupOut>
     answered(db, user, groups).await
 }
 
-/// `POST /api/sites {name}`: creates a site with a library named Documents and its three
-/// groups, Owners, Members and Visitors, assigned Owner, Editor and Viewer on it; the creator
-/// becomes a member of its Owners group. Administrators only. `201` with the site and its
-/// groups.
+/// `POST /api/sites {name, template?, description?, language?, time_zone?}`: creates a site
+/// from a template (`team` when none is given; a built-in's name or a saved template's id),
+/// with the template's libraries, folders, kind, language, time zone and navigation, the
+/// fields given overriding the template's, and its three groups, Owners, Members and Visitors,
+/// assigned Owner, Editor and Viewer on it; the creator becomes a member of its Owners group
+/// (see [`tree::create_site`]). Administrators only (`403`). `422 invalid_request` for a
+/// template that is neither a built-in nor an id, or a description over 500 characters, `404`
+/// for an unknown or deleted template, `422 invalid_language` or `invalid_time_zone`. `201`
+/// with the site and its groups.
 pub(crate) async fn create(
     State(state): State<AppState>,
     signed: Signed,
@@ -203,13 +214,21 @@ pub(crate) async fn create(
     let site = {
         let state = state.clone();
         to_completion(async move {
-            let op = TreeOp::Create {
-                parent: None,
-                kind: NodeKind::Site,
-                name: new.name,
-                id: NodeId(Uuid::new_v4()),
-            };
-            Ok(tree::apply(&state, &actor, op).await?.node)
+            let mut shape =
+                crate::templates::shape_for(&state, &actor, new.template.as_deref()).await?;
+            if let Some(description) = new.description {
+                shape.description = description;
+            }
+            if let Some(language) = new.language {
+                shape.language = language;
+            }
+            if let Some(time_zone) = new.time_zone {
+                shape.time_zone = time_zone;
+            }
+            let id = NodeId(Uuid::new_v4());
+            Ok(tree::create_site(&state, &actor, id, &new.name, shape)
+                .await?
+                .node)
         })
         .await?
     };

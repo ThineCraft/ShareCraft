@@ -134,17 +134,24 @@ fn group_from_row(row: &PgRow) -> Result<Group, sqlx::Error> {
 }
 
 /// Makes the three groups of the site `site` that it does not have yet, each with its
-/// assignment on the site, and records `group.created` for each. Returns how many it made. A
-/// group that exists is left as it is, assignments included, so running this again never gives
-/// back an assignment someone removed.
+/// assignment on the site, and records `group.created` for each: with the ids `ids` (Owners,
+/// Members and Visitors, in that order) when given, otherwise new random ones. Returns how many
+/// it made. A group that exists is left as it is, assignments included, so running this again
+/// never gives back an assignment someone removed.
 pub(crate) async fn ensure_site_groups(
     conn: &mut PgConnection,
     site: NodeId,
+    ids: Option<[Uuid; 3]>,
 ) -> Result<u64, sqlx::Error> {
+    let ids: Vec<Option<Uuid>> = match ids {
+        Some(ids) => ids.into_iter().map(Some).collect(),
+        None => vec![None; 3],
+    };
     let made: Vec<(Uuid, String)> = sqlx::query_as(
         "with made as ( \
              insert into groups (id, site_id, purpose) \
-             select gen_random_uuid(), $1, p from unnest(array['owners', 'members', 'visitors']) p \
+             select coalesce(i, gen_random_uuid()), $1, p \
+             from unnest($2::uuid[], array['owners', 'members', 'visitors']) as t(i, p) \
              on conflict (site_id, purpose) do nothing \
              returning id, purpose), \
          given as ( \
@@ -155,6 +162,7 @@ pub(crate) async fn ensure_site_groups(
          select id, purpose from made order by id",
     )
     .bind(site.0)
+    .bind(&ids)
     .fetch_all(&mut *conn)
     .await?;
     for (id, purpose) in &made {

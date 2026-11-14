@@ -20,6 +20,7 @@ mod roles;
 mod scopes;
 mod settings;
 mod sites;
+mod templates;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 mod tree;
@@ -52,6 +53,10 @@ pub use sites::{
     DEFAULT_LANGUAGE, DEFAULT_TIME_ZONE, GLOBAL_NAVIGATION, NavScope, RegionalDefaults, SiteChange,
     SiteKind, SiteSettings, TemplateRow, validate_description, validate_language,
     validate_time_zone,
+};
+pub use templates::{
+    MAX_PACKAGE_BYTES, MAX_TEMPLATE_DEPTH, MAX_TEMPLATE_FOLDERS, MAX_TEMPLATE_LIBRARIES,
+    validate_template_body, validate_template_description, validate_template_name,
 };
 pub use tree::{Node, NodeChange, NodeKind, NodeRow, NodesApplied, validate_node_name};
 pub use uploads::{
