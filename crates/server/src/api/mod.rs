@@ -592,6 +592,7 @@ mod tests {
             database_url: DatabaseUrl::new(test.url()),
             editors_dir: dir.join("editors"),
             max_file_bytes: 64 << 20,
+            upload_idle: Duration::from_secs(60),
         };
         let store = RevisionStore::open(&crate::library_path(dir)).unwrap();
         let blobs = revisions::BlobStore::open(&crate::blobs_path(dir)).unwrap();

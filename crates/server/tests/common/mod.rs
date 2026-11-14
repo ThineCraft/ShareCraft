@@ -502,6 +502,7 @@ pub fn config_at(data_dir: &Path, db: &TestDb) -> Config {
         database_url: server::config::DatabaseUrl::new(db.url()),
         editors_dir: data_dir.join("editors"),
         max_file_bytes: 64 << 20,
+        upload_idle: Duration::from_secs(60),
     }
 }
 

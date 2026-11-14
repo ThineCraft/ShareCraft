@@ -44,6 +44,9 @@ pub struct Config {
     pub editors_dir: PathBuf,
     /// The largest file, in bytes, a file document may hold.
     pub max_file_bytes: u64,
+    /// How long a chunk of an upload may go without sending a byte before it is cut off,
+    /// keeping what arrived; a stalled connection would otherwise hold its session for ever.
+    pub upload_idle: Duration,
 }
 
 /// A database URL. It usually holds a password, so `Debug` never shows it.
@@ -150,6 +153,7 @@ impl Config {
             database_url,
             editors_dir: PathBuf::from(editors_dir.unwrap_or(DEFAULT_EDITORS)),
             max_file_bytes,
+            upload_idle: Duration::from_secs(60),
         })
     }
 }

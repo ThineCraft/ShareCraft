@@ -16,7 +16,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use collab_core::ids::{DocId, NodeId};
-use common::{FileClient, Site, StoppableServer, TestServer, TestUser, spawn_server};
+use common::{
+    FileClient, Site, StoppableServer, TestServer, TestUser, spawn_server, spawn_server_config,
+};
 use futures_util::StreamExt;
 use protocol::{FileServerMsg, SaveState, SeatState};
 use records::Principal;
@@ -807,7 +809,7 @@ async fn permission_lost_during_upload_refuses_finish() {
 
 /// A session that has received nothing for a day is ended by the sweeper, and its part file
 /// removed; a younger one is kept. The sweeper never removes a part file while a chunk is being
-/// written: it waits for the chunk.
+/// written, and never waits for one: it skips the busy session.
 #[tokio::test]
 async fn expired_sessions_are_swept() {
     let server = spawn_server().await;
@@ -826,7 +828,7 @@ async fn expired_sessions_are_swept() {
     .await;
     assert_eq!(received(&server, &ann, &id).await, 1000);
 
-    // A chunk being written when the sweep comes: it waits for the chunk.
+    // A chunk being written when the sweep comes: the sweep skips the busy session at once.
     let (release, released) = tokio::sync::oneshot::channel::<()>();
     let tail = content[1000..].to_vec();
     let body = futures_util::stream::once(async { Ok::<_, std::io::Error>(vec![7u8; 1000]) })
@@ -852,21 +854,15 @@ async fn expired_sessions_are_swept() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     let later = OffsetDateTime::now_utc() + time::Duration::hours(25);
-    let mut sweep = tokio::spawn({
-        let state = state.clone();
-        async move { server::sweep_once(&state, later).await }
-    });
-    assert!(
-        tokio::time::timeout(Duration::from_millis(300), &mut sweep)
-            .await
-            .is_err(),
-        "the sweep did not wait for the chunk"
-    );
+    tokio::time::timeout(Duration::from_secs(5), server::sweep_once(&state, later))
+        .await
+        .expect("the sweep waited for a busy session");
     assert!(part.exists());
     release.send(()).unwrap();
     let response = slow.await.unwrap().unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    sweep.await.unwrap();
+    assert_eq!(received(&server, &ann, &id).await, 4000);
+    server::sweep_once(&state, later).await;
 
     // A day after the chunk, the session is gone with its part file.
     assert_eq!(
@@ -884,4 +880,37 @@ async fn expired_sessions_are_swept() {
     assert!(stray.exists());
     server::sweep_once(&state, OffsetDateTime::now_utc() + time::Duration::hours(2)).await;
     assert!(!stray.exists());
+}
+
+/// A chunk whose body stalls without breaking is cut off once it has sent nothing for the idle
+/// time: what arrived is kept, the session's turn is free again, and the upload resumes.
+#[tokio::test]
+async fn stalled_chunk_is_cut_off_and_resumable() {
+    let server = spawn_server_config(|c| c.upload_idle = Duration::from_millis(300)).await;
+    let ann = server.user("Ann").await;
+    let home = server.home_of(&ann).await;
+    let content = bytes(5000, 16);
+    let id = start_file(&server, &ann, home, "Stalled.pdf", &content).await;
+
+    // 1000 bytes, then nothing, with the connection left open.
+    let head = content[..1000].to_vec();
+    let body = futures_util::stream::once(async move { Ok::<_, std::io::Error>(head) })
+        .chain(futures_util::stream::pending());
+    let stalled = server
+        .http(Some(&ann))
+        .put(server.url(&format!("/api/uploads/{id}")))
+        .header(CONTENT_RANGE, "bytes 0-4999/5000")
+        .body(reqwest::Body::wrap_stream(body))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stalled.status(), StatusCode::BAD_REQUEST);
+    let answer: Value = stalled.json().await.unwrap();
+    assert_eq!(answer["error"], "incomplete_chunk");
+    assert_eq!(answer["received"], 1000);
+
+    assert_eq!(received(&server, &ann, &id).await, 1000);
+    put_all(&server, &ann, &id, &content, 1000, 4000).await;
+    let doc = created_doc(finish(&server, &ann, &id).await).await;
+    assert_eq!(download(&server, &ann, doc).await.0, content);
 }

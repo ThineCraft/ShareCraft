@@ -23,9 +23,10 @@
 //! `<data>/uploads/<id>.part`, on the same volume as the content store, so finishing renames
 //! it into place. The running SHA-256 of what was received is kept in memory; after a restart it
 //! is computed again from the part file, at the next chunk or at the finish. Every request on a
-//! session takes its turn on a lock of the session's own, which the sweeper also takes before
-//! it removes a session that has received nothing for a day, so a part file is never removed
-//! while a chunk is being written to it.
+//! session takes its turn on a lock of the session's own, which the sweeper also takes (without
+//! waiting: a busy session is skipped) before it removes a session that has received nothing
+//! for a day, so a part file is never removed while a chunk is being written to it. A chunk
+//! whose body sends nothing for `upload_idle` (a minute) is cut off, keeping what arrived.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -413,7 +414,8 @@ fn chunk_range(text: &str) -> Option<ChunkRange> {
 ///
 /// The bytes stream into the part file while they are hashed, and are flushed before the
 /// session records them. A body that ends before the range does, or breaks, keeps what
-/// arrived: `400 incomplete_chunk {received}`. A body longer than its range keeps nothing of
+/// arrived: `400 incomplete_chunk {received}`; so does a body that sends nothing for the
+/// configured `upload_idle`. A body longer than its range keeps nothing of
 /// it: `400 invalid_range {received}`. The chunk is written to the end even if the caller goes
 /// away.
 pub(crate) async fn chunk(
@@ -457,7 +459,10 @@ pub(crate) async fn chunk(
             append(&part, received, hashed, range.len(), ChannelReader::new(rx))
         });
         let mut stream = body.into_data_stream();
-        while let Some(frame) = stream.next().await {
+        let idle = state.config().upload_idle;
+        // A body that sends nothing for `idle` is cut off like a broken one, so a stalled
+        // connection never holds the session's turn for ever.
+        while let Ok(Some(frame)) = tokio::time::timeout(idle, stream.next()).await {
             let item = frame.map_err(|e| std::io::Error::new(ErrorKind::ConnectionAborted, e));
             let failed = item.is_err();
             if tx.send(item).await.is_err() || failed {
@@ -789,8 +794,9 @@ fn completed(state: &AppState, user: &User, doc: DocId, session: &UploadSession,
 
 /// Ends, as of `now`, every upload session that has received nothing for a day, and removes
 /// part files left without a session for an hour. Each session is ended under its turn, so
-/// never while a chunk is being written; a session that received a chunk while the sweeper
-/// waited for its turn is kept. Failures are logged; the next sweep tries again.
+/// never while a chunk is being written; a session whose turn is taken (a request under way)
+/// is skipped, so the sweep never waits on a session. Failures are logged; the next sweep
+/// tries again.
 pub(crate) async fn sweep_uploads(state: &AppState, now: OffsetDateTime) {
     let db = state.db();
     let idle = match db.idle_uploads(now - UPLOAD_LIFETIME).await {
@@ -803,7 +809,11 @@ pub(crate) async fn sweep_uploads(state: &AppState, now: OffsetDateTime) {
     let mut swept = 0usize;
     for id in idle {
         let turn = state.uploads().turn(id);
-        let _turn = turn.lock().await;
+        // A session whose turn is taken has a request under way: it is not idle, and the
+        // sweep never waits for it.
+        let Ok(_turn) = turn.try_lock() else {
+            continue;
+        };
         match db.upload_session(id).await {
             Ok(Some(session)) if session.touched_at <= now - UPLOAD_LIFETIME => {
                 if end_session(state, id).await.is_ok() {
@@ -863,7 +873,10 @@ async fn remove_orphan_parts(state: &AppState, now: OffsetDateTime) {
     };
     for id in old {
         let turn = state.uploads().turn(id);
-        let _turn = turn.lock().await;
+        // Busy: a request is under way, so it is no orphan for now.
+        let Ok(_turn) = turn.try_lock() else {
+            continue;
+        };
         match state.db().upload_session(id).await {
             Ok(None) => {
                 remove_part(state, id).await;
