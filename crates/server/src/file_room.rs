@@ -65,6 +65,15 @@ pub(crate) enum FileCommand {
     Confirm { conn: ConnId, client: ClientId },
     /// The connection ended.
     Leave { conn: ConnId, client: ClientId },
+    /// Whether a save by `user` with `token`, made from `base`, would be taken now: answered
+    /// `None` if so, otherwise with the answer the save would get. Asked before a save's body
+    /// is read, so a save that would be refused stores nothing.
+    CheckSave {
+        user: UserId,
+        token: String,
+        base: Option<RevisionId>,
+        reply: oneshot::Sender<Option<SaveReply>>,
+    },
     /// Store the content `blob`, already in the content store, as the document's next
     /// revision, on behalf of the seat holder.
     Save {
@@ -125,6 +134,33 @@ pub(crate) fn start(place: Place, name: String, storage: Storage, grace: Duratio
 }
 
 impl Rooms {
+    /// Asks `doc`'s file session whether it would take a save by `user` with `token`, made
+    /// from `base`, now: `None` if so, otherwise the answer the save would get (`NotHolder` if
+    /// no session is open, or if it ends before answering). The save is checked again when it
+    /// arrives.
+    pub(crate) async fn check_save(
+        &self,
+        doc: DocId,
+        user: UserId,
+        token: &str,
+        base: Option<RevisionId>,
+    ) -> Option<SaveReply> {
+        let Some(Link::File(link)) = self.link(doc) else {
+            return Some(SaveReply::NotHolder);
+        };
+        let (reply, answer) = oneshot::channel();
+        let check = FileCommand::CheckSave {
+            user,
+            token: token.to_owned(),
+            base,
+            reply,
+        };
+        if link.commands.send(check).await.is_err() {
+            return Some(SaveReply::NotHolder);
+        }
+        answer.await.unwrap_or(Some(SaveReply::NotHolder))
+    }
+
     /// Asks `doc`'s file session to store the content `blob` (already in the content store),
     /// made from the revision `base`, for `user` holding the seat with `token`. `NotHolder` if
     /// no session is open (none is opened for this), or if it ends before answering.
@@ -323,6 +359,14 @@ impl FileRoom {
                 let _ = accepted.send(reply);
             }
             FileCommand::Confirm { conn, client } => self.confirm(conn, client),
+            FileCommand::CheckSave {
+                user,
+                token,
+                base,
+                reply,
+            } => {
+                let _ = reply.send(self.refusal(user, &token, base.as_ref()));
+            }
             FileCommand::Leave { conn, client } => self.leave(conn, client),
             FileCommand::Save {
                 user,
@@ -451,6 +495,28 @@ impl FileRoom {
         self.seat
             .as_ref()
             .is_some_and(|s| s.user == user && same_token(&s.token, token))
+    }
+
+    /// The answer a save by `user` with `token`, made from `base`, would get at once, or later
+    /// when its turn comes, if it would be refused; `None` if it would be taken now.
+    fn refusal(&self, user: UserId, token: &str, base: Option<&RevisionId>) -> Option<SaveReply> {
+        if !self.holds_seat(user, token) {
+            return Some(SaveReply::NotHolder);
+        }
+        if let Some(current) = &self.conflict {
+            return Some(SaveReply::Conflict {
+                current: current.clone(),
+            });
+        }
+        if base != self.revision.as_ref() {
+            return Some(SaveReply::Conflict {
+                current: self.revision.clone(),
+            });
+        }
+        if self.waiting.is_some() {
+            return Some(SaveReply::Busy);
+        }
+        None
     }
 
     /// A save arrived. One from someone not holding the seat with that token is answered

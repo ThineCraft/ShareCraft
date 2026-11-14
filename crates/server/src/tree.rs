@@ -220,15 +220,7 @@ pub async fn create_document(
     let _turn = state.tree_lock().lock().await;
     ensure_in_step(state).await?;
     let db = state.db();
-    let name = validate_document_name(name, editor)?.to_owned();
-    let parent_node = visible(db, actor, parent).await?;
-    if !matches!(parent_node.0.kind, NodeKind::Library | NodeKind::Folder) {
-        return Err(AccessError::WrongPlace);
-    }
-    require(&parent_node.1, Perms::ADD)?;
-    if !db.name_free(parent, &name, None).await? {
-        return Err(AccessError::NameTaken);
-    }
+    let name = new_document_name(db, actor, parent, name, editor).await?;
     let node = NodeId(id.0);
     unused(state, node).await?;
     let parent_record = git_record(state, parent).await?;
@@ -271,6 +263,47 @@ pub async fn create_document(
     db.document(id)
         .await?
         .ok_or_else(|| DbError::new("the new document was not recorded").into())
+}
+
+/// Checks that `actor` may create a file named `name`, opened in `editor`, in `parent` now:
+/// the checks [`create_document`] makes first, without taking the tree's turn. An upload makes
+/// them before reading its body, so a request that would be refused stores nothing;
+/// [`create_document`] makes them again.
+///
+/// # Errors
+/// `NotFound`, `Forbidden` unless `actor` has `add` on `parent`, `WrongPlace`, `InvalidName`,
+/// `WrongExtension`, `NameTaken`, or the database error.
+pub async fn check_create_document(
+    state: &AppState,
+    actor: &User,
+    parent: NodeId,
+    name: &str,
+    editor: Editor,
+) -> Result<(), AccessError> {
+    new_document_name(state.db(), actor, parent, name, editor)
+        .await
+        .map(|_| ())
+}
+
+/// The name a new file `name` in `parent` would have, once `actor` is found to have `add` on
+/// `parent`, a library or folder, and the name to be acceptable for `editor` and free there.
+async fn new_document_name(
+    db: &Db,
+    actor: &User,
+    parent: NodeId,
+    name: &str,
+    editor: Editor,
+) -> Result<String, AccessError> {
+    let name = validate_document_name(name, editor)?.to_owned();
+    let parent_node = visible(db, actor, parent).await?;
+    if !matches!(parent_node.0.kind, NodeKind::Library | NodeKind::Folder) {
+        return Err(AccessError::WrongPlace);
+    }
+    require(&parent_node.1, Perms::ADD)?;
+    if !db.name_free(parent, &name, None).await? {
+        return Err(AccessError::NameTaken);
+    }
+    Ok(name)
 }
 
 /// What moving the tree records into their sub-folders did, as the start-up line says it.

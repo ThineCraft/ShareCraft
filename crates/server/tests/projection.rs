@@ -457,3 +457,39 @@ async fn recording_recovers_after_a_failed_append() {
         assert_eq!(row.parent, parent);
     }
 }
+
+/// A revision whose content row cannot be written is still recorded, and a revision list out
+/// of step is still replaced from Git: the failure only flags the content rows for a rebuild.
+#[tokio::test]
+async fn a_failed_content_row_still_repairs_the_revision_list() {
+    let server = spawn_server().await;
+    let db = &server.db.db;
+    let doc = new_doc();
+    let mut a = TestClient::connect(&server, doc, "Ann").await;
+    let first = type_and_save(&mut a, "one").await;
+    wait_recorded(db, doc, &first).await;
+
+    // The recorded list falls out of step, and completed content rows can no longer be
+    // written (claims, which are pending rows, still can).
+    sqlx::query("delete from revisions where document_id = $1")
+        .bind(doc.0)
+        .execute(db.test_pool())
+        .await
+        .unwrap();
+    sqlx::raw_sql(
+        "create function no_completed_rows() returns trigger language plpgsql as $$ \
+         begin if not new.pending then raise exception 'no completed rows'; end if; \
+         return new; end $$; \
+         create trigger no_completed_rows before insert on blob_refs \
+         for each row execute function no_completed_rows();",
+    )
+    .execute(db.test_pool())
+    .await
+    .unwrap();
+
+    let second = type_and_save(&mut a, " two").await;
+    let rows = wait_recorded(db, doc, &second).await;
+    let recorded: Vec<&str> = rows.iter().map(|r| r.revision.as_str()).collect();
+    assert_eq!(recorded, [first.as_str(), second.as_str()]);
+    assert!(db.blob_refs_flagged().await.unwrap());
+}

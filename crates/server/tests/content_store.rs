@@ -562,3 +562,135 @@ async fn startup_erasure_waits_for_a_clean_rebuild() {
         b"named by a version"
     );
 }
+
+/// How many files the content store holds, finished or still in `tmp`.
+fn stored_files(server: &TestServer) -> usize {
+    let tmp = std::fs::read_dir(server.blobs().tmp_dir()).unwrap().count();
+    server.blobs().list().unwrap().len() + tmp
+}
+
+/// An upload the caller may not make is refused before its body is read: nothing is stored.
+#[tokio::test]
+async fn refused_upload_stores_nothing() {
+    let server = spawn_server().await;
+    let ann = server.user("Ann").await;
+    let bob = server.user("Bob").await;
+    let anns = server.home_of(&ann).await.0.to_string();
+    let response = server
+        .http(Some(&bob))
+        .post(server.url("/api/docs/upload"))
+        .query(&[("parent", anns.as_str()), ("name", "Into.xlsx")])
+        .body(vec![1u8; 2 * MIB as usize])
+        .send()
+        .await;
+    // The server may answer before the client has sent the whole body.
+    if let Ok(response) = response {
+        assert!(response.status().is_client_error(), "{}", response.status());
+    }
+    assert_eq!(stored_files(&server), 0);
+
+    // A name that is taken is refused the same way.
+    upload(&server, &ann, "Taken.xlsx", b"first".to_vec()).await;
+    let before = stored_files(&server);
+    let response = server
+        .http(Some(&ann))
+        .post(server.url("/api/docs/upload"))
+        .query(&[("parent", anns.as_str()), ("name", "Taken.xlsx")])
+        .body(b"second".to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(stored_files(&server), before);
+}
+
+/// A save without the seat, or from a revision that is not the current one, is refused before
+/// its body is read: nothing is stored.
+#[tokio::test]
+async fn save_without_the_seat_stores_nothing() {
+    let server = spawn_server().await;
+    let ann = server.user("Ann").await;
+    let doc = new_doc();
+    server.create_file_document(doc, &ann).await;
+    let put = |token: String, base: Option<String>| {
+        let mut request = server
+            .http(Some(&ann))
+            .put(server.url(&format!("/api/docs/{}/content", doc.0)))
+            .header(SEAT, token)
+            .body(b"refused bytes".to_vec());
+        if let Some(base) = base {
+            request = request.query(&[("base", base)]);
+        }
+        request.send()
+    };
+    // No session open.
+    let response = put("0".repeat(64), None).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let seat = FileClient::connect_as(&server, doc, &ann).await;
+    let token = seat.token().unwrap();
+    // A wrong token.
+    let response = put("0".repeat(64), None).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    // A base that is not the current revision.
+    let response = put(token, Some("1".repeat(40))).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(stored_files(&server), 0);
+}
+
+/// A save that passes the check before its body but is refused when it arrives (another save
+/// made a new revision meanwhile) has the content it stored erased.
+#[tokio::test]
+async fn refusal_after_storing_leaves_no_blob() {
+    let server = spawn_server().await;
+    let ann = server.user("Ann").await;
+    let doc = new_doc();
+    server.create_file_document(doc, &ann).await;
+    let seat = FileClient::connect_as(&server, doc, &ann).await;
+    let token = seat.token().unwrap();
+    let url = server.url(&format!("/api/docs/{}/content", doc.0));
+
+    // A slow save from no revision: the end of its body waits until released.
+    let (release, released) = tokio::sync::oneshot::channel::<()>();
+    let body = futures_util::stream::once(async { Ok::<_, std::io::Error>(b"slow ".to_vec()) })
+        .chain(futures_util::stream::once(async move {
+            released.await.unwrap();
+            Ok(b"bytes".to_vec())
+        }));
+    let slow = tokio::spawn(
+        server
+            .http(Some(&ann))
+            .put(url.clone())
+            .header(SEAT, token.clone())
+            .body(reqwest::Body::wrap_stream(body))
+            .send(),
+    );
+    // Wait until the slow body is being written.
+    let tmp = server.blobs().tmp_dir();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while std::fs::read_dir(&tmp).unwrap().count() == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the slow save never started"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // Another save from no revision is made first.
+    let response = server
+        .http(Some(&ann))
+        .put(url)
+        .header(SEAT, token)
+        .body(b"quick bytes".to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    release.send(()).unwrap();
+    let response = slow.await.unwrap().unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let blobs = server.blobs();
+    assert!(!blobs.contains(&BlobRef::of(b"slow bytes").sha256));
+    assert!(blobs.contains(&BlobRef::of(b"quick bytes").sha256));
+    assert_eq!(stored_files(&server), 1);
+}

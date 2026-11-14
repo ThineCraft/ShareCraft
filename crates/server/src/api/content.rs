@@ -109,6 +109,28 @@ async fn body_blob(state: &AppState, request: Request) -> Result<BlobRef, ApiErr
     }
 }
 
+/// Erases `blob`, the body of a request refused after it was stored, unless something names it
+/// (the same content saved by someone else, or by an earlier version). Nothing is erased while
+/// a flag says the content rows may be incomplete, as a version could then name the content
+/// without a row; the start-up erasure deals with it after the rebuild. Failures are logged.
+async fn discard(state: &AppState, blob: BlobRef) {
+    match state.db().blob_refs_flagged().await {
+        Ok(false) => {}
+        Ok(true) => return,
+        Err(e) => {
+            eprintln!("sharecraft-server: database failure: {e}");
+            return;
+        }
+    }
+    if let Err(e) = state
+        .blobs()
+        .erase_if_unreferenced(state.db(), &blob.sha256)
+        .await
+    {
+        eprintln!("sharecraft-server: cannot erase the content of a refused request: {e}");
+    }
+}
+
 /// `GET /api/docs/{id}/content[?revision=<id>]`: the document's bytes, as its current revision
 /// or the given one, or the one byte range asked for (see [`file_answer`]). `204` if the
 /// document has no revision yet; `404` if the caller has no role on it or the revision is not
@@ -343,9 +365,12 @@ fn file_stream(
 /// next revision, made from revision `base` (none if the document has none yet). The request
 /// carries the seat token in `X-ShareCraft-Seat`.
 ///
-/// The role is checked before the body is read. The body streams into the content store, and a
-/// reference to it is handed to the document's file session and nothing else; the save
-/// finishes even if the caller goes away.
+/// The role, and with the file session the seat, the token and the base revision, are checked
+/// before the body is read, so a save that would be refused stores nothing. The body streams
+/// into the content store, and a reference to it is handed to the document's file session and
+/// nothing else, which checks the save again; the save finishes even if the caller goes away.
+/// A save refused after its body was stored has that content erased, unless something else
+/// names it.
 pub(crate) async fn save(
     State(state): State<AppState>,
     signed: Signed,
@@ -383,16 +408,33 @@ pub(crate) async fn save(
         .and_then(|value| value.to_str().ok())
         .ok_or(ApiError::Forbidden)?
         .to_owned();
+    if let Some(refused) = state
+        .rooms()
+        .check_save(doc, user, &token, base.clone())
+        .await
+    {
+        return Ok(save_answer(refused));
+    }
     let blob = body_blob(&state, request).await?;
 
     let reply = {
         let state = state.clone();
-        to_completion(
-            async move { Ok(state.rooms().save_file(doc, user, &token, base, blob).await) },
-        )
+        to_completion(async move {
+            let reply = state.rooms().save_file(doc, user, &token, base, blob).await;
+            // Saved or unchanged, a version names the content.
+            if !matches!(reply, SaveReply::Saved(_) | SaveReply::Unchanged(_)) {
+                discard(&state, blob).await;
+            }
+            Ok(reply)
+        })
         .await?
     };
-    Ok(match reply {
+    Ok(save_answer(reply))
+}
+
+/// The answer to a save the file session answered with `reply`.
+fn save_answer(reply: SaveReply) -> Response {
+    match reply {
         SaveReply::Saved(revision) => saved(&revision, true),
         SaveReply::Unchanged(revision) => saved(&revision, false),
         SaveReply::NotHolder => ApiError::Forbidden.into_response(),
@@ -408,7 +450,7 @@ pub(crate) async fn save(
             Json(json!({ "error": "busy" })),
         )
             .into_response(),
-    })
+    }
 }
 
 /// The answer to a save that stored (or found equal) `revision`.
@@ -419,8 +461,10 @@ fn saved(revision: &RevisionId, changed: bool) -> Response {
 /// `POST /api/docs/upload?parent=<id>&name=<file name>`: creates a document from the bytes
 /// sent in the library or folder `parent` (of which the caller must be an editor), with them as
 /// its first revision. The document inherits its access from there. The editor is the one
-/// whose extension ends the name. The bytes stream into the content store first, and are
-/// claimed for the revision before it is committed. If they cannot be stored after the
+/// whose extension ends the name. The caller's right to add there and the name are checked
+/// before the body is read (and again when the document is made); the bytes then stream into
+/// the content store, and are claimed for the revision before it is committed. Content stored
+/// for an upload that is then refused, or fails, is erased unless something else names it. If they cannot be stored after the
 /// document was made, the document stays, empty, and the answer is `503` naming it.
 pub(crate) async fn upload(
     State(state): State<AppState>,
@@ -432,11 +476,18 @@ pub(crate) async fn upload(
     let parent = NodeId(parse_id(&query.parent.ok_or(ApiError::BadRequest)?)?);
     let name = query.name.ok_or(ApiError::BadRequest)?;
     let editor = Editor::for_file_name(name.trim()).ok_or(ApiError::BadRequest)?;
+    let user = signed.session.user;
+    match tree::check_create_document(&state, &user, parent, &name, editor).await {
+        Ok(()) => {}
+        // The name is only an extension.
+        Err(AccessError::WrongExtension) => return Err(ApiError::BadRequest),
+        Err(e) => return Err(e.into()),
+    }
     let blob = body_blob(&state, request).await?;
     if blob.size == 0 {
+        discard(&state, blob).await;
         return Err(ApiError::BadRequest);
     }
-    let user = signed.session.user;
 
     to_completion(async move {
         let id = DocId(Uuid::new_v4());
@@ -444,9 +495,14 @@ pub(crate) async fn upload(
             tree::create_document(&state, &user, parent, id, &name, editor, Some(blob.size)).await;
         let document = match created {
             Ok(document) => document,
-            // The name is only an extension.
-            Err(AccessError::WrongExtension) => return Err(ApiError::BadRequest),
-            Err(e) => return Err(e.into()),
+            Err(e) => {
+                discard(&state, blob).await;
+                return Err(match e {
+                    // The name is only an extension.
+                    AccessError::WrongExtension => ApiError::BadRequest,
+                    e => e.into(),
+                });
+            }
         };
         let access = state
             .db()
@@ -483,6 +539,7 @@ pub(crate) async fn upload(
                     "sharecraft-server: upload of document {} failed: {e:?}",
                     id.0
                 );
+                discard(&state, blob).await;
                 // The document stays, empty.
                 let body = Json(json!({ "error": "unavailable", "document": id.0.to_string() }));
                 return Ok((StatusCode::SERVICE_UNAVAILABLE, body).into_response());

@@ -226,7 +226,7 @@ async fn record(
         .await
         .map_err(|e| e.to_string())?;
     if let Some(blob) = blob {
-        record_ref(db, doc, blob, revision).await?;
+        record_ref(db, doc, blob, revision).await;
     }
     if !appended {
         replace_from_git(store, db, doc).await?;
@@ -234,19 +234,17 @@ async fn record(
     Ok(())
 }
 
-/// Records that `revision` of `doc` names `blob`; on failure, flags the content rows for a
-/// rebuild at the next start.
-async fn record_ref(
-    db: &Db,
-    doc: DocId,
-    blob: BlobRef,
-    revision: &RevisionId,
-) -> Result<(), String> {
+/// Records that `revision` of `doc` names `blob`. A failure is logged and flags the content
+/// rows for a rebuild at the next start; it never stops the revision list from being recorded.
+async fn record_ref(db: &Db, doc: DocId, blob: BlobRef, revision: &RevisionId) {
     if let Err(e) = db.record_blob_ref(doc, blob, &revision.to_string()).await {
+        eprintln!(
+            "sharecraft-server: the content of revision {revision} of document {} could not be \
+             recorded: {e}",
+            doc.0
+        );
         flag_dirty(db).await;
-        return Err(e.to_string());
     }
-    Ok(())
 }
 
 /// Replaces `doc`'s list with its history in Git. If Git has a newer revision once the list is
@@ -261,7 +259,7 @@ async fn replace_from_git(
         let newest = history.last().map(|r| r.revision.clone());
         for info in &history {
             if let Some(blob) = info.blob {
-                record_ref(db, doc, blob, &info.revision).await?;
+                record_ref(db, doc, blob, &info.revision).await;
             }
         }
         let records = history
