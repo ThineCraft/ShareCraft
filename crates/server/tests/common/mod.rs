@@ -26,7 +26,7 @@ use protocol::{
 use records::test_support::TestDb;
 use records::{Db, Editor, NewUser, NodeKind, Principal, User};
 use reqwest::header::{COOKIE, HeaderMap, HeaderValue, ORIGIN, SET_COOKIE};
-use revisions::RevisionStore;
+use revisions::{BlobRef, BlobStore, RevisionStore, Stored};
 use server::tree::{self, TreeOp};
 use server::{AppState, Checkpointer, Config};
 use tempfile::TempDir;
@@ -116,7 +116,7 @@ impl Site {
     }
 
     /// The running server's state.
-    async fn state(&self) -> &AppState {
+    pub async fn state(&self) -> &AppState {
         self.state
             .get_or_init(|| async {
                 let coming = self.coming.lock().unwrap().take();
@@ -407,6 +407,21 @@ impl TestServer {
         RevisionStore::open(&self.library()).unwrap()
     }
 
+    /// Opens the server's content store.
+    pub fn blobs(&self) -> BlobStore {
+        BlobStore::open(&server::blobs_path(self.data_dir.path())).unwrap()
+    }
+
+    /// `bytes`, written to the server's content store, as a writer does before a checkpoint.
+    pub fn blob(&self, bytes: &[u8]) -> BlobRef {
+        store_blob(self.data_dir.path(), bytes)
+    }
+
+    /// The bytes of a stored version of a document of this server.
+    pub fn bytes(&self, stored: &Stored) -> Vec<u8> {
+        bytes_in(&self.library(), stored)
+    }
+
     /// The commits that changed `doc`, newest first. Its ref's history also holds the other
     /// commits on `main` (other documents' and the content tree's), which are left out.
     pub fn doc_commits(&self, doc: DocId) -> Vec<String> {
@@ -615,6 +630,28 @@ impl Drop for StoppableServer {
     }
 }
 
+/// `bytes`, written to the content store of the server storing under `data_dir`.
+pub fn store_blob(data_dir: &Path, bytes: &[u8]) -> BlobRef {
+    BlobStore::open(&server::blobs_path(data_dir))
+        .unwrap()
+        .write_from(bytes, u64::MAX)
+        .unwrap()
+}
+
+/// The data folder of the server whose library repository is at `library`.
+pub fn data_of(library: &Path) -> &Path {
+    library.parent().unwrap().parent().unwrap()
+}
+
+/// The bytes of `stored`, a version of a document in the library repository at `library`: from
+/// the content store beside it, or inline for a version saved before the store.
+pub fn bytes_in(library: &Path, stored: &Stored) -> Vec<u8> {
+    BlobStore::open(&server::blobs_path(data_of(library)))
+        .unwrap()
+        .read_all(&stored.content)
+        .unwrap()
+}
+
 /// Waits until the stored text of `doc` in `server`'s library is `text`.
 pub async fn wait_stored(server: &TestServer, doc: DocId, text: &str) {
     wait_stored_in(&server.library(), doc, text).await;
@@ -626,7 +663,7 @@ pub async fn wait_stored_in(library: &Path, doc: DocId, text: &str) {
     let store = RevisionStore::open(library).unwrap();
     loop {
         let stored = store.read(doc, None).unwrap();
-        if stored.is_some_and(|s| s.bytes == text.as_bytes()) {
+        if stored.is_some_and(|s| bytes_in(library, &s) == text.as_bytes()) {
             return;
         }
         assert!(
@@ -655,7 +692,8 @@ pub async fn spawn_server_with_grace(
     let checkpointer = make(&server::library_path(data_dir.path()));
     let listener = tokio::net::TcpListener::bind(config.addr).await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let state = AppState::new(config, checkpointer, db.db.clone());
+    let blobs = BlobStore::open(&server::blobs_path(data_dir.path())).unwrap();
+    let state = AppState::new(config, checkpointer, blobs, db.db.clone());
     tokio::spawn(fail_loudly(server::serve_state(state.clone(), listener)));
     TestServer {
         site: Site::ready(addr, db.db.clone(), state),

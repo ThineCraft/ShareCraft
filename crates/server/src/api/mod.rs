@@ -37,9 +37,10 @@ use crate::room::AccessChange;
 const MAX_BODY: usize = 16 * 1024;
 
 /// The `/api` routes, to be nested under `/api`. Unknown paths answer `404 {"error":"not_found"}`
-/// and pass the same guard as the others. File content (`max_file_bytes` at most per request) is
-/// the only thing allowed a body larger than [`MAX_BODY`].
-pub(crate) fn router(max_file_bytes: usize) -> Router<AppState> {
+/// and pass the same guard as the others. File content is the only thing allowed a body larger
+/// than [`MAX_BODY`]: it is streamed into the content store, up to the largest file allowed
+/// (`max_file_bytes`), which the content routes check themselves.
+pub(crate) fn router() -> Router<AppState> {
     Router::new()
         .route("/session", post(session::sign_in).delete(session::sign_out))
         .route("/me", get(session::me))
@@ -86,16 +87,11 @@ pub(crate) fn router(max_file_bytes: usize) -> Router<AppState> {
         .route("/explorer/{root}/counts", get(explorer::counts))
         .route("/explorer/{root}/export.csv", get(explorer::export))
         .route("/docs", post(docs::create))
-        .route(
-            "/docs/upload",
-            post(content::upload).layer(DefaultBodyLimit::max(max_file_bytes)),
-        )
+        .route("/docs/upload", post(content::upload))
         .route("/docs/{id}", get(docs::open))
         .route(
             "/docs/{id}/content",
-            get(content::download)
-                .put(content::save)
-                .layer(DefaultBodyLimit::max(max_file_bytes)),
+            get(content::download).put(content::save),
         )
         .route("/docs/{id}/access", get(nodes::access).put(nodes::share))
         .route("/docs/{id}/events", get(docs::events))
@@ -572,7 +568,8 @@ mod tests {
             max_file_bytes: 64 << 20,
         };
         let store = RevisionStore::open(&crate::library_path(dir)).unwrap();
-        AppState::new(config, Arc::new(store), test.db.clone())
+        let blobs = revisions::BlobStore::open(&crate::blobs_path(dir)).unwrap();
+        AppState::new(config, Arc::new(store), blobs, test.db.clone())
     }
 
     /// The owner's request to remove Bob's grant is cancelled (its future dropped) after the

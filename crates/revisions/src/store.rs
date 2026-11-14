@@ -10,6 +10,7 @@ use gix::refs::Target;
 use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 use gix::{ObjectId, Repository};
 
+use crate::blobs::{BlobRef, Content};
 use crate::meta::{Author, Meta};
 use crate::{Checkpoint, CheckpointError, GitError, Outcome, RevisionId, RevisionInfo, Stored};
 
@@ -18,7 +19,9 @@ const SCHEMA: u32 = 1;
 
 /// Stores document checkpoints in one bare Git repository.
 ///
-/// Layout: branch `refs/heads/main`; content at `docs/<doc_id>/content`; metadata at
+/// Layout: branch `refs/heads/main`; content at `docs/<doc_id>/content`, a pointer into the
+/// content store (see [`BlobRef::to_pointer`]) or, for a version saved before the store, the
+/// bytes themselves; metadata at
 /// `docs/<doc_id>/meta.json`; and `refs/sharecraft/docs/<doc_id>` pointing at the last commit
 /// that changed that document. The content tree is recorded beside the documents, one file per
 /// node at `tree/<first two hex digits of the id>/<node_id>.json`, with `refs/sharecraft/tree` pointing at the last commit that
@@ -136,7 +139,7 @@ fn read_commit(doc: DocId, commit: &gix::Commit<'_>) -> Result<Option<Stored>, C
         (Some(bytes), Some(meta)) => match serde_json::from_slice(&meta) {
             Ok(meta) => Ok(Some(Stored {
                 revision: RevisionId::from_oid(commit.id),
-                bytes,
+                content: Content::from_git(bytes),
                 meta,
             })),
             Err(e) => Err(corrupt(
@@ -187,6 +190,10 @@ fn describe_commit(
     let mut authors = vec![author_from(signature.name, signature.email)];
     let message = String::from_utf8_lossy(commit.message_raw()?);
     authors.extend(message.lines().filter_map(co_author));
+    let blob = match &stored.content {
+        Content::Blob(blob) => Some(*blob),
+        Content::Inline(_) => None,
+    };
     Ok(Some(RevisionInfo {
         revision: stored.revision,
         doc,
@@ -194,6 +201,8 @@ fn describe_commit(
         authors,
         file_name: stored.meta.file_name,
         fields: stored.meta.fields,
+        blob,
+        size: stored.content.size(),
     }))
 }
 
@@ -436,12 +445,39 @@ impl RevisionStore {
         Ok(docs)
     }
 
-    /// Stores the document state as one commit, unless it equals what is stored.
+    /// Stores the document state as one commit, its content as a pointer to `c.blob`, unless
+    /// it equals what is stored. Content is compared by hash and size; an old inline version
+    /// is hashed to compare, so saving it unchanged writes nothing.
     ///
     /// # Errors
     /// `Stale` if `base` is not the document's current revision, `NoAuthors` or
     /// `InvalidFileName` for bad input, otherwise Git or metadata errors.
     pub fn checkpoint(&self, c: &Checkpoint<'_>) -> Result<Outcome, CheckpointError> {
+        self.commit_checkpoint(c, &c.blob.to_pointer(), c.blob)
+    }
+
+    /// Stores a checkpoint with `bytes` inline in Git, as versions were stored before the
+    /// content store; `c.blob` is ignored. For tests of the upgrade only.
+    ///
+    /// # Errors
+    /// As [`RevisionStore::checkpoint`].
+    #[cfg(feature = "test-support")]
+    pub fn checkpoint_inline(
+        &self,
+        c: &Checkpoint<'_>,
+        bytes: &[u8],
+    ) -> Result<Outcome, CheckpointError> {
+        self.commit_checkpoint(c, bytes, BlobRef::of(bytes))
+    }
+
+    /// Commits `c` with `stored_bytes` as the content file, unless `blob`, the content they
+    /// stand for, file name and fields equal what is stored.
+    fn commit_checkpoint(
+        &self,
+        c: &Checkpoint<'_>,
+        stored_bytes: &[u8],
+        blob: BlobRef,
+    ) -> Result<Outcome, CheckpointError> {
         let Some(first) = c.authors.first() else {
             return Err(CheckpointError::NoAuthors);
         };
@@ -467,7 +503,7 @@ impl RevisionStore {
         };
 
         if let Some(s) = &stored
-            && s.bytes == c.bytes
+            && s.content.blob_ref() == blob
             && s.meta.file_name == c.file_name
             && s.meta.fields == *c.fields
         {
@@ -514,7 +550,7 @@ impl RevisionStore {
             &doc_ref(c.doc),
             current,
             |editor| {
-                let content = repo.write_blob(c.bytes)?.detach();
+                let content = repo.write_blob(stored_bytes)?.detach();
                 let meta_blob = repo.write_blob(&meta_bytes)?.detach();
                 editor.remove(dir.as_str())?;
                 editor.upsert(format!("{dir}/content"), EntryKind::Blob, content)?;
@@ -570,7 +606,7 @@ mod tests {
         let cp = Checkpoint {
             doc,
             file_name: "n.txt",
-            bytes: b"x",
+            blob: BlobRef::of(b"x"),
             base: None,
             authors: &authors,
             fields: &fields,
@@ -651,7 +687,7 @@ mod tests {
             .checkpoint(&Checkpoint {
                 doc,
                 file_name: "n.txt",
-                bytes: b"x",
+                blob: BlobRef::of(b"x"),
                 base: None,
                 authors: &authors,
                 fields: &fields,

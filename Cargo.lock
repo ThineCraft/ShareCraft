@@ -2184,6 +2184,7 @@ dependencies = [
  "collab-core",
  "getrandom 0.4.3",
  "records",
+ "revisions",
  "serde",
  "serde_json",
  "sha2 0.11.1",
@@ -2256,8 +2257,10 @@ version = "0.1.0"
 dependencies = [
  "collab-core",
  "gix",
+ "revisions",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
  "tempfile",
  "thiserror",
  "time",

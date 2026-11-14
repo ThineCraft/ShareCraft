@@ -1,19 +1,29 @@
 //! PostgreSQL's index of the revisions in Git: recorded after each checkpoint, reconciled when
 //! the server starts, and rebuilt on request. Git stays the authority; whenever the index
-//! disagrees with it, the document's list is replaced from Git.
+//! disagrees with it, the document's list is replaced from Git. Recording a revision also
+//! records the content it points at (a completed `blob_refs` row); those rows are rebuilt from
+//! Git at a start when a flag asks for it ([`reconcile_blobs`]).
 
+use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use collab_core::ids::DocId;
 use records::{Db, NewEvent, RevisionRecord};
-use revisions::{GitError, RevisionId, RevisionInfo};
+use revisions::{BlobRef, GitError, RevisionId, RevisionInfo};
 use serde_json::Value;
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
 
+use crate::AppState;
+use crate::blobs::flag_dirty;
 use crate::checkpoint::Checkpointer;
 use crate::events::{EventSink, error_text};
+
+/// Content nothing names is erased at a start only once it is at least this old, so a save
+/// that has stored its bytes but not yet claimed them never loses them.
+const ERASE_AFTER: time::Duration = time::Duration::hours(24);
 
 /// How many times a document's list is replaced from Git in a row when Git moves on while it
 /// is being replaced.
@@ -210,12 +220,31 @@ async fn record(
     .await?
     .ok_or_else(|| format!("{revision} is not a revision of the document"))?;
     let parent = parent.map(ToString::to_string);
+    let blob = info.blob;
     let appended = db
         .append_revision(parent.as_deref(), &to_record(info)?)
         .await
         .map_err(|e| e.to_string())?;
+    if let Some(blob) = blob {
+        record_ref(db, doc, blob, revision).await?;
+    }
     if !appended {
         replace_from_git(store, db, doc).await?;
+    }
+    Ok(())
+}
+
+/// Records that `revision` of `doc` names `blob`; on failure, flags the content rows for a
+/// rebuild at the next start.
+async fn record_ref(
+    db: &Db,
+    doc: DocId,
+    blob: BlobRef,
+    revision: &RevisionId,
+) -> Result<(), String> {
+    if let Err(e) = db.record_blob_ref(doc, blob, &revision.to_string()).await {
+        flag_dirty(db).await;
+        return Err(e.to_string());
     }
     Ok(())
 }
@@ -230,6 +259,11 @@ async fn replace_from_git(
     for _ in 0..REPLACE_ATTEMPTS {
         let history = blocking(store, move |s| s.history(doc).map_err(|e| e.to_string())).await?;
         let newest = history.last().map(|r| r.revision.clone());
+        for info in &history {
+            if let Some(blob) = info.blob {
+                record_ref(db, doc, blob, &info.revision).await?;
+            }
+        }
         let records = history
             .into_iter()
             .map(to_record)
@@ -277,4 +311,144 @@ fn to_record(info: RevisionInfo) -> Result<RevisionRecord, String> {
         name: info.file_name,
         fields: Value::Object(info.fields),
     })
+}
+
+/// What a reconcile of the content rows did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BlobReport {
+    /// Whether a flag asked for a rebuild, so one was made.
+    pub rebuilt: bool,
+    /// Versions found in Git that point into the content store.
+    pub versions: usize,
+    /// Contents erased because nothing names them.
+    pub erased: usize,
+    /// Documents whose history could not be read, and why.
+    pub failed: Vec<(DocId, String)>,
+}
+
+impl fmt::Display for BlobReport {
+    /// One line with the counts.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if !self.rebuilt {
+            return f.write_str("nothing to rebuild");
+        }
+        write!(
+            f,
+            "{} stored versions, {} failed, {} unused contents erased",
+            self.versions,
+            self.failed.len(),
+            self.erased
+        )
+    }
+}
+
+/// Rebuilds the content rows (`blob_refs`) from Git, but only when the upgrade marker or the
+/// dirty flag asks for it: every version of every document that points into the content store
+/// is recorded. A rebuild that read every document replaces the completed rows and clears the
+/// flags; one with a failure only adds, keeps the flags, and erases nothing. After a rebuild
+/// with no failure, content nothing names is erased, if it is older than 24 hours as of `now`
+/// (by its row, or by its file when it has none), and so are abandoned files in the store's
+/// `tmp` folder of that age. Old versions with their bytes inline in Git are left as they are.
+///
+/// # Errors
+/// The Git error if the documents in Git cannot be listed.
+pub async fn reconcile_blobs(
+    state: &AppState,
+    now: OffsetDateTime,
+) -> Result<BlobReport, GitError> {
+    let db = state.db();
+    let mut report = BlobReport::default();
+    match db.blob_refs_flagged().await {
+        Ok(true) => {}
+        Ok(false) => return Ok(report),
+        Err(e) => {
+            eprintln!("sharecraft-server: cannot read the content flags: {e}");
+            return Ok(report);
+        }
+    }
+    report.rebuilt = true;
+    let store = state.checkpointer();
+    let listing = Arc::clone(store);
+    let docs = tokio::task::spawn_blocking(move || listing.documents())
+        .await
+        .map_err(GitError::new)??;
+    let mut refs = Vec::new();
+    for doc in docs {
+        match blocking(store, move |s| s.history(doc).map_err(|e| e.to_string())).await {
+            Ok(history) => refs.extend(
+                history
+                    .into_iter()
+                    .filter_map(|info| Some((doc, info.blob?, info.revision.to_string()))),
+            ),
+            Err(error) => report.failed.push((doc, error)),
+        }
+    }
+    report.versions = refs.len();
+    let complete = report.failed.is_empty();
+    if let Err(e) = db.rebuild_blob_refs(&refs, complete).await {
+        // The flags stay set, so the next start tries again; nothing is erased meanwhile.
+        eprintln!("sharecraft-server: cannot rebuild the content rows: {e}");
+        report.rebuilt = false;
+        return Ok(report);
+    }
+    if complete {
+        report.erased = erase_unnamed(state, now).await;
+    }
+    Ok(report)
+}
+
+/// Erases the content nothing names that is older than [`ERASE_AFTER`] as of `now`, and the
+/// abandoned files in `tmp` of that age; how many contents it erased. Failures are logged.
+async fn erase_unnamed(state: &AppState, now: OffsetDateTime) -> usize {
+    let db = state.db();
+    let blobs = state.blobs();
+    let cutoff = now - ERASE_AFTER;
+    let cutoff_time = SystemTime::UNIX_EPOCH
+        + std::time::Duration::from_secs(u64::try_from(cutoff.unix_timestamp()).unwrap_or(0));
+    let mut candidates: Vec<[u8; 32]> = match db.unreferenced_blobs(cutoff).await {
+        Ok(found) => found,
+        Err(e) => {
+            eprintln!("sharecraft-server: cannot list unused contents: {e}");
+            return 0;
+        }
+    };
+    let mut seen: HashSet<[u8; 32]> = candidates.iter().copied().collect();
+    let listed = {
+        let blobs = Arc::clone(blobs);
+        tokio::task::spawn_blocking(move || {
+            let files = blobs.store().list()?;
+            blobs.store().clear_tmp(cutoff_time)?;
+            Ok::<_, revisions::BlobError>(files)
+        })
+        .await
+    };
+    match listed {
+        Ok(Ok(files)) => {
+            for (sha256, modified) in files {
+                if modified >= cutoff_time || seen.contains(&sha256) {
+                    continue;
+                }
+                // A file with a row is judged by its row's age, above.
+                match db.blob_created_at(&sha256).await {
+                    Ok(None) => {
+                        seen.insert(sha256);
+                        candidates.push(sha256);
+                    }
+                    Ok(Some(_)) => {}
+                    Err(e) => eprintln!("sharecraft-server: cannot read a content row: {e}"),
+                }
+            }
+        }
+        Ok(Err(e)) => eprintln!("sharecraft-server: cannot list the content store: {e}"),
+        Err(e) => eprintln!("sharecraft-server: cannot list the content store: {e}"),
+    }
+    let mut erased = 0;
+    for sha256 in candidates {
+        match blobs.erase_if_unreferenced(db, &sha256).await {
+            Ok(true) => erased += 1,
+            Ok(false) => {}
+            Err(e) => eprintln!("sharecraft-server: cannot erase unused content: {e}"),
+        }
+    }
+    erased
 }

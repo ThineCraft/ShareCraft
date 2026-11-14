@@ -8,15 +8,21 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Writing versions in the old inline form, for tests of the upgrade; for tests only.
+test-support = []
+
 [dependencies]
 collab-core = { path = "../collab-core" }
 gix = { version = "0.90.0", default-features = false, features = ["sha1"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+sha2 = "0.11.1"
 thiserror = "2.0.21"
 time = { version = "0.3.55", features = ["parsing"] }
-uuid = "1.29.2"
+uuid = { version = "1.29.2", features = ["v4"] }
 
 [dev-dependencies]
+revisions = { path = ".", features = ["test-support"] }
 tempfile = "3.27.0"
 uuid = { version = "1.29.2", features = ["v4"] }

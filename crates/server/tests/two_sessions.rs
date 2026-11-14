@@ -411,8 +411,8 @@ async fn healthz_answers_ok() {
 
 // ---- Checkpoints ----
 
-fn stored_text(stored: &Stored) -> String {
-    String::from_utf8(stored.bytes.clone()).unwrap()
+fn stored_text(server: &common::TestServer, stored: &Stored) -> String {
+    String::from_utf8(server.bytes(stored)).unwrap()
 }
 
 fn open_store(path: &std::path::Path) -> RevisionStore {
@@ -438,7 +438,7 @@ async fn idle_session_is_checkpointed() {
 
     let stored = server.store().read(doc, None).unwrap().unwrap();
     assert_eq!(stored.revision.to_string(), rev_a);
-    assert_eq!(stored_text(&stored), a.text());
+    assert_eq!(stored_text(&server, &stored), a.text());
     assert_eq!(stored.meta.file_name, format!("{}.txt", doc.0));
     let mut names: Vec<_> = stored
         .meta
@@ -520,7 +520,7 @@ async fn typing_resumes_from_saved_revision() {
     assert_eq!(commits.first(), Some(&second));
     assert!(commits.contains(&first), "{commits:?}");
     let stored = server.store().read(doc, None).unwrap().unwrap();
-    assert_eq!(stored_text(&stored), "abcdef!");
+    assert_eq!(stored_text(&server, &stored), "abcdef!");
 }
 
 /// Fails the first `failures` writes, then stores normally.
@@ -625,7 +625,7 @@ async fn failed_checkpoint_is_retried_and_reported() {
     );
     let stored = server.store().read(doc, None).unwrap().unwrap();
     assert_eq!(stored.revision.to_string(), rev);
-    assert_eq!(stored_text(&stored), "one two");
+    assert_eq!(stored_text(&server, &stored), "one two");
 }
 
 #[tokio::test]
@@ -667,7 +667,7 @@ async fn no_commit_per_change() {
     a.wait_saved(Seq(50)).await;
     assert_eq!(server.doc_commits(doc).len(), 1);
     let stored = server.store().read(doc, None).unwrap().unwrap();
-    assert_eq!(stored_text(&stored), "x".repeat(50));
+    assert_eq!(stored_text(&server, &stored), "x".repeat(50));
 }
 
 #[tokio::test]
@@ -931,7 +931,7 @@ async fn rejoin_during_final_checkpoint_sees_latest_text() {
     let c = TestClient::connect(&server, doc, "C").await;
     assert_eq!(c.text(), "hello");
     let stored = server.store().read(doc, None).unwrap().unwrap();
-    assert_eq!(stored_text(&stored), "hello");
+    assert_eq!(stored_text(&server, &stored), "hello");
 }
 
 #[test]

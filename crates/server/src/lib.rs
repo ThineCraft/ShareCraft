@@ -8,6 +8,7 @@
 
 mod api;
 mod auth;
+mod blobs;
 mod checkpoint;
 pub mod cli;
 pub mod config;
@@ -35,16 +36,18 @@ use axum::response::Response;
 use axum::routing::get;
 use collab_core::ids::DocId;
 use records::Db;
-use revisions::RevisionStore;
+use revisions::{BlobStore, RevisionStore};
 use tokio::net::TcpListener;
 use tower_http::services::ServeDir;
 
+pub use blobs::blobs_path;
 pub use checkpoint::{Checkpointer, library_path};
 pub use config::{Config, ConfigError};
 pub use links::sweep_once;
-pub use projection::{Report, rebuild, reconcile};
+pub use projection::{BlobReport, Report, rebuild, reconcile, reconcile_blobs};
 
 use auth::Throttle;
+use blobs::Blobs;
 use checkpoint::Timing;
 use editors::Editors;
 use events::EventSink;
@@ -61,6 +64,7 @@ struct Shared {
     config: Config,
     rooms: Arc<Rooms>,
     checkpointer: Arc<dyn Checkpointer>,
+    blobs: Arc<Blobs>,
     db: Db,
     editors: Editors,
     events: EventSink,
@@ -78,15 +82,22 @@ struct Shared {
 
 impl AppState {
     /// State for a server with no rooms open yet, loading and saving documents through
-    /// `checkpointer` and keeping accounts and sessions in `db`.
+    /// `checkpointer`, their bytes in the content store `blobs`, and keeping accounts and
+    /// sessions in `db`.
     #[must_use]
-    pub fn new(config: Config, checkpointer: Arc<dyn Checkpointer>, db: Db) -> Self {
+    pub fn new(
+        config: Config,
+        checkpointer: Arc<dyn Checkpointer>,
+        blobs: BlobStore,
+        db: Db,
+    ) -> Self {
         let editors_dir = config.editors_dir.clone();
         Self {
             shared: Arc::new(Shared {
                 config,
                 rooms: Arc::new(Rooms::default()),
                 checkpointer,
+                blobs: Arc::new(Blobs::new(blobs)),
                 events: EventSink::start(db.clone()),
                 editors: Editors::load(&editors_dir),
                 db,
@@ -119,6 +130,10 @@ impl AppState {
 
     fn checkpointer(&self) -> &Arc<dyn Checkpointer> {
         &self.shared.checkpointer
+    }
+
+    fn blobs(&self) -> &Arc<Blobs> {
+        &self.shared.blobs
     }
 
     fn events(&self) -> &EventSink {
@@ -162,6 +177,7 @@ impl AppState {
             name,
             Storage {
                 store: Arc::clone(&self.shared.checkpointer),
+                blobs: Arc::clone(&self.shared.blobs),
                 db: Some(self.shared.db.clone()),
                 events: self.shared.events.clone(),
             },
@@ -178,6 +194,7 @@ impl AppState {
             name,
             Storage {
                 store: Arc::clone(&self.shared.checkpointer),
+                blobs: Arc::clone(&self.shared.blobs),
                 db: Some(self.shared.db.clone()),
                 events: self.shared.events.clone(),
             },
@@ -209,7 +226,7 @@ pub fn router(state: AppState) -> Router {
         .layer(middleware::from_fn(no_cache));
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
-        .nest("/api", api::router(state.config().max_file_bytes))
+        .nest("/api", api::router())
         .route("/ws/docs/{doc_id}", get(ws::upgrade))
         .route("/l/{token}", get(links::page))
         .merge(editors::router(state.clone()))
@@ -267,17 +284,20 @@ pub async fn serve(config: Config, listener: TcpListener) -> std::io::Result<()>
 }
 
 /// The state of a server about to accept connections, storing documents in the library
-/// repository under `config.data_dir` (see [`library_path`]) and records in the database at
-/// `config.database_url`, whose schema it brings up to date first. It moves tree records written
-/// before the sub-folders into them (see [`tree::move_records`]), reconciles the content
-/// tree in the database with Git (see [`tree::reconcile`]), adopts documents recorded before
-/// the tree (see [`tree::adopt_flat_documents`]), reconciles the revisions recorded in the
-/// database with Git (see [`reconcile`]), and prints one line with the counts of each.
+/// repository under `config.data_dir` (see [`library_path`]), their bytes in the content store
+/// there (see [`blobs_path`]), and records in the database at `config.database_url`, whose
+/// schema it brings up to date first. It moves tree records written before the sub-folders
+/// into them (see [`tree::move_records`]), reconciles the content tree in the database with Git
+/// (see [`tree::reconcile`]), adopts documents recorded before the tree (see
+/// [`tree::adopt_flat_documents`]), reconciles the revisions recorded in the database with Git
+/// (see [`reconcile`]), rebuilds the content rows from Git when a flag asks for it (see
+/// [`reconcile_blobs`]), and prints one line with the counts of each.
 ///
 /// # Errors
 /// Returns an error if the database cannot be reached or migrated, if the library repository
-/// cannot be opened, created or listed, or if the tree cannot be moved or read or the adoption fails (a
-/// missing administrator is only reported: the documents wait for a start with one).
+/// or the content store cannot be opened, created or listed, or if the tree cannot be moved or
+/// read or the adoption fails (a missing administrator is only reported: the documents wait for
+/// a start with one).
 pub async fn prepare(config: Config) -> std::io::Result<AppState> {
     let db = Db::connect(config.database_url.expose())
         .await
@@ -286,9 +306,14 @@ pub async fn prepare(config: Config) -> std::io::Result<AppState> {
         .await
         .map_err(|e| std::io::Error::other(format!("cannot migrate the database: {e}")))?;
     let path = library_path(&config.data_dir);
-    let opened = tokio::task::spawn_blocking(move || {
-        RevisionStore::open(&path)
-            .map_err(|e| std::io::Error::other(format!("cannot open {}: {e}", path.display())))
+    let blobs_dir = blobs_path(&config.data_dir);
+    let (opened, blobs) = tokio::task::spawn_blocking(move || {
+        let store = RevisionStore::open(&path)
+            .map_err(|e| std::io::Error::other(format!("cannot open {}: {e}", path.display())))?;
+        let blobs = BlobStore::open(&blobs_dir).map_err(|e| {
+            std::io::Error::other(format!("cannot open {}: {e}", blobs_dir.display()))
+        })?;
+        Ok::<_, std::io::Error>((store, blobs))
     })
     .await
     .map_err(std::io::Error::other)??;
@@ -332,7 +357,18 @@ pub async fn prepare(config: Config) -> std::io::Result<AppState> {
             doc.0
         );
     }
-    Ok(AppState::new(config, store, db))
+    let state = AppState::new(config, store, blobs, db);
+    let blob_report = reconcile_blobs(&state, time::OffsetDateTime::now_utc())
+        .await
+        .map_err(|e| std::io::Error::other(format!("cannot list the documents in Git: {e}")))?;
+    println!("Reconciled stored content with Git: {blob_report}");
+    for (doc, error) in &blob_report.failed {
+        eprintln!(
+            "sharecraft-server: content of document {} not reconciled: {error}",
+            doc.0
+        );
+    }
+    Ok(state)
 }
 
 /// Serves `state` on `listener` until the process ends, with the expiry sweeper (see

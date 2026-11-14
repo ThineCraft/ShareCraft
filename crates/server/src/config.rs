@@ -13,15 +13,17 @@ pub const DEFAULT_DATA: &str = "./data";
 pub const DEFAULT_WEB: &str = "./web";
 /// Directory of installed editors used when `SHARECRAFT_EDITORS_DIR` is not set.
 pub const DEFAULT_EDITORS: &str = "./editors";
-/// Largest file a document may hold, in bytes, when `SHARECRAFT_MAX_FILE_BYTES` is not set.
-pub const DEFAULT_MAX_FILE_BYTES: usize = 64 * 1024 * 1024;
+/// Largest file a document may hold, in bytes, when `SHARECRAFT_MAX_FILE_BYTES` is not set:
+/// 10 GiB.
+pub const DEFAULT_MAX_FILE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 
 /// How the server runs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
     /// Address to listen on; always a loopback address.
     pub addr: SocketAddr,
-    /// Where documents are stored.
+    /// Where documents are stored: the library repositories, and the content store in
+    /// `blobs`.
     pub data_dir: PathBuf,
     /// Static files served at `/`.
     pub web_dir: PathBuf,
@@ -41,7 +43,7 @@ pub struct Config {
     /// Where the built editors are installed, one folder per editor, served at `/editors`.
     pub editors_dir: PathBuf,
     /// The largest file, in bytes, a file document may hold.
-    pub max_file_bytes: usize,
+    pub max_file_bytes: u64,
 }
 
 /// A database URL. It usually holds a password, so `Debug` never shows it.
@@ -132,7 +134,7 @@ impl Config {
         let database_url = database_url_from(database_url)?;
         let max_file_bytes = match max_file_bytes {
             None => DEFAULT_MAX_FILE_BYTES,
-            Some(text) => match text.trim().parse::<usize>() {
+            Some(text) => match text.trim().parse::<u64>() {
                 Ok(bytes) if bytes > 0 => bytes,
                 _ => return Err(ConfigError::BadMaxFileBytes(text.to_owned())),
             },
@@ -217,7 +219,7 @@ mod tests {
         assert_eq!(c.room_grace, Duration::from_secs(60));
         assert_eq!(c.write_timeout, Duration::from_secs(10));
         assert_eq!(c.editors_dir, PathBuf::from("./editors"));
-        assert_eq!(c.max_file_bytes, 64 * 1024 * 1024);
+        assert_eq!(c.max_file_bytes, 10 * 1024 * 1024 * 1024);
     }
 
     #[test]

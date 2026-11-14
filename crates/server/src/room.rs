@@ -20,13 +20,14 @@ use collab_core::server_log::ServerLog;
 use collab_text::{TextDoc, TextOp};
 use protocol::{Participant, RemovedReason, Resume, RoomEpoch, SaveState, ServerMsg};
 use records::{Access, Db, NewEvent};
-use revisions::{Author, CheckpointError, Outcome, RevisionId};
+use revisions::{Author, Outcome, RevisionId};
 use serde_json::{Map, Value};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use uuid::Uuid;
 
+use crate::blobs::{Blobs, write_claimed};
 use crate::checkpoint::{Checkpointer, Finished, SaveJob, Schedule, Timing, WriteError};
 use crate::events::{EventSink, error_text};
 use crate::file_room::{self, FileLink};
@@ -842,16 +843,19 @@ impl Place {
     }
 }
 
-/// Where a room's document is stored, where its revisions are recorded, if anywhere, and where
-/// it reports what happens in it.
+/// Where a room's document is stored (its versions in Git, their bytes in the content store),
+/// where its revisions are recorded and its content claimed, if anywhere, and where it reports
+/// what happens in it.
 pub(crate) struct Storage {
     pub store: Arc<dyn Checkpointer>,
+    pub blobs: Arc<Blobs>,
     pub db: Option<Db>,
     pub events: EventSink,
 }
 
-/// A checkpoint being written on a blocking task.
-pub(crate) type Running = JoinHandle<Result<Outcome, CheckpointError>>;
+/// A checkpoint being written: its content stored and claimed, then committed on a blocking
+/// task, then its claim settled.
+pub(crate) type Running = JoinHandle<Result<Outcome, WriteError>>;
 
 /// Loads the document, then handles commands and writes checkpoints until nobody has been
 /// connected for `grace` and everything is saved, or at once when empty once in conflict.
@@ -868,8 +872,13 @@ async fn run(
         mut rx,
         mut access_rx,
     } = channels;
-    let Storage { store, db, events } = storage;
-    let initial = match load_serving(load(&store, doc), &mut access_rx, &mut name).await {
+    let Storage {
+        store,
+        blobs,
+        db,
+        events,
+    } = storage;
+    let initial = match load_serving(load(&store, &blobs, doc), &mut access_rx, &mut name).await {
         Ok(initial) => initial,
         Err(err) => {
             eprintln!("sharecraft-server: cannot open document {}: {err}", doc.0);
@@ -888,7 +897,9 @@ async fn run(
     let mut room = Room::new(doc, name, initial, timing).with_events(events.clone());
     // Revisions are recorded off this task, in the order they are written: the blocking task
     // that writes one queues it before the room learns of it, and one checkpoint runs at a time.
-    let recorder = db.map(|db| Recorder::start(doc, Arc::clone(&store), db, events));
+    let recorder = db
+        .clone()
+        .map(|db| Recorder::start(doc, Arc::clone(&store), db, events));
     let mut running: Option<Running> = None;
     // The room opens for a join waiting in its channel; until that is handled it is empty.
     let mut empty_since = Some(Instant::now());
@@ -926,16 +937,25 @@ async fn run(
             () = sleep_until(due) => {
                 if let Some(job) = room.start_checkpoint() {
                     let store = Arc::clone(&store);
+                    let blobs = Arc::clone(&blobs);
+                    let db = db.clone();
                     let file_name = room.name.clone();
                     let recorder = recorder.clone();
-                    running = Some(tokio::task::spawn_blocking(move || {
-                        let result = job.write(doc, &file_name, &*store);
-                        if let (Ok(Outcome::Written(revision)), Some(recorder)) =
-                            (&result, &recorder)
-                        {
-                            recorder.written(job.base(), revision);
-                        }
-                        result
+                    running = Some(tokio::spawn(async move {
+                        let blob = blobs
+                            .write_bytes(job.text().as_bytes().to_vec())
+                            .await
+                            .map_err(WriteError::Failed)?;
+                        write_claimed(&blobs, db.as_ref(), store, doc, blob, move |store| {
+                            let result = job.write(doc, &file_name, blob, store);
+                            if let (Ok(Outcome::Written(revision)), Some(recorder)) =
+                                (&result, &recorder)
+                            {
+                                recorder.written(job.base(), revision);
+                            }
+                            result
+                        })
+                        .await
                     }));
                 }
             }
@@ -1020,8 +1040,13 @@ pub(crate) fn grace_end(since: Instant, grace: Duration) -> Instant {
     since.checked_add(grace).unwrap_or(since)
 }
 
-/// Reads the document's current revision without blocking the async workers.
-async fn load(store: &Arc<dyn Checkpointer>, doc: DocId) -> Result<Initial, String> {
+/// Reads the document's current revision, its text from the content store (or inline, for a
+/// version saved before it), without blocking the async workers.
+async fn load(
+    store: &Arc<dyn Checkpointer>,
+    blobs: &Arc<Blobs>,
+    doc: DocId,
+) -> Result<Initial, String> {
     let store = Arc::clone(store);
     let loaded = tokio::task::spawn_blocking(move || store.load(doc))
         .await
@@ -1030,7 +1055,8 @@ async fn load(store: &Arc<dyn Checkpointer>, doc: DocId) -> Result<Initial, Stri
     let Some(stored) = loaded else {
         return Ok(Initial::default());
     };
-    let text = String::from_utf8(stored.bytes)
+    let bytes = blobs.read_all(stored.content).await?;
+    let text = String::from_utf8(bytes)
         .map_err(|_| format!("revision {} is not valid UTF-8 text", stored.revision))?;
     Ok(Initial {
         doc: TextDoc::new(text),
@@ -1044,7 +1070,7 @@ async fn load(store: &Arc<dyn Checkpointer>, doc: DocId) -> Result<Initial, Stri
 pub(crate) async fn finished(running: &mut Option<Running>) -> Result<Outcome, WriteError> {
     match running {
         Some(handle) => match handle.await {
-            Ok(result) => result.map_err(WriteError::from),
+            Ok(result) => result,
             Err(e) => Err(WriteError::Failed(format!("checkpoint task failed: {e}"))),
         },
         None => std::future::pending().await,
@@ -1069,6 +1095,7 @@ pub(crate) async fn sleep_until(due: Option<Instant>) {
 mod tests {
     use super::*;
     use crate::members::builtin_access;
+    use revisions::CheckpointError;
     use std::time::Duration;
     use uuid::Uuid;
 
@@ -1541,6 +1568,7 @@ mod tests {
     // The test runtime has one thread, so the room task runs only while the test awaits.
     #[tokio::test]
     async fn access_change_gets_through_a_full_command_queue() {
+        let blob_dir = tempfile::tempdir().unwrap();
         let rooms = Arc::new(Rooms::default());
         let store: Arc<dyn Checkpointer> = Arc::new(Blank);
         let doc = DocId(Uuid::from_u128(77));
@@ -1553,6 +1581,7 @@ mod tests {
             "Notes.txt".into(),
             Storage {
                 store: Arc::clone(&store),
+                blobs: crate::blobs::test_blobs(blob_dir.path()),
                 db: None,
                 events: EventSink::discard(),
             },
@@ -1674,6 +1703,7 @@ mod tests {
     /// together.
     #[tokio::test]
     async fn pending_join_wins_over_giving_up() {
+        let blob_dir = tempfile::tempdir().unwrap();
         let (started_tx, started) = std::sync::mpsc::channel();
         let (release, gate) = std::sync::mpsc::channel();
         let store: Arc<dyn Checkpointer> = Arc::new(Gated {
@@ -1687,6 +1717,7 @@ mod tests {
             "Notes.txt".into(),
             Storage {
                 store,
+                blobs: crate::blobs::test_blobs(blob_dir.path()),
                 db: None,
                 events: EventSink::discard(),
             },
@@ -1804,6 +1835,7 @@ mod tests {
     /// once loaded it names who joined, and stores its checkpoint under the new name.
     #[tokio::test]
     async fn loading_room_answers_and_takes_a_rename() {
+        let blob_dir = tempfile::tempdir().unwrap();
         let (release, gate) = std::sync::mpsc::channel();
         let store = Arc::new(HeldLoad {
             gate: std::sync::Mutex::new(gate),
@@ -1816,6 +1848,7 @@ mod tests {
             "Plan.txt".into(),
             Storage {
                 store: Arc::clone(&store) as Arc<dyn Checkpointer>,
+                blobs: crate::blobs::test_blobs(blob_dir.path()),
                 db: None,
                 events: EventSink::discard(),
             },

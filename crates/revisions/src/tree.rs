@@ -471,7 +471,7 @@ mod tests {
             .checkpoint(&Checkpoint {
                 doc,
                 file_name: "n.txt",
-                bytes,
+                blob: crate::BlobRef::of(bytes),
                 base,
                 authors: &authors,
                 fields: &fields,
@@ -573,7 +573,10 @@ mod tests {
             panic!("expected Written");
         };
         assert_eq!(store.head(doc).unwrap(), Some(second.clone()));
-        assert_eq!(store.read(doc, None).unwrap().unwrap().bytes, b"two");
+        assert_eq!(
+            store.read(doc, None).unwrap().unwrap().content,
+            crate::Content::Blob(crate::BlobRef::of(b"two"))
+        );
         assert_eq!(store.history(doc).unwrap().len(), 2);
     }
 
@@ -993,7 +996,10 @@ mod tests {
             assert_eq!(object_at(&store, &flat_path(r.id)), None);
         }
         assert_eq!(sorted(store.read_tree().unwrap()), expected);
-        assert_eq!(store.read(doc, None).unwrap().unwrap().bytes, b"one");
+        assert_eq!(
+            store.read(doc, None).unwrap().unwrap().content,
+            crate::Content::Blob(crate::BlobRef::of(b"one"))
+        );
 
         // A second move finds nothing to move and writes nothing.
         assert_eq!(

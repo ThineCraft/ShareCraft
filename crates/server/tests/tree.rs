@@ -80,7 +80,13 @@ impl Env {
         let test = TestDb::create().await;
         let store = Arc::new(RevisionStore::open(&library(dir.path())).unwrap());
         let checkpointer = wrap(store.clone());
-        let state = AppState::new(config(dir.path(), &test), checkpointer, test.db.clone());
+        let blobs = revisions::BlobStore::open(&server::blobs_path(dir.path())).unwrap();
+        let state = AppState::new(
+            config(dir.path(), &test),
+            checkpointer,
+            blobs,
+            test.db.clone(),
+        );
         Env {
             dir,
             test,
@@ -629,7 +635,7 @@ async fn rename_keeps_document_head() {
         .checkpoint(&Checkpoint {
             doc: file.id,
             file_name: "Plan.xlsx",
-            bytes: b"one",
+            blob: revisions::BlobRef::of(b"one"),
             base: None,
             authors: &authors,
             fields: &fields,
@@ -654,7 +660,7 @@ async fn rename_keeps_document_head() {
         .checkpoint(&Checkpoint {
             doc: file.id,
             file_name: "Budget.xlsx",
-            bytes: b"two",
+            blob: revisions::BlobRef::of(b"two"),
             base: Some(&first),
             authors: &authors,
             fields: &fields,
@@ -1384,7 +1390,13 @@ impl Checkpointer for NoTree {
 async fn store_without_tree_is_reported() {
     let dir = tempfile::tempdir().unwrap();
     let test = TestDb::create().await;
-    let state = AppState::new(config(dir.path(), &test), Arc::new(NoTree), test.db.clone());
+    let blobs = revisions::BlobStore::open(&server::blobs_path(dir.path())).unwrap();
+    let state = AppState::new(
+        config(dir.path(), &test),
+        Arc::new(NoTree),
+        blobs,
+        test.db.clone(),
+    );
     let password = Uuid::new_v4().simple().to_string();
     let admin = test
         .db

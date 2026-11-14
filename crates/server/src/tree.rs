@@ -215,7 +215,7 @@ pub async fn create_document(
     id: DocId,
     name: &str,
     editor: Editor,
-    uploaded: Option<usize>,
+    uploaded: Option<u64>,
 ) -> Result<Document, AccessError> {
     let _turn = state.tree_lock().lock().await;
     ensure_in_step(state).await?;

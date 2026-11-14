@@ -264,7 +264,7 @@ async fn a_stale_save_records_one_conflict_with_the_current_revision() {
         .checkpoint(&Checkpoint {
             doc,
             file_name: "other.txt",
-            bytes: b"other text",
+            blob: server.blob(b"other text"),
             base: Some(&saved),
             authors: &[revisions::Author {
                 id: "someone-else".into(),

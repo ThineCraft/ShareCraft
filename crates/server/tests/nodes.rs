@@ -1332,7 +1332,7 @@ async fn rename_open_file_then_checkpoint_uses_new_name() {
     a.wait_saved(Seq(2)).await;
     let stored = w.server.store().read(id, None).unwrap().unwrap();
     assert_eq!(stored.meta.file_name, "Notes.txt");
-    assert_eq!(stored.bytes, b"abcdef");
+    assert_eq!(w.server.bytes(&stored), b"abcdef");
     assert!(a.removed.is_none());
 }
 

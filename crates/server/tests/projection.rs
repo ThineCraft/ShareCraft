@@ -63,11 +63,12 @@ fn write_behind(
     let store = RevisionStore::open(library).unwrap();
     let base: RevisionId = base.parse().unwrap();
     let authors = [author("someone-else", "Someone Else")];
+    let blob = common::store_blob(common::data_of(library), bytes);
     let outcome = store
         .checkpoint(&Checkpoint {
             doc,
             file_name: &format!("{}.txt", doc.0),
-            bytes,
+            blob,
             base: Some(&base),
             authors: &authors,
             fields,
@@ -266,7 +267,7 @@ async fn index_failure_does_not_fail_the_save() {
         a.saves()
     );
     let stored = server.store().read(doc, None).unwrap().unwrap();
-    assert_eq!(stored.bytes, b"kept in Git");
+    assert_eq!(server.bytes(&stored), b"kept in Git");
     assert_eq!(stored.revision.to_string(), second);
 }
 
@@ -284,7 +285,7 @@ async fn corrupt_document_is_reported_and_the_others_reconcile() {
             .checkpoint(&Checkpoint {
                 doc,
                 file_name: "notes.txt",
-                bytes: b"text",
+                blob: common::store_blob(data_dir.path(), b"text"),
                 base: None,
                 authors: &authors,
                 fields: &fields,
@@ -408,7 +409,7 @@ async fn live_save_keeps_fields_set_by_a_metadata_only_revision() {
         .unwrap()
         .unwrap();
     assert_eq!(stored.revision.to_string(), live);
-    assert_eq!(stored.bytes, b"text more");
+    assert_eq!(common::bytes_in(&library, &stored), b"text more");
     assert_eq!(stored.meta.fields, fields);
     wait_recorded(&db.db, doc, &live).await;
     assert_eq!(fields_of(&db.db, doc).await, json!({ "status": "draft" }));

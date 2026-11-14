@@ -17,7 +17,7 @@ use axum::Json;
 use axum::Router;
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Path, Query, Request, State};
-use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, REFERRER_POLICY, SET_COOKIE};
+use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, RANGE, REFERRER_POLICY, SET_COOKIE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -255,19 +255,20 @@ async fn reached_document(
         .ok_or(ApiError::LinkNotFound)
 }
 
-/// `GET /api/l/{token}/content/{node}`: a file's bytes as its last saved revision, with the
-/// headers of every download (an `octet-stream` attachment, `nosniff`, a sandbox policy). `204`
-/// if it has never been saved.
+/// `GET /api/l/{token}/content/{node}`: a file's bytes as its last saved revision, read from the
+/// content store, with the headers of every download (an `octet-stream` attachment, `nosniff`,
+/// a sandbox policy) and one byte range if asked for. `204` if it has never been saved.
 async fn content(
     State(state): State<AppState>,
     Path((token, node)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let token = token_of(&token)?;
     let node = reached_id(&node)?;
     let document = reached_document(&state, &token, node).await?;
     let doc = document.id;
     match blocking(&state, move |store| store.load(doc)).await? {
-        Some(stored) => file_answer(&document.name, stored),
+        Some(stored) => file_answer(&state, &document.name, stored, headers.get(RANGE)).await,
         None => Ok(StatusCode::NO_CONTENT.into_response()),
     }
 }
@@ -288,10 +289,17 @@ async fn text(
     let doc = document.id;
     let stored = blocking(&state, move |store| store.load(doc)).await?;
     let (text, revision) = match stored {
-        Some(stored) => (
-            String::from_utf8_lossy(&stored.bytes).into_owned(),
-            Some(stored.revision.to_string()),
-        ),
+        Some(stored) => {
+            let bytes = state
+                .blobs()
+                .read_all(stored.content)
+                .await
+                .map_err(|e| ApiError::unavailable(&e))?;
+            (
+                String::from_utf8_lossy(&bytes).into_owned(),
+                Some(stored.revision.to_string()),
+            )
+        }
         None => (String::new(), None),
     };
     Ok(Json(json!({
@@ -305,8 +313,9 @@ async fn text(
 /// Revokes, as the server and for the reason `expired`, every live link whose expiry is at or
 /// before `now`, one link per transaction exactly as a manager would revoke it, rechecking the
 /// open documents below each signed-in link's assignments before the next; then forgets the
-/// requests for access submitted more than a day before `now`. Logs one line if it revoked
-/// anything, and answers how many links it revoked. A database failure is logged and skipped:
+/// requests for access submitted more than a day before `now`, and settles from Git the content
+/// claims pending for more than an hour. Logs one line if it revoked anything, and answers how
+/// many links it revoked. A database failure is logged and skipped:
 /// the next sweep tries again.
 pub async fn sweep_once(state: &AppState, now: OffsetDateTime) -> usize {
     let db = state.db();
@@ -339,6 +348,7 @@ pub async fn sweep_once(state: &AppState, now: OffsetDateTime) -> usize {
     if let Err(e) = db.forget_old_attempts(now).await {
         eprintln!("sharecraft-server: database failure: {e}");
     }
+    crate::blobs::settle_stale_claims(state, now).await;
     if revoked > 0 {
         println!("sharecraft-server: revoked {revoked} expired link(s)");
     }

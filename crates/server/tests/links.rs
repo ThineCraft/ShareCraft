@@ -1268,3 +1268,43 @@ async fn sharing_settings() {
     let (status, _) = make_link(&server, &ann, &place, "anyone", "viewer", Some(in_days(6))).await;
     assert_eq!(status, StatusCode::CREATED);
 }
+
+/// An anyone link's download reads the content store: the whole file, a byte range, and `503`
+/// once the stored content is gone (never a file of nothing).
+#[tokio::test]
+async fn anyone_link_download_reads_the_store() {
+    let server = server().await;
+    let ann = server.user("Ann").await;
+    anyone_links(&server, true).await;
+    let place = home(&server, &ann).await;
+    let bytes: Vec<u8> = (0..4096u32).map(|n| (n % 241) as u8).collect();
+    let node = file(&server, &ann, &place, "Shared.xlsx", &bytes).await;
+    let (_, token) = link(&server, &ann, &node, "anyone", "viewer", Some(in_days(1))).await;
+    let path = format!("/api/l/{token}/content/{node}");
+
+    let response = anonymous(&server, &path).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["accept-ranges"], "bytes");
+    assert_eq!(response.bytes().await.unwrap().to_vec(), bytes);
+
+    let response = send(
+        reqwest::Client::new()
+            .get(server.url(&path))
+            .header("range", "bytes=100-199"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(response.headers()["content-range"], "bytes 100-199/4096");
+    assert_eq!(response.bytes().await.unwrap().to_vec(), bytes[100..200]);
+
+    let blob = revisions::BlobRef::of(&bytes);
+    let stored = server
+        .store()
+        .read(DocId(uuid_of(&node)), None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.content, revisions::Content::Blob(blob));
+    assert!(server.blobs().erase(&blob.sha256).unwrap());
+    let response = anonymous(&server, &path).await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}

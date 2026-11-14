@@ -725,7 +725,7 @@ async fn object_that_is_not_a_revision_is_not_found() {
 #[tokio::test]
 async fn files_up_to_the_limit_pass_and_larger_ones_do_not() {
     const LIMIT: usize = 64 * 1024;
-    let server = spawn_server_config(|config| config.max_file_bytes = LIMIT).await;
+    let server = spawn_server_config(|config| config.max_file_bytes = LIMIT as u64).await;
     let ann = server.user("Ann").await;
 
     let first: Vec<u8> = (0..40 * 1024).map(|n| (n % 251) as u8).collect();

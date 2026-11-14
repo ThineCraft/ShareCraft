@@ -1,9 +1,13 @@
 #![forbid(unsafe_code)]
 //! The revision store: the only code that writes to Git.
 //!
-//! A [`Checkpoint`] of one document becomes one Git commit holding its content and a JSON
-//! metadata file; a [`TreeChange`] becomes one commit of node records. See [`RevisionStore`] for the repository layout.
+//! A [`Checkpoint`] of one document becomes one Git commit holding a pointer to its content and
+//! a JSON metadata file; a [`TreeChange`] becomes one commit of node records. See
+//! [`RevisionStore`] for the repository layout. The bytes themselves live in the content store
+//! ([`BlobStore`]), named by their SHA-256; versions saved before it existed keep their bytes
+//! inline in Git and are read as before.
 
+mod blobs;
 mod meta;
 mod store;
 mod tree;
@@ -15,6 +19,7 @@ use collab_core::ids::DocId;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+pub use blobs::{BlobError, BlobRef, BlobStore, Content, hex, parse_hex};
 pub use meta::{Author, Meta};
 pub use store::{RevisionStore, is_valid_author_name};
 pub use tree::{Stamp, TREE_MOVE_MESSAGE, TreeChange, TreeMove, TreeRecord};
@@ -105,8 +110,8 @@ pub struct Checkpoint<'a> {
     pub doc: DocId,
     /// Display file name: non-empty, no `/`, `\` or control characters.
     pub file_name: &'a str,
-    /// The document content.
-    pub bytes: &'a [u8],
+    /// The content, already in the content store; Git stores a pointer to it.
+    pub blob: BlobRef,
     /// The revision this state was derived from; `None` for a document with no revision yet.
     pub base: Option<&'a RevisionId>,
     /// Who contributed; the first is the commit author. Must not be empty.
@@ -120,7 +125,8 @@ pub struct Checkpoint<'a> {
 pub enum Outcome {
     /// A new commit was made.
     Written(RevisionId),
-    /// Content, file name and fields equal the stored ones; nothing was written.
+    /// Content (compared by hash and size), file name and fields equal the stored ones;
+    /// nothing was written.
     Unchanged(RevisionId),
 }
 
@@ -181,6 +187,10 @@ pub struct RevisionInfo {
     pub file_name: String,
     /// The document fields stored with it.
     pub fields: Map<String, Value>,
+    /// The content it points at; `None` for an old version whose bytes are inline in Git.
+    pub blob: Option<BlobRef>,
+    /// The content's size in bytes, inline or not.
+    pub size: u64,
 }
 
 /// A stored revision of a document.
@@ -188,8 +198,8 @@ pub struct RevisionInfo {
 pub struct Stored {
     /// The revision read.
     pub revision: RevisionId,
-    /// The content.
-    pub bytes: Vec<u8>,
+    /// The content: a pointer into the content store, or an old version's inline bytes.
+    pub content: Content,
     /// The metadata.
     pub meta: Meta,
 }

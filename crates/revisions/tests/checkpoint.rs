@@ -6,7 +6,9 @@
 )]
 
 use collab_core::ids::DocId;
-use revisions::{Author, Checkpoint, CheckpointError, Outcome, RevisionId, RevisionStore};
+use revisions::{
+    Author, BlobRef, Checkpoint, CheckpointError, Content, Outcome, RevisionId, RevisionStore,
+};
 use serde_json::{Map, Value};
 use std::str::FromStr;
 use uuid::Uuid;
@@ -49,11 +51,16 @@ fn cp<'a>(
     Checkpoint {
         doc,
         file_name: "notes.txt",
-        bytes,
+        blob: BlobRef::of(bytes),
         base,
         authors,
         fields,
     }
+}
+
+/// What a version saved with `bytes` stores: a pointer to them.
+fn pointer(bytes: &[u8]) -> Content {
+    Content::Blob(BlobRef::of(bytes))
 }
 
 fn written(o: Outcome) -> RevisionId {
@@ -81,7 +88,7 @@ fn first_checkpoint_writes_content_and_meta() {
             .unwrap(),
     );
     let stored = f.store.read(d, None).unwrap().unwrap();
-    assert_eq!(stored.bytes, b"hello");
+    assert_eq!(stored.content, pointer(b"hello"));
     assert_eq!(stored.revision, id);
     assert_eq!(stored.meta.schema, 1);
     assert_eq!(stored.meta.doc_id, d);
@@ -267,8 +274,14 @@ fn documents_do_not_block_each_other() {
         .unwrap();
     assert!(matches!(a2, Outcome::Written(_)));
     // Both documents' content survives on main.
-    assert_eq!(f.store.read(db, None).unwrap().unwrap().bytes, b"b1");
-    assert_eq!(f.store.read(da, None).unwrap().unwrap().bytes, b"a2");
+    assert_eq!(
+        f.store.read(db, None).unwrap().unwrap().content,
+        pointer(b"b1")
+    );
+    assert_eq!(
+        f.store.read(da, None).unwrap().unwrap().content,
+        pointer(b"a2")
+    );
 }
 
 #[test]
@@ -288,9 +301,12 @@ fn read_at_earlier_revision_returns_earlier_bytes() {
             .unwrap(),
     );
     let old = f.store.read(d, Some(&first)).unwrap().unwrap();
-    assert_eq!(old.bytes, b"old");
+    assert_eq!(old.content, pointer(b"old"));
     assert_eq!(old.revision, first);
-    assert_eq!(f.store.read(d, None).unwrap().unwrap().bytes, b"new");
+    assert_eq!(
+        f.store.read(d, None).unwrap().unwrap().content,
+        pointer(b"new")
+    );
 }
 
 #[test]
@@ -655,4 +671,56 @@ fn content_without_metadata_is_corrupt() {
         assert_corrupt(f.store.describe(d, &bad), &bad);
         assert_corrupt(f.store.history(d), &bad);
     }
+}
+
+/// A document saved before the content store keeps its bytes inline. Saving the same bytes
+/// again, now as a pointer, is unchanged (compared by hash and size) and writes nothing; other
+/// bytes are written as a pointer, and the old version still reads inline.
+#[test]
+fn unchanged_old_document_writes_nothing() {
+    let f = fixture();
+    let d = doc();
+    let a = [author("u1", "Ann")];
+    let fields = Map::new();
+    let old = written(
+        f.store
+            .checkpoint_inline(&cp(d, b"", None, &a, &fields), b"from before")
+            .unwrap(),
+    );
+    let stored = f.store.read(d, None).unwrap().unwrap();
+    assert_eq!(stored.content, Content::Inline(b"from before".to_vec()));
+    let commits = commit_count(&f.path);
+
+    let again = f
+        .store
+        .checkpoint(&cp(d, b"from before", Some(&old), &a, &fields))
+        .unwrap();
+    assert_eq!(again, Outcome::Unchanged(old.clone()));
+    assert_eq!(commit_count(&f.path), commits);
+
+    let new = written(
+        f.store
+            .checkpoint(&cp(d, b"changed", Some(&old), &a, &fields))
+            .unwrap(),
+    );
+    assert_eq!(commit_count(&f.path), commits + 1);
+    assert_eq!(
+        f.store.read(d, None).unwrap().unwrap().content,
+        pointer(b"changed")
+    );
+    let first = f.store.read(d, Some(&old)).unwrap().unwrap();
+    assert_eq!(first.content, Content::Inline(b"from before".to_vec()));
+
+    // The history describes both: the old one by its inline size, the new one by its pointer.
+    let history = f.store.history(d).unwrap();
+    assert_eq!(history.len(), 2);
+    assert_eq!((history[0].blob, history[0].size), (None, 11));
+    assert_eq!(
+        (
+            history[1].revision.clone(),
+            history[1].blob,
+            history[1].size
+        ),
+        (new, Some(BlobRef::of(b"changed")), 7)
+    );
 }

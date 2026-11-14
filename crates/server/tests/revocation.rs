@@ -559,7 +559,7 @@ async fn standing_proof() {
     // The checkpoint read back from Git holds the converged text.
     ann.wait_saved(Seq(4)).await;
     let stored = server.store().read(doc, None).unwrap().unwrap();
-    assert_eq!(String::from_utf8(stored.bytes).unwrap(), text);
+    assert_eq!(String::from_utf8(server.bytes(&stored)).unwrap(), text);
 }
 
 /// What `doc` holds in the tests below; no frame sent to someone removed may contain it.

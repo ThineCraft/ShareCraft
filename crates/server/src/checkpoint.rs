@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use collab_core::ids::{DocId, Seq};
 use revisions::{
-    Author, Checkpoint, CheckpointError, GitError, Outcome, RevisionId, RevisionInfo,
+    Author, BlobRef, Checkpoint, CheckpointError, GitError, Outcome, RevisionId, RevisionInfo,
     RevisionStore, Stored, TreeChange, TreeMove, TreeRecord,
 };
 use serde_json::{Map, Value};
@@ -22,7 +22,7 @@ const MAX_FINAL_DELAY: Duration = Duration::from_secs(30);
 /// Stores and reads document revisions on behalf of rooms. Calls block, so rooms make them
 /// from a blocking task.
 pub trait Checkpointer: Send + Sync + 'static {
-    /// Stores one checkpoint.
+    /// Stores one checkpoint: a pointer to its content, which is already in the content store.
     ///
     /// # Errors
     /// Whatever the store reports, including `Stale` when `c.base` is not the current revision.
@@ -185,17 +185,24 @@ impl SaveJob {
         self.authors.iter().map(|a| a.id.clone()).collect()
     }
 
-    /// Writes the checkpoint of `doc`, stored under the document's name `file_name`. Blocks.
+    /// The text to store.
+    pub(crate) fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// Writes the checkpoint of `doc`, stored under the document's name `file_name`, its
+    /// content `blob`: the text, already in the content store. Blocks.
     pub(crate) fn write(
         &self,
         doc: DocId,
         file_name: &str,
+        blob: BlobRef,
         store: &dyn Checkpointer,
     ) -> Result<Outcome, CheckpointError> {
         store.write(&Checkpoint {
             doc,
             file_name,
-            bytes: self.text.as_bytes(),
+            blob,
             base: self.base.as_ref(),
             authors: &self.authors,
             fields: &self.fields,

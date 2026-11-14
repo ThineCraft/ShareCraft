@@ -1,9 +1,11 @@
 #![forbid(unsafe_code)]
 //! The PostgreSQL records: accounts, sessions, documents, roles and access assignments, the
-//! revision index and the event log. PostgreSQL never holds document content; Git does.
+//! revision index, the content store's safety rows and the event log. PostgreSQL never holds
+//! document content; Git and the content store do.
 
 mod accounts;
 mod adoption;
+mod blobs;
 mod db;
 mod documents;
 mod events;
@@ -23,6 +25,7 @@ pub use accounts::{
     AccountError, NewUser, SESSION_LIFETIME, Session, SessionToken, SignInError, User,
 };
 pub use adoption::{Adoption, Unplaced};
+pub use blobs::{BLOB_REFS_DIRTY, BLOB_REFS_UPGRADE, ClaimId, StaleClaim};
 pub use db::{Db, DbError};
 pub use documents::{AccessError, Document, Editor, Grant, validate_document_name};
 pub use events::{Event, NewEvent};

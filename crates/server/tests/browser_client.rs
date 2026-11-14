@@ -225,7 +225,7 @@ async fn browser_reports_text_lost_in_a_server_restart() {
         .read(doc, None)
         .unwrap()
         .unwrap();
-    assert_eq!(stored.bytes, b"saved");
+    assert_eq!(common::bytes_in(&library, &stored), b"saved");
     assert_eq!(a.text(), "saved");
 }
 

@@ -1,31 +1,42 @@
 //! A file document's bytes over HTTP: download, save, and upload as a new document.
 //!
 //! ShareCraft never interprets these bytes. A download is always an attachment of type
-//! `application/octet-stream`, behind headers that keep a browser from rendering it. A save
-//! goes to the document's file session and nowhere else; an upload creates a document and its
-//! first revision, which nobody can have open yet.
+//! `application/octet-stream`, behind headers that keep a browser from rendering it, and may
+//! ask for one byte range. A save goes to the document's file session and nowhere else; an
+//! upload creates a document and its first revision, which nobody can have open yet.
+//!
+//! No file is ever held in memory: a save or an upload streams its body into the content store
+//! while hashing it, and hands on only a reference to the stored content; a download streams
+//! from the content store.
 
 use std::fmt::Write as _;
+use std::io::{Seek, SeekFrom};
 use std::str::FromStr;
+use std::sync::Arc;
 
 use axum::Json;
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::rejection::QueryRejection;
-use axum::extract::{FromRequest, Path, Query, Request, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::header::{
-    CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_SECURITY_POLICY, CONTENT_TYPE,
-    X_CONTENT_TYPE_OPTIONS,
+    ACCEPT_RANGES, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE,
+    CONTENT_SECURITY_POLICY, CONTENT_TYPE, RANGE, X_CONTENT_TYPE_OPTIONS,
 };
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use collab_core::ids::{DocId, NodeId};
+use futures_util::Stream;
 use records::{AccessError, Editor};
-use revisions::{Author, Checkpoint, CheckpointError, Outcome, RevisionId, Stored};
+use revisions::{
+    Author, BlobRef, Checkpoint, CheckpointError, Content, Outcome, RevisionId, Stored,
+};
 use serde::Deserialize;
 use serde_json::{Map, json};
+use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
 use super::{ApiError, parse_id, to_completion};
+use crate::blobs::{BodyError, write_claimed};
 use crate::checkpoint::Checkpointer;
 use crate::file_room::SaveReply;
 use crate::projection::record_first;
@@ -37,6 +48,8 @@ use crate::{AppState, auth::Signed};
 const SEAT_HEADER: &str = "x-sharecraft-seat";
 /// The response header naming the revision a download holds.
 const REVISION_HEADER: &str = "x-sharecraft-revision";
+/// How much of a file a download reads and sends at a time.
+const DOWNLOAD_CHUNK: usize = 64 * 1024;
 
 /// Query of `GET /api/docs/{id}/content`.
 #[derive(Deserialize)]
@@ -75,25 +88,37 @@ pub(crate) async fn blocking<T: Send + 'static>(
     }
 }
 
-/// The bytes of a request body, refused with `413` when the limit set for the route is passed
-/// (the limit is applied while reading) and `400` when the body cannot be read.
-async fn body_bytes(request: Request, state: &AppState) -> Result<Bytes, ApiError> {
-    Bytes::from_request(request, state)
-        .await
-        .map_err(|rejection| match rejection.status() {
-            StatusCode::PAYLOAD_TOO_LARGE => ApiError::TooLarge,
-            _ => ApiError::BadRequest,
-        })
+/// Streams a request body into the content store and answers what it stored. Refused with `413`
+/// past the largest file allowed (at once when the body declares a larger length, otherwise as
+/// soon as more arrives; nothing is stored), and `400` when the body cannot be read.
+async fn body_blob(state: &AppState, request: Request) -> Result<BlobRef, ApiError> {
+    let limit = state.config().max_file_bytes;
+    let declared = request
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    if declared.is_some_and(|length| length > limit) {
+        return Err(ApiError::TooLarge);
+    }
+    match state.blobs().write_body(request.into_body(), limit).await {
+        Ok(blob) => Ok(blob),
+        Err(BodyError::TooLarge) => Err(ApiError::TooLarge),
+        Err(BodyError::Broken) => Err(ApiError::BadRequest),
+        Err(BodyError::Store(e)) => Err(ApiError::unavailable(&e)),
+    }
 }
 
 /// `GET /api/docs/{id}/content[?revision=<id>]`: the document's bytes, as its current revision
-/// or the given one. `204` if the document has no revision yet; `404` if the caller has no role
-/// on it or the revision is not one of its own.
+/// or the given one, or the one byte range asked for (see [`file_answer`]). `204` if the
+/// document has no revision yet; `404` if the caller has no role on it or the revision is not
+/// one of its own.
 pub(crate) async fn download(
     State(state): State<AppState>,
     signed: Signed,
     Path(id): Path<String>,
     query: Result<Query<DownloadQuery>, QueryRejection>,
+    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let doc = DocId(parse_id(&id)?);
     let db = state.db();
@@ -122,13 +147,89 @@ pub(crate) async fn download(
         },
     };
 
-    file_answer(&document.name, stored)
+    file_answer(&state, &document.name, stored, headers.get(RANGE)).await
+}
+
+/// Which bytes of a file a download sends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Span {
+    /// All of them.
+    Whole,
+    /// From `start` to `end`, both included.
+    Part { start: u64, end: u64 },
+    /// The range asked for starts beyond the end.
+    Unsatisfiable,
+}
+
+/// The bytes of a file of `size` bytes that the `Range` header `range` asks for. One range of
+/// bytes is served (`a-b`, `a-` or the suffix `-n`); anything else, several ranges included, is
+/// ignored and the whole file is sent.
+fn span_of(range: Option<&HeaderValue>, size: u64) -> Span {
+    let number = |text: &str| -> Option<u64> {
+        if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        text.parse().ok()
+    };
+    let Some(spec) = range
+        .and_then(|value| value.to_str().ok())
+        .and_then(|text| text.trim().strip_prefix("bytes="))
+    else {
+        return Span::Whole;
+    };
+    let Some((first, last)) = spec.split_once('-') else {
+        return Span::Whole;
+    };
+    if spec.contains(',') {
+        return Span::Whole;
+    }
+    let (first, last) = (first.trim(), last.trim());
+    if first.is_empty() {
+        let Some(suffix) = number(last) else {
+            return Span::Whole;
+        };
+        if suffix == 0 || size == 0 {
+            return Span::Unsatisfiable;
+        }
+        let suffix = suffix.min(size);
+        return Span::Part {
+            start: size - suffix,
+            end: size - 1,
+        };
+    }
+    let Some(start) = number(first) else {
+        return Span::Whole;
+    };
+    let end = if last.is_empty() {
+        None
+    } else {
+        match number(last) {
+            Some(end) if end >= start => Some(end),
+            _ => return Span::Whole,
+        }
+    };
+    if start >= size {
+        return Span::Unsatisfiable;
+    }
+    let last_byte = size - 1;
+    Span::Part {
+        start,
+        end: end.map_or(last_byte, |end| end.min(last_byte)),
+    }
 }
 
 /// A file's bytes as every download answers them: an attachment named `name`, of type
 /// `application/octet-stream`, that a browser neither sniffs nor renders (`nosniff`, a sandbox
-/// policy), never cached, naming its revision.
-pub(crate) fn file_answer(name: &str, stored: Stored) -> Result<Response, ApiError> {
+/// policy), never cached, naming its revision, with `Accept-Ranges: bytes`. When `range` asks
+/// for one byte range it is `206` with that range and its `Content-Range`, or `416` if it
+/// starts beyond the end. The bytes stream from the content store (an old version's from Git);
+/// a version whose content is missing from the store is logged and answers `503`.
+pub(crate) async fn file_answer(
+    state: &AppState,
+    name: &str,
+    stored: Stored,
+    range: Option<&HeaderValue>,
+) -> Result<Response, ApiError> {
     let mut headers = HeaderMap::new();
     headers.insert(
         CONTENT_TYPE,
@@ -146,15 +247,105 @@ pub(crate) fn file_answer(name: &str, stored: Stored) -> Result<Response, ApiErr
         HeaderValue::from_str(&stored.revision.to_string())
             .map_err(|e| ApiError::unavailable(&e))?,
     );
-    Ok((StatusCode::OK, headers, stored.bytes).into_response())
+    headers.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    let size = stored.content.size();
+    let file = match &stored.content {
+        Content::Blob(blob) => Some(open_content(state, &stored.revision, *blob).await?),
+        Content::Inline(_) => None,
+    };
+    let (status, start, length) = match span_of(range, size) {
+        Span::Whole => (StatusCode::OK, 0, size),
+        Span::Part { start, end } => {
+            headers.insert(
+                CONTENT_RANGE,
+                header_value(&format!("bytes {start}-{end}/{size}"))?,
+            );
+            (StatusCode::PARTIAL_CONTENT, start, end - start + 1)
+        }
+        Span::Unsatisfiable => {
+            headers.insert(CONTENT_RANGE, header_value(&format!("bytes */{size}"))?);
+            return Ok((StatusCode::RANGE_NOT_SATISFIABLE, headers).into_response());
+        }
+    };
+    headers.insert(CONTENT_LENGTH, header_value(&length.to_string())?);
+    let body = match (stored.content, file) {
+        (_, Some(file)) => Body::from_stream(file_stream(file, start, length)?),
+        (Content::Inline(bytes), None) => {
+            let from = usize::try_from(start).map_err(|e| ApiError::unavailable(&e))?;
+            let to = usize::try_from(start + length).map_err(|e| ApiError::unavailable(&e))?;
+            Body::from(bytes.get(from..to).unwrap_or_default().to_vec())
+        }
+        (Content::Blob(_), None) => return Err(ApiError::Unavailable),
+    };
+    Ok((status, headers, body).into_response())
+}
+
+fn header_value(text: &str) -> Result<HeaderValue, ApiError> {
+    HeaderValue::from_str(text).map_err(|e| ApiError::unavailable(&e))
+}
+
+/// The stored content `blob` of `revision`, opened for reading. Content missing from the store,
+/// or not of its recorded size, is logged and answers `503`.
+async fn open_content(
+    state: &AppState,
+    revision: &RevisionId,
+    blob: BlobRef,
+) -> Result<std::fs::File, ApiError> {
+    let blobs = Arc::clone(state.blobs());
+    let opened = tokio::task::spawn_blocking(move || {
+        let file = blobs.store().open_blob(&blob.sha256)?;
+        match file {
+            Some(file) if file.metadata()?.len() == blob.size => Ok(Some(file)),
+            Some(_) | None => Ok::<_, revisions::BlobError>(None),
+        }
+    })
+    .await
+    .map_err(|e| ApiError::unavailable(&e))?
+    .map_err(|e| ApiError::unavailable(&e))?;
+    opened.ok_or_else(|| {
+        eprintln!(
+            "sharecraft-server: content {} of revision {revision} is missing from the content \
+             store",
+            blob.hex()
+        );
+        ApiError::Unavailable
+    })
+}
+
+/// `length` bytes of `file` from `start`, read a chunk at a time as the client takes them.
+fn file_stream(
+    mut file: std::fs::File,
+    start: u64,
+    length: u64,
+) -> Result<impl Stream<Item = std::io::Result<Bytes>>, ApiError> {
+    file.seek(SeekFrom::Start(start))
+        .map_err(|e| ApiError::unavailable(&e))?;
+    let reader = tokio::fs::File::from_std(file).take(length);
+    Ok(futures_util::stream::unfold(
+        Some(reader),
+        |reader| async move {
+            let mut reader = reader?;
+            let mut buf = vec![0u8; DOWNLOAD_CHUNK];
+            match reader.read(&mut buf).await {
+                Ok(0) => None,
+                Ok(n) => {
+                    buf.truncate(n);
+                    Some((Ok(Bytes::from(buf)), Some(reader)))
+                }
+                // The response ends after the error.
+                Err(e) => Some((Err(e), None)),
+            }
+        },
+    ))
 }
 
 /// `PUT /api/docs/{id}/content?base=<id>`: the seat holder saves the file as the document's
 /// next revision, made from revision `base` (none if the document has none yet). The request
 /// carries the seat token in `X-ShareCraft-Seat`.
 ///
-/// The role is checked before the body is read. The save is handed to the document's file
-/// session and nothing else, and finishes even if the caller goes away.
+/// The role is checked before the body is read. The body streams into the content store, and a
+/// reference to it is handed to the document's file session and nothing else; the save
+/// finishes even if the caller goes away.
 pub(crate) async fn save(
     State(state): State<AppState>,
     signed: Signed,
@@ -192,16 +383,13 @@ pub(crate) async fn save(
         .and_then(|value| value.to_str().ok())
         .ok_or(ApiError::Forbidden)?
         .to_owned();
-    let bytes = body_bytes(request, &state).await?;
+    let blob = body_blob(&state, request).await?;
 
     let reply = {
         let state = state.clone();
-        to_completion(async move {
-            Ok(state
-                .rooms()
-                .save_file(doc, user, &token, base, bytes.to_vec())
-                .await)
-        })
+        to_completion(
+            async move { Ok(state.rooms().save_file(doc, user, &token, base, blob).await) },
+        )
         .await?
     };
     Ok(match reply {
@@ -231,8 +419,9 @@ fn saved(revision: &RevisionId, changed: bool) -> Response {
 /// `POST /api/docs/upload?parent=<id>&name=<file name>`: creates a document from the bytes
 /// sent in the library or folder `parent` (of which the caller must be an editor), with them as
 /// its first revision. The document inherits its access from there. The editor is the one
-/// whose extension ends the name. If the bytes cannot be stored after the document was made,
-/// the document stays, empty, and the answer is `503` naming it.
+/// whose extension ends the name. The bytes stream into the content store first, and are
+/// claimed for the revision before it is committed. If they cannot be stored after the
+/// document was made, the document stays, empty, and the answer is `503` naming it.
 pub(crate) async fn upload(
     State(state): State<AppState>,
     signed: Signed,
@@ -243,8 +432,8 @@ pub(crate) async fn upload(
     let parent = NodeId(parse_id(&query.parent.ok_or(ApiError::BadRequest)?)?);
     let name = query.name.ok_or(ApiError::BadRequest)?;
     let editor = Editor::for_file_name(name.trim()).ok_or(ApiError::BadRequest)?;
-    let bytes = body_bytes(request, &state).await?;
-    if bytes.is_empty() {
+    let blob = body_blob(&state, request).await?;
+    if blob.size == 0 {
         return Err(ApiError::BadRequest);
     }
     let user = signed.session.user;
@@ -252,8 +441,7 @@ pub(crate) async fn upload(
     to_completion(async move {
         let id = DocId(Uuid::new_v4());
         let created =
-            tree::create_document(&state, &user, parent, id, &name, editor, Some(bytes.len()))
-                .await;
+            tree::create_document(&state, &user, parent, id, &name, editor, Some(blob.size)).await;
         let document = match created {
             Ok(document) => document,
             // The name is only an extension.
@@ -270,21 +458,32 @@ pub(crate) async fn upload(
             name: credited_name(&user.name),
         };
         let file_name = document.name.clone();
-        let written = blocking(&state, move |store| {
-            store.write(&Checkpoint {
-                doc: id,
-                file_name: &file_name,
-                bytes: &bytes,
-                base: None,
-                authors: std::slice::from_ref(&author),
-                fields: &Map::new(),
-            })
-        })
+        let written = write_claimed(
+            state.blobs(),
+            Some(state.db()),
+            Arc::clone(state.checkpointer()),
+            id,
+            blob,
+            move |store| {
+                store.write(&Checkpoint {
+                    doc: id,
+                    file_name: &file_name,
+                    blob,
+                    base: None,
+                    authors: std::slice::from_ref(&author),
+                    fields: &Map::new(),
+                })
+            },
+        )
         .await;
         let revision = match written {
             Ok(Outcome::Written(revision) | Outcome::Unchanged(revision)) => revision,
-            Err(_) => {
-                // Already reported to standard error; the document stays, empty.
+            Err(e) => {
+                eprintln!(
+                    "sharecraft-server: upload of document {} failed: {e:?}",
+                    id.0
+                );
+                // The document stays, empty.
                 let body = Json(json!({ "error": "unavailable", "document": id.0.to_string() }));
                 return Ok((StatusCode::SERVICE_UNAVAILABLE, body).into_response());
             }

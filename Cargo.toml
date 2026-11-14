@@ -34,3 +34,7 @@ opt-level = 3
 
 [profile.dev.package.zlib-rs]
 opt-level = 3
+
+# Every file saved or uploaded is hashed with SHA-256 as it streams into the content store.
+[profile.dev.package.sha2]
+opt-level = 3

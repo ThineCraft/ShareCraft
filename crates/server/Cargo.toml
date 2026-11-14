@@ -30,7 +30,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 thiserror = "2.0.21"
 time = { version = "0.3.55", features = ["formatting", "parsing"] }
-tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "fs", "io-util"] }
 tower-http = { version = "0.7.1", features = ["fs"] }
 uuid = { version = "1.29.2", features = ["v4"] }
 
@@ -38,6 +38,7 @@ uuid = { version = "1.29.2", features = ["v4"] }
 base64 = "0.23.1"
 gix = { version = "0.90.0", default-features = false, features = ["sha1"] }
 records = { path = "../records", features = ["test-support"] }
+revisions = { path = "../revisions", features = ["test-support"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "query", "stream"] }
 sha2 = "0.11.1"
 sqlx = { version = "0.9.0", default-features = false, features = ["postgres", "runtime-tokio"] }

@@ -5,9 +5,10 @@
 //! one editing seat. Whoever may edit and joins while the seat is free takes it, with a fresh
 //! random token; everyone else watches. The seat is freed when its holder leaves, is removed or
 //! loses the right to edit, and nobody is given it then: a connection takes a free seat only
-//! by joining again, because its copy of the file may be old. The holder saves by handing the
-//! session the file's bytes with its token ([`Rooms::save_file`]); the session writes them as
-//! one checkpoint on a blocking task, one save at a time.
+//! by joining again, because its copy of the file may be old. The holder saves by streaming the
+//! file into the content store and handing the session a reference to it with its token
+//! ([`Rooms::save_file`]); the session never holds the bytes. It claims the content, writes one
+//! checkpoint pointing at it on a blocking task and settles the claim, one save at a time.
 //!
 //! Access changes reach a file session on the same channel and with the same meaning as a text
 //! room (see [`AccessChange`]). If a save finds the document saved from elsewhere, the session
@@ -20,11 +21,12 @@ use axum::extract::ws::Utf8Bytes;
 use collab_core::ids::{ClientId, DocId, SessionId, UserId};
 use protocol::{FileServerMsg, Participant, RemovedReason, SaveState, SeatState};
 use records::{Access, NewEvent};
-use revisions::{Author, Checkpoint, Outcome, RevisionId};
+use revisions::{Author, BlobRef, Checkpoint, Outcome, RevisionId};
 use serde_json::{Map, Value};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 
+use crate::blobs::write_claimed;
 use crate::checkpoint::{Checkpointer, WriteError};
 use crate::events::{EventSink, error_text};
 use crate::members::{self, AccessRules, Admission, Frames, Member, Members};
@@ -63,13 +65,14 @@ pub(crate) enum FileCommand {
     Confirm { conn: ConnId, client: ClientId },
     /// The connection ended.
     Leave { conn: ConnId, client: ClientId },
-    /// Store `bytes` as the document's next revision, on behalf of the seat holder.
+    /// Store the content `blob`, already in the content store, as the document's next
+    /// revision, on behalf of the seat holder.
     Save {
         user: UserId,
         token: String,
         /// The revision the bytes were made from.
         base: Option<RevisionId>,
-        bytes: Vec<u8>,
+        blob: BlobRef,
         /// Answered once the save is decided; dropped if the session ended first.
         reply: oneshot::Sender<SaveReply>,
     },
@@ -122,16 +125,16 @@ pub(crate) fn start(place: Place, name: String, storage: Storage, grace: Duratio
 }
 
 impl Rooms {
-    /// Asks `doc`'s file session to store `bytes`, made from the revision `base`, for `user`
-    /// holding the seat with `token`. `NotHolder` if no session is open (none is opened for
-    /// this), or if it ends before answering.
+    /// Asks `doc`'s file session to store the content `blob` (already in the content store),
+    /// made from the revision `base`, for `user` holding the seat with `token`. `NotHolder` if
+    /// no session is open (none is opened for this), or if it ends before answering.
     pub(crate) async fn save_file(
         &self,
         doc: DocId,
         user: UserId,
         token: &str,
         base: Option<RevisionId>,
-        bytes: Vec<u8>,
+        blob: BlobRef,
     ) -> SaveReply {
         let Some(Link::File(link)) = self.link(doc) else {
             return SaveReply::NotHolder;
@@ -141,7 +144,7 @@ impl Rooms {
             user,
             token: token.to_owned(),
             base,
-            bytes,
+            blob,
             reply,
         };
         if link.commands.send(save).await.is_err() {
@@ -165,13 +168,13 @@ struct Waiting {
     user: UserId,
     token: String,
     base: Option<RevisionId>,
-    bytes: Vec<u8>,
+    blob: BlobRef,
     reply: oneshot::Sender<SaveReply>,
 }
 
 /// One write to the store, taken from the session when it starts.
 struct WriteJob {
-    bytes: Vec<u8>,
+    blob: BlobRef,
     base: Option<RevisionId>,
     author: Author,
     fields: Map<String, Value>,
@@ -189,7 +192,7 @@ impl WriteJob {
         store.write(&Checkpoint {
             doc,
             file_name,
-            bytes: &self.bytes,
+            blob: self.blob,
             base: self.base.as_ref(),
             authors: std::slice::from_ref(&self.author),
             fields: &self.fields,
@@ -325,13 +328,13 @@ impl FileRoom {
                 user,
                 token,
                 base,
-                bytes,
+                blob,
                 reply,
             } => self.save(Waiting {
                 user,
                 token,
                 base,
-                bytes,
+                blob,
                 reply,
             }),
         }
@@ -526,7 +529,7 @@ impl FileRoom {
         self.writing = Some((save.reply, author.id.clone()));
         self.broadcast_save(SaveState::Saving, None);
         Some(WriteJob {
-            bytes: save.bytes,
+            blob: save.blob,
             base: save.base,
             author,
             fields: self.fields.clone(),
@@ -738,7 +741,12 @@ async fn run(
     grace: Duration,
 ) {
     let doc = place.doc();
-    let Storage { store, db, events } = storage;
+    let Storage {
+        store,
+        blobs,
+        db,
+        events,
+    } = storage;
     let (revision, fields) = match load_serving(load(&store, doc), &mut access_rx, &mut name).await
     {
         Ok(loaded) => loaded,
@@ -758,7 +766,9 @@ async fn run(
     let mut room = FileRoom::new(doc, name, revision, fields, events.clone());
     // Revisions are recorded off this task, in the order written: one save is written at a
     // time, and the blocking task that writes it queues it before the session learns of it.
-    let recorder = db.map(|db| Recorder::start(doc, Arc::clone(&store), db, events));
+    let recorder = db
+        .clone()
+        .map(|db| Recorder::start(doc, Arc::clone(&store), db, events));
     let mut running: Option<Running> = None;
     // The session opens for a join waiting in its channel; until that is handled it is empty.
     let mut empty_since = Some(Instant::now());
@@ -769,14 +779,20 @@ async fn run(
             && let Some(job) = room.next_write()
         {
             let store = Arc::clone(&store);
+            let blobs = Arc::clone(&blobs);
+            let db = db.clone();
             let file_name = room.name.clone();
             let recorder = recorder.clone();
-            running = Some(tokio::task::spawn_blocking(move || {
-                let result = job.write(doc, &file_name, &*store);
-                if let (Ok(Outcome::Written(revision)), Some(recorder)) = (&result, &recorder) {
-                    recorder.written(job.base.as_ref(), revision);
-                }
-                result
+            let blob = job.blob;
+            running = Some(tokio::spawn(async move {
+                write_claimed(&blobs, db.as_ref(), store, doc, blob, move |store| {
+                    let result = job.write(doc, &file_name, store);
+                    if let (Ok(Outcome::Written(revision)), Some(recorder)) = (&result, &recorder) {
+                        recorder.written(job.base.as_ref(), revision);
+                    }
+                    result
+                })
+                .await
             }));
         }
         let now = Instant::now();
@@ -914,6 +930,21 @@ mod tests {
             RevisionStore::open(&crate::library_path(self.dir.path())).unwrap()
         }
 
+        /// The content store the sessions use.
+        fn blobs(&self) -> Arc<crate::blobs::Blobs> {
+            crate::blobs::test_blobs(self.dir.path())
+        }
+
+        /// `bytes`, stored in the content store, as a save hands them on.
+        fn blob(&self, bytes: &[u8]) -> BlobRef {
+            self.blobs().store().write_from(bytes, u64::MAX).unwrap()
+        }
+
+        /// The bytes of a stored version.
+        fn read(&self, stored: &Stored) -> Vec<u8> {
+            self.blobs().store().read_all(&stored.content).unwrap()
+        }
+
         /// Opens the document's session on the library, recording revisions in the database.
         fn open(&self) -> FileLink {
             self.open_with(Arc::new(self.library()), Some(self.db.clone()))
@@ -925,6 +956,7 @@ mod tests {
                 NAME.into(),
                 Storage {
                     store,
+                    blobs: self.blobs(),
                     db,
                     events: EventSink::discard(),
                 },
@@ -1054,7 +1086,7 @@ mod tests {
 
         let reply = f
             .rooms
-            .save_file(f.doc, f.ann, &token, None, bytes.clone())
+            .save_file(f.doc, f.ann, &token, None, f.blob(&bytes))
             .await;
         let SaveReply::Saved(revision) = reply else {
             panic!("{reply:?}");
@@ -1073,7 +1105,7 @@ mod tests {
         let store = f.library();
         let stored = store.read(f.doc, None).unwrap().unwrap();
         assert_eq!(stored.revision, revision);
-        assert_eq!(stored.bytes, bytes);
+        assert_eq!(f.read(&stored), bytes);
         let info = store.describe(f.doc, &revision).unwrap().unwrap();
         assert_eq!(info.file_name, NAME);
         assert_eq!(
@@ -1105,7 +1137,7 @@ mod tests {
         // No session is open, and saving does not open one.
         let reply = f
             .rooms
-            .save_file(f.doc, f.ann, &"0".repeat(64), None, b"x".to_vec())
+            .save_file(f.doc, f.ann, &"0".repeat(64), None, f.blob(b"x"))
             .await;
         assert_eq!(reply, SaveReply::NotHolder);
         assert!(f.rooms.link(f.doc).is_none());
@@ -1128,7 +1160,7 @@ mod tests {
         ] {
             let reply = f
                 .rooms
-                .save_file(f.doc, user, token, None, b"x".to_vec())
+                .save_file(f.doc, user, token, None, f.blob(b"x"))
                 .await;
             assert_eq!(reply, SaveReply::NotHolder);
         }
@@ -1143,7 +1175,7 @@ mod tests {
         let token = token.unwrap();
         let SaveReply::Saved(first) = f
             .rooms
-            .save_file(f.doc, f.ann, &token, None, b"one".to_vec())
+            .save_file(f.doc, f.ann, &token, None, f.blob(b"one"))
             .await
         else {
             panic!("the first save failed");
@@ -1152,7 +1184,7 @@ mod tests {
         // Made from no revision, after the first was saved.
         let reply = f
             .rooms
-            .save_file(f.doc, f.ann, &token, None, b"two".to_vec())
+            .save_file(f.doc, f.ann, &token, None, f.blob(b"two"))
             .await;
         assert_eq!(
             reply,
@@ -1161,12 +1193,12 @@ mod tests {
             }
         );
         let stored = f.library().read(f.doc, None).unwrap().unwrap();
-        assert_eq!(stored.bytes, b"one");
+        assert_eq!(f.read(&stored), b"one");
 
         // Made from the current revision, it is stored.
         let reply = f
             .rooms
-            .save_file(f.doc, f.ann, &token, Some(first), b"two".to_vec())
+            .save_file(f.doc, f.ann, &token, Some(first), f.blob(b"two"))
             .await;
         assert!(matches!(reply, SaveReply::Saved(_)), "{reply:?}");
     }
@@ -1179,7 +1211,7 @@ mod tests {
         let token = token.unwrap();
         let SaveReply::Saved(first) = f
             .rooms
-            .save_file(f.doc, f.ann, &token, None, b"same".to_vec())
+            .save_file(f.doc, f.ann, &token, None, f.blob(b"same"))
             .await
         else {
             panic!("the first save failed");
@@ -1188,7 +1220,7 @@ mod tests {
 
         let reply = f
             .rooms
-            .save_file(f.doc, f.ann, &token, Some(first.clone()), b"same".to_vec())
+            .save_file(f.doc, f.ann, &token, Some(first.clone()), f.blob(b"same"))
             .await;
         assert_eq!(reply, SaveReply::Unchanged(first.clone()));
         ann.until(|m| is_save(m, SaveState::Saving)).await;
@@ -1216,7 +1248,7 @@ mod tests {
             .checkpoint(&Checkpoint {
                 doc: f.doc,
                 file_name: NAME,
-                bytes: b"from elsewhere",
+                blob: f.blob(b"from elsewhere"),
                 base: None,
                 authors: &[Author {
                     id: "someone".into(),
@@ -1233,7 +1265,7 @@ mod tests {
         // The session still thinks the document was never saved, as does the holder.
         let reply = f
             .rooms
-            .save_file(f.doc, f.ann, &token, None, b"mine".to_vec())
+            .save_file(f.doc, f.ann, &token, None, f.blob(b"mine"))
             .await;
         assert_eq!(
             reply,
@@ -1251,7 +1283,7 @@ mod tests {
                 f.ann,
                 &token,
                 Some(elsewhere.clone()),
-                b"mine".to_vec(),
+                f.blob(b"mine"),
             )
             .await;
         assert_eq!(
@@ -1261,7 +1293,7 @@ mod tests {
             }
         );
         let stored = f.library().read(f.doc, None).unwrap().unwrap();
-        assert_eq!(stored.bytes, b"from elsewhere");
+        assert_eq!(f.read(&stored), b"from elsewhere");
 
         // Once empty, the session ends without waiting out its grace period.
         link.commands
@@ -1349,7 +1381,8 @@ mod tests {
             let rooms = Arc::clone(&f.rooms);
             let doc = f.doc;
             let ann = f.ann;
-            async move { rooms.save_file(doc, ann, &token, None, b"x".to_vec()).await }
+            let blob = f.blob(b"x");
+            async move { rooms.save_file(doc, ann, &token, None, blob).await }
         });
         let started = tokio::task::spawn_blocking(move || {
             started.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -1439,11 +1472,8 @@ mod tests {
         let rooms = Arc::clone(&f.rooms);
         let doc = f.doc;
         let token = token.to_owned();
-        tokio::spawn(async move {
-            rooms
-                .save_file(doc, user, &token, base, b"x".to_vec())
-                .await
-        })
+        let blob = f.blob(b"x");
+        tokio::spawn(async move { rooms.save_file(doc, user, &token, base, blob).await })
     }
 
     /// The revision the gated store answers every write with.
@@ -1470,12 +1500,12 @@ mod tests {
         // Bob's save is answered while the write is still held.
         let stranger = f
             .rooms
-            .save_file(f.doc, f.bob, &token, None, b"x".to_vec())
+            .save_file(f.doc, f.bob, &token, None, f.blob(b"x"))
             .await;
         assert_eq!(stranger, SaveReply::NotHolder);
         let third = f
             .rooms
-            .save_file(f.doc, f.ann, &token, Some(gated_revision()), b"x".to_vec())
+            .save_file(f.doc, f.ann, &token, Some(gated_revision()), f.blob(b"x"))
             .await;
         assert_eq!(third, SaveReply::Busy);
         assert!(!first.is_finished() && !second.is_finished());
@@ -1601,7 +1631,7 @@ mod tests {
         let token = token.unwrap();
         let reply = f
             .rooms
-            .save_file(f.doc, f.ann, &token, None, b"one".to_vec())
+            .save_file(f.doc, f.ann, &token, None, f.blob(b"one"))
             .await;
         assert_eq!(reply, SaveReply::Failed);
         ann.until(|m| is_save(m, SaveState::Failed)).await;
@@ -1609,11 +1639,11 @@ mod tests {
 
         let reply = f
             .rooms
-            .save_file(f.doc, f.ann, &token, None, b"one".to_vec())
+            .save_file(f.doc, f.ann, &token, None, f.blob(b"one"))
             .await;
         assert!(matches!(reply, SaveReply::Saved(_)), "{reply:?}");
         assert_eq!(
-            f.library().read(f.doc, None).unwrap().unwrap().bytes,
+            f.read(&f.library().read(f.doc, None).unwrap().unwrap()),
             b"one"
         );
     }
@@ -1635,12 +1665,12 @@ mod tests {
 
         let reply = f
             .rooms
-            .save_file(f.doc, f.ann, &before, None, b"x".to_vec())
+            .save_file(f.doc, f.ann, &before, None, f.blob(b"x"))
             .await;
         assert_eq!(reply, SaveReply::NotHolder);
         let reply = f
             .rooms
-            .save_file(f.doc, f.ann, &after, None, b"x".to_vec())
+            .save_file(f.doc, f.ann, &after, None, f.blob(b"x"))
             .await;
         assert!(matches!(reply, SaveReply::Saved(_)), "{reply:?}");
     }
@@ -1657,6 +1687,7 @@ mod tests {
             NAME.into(),
             Storage {
                 store: Arc::new(f.library()),
+                blobs: f.blobs(),
                 db: None,
                 events,
             },
