@@ -507,7 +507,8 @@ pub(crate) async fn chain_with(
         let Some((found, given)) = by_id.remove(&id) else {
             return Ok(None);
         };
-        if found.deleted && !as_if_live {
+        // A deleted site is in no recycle bin: nothing in it is reached as if live.
+        if found.deleted && (!as_if_live || found.kind == NodeKind::Site) {
             return Ok(None);
         }
         next = found.parent;

@@ -357,9 +357,8 @@ async fn delete_folder_with_contents() {
         .await;
     assert_eq!(second["items"][0]["name"], "C");
     assert!(second["next"].is_null());
-
-    // The site cannot be deleted (a library can: see tests/archive.rs).
-    assert_eq!(w.delete(&w.root, &w.site).await, StatusCode::BAD_REQUEST);
+    // A library can be deleted too (tests/archive.rs); a whole site only by an administrator,
+    // and never to its own bin (tests/site_lifecycle.rs).
 }
 
 #[tokio::test]

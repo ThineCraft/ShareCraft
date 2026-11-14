@@ -51,7 +51,10 @@ pub(crate) fn router() -> Router<AppState> {
         .route("/me", get(session::me))
         .route("/editors", get(crate::editors::list))
         .route("/sites", get(sites::list).post(sites::create))
-        .route("/sites/{id}", get(sites::show).patch(sites::change))
+        .route(
+            "/sites/{id}",
+            get(sites::show).patch(sites::change).delete(sites::remove),
+        )
         .route("/sites/{id}/quota", put(sites::set_quota))
         .route("/sites/{id}/archive", post(sites::archive))
         .route("/sites/{id}/reactivate", post(sites::reactivate))
@@ -139,6 +142,9 @@ pub(crate) fn router() -> Router<AppState> {
         .route("/admin/users", get(admin::users).post(admin::create))
         .route("/admin/users/{id}/disable", post(admin::disable))
         .route("/admin/users/{id}/enable", post(admin::enable))
+        .route("/admin/sites", get(admin::sites))
+        .route("/admin/sites/{id}", delete(admin::purge_site))
+        .route("/admin/sites/{id}/restore", post(admin::restore_site))
         .fallback(|| async { ApiError::NotFound })
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .layer(middleware::from_fn(require_same_origin))
@@ -210,6 +216,10 @@ pub(crate) enum ApiError {
     WrongPlace,
     /// 400: a site cannot be deleted, and cannot inherit.
     IsSite,
+    /// 409: the site is deleted; only restoring and purging it are possible.
+    SiteDeleted,
+    /// 409: the site is not deleted, so it cannot be restored or purged.
+    NotDeleted,
     /// 409: one administrator must stay enabled.
     LastAdmin,
     /// 422: a well-formed request with a value that makes no sense, such as an unknown role or
@@ -312,6 +322,8 @@ impl ApiError {
             ApiError::IntoItself => (StatusCode::BAD_REQUEST, "into_itself"),
             ApiError::WrongPlace => (StatusCode::BAD_REQUEST, "wrong_place"),
             ApiError::IsSite => (StatusCode::BAD_REQUEST, "is_site"),
+            ApiError::SiteDeleted => (StatusCode::CONFLICT, "site_deleted"),
+            ApiError::NotDeleted => (StatusCode::CONFLICT, "not_deleted"),
             ApiError::LastAdmin => (StatusCode::CONFLICT, "last_admin"),
             ApiError::InvalidRequest => (StatusCode::UNPROCESSABLE_ENTITY, "invalid_request"),
             ApiError::InvalidName => (StatusCode::UNPROCESSABLE_ENTITY, "invalid_name"),
@@ -386,6 +398,8 @@ impl From<AccessError> for ApiError {
             AccessError::IntoItself => ApiError::IntoItself,
             AccessError::ParentInBin => ApiError::ParentInBin,
             AccessError::IsSite => ApiError::IsSite,
+            AccessError::SiteDeleted => ApiError::SiteDeleted,
+            AccessError::NotDeleted => ApiError::NotDeleted,
             AccessError::QuotaExceeded => ApiError::QuotaExceeded,
             // The server picks a fresh random id, so a clash is not the caller's doing.
             AccessError::Exists | AccessError::Db(_) | AccessError::Unjudged(_) => {

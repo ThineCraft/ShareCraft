@@ -817,8 +817,9 @@ async fn delete_takes_files_and_folders_with_their_contents() {
         delete(&vic, &doc).await,
         (StatusCode::FORBIDDEN, error("forbidden"))
     );
+    // Only administrators delete a site, as a whole (see tests/site_lifecycle.rs).
     assert_eq!(
-        delete(&w.root, &w.site).await,
+        delete(&vic, &w.site).await,
         (StatusCode::BAD_REQUEST, error("is_site"))
     );
     // Deleting a library needs manage_site on the site (see tests/archive.rs).

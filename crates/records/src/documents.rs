@@ -211,6 +211,12 @@ pub enum AccessError {
     ParentInBin,
     #[error("a site cannot do that")]
     IsSite,
+    /// The site is deleted: only restoring and purging it are possible.
+    #[error("that site is deleted")]
+    SiteDeleted,
+    /// The site is not deleted, so it cannot be restored or purged.
+    #[error("that site is not deleted")]
+    NotDeleted,
     /// The site has no room left under its storage quota for what would be stored.
     #[error("the site's storage quota would be exceeded")]
     QuotaExceeded,

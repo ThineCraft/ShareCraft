@@ -663,6 +663,247 @@ impl Db {
     }
 }
 
+/// One site as the administrators' Sites page lists it: live, archived or deleted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdminSite {
+    pub id: NodeId,
+    pub name: String,
+    pub kind: SiteKind,
+    /// Whether it is archived (a deleted site may be archived too).
+    pub archived: bool,
+    pub is_hub: bool,
+    /// The hub it joined, with the hub's name.
+    pub hub: Option<(NodeId, String)>,
+    /// The bytes it holds (see [`crate::SiteUsage`]).
+    pub used: u64,
+    /// Its quota in bytes; `None` for no limit.
+    pub quota: Option<u64>,
+    /// How many people own it (see [`Db::site_owners`]).
+    pub owners: i64,
+    /// When it was deleted, if it is.
+    pub deleted_at: Option<OffsetDateTime>,
+    /// The name of whoever deleted it, if known.
+    pub deleted_by: Option<String>,
+}
+
+/// Clears the hub `hub` from every site that joined it (`joined_hub`), recording `hub.left` by
+/// `actor` for each with `{"hub", "released": true}`. The caller has locked the rows of those
+/// sites and writes their records, cleared the same way, in the same commit (see
+/// `server::sites::released_members`). Purging a hub does this; so will unregistering one.
+/// Answers the sites it cleared, by id.
+pub(crate) async fn release_hub_rows(
+    conn: &mut PgConnection,
+    actor: Option<UserId>,
+    hub: NodeId,
+) -> Result<Vec<NodeId>, sqlx::Error> {
+    let members: Vec<Uuid> =
+        sqlx::query_scalar("update sites set joined_hub = null where joined_hub = $1 returning id")
+            .bind(hub.0)
+            .fetch_all(&mut *conn)
+            .await?;
+    let mut members: Vec<NodeId> = members.into_iter().map(NodeId).collect();
+    members.sort_unstable();
+    for member in &members {
+        record(
+            &mut *conn,
+            NewEvent {
+                kind: "hub.left",
+                actor,
+                subject: None,
+                document: None,
+                node: Some(*member),
+                detail: serde_json::json!({ "hub": hub.0, "released": true }),
+            },
+        )
+        .await?;
+    }
+    Ok(members)
+}
+
+/// Deletes everything the purged site `site` owned besides its nodes (which stay as
+/// tombstones), in the transaction that purged its rows: the links, access requests and
+/// assignments of its nodes, its groups with their memberships and every assignment naming
+/// them, its upload sessions and its usage row; the sites that joined it as a hub leave it (see
+/// [`release_hub_rows`]), and its own row keeps no hub, no hub it joined and no hub
+/// navigation. Its groups are locked `FOR UPDATE`, by id, first.
+pub(crate) async fn purge_site_rows(
+    conn: &mut PgConnection,
+    actor: Option<UserId>,
+    site: NodeId,
+) -> Result<(), sqlx::Error> {
+    let groups: Vec<Uuid> =
+        sqlx::query_scalar("select id from groups where site_id = $1 order by id for update")
+            .bind(site.0)
+            .fetch_all(&mut *conn)
+            .await?;
+    sqlx::query(
+        "delete from links \
+         where node_id in (select id from nodes where site_id = $1) or group_id = any($2)",
+    )
+    .bind(site.0)
+    .bind(&groups)
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query(
+        "delete from access_requests where node_id in (select id from nodes where site_id = $1)",
+    )
+    .bind(site.0)
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query(
+        "delete from assignments \
+         where node_id in (select id from nodes where site_id = $1) \
+            or (principal_kind = 'group' and principal_id = any($2))",
+    )
+    .bind(site.0)
+    .bind(&groups)
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query("delete from group_members where group_id = any($1)")
+        .bind(&groups)
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query("delete from groups where id = any($1)")
+        .bind(&groups)
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query("delete from upload_sessions where site_id = $1")
+        .bind(site.0)
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query("delete from site_usage where site_id = $1")
+        .bind(site.0)
+        .execute(&mut *conn)
+        .await?;
+    release_hub_rows(&mut *conn, actor, site).await?;
+    sqlx::query(
+        "update sites set joined_hub = null, is_hub = false, hub_navigation = null where id = $1",
+    )
+    .bind(site.0)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// Where a site is in its lifecycle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SiteState {
+    /// Not deleted (it may be archived).
+    Live,
+    /// Deleted, not yet purged (its purge may have started: see [`SiteSettings::purging`]).
+    Deleted,
+    /// Purged: only its tombstones are left.
+    Purged,
+}
+
+impl Db {
+    /// Where the site `site` is in its lifecycle; `None` if there is no such site.
+    pub async fn site_state(&self, site: NodeId) -> Result<Option<SiteState>, DbError> {
+        let row: Option<(bool, bool)> = sqlx::query_as(
+            "select deleted_at is not null, purged_at is not null from nodes \
+             where id = $1 and kind = 'site'",
+        )
+        .bind(site.0)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row.map(|(deleted, purged)| match (deleted, purged) {
+            (_, true) => SiteState::Purged,
+            (true, false) => SiteState::Deleted,
+            (false, false) => SiteState::Live,
+        }))
+    }
+
+    /// Marks the deleted site `site` as being purged (`purging`), or the purge as finished.
+    pub async fn set_site_purging(&self, site: NodeId, purging: bool) -> Result<(), DbError> {
+        sqlx::query("update sites set purging = $2 where id = $1")
+            .bind(site.0)
+            .bind(purging)
+            .execute(self.pool())
+            .await?;
+        Ok(())
+    }
+
+    /// The deleted sites to purge at `now`: every site whose purge was started and not finished
+    /// (`purging`) first, then every site deleted [`crate::BIN_DAYS`] days or more before
+    /// `now` and not purged, oldest deletion first.
+    pub async fn sites_to_purge(&self, now: OffsetDateTime) -> Result<Vec<NodeId>, DbError> {
+        let ids: Vec<Uuid> = sqlx::query_scalar(
+            "select n.id from nodes n join sites s on s.id = n.id \
+             where n.kind = 'site' and n.deleted_at is not null \
+               and (s.purging or (n.purged_at is null and n.deleted_at <= $1)) \
+             order by s.purging desc, n.deleted_at, n.id",
+        )
+        .bind(now - time::Duration::days(crate::BIN_DAYS))
+        .fetch_all(self.pool())
+        .await?;
+        Ok(ids.into_iter().map(NodeId).collect())
+    }
+
+    /// The names of the sites that are not deleted, lower-cased, for finding a free name.
+    pub async fn live_site_names(&self) -> Result<Vec<String>, DbError> {
+        let names = sqlx::query_scalar(
+            "select lower(name) from nodes \
+             where kind = 'site' and parent_id is null and deleted_at is null",
+        )
+        .fetch_all(self.pool())
+        .await?;
+        Ok(names)
+    }
+
+    /// Every site that is not purged, live, archived or deleted, by name, for the
+    /// administrators' Sites page. Whoever asks: the caller checks they are an administrator.
+    pub async fn admin_sites(&self) -> Result<Vec<AdminSite>, DbError> {
+        let rows = sqlx::query(
+            "select n.id, n.name, n.deleted_at, u.name as deleted_by, \
+                    coalesce(s.kind, 'team') as kind, s.archived_at is not null as archived, \
+                    coalesce(s.is_hub, false) as is_hub, s.joined_hub, h.name as hub_name, \
+                    coalesce(su.used, 0) as used, su.quota, \
+                    (select count(*) from users o where o.disabled_at is null and ( \
+                         o.id in (select m.user_id from group_members m \
+                                  join groups g on g.id = m.group_id \
+                                  where g.site_id = n.id and g.purpose = 'owners') \
+                         or o.id in (select a.principal_id from assignments a \
+                                     where a.node_id = n.id and a.principal_kind = 'user' \
+                                       and a.role_id = 'owner'))) as owners \
+             from nodes n \
+             left join sites s on s.id = n.id \
+             left join nodes h on h.id = s.joined_hub \
+             left join site_usage su on su.site_id = n.id \
+             left join users u on u.id = n.deleted_by \
+             where n.kind = 'site' and n.parent_id is null and n.purged_at is null \
+             order by lower(n.name), n.id",
+        )
+        .fetch_all(self.pool())
+        .await?;
+        let bytes = |value: i64| u64::try_from(value).unwrap_or(0);
+        rows.iter()
+            .map(|row| {
+                let kind: String = row.try_get("kind")?;
+                let hub = row
+                    .try_get::<Option<Uuid>, _>("joined_hub")?
+                    .zip(row.try_get::<Option<String>, _>("hub_name")?)
+                    .map(|(id, name)| (NodeId(id), name));
+                Ok(AdminSite {
+                    id: NodeId(row.try_get("id")?),
+                    name: row.try_get("name")?,
+                    kind: SiteKind::parse(&kind).ok_or_else(|| {
+                        sqlx::Error::Decode(format!("unknown site kind {kind:?}").into())
+                    })?,
+                    archived: row.try_get::<Option<bool>, _>("archived")?.unwrap_or(false),
+                    is_hub: row.try_get("is_hub")?,
+                    hub,
+                    used: bytes(row.try_get("used")?),
+                    quota: row.try_get::<Option<i64>, _>("quota")?.map(bytes),
+                    owners: row.try_get("owners")?,
+                    deleted_at: row.try_get("deleted_at")?,
+                    deleted_by: row.try_get("deleted_by")?,
+                })
+            })
+            .collect::<Result<_, sqlx::Error>>()
+            .map_err(DbError::from)
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {

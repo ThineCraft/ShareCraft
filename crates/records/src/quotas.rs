@@ -554,8 +554,8 @@ impl Db {
     pub async fn rebuild_usage(&self, complete: bool) -> Result<(), DbError> {
         let mut tx = self.pool().begin().await?;
         sqlx::query(
-            "insert into site_usage (site_id) select id from nodes where kind = 'site' \
-             order by id on conflict do nothing",
+            "insert into site_usage (site_id) select id from nodes \
+             where kind = 'site' and purged_at is null order by id on conflict do nothing",
         )
         .execute(&mut *tx)
         .await?;

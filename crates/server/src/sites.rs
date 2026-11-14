@@ -16,8 +16,8 @@ use collab_core::ids::{NodeId, UserId};
 use protocol::RemovedReason;
 use records::{
     AccessError, Db, DbError, NewEvent, NodeKind, Perms, RegionalDefaults, SiteChange, SiteKind,
-    SiteSettings, TemplateRow, User, validate_description, validate_language, validate_node_name,
-    validate_time_zone,
+    SiteSettings, SiteState, TemplateRow, User, validate_description, validate_language,
+    validate_node_name, validate_time_zone,
 };
 use revisions::{
     CheckpointError, GitError, OrgNavigation, SITE_SCHEMA, SiteRecord, Stamp, TemplateRecord,
@@ -374,10 +374,8 @@ async fn set_archived(
     if !current.is_some_and(|u| u.is_admin && !u.disabled) {
         return Err(AccessError::Forbidden);
     }
+    live_site(db, site).await?;
     let node = db.node(site).await?.ok_or(AccessError::NotFound)?;
-    if node.kind != NodeKind::Site || node.deleted {
-        return Err(AccessError::NotFound);
-    }
     let store = state.checkpointer();
     let stored = read_site_record(store, site).await.map_err(git_failure)?;
     let before = match &stored {
@@ -462,6 +460,73 @@ async fn set_archived(
             Err(refused)
         }
     }
+}
+
+/// `Ok` for a live site; `SiteDeleted` for a deleted one, `NotFound` for anything else (a
+/// purged site included).
+async fn live_site(db: &Db, site: NodeId) -> Result<(), AccessError> {
+    match db.site_state(site).await? {
+        Some(SiteState::Live) => Ok(()),
+        Some(SiteState::Deleted) => Err(AccessError::SiteDeleted),
+        Some(SiteState::Purged) | None => Err(AccessError::NotFound),
+    }
+}
+
+/// Deletes the site `site` for `actor`, an enabled administrator (an archived site included):
+/// one Git commit marking its site node deleted, mirrored with `site.deleted` (see
+/// [`crate::tree::apply`]); then everything under way in it is ended (see
+/// [`end_site_activity`], with `deleted`). From then on everything in it answers as missing to
+/// everyone, until an administrator restores it ([`crate::tree::restore_site`]) or it is
+/// purged ([`crate::tree::purge_site`]), 93 days after the deletion at the latest.
+///
+/// # Errors
+/// `Forbidden` unless `actor` is an enabled administrator; `SiteDeleted` for a deleted site;
+/// `NotFound` for anything but a site; `OutOfStep` while the tree needs repair; otherwise the
+/// Git or database error.
+pub async fn delete(state: &AppState, actor: &User, site: NodeId) -> Result<(), AccessError> {
+    let db = state.db();
+    if !db
+        .user(actor.id)
+        .await?
+        .is_some_and(|u| u.is_admin && !u.disabled)
+    {
+        return Err(AccessError::Forbidden);
+    }
+    live_site(db, site).await?;
+    crate::tree::apply(state, actor, crate::tree::TreeOp::Delete { id: site }).await?;
+    end_site_activity(state, site, RemovedReason::Deleted).await;
+    Ok(())
+}
+
+/// Every site whose record in Git names `hub` as the hub it joined, each as it is (first) and
+/// with `joined_hub` cleared (second): what a commit that releases the hub's members writes,
+/// with their rows cleared in the same transaction (`records`' `release_hub_rows`). Purging a
+/// hub releases them; so will unregistering one. A store that keeps no site records has none.
+///
+/// # Errors
+/// The Git error, as a database error.
+pub(crate) async fn released_members(
+    state: &AppState,
+    hub: NodeId,
+) -> Result<Vec<(SiteRecord, SiteRecord)>, AccessError> {
+    let store = Arc::clone(state.checkpointer());
+    let records = tokio::task::spawn_blocking(move || store.read_sites())
+        .await
+        .map_err(|e| git_failure(CheckpointError::Git(GitError::new(e))))?;
+    let records = match records {
+        Ok(records) => records,
+        Err(CheckpointError::Unsupported) => return Ok(Vec::new()),
+        Err(e) => return Err(git_failure(e)),
+    };
+    Ok(records
+        .into_iter()
+        .filter(|record| record.joined_hub == Some(hub.0))
+        .map(|before| {
+            let mut after = before.clone();
+            after.joined_hub = None;
+            (before, after)
+        })
+        .collect())
 }
 
 /// Ends everything under way in `site`: every editing session (text and file) of a document

@@ -858,14 +858,11 @@ async fn concurrent_same_name_one_wins() {
 async fn delete_takes_a_folder_with_its_contents() {
     let env = Env::new().await;
     let admin = env.user("Ada", true).await;
-    let (site, library) = env.site(&admin, "Team").await;
+    let (_, library) = env.site(&admin, "Team").await;
     let folder = env.folder(&admin, library, "Plans").await;
     let file = env.file(&admin, folder, "Plan.xlsx").await.unwrap();
-    // A library can be deleted too (tests/archive.rs); a site cannot.
-    assert_eq!(
-        env.apply(&admin, TreeOp::Delete { id: site }).await,
-        Err(AccessError::IsSite)
-    );
+    // A library can be deleted too (tests/archive.rs); a whole site only by an administrator
+    // (tests/site_lifecycle.rs).
     let commits = env.commits();
     let applied = tree::apply(&env.state, &admin, TreeOp::Delete { id: folder })
         .await

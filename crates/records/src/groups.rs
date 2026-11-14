@@ -297,16 +297,20 @@ async fn locked_admin(conn: &mut PgConnection, user: UserId) -> Result<bool, sql
     Ok(admin == Some(true))
 }
 
-/// The site and purpose of the group `id`; `NoSuchGroup` if there is none.
+/// The site and purpose of the group `id`; `NoSuchGroup` if there is none, or if its site is
+/// deleted (a deleted site's groups answer as missing until it is restored).
 async fn group_place(
     conn: &mut PgConnection,
     id: GroupId,
 ) -> Result<(Option<NodeId>, Option<SiteGroup>), AccessError> {
-    let row: Option<(Option<Uuid>, Option<String>)> =
-        sqlx::query_as("select site_id, purpose from groups where id = $1")
-            .bind(id.0)
-            .fetch_optional(conn)
-            .await?;
+    let row: Option<(Option<Uuid>, Option<String>)> = sqlx::query_as(
+        "select g.site_id, g.purpose from groups g \
+         where g.id = $1 and not exists (select 1 from nodes s \
+                                         where s.id = g.site_id and s.deleted_at is not null)",
+    )
+    .bind(id.0)
+    .fetch_optional(conn)
+    .await?;
     let (site, purpose) = row.ok_or(AccessError::NoSuchGroup)?;
     Ok((
         site.map(NodeId),
@@ -776,6 +780,8 @@ pub(crate) async fn visible_groups(
                                            and m.node_id in (select origin from live))) \
          select {GROUP_COLUMNS} from {GROUP_FROM} \
          where g.purpose is distinct from 'link' \
+           and not exists (select 1 from nodes gs \
+                           where gs.id = g.site_id and gs.deleted_at is not null) \
            and ($3::uuid[] is null or g.id = any($3)) \
            and ($2 \
                 or ((select yes from manages) \

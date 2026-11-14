@@ -172,6 +172,8 @@ test('every error code of the tree and access routes has its own sentence', () =
     'invalid_navigation',
     'invalid_template',
     'archived',
+    'site_deleted',
+    'not_deleted',
   ]) {
     assert.notEqual(messageFor(code), general, code);
   }

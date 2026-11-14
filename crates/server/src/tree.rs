@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use collab_core::ids::{DocId, NodeId, UserId};
+use protocol::RemovedReason;
 use records::{
     Access, AccessError, BinStage, ClaimId, Db, DbError, Document, Editor, NewEvent, Node,
     NodeChange, NodeKind, NodeRow, NodesApplied, Perms, QuotaError, Reservation, SiteKind,
@@ -248,6 +249,17 @@ struct Plan {
     undo_removed_sites: Vec<Uuid>,
     /// The `sites` rows of `sites`, mirrored with exactly the records' values.
     new_sites: Vec<SiteSettings>,
+    /// Sites whose record the commit removes: a purged site's.
+    removed_sites: Vec<Uuid>,
+    /// Site records the take-back writes back.
+    undo_sites: Vec<SiteRecord>,
+    /// Records Git already holds that are mirrored with the change: a purge's records purged
+    /// before it.
+    also_rows: Vec<TreeRecord>,
+    /// The `sites` rows locked for the change (see [`NodeChange::sites`]).
+    site_rows: Vec<NodeId>,
+    /// The deleted site this change purges as a whole (see [`NodeChange::purge_site`]).
+    purge_site: Option<NodeId>,
     /// A new site's Owners, Members and Visitors group ids, which its navigation names.
     site_group_ids: Option<[Uuid; 3]>,
     needs_admin: bool,
@@ -307,6 +319,11 @@ impl Default for Plan {
             sites: Vec::new(),
             undo_removed_sites: Vec::new(),
             new_sites: Vec::new(),
+            removed_sites: Vec::new(),
+            undo_sites: Vec::new(),
+            also_rows: Vec::new(),
+            site_rows: Vec::new(),
+            purge_site: None,
             site_group_ids: None,
             needs_admin: false,
             needs: Vec::new(),
@@ -467,6 +484,238 @@ pub async fn purge_due(state: &AppState, now: OffsetDateTime) -> usize {
     }
     if purged > 0 {
         println!("sharecraft-server: purged {purged} recycle bin item(s)");
+    }
+    purged
+}
+
+/// Restores the deleted site `site` for `actor`, an enabled administrator: one commit writing
+/// its tree record live again, mirrored with `site.restored`. Nothing else changed when it was
+/// deleted, so everything comes back as it was: its bin with each entry's stage and time, its
+/// links, groups, members, quota and usage, its settings (an archived site comes back
+/// archived) and the hub it joined, if that hub was not purged meanwhile. A name another site
+/// took meanwhile gets ` (2)`, ` (3)` …, and the answer says so (`renamed`).
+///
+/// # Errors
+/// `Forbidden` unless `actor` is an enabled administrator; `NotFound` for anything but a site
+/// not purged (a site whose purge has started included); `NotDeleted` for a site that is not
+/// deleted; `OutOfStep` while the tree needs repair; otherwise the Git or database error.
+pub async fn restore_site(
+    state: &AppState,
+    actor: &User,
+    site: NodeId,
+) -> Result<Applied, AccessError> {
+    let _turn = state.tree_lock().lock().await;
+    ensure_in_step(state).await?;
+    let db = state.db();
+    if !is_admin(db, actor).await? {
+        return Err(AccessError::Forbidden);
+    }
+    if !db
+        .node(site)
+        .await?
+        .is_some_and(|n| n.kind == NodeKind::Site)
+    {
+        return Err(AccessError::NotFound);
+    }
+    let record = git_record(state, site).await?;
+    if record.purged.is_some() || db.site_settings(site).await?.is_some_and(|s| s.purging) {
+        return Err(AccessError::NotFound);
+    }
+    if record.deleted.is_none() {
+        return Err(AccessError::NotDeleted);
+    }
+    let taken: HashSet<String> = db.live_site_names().await?.into_iter().collect();
+    let mut back = revived(&record);
+    back.name = unique_node_name(&record.name, None, &taken);
+    let renamed = (back.name != record.name).then(|| (site, record.name.clone()));
+    let plan = Plan {
+        id: site,
+        message: format!("Restore site {}", record.name),
+        events: vec![NewEvent {
+            kind: "site.restored",
+            actor: Some(actor.id),
+            subject: None,
+            document: None,
+            node: Some(site),
+            detail: json!({
+                "name": back.name,
+                "from_name": renamed.as_ref().map(|(_, from)| from),
+            }),
+        }],
+        records: vec![back],
+        undo: vec![record],
+        needs_admin: true,
+        ..Plan::default()
+    };
+    commit(state, Some(actor), plan).await?;
+    let node = db.node(site).await?.ok_or(AccessError::NotFound)?;
+    Ok(Applied {
+        node,
+        deleted: Vec::new(),
+        renamed,
+    })
+}
+
+/// Purges the deleted site `site` as a whole: by `actor`, an enabled administrator, or by the
+/// server (`None`) when its 93 days are up or to finish a purge a stop interrupted. In order:
+/// the site is marked `purging`; one commit tombstones every tree record of the site (each
+/// marked purged, the live ones deleted with the site too), removes its site record, and clears
+/// `joined_hub` in the record of every site that joined it as a hub (see
+/// [`crate::sites::released_members`]); one transaction mirrors that and deletes its links,
+/// requests, assignments, groups with their memberships, upload sessions and usage row (see
+/// [`NodeChange::purge_site`]), recording `site.purged`; then each content its files' versions
+/// named that nothing names any more is erased; and `purging` is cleared last. Each step
+/// finds what is already done and does the rest, so a purge started again after a stop
+/// finishes it.
+///
+/// # Errors
+/// `Forbidden` unless `actor` is an enabled administrator; `NotFound` for anything but a site
+/// not yet purged; `NotDeleted` for a site that is not deleted; `OutOfStep` while the tree
+/// needs repair; otherwise the Git or database error (the site then stays marked `purging`,
+/// and the sweeper finishes it).
+pub async fn purge_site(
+    state: &AppState,
+    actor: Option<&User>,
+    site: NodeId,
+) -> Result<(), AccessError> {
+    let db = state.db();
+    if let Some(actor) = actor
+        && !is_admin(db, actor).await?
+    {
+        return Err(AccessError::Forbidden);
+    }
+    // Before the tree's turn: ending an upload waits for that upload's own turn.
+    if db
+        .node(site)
+        .await?
+        .is_some_and(|n| n.kind == NodeKind::Site && n.deleted)
+    {
+        crate::sites::end_site_activity(state, site, RemovedReason::Deleted).await;
+    }
+    let done = {
+        let _turn = state.tree_lock().lock().await;
+        ensure_in_step(state).await?;
+        let node = db
+            .node(site)
+            .await?
+            .filter(|n| n.kind == NodeKind::Site)
+            .ok_or(AccessError::NotFound)?;
+        if !node.deleted {
+            return Err(AccessError::NotDeleted);
+        }
+        let purging = db.site_settings(site).await?.is_some_and(|s| s.purging);
+        let record = git_record(state, site).await?;
+        if record.purged.is_some() && !purging {
+            return Err(AccessError::NotFound);
+        }
+        db.set_site_purging(site, true).await?;
+        let plan = plan_purge_site(state, actor, &record).await?;
+        commit(state, actor, plan).await?
+    };
+    erase_released(state, done).await;
+    db.set_site_purging(site, false).await?;
+    Ok(())
+}
+
+/// Works out the purge of the deleted site whose tree record is `site` (see [`purge_site`]).
+async fn plan_purge_site(
+    state: &AppState,
+    actor: Option<&User>,
+    site: &TreeRecord,
+) -> Result<Plan, AccessError> {
+    let store = state.checkpointer();
+    let id = NodeId(site.id);
+    let tree = read_tree(store).await.map_err(git_failure)?;
+    let in_site: Vec<TreeRecord> = tree.into_iter().filter(|r| r.site == site.id).collect();
+    let (ordered, orphans) = parents_first(&in_site);
+    let stamp = Stamp {
+        at: now_text(),
+        by: actor.map_or_else(server_author, author_of),
+    };
+    let mut records = Vec::new();
+    let mut undo = Vec::new();
+    let mut also_rows = Vec::new();
+    for record in ordered.into_iter().chain(orphans) {
+        if record.purged.is_some() {
+            also_rows.push(record.clone());
+            continue;
+        }
+        undo.push(record.clone());
+        let mut gone = record.clone();
+        if gone.deleted.is_none() {
+            gone.deleted = Some(stamp.clone());
+            gone.deleted_with = Some(site.id);
+        }
+        gone.purged = Some(stamp.clone());
+        gone.bin_stage = None;
+        records.push(gone);
+    }
+    let members = crate::sites::released_members(state, id).await?;
+    let stored = crate::sites::read_site_record(store, id)
+        .await
+        .map_err(git_failure)?;
+    let mut site_rows: Vec<NodeId> = members.iter().map(|(_, after)| NodeId(after.id)).collect();
+    site_rows.push(id);
+    site_rows.sort_unstable();
+    let new_sites = members
+        .iter()
+        .map(|(_, after)| crate::sites::settings_of(after))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(DbError::new)?;
+    let mut undo_sites: Vec<SiteRecord> =
+        members.iter().map(|(before, _)| before.clone()).collect();
+    undo_sites.extend(stored.iter().cloned());
+    Ok(Plan {
+        id,
+        message: format!("Purge site {}", site.name),
+        events: vec![NewEvent {
+            kind: "site.purged",
+            actor: actor.map(|a| a.id),
+            subject: None,
+            document: None,
+            node: Some(id),
+            detail: json!({ "name": site.name, "items": records.len() }),
+        }],
+        records,
+        undo,
+        also_rows,
+        sites: members.into_iter().map(|(_, after)| after).collect(),
+        new_sites,
+        removed_sites: stored.map(|record| record.id).into_iter().collect(),
+        undo_sites,
+        site_rows,
+        needs_admin: actor.is_some(),
+        purge_site: Some(id),
+        ..Plan::default()
+    })
+}
+
+/// Purges, as the server, every deleted site whose purge a stop interrupted, then every site
+/// deleted [`records::BIN_DAYS`] days or more before `now` (see [`purge_site`]), one at a time.
+/// Answers how many it purged; a failure is logged and the site left for the next sweep.
+pub async fn purge_due_sites(state: &AppState, now: OffsetDateTime) -> usize {
+    let due = match state.db().sites_to_purge(now).await {
+        Ok(due) => due,
+        Err(e) => {
+            eprintln!("sharecraft-server: database failure: {e}");
+            return 0;
+        }
+    };
+    let mut purged = 0;
+    for site in due {
+        let state = state.clone();
+        // On its own task, so that a sweep stopped midway still finishes the site it is on.
+        let done = tokio::spawn(async move { purge_site(&state, None, site).await }).await;
+        match done {
+            Ok(Ok(())) => purged += 1,
+            // Restored or purged meanwhile.
+            Ok(Err(AccessError::NotFound | AccessError::NotDeleted)) => {}
+            Ok(Err(e)) => eprintln!("sharecraft-server: could not purge site {}: {e}", site.0),
+            Err(e) => eprintln!("sharecraft-server: a site purge did not finish: {e}"),
+        }
+    }
+    if purged > 0 {
+        println!("sharecraft-server: purged {purged} deleted site(s)");
     }
     purged
 }
@@ -880,31 +1129,38 @@ async fn commit(
     let rows = plan
         .records
         .iter()
+        .chain(&plan.also_rows)
         .map(to_row)
         .collect::<Result<Vec<_>, _>>()
         .map_err(DbError::new)?;
-    if plan.sites.is_empty() {
-        write_tree(
-            store,
-            author.clone(),
-            plan.message.clone(),
-            plan.records.clone(),
-        )
-        .await
-    } else {
-        write_sites(
-            store,
-            author.clone(),
-            plan.message.clone(),
-            plan.records.clone(),
-            plan.sites.clone(),
-            Vec::new(),
-        )
-        .await
+    // A purge resumed after Git recorded it has nothing left to write there.
+    let writes =
+        !(plan.records.is_empty() && plan.sites.is_empty() && plan.removed_sites.is_empty());
+    if writes {
+        if plan.sites.is_empty() && plan.removed_sites.is_empty() {
+            write_tree(
+                store,
+                author.clone(),
+                plan.message.clone(),
+                plan.records.clone(),
+            )
+            .await
+        } else {
+            write_sites(
+                store,
+                author.clone(),
+                plan.message.clone(),
+                plan.records.clone(),
+                plan.sites.clone(),
+                plan.removed_sites.clone(),
+            )
+            .await
+        }
+        .map_err(git_failure)?;
     }
-    .map_err(git_failure)?;
     let undo = Undo {
         records: plan.undo,
+        sites: plan.undo_sites,
         removed_sites: plan.undo_removed_sites,
         ..Undo::default()
     };
@@ -923,9 +1179,10 @@ async fn commit(
             copies: &plan.copies,
             needs_below: plan.needs_below,
             as_if_live: plan.as_if_live,
-            sites: &[],
+            sites: &plan.site_rows,
             new_sites: &plan.new_sites,
             site_group_ids: plan.site_group_ids,
+            purge_site: plan.purge_site,
         })
         .await;
     match applied {
@@ -939,7 +1196,12 @@ async fn commit(
             // Git does not hold a new file's editor: new files are taken back.
             let taken_back = (plan.document.is_none() && plan.copies.is_empty())
                 || take_back_all(state, author.clone(), &plan.message, undo).await;
-            let ids: Vec<Uuid> = plan.records.iter().map(|r| r.id).collect();
+            let ids: Vec<Uuid> = plan
+                .records
+                .iter()
+                .chain(&plan.also_rows)
+                .map(|r| r.id)
+                .collect();
             let repaired =
                 repair_ids(state, &ids).await && crate::sites::repair_sites(state, &site_ids).await;
             if !(taken_back && repaired) {
@@ -955,7 +1217,7 @@ async fn commit(
                     plan.id.0
                 );
             }
-            if !take_back_all(state, author, &plan.message, undo).await {
+            if writes && !take_back_all(state, author, &plan.message, undo).await {
                 state.tree_out_of_step().store(true, Ordering::SeqCst);
             }
             Err(refused)
@@ -1514,6 +1776,10 @@ async fn plan_delete(state: &AppState, actor: &User, id: NodeId) -> Result<Plan,
     let mut needs = Vec::new();
     let mut below_from: Vec<NodeId> = Vec::new();
     match node.kind {
+        // Administrators delete whole sites; for anyone else a site cannot be deleted.
+        NodeKind::Site if is_admin(db, actor).await? => {
+            return plan_delete_site(state, actor, &node).await;
+        }
         NodeKind::Site => return Err(AccessError::IsSite),
         NodeKind::Library => {
             let site_access = db
@@ -1615,6 +1881,49 @@ async fn plan_delete(state: &AppState, actor: &User, id: NodeId) -> Result<Plan,
     })
 }
 
+/// Deletes the site `node` for `actor`, an administrator: its site record in Git marked deleted
+/// by `actor`, with no bin stage, and nothing else; everything in it is then unreachable by the
+/// rule that a deleted node at or above means no access. Its links stay unrevoked and its
+/// requests open, so a restore gives everything back. Recorded as `site.deleted`.
+async fn plan_delete_site(
+    state: &AppState,
+    actor: &User,
+    node: &Node,
+) -> Result<Plan, AccessError> {
+    let before = git_record(state, node.id).await?;
+    let mut after = before.clone();
+    after.deleted = Some(Stamp {
+        at: now_text(),
+        by: author_of(actor),
+    });
+    after.deleted_with = Some(node.id.0);
+    after.bin_stage = None;
+    Ok(Plan {
+        id: node.id,
+        message: format!("Delete site {}", node.name),
+        records: vec![after],
+        undo: vec![before],
+        needs_admin: true,
+        events: vec![NewEvent {
+            kind: "site.deleted",
+            actor: Some(actor.id),
+            subject: None,
+            document: None,
+            node: Some(node.id),
+            detail: json!({ "name": node.name }),
+        }],
+        ..Plan::default()
+    })
+}
+
+/// Whether `actor` is, as the records now hold, an enabled administrator.
+async fn is_admin(db: &Db, actor: &User) -> Result<bool, AccessError> {
+    Ok(db
+        .user(actor.id)
+        .await?
+        .is_some_and(|user| user.is_admin && !user.disabled))
+}
+
 /// The deletion a record belongs to: the entry it was deleted with (its own id for a record
 /// deleted before the recycle bin); `None` for a live record.
 fn deleted_with(record: &TreeRecord) -> Option<Uuid> {
@@ -1636,7 +1945,11 @@ fn stage_of(record: &TreeRecord) -> BinStage {
 /// item its deletion started from.
 async fn bin_record(state: &AppState, id: NodeId) -> Result<TreeRecord, AccessError> {
     let record = git_record(state, id).await?;
-    if record.purged.is_some() || deleted_with(&record) != Some(id.0) {
+    // A deleted site is in no bin: it is restored and purged as a whole.
+    if record.purged.is_some()
+        || deleted_with(&record) != Some(id.0)
+        || record.kind == kind_word(NodeKind::Site)
+    {
         return Err(AccessError::NotFound);
     }
     Ok(record)

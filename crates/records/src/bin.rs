@@ -115,11 +115,11 @@ impl Db {
     }
 
     /// The entry `node` of the recycle bin: `None` unless it is the item a person deleted, not
-    /// purged.
+    /// purged. A deleted site is no entry of any bin (see [`Db::sites_to_purge`]).
     pub async fn bin_state(&self, node: NodeId) -> Result<Option<BinState>, DbError> {
         let row: Option<(Uuid, Option<i16>, OffsetDateTime)> = sqlx::query_as(
             "select site_id, bin_stage, deleted_at from nodes \
-             where id = $1 and deleted_with = id and purged_at is null",
+             where id = $1 and deleted_with = id and purged_at is null and kind <> 'site'",
         )
         .bind(node.0)
         .fetch_optional(self.pool())
@@ -242,7 +242,7 @@ impl Db {
              left join users u on u.id = n.deleted_by \
              left join documents d on d.id = n.id and n.kind = 'document' \
              where n.site_id = $1 and n.deleted_with = n.id and n.purged_at is null \
-               and coalesce(n.bin_stage, 1) = $2 \
+               and n.kind <> 'site' and coalesce(n.bin_stage, 1) = $2 \
                and ($3::timestamptz is null or (n.deleted_at, n.id) < ($3, $4)) \
              order by n.deleted_at desc, n.id desc \
              limit $5",
@@ -292,11 +292,13 @@ impl Db {
     }
 
     /// The entries of every recycle bin due to be purged at `now`: deleted [`BIN_DAYS`] days or
-    /// more before it, oldest first.
+    /// more before it, oldest first. A deleted site is no entry: it is purged as a whole (see
+    /// [`Db::sites_to_purge`]); the entries of its own bin are listed here as any others.
     pub async fn due_for_purge(&self, now: OffsetDateTime) -> Result<Vec<NodeId>, DbError> {
         let ids: Vec<Uuid> = sqlx::query_scalar(
             "select id from nodes \
              where deleted_with = id and purged_at is null and deleted_at <= $1 \
+               and kind <> 'site' \
              order by deleted_at, id",
         )
         .bind(now - Duration::days(BIN_DAYS))

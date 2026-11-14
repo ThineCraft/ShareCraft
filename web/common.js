@@ -39,6 +39,9 @@ const MESSAGES = {
   into_itself: 'A folder cannot be moved into itself or into a folder inside it.',
   wrong_place: 'That cannot go there. Choose a library or a folder.',
   is_site: 'A site cannot be moved, deleted or made to inherit.',
+  site_deleted:
+    'That site is deleted. An administrator can restore it from the Sites page, or purge it.',
+  not_deleted: 'That site is not deleted, so there is nothing to restore or purge.',
   invalid_request: 'That change is not allowed. A file keeps its extension when renamed.',
   unavailable: 'The server is busy or its database is unavailable. Try again in a moment.',
   bad_request: 'The server could not read that request. Reload the page and try again.',

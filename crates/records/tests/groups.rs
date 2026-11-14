@@ -1364,14 +1364,22 @@ async fn upgrade_keeps_everyones_access() {
     let mut expected = vec![admin.id, ann.id];
     expected.sort();
     assert_eq!(owner_ids, expected);
+    // Beta is deleted, so its groups answer as missing (plan 3B); its members are read directly.
     let beta_groups = site_groups(&test, beta).await;
-    let (_, editors) = test
-        .db
-        .group(admin.id, beta_groups.members)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(editors.iter().map(|u| u.id).collect::<Vec<_>>(), [carl.id]);
+    assert!(
+        test.db
+            .group(admin.id, beta_groups.members)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let editors: Vec<Uuid> =
+        sqlx::query_scalar("select user_id from group_members where group_id = $1")
+            .bind(beta_groups.members.0)
+            .fetch_all(test.db.test_pool())
+            .await
+            .unwrap();
+    assert_eq!(editors, [carl.id.0]);
 
     let upgraded: Vec<(Option<Uuid>, serde_json::Value)> = sqlx::query_as(
         "select subject, detail from events where kind = 'group.member_added' order by id",

@@ -13,6 +13,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use collab_core::ids::{DocId, GroupId, NodeId, UserId};
+use protocol::RemovedReason;
 use records::{
     Access, AccessError, AssignmentView, Crumb, Cursor, Db, Editor, LinkKind, Listed, Node,
     NodeKind, Perms, Principal, PrincipalView, RoleRef, User,
@@ -479,6 +480,10 @@ pub(crate) async fn delete_one(state: &AppState, actor: &User, id: NodeId) -> Re
     // Removal is final, so it needs no ordering with other access changes.
     for doc in applied.deleted {
         state.rooms().send_to(doc, AccessChange::Deleted);
+    }
+    // An administrator deleted a whole site: everything under way in it ends.
+    if applied.node.kind == NodeKind::Site {
+        crate::sites::end_site_activity(state, id, RemovedReason::Deleted).await;
     }
     Ok(())
 }

@@ -451,6 +451,26 @@ pub(crate) async fn archive(
     Ok(Json(site_out(&state, &actor, site).await?))
 }
 
+/// `DELETE /api/sites/{id}`: deletes the site (see [`sites::delete`]). Administrators only
+/// (`403`, before anything else); `409 site_deleted` for a deleted site; `404` for anything but
+/// a site. One commit, recorded as `site.deleted`; its editing sessions end and its uploads are
+/// abandoned. Everything in it then answers `404` to everyone; administrators restore or purge
+/// it from `/api/admin/sites`. Answers `204`.
+pub(crate) async fn remove(
+    State(state): State<AppState>,
+    signed: Signed,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let site = node_id(&id)?;
+    let actor = signed.session.user;
+    to_completion(async move {
+        sites::delete(&state, &actor, site).await?;
+        Ok(())
+    })
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// `POST /api/sites/{id}/reactivate`: makes the archived site writable again, with every
 /// permission as it was (see [`sites::reactivate`]). Administrators only (`403`); `404` for
 /// anything but a live site. One commit, recorded as `site.reactivated`; reactivating a site

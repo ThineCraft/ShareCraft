@@ -392,10 +392,11 @@ async fn delete_and_restore_a_library() {
         "{restored:?}"
     );
 
-    // The site itself still cannot be deleted.
+    // The site itself cannot be deleted by its owner (administrators delete whole sites: see
+    // tests/site_lifecycle.rs).
     let (status, _) = w
         .call(
-            &w.root,
+            &w.olive,
             Method::DELETE,
             &format!("/api/nodes/{}", w.site),
             None,

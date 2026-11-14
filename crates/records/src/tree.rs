@@ -19,10 +19,12 @@ use crate::roles::lock_roles;
 use crate::scopes::{
     LOCK_ATTEMPTS, access_with, judged_roles, lock_segment_with, lock_top_down, scopes_of, segment,
 };
-use crate::sites::{SiteSettings, ensure_site_row, upsert_site};
+use crate::sites::{SiteSettings, ensure_site_row, purge_site_rows, upsert_site};
 use crate::{AccessError, Db, DbError, Editor, Perms};
 
 const MAX_NAME_CHARS: usize = 120;
+/// The events of a purge, whose detail gets what the purge gave back.
+const PURGE_EVENTS: [&str; 2] = ["node.purged", "site.purged"];
 const REFUSED_CHARS: [char; 9] = ['"', '*', ':', '<', '>', '?', '/', '\\', '|'];
 
 /// What a node of the tree is.
@@ -100,7 +102,7 @@ pub struct NodeRow {
 impl NodeRow {
     /// The row with the recycle bin state it is stored with: a deleted row written before the
     /// bin is its own entry, in the first stage; only an entry that is not purged has a stage;
-    /// a live row has no bin state.
+    /// a live row has no bin state. A deleted site is in no bin, so it has no stage either.
     #[must_use]
     pub fn normalized(&self) -> NodeRow {
         let mut row = self.clone();
@@ -114,7 +116,7 @@ impl NodeRow {
         if row.deleted_with.is_none() {
             row.deleted_with = Some(row.id);
         }
-        if !top || row.purged_at.is_some() {
+        if !top || row.purged_at.is_some() || row.kind == NodeKind::Site {
             row.bin_stage = None;
         } else if row.bin_stage.is_none() {
             row.bin_stage = Some(1);
@@ -201,6 +203,10 @@ pub struct NodeChange<'a> {
     /// order: chosen before the change so its navigation can aim at them. New random ids when
     /// `None`.
     pub site_group_ids: Option<[Uuid; 3]>,
+    /// The deleted site whose purge this is (every row of it among `rows`, purged): once the
+    /// rows are written, everything else the site owned goes in the same transaction (see
+    /// [`crate::sites::purge_site_rows`]).
+    pub purge_site: Option<NodeId>,
 }
 
 /// Inserts or updates `row`, and for a document node the name of its `documents` row. A site
@@ -250,7 +256,8 @@ async fn upsert_node_with(
         }
         Err(e) => return Err(e.into()),
     }
-    if row.kind == NodeKind::Site {
+    // A purged site keeps no groups and no settings of its own.
+    if row.kind == NodeKind::Site && row.purged_at.is_none() {
         ensure_site_groups(&mut *conn, row.id, group_ids).await?;
         ensure_site_row(&mut *conn, row.id).await?;
     }
@@ -278,12 +285,13 @@ pub(crate) struct Locked {
     usage: UsageChanges,
 }
 
-/// The nodes `change` marks deleted and does not purge, and the sites they are in.
+/// The nodes `change` marks deleted and does not purge, and the sites they are in. A site's own
+/// deletion is left out: it revokes nothing and closes nothing, so that restoring the site
+/// gives everything back as it was.
 fn deleting(change: &NodeChange<'_>) -> (Vec<NodeId>, Vec<NodeId>) {
-    let rows = change
-        .rows
-        .iter()
-        .filter(|row| row.deleted_at.is_some() && row.purged_at.is_none());
+    let rows = change.rows.iter().filter(|row| {
+        row.deleted_at.is_some() && row.purged_at.is_none() && row.kind != NodeKind::Site
+    });
     let nodes = rows.clone().map(|row| row.id).collect();
     let mut sites: Vec<NodeId> = rows.map(|row| row.site).collect();
     sites.sort_unstable();
@@ -350,7 +358,7 @@ pub struct NodesApplied {
     /// The contents the versions of the documents it purged named; nothing in `blob_refs`
     /// names them for those documents any more, so each is erased if nothing else does.
     pub released: Vec<BlobRef>,
-    /// The ids of the `node.purged` events it recorded.
+    /// The ids of the `node.purged` and `site.purged` events it recorded.
     pub purge_events: Vec<i64>,
 }
 
@@ -625,7 +633,7 @@ impl Db {
         let mut done = NodesApplied::default();
         if !purged.is_empty() {
             let gone = after_purge(&mut tx, change.actor, &purged, &locked.purged_links).await?;
-            for event in events.iter_mut().filter(|e| e.kind == "node.purged") {
+            for event in events.iter_mut().filter(|e| PURGE_EVENTS.contains(&e.kind)) {
                 if let Some(detail) = event.detail.as_object_mut() {
                     detail.insert("versions".to_owned(), gone.versions.into());
                     detail.insert("bytes".to_owned(), gone.bytes.into());
@@ -633,8 +641,11 @@ impl Db {
             }
             done.released = gone.contents;
         }
+        if let Some(site) = change.purge_site {
+            purge_site_rows(&mut tx, change.actor, site).await?;
+        }
         for event in events {
-            if event.kind == "node.purged" {
+            if PURGE_EVENTS.contains(&event.kind) {
                 done.purge_events
                     .push(record_with_id(&mut tx, event).await?);
             } else {

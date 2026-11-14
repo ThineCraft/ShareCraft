@@ -50,9 +50,9 @@ pub use roles::{Access, Perms, Principal, RoleDef, RoleRef};
 pub use scopes::{Crumb, Cursor, Listed, NodeAccess};
 pub use settings::{ANYONE_LINK_MAX_DAYS, ANYONE_LINKS, SharingSettings};
 pub use sites::{
-    DEFAULT_LANGUAGE, DEFAULT_TIME_ZONE, GLOBAL_NAVIGATION, NavScope, RegionalDefaults, SiteChange,
-    SiteKind, SiteSettings, TemplateRow, validate_description, validate_language,
-    validate_time_zone,
+    AdminSite, DEFAULT_LANGUAGE, DEFAULT_TIME_ZONE, GLOBAL_NAVIGATION, NavScope, RegionalDefaults,
+    SiteChange, SiteKind, SiteSettings, SiteState, TemplateRow, validate_description,
+    validate_language, validate_time_zone,
 };
 pub use templates::{
     MAX_PACKAGE_BYTES, MAX_TEMPLATE_DEPTH, MAX_TEMPLATE_FOLDERS, MAX_TEMPLATE_LIBRARIES,
