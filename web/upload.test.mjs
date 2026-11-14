@@ -536,6 +536,28 @@ test('a kept session the server no longer has is started afresh', async () => {
   assert.ok(calls.includes('PUT /api/uploads/sess'));
 });
 
+test('a retry while the server is still down keeps the session for the next try', async () => {
+  const server = stubServer();
+  const inner = server.fetch;
+  let down = true;
+  server.fetch = async (url, init = {}) => {
+    if (down) throw new TypeError('connection refused');
+    return inner(url, init);
+  };
+  const [outcome] = await queueFor(server, { attempts: 2 }).run([{ ...fileOf('x.pdf', 10), resumeId: 'sess', parentId: 'lib' }]);
+  assert.equal(outcome.status, 'failed');
+  assert.equal(outcome.keep, true);
+  assert.equal(outcome.retry, true);
+  assert.equal(outcome.sessionId, 'sess');
+  down = false;
+  server.state.size = 10;
+  const [second] = await queueFor(server).run([{ ...outcome.file, resumeId: outcome.sessionId }]);
+  assert.equal(second.status, 'done');
+  const calls = server.log.map((call) => `${call.method} ${call.url}`);
+  assert.equal(calls[0], 'GET /api/uploads/sess');
+  assert.ok(!calls.includes('POST /api/uploads'));
+});
+
 test('a busy server at the finish keeps the session and says so plainly', async () => {
   const server = stubServer({ finish: () => json(503, { error: 'busy' }) });
   const [outcome] = await queueFor(server).run([fileOf('x.pdf', 5)]);

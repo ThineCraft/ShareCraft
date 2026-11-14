@@ -288,14 +288,18 @@ export class UploadQueue {
     let cleaned = null;
     if (id) {
       // A kept session: ask the server how much it holds, then send the rest and finish.
+      // The session id is recorded first, so a failed question keeps it for the next try
+      // and for Clear (which gives the session back).
+      outcome.parentId = file.parentId;
+      outcome.sessionId = id;
       const asked = await this.#call('GET', `/api/uploads/${seg(id)}`);
       if (asked.status === 404) {
         id = null; // it ended on the server (24 h, or a restart that lost it): start afresh
+        outcome.sessionId = undefined;
+        outcome.parentId = undefined;
       } else if (!asked.ok || typeof asked.data?.received !== 'number') {
         throw new Stop(messageFor(asked.error ?? 'network'), true, { keep: true });
       } else {
-        outcome.parentId = file.parentId;
-        outcome.sessionId = id;
         this.#change(outcome, { status: 'uploading', message: '', sent: Math.min(asked.data.received, file.size) });
       }
     }
