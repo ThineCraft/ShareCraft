@@ -61,7 +61,7 @@ pub(crate) struct DirectoryQuery {
 
 /// The sites `user` can see, each with its access and settings (the defaults of a site with
 /// no row).
-async fn visible_sites(
+pub(crate) async fn visible_sites(
     db: &Db,
     user: &User,
 ) -> Result<Vec<(Node, Option<Access>, SiteSettings)>, ApiError> {
@@ -94,7 +94,7 @@ async fn visible_sites(
 /// Whether `access` includes `manage_site`, or on an archived site would include it were the
 /// site not archived: who sees an archived site in the directory and a site's storage. Seeing
 /// is not changing; nobody holds `manage_site` on an archived site.
-fn manages(access: Option<&Access>) -> bool {
+pub(crate) fn manages(access: Option<&Access>) -> bool {
     access.is_some_and(|a| a.ignoring_archive().contains(Perms::MANAGE_SITE))
 }
 
@@ -126,41 +126,54 @@ pub(crate) async fn list(
         .as_deref()
         .map(str::to_lowercase)
         .unwrap_or_default();
-    let sites = visible_sites(state.db(), &signed.session.user).await?;
+    Ok(Json(
+        directory(state.db(), &signed.session.user, &needle, hub, kind).await?,
+    ))
+}
+
+/// The site directory for `user` (see [`list`]): the sites they can see whose name contains
+/// `needle` (lower-cased), that joined `hub` if given (none when they cannot see the hub), of
+/// `kind` if given; an archived site only to people who manage it.
+pub(crate) async fn directory(
+    db: &Db,
+    user: &User,
+    needle: &str,
+    hub: Option<NodeId>,
+    kind: Option<SiteKind>,
+) -> Result<Vec<SiteSummary>, ApiError> {
+    let sites = visible_sites(db, user).await?;
     let names: HashMap<NodeId, String> = sites
         .iter()
         .map(|(node, _, _)| (node.id, node.name.clone()))
         .collect();
     // A hub the caller cannot see is not confirmed by listing the sites that joined it.
     if hub.is_some_and(|hub| !names.contains_key(&hub)) {
-        return Ok(Json(Vec::new()));
+        return Ok(Vec::new());
     }
-    Ok(Json(
-        sites
-            .into_iter()
-            .filter(|(node, access, settings)| {
-                (settings.archived_at.is_none() || manages(access.as_ref()))
-                    && node.name.to_lowercase().contains(&needle)
-                    && kind.is_none_or(|kind| settings.kind == kind)
-                    && hub.is_none_or(|hub| settings.joined_hub == Some(hub))
-            })
-            .map(|(node, access, settings)| SiteSummary {
-                id: node.id.0.to_string(),
-                hub: settings.joined_hub.and_then(|hub| {
-                    names.get(&hub).map(|name| SiteName {
-                        id: hub.0.to_string(),
-                        name: name.clone(),
-                    })
-                }),
-                name: node.name,
-                access,
-                kind: settings.kind.as_str(),
-                description: settings.description,
-                is_hub: settings.is_hub,
-                archived: settings.archived_at.is_some(),
-            })
-            .collect(),
-    ))
+    Ok(sites
+        .into_iter()
+        .filter(|(node, access, settings)| {
+            (settings.archived_at.is_none() || manages(access.as_ref()))
+                && node.name.to_lowercase().contains(needle)
+                && kind.is_none_or(|kind| settings.kind == kind)
+                && hub.is_none_or(|hub| settings.joined_hub == Some(hub))
+        })
+        .map(|(node, access, settings)| SiteSummary {
+            id: node.id.0.to_string(),
+            hub: settings.joined_hub.and_then(|hub| {
+                names.get(&hub).map(|name| SiteName {
+                    id: hub.0.to_string(),
+                    name: name.clone(),
+                })
+            }),
+            name: node.name,
+            access,
+            kind: settings.kind.as_str(),
+            description: settings.description,
+            is_hub: settings.is_hub,
+            archived: settings.archived_at.is_some(),
+        })
+        .collect())
 }
 
 /// The body of `POST /api/sites`.
@@ -278,7 +291,11 @@ pub(crate) async fn show(
 }
 
 /// The site `site` as `GET /api/sites/{id}` answers it for `user`.
-async fn site_out(state: &AppState, user: &User, site: NodeId) -> Result<Value, ApiError> {
+pub(crate) async fn site_out(
+    state: &AppState,
+    user: &User,
+    site: NodeId,
+) -> Result<Value, ApiError> {
     let db = state.db();
     let sites = visible_sites(db, user).await?;
     let hub_name = |hub: NodeId| {

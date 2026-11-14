@@ -1,7 +1,8 @@
 //! Sites' own settings: changing them (one Git commit with the site's renamed tree record when
 //! the name changes too, then mirrored into PostgreSQL, taken back if refused), archiving and
-//! reactivating a site, ending everything under way in a site, and the start-up reconcile of
-//! the site records, saved templates and global navigation with Git.
+//! reactivating a site, ending everything under way in a site, hubs (registering and
+//! unregistering one, joining and leaving one), a site's own and the global navigation, and the
+//! start-up reconcile of the site records, saved templates and global navigation with Git.
 //!
 //! A site created before site records has no record in Git: it reads as a team site with no
 //! description and the organisation's default language and time zone, and its record is
@@ -15,12 +16,13 @@ use std::sync::atomic::Ordering;
 use collab_core::ids::{NodeId, UserId};
 use protocol::RemovedReason;
 use records::{
-    AccessError, Db, DbError, NewEvent, NodeKind, Perms, RegionalDefaults, SiteChange, SiteKind,
-    SiteSettings, SiteState, TemplateRow, User, validate_description, validate_language,
-    validate_node_name, validate_time_zone,
+    AccessError, Db, DbError, NavScope, NewEvent, NodeKind, Perms, RegionalDefaults, SiteChange,
+    SiteKind, SiteSettings, SiteState, SitesMirror, TemplateRow, User, validate_description,
+    validate_language, validate_node_name, validate_time_zone,
 };
 use revisions::{
-    CheckpointError, GitError, OrgNavigation, SITE_SCHEMA, SiteRecord, Stamp, TemplateRecord,
+    CheckpointError, GitError, HubRecord, NavItem, OrgNavigation, SITE_SCHEMA, SiteRecord, Stamp,
+    TemplateRecord,
 };
 use serde_json::{Map, json};
 use time::OffsetDateTime;
@@ -33,7 +35,7 @@ use crate::checkpoint::Checkpointer;
 use crate::room::AccessChange;
 use crate::tree::{
     TreeError, Undo, author_of, ensure_in_step, git_failure, git_record, now_text, repair_ids,
-    require, take_back_all, to_row, visible, write_sites,
+    require, take_back_all, to_row, visible, write_records, write_sites,
 };
 
 /// What a person asks to change of a site: each field given is set.
@@ -501,7 +503,7 @@ pub async fn delete(state: &AppState, actor: &User, site: NodeId) -> Result<(), 
 /// Every site whose record in Git names `hub` as the hub it joined, each as it is (first) and
 /// with `joined_hub` cleared (second): what a commit that releases the hub's members writes,
 /// with their rows cleared in the same transaction (`records`' `release_hub_rows`). Purging a
-/// hub releases them; so will unregistering one. A store that keeps no site records has none.
+/// hub releases them, and so does unregistering one ([`unregister_hub`]). A store that keeps no site records has none.
 ///
 /// # Errors
 /// The Git error, as a database error.
@@ -757,4 +759,498 @@ pub async fn reconcile(store: Arc<dyn Checkpointer>, db: &Db) -> Result<SitesRep
         report.updated = report.updated.saturating_add(1);
     }
     Ok(report)
+}
+
+/// The record of `site` in Git (`None` if it has none), and the record a change starts from:
+/// that one, or for a site with none a new record with the organisation's defaults.
+async fn record_and_start(
+    state: &AppState,
+    site: NodeId,
+) -> Result<(Option<SiteRecord>, SiteRecord), AccessError> {
+    let stored = read_site_record(state.checkpointer(), site)
+        .await
+        .map_err(git_failure)?;
+    let start = match &stored {
+        Some(record) => record.clone(),
+        None => new_site_record(site, &state.db().regional_defaults().await?),
+    };
+    Ok((stored, start))
+}
+
+/// The live site `site` as `actor` sees it, with their access: `NotFound` unless it is a site
+/// they can see that is not deleted.
+async fn seen_site(
+    state: &AppState,
+    actor: &User,
+    site: NodeId,
+) -> Result<(records::Node, records::Access), AccessError> {
+    let (node, access) = visible(state.db(), actor, site).await?;
+    if node.kind != NodeKind::Site || node.deleted {
+        return Err(AccessError::NotFound);
+    }
+    Ok((node, access))
+}
+
+/// `Ok` if `actor` is an enabled administrator; otherwise the refusal of an administrators'
+/// route on `site`: `Archived` when they can see the site and it is archived, `Forbidden`
+/// otherwise.
+async fn admin_on(db: &Db, actor: &User, site: NodeId) -> Result<(), AccessError> {
+    if db
+        .user(actor.id)
+        .await?
+        .is_some_and(|u| u.is_admin && !u.disabled)
+    {
+        return Ok(());
+    }
+    Err(match db.effective_access(actor.id, site).await? {
+        Some(access) => access.refusal(),
+        None => AccessError::Forbidden,
+    })
+}
+
+/// A change of site records: each changed site's record as Git held it (`None` if it had
+/// none) and as it is to be, with what its mirror must judge and record.
+struct SitesCommit {
+    /// The commit message.
+    message: String,
+    /// Each site's record before (`None` if Git had none) and after.
+    changed: Vec<(Option<SiteRecord>, SiteRecord)>,
+    /// Whether the actor must be an enabled administrator.
+    needs_admin: bool,
+    /// Nodes the actor must hold the given permissions on.
+    needs: Vec<(NodeId, Perms)>,
+    /// Sites whose rows are locked too, unchanged.
+    also_lock: Vec<NodeId>,
+    /// A hub whose members leave it.
+    release_hub: Option<NodeId>,
+    /// The events recorded with the change.
+    events: Vec<NewEvent>,
+}
+
+/// Writes `commit`'s site records as one Git commit by `actor`, then mirrors them into
+/// PostgreSQL, judged again there; a refused change is taken back by a second commit, and a
+/// database failure after judging is repaired from Git or leaves the tree marked out of step.
+/// The caller holds the tree lock.
+async fn commit_sites(
+    state: &AppState,
+    actor: &User,
+    commit: SitesCommit,
+) -> Result<(), AccessError> {
+    let author = author_of(actor);
+    let after: Vec<SiteRecord> = commit.changed.iter().map(|(_, a)| a.clone()).collect();
+    let ids: Vec<NodeId> = after.iter().map(|r| NodeId(r.id)).collect();
+    let settings: Vec<SiteSettings> = after
+        .iter()
+        .map(settings_of)
+        .collect::<Result<_, _>>()
+        .map_err(DbError::new)?;
+    let store = state.checkpointer();
+    write_sites(
+        store,
+        author.clone(),
+        commit.message.clone(),
+        Vec::new(),
+        after,
+        Vec::new(),
+    )
+    .await
+    .map_err(git_failure)?;
+    let undo = Undo {
+        sites: commit
+            .changed
+            .iter()
+            .filter_map(|(before, _)| before.clone())
+            .collect(),
+        removed_sites: commit
+            .changed
+            .iter()
+            .filter(|(before, _)| before.is_none())
+            .map(|(_, after)| after.id)
+            .collect(),
+        ..Undo::default()
+    };
+    let applied = state
+        .db()
+        .apply_sites_mirror(SitesMirror {
+            settings: &settings,
+            actor: actor.id,
+            needs_admin: commit.needs_admin,
+            needs: &commit.needs,
+            also_lock: &commit.also_lock,
+            release_hub: commit.release_hub,
+            events: commit.events,
+        })
+        .await;
+    match applied {
+        Ok(()) => Ok(()),
+        Err(AccessError::Db(error)) => {
+            eprintln!(
+                "sharecraft-server: {} is in Git but not in the database: {error}",
+                commit.message
+            );
+            if !repair_sites(state, &ids).await {
+                state.tree_out_of_step().store(true, Ordering::SeqCst);
+            }
+            Err(AccessError::Db(error))
+        }
+        Err(refused) => {
+            if let AccessError::Unjudged(error) = &refused {
+                eprintln!(
+                    "sharecraft-server: {} could not be judged, so it is taken back: {error}",
+                    commit.message
+                );
+            }
+            if !take_back_all(state, author, &commit.message, undo).await {
+                state.tree_out_of_step().store(true, Ordering::SeqCst);
+            }
+            Err(refused)
+        }
+    }
+}
+
+/// One event about `site` by `actor`.
+fn site_event(
+    kind: &'static str,
+    actor: &User,
+    site: NodeId,
+    detail: serde_json::Value,
+) -> NewEvent {
+    NewEvent {
+        kind,
+        actor: Some(actor.id),
+        subject: None,
+        document: None,
+        node: Some(site),
+        detail,
+    }
+}
+
+/// Makes `site` a hub with the navigation bar `navigation`, or changes the bar of a hub, for
+/// `actor`, an enabled administrator. One sites commit, mirrored with `hub.registered` the
+/// first time and `navigation.changed` (`"which": "hub"`) after; the same bar again changes
+/// nothing. The bar is checked by [`Db::validate_navigation`] and `actor` must be able to view
+/// every node it targets ([`Db::check_navigation_saver`]).
+///
+/// # Errors
+/// `Forbidden` for anyone else (`Archived` for them on an archived site they can see);
+/// `NotFound` unless `site` is a live site; `Archived` on an archived site; `IsHub` for a site
+/// that joined a hub; `InvalidNavigation`; `OutOfStep`; otherwise the Git or database error.
+pub async fn set_hub(
+    state: &AppState,
+    actor: &User,
+    site: NodeId,
+    navigation: Vec<NavItem>,
+) -> Result<(), AccessError> {
+    let _turn = state.tree_lock().lock().await;
+    ensure_in_step(state).await?;
+    let db = state.db();
+    admin_on(db, actor, site).await?;
+    let (node, access) = seen_site(state, actor, site).await?;
+    if access.archived() {
+        return Err(AccessError::Archived);
+    }
+    db.validate_navigation(&navigation, NavScope::Hub).await?;
+    db.check_navigation_saver(actor.id, &navigation).await?;
+    let (stored, before) = record_and_start(state, site).await?;
+    if before.joined_hub.is_some() {
+        return Err(AccessError::IsHub);
+    }
+    let wanted = HubRecord { navigation };
+    if before.hub.as_ref() == Some(&wanted) {
+        return Ok(());
+    }
+    let event = if before.hub.is_none() {
+        site_event("hub.registered", actor, site, json!({ "name": node.name }))
+    } else {
+        site_event(
+            "navigation.changed",
+            actor,
+            site,
+            json!({ "which": "hub", "name": node.name }),
+        )
+    };
+    let mut after = before;
+    after.hub = Some(wanted);
+    commit_sites(
+        state,
+        actor,
+        SitesCommit {
+            message: format!("Set the hub navigation of {}", node.name),
+            changed: vec![(stored, after)],
+            needs_admin: true,
+            needs: Vec::new(),
+            also_lock: Vec::new(),
+            release_hub: None,
+            events: vec![event],
+        },
+    )
+    .await
+}
+
+/// Unregisters the hub `site` for `actor`, an enabled administrator: one sites commit writing
+/// its record with no hub and every member's with no joined hub, mirrored with
+/// `hub.unregistered` and `hub.left` (`"released": true`) for each member.
+///
+/// # Errors
+/// As [`set_hub`], with `NotAHub` for a site that is not a hub.
+pub async fn unregister_hub(
+    state: &AppState,
+    actor: &User,
+    site: NodeId,
+) -> Result<(), AccessError> {
+    let _turn = state.tree_lock().lock().await;
+    ensure_in_step(state).await?;
+    let db = state.db();
+    admin_on(db, actor, site).await?;
+    let (node, access) = seen_site(state, actor, site).await?;
+    if access.archived() {
+        return Err(AccessError::Archived);
+    }
+    let (stored, before) = record_and_start(state, site).await?;
+    if before.hub.is_none() {
+        return Err(AccessError::NotAHub);
+    }
+    let members = released_members(state, site).await?;
+    let mut after = before;
+    after.hub = None;
+    let mut changed = vec![(stored, after)];
+    changed.extend(members.into_iter().map(|(b, a)| (Some(b), a)));
+    commit_sites(
+        state,
+        actor,
+        SitesCommit {
+            message: format!("Unregister hub {}", node.name),
+            changed,
+            needs_admin: true,
+            needs: Vec::new(),
+            also_lock: Vec::new(),
+            release_hub: Some(site),
+            events: vec![site_event(
+                "hub.unregistered",
+                actor,
+                site,
+                json!({ "name": node.name }),
+            )],
+        },
+    )
+    .await
+}
+
+/// Joins `site` to the hub `hub`, or with `None` leaves the hub it joined, for `actor`, who
+/// needs `manage_site` on the site and `view` on the hub. Joining never changes anyone's
+/// access. One sites commit, mirrored with `hub.left` for a hub left and `hub.joined` for the
+/// one joined, both site rows locked, lower id first; the same hub again changes nothing.
+///
+/// # Errors
+/// `NotFound` unless `site` is a live site `actor` can see, or `hub` one they can view;
+/// `Forbidden` (`Archived` on an archived site) without `manage_site`; `IsHub` when `site` is
+/// a hub; `NotAHub` when `hub` is not one; `OutOfStep`; otherwise the Git or database error.
+pub async fn join_hub(
+    state: &AppState,
+    actor: &User,
+    site: NodeId,
+    hub: Option<NodeId>,
+) -> Result<(), AccessError> {
+    let _turn = state.tree_lock().lock().await;
+    ensure_in_step(state).await?;
+    let (node, access) = seen_site(state, actor, site).await?;
+    require(&access, Perms::MANAGE_SITE)?;
+    let (stored, before) = record_and_start(state, site).await?;
+    if before.joined_hub == hub.map(|h| h.0) {
+        return Ok(());
+    }
+    let mut events = Vec::new();
+    if let Some(old) = before.joined_hub {
+        events.push(site_event(
+            "hub.left",
+            actor,
+            site,
+            json!({ "name": node.name, "hub": old }),
+        ));
+    }
+    let mut needs = vec![(site, Perms::MANAGE_SITE)];
+    if let Some(hub) = hub {
+        let (hub_node, hub_access) = seen_site(state, actor, hub).await?;
+        if !hub_access.perms.contains(Perms::VIEW) {
+            return Err(AccessError::NotFound);
+        }
+        if before.hub.is_some() {
+            return Err(AccessError::IsHub);
+        }
+        let (hub_record, _) = record_and_start(state, hub).await?;
+        if hub_record.is_none_or(|record| record.hub.is_none()) {
+            return Err(AccessError::NotAHub);
+        }
+        needs.push((hub, Perms::VIEW));
+        events.push(site_event(
+            "hub.joined",
+            actor,
+            site,
+            json!({ "name": node.name, "hub": hub.0, "hub_name": hub_node.name }),
+        ));
+    }
+    let mut after = before;
+    after.joined_hub = hub.map(|h| h.0);
+    commit_sites(
+        state,
+        actor,
+        SitesCommit {
+            message: match hub {
+                Some(_) => format!("Join {} to a hub", node.name),
+                None => format!("{} leaves its hub", node.name),
+            },
+            changed: vec![(stored, after)],
+            needs_admin: false,
+            needs,
+            also_lock: hub.into_iter().collect(),
+            release_hub: None,
+            events,
+        },
+    )
+    .await
+}
+
+/// Sets `site`'s own navigation to `items`, or with `None` makes it automatic (every library
+/// of the site, by name), for `actor`, who needs `manage_site` on it. The items are checked by
+/// [`Db::validate_navigation`] (node targets in the site itself) and `actor` must be able to
+/// view every node they target. One sites commit, mirrored with `navigation.changed`
+/// (`"which": "local"`); the same navigation again changes nothing.
+///
+/// # Errors
+/// `NotFound` unless `site` is a live site `actor` can see; `Forbidden` (`Archived` on an
+/// archived site) without `manage_site`; `InvalidNavigation`; `OutOfStep`; otherwise the Git
+/// or database error.
+pub async fn set_navigation(
+    state: &AppState,
+    actor: &User,
+    site: NodeId,
+    items: Option<Vec<NavItem>>,
+) -> Result<(), AccessError> {
+    let _turn = state.tree_lock().lock().await;
+    ensure_in_step(state).await?;
+    let db = state.db();
+    let (node, access) = seen_site(state, actor, site).await?;
+    require(&access, Perms::MANAGE_SITE)?;
+    if let Some(items) = &items {
+        db.validate_navigation(items, NavScope::Local(site)).await?;
+        db.check_navigation_saver(actor.id, items).await?;
+    }
+    let (stored, before) = record_and_start(state, site).await?;
+    if before.navigation == items {
+        return Ok(());
+    }
+    let mut after = before;
+    after.navigation = items;
+    commit_sites(
+        state,
+        actor,
+        SitesCommit {
+            message: format!("Change the navigation of {}", node.name),
+            changed: vec![(stored, after)],
+            needs_admin: false,
+            needs: vec![(site, Perms::MANAGE_SITE)],
+            also_lock: Vec::new(),
+            release_hub: None,
+            events: vec![site_event(
+                "navigation.changed",
+                actor,
+                site,
+                json!({ "which": "local", "name": node.name }),
+            )],
+        },
+    )
+    .await
+}
+
+/// Sets the organisation's global navigation to `items` for `actor`, an enabled
+/// administrator: one sites commit writing `org/navigation.json`, mirrored with
+/// `navigation.changed` (`"which": "global"`), taken back if refused. The items are checked by
+/// [`Db::validate_navigation`] and `actor` must be able to view every node they target. The
+/// same navigation again changes nothing.
+///
+/// # Errors
+/// `Forbidden` for anyone else; `InvalidNavigation`; `OutOfStep`; otherwise the Git or
+/// database error.
+pub async fn set_global_navigation(
+    state: &AppState,
+    actor: &User,
+    items: Vec<NavItem>,
+) -> Result<(), AccessError> {
+    let _turn = state.tree_lock().lock().await;
+    ensure_in_step(state).await?;
+    let db = state.db();
+    if !db
+        .user(actor.id)
+        .await?
+        .is_some_and(|u| u.is_admin && !u.disabled)
+    {
+        return Err(AccessError::Forbidden);
+    }
+    db.validate_navigation(&items, NavScope::Global).await?;
+    db.check_navigation_saver(actor.id, &items).await?;
+    let store = Arc::clone(state.checkpointer());
+    let stored = tokio::task::spawn_blocking(move || store.read_org_navigation())
+        .await
+        .map_err(|e| git_failure(CheckpointError::Git(GitError::new(e))))?
+        .map_err(git_failure)?;
+    let before = stored.unwrap_or(OrgNavigation {
+        schema: SITE_SCHEMA,
+        navigation: Vec::new(),
+    });
+    if before.navigation == items {
+        return Ok(());
+    }
+    let after = OrgNavigation {
+        schema: SITE_SCHEMA,
+        navigation: items.clone(),
+    };
+    let author = author_of(actor);
+    let message = "Change the global navigation".to_owned();
+    write_records(
+        state.checkpointer(),
+        author.clone(),
+        message.clone(),
+        Undo {
+            org_navigation: Some(after),
+            ..Undo::default()
+        },
+    )
+    .await
+    .map_err(git_failure)?;
+    let event = NewEvent {
+        kind: "navigation.changed",
+        actor: Some(actor.id),
+        subject: None,
+        document: None,
+        node: None,
+        detail: json!({ "which": "global" }),
+    };
+    match db.apply_global_navigation_by(actor.id, &items, event).await {
+        Ok(()) => Ok(()),
+        Err(AccessError::Db(error)) => {
+            eprintln!(
+                "sharecraft-server: the global navigation is in Git but not in the database: \
+                 {error}"
+            );
+            // The next change reconciles the global navigation with Git (see `ensure_in_step`).
+            state.tree_out_of_step().store(true, Ordering::SeqCst);
+            Err(AccessError::Db(error))
+        }
+        Err(refused) => {
+            if let AccessError::Unjudged(error) = &refused {
+                eprintln!(
+                    "sharecraft-server: a change of the global navigation could not be judged, \
+                     so it is taken back: {error}"
+                );
+            }
+            let undo = Undo {
+                org_navigation: Some(before),
+                ..Undo::default()
+            };
+            if !take_back_all(state, author, &message, undo).await {
+                state.tree_out_of_step().store(true, Ordering::SeqCst);
+            }
+            Err(refused)
+        }
+    }
 }

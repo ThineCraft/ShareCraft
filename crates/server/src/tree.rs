@@ -21,8 +21,8 @@ use records::{
     validate_node_name, validate_template_body, validate_time_zone,
 };
 use revisions::{
-    Author, BlobRef, Checkpoint, CheckpointError, Content, GitError, SITE_SCHEMA, SiteRecord,
-    SitesChange, Stamp, TemplateBody, TemplateFolder, TemplateLibrary, TemplateNavItem,
+    Author, BlobRef, Checkpoint, CheckpointError, Content, GitError, OrgNavigation, SITE_SCHEMA,
+    SiteRecord, SitesChange, Stamp, TemplateBody, TemplateFolder, TemplateLibrary, TemplateNavItem,
     TemplateRecord, TreeChange, TreeMove, TreeRecord,
 };
 use serde_json::{Map, Value, json};
@@ -177,8 +177,8 @@ pub(crate) struct PendingUndo {
 }
 
 /// What takes a change back, written as one commit: tree records, site records, sites whose
-/// record is removed (their creation taken back), saved templates put back, and templates
-/// whose record is removed (their saving taken back).
+/// record is removed (their creation taken back), saved templates put back, templates whose
+/// record is removed (their saving taken back), and the global navigation put back.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Undo {
     pub(crate) records: Vec<TreeRecord>,
@@ -186,6 +186,8 @@ pub(crate) struct Undo {
     pub(crate) removed_sites: Vec<Uuid>,
     pub(crate) templates: Vec<TemplateRecord>,
     pub(crate) removed_templates: Vec<Uuid>,
+    /// The global navigation put back.
+    pub(crate) org_navigation: Option<OrgNavigation>,
 }
 
 /// A new site's shape and settings: what a template makes, with the fields given at creation
@@ -1321,6 +1323,7 @@ async fn write_undo(state: &AppState, pending: &PendingUndo) -> Result<(), Check
         && undo.removed_sites.is_empty()
         && undo.templates.is_empty()
         && undo.removed_templates.is_empty()
+        && undo.org_navigation.is_none()
     {
         return write_tree(
             state.checkpointer(),
@@ -2803,6 +2806,7 @@ pub(crate) async fn write_records(
         change.removed_sites = &records.removed_sites;
         change.templates = &records.templates;
         change.removed_templates = &records.removed_templates;
+        change.org_navigation = records.org_navigation.as_ref();
         store.write_sites(&change).map(|_| ())
     })
     .await

@@ -217,6 +217,13 @@ pub enum AccessError {
     /// The site is not deleted, so it cannot be restored or purged.
     #[error("that site is not deleted")]
     NotDeleted,
+    /// The site is not a hub, so it cannot be joined or unregistered.
+    #[error("that site is not a hub")]
+    NotAHub,
+    /// A hub cannot join a hub, and a site that joined a hub cannot become one: hubs are one
+    /// level deep.
+    #[error("a hub cannot join a hub")]
+    IsHub,
     /// The site has no room left under its storage quota for what would be stored.
     #[error("the site's storage quota would be exceeded")]
     QuotaExceeded,

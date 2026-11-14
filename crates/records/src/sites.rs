@@ -689,7 +689,7 @@ pub struct AdminSite {
 /// Clears the hub `hub` from every site that joined it (`joined_hub`), recording `hub.left` by
 /// `actor` for each with `{"hub", "released": true}`. The caller has locked the rows of those
 /// sites and writes their records, cleared the same way, in the same commit (see
-/// `server::sites::released_members`). Purging a hub does this; so will unregistering one.
+/// `server::sites::released_members`). Purging a hub does this, and so does unregistering one.
 /// Answers the sites it cleared, by id.
 pub(crate) async fn release_hub_rows(
     conn: &mut PgConnection,

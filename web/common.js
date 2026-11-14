@@ -42,6 +42,9 @@ const MESSAGES = {
   site_deleted:
     'That site is deleted. An administrator can restore it from the Sites page, or purge it.',
   not_deleted: 'That site is not deleted, so there is nothing to restore or purge.',
+  not_a_hub: 'That site is not a hub. An administrator can make it one first.',
+  is_hub:
+    'A hub cannot join another hub, and a site that has joined a hub cannot become one. Leave the hub first.',
   invalid_request: 'That change is not allowed. A file keeps its extension when renamed.',
   unavailable: 'The server is busy or its database is unavailable. Try again in a moment.',
   bad_request: 'The server could not read that request. Reload the page and try again.',

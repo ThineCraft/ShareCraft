@@ -13,6 +13,7 @@ mod events;
 mod explorer;
 mod groups;
 mod links;
+mod navigation;
 mod quotas;
 mod requests;
 mod revisions;
@@ -41,6 +42,7 @@ pub use explorer::{
 };
 pub use groups::{Group, SiteGroup};
 pub use links::{AnyoneGrant, Link, LinkError, LinkKind, LinkToken};
+pub use navigation::{NavViewer, ResolvedItem, ResolvedTarget, SitesMirror};
 pub use quotas::{QUOTA_WARNING_PERCENT, QuotaError, Reservation, SiteUsage};
 pub use requests::{
     AccessRequest, MyRequest, REQUEST_MESSAGE_MAX, REQUESTS_PER_DAY, RequestDecision, RequestError,

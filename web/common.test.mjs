@@ -174,6 +174,8 @@ test('every error code of the tree and access routes has its own sentence', () =
     'archived',
     'site_deleted',
     'not_deleted',
+    'not_a_hub',
+    'is_hub',
   ]) {
     assert.notEqual(messageFor(code), general, code);
   }

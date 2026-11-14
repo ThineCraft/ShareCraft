@@ -616,6 +616,23 @@ async fn archived_site_refuses_every_write() {
                 format!("/api/sites/{site}/quota"),
                 Some(json!({ "bytes": 1_000_000 })),
             ),
+            // Hubs and navigation.
+            write(
+                Method::PUT,
+                format!("/api/sites/{site}/hub"),
+                Some(json!({ "navigation": [] })),
+            ),
+            write(Method::DELETE, format!("/api/sites/{site}/hub"), None),
+            write(
+                Method::PUT,
+                format!("/api/sites/{site}/joined-hub"),
+                Some(json!({ "hub": other })),
+            ),
+            write(
+                Method::PUT,
+                format!("/api/sites/{site}/navigation"),
+                Some(json!({ "items": [] })),
+            ),
             write(
                 Method::POST,
                 format!("/api/nodes/{site}/children"),

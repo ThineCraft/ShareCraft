@@ -9,6 +9,7 @@ mod docs;
 mod explorer;
 mod groups;
 mod links;
+mod navigation;
 pub(crate) mod nodes;
 mod requests;
 mod roles;
@@ -59,6 +60,27 @@ pub(crate) fn router() -> Router<AppState> {
         .route("/sites/{id}/archive", post(sites::archive))
         .route("/sites/{id}/reactivate", post(sites::reactivate))
         .route("/sites/{id}/groups", get(sites::groups))
+        .route(
+            "/sites/{id}/hub",
+            put(navigation::set_hub)
+                .delete(navigation::unregister_hub)
+                .layer(DefaultBodyLimit::max(navigation::MAX_NAVIGATION_BODY)),
+        )
+        .route("/sites/{id}/joined-hub", put(navigation::join_hub))
+        .route(
+            "/sites/{id}/navigation",
+            get(navigation::site)
+                .put(navigation::set_site)
+                .layer(DefaultBodyLimit::max(navigation::MAX_NAVIGATION_BODY)),
+        )
+        .route(
+            "/navigation",
+            get(navigation::global)
+                .put(navigation::set_global)
+                .layer(DefaultBodyLimit::max(navigation::MAX_NAVIGATION_BODY)),
+        )
+        .route("/hubs", get(navigation::hubs))
+        .route("/hubs/{id}/sites", get(navigation::hub_sites))
         .route("/sites/{id}/template", post(templates::save))
         .route("/templates", get(templates::list))
         .route(
@@ -220,6 +242,10 @@ pub(crate) enum ApiError {
     SiteDeleted,
     /// 409: the site is not deleted, so it cannot be restored or purged.
     NotDeleted,
+    /// 409: the site is not a hub, so it cannot be joined or unregistered.
+    NotAHub,
+    /// 409: a hub cannot join a hub, and a site that joined a hub cannot become one.
+    IsHub,
     /// 409: one administrator must stay enabled.
     LastAdmin,
     /// 422: a well-formed request with a value that makes no sense, such as an unknown role or
@@ -324,6 +350,8 @@ impl ApiError {
             ApiError::IsSite => (StatusCode::BAD_REQUEST, "is_site"),
             ApiError::SiteDeleted => (StatusCode::CONFLICT, "site_deleted"),
             ApiError::NotDeleted => (StatusCode::CONFLICT, "not_deleted"),
+            ApiError::NotAHub => (StatusCode::CONFLICT, "not_a_hub"),
+            ApiError::IsHub => (StatusCode::CONFLICT, "is_hub"),
             ApiError::LastAdmin => (StatusCode::CONFLICT, "last_admin"),
             ApiError::InvalidRequest => (StatusCode::UNPROCESSABLE_ENTITY, "invalid_request"),
             ApiError::InvalidName => (StatusCode::UNPROCESSABLE_ENTITY, "invalid_name"),
@@ -400,6 +428,8 @@ impl From<AccessError> for ApiError {
             AccessError::IsSite => ApiError::IsSite,
             AccessError::SiteDeleted => ApiError::SiteDeleted,
             AccessError::NotDeleted => ApiError::NotDeleted,
+            AccessError::NotAHub => ApiError::NotAHub,
+            AccessError::IsHub => ApiError::IsHub,
             AccessError::QuotaExceeded => ApiError::QuotaExceeded,
             // The server picks a fresh random id, so a clash is not the caller's doing.
             AccessError::Exists | AccessError::Db(_) | AccessError::Unjudged(_) => {
