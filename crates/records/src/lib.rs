@@ -20,6 +20,7 @@ mod settings;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 mod tree;
+mod uploads;
 
 pub use accounts::{
     AccountError, NewUser, SESSION_LIFETIME, Session, SessionToken, SignInError, User,
@@ -43,3 +44,4 @@ pub use roles::{Access, Perms, Principal, RoleDef, RoleRef};
 pub use scopes::{Crumb, Cursor, Listed, NodeAccess};
 pub use settings::{ANYONE_LINK_MAX_DAYS, ANYONE_LINKS, SharingSettings};
 pub use tree::{Node, NodeChange, NodeKind, NodeRow, validate_node_name};
+pub use uploads::{NewUpload, UPLOADS_PER_PERSON, UploadError, UploadSession, UploadTarget};

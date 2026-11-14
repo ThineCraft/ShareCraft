@@ -40,12 +40,14 @@ use revisions::{BlobStore, RevisionStore};
 use tokio::net::TcpListener;
 use tower_http::services::ServeDir;
 
+pub use api::uploads::uploads_path;
 pub use blobs::blobs_path;
 pub use checkpoint::{Checkpointer, library_path};
 pub use config::{Config, ConfigError};
 pub use links::sweep_once;
 pub use projection::{BlobReport, Report, rebuild, reconcile, reconcile_blobs};
 
+use api::uploads::Uploads;
 use auth::Throttle;
 use blobs::Blobs;
 use checkpoint::Timing;
@@ -65,6 +67,8 @@ struct Shared {
     rooms: Arc<Rooms>,
     checkpointer: Arc<dyn Checkpointer>,
     blobs: Arc<Blobs>,
+    /// The upload sessions' part files and running hashes.
+    uploads: Arc<Uploads>,
     db: Db,
     editors: Editors,
     events: EventSink,
@@ -92,12 +96,14 @@ impl AppState {
         db: Db,
     ) -> Self {
         let editors_dir = config.editors_dir.clone();
+        let uploads_dir = uploads_path(&config.data_dir);
         Self {
             shared: Arc::new(Shared {
                 config,
                 rooms: Arc::new(Rooms::default()),
                 checkpointer,
                 blobs: Arc::new(Blobs::new(blobs)),
+                uploads: Arc::new(Uploads::new(uploads_dir)),
                 events: EventSink::start(db.clone()),
                 editors: Editors::load(&editors_dir),
                 db,
@@ -134,6 +140,10 @@ impl AppState {
 
     fn blobs(&self) -> &Arc<Blobs> {
         &self.shared.blobs
+    }
+
+    fn uploads(&self) -> &Arc<Uploads> {
+        &self.shared.uploads
     }
 
     fn events(&self) -> &EventSink {

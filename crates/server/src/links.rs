@@ -313,9 +313,10 @@ async fn text(
 /// Revokes, as the server and for the reason `expired`, every live link whose expiry is at or
 /// before `now`, one link per transaction exactly as a manager would revoke it, rechecking the
 /// open documents below each signed-in link's assignments before the next; then forgets the
-/// requests for access submitted more than a day before `now`, and settles from Git the content
-/// claims pending for more than an hour. Logs one line if it revoked anything, and answers how
-/// many links it revoked. A database failure is logged and skipped:
+/// requests for access submitted more than a day before `now`, settles from Git the content
+/// claims pending for more than an hour, and ends the upload sessions that have received
+/// nothing for a day (see [`crate::api::uploads::sweep_uploads`]). Logs one line if it revoked
+/// anything, and answers how many links it revoked. A database failure is logged and skipped:
 /// the next sweep tries again.
 pub async fn sweep_once(state: &AppState, now: OffsetDateTime) -> usize {
     let db = state.db();
@@ -349,6 +350,7 @@ pub async fn sweep_once(state: &AppState, now: OffsetDateTime) -> usize {
         eprintln!("sharecraft-server: database failure: {e}");
     }
     crate::blobs::settle_stale_claims(state, now).await;
+    crate::api::uploads::sweep_uploads(state, now).await;
     if revoked > 0 {
         println!("sharecraft-server: revoked {revoked} expired link(s)");
     }

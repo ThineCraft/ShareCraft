@@ -13,6 +13,7 @@ mod roles;
 mod session;
 mod settings;
 mod sites;
+pub(crate) mod uploads;
 
 use std::fmt;
 
@@ -39,7 +40,8 @@ const MAX_BODY: usize = 16 * 1024;
 /// The `/api` routes, to be nested under `/api`. Unknown paths answer `404 {"error":"not_found"}`
 /// and pass the same guard as the others. File content is the only thing allowed a body larger
 /// than [`MAX_BODY`]: it is streamed into the content store, up to the largest file allowed
-/// (`max_file_bytes`), which the content routes check themselves.
+/// (`max_file_bytes`), which the content routes check themselves, or into an upload's part file,
+/// up to the size the upload declared.
 pub(crate) fn router() -> Router<AppState> {
     Router::new()
         .route("/session", post(session::sign_in).delete(session::sign_out))
@@ -88,6 +90,14 @@ pub(crate) fn router() -> Router<AppState> {
         .route("/explorer/{root}/export.csv", get(explorer::export))
         .route("/docs", post(docs::create))
         .route("/docs/upload", post(content::upload))
+        .route("/uploads", post(uploads::start))
+        .route(
+            "/uploads/{id}",
+            get(uploads::show)
+                .put(uploads::chunk)
+                .delete(uploads::abandon),
+        )
+        .route("/uploads/{id}/finish", post(uploads::finish))
         .route("/docs/{id}", get(docs::open))
         .route(
             "/docs/{id}/content",
@@ -206,6 +216,17 @@ pub(crate) enum ApiError {
     AlreadyDecided,
     /// 400: a request's message or a reply is longer than 500 characters.
     MessageTooLong,
+    /// 409: someone holds the editing seat of the document a new version was uploaded for.
+    BeingEdited,
+    /// 400: a plain-text document takes no uploaded versions; it is edited in its room.
+    TextDocument,
+    /// 422: the uploaded bytes are not the size and SHA-256 declared.
+    ChecksumMismatch,
+    /// 429: the person already has the most upload sessions open.
+    TooManyUploads,
+    /// 400: a chunk's `Content-Range` is missing, malformed, beyond the declared size, or not
+    /// the length of its body.
+    InvalidRange,
     /// 503: the database failed.
     Unavailable,
 }
@@ -258,6 +279,11 @@ impl ApiError {
             ApiError::TooManyRequests => (StatusCode::TOO_MANY_REQUESTS, "too_many_requests"),
             ApiError::AlreadyDecided => (StatusCode::CONFLICT, "already_decided"),
             ApiError::MessageTooLong => (StatusCode::BAD_REQUEST, "message_too_long"),
+            ApiError::BeingEdited => (StatusCode::CONFLICT, "being_edited"),
+            ApiError::TextDocument => (StatusCode::BAD_REQUEST, "text_document"),
+            ApiError::ChecksumMismatch => (StatusCode::UNPROCESSABLE_ENTITY, "checksum_mismatch"),
+            ApiError::TooManyUploads => (StatusCode::TOO_MANY_REQUESTS, "too_many_uploads"),
+            ApiError::InvalidRange => (StatusCode::BAD_REQUEST, "invalid_range"),
             ApiError::Unavailable => (StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
         }
     }

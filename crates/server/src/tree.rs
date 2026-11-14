@@ -285,6 +285,21 @@ pub async fn check_create_document(
         .map(|_| ())
 }
 
+/// `name`, or the first of `name (2)`, `name (3)` … (before the extension) that no undeleted
+/// item in `parent` has, ignoring case: the name to suggest when `name` is taken there.
+///
+/// # Errors
+/// The database error.
+pub async fn suggest_name(
+    db: &Db,
+    parent: NodeId,
+    name: &str,
+    editor: Editor,
+) -> Result<String, DbError> {
+    let taken: HashSet<String> = db.live_child_names(parent).await?.into_iter().collect();
+    Ok(unique_name(name, editor, &taken))
+}
+
 /// The name a new file `name` in `parent` would have, once `actor` is found to have `add` on
 /// `parent`, a library or folder, and the name to be acceptable for `editor` and free there.
 async fn new_document_name(

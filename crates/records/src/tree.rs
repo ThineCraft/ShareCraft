@@ -461,6 +461,17 @@ impl Db {
         Ok(found)
     }
 
+    /// The names of `parent`'s undeleted children, lower-cased, for finding a free name.
+    pub async fn live_child_names(&self, parent: NodeId) -> Result<Vec<String>, DbError> {
+        let names = sqlx::query_scalar(
+            "select lower(name) from nodes where parent_id = $1 and deleted_at is null",
+        )
+        .bind(parent.0)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(names)
+    }
+
     /// Whether no undeleted child of `parent`, other than `except`, is named `name`, ignoring
     /// case.
     pub async fn name_free(

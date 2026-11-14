@@ -10,6 +10,10 @@
 //! ([`Rooms::save_file`]); the session never holds the bytes. It claims the content, writes one
 //! checkpoint pointing at it on a blocking task and settles the claim, one save at a time.
 //!
+//! An upload of a new version is saved the same way, through the session, by the person who
+//! uploaded it ([`upload_version`]), but only while nobody holds the seat: while someone does,
+//! it is refused as `BeingEdited`. It is held to the same base revision rule as a save.
+//!
 //! Access changes reach a file session on the same channel and with the same meaning as a text
 //! room (see [`AccessChange`]). If a save finds the document saved from elsewhere, the session
 //! is in conflict: every later save is refused, and it ends as soon as it is empty.
@@ -74,6 +78,23 @@ pub(crate) enum FileCommand {
         base: Option<RevisionId>,
         reply: oneshot::Sender<Option<SaveReply>>,
     },
+    /// Whether an uploaded new version made from `base` would be taken now: answered `None` if
+    /// so, otherwise with the answer it would get. Asked before the upload is finished.
+    CheckUpload {
+        base: Option<RevisionId>,
+        reply: oneshot::Sender<Option<SaveReply>>,
+    },
+    /// Store the content `blob`, already in the content store, as the document's next revision
+    /// made from `base`, uploaded by `user`, whose account name is `name`; only while nobody
+    /// holds the seat.
+    Upload {
+        user: UserId,
+        name: String,
+        base: Option<RevisionId>,
+        blob: BlobRef,
+        /// Answered once the upload is decided; dropped if the session ended first.
+        reply: oneshot::Sender<SaveReply>,
+    },
     /// Store the content `blob`, already in the content store, as the document's next
     /// revision, on behalf of the seat holder.
     Save {
@@ -103,6 +124,8 @@ pub(crate) enum SaveReply {
     Failed,
     /// A save is being written and another is already waiting; nothing was done.
     Busy,
+    /// An uploaded version was refused because someone holds the editing seat.
+    BeingEdited,
 }
 
 /// The ways into one file session.
@@ -190,6 +213,46 @@ impl Rooms {
     }
 }
 
+/// The file session ended before it answered; the caller may ask a fresh one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SessionEnded;
+
+/// Asks the file session `link` whether it would take an uploaded new version made from `base`
+/// now: `None` if so, otherwise the answer the upload would get.
+pub(crate) async fn check_upload(
+    link: &FileLink,
+    base: Option<RevisionId>,
+) -> Result<Option<SaveReply>, SessionEnded> {
+    let (reply, answer) = oneshot::channel();
+    link.commands
+        .send(FileCommand::CheckUpload { base, reply })
+        .await
+        .map_err(|_| SessionEnded)?;
+    answer.await.map_err(|_| SessionEnded)
+}
+
+/// Asks the file session `link` to store the content `blob` (already in the content store) as
+/// a new version made from `base`, uploaded by `user` whose account name is `name`. A session
+/// that ends before answering has written nothing for it.
+pub(crate) async fn upload_version(
+    link: &FileLink,
+    user: UserId,
+    name: String,
+    base: Option<RevisionId>,
+    blob: BlobRef,
+) -> Result<SaveReply, SessionEnded> {
+    let (reply, answer) = oneshot::channel();
+    let upload = FileCommand::Upload {
+        user,
+        name,
+        base,
+        blob,
+        reply,
+    };
+    link.commands.send(upload).await.map_err(|_| SessionEnded)?;
+    answer.await.map_err(|_| SessionEnded)
+}
+
 /// The editing seat: the connection holding it and the token that proves it.
 struct Seat {
     client: ClientId,
@@ -199,10 +262,19 @@ struct Seat {
     token: String,
 }
 
+/// Who a waiting save is from.
+enum Saver {
+    /// The seat holder, with the token that proves it.
+    Holder { token: String },
+    /// Someone who uploaded a new version, credited under this name; taken only while nobody
+    /// holds the seat.
+    Uploader { name: String },
+}
+
 /// A save waiting for its turn.
 struct Waiting {
     user: UserId,
-    token: String,
+    from: Saver,
     base: Option<RevisionId>,
     blob: BlobRef,
     reply: oneshot::Sender<SaveReply>,
@@ -368,6 +440,24 @@ impl FileRoom {
                 let _ = reply.send(self.refusal(user, &token, base.as_ref()));
             }
             FileCommand::Leave { conn, client } => self.leave(conn, client),
+            FileCommand::CheckUpload { base, reply } => {
+                let _ = reply.send(self.upload_refusal(base.as_ref()));
+            }
+            FileCommand::Upload {
+                user,
+                name,
+                base,
+                blob,
+                reply,
+            } => self.save(Waiting {
+                user,
+                from: Saver::Uploader {
+                    name: credited_name(&name),
+                },
+                base,
+                blob,
+                reply,
+            }),
             FileCommand::Save {
                 user,
                 token,
@@ -376,7 +466,7 @@ impl FileRoom {
                 reply,
             } => self.save(Waiting {
                 user,
-                token,
+                from: Saver::Holder { token },
                 base,
                 blob,
                 reply,
@@ -519,12 +609,41 @@ impl FileRoom {
         None
     }
 
-    /// A save arrived. One from someone not holding the seat with that token is answered
-    /// `NotHolder` at once; one behind a save already waiting is answered `Busy`. Otherwise
-    /// it waits for its turn, when it is checked again (see [`FileRoom::next_write`]).
+    /// The answer an uploaded version made from `base` would get at once, or later when its
+    /// turn comes, if it would be refused; `None` if it would be taken now.
+    fn upload_refusal(&self, base: Option<&RevisionId>) -> Option<SaveReply> {
+        if self.seat.is_some() {
+            return Some(SaveReply::BeingEdited);
+        }
+        if let Some(current) = &self.conflict {
+            return Some(SaveReply::Conflict {
+                current: current.clone(),
+            });
+        }
+        if base != self.revision.as_ref() {
+            return Some(SaveReply::Conflict {
+                current: self.revision.clone(),
+            });
+        }
+        if self.waiting.is_some() {
+            return Some(SaveReply::Busy);
+        }
+        None
+    }
+
+    /// A save arrived. One from someone not holding the seat with that token, or an upload
+    /// while someone holds it, is answered at once (`NotHolder`, `BeingEdited`); one behind a
+    /// save already waiting is answered `Busy`. Otherwise it waits for its turn, when it is
+    /// checked again (see [`FileRoom::next_write`]).
     fn save(&mut self, save: Waiting) {
-        if !self.holds_seat(save.user, &save.token) {
-            let _ = save.reply.send(SaveReply::NotHolder);
+        let refused = match &save.from {
+            Saver::Holder { token } => {
+                (!self.holds_seat(save.user, token)).then_some(SaveReply::NotHolder)
+            }
+            Saver::Uploader { .. } => self.seat.is_some().then_some(SaveReply::BeingEdited),
+        };
+        if let Some(refused) = refused {
+            let _ = save.reply.send(refused);
             return;
         }
         if self.waiting.is_some() {
@@ -560,20 +679,38 @@ impl FileRoom {
 
     /// The save waiting, if it may be written and nothing is being written. A save that may not
     /// is answered: one from someone no longer holding the seat with that token is
-    /// `NotHolder`; once in conflict, or on a revision other than the current one, it is
-    /// `Conflict`.
+    /// `NotHolder`, an upload while someone holds the seat `BeingEdited`; once in conflict, or
+    /// on a revision other than the current one, it is `Conflict`.
     fn next_write(&mut self) -> Option<WriteJob> {
         if self.writing.is_some() {
             return None;
         }
         let save = self.waiting.take()?;
-        let holder = self
-            .seat
-            .as_ref()
-            .filter(|s| s.user == save.user && same_token(&s.token, &save.token));
-        let Some(holder) = holder else {
-            let _ = save.reply.send(SaveReply::NotHolder);
-            return None;
+        let author = match &save.from {
+            Saver::Holder { token } => {
+                let holder = self
+                    .seat
+                    .as_ref()
+                    .filter(|s| s.user == save.user && same_token(&s.token, token));
+                let Some(holder) = holder else {
+                    let _ = save.reply.send(SaveReply::NotHolder);
+                    return None;
+                };
+                Author {
+                    id: holder.user.0.to_string(),
+                    name: holder.name.clone(),
+                }
+            }
+            Saver::Uploader { name } => {
+                if self.seat.is_some() {
+                    let _ = save.reply.send(SaveReply::BeingEdited);
+                    return None;
+                }
+                Author {
+                    id: save.user.0.to_string(),
+                    name: name.clone(),
+                }
+            }
         };
         if let Some(current) = &self.conflict {
             let _ = save.reply.send(SaveReply::Conflict {
@@ -588,10 +725,6 @@ impl FileRoom {
             });
             return None;
         }
-        let author = Author {
-            id: holder.user.0.to_string(),
-            name: holder.name.clone(),
-        };
         self.writing = Some((save.reply, author.id.clone()));
         self.broadcast_save(SaveState::Saving, None);
         Some(WriteJob {

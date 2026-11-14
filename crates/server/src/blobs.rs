@@ -263,13 +263,13 @@ pub(crate) async fn settle_stale_claims(state: &AppState, now: time::OffsetDateT
 
 /// Reads the chunks sent on a channel, in order, as one stream of bytes; blocks while waiting
 /// for the next. Ends when the sender is dropped.
-struct ChannelReader {
+pub(crate) struct ChannelReader {
     rx: mpsc::Receiver<std::io::Result<Bytes>>,
     current: Bytes,
 }
 
 impl ChannelReader {
-    fn new(rx: mpsc::Receiver<std::io::Result<Bytes>>) -> Self {
+    pub(crate) fn new(rx: mpsc::Receiver<std::io::Result<Bytes>>) -> Self {
         Self {
             rx,
             current: Bytes::new(),

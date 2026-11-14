@@ -26,12 +26,12 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use collab_core::ids::{DocId, NodeId};
 use futures_util::Stream;
-use records::{AccessError, Editor};
+use records::{AccessError, Editor, User};
 use revisions::{
     Author, BlobRef, Checkpoint, CheckpointError, Content, Outcome, RevisionId, Stored,
 };
 use serde::Deserialize;
-use serde_json::{Map, json};
+use serde_json::{Map, Value, json};
 use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
@@ -91,7 +91,7 @@ pub(crate) async fn blocking<T: Send + 'static>(
 /// Streams a request body into the content store and answers what it stored. Refused with `413`
 /// past the largest file allowed (at once when the body declares a larger length, otherwise as
 /// soon as more arrives; nothing is stored), and `400` when the body cannot be read.
-async fn body_blob(state: &AppState, request: Request) -> Result<BlobRef, ApiError> {
+pub(super) async fn body_blob(state: &AppState, request: Request) -> Result<BlobRef, ApiError> {
     let limit = state.config().max_file_bytes;
     let declared = request
         .headers()
@@ -113,7 +113,7 @@ async fn body_blob(state: &AppState, request: Request) -> Result<BlobRef, ApiErr
 /// (the same content saved by someone else, or by an earlier version). Nothing is erased while
 /// a flag says the content rows may be incomplete, as a version could then name the content
 /// without a row; the start-up erasure deals with it after the rebuild. Failures are logged.
-async fn discard(state: &AppState, blob: BlobRef) {
+pub(super) async fn discard(state: &AppState, blob: BlobRef) {
     match state.db().blob_refs_flagged().await {
         Ok(false) => {}
         Ok(true) => return,
@@ -432,8 +432,8 @@ pub(crate) async fn save(
     Ok(save_answer(reply))
 }
 
-/// The answer to a save the file session answered with `reply`.
-fn save_answer(reply: SaveReply) -> Response {
+/// The answer to a save (or an uploaded new version) the file session answered with `reply`.
+pub(super) fn save_answer(reply: SaveReply) -> Response {
     match reply {
         SaveReply::Saved(revision) => saved(&revision, true),
         SaveReply::Unchanged(revision) => saved(&revision, false),
@@ -450,6 +450,7 @@ fn save_answer(reply: SaveReply) -> Response {
             Json(json!({ "error": "busy" })),
         )
             .into_response(),
+        SaveReply::BeingEdited => ApiError::BeingEdited.into_response(),
     }
 }
 
@@ -490,78 +491,109 @@ pub(crate) async fn upload(
     }
 
     to_completion(async move {
-        let id = DocId(Uuid::new_v4());
-        let created =
-            tree::create_document(&state, &user, parent, id, &name, editor, Some(blob.size)).await;
-        let document = match created {
-            Ok(document) => document,
-            Err(e) => {
-                discard(&state, blob).await;
-                return Err(match e {
-                    // The name is only an extension.
-                    AccessError::WrongExtension => ApiError::BadRequest,
-                    e => e.into(),
-                });
-            }
-        };
-        let access = state
-            .db()
-            .doc_access(user.id, id)
-            .await
-            .map_err(|e| ApiError::unavailable(&e))?;
-        let author = Author {
-            id: user.id.0.to_string(),
-            name: credited_name(&user.name),
-        };
-        let file_name = document.name.clone();
-        let written = write_claimed(
-            state.blobs(),
-            Some(state.db()),
-            Arc::clone(state.checkpointer()),
-            id,
-            blob,
-            move |store| {
-                store.write(&Checkpoint {
-                    doc: id,
-                    file_name: &file_name,
-                    blob,
-                    base: None,
-                    authors: std::slice::from_ref(&author),
-                    fields: &Map::new(),
-                })
+        Ok(
+            match create_uploaded(&state, &user, parent, &name, editor, blob).await? {
+                Created::Done { body, .. } => (StatusCode::CREATED, Json(body)).into_response(),
+                Created::Failed(response) => response,
             },
         )
-        .await;
-        let revision = match written {
-            Ok(Outcome::Written(revision) | Outcome::Unchanged(revision)) => revision,
-            Err(e) => {
-                eprintln!(
-                    "sharecraft-server: upload of document {} failed: {e:?}",
-                    id.0
-                );
-                discard(&state, blob).await;
-                // The document stays, empty.
-                let body = Json(json!({ "error": "unavailable", "document": id.0.to_string() }));
-                return Ok((StatusCode::SERVICE_UNAVAILABLE, body).into_response());
-            }
-        };
-        record_first(
-            state.checkpointer(),
-            state.db(),
-            state.events(),
-            id,
-            &revision,
-        )
-        .await;
-        let body = Json(json!({
-            "id": document.id.0.to_string(),
-            "name": document.name,
-            "editor": document.editor,
-            "access": access,
-        }));
-        Ok((StatusCode::CREATED, body).into_response())
     })
     .await
+}
+
+/// What [`create_uploaded`] made.
+pub(super) enum Created {
+    /// The document `doc`, with its first revision; `body` describes it.
+    Done { doc: DocId, body: Value },
+    /// The document was made but its content could not be stored: the answer to give.
+    Failed(Response),
+}
+
+/// Creates a document named `name`, opened in `editor`, in `parent` for `user`, with the
+/// content `blob` (already in the content store) as its first revision: the tree record and
+/// document row, then the revision, claimed before it is committed. Content of a document that
+/// is refused or fails is erased unless something else names it. If it cannot be stored after
+/// the document was made, the document stays, empty, and the answer is `503` naming it.
+pub(super) async fn create_uploaded(
+    state: &AppState,
+    user: &User,
+    parent: NodeId,
+    name: &str,
+    editor: Editor,
+    blob: BlobRef,
+) -> Result<Created, ApiError> {
+    let id = DocId(Uuid::new_v4());
+    let created =
+        tree::create_document(state, user, parent, id, name, editor, Some(blob.size)).await;
+    let document = match created {
+        Ok(document) => document,
+        Err(e) => {
+            discard(state, blob).await;
+            return Err(match e {
+                // The name is only an extension.
+                AccessError::WrongExtension => ApiError::BadRequest,
+                e => e.into(),
+            });
+        }
+    };
+    let access = state
+        .db()
+        .doc_access(user.id, id)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?;
+    let author = Author {
+        id: user.id.0.to_string(),
+        name: credited_name(&user.name),
+    };
+    let file_name = document.name.clone();
+    let written = write_claimed(
+        state.blobs(),
+        Some(state.db()),
+        Arc::clone(state.checkpointer()),
+        id,
+        blob,
+        move |store| {
+            store.write(&Checkpoint {
+                doc: id,
+                file_name: &file_name,
+                blob,
+                base: None,
+                authors: std::slice::from_ref(&author),
+                fields: &Map::new(),
+            })
+        },
+    )
+    .await;
+    let revision = match written {
+        Ok(Outcome::Written(revision) | Outcome::Unchanged(revision)) => revision,
+        Err(e) => {
+            eprintln!(
+                "sharecraft-server: upload of document {} failed: {e:?}",
+                id.0
+            );
+            discard(state, blob).await;
+            // The document stays, empty.
+            let body = Json(json!({ "error": "unavailable", "document": id.0.to_string() }));
+            return Ok(Created::Failed(
+                (StatusCode::SERVICE_UNAVAILABLE, body).into_response(),
+            ));
+        }
+    };
+    record_first(
+        state.checkpointer(),
+        state.db(),
+        state.events(),
+        id,
+        &revision,
+    )
+    .await;
+    let body = json!({
+        "id": document.id.0.to_string(),
+        "name": document.name,
+        "editor": document.editor,
+        "access": access,
+    });
+    Ok(Created::Done { doc: id, body })
 }
 
 /// The `Content-Disposition` of a download of the file `name`: an attachment, with an ASCII
