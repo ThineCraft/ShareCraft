@@ -10,6 +10,7 @@ import {
   queryId,
   can,
   confirmDialog,
+  deleteLibraryText,
   quotaSubmit,
   quotaText,
   usagePercent,
@@ -46,9 +47,11 @@ const manageSite = can(here.access, 'manage_site');
 const manageAccess = can(here.access, 'manage_access');
 $('new-library').hidden = !manageSite;
 $('groups-link').hidden = !manageSite;
+$('settings-link').hidden = !(manageSite || me.is_admin);
 $('access-link').hidden = !manageAccess;
 $('explorer-link').hidden = !manageAccess;
-$('site-tools').hidden = !(manageSite || manageAccess);
+$('site-tools').hidden = !(manageSite || manageAccess || me.is_admin);
+$('settings-link').href = `/site-settings.html?id=${seg(siteId)}`;
 $('access-link').href = `/access.html?id=${seg(siteId)}`;
 $('explorer-link').href = `/explorer.html?root=${seg(siteId)}`;
 $('groups-link').href = `/groups.html?site=${seg(siteId)}`;
@@ -94,7 +97,8 @@ async function showAbout() {
       h('small', {}, `Archived ${formatDate(info.archived.at)}${info.archived.by ? ` by ${info.archived.by}` : ''}.`),
     );
   }
-  const mayJoin = can(info.access, 'manage_site') && !info.is_hub;
+  // An archived site cannot change its hub (the server answers `archived`), so neither is offered.
+  const mayJoin = can(info.access, 'manage_site') && !info.is_hub && !info.archived;
   $('leave-hub-row').hidden = !(mayJoin && info.hub);
   $('join-hub').hidden = true;
   if (mayJoin && !info.hub) {
@@ -200,6 +204,8 @@ async function showLibraries() {
   }
   const libraries = result.data.items.filter((item) => item.kind === 'library');
   $('empty').hidden = libraries.length > 0;
+  // People who manage the site may delete a library (to the recycle bin), unless it is archived.
+  const mayDelete = manageSite && !info?.archived;
   $('libraries').replaceChildren(
     ...libraries.map((library) =>
       h(
@@ -208,9 +214,25 @@ async function showLibraries() {
         h('span', { class: 'grow' }, h('a', { href: pageFor('library', library.id) }, library.name)),
         library.access ? h('small', {}, roleLine(library.access)) : h('small', { class: 'mark' }, 'Limited access'),
         library.inherits ? null : h('small', { class: 'mark' }, 'Own permissions'),
+        mayDelete ? deleteLibraryButton(library) : null,
       ),
     ),
   );
+}
+
+/** The Delete button of `library`: asks first, naming it, then sends it to the recycle bin. */
+function deleteLibraryButton(library) {
+  const button = h('button', { type: 'button', class: 'plain', 'aria-label': `Delete the library ${library.name}` }, 'Delete');
+  button.addEventListener('click', async () => {
+    showMessage(error, '');
+    if (!(await confirmDialog(deleteLibraryText(library.name), 'Delete library'))) return;
+    const result = await api('DELETE', `/nodes/${seg(library.id)}`);
+    if (!result.ok) return showMessage(error, messageFor(result.error));
+    $('status').textContent = `The library ${library.name} is in the recycle bin.`;
+    info = (await siteChrome(siteId, { currentId: siteId })).site ?? info;
+    await showLibraries();
+  });
+  return button;
 }
 
 function fail(text) {

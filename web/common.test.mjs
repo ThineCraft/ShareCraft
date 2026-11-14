@@ -1042,3 +1042,99 @@ test('new_messages_for_new_error_codes', () => {
   for (const [at, code] of codes.entries()) assert.notEqual(sentences[at], general, code);
   assert.equal(new Set(sentences).size, codes.length, 'each code has a sentence of its own');
 });
+
+import {
+  adminSiteActions,
+  adminSiteRow,
+  deleteSiteText,
+  languageChoices,
+  purgeSiteText,
+  templateReasonText,
+  timeZoneChoices,
+} from './common.js';
+
+/** Rows as `GET /api/admin/sites` answers them. */
+const ADMIN_ROWS = {
+  active: { id: SITE, name: 'Sales', state: 'active', kind: 'team', is_hub: true, hub: null, used: 1536, quota: null, owners: 2, deleted: null, purge_at: null },
+  archived: { id: LIB, name: 'Old projects', state: 'archived', kind: 'communication', is_hub: false, hub: { id: SITE, name: 'Sales' }, used: 0, quota: 1024 ** 3, owners: 0, deleted: null, purge_at: null },
+  deleted: {
+    id: DIR,
+    name: '<b>Gone</b>',
+    state: 'deleted',
+    kind: 'team',
+    is_hub: false,
+    hub: null,
+    used: 10,
+    quota: null,
+    owners: 1,
+    deleted: { at: '2026-11-01T10:00:00Z', by: 'Root' },
+    purge_at: '2027-02-02T10:00:00Z',
+  },
+};
+
+test('admin_sites_rows_and_actions_by_state', () => {
+  const actions = (row) => adminSiteActions(row).map((a) => a.action);
+  assert.deepEqual(actions(ADMIN_ROWS.active), ['archive', 'delete']);
+  assert.deepEqual(actions(ADMIN_ROWS.archived), ['reactivate', 'delete']);
+  assert.deepEqual(actions(ADMIN_ROWS.deleted), ['restore', 'purge']);
+  assert.deepEqual(adminSiteActions(ADMIN_ROWS.deleted).map((a) => a.label), ['Restore', 'Delete permanently']);
+
+  const all = chromeDocument();
+  try {
+    const clicked = [];
+    const rows = Object.values(ADMIN_ROWS).map((row) => adminSiteRow(row, (action, site) => clicked.push([action, site.id])));
+    const [active, archived, deleted] = rows.map(texts);
+    // State, storage, owners and hub, as text.
+    assert.ok(active.includes('Sales'));
+    assert.ok(active.some((t) => t.includes('Active')));
+    assert.ok(active.some((t) => t.includes('Hub')));
+    assert.ok(active.some((t) => t.includes('1.5 KB')));
+    assert.ok(active.some((t) => t.includes('2 owners')));
+    assert.ok(!active.some((t) => t.includes('No enabled owner')));
+    assert.ok(archived.some((t) => t.includes('Archived')));
+    assert.ok(archived.some((t) => t.includes('Sales')), 'the hub it joined');
+    assert.ok(archived.some((t) => t.includes('No enabled owner')), 'a site with no enabled owner is flagged');
+    assert.ok(deleted.includes('<b>Gone</b>'), 'the name is drawn as text');
+    assert.ok(deleted.some((t) => t.includes('Deleted')));
+    // A live site's name links to it; a deleted one does not.
+    const links = all.filter((element) => element.tag === 'a').map((a) => a.attributes.href);
+    assert.ok(links.includes(`/site.html?id=${SITE}`));
+    assert.ok(!links.includes(`/site.html?id=${DIR}`));
+    // Each action button is named for its site and calls back with the action.
+    const buttons = all.filter((element) => element.tag === 'button');
+    const purge = buttons.find((b) => b.attributes['aria-label'] === 'Delete <b>Gone</b> permanently');
+    assert.ok(purge);
+    purge.listeners.click();
+    assert.deepEqual(clicked, [['purge', DIR]]);
+    assert.ok(buttons.some((b) => b.attributes['aria-label'] === 'Archive Sales'));
+    assert.ok(buttons.some((b) => b.attributes['aria-label'] === 'Reactivate Old projects'));
+  } finally {
+    delete globalThis.document;
+  }
+});
+
+test('purge_confirmation_names_the_site', () => {
+  const text = purgeSiteText(ADMIN_ROWS.deleted);
+  assert.ok(text.includes('<b>Gone</b>'), 'names the site');
+  assert.match(text, /cannot be undone/);
+  assert.match(text, /permanently/);
+  const deleting = deleteSiteText(ADMIN_ROWS.active);
+  assert.ok(deleting.includes('Sales'));
+  assert.ok(deleting.includes('Everyone loses access at once. It can be restored for 93 days.'));
+});
+
+test('regional choices and template refusals', () => {
+  const languages = languageChoices('en');
+  assert.ok(languages.length >= 35 && languages.length <= 50);
+  for (const { value } of languages) assert.match(value, /^[a-zA-Z]{2,3}(-[a-zA-Z]{4})?(-([a-zA-Z]{2}|[0-9]{3}))?$/);
+  // A site's language that is not in the list is kept as a choice.
+  assert.equal(languageChoices('gsw-CH')[0].value, 'gsw-CH');
+  const zones = timeZoneChoices('Europe/London');
+  assert.equal(zones[0], 'UTC');
+  assert.ok(zones.includes('Europe/London'));
+  assert.equal(new Set(zones).size, zones.length);
+  assert.ok(timeZoneChoices('Mars/Base').includes('Mars/Base'));
+  for (const reason of ['too_large', 'too_deep', 'too_many_folders', 'too_many_libraries', 'unknown_field', 'identifiers', 'invalid_navigation', 'invalid_names']) {
+    assert.notEqual(templateReasonText(reason), templateReasonText('no_such_reason'), reason);
+  }
+});

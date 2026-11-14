@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ShareCraft — Site settings</title>
+<link rel="stylesheet" href="./style.css">
+</head>
+<body>
+<div class="page">
+ <nav class="topbar" aria-label="Account">
+  <a href="/">Sites</a>
+  <span id="who" class="meta"></span>
+  <span class="spacer"></span>
+  <a id="people-link" class="button plain" href="/people.html" hidden>People</a>
+  <button type="button" id="sign-out" class="plain">Sign out</button>
+ </nav>
+ <nav id="crumbs" class="crumbs" aria-label="Breadcrumb"></nav>
+ <p id="status" role="status" aria-live="polite" class="meta"></p>
+ <h1 id="title">Site settings</h1>
+ <p id="archived-banner" class="note" hidden>This site is archived. It can be read but not changed. An administrator can reactivate it on the Sites page.</p>
+ <p id="error" role="alert" class="msg"></p>
+
+ <section id="general" aria-labelledby="general-heading" hidden>
+  <h2 id="general-heading">About the site</h2>
+  <form id="settings" class="stack">
+   <div class="field">
+    <label for="site-name">Name</label>
+    <input type="text" id="site-name" maxlength="120" autocomplete="off" required>
+   </div>
+   <div class="field">
+    <label for="site-description">Description</label>
+    <textarea id="site-description" class="short" maxlength="500" aria-describedby="description-note"></textarea>
+    <small id="description-note" class="meta">Shown in the site directory. At most 500 characters.</small>
+   </div>
+   <div class="field">
+    <label for="site-language">Language</label>
+    <select id="site-language" aria-describedby="regional-note"></select>
+   </div>
+   <div class="field">
+    <label for="site-zone">Time zone</label>
+    <select id="site-zone" aria-describedby="regional-note"></select>
+    <small id="regional-note" class="meta">Dates, times and sizes on this site's pages are shown in its language and time zone.</small>
+   </div>
+   <div><button type="submit">Save</button></div>
+   <p id="settings-msg" role="alert" class="msg"></p>
+  </form>
+ </section>
+
+ <section id="hub" aria-labelledby="hub-heading" hidden>
+  <h2 id="hub-heading">Hub</h2>
+  <p id="hub-line"></p>
+  <form id="join-hub" class="row" hidden>
+   <div class="field">
+    <label for="hub-choice">Join a hub</label>
+    <select id="hub-choice"></select>
+   </div>
+   <button type="submit">Join hub</button>
+  </form>
+  <p class="meta" id="join-note" hidden>Joining a hub adds its navigation bar to this site. It never changes who has access. A site joins one hub at most: joining another replaces it.</p>
+  <p id="leave-hub-row" hidden><button type="button" id="leave-hub" class="plain">Leave hub</button></p>
+  <p id="hub-msg" role="alert" class="msg"></p>
+ </section>
+
+ <section id="navigation" aria-labelledby="navigation-heading" hidden>
+  <h2 id="navigation-heading">Navigation</h2>
+  <fieldset class="kinds" id="nav-mode">
+   <legend>The links under the site's name</legend>
+   <label class="check"><input type="radio" name="nav-mode" id="nav-automatic" value="automatic"> Automatic: every library of the site, by name</label>
+   <label class="check"><input type="radio" name="nav-mode" id="nav-custom" value="custom"> Custom: the links below</label>
+  </fieldset>
+  <div id="local-editor" hidden></div>
+  <p><button type="button" id="save-navigation">Save navigation</button></p>
+  <p id="navigation-msg" role="alert" class="msg"></p>
+ </section>
+
+ <section id="hub-admin" aria-labelledby="hub-admin-heading" hidden>
+  <h2 id="hub-admin-heading">Hub settings</h2>
+  <p class="meta">For administrators. A hub's navigation bar is shown on the hub and on every site that joins it.</p>
+  <p id="make-hub-row" hidden><button type="button" id="make-hub">Make this site a hub</button></p>
+  <div id="hub-bar" hidden>
+   <h3>Hub navigation bar</h3>
+   <div id="hub-editor"></div>
+   <div class="toolbar">
+    <button type="button" id="save-hub">Save hub bar</button>
+    <button type="button" id="unregister-hub" class="plain">Unregister hub</button>
+   </div>
+  </div>
+  <p id="hub-admin-msg" role="alert" class="msg"></p>
+ </section>
+
+ <section id="template" aria-labelledby="template-heading" hidden>
+  <h2 id="template-heading">Save as template</h2>
+  <p class="meta">A template keeps the site's libraries, folders, settings and navigation, without files, members or links. New sites can be made from it, and it can be carried to another installation from the <a href="/templates.html">Templates</a> page.</p>
+  <form id="save-template" class="stack">
+   <div class="field">
+    <label for="template-name">Template name</label>
+    <input type="text" id="template-name" maxlength="80" autocomplete="off" required>
+   </div>
+   <div class="field">
+    <label for="template-description">Description (optional)</label>
+    <textarea id="template-description" class="short" maxlength="500"></textarea>
+   </div>
+   <div><button type="submit">Save as template</button></div>
+   <p id="template-msg" role="alert" class="msg"></p>
+   <ul id="template-cleaned" class="list" aria-label="Names changed in the template" hidden></ul>
+  </form>
+ </section>
+</div>
+<script type="module" src="./site-settings.js"></script>
+</body>
+</html>

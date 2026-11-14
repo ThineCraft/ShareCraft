@@ -124,12 +124,14 @@ export function inheritAgainMessage(code) {
 /**
  * Calls `/api{path}`. Never throws: returns { ok, status, data, error } where `error` is the
  * server's error code (or "network"). A 401 "not_signed_in" sends the page to the sign-in page.
+ * `body` is sent as JSON; with `{ raw: true }` it is sent as it is (the text of a template
+ * package, say).
  */
-export async function api(method, path, body) {
+export async function api(method, path, body, { raw = false } = {}) {
   const init = { method, credentials: 'same-origin', headers: {} };
   if (body !== undefined) {
     init.headers['Content-Type'] = 'application/json';
-    init.body = JSON.stringify(body);
+    init.body = raw ? body : JSON.stringify(body);
   }
   let response;
   try {
@@ -1064,10 +1066,15 @@ export function safeHref(url) {
   return scheme === 'https' || scheme === 'http' || scheme === 'mailto' ? url : null;
 }
 
-/** The address a resolved navigation target opens, or null (a heading, or a refused address). */
+/**
+ * The address a resolved navigation target opens, or null (a heading, or a refused address). A
+ * document opens the page of its editor when the target names it (`editor: "text"` opens the
+ * text page). The server's answer does not name it yet, so a document opens the file page,
+ * which sends a text document on to its text page.
+ */
 export function navHref(target) {
   if (!target) return null;
-  if (typeof target.node === 'string') return pageFor(target.kind, target.node);
+  if (typeof target.node === 'string') return pageFor(target.kind, target.node, target.editor);
   return safeHref(target.url);
 }
 
@@ -1158,25 +1165,36 @@ export function navigationView(site, nav, { currentId } = {}) {
   return view;
 }
 
-/** Closes every open sub-list of a drawn navigation when the person clicks elsewhere. */
-function closeOnOutsideClick(view) {
-  globalThis.document?.addEventListener?.('click', (event) => {
-    if (view.contains?.(event.target)) return;
-    for (const button of view.querySelectorAll?.('.sub-toggle[aria-expanded="true"]') ?? []) {
-      setOpen(button, view.querySelector(`#${button.getAttribute('aria-controls')}`), false);
+let closing = null; // the document the outside-click closer listens on: one listener per page
+
+/**
+ * Closes every open sub-list of the navigation drawn on the page when the person clicks
+ * elsewhere. The one listener looks the navigation up at each click, so it keeps working after
+ * the bars are drawn again (joining or leaving a hub, saving navigation).
+ */
+function closeOnOutsideClick() {
+  const doc = globalThis.document;
+  if (!doc?.addEventListener || closing === doc) return;
+  closing = doc;
+  doc.addEventListener('click', (event) => {
+    for (const view of doc.querySelectorAll?.('[data-chrome]') ?? []) {
+      if (view.contains?.(event.target)) continue;
+      for (const button of view.querySelectorAll?.('.sub-toggle[aria-expanded="true"]') ?? []) {
+        setOpen(button, view.querySelector(`#${button.getAttribute('aria-controls')}`), false);
+      }
     }
   });
 }
 
 /** Puts a drawn navigation in `place`, or after the page's account bar (replacing an earlier one). */
 function placeChrome(view, place) {
+  closeOnOutsideClick();
   if (place) return place.replaceChildren(view);
   const old = document.querySelector('[data-chrome]');
   if (old) return old.replaceWith(view);
   const bar = document.querySelector('.topbar, .bar');
   if (bar) bar.after(view);
   else document.body?.prepend(view);
-  closeOnOutsideClick(view);
 }
 
 /**
@@ -1252,5 +1270,204 @@ export function directoryRow(site) {
     site.is_hub ? h('small', { class: 'mark own' }, 'Hub') : null,
     site.archived ? h('small', { class: 'mark' }, 'Archived') : null,
     site.access ? h('small', {}, roleLine(site.access)) : h('small', { class: 'mark' }, 'Limited access'),
+  );
+}
+
+// ---- site settings, templates and the administrators' Sites page ----
+
+/** The languages a site may be set to, as `[tag, name]`: a fixed list of common ones. */
+export const LANGUAGES = Object.freeze([
+  ['en', 'English'],
+  ['en-GB', 'English (United Kingdom)'],
+  ['en-US', 'English (United States)'],
+  ['ar', 'Arabic'],
+  ['bg', 'Bulgarian'],
+  ['ca', 'Catalan'],
+  ['cs', 'Czech'],
+  ['cy', 'Welsh'],
+  ['da', 'Danish'],
+  ['de', 'German'],
+  ['de-CH', 'German (Switzerland)'],
+  ['el', 'Greek'],
+  ['es', 'Spanish'],
+  ['es-MX', 'Spanish (Mexico)'],
+  ['et', 'Estonian'],
+  ['fi', 'Finnish'],
+  ['fr', 'French'],
+  ['fr-CA', 'French (Canada)'],
+  ['ga', 'Irish'],
+  ['he', 'Hebrew'],
+  ['hi', 'Hindi'],
+  ['hr', 'Croatian'],
+  ['hu', 'Hungarian'],
+  ['id', 'Indonesian'],
+  ['is', 'Icelandic'],
+  ['it', 'Italian'],
+  ['ja', 'Japanese'],
+  ['ko', 'Korean'],
+  ['lt', 'Lithuanian'],
+  ['lv', 'Latvian'],
+  ['ms', 'Malay'],
+  ['nb', 'Norwegian Bokmål'],
+  ['nl', 'Dutch'],
+  ['pl', 'Polish'],
+  ['pt', 'Portuguese'],
+  ['pt-BR', 'Portuguese (Brazil)'],
+  ['ro', 'Romanian'],
+  ['ru', 'Russian'],
+  ['sk', 'Slovak'],
+  ['sl', 'Slovenian'],
+  ['sr', 'Serbian'],
+  ['sv', 'Swedish'],
+  ['th', 'Thai'],
+  ['tr', 'Turkish'],
+  ['uk', 'Ukrainian'],
+  ['vi', 'Vietnamese'],
+  ['zh-Hans', 'Chinese (Simplified)'],
+  ['zh-Hant', 'Chinese (Traditional)'],
+]);
+
+/**
+ * The language choices of a select, `[{value, label}]`: `current` first when it is not in the
+ * fixed list (a site set through the API keeps its language), then the list.
+ */
+export function languageChoices(current) {
+  const listed = LANGUAGES.map(([value, name]) => ({ value, label: `${name} (${value})` }));
+  if (current && !LANGUAGES.some(([value]) => value === current)) return [{ value: current, label: current }, ...listed];
+  return listed;
+}
+
+/** The time zones `Intl` knows, `UTC` first, with `current` kept when `Intl` does not list it. */
+export function timeZoneChoices(current) {
+  let zones = [];
+  try {
+    zones = Intl.supportedValuesOf('timeZone');
+  } catch {
+    zones = [];
+  }
+  const all = ['UTC', ...zones.filter((zone) => zone !== 'UTC')];
+  if (current && !all.includes(current)) all.splice(1, 0, current);
+  return all;
+}
+
+/** Fills `select` with `choices` (`[{value, label}]` or strings) and chooses `current`. Text only. */
+export function fillSelect(select, choices, current) {
+  select.replaceChildren(
+    ...choices.map((choice) =>
+      typeof choice === 'string' ? h('option', { value: choice }, choice) : h('option', { value: choice.value }, choice.label),
+    ),
+  );
+  select.value = current ?? '';
+}
+
+const TEMPLATE_REASONS = Object.assign(Object.create(null), {
+  too_large: 'The package is larger than 1 MB.',
+  not_utf8: 'The package is not a text file.',
+  unreadable: 'The file is not a template package: it could not be read as one.',
+  unknown_version: 'The package was made by a newer version of ShareCraft.',
+  identifiers: 'The package names things by identifier. A package names libraries by name only.',
+  unknown_field: 'The package holds something a template cannot carry.',
+  invalid_name: 'The template name is empty or longer than 80 characters.',
+  invalid_description: 'The description is longer than 500 characters.',
+  invalid_kind: 'The package makes a kind of site that does not exist.',
+  invalid_language: 'The package has a language that is not a language code.',
+  invalid_time_zone: 'The package has a time zone that is not known.',
+  too_many_libraries: 'The template has more than 100 libraries.',
+  too_many_folders: 'The template has more than 5,000 folders.',
+  too_deep: 'The template has folders more than 20 levels deep.',
+  invalid_names: 'The template has a library or folder name that is not allowed, or the same name twice in one place.',
+  invalid_navigation: 'The template has a navigation link that is not allowed.',
+});
+
+/** The sentence for the `reason` of a refused template (`422 invalid_template`). */
+export function templateReasonText(reason) {
+  return TEMPLATE_REASONS[reason] ?? messageFor('invalid_template');
+}
+
+/** The sentence for a refused template answer from `api`: its reason when there is one. */
+export function templateRefusal(result) {
+  if (result.error === 'invalid_template') return templateReasonText(result.data?.reason);
+  if (result.status === 413) return TEMPLATE_REASONS.too_large;
+  return messageFor(result.error);
+}
+
+/** Asking before deleting the library `name`. */
+export const deleteLibraryText = (name) =>
+  `Delete the library ${name}? It goes to the recycle bin with everything in it, and can be restored from there.`;
+
+/** Asking before archiving `site` (a row of the administrators' Sites page). */
+export const archiveSiteText = (site) =>
+  `Archive the site ${site.name}? It becomes read-only for everyone and is hidden from the site directory until an administrator reactivates it.`;
+
+/** Asking before deleting `site`. */
+export const deleteSiteText = (site) =>
+  `Delete the site ${site.name}? Everyone loses access at once. It can be restored for 93 days.`;
+
+/** Asking before purging the deleted `site`: it names the site and says it cannot be undone. */
+export const purgeSiteText = (site) =>
+  `Delete the site ${site.name} permanently? Everything in it is erased now and it can no longer be restored. This cannot be undone.`;
+
+/** The actions the administrators' Sites page offers for `site`, by its state. */
+export function adminSiteActions(site) {
+  switch (site.state) {
+    case 'deleted':
+      return [
+        { action: 'restore', label: 'Restore', name: `Restore ${site.name}` },
+        { action: 'purge', label: 'Delete permanently', name: `Delete ${site.name} permanently` },
+      ];
+    case 'archived':
+      return [
+        { action: 'reactivate', label: 'Reactivate', name: `Reactivate ${site.name}` },
+        { action: 'delete', label: 'Delete', name: `Delete ${site.name}` },
+      ];
+    default:
+      return [
+        { action: 'archive', label: 'Archive', name: `Archive ${site.name}` },
+        { action: 'delete', label: 'Delete', name: `Delete ${site.name}` },
+      ];
+  }
+}
+
+const STATE_LABELS = { active: 'Active', archived: 'Archived', deleted: 'Deleted' };
+
+/**
+ * One site of `GET /api/admin/sites` as a list row: its name (linked unless deleted), state,
+ * kind, hub, storage and owners (flagged when it has no enabled owner), when it was deleted and
+ * when it will be erased, and its action buttons, which call `onAction(action, site)`. Text only.
+ */
+export function adminSiteRow(site, onAction) {
+  const storage =
+    site.quota == null ? `${formatSize(site.used)} used, no quota` : `${formatSize(site.used)} of ${formatSize(site.quota)} used`;
+  const owners = site.owners > 0 ? `${site.owners} owner${site.owners === 1 ? '' : 's'}` : null;
+  const buttons = adminSiteActions(site).map(({ action, label, name }) => {
+    const button = h('button', { type: 'button', class: 'plain', 'aria-label': name }, label);
+    button.addEventListener('click', () => onAction(action, site));
+    return button;
+  });
+  return h(
+    'li',
+    { class: 'admin-site' },
+    h(
+      'span',
+      { class: 'grow' },
+      site.state === 'deleted' ? h('strong', {}, site.name) : h('a', { href: pageFor('site', site.id) }, site.name),
+      h('br'),
+      h('small', {}, `${STATE_LABELS[site.state] ?? site.state} · ${kindLabel(site.kind)}`),
+      site.hub ? h('small', {}, ' · In the hub ', site.hub.name) : null,
+      h('br'),
+      h('small', {}, storage),
+      owners ? h('small', {}, ` · ${owners}`) : null,
+      site.deleted ? h('br') : null,
+      site.deleted
+        ? h(
+            'small',
+            {},
+            `Deleted ${formatDate(site.deleted.at)}${site.deleted.by ? ` by ${site.deleted.by}` : ''}. Erased for good ${formatDate(site.purge_at)} unless restored.`,
+          )
+        : null,
+    ),
+    site.is_hub ? h('small', { class: 'mark own' }, 'Hub') : null,
+    site.owners > 0 ? null : h('small', { class: 'mark warn' }, 'No enabled owner'),
+    h('span', { class: 'actions' }, ...buttons),
   );
 }
