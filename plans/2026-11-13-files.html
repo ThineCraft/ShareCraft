@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ShareCraft — Files: Implementation Plan</title>
+<style>
+:root{color-scheme:light dark;--ink:light-dark(#172f38,#e4ecef);--muted:light-dark(#536b72,#a9b9bf);--line:light-dark(#d7e2e3,#36454b);--paper:light-dark(#fff,#1d272b);--wash:light-dark(#f2f6f5,#141b1e);--accent:light-dark(#3156c9,#9db4ff);font:15px/1.6 Segoe UI,system-ui,sans-serif;color:var(--ink);background:var(--wash)}
+*{box-sizing:border-box}body{margin:0;padding:28px 18px 80px}main{max-width:940px;margin:auto}
+h1{font-size:1.9rem;letter-spacing:-.03em;line-height:1.2;margin:0 0 14px}h2{font-size:1.3rem;margin:38px 0 12px;padding-top:18px;border-top:1px solid var(--line)}h3{font-size:1.08rem;margin:30px 0 8px}h4{font-size:.95rem;margin:16px 0 6px}
+p{margin:0 0 12px}ul,ol{margin:0 0 12px;padding-left:22px}li{margin-bottom:6px}a{color:var(--accent)}
+code{font-family:Consolas,Menlo,monospace;font-size:.88em;background:light-dark(#e9efee,#263238);padding:1px 5px;border-radius:3px;overflow-wrap:anywhere}
+pre{background:var(--paper);border:1px solid var(--line);border-radius:7px;padding:12px 14px;overflow-x:auto;font:13px/1.5 Consolas,Menlo,monospace;margin:0 0 12px}pre code{background:none;padding:0;font-size:inherit}
+.note{border-left:4px solid var(--accent);background:var(--paper);padding:12px 16px;margin:0 0 14px}.note p:last-child{margin:0}
+.task{background:var(--paper);border:1px solid var(--line);border-radius:9px;padding:6px 20px 14px;margin:18px 0}
+ol.steps{list-style:none;padding-left:0}ol.steps>li{padding-left:28px;position:relative;margin-bottom:10px}ol.steps>li::before{content:"☐";position:absolute;left:2px;color:var(--muted)}
+table{border-collapse:collapse;width:100%;font-size:.9rem;background:var(--paper);margin-bottom:14px}th,td{border:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top}th{background:light-dark(#e8efed,#263238)}
+.small{font-size:.88rem;color:var(--muted)}
+tbody tr:nth-child(even) td{background:light-dark(#f4f8f7,#212b30)}
+ol.steps>li:nth-child(even),ul.band>li:nth-child(even),ol.band>li:nth-child(even){background:light-dark(#f4f8f7,#212b30);border-radius:4px}
+</style>
+</head>
+<body><main>
+<h1>Files: content store, uploads, recycle bin, copy and quotas: implementation plan</h1>
+<p class="small">ShareCraft &middot; Stage 2, platform plan 3A &middot; Written 13 November 2026</p>
+<div class="note"><p><strong>For agentic workers:</strong> REQUIRED SUB-SKILL: use superpowers:subagent-driven-development or superpowers:executing-plans. Steps are checkboxes.</p></div>
+
+<p><strong>Goal:</strong> everyday file work at SharePoint's level. Files of many gigabytes upload by drag and drop, resume after an interruption and are checked against their checksum. Deleted items go to a two-stage recycle bin and can be restored for 93 days; after that, or when the bin is emptied, their bytes are truly erased. Files and folders can be copied, and many items moved, copied or deleted at once. Duplicate and invalid names are handled without losing anyone's work. Each site has a storage quota.</p>
+<p><strong>Architecture:</strong> file bytes move out of Git into a <em>content store</em> in the data folder: one file per distinct content, named by its SHA-256. Git keeps, for each saved version, a small pointer naming that hash and size, so history, attribution, JSON metadata and checkpoints stay in Git exactly as before (S3, S4). Identical bytes are stored once, so a copy costs nothing. PostgreSQL keeps one row per stored blob and one row per version that points at it, written <em>before</em> the Git commit, so nothing can erase a blob that a version is about to name. Uploads and saves stream to disk while being hashed and pass a reference, never the bytes, through the editing session. Deleting stays a soft delete (plan 1); the recycle bin is a view over deleted nodes whose stage and deletion grouping are recorded in Git with the node. Purging marks the node purged and erases each blob no longer named by any version of any item that is live or in a bin.</p>
+<p><strong>Tech stack:</strong> the existing workspace; <code>sha2</code> (already used by <code>records</code> and <code>server</code>, MIT/Apache) added to <code>revisions</code>; no other new dependency.</p>
+<p><strong>Spec:</strong> <a href="../scope.html">scope.html</a> SC-02 (drag-and-drop and resumable uploads, bulk operations, copy, deletion with documented permission and history behaviour, duplicates, invalid names, interrupted transfers, checksums, quotas, large files), SC-01 (quotas), SC-21 (binary storage; recoverable deletion versus permanent erasure), SC-23 (resumable uploads, checksums, range downloads); D24. Plans 1, 2A and 2B are the base. Owner decisions of 13 November 2026: plan 3 is split into 3A files, 3B sites and 3C libraries, in that order, with document sets and metadata panels moving to Stage 3; the recycle bin has two stages and keeps items 93 days in total, as SharePoint does; malware scanning (plan 3C) calls an external scanner the organisation runs; file bytes live in a content store named by SHA-256 with pointers in Git (settles the binary-storage part of decision 3).</p>
+
+<h2>Not in this plan</h2>
+<ul class="band">
+<li>Previews, image and template libraries, new-from-template, upload rules and file policies, malware quarantine (plan 3C). Site templates, site and library lifecycle, hubs, navigation, language and time zone (plan 3B).</li>
+<li>Rewriting Git history: bytes already stored inside Git before this plan stay in its history and cannot be erased; only versions saved after the upgrade can be. A history-purge tool is later work.</li>
+<li>Uploading a new version of a plain-text document (they are edited live in the text room; refused with <code>text_document</code>). Encryption of the content store, object-storage backends, per-library version limits (SC-08, Stage 3).</li>
+</ul>
+
+<h2>Global constraints</h2>
+<ul class="band">
+<li><strong>Content store:</strong> <code>&lt;data&gt;/blobs/&lt;first two hex digits&gt;/&lt;sha256&gt;</code>, one file per distinct content, never modified. New content is written under <code>&lt;data&gt;/blobs/tmp/</code> (or arrives there as an upload's part file, on the same volume), flushed, then renamed into place; a blob that already exists is not rewritten. The store lives in <code>revisions</code> (<code>BlobStore</code>); the server holds it in <code>AppState</code> and is the only code that turns a pointer into bytes.</li>
+<li><strong>Pointer:</strong> a saved version's <code>docs/&lt;id&gt;/content</code> in Git holds exactly <code>sharecraft-blob 1\nsha256 &lt;64 lowercase hex&gt;\nsize &lt;decimal bytes&gt;\n</code>. Content that does not start with <code>sharecraft-blob 1\n</code> is an old version whose bytes are inline, read as before. Every version saved after the upgrade is a pointer, plain-text documents included. "Unchanged" is decided by comparing hash and size (an inline old version is hashed to compare), so opening and saving an old document unchanged writes nothing.</li>
+<li><strong>Blob safety:</strong> tables <code>blobs (sha256 pk, size, created_at)</code> and <code>blob_refs (sha256, doc_id, revision text null, pending boolean, primary key (doc_id, sha256, revision))</code>. Before any checkpoint, copy or new file names a hash, a <em>pending</em> <code>blob_refs</code> row is written with the <code>blobs</code> row locked <code>FOR SHARE</code>; after the Git commit the row is completed with its revision (or deleted if the commit failed). Erasure locks the <code>blobs</code> row <code>FOR UPDATE</code>, re-counts every row naming it (pending included) and erases only at zero. A pending row older than one hour with no matching Git revision is cleared by the sweeper.</li>
+<li><strong>Locking order</strong> (extending plans 2A and 2B): node rows top-down, then link rows, then <code>site_usage</code>, then groups by id, then roles by id; <code>blobs</code> rows are locked in their own short transactions, never while holding the others.</li>
+<li><strong>Streaming:</strong> uploads, saves and downloads never hold a whole file in memory. A save streams the body into the store in the request handler and passes a <code>BlobRef</code> through the file session (<code>FileCommand::Save</code>, the seat's waiting save and the write job carry a <code>BlobRef</code>, not bytes). Downloads support one <code>Range</code> (<code>206</code>, <code>Content-Range</code>, <code>Accept-Ranges: bytes</code>; <code>416</code> when unsatisfiable) and keep today's download headers. A pointer whose blob file is missing is logged and answers 503.</li>
+<li><strong>Sizes:</strong> <code>SHARECRAFT_MAX_FILE_BYTES</code> stays the largest file allowed, with a new default of 10 GiB. Each person may have at most 5 open upload sessions, and their declared sizes are reserved against the site's quota while open.</li>
+<li><strong>Checksums:</strong> SHA-256 of the whole file, computed as chunks arrive (and recomputed from the part file only after a server restart). Finishing refuses (<code>checksum_mismatch</code>, 422) if the bytes differ from the declared size and checksum, and creates nothing.</li>
+<li><strong>New versions go through the editing session:</strong> an upload that replaces a file (a new-version session, or "replace" on a name conflict) is allowed only for file documents (<code>Editor::is_file</code>) and is saved through the document's file session exactly as an editor's save (<code>Rooms::save_file</code>, the seat rules, S4's base revision); while someone holds the editing seat it answers <code>409 being_edited</code>.</li>
+<li><strong>Recycle bin:</strong> deleting moves an item (a folder with every live item inside it) to its site's <em>first-stage</em> bin; every open editing session on a deleted document ends with <code>deleted</code> (S5), for a folder as for a file. Restoring or removing from the first stage needs <code>delete</code> on the item, judged by a defined function <code>Db::access_as_if_live(user, node)</code> (the one access decision with the deleted flags of the node and its <code>deleted_with</code> group ignored). Removing from the first stage moves the item to the <em>second stage</em>, which only people with <code>manage_site</code> on the site see, restore from and remove from. 93 days after the original deletion, or when removed from the second stage, an item is <em>purged</em>. The bin page lists the entries the viewer could restore (so a person sees nothing whose name they could not see when it was live). The stage and the deletion grouping (<code>deleted_with</code>) are recorded in the node's Git record, with <code>"purged"</code>, so reconcile rebuilds them.</li>
+<li><strong>Restore</strong> puts an item back where it was, with its own permissions as they were. If a folder above it is in the bin, that folder node alone is restored too (never what was deleted with it), and only if the person may restore it; otherwise the answer is <code>409 parent_in_bin</code>. If a folder above it has been purged, the item is restored to the top of its library. Items deleted with a folder come back with it; items deleted separately before the folder stay in the bin. A name now taken gets <code>&nbsp;(2)</code>, <code>&nbsp;(3)</code> &hellip; before its extension (plan 1's <code>unique_name</code>, shared) and the answer says so. Links revoked by the deletion stay revoked.</li>
+<li><strong>Purge and erasure:</strong> purging an item purges what was deleted with it; items inside it deleted separately keep their own bin entries. A purged node stays as a tombstone (Git record marked <code>"purged"</code>, PostgreSQL row kept, never listed) so sync clients learn it is gone (SC-23); its assignments, link groups and open requests are removed. Its versions' <code>blob_refs</code> rows are deleted and each hash with no rows left is erased (the blob file deleted after the commit). Bytes stored inline in Git before the upgrade are not erasable.</li>
+<li><strong>Copy:</strong> copying a file or folder (to any library or folder the person may add to) makes new items with new identifiers and the same bytes, the latest saved version only (unsaved live edits in an open text room are not included; history is not copied), and the destination's permissions (a copy inherits; own permissions and links are not copied). An old inline latest version is written to the store first. Needs <code>view</code> on the source and <code>add</code> on the destination. A folder's copy is one tree commit, and the first versions of all its documents one checkpoint commit.</li>
+<li><strong>Bulk:</strong> move, copy, delete and restore accept up to 500 items per request; each item is one operation with its own result (<code>ok</code> or an error code), in the order given.</li>
+<li><strong>Names on upload and copy:</strong> refused characters are replaced by <code>_</code> (plan 1's <code>clean_name</code>, shared) and the answer says so. A name taken in the destination: an upload answers <code>409 name_taken {suggested}</code> until the person chooses <em>replace</em> (a new version as above; needs <code>edit</code>), <em>keep both</em> or <em>skip</em>. Copies always keep both.</li>
+<li><strong>Quotas:</strong> each site has a storage quota in bytes (default none; set by administrators). Usage is the sum of the sizes of every version of every item in the site, live and in its bins, inline old versions included (their size is known from Git). A save, upload or copy first reserves its bytes in its own transaction (<code>site_usage</code> locked <code>FOR UPDATE</code>, checked, reservation added), then commits to Git, then turns the reservation into usage; a failure releases it. Over the quota it is refused (<code>quota_exceeded</code>, 507) before anything is committed. Checkpoints of the live text room and of co-authoring are never refused for quota (they would retry for ever); deleting, restoring and purging always work. At 90% the site page warns its owners.</li>
+<li>All existing rules stand: the one access decision, S4 base revisions, S5 rechecks, events for every change (<code>node.restored</code>, <code>node.binned</code> (to the second stage), <code>node.purged</code> (with bytes freed), <code>node.copied</code>, <code>quota.changed</code>, <code>upload.completed</code>), no printing of <code>.env</code>, addresses, passwords or tokens, HTML documents with colour banding.</li>
+</ul>
+
+<h2>Review focus</h2>
+<ol class="band">
+<li>Erasure never removes bytes a version points at or is about to point at: a purge racing a save of the same bytes, a copy, an old version of another file. (Task 4, <code>erasure_keeps_shared_bytes</code>, <code>purge_racing_a_save_of_the_same_bytes</code>.)</li>
+<li>An interrupted upload resumed from where it stopped produces exactly the declared bytes; a wrong checksum, a short or long upload, or chunks out of order create nothing. (Task 2, <code>resume_after_interruption</code>, <code>bad_uploads_create_nothing</code>.)</li>
+<li>Restoring a folder brings back what was deleted with it, not what was deleted separately before it, with the same permissions; it never restores someone else's deleted folder the person may not restore; it never resurrects a revoked link. (Task 3, <code>restore_folder_brings_back_its_own</code>, <code>restore_never_beyond_your_rights</code>.)</li>
+<li>Two uploads finishing at the same moment cannot take a site over its quota together. (Task 5, <code>concurrent_finish_respects_quota</code>.)</li>
+<li>After the upgrade, a live checkpoint writes a pointer and is still refused when stale; an editor's save of a large file streams through the file session; old inline versions still download byte for byte; a replace upload while someone edits is refused. (Task 1, <code>checkpoint_writes_pointer_and_stays_s4</code>, <code>old_inline_versions_still_read</code>; Task 2, <code>replace_while_being_edited_refused</code>.)</li>
+</ol>
+
+<div class="task">
+<h3>Task 1: the content store and streaming</h3>
+<p><strong>Files:</strong> create <code>crates/revisions/src/blobs.rs</code>, <code>crates/records/migrations/0009_blobs.sql</code>, <code>crates/records/src/blobs.rs</code>; modify <code>crates/revisions/Cargo.toml</code> (sha2), <code>crates/revisions/src/store.rs</code> and <code>lib.rs</code> (pointers; "unchanged" by hash; <code>Stored.content</code>), <code>crates/server/src/checkpoint.rs</code> (the trait and every implementation: <code>file_room.rs</code> and <code>room.rs</code> test checkpointers, and the test checkpointers in <code>crates/server/tests/content.rs</code>, <code>events.rs</code>, <code>file_session.rs</code>, <code>revocation.rs</code>), <code>crates/server/src/file_room.rs</code> (<code>FileCommand::Save</code>, the waiting save and the write job carry a <code>BlobRef</code>), <code>crates/server/src/room.rs</code> (text room loads and checkpoints through the store), <code>crates/server/src/links.rs</code> (anonymous download and text read through the store), <code>crates/server/src/api/content.rs</code> (streaming save, upload and ranged download; <code>file_answer</code>), <code>crates/server/src/projection.rs</code>, <code>crates/server/src/config.rs</code>.</p>
+<ul class="band">
+<li><code>revisions::BlobStore::open(dir)</code>; <code>write_from(&amp;self, reader, limit) -&gt; Result&lt;BlobRef, BlobError&gt;</code>; <code>adopt_part(&amp;self, part: &amp;Path, expected: BlobRef)</code> (renames an upload's checked part file into place); <code>open_blob(&amp;self, hash) -&gt; Result&lt;Option&lt;File&gt;, BlobError&gt;</code>; <code>erase(&amp;self, hash)</code>; <code>revisions::BlobRef { sha256: [u8; 32], size: u64 }</code> with <code>to_pointer()</code> / <code>from_pointer()</code>. <code>Stored { content: Content, .. }</code> with <code>Content::Blob(BlobRef)</code> / <code>Content::Inline(Vec&lt;u8&gt;)</code>.</li>
+<li><code>records</code>: <code>Db::claim_blob(&amp;self, blob: BlobRef, doc) -&gt; Result&lt;ClaimId, DbError&gt;</code> (blobs row upserted and locked <code>FOR SHARE</code>, pending ref written, one transaction), <code>Db::settle_claim(&amp;self, claim, revision: Option&lt;&amp;str&gt;)</code> (complete with the revision, or delete when the commit failed), <code>Db::release_blob_if_unreferenced(&amp;self, hash) -&gt; Result&lt;bool, DbError&gt;</code> (locks <code>FOR UPDATE</code>, counts, deletes the row at zero; the caller then erases the file). The projection recorder writes the completed refs; the start-up reconcile rebuilds <code>blob_refs</code> from Git only when the upgrade marker or a <code>blob_refs_dirty</code> flag says so (purged nodes left out), and erases unreferenced blobs only after a rebuild with no failure and only blobs older than 24 hours.</li>
+<li>Upgrade: existing inline versions are left as they are and counted by size; no bytes are moved out of Git.</li>
+</ul>
+<ol class="steps">
+<li>Write failing tests: <code>blob_written_once_and_named_by_hash</code>; <code>pointer_round_trip_exact_bytes</code>; <code>too_large_writes_nothing</code>; <code>checkpoint_writes_pointer_and_stays_s4</code>; <code>unchanged_old_document_writes_nothing</code>; <code>old_inline_versions_still_read</code>; <code>download_supports_a_range</code> (first bytes, a middle range, a suffix range, 416); <code>saves_stream_through_the_file_session</code> (a reader that fails if the server ever buffers more than 1 MiB of it at once, wrapping a 200 MiB body); <code>text_room_checkpoint_is_a_pointer</code>; <code>anyone_link_download_reads_the_store</code>; <code>rebuild_only_when_flagged</code>; <code>startup_erasure_waits_for_a_clean_rebuild</code>.</li>
+<li>Run: fails. Implement. Run <code>cargo test -p revisions</code> and <code>cargo xtask check</code>: pass.</li>
+<li>Commit <code>feat: file bytes in a content store, pointers in Git</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 2: resumable upload sessions</h3>
+<p><strong>Files:</strong> create <code>crates/records/migrations/0010_uploads.sql</code>, <code>crates/records/src/uploads.rs</code>, <code>crates/server/src/api/uploads.rs</code>, <code>crates/server/tests/uploads.rs</code>; modify <code>api/mod.rs</code>, the sweeper (plan 2B) to expire sessions and clear stale pending claims.</p>
+<ul class="band">
+<li>Table <code>upload_sessions (id uuid pk, owner references users, site_id, parent_id null, doc_id null, name text, size bigint, sha256 bytea, received bigint, base_revision text null, created_at, touched_at)</code>; parts at <code>&lt;data&gt;/uploads/&lt;id&gt;.part</code> (same volume as the store).</li>
+<li><code>POST /api/uploads {parent | doc, name, size, sha256, base?}</code> starts a session: a new file under <code>parent</code> (<code>add</code>), or a new version of file document <code>doc</code> based on <code>base</code> (<code>edit</code>; <code>text_document</code> for plain-text documents); size limit, the 5-session limit and the quota reservation checked now. <code>PUT /api/uploads/{id}</code> with <code>Content-Range: bytes start-end/size</code> appends only at the received offset (<code>409 wrong_offset {expected}</code>), hashing as it writes. <code>GET /api/uploads/{id}</code> answers the bytes received. <code>POST /api/uploads/{id}/finish {on_conflict?}</code> re-checks permission, checks size and SHA-256, adopts the part into the store, claims the blob, then creates the file (name rules and conflict choices) or saves the new version through the file session (<code>being_edited</code> while the seat is held; stale <code>base</code> refused as S4). <code>DELETE /api/uploads/{id}</code> abandons it. Other people get 404 for a session. Sessions with no chunk for 24 hours expire; the sweeper deletes their parts and releases their reservations.</li>
+</ul>
+<ol class="steps">
+<li>Write failing tests: <code>upload_in_chunks_then_finish</code>; <code>resume_after_interruption</code>; <code>resume_after_server_restart</code> (the hash is recomputed from the part); <code>bad_uploads_create_nothing</code>; <code>sessions_belong_to_their_owner</code>; <code>five_open_sessions_at_most</code>; <code>new_version_goes_through_the_file_session</code>; <code>replace_while_being_edited_refused</code>; <code>new_version_session_refused_when_stale</code>; <code>text_documents_refuse_new_version_uploads</code>; <code>permission_lost_during_upload_refuses_finish</code>; <code>expired_sessions_are_swept</code>.</li>
+<li>Run: fails. Implement. Run <code>cargo xtask check</code>: passes.</li>
+<li>Commit <code>feat(server): resumable upload sessions with checksums</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 3: the recycle bin</h3>
+<p><strong>Files:</strong> create <code>crates/records/migrations/0011_bin.sql</code>, <code>crates/records/src/bin.rs</code>, <code>crates/records/tests/bin.rs</code>, <code>crates/server/src/api/bin.rs</code>, <code>crates/server/tests/bin.rs</code>; modify <code>crates/revisions/src/tree.rs</code> (<code>TreeRecord</code> gains <code>bin_stage</code>, <code>deleted_with</code>, <code>purged</code>), <code>crates/records/src/tree.rs</code> and <code>crates/server/src/tree.rs</code> (recursive delete; <code>TreeOp::Restore</code>, <code>ToSecondStage</code>, <code>Purge</code>; <code>apply</code> returns every document deleted so each open session ends), <code>crates/server/src/api/nodes.rs</code> (delete sends <code>Deleted</code> to every deleted document), and every user of plan 1's <code>not_empty</code> rule (<code>server/src/tree.rs</code> ~966, <code>api/mod.rs</code> ~166/242/302, <code>records/src/documents.rs</code> ~190, <code>tests/nodes.rs</code> ~819, <code>tests/tree.rs</code> ~859, <code>web/common.js</code> ~31, the comments on <code>TreeOp::Delete</code> and in <code>nodes.rs</code> ~380).</p>
+<ul class="band">
+<li>Columns on <code>nodes</code> mirrored from Git: <code>deleted_with uuid null</code>, <code>bin_stage smallint null</code>, <code>purged_at null</code>. <code>Db::access_as_if_live(&amp;self, user, node)</code> as Global constraints.</li>
+<li><code>Db::bin(&amp;self, user, site, stage, after, limit)</code>: paged entries the viewer could restore (top of each deletion, path at deletion, size, who deleted it, when, days left); <code>Db::due_for_purge(now)</code>; the sweeper purges what is due, one item per transaction.</li>
+</ul>
+<ol class="steps">
+<li>Write failing tests: <code>delete_folder_with_contents</code>; <code>deleting_a_folder_ends_sessions_inside_it</code>; <code>restore_folder_brings_back_its_own</code> (a file deleted separately earlier stays in the bin; permissions as before; a revoked link stays revoked); <code>restore_never_beyond_your_rights</code> (a folder above deleted by someone else and not restorable by you: <code>parent_in_bin</code>; restorable: the folder alone comes back); <code>restore_under_a_purged_folder_goes_to_the_library_top</code>; <code>restore_into_a_taken_name_gets_a_suffix</code>; <code>bin_lists_only_what_you_could_restore</code>; <code>second_stage_only_for_site_managers</code>; <code>purge_after_93_days</code> (controlled clock); <code>purging_a_folder_keeps_separate_entries</code>; <code>purged_items_are_tombstones_without_access</code>; <code>reconcile_keeps_bin_state</code>.</li>
+<li>Run: fails. Implement. Run <code>cargo xtask check</code>: passes.</li>
+<li>Commit <code>feat: two-stage recycle bin with restore and purge</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 4: erasure, copy and bulk operations</h3>
+<p><strong>Files:</strong> create <code>crates/server/src/api/bulk.rs</code>, <code>crates/server/tests/copy_bulk.rs</code>; modify the server's tree (<code>TreeOp::Copy</code>), the purge path (Task 3), <code>crates/records/src/blobs.rs</code>.</p>
+<ul class="band">
+<li>Purging a document deletes its <code>blob_refs</code> rows in the purge transaction; after it commits, each of its hashes goes through <code>release_blob_if_unreferenced</code> and is erased at zero.</li>
+<li><code>TreeOp::Copy { id, parent, name? }</code>: Global constraints' rules; claims every copied blob before the commits; <code>node.copied</code> events name the source.</li>
+<li><code>POST /api/bulk {op: "move" | "copy" | "delete" | "restore", items: [ids], parent?}</code>: up to 500 items; answers <code>[{id, ok, error?, new_id?}]</code> in order; each item through the same single-item path.</li>
+</ul>
+<ol class="steps">
+<li>Write failing tests: <code>erasure_keeps_shared_bytes</code>; <code>purge_racing_a_save_of_the_same_bytes</code> (a gate holds the save between claim and commit; the purge does not erase); <code>copy_file_and_folder</code> (new ids, same bytes, no new blob file, destination permissions, no links, two commits for a folder); <code>copy_of_an_old_inline_file_writes_its_blob</code>; <code>copy_needs_view_and_add</code>; <code>bulk_reports_each_item</code>; <code>bulk_limit_500</code>.</li>
+<li>Run: fails. Implement. Run <code>cargo xtask check</code>: passes.</li>
+<li>Commit <code>feat: erasure, copy and bulk operations</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 5: quotas, duplicate and invalid names</h3>
+<p><strong>Files:</strong> create <code>crates/records/migrations/0012_quotas.sql</code>, <code>crates/records/src/quotas.rs</code>, <code>crates/records/tests/quotas.rs</code>; modify the upload, save and copy paths, <code>api/sites.rs</code>, <code>crates/server/src/tree.rs</code> (<code>clean_name</code> and <code>unique_name</code> shared with uploads and copies).</p>
+<ul class="band">
+<li>Table <code>site_usage (site_id pk, used bigint, reserved bigint, quota bigint null)</code>; reserve, commit and release as Global constraints; the rebuild recomputes <code>used</code> when flagged. <code>PUT /api/sites/{id}/quota {bytes | null}</code> (administrators); <code>GET /api/sites/{id}</code> includes <code>used</code> and <code>quota</code> for people with <code>manage_site</code>.</li>
+<li>Names: <code>409 name_taken {suggested}</code> for uploads without a choice; <code>on_conflict: "replace" | "keep_both" | "skip"</code>.</li>
+</ul>
+<ol class="steps">
+<li>Write failing tests: <code>quota_refuses_before_committing</code>; <code>concurrent_finish_respects_quota</code>; <code>live_checkpoints_never_refused_for_quota</code>; <code>failed_commit_releases_the_reservation</code>; <code>deleting_and_purging_always_allowed_over_quota</code>; <code>usage_counts_versions_bins_and_inline</code>; <code>upload_name_choices</code>; <code>refused_characters_cleaned_and_reported</code>.</li>
+<li>Run: fails. Implement. Run <code>cargo xtask check</code>: passes.</li>
+<li>Commit <code>feat: site quotas and name handling on upload</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 6: pages</h3>
+<p><strong>Files:</strong> modify <code>web/library.js</code>/<code>library.html</code>, <code>web/site.js</code>, <code>web/groups.js</code>, <code>web/roles.js</code>, <code>web/common.js</code>, <code>web/style.css</code>, <code>web/common.test.mjs</code>; create <code>web/bin.html</code>/<code>bin.js</code>, <code>web/upload.js</code>, <code>web/upload.test.mjs</code>.</p>
+<ul class="band">
+<li><strong>Upload:</strong> drop files or whole folders onto a library or folder (folders recreated), or pick them; an upload panel with each file's progress, 8 MiB chunks through upload sessions, SHA-256 computed in the browser; a dropped connection retries from the server's offset; a name conflict asks Replace / Keep both / Skip (with "do this for the rest"); refused characters and <code>being_edited</code> explained.</li>
+<li><strong>Selection and bulk:</strong> check boxes on library rows and Select all; Move&hellip;, Copy&hellip;, Delete with one confirmation and a summary of per-item results. <strong>Copy&hellip;</strong> reuses the move dialog.</li>
+<li><strong>Recycle bin</strong> (<code>bin.html?site=</code>, linked from the site and library pages): first stage (path, who deleted, when, days left, size), Restore and Delete; second stage for site managers; Empty with a confirmation that says it cannot be undone.</li>
+<li><strong>Quota:</strong> usage bar on the site page for site managers, warning at 90%; quota field for administrators.</li>
+<li>Confirmations before Remove member (groups page) and Delete role (roles page), noted in the last browser check. 375 pixels, light and dark mode, colour banding, names as text only.</li>
+</ul>
+<ol class="steps">
+<li>Write failing tests (chunk planning and resume offsets, conflict choices, bulk result summaries, days-left wording; the upload queue against a stubbed server).</li>
+<li>Run <code>node --test web/*.test.mjs</code>: fails. Implement. Run it and <code>cargo xtask check</code>: pass.</li>
+<li>Commit <code>feat(web): uploads, bulk operations, copy and the recycle bin</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 7 (controller): browser check and documents</h3>
+<ol class="steps">
+<li>Back up the development database and the whole data folder; build; check the build's exit code; stop the old server before building; start the new one (migrations 0009&ndash;0012 and the blob-refs rebuild run).</li>
+<li>In the browser (window open), record each as checked or not: drag a folder of several files and a 1 GiB file into a library; interrupt the large upload (stop the server mid-way) and resume; each name-conflict choice; select several files and copy, move and delete them; delete a folder while one of its files is open; restore a folder from the bin; second stage as a site owner; a quota that refuses an upload; an old (pre-upgrade) file still downloads; a range download; 375 pixels and dark mode.</li>
+<li>Update <code>BUILDING.html</code> (content store layout, pointer format, blob safety, erasure, upgrade and backups, routes, limits), <code>sequencing.html</code>, and record the owner decisions of 13 November 2026 in <code>scope.html</code> (binary storage settled; the bin; the scanner approach for 3C; the plan 3 split). Commit <code>docs: files</code>.</li>
+</ol></div>
+</main></body>
+
+</html>
