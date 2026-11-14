@@ -770,3 +770,14 @@ test('the quota field: empty is no quota, a number is gigabytes, anything else i
   assert.equal(parseQuotaGb('lots'), undefined);
   assert.equal(parseQuotaGb('1e3'), undefined);
 });
+
+import { quotaSubmit } from './common.js';
+
+test('an empty quota field removes the quota only where the current quota is shown', () => {
+  assert.deepEqual(quotaSubmit('', { blind: false }), { bytes: null });
+  assert.deepEqual(quotaSubmit('2', { blind: false }), { bytes: 2 * 1024 ** 3 });
+  assert.match(quotaSubmit('', { blind: true }).error, /number of gigabytes/);
+  assert.match(quotaSubmit('  ', { blind: true }).error, /number of gigabytes/);
+  assert.deepEqual(quotaSubmit('2', { blind: true }), { bytes: 2 * 1024 ** 3 });
+  assert.match(quotaSubmit('lots', { blind: false }).error, /number of gigabytes/);
+});

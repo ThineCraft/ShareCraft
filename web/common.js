@@ -946,3 +946,15 @@ export function confirmDialog(text, label) {
     cancel.focus();
   });
 }
+
+/**
+ * What the quota form sends: `{ bytes }` (null for no quota) or `{ error }`. Where the person
+ * cannot see the current quota (`blind`), an empty field is refused rather than taken to mean
+ * "remove the quota"; removing it there has its own button.
+ */
+export function quotaSubmit(text, { blind = false } = {}) {
+  const bytes = parseQuotaGb(text);
+  const asked = 'Enter the quota as a number of gigabytes' + (blind ? '.' : ', or leave it empty for no quota.');
+  if (bytes === undefined || (blind && bytes === null)) return { error: asked };
+  return { bytes };
+}

@@ -52,6 +52,13 @@ $('more').addEventListener('click', () => loadPage());
 $('empty-bin').addEventListener('click', emptyBin);
 await reload();
 
+/** Forgets the last Empty's summary so it does not linger over another listing. */
+function clearSummary() {
+  $('bin-status').textContent = '';
+  $('bin-failures').replaceChildren();
+  $('bin-failures').hidden = true;
+}
+
 function choose(event, which) {
   event.preventDefault();
   if (which === stage) return;
@@ -67,6 +74,7 @@ function note(text, isError) {
 }
 
 async function reload() {
+  clearSummary();
   entries = [];
   next = null;
   for (const which of ['first', 'second']) {
@@ -206,6 +214,7 @@ async function emptyBin() {
   } finally {
     button.disabled = false;
   }
+  await reload();
   $('bin-status').textContent = `${done} of ${all.length} ${all.length === 1 ? 'item was' : 'items were'} ${verb}.`;
   if (failed.length) {
     // The alert is for the failure summary only; the items are listed below it.
@@ -215,7 +224,6 @@ async function emptyBin() {
     );
     $('bin-failures').hidden = false;
   }
-  await reload();
 }
 
 function fail(text) {

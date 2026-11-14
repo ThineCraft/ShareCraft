@@ -6,7 +6,8 @@ import {
   pageFor,
   queryId,
   can,
-  parseQuotaGb,
+  confirmDialog,
+  quotaSubmit,
   quotaText,
   usagePercent,
   requireMe,
@@ -90,18 +91,29 @@ function showQuotaOnly() {
   $('storage').hidden = false;
   $('storage-text').textContent = 'The current quota and usage are shown to people who manage this site.';
   $('quota-form').hidden = false;
+  $('quota-remove').hidden = false;
+}
+
+/** Sets the quota to `bytes` (null for none) and shows the result. */
+async function putQuota(bytes) {
+  const result = await api('PUT', `/sites/${seg(siteId)}/quota`, { bytes });
+  if (!result.ok) return showMessage(error, messageFor(result.error));
+  if (manageSite) await showStorage();
+  else showMessage(error, bytes === null ? 'The quota was removed.' : 'The quota was set.');
 }
 
 $('quota-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   showMessage(error, '');
-  const bytes = parseQuotaGb($('quota-gb').value);
-  if (bytes === undefined) {
-    return showMessage(error, 'Enter the quota as a number of gigabytes, or leave it empty for no quota.');
-  }
-  const result = await api('PUT', `/sites/${seg(siteId)}/quota`, { bytes });
-  if (!result.ok) return showMessage(error, messageFor(result.error));
-  await showStorage();
+  const asked = quotaSubmit($('quota-gb').value, { blind: !manageSite });
+  if (asked.error) return showMessage(error, asked.error);
+  await putQuota(asked.bytes);
+});
+
+$('quota-remove').addEventListener('click', async () => {
+  showMessage(error, '');
+  const sure = await confirmDialog('Remove the storage quota of this site? It will then have no limit.', 'Remove quota');
+  if (sure) await putQuota(null);
 });
 
 async function showLibraries() {
