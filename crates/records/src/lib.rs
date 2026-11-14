@@ -56,7 +56,8 @@ pub use sites::{
 };
 pub use templates::{
     MAX_PACKAGE_BYTES, MAX_TEMPLATE_DEPTH, MAX_TEMPLATE_FOLDERS, MAX_TEMPLATE_LIBRARIES,
-    validate_template_body, validate_template_description, validate_template_name,
+    check_template_size, validate_template_body, validate_template_description,
+    validate_template_name,
 };
 pub use tree::{Node, NodeChange, NodeKind, NodeRow, NodesApplied, validate_node_name};
 pub use uploads::{

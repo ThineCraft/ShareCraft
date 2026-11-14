@@ -16,8 +16,9 @@ use super::nodes::node_id;
 use super::{ApiError, JsonBody, to_completion};
 use crate::AppState;
 use crate::auth::Signed;
-use crate::templates::{self, TemplateSummary};
+use crate::templates::{self, Cleaned, TemplateSummary};
 use crate::tree::clean_folder_name;
+use revisions::TemplateRecord;
 
 /// The largest body `POST /api/templates/import` reads: a package larger than
 /// [`records::MAX_PACKAGE_BYTES`] up to this is answered with its reason, beyond it `413`.
@@ -45,7 +46,8 @@ pub(crate) struct SaveBody {
 /// `POST /api/sites/{id}/template {name, description?}`: saves the site's shape as a template
 /// (see [`templates::save_from_site`]). Administrators only (`403`); `404` for anything but a
 /// live site; `422 invalid_template` with a `reason` for a name or description that breaks the
-/// rules or a site too large for a template. `201` with the template as listed.
+/// rules or a site too large for a template. `201` with the template as listed and `cleaned`,
+/// the names made under older rules that had to change (`[{from, to}]`).
 pub(crate) async fn save(
     State(state): State<AppState>,
     signed: Signed,
@@ -55,10 +57,9 @@ pub(crate) async fn save(
     let site = node_id(&id)?;
     let actor = signed.session.user;
     to_completion(async move {
-        let record =
+        let (record, cleaned) =
             templates::save_from_site(&state, &actor, site, &body.name, &body.description).await?;
-        let out = templates::summary_of_record(&record);
-        Ok((StatusCode::CREATED, Json(out)).into_response())
+        Ok((StatusCode::CREATED, Json(answered(&record, &cleaned))).into_response())
     })
     .await
 }
@@ -100,17 +101,25 @@ pub(crate) async fn import(
     if !actor.is_admin {
         return Err(ApiError::Forbidden);
     }
-    let (package, cleaned) = templates::read_package(&body)?;
+    // Reading a package is bounded work, but not trivial: it runs off the async workers.
+    let (package, cleaned) = tokio::task::spawn_blocking(move || templates::read_package(&body))
+        .await
+        .map_err(|e| ApiError::unavailable(&e))??;
     to_completion(async move {
         let record = templates::import(&state, &actor, package, &cleaned).await?;
-        let mut out: Value =
-            serde_json::to_value(templates::summary_of_record(&record)).unwrap_or_default();
-        if let Some(fields) = out.as_object_mut() {
-            fields.insert("cleaned".to_owned(), json!(cleaned));
-        }
-        Ok((StatusCode::CREATED, Json(out)).into_response())
+        Ok((StatusCode::CREATED, Json(answered(&record, &cleaned))).into_response())
     })
     .await
+}
+
+/// A saved template as listed, with `cleaned`: the names that had to change.
+fn answered(record: &TemplateRecord, cleaned: &[Cleaned]) -> Value {
+    let mut out: Value =
+        serde_json::to_value(templates::summary_of_record(record)).unwrap_or_default();
+    if let Some(fields) = out.as_object_mut() {
+        fields.insert("cleaned".to_owned(), json!(cleaned));
+    }
+    out
 }
 
 /// `DELETE /api/templates/{id}`: deletes a saved template (its record is kept, marked

@@ -2591,7 +2591,7 @@ fn unique_name(name: &str, editor: Editor, taken: &HashSet<String>) -> String {
 
 /// `stem`, `suffix` and `extension` joined, with `stem` shortened so the whole fits the name
 /// length limit.
-fn fit(stem: &str, extension: &str, suffix: &str) -> String {
+pub(crate) fn fit(stem: &str, extension: &str, suffix: &str) -> String {
     let room = MAX_NAME_CHARS
         .saturating_sub(extension.chars().count())
         .saturating_sub(suffix.chars().count())

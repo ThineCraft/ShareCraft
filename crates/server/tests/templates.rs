@@ -14,10 +14,11 @@
 mod common;
 
 use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
 
 use common::{Site, TestServer, TestUser, spawn_server};
 use reqwest::{Method, StatusCode};
-use revisions::{Author, NavItem, NavTarget, SiteRecord, SitesChange, TreeRecord};
+use revisions::{Author, NavItem, NavTarget, SiteRecord, SitesChange, TreeChange, TreeRecord};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -1058,4 +1059,201 @@ async fn built_ins_cannot_be_deleted() {
         json!({ "name": "Still", "template": "team" }),
     )
     .await;
+}
+
+/// A package whose Documents library holds `count` folders, every one named `name`.
+fn same_named(count: usize, name: &str) -> Vec<u8> {
+    let mut package = good_package();
+    package["body"]["libraries"][0]["folders"] =
+        (0..count).map(|_| json!({ "name": name })).collect();
+    serde_json::to_vec(&package).unwrap()
+}
+
+#[tokio::test]
+async fn crafted_package_is_refused_or_cleaned_quickly() {
+    let server = spawn_server().await;
+    let root = server.admin("Root").await;
+    // Names made unique one by one would take billions of steps for these; the limits are
+    // checked first, and naming is linear.
+    for count in [5_001, 75_000] {
+        let bytes = same_named(count, "a");
+        assert!(bytes.len() <= 1024 * 1024, "{}", bytes.len());
+        let started = Instant::now();
+        let (status, body) = import(&server, &root, bytes).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["reason"], "too_many_folders", "{body}");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{count} folders took {:?}",
+            started.elapsed()
+        );
+    }
+    assert!(server.store().read_templates().unwrap().is_empty());
+
+    // The most folders allowed, all with one name in one place, are taken and named apart.
+    let started = Instant::now();
+    let (status, body) = import(&server, &root, same_named(5_000, "a")).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "took {:?}",
+        started.elapsed()
+    );
+    let cleaned = body["cleaned"].as_array().unwrap();
+    assert_eq!(cleaned.len(), 4_999);
+    assert_eq!(cleaned[0], json!({ "from": "a", "to": "a (2)" }));
+    assert_eq!(cleaned[4_998], json!({ "from": "a", "to": "a (5000)" }));
+    let records = server.store().read_templates().unwrap();
+    let folders = &records[0].body.libraries[0].folders;
+    let mut names: Vec<String> = folders.iter().map(|f| f.name.to_lowercase()).collect();
+    names.sort();
+    names.dedup();
+    assert_eq!(names.len(), 5_000);
+}
+
+#[tokio::test]
+async fn cleaned_links_follow_their_library() {
+    let server = spawn_server().await;
+    let root = server.admin("Root").await;
+    let mut package = good_package();
+    package["body"]["libraries"] = json!([
+        { "name": "Bad:Name", "folders": [] },
+        { "name": "bad_name", "folders": [] }
+    ]);
+    package["body"]["navigation"] = json!([
+        { "label": "First", "target": { "library": "Bad:Name" }, "audience": [], "children": [] },
+        { "label": "Second", "target": { "library": "bad_name" }, "audience": [], "children": [] },
+        { "label": "Third", "target": { "library": "BAD:NAME" }, "audience": [], "children": [] }
+    ]);
+    let (status, body) = import(&server, &root, serde_json::to_vec(&package).unwrap()).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(
+        body["cleaned"],
+        json!([
+            { "from": "Bad:Name", "to": "Bad_Name" },
+            { "from": "bad_name", "to": "bad_name (2)" }
+        ])
+    );
+    let template = body["id"].as_str().unwrap().to_owned();
+    let (status, exported) = call(
+        &server,
+        &root,
+        Method::GET,
+        &format!("/api/templates/{template}/package"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{exported}");
+    let targets: Vec<&Value> = exported["body"]["navigation"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| &item["target"]["library"])
+        .collect();
+    assert_eq!(
+        targets,
+        vec![
+            &json!("Bad_Name"),
+            &json!("bad_name (2)"),
+            &json!("Bad_Name")
+        ]
+    );
+
+    let id = create_site(
+        &server,
+        &root,
+        json!({ "name": "Linked", "template": template }),
+    )
+    .await;
+    let first = node_at(&server, &id, "Bad_Name");
+    let second = node_at(&server, &id, "bad_name (2)");
+    let navigation = record_of(&server, &id).navigation.unwrap();
+    let targets: Vec<Option<NavTarget>> = navigation.iter().map(|i| i.target.clone()).collect();
+    assert_eq!(
+        targets,
+        vec![
+            Some(NavTarget::Node(first)),
+            Some(NavTarget::Node(second)),
+            Some(NavTarget::Node(first))
+        ]
+    );
+}
+
+#[tokio::test]
+async fn old_names_are_cleaned_when_saved() {
+    let server = spawn_server().await;
+    let root = server.admin("Root").await;
+    let site = create_site(&server, &root, json!({ "name": "Old" })).await;
+    let plans = child(&server, &root, &site, "library", "Plans").await;
+    let q1 = child(&server, &root, &plans, "folder", "Q1").await;
+    // Named under older rules: names refused today.
+    let tree = server.store().read_tree().unwrap();
+    let renamed: Vec<TreeRecord> = tree
+        .iter()
+        .filter_map(|r| {
+            let mut r = r.clone();
+            r.name = match r.id.to_string() {
+                id if id == plans => "Old:Plans".to_owned(),
+                id if id == q1 => "trail.".to_owned(),
+                _ => return None,
+            };
+            Some(r)
+        })
+        .collect();
+    let author = Author {
+        id: "test".into(),
+        name: "Test".into(),
+    };
+    server
+        .store()
+        .write_tree(&TreeChange {
+            author: &author,
+            message: "Names under older rules",
+            records: &renamed,
+        })
+        .unwrap();
+    let mut record = record_of(&server, &site);
+    record.navigation = Some(vec![nav(
+        "Plans",
+        Some(NavTarget::Node(Uuid::parse_str(&q1).unwrap())),
+        Vec::new(),
+    )]);
+    write_record(&server, record);
+
+    let (status, saved) = save(&server, &root, &site, "From old").await;
+    assert_eq!(status, StatusCode::CREATED, "{saved}");
+    assert_eq!(
+        saved["cleaned"],
+        json!([
+            { "from": "Old:Plans", "to": "Old_Plans" },
+            { "from": "trail.", "to": "trail_" }
+        ])
+    );
+    let records = server.store().read_templates().unwrap();
+    let body = serde_json::to_value(&records[0].body).unwrap();
+    assert_eq!(
+        body["libraries"],
+        json!([
+            { "name": "Documents", "folders": [] },
+            { "name": "Old_Plans", "folders": [ { "name": "trail_", "folders": [] } ] }
+        ])
+    );
+    assert_eq!(
+        body["navigation"][0]["target"],
+        json!({ "library": "Old_Plans" })
+    );
+    let saved_events = events(&server, "template.saved").await;
+    assert_eq!(saved_events[0]["cleaned"], saved["cleaned"]);
+
+    // A site made from it gets the cleaned names, and its link reaches the library.
+    let copy = create_site(
+        &server,
+        &root,
+        json!({ "name": "New", "template": saved["id"] }),
+    )
+    .await;
+    let library = node_at(&server, &copy, "Old_Plans");
+    node_at(&server, &copy, "Old_Plans/trail_");
+    let navigation = record_of(&server, &copy).navigation.unwrap();
+    assert_eq!(navigation[0].target, Some(NavTarget::Node(library)));
 }

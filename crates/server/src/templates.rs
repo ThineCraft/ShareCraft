@@ -15,7 +15,7 @@ use std::sync::atomic::Ordering;
 use collab_core::ids::NodeId;
 use records::{
     AccessError, DbError, MAX_PACKAGE_BYTES, NewEvent, NodeKind, RegionalDefaults, SiteGroup,
-    TemplateRow, User, validate_template_body, validate_template_description,
+    TemplateRow, User, check_template_size, validate_template_body, validate_template_description,
     validate_template_name,
 };
 use revisions::{
@@ -29,8 +29,8 @@ use uuid::Uuid;
 
 use crate::AppState;
 use crate::tree::{
-    LIBRARY_NAME, SiteShape, Undo, author_of, clean_folder_name, ensure_in_step, git_failure,
-    now_text, read_tree, take_back_all, unique_node_name, write_records,
+    LIBRARY_NAME, SiteShape, Undo, author_of, clean_folder_name, ensure_in_step, fit, git_failure,
+    now_text, read_tree, take_back_all, write_records,
 };
 
 /// The name of the built-in Team template.
@@ -282,11 +282,11 @@ fn names_identifiers(navigation: &Value) -> bool {
 /// Reads a template package from another installation, refusing it with `InvalidTemplate` and
 /// a reason (`too_large` over 1 MiB, `not_utf8`, `unreadable`, `unknown_version`,
 /// `identifiers` for anything named by id, `unknown_field`, `invalid_name`,
-/// `invalid_description`, then those of [`validate_template_body`]), or cleaning it: library
-/// and folder names get the rules of names made here (refused characters become `_`, a name
-/// Windows keeps for a device gets `_`, and a name taken in its place gets ` (2)` …), and a
-/// navigation link's library name is cleaned the same way. Answers the package as it will be
-/// kept and the names that changed, in the order they appear.
+/// `invalid_description`, the size limits of [`check_template_size`], then the other rules of
+/// [`validate_template_body`]), or cleaning it (see [`clean_shape`]). The size limits are
+/// checked before any name is cleaned, and cleaning takes time in proportion to the number of
+/// names, so no package costs much more to refuse than a small one. Answers the package as it
+/// will be kept and the names that changed, in the order they appear.
 ///
 /// # Errors
 /// `InvalidTemplate` as above.
@@ -314,6 +314,8 @@ pub fn read_package(bytes: &[u8]) -> Result<(TemplatePackage, Vec<Cleaned>), Acc
     {
         return refused("identifiers");
     }
+    // serde_json names an unexpected field "unknown field" in its message; a change there
+    // would answer `unreadable` instead, which the hostile-package test would catch.
     let mut package: TemplatePackage = match serde_json::from_value(value) {
         Ok(package) => package,
         Err(e) if e.to_string().contains("unknown field") => return refused("unknown_field"),
@@ -321,69 +323,108 @@ pub fn read_package(bytes: &[u8]) -> Result<(TemplatePackage, Vec<Cleaned>), Acc
     };
     package.name = validate_template_name(&package.name)?.to_owned();
     validate_template_description(&package.description)?;
-    let mut cleaned = Vec::new();
-    package.body.libraries = clean_libraries(package.body.libraries, &mut cleaned);
-    if let Some(items) = &mut package.body.navigation {
-        for item in items.iter_mut() {
-            clean_target(item);
-            item.children.iter_mut().for_each(clean_target);
-        }
-    }
+    check_template_size(&package.body)?;
+    let cleaned = clean_shape(&mut package.body);
     validate_template_body(&package.body)?;
     Ok((package, cleaned))
 }
 
-/// A navigation item's library name, cleaned as library names are.
-fn clean_target(item: &mut TemplateNavItem) {
-    if let Some(TemplateNavTarget::Library(name)) = &mut item.target {
-        *name = clean_folder_name(name);
+/// Cleans the names of `body`'s libraries and folders by the rules of names made here
+/// (refused characters become `_`, a name Windows keeps for a device gets `_`, and a name taken
+/// in its place, ignoring case, gets ` (2)`, ` (3)` …), and leads each navigation link to the
+/// library it named: a link naming a library as the body named it (exactly, or else ignoring
+/// case) names that library's name as kept. Answers the names that changed, depth first.
+fn clean_shape(body: &mut TemplateBody) -> Vec<Cleaned> {
+    let mut cleaned = Vec::new();
+    let mut libraries = Namer::default();
+    let mut exact: HashMap<String, String> = HashMap::new();
+    let mut folded: HashMap<String, String> = HashMap::new();
+    for library in &mut body.libraries {
+        let kept = libraries.keep(&library.name);
+        exact
+            .entry(library.name.clone())
+            .or_insert_with(|| kept.clone());
+        folded
+            .entry(library.name.to_lowercase())
+            .or_insert_with(|| kept.clone());
+        note(&mut cleaned, &mut library.name, kept);
+        clean_folders(&mut library.folders, &mut cleaned);
+    }
+    if let Some(items) = &mut body.navigation {
+        lead_links(items, &exact, &folded);
+    }
+    cleaned
+}
+
+/// Each library link of `items` and their children led to the library's kept name (see
+/// [`clean_shape`]); a link naming no library of the body is left as it is.
+fn lead_links(
+    items: &mut [TemplateNavItem],
+    exact: &HashMap<String, String>,
+    folded: &HashMap<String, String>,
+) {
+    for item in items {
+        if let Some(TemplateNavTarget::Library(name)) = &mut item.target {
+            let kept = exact
+                .get(name.as_str())
+                .or_else(|| folded.get(&name.to_lowercase()));
+            if let Some(kept) = kept {
+                kept.clone_into(name);
+            }
+        }
+        lead_links(&mut item.children, exact, folded);
     }
 }
 
-/// `name` cleaned and made unique among `taken`, which it then joins; a change is noted.
-fn clean_one(name: String, taken: &mut HashSet<String>, cleaned: &mut Vec<Cleaned>) -> String {
-    let kept = unique_node_name(&clean_folder_name(&name), None, taken);
-    taken.insert(kept.to_lowercase());
-    if kept != name {
+/// Sets `name` to `kept`, noting the change if there is one.
+fn note(cleaned: &mut Vec<Cleaned>, name: &mut String, kept: String) {
+    if *name != kept {
         cleaned.push(Cleaned {
-            from: name,
-            to: kept.clone(),
+            from: std::mem::replace(name, kept.clone()),
+            to: kept,
         });
     }
-    kept
 }
 
-/// `libraries` with every name cleaned (see [`read_package`]).
-fn clean_libraries(
-    libraries: Vec<TemplateLibrary>,
-    cleaned: &mut Vec<Cleaned>,
-) -> Vec<TemplateLibrary> {
-    let mut taken = HashSet::new();
-    libraries
-        .into_iter()
-        .map(|library| {
-            let name = clean_one(library.name, &mut taken, cleaned);
-            TemplateLibrary {
-                name,
-                folders: clean_folders(library.folders, cleaned),
-            }
-        })
-        .collect()
+/// `folders`, and the folders inside them, with every name cleaned, depth first.
+fn clean_folders(folders: &mut [TemplateFolder], cleaned: &mut Vec<Cleaned>) {
+    let mut namer = Namer::default();
+    for folder in folders {
+        let kept = namer.keep(&folder.name);
+        note(cleaned, &mut folder.name, kept);
+        clean_folders(&mut folder.folders, cleaned);
+    }
 }
 
-/// `folders` with every name cleaned, depth first.
-fn clean_folders(folders: Vec<TemplateFolder>, cleaned: &mut Vec<Cleaned>) -> Vec<TemplateFolder> {
-    let mut taken = HashSet::new();
-    folders
-        .into_iter()
-        .map(|folder| {
-            let name = clean_one(folder.name, &mut taken, cleaned);
-            TemplateFolder {
-                name,
-                folders: clean_folders(folder.folders, cleaned),
+/// The names kept in one place, made acceptable and unique ignoring case, in time in
+/// proportion to their number: for each name it remembers the next ` (n)` to try, so many
+/// items with one name do not each count up from ` (2)`.
+#[derive(Default)]
+struct Namer {
+    /// The names kept, lower-cased.
+    taken: HashSet<String>,
+    /// For each cleaned name (lower-cased) that was taken, the next number to try.
+    next: HashMap<String, u64>,
+}
+
+impl Namer {
+    /// `name` cleaned, and made unique among the names kept so far, which it then joins.
+    fn keep(&mut self, name: &str) -> String {
+        let cleaned = clean_folder_name(name);
+        let lower = cleaned.to_lowercase();
+        if self.taken.insert(lower.clone()) {
+            return cleaned;
+        }
+        let mut n = self.next.get(&lower).copied().unwrap_or(2);
+        loop {
+            let candidate = fit(&cleaned, "", &format!(" ({n})"));
+            n = n.saturating_add(1);
+            if self.taken.insert(candidate.to_lowercase()) {
+                self.next.insert(lower, n);
+                return candidate;
             }
-        })
-        .collect()
+        }
+    }
 }
 
 /// A template's navigation made a new site's: each library name becomes the new library of
@@ -539,7 +580,9 @@ fn template_navigation(
 /// Saves the shape of the site `site` as a new template named `name`, for `actor`, an
 /// administrator: its live libraries and folders (no files, nothing in its recycle bin), its
 /// kind, language, time zone and navigation (see [`template_navigation`]), as its records in
-/// Git hold them. One commit, mirrored with `template.saved`.
+/// Git hold them. Names made under older rules are cleaned as an imported package's are (see
+/// [`clean_shape`]), and the links to them follow. One commit, mirrored with `template.saved`
+/// (with the names cleaned). Answers the template and the names that changed.
 ///
 /// # Errors
 /// `Forbidden` for anyone else; `InvalidTemplate` for a name or description that breaks the
@@ -552,7 +595,7 @@ pub async fn save_from_site(
     site: NodeId,
     name: &str,
     description: &str,
-) -> Result<TemplateRecord, AccessError> {
+) -> Result<(TemplateRecord, Vec<Cleaned>), AccessError> {
     require_admin(state, actor).await?;
     let name = validate_template_name(name)?.to_owned();
     validate_template_description(description)?;
@@ -577,7 +620,7 @@ pub async fn save_from_site(
         .into_iter()
         .map(|(id, purpose)| (id.0, purpose))
         .collect();
-    let body = TemplateBody {
+    let mut body = TemplateBody {
         kind: record.kind.clone(),
         language: record.language.clone(),
         time_zone: record.time_zone.clone(),
@@ -587,6 +630,8 @@ pub async fn save_from_site(
             .as_ref()
             .map(|items| template_navigation(items, &tree, site.0, &own_groups)),
     };
+    check_template_size(&body)?;
+    let cleaned = clean_shape(&mut body);
     validate_template_body(&body)?;
     let template = new_template(actor, name, description.to_owned(), body);
     let event = NewEvent {
@@ -595,7 +640,12 @@ pub async fn save_from_site(
         subject: None,
         document: None,
         node: Some(site),
-        detail: json!({ "template": template.id, "name": template.name, "site": site.0 }),
+        detail: json!({
+            "template": template.id,
+            "name": template.name,
+            "site": site.0,
+            "cleaned": cleaned,
+        }),
     };
     let message = format!("Save template {}", template.name);
     let undo = Undo {
@@ -603,7 +653,7 @@ pub async fn save_from_site(
         ..Undo::default()
     };
     commit_template(state, actor, &message, &template, undo, event).await?;
-    Ok(template)
+    Ok((template, cleaned))
 }
 
 /// A new template record made by `actor` now.

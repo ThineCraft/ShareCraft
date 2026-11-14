@@ -64,24 +64,12 @@ pub fn validate_template_description(text: &str) -> Result<&str, AccessError> {
     }
 }
 
-/// Checks a template's body, answering `InvalidTemplate` with the first rule it breaks:
-/// `invalid_kind` (not `team` or `communication`), `invalid_language`, `invalid_time_zone`,
-/// `too_many_libraries` (over 100), `too_many_folders` (over 5,000 in all), `too_deep` (a
-/// folder more than 20 levels below its library), `invalid_names` (a name that is not a node
-/// name, or two alike in one place, ignoring case; cleaning names first avoids this), and
-/// `invalid_navigation` (the rules of a site's navigation, with libraries named rather than
-/// identified, and audiences of `owners`, `members` or `visitors`).
-pub fn validate_template_body(body: &TemplateBody) -> Result<(), AccessError> {
+/// Checks only the size of a template's body, cheaply and before anything else is done with
+/// it: `too_many_libraries` (over 100), `too_many_folders` (over 5,000 in all) or `too_deep` (a
+/// folder more than 20 levels below its library). Stops as soon as a limit is passed, so a
+/// package far over the limits costs no more than one within them.
+pub fn check_template_size(body: &TemplateBody) -> Result<(), AccessError> {
     let refuse = |reason: &'static str| Err(AccessError::InvalidTemplate(reason));
-    if !SITE_KINDS.contains(&body.kind.as_str()) {
-        return refuse("invalid_kind");
-    }
-    if validate_language(&body.language).is_err() {
-        return refuse("invalid_language");
-    }
-    if validate_time_zone(&body.time_zone).is_err() {
-        return refuse("invalid_time_zone");
-    }
     if body.libraries.len() > MAX_TEMPLATE_LIBRARIES {
         return refuse("too_many_libraries");
     }
@@ -106,6 +94,28 @@ pub fn validate_template_body(body: &TemplateBody) -> Result<(), AccessError> {
             stack.push((&folder.folders, depth.saturating_add(1)));
         }
     }
+    Ok(())
+}
+
+/// Checks a template's body, answering `InvalidTemplate` with the first rule it breaks:
+/// `invalid_kind` (not `team` or `communication`), `invalid_language`, `invalid_time_zone`,
+/// `too_many_libraries` (over 100), `too_many_folders` (over 5,000 in all), `too_deep` (a
+/// folder more than 20 levels below its library), `invalid_names` (a name that is not a node
+/// name, or two alike in one place, ignoring case; cleaning names first avoids this), and
+/// `invalid_navigation` (the rules of a site's navigation, with libraries named rather than
+/// identified, and audiences of `owners`, `members` or `visitors`).
+pub fn validate_template_body(body: &TemplateBody) -> Result<(), AccessError> {
+    let refuse = |reason: &'static str| Err(AccessError::InvalidTemplate(reason));
+    if !SITE_KINDS.contains(&body.kind.as_str()) {
+        return refuse("invalid_kind");
+    }
+    if validate_language(&body.language).is_err() {
+        return refuse("invalid_language");
+    }
+    if validate_time_zone(&body.time_zone).is_err() {
+        return refuse("invalid_time_zone");
+    }
+    check_template_size(body)?;
     if !names_acceptable(body) {
         return refuse("invalid_names");
     }
