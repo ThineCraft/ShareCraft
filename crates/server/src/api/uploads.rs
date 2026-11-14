@@ -1,12 +1,16 @@
 //! Resumable uploads: a file sent a chunk at a time, checked against its declared size and
 //! SHA-256, then made into a new file or a new version of a file document.
 //!
-//! - `POST /api/uploads {parent | doc, name, size, sha256, base?}` starts a session: a new file
-//!   named `name` in the library or folder `parent` (needs `add`), or a new version of the file
-//!   document `doc` made from its revision `base` (needs `edit`; a plain-text document is
-//!   refused as `text_document`, and while someone holds the editing seat as `being_edited`).
-//!   The size is checked against the largest file allowed, and a person has at most
-//!   [`records::UPLOADS_PER_PERSON`] sessions open (`too_many_uploads`).
+//! - `POST /api/uploads {parent | doc, name, size, sha256, base?, on_conflict?}` starts a
+//!   session: a new file named `name` in the library or folder `parent` (needs `add`), or a new
+//!   version of the file document `doc` made from its revision `base` (needs `edit`; a
+//!   plain-text document is refused as `text_document`, and while someone holds the editing
+//!   seat as `being_edited`). A new file's name is trimmed and its refused characters become
+//!   `_`; the answer then says so (`renamed {from, to}`). The size is checked against the
+//!   largest file allowed and reserved against the site's quota while the session is open
+//!   (`507 quota_exceeded` when it has no room), and a person has at most
+//!   [`records::UPLOADS_PER_PERSON`] sessions open (`too_many_uploads`). `on_conflict`
+//!   (`replace`, `keep_both` or `skip`) says now what to do if the name is taken at the finish.
 //! - `PUT /api/uploads/{id}` with `Content-Range: bytes <start>-<end>/<size>` appends one
 //!   chunk at the number of bytes received so far (otherwise `409 wrong_offset {expected}`),
 //!   hashing it on the way. A chunk whose body ends early or breaks keeps what arrived (the
@@ -16,7 +20,12 @@
 //!   (`422 checksum_mismatch` ends the session and creates nothing), checks the permission
 //!   again, moves the part file into the content store and claims it, then creates the file or
 //!   saves the new version through the document's file session, exactly as an editor's save.
-//!   A name now taken is `409 name_taken {suggested}`.
+//!   A name now taken is `409 name_taken {suggested}` until a choice is made, at the start or
+//!   as `?on_conflict=` here: `replace` saves a new version of the file there (needs `edit`;
+//!   `409 being_edited` while someone holds its seat), `keep_both` takes the suggested name,
+//!   `skip` ends the session and makes nothing (`200 {skipped: true}`). The site must still
+//!   have room for the bytes (`507 quota_exceeded`, the session left open): the reservation
+//!   becomes usage once they are committed and is given back if they are not.
 //! - `DELETE /api/uploads/{id}` abandons the session.
 //!
 //! A session is its owner's alone: anyone else is answered `404`. Its bytes go to its part file
@@ -37,14 +46,16 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::SystemTime;
 
 use axum::Json;
-use axum::extract::{Path as UrlPath, Request, State};
+use axum::extract::rejection::QueryRejection;
+use axum::extract::{Path as UrlPath, Query, Request, State};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_RANGE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use collab_core::ids::{DocId, NodeId};
 use futures_util::StreamExt;
 use records::{
-    AccessError, Editor, NewEvent, NewUpload, UploadError, UploadSession, UploadTarget, User,
+    AccessError, Editor, NameConflict, NewEvent, NewUpload, NodeKind, QuotaError, Reservation,
+    UploadError, UploadSession, UploadTarget, User,
 };
 use revisions::{BlobError, BlobRef, RevisionId, parse_hex};
 use serde::Deserialize;
@@ -54,10 +65,10 @@ use time::OffsetDateTime;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use super::content::{Created, create_uploaded, discard, save_answer};
+use super::content::{Created, create_uploaded, discard, query_of, save_answer};
 use super::{ApiError, JsonBody, parse_id, to_completion};
 use crate::auth::Signed;
-use crate::blobs::{ChannelReader, Held};
+use crate::blobs::{ChannelReader, Held, release};
 use crate::file_room::{FileLink, SaveReply, check_upload, upload_version};
 use crate::{AppState, tree};
 
@@ -143,10 +154,220 @@ pub(crate) struct StartBody {
     sha256: String,
     /// The revision a new version was made from; none if the document has none.
     base: Option<String>,
+    /// For a new file, what to do if its name is taken at the finish.
+    on_conflict: Option<String>,
+}
+
+/// Query of `POST /api/uploads/{id}/finish`.
+#[derive(Deserialize)]
+pub(crate) struct FinishQuery {
+    /// What to do if the new file's name is taken: `replace`, `keep_both` or `skip`.
+    on_conflict: Option<String>,
+}
+
+/// The choice named by `text`, if given: `422 invalid_request` for an unknown one.
+pub(super) fn conflict_choice(text: Option<&str>) -> Result<Option<NameConflict>, ApiError> {
+    text.map(|text| NameConflict::parse(text).ok_or(ApiError::InvalidRequest))
+        .transpose()
+}
+
+/// A new file's name as asked for, trimmed, made acceptable: refused and control characters
+/// become `_` (see [`tree::clean_name`]). With the editor its extension opens it in, and the
+/// name asked for (trimmed) if it had to change. `400` for a name with no extension any editor
+/// takes, or that is only an extension.
+pub(super) fn clean_upload_name(asked: &str) -> Result<(String, Editor, Option<String>), ApiError> {
+    let asked = asked.trim();
+    let editor = Editor::for_file_name(asked).ok_or(ApiError::BadRequest)?;
+    // A name that is only an extension names nothing.
+    if editor
+        .native_extension()
+        .is_some_and(|ext| asked.len() <= ext.len())
+    {
+        return Err(ApiError::BadRequest);
+    }
+    let name = tree::clean_name(asked, editor);
+    let editor = Editor::for_file_name(&name).ok_or(ApiError::BadRequest)?;
+    let renamed = (name != asked).then(|| asked.to_owned());
+    Ok((name, editor, renamed))
+}
+
+/// Adds `renamed {from, to}` to the answer `body` (an object), `null` unless the name `from`
+/// had to change to `to`.
+pub(super) fn add_renamed(body: &mut serde_json::Value, from: Option<&str>, to: &str) {
+    let renamed = match from {
+        Some(from) if from != to => json!({ "from": from, "to": to }),
+        _ => serde_json::Value::Null,
+    };
+    if let Some(fields) = body.as_object_mut() {
+        fields.insert("renamed".to_owned(), renamed);
+    }
+}
+
+/// Where a new file goes once its name is settled (see [`settle_name`]).
+pub(super) enum Named {
+    /// A new file named `name`; `renamed` is the name it had before, if it had to change.
+    New {
+        name: String,
+        editor: Editor,
+        renamed: Option<String>,
+    },
+    /// A new version of the file `doc` there (named `name`), made from `base`.
+    Replace {
+        doc: DocId,
+        name: String,
+        base: Option<RevisionId>,
+    },
+    /// The name is taken and nothing was chosen: `409 name_taken {suggested}`.
+    Taken { suggested: String },
+    /// The name is taken and the person chose to skip it.
+    Skip,
+    /// The file there would not take a new version now: the answer to give.
+    Refused(SaveReply),
+}
+
+impl Named {
+    /// The answer for `Taken` or `Skip`.
+    pub(super) fn answer(&self) -> Option<Response> {
+        match self {
+            Named::Taken { suggested } => Some(
+                (
+                    StatusCode::CONFLICT,
+                    Json(json!({ "error": "name_taken", "suggested": suggested })),
+                )
+                    .into_response(),
+            ),
+            Named::Skip => Some(Json(json!({ "skipped": true })).into_response()),
+            Named::Refused(reply) => Some(save_answer(reply.clone())),
+            Named::New { .. } | Named::Replace { .. } => None,
+        }
+    }
+}
+
+/// Settles where a new file named `name` (already cleaned), opened in `editor`, goes in
+/// `parent` for `user`: as named if the name is free there; if it is taken, as `choice` says
+/// (`keep_both` takes the first free name `name (2)`, `name (3)` …; `replace` a new version of
+/// the file there, once `user` is found allowed to save one and its file session would take
+/// it now), or nothing chosen. `404`, `403`, `wrong_place` and the like as for creating it.
+pub(super) async fn settle_name(
+    state: &AppState,
+    user: &User,
+    parent: NodeId,
+    name: &str,
+    editor: Editor,
+    choice: Option<NameConflict>,
+) -> Result<Named, ApiError> {
+    match tree::check_create_document(state, user, parent, name, editor).await {
+        Ok(()) => {
+            return Ok(Named::New {
+                name: name.to_owned(),
+                editor,
+                renamed: None,
+            });
+        }
+        Err(AccessError::NameTaken) => {}
+        // The name is only an extension.
+        Err(AccessError::WrongExtension) => return Err(ApiError::BadRequest),
+        Err(e) => return Err(e.into()),
+    }
+    let suggested = || async {
+        tree::suggest_name(state.db(), parent, name, editor)
+            .await
+            .map_err(|e| ApiError::unavailable(&e))
+    };
+    match choice {
+        None => Ok(Named::Taken {
+            suggested: suggested().await?,
+        }),
+        Some(NameConflict::Skip) => Ok(Named::Skip),
+        Some(NameConflict::KeepBoth) => Ok(Named::New {
+            name: suggested().await?,
+            editor,
+            renamed: Some(name.to_owned()),
+        }),
+        Some(NameConflict::Replace) => replace_target(state, user, parent, name, editor).await,
+    }
+}
+
+/// The file named `name` in `parent` that a `replace` saves a new version of: it must be a
+/// file document (`wrong_place` for a folder, `text_document` for plain text) on which `user`
+/// has `edit`, and its file session must take a new version now (otherwise `Refused` with its
+/// answer, such as `being_edited`). The version is made from the revision the file session
+/// holds. A name freed meanwhile makes a new file after all.
+async fn replace_target(
+    state: &AppState,
+    user: &User,
+    parent: NodeId,
+    name: &str,
+    editor: Editor,
+) -> Result<Named, ApiError> {
+    let db = state.db();
+    let Some(node) = db
+        .live_child_named(parent, name)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?
+    else {
+        return Ok(Named::New {
+            name: name.to_owned(),
+            editor,
+            renamed: None,
+        });
+    };
+    if node.kind != NodeKind::Document {
+        return Err(ApiError::WrongPlace);
+    }
+    let doc = DocId(node.id.0);
+    let name = check_new_version(state, user, doc).await?;
+    let mut base = db
+        .document(doc)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?
+        .and_then(|document| document.revision)
+        .and_then(|text| RevisionId::from_str(&text).ok());
+    // The recorded revision may lag the file session's; the session's own is the one to
+    // replace.
+    for _ in 0..SESSION_ATTEMPTS {
+        match ask_check(state, doc, &name, base.clone()).await? {
+            None => return Ok(Named::Replace { doc, name, base }),
+            Some(SaveReply::Conflict { current }) => base = current,
+            Some(refused) => return Ok(Named::Refused(refused)),
+        }
+    }
+    Ok(Named::Refused(SaveReply::Busy))
+}
+
+/// Saves the content `held` as a new version of `doc` (named `name`) made from `base`, for
+/// `user`, through the document's file session, opened again if it ends before answering.
+/// Content not saved is erased unless something else names it.
+pub(super) async fn store_version(
+    state: &AppState,
+    user: &User,
+    doc: DocId,
+    name: &str,
+    base: Option<RevisionId>,
+    held: Held,
+) -> SaveReply {
+    let blob = held.blob();
+    // A session that ended before taking the upload wrote nothing for it; it is opened again.
+    let mut reply = SaveReply::Failed;
+    for _ in 0..SESSION_ATTEMPTS {
+        let link = session_of(state, doc, name);
+        if let Ok(answer) =
+            upload_version(&link, user.id, user.name.clone(), base.clone(), blob).await
+        {
+            reply = answer;
+            break;
+        }
+    }
+    match &reply {
+        // Saved, or a version already names the content.
+        SaveReply::Saved(_) | SaveReply::Unchanged(_) => {}
+        _ => discard(state, held).await,
+    }
+    reply
 }
 
 /// `POST /api/uploads`: starts an upload session (see the module documentation). `201` with
-/// `{id, name, size, received}`.
+/// `{id, name, size, received, parent, doc, base, on_conflict, renamed}`.
 pub(crate) async fn start(
     State(state): State<AppState>,
     signed: Signed,
@@ -160,15 +381,18 @@ pub(crate) async fn start(
         return Err(ApiError::TooLarge);
     }
     let sha256 = parse_hex(&body.sha256.to_ascii_lowercase()).ok_or(ApiError::InvalidRequest)?;
+    let on_conflict = conflict_choice(body.on_conflict.as_deref())?;
+    let mut renamed = None;
     let db = state.db();
     let (target, name, base, site) = match (body.parent, body.doc) {
         (Some(parent), None) => {
             let parent = NodeId(parse_id(&parent)?);
-            let name = body.name.ok_or(ApiError::BadRequest)?;
+            let asked = body.name.ok_or(ApiError::BadRequest)?;
             if body.base.is_some() {
                 return Err(ApiError::BadRequest);
             }
-            let editor = Editor::for_file_name(name.trim()).ok_or(ApiError::BadRequest)?;
+            let (name, editor, from) = clean_upload_name(&asked)?;
+            renamed = from;
             match tree::check_create_document(&state, &user, parent, &name, editor).await {
                 // A name taken now is settled when the upload finishes.
                 Ok(()) | Err(AccessError::NameTaken) => {}
@@ -217,10 +441,12 @@ pub(crate) async fn start(
             size: body.size,
             sha256,
             base: base_text.as_deref(),
+            on_conflict: on_conflict.filter(|_| matches!(target, UploadTarget::NewFile { .. })),
         })
         .await
         .map_err(|e| match e {
             UploadError::TooMany => ApiError::TooManyUploads,
+            UploadError::QuotaExceeded => ApiError::QuotaExceeded,
             UploadError::Db(e) => ApiError::unavailable(&e),
         })?;
     let uploads = Arc::clone(state.uploads());
@@ -237,7 +463,9 @@ pub(crate) async fn start(
         }
         return Err(ApiError::Unavailable);
     }
-    Ok((StatusCode::CREATED, Json(describe(&session))).into_response())
+    let mut out = describe(&session);
+    add_renamed(&mut out, renamed.as_deref(), &session.name);
+    Ok((StatusCode::CREATED, Json(out)).into_response())
 }
 
 /// The session as the API describes it.
@@ -254,6 +482,7 @@ fn describe(session: &UploadSession) -> serde_json::Value {
         "parent": parent,
         "doc": doc,
         "base": session.base,
+        "on_conflict": session.on_conflict.map(NameConflict::as_str),
     })
 }
 
@@ -638,8 +867,10 @@ pub(crate) async fn finish(
     State(state): State<AppState>,
     signed: Signed,
     UrlPath(id): UrlPath<String>,
+    query: Result<Query<FinishQuery>, QueryRejection>,
 ) -> Result<Response, ApiError> {
     let id = parse_id(&id)?;
+    let choice = conflict_choice(query_of(query)?.on_conflict.as_deref())?;
     let user = signed.session.user;
     owned(&state, id, &user).await?;
     to_completion(async move {
@@ -689,7 +920,8 @@ pub(crate) async fn finish(
 
         match session.target {
             UploadTarget::NewFile { parent } => {
-                finish_new_file(&state, &user, &session, parent, blob).await
+                let choice = choice.or(session.on_conflict);
+                finish_new_file(&state, &user, &session, parent, blob, choice).await
             }
             UploadTarget::NewVersion { doc } => {
                 finish_new_version(&state, &user, &session, doc, blob).await
@@ -699,63 +931,85 @@ pub(crate) async fn finish(
     .await
 }
 
-/// Moves the session's part file into the content store as `blob`, held, and ends the
-/// session. The caller holds its turn and has checked the bytes. A part file gone missing ends
-/// the session, which can never finish; if the session cannot be ended after its part was
-/// moved, the content is discarded.
-async fn adopt(state: &AppState, session: &UploadSession, blob: BlobRef) -> Result<Held, ApiError> {
-    let part = state.uploads().part(session.id);
-    let held = match state.blobs().adopt_part(part, blob).await {
-        Ok(held) => held,
-        Err(BlobError::Io(e)) if e.kind() == ErrorKind::NotFound => {
-            eprintln!("sharecraft-server: the part file of an upload is missing");
-            end_session(state, session.id).await?;
-            return Err(ApiError::Unavailable);
-        }
-        Err(e) => return Err(ApiError::unavailable(&e)),
+/// Ends the session for its finish, keeping its declared size reserved (refused with
+/// `507 quota_exceeded`, the session left open, when the site has no room for it now), then
+/// moves its part file into the content store as `blob`, held. The caller holds its turn and
+/// has checked the bytes, and commits or releases the reservation answered. A part file that
+/// cannot be moved (gone missing, or a failure of the store) gives the reservation back; the
+/// session has ended either way.
+async fn adopt(
+    state: &AppState,
+    session: &UploadSession,
+    blob: BlobRef,
+) -> Result<(Held, Reservation), ApiError> {
+    let reservation = match state.db().claim_upload(session.id).await {
+        Ok(Some(reservation)) => reservation,
+        Ok(None) => return Err(ApiError::NotFound),
+        Err(QuotaError::Exceeded) => return Err(ApiError::QuotaExceeded),
+        Err(QuotaError::Db(e)) => return Err(ApiError::unavailable(&e)),
     };
-    if let Err(e) = end_session(state, session.id).await {
-        discard(state, held).await;
-        return Err(e);
+    let part = state.uploads().part(session.id);
+    let adopted = state.blobs().adopt_part(part, blob).await;
+    state.uploads().forget(session.id);
+    match adopted {
+        Ok(held) => Ok((held, reservation)),
+        Err(e) => {
+            release(state.db(), reservation).await;
+            remove_part(state, session.id).await;
+            match e {
+                BlobError::Io(e) if e.kind() == ErrorKind::NotFound => {
+                    eprintln!("sharecraft-server: the part file of an upload is missing");
+                    Err(ApiError::Unavailable)
+                }
+                e => Err(ApiError::unavailable(&e)),
+            }
+        }
     }
-    Ok(held)
 }
 
-/// Finishes a session making a new file in `parent` with the content `blob`.
+/// Finishes a session making a new file in `parent` with the content `blob`, its name settled
+/// as `choice` says when it is taken (see [`settle_name`]).
 async fn finish_new_file(
     state: &AppState,
     user: &User,
     session: &UploadSession,
     parent: NodeId,
     blob: BlobRef,
+    choice: Option<NameConflict>,
 ) -> Result<Response, ApiError> {
-    let name = &session.name;
-    let editor = Editor::for_file_name(name.trim()).ok_or(ApiError::BadRequest)?;
-    match tree::check_create_document(state, user, parent, name, editor).await {
-        Ok(()) => {}
-        Err(AccessError::NameTaken) => {
-            let suggested = tree::suggest_name(state.db(), parent, name.trim(), editor)
-                .await
-                .map_err(|e| ApiError::unavailable(&e))?;
-            return Ok((
-                StatusCode::CONFLICT,
-                Json(json!({ "error": "name_taken", "suggested": suggested })),
-            )
-                .into_response());
-        }
-        Err(AccessError::WrongExtension) => return Err(ApiError::BadRequest),
-        Err(e) => return Err(e.into()),
+    let editor = Editor::for_file_name(&session.name).ok_or(ApiError::BadRequest)?;
+    let named = settle_name(state, user, parent, &session.name, editor, choice).await?;
+    if matches!(named, Named::Skip) {
+        end_session(state, session.id).await?;
     }
-    let held = adopt(state, session, blob).await?;
-    Ok(
-        match create_uploaded(state, user, parent, name, editor, held).await? {
-            Created::Done { doc, body } => {
-                completed(state, user, doc, session, false);
-                (StatusCode::CREATED, Json(body)).into_response()
-            }
-            Created::Failed(response) => response,
-        },
-    )
+    if let Some(answer) = named.answer() {
+        return Ok(answer);
+    }
+    let (name, editor, renamed) = match named {
+        Named::New {
+            name,
+            editor,
+            renamed,
+        } => (name, editor, renamed),
+        Named::Replace { doc, name, base } => {
+            return save_upload(state, user, session, doc, &name, base, blob).await;
+        }
+        Named::Taken { .. } | Named::Skip | Named::Refused(_) => {
+            return Err(ApiError::Unavailable);
+        }
+    };
+    let (held, reservation) = adopt(state, session, blob).await?;
+    let created = create_uploaded(state, user, parent, &name, editor, held).await;
+    // A version written was counted with its commit.
+    release(state.db(), reservation).await;
+    Ok(match created? {
+        Created::Done { doc, mut body } => {
+            completed(state, user, doc, session, false);
+            add_renamed(&mut body, renamed.as_deref(), &name);
+            (StatusCode::CREATED, Json(body)).into_response()
+        }
+        Created::Failed(response) => response,
+    })
 }
 
 /// Finishes a session making a new version of `doc` with the content `blob`, through the
@@ -779,23 +1033,26 @@ async fn finish_new_version(
         }
         return Ok(save_answer(refused));
     }
-    let held = adopt(state, session, blob).await?;
-    // A session that ended before taking the upload wrote nothing for it; it is opened again.
-    let mut reply = SaveReply::Failed;
-    for _ in 0..SESSION_ATTEMPTS {
-        let link = session_of(state, doc, &name);
-        if let Ok(answer) =
-            upload_version(&link, user.id, user.name.clone(), base.clone(), blob).await
-        {
-            reply = answer;
-            break;
-        }
-    }
-    match &reply {
-        SaveReply::Saved(_) => completed(state, user, doc, session, true),
-        // A version already names the content.
-        SaveReply::Unchanged(_) => {}
-        _ => discard(state, held).await,
+    save_upload(state, user, session, doc, &name, base, blob).await
+}
+
+/// Saves the session's content `blob` as a new version of `doc` (named `name`) made from
+/// `base`, through the document's file session, once its bytes are claimed against the quota.
+async fn save_upload(
+    state: &AppState,
+    user: &User,
+    session: &UploadSession,
+    doc: DocId,
+    name: &str,
+    base: Option<RevisionId>,
+    blob: BlobRef,
+) -> Result<Response, ApiError> {
+    let (held, reservation) = adopt(state, session, blob).await?;
+    let reply = store_version(state, user, doc, name, base, held).await;
+    // A version written was counted with its commit.
+    release(state.db(), reservation).await;
+    if matches!(reply, SaveReply::Saved(_)) {
+        completed(state, user, doc, session, true);
     }
     Ok(save_answer(reply))
 }

@@ -55,6 +55,34 @@ $('new-library').addEventListener('submit', async (event) => {
 });
 
 await showLibraries();
+if (manageSite) await showStorage();
+
+/** For people who manage the site: what it holds against its quota, warning from 90%. */
+async function showStorage() {
+  const result = await api('GET', `/sites/${seg(siteId)}`);
+  if (!result.ok || result.data.used === undefined) return;
+  const { used, quota, quota_warning: warning } = result.data;
+  const box = $('storage');
+  box.textContent =
+    quota === null
+      ? `This site holds ${bytes(used)}. It has no storage quota.`
+      : `This site holds ${bytes(used)} of its ${bytes(quota)} storage quota.` +
+        (warning ? ' It is nearly full: delete or purge what is not needed, or ask an administrator for more.' : '');
+  box.classList.toggle('msg', Boolean(warning));
+  box.hidden = false;
+}
+
+/** `n` bytes in the largest unit that keeps it at 1 or more. */
+function bytes(n) {
+  const units = ['bytes', 'KB', 'MB', 'GB', 'TB'];
+  let value = n;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return unit === 0 ? `${value} bytes` : `${value.toFixed(1)} ${units[unit]}`;
+}
 
 async function showLibraries() {
   const result = await api('GET', `/nodes/${seg(siteId)}/children?limit=500`);

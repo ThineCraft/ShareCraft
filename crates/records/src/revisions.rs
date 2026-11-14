@@ -23,6 +23,8 @@ pub struct RevisionRecord {
     pub name: String,
     /// The document's fields at this revision.
     pub fields: Value,
+    /// The size of the document's content at this revision, in bytes.
+    pub size: u64,
 }
 
 /// One recorded revision.
@@ -84,8 +86,9 @@ async fn insert(
     parent: Option<&str>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "insert into revisions (revision, document_id, position, parent, committed_at, authors) \
-         values ($1, $2, $3, $4, $5, $6)",
+        "insert into revisions \
+             (revision, document_id, position, parent, committed_at, authors, size) \
+         values ($1, $2, $3, $4, $5, $6, $7)",
     )
     .bind(&r.revision)
     .bind(r.doc.0)
@@ -93,6 +96,7 @@ async fn insert(
     .bind(parent)
     .bind(r.committed_at)
     .bind(stored_authors(&r.authors))
+    .bind(i64::try_from(r.size).unwrap_or(i64::MAX))
     .execute(&mut *conn)
     .await?;
     Ok(())

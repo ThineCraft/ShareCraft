@@ -1,12 +1,12 @@
-//! Sites, the top level of the content tree: the ones a person can see, creating one, and a
-//! site's three groups.
+//! Sites, the top level of the content tree: the ones a person can see, one site with its
+//! storage and quota, creating one, setting its quota, and a site's three groups.
 
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use collab_core::ids::NodeId;
-use records::{Access, Db, Group, NodeKind, User};
+use records::{Access, Db, Group, NodeKind, Perms, User};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -125,4 +125,76 @@ pub(crate) async fn groups(
         return Err(ApiError::NotFound);
     }
     Ok(Json(groups))
+}
+
+/// `GET /api/sites/{id}`: the site as `GET /api/sites` lists it, and for people who may manage
+/// it, its storage: `used` (bytes held by every version of every item, live and in its bins),
+/// `quota` (`null` for no limit) and `quota_warning` (from 90% of the quota, for the site page
+/// to warn its owners). `404` when the caller may see nothing of it, or there is no such site.
+pub(crate) async fn show(
+    State(state): State<AppState>,
+    signed: Signed,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let site = node_id(&id)?;
+    let db = state.db();
+    let (node, access) = db
+        .sites_for(signed.session.user.id)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?
+        .into_iter()
+        .find(|(node, _)| node.id == site)
+        .ok_or(ApiError::NotFound)?;
+    let manages = access
+        .as_ref()
+        .is_some_and(|a| a.perms.contains(Perms::MANAGE_SITE));
+    let id = node.id.0.to_string();
+    if !manages {
+        return Ok(Json(
+            serde_json::json!({ "id": id, "name": node.name, "access": access }),
+        ));
+    }
+    let usage = db
+        .site_usage(site)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?;
+    Ok(Json(serde_json::json!({
+        "id": id,
+        "name": node.name,
+        "access": access,
+        "used": usage.used,
+        "quota": usage.quota,
+        "quota_warning": usage.near_quota(),
+    })))
+}
+
+/// The body of `PUT /api/sites/{id}/quota`.
+#[derive(Deserialize)]
+pub(crate) struct QuotaBody {
+    /// The most the site may hold, in bytes; `null` for no limit.
+    bytes: Option<u64>,
+}
+
+/// `PUT /api/sites/{id}/quota {bytes | null}`: sets the site's storage quota. Administrators
+/// only (`403`); `404` for anything but a site. A quota below what the site holds is allowed:
+/// the site then takes nothing more until space is freed. Records `quota.changed`. `204`.
+pub(crate) async fn set_quota(
+    State(state): State<AppState>,
+    signed: Signed,
+    Path(id): Path<String>,
+    JsonBody(body): JsonBody<QuotaBody>,
+) -> Result<Response, ApiError> {
+    let site = node_id(&id)?;
+    let actor = signed.session.user;
+    if !actor.is_admin {
+        return Err(ApiError::Forbidden);
+    }
+    to_completion(async move {
+        state
+            .db()
+            .set_site_quota(actor.id, site, body.bytes)
+            .await?;
+        Ok(StatusCode::NO_CONTENT.into_response())
+    })
+    .await
 }

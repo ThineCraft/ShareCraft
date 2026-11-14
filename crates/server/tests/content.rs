@@ -508,14 +508,20 @@ async fn bad_file_names_are_refused() {
         let response = upload(&server, &ann, name, b"data".to_vec()).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{name:?}");
     }
-    // An editor opens it, but it is not a name a document may have: 422, as for any document.
-    for name in ["a/b.xlsx", "a\\b.xlsx", "tab\t.xlsx", long.as_str()] {
+    // An editor opens it, but it is not a name a document may have: refused and control
+    // characters become `_`, a long name is shortened, and the answer says so.
+    let shortened = format!("{}.xlsx", "a".repeat(115));
+    for (name, cleaned) in [
+        ("a/b.xlsx", "a_b.xlsx"),
+        ("c\\d.xlsx", "c_d.xlsx"),
+        ("tab\t.xlsx", "tab_.xlsx"),
+        (long.as_str(), shortened.as_str()),
+    ] {
         let response = upload(&server, &ann, name, b"data".to_vec()).await;
-        assert_eq!(
-            response.status(),
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "{name:?}"
-        );
+        assert_eq!(response.status(), StatusCode::CREATED, "{name:?}");
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["name"], cleaned, "{name:?}");
+        assert_eq!(body["renamed"]["from"], name, "{name:?}");
     }
     // No name at all.
     let parent = home(&server, &ann).await;
@@ -532,7 +538,8 @@ async fn bad_file_names_are_refused() {
     let response = upload(&server, &ann, "Empty.xlsx", Vec::new()).await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
-    assert_eq!(documents_of(&server, &ann).await, 0);
+    // Only the four cleaned names were made.
+    assert_eq!(documents_of(&server, &ann).await, 4);
 }
 
 #[tokio::test]

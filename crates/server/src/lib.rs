@@ -45,7 +45,9 @@ pub use blobs::blobs_path;
 pub use checkpoint::{Checkpointer, library_path};
 pub use config::{Config, ConfigError};
 pub use links::sweep_once;
-pub use projection::{BlobReport, Report, rebuild, reconcile, reconcile_blobs};
+pub use projection::{
+    BlobReport, Report, UsageReport, rebuild, reconcile, reconcile_blobs, reconcile_usage,
+};
 
 use api::uploads::Uploads;
 use auth::Throttle;
@@ -301,7 +303,9 @@ pub async fn serve(config: Config, listener: TcpListener) -> std::io::Result<()>
 /// (see [`tree::reconcile`]), adopts documents recorded before the tree (see
 /// [`tree::adopt_flat_documents`]), reconciles the revisions recorded in the database with Git
 /// (see [`reconcile`]), rebuilds the content rows from Git when a flag asks for it (see
-/// [`reconcile_blobs`]), and prints one line with the counts of each.
+/// [`reconcile_blobs`]), drops interrupted quota reservations and rebuilds the sites' usage
+/// when a flag asks for it (see [`reconcile_usage`]), and prints one line with the counts of
+/// each.
 ///
 /// # Errors
 /// Returns an error if the database cannot be reached or migrated, if the library repository
@@ -375,6 +379,14 @@ pub async fn prepare(config: Config) -> std::io::Result<AppState> {
     for (doc, error) in &blob_report.failed {
         eprintln!(
             "sharecraft-server: content of document {} not reconciled: {error}",
+            doc.0
+        );
+    }
+    let usage_report = reconcile_usage(&state).await;
+    println!("Reconciled the sites' usage: {usage_report}");
+    for (doc, error) in &usage_report.failed {
+        eprintln!(
+            "sharecraft-server: sizes of the versions of document {} not read: {error}",
             doc.0
         );
     }

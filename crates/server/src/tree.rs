@@ -15,8 +15,8 @@ use std::sync::atomic::Ordering;
 use collab_core::ids::{DocId, NodeId, UserId};
 use records::{
     Access, AccessError, BinStage, ClaimId, Db, DbError, Document, Editor, NewEvent, Node,
-    NodeChange, NodeKind, NodeRow, NodesApplied, Perms, User, validate_document_name,
-    validate_node_name,
+    NodeChange, NodeKind, NodeRow, NodesApplied, Perms, QuotaError, Reservation, User,
+    validate_document_name, validate_node_name,
 };
 use revisions::{
     Author, BlobRef, Checkpoint, CheckpointError, Content, GitError, Stamp, TreeChange, TreeMove,
@@ -28,7 +28,7 @@ use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
 use crate::AppState;
-use crate::blobs::Held;
+use crate::blobs::{Held, commit as commit_reservation, release};
 use crate::checkpoint::Checkpointer;
 use crate::projection::record_first;
 use crate::room::credited_name;
@@ -216,6 +216,8 @@ struct CopiedContents {
     /// The tree commit's message and the records that take it back (the copies purged).
     message: String,
     undo: Vec<TreeRecord>,
+    /// The versions' bytes, reserved against the destination site's quota.
+    reservation: Option<Reservation>,
 }
 
 /// The first version of one file a copy makes.
@@ -286,7 +288,9 @@ impl Default for Plan {
 /// access from where they go (no permissions or links are copied), holding the latest saved
 /// version of each file and nothing of its history: the folder (with every live item below it
 /// the person may view) in one tree commit, then the first versions of all its files in one
-/// checkpoint commit, their contents claimed before either. Refused characters in the name
+/// checkpoint commit, their contents claimed before either; their bytes are first reserved
+/// against the quota of the site they go to (`QuotaExceeded` when it has no room, before
+/// anything is committed). Refused characters in the name
 /// become `_` and a name taken there gets ` (2)`, ` (3)` …; the answer says so. View on every
 /// item copied is judged again with the change, so view lost meanwhile refuses it. A file Git
 /// holds without a document row is left out. If the versions cannot be committed after the
@@ -334,6 +338,9 @@ pub async fn apply(state: &AppState, actor: &User, op: TreeOp) -> Result<Applied
                 Err(e) => {
                     if let Some(contents) = contents {
                         state.blobs().settle_all(db, &contents.claims, None).await;
+                        if let Some(reservation) = contents.reservation {
+                            release(db, reservation).await;
+                        }
                     }
                     return Err(e);
                 }
@@ -1870,12 +1877,33 @@ async fn plan_copy(
         });
         held.push(hold);
     }
+    // The bytes the copy adds to where it goes, every version counting, refused before
+    // anything is committed when that site has no room for them.
+    let bytes = versions
+        .iter()
+        .fold(0u64, |sum, v| sum.saturating_add(v.blob.size));
+    let reservation = if versions.is_empty() {
+        None
+    } else {
+        Some(
+            db.reserve_bytes(place.site, bytes)
+                .await
+                .map_err(|e| match e {
+                    QuotaError::Exceeded => AccessError::QuotaExceeded,
+                    QuotaError::Db(e) => AccessError::Db(e),
+                })?,
+        )
+    };
     let wanted: Vec<(BlobRef, DocId)> = versions.iter().map(|v| (v.blob, v.doc)).collect();
-    let claims = state
-        .blobs()
-        .claim_all(db, &wanted)
-        .await
-        .map_err(DbError::new)?;
+    let claims = match state.blobs().claim_all(db, &wanted).await {
+        Ok(claims) => claims,
+        Err(e) => {
+            if let Some(reservation) = reservation {
+                release(db, reservation).await;
+            }
+            return Err(DbError::new(e).into());
+        }
+    };
     // The claims keep the contents now.
     drop(held);
 
@@ -1909,15 +1937,17 @@ async fn plan_copy(
             events,
             message,
             undo,
+            reservation,
         }),
         ..Plan::default()
     })
 }
 
 /// Commits the first versions of the files a copy made, as one commit credited to `actor`,
-/// then settles their claims, records the revisions and the `node.copied` events. If the
-/// commit fails the claims are withdrawn, the copy is taken back (see [`take_back_copy`]) and
-/// the Git error is answered.
+/// then settles their claims, counts their bytes in the site's usage (its reservation turned
+/// into usage), records the revisions and the `node.copied` events. If the commit fails the
+/// claims are withdrawn, the reservation given back, the copy is taken back (see
+/// [`take_back_copy`]) and the Git error is answered.
 async fn store_copied(
     state: &AppState,
     actor: &User,
@@ -1928,6 +1958,7 @@ async fn store_copied(
         record_events(db, &contents.events).await;
         return Ok(());
     }
+    let reservation = contents.reservation;
     let author = author_of(actor);
     let message = format!("Copy {}", contents.name);
     let store = Arc::clone(state.checkpointer());
@@ -1954,12 +1985,18 @@ async fn store_copied(
         Ok((Ok(revision), versions)) => (revision, versions),
         Ok((Err(e), _)) => {
             state.blobs().settle_all(db, &contents.claims, None).await;
+            if let Some(reservation) = reservation {
+                release(db, reservation).await;
+            }
             eprintln!("sharecraft-server: the versions of a copy could not be stored: {e}");
             take_back_copy(state, actor, contents.message, contents.undo).await;
             return Err(git_failure(e));
         }
         Err(e) => {
             state.blobs().settle_all(db, &contents.claims, None).await;
+            if let Some(reservation) = reservation {
+                release(db, reservation).await;
+            }
             take_back_copy(state, actor, contents.message, contents.undo).await;
             return Err(e);
         }
@@ -1968,6 +2005,9 @@ async fn store_copied(
         .blobs()
         .settle_all(db, &contents.claims, Some(&revision))
         .await;
+    if let Some(reservation) = reservation {
+        commit_reservation(db, reservation).await;
+    }
     for version in versions {
         record_first(
             state.checkpointer(),
@@ -2171,7 +2211,7 @@ fn find_home(tree: &[TreeRecord]) -> Option<(NodeId, NodeId)> {
 /// `name` made acceptable as a node name: refused and control characters become `_`, as does
 /// a trailing dot; an empty name becomes "Untitled"; a long one is shortened before its
 /// extension.
-fn clean_name(name: &str, editor: Editor) -> String {
+pub(crate) fn clean_name(name: &str, editor: Editor) -> String {
     let replaced: String = name
         .trim()
         .chars()

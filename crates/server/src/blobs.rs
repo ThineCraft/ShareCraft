@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use axum::body::{Body, Bytes};
 use collab_core::ids::DocId;
 use futures_util::StreamExt;
-use records::{BLOB_REFS_DIRTY, ClaimId, Db};
+use records::{BLOB_REFS_DIRTY, ClaimId, Db, Reservation};
 use revisions::{BlobError, BlobRef, BlobStore, CheckpointError, Content, Outcome, RevisionId};
 use tokio::sync::{RwLock, mpsc};
 
@@ -363,7 +363,8 @@ pub(crate) async fn flag_dirty(db: &Db) {
 
 /// Commits a checkpoint naming `blob` with `write`, claiming the content first and settling the
 /// claim after, when there is a database to claim it in (`db`); without one, the content is
-/// only checked to be there.
+/// only checked to be there. A version written is counted in its site's usage (see
+/// [`count_usage`]); a caller that reserved its bytes then releases its reservation.
 pub(crate) async fn write_claimed(
     blobs: &Blobs,
     db: Option<&Db>,
@@ -398,8 +399,42 @@ pub(crate) async fn write_claimed(
             _ => None,
         };
         blobs.settle(db, claim, revision).await;
+        if revision.is_some() {
+            count_usage(db, doc, blob.size).await;
+        }
     }
     result
+}
+
+/// Gives back `reservation`, whose bytes were not stored (or were counted by
+/// [`write_claimed`]). A failure is logged; the next start drops the reservation.
+pub(crate) async fn release(db: &Db, reservation: Reservation) {
+    if let Err(e) = db.release_reservation(reservation).await {
+        eprintln!("sharecraft-server: cannot release a quota reservation: {e}");
+    }
+}
+
+/// Turns `reservation` into usage: its bytes were stored. A failure is logged and flags the
+/// usage for a rebuild at the next start.
+pub(crate) async fn commit(db: &Db, reservation: Reservation) {
+    if let Err(e) = db.commit_reservation(reservation).await {
+        eprintln!("sharecraft-server: cannot count stored bytes in their site's usage: {e}");
+        if let Err(e) = db.flag_usage_rebuild().await {
+            eprintln!("sharecraft-server: cannot flag the usage for a rebuild: {e}");
+        }
+    }
+}
+
+/// Adds `bytes` to the usage of the site holding `doc`, whose new version was just committed
+/// (never refused: a checkpoint of the live text room would retry for ever). A failure is
+/// logged and flags the usage for a rebuild at the next start.
+pub(crate) async fn count_usage(db: &Db, doc: DocId, bytes: u64) {
+    if let Err(e) = db.add_usage(doc, bytes).await {
+        eprintln!("sharecraft-server: cannot count a new version in its site's usage: {e}");
+        if let Err(e) = db.flag_usage_rebuild().await {
+            eprintln!("sharecraft-server: cannot flag the usage for a rebuild: {e}");
+        }
+    }
 }
 
 /// A pending claim older than this is settled from Git by the sweeper.

@@ -5,7 +5,10 @@
 //! the uploader declared (name, size, SHA-256) and how many bytes of its part file are written
 //! and flushed (`received`). The bytes themselves stay in the part file on disk; the server
 //! hashes them as they arrive. A person has at most [`UPLOADS_PER_PERSON`] sessions open, and a
-//! session that has received nothing for a day is swept.
+//! session that has received nothing for a day is swept. While open, a session holds its
+//! declared size reserved against its site's quota (see [`crate::Reservation`]); ending it
+//! releases that, and claiming it for its finish ([`Db::claim_upload`]) keeps the bytes
+//! reserved for the commit.
 
 use collab_core::ids::{DocId, NodeId, UserId};
 use sqlx::Row;
@@ -13,7 +16,8 @@ use sqlx::postgres::PgRow;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::{Db, DbError};
+use crate::quotas::{change_reserved, fits, locked_usage};
+use crate::{Db, DbError, QuotaError, Reservation};
 
 /// How many upload sessions one person may have open at once.
 pub const UPLOADS_PER_PERSON: i64 = 5;
@@ -25,6 +29,40 @@ pub enum UploadTarget {
     NewFile { parent: NodeId },
     /// A new version of this file document.
     NewVersion { doc: DocId },
+}
+
+/// What to do when a new file's name is taken where it goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NameConflict {
+    /// Save the upload as a new version of the file there.
+    Replace,
+    /// Make the new file with the first free name `name (2)`, `name (3)` ….
+    KeepBoth,
+    /// Make nothing.
+    Skip,
+}
+
+impl NameConflict {
+    /// The choice as the API and the database name it.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NameConflict::Replace => "replace",
+            NameConflict::KeepBoth => "keep_both",
+            NameConflict::Skip => "skip",
+        }
+    }
+
+    /// The choice named `text`, if it is one.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "replace" => Some(NameConflict::Replace),
+            "keep_both" => Some(NameConflict::KeepBoth),
+            "skip" => Some(NameConflict::Skip),
+            _ => None,
+        }
+    }
 }
 
 /// An upload session as its row holds it.
@@ -46,6 +84,8 @@ pub struct UploadSession {
     pub received: u64,
     /// For a new version, the revision it was made from (none if the document has none).
     pub base: Option<String>,
+    /// For a new file, what to do if its name is taken, if chosen when it started.
+    pub on_conflict: Option<NameConflict>,
     pub created_at: OffsetDateTime,
     /// When the session started or last received a chunk.
     pub touched_at: OffsetDateTime,
@@ -62,6 +102,7 @@ pub struct NewUpload<'a> {
     pub size: u64,
     pub sha256: [u8; 32],
     pub base: Option<&'a str>,
+    pub on_conflict: Option<NameConflict>,
 }
 
 /// Why an upload session was not started.
@@ -70,6 +111,9 @@ pub enum UploadError {
     /// The person already has [`UPLOADS_PER_PERSON`] sessions open.
     #[error("too many uploads under way")]
     TooMany,
+    /// The site has no room for the declared size under its quota.
+    #[error("the site's storage quota would be exceeded")]
+    QuotaExceeded,
     #[error(transparent)]
     Db(#[from] DbError),
 }
@@ -89,7 +133,7 @@ fn bytes_of(value: i64) -> u64 {
 macro_rules! columns {
     () => {
         "id, owner, site_id, parent_id, doc_id, name, size, sha256, received, base_revision, \
-         created_at, touched_at"
+         on_conflict, created_at, touched_at"
     };
 }
 
@@ -107,6 +151,13 @@ fn session_from_row(row: &PgRow) -> Result<UploadSession, sqlx::Error> {
             ));
         }
     };
+    let on_conflict: Option<String> = row.try_get("on_conflict")?;
+    let on_conflict = match on_conflict {
+        Some(text) => Some(NameConflict::parse(&text).ok_or_else(|| {
+            sqlx::Error::Decode("an upload's name conflict choice is unknown".into())
+        })?),
+        None => None,
+    };
     let sha256: Vec<u8> = row.try_get("sha256")?;
     let sha256: [u8; 32] = sha256
         .try_into()
@@ -121,6 +172,7 @@ fn session_from_row(row: &PgRow) -> Result<UploadSession, sqlx::Error> {
         sha256,
         received: bytes_of(row.try_get("received")?),
         base: row.try_get("base_revision")?,
+        on_conflict,
         created_at: row.try_get("created_at")?,
         touched_at: row.try_get("touched_at")?,
     })
@@ -128,9 +180,11 @@ fn session_from_row(row: &PgRow) -> Result<UploadSession, sqlx::Error> {
 
 impl Db {
     /// Starts the upload session `new`, with nothing received, unless its owner already has
-    /// [`UPLOADS_PER_PERSON`] open. The owner's row is locked while counting, so two sessions
-    /// started at once cannot both take the last place. The caller has checked the person may
-    /// upload there.
+    /// [`UPLOADS_PER_PERSON`] open (`TooMany`) or its site has no room for its declared size
+    /// under its quota (`QuotaExceeded`); the size is reserved in the site while the session is
+    /// open. The owner's row is locked while counting, then the site's usage row, so two
+    /// sessions started at once cannot both take the last place or the last bytes. The caller
+    /// has checked the person may upload there.
     pub async fn start_upload(&self, new: NewUpload<'_>) -> Result<UploadSession, UploadError> {
         let mut tx = self.pool().begin().await.map_err(DbError::from)?;
         sqlx::query("select id from users where id = $1 for update")
@@ -146,14 +200,24 @@ impl Db {
         if open >= UPLOADS_PER_PERSON {
             return Err(UploadError::TooMany);
         }
+        let usage = locked_usage(&mut tx, new.site)
+            .await
+            .map_err(DbError::from)?;
+        if !fits(usage.used, usage.reserved, usage.quota, new.size) {
+            return Err(UploadError::QuotaExceeded);
+        }
+        change_reserved(&mut tx, new.site, column(new.size))
+            .await
+            .map_err(DbError::from)?;
         let (parent, doc) = match new.target {
             UploadTarget::NewFile { parent } => (Some(parent.0), None),
             UploadTarget::NewVersion { doc } => (None, Some(doc.0)),
         };
         let row = sqlx::query(concat!(
             "insert into upload_sessions \
-                 (id, owner, site_id, parent_id, doc_id, name, size, sha256, base_revision) \
-             values ($1, $2, $3, $4, $5, $6, $7, $8, $9) returning ",
+                 (id, owner, site_id, parent_id, doc_id, name, size, sha256, base_revision, \
+                  on_conflict) \
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) returning ",
             columns!()
         ))
         .bind(new.id)
@@ -165,6 +229,7 @@ impl Db {
         .bind(column(new.size))
         .bind(&new.sha256[..])
         .bind(new.base)
+        .bind(new.on_conflict.map(NameConflict::as_str))
         .fetch_one(&mut *tx)
         .await
         .map_err(DbError::from)?;
@@ -199,13 +264,75 @@ impl Db {
         Ok(done.rows_affected() > 0)
     }
 
-    /// Ends the upload session `id`: finished, abandoned or expired. Whether it existed.
+    /// Ends the upload session `id`, abandoned, refused or expired, releasing its reservation.
+    /// Whether it existed. The site's usage row is locked before the session's row, as
+    /// [`Db::claim_upload`] locks them.
     pub async fn end_upload(&self, id: Uuid) -> Result<bool, DbError> {
-        let done = sqlx::query("delete from upload_sessions where id = $1")
+        let Some(site) = self.upload_site(id).await? else {
+            return Ok(false);
+        };
+        let mut tx = self.pool().begin().await?;
+        locked_usage(&mut tx, site).await?;
+        let size: Option<i64> =
+            sqlx::query_scalar("delete from upload_sessions where id = $1 returning size")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some(size) = size else {
+            return Ok(false);
+        };
+        change_reserved(&mut tx, site, -size).await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// The site of upload session `id`, if it exists.
+    async fn upload_site(&self, id: Uuid) -> Result<Option<NodeId>, DbError> {
+        let site: Option<Uuid> =
+            sqlx::query_scalar("select site_id from upload_sessions where id = $1")
+                .bind(id)
+                .fetch_optional(self.pool())
+                .await?;
+        Ok(site.map(NodeId))
+    }
+
+    /// Ends the upload session `id` for its finish, keeping its declared size reserved for the
+    /// commit: the reservation answered, which the caller commits or releases. Refused
+    /// (`Exceeded`), leaving the session open, if the site has no room for it now: what the
+    /// site uses, with what is reserved for commits under way (not for other open sessions)
+    /// and this session's size, would go over its quota, which may have been lowered since it
+    /// started. `None` if the session is gone. Two sessions finishing at once take turns on the
+    /// site's usage row, so they cannot go over the quota together.
+    pub async fn claim_upload(&self, id: Uuid) -> Result<Option<Reservation>, QuotaError> {
+        let Some(site) = self.upload_site(id).await? else {
+            return Ok(None);
+        };
+        let mut tx = self.pool().begin().await?;
+        let usage = locked_usage(&mut tx, site).await?;
+        let size: Option<i64> =
+            sqlx::query_scalar("select size from upload_sessions where id = $1 for update")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some(size) = size else {
+            return Ok(None);
+        };
+        let open: i64 = sqlx::query_scalar(
+            "select coalesce(sum(size), 0)::bigint from upload_sessions where site_id = $1",
+        )
+        .bind(site.0)
+        .fetch_one(&mut *tx)
+        .await?;
+        let committing = usage.reserved.saturating_sub(bytes_of(open));
+        if !fits(usage.used, committing, usage.quota, bytes_of(size)) {
+            return Err(QuotaError::Exceeded);
+        }
+        sqlx::query("delete from upload_sessions where id = $1")
             .bind(id)
-            .execute(self.pool())
+            .execute(&mut *tx)
             .await?;
-        Ok(done.rows_affected() > 0)
+        tx.commit().await?;
+        Ok(Some(Reservation::new(site, bytes_of(size))))
     }
 
     /// The upload sessions that have received nothing since `before` (nor started after it),

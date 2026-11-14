@@ -2,7 +2,8 @@
 //! the server starts, and rebuilt on request. Git stays the authority; whenever the index
 //! disagrees with it, the document's list is replaced from Git. Recording a revision also
 //! records the content it points at (a completed `blob_refs` row); those rows are rebuilt from
-//! Git at a start when a flag asks for it ([`reconcile_blobs`]).
+//! Git at a start when a flag asks for it ([`reconcile_blobs`]), and so is each site's usage,
+//! from the sizes of its versions ([`reconcile_usage`]).
 
 use std::collections::HashSet;
 use std::fmt;
@@ -308,6 +309,7 @@ fn to_record(info: RevisionInfo) -> Result<RevisionRecord, String> {
         authors: info.authors.into_iter().map(|a| (a.id, a.name)).collect(),
         name: info.file_name,
         fields: Value::Object(info.fields),
+        size: info.size,
     })
 }
 
@@ -508,4 +510,82 @@ async fn walk_store(
             Vec::new()
         }
     }
+}
+
+/// What a reconcile of the sites' usage did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UsageReport {
+    /// Whether a flag asked for a rebuild, so one was made.
+    pub rebuilt: bool,
+    /// Documents whose versions' sizes were read from Git.
+    pub filled: usize,
+    /// Documents whose versions' sizes could not be read, and why.
+    pub failed: Vec<(DocId, String)>,
+}
+
+impl fmt::Display for UsageReport {
+    /// One line with the counts.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if !self.rebuilt {
+            return f.write_str("nothing to rebuild");
+        }
+        write!(
+            f,
+            "usage rebuilt, sizes of {} documents read from Git, {} failed",
+            self.filled,
+            self.failed.len()
+        )
+    }
+}
+
+/// Drops the reservations of saves, uploads and copies that a stop interrupted (see
+/// [`Db::reset_reservations`]), then rebuilds every site's usage when a flag asks for it: the
+/// sizes of versions recorded before sizes were kept are read from Git (inline old versions
+/// included), then each site's usage is set to the sum of the sizes of every version of every
+/// item in it that is not purged. A rebuild with a document that could not be read counts what
+/// it knows and keeps the flags, so the next start tries again. Failures are logged.
+pub async fn reconcile_usage(state: &AppState) -> UsageReport {
+    let db = state.db();
+    let mut report = UsageReport::default();
+    if let Err(e) = db.reset_reservations().await {
+        eprintln!("sharecraft-server: cannot reset the quota reservations: {e}");
+    }
+    match db.usage_rebuild_flagged().await {
+        Ok(true) => {}
+        Ok(false) => return report,
+        Err(e) => {
+            eprintln!("sharecraft-server: cannot read the usage flags: {e}");
+            return report;
+        }
+    }
+    let missing = match db.revision_sizes_missing().await {
+        Ok(missing) => missing,
+        Err(e) => {
+            eprintln!("sharecraft-server: cannot list the versions without a size: {e}");
+            return report;
+        }
+    };
+    let store = state.checkpointer();
+    for doc in missing {
+        let history = blocking(store, move |s| s.history(doc).map_err(|e| e.to_string())).await;
+        let sizes: Vec<(String, u64)> = match history {
+            Ok(history) => history
+                .into_iter()
+                .map(|info| (info.revision.to_string(), info.size))
+                .collect(),
+            Err(error) => {
+                report.failed.push((doc, error));
+                continue;
+            }
+        };
+        match db.set_revision_sizes(doc, &sizes).await {
+            Ok(()) => report.filled += 1,
+            Err(e) => report.failed.push((doc, e.to_string())),
+        }
+    }
+    match db.rebuild_usage(report.failed.is_empty()).await {
+        Ok(()) => report.rebuilt = true,
+        Err(e) => eprintln!("sharecraft-server: cannot rebuild the sites' usage: {e}"),
+    }
+    report
 }

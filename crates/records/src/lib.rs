@@ -13,6 +13,7 @@ mod events;
 mod explorer;
 mod groups;
 mod links;
+mod quotas;
 mod requests;
 mod revisions;
 mod roles;
@@ -38,6 +39,7 @@ pub use explorer::{
 };
 pub use groups::{Group, SiteGroup};
 pub use links::{AnyoneGrant, Link, LinkError, LinkKind, LinkToken};
+pub use quotas::{QUOTA_WARNING_PERCENT, QuotaError, Reservation, SiteUsage};
 pub use requests::{
     AccessRequest, MyRequest, REQUEST_MESSAGE_MAX, REQUESTS_PER_DAY, RequestDecision, RequestError,
 };
@@ -46,4 +48,6 @@ pub use roles::{Access, Perms, Principal, RoleDef, RoleRef};
 pub use scopes::{Crumb, Cursor, Listed, NodeAccess};
 pub use settings::{ANYONE_LINK_MAX_DAYS, ANYONE_LINKS, SharingSettings};
 pub use tree::{Node, NodeChange, NodeKind, NodeRow, NodesApplied, validate_node_name};
-pub use uploads::{NewUpload, UPLOADS_PER_PERSON, UploadError, UploadSession, UploadTarget};
+pub use uploads::{
+    NameConflict, NewUpload, UPLOADS_PER_PERSON, UploadError, UploadSession, UploadTarget,
+};

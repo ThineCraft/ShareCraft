@@ -14,6 +14,7 @@ use crate::groups::{
     add_site_owner, all_locked, ensure_site_groups, groups_judged_by, lock_groups,
 };
 use crate::links::{after_deletion, lock_links_below, revoke_locked};
+use crate::quotas::{UsageChanges, apply_usage_changes, usage_changes};
 use crate::roles::lock_roles;
 use crate::scopes::{
     LOCK_ATTEMPTS, access_with, judged_roles, lock_segment_with, lock_top_down, scopes_of, segment,
@@ -252,6 +253,8 @@ type Doomed = Vec<(uuid::Uuid, Option<GroupId>)>;
 struct Locked {
     doomed: Doomed,
     purged_links: Doomed,
+    /// What the change does to sites' usage, their rows locked.
+    usage: UsageChanges,
 }
 
 /// The nodes `change` marks deleted and does not purge, and the sites they are in.
@@ -387,7 +390,9 @@ async fn after_purge(
 /// from its source scope down, as access changes lock it (ancestors `FOR SHARE`, a node the
 /// change writes `FOR UPDATE`), in `needs` order; then every row the change writes,
 /// `FOR UPDATE`, ancestors first (see `lock_top_down`); then the live links at or below a node
-/// it deletes, by id, `FOR UPDATE`; then the groups the actor is a member of that
+/// it deletes, by id, `FOR UPDATE`; then the usage rows of the sites whose usage it changes
+/// (a purge, a move to another site), by site id, `FOR UPDATE`; then the groups the actor is a
+/// member of that
 /// are assigned on those chains' scopes, by id, `FOR SHARE`, with those links' groups
 /// `FOR UPDATE`; then the roles giving that access,
 /// by id, `FOR SHARE`; then the access is worked out again and judged. So an assignment changed
@@ -412,6 +417,7 @@ async fn judge(
         lock_top_down(&mut *conn, &written, true).await?;
         let doomed = lock_links_below(&mut *conn, &deleted, &sites).await?;
         let purged_links = lock_links_of(&mut *conn, &purged).await?;
+        let usage = usage_changes(&mut *conn, change.rows).await?;
         lock_groups(
             &mut *conn,
             [],
@@ -421,6 +427,7 @@ async fn judge(
         return Ok(Some(Locked {
             doomed,
             purged_links,
+            usage,
         }));
     }
     let actor = change.actor.ok_or(AccessError::Forbidden)?;
@@ -450,6 +457,7 @@ async fn judge(
     lock_top_down(&mut *conn, &written, true).await?;
     let doomed = lock_links_below(&mut *conn, &deleted, &sites).await?;
     let purged_links = lock_links_of(&mut *conn, &purged).await?;
+    let usage = usage_changes(&mut *conn, change.rows).await?;
     let judged = groups_judged_by(&mut *conn, actor, &scopes).await?;
     lock_groups(
         &mut *conn,
@@ -483,6 +491,7 @@ async fn judge(
     Ok(Some(Locked {
         doomed,
         purged_links,
+        usage,
     }))
 }
 
@@ -558,6 +567,7 @@ impl Db {
         for row in change.rows {
             upsert_node(&mut tx, row).await?;
         }
+        apply_usage_changes(&mut tx, &locked.usage).await?;
         if let (Some(creator), Some(first)) = (change.site_groups, change.rows.first()) {
             add_site_owner(&mut tx, first.id, creator, change.actor).await?;
         }
@@ -719,6 +729,26 @@ impl Db {
         .fetch_all(self.pool())
         .await?;
         Ok(names)
+    }
+
+    /// The undeleted child of `parent` named `name`, ignoring case, if there is one: the item a
+    /// new file of that name would replace.
+    pub async fn live_child_named(
+        &self,
+        parent: NodeId,
+        name: &str,
+    ) -> Result<Option<Node>, DbError> {
+        let row = sqlx::query(
+            "select id, kind, parent_id, site_id, name, unique_scope, \
+                    (deleted_at is not null) as deleted, created_by, created_at \
+             from nodes \
+             where parent_id = $1 and lower(name) = lower($2) and deleted_at is null",
+        )
+        .bind(parent.0)
+        .bind(name)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row.as_ref().map(node_from_row).transpose()?)
     }
 
     /// Whether no undeleted child of `parent`, other than `except`, is named `name`, ignoring

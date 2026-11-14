@@ -26,7 +26,7 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use collab_core::ids::{DocId, NodeId};
 use futures_util::Stream;
-use records::{AccessError, Editor, User};
+use records::{AccessError, Editor, QuotaError, Reservation, User};
 use revisions::{
     Author, BlobRef, Checkpoint, CheckpointError, Content, Outcome, RevisionId, Stored,
 };
@@ -35,8 +35,11 @@ use serde_json::{Map, Value, json};
 use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
+use super::uploads::{
+    Named, add_renamed, clean_upload_name, conflict_choice, settle_name, store_version,
+};
 use super::{ApiError, parse_id, to_completion};
-use crate::blobs::{BodyError, Held, write_claimed};
+use crate::blobs::{BodyError, Held, release, write_claimed};
 use crate::checkpoint::Checkpointer;
 use crate::file_room::SaveReply;
 use crate::projection::record_first;
@@ -69,10 +72,12 @@ pub(crate) struct UploadQuery {
     /// The library or folder the new document goes into.
     parent: Option<String>,
     name: Option<String>,
+    /// What to do if the name is taken there: `replace`, `keep_both` or `skip`.
+    on_conflict: Option<String>,
 }
 
 /// A query that does not parse is a `400`.
-fn query_of<T>(query: Result<Query<T>, QueryRejection>) -> Result<T, ApiError> {
+pub(super) fn query_of<T>(query: Result<Query<T>, QueryRejection>) -> Result<T, ApiError> {
     query.map(|Query(q)| q).map_err(|_| ApiError::BadRequest)
 }
 
@@ -134,6 +139,37 @@ pub(super) async fn discard(state: &AppState, held: Held) {
     {
         eprintln!("sharecraft-server: cannot erase the content of a refused request: {e}");
     }
+}
+
+/// Reserves the bytes of `held`, stored for a request, against the quota of `site`: refused
+/// with `507 quota_exceeded` when the site has no room for them, the content then erased
+/// unless something else names it.
+pub(super) async fn reserve_held(
+    state: &AppState,
+    site: NodeId,
+    held: Held,
+) -> Result<(Held, Reservation), ApiError> {
+    match state.db().reserve_bytes(site, held.blob().size).await {
+        Ok(reservation) => Ok((held, reservation)),
+        Err(e) => {
+            discard(state, held).await;
+            Err(match e {
+                QuotaError::Exceeded => ApiError::QuotaExceeded,
+                QuotaError::Db(e) => ApiError::unavailable(&e),
+            })
+        }
+    }
+}
+
+/// The site `node` is in: `404` if there is no such node.
+async fn site_of(state: &AppState, node: NodeId) -> Result<NodeId, ApiError> {
+    Ok(state
+        .db()
+        .node(node)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?
+        .ok_or(ApiError::NotFound)?
+        .site)
 }
 
 /// `GET /api/docs/{id}/content[?revision=<id>]`: the document's bytes, as its current revision
@@ -374,8 +410,10 @@ fn file_stream(
 /// before the body is read, so a save that would be refused stores nothing. The body streams
 /// into the content store, and a reference to it is handed to the document's file session and
 /// nothing else, which checks the save again; the save finishes even if the caller goes away.
-/// A save refused after its body was stored has that content erased, unless something else
-/// names it.
+/// Its bytes are reserved against the site's quota before they are handed on (`507
+/// quota_exceeded` when the site has no room); the reservation is given back once the session
+/// answers, the version written having been counted with its commit. A save refused after its
+/// body was stored has that content erased, unless something else names it.
 pub(crate) async fn save(
     State(state): State<AppState>,
     signed: Signed,
@@ -420,7 +458,9 @@ pub(crate) async fn save(
     {
         return Ok(save_answer(refused));
     }
+    let site = site_of(&state, doc.into()).await?;
     let held = body_blob(&state, request).await?;
+    let (held, reservation) = reserve_held(&state, site, held).await?;
 
     let reply = {
         let state = state.clone();
@@ -431,6 +471,7 @@ pub(crate) async fn save(
             if !matches!(reply, SaveReply::Saved(_) | SaveReply::Unchanged(_)) {
                 discard(&state, held).await;
             }
+            release(state.db(), reservation).await;
             Ok(reply)
         })
         .await?
@@ -465,14 +506,21 @@ fn saved(revision: &RevisionId, changed: bool) -> Response {
     Json(json!({ "revision": revision.to_string(), "changed": changed })).into_response()
 }
 
-/// `POST /api/docs/upload?parent=<id>&name=<file name>`: creates a document from the bytes
-/// sent in the library or folder `parent` (of which the caller must be an editor), with them as
-/// its first revision. The document inherits its access from there. The editor is the one
-/// whose extension ends the name. The caller's right to add there and the name are checked
-/// before the body is read (and again when the document is made); the bytes then stream into
-/// the content store, and are claimed for the revision before it is committed. Content stored
-/// for an upload that is then refused, or fails, is erased unless something else names it. If they cannot be stored after the
-/// document was made, the document stays, empty, and the answer is `503` naming it.
+/// `POST /api/docs/upload?parent=<id>&name=<file name>[&on_conflict=<choice>]`: creates a
+/// document from the bytes sent in the library or folder `parent` (of which the caller must be
+/// an editor), with them as its first revision. The document inherits its access from there.
+/// The editor is the one whose extension ends the name. The name is trimmed and its refused
+/// characters become `_` (the answer then says so: `renamed {from, to}`). The caller's right to
+/// add there and the name are checked before the body is read (and again when the document is
+/// made): a name taken there is `409 name_taken {suggested}` unless `on_conflict` chooses
+/// `replace` (a new version of the file there, saved through its file session, answered as a
+/// save; `409 being_edited` while someone holds its seat), `keep_both` (the suggested name) or
+/// `skip` (`200 {skipped: true}`, the body unread). The bytes then stream into the content
+/// store and are reserved against the site's quota (`507 quota_exceeded` when it has no room),
+/// and are claimed for the revision before it is committed. Content stored for an upload that
+/// is then refused, or fails, is erased unless something else names it. If they cannot be
+/// stored after the document was made, the document stays, empty, and the answer is `503`
+/// naming it.
 pub(crate) async fn upload(
     State(state): State<AppState>,
     signed: Signed,
@@ -481,28 +529,52 @@ pub(crate) async fn upload(
 ) -> Result<Response, ApiError> {
     let query = query_of(query)?;
     let parent = NodeId(parse_id(&query.parent.ok_or(ApiError::BadRequest)?)?);
-    let name = query.name.ok_or(ApiError::BadRequest)?;
-    let editor = Editor::for_file_name(name.trim()).ok_or(ApiError::BadRequest)?;
+    let asked = query.name.ok_or(ApiError::BadRequest)?;
+    let choice = conflict_choice(query.on_conflict.as_deref())?;
+    let (name, editor, cleaned_from) = clean_upload_name(&asked)?;
     let user = signed.session.user;
-    match tree::check_create_document(&state, &user, parent, &name, editor).await {
-        Ok(()) => {}
-        // The name is only an extension.
-        Err(AccessError::WrongExtension) => return Err(ApiError::BadRequest),
-        Err(e) => return Err(e.into()),
+    let named = settle_name(&state, &user, parent, &name, editor, choice).await?;
+    if let Some(answer) = named.answer() {
+        return Ok(answer);
     }
+    let site = site_of(&state, parent).await?;
     let held = body_blob(&state, request).await?;
     if held.blob().size == 0 {
         discard(&state, held).await;
         return Err(ApiError::BadRequest);
     }
+    let (held, reservation) = reserve_held(&state, site, held).await?;
 
     to_completion(async move {
-        Ok(
-            match create_uploaded(&state, &user, parent, &name, editor, held).await? {
-                Created::Done { body, .. } => (StatusCode::CREATED, Json(body)).into_response(),
-                Created::Failed(response) => response,
-            },
-        )
+        let answer = match named {
+            Named::New {
+                name: final_name,
+                editor,
+                renamed,
+            } => {
+                let created =
+                    create_uploaded(&state, &user, parent, &final_name, editor, held).await;
+                match created {
+                    Ok(Created::Done { mut body, .. }) => {
+                        let from = cleaned_from.as_deref().or(renamed.as_deref());
+                        add_renamed(&mut body, from, &final_name);
+                        Ok((StatusCode::CREATED, Json(body)).into_response())
+                    }
+                    Ok(Created::Failed(response)) => Ok(response),
+                    Err(e) => Err(e),
+                }
+            }
+            Named::Replace { doc, name, base } => Ok(save_answer(
+                store_version(&state, &user, doc, &name, base, held).await,
+            )),
+            Named::Taken { .. } | Named::Skip | Named::Refused(_) => {
+                discard(&state, held).await;
+                Err(ApiError::Unavailable)
+            }
+        };
+        // A version written was counted with its commit.
+        release(state.db(), reservation).await;
+        answer
     })
     .await
 }

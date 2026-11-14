@@ -50,6 +50,8 @@ pub(crate) fn router() -> Router<AppState> {
         .route("/me", get(session::me))
         .route("/editors", get(crate::editors::list))
         .route("/sites", get(sites::list).post(sites::create))
+        .route("/sites/{id}", get(sites::show))
+        .route("/sites/{id}/quota", put(sites::set_quota))
         .route("/sites/{id}/groups", get(sites::groups))
         .route("/sites/{id}/bin", get(bin::list))
         .route("/bin/{id}", delete(bin::remove))
@@ -241,6 +243,8 @@ pub(crate) enum ApiError {
     /// 400: a chunk's `Content-Range` is missing, malformed, beyond the declared size, or not
     /// the length of its body.
     InvalidRange,
+    /// 507: the site has no room left under its storage quota for what would be stored.
+    QuotaExceeded,
     /// 503: the database failed.
     Unavailable,
 }
@@ -304,6 +308,7 @@ impl ApiError {
             ApiError::ChecksumMismatch => (StatusCode::UNPROCESSABLE_ENTITY, "checksum_mismatch"),
             ApiError::TooManyUploads => (StatusCode::TOO_MANY_REQUESTS, "too_many_uploads"),
             ApiError::InvalidRange => (StatusCode::BAD_REQUEST, "invalid_range"),
+            ApiError::QuotaExceeded => (StatusCode::INSUFFICIENT_STORAGE, "quota_exceeded"),
             ApiError::Unavailable => (StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
         }
     }
@@ -344,6 +349,7 @@ impl From<AccessError> for ApiError {
             AccessError::IntoItself => ApiError::IntoItself,
             AccessError::ParentInBin => ApiError::ParentInBin,
             AccessError::IsSite => ApiError::IsSite,
+            AccessError::QuotaExceeded => ApiError::QuotaExceeded,
             // The server picks a fresh random id, so a clash is not the caller's doing.
             AccessError::Exists | AccessError::Db(_) | AccessError::Unjudged(_) => {
                 ApiError::unavailable(&e)

@@ -30,6 +30,7 @@ fn record(doc: DocId, n: u8) -> RevisionRecord {
         authors: vec![("u1".into(), "Ann".into())],
         name: format!("notes-{n}.txt"),
         fields: json!({ "n": n }),
+        size: u64::from(n),
     }
 }
 
