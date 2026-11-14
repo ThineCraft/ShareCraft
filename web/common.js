@@ -819,6 +819,18 @@ export function daysLeftText(days) {
   return days === 1 ? '1 day left' : `${days} days left`;
 }
 
+/**
+ * What a recycle bin entry is and where it was, from its `kind` and `path` (the names of the
+ * folders above it in its library): "Folder in Plans / 2026", "File at the top of its library",
+ * or for a whole library "Library, with everything in it".
+ */
+export function binEntryText(entry) {
+  if (entry.kind === 'library') return 'Library, with everything in it';
+  const what = entry.kind === 'folder' ? 'Folder' : 'File';
+  const where = entry.path?.length ? `in ${entry.path.join(' / ')}` : 'at the top of its library';
+  return `${what} ${where}`;
+}
+
 /** `n` bytes in the largest unit that keeps it at 1 or more, in the page's language (see [`formatSize`]). */
 export const bytesText = (n) => formatSize(n);
 

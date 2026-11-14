@@ -626,6 +626,7 @@ test('a file never saved offers no download', () => {
 // ---- files: bin wording, bulk results, quota wording, selection ----
 
 import {
+  binEntryText,
   bulkSummary,
   bytesText,
   canPlaceHere,
@@ -646,6 +647,13 @@ test('days left in the recycle bin are worded plainly', () => {
   assert.equal(daysLeftText(0), 'Erased within a day');
   assert.equal(daysLeftText(-4), 'Erased within a day');
   assert.equal(daysLeftText(null), '');
+});
+
+test('a bin entry says what it is and where it was', () => {
+  assert.equal(binEntryText({ kind: 'file', path: [] }), 'File at the top of its library');
+  assert.equal(binEntryText({ kind: 'file', path: ['Plans', '2026'] }), 'File in Plans / 2026');
+  assert.equal(binEntryText({ kind: 'folder', path: ['Plans'] }), 'Folder in Plans');
+  assert.equal(binEntryText({ kind: 'library', path: [] }), 'Library, with everything in it');
 });
 
 test('sizes are worded in the largest sensible unit', () => {

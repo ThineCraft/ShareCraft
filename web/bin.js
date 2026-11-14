@@ -4,6 +4,7 @@
 
 import {
   api,
+  binEntryText,
   formatSize,
   can,
   confirmDialog,
@@ -115,7 +116,6 @@ function render() {
 function row(entry) {
   const restore = action('Restore', entry, () => restoreEntry(entry));
   const remove = action(stage === 'second' ? 'Delete forever' : 'Delete', entry, () => removeEntry(entry));
-  const where = entry.path.length ? `in ${entry.path.join(' / ')}` : 'at the top of its library';
   const by = entry.deleted_by ? `Deleted by ${entry.deleted_by.name}` : 'Deleted';
   return h(
     'li',
@@ -125,7 +125,7 @@ function row(entry) {
       { class: 'grow' },
       h('strong', {}, entry.name),
       h('br'),
-      h('small', {}, `${entry.kind === 'folder' ? 'Folder' : 'File'} ${where}`),
+      h('small', {}, binEntryText(entry)),
     ),
     h('small', {}, `${by}${entry.deleted_at ? `, ${formatDate(entry.deleted_at)}` : ''}`),
     h('small', {}, daysLeftText(entry.days_left)),
