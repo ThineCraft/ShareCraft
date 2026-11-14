@@ -2,6 +2,7 @@
 //! than `GET` must also carry `Origin`. Errors are `{"error": "<code>"}`.
 
 mod admin;
+mod bin;
 pub(crate) mod content;
 mod docs;
 mod explorer;
@@ -49,6 +50,9 @@ pub(crate) fn router() -> Router<AppState> {
         .route("/editors", get(crate::editors::list))
         .route("/sites", get(sites::list).post(sites::create))
         .route("/sites/{id}/groups", get(sites::groups))
+        .route("/sites/{id}/bin", get(bin::list))
+        .route("/bin/{id}", delete(bin::remove))
+        .route("/bin/{id}/restore", post(bin::restore))
         .route("/roles", get(roles::list).post(roles::create))
         .route("/roles/{id}", patch(roles::change).delete(roles::remove))
         .route("/groups", get(groups::list).post(groups::create))
@@ -168,8 +172,9 @@ pub(crate) enum ApiError {
     SiteGroup,
     /// 409: another item in the same place already has that name (ignoring case).
     NameTaken,
-    /// 409: a folder still holds items.
-    NotEmpty,
+    /// 409: a folder above the item to restore is in the recycle bin, and the caller may not
+    /// restore it.
+    ParentInBin,
     /// 400: a folder cannot be moved into itself or below itself.
     IntoItself,
     /// 400: that kind of item cannot go there, or cannot be moved or deleted.
@@ -256,7 +261,7 @@ impl ApiError {
             ApiError::GroupInUse => (StatusCode::CONFLICT, "group_in_use"),
             ApiError::SiteGroup => (StatusCode::BAD_REQUEST, "site_group"),
             ApiError::NameTaken => (StatusCode::CONFLICT, "name_taken"),
-            ApiError::NotEmpty => (StatusCode::CONFLICT, "not_empty"),
+            ApiError::ParentInBin => (StatusCode::CONFLICT, "parent_in_bin"),
             ApiError::IntoItself => (StatusCode::BAD_REQUEST, "into_itself"),
             ApiError::WrongPlace => (StatusCode::BAD_REQUEST, "wrong_place"),
             ApiError::IsSite => (StatusCode::BAD_REQUEST, "is_site"),
@@ -321,7 +326,7 @@ impl From<AccessError> for ApiError {
             AccessError::NameTaken => ApiError::NameTaken,
             AccessError::WrongPlace => ApiError::WrongPlace,
             AccessError::IntoItself => ApiError::IntoItself,
-            AccessError::NotEmpty => ApiError::NotEmpty,
+            AccessError::ParentInBin => ApiError::ParentInBin,
             AccessError::IsSite => ApiError::IsSite,
             // The server picks a fresh random id, so a clash is not the caller's doing.
             AccessError::Exists | AccessError::Db(_) | AccessError::Unjudged(_) => {
@@ -562,7 +567,8 @@ mod tests {
             },
         )
         .await
-        .unwrap();
+        .unwrap()
+        .node;
         let (children, _) = db
             .children(root.id, site.id, None, 10)
             .await

@@ -352,6 +352,9 @@ async fn load(
                     by: author.clone(),
                 },
                 deleted: None,
+                bin_stage: None,
+                deleted_with: None,
+                purged: None,
             });
         }
         files.push(ids);

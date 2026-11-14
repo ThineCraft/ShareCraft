@@ -97,7 +97,7 @@ pub(crate) async fn create(
                 name: new.name,
                 id: NodeId(Uuid::new_v4()),
             };
-            Ok(tree::apply(&state, &actor, op).await?)
+            Ok(tree::apply(&state, &actor, op).await?.node)
         })
         .await?
     };

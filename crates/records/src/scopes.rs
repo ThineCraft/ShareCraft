@@ -106,7 +106,8 @@ pub(crate) const REACH: &str = concat!(
 /// `with recursive`), those with a deleted node at or above them: the CTEs `held_up` and
 /// `dead(origin)`. The same test as [`REACH`]'s `live`, the other way round: an assignment on
 /// such a scope grants nothing, and it counts for nothing either (nothing in use, no manager
-/// to keep). Nothing is ever undeleted, so a scope found dead stays so.
+/// to keep). A scope found dead stays so unless what was deleted is restored from the recycle
+/// bin, which brings its assignments back into force.
 pub(crate) const DEAD: &str = "\
     held_up(origin, id, parent_id, deleted) as ( \
         select n.id, n.id, n.parent_id, n.deleted_at is not null \
@@ -187,13 +188,13 @@ const CHAIN: &str = concat!(
     "with recursive ",
     mine!(),
     ", up(id, kind, parent_id, site_id, name, unique_scope, deleted, created_by, \
-          created_at) as ( \
+          created_at, purged) as ( \
         select id, kind, parent_id, site_id, name, unique_scope, deleted_at is not null, \
-               created_by, created_at \
+               created_by, created_at, purged_at is not null \
         from nodes where id = $2 \
         union \
         select n.id, n.kind, n.parent_id, n.site_id, n.name, n.unique_scope, \
-               n.deleted_at is not null, n.created_by, n.created_at \
+               n.deleted_at is not null, n.created_by, n.created_at, n.purged_at is not null \
         from nodes n join up on n.id = up.parent_id) \
     select up.*, m.role_id, m.role_name, m.perms from up \
     left join mine m on m.node_id = up.id and up.unique_scope"
@@ -397,6 +398,19 @@ pub(crate) async fn chain(
     user: UserId,
     node: NodeId,
 ) -> Result<Option<Vec<Link>>, sqlx::Error> {
+    chain_with(conn, user, node, false).await
+}
+
+/// [`chain`], or with `as_if_live` the chain as it would be if `node` and everything deleted
+/// above it were live again (see [`Db::access_as_if_live`]): deleted nodes are walked through,
+/// and a purged folder above `node` is passed over up to its library, where a restore would
+/// put `node`. `None` for a purged `node` either way.
+pub(crate) async fn chain_with(
+    conn: &mut PgConnection,
+    user: UserId,
+    node: NodeId,
+    as_if_live: bool,
+) -> Result<Option<Vec<Link>>, sqlx::Error> {
     let standing = standing(conn, user).await?;
     if standing == Standing::Nobody {
         return Ok(None);
@@ -408,8 +422,12 @@ pub(crate) async fn chain(
         .await?;
     let mut by_id: HashMap<NodeId, (Node, Vec<(RoleRef, Perms)>)> =
         HashMap::with_capacity(rows.len());
+    let mut purged = std::collections::HashSet::new();
     for row in &rows {
         let found = node_from_row(row)?;
+        if row.try_get::<bool, _>("purged")? {
+            purged.insert(found.id);
+        }
         let given = match row.try_get::<Option<String>, _>("role_id")? {
             Some(id) => Some((
                 RoleRef {
@@ -426,17 +444,27 @@ pub(crate) async fn chain(
             .1
             .extend(given);
     }
+    if purged.contains(&node) {
+        return Ok(None);
+    }
     let mut upward = Vec::with_capacity(by_id.len());
     let mut next = Some(node);
+    // While passing over a purged folder and what lies between it and its library.
+    let mut passing = false;
     while let Some(id) = next {
         // Taking each node out means a cycle finds its start gone and ends here.
         let Some((found, given)) = by_id.remove(&id) else {
             return Ok(None);
         };
-        if found.deleted {
+        if found.deleted && !as_if_live {
             return Ok(None);
         }
         next = found.parent;
+        passing |= purged.contains(&found.id);
+        if passing && found.kind != NodeKind::Library {
+            continue;
+        }
+        passing = false;
         upward.push((found, given));
     }
     if upward.last().map(|(top, _)| top.kind) != Some(NodeKind::Site) {
@@ -469,7 +497,18 @@ pub(crate) async fn access_in(
     user: UserId,
     node: NodeId,
 ) -> Result<Option<Access>, sqlx::Error> {
-    Ok(chain(conn, user, node)
+    access_with(conn, user, node, false).await
+}
+
+/// [`access_in`], or with `as_if_live` what `user` could do with `node` if it were live (see
+/// [`Db::access_as_if_live`]).
+pub(crate) async fn access_with(
+    conn: &mut PgConnection,
+    user: UserId,
+    node: NodeId,
+    as_if_live: bool,
+) -> Result<Option<Access>, sqlx::Error> {
+    Ok(chain_with(conn, user, node, as_if_live)
         .await?
         .and_then(|mut links| links.pop().and_then(|link| link.role)))
 }
@@ -1329,7 +1368,20 @@ pub(crate) async fn lock_segment(
     above: bool,
     write: bool,
 ) -> Result<Option<Vec<Link>>, AccessError> {
-    let seen = chain(conn, actor, node)
+    lock_segment_with(conn, actor, node, above, write, false).await
+}
+
+/// [`lock_segment`], or with `as_if_live` along the chain as it would be if `node` were live
+/// (see [`chain_with`]).
+pub(crate) async fn lock_segment_with(
+    conn: &mut PgConnection,
+    actor: UserId,
+    node: NodeId,
+    above: bool,
+    write: bool,
+    as_if_live: bool,
+) -> Result<Option<Vec<Link>>, AccessError> {
+    let seen = chain_with(conn, actor, node, as_if_live)
         .await?
         .ok_or(AccessError::NotFound)?;
     let wanted = segment(&seen, above);
@@ -1344,7 +1396,7 @@ pub(crate) async fn lock_segment(
             .execute(&mut *conn)
             .await?;
     }
-    let now = chain(conn, actor, node)
+    let now = chain_with(conn, actor, node, as_if_live)
         .await?
         .ok_or(AccessError::NotFound)?;
     Ok((segment(&now, above) == wanted).then_some(now))

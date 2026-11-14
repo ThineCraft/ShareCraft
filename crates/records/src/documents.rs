@@ -186,8 +186,10 @@ pub enum AccessError {
     WrongPlace,
     #[error("an item cannot be moved into itself")]
     IntoItself,
-    #[error("that folder is not empty")]
-    NotEmpty,
+    /// An item in the recycle bin is in a folder that is in the bin too, and the person may
+    /// not restore that folder.
+    #[error("a folder above that item is in the recycle bin")]
+    ParentInBin,
     #[error("a site cannot do that")]
     IsSite,
     /// The tree in PostgreSQL no longer matches Git and could not be repaired yet; tree changes

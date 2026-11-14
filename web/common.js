@@ -28,7 +28,8 @@ const MESSAGES = {
   upload_required: 'A PDF cannot be made empty. Upload a PDF file instead.',
   wrong_extension: 'That name does not end with the extension of this kind of document.',
   name_taken: 'Something here already has that name. Choose a different name.',
-  not_empty: 'That folder still has items in it. Move or delete them first.',
+  parent_in_bin:
+    'A folder this item was in is in the recycle bin, and you cannot restore it. Ask whoever deleted that folder to restore it first.',
   into_itself: 'A folder cannot be moved into itself or into a folder inside it.',
   wrong_place: 'That cannot go there. Choose a library or a folder.',
   is_site: 'A site cannot be moved, deleted or made to inherit.',

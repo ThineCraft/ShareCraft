@@ -155,7 +155,7 @@ test('every error code of the tree and access routes has its own sentence', () =
   const general = messageFor('something_nobody_made_up');
   for (const code of [
     'name_taken',
-    'not_empty',
+    'parent_in_bin',
     'into_itself',
     'wrong_place',
     'is_site',
@@ -170,7 +170,7 @@ test('every error code of the tree and access routes has its own sentence', () =
     assert.notEqual(messageFor(code), general, code);
   }
   assert.match(messageFor('name_taken'), /already has that name/);
-  assert.match(messageFor('not_empty'), /still has items/);
+  assert.match(messageFor('parent_in_bin'), /recycle bin/);
   assert.match(messageFor('into_itself'), /itself/);
 });
 

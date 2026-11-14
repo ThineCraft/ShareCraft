@@ -633,7 +633,7 @@ async fn dead_links_do_not_keep_a_role() {
         .unwrap();
     // A link left live under a deleted item, as one made while an ancestor was being deleted
     // could be.
-    sqlx::query("update nodes set deleted_at = now() where id = $1")
+    sqlx::query("update nodes set deleted_at = now(), deleted_with = id where id = $1")
         .bind(t.library.0)
         .execute(test.db.test_pool())
         .await

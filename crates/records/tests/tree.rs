@@ -26,6 +26,9 @@ fn row(id: NodeId, kind: NodeKind, parent: Option<NodeId>, site: NodeId, name: &
         deleted_by: None,
         created_by: None,
         created_at: OffsetDateTime::now_utc(),
+        deleted_with: None,
+        bin_stage: None,
+        purged_at: None,
     }
 }
 

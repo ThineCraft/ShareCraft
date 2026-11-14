@@ -117,6 +117,9 @@ pub async fn put(
                 deleted_by: None,
                 created_by: None,
                 created_at: OffsetDateTime::now_utc(),
+                deleted_with: None,
+                bin_stage: None,
+                purged_at: None,
             },
             None,
         )
@@ -175,6 +178,9 @@ pub async fn delete(test: &TestDb, id: NodeId) {
                 deleted_by: None,
                 created_by: node.created_by,
                 created_at: node.created_at,
+                deleted_with: None,
+                bin_stage: None,
+                purged_at: None,
             },
             None,
         )

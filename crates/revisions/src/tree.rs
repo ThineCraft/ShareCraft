@@ -59,6 +59,20 @@ pub struct TreeRecord {
     pub created: Stamp,
     /// When and by whom it was deleted, if it was.
     pub deleted: Option<Stamp>,
+    /// For the item a person deleted (the top of a deletion, see `deleted_with`), the stage of
+    /// the recycle bin it is in: 1 or 2. Absent on everything else, and on records written
+    /// before the recycle bin, which are read as in the first stage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bin_stage: Option<u8>,
+    /// For a deleted node, the item whose deletion took it to the recycle bin: its own id for
+    /// the item a person deleted, that item's id for everything deleted with it. Absent on
+    /// live nodes, and on records written before the recycle bin (each its own deletion).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted_with: Option<Uuid>,
+    /// When and by whom it was purged from the recycle bin, if it was: the record stays as a
+    /// tombstone, so that anyone following the tree learns it is gone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purged: Option<Stamp>,
 }
 
 impl TreeRecord {
@@ -76,6 +90,17 @@ impl TreeRecord {
         }
         if !KINDS.contains(&self.kind.as_str()) {
             return Some(format!("unknown kind {:?}", self.kind));
+        }
+        if self
+            .bin_stage
+            .is_some_and(|stage| !(1..=2).contains(&stage))
+        {
+            return Some(format!("unknown bin stage {:?}", self.bin_stage));
+        }
+        if self.deleted.is_none()
+            && (self.bin_stage.is_some() || self.deleted_with.is_some() || self.purged.is_some())
+        {
+            return Some("a live node with recycle bin state".to_owned());
         }
         None
     }
@@ -102,11 +127,13 @@ pub struct TreeMove {
     pub duplicates: usize,
 }
 
-/// The latest moment `record` speaks of: when it was deleted, if it was, or created. `None` if
+/// The latest moment `record` speaks of: when it was purged or deleted, if it was, or created. `None` if
 /// neither can be read as RFC 3339.
 fn latest(record: &TreeRecord) -> Option<OffsetDateTime> {
     let at = |stamp: &Stamp| OffsetDateTime::parse(&stamp.at, &Rfc3339).ok();
-    at(&record.created).max(record.deleted.as_ref().and_then(at))
+    at(&record.created)
+        .max(record.deleted.as_ref().and_then(at))
+        .max(record.purged.as_ref().and_then(at))
 }
 
 /// Of the two records of one node, `flat` at `tree/<id>.json` and `sharded` in its sub-folder,
@@ -450,6 +477,9 @@ mod tests {
             name: name.into(),
             created: stamp(ann()),
             deleted: None,
+            bin_stage: None,
+            deleted_with: None,
+            purged: None,
         }
     }
 
@@ -681,6 +711,53 @@ mod tests {
 }
 "#;
         assert_eq!(text, expected);
+    }
+
+    #[test]
+    fn bin_state_round_trips_and_old_records_still_read() {
+        let id = Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
+        let parent = Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap();
+        let site = Uuid::parse_str("33333333-3333-4333-8333-333333333333").unwrap();
+        let mut rec = record(id, "document", Some(parent), site, "Plan.xlsx");
+        rec.deleted = Some(stamp(bob()));
+        rec.deleted_with = Some(parent);
+        let text = String::from_utf8(rec.to_file_bytes().unwrap()).unwrap();
+        assert!(
+            text.contains(&format!("\"deleted_with\": \"{parent}\"")),
+            "{text}"
+        );
+        assert!(!text.contains("bin_stage"), "{text}");
+        assert!(!text.contains("purged"), "{text}");
+        let read: TreeRecord = serde_json::from_str(&text).unwrap();
+        assert_eq!(read, rec);
+
+        let mut top = record(id, "folder", Some(parent), site, "Plans");
+        top.deleted = Some(stamp(bob()));
+        top.deleted_with = Some(id);
+        top.bin_stage = Some(2);
+        top.purged = Some(stamp(ann()));
+        let read: TreeRecord = serde_json::from_slice(&top.to_file_bytes().unwrap()).unwrap();
+        assert_eq!(read, top);
+
+        // A record written before the recycle bin has none of its fields.
+        let old = r#"{"schema": 1, "id": "11111111-1111-4111-8111-111111111111",
+            "kind": "folder", "parent": null, "site": "33333333-3333-4333-8333-333333333333",
+            "name": "Old", "created": {"at": "2026-11-11T09:30:00Z", "by": {"id": "u1",
+            "name": "Ann"}}, "deleted": {"at": "2026-11-12T09:30:00Z", "by": {"id": "u1",
+            "name": "Ann"}}}"#;
+        let read: TreeRecord = serde_json::from_str(old).unwrap();
+        assert_eq!(
+            (read.bin_stage, read.deleted_with, read.purged.clone()),
+            (None, None, None)
+        );
+        assert_eq!(read.problem(), None);
+
+        let mut bad = record(id, "folder", None, site, "Live");
+        bad.bin_stage = Some(1);
+        assert!(bad.problem().is_some());
+        bad.deleted = Some(stamp(ann()));
+        bad.bin_stage = Some(3);
+        assert!(bad.problem().is_some());
     }
 
     #[test]

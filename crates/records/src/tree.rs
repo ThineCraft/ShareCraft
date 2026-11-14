@@ -12,10 +12,10 @@ use crate::events::{NewEvent, record};
 use crate::groups::{
     add_site_owner, all_locked, ensure_site_groups, groups_judged_by, lock_groups,
 };
-use crate::links::{after_deletion, lock_links_below};
+use crate::links::{after_deletion, lock_links_below, revoke_locked};
 use crate::roles::lock_roles;
 use crate::scopes::{
-    LOCK_ATTEMPTS, access_in, judged_roles, lock_segment, lock_top_down, scopes_of, segment,
+    LOCK_ATTEMPTS, access_with, judged_roles, lock_segment_with, lock_top_down, scopes_of, segment,
 };
 use crate::{AccessError, Db, DbError, Editor, Perms};
 
@@ -83,6 +83,41 @@ pub struct NodeRow {
     pub deleted_by: Option<UserId>,
     pub created_by: Option<UserId>,
     pub created_at: OffsetDateTime,
+    /// For a deleted node, the item whose deletion took it to the recycle bin: itself for the
+    /// item a person deleted, that item for everything deleted with it. `None` on a deleted
+    /// row is read as the node's own id (it was deleted before the bin).
+    pub deleted_with: Option<NodeId>,
+    /// For the item a person deleted, the bin stage it is in, 1 or 2. `None` on such an item
+    /// that is not purged is read as 1.
+    pub bin_stage: Option<i16>,
+    /// When it was purged from the bin, if it was: the row stays as a tombstone.
+    pub purged_at: Option<OffsetDateTime>,
+}
+
+impl NodeRow {
+    /// The row with the recycle bin state it is stored with: a deleted row written before the
+    /// bin is its own entry, in the first stage; only an entry that is not purged has a stage;
+    /// a live row has no bin state.
+    #[must_use]
+    pub fn normalized(&self) -> NodeRow {
+        let mut row = self.clone();
+        if row.deleted_at.is_none() {
+            row.deleted_with = None;
+            row.bin_stage = None;
+            row.purged_at = None;
+            return row;
+        }
+        let top = row.deleted_with.is_none_or(|with| with == row.id);
+        if row.deleted_with.is_none() {
+            row.deleted_with = Some(row.id);
+        }
+        if !top || row.purged_at.is_some() {
+            row.bin_stage = None;
+        } else if row.bin_stage.is_none() {
+            row.bin_stage = Some(1);
+        }
+        row
+    }
 }
 
 /// Checks a name for any node: 1 to 120 characters after trimming, no control characters,
@@ -144,20 +179,26 @@ pub struct NodeChange<'a> {
     /// Records the first row's node as a new document opened in this editor, created by
     /// `actor`.
     pub document: Option<Editor>,
+    /// Judges `needs` as if the nodes were live (see [`Db::access_as_if_live`]): for restoring
+    /// an item from the recycle bin, or taking it further out.
+    pub as_if_live: bool,
 }
 
 /// Inserts or updates `row`, and for a document node the name of its `documents` row. A site
 /// gets the groups it does not have yet (see [`ensure_site_groups`]).
 pub(crate) async fn upsert_node(conn: &mut PgConnection, row: &NodeRow) -> Result<(), AccessError> {
+    let row = &row.normalized();
     let result = sqlx::query(
         "insert into nodes \
              (id, kind, parent_id, site_id, name, unique_scope, deleted_at, deleted_by, \
-              created_by, created_at) \
-         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+              created_by, created_at, deleted_with, bin_stage, purged_at) \
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
          on conflict (id) do update set \
              kind = excluded.kind, parent_id = excluded.parent_id, \
              site_id = excluded.site_id, name = excluded.name, \
-             deleted_at = excluded.deleted_at, deleted_by = excluded.deleted_by",
+             deleted_at = excluded.deleted_at, deleted_by = excluded.deleted_by, \
+             deleted_with = excluded.deleted_with, bin_stage = excluded.bin_stage, \
+             purged_at = excluded.purged_at",
     )
     .bind(row.id.0)
     .bind(row.kind.as_str())
@@ -169,6 +210,9 @@ pub(crate) async fn upsert_node(conn: &mut PgConnection, row: &NodeRow) -> Resul
     .bind(row.deleted_by.map(|u| u.0))
     .bind(row.created_by.map(|u| u.0))
     .bind(row.created_at)
+    .bind(row.deleted_with.map(|n| n.0))
+    .bind(row.bin_stage)
+    .bind(row.purged_at)
     .execute(&mut *conn)
     .await;
     match result {
@@ -195,14 +239,121 @@ pub(crate) async fn upsert_node(conn: &mut PgConnection, row: &NodeRow) -> Resul
 /// with its group: locked by [`judge`], revoked once the rows are written.
 type Doomed = Vec<(uuid::Uuid, Option<GroupId>)>;
 
-/// The nodes `change` marks deleted, and the sites they are in.
+/// What [`judge`] locked for a tree change: the live links it revokes (see [`Doomed`]) and the
+/// links, revoked or not, of the nodes it purges, which go with them.
+#[derive(Default)]
+struct Locked {
+    doomed: Doomed,
+    purged_links: Doomed,
+}
+
+/// The nodes `change` marks deleted and does not purge, and the sites they are in.
 fn deleting(change: &NodeChange<'_>) -> (Vec<NodeId>, Vec<NodeId>) {
-    let rows = change.rows.iter().filter(|row| row.deleted_at.is_some());
+    let rows = change
+        .rows
+        .iter()
+        .filter(|row| row.deleted_at.is_some() && row.purged_at.is_none());
     let nodes = rows.clone().map(|row| row.id).collect();
     let mut sites: Vec<NodeId> = rows.map(|row| row.site).collect();
     sites.sort_unstable();
     sites.dedup();
     (nodes, sites)
+}
+
+/// The nodes `change` purges.
+fn purging(change: &NodeChange<'_>) -> Vec<NodeId> {
+    change
+        .rows
+        .iter()
+        .filter(|row| row.purged_at.is_some())
+        .map(|row| row.id)
+        .collect()
+}
+
+/// Locks, `FOR UPDATE` and by id, every link of the nodes `purged`, revoked or not, and returns
+/// them with their groups.
+async fn lock_links_of(conn: &mut PgConnection, purged: &[NodeId]) -> Result<Doomed, sqlx::Error> {
+    if purged.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids: Vec<Uuid> = purged.iter().map(|id| id.0).collect();
+    let rows: Vec<(Uuid, Option<Uuid>)> = sqlx::query_as(
+        "select id, group_id from links where node_id = any($1) order by id for update",
+    )
+    .bind(&ids)
+    .fetch_all(conn)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, group)| (id, group.map(GroupId)))
+        .collect())
+}
+
+/// What purging removed of the documents' versions: how many rows named a content, and the
+/// sum of those contents' sizes.
+#[derive(Clone, Copy, Debug, Default)]
+struct PurgedVersions {
+    versions: i64,
+    bytes: i64,
+}
+
+/// The rest of purging the nodes `purged`, once their rows are written: their assignments go,
+/// their links (locked by [`lock_links_of`]) are revoked if still live and then deleted with
+/// their hidden groups, the access requests still open on them are closed, and the rows naming
+/// their documents' contents in `blob_refs` are deleted (erasing what nothing names any more is
+/// the caller's).
+async fn after_purge(
+    conn: &mut PgConnection,
+    actor: Option<UserId>,
+    purged: &[NodeId],
+    links: &Doomed,
+) -> Result<PurgedVersions, sqlx::Error> {
+    let ids: Vec<Uuid> = purged.iter().map(|id| id.0).collect();
+    for (link, group) in links {
+        revoke_locked(&mut *conn, actor, *link, "item purged").await?;
+        sqlx::query("delete from links where id = $1")
+            .bind(link)
+            .execute(&mut *conn)
+            .await?;
+        if let Some(group) = group {
+            sqlx::query("delete from group_members where group_id = $1")
+                .bind(group.0)
+                .execute(&mut *conn)
+                .await?;
+            sqlx::query(
+                "delete from assignments where principal_kind = 'group' and principal_id = $1",
+            )
+            .bind(group.0)
+            .execute(&mut *conn)
+            .await?;
+            sqlx::query("delete from groups where id = $1 and purpose = 'link'")
+                .bind(group.0)
+                .execute(&mut *conn)
+                .await?;
+        }
+    }
+    sqlx::query("delete from assignments where node_id = any($1)")
+        .bind(&ids)
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query(
+        "update access_requests set decided_at = now(), decision = 'closed' \
+         where decided_at is null and node_id = any($1)",
+    )
+    .bind(&ids)
+    .execute(&mut *conn)
+    .await?;
+    let (versions, bytes): (i64, Option<i64>) = sqlx::query_as(
+        "with gone as (delete from blob_refs where doc_id = any($1) returning sha256) \
+         select count(*), sum(b.size)::bigint from gone join blobs b on b.sha256 = gone.sha256",
+    )
+    .bind(&ids)
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok(PurgedVersions {
+        versions,
+        bytes: bytes.unwrap_or(0),
+    })
 }
 
 /// Locks what `change` needs and judges its actor's access. Each needed node's chain is locked
@@ -216,11 +367,12 @@ fn deleting(change: &NodeChange<'_>) -> (Vec<NodeId>, Vec<NodeId>) {
 /// anywhere above a needed node, a membership ended of a group giving the access, or a role
 /// changed that gives it, either waits for this change or is seen by it. Returns the links to
 /// revoke, or `None` if a chain or the groups moved while they were being locked: the caller
-/// starts over.
+/// starts over. The links of nodes it purges are locked with the live links, after them, and
+/// their groups `FOR UPDATE` with those links' groups.
 async fn judge(
     conn: &mut PgConnection,
     change: &NodeChange<'_>,
-) -> Result<Option<Doomed>, AccessError> {
+) -> Result<Option<Locked>, AccessError> {
     // The rows written are locked in the one order for several nodes (see `lock_top_down`)
     // before any is written, whatever order they come in (a move's subtree is read parents
     // first, otherwise in any order), and before any group or role: every transaction takes
@@ -228,11 +380,21 @@ async fn judge(
     // node that another holds while waiting for that group.
     let written: Vec<NodeId> = change.rows.iter().map(|row| row.id).collect();
     let (deleted, sites) = deleting(change);
+    let purged = purging(change);
     if !change.needs_admin && change.needs.is_empty() {
         lock_top_down(&mut *conn, &written, true).await?;
         let doomed = lock_links_below(&mut *conn, &deleted, &sites).await?;
-        lock_groups(&mut *conn, [], doomed.iter().filter_map(|(_, g)| *g)).await?;
-        return Ok(Some(doomed));
+        let purged_links = lock_links_of(&mut *conn, &purged).await?;
+        lock_groups(
+            &mut *conn,
+            [],
+            doomed.iter().chain(&purged_links).filter_map(|(_, g)| *g),
+        )
+        .await?;
+        return Ok(Some(Locked {
+            doomed,
+            purged_links,
+        }));
     }
     let actor = change.actor.ok_or(AccessError::Forbidden)?;
     if change.needs_admin {
@@ -250,7 +412,9 @@ async fn judge(
     let mut scopes = Vec::new();
     for (id, _) in change.needs {
         let written = change.rows.iter().any(|row| row.id == *id);
-        let Some(links) = lock_segment(&mut *conn, actor, *id, false, written).await? else {
+        let Some(links) =
+            lock_segment_with(&mut *conn, actor, *id, false, written, change.as_if_live).await?
+        else {
             return Ok(None);
         };
         scopes.extend(scopes_of(&segment(&links, false)));
@@ -258,11 +422,12 @@ async fn judge(
     }
     lock_top_down(&mut *conn, &written, true).await?;
     let doomed = lock_links_below(&mut *conn, &deleted, &sites).await?;
+    let purged_links = lock_links_of(&mut *conn, &purged).await?;
     let judged = groups_judged_by(&mut *conn, actor, &scopes).await?;
     lock_groups(
         &mut *conn,
         judged.iter().copied(),
-        doomed.iter().filter_map(|(_, g)| *g),
+        doomed.iter().chain(&purged_links).filter_map(|(_, g)| *g),
     )
     .await?;
     lock_roles(&mut *conn, involved).await?;
@@ -274,7 +439,7 @@ async fn judge(
     }
     // Every chain and role is locked now, so none of this access can change before the commit.
     for (id, needed) in change.needs {
-        match access_in(&mut *conn, actor, *id).await? {
+        match access_with(&mut *conn, actor, *id, change.as_if_live).await? {
             None => return Err(AccessError::NotFound),
             Some(access) if !access.perms.contains(*needed) => {
                 return Err(AccessError::Forbidden);
@@ -282,7 +447,10 @@ async fn judge(
             Some(_) => {}
         }
     }
-    Ok(Some(doomed))
+    Ok(Some(Locked {
+        doomed,
+        purged_links,
+    }))
 }
 
 impl Db {
@@ -311,13 +479,17 @@ impl Db {
     /// [`Db::apply_node`] does (a site row gets its three groups), makes the new site's creator a
     /// member of its Owners group if asked, and writes the events. A node it marks deleted has its
     /// live links, and those of every node below it, revoked (reason `item deleted`), and the
-    /// open access requests on it and below it closed, in the same transaction.
+    /// open access requests on it and below it closed, in the same transaction. A node it marks
+    /// purged loses its assignments, its links with their hidden groups, its open access
+    /// requests and the rows naming its versions' contents, in the same transaction; each
+    /// `node.purged` event's detail gets how many versions went (`versions`) and the sum of
+    /// their contents' sizes (`bytes`).
     ///
     /// A database failure before the change was judged allowed (the connection lost while
     /// locking, or the tree changing on every attempt) is `Unjudged`: nothing was written, and
     /// the change must be treated as refused. `Db` is a failure after it was judged allowed.
     pub async fn apply_nodes(&self, change: NodeChange<'_>) -> Result<(), AccessError> {
-        let (mut tx, doomed) = self.judged(&change).await.map_err(|e| match e {
+        let (mut tx, locked) = self.judged(&change).await.map_err(|e| match e {
             AccessError::Db(e) => AccessError::Unjudged(e),
             other => other,
         })?;
@@ -348,9 +520,20 @@ impl Db {
         }
         let (deleted, sites) = deleting(&change);
         if !deleted.is_empty() {
-            after_deletion(&mut tx, change.actor, &doomed, &sites).await?;
+            after_deletion(&mut tx, change.actor, &locked.doomed, &sites).await?;
         }
-        for event in change.events {
+        let purged = purging(&change);
+        let mut events = change.events;
+        if !purged.is_empty() {
+            let gone = after_purge(&mut tx, change.actor, &purged, &locked.purged_links).await?;
+            for event in events.iter_mut().filter(|e| e.kind == "node.purged") {
+                if let Some(detail) = event.detail.as_object_mut() {
+                    detail.insert("versions".to_owned(), gone.versions.into());
+                    detail.insert("bytes".to_owned(), gone.bytes.into());
+                }
+            }
+        }
+        for event in events {
             record(&mut tx, event).await?;
         }
         tx.commit().await?;
@@ -358,15 +541,15 @@ impl Db {
     }
 
     /// A transaction in which `change` has been judged allowed, with what it needs locked, and
-    /// the links it revokes.
+    /// the links it revokes or deletes.
     async fn judged(
         &self,
         change: &NodeChange<'_>,
-    ) -> Result<(sqlx::Transaction<'static, sqlx::Postgres>, Doomed), AccessError> {
+    ) -> Result<(sqlx::Transaction<'static, sqlx::Postgres>, Locked), AccessError> {
         for _ in 0..LOCK_ATTEMPTS {
             let mut tx = self.pool().begin().await?;
-            if let Some(doomed) = judge(&mut tx, change).await? {
-                return Ok((tx, doomed));
+            if let Some(locked) = judge(&mut tx, change).await? {
+                return Ok((tx, locked));
             }
             tx.rollback().await?;
         }
@@ -377,7 +560,7 @@ impl Db {
     pub async fn node_rows(&self) -> Result<Vec<NodeRow>, DbError> {
         let rows = sqlx::query(
             "select id, kind, parent_id, site_id, name, deleted_at, deleted_by, created_by, \
-                    created_at from nodes",
+                    created_at, deleted_with, bin_stage, purged_at from nodes",
         )
         .fetch_all(self.pool())
         .await?;
@@ -396,6 +579,9 @@ impl Db {
                     deleted_by: row.try_get::<Option<Uuid>, _>("deleted_by")?.map(UserId),
                     created_by: row.try_get::<Option<Uuid>, _>("created_by")?.map(UserId),
                     created_at: row.try_get("created_at")?,
+                    deleted_with: row.try_get::<Option<Uuid>, _>("deleted_with")?.map(NodeId),
+                    bin_stage: row.try_get("bin_stage")?,
+                    purged_at: row.try_get("purged_at")?,
                 })
             })
             .collect::<Result<_, sqlx::Error>>()

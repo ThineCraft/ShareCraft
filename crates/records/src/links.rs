@@ -1006,7 +1006,7 @@ impl Db {
                 .execute(&mut *tx)
                 .await?;
             lock_groups(&mut tx, [], group.map(GroupId)).await?;
-            // Nothing is ever undeleted, but the check is cheap and keeps the rule local.
+            // Restored from the recycle bin meanwhile, it is live again: the link stays.
             let dead: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(still_dead.clone()))
                 .bind(node)
                 .fetch_one(&mut *tx)

@@ -5,6 +5,7 @@
 
 mod accounts;
 mod adoption;
+mod bin;
 mod blobs;
 mod db;
 mod documents;
@@ -26,6 +27,7 @@ pub use accounts::{
     AccountError, NewUser, SESSION_LIFETIME, Session, SessionToken, SignInError, User,
 };
 pub use adoption::{Adoption, Unplaced};
+pub use bin::{BIN_DAYS, BinCursor, BinEntry, BinStage, BinState};
 pub use blobs::{BLOB_REFS_DIRTY, BLOB_REFS_UPGRADE, ClaimId, StaleClaim};
 pub use db::{Db, DbError};
 pub use documents::{AccessError, Document, Editor, Grant, validate_document_name};

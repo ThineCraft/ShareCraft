@@ -166,7 +166,8 @@ impl Site {
             },
         )
         .await
-        .unwrap();
+        .unwrap()
+        .node;
         let (children, _) = self
             .records
             .children(admin.id, site.id, None, 10)
@@ -205,7 +206,8 @@ impl Site {
             },
         )
         .await
-        .unwrap();
+        .unwrap()
+        .node;
         self.records
             .set_node_access(admin, folder.id, Principal::User(user.id), Some("owner"))
             .await

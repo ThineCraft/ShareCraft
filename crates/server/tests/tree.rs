@@ -121,7 +121,7 @@ impl Env {
     }
 
     async fn apply(&self, actor: &User, op: TreeOp) -> Result<Node, AccessError> {
-        tree::apply(&self.state, actor, op).await
+        tree::apply(&self.state, actor, op).await.map(|a| a.node)
     }
 
     /// Creates a site named `name` as `admin`; returns it and its Documents library.
@@ -855,16 +855,12 @@ async fn concurrent_same_name_one_wins() {
 }
 
 #[tokio::test]
-async fn delete_non_empty_folder_refused() {
+async fn delete_takes_a_folder_with_its_contents() {
     let env = Env::new().await;
     let admin = env.user("Ada", true).await;
     let (site, library) = env.site(&admin, "Team").await;
     let folder = env.folder(&admin, library, "Plans").await;
     let file = env.file(&admin, folder, "Plan.xlsx").await.unwrap();
-    assert_eq!(
-        env.apply(&admin, TreeOp::Delete { id: folder }).await,
-        Err(AccessError::NotEmpty)
-    );
     assert_eq!(
         env.apply(&admin, TreeOp::Delete { id: library }).await,
         Err(AccessError::WrongPlace)
@@ -873,14 +869,22 @@ async fn delete_non_empty_folder_refused() {
         env.apply(&admin, TreeOp::Delete { id: site }).await,
         Err(AccessError::IsSite)
     );
-    env.apply(&admin, TreeOp::Delete { id: file.id.into() })
+    let commits = env.commits();
+    let applied = tree::apply(&env.state, &admin, TreeOp::Delete { id: folder })
         .await
         .unwrap();
-    let gone = env
-        .apply(&admin, TreeOp::Delete { id: folder })
-        .await
-        .unwrap();
-    assert!(gone.deleted);
+    assert!(applied.node.deleted);
+    assert_eq!(applied.deleted, vec![file.id]);
+    assert_eq!(env.commits(), commits + 1, "one commit");
+    assert!(
+        env.db()
+            .node(file.id.into())
+            .await
+            .unwrap()
+            .unwrap()
+            .deleted
+    );
+    // The folder's event, and the file's own.
     assert_eq!(env.events("node.deleted").await.len(), 2);
     env.assert_agree().await;
 }
@@ -1093,6 +1097,9 @@ async fn old_layout_is_moved_before_the_reconcile() {
         name: "Old plans".into(),
         created: stamp,
         deleted: None,
+        bin_stage: None,
+        deleted_with: None,
+        purged: None,
     };
     write_flat(&env, std::slice::from_ref(&old));
     let commits = env.commits();
@@ -1422,7 +1429,8 @@ async fn store_without_tree_is_reported() {
             id: NodeId(Uuid::new_v4()),
         },
     )
-    .await;
+    .await
+    .map(|a| a.node);
     match made {
         Err(AccessError::Db(e)) => assert!(e.to_string().contains("does not support"), "{e}"),
         other => panic!("expected a plain error, got {other:?}"),

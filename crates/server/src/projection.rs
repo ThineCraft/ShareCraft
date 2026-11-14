@@ -342,7 +342,8 @@ impl fmt::Display for BlobReport {
 
 /// Rebuilds the content rows (`blob_refs`) from Git, but only when the upgrade marker or the
 /// dirty flag asks for it: every version of every document that points into the content store
-/// is recorded. A rebuild that read every document replaces the completed rows and clears the
+/// is recorded, except the versions of files purged from the recycle bin. A rebuild that read
+/// every document replaces the completed rows and clears the
 /// flags; one with a failure only adds, keeps the flags, and erases nothing. After a rebuild
 /// with no failure, content nothing names is erased, if it is older than 24 hours as of `now`
 /// (by its row, or by its file when it has none), and so are abandoned files in the store's
@@ -370,8 +371,10 @@ pub async fn reconcile_blobs(
     let docs = tokio::task::spawn_blocking(move || listing.documents())
         .await
         .map_err(GitError::new)??;
+    // A purged file's versions name nothing any more: its contents may be erased.
+    let purged = purged_documents(store).await?;
     let mut refs = Vec::new();
-    for doc in docs {
+    for doc in docs.into_iter().filter(|doc| !purged.contains(doc)) {
         match blocking(store, move |s| s.history(doc).map_err(|e| e.to_string())).await {
             Ok(history) => refs.extend(
                 history
@@ -393,6 +396,23 @@ pub async fn reconcile_blobs(
         report.erased = erase_unnamed(state, now).await;
     }
     Ok(report)
+}
+
+/// The files Git records as purged from the recycle bin. A store without a tree has none.
+async fn purged_documents(store: &Arc<dyn Checkpointer>) -> Result<HashSet<DocId>, GitError> {
+    let tree = Arc::clone(store);
+    match tokio::task::spawn_blocking(move || tree.read_tree())
+        .await
+        .map_err(GitError::new)?
+    {
+        Ok(records) => Ok(records
+            .into_iter()
+            .filter(|r| r.purged.is_some() && r.kind == "document")
+            .map(|r| DocId(r.id))
+            .collect()),
+        Err(revisions::CheckpointError::Unsupported) => Ok(HashSet::new()),
+        Err(e) => Err(GitError::new(e)),
+    }
 }
 
 /// Erases the content nothing names that is older than [`ERASE_AFTER`] as of `now`, and the

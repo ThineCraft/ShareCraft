@@ -795,7 +795,7 @@ async fn move_needs_editor_at_both_ends_and_a_place_that_fits() {
 }
 
 #[tokio::test]
-async fn delete_takes_files_and_empty_folders_only() {
+async fn delete_takes_files_and_folders_with_their_contents() {
     let w = world().await;
     let w = &w;
     let ed = w.server.user("Ed").await;
@@ -815,10 +815,6 @@ async fn delete_takes_files_and_empty_folders_only() {
         (StatusCode::FORBIDDEN, error("forbidden"))
     );
     assert_eq!(
-        delete(&ed, &folder).await,
-        (StatusCode::CONFLICT, error("not_empty"))
-    );
-    assert_eq!(
         delete(&w.root, &w.site).await,
         (StatusCode::BAD_REQUEST, error("is_site"))
     );
@@ -826,10 +822,7 @@ async fn delete_takes_files_and_empty_folders_only() {
         delete(&w.root, &w.library).await,
         (StatusCode::BAD_REQUEST, error("wrong_place"))
     );
-    assert_eq!(
-        delete(&ed, &doc).await,
-        (StatusCode::NO_CONTENT, Value::Null)
-    );
+    // The folder goes with the file in it.
     assert_eq!(
         delete(&ed, &folder).await,
         (StatusCode::NO_CONTENT, Value::Null)

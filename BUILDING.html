@@ -458,14 +458,14 @@ cargo xtask editors verify             # every installed editor matches editors.
 <tr><td>Create a folder, or a file (a new document or an upload), in a library or folder</td><td>An editor of that library or folder.</td></tr>
 <tr><td>Rename</td><td>A site or library: an owner of it. A folder or file: an editor of it.</td></tr>
 <tr><td>Move a folder or file into another library or folder (also in another site)</td><td>An editor of the item and of the place it goes into. A folder cannot go into itself or below itself.</td></tr>
-<tr><td>Delete a file, or an empty folder</td><td>An editor of it.</td></tr>
+<tr><td>Delete a file, or a folder with everything in it, to the recycle bin</td><td>An editor of it.</td></tr>
 <tr><td>See who has access, give or remove access, break inheritance or inherit again</td><td>An owner. To inherit again, also an owner of the scope above.</td></tr>
 </tbody></table></div>
 <p>The table uses the names of the built-in roles. Since 12 November 2026 the server decides by permissions, not role names: a custom role with the right permission does the same. Section 23 gives the permission each change needs.</p>
 <p><strong>Names.</strong> A name is 1 to 120 characters after spaces at either end are removed. It cannot contain control characters or any of <code>" * : &lt; &gt; ? / \ |</code>, and cannot end with a dot. No two items in the same place can have the same name, ignoring case; the second is refused with <code>name_taken</code>. The name of a file must end with the extension of its editor, where the editor has one (for example <code>.xlsx</code> for GridCraft). A deleted item frees its name.</p>
 <p><strong>Known and intended.</strong> These answers can tell a person a little about items they cannot see; they are kept because hiding it would cost more than it protects:</p>
 <ul>
-<li>Deleting a folder that holds only items the person cannot see answers <code>not_empty</code>, so they learn that something is there.</li>
+<li>Deleting a folder takes every live item in it to the recycle bin with it, including items the person cannot see; whoever may restore the folder restores them with it.</li>
 <li>Creating, renaming or moving an item to a name that a hidden item in the same place already has answers <code>name_taken</code>, so they learn that an item with that name is there.</li>
 <li>Moving a file from a restricted folder to a widely shared one needs only editor at both ends, so an editor can widen who sees it (as in SharePoint). A file that inherits takes its new place's permissions when moved; a file with its own permissions keeps them.</li>
 </ul>
@@ -504,7 +504,7 @@ cargo xtask editors verify             # every installed editor matches editors.
 <tr><td><code>forbidden</code></td><td>403</td><td>The person lacks the permission for the change, or an administrator is needed (a new site).</td></tr>
 <tr><td><code>no_such_user</code></td><td>404</td><td>No account has the email given (owners only).</td></tr>
 <tr><td><code>name_taken</code></td><td>409</td><td>Another item in the same place has that name, ignoring case.</td></tr>
-<tr><td><code>not_empty</code></td><td>409</td><td>A folder that still holds items cannot be deleted.</td></tr>
+<tr><td><code>parent_in_bin</code></td><td>409</td><td>A folder above the item to restore is in the recycle bin, and the person may not restore that folder.</td></tr>
 <tr><td><code>last_manager</code></td><td>409</td><td>A site, library, folder or file must keep at least one assignment whose role includes <code>manage_access</code>. Replaces <code>last_owner</code>, which no route answers now.</td></tr>
 <tr><td><code>into_itself</code></td><td>400</td><td>A folder cannot be moved into itself or below itself.</td></tr>
 <tr><td><code>wrong_place</code></td><td>400</td><td>That kind of item cannot go there, or cannot be moved or deleted: a library outside a site, a folder or file directly in a site, a moved site or library, a deleted library, or a file made through the children route.</td></tr>
@@ -652,7 +652,7 @@ base-uri 'none'; form-action 'none'</code></pre>
 <tr><td><code>view</code></td><td>List, open, download, and join a session read-only.</td></tr>
 <tr><td><code>add</code></td><td>Create folders and files, upload, and move something into the place.</td></tr>
 <tr><td><code>edit</code></td><td>Change content, rename, move something out, and take the editing seat.</td></tr>
-<tr><td><code>delete</code></td><td>Delete a file or an empty folder.</td></tr>
+<tr><td><code>delete</code></td><td>Delete a file or a folder with its contents to the recycle bin; restore it from the first stage, or move it on to the second.</td></tr>
 <tr><td><code>manage_access</code></td><td>See and change access, break and restore inheritance, and use the explorer.</td></tr>
 <tr><td><code>manage_site</code></td><td>Create and rename libraries, rename the site, and manage the site's groups.</td></tr>
 </tbody></table></div>

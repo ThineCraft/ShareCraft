@@ -284,7 +284,7 @@ pub(crate) async fn create(
             name: new.name,
             id: NodeId(Uuid::new_v4()),
         };
-        Ok(tree::apply(&state, &actor, op).await?)
+        Ok(tree::apply(&state, &actor, op).await?.node)
     })
     .await?;
     Ok((StatusCode::CREATED, Json(NodeOut::from(node))).into_response())
@@ -315,7 +315,9 @@ pub(crate) async fn change(
     let node = to_completion(async move {
         let mut node = None;
         if let Some(name) = change.name {
-            let renamed = tree::apply(&state, &actor, TreeOp::Rename { id, name }).await?;
+            let renamed = tree::apply(&state, &actor, TreeOp::Rename { id, name })
+                .await?
+                .node;
             if renamed.kind == NodeKind::Document {
                 after_rename(&state, DocId(id.0)).await;
             }
@@ -326,7 +328,7 @@ pub(crate) async fn change(
             // Checked whatever the answer: a change that failed after it was stored must not
             // leave anyone with rights they lost.
             recheck_below(&state, id).await;
-            node = Some(moved?);
+            node = Some(moved?.node);
         }
         node.ok_or(ApiError::InvalidRequest)
     })
@@ -352,8 +354,9 @@ async fn after_rename(state: &AppState, doc: DocId) {
     }
 }
 
-/// `DELETE /api/nodes/{id}`: deletes a file or an empty folder (editors). Everyone connected to
-/// a deleted file is removed with `Removed { deleted }` before the answer. `204`.
+/// `DELETE /api/nodes/{id}`: deletes a file, or a folder with every live item in it, to the
+/// first stage of the site's recycle bin (editors). Everyone connected to a deleted file, in
+/// the folder or below it too, is removed with `Removed { deleted }` before the answer. `204`.
 pub(crate) async fn remove(
     State(state): State<AppState>,
     signed: Signed,
@@ -362,28 +365,38 @@ pub(crate) async fn remove(
     let id = node_id(&id)?;
     let actor = signed.session.user;
     to_completion(async move {
-        let deleted = match tree::apply(&state, &actor, TreeOp::Delete { id }).await {
-            Ok(node) => node,
+        let applied = match tree::apply(&state, &actor, TreeOp::Delete { id }).await {
+            Ok(applied) => applied,
             Err(e) => {
                 // A delete that failed after Git recorded it may still have been repaired into
-                // PostgreSQL from Git: then the file is gone, and so must its room be.
-                if let Ok(Some(node)) = state.db().node(id).await
-                    && node.deleted
-                    && node.kind == NodeKind::Document
-                {
-                    state.rooms().send_to(DocId(id.0), AccessChange::Deleted);
-                }
+                // PostgreSQL from Git: then its files are gone, and so must their rooms be.
+                end_deleted_sessions_below(&state, id).await;
                 return Err(e.into());
             }
         };
-        if deleted.kind == NodeKind::Document {
-            // Removal is final, so it needs no ordering with other access changes.
-            state.rooms().send_to(DocId(id.0), AccessChange::Deleted);
+        // Removal is final, so it needs no ordering with other access changes.
+        for doc in applied.deleted {
+            state.rooms().send_to(doc, AccessChange::Deleted);
         }
         Ok(())
     })
     .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Ends, with `Removed { deleted }`, the session of every open file at or below `node` that
+/// PostgreSQL holds deleted.
+pub(crate) async fn end_deleted_sessions_below(state: &AppState, node: NodeId) {
+    let db = state.db();
+    for doc in state.rooms().open_documents() {
+        let below = db.is_at_or_below(doc.into(), node).await.unwrap_or(false);
+        if below
+            && let Ok(Some(found)) = db.node(doc.into()).await
+            && found.deleted
+        {
+            state.rooms().send_to(doc, AccessChange::Deleted);
+        }
+    }
 }
 
 /// Whom an assignment names, as answered: `{kind: "user", id, name, email?}` for a person

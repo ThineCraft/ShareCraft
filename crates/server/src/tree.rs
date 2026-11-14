@@ -13,8 +13,8 @@ use std::sync::atomic::Ordering;
 
 use collab_core::ids::{DocId, NodeId, UserId};
 use records::{
-    Access, AccessError, Db, DbError, Document, Editor, NewEvent, Node, NodeChange, NodeKind,
-    NodeRow, Perms, User, validate_document_name, validate_node_name,
+    Access, AccessError, BinStage, Db, DbError, Document, Editor, NewEvent, Node, NodeChange,
+    NodeKind, NodeRow, Perms, User, validate_document_name, validate_node_name,
 };
 use revisions::{Author, CheckpointError, GitError, Stamp, TreeChange, TreeMove, TreeRecord};
 use serde_json::json;
@@ -56,8 +56,27 @@ pub enum TreeOp {
     Rename { id: NodeId, name: String },
     /// Moves a folder or file into the library or folder `parent`.
     Move { id: NodeId, parent: NodeId },
-    /// Deletes a file, or a folder with no undeleted children.
+    /// Deletes a file, or a folder with every live item below it, to the first stage of the
+    /// site's recycle bin: one entry, `id`, for all of them.
     Delete { id: NodeId },
+    /// Restores the recycle bin entry `id`, with everything deleted with it, where it was (see
+    /// [`apply`]).
+    Restore { id: NodeId },
+    /// Moves the recycle bin entry `id` from the first stage to the second.
+    ToSecondStage { id: NodeId },
+    /// Purges the recycle bin entry `id`, in the second stage, with everything deleted with it.
+    Purge { id: NodeId },
+}
+
+/// What [`apply`] did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Applied {
+    /// The node the change is about, as PostgreSQL then holds it.
+    pub node: Node,
+    /// Every file the change deleted: their open sessions end.
+    pub deleted: Vec<DocId>,
+    /// A restored item whose name was taken meanwhile, and the name it had.
+    pub renamed: Option<(NodeId, String)>,
 }
 
 /// Why reading or repairing the tree, or adopting documents, failed.
@@ -154,6 +173,32 @@ struct Plan {
     site_groups: bool,
     document: Option<Editor>,
     events: Vec<NewEvent>,
+    /// `needs` are judged as if the nodes were live (see [`Db::access_as_if_live`]).
+    as_if_live: bool,
+    /// The files the change deletes.
+    deleted: Vec<DocId>,
+    /// A restored item that had to be renamed, and its name before.
+    renamed: Option<(NodeId, String)>,
+}
+
+impl Default for Plan {
+    /// A change of nothing, for filling in the fields a change leaves as they are.
+    fn default() -> Self {
+        Plan {
+            id: NodeId(Uuid::nil()),
+            message: String::new(),
+            records: Vec::new(),
+            undo: Vec::new(),
+            needs_admin: false,
+            needs: Vec::new(),
+            site_groups: false,
+            document: None,
+            events: Vec::new(),
+            as_if_live: false,
+            deleted: Vec::new(),
+            renamed: None,
+        }
+    }
 }
 
 /// Applies `op` for `actor`: judges it under the tree lock (see the module documentation),
@@ -169,10 +214,23 @@ struct Plan {
 /// `delete`); `InvalidName`, `WrongExtension` or `NameTaken` for a name;
 /// `WrongPlace` for a kind that cannot go there or cannot be moved or deleted (and for files,
 /// which [`create_document`] creates); `IntoItself` for a move into the node or below it;
-/// `NotEmpty` for a folder with undeleted children; `IsSite` for deleting a site; `Exists` for
-/// an identifier already used; `OutOfStep` while the tree needs repair; otherwise the Git or
-/// database error.
-pub async fn apply(state: &AppState, actor: &User, op: TreeOp) -> Result<Node, AccessError> {
+/// `IsSite` for deleting a site; `Exists` for an identifier already used; `OutOfStep` while the
+/// tree needs repair; otherwise the Git or database error.
+///
+/// A deletion takes a folder with every live item below it to the first stage of the site's
+/// recycle bin, as one entry, in one commit, and answers every file it deleted. The recycle
+/// bin's operations take an entry (`NotFound` for anything else, or for an entry the person
+/// may not see): restoring from the first stage and moving on to the second need `delete` on
+/// the entry as if it were live ([`Db::access_as_if_live`]); restoring from the second stage
+/// and purging (second stage only, `WrongPlace` otherwise) need `manage_site` on the site.
+///
+/// A restore puts the entry and everything deleted with it back where it was, with its own
+/// permissions as they were (links revoked by the deletion stay revoked). A folder above it
+/// still in the bin is restored too, that folder alone (`ParentInBin` unless the person may
+/// restore it); what was deleted with such a folder stays in the bin, as entries of its own.
+/// Under a purged folder the entry goes to the top of its library. A name taken meanwhile gets
+/// ` (2)`, ` (3)` … before its extension, and the answer says so.
+pub async fn apply(state: &AppState, actor: &User, op: TreeOp) -> Result<Applied, AccessError> {
     let _turn = state.tree_lock().lock().await;
     ensure_in_step(state).await?;
     let db = state.db();
@@ -180,7 +238,10 @@ pub async fn apply(state: &AppState, actor: &User, op: TreeOp) -> Result<Node, A
         TreeOp::Create { id, .. }
         | TreeOp::Rename { id, .. }
         | TreeOp::Move { id, .. }
-        | TreeOp::Delete { id } => *id,
+        | TreeOp::Delete { id }
+        | TreeOp::Restore { id }
+        | TreeOp::ToSecondStage { id }
+        | TreeOp::Purge { id } => *id,
     };
     let plan = match op {
         TreeOp::Create {
@@ -192,11 +253,60 @@ pub async fn apply(state: &AppState, actor: &User, op: TreeOp) -> Result<Node, A
         TreeOp::Rename { id, name } => plan_rename(state, actor, id, &name).await?,
         TreeOp::Move { id, parent } => plan_move(state, actor, id, parent).await?,
         TreeOp::Delete { id } => Some(plan_delete(state, actor, id).await?),
+        TreeOp::Restore { id } => Some(plan_restore(state, actor, id).await?),
+        TreeOp::ToSecondStage { id } => Some(plan_to_second_stage(state, actor, id).await?),
+        TreeOp::Purge { id } => Some(plan_purge(state, Some(actor), id).await?),
     };
-    if let Some(plan) = plan {
-        commit(state, actor, plan).await?;
+    let (deleted, renamed) = match plan {
+        Some(mut plan) => {
+            let deleted = std::mem::take(&mut plan.deleted);
+            let renamed = plan.renamed.take();
+            commit(state, Some(actor), plan).await?;
+            (deleted, renamed)
+        }
+        None => (Vec::new(), None),
+    };
+    let node = db.node(id).await?.ok_or(AccessError::NotFound)?;
+    Ok(Applied {
+        node,
+        deleted,
+        renamed,
+    })
+}
+
+/// Purges, as the server, every recycle bin entry deleted [`records::BIN_DAYS`] days or more
+/// before `now`, whatever its stage: one entry per tree turn, commit and transaction. Answers
+/// how many it purged; a failure is logged and the entry left for the next sweep.
+pub async fn purge_due(state: &AppState, now: OffsetDateTime) -> usize {
+    let due = match state.db().due_for_purge(now).await {
+        Ok(due) => due,
+        Err(e) => {
+            eprintln!("sharecraft-server: database failure: {e}");
+            return 0;
+        }
+    };
+    let mut purged = 0;
+    for id in due {
+        let state = state.clone();
+        let done = tokio::spawn(async move {
+            let _turn = state.tree_lock().lock().await;
+            ensure_in_step(&state).await?;
+            let plan = plan_purge(&state, None, id).await?;
+            commit(&state, None, plan).await
+        })
+        .await;
+        match done {
+            Ok(Ok(())) => purged += 1,
+            // Purged or restored meanwhile.
+            Ok(Err(AccessError::NotFound)) => {}
+            Ok(Err(e)) => eprintln!("sharecraft-server: could not purge node {}: {e}", id.0),
+            Err(e) => eprintln!("sharecraft-server: a purge did not finish: {e}"),
+        }
     }
-    db.node(id).await?.ok_or(AccessError::NotFound)
+    if purged > 0 {
+        println!("sharecraft-server: purged {purged} recycle bin item(s)");
+    }
+    purged
 }
 
 /// Creates the file `id` named `name`, opened in `editor`, in the library or folder `parent`:
@@ -258,8 +368,9 @@ pub async fn create_document(
             node: Some(node),
             detail,
         }],
+        ..Plan::default()
     };
-    commit(state, actor, plan).await?;
+    commit(state, Some(actor), plan).await?;
     db.document(id)
         .await?
         .ok_or_else(|| DbError::new("the new document was not recorded").into())
@@ -359,7 +470,8 @@ pub async fn move_records(store: Arc<dyn Checkpointer>) -> Result<Moved, TreeErr
 }
 
 /// Brings PostgreSQL's nodes up to date with Git: every record whose row is missing or
-/// differs (kind, parent, site, name, or whether it is deleted) is written, parents before
+/// differs (kind, parent, site, name, whether it is deleted, and its recycle bin state: what
+/// it was deleted with, its stage, whether it is purged) is written, parents before
 /// children, with the matching `node.*` event marked `"repaired": true`. A record that cannot
 /// be written, or that does not lead up to a site, does not stop the others; it is listed in
 /// the report.
@@ -580,8 +692,12 @@ async fn ensure_in_step(state: &AppState) -> Result<(), AccessError> {
 /// first taken back, as Git does not hold its editor); if that fails too, the tree is marked
 /// out of step. A take-back that cannot be written also marks it out of step, and is kept to
 /// be written before the next reconcile (see [`ensure_in_step`]).
-async fn commit(state: &AppState, actor: &User, plan: Plan) -> Result<(), AccessError> {
+///
+/// `actor` is `None` for a change the server makes on its own (a purge when an item's time in
+/// the bin is up), credited to "ShareCraft" and judged by nobody.
+async fn commit(state: &AppState, actor: Option<&User>, plan: Plan) -> Result<(), AccessError> {
     let store = state.checkpointer();
+    let author = actor.map_or_else(server_author, author_of);
     let rows = plan
         .records
         .iter()
@@ -590,22 +706,24 @@ async fn commit(state: &AppState, actor: &User, plan: Plan) -> Result<(), Access
         .map_err(DbError::new)?;
     write_tree(
         store,
-        author_of(actor),
+        author.clone(),
         plan.message.clone(),
         plan.records.clone(),
     )
     .await
     .map_err(git_failure)?;
+    let actor_id = actor.map(|a| a.id);
     let applied = state
         .db()
         .apply_nodes(NodeChange {
             rows: &rows,
             events: plan.events,
-            actor: Some(actor.id),
+            actor: actor_id,
             needs_admin: plan.needs_admin,
             needs: &plan.needs,
-            site_groups: plan.site_groups.then_some(actor.id),
+            site_groups: if plan.site_groups { actor_id } else { None },
             document: plan.document,
+            as_if_live: plan.as_if_live,
         })
         .await;
     match applied {
@@ -616,8 +734,8 @@ async fn commit(state: &AppState, actor: &User, plan: Plan) -> Result<(), Access
                  {error}",
                 plan.id.0
             );
-            let taken_back =
-                plan.document.is_none() || take_back(state, actor, &plan.message, plan.undo).await;
+            let taken_back = plan.document.is_none()
+                || take_back(state, author.clone(), &plan.message, plan.undo).await;
             let ids: Vec<Uuid> = plan.records.iter().map(|r| r.id).collect();
             if !(taken_back && repair_ids(state, &ids).await) {
                 state.tree_out_of_step().store(true, Ordering::SeqCst);
@@ -632,7 +750,7 @@ async fn commit(state: &AppState, actor: &User, plan: Plan) -> Result<(), Access
                     plan.id.0
                 );
             }
-            if !take_back(state, actor, &plan.message, plan.undo).await {
+            if !take_back(state, author, &plan.message, plan.undo).await {
                 state.tree_out_of_step().store(true, Ordering::SeqCst);
             }
             Err(refused)
@@ -642,9 +760,9 @@ async fn commit(state: &AppState, actor: &User, plan: Plan) -> Result<(), Access
 
 /// Writes `undo` as a second commit, taking back the change `message` describes. Returns
 /// whether it was written; if not, it is kept to be written before the next reconcile.
-async fn take_back(state: &AppState, actor: &User, message: &str, undo: Vec<TreeRecord>) -> bool {
+async fn take_back(state: &AppState, author: Author, message: &str, undo: Vec<TreeRecord>) -> bool {
     let pending = PendingUndo {
-        author: author_of(actor),
+        author,
         message: format!("Undo: {message}"),
         records: undo,
     };
@@ -733,14 +851,17 @@ async fn repair_ids(state: &AppState, ids: &[Uuid]) -> bool {
 /// Writes `record` into PostgreSQL if `current` differs from it, with the matching event marked
 /// as a repair. Returns whether it wrote.
 async fn repair(db: &Db, record: &TreeRecord, current: Option<&NodeRow>) -> Result<bool, String> {
-    let row = to_row(record)?;
+    let row = to_row(record)?.normalized();
     let kind = match current {
         None => "node.created",
         Some(now) if same(now, &row) => return Ok(false),
+        Some(now) if now.purged_at.is_none() && row.purged_at.is_some() => "node.purged",
         Some(now) if now.deleted_at.is_some() && row.deleted_at.is_none() => "node.created",
         Some(now) if now.deleted_at.is_none() && row.deleted_at.is_some() => "node.deleted",
         Some(now) if now.parent != row.parent || now.site != row.site => "node.moved",
-        Some(_) => "node.renamed",
+        Some(now) if now.name != row.name => "node.renamed",
+        Some(now) if row.bin_stage == Some(2) && now.bin_stage != Some(2) => "node.binned",
+        Some(_) => "node.deleted",
     };
     let event = NewEvent {
         kind,
@@ -760,13 +881,17 @@ async fn repair(db: &Db, record: &TreeRecord, current: Option<&NodeRow>) -> Resu
     Ok(true)
 }
 
-/// Whether PostgreSQL's row says what Git's does.
+/// Whether PostgreSQL's row says what Git's does, recycle bin state included.
 fn same(now: &NodeRow, git: &NodeRow) -> bool {
+    let (now, git) = (now.normalized(), git.normalized());
     now.kind == git.kind
         && now.parent == git.parent
         && now.site == git.site
         && now.name == git.name
         && now.deleted_at.is_some() == git.deleted_at.is_some()
+        && now.deleted_with == git.deleted_with
+        && now.bin_stage == git.bin_stage
+        && now.purged_at.is_some() == git.purged_at.is_some()
 }
 
 /// `records` ordered so each parent comes before its children, and the records that do not
@@ -838,6 +963,7 @@ async fn plan_create(
             site_groups: true,
             document: None,
             events,
+            ..Plan::default()
         }));
     }
     let parent = parent.ok_or(AccessError::WrongPlace)?;
@@ -877,6 +1003,7 @@ async fn plan_create(
         needs: vec![(parent, needed)],
         site_groups: false,
         document: None,
+        ..Plan::default()
     }))
 }
 
@@ -930,6 +1057,7 @@ async fn plan_rename(
         needs: vec![(id, needed)],
         site_groups: false,
         document: None,
+        ..Plan::default()
     }))
 }
 
@@ -998,9 +1126,13 @@ async fn plan_move(
         needs: vec![(destination, Perms::ADD), (id, Perms::EDIT)],
         site_groups: false,
         document: None,
+        ..Plan::default()
     }))
 }
 
+/// Deletes `id`, and for a folder every live item below it, to the first stage of the site's
+/// recycle bin: each record marked deleted now by `actor` and with `id`, `id` the entry. Items
+/// below that were deleted before keep their own entries.
 async fn plan_delete(state: &AppState, actor: &User, id: NodeId) -> Result<Plan, AccessError> {
     let db = state.db();
     let (node, access) = visible(db, actor, id).await?;
@@ -1010,29 +1142,430 @@ async fn plan_delete(state: &AppState, actor: &User, id: NodeId) -> Result<Plan,
         NodeKind::Folder | NodeKind::Document => {}
     }
     require(&access, Perms::DELETE)?;
-    if node.kind == NodeKind::Folder && db.has_live_children(id).await? {
-        return Err(AccessError::NotEmpty);
-    }
     let before = git_record(state, id).await?;
-    let after = deleted(&before, author_of(actor));
+    let mut undo = vec![before.clone()];
+    if node.kind == NodeKind::Folder {
+        let tree = read_tree(state.checkpointer()).await.map_err(git_failure)?;
+        undo.extend(
+            below(&tree, id.0)
+                .into_iter()
+                .filter(|r| r.deleted.is_none())
+                .cloned(),
+        );
+    }
+    let stamp = Stamp {
+        at: now_text(),
+        by: author_of(actor),
+    };
+    let records: Vec<TreeRecord> = undo
+        .iter()
+        .map(|r| {
+            let mut gone = r.clone();
+            gone.deleted = Some(stamp.clone());
+            gone.deleted_with = Some(id.0);
+            gone.bin_stage = (r.id == id.0).then_some(1);
+            gone
+        })
+        .collect();
+    let documents: Vec<DocId> = records
+        .iter()
+        .filter(|r| r.kind == kind_word(NodeKind::Document))
+        .map(|r| DocId(r.id))
+        .collect();
+    let mut events = vec![NewEvent {
+        kind: "node.deleted",
+        actor: Some(actor.id),
+        subject: None,
+        document: document_of(node.kind, id),
+        node: Some(id),
+        detail: json!({ "name": node.name, "items": records.len() }),
+    }];
+    // Each file deleted with a folder has the deletion in its own history too.
+    events.extend(
+        records
+            .iter()
+            .filter(|r| r.id != id.0 && r.kind == kind_word(NodeKind::Document))
+            .map(|r| NewEvent {
+                kind: "node.deleted",
+                actor: Some(actor.id),
+                subject: None,
+                document: Some(DocId(r.id)),
+                node: Some(NodeId(r.id)),
+                detail: json!({ "name": r.name, "with": id.0 }),
+            }),
+    );
     Ok(Plan {
         id,
         message: format!("Delete {} {}", kind_word(node.kind), node.name),
-        events: vec![NewEvent {
-            kind: "node.deleted",
+        events,
+        records,
+        undo,
+        needs: vec![(id, Perms::DELETE)],
+        deleted: documents,
+        ..Plan::default()
+    })
+}
+
+/// The deletion a record belongs to: the entry it was deleted with (its own id for a record
+/// deleted before the recycle bin); `None` for a live record.
+fn deleted_with(record: &TreeRecord) -> Option<Uuid> {
+    record
+        .deleted
+        .as_ref()
+        .map(|_| record.deleted_with.unwrap_or(record.id))
+}
+
+/// The bin stage of the entry `record`; a record from before the bin is in the first.
+fn stage_of(record: &TreeRecord) -> BinStage {
+    match record.bin_stage {
+        Some(2) => BinStage::Second,
+        _ => BinStage::First,
+    }
+}
+
+/// The recycle bin entry `id` as Git records it, if `id` is one: deleted, not purged, and the
+/// item its deletion started from.
+async fn bin_record(state: &AppState, id: NodeId) -> Result<TreeRecord, AccessError> {
+    let record = git_record(state, id).await?;
+    if record.purged.is_some() || deleted_with(&record) != Some(id.0) {
+        return Err(AccessError::NotFound);
+    }
+    Ok(record)
+}
+
+/// What a person needs to restore or move on the entry `record` (or a folder deleted with it,
+/// `node`), which they must be able to see: in the first stage `delete` on `node` as if it were
+/// live, in the second `manage_site` on the site. Checked now (`NotFound` if they cannot see
+/// it, `Forbidden` if they can and lack the permission); returned to be judged again when the
+/// change is applied.
+async fn bin_need(
+    db: &Db,
+    actor: &User,
+    record: &TreeRecord,
+    node: NodeId,
+) -> Result<(NodeId, Perms), AccessError> {
+    match stage_of(record) {
+        BinStage::First => {
+            let access = db
+                .access_as_if_live(actor.id, node)
+                .await?
+                .ok_or(AccessError::NotFound)?;
+            require(&access, Perms::DELETE)?;
+            Ok((node, Perms::DELETE))
+        }
+        BinStage::Second => {
+            let site = NodeId(record.site);
+            let manages = db
+                .effective_access(actor.id, site)
+                .await?
+                .is_some_and(|a| a.perms.contains(Perms::MANAGE_SITE));
+            if !manages {
+                return Err(AccessError::NotFound);
+            }
+            Ok((site, Perms::MANAGE_SITE))
+        }
+    }
+}
+
+/// `record` live again: no longer deleted, in no bin.
+fn revived(record: &TreeRecord) -> TreeRecord {
+    let mut back = record.clone();
+    back.deleted = None;
+    back.deleted_with = None;
+    back.bin_stage = None;
+    back.purged = None;
+    back
+}
+
+/// Restores the entry `id` and everything deleted with it (see [`apply`]).
+async fn plan_restore(state: &AppState, actor: &User, id: NodeId) -> Result<Plan, AccessError> {
+    let db = state.db();
+    let entry = bin_record(state, id).await?;
+    let mut needs = vec![bin_need(db, actor, &entry, id).await?];
+    let tree = read_tree(state.checkpointer()).await.map_err(git_failure)?;
+    let by_id: HashMap<Uuid, &TreeRecord> = tree.iter().map(|r| (r.id, r)).collect();
+    let mut group = vec![&entry];
+    group.extend(
+        below(&tree, id.0)
+            .into_iter()
+            .filter(|r| r.purged.is_none() && deleted_with(r) == Some(id.0)),
+    );
+
+    // The folders above it still in the bin, nearest first, up to the first live one; none
+    // if a folder above it was purged, when it goes to the top of its library.
+    let mut alone: Vec<&TreeRecord> = Vec::new();
+    let mut purged_above = false;
+    let mut next = entry.parent;
+    while let Some(parent) = next {
+        let record = by_id
+            .get(&parent)
+            .copied()
+            .ok_or_else(|| git_failure(missing(parent)))?;
+        if record.purged.is_some() {
+            purged_above = true;
+            break;
+        }
+        if record.deleted.is_none() {
+            break;
+        }
+        alone.push(record);
+        next = record.parent;
+    }
+    let mut new_parent = entry.parent;
+    if purged_above {
+        alone.clear();
+        let mut up = entry.parent;
+        new_parent = None;
+        while let Some(at) = up {
+            let record = by_id
+                .get(&at)
+                .copied()
+                .ok_or_else(|| git_failure(missing(at)))?;
+            if record.kind == kind_word(NodeKind::Library) {
+                new_parent = Some(record.id);
+                break;
+            }
+            up = record.parent;
+        }
+        if new_parent.is_none() {
+            return Err(git_failure(missing(id.0)));
+        }
+    }
+    for folder in &alone {
+        let top = deleted_with(folder)
+            .and_then(|with| by_id.get(&with).copied())
+            .unwrap_or(folder);
+        let need = bin_need(db, actor, top, NodeId(folder.id))
+            .await
+            .map_err(|e| match e {
+                AccessError::NotFound | AccessError::Forbidden => AccessError::ParentInBin,
+                other => other,
+            })?;
+        needs.push(need);
+    }
+    // Ancestors before descendants, each once.
+    needs.reverse();
+    let mut seen = HashSet::new();
+    needs.retain(|(node, _)| seen.insert(*node));
+
+    // What was deleted with a folder restored alone stays in the bin: each part of it whose
+    // folder is live again becomes an entry of its own, in its entry's stage.
+    let alone_ids: HashSet<Uuid> = alone.iter().map(|r| r.id).collect();
+    let mut retopped = Vec::new();
+    for folder in &alone {
+        if deleted_with(folder) != Some(folder.id) {
+            continue;
+        }
+        let stage = folder.bin_stage.unwrap_or(1);
+        let left: Vec<&TreeRecord> = below(&tree, folder.id)
+            .into_iter()
+            .filter(|r| {
+                r.purged.is_none()
+                    && deleted_with(r) == Some(folder.id)
+                    && !alone_ids.contains(&r.id)
+            })
+            .collect();
+        let left_ids: HashSet<Uuid> = left.iter().map(|r| r.id).collect();
+        for record in left {
+            let mut top = record;
+            while let Some(parent) = top.parent.filter(|p| left_ids.contains(p)) {
+                match by_id.get(&parent) {
+                    Some(above) => top = above,
+                    None => break,
+                }
+            }
+            let mut moved = record.clone();
+            moved.deleted_with = Some(top.id);
+            moved.bin_stage = (top.id == record.id).then_some(stage);
+            retopped.push((record, moved));
+        }
+    }
+
+    // The highest node restored is the one whose name may be taken now.
+    let mut restored: Vec<TreeRecord> = alone.iter().rev().map(|r| revived(r)).collect();
+    restored.extend(group.iter().map(|r| revived(r)));
+    if let Some(first) = restored.first_mut() {
+        if first.id == id.0 {
+            first.parent = new_parent;
+        }
+        let parent = first.parent.map(NodeId).ok_or(AccessError::WrongPlace)?;
+        let taken: HashSet<String> = db.live_child_names(parent).await?.into_iter().collect();
+        if taken.contains(&first.name.to_lowercase()) {
+            let editor = if first.kind == kind_word(NodeKind::Document) {
+                db.document(DocId(first.id)).await?.map(|d| d.editor)
+            } else {
+                None
+            };
+            first.name = unique_node_name(&first.name, editor, &taken);
+        }
+    }
+    let renamed = restored.first().and_then(|first| {
+        let before = by_id.get(&first.id)?;
+        (before.name != first.name).then(|| (NodeId(first.id), before.name.clone()))
+    });
+
+    let mut undo: Vec<TreeRecord> = alone.iter().rev().map(|r| (*r).clone()).collect();
+    undo.extend(group.iter().map(|r| (*r).clone()));
+    let mut events: Vec<NewEvent> = alone
+        .iter()
+        .rev()
+        .map(|folder| NewEvent {
+            kind: "node.restored",
             actor: Some(actor.id),
             subject: None,
-            document: document_of(node.kind, id),
+            document: None,
+            node: Some(NodeId(folder.id)),
+            detail: json!({ "name": folder.name, "alone": true, "for": id.0 }),
+        })
+        .collect();
+    let kind = parse_kind(&entry.kind).unwrap_or(NodeKind::Folder);
+    let restored_entry = restored.iter().find(|r| r.id == id.0);
+    events.push(NewEvent {
+        kind: "node.restored",
+        actor: Some(actor.id),
+        subject: None,
+        document: document_of(kind, id),
+        node: Some(id),
+        detail: json!({
+            "name": restored_entry.map_or(&entry.name, |r| &r.name),
+            "from_name": renamed.as_ref().map(|(_, from)| from),
+            "parent": restored_entry.and_then(|r| r.parent),
+            "items": group.len(),
+            "folders_restored": alone.len(),
+        }),
+    });
+    for (before, after) in retopped {
+        undo.push(before.clone());
+        restored.push(after);
+    }
+    Ok(Plan {
+        id,
+        message: format!("Restore {} {}", kind_word(kind), entry.name),
+        records: restored,
+        undo,
+        needs,
+        events,
+        as_if_live: true,
+        renamed,
+        ..Plan::default()
+    })
+}
+
+/// Moves the entry `id` from the first stage of the bin to the second.
+async fn plan_to_second_stage(
+    state: &AppState,
+    actor: &User,
+    id: NodeId,
+) -> Result<Plan, AccessError> {
+    let entry = bin_record(state, id).await?;
+    let need = bin_need(state.db(), actor, &entry, id).await?;
+    if stage_of(&entry) != BinStage::First {
+        return Err(AccessError::WrongPlace);
+    }
+    let mut after = entry.clone();
+    after.bin_stage = Some(2);
+    let kind = parse_kind(&entry.kind).unwrap_or(NodeKind::Folder);
+    Ok(Plan {
+        id,
+        message: format!(
+            "Move {} {} to the second stage of the recycle bin",
+            kind_word(kind),
+            entry.name
+        ),
+        events: vec![NewEvent {
+            kind: "node.binned",
+            actor: Some(actor.id),
+            subject: None,
+            document: document_of(kind, id),
             node: Some(id),
-            detail: json!({ "name": node.name }),
+            detail: json!({ "name": entry.name }),
         }],
         records: vec![after],
-        undo: vec![before],
-        needs_admin: false,
-        needs: vec![(id, Perms::DELETE)],
-        site_groups: false,
-        document: None,
+        undo: vec![entry],
+        needs: vec![need],
+        as_if_live: true,
+        ..Plan::default()
     })
+}
+
+/// Purges the entry `id` with everything deleted with it: by `actor` from the second stage
+/// (with `manage_site` on the site), or by the server (`None`) at any stage when its time in
+/// the bin is up. Items below it deleted on their own keep their entries.
+async fn plan_purge(
+    state: &AppState,
+    actor: Option<&User>,
+    id: NodeId,
+) -> Result<Plan, AccessError> {
+    let entry = bin_record(state, id).await?;
+    let needs = match actor {
+        Some(actor) => {
+            let need = bin_need(state.db(), actor, &entry, id).await?;
+            if stage_of(&entry) != BinStage::Second {
+                return Err(AccessError::WrongPlace);
+            }
+            vec![need]
+        }
+        None => Vec::new(),
+    };
+    let tree = read_tree(state.checkpointer()).await.map_err(git_failure)?;
+    let mut undo = vec![entry.clone()];
+    undo.extend(
+        below(&tree, id.0)
+            .into_iter()
+            .filter(|r| r.purged.is_none() && deleted_with(r) == Some(id.0))
+            .cloned(),
+    );
+    let stamp = Stamp {
+        at: now_text(),
+        by: actor.map_or_else(server_author, author_of),
+    };
+    let records: Vec<TreeRecord> = undo
+        .iter()
+        .map(|r| {
+            let mut gone = r.clone();
+            gone.purged = Some(stamp.clone());
+            gone.bin_stage = None;
+            gone
+        })
+        .collect();
+    let kind = parse_kind(&entry.kind).unwrap_or(NodeKind::Folder);
+    Ok(Plan {
+        id,
+        message: format!("Purge {} {}", kind_word(kind), entry.name),
+        events: vec![NewEvent {
+            kind: "node.purged",
+            actor: actor.map(|a| a.id),
+            subject: None,
+            document: document_of(kind, id),
+            node: Some(id),
+            detail: json!({ "name": entry.name, "items": records.len() }),
+        }],
+        records,
+        undo,
+        needs,
+        as_if_live: true,
+        ..Plan::default()
+    })
+}
+
+/// The Git error for a record that names a node Git does not hold.
+fn missing(id: Uuid) -> CheckpointError {
+    CheckpointError::InvalidTreeChange(format!("node {id} leads to a node not in the tree"))
+}
+
+/// `name`, or the first of `name (2)`, `name (3)` … that `taken` (lower-cased names) does not
+/// hold: before the extension for a file opened in `editor`, at the end for a folder.
+fn unique_node_name(name: &str, editor: Option<Editor>, taken: &HashSet<String>) -> String {
+    if let Some(editor) = editor {
+        return unique_name(name, editor, taken);
+    }
+    if !taken.contains(&name.to_lowercase()) {
+        return name.to_owned();
+    }
+    (2u64..)
+        .map(|n| fit(name, "", &format!(" ({n})")))
+        .find(|candidate| !taken.contains(&candidate.to_lowercase()))
+        .unwrap_or_else(|| name.to_owned())
 }
 
 /// Every record below `id` in `tree`, deleted ones included, parents before children.
@@ -1250,13 +1783,21 @@ fn new_record(
         name: name.to_owned(),
         created: Stamp { at: now_text(), by },
         deleted: None,
+        bin_stage: None,
+        deleted_with: None,
+        purged: None,
     }
 }
 
-/// `record`, deleted now by `by`.
+/// `record`, deleted and purged now by `by`: the take-back of a creation, which never reaches
+/// the recycle bin.
 fn deleted(record: &TreeRecord, by: Author) -> TreeRecord {
+    let stamp = Stamp { at: now_text(), by };
     let mut gone = record.clone();
-    gone.deleted = Some(Stamp { at: now_text(), by });
+    gone.deleted = Some(stamp.clone());
+    gone.deleted_with = Some(record.id);
+    gone.bin_stage = None;
+    gone.purged = Some(stamp);
     gone
 }
 
@@ -1341,6 +1882,9 @@ fn to_row(record: &TreeRecord) -> Result<NodeRow, String> {
         deleted_by: record.deleted.as_ref().and_then(|d| user(&d.by)),
         created_by: user(&record.created.by),
         created_at: time(&record.created.at)?,
+        deleted_with: record.deleted_with.map(NodeId),
+        bin_stage: record.bin_stage.map(i16::from),
+        purged_at: record.purged.as_ref().map(|p| time(&p.at)).transpose()?,
     })
 }
 

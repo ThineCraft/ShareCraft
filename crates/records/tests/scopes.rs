@@ -966,6 +966,9 @@ async fn rename_file(
         deleted_by: None,
         created_by: node.created_by,
         created_at: node.created_at,
+        deleted_with: None,
+        bin_stage: None,
+        purged_at: None,
     };
     db.apply_nodes(records::NodeChange {
         rows: std::slice::from_ref(&row),

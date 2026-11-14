@@ -62,6 +62,9 @@ fn row(id: NodeId, kind: NodeKind, parent: Option<NodeId>, site: NodeId, name: &
         deleted_by: None,
         created_by: None,
         created_at: OffsetDateTime::now_utc(),
+        deleted_with: None,
+        bin_stage: None,
+        purged_at: None,
     }
 }
 
@@ -730,6 +733,9 @@ async fn rename(db: Db, actor: UserId, file: NodeId, name: &str) -> Result<(), A
         deleted_by: None,
         created_by: node.created_by,
         created_at: node.created_at,
+        deleted_with: None,
+        bin_stage: None,
+        purged_at: None,
     };
     db.apply_nodes(NodeChange {
         rows: std::slice::from_ref(&row),
@@ -1296,13 +1302,16 @@ async fn upgrade_keeps_everyones_access() {
         old_gamma,
     ];
     // Plan 1's access, worked out by this plan's code with no group membership at all: an
-    // empty stand-in for the table the upgrade makes.
-    sqlx::query("create table group_members (group_id uuid, user_id uuid)")
-        .execute(test.db.test_pool())
-        .await
-        .unwrap();
+    // empty stand-in for the table the upgrade makes, and for the recycle bin's column that
+    // the access decision reads (nothing was purged before the bin).
+    sqlx::raw_sql(
+        "create table group_members (group_id uuid, user_id uuid);          alter table nodes add column purged_at timestamptz;",
+    )
+    .execute(test.db.test_pool())
+    .await
+    .unwrap();
     let before = everything(&test.db, &people, &nodes).await;
-    sqlx::query("drop table group_members")
+    sqlx::raw_sql("drop table group_members; alter table nodes drop column purged_at;")
         .execute(test.db.test_pool())
         .await
         .unwrap();
@@ -1459,8 +1468,21 @@ async fn upgrade_records_the_groups_it_made() {
     let old = plan1_node(&test, NodeKind::Site, None, None, "Old", false).await;
     test.db.migrate_to(6).await.unwrap();
     assert!(group_created(&test, old).await.is_empty());
-    // A site made after the upgrade records its groups as it makes them.
+    // A site made after the upgrade records its groups as it makes them. This code writes the
+    // recycle bin's columns too: empty stand-ins for them, which the bin's migration makes.
+    sqlx::raw_sql(
+        "alter table nodes add column deleted_with uuid, add column bin_stage smallint,          add column purged_at timestamptz;",
+    )
+    .execute(test.db.test_pool())
+    .await
+    .unwrap();
     let new = common::site(&test, "New", None).await;
+    sqlx::raw_sql(
+        "alter table nodes drop column deleted_with, drop column bin_stage,          drop column purged_at;",
+    )
+    .execute(test.db.test_pool())
+    .await
+    .unwrap();
     let recorded = group_created(&test, new).await;
     assert_eq!(recorded.len(), 3, "{recorded:?}");
 
