@@ -12,7 +12,7 @@ import {
   explorerQuery,
   explorerRows,
   filterChoices,
-  formatTime,
+  formatDate,
   h,
   inheritAgainMessage,
   messageFor,
@@ -31,6 +31,7 @@ import {
   toggleOpen,
   visibleTree,
   withChosen,
+  siteChrome,
 } from './common.js';
 
 const $ = (id) => document.getElementById(id);
@@ -49,6 +50,7 @@ if (!here) {
   offerRequest(error, rootId);
   fail(MISSING);
 }
+await siteChrome(here.path[0].id, { currentId: rootId });
 const rootNode = here.path[here.path.length - 1];
 if (!can(here.access, 'manage_access')) fail('Only people who manage access here can use the explorer.');
 $('title').textContent = `Inheritance explorer: ${rootNode.name}`;
@@ -334,7 +336,7 @@ async function showDetail(row) {
 }
 
 function stamp(item) {
-  return item ? `${item.user.name}${item.at ? `, ${formatTime(item.at)}` : ''}` : 'Not recorded';
+  return item ? `${item.user.name}${item.at ? `, ${formatDate(item.at)}` : ''}` : 'Not recorded';
 }
 
 function detailView(found) {

@@ -15,6 +15,8 @@ import {
   seg,
   setupTopbar,
   showMessage,
+  organisationChrome,
+  siteChrome,
 } from './common.js';
 
 const $ = (id) => document.getElementById(id);
@@ -25,6 +27,8 @@ setupTopbar(me, error);
 const siteId = queryId(location.search, 'site');
 const groupId = queryId(location.search, 'id');
 const MISSING = 'These groups do not exist, or you cannot see them.';
+if (siteId) await siteChrome(siteId);
+else await organisationChrome();
 
 $('new-group').hidden = !(me.is_admin && !siteId && !groupId);
 $('new-group').addEventListener('submit', async (event) => {

@@ -14,6 +14,7 @@ import {
   seg,
   setupTopbar,
   showMessage,
+  organisationChrome,
 } from './common.js';
 
 const $ = (id) => document.getElementById(id);
@@ -22,6 +23,7 @@ const status = $('status');
 
 const me = await requireMe();
 setupTopbar(me, error);
+await organisationChrome();
 
 if (!me.is_admin) {
   status.textContent = 'Only administrators can manage roles.';

@@ -14,6 +14,7 @@ import {
   seg,
   setupTopbar,
   showMessage,
+  organisationChrome,
 } from './common.js';
 
 const $ = (id) => document.getElementById(id);
@@ -21,6 +22,7 @@ const error = $('error');
 
 const me = await requireMe();
 setupTopbar(me, error);
+await organisationChrome();
 
 const rolesResult = await api('GET', '/roles');
 const roles = rolesResult.ok ? rolesResult.data : [];

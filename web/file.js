@@ -30,6 +30,7 @@ import {
   seg,
   showCrumbs,
   linkNearestPlace,
+  siteChrome,
 } from './common.js';
 
 const FIRST_DELAY = 500;
@@ -180,6 +181,7 @@ async function showPlace() {
   if (!here) return;
   folder = here.folder;
   path = here.path;
+  await siteChrome(path[0].id, { currentId: path.find((step) => step.kind === 'library')?.id });
   if (folder) {
     $('back').href = pageFor(folder.kind, folder.id);
     $('back').setAttribute('aria-label', `Back to ${folder.name}`);

@@ -8,7 +8,7 @@ import {
   bulkSummary,
   can,
   canPlaceHere,
-  formatTime,
+  formatDate,
   h,
   itemActions,
   messageFor,
@@ -23,7 +23,7 @@ import {
   setupTopbar,
   showCrumbs,
   showMessage,
-  showSiteNav,
+  siteChrome,
 } from './common.js';
 import {
   CONFLICT_CHOICES,
@@ -67,7 +67,7 @@ $('edit-tools').hidden = !can(here.access, 'add');
 $('top-tools').hidden = !can(here.access, 'manage_access');
 $('explorer-link').href = `/explorer.html?root=${seg(nodeId)}`;
 $('access-link').href = `/access.html?id=${seg(nodeId)}`;
-showSiteNav($('sitenav'), here.path[0].id, here.path.find((step) => step.kind === 'library')?.id);
+await siteChrome(here.path[0].id, { currentId: here.path.find((step) => step.kind === 'library')?.id });
 
 $('bin-link').href = `/bin.html?site=${seg(here.path[0].id)}`;
 const siteId = here.path[0].id;
@@ -177,7 +177,7 @@ function row(item) {
   const saved =
     item.kind === 'document'
       ? item.revised_at
-        ? `Last saved ${formatTime(item.revised_at)}`
+        ? `Last saved ${formatDate(item.revised_at)}`
         : 'Not saved yet'
       : null;
   const box =

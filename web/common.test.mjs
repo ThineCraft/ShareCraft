@@ -815,3 +815,230 @@ test('a deleted document links to the nearest folder above it that still exists'
   assert.equal(await nearestLivingAncestor(path, async () => null), null);
   assert.equal(await nearestLivingAncestor([path.at(-1)], alive('doc')), null);
 });
+
+// ---- sites: regional formatting, navigation bars and the directory ----
+
+import { directoryFilter, formatDate, formatSize, navigationView, safeHref, siteChrome } from './common.js';
+
+/** Spaces as one plain space: ICU puts narrow no-break spaces before AM and PM. */
+const plain = (text) => text.replace(/[\s  ]+/g, ' ');
+
+test('dates_shown_in_site_time_zone_across_dst', () => {
+  const london = { language: 'en-GB', timeZone: 'Europe/London' };
+  assert.equal(plain(formatDate('2026-11-14T15:04:00Z', london)), '14 Nov 2026, 15:04 GMT');
+  // Europe/London moves to summer time at 01:00 UTC on 29 March 2026.
+  assert.equal(plain(formatDate('2026-03-29T00:30:00Z', london)), '29 Mar 2026, 00:30 GMT');
+  assert.equal(plain(formatDate('2026-03-29T01:30:00Z', london)), '29 Mar 2026, 02:30 BST');
+  // America/New_York moves to summer time at 07:00 UTC on 8 March 2026.
+  const newYork = { language: 'en-US', timeZone: 'America/New_York' };
+  assert.equal(plain(formatDate('2026-03-08T06:30:00Z', newYork)), 'Mar 8, 2026, 1:30 AM EST');
+  assert.equal(plain(formatDate('2026-03-08T07:30:00Z', newYork)), 'Mar 8, 2026, 3:30 AM EDT');
+  // The same moment in another zone and language.
+  assert.equal(plain(formatDate('2026-07-01T12:00:00Z', { language: 'de', timeZone: 'Europe/Berlin' })), '1. Juli 2026, 14:00 MESZ');
+  // Not a time: shown as it came; a bad zone or language falls back instead of throwing.
+  assert.equal(formatDate('not a time', london), 'not a time');
+  assert.equal(formatDate(null, london), '');
+  assert.doesNotThrow(() => formatDate('2026-11-14T15:04:00Z', { language: 'xx-!!', timeZone: 'Mars/Olympus' }));
+});
+
+test('sizes_in_site_language', () => {
+  assert.equal(formatSize(1536, 'en'), '1.5 KB');
+  assert.equal(formatSize(1536, 'de'), '1,5 KB');
+  assert.equal(formatSize(1536, 'fr'), '1,5 KB');
+  assert.equal(formatSize(10 * 1024 ** 3, 'de'), '10,0 GB');
+  assert.equal(formatSize(1023, 'en'), '1023 bytes');
+  assert.equal(formatSize(0, 'de'), '0 bytes');
+  // Without a language, sizes read as they always did.
+  assert.equal(formatSize(1536), '1.5 KB');
+  assert.equal(formatSize(1536, 'not a language!'), '1.5 KB');
+});
+
+// A document able to hold a drawn navigation: elements keep tag, attributes, children (strings
+// stay strings, so text can never become markup) and listeners.
+function chromeDocument() {
+  const all = [];
+  globalThis.document = {
+    documentElement: { lang: 'en' },
+    createElement(tag) {
+      const element = {
+        tag,
+        attributes: {},
+        children: [],
+        listeners: {},
+        hidden: false,
+        setAttribute(name, value) {
+          this.attributes[name] = value;
+        },
+        getAttribute(name) {
+          return this.attributes[name] ?? null;
+        },
+        append(...nodes) {
+          this.children.push(...nodes);
+        },
+        replaceChildren(...nodes) {
+          this.children = nodes;
+        },
+        addEventListener(type, listener) {
+          this.listeners[type] = listener;
+        },
+        set innerHTML(_) {
+          throw new Error('innerHTML is never used');
+        },
+      };
+      all.push(element);
+      return element;
+    },
+    getElementById: () => null,
+    querySelector: () => null,
+    addEventListener() {},
+  };
+  return all;
+}
+
+/** Every string drawn below `element`, in order. */
+const texts = (element) =>
+  element.children.flatMap((child) => (typeof child === 'string' ? [child] : texts(child)));
+
+test('navigation_drawn_as_text_only', () => {
+  const all = chromeDocument();
+  try {
+    const hostile = '<img src=x onerror="alert(1)">';
+    const nav = {
+      global: [{ id: 'g1', label: hostile, target: { url: 'https://example.org/' }, targeted: false, children: [] }],
+      hub: { id: SITE, name: `${hostile} hub`, items: [] },
+      local: [
+        {
+          id: 'l1',
+          label: hostile,
+          target: null,
+          targeted: true,
+          children: [{ id: 'l2', label: 'Plans', target: { node: LIB, kind: 'library' }, targeted: false, children: [] }],
+        },
+      ],
+      automatic: false,
+    };
+    const view = navigationView({ id: SITE, name: `${hostile} site` }, nav, { currentId: LIB });
+    assert.ok(!all.some((element) => element.tag === 'img'), 'no element is made from a label');
+    const drawn = texts(view);
+    assert.ok(drawn.includes(hostile), 'the label is drawn as text');
+    assert.ok(drawn.includes(`${hostile} hub`), 'the hub name is drawn as text');
+    assert.ok(drawn.includes(`${hostile} site`));
+    const links = all.filter((element) => element.tag === 'a');
+    assert.ok(links.some((a) => a.attributes.href === 'https://example.org/'));
+    assert.ok(links.some((a) => a.attributes.href === `/site.html?id=${SITE}`), 'the hub name links to the hub');
+    const plans = links.find((a) => a.attributes.href === `/library.html?id=${LIB}`);
+    assert.equal(plans.attributes['aria-current'], 'page');
+    // The menu is a disclosure button at narrow widths, and so is each heading with children.
+    const buttons = all.filter((element) => element.tag === 'button');
+    assert.ok(buttons.length >= 2);
+    for (const button of buttons) assert.equal(button.attributes['aria-expanded'], 'false');
+  } finally {
+    delete globalThis.document;
+  }
+});
+
+test('a hub bar the viewer cannot name is drawn without the hub link', () => {
+  const all = chromeDocument();
+  try {
+    const nav = {
+      global: [],
+      hub: { id: null, name: null, items: [{ id: 'h1', label: 'News', target: { url: '/news' }, targeted: false, children: [] }] },
+      local: [],
+      automatic: true,
+    };
+    navigationView(null, nav, {});
+    const links = all.filter((element) => element.tag === 'a');
+    assert.deepEqual(links.map((a) => a.attributes.href), ['/news']);
+  } finally {
+    delete globalThis.document;
+  }
+});
+
+test('bad_url_never_becomes_a_link', async () => {
+  for (const bad of [
+    'javascript:alert(1)',
+    'JavaScript:alert(1)',
+    ' javascript:alert(1)',
+    'data:text/html,<script>alert(1)</script>',
+    '//evil.example/',
+    '/\\evil.example',
+    '/\t/evil.example',
+    'vbscript:x',
+    'relative/path',
+    '',
+    'https://example.org/' + 'a'.repeat(2000),
+    null,
+    42,
+  ]) {
+    assert.equal(safeHref(bad), null, String(bad));
+  }
+  for (const good of ['https://example.org/', 'HTTP://example.org', 'mailto:team@example.org', '/library.html?id=1']) {
+    assert.equal(safeHref(good), good);
+  }
+
+  // A stubbed server sends a `javascript:` address anyway: the page draws the label as text.
+  const all = chromeDocument();
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    const body = url.endsWith('/navigation')
+      ? {
+          global: [{ id: 'g', label: 'Click me', target: { url: 'javascript:alert(1)' }, targeted: false, children: [] }],
+          hub: null,
+          local: [{ id: 'l', label: 'Sneaky', target: { url: '//evil.example/' }, targeted: false, children: [] }],
+          automatic: false,
+        }
+      : { id: SITE, name: 'Sales', language: 'en-GB', time_zone: 'Europe/London', kind: 'team', description: '' };
+    return { ok: true, status: 200, json: async () => body };
+  };
+  try {
+    const place = document.createElement('div');
+    const shown = await siteChrome(SITE, { place });
+    assert.equal(shown.site.name, 'Sales');
+    for (const a of all.filter((element) => element.tag === 'a')) {
+      assert.notEqual(safeHref(a.attributes.href), null, `linked ${a.attributes.href}`);
+    }
+    const drawn = texts(place);
+    assert.ok(drawn.includes('Click me'));
+    assert.ok(drawn.includes('Sneaky'));
+    // The page takes the site's language, and dates follow it.
+    assert.equal(document.documentElement.lang, 'en-GB');
+    assert.equal(plain(formatDate('2026-11-14T15:04:00Z')), '14 Nov 2026, 15:04 GMT');
+  } finally {
+    globalThis.fetch = realFetch;
+    delete globalThis.document;
+  }
+});
+
+test('directory_filter_matches_names_and_descriptions', () => {
+  const sites = [
+    { id: 'a', name: 'Sales', description: 'Quotes and contracts' },
+    { id: 'b', name: 'Marketing', description: 'Campaigns for SALES teams' },
+    { id: 'c', name: 'Legal', description: '' },
+    { id: 'd', name: 'Ops' },
+  ];
+  const ids = (text) => directoryFilter(sites, text).map((site) => site.id);
+  assert.deepEqual(ids('sales'), ['a', 'b']);
+  assert.deepEqual(ids('  CONTRACT '), ['a']);
+  assert.deepEqual(ids('leg'), ['c']);
+  assert.deepEqual(ids(''), ['a', 'b', 'c', 'd']);
+  assert.deepEqual(ids(undefined), ['a', 'b', 'c', 'd']);
+  assert.deepEqual(ids('nothing like it'), []);
+});
+
+test('new_messages_for_new_error_codes', () => {
+  const general = messageFor('no_such_code');
+  const codes = [
+    'archived',
+    'invalid_navigation',
+    'invalid_template',
+    'invalid_language',
+    'invalid_time_zone',
+    'not_a_hub',
+    'is_hub',
+    'site_deleted',
+    'not_deleted',
+  ];
+  const sentences = codes.map(messageFor);
+  for (const [at, code] of codes.entries()) assert.notEqual(sentences[at], general, code);
+  assert.equal(new Set(sentences).size, codes.length, 'each code has a sentence of its own');
+});

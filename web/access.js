@@ -26,6 +26,7 @@ import {
   setupTopbar,
   showCrumbs,
   showMessage,
+  siteChrome,
 } from './common.js';
 
 const $ = (id) => document.getElementById(id);
@@ -41,6 +42,7 @@ if (!here) {
   offerRequest(error, nodeId);
   fail(MISSING);
 }
+await siteChrome(here.path[0].id, { currentId: nodeId });
 const self = here.path[here.path.length - 1];
 $('title').textContent = `Access to ${self.name}`;
 document.title = `Access to ${self.name} — ShareCraft`;

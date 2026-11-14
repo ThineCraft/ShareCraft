@@ -1,7 +1,7 @@
 // The organisation's sharing settings, for administrators: whether links for anyone may be made
 // and used, and how long one may last. The server decides; refusals are shown as sentences.
 
-import { api, messageFor, requireMe, showMessage } from './common.js';
+import { api, messageFor, organisationChrome, requireMe, showMessage } from './common.js';
 
 const $ = (id) => document.getElementById(id);
 const error = $('error');
@@ -15,6 +15,7 @@ try {
   throw err;
 }
 $('who').textContent = `Signed in as ${me.name}`;
+await organisationChrome();
 
 if (!me.is_admin) {
   status.textContent = 'Only administrators can change the sharing settings.';

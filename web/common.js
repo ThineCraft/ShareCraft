@@ -518,11 +518,8 @@ export function canPlaceHere(trail, ids, currentParentId, { copy = false } = {})
   return copy || here.id !== currentParentId;
 }
 
-/** A time from the server as the person's local date and time. */
-export function formatTime(text) {
-  const date = new Date(text);
-  return Number.isNaN(date.getTime()) ? text : date.toLocaleString();
-}
+/** A time from the server in the page's language and time zone (see [`formatDate`]). */
+export const formatTime = (text) => formatDate(text);
 
 /**
  * What an anyone link's page offers for a file with `revised_at` (as the server answers it,
@@ -554,34 +551,6 @@ export function setupTopbar(me, error) {
     if (result.ok) location.assign('/signin.html');
     else showMessage(error, messageFor(result.error));
   });
-}
-
-/**
- * The site navigation: the libraries of site `siteId` as links in `target` (a `nav` element),
- * the one with id `currentId` marked as the current page.
- */
-export async function showSiteNav(target, siteId, currentId) {
-  const result = await api('GET', `/nodes/${seg(siteId)}/children?limit=500`);
-  if (!result.ok) return;
-  const libraries = result.data.items.filter((item) => item.kind === 'library');
-  target.replaceChildren(
-    h(
-      'ul',
-      {},
-      ...libraries.map((library) =>
-        h(
-          'li',
-          {},
-          h(
-            'a',
-            { href: pageFor('library', library.id), 'aria-current': library.id === currentId ? 'page' : null },
-            library.name,
-          ),
-        ),
-      ),
-    ),
-  );
-  target.hidden = libraries.length === 0;
 }
 
 /** Puts `text` in `element`, followed by a link to `folder` (a crumb) when there is one. */
@@ -711,9 +680,10 @@ export const linkRoleChoices = (roles, access) =>
 
 /**
  * The expiry of a link for people: `expires 1 December`, with the year when it is not the year of
- * `now`; `never expires` for none. `now` (milliseconds), `timeZone` and `locale` can be passed in.
+ * `now`; `never expires` for none. `now` (milliseconds), `timeZone` and `locale` can be passed in;
+ * they default to the page's (see [`setRegional`]).
  */
-export function expiryText(iso, { now = Date.now(), timeZone, locale = 'en-GB' } = {}) {
+export function expiryText(iso, { now = Date.now(), timeZone = regional.timeZone, locale = regional.language ?? 'en-GB' } = {}) {
   if (iso == null) return 'never expires';
   const date = new Date(iso);
   if (Number.isNaN(date.getTime())) return String(iso);
@@ -847,17 +817,8 @@ export function daysLeftText(days) {
   return days === 1 ? '1 day left' : `${days} days left`;
 }
 
-/** `n` bytes in the largest unit that keeps it at 1 or more. */
-export function bytesText(n) {
-  const units = ['bytes', 'KB', 'MB', 'GB', 'TB'];
-  let value = n;
-  let unit = 0;
-  while (value >= 1024 && unit < units.length - 1) {
-    value /= 1024;
-    unit += 1;
-  }
-  return unit === 0 ? `${value} bytes` : `${value.toFixed(1)} ${units[unit]}`;
-}
+/** `n` bytes in the largest unit that keeps it at 1 or more, in the page's language (see [`formatSize`]). */
+export const bytesText = (n) => formatSize(n);
 
 const itemsText = (n) => `${n} ${n === 1 ? 'item' : 'items'}`;
 const capital = (text) => text.charAt(0).toUpperCase() + text.slice(1);
@@ -1004,4 +965,292 @@ export function quotaSubmit(text, { blind = false } = {}) {
   const asked = 'Enter the quota as a number of gigabytes' + (blind ? '.' : ', or leave it empty for no quota.');
   if (bytes === undefined || (blind && bytes === null)) return { error: asked };
   return { bytes };
+}
+
+// ---- sites: regional formatting, navigation bars and the site directory ----
+
+/** `language` if `Intl` knows it as a language tag, otherwise undefined. */
+function knownLanguage(language) {
+  if (typeof language !== 'string' || language === '') return undefined;
+  try {
+    return Intl.getCanonicalLocales(language)[0];
+  } catch {
+    return undefined;
+  }
+}
+
+/** `timeZone` if `Intl` knows the zone, otherwise undefined. */
+function knownZone(timeZone) {
+  if (typeof timeZone !== 'string' || timeZone === '') return undefined;
+  try {
+    new Intl.DateTimeFormat('en', { timeZone });
+    return timeZone;
+  } catch {
+    return undefined;
+  }
+}
+
+// The language and time zone the page shows dates and sizes in: the site's, or the
+// organisation's outside a site. Until a page sets them, the browser's own are used for dates
+// and English for sizes, as before.
+let regional = { language: undefined, timeZone: undefined };
+
+/**
+ * Sets the language and time zone of the page (`{ language, timeZone }`, as a site or the
+ * organisation defaults give them) and `<html lang>`. A value `Intl` does not know is ignored.
+ */
+export function setRegional({ language, timeZone } = {}) {
+  regional = { language: knownLanguage(language), timeZone: knownZone(timeZone) };
+  const root = globalThis.document?.documentElement;
+  if (root && regional.language) root.lang = regional.language;
+}
+
+/**
+ * A time from the server (RFC 3339, UTC) as a date and time in `language` and `timeZone`, with
+ * the zone's short name: `14 Nov 2026, 15:04 GMT`. Either left out is the page's own (see
+ * [`setRegional`]). '' for none; anything that is not a time is shown as it came.
+ */
+export function formatDate(iso, { language, timeZone } = {}) {
+  if (iso == null) return '';
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return String(iso);
+  const options = {
+    day: 'numeric',
+    month: 'short',
+    year: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+    timeZoneName: 'short',
+    timeZone: knownZone(timeZone) ?? regional.timeZone,
+  };
+  return new Intl.DateTimeFormat(knownLanguage(language) ?? regional.language, options).format(date);
+}
+
+/**
+ * `bytes` in the largest unit that keeps it at 1 or more, its number written in `language` (the
+ * page's when left out; English when there is none): `1.5 KB`, `1,5 KB`.
+ */
+export function formatSize(bytes, language) {
+  if (typeof bytes !== 'number' || !Number.isFinite(bytes)) return String(bytes);
+  const units = ['bytes', 'KB', 'MB', 'GB', 'TB'];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  const locale = knownLanguage(language) ?? regional.language ?? 'en';
+  const digits = unit === 0 ? { maximumFractionDigits: 0, useGrouping: false } : { minimumFractionDigits: 1, maximumFractionDigits: 1 };
+  return `${new Intl.NumberFormat(locale, digits).format(value)} ${units[unit]}`;
+}
+
+/** The longest address a navigation link may have, as the server allows. */
+const MAX_URL = 2000;
+
+/**
+ * `url` if it may be put into `href`: `https:`, `http:`, `mailto:` or a path starting with a
+ * single `/`, at most 2,000 characters, with no control characters and no space at either end.
+ * Otherwise null, and the page shows the label as text. The server refuses anything else
+ * already; this is checked again on the page.
+ */
+export function safeHref(url) {
+  if (typeof url !== 'string' || url === '' || url.length > MAX_URL || url !== url.trim()) return null;
+  for (const ch of url) {
+    const code = ch.codePointAt(0);
+    if (code < 0x20 || code === 0x7f) return null;
+  }
+  if (url.startsWith('/')) return url[1] === '/' || url[1] === '\\' ? null : url;
+  const scheme = /^([a-zA-Z][a-zA-Z0-9+.-]*):/.exec(url)?.[1].toLowerCase();
+  return scheme === 'https' || scheme === 'http' || scheme === 'mailto' ? url : null;
+}
+
+/** The address a resolved navigation target opens, or null (a heading, or a refused address). */
+export function navHref(target) {
+  if (!target) return null;
+  if (typeof target.node === 'string') return pageFor(target.kind, target.node);
+  return safeHref(target.url);
+}
+
+let menus = 0; // makes the id of each drawn menu unique on the page
+
+/** Opens or closes the list `list` under the disclosure button `button`. */
+function setOpen(button, list, open) {
+  button.setAttribute('aria-expanded', open ? 'true' : 'false');
+  list.hidden = !open;
+}
+
+/** One navigation item, with its children under a disclosure button. Text only, never markup. */
+function navItem(item, currentId) {
+  const href = navHref(item.target);
+  const current = item.target?.node != null && item.target.node === currentId;
+  const label = href
+    ? h('a', { href, 'aria-current': current ? 'page' : null }, item.label)
+    : item.children?.length
+      ? null
+      : h('span', { class: 'heading' }, item.label);
+  const targeted = item.targeted
+    ? h('small', { class: 'mark', title: 'Shown only to the groups it is aimed at, and to you because you manage it' }, 'Targeted')
+    : null;
+  if (!item.children?.length) return h('li', {}, label, targeted);
+  menus += 1;
+  const id = `nav-sub-${menus}`;
+  const sub = h('ul', { class: 'sub', id }, ...item.children.map((child) => navItem(child, currentId)));
+  sub.hidden = true;
+  const toggle = label
+    ? h('button', { type: 'button', class: 'sub-toggle', 'aria-expanded': 'false', 'aria-controls': id, 'aria-label': `More under ${item.label}` }, '▾')
+    : h('button', { type: 'button', class: 'sub-toggle heading', 'aria-expanded': 'false', 'aria-controls': id }, item.label, ' ▾');
+  toggle.addEventListener('click', () => setOpen(toggle, sub, toggle.getAttribute('aria-expanded') !== 'true'));
+  return h('li', { class: 'has-sub' }, label, toggle, targeted, sub);
+}
+
+/** One bar: a name (a link to `head.href` when there is one) and its items. */
+function navBar(kind, label, head, items, currentId) {
+  const name = head?.name == null ? null : head.href ? h('a', { class: 'navhead', href: head.href }, head.name) : h('span', { class: 'navhead' }, head.name);
+  return h(
+    'div',
+    { class: `navbar ${kind}`, 'data-bar': kind },
+    name,
+    items.length ? h('ul', { 'aria-label': label }, ...items.map((item) => navItem(item, currentId))) : null,
+  );
+}
+
+/**
+ * The navigation shown on a page: the organisation's global bar, the hub's bar (its name linking
+ * to the hub, unless the viewer may not see the hub, when only its items are drawn) and the
+ * site's own navigation under the site's name. `site` is `{ id, name }` or null outside a site;
+ * `nav` is `{ global, hub, local }` as `GET /api/sites/{id}/navigation` answers. At narrow
+ * widths the bars fold behind a Menu button. Labels and names are drawn as text only, and an
+ * address only becomes a link after [`safeHref`] accepts it. `currentId` is marked as the
+ * current page.
+ */
+export function navigationView(site, nav, { currentId } = {}) {
+  const bars = [];
+  if (nav?.global?.length) bars.push(navBar('global', 'Organisation', null, nav.global, currentId));
+  if (nav?.hub) {
+    const hub = nav.hub;
+    const head = hub.id != null && hub.name != null ? { name: hub.name, href: pageFor('site', hub.id) } : null;
+    if (head || hub.items?.length) bars.push(navBar('hub', 'Hub', head, hub.items ?? [], currentId));
+  }
+  if (site || nav?.local?.length) {
+    const head = site ? { name: site.name, href: pageFor('site', site.id) } : null;
+    bars.push(navBar('local', 'This site', head, nav?.local ?? [], currentId));
+  }
+  menus += 1;
+  const id = `nav-menu-${menus}`;
+  const menu = h('div', { class: 'chrome-menu', id }, ...bars);
+  const toggle = h('button', { type: 'button', class: 'plain menu-toggle', 'aria-expanded': 'false', 'aria-controls': id }, 'Menu');
+  toggle.addEventListener('click', () => {
+    toggle.setAttribute('aria-expanded', toggle.getAttribute('aria-expanded') === 'true' ? 'false' : 'true');
+  });
+  const view = h('nav', { class: 'chrome', 'aria-label': 'Site navigation', 'data-chrome': '' }, toggle, menu);
+  view.hidden = bars.length === 0;
+  // Escape closes what is open and goes back to the button that opened it.
+  view.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape') return;
+    const open = [...(view.querySelectorAll?.('button[aria-expanded="true"]') ?? [])];
+    const inner = open.filter((button) => button !== toggle);
+    const last = inner.at(-1) ?? (open.includes(toggle) ? toggle : null);
+    if (!last) return;
+    if (last === toggle) toggle.setAttribute('aria-expanded', 'false');
+    else setOpen(last, view.querySelector(`#${last.getAttribute('aria-controls')}`), false);
+    last.focus();
+  });
+  return view;
+}
+
+/** Closes every open sub-list of a drawn navigation when the person clicks elsewhere. */
+function closeOnOutsideClick(view) {
+  globalThis.document?.addEventListener?.('click', (event) => {
+    if (view.contains?.(event.target)) return;
+    for (const button of view.querySelectorAll?.('.sub-toggle[aria-expanded="true"]') ?? []) {
+      setOpen(button, view.querySelector(`#${button.getAttribute('aria-controls')}`), false);
+    }
+  });
+}
+
+/** Puts a drawn navigation in `place`, or after the page's account bar (replacing an earlier one). */
+function placeChrome(view, place) {
+  if (place) return place.replaceChildren(view);
+  const old = document.querySelector('[data-chrome]');
+  if (old) return old.replaceWith(view);
+  const bar = document.querySelector('.topbar, .bar');
+  if (bar) bar.after(view);
+  else document.body?.prepend(view);
+  closeOnOutsideClick(view);
+}
+
+/**
+ * The navigation of a page inside site `siteId`: fetches the site (`GET /api/sites/{id}`) and its
+ * navigation once, sets the page's language and time zone (and `<html lang>`) to the site's,
+ * and draws the bars (see [`navigationView`]) after the account bar, or in `place`.
+ * `currentId` is marked as the current page. Answers `{ site, navigation }`, each null when it
+ * could not be read; without the site the organisation defaults are used.
+ */
+export async function siteChrome(siteId, { currentId, place } = {}) {
+  const [site, navigation] = await Promise.all([
+    api('GET', `/sites/${seg(siteId)}`),
+    api('GET', `/sites/${seg(siteId)}/navigation`),
+  ]);
+  if (site.ok) setRegional({ language: site.data.language, timeZone: site.data.time_zone });
+  else await useOrganisationRegional();
+  const shown = { site: site.ok ? site.data : null, navigation: navigation.ok ? navigation.data : null };
+  placeChrome(navigationView(shown.site, shown.navigation, { currentId }), place);
+  return shown;
+}
+
+/** Sets the page's language and time zone to the organisation defaults. */
+async function useOrganisationRegional() {
+  const result = await api('GET', '/settings/regional');
+  if (result.ok) setRegional({ language: result.data.default_language, timeZone: result.data.default_time_zone });
+}
+
+/**
+ * The navigation of a page outside any site: the organisation's language and time zone and its
+ * global bar (`GET /api/navigation`), drawn after the account bar or in `place`.
+ */
+export async function organisationChrome({ place } = {}) {
+  const [, navigation] = await Promise.all([useOrganisationRegional(), api('GET', '/navigation')]);
+  const global = navigation.ok ? navigation.data.items : [];
+  placeChrome(navigationView(null, { global, hub: null, local: [] }), place);
+}
+
+/** `Team site` or `Communication site`. */
+export const kindLabel = (kind) => (kind === 'communication' ? 'Communication site' : 'Team site');
+
+/**
+ * The sites of `sites` (directory rows) whose name or description holds `text`, ignoring case
+ * and spaces at either end; every site for no text.
+ */
+export function directoryFilter(sites, text) {
+  const needle = String(text ?? '').trim().toLocaleLowerCase();
+  if (needle === '') return sites;
+  return sites.filter(
+    (site) =>
+      String(site.name ?? '').toLocaleLowerCase().includes(needle) ||
+      String(site.description ?? '').toLocaleLowerCase().includes(needle),
+  );
+}
+
+/**
+ * One site of the directory (as `GET /api/sites` lists it) as a list row: its name linked, its
+ * kind, whether it is a hub or archived, the hub it joined, its description and the person's role.
+ */
+export function directoryRow(site) {
+  return h(
+    'li',
+    {},
+    h(
+      'span',
+      { class: 'grow' },
+      h('a', { href: pageFor('site', site.id) }, site.name),
+      h('br'),
+      h('small', {}, kindLabel(site.kind)),
+      site.hub ? h('small', {}, ' · Hub: ', h('a', { href: pageFor('site', site.hub.id) }, site.hub.name)) : null,
+      site.description ? h('br') : null,
+      site.description ? h('span', { class: 'description' }, site.description) : null,
+    ),
+    site.is_hub ? h('small', { class: 'mark own' }, 'Hub') : null,
+    site.archived ? h('small', { class: 'mark' }, 'Archived') : null,
+    site.access ? h('small', {}, roleLine(site.access)) : h('small', { class: 'mark' }, 'Limited access'),
+  );
 }

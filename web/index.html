@@ -23,10 +23,38 @@
    <label for="site-name">New site</label>
    <input type="text" id="site-name" maxlength="120" autocomplete="off" required>
   </div>
+  <div class="field">
+   <label for="site-template">Template</label>
+   <select id="site-template">
+    <option value="team">Team site</option>
+    <option value="communication">Communication site</option>
+   </select>
+  </div>
   <button type="submit">New site</button>
  </form>
  <p id="error" role="alert" class="msg"></p>
- <ul id="sites" class="list"></ul>
+ <form id="find" class="filters" role="search" aria-label="Find a site">
+  <div class="field">
+   <label for="q">Find a site by name or description</label>
+   <input type="search" id="q" autocomplete="off" maxlength="200">
+  </div>
+  <div class="field">
+   <label for="kind">Kind</label>
+   <select id="kind">
+    <option value="">All kinds</option>
+    <option value="team">Team sites</option>
+    <option value="communication">Communication sites</option>
+   </select>
+  </div>
+  <div class="field">
+   <label for="hub">Hub</label>
+   <select id="hub">
+    <option value="">Any hub or none</option>
+   </select>
+  </div>
+ </form>
+ <p id="count" class="meta" role="status" aria-live="polite"></p>
+ <ul id="sites" class="list" aria-label="Sites"></ul>
  <p id="empty" hidden>You do not have access to any site yet.</p>
  <section id="mine" aria-labelledby="mine-heading" hidden>
   <h2 id="mine-heading">My requests</h2>

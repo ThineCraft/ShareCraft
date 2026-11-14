@@ -19,7 +19,24 @@
  <p id="status" role="status" aria-live="polite" class="meta"></p>
  <h1 id="title">Site</h1>
  <p id="role" class="kind"></p>
+ <p id="archived-banner" class="note" hidden>This site is archived. It can be read but not changed.</p>
  <p id="error" role="alert" class="msg"></p>
+ <section id="about" class="site-facts" aria-label="About this site" hidden>
+  <p><span id="kind-label" class="mark"></span> <span id="hub-mark" class="mark own" hidden>Hub</span></p>
+  <p id="description" class="description" hidden></p>
+  <dl class="facts">
+   <dt>Owners</dt><dd id="owners"></dd>
+   <dt>Hub</dt><dd id="hub-line"></dd>
+  </dl>
+  <form id="join-hub" class="row" hidden>
+   <div class="field">
+    <label for="hub-choice">Join a hub</label>
+    <select id="hub-choice"></select>
+   </div>
+   <button type="submit">Join hub</button>
+  </form>
+  <p id="leave-hub-row" hidden><button type="button" id="leave-hub" class="plain">Leave hub</button></p>
+ </section>
  <section id="storage" aria-label="Storage" hidden>
   <p id="storage-text" class="meta"></p>
   <progress id="storage-bar" max="100" value="0" hidden></progress>
@@ -48,6 +65,11 @@
  <h2>Libraries</h2>
  <ul id="libraries" class="list"></ul>
  <p id="empty" hidden>There are no libraries you can open here.</p>
+ <section id="members" aria-labelledby="members-heading" hidden>
+  <h2 id="members-heading">Sites in this hub</h2>
+  <ul id="member-sites" class="list" aria-labelledby="members-heading"></ul>
+  <p id="members-empty" class="meta" hidden>No site you can see has joined this hub yet.</p>
+ </section>
 </div>
 <script type="module" src="./site.js"></script>
 </body>

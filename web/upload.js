@@ -4,7 +4,7 @@
 // retried from the offset the server reports. Nothing here touches the page: the library page
 // shows the queue's progress and answers its questions. Nothing runs at import.
 
-import { bytesText, goToSignIn, messageFor, quotaRefusalText, seg } from './common.js';
+import { formatSize, goToSignIn, messageFor, quotaRefusalText, seg } from './common.js';
 
 /** The size of one chunk: 8 MiB. */
 export const CHUNK = 8 * 1024 * 1024;
@@ -569,7 +569,7 @@ async function walk(entry, path, found) {
 }
 
 /** `n` bytes for the progress line: `3.0 MB of 20.0 MB`. */
-export const progressText = (sent, size) => `${bytesText(sent)} of ${bytesText(size)}`;
+export const progressText = (sent, size) => `${formatSize(sent)} of ${formatSize(size)}`;
 
 /** One line for the whole panel: `3 of 8 uploaded, 1 skipped, 1 failed`; empty with no uploads. */
 export function uploadsSummary(outcomes) {

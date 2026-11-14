@@ -4,12 +4,12 @@
 
 import {
   api,
-  bytesText,
+  formatSize,
   can,
   confirmDialog,
   daysLeftText,
   emptyBinText,
-  formatTime,
+  formatDate,
   h,
   messageFor,
   offerRequest,
@@ -19,6 +19,7 @@ import {
   setupTopbar,
   showCrumbs,
   showMessage,
+  siteChrome,
 } from './common.js';
 
 const PAGE = 100;
@@ -41,6 +42,7 @@ if (!here) {
   offerRequest(error, siteId);
   fail(MISSING);
 }
+await siteChrome(siteId);
 const manageSite = can(here.access, 'manage_site');
 document.title = `Recycle bin — ${here.path[here.path.length - 1].name} — ShareCraft`;
 $('stages').hidden = !manageSite;
@@ -125,9 +127,9 @@ function row(entry) {
       h('br'),
       h('small', {}, `${entry.kind === 'folder' ? 'Folder' : 'File'} ${where}`),
     ),
-    h('small', {}, `${by}${entry.deleted_at ? `, ${formatTime(entry.deleted_at)}` : ''}`),
+    h('small', {}, `${by}${entry.deleted_at ? `, ${formatDate(entry.deleted_at)}` : ''}`),
     h('small', {}, daysLeftText(entry.days_left)),
-    h('small', {}, bytesText(entry.size)),
+    h('small', {}, formatSize(entry.size)),
     h('span', { class: 'actions' }, restore, remove),
   );
 }
