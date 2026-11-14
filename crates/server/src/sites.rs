@@ -607,6 +607,80 @@ pub(crate) async fn repair_sites(state: &AppState, sites: &[NodeId]) -> bool {
     true
 }
 
+/// After the organisation's regional defaults change, brings the rows of the sites with no
+/// record in Git to the new defaults, as such a site is read as the organisation's current
+/// defaults: only their language and time zone change, and no event is recorded for them (the
+/// settings change is the event). The caller holds the tree lock, so no site record is written
+/// meanwhile. A row that differs from a record-less site in anything else, or of a site whose
+/// purge has started, is left for the reconcile. Returns whether every row was written; on a
+/// failure the caller marks the tree out of step, so the reconcile finishes the job.
+pub(crate) async fn follow_defaults(state: &AppState) -> bool {
+    let store = Arc::clone(state.checkpointer());
+    let records = match tokio::task::spawn_blocking(move || store.read_sites()).await {
+        Ok(Ok(records)) => records,
+        Ok(Err(CheckpointError::Unsupported)) => return true,
+        Ok(Err(e)) => {
+            eprintln!("sharecraft-server: could not read the site records from Git: {e}");
+            return false;
+        }
+        Err(e) => {
+            eprintln!("sharecraft-server: could not read the site records from Git: {e}");
+            return false;
+        }
+    };
+    let recorded: HashSet<Uuid> = records.iter().map(|record| record.id).collect();
+    let db = state.db();
+    let (defaults, nodes, rows) = match tokio::try_join!(
+        db.regional_defaults(),
+        db.node_rows(),
+        db.all_site_settings()
+    ) {
+        Ok(found) => found,
+        Err(e) => {
+            eprintln!("sharecraft-server: could not bring sites to the new defaults: {e}");
+            return false;
+        }
+    };
+    let live: HashSet<NodeId> = nodes
+        .into_iter()
+        .filter(|row| row.kind == NodeKind::Site && row.purged_at.is_none())
+        .map(|row| row.id)
+        .collect();
+    let mut all_written = true;
+    for current in rows {
+        if recorded.contains(&current.id.0) || !live.contains(&current.id) || current.purging {
+            continue;
+        }
+        let Ok(wanted) = settings_of(&new_site_record(current.id, &defaults)) else {
+            continue;
+        };
+        let mut followed = current.clone();
+        followed.language.clone_from(&wanted.language);
+        followed.time_zone.clone_from(&wanted.time_zone);
+        if current.same_record(&wanted) || !followed.same_record(&wanted) {
+            continue;
+        }
+        let applied = db
+            .apply_site_change(SiteChange {
+                settings: &followed,
+                node: None,
+                actor: None,
+                needs_admin: false,
+                needs: Perms::NONE,
+                events: Vec::new(),
+            })
+            .await;
+        if let Err(e) = applied {
+            eprintln!(
+                "sharecraft-server: could not bring site {} to the new defaults: {e}",
+                current.id.0
+            );
+            all_written = false;
+        }
+    }
+    all_written
+}
+
 /// Writes `record` into PostgreSQL if `current` differs from it, with `site.changed` marked as
 /// a repair. Returns whether it wrote.
 async fn repair_site(

@@ -846,3 +846,89 @@ async fn site_change_failing_after_judging_is_repaired_when_back_in_step() {
         "{repaired:?}"
     );
 }
+
+#[tokio::test]
+async fn old_sites_follow_changed_defaults_at_once() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let db = TestDb::create().await;
+    let mut first = StoppableServer::start(data_dir.path(), &db, |_| {});
+    let root = first.admin("Root").await;
+    let store = || RevisionStore::open(&server::library_path(data_dir.path())).unwrap();
+    let old = create_site(&first, &root, "Old").await;
+    let untouched = create_site(&first, &root, "Untouched").await;
+    let recorded = create_site(&first, &root, "Recorded").await;
+    // Made before site records: no record in Git.
+    let author = Author {
+        id: "test".into(),
+        name: "Test".into(),
+    };
+    let removed = [node(&old).0, node(&untouched).0];
+    let mut change = SitesChange::new(&author, "Remove the records");
+    change.removed_sites = &removed;
+    store().write_sites(&change).unwrap();
+    // Their rows as migration 0013 made them.
+    sqlx::query("update sites set template = null where id = any($1)")
+        .bind(&removed[..])
+        .execute(db.db.test_pool())
+        .await
+        .unwrap();
+
+    let (status, body) = call(
+        &first,
+        &root,
+        Method::PUT,
+        "/api/settings/regional",
+        Some(json!({ "default_language": "fr-CA", "default_time_zone": "America/Toronto" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // The sites with no record read as the new defaults at once; the one with a record keeps
+    // its own.
+    for id in [&old, &untouched] {
+        let (status, body) = show(&first, &root, id).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            (&body["language"], &body["time_zone"]),
+            (&json!("fr-CA"), &json!("America/Toronto"))
+        );
+    }
+    let (_, body) = show(&first, &root, &recorded).await;
+    assert_eq!(
+        (&body["language"], &body["time_zone"]),
+        (&json!("en"), &json!("UTC"))
+    );
+    assert!(store().read_site_record(node(&old).0).unwrap().is_none());
+
+    // A change starts from what the owner saw.
+    let (status, body) = patch(&first, &root, &old, json!({ "language": "de" })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let changed = events(&first, "site.changed").await;
+    assert_eq!(changed.len(), 1, "no repaired events: {changed:?}");
+    assert_eq!(
+        changed[0]["fields"],
+        json!({ "language": { "from": "fr-CA", "to": "de" } })
+    );
+    let record = store().read_site_record(node(&old).0).unwrap().unwrap();
+    assert_eq!(
+        (record.language.as_str(), record.time_zone.as_str()),
+        ("de", "America/Toronto")
+    );
+    first.stop();
+
+    // A restart finds nothing to repair.
+    let second = StoppableServer::start(data_dir.path(), &db, |_| {});
+    let rita = second.admin("Rita").await;
+    let changed = events(&second, "site.changed").await;
+    assert_eq!(changed.len(), 1, "nothing repaired: {changed:?}");
+    let (_, body) = show(&second, &rita, &untouched).await;
+    assert_eq!(
+        (&body["language"], &body["time_zone"]),
+        (&json!("fr-CA"), &json!("America/Toronto"))
+    );
+    let (_, body) = show(&second, &rita, &old).await;
+    assert_eq!(
+        (&body["language"], &body["time_zone"]),
+        (&json!("de"), &json!("America/Toronto"))
+    );
+}

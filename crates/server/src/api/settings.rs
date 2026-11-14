@@ -9,6 +9,7 @@ use records::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::atomic::Ordering;
 
 use super::{ApiError, JsonBody};
 use crate::AppState;
@@ -148,7 +149,8 @@ pub(crate) struct RegionalChange {
 /// `PUT /api/settings/regional {default_language?, default_time_zone?}`: changes the defaults
 /// given, for administrators (`403` otherwise); `422 invalid_language` or `invalid_time_zone`
 /// for a value that is not one, `invalid_request` for none given. Answers the defaults as they
-/// then are. Sites with a record keep their own settings.
+/// then are. Sites with a record keep their own settings; sites with none follow the new
+/// defaults at once.
 pub(crate) async fn change_regional(
     State(state): State<AppState>,
     signed: Signed,
@@ -177,8 +179,14 @@ pub(crate) async fn change_regional(
     }
     let db = state.db();
     let actor = signed.session.user.id;
+    // Under the tree lock, so that no site record is written while the sites with none are
+    // brought to the new defaults (they read as the organisation's current defaults).
+    let _turn = state.tree_lock().lock().await;
     for (key, value) in changes {
         db.set_setting(actor, key, Value::String(value)).await?;
+    }
+    if !crate::sites::follow_defaults(&state).await {
+        state.tree_out_of_step().store(true, Ordering::SeqCst);
     }
     let defaults = db
         .regional_defaults()
