@@ -100,7 +100,7 @@ fn manages(access: Option<&Access>) -> bool {
 /// each with its kind, description, the hub it joined (only if the caller can see that hub)
 /// and whether it is a hub. An archived site is listed, marked, only to people who manage it.
 /// `q` keeps the sites whose name contains it, ignoring case; `hub` those that joined that
-/// hub; `kind` those of that kind (`422 invalid_request` for another kind or a hub that is
+/// hub (none at all when the caller cannot see the hub); `kind` those of that kind (`422 invalid_request` for another kind or a hub that is
 /// not an id).
 pub(crate) async fn list(
     State(state): State<AppState>,
@@ -129,6 +129,10 @@ pub(crate) async fn list(
         .iter()
         .map(|(node, _, _)| (node.id, node.name.clone()))
         .collect();
+    // A hub the caller cannot see is not confirmed by listing the sites that joined it.
+    if hub.is_some_and(|hub| !names.contains_key(&hub)) {
+        return Ok(Json(Vec::new()));
+    }
     Ok(Json(
         sites
             .into_iter()

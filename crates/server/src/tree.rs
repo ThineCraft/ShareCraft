@@ -15,8 +15,8 @@ use std::sync::atomic::Ordering;
 use collab_core::ids::{DocId, NodeId, UserId};
 use records::{
     Access, AccessError, BinStage, ClaimId, Db, DbError, Document, Editor, NewEvent, Node,
-    NodeChange, NodeKind, NodeRow, NodesApplied, Perms, QuotaError, Reservation, User,
-    validate_document_name, validate_node_name,
+    NodeChange, NodeKind, NodeRow, NodesApplied, Perms, QuotaError, Reservation, SiteSettings,
+    User, validate_document_name, validate_node_name,
 };
 use revisions::{
     Author, BlobRef, Checkpoint, CheckpointError, Content, GitError, SiteRecord, SitesChange,
@@ -199,6 +199,8 @@ struct Plan {
     sites: Vec<SiteRecord>,
     /// Sites whose record the take-back removes: a new site's.
     undo_removed_sites: Vec<Uuid>,
+    /// The `sites` rows of `sites`, mirrored with exactly the records' values.
+    new_sites: Vec<SiteSettings>,
     needs_admin: bool,
     needs: Vec<(NodeId, Perms)>,
     /// A new site: its creator becomes a member of its Owners group.
@@ -255,6 +257,7 @@ impl Default for Plan {
             undo: Vec::new(),
             sites: Vec::new(),
             undo_removed_sites: Vec::new(),
+            new_sites: Vec::new(),
             needs_admin: false,
             needs: Vec::new(),
             site_groups: false,
@@ -766,7 +769,8 @@ pub async fn adopt_flat_documents(
 }
 
 /// Refuses tree changes while the tree is out of step, unless the take-backs that could not be
-/// written now are, and a reconcile of the whole tree then succeeds.
+/// written now are, and a reconcile of the whole tree, then of the site records (see
+/// [`crate::sites::reconcile`]; skipped for a store that keeps none), then succeeds.
 pub(crate) async fn ensure_in_step(state: &AppState) -> Result<(), AccessError> {
     let flag = state.tree_out_of_step();
     if !flag.load(Ordering::SeqCst) {
@@ -776,19 +780,30 @@ pub(crate) async fn ensure_in_step(state: &AppState) -> Result<(), AccessError> 
         return Err(AccessError::OutOfStep);
     }
     match reconcile(Arc::clone(state.checkpointer()), state.db()).await {
-        Ok(report) if report.failed.is_empty() => {
-            flag.store(false, Ordering::SeqCst);
-            Ok(())
-        }
+        Ok(report) if report.failed.is_empty() => {}
         Ok(report) => {
             eprintln!("sharecraft-server: the content tree is still out of step: {report}");
-            Err(AccessError::OutOfStep)
+            return Err(AccessError::OutOfStep);
         }
         Err(e) => {
             eprintln!("sharecraft-server: the content tree is still out of step: {e}");
-            Err(AccessError::OutOfStep)
+            return Err(AccessError::OutOfStep);
         }
     }
+    match crate::sites::reconcile(Arc::clone(state.checkpointer()), state.db()).await {
+        Ok(report) if report.failed.is_empty() => {}
+        Err(TreeError::Git(CheckpointError::Unsupported)) => {}
+        Ok(report) => {
+            eprintln!("sharecraft-server: the site records are still out of step: {report}");
+            return Err(AccessError::OutOfStep);
+        }
+        Err(e) => {
+            eprintln!("sharecraft-server: the site records are still out of step: {e}");
+            return Err(AccessError::OutOfStep);
+        }
+    }
+    flag.store(false, Ordering::SeqCst);
+    Ok(())
 }
 
 /// Writes `plan` to Git, then mirrors it into PostgreSQL. If PostgreSQL refuses it (the
@@ -857,6 +872,7 @@ async fn commit(
             needs_below: plan.needs_below,
             as_if_live: plan.as_if_live,
             sites: &[],
+            new_sites: &plan.new_sites,
         })
         .await;
     match applied {
@@ -1161,6 +1177,7 @@ async fn plan_create(
             message: format!("Create site {name}"),
             records: vec![site, lib],
             undo,
+            new_sites: vec![crate::sites::settings_of(&site_record).map_err(DbError::new)?],
             sites: vec![site_record],
             undo_removed_sites: vec![id.0],
             needs_admin: true,

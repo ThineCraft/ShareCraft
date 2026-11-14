@@ -693,6 +693,16 @@ async fn directory_filters_by_name_kind_and_hub() {
         names(&directory(&server, &reader, format!("?hub={hub}")).await),
         ["Alpha team"]
     );
+    // A hub the reader cannot see lists nothing, though Beta, which they see, joined it.
+    assert!(
+        directory(&server, &reader, format!("?hub={hidden_hub}"))
+            .await
+            .is_empty()
+    );
+    assert_eq!(
+        names(&directory(&server, &root, format!("?hub={hidden_hub}")).await),
+        ["Beta news"]
+    );
 
     // An administrator, who manages every site, also sees the archived one, marked.
     let everything = directory(&server, &root, "?q=news".into()).await;
@@ -771,4 +781,68 @@ async fn owners_listed_without_hidden_groups() {
     let stranger = server.user("Stan").await;
     let (status, _) = show(&server, &stranger, &id).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn site_change_failing_after_judging_is_repaired_when_back_in_step() {
+    let server = spawn_server().await;
+    let root = server.admin("Root").await;
+    let id = create_site(&server, &root, "Team").await;
+    let other = create_site(&server, &root, "Other").await;
+    // PostgreSQL fails to write the description "Boom", after the change was judged allowed.
+    let pool = server.records_db().test_pool().clone();
+    sqlx::raw_sql(
+        "create function refuse_boom() returns trigger language plpgsql as $$ \
+         begin if new.description = 'Boom' then \
+         raise exception 'disk trouble'; end if; \
+         return new; end $$; \
+         create trigger refuse_boom before insert or update on sites \
+         for each row execute function refuse_boom();",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (status, body) = patch(&server, &root, &id, json!({ "description": "Boom" })).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    // Git holds the change; the repair failed too, so the row still differs.
+    let record = server
+        .store()
+        .read_site_record(node(&id).0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.description, "Boom");
+    let row = server
+        .records_db()
+        .site_settings(node(&id))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.description, "");
+    // PostgreSQL accepts it again.
+    sqlx::raw_sql("drop trigger refuse_boom on sites; drop function refuse_boom();")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // The next change, of another site, first brings the tree and the site rows back in step
+    // from Git.
+    let (status, body) = patch(&server, &root, &other, json!({ "time_zone": "Asia/Tokyo" })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["time_zone"], "Asia/Tokyo");
+    let row = server
+        .records_db()
+        .site_settings(node(&id))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (row.description.as_str(), row.time_zone.as_str()),
+        ("Boom", "UTC")
+    );
+    let repaired = events(&server, "site.changed").await;
+    assert!(
+        repaired.iter().any(|detail| detail["repaired"] == true),
+        "{repaired:?}"
+    );
 }

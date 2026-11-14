@@ -19,7 +19,7 @@ use crate::roles::lock_roles;
 use crate::scopes::{
     LOCK_ATTEMPTS, access_with, judged_roles, lock_segment_with, lock_top_down, scopes_of, segment,
 };
-use crate::sites::ensure_site_row;
+use crate::sites::{SiteSettings, ensure_site_row, upsert_site};
 use crate::{AccessError, Db, DbError, Editor, Perms};
 
 const MAX_NAME_CHARS: usize = 120;
@@ -194,6 +194,9 @@ pub struct NodeChange<'a> {
     /// Sites whose `sites` row the change writes: locked `FOR UPDATE`, by id, after the node
     /// rows and before the links, usage rows, groups and roles.
     pub sites: &'a [NodeId],
+    /// The `sites` rows of new sites among `rows`, written with exactly these values (rather
+    /// than the organisation's defaults as they are now), after the rows.
+    pub new_sites: &'a [SiteSettings],
 }
 
 /// Inserts or updates `row`, and for a document node the name of its `documents` row. A site
@@ -587,6 +590,9 @@ impl Db {
         // `judge` has locked every row written, in the one order, before any group or role.
         for row in change.rows {
             upsert_node(&mut tx, row).await?;
+        }
+        for site in change.new_sites {
+            upsert_site(&mut tx, site).await?;
         }
         // A person's move into a site without room is refused; Git's own changes are mirrored.
         apply_usage_changes(&mut tx, &locked.usage, change.actor.is_some()).await?;

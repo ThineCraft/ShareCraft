@@ -90,7 +90,7 @@ pub(crate) fn new_site_record(id: NodeId, defaults: &RegionalDefaults) -> SiteRe
 }
 
 /// A site record as PostgreSQL holds it.
-fn settings_of(record: &SiteRecord) -> Result<SiteSettings, String> {
+pub(crate) fn settings_of(record: &SiteRecord) -> Result<SiteSettings, String> {
     let kind = SiteKind::parse(&record.kind)
         .ok_or_else(|| format!("site {} has an unknown kind {:?}", record.id, record.kind))?;
     let archived_at = record

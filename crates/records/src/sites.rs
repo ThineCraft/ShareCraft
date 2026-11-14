@@ -354,7 +354,10 @@ pub(crate) async fn ensure_site_row(
 
 /// Writes `settings` into the site's row, which the caller has locked if it exists; `purging`
 /// is left as it is.
-async fn upsert_site(conn: &mut PgConnection, settings: &SiteSettings) -> Result<(), AccessError> {
+pub(crate) async fn upsert_site(
+    conn: &mut PgConnection,
+    settings: &SiteSettings,
+) -> Result<(), AccessError> {
     sqlx::query(
         "insert into sites (id, kind, description, language, time_zone, template, archived_at, \
              archived_by, is_hub, hub_navigation, joined_hub, navigation) \

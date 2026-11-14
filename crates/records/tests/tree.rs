@@ -248,3 +248,37 @@ fn validate_node_name_rules() {
         Ok("Q3 report (final).xlsx")
     );
 }
+
+/// A new site's `sites` row takes exactly the values its record in Git was written with, not
+/// the organisation's defaults as they are when the row is written: they may have changed in
+/// between.
+#[tokio::test]
+async fn new_site_row_takes_the_record_values() {
+    let test = TestDb::create().await;
+    let site = id();
+    let mut settings = records::SiteSettings::defaults(site, "de-CH", "Europe/Zurich");
+    settings.description = "From the record".into();
+    test.db
+        .apply_nodes(records::NodeChange {
+            rows: &[row(site, NodeKind::Site, None, site, "Team")],
+            new_sites: std::slice::from_ref(&settings),
+            ..records::NodeChange::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(test.db.regional_defaults().await.unwrap().language, "en");
+    let stored = test.db.site_settings(site).await.unwrap().unwrap();
+    assert_eq!(stored, settings);
+
+    // A site applied without values gets the organisation's defaults.
+    let other = id();
+    test.db
+        .apply_node(&row(other, NodeKind::Site, None, other, "Other"), None)
+        .await
+        .unwrap();
+    let stored = test.db.site_settings(other).await.unwrap().unwrap();
+    assert_eq!(
+        (stored.language.as_str(), stored.time_zone.as_str()),
+        ("en", "UTC")
+    );
+}
