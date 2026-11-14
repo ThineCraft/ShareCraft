@@ -1,0 +1,326 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ShareCraft — Libraries: Implementation Plan</title>
+<style>
+:root{color-scheme:light dark;--ink:light-dark(#172f38,#e4ecef);--muted:light-dark(#536b72,#a9b9bf);--line:light-dark(#d7e2e3,#36454b);--paper:light-dark(#fff,#1d272b);--wash:light-dark(#f2f6f5,#141b1e);--accent:light-dark(#3156c9,#9db4ff);font:15px/1.6 Segoe UI,system-ui,sans-serif;color:var(--ink);background:var(--wash)}
+*{box-sizing:border-box}body{margin:0;padding:28px 18px 80px}main{max-width:940px;margin:auto}
+h1{font-size:1.9rem;letter-spacing:-.03em;line-height:1.2;margin:0 0 14px}h2{font-size:1.3rem;margin:38px 0 12px;padding-top:18px;border-top:1px solid var(--line)}h3{font-size:1.08rem;margin:30px 0 8px}h4{font-size:.95rem;margin:16px 0 6px}
+p{margin:0 0 12px}ul,ol{margin:0 0 12px;padding-left:22px}li{margin-bottom:6px}a{color:var(--accent)}
+code{font-family:Consolas,Menlo,monospace;font-size:.88em;background:light-dark(#e9efee,#263238);padding:1px 5px;border-radius:3px;overflow-wrap:anywhere}
+pre{background:var(--paper);border:1px solid var(--line);border-radius:7px;padding:12px 14px;overflow-x:auto;font:13px/1.5 Consolas,Menlo,monospace;margin:0 0 12px}pre code{background:none;padding:0;font-size:inherit}
+.note{border-left:4px solid var(--accent);background:var(--paper);padding:12px 16px;margin:0 0 14px}.note p:last-child{margin:0}
+.task{background:var(--paper);border:1px solid var(--line);border-radius:9px;padding:6px 20px 14px;margin:18px 0}
+ol.steps{list-style:none;padding-left:0}ol.steps>li{padding-left:28px;position:relative;margin-bottom:10px}ol.steps>li::before{content:"☐";position:absolute;left:2px;color:var(--muted)}
+table{border-collapse:collapse;width:100%;font-size:.9rem;background:var(--paper);margin-bottom:14px}th,td{border:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top}th{background:light-dark(#e8efed,#263238)}
+.small{font-size:.88rem;color:var(--muted)}
+tbody tr:nth-child(even) td{background:light-dark(#f4f8f7,#212b30)}
+ol.steps>li:nth-child(even),ul.band>li:nth-child(even),ol.band>li:nth-child(even){background:light-dark(#f4f8f7,#212b30);border-radius:4px}
+</style>
+</head>
+<body><main>
+<h1>Libraries: kinds, any file type, malware scanning, previews and file policies: implementation plan</h1>
+<p class="small">ShareCraft &middot; Stage 2, platform plan 3C &middot; Written 14 November 2026</p>
+<div class="note"><p><strong>For agentic workers:</strong> REQUIRED SUB-SKILL: use superpowers:subagent-driven-development or superpowers:executing-plans. Steps are checkboxes.</p></div>
+
+<p><strong>Goal:</strong> libraries at SharePoint's level for everyday files:
+<ul>
+<li>A library holds files of any type, not only the editors' four. Each new file is checked by the organisation's own malware scanner before anyone can open it, and infected files are quarantined.</li>
+<li>Files that a browser can show safely get a preview, and image libraries show thumbnails.</li>
+<li>A library is a document, image, template or asset library, and has settings: folders on or off, the file types it accepts, and the largest file it takes. Template libraries give the site its "New from template" choices.</li>
+<li>Administrators can block file types for the whole organisation.</li>
+</ul></p>
+<p><strong>Architecture:</strong>
+<ul>
+<li><strong>Library records:</strong> each library gets a second Git record, <code>libraries/&lt;xx&gt;/&lt;id&gt;.json</code>, beside its tree record. It holds the library's kind and settings and is mirrored into PostgreSQL as site records are (plan 3B: one commit per change, mirrored after it, taken back when refused, compared at every start).</li>
+<li><strong>Files without an editor:</strong> a file that no editor opens is a document with the new editor value <code>other</code>. It has versions, a recycle bin entry, sharing and quotas like any file, and opens as a preview or a download.</li>
+<li><strong>Scanning:</strong> the result belongs to the content, not the document. The <code>blobs</code> row records it, so the same bytes are scanned once. A scan worker sends each new upload to the scanner over ICAP. Until the content is clean, every route that would hand out its bytes refuses.</li>
+<li><strong>Previews:</strong> they come from a separate route that serves only a short list of safe types, with the same sandboxing as downloads. Thumbnails are made on the server, are kept beside the content store and are erased with it.</li>
+</ul></p>
+<p><strong>Tech stack:</strong> the existing workspace, plus the <code>image</code> crate (MIT or Apache 2.0), built with only its PNG, JPEG, GIF and WebP decoders and its PNG encoder, for thumbnails. The ICAP client is written in the server; it is small and has no dependency.</p>
+<p><strong>Spec:</strong> <a href="../scope.html">scope.html</a> SC-02 (document, asset, image and template libraries; optional folder-free organisation; new-from-template; preview and unsupported previews; malware quarantine; library settings, upload validation and configurable file policies), SC-21, D28, D30 (a pluggable external scanner the organisation runs), D36 (any file type arrives in 3C with scanning). Plans 1 to 3B are the base. Owner decisions of 14 November 2026: the scanner is reached over ICAP; a new file is held until the scanner says it is clean (with no scanner configured, files are available at once; if the scanner is down files wait, unless an administrator lets them through); previews are what a browser can show safely, plus thumbnails made on the server for image libraries; the four kinds are as proposed (document as today; image: thumbnail grid and image-only uploads; template: its files are the site's "New from template" choices; asset: a library administrators mark for logos and brand images, used by branding in plan 4).</p>
+
+<h2>Proposals in this plan for the owner to check</h2>
+<p>These are choices the plan makes that the owner's answers did not settle. Approving the plan approves them; any can be changed before building.</p>
+<ol class="band">
+<li><strong>Saves from the editors are scanned afterwards, not held.</strong> Holding them would stop people reopening a spreadsheet they have just saved. An infected save is quarantined as soon as the scanner reports it. Uploads, new-version uploads and "New from template" copies are held until clean.</li>
+<li><strong>Only administrators release or delete quarantined files.</strong> Site owners and the uploader see that a file is quarantined, and why, but cannot release it. A released file is marked clean for that content, and the release is recorded with the person and the reason.</li>
+<li><strong>Files that existed before the upgrade are not scanned automatically.</strong> They were all files from the four editors, so they stay available and are marked "not scanned". An administrator can press "Scan existing files" to queue them.</li>
+<li><strong>No file type is blocked by default,</strong> as in SharePoint today. Administrators can add types to an organisation block list, and a library can narrow what it accepts further.</li>
+<li><strong>SVG images are shown only as images.</strong> They appear through an <code>&lt;img&gt;</code> element, which runs no script, and get no thumbnail. Text previews show at most the first 1 MiB. Files over the scanner's size limit wait for an administrator, unless an administrator lets large files through.</li>
+</ol>
+
+<h2>Not in this plan</h2>
+<ul class="band">
+<li>Document sets, metadata panels and missing-information views (Stage 3, with columns and content types).</li>
+<li>Previews converted on the server (other office formats, video thumbnails), and editing images.</li>
+<li>Branding that uses asset libraries (plan 4).</li>
+<li>Scanners other than ICAP; scanning the bytes stored before the upgrade without an administrator asking; re-scanning on a schedule when signatures change.</li>
+<li>A tool that moves pre-3A bytes out of Git history (later work, see BUILDING section 25).</li>
+</ul>
+
+<h2>Global constraints</h2>
+<ul class="band">
+<li><strong>Library record in Git:</strong> <code>libraries/&lt;first two hex digits&gt;/&lt;library id&gt;.json</code>, two-space indent, one line per field, in this order:
+<pre>{"schema": 1, "id", "kind": "document"|"image"|"template"|"asset",
+ "description": 0–500 characters,
+ "folders": true|false,
+ "allowed_types": [extension] or null,
+ "blocked_types": [extension],
+ "max_file_bytes": number or null}</pre>
+<ul>
+<li>An extension is written lower case with its leading dot (<code>".png"</code>, <code>".tar.gz"</code>). Lists hold at most 100 extensions, each 2&ndash;20 characters of letters, digits and dots.</li>
+<li>A library made before this plan has no file. It is read as <code>document</code>, empty description, folders on, all types allowed, nothing blocked and no limit; its file is written at its first change.</li>
+<li>The commit moves <code>refs/sharecraft/sites</code>, as site records do.</li>
+<li>Site templates (plan 3B) carry each library's kind and settings. A package with none is read as document libraries with the defaults.</li>
+</ul></li>
+<li><strong>Kinds:</strong>
+<ul>
+<li><strong>image:</strong> accepts only <code>.png .jpg .jpeg .gif .webp .svg .avif .bmp .tif .tiff .heic</code>. A library's <code>allowed_types</code> may narrow this list further but never widen it.</li>
+<li><strong>template:</strong> its live files, those the person can view, are the "New from template" choices in every library of its site.</li>
+<li><strong>asset:</strong> only administrators set this kind, or change a library away from it. Asset libraries are listed at <code>GET /api/assets</code> to people who can view them.</li>
+<li><strong>Changing kind</strong> never touches files already in the library. A file that the new settings would refuse stays, and is shown with a mark.</li>
+</ul></li>
+<li><strong>Folders off:</strong> new folders, and moves or copies of a folder into the library, answer <code>409 folders_off</code>. Existing folders stay and can be emptied, deleted and restored.</li>
+<li><strong>Any file type:</strong> <code>Editor::Other</code>, id <code>"other"</code>, for any name that no editor's native extension ends. It is added to the migration's check constraint, and <code>is_file()</code> is true for it. Rename rules:
+<ul>
+<li>An editor's file keeps its extension, as today.</li>
+<li>An <code>other</code> file may take any extension except an editor's native one, which answers <code>wrong_extension</code>.</li>
+<li>Every new name is checked against the file policies.</li>
+</ul>
+New versions of an <code>other</code> file come through upload sessions, as for editors' files.</li>
+<li><strong>File policies:</strong> a name is refused with <code>422 blocked_file_type {"extension"}</code> when:
+<ul>
+<li>its extension is in the organisation's <code>blocked_file_types</code> setting (a list, empty by default, set by administrators), or</li>
+<li>it is not allowed by its library (<code>allowed_types</code>, <code>blocked_types</code>, or the image list).</li>
+</ul>
+A size over the library's <code>max_file_bytes</code> answers <code>413 file_too_large {"limit"}</code>. Both are checked when an upload session starts, and again at finish, at a copy or move into the library, and at a rename. A file's extension is the longest suffix that is in the list being checked, matched without regard to case (so <code>.tar.gz</code> matches before <code>.gz</code>).</li>
+<li><strong>Scan states</strong> (column <code>blobs.scan</code>):
+<ul>
+<li><code>pending</code>: waiting for the scanner.</li>
+<li><code>clean</code>.</li>
+<li><code>infected</code>: with <code>scan_detail</code> (the scanner's threat name, at most 200 characters).</li>
+<li><code>failed</code>: scanner error, retried.</li>
+<li><code>too_large</code>: over the scanner limit.</li>
+<li><code>unscanned</code>: content stored before the upgrade, or stored while no scanner was configured.</li>
+<li><code>released</code>: an administrator let infected or held content through.</li>
+</ul>
+New content is <code>pending</code> when a scanner is configured and <code>unscanned</code> when not.
+<p>Content is <strong>available</strong> when it is clean, released or unscanned; when it is failed or too_large and the matching setting lets it through; or when it is pending and came from an editor's save.</p>
+<p>Every route that hands out bytes answers <code>423 held {"scan"}</code> for content that is not available: content download, ranged download, preview, thumbnail, anyone-link download, opening in an editor, copy, new-from-template, and the text room loading a revision. Listing, renaming, moving, deleting and sharing still work.</p></li>
+<li><strong>Quarantine:</strong> a document whose current version is infected is quarantined. Every person who can see it sees the mark and the threat name. Only administrators see the organisation's quarantine list (<code>GET /api/admin/quarantine</code>), and they release it (<code>POST /api/admin/quarantine/{sha256}/release {reason}</code>, at least 3 characters) or delete it (<code>POST /api/admin/quarantine/{sha256}/delete</code>). Delete purges every document whose current version names that content, skipping the bin, and erases the content once nothing names it.</li>
+<li><strong>ICAP:</strong>
+<ul>
+<li>Settings: <code>scanner_url</code> (<code>icap://host[:port]/service</code>, default port 1344; empty means no scanner), <code>scanner_timeout_seconds</code> (default 120, 5&ndash;3600), <code>scanner_max_bytes</code> (default 2 GiB), <code>scanner_unavailable</code> (<code>"hold"</code> default, or <code>"allow"</code>) and <code>scanner_too_large</code> (<code>"hold"</code> default, or <code>"allow"</code>). Administrators set them.</li>
+<li>A scan sends <code>RESPMOD</code> with the file as a chunked HTTP response body, streaming from the content store, never whole in memory. It honours <code>Preview</code> and <code>100 Continue</code> when the server's <code>OPTIONS</code> asks for them.</li>
+<li><code>204</code>, or <code>200</code> with no infection header, means clean. <code>200</code>/<code>403</code> with <code>X-Infection-Found</code>, <code>X-Violations-Found</code> or <code>X-Virus-ID</code> means infected. Anything else, a timeout or a refused connection means failed.</li>
+<li>Failed content is retried after 1, 5, 15 and then every 60 minutes.</li>
+<li>The worker runs at most 2 scans at once. Each scan records <code>content.scanned {"sha256", "result", "detail"}</code>.</li>
+</ul></li>
+<li><strong>Previews:</strong> <code>GET /api/docs/{id}/preview</code> (view needed; content available), with the download's headers except <code>Content-Disposition: inline</code> and a fixed safe <code>Content-Type</code> chosen by extension:
+<table><tr><th>Kind</th><th>Types</th></tr>
+<tr><td>Images</td><td>png, jpeg, gif, webp, avif, bmp, svg (<code>image/svg+xml</code>, with the CSP <code>sandbox</code> header that every answer carries)</td></tr>
+<tr><td>Audio</td><td>mp3, ogg, wav, m4a, flac</td></tr>
+<tr><td>Video</td><td>mp4, webm, mov, served as <code>video/mp4</code> for <code>.mov</code></td></tr>
+<tr><td>Text</td><td><code>text/plain; charset=utf-8</code>, the first 1 MiB, for <code>.txt .md .csv .tsv .log .json .xml .yaml .yml .toml .ini .rs .js .ts .py .java .c .h .cpp .cs .go .rb .php .sh .ps1 .sql .css .html .htm</code>, and only if valid UTF-8</td></tr></table>
+Every other type answers <code>415 no_preview</code>. PDF previews open in PdfCraft as today. HTML is only ever previewed as text.</li>
+<li><strong>Thumbnails:</strong> <code>GET /api/docs/{id}/thumbnail</code> answers a PNG at most 256 pixels on its longer side, made from png, jpeg, gif (first frame) and webp.
+<ul>
+<li><strong>Making one:</strong> it is made the first time it is asked for. A decode limit of 12,000 &times; 12,000 pixels and 256 MiB guards against oversized images. At most 2 are made at once, each in <code>spawn_blocking</code>.</li>
+<li><strong>Storing it:</strong> it is kept at <code>&lt;data&gt;/thumbs/&lt;xx&gt;/&lt;sha256&gt;.png</code>. Erasing a blob erases its thumbnail.</li>
+<li><strong>When there is none:</strong> other types, and images that fail to decode, answer <code>415 no_thumbnail</code>.</li>
+</ul></li>
+<li><strong>New from template:</strong> <code>GET /api/libraries/{id}/templates</code> lists the template files of the library's site that the person can view: files whose content is available, in every template library of the site. <code>POST /api/libraries/{id}/from-template {template, parent?, name?}</code> copies one into the library, or into folder <code>parent</code>, through the existing copy path. That path brings the quota, name cleaning, policies and <code>add</code> checks. The copy starts as the template's latest version, with no history.</li>
+<li><strong>Locking order</strong> (unchanged from 3B, with library rows after site rows): node rows top-down, then <code>sites</code> rows by id, then <code>libraries</code> rows by id, then link rows, then <code>site_usage</code>, then groups by id, then roles by id. The <code>blobs</code> row for a scan result is locked in its own short transaction, never while holding the others (as 3A).</li>
+<li><strong>Events:</strong> <code>library.changed</code> (fields changed, with old and new values), <code>content.scanned</code>, <code>content.released</code> (who, reason), <code>content.deleted</code> (who, how many documents), <code>setting.changed</code> for the new settings.</li>
+<li><strong>Errors</strong> (each with a plain-English message in <code>common.js</code>): <code>blocked_file_type</code> 422, <code>file_too_large</code> 413, <code>folders_off</code> 409, <code>held</code> 423, <code>no_preview</code> 415, <code>no_thumbnail</code> 415, <code>invalid_library_settings</code> 422 (with <code>{"reason"}</code>), <code>invalid_scanner_url</code> 422.</li>
+</ul>
+
+<h2>Review focus</h2>
+<ol class="band">
+<li><strong>No route hands out the bytes of held or infected content.</strong> That includes ranged downloads, anyone links, previews, thumbnails, opening in an editor, copies and new-from-template, the text room, and a version history download of an older version whose content is infected. (Task 3, <code>held_content_is_never_served</code>, a table of every byte-serving route.)</li>
+<li><strong>A preview or download of a file that contains a web page or script never runs it.</strong> This covers an <code>.html</code> file, an <code>.svg</code> with a script, a <code>.png</code> that is really HTML, and a name with quotes or line breaks in the <code>Content-Disposition</code>. (Task 4, <code>previews_never_run_content</code>.)</li>
+<li><strong>A hostile image cannot exhaust the server.</strong> This covers a decompression bomb, a 50,000-pixel-wide PNG, a truncated JPEG and a GIF with 10,000 frames. Each answers <code>no_thumbnail</code> quickly and the server keeps serving. (Task 4, <code>hostile_images_refused_quickly</code>.)</li>
+<li><strong>Scanner trouble never loses a file or lets one through by accident.</strong> This covers a scanner that refuses the connection, times out halfway, answers garbage or restarts during a scan: the content stays held and is retried, and only <code>scanner_unavailable: allow</code> lets it through. The same bytes uploaded twice are scanned once. (Task 3, <code>scanner_failures_hold_and_retry</code>, <code>same_content_scanned_once</code>.)</li>
+<li><strong>Policies hold on every path into a library:</strong> upload session start and finish, single-request upload, copy, move, bulk, rename, restore from the bin (a restored file whose type is now blocked is restored but marked), and new-from-template. (Task 2, <code>policies_hold_on_every_path</code>.)</li>
+</ol>
+
+<div class="task">
+<h3>Task 1: library records, kinds and settings</h3>
+<p><strong>Files:</strong>
+<ul>
+<li><strong>Create:</strong> <code>crates/records/migrations/0014_libraries.sql</code>, <code>crates/records/src/libraries.rs</code>, <code>crates/revisions/src/libraries.rs</code>, <code>crates/server/src/libraries.rs</code> (apply, reconcile), <code>crates/server/src/api/libraries.rs</code>, <code>crates/server/tests/libraries.rs</code>.</li>
+<li><strong>Modify:</strong> <code>crates/server/src/tree.rs</code> (creating a library writes its record in the same commit; <code>folders_off</code>), <code>crates/server/src/sites.rs</code> (reconcile order), <code>crates/server/src/templates.rs</code> (templates and packages carry library kind and settings), <code>crates/server/src/api/mod.rs</code>, <code>crates/server/src/lib.rs</code>.</li>
+</ul></p>
+<ul class="band">
+<li><strong>Data:</strong> table <code>libraries (id uuid pk references nodes, kind, description, folders boolean, allowed_types text[] null, blocked_types text[], max_file_bytes bigint null)</code>, filled with the defaults for existing libraries. <code>revisions::LibraryRecord</code>. <code>records</code> gains <code>Db::library_settings(id)</code>, <code>validate_library_settings(&amp;LibraryRecord, admin: bool)</code> and <code>Db::apply_library_change(...)</code>.</li>
+<li><strong>Routes:</strong>
+<ul>
+<li><code>GET /api/libraries/{id}</code> (view): the record, plus the effective allowed list for image libraries.</li>
+<li><code>PATCH /api/libraries/{id} {description?, kind?, folders?, allowed_types?, blocked_types?, max_file_bytes?}</code> (<code>manage_site</code>; kind <code>asset</code>, or a change away from it, needs an administrator): one commit, <code>library.changed</code>, <code>403 archived</code> on an archived site.</li>
+<li><code>POST /api/sites/{id}/libraries {name, kind?}</code> creates a library of that kind (the existing new-library path, now with a kind).</li>
+<li><code>GET /api/assets</code>: asset libraries the person can view.</li>
+</ul></li>
+</ul>
+<ol class="steps">
+<li>Write failing tests: <code>library_record_round_trip_exact_bytes</code>, <code>old_library_reads_defaults_and_writes_on_first_change</code>, <code>new_library_writes_both_records_in_one_commit</code>, <code>settings_need_manage_site_and_asset_needs_admin</code>, <code>bad_settings_refused</code> (each limit, a malformed extension, an image library widening its list), <code>folders_off_refuses_new_folders_and_folder_moves</code>, <code>reconcile_rebuilds_libraries_from_git</code>, <code>library_change_refused_by_database_is_taken_back</code>, <code>templates_carry_library_kinds</code>, <code>assets_listed_only_where_visible</code>, <code>archived_site_refuses_library_changes</code> (and the new route added to the archive table).</li>
+<li>Run: fails. Implement. Run <code>cargo xtask check</code>: passes.</li>
+<li>Commit <code>feat: library records with kinds, folders and file settings</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 2: any file type and file policies</h3>
+<p><strong>Files:</strong>
+<ul>
+<li><strong>Create:</strong> <code>crates/records/src/policies.rs</code>, <code>crates/server/tests/policies.rs</code>.</li>
+<li><strong>Modify:</strong> <code>crates/records/src/documents.rs</code> (<code>Editor::Other</code>), migration 0014 (editor check constraint), <code>crates/records/src/settings.rs</code> (<code>blocked_file_types</code>), <code>crates/server/src/api/uploads.rs</code>, <code>api/content.rs</code>, <code>api/docs.rs</code>, <code>api/nodes.rs</code>, <code>api/bulk.rs</code>, <code>crates/server/src/tree.rs</code> (copy, move, rename, restore), <code>crates/server/src/api/settings.rs</code>.</li>
+</ul></p>
+<ul class="band">
+<li><code>records::policies::check_name(name, &amp;LibrarySettings, &amp;OrgPolicy) -&gt; Result&lt;(), PolicyError&gt;</code> and <code>check_size(bytes, &amp;LibrarySettings)</code>, called on every path in Review focus 5.</li>
+<li><code>Editor::for_file_name</code> still names an editor for its native extensions. Every other name becomes <code>Editor::Other</code>.</li>
+<li>The organisation block list is set through <code>GET/PUT /api/settings/files {blocked_file_types}</code> (administrators).</li>
+<li>Opening an <code>other</code> file returns the document with <code>editor: "other"</code>. The page decides between preview and download (Task 6).</li>
+<li>A restored file whose type is now refused is restored, and carries <code>"policy": "blocked"</code> in its listings.</li>
+</ul>
+<ol class="steps">
+<li>Write failing tests: <code>any_file_type_uploads_as_other</code> (a <code>.zip</code>, a <code>.png</code>, a name with no extension), <code>editor_types_still_open_in_their_editor</code>, <code>other_files_rename_but_never_to_an_editor_extension</code>, <code>new_versions_of_other_files_through_sessions</code>, <code>policies_hold_on_every_path</code>, <code>longest_extension_matches_first</code>, <code>org_block_list_is_for_administrators</code>, <code>restored_blocked_file_is_marked</code>.</li>
+<li>Run: fails. Implement. Run <code>cargo xtask check</code>: passes.</li>
+<li>Commit <code>feat: any file type, organisation and library file policies</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 3: malware scanning over ICAP and quarantine</h3>
+<p><strong>Files:</strong>
+<ul>
+<li><strong>Create:</strong> <code>crates/server/src/icap.rs</code> (the client), <code>crates/server/src/scan.rs</code> (worker, queue, retry), <code>crates/server/src/api/quarantine.rs</code>, <code>crates/records/src/scans.rs</code>, <code>crates/server/tests/scan.rs</code>, <code>xtask/src/fake_icap.rs</code>.</li>
+<li><strong>Modify:</strong> migration 0014 (<code>blobs.scan</code>, <code>scan_detail</code>, <code>scanned_at</code>, <code>scan_attempts</code>, <code>next_scan_at</code>; existing rows <code>unscanned</code>), <code>crates/server/src/blobs.rs</code>, every byte-serving route (<code>api/content.rs</code>, <code>links.rs</code>, <code>api/docs.rs</code> open, <code>room.rs</code> load, <code>tree.rs</code> copy), <code>crates/records/src/settings.rs</code> (scanner settings), <code>crates/server/src/lib.rs</code> (start the worker), <code>xtask/src/main.rs</code>.</li>
+</ul></p>
+<ul class="band">
+<li><code>icap::Client::scan(&amp;self, reader: impl AsyncRead, size: u64, name: &amp;str) -&gt; Result&lt;Verdict, IcapError&gt;</code>, with <code>Verdict::{Clean, Infected(String)}</code>. <code>icap::Client::options()</code> reads <code>Preview</code>, <code>Max-Connections</code> and <code>ISTag</code>.</li>
+<li><code>records</code>: <code>Db::scan_state(sha) -&gt; ScanState</code>, <code>Db::is_available(sha, origin) -&gt; bool</code>, <code>Db::record_scan(sha, result)</code>, <code>Db::due_scans(limit)</code>, <code>Db::release(sha, by, reason)</code>, and <code>Db::quarantine_list()</code> (content, threat, documents with their paths, which only administrators see).</li>
+<li><strong>Where new content comes from:</strong> each claim (3A's <code>claim_blob</code>) states its origin, <code>Upload</code> or <code>EditorSave</code>. Editor saves are never held, as the owner's proposal 1 says.</li>
+<li><strong>Admin routes:</strong>
+<ul>
+<li><code>GET/PUT /api/settings/scanner</code>. A PUT tests the scanner with <code>OPTIONS</code> and answers <code>{ok, server}</code>, or <code>invalid_scanner_url</code> / <code>{ok: false, error}</code>.</li>
+<li><code>POST /api/admin/scan-existing</code> queues all <code>unscanned</code> content.</li>
+<li>The quarantine routes in the global constraints.</li>
+</ul></li>
+<li><strong>Listings</strong> show <code>scan</code> on each file: <code>held</code>, <code>quarantined {threat}</code>, or absent when available.</li>
+<li><strong>The fake scanner:</strong> <code>cargo xtask fake-icap [--port 1344] [--slow] [--fail]</code> runs a small ICAP server for development and tests. It answers infected for content holding the EICAR test string, and clean for anything else.</li>
+</ul>
+<ol class="steps">
+<li>Write failing tests (against the fake ICAP server started in the test):
+<ul>
+<li><code>icap_clean_and_infected_verdicts</code></li>
+<li><code>icap_streams_without_holding_the_file</code> (a 200 MiB file, under 8 MiB held at once)</li>
+<li><code>icap_preview_and_continue</code></li>
+<li><code>held_content_is_never_served</code></li>
+<li><code>editor_saves_are_not_held_but_quarantined_when_infected</code></li>
+<li><code>scanner_failures_hold_and_retry</code> (refused, timeout halfway, garbage, restart)</li>
+<li><code>unavailable_allow_lets_files_through</code></li>
+<li><code>too_large_held_unless_allowed</code></li>
+<li><code>same_content_scanned_once</code></li>
+<li><code>no_scanner_means_unscanned_and_available</code></li>
+<li><code>existing_content_is_unscanned_until_asked</code></li>
+<li><code>release_and_delete_are_for_administrators</code></li>
+<li><code>quarantine_delete_purges_and_erases</code></li>
+<li><code>scan_events_recorded</code></li>
+</ul></li>
+<li>Run: fails. Implement. Run <code>cargo xtask check</code>: passes.</li>
+<li>Commit <code>feat: malware scanning over ICAP with quarantine</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 4: previews and thumbnails</h3>
+<p><strong>Files:</strong>
+<ul>
+<li><strong>Create:</strong> <code>crates/server/src/previews.rs</code>, <code>crates/server/tests/previews.rs</code>, with fixtures under <code>crates/server/tests/fixtures/images/</code> (generated in the test where possible).</li>
+<li><strong>Modify:</strong> <code>crates/server/Cargo.toml</code> (<code>image</code>, default features off, features png, jpeg, gif and webp), <code>crates/server/src/api/content.rs</code>, <code>crates/server/src/blobs.rs</code> (erasing a blob erases its thumbnail), <code>api/mod.rs</code>.</li>
+</ul></p>
+<ul class="band">
+<li><code>previews::preview_type(name) -&gt; Option&lt;PreviewType&gt;</code> and <code>previews::thumbnail(store, sha) -&gt; Result&lt;PathBuf, ThumbError&gt;</code>, with the limits in the global constraints.</li>
+<li><strong>Headers:</strong> preview answers carry <code>nosniff</code>, CSP <code>sandbox</code>, <code>Cache-Control: no-store</code>, and support ranges for audio and video. Thumbnails may be cached privately for 5 minutes (<code>private, max-age=300</code>) because they carry no more than the listing does.</li>
+<li><strong>Anyone links:</strong> their pages may show previews through <code>GET /api/links/{token}/preview</code>, with the same rules.</li>
+</ul>
+<ol class="steps">
+<li>Write failing tests: <code>preview_types_and_headers</code>, <code>text_preview_first_mib_and_utf8_only</code>, <code>previews_never_run_content</code>, <code>media_previews_support_ranges</code>, <code>thumbnails_made_once_and_cached</code>, <code>hostile_images_refused_quickly</code>, <code>thumbnail_erased_with_its_blob</code>, <code>held_content_has_no_preview_or_thumbnail</code>, <code>anyone_link_preview</code>.</li>
+<li>Run: fails. Implement. Run <code>cargo xtask check</code>: passes.</li>
+<li>Commit <code>feat: safe previews and image thumbnails</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 5: template and image libraries on the server</h3>
+<p><strong>Files:</strong> modify <code>crates/server/src/api/libraries.rs</code>, <code>crates/server/src/tree.rs</code> (copy from a template) and <code>crates/server/src/api/nodes.rs</code> (children answer <code>thumbnail: true</code> for image files with available content); create <code>crates/server/tests/library_kinds.rs</code>.</p>
+<ul class="band">
+<li>The template routes in the global constraints.</li>
+<li>Children listings of an image library may be asked for with <code>?view=grid</code>, which answers up to 200 per page with the same paging as today.</li>
+<li>Template files in a library of another kind are ignored. A template file the person cannot view is never listed.</li>
+</ul>
+<ol class="steps">
+<li>Write failing tests: <code>templates_listed_from_the_sites_template_libraries</code>, <code>new_from_template_copies_latest_version_only</code>, <code>new_from_template_obeys_quota_policies_and_add</code>, <code>held_templates_not_offered</code>, <code>templates_from_other_sites_never_offered</code>, <code>image_library_refuses_other_types</code>, <code>grid_listing_marks_thumbnails</code>.</li>
+<li>Run: fails. Implement. Run <code>cargo xtask check</code>: passes.</li>
+<li>Commit <code>feat: template and image libraries</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 6: pages</h3>
+<p><strong>Files:</strong>
+<ul>
+<li><strong>Create:</strong> <code>web/library-settings.html</code>/<code>library-settings.js</code>, <code>web/quarantine.html</code>/<code>quarantine.js</code>.</li>
+<li><strong>Modify:</strong> <code>web/library.html</code>/<code>library.js</code>, <code>web/file.html</code>/<code>file.js</code>, <code>web/site.html</code>/<code>site.js</code> (new library with a kind), <code>web/sharing.html</code>/<code>sharing.js</code> (organisation file block list, scanner settings and Test, Scan existing files), <code>web/link.js</code> (previews on anyone-link pages), <code>web/upload.js</code> (<code>blocked_file_type</code>, <code>file_too_large</code>, "being checked" after finishing), <code>web/common.js</code>, <code>web/common.test.mjs</code>, <code>web/style.css</code>.</li>
+</ul></p>
+<ul class="band">
+<li><strong>File page:</strong>
+<ul>
+<li>An editor's file opens in its editor, as today.</li>
+<li>Any other file shows its preview (image, audio, video or text), or "No preview for this type" with Download.</li>
+<li>A held file shows "Being checked for malware" and checks again every 10 seconds, at most 30 times.</li>
+<li>A quarantined file shows the threat name and "An administrator can release or delete it".</li>
+</ul></li>
+<li><strong>Library page:</strong>
+<ul>
+<li>Its kind is shown, and image libraries have a Grid / List switch (the grid uses thumbnails and is lazy-loaded).</li>
+<li>"New from template" lists the site's templates.</li>
+<li>Each row carries a held, quarantined or blocked mark.</li>
+<li>When folders are off, New folder is hidden.</li>
+<li>The upload panel explains a refused type or size.</li>
+</ul></li>
+<li><strong>Library settings</strong> (owners): description, kind (asset only for administrators), folders on or off, allowed and blocked types (a comma-separated field, normalised and shown back as a list), largest file in MB.</li>
+<li><strong>Quarantine</strong> (administrators): threat, content size, each document's path, Release (asks for a reason) and Delete (confirmation: "Delete every file holding this content? They skip the recycle bin and cannot be restored.").</li>
+<li><strong>Every page:</strong> 375 pixels, light and dark mode, alternating row shading on lists in both, names as text only. Confirmation dialogs resolve on the button click itself, not only on the dialog's <code>close</code> event (found in the 3B browser check).</li>
+</ul>
+<ol class="steps">
+<li>Write failing tests: <code>file_page_chooses_editor_preview_or_download</code>, <code>held_file_polls_then_stops</code>, <code>quarantine_text_names_the_threat_as_text</code>, <code>type_list_field_normalises</code>, <code>grid_switch_only_for_image_libraries</code>, <code>new_messages_for_new_error_codes</code>, <code>confirm_dialog_resolves_on_click</code>.</li>
+<li>Run <code>node --test web/*.test.mjs</code>: fails. Implement. Run it and <code>cargo xtask check</code>: pass.</li>
+<li>Commit <code>feat(web): library kinds and settings, previews, scanning and quarantine pages</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 7 (controller): browser check and documents</h3>
+<ol class="steps">
+<li>Back up the development database and the whole data folder. Build into <code>J:\cargo-target\sharecraft</code>, stopping the old server first; rebuild <code>web/pkg</code>; start the new server (migration 0014 runs); start <code>cargo xtask fake-icap</code> and point the scanner setting at it.</li>
+<li>In the browser, record each item as checked or not:
+<ul>
+<li>Upload a <code>.zip</code>, a <code>.png</code> and a <code>.txt</code>; each shows "Being checked" and then becomes available.</li>
+<li>Upload the EICAR test file: it is quarantined; release one copy and delete another as an administrator.</li>
+<li>Stop the fake scanner and upload: the file waits; start the scanner again and the file becomes available.</li>
+<li>Previews for an image, a text file, an HTML file shown as text, and an audio or video file.</li>
+<li>Make an image library: its grid shows thumbnails, and a <code>.zip</code> upload is refused.</li>
+<li>Make a template library with a <code>.docx</code>, then use "New from template" in another library.</li>
+<li>Turn folders off; block <code>.exe</code> for the organisation and try uploading one.</li>
+<li>Check pages at 375 pixels and in dark mode.</li>
+</ul></li>
+<li><strong>Documents:</strong>
+<ul>
+<li><code>BUILDING.html</code>: a new section 27, "Libraries: kinds, any file type, scanning, previews and policies". It covers the Git layout, the ICAP setup (including how to run ClamAV with c-icap, as a pointer only), scan states and what is held, quarantine, the preview types and their headers, thumbnails, policies, routes, events, errors, limits and the upgrade. Licences becomes section 28 and adds the <code>image</code> crate.</li>
+<li><code>sequencing.html</code>: updated.</li>
+<li><code>scope.html</code>: the owner decisions of 14 November 2026 for 3C, as D37 (ICAP and held until clean), D38 (previews and thumbnails), D39 (library kinds), with the approved proposals.</li>
+</ul>
+Commit <code>docs: libraries</code>.</li>
+</ol></div>
+</main></body>
+
+
+</html>
