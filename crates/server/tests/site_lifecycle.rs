@@ -955,6 +955,50 @@ async fn site_purge_keeps_blobs_other_sites_name() {
 }
 
 #[tokio::test]
+async fn refused_purge_leaves_site_restorable() {
+    let w = world().await;
+    let (status, _) = w.delete_site(&w.root, &w.site).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    // PostgreSQL refuses to mark the site's nodes purged, as a change refused in the judged
+    // transaction would be; the purge's commit is then taken back.
+    sqlx::raw_sql(
+        "create function refuse_purge() returns trigger language plpgsql as $$          begin if new.purged_at is not null and old.purged_at is null then          raise exception using errcode = 'unique_violation', message = 'refused'; end if;          return new; end $$;          create trigger refuse_purge before update on nodes          for each row execute function refuse_purge();",
+    )
+    .execute(w.server.records_db().test_pool())
+    .await
+    .unwrap();
+
+    let (status, body) = w.purge_site(&w.root, &w.site).await;
+    assert!(status.is_client_error(), "{status} {body}");
+    let purging: bool = sqlx::query_scalar("select purging from sites where id = $1")
+        .bind(uuid(&w.site))
+        .fetch_one(w.server.records_db().test_pool())
+        .await
+        .unwrap();
+    assert!(!purging, "a refused purge leaves the site unmarked");
+    assert!(
+        w.server
+            .store()
+            .read_tree_record(uuid(&w.site))
+            .unwrap()
+            .unwrap()
+            .purged
+            .is_none(),
+        "the purge was taken back in Git"
+    );
+    assert!(w.events("site.purged", &w.site).await.is_empty());
+
+    // The site is still deleted, and can be restored.
+    sqlx::raw_sql("drop trigger refuse_purge on nodes")
+        .execute(w.server.records_db().test_pool())
+        .await
+        .unwrap();
+    let (status, body) = w.restore_site(&w.root, &w.site).await;
+    assert!(status.is_success(), "{status} {body}");
+    assert!(row(&w.server, &w.site).await.deleted_at.is_none());
+}
+
+#[tokio::test]
 async fn site_purge_resumes_after_restart() {
     let data_dir = tempfile::tempdir().unwrap();
     let db = TestDb::create().await;

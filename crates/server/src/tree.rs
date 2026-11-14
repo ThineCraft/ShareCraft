@@ -573,8 +573,9 @@ pub async fn restore_site(
 /// # Errors
 /// `Forbidden` unless `actor` is an enabled administrator; `NotFound` for anything but a site
 /// not yet purged; `NotDeleted` for a site that is not deleted; `OutOfStep` while the tree
-/// needs repair; otherwise the Git or database error (the site then stays marked `purging`,
-/// and the sweeper finishes it).
+/// needs repair; otherwise the Git or database error. A purge refused or failed before Git
+/// held it clears `purging` again, so the site stays deleted and can be restored; one that
+/// failed after its commit stays marked `purging`, and the sweeper finishes it.
 pub async fn purge_site(
     state: &AppState,
     actor: Option<&User>,
@@ -611,12 +612,43 @@ pub async fn purge_site(
             return Err(AccessError::NotFound);
         }
         db.set_site_purging(site, true).await?;
-        let plan = plan_purge_site(state, actor, &record).await?;
-        commit(state, actor, plan).await?
+        let purged = match plan_purge_site(state, actor, &record).await {
+            Ok(plan) => commit(state, actor, plan).await,
+            Err(error) => Err(error),
+        };
+        match purged {
+            Ok(done) => done,
+            Err(error) => {
+                unmark_unstarted_purge(state, site).await;
+                return Err(error);
+            }
+        }
     };
     erase_released(state, done).await;
     db.set_site_purging(site, false).await?;
     Ok(())
+}
+
+/// After a purge of `site` was refused or failed, clears its `purging` mark unless Git holds
+/// the purge (its tree record is marked purged): a purge whose commit never happened, or was
+/// taken back, leaves the site deleted and restorable, while one Git already holds stays
+/// marked for the sweeper to finish. If Git cannot be read the mark stays, which is safe.
+async fn unmark_unstarted_purge(state: &AppState, site: NodeId) {
+    match git_record(state, site).await {
+        Ok(record) if record.purged.is_none() => {
+            if let Err(e) = state.db().set_site_purging(site, false).await {
+                eprintln!(
+                    "sharecraft-server: could not clear the purge mark of site {}: {e}",
+                    site.0
+                );
+            }
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!(
+            "sharecraft-server: could not read site {} from Git after its purge failed: {e}",
+            site.0
+        ),
+    }
 }
 
 /// Works out the purge of the deleted site whose tree record is `site` (see [`purge_site`]).
