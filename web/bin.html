@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ShareCraft — Recycle bin</title>
+<link rel="stylesheet" href="./style.css">
+</head>
+<body>
+<div class="page">
+ <nav class="topbar" aria-label="Account">
+  <a href="/">Sites</a>
+  <span id="who" class="meta"></span>
+  <span class="spacer"></span>
+  <a id="people-link" class="button plain" href="/people.html" hidden>People</a>
+  <button type="button" id="sign-out" class="plain">Sign out</button>
+ </nav>
+ <nav id="crumbs" class="crumbs" aria-label="Breadcrumb"></nav>
+ <p id="status" role="status" aria-live="polite" class="meta"></p>
+ <h1 id="title">Recycle bin</h1>
+ <p id="error" role="alert" class="msg"></p>
+ <p class="meta">Deleted items stay here for 93 days. Restore puts an item back where it was.</p>
+ <nav id="stages" class="sitenav" aria-label="Recycle bin stage" hidden>
+  <ul>
+   <li><a id="stage-first" href="#first">Deleted items</a></li>
+   <li><a id="stage-second" href="#second">Second stage (site managers)</a></li>
+  </ul>
+ </nav>
+ <p id="stage-help" class="meta"></p>
+ <div class="toolbar"><button type="button" id="empty-bin" class="plain" hidden>Empty</button></div>
+ <ul id="entries" class="list" aria-label="Items in the recycle bin"></ul>
+ <p id="empty" hidden>There is nothing here.</p>
+ <p><button type="button" id="more" class="plain" hidden>Show more</button></p>
+</div>
+<script type="module" src="./bin.js"></script>
+</body>
+</html>

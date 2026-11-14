@@ -4,6 +4,8 @@
 import {
   PERMS,
   api,
+  confirmDialog,
+  deleteRoleText,
   h,
   messageFor,
   permLabel,
@@ -90,6 +92,7 @@ function roleRow(role) {
   });
   remove.addEventListener('click', async () => {
     note('', false);
+    if (!(await confirmDialog(deleteRoleText(role), 'Delete role'))) return;
     const result = await api('DELETE', `/roles/${seg(role.id)}`);
     note(result.ok ? `${role.name} was deleted.` : messageFor(result.error), !result.ok);
     await showRoles();

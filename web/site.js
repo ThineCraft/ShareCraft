@@ -6,6 +6,9 @@ import {
   pageFor,
   queryId,
   can,
+  parseQuotaGb,
+  quotaText,
+  usagePercent,
   requireMe,
   roleLine,
   seg,
@@ -42,6 +45,7 @@ $('site-tools').hidden = !(manageSite || manageAccess);
 $('access-link').href = `/access.html?id=${seg(siteId)}`;
 $('explorer-link').href = `/explorer.html?root=${seg(siteId)}`;
 $('groups-link').href = `/groups.html?site=${seg(siteId)}`;
+$('bin-link').href = `/bin.html?site=${seg(siteId)}`;
 
 $('new-library').addEventListener('submit', async (event) => {
   event.preventDefault();
@@ -62,27 +66,32 @@ async function showStorage() {
   const result = await api('GET', `/sites/${seg(siteId)}`);
   if (!result.ok || result.data.used === undefined) return;
   const { used, quota, quota_warning: warning } = result.data;
-  const box = $('storage');
-  box.textContent =
-    quota === null
-      ? `This site holds ${bytes(used)}. It has no storage quota.`
-      : `This site holds ${bytes(used)} of its ${bytes(quota)} storage quota.` +
-        (warning ? ' It is nearly full: delete or purge what is not needed, or ask an administrator for more.' : '');
-  box.classList.toggle('msg', Boolean(warning));
-  box.hidden = false;
+  $('storage').hidden = false;
+  $('storage-text').textContent = quotaText(result.data);
+  $('storage-text').classList.toggle('msg', Boolean(warning));
+  const percent = usagePercent(used, quota);
+  $('storage-bar').hidden = percent === null;
+  if (percent !== null) {
+    $('storage-bar').value = percent;
+    $('storage-bar').textContent = `${percent}%`;
+    $('storage-bar').setAttribute('aria-label', `${percent}% of the storage quota used`);
+    $('storage-bar').classList.toggle('warn', Boolean(warning));
+  }
+  $('quota-form').hidden = !me.is_admin;
+  if (me.is_admin) $('quota-gb').value = quota === null ? '' : String(Math.round((quota / 1024 ** 3) * 100) / 100);
 }
 
-/** `n` bytes in the largest unit that keeps it at 1 or more. */
-function bytes(n) {
-  const units = ['bytes', 'KB', 'MB', 'GB', 'TB'];
-  let value = n;
-  let unit = 0;
-  while (value >= 1024 && unit < units.length - 1) {
-    value /= 1024;
-    unit += 1;
+$('quota-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  showMessage(error, '');
+  const bytes = parseQuotaGb($('quota-gb').value);
+  if (bytes === undefined) {
+    return showMessage(error, 'Enter the quota as a number of gigabytes, or leave it empty for no quota.');
   }
-  return unit === 0 ? `${value} bytes` : `${value.toFixed(1)} ${units[unit]}`;
-}
+  const result = await api('PUT', `/sites/${seg(siteId)}/quota`, { bytes });
+  if (!result.ok) return showMessage(error, messageFor(result.error));
+  await showStorage();
+});
 
 async function showLibraries() {
   const result = await api('GET', `/nodes/${seg(siteId)}/children?limit=500`);

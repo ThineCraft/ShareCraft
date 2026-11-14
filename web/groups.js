@@ -4,11 +4,13 @@
 
 import {
   api,
+  confirmDialog,
   groupLabel,
   h,
   messageFor,
   pageFor,
   queryId,
+  removeMemberText,
   requireMe,
   seg,
   setupTopbar,
@@ -118,6 +120,7 @@ function memberRow(group, member) {
   );
   remove.addEventListener('click', async () => {
     note('', false);
+    if (!(await confirmDialog(removeMemberText(member, group), 'Remove'))) return;
     const result = await api('DELETE', `/groups/${seg(group.id)}/members/${seg(member.id)}`);
     note(result.ok ? `${member.name} was removed.` : messageFor(result.error), !result.ok);
     await load();

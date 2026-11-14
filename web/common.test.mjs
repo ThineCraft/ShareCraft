@@ -607,3 +607,166 @@ test('a file never saved offers no download', () => {
   assert.equal(saved.download, true);
   assert.match(saved.saved, /^Last saved /);
 });
+
+// ---- files: bin wording, bulk results, quota wording, selection ----
+
+import {
+  bulkSummary,
+  bytesText,
+  canPlaceHere,
+  daysLeftText,
+  deleteRoleText,
+  emptyBinText,
+  quotaRefusalText,
+  quotaText,
+  removeMemberText,
+  selectionState,
+  usagePercent,
+} from './common.js';
+
+test('days left in the recycle bin are worded plainly', () => {
+  assert.equal(daysLeftText(93), '93 days left');
+  assert.equal(daysLeftText(2), '2 days left');
+  assert.equal(daysLeftText(1), '1 day left');
+  assert.equal(daysLeftText(0), 'Erased within a day');
+  assert.equal(daysLeftText(-4), 'Erased within a day');
+  assert.equal(daysLeftText(null), '');
+});
+
+test('sizes are worded in the largest sensible unit', () => {
+  assert.equal(bytesText(0), '0 bytes');
+  assert.equal(bytesText(1023), '1023 bytes');
+  assert.equal(bytesText(1536), '1.5 KB');
+  assert.equal(bytesText(10 * 1024 ** 3), '10.0 GB');
+});
+
+test('a bulk summary names every item with its own outcome', () => {
+  const names = { a: 'Budget.xlsx', b: 'Plans', c: 'Notes.docx', d: 'Old.pdf' };
+  const results = [
+    { id: 'a', ok: true },
+    { id: 'b', ok: true, new_id: 'b2', renamed: { from: 'Plans', to: 'Plans (2)' } },
+    { id: 'c', ok: false, error: 'forbidden' },
+    { id: 'd', ok: false, error: 'quota_exceeded' },
+  ];
+  const summary = bulkSummary('copy', results, names);
+  assert.equal(summary.ok, 2);
+  assert.equal(summary.failed, 2);
+  assert.equal(summary.headline, '2 of 4 items were copied. 2 could not be.');
+  assert.equal(summary.lines.length, 4);
+  assert.deepEqual(
+    summary.lines.map((line) => [line.name, line.ok]),
+    [['Budget.xlsx', true], ['Plans', true], ['Notes.docx', false], ['Old.pdf', false]],
+  );
+  assert.match(summary.lines[1].text, /Plans \(2\)/); // the rename is shown
+  assert.equal(summary.lines[2].text, messageFor('forbidden'));
+  assert.equal(summary.lines[3].text, messageFor('quota_exceeded'));
+});
+
+test('a bulk summary with everything done is one sentence per operation', () => {
+  const names = { a: 'A.docx' };
+  assert.equal(bulkSummary('delete', [{ id: 'a', ok: true }], names).headline, '1 item was moved to the recycle bin.');
+  assert.equal(bulkSummary('move', [{ id: 'a', ok: true }], names).headline, '1 item was moved.');
+  assert.equal(
+    bulkSummary('restore', [{ id: 'a', ok: true, renamed: { from: 'A.docx', to: 'A (2).docx' } }], names).headline,
+    '1 item was restored.',
+  );
+  assert.equal(
+    bulkSummary('delete', [{ id: 'a', ok: false, error: 'not_found' }], names).headline,
+    'No items were moved to the recycle bin. 1 could not be.',
+  );
+});
+
+test('an item the summary has no name for is called an item', () => {
+  const summary = bulkSummary('move', [{ id: 'zz', ok: false, error: 'not_found' }], {});
+  assert.equal(summary.lines[0].name, 'An item');
+});
+
+test('select all reports none, some or all of the listed items', () => {
+  assert.deepEqual(selectionState(new Set(), ['a', 'b']), { count: 0, all: false, some: false });
+  assert.deepEqual(selectionState(new Set(['a']), ['a', 'b']), { count: 1, all: false, some: true });
+  assert.deepEqual(selectionState(new Set(['a', 'b']), ['a', 'b']), { count: 2, all: true, some: false });
+  // an id no longer listed is not counted
+  assert.deepEqual(selectionState(new Set(['gone']), ['a']), { count: 0, all: false, some: false });
+  assert.deepEqual(selectionState(new Set(), []), { count: 0, all: false, some: false });
+});
+
+test('copy is offered where move is not: the folder the items are in', () => {
+  const here = { id: 'f', kind: 'folder', access: { perms: ['view', 'add'] } };
+  assert.equal(canPlaceHere([here], ['x'], 'f', { copy: false }), false);
+  assert.equal(canPlaceHere([here], ['x'], 'f', { copy: true }), true);
+  // never into itself or below it, for either
+  assert.equal(canPlaceHere([here], ['f'], 'p', { copy: true }), false);
+  assert.equal(canPlaceHere([here], ['x', 'f'], 'p', { copy: false }), false);
+  // needs add
+  const viewOnly = { id: 'g', kind: 'folder', access: { perms: ['view'] } };
+  assert.equal(canPlaceHere([viewOnly], ['x'], 'f', { copy: true }), false);
+  assert.equal(canPlaceHere([], ['x'], 'f', { copy: true }), false);
+});
+
+test('the move dialog leaves out every item being moved', () => {
+  const items = [
+    { id: 'a', kind: 'folder', name: 'A', access: { perms: ['view', 'add'] } },
+    { id: 'b', kind: 'folder', name: 'B', access: { perms: ['view', 'add'] } },
+    { id: 'c', kind: 'folder', name: 'C', access: { perms: ['view', 'add'] } },
+  ];
+  assert.deepEqual(moveChoices(items, ['a', 'b']).map((choice) => choice.id), ['c']);
+  assert.deepEqual(moveChoices(items, 'a').map((choice) => choice.id), ['b', 'c']);
+});
+
+test('quota wording: usage, warning from 90%, and refusals in plain words', () => {
+  assert.equal(usagePercent(50, 100), 50);
+  assert.equal(usagePercent(150, 100), 100);
+  assert.equal(usagePercent(5, null), null);
+  assert.equal(usagePercent(5, 0), 100);
+  assert.equal(quotaText({ used: 2048, quota: null }), 'This site holds 2.0 KB. It has no storage quota.');
+  assert.match(quotaText({ used: 512, quota: 1024 }), /512 bytes of its 1\.0 KB storage quota/);
+  assert.doesNotMatch(quotaText({ used: 512, quota: 1024 }), /nearly full/);
+  assert.match(quotaText({ used: 950, quota: 1000, quota_warning: true }), /nearly full/);
+  const refusal = quotaRefusalText({ used: 900, quota: 1000 }, { name: 'Big.pdf', size: 500 });
+  assert.match(refusal, /Big\.pdf/);
+  assert.match(refusal, /500 bytes/);
+  assert.match(refusal, /900 bytes of its 1000 bytes/);
+  // someone who cannot see the numbers still gets a sentence
+  assert.match(quotaRefusalText(null, { name: 'Big.pdf', size: 5 }), /Big\.pdf/);
+  assert.match(quotaRefusalText(null, { name: 'Big.pdf', size: 5 }), /no room/);
+});
+
+test('emptying a bin says what cannot be undone', () => {
+  assert.match(emptyBinText('second', 3), /3 items/);
+  assert.match(emptyBinText('second', 3), /cannot be undone/);
+  assert.match(emptyBinText('second', 1), /1 item\b/);
+  assert.match(emptyBinText('first', 2), /second stage/);
+  assert.match(emptyBinText('first', 2), /people who manage the site/);
+});
+
+test('confirmations for removing a member and deleting a role', () => {
+  assert.match(removeMemberText({ name: 'Ada' }, { name: 'Editors' }), /Remove Ada from Editors/);
+  assert.match(deleteRoleText({ name: 'Reviewer' }), /Delete the role Reviewer/);
+  assert.match(deleteRoleText({ name: 'Reviewer' }), /cannot be undone/);
+});
+
+test('new error codes have sentences', () => {
+  for (const code of [
+    'being_edited',
+    'text_document',
+    'checksum_mismatch',
+    'too_many_uploads',
+    'invalid_range',
+    'wrong_offset',
+  ]) {
+    assert.notEqual(messageFor(code), messageFor('no-such-code'), code);
+  }
+});
+
+import { parseQuotaGb } from './common.js';
+
+test('the quota field: empty is no quota, a number is gigabytes, anything else is refused', () => {
+  assert.equal(parseQuotaGb(''), null);
+  assert.equal(parseQuotaGb('  '), null);
+  assert.equal(parseQuotaGb('10'), 10 * 1024 ** 3);
+  assert.equal(parseQuotaGb('0.5'), 512 * 1024 ** 2);
+  assert.equal(parseQuotaGb('0'), 0);
+  assert.equal(parseQuotaGb('-1'), undefined);
+  assert.equal(parseQuotaGb('lots'), undefined);
+  assert.equal(parseQuotaGb('1e3'), undefined);
+});

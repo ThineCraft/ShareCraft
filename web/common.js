@@ -53,6 +53,13 @@ const MESSAGES = {
   too_many_requests: 'You have asked for access too many times today. Try again tomorrow.',
   already_decided: 'Someone has already decided that request. Reload the page.',
   message_too_long: 'That message is too long. Use 500 characters or fewer.',
+  being_edited: 'Someone is editing that file right now. Try again when they have finished.',
+  text_document: 'That is a text document. Open it and edit it in its own page.',
+  checksum_mismatch:
+    'The file did not arrive intact (it may have changed while it was being sent). Nothing was saved; try again.',
+  too_many_uploads: 'You have too many uploads open at once. Wait for some to finish, then try again.',
+  invalid_range: 'The server could not take that part of the file. Try the upload again.',
+  wrong_offset: 'The upload got out of step with the server. Try the upload again.',
 };
 
 /** What a document page says when the document is missing or the person has no access. */
@@ -458,8 +465,9 @@ export function previewView(preview) {
  * true only for a library or folder where the person may add (`add`).
  */
 export function moveChoices(items, movingId) {
+  const moving = [].concat(movingId);
   return items
-    .filter((item) => item.id !== movingId && ['site', 'library', 'folder'].includes(item.kind))
+    .filter((item) => !moving.includes(item.id) &&['site', 'library', 'folder'].includes(item.kind))
     .map((item) => ({
       id: item.id,
       kind: item.kind,
@@ -479,6 +487,19 @@ export function canMoveHere(trail, movingId, currentParentId) {
   if (!here || !['library', 'folder'].includes(here.kind) || !can(here.access, 'add')) return false;
   if (trail.some((step) => step.id === movingId)) return false;
   return here.id !== currentParentId;
+}
+
+/**
+ * Whether "Move here" or "Copy here" is offered at the end of `trail` for the items `ids`: a
+ * library or folder the person may add to, with none of the items in the trail (never into
+ * itself or below). A move is not offered where the items are already (`currentParentId`); a
+ * copy is (it is kept alongside under a new name).
+ */
+export function canPlaceHere(trail, ids, currentParentId, { copy = false } = {}) {
+  const here = trail[trail.length - 1];
+  if (!here || !['library', 'folder'].includes(here.kind) || !can(here.access, 'add')) return false;
+  if (trail.some((step) => ids.includes(step.id))) return false;
+  return copy || here.id !== currentParentId;
 }
 
 /** A time from the server as the person's local date and time. */
@@ -770,4 +791,157 @@ export function offerRequest(after, id) {
     form.replaceChildren(h('p', { role: 'status' }, REQUEST_SENT));
   });
   after.after(form);
+}
+
+// ---- files: recycle bin, bulk operations, quota, confirmations ----
+
+/** How long an item in the recycle bin has left, from the server's `days_left`. */
+export function daysLeftText(days) {
+  if (days == null) return '';
+  if (days <= 0) return 'Erased within a day';
+  return days === 1 ? '1 day left' : `${days} days left`;
+}
+
+/** `n` bytes in the largest unit that keeps it at 1 or more. */
+export function bytesText(n) {
+  const units = ['bytes', 'KB', 'MB', 'GB', 'TB'];
+  let value = n;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return unit === 0 ? `${value} bytes` : `${value.toFixed(1)} ${units[unit]}`;
+}
+
+const itemsText = (n) => `${n} ${n === 1 ? 'item' : 'items'}`;
+const capital = (text) => text.charAt(0).toUpperCase() + text.slice(1);
+const BULK_DONE = {
+  move: 'moved',
+  copy: 'copied',
+  delete: 'moved to the recycle bin',
+  restore: 'restored',
+};
+
+/**
+ * What a bulk request did, from the server's results (`[{id, ok, error?, new_id?, renamed?}]`)
+ * and the names of the items by id: `{ ok, failed, headline, lines }`, one line (`{ name, ok,
+ * text }`) per item in the order given, a rename (`renamed {from, to}`) shown on its line.
+ */
+export function bulkSummary(op, results, names) {
+  const done = BULK_DONE[op] ?? 'changed';
+  const ok = results.filter((result) => result.ok).length;
+  const failed = results.length - ok;
+  const was = (n) => (n === 1 ? 'was' : 'were');
+  let headline;
+  if (failed === 0) headline = `${itemsText(ok)} ${was(ok)} ${done}.`;
+  else if (ok === 0) headline = `No items were ${done}. ${failed} could not be.`;
+  else headline = `${ok} of ${itemsText(results.length)} ${was(ok)} ${done}. ${failed} could not be.`;
+  const lines = results.map((result) => {
+    const name = names[result.id] ?? 'An item';
+    let text;
+    if (!result.ok) text = messageFor(result.error);
+    else if (result.renamed) {
+      text = `${capital(done)} as “${result.renamed.to}”, because “${result.renamed.from}” was taken.`;
+    } else text = `${capital(done)}.`;
+    return { name, ok: result.ok, text };
+  });
+  return { ok, failed, headline, lines };
+}
+
+/** Whether none, some or all of `listed` (item ids) are in the set `selected`. */
+export function selectionState(selected, listed) {
+  const count = listed.filter((id) => selected.has(id)).length;
+  const all = listed.length > 0 && count === listed.length;
+  return { count, all, some: count > 0 && !all };
+}
+
+/** The share of `quota` used, from 0 to 100; `null` when there is no quota. */
+export function usagePercent(used, quota) {
+  if (quota === null || quota === undefined) return null;
+  if (quota <= 0) return 100;
+  return Math.min(100, Math.round((used / quota) * 100));
+}
+
+/** The site page's storage line, for people who manage the site (`GET /api/sites/{id}`). */
+export function quotaText({ used, quota, quota_warning: warning }) {
+  if (quota === null || quota === undefined) {
+    return `This site holds ${bytesText(used)}. It has no storage quota.`;
+  }
+  return (
+    `This site holds ${bytesText(used)} of its ${bytesText(quota)} storage quota.` +
+    (warning ? ' It is nearly full: delete or purge what is not needed, or ask an administrator for more.' : '')
+  );
+}
+
+/**
+ * Why a file did not fit: the space situation of its site in plain words. `site` is the
+ * site's storage (`{ used, quota }`) when the person may see it, otherwise null or without
+ * the numbers; `file` is `{ name, size }`.
+ */
+export function quotaRefusalText(site, file) {
+  const head = `There is no room for “${file.name}” (${bytesText(file.size)}).`;
+  if (site && typeof site.used === 'number' && typeof site.quota === 'number') {
+    return (
+      `${head} The site holds ${bytesText(site.used)} of its ${bytesText(site.quota)} storage quota. ` +
+      'Delete or purge what is not needed, or ask an administrator for more.'
+    );
+  }
+  return `${head} The site has no room left under its storage quota. Ask someone who manages the site to free some space, or an administrator for more.`;
+}
+
+/** The confirmation before emptying a bin stage of `count` items. */
+export function emptyBinText(stage, count) {
+  if (stage === 'second') {
+    return `Permanently erase ${itemsText(count)}? Their files are erased from the server and this cannot be undone.`;
+  }
+  return (
+    `Move ${itemsText(count)} to the second stage of the recycle bin? ` +
+    'You will not be able to restore them yourself afterwards: only people who manage the site can bring them back, until they are erased for good.'
+  );
+}
+
+/** The confirmation before removing `member` from `group`. */
+export const removeMemberText = (member, group) =>
+  `Remove ${member.name} from ${group.name}? They lose any access that comes from this group.`;
+
+/** The confirmation before deleting `role`. */
+export const deleteRoleText = (role) => `Delete the role ${role.name}? This cannot be undone.`;
+
+/**
+ * The quota in bytes for the text of the quota field (gigabytes, decimals allowed): `null`
+ * for an empty field (no quota), `undefined` when it is not a number.
+ */
+export function parseQuotaGb(text) {
+  const trimmed = String(text).trim();
+  if (trimmed === '') return null;
+  if (!/^\d+(\.\d+)?$/.test(trimmed)) return undefined;
+  return Math.round(Number(trimmed) * 1024 ** 3);
+}
+
+/**
+ * Asks the person to confirm before something is done: a dialog with `text`, a Cancel button
+ * and a `label` button. Resolves true for the label, false for Cancel or Escape. The text is
+ * put in as text only.
+ */
+export function confirmDialog(text, label) {
+  return new Promise((resolve) => {
+    const dialog = h('dialog', { 'aria-label': label });
+    const cancel = h('button', { type: 'button', class: 'plain' }, 'Cancel');
+    const confirm = h('button', { type: 'button' }, label);
+    dialog.append(h('p', {}, text), h('div', { class: 'row end' }, cancel, confirm));
+    let answer = false;
+    cancel.addEventListener('click', () => dialog.close());
+    confirm.addEventListener('click', () => {
+      answer = true;
+      dialog.close();
+    });
+    dialog.addEventListener('close', () => {
+      dialog.remove();
+      resolve(answer);
+    });
+    document.body.append(dialog);
+    dialog.showModal();
+    cancel.focus();
+  });
 }

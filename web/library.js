@@ -5,10 +5,10 @@
 import { EDITORS, withExtension } from './editor-host.js';
 import {
   api,
+  bulkSummary,
   can,
-  canMoveHere,
+  canPlaceHere,
   formatTime,
-  goToSignIn,
   h,
   itemActions,
   messageFor,
@@ -18,12 +18,24 @@ import {
   queryId,
   requireMe,
   roleLine,
+  selectionState,
   seg,
   setupTopbar,
   showCrumbs,
   showMessage,
   showSiteNav,
 } from './common.js';
+import {
+  CONFLICT_CHOICES,
+  UploadQueue,
+  conflictQuestion,
+  filesFromDrop,
+  filesFromPicker,
+  outcomeNote,
+  progressText,
+} from './upload.js';
+
+const BULK_MAX = 500;
 
 const PAGE = 50;
 const $ = (id) => document.getElementById(id);
@@ -55,10 +67,33 @@ $('explorer-link').href = `/explorer.html?root=${seg(nodeId)}`;
 $('access-link').href = `/access.html?id=${seg(nodeId)}`;
 showSiteNav($('sitenav'), here.path[0].id, here.path.find((step) => step.kind === 'library')?.id);
 
+$('bin-link').href = `/bin.html?site=${seg(here.path[0].id)}`;
+const siteId = here.path[0].id;
+const canAdd = can(here.access, 'add');
+
+// Everything the code below reads while the page is drawn is declared here, before the first
+// await: a `let` or `const` further down would still be unusable when `reload` draws the list.
 let items = [];
 let next = null;
+const selected = new Set(); // ids of the checked items
+const uploads = []; // every upload shown in the panel, as the queue reports it
+let uploadChain = Promise.resolve(); // uploads run one batch at a time
+let moving = []; // the items the move or copy dialog is for
+let moveMode = 'move';
+let trail = [];
+let moveRequest = 0; // the latest listing asked for; older answers are dropped
+let deleting = [];
+let renaming = null;
 
 $('more').addEventListener('click', () => loadPage());
+$('select-all').addEventListener('change', () => {
+  const all = $('select-all').checked;
+  for (const item of items) {
+    if (all) selected.add(item.id);
+    else selected.delete(item.id);
+  }
+  render();
+});
 await reload();
 
 // ---- the listing ----
@@ -66,6 +101,7 @@ await reload();
 async function reload() {
   items = [];
   next = null;
+  selected.clear();
   await loadPage();
 }
 
@@ -85,6 +121,25 @@ function render() {
   $('empty').hidden = items.length > 0;
   $('more').hidden = !next;
   $('items').replaceChildren(...items.map(row));
+  showSelection();
+}
+
+/** The bulk bar: Select all, how many are checked, and the buttons that need a selection. */
+function showSelection() {
+  const choosable = items.filter((item) => item.kind !== 'library');
+  const state = selectionState(selected, choosable.map((item) => item.id));
+  $('bulk-bar').hidden = choosable.length === 0;
+  $('select-all').checked = state.all;
+  $('select-all').indeterminate = state.some;
+  $('selected-count').textContent = state.count === 0 ? '' : `${state.count} selected`;
+  const allowed = selectedItems().map(itemActions);
+  $('bulk-move').disabled = state.count === 0 || !allowed.every((a) => a.move);
+  $('bulk-copy').disabled = state.count === 0;
+  $('bulk-delete').disabled = state.count === 0 || !allowed.every((a) => a.remove);
+}
+
+function selectedItems() {
+  return items.filter((item) => selected.has(item.id));
 }
 
 function kindLabel(item) {
@@ -97,8 +152,8 @@ function row(item) {
   const buttons = [];
   const allowed = itemActions(item);
   if (allowed.rename) buttons.push(action('Rename', item, askRename));
-  if (allowed.move) buttons.push(action('Move…', item, askMove));
-  if (allowed.remove) buttons.push(action('Delete', item, askDelete));
+  if (allowed.move) buttons.push(action('Move…', item, (one) => askMove([one], 'move')));
+  if (allowed.remove) buttons.push(action('Delete', item, (one) => askDelete([one])));
   if (allowed.access) {
     buttons.push(
       h(
@@ -118,9 +173,19 @@ function row(item) {
         ? `Last saved ${formatTime(item.revised_at)}`
         : 'Not saved yet'
       : null;
+  const box =
+    item.kind === 'library'
+      ? null
+      : h('input', { type: 'checkbox', 'aria-label': `Select ${item.name}`, checked: selected.has(item.id) });
+  box?.addEventListener('change', () => {
+    if (box.checked) selected.add(item.id);
+    else selected.delete(item.id);
+    showSelection();
+  });
   return h(
     'li',
     {},
+    box,
     h('span', { class: 'grow' }, h('a', { href: pageFor(item.kind, item.id, item.editor) }, item.name)),
     h('small', {}, kindLabel(item)),
     saved && h('small', {}, saved),
@@ -174,53 +239,114 @@ $('new-doc').addEventListener('submit', async (event) => {
   else note(result.data?.message ?? messageFor(result.error), true);
 });
 
-$('upload-doc').addEventListener('submit', async (event) => {
-  event.preventDefault();
-  note('', false);
-  const file = $('upload-file').files[0];
-  if (!file) return;
-  let response;
-  try {
-    response = await fetch(
-      `/api/docs/upload?parent=${seg(nodeId)}&name=${encodeURIComponent(file.name)}`,
-      {
-        method: 'POST',
-        credentials: 'same-origin',
-        headers: { 'Content-Type': 'application/octet-stream' },
-        body: file,
-      },
-    );
-  } catch {
-    return note(messageFor('network'), true);
+// ---- uploading ----
+
+$('pick-files').addEventListener('change', (event) => {
+  startUploads(filesFromPicker(event.target.files));
+  event.target.value = '';
+});
+$('pick-folder').addEventListener('change', (event) => {
+  startUploads(filesFromPicker(event.target.files));
+  event.target.value = '';
+});
+$('uploads-clear').addEventListener('click', () => {
+  for (let at = uploads.length - 1; at >= 0; at -= 1) {
+    if (!['waiting', 'hashing', 'uploading'].includes(uploads[at].status)) uploads.splice(at, 1);
   }
-  const data = await response.json().catch(() => null);
-  if (response.ok && data?.id) {
-    $('upload-doc').reset();
-    note(`“${data.name ?? file.name}” was uploaded.`, false);
-    await reload();
-    return;
-  }
-  const code = typeof data?.error === 'string' ? data.error : 'unknown';
-  if (response.status === 401 && code === 'not_signed_in') goToSignIn();
-  note(uploadProblem(response.status, code), true);
+  showUploads();
 });
 
-function uploadProblem(status, code) {
-  switch (status) {
-    case 400:
-      return 'That file cannot be uploaded. Upload a .xlsx, .docx, .pdf or .solidcraft.json file that is not empty.';
-    case 413:
-      return 'That file is too large to upload.';
-    case 422:
-      return 'That file name is not allowed. Rename the file and try again.';
-    default:
-      return messageFor(code);
-  }
+// Files and folders dropped anywhere on the page go into this library or folder.
+const hasFiles = (event) => [...(event.dataTransfer?.types ?? [])].includes('Files');
+document.addEventListener('dragover', (event) => {
+  if (!canAdd || !hasFiles(event)) return;
+  event.preventDefault();
+  document.body.classList.add('dragging');
+});
+document.addEventListener('dragleave', (event) => {
+  if (event.relatedTarget === null) document.body.classList.remove('dragging');
+});
+document.addEventListener('drop', async (event) => {
+  document.body.classList.remove('dragging');
+  if (!canAdd || !hasFiles(event)) return;
+  event.preventDefault();
+  startUploads(await filesFromDrop(event.dataTransfer));
+});
+
+/** Queues `files` (from a drop or a picker) behind any upload still running. */
+function startUploads(files) {
+  if (files.length === 0) return;
+  note('', false);
+  const queue = new UploadQueue({
+    parent: nodeId,
+    site: siteId,
+    onChange: (outcome) => {
+      if (!uploads.includes(outcome)) uploads.push(outcome);
+      showUploads();
+    },
+    resolve: askConflict,
+  });
+  uploadChain = uploadChain
+    .then(() => queue.run(files))
+    .then(() => reload())
+    .catch(() => {});
+}
+
+function showUploads() {
+  $('upload-panel').hidden = uploads.length === 0;
+  $('uploads').replaceChildren(...uploads.map(uploadRow));
+}
+
+function uploadRow(outcome) {
+  const path = outcome.file.path?.length ? `${outcome.file.path.join(' / ')} / ` : '';
+  const busy = ['hashing', 'uploading'].includes(outcome.status);
+  let text;
+  if (outcome.status === 'waiting') text = 'Waiting';
+  else if (outcome.status === 'hashing') text = 'Checking the file…';
+  else if (outcome.status === 'uploading') text = progressText(outcome.sent, outcome.size);
+  else text = outcomeNote(outcome);
+  const again = outcome.retry ? h('button', { type: 'button', class: 'plain' }, 'Upload again') : null;
+  again?.addEventListener('click', () => {
+    uploads.splice(uploads.indexOf(outcome), 1);
+    startUploads([outcome.file]);
+  });
+  return h(
+    'li',
+    {},
+    h('span', { class: 'grow' }, h('strong', {}, `${path}${outcome.name}`), h('br'), h('small', {}, text)),
+    busy && outcome.size > 0
+      ? h('progress', { max: outcome.size, value: outcome.sent, 'aria-label': `Progress of ${outcome.name}` })
+      : null,
+    outcome.status === 'failed' ? h('small', { class: 'mark' }, 'Not uploaded') : null,
+    again,
+  );
+}
+
+// The question asked when a name is taken: Replace, Keep both or Skip, for this file or the rest.
+const conflictDialog = $('conflict-dialog');
+function askConflict({ name, suggested }) {
+  return new Promise((resolve) => {
+    $('conflict-text').textContent = conflictQuestion(name, suggested);
+    $('conflict-all').checked = false;
+    let choice = 'skip'; // Escape skips
+    for (const { value } of CONFLICT_CHOICES) {
+      const id = { replace: 'conflict-replace', keep_both: 'conflict-keep', skip: 'conflict-skip' }[value];
+      $(id).onclick = () => {
+        choice = value;
+        conflictDialog.close();
+      };
+    }
+    conflictDialog.addEventListener(
+      'close',
+      () => resolve({ choice, all: $('conflict-all').checked }),
+      { once: true },
+    );
+    conflictDialog.showModal();
+  });
 }
 
 // ---- rename ----
 
-let renaming = null;
 const renameDialog = $('rename-dialog');
 $('rename-cancel').addEventListener('click', () => renameDialog.close());
 
@@ -257,49 +383,83 @@ $('rename-form').addEventListener('submit', async (event) => {
   await reload();
 });
 
-// ---- delete ----
+// ---- bulk: delete, move and copy ----
 
-let deleting = null;
 const deleteDialog = $('delete-dialog');
 $('delete-cancel').addEventListener('click', () => deleteDialog.close());
+$('bulk-delete').addEventListener('click', () => askDelete(selectedItems()));
+$('bulk-move').addEventListener('click', () => askMove(selectedItems(), 'move'));
+$('bulk-copy').addEventListener('click', () => askMove(selectedItems(), 'copy'));
 
-function askDelete(item) {
-  deleting = item;
-  $('delete-title').textContent = `Delete “${item.name}”?`;
+function askDelete(list) {
+  deleting = list;
+  const one = list[0];
+  $('delete-title').textContent = list.length === 1 ? `Delete “${one.name}”?` : `Delete ${list.length} items?`;
+  const inside = list.some((item) => item.kind === 'folder') ? ' Folders go with everything inside them.' : '';
   $('delete-text').textContent =
-    item.kind === 'folder'
-      ? `The folder “${item.name}” will be deleted. It must be empty.`
-      : `The document “${item.name}” will be deleted. Anyone who has it open is disconnected.`;
+    `${list.length === 1 ? `“${one.name}” will be` : `${list.length} items will be`} moved to the recycle bin, where ${
+      list.length === 1 ? 'it' : 'they'
+    } can be restored for 93 days.${inside} Anyone who has a deleted file open is disconnected.`;
   showMessage($('delete-error'), '');
   deleteDialog.showModal();
 }
 
 $('delete-form').addEventListener('submit', async (event) => {
   event.preventDefault();
-  const item = deleting;
-  const result = await api('DELETE', `/nodes/${seg(item.id)}`);
-  if (!result.ok) return showMessage($('delete-error'), messageFor(result.error));
+  const list = deleting;
   deleteDialog.close();
-  note(`“${item.name}” was deleted.`, false);
-  await reload();
+  await runBulk('delete', list, null);
 });
 
-// ---- move ----
+/** Sends `list` through `POST /api/bulk` (500 at a time) and shows what happened to each. */
+async function runBulk(op, list, parent) {
+  note('', false);
+  const results = [];
+  for (let at = 0; at < list.length; at += BULK_MAX) {
+    const batch = list.slice(at, at + BULK_MAX);
+    const body = { op, items: batch.map((item) => item.id) };
+    if (parent) body.parent = parent;
+    const result = await api('POST', '/bulk', body);
+    if (!result.ok) {
+      for (const item of batch) results.push({ id: item.id, ok: false, error: result.error });
+    } else results.push(...result.data);
+  }
+  const names = Object.fromEntries(list.map((item) => [item.id, item.name]));
+  const summary = bulkSummary(op, results, names);
+  $('bulk-headline').textContent = summary.headline;
+  $('bulk-results-box').hidden = false;
+  $('bulk-results').hidden = false;
+  $('bulk-results').replaceChildren(
+    ...summary.lines.map((line) =>
+      h(
+        'li',
+        {},
+        h('span', { class: 'grow' }, h('strong', {}, line.name), h('br'), h('small', {}, line.text)),
+        line.ok ? null : h('small', { class: 'mark' }, 'Not done'),
+      ),
+    ),
+  );
+  await reload();
+}
+
+// ---- move and copy (one dialog) ----
 
 const moveDialog = $('move-dialog');
-let moving = null;
-let trail = [];
-let moveRequest = 0; // the latest listing asked for; older answers are dropped
 $('move-cancel').addEventListener('click', () => moveDialog.close());
 
-function askMove(item) {
-  moving = item;
+function askMove(list, mode) {
+  moving = list;
+  moveMode = mode;
   trail = here.path.map(({ id, kind, name, access }) => ({ id, kind, name, access }));
-  $('move-title').textContent = `Move “${item.name}”`;
+  const verb = mode === 'copy' ? 'Copy' : 'Move';
+  $('move-title').textContent = list.length === 1 ? `${verb} “${list[0].name}”` : `${verb} ${list.length} items`;
+  $('move-here').textContent = `${verb} here`;
   showMessage($('move-error'), '');
   moveDialog.showModal();
   browse();
 }
+
+const movingIds = () => moving.map((item) => item.id);
 
 // Lists the places inside the last step of `trail` (the sites at the top).
 async function browse() {
@@ -326,7 +486,7 @@ async function browse() {
   }
   if (request !== moveRequest) return;
   showMessage($('move-error'), failure ? messageFor(failure) : '');
-  const places = moveChoices(listed, moving.id);
+  const places = moveChoices(listed, movingIds());
   $('move-empty').hidden = places.length > 0 || failure !== null;
   $('move-list').replaceChildren(
     ...places.map((choice) => {
@@ -367,23 +527,16 @@ function showTrail() {
   $('move-crumbs').replaceChildren(
     h('ol', {}, ...[top, ...steps].map((button) => h('li', {}, button))),
   );
-  $('move-here').disabled = !canMoveHere(trail, moving.id, nodeId);
+  $('move-here').disabled = !canPlaceHere(trail, movingIds(), nodeId, { copy: moveMode === 'copy' });
 }
 
 $('move-here').addEventListener('click', async () => {
-  const item = moving;
+  const list = moving;
+  const mode = moveMode;
   const place = trail[trail.length - 1];
-  if (!canMoveHere(trail, item.id, nodeId)) return;
-  $('move-here').disabled = true;
-  const result = await api('PATCH', `/nodes/${seg(item.id)}`, { parent: place.id });
-  if (!result.ok) {
-    showMessage($('move-error'), messageFor(result.error));
-    $('move-here').disabled = !canMoveHere(trail, item.id, nodeId);
-    return;
-  }
+  if (!canPlaceHere(trail, movingIds(), nodeId, { copy: mode === 'copy' })) return;
   moveDialog.close();
-  note(`“${item.name}” was moved to “${place.name}”.`, false);
-  await reload();
+  await runBulk(mode, list, place.id);
 });
 
 function fail(text) {

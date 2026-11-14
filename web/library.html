@@ -24,6 +24,7 @@
   <a id="access-link" class="button plain" href="#">Access</a>
   <a id="explorer-link" class="button plain" href="#">Inheritance explorer</a>
  </div>
+ <p><a id="bin-link" class="button plain" href="#">Recycle bin</a></p>
  <p id="error" role="alert" class="msg"></p>
  <div id="edit-tools" hidden>
   <form id="new-folder" class="row">
@@ -49,15 +50,37 @@
    </div>
    <button type="submit">New document</button>
   </form>
-  <form id="upload-doc" class="row">
-   <div class="field">
-    <label for="upload-file">Upload a file (.xlsx, .docx, .pdf or .solidcraft.json)</label>
-    <input type="file" id="upload-file" accept=".xlsx,.docx,.pdf,.json" required>
+  <div id="drop-zone" class="drop" tabindex="-1">
+   <p><strong>Drop files or folders anywhere on this page to upload them here.</strong></p>
+   <div class="row">
+    <div class="field">
+     <label for="pick-files">Choose files</label>
+     <input type="file" id="pick-files" multiple>
+    </div>
+    <div class="field">
+     <label for="pick-folder">Choose a folder</label>
+     <input type="file" id="pick-folder" webkitdirectory>
+    </div>
    </div>
-   <button type="submit">Upload</button>
-  </form>
+  </div>
  </div>
+ <section id="upload-panel" aria-labelledby="upload-heading" hidden>
+  <h2 id="upload-heading">Uploads</h2>
+  <ul id="uploads" class="list"></ul>
+  <p><button type="button" id="uploads-clear" class="plain">Clear finished</button></p>
+ </section>
  <h2 id="items-heading">Contents</h2>
+ <div id="bulk-bar" class="toolbar" role="toolbar" aria-label="Selected items" hidden>
+  <label class="check"><input type="checkbox" id="select-all"> Select all</label>
+  <span id="selected-count" class="meta" role="status"></span>
+  <button type="button" id="bulk-move" class="plain" disabled>Move…</button>
+  <button type="button" id="bulk-copy" class="plain" disabled>Copy…</button>
+  <button type="button" id="bulk-delete" class="plain" disabled>Delete</button>
+ </div>
+ <p id="bulk-results-box" hidden>
+  <strong id="bulk-headline"></strong>
+ </p>
+ <ul id="bulk-results" class="list" hidden></ul>
  <ul id="items" class="list" aria-labelledby="items-heading"></ul>
  <p id="empty" hidden>There is nothing here yet.</p>
  <p><button type="button" id="more" class="plain" hidden>Show more</button></p>
@@ -101,6 +124,18 @@
   <button type="button" id="move-cancel" class="plain">Cancel</button>
   <button type="button" id="move-here" disabled>Move here</button>
  </div>
+</dialog>
+<dialog id="conflict-dialog" aria-labelledby="conflict-title">
+ <form method="dialog" id="conflict-form">
+  <h2 id="conflict-title">That name is taken</h2>
+  <p id="conflict-text"></p>
+  <label class="check"><input type="checkbox" id="conflict-all"> Do this for the rest</label>
+  <div class="row end">
+   <button type="button" id="conflict-skip" class="plain">Skip</button>
+   <button type="button" id="conflict-keep" class="plain">Keep both</button>
+   <button type="button" id="conflict-replace">Replace</button>
+  </div>
+ </form>
 </dialog>
 <script type="module" src="./library.js"></script>
 </body>
