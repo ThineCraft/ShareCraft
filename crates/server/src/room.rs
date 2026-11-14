@@ -136,6 +136,9 @@ pub(crate) enum AccessChange {
     Renamed { name: String },
     /// The document was deleted: every connection is removed with `Removed { deleted }`.
     Deleted,
+    /// Every connection is removed with `Removed { reason }`: the document's site was archived
+    /// (`archived`) or deleted (`deleted`).
+    Ended { reason: RemovedReason },
     /// Asks who is connected: the room answers on `reply` with every account connected (or
     /// being let in), each once. A room still loading its document answers with nobody.
     ConnectedUsers { reply: oneshot::Sender<Vec<UserId>> },
@@ -1030,7 +1033,8 @@ pub(crate) async fn load_serving<T>(
                     AccessChange::SetAccess { .. }
                     | AccessChange::EndSession { .. }
                     | AccessChange::RemoveUser { .. }
-                    | AccessChange::Deleted,
+                    | AccessChange::Deleted
+                    | AccessChange::Ended { .. },
                 ) => {}
                 // The registry holds a sender until the room ends, so this does not happen.
                 None => return loading.await,

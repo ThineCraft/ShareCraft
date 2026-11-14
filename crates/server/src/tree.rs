@@ -65,8 +65,8 @@ pub enum TreeOp {
     Rename { id: NodeId, name: String },
     /// Moves a folder or file into the library or folder `parent`.
     Move { id: NodeId, parent: NodeId },
-    /// Deletes a file, or a folder with every live item below it, to the first stage of the
-    /// site's recycle bin: one entry, `id`, for all of them.
+    /// Deletes a file, or a folder or library with every live item below it, to the first
+    /// stage of the site's recycle bin: one entry, `id`, for all of them.
     Delete { id: NodeId },
     /// Restores the recycle bin entry `id`, with everything deleted with it, where it was (see
     /// [`apply`]).
@@ -334,7 +334,9 @@ impl Default for Plan {
 /// library or a rename of one `manage_site` on the site, a folder `add` on the place it goes
 /// into, a rename `edit`, a move `edit` on what moves and `add` on where it goes, a deletion
 /// `delete`, a folder's deletion also on every place below it with permissions of its own,
-/// `ForbiddenBelow` otherwise); `InvalidName`, `WrongExtension` or `NameTaken` for a name;
+/// `ForbiddenBelow` otherwise, a library's `manage_site` on the site and `delete` on every
+/// place below it with permissions of its own); `Archived` in place of `Forbidden` (and of
+/// `ForbiddenBelow`) when the node's site is archived; `InvalidName`, `WrongExtension` or `NameTaken` for a name;
 /// `WrongPlace` for a kind that cannot go there or cannot be moved or deleted (and for files,
 /// which [`create_document`] creates); `IntoItself` for a move into the node or below it;
 /// `IsSite` for deleting a site; `Exists` for an identifier already used; `OutOfStep` while the
@@ -1499,37 +1501,58 @@ async fn plan_move(
     }))
 }
 
-/// Deletes `id`, and for a folder every live item below it, to the first stage of the site's
-/// recycle bin: each record marked deleted now by `actor` and with `id`, `id` the entry. Items
-/// below that were deleted before keep their own entries. A folder needs `delete` on itself and
-/// on every live place below it with permissions of its own (`ForbiddenBelow` otherwise).
+/// Deletes `id`, and for a folder or library every live item below it, to the first stage of
+/// the site's recycle bin: each record marked deleted now by `actor` and with `id`, `id` the
+/// entry. Items below that were deleted before keep their own entries. A file needs `delete` on
+/// itself; a folder `delete` on itself and on every live place below it with permissions of
+/// its own (`ForbiddenBelow` otherwise); a library `manage_site` on its site and `delete` on
+/// itself, when it has permissions of its own, and on every live place below it with
+/// permissions of its own (`ForbiddenBelow` otherwise).
 async fn plan_delete(state: &AppState, actor: &User, id: NodeId) -> Result<Plan, AccessError> {
     let db = state.db();
     let (node, access) = visible(db, actor, id).await?;
+    let mut needs = Vec::new();
+    let mut below_from: Vec<NodeId> = Vec::new();
     match node.kind {
         NodeKind::Site => return Err(AccessError::IsSite),
-        NodeKind::Library => return Err(AccessError::WrongPlace),
-        NodeKind::Folder | NodeKind::Document => {}
-    }
-    require(&access, Perms::DELETE)?;
-    let mut needs = vec![(id, Perms::DELETE)];
-    let mut needs_below = 0;
-    if node.kind == NodeKind::Folder {
-        for scope in db.scopes_below(id).await? {
-            let allowed = db
-                .effective_access(actor.id, scope)
+        NodeKind::Library => {
+            let site_access = db
+                .effective_access(actor.id, node.site)
                 .await?
-                .is_some_and(|a| a.perms.contains(Perms::DELETE));
-            if !allowed {
-                return Err(AccessError::ForbiddenBelow);
+                .ok_or(AccessError::NotFound)?;
+            require(&site_access, Perms::MANAGE_SITE)?;
+            needs.push((node.site, Perms::MANAGE_SITE));
+            // The library itself, when it has permissions of its own, is one of the places
+            // inside the site that the deletion takes.
+            if node.unique_scope {
+                below_from.push(id);
             }
-            needs.push((scope, Perms::DELETE));
-            needs_below += 1;
         }
+        NodeKind::Folder | NodeKind::Document => {
+            require(&access, Perms::DELETE)?;
+            needs.push((id, Perms::DELETE));
+        }
+    }
+    if matches!(node.kind, NodeKind::Folder | NodeKind::Library) {
+        below_from.extend(db.scopes_below(id).await?);
+    }
+    let needs_below = below_from.len();
+    for scope in below_from {
+        let access = db.effective_access(actor.id, scope).await?;
+        if !access
+            .as_ref()
+            .is_some_and(|a| a.perms.contains(Perms::DELETE))
+        {
+            return Err(match access {
+                Some(access) if access.archived() => AccessError::Archived,
+                _ => AccessError::ForbiddenBelow,
+            });
+        }
+        needs.push((scope, Perms::DELETE));
     }
     let before = git_record(state, id).await?;
     let mut undo = vec![before.clone()];
-    if node.kind == NodeKind::Folder {
+    if matches!(node.kind, NodeKind::Folder | NodeKind::Library) {
         let tree = read_tree(state.checkpointer()).await.map_err(git_failure)?;
         undo.extend(
             below(&tree, id.0)
@@ -1641,14 +1664,19 @@ async fn bin_need(
         }
         BinStage::Second => {
             let site = NodeId(record.site);
-            let manages = db
-                .effective_access(actor.id, site)
-                .await?
-                .is_some_and(|a| a.perms.contains(Perms::MANAGE_SITE));
-            if !manages {
-                return Err(AccessError::NotFound);
+            match db.effective_access(actor.id, site).await? {
+                Some(access) if access.perms.contains(Perms::MANAGE_SITE) => {
+                    Ok((site, Perms::MANAGE_SITE))
+                }
+                // Its managers see the entry still, and are told why nothing changes.
+                Some(access)
+                    if access.archived()
+                        && access.ignoring_archive().contains(Perms::MANAGE_SITE) =>
+                {
+                    Err(AccessError::Archived)
+                }
+                _ => Err(AccessError::NotFound),
             }
-            Ok((site, Perms::MANAGE_SITE))
         }
     }
 }
@@ -1876,7 +1904,8 @@ async fn plan_to_second_stage(
 
 /// Purges the entry `id` with everything deleted with it: by `actor` from the second stage
 /// (with `manage_site` on the site), or by the server (`None`) at any stage when its time in
-/// the bin is up. Items below it deleted on their own keep their entries.
+/// the bin is up. Items below it deleted on their own keep their entries, except below a
+/// library: with no library left to restore them into, they are purged with it.
 async fn plan_purge(
     state: &AppState,
     actor: Option<&User>,
@@ -1894,11 +1923,12 @@ async fn plan_purge(
         None => Vec::new(),
     };
     let tree = read_tree(state.checkpointer()).await.map_err(git_failure)?;
+    let library = entry.kind == kind_word(NodeKind::Library);
     let mut undo = vec![entry.clone()];
     undo.extend(
         below(&tree, id.0)
             .into_iter()
-            .filter(|r| r.purged.is_none() && deleted_with(r) == Some(id.0))
+            .filter(|r| r.purged.is_none() && (library || deleted_with(r) == Some(id.0)))
             .cloned(),
     );
     let stamp = Stamp {
@@ -2361,13 +2391,10 @@ pub(crate) async fn visible(
     Ok((node, access))
 }
 
-/// `Forbidden` unless `access` holds every permission of `needed`.
+/// `Forbidden` unless `access` holds every permission of `needed`; `Archived` instead when the
+/// node's site is archived (see [`Access::require`]).
 pub(crate) fn require(access: &Access, needed: Perms) -> Result<(), AccessError> {
-    if access.perms.contains(needed) {
-        Ok(())
-    } else {
-        Err(AccessError::Forbidden)
-    }
+    access.require(needed)
 }
 
 /// `Exists` if `id` is already used by a node, in Git or PostgreSQL, or by a document.

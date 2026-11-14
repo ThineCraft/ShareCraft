@@ -821,9 +821,10 @@ async fn delete_takes_files_and_folders_with_their_contents() {
         delete(&w.root, &w.site).await,
         (StatusCode::BAD_REQUEST, error("is_site"))
     );
+    // Deleting a library needs manage_site on the site (see tests/archive.rs).
     assert_eq!(
-        delete(&w.root, &w.library).await,
-        (StatusCode::BAD_REQUEST, error("wrong_place"))
+        delete(&ed, &w.library).await,
+        (StatusCode::FORBIDDEN, error("forbidden"))
     );
     // The folder goes with the file in it.
     assert_eq!(

@@ -1,6 +1,7 @@
 //! Sites' own settings: changing them (one Git commit with the site's renamed tree record when
-//! the name changes too, then mirrored into PostgreSQL, taken back if refused), and the
-//! start-up reconcile of the site records, saved templates and global navigation with Git.
+//! the name changes too, then mirrored into PostgreSQL, taken back if refused), archiving and
+//! reactivating a site, ending everything under way in a site, and the start-up reconcile of
+//! the site records, saved templates and global navigation with Git.
 //!
 //! A site created before site records has no record in Git: it reads as a team site with no
 //! description and the organisation's default language and time zone, and its record is
@@ -12,13 +13,14 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use collab_core::ids::{NodeId, UserId};
+use protocol::RemovedReason;
 use records::{
     AccessError, Db, DbError, NewEvent, NodeKind, Perms, RegionalDefaults, SiteChange, SiteKind,
     SiteSettings, TemplateRow, User, validate_description, validate_language, validate_node_name,
     validate_time_zone,
 };
 use revisions::{
-    CheckpointError, GitError, OrgNavigation, SITE_SCHEMA, SiteRecord, TemplateRecord,
+    CheckpointError, GitError, OrgNavigation, SITE_SCHEMA, SiteRecord, Stamp, TemplateRecord,
 };
 use serde_json::{Map, json};
 use time::OffsetDateTime;
@@ -26,10 +28,12 @@ use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
 use crate::AppState;
+use crate::api::uploads::abandon_session;
 use crate::checkpoint::Checkpointer;
+use crate::room::AccessChange;
 use crate::tree::{
-    TreeError, Undo, author_of, ensure_in_step, git_failure, git_record, repair_ids, require,
-    take_back_all, to_row, visible, write_sites,
+    TreeError, Undo, author_of, ensure_in_step, git_failure, git_record, now_text, repair_ids,
+    require, take_back_all, to_row, visible, write_sites,
 };
 
 /// What a person asks to change of a site: each field given is set.
@@ -315,6 +319,183 @@ pub async fn change(
                 state.tree_out_of_step().store(true, Ordering::SeqCst);
             }
             Err(refused)
+        }
+    }
+}
+
+/// Archives `site` for `actor`, an enabled administrator: one Git commit writing the site's
+/// record with `archived` stamped now by `actor`, mirrored into PostgreSQL with `site.archived`.
+/// From then on every permission on the site's nodes is narrowed to `view`, for everyone, and
+/// every write is refused with `Archived`. Then everything under way in the site is ended (see
+/// [`end_site_activity`], with `archived`). Archiving an archived site changes nothing and
+/// writes no commit. Answers the settings as PostgreSQL then holds them.
+///
+/// # Errors
+/// `Forbidden` unless `actor` is an enabled administrator; `NotFound` for anything but a live
+/// site; `OutOfStep` while the tree needs repair; otherwise the Git or database error.
+pub async fn archive(
+    state: &AppState,
+    actor: &User,
+    site: NodeId,
+) -> Result<SiteSettings, AccessError> {
+    let settings = set_archived(state, actor, site, true).await?;
+    end_site_activity(state, site, RemovedReason::Archived).await;
+    Ok(settings)
+}
+
+/// Reactivates the archived `site` for `actor`, an enabled administrator: one Git commit
+/// writing the site's record with no `archived` stamp, mirrored with `site.reactivated`; its
+/// permissions are as they were before it was archived. Reactivating a site that is not
+/// archived changes nothing and writes no commit. Answers the settings as PostgreSQL then
+/// holds them.
+///
+/// # Errors
+/// As [`archive`].
+pub async fn reactivate(
+    state: &AppState,
+    actor: &User,
+    site: NodeId,
+) -> Result<SiteSettings, AccessError> {
+    set_archived(state, actor, site, false).await
+}
+
+/// Archives (`archived`) or reactivates `site` for `actor` (see [`archive`] and
+/// [`reactivate`]), under the tree lock.
+async fn set_archived(
+    state: &AppState,
+    actor: &User,
+    site: NodeId,
+    archived: bool,
+) -> Result<SiteSettings, AccessError> {
+    let _turn = state.tree_lock().lock().await;
+    ensure_in_step(state).await?;
+    let db = state.db();
+    let current = db.user(actor.id).await?;
+    if !current.is_some_and(|u| u.is_admin && !u.disabled) {
+        return Err(AccessError::Forbidden);
+    }
+    let node = db.node(site).await?.ok_or(AccessError::NotFound)?;
+    if node.kind != NodeKind::Site || node.deleted {
+        return Err(AccessError::NotFound);
+    }
+    let store = state.checkpointer();
+    let stored = read_site_record(store, site).await.map_err(git_failure)?;
+    let before = match &stored {
+        Some(record) => record.clone(),
+        None => new_site_record(site, &db.regional_defaults().await?),
+    };
+    if before.archived.is_some() == archived {
+        return db.site_settings(site).await?.ok_or(AccessError::NotFound);
+    }
+    let author = author_of(actor);
+    let mut after = before.clone();
+    after.archived = archived.then(|| Stamp {
+        at: now_text(),
+        by: author.clone(),
+    });
+    let (verb, kind) = if archived {
+        ("Archive", "site.archived")
+    } else {
+        ("Reactivate", "site.reactivated")
+    };
+    let message = format!("{verb} site {}", node.name);
+    write_sites(
+        store,
+        author.clone(),
+        message.clone(),
+        Vec::new(),
+        vec![after.clone()],
+        Vec::new(),
+    )
+    .await
+    .map_err(git_failure)?;
+    let undo = Undo {
+        sites: stored.clone().into_iter().collect(),
+        removed_sites: if stored.is_none() {
+            vec![site.0]
+        } else {
+            Vec::new()
+        },
+        ..Undo::default()
+    };
+    let settings = settings_of(&after).map_err(DbError::new)?;
+    let applied = db
+        .apply_site_change(SiteChange {
+            settings: &settings,
+            node: None,
+            actor: Some(actor.id),
+            needs_admin: true,
+            needs: Perms::NONE,
+            events: vec![NewEvent {
+                kind,
+                actor: Some(actor.id),
+                subject: None,
+                document: None,
+                node: Some(site),
+                detail: json!({ "name": node.name }),
+            }],
+        })
+        .await;
+    match applied {
+        Ok(()) => db.site_settings(site).await?.ok_or(AccessError::NotFound),
+        Err(AccessError::Db(error)) => {
+            eprintln!(
+                "sharecraft-server: {kind} of site {} is in Git but not in the database: {error}",
+                site.0
+            );
+            if !repair_sites(state, &[site]).await {
+                state.tree_out_of_step().store(true, Ordering::SeqCst);
+            }
+            Err(AccessError::Db(error))
+        }
+        Err(refused) => {
+            if let AccessError::Unjudged(error) = &refused {
+                eprintln!(
+                    "sharecraft-server: {kind} of site {} could not be judged, so it is taken \
+                     back: {error}",
+                    site.0
+                );
+            }
+            if !take_back_all(state, author, &message, undo).await {
+                state.tree_out_of_step().store(true, Ordering::SeqCst);
+            }
+            Err(refused)
+        }
+    }
+}
+
+/// Ends everything under way in `site`: every editing session (text and file) of a document
+/// in the site is ended, each person in it removed with `Removed { reason }`, and every upload
+/// session into the site is abandoned, its part file removed and its reservation of the site's
+/// quota released. Archiving calls it with `archived`, deleting a site with `deleted`. Failures
+/// are logged and do not stop the rest: a person left in a session keeps only what the access
+/// decision now gives them, and an upload left open is refused at its next chunk or finish.
+pub(crate) async fn end_site_activity(state: &AppState, site: NodeId, reason: RemovedReason) {
+    let db = state.db();
+    for doc in state.rooms().open_documents() {
+        match db.node(doc.into()).await {
+            Ok(Some(node)) if node.site == site => {
+                // Removal is final, so it needs no ordering with other access changes.
+                state.rooms().send_to(doc, AccessChange::Ended { reason });
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("sharecraft-server: database failure: {e}"),
+        }
+    }
+    let uploads = match db.uploads_in_site(site).await {
+        Ok(uploads) => uploads,
+        Err(e) => {
+            eprintln!("sharecraft-server: database failure: {e}");
+            return;
+        }
+    };
+    for id in uploads {
+        if let Err(e) = abandon_session(state, id).await {
+            eprintln!(
+                "sharecraft-server: could not abandon an upload into site {}: {}",
+                site.0,
+                e.code()
+            );
         }
     }
 }

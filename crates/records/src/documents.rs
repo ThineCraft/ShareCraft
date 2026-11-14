@@ -125,6 +125,9 @@ pub enum AccessError {
     NoSuchRole,
     #[error("you may not do that")]
     Forbidden,
+    /// The node's site is archived: it is read-only for everyone until it is reactivated.
+    #[error("this site is archived")]
+    Archived,
     /// Deleting a folder needs `delete` on every place below it with permissions of its own.
     #[error("you may not delete something inside that folder")]
     ForbiddenBelow,

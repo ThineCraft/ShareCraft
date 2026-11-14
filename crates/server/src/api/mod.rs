@@ -53,6 +53,8 @@ pub(crate) fn router() -> Router<AppState> {
         .route("/sites", get(sites::list).post(sites::create))
         .route("/sites/{id}", get(sites::show).patch(sites::change))
         .route("/sites/{id}/quota", put(sites::set_quota))
+        .route("/sites/{id}/archive", post(sites::archive))
+        .route("/sites/{id}/reactivate", post(sites::reactivate))
         .route("/sites/{id}/groups", get(sites::groups))
         .route("/sites/{id}/template", post(templates::save))
         .route("/templates", get(templates::list))
@@ -176,6 +178,9 @@ pub(crate) enum ApiError {
     /// 403: deleting the folder needs `delete` on a place inside it with permissions of its own,
     /// which the caller lacks.
     ForbiddenBelow,
+    /// 403: the node's site is archived, read-only for everyone until an administrator
+    /// reactivates it. Answered in place of `forbidden` whenever that is why.
+    Archived,
     /// 404: no such API route, document or account, or none the caller may see.
     NotFound,
     /// 404: no account has the email given.
@@ -292,6 +297,7 @@ impl ApiError {
             ApiError::InvalidCredentials => (StatusCode::UNAUTHORIZED, "invalid_credentials"),
             ApiError::Forbidden => (StatusCode::FORBIDDEN, "forbidden"),
             ApiError::ForbiddenBelow => (StatusCode::FORBIDDEN, "forbidden_below"),
+            ApiError::Archived => (StatusCode::FORBIDDEN, "archived"),
             ApiError::NotFound => (StatusCode::NOT_FOUND, "not_found"),
             ApiError::NoSuchUser => (StatusCode::NOT_FOUND, "no_such_user"),
             ApiError::EmailTaken => (StatusCode::CONFLICT, "email_taken"),
@@ -350,6 +356,7 @@ impl From<AccessError> for ApiError {
             AccessError::NoSuchRole => ApiError::InvalidRequest,
             AccessError::Forbidden => ApiError::Forbidden,
             AccessError::ForbiddenBelow => ApiError::ForbiddenBelow,
+            AccessError::Archived => ApiError::Archived,
             AccessError::LastManager => ApiError::LastManager,
             AccessError::BeyondYourAccess => ApiError::BeyondYourAccess,
             AccessError::RoleInUse => ApiError::RoleInUse,
@@ -394,6 +401,7 @@ impl From<LinkError> for ApiError {
     fn from(e: LinkError) -> Self {
         match e {
             LinkError::NotFound => ApiError::LinkNotFound,
+            LinkError::Archived => ApiError::Archived,
             LinkError::Db(_) => ApiError::unavailable(&e),
         }
     }
@@ -404,6 +412,7 @@ impl From<RequestError> for ApiError {
         match e {
             RequestError::TooMany => ApiError::TooManyRequests,
             RequestError::MessageTooLong => ApiError::MessageTooLong,
+            RequestError::Archived => ApiError::Archived,
             RequestError::Db(_) => ApiError::unavailable(&e),
         }
     }

@@ -19,8 +19,8 @@ use uuid::Uuid;
 
 use crate::groups::{manages, visible_groups};
 use crate::scopes::{
-    ASSIGNED, Link, MINE, MINE_ON_N, Standing, access_step, applies_to, chain, crumb, manager,
-    path_in, source_index, standing,
+    ASSIGNED, Link, MINE, MINE_ON_N, Standing, access_step, applies_to, archive_step, chain, crumb,
+    path_in, reading_manager, site_archived, source_index, standing,
 };
 use crate::{
     Access, AccessError, Crumb, Db, DbError, LinkKind, NodeKind, Perms, Principal, RoleRef,
@@ -175,12 +175,17 @@ struct Found {
 }
 
 impl Found {
+    /// Whether the viewer manages access here: what the explorer shows. On an archived site,
+    /// the `manage_access` they would hold were it not archived (reading is not changing).
     fn managed(&self) -> bool {
-        self.node
-            .role
-            .as_ref()
-            .is_some_and(Access::can_manage_access)
+        self.node.role.as_ref().is_some_and(reads_access)
     }
+}
+
+/// Whether `access` lets its person see who has access, as a manager: `manage_access`, or on
+/// an archived site the `manage_access` they would hold were it not archived.
+fn reads_access(access: &Access) -> bool {
+    access.ignoring_archive().contains(Perms::MANAGE_ACCESS)
 }
 
 fn step(kind: NodeKind, name: &str, id: NodeId) -> Step {
@@ -218,6 +223,7 @@ async fn scopes_under(
     let (Some(site), Some(root)) = (root_links.first(), root_links.last()) else {
         return Ok(Vec::new());
     };
+    let archived = site_archived(&mut *conn, site.node.id).await?;
     let rows = sqlx::query(WALK)
         .bind(site.node.id.0)
         .bind(root.node.id.0)
@@ -301,7 +307,8 @@ async fn scopes_under(
             };
             scopes.push(node.scope);
             let mine = own.get(id).cloned().flatten();
-            access = access_step(standing, node.scope, mine, access);
+            // The one rule, then the archive's narrowing, as the access decision has them.
+            access = archive_step(access_step(standing, node.scope, mine, access), archived);
             crumbs.push(Crumb {
                 id: *id,
                 kind: node.kind,
@@ -643,7 +650,7 @@ async fn breaks_window(
     let manages_root = links
         .last()
         .and_then(|link| link.role.as_ref())
-        .is_some_and(Access::can_manage_access);
+        .is_some_and(reads_access);
     if !manages_root {
         return Ok(None);
     }
@@ -724,7 +731,7 @@ async fn breaks_window(
         .then(|| links.get(source_index(&links, true)))
         .flatten()
         .filter(|link| link.node.unique_scope)
-        .filter(|link| link.role.as_ref().is_some_and(Access::can_manage_access))
+        .filter(|link| link.role.as_ref().is_some_and(reads_access))
         .map(crumb);
     let mut breaks = Vec::with_capacity(page_ids.len());
     for (found, breaks_below) in shown
@@ -767,7 +774,7 @@ pub(crate) async fn break_counts_in(
     // Inside the viewer's reach as a manager: they manage access at or above `parent`.
     let inside = links
         .iter()
-        .any(|link| link.role.as_ref().is_some_and(Access::can_manage_access));
+        .any(|link| link.role.as_ref().is_some_and(reads_access));
     if !inside {
         return Ok(Vec::new());
     }
@@ -823,6 +830,7 @@ fn on_scope(standing: Standing, given: Option<i32>) -> Result<Perms, sqlx::Error
         .map(|perms| Access {
             perms,
             roles: Vec::new(),
+            archived_from: None,
         });
     Ok(access_step(standing, true, own, None).map_or(Perms::NONE, |access| access.perms))
 }
@@ -1006,7 +1014,7 @@ impl Db {
     ) -> Result<RestorePreview, AccessError> {
         let mut conn = self.pool().acquire().await?;
         let standing = standing(&mut conn, viewer).await?;
-        let links = manager(chain(&mut conn, viewer, node).await?)?;
+        let links = reading_manager(chain(&mut conn, viewer, node).await?)?;
         let Some(target) = links.last() else {
             return Err(AccessError::NotFound);
         };
@@ -1018,7 +1026,7 @@ impl Db {
             .checked_sub(2)
             .and_then(|i| links.get(i))
             .and_then(|link| link.role.as_ref())
-            .is_some_and(Access::can_manage_access);
+            .is_some_and(reads_access);
         if !parent_manages {
             return Err(AccessError::Forbidden);
         }

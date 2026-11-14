@@ -466,6 +466,7 @@ async fn custom_role_grants_exactly_its_permissions() {
     let expected = Access {
         perms: contributor(),
         roles: vec![role.role_ref()],
+        archived_from: None,
     };
     for node in [t.a, t.b, t.file] {
         assert_eq!(access(&test, cy.id, node).await, Some(expected.clone()));
@@ -755,6 +756,7 @@ async fn listings_follow_assignments() {
     let as_writer = Some(Access {
         perms: contributor(),
         roles: vec![role.role_ref()],
+        archived_from: None,
     });
 
     // Sites: full access, limited access, or every site for an administrator.

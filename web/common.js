@@ -24,6 +24,8 @@ const MESSAGES = {
   forbidden: 'That request was refused. Reload the page and try again.',
   forbidden_below:
     'Something inside that folder has its own permissions and you may not delete it, so the folder cannot be deleted.',
+  archived:
+    'This site is archived, so nothing in it can be changed. An administrator can reactivate it.',
   network: 'Could not reach the server. Check the connection and try again.',
   too_large: 'That file is too large.',
   unknown_editor: 'That kind of document cannot be made here.',
@@ -77,6 +79,7 @@ const REMOVED = Object.assign(Object.create(null), {
   signed_out: 'You were signed out.',
   account_disabled: 'Your account was disabled.',
   deleted: 'This document was deleted.',
+  archived: 'The site of this document was archived. It can still be read, but not changed.',
 });
 
 /** What a document page says when the server removed it, for the server's reason. */

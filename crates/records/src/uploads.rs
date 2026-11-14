@@ -335,6 +335,16 @@ impl Db {
         Ok(Some(Reservation::new(site, bytes_of(size))))
     }
 
+    /// Every upload session into the site `site`, whoever it belongs to, by id.
+    pub async fn uploads_in_site(&self, site: NodeId) -> Result<Vec<Uuid>, DbError> {
+        let ids =
+            sqlx::query_scalar("select id from upload_sessions where site_id = $1 order by id")
+                .bind(site.0)
+                .fetch_all(self.pool())
+                .await?;
+        Ok(ids)
+    }
+
     /// The upload sessions that have received nothing since `before` (nor started after it),
     /// oldest first.
     pub async fn idle_uploads(&self, before: OffsetDateTime) -> Result<Vec<Uuid>, DbError> {

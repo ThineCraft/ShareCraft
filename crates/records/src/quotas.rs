@@ -359,6 +359,15 @@ impl Db {
         if admin != Some(true) {
             return Err(AccessError::Forbidden);
         }
+        // An archived site's quota changes for nobody until it is reactivated.
+        let archived: Option<bool> =
+            sqlx::query_scalar("select archived_at is not null from sites where id = $1 for share")
+                .bind(site.0)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if archived == Some(true) {
+            return Err(AccessError::Archived);
+        }
         let before = locked_usage(&mut tx, site).await?;
         sqlx::query("update site_usage set quota = $2 where site_id = $1")
             .bind(site.0)

@@ -23,7 +23,7 @@ use crate::events::{NewEvent, record};
 use crate::roles::lock_roles;
 use crate::scopes::{
     DEAD, DeadOf, LOCK_ATTEMPTS, MANAGE_ACCESS_BIT, MANAGE_SITE_BIT, REACH, Standing, access_in,
-    judged_roles, lock_top_down, remove_dead_assignments, standing,
+    judged_roles, lock_top_down, remove_dead_assignments, site_archived, standing,
 };
 use crate::{AccessError, Db, DbError, Perms, User};
 
@@ -351,7 +351,8 @@ fn validate_group_name(name: &str) -> Result<&str, AccessError> {
 
 /// Whether `user` manages the members of a group of `site` (`None` for an organisation group):
 /// an enabled administrator manages every group, and someone with `manage_site` on a site its
-/// groups.
+/// groups (on an archived site, the `manage_site` they would hold were it not archived: they
+/// still see the members, though nobody changes them until it is reactivated).
 pub(crate) async fn manages(
     conn: &mut PgConnection,
     user: UserId,
@@ -364,7 +365,7 @@ pub(crate) async fn manages(
             None => Ok(false),
             Some(site) => Ok(access_in(conn, user, site)
                 .await?
-                .is_some_and(|access| access.can_manage_site())),
+                .is_some_and(|access| access.ignoring_archive().contains(Perms::MANAGE_SITE))),
         },
     }
 }
@@ -605,6 +606,12 @@ impl Db {
             let (site, purpose) = group_place(&mut tx, group).await?;
             if locked_admin(&mut tx, actor).await? {
                 lock_groups(&mut tx, [], Some(group)).await?;
+                // An archived site's groups change for nobody, administrators included.
+                if let Some(site) = site
+                    && site_archived(&mut tx, site).await?
+                {
+                    return Err(AccessError::Archived);
+                }
             } else {
                 let site = site.ok_or(AccessError::Forbidden)?;
                 if !judge_membership(&mut tx, actor, group, site, change).await? {
@@ -736,7 +743,7 @@ async fn judge_membership(
     }
     match access_in(&mut *conn, actor, site).await? {
         None => return Err(AccessError::NotFound),
-        Some(access) if !access.can_manage_site() => return Err(AccessError::Forbidden),
+        Some(access) if !access.can_manage_site() => return Err(access.refusal()),
         Some(_) => {}
     }
     for (node, _, perms) in &now_assigned {

@@ -13,7 +13,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
-use super::nodes::require_manager;
+use super::nodes::require_reading_manager;
 use super::{ApiError, JsonBody, parse_id, to_completion};
 use crate::AppState;
 use crate::auth::Signed;
@@ -167,7 +167,7 @@ pub(crate) async fn events(
     let doc = DocId(parse_id(&id)?);
     let db = state.db();
     let caller = signed.session.user.id;
-    require_manager(db, caller, doc.into()).await?;
+    require_reading_manager(db, caller, doc.into()).await?;
     let events = db
         .recent_events_for(doc, MAX_EVENTS)
         .await

@@ -23,7 +23,7 @@ use crate::events::{NewEvent, record};
 use crate::explorer::UserRef;
 use crate::scopes::{
     MANAGE_ACCESS_BIT, MAX_DEPTH, MINE, Standing, assign_locked, assignment_on, chain, crumb,
-    document_of, manager, path_in, source_index, standing,
+    document_of, manager, node_site_archived, path_in, source_index, standing,
 };
 use crate::{AccessError, Crumb, Db, DbError, Principal, RoleRef};
 
@@ -44,6 +44,10 @@ pub enum RequestError {
     /// else.
     #[error("that message is too long")]
     MessageTooLong,
+    /// The item is in an archived site, which takes no requests until it is reactivated. Said
+    /// only to someone who can see the item; anyone else gets the usual answer.
+    #[error("this site is archived")]
+    Archived,
     #[error(transparent)]
     Db(#[from] DbError),
 }
@@ -198,14 +202,26 @@ impl Db {
         .fetch_all(&mut *tx)
         .await?;
         let links = chain(&mut tx, user, node).await?;
-        // Wanted only for a live item the person cannot open, whose chain is the one locked.
-        let wanted = links.as_ref().is_some_and(|links| {
-            links.last().is_some_and(|link| link.role.is_none())
-                && links
-                    .iter()
-                    .map(|link| link.node.id.0)
-                    .eq(locked.iter().copied())
-        });
+        let archived = node_site_archived(&mut tx, node).await?;
+        // Someone who can see the item is told why; anyone else learns nothing.
+        if archived
+            && links
+                .as_ref()
+                .is_some_and(|links| links.last().is_some_and(|link| link.role.is_some()))
+        {
+            tx.commit().await?;
+            return Err(RequestError::Archived);
+        }
+        // Wanted only for a live item the person cannot open, whose chain is the one locked,
+        // in a site that is not archived.
+        let wanted = !archived
+            && links.as_ref().is_some_and(|links| {
+                links.last().is_some_and(|link| link.role.is_none())
+                    && links
+                        .iter()
+                        .map(|link| link.node.id.0)
+                        .eq(locked.iter().copied())
+            });
         let written: Option<(Uuid, bool)> = sqlx::query_as(
             "insert into access_requests (id, node_id, requester, message) \
              select $1, $2, $3, $4 where $5 \
@@ -267,10 +283,15 @@ impl Db {
             let Some(mut links) = chain(&mut conn, manager, node).await? else {
                 continue;
             };
+            // Reading: on an archived site its managers still see the requests waiting.
             if !links
                 .last()
                 .and_then(|link| link.role.as_ref())
-                .is_some_and(crate::Access::can_manage_access)
+                .is_some_and(|access| {
+                    access
+                        .ignoring_archive()
+                        .contains(crate::Perms::MANAGE_ACCESS)
+                })
             {
                 continue;
             }

@@ -512,16 +512,18 @@ async fn judge(
     // Every chain and role is locked now, so none of this access can change before the commit.
     let below_from = change.needs.len().saturating_sub(change.needs_below);
     for (at, (id, needed)) in change.needs.iter().enumerate() {
-        let allowed = match access_with(&mut *conn, actor, *id, change.as_if_live).await? {
+        let access = access_with(&mut *conn, actor, *id, change.as_if_live).await?;
+        let allowed = match &access {
             None if at < below_from => return Err(AccessError::NotFound),
             None => false,
             Some(access) => access.perms.contains(*needed),
         };
         if !allowed {
-            return Err(if at < below_from {
-                AccessError::Forbidden
-            } else {
-                AccessError::ForbiddenBelow
+            // A refusal because the site is archived says so, wherever it is judged.
+            return Err(match access {
+                Some(access) if access.archived() => AccessError::Archived,
+                _ if at < below_from => AccessError::Forbidden,
+                _ => AccessError::ForbiddenBelow,
             });
         }
     }

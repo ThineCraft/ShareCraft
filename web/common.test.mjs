@@ -171,6 +171,7 @@ test('every error code of the tree and access routes has its own sentence', () =
     'invalid_time_zone',
     'invalid_navigation',
     'invalid_template',
+    'archived',
   ]) {
     assert.notEqual(messageFor(code), general, code);
   }
@@ -182,6 +183,12 @@ test('every error code of the tree and access routes has its own sentence', () =
 test('a document that was deleted has its own removal message', () => {
   assert.equal(removedMessage('deleted'), 'This document was deleted.');
   assert.notEqual(removedMessage('access_revoked'), removedMessage('deleted'));
+});
+
+test('a document whose site was archived has its own removal message', () => {
+  assert.match(removedMessage('archived'), /archived/);
+  assert.match(messageFor('archived'), /archived/);
+  assert.notEqual(removedMessage('archived'), removedMessage('deleted'));
 });
 
 test('a removed frame is read as a removal even when the client cannot read it', () => {

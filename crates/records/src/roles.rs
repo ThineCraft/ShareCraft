@@ -214,12 +214,18 @@ pub struct RoleRef {
 }
 
 /// What a person may do with a node: the union of the permissions of every assignment that
-/// names them on the scope deciding the node, and the roles that gave them, for display.
+/// names them on the scope deciding the node, and the roles that gave them, for display. On a
+/// node of an archived site every permission is narrowed to `view` (see
+/// [`Access::narrowed_by_archive`]), for everyone, administrators included.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Access {
     pub perms: Perms,
     /// The roles of those assignments, by id, each once.
     pub roles: Vec<RoleRef>,
+    /// On a node of an archived site, the permissions the person would hold were it not
+    /// archived; `None` otherwise. Not answered: the site says it is archived.
+    #[serde(skip)]
+    pub archived_from: Option<Perms>,
 }
 
 impl Access {
@@ -229,6 +235,7 @@ impl Access {
         Access {
             perms: role.perms,
             roles: vec![role.role_ref()],
+            archived_from: None,
         }
     }
 
@@ -241,6 +248,59 @@ impl Access {
                 id: "owner".to_owned(),
                 name: "Owner".to_owned(),
             }],
+            archived_from: None,
+        }
+    }
+
+    /// This access on a node of an archived site: `view` alone (nothing if it held nothing),
+    /// keeping the roles for display and remembering what it held in `archived_from`. The
+    /// narrowing every access decision on an archived site goes through.
+    #[must_use]
+    pub fn narrowed_by_archive(self) -> Access {
+        let held = self.archived_from.unwrap_or(self.perms);
+        Access {
+            perms: if held.is_empty() {
+                Perms::NONE
+            } else {
+                Perms::VIEW
+            },
+            roles: self.roles,
+            archived_from: Some(held),
+        }
+    }
+
+    /// Whether this access was narrowed because the node's site is archived.
+    #[must_use]
+    pub fn archived(&self) -> bool {
+        self.archived_from.is_some()
+    }
+
+    /// The permissions held were the site not archived: what decides what a person may *see*
+    /// (the explorer, a scope's access, its links, the bin), never what they may change.
+    #[must_use]
+    pub fn ignoring_archive(&self) -> Perms {
+        self.archived_from.unwrap_or(self.perms)
+    }
+
+    /// The refusal for a permission this access lacks: `Archived` on a node of an archived
+    /// site, `Forbidden` otherwise.
+    #[must_use]
+    pub fn refusal(&self) -> AccessError {
+        if self.archived() {
+            AccessError::Archived
+        } else {
+            AccessError::Forbidden
+        }
+    }
+
+    /// `Ok` if this access holds every permission of `needed`, otherwise its [`refusal`].
+    ///
+    /// [`refusal`]: Access::refusal
+    pub fn require(&self, needed: Perms) -> Result<(), AccessError> {
+        if self.perms.contains(needed) {
+            Ok(())
+        } else {
+            Err(self.refusal())
         }
     }
 
@@ -258,7 +318,11 @@ impl Access {
         }
         roles.sort();
         roles.dedup_by(|a, b| a.id == b.id);
-        Some(Access { perms, roles })
+        Some(Access {
+            perms,
+            roles,
+            archived_from: None,
+        })
     }
 
     /// Reads the columns `perms` (`bit_or` of the roles' permissions), `role_ids` and
@@ -283,6 +347,7 @@ impl Access {
         Ok(Some(Access {
             perms: Perms::from_column(perms)?,
             roles,
+            archived_from: None,
         }))
     }
 

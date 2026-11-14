@@ -448,8 +448,11 @@ async fn after_rename(state: &AppState, doc: DocId) {
 }
 
 /// `DELETE /api/nodes/{id}`: deletes a file, or a folder with every live item in it, to the
-/// first stage of the site's recycle bin (editors). Everyone connected to a deleted file, in
-/// the folder or below it too, is removed with `Removed { deleted }` before the answer. `204`.
+/// first stage of the site's recycle bin (editors), or a library with everything in it (people
+/// with `manage_site` on the site, and `delete` on every place inside with permissions of its
+/// own: `403 forbidden_below` otherwise); `400 is_site` for a site. Everyone connected to a
+/// deleted file, in the folder or library or below it too, is removed with
+/// `Removed { deleted }` before the answer. `204`.
 pub(crate) async fn remove(
     State(state): State<AppState>,
     signed: Signed,
@@ -652,7 +655,8 @@ pub(crate) async fn access(
 }
 
 /// Succeeds if `user` may manage access to `node`: `NotFound` when they have no access to it,
-/// `Forbidden` when it lacks `manage_access`.
+/// `Forbidden` when it lacks `manage_access` (`Archived` on an archived site). For changing
+/// access.
 pub(super) async fn require_manager(db: &Db, user: UserId, node: NodeId) -> Result<(), ApiError> {
     match db
         .effective_access(user, node)
@@ -660,7 +664,27 @@ pub(super) async fn require_manager(db: &Db, user: UserId, node: NodeId) -> Resu
         .map_err(|e| ApiError::unavailable(&e))?
     {
         None => Err(ApiError::NotFound),
-        Some(held) if !held.can_manage_access() => Err(ApiError::Forbidden),
+        Some(held) if !held.can_manage_access() => Err(held.refusal().into()),
+        Some(_) => Ok(()),
+    }
+}
+
+/// [`require_manager`] for reading what managers read (the explorer, a document's events): on
+/// an archived site the `manage_access` the person would hold were it not archived is enough.
+pub(super) async fn require_reading_manager(
+    db: &Db,
+    user: UserId,
+    node: NodeId,
+) -> Result<(), ApiError> {
+    match db
+        .effective_access(user, node)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?
+    {
+        None => Err(ApiError::NotFound),
+        Some(held) if !held.ignoring_archive().contains(Perms::MANAGE_ACCESS) => {
+            Err(ApiError::Forbidden)
+        }
         Some(_) => Ok(()),
     }
 }

@@ -1,6 +1,6 @@
 //! Sites, the top level of the content tree: the site directory, one site with its settings,
-//! owners, storage and quota, creating one, changing its settings, setting its quota, and a
-//! site's three groups.
+//! owners, storage and quota, creating one, changing its settings, setting its quota,
+//! archiving and reactivating it, and a site's three groups.
 
 use std::collections::HashMap;
 
@@ -91,9 +91,11 @@ async fn visible_sites(
         .collect())
 }
 
-/// Whether `access` includes `manage_site`.
+/// Whether `access` includes `manage_site`, or on an archived site would include it were the
+/// site not archived: who sees an archived site in the directory and a site's storage. Seeing
+/// is not changing; nobody holds `manage_site` on an archived site.
 fn manages(access: Option<&Access>) -> bool {
-    access.is_some_and(|a| a.perms.contains(Perms::MANAGE_SITE))
+    access.is_some_and(|a| a.ignoring_archive().contains(Perms::MANAGE_SITE))
 }
 
 /// `GET /api/sites?q=&hub=&kind=`: the site directory, by name: the sites the caller can see,
@@ -398,7 +400,7 @@ pub(crate) async fn set_quota(
     let site = node_id(&id)?;
     let actor = signed.session.user;
     if !actor.is_admin {
-        return Err(ApiError::Forbidden);
+        return Err(refused_on(state.db(), &actor, site).await?);
     }
     to_completion(async move {
         state
@@ -408,4 +410,66 @@ pub(crate) async fn set_quota(
         Ok(StatusCode::NO_CONTENT.into_response())
     })
     .await
+}
+
+/// The refusal of a route only administrators may use, for `user`, who is not one: `403
+/// archived` when they can see `site` and it is archived (so the page can say why nothing
+/// changes), `403 forbidden` otherwise.
+async fn refused_on(db: &Db, user: &User, site: NodeId) -> Result<ApiError, ApiError> {
+    let access = db
+        .effective_access(user.id, site)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?;
+    Ok(match access {
+        Some(access) => access.refusal().into(),
+        None => ApiError::Forbidden,
+    })
+}
+
+/// `POST /api/sites/{id}/archive`: archives the site (see [`sites::archive`]): read-only for
+/// everyone, administrators included, hidden from the directory but for its managers, its open
+/// editing sessions ended (`archived`), its uploads abandoned and its anyone links answering as
+/// expired ones do, until it is reactivated. Administrators only (`403`); `404` for anything but
+/// a live site. One commit, recorded as `site.archived`; archiving an archived site changes
+/// nothing. Answers the site as `GET /api/sites/{id}` does.
+pub(crate) async fn archive(
+    State(state): State<AppState>,
+    signed: Signed,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let site = node_id(&id)?;
+    let actor = signed.session.user;
+    {
+        let state = state.clone();
+        let actor = actor.clone();
+        to_completion(async move {
+            sites::archive(&state, &actor, site).await?;
+            Ok(())
+        })
+        .await?;
+    }
+    Ok(Json(site_out(&state, &actor, site).await?))
+}
+
+/// `POST /api/sites/{id}/reactivate`: makes the archived site writable again, with every
+/// permission as it was (see [`sites::reactivate`]). Administrators only (`403`); `404` for
+/// anything but a live site. One commit, recorded as `site.reactivated`; reactivating a site
+/// that is not archived changes nothing. Answers the site as `GET /api/sites/{id}` does.
+pub(crate) async fn reactivate(
+    State(state): State<AppState>,
+    signed: Signed,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let site = node_id(&id)?;
+    let actor = signed.session.user;
+    {
+        let state = state.clone();
+        let actor = actor.clone();
+        to_completion(async move {
+            sites::reactivate(&state, &actor, site).await?;
+            Ok(())
+        })
+        .await?;
+    }
+    Ok(Json(site_out(&state, &actor, site).await?))
 }

@@ -27,6 +27,7 @@ pub(crate) fn builtin_access(id: &str) -> Access {
         || Access {
             perms: records::Perms::NONE,
             roles: Vec::new(),
+            archived_from: None,
         },
         |role| Access::from_role(&role),
     )
@@ -334,7 +335,8 @@ pub(crate) fn users_of<'a>(members: impl IntoIterator<Item = &'a Member>) -> Vec
 
 /// Carries out one access change in `room`: a role adjusts every connection of that person;
 /// no role, an ended sign-in or a disabled account removes the connections concerned; a
-/// deleted document removes everyone; a rename changes the name later revisions are stored
+/// deleted document, or the end of everything in its site, removes everyone; a rename changes
+/// the name later revisions are stored
 /// under; a question about who is connected is answered.
 pub(crate) fn apply_access(room: &mut impl AccessRules, change: AccessChange) {
     match change {
@@ -349,6 +351,7 @@ pub(crate) fn apply_access(room: &mut impl AccessRules, change: AccessChange) {
             room.remove(&|m| m.user == user, RemovedReason::AccountDisabled);
         }
         AccessChange::Deleted => room.remove(&|_| true, RemovedReason::Deleted),
+        AccessChange::Ended { reason } => room.remove(&|_| true, reason),
         AccessChange::Renamed { name } => room.rename(name),
         AccessChange::ConnectedUsers { reply } => {
             // The asker may have gone away; nothing to do then.

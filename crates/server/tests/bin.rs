@@ -358,8 +358,7 @@ async fn delete_folder_with_contents() {
     assert_eq!(second["items"][0]["name"], "C");
     assert!(second["next"].is_null());
 
-    // The site and the library cannot be deleted.
-    assert_eq!(w.delete(&w.root, &w.library).await, StatusCode::BAD_REQUEST);
+    // The site cannot be deleted (a library can: see tests/archive.rs).
     assert_eq!(w.delete(&w.root, &w.site).await, StatusCode::BAD_REQUEST);
 }
 

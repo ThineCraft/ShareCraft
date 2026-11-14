@@ -32,7 +32,9 @@ pub(crate) struct NewRequest {
 /// `POST /api/nodes/{id}/requests {message?}`: asks for access to the node. `202` with
 /// `{message}` (always the same) whether the node exists, does not, or is one the caller can
 /// already open; `429 too_many_requests` after 20 submissions in a day (checked before
-/// anything about the node); `400 message_too_long` over 500 characters.
+/// anything about the node); `400 message_too_long` over 500 characters; `403 archived` to
+/// someone who can see the node when its site is archived (anyone else gets the usual `202`,
+/// and nothing is recorded).
 pub(crate) async fn create(
     State(state): State<AppState>,
     signed: Signed,

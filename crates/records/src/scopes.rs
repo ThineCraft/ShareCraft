@@ -183,7 +183,8 @@ pub(crate) async fn remove_dead_assignments(
 }
 
 /// `node` ($2) and everything above it; each scope once per assignment of `$1`'s on it (see
-/// [`mine!`]) with that assignment's role, or once with nulls if there is none.
+/// [`mine!`]) with that assignment's role, or once with nulls if there is none; with, for a
+/// site, whether it is archived (`site_archived`).
 const CHAIN: &str = concat!(
     "with recursive ",
     mine!(),
@@ -196,9 +197,52 @@ const CHAIN: &str = concat!(
         select n.id, n.kind, n.parent_id, n.site_id, n.name, n.unique_scope, \
                n.deleted_at is not null, n.created_by, n.created_at, n.purged_at is not null \
         from nodes n join up on n.id = up.parent_id) \
-    select up.*, m.role_id, m.role_name, m.perms from up \
-    left join mine m on m.node_id = up.id and up.unique_scope"
+    select up.*, m.role_id, m.role_name, m.perms, \
+           coalesce(s.archived_at is not null, false) as site_archived from up \
+    left join mine m on m.node_id = up.id and up.unique_scope \
+    left join sites s on s.id = up.id and up.kind = 'site'"
 );
+
+/// Whether the site `site` is archived. `false` for a site with no `sites` row, or a node that
+/// is not a site.
+pub(crate) async fn site_archived(
+    conn: &mut PgConnection,
+    site: NodeId,
+) -> Result<bool, sqlx::Error> {
+    let archived: Option<bool> =
+        sqlx::query_scalar("select archived_at is not null from sites where id = $1")
+            .bind(site.0)
+            .fetch_optional(conn)
+            .await?;
+    Ok(archived.unwrap_or(false))
+}
+
+/// Whether the site of the node `node` is archived. `false` for an unknown node.
+pub(crate) async fn node_site_archived(
+    conn: &mut PgConnection,
+    node: NodeId,
+) -> Result<bool, sqlx::Error> {
+    let archived: Option<bool> = sqlx::query_scalar(
+        "select s.archived_at is not null from nodes n join sites s on s.id = n.site_id \
+         where n.id = $1",
+    )
+    .bind(node.0)
+    .fetch_optional(conn)
+    .await?;
+    Ok(archived.unwrap_or(false))
+}
+
+/// The archive's narrowing of one access decision: on a node of an archived site (`archived`)
+/// every permission becomes `view`, for everyone, administrators included (see
+/// [`Access::narrowed_by_archive`]); anywhere else `access` as it is. Applied after
+/// [`access_step`], the administrator's shortcut included.
+pub(crate) fn archive_step(access: Option<Access>, archived: bool) -> Option<Access> {
+    if archived {
+        access.map(Access::narrowed_by_archive)
+    } else {
+        access
+    }
+}
 
 /// The access the person's assignments (see [`mine!`]) give on the node `n` of the enclosing
 /// query when it is a scope, as the columns [`Access::from_aggregate`] reads.
@@ -392,7 +436,9 @@ pub(crate) fn access_step(
 ///
 /// This is the one place access is decided: an enabled administrator has every permission
 /// everywhere; otherwise a scope gives the union of the person's assignments on it (see
-/// [`mine!`]), and any other node the access of the node above.
+/// [`mine!`]), and any other node the access of the node above. On an archived site every
+/// permission so worked out, an administrator's included, is narrowed to `view` (see
+/// [`archive_step`]).
 pub(crate) async fn chain(
     conn: &mut PgConnection,
     user: UserId,
@@ -426,10 +472,14 @@ pub(crate) async fn chain_with(
     let mut by_id: HashMap<NodeId, (Node, Vec<(RoleRef, Perms)>)> =
         HashMap::with_capacity(rows.len());
     let mut purged = std::collections::HashSet::new();
+    let mut archived = false;
     for row in &rows {
         let found = node_from_row(row)?;
         if row.try_get::<bool, _>("purged")? {
             purged.insert(found.id);
+        }
+        if found.kind == NodeKind::Site && row.try_get::<bool, _>("site_archived")? {
+            archived = true;
         }
         let given = match row.try_get::<Option<String>, _>("role_id")? {
             Some(id) => Some((
@@ -486,7 +536,7 @@ pub(crate) async fn chain_with(
         return Ok(None);
     }
     let mut role = None;
-    let links: Vec<Link> = upward
+    let mut links: Vec<Link> = upward
         .into_iter()
         .rev()
         .map(|(node, given)| {
@@ -509,6 +559,12 @@ pub(crate) async fn chain_with(
             .is_some_and(|access| access.perms.contains(Perms::MANAGE_SITE));
         if !manages {
             return Ok(None);
+        }
+    }
+    // After every other rule, the administrator's shortcut included.
+    if archived {
+        for link in &mut links {
+            link.role = archive_step(link.role.take(), true);
         }
     }
     Ok(Some(links))
@@ -601,12 +657,25 @@ pub(crate) fn judged_roles(links: &[Link]) -> impl Iterator<Item = String> + '_ 
 }
 
 /// `NotFound` unless the chain exists and its person has access to the last node, `Forbidden`
-/// unless that access includes `manage_access`.
+/// unless that access includes `manage_access` (`Archived` on an archived site, where nobody
+/// holds it). For changing access.
 pub(crate) fn manager(links: Option<Vec<Link>>) -> Result<Vec<Link>, AccessError> {
     let links = links.ok_or(AccessError::NotFound)?;
     match links.last().and_then(|link| link.role.as_ref()) {
         None => Err(AccessError::NotFound),
         Some(access) if access.can_manage_access() => Ok(links),
+        Some(access) => Err(access.refusal()),
+    }
+}
+
+/// [`manager`] for seeing access rather than changing it: on an archived site, the
+/// `manage_access` the person would hold were it not archived is enough, so the people who
+/// managed it still read who has access, its links and its requests.
+pub(crate) fn reading_manager(links: Option<Vec<Link>>) -> Result<Vec<Link>, AccessError> {
+    let links = links.ok_or(AccessError::NotFound)?;
+    match links.last().and_then(|link| link.role.as_ref()) {
+        None => Err(AccessError::NotFound),
+        Some(access) if access.ignoring_archive().contains(Perms::MANAGE_ACCESS) => Ok(links),
         Some(_) => Err(AccessError::Forbidden),
     }
 }
@@ -746,6 +815,19 @@ impl Db {
         Ok(access_in(&mut conn, user, node).await?)
     }
 
+    /// Whether the site `site` is archived: read-only for everyone until it is reactivated.
+    /// `false` for a node that is not a site, or an unknown one.
+    pub async fn site_archived(&self, site: NodeId) -> Result<bool, DbError> {
+        let mut conn = self.pool().acquire().await?;
+        Ok(site_archived(&mut conn, site).await?)
+    }
+
+    /// Whether the site of the node `node` is archived. `false` for an unknown node.
+    pub async fn node_site_archived(&self, node: NodeId) -> Result<bool, DbError> {
+        let mut conn = self.pool().acquire().await?;
+        Ok(node_site_archived(&mut conn, node).await?)
+    }
+
     /// Whether `user` may manage access somewhere: an enabled administrator, or an enabled
     /// account with `manage_access` on some live node. A disabled or unknown account may not.
     pub async fn manages_access_anywhere(&self, user: UserId) -> Result<bool, DbError> {
@@ -776,7 +858,8 @@ impl Db {
     }
 
     /// The sites `user` can see, by name: those they have access to, and those where they have
-    /// access only somewhere below (`None`, limited access).
+    /// access only somewhere below (`None`, limited access). On an archived site the access is
+    /// narrowed to `view`, as the one access decision narrows it.
     pub async fn sites_for(&self, user: UserId) -> Result<Vec<(Node, Option<Access>)>, DbError> {
         let mut conn = self.pool().acquire().await?;
         let admin = match standing(&mut conn, user).await? {
@@ -786,8 +869,10 @@ impl Db {
         };
         let query = format!(
             "with recursive {REACH} \
-             select {NODE_COLUMNS}, g.perms, g.role_ids, g.role_names \
+             select {NODE_COLUMNS}, g.perms, g.role_ids, g.role_names, \
+                    coalesce(s.archived_at is not null, false) as site_archived \
              from nodes n {MINE_ON_N} \
+             left join sites s on s.id = n.id \
              where n.parent_id is null and n.deleted_at is null \
                and ($2 or g.perms is not null or n.id in (select id from reach)) \
              order by lower(n.name), n.id"
@@ -804,6 +889,7 @@ impl Db {
                 } else {
                     Access::from_aggregate(row)?
                 };
+                let access = archive_step(access, row.try_get("site_archived")?);
                 Ok((node_from_row(row)?, access))
             })
             .collect::<Result<_, sqlx::Error>>()
@@ -827,6 +913,10 @@ impl Db {
         let mut conn = self.pool().acquire().await?;
         let Some(mut links) = chain(&mut conn, user, parent).await? else {
             return Ok(None);
+        };
+        let archived = match links.first() {
+            Some(site) => site_archived(&mut conn, site.node.id).await?,
+            None => false,
         };
         let parent_access = links.pop().and_then(|link| link.role);
         if parent_access.is_none() && !in_reach(&mut conn, user, parent).await? {
@@ -867,9 +957,9 @@ impl Db {
         for row in &rows {
             let node = node_from_row(row)?;
             let role = if admin {
-                Some(Access::administrator())
+                archive_step(Some(Access::administrator()), archived)
             } else if node.unique_scope {
-                Access::from_aggregate(row)?
+                archive_step(Access::from_aggregate(row)?, archived)
             } else {
                 parent_access.clone()
             };
@@ -906,7 +996,7 @@ impl Db {
     /// Who has access to `node` and where it comes from. `actor` must manage access to it.
     pub async fn access(&self, actor: UserId, node: NodeId) -> Result<NodeAccess, AccessError> {
         let mut conn = self.pool().acquire().await?;
-        let links = manager(chain(&mut conn, actor, node).await?)?;
+        let links = reading_manager(chain(&mut conn, actor, node).await?)?;
         let source = links
             .get(source_index(&links, false))
             .ok_or(AccessError::NotFound)?;
@@ -1031,7 +1121,10 @@ impl Db {
             .and_then(|link| link.role.as_ref())
             .is_some_and(Access::can_manage_access);
         if !parent_manages {
-            return Err(AccessError::Forbidden);
+            return Err(target
+                .role
+                .as_ref()
+                .map_or(AccessError::Forbidden, Access::refusal));
         }
         let removed: i64 =
             sqlx::query_scalar("select count(*) from assignments where node_id = $1")

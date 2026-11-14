@@ -484,7 +484,7 @@ pub(crate) async fn save(
         .map_err(|e| ApiError::unavailable(&e))?
         .ok_or(ApiError::NotFound)?;
     if !access.can_edit() {
-        return Err(ApiError::Forbidden);
+        return Err(access.refusal().into());
     }
     let document = db
         .document(doc)

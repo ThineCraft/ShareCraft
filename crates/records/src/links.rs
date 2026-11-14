@@ -27,7 +27,8 @@ use crate::groups::{all_locked, groups_judged_by, lock_groups};
 use crate::roles::{lock_roles, role_by_id};
 use crate::scopes::{
     CHILD_ORDER, DEAD, LOCK_ATTEMPTS, NODE_COLUMNS, break_locked, chain, document_of, judged_roles,
-    lock_segment, lock_top_down, manager, scopes_of, segment, source_index, with_principal,
+    lock_segment, lock_top_down, manager, node_site_archived, reading_manager, scopes_of, segment,
+    source_index, with_principal,
 };
 use crate::settings::sharing_in;
 use crate::tree::node_from_row;
@@ -135,6 +136,9 @@ pub enum LinkError {
     /// distinguished.
     #[error("this link does not work")]
     NotFound,
+    /// The link's item is in an archived site, which nobody joins until it is reactivated.
+    #[error("this site is archived")]
+    Archived,
     #[error(transparent)]
     Db(#[from] DbError),
 }
@@ -398,14 +402,18 @@ macro_rules! own_permissions_below_root {
 }
 
 /// The live anyone link with the token hash `$1`, unexpired at `$2`, while the organisation
-/// allows anyone links: the CTE `link(id, root)`, empty otherwise.
+/// allows anyone links and its item's site is not archived (an archived site's anyone links
+/// answer as expired ones do, until it is reactivated): the CTE `link(id, root)`, empty
+/// otherwise.
 const ANYONE_LINK: &str = "\
     link(id, root) as ( \
         select l.id, l.node_id from links l \
         where l.token_hash = $1 and l.kind = 'anyone' and l.revoked_at is null \
           and l.expires_at > $2 \
           and exists (select 1 from settings s \
-                      where s.key = 'anyone_links' and s.value = 'true'::jsonb))";
+                      where s.key = 'anyone_links' and s.value = 'true'::jsonb) \
+          and not exists (select 1 from nodes ln join sites ls on ls.id = ln.site_id \
+                          where ln.id = l.node_id and ls.archived_at is not null))";
 
 /// Of the nodes listed by `held(node_id)` (a CTE the query defines after [`ANYONE_LINK`]),
 /// those an anyone link reaches: the CTE `reachable(id)`. A node is reachable when it is the
@@ -644,7 +652,7 @@ impl Db {
     /// the node (`NotFound`, `Forbidden`).
     pub async fn links_on(&self, actor: UserId, node: NodeId) -> Result<Vec<Link>, AccessError> {
         let mut conn = self.pool().acquire().await?;
-        manager(chain(&mut conn, actor, node).await?)?;
+        reading_manager(chain(&mut conn, actor, node).await?)?;
         let query = format!(
             "select {LINK_COLUMNS} from {LINK_FROM} where l.node_id = $1 \
              order by l.created_at desc, l.id"
@@ -802,6 +810,10 @@ impl Db {
                 tx.rollback().await?;
                 continue;
             }
+            // Joining is a change of who has access: an archived site takes none.
+            if node_site_archived(&mut tx, node).await? {
+                return Err(LinkError::Archived);
+            }
             let Some(role) = role_by_id(&mut tx, &role).await? else {
                 return Err(LinkError::NotFound);
             };
@@ -853,8 +865,10 @@ impl Db {
             "select l.node_id, l.kind, r.id, r.name from links l join roles r on r.id = l.role_id \
              where l.token_hash = $1 and l.revoked_at is null \
                and (l.expires_at is null or l.expires_at > now()) \
-               and (l.kind = 'signed_in' or exists (select 1 from settings s \
-                    where s.key = 'anyone_links' and s.value = 'true'::jsonb))",
+               and (l.kind = 'signed_in' or (exists (select 1 from settings s \
+                    where s.key = 'anyone_links' and s.value = 'true'::jsonb) \
+                    and not exists (select 1 from nodes ln join sites ls on ls.id = ln.site_id \
+                                    where ln.id = l.node_id and ls.archived_at is not null)))",
         )
         .bind(token.hash())
         .fetch_optional(self.pool())

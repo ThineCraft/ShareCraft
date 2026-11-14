@@ -138,7 +138,8 @@ impl Db {
     /// the last). The first stage lists the entries `user` could restore: those they may delete
     /// as if live (see [`Db::access_as_if_live`]), so nobody sees an entry whose name they could
     /// not see when it was live. The second stage lists every entry, to people with
-    /// `manage_site` on the site only.
+    /// `manage_site` on the site only. On an archived site these are judged by what the person
+    /// would hold were it not archived: reading the bin is not changing it.
     ///
     /// # Errors
     /// `NotFound` if `site` is not a live site; `Forbidden` for the second stage without
@@ -157,9 +158,11 @@ impl Db {
         if !found.is_some_and(|n| n.kind == NodeKind::Site && !n.deleted) {
             return Err(AccessError::NotFound);
         }
+        // Seeing the bin is reading: on an archived site it is judged by what each person would
+        // hold were it not archived, so its managers still see what is in it.
         if stage == BinStage::Second {
             let access = self.effective_access(user, site).await?;
-            if !access.is_some_and(|a| a.perms.contains(Perms::MANAGE_SITE)) {
+            if !access.is_some_and(|a| a.ignoring_archive().contains(Perms::MANAGE_SITE)) {
                 return Err(AccessError::Forbidden);
             }
         }
@@ -179,7 +182,7 @@ impl Db {
                     BinStage::First => self
                         .access_as_if_live(user, entry.id)
                         .await?
-                        .is_some_and(|a| a.perms.contains(Perms::DELETE)),
+                        .is_some_and(|a| a.ignoring_archive().contains(Perms::DELETE)),
                 };
                 if !shown {
                     continue;

@@ -517,7 +517,7 @@ async fn check_new_version(state: &AppState, user: &User, doc: DocId) -> Result<
         return Err(ApiError::TextDocument);
     }
     if !access.can_edit() {
-        return Err(ApiError::Forbidden);
+        return Err(access.refusal().into());
     }
     Ok(document.name)
 }
@@ -553,6 +553,36 @@ async fn owned(state: &AppState, id: Uuid, user: &User) -> Result<UploadSession,
         .map_err(|e| ApiError::unavailable(&e))?
         .filter(|session| session.owner == user.id)
         .ok_or(ApiError::NotFound)
+}
+
+/// `403 archived` if the site the session's file goes into is archived. Archiving abandons the
+/// site's sessions; this refuses one started in the same instant, before it takes a byte.
+async fn refuse_archived(state: &AppState, session: &UploadSession) -> Result<(), ApiError> {
+    let place = match session.target {
+        UploadTarget::NewFile { parent } => parent,
+        UploadTarget::NewVersion { doc } => doc.into(),
+    };
+    let db = state.db();
+    let archived = db
+        .site_archived(session.site)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?
+        || db
+            .node_site_archived(place)
+            .await
+            .map_err(|e| ApiError::unavailable(&e))?;
+    if archived {
+        return Err(ApiError::Archived);
+    }
+    Ok(())
+}
+
+/// Abandons the upload session `id`, whoever it belongs to, once any request on it is done:
+/// its row (releasing its reservation), its part file, and what this process knows of it.
+pub(crate) async fn abandon_session(state: &AppState, id: Uuid) -> Result<(), ApiError> {
+    let turn = state.uploads().turn(id);
+    let _turn = turn.lock().await;
+    end_session(state, id).await
 }
 
 /// `GET /api/uploads/{id}`: the session, with how many bytes were received.
@@ -669,6 +699,7 @@ pub(crate) async fn chunk(
     let id = parse_id(&id)?;
     let user = signed.session.user;
     let session = owned(&state, id, &user).await?;
+    refuse_archived(&state, &session).await?;
     let range = headers
         .get(CONTENT_RANGE)
         .and_then(|value| value.to_str().ok())
@@ -884,7 +915,8 @@ pub(crate) async fn finish(
     let id = parse_id(&id)?;
     let choice = conflict_choice(query_of(query)?.on_conflict.as_deref())?;
     let user = signed.session.user;
-    owned(&state, id, &user).await?;
+    let session = owned(&state, id, &user).await?;
+    refuse_archived(&state, &session).await?;
     to_completion(async move {
         let turn = state.uploads().turn(id);
         let mut progress = turn.lock().await;

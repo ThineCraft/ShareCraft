@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use time::OffsetDateTime;
 
-use super::nodes::{AssignmentOut, CrumbOut, PrincipalOut, node_id, require_manager};
+use super::nodes::{AssignmentOut, CrumbOut, PrincipalOut, node_id, require_reading_manager};
 use super::{ApiError, parse_id};
 use crate::AppState;
 use crate::auth::Signed;
@@ -146,7 +146,7 @@ fn filter_of(query: &BreaksQuery) -> Result<ExplorerFilter, ApiError> {
 /// Succeeds if `user` may use the explorer from `root`: `404` when they have no access to it,
 /// `403` without `manage_access` on it.
 async fn require_explorer(state: &AppState, user: UserId, root: NodeId) -> Result<(), ApiError> {
-    require_manager(state.db(), user, root).await
+    require_reading_manager(state.db(), user, root).await
 }
 
 /// One page of breaks from the records layer; `403` if the caller no longer manages `root`.

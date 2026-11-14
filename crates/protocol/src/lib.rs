@@ -69,6 +69,8 @@ pub enum RemovedReason {
     AccountDisabled,
     /// The document was deleted.
     Deleted,
+    /// The document's site was archived: it is read-only until it is reactivated.
+    Archived,
     /// A reason this build does not know, sent by a newer server. Never sent; a client reads
     /// it as a removal all the same, so an unknown reason never looks like a broken frame.
     #[serde(other)]

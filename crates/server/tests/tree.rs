@@ -861,10 +861,7 @@ async fn delete_takes_a_folder_with_its_contents() {
     let (site, library) = env.site(&admin, "Team").await;
     let folder = env.folder(&admin, library, "Plans").await;
     let file = env.file(&admin, folder, "Plan.xlsx").await.unwrap();
-    assert_eq!(
-        env.apply(&admin, TreeOp::Delete { id: library }).await,
-        Err(AccessError::WrongPlace)
-    );
+    // A library can be deleted too (tests/archive.rs); a site cannot.
     assert_eq!(
         env.apply(&admin, TreeOp::Delete { id: site }).await,
         Err(AccessError::IsSite)

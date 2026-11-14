@@ -457,6 +457,7 @@ async fn recheck_after_join(
             Recheck::Removed(RemovedReason::AccessRevoked)
         }
         AccessChange::Deleted => Recheck::Removed(RemovedReason::Deleted),
+        AccessChange::Ended { reason } => Recheck::Removed(reason),
         AccessChange::SetAccess { role: Some(_), .. }
         | AccessChange::Renamed { .. }
         | AccessChange::ConnectedUsers { .. } => Recheck::Keep,

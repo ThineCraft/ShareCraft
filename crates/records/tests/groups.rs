@@ -1305,19 +1305,22 @@ async fn upgrade_keeps_everyones_access() {
         old_gamma,
     ];
     // Plan 1's access, worked out by this plan's code with no group membership at all: an
-    // empty stand-in for the table the upgrade makes, and for the recycle bin's column that
-    // the access decision reads (nothing was purged before the bin).
+    // empty stand-in for the table the upgrade makes, for the recycle bin's column that the
+    // access decision reads (nothing was purged before the bin), and for the sites' own rows
+    // it reads for the archive (nothing was archived before sites had settings).
     sqlx::raw_sql(
-        "create table group_members (group_id uuid, user_id uuid);          alter table nodes add column purged_at timestamptz;",
+        "create table group_members (group_id uuid, user_id uuid);          alter table nodes add column purged_at timestamptz;          create table sites (id uuid primary key, archived_at timestamptz);",
     )
     .execute(test.db.test_pool())
     .await
     .unwrap();
     let before = everything(&test.db, &people, &nodes).await;
-    sqlx::raw_sql("drop table group_members; alter table nodes drop column purged_at;")
-        .execute(test.db.test_pool())
-        .await
-        .unwrap();
+    sqlx::raw_sql(
+        "drop table group_members; alter table nodes drop column purged_at; drop table sites;",
+    )
+    .execute(test.db.test_pool())
+    .await
+    .unwrap();
     let below_before: Vec<(Uuid, Uuid, String)> = sqlx::query_as(
         "select a.node_id, a.principal_id, a.role_id from assignments a \
          join nodes n on n.id = a.node_id where n.parent_id is not null order by 1, 2",
@@ -1475,7 +1478,7 @@ async fn upgrade_records_the_groups_it_made() {
     // recycle bin's columns and the rows of sites' own settings too: empty stand-ins for them,
     // which later migrations make.
     sqlx::raw_sql(
-        "alter table nodes add column deleted_with uuid, add column bin_stage smallint,          add column purged_at timestamptz;          create table settings (key text primary key, value jsonb);          create table sites (id uuid primary key, language text, time_zone text);",
+        "alter table nodes add column deleted_with uuid, add column bin_stage smallint,          add column purged_at timestamptz;          create table settings (key text primary key, value jsonb);          create table sites (id uuid primary key, language text, time_zone text,          archived_at timestamptz);",
     )
     .execute(test.db.test_pool())
     .await
