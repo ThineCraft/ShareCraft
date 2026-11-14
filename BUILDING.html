@@ -26,7 +26,7 @@ table.banded tbody tr:nth-child(even)>td{background:light-dark(#f4f8f7,#212b30)}
 </header>
 <div class="layout">
 <nav aria-label="Document contents"><p>In this document</p>
-<a href="#need">01 · What you need</a><a href="#build">02 · Build and check</a><a href="#admin">03 · The first administrator</a><a href="#run">04 · Run it and sign in</a><a href="#settings">05 · Settings</a><a href="#accounts">06 · Accounts and signing in</a><a href="#sharing">07 · Sharing and roles</a><a href="#removed">08 · What a removed person sees</a><a href="#data">09 · Where data is kept</a><a href="#index">10 · The revision index</a><a href="#events">11 · Events</a><a href="#stop">12 · Stopping the server, and notices</a><a href="#editors">13 · Building the editors</a><a href="#files">14 · Opening a file document</a><a href="#session">15 · File session, seat and saving</a><a href="#content">16 · Content routes</a><a href="#tree">17 · The content tree and routes</a><a href="#treegit">18 · The tree in Git and PostgreSQL</a><a href="#upgrade">19 · Upgrading</a><a href="#policy">20 · The editor pages' policy</a><a href="#limits">21 · Known limits</a><a href="#scale">22 · A library of 100,000 files</a><a href="#groups">23 · Groups, roles and the explorer</a><a href="#links">24 · Sharing links and requests</a><a href="#licences">25 · Licences</a>
+<a href="#need">01 · What you need</a><a href="#build">02 · Build and check</a><a href="#admin">03 · The first administrator</a><a href="#run">04 · Run it and sign in</a><a href="#settings">05 · Settings</a><a href="#accounts">06 · Accounts and signing in</a><a href="#sharing">07 · Sharing and roles</a><a href="#removed">08 · What a removed person sees</a><a href="#data">09 · Where data is kept</a><a href="#index">10 · The revision index</a><a href="#events">11 · Events</a><a href="#stop">12 · Stopping the server, and notices</a><a href="#editors">13 · Building the editors</a><a href="#files">14 · Opening a file document</a><a href="#session">15 · File session, seat and saving</a><a href="#content">16 · Content routes</a><a href="#tree">17 · The content tree and routes</a><a href="#treegit">18 · The tree in Git and PostgreSQL</a><a href="#upgrade">19 · Upgrading</a><a href="#policy">20 · The editor pages' policy</a><a href="#limits">21 · Known limits</a><a href="#scale">22 · A library of 100,000 files</a><a href="#groups">23 · Groups, roles and the explorer</a><a href="#links">24 · Sharing links and requests</a><a href="#storage">25 · Files, bin and quotas</a><a href="#licences">26 · Licences</a>
 </nav>
 <main id="main">
 <div class="toolbar"><span class="small">Standalone HTML · Print-ready · No external assets</span><button type="button" onclick="window.print()">Print / Save PDF</button></div>
@@ -196,7 +196,7 @@ cargo run -p server</code></pre>
 <div class="table-wrap"><table><caption>Git and PostgreSQL</caption>
 <thead><tr><th>Store</th><th>Holds</th><th>If it is lost</th></tr></thead>
 <tbody>
-<tr><td><strong>Git</strong>, the library repository under the data folder</td><td>The content of every document and its metadata, one Git commit per saved checkpoint. Only the server writes to it.</td><td>Documents and their history are lost. Back up the data folder.</td></tr>
+<tr><td><strong>Git</strong>, the library repository under the data folder, with the content store (<code>blobs</code>) beside it</td><td>The content of every document (in Git for older versions, in the content store for newer ones) and its metadata, one Git commit per saved checkpoint. Only the server writes to it.</td><td>Documents and their history are lost. Back up the data folder.</td></tr>
 <tr><td><strong>PostgreSQL</strong>, the database named by <code>DATABASE_URL</code></td><td>Accounts and password hashes, sign-in sessions, who has access to which document, the index of revisions, and events (sections 10 and 11).</td><td>Nobody can sign in, and who may open which document is forgotten. The documents themselves are safe in Git. See below.</td></tr>
 </tbody></table></div>
 <p><strong>PostgreSQL needs its own backup.</strong> Backing up the data folder does not back up accounts, sharing or events, and backing up the database does not back up document content. Keep both, taken at about the same time. Only the revision index in PostgreSQL can be rebuilt from Git (section 10).</p>
@@ -207,7 +207,7 @@ cargo run -p server</code></pre>
 <p>With the defaults that is <code>data/libraries/00000000-0000-0000-0000-000000000001.git</code>. The <code>data</code> folder is not kept in Git. Every document lives in that one library for now.</p>
 <p>Inside the repository, the <code>main</code> branch holds, for each document identifier:</p>
 <ul>
-<li><code>docs/&lt;doc_id&gt;/content</code>: the document text, or for a file document the file's bytes exactly as saved.</li>
+<li><code>docs/&lt;doc_id&gt;/content</code>: for a version saved since 14 November 2026, a pointer to the bytes in the content store (section 25). For an older version, the document text, or for a file document the file's bytes exactly as saved.</li>
 <li><code>docs/&lt;doc_id&gt;/meta.json</code>: the metadata for that revision, as JSON: the document's name, free-form fields, and the people credited so far.</li>
 </ul>
 <p>Each saved checkpoint is one Git commit. The commit's author is the account that made the change; if several accounts contributed since the last checkpoint, the others are named on <code>Co-authored-by</code> lines. Their addresses are of the form <code>&lt;account id&gt;@sharecraft.invalid</code>, not real email addresses. The document identifier is the one after the <code>#</code> in the page's address. To look at a saved document with plain <code>git</code>, run these from the repository root:</p>
@@ -600,17 +600,17 @@ base-uri 'none'; form-action 'none'</code></pre>
 <li><strong>Local connections only.</strong> The server will not listen on a non-loopback address and refuses connections that do not come from a page it served (section 04). Two people on two computers cannot use it together. Passwords must not cross a network without encryption, and encryption (TLS) is a separate piece of work.</li>
 <li><strong>Accounts are made by an administrator.</strong> There is no sign-up, and <strong>nobody can change their own password yet</strong>, nor reset a forgotten one.</li>
 <li><strong>No single sign-on, multi-factor sign-in or guests.</strong> Access is a password account, given to a person or to a group on a site, library, folder or file. Groups cannot contain groups.</li>
-<li><strong>Only the first part of sites and libraries.</strong> The tree and inherited access are built (sections 17 to 19). Groups, roles and the inheritance explorer are built (section 23). Sharing links, anyone links and access requests are built (section 24). Not built yet: guests, domain allow and block lists, notifications, service identities, audience targeting, branding, and metadata edited after creation. A library of 100,000 files is measured (section 22).</li>
+<li><strong>Only the first part of sites and libraries.</strong> The tree and inherited access are built (sections 17 to 19). Groups, roles and the inheritance explorer are built (section 23). Sharing links, anyone links and access requests are built (section 24). Uploads, the recycle bin, copy and quotas are built (section 25). Not built yet: guests, domain allow and block lists, notifications, service identities, audience targeting, branding, and metadata edited after creation. A library of 100,000 files is measured (section 22).</li>
 <li><strong>Links work on this machine only.</strong> A link's address is built from the address the person making it is using, and the server listens on the local machine only (section 04). A link opened on another computer will not reach it. Anyone links do not yet count how often they are used.</li>
 <li><strong>No page for events</strong> (section 11), and no way to see the document's saved revisions from the site: use Git (section 09).</li>
-<li><strong>One server process.</strong> Removal from live sessions is sent inside the process; running several server processes would need a different mechanism.</li>
+<li><strong>One server process.</strong> The locks of the content store and upload sessions are inside the process too (section 25). Removal from live sessions is sent inside the process; running several server processes would need a different mechanism.</li>
 <li><strong>Large pastes go in pieces.</strong> One change can be at most 512 KiB as sent (section 05); a larger paste is refused with a message asking for smaller parts.</li>
 <li><strong>One person edits a file at a time.</strong> GridCraft, WordCraft, PdfCraft and SolidCraft files open from ShareCraft and save back as Git revisions, but only the holder of the editing seat can save; others read under a banner. Editing a file together is Stage 2 work. Saving is on demand, never automatic.</li>
 <li><strong>The editors save only while their tab is shown.</strong> A Save sent while the browser tab is hidden waits until the tab is shown again. While hosted, the editors refuse New, Open and Close and keep the document they were given; PdfCraft may still open some views as extra tabs. See <a href="editors.html#found">editors.html</a>.</li>
 <li><strong>Editors are built on this machine</strong> (section 13), take tens of minutes each, and are not published. A build to be published must first be rebuilt with path remapping.</li>
 <li><strong>The first open of an editor is still a large download.</strong> The editors are sent compressed (section 13), but SolidCraft's WebAssembly file still arrives as about 34.5 MB the first time it opens, and the others as 7 MB to 13 MB. A browser keeps them afterwards. Sizes are in <a href="editors.html#glance">editors.html</a>. Opening and editing in each editor after compression was added has not been checked.</li>
-<li><strong>Uploads only make new documents.</strong> A file cannot be replaced by uploading.</li>
-<li><strong>PostgreSQL needs its own backup</strong> (section 09), and the event log is never trimmed.</li>
+<li><strong>Replacing a file by uploading has no page yet.</strong> The upload routes can add a new version to a file (sections 16 and 25), but no page offers it.</li>
+<li><strong>PostgreSQL needs its own backup</strong> (section 09), taken together with the data folder (section 25), and the event log is never trimmed.</li>
 <li><strong>A take-back is kept only in memory.</strong> If a refused tree change could not be taken back in Git (section 18) and the server stops before it is written, the next start's reconcile puts the refused change into PostgreSQL. Both need Git to fail first; check the console for <code>could not take back a tree change</code>.</li>
 </ul>
 </section>
@@ -858,7 +858,172 @@ base-uri 'none'; form-action 'none'</code></pre>
 </tbody></table></div>
 </section>
 
-<section id="licences"><h2>25 / Licences</h2>
+<section id="storage"><h2>25 / Files: the content store, uploads, the recycle bin, copy and quotas</h2>
+<p>Added on 14 November 2026 (plan 3A, on the branch <code>platform-files</code>, not yet merged). File bytes no longer live in Git. They live in a content store on disk, and Git holds a short pointer. On top of that sit resumable uploads, a two-stage recycle bin, copy and bulk operations, and storage quotas for sites. Plan 3A took no decisions of its own about who may see or do what: the permission rules of sections 17 and 23 apply unchanged, with the exceptions named below.</p>
+<h3>The content store</h3>
+<p>Every file's bytes are kept once, under the name of their SHA-256 hash. Two files with the same bytes share one stored copy.</p>
+<pre><code>&lt;data folder&gt;/blobs/&lt;first two hex digits&gt;/&lt;64 hex digits of the SHA-256&gt;
+&lt;data folder&gt;/blobs/tmp/&lt;id&gt;.tmp          bytes still arriving
+&lt;data folder&gt;/uploads/&lt;id&gt;.part           a resumable upload in progress (section 16)</code></pre>
+<p>New content is written into <code>tmp</code>, hashed on the way in, flushed to disk, and then renamed into its place. A file that is already stored is not written again. A byte is never read into memory all at once: saves, uploads and downloads stream in pieces of 64 KiB.</p>
+<h3>The pointer in Git</h3>
+<p>In the Git repository, <code>docs/&lt;doc_id&gt;/content</code> for a file now holds this, exactly, and nothing else:</p>
+<pre><code>sharecraft-blob 1
+sha256 &lt;64 lowercase hex digits&gt;
+size &lt;the size in bytes, written without leading zeros&gt;
+</code></pre>
+<p>A file whose content is exactly that form is a pointer. Anything else is read as the file's own bytes. That second case is how every version saved before this plan still reads (see "Upgrading from inline content"). Text documents work the same way: each checkpoint writes its text to the store and commits a pointer. Git history therefore stays small, and each revision still names its bytes exactly.</p>
+<h3>Blob safety: claims, holds and erasure</h3>
+<p>The danger is a stored file being erased while a version in Git still names it, or while a save is just about to name it. Four things prevent that.</p>
+<ul>
+<li><strong>Claims.</strong> Before a version is committed to Git, the server claims its content in PostgreSQL (a pending row in <code>blob_refs</code>). When the commit is in, the claim is settled: the pending row becomes a completed row naming the document and revision. If the commit fails or finds nothing to change, the claim is withdrawn. A claim also checks that the file is still on disk; if it is not, the save fails with <code>503</code> and nothing names missing bytes.</li>
+<li><strong>Holds.</strong> From the moment content is stored until its claim is settled, the server holds it in memory, so no erasure can take it. A request that hangs keeps its hold for as long as it hangs. Holds are not kept in PostgreSQL.</li>
+<li><strong>Erasure only when nothing names the content.</strong> The server counts every row, pending ones included, under a lock, and erases only at zero and with no hold. Bytes shared by several files or versions stay until the last one goes.</li>
+<li><strong>No erasure while the rows may be incomplete.</strong> Two flags in the <code>maintenance_flags</code> table say so: <code>blob_refs_upgrade</code> (set by migration 0009) and <code>blob_refs_dirty</code> (set whenever a row could not be written). While either is set, nothing is erased and the files simply stay.</li>
+</ul>
+<div class="table-wrap"><table class="banded"><caption>When stored content is erased</caption>
+<thead><tr><th>When</th><th>What is erased</th></tr></thead>
+<tbody>
+<tr><td>A save or upload is refused or fails after its body was stored</td><td>That content, at once, if nothing else names or holds it.</td></tr>
+<tr><td>A file is purged from the recycle bin</td><td>The content of every version of it that nothing else names. The <code>node.purged</code> event gets <code>bytes_freed</code> a moment after the purge. Sending a file to the bin, or on to the second stage, erases nothing.</td></tr>
+<tr><td>The minute sweep</td><td>Content with no <code>blob_refs</code> row that is older than 24 hours, and claims left pending for more than an hour (settled from the newest Git revision that names the hash, otherwise withdrawn).</td></tr>
+<tr><td>The hourly sweep (and the first sweep after a start)</td><td>A walk of the store's folders: files with no row and older than 24 hours are erased, as are files in <code>tmp</code> of that age. The walk is hourly because it lists the whole store.</td></tr>
+<tr><td>A start with a flag set</td><td>The rows are rebuilt from the history of every document in Git (files purged from the bin are left out). Only if every document could be read are the flags cleared and unused content older than 24 hours erased. The start-up line reads <code>Reconciled stored content with Git: …</code>, giving the versions read, the failures and the contents erased, or <code>nothing to rebuild</code>.</td></tr>
+</tbody></table></div>
+<p>A flag that stays set (a document Git cannot read, say) blocks every erasure until a start can read everything. The console says so.</p>
+<h3>One server per data folder</h3>
+<p><strong>Run only one server process on a data folder.</strong> The locks that keep claims, holds, erasures and upload sessions in order are inside the process, as the removal of live sessions already is (section 21). Two servers on one folder could erase a file the other is about to name.</p>
+<h3>Upgrading from inline content</h3>
+<p>Migrations 0009 to 0012 run on the first start of the new server, and the blob rows and site usage are rebuilt then (two more lines on the console: <code>Reconciled stored content with Git</code> and <code>Reconciled the sites' usage</code>). Like the earlier migrations they are one way: a server from before this plan refuses to start on the upgraded database.</p>
+<ul>
+<li><strong>Old versions are not rewritten.</strong> Versions saved before this plan keep their bytes inline in Git and read exactly as before. Only new saves write pointers. Nothing in Git history is changed.</li>
+<li>Saving the same bytes as an old inline version still counts as "unchanged" and writes nothing, because the old content is hashed to compare. Copying a file whose latest version is inline writes that content into the store first.</li>
+<li>Sizes of old versions are read from Git when usage is rebuilt, so they count toward quotas.</li>
+<li>An item deleted before the upgrade becomes a first-stage bin entry with its original deletion time (migration 0011). If that was more than 93 days ago, the first sweep purges it.</li>
+</ul>
+<h3>Backups</h3>
+<p><strong>Back up the data folder and the PostgreSQL database together, taken at about the same time, and restore them as a pair.</strong> The data folder now holds the content store as well as the Git repository (a file's pointer without its stored bytes cannot be downloaded; the answer is <code>503</code>). The database holds the claims and rows that the sweeps trust when they decide that content is unused, so do not restore one without the other. Take the backup before this upgrade as well (section 19). Backing up while the server is stopped is the safe way; a copy taken while it runs can miss a file saved during the copy.</p>
+<h3>Resumable upload sessions</h3>
+<p>The routes are in section 16. The limits are:</p>
+<div class="table-wrap"><table class="banded"><caption>Upload limits</caption>
+<thead><tr><th>Limit</th><th>Value</th><th>What happens</th></tr></thead>
+<tbody>
+<tr><td>Open sessions per person</td><td>5</td><td><code>429 too_many_uploads</code> on a sixth start. Finishing or abandoning one frees a place.</td></tr>
+<tr><td>Largest file</td><td>10 GiB (<code>SHARECRAFT_MAX_FILE_BYTES</code>)</td><td><code>413</code> at the start (or, for a one-request upload, as soon as the body goes over). Size 0 is refused with <code>422</code>.</td></tr>
+<tr><td>Idle time inside one chunk</td><td>60 seconds</td><td>A chunk whose body sends nothing for 60 seconds is cut off. What arrived is kept and the answer is <code>400 incomplete_chunk</code> with <code>received</code>, so the page resumes from there. A stalled chunk cannot hold a session for ever.</td></tr>
+<tr><td>Idle session</td><td>24 hours</td><td>The minute sweep removes the session, its part file and its quota reservation. A session with a chunk arriving is skipped, and a part file with no session is removed once an hour old.</td></tr>
+</tbody></table></div>
+<p>The page sends 8 MiB chunks, works out the SHA-256 in the browser before it starts (the server needs it at the start, so a very large file is read twice), and picks up from the server's <code>received</code> after a dropped connection or a restart. A session with a bad checksum ends and makes nothing. Name clashes are settled with <code>on_conflict</code> (<code>replace</code>, <code>keep_both</code> or <code>skip</code>), given when the session starts or on the finish (<code>?on_conflict=</code>, which wins). Without it, a taken name answers <code>409 name_taken</code> with a <code>suggested</code> name; <code>POST /api/docs/upload</code> takes the same choice and answers a skipped file with <code>200 {"skipped": true}</code>. <code>replace</code> saves a new version through the file's session, so it is refused with <code>409 being_edited</code> while someone holds the editing seat.</p>
+<h3>Range downloads</h3>
+<p>Downloads answer <code>Accept-Ranges: bytes</code> and send <code>Content-Length</code>. One range (<code>bytes=a-b</code>, <code>a-</code> or <code>-n</code>) is answered <code>206</code> with <code>Content-Range</code>. A start beyond the end, an empty file or <code>-0</code> is answered <code>416</code> with <code>Content-Range: bytes */&lt;size&gt;</code>. Several ranges, or one that is not well formed, get the whole file with <code>200</code>. The same applies to downloads through an anyone link (section 24). The headers of section 16 are unchanged, so a download can still never run as a page.</p>
+<h3>The recycle bin</h3>
+<p>Deleting a file or folder is no longer final. Items go through two stages and are purged for good <strong>93 days after they were deleted</strong>, in total (the days do not start again at the second stage), as in SharePoint.</p>
+<div class="table-wrap"><table class="banded"><caption>The two stages</caption>
+<thead><tr><th></th><th>First stage</th><th>Second stage</th></tr></thead>
+<tbody>
+<tr><td>How an item gets there</td><td><code>DELETE /api/nodes/&lt;id&gt;</code>. A folder takes every live item in it, in one Git commit.</td><td><code>DELETE /api/bin/&lt;id&gt;</code> on a first-stage entry.</td></tr>
+<tr><td>Who sees it</td><td>Anyone who could delete the item if it were live (<code>delete</code> as if it had not been deleted).</td><td>Only people with <code>manage_site</code> on the site. Others get <code>403</code> for the list and <code>404</code> for an entry.</td></tr>
+<tr><td>Who may restore</td><td>The same people.</td><td>The same people.</td></tr>
+<tr><td>What is kept</td><td>The item with its own permissions. Links were revoked at deletion and stay revoked.</td><td>The same, and it still counts against the site's quota.</td></tr>
+<tr><td>How it ends</td><td>Restore, move on to the second stage, or purge after 93 days.</td><td>Restore, <code>DELETE /api/bin/&lt;id&gt;</code> to purge, or purge after 93 days.</td></tr>
+</tbody></table></div>
+<ul>
+<li><strong>Only the top of a deletion is listed.</strong> A folder deleted with its contents is one entry. The items that went with it are restored with it, and are <code>404</code> on their own.</li>
+<li><strong>Restoring</strong> brings back the entry and everything deleted with it, with their own permissions. If a name is now taken, the top restored item gets <code>(2)</code>, <code>(3)</code> and so on, and the answer says so in <code>renamed</code>. If a folder above is still in the bin, it comes back too, but only for a person who may restore that folder (<code>delete</code> on it, or <code>manage_site</code> for one in the second stage); otherwise the answer is <code>409 parent_in_bin</code>. Items that had been deleted separately with such a folder stay in the bin. If a folder above was purged, the item goes to the top of its library.</li>
+<li><strong><code>forbidden_below</code>.</strong> Deleting a folder needs <code>delete</code> on the folder and on every place inside it that has permissions of its own. A person with less gets <code>403 forbidden_below</code> and nothing changes. This stops someone from removing items that others made stricter on purpose. It does tell the person that such a place exists.</li>
+<li><strong>The purged-segment rule.</strong> When a folder above an item has been purged and that folder had its own permissions, there is nothing left to say who could see the item. Seeing and restoring it then needs <code>manage_site</code> on its site. Ordinary editors do not see it; site managers do.</li>
+<li><strong>Purging</strong> is done by the server (as <em>ShareCraft</em>) once an entry is 93 days old, in the minute sweep, or by a manager. It leaves a tombstone: the item's own permissions, links (revoked) and their hidden groups are deleted, open access requests are closed, the <code>blob_refs</code> rows are deleted, the content is erased as in the table above, and the space goes back to the site's quota. The event <code>node.purged</code> carries <code>versions</code>, <code>bytes</code> and <code>bytes_freed</code>.</li>
+<li>Roles and groups used only on binned items can be deleted; a restored item then comes back without them.</li>
+</ul>
+<h3>Copy and bulk operations</h3>
+<p><strong>Copy.</strong> <code>POST /api/nodes/&lt;id&gt;/copy {parent, name?}</code> needs <code>view</code> on the source and <code>add</code> on the destination, and a folder cannot be copied into itself. The copy has new ids, is made by the person copying, inherits its access from the new place (no permissions or links are copied) and has only the latest version of each file; history is not copied. A folder copy leaves out anything the person cannot view. Copied files share the stored bytes of the originals, so no space is used on disk, but the copies count against the destination site's quota. Name clashes are settled by adding <code>(2)</code> and so on, and the answer reports it.</p>
+<p>A copy is <strong>one tree commit plus one checkpoint commit</strong> for all the copied files' first versions. If the second commit fails, the copy is <strong>taken back</strong>: the new items are removed, claims are withdrawn, and the answer is <code>503</code>. No empty copies are left and no <code>node.copied</code> event is written for it. If view is lost on an item part-way through, the whole copy is refused.</p>
+<p><strong>Bulk.</strong> <code>POST /api/bulk {op, items, parent?}</code> takes <code>move</code>, <code>copy</code>, <code>delete</code> or <code>restore</code> for up to <strong>500 items</strong> (<code>422 invalid_request</code> above that, or for a move or copy with no <code>parent</code>). The request body may be up to 64 KiB. Each item goes through the same code as the single-item route and gets its own result, in order: <code>{id, ok, error?, new_id?, renamed?}</code>, where <code>error</code> is the code the single route would have answered. One item failing does not stop the others. The pages use it for selecting several files.</p>
+<h3>Quotas</h3>
+<p>Each site has a quota in bytes, or none. A site's usage counts <strong>every stored version of every item in it, in both stages of its recycle bin</strong>; a purge gives the space back. A version stored in Git before this plan counts by its size in Git.</p>
+<ul>
+<li><strong>Reservations.</strong> Before it is committed, a save, a one-request upload, a copy and a resumable upload session set aside the bytes they will add (an upload session sets aside its declared size when it starts, and holds it until it finishes, is abandoned or is swept). The check <code>used + reserved + new bytes ≤ quota</code> and the reservation are made together under a lock, so two uploads cannot both take the last space. A reservation not turned into usage is given back, and a stop of the server drops any that were interrupted.</li>
+<li><strong>The refusal is <code>507 quota_exceeded</code>.</strong> Saves and one-request uploads are refused before the body is read when <code>Content-Length</code> already shows it does not fit. An upload that went over only when it finished leaves its session open and reserved.</li>
+<li><strong>Moves between sites.</strong> Moving an item to another site takes its bytes with it. A move is refused with <code>507 quota_exceeded</code> if they do not fit in the destination. A save or upload finish whose file has meanwhile moved to another site checks for room there.</li>
+<li><strong>Never refused.</strong> Deleting, restoring, moving to the second stage and purging never need room. Live text-document checkpoints are counted but never refused, since refusing one would lose a person's typing.</li>
+<li><strong>The second stage still counts.</strong> Only a purge frees space.</li>
+<li><strong>Only administrators set quotas.</strong> <code>PUT /api/sites/&lt;id&gt;/quota {bytes}</code>, with <code>null</code> for none (<code>403</code> for anyone else, <code>404</code> for something that is not a site). A quota below current usage is allowed: the site then takes nothing more until space is freed. It records <code>quota.changed</code>. People with <code>manage_site</code> see the site's usage, its quota and a warning from 90% on its page; administrators without <code>manage_site</code> see the quota field only.</li>
+<li>Usage is a counter kept at each commit. It is rebuilt from the recorded version sizes at a start when a flag in the <code>usage_flags</code> table asks for it (migration 0012 sets one), and a purge of a version whose size was not recorded asks for a rebuild.</li>
+</ul>
+<h3>Name cleaning</h3>
+<p>A name given to an upload or a copy is cleaned instead of refused, and the answer reports it in <code>renamed {from, to}</code>; the page shows the new name.</p>
+<ul>
+<li>Spaces at the ends are trimmed. Control characters and each of <code>" * : &lt; &gt; ? / \ |</code> become <code>_</code>. A trailing dot becomes <code>_</code>.</li>
+<li><strong>Windows reserved names.</strong> If the first part of the name (up to the first dot, ignoring trailing spaces) is <code>CON</code>, <code>PRN</code>, <code>AUX</code>, <code>NUL</code>, <code>COM1</code> to <code>COM9</code> or <code>LPT1</code> to <code>LPT9</code>, in any case, an <code>_</code> is added after it: <code>con.pdf</code> becomes <code>con_.pdf</code>, and <code>LPT1.backup.pdf</code> becomes <code>LPT1_.backup.pdf</code>. This applies to folders too.</li>
+<li>A name that ends up empty becomes <code>Untitled</code>. A name longer than 120 characters is shortened and keeps its extension. A name that is only an extension (<code>.xlsx</code>) is refused with <code>400</code>.</li>
+<li>A name that is already used in the place is settled by <code>on_conflict</code> for uploads, or gets <code>(2)</code>, <code>(3)</code> for a copy or a restore.</li>
+</ul>
+<h3>Events</h3>
+<p><code>upload.completed</code> (the upload, its bytes, whether it was a new version), <code>node.copied</code> (the top item, with <code>from</code>, <code>name</code>, <code>parent</code> and <code>items</code>, and one for each file below it), <code>node.deleted</code> (for a folder, with <code>items</code>), <code>node.restored</code>, <code>node.binned</code> (moved to the second stage), <code>node.purged</code> (<code>versions</code>, <code>bytes</code>, <code>bytes_freed</code>) and <code>quota.changed</code> (<code>quota</code>, <code>previous</code>).</p>
+<h3>The routes</h3>
+<p>All need a signed-in person and a request from a page of this site, like every <code>/api</code> route. The upload session routes are in section 16.</p>
+<div class="table-wrap"><table class="banded"><caption>Routes added or changed by files</caption>
+<thead><tr><th>Route</th><th>Who</th><th>Answers</th></tr></thead>
+<tbody>
+<tr><td><code>GET /api/sites/&lt;id&gt;/bin?stage=first|second&amp;after=&amp;limit=</code></td><td>First stage: anyone who could delete what is listed. Second stage: <code>manage_site</code></td><td><code>200</code> <code>{items, next}</code>, newest deletion first. Each item has <code>id, kind, name, editor?, path, size, deleted_by, deleted_at, days_left, stage</code>.</td></tr>
+<tr><td><code>POST /api/bin/&lt;id&gt;/restore</code></td><td>As above</td><td><code>200</code> <code>{node, renamed}</code> (<code>renamed</code> is <code>{id, from, to}</code> or null). <code>409 parent_in_bin</code>; <code>404</code> for an entry the person cannot see.</td></tr>
+<tr><td><code>DELETE /api/bin/&lt;id&gt;</code></td><td>As above</td><td><code>204</code>. A first-stage entry moves to the second stage; a second-stage entry is purged. There is no "empty the bin" route: the page sends one request per item.</td></tr>
+<tr><td><code>POST /api/nodes/&lt;id&gt;/copy</code> <code>{parent, name?}</code></td><td><code>view</code> on the source, <code>add</code> on the destination</td><td><code>201</code> <code>{node, renamed}</code>. <code>507 quota_exceeded</code>; <code>503</code> if taken back; <code>400 into_itself</code>.</td></tr>
+<tr><td><code>POST /api/bulk</code> <code>{op, items, parent?}</code></td><td>As the single-item route, per item</td><td><code>200</code>, a list of results in order.</td></tr>
+<tr><td><code>PUT /api/sites/&lt;id&gt;/quota</code> <code>{bytes | null}</code></td><td>Administrators</td><td><code>204</code>.</td></tr>
+<tr><td><code>GET /api/sites/&lt;id&gt;</code></td><td>A role on the site</td><td><code>200</code> <code>{id, name, access}</code>; with <code>manage_site</code> also <code>used</code>, <code>quota</code> and <code>quota_warning</code>.</td></tr>
+<tr><td><code>POST /api/docs/upload</code></td><td>As before</td><td>Now takes <code>on_conflict</code>, and carries <code>renamed</code> when the name was cleaned. <code>507 quota_exceeded</code>.</td></tr>
+<tr><td><code>PUT /api/docs/&lt;id&gt;/content</code></td><td>As before</td><td><code>507 quota_exceeded</code>. The body is streamed into the store, not held in memory.</td></tr>
+<tr><td><code>GET /api/docs/&lt;id&gt;/content</code></td><td>As before</td><td>Accepts <code>Range</code> (above).</td></tr>
+</tbody></table></div>
+<h3>New error codes</h3>
+<div class="table-wrap"><table class="banded"><caption>Error codes added with files</caption>
+<thead><tr><th>Code</th><th>Status</th><th>When</th></tr></thead>
+<tbody>
+<tr><td><code>quota_exceeded</code></td><td>507</td><td>The site has no room for the bytes (a save, upload, copy or move into it).</td></tr>
+<tr><td><code>too_many_uploads</code></td><td>429</td><td>Five upload sessions are already open.</td></tr>
+<tr><td><code>checksum_mismatch</code></td><td>422</td><td>The bytes received are not the declared SHA-256. The session ends.</td></tr>
+<tr><td><code>wrong_offset</code></td><td>409</td><td>A chunk does not start where the last one ended. <code>expected</code> says where it should.</td></tr>
+<tr><td><code>incomplete</code></td><td>409</td><td>A finish before every byte arrived.</td></tr>
+<tr><td><code>incomplete_chunk</code></td><td>400</td><td>A chunk ended early, broke or went idle. What arrived is kept.</td></tr>
+<tr><td><code>invalid_range</code></td><td>400</td><td>A <code>Content-Range</code> that is not well formed, outside the size, or shorter than the body.</td></tr>
+<tr><td><code>being_edited</code></td><td>409</td><td>A new version was uploaded while someone holds the editing seat.</td></tr>
+<tr><td><code>text_document</code></td><td>400</td><td>A new version was uploaded for a plain-text document.</td></tr>
+<tr><td><code>forbidden_below</code>, <code>parent_in_bin</code></td><td>403, 409</td><td>As described under the recycle bin. <code>parent_in_bin</code> replaces <code>not_empty</code>, which no route answers now: a folder with contents can be deleted.</td></tr>
+</tbody></table></div>
+<h3>Rulings that change behaviour</h3>
+<div class="table-wrap"><table class="banded"><caption>Rulings made while building</caption>
+<thead><tr><th>Ruling</th><th>Effect</th></tr></thead>
+<tbody>
+<tr><td>A failed versions commit takes a copy back.</td><td>The person asked for a copy, not empty shells. One more failure path; the answer is <code>503</code>.</td></tr>
+<tr><td>The second stage keeps counting against the quota.</td><td>As in SharePoint. Only a purge frees space.</td></tr>
+<tr><td>A move into another site is refused when the bytes do not fit.</td><td>A save or finish whose file has moved checks again. Deleting, restoring and purging are never refused.</td></tr>
+<tr><td>Deleting a folder needs <code>delete</code> on every place below it with its own permissions.</td><td>One more check per folder delete, found by following the permission breaks.</td></tr>
+<tr><td>Seeing an item whose purged folder had its own permissions needs <code>manage_site</code>.</td><td>Closes a leak without storing more state. Ordinary users do not see such items.</td></tr>
+<tr><td>The store walk is hourly; the cheap unreferenced-row erasure stays every minute.</td><td>Orphans can live up to an hour longer.</td></tr>
+<tr><td>A purge's <code>bytes_freed</code> is added after the purge commits.</td><td>Erasure can only run once the rows are gone, so the event shows it a moment later.</td></tr>
+<tr><td>The editors still hold a whole file in the browser's memory.</td><td>They need it all. Large transfers go through upload sessions.</td></tr>
+</tbody></table></div>
+<h3>The upgrade: migrations 0009 to 0012</h3>
+<div class="table-wrap"><table class="banded"><caption>What the migrations change</caption>
+<thead><tr><th>Migration</th><th>What it holds</th></tr></thead>
+<tbody>
+<tr><td><code>0009_blobs</code></td><td><code>blobs</code> (hash, size, created), <code>blob_refs</code> (the claims and completed rows: hash, document, revision, pending) and <code>maintenance_flags</code> with the upgrade marker.</td></tr>
+<tr><td><code>0010_uploads</code></td><td><code>upload_sessions</code>: owner, site, target (a new file's folder or a file's new version), name, size, SHA-256, bytes received, last touched.</td></tr>
+<tr><td><code>0011_bin</code></td><td><code>nodes.deleted_with</code>, <code>bin_stage</code> and <code>purged_at</code>. Existing deleted rows become their own first-stage entries. Git's tree records gain the same three optional fields.</td></tr>
+<tr><td><code>0012_quotas</code></td><td><code>site_usage</code> (used, reserved, quota per site), <code>revisions.size</code>, <code>usage_flags</code>, and the upload session's <code>on_conflict</code>.</td></tr>
+</tbody></table></div>
+<h3>What this build does not do yet</h3>
+<ul>
+<li>No page offers uploading a new version of a file; the routes exist (section 16).</li>
+<li>Empty folders inside a dropped folder are not recreated.</li>
+<li>The bin's "Empty" button deletes one item at a time.</li>
+<li>Malware scanning is not built. It is planned for plan 3C, through a scanner the organisation runs.</li>
+<li>The editors still hold a whole file in the browser's memory (see the rulings above).</li>
+</ul>
+</section>
+
+<section id="licences"><h2>26 / Licences</h2>
 <p>ShareCraft is licensed <strong>MIT OR Apache-2.0</strong>; the texts are in <code>LICENSE-MIT</code> and <code>LICENSE-APACHE</code>. <code>cargo xtask check</code> refuses any dependency whose licence has no non-copyleft option (GPL, LGPL, AGPL, MPL, EUPL, CDDL, SSPL).</p>
 <p>The <code>revisions</code> crate stores documents in Git using <code>gix</code> (gitoxide), a Git implementation written in Rust and licensed MIT or Apache 2.0. No C library is involved and no copyleft code is linked. Repositories it writes are ordinary Git repositories: the <code>git</code> command line reads them as usual.</p>
 <p>The four editors are licensed MIT or Apache 2.0, by their original authors. They are not part of ShareCraft's code and are not compiled into the server. The build tool copies each fork's licence, notice and attribution files into the installed editor's <code>licenses/</code> folder; what each fork changed is listed in its <code>NOTICE</code> and in <a href="editors.html">editors.html</a>.</p>
