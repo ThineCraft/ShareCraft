@@ -228,6 +228,25 @@ impl Db {
         )
     }
 
+    /// Which of the contents `sha256s` have a row, asked a few thousand at a time.
+    pub async fn blobs_with_rows(
+        &self,
+        sha256s: &[[u8; 32]],
+    ) -> Result<std::collections::HashSet<[u8; 32]>, DbError> {
+        const BATCH: usize = 2000;
+        let mut found = std::collections::HashSet::new();
+        for batch in sha256s.chunks(BATCH) {
+            let hashes: Vec<String> = batch.iter().map(|h| hex(h)).collect();
+            let rows: Vec<String> =
+                sqlx::query_scalar("select sha256 from blobs where sha256 = any($1)")
+                    .bind(&hashes)
+                    .fetch_all(self.pool())
+                    .await?;
+            found.extend(rows.iter().filter_map(|h| parse_hex(h)));
+        }
+        Ok(found)
+    }
+
     /// The contents with a row created before `before` that no `blob_refs` row names.
     pub async fn unreferenced_blobs(
         &self,

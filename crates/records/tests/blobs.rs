@@ -168,3 +168,20 @@ async fn rebuild_replaces_completed_rows_and_clears_flags_only_when_complete() {
     db.set_blob_refs_flag(BLOB_REFS_UPGRADE).await.unwrap();
     assert!(db.blob_refs_flagged().await.unwrap());
 }
+
+/// Which of many contents have a row, answered in one go, however many are asked about.
+#[tokio::test]
+async fn rows_of_many_contents_at_once() {
+    let test = TestDb::create().await;
+    let db = &test.db;
+    let with_row = BlobRef::of(b"has a row");
+    db.claim_blob(with_row, doc()).await.unwrap();
+    let mut asked: Vec<[u8; 32]> = (0..5000u32)
+        .map(|n| BlobRef::of(&n.to_le_bytes()).sha256)
+        .collect();
+    asked.push(with_row.sha256);
+    let found = db.blobs_with_rows(&asked).await.unwrap();
+    assert_eq!(found.len(), 1);
+    assert!(found.contains(&with_row.sha256));
+    assert!(db.blobs_with_rows(&[]).await.unwrap().is_empty());
+}

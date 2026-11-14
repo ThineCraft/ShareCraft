@@ -46,7 +46,12 @@ pub(crate) struct Blobs {
     erasing: RwLock<()>,
     /// How many [`Held`] there are of each content.
     holds: Mutex<HashMap<[u8; 32], usize>>,
+    /// When the sweeper last walked the store's files, as of the time it was given.
+    walked: Mutex<Option<time::OffsetDateTime>>,
 }
+
+/// How often the sweeper walks the store's files.
+const WALK_EVERY: time::Duration = time::Duration::hours(1);
 
 /// Content just stored, or found stored, by a write that has not settled what becomes of it:
 /// while this lives, nothing erases it (see the module documentation). Dropping it ends the
@@ -103,7 +108,19 @@ impl Blobs {
             store,
             erasing: RwLock::new(()),
             holds: Mutex::new(HashMap::new()),
+            walked: Mutex::new(None),
         }
+    }
+
+    /// Whether a walk of the store's files is due as of `now`: on the first sweep since the
+    /// server started, then hourly. Answering yes counts as walking.
+    pub(crate) fn walk_due(&self, now: time::OffsetDateTime) -> bool {
+        let mut walked = self.walked.lock().unwrap_or_else(PoisonError::into_inner);
+        if walked.is_some_and(|at| now - at < WALK_EVERY) {
+            return false;
+        }
+        *walked = Some(now);
+        true
     }
 
     /// Whether some write holds the content `sha256`.
@@ -320,6 +337,10 @@ impl Blobs {
     ) -> Result<bool, String> {
         let _turn = self.erasing.write().await;
         if self.is_held(sha256) {
+            return Ok(false);
+        }
+        // A flag set since the caller looked means a version may name it without a row.
+        if db.blob_refs_flagged().await.map_err(|e| e.to_string())? {
             return Ok(false);
         }
         if !db

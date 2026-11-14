@@ -203,7 +203,7 @@ struct Plan {
 }
 
 /// The first versions of the files a copy makes, claimed before the copy's tree commit and
-/// committed together after it.
+/// committed together after it, and what is recorded once they are, or done if they cannot be.
 struct CopiedContents {
     /// What to write for each file that has a version.
     versions: Vec<CopiedVersion>,
@@ -211,6 +211,11 @@ struct CopiedContents {
     claims: Vec<ClaimId>,
     /// What the commit message names.
     name: String,
+    /// The `node.copied` events, recorded once the versions are committed.
+    events: Vec<NewEvent>,
+    /// The tree commit's message and the records that take it back (the copies purged).
+    message: String,
+    undo: Vec<TreeRecord>,
 }
 
 /// The first version of one file a copy makes.
@@ -282,9 +287,11 @@ impl Default for Plan {
 /// version of each file and nothing of its history: the folder (with every live item below it
 /// the person may view) in one tree commit, then the first versions of all its files in one
 /// checkpoint commit, their contents claimed before either. Refused characters in the name
-/// become `_` and a name taken there gets ` (2)`, ` (3)` …; the answer says so. If the
-/// versions cannot be committed after the items were, the items stay, empty, and the Git error
-/// is answered.
+/// become `_` and a name taken there gets ` (2)`, ` (3)` …; the answer says so. View on every
+/// item copied is judged again with the change, so view lost meanwhile refuses it. A file Git
+/// holds without a document row is left out. If the versions cannot be committed after the
+/// items were, the copy is taken back (its items purged, in no bin) and the Git error is
+/// answered; its `node.copied` events are recorded only once the versions are committed.
 pub async fn apply(state: &AppState, actor: &User, op: TreeOp) -> Result<Applied, AccessError> {
     let _turn = state.tree_lock().lock().await;
     ensure_in_step(state).await?;
@@ -1741,6 +1748,8 @@ async fn plan_copy(
             editors.insert(record.id, document.editor);
         }
     }
+    // A file Git holds with no document row cannot be opened, so it is not copied.
+    chosen.retain(|(r, _)| r.kind != kind_word(NodeKind::Document) || editors.contains_key(&r.id));
 
     // The top item's name: as asked, or as it is, cleaned and made unique where it goes.
     let editor = editors.get(&source.id).copied();
@@ -1870,42 +1879,55 @@ async fn plan_copy(
     // The claims keep the contents now.
     drop(held);
 
-    let undo = records.iter().map(|r| deleted(r, author.clone())).collect();
+    let undo: Vec<TreeRecord> = records.iter().map(|r| deleted(r, author.clone())).collect();
+    let message = format!(
+        "Copy {} {} to {}",
+        kind_word(node.kind),
+        source.name,
+        place.name
+    );
+    // View on everything copied is judged again with the change, ancestors first.
+    let mut needs = vec![(destination, Perms::ADD), (id, Perms::VIEW)];
+    needs.extend(
+        chosen
+            .iter()
+            .skip(1)
+            .map(|(r, _)| (NodeId(r.id), Perms::VIEW)),
+    );
     Ok(Plan {
         id: new_top,
-        message: format!(
-            "Copy {} {} to {}",
-            kind_word(node.kind),
-            source.name,
-            place.name
-        ),
+        message: message.clone(),
         records,
-        undo,
-        needs: vec![(destination, Perms::ADD), (id, Perms::VIEW)],
-        events,
+        undo: undo.clone(),
+        needs,
         renamed,
         copies,
         contents: Some(CopiedContents {
             versions,
             claims,
             name: top_name,
+            events,
+            message,
+            undo,
         }),
         ..Plan::default()
     })
 }
 
 /// Commits the first versions of the files a copy made, as one commit credited to `actor`,
-/// then settles their claims and records the revisions. If the commit fails the claims are
-/// withdrawn, the files stay empty, and the Git error is answered.
+/// then settles their claims, records the revisions and the `node.copied` events. If the
+/// commit fails the claims are withdrawn, the copy is taken back (see [`take_back_copy`]) and
+/// the Git error is answered.
 async fn store_copied(
     state: &AppState,
     actor: &User,
     contents: CopiedContents,
 ) -> Result<(), AccessError> {
+    let db = state.db();
     if contents.versions.is_empty() {
+        record_events(db, &contents.events).await;
         return Ok(());
     }
-    let db = state.db();
     let author = author_of(actor);
     let message = format!("Copy {}", contents.name);
     let store = Arc::clone(state.checkpointer());
@@ -1933,10 +1955,12 @@ async fn store_copied(
         Ok((Err(e), _)) => {
             state.blobs().settle_all(db, &contents.claims, None).await;
             eprintln!("sharecraft-server: the versions of a copy could not be stored: {e}");
+            take_back_copy(state, actor, contents.message, contents.undo).await;
             return Err(git_failure(e));
         }
         Err(e) => {
             state.blobs().settle_all(db, &contents.claims, None).await;
+            take_back_copy(state, actor, contents.message, contents.undo).await;
             return Err(e);
         }
     };
@@ -1954,7 +1978,50 @@ async fn store_copied(
         )
         .await;
     }
+    record_events(db, &contents.events).await;
     Ok(())
+}
+
+/// Records `events` on their own, logging a failure.
+async fn record_events(db: &Db, events: &[NewEvent]) {
+    for event in events {
+        if let Err(e) = db.append_event(event).await {
+            eprintln!("sharecraft-server: database failure: {e}");
+        }
+    }
+}
+
+/// Takes back a copy whose versions could not be committed: `undo` (its records purged) as a
+/// second commit, then mirrored into PostgreSQL, so the copies are tombstones that no list and
+/// no bin shows. A take-back that cannot be written or mirrored marks the tree out of step, as
+/// [`commit`] does.
+async fn take_back_copy(state: &AppState, actor: &User, message: String, undo: Vec<TreeRecord>) {
+    let ids: Vec<Uuid> = undo.iter().map(|r| r.id).collect();
+    if !take_back(state, author_of(actor), &message, undo.clone()).await {
+        state.tree_out_of_step().store(true, Ordering::SeqCst);
+        return;
+    }
+    let rows = match undo.iter().map(to_row).collect::<Result<Vec<_>, _>>() {
+        Ok(rows) => rows,
+        Err(e) => {
+            eprintln!("sharecraft-server: cannot take back a copy: {e}");
+            state.tree_out_of_step().store(true, Ordering::SeqCst);
+            return;
+        }
+    };
+    let mirrored = state
+        .db()
+        .apply_nodes(NodeChange {
+            rows: &rows,
+            ..NodeChange::default()
+        })
+        .await;
+    if let Err(e) = mirrored {
+        eprintln!("sharecraft-server: cannot take back a copy in the database: {e}");
+        if !repair_ids(state, &ids).await {
+            state.tree_out_of_step().store(true, Ordering::SeqCst);
+        }
+    }
 }
 
 /// The Git error for a record that names a node Git does not hold.

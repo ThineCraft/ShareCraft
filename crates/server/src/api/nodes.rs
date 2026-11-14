@@ -420,6 +420,13 @@ impl Copied {
     pub(crate) fn id(&self) -> &str {
         &self.node.id
     }
+
+    /// The name asked for and the one given, if they differ.
+    pub(crate) fn renamed(&self) -> Option<(String, String)> {
+        self.renamed
+            .as_ref()
+            .map(|r| (r.from.clone(), r.to.clone()))
+    }
 }
 
 /// Called after the file `doc` was renamed: its room, if open, stores later revisions under

@@ -53,10 +53,28 @@ pub(crate) struct ItemResult {
     /// For a copy, the new item.
     #[serde(skip_serializing_if = "Option::is_none")]
     new_id: Option<String>,
+    /// For a copy or a restore whose name had to change, the name before and after.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    renamed: Option<Renamed>,
+}
+
+/// A name that had to change.
+#[derive(Serialize)]
+pub(crate) struct Renamed {
+    from: String,
+    to: String,
+}
+
+/// What one item's operation made: a copy's new id, and a name that had to change.
+#[derive(Default)]
+struct Done {
+    new_id: Option<String>,
+    renamed: Option<Renamed>,
 }
 
 /// `POST /api/bulk {op: "move" | "copy" | "delete" | "restore", items: [ids], parent?}`: each
-/// item in turn, as the single-item route does it. `200 [{id, ok, error?, new_id?}]`, in the
+/// item in turn, as the single-item route does it. `200 [{id, ok, error?, new_id?, renamed?}]`
+/// (`renamed {from, to}` when a copy's or a restored item's name had to change), in the
 /// order given. `422 invalid_request` for more than 500 items, or a move or copy without a
 /// `parent` (or with one that is not an id); nothing is done then.
 pub(crate) async fn run(
@@ -82,17 +100,19 @@ pub(crate) async fn run(
                 Err(e) => Err(e),
             };
             results.push(match done {
-                Ok(new_id) => ItemResult {
+                Ok(done) => ItemResult {
                     id: item,
                     ok: true,
                     error: None,
-                    new_id,
+                    new_id: done.new_id,
+                    renamed: done.renamed,
                 },
                 Err(e) => ItemResult {
                     id: item,
                     ok: false,
                     error: Some(e.code()),
                     new_id: None,
+                    renamed: None,
                 },
             });
         }
@@ -102,24 +122,45 @@ pub(crate) async fn run(
     Ok(Json(results))
 }
 
-/// Does `op` to `id` for `actor`; for a copy, answers the new item's id.
+/// Does `op` to `id` for `actor`.
 async fn one(
     state: &AppState,
     actor: &records::User,
     op: BulkOp,
     id: NodeId,
     parent: Option<NodeId>,
-) -> Result<Option<String>, ApiError> {
+) -> Result<Done, ApiError> {
     match (op, parent) {
-        (BulkOp::Move, Some(parent)) => move_one(state, actor, id, parent).await.map(|_| None),
-        (BulkOp::Copy, Some(parent)) => copy_one(state, actor, id, parent, None)
+        (BulkOp::Move, Some(parent)) => move_one(state, actor, id, parent)
             .await
-            .map(|copied| Some(copied.id().to_owned())),
-        (BulkOp::Delete, _) => delete_one(state, actor, id).await.map(|()| None),
-        (BulkOp::Restore, _) => tree::apply(state, actor, TreeOp::Restore { id })
-            .await
-            .map(|_| None)
-            .map_err(ApiError::from),
+            .map(|_| Done::default()),
+        (BulkOp::Copy, Some(parent)) => {
+            let copied = copy_one(state, actor, id, parent, None).await?;
+            Ok(Done {
+                new_id: Some(copied.id().to_owned()),
+                renamed: copied.renamed().map(|(from, to)| Renamed { from, to }),
+            })
+        }
+        (BulkOp::Delete, _) => delete_one(state, actor, id).await.map(|()| Done::default()),
+        (BulkOp::Restore, _) => {
+            let applied = tree::apply(state, actor, TreeOp::Restore { id }).await?;
+            let renamed = match applied.renamed {
+                Some((node, from)) => {
+                    let to = state
+                        .db()
+                        .node(node)
+                        .await
+                        .map_err(|e| ApiError::unavailable(&e))?
+                        .map_or_else(String::new, |n| n.name);
+                    Some(Renamed { from, to })
+                }
+                None => None,
+            };
+            Ok(Done {
+                new_id: None,
+                renamed,
+            })
+        }
         (BulkOp::Move | BulkOp::Copy, None) => Err(ApiError::InvalidRequest),
     }
 }

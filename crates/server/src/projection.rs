@@ -393,7 +393,7 @@ pub async fn reconcile_blobs(
         return Ok(report);
     }
     if complete {
-        report.erased = erase_unnamed(state, now).await;
+        report.erased = erase_unnamed(state, now, true).await;
     }
     Ok(report)
 }
@@ -401,11 +401,13 @@ pub async fn reconcile_blobs(
 /// The sweeper's erasure, as of `now`: content nothing names (no `blob_refs` row, pending ones
 /// included) and no write holds, older than 24 hours by its row or, without one, by its file,
 /// and abandoned files in the store's `tmp` folder of that age; how many contents it erased.
+/// Content with a row is looked for on every sweep; the store's files (for content with no
+/// row, and `tmp`) are walked on the first sweep after start-up and then hourly.
 /// Nothing is erased while a flag asks for the content rows to be rebuilt, as a version could
 /// then name content without a row. Failures are logged.
 pub(crate) async fn sweep_unnamed(state: &AppState, now: OffsetDateTime) -> usize {
     match state.db().blob_refs_flagged().await {
-        Ok(false) => erase_unnamed(state, now).await,
+        Ok(false) => erase_unnamed(state, now, state.blobs().walk_due(now)).await,
         Ok(true) => 0,
         Err(e) => {
             eprintln!("sharecraft-server: cannot read the content flags: {e}");
@@ -431,9 +433,11 @@ async fn purged_documents(store: &Arc<dyn Checkpointer>) -> Result<HashSet<DocId
     }
 }
 
-/// Erases the content nothing names that is older than [`ERASE_AFTER`] as of `now`, and the
-/// abandoned files in `tmp` of that age; how many contents it erased. Failures are logged.
-async fn erase_unnamed(state: &AppState, now: OffsetDateTime) -> usize {
+/// Erases the content nothing names that is older than [`ERASE_AFTER`] as of `now`; how many
+/// contents it erased. Content with a row is found from the rows; with `walk`, the store's
+/// files are listed too (their rows looked up in batches) for content with no row, and the
+/// abandoned files in `tmp` of that age are removed. Failures are logged.
+async fn erase_unnamed(state: &AppState, now: OffsetDateTime, walk: bool) -> usize {
     let db = state.db();
     let blobs = state.blobs();
     let cutoff = now - ERASE_AFTER;
@@ -446,35 +450,9 @@ async fn erase_unnamed(state: &AppState, now: OffsetDateTime) -> usize {
             return 0;
         }
     };
-    let mut seen: HashSet<[u8; 32]> = candidates.iter().copied().collect();
-    let listed = {
-        let blobs = Arc::clone(blobs);
-        tokio::task::spawn_blocking(move || {
-            let files = blobs.store().list()?;
-            blobs.store().clear_tmp(cutoff_time)?;
-            Ok::<_, revisions::BlobError>(files)
-        })
-        .await
-    };
-    match listed {
-        Ok(Ok(files)) => {
-            for (sha256, modified) in files {
-                if modified >= cutoff_time || seen.contains(&sha256) {
-                    continue;
-                }
-                // A file with a row is judged by its row's age, above.
-                match db.blob_created_at(&sha256).await {
-                    Ok(None) => {
-                        seen.insert(sha256);
-                        candidates.push(sha256);
-                    }
-                    Ok(Some(_)) => {}
-                    Err(e) => eprintln!("sharecraft-server: cannot read a content row: {e}"),
-                }
-            }
-        }
-        Ok(Err(e)) => eprintln!("sharecraft-server: cannot list the content store: {e}"),
-        Err(e) => eprintln!("sharecraft-server: cannot list the content store: {e}"),
+    let seen: HashSet<[u8; 32]> = candidates.iter().copied().collect();
+    if walk {
+        candidates.extend(walk_store(state, cutoff_time, &seen).await);
     }
     let mut erased = 0;
     for sha256 in candidates {
@@ -485,4 +463,49 @@ async fn erase_unnamed(state: &AppState, now: OffsetDateTime) -> usize {
         }
     }
     erased
+}
+
+/// The store's files last written before `cutoff_time` that are not in `seen` and have no row,
+/// after removing the abandoned files in `tmp` written before it.
+async fn walk_store(
+    state: &AppState,
+    cutoff_time: SystemTime,
+    seen: &HashSet<[u8; 32]>,
+) -> Vec<[u8; 32]> {
+    let blobs = state.blobs();
+    let listed = {
+        let blobs = Arc::clone(blobs);
+        tokio::task::spawn_blocking(move || {
+            let files = blobs.store().list()?;
+            blobs.store().clear_tmp(cutoff_time)?;
+            Ok::<_, revisions::BlobError>(files)
+        })
+        .await
+    };
+    let old: Vec<[u8; 32]> = match listed {
+        Ok(Ok(files)) => files
+            .into_iter()
+            .filter(|(sha256, modified)| *modified < cutoff_time && !seen.contains(sha256))
+            .map(|(sha256, _)| sha256)
+            .collect(),
+        Ok(Err(e)) => {
+            eprintln!("sharecraft-server: cannot list the content store: {e}");
+            return Vec::new();
+        }
+        Err(e) => {
+            eprintln!("sharecraft-server: cannot list the content store: {e}");
+            return Vec::new();
+        }
+    };
+    // A file with a row is judged by its row's age, from the rows.
+    match state.db().blobs_with_rows(&old).await {
+        Ok(with_rows) => old
+            .into_iter()
+            .filter(|sha256| !with_rows.contains(sha256))
+            .collect(),
+        Err(e) => {
+            eprintln!("sharecraft-server: cannot read the content rows: {e}");
+            Vec::new()
+        }
+    }
 }

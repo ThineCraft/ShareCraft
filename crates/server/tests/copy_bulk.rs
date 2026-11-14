@@ -431,10 +431,12 @@ async fn purge_deletes_blob_refs_and_closes_requests() {
     assert!(!w.stored(b"asked about, again"));
 }
 
-/// Holds the checkpoints of one file name, once armed, until let go.
+/// Holds the checkpoints of one file name (or the loads of one document, by id), once armed,
+/// until let go; and fails every commit of several new documents while `fail_new` is set.
 #[derive(Default)]
 struct Gate {
     armed: AtomicBool,
+    fail_new: AtomicBool,
     name: Mutex<String>,
     /// Whether a checkpoint is waiting, and whether it may go on.
     state: Mutex<(bool, bool)>,
@@ -479,6 +481,7 @@ impl Checkpointer for Gated {
     }
 
     fn load(&self, doc: DocId) -> Result<Option<Stored>, CheckpointError> {
+        self.1.pass(&doc.0.to_string());
         self.0.read(doc, None)
     }
 
@@ -528,8 +531,315 @@ impl Checkpointer for Gated {
         message: &str,
         checkpoints: &[Checkpoint<'_>],
     ) -> Result<RevisionId, CheckpointError> {
+        if self.1.fail_new.load(Ordering::SeqCst) {
+            return Err(CheckpointError::Git(GitError::new("disk on fire")));
+        }
         self.0.checkpoint_new(author, message, checkpoints)
     }
+}
+
+/// A world whose store waits at, or fails through, `gate`.
+async fn gated_world(gate: &Arc<Gate>) -> World {
+    let held = Arc::clone(gate);
+    let server = spawn_server_with(move |path: &Path| {
+        Arc::new(Gated(RevisionStore::open(path).unwrap(), held)) as Arc<dyn Checkpointer>
+    })
+    .await;
+    world_on(server).await
+}
+
+/// A copy whose versions cannot be committed after its items were is taken back: the answer
+/// is `503`, the copies are tombstones (in no list and no bin), no `node.copied` event tells
+/// of them, and no claim is left.
+#[tokio::test]
+async fn failed_versions_commit_takes_the_copy_back() {
+    let gate = Arc::new(Gate::default());
+    let w = gated_world(&gate).await;
+    let plans = w.folder(&w.library, "Plans").await;
+    w.upload(&plans, "A.xlsx", b"to copy, in vain").await;
+    let dest = w.folder(&w.library, "Dest").await;
+    gate.fail_new.store(true, Ordering::SeqCst);
+
+    let (status, body) = w.copy(&w.root, &plans, &dest, None).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(!body.to_string().contains("disk on fire"));
+    assert_eq!(w.children(&dest).await.len(), 0);
+    for stage in ["first", "second"] {
+        let site = w
+            .server
+            .records_db()
+            .node(node_id(&dest))
+            .await
+            .unwrap()
+            .unwrap()
+            .site;
+        let (status, page) = w
+            .call(
+                &w.root,
+                Method::GET,
+                &format!("/api/sites/{}/bin?stage={stage}", site.0),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(page["items"].as_array().unwrap().len(), 0, "{page}");
+    }
+    let pool = w.server.records_db().test_pool().clone();
+    let copied: i64 = sqlx::query_scalar("select count(*) from events where kind = 'node.copied'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(copied, 0);
+    let rows: Vec<(Uuid, bool)> =
+        sqlx::query_as("select id, purged_at is not null from nodes where parent_id = $1")
+            .bind(uuid(&dest))
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].1, "the copy is a tombstone");
+    let record = w
+        .server
+        .store()
+        .read_tree_record(rows[0].0)
+        .unwrap()
+        .unwrap();
+    assert!(record.purged.is_some());
+    let pending: i64 = sqlx::query_scalar("select count(*) from blob_refs where pending")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(pending, 0);
+
+    // Once the store works again, the same copy goes through.
+    gate.fail_new.store(false, Ordering::SeqCst);
+    let (status, body) = w.copy(&w.root, &plans, &dest, None).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["node"]["name"], "Plans");
+}
+
+/// Plans, which Bob may view, with Inner (Bob may view it too) and Secret (Bob may not) in it,
+/// and Dest, where Bob may add.
+struct Shared {
+    plans: String,
+    inner: String,
+    secret: String,
+    dest: String,
+    bob: TestUser,
+}
+
+async fn shared(w: &World) -> Shared {
+    let bob = w.server.user("Bob").await;
+    let plans = w.folder(&w.library, "Plans").await;
+    w.upload(&plans, "Top.xlsx", b"top").await;
+    let inner = w.folder(&plans, "Inner").await;
+    w.upload(&inner, "In.xlsx", b"inner").await;
+    let secret = w.folder(&plans, "Secret").await;
+    w.upload(&secret, "S.xlsx", b"secret").await;
+    let dest = w.folder(&w.library, "Dest").await;
+    w.grant(&plans, &bob, "viewer").await;
+    w.grant(&dest, &bob, "editor").await;
+    w.unshare(&secret, &bob).await;
+    Shared {
+        plans,
+        inner,
+        secret,
+        dest,
+        bob,
+    }
+}
+
+impl World {
+    /// Removes `user`'s own assignment on `node` (breaking its inheritance first).
+    async fn unshare(&self, node: &str, user: &TestUser) {
+        let (status, body) = self
+            .call(
+                &self.root,
+                Method::DELETE,
+                &format!("/api/nodes/{node}/access/user/{}", user.id.0),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    }
+}
+
+/// A folder's copy leaves out what the copier may not view.
+#[tokio::test]
+async fn folder_copy_skips_what_you_cannot_view() {
+    let w = world().await;
+    let s = shared(&w).await;
+    let (status, _) = w
+        .call(
+            &s.bob,
+            Method::GET,
+            &format!("/api/nodes/{}", s.secret),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, copied) = w.copy(&s.bob, &s.plans, &s.dest, None).await;
+    assert_eq!(status, StatusCode::CREATED, "{copied}");
+    let copy = copied["node"]["id"].as_str().unwrap().to_owned();
+    let names: Vec<String> = w
+        .children(&copy)
+        .await
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    assert_eq!(names, ["Inner", "Top.xlsx"]);
+    assert_eq!(
+        copied_items(&w, &copy).await,
+        4,
+        "Plans, Inner, In.xlsx and Top.xlsx"
+    );
+}
+
+/// The `items` the `node.copied` event of `node` counts.
+async fn copied_items(w: &World, node: &str) -> i64 {
+    let detail: Value =
+        sqlx::query_scalar("select detail from events where kind = 'node.copied' and node_id = $1")
+            .bind(uuid(node))
+            .fetch_one(w.server.records_db().test_pool())
+            .await
+            .unwrap();
+    detail["items"].as_i64().unwrap()
+}
+
+/// View of an item inside a folder, lost while the folder's copy is being planned, is judged
+/// again when the copy is applied: the copy is refused and makes nothing.
+#[tokio::test]
+async fn view_lost_mid_copy_is_honoured() {
+    let gate = Arc::new(Gate::default());
+    let w = gated_world(&gate).await;
+    let s = shared(&w).await;
+    let inside = w.children(&s.inner).await[0].1.clone();
+    let commits = w.commits();
+    gate.arm(&inside);
+    let copying = {
+        let http = w.server.http(Some(&s.bob));
+        let url = w.server.url(&format!("/api/nodes/{}/copy", s.plans));
+        let body = json!({ "parent": s.dest });
+        tokio::spawn(async move { http.post(url).json(&body).send().await.unwrap().status() })
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !gate.waiting() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the copy never loaded In.xlsx"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    w.unshare(&s.inner, &s.bob).await;
+    gate.open();
+    let status = copying.await.unwrap();
+    assert!(
+        matches!(status, StatusCode::NOT_FOUND | StatusCode::FORBIDDEN),
+        "{status}"
+    );
+    assert_eq!(w.children(&s.dest).await.len(), 0);
+    let pending: i64 = sqlx::query_scalar("select count(*) from blob_refs where pending")
+        .fetch_one(w.server.records_db().test_pool())
+        .await
+        .unwrap();
+    assert_eq!(pending, 0);
+    // The refused change was taken back in Git; nothing new is left there.
+    let tree = w.server.store().read_tree().unwrap();
+    assert!(
+        tree.iter()
+            .all(|r| r.parent != Some(uuid(&s.dest)) || r.purged.is_some())
+    );
+    assert!(w.commits() >= commits);
+}
+
+/// The sweeper walks the content store's files at most hourly; content with a row nothing names
+/// is erased on every sweep.
+#[tokio::test]
+async fn sweep_walks_the_store_hourly() {
+    let w = world().await;
+    let now = time::OffsetDateTime::now_utc();
+    let first = w.server.blob(b"loose, swept on the first walk");
+    let state = w.server.state().await;
+    server::sweep_once(state, now + time::Duration::days(2)).await;
+    assert!(!w.stored(b"loose, swept on the first walk"));
+
+    let second = w.server.blob(b"loose, waits for the next walk");
+    server::sweep_once(
+        state,
+        now + time::Duration::days(2) + time::Duration::minutes(10),
+    )
+    .await;
+    assert!(
+        w.stored(b"loose, waits for the next walk"),
+        "walked again within the hour"
+    );
+    // Content with a row is found without a walk.
+    let db = w.server.records_db();
+    let withdrawn = w.server.blob(b"claimed, then withdrawn");
+    let doc = DocId(Uuid::new_v4());
+    let claim = db.claim_blob(withdrawn, doc).await.unwrap();
+    db.settle_claim(claim, None).await.unwrap();
+    server::sweep_once(
+        state,
+        now + time::Duration::days(2) + time::Duration::minutes(20),
+    )
+    .await;
+    assert!(!w.stored(b"claimed, then withdrawn"));
+    assert!(w.stored(b"loose, waits for the next walk"));
+
+    server::sweep_once(
+        state,
+        now + time::Duration::days(2) + time::Duration::hours(2),
+    )
+    .await;
+    assert!(!w.stored(b"loose, waits for the next walk"));
+    let _ = (first, second);
+}
+
+/// A bulk copy or restore says when an item's name had to change.
+#[tokio::test]
+async fn bulk_results_say_renamed() {
+    let w = world().await;
+    let a = w.upload(&w.library, "A.xlsx", b"renamed in bulk").await;
+    let (_, results) = w
+        .call(
+            &w.root,
+            Method::POST,
+            "/api/bulk",
+            Some(json!({ "op": "copy", "items": [a], "parent": w.library })),
+        )
+        .await;
+    assert_eq!(
+        results[0]["renamed"],
+        json!({ "from": "A.xlsx", "to": "A (2).xlsx" }),
+        "{results}"
+    );
+    w.delete(&a).await;
+    let copy = results[0]["new_id"].as_str().unwrap().to_owned();
+    let (status, _) = w
+        .call(
+            &w.root,
+            Method::PATCH,
+            &format!("/api/nodes/{copy}"),
+            Some(json!({ "name": "A.xlsx" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, results) = w
+        .call(
+            &w.root,
+            Method::POST,
+            "/api/bulk",
+            Some(json!({ "op": "restore", "items": [a] })),
+        )
+        .await;
+    assert_eq!(results[0]["ok"], true, "{results}");
+    assert_eq!(
+        results[0]["renamed"],
+        json!({ "from": "A.xlsx", "to": "A (2).xlsx" }),
+        "{results}"
+    );
 }
 
 /// A save of the same bytes as a file being purged, held between its claim and its commit,
