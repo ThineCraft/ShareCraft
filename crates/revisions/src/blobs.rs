@@ -233,7 +233,23 @@ impl BlobStore {
     ///
     /// # Errors
     /// `TooLarge`, or the I/O error of the reader or the file system; nothing is stored then.
-    pub fn write_from(&self, mut reader: impl Read, limit: u64) -> Result<BlobRef, BlobError> {
+    pub fn write_from(&self, reader: impl Read, limit: u64) -> Result<BlobRef, BlobError> {
+        let (tmp, blob) = self.write_tmp(reader, limit)?;
+        self.place(&tmp, blob)?;
+        Ok(blob)
+    }
+
+    /// The first half of [`BlobStore::write_from`]: reads everything `reader` gives into a new
+    /// file under `tmp`, hashing it on the way, flushes it, and answers where it is and what it
+    /// holds. [`BlobStore::place`] then puts it in place. At most `limit` bytes are taken.
+    ///
+    /// # Errors
+    /// `TooLarge`, or the I/O error of the reader or the file system; nothing is kept then.
+    pub fn write_tmp(
+        &self,
+        mut reader: impl Read,
+        limit: u64,
+    ) -> Result<(PathBuf, BlobRef), BlobError> {
         let (path, mut file) = self.new_tmp()?;
         let result = (|| {
             let mut hasher = Sha256::new();
@@ -262,15 +278,22 @@ impl BlobStore {
         })();
         drop(file);
         match result {
-            Ok(blob) => {
-                self.put_in_place(&path, &blob)?;
-                Ok(blob)
-            }
+            Ok(blob) => Ok((path, blob)),
             Err(e) => {
                 let _ = std::fs::remove_file(&path);
                 Err(e)
             }
         }
+    }
+
+    /// The second half of [`BlobStore::write_from`]: moves `tmp`, written by
+    /// [`BlobStore::write_tmp`] to hold `blob`, into place, or removes it if that content is
+    /// stored already.
+    ///
+    /// # Errors
+    /// The I/O error; `tmp` is removed then.
+    pub fn place(&self, tmp: &Path, blob: BlobRef) -> Result<(), BlobError> {
+        self.put_in_place(tmp, &blob)
     }
 
     /// Renames `part`, an upload's part file under [`BlobStore::tmp_dir`] already checked to

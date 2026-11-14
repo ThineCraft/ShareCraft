@@ -46,7 +46,7 @@ use futures_util::StreamExt;
 use records::{
     AccessError, Editor, NewEvent, NewUpload, UploadError, UploadSession, UploadTarget, User,
 };
-use revisions::{BlobRef, RevisionId, parse_hex};
+use revisions::{BlobError, BlobRef, RevisionId, parse_hex};
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -57,7 +57,7 @@ use uuid::Uuid;
 use super::content::{Created, create_uploaded, discard, save_answer};
 use super::{ApiError, JsonBody, parse_id, to_completion};
 use crate::auth::Signed;
-use crate::blobs::ChannelReader;
+use crate::blobs::{ChannelReader, Held};
 use crate::file_room::{FileLink, SaveReply, check_upload, upload_version};
 use crate::{AppState, tree};
 
@@ -628,11 +628,12 @@ fn hash_prefix(file: &mut File, length: u64) -> std::io::Result<Sha256> {
 /// SHA-256; the permission is checked again (`add` on the folder, `edit` on the document), a
 /// new file's name must be free (`409 name_taken {suggested}`), and a new version is asked of
 /// the file session (`409 being_edited` while someone holds the seat, `409 {current}` if the
-/// base is no longer current). Each of these leaves the session as it was. Then the part file
-/// becomes stored content and the session ends; a new file is created with it as its first
-/// revision (`201`, as `POST /api/docs/upload` answers), and a new version is saved through
-/// the file session (`200 {revision, changed}`). Content refused or failed from there is erased
-/// unless something else names it. Runs to the end even if the caller goes away.
+/// base is no longer current). Each of these leaves the session as it was, except a stale base,
+/// which can never finish and ends it. A part file gone missing ends the session (`503`). Then
+/// the part file becomes stored content and the session ends; a new file is created with it as
+/// its first revision (`201`, as `POST /api/docs/upload` answers), and a new version is saved
+/// through the file session (`200 {revision, changed}`). Content refused or failed from there
+/// is erased unless something else names it. Runs to the end even if the caller goes away.
 pub(crate) async fn finish(
     State(state): State<AppState>,
     signed: Signed,
@@ -657,13 +658,22 @@ pub(crate) async fn finish(
             None => {
                 let part = state.uploads().part(id);
                 let size = session.size;
-                tokio::task::spawn_blocking(move || {
+                let hashed = tokio::task::spawn_blocking(move || {
                     let mut file = File::open(&part)?;
                     hash_prefix(&mut file, size)
                 })
                 .await
-                .map_err(|e| ApiError::unavailable(&e))?
-                .map_err(|e| ApiError::unavailable(&e))?
+                .map_err(|e| ApiError::unavailable(&e))?;
+                match hashed {
+                    Ok(hasher) => hasher,
+                    Err(e) if e.kind() == ErrorKind::NotFound => {
+                        // Its bytes are gone: it can never finish.
+                        eprintln!("sharecraft-server: the part file of an upload is missing");
+                        end_session(&state, id).await?;
+                        return Err(ApiError::Unavailable);
+                    }
+                    Err(e) => return Err(ApiError::unavailable(&e)),
+                }
             }
         };
         let blob = BlobRef {
@@ -689,16 +699,26 @@ pub(crate) async fn finish(
     .await
 }
 
-/// Moves the session's part file into the content store as `blob` and ends the session. The
-/// caller holds its turn and has checked the bytes.
-async fn adopt(state: &AppState, session: &UploadSession, blob: BlobRef) -> Result<(), ApiError> {
+/// Moves the session's part file into the content store as `blob`, held, and ends the
+/// session. The caller holds its turn and has checked the bytes. A part file gone missing ends
+/// the session, which can never finish; if the session cannot be ended after its part was
+/// moved, the content is discarded.
+async fn adopt(state: &AppState, session: &UploadSession, blob: BlobRef) -> Result<Held, ApiError> {
     let part = state.uploads().part(session.id);
-    let blobs = Arc::clone(state.blobs());
-    tokio::task::spawn_blocking(move || blobs.store().adopt_part(&part, blob))
-        .await
-        .map_err(|e| ApiError::unavailable(&e))?
-        .map_err(|e| ApiError::unavailable(&e))?;
-    end_session(state, session.id).await
+    let held = match state.blobs().adopt_part(part, blob).await {
+        Ok(held) => held,
+        Err(BlobError::Io(e)) if e.kind() == ErrorKind::NotFound => {
+            eprintln!("sharecraft-server: the part file of an upload is missing");
+            end_session(state, session.id).await?;
+            return Err(ApiError::Unavailable);
+        }
+        Err(e) => return Err(ApiError::unavailable(&e)),
+    };
+    if let Err(e) = end_session(state, session.id).await {
+        discard(state, held).await;
+        return Err(e);
+    }
+    Ok(held)
 }
 
 /// Finishes a session making a new file in `parent` with the content `blob`.
@@ -726,9 +746,9 @@ async fn finish_new_file(
         Err(AccessError::WrongExtension) => return Err(ApiError::BadRequest),
         Err(e) => return Err(e.into()),
     }
-    adopt(state, session, blob).await?;
+    let held = adopt(state, session, blob).await?;
     Ok(
-        match create_uploaded(state, user, parent, name, editor, blob).await? {
+        match create_uploaded(state, user, parent, name, editor, held).await? {
             Created::Done { doc, body } => {
                 completed(state, user, doc, session, false);
                 (StatusCode::CREATED, Json(body)).into_response()
@@ -753,9 +773,13 @@ async fn finish_new_version(
         None => None,
     };
     if let Some(refused) = ask_check(state, doc, &name, base.clone()).await? {
+        // A stale base can never finish: the session ends.
+        if matches!(refused, SaveReply::Conflict { .. }) {
+            end_session(state, session.id).await?;
+        }
         return Ok(save_answer(refused));
     }
-    adopt(state, session, blob).await?;
+    let held = adopt(state, session, blob).await?;
     // A session that ended before taking the upload wrote nothing for it; it is opened again.
     let mut reply = SaveReply::Failed;
     for _ in 0..SESSION_ATTEMPTS {
@@ -771,7 +795,7 @@ async fn finish_new_version(
         SaveReply::Saved(_) => completed(state, user, doc, session, true),
         // A version already names the content.
         SaveReply::Unchanged(_) => {}
-        _ => discard(state, blob).await,
+        _ => discard(state, held).await,
     }
     Ok(save_answer(reply))
 }

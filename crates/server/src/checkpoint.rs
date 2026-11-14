@@ -98,6 +98,21 @@ pub trait Checkpointer: Send + Sync + 'static {
     fn move_tree_records(&self, _author: &Author) -> Result<TreeMove, CheckpointError> {
         Err(CheckpointError::Unsupported)
     }
+
+    /// Stores the first versions of several new documents as one commit credited to `author`
+    /// (see [`RevisionStore::checkpoint_new`]); answers that commit.
+    ///
+    /// # Errors
+    /// Whatever the store reports, including `Stale` when a document has a revision already;
+    /// `Unsupported` unless the implementation keeps several documents in one commit.
+    fn write_new(
+        &self,
+        _author: &Author,
+        _message: &str,
+        _checkpoints: &[Checkpoint<'_>],
+    ) -> Result<RevisionId, CheckpointError> {
+        Err(CheckpointError::Unsupported)
+    }
 }
 
 impl Checkpointer for RevisionStore {
@@ -147,6 +162,15 @@ impl Checkpointer for RevisionStore {
 
     fn move_tree_records(&self, author: &Author) -> Result<TreeMove, CheckpointError> {
         RevisionStore::move_tree_records(self, author)
+    }
+
+    fn write_new(
+        &self,
+        author: &Author,
+        message: &str,
+        checkpoints: &[Checkpoint<'_>],
+    ) -> Result<RevisionId, CheckpointError> {
+        self.checkpoint_new(author, message, checkpoints)
     }
 }
 

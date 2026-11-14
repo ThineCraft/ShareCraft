@@ -316,8 +316,10 @@ async fn text(
 /// requests for access submitted more than a day before `now`, settles from Git the content
 /// claims pending for more than an hour, ends the upload sessions that have received nothing
 /// for a day (see [`crate::api::uploads::sweep_uploads`]), and purges the recycle bin entries
-/// whose time is up as of `now` (see [`crate::tree::purge_due`]). Logs one line if it revoked
-/// anything, and answers how many links it revoked. A database failure is logged and skipped:
+/// whose time is up as of `now` (see [`crate::tree::purge_due`]), and erases the content
+/// nothing names that is a day old (see [`crate::projection::sweep_unnamed`]). Logs one line if
+/// it revoked anything, and answers how many links it revoked. A database failure is logged and
+/// skipped:
 /// the next sweep tries again.
 pub async fn sweep_once(state: &AppState, now: OffsetDateTime) -> usize {
     let db = state.db();
@@ -353,6 +355,10 @@ pub async fn sweep_once(state: &AppState, now: OffsetDateTime) -> usize {
     crate::blobs::settle_stale_claims(state, now).await;
     crate::api::uploads::sweep_uploads(state, now).await;
     crate::tree::purge_due(state, now).await;
+    let erased = crate::projection::sweep_unnamed(state, now).await;
+    if erased > 0 {
+        println!("sharecraft-server: erased {erased} unused content(s)");
+    }
     if revoked > 0 {
         println!("sharecraft-server: revoked {revoked} expired link(s)");
     }

@@ -3,6 +3,7 @@
 
 mod admin;
 mod bin;
+mod bulk;
 pub(crate) mod content;
 mod docs;
 mod explorer;
@@ -53,6 +54,10 @@ pub(crate) fn router() -> Router<AppState> {
         .route("/sites/{id}/bin", get(bin::list))
         .route("/bin/{id}", delete(bin::remove))
         .route("/bin/{id}/restore", post(bin::restore))
+        .route(
+            "/bulk",
+            post(bulk::run).layer(DefaultBodyLimit::max(bulk::MAX_BODY)),
+        )
         .route("/roles", get(roles::list).post(roles::create))
         .route("/roles/{id}", patch(roles::change).delete(roles::remove))
         .route("/groups", get(groups::list).post(groups::create))
@@ -76,6 +81,7 @@ pub(crate) fn router() -> Router<AppState> {
             delete(nodes::unshare),
         )
         .route("/nodes/{id}/inheritance", post(nodes::inheritance))
+        .route("/nodes/{id}/copy", post(nodes::copy))
         .route("/nodes/{id}/links", get(links::list).post(links::create))
         .route("/links/{id}", delete(links::revoke))
         .route("/nodes/{id}/requests", post(requests::create))
@@ -246,6 +252,11 @@ impl ApiError {
     pub(crate) fn unavailable(cause: &dyn fmt::Display) -> ApiError {
         eprintln!("sharecraft-server: database failure: {cause}");
         ApiError::Unavailable
+    }
+
+    /// The code the answer's `error` names.
+    pub(crate) fn code(self) -> &'static str {
+        self.status_and_code().1
     }
 
     fn status_and_code(self) -> (StatusCode, &'static str) {

@@ -74,6 +74,7 @@ async fn rename(db: Db, actor: UserId, node: NodeId, name: &str) -> Result<(), A
         ..NodeChange::default()
     })
     .await
+    .map(drop)
 }
 
 /// A new folder `name` under `parent` by `actor`, judged as the server judges one (`add`).
@@ -119,6 +120,7 @@ async fn delete_node(db: &Db, actor: UserId, node: NodeId) -> Result<(), AccessE
         ..NodeChange::default()
     })
     .await
+    .map(drop)
 }
 
 #[tokio::test]

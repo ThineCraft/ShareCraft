@@ -744,6 +744,7 @@ async fn rename(db: Db, actor: UserId, file: NodeId, name: &str) -> Result<(), A
         ..NodeChange::default()
     })
     .await
+    .map(drop)
 }
 
 #[tokio::test]
@@ -917,6 +918,7 @@ async fn membership_and_cross_site_move_do_not_deadlock() {
                 ..NodeChange::default()
             })
             .await
+            .map(drop)
     });
     wait_blocked(&test, held.pid, 1).await;
     let second = test.db.clone();
@@ -975,6 +977,7 @@ async fn member_moving_while_their_group_grows_do_not_deadlock() {
                 ..NodeChange::default()
             })
             .await
+            .map(drop)
     });
     wait_blocked(&test, held.pid, 1).await;
     let second = test.db.clone();

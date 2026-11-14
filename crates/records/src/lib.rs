@@ -45,5 +45,5 @@ pub use revisions::{RevisionRecord, RevisionRow};
 pub use roles::{Access, Perms, Principal, RoleDef, RoleRef};
 pub use scopes::{Crumb, Cursor, Listed, NodeAccess};
 pub use settings::{ANYONE_LINK_MAX_DAYS, ANYONE_LINKS, SharingSettings};
-pub use tree::{Node, NodeChange, NodeKind, NodeRow, validate_node_name};
+pub use tree::{Node, NodeChange, NodeKind, NodeRow, NodesApplied, validate_node_name};
 pub use uploads::{NewUpload, UPLOADS_PER_PERSON, UploadError, UploadSession, UploadTarget};

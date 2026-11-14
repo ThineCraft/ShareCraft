@@ -726,6 +726,11 @@ async fn new_version_session_refused_when_stale() {
         response.json::<Value>().await.unwrap()["current"],
         second.as_str()
     );
+    // It can never finish now: the session is ended.
+    assert_eq!(
+        show(&server, &ann, &late_id).await.status(),
+        StatusCode::NOT_FOUND
+    );
     let response = start_version(&server, &ann, doc, Some(&first), &late).await;
     assert_eq!(response.status(), StatusCode::CONFLICT);
     assert_eq!(

@@ -7,10 +7,18 @@
 //! while it releases the row and deletes the file. So a claim either finishes before an erasure
 //! starts (which then counts it and erases nothing), or starts after the file is gone (and
 //! fails, saving nothing). PostgreSQL's row locks order the rows; this lock orders the file.
+//!
+//! Between being written and being claimed, content is held ([`Held`]): a write puts its file
+//! in place and takes the hold under the same shared turn, and no erasure touches held content.
+//! So a write that finds its content already stored (and writes nothing) cannot lose it to an
+//! erasure before its claim, and content just stored waits for its claim however long the
+//! request takes. Holds live in this process only; they are not needed across a restart, as
+//! nothing is then between a write and its claim.
 
+use std::collections::HashMap;
 use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use axum::body::{Body, Bytes};
 use collab_core::ids::DocId;
@@ -36,6 +44,45 @@ pub(crate) struct Blobs {
     store: BlobStore,
     /// Held shared by a claim, alone by an erasure; see the module documentation.
     erasing: RwLock<()>,
+    /// How many [`Held`] there are of each content.
+    holds: Mutex<HashMap<[u8; 32], usize>>,
+}
+
+/// Content just stored, or found stored, by a write that has not settled what becomes of it:
+/// while this lives, nothing erases it (see the module documentation). Dropping it ends the
+/// hold.
+pub(crate) struct Held {
+    blobs: Arc<Blobs>,
+    blob: BlobRef,
+}
+
+impl Held {
+    /// The content held.
+    pub(crate) fn blob(&self) -> BlobRef {
+        self.blob
+    }
+}
+
+impl std::fmt::Debug for Held {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Held").field(&self.blob).finish()
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        let mut holds = self
+            .blobs
+            .holds
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(count) = holds.get_mut(&self.blob.sha256) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                holds.remove(&self.blob.sha256);
+            }
+        }
+    }
 }
 
 /// Why a request body could not be stored.
@@ -55,7 +102,68 @@ impl Blobs {
         Self {
             store,
             erasing: RwLock::new(()),
+            holds: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Whether some write holds the content `sha256`.
+    fn is_held(&self, sha256: &[u8; 32]) -> bool {
+        self.holds
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains_key(sha256)
+    }
+
+    /// Takes a hold on `blob`. The caller holds the shared turn.
+    fn hold(self: &Arc<Self>, blob: BlobRef) -> Held {
+        *self
+            .holds
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(blob.sha256)
+            .or_insert(0) += 1;
+        Held {
+            blobs: Arc::clone(self),
+            blob,
+        }
+    }
+
+    /// Puts a finished file holding `blob` in place with `place` and holds it, under the
+    /// shared turn so no erasure runs in between.
+    async fn place_held(
+        self: &Arc<Self>,
+        blob: BlobRef,
+        place: impl FnOnce(&BlobStore) -> Result<(), BlobError> + Send + 'static,
+    ) -> Result<Held, BlobError> {
+        let _turn = self.erasing.read().await;
+        let held = self.hold(blob);
+        let blobs = Arc::clone(self);
+        match tokio::task::spawn_blocking(move || place(&blobs.store)).await {
+            Ok(Ok(())) => Ok(held),
+            Ok(Err(e)) => Err(e),
+            Err(e) => Err(BlobError::Io(std::io::Error::other(e))),
+        }
+    }
+
+    /// Moves `part`, an upload's part file checked to hold `blob`, into the store (see
+    /// [`BlobStore::adopt_part`]) and holds it.
+    pub(crate) async fn adopt_part(
+        self: &Arc<Self>,
+        part: PathBuf,
+        blob: BlobRef,
+    ) -> Result<Held, BlobError> {
+        self.place_held(blob, move |store| store.adopt_part(&part, blob))
+            .await
+    }
+
+    /// Holds `blob`, content already stored that a copy is about to name; `None` if it is not
+    /// stored (any more).
+    pub(crate) async fn hold_stored(self: &Arc<Self>, blob: BlobRef) -> Option<Held> {
+        let _turn = self.erasing.read().await;
+        if !self.store.contains(&blob.sha256) {
+            return None;
+        }
+        Some(self.hold(blob))
     }
 
     /// The store itself.
@@ -64,26 +172,30 @@ impl Blobs {
     }
 
     /// Stores `bytes`, already in memory (a text document's text), without blocking the async
-    /// workers.
-    pub(crate) async fn write_bytes(self: &Arc<Self>, bytes: Vec<u8>) -> Result<BlobRef, String> {
+    /// workers, and holds them.
+    pub(crate) async fn write_bytes(self: &Arc<Self>, bytes: Vec<u8>) -> Result<Held, String> {
         let blobs = Arc::clone(self);
-        tokio::task::spawn_blocking(move || blobs.store.write_from(&bytes[..], u64::MAX))
+        let (tmp, blob) =
+            tokio::task::spawn_blocking(move || blobs.store.write_tmp(&bytes[..], u64::MAX))
+                .await
+                .map_err(|e| format!("content store task failed: {e}"))?
+                .map_err(|e| e.to_string())?;
+        self.place_held(blob, move |store| store.place(&tmp, blob))
             .await
-            .map_err(|e| format!("content store task failed: {e}"))?
             .map_err(|e| e.to_string())
     }
 
-    /// Streams `body` into the store, hashing it on the way, holding no more than a few chunks
-    /// at a time; at most `limit` bytes.
+    /// Streams `body` into the store, hashing it on the way, keeping no more than a few chunks
+    /// in memory at a time; at most `limit` bytes. Holds what it stored.
     pub(crate) async fn write_body(
         self: &Arc<Self>,
         body: Body,
         limit: u64,
-    ) -> Result<BlobRef, BodyError> {
+    ) -> Result<Held, BodyError> {
         let (tx, rx) = mpsc::channel(BODY_QUEUE);
         let blobs = Arc::clone(self);
         let writer = tokio::task::spawn_blocking(move || {
-            blobs.store.write_from(ChannelReader::new(rx), limit)
+            blobs.store.write_tmp(ChannelReader::new(rx), limit)
         });
         let mut stream = body.into_data_stream();
         while let Some(frame) = stream.next().await {
@@ -95,15 +207,19 @@ impl Blobs {
             }
         }
         drop(tx);
-        match writer.await {
-            Ok(Ok(blob)) => Ok(blob),
+        let written = match writer.await {
+            Ok(Ok(written)) => Ok(written),
             Ok(Err(BlobError::TooLarge { .. })) => Err(BodyError::TooLarge),
             Ok(Err(BlobError::Io(e))) if e.kind() == ErrorKind::ConnectionAborted => {
                 Err(BodyError::Broken)
             }
             Ok(Err(e)) => Err(BodyError::Store(e)),
             Err(e) => Err(BodyError::Store(BlobError::Io(std::io::Error::other(e)))),
-        }
+        };
+        let (tmp, blob) = written?;
+        self.place_held(blob, move |store| store.place(&tmp, blob))
+            .await
+            .map_err(BodyError::Store)
     }
 
     /// The whole of `content` in memory, without blocking the async workers. For text.
@@ -113,6 +229,52 @@ impl Blobs {
             .await
             .map_err(|e| format!("content store task failed: {e}"))?
             .map_err(|e| e.to_string())
+    }
+
+    /// Claims several contents at once for the versions of a copy, as [`Blobs::claim`] claims
+    /// one: every claim is withdrawn and it fails if any content was erased meanwhile.
+    pub(crate) async fn claim_all(
+        &self,
+        db: &Db,
+        claims: &[(BlobRef, DocId)],
+    ) -> Result<Vec<ClaimId>, String> {
+        if claims.is_empty() {
+            return Ok(Vec::new());
+        }
+        let _turn = self.erasing.read().await;
+        let ids = db
+            .claim_blobs(claims)
+            .await
+            .map_err(|e| format!("cannot claim the contents of a copy: {e}"))?;
+        if let Some((blob, _)) = claims
+            .iter()
+            .find(|(blob, _)| !self.store.contains(&blob.sha256))
+        {
+            self.settle_all(db, &ids, None).await;
+            return Err(format!(
+                "content {} is missing from the content store",
+                blob.hex()
+            ));
+        }
+        Ok(ids)
+    }
+
+    /// Settles `claims` with the revision that names their contents, or withdraws them, as
+    /// [`Blobs::settle`] settles one.
+    pub(crate) async fn settle_all(
+        &self,
+        db: &Db,
+        claims: &[ClaimId],
+        revision: Option<&RevisionId>,
+    ) {
+        if claims.is_empty() {
+            return;
+        }
+        let revision = revision.map(ToString::to_string);
+        if let Err(e) = db.settle_claims(claims, revision.as_deref()).await {
+            eprintln!("sharecraft-server: cannot settle the content claims of a copy: {e}");
+            flag_dirty(db).await;
+        }
     }
 
     /// Claims `blob` for a version of `doc` about to be committed, and checks it is still in
@@ -149,14 +311,17 @@ impl Blobs {
         }
     }
 
-    /// Erases the content `sha256` if nothing names it, pending claims included; whether it
-    /// did.
+    /// Erases the content `sha256` if nothing names it, pending claims included, and no write
+    /// holds it; whether a file was erased.
     pub(crate) async fn erase_if_unreferenced(
         &self,
         db: &Db,
         sha256: &[u8; 32],
     ) -> Result<bool, String> {
         let _turn = self.erasing.write().await;
+        if self.is_held(sha256) {
+            return Ok(false);
+        }
         if !db
             .release_blob_if_unreferenced(sha256)
             .await
@@ -164,8 +329,7 @@ impl Blobs {
         {
             return Ok(false);
         }
-        self.store.erase(sha256).map_err(|e| e.to_string())?;
-        Ok(true)
+        self.store.erase(sha256).map_err(|e| e.to_string())
     }
 }
 

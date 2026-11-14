@@ -92,6 +92,39 @@ impl Db {
         Ok(ClaimId(id))
     }
 
+    /// Claims several contents at once, as [`Db::claim_blob`] claims one, in one transaction:
+    /// for each `(content, document)` a pending row, with every content's `blobs` row created
+    /// if absent and locked `FOR SHARE`, by hash. Answers the claims in the order given. For a
+    /// copy, whose versions are committed together.
+    pub async fn claim_blobs(&self, claims: &[(BlobRef, DocId)]) -> Result<Vec<ClaimId>, DbError> {
+        let mut tx = self.pool().begin().await?;
+        // By hash, so two claims of the same contents never wait on each other in turn.
+        let blobs: std::collections::BTreeMap<String, BlobRef> =
+            claims.iter().map(|(blob, _)| (blob.hex(), *blob)).collect();
+        for blob in blobs.values() {
+            upsert_blob(&mut tx, blob).await?;
+        }
+        let hashes: Vec<String> = blobs.keys().cloned().collect();
+        sqlx::query("select sha256 from blobs where sha256 = any($1) order by sha256 for share")
+            .bind(&hashes)
+            .fetch_all(&mut *tx)
+            .await?;
+        let mut ids = Vec::with_capacity(claims.len());
+        for (blob, doc) in claims {
+            let id: i64 = sqlx::query_scalar(
+                "insert into blob_refs (sha256, doc_id, revision, pending) \
+                 values ($1, $2, null, true) returning id",
+            )
+            .bind(blob.hex())
+            .bind(doc.0)
+            .fetch_one(&mut *tx)
+            .await?;
+            ids.push(ClaimId(id));
+        }
+        tx.commit().await?;
+        Ok(ids)
+    }
+
     /// Settles `claim` after its Git commit: with `Some(revision)` the version was committed and
     /// a completed row names it; with `None` the commit failed or wrote nothing, and the pending
     /// row is deleted. Settling a claim already settled does nothing.
@@ -109,6 +142,30 @@ impl Db {
         .await?;
         if let (Some((sha256, doc)), Some(revision)) = (pending, revision) {
             insert_completed(&mut tx, DocId(doc), &sha256, revision).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Settles every claim of `claims` as [`Db::settle_claim`] settles one, with the same
+    /// `revision`, in one transaction.
+    pub async fn settle_claims(
+        &self,
+        claims: &[ClaimId],
+        revision: Option<&str>,
+    ) -> Result<(), DbError> {
+        let ids: Vec<i64> = claims.iter().map(|c| c.0).collect();
+        let mut tx = self.pool().begin().await?;
+        let pending: Vec<(String, uuid::Uuid)> = sqlx::query_as(
+            "delete from blob_refs where id = any($1) and pending returning sha256, doc_id",
+        )
+        .bind(&ids)
+        .fetch_all(&mut *tx)
+        .await?;
+        if let Some(revision) = revision {
+            for (sha256, doc) in pending {
+                insert_completed(&mut tx, DocId(doc), &sha256, revision).await?;
+            }
         }
         tx.commit().await?;
         Ok(())

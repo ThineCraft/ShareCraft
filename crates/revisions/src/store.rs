@@ -470,6 +470,102 @@ impl RevisionStore {
         self.commit_checkpoint(c, bytes, BlobRef::of(bytes))
     }
 
+    /// Stores the first version of each of several new documents as one commit credited to
+    /// `author`, with `message`: each checkpoint's content as a pointer to its `blob`. Every
+    /// document must have no revision yet (its `base` is ignored); the commit moves `main` and
+    /// every document's ref together, or nothing. Answers the commit, which is each document's
+    /// first revision.
+    ///
+    /// # Errors
+    /// `Stale` if a document has a revision already, `NoAuthors` for none given,
+    /// `InvalidAuthor` or `InvalidFileName` for bad input, `InvalidTreeChange` for no
+    /// checkpoints or one document twice, otherwise Git or metadata errors.
+    pub fn checkpoint_new(
+        &self,
+        author: &Author,
+        message: &str,
+        checkpoints: &[Checkpoint<'_>],
+    ) -> Result<RevisionId, CheckpointError> {
+        if checkpoints.is_empty() {
+            return Err(CheckpointError::InvalidTreeChange(
+                "no documents to store".to_owned(),
+            ));
+        }
+        if !valid_author(author) {
+            return Err(CheckpointError::InvalidAuthor);
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut written = Vec::with_capacity(checkpoints.len());
+        for c in checkpoints {
+            if c.authors.is_empty() {
+                return Err(CheckpointError::NoAuthors);
+            }
+            if !c.authors.iter().all(valid_author) {
+                return Err(CheckpointError::InvalidAuthor);
+            }
+            if !valid_file_name(c.file_name) {
+                return Err(CheckpointError::InvalidFileName);
+            }
+            if !seen.insert(c.doc) {
+                return Err(CheckpointError::InvalidTreeChange(format!(
+                    "document {} given twice",
+                    c.doc.0
+                )));
+            }
+            let meta = Meta {
+                schema: SCHEMA,
+                doc_id: c.doc,
+                file_name: c.file_name.to_owned(),
+                fields: c.fields.clone(),
+                contributors: c.authors.to_vec(),
+            };
+            written.push((c.doc, c.blob.to_pointer(), meta.to_file_bytes()?));
+        }
+        let _guard = self.lock();
+        let repo = self.repo()?;
+        for (doc, _, _) in &written {
+            if let Some(current) = doc_head(&repo, *doc)? {
+                return Err(CheckpointError::Stale {
+                    current: Some(RevisionId::from_oid(current)),
+                });
+            }
+        }
+        let parent = main_tip(&repo)?;
+        let root = match &parent {
+            Some(commit) => commit.tree_id()?.detach(),
+            None => ObjectId::empty_tree(repo.object_hash()),
+        };
+        let mut editor = repo.edit_tree(root)?;
+        for (doc, pointer, meta) in &written {
+            let dir = format!("docs/{}", doc.0);
+            let content = repo.write_blob(pointer)?.detach();
+            let meta_blob = repo.write_blob(meta)?.detach();
+            editor.remove(dir.as_str())?;
+            editor.upsert(format!("{dir}/content"), EntryKind::Blob, content)?;
+            editor.upsert(format!("{dir}/meta.json"), EntryKind::Blob, meta_blob)?;
+        }
+        let tree = editor.write()?.detach();
+        let signature = signature(author);
+        let parent_id = parent.as_ref().map(|p| p.id().detach());
+        let commit = gix::objs::Commit {
+            tree,
+            parents: parent_id.into_iter().collect(),
+            author: signature.clone(),
+            committer: signature.clone(),
+            encoding: None,
+            message: format!("{message}\n").into(),
+            extra_headers: Vec::new(),
+        };
+        let oid = repo.write_object(&commit)?.detach();
+        let mut edits = vec![ref_edit(MAIN, oid, parent_id)?];
+        for (doc, _, _) in &written {
+            edits.push(ref_edit(&doc_ref(*doc), oid, None)?);
+        }
+        let mut time = gix::date::parse::TimeBuf::default();
+        repo.edit_references_as(edits, Some(signature.to_ref(&mut time)))?;
+        Ok(RevisionId::from_oid(oid))
+    }
+
     /// Commits `c` with `stored_bytes` as the content file, unless `blob`, the content they
     /// stand for, file name and fields equal what is stored.
     fn commit_checkpoint(

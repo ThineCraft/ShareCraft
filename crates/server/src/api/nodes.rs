@@ -1,5 +1,5 @@
 //! The content tree: a node and its breadcrumb, its children, creating libraries and folders,
-//! renaming, moving and deleting, and who may access a node.
+//! renaming, moving, copying and deleting, and who may access a node.
 //!
 //! `/api/docs/{id}/access…` are served by the same handlers: a file's node identifier is its
 //! document identifier.
@@ -14,8 +14,8 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use collab_core::ids::{DocId, GroupId, NodeId, UserId};
 use records::{
-    Access, AssignmentView, Crumb, Cursor, Db, Editor, LinkKind, Listed, Node, NodeKind, Perms,
-    Principal, PrincipalView, RoleRef,
+    Access, AccessError, AssignmentView, Crumb, Cursor, Db, Editor, LinkKind, Listed, Node,
+    NodeKind, Perms, Principal, PrincipalView, RoleRef, User,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -324,16 +324,102 @@ pub(crate) async fn change(
             node = Some(renamed);
         }
         if let Some(parent) = parent {
-            let moved = tree::apply(&state, &actor, TreeOp::Move { id, parent }).await;
-            // Checked whatever the answer: a change that failed after it was stored must not
-            // leave anyone with rights they lost.
-            recheck_below(&state, id).await;
-            node = Some(moved?.node);
+            node = Some(move_one(&state, &actor, id, parent).await?);
         }
         node.ok_or(ApiError::InvalidRequest)
     })
     .await?;
     Ok(Json(NodeOut::from(node)))
+}
+
+/// Moves `id` into `parent` for `actor`, then rechecks the open documents below it whatever
+/// the answer: a move that failed after it was stored must not leave anyone with rights they
+/// lost. Run inside [`to_completion`].
+pub(crate) async fn move_one(
+    state: &AppState,
+    actor: &User,
+    id: NodeId,
+    parent: NodeId,
+) -> Result<Node, ApiError> {
+    let moved = tree::apply(state, actor, TreeOp::Move { id, parent }).await;
+    recheck_below(state, id).await;
+    Ok(moved?.node)
+}
+
+/// The body of `POST /api/nodes/{id}/copy`.
+#[derive(Deserialize)]
+pub(crate) struct CopyBody {
+    /// The library or folder the copy goes into.
+    parent: String,
+    /// The copy's name; the original's if absent.
+    name: Option<String>,
+}
+
+/// A copy whose name had to change.
+#[derive(Serialize)]
+pub(crate) struct RenamedOut {
+    /// The name asked for (the original's when none was).
+    from: String,
+    to: String,
+}
+
+/// `POST /api/nodes/{id}/copy`.
+#[derive(Serialize)]
+pub(crate) struct Copied {
+    /// The new item.
+    node: NodeOut,
+    /// Set when refused characters were replaced or the name was taken there.
+    renamed: Option<RenamedOut>,
+}
+
+/// `POST /api/nodes/{id}/copy {parent, name?}`: copies the file or folder into the library or
+/// folder `parent` (see [`tree::apply`]): `view` on it and `add` on `parent` are needed. `201
+/// {node, renamed}`; `renamed` says so when the name had to change.
+pub(crate) async fn copy(
+    State(state): State<AppState>,
+    signed: Signed,
+    Path(id): Path<String>,
+    JsonBody(body): JsonBody<CopyBody>,
+) -> Result<Response, ApiError> {
+    let id = node_id(&id)?;
+    let parent = node_id(&body.parent)?;
+    let actor = signed.session.user;
+    let copied =
+        to_completion(async move { copy_one(&state, &actor, id, parent, body.name).await }).await?;
+    Ok((StatusCode::CREATED, Json(copied)).into_response())
+}
+
+/// Copies `id` into `parent` for `actor`, named `name` or as it is. Run inside
+/// [`to_completion`].
+pub(crate) async fn copy_one(
+    state: &AppState,
+    actor: &User,
+    id: NodeId,
+    parent: NodeId,
+    name: Option<String>,
+) -> Result<Copied, ApiError> {
+    let applied = tree::apply(state, actor, TreeOp::Copy { id, parent, name })
+        .await
+        .map_err(|e| match e {
+            // The name asked for has another extension than the file's.
+            AccessError::WrongExtension => ApiError::InvalidName,
+            e => e.into(),
+        })?;
+    let renamed = applied.renamed.map(|(_, from)| RenamedOut {
+        from,
+        to: applied.node.name.clone(),
+    });
+    Ok(Copied {
+        node: NodeOut::from(applied.node),
+        renamed,
+    })
+}
+
+impl Copied {
+    /// The new item's id.
+    pub(crate) fn id(&self) -> &str {
+        &self.node.id
+    }
 }
 
 /// Called after the file `doc` was renamed: its room, if open, stores later revisions under
@@ -364,24 +450,27 @@ pub(crate) async fn remove(
 ) -> Result<StatusCode, ApiError> {
     let id = node_id(&id)?;
     let actor = signed.session.user;
-    to_completion(async move {
-        let applied = match tree::apply(&state, &actor, TreeOp::Delete { id }).await {
-            Ok(applied) => applied,
-            Err(e) => {
-                // A delete that failed after Git recorded it may still have been repaired into
-                // PostgreSQL from Git: then its files are gone, and so must their rooms be.
-                end_deleted_sessions_below(&state, id).await;
-                return Err(e.into());
-            }
-        };
-        // Removal is final, so it needs no ordering with other access changes.
-        for doc in applied.deleted {
-            state.rooms().send_to(doc, AccessChange::Deleted);
-        }
-        Ok(())
-    })
-    .await?;
+    to_completion(async move { delete_one(&state, &actor, id).await }).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Deletes `id` for `actor` to the recycle bin, removing everyone connected to a file it
+/// deleted. Run inside [`to_completion`].
+pub(crate) async fn delete_one(state: &AppState, actor: &User, id: NodeId) -> Result<(), ApiError> {
+    let applied = match tree::apply(state, actor, TreeOp::Delete { id }).await {
+        Ok(applied) => applied,
+        Err(e) => {
+            // A delete that failed after Git recorded it may still have been repaired into
+            // PostgreSQL from Git: then its files are gone, and so must their rooms be.
+            end_deleted_sessions_below(state, id).await;
+            return Err(e.into());
+        }
+    };
+    // Removal is final, so it needs no ordering with other access changes.
+    for doc in applied.deleted {
+        state.rooms().send_to(doc, AccessChange::Deleted);
+    }
+    Ok(())
 }
 
 /// Ends, with `Removed { deleted }`, the session of every open file at or below `node` that

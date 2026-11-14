@@ -1,5 +1,6 @@
-//! Changes to the content tree (create, rename, move, delete), the start-up reconcile of
-//! PostgreSQL's mirror with Git, and adopting documents recorded before the tree.
+//! Changes to the content tree (create, rename, move, copy, delete, and the recycle bin's
+//! restore and purge), the start-up reconcile of PostgreSQL's mirror with Git, and adopting
+//! documents recorded before the tree.
 //!
 //! Every change is judged under the server's tree lock, recorded as one Git commit credited to
 //! the person who made it, then mirrored into PostgreSQL in one transaction that locks the
@@ -13,17 +14,23 @@ use std::sync::atomic::Ordering;
 
 use collab_core::ids::{DocId, NodeId, UserId};
 use records::{
-    Access, AccessError, BinStage, Db, DbError, Document, Editor, NewEvent, Node, NodeChange,
-    NodeKind, NodeRow, Perms, User, validate_document_name, validate_node_name,
+    Access, AccessError, BinStage, ClaimId, Db, DbError, Document, Editor, NewEvent, Node,
+    NodeChange, NodeKind, NodeRow, NodesApplied, Perms, User, validate_document_name,
+    validate_node_name,
 };
-use revisions::{Author, CheckpointError, GitError, Stamp, TreeChange, TreeMove, TreeRecord};
-use serde_json::json;
+use revisions::{
+    Author, BlobRef, Checkpoint, CheckpointError, Content, GitError, Stamp, TreeChange, TreeMove,
+    TreeRecord,
+};
+use serde_json::{Map, Value, json};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
 use crate::AppState;
+use crate::blobs::Held;
 use crate::checkpoint::Checkpointer;
+use crate::projection::record_first;
 use crate::room::credited_name;
 
 /// The format version of the tree records this server writes.
@@ -66,16 +73,24 @@ pub enum TreeOp {
     ToSecondStage { id: NodeId },
     /// Purges the recycle bin entry `id`, in the second stage, with everything deleted with it.
     Purge { id: NodeId },
+    /// Copies the file or folder `id` (a folder with every live item below it the person may
+    /// view) into the library or folder `parent`, named `name` or as it is (see [`apply`]).
+    Copy {
+        id: NodeId,
+        parent: NodeId,
+        name: Option<String>,
+    },
 }
 
 /// What [`apply`] did.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Applied {
-    /// The node the change is about, as PostgreSQL then holds it.
+    /// The node the change is about, as PostgreSQL then holds it: for a copy, the new one.
     pub node: Node,
     /// Every file the change deleted: their open sessions end.
     pub deleted: Vec<DocId>,
-    /// A restored item whose name was taken meanwhile, and the name it had.
+    /// A restored item whose name was taken meanwhile, and the name it had; or a copy whose
+    /// name had to change, and the name asked for.
     pub renamed: Option<(NodeId, String)>,
 }
 
@@ -181,6 +196,29 @@ struct Plan {
     deleted: Vec<DocId>,
     /// A restored item that had to be renamed, and its name before.
     renamed: Option<(NodeId, String)>,
+    /// The files a copy makes, each with its editor.
+    copies: Vec<(NodeId, Editor)>,
+    /// The versions a copy stores once its tree commit is in, already claimed.
+    contents: Option<CopiedContents>,
+}
+
+/// The first versions of the files a copy makes, claimed before the copy's tree commit and
+/// committed together after it.
+struct CopiedContents {
+    /// What to write for each file that has a version.
+    versions: Vec<CopiedVersion>,
+    /// The claims on their contents, in the same order.
+    claims: Vec<ClaimId>,
+    /// What the commit message names.
+    name: String,
+}
+
+/// The first version of one file a copy makes.
+struct CopiedVersion {
+    doc: DocId,
+    file_name: String,
+    blob: BlobRef,
+    fields: Map<String, Value>,
 }
 
 impl Default for Plan {
@@ -200,6 +238,8 @@ impl Default for Plan {
             as_if_live: false,
             deleted: Vec::new(),
             renamed: None,
+            copies: Vec::new(),
+            contents: None,
         }
     }
 }
@@ -233,7 +273,18 @@ impl Default for Plan {
 /// still in the bin is restored too, that folder alone (`ParentInBin` unless the person may
 /// restore it); what was deleted with such a folder stays in the bin, as entries of its own.
 /// Under a purged folder the entry goes to the top of its library. A name taken meanwhile gets
-/// ` (2)`, ` (3)` … before its extension, and the answer says so.
+/// ` (2)`, ` (3)` … before its extension, and the answer says so. A purge erases, once it has
+/// committed, each content its files' versions named that nothing names any more.
+///
+/// A copy needs `view` on what is copied and `add` on where it goes (`IntoItself` for a folder
+/// into itself or below itself). It makes new items with new identifiers that inherit their
+/// access from where they go (no permissions or links are copied), holding the latest saved
+/// version of each file and nothing of its history: the folder (with every live item below it
+/// the person may view) in one tree commit, then the first versions of all its files in one
+/// checkpoint commit, their contents claimed before either. Refused characters in the name
+/// become `_` and a name taken there gets ` (2)`, ` (3)` …; the answer says so. If the
+/// versions cannot be committed after the items were, the items stay, empty, and the Git error
+/// is answered.
 pub async fn apply(state: &AppState, actor: &User, op: TreeOp) -> Result<Applied, AccessError> {
     let _turn = state.tree_lock().lock().await;
     ensure_in_step(state).await?;
@@ -245,7 +296,8 @@ pub async fn apply(state: &AppState, actor: &User, op: TreeOp) -> Result<Applied
         | TreeOp::Delete { id }
         | TreeOp::Restore { id }
         | TreeOp::ToSecondStage { id }
-        | TreeOp::Purge { id } => *id,
+        | TreeOp::Purge { id }
+        | TreeOp::Copy { id, .. } => *id,
     };
     let plan = match op {
         TreeOp::Create {
@@ -260,15 +312,31 @@ pub async fn apply(state: &AppState, actor: &User, op: TreeOp) -> Result<Applied
         TreeOp::Restore { id } => Some(plan_restore(state, actor, id).await?),
         TreeOp::ToSecondStage { id } => Some(plan_to_second_stage(state, actor, id).await?),
         TreeOp::Purge { id } => Some(plan_purge(state, Some(actor), id).await?),
+        TreeOp::Copy { id, parent, name } => {
+            Some(plan_copy(state, actor, id, parent, name.as_deref()).await?)
+        }
     };
-    let (deleted, renamed) = match plan {
+    let (deleted, renamed, id) = match plan {
         Some(mut plan) => {
             let deleted = std::mem::take(&mut plan.deleted);
             let renamed = plan.renamed.take();
-            commit(state, Some(actor), plan).await?;
-            (deleted, renamed)
+            let contents = plan.contents.take();
+            let target = plan.id;
+            match commit(state, Some(actor), plan).await {
+                Ok(done) => erase_released(state, done).await,
+                Err(e) => {
+                    if let Some(contents) = contents {
+                        state.blobs().settle_all(db, &contents.claims, None).await;
+                    }
+                    return Err(e);
+                }
+            }
+            if let Some(contents) = contents {
+                store_copied(state, actor, contents).await?;
+            }
+            (deleted, renamed, target)
         }
-        None => (Vec::new(), None),
+        None => (Vec::new(), None, id),
     };
     let node = db.node(id).await?.ok_or(AccessError::NotFound)?;
     Ok(Applied {
@@ -296,7 +364,9 @@ pub async fn purge_due(state: &AppState, now: OffsetDateTime) -> usize {
             let _turn = state.tree_lock().lock().await;
             ensure_in_step(&state).await?;
             let plan = plan_purge(&state, None, id).await?;
-            commit(&state, None, plan).await
+            let done = commit(&state, None, plan).await?;
+            erase_released(&state, done).await;
+            Ok::<_, AccessError>(())
         })
         .await;
         match done {
@@ -698,8 +768,13 @@ async fn ensure_in_step(state: &AppState) -> Result<(), AccessError> {
 /// be written before the next reconcile (see [`ensure_in_step`]).
 ///
 /// `actor` is `None` for a change the server makes on its own (a purge when an item's time in
-/// the bin is up), credited to "ShareCraft" and judged by nobody.
-async fn commit(state: &AppState, actor: Option<&User>, plan: Plan) -> Result<(), AccessError> {
+/// the bin is up), credited to "ShareCraft" and judged by nobody. Answers what PostgreSQL
+/// released (see [`erase_released`]).
+async fn commit(
+    state: &AppState,
+    actor: Option<&User>,
+    plan: Plan,
+) -> Result<NodesApplied, AccessError> {
     let store = state.checkpointer();
     let author = actor.map_or_else(server_author, author_of);
     let rows = plan
@@ -727,19 +802,21 @@ async fn commit(state: &AppState, actor: Option<&User>, plan: Plan) -> Result<()
             needs: &plan.needs,
             site_groups: if plan.site_groups { actor_id } else { None },
             document: plan.document,
+            copies: &plan.copies,
             needs_below: plan.needs_below,
             as_if_live: plan.as_if_live,
         })
         .await;
     match applied {
-        Ok(()) => Ok(()),
+        Ok(done) => Ok(done),
         Err(AccessError::Db(error)) => {
             eprintln!(
                 "sharecraft-server: tree change to node {} is in Git but not in the database: \
                  {error}",
                 plan.id.0
             );
-            let taken_back = plan.document.is_none()
+            // Git does not hold a new file's editor: new files are taken back.
+            let taken_back = (plan.document.is_none() && plan.copies.is_empty())
                 || take_back(state, author.clone(), &plan.message, plan.undo).await;
             let ids: Vec<Uuid> = plan.records.iter().map(|r| r.id).collect();
             if !(taken_back && repair_ids(state, &ids).await) {
@@ -759,6 +836,42 @@ async fn commit(state: &AppState, actor: Option<&User>, plan: Plan) -> Result<()
                 state.tree_out_of_step().store(true, Ordering::SeqCst);
             }
             Err(refused)
+        }
+    }
+}
+
+/// Erases, once a purge has committed, each content the versions of its files named that
+/// nothing names any more (and no write holds), and adds to each of its `node.purged` events
+/// the bytes this freed (`bytes_freed`). Nothing is erased while a flag says the content rows
+/// may be incomplete; the sweeper erases it after the rebuild. Failures are logged.
+async fn erase_released(state: &AppState, done: NodesApplied) {
+    if done.purge_events.is_empty() && done.released.is_empty() {
+        return;
+    }
+    let db = state.db();
+    let mut freed: u64 = 0;
+    let erasing = match db.blob_refs_flagged().await {
+        Ok(flagged) => !flagged,
+        Err(e) => {
+            eprintln!("sharecraft-server: database failure: {e}");
+            false
+        }
+    };
+    if erasing {
+        for blob in &done.released {
+            match state.blobs().erase_if_unreferenced(db, &blob.sha256).await {
+                Ok(true) => freed = freed.saturating_add(blob.size),
+                Ok(false) => {}
+                Err(e) => eprintln!("sharecraft-server: cannot erase purged content: {e}"),
+            }
+        }
+    }
+    for event in done.purge_events {
+        if let Err(e) = db
+            .add_event_detail(event, "bytes_freed", json!(freed))
+            .await
+        {
+            eprintln!("sharecraft-server: database failure: {e}");
         }
     }
 }
@@ -1570,6 +1683,280 @@ async fn plan_purge(
     })
 }
 
+/// Copies `id` into `destination` for `actor` (see [`apply`]): the new records, their files,
+/// the `node.copied` events naming the sources, and the latest version of each file, its
+/// content held (an old inline version written to the store first) and then claimed.
+async fn plan_copy(
+    state: &AppState,
+    actor: &User,
+    id: NodeId,
+    destination: NodeId,
+    name: Option<&str>,
+) -> Result<Plan, AccessError> {
+    let db = state.db();
+    let (node, access) = visible(db, actor, id).await?;
+    if !matches!(node.kind, NodeKind::Folder | NodeKind::Document) {
+        return Err(AccessError::WrongPlace);
+    }
+    let (place, place_access) = visible(db, actor, destination).await?;
+    if !matches!(place.kind, NodeKind::Library | NodeKind::Folder) {
+        return Err(AccessError::WrongPlace);
+    }
+    require(&access, Perms::VIEW)?;
+    require(&place_access, Perms::ADD)?;
+    if db.is_at_or_below(destination, id).await? {
+        return Err(AccessError::IntoItself);
+    }
+    let tree = read_tree(state.checkpointer()).await.map_err(git_failure)?;
+    let source = tree
+        .iter()
+        .find(|r| r.id == id.0 && r.deleted.is_none())
+        .ok_or(AccessError::NotFound)?;
+    let place_record = git_record(state, destination).await?;
+
+    // The source, and every live item below it the person may view whose folder is copied.
+    // Each with the id of its copy.
+    let new_top = NodeId(Uuid::new_v4());
+    let mut chosen: Vec<(&TreeRecord, Uuid)> = vec![(source, new_top.0)];
+    let mut ids: HashMap<Uuid, Uuid> = HashMap::from([(source.id, new_top.0)]);
+    for record in below(&tree, id.0) {
+        if record.deleted.is_some() || !record.parent.is_some_and(|p| ids.contains_key(&p)) {
+            continue;
+        }
+        let viewable = db
+            .effective_access(actor.id, NodeId(record.id))
+            .await?
+            .is_some_and(|a| a.perms.contains(Perms::VIEW));
+        if viewable {
+            let fresh = Uuid::new_v4();
+            ids.insert(record.id, fresh);
+            chosen.push((record, fresh));
+        }
+    }
+    let mut editors: HashMap<Uuid, Editor> = HashMap::new();
+    for (record, _) in &chosen {
+        if record.kind == kind_word(NodeKind::Document)
+            && let Some(document) = db.document(DocId(record.id)).await?
+        {
+            editors.insert(record.id, document.editor);
+        }
+    }
+
+    // The top item's name: as asked, or as it is, cleaned and made unique where it goes.
+    let editor = editors.get(&source.id).copied();
+    if node.kind == NodeKind::Document && editor.is_none() {
+        return Err(AccessError::NotFound);
+    }
+    let asked = name.unwrap_or(&source.name).trim().to_owned();
+    let cleaned = match editor {
+        Some(editor) => {
+            let cleaned = clean_name(&asked, editor);
+            validate_document_name(&cleaned, editor)?;
+            cleaned
+        }
+        None => clean_folder_name(&asked),
+    };
+    let taken: HashSet<String> = db
+        .live_child_names(destination)
+        .await?
+        .into_iter()
+        .collect();
+    let top_name = unique_node_name(&cleaned, editor, &taken);
+    let renamed = (top_name != asked).then(|| (new_top, asked.clone()));
+
+    let author = author_of(actor);
+    let mut records = Vec::with_capacity(chosen.len());
+    for (record, fresh) in &chosen {
+        let kind = parse_kind(&record.kind).unwrap_or(NodeKind::Folder);
+        let (parent, name) = if record.id == source.id {
+            (destination, top_name.as_str())
+        } else {
+            let parent = record.parent.and_then(|p| ids.get(&p)).copied();
+            (
+                NodeId(parent.ok_or_else(|| git_failure(missing(record.id)))?),
+                record.name.as_str(),
+            )
+        };
+        records.push(new_record(
+            NodeId(*fresh),
+            kind,
+            Some(parent),
+            place_record.site,
+            name,
+            author.clone(),
+        ));
+    }
+    let copies: Vec<(NodeId, Editor)> = chosen
+        .iter()
+        .filter_map(|(r, fresh)| editors.get(&r.id).map(|e| (NodeId(*fresh), *e)))
+        .collect();
+
+    let mut events = vec![NewEvent {
+        kind: "node.copied",
+        actor: Some(actor.id),
+        subject: None,
+        document: document_of(node.kind, new_top),
+        node: Some(new_top),
+        detail: json!({
+            "from": source.id,
+            "name": top_name,
+            "parent": destination.0,
+            "items": records.len(),
+        }),
+    }];
+    events.extend(
+        chosen
+            .iter()
+            .filter(|(r, _)| r.id != source.id && editors.contains_key(&r.id))
+            .map(|(r, fresh)| NewEvent {
+                kind: "node.copied",
+                actor: Some(actor.id),
+                subject: None,
+                document: Some(DocId(*fresh)),
+                node: Some(NodeId(*fresh)),
+                detail: json!({ "from": r.id, "name": r.name, "with": new_top.0 }),
+            }),
+    );
+
+    // The latest version of each file, its content held until it is claimed.
+    let mut versions = Vec::new();
+    let mut held: Vec<Held> = Vec::new();
+    for (record, fresh) in &chosen {
+        if !editors.contains_key(&record.id) {
+            continue;
+        }
+        let doc = DocId(record.id);
+        let store = Arc::clone(state.checkpointer());
+        let stored = tokio::task::spawn_blocking(move || store.load(doc))
+            .await
+            .map_err(|e| git_failure(CheckpointError::Git(GitError::new(e))))?
+            .map_err(git_failure)?;
+        let Some(stored) = stored else {
+            continue;
+        };
+        let hold = match stored.content {
+            Content::Blob(blob) => state.blobs().hold_stored(blob).await.ok_or_else(|| {
+                DbError::new(format!(
+                    "content {} of document {} is missing from the content store",
+                    blob.hex(),
+                    doc.0
+                ))
+            })?,
+            Content::Inline(bytes) => state
+                .blobs()
+                .write_bytes(bytes)
+                .await
+                .map_err(DbError::new)?,
+        };
+        let new_doc = DocId(*fresh);
+        let file_name = records
+            .iter()
+            .find(|r| r.id == new_doc.0)
+            .map_or_else(|| record.name.clone(), |r| r.name.clone());
+        versions.push(CopiedVersion {
+            doc: new_doc,
+            file_name,
+            blob: hold.blob(),
+            fields: stored.meta.fields,
+        });
+        held.push(hold);
+    }
+    let wanted: Vec<(BlobRef, DocId)> = versions.iter().map(|v| (v.blob, v.doc)).collect();
+    let claims = state
+        .blobs()
+        .claim_all(db, &wanted)
+        .await
+        .map_err(DbError::new)?;
+    // The claims keep the contents now.
+    drop(held);
+
+    let undo = records.iter().map(|r| deleted(r, author.clone())).collect();
+    Ok(Plan {
+        id: new_top,
+        message: format!(
+            "Copy {} {} to {}",
+            kind_word(node.kind),
+            source.name,
+            place.name
+        ),
+        records,
+        undo,
+        needs: vec![(destination, Perms::ADD), (id, Perms::VIEW)],
+        events,
+        renamed,
+        copies,
+        contents: Some(CopiedContents {
+            versions,
+            claims,
+            name: top_name,
+        }),
+        ..Plan::default()
+    })
+}
+
+/// Commits the first versions of the files a copy made, as one commit credited to `actor`,
+/// then settles their claims and records the revisions. If the commit fails the claims are
+/// withdrawn, the files stay empty, and the Git error is answered.
+async fn store_copied(
+    state: &AppState,
+    actor: &User,
+    contents: CopiedContents,
+) -> Result<(), AccessError> {
+    if contents.versions.is_empty() {
+        return Ok(());
+    }
+    let db = state.db();
+    let author = author_of(actor);
+    let message = format!("Copy {}", contents.name);
+    let store = Arc::clone(state.checkpointer());
+    let versions = contents.versions;
+    let written = tokio::task::spawn_blocking(move || {
+        let authors = [author.clone()];
+        let checkpoints: Vec<Checkpoint<'_>> = versions
+            .iter()
+            .map(|v| Checkpoint {
+                doc: v.doc,
+                file_name: &v.file_name,
+                blob: v.blob,
+                base: None,
+                authors: &authors,
+                fields: &v.fields,
+            })
+            .collect();
+        let written = store.write_new(&author, &message, &checkpoints);
+        (written, versions)
+    })
+    .await
+    .map_err(|e| git_failure(CheckpointError::Git(GitError::new(e))));
+    let (revision, versions) = match written {
+        Ok((Ok(revision), versions)) => (revision, versions),
+        Ok((Err(e), _)) => {
+            state.blobs().settle_all(db, &contents.claims, None).await;
+            eprintln!("sharecraft-server: the versions of a copy could not be stored: {e}");
+            return Err(git_failure(e));
+        }
+        Err(e) => {
+            state.blobs().settle_all(db, &contents.claims, None).await;
+            return Err(e);
+        }
+    };
+    state
+        .blobs()
+        .settle_all(db, &contents.claims, Some(&revision))
+        .await;
+    for version in versions {
+        record_first(
+            state.checkpointer(),
+            db,
+            state.events(),
+            version.doc,
+            &revision,
+        )
+        .await;
+    }
+    Ok(())
+}
+
 /// The Git error for a record that names a node Git does not hold.
 fn missing(id: Uuid) -> CheckpointError {
     CheckpointError::InvalidTreeChange(format!("node {id} leads to a node not in the tree"))
@@ -1741,6 +2128,31 @@ fn clean_name(name: &str, editor: Editor) -> String {
         stem
     };
     fit(stem, extension, "")
+}
+
+/// `name` made acceptable as a folder name: refused and control characters become `_`, as does
+/// a trailing dot; an empty name becomes "Untitled"; a long one is shortened.
+fn clean_folder_name(name: &str) -> String {
+    let replaced: String = name
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_control() || REFUSED_CHARS.contains(&c) {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let mut cleaned = replaced.trim().to_owned();
+    while cleaned.ends_with('.') {
+        cleaned.pop();
+        cleaned.push('_');
+    }
+    if cleaned.is_empty() {
+        return "Untitled".to_owned();
+    }
+    fit(&cleaned, "", "")
 }
 
 /// `name`, or the first of `name (2)`, `name (3)` … (before the extension) that `taken`, which

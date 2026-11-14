@@ -41,13 +41,21 @@ pub struct NewEvent {
 
 /// Writes `event` on `conn`, normally a transaction, so the event commits with the change.
 pub(crate) async fn record(conn: &mut PgConnection, event: NewEvent) -> Result<(), sqlx::Error> {
+    insert(conn, &event).await.map(drop)
+}
+
+/// As [`record`], answering the event's id.
+pub(crate) async fn record_with_id(
+    conn: &mut PgConnection,
+    event: NewEvent,
+) -> Result<i64, sqlx::Error> {
     insert(conn, &event).await
 }
 
-async fn insert(conn: &mut PgConnection, event: &NewEvent) -> Result<(), sqlx::Error> {
-    sqlx::query(
+async fn insert(conn: &mut PgConnection, event: &NewEvent) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar(
         "insert into events (kind, actor, subject, document_id, node_id, detail) \
-         values ($1, $2, $3, $4, $5, $6)",
+         values ($1, $2, $3, $4, $5, $6) returning id",
     )
     .bind(event.kind)
     .bind(event.actor.map(|u| u.0))
@@ -55,9 +63,8 @@ async fn insert(conn: &mut PgConnection, event: &NewEvent) -> Result<(), sqlx::E
     .bind(event.document.map(|d| d.0))
     .bind(event.node.map(|n| n.0))
     .bind(&event.detail)
-    .execute(conn)
-    .await?;
-    Ok(())
+    .fetch_one(conn)
+    .await
 }
 
 impl Db {
@@ -65,6 +72,26 @@ impl Db {
     pub async fn append_event(&self, event: &NewEvent) -> Result<(), DbError> {
         let mut conn = self.pool().acquire().await?;
         insert(&mut conn, event).await?;
+        Ok(())
+    }
+
+    /// Adds `key` with `value` to the detail of the event `id`, recorded earlier: for a figure
+    /// only known once the change has committed, such as the bytes a purge freed.
+    pub async fn add_event_detail(
+        &self,
+        id: i64,
+        key: &str,
+        value: serde_json::Value,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "update events set detail = detail || jsonb_build_object($2::text, $3::jsonb) \
+             where id = $1",
+        )
+        .bind(id)
+        .bind(key)
+        .bind(value)
+        .execute(self.pool())
+        .await?;
         Ok(())
     }
 

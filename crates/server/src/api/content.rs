@@ -36,7 +36,7 @@ use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
 use super::{ApiError, parse_id, to_completion};
-use crate::blobs::{BodyError, write_claimed};
+use crate::blobs::{BodyError, Held, write_claimed};
 use crate::checkpoint::Checkpointer;
 use crate::file_room::SaveReply;
 use crate::projection::record_first;
@@ -88,10 +88,11 @@ pub(crate) async fn blocking<T: Send + 'static>(
     }
 }
 
-/// Streams a request body into the content store and answers what it stored. Refused with `413`
-/// past the largest file allowed (at once when the body declares a larger length, otherwise as
-/// soon as more arrives; nothing is stored), and `400` when the body cannot be read.
-pub(super) async fn body_blob(state: &AppState, request: Request) -> Result<BlobRef, ApiError> {
+/// Streams a request body into the content store and answers what it stored, held until the
+/// caller is done with it. Refused with `413` past the largest file allowed (at once when the
+/// body declares a larger length, otherwise as soon as more arrives; nothing is stored), and
+/// `400` when the body cannot be read.
+pub(super) async fn body_blob(state: &AppState, request: Request) -> Result<Held, ApiError> {
     let limit = state.config().max_file_bytes;
     let declared = request
         .headers()
@@ -109,11 +110,15 @@ pub(super) async fn body_blob(state: &AppState, request: Request) -> Result<Blob
     }
 }
 
-/// Erases `blob`, the body of a request refused after it was stored, unless something names it
-/// (the same content saved by someone else, or by an earlier version). Nothing is erased while
-/// a flag says the content rows may be incomplete, as a version could then name the content
-/// without a row; the start-up erasure deals with it after the rebuild. Failures are logged.
-pub(super) async fn discard(state: &AppState, blob: BlobRef) {
+/// Erases `held`, the body of a request refused after it was stored, unless something names it
+/// (the same content saved by someone else, or by an earlier version) or another write holds
+/// it. Nothing is erased while a flag says the content rows may be incomplete, as a version
+/// could then name the content without a row; the sweeper deals with it after the rebuild.
+/// Failures are logged.
+pub(super) async fn discard(state: &AppState, held: Held) {
+    let blob = held.blob();
+    // This request's own hold ends first; anyone else's keeps the content.
+    drop(held);
     match state.db().blob_refs_flagged().await {
         Ok(false) => {}
         Ok(true) => return,
@@ -415,15 +420,16 @@ pub(crate) async fn save(
     {
         return Ok(save_answer(refused));
     }
-    let blob = body_blob(&state, request).await?;
+    let held = body_blob(&state, request).await?;
 
     let reply = {
         let state = state.clone();
         to_completion(async move {
+            let blob = held.blob();
             let reply = state.rooms().save_file(doc, user, &token, base, blob).await;
             // Saved or unchanged, a version names the content.
             if !matches!(reply, SaveReply::Saved(_) | SaveReply::Unchanged(_)) {
-                discard(&state, blob).await;
+                discard(&state, held).await;
             }
             Ok(reply)
         })
@@ -484,15 +490,15 @@ pub(crate) async fn upload(
         Err(AccessError::WrongExtension) => return Err(ApiError::BadRequest),
         Err(e) => return Err(e.into()),
     }
-    let blob = body_blob(&state, request).await?;
-    if blob.size == 0 {
-        discard(&state, blob).await;
+    let held = body_blob(&state, request).await?;
+    if held.blob().size == 0 {
+        discard(&state, held).await;
         return Err(ApiError::BadRequest);
     }
 
     to_completion(async move {
         Ok(
-            match create_uploaded(&state, &user, parent, &name, editor, blob).await? {
+            match create_uploaded(&state, &user, parent, &name, editor, held).await? {
                 Created::Done { body, .. } => (StatusCode::CREATED, Json(body)).into_response(),
                 Created::Failed(response) => response,
             },
@@ -510,7 +516,7 @@ pub(super) enum Created {
 }
 
 /// Creates a document named `name`, opened in `editor`, in `parent` for `user`, with the
-/// content `blob` (already in the content store) as its first revision: the tree record and
+/// content `held` (already in the content store) as its first revision: the tree record and
 /// document row, then the revision, claimed before it is committed. Content of a document that
 /// is refused or fails is erased unless something else names it. If it cannot be stored after
 /// the document was made, the document stays, empty, and the answer is `503` naming it.
@@ -520,15 +526,16 @@ pub(super) async fn create_uploaded(
     parent: NodeId,
     name: &str,
     editor: Editor,
-    blob: BlobRef,
+    held: Held,
 ) -> Result<Created, ApiError> {
+    let blob = held.blob();
     let id = DocId(Uuid::new_v4());
     let created =
         tree::create_document(state, user, parent, id, name, editor, Some(blob.size)).await;
     let document = match created {
         Ok(document) => document,
         Err(e) => {
-            discard(state, blob).await;
+            discard(state, held).await;
             return Err(match e {
                 // The name is only an extension.
                 AccessError::WrongExtension => ApiError::BadRequest,
@@ -536,11 +543,13 @@ pub(super) async fn create_uploaded(
             });
         }
     };
-    let access = state
-        .db()
-        .doc_access(user.id, id)
-        .await
-        .map_err(|e| ApiError::unavailable(&e))?;
+    let access = match state.db().doc_access(user.id, id).await {
+        Ok(access) => access,
+        Err(e) => {
+            discard(state, held).await;
+            return Err(ApiError::unavailable(&e));
+        }
+    };
     let author = Author {
         id: user.id.0.to_string(),
         name: credited_name(&user.name),
@@ -571,7 +580,7 @@ pub(super) async fn create_uploaded(
                 "sharecraft-server: upload of document {} failed: {e:?}",
                 id.0
             );
-            discard(state, blob).await;
+            discard(state, held).await;
             // The document stays, empty.
             let body = Json(json!({ "error": "unavailable", "document": id.0.to_string() }));
             return Ok(Created::Failed(
@@ -579,6 +588,8 @@ pub(super) async fn create_uploaded(
             ));
         }
     };
+    // The claim is settled: the version names the content now.
+    drop(held);
     record_first(
         state.checkpointer(),
         state.db(),

@@ -977,6 +977,7 @@ async fn rename_file(
         ..records::NodeChange::default()
     })
     .await
+    .map(drop)
 }
 
 #[tokio::test]

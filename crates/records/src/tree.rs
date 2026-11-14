@@ -1,6 +1,7 @@
 //! The content tree: sites, libraries, folders and files, mirrored from Git into PostgreSQL.
 
 use collab_core::ids::{GroupId, NodeId, UserId};
+use revisions::{BlobRef, parse_hex};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgRow;
 use sqlx::{PgConnection, Row};
@@ -8,7 +9,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::documents::UNIQUE_VIOLATION;
-use crate::events::{NewEvent, record};
+use crate::events::{NewEvent, record, record_with_id};
 use crate::groups::{
     add_site_owner, all_locked, ensure_site_groups, groups_judged_by, lock_groups,
 };
@@ -179,6 +180,9 @@ pub struct NodeChange<'a> {
     /// Records the first row's node as a new document opened in this editor, created by
     /// `actor`.
     pub document: Option<Editor>,
+    /// Records each of these nodes, among `rows`, as a new document opened in its editor,
+    /// created by `actor`: the files of a copy.
+    pub copies: &'a [(NodeId, Editor)],
     /// How many of the last `needs` are places below a folder being deleted: a refusal on one of
     /// them is `ForbiddenBelow`.
     pub needs_below: usize,
@@ -292,12 +296,24 @@ async fn lock_links_of(conn: &mut PgConnection, purged: &[NodeId]) -> Result<Doo
         .collect())
 }
 
-/// What purging removed of the documents' versions: how many rows named a content, and the
-/// sum of those contents' sizes.
-#[derive(Clone, Copy, Debug, Default)]
+/// What purging removed of the documents' versions: how many rows named a content, the sum of
+/// those contents' sizes, and the distinct contents they named.
+#[derive(Clone, Debug, Default)]
 struct PurgedVersions {
     versions: i64,
     bytes: i64,
+    contents: Vec<BlobRef>,
+}
+
+/// What [`Db::apply_nodes`] did besides writing the rows, for the caller to finish once it has
+/// committed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NodesApplied {
+    /// The contents the versions of the documents it purged named; nothing in `blob_refs`
+    /// names them for those documents any more, so each is erased if nothing else does.
+    pub released: Vec<BlobRef>,
+    /// The ids of the `node.purged` events it recorded.
+    pub purge_events: Vec<i64>,
 }
 
 /// The rest of purging the nodes `purged`, once their rows are written: their assignments go,
@@ -346,17 +362,25 @@ async fn after_purge(
     .bind(&ids)
     .execute(&mut *conn)
     .await?;
-    let (versions, bytes): (i64, Option<i64>) = sqlx::query_as(
+    let gone: Vec<(String, i64)> = sqlx::query_as(
         "with gone as (delete from blob_refs where doc_id = any($1) returning sha256) \
-         select count(*), sum(b.size)::bigint from gone join blobs b on b.sha256 = gone.sha256",
+         select b.sha256, b.size from gone join blobs b on b.sha256 = gone.sha256",
     )
     .bind(&ids)
-    .fetch_one(&mut *conn)
+    .fetch_all(&mut *conn)
     .await?;
-    Ok(PurgedVersions {
-        versions,
-        bytes: bytes.unwrap_or(0),
-    })
+    let mut purged = PurgedVersions::default();
+    let mut seen = std::collections::HashSet::new();
+    for (sha256, size) in gone {
+        purged.versions += 1;
+        purged.bytes = purged.bytes.saturating_add(size);
+        if seen.insert(sha256.clone())
+            && let (Some(sha256), Ok(size)) = (parse_hex(&sha256), u64::try_from(size))
+        {
+            purged.contents.push(BlobRef { sha256, size });
+        }
+    }
+    Ok(purged)
 }
 
 /// Locks what `change` needs and judges its actor's access. Each needed node's chain is locked
@@ -479,6 +503,7 @@ impl Db {
             ..NodeChange::default()
         })
         .await
+        .map(drop)
     }
 
     /// Applies `change` in one transaction: locks and judges what it needs (`NotFound` if the
@@ -492,22 +517,31 @@ impl Db {
     /// purged loses its assignments, its links with their hidden groups, its open access
     /// requests and the rows naming its versions' contents, in the same transaction; each
     /// `node.purged` event's detail gets how many versions went (`versions`) and the sum of
-    /// their contents' sizes (`bytes`).
+    /// their contents' sizes (`bytes`). Answers the contents those versions named and the ids
+    /// of the `node.purged` events, for the caller to erase what nothing names any more once
+    /// this has committed. A document a copy makes (`copies`) is recorded as `document`'s is.
     ///
     /// A database failure before the change was judged allowed (the connection lost while
     /// locking, or the tree changing on every attempt) is `Unjudged`: nothing was written, and
     /// the change must be treated as refused. `Db` is a failure after it was judged allowed.
-    pub async fn apply_nodes(&self, change: NodeChange<'_>) -> Result<(), AccessError> {
+    pub async fn apply_nodes(&self, change: NodeChange<'_>) -> Result<NodesApplied, AccessError> {
         let (mut tx, locked) = self.judged(&change).await.map_err(|e| match e {
             AccessError::Db(e) => AccessError::Unjudged(e),
             other => other,
         })?;
-        if let (Some(editor), Some(first)) = (change.document, change.rows.first()) {
+        let first = change
+            .document
+            .zip(change.rows.first())
+            .map(|(editor, row)| (row.id, editor));
+        for (id, editor) in first.iter().chain(change.copies) {
+            let Some(row) = change.rows.iter().find(|row| row.id == *id) else {
+                return Err(DbError::new("a new document has no node among the rows").into());
+            };
             let inserted = sqlx::query(
                 "insert into documents (id, name, editor, created_by) values ($1, $2, $3, $4)",
             )
-            .bind(first.id.0)
-            .bind(&first.name)
+            .bind(row.id.0)
+            .bind(&row.name)
             .bind(editor.id())
             .bind(change.actor.map(|u| u.0))
             .execute(&mut *tx)
@@ -533,6 +567,7 @@ impl Db {
         }
         let purged = purging(&change);
         let mut events = change.events;
+        let mut done = NodesApplied::default();
         if !purged.is_empty() {
             let gone = after_purge(&mut tx, change.actor, &purged, &locked.purged_links).await?;
             for event in events.iter_mut().filter(|e| e.kind == "node.purged") {
@@ -541,12 +576,18 @@ impl Db {
                     detail.insert("bytes".to_owned(), gone.bytes.into());
                 }
             }
+            done.released = gone.contents;
         }
         for event in events {
-            record(&mut tx, event).await?;
+            if event.kind == "node.purged" {
+                done.purge_events
+                    .push(record_with_id(&mut tx, event).await?);
+            } else {
+                record(&mut tx, event).await?;
+            }
         }
         tx.commit().await?;
-        Ok(())
+        Ok(done)
     }
 
     /// A transaction in which `change` has been judged allowed, with what it needs locked, and

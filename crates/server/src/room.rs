@@ -942,11 +942,14 @@ async fn run(
                     let file_name = room.name.clone();
                     let recorder = recorder.clone();
                     running = Some(tokio::spawn(async move {
-                        let blob = blobs
+                        // Held until the claim is settled.
+                        let held = blobs
                             .write_bytes(job.text().as_bytes().to_vec())
                             .await
                             .map_err(WriteError::Failed)?;
-                        write_claimed(&blobs, db.as_ref(), store, doc, blob, move |store| {
+                        let blob = held.blob();
+                        let written =
+                            write_claimed(&blobs, db.as_ref(), store, doc, blob, move |store| {
                             let result = job.write(doc, &file_name, blob, store);
                             if let (Ok(Outcome::Written(revision)), Some(recorder)) =
                                 (&result, &recorder)
@@ -955,7 +958,9 @@ async fn run(
                             }
                             result
                         })
-                        .await
+                        .await;
+                        drop(held);
+                        written
                     }));
                 }
             }

@@ -398,6 +398,22 @@ pub async fn reconcile_blobs(
     Ok(report)
 }
 
+/// The sweeper's erasure, as of `now`: content nothing names (no `blob_refs` row, pending ones
+/// included) and no write holds, older than 24 hours by its row or, without one, by its file,
+/// and abandoned files in the store's `tmp` folder of that age; how many contents it erased.
+/// Nothing is erased while a flag asks for the content rows to be rebuilt, as a version could
+/// then name content without a row. Failures are logged.
+pub(crate) async fn sweep_unnamed(state: &AppState, now: OffsetDateTime) -> usize {
+    match state.db().blob_refs_flagged().await {
+        Ok(false) => erase_unnamed(state, now).await,
+        Ok(true) => 0,
+        Err(e) => {
+            eprintln!("sharecraft-server: cannot read the content flags: {e}");
+            0
+        }
+    }
+}
+
 /// The files Git records as purged from the recycle bin. A store without a tree has none.
 async fn purged_documents(store: &Arc<dyn Checkpointer>) -> Result<HashSet<DocId>, GitError> {
     let tree = Arc::clone(store);
