@@ -6,7 +6,8 @@ use std::time::Duration;
 use collab_core::ids::{DocId, Seq};
 use revisions::{
     Author, BlobRef, Checkpoint, CheckpointError, GitError, Outcome, RevisionId, RevisionInfo,
-    RevisionStore, Stored, TreeChange, TreeMove, TreeRecord,
+    RevisionStore, SiteRecord, SitesChange, Stored, TemplateRecord, TreeChange, TreeMove,
+    TreeRecord,
 };
 use serde_json::{Map, Value};
 use tokio::time::Instant;
@@ -113,6 +114,60 @@ pub trait Checkpointer: Send + Sync + 'static {
     ) -> Result<RevisionId, CheckpointError> {
         Err(CheckpointError::Unsupported)
     }
+
+    /// Records one change to the site records, saved templates or global navigation, with the
+    /// tree records that go with it, as one commit (see [`RevisionStore::write_sites`]).
+    ///
+    /// A store that keeps no site records writes the tree records alone, as
+    /// [`Checkpointer::write_tree`] does (its sites then read as having no record, with the
+    /// organisation's defaults); with no tree records it answers `Unsupported`.
+    ///
+    /// # Errors
+    /// Whatever the store reports.
+    fn write_sites(&self, change: &SitesChange<'_>) -> Result<RevisionId, CheckpointError> {
+        if change.tree.is_empty() {
+            return Err(CheckpointError::Unsupported);
+        }
+        self.write_tree(&TreeChange {
+            author: change.author,
+            message: change.message,
+            records: change.tree,
+        })
+    }
+
+    /// Every site record.
+    ///
+    /// # Errors
+    /// Whatever the store reports, including `Corrupt` for an unreadable record; `Unsupported`
+    /// unless the implementation keeps site records.
+    fn read_sites(&self) -> Result<Vec<SiteRecord>, CheckpointError> {
+        Err(CheckpointError::Unsupported)
+    }
+
+    /// The record of one site; `None` if it has none.
+    ///
+    /// # Errors
+    /// Whatever the store reports, including `Corrupt` for an unreadable record; `Unsupported`
+    /// unless the implementation keeps site records.
+    fn read_site_record(&self, _id: Uuid) -> Result<Option<SiteRecord>, CheckpointError> {
+        Err(CheckpointError::Unsupported)
+    }
+
+    /// Every saved template, deleted ones included.
+    ///
+    /// # Errors
+    /// Whatever the store reports; `Unsupported` unless the implementation keeps templates.
+    fn read_templates(&self) -> Result<Vec<TemplateRecord>, CheckpointError> {
+        Err(CheckpointError::Unsupported)
+    }
+
+    /// The organisation's global navigation; `None` if none was ever recorded.
+    ///
+    /// # Errors
+    /// Whatever the store reports; `Unsupported` unless the implementation keeps it.
+    fn read_org_navigation(&self) -> Result<Option<revisions::OrgNavigation>, CheckpointError> {
+        Err(CheckpointError::Unsupported)
+    }
 }
 
 impl Checkpointer for RevisionStore {
@@ -171,6 +226,26 @@ impl Checkpointer for RevisionStore {
         checkpoints: &[Checkpoint<'_>],
     ) -> Result<RevisionId, CheckpointError> {
         self.checkpoint_new(author, message, checkpoints)
+    }
+
+    fn write_sites(&self, change: &SitesChange<'_>) -> Result<RevisionId, CheckpointError> {
+        RevisionStore::write_sites(self, change)
+    }
+
+    fn read_sites(&self) -> Result<Vec<SiteRecord>, CheckpointError> {
+        RevisionStore::read_sites(self)
+    }
+
+    fn read_site_record(&self, id: Uuid) -> Result<Option<SiteRecord>, CheckpointError> {
+        RevisionStore::read_site_record(self, id)
+    }
+
+    fn read_templates(&self) -> Result<Vec<TemplateRecord>, CheckpointError> {
+        RevisionStore::read_templates(self)
+    }
+
+    fn read_org_navigation(&self) -> Result<Option<revisions::OrgNavigation>, CheckpointError> {
+        RevisionStore::read_org_navigation(self)
     }
 }
 

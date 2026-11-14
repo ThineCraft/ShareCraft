@@ -19,8 +19,8 @@ use records::{
     validate_document_name, validate_node_name,
 };
 use revisions::{
-    Author, BlobRef, Checkpoint, CheckpointError, Content, GitError, Stamp, TreeChange, TreeMove,
-    TreeRecord,
+    Author, BlobRef, Checkpoint, CheckpointError, Content, GitError, SiteRecord, SitesChange,
+    Stamp, TreeChange, TreeMove, TreeRecord,
 };
 use serde_json::{Map, Value, json};
 use time::OffsetDateTime;
@@ -171,6 +171,19 @@ pub(crate) struct PendingUndo {
     author: Author,
     message: String,
     records: Vec<TreeRecord>,
+    /// Site records put back by the take-back.
+    sites: Vec<SiteRecord>,
+    /// Sites whose record the take-back removes: their creation is taken back.
+    removed_sites: Vec<Uuid>,
+}
+
+/// What takes a change back: the tree records, site records and site records to remove,
+/// written as one commit.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Undo {
+    pub(crate) records: Vec<TreeRecord>,
+    pub(crate) sites: Vec<SiteRecord>,
+    pub(crate) removed_sites: Vec<Uuid>,
 }
 
 /// A change worked out and judged, ready to be committed and mirrored.
@@ -182,6 +195,10 @@ struct Plan {
     records: Vec<TreeRecord>,
     /// The records that take the change back: the previous records, or the new ones deleted.
     undo: Vec<TreeRecord>,
+    /// Site records written in the same commit: a new site's.
+    sites: Vec<SiteRecord>,
+    /// Sites whose record the take-back removes: a new site's.
+    undo_removed_sites: Vec<Uuid>,
     needs_admin: bool,
     needs: Vec<(NodeId, Perms)>,
     /// A new site: its creator becomes a member of its Owners group.
@@ -236,6 +253,8 @@ impl Default for Plan {
             message: String::new(),
             records: Vec::new(),
             undo: Vec::new(),
+            sites: Vec::new(),
+            undo_removed_sites: Vec::new(),
             needs_admin: false,
             needs: Vec::new(),
             site_groups: false,
@@ -748,7 +767,7 @@ pub async fn adopt_flat_documents(
 
 /// Refuses tree changes while the tree is out of step, unless the take-backs that could not be
 /// written now are, and a reconcile of the whole tree then succeeds.
-async fn ensure_in_step(state: &AppState) -> Result<(), AccessError> {
+pub(crate) async fn ensure_in_step(state: &AppState) -> Result<(), AccessError> {
     let flag = state.tree_out_of_step();
     if !flag.load(Ordering::SeqCst) {
         return Ok(());
@@ -797,14 +816,32 @@ async fn commit(
         .map(to_row)
         .collect::<Result<Vec<_>, _>>()
         .map_err(DbError::new)?;
-    write_tree(
-        store,
-        author.clone(),
-        plan.message.clone(),
-        plan.records.clone(),
-    )
-    .await
+    if plan.sites.is_empty() {
+        write_tree(
+            store,
+            author.clone(),
+            plan.message.clone(),
+            plan.records.clone(),
+        )
+        .await
+    } else {
+        write_sites(
+            store,
+            author.clone(),
+            plan.message.clone(),
+            plan.records.clone(),
+            plan.sites.clone(),
+            Vec::new(),
+        )
+        .await
+    }
     .map_err(git_failure)?;
+    let undo = Undo {
+        records: plan.undo,
+        sites: Vec::new(),
+        removed_sites: plan.undo_removed_sites,
+    };
+    let site_ids: Vec<NodeId> = plan.sites.iter().map(|r| NodeId(r.id)).collect();
     let actor_id = actor.map(|a| a.id);
     let applied = state
         .db()
@@ -819,6 +856,7 @@ async fn commit(
             copies: &plan.copies,
             needs_below: plan.needs_below,
             as_if_live: plan.as_if_live,
+            sites: &[],
         })
         .await;
     match applied {
@@ -831,9 +869,11 @@ async fn commit(
             );
             // Git does not hold a new file's editor: new files are taken back.
             let taken_back = (plan.document.is_none() && plan.copies.is_empty())
-                || take_back(state, author.clone(), &plan.message, plan.undo).await;
+                || take_back_all(state, author.clone(), &plan.message, undo).await;
             let ids: Vec<Uuid> = plan.records.iter().map(|r| r.id).collect();
-            if !(taken_back && repair_ids(state, &ids).await) {
+            let repaired =
+                repair_ids(state, &ids).await && crate::sites::repair_sites(state, &site_ids).await;
+            if !(taken_back && repaired) {
                 state.tree_out_of_step().store(true, Ordering::SeqCst);
             }
             Err(AccessError::Db(error))
@@ -846,7 +886,7 @@ async fn commit(
                     plan.id.0
                 );
             }
-            if !take_back(state, author, &plan.message, plan.undo).await {
+            if !take_back_all(state, author, &plan.message, undo).await {
                 state.tree_out_of_step().store(true, Ordering::SeqCst);
             }
             Err(refused)
@@ -893,10 +933,28 @@ async fn erase_released(state: &AppState, done: NodesApplied) {
 /// Writes `undo` as a second commit, taking back the change `message` describes. Returns
 /// whether it was written; if not, it is kept to be written before the next reconcile.
 async fn take_back(state: &AppState, author: Author, message: &str, undo: Vec<TreeRecord>) -> bool {
+    let undo = Undo {
+        records: undo,
+        ..Undo::default()
+    };
+    take_back_all(state, author, message, undo).await
+}
+
+/// Writes `undo`, tree and site records together, as a second commit taking back the change
+/// `message` describes. Returns whether it was written; if not, it is kept to be written
+/// before the next reconcile.
+pub(crate) async fn take_back_all(
+    state: &AppState,
+    author: Author,
+    message: &str,
+    undo: Undo,
+) -> bool {
     let pending = PendingUndo {
         author,
         message: format!("Undo: {message}"),
-        records: undo,
+        records: undo.records,
+        sites: undo.sites,
+        removed_sites: undo.removed_sites,
     };
     match write_undo(state, &pending).await {
         Ok(()) => true,
@@ -929,11 +987,22 @@ async fn write_pending_undos(state: &AppState) -> bool {
 
 /// Writes one take-back as a commit.
 async fn write_undo(state: &AppState, pending: &PendingUndo) -> Result<(), CheckpointError> {
-    write_tree(
+    if pending.sites.is_empty() && pending.removed_sites.is_empty() {
+        return write_tree(
+            state.checkpointer(),
+            pending.author.clone(),
+            pending.message.clone(),
+            pending.records.clone(),
+        )
+        .await;
+    }
+    write_sites(
         state.checkpointer(),
         pending.author.clone(),
         pending.message.clone(),
         pending.records.clone(),
+        pending.sites.clone(),
+        pending.removed_sites.clone(),
     )
     .await
 }
@@ -947,7 +1016,7 @@ fn pending_undos(state: &AppState) -> std::sync::MutexGuard<'_, Vec<PendingUndo>
 }
 
 /// Reconciles the nodes `ids` from Git once. Returns whether every one is now in step.
-async fn repair_ids(state: &AppState, ids: &[Uuid]) -> bool {
+pub(crate) async fn repair_ids(state: &AppState, ids: &[Uuid]) -> bool {
     let db = state.db();
     for id in ids {
         let id = *id;
@@ -1070,8 +1139,10 @@ async fn plan_create(
             return Err(AccessError::NameTaken);
         }
         unused(state, id).await?;
+        let defaults = db.regional_defaults().await?;
         let library = NodeId(Uuid::new_v4());
         let site = new_record(id, NodeKind::Site, None, id.0, &name, author.clone());
+        let site_record = crate::sites::new_site_record(id, &defaults);
         let lib = new_record(
             library,
             NodeKind::Library,
@@ -1090,6 +1161,8 @@ async fn plan_create(
             message: format!("Create site {name}"),
             records: vec![site, lib],
             undo,
+            sites: vec![site_record],
+            undo_removed_sites: vec![id.0],
             needs_admin: true,
             needs: Vec::new(),
             site_groups: true,
@@ -2107,7 +2180,11 @@ fn below(tree: &[TreeRecord], id: Uuid) -> Vec<&TreeRecord> {
 }
 
 /// The node `id` and `actor`'s access to it; `NotFound` unless they have some.
-async fn visible(db: &Db, actor: &User, id: NodeId) -> Result<(Node, Access), AccessError> {
+pub(crate) async fn visible(
+    db: &Db,
+    actor: &User,
+    id: NodeId,
+) -> Result<(Node, Access), AccessError> {
     let access = db
         .effective_access(actor.id, id)
         .await?
@@ -2117,7 +2194,7 @@ async fn visible(db: &Db, actor: &User, id: NodeId) -> Result<(Node, Access), Ac
 }
 
 /// `Forbidden` unless `access` holds every permission of `needed`.
-fn require(access: &Access, needed: Perms) -> Result<(), AccessError> {
+pub(crate) fn require(access: &Access, needed: Perms) -> Result<(), AccessError> {
     if access.perms.contains(needed) {
         Ok(())
     } else {
@@ -2143,7 +2220,7 @@ async fn unused(state: &AppState, id: NodeId) -> Result<(), AccessError> {
 }
 
 /// The record of `id` in Git; `NotFound` if Git has none.
-async fn git_record(state: &AppState, id: NodeId) -> Result<TreeRecord, AccessError> {
+pub(crate) async fn git_record(state: &AppState, id: NodeId) -> Result<TreeRecord, AccessError> {
     let store = Arc::clone(state.checkpointer());
     tokio::task::spawn_blocking(move || store.read_tree_record(id.0))
         .await
@@ -2181,8 +2258,30 @@ async fn write_tree(
     .map_err(|e| CheckpointError::Git(GitError::new(e)))?
 }
 
+/// Writes `tree` and `sites` records, and removes the records of `removed_sites`, as one commit
+/// credited to `author` (see [`crate::Checkpointer::write_sites`]).
+pub(crate) async fn write_sites(
+    store: &Arc<dyn Checkpointer>,
+    author: Author,
+    message: String,
+    tree: Vec<TreeRecord>,
+    sites: Vec<SiteRecord>,
+    removed_sites: Vec<Uuid>,
+) -> Result<(), CheckpointError> {
+    let store = Arc::clone(store);
+    tokio::task::spawn_blocking(move || {
+        let mut change = SitesChange::new(&author, &message);
+        change.tree = &tree;
+        change.sites = &sites;
+        change.removed_sites = &removed_sites;
+        store.write_sites(&change).map(|_| ())
+    })
+    .await
+    .map_err(|e| CheckpointError::Git(GitError::new(e)))?
+}
+
 /// A Git failure, answered as an unavailable store.
-fn git_failure(e: CheckpointError) -> AccessError {
+pub(crate) fn git_failure(e: CheckpointError) -> AccessError {
     AccessError::Db(DbError::new(format!("the content tree in Git: {e}")))
 }
 
@@ -2408,7 +2507,7 @@ fn parse_kind(word: &str) -> Option<NodeKind> {
 }
 
 /// The commit author for `user`.
-fn author_of(user: &User) -> Author {
+pub(crate) fn author_of(user: &User) -> Author {
     Author {
         id: user.id.0.to_string(),
         name: credited_name(&user.name),
@@ -2416,7 +2515,7 @@ fn author_of(user: &User) -> Author {
 }
 
 /// The commit author for changes the server makes on its own.
-fn server_author() -> Author {
+pub(crate) fn server_author() -> Author {
     Author {
         id: SERVER_AUTHOR_ID.to_owned(),
         name: SERVER_AUTHOR_NAME.to_owned(),
@@ -2424,14 +2523,14 @@ fn server_author() -> Author {
 }
 
 /// Now, as a record's timestamp.
-fn now_text() -> String {
+pub(crate) fn now_text() -> String {
     OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned())
 }
 
 /// A record as PostgreSQL holds it.
-fn to_row(record: &TreeRecord) -> Result<NodeRow, String> {
+pub(crate) fn to_row(record: &TreeRecord) -> Result<NodeRow, String> {
     let kind = parse_kind(&record.kind)
         .ok_or_else(|| format!("node {} has an unknown kind {:?}", record.id, record.kind))?;
     let time = |text: &str| {

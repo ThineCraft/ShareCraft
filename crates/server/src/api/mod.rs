@@ -50,7 +50,7 @@ pub(crate) fn router() -> Router<AppState> {
         .route("/me", get(session::me))
         .route("/editors", get(crate::editors::list))
         .route("/sites", get(sites::list).post(sites::create))
-        .route("/sites/{id}", get(sites::show))
+        .route("/sites/{id}", get(sites::show).patch(sites::change))
         .route("/sites/{id}/quota", put(sites::set_quota))
         .route("/sites/{id}/groups", get(sites::groups))
         .route("/sites/{id}/bin", get(bin::list))
@@ -94,6 +94,10 @@ pub(crate) fn router() -> Router<AppState> {
         .route(
             "/settings/sharing",
             get(settings::show).put(settings::change),
+        )
+        .route(
+            "/settings/regional",
+            get(settings::regional).put(settings::change_regional),
         )
         .nest("/l", crate::links::api_router())
         .route("/nodes/{id}/inheritance/preview", get(explorer::preview))
@@ -201,6 +205,12 @@ pub(crate) enum ApiError {
     InvalidName,
     /// 422: not an acceptable email address.
     InvalidEmail,
+    /// 422: not a well-formed language tag.
+    InvalidLanguage,
+    /// 422: not a time zone the server knows.
+    InvalidTimeZone,
+    /// 422: a navigation that breaks one of its rules.
+    InvalidNavigation,
     /// 422: the password is too short or too long.
     WeakPassword,
     /// 413: the body is larger than the route allows (16 KiB; file content, `max_file_bytes`).
@@ -288,6 +298,9 @@ impl ApiError {
             ApiError::InvalidRequest => (StatusCode::UNPROCESSABLE_ENTITY, "invalid_request"),
             ApiError::InvalidName => (StatusCode::UNPROCESSABLE_ENTITY, "invalid_name"),
             ApiError::InvalidEmail => (StatusCode::UNPROCESSABLE_ENTITY, "invalid_email"),
+            ApiError::InvalidLanguage => (StatusCode::UNPROCESSABLE_ENTITY, "invalid_language"),
+            ApiError::InvalidTimeZone => (StatusCode::UNPROCESSABLE_ENTITY, "invalid_time_zone"),
+            ApiError::InvalidNavigation => (StatusCode::UNPROCESSABLE_ENTITY, "invalid_navigation"),
             ApiError::WeakPassword => (StatusCode::UNPROCESSABLE_ENTITY, "weak_password"),
             ApiError::TooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "too_large"),
             ApiError::NotJson => (StatusCode::UNSUPPORTED_MEDIA_TYPE, "not_json"),
@@ -342,6 +355,9 @@ impl From<AccessError> for ApiError {
             // A value that makes no sense for the setting, as any other such value.
             AccessError::InvalidSetting => ApiError::InvalidRequest,
             AccessError::InvalidName => ApiError::InvalidName,
+            AccessError::InvalidLanguage => ApiError::InvalidLanguage,
+            AccessError::InvalidTimeZone => ApiError::InvalidTimeZone,
+            AccessError::InvalidNavigation => ApiError::InvalidNavigation,
             // `POST /api/docs` answers this itself, naming the extension expected.
             AccessError::WrongExtension => ApiError::InvalidRequest,
             AccessError::NameTaken => ApiError::NameTaken,

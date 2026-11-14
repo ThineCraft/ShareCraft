@@ -1,11 +1,13 @@
 //! Organisation settings: a few known keys, each with a value of a known type, changed only by
-//! administrators. Every change records `setting.changed`.
+//! administrators: sharing, and the regional defaults of sites. Every change records
+//! `setting.changed`.
 
 use collab_core::ids::UserId;
 use serde_json::{Value, json};
 use sqlx::PgConnection;
 
 use crate::events::{NewEvent, record};
+use crate::sites::{DEFAULT_LANGUAGE, DEFAULT_TIME_ZONE, validate_language, validate_time_zone};
 use crate::{AccessError, Db, DbError};
 
 /// Whether anyone links may be created and used (a boolean; off by default).
@@ -25,20 +27,25 @@ pub struct SharingSettings {
     pub anyone_link_max_days: i64,
 }
 
-/// `value` if it is acceptable for the setting `key`; `InvalidSetting` for an unknown key or a
-/// value of the wrong type or out of range.
+/// `value` if it is acceptable for the setting `key`; `InvalidSetting` for an unknown key (the
+/// global navigation is not set here) or a value of the wrong type or out of range,
+/// `InvalidLanguage` or `InvalidTimeZone` for a default language or time zone that is not one.
 fn validate(key: &str, value: &Value) -> Result<(), AccessError> {
+    let text = || value.as_str().unwrap_or_default();
     let fits = match key {
+        DEFAULT_LANGUAGE => validate_language(text()).is_ok(),
+        DEFAULT_TIME_ZONE => validate_time_zone(text()).is_ok(),
         ANYONE_LINKS => value.is_boolean(),
         ANYONE_LINK_MAX_DAYS => value
             .as_i64()
             .is_some_and(|days| (1..=MAX_DAYS_LIMIT).contains(&days)),
         _ => false,
     };
-    if fits {
-        Ok(())
-    } else {
-        Err(AccessError::InvalidSetting)
+    match (fits, key) {
+        (true, _) => Ok(()),
+        (false, DEFAULT_LANGUAGE) => Err(AccessError::InvalidLanguage),
+        (false, DEFAULT_TIME_ZONE) => Err(AccessError::InvalidTimeZone),
+        (false, _) => Err(AccessError::InvalidSetting),
     }
 }
 
@@ -92,7 +99,9 @@ impl Db {
 
     /// Sets `key` to `value`. `actor` must be an enabled administrator (`Forbidden`);
     /// `InvalidSetting` for an unknown key or a value it does not take (`anyone_links` a
-    /// boolean, `anyone_link_max_days` an integer from 1 to 365). Records `setting.changed`
+    /// boolean, `anyone_link_max_days` an integer from 1 to 365, `default_language` a language
+    /// tag and `default_time_zone` a time zone name: `InvalidLanguage` and `InvalidTimeZone`
+    /// for those). Records `setting.changed`
     /// with the values before and after, unless the value is unchanged. Switching
     /// `anyone_links` off stops every anyone link at once without revoking any.
     pub async fn set_setting(

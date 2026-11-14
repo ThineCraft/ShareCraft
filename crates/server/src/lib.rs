@@ -19,6 +19,7 @@ mod links;
 mod members;
 mod projection;
 mod room;
+pub mod sites;
 pub mod tree;
 mod ws;
 
@@ -360,6 +361,13 @@ pub async fn prepare(config: Config) -> std::io::Result<AppState> {
     }
     for (node, error) in &tree_report.failed {
         eprintln!("sharecraft-server: node {node} of the content tree not reconciled: {error}");
+    }
+    let sites_report = sites::reconcile(Arc::clone(&store), &db)
+        .await
+        .map_err(|e| std::io::Error::other(format!("cannot reconcile the site records: {e}")))?;
+    println!("Reconciled the site records with Git: {sites_report}");
+    for (id, error) in &sites_report.failed {
+        eprintln!("sharecraft-server: site record {id} not reconciled: {error}");
     }
     let report = reconcile(Arc::clone(&store), &db)
         .await

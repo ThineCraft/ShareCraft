@@ -1472,16 +1472,17 @@ async fn upgrade_records_the_groups_it_made() {
     test.db.migrate_to(6).await.unwrap();
     assert!(group_created(&test, old).await.is_empty());
     // A site made after the upgrade records its groups as it makes them. This code writes the
-    // recycle bin's columns too: empty stand-ins for them, which the bin's migration makes.
+    // recycle bin's columns and the rows of sites' own settings too: empty stand-ins for them,
+    // which later migrations make.
     sqlx::raw_sql(
-        "alter table nodes add column deleted_with uuid, add column bin_stage smallint,          add column purged_at timestamptz;",
+        "alter table nodes add column deleted_with uuid, add column bin_stage smallint,          add column purged_at timestamptz;          create table settings (key text primary key, value jsonb);          create table sites (id uuid primary key, language text, time_zone text);",
     )
     .execute(test.db.test_pool())
     .await
     .unwrap();
     let new = common::site(&test, "New", None).await;
     sqlx::raw_sql(
-        "alter table nodes drop column deleted_with, drop column bin_stage,          drop column purged_at;",
+        "alter table nodes drop column deleted_with, drop column bin_stage,          drop column purged_at; drop table sites; drop table settings;",
     )
     .execute(test.db.test_pool())
     .await

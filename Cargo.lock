@@ -2183,6 +2183,7 @@ dependencies = [
  "argon2",
  "collab-core",
  "getrandom 0.4.3",
+ "jiff",
  "records",
  "revisions",
  "serde",

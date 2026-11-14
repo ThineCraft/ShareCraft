@@ -19,6 +19,7 @@ use crate::roles::lock_roles;
 use crate::scopes::{
     LOCK_ATTEMPTS, access_with, judged_roles, lock_segment_with, lock_top_down, scopes_of, segment,
 };
+use crate::sites::ensure_site_row;
 use crate::{AccessError, Db, DbError, Editor, Perms};
 
 const MAX_NAME_CHARS: usize = 120;
@@ -190,6 +191,9 @@ pub struct NodeChange<'a> {
     /// Judges `needs` as if the nodes were live (see [`Db::access_as_if_live`]): for restoring
     /// an item from the recycle bin, or taking it further out.
     pub as_if_live: bool,
+    /// Sites whose `sites` row the change writes: locked `FOR UPDATE`, by id, after the node
+    /// rows and before the links, usage rows, groups and roles.
+    pub sites: &'a [NodeId],
 }
 
 /// Inserts or updates `row`, and for a document node the name of its `documents` row. A site
@@ -232,6 +236,7 @@ pub(crate) async fn upsert_node(conn: &mut PgConnection, row: &NodeRow) -> Resul
     }
     if row.kind == NodeKind::Site {
         ensure_site_groups(&mut *conn, row.id).await?;
+        ensure_site_row(&mut *conn, row.id).await?;
     }
     if row.kind == NodeKind::Document {
         sqlx::query("update documents set name = $2 where id = $1")
@@ -250,7 +255,7 @@ type Doomed = Vec<(uuid::Uuid, Option<GroupId>)>;
 /// What [`judge`] locked for a tree change: the live links it revokes (see [`Doomed`]) and the
 /// links, revoked or not, of the nodes it purges, which go with them.
 #[derive(Default)]
-struct Locked {
+pub(crate) struct Locked {
     doomed: Doomed,
     purged_links: Doomed,
     /// What the change does to sites' usage, their rows locked.
@@ -297,6 +302,20 @@ async fn lock_links_of(conn: &mut PgConnection, purged: &[NodeId]) -> Result<Doo
         .into_iter()
         .map(|(id, group)| (id, group.map(GroupId)))
         .collect())
+}
+
+/// Locks the `sites` rows of `sites`, by id, `FOR UPDATE`.
+async fn lock_site_rows(conn: &mut PgConnection, sites: &[NodeId]) -> Result<(), sqlx::Error> {
+    if sites.is_empty() {
+        return Ok(());
+    }
+    let mut ids: Vec<Uuid> = sites.iter().map(|id| id.0).collect();
+    ids.sort_unstable();
+    sqlx::query("select id from sites where id = any($1) order by id for update")
+        .bind(&ids)
+        .execute(conn)
+        .await?;
+    Ok(())
 }
 
 /// What purging removed of the documents' versions: how many rows named a content, the sum of
@@ -415,6 +434,7 @@ async fn judge(
     let purged = purging(change);
     if !change.needs_admin && change.needs.is_empty() {
         lock_top_down(&mut *conn, &written, true).await?;
+        lock_site_rows(&mut *conn, change.sites).await?;
         let doomed = lock_links_below(&mut *conn, &deleted, &sites).await?;
         let purged_links = lock_links_of(&mut *conn, &purged).await?;
         let usage = usage_changes(&mut *conn, change.rows).await?;
@@ -455,6 +475,7 @@ async fn judge(
         involved.extend(judged_roles(&links));
     }
     lock_top_down(&mut *conn, &written, true).await?;
+    lock_site_rows(&mut *conn, change.sites).await?;
     let doomed = lock_links_below(&mut *conn, &deleted, &sites).await?;
     let purged_links = lock_links_of(&mut *conn, &purged).await?;
     let usage = usage_changes(&mut *conn, change.rows).await?;
@@ -603,7 +624,7 @@ impl Db {
 
     /// A transaction in which `change` has been judged allowed, with what it needs locked, and
     /// the links it revokes or deletes.
-    async fn judged(
+    pub(crate) async fn judged(
         &self,
         change: &NodeChange<'_>,
     ) -> Result<(sqlx::Transaction<'static, sqlx::Postgres>, Locked), AccessError> {

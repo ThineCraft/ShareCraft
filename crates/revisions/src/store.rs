@@ -37,6 +37,8 @@ pub struct RevisionStore {
 
 const DOC_REFS: &str = "refs/sharecraft/docs/";
 pub(crate) const TREE_REF: &str = "refs/sharecraft/tree";
+/// Names the last commit that changed `sites/`, `templates/` or `org/`.
+pub(crate) const SITES_REF: &str = "refs/sharecraft/sites";
 
 fn doc_ref(doc: DocId) -> String {
     format!("{DOC_REFS}{}", doc.0)
@@ -237,20 +239,19 @@ fn ref_edit(name: &str, new: ObjectId, expected: Option<ObjectId>) -> Result<Ref
     })
 }
 
-/// Points `main` and the ref `other` at `oid` in one transaction, each allowed only while it
+/// Points `main` and each of `others` at `oid` in one transaction, each allowed only while it
 /// is still at the tip expected.
 fn move_main_and(
     repo: &Repository,
-    other: &str,
+    others: &[(&str, Option<ObjectId>)],
     oid: ObjectId,
     expected_main: Option<ObjectId>,
-    expected_other: Option<ObjectId>,
     signature: &gix::actor::Signature,
 ) -> Result<(), CheckpointError> {
-    let edits = [
-        ref_edit(MAIN, oid, expected_main)?,
-        ref_edit(other, oid, expected_other)?,
-    ];
+    let mut edits = vec![ref_edit(MAIN, oid, expected_main)?];
+    for (name, expected) in others {
+        edits.push(ref_edit(name, oid, *expected)?);
+    }
     let mut time = gix::date::parse::TimeBuf::default();
     repo.edit_references_as(edits, Some(signature.to_ref(&mut time)))?;
     Ok(())
@@ -276,6 +277,26 @@ pub(crate) fn commit_on_main(
     expected_other: Option<ObjectId>,
     edit: impl FnOnce(&mut gix::object::tree::Editor<'_>) -> Result<(), CheckpointError>,
 ) -> Result<ObjectId, CheckpointError> {
+    commit_on_main_moving(
+        repo,
+        parent,
+        signature,
+        message,
+        &[(other, expected_other)],
+        edit,
+    )
+}
+
+/// Like [`commit_on_main`], moving every ref of `others` (each only if still at the tip
+/// expected) with `main`, in one transaction.
+pub(crate) fn commit_on_main_moving(
+    repo: &Repository,
+    parent: Option<&gix::Commit<'_>>,
+    signature: &gix::actor::Signature,
+    message: String,
+    others: &[(&str, Option<ObjectId>)],
+    edit: impl FnOnce(&mut gix::object::tree::Editor<'_>) -> Result<(), CheckpointError>,
+) -> Result<ObjectId, CheckpointError> {
     let root = match parent {
         Some(commit) => commit.tree_id()?.detach(),
         None => ObjectId::empty_tree(repo.object_hash()),
@@ -295,7 +316,7 @@ pub(crate) fn commit_on_main(
         extra_headers: Vec::new(),
     };
     let oid = repo.write_object(&commit)?.detach();
-    move_main_and(repo, other, oid, parent_id, expected_other, signature)?;
+    move_main_and(repo, others, oid, parent_id, signature)?;
     Ok(oid)
 }
 
@@ -681,10 +702,9 @@ mod tests {
     ) -> Result<(), CheckpointError> {
         move_main_and(
             repo,
-            &doc_ref(doc),
+            &[(&doc_ref(doc), expected_doc)],
             oid,
             expected_main,
-            expected_doc,
             signature,
         )
     }

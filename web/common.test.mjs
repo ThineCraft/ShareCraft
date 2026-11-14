@@ -167,6 +167,9 @@ test('every error code of the tree and access routes has its own sentence', () =
     'invalid_request',
     'no_such_user',
     'not_found',
+    'invalid_language',
+    'invalid_time_zone',
+    'invalid_navigation',
   ]) {
     assert.notEqual(messageFor(code), general, code);
   }

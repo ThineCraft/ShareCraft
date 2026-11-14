@@ -77,14 +77,14 @@ pub struct TreeRecord {
 
 impl TreeRecord {
     /// Pretty-printed with two-space indent and a trailing newline.
-    fn to_file_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
+    pub(crate) fn to_file_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
         let mut bytes = serde_json::to_vec_pretty(self)?;
         bytes.push(b'\n');
         Ok(bytes)
     }
 
     /// Why the record cannot be stored or was stored wrongly, if so.
-    fn problem(&self) -> Option<String> {
+    pub(crate) fn problem(&self) -> Option<String> {
         if self.schema != TREE_SCHEMA {
             return Some(format!("unknown schema {}", self.schema));
         }
@@ -144,22 +144,22 @@ fn keeps_flat(flat: &TreeRecord, sharded: &TreeRecord) -> bool {
 }
 
 /// The sub-folder of `tree/` that holds the record of `id`: its first two hex digits.
-fn shard(id: Uuid) -> String {
+pub(crate) fn shard(id: Uuid) -> String {
     id.simple().to_string().chars().take(2).collect()
 }
 
 /// Where the record of `id` is written: `tree/<xx>/<id>.json`.
-fn record_path(id: Uuid) -> String {
+pub(crate) fn record_path(id: Uuid) -> String {
     format!("{TREE_DIR}/{}/{id}.json", shard(id))
 }
 
 /// Where the record of `id` was written before the sub-folders: `tree/<id>.json`.
-fn flat_path(id: Uuid) -> String {
+pub(crate) fn flat_path(id: Uuid) -> String {
     format!("{TREE_DIR}/{id}.json")
 }
 
 /// Whether `name` is the name of a sub-folder of `tree/`: two lowercase hex digits.
-fn is_shard_name(name: &[u8]) -> bool {
+pub(crate) fn is_shard_name(name: &[u8]) -> bool {
     name.len() == 2 && name.iter().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 

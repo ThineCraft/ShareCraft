@@ -9,6 +9,7 @@
 
 mod blobs;
 mod meta;
+mod sites;
 mod store;
 mod tree;
 
@@ -21,6 +22,11 @@ use serde_json::{Map, Value};
 
 pub use blobs::{BlobError, BlobRef, BlobStore, Content, hex, parse_hex};
 pub use meta::{Author, Meta};
+pub use sites::{
+    HubRecord, MAX_DESCRIPTION_CHARS, MAX_TEMPLATE_NAME_CHARS, NavItem, NavTarget, OrgNavigation,
+    SITE_KINDS, SITE_SCHEMA, SiteRecord, SitesChange, TemplateBody, TemplateFolder,
+    TemplateLibrary, TemplateNavItem, TemplateNavTarget, TemplateRecord,
+};
 pub use store::{RevisionStore, is_valid_author_name};
 pub use tree::{Stamp, TREE_MOVE_MESSAGE, TreeChange, TreeMove, TreeRecord};
 

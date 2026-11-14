@@ -61,6 +61,10 @@ const MESSAGES = {
   too_many_uploads: 'You have too many uploads open at once. Wait for some to finish, then try again.',
   invalid_range: 'The server could not take that part of the file. Try the upload again.',
   wrong_offset: 'The upload got out of step with the server. Try the upload again.',
+  invalid_language: 'That is not a language code. Use one like en, en-GB or pt-BR.',
+  invalid_time_zone: 'That is not a known time zone. Use one like UTC or Europe/London.',
+  invalid_navigation:
+    'That navigation is not allowed. Check the labels (60 characters at most), the addresses (https:, http:, mailto: or a path) and that links go one level deep.',
 };
 
 /** What a document page says when the document is missing or the person has no access. */

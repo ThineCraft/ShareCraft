@@ -179,6 +179,15 @@ pub enum AccessError {
     InvalidSetting,
     #[error("that is not a valid document name")]
     InvalidName,
+    /// Not a well-formed language tag (see [`crate::validate_language`]).
+    #[error("that is not a language tag")]
+    InvalidLanguage,
+    /// Not a time zone the time zone database knows (see [`crate::validate_time_zone`]).
+    #[error("that is not a known time zone")]
+    InvalidTimeZone,
+    /// A navigation that breaks a rule of [`crate::Db::validate_navigation`].
+    #[error("that navigation is not allowed")]
+    InvalidNavigation,
     #[error("the name of this kind of document must end with its file extension")]
     WrongExtension,
     #[error("a document with that id already exists")]
