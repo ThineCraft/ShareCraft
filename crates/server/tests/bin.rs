@@ -563,6 +563,89 @@ async fn restore_never_beyond_your_rights() {
 }
 
 #[tokio::test]
+async fn deleting_a_folder_needs_delete_on_its_own_places_below() {
+    let w = world().await;
+    let ann = w.server.user("Ann").await;
+    w.grant(&w.site, &ann, "editor").await;
+    let plans = w.folder(&w.root, &w.library, "Plans").await;
+    let own = w.folder(&w.root, &plans, "Own").await;
+    let inside = w.doc(&w.root, &own, "Inside").await;
+    // Ann only views the place inside with permissions of its own.
+    w.grant(&own, &ann, "viewer").await;
+
+    let commits = w.commits();
+    let (status, body) = w
+        .call(&ann, Method::DELETE, &format!("/api/nodes/{plans}"), None)
+        .await;
+    assert_eq!(
+        (status, body),
+        (StatusCode::FORBIDDEN, error("forbidden_below"))
+    );
+    assert_eq!(w.commits(), commits, "nothing written to Git");
+    for node in [&plans, &own, &inside] {
+        assert!(w.row(node).await.deleted_at.is_none());
+        assert!(w.record(node).deleted.is_none());
+    }
+    assert_eq!(w.bin(&w.root, "first").await, Vec::<String>::new());
+
+    // With delete there too, the folder goes.
+    w.grant(&own, &ann, "editor").await;
+    assert_eq!(w.delete(&ann, &plans).await, StatusCode::NO_CONTENT);
+    assert!(w.row(&inside).await.deleted_at.is_some());
+}
+
+#[tokio::test]
+async fn purged_folder_with_its_own_permissions_keeps_its_items_hidden() {
+    let w = world().await;
+    let ed = w.server.user("Ed").await;
+    let bob = w.server.user("Bob").await;
+    let olga = w.server.user("Olga").await;
+    w.grant(&w.site, &ed, "editor").await;
+    w.grant(&w.site, &olga, "owner").await;
+    // A is Bob's alone: nobody else is assigned there.
+    let a = w.folder(&w.root, &w.library, "Secret A").await;
+    w.grant(&a, &bob, "owner").await;
+    for other in [&ed, &olga] {
+        let (status, _) = w
+            .call(
+                &w.root,
+                Method::DELETE,
+                &format!("/api/nodes/{a}/access/user/{}", other.id.0),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+    let x = w.doc(&bob, &a, "X").await;
+    assert_eq!(
+        w.names(&ed, &w.library).await.unwrap(),
+        Vec::<String>::new()
+    );
+    assert_eq!(w.delete(&bob, &x).await, StatusCode::NO_CONTENT);
+    assert_eq!(w.delete(&w.root, &a).await, StatusCode::NO_CONTENT);
+    w.purge(&a).await;
+
+    // A library editor sees nothing of it, and cannot restore it.
+    assert_eq!(w.bin(&ed, "first").await, Vec::<String>::new());
+    assert_eq!(w.restore(&ed, &x).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(w.bin_remove(&ed, &x).await, StatusCode::NOT_FOUND);
+    assert!(w.row(&x).await.deleted_at.is_some());
+
+    // A site manager sees it, with the purged folder's name in its path, and restores it.
+    let (_, page) = w.bin_page(&olga, "first").await;
+    let item = page["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["id"] == x.as_str())
+        .expect("the site manager sees it");
+    assert_eq!(item["path"], json!(["Team", "Documents", "Secret A"]));
+    let (status, body) = w.restore(&olga, &x).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["node"]["parent"], w.library.as_str());
+}
+
+#[tokio::test]
 async fn restore_under_a_purged_folder_goes_to_the_library_top() {
     let w = world().await;
     let plans = w.folder(&w.root, &w.library, "Plans").await;

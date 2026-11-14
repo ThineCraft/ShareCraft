@@ -316,10 +316,21 @@ async fn access_as_if_live_ignores_the_deletion() {
         None,
         "Bob had access only in the purged folder"
     );
+    // The purged folder had permissions of its own: the library's editors do not see what it
+    // hid; the site's managers do.
     assert_eq!(
-        role_of(test.db.access_as_if_live(b.ann, b.hidden).await.unwrap()),
-        Some(Role::Editor)
+        test.db.access_as_if_live(b.ann, b.hidden).await.unwrap(),
+        None
     );
+    assert!(
+        test.db
+            .access_as_if_live(b.admin, b.hidden)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let mine_names = names(&test, b.ann, b.site, BinStage::First).await;
+    assert!(!mine_names.contains(&"Hidden".to_owned()), "{mine_names:?}");
 }
 
 #[tokio::test]

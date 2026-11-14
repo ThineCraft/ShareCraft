@@ -100,7 +100,9 @@ impl Db {
     /// What `user` could do with `node` if it were live: the one access decision (see
     /// [`Db::effective_access`]) with the deleted flags of `node`, of what was deleted with it and
     /// of every folder above it ignored, and a purged folder above it passed over (its items are
-    /// restored to the top of their library, so they are judged there). The same as
+    /// restored to the top of their library, so they are judged there; when what is passed over
+    /// had permissions of its own, only people with `manage_site` on the site have any). The
+    /// same as
     /// [`Db::effective_access`] for a live node. `None` for a purged node, a missing one, or a
     /// disabled or unknown account.
     pub async fn access_as_if_live(

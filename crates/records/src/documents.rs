@@ -125,6 +125,9 @@ pub enum AccessError {
     NoSuchRole,
     #[error("you may not do that")]
     Forbidden,
+    /// Deleting a folder needs `delete` on every place below it with permissions of its own.
+    #[error("you may not delete something inside that folder")]
+    ForbiddenBelow,
     /// Every scope keeps at least one assignment whose role includes `manage_access`.
     #[error("this would leave nobody who can manage access here")]
     LastManager,

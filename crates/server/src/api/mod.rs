@@ -152,6 +152,9 @@ pub(crate) enum ApiError {
     InvalidCredentials,
     /// 403: the request failed the same-origin check.
     Forbidden,
+    /// 403: deleting the folder needs `delete` on a place inside it with permissions of its own,
+    /// which the caller lacks.
+    ForbiddenBelow,
     /// 404: no such API route, document or account, or none the caller may see.
     NotFound,
     /// 404: no account has the email given.
@@ -251,6 +254,7 @@ impl ApiError {
             ApiError::NotSignedIn => (StatusCode::UNAUTHORIZED, "not_signed_in"),
             ApiError::InvalidCredentials => (StatusCode::UNAUTHORIZED, "invalid_credentials"),
             ApiError::Forbidden => (StatusCode::FORBIDDEN, "forbidden"),
+            ApiError::ForbiddenBelow => (StatusCode::FORBIDDEN, "forbidden_below"),
             ApiError::NotFound => (StatusCode::NOT_FOUND, "not_found"),
             ApiError::NoSuchUser => (StatusCode::NOT_FOUND, "no_such_user"),
             ApiError::EmailTaken => (StatusCode::CONFLICT, "email_taken"),
@@ -303,6 +307,7 @@ impl From<AccessError> for ApiError {
             // As an unknown role name was before roles could be defined.
             AccessError::NoSuchRole => ApiError::InvalidRequest,
             AccessError::Forbidden => ApiError::Forbidden,
+            AccessError::ForbiddenBelow => ApiError::ForbiddenBelow,
             AccessError::LastManager => ApiError::LastManager,
             AccessError::BeyondYourAccess => ApiError::BeyondYourAccess,
             AccessError::RoleInUse => ApiError::RoleInUse,

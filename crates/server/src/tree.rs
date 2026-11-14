@@ -173,6 +173,8 @@ struct Plan {
     site_groups: bool,
     document: Option<Editor>,
     events: Vec<NewEvent>,
+    /// How many of the last `needs` are places below a folder being deleted.
+    needs_below: usize,
     /// `needs` are judged as if the nodes were live (see [`Db::access_as_if_live`]).
     as_if_live: bool,
     /// The files the change deletes.
@@ -194,6 +196,7 @@ impl Default for Plan {
             site_groups: false,
             document: None,
             events: Vec::new(),
+            needs_below: 0,
             as_if_live: false,
             deleted: Vec::new(),
             renamed: None,
@@ -211,7 +214,8 @@ impl Default for Plan {
 /// to `actor`; `Forbidden` when they lack a permission (a site needs an administrator, a
 /// library or a rename of one `manage_site` on the site, a folder `add` on the place it goes
 /// into, a rename `edit`, a move `edit` on what moves and `add` on where it goes, a deletion
-/// `delete`); `InvalidName`, `WrongExtension` or `NameTaken` for a name;
+/// `delete`, a folder's deletion also on every place below it with permissions of its own,
+/// `ForbiddenBelow` otherwise); `InvalidName`, `WrongExtension` or `NameTaken` for a name;
 /// `WrongPlace` for a kind that cannot go there or cannot be moved or deleted (and for files,
 /// which [`create_document`] creates); `IntoItself` for a move into the node or below it;
 /// `IsSite` for deleting a site; `Exists` for an identifier already used; `OutOfStep` while the
@@ -723,6 +727,7 @@ async fn commit(state: &AppState, actor: Option<&User>, plan: Plan) -> Result<()
             needs: &plan.needs,
             site_groups: if plan.site_groups { actor_id } else { None },
             document: plan.document,
+            needs_below: plan.needs_below,
             as_if_live: plan.as_if_live,
         })
         .await;
@@ -1132,7 +1137,8 @@ async fn plan_move(
 
 /// Deletes `id`, and for a folder every live item below it, to the first stage of the site's
 /// recycle bin: each record marked deleted now by `actor` and with `id`, `id` the entry. Items
-/// below that were deleted before keep their own entries.
+/// below that were deleted before keep their own entries. A folder needs `delete` on itself and
+/// on every live place below it with permissions of its own (`ForbiddenBelow` otherwise).
 async fn plan_delete(state: &AppState, actor: &User, id: NodeId) -> Result<Plan, AccessError> {
     let db = state.db();
     let (node, access) = visible(db, actor, id).await?;
@@ -1142,6 +1148,21 @@ async fn plan_delete(state: &AppState, actor: &User, id: NodeId) -> Result<Plan,
         NodeKind::Folder | NodeKind::Document => {}
     }
     require(&access, Perms::DELETE)?;
+    let mut needs = vec![(id, Perms::DELETE)];
+    let mut needs_below = 0;
+    if node.kind == NodeKind::Folder {
+        for scope in db.scopes_below(id).await? {
+            let allowed = db
+                .effective_access(actor.id, scope)
+                .await?
+                .is_some_and(|a| a.perms.contains(Perms::DELETE));
+            if !allowed {
+                return Err(AccessError::ForbiddenBelow);
+            }
+            needs.push((scope, Perms::DELETE));
+            needs_below += 1;
+        }
+    }
     let before = git_record(state, id).await?;
     let mut undo = vec![before.clone()];
     if node.kind == NodeKind::Folder {
@@ -1200,7 +1221,8 @@ async fn plan_delete(state: &AppState, actor: &User, id: NodeId) -> Result<Plan,
         events,
         records,
         undo,
-        needs: vec![(id, Perms::DELETE)],
+        needs,
+        needs_below,
         deleted: documents,
         ..Plan::default()
     })

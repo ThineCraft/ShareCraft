@@ -22,6 +22,8 @@ const MESSAGES = {
   weak_password: 'That password is too short or too long.',
   not_found: 'That could not be found.',
   forbidden: 'That request was refused. Reload the page and try again.',
+  forbidden_below:
+    'Something inside that folder has its own permissions and you may not delete it, so the folder cannot be deleted.',
   network: 'Could not reach the server. Check the connection and try again.',
   too_large: 'That file is too large.',
   unknown_editor: 'That kind of document cannot be made here.',

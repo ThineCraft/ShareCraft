@@ -156,6 +156,7 @@ test('every error code of the tree and access routes has its own sentence', () =
   for (const code of [
     'name_taken',
     'parent_in_bin',
+    'forbidden_below',
     'into_itself',
     'wrong_place',
     'is_site',

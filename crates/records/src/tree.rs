@@ -179,6 +179,9 @@ pub struct NodeChange<'a> {
     /// Records the first row's node as a new document opened in this editor, created by
     /// `actor`.
     pub document: Option<Editor>,
+    /// How many of the last `needs` are places below a folder being deleted: a refusal on one of
+    /// them is `ForbiddenBelow`.
+    pub needs_below: usize,
     /// Judges `needs` as if the nodes were live (see [`Db::access_as_if_live`]): for restoring
     /// an item from the recycle bin, or taking it further out.
     pub as_if_live: bool,
@@ -438,13 +441,19 @@ async fn judge(
         return Ok(None);
     }
     // Every chain and role is locked now, so none of this access can change before the commit.
-    for (id, needed) in change.needs {
-        match access_with(&mut *conn, actor, *id, change.as_if_live).await? {
-            None => return Err(AccessError::NotFound),
-            Some(access) if !access.perms.contains(*needed) => {
-                return Err(AccessError::Forbidden);
-            }
-            Some(_) => {}
+    let below_from = change.needs.len().saturating_sub(change.needs_below);
+    for (at, (id, needed)) in change.needs.iter().enumerate() {
+        let allowed = match access_with(&mut *conn, actor, *id, change.as_if_live).await? {
+            None if at < below_from => return Err(AccessError::NotFound),
+            None => false,
+            Some(access) => access.perms.contains(*needed),
+        };
+        if !allowed {
+            return Err(if at < below_from {
+                AccessError::Forbidden
+            } else {
+                AccessError::ForbiddenBelow
+            });
         }
     }
     Ok(Some(Locked {
@@ -634,6 +643,19 @@ impl Db {
         .fetch_one(self.pool())
         .await?;
         Ok(found)
+    }
+
+    /// The live nodes strictly below `node` with permissions of their own, ancestors before
+    /// descendants: what deleting `node` must also be allowed on. Read from the site's scopes,
+    /// so its cost follows how many places have their own permissions, not how many items.
+    pub async fn scopes_below(&self, node: NodeId) -> Result<Vec<NodeId>, DbError> {
+        let ids: Vec<Uuid> = sqlx::query_scalar(
+            "with recursive up(origin, id, parent_id, depth) as (                  select s.id, s.id, s.parent_id, 0 from nodes s                  where s.site_id = (select site_id from nodes where id = $1)                    and s.unique_scope and s.deleted_at is null and s.id <> $1                  union all                  select up.origin, n.id, n.parent_id, up.depth + 1                  from up join nodes n on n.id = up.parent_id where up.depth < 10000)              select origin from up group by origin              having bool_or(id = $1) order by max(depth), origin",
+        )
+        .bind(node.0)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(ids.into_iter().map(NodeId).collect())
     }
 
     /// Whether `id` has any undeleted child.

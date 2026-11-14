@@ -403,8 +403,11 @@ pub(crate) async fn chain(
 
 /// [`chain`], or with `as_if_live` the chain as it would be if `node` and everything deleted
 /// above it were live again (see [`Db::access_as_if_live`]): deleted nodes are walked through,
-/// and a purged folder above `node` is passed over up to its library, where a restore would
-/// put `node`. `None` for a purged `node` either way.
+/// and below a purged folder everything between `node` and its library is passed over, as a
+/// restore would put `node` at the top of its library. If what is passed over held a scope of
+/// its own, only people with `manage_site` on the site have access (`None` for anyone else), so
+/// the library's permissions never show an item that a narrower scope hid. `None` for a purged
+/// `node` either way.
 pub(crate) async fn chain_with(
     conn: &mut PgConnection,
     user: UserId,
@@ -449,8 +452,6 @@ pub(crate) async fn chain_with(
     }
     let mut upward = Vec::with_capacity(by_id.len());
     let mut next = Some(node);
-    // While passing over a purged folder and what lies between it and its library.
-    let mut passing = false;
     while let Some(id) = next {
         // Taking each node out means a cycle finds its start gone and ends here.
         let Some((found, given)) = by_id.remove(&id) else {
@@ -460,35 +461,57 @@ pub(crate) async fn chain_with(
             return Ok(None);
         }
         next = found.parent;
-        passing |= purged.contains(&found.id);
-        if passing && found.kind != NodeKind::Library {
-            continue;
-        }
-        passing = false;
         upward.push((found, given));
+    }
+    // Below a purged folder, the node is judged where a restore would put it: at the top of
+    // its library, passing over everything between. If what is passed over held permissions
+    // of its own, the library's could show the node to people that hid it from: then only
+    // the site's managers, who see every name in its bin, have access to it.
+    let mut needs_manager = false;
+    // `node` itself is not purged (see above), so the highest purged node is above it.
+    if let Some(highest) = upward.iter().rposition(|(n, _)| purged.contains(&n.id)) {
+        let after = highest.saturating_add(1);
+        let Some(library) = upward
+            .iter()
+            .skip(after)
+            .position(|(n, _)| n.kind == NodeKind::Library)
+            .map(|at| at.saturating_add(after))
+        else {
+            return Ok(None);
+        };
+        let passed: Vec<_> = upward.drain(1..library).collect();
+        needs_manager = passed.iter().any(|(n, _)| n.unique_scope);
     }
     if upward.last().map(|(top, _)| top.kind) != Some(NodeKind::Site) {
         return Ok(None);
     }
     let mut role = None;
-    Ok(Some(
-        upward
-            .into_iter()
-            .rev()
-            .map(|(node, given)| {
-                role = access_step(
-                    standing,
-                    node.unique_scope,
-                    Access::union_of(given),
-                    role.take(),
-                );
-                Link {
-                    node,
-                    role: role.clone(),
-                }
-            })
-            .collect(),
-    ))
+    let links: Vec<Link> = upward
+        .into_iter()
+        .rev()
+        .map(|(node, given)| {
+            role = access_step(
+                standing,
+                node.unique_scope,
+                Access::union_of(given),
+                role.take(),
+            );
+            Link {
+                node,
+                role: role.clone(),
+            }
+        })
+        .collect();
+    if needs_manager {
+        let manages = links
+            .first()
+            .and_then(|site| site.role.as_ref())
+            .is_some_and(|access| access.perms.contains(Perms::MANAGE_SITE));
+        if !manages {
+            return Ok(None);
+        }
+    }
+    Ok(Some(links))
 }
 
 /// What `user` may do with `node`, on `conn`.
