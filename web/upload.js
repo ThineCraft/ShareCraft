@@ -172,6 +172,11 @@ export async function hashFile(file, onProgress = () => {}) {
 const sleepFor = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** A failure that ends one file's upload, with the sentence to show. */
+/** Whether the browser failed to read the picked file (moved, deleted, locked or permission lost). */
+const unreadable = (e) => ['NotReadableError', 'NotFoundError', 'SecurityError'].includes(e?.name);
+const readFailure = (name) =>
+  `“${name}” could not be read. It may have been moved, deleted or be in use by another program. Check it and pick it again.`;
+
 class Stop extends Error {
   /** `keep`: the session is still open and a retry can finish it; `ended`: nothing to give back. */
   constructor(message, retry = false, { keep = false, ended = false } = {}) {
@@ -234,7 +239,7 @@ export class UploadQueue {
         await this.#one(outcome);
       } catch (e) {
         outcome.status = 'failed';
-        outcome.message = e instanceof Stop ? e.message : messageFor('unknown');
+        outcome.message = e instanceof Stop ? e.message : unreadable(e) ? readFailure(outcome.name) : messageFor('unknown');
         outcome.retry = e instanceof Stop && (e.retry || e.keep);
         outcome.keep = e instanceof Stop && e.keep;
       }
@@ -282,11 +287,19 @@ export class UploadQueue {
     let id = file.resumeId;
     let cleaned = null;
     if (id) {
-      // A kept session: everything was sent, only the finish is left.
-      outcome.parentId = file.parentId;
-      outcome.sessionId = id;
-      this.#change(outcome, { status: 'uploading', message: '', sent: file.size });
-    } else {
+      // A kept session: ask the server how much it holds, then send the rest and finish.
+      const asked = await this.#call('GET', `/api/uploads/${seg(id)}`);
+      if (asked.status === 404) {
+        id = null; // it ended on the server (24 h, or a restart that lost it): start afresh
+      } else if (!asked.ok || typeof asked.data?.received !== 'number') {
+        throw new Stop(messageFor(asked.error ?? 'network'), true, { keep: true });
+      } else {
+        outcome.parentId = file.parentId;
+        outcome.sessionId = id;
+        this.#change(outcome, { status: 'uploading', message: '', sent: Math.min(asked.data.received, file.size) });
+      }
+    }
+    if (!id) {
       this.#change(outcome, { status: 'hashing', message: 'Checking the file…', hashed: 0 });
       const sha256 = await this.hash(file, (done) => this.#change(outcome, { sent: 0, hashed: done }));
       const parent = file.version ? null : await this.#folderFor(file.path ?? []);
@@ -301,7 +314,7 @@ export class UploadQueue {
       this.#change(outcome, { status: 'uploading', message: '', sent: started.received ?? 0 });
     }
     try {
-      if (!file.resumeId) await this.#send(outcome, id);
+      if (outcome.sent < file.size) await this.#send(outcome, id);
       await this.#finish(outcome, id, cleaned);
     } catch (e) {
       // A session left open keeps its size reserved against the site's quota: give it back,
@@ -360,7 +373,7 @@ export class UploadQueue {
         throw await this.#problem(result, file);
       }
       this.#change(outcome, { sent: received });
-      if (failures >= this.attempts) throw new Stop(messageFor('network'), true);
+      if (failures >= this.attempts) throw new Stop(messageFor('network'), true, { keep: true });
       if (failures > 0) {
         await this.sleep(this.#backoff(failures));
         // The server's own count is the truth about what it holds.

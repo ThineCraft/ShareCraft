@@ -577,6 +577,35 @@ export function showProblemWithFolder(element, text, folder) {
   }
 }
 
+/**
+ * The nearest place above the last step of `path` (a breadcrumb path) that still exists and
+ * that the person may open, or null. `exists(id)` answers true, false, or null when it could
+ * not be told (then the search stops and nothing is linked).
+ */
+export async function nearestLivingAncestor(path, exists) {
+  for (let at = path.length - 2; at >= 0; at -= 1) {
+    const step = path[at];
+    if (!step?.access) continue;
+    const there = await exists(step.id);
+    if (there === null) return null;
+    if (there) return step;
+  }
+  return null;
+}
+
+/** Whether node `id` can still be read: true, false for "gone or hidden", null for "could not tell". */
+export async function nodeStillThere(id) {
+  const result = await api('GET', `/nodes/${seg(id)}`);
+  if (result.ok) return true;
+  return result.error === 'network' ? null : false;
+}
+
+/** Adds a link to the nearest place above `path` that still exists, when one is found. */
+export async function linkNearestPlace(element, path) {
+  const place = await nearestLivingAncestor(path, nodeStillThere);
+  if (place) element.append(' ', h('a', { href: pageFor(place.kind, place.id) }, `Go to ${place.name}`));
+}
+
 /** The roles in `roles` whose permissions are all held in `access`: the ones this person may give. */
 export const rolesWithin = (roles, access) =>
   roles.filter((role) => role.perms.every((perm) => can(access, perm)));
@@ -871,7 +900,9 @@ export function quotaText({ used, quota, quota_warning: warning }) {
   }
   return (
     `This site holds ${bytesText(used)} of its ${bytesText(quota)} storage quota.` +
-    (warning ? ' It is nearly full: delete or purge what is not needed, or ask an administrator for more.' : '')
+    (warning
+      ? ` It ${used >= quota ? 'is full' : 'is nearly full'}: delete or purge what is not needed, or ask an administrator for more.`
+      : '')
   );
 }
 
@@ -950,7 +981,8 @@ export function confirmDialog(text, label) {
 /**
  * What the quota form sends: `{ bytes }` (null for no quota) or `{ error }`. Where the person
  * cannot see the current quota (`blind`), an empty field is refused rather than taken to mean
- * "remove the quota"; removing it there has its own button.
+ * "remove the quota"; removing it has its own confirmed button. The site page always passes
+ * `blind`, so nobody removes a quota by leaving the field empty.
  */
 export function quotaSubmit(text, { blind = false } = {}) {
   const bytes = parseQuotaGb(text);

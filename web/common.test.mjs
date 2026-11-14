@@ -722,6 +722,12 @@ test('quota wording: usage, warning from 90%, and refusals in plain words', () =
   assert.match(quotaText({ used: 512, quota: 1024 }), /512 bytes of its 1\.0 KB storage quota/);
   assert.doesNotMatch(quotaText({ used: 512, quota: 1024 }), /nearly full/);
   assert.match(quotaText({ used: 950, quota: 1000, quota_warning: true }), /nearly full/);
+  // at or over the quota it is full, not "nearly" full
+  for (const used of [1000, 1200]) {
+    const text = quotaText({ used, quota: 1000, quota_warning: true });
+    assert.match(text, /is full/);
+    assert.doesNotMatch(text, /nearly/);
+  }
   const refusal = quotaRefusalText({ used: 900, quota: 1000 }, { name: 'Big.pdf', size: 500 });
   assert.match(refusal, /Big\.pdf/);
   assert.match(refusal, /500 bytes/);
@@ -780,4 +786,17 @@ test('an empty quota field removes the quota only where the current quota is sho
   assert.match(quotaSubmit('  ', { blind: true }).error, /number of gigabytes/);
   assert.deepEqual(quotaSubmit('2', { blind: true }), { bytes: 2 * 1024 ** 3 });
   assert.match(quotaSubmit('lots', { blind: false }).error, /number of gigabytes/);
+});
+
+import { nearestLivingAncestor } from './common.js';
+
+test('a deleted document links to the nearest folder above it that still exists', async () => {
+  const mk = (id) => ({ id, kind: 'folder', name: id, access: { perms: ['view'], roles: [] } });
+  const path = [mk('site'), mk('lib'), mk('a'), mk('b'), { id: 'doc', kind: 'document', name: 'doc', access: {} }];
+  const alive = (...ids) => async (id) => ids.includes(id);
+  assert.equal((await nearestLivingAncestor(path, alive('site', 'lib', 'a', 'b'))).id, 'b');
+  assert.equal((await nearestLivingAncestor(path, alive('site', 'lib'))).id, 'lib');
+  assert.equal(await nearestLivingAncestor(path, alive()), null);
+  assert.equal(await nearestLivingAncestor(path, async () => null), null);
+  assert.equal(await nearestLivingAncestor([path.at(-1)], alive('doc')), null);
 });

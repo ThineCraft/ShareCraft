@@ -80,6 +80,7 @@ async function showStorage() {
     $('storage-bar').classList.toggle('warn', Boolean(warning));
   }
   $('quota-form').hidden = !me.is_admin;
+  $('quota-remove').hidden = !me.is_admin;
   if (me.is_admin) $('quota-gb').value = quota === null ? '' : String(Math.round((quota / 1024 ** 3) * 100) / 100);
 }
 
@@ -105,7 +106,7 @@ async function putQuota(bytes) {
 $('quota-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   showMessage(error, '');
-  const asked = quotaSubmit($('quota-gb').value, { blind: !manageSite });
+  const asked = quotaSubmit($('quota-gb').value, { blind: true });
   if (asked.error) return showMessage(error, asked.error);
   await putQuota(asked.bytes);
 });

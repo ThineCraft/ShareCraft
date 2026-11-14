@@ -341,7 +341,9 @@ function drawUploads() {
   if ($('upload-summary').textContent !== summary) $('upload-summary').textContent = summary;
 }
 
-function forgetUpload(outcome) {
+/** Drops a row. A kept session that is not going to be resumed is given back to the server. */
+function forgetUpload(outcome, { release = true } = {}) {
+  if (release && outcome.keep && outcome.sessionId) api('DELETE', `/uploads/${seg(outcome.sessionId)}`);
   uploads.splice(uploads.indexOf(outcome), 1);
   uploadRows.get(outcome)?.item.remove();
   uploadRows.delete(outcome);
@@ -369,7 +371,7 @@ function uploadRow(outcome) {
     ? h('button', { type: 'button', class: 'plain' }, outcome.keep ? 'Try again' : 'Upload again')
     : null;
   again?.addEventListener('click', () => {
-    forgetUpload(outcome);
+    forgetUpload(outcome, { release: false });
     // A kept session only needs its finish sent again; otherwise the file goes up afresh.
     startUploads([
       outcome.keep

@@ -365,6 +365,11 @@ pub async fn prepare(config: Config) -> std::io::Result<AppState> {
         .await
         .map_err(|e| std::io::Error::other(format!("cannot list the documents in Git: {e}")))?;
     println!("Reconciled revisions with Git: {report}");
+    if !report.failed.is_empty() {
+        // A version that could not be listed may name content that has no row yet: nothing is
+        // erased until the content rows are rebuilt from Git without a failure.
+        blobs::flag_dirty(&db).await;
+    }
     for (doc, error) in &report.failed {
         eprintln!(
             "sharecraft-server: revisions of document {} not reconciled: {error}",

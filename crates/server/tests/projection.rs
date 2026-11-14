@@ -309,9 +309,13 @@ async fn corrupt_document_is_reported_and_the_others_reconcile() {
     assert_eq!((again.documents, again.updated), (2, 0));
     assert_eq!(again.failed.len(), 1);
 
-    // A server starts despite the broken document.
+    // A server starts despite the broken document, and flags the content rows for a rebuild so
+    // that nothing is erased while a document's revisions could not be read.
+    db.db.rebuild_blob_refs(&[], true).await.unwrap(); // a fresh database starts flagged
+    assert!(!db.db.blob_refs_flagged().await.unwrap());
     let running = StoppableServer::start(data_dir.path(), &db, |_| {});
     wait_listening(&running).await;
+    assert!(db.db.blob_refs_flagged().await.unwrap());
 }
 
 fn conflicts(c: &TestClient) -> usize {

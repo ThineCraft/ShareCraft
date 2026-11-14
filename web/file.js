@@ -29,7 +29,7 @@ import {
   roleLine,
   seg,
   showCrumbs,
-  showProblemWithFolder,
+  linkNearestPlace,
 } from './common.js';
 
 const FIRST_DELAY = 500;
@@ -61,6 +61,7 @@ const clientId = crypto.randomUUID(); // this page load's connection
 let me = null;
 let docId = '';
 let doc = null;             // { id, name, editor, access, revision } from the server
+let path = [];              // the breadcrumb path as it was when the page loaded
 let folder = null;          // the step above the file in its breadcrumb, where closing goes
 let socket = null;
 let joined = false;         // the server answered the join on the current socket
@@ -178,6 +179,7 @@ async function showPlace() {
   const here = await showCrumbs($('crumbs'), docId, { linkLast: false });
   if (!here) return;
   folder = here.folder;
+  path = here.path;
   if (folder) {
     $('back').href = pageFor(folder.kind, folder.id);
     $('back').setAttribute('aria-label', `Back to ${folder.name}`);
@@ -202,10 +204,11 @@ function showDownload() {
   else downloadLink.removeAttribute('href');
 }
 
-function showProblem(text, linkFolder = null) {
+function showProblem(text, linkNearest = false) {
   statusPill.hidden = true;
   editorArea.replaceChildren();
-  showProblemWithFolder($('problem'), text, linkFolder);
+  $('problem').textContent = text;
+  if (linkNearest) linkNearestPlace($('problem'), path);
 }
 
 // The server removed this page, or the document is gone: nothing of it stays on the screen or
@@ -243,7 +246,7 @@ function stopRemoved(reason) {
   old?.close();
   showProblem(
     reason === 'missing' ? MISSING_DOCUMENT : removedMessage(reason),
-    reason === 'deleted' ? folder : null,
+    reason === 'deleted',
   );
   if (reason === 'missing') offerRequest($('problem'), docId);
 }

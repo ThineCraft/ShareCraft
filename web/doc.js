@@ -16,7 +16,7 @@ import {
   seg,
   showCrumbs,
   showMessage,
-  showProblemWithFolder,
+  linkNearestPlace,
 } from './common.js';
 
 const FIRST_DELAY = 500;
@@ -48,6 +48,7 @@ let pendingClose = null; // a socket that closed during a composition, handled w
 let canEdit = false;   // the server says this person may change the text
 let removedReason = ''; // set once the server removed this page: no reconnecting
 let roleCheck = 0;      // the latest role request; older answers are dropped
+let path = [];          // the breadcrumb path as it was when the page loaded
 let folder = null;      // the step above the document in its breadcrumb, where closing goes
 let checking = false;   // a still-allowed check is in flight
 let closedBeforeJoin = 0; // closes in a row, before joining, while the document stayed open
@@ -104,6 +105,7 @@ async function showPlace() {
   const here = await showCrumbs($('crumbs'), docId, { linkLast: false });
   if (!here) return;
   folder = here.folder;
+  path = here.path;
   if (folder) {
     $('back').href = pageFor(folder.kind, folder.id);
     $('back').setAttribute('aria-label', `Back to ${folder.name}`);
@@ -173,7 +175,8 @@ function stopRemoved(reason) {
   old?.close();
   if (reason === 'deleted') {
     $('editor').hidden = true;
-    showProblemWithFolder($('problem'), removedMessage(reason), folder);
+    showMessage($('problem'), removedMessage(reason));
+    linkNearestPlace($('problem'), path);
   }
   render();
 }

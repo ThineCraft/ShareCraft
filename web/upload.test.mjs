@@ -225,6 +225,18 @@ test('an upload that keeps failing stops and says the connection was lost', asyn
   assert.match(outcome.message, /Could not reach the server/);
 });
 
+test('a file the browser cannot read says so plainly', async () => {
+  const server = stubServer();
+  const unreadable = async () => {
+    throw new DOMException('The requested file could not be read', 'NotReadableError');
+  };
+  const [outcome] = await queueFor(server, { hash: unreadable }).run([fileOf('x.pdf', 10)]);
+  assert.equal(outcome.status, 'failed');
+  assert.match(outcome.message, /could not be read/);
+  assert.match(outcome.message, /x\.pdf/);
+  assert.doesNotMatch(outcome.message, /Something went wrong/);
+});
+
 test('a name conflict asks once and applies a choice to the rest when asked', async () => {
   const asked = [];
   const server = stubServer({
@@ -474,7 +486,54 @@ test('being edited at the finish keeps the session and a retry only finishes', a
   ]);
   assert.equal(second.status, 'done');
   const calls = server.log.slice(before).map((call) => `${call.method} ${call.url}`);
-  assert.deepEqual(calls, ['POST /api/uploads/sess/finish?on_conflict=replace']);
+  assert.deepEqual(calls, ['GET /api/uploads/sess', 'POST /api/uploads/sess/finish?on_conflict=replace']);
+});
+
+test('giving up on the network keeps the session so a retry can carry on', async () => {
+  const fail = {};
+  for (let n = 1; n <= 20; n += 1) fail[n] = 'network';
+  const server = stubServer({ fail });
+  const [outcome] = await queueFor(server, { attempts: 2 }).run([fileOf('x.pdf', 10)]);
+  assert.equal(outcome.status, 'failed');
+  assert.equal(outcome.keep, true);
+  assert.equal(outcome.retry, true);
+  assert.equal(outcome.sessionId, 'sess');
+  assert.ok(!server.log.some((call) => call.method === 'DELETE'));
+});
+
+test('a kept session is asked how much it holds and only the rest is sent', async () => {
+  const server = stubServer();
+  server.state.size = 20 * MIB;
+  server.state.received = 8 * MIB;
+  const before = server.log.length;
+  const [outcome] = await queueFor(server).run([{ ...fileOf('x.pdf', 20 * MIB), resumeId: 'sess' }]);
+  assert.equal(outcome.status, 'done');
+  const calls = server.log.slice(before).map((call) => `${call.method} ${call.url} ${call.headers?.['Content-Range'] ?? ''}`.trim());
+  assert.deepEqual(calls, [
+    'GET /api/uploads/sess',
+    `PUT /api/uploads/sess bytes ${8 * MIB}-${16 * MIB - 1}/${20 * MIB}`,
+    `PUT /api/uploads/sess bytes ${16 * MIB}-${20 * MIB - 1}/${20 * MIB}`,
+    'POST /api/uploads/sess/finish',
+  ]);
+});
+
+test('a kept session the server no longer has is started afresh', async () => {
+  const server = stubServer();
+  const inner = server.fetch;
+  let first = true;
+  server.fetch = async (url, init = {}) => {
+    if (first && url === '/api/uploads/sess' && (init.method ?? 'GET') === 'GET') {
+      first = false;
+      server.log.push({ method: 'GET', url });
+      return json(404, { error: 'not_found' });
+    }
+    return inner(url, init);
+  };
+  const [outcome] = await queueFor(server).run([{ ...fileOf('x.pdf', 10), resumeId: 'sess' }]);
+  assert.equal(outcome.status, 'done');
+  const calls = server.log.map((call) => `${call.method} ${call.url}`);
+  assert.deepEqual(calls.slice(0, 2), ['GET /api/uploads/sess', 'POST /api/uploads']);
+  assert.ok(calls.includes('PUT /api/uploads/sess'));
 });
 
 test('a busy server at the finish keeps the session and says so plainly', async () => {
