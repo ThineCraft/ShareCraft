@@ -567,7 +567,8 @@ impl Db {
         for row in change.rows {
             upsert_node(&mut tx, row).await?;
         }
-        apply_usage_changes(&mut tx, &locked.usage).await?;
+        // A person's move into a site without room is refused; Git's own changes are mirrored.
+        apply_usage_changes(&mut tx, &locked.usage, change.actor.is_some()).await?;
         if let (Some(creator), Some(first)) = (change.site_groups, change.rows.first()) {
             add_site_owner(&mut tx, first.id, creator, change.actor).await?;
         }

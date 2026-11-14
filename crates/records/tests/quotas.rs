@@ -320,3 +320,43 @@ async fn sizes_missing_are_filled() {
     db.rebuild_usage(true).await.unwrap();
     assert_eq!(db.site_usage(site).await.unwrap().used, 77);
 }
+
+/// Purging a file with a version whose size is not known yet cannot give back what it does
+/// not know: it asks for a rebuild of the usage.
+#[tokio::test]
+async fn purge_with_unknown_sizes_flags_a_rebuild() {
+    let test = TestDb::create().await;
+    let db = &test.db;
+    let root = user(&test, "Root", true).await;
+    let (site, library) = site_with_library(&test, root.id).await;
+    let doc = document_in(&test, root.id, library, site, "old.txt").await;
+    db.append_revision(None, &record(doc, 1, 0)).await.unwrap();
+    db.rebuild_usage(true).await.unwrap();
+    sqlx::query("update revisions set size = null")
+        .execute(db.test_pool())
+        .await
+        .unwrap();
+    assert!(!db.usage_rebuild_flagged().await.unwrap());
+
+    let now = OffsetDateTime::now_utc();
+    db.apply_node(
+        &NodeRow {
+            id: doc.into(),
+            kind: NodeKind::Document,
+            parent: Some(library),
+            site,
+            name: "old.txt".into(),
+            deleted_at: Some(now),
+            deleted_by: None,
+            created_by: None,
+            created_at: now,
+            deleted_with: Some(doc.into()),
+            bin_stage: None,
+            purged_at: Some(now),
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(db.usage_rebuild_flagged().await.unwrap());
+}

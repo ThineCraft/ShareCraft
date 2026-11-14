@@ -896,3 +896,239 @@ async fn site_quota_set_and_shown() {
             .unwrap();
     assert_eq!(events, 2);
 }
+
+/// A second site made by Root; `(site, library)`.
+async fn other_site(t: &Team, name: &str) -> (String, String) {
+    let (status, site) = t
+        .call(
+            &t.root,
+            Method::POST,
+            "/api/sites",
+            Some(json!({ "name": name })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{site}");
+    let site = site["id"].as_str().unwrap().to_owned();
+    let (_, page) = t
+        .call(
+            &t.root,
+            Method::GET,
+            &format!("/api/nodes/{site}/children"),
+            None,
+        )
+        .await;
+    let library = page["items"][0]["id"].as_str().unwrap().to_owned();
+    (site, library)
+}
+
+/// Sets the quota of `site`, as Root.
+async fn set_quota_of(t: &Team, site: &str, bytes: Option<u64>) {
+    let (status, body) = t
+        .call(
+            &t.root,
+            Method::PUT,
+            &format!("/api/sites/{site}/quota"),
+            Some(json!({ "bytes": bytes })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+}
+
+/// Moves `node` into `parent`, as Root.
+async fn move_to(t: &Team, node: &str, parent: &str) -> (StatusCode, Value) {
+    t.call(
+        &t.root,
+        Method::PATCH,
+        &format!("/api/nodes/{node}"),
+        Some(json!({ "parent": parent })),
+    )
+    .await
+}
+
+/// A file moved into another site takes its versions' bytes there, and is refused with
+/// `507 quota_exceeded` when that site has no room for them; nothing moves then.
+#[tokio::test]
+async fn move_into_full_site_refused() {
+    let t = team().await;
+    let (other, other_library) = other_site(&t, "Other").await;
+    set_quota_of(&t, &other, Some(50)).await;
+    let big = t.file("Big.pdf", &[1u8; 100]).await;
+    let small = t.file("Small.pdf", &[2u8; 10]).await;
+
+    let (status, body) = move_to(&t, &big, &other_library).await;
+    assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE, "{body}");
+    assert_eq!(body["error"], "quota_exceeded");
+    assert_eq!(t.names().await, ["Big.pdf", "Small.pdf"]);
+    assert_eq!(t.usage().await, (110, 0));
+    assert_eq!(usage_of(&t.server, node_id(&other)).await, (0, 0));
+
+    let (status, body) = move_to(&t, &small, &other_library).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(t.usage().await, (100, 0));
+    assert_eq!(usage_of(&t.server, node_id(&other)).await, (10, 0));
+}
+
+/// An upload of a new version whose file moved to another site while it was under way is
+/// judged against that site's quota when it finishes: refused there (the session left open,
+/// still reserved where it started), and once there is room, stored and counted there.
+#[tokio::test]
+async fn upload_follows_its_file_to_another_site() {
+    let t = team().await;
+    let (other, other_library) = other_site(&t, "Other").await;
+    let file = t.file("F.pdf", &[1u8; 10]).await;
+    let started = t
+        .session(json!({ "doc": file, "base": t.head(&file) }), &[2u8; 60])
+        .await;
+    let id = started["id"].as_str().unwrap();
+    set_quota_of(&t, &other, Some(50)).await;
+    let (status, body) = move_to(&t, &file, &other_library).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = t.finish(id, None).await;
+    assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE, "{body}");
+    let (status, _) = t
+        .call(&t.root, Method::GET, &format!("/api/uploads/{id}"), None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(t.usage().await, (0, 60));
+    assert_eq!(usage_of(&t.server, node_id(&other)).await, (10, 0));
+
+    set_quota_of(&t, &other, None).await;
+    let (status, body) = t.finish(id, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(t.usage().await, (0, 0));
+    assert_eq!(usage_of(&t.server, node_id(&other)).await, (70, 0));
+}
+
+/// A body that sends a little and then nothing more: only an answer given before reading it
+/// can arrive.
+fn endless_body() -> reqwest::Body {
+    let start = futures_util::stream::once(async { Ok::<_, std::io::Error>(vec![1u8; 4]) });
+    reqwest::Body::wrap_stream(futures_util::StreamExt::chain(
+        start,
+        futures_util::stream::pending(),
+    ))
+}
+
+/// A body that cannot fit is refused before it is read: by its declared length, or one byte
+/// when it declares none.
+#[tokio::test]
+async fn over_quota_refused_before_the_body() {
+    let t = team().await;
+    let file = t.file("Full.pdf", &[1u8; 10]).await;
+    t.set_quota(Some(10)).await;
+    let answer = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        t.server
+            .http(Some(&t.root))
+            .post(t.server.url("/api/docs/upload"))
+            .query(&[("parent", t.library.as_str()), ("name", "More.pdf")])
+            .body(endless_body())
+            .send(),
+    )
+    .await
+    .expect("the upload was not answered before its body was read")
+    .unwrap();
+    assert_eq!(answer.status(), StatusCode::INSUFFICIENT_STORAGE);
+
+    let seat = FileClient::connect_as(&t.server, doc_id(&file), &t.root).await;
+    let answer = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        t.server
+            .http(Some(&t.root))
+            .put(t.server.url(&format!("/api/docs/{file}/content")))
+            .query(&[("base", t.head(&file).unwrap())])
+            .header(SEAT, seat.token().unwrap())
+            .body(endless_body())
+            .send(),
+    )
+    .await
+    .expect("the save was not answered before its body was read")
+    .unwrap();
+    assert_eq!(answer.status(), StatusCode::INSUFFICIENT_STORAGE);
+}
+
+/// Replacing an item the person cannot see answers as if nothing could be replaced there,
+/// whatever kind of item it is.
+#[tokio::test]
+async fn replace_of_a_hidden_item_answers_not_found() {
+    let t = team().await;
+    let ann = t.server.user("Ann").await;
+    let (status, body) = t
+        .call(
+            &t.root,
+            Method::PUT,
+            &format!("/api/nodes/{}/access", t.library),
+            Some(json!({ "email": ann.email, "role": "editor" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let (status, folder) = t
+        .call(
+            &t.root,
+            Method::POST,
+            &format!("/api/nodes/{}/children", t.library),
+            Some(json!({ "kind": "folder", "name": "Secret.pdf" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{folder}");
+    let file = t.file("Hidden.pdf", b"hidden").await;
+    for node in [folder["id"].as_str().unwrap(), file.as_str()] {
+        let (status, body) = t
+            .call(
+                &t.root,
+                Method::POST,
+                &format!("/api/nodes/{node}/inheritance"),
+                Some(json!({ "inherit": false })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        let (status, body) = t
+            .call(
+                &t.root,
+                Method::DELETE,
+                &format!("/api/nodes/{node}/access/user/{}", ann.id.0),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    }
+
+    for name in ["Secret.pdf", "Hidden.pdf"] {
+        let started = session_as(
+            &t.server,
+            &ann,
+            json!({ "parent": t.library, "name": name, "on_conflict": "replace" }),
+            b"mine",
+        )
+        .await;
+        let (status, body) = call(
+            &t.server,
+            &ann,
+            Method::POST,
+            &format!("/api/uploads/{}/finish", started["id"].as_str().unwrap()),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{name}: {body}");
+    }
+}
+
+/// Names Windows reserves for devices get `_` after their first part, and the answer says so.
+#[tokio::test]
+async fn reserved_windows_names_cleaned() {
+    let t = team().await;
+    for (asked, cleaned) in [
+        ("con.pdf", "con_.pdf"),
+        ("LPT1.backup.pdf", "LPT1_.backup.pdf"),
+        ("Nul .pdf", "Nul_.pdf"),
+    ] {
+        let (status, body) = t.upload(&t.library, asked, b"device").await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(body["name"], cleaned);
+        assert_eq!(body["renamed"]["from"], asked);
+    }
+    let (status, body) = t.upload(&t.library, "Console.pdf", b"not a device").await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert!(body["renamed"].is_null());
+}

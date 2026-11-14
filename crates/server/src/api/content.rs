@@ -26,7 +26,7 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use collab_core::ids::{DocId, NodeId};
 use futures_util::Stream;
-use records::{AccessError, Editor, QuotaError, Reservation, User};
+use records::{AccessError, Editor, NameConflict, QuotaError, Reservation, User};
 use revisions::{
     Author, BlobRef, Checkpoint, CheckpointError, Content, Outcome, RevisionId, Stored,
 };
@@ -51,6 +51,8 @@ use crate::{AppState, auth::Signed};
 const SEAT_HEADER: &str = "x-sharecraft-seat";
 /// The response header naming the revision a download holds.
 const REVISION_HEADER: &str = "x-sharecraft-revision";
+/// How many times a kept-both upload picks its name again when it is taken meanwhile.
+const NAME_ATTEMPTS: usize = 5;
 /// How much of a file a download reads and sends at a time.
 const DOWNLOAD_CHUNK: usize = 64 * 1024;
 
@@ -159,6 +161,57 @@ pub(super) async fn reserve_held(
             })
         }
     }
+}
+
+/// Refuses with `507 quota_exceeded`, before the body is read, a request whose body cannot fit
+/// in `site`: its declared `Content-Length`, or one byte when it declares none, beyond what the
+/// site's quota leaves. The bytes are reserved once they are stored.
+async fn room_for_body(
+    state: &AppState,
+    site: NodeId,
+    headers: &HeaderMap,
+) -> Result<(), ApiError> {
+    let declared = headers
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(1);
+    let usage = state
+        .db()
+        .site_usage(site)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?;
+    if usage.has_room(declared) {
+        Ok(())
+    } else {
+        Err(ApiError::QuotaExceeded)
+    }
+}
+
+/// `reservation`, moved to the site `node` is in now, if it was moved to another site since the
+/// bytes were reserved: `507 quota_exceeded` when that site has no room for them (the
+/// reservation given back).
+pub(super) async fn follow_node(
+    state: &AppState,
+    reservation: Reservation,
+    node: NodeId,
+) -> Result<Reservation, ApiError> {
+    let site = match site_of(state, node).await {
+        Ok(site) => site,
+        Err(e) => {
+            release(state.db(), reservation).await;
+            return Err(e);
+        }
+    };
+    if site == reservation.site() {
+        return Ok(reservation);
+    }
+    let moved = state.db().reserve_bytes(site, reservation.bytes()).await;
+    release(state.db(), reservation).await;
+    moved.map_err(|e| match e {
+        QuotaError::Exceeded => ApiError::QuotaExceeded,
+        QuotaError::Db(e) => ApiError::unavailable(&e),
+    })
 }
 
 /// The site `node` is in: `404` if there is no such node.
@@ -459,12 +512,21 @@ pub(crate) async fn save(
         return Ok(save_answer(refused));
     }
     let site = site_of(&state, doc.into()).await?;
+    room_for_body(&state, site, &headers).await?;
     let held = body_blob(&state, request).await?;
     let (held, reservation) = reserve_held(&state, site, held).await?;
 
     let reply = {
         let state = state.clone();
         to_completion(async move {
+            // Moved to another site while the body arrived: judged there.
+            let reservation = match follow_node(&state, reservation, doc.into()).await {
+                Ok(reservation) => reservation,
+                Err(e) => {
+                    discard(&state, held).await;
+                    return Err(e);
+                }
+            };
             let blob = held.blob();
             let reply = state.rooms().save_file(doc, user, &token, base, blob).await;
             // Saved or unchanged, a version names the content.
@@ -538,14 +600,28 @@ pub(crate) async fn upload(
         return Ok(answer);
     }
     let site = site_of(&state, parent).await?;
+    room_for_body(&state, site, request.headers()).await?;
     let held = body_blob(&state, request).await?;
     if held.blob().size == 0 {
         discard(&state, held).await;
         return Err(ApiError::BadRequest);
     }
     let (held, reservation) = reserve_held(&state, site, held).await?;
+    let keep_both = choice == Some(NameConflict::KeepBoth);
 
     to_completion(async move {
+        // Moved to another site while the body arrived: judged there.
+        let place = match &named {
+            Named::Replace { doc, .. } => (*doc).into(),
+            _ => parent,
+        };
+        let reservation = match follow_node(&state, reservation, place).await {
+            Ok(reservation) => reservation,
+            Err(e) => {
+                discard(&state, held).await;
+                return Err(e);
+            }
+        };
         let answer = match named {
             Named::New {
                 name: final_name,
@@ -553,7 +629,8 @@ pub(crate) async fn upload(
                 renamed,
             } => {
                 let created =
-                    create_uploaded(&state, &user, parent, &final_name, editor, held).await;
+                    create_uploaded(&state, &user, parent, &final_name, editor, held, keep_both)
+                        .await;
                 match created {
                     Ok(Created::Done { mut body, .. }) => {
                         let from = cleaned_from.as_deref().or(renamed.as_deref());
@@ -591,7 +668,9 @@ pub(super) enum Created {
 /// content `held` (already in the content store) as its first revision: the tree record and
 /// document row, then the revision, claimed before it is committed. Content of a document that
 /// is refused or fails is erased unless something else names it. If it cannot be stored after
-/// the document was made, the document stays, empty, and the answer is `503` naming it.
+/// the document was made, the document stays, empty, and the answer is `503` naming it. With
+/// `keep_both`, a name taken meanwhile is chosen again (the first free `name (2)`, `name (3)`
+/// …) rather than refused, so the upload is not lost.
 pub(super) async fn create_uploaded(
     state: &AppState,
     user: &User,
@@ -599,11 +678,27 @@ pub(super) async fn create_uploaded(
     name: &str,
     editor: Editor,
     held: Held,
+    keep_both: bool,
 ) -> Result<Created, ApiError> {
     let blob = held.blob();
     let id = DocId(Uuid::new_v4());
-    let created =
-        tree::create_document(state, user, parent, id, name, editor, Some(blob.size)).await;
+    let mut name = name.to_owned();
+    let mut created =
+        tree::create_document(state, user, parent, id, &name, editor, Some(blob.size)).await;
+    for _ in 0..NAME_ATTEMPTS {
+        if !(keep_both && matches!(created, Err(AccessError::NameTaken))) {
+            break;
+        }
+        name = match tree::suggest_name(state.db(), parent, &name, editor).await {
+            Ok(name) => name,
+            Err(e) => {
+                discard(state, held).await;
+                return Err(ApiError::unavailable(&e));
+            }
+        };
+        created =
+            tree::create_document(state, user, parent, id, &name, editor, Some(blob.size)).await;
+    }
     let document = match created {
         Ok(document) => document,
         Err(e) => {

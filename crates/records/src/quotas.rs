@@ -6,7 +6,8 @@
 //! reserves its bytes ([`Db::reserve_bytes`]) with the site's row locked `FOR UPDATE`, refused
 //! (`QuotaError::Exceeded`) when the site would go over its quota; once its commit is in, the
 //! reservation becomes usage, and a failure releases it. An open upload session holds its
-//! declared size reserved. Checkpoints of the live text room are counted without being
+//! declared size reserved, not what it has received so far: a session that is abandoned without
+//! being ended holds that quota until it is swept, a day after its last chunk. Checkpoints of the live text room are counted without being
 //! reserved ([`Db::add_usage`]): they are never refused.
 //!
 //! Locking order (extending the tree's): node rows, then link rows, then `site_usage` rows by
@@ -44,6 +45,12 @@ pub struct SiteUsage {
 }
 
 impl SiteUsage {
+    /// Whether `bytes` more fit under the quota, with what is used and reserved.
+    #[must_use]
+    pub fn has_room(&self, bytes: u64) -> bool {
+        fits(self.used, self.reserved, self.quota, bytes)
+    }
+
     /// Whether the site has used [`QUOTA_WARNING_PERCENT`] of its quota or more.
     #[must_use]
     pub fn near_quota(&self) -> bool {
@@ -167,11 +174,24 @@ pub(crate) async fn change_reserved(
     site: NodeId,
     delta: i64,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query("update site_usage set reserved = greatest(reserved + $2, 0) where site_id = $1")
-        .bind(site.0)
-        .bind(delta)
-        .execute(conn)
-        .await?;
+    // The row is locked by the update; the value before it tells whether it went below zero.
+    let clamped: Option<bool> = sqlx::query_scalar(
+        "with before as (select reserved from site_usage where site_id = $1 for update) \
+         update site_usage set reserved = greatest(site_usage.reserved + $2, 0) \
+         from before where site_id = $1 returning before.reserved + $2 < 0",
+    )
+    .bind(site.0)
+    .bind(delta)
+    .fetch_optional(conn)
+    .await?;
+    if clamped == Some(true) {
+        // Reservations were given back that were never made: a fault, not a refusal. The
+        // count stays at zero; the next start sets it from the open sessions again.
+        eprintln!(
+            "sharecraft-server: warning: the reserved bytes of site {} would have gone below zero",
+            site.0
+        );
+    }
     Ok(())
 }
 
@@ -239,11 +259,16 @@ async fn versions_size(conn: &mut PgConnection, ids: &[Uuid]) -> Result<i64, sql
     .await
 }
 
-/// Applies `changes` to the usage rows [`usage_changes`] locked.
+/// Applies `changes` to the usage rows [`usage_changes`] locked. With `judged` (a person's
+/// change, not a mirror of what Git already holds), a move into a site without room for the
+/// versions' bytes under its quota is refused (`QuotaExceeded`), and the caller rolls the change
+/// back; purges are never refused. A purge of a document with a version whose size is not
+/// recorded yet gives back only what is known and flags the usage for a rebuild.
 pub(crate) async fn apply_usage_changes(
     conn: &mut PgConnection,
     changes: &UsageChanges,
-) -> Result<(), sqlx::Error> {
+    judged: bool,
+) -> Result<(), AccessError> {
     let add = |site: NodeId, delta: i64| {
         sqlx::query("update site_usage set used = greatest(used + $2, 0) where site_id = $1")
             .bind(site.0)
@@ -252,9 +277,36 @@ pub(crate) async fn apply_usage_changes(
     for (site, ids) in &changes.freed {
         let bytes = versions_size(&mut *conn, ids).await?;
         add(*site, -bytes).execute(&mut *conn).await?;
+        let unknown: bool = sqlx::query_scalar(
+            "select exists (select 1 from revisions where document_id = any($1) and size is null)",
+        )
+        .bind(ids)
+        .fetch_one(&mut *conn)
+        .await?;
+        if unknown {
+            sqlx::query("insert into usage_flags (name) values ($1) on conflict do nothing")
+                .bind(USAGE_DIRTY)
+                .execute(&mut *conn)
+                .await?;
+        }
     }
     for ((from, to), ids) in &changes.moved {
         let bytes = versions_size(&mut *conn, ids).await?;
+        if judged {
+            let (used, reserved, quota): (i64, i64, Option<i64>) =
+                sqlx::query_as("select used, reserved, quota from site_usage where site_id = $1")
+                    .bind(to.0)
+                    .fetch_one(&mut *conn)
+                    .await?;
+            if !fits(
+                bytes_of(used),
+                bytes_of(reserved),
+                quota.map(bytes_of),
+                bytes_of(bytes),
+            ) {
+                return Err(AccessError::QuotaExceeded);
+            }
+        }
         add(*from, -bytes).execute(&mut *conn).await?;
         add(*to, bytes).execute(&mut *conn).await?;
     }
@@ -378,6 +430,51 @@ impl Db {
         .execute(self.pool())
         .await?;
         Ok(())
+    }
+
+    /// Moves the reservation of upload session `id` to `site`, where what it makes now goes
+    /// (its file or folder was moved to another site meanwhile): refused (`Exceeded`), changing
+    /// nothing and leaving the session open, when `site` has no room for its declared size.
+    /// Both sites' usage rows are locked, by site id, before the session's row. Whether the
+    /// session still exists.
+    pub async fn move_upload(&self, id: Uuid, site: NodeId) -> Result<bool, QuotaError> {
+        let before: Option<Uuid> =
+            sqlx::query_scalar("select site_id from upload_sessions where id = $1")
+                .bind(id)
+                .fetch_optional(self.pool())
+                .await?;
+        let Some(before) = before.map(NodeId) else {
+            return Ok(false);
+        };
+        if before == site {
+            return Ok(true);
+        }
+        let mut tx = self.pool().begin().await?;
+        lock_usage(&mut tx, &[before, site]).await?;
+        let size: Option<i64> = sqlx::query_scalar(
+            "select size from upload_sessions where id = $1 and site_id = $2 for update",
+        )
+        .bind(id)
+        .bind(before.0)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(size) = size else {
+            // Ended, or moved by another request meanwhile: that one has settled it.
+            return Ok(self.upload_session(id).await?.is_some());
+        };
+        let there = locked_usage(&mut tx, site).await?;
+        if !there.has_room(bytes_of(size)) {
+            return Err(QuotaError::Exceeded);
+        }
+        change_reserved(&mut tx, before, -size).await?;
+        change_reserved(&mut tx, site, size).await?;
+        sqlx::query("update upload_sessions set site_id = $2 where id = $1")
+            .bind(id)
+            .bind(site.0)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(true)
     }
 
     /// Drops every reservation but those of the open upload sessions, which are set aside again:

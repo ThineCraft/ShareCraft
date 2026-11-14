@@ -8,7 +8,9 @@
 //!   seat as `being_edited`). A new file's name is trimmed and its refused characters become
 //!   `_`; the answer then says so (`renamed {from, to}`). The size is checked against the
 //!   largest file allowed and reserved against the site's quota while the session is open
-//!   (`507 quota_exceeded` when it has no room), and a person has at most
+//!   (`507 quota_exceeded` when it has no room): the declared size, however little has been
+//!   received, so a session left open holds that quota until it is finished, abandoned or swept
+//!   a day after its last chunk. A person has at most
 //!   [`records::UPLOADS_PER_PERSON`] sessions open (`too_many_uploads`). `on_conflict`
 //!   (`replace`, `keep_both` or `skip`) says now what to do if the name is taken at the finish.
 //! - `PUT /api/uploads/{id}` with `Content-Range: bytes <start>-<end>/<size>` appends one
@@ -54,8 +56,8 @@ use axum::response::{IntoResponse, Response};
 use collab_core::ids::{DocId, NodeId};
 use futures_util::StreamExt;
 use records::{
-    AccessError, Editor, NameConflict, NewEvent, NewUpload, NodeKind, QuotaError, Reservation,
-    UploadError, UploadSession, UploadTarget, User,
+    AccessError, Editor, NameConflict, NewEvent, NewUpload, NodeKind, Perms, QuotaError,
+    Reservation, UploadError, UploadSession, UploadTarget, User,
 };
 use revisions::{BlobError, BlobRef, RevisionId, parse_hex};
 use serde::Deserialize;
@@ -312,6 +314,16 @@ async fn replace_target(
             renamed: None,
         });
     };
+    // An item the person cannot see answers as nothing replaceable there would, before its
+    // kind could tell anything about it.
+    let visible = db
+        .effective_access(user.id, node.id)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?
+        .is_some_and(|access| access.perms.contains(Perms::VIEW));
+    if !visible {
+        return Err(ApiError::NotFound);
+    }
     if node.kind != NodeKind::Document {
         return Err(ApiError::WrongPlace);
     }
@@ -917,6 +929,7 @@ pub(crate) async fn finish(
         }
         // Kept until the session ends, in case a check below refuses.
         progress.hashed = Some((session.size, hasher));
+        follow_site(&state, &session).await?;
 
         match session.target {
             UploadTarget::NewFile { parent } => {
@@ -967,6 +980,34 @@ async fn adopt(
     }
 }
 
+/// Moves the session's reservation to the site where what it makes now goes, when its folder
+/// or file was moved to another site since it started: `507 quota_exceeded` when that site has
+/// no room for it, the session left open and reserved where it was.
+async fn follow_site(state: &AppState, session: &UploadSession) -> Result<(), ApiError> {
+    let place = match session.target {
+        UploadTarget::NewFile { parent } => parent,
+        UploadTarget::NewVersion { doc } => doc.into(),
+    };
+    let Some(node) = state
+        .db()
+        .node(place)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?
+    else {
+        // Gone: the checks below answer it.
+        return Ok(());
+    };
+    if node.site == session.site {
+        return Ok(());
+    }
+    match state.db().move_upload(session.id, node.site).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(ApiError::NotFound),
+        Err(QuotaError::Exceeded) => Err(ApiError::QuotaExceeded),
+        Err(QuotaError::Db(e)) => Err(ApiError::unavailable(&e)),
+    }
+}
+
 /// Finishes a session making a new file in `parent` with the content `blob`, its name settled
 /// as `choice` says when it is taken (see [`settle_name`]).
 async fn finish_new_file(
@@ -999,7 +1040,8 @@ async fn finish_new_file(
         }
     };
     let (held, reservation) = adopt(state, session, blob).await?;
-    let created = create_uploaded(state, user, parent, &name, editor, held).await;
+    let keep_both = choice == Some(NameConflict::KeepBoth);
+    let created = create_uploaded(state, user, parent, &name, editor, held, keep_both).await;
     // A version written was counted with its commit.
     release(state.db(), reservation).await;
     Ok(match created? {

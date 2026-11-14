@@ -2209,8 +2209,9 @@ fn find_home(tree: &[TreeRecord]) -> Option<(NodeId, NodeId)> {
 }
 
 /// `name` made acceptable as a node name: refused and control characters become `_`, as does
-/// a trailing dot; an empty name becomes "Untitled"; a long one is shortened before its
-/// extension.
+/// a trailing dot (after trailing spaces are trimmed); a name Windows keeps for a device gets
+/// `_` after its first part (see [`not_a_device`]); an empty name becomes "Untitled"; a long one
+/// is shortened before its extension.
 pub(crate) fn clean_name(name: &str, editor: Editor) -> String {
     let replaced: String = name
         .trim()
@@ -2228,6 +2229,7 @@ pub(crate) fn clean_name(name: &str, editor: Editor) -> String {
         cleaned.pop();
         cleaned.push('_');
     }
+    let cleaned = not_a_device(&cleaned);
     let (stem, extension) = split_extension(&cleaned, editor);
     let stem = if stem.trim().is_empty() {
         "Untitled"
@@ -2237,8 +2239,32 @@ pub(crate) fn clean_name(name: &str, editor: Editor) -> String {
     fit(stem, extension, "")
 }
 
+/// The names Windows keeps for devices, whatever follows them after a dot.
+const DEVICE_NAMES: [&str; 22] = [
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// `name`, with `_` after its first part (up to the first dot, without trailing spaces) when
+/// that part is a name Windows keeps for a device, in any case: `con.txt` becomes `con_.txt`,
+/// so the file can be saved on Windows.
+fn not_a_device(name: &str) -> String {
+    let first = name.split('.').next().unwrap_or_default();
+    let base = first.trim_end();
+    if DEVICE_NAMES
+        .iter()
+        .any(|device| device.eq_ignore_ascii_case(base))
+    {
+        let rest = name.get(base.len()..).unwrap_or_default();
+        format!("{base}_{rest}")
+    } else {
+        name.to_owned()
+    }
+}
+
 /// `name` made acceptable as a folder name: refused and control characters become `_`, as does
-/// a trailing dot; an empty name becomes "Untitled"; a long one is shortened.
+/// a trailing dot (after trailing spaces are trimmed); a name Windows keeps for a device gets
+/// `_` after its first part; an empty name becomes "Untitled"; a long one is shortened.
 fn clean_folder_name(name: &str) -> String {
     let replaced: String = name
         .trim()
@@ -2259,7 +2285,7 @@ fn clean_folder_name(name: &str) -> String {
     if cleaned.is_empty() {
         return "Untitled".to_owned();
     }
-    fit(&cleaned, "", "")
+    fit(&not_a_device(&cleaned), "", "")
 }
 
 /// `name`, or the first of `name (2)`, `name (3)` … (before the extension) that `taken`, which
@@ -2433,6 +2459,19 @@ fn to_row(record: &TreeRecord) -> Result<NodeRow, String> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reserved_device_names_get_an_underscore() {
+        assert_eq!(clean_name("CON.txt", Editor::Text), "CON_.txt");
+        assert_eq!(clean_name("com1.tar.txt", Editor::Text), "com1_.tar.txt");
+        assert_eq!(clean_name("nul", Editor::Text), "nul_");
+        assert_eq!(clean_name("aux .txt", Editor::Text), "aux_.txt");
+        assert_eq!(clean_name("lpt9. ", Editor::Text), "lpt9_");
+        assert_eq!(clean_name("COM0.txt", Editor::Text), "COM0.txt");
+        assert_eq!(clean_name("CONSOLE.txt", Editor::Text), "CONSOLE.txt");
+        assert_eq!(clean_folder_name("Prn"), "Prn_");
+        assert_eq!(clean_folder_name("notes. . "), "notes. _");
+    }
 
     #[test]
     fn names_are_cleaned_and_made_unique() {
