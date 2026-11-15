@@ -472,3 +472,64 @@ body.dragging .drop-overlay{display:flex}
 @media (forced-colors:active){
  .menu [role=menuitem]:focus{outline:2px solid CanvasText}
 }
+/* library page: the file table. Type icons are inline SVG coloured here, each at 3:1 or more on
+   the row (paper, band and hover) in light and dark. Under 700 pixels the table folds to the name
+   with a second line; the folded cells stay for screen readers */
+.files{width:100%;border-collapse:collapse;margin:0 0 12px;border-top:1px solid var(--line)}
+.files th,.files td{padding:6px 8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:middle}
+.files th{font-size:12px;font-weight:600;color:var(--muted);white-space:nowrap}
+.files tbody tr:nth-child(even){background:var(--band)}
+.files tbody tr:hover{background:var(--soft)}
+.files .c-select,.files .c-actions{width:1%;white-space:nowrap}
+.files .c-select input{display:block;width:20px;height:20px;margin:0}
+.files .c-modified,.files .c-type{width:1%;white-space:nowrap;font-size:13px;color:var(--muted)}
+.files .c-modified time{color:var(--text)}
+.files .c-sharing{width:1%;white-space:nowrap}
+.files .c-sharing .mark+.mark{margin-left:4px}
+.files .none{color:var(--muted)}
+.files button.sort{min-height:32px;padding:2px 6px;margin:0 -6px;border:0;border-radius:6px;background:transparent;color:var(--muted);font-weight:600;font-size:12px;gap:4px}
+.files button.sort:hover{background:var(--soft);color:var(--text)}
+.files th[aria-sort] button.sort{color:var(--text)}
+.sort-arrow{font-size:10px;min-width:10px}
+.name-cell{display:flex;align-items:center;gap:10px;min-width:0}
+.name-text{display:flex;flex-wrap:wrap;align-items:center;gap:2px 8px;min-width:0}
+.files a.name-link{font-weight:600;color:var(--text);text-decoration:none;overflow-wrap:anywhere}
+.files a.name-link:hover,.files a.name-link:focus-visible{color:var(--accent-ink);text-decoration:underline}
+.files .sub{display:none}
+.file-pic{display:grid;place-items:center;width:28px;height:28px;flex:none;border-radius:5px;overflow:hidden}
+.file-pic img{width:100%;height:100%;object-fit:cover;border:1px solid var(--line);border-radius:5px;background:var(--sheet)}
+.file-icon{display:block;width:24px;height:24px}
+.file-icon .fill{fill:var(--ic)}
+.file-icon .fold{fill:none;stroke:var(--icon-ink);stroke-width:1.2;opacity:.55}
+.file-icon .ink{fill:var(--icon-ink)}
+.file-icon .line{fill:none;stroke:var(--icon-ink);stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round}
+.file-icon{--icon-ink:light-dark(#fff,#172023)}
+.k-folder{--ic:light-dark(#9a6200,#f0b44c)}
+.k-text{--ic:light-dark(#55656d,#b4c2c9)}
+.k-word{--ic:light-dark(#2556c4,#8fb0ff)}
+.k-sheet{--ic:light-dark(#1b7a43,#6fd39b)}
+.k-pdf{--ic:light-dark(#c02a1e,#ff9b8f)}
+.k-model{--ic:light-dark(#6d47c2,#c3a6ff)}
+.k-image{--ic:light-dark(#ad2f7a,#f59ac8)}
+.k-audio{--ic:light-dark(#0b7480,#6dd6e3)}
+.k-video{--ic:light-dark(#b84a00,#ffab70)}
+.k-archive{--ic:light-dark(#7d5a3c,#d9b48f)}
+.k-file{--ic:light-dark(#5d6d75,#afbdc4)}
+.sort-narrow{display:none!important;align-items:center;gap:8px;margin:0 0 8px}
+.sort-narrow select{min-height:44px;flex:1;max-width:260px}
+.files .menu-button.dots{min-width:36px;min-height:32px;padding:2px 8px;font-size:18px;line-height:1;letter-spacing:1px}
+@media (max-width:699px){
+ .files thead{display:none}
+ .files tbody :is(.c-modified,.c-type,.c-sharing){position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap;border:0}
+ .sort-narrow:not([hidden]){display:flex!important}
+ .files .sub{display:flex;flex-wrap:wrap;align-items:center;gap:2px 8px;flex-basis:100%;font-size:12px;color:var(--muted)}
+ .files .sub>span+span::before{content:"·";margin-right:8px}
+ .files td{padding:8px 6px}
+ .files .c-select input{width:24px;height:24px}
+ .files .menu-button.dots{min-width:44px;min-height:44px}
+}
+@media (forced-colors:active){
+ .file-icon .fill{fill:CanvasText}
+ .file-icon .ink{fill:Canvas}
+ .file-icon .line,.file-icon .fold{stroke:Canvas}
+}

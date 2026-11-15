@@ -7,7 +7,7 @@
 <link rel="stylesheet" href="./style.css">
 </head>
 <body>
-<div class="page">
+<div class="page wide">
  <nav class="topbar" aria-label="Account">
   <a href="/">Sites</a>
   <span id="who" class="meta"></span>
@@ -64,7 +64,33 @@
   <strong id="bulk-headline"></strong>
  </p>
  <ul id="bulk-results" class="list" hidden></ul>
- <ul id="items" class="list" aria-labelledby="items-heading"></ul>
+ <p id="sort-status" class="visually-hidden" role="status" aria-live="polite"></p>
+ <p id="sort-note" class="meta" hidden></p>
+ <div id="sort-narrow" class="sort-narrow" hidden>
+  <label for="sort-select">Sort by</label>
+  <select id="sort-select">
+   <option value="name:ascending">Name, A to Z</option>
+   <option value="name:descending">Name, Z to A</option>
+   <option value="modified:descending">Modified, newest first</option>
+   <option value="modified:ascending">Modified, oldest first</option>
+   <option value="type:ascending">Type, A to Z</option>
+   <option value="type:descending">Type, Z to A</option>
+  </select>
+ </div>
+ <table id="file-table" class="files" aria-labelledby="items-heading" hidden>
+  <thead>
+   <tr>
+    <th scope="col" class="c-select"><span class="visually-hidden">Select</span></th>
+    <th scope="col" class="c-name" data-sort="name"><button type="button" class="sort" data-sort="name">Name<span class="sort-arrow" aria-hidden="true"></span></button></th>
+    <th scope="col" class="c-modified" data-sort="modified"><button type="button" class="sort" data-sort="modified">Modified<span class="sort-arrow" aria-hidden="true"></span></button></th>
+    <th scope="col" class="c-type" data-sort="type"><button type="button" class="sort" data-sort="type">Type<span class="sort-arrow" aria-hidden="true"></span></button></th>
+    <th scope="col" class="c-sharing">Sharing</th>
+    <th scope="col" class="c-actions"><span class="visually-hidden">Actions</span></th>
+   </tr>
+  </thead>
+  <tbody id="file-rows"></tbody>
+ </table>
+ <ul id="items" class="list" aria-labelledby="items-heading" hidden></ul>
  <p id="empty" hidden>There is nothing here yet.</p>
  <p><button type="button" id="more" class="plain" hidden>Show more</button></p>
 </div>

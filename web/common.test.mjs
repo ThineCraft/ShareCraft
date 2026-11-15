@@ -1567,6 +1567,13 @@ test('thumbnails_load_their_route_and_survive_a_redraw', async () => {
   await noneImg.listeners.error();
   assert.equal(none.children[0].attributes.class, 'placeholder');
   assert.equal(none.children[0].textContent, 'No thumbnail');
+
+  // A row gives its own fallback: the file's type icon instead of the placeholder words.
+  const row = picture();
+  const icon = { tag: 'svg' };
+  const rowImg = libs.showThumbnail(row, url, { doc, load: async () => null, fallback: () => icon });
+  await rowImg.listeners.error();
+  assert.equal(row.children[0], icon);
 });
 
 // ---- the site's look: header, footer, vertical navigation, site cards and the frame bar ----

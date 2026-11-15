@@ -46,6 +46,7 @@ import {
   uploadsSummary,
 } from './upload.js';
 import { setupMenu } from './menu.js';
+import { fileIcon, fileKind, nextSort, parseSort, relativeTime, sortDescription, sortEntries, typeLabel } from './files.js';
 
 const BULK_MAX = 500;
 const GRID_PAGE = 200; // the grid's page, the most the server answers at once
@@ -134,9 +135,13 @@ let watcher = null; // loads a tile's thumbnail when it scrolls into view
 let templates = [];
 let creating = null; // what the create dialog makes: 'folder', 'doc:<editor>' or 'template'
 let actionsFor = null; // the item whose Actions menu was used last, so focus can go back to it
+let sort = loadSort(); // the list's order, remembered per viewer
 
 $('more').addEventListener('click', () => loadPage());
 setupViews();
+setupSort();
+// "5 minutes ago" moves on while the page stays open.
+setInterval(refreshTimes, 60_000);
 await setupTemplates();
 setupNewMenu();
 $('select-all').addEventListener('change', () => {
@@ -177,15 +182,81 @@ function render() {
   watcher?.disconnect();
   watcher = null;
   const grid = view === 'grid';
+  const lostFocus =
+    document.activeElement === document.body ||
+    $('items').contains(document.activeElement) ||
+    $('file-rows').contains(document.activeElement);
+  // The grid of an image library is a list of tiles; the list is a table that sorts.
   $('items').classList.toggle('grid', grid);
-  const lostFocus = document.activeElement === document.body || $('items').contains(document.activeElement);
-  $('items').replaceChildren(...items.map(grid ? tile : row));
+  $('items').hidden = !grid;
+  $('file-table').hidden = grid || items.length === 0;
+  $('items').replaceChildren(...(grid ? items.map(tile) : []));
+  $('file-rows').replaceChildren(...(grid ? [] : sortEntries(items, sort.key, sort.direction).map(row)));
+  showSort();
   showSelection();
   // After a rename (or anything else chosen from a row's menu) focus goes back to that row's
   // Actions button, when the row is still there and focus has not gone anywhere else.
   if (lostFocus && actionsFor) {
-    const again = [...$('items').querySelectorAll('button[data-for]')].find((b) => b.dataset.for === actionsFor);
+    const again = [...document.querySelectorAll('#items button[data-for], #file-rows button[data-for]')].find(
+      (b) => b.dataset.for === actionsFor,
+    );
     again?.focus();
+  }
+}
+
+// ---- sorting the list ----
+
+function loadSort() {
+  try {
+    return parseSort(localStorage.getItem('sharecraft-library-sort'));
+  } catch {
+    return parseSort(null); // no storage: by name
+  }
+}
+
+/** The column headers sort on wide screens; a Sort by list does the same on narrow ones. */
+function setupSort() {
+  for (const button of $('file-table').querySelectorAll('button.sort')) {
+    button.addEventListener('click', () => sortBy(nextSort(sort, button.dataset.sort)));
+  }
+  $('sort-select').addEventListener('change', () => {
+    const [key, direction] = $('sort-select').value.split(':');
+    sortBy(parseSort({ key, direction }));
+  });
+}
+
+function sortBy(chosen) {
+  sort = chosen;
+  try {
+    localStorage.setItem('sharecraft-library-sort', JSON.stringify(sort));
+  } catch {
+    // not remembered; the list is still sorted
+  }
+  render();
+  $('sort-status').textContent = sortDescription(sort);
+}
+
+/** Marks the sorted column (aria-sort and its arrow) and says when only part is loaded. */
+function showSort() {
+  for (const th of $('file-table').querySelectorAll('th[data-sort]')) {
+    const on = th.dataset.sort === sort.key;
+    if (on) th.setAttribute('aria-sort', sort.direction);
+    else th.removeAttribute('aria-sort');
+    th.querySelector('.sort-arrow').textContent = on ? (sort.direction === 'ascending' ? '▲' : '▼') : '';
+  }
+  $('sort-narrow').hidden = $('file-table').hidden;
+  $('sort-select').value = `${sort.key}:${sort.direction}`;
+  const partial = view === 'list' && next !== null && (sort.key !== 'name' || sort.direction !== 'ascending');
+  $('sort-note').hidden = !partial;
+  $('sort-note').textContent = partial
+    ? `Sorted among the ${items.length} items loaded so far. Show more loads the rest.`
+    : '';
+}
+
+/** Rewrites every "5 minutes ago" from the time it stands for. */
+function refreshTimes() {
+  for (const time of $('file-rows').querySelectorAll('time[data-at]')) {
+    time.textContent = relativeTime(time.dataset.at);
   }
 }
 
@@ -253,7 +324,7 @@ function placeholder(item) {
 
 function watchThumbnail(picture) {
   if (!('IntersectionObserver' in globalThis)) {
-    showThumbnail(picture, thumbnailUrl(picture));
+    showThumbnail(picture, thumbnailUrl(picture), thumbnailOptions(picture));
     return;
   }
   watcher ??= new IntersectionObserver(
@@ -261,7 +332,7 @@ function watchThumbnail(picture) {
       for (const entry of entries) {
         if (!entry.isIntersecting) continue;
         watcher?.unobserve(entry.target);
-        showThumbnail(entry.target, thumbnailUrl(entry.target));
+        showThumbnail(entry.target, thumbnailUrl(entry.target), thumbnailOptions(entry.target));
       }
     },
     { rootMargin: '200px' },
@@ -272,6 +343,12 @@ function watchThumbnail(picture) {
 /** The thumbnail route of a tile's box (a declaration: tiles are drawn before this line runs). */
 function thumbnailUrl(picture) {
   return `/api/docs/${seg(picture.dataset.id)}/thumbnail`;
+}
+
+/** A row's picture falls back to its type icon; a tile's to the placeholder words. */
+function thumbnailOptions(picture) {
+  const kind = picture.dataset.icon;
+  return kind ? { fallback: () => fileIcon(kind) } : {};
 }
 
 // ---- New from template ----
@@ -313,13 +390,9 @@ function kindLabel(item) {
   return Object.hasOwn(EDITORS, item.editor) ? EDITORS[item.editor].name : 'File';
 }
 
+/** A row of the file table: select box, icon and name, modified, type, sharing and Actions. */
 function row(item) {
-  const saved =
-    item.kind === 'document'
-      ? item.revised_at
-        ? `Last saved ${formatDate(item.revised_at)}`
-        : 'Not saved yet'
-      : null;
+  const kind = fileKind(item.name, item.editor, item.kind);
   const box =
     item.kind === 'library'
       ? null
@@ -329,26 +402,71 @@ function row(item) {
     else selected.delete(item.id);
     showSelection();
   });
+  // The icon; for an image its thumbnail once it scrolls into view (the icon until then, and
+  // again should no thumbnail come).
+  const picture = h('span', { class: 'file-pic', 'aria-hidden': 'true' }, fileIcon(kind));
+  if (item.thumbnail) {
+    picture.dataset.id = item.id;
+    picture.dataset.icon = kind;
+    watchThumbnail(picture);
+  }
+  const type = typeLabel(item);
+  const modified = modifiedCell(item);
   return h(
-    'li',
+    'tr',
     {},
-    box,
+    h('td', { class: 'c-select' }, box),
     h(
-      'span',
-      { class: 'grow' },
-      h('a', { href: pageFor(item.kind, item.id, item.editor) }, item.name),
+      'td',
+      { class: 'c-name' },
       h(
-        'span',
-        { class: 'details' },
-        h('small', {}, kindLabel(item)),
-        saved && h('small', {}, saved),
-        item.access ? null : h('small', { class: 'mark' }, 'Limited access'),
-        item.inherits || item.kind === 'library' ? null : h('small', { class: 'mark' }, 'Own permissions'),
-        ...itemMarks(item).map((mark) => h('small', { class: 'mark warn' }, mark)),
+        'div',
+        { class: 'name-cell' },
+        picture,
+        h(
+          'div',
+          { class: 'name-text' },
+          h('a', { href: pageFor(item.kind, item.id, item.editor), class: 'name-link' }, item.name),
+          ...itemMarks(item).map((mark) => h('small', { class: 'mark warn' }, mark)),
+          // The narrow layout's second line; screen readers get the same from the cells.
+          h(
+            'span',
+            { class: 'sub', 'aria-hidden': 'true' },
+            h('span', {}, type),
+            modified.short ? h('span', {}, modified.short) : null,
+            ...sharingMarks(item),
+          ),
+        ),
       ),
     ),
-    actionsMenu(item),
+    h('td', { class: 'c-modified' }, ...modified.nodes),
+    h('td', { class: 'c-type' }, type),
+    h('td', { class: 'c-sharing' }, ...sharingMarks(item)),
+    h('td', { class: 'c-actions' }, actionsMenu(item)),
   );
+}
+
+/** The Modified cell: "5 minutes ago", with the exact time in its title and for screen readers. */
+function modifiedCell(item) {
+  if (item.kind !== 'document') return { nodes: [h('span', { class: 'none', 'aria-hidden': 'true' }, '—')], short: '' };
+  if (!item.revised_at) return { nodes: [h('span', { class: 'meta' }, 'Not saved yet')], short: 'Not saved yet' };
+  const exact = formatDate(item.revised_at);
+  const words = relativeTime(item.revised_at);
+  return {
+    nodes: [
+      h('time', { datetime: item.revised_at, title: exact, 'data-at': item.revised_at }, words),
+      h('span', { class: 'visually-hidden' }, ` (${exact})`),
+    ],
+    short: words,
+  };
+}
+
+/** The Sharing column's badges: own permissions, and the person's limited access. */
+function sharingMarks(item) {
+  return [
+    item.access ? null : h('small', { class: 'mark' }, 'Limited access'),
+    item.inherits || item.kind === 'library' ? null : h('small', { class: 'mark own' }, 'Own permissions'),
+  ].filter(Boolean);
 }
 
 /** A row's Actions menu ("⋯"): Rename, Move…, Copy…, Delete and Access, as far as allowed. */

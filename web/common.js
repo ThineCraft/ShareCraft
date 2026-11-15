@@ -1091,6 +1091,11 @@ export function setRegional({ language, timeZone } = {}) {
   if (root && regional.language) root.lang = regional.language;
 }
 
+/** The page's language and time zone as set by [`setRegional`] (either may be undefined). */
+export function regionalSettings() {
+  return { ...regional };
+}
+
 /**
  * A time from the server (RFC 3339, UTC) as a date and time in `language` and `timeZone`, with
  * the zone's short name: `14 Nov 2026, 15:04 GMT`. Either left out is the page's own (see
@@ -2132,10 +2137,11 @@ export async function loadThumbnail(url, { fetch = globalThis.fetch, wait = slee
  * the route itself: the pages' policy takes images from their own origin only, so a `blob:`
  * URL would show as a broken image. Should the image fail, the route is asked once more through
  * `load` ({@link loadThumbnail}), which waits out a busy server: the image again when it then
- * answers, the plain placeholder otherwise. Nothing is drawn into a box no longer in the page.
+ * answers, the plain placeholder otherwise (or what `fallback()` makes, such as a file's type
+ * icon). Nothing is drawn into a box no longer in the page.
  * `doc` makes the elements (the page's document; a test's stand-in).
  */
-export function showThumbnail(picture, url, { load = loadThumbnail, doc = globalThis.document } = {}) {
+export function showThumbnail(picture, url, { load = loadThumbnail, doc = globalThis.document, fallback = null } = {}) {
   const show = (retry) => {
     const img = doc.createElement('img');
     img.setAttribute('alt', '');
@@ -2147,6 +2153,10 @@ export function showThumbnail(picture, url, { load = loadThumbnail, doc = global
         if (!picture.isConnected) return;
         if (again) {
           show(false);
+          return;
+        }
+        if (fallback) {
+          picture.replaceChildren(fallback());
           return;
         }
         const none = doc.createElement('span');
