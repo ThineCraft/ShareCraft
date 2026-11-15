@@ -1000,3 +1000,50 @@ dialog input[type=password]{width:100%}
  .admin-link[aria-current=page]{box-shadow:none;outline:2px solid Highlight;outline-offset:-2px}
  .empty-state{border-color:CanvasText}
 }
+/* library page: the folder tree. A column at the left of the table from 1000 pixels when there is
+   room beside the table (and the details pane); otherwise behind the Folders button, above the
+   table. Rows are banded by the page (every second visible row) */
+.folder-pane{margin:0 0 12px;padding:8px 6px;border:1px solid var(--line);border-radius:10px;background:var(--paper);max-height:50vh;overflow:auto;min-width:0}
+.lib-body:not(.tree-col)>.folder-pane{grid-column:1/-1}
+.page .folder-pane .pane-title{margin:0 6px 6px;font-size:12px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
+.lib-body.tree-col{display:grid;grid-template-columns:220px minmax(0,1fr);gap:16px;align-items:start}
+.lib-body.tree-col>.folder-pane{position:sticky;top:12px;max-height:calc(100vh - 24px);margin:0}
+@media (min-width:1100px){
+ .details-open .lib-body.tree-col{grid-template-columns:200px minmax(0,1fr) minmax(300px,360px)}
+}
+[role=tree],[role=tree] [role=group]{list-style:none;margin:0;padding:0}
+[role=tree] li[role=treeitem]{outline:none}
+.tree-row{display:flex;align-items:center;gap:4px;min-height:32px;padding:2px 8px 2px calc(var(--level,0) * 16px + 2px);border-radius:6px;cursor:pointer;overflow-wrap:anywhere}
+.tree-row.band{background:var(--band)}
+.tree-row:hover{background:var(--soft)}
+li[role=treeitem]:focus-visible>.tree-row{outline:2px solid var(--accent-ink);outline-offset:-2px}
+li[role=treeitem][aria-selected=true]>.tree-row{background:var(--soft);font-weight:600;box-shadow:inset 3px 0 0 var(--accent-ink)}
+.twisty{display:grid;place-items:center;flex:none;width:22px;height:24px;color:var(--muted);font-size:12px}
+.tree-icon{display:grid;place-items:center;flex:none}
+.tree-icon .file-icon{width:18px;height:18px}
+.tree-name{min-width:0}
+.tree-loading{font-size:12px;margin-left:4px}
+@media (max-width:760px){
+ .tree-row{min-height:44px}
+ .folders-toggle{min-height:44px}
+}
+/* dragging items onto a folder row, a tree folder or a breadcrumb step; the hint says why not */
+.files tbody tr.drop-ok,.tree-row.drop-ok,.crumbs .drop-ok{outline:2px dashed var(--accent-ink);outline-offset:-2px;background:var(--soft)}
+.files tbody tr.drop-no,.tree-row.drop-no,.crumbs .drop-no{outline:2px dashed var(--stop-ink);outline-offset:-2px;cursor:no-drop}
+.files tbody tr.drag-source{opacity:.6}
+.drag-hint{position:fixed;left:50%;bottom:16px;z-index:90;max-width:calc(100% - 32px);margin:0;padding:8px 16px;transform:translateX(-50%);border:1px solid var(--accent-ink);border-radius:20px;background:var(--paper);color:var(--text);box-shadow:0 6px 20px rgb(0 0 0/.18);pointer-events:none}
+.drag-hint:empty{display:none}
+.drag-hint.no{border-color:var(--stop-ink);color:var(--stop-ink)}
+.drag-ghost{position:fixed;top:-200px;left:-200px;padding:6px 12px;border-radius:8px;background:var(--accent);color:var(--on-accent);font-weight:600;white-space:nowrap}
+/* cut and paste: the bar under the toolbar while items wait to be pasted */
+.cut-bar{display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px;margin:0 0 10px;padding:8px 12px;border:1px solid var(--accent-ink);border-radius:10px;background:var(--soft)}
+.cut-bar .grow{flex:1 1 200px;font-weight:600}
+.files tbody tr.cut .file-pic{opacity:.45}
+@media (max-width:760px){
+ .cut-bar button{min-height:44px}
+}
+@media (forced-colors:active){
+ .files tbody tr.drop-ok,.tree-row.drop-ok,.crumbs .drop-ok{outline-color:Highlight}
+ .files tbody tr.drop-no,.tree-row.drop-no,.crumbs .drop-no{outline-color:CanvasText}
+ li[role=treeitem][aria-selected=true]>.tree-row{outline:1px solid Highlight}
+}

@@ -50,6 +50,17 @@ import { runLatestAction, showToast } from './toast.js';
 import { buildUndo, isUndoKey, performUndo } from './undo.js';
 import { addPaletteActions } from './palette.js';
 import { createDetails } from './details.js';
+import {
+  ITEM_TYPE,
+  canDrop,
+  clipboardKey,
+  cutText,
+  dragList,
+  isFileDrag,
+  isItemDrag,
+  mountFolderTree,
+  parseCut,
+} from './tree.js';
 import { fileIcon, fileKind, nextSort, parseSort, relativeTime, sortDescription, sortEntries, typeLabel } from './files.js';
 
 const BULK_MAX = 500;
@@ -139,6 +150,14 @@ let templates = [];
 let creating = null; // what the create dialog makes: 'folder', 'doc:<editor>' or 'template'
 let actionsFor = null; // the item whose Actions menu was used last, so focus can go back to it
 let sort = loadSort(); // the list's order, remembered per viewer
+let tree = null; // the folder tree beside the table (see setupTree)
+let dragging = null; // the items being dragged onto a folder: { items, from }
+let dropAt = null; // the element marked as where a drag would land
+let ghost = null; // the small "3 items" picture under the pointer while dragging
+let expandTimer = 0; // opens a tree folder held under a drag
+let cut = loadCut(); // items cut with Ctrl+X, waiting to be pasted in another folder (kept for the tab)
+const MAC = /Mac|iPhone|iPad/.test(globalThis.navigator?.platform ?? '');
+const KEY_MOD = MAC ? { text: 'Command', aria: 'Meta' } : { text: 'Ctrl', aria: 'Control' };
 // The details pane beside the table (a sheet on narrow screens): preview, facts and access of
 // the selected row, with the row actions. Only for the list; the grid of an image library has none.
 const details = createDetails({
@@ -181,6 +200,8 @@ $('select-all').addEventListener('change', () => {
   render();
 });
 await reload();
+setupTree();
+markCrumbs();
 
 // ---- the listing ----
 
@@ -189,6 +210,7 @@ async function reload() {
   next = null;
   selected.clear();
   await loadPage();
+  tree?.refresh();
 }
 
 async function loadPage() {
@@ -222,6 +244,7 @@ function render() {
   $('file-rows').replaceChildren(...(grid ? [] : sortEntries(items, sort.key, sort.direction).map(row)));
   showSort();
   showSelection();
+  showCut();
   details.redraw();
   // After a rename (or anything else chosen from a row's menu) focus goes back to that row's
   // Actions button, when the row is still there and focus has not gone anywhere else.
@@ -405,6 +428,7 @@ function showSelection() {
   $('select-note').textContent = `Select all covers the ${choosable.length} items loaded so far. Use Show more to load the rest.`;
   const allowed = selectedItems().map(itemActions);
   $('bulk-move').disabled = state.count === 0 || !allowed.every((a) => a.move);
+  $('bulk-cut').disabled = $('bulk-move').disabled;
   $('bulk-copy').disabled = state.count === 0;
   $('bulk-delete').disabled = state.count === 0 || !allowed.every((a) => a.remove);
 }
@@ -474,6 +498,11 @@ function row(item) {
     h('td', { class: 'c-actions' }, actionsMenu(item)),
   );
   details.row(tr, item);
+  // A row the person may move can be dragged onto a folder (the link inside is not dragged on its own).
+  if (itemActions(item).move) {
+    tr.draggable = true;
+    tr.querySelector('a.name-link').draggable = false;
+  }
   return tr;
 }
 
@@ -519,10 +548,14 @@ function actionsMenu(item) {
   const menu = h(
     'ul',
     { class: 'menu end', id: `actions-${item.id}`, 'aria-label': `Actions for ${item.name}` },
-    ...entries.map((entry) => {
+    ...entries.flatMap((entry) => {
       if (entry === 'details') return choose('Details', () => details.show(item, { focus: true }));
       if (entry === 'rename') return choose('Rename', () => askRename(item));
-      if (entry === 'move') return choose('Move…', () => askMove([item], 'move'));
+      if (entry === 'move') {
+        const cutEntry = choose('Cut', () => cutItems([item]));
+        cutEntry.firstChild.setAttribute('aria-keyshortcuts', `${KEY_MOD.aria}+X`);
+        return [choose('Move to…', () => askMove([item], 'move')), cutEntry];
+      }
       if (entry === 'copy') return choose('Copy…', () => askMove([item], 'copy'));
       if (entry === 'delete') return choose('Delete', () => deleteItems([item]), true);
       return h('li', { role: 'none' }, h('a', { role: 'menuitem', href: `/access.html?id=${seg(item.id)}` }, 'Access'));
@@ -649,7 +682,8 @@ $('uploads-clear').addEventListener('click', () => {
 });
 
 // Files and folders dropped anywhere on the page go into this library or folder.
-const hasFiles = (event) => [...(event.dataTransfer?.types ?? [])].includes('Files');
+// Items dragged from the table carry their own type (see tree.js), so they never open the overlay.
+const hasFiles = (event) => isFileDrag(event.dataTransfer?.types);
 document.addEventListener('dragover', (event) => {
   if (!canAdd || !hasFiles(event)) return;
   event.preventDefault();
@@ -845,6 +879,7 @@ $('rename-form').addEventListener('submit', async (event) => {
 
 $('bulk-delete').addEventListener('click', () => deleteItems(selectedItems()));
 $('bulk-move').addEventListener('click', () => askMove(selectedItems(), 'move'));
+$('bulk-cut').addEventListener('click', () => cutItems(selectedItems()));
 $('bulk-copy').addEventListener('click', () => askMove(selectedItems(), 'copy'));
 
 /**
@@ -866,7 +901,7 @@ async function deleteItems(list) {
  * well is said in a toast (with Undo for a delete or a move); when several items were sent and
  * some failed, or names had to change, every item is listed under the bar.
  */
-async function runBulk(op, list, place) {
+async function runBulk(op, list, place, from = nodeId) {
   note('', false);
   $('bulk-results-box').hidden = true;
   $('bulk-results').hidden = true;
@@ -913,14 +948,14 @@ async function runBulk(op, list, place) {
   offerUndo(
     buildUndo(
       { op, done, to: place },
-      list.map((item) => ({ id: item.id, name: item.name, parent: nodeId })),
+      list.map((item) => ({ id: item.id, name: item.name, parent: from })),
     ),
   );
 }
 
 // ---- undo: a toast's Undo button, or Ctrl+Z ----
 
-const UNDO_KEYS = /Mac|iPhone|iPad/.test(globalThis.navigator?.platform ?? '') ? 'Command+Z' : 'Ctrl+Z';
+const UNDO_KEYS = `${KEY_MOD.text}+Z`;
 
 /** Says what was done, with an Undo button that reverses it and then says how that went. */
 function offerUndo(undo) {
@@ -1042,6 +1077,315 @@ $('move-here').addEventListener('click', async () => {
   if (!canPlaceHere(trail, movingIds(), nodeId, { copy: mode === 'copy' })) return;
   moveDialog.close();
   await runBulk(mode, list, place);
+});
+
+// ---- the folder tree ----
+
+/**
+ * The library's folder tree. From 1000 pixels, when the table keeps enough room beside it (and
+ * beside the details pane), it is a column at the left that the Folders button hides and shows
+ * (remembered); otherwise the Folders button shows it above the table.
+ */
+function setupTree() {
+  if (!libraryStep || library?.folders === false) return;
+  // Constants here, not at the top level: this runs before the lines below it in the module.
+  const TREE_COLUMN = 220 + 16; // the tree's column and its gap
+  const TABLE_ROOM = 520; // the least the table keeps beside it
+  const DETAILS_COLUMN = 380; // the details pane and its gap
+  const page = $('lib-body').closest('.page');
+  const toggle = $('folders-toggle');
+  const pane = $('folder-pane');
+  toggle.hidden = false;
+  const steps = here.path.slice(here.path.indexOf(libraryStep));
+  tree = mountFolderTree({
+    list: $('folder-tree'),
+    root: { id: libraryStep.id, name: libraryStep.name, kind: 'library', access: libraryStep.access ?? null },
+    path: steps,
+    currentId: nodeId,
+    onDraw: () => {
+      dropAt = null;
+    },
+  });
+  tree.reveal();
+  const wide = globalThis.matchMedia?.('(min-width: 1000px)') ?? { matches: true, addEventListener() {} };
+  let columnOpen = true;
+  try {
+    columnOpen = localStorage.getItem('sharecraft-folder-tree') !== 'closed';
+  } catch {
+    // no storage: the column shows
+  }
+  let shortOpen = false;
+  let fits = false;
+  const layout = () => {
+    const room = $('lib-body').clientWidth - (page.classList.contains('details-open') ? DETAILS_COLUMN : 0);
+    fits = wide.matches && room >= TREE_COLUMN + TABLE_ROOM;
+    const open = fits ? columnOpen : shortOpen;
+    $('lib-body').classList.toggle('tree-col', fits && open);
+    pane.hidden = !open;
+    toggle.setAttribute('aria-expanded', String(open));
+    if (!open && pane.contains(document.activeElement)) toggle.focus();
+  };
+  toggle.addEventListener('click', () => {
+    if (fits) {
+      columnOpen = !columnOpen;
+      try {
+        localStorage.setItem('sharecraft-folder-tree', columnOpen ? 'open' : 'closed');
+      } catch {
+        // not remembered
+      }
+    } else shortOpen = !shortOpen;
+    layout();
+  });
+  wide.addEventListener('change', layout);
+  if ('ResizeObserver' in globalThis) new ResizeObserver(layout).observe($('lib-body'));
+  else globalThis.addEventListener('resize', layout);
+  // Opening or closing the details pane changes the room beside the table.
+  new MutationObserver(layout).observe(page, { attributes: true, attributeFilter: ['class'] });
+  layout();
+}
+
+/** Each breadcrumb step knows its place in the path, so that items can be dropped on it. */
+function markCrumbs() {
+  $('crumbs')
+    .querySelectorAll('li')
+    .forEach((li, at) => {
+      li.dataset.at = String(at);
+    });
+}
+
+// ---- dragging items onto a folder ----
+
+/**
+ * Where a drag over `element` would land: `{ mark, target, ancestry }` for a tree folder, a
+ * folder row of the table or a breadcrumb step; null elsewhere (files are not places).
+ */
+function dropTargetOf(element) {
+  const treeItem = element?.closest?.('#folder-tree li[role=treeitem]');
+  if (treeItem) {
+    const node = tree?.node(treeItem.dataset.id);
+    if (!node) return null;
+    return { mark: treeItem.querySelector(':scope > .tree-row'), target: node, ancestry: tree.ancestry(node.id) };
+  }
+  const tr = element?.closest?.('#file-rows tr[data-id]');
+  if (tr) {
+    const item = items.find((entry) => entry.id === tr.dataset.id);
+    if (!item || !['folder', 'library'].includes(item.kind)) return null;
+    return { mark: tr, target: item, ancestry: [...here.path.map((step) => step.id), item.id] };
+  }
+  const crumb = element?.closest?.('#crumbs li[data-at]');
+  if (crumb) {
+    const at = Number(crumb.dataset.at);
+    const step = here.path[at];
+    if (!step) return null;
+    return { mark: crumb.firstElementChild, target: step, ancestry: here.path.slice(0, at + 1).map((s) => s.id) };
+  }
+  return null;
+}
+
+function draggedWhat(list) {
+  return list.length === 1 ? list[0].name : `${list.length} items`;
+}
+
+$('file-rows').addEventListener('dragstart', (event) => {
+  const tr = event.target.closest?.('tr[data-id]');
+  const item = tr && items.find((entry) => entry.id === tr.dataset.id);
+  if (!item || view !== 'list' || !event.dataTransfer) return;
+  const list = dragList(item.id, selected, items).map((entry) => ({
+    id: entry.id,
+    name: entry.name,
+    kind: entry.kind,
+    movable: itemActions(entry).move,
+  }));
+  dragging = { items: list, from: nodeId };
+  event.dataTransfer.effectAllowed = 'move';
+  event.dataTransfer.setData(ITEM_TYPE, JSON.stringify(list.map((entry) => entry.id)));
+  event.dataTransfer.setData('text/plain', list.map((entry) => entry.name).join('\n'));
+  ghost = h('div', { class: 'drag-ghost', 'aria-hidden': 'true' }, `Move ${draggedWhat(list)}`);
+  document.body.append(ghost);
+  event.dataTransfer.setDragImage?.(ghost, 14, 14);
+  for (const row of $('file-rows').querySelectorAll('tr[data-id]')) {
+    row.classList.toggle('drag-source', list.some((entry) => entry.id === row.dataset.id));
+  }
+  dragHint(`Drop on a folder to move ${draggedWhat(list)}.`, true);
+});
+
+document.addEventListener('dragover', (event) => {
+  if (!dragging || !isItemDrag(event.dataTransfer?.types)) return;
+  const found = dropTargetOf(event.target);
+  const verdict = found ? canDrop(dragging.items, found.target, found.ancestry, { from: dragging.from }) : null;
+  markDrop(found, verdict);
+  if (verdict?.ok) {
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'move';
+  } else event.dataTransfer.dropEffect = 'none';
+});
+
+document.addEventListener('drop', async (event) => {
+  if (!dragging || !isItemDrag(event.dataTransfer?.types)) return;
+  event.preventDefault();
+  const drag = dragging;
+  const found = dropTargetOf(event.target);
+  endDrag();
+  if (!found) return;
+  const verdict = canDrop(drag.items, found.target, found.ancestry, { from: drag.from });
+  if (!verdict.ok) {
+    showToast(verdict.reason, { kind: 'error' });
+    return;
+  }
+  await runBulk('move', drag.items, { id: found.target.id, name: found.target.name }, drag.from);
+});
+
+$('file-rows').addEventListener('dragend', () => endDrag());
+
+/** Marks where the drag would land (or why it cannot), and opens a closed tree folder held under it. */
+function markDrop(found, verdict) {
+  const mark = found?.mark ?? null;
+  if (mark === dropAt) return;
+  dropAt?.classList.remove('drop-ok', 'drop-no');
+  dropAt = mark;
+  clearTimeout(expandTimer);
+  if (!mark) {
+    dragHint(`Drop on a folder to move ${draggedWhat(dragging.items)}.`, true);
+    return;
+  }
+  mark.classList.add(verdict.ok ? 'drop-ok' : 'drop-no');
+  dragHint(verdict.ok ? verdict.message : verdict.reason, verdict.ok);
+  const treeItem = mark.closest('#folder-tree li[role=treeitem]');
+  if (treeItem?.getAttribute('aria-expanded') === 'false') {
+    expandTimer = setTimeout(() => {
+      if (dragging && dropAt === mark) tree?.expand(treeItem.dataset.id);
+    }, 800);
+  }
+}
+
+function dragHint(text, ok) {
+  $('drag-status').textContent = text;
+  $('drag-status').classList.toggle('no', !ok);
+}
+
+function endDrag() {
+  dragging = null;
+  clearTimeout(expandTimer);
+  dropAt?.classList.remove('drop-ok', 'drop-no');
+  dropAt = null;
+  ghost?.remove();
+  ghost = null;
+  dragHint('', true);
+  for (const row of $('file-rows').querySelectorAll('tr.drag-source')) row.classList.remove('drag-source');
+}
+
+// ---- cut and paste: Ctrl+X on selected rows, Ctrl+V in another folder ----
+
+function loadCut() {
+  try {
+    return parseCut(sessionStorage.getItem('sharecraft-cut'));
+  } catch {
+    return null; // no storage: nothing was cut
+  }
+}
+
+function saveCut() {
+  try {
+    if (cut) sessionStorage.setItem('sharecraft-cut', JSON.stringify(cut));
+    else sessionStorage.removeItem('sharecraft-cut');
+  } catch {
+    // kept on this page only
+  }
+}
+
+/** Whether the cut items may be pasted here, as `canDrop` answers. */
+function pasteVerdict() {
+  const place = { id: nodeId, name: self.name, kind: self.kind, access: here.access };
+  return canDrop(cut.items, place, here.path.map((step) => step.id), { from: cut.from });
+}
+
+/** Cuts the items of `list` that the person may move; they are moved when pasted in another folder. */
+function cutItems(list) {
+  const movable = list.filter((item) => itemActions(item).move);
+  if (movable.length === 0) {
+    showToast(list.length === 1 ? `You cannot move ${list[0].name}.` : 'You cannot move these items.', { kind: 'error' });
+    return;
+  }
+  cut = { from: nodeId, fromName: self.name, items: movable.map(({ id, name }) => ({ id, name })) };
+  saveCut();
+  showCut();
+  const left = list.length - movable.length;
+  $('cut-status').textContent =
+    `${cutText(cut.items)}.${left ? ` ${left} you cannot move ${left === 1 ? 'was' : 'were'} left out.` : ''} ` +
+    `Open the folder to move to and press ${KEY_MOD.text}+V, or press Escape to cancel.`;
+}
+
+/** The bar that says what is cut, with Paste here and Cancel; the cut rows are dimmed. */
+function showCut() {
+  $('cut-bar').hidden = !cut;
+  const ids = new Set(cut && cut.from === nodeId ? cut.items.map((item) => item.id) : []);
+  for (const tr of $('file-rows').querySelectorAll('tr[data-id]')) tr.classList.toggle('cut', ids.has(tr.dataset.id));
+  if (!cut) return;
+  $('cut-text').textContent = cutText(cut.items);
+  const verdict = pasteVerdict();
+  $('cut-paste').disabled = !verdict.ok;
+  $('cut-paste').textContent = `Paste here (${KEY_MOD.text}+V)`;
+  $('cut-hint').hidden = verdict.ok;
+  $('cut-hint').textContent = verdict.ok
+    ? ''
+    : cut.from === nodeId
+      ? 'Open the folder to move to, then paste.'
+      : verdict.reason;
+}
+
+async function pasteCut() {
+  if (!cut) return;
+  const verdict = pasteVerdict();
+  if (!verdict.ok) {
+    showToast(cut.from === nodeId ? `${verdict.reason} Open another folder to paste.` : verdict.reason, { kind: 'error' });
+    return;
+  }
+  const { items: list, from } = cut;
+  const back = $('cut-bar').contains(document.activeElement);
+  cut = null;
+  saveCut();
+  showCut();
+  await runBulk('move', list, { id: nodeId, name: self.name }, from);
+  if (back) $('file-rows').querySelector('tr[tabindex="0"]')?.focus();
+}
+
+function cancelCut() {
+  if (!cut) return;
+  const back = $('cut-bar').contains(document.activeElement);
+  cut = null;
+  saveCut();
+  showCut();
+  $('cut-status').textContent = 'Nothing is waiting to be moved now.';
+  if (back) $('file-rows').querySelector('tr[tabindex="0"]')?.focus();
+}
+
+$('cut-paste').addEventListener('click', () => pasteCut());
+$('cut-cancel').addEventListener('click', () => cancelCut());
+$('bulk-cut').setAttribute('aria-keyshortcuts', `${KEY_MOD.aria}+X`);
+$('cut-paste').setAttribute('aria-keyshortcuts', `${KEY_MOD.aria}+V`);
+
+document.addEventListener('keydown', (event) => {
+  const what = clipboardKey(event);
+  if (!what || document.querySelector('dialog[open]') || event.target.closest?.('[role=menu]')) return;
+  if (what === 'cancel') {
+    if (!cut || dragging) return;
+    event.preventDefault();
+    cancelCut();
+  } else if (what === 'cut') {
+    const focused = document.activeElement?.closest?.('#file-rows tr[data-id]');
+    const list = selected.size
+      ? selectedItems()
+      : focused
+        ? items.filter((item) => item.id === focused.dataset.id)
+        : [];
+    if (list.length === 0) return;
+    event.preventDefault();
+    cutItems(list);
+  } else if (what === 'paste') {
+    if (!cut) return;
+    event.preventDefault();
+    pasteCut();
+  }
 });
 
 function fail(text) {
