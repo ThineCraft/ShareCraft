@@ -921,3 +921,20 @@ dialog.details-sheet[open]{animation:sheet-in .2s ease-out}
  .share-trail li.source>a,.share-trail li.source>span,.source-badge{border:1px solid CanvasText}
  .link-card{border-color:CanvasText}
 }
+/* toasts (toast.js): a stack at the bottom-left, across the bottom on phones; never themed by a site look */
+.toasts{position:fixed;left:16px;bottom:max(16px,env(safe-area-inset-bottom));z-index:60;width:min(380px,calc(100vw - 32px));--accent:#3156c9;--accent-ink:light-dark(#3156c9,#9db4ff);--on-accent:#fff}
+.toast-list{display:flex;flex-direction:column;gap:8px;margin:0;padding:0;list-style:none}
+.toast{display:flex;align-items:center;gap:4px 8px;padding:8px 8px 8px 14px;border:1px solid var(--line);border-left:4px solid var(--accent-ink);border-radius:9px;background:var(--paper);color:var(--text);box-shadow:0 8px 24px rgb(0 0 0/.2)}
+.toast.error{border-left-color:var(--stop-ink);background:var(--stop-bg);color:var(--stop-ink)}
+.toast-text{flex:1;min-width:0;margin:0;font-size:13px;overflow-wrap:anywhere}
+.toast .toast-action{flex:none;min-height:32px;padding:4px 12px;font-weight:600;border-color:transparent}
+.toast .toast-action:hover{border-color:var(--line)}
+.toast .toast-close{flex:none;min-width:32px;min-height:32px;padding:0;border-color:transparent;color:var(--muted);font-size:18px;line-height:1}
+.toast.error .toast-close{color:var(--stop-ink)}
+@keyframes toast-in{from{opacity:0;transform:translateY(12px)}}
+@media (prefers-reduced-motion:no-preference){.toast{animation:toast-in .18s ease-out}}
+@media (max-width:600px){
+ .toasts{left:8px;right:8px;bottom:max(8px,env(safe-area-inset-bottom));width:auto}
+ .toast .toast-action,.toast .toast-close{min-height:44px;min-width:44px}
+}
+@media (forced-colors:active){.toast{border:1px solid CanvasText;border-left-width:4px}}

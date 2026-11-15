@@ -46,6 +46,8 @@ import {
   uploadsSummary,
 } from './upload.js';
 import { setupMenu } from './menu.js';
+import { runLatestAction, showToast } from './toast.js';
+import { buildUndo, isUndoKey, performUndo } from './undo.js';
 import { addPaletteActions } from './palette.js';
 import { createDetails } from './details.js';
 import { fileIcon, fileKind, nextSort, parseSort, relativeTime, sortDescription, sortEntries, typeLabel } from './files.js';
@@ -126,7 +128,6 @@ let moving = []; // the items the move or copy dialog is for
 let moveMode = 'move';
 let trail = [];
 let moveRequest = 0; // the latest listing asked for; older answers are dropped
-let deleting = [];
 let renaming = null;
 const uploadRows = new Map(); // outcome -> its list item
 const dirtyUploads = new Set(); // outcomes to redraw at the next frame
@@ -151,7 +152,7 @@ const details = createDetails({
     actionsFor = item.id;
     if (key === 'rename') askRename(item);
     else if (key === 'move') askMove([item], 'move');
-    else if (key === 'delete') askDelete([item]);
+    else if (key === 'delete') deleteItems([item]);
   },
   me,
   enabled: () => view === 'list',
@@ -523,7 +524,7 @@ function actionsMenu(item) {
       if (entry === 'rename') return choose('Rename', () => askRename(item));
       if (entry === 'move') return choose('Move…', () => askMove([item], 'move'));
       if (entry === 'copy') return choose('Copy…', () => askMove([item], 'copy'));
-      if (entry === 'delete') return choose('Delete', () => askDelete([item]), true);
+      if (entry === 'delete') return choose('Delete', () => deleteItems([item]), true);
       return h('li', { role: 'none' }, h('a', { role: 'menuitem', href: `/access.html?id=${seg(item.id)}` }, 'Access'));
     }),
   );
@@ -600,8 +601,9 @@ $('create-form').addEventListener('submit', async (event) => {
     const result = await api('POST', `/nodes/${seg(nodeId)}/children`, { kind: 'folder', name });
     if (!result.ok) return say(messageFor(result.error));
     createDialog.close();
-    note(`Folder “${result.data.name}” was created.`, false);
-    return reload();
+    await reload();
+    showToast(`Created the folder ${result.data.name}`);
+    return;
   }
   if (key === 'template') {
     const template = templates.find((t) => t.id === $('create-template').value);
@@ -614,8 +616,9 @@ $('create-form').addEventListener('submit', async (event) => {
       return say(policyRefusalText(result.error, result.data, name || template.name) ?? messageFor(result.error));
     }
     createDialog.close();
-    note(`“${result.data.node.name}” was made from the template ${template.name}.`, false);
-    return reload();
+    await reload();
+    showToast(`Made ${result.data.node.name} from the template ${template.name}`);
+    return;
   }
   const editor = key.slice(4);
   const extension = Object.hasOwn(EDITORS, editor) ? EDITORS[editor].extension : null;
@@ -834,46 +837,44 @@ $('rename-form').addEventListener('submit', async (event) => {
     return showMessage($('rename-error'), policyRefusalText(result.error, result.data, name) ?? messageFor(result.error));
   }
   renameDialog.close();
-  note(`Renamed to “${result.data.name}”.`, false);
   await reload();
+  offerUndo(buildUndo({ op: 'rename', id: item.id, name: result.data.name }, { id: item.id, name: item.name }));
 });
 
 // ---- bulk: delete, move and copy ----
 
-const deleteDialog = $('delete-dialog');
-$('delete-cancel').addEventListener('click', () => deleteDialog.close());
-$('bulk-delete').addEventListener('click', () => askDelete(selectedItems()));
+$('bulk-delete').addEventListener('click', () => deleteItems(selectedItems()));
 $('bulk-move').addEventListener('click', () => askMove(selectedItems(), 'move'));
 $('bulk-copy').addEventListener('click', () => askMove(selectedItems(), 'copy'));
 
-function askDelete(list) {
-  deleting = list;
-  const one = list[0];
-  $('delete-title').textContent = list.length === 1 ? `Delete “${one.name}”?` : `Delete ${list.length} items?`;
-  const inside = list.some((item) => item.kind === 'folder') ? ' Folders go with everything inside them.' : '';
-  $('delete-text').textContent =
-    `${list.length === 1 ? `“${one.name}” will be` : `${list.length} items will be`} moved to the recycle bin, where ${
-      list.length === 1 ? 'it' : 'they'
-    } can be restored for 93 days.${inside} Anyone who has a deleted file open is disconnected.`;
-  showMessage($('delete-error'), '');
-  deleteDialog.showModal();
+/**
+ * Deletes `list` to the recycle bin at once, with no question: the toast that follows offers
+ * Undo, which restores them from the bin. When a row's own menu was used, focus goes to the next row.
+ */
+async function deleteItems(list) {
+  if (list.length === 0) return;
+  if (list.length === 1 && actionsFor === list[0].id) {
+    const order = sortEntries(items, sort.key, sort.direction);
+    const at = order.findIndex((item) => item.id === list[0].id);
+    actionsFor = (order[at + 1] ?? order[at - 1])?.id ?? null;
+  }
+  await runBulk('delete', list, null);
 }
 
-$('delete-form').addEventListener('submit', async (event) => {
-  event.preventDefault();
-  const list = deleting;
-  deleteDialog.close();
-  await runBulk('delete', list, null);
-});
-
-/** Sends `list` through `POST /api/bulk` (500 at a time) and shows what happened to each. */
-async function runBulk(op, list, parent) {
+/**
+ * Sends `list` through `POST /api/bulk` (500 at a time) to `place` (a move or copy). What went
+ * well is said in a toast (with Undo for a delete or a move); when several items were sent and
+ * some failed, or names had to change, every item is listed under the bar.
+ */
+async function runBulk(op, list, place) {
   note('', false);
+  $('bulk-results-box').hidden = true;
+  $('bulk-results').hidden = true;
   const results = [];
   for (let at = 0; at < list.length; at += BULK_MAX) {
     const batch = list.slice(at, at + BULK_MAX);
     const body = { op, items: batch.map((item) => item.id) };
-    if (parent) body.parent = parent;
+    if (place) body.parent = place.id;
     const result = await api('POST', '/bulk', body);
     if (!result.ok) {
       for (const item of batch) results.push({ id: item.id, ok: false, error: result.error });
@@ -881,21 +882,70 @@ async function runBulk(op, list, parent) {
   }
   const names = Object.fromEntries(list.map((item) => [item.id, item.name]));
   const summary = bulkSummary(op, results, names);
-  $('bulk-headline').textContent = summary.headline;
-  $('bulk-results-box').hidden = false;
-  $('bulk-results').hidden = false;
-  $('bulk-results').replaceChildren(
-    ...summary.lines.map((line) =>
-      h(
-        'li',
-        {},
-        h('span', { class: 'grow' }, h('strong', {}, line.name), h('br'), h('small', {}, line.text)),
-        line.ok ? null : h('small', { class: 'mark' }, 'Not done'),
+  const done = results.filter((result) => result.ok).map((result) => result.id);
+  const listed = (summary.failed > 0 && list.length > 1) || results.some((result) => result.ok && result.renamed);
+  if (listed) {
+    $('bulk-headline').textContent = summary.headline;
+    $('bulk-results-box').hidden = false;
+    $('bulk-results').hidden = false;
+    $('bulk-results').replaceChildren(
+      ...summary.lines.map((line) =>
+        h(
+          'li',
+          {},
+          h('span', { class: 'grow' }, h('strong', {}, line.name), h('br'), h('small', {}, line.text)),
+          line.ok ? null : h('small', { class: 'mark' }, 'Not done'),
+        ),
       ),
+    );
+  }
+  await reload();
+  if (summary.failed > 0 && list.length === 1) {
+    showToast(`Could not ${op} ${list[0].name}. ${summary.lines[0].text}`, { kind: 'error' });
+    return;
+  }
+  if (done.length === 0) return;
+  if (op === 'copy') {
+    const what = done.length === 1 ? names[done[0]] : `${done.length} items`;
+    showToast(`Copied ${what} to ${place.name}`);
+    return;
+  }
+  offerUndo(
+    buildUndo(
+      { op, done, to: place },
+      list.map((item) => ({ id: item.id, name: item.name, parent: nodeId })),
     ),
   );
-  await reload();
 }
+
+// ---- undo: a toast's Undo button, or Ctrl+Z ----
+
+const UNDO_KEYS = /Mac|iPhone|iPad/.test(globalThis.navigator?.platform ?? '') ? 'Command+Z' : 'Ctrl+Z';
+
+/** Says what was done, with an Undo button that reverses it and then says how that went. */
+function offerUndo(undo) {
+  if (!undo) return;
+  showToast(undo.message, {
+    announce: `${undo.message}. To undo, press ${UNDO_KEYS}.`,
+    action: {
+      label: undo.label,
+      run: async () => {
+        const outcome = await performUndo(undo, api);
+        // The list of what a bulk action did is out of date once it is undone.
+        $('bulk-results-box').hidden = true;
+        $('bulk-results').hidden = true;
+        await reload();
+        showToast(outcome.message, { kind: outcome.ok ? 'ok' : 'error' });
+      },
+    },
+  });
+}
+
+// Ctrl+Z (Cmd+Z) outside text fields and dialogs undoes the newest action still on screen.
+document.addEventListener('keydown', (event) => {
+  if (!isUndoKey(event) || document.querySelector('dialog[open]')) return;
+  if (runLatestAction()) event.preventDefault();
+});
 
 // ---- move and copy (one dialog) ----
 
@@ -991,7 +1041,7 @@ $('move-here').addEventListener('click', async () => {
   const place = trail[trail.length - 1];
   if (!canPlaceHere(trail, movingIds(), nodeId, { copy: mode === 'copy' })) return;
   moveDialog.close();
-  await runBulk(mode, list, place.id);
+  await runBulk(mode, list, place);
 });
 
 function fail(text) {

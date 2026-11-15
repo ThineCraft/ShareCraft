@@ -27,6 +27,8 @@ import {
   siteChrome,
 } from './common.js';
 import { setupMenu } from './menu.js';
+import { showToast } from './toast.js';
+import { buildUndo, performUndo } from './undo.js';
 import { relativeTime } from './files.js';
 import { libraryCardModel, libraryIcon, ownerChip, recentAcrossLibraries, recentIcon } from './site-home.js';
 
@@ -57,9 +59,8 @@ document.title = `${site.name} — ShareCraft`;
 const manageSite = can(here.access, 'manage_site');
 const manageAccess = can(here.access, 'manage_access');
 
-const announce = (text) => {
-  $('status').textContent = text;
-};
+// What was done is said in a toast (refusals stay in the dialog or above the page).
+const announce = (text) => showToast(text);
 
 // ---- Manage site: one menu, shown only to people who may use something in it ----
 
@@ -356,11 +357,24 @@ function libraryActions(model) {
       showMessage(error, messageFor(result.error));
       return button.focus();
     }
-    announce(`The library ${model.name} is in the recycle bin.`);
     info = (await siteChrome(siteId, { currentId: siteId, footer: true })).site ?? info;
     showAbout();
     await showLibraries();
     $('libraries').querySelector('.card-link, .new-card')?.focus();
+    // Asked first, then undoable for a while: Undo restores it from the recycle bin.
+    const undo = buildUndo({ op: 'delete', done: [model.id] }, [{ id: model.id, name: model.name }]);
+    showToast(`Deleted the library ${model.name}`, {
+      action: {
+        label: 'Undo',
+        run: async () => {
+          const outcome = await performUndo(undo, api);
+          info = (await siteChrome(siteId, { currentId: siteId, footer: true })).site ?? info;
+          showAbout();
+          await showLibraries();
+          showToast(outcome.message, { kind: outcome.ok ? 'ok' : 'error' });
+        },
+      },
+    });
   });
   const wrap = h('div', { class: 'menu-wrap lib-actions' }, button, menu);
   setupMenu(button, menu);

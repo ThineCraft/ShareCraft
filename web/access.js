@@ -31,6 +31,7 @@ import {
 } from './common.js';
 import { avatarColour, initials } from './account.js';
 import { setupMenu } from './menu.js';
+import { showToast } from './toast.js';
 import { accessSummary, comboboxFilter, looksLikeEmail, permsSentence, sortEntries } from './share.js';
 
 const $ = (id) => document.getElementById(id);
@@ -83,8 +84,14 @@ if (sharingResult.ok) sharing = sharingResult.data;
 if (!sharing.anyone_links) $('anyone-option').remove();
 else $('anyone-option').hidden = false;
 
+/** A refusal stays above the page; what was done is said in a toast. */
 function note(text, isError) {
-  error.classList.toggle('ok', !isError);
+  error.classList.remove('ok');
+  if (text && !isError) {
+    showMessage(error, '');
+    showToast(text);
+    return;
+  }
   showMessage(error, text);
 }
 
@@ -626,7 +633,6 @@ async function copyAddress(url, input) {
   try {
     await navigator.clipboard.writeText(url);
     note('Copied.', false);
-    say('Copied.');
   } catch {
     if (input) {
       input.focus();
