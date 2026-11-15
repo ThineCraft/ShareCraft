@@ -100,7 +100,8 @@ test('look_tokens_use_light_dark', () => {
   };
   assert.deepEqual(lookTokens(effective), {
     '--accent': 'light-dark(#3156c9,#748ddd)',
-    '--accent-ink': 'light-dark(#ffffff,#141c20)',
+    '--accent-ink': 'light-dark(#3156c9,#748ddd)',
+    '--on-accent': 'light-dark(#ffffff,#141c20)',
     '--header-bg': 'light-dark(#233239,#233239)',
     '--header-ink': 'light-dark(#ffffff,#ffffff)',
   });

@@ -167,7 +167,7 @@ const round2 = (x) => Math.round(x * 100) / 100;
 
 /**
  * Checks a theme `{primary, secondary, primary_dark?, secondary_dark?}` (colours as `#rrggbb`).
- * Returns `{ok: true, resolved}` with the light and dark `{accent, accent_ink, header_bg,
+ * Returns `{ok: true, resolved}` with the light and dark `{accent, accent_ink, on_accent, header_bg,
  * header_ink}` as `#rrggbb`, or `{ok: false, pairs}` with every failing `{check, ratio,
  * suggestion}` (ratio to 2 decimals, suggestion `#rrggbb` or `null`). Check names:
  * primary_on_light, button_on_primary, primary_dark_on_dark, button_on_primary_dark,
@@ -225,13 +225,15 @@ export function checkTheme(theme) {
     resolved: {
       light: {
         accent: hexOf(p),
-        accent_ink: WHITE,
+        accent_ink: hexOf(p),
+        on_accent: WHITE,
         header_bg: hexOf(s),
         header_ink: lightHeader.ink,
       },
       dark: {
         accent: hexOf(primaryDark),
-        accent_ink: bestInk(primaryDark).ink,
+        accent_ink: hexOf(primaryDark),
+        on_accent: bestInk(primaryDark).ink,
         header_bg: hexOf(secondaryDark),
         header_ink: bestInk(secondaryDark).ink,
       },
@@ -242,7 +244,8 @@ export function checkTheme(theme) {
 /**
  * The CSS variables an effective look sets, as `{name: 'light-dark(a,b)'}`. `effective` is the
  * answer of `GET /api/sites/{id}/look`: its `theme` holds `light` and `dark`, each with
- * `accent`, `accent_ink`, `header_bg` and `header_ink`. Pages set them with
+ * `accent` (button fill), `accent_ink` (link and focus colour), `on_accent` (button text),
+ * `header_bg` and `header_ink`. Pages set them with
  * `style.setProperty`, never through markup.
  */
 export function lookTokens(effective) {
@@ -251,6 +254,7 @@ export function lookTokens(effective) {
   return {
     '--accent': pair('accent'),
     '--accent-ink': pair('accent_ink'),
+    '--on-accent': pair('on_accent'),
     '--header-bg': pair('header_bg'),
     '--header-ink': pair('header_ink'),
   };

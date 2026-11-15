@@ -294,13 +294,15 @@
       "resolved": {
         "light": {
           "accent": "#3156c9",
-          "accent_ink": "#ffffff",
+          "accent_ink": "#3156c9",
+          "on_accent": "#ffffff",
           "header_bg": "#233239",
           "header_ink": "#ffffff"
         },
         "dark": {
           "accent": "#748ddd",
-          "accent_ink": "#141c20",
+          "accent_ink": "#748ddd",
+          "on_accent": "#141c20",
           "header_bg": "#233239",
           "header_ink": "#ffffff"
         }
@@ -314,13 +316,15 @@
       "resolved": {
         "light": {
           "accent": "#1f5f8b",
-          "accent_ink": "#ffffff",
+          "accent_ink": "#1f5f8b",
+          "on_accent": "#ffffff",
           "header_bg": "#163447",
           "header_ink": "#ffffff"
         },
         "dark": {
           "accent": "#3c96d4",
-          "accent_ink": "#141c20",
+          "accent_ink": "#3c96d4",
+          "on_accent": "#141c20",
           "header_bg": "#163447",
           "header_ink": "#ffffff"
         }
@@ -334,13 +338,15 @@
       "resolved": {
         "light": {
           "accent": "#7a3e8f",
-          "accent_ink": "#ffffff",
+          "accent_ink": "#7a3e8f",
+          "on_accent": "#ffffff",
           "header_bg": "#3b2244",
           "header_ink": "#ffffff"
         },
         "dark": {
           "accent": "#b37cc6",
-          "accent_ink": "#141c20",
+          "accent_ink": "#b37cc6",
+          "on_accent": "#141c20",
           "header_bg": "#3b2244",
           "header_ink": "#ffffff"
         }
@@ -354,13 +360,15 @@
       "resolved": {
         "light": {
           "accent": "#a3431c",
-          "accent_ink": "#ffffff",
+          "accent_ink": "#a3431c",
+          "on_accent": "#ffffff",
           "header_bg": "#40261b",
           "header_ink": "#ffffff"
         },
         "dark": {
           "accent": "#de6f41",
-          "accent_ink": "#141c20",
+          "accent_ink": "#de6f41",
+          "on_accent": "#141c20",
           "header_bg": "#40261b",
           "header_ink": "#ffffff"
         }
@@ -374,13 +382,15 @@
       "resolved": {
         "light": {
           "accent": "#2f6b3a",
-          "accent_ink": "#ffffff",
+          "accent_ink": "#2f6b3a",
+          "on_accent": "#ffffff",
           "header_bg": "#1f3324",
           "header_ink": "#ffffff"
         },
         "dark": {
           "accent": "#48a459",
-          "accent_ink": "#141c20",
+          "accent_ink": "#48a459",
+          "on_accent": "#141c20",
           "header_bg": "#1f3324",
           "header_ink": "#ffffff"
         }
@@ -394,13 +404,15 @@
       "resolved": {
         "light": {
           "accent": "#4a5560",
-          "accent_ink": "#ffffff",
+          "accent_ink": "#4a5560",
+          "on_accent": "#ffffff",
           "header_bg": "#1f262c",
           "header_ink": "#ffffff"
         },
         "dark": {
           "accent": "#8492a0",
-          "accent_ink": "#141c20",
+          "accent_ink": "#8492a0",
+          "on_accent": "#141c20",
           "header_bg": "#1f262c",
           "header_ink": "#ffffff"
         }

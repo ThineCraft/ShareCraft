@@ -491,8 +491,12 @@ pub struct FailedPair {
 pub struct Palette {
     /// The accent: links, button fill, the focus ring and the bar stripe.
     pub accent: Colour,
-    /// The text on an accent button: white or the dark ink.
+    /// The accent as link text and the focus ring (what `--accent-ink` is in `style.css`):
+    /// the primary in light mode, the dark primary in dark mode.
     pub accent_ink: Colour,
+    /// The text on an accent button: white in light mode; white or the dark ink, whichever
+    /// reads better, on the dark primary.
+    pub on_accent: Colour,
     /// The background of a strong header or footer.
     pub header_bg: Colour,
     /// The text on it: white or the dark ink.
@@ -606,13 +610,15 @@ pub fn check_theme(theme: &Theme) -> Result<ResolvedTheme, Vec<FailedPair>> {
         (true, Some(accent), Some(header)) => Ok(ResolvedTheme {
             light: Palette {
                 accent: p,
-                accent_ink: WHITE,
+                accent_ink: p,
+                on_accent: WHITE,
                 header_bg: s,
                 header_ink: light_ink,
             },
             dark: Palette {
                 accent,
-                accent_ink: best_ink(accent).0,
+                accent_ink: accent,
+                on_accent: best_ink(accent).0,
                 header_bg: header,
                 header_ink: best_ink(header).0,
             },
@@ -930,7 +936,7 @@ pub struct Look {
     /// A copy of the theme, so editing or deleting the source never breaks the site.
     pub theme: Theme,
     /// Where the theme came from: `builtin:<id>`, `org:<uuid>`, `site:<uuid>` or `custom`.
-    pub theme_from: String,
+    pub from: String,
     /// The logo (at most 1 MiB).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logo: Option<ImageRef>,
@@ -952,7 +958,7 @@ impl Default for Look {
     fn default() -> Look {
         Look {
             theme: SHARECRAFT.theme(),
-            theme_from: SHARECRAFT.id.to_owned(),
+            from: SHARECRAFT.id.to_owned(),
             logo: None,
             thumbnail: None,
             logo_alt: String::new(),
@@ -973,7 +979,7 @@ impl Look {
         if let Some(p) = self.theme.problem() {
             return Some(p);
         }
-        if !theme_source_ok(&self.theme_from) {
+        if !theme_source_ok(&self.from) {
             return Some(
                 "a theme comes from builtin:<id>, org:<id>, site:<id> or custom".to_owned(),
             );
@@ -1458,7 +1464,7 @@ mod tests {
         longest.theme.name = "é".repeat(60);
         assert_eq!(longest.problem("Site"), None);
         for from in ["", "builtin:nope", "org:x", "site:", "elsewhere", "custom "] {
-            change(&|l| l.theme_from = from.into());
+            change(&|l| l.from = from.into());
         }
         for from in [
             "custom",
@@ -1467,7 +1473,7 @@ mod tests {
             "site:5e5e5e5e-5e5e-45e5-85e5-5e5e5e5e5e5e",
         ] {
             let mut look = ok.clone();
-            look.theme_from = from.into();
+            look.from = from.into();
             assert_eq!(look.problem("Site"), None, "{from}");
         }
         // Logo text and images.
@@ -1777,7 +1783,7 @@ mod tests {
         assert_eq!(back.themes[0].primary, colour("#3156c9"));
 
         let mut look = Look::default();
-        look.theme_from = "org:11111111-1111-4111-8111-111111111111".into();
+        look.from = "org:11111111-1111-4111-8111-111111111111".into();
         look.logo = Some(image(2048));
         look.logo_alt = "The Dusk logo".into();
         look.header = Header {
@@ -1811,7 +1817,7 @@ mod tests {
     "primary": "#3156c9",
     "secondary": "#233239"
   }},
-  "theme_from": "org:11111111-1111-4111-8111-111111111111",
+  "from": "org:11111111-1111-4111-8111-111111111111",
   "logo": {{
     "sha256": "{hash}",
     "media_type": "image/png",
