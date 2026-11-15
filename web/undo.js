@@ -21,6 +21,7 @@ function chunks(list, size) {
  * The undo of an action that was done, or null when there is nothing to undo.
  * - `{ op: 'delete', done: [ids] }` with `before` the items as they were (`[{ id, name }]`);
  * - `{ op: 'move', done: [ids], to: { id, name } }` with `before` `[{ id, name, parent }]`;
+ * - `{ op: 'restore', done: [ids] }` (from the recycle bin) with `before` `[{ id, name }]`;
  * - `{ op: 'rename', id, name }` (the new name) with `before` `{ id, name }` (the old one).
  * Answers `{ op, message, label, requests, names, back }`: `message` is the toast's words,
  * `requests` the calls that reverse it (`{ method, path, body, ids, bulk }`).
@@ -38,7 +39,7 @@ export function buildUndo(action, before) {
       requests: [{ method: 'PATCH', path: `/nodes/${encodeURIComponent(before.id)}`, body: { name: before.name }, ids: [before.id], bulk: false }],
     };
   }
-  if (action.op !== 'delete' && action.op !== 'move') return null;
+  if (action.op !== 'delete' && action.op !== 'move' && action.op !== 'restore') return null;
   const done = new Set(action.done ?? []);
   const items = (Array.isArray(before) ? before : []).filter((item) => done.has(item.id));
   if (items.length === 0) return null;
@@ -56,6 +57,20 @@ export function buildUndo(action, before) {
             bulk: true,
           }));
     return { op: 'delete', message: `Deleted ${what}`, label: 'Undo', names, requests };
+  }
+  if (action.op === 'restore') {
+    // Undoing a restore deletes the items again, through the normal delete route.
+    const requests =
+      items.length === 1
+        ? [{ method: 'DELETE', path: `/nodes/${encodeURIComponent(items[0].id)}`, ids: [items[0].id], bulk: false }]
+        : chunks(items.map((item) => item.id), UNDO_BATCH).map((ids) => ({
+            method: 'POST',
+            path: '/bulk',
+            body: { op: 'delete', items: ids },
+            ids,
+            bulk: true,
+          }));
+    return { op: 'restore', message: `Restored ${what}`, label: 'Undo', names, requests };
   }
   // A move goes back per place the items came from.
   const byParent = new Map();
@@ -97,7 +112,7 @@ export function undoResults(request, result) {
   ];
 }
 
-const UNDONE = { delete: 'restored', move: 'moved back', rename: 'renamed back' };
+const UNDONE = { delete: 'restored', move: 'moved back', rename: 'renamed back', restore: 'moved back to the recycle bin' };
 
 /** What happened when `undo` was tried: `{ ok, message }` in plain words for a toast. */
 export function undoOutcome(undo, results) {
@@ -107,7 +122,8 @@ export function undoOutcome(undo, results) {
   if (bad.length === 0) {
     if (undo.op === 'rename') return { ok: true, message: `Renamed back to ${undo.back}.` };
     const what = good.length === 1 ? nameOf(good[0].id) : itemsText(good.length);
-    let message = undo.op === 'delete' ? `Restored ${what}.` : `Moved ${what} back.`;
+    let message =
+      undo.op === 'delete' ? `Restored ${what}.` : undo.op === 'restore' ? `Moved ${what} back to the recycle bin.` : `Moved ${what} back.`;
     for (const r of good) {
       if (r.renamed?.from && r.renamed?.to) {
         message += ` “${r.renamed.from}” is now “${r.renamed.to}”, because its name was taken.`;

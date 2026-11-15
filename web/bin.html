@@ -17,7 +17,7 @@
  <p id="status" role="status" aria-live="polite" class="meta"></p>
  <h1 id="title">Recycle bin</h1>
  <p id="error" role="alert" class="msg"></p>
- <p class="meta">Deleted items stay here for 93 days. Restore puts an item back where it was.</p>
+ <p id="summary" class="meta bin-summary"></p>
  <nav id="stages" class="sitenav" aria-label="Recycle bin stage" hidden>
   <ul>
    <li><a id="stage-first" href="#first">Deleted items</a></li>
@@ -25,12 +25,26 @@
   </ul>
  </nav>
  <p id="stage-help" class="meta"></p>
- <div class="toolbar"><button type="button" id="empty-bin" class="plain" hidden>Empty</button></div>
+ <div id="bin-filters" class="filters bin-filters" role="search" aria-label="Find in the recycle bin" hidden>
+  <div class="field bin-search"><label for="bin-search">Search by name or place</label><input type="search" id="bin-search" autocomplete="off" spellcheck="false"></div>
+  <div class="field"><label for="bin-by">Deleted by</label><select id="bin-by"><option value="anyone">Anyone</option><option value="me">Me</option></select></div>
+  <div class="field"><label for="bin-kind">Type</label><select id="bin-kind"><option value="">Any type</option></select></div>
+ </div>
+ <p id="shown" class="meta" role="status" aria-live="polite"></p>
+ <div id="bin-bar" class="toolbar bin-bar" role="toolbar" aria-label="Selected items" hidden>
+  <label class="check"><input type="checkbox" id="select-all"> Select all</label>
+  <span id="selected-count" class="meta" role="status" aria-live="polite"></span>
+  <span class="spacer"></span>
+  <button type="button" id="bulk-restore" disabled>Restore selected</button>
+  <button type="button" id="bulk-delete" class="plain" disabled>Delete selected</button>
+  <button type="button" id="empty-bin" class="plain" hidden>Empty</button>
+ </div>
  <p id="bin-status" role="status" aria-live="polite" class="meta"></p>
  <ul id="bin-failures" class="list" aria-label="Items that could not be removed" hidden></ul>
- <ul id="entries" class="list" aria-label="Items in the recycle bin"></ul>
- <p id="empty" hidden>There is nothing here.</p>
+ <div id="groups" class="bin-groups"></div>
+ <div id="empty" class="bin-empty" hidden><p id="empty-text"></p><button type="button" id="clear-filters" class="plain" hidden>Clear search and filters</button></div>
  <p><button type="button" id="more" class="plain" hidden>Show more</button></p>
+ <p id="keys-status" class="visually-hidden" role="status" aria-live="polite"></p>
 </div>
 <script type="module" src="./bin.js"></script>
 </body>
