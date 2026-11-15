@@ -1,3 +1,7 @@
+// A site's home page: a short introduction (description, kind, hub, owners), the libraries as
+// cards and the files changed lately across them. Everything administrative sits in one
+// "Manage site" menu for the people who may use it; members see none of it.
+
 import {
   api,
   directoryRow,
@@ -16,16 +20,23 @@ import {
   quotaText,
   usagePercent,
   requireMe,
-  roleLine,
   seg,
   setupTopbar,
   showCrumbs,
   showMessage,
   siteChrome,
 } from './common.js';
+import { setupMenu } from './menu.js';
+import { relativeTime } from './files.js';
+import { libraryCardModel, libraryIcon, ownerChip, recentAcrossLibraries, recentIcon } from './site-home.js';
 
 const $ = (id) => document.getElementById(id);
 const error = $('error');
+
+/** How many libraries' first pages "Recent in this site" reads, and how many kinds are asked. */
+const RECENT_LIBRARIES = 6;
+const KINDS_ASKED = 24;
+const RECENT_SHOWN = 8;
 
 const me = await requireMe();
 setupTopbar(me, error);
@@ -43,57 +54,60 @@ const site = here.path[here.path.length - 1];
 let info = (await siteChrome(siteId, { currentId: siteId, footer: true })).site;
 $('title').textContent = site.name;
 document.title = `${site.name} — ShareCraft`;
-$('role').textContent = roleLine(here.access);
 const manageSite = can(here.access, 'manage_site');
 const manageAccess = can(here.access, 'manage_access');
-$('new-library').hidden = !manageSite;
-$('groups-link').hidden = !manageSite;
-$('settings-link').hidden = !(manageSite || me.is_admin);
-$('access-link').hidden = !manageAccess;
-$('explorer-link').hidden = !manageAccess;
-$('site-tools').hidden = !(manageSite || manageAccess || me.is_admin);
+
+const announce = (text) => {
+  $('status').textContent = text;
+};
+
+// ---- Manage site: one menu, shown only to people who may use something in it ----
+
 $('settings-link').href = `/site-settings.html?id=${seg(siteId)}`;
+$('look-link').href = `/site-look.html?id=${seg(siteId)}`;
 $('access-link').href = `/access.html?id=${seg(siteId)}`;
-$('explorer-link').href = `/explorer.html?root=${seg(siteId)}`;
 $('groups-link').href = `/groups.html?site=${seg(siteId)}`;
+$('explorer-link').href = `/explorer.html?root=${seg(siteId)}`;
 $('bin-link').href = `/bin.html?site=${seg(siteId)}`;
+$('settings-link').hidden = !(manageSite || me.is_admin);
+$('look-link').hidden = !manageSite;
+$('access-link').hidden = !manageAccess;
+$('groups-link').hidden = !manageSite;
+$('explorer-link').hidden = !manageAccess;
+$('bin-link').hidden = !(manageSite || manageAccess);
+// Usage is shown to people who manage the site; administrators may set the quota anywhere.
+$('quota-item').hidden = !(manageSite || me.is_admin);
+const mayManage = manageSite || manageAccess || me.is_admin;
+$('manage-wrap').hidden = !mayManage;
+if (mayManage) setupMenu($('manage-button'), $('manage-menu'));
 
-// A new library is a document, image or template library; administrators may make asset libraries.
-$('library-kind').replaceChildren(
-  ...libraryKindChoices(me.is_admin).map((choice) => h('option', { value: choice.value }, choice.label)),
-);
-$('new-library').addEventListener('submit', async (event) => {
-  event.preventDefault();
-  showMessage(error, '');
-  const result = await api('POST', `/sites/${seg(siteId)}/libraries`, {
-    name: $('library-name').value.trim(),
-    kind: $('library-kind').value,
-  });
-  if (result.ok) location.assign(pageFor('library', result.data.id));
-  else showMessage(error, messageFor(result.error));
-});
+/** Opens `dialog` with `first` focused; focus goes back to the Manage site button when it closes. */
+function openDialog(dialog, first, back = $('manage-button')) {
+  dialog.showModal();
+  first?.focus();
+  dialog.addEventListener('close', () => back?.isConnected && back.focus(), { once: true });
+}
 
-await showAbout();
-await showLibraries();
-if (manageSite) await showStorage(info);
-else if (me.is_admin) showQuotaOnly();
-await showMembers();
+// ---- the introduction: description, kind and hub as chips, owners as avatar chips ----
 
 /**
- * What the site is: its kind, description, owners and hub, and the archived banner. People who
- * manage it may join it to a hub they can see, or leave the one it joined; a hub joins none.
+ * What the site is: its description, kind, hub and owners, and the archived banner. Also whether
+ * the hub entry of Manage site is offered: people who manage the site may join it to a hub or
+ * leave the one it joined; a hub joins none, and an archived site cannot change its hub.
  */
-async function showAbout() {
+function showAbout() {
   if (!info) return;
   $('about').hidden = false;
-  $('kind-label').textContent = kindLabel(info.kind);
-  $('hub-mark').hidden = !info.is_hub;
   $('description').textContent = info.description ?? '';
   $('description').hidden = !info.description;
-  $('owners').textContent = info.owners?.length ? info.owners.join(', ') : 'No owners';
-  if (info.is_hub) $('hub-line').replaceChildren('This site is a hub. Other sites can join it.');
-  else if (info.hub) $('hub-line').replaceChildren(h('a', { href: pageFor('site', info.hub.id) }, info.hub.name));
-  else $('hub-line').replaceChildren('None');
+  $('kind-chip').textContent = kindLabel(info.kind);
+  const hubChip = $('hub-chip');
+  hubChip.hidden = !(info.is_hub || info.hub);
+  if (info.is_hub) hubChip.replaceChildren('Hub: other sites can join it');
+  else if (info.hub) hubChip.replaceChildren('In the hub ', h('a', { href: pageFor('site', info.hub.id) }, info.hub.name));
+  const owners = info.owners ?? [];
+  $('owners-row').hidden = owners.length === 0;
+  $('owners').replaceChildren(...owners.map((name) => ownerChip(name)));
   $('archived-banner').hidden = !info.archived;
   if (info.archived?.at) {
     $('archived-banner').replaceChildren(
@@ -102,105 +116,174 @@ async function showAbout() {
       h('small', {}, `Archived ${formatDate(info.archived.at)}${info.archived.by ? ` by ${info.archived.by}` : ''}.`),
     );
   }
-  // An archived site cannot change its hub (the server answers `archived`), so neither is offered.
-  const mayJoin = can(info.access, 'manage_site') && !info.is_hub && !info.archived;
-  $('leave-hub-row').hidden = !(mayJoin && info.hub);
+  $('hub-item').hidden = !(can(info.access, 'manage_site') && !info.is_hub && !info.archived);
+  // Owners are told on the page itself when the site is nearly full; the figures are in Storage quota.
+  const warning = manageSite && info.used !== undefined && info.quota_warning;
+  $('storage-warning').hidden = !warning;
+  if (warning) $('storage-warning').textContent = quotaText(info);
+}
+
+/** Reads the site and its bars again (after its hub or quota changed) and draws the introduction. */
+async function refreshSite(fallback) {
+  info = (await siteChrome(siteId, { currentId: siteId, footer: true })).site ?? fallback ?? info;
+  showAbout();
+}
+
+showAbout();
+
+// ---- Join or leave a hub… ----
+
+$('hub-item').addEventListener('click', async () => {
+  showMessage($('hub-error'), '');
+  const joined = info?.hub;
+  $('leave-hub').hidden = !joined;
   $('join-hub').hidden = true;
-  if (mayJoin && !info.hub) {
-    const hubs = await api('GET', '/hubs');
-    const choices = hubs.ok ? hubs.data.filter((hub) => hub.id !== siteId) : [];
-    $('hub-choice').replaceChildren(...choices.map((hub) => h('option', { value: hub.id }, hub.name)));
-    $('join-hub').hidden = choices.length === 0;
+  $('hub-field').hidden = true;
+  $('hub-close').textContent = 'Cancel';
+  if (joined) {
+    $('hub-text').replaceChildren('This site has joined the hub ', h('strong', {}, joined.name), '. Leaving it takes the hub’s navigation off this site.');
+    openDialog($('hub-dialog'), $('hub-close'));
+    return;
   }
-}
+  const hubs = await api('GET', '/hubs');
+  const choices = hubs.ok ? hubs.data.filter((hub) => hub.id !== siteId) : [];
+  $('hub-choice').replaceChildren(...choices.map((hub) => h('option', { value: hub.id }, hub.name)));
+  $('hub-field').hidden = choices.length === 0;
+  $('join-hub').hidden = choices.length === 0;
+  if (!hubs.ok) $('hub-text').textContent = messageFor(hubs.error);
+  else if (choices.length === 0) {
+    $('hub-text').textContent = 'There is no hub you can join this site to.';
+    $('hub-close').textContent = 'Close';
+  } else $('hub-text').textContent = 'A site in a hub shows the hub’s navigation and is listed on the hub’s page.';
+  openDialog($('hub-dialog'), choices.length ? $('hub-choice') : $('hub-close'));
+});
 
-/** Joins the hub `hub`, or leaves the one joined (`null`), then draws the site and its bars again. */
+/** Joins the hub `hub`, or leaves the one joined (`null`); refusals stay in the dialog. */
 async function setHub(hub) {
-  showMessage(error, '');
+  showMessage($('hub-error'), '');
   const result = await api('PUT', `/sites/${seg(siteId)}/joined-hub`, { hub });
-  if (!result.ok) return showMessage(error, messageFor(result.error));
-  info = (await siteChrome(siteId, { currentId: siteId, footer: true })).site ?? result.data;
-  await showAbout();
+  if (!result.ok) return showMessage($('hub-error'), messageFor(result.error));
+  $('hub-dialog').close();
+  await refreshSite(result.data);
+  announce(info?.hub ? `This site joined the hub ${info.hub.name}.` : 'This site left its hub.');
 }
 
-$('join-hub').addEventListener('submit', async (event) => {
+$('hub-close').addEventListener('click', () => $('hub-dialog').close());
+$('hub-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   if ($('hub-choice').value) await setHub($('hub-choice').value);
 });
 $('leave-hub').addEventListener('click', () => setHub(null));
 
-/** On a hub's page: the sites that joined it which the person can see. */
-async function showMembers() {
-  if (!info?.is_hub) return;
-  const result = await api('GET', `/hubs/${seg(siteId)}/sites`);
-  if (!result.ok) return;
-  $('members').hidden = false;
-  $('members-empty').hidden = result.data.length > 0;
-  $('member-sites').replaceChildren(...result.data.map(directoryRow));
-}
+// ---- Storage quota… ----
 
 /**
- * For people who manage the site: what it holds against its quota, warning from 90%. `known` is
- * the site as already read, if it was.
+ * Fills the storage dialog: for people who manage the site what it holds against its quota
+ * (warning from 90%); administrators get the field to set or remove the quota too, and where
+ * they do not manage the site, the field without the figures.
  */
-async function showStorage(known) {
-  let data = known;
-  if (!data || data.used === undefined) {
+async function fillStorage() {
+  let data = info;
+  if (manageSite && (!data || data.used === undefined)) {
     const result = await api('GET', `/sites/${seg(siteId)}`);
-    if (!result.ok) return;
-    data = result.data;
+    if (result.ok) data = result.data;
   }
-  if (data.used === undefined) return;
-  const { used, quota, quota_warning: warning } = data;
-  $('storage').hidden = false;
-  $('storage-text').textContent = quotaText(data);
-  $('storage-text').classList.toggle('msg', Boolean(warning));
-  const percent = usagePercent(used, quota);
-  $('storage-bar').hidden = percent === null;
+  const known = manageSite && data && data.used !== undefined;
+  const text = $('storage-text');
+  text.textContent = known ? quotaText(data) : 'The current quota and usage are shown to people who manage this site.';
+  text.className = known && data.quota_warning ? 'note' : 'meta';
+  const percent = known ? usagePercent(data.used, data.quota) : null;
+  const bar = $('storage-bar');
+  bar.hidden = percent === null;
   if (percent !== null) {
-    $('storage-bar').value = percent;
-    $('storage-bar').textContent = `${percent}%`;
-    $('storage-bar').setAttribute('aria-label', `${percent}% of the storage quota used`);
-    $('storage-bar').classList.toggle('warn', Boolean(warning));
+    bar.value = percent;
+    bar.textContent = `${percent}%`;
+    bar.setAttribute('aria-label', `${percent}% of the storage quota used`);
+    bar.classList.toggle('warn', Boolean(data.quota_warning));
   }
-  $('quota-form').hidden = !me.is_admin;
-  $('quota-remove').hidden = !me.is_admin;
-  if (me.is_admin) $('quota-gb').value = quota === null ? '' : String(Math.round((quota / 1024 ** 3) * 100) / 100);
+  for (const id of ['quota-field', 'quota-set']) $(id).hidden = !me.is_admin;
+  // There is nothing to remove where the site is known to have no quota.
+  $('quota-remove').hidden = !me.is_admin || (known && data.quota == null);
+  $('quota-close').textContent = me.is_admin ? 'Cancel' : 'Close';
+  if (me.is_admin) $('quota-gb').value = known && data.quota != null ? String(Math.round((data.quota / 1024 ** 3) * 100) / 100) : '';
 }
 
-/**
- * Administrators may set a quota even where they hold no manage_site role here; the server
- * shows usage only to people who manage the site, so they get the field without the figures.
- */
-function showQuotaOnly() {
-  $('storage').hidden = false;
-  $('storage-text').textContent = 'The current quota and usage are shown to people who manage this site.';
-  $('quota-form').hidden = false;
-  $('quota-remove').hidden = false;
-}
+$('quota-item').addEventListener('click', async () => {
+  showMessage($('quota-error'), '');
+  await fillStorage();
+  openDialog($('quota-dialog'), me.is_admin ? $('quota-gb') : $('quota-close'));
+});
+$('quota-close').addEventListener('click', () => $('quota-dialog').close());
 
-/** Sets the quota to `bytes` (null for none) and shows the result. */
+/** Sets the quota to `bytes` (null for none); the dialog closes and says what changed. */
 async function putQuota(bytes) {
   const result = await api('PUT', `/sites/${seg(siteId)}/quota`, { bytes });
-  if (!result.ok) return showMessage(error, messageFor(result.error));
-  if (manageSite) await showStorage(null);
-  else showMessage(error, bytes === null ? 'The quota was removed.' : 'The quota was set.');
+  if (!result.ok) return showMessage($('quota-error'), messageFor(result.error));
+  $('quota-dialog').close();
+  if (manageSite) await refreshSite();
+  announce(bytes === null ? 'The quota was removed.' : 'The quota was set.');
 }
 
 $('quota-form').addEventListener('submit', async (event) => {
   event.preventDefault();
-  showMessage(error, '');
+  showMessage($('quota-error'), '');
   const asked = quotaSubmit($('quota-gb').value, { blind: true });
-  if (asked.error) return showMessage(error, asked.error);
+  if (asked.error) return showMessage($('quota-error'), asked.error);
   await putQuota(asked.bytes);
 });
 
 $('quota-remove').addEventListener('click', async () => {
-  showMessage(error, '');
+  showMessage($('quota-error'), '');
   const sure = await confirmDialog('Remove the storage quota of this site? It will then have no limit.', 'Remove quota');
   if (sure) await putQuota(null);
+  else $('quota-remove').focus();
 });
 
+// ---- New library: a card-shaped button opening a dialog ----
+
+// A new library is a document, image or template library; administrators may make asset libraries.
+$('library-kind').replaceChildren(
+  ...libraryKindChoices(me.is_admin).map((choice) => h('option', { value: choice.value }, choice.label)),
+);
+const mayAddLibrary = () => manageSite && !info?.archived;
+
+$('new-library-cancel').addEventListener('click', () => $('new-library-dialog').close());
+$('new-library').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const say = (text) => showMessage($('new-library-error'), text);
+  const name = $('library-name').value.trim();
+  if (!name) {
+    say('Give the library a name.');
+    $('library-name').focus();
+    return;
+  }
+  say('');
+  $('new-library-submit').disabled = true;
+  const result = await api('POST', `/sites/${seg(siteId)}/libraries`, { name, kind: $('library-kind').value });
+  $('new-library-submit').disabled = false;
+  if (result.ok) location.assign(pageFor('library', result.data.id));
+  else say(messageFor(result.error));
+});
+
+function newLibraryCard() {
+  const button = h(
+    'button',
+    { type: 'button', class: 'new-card' },
+    h('span', { class: 'new-plus', 'aria-hidden': 'true' }, '+'),
+    'New library',
+  );
+  button.addEventListener('click', () => {
+    $('library-name').value = '';
+    $('library-kind').value = 'document';
+    showMessage($('new-library-error'), '');
+    openDialog($('new-library-dialog'), $('library-name'), button);
+  });
+  return h('li', { class: 'library-card new' }, button);
+}
+
+// ---- the libraries as cards, and the files changed lately across them ----
+
+/** The libraries of the site the person can see, their kinds and first pages, then both sections. */
 async function showLibraries() {
   const result = await api('GET', `/nodes/${seg(siteId)}/children?limit=500`);
   if (!result.ok) {
@@ -208,36 +291,122 @@ async function showLibraries() {
     return;
   }
   const libraries = result.data.items.filter((item) => item.kind === 'library');
-  $('empty').hidden = libraries.length > 0;
-  // People who manage the site may delete a library (to the recycle bin), unless it is archived.
-  const mayDelete = manageSite && !info?.archived;
-  $('libraries').replaceChildren(
-    ...libraries.map((library) =>
+  const read = libraries.slice(0, RECENT_LIBRARIES);
+  // The kinds (a library the person sees only in part answers nothing) and a few first pages, together.
+  const [kinds, pages] = await Promise.all([
+    Promise.all(
+      libraries.map((library, index) =>
+        library.access && index < KINDS_ASKED ? api('GET', `/libraries/${seg(library.id)}`) : null,
+      ),
+    ),
+    Promise.all(read.map((library) => api('GET', `/nodes/${seg(library.id)}/children?limit=100`))),
+  ]);
+  const models = libraries.map((library, index) => {
+    const page = index < read.length && pages[index].ok ? pages[index].data : null;
+    return libraryCardModel({
+      ...library,
+      kind: kinds[index]?.ok ? kinds[index].data.kind : undefined,
+      count: page ? page.items.length : undefined,
+      more: Boolean(page?.next),
+    });
+  });
+  $('empty').hidden = libraries.length > 0 || mayAddLibrary();
+  $('libraries').replaceChildren(...models.map(libraryCard), ...(mayAddLibrary() ? [newLibraryCard()] : []));
+  showRecent(read.map((library, index) => ({ library, items: pages[index].ok ? pages[index].data.items : [] })));
+}
+
+/** One library card: its icon, name (the card's one link), kind, count and access; owners get Actions. */
+function libraryCard(model) {
+  const marks = [
+    model.limited ? h('span', { class: 'mark' }, 'Limited access') : null,
+    model.ownPermissions ? h('span', { class: 'mark' }, 'Own permissions') : null,
+  ].filter(Boolean);
+  const facts = [model.kind, model.count].filter(Boolean).join(' · ');
+  return h(
+    'li',
+    { class: 'library-card' },
+    h('span', { class: 'lib-pic' }, libraryIcon(model.icon)),
+    h(
+      'div',
+      { class: 'lib-body' },
+      h('h3', {}, h('a', { class: 'card-link', href: model.href }, model.name)),
+      h('p', { class: 'lib-facts' }, facts),
+      marks.length ? h('p', { class: 'card-badges' }, ...marks) : null,
+    ),
+    // People who manage the site may delete a library (to the recycle bin), unless it is archived.
+    mayAddLibrary() ? libraryActions(model) : null,
+  );
+}
+
+/** The small Actions menu of a library card: Delete, which asks first, naming the library. */
+function libraryActions(model) {
+  const menuId = `library-menu-${model.id}`;
+  const button = h(
+    'button',
+    { type: 'button', class: 'plain menu-button dots', 'aria-label': `Actions for ${model.name}` },
+    h('span', { 'aria-hidden': 'true' }, '⋯'),
+  );
+  const remove = h('button', { type: 'button', role: 'menuitem', class: 'danger' }, 'Delete');
+  const menu = h('ul', { id: menuId, class: 'menu end', 'aria-label': `Actions for ${model.name}` }, h('li', { role: 'none' }, remove));
+  remove.addEventListener('click', async () => {
+    showMessage(error, '');
+    if (!(await confirmDialog(deleteLibraryText(model.name), 'Delete library'))) return button.focus();
+    const result = await api('DELETE', `/nodes/${seg(model.id)}`);
+    if (!result.ok) {
+      showMessage(error, messageFor(result.error));
+      return button.focus();
+    }
+    announce(`The library ${model.name} is in the recycle bin.`);
+    info = (await siteChrome(siteId, { currentId: siteId, footer: true })).site ?? info;
+    showAbout();
+    await showLibraries();
+    $('libraries').querySelector('.card-link, .new-card')?.focus();
+  });
+  const wrap = h('div', { class: 'menu-wrap lib-actions' }, button, menu);
+  setupMenu(button, menu);
+  return wrap;
+}
+
+/** "Recent in this site": the files changed last in the first pages of `lists`, with their library. */
+function showRecent(lists) {
+  const files = recentAcrossLibraries(lists, RECENT_SHOWN);
+  $('recent-empty').hidden = files.length > 0;
+  $('recent').replaceChildren(
+    ...files.map((file) =>
       h(
         'li',
-        {},
-        h('span', { class: 'grow' }, h('a', { href: pageFor('library', library.id) }, library.name)),
-        library.access ? h('small', {}, roleLine(library.access)) : h('small', { class: 'mark' }, 'Limited access'),
-        library.inherits ? null : h('small', { class: 'mark' }, 'Own permissions'),
-        mayDelete ? deleteLibraryButton(library) : null,
+        { class: 'recent-file' },
+        recentIcon(file),
+        h(
+          'span',
+          { class: 'recent-text' },
+          h('a', { href: file.href, title: file.name }, file.name),
+          h(
+            'small',
+            {},
+            file.libraryName ? `${file.libraryName} · ` : '',
+            h('time', { datetime: file.at, title: formatDate(file.at) }, relativeTime(file.at)),
+          ),
+        ),
       ),
     ),
   );
 }
 
-/** The Delete button of `library`: asks first, naming it, then sends it to the recycle bin. */
-function deleteLibraryButton(library) {
-  const button = h('button', { type: 'button', class: 'plain', 'aria-label': `Delete the library ${library.name}` }, 'Delete');
-  button.addEventListener('click', async () => {
-    showMessage(error, '');
-    if (!(await confirmDialog(deleteLibraryText(library.name), 'Delete library'))) return;
-    const result = await api('DELETE', `/nodes/${seg(library.id)}`);
-    if (!result.ok) return showMessage(error, messageFor(result.error));
-    $('status').textContent = `The library ${library.name} is in the recycle bin.`;
-    info = (await siteChrome(siteId, { currentId: siteId, footer: true })).site ?? info;
-    await showLibraries();
-  });
-  return button;
+await showLibraries();
+setInterval(() => {
+  for (const time of $('recent').querySelectorAll('time')) time.textContent = relativeTime(time.dateTime);
+}, 60_000);
+
+// ---- on a hub's page: the sites that joined it which the person can see ----
+
+if (info?.is_hub) {
+  const result = await api('GET', `/hubs/${seg(siteId)}/sites`);
+  if (result.ok) {
+    $('members').hidden = false;
+    $('members-empty').hidden = result.data.length > 0;
+    $('member-sites').replaceChildren(...result.data.map(directoryRow));
+  }
 }
 
 function fail(text) {
