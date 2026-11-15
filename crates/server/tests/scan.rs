@@ -283,6 +283,147 @@ async fn icap_clean_and_infected_verdicts() {
     }
     let parsed = ScannerUrl::parse("icap://scanner.example/avscan").unwrap();
     assert_eq!(parsed.to_string(), "icap://scanner.example:1344/avscan");
+    // The fake scanner refuses bare LF line ends; none were sent.
+    assert_eq!(fake.seen().malformed, 0);
+}
+
+/// Listens for one connection, keeps every byte the client sends until it has been quiet for
+/// half a second, then answers `answer` and hands the bytes back.
+fn capture(answer: &'static [u8]) -> (SocketAddr, std::sync::mpsc::Receiver<Vec<u8>>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind(local()).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        let mut bytes = Vec::new();
+        let mut buffer = [0u8; 4096];
+        loop {
+            match stream.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => bytes.extend_from_slice(&buffer[..n]),
+            }
+        }
+        let _ = stream.write_all(answer);
+        let _ = tx.send(bytes);
+    });
+    (addr, rx)
+}
+
+/// Whether every line feed in `bytes` follows a carriage return.
+fn crlf_only(bytes: &[u8]) -> bool {
+    bytes
+        .iter()
+        .enumerate()
+        .all(|(at, b)| *b != b'\n' || (at > 0 && bytes[at - 1] == b'\r'))
+}
+
+#[tokio::test]
+async fn icap_requests_use_crlf_only() {
+    let client_at = |addr: SocketAddr| {
+        Client::new(
+            ScannerUrl::parse(&format!("icap://{addr}/scan")).unwrap(),
+            Duration::from_secs(10),
+        )
+    };
+    let options_answer: &[u8] =
+        b"ICAP/1.0 200 OK\r\nISTag: \"x\"\r\nPreview: 4\r\nEncapsulated: null-body=0\r\n\r\n";
+    let clean: &[u8] = b"ICAP/1.0 204 No Content\r\nEncapsulated: null-body=0\r\n\r\n";
+
+    let (addr, sent) = capture(options_answer);
+    let options = client_at(addr).options().await.unwrap();
+    assert_eq!(options.preview, Some(4));
+    let bytes = sent.recv().unwrap();
+    assert!(bytes.starts_with(b"OPTIONS icap://"), "{bytes:?}");
+    assert!(bytes.ends_with(b"\r\n\r\n"), "{bytes:?}");
+    assert!(crlf_only(&bytes), "{}", String::from_utf8_lossy(&bytes));
+
+    // Without a preview, with one that the file overflows, and with one that holds it whole.
+    for (preview, body, ending) in [
+        (None, b"abcdefghij".as_slice(), b"\r\n0\r\n\r\n".as_slice()),
+        (
+            Some(4),
+            b"abcdefghij".as_slice(),
+            b"\r\n0\r\n\r\n".as_slice(),
+        ),
+        (
+            Some(4),
+            b"abc".as_slice(),
+            b"\r\n0; ieof\r\n\r\n".as_slice(),
+        ),
+    ] {
+        let (addr, sent) = capture(clean);
+        let options = server::icap::Options {
+            preview,
+            ..server::icap::Options::default()
+        };
+        let verdict = client_at(addr)
+            .scan_with(&options, body, body.len() as u64, "a b.txt")
+            .await
+            .unwrap();
+        assert_eq!(verdict, Verdict::Clean);
+        let bytes = sent.recv().unwrap();
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        assert!(bytes.starts_with(b"RESPMOD icap://"), "{text}");
+        assert!(crlf_only(&bytes), "{text}");
+        assert!(bytes.ends_with(ending), "{text}");
+        assert!(
+            text.contains("\r\n\r\nGET /a%20b.txt HTTP/1.1\r\n"),
+            "{text}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn icap_deadline_covers_the_whole_exchange() {
+    // An answer dribbled a byte every half second would take most of a minute.
+    let fake = FakeIcap::start(
+        local(),
+        Behaviour {
+            dribble: Some(Duration::from_millis(500)),
+            ..Behaviour::default()
+        },
+    )
+    .unwrap();
+    let client = Client::new(
+        ScannerUrl::parse(&fake.url()).unwrap(),
+        Duration::from_secs(2),
+    );
+    let started = std::time::Instant::now();
+    let failed = client.scan(&b"slowly"[..], 6, "slow.bin").await;
+    assert!(
+        matches!(failed, Err(server::icap::IcapError::TimedOut)),
+        "{failed:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "{:?}",
+        started.elapsed()
+    );
+
+    // A head that never ends is refused once it passes its limit.
+    fake.set(Behaviour {
+        endless_head: true,
+        ..Behaviour::default()
+    });
+    let client = Client::new(
+        ScannerUrl::parse(&fake.url()).unwrap(),
+        Duration::from_secs(30),
+    );
+    let started = std::time::Instant::now();
+    let failed = client.scan(&b"endless"[..], 7, "endless.bin").await;
+    assert!(
+        matches!(failed, Err(server::icap::IcapError::Malformed(_))),
+        "{failed:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
 }
 
 /// Reads `total` bytes of a pattern without ever holding them, noting the most read beyond
@@ -798,6 +939,41 @@ async fn scanner_failures_hold_and_retry() {
         ScanState::Clean
     );
 
+    // Dribbles its answer a byte at a time: the whole exchange has a deadline.
+    fake.set(Behaviour {
+        dribble: Some(Duration::from_millis(500)),
+        ..Behaviour::default()
+    });
+    let dribbled = b"the scanner answers very slowly".to_vec();
+    let started = std::time::Instant::now();
+    let doc = upload(&server, &ann, &home, "Dribbled.bin", &dribbled).await;
+    wait_scan(&server, &dribbled, |s| s == ScanState::Failed).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "{:?}",
+        started.elapsed()
+    );
+    let info = state_of(&server, &dribbled).await.unwrap();
+    assert!(
+        info.detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("in time"),
+        "{info:?}"
+    );
+    let (status, _) = download(&server, &ann, &doc).await;
+    assert_eq!(status, StatusCode::LOCKED);
+    fake.set(Behaviour::default());
+    server::scan_once(
+        &state,
+        OffsetDateTime::now_utc() + time::Duration::minutes(2),
+    )
+    .await;
+    assert_eq!(
+        state_of(&server, &dribbled).await.unwrap().state,
+        ScanState::Clean
+    );
+
     // Restarts during a scan.
     fake.set(Behaviour {
         slow: Some(Duration::from_secs(10)),
@@ -922,6 +1098,24 @@ async fn unavailable_allow_lets_files_through() {
     let (status, _) = download(&server, &ann, &doc).await;
     assert_eq!(status, StatusCode::LOCKED);
 
+    // Clearing the scanner releases nothing: held content stays held.
+    let answer = scanner(&server, &admin, json!({ "scanner_url": "" })).await;
+    assert_eq!(answer["ok"], true, "{answer}");
+    let (status, body) = download(&server, &ann, &doc).await;
+    assert_eq!(status, StatusCode::LOCKED, "{body}");
+    assert_eq!(body["scan"], "failed");
+    assert_eq!(listed(&server, &ann, &home, &doc).await["scan"], "held");
+    // New content stored with no scanner is unscanned, and available.
+    let fresh = b"stored with no scanner".to_vec();
+    let fresh_doc = upload(&server, &ann, &home, "Fresh.bin", &fresh).await;
+    assert_eq!(
+        state_of(&server, &fresh).await.unwrap().state,
+        ScanState::Unscanned
+    );
+    let (status, _) = download(&server, &ann, &fresh_doc).await;
+    assert_eq!(status, StatusCode::OK);
+    scanner(&server, &admin, json!({ "scanner_url": url })).await;
+
     let (status, settings) =
         call(&server, &admin, Method::GET, "/api/settings/scanner", None).await;
     assert_eq!(status, StatusCode::OK);
@@ -1043,7 +1237,15 @@ async fn existing_content_is_unscanned_until_asked() {
     let kept = upload(&server, &ann, &home, "Good.bin", &good).await;
     let doomed = upload(&server, &ann, &home, "Bad.bin", &bad).await;
 
-    let fake = FakeIcap::start(local(), Behaviour::default()).unwrap();
+    // Slow, so that the queued content can be seen waiting.
+    let fake = FakeIcap::start(
+        local(),
+        Behaviour {
+            slow: Some(Duration::from_secs(3)),
+            ..Behaviour::default()
+        },
+    )
+    .unwrap();
     scanner(&server, &admin, json!({ "scanner_url": fake.url() })).await;
     server::scan_once(&state, OffsetDateTime::now_utc()).await;
     assert_eq!(fake.seen().scans, 0);
@@ -1075,6 +1277,21 @@ async fn existing_content_is_unscanned_until_asked() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["queued"], 2);
+    // Queued content stays available while it waits, uploads included.
+    for (bytes, doc) in [(&good, &kept), (&bad, &doomed)] {
+        assert_eq!(
+            state_of(&server, bytes).await.unwrap().state,
+            ScanState::Pending
+        );
+        let (status, body) = download(&server, &ann, doc).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            listed(&server, &ann, &home, doc)
+                .await
+                .get("scan")
+                .is_none()
+        );
+    }
     wait_scan(&server, &good, |s| s == ScanState::Clean).await;
     wait_scan(&server, &bad, |s| s == ScanState::Infected).await;
     let (status, _) = download(&server, &ann, &kept).await;

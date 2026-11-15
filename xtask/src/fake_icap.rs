@@ -7,7 +7,10 @@
 //! `204`. It honours a `Preview` it advertised (answering `100 Continue`, or at once when the
 //! preview holds the test string or ends the file with `ieof`). Its behaviour can be changed
 //! while it runs, to be slow, fail, answer garbage, stall or drop the connection part way
-//! through a body.
+//! through a body, dribble its answer a byte at a time, or send a head that never ends.
+//!
+//! Like a strict real scanner, it takes only CRLF line ends: a request line, header or chunk
+//! line ended by a bare LF ends the connection without an answer, and is counted.
 //!
 //! The EICAR string is built here from parts at run time, so no source file or binary holds it
 //! whole.
@@ -60,6 +63,10 @@ pub struct Behaviour {
     pub stall_after: Option<u64>,
     /// Closes the connection once this many bytes of a body have arrived.
     pub drop_after: Option<u64>,
+    /// Sends each answer to a scan one byte at a time, waiting this long between bytes.
+    pub dribble: Option<Duration>,
+    /// Answers a scan with a status line and then headers without end.
+    pub endless_head: bool,
 }
 
 /// What the fake server has seen since it started.
@@ -79,10 +86,13 @@ pub struct Seen {
     pub infected: u64,
     /// Body bytes received, over all scans.
     pub received: u64,
+    /// Requests refused because a line did not end with CRLF, or was otherwise malformed.
+    pub malformed: u64,
 }
 
 #[derive(Default)]
 struct Counters {
+    malformed: AtomicU64,
     options: AtomicU64,
     scans: AtomicU64,
     previews: AtomicU64,
@@ -178,6 +188,7 @@ impl FakeIcap {
             ieofs: c.ieofs.load(Ordering::SeqCst),
             infected: c.infected.load(Ordering::SeqCst),
             received: c.received.load(Ordering::SeqCst),
+            malformed: c.malformed.load(Ordering::SeqCst),
         }
     }
 
@@ -222,7 +233,11 @@ fn accept(listener: &TcpListener, shared: &Arc<Shared>) {
                 }
                 let serving = Arc::clone(shared);
                 thread::spawn(move || {
-                    let _ = serve(stream, &serving);
+                    if let Err(e) = serve(stream, &serving)
+                        && e.kind() == ErrorKind::InvalidData
+                    {
+                        serving.counters.malformed.fetch_add(1, Ordering::SeqCst);
+                    }
                 });
             }
             Err(e) if e.kind() == ErrorKind::WouldBlock => {
@@ -257,9 +272,14 @@ fn read_line(reader: &mut impl BufRead) -> std::io::Result<Option<String>> {
     if read == 0 {
         return Ok(None);
     }
-    while line.last().is_some_and(|b| *b == b'\n' || *b == b'\r') {
-        line.pop();
+    // Every line ends with CRLF; a bare LF, or no line end at all, is refused.
+    if !line.ends_with(b"\r\n") {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "a line that does not end with CRLF",
+        ));
     }
+    line.truncate(line.len() - 2);
     Ok(Some(String::from_utf8_lossy(&line).into_owned()))
 }
 
@@ -486,6 +506,26 @@ fn respmod(
             thread::sleep(step);
             waited += step;
         }
+    }
+    if behaviour.endless_head {
+        writer.write_all(b"ICAP/1.0 204 No Content\r\n")?;
+        while !shared.stopping() {
+            writer.write_all(b"X-Padding: the head of this answer never ends\r\n")?;
+        }
+        return Ok(false);
+    }
+    if let Some(gap) = behaviour.dribble {
+        let answer: &[u8] =
+            b"ICAP/1.0 204 No Content\r\nISTag: \"fake-1\"\r\nEncapsulated: null-body=0\r\n\r\n";
+        for byte in answer {
+            if shared.stopping() {
+                return Ok(false);
+            }
+            writer.write_all(std::slice::from_ref(byte))?;
+            writer.flush()?;
+            thread::sleep(gap);
+        }
+        return Ok(true);
     }
     if behaviour.garbage {
         writer.write_all(b"this is not an ICAP answer\r\n\r\n")?;

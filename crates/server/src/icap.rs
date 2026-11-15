@@ -8,8 +8,12 @@
 //!
 //! `204`, or `200` without an infection header, is clean; `200` or `403` with
 //! `X-Infection-Found`, `X-Violations-Found` or `X-Virus-ID` is infected; anything else, a
-//! malformed answer, a refused connection or a step that takes longer than the timeout is an
-//! error, which the scan worker retries.
+//! malformed answer, a refused connection, an answer head over 64 KiB, or an exchange that
+//! takes longer than the timeout is an error, which the scan worker retries. The timeout covers
+//! the whole exchange: connecting, sending, and reading the full answer head, so a scanner that
+//! dribbles its answer cannot keep content waiting for ever.
+//!
+//! Every line of the protocol, and every chunk's framing, ends with CRLF.
 
 use std::fmt::Write as _;
 use std::time::Duration;
@@ -24,6 +28,12 @@ const PIECE: usize = 64 * 1024;
 const MAX_HEAD: usize = 64 * 1024;
 /// The largest preview sent, whatever the service advertises.
 const MAX_PREVIEW: u64 = 64 * 1024;
+/// The end of every protocol line.
+const CRLF: &str = "\r\n";
+/// The zero chunk that ends a body (with its empty trailer).
+const LAST_CHUNK: &str = "0\r\n\r\n";
+/// The zero chunk that ends a preview holding the whole file.
+const LAST_IN_PREVIEW: &str = "0; ieof\r\n\r\n";
 
 /// What a scanner said of a file.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -92,8 +102,8 @@ pub struct Client {
 }
 
 impl Client {
-    /// A client of the service at `url`, giving up on any one step (connecting, sending a
-    /// piece, waiting for an answer) after `timeout`.
+    /// A client of the service at `url`, giving up on an exchange (connecting, sending the
+    /// request and file, and reading the answer) that takes longer than `timeout`.
     #[must_use]
     pub fn new(url: ScannerUrl, timeout: Duration) -> Client {
         Client { url, timeout }
@@ -105,16 +115,23 @@ impl Client {
         &self.url
     }
 
-    /// Runs `step`, failing with [`IcapError::TimedOut`] after the timeout.
+    /// Runs one step of an exchange, its I/O error described by `error`.
     async fn step<T>(
         &self,
         step: impl Future<Output = std::io::Result<T>>,
         error: fn(std::io::Error) -> IcapError,
     ) -> Result<T, IcapError> {
-        match tokio::time::timeout(self.timeout, step).await {
-            Ok(result) => result.map_err(error),
-            Err(_) => Err(IcapError::TimedOut),
-        }
+        step.await.map_err(error)
+    }
+
+    /// Runs a whole exchange, failing with [`IcapError::TimedOut`] once the timeout has passed.
+    async fn within<T>(
+        &self,
+        exchange: impl Future<Output = Result<T, IcapError>>,
+    ) -> Result<T, IcapError> {
+        tokio::time::timeout(self.timeout, exchange)
+            .await
+            .unwrap_or(Err(IcapError::TimedOut))
     }
 
     async fn connect(&self) -> Result<TcpStream, IcapError> {
@@ -138,6 +155,10 @@ impl Client {
     /// The scanner cannot be reached, does not answer in time, or answers something other
     /// than `200` ICAP.
     pub async fn options(&self) -> Result<Options, IcapError> {
+        self.within(self.ask_options()).await
+    }
+
+    async fn ask_options(&self) -> Result<Options, IcapError> {
         let mut stream = self.connect().await?;
         let (target, host) = self.target();
         let request = format!(
@@ -174,8 +195,11 @@ impl Client {
         size: u64,
         name: &str,
     ) -> Result<Verdict, IcapError> {
-        let options = self.options().await?;
-        self.scan_with(&options, reader, size, name).await
+        self.within(async {
+            let options = self.ask_options().await?;
+            self.respmod(&options, reader, size, name).await
+        })
+        .await
     }
 
     /// Scans the `size` bytes `reader` gives, a file named `name`, with `RESPMOD`, the service
@@ -183,9 +207,19 @@ impl Client {
     /// when the service takes one.
     ///
     /// # Errors
-    /// The scanner cannot be reached, a step takes longer than the timeout, the file cannot be
-    /// read, or the answer is malformed or neither clean nor infected.
+    /// The scanner cannot be reached, the exchange takes longer than the timeout, the file
+    /// cannot be read, or the answer is malformed or neither clean nor infected.
     pub async fn scan_with(
+        &self,
+        options: &Options,
+        reader: impl AsyncRead + Unpin,
+        size: u64,
+        name: &str,
+    ) -> Result<Verdict, IcapError> {
+        self.within(self.respmod(options, reader, size, name)).await
+    }
+
+    async fn respmod(
         &self,
         options: &Options,
         reader: impl AsyncRead + Unpin,
@@ -237,15 +271,7 @@ impl Client {
             }
             // The whole file fitted in the preview.
             let ended = size <= n;
-            let last = if ended {
-                "0; ieof
-
-"
-            } else {
-                "0
-
-"
-            };
+            let last = if ended { LAST_IN_PREVIEW } else { LAST_CHUNK };
             if let Err(e) = self
                 .step(stream.write_all(last.as_bytes()), IcapError::Io)
                 .await
@@ -273,14 +299,7 @@ impl Client {
             return Err(short_file());
         }
         if let Err(e) = self
-            .step(
-                stream.write_all(
-                    b"0
-
-",
-                ),
-                IcapError::Io,
-            )
+            .step(stream.write_all(LAST_CHUNK.as_bytes()), IcapError::Io)
             .await
         {
             return self.answer_after_failure(&mut stream, e).await;
@@ -311,21 +330,12 @@ impl Client {
                 break;
             }
             let data = piece.get(..n).ok_or(IcapError::Malformed("piece"))?;
-            let size_line = format!(
-                "{n:x}
-"
-            );
+            let size_line = format!("{n:x}{CRLF}");
             self.step(stream.write_all(size_line.as_bytes()), IcapError::Io)
                 .await?;
             self.step(stream.write_all(data), IcapError::Io).await?;
-            self.step(
-                stream.write_all(
-                    b"
-",
-                ),
-                IcapError::Io,
-            )
-            .await?;
+            self.step(stream.write_all(CRLF.as_bytes()), IcapError::Io)
+                .await?;
             sent += u64::try_from(n).unwrap_or(0);
         }
         Ok(sent)

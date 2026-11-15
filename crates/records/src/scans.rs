@@ -6,8 +6,10 @@
 //! 1, 5, 15 and then every 60 minutes) or `too_large`. An administrator may release content
 //! (`released`). Content is available when it is clean, released or unscanned; when it failed
 //! or is too large and the matching setting lets it through; when it is pending and only ever
-//! came from an editor's save (`scan_hold` false: an upload naming it sets the hold); and,
-//! with no scanner configured, whenever it is not infected, as nothing could ever scan it.
+//! came from an editor's save, or was queued by "scan existing files" (`scan_hold` false: an
+//! upload naming it sets the hold). Clearing the scanner setting releases nothing: held content
+//! stays held, as when the scanner is down. Content stored while no scanner is configured is
+//! `unscanned`, and available.
 //!
 //! A `blobs` row is written here in a short transaction of its own, never while holding any
 //! other lock.
@@ -336,8 +338,6 @@ impl ScannerSettings {
         match state {
             ScanState::Clean | ScanState::Released | ScanState::Unscanned => true,
             ScanState::Infected => false,
-            // Nothing can ever scan it while no scanner is configured.
-            _ if self.url.is_none() => true,
             ScanState::Pending => !hold,
             ScanState::Failed => self.unavailable_allow,
             ScanState::TooLarge => self.too_large_allow,
@@ -641,10 +641,13 @@ impl Db {
             .collect())
     }
 
-    /// Queues every unscanned content that some version names for the scanner; how many.
+    /// Queues every unscanned content that some version names for the scanner; how many. It
+    /// stays available while it waits (its hold cleared: it was available before), and is
+    /// quarantined if the scanner finds it infected.
     pub async fn queue_unscanned(&self) -> Result<u64, DbError> {
         let done = sqlx::query(
-            "update blobs b set scan = 'pending', next_scan_at = now(), scan_attempts = 0 \
+            "update blobs b set scan = 'pending', next_scan_at = now(), scan_attempts = 0, \
+                 scan_hold = false \
              where b.scan = 'unscanned' \
                and exists (select 1 from blob_refs r where r.sha256 = b.sha256)",
         )
@@ -853,9 +856,14 @@ mod tests {
         assert!(allowing.available(ScanState::Failed, true));
         assert!(allowing.available(ScanState::TooLarge, true));
         assert!(!allowing.available(ScanState::Infected, false));
+        // Clearing the scanner releases nothing.
         let none = ScannerSettings::default();
-        assert!(none.available(ScanState::Pending, true));
+        assert!(!none.available(ScanState::Pending, true));
+        assert!(none.available(ScanState::Pending, false));
+        assert!(!none.available(ScanState::Failed, true));
+        assert!(!none.available(ScanState::TooLarge, true));
         assert!(!none.available(ScanState::Infected, true));
+        assert!(none.available(ScanState::Unscanned, true));
     }
 
     #[test]

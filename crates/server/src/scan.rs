@@ -172,11 +172,8 @@ async fn scan_stored(
         Ok(Err(e)) => return ScanResult::Failed(format!("cannot open the content: {e}")),
         Err(e) => return ScanResult::Failed(format!("cannot open the content: {e}")),
     };
-    let options = match client.options().await {
-        Ok(options) => options,
-        Err(e) => return ScanResult::Failed(e.to_string()),
-    };
-    match client.scan_with(&options, file, blob.size, name).await {
+    // One deadline for the whole exchange, OPTIONS included.
+    match client.scan(file, blob.size, name).await {
         Ok(Verdict::Clean) => ScanResult::Clean,
         Ok(Verdict::Infected(threat)) => ScanResult::Infected(threat),
         Err(e) => ScanResult::Failed(e.to_string()),
