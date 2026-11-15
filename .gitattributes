@@ -5,3 +5,7 @@ crates/records/migrations/*.sql text eol=lf
 
 # Image fixtures are bytes, never text.
 crates/server/tests/fixtures/images/** binary
+
+# The Windows scripts run on Windows only: cmd needs CRLF, and PowerShell reads either.
+packaging/windows/**/*.cmd text eol=crlf
+packaging/windows/**/*.ps1 text eol=crlf

@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="How to install, start, stop, back up and remove the ready-to-run Windows package of ShareCraft.">
+<title>ShareCraft for Windows</title>
+<style>
+:root{color-scheme:light dark;--ink:light-dark(#172f38,#dce8e6);--muted:light-dark(#536b72,#9db3b6);--line:light-dark(#d7e2e3,#34474c);--accent:light-dark(#086959,#6fd3b8);--paper:light-dark(#fff,#1a2427);--wash:light-dark(#f2f6f5,#11191b);--band:light-dark(#f4f8f7,#212b30);--head:light-dark(#e8efed,#243236);--note:light-dark(#e5f0ec,#1b2f2a);--warn:light-dark(#fff3dc,#3b2f15);--warn-line:light-dark(#b66e00,#f0b04a);--code:light-dark(#e8efed,#243236)}
+*{box-sizing:border-box}
+html{font-family:"Segoe UI",Arial,sans-serif;line-height:1.6;color:var(--ink);background:var(--wash)}
+body{margin:0;background:var(--wash)}
+a{color:var(--accent);text-underline-offset:3px}
+a:focus-visible{outline:3px solid var(--warn-line);outline-offset:3px}
+header{background:light-dark(#123e3b,#0c2624);color:#fff;padding:48px 16px 40px;border-bottom:6px solid #71d8b5}
+header .inner,main{max-width:900px;margin:0 auto}
+header p.eyebrow{text-transform:uppercase;letter-spacing:.15em;font-size:.75rem;font-weight:700;color:#a7e7d1;margin:0}
+header h1{font-size:clamp(2rem,6vw,3.2rem);line-height:1.1;margin:12px 0}
+header p.lede{font-size:1.1rem;color:#e0eee9;margin:0;max-width:720px}
+main{padding:28px 16px 64px}
+nav.toc{background:var(--paper);border:1px solid var(--line);border-radius:8px;padding:16px 20px;margin-bottom:32px}
+nav.toc p{margin:0 0 8px;font-weight:700}
+nav.toc ol{margin:0;padding-left:22px;columns:2;column-gap:32px}
+@media(max-width:640px){nav.toc ol{columns:1}}
+section{margin:0 0 36px;scroll-margin-top:16px}
+h2{font-size:1.5rem;line-height:1.25;margin:0 0 14px}
+h3{font-size:1.1rem;margin:22px 0 10px}
+p{margin:0 0 14px}
+ul,ol{margin:0 0 14px;padding-left:22px}
+li{margin:0 0 6px}
+code{font-family:Consolas,"Cascadia Mono",monospace;font-size:.92em;background:var(--code);border-radius:3px;padding:1px 5px;overflow-wrap:anywhere}
+pre{background:light-dark(#0f2a2c,#0a1a1b);color:#e6f2ee;border-radius:6px;padding:12px 14px;overflow-x:auto;margin:0 0 14px}
+pre code{background:none;padding:0;color:inherit}
+.note,.warn{padding:14px 18px;border-left:4px solid var(--accent);background:var(--note);margin:0 0 16px;border-radius:0 6px 6px 0}
+.warn{border-left-color:var(--warn-line);background:var(--warn)}
+.note p:last-child,.warn p:last-child{margin:0}
+.table-wrap{overflow-x:auto;margin:0 0 16px}
+table{border-collapse:collapse;width:100%;font-size:.93rem;background:var(--paper)}
+caption{text-align:left;font-weight:700;padding:0 0 8px}
+th,td{border:1px solid var(--line);padding:9px 12px;text-align:left;vertical-align:top}
+th{background:var(--head)}
+table.banded tbody tr:nth-child(even)>td{background:var(--band)}
+footer{border-top:1px solid var(--line);padding-top:16px;color:var(--muted);font-size:.88rem}
+@media print{:root{color-scheme:light}header{background:#fff;color:#000;border-bottom:3px solid #086959}header p.lede,header p.eyebrow{color:#000}nav.toc{display:none}pre{background:#f4f4f4;color:#000;border:1px solid #999;white-space:pre-wrap}}
+</style>
+</head>
+<body>
+<header><div class="inner">
+<p class="eyebrow">ThineCraft / ShareCraft</p>
+<h1>ShareCraft for Windows</h1>
+<p class="lede">A ready-to-run copy of ShareCraft: install it on a Windows 11 computer without a compiler, Git or a separate database, try it in your browser, and remove it again cleanly.</p>
+</div></header>
+<main>
+
+<nav class="toc" aria-label="Contents"><p>Contents</p><ol>
+<li><a href="#what">What it is</a></li>
+<li><a href="#need">What you need</a></li>
+<li><a href="#install">Installing</a></li>
+<li><a href="#signin">Signing in</a></li>
+<li><a href="#startstop">Starting and stopping</a></li>
+<li><a href="#data">Where your data lives, and backups</a></li>
+<li><a href="#scanner">The malware scanner, and ClamAV</a></li>
+<li><a href="#antivirus">Your computer's own antivirus</a></li>
+<li><a href="#limits">Limits</a></li>
+<li><a href="#reinstall">Installing a newer copy</a></li>
+<li><a href="#uninstall">Uninstalling</a></li>
+<li><a href="#trouble">When something goes wrong</a></li>
+<li><a href="#checked">What has and has not been checked</a></li>
+</ol></nav>
+
+<section id="what"><h2>1. What it is</h2>
+<p>ShareCraft is an open-source place to keep and share documents, in the spirit of SharePoint: sites, libraries, folders, sharing with people and groups, and editors for text, spreadsheets, word documents, PDFs and 3D designs, all in the browser.</p>
+<p>This folder holds everything already built:</p>
+<div class="table-wrap"><table class="banded"><caption>What is in this folder</caption>
+<thead><tr><th>Item</th><th>What it is</th></tr></thead>
+<tbody>
+<tr><td><code>Install ShareCraft.cmd</code></td><td>Double-click this to install.</td></tr>
+<tr><td><code>scripts\</code></td><td>The install, start, stop and uninstall scripts (Windows PowerShell).</td></tr>
+<tr><td><code>bin\sharecraft-server.exe</code></td><td>The ShareCraft server.</td></tr>
+<tr><td><code>bin\xtask.exe</code></td><td>The project's helper program. Here it runs only the stand-in malware scanner.</td></tr>
+<tr><td><code>web\</code>, <code>editors\</code></td><td>The pages and the four file editors.</td></tr>
+<tr><td><code>pgsql\</code></td><td>A private copy of the PostgreSQL 18 database programs, used only by ShareCraft.</td></tr>
+<tr><td><code>README.html</code>, <code>LICENCES.html</code>, <code>VERSION</code></td><td>This guide, the licences, and which build this is.</td></tr>
+</tbody></table></div>
+</section>
+
+<section id="need"><h2>2. What you need</h2>
+<ul>
+<li>Windows 11 (64-bit), signed in as the person who will run ShareCraft.</li>
+<li>About 2 GB of free disk space: about 800 MB for the program, and the rest for the database and your documents to start with.</li>
+<li>A web browser (Edge, which comes with Windows, is fine).</li>
+</ul>
+<p>You do <strong>not</strong> need administrator rights, a compiler, Git or PostgreSQL. Nothing is installed for other Windows users, and no Windows service is added.</p>
+</section>
+
+<section id="install"><h2>3. Installing</h2>
+<ol>
+<li>Copy this whole folder (or the zip, then unzip it) anywhere on the computer, for example to Downloads. Do not run it from inside the zip.</li>
+<li>Double-click <strong>Install ShareCraft.cmd</strong>. If Windows asks whether to run a file from the internet, choose to run it.</li>
+<li>Answer the questions in the window:
+<ul>
+<li>the first administrator's <strong>email address</strong> and <strong>name</strong>;</li>
+<li>whether to <strong>start ShareCraft when you sign in to Windows</strong> (the default is No);</li>
+<li>then the administrator's <strong>password</strong>, at least 10 characters. It is asked for by ShareCraft itself and is not shown while you type.</li>
+</ul></li>
+<li>Wait a few minutes. The installer copies the program, makes the database, switches on the stand-in scanner, adds Start-menu shortcuts, starts everything and opens ShareCraft in your browser. Press a key to close the window when it says it has finished.</li>
+</ol>
+<div class="table-wrap"><table class="banded"><caption>What the installer makes</caption>
+<thead><tr><th>Where</th><th>What</th></tr></thead>
+<tbody>
+<tr><td><code>%LOCALAPPDATA%\Programs\ShareCraft</code></td><td>The program: a copy of this folder.</td></tr>
+<tr><td><code>%LOCALAPPDATA%\ShareCraft\db</code></td><td>The database. It answers only on this computer (<code>127.0.0.1</code>), on the first free port from 5440 to 5460.</td></tr>
+<tr><td><code>%LOCALAPPDATA%\ShareCraft\data</code></td><td>Your documents and their history.</td></tr>
+<tr><td><code>%LOCALAPPDATA%\ShareCraft\.env</code></td><td>The database password, made at random and never shown. Only your Windows account can read this file. Do not share it.</td></tr>
+<tr><td><code>%LOCALAPPDATA%\ShareCraft\settings.cmd</code></td><td>ShareCraft's address and folders, and the ports in use. No secrets.</td></tr>
+<tr><td><code>%LOCALAPPDATA%\ShareCraft\logs</code></td><td>What the server, the scanner and the database have said.</td></tr>
+<tr><td>Start menu, <strong>ShareCraft</strong> folder</td><td>ShareCraft, Stop ShareCraft, Uninstall ShareCraft, and this guide.</td></tr>
+</tbody></table></div>
+<p><code>%LOCALAPPDATA%</code> is your own local application folder, usually <code>C:\Users\&lt;you&gt;\AppData\Local</code>. To open it, type <code>%LOCALAPPDATA%\ShareCraft</code> into the address bar of File Explorer.</p>
+<p>ShareCraft itself uses the first free port from 8787 to 8799, and the stand-in scanner the first free port from 1344 to 1354. The installer says which ones it picked.</p>
+<p>If ShareCraft is already installed for you, the installer stops and changes nothing; see <a href="#reinstall">Installing a newer copy</a>.</p>
+</section>
+
+<section id="signin"><h2>4. Signing in</h2>
+<p>Open the address the installer showed, for example <code>http://127.0.0.1:8787/</code>, and sign in with the administrator's email address and password. As administrator you can add people on the People page, make sites, and change the organisation settings.</p>
+<p>Use <code>127.0.0.1</code> or <code>localhost</code> in the address; other names for the computer are refused.</p>
+</section>
+
+<section id="startstop"><h2>5. Starting and stopping</h2>
+<div class="table-wrap"><table class="banded"><caption>Start-menu shortcuts</caption>
+<thead><tr><th>Shortcut</th><th>What it does</th></tr></thead>
+<tbody>
+<tr><td><strong>ShareCraft</strong></td><td>Starts the database, the stand-in scanner and ShareCraft in the background, waits until ShareCraft answers (up to a minute) and opens it in your browser. If it is already running, it only opens the browser. If ShareCraft does not answer within a minute, a message says so and where its log is.</td></tr>
+<tr><td><strong>Stop ShareCraft</strong></td><td>Stops ShareCraft and the scanner, then the database, and says when it has finished.</td></tr>
+<tr><td><strong>Uninstall ShareCraft</strong></td><td>See <a href="#uninstall">Uninstalling</a>.</td></tr>
+<tr><td><strong>ShareCraft guide</strong></td><td>Opens this page.</td></tr>
+</tbody></table></div>
+<p>ShareCraft runs only while you have started it; it does not start by itself after Windows restarts unless you chose <strong>start when I sign in</strong> during installation. Signing out of Windows ends it.</p>
+<div class="note"><p><strong>Stop after saving.</strong> Stopping ends ShareCraft at once. Changes typed in the last few seconds (at most 30 seconds) before stopping may be lost; everything saved before that is kept. Wait until the page says <em>Saved</em> before you stop.</p></div>
+</section>
+
+<section id="data"><h2>6. Where your data lives, and backups</h2>
+<p>Everything that is yours is in one folder: <code>%LOCALAPPDATA%\ShareCraft</code>. The documents are in <code>data</code>, and accounts, sharing and history are in the database in <code>db</code>. Both are needed; neither is enough alone.</p>
+<h3>To make a backup</h3>
+<ol>
+<li>Run <strong>Stop ShareCraft</strong> and wait for its message. (Copying while it runs can give a database copy that does not work.)</li>
+<li>Copy the whole folder <code>%LOCALAPPDATA%\ShareCraft</code> somewhere safe, such as an external drive.</li>
+<li>Start ShareCraft again.</li>
+</ol>
+<p>The copy includes <code>.env</code>, which holds the database password: keep the backup as private as the computer itself.</p>
+<h3>To restore a backup</h3>
+<p>Stop ShareCraft, put the copied folder back as <code>%LOCALAPPDATA%\ShareCraft</code> (replacing what is there), and start ShareCraft again. To restore on another computer, or for another Windows user, install there first, stop it, replace the folder, then run the installer again with <code>-Reinstall</code> (next sections) so it checks the ports.</p>
+</section>
+
+<section id="scanner"><h2>7. The malware scanner, and ClamAV</h2>
+<p>ShareCraft can send every uploaded file to a malware scanner before anyone may open it. So that this can be tried at once, the installer switches on a <strong>stand-in scanner</strong>. It is not antivirus: it only recognises the standard EICAR test text (a harmless string made for testing scanners) and calls every other file clean.</p>
+<p>To use a real scanner, run ClamAV with c-icap (its ClamAV service) on a computer you control, then, signed in as administrator, open <strong>Organisation settings</strong> (the address ends in <code>/sharing.html</code>), find <strong>Malware scanner</strong>, and set the scanner address to your scanner's, for example <code>icap://scanner.example.org:1344/srv_clamav</code>. The part after the last <code>/</code> is whatever your scanner calls its service. Saving tests the address at once and says whether the scanner answered.</p>
+<p>The stand-in keeps running in the background after that; it does no harm. To switch scanning off altogether, empty the scanner address.</p>
+<p>ShareCraft has been tested only against the stand-in, not against a real ClamAV. Try a real scanner with a test file before relying on it.</p>
+</section>
+
+<section id="antivirus"><h2>8. Your computer's own antivirus</h2>
+<div class="warn"><p><strong>Windows Security (or other antivirus) may delete files ShareCraft has stored.</strong> It watches the data folder like any other folder. If you upload the EICAR test file to try the scanner, your antivirus may remove the stored copy, and ShareCraft then reports the file's content as missing. This is your antivirus working, not a fault in ShareCraft. To try the scanner, use a file with some other text before the test string, and delete it afterwards.</p></div>
+</section>
+
+<section id="limits"><h2>9. Limits</h2>
+<ul>
+<li><strong>This computer only.</strong> ShareCraft answers only at <code>http://127.0.0.1:&lt;port&gt;</code> on this computer. Phones, other computers and other people on your network cannot reach it. That needs a production mode that is not built yet.</li>
+<li><strong>No HTTPS.</strong> The connection is plain HTTP, which is acceptable only because it never leaves the computer.</li>
+<li><strong>For one Windows user.</strong> It is installed for the Windows user who ran the installer. Other people can still have ShareCraft accounts and use them from this computer's browser.</li>
+<li><strong>Not a Windows service.</strong> It runs while started and stops when you sign out.</li>
+<li><strong>No automatic updates</strong> and no signed installer. Windows may warn about running the scripts; that is expected.</li>
+<li><strong>Folder names.</strong> A Windows user folder with spaces or letters such as <code>&euml;</code> (for example <code>C:\Users\Zo&euml; Smith</code>) works: the database programs cannot read such letters, so the scripts give them the folder's short name instead (like <code>ZOSMIT~1</code>), which Windows keeps on the system drive. On a drive where Windows keeps no short names, the installer stops before copying anything and says so.</li>
+</ul>
+</section>
+
+<section id="reinstall"><h2>10. Installing a newer copy</h2>
+<p>To install a newer (or the same) copy over the one you have, keeping all documents, accounts and the database:</p>
+<ol>
+<li>Unzip the new copy anywhere.</li>
+<li>Open a Command Prompt in that folder (in File Explorer, type <code>cmd</code> into the address bar and press Enter).</li>
+<li>Run:</li>
+</ol>
+<pre><code>"Install ShareCraft.cmd" -Reinstall</code></pre>
+<p>It stops ShareCraft, replaces the program in <code>%LOCALAPPDATA%\Programs\ShareCraft</code>, keeps <code>%LOCALAPPDATA%\ShareCraft</code> as it is (only the port numbers change, if another program has taken one meanwhile), and starts ShareCraft again. It does not ask for an administrator, because the accounts are kept. The new server brings the database up to date by itself when it starts.</p>
+</section>
+
+<section id="uninstall"><h2>11. Uninstalling</h2>
+<p>Choose <strong>Uninstall ShareCraft</strong> in the Start menu. It asks first whether to remove ShareCraft, stops everything, then asks:</p>
+<p><strong>Also delete all ShareCraft data and the database? [y/N]</strong></p>
+<ul>
+<li>Answer <strong>N</strong> (or just press Enter) to keep <code>%LOCALAPPDATA%\ShareCraft</code>. Only the program and the shortcuts are removed, and installing again with <code>-Reinstall</code> brings everything back.</li>
+<li>Answer <strong>y</strong> to delete the documents, the accounts and the database as well. This cannot be undone, so make a backup first if you might want them.</li>
+</ul>
+<p>Nothing is deleted without that answer. The uninstaller does not touch this folder (the one you installed from); delete it yourself when you no longer need it.</p>
+</section>
+
+<section id="trouble"><h2>12. When something goes wrong</h2>
+<div class="table-wrap"><table class="banded"><caption>Common problems</caption>
+<thead><tr><th>What you see</th><th>What to do</th></tr></thead>
+<tbody>
+<tr><td>"ShareCraft is already installed for this Windows user"</td><td>Nothing was changed. To install over it and keep your data, use <code>-Reinstall</code> (section 10). To start afresh, uninstall and delete the data first (section 11).</td></tr>
+<tr><td>"There is no free port for ..."</td><td>Other programs use every port in that range. Close one of them, or restart Windows, and run the installer again.</td></tr>
+<tr><td>"ShareCraft did not answer within 60 seconds"</td><td>It may still be starting on a slow disk: try the address again a minute later. Otherwise read <code>logs\server.err.log</code> in <code>%LOCALAPPDATA%\ShareCraft</code>.</td></tr>
+<tr><td>"Starting the database ... failed"</td><td>Read <code>logs\postgresql.log</code>. A database that was not stopped cleanly usually starts again after Stop ShareCraft and then ShareCraft.</td></tr>
+<tr><td>The administrator was not created</td><td>The installer offers three tries. The password needs at least 10 characters.</td></tr>
+<tr><td>A first install stopped half way</td><td>It takes back what it made, so you can simply run it again.</td></tr>
+</tbody></table></div>
+<p>The logs never contain the database password or address. If you ask someone for help, send the log files, never <code>.env</code>.</p>
+</section>
+
+<section id="checked"><h2>13. What has and has not been checked</h2>
+<p><strong>Checked</strong>, on the build computer (Windows 11, Windows PowerShell 5.1):</p>
+<ul>
+<li>The scripts' automated self-tests: port picking, quoting of folder names with spaces and non-ASCII letters, the narrowed access list on <code>.env</code>, that no password reaches the window or the files around it, that a reinstall keeps data and the database, and that uninstalling keeps data unless told otherwise.</li>
+<li>One full install from the package zip into a temporary profile folder whose name had a space and an <code>&euml;</code>: the database was made, the administrator could sign in, the scanner address was set, Stop and Start worked, a second install was refused, a reinstall kept the data, and uninstalling with deletion confirmed removed everything. The installer was given its answers by a script there, not typed.</li>
+</ul>
+<p><strong>Not checked:</strong></p>
+<ul>
+<li>A second, clean Windows 11 computer, or a Windows user account whose real profile folder has non-ASCII letters (only a temporary folder was used).</li>
+<li>Double-clicking the installer and typing the answers by hand, and the Start-menu shortcuts' message windows (the scripts behind them were run directly).</li>
+<li>Start when I sign in, after a real sign-in.</li>
+<li>SmartScreen or antivirus warnings on another computer, and computers where scripts are restricted by an organisation's policy.</li>
+<li>A real ClamAV scanner.</li>
+<li>Restoring a backup on another computer.</li>
+</ul>
+</section>
+
+<footer><p>ShareCraft is free software (MIT OR Apache-2.0); PostgreSQL and the editors carry their own licences, listed in <code>LICENCES.html</code>. The build is named in <code>VERSION</code>.</p></footer>
+</main>
+</body>
+</html>
