@@ -301,6 +301,29 @@ pub(crate) async fn add_image(
     Ok((StatusCode::CREATED, Json(image_out(&image))).into_response())
 }
 
+/// The body of `PATCH /api/brand/images/{id}`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ImageRename {
+    name: String,
+}
+
+/// `PATCH /api/brand/images/{id} {name}`: renames a brand image (see [`brand::rename_image`]);
+/// `{id, kind, name, url}`. `403`; `404` for no such image; `422 invalid_request` for a name
+/// that is empty, too long or holds control or invisible characters.
+pub(crate) async fn rename_image(
+    State(state): State<AppState>,
+    signed: Signed,
+    Path(id): Path<String>,
+    JsonBody(body): JsonBody<ImageRename>,
+) -> Result<Json<Value>, BrandError> {
+    let id = parse_id(&id)?;
+    let actor = signed.session.user;
+    let image =
+        completed(async move { brand::rename_image(&state, &actor, id, &body.name).await }).await?;
+    Ok(Json(image_out(&image)))
+}
+
 /// `DELETE /api/brand/images/{id}`: removes a brand image (see [`brand::remove_image`]);
 /// `204`. `403`; `404` for no such image.
 pub(crate) async fn remove_image(

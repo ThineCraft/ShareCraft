@@ -1,7 +1,7 @@
 // Shared by every page: calling the API, turning its error codes into sentences, and the
 // sign-in redirect. Pages hold no merging or permission logic; the server decides.
 
-import { applyLook } from './look.js';
+import { CHECK_LABELS, MIN_RATIO, applyLook, parseColour } from './look.js';
 
 const MESSAGES = {
   invalid_credentials: 'That email and password do not match.',
@@ -1267,6 +1267,31 @@ export function brandImageHref(url) {
   return typeof url === 'string' && BRAND_IMAGE.test(url) ? url : null;
 }
 
+const DRAFT_IMAGE = /^\/api\/docs\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/(preview|thumbnail)$/i;
+
+/**
+ * `url` if the preview of a draft look may load it, else null: a brand image, or the preview
+ * or thumbnail of a document chosen in the picker but not yet applied (which only becomes a
+ * brand image when the look is applied). Only Change the look's preview element uses this;
+ * every page shows brand images only.
+ */
+export function draftImageHref(url) {
+  return brandImageHref(url) ?? (typeof url === 'string' && DRAFT_IMAGE.test(url) ? url : null);
+}
+
+/**
+ * A colour swatch for `colour` (`#rrggbb`), named `label` for its tooltip and screen readers:
+ * the colour is set as `--swatch` through the CSS object model after it is checked, never
+ * through markup. Anything else gives an empty, crossed swatch.
+ */
+export function swatch(colour, label) {
+  const good = typeof colour === 'string' && HEX_COLOUR.test(colour) ? colour.toLowerCase() : null;
+  const text = good ? `${label} ${good}` : `${label}: none`;
+  const mark = h('span', { class: good ? 'swatch' : 'swatch none', title: text, role: 'img', 'aria-label': text });
+  if (good) mark.style?.setProperty('--swatch', good);
+  return mark;
+}
+
 /**
  * An `<img>` of the brand image `url` with `attributes`, hidden if it fails to load (a held
  * image answers 423); `onError` runs then too.
@@ -1280,6 +1305,78 @@ function brandImage(url, attributes, onError) {
   return img;
 }
 
+/**
+ * A theme's four swatches (a theme as `GET /api/brand` lists it, with `resolved` colours when
+ * it passes): primary and secondary in light mode, then in dark mode.
+ */
+export function themeSwatches(theme) {
+  const light = theme?.resolved?.light;
+  const dark = theme?.resolved?.dark;
+  return h(
+    'span',
+    { class: 'swatches' },
+    swatch(light?.accent ?? theme?.primary, 'Primary'),
+    swatch(light?.header_bg ?? theme?.secondary, 'Secondary'),
+    swatch(dark?.accent ?? theme?.primary_dark, 'Primary in dark mode'),
+    swatch(dark?.header_bg ?? theme?.secondary_dark, 'Secondary in dark mode'),
+  );
+}
+
+/**
+ * The rows of the live contrast check for `check` (the answer of `checkTheme` in look.js): one
+ * per failing pair, with its ratio and, where there is one, a swatch and a "Use suggested"
+ * button that calls `onUse(pair)`. A theme whose colours are not all `#rrggbb` gets one row
+ * saying so; a passing theme one row saying every pair reads.
+ */
+export function contrastRows(check, onUse) {
+  if (check?.invalid) return [h('li', {}, h('span', { class: 'grow' }, 'Write each colour as # and six hexadecimal digits, like #3156c9.'))];
+  if (check?.ok) return [h('li', { class: 'pass' }, h('span', { class: 'grow' }, `Every pair reads at ${MIN_RATIO}:1 or more, in light and dark mode.`))];
+  return (check?.pairs ?? []).map((pair) => {
+    const label = CHECK_LABELS[pair.check] ?? pair.check;
+    const text = h(
+      'span',
+      { class: 'grow' },
+      label,
+      h('br'),
+      h('small', { class: 'ratio' }, `${Number(pair.ratio).toFixed(2)}:1, needs ${MIN_RATIO}:1`),
+    );
+    if (typeof pair.suggestion !== 'string' || !parseColour(pair.suggestion)) {
+      return h('li', {}, text, h('small', {}, 'Set this dark colour yourself.'));
+    }
+    const use = h('button', { type: 'button', class: 'plain', 'aria-label': `Use suggested ${pair.suggestion} for ${label}` }, `Use suggested ${pair.suggestion}`);
+    use.addEventListener('click', () => onUse(pair));
+    return h('li', {}, text, swatch(pair.suggestion, 'Suggested'), use);
+  });
+}
+
+/**
+ * A colour field: a label, a colour picker and a text box for `#rrggbb`, kept in step. `id` is
+ * the text box's id; `optional` fields may be left empty (a dark colour then derived, shown as
+ * the placeholder `hint`). `onInput(text)` runs on every change. Answers `{element, input,
+ * set(value, hint)}`, `input` being the text box.
+ */
+export function colourField(id, label, { optional = false, onInput } = {}) {
+  const text = h('input', { type: 'text', id, autocomplete: 'off', spellcheck: 'false', maxlength: '7', 'aria-describedby': `${id}-note` });
+  const picker = h('input', { type: 'color', 'aria-label': `${label}, colour picker` });
+  const note = h('small', { id: `${id}-note`, class: 'meta' }, optional ? 'Leave empty to work it out from the light colour.' : 'Like #3156c9.');
+  text.addEventListener('input', () => {
+    if (parseColour(text.value.trim())) picker.value = text.value.trim().toLowerCase();
+    onInput?.(text.value);
+  });
+  picker.addEventListener('input', () => {
+    text.value = picker.value;
+    onInput?.(picker.value);
+  });
+  const set = (value, hint = '') => {
+    text.value = value ?? '';
+    text.placeholder = hint ? `Worked out: ${hint}` : '';
+    const shown = parseColour(value ?? '') ? value : parseColour(hint) ? hint : '#000000';
+    picker.value = shown.toLowerCase();
+  };
+  const element = h('div', { class: 'field' }, h('label', { for: id }, label), h('div', { class: 'colour-row' }, picker, text), note);
+  return { element, input: text, set };
+}
+
 const oneOf = (value, choices, fallback) => (choices.includes(value) ? value : fallback);
 
 /**
@@ -1289,16 +1386,18 @@ const oneOf = (value, choices, fallback) => (choices.includes(value) ? value : f
  * `logo_alt`; the name is always there, hidden for all but screen readers when the look hides
  * the title (which needs a logo), and shown again when the logo fails to load. An extended
  * header with an image shows it through `<img>` under a fixed dark shade. Names are text only,
- * and only brand images are loaded.
+ * and only brand images are loaded (with `draft`, in Change the look's preview, also the
+ * documents [`draftImageHref`] allows).
  */
-export function headerView(site, look) {
+export function headerView(site, look, { draft = false } = {}) {
+  const href = draft ? draftImageHref : brandImageHref;
   const header = look?.header ?? {};
   const layout = oneOf(header.layout, HEADER_LAYOUTS, 'compact');
   const extended = layout === 'extended';
-  const imageUrl = extended && header.background === 'image' ? brandImageHref(header.image_url) : null;
+  const imageUrl = extended && header.background === 'image' ? href(header.image_url) : null;
   const background = imageUrl ? 'image' : oneOf(header.background, BACKGROUNDS, 'none');
   const align = extended ? oneOf(header.align, ALIGNS, 'left') : 'left';
-  const logoUrl = brandImageHref(look?.logo_url);
+  const logoUrl = href(look?.logo_url);
   const hideTitle = Boolean(header.hide_title && logoUrl);
   const name = h('span', { class: hideTitle ? 'site-name sr' : 'site-name' }, site.name);
   const alt = typeof look?.logo_alt === 'string' && look.logo_alt !== '' ? look.logo_alt : site.name;
@@ -1338,14 +1437,14 @@ function footerLink(link) {
  * The footer of a site page for the effective look `look`, or null when it is off (or the look
  * could not be read). A simple footer has one group of at most 8 links and no heading; an
  * extended one up to 4 groups of 8 under their headings. Text only; links through
- * [`footerHref`]; only brand images are loaded.
+ * [`footerHref`]; only brand images are loaded (with `draft`, see [`headerView`]).
  */
-export function footerView(look) {
+export function footerView(look, { draft = false } = {}) {
   const footer = look?.footer;
   if (!footer?.enabled) return null;
   const layout = footer.layout === 'extended' ? 'extended' : 'simple';
   const background = oneOf(footer.background, BACKGROUNDS, 'none');
-  const logoUrl = brandImageHref(footer.logo_url);
+  const logoUrl = (draft ? draftImageHref : brandImageHref)(footer.logo_url);
   const name = typeof footer.name === 'string' ? footer.name : '';
   const logo = logoUrl ? brandImage(logoUrl, { class: 'footer-logo', alt: name ? '' : (look.logo_alt ?? '') }) : null;
   const groups = (Array.isArray(footer.groups) ? footer.groups : []).slice(0, layout === 'extended' ? FOOTER_GROUPS : 1);

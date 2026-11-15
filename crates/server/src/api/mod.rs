@@ -117,7 +117,9 @@ pub(crate) fn router() -> Router<AppState> {
         .route("/brand/images", post(brand::add_image))
         .route(
             "/brand/images/{id}",
-            get(brand::image).delete(brand::remove_image),
+            get(brand::image)
+                .patch(brand::rename_image)
+                .delete(brand::remove_image),
         )
         .route("/brand/managers", put(brand::set_managers))
         .route("/hubs", get(navigation::hubs))

@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ShareCraft — Change the look</title>
+<link rel="stylesheet" href="./style.css">
+</head>
+<body>
+<div class="page look">
+ <nav class="topbar" aria-label="Account">
+  <a href="/">Sites</a>
+  <span id="who" class="meta"></span>
+  <span class="spacer"></span>
+  <a id="people-link" class="button plain" href="/people.html" hidden>People</a>
+  <button type="button" id="sign-out" class="plain">Sign out</button>
+ </nav>
+ <nav id="crumbs" class="crumbs" aria-label="Breadcrumb"></nav>
+ <p id="status" role="status" aria-live="polite" class="meta"></p>
+ <h1 id="title">Change the look</h1>
+ <p id="archived-banner" class="note" hidden>This site is archived. Its look is shown but cannot be changed.</p>
+ <p id="hub-note" class="note" hidden></p>
+ <p id="error" role="alert" class="msg"></p>
+
+ <div id="content" class="look-layout" hidden>
+  <section class="look-side" aria-labelledby="preview-heading">
+   <h2 id="preview-heading">Preview</h2>
+   <p class="meta">How the draft looks in light and dark mode. Nothing is saved until you apply it.</p>
+   <div class="look-previews">
+    <div id="preview-light" class="look-preview" data-scheme="light" inert></div>
+    <div id="preview-dark" class="look-preview" data-scheme="dark" inert></div>
+   </div>
+  </section>
+
+  <div class="look-editor">
+   <section aria-labelledby="theme-heading">
+    <h2 id="theme-heading">Theme</h2>
+    <p id="source-note" class="note" hidden><span id="source-text"></span> <button type="button" id="source-update" class="plain" hidden>Use the current version</button></p>
+    <div class="field">
+     <label for="theme-choice">Theme</label>
+     <select id="theme-choice"></select>
+    </div>
+    <div class="field">
+     <label for="theme-name">Name</label>
+     <input type="text" id="theme-name" maxlength="60" autocomplete="off">
+    </div>
+    <div id="colour-fields"></div>
+    <h3>Contrast check</h3>
+    <ul id="pairs" class="list pairs" aria-label="Contrast check" aria-live="polite"></ul>
+    <div class="toolbar">
+     <button type="button" id="save-site-theme" class="plain">Save as a theme of this site</button>
+    </div>
+    <h3 id="site-themes-heading" hidden>This site's themes</h3>
+    <ul id="site-themes" class="list" aria-labelledby="site-themes-heading" hidden></ul>
+   </section>
+
+   <section aria-labelledby="header-heading">
+    <h2 id="header-heading">Header</h2>
+    <div id="logo-slot"></div>
+    <div id="thumbnail-slot"></div>
+    <div class="field">
+     <label for="logo-alt">Logo description</label>
+     <input type="text" id="logo-alt" maxlength="120" autocomplete="off" aria-describedby="logo-alt-note">
+     <small id="logo-alt-note" class="meta">Read out in place of the logo. Leave empty to use the site's name.</small>
+    </div>
+    <div class="field">
+     <label for="header-layout">Layout</label>
+     <select id="header-layout">
+      <option value="minimal">Minimal: one slim row</option>
+      <option value="compact">Compact</option>
+      <option value="standard">Standard: a larger logo and title</option>
+      <option value="extended">Extended: a tall band</option>
+     </select>
+    </div>
+    <div class="field">
+     <label for="header-background">Background</label>
+     <select id="header-background">
+      <option value="none">None</option>
+      <option value="soft">Soft: a tint of the primary colour</option>
+      <option value="strong">Strong: the secondary colour</option>
+      <option value="image">Image (extended layout only)</option>
+     </select>
+    </div>
+    <div id="header-image-slot"></div>
+    <div class="field" id="align-field">
+     <label for="header-align">Alignment (extended layout only)</label>
+     <select id="header-align">
+      <option value="left">Left</option>
+      <option value="centre">Centre</option>
+      <option value="right">Right</option>
+     </select>
+    </div>
+    <label class="check"><input type="checkbox" id="hide-title"> Hide the site's name beside the logo (needs a logo)</label>
+   </section>
+
+   <section aria-labelledby="navigation-heading">
+    <h2 id="navigation-heading">Navigation</h2>
+    <fieldset class="kinds">
+     <legend>Where the site's links go</legend>
+     <label class="check"><input type="radio" name="navigation" id="nav-horizontal" value="horizontal"> Across the top</label>
+     <label class="check"><input type="radio" name="navigation" id="nav-vertical" value="vertical"> In a column at the left (in the Menu on narrow screens)</label>
+    </fieldset>
+   </section>
+
+   <section aria-labelledby="footer-heading">
+    <h2 id="footer-heading">Footer</h2>
+    <label class="check"><input type="checkbox" id="footer-enabled"> Show a footer on the site's pages</label>
+    <div id="footer-fields">
+     <div class="field">
+      <label for="footer-layout">Layout</label>
+      <select id="footer-layout">
+       <option value="simple">Simple: one row of up to 8 links</option>
+       <option value="extended">Extended: up to 4 groups of 8 links, with headings</option>
+      </select>
+     </div>
+     <div class="field">
+      <label for="footer-background">Background</label>
+      <select id="footer-background">
+       <option value="none">None</option>
+       <option value="soft">Soft</option>
+       <option value="strong">Strong</option>
+      </select>
+     </div>
+     <div class="field">
+      <label for="footer-name">Name</label>
+      <input type="text" id="footer-name" maxlength="80" autocomplete="off">
+     </div>
+     <div id="footer-logo-slot"></div>
+     <div id="footer-groups" class="footer-editor"></div>
+    </div>
+   </section>
+  </div>
+ </div>
+
+ <div id="actions" class="action-bar" hidden>
+  <button type="button" id="apply" disabled>Apply</button>
+  <button type="button" id="cancel" class="plain" disabled>Cancel</button>
+  <span id="apply-note" class="meta" aria-live="polite"></span>
+ </div>
+ <p id="apply-msg" role="alert" class="msg"></p>
+
+ <section id="history-section" aria-labelledby="history-heading" hidden>
+  <h2 id="history-heading">History</h2>
+  <p class="meta">The last 50 changes, newest first. Preview loads one as the draft; Restore applies it again.</p>
+  <ul id="history" class="list" aria-labelledby="history-heading"></ul>
+  <p id="history-empty" class="meta" hidden>The look has not been changed yet.</p>
+ </section>
+</div>
+<script type="module" src="./site-look.js"></script>
+</body>
+</html>

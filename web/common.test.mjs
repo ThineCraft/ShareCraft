@@ -1939,3 +1939,104 @@ test('frame_look_on_bar_and_navigation_only', async () => {
     delete globalThis.document;
   }
 });
+
+// ---- Change the look's preview: draft images chosen from a document ----
+
+import { draftImageHref, swatch } from './common.js';
+
+test('preview_loads_only_brand_or_document_images', () => {
+  const all = lookDocument();
+  try {
+    const DOC_URL = `/api/docs/${FILE}/preview`;
+    const THUMB_URL = `/api/docs/${FILE}/thumbnail`;
+    assert.equal(draftImageHref(IMAGE), IMAGE);
+    assert.equal(draftImageHref(DOC_URL), DOC_URL);
+    assert.equal(draftImageHref(THUMB_URL), THUMB_URL);
+    for (const bad of [
+      `/api/docs/${FILE}/content`,
+      `/api/docs/${FILE}/preview?x=1`,
+      `/api/docs/${FILE}/preview/`,
+      `/api/docs/not-an-id/preview`,
+      `//evil.example/api/docs/${FILE}/preview`,
+      `https://evil.example/api/docs/${FILE}/preview`,
+      `/api/docs/${FILE}/../../x/preview`,
+      'javascript:alert(1)',
+      `data:image/svg+xml,<svg/>`,
+      null,
+    ]) {
+      assert.equal(draftImageHref(bad), null, String(bad));
+    }
+    const draftLook = look({
+      logo_url: DOC_URL,
+      header: { layout: 'extended', background: 'image', image_url: THUMB_URL },
+      footer: { enabled: true, name: '', logo_url: DOC_URL },
+    });
+    // On a page, a document address is never loaded: only brand images.
+    const page = headerView(SALES, draftLook);
+    assert.equal(byClass(page, 'site-logo').length, 0);
+    assert.equal(byClass(page, 'band-image').length, 0);
+    assert.equal(byClass(footerView(draftLook), 'footer-logo').length, 0);
+    // In the preview element (draft) it is, and nothing else.
+    const preview = headerView(SALES, draftLook, { draft: true });
+    assert.equal(byClass(preview, 'site-logo')[0].attributes.src, DOC_URL);
+    assert.equal(byClass(preview, 'band-image')[0].attributes.src, THUMB_URL);
+    assert.equal(byClass(footerView(draftLook, { draft: true }), 'footer-logo')[0].attributes.src, DOC_URL);
+    const odd = headerView(SALES, look({ logo_url: `/api/docs/${FILE}/content` }), { draft: true });
+    assert.equal(byClass(odd, 'site-logo').length, 0);
+    for (const img of all.filter((e) => e.tag === 'img')) {
+      assert.ok(draftImageHref(img.attributes.src), img.attributes.src);
+    }
+  } finally {
+    delete globalThis.document;
+  }
+});
+
+test('swatches_set_colour_only_through_the_object_model', () => {
+  lookDocument();
+  try {
+    const good = swatch('#1F5F8B', 'Primary');
+    assert.equal(good.style.props['--swatch'], '#1f5f8b');
+    assert.equal(good.attributes.title, 'Primary #1f5f8b');
+    for (const bad of ['red;background:url(x)', 'url(x)', '#fff', null]) {
+      const none = swatch(bad, 'Primary');
+      assert.deepEqual(none.style.props, {}, String(bad));
+      assert.ok(none.attributes.class.split(' ').includes('none'));
+    }
+  } finally {
+    delete globalThis.document;
+  }
+});
+
+import { contrastRows } from './common.js';
+
+test('contrast_rows_name_each_failing_pair_with_its_suggestion', () => {
+  lookDocument();
+  try {
+    const used = [];
+    const rows = contrastRows(
+      {
+        ok: false,
+        pairs: [
+          { check: 'primary_on_light', ratio: 2.1, suggestion: '#4f6fd1' },
+          { check: 'primary_dark_on_dark', ratio: 1.84, suggestion: null },
+        ],
+      },
+      (pair) => used.push(pair.check),
+    );
+    assert.equal(rows.length, 2);
+    assert.ok(texts(rows[0]).join(' ').includes('Links and accents on light pages'));
+    assert.ok(texts(rows[0]).join(' ').includes('2.10:1, needs 4.5:1'));
+    const use = elements(rows[0]).find((e) => e.tag === 'button');
+    assert.deepEqual(use.children, ['Use suggested #4f6fd1']);
+    assert.equal(byClass(rows[0], 'swatch')[0].style.props['--swatch'], '#4f6fd1');
+    use.listeners.click();
+    assert.deepEqual(used, ['primary_on_light']);
+    // A derived dark colour that cannot pass has no button: it must be set by hand.
+    assert.equal(elements(rows[1]).filter((e) => e.tag === 'button').length, 0);
+    // Passing and unreadable themes get one row each.
+    assert.equal(contrastRows({ ok: true }, () => {}).length, 1);
+    assert.ok(texts(contrastRows({ ok: false, pairs: [], invalid: true }, () => {})[0]).join(' ').includes('#3156c9'));
+  } finally {
+    delete globalThis.document;
+  }
+});

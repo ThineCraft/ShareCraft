@@ -1,5 +1,5 @@
 // A site's settings, for the people who manage it: its name, description, language and time
-// zone, the hub it joined, and its own navigation (Automatic, or a custom list edited with
+// zone, a link to Change the look, the hub it joined, and its own navigation (Automatic, or a custom list edited with
 // buttons). Administrators also make it a hub and edit the hub's bar, unregister it, and save
 // the site as a template. The server decides every change; refusals are shown as sentences.
 
@@ -62,6 +62,12 @@ function showTitle() {
 async function redrawChrome() {
   info = (await siteChrome(siteId)).site ?? info;
   showTitle();
+}
+
+// The look is shown to the people who manage the site, archived or not (it is read-only then).
+if (manageSite) {
+  $('look').hidden = false;
+  $('look-link').setAttribute('href', `/site-look.html?id=${seg(siteId)}`);
 }
 
 // An archived site can be read but not changed; administrators may still save it as a template.

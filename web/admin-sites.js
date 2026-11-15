@@ -1,6 +1,7 @@
 // The administrators' Sites page: every site with its state, storage, owners and hub, flagging
 // sites with no enabled owner. Archive, Reactivate and Delete for live sites; Restore and
-// Delete permanently for deleted ones, each asked first where it takes something away.
+// Delete permanently for deleted ones, each asked first where it takes something away. A link
+// to the Brand centre for administrators and brand managers.
 
 import {
   adminSiteRow,
@@ -30,8 +31,14 @@ try {
 $('who').textContent = `Signed in as ${me.name}`;
 await organisationChrome();
 
+// The brand centre is looked after by administrators and the brand managers they name.
+const brand = me.is_admin ? null : await api('GET', '/brand');
+$('brand-link').hidden = !(me.is_admin || brand?.data?.can_manage);
+
 if (!me.is_admin) {
-  status.textContent = 'Only administrators can manage sites.';
+  status.textContent = brand?.data?.can_manage
+    ? 'Only administrators can manage sites. As a brand manager you can open the Brand centre.'
+    : 'Only administrators can manage sites.';
 } else {
   $('content').hidden = false;
   await showSites();

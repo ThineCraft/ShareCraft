@@ -177,3 +177,311 @@ test('apply_look_refuses_non_hex', () => {
   assert.equal(applyLook(null, { theme: SHARECRAFT }), false);
   assert.equal(applyLook({}, { theme: SHARECRAFT }), false);
 });
+
+// ---- Change the look: the draft, the live check, history and the brand centre ----
+
+import {
+  brandCentreSections,
+  draftFromLook,
+  lookInput,
+  lookSession,
+  previewEffective,
+} from './look.js';
+import { filterImages, imageEntries } from './image-picker.js';
+
+const SITE_ID = '11111111-1111-4111-8111-111111111111';
+const DOC_A = '0000000a-0000-4000-8000-00000000000a';
+const DOC_B = '0000000b-0000-4000-8000-00000000000b';
+const SHA_A = 'a'.repeat(64);
+const SHA_B = 'b'.repeat(64);
+const SHA_C = 'c'.repeat(64);
+const ref = (sha256, from_doc, name) => ({ sha256, media_type: 'image/png', bytes: 10, width: 4, height: 4, name, from_doc });
+const STORED = Object.freeze({
+  theme: { name: 'ShareCraft', primary: '#3156c9', secondary: '#233239' },
+  from: 'builtin:sharecraft',
+  logo: ref(SHA_A, DOC_A, 'Logo.png'),
+  logo_alt: '',
+  header: { layout: 'compact', background: 'none', align: 'left', hide_title: false },
+  navigation: 'horizontal',
+  footer: { enabled: false, layout: 'simple', name: '', background: 'none', groups: [] },
+});
+const settingsOf = (look) => ({ look: structuredClone(look), themes: [], theme_source_changed: false });
+const THEMES = [
+  { id: 'builtin:sharecraft', from: 'builtin:sharecraft', name: 'ShareCraft', primary: '#3156c9', secondary: '#233239', primary_dark: null, secondary_dark: null },
+  { id: 'builtin:plum', from: 'builtin:plum', name: 'Plum', primary: '#7a3e8f', secondary: '#3b2244', primary_dark: null, secondary_dark: null },
+];
+
+/** A stand-in for `api`: records every call and answers with `answer(method, path, body)`. */
+function sender(answer = () => ({ ok: true, status: 200, data: settingsOf(STORED) })) {
+  const calls = [];
+  const send = async (method, path, body) => {
+    calls.push({ method, path, body });
+    return answer(method, path, body);
+  };
+  return { calls, send };
+}
+
+test('draft_changes_never_saved_until_apply', async () => {
+  const { calls, send } = sender((method, path, body) => ({
+    ok: true,
+    status: 200,
+    data: { look: { ...STORED, header: { ...STORED.header, layout: body.look.header.layout } }, themes: [], theme_source_changed: false },
+  }));
+  const session = lookSession({ siteId: SITE_ID, settings: settingsOf(STORED), themes: THEMES, brandImages: [], send });
+  assert.equal(session.status().dirty, false);
+  assert.equal(session.status().canApply, false, 'nothing to apply yet');
+  session.change((draft) => {
+    draft.header.layout = 'standard';
+  });
+  session.change((draft) => {
+    draft.navigation = 'vertical';
+  });
+  session.chooseTheme(THEMES[1]);
+  assert.equal(calls.length, 0, 'changing the draft sends nothing');
+  assert.equal(session.status().dirty, true);
+  // Cancel drops the draft, still without a call.
+  session.cancel();
+  assert.equal(session.status().dirty, false);
+  assert.equal(session.draft.header.layout, 'compact');
+  assert.equal(session.draft.from, 'builtin:sharecraft');
+  assert.equal(calls.length, 0);
+  // Apply sends the draft once, as a look.
+  session.change((draft) => {
+    draft.header.layout = 'standard';
+  });
+  assert.equal(session.status().canApply, true);
+  const result = await session.apply();
+  assert.equal(result.ok, true);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].method, 'PUT');
+  assert.equal(calls[0].path, `/sites/${SITE_ID}/look`);
+  assert.equal(calls[0].body.look.header.layout, 'standard');
+  assert.deepEqual(calls[0].body.look.theme, { from: 'builtin:sharecraft' });
+  assert.deepEqual(calls[0].body.look.logo, { keep: SHA_A }, 'an image the look holds is kept');
+  // The saved look is now what the server answered; the draft starts from it.
+  assert.equal(session.status().dirty, false);
+  assert.equal(session.draft.header.layout, 'standard');
+  // A read-only (archived) site never applies.
+  const archived = lookSession({ siteId: SITE_ID, settings: settingsOf(STORED), themes: THEMES, brandImages: [], send, readOnly: true });
+  archived.change((draft) => {
+    draft.navigation = 'vertical';
+  });
+  assert.equal(archived.status().canApply, false);
+  assert.equal((await archived.apply()).ok, false);
+  assert.equal(calls.length, 1);
+});
+
+test('apply_disabled_while_contrast_fails', async () => {
+  const { calls, send } = sender();
+  const session = lookSession({ siteId: SITE_ID, settings: settingsOf(STORED), themes: THEMES, brandImages: [], send });
+  session.setColour('primary', '#FFFF00');
+  assert.equal(session.draft.theme.primary, '#ffff00', 'colours are kept in lower case');
+  assert.equal(session.draft.from, 'custom', 'an edited colour makes the theme custom');
+  const status = session.status();
+  assert.equal(status.dirty, true);
+  assert.equal(status.check.ok, false);
+  assert.ok(status.check.pairs.some((p) => p.check === 'primary_on_light'));
+  assert.equal(status.canApply, false);
+  assert.equal((await session.apply()).ok, false);
+  assert.equal(calls.length, 0, 'nothing is sent while a pair fails');
+  // A colour that is not #rrggbb cannot be applied either.
+  session.setColour('primary', 'red;background:url(x)');
+  assert.equal(session.status().canApply, false);
+  assert.equal(session.status().check.invalid, true);
+  // A readable colour again: Apply comes back.
+  session.setColour('primary', '#1f5f8b');
+  assert.equal(session.status().canApply, true);
+  // A dark colour left empty is derived.
+  session.setColour('primary_dark', '');
+  assert.equal('primary_dark' in session.draft.theme, false);
+});
+
+test('use_suggested_fixes_the_pair', () => {
+  const { send } = sender();
+  const session = lookSession({ siteId: SITE_ID, settings: settingsOf(STORED), themes: THEMES, brandImages: [], send });
+  const cases = [
+    ['primary', '#7fa0ff', 'primary_on_light'],
+    ['secondary', '#777777', 'header_on_secondary'],
+    ['secondary_dark', '#808080', 'header_on_secondary_dark'],
+    ['primary_dark', '#3a4a52', 'primary_dark_on_dark'],
+  ];
+  for (const [field, colour, check] of cases) {
+    session.cancel();
+    session.setColour(field, colour);
+    const pair = session.status().check.pairs.find((p) => p.check === check);
+    assert.ok(pair, `${check} fails for ${colour}`);
+    assert.match(pair.suggestion, /^#[0-9a-f]{6}$/);
+    session.useSuggested(pair);
+    assert.equal(session.draft.theme[field], pair.suggestion, check);
+    const after = session.status().check;
+    assert.ok(!(after.pairs ?? []).some((p) => p.check === check), `${check} fixed`);
+    assert.equal(after.ok, true, check);
+    assert.equal(session.status().canApply, true, check);
+  }
+  // A pair without a suggestion (a derived dark colour that cannot pass) changes nothing.
+  const before = structuredClone(session.draft);
+  session.useSuggested({ check: 'primary_dark_on_dark', ratio: 1.2, suggestion: null });
+  assert.deepEqual(session.draft, before);
+});
+
+test('history_entry_loads_as_draft', () => {
+  const { calls, send } = sender();
+  const session = lookSession({ siteId: SITE_ID, settings: settingsOf(STORED), themes: THEMES, brandImages: [], send });
+  const older = {
+    ...structuredClone(STORED),
+    theme: { name: 'Plum', primary: '#7a3e8f', secondary: '#3b2244' },
+    from: 'builtin:plum',
+    logo: ref(SHA_B, DOC_B, 'Old logo.png'),
+    header: { layout: 'extended', background: 'strong', align: 'centre', hide_title: false },
+  };
+  session.preview({ event_id: 7, at: '2026-11-14T10:00:00Z', by: null, look: older });
+  assert.deepEqual(session.draft, draftFromLook(older));
+  assert.equal(session.status().dirty, true);
+  assert.equal(calls.length, 0, 'a preview sends nothing');
+  // The preview shows it: the theme's colours, its logo through the brand image address.
+  const effective = previewEffective(session.draft, 'Sales');
+  assert.equal(effective.theme.light.accent, '#7a3e8f');
+  assert.equal(effective.logo_url, `/api/brand/images/${SHA_B}`);
+  assert.equal(effective.logo_alt, 'Sales');
+  assert.equal(effective.header.layout, 'extended');
+  // An entry with no look is the default look.
+  session.preview({ event_id: 1, look: null });
+  assert.equal(session.draft.from, 'builtin:sharecraft');
+  assert.equal(session.draft.logo, null);
+  // Applying a previewed look keeps what the site holds, re-chooses the rest from its document.
+  const input = lookInput(draftFromLook(older), { current: STORED, themes: THEMES, brandImages: [] });
+  assert.deepEqual(input.theme, { from: 'builtin:plum' });
+  assert.deepEqual(input.logo, { doc: DOC_B });
+  const withBrand = lookInput(draftFromLook(older), {
+    current: STORED,
+    themes: THEMES,
+    brandImages: [{ id: 'img-1', kind: 'logo', name: 'Old logo', url: `/api/brand/images/${SHA_B}` }],
+  });
+  assert.deepEqual(withBrand.logo, { brand_image: 'img-1' });
+  // A theme changed since in the brand centre is sent as the copy the draft holds.
+  const changed = lookInput(draftFromLook(older), {
+    current: STORED,
+    themes: [{ ...THEMES[1], primary: '#6a2e7f' }],
+    brandImages: [],
+  });
+  assert.deepEqual(changed.theme, { name: 'Plum', primary: '#7a3e8f', secondary: '#3b2244' });
+});
+
+test('image_gone_loads_without_images', async () => {
+  const { calls, send } = sender(() => ({
+    ok: false,
+    status: 409,
+    error: 'image_gone',
+    data: { error: 'image_gone', slots: ['logo', 'header.image'] },
+  }));
+  const session = lookSession({ siteId: SITE_ID, settings: settingsOf(STORED), themes: THEMES, brandImages: [], send });
+  const older = {
+    ...structuredClone(STORED),
+    logo: ref(SHA_B, DOC_B, 'Gone.png'),
+    thumbnail: ref(SHA_C, DOC_A, 'Mark.png'),
+    header: { layout: 'extended', background: 'image', image: ref(SHA_B, DOC_B, 'Band.png'), align: 'left', hide_title: true },
+  };
+  const result = await session.restore({ event_id: 12, look: older });
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0], { method: 'POST', path: `/sites/${SITE_ID}/look/rollback`, body: { event_id: 12 } });
+  assert.equal(result.ok, false);
+  assert.deepEqual(result.gone, ['logo', 'header.image']);
+  // The entry is now the draft, without the images whose content is gone.
+  const draft = session.draft;
+  assert.equal(draft.logo, null);
+  assert.equal(draft.header.image, null);
+  assert.equal(draft.header.background, 'none', 'an image band without its image has no background');
+  assert.equal(draft.header.hide_title, false, 'the title shows without a logo');
+  assert.equal(draft.thumbnail.sha256, SHA_C, 'the other images stay');
+  assert.equal(session.status().dirty, true);
+  // A restore that works makes the answer the saved look.
+  const ok = sender(() => ({ ok: true, status: 200, data: settingsOf({ ...STORED, navigation: 'vertical' }) }));
+  const other = lookSession({ siteId: SITE_ID, settings: settingsOf(STORED), themes: THEMES, brandImages: [], send: ok.send });
+  assert.equal((await other.restore({ event_id: 3, look: STORED })).ok, true);
+  assert.equal(other.draft.navigation, 'vertical');
+  assert.equal(other.status().dirty, false);
+});
+
+test('picker_filters_and_lists_only_images', () => {
+  const library = { id: 'lib-1', name: 'Brand assets' };
+  const items = [
+    { id: 'f1', kind: 'folder', name: 'Logos.png' },
+    { id: 'd1', kind: 'document', name: 'Logo.PNG', thumbnail: true },
+    { id: 'd2', kind: 'document', name: 'Mark.svg' },
+    { id: 'd3', kind: 'document', name: 'Report.docx' },
+    { id: 'd4', kind: 'document', name: 'Band.jpeg', thumbnail: true },
+    { id: 'd5', kind: 'document', name: 'Held.png', scan: 'held' },
+    { id: 'd6', kind: 'document', name: 'Bad.webp', scan: 'quarantined' },
+    { id: 'd7', kind: 'document', name: 'Blocked.gif', policy: 'blocked' },
+    { id: 'd8', kind: 'document', name: 'notes.svg.txt' },
+    { id: 'd9', kind: 'document', name: 'Photo.avif' },
+    { id: 'd10', kind: 'document', name: 'Banner.webp', thumbnail: true },
+  ];
+  const entries = imageEntries(items, library);
+  assert.deepEqual(
+    entries.map((e) => e.name),
+    ['Band.jpeg', 'Banner.webp', 'Logo.PNG', 'Mark.svg'],
+  );
+  assert.deepEqual(entries[2], {
+    doc: 'd1',
+    name: 'Logo.PNG',
+    library: 'Brand assets',
+    thumb: '/api/docs/d1/thumbnail',
+  });
+  assert.equal(entries[3].thumb, '/api/docs/d2/preview', 'an SVG is shown from its preview');
+  assert.deepEqual(filterImages(entries, '  ban ').map((e) => e.name), ['Band.jpeg', 'Banner.webp']);
+  assert.deepEqual(filterImages(entries, 'LOGO').map((e) => e.name), ['Logo.PNG']);
+  assert.deepEqual(filterImages(entries, 'brand').map((e) => e.name), entries.map((e) => e.name), 'the library name matches too');
+  assert.deepEqual(filterImages(entries, ''), entries);
+  assert.deepEqual(filterImages(entries, 'zzz'), []);
+});
+
+test('brand_centre_hides_managers_from_non_admins', () => {
+  const managers = [{ id: 'u1', name: 'Mia', email: 'mia@example.test' }];
+  // A brand manager changes themes and images but never sees or names the managers.
+  assert.deepEqual(brandCentreSections({ can_manage: true }, { is_admin: false }), { edit: true, managers: false });
+  assert.deepEqual(brandCentreSections({ can_manage: true, managers }, { is_admin: false }), { edit: true, managers: false });
+  // An administrator sees them.
+  assert.deepEqual(brandCentreSections({ can_manage: true, managers }, { is_admin: true }), { edit: true, managers: true });
+  // Anyone else signed in reads the brand centre only.
+  assert.deepEqual(brandCentreSections({ can_manage: false }, { is_admin: false }), { edit: false, managers: false });
+});
+
+test('look_input_sends_only_what_the_layout_uses', () => {
+  const draft = draftFromLook({
+    ...structuredClone(STORED),
+    logo: null,
+    header: { layout: 'compact', background: 'image', image: ref(SHA_A, DOC_A, 'Band.png'), align: 'right', hide_title: true },
+    footer: {
+      enabled: true,
+      layout: 'simple',
+      name: 'Sales',
+      background: 'soft',
+      groups: [
+        { heading: 'Kept out', links: [{ label: 'Home', url: '/' }, { label: ' ', url: '' }] },
+        { heading: 'Second', links: [{ label: 'Help', url: 'https://example.test/' }] },
+      ],
+    },
+  });
+  const input = lookInput(draft, { current: STORED, themes: THEMES });
+  // A compact header has no image, alignment or image background; no logo, no hidden title.
+  assert.deepEqual(input.header, { layout: 'compact', background: 'none', align: 'left', hide_title: false });
+  // A simple footer: the first group, no heading, empty links left out.
+  assert.deepEqual(input.footer.groups, [{ heading: '', links: [{ label: 'Home', url: '/' }] }]);
+  // Extended: the image band and alignment go, and every group with its heading.
+  draft.header.layout = 'extended';
+  draft.footer.layout = 'extended';
+  const wide = lookInput(draft, { current: STORED, themes: THEMES });
+  assert.deepEqual(wide.header.image, { keep: SHA_A });
+  assert.equal(wide.header.background, 'image');
+  assert.equal(wide.header.align, 'right');
+  assert.deepEqual(
+    wide.footer.groups.map((g) => g.heading),
+    ['Kept out', 'Second'],
+  );
+  // An empty group added to edit is no change.
+  const { send } = sender();
+  const session = lookSession({ siteId: SITE_ID, settings: settingsOf(STORED), themes: THEMES, brandImages: [], send });
+  session.change((d) => d.footer.groups.push({ heading: '', links: [{ label: '', url: '' }] }));
+  assert.equal(session.status().dirty, false);
+});

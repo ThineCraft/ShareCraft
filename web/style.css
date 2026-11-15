@@ -383,3 +383,61 @@ input[type=file]{max-width:100%}
  .site-header{margin:0;border-radius:0}
  .footer-links :is(a,span){min-height:44px;display:flex;align-items:center}
 }
+/* Change the look and the brand centre: colour fields, swatches, the live contrast check, the
+   preview in light and dark side by side, image slots and the image picker. The preview's colours
+   come only from applyLook on the preview element (style.setProperty), never from markup */
+.page.look{max-width:1240px}
+.look-layout{display:grid;gap:8px 24px}
+.look-side{min-width:0}
+.look-editor{min-width:0}
+@media (min-width:1000px){
+ .look-layout{grid-template-columns:minmax(0,1fr) minmax(0,1.15fr);align-items:start}
+ .look-editor{grid-column:1;grid-row:1}
+ .look-side{grid-column:2;grid-row:1;position:sticky;top:8px}
+}
+.look-previews{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px}
+.look-preview{color-scheme:light;--soft:color-mix(in srgb,var(--accent) 11%,var(--paper));background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:10px;padding:8px;font-size:12px;min-width:0;overflow:hidden}
+.look-preview[data-scheme=dark]{color-scheme:dark}
+.look-preview .preview-label{margin:0 0 6px;font-size:11px;font-weight:600;color:var(--muted)}
+.look-preview .site-header{zoom:.7;margin:0}
+.look-preview .site-footer{zoom:.75;margin:8px 0 0}
+.look-preview .list{margin:8px 0;background:var(--paper)}
+.look-preview .list li{padding:6px 8px}
+.look-preview .preview-buttons{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:8px 0 0}
+.look-preview .preview-buttons button{min-height:28px;padding:2px 10px}
+.look-preview .preview-nav{display:flex;flex-wrap:wrap;gap:4px 12px;margin:6px 0 0;padding:0;list-style:none}
+.look-preview .preview-nav [aria-current]{font-weight:600;color:var(--text)}
+.look-preview .preview-body{display:block}
+.look-preview .preview-body.vertical{display:grid;grid-template-columns:72px minmax(0,1fr);gap:8px}
+.look-preview .preview-body.vertical .preview-nav{flex-direction:column;border-right:1px solid var(--line);padding-right:6px}
+.colour-row{display:flex;align-items:center;gap:8px}
+.colour-row input[type=text]{flex:1;min-width:0;font-family:ui-monospace,'Cascadia Mono',Consolas,monospace}
+input[type=color]{width:44px;height:36px;padding:2px;border:1px solid var(--line);border-radius:7px;background:var(--paper);flex:none;cursor:pointer}
+.swatch{display:inline-block;width:20px;height:20px;border-radius:5px;border:1px solid var(--line);background:var(--swatch,transparent);flex:none;vertical-align:middle}
+.swatch.none{background:linear-gradient(to top right,transparent 45%,var(--muted) 50%,transparent 55%)}
+.swatches{display:inline-flex;gap:4px;align-items:center;flex:none}
+.pairs li .ratio{font-variant-numeric:tabular-nums}
+.pairs li.pass{color:var(--muted)}
+.slot{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-bottom:14px}
+.slot .slot-picture{display:grid;place-items:center;width:64px;height:44px;border:1px solid var(--line);border-radius:5px;background:var(--sheet);overflow:hidden;flex:none}
+.slot .slot-picture img{width:100%;height:100%;object-fit:contain}
+.slot .slot-name{flex:1;min-width:120px;overflow-wrap:anywhere}
+.slot .slot-label{flex-basis:100%;font-size:12px;color:var(--muted)}
+.action-bar{position:sticky;bottom:0;z-index:2;display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px;margin:16px 0 0;padding:10px 0;background:var(--bg);border-top:1px solid var(--line)}
+.action-bar .meta{flex:1;min-width:160px}
+.footer-editor .footer-group{border:1px solid var(--line);border-radius:7px;padding:8px 10px;margin:0 0 10px}
+.footer-editor .footer-group .list li{align-items:flex-end}
+.footer-editor .footer-group .list .field{margin:0;flex:1;min-width:140px}
+.theme-form{border:1px solid var(--line);border-radius:10px;padding:12px;margin:0 0 12px;background:var(--paper)}
+.list li .swatches{margin-right:4px}
+.list.grid.images li{gap:4px}
+.list.grid.images .thumb{aspect-ratio:3/2}
+dialog.picker-dialog{max-width:min(760px,calc(100vw - 32px))}
+dialog .list.grid.picker{max-height:50vh;overflow:auto;padding:4px}
+.list.grid.picker li{padding:0}
+.list.grid.picker button.pick{display:flex;flex-direction:column;align-items:stretch;justify-content:flex-start;gap:4px;width:100%;height:100%;padding:6px;border:0;border-radius:7px;background:transparent;color:var(--text);text-align:left}
+.list.grid.picker button.pick small{color:var(--muted);font-size:11px;overflow-wrap:anywhere}
+@media (max-width:760px){
+ input[type=color]{width:52px;height:44px}
+ .look-preview .site-header{zoom:.6}
+}

@@ -292,3 +292,424 @@ export function applyLook(root, effective) {
   for (const name of LOOK_VARIABLES) style.setProperty(name, tokens[name]);
   return true;
 }
+
+// ---- Change the look: the draft, what Apply sends, the preview and the session ----
+//
+// A draft is a look as the server stores it (`GET /api/sites/{id}/look/settings` answers
+// `look`), with each image slot holding one of: an image the look stores (`{sha256, name,
+// from_doc, ...}`), a brand-centre image chosen from the picker (`{brand_image, sha256, name}`)
+// or a document chosen from the picker (`{doc, name}`); `null` for none. Nothing in a draft is
+// saved until Apply.
+
+/** The look of a site with none recorded: the built-in ShareCraft theme and the defaults. */
+export const DEFAULT_LOOK = Object.freeze({
+  theme: { name: 'ShareCraft', primary: '#3156c9', secondary: '#233239' },
+  from: 'builtin:sharecraft',
+  logo: null,
+  thumbnail: null,
+  logo_alt: '',
+  header: { layout: 'compact', background: 'none', image: null, align: 'left', hide_title: false },
+  navigation: 'horizontal',
+  footer: { enabled: false, layout: 'simple', logo: null, name: '', background: 'none', groups: [] },
+});
+
+/** The theme colour each check is about, which "Use suggested" sets. */
+export const CHECK_FIELD = Object.freeze({
+  primary_on_light: 'primary',
+  button_on_primary: 'primary',
+  primary_dark_on_dark: 'primary_dark',
+  button_on_primary_dark: 'primary_dark',
+  header_on_secondary: 'secondary',
+  header_on_secondary_dark: 'secondary_dark',
+});
+
+/** Each check in words, for the live contrast check. */
+export const CHECK_LABELS = Object.freeze({
+  primary_on_light: 'Links and accents on light pages',
+  button_on_primary: 'White button text on the primary colour',
+  primary_dark_on_dark: 'Links and accents on dark pages',
+  button_on_primary_dark: 'Button text on the dark primary colour',
+  header_on_secondary: 'Header text on the secondary colour',
+  header_on_secondary_dark: 'Header text on the dark secondary colour',
+});
+
+/** The colours of a theme, in the order the forms show them. */
+export const THEME_FIELDS = Object.freeze(['primary', 'secondary', 'primary_dark', 'secondary_dark']);
+const SHA256 = /^[0-9a-f]{64}$/;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+const clone = (value) => (value === undefined ? undefined : JSON.parse(JSON.stringify(value)));
+
+/** A copy of the image of a slot as a draft holds it, or null. */
+function draftImage(image) {
+  return image && typeof image === 'object' ? clone(image) : null;
+}
+
+/** Only the name and the colours a theme has; dark colours left out are derived. */
+export function themeOf(theme) {
+  const out = { name: String(theme?.name ?? '') };
+  for (const field of THEME_FIELDS) {
+    const value = theme?.[field];
+    if (typeof value === 'string' && value !== '') out[field] = parseColour(value) ? value.toLowerCase() : value;
+  }
+  return out;
+}
+
+/** A draft of `look` (a look as stored, or null for the default look), with every field set. */
+export function draftFromLook(look) {
+  const base = look && typeof look === 'object' ? look : DEFAULT_LOOK;
+  const header = { ...DEFAULT_LOOK.header, ...base.header };
+  const footer = { ...DEFAULT_LOOK.footer, ...base.footer };
+  return {
+    theme: themeOf(base.theme ?? DEFAULT_LOOK.theme),
+    from: typeof base.from === 'string' ? base.from : 'custom',
+    logo: draftImage(base.logo),
+    thumbnail: draftImage(base.thumbnail),
+    logo_alt: String(base.logo_alt ?? ''),
+    header: {
+      layout: header.layout,
+      background: header.background,
+      image: draftImage(header.image),
+      align: header.align,
+      hide_title: Boolean(header.hide_title),
+    },
+    navigation: base.navigation === 'vertical' ? 'vertical' : 'horizontal',
+    footer: {
+      enabled: Boolean(footer.enabled),
+      layout: footer.layout === 'extended' ? 'extended' : 'simple',
+      logo: draftImage(footer.logo),
+      name: String(footer.name ?? ''),
+      background: footer.background,
+      groups: clone(Array.isArray(footer.groups) ? footer.groups : []),
+    },
+  };
+}
+
+/** Whether two themes have the same name and colours (a dark colour left out is derived). */
+export function sameTheme(a, b) {
+  const x = themeOf(a);
+  const y = themeOf(b);
+  return x.name === y.name && THEME_FIELDS.every((field) => (x[field] ?? null) === (y[field] ?? null));
+}
+
+/** The content hash of a brand image address `/api/brand/images/{sha256}`, or null. */
+export function shaOfUrl(url) {
+  const match = typeof url === 'string' ? /^\/api\/brand\/images\/([0-9a-f]{64})$/.exec(url) : null;
+  return match ? match[1] : null;
+}
+
+/**
+ * Where the preview shows a draft image from: a stored or brand-centre image at its brand
+ * image address, a document chosen from the picker at its preview; null for anything else.
+ */
+export function draftImageUrl(image) {
+  if (!image || typeof image !== 'object') return null;
+  if (typeof image.sha256 === 'string' && SHA256.test(image.sha256)) return `/api/brand/images/${image.sha256}`;
+  if (typeof image.doc === 'string' && UUID.test(image.doc)) return `/api/docs/${image.doc}/preview`;
+  return null;
+}
+
+/**
+ * The colours the preview shows for `theme`, even one that fails a check (so the person sees
+ * what fails): the checked colours when it passes, else each colour as given, a missing dark
+ * colour derived where it can be, and the better text colour on each.
+ */
+export function previewPalettes(theme) {
+  const checked = checkTheme(themeOf(theme));
+  if (checked.ok) return checked.resolved;
+  const p = parseColour(theme?.primary) ?? parseColour(DEFAULT_LOOK.theme.primary);
+  const s = parseColour(theme?.secondary) ?? parseColour(DEFAULT_LOOK.theme.secondary);
+  const pd = parseColour(theme?.primary_dark) ?? deriveDark(p, 'primary') ?? p;
+  const sd = parseColour(theme?.secondary_dark) ?? deriveDark(s, 'secondary') ?? s;
+  const palette = (accent, header) => ({
+    accent: hexOf(accent),
+    accent_ink: hexOf(accent),
+    on_accent: bestInk(accent).ink,
+    header_bg: hexOf(header),
+    header_ink: bestInk(header).ink,
+  });
+  return { light: { ...palette(p, s), on_accent: WHITE }, dark: palette(pd, sd) };
+}
+
+/**
+ * The draft as `GET /api/sites/{id}/look` would answer it, for the preview: the theme's colours
+ * (see [`previewPalettes`]), image addresses (see [`draftImageUrl`]) and the site's name as the
+ * logo description when it is empty.
+ */
+export function previewEffective(draft, siteName) {
+  const put = (target, key, image) => {
+    const url = draftImageUrl(image);
+    if (url) target[key] = url;
+    return target;
+  };
+  const header = put(
+    {
+      layout: draft.header.layout,
+      background: draft.header.background,
+      align: draft.header.align,
+      hide_title: draft.header.hide_title,
+    },
+    'image_url',
+    draft.header.image,
+  );
+  const footer = put(
+    {
+      enabled: draft.footer.enabled,
+      layout: draft.footer.layout,
+      name: draft.footer.name,
+      background: draft.footer.background,
+      groups: draft.footer.groups,
+    },
+    'logo_url',
+    draft.footer.logo,
+  );
+  const out = {
+    theme: previewPalettes(draft.theme),
+    logo_alt: draft.logo_alt.trim() || siteName,
+    header,
+    navigation: draft.navigation,
+    footer,
+    theme_from: 'site',
+  };
+  put(out, 'logo_url', draft.logo);
+  put(out, 'thumbnail_url', draft.thumbnail);
+  return out;
+}
+
+/** Every image hash of a stored look. */
+function lookHashes(look) {
+  return [look?.logo, look?.thumbnail, look?.header?.image, look?.footer?.logo]
+    .map((image) => image?.sha256)
+    .filter((sha) => typeof sha === 'string');
+}
+
+/**
+ * How a draft image is sent: `{doc}` or `{brand_image}` as chosen; an image the look holds now
+ * as `{keep}`; else (an image from an earlier look) the brand-centre image with the same
+ * content, or its document again; null for none.
+ */
+function slotInput(image, current, brandImages) {
+  if (!image) return null;
+  if (typeof image.doc === 'string') return { doc: image.doc };
+  if (typeof image.brand_image === 'string') return { brand_image: image.brand_image };
+  if (typeof image.sha256 !== 'string') return null;
+  if (lookHashes(current).includes(image.sha256)) return { keep: image.sha256 };
+  const brand = (brandImages ?? []).find((b) => shaOfUrl(b.url) === image.sha256);
+  if (brand) return { brand_image: brand.id };
+  return typeof image.from_doc === 'string' ? { doc: image.from_doc } : null;
+}
+
+/**
+ * The body Apply sends as `look` (`PUT /api/sites/{id}/look`) for `draft`. `current` is the
+ * look the site has now (stored), `themes` every theme the page offers (`{from, name,
+ * primary, ...}`), `brandImages` the brand centre's images. A theme still the same as its
+ * source is sent by its source; otherwise (custom, or changed or gone at its source) as the
+ * colours the draft holds.
+ */
+export function lookInput(draft, { current = null, themes = [], brandImages = [] } = {}) {
+  const source = draft.from !== 'custom' ? themes.find((t) => t.from === draft.from) : null;
+  const theme = source && sameTheme(source, draft.theme) ? { from: draft.from } : themeOf(draft.theme);
+  // The draft keeps every choice while the person tries layouts; what is sent is only what the
+  // chosen layout uses: an image and an alignment only for an extended header, a hidden title
+  // only with a logo, and the footer's groups as its layout allows them.
+  const extended = draft.header.layout === 'extended';
+  const band = extended && draft.header.background === 'image' && draft.header.image ? draft.header.image : null;
+  const out = {
+    theme,
+    logo_alt: draft.logo_alt,
+    header: {
+      layout: draft.header.layout,
+      background: draft.header.background === 'image' && !band ? 'none' : draft.header.background,
+      align: extended ? draft.header.align : 'left',
+      hide_title: Boolean(draft.header.hide_title && draft.logo),
+    },
+    navigation: draft.navigation,
+    footer: {
+      enabled: draft.footer.enabled,
+      layout: draft.footer.layout,
+      name: draft.footer.name,
+      background: draft.footer.background,
+      groups: footerGroups(draft.footer),
+    },
+  };
+  const slot = (target, key, image) => {
+    const value = slotInput(image, current, brandImages);
+    if (value) target[key] = value;
+  };
+  slot(out, 'logo', draft.logo);
+  slot(out, 'thumbnail', draft.thumbnail);
+  slot(out.header, 'image', band);
+  slot(out.footer, 'logo', draft.footer.logo);
+  return out;
+}
+
+/** The most groups of links a footer of each layout has. */
+export const FOOTER_GROUP_LIMIT = Object.freeze({ simple: 1, extended: 4 });
+/** The most links in a footer group. */
+export const FOOTER_LINK_LIMIT = 8;
+
+/**
+ * The footer's groups as sent: links left wholly empty are dropped, and then groups with
+ * neither a heading nor a link; a simple footer has its first group only and no heading; an
+ * extended one at most 4 groups.
+ */
+export function footerGroups(footer) {
+  const simple = footer.layout !== 'extended';
+  const groups = (Array.isArray(footer.groups) ? footer.groups : []).slice(0, simple ? 1 : FOOTER_GROUP_LIMIT.extended);
+  return groups
+    .map((group) => ({
+      heading: simple ? '' : String(group?.heading ?? ''),
+      links: (Array.isArray(group?.links) ? group.links : [])
+        .filter((link) => String(link?.label ?? '').trim() !== '' || String(link?.url ?? '').trim() !== '')
+        .map((link) => ({ label: String(link.label ?? ''), url: String(link.url ?? '') })),
+    }))
+    .filter((group) => group.heading.trim() !== '' || group.links.length > 0);
+}
+
+/** The draft as it would be sent, to tell whether it differs from the saved look. */
+function comparable(draft) {
+  return { ...draft, footer: { ...draft.footer, groups: footerGroups(draft.footer) } };
+}
+
+/**
+ * `draft` without the images of `slots` (`logo`, `thumbnail`, `header.image`, `footer.logo`),
+ * as a rollback refused with `image_gone` names them; an image band without its image has no
+ * background then, and a hidden title shows again without a logo.
+ */
+export function withoutSlots(draft, slots) {
+  const out = clone(draft);
+  for (const slot of slots ?? []) {
+    if (slot === 'logo') out.logo = null;
+    if (slot === 'thumbnail') out.thumbnail = null;
+    if (slot === 'header.image') out.header.image = null;
+    if (slot === 'footer.logo') out.footer.logo = null;
+  }
+  if (out.header.background === 'image' && !out.header.image) out.header.background = 'none';
+  if (!out.logo) out.header.hide_title = false;
+  return out;
+}
+
+/** A text form of `value` with the keys of every object sorted, to compare drafts. */
+function canonical(value) {
+  if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonical(value[key])}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value ?? null);
+}
+
+/**
+ * The Change the look page's state for site `siteId`, without any DOM: the saved look (from
+ * `settings`, the answer of `GET /api/sites/{id}/look/settings`) and a draft. Changes go to the
+ * draft only; `apply` sends it (`PUT`), `cancel` drops it, `preview` loads a history entry as
+ * the draft and `restore` rolls back to it, loading it as a draft without the images whose
+ * content is gone when the server says so. `send(method, path, body)` is `api` from common.js
+ * (paths without `/api`). `readOnly` (an archived site) never applies or restores.
+ */
+export function lookSession({ siteId, settings, themes = [], brandImages = [], send, readOnly = false }) {
+  let saved = settings;
+  let draft = draftFromLook(saved?.look);
+  const path = `/sites/${encodeURIComponent(siteId)}`;
+  const take = (answer) => {
+    saved = answer;
+    draft = draftFromLook(saved?.look);
+  };
+  const session = {
+    get draft() {
+      return draft;
+    },
+    get settings() {
+      return saved;
+    },
+    /** Changes the draft with `edit(draft)`. */
+    change(edit) {
+      edit(draft);
+    },
+    /** Copies `theme` (`{from, name, primary, ...}`) into the draft. */
+    chooseTheme(theme) {
+      draft.theme = themeOf(theme);
+      draft.from = theme.from;
+    },
+    /** Sets a theme colour as typed (empty leaves a dark colour to be derived); the theme becomes custom. */
+    setColour(field, value) {
+      if (!THEME_FIELDS.includes(field)) return;
+      const text = String(value ?? '').trim();
+      if (text === '' && field.endsWith('_dark')) delete draft.theme[field];
+      else draft.theme[field] = parseColour(text) ? text.toLowerCase() : text;
+      draft.from = 'custom';
+    },
+    /** Sets the theme's name; the theme becomes custom. */
+    setName(name) {
+      draft.theme.name = String(name ?? '');
+      draft.from = 'custom';
+    },
+    /** Sets the colour a failing `pair` is about to its suggestion, if it has one. */
+    useSuggested(pair) {
+      const field = CHECK_FIELD[pair?.check];
+      if (!field || typeof pair.suggestion !== 'string' || !parseColour(pair.suggestion)) return;
+      session.setColour(field, pair.suggestion);
+    },
+    /** Drops the draft: back to the saved look. */
+    cancel() {
+      draft = draftFromLook(saved?.look);
+    },
+    /** `{dirty, check, canApply}`: Apply needs a change, every pair passing, a name and a live site. */
+    status() {
+      const check = checkTheme(draft.theme);
+      const dirty = canonical(comparable(draft)) !== canonical(comparable(draftFromLook(saved?.look)));
+      const named = draft.theme.name.trim() !== '';
+      return { dirty, check, canApply: dirty && check.ok && named && !readOnly };
+    },
+    /** Loads the look of history `entry` as the draft. */
+    preview(entry) {
+      draft = draftFromLook(entry?.look ?? null);
+    },
+    /** Sends the draft. Answers the `api` result; on success the answer is the saved look. */
+    async apply() {
+      if (!session.status().canApply) return { ok: false, error: null };
+      const body = { look: lookInput(draft, { current: saved?.look, themes, brandImages }) };
+      const result = await send('PUT', `${path}/look`, body);
+      if (result.ok) take(result.data);
+      return result;
+    },
+    /**
+     * Rolls back to history `entry`. On success the answer is the saved look; when its images'
+     * content is gone (`409 image_gone`), the entry becomes the draft without them, and the
+     * answer carries `gone`, the slots.
+     */
+    async restore(entry) {
+      if (readOnly) return { ok: false, error: null };
+      const result = await send('POST', `${path}/look/rollback`, { event_id: entry.event_id });
+      if (result.ok) {
+        take(result.data);
+        return result;
+      }
+      if (result.error === 'image_gone') {
+        const gone = Array.isArray(result.data?.slots) ? result.data.slots : [];
+        draft = withoutSlots(draftFromLook(entry.look ?? null), gone);
+        return { ...result, gone };
+      }
+      return result;
+    },
+    /** The themes and brand images the session knows, for the page to replace after a change. */
+    setChoices(next) {
+      if (Array.isArray(next.themes)) themes = next.themes;
+      if (Array.isArray(next.brandImages)) brandImages = next.brandImages;
+    },
+  };
+  return session;
+}
+
+/**
+ * What the brand centre page shows `me` for `brand` (`GET /api/brand`): `edit` for brand
+ * managers and administrators (themes and images), `managers` for administrators only.
+ */
+export function brandCentreSections(brand, me) {
+  return {
+    edit: Boolean(brand?.can_manage),
+    managers: Boolean(me?.is_admin) && Array.isArray(brand?.managers),
+  };
+}

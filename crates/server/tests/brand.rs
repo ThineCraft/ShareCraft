@@ -590,6 +590,77 @@ async fn image_from_asset_library_needs_view() {
 }
 
 #[tokio::test]
+async fn image_renamed_by_brand_managers() {
+    let server = spawn_server().await;
+    let root = server.admin("Root").await;
+    let mia = server.user("Mia").await;
+    let ned = server.user("Ned").await;
+    managers(&server, &root, &[&mia]).await;
+    let (_, _, assets) = site_with_assets(&server, &root, "Marketing").await;
+    let logo = png(8, 8);
+    let doc = upload(&server, &root, &assets, "Logo.png", &logo).await;
+    let (status, body) = new_image(&server, &root, json!({ "doc": doc, "kind": "logo" })).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let id = body["id"].as_str().unwrap().to_owned();
+    let path = format!("/api/brand/images/{id}");
+    let rename = |user, name: Value| {
+        call(
+            &server,
+            Some(user),
+            Method::PATCH,
+            &path,
+            Some(json!({ "name": name })),
+        )
+    };
+
+    // Not by anyone else.
+    let (status, body) = rename(&ned, json!("Mine")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    // A brand manager renames it: the name is trimmed, the content is the same.
+    let (status, body) = rename(&mia, json!("  Main logo ")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["id"], id.as_str());
+    assert_eq!(body["name"], "Main logo");
+    assert_eq!(body["kind"], "logo");
+    assert_eq!(body["url"], format!("/api/brand/images/{}", sha(&logo)));
+    let git = in_git(&server);
+    assert_eq!(git.images[0].image.name, "Main logo");
+    assert_eq!(git.images[0].image.sha256, sha(&logo));
+    assert_eq!(
+        centre(&server, &ned).await["images"][0]["name"],
+        "Main logo"
+    );
+    let changed = events(&server, "brand.image_changed").await;
+    assert_eq!(changed.last().unwrap()["action"], "renamed");
+    assert_eq!(changed.last().unwrap()["before"], "Logo.png");
+    // The same name again writes nothing.
+    let (status, _) = rename(&mia, json!("Main logo")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(events(&server, "brand.image_changed").await.len(), 2);
+    // Empty, too long or with control characters: refused.
+    for bad in [
+        json!(""),
+        json!("   "),
+        json!("a\u{0007}b"),
+        json!("x".repeat(121)),
+    ] {
+        let (status, body) = rename(&mia, bad.clone()).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{bad}: {body}");
+    }
+    // No such image.
+    let (status, _) = call(
+        &server,
+        Some(&mia),
+        Method::PATCH,
+        &format!("/api/brand/images/{}", Uuid::new_v4()),
+        Some(json!({ "name": "X" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(in_git(&server).images[0].image.name, "Main logo");
+}
+
+#[tokio::test]
 async fn image_type_judged_by_content() {
     let server = spawn_server().await;
     let root = server.admin("Root").await;

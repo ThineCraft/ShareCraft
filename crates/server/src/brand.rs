@@ -848,6 +848,47 @@ pub(crate) async fn remove_image(
     .await
 }
 
+/// Renames the image `id` of the brand centre to `name` (trimmed) for `actor`, with
+/// `brand.image_changed` (`renamed`, and the name `before`). Its content stays the same. The
+/// same name again changes nothing. Answers the image.
+///
+/// # Errors
+/// `403`; `404` for no such image; `422 invalid_request` for a name that is empty, longer than
+/// 120 characters or holds control or invisible characters; otherwise `503`.
+pub(crate) async fn rename_image(
+    state: &AppState,
+    actor: &User,
+    id: Uuid,
+    name: &str,
+) -> Result<BrandImage, BrandError> {
+    if !allowed(state.db(), actor, BrandNeeds::Manager).await? {
+        return Err(ApiError::Forbidden.into());
+    }
+    let name = clean_text(name)
+        .filter(|n| (1..=MAX_IMAGE_NAME_CHARS).contains(&n.chars().count()))
+        .ok_or(ApiError::InvalidRequest)?
+        .to_owned();
+    change_brand(state, actor, BrandNeeds::Manager, |brand| {
+        let image = brand
+            .images
+            .iter_mut()
+            .find(|i| i.id == id)
+            .ok_or(ApiError::NotFound)?;
+        let before = std::mem::replace(&mut image.image.name, name.clone());
+        let renamed = image.clone();
+        Ok(Edited {
+            message: format!("Rename the brand image {before} to {name}"),
+            events: vec![brand_event(
+                "brand.image_changed",
+                actor,
+                json!({ "action": "renamed", "before": before, "image": image_detail(&renamed) }),
+            )],
+            answer: renamed,
+        })
+    })
+    .await
+}
+
 /// Names the brand managers for `actor`, an enabled administrator: `users`, each an enabled
 /// account, each once, in the order given, with `brand.managers_changed {from, to}`. Naming
 /// the same managers again changes nothing.
