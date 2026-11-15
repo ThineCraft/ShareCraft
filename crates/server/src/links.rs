@@ -224,13 +224,17 @@ async fn children(
     let node = reached_id(&node)?;
     let Query(query) = query.map_err(|_| ApiError::BadRequest)?;
     let (after, limit) = query.page()?;
-    let (listed, next) = state
-        .db()
+    let db = state.db();
+    let (listed, next) = db
         .anyone_children(&token, node, after.as_ref(), limit)
         .await
         .map_err(|e| ApiError::unavailable(&e))?
         .ok_or(ApiError::LinkNotFound)?;
-    Ok(Json(ChildrenPage::of(listed, next.as_ref())))
+    Ok(Json(
+        ChildrenPage::of(listed, next.as_ref())
+            .marked(db, node)
+            .await?,
+    ))
 }
 
 /// The document `node` if the anyone link with `token` reaches it now, with its name and

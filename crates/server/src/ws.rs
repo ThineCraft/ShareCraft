@@ -12,7 +12,7 @@ use collab_text::TextOp;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use protocol::{ClientMsg, FileClientMsg, FileServerMsg, RemovedReason, Resume, ServerMsg};
-use records::Access;
+use records::{Access, Editor};
 use time::OffsetDateTime;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
@@ -112,6 +112,10 @@ async fn visitor(
         .await
         .map_err(|e| ApiError::unavailable(&e))?
         .ok_or(ApiError::NotFound)?;
+    // A file no editor opens has no session to join.
+    if document.editor == Editor::Other {
+        return Err(ApiError::BadRequest);
+    }
     Ok(Visitor {
         user: session.user.id,
         session: session.id,

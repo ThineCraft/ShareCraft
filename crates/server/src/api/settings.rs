@@ -1,5 +1,6 @@
 //! The organisation's settings: sharing (whether anyone links may be made and used, and how
-//! long one may last) and the regional defaults of sites (language and time zone).
+//! long one may last), the regional defaults of sites (language and time zone), and the file
+//! types blocked everywhere.
 
 use axum::Json;
 use axum::extract::State;
@@ -193,4 +194,60 @@ pub(crate) async fn change_regional(
         .await
         .map_err(|e| ApiError::unavailable(&e))?;
     Ok(Json(defaults.into()))
+}
+
+/// `GET /api/settings/files`.
+#[derive(Serialize)]
+pub(crate) struct FilesOut {
+    blocked_file_types: Vec<String>,
+}
+
+/// `GET /api/settings/files`: the organisation's block list of file types, for administrators
+/// (`403` otherwise).
+pub(crate) async fn files(
+    State(state): State<AppState>,
+    signed: Signed,
+) -> Result<Json<FilesOut>, ApiError> {
+    if !signed.session.user.is_admin {
+        return Err(ApiError::Forbidden);
+    }
+    let policy = state
+        .db()
+        .org_policy()
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?;
+    Ok(Json(FilesOut {
+        blocked_file_types: policy.blocked_file_types,
+    }))
+}
+
+/// The body of `PUT /api/settings/files`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FilesChange {
+    /// Extensions, such as `.exe`; trimmed and lower-cased.
+    blocked_file_types: Value,
+}
+
+/// `PUT /api/settings/files {blocked_file_types}`: sets the organisation's block list, for
+/// administrators (`403` otherwise): at most 100 extensions (each trimmed and lower-cased, then
+/// 2 to 20 characters of letters, digits and dots with its leading dot), none twice;
+/// `422 invalid_request` otherwise. Recorded as `setting.changed`. Answers the list as it then
+/// is. It applies at once to every new name, upload, copy and move; files already stored stay,
+/// and are marked in their listings. Set under the tree's turn, so a change of the tree never
+/// sees the list half way.
+pub(crate) async fn change_files(
+    State(state): State<AppState>,
+    signed: Signed,
+    JsonBody(change): JsonBody<FilesChange>,
+) -> Result<Json<FilesOut>, ApiError> {
+    if !signed.session.user.is_admin {
+        return Err(ApiError::Forbidden);
+    }
+    let _turn = state.tree_lock().lock().await;
+    let blocked_file_types = state
+        .db()
+        .set_blocked_file_types(signed.session.user.id, &change.blocked_file_types)
+        .await?;
+    Ok(Json(FilesOut { blocked_file_types }))
 }

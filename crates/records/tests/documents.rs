@@ -555,23 +555,26 @@ async fn existing_documents_are_text() {
 
 #[test]
 fn editor_is_chosen_by_extension() {
-    assert_eq!(
-        Editor::for_file_name("Budget.XLSX"),
-        Some(Editor::GridCraft)
-    );
-    assert_eq!(Editor::for_file_name("a.docx"), Some(Editor::WordCraft));
-    assert_eq!(Editor::for_file_name("a.pdf"), Some(Editor::PdfCraft));
+    assert_eq!(Editor::for_file_name("Budget.XLSX"), Editor::GridCraft);
+    assert_eq!(Editor::for_file_name("a.docx"), Editor::WordCraft);
+    assert_eq!(Editor::for_file_name("a.pdf"), Editor::PdfCraft);
     assert_eq!(
         Editor::for_file_name("a.solidcraft.json"),
-        Some(Editor::SolidCraft)
+        Editor::SolidCraft
     );
-    assert_eq!(Editor::for_file_name("notes.txt"), None);
-    assert_eq!(Editor::for_file_name("a.json"), None);
-    assert_eq!(Editor::for_file_name("é"), None);
+    // Every other name is a file no editor opens.
+    assert_eq!(Editor::for_file_name("notes.txt"), Editor::Other);
+    assert_eq!(Editor::for_file_name("a.json"), Editor::Other);
+    assert_eq!(Editor::for_file_name("é"), Editor::Other);
     for editor in Editor::ALL {
         assert_eq!(Editor::from_id(editor.id()), Some(editor));
         assert_eq!(editor.is_file(), editor != Editor::Text);
+        assert_eq!(
+            editor.opens_in_editor(),
+            !matches!(editor, Editor::Text | Editor::Other)
+        );
     }
+    assert_eq!(Editor::from_id("other"), Some(Editor::Other));
     assert_eq!(Editor::from_id("excel"), None);
 }
 
@@ -606,4 +609,21 @@ async fn file_name_must_match_its_editor() {
             .await
             .is_ok()
     );
+    // A file no editor opens may have any name but an editor's extension; the database
+    // takes its editor.
+    for name in ["Archive.zip", "README", "a.tar.gz"] {
+        let made = test
+            .db
+            .create_document(ann.id, doc_id(), name, Editor::Other)
+            .await
+            .unwrap();
+        assert_eq!(made.editor, Editor::Other);
+    }
+    for name in ["Budget.xlsx", "Letter.DOCX", "Part.solidcraft.json"] {
+        let result = test
+            .db
+            .create_document(ann.id, doc_id(), name, Editor::Other)
+            .await;
+        assert_eq!(result, Err(AccessError::WrongExtension), "{name:?}");
+    }
 }

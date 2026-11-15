@@ -16,11 +16,12 @@ use collab_core::ids::{DocId, NodeId, UserId};
 use protocol::RemovedReason;
 use records::{
     Access, AccessError, BinStage, ClaimId, Db, DbError, Document, Editor, LibraryKind,
-    LibrarySettings, NewEvent, Node, NodeChange, NodeKind, NodeRow, NodesApplied, Perms,
+    LibrarySettings, NewEvent, Node, NodeChange, NodeKind, NodeRow, NodesApplied, OrgPolicy, Perms,
     QuotaError, Reservation, SiteKind, SiteSettings, User, validate_description,
     validate_document_name, validate_language, validate_node_name, validate_template_body,
     validate_time_zone,
 };
+use records::{check_name, check_size};
 use revisions::{
     Author, BlobRef, Checkpoint, CheckpointError, Content, GitError, LibraryFields, LibraryRecord,
     OrgNavigation, SITE_SCHEMA, SiteRecord, SitesChange, Stamp, TemplateBody, TemplateFolder,
@@ -387,8 +388,12 @@ impl Default for Plan {
 /// which [`create_document`] creates); `IntoItself` for a move into the node or below it;
 /// `IsSite` for deleting a site; `Exists` for an identifier already used; `FoldersOff` for a
 /// new folder in a library whose folders are off, a folder copied into one, or a folder moved
-/// into one from elsewhere; `OutOfStep` while the tree needs repair; otherwise the Git or
-/// database error.
+/// into one from elsewhere; `BlockedFileType` or `FileTooLarge` for a file the policies of
+/// the library it would go into refuse (see [`check_policies`]): a renamed file's new name, a
+/// file moved into another library (or each file below a folder moved there) and every file a
+/// copy makes; `OutOfStep` while the tree needs repair; otherwise the Git or database error.
+/// A restore is never refused for a policy: a file whose type is now refused is restored, and
+/// its listings mark it.
 ///
 /// A deletion takes a folder with every live item below it to the first stage of the site's
 /// recycle bin, as one entry, in one commit, and answers every file it deleted. The recycle
@@ -791,7 +796,8 @@ pub async fn purge_due_sites(state: &AppState, now: OffsetDateTime) -> usize {
 /// # Errors
 /// As [`apply`] for a create: `NotFound`, `Forbidden` unless `actor` has `add` on
 /// `parent`, `WrongPlace` unless `parent` is a library or folder, `InvalidName`,
-/// `WrongExtension`, `NameTaken`, `Exists`, `OutOfStep`, or the Git or database error.
+/// `WrongExtension`, `BlockedFileType`, `FileTooLarge` (for the `uploaded` size), `NameTaken`,
+/// `Exists`, `OutOfStep`, or the Git or database error.
 pub async fn create_document(
     state: &AppState,
     actor: &User,
@@ -804,7 +810,7 @@ pub async fn create_document(
     let _turn = state.tree_lock().lock().await;
     ensure_in_step(state).await?;
     let db = state.db();
-    let name = new_document_name(db, actor, parent, name, editor).await?;
+    let name = new_document_name(db, actor, parent, name, editor, uploaded).await?;
     let node = NodeId(id.0);
     unused(state, node).await?;
     let parent_record = git_record(state, parent).await?;
@@ -850,24 +856,62 @@ pub async fn create_document(
         .ok_or_else(|| DbError::new("the new document was not recorded").into())
 }
 
-/// Checks that `actor` may create a file named `name`, opened in `editor`, in `parent` now:
-/// the checks [`create_document`] makes first, without taking the tree's turn. An upload makes
-/// them before reading its body, so a request that would be refused stores nothing;
-/// [`create_document`] makes them again.
+/// Checks that `actor` may create a file named `name`, opened in `editor`, of `size` bytes
+/// when known, in `parent` now: the checks [`create_document`] makes first, without taking the
+/// tree's turn. An upload makes them before reading its body, so a request that would be
+/// refused stores nothing; [`create_document`] makes them again.
 ///
 /// # Errors
 /// `NotFound`, `Forbidden` unless `actor` has `add` on `parent`, `WrongPlace`, `InvalidName`,
-/// `WrongExtension`, `NameTaken`, or the database error.
+/// `WrongExtension`, `BlockedFileType`, `FileTooLarge`, `NameTaken`, or the database error.
 pub async fn check_create_document(
     state: &AppState,
     actor: &User,
     parent: NodeId,
     name: &str,
     editor: Editor,
+    size: Option<u64>,
 ) -> Result<(), AccessError> {
-    new_document_name(state.db(), actor, parent, name, editor)
+    new_document_name(state.db(), actor, parent, name, editor, size)
         .await
         .map(|_| ())
+}
+
+/// The file policies that hold where `place` is: the settings of the library it is in (or is)
+/// and the organisation's; `None` outside any library.
+pub(crate) async fn policies_at(
+    db: &Db,
+    place: NodeId,
+) -> Result<Option<(LibrarySettings, OrgPolicy)>, AccessError> {
+    let Some(library) = db.library_of(place).await? else {
+        return Ok(None);
+    };
+    let settings = db
+        .library_settings(library)
+        .await?
+        .unwrap_or_else(|| LibrarySettings::defaults(library));
+    Ok(Some((settings, db.org_policy().await?)))
+}
+
+/// Checks a file named `name`, of `size` bytes when known, in or going into `place` against
+/// the file policies there (see [`records::check_name`] and [`records::check_size`]):
+/// `BlockedFileType` or `FileTooLarge`.
+///
+/// # Errors
+/// `BlockedFileType`, `FileTooLarge`, or the database error.
+pub(crate) async fn check_policies(
+    db: &Db,
+    place: NodeId,
+    name: &str,
+    size: Option<u64>,
+) -> Result<(), AccessError> {
+    if let Some((library, org)) = policies_at(db, place).await? {
+        check_name(name, &library, &org)?;
+        if let Some(size) = size {
+            check_size(size, &library)?;
+        }
+    }
+    Ok(())
 }
 
 /// `name`, or the first of `name (2)`, `name (3)` … (before the extension) that no undeleted
@@ -885,14 +929,16 @@ pub async fn suggest_name(
     Ok(unique_name(name, editor, &taken))
 }
 
-/// The name a new file `name` in `parent` would have, once `actor` is found to have `add` on
-/// `parent`, a library or folder, and the name to be acceptable for `editor` and free there.
+/// The name a new file `name` (of `size` bytes, when known) in `parent` would have, once
+/// `actor` is found to have `add` on `parent`, a library or folder, the name to be acceptable
+/// for `editor`, the file to pass the file policies there, and the name to be free there.
 async fn new_document_name(
     db: &Db,
     actor: &User,
     parent: NodeId,
     name: &str,
     editor: Editor,
+    size: Option<u64>,
 ) -> Result<String, AccessError> {
     let name = validate_document_name(name, editor)?.to_owned();
     let parent_node = visible(db, actor, parent).await?;
@@ -900,6 +946,7 @@ async fn new_document_name(
         return Err(AccessError::WrongPlace);
     }
     require(&parent_node.1, Perms::ADD)?;
+    check_policies(db, parent, &name, size).await?;
     if !db.name_free(parent, &name, None).await? {
         return Err(AccessError::NameTaken);
     }
@@ -1623,6 +1670,45 @@ async fn refuse_folder_into(db: &Db, id: NodeId, destination: NodeId) -> Result<
     Ok(())
 }
 
+/// Checks what moving `node` into `destination` brings into another library against the file
+/// policies there: the file itself, or each live file below the folder, by name and by the
+/// size of its current version. A move within one library brings nothing new into it and is
+/// not checked.
+async fn refuse_files_into(
+    state: &AppState,
+    node: &Node,
+    destination: NodeId,
+) -> Result<(), AccessError> {
+    let db = state.db();
+    let into = db.library_of(destination).await?;
+    if into.is_none() || into == db.library_of(node.id).await? {
+        return Ok(());
+    }
+    let Some((library, org)) = policies_at(db, destination).await? else {
+        return Ok(());
+    };
+    let files: Vec<(DocId, String)> = match node.kind {
+        NodeKind::Document => vec![(DocId(node.id.0), node.name.clone())],
+        NodeKind::Folder => {
+            let tree = read_tree(state.checkpointer()).await.map_err(git_failure)?;
+            below(&tree, node.id.0)
+                .into_iter()
+                .filter(|r| r.deleted.is_none() && r.kind == kind_word(NodeKind::Document))
+                .map(|r| (DocId(r.id), r.name.clone()))
+                .collect()
+        }
+        NodeKind::Site | NodeKind::Library => Vec::new(),
+    };
+    for (_, name) in &files {
+        check_name(name, &library, &org)?;
+    }
+    let docs: Vec<DocId> = files.iter().map(|(doc, _)| *doc).collect();
+    for (_, size) in db.current_sizes(&docs).await? {
+        check_size(size, &library)?;
+    }
+    Ok(())
+}
+
 /// Creates the library `id` named `name`, of the kind `kind`, in the site `site` for `actor`,
 /// who needs `manage_site` on the site (an asset library also needs an enabled administrator):
 /// its tree record and its library record, with the defaults for the kind, in one Git commit,
@@ -1819,6 +1905,10 @@ async fn plan_rename(
     if before.name == name {
         return Ok(None);
     }
+    // A file's new name is checked against the policies where it is.
+    if node.kind == NodeKind::Document {
+        check_policies(db, id, &name, None).await?;
+    }
     let free = match node.parent {
         None => db.site_name_free(&name, Some(id)).await?,
         Some(parent) => db.name_free(parent, &name, Some(id)).await?,
@@ -1875,6 +1965,7 @@ async fn plan_move(
     if node.kind == NodeKind::Folder {
         refuse_folder_into(db, id, destination).await?;
     }
+    refuse_files_into(state, &node, destination).await?;
     if !db.name_free(destination, &node.name, Some(id)).await? {
         return Err(AccessError::NameTaken);
     }
@@ -2522,6 +2613,19 @@ async fn plan_copy(
     let top_name = unique_node_name(&cleaned, editor, &taken);
     let renamed = (top_name != asked).then(|| (new_top, asked.clone()));
 
+    // Every file the copy makes is a new file where it goes: the policies there hold for each.
+    let policies = policies_at(db, destination).await?;
+    if let Some((library, org)) = &policies {
+        for (record, _) in chosen.iter().filter(|(r, _)| editors.contains_key(&r.id)) {
+            let name = if record.id == source.id {
+                top_name.as_str()
+            } else {
+                record.name.as_str()
+            };
+            check_name(name, library, org)?;
+        }
+    }
+
     let author = author_of(actor);
     let mut records = Vec::with_capacity(chosen.len());
     for (record, fresh) in &chosen {
@@ -2618,6 +2722,11 @@ async fn plan_copy(
             fields: stored.meta.fields,
         });
         held.push(hold);
+    }
+    if let Some((library, _)) = &policies {
+        for version in &versions {
+            check_size(version.blob.size, library)?;
+        }
     }
     // The bytes the copy adds to where it goes, every version counting, refused before
     // anything is committed when that site has no room for them.

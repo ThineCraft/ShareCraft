@@ -132,7 +132,7 @@ fn read_manifest(folder_path: &Path, folder: &str) -> Result<Manifest, String> {
     if manifest.id != folder {
         return Err(format!("{MANIFEST} names another editor"));
     }
-    if !Editor::from_id(&manifest.id).is_some_and(Editor::is_file) {
+    if !Editor::from_id(&manifest.id).is_some_and(Editor::opens_in_editor) {
         return Err("not the id of a file editor".to_owned());
     }
     for hash in manifest.script_hashes.iter().chain(&manifest.style_hashes) {

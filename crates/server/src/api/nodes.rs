@@ -179,6 +179,11 @@ pub(crate) struct ChildOut {
     #[serde(skip_serializing_if = "Option::is_none")]
     revised_at: Option<String>,
     inherits: bool,
+    /// `blocked` for a file the file policies where it is now refuse (restored from the bin,
+    /// or there before its library's settings or the organisation's block list changed); it
+    /// stays, marked. Absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    policy: Option<&'static str>,
 }
 
 impl From<Listed> for ChildOut {
@@ -191,6 +196,7 @@ impl From<Listed> for ChildOut {
             editor: child.editor,
             revised_at: rfc3339(child.revised_at),
             inherits: !child.node.unique_scope,
+            policy: None,
         }
     }
 }
@@ -211,11 +217,35 @@ impl ChildrenPage {
             next: next.map(encode_cursor),
         }
     }
+
+    /// The page, each file in it that the file policies where it is (in `parent`) now refuse
+    /// marked `"policy": "blocked"`.
+    pub(crate) async fn marked(mut self, db: &Db, parent: NodeId) -> Result<Self, ApiError> {
+        if !self
+            .items
+            .iter()
+            .any(|item| item.kind == NodeKind::Document)
+        {
+            return Ok(self);
+        }
+        let Some((library, org)) = tree::policies_at(db, parent).await? else {
+            return Ok(self);
+        };
+        for item in &mut self.items {
+            if item.kind == NodeKind::Document
+                && records::check_name(&item.name, &library, &org).is_err()
+            {
+                item.policy = Some("blocked");
+            }
+        }
+        Ok(self)
+    }
 }
 
 /// `GET /api/nodes/{id}/children?after=&limit=`: one page of the children the caller can see,
 /// folders before files, then by name. `limit` is 1 to 500 (100 if absent); `after` is the
-/// `next` of the previous page.
+/// `next` of the previous page. A file the file policies there now refuse is marked
+/// `"policy": "blocked"`.
 pub(crate) async fn children(
     State(state): State<AppState>,
     signed: Signed,
@@ -225,13 +255,17 @@ pub(crate) async fn children(
     let id = node_id(&id)?;
     let Query(query) = query.map_err(|_| ApiError::BadRequest)?;
     let (after, limit) = query.page()?;
-    let (listed, next) = state
-        .db()
+    let db = state.db();
+    let (listed, next) = db
         .children(signed.session.user.id, id, after.as_ref(), limit)
         .await
         .map_err(|e| ApiError::unavailable(&e))?
         .ok_or(ApiError::NotFound)?;
-    Ok(Json(ChildrenPage::of(listed, next.as_ref())))
+    Ok(Json(
+        ChildrenPage::of(listed, next.as_ref())
+            .marked(db, id)
+            .await?,
+    ))
 }
 
 /// A cursor as the opaque text a page passes back: its JSON, in hexadecimal.
@@ -300,7 +334,10 @@ pub(crate) struct NodeChange {
 }
 
 /// `PATCH /api/nodes/{id} {name?, parent?}`: renames the node, moves it, or both (the rename
-/// first; if the move is then refused, the rename stays). Answers the node as it then is.
+/// first; if the move is then refused, the rename stays). Answers the node as it then is. A
+/// file's new name must keep its editor's extension, and a file no editor opens may not take
+/// one (`422 wrong_extension`); the file policies of the library it is in, or goes into, hold
+/// (`422 blocked_file_type {extension}`, `413 file_too_large {limit}`).
 pub(crate) async fn change(
     State(state): State<AppState>,
     signed: Signed,
@@ -317,7 +354,11 @@ pub(crate) async fn change(
         let mut node = None;
         if let Some(name) = change.name {
             let renamed = tree::apply(&state, &actor, TreeOp::Rename { id, name })
-                .await?
+                .await
+                .map_err(|e| match e {
+                    AccessError::WrongExtension => ApiError::WrongExtension,
+                    e => e.into(),
+                })?
                 .node;
             if renamed.kind == NodeKind::Document {
                 after_rename(&state, DocId(id.0)).await;

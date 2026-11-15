@@ -75,6 +75,10 @@ const MESSAGES = {
     'That navigation is not allowed. Check the labels (60 characters at most), the addresses (https:, http:, mailto: or a path) and that links go one level deep.',
   folders_off:
     'This library does not take folders. Its owners can switch folders on in the library settings.',
+  blocked_file_type:
+    'Files of that type are not allowed here. The library or the organisation blocks it; choose another file or another library.',
+  file_too_large:
+    'That file is larger than this library takes. Choose a smaller file or another library.',
   invalid_library_settings:
     'Those library settings are not allowed. File types are written like .png (at most 100 of them), and an image library accepts only image types.',
   invalid_template:

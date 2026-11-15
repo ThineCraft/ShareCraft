@@ -14,7 +14,8 @@ use crate::{Access, Db, DbError, Perms, Principal, RoleRef};
 pub(crate) const UNIQUE_VIOLATION: &str = "23505";
 
 /// The editor that opens a document. `Text` is the built-in plain-text editor; every other
-/// editor works on a file whose bytes ShareCraft never interprets.
+/// editor works on a file whose bytes ShareCraft never interprets. `Other` is a file no editor
+/// opens: it is shown as a preview or downloaded, and gets new versions only by upload.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Editor {
@@ -23,16 +24,18 @@ pub enum Editor {
     WordCraft,
     PdfCraft,
     SolidCraft,
+    Other,
 }
 
 impl Editor {
-    /// Every editor.
-    pub const ALL: [Editor; 5] = [
+    /// Every editor, `Other` included.
+    pub const ALL: [Editor; 6] = [
         Editor::Text,
         Editor::GridCraft,
         Editor::WordCraft,
         Editor::PdfCraft,
         Editor::SolidCraft,
+        Editor::Other,
     ];
 
     /// The lower-case id, as stored and as written in JSON.
@@ -44,6 +47,7 @@ impl Editor {
             Editor::WordCraft => "wordcraft",
             Editor::PdfCraft => "pdfcraft",
             Editor::SolidCraft => "solidcraft",
+            Editor::Other => "other",
         }
     }
 
@@ -53,11 +57,12 @@ impl Editor {
         Editor::ALL.into_iter().find(|editor| editor.id() == id)
     }
 
-    /// The file extension (with its dot) of the files this editor opens; `None` for `Text`.
+    /// The file extension (with its dot) of the files this editor opens; `None` for `Text` and
+    /// `Other`.
     #[must_use]
     pub fn native_extension(self) -> Option<&'static str> {
         match self {
-            Editor::Text => None,
+            Editor::Text | Editor::Other => None,
             Editor::GridCraft => Some(".xlsx"),
             Editor::WordCraft => Some(".docx"),
             Editor::PdfCraft => Some(".pdf"),
@@ -65,21 +70,31 @@ impl Editor {
         }
     }
 
-    /// The editor whose native extension ends `name`, ignoring ASCII case. Never `Text`.
+    /// The editor whose native extension ends `name`, ignoring ASCII case; `Other` for every
+    /// other name, with any extension or none. Never `Text`.
     #[must_use]
-    pub fn for_file_name(name: &str) -> Option<Editor> {
-        Editor::ALL.into_iter().find(|editor| {
-            editor
-                .native_extension()
-                .is_some_and(|ext| ends_with(name, ext))
-        })
+    pub fn for_file_name(name: &str) -> Editor {
+        Editor::ALL
+            .into_iter()
+            .find(|editor| {
+                editor
+                    .native_extension()
+                    .is_some_and(|ext| ends_with(name, ext))
+            })
+            .unwrap_or(Editor::Other)
     }
 
     /// Whether the document is a file ShareCraft keeps without interpreting: every editor but
-    /// `Text`.
+    /// `Text`, `Other` included.
     #[must_use]
     pub fn is_file(self) -> bool {
         self != Editor::Text
+    }
+
+    /// Whether an editor of its own opens the file in a file session: every file but `Other`.
+    #[must_use]
+    pub fn opens_in_editor(self) -> bool {
+        self.is_file() && self != Editor::Other
     }
 }
 
@@ -203,8 +218,18 @@ pub enum AccessError {
     /// copied into it.
     #[error("this library does not take folders")]
     FoldersOff,
+    /// An editor's file must keep its editor's extension; a file no editor opens may not take
+    /// an editor's extension.
     #[error("the name of this kind of document must end with its file extension")]
     WrongExtension,
+    /// The file's type is blocked by the organisation, or not allowed by the library it is in
+    /// or going into (see [`crate::check_name`]).
+    #[error("files of type {0:?} are not allowed there")]
+    BlockedFileType(crate::FileType),
+    /// The file is larger than its library takes; the library's limit in bytes (see
+    /// [`crate::check_size`]).
+    #[error("that file is larger than the {0} bytes allowed there")]
+    FileTooLarge(u64),
     #[error("a document with that id already exists")]
     Exists,
     #[error("something with that name is already in that place")]
@@ -253,18 +278,24 @@ impl From<sqlx::Error> for AccessError {
     }
 }
 
-/// Checks a document's name: the rule for every node's name (see [`validate_node_name`]), and
-/// for a file, its editor's extension with something before it. Returns the trimmed name.
+/// Checks a document's name: the rule for every node's name (see [`validate_node_name`]); for
+/// an editor's file, its editor's extension with something before it; for a file no editor
+/// opens, no editor's extension. Returns the trimmed name. File policies are checked apart
+/// (see [`crate::check_name`]).
 pub fn validate_document_name(name: &str, editor: Editor) -> Result<&str, AccessError> {
     let name = validate_node_name(name)?;
     check_extension(name, editor)?;
     Ok(name)
 }
 
-/// A file document's name must be the editor's extension with something before it.
+/// An editor's file's name must be the editor's extension with something before it; a file no
+/// editor opens may not end with an editor's extension.
 fn check_extension(name: &str, editor: Editor) -> Result<(), AccessError> {
     match editor.native_extension() {
         Some(ext) if !(ends_with(name, ext) && name.len() > ext.len()) => {
+            Err(AccessError::WrongExtension)
+        }
+        None if editor == Editor::Other && Editor::for_file_name(name) != Editor::Other => {
             Err(AccessError::WrongExtension)
         }
         _ => Ok(()),

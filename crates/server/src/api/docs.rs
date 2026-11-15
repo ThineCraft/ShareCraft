@@ -45,7 +45,9 @@ fn refused(code: &str, message: &str) -> Response {
 
 /// `POST /api/docs {parent, name?, editor?}`: creates a document in the library or folder
 /// `parent`, of which the caller must be an editor. The document inherits its access from
-/// there. `201` with the document and the caller's access to it.
+/// there. `201` with the document and the caller's access to it. Its name is checked against
+/// the file policies there (`422 blocked_file_type {extension}`). An empty PDF, or an empty
+/// file no editor opens (`other`), is `400 upload_required`.
 pub(crate) async fn create(
     State(state): State<AppState>,
     signed: Signed,
@@ -63,6 +65,12 @@ pub(crate) async fn create(
         return Ok(refused(
             "upload_required",
             "an empty PDF is not a file: upload a PDF instead",
+        ));
+    }
+    if editor == Editor::Other {
+        return Ok(refused(
+            "upload_required",
+            "a file no editor opens is not made empty: upload the file instead",
         ));
     }
     let id = DocId(Uuid::new_v4());
@@ -114,7 +122,8 @@ pub(crate) struct DocDetail {
     revision: Option<String>,
 }
 
-/// `GET /api/docs/{id}`: the document, if the caller has access to it.
+/// `GET /api/docs/{id}`: the document, if the caller has access to it. For a file no editor
+/// opens, `editor` is `other`: the page shows a preview or offers a download.
 pub(crate) async fn open(
     State(state): State<AppState>,
     signed: Signed,

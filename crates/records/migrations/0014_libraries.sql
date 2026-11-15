@@ -17,3 +17,13 @@ create index libraries_kind on libraries (kind) where kind <> 'document';
 
 insert into libraries (id)
 select id from nodes where kind = 'library';
+
+-- A file no editor opens is a document of the editor 'other': any file type.
+alter table documents drop constraint documents_editor_check;
+alter table documents add constraint documents_editor_check
+  check (editor in ('text', 'gridcraft', 'wordcraft', 'pdfcraft', 'solidcraft', 'other'));
+
+-- The organisation's block list of file types: extensions refused in every library. None by
+-- default.
+insert into settings (key, value) values ('blocked_file_types', '[]')
+on conflict (key) do nothing;

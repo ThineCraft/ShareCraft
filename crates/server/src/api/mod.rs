@@ -30,7 +30,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use collab_core::ids::{DocId, NodeId, SessionId, UserId};
-use records::{AccessError, AccountError, LinkError, RequestError};
+use records::{AccessError, AccountError, FileType, LinkError, RequestError};
 use serde::de::DeserializeOwned;
 use serde_json::json;
 use uuid::Uuid;
@@ -141,6 +141,10 @@ pub(crate) fn router() -> Router<AppState> {
         .route(
             "/settings/regional",
             get(settings::regional).put(settings::change_regional),
+        )
+        .route(
+            "/settings/files",
+            get(settings::files).put(settings::change_files),
         )
         .nest("/l", crate::links::api_router())
         .route("/nodes/{id}/inheritance/preview", get(explorer::preview))
@@ -276,6 +280,15 @@ pub(crate) enum ApiError {
     InvalidLibrarySettings(&'static str),
     /// 409: the library's folders are off: no new folder, and no folder moved or copied in.
     FoldersOff,
+    /// 422: the name does not keep its editor's extension, or a file no editor opens would
+    /// take an editor's extension.
+    WrongExtension,
+    /// 422: the file's type is blocked by the organisation or not allowed by its library; the
+    /// answer's `extension` names it (empty for none).
+    BlockedFileType(FileType),
+    /// 413: the file is larger than its library takes; the answer's `limit` is the library's
+    /// limit in bytes.
+    FileTooLarge(u64),
     /// 422: the password is too short or too long.
     WeakPassword,
     /// 413: the body is larger than the route allows (16 KiB; file content, `max_file_bytes`).
@@ -376,6 +389,9 @@ impl ApiError {
                 (StatusCode::UNPROCESSABLE_ENTITY, "invalid_library_settings")
             }
             ApiError::FoldersOff => (StatusCode::CONFLICT, "folders_off"),
+            ApiError::WrongExtension => (StatusCode::UNPROCESSABLE_ENTITY, "wrong_extension"),
+            ApiError::BlockedFileType(_) => (StatusCode::UNPROCESSABLE_ENTITY, "blocked_file_type"),
+            ApiError::FileTooLarge(_) => (StatusCode::PAYLOAD_TOO_LARGE, "file_too_large"),
             ApiError::WeakPassword => (StatusCode::UNPROCESSABLE_ENTITY, "weak_password"),
             ApiError::TooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "too_large"),
             ApiError::NotJson => (StatusCode::UNSUPPORTED_MEDIA_TYPE, "not_json"),
@@ -437,6 +453,8 @@ impl From<AccessError> for ApiError {
             AccessError::InvalidTemplate(reason) => ApiError::InvalidTemplate(reason),
             AccessError::InvalidLibrarySettings(reason) => ApiError::InvalidLibrarySettings(reason),
             AccessError::FoldersOff => ApiError::FoldersOff,
+            AccessError::BlockedFileType(file_type) => ApiError::BlockedFileType(file_type),
+            AccessError::FileTooLarge(limit) => ApiError::FileTooLarge(limit),
             // `POST /api/docs` answers this itself, naming the extension expected.
             AccessError::WrongExtension => ApiError::InvalidRequest,
             AccessError::NameTaken => ApiError::NameTaken,
@@ -604,10 +622,17 @@ fn after_sign_out(state: &AppState, session: SessionId) {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, code) = self.status_and_code();
-        if let ApiError::InvalidTemplate(reason) | ApiError::InvalidLibrarySettings(reason) = self {
-            return (status, Json(json!({ "error": code, "reason": reason }))).into_response();
-        }
-        (status, Json(json!({ "error": code }))).into_response()
+        let body = match self {
+            ApiError::InvalidTemplate(reason) | ApiError::InvalidLibrarySettings(reason) => {
+                json!({ "error": code, "reason": reason })
+            }
+            ApiError::BlockedFileType(file_type) => {
+                json!({ "error": code, "extension": file_type })
+            }
+            ApiError::FileTooLarge(limit) => json!({ "error": code, "limit": limit }),
+            _ => json!({ "error": code }),
+        };
+        (status, Json(body)).into_response()
     }
 }
 

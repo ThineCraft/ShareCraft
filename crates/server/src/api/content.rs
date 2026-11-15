@@ -491,8 +491,9 @@ pub(crate) async fn save(
         .await
         .map_err(|e| ApiError::unavailable(&e))?
         .ok_or(ApiError::NotFound)?;
-    // A text document is edited in its room, never as a file.
-    if !document.editor.is_file() {
+    // A text document is edited in its room, never as a file; a file no editor opens takes
+    // new versions only by upload.
+    if !document.editor.opens_in_editor() {
         return Err(ApiError::BadRequest);
     }
     let base = match query_of(query)?.base {
@@ -571,7 +572,9 @@ fn saved(revision: &RevisionId, changed: bool) -> Response {
 /// `POST /api/docs/upload?parent=<id>&name=<file name>[&on_conflict=<choice>]`: creates a
 /// document from the bytes sent in the library or folder `parent` (of which the caller must be
 /// an editor), with them as its first revision. The document inherits its access from there.
-/// The editor is the one whose extension ends the name. The name is trimmed and its refused
+/// The editor is the one whose extension ends the name (`other` when none does). The name and
+/// the size are checked against the file policies of the library it goes into
+/// (`422 blocked_file_type {extension}`, `413 file_too_large {limit}`). The name is trimmed and its refused
 /// characters become `_` (the answer then says so: `renamed {from, to}`). The caller's right to
 /// add there and the name are checked before the body is read (and again when the document is
 /// made): a name taken there is `409 name_taken {suggested}` unless `on_conflict` chooses
@@ -595,7 +598,12 @@ pub(crate) async fn upload(
     let choice = conflict_choice(query.on_conflict.as_deref())?;
     let (name, editor, cleaned_from) = clean_upload_name(&asked)?;
     let user = signed.session.user;
-    let named = settle_name(&state, &user, parent, &name, editor, choice).await?;
+    let declared = request
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    let named = settle_name(&state, &user, parent, &name, editor, choice, declared).await?;
     if let Some(answer) = named.answer() {
         return Ok(answer);
     }
@@ -641,9 +649,20 @@ pub(crate) async fn upload(
                     Err(e) => Err(e),
                 }
             }
-            Named::Replace { doc, name, base } => Ok(save_answer(
-                store_version(&state, &user, doc, &name, base, held).await,
-            )),
+            Named::Replace { doc, name, base } => {
+                // The body may not have declared its length.
+                match tree::check_policies(state.db(), doc.into(), &name, Some(held.blob().size))
+                    .await
+                {
+                    Ok(()) => Ok(save_answer(
+                        store_version(&state, &user, doc, &name, base, held).await,
+                    )),
+                    Err(e) => {
+                        discard(&state, held).await;
+                        Err(e.into())
+                    }
+                }
+            }
             Named::Taken { .. } | Named::Skip | Named::Refused(_) => {
                 discard(&state, held).await;
                 Err(ApiError::Unavailable)

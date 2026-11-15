@@ -8,6 +8,7 @@
 use axum::Json;
 use axum::extract::State;
 use collab_core::ids::NodeId;
+use records::FileType;
 use serde::{Deserialize, Serialize};
 
 use super::nodes::{copy_one, delete_one, move_one, node_id};
@@ -50,6 +51,12 @@ pub(crate) struct ItemResult {
     /// The error code, as the single-item route would answer it.
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<&'static str>,
+    /// For `blocked_file_type`, the type refused.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    extension: Option<FileType>,
+    /// For `file_too_large`, the library's limit in bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    limit: Option<u64>,
     /// For a copy, the new item.
     #[serde(skip_serializing_if = "Option::is_none")]
     new_id: Option<String>,
@@ -73,7 +80,9 @@ struct Done {
 }
 
 /// `POST /api/bulk {op: "move" | "copy" | "delete" | "restore", items: [ids], parent?}`: each
-/// item in turn, as the single-item route does it. `200 [{id, ok, error?, new_id?, renamed?}]`
+/// item in turn, as the single-item route does it, the file policies of where it goes
+/// included. `200 [{id, ok, error?, extension?, limit?, new_id?, renamed?}]` (`extension` for
+/// `blocked_file_type`, `limit` for `file_too_large`)
 /// (`renamed {from, to}` when a copy's or a restored item's name had to change), in the
 /// order given. `422 invalid_request` for more than 500 items, or a move or copy without a
 /// `parent` (or with one that is not an id); nothing is done then.
@@ -104,6 +113,8 @@ pub(crate) async fn run(
                     id: item,
                     ok: true,
                     error: None,
+                    extension: None,
+                    limit: None,
                     new_id: done.new_id,
                     renamed: done.renamed,
                 },
@@ -111,6 +122,14 @@ pub(crate) async fn run(
                     id: item,
                     ok: false,
                     error: Some(e.code()),
+                    extension: match e {
+                        ApiError::BlockedFileType(file_type) => Some(file_type),
+                        _ => None,
+                    },
+                    limit: match e {
+                        ApiError::FileTooLarge(limit) => Some(limit),
+                        _ => None,
+                    },
                     new_id: None,
                     renamed: None,
                 },

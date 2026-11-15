@@ -6,7 +6,10 @@
 //!   version of the file document `doc` made from its revision `base` (needs `edit`; a
 //!   plain-text document is refused as `text_document`, and while someone holds the editing
 //!   seat as `being_edited`). A new file's name is trimmed and its refused characters become
-//!   `_`; the answer then says so (`renamed {from, to}`). The size is checked against the
+//!   `_`; the answer then says so (`renamed {from, to}`). A name no editor opens makes a file
+//!   of the editor `other`. The name and size are checked against the file policies of the
+//!   library it goes into (`422 blocked_file_type {extension}`, `413 file_too_large {limit}`),
+//!   at the start and again at the finish. The size is checked against the
 //!   largest file allowed and reserved against the site's quota while the session is open
 //!   (`507 quota_exceeded` when it has no room): the declared size, however little has been
 //!   received, so a session left open holds that quota until it is finished, abandoned or swept
@@ -174,21 +177,22 @@ pub(super) fn conflict_choice(text: Option<&str>) -> Result<Option<NameConflict>
 }
 
 /// A new file's name as asked for, trimmed, made acceptable: refused and control characters
-/// become `_` (see [`tree::clean_name`]). With the editor its extension opens it in, and the
-/// name asked for (trimmed) if it had to change. `400` for a name with no extension any editor
-/// takes, or that is only an extension.
+/// become `_` (see [`tree::clean_name`]). With the editor its extension opens it in (`other`
+/// when no editor does), and the name asked for (trimmed) if it had to change. `400` for an
+/// empty name, or one that is only an editor's extension.
 pub(super) fn clean_upload_name(asked: &str) -> Result<(String, Editor, Option<String>), ApiError> {
     let asked = asked.trim();
-    let editor = Editor::for_file_name(asked).ok_or(ApiError::BadRequest)?;
+    let editor = Editor::for_file_name(asked);
     // A name that is only an extension names nothing.
-    if editor
-        .native_extension()
-        .is_some_and(|ext| asked.len() <= ext.len())
+    if asked.is_empty()
+        || editor
+            .native_extension()
+            .is_some_and(|ext| asked.len() <= ext.len())
     {
         return Err(ApiError::BadRequest);
     }
     let name = tree::clean_name(asked, editor);
-    let editor = Editor::for_file_name(&name).ok_or(ApiError::BadRequest)?;
+    let editor = Editor::for_file_name(&name);
     let renamed = (name != asked).then(|| asked.to_owned());
     Ok((name, editor, renamed))
 }
@@ -245,8 +249,9 @@ impl Named {
     }
 }
 
-/// Settles where a new file named `name` (already cleaned), opened in `editor`, goes in
-/// `parent` for `user`: as named if the name is free there; if it is taken, as `choice` says
+/// Settles where a new file named `name` (already cleaned), opened in `editor`, of `size`
+/// bytes when known, goes in `parent` for `user`, once the file policies there take it
+/// (`blocked_file_type`, `file_too_large`): as named if the name is free there; if it is taken, as `choice` says
 /// (`keep_both` takes the first free name `name (2)`, `name (3)` …; `replace` a new version of
 /// the file there, once `user` is found allowed to save one and its file session would take
 /// it now), or nothing chosen. `404`, `403`, `wrong_place` and the like as for creating it.
@@ -257,8 +262,9 @@ pub(super) async fn settle_name(
     name: &str,
     editor: Editor,
     choice: Option<NameConflict>,
+    size: Option<u64>,
 ) -> Result<Named, ApiError> {
-    match tree::check_create_document(state, user, parent, name, editor).await {
+    match tree::check_create_document(state, user, parent, name, editor, size).await {
         Ok(()) => {
             return Ok(Named::New {
                 name: name.to_owned(),
@@ -405,7 +411,8 @@ pub(crate) async fn start(
             }
             let (name, editor, from) = clean_upload_name(&asked)?;
             renamed = from;
-            match tree::check_create_document(&state, &user, parent, &name, editor).await {
+            let size = Some(body.size);
+            match tree::check_create_document(&state, &user, parent, &name, editor, size).await {
                 // A name taken now is settled when the upload finishes.
                 Ok(()) | Err(AccessError::NameTaken) => {}
                 // The name is only an extension.
@@ -427,6 +434,7 @@ pub(crate) async fn start(
                 None => None,
             };
             let name = check_new_version(&state, &user, doc).await?;
+            tree::check_policies(db, doc.into(), &name, Some(body.size)).await?;
             if let Some(refused) = ask_check(&state, doc, &name, base.clone()).await? {
                 return Ok(save_answer(refused));
             }
@@ -1050,8 +1058,9 @@ async fn finish_new_file(
     blob: BlobRef,
     choice: Option<NameConflict>,
 ) -> Result<Response, ApiError> {
-    let editor = Editor::for_file_name(&session.name).ok_or(ApiError::BadRequest)?;
-    let named = settle_name(state, user, parent, &session.name, editor, choice).await?;
+    let editor = Editor::for_file_name(&session.name);
+    let size = Some(session.size);
+    let named = settle_name(state, user, parent, &session.name, editor, choice, size).await?;
     if matches!(named, Named::Skip) {
         end_session(state, session.id).await?;
     }
@@ -1096,6 +1105,7 @@ async fn finish_new_version(
     blob: BlobRef,
 ) -> Result<Response, ApiError> {
     let name = check_new_version(state, user, doc).await?;
+    tree::check_policies(state.db(), doc.into(), &name, Some(session.size)).await?;
     let base = match &session.base {
         Some(text) => Some(RevisionId::from_str(text).map_err(|e| ApiError::unavailable(&e))?),
         None => None,

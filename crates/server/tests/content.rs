@@ -503,8 +503,9 @@ async fn bad_file_names_are_refused() {
     let ann = server.user("Ann").await;
     let long = format!("{}.xlsx", "a".repeat(300));
 
-    // No editor opens the name: 400.
-    for name in ["report", "report.exe", ".xlsx", "notes.txt", ""] {
+    // Only an editor's extension, or nothing: 400. Any other name is a file no editor opens
+    // (see `tests/policies.rs`).
+    for name in [".xlsx", ".solidcraft.json", "", "   "] {
         let response = upload(&server, &ann, name, b"data".to_vec()).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{name:?}");
     }
