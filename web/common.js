@@ -626,7 +626,7 @@ export function setupTopbar(me, error) {
     const brandManager = me.is_admin
       ? Promise.resolve(true)
       : api('GET', '/brand').then((result) => Boolean(result.ok && result.data?.can_manage));
-    setupAccountMenu(bar, me, {
+    const account = setupAccountMenu(bar, me, {
       brandManager,
       signOut: async () => {
         const result = await api('DELETE', '/session');
@@ -634,8 +634,22 @@ export function setupTopbar(me, error) {
         else if (error) showMessage(error, messageFor(result.error));
       },
     });
+    startShell(me, account);
   }
   startPalette(me);
+}
+
+/**
+ * Starts the phone-first shell (shell.js, round 20) on a page with the account bar: the tab bar
+ * at the bottom on phones. Loaded on demand like the palette.
+ */
+function startShell(me, account) {
+  if (typeof document === 'undefined') return;
+  import('./shell.js')
+    .then((shell) => shell.setupShell(me, { account }))
+    .catch(() => {
+      // without the shell the page keeps its account bar at the top
+    });
 }
 
 /**

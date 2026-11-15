@@ -1431,3 +1431,81 @@ dialog.side-drawer::backdrop{background:rgb(0 0 0/.35)}
  .bin-meter{border:1px solid CanvasText}
 }
 #shown:empty,#bin-status:empty{margin:0}
+/* the phone-first shell (shell.js, round 20): on phones (and with a finger below 900 px) a tab
+   bar at the bottom, menus and Recent as bottom sheets, the palette full screen. html.phone-shell
+   is set by shell.js and sheet.js from the same rule, so CSS and script never disagree. The tab
+   bar is the product's, never themed by a site look. */
+.tabbar{display:none}
+html.phone-shell{--tabbar-space:calc(57px + env(safe-area-inset-bottom))}
+html.phone-shell.keyboard-up{--tabbar-space:0px}
+.phone-shell body:has(>.tabbar){padding-bottom:calc(var(--tabbar-space) + var(--space-5))}
+.phone-shell body:has(>.tabbar):has(>.upload-tray:not([hidden])){padding-bottom:calc(var(--tabbar-space) + 110px)}
+.phone-shell .tabbar{display:block;position:fixed;left:0;right:0;bottom:0;z-index:50;padding:0 0 env(safe-area-inset-bottom);border-top:1px solid var(--line);background:var(--paper);box-shadow:var(--shadow-2);--accent:#3156c9;--accent-ink:light-dark(#3156c9,#9db4ff);--soft:color-mix(in srgb,var(--accent) 14%,var(--paper))}
+.phone-shell.keyboard-up .tabbar{display:none}
+.tabbar ul{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));margin:0 auto;padding:0;max-width:560px;list-style:none}
+.tabbar li{display:flex;margin:0;padding:0}
+.tabbar .tab{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;width:100%;min-height:56px;padding:var(--space-1) 0;border:0;border-radius:0;background:transparent;color:var(--muted);font-size:var(--text-xs);font-weight:600;line-height:var(--leading-tight);text-decoration:none;box-shadow:none;-webkit-tap-highlight-color:transparent}
+.tabbar .tab:hover{background:transparent;color:var(--text);box-shadow:none}
+.tabbar .tab:focus-visible{outline:2px solid var(--accent-ink);outline-offset:-4px;border-radius:var(--radius-md)}
+.tab-icon{display:grid;place-items:center;width:56px;height:30px;border-radius:var(--radius-pill);transition:background-color var(--dur-fast) var(--ease)}
+.tab-svg{fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+.tabbar .tab:active .tab-icon{background:var(--band)}
+.tabbar .tab:is([aria-current=page],[aria-expanded=true]){color:var(--accent-ink)}
+.tabbar .tab:is([aria-current=page],[aria-expanded=true]) .tab-icon{background:var(--soft)}
+.tabbar .tab[aria-current=page] .tab-svg{stroke-width:2.2}
+/* the account bar keeps the wordmark and the page's context action: Search and You went down */
+.phone-shell .topbar :is(.palette-button,.avatar-button){display:none}
+.phone-shell .topbar .in-topbar{flex:none}
+.phone-shell .topbar :is(button,.button).in-topbar,.phone-shell .topbar .in-topbar>.menu-button{min-height:var(--control-touch)}
+/* toasts and the upload tray sit on the tab bar, never under it */
+.phone-shell .toasts{bottom:calc(var(--tabbar-space) + var(--space-2))}
+.phone-shell .upload-tray{bottom:var(--tabbar-space)}
+/* the command palette as a full-screen sheet, as tall as what the keyboard leaves */
+.palette-cancel{display:none}
+.phone-shell dialog.palette[open]{display:flex;flex-direction:column;width:100vw;max-width:none;height:var(--viewport-height,100dvh);max-height:none;margin:0;border:0;border-radius:0}
+.phone-shell dialog.palette[open] .palette-list{flex:1;max-height:none}
+.phone-shell .palette-search .palette-cancel{display:inline-flex;flex:none;min-height:var(--control-touch);padding:0 var(--space-2)}
+.phone-shell .palette-keys{display:none}
+/* bottom sheets: menus (menu.js, in the top layer) and the Recent sheet */
+.menu.as-sheet,.list .menu.as-sheet{position:fixed;inset:auto 0 0 0;top:auto;width:auto;height:auto;min-width:0;max-width:none;max-height:min(80dvh,640px);margin:0;padding:0 var(--space-2) calc(var(--space-2) + env(safe-area-inset-bottom));overflow-y:auto;overscroll-behavior:contain;border:1px solid var(--line);border-bottom:0;border-radius:var(--radius-lg) var(--radius-lg) 0 0;background:var(--paper);color:var(--text);box-shadow:var(--shadow-3);transform:translateY(var(--sheet-drag,0px));z-index:70}
+.account-wrap .account-menu.as-sheet{min-width:0;max-width:none}
+.menu.as-sheet::backdrop{background:rgb(0 0 0/.4)}
+.menu.as-sheet.sheet-still{touch-action:none}
+.menu.as-sheet :is([role=menuitem],[role=menuitemradio],[role=menuitemcheckbox]),.list .menu.as-sheet [role=menuitem]{min-height:48px;padding:var(--space-2) var(--space-4);font-size:var(--text-md)}
+.sheet-handle{display:none}
+.menu.as-sheet>.sheet-handle,dialog.shell-sheet .sheet-handle{display:flex;justify-content:center;align-items:center;position:sticky;top:0;z-index:1;height:24px;margin:0 calc(-1 * var(--space-2));background:var(--paper);touch-action:none;cursor:grab}
+.menu.as-sheet>.sheet-handle::before,dialog.shell-sheet .sheet-handle::before{content:'';width:36px;height:4px;border-radius:var(--radius-pill);background:var(--line)}
+.menu.as-sheet>.sheet-handle.labelled{flex-direction:column;height:auto;padding:10px var(--space-4) var(--space-2);gap:var(--space-2);margin-bottom:var(--space-1);border-bottom:1px solid var(--line)}
+.menu.as-sheet>.sheet-handle.labelled::after{content:attr(data-label);align-self:stretch;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted);font-size:var(--text-sm);font-weight:600}
+@keyframes shell-sheet-up{from{transform:translateY(100%)}}
+@media (prefers-reduced-motion:no-preference){
+ .menu.as-sheet,dialog.shell-sheet[open]{animation:shell-sheet-up var(--dur) var(--ease)}
+ .menu.as-sheet:not(.sheet-dragging),dialog.shell-sheet:not(.sheet-dragging){transition:transform var(--dur) var(--ease)}
+}
+dialog.shell-sheet{position:fixed;inset:auto 0 0 0;width:auto;max-width:none;max-height:min(85dvh,680px);margin:0;padding:0 var(--space-2) calc(var(--space-3) + env(safe-area-inset-bottom));overflow-y:auto;overscroll-behavior:contain;border:1px solid var(--line);border-bottom:0;border-radius:var(--radius-lg) var(--radius-lg) 0 0;transform:translateY(var(--sheet-drag,0px));--accent:#3156c9;--accent-ink:light-dark(#3156c9,#9db4ff);--soft:color-mix(in srgb,var(--accent) 11%,var(--paper))}
+dialog.shell-sheet::backdrop{background:rgb(0 0 0/.4)}
+.sheet-head{display:flex;align-items:center;gap:var(--space-2);padding:0 0 var(--space-2) var(--space-2)}
+.sheet-head h2{flex:1;margin:0;font-size:var(--text-lg)}
+.sheet-head .sheet-close{min-height:var(--control-touch)}
+.shell-recent{margin:0;padding:0;list-style:none}
+.shell-recent li{border-radius:var(--radius-md)}
+.shell-recent li:nth-child(even){background:var(--band)}
+.shell-recent-link{display:flex;align-items:center;gap:var(--space-3);min-height:56px;padding:var(--space-2) var(--space-3);border-radius:var(--radius-md);color:var(--text);text-decoration:none}
+.shell-recent-link:hover,.shell-recent-link:focus{background:var(--soft)}
+.shell-recent-link:focus-visible{outline:2px solid var(--accent-ink);outline-offset:-2px}
+.shell-recent-link .file-icon{flex:none}
+.shell-recent-text{display:flex;flex-direction:column;min-width:0}
+.shell-recent-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}
+.shell-recent-text small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted);font-size:var(--text-sm)}
+.shell-empty{margin:0;padding:var(--space-4) var(--space-2) var(--space-5)}
+/* long press: rows and cards can be held without the browser's callout or text selection; the
+   held one fills in slowly as feedback (after a short pause, so a scroll does not flash) */
+.phone-shell :is(.files tbody tr,.library-card){-webkit-touch-callout:none;-webkit-user-select:none;user-select:none}
+.phone-shell :is(.files tbody tr,.library-card) a{-webkit-touch-callout:none}
+.phone-shell :is(.files tbody tr,.library-card).long-pressing{background:var(--soft);transition:background-color 350ms linear 150ms}
+@media (prefers-reduced-motion:reduce){.phone-shell :is(.files tbody tr,.library-card).long-pressing{transition:none}}
+@media (forced-colors:active){
+ .phone-shell .tabbar{border-top:1px solid CanvasText}
+ .tabbar .tab:is([aria-current=page],[aria-expanded=true]){color:Highlight}
+ .menu.as-sheet,dialog.shell-sheet{border:1px solid CanvasText}
+}

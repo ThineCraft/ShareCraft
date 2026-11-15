@@ -495,7 +495,8 @@ function row(item) {
   );
   details.row(tr, item);
   // A row the person may move can be dragged onto a folder (the link inside is not dragged on its own).
-  if (itemActions(item).move) {
+  // (Not with a finger: there a held row opens its Actions sheet, shell.js.)
+  if (itemActions(item).move && !globalThis.matchMedia?.('(pointer: coarse)').matches) {
     tr.draggable = true;
     tr.querySelector('a.name-link').draggable = false;
   }

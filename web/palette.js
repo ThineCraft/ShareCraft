@@ -276,12 +276,22 @@ export function addPaletteActions(provide) {
 }
 
 let installed = false;
+let current = null; // the page's palette, once set up
+
+/**
+ * Opens the palette (the phone shell's Search tab does this). `from` is the control that opened
+ * it, which gets aria-expanded while it is open. Does nothing before setupPalette.
+ */
+export function openPalette(from = null) {
+  current?.open(from);
+}
 
 /** Wires the palette into the page for the signed-in person `me`: its shortcut and the account bar's button. */
 export function setupPalette(me) {
   if (installed || typeof document === 'undefined') return;
   installed = true;
   const palette = createPalette(me);
+  current = palette;
   const mac = /Mac|iPhone|iPad/.test(globalThis.navigator?.platform ?? '');
   const bar = document.querySelector('.topbar');
   if (bar) {
@@ -319,6 +329,8 @@ export function setupPalette(me) {
 function createPalette(me) {
   let dialog = null;
   let field;
+  let cancel;
+  let opener = null;
   let list;
   let live;
   let note;
@@ -332,6 +344,9 @@ function createPalette(me) {
   let fetched = null;
 
   function build() {
+    // Shown only as the phone shell's full-screen sheet, where there is no backdrop to press.
+    cancel = h('button', { type: 'button', class: 'ghost palette-cancel' }, 'Cancel');
+    cancel.addEventListener('click', () => close());
     field = h('input', {
       type: 'text',
       id: 'palette-field',
@@ -352,7 +367,7 @@ function createPalette(me) {
       { class: 'palette', 'aria-labelledby': 'palette-title' },
       h('h2', { id: 'palette-title', class: 'visually-hidden' }, 'Search or jump to'),
       h('label', { for: 'palette-field', class: 'visually-hidden' }, 'Search or jump to'),
-      h('div', { class: 'palette-search' }, h('span', { class: 'palette-glass', 'aria-hidden': 'true' }), field),
+      h('div', { class: 'palette-search' }, h('span', { class: 'palette-glass', 'aria-hidden': 'true' }), field, cancel),
       list,
       note,
       live,
@@ -362,6 +377,8 @@ function createPalette(me) {
     field.addEventListener('input', () => render());
     field.addEventListener('keydown', onKey);
     dialog.addEventListener('close', () => {
+      opener?.setAttribute('aria-expanded', 'false');
+      opener = null;
       const back = returnTo;
       returnTo = null;
       if (back?.isConnected && typeof back.focus === 'function') back.focus();
@@ -550,10 +567,12 @@ function createPalette(me) {
     return fetched;
   }
 
-  function open() {
+  function open(from = null) {
     if (!dialog) build();
     if (dialog.open) return;
-    returnTo = document.activeElement;
+    returnTo = from ?? document.activeElement;
+    opener = from;
+    opener?.setAttribute('aria-expanded', 'true');
     field.value = '';
     live.textContent = '';
     dialog.showModal();

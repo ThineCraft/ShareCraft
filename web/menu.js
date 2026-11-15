@@ -6,6 +6,13 @@
 //
 // The key handling is pure (`menuKey`, `buttonKey`, `typeahead`) so that it is tested without a
 // page; `setupMenu` wires it to the elements.
+//
+// On phones (sheet.js `phoneShellNow`, round 20) a menu opens as a bottom sheet instead: in the
+// top layer (a manual popover) over a dimmed page, with a drag handle, 48 pixel rows, Tab kept
+// inside, and closed by Escape, a tap outside, a choice or a swipe down; focus goes back to the
+// button (or to whatever opened it, such as the tab bar's You).
+
+import { dragToClose, phoneShellNow } from './sheet.js';
 
 /**
  * What a key does while focus is on entry `index` of an open menu of `count` entries:
@@ -77,11 +84,76 @@ function listenOnce() {
     (event) => {
       if (!openNow) return;
       const target = event.target;
-      if (openNow.menu.contains(target) || openNow.button.contains(target)) return;
+      const { menu, button, opener } = openNow;
+      const sheet = menu.classList.contains('as-sheet');
+      // A sheet's dimmed backdrop belongs to the sheet itself: a press there is outside its box.
+      const onBackdrop = sheet && target === menu && event.clientY < menu.getBoundingClientRect().top;
+      if (!onBackdrop && (menu.contains(target) || button.contains(target) || opener?.contains(target))) return;
+      // On a sheet the press outside only closes it: it does not also press what is under it.
+      if (sheet) {
+        event.preventDefault();
+        swallowNextClick();
+        openNow.close(true);
+        return;
+      }
       openNow.close(false);
     },
     true,
   );
+}
+
+function swallowNextClick() {
+  const until = Date.now() + 600;
+  const swallow = (event) => {
+    document.removeEventListener('click', swallow, true);
+    if (Date.now() < until) {
+      event.preventDefault();
+      event.stopPropagation();
+    }
+  };
+  document.addEventListener('click', swallow, true);
+  setTimeout(() => document.removeEventListener('click', swallow, true), 600);
+}
+
+const HANDLE_CLASS = 'sheet-handle';
+
+/** Shows `menu` as a bottom sheet (in the top layer where the browser has popovers); returns how to undo it. */
+function showAsSheet(menu, close) {
+  menu.classList.add('as-sheet');
+  let handle = menu.querySelector(`:scope > .${HANDLE_CLASS}`);
+  if (!handle) {
+    handle = document.createElement('li');
+    handle.className = HANDLE_CLASS;
+    handle.setAttribute('role', 'none');
+    handle.setAttribute('aria-hidden', 'true');
+    menu.prepend(handle);
+  }
+  // The sheet shows what it is for ("Actions for Budget.xlsx"); the account menu has its own head.
+  const label = menu.classList.contains('account-menu') ? '' : menu.getAttribute('aria-label') || '';
+  handle.dataset.label = label;
+  handle.classList.toggle('labelled', label !== '');
+  if (typeof menu.showPopover === 'function') {
+    menu.setAttribute('popover', 'manual');
+    try {
+      menu.showPopover();
+    } catch {
+      // already shown
+    }
+  }
+  menu.classList.toggle('sheet-still', menu.scrollHeight <= menu.clientHeight + 1);
+  const stopDrag = dragToClose(menu, () => close(true), { handle });
+  return () => {
+    stopDrag();
+    if (menu.hasAttribute('popover')) {
+      try {
+        menu.hidePopover();
+      } catch {
+        // already hidden
+      }
+      menu.removeAttribute('popover');
+    }
+    menu.classList.remove('as-sheet', 'sheet-still');
+  };
 }
 
 // Entries: plain items, and radio or checkbox items (which keep the menu open when chosen).
@@ -114,20 +186,35 @@ export function setupMenu(button, menu) {
     for (const item of menu.querySelectorAll(ITEM)) item.tabIndex = -1;
   };
 
+  let undoSheet = null;
+  let opener = null; // another control that opened the menu (focus goes back to it)
+
   const close = (refocus) => {
     if (menu.hidden) return;
+    undoSheet?.();
+    undoSheet = null;
     menu.hidden = true;
     button.setAttribute('aria-expanded', 'false');
+    opener?.setAttribute('aria-expanded', 'false');
+    const back = opener?.isConnected ? opener : button;
+    opener = null;
     if (openNow?.menu === menu) openNow = null;
-    if (refocus) button.focus();
+    if (refocus) back.focus();
   };
 
-  const open = (where = 'first') => {
+  /**
+   * Opens the menu with focus on its 'first' or 'last' entry. `from` is a control other than the
+   * button that opened it (it gets aria-expanded, and focus back when the menu closes).
+   */
+  const open = (where = 'first', from = null) => {
     if (openNow && openNow.menu !== menu) openNow.close(false);
     prepare();
+    opener = from && from !== button ? from : null;
     menu.hidden = false;
     button.setAttribute('aria-expanded', 'true');
-    openNow = { button, menu, close };
+    opener?.setAttribute('aria-expanded', 'true');
+    if (phoneShellNow()) undoSheet = showAsSheet(menu, close);
+    openNow = { button, menu, close, opener };
     const items = menuItems(menu);
     const target = where === 'last' ? items[items.length - 1] : items[0];
     target?.focus();
@@ -156,6 +243,13 @@ export function setupMenu(button, menu) {
       event.preventDefault();
       event.stopPropagation(); // not also the Escape of a dialog around the menu
       close(true);
+      return;
+    }
+    if (result?.close === 'leave' && menu.classList.contains('as-sheet')) {
+      // A sheet keeps focus: Tab and Shift+Tab go round its entries.
+      event.preventDefault();
+      const step = event.shiftKey ? -1 : 1;
+      items[(index + step + items.length) % items.length]?.focus();
       return;
     }
     if (result?.close === 'leave') {
@@ -190,7 +284,7 @@ export function setupMenu(button, menu) {
   // Focus leaving both the menu and its button (a click elsewhere, a screen reader jump) closes it.
   menu.addEventListener('focusout', (event) => {
     const next = event.relatedTarget;
-    if (next && (menu.contains(next) || button.contains(next))) return;
+    if (next && (menu.contains(next) || button.contains(next) || opener?.contains(next))) return;
     if (next) close(false);
   });
   return { open, close };
