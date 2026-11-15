@@ -31,6 +31,7 @@ import { showToast } from './toast.js';
 import { buildUndo, performUndo } from './undo.js';
 import { relativeTime } from './files.js';
 import { libraryCardModel, libraryIcon, ownerChip, recentAcrossLibraries, recentIcon } from './site-home.js';
+import { checklistModel, readWelcome, showChecklist, unsetParts, unsetText, writeWelcome } from './new-site.js';
 
 const $ = (id) => document.getElementById(id);
 const error = $('error');
@@ -61,6 +62,17 @@ const manageAccess = can(here.access, 'manage_access');
 
 // What was done is said in a toast (refusals stay in the dialog or above the page).
 const announce = (text) => showToast(text);
+
+// Get started (round 24, drawn further down): arriving from the New site wizard (`welcome=1`),
+// and the parts it could not set (`unset`). Both leave the address once read.
+const params = new URLSearchParams(location.search);
+const welcome = params.get('welcome') === '1';
+const unset = unsetParts(params.get('unset'));
+if (welcome || params.has('unset')) history.replaceState(null, '', `${location.pathname}?id=${seg(siteId)}${location.hash}`);
+let libraryFacts = null; // what showLibraries found: { count, files, first }
+let checklistFacts = null; // people, look and hubs, read for owners only
+let newLibraryButton = null; // the New library card's button, which the checklist opens too
+const mayGetStarted = () => manageSite && !info?.archived && !readWelcome(me.id, siteId).dismissed;
 
 // ---- Manage site: one menu, shown only to people who may use something in it ----
 
@@ -128,6 +140,7 @@ function showAbout() {
 async function refreshSite(fallback) {
   info = (await siteChrome(siteId, { currentId: siteId, footer: true })).site ?? fallback ?? info;
   showAbout();
+  showGetStarted();
 }
 
 showAbout();
@@ -279,6 +292,7 @@ function newLibraryCard() {
     showMessage($('new-library-error'), '');
     openDialog($('new-library-dialog'), $('library-name'), button);
   });
+  newLibraryButton = button;
   return h('li', { class: 'library-card new' }, button);
 }
 
@@ -311,9 +325,15 @@ async function showLibraries() {
       more: Boolean(page?.next),
     });
   });
+  libraryFacts = {
+    count: libraries.length,
+    files: read.some((library, index) => pages[index].ok && pages[index].data.items.some((item) => item.kind === 'document')),
+    first: libraries.find((library) => library.access) ?? null,
+  };
   $('empty').hidden = libraries.length > 0 || mayAddLibrary();
   $('libraries').replaceChildren(...models.map(libraryCard), ...(mayAddLibrary() ? [newLibraryCard()] : []));
   showRecent(read.map((library, index) => ({ library, items: pages[index].ok ? pages[index].data.items : [] })));
+  showGetStarted();
 }
 
 /** One library card: its icon, name (the card's one link), kind, count and access; owners get Actions. */
@@ -407,7 +427,93 @@ function showRecent(lists) {
   );
 }
 
+// ---- Get started: a checklist for the owners of a new site (round 24) ----
+
+/** People, the look and the hubs, for the checklist: read once, again after something changed them. */
+async function readChecklistFacts() {
+  const [groups, access, look, hubs] = await Promise.all([
+    api('GET', `/sites/${seg(siteId)}/groups`),
+    manageAccess ? api('GET', `/nodes/${seg(siteId)}/access`) : null,
+    api('GET', `/sites/${seg(siteId)}/look/settings`),
+    api('GET', '/hubs'),
+  ]);
+  const siteGroups = groups.ok ? groups.data : [];
+  const inGroups = siteGroups.reduce((sum, group) => sum + (Number(group.member_count) || 0), 0);
+  // People and groups given access on the site itself, besides its own three groups (links are not people).
+  const own = new Set(siteGroups.map((group) => group.id));
+  const given = access?.ok ? access.data.assignments.filter((a) => a.principal.kind !== 'link' && !own.has(a.principal.id)).length : 0;
+  checklistFacts = {
+    people: inGroups + given,
+    lookSet: look.ok ? look.data.look != null : false,
+    hubs: hubs.ok ? hubs.data.filter((hub) => hub.id !== siteId).length : 0,
+  };
+}
+
+/** Draws the Get started card, or hides it (see showChecklist). */
+function showGetStarted() {
+  const card = $('get-started');
+  if (!checklistFacts || !libraryFacts || !mayGetStarted()) {
+    card.hidden = true;
+    return;
+  }
+  const model = checklistModel(info, {
+    ...checklistFacts,
+    files: libraryFacts.files,
+    libraries: libraryFacts.count,
+    baseline: readWelcome(me.id, siteId).baseline ?? undefined,
+  });
+  card.hidden = !showChecklist({ manages: manageSite, archived: Boolean(info?.archived), dismissed: false, welcome, complete: model.complete });
+  if (card.hidden) return;
+  $('gs-bar').max = model.total;
+  $('gs-bar').value = model.done;
+  $('gs-summary').textContent = model.summary;
+  $('gs-list').replaceChildren(...model.items.map(checklistItem));
+}
+
+/** One step of the checklist: a tick, what to do (a link, or a button for a dialog) and a hint. */
+function checklistItem(item) {
+  const label = `${item.label}${item.done ? ' (done)' : ''}`;
+  const link = (href) => h('a', { class: 'gs-action', href }, label);
+  const button = (run) => {
+    const element = h('button', { type: 'button', class: 'gs-action' }, label);
+    element.addEventListener('click', run);
+    return element;
+  };
+  let action;
+  if (item.key === 'people') action = link(manageAccess ? `/access.html?id=${seg(siteId)}` : `/groups.html?site=${seg(siteId)}`);
+  else if (item.key === 'upload') {
+    action = libraryFacts.first ? link(`${pageFor('library', libraryFacts.first.id)}#upload`) : button(() => newLibraryButton?.click());
+  } else if (item.key === 'look') action = link(`/site-look.html?id=${seg(siteId)}`);
+  else if (item.key === 'hub') action = button(() => $('hub-item').click());
+  else action = button(() => newLibraryButton?.click());
+  return h(
+    'li',
+    { class: `gs-item${item.done ? ' done' : ''}` },
+    h('span', { class: 'gs-tick', 'aria-hidden': 'true' }, item.done ? '✓' : ''),
+    h('span', { class: 'gs-text' }, action, h('span', { class: 'gs-hint' }, item.done ? 'Done.' : item.hint)),
+  );
+}
+
+$('gs-dismiss').addEventListener('click', () => {
+  writeWelcome(me.id, siteId, { dismissed: true });
+  $('get-started').hidden = true;
+  $('title').tabIndex = -1;
+  $('title').focus();
+  showToast('Get started is dismissed. Everything in it is in Manage site.');
+});
+
+if (mayGetStarted()) await readChecklistFacts();
 await showLibraries();
+// What the wizard could not set on the new site is said once, with the way to try again.
+if (unset.length) {
+  showToast(unsetText(unset), {
+    kind: 'error',
+    action: {
+      label: 'Try again in Site settings',
+      run: () => location.assign(`/site-settings.html?id=${seg(siteId)}#${unset[0]}`),
+    },
+  });
+}
 setInterval(() => {
   for (const time of $('recent').querySelectorAll('time')) time.textContent = relativeTime(time.dateTime);
 }, 60_000);

@@ -19,6 +19,7 @@ import {
   siteMark,
 } from './common.js';
 import { fileIcon, fileKind, relativeTime } from './files.js';
+import { setupNewSiteWizard } from './new-site-wizard.js';
 import { addPaletteActions } from './palette.js';
 import { forgetOpened, greeting, hourIn, readRecent, siteCardModel } from './start.js';
 
@@ -44,53 +45,17 @@ $('requests-link').hidden = !(me.open_requests > 0);
 $('requests-count').textContent = String(me.open_requests);
 $('requests-link').setAttribute('aria-label', `Requests, ${me.open_requests} open`);
 
-// ---- New site: a button for those who may create sites, opening a small dialog ----
+// ---- New site: a button for those who may create sites, opening the wizard (new-site-wizard.js) ----
 
-const newSiteDialog = $('new-site-dialog');
 $('new-site-button').hidden = !me.is_admin;
-$('new-site-button').addEventListener('click', () => {
-  $('site-name').value = '';
-  showMessage($('new-site-error'), '');
-  newSiteDialog.showModal();
-  $('site-name').focus();
-});
-$('new-site-cancel').addEventListener('click', () => newSiteDialog.close());
-newSiteDialog.addEventListener('close', () => $('new-site-button').focus());
-// The command palette's New site opens this dialog: here directly, from other pages through #new-site.
 if (me.is_admin) {
+  const wizard = setupNewSiteWizard(me, $('new-site-button'));
+  $('new-site-button').addEventListener('click', () => wizard.open());
+  // The command palette's New site opens the wizard: here directly, from other pages through #new-site.
   addPaletteActions(() => [{ key: 'new-site', label: 'New site', keywords: 'create add make site', run: () => $('new-site-button').click() }]);
   if (location.hash === '#new-site') {
     history.replaceState(null, '', location.pathname + location.search);
     $('new-site-button').click();
-  }
-}
-
-$('new-site').addEventListener('submit', async (event) => {
-  event.preventDefault();
-  const say = (text) => showMessage($('new-site-error'), text);
-  const name = $('site-name').value.trim();
-  if (!name) {
-    say('Give the site a name.');
-    $('site-name').focus();
-    return;
-  }
-  say('');
-  $('new-site-submit').disabled = true;
-  const result = await api('POST', '/sites', { name, template: $('site-template').value });
-  $('new-site-submit').disabled = false;
-  if (result.ok) location.assign(pageFor('site', result.data.id));
-  else say(messageFor(result.error));
-});
-
-// Administrators choose the template of a new site: the built-in ones and the saved ones.
-if (me.is_admin) {
-  const templates = await api('GET', '/templates');
-  if (templates.ok && templates.data.length > 0) {
-    $('site-template').replaceChildren(
-      ...templates.data.map((template) =>
-        h('option', { value: template.id }, template.built_in ? template.name : `${template.name} (saved template)`),
-      ),
-    );
   }
 }
 

@@ -64,24 +64,73 @@
   <ul id="mine-list" class="list" aria-labelledby="mine-heading"></ul>
  </section>
 </div>
-<dialog id="new-site-dialog" aria-labelledby="new-site-title">
- <form id="new-site" method="dialog">
-  <h2 id="new-site-title">New site</h2>
-  <div class="field">
-   <label for="site-name">Site name</label>
-   <input type="text" id="site-name" maxlength="120" autocomplete="off" required>
+<dialog id="new-site-dialog" class="wizard" aria-labelledby="new-site-title">
+ <form id="new-site" class="wizard-form" novalidate>
+  <div class="wizard-head">
+   <h2 id="new-site-title">New site</h2>
+   <button type="button" id="new-site-close" class="plain wizard-close" aria-label="Close">
+    <span aria-hidden="true">×</span>
+   </button>
   </div>
-  <div class="field">
-   <label for="site-template">Template</label>
-   <select id="site-template">
-    <option value="team">Team site</option>
-    <option value="communication">Communication site</option>
-   </select>
+  <ol id="wizard-steps" class="wizard-steps" role="list" aria-label="Steps"></ol>
+  <p id="wizard-live" class="visually-hidden" aria-live="polite"></p>
+  <div class="wizard-body">
+   <fieldset id="step-template" class="wizard-step" aria-labelledby="step-template-title">
+    <h3 id="step-template-title" class="wizard-step-title" tabindex="-1">Choose a template</h3>
+    <p class="meta wizard-lede">A template gives the site its kind, libraries and navigation. You can change all of it later.</p>
+    <div id="template-cards" class="template-cards"></div>
+    <p id="template-msg" class="field-msg" aria-live="polite"></p>
+   </fieldset>
+   <div id="step-details" class="wizard-step" role="group" aria-labelledby="step-details-title" hidden>
+    <h3 id="step-details-title" class="wizard-step-title" tabindex="-1">Name and describe the site</h3>
+    <p id="details-template" class="meta wizard-lede"></p>
+    <div class="field">
+     <label for="site-name">Site name</label>
+     <input type="text" id="site-name" maxlength="200" autocomplete="off" required aria-describedby="site-name-msg">
+     <p id="site-name-msg" class="field-msg" aria-live="polite"></p>
+    </div>
+    <div class="field">
+     <label for="site-description">Description <span class="optional">(optional)</span></label>
+     <textarea id="site-description" class="short" aria-describedby="site-description-note site-description-msg"></textarea>
+     <small id="site-description-note" class="meta">Shown on the site's home page and in the site directory. At most 500 characters.</small>
+     <p id="site-description-msg" class="field-msg" aria-live="polite"></p>
+    </div>
+    <details id="regional" class="wizard-regional">
+     <summary>Language and time zone: <span id="regional-summary"></span></summary>
+     <div class="field">
+      <label for="site-language">Language</label>
+      <select id="site-language" aria-describedby="regional-note"></select>
+     </div>
+     <div class="field">
+      <label for="site-zone">Time zone</label>
+      <select id="site-zone" aria-describedby="regional-note"></select>
+     </div>
+     <small id="regional-note" class="meta"></small>
+     <p id="regional-msg" class="field-msg" aria-live="polite"></p>
+    </details>
+   </div>
+   <div id="step-look" class="wizard-step" role="group" aria-labelledby="step-look-title" hidden>
+    <h3 id="step-look-title" class="wizard-step-title" tabindex="-1">Look and hub <span class="optional">(optional)</span></h3>
+    <p class="meta wizard-lede">Pick colours and a hub now, or skip this and do it later from Manage site.</p>
+    <fieldset class="wizard-themes">
+     <legend>Colours</legend>
+     <div id="wizard-gallery" class="theme-gallery compact"></div>
+    </fieldset>
+    <div id="wizard-hub-field" class="field" hidden>
+     <label for="wizard-hub">Hub</label>
+     <select id="wizard-hub" aria-describedby="wizard-hub-note"></select>
+     <small id="wizard-hub-note" class="meta">A site in a hub shows the hub's navigation and is listed on the hub's page. It never changes who has access.</small>
+    </div>
+   </div>
   </div>
   <p id="new-site-error" role="alert" class="msg"></p>
-  <div class="row end">
+  <div class="wizard-actions">
    <button type="button" id="new-site-cancel" class="plain">Cancel</button>
-   <button type="submit" id="new-site-submit">Create site</button>
+   <span class="spacer"></span>
+   <button type="button" id="wizard-back" class="plain" hidden>Back</button>
+   <button type="button" id="wizard-skip" class="plain" hidden>Skip</button>
+   <button type="button" id="wizard-next">Next</button>
+   <button type="submit" id="new-site-submit" hidden>Create site</button>
   </div>
  </form>
 </dialog>

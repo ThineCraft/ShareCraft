@@ -195,6 +195,15 @@ $('select-all').addEventListener('change', () => {
 await reload();
 setupTree();
 markCrumbs();
+// Upload files on a new site's Get started list arrives as #upload: the New menu opens on Upload
+// files, so one more press opens the file picker (a page cannot open it on its own).
+if (location.hash === '#upload') {
+  history.replaceState(null, '', location.pathname + location.search);
+  if (canAdd) {
+    $('new-button').click();
+    $('new-menu').querySelector('[data-key="files"]')?.focus();
+  }
+}
 
 // ---- the listing ----
 
@@ -580,7 +589,7 @@ function setupNewMenu() {
   const entries = newMenu({ folders: library?.folders, editors: docEditors, templates: templates.length });
   $('new-menu').replaceChildren(
     ...entries.map(({ key, label }) => {
-      const entry = h('button', { type: 'button', role: 'menuitem' }, label);
+      const entry = h('button', { type: 'button', role: 'menuitem', 'data-key': key }, label);
       entry.addEventListener('click', () => chooseNew(key));
       return h('li', { role: 'none' }, entry);
     }),
