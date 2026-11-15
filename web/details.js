@@ -1,5 +1,5 @@
 // The library's details pane: what a file or folder is (a large preview, its type, size, when
-// and by whom it was last changed, who has access) without opening it. On wide screens it is a
+// and by whom it was last changed, who has access, its latest activity) without opening it. On wide screens it is a
 // column beside the table that follows the selected row; on narrow ones a sheet that slides in
 // from the right. The helpers at the top are pure and tested; `createDetails` draws the pane.
 
@@ -18,6 +18,7 @@ import {
   rolesText,
   seg,
 } from './common.js';
+import { PANE_ENTRIES, activityError, activityPanel, collapseSaves, drawTimeline, peopleDirectory } from './activity.js';
 import { EDITORS } from './editor-host.js';
 import { fileIcon, fileKind, relativeTime, typeLabel } from './files.js';
 import { addShortcut, isTextField } from './shortcuts.js';
@@ -464,9 +465,16 @@ export function createDetails({ pane, sheet, status, rows, page, entry, act, me,
         (async () => {
           const answer = await getJson(`/nodes/${seg(item.id)}/access`, abort.signal);
           update({ access: answer.ok ? answer.data : { error: answer.error } });
-          if (!answer.ok || item.kind !== 'document' || !item.revised_at) return;
+          if (!answer.ok || item.kind !== 'document') return;
           const events = await getJson(`/docs/${seg(item.id)}/events`, abort.signal);
-          if (events.ok) update({ by: changedBy(events.data, item.revised_at, peopleIn(answer.data), me?.id ?? null) });
+          if (!events.ok) {
+            update({ activity: { error: activityError(events.status, events.error) } });
+            return;
+          }
+          update({
+            by: item.revised_at ? changedBy(events.data, item.revised_at, peopleIn(answer.data), me?.id ?? null) : null,
+            activity: { entries: collapseSaves(events.data), people: peopleDirectory({ me, access: answer.data }), access: answer.data },
+          });
         })(),
       );
     } else {
@@ -584,7 +592,36 @@ export function createDetails({ pane, sheet, status, rows, page, entry, act, me,
         ),
       ]),
     );
-    info.replaceChildren(h('h3', { class: 'details-name' }, model.name), facts, accessPart(model.access), actionsPart(item, model));
+    info.replaceChildren(h('h3', { class: 'details-name' }, model.name), facts, accessPart(model.access), activityPart(item), actionsPart(item, model));
+  }
+
+  /**
+   * The latest few things that happened to a file, for those who manage its access (the events
+   * route is theirs only), with "See all activity" opening the full panel (activity.js).
+   */
+  function activityPart(item) {
+    if (item.kind !== 'document' || !can(item.access, 'manage_access')) return null;
+    const heading = h('h4', { id: 'details-activity-heading' }, 'Activity');
+    const section = h('section', { class: 'details-activity', 'aria-labelledby': 'details-activity-heading' }, heading);
+    const activity = details.activity;
+    if (activity === undefined) {
+      section.append(h('p', { class: 'meta', 'aria-busy': 'true' }, 'Loading…'));
+      return section;
+    }
+    if (activity.error) {
+      section.append(h('p', { class: 'meta' }, activity.error));
+      return section;
+    }
+    if (!activity.entries.length) {
+      section.append(h('p', { class: 'meta' }, 'Nothing recorded yet.'));
+      return section;
+    }
+    const list = h('div', { class: 'activity-timeline compact' });
+    drawTimeline(list, activity.entries.slice(0, PANE_ENTRIES), activity.people, { level: 5 });
+    const all = h('button', { type: 'button', class: 'ghost small' }, activity.entries.length > PANE_ENTRIES ? `See all activity (${activity.entries.length})` : 'See all activity');
+    all.addEventListener('click', () => activityPanel().open({ id: item.id, name: item.name, me, opener: all, access: activity.access }));
+    section.append(list, h('p', {}, all));
+    return section;
   }
 
   function accessPart(access) {

@@ -38,6 +38,7 @@ import {
   siteChrome,
 } from './common.js';
 import { forgetOpened, rememberOpened } from './start.js';
+import { activityPanel } from './activity.js';
 import { setupEditorFrame } from './editor-frame.js';
 import { createViewer } from './file-viewer.js';
 import { viewerList } from './viewer.js';
@@ -75,6 +76,10 @@ const chrome = setupEditorFrame(frameBox, {
           { label: 'Status', value: statusText.textContent },
         ]
       : [],
+  onActivity: ({ opener }) => {
+    if (removed || !doc) return;
+    activityPanel().open({ id: docId, name: doc.name, me, opener });
+  },
   onRenamed: (node) => {
     if (removed || !doc) return;
     doc = { ...doc, name: node.name };

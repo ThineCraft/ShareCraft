@@ -1509,3 +1509,50 @@ dialog.shell-sheet::backdrop{background:rgb(0 0 0/.4)}
  .tabbar .tab:is([aria-current=page],[aria-expanded=true]){color:Highlight}
  .menu.as-sheet,dialog.shell-sheet{border:1px solid CanvasText}
 }
+
+/* ---- Activity (round 21): a file's timeline in the details pane and in its own panel ---- */
+.details-activity h4{margin:0 0 var(--space-2)}
+.details-activity p{margin:0;font-size:var(--text-sm)}
+.activity-timeline{display:flex;flex-direction:column;gap:var(--space-3)}
+.activity-day-heading{margin:0 0 var(--space-1);font-size:var(--text-xs);font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
+.activity-list,.activity-run{list-style:none;margin:0;padding:0}
+.activity-entry{display:flex;align-items:flex-start;gap:var(--space-2);padding:var(--space-2);border-radius:var(--radius-sm)}
+.activity-list>.activity-entry:nth-child(even){background:var(--band)}
+.activity-entry>.avatar{margin-top:2px}
+.activity-entry:focus-visible{outline:2px solid var(--accent-ink);outline-offset:1px}
+.activity-body{flex:1;min-width:0}
+.activity-text{margin:0;font-size:var(--text-sm);overflow-wrap:anywhere}
+.activity-when{display:block;color:var(--muted);font-size:var(--text-xs)}
+.activity-system{background:var(--band);color:var(--muted)}
+.activity-expand{margin-top:var(--space-1)}
+.activity-run{margin-top:var(--space-1);border-left:2px solid var(--line);padding-left:var(--space-2);font-size:var(--text-sm)}
+.activity-run li{display:flex;flex-wrap:wrap;justify-content:space-between;gap:0 var(--space-2);padding:2px var(--space-1)}
+.activity-run li:nth-child(even){background:var(--band)}
+.activity-run .activity-when{display:inline}
+.activity-timeline.compact .activity-entry{padding:var(--space-1) var(--space-2)}
+dialog.activity-panel{margin:0;padding:0 var(--space-4) var(--space-4);border:0;background:var(--paper);color:var(--text);overflow-y:auto;overscroll-behavior:contain;box-shadow:var(--shadow-3)}
+dialog.activity-panel::backdrop{background:rgb(0 0 0/.4)}
+dialog.activity-panel.as-side{position:fixed;inset:0 0 0 auto;width:min(480px,100vw);max-width:100vw;height:100dvh;max-height:100dvh;border-left:1px solid var(--line);border-radius:0}
+dialog.activity-panel.as-bottom{position:fixed;inset:auto 0 0 0;width:auto;max-width:none;max-height:min(85dvh,680px);padding:0 var(--space-3) calc(var(--space-3) + env(safe-area-inset-bottom));border:1px solid var(--line);border-bottom:0;border-radius:var(--radius-lg) var(--radius-lg) 0 0;transform:translateY(var(--sheet-drag,0px))}
+dialog.activity-panel .sheet-handle{display:none}
+dialog.activity-panel.as-bottom .sheet-handle{display:flex;justify-content:center;align-items:center;position:sticky;top:0;z-index:1;height:24px;background:var(--paper);touch-action:none;cursor:grab}
+dialog.activity-panel.as-bottom .sheet-handle::before{content:'';width:36px;height:4px;border-radius:var(--radius-pill);background:var(--line)}
+.activity-head{position:sticky;top:0;z-index:1;display:flex;align-items:flex-start;gap:var(--space-2);padding:var(--space-4) 0 var(--space-2);background:var(--paper)}
+dialog.activity-panel.as-bottom .activity-head{top:24px;padding-top:0}
+.activity-titles{flex:1;min-width:0}
+.activity-titles h2{margin:0;font-size:var(--text-lg)}
+.activity-subtitle{margin:2px 0 0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.activity-head .sheet-close{min-height:var(--control-touch)}
+.activity-status{margin:0 0 var(--space-2)}
+.activity-status:empty{display:none}
+.activity-more{margin-top:var(--space-3)}
+.activity-end,.activity-empty{margin:var(--space-3) 0 0;color:var(--muted);font-size:var(--text-sm)}
+@media (prefers-reduced-motion:no-preference){
+ dialog.activity-panel.as-side[open]{animation:sheet-in var(--dur) var(--ease)}
+ dialog.activity-panel.as-bottom[open]{animation:shell-sheet-up var(--dur) var(--ease)}
+ dialog.activity-panel.as-bottom:not(.sheet-dragging){transition:transform var(--dur) var(--ease)}
+}
+@media (forced-colors:active){
+ dialog.activity-panel{border:1px solid CanvasText}
+ .activity-system{border:1px solid CanvasText}
+}

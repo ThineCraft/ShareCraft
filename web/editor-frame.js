@@ -1,7 +1,7 @@
 // The focused editor frame (file.html and doc.html): one slim bar above the editor with the way
 // back (the site's mark), the file's name (a button that renames it, where allowed) over its
 // breadcrumb, the save status as a quiet dot and word, who else is in the file, Share, Download,
-// Save and a "⋯" menu with the rest; and a Focus mode that hides the bar and leaves only a small
+// Save and a "⋯" menu with the rest (Details, Activity, …); and a Focus mode that hides the bar and leaves only a small
 // "Exit focus" pill, remembered per viewer.
 //
 // `presenceModel`, `statusLabel`, `backLabel` and `isFocusShortcut` are pure and tested;
@@ -105,11 +105,12 @@ function writeFocus(on) {
 /**
  * Wires the slim bar of an editor page. `frame` is the `.frame` element. Options:
  * `details()` answers the facts for the Details dialog (`[{ label, value }]`), `onRenamed(node)`
- * is called with the server's answer after a rename. Returns the controls the page drives:
+ * is called with the server's answer after a rename, `onActivity({ opener })` opens the file's
+ * Activity panel (offered to those who may share the file). Returns the controls the page drives:
  * `setName(name)`, `setRenamable(yes)`, `setPlace(path, folder)`, `setStatus(state)`,
  * `setPresence(people, me)`, `setNodeId(id)`.
  */
-export function setupEditorFrame(frame, { details = () => [], onRenamed = () => {} } = {}) {
+export function setupEditorFrame(frame, { details = () => [], onRenamed = () => {}, onActivity = null } = {}) {
   const $ = (id) => document.getElementById(id);
   const bar = frame.querySelector('.bar');
   const title = $('title');
@@ -229,8 +230,12 @@ export function setupEditorFrame(frame, { details = () => [], onRenamed = () => 
   const locationLabel = h('li', { role: 'none', class: 'menu-label', 'aria-hidden': 'true' }, 'Location');
   const locationGroup = h('ul', { role: 'group', class: 'menu-group', 'aria-label': 'Location' });
   const locationItems = [locationLabel, h('li', { role: 'none' }, locationGroup)];
+  // Activity (activity.js): who changed the file and when. The events route answers only those
+  // who manage access, as Share does, so the item shows when Share would.
+  const activityItem = h('li', { role: 'none', hidden: true }, entry('Activity', () => onActivity?.({ opener: more })));
   moreMenu.replaceChildren(
     h('li', { role: 'none' }, entry('Details', showDetails)),
+    activityItem,
     ...narrowOnly,
     h('li', { role: 'separator', class: 'menu-separator' }),
     ...locationItems,
@@ -240,6 +245,7 @@ export function setupEditorFrame(frame, { details = () => [], onRenamed = () => 
   // and Focus move into it, and so does the location (the breadcrumb is hidden there).
   const syncMenu = () => {
     const small = Boolean(narrow?.matches);
+    activityItem.hidden = !onActivity || accessLink.hidden;
     narrowOnly[0].hidden = !small || accessLink.hidden;
     shareItem.href = accessLink.getAttribute('href') ?? '#';
     narrowOnly[1].hidden = !small || download.hidden || !download.getAttribute('href');

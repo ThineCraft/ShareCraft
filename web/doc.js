@@ -21,6 +21,7 @@ import {
   siteChrome,
 } from './common.js';
 import { forgetOpened, rememberOpened } from './start.js';
+import { activityPanel } from './activity.js';
 import { setupEditorFrame } from './editor-frame.js';
 
 const FIRST_DELAY = 500;
@@ -71,6 +72,10 @@ const chrome = setupEditorFrame(frame, {
           { label: 'People here', value: people.map((person) => (person.me ? `${person.name} (you)` : person.name)).join(', ') },
         ]
       : [],
+  onActivity: ({ opener }) => {
+    if (removedReason || !info) return;
+    activityPanel().open({ id: docId, name: info.name, me, opener });
+  },
   onRenamed: (node) => {
     if (removedReason || !info) return;
     showDetail({ ...info, name: node.name });
