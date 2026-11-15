@@ -342,7 +342,8 @@ impl Blobs {
     }
 
     /// Erases the content `sha256` if nothing names it, pending claims included, and no write
-    /// holds it; whether a file was erased.
+    /// holds it, and then its thumbnail (see [`crate::previews`]); whether a file was erased. A
+    /// thumbnail that cannot be erased is logged.
     pub(crate) async fn erase_if_unreferenced(
         &self,
         db: &Db,
@@ -363,7 +364,15 @@ impl Blobs {
         {
             return Ok(false);
         }
-        self.store.erase(sha256).map_err(|e| e.to_string())
+        let erased = self.store.erase(sha256).map_err(|e| e.to_string())?;
+        // After the content: a thumbnail being made meanwhile checks for the content last.
+        if let Err(e) = crate::previews::erase_thumbnail(&self.store, sha256) {
+            eprintln!(
+                "sharecraft-server: cannot erase the thumbnail of content {}: {e}",
+                revisions::hex(sha256)
+            );
+        }
+        Ok(erased)
     }
 }
 

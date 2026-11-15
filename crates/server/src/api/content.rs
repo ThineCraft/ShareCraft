@@ -2,7 +2,9 @@
 //!
 //! ShareCraft never interprets these bytes. A download is always an attachment of type
 //! `application/octet-stream`, behind headers that keep a browser from rendering it, and may
-//! ask for one byte range. A save goes to the document's file session and nowhere else; an
+//! ask for one byte range. A preview is the same bytes shown in the page, only for the safe
+//! types of [`crate::previews`] and as the type their extension fixes, behind the same
+//! headers; a thumbnail is a PNG the server makes from an image. A save goes to the document's file session and nowhere else; an
 //! upload creates a document and its first revision, which nobody can have open yet.
 //!
 //! No file is ever held in memory: a save or an upload streams its body into the content store
@@ -42,6 +44,7 @@ use super::{ApiError, parse_id, to_completion};
 use crate::blobs::{BodyError, Held, release, write_claimed};
 use crate::checkpoint::Checkpointer;
 use crate::file_room::SaveReply;
+use crate::previews::{self, PreviewKind, PreviewType, ThumbError};
 use crate::projection::record_first;
 use crate::room::credited_name;
 use crate::scan::require_available;
@@ -335,6 +338,35 @@ fn span_of(range: Option<&HeaderValue>, size: u64) -> Span {
     }
 }
 
+/// How a file's bytes are handed out: as a download, or as a preview a browser shows.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Delivery {
+    /// The `Content-Type`, fixed by the server, never read from the bytes.
+    content_type: &'static str,
+    /// `inline` (a preview) or `attachment` (a download).
+    disposition: &'static str,
+    /// Whether one byte range is served when asked for.
+    ranges: bool,
+}
+
+/// Every download: an attachment of no particular type, in ranges when asked.
+const DOWNLOAD: Delivery = Delivery {
+    content_type: "application/octet-stream",
+    disposition: "attachment",
+    ranges: true,
+};
+
+impl Delivery {
+    /// A preview of the type `preview`: shown in the page, in ranges for audio and video.
+    fn preview(preview: PreviewType) -> Self {
+        Self {
+            content_type: preview.content_type,
+            disposition: "inline",
+            ranges: preview.ranges(),
+        }
+    }
+}
+
 /// A file's bytes as every download answers them: an attachment named `name`, of type
 /// `application/octet-stream`, that a browser neither sniffs nor renders (`nosniff`, a sandbox
 /// policy), never cached, naming its revision, with `Accept-Ranges: bytes`. When `range` asks
@@ -349,25 +381,53 @@ pub(crate) async fn file_answer(
     stored: Stored,
     range: Option<&HeaderValue>,
 ) -> Result<Response, ApiError> {
-    require_available(state, &stored.content).await?;
+    stored_answer(state, name, stored, range, DOWNLOAD).await
+}
+
+/// The headers every answer handing out a file's bytes carries: its type and disposition
+/// from `delivery`, `nosniff`, the sandbox policy, `no-store`, and its revision.
+fn byte_headers(
+    name: &str,
+    revision: &RevisionId,
+    delivery: Delivery,
+) -> Result<HeaderMap, ApiError> {
     let mut headers = HeaderMap::new();
     headers.insert(
         CONTENT_TYPE,
-        HeaderValue::from_static("application/octet-stream"),
+        HeaderValue::from_static(delivery.content_type),
     );
     headers.insert(
         CONTENT_DISPOSITION,
-        HeaderValue::from_str(&content_disposition(name)).map_err(|e| ApiError::unavailable(&e))?,
+        header_value(&disposition(delivery.disposition, name))?,
     );
     headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
     headers.insert(CONTENT_SECURITY_POLICY, HeaderValue::from_static("sandbox"));
     headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
     headers.insert(
         HeaderName::from_static(REVISION_HEADER),
-        HeaderValue::from_str(&stored.revision.to_string())
-            .map_err(|e| ApiError::unavailable(&e))?,
+        header_value(&revision.to_string())?,
     );
-    headers.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    Ok(headers)
+}
+
+/// A file's bytes as `delivery` hands them out, with the headers of [`file_answer`]; a range is
+/// served only when `delivery` allows ranges (the whole file otherwise, without
+/// `Accept-Ranges`).
+async fn stored_answer(
+    state: &AppState,
+    name: &str,
+    stored: Stored,
+    range: Option<&HeaderValue>,
+    delivery: Delivery,
+) -> Result<Response, ApiError> {
+    require_available(state, &stored.content).await?;
+    let mut headers = byte_headers(name, &stored.revision, delivery)?;
+    let range = if delivery.ranges {
+        headers.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+        range
+    } else {
+        None
+    };
     let size = stored.content.size();
     let file = match &stored.content {
         Content::Blob(blob) => Some(open_content(state, &stored.revision, *blob).await?),
@@ -398,6 +458,156 @@ pub(crate) async fn file_answer(
         (Content::Blob(_), None) => return Err(ApiError::Unavailable),
     };
     Ok((status, headers, body).into_response())
+}
+
+/// `GET /api/docs/{id}/preview`: the document's current version for a browser to show (see
+/// [`preview_answer`]). `404` if the caller has no role on it.
+pub(crate) async fn preview(
+    State(state): State<AppState>,
+    signed: Signed,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let doc = DocId(parse_id(&id)?);
+    let document = viewed_document(&state, &signed, doc).await?;
+    preview_answer(&state, &document, headers.get(RANGE)).await
+}
+
+/// The document `doc`, if the signed-in caller has a role on it; `404` otherwise.
+async fn viewed_document(
+    state: &AppState,
+    signed: &Signed,
+    doc: DocId,
+) -> Result<records::Document, ApiError> {
+    let db = state.db();
+    db.doc_access(signed.session.user.id, doc)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?
+        .ok_or(ApiError::NotFound)?;
+    db.document(doc)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?
+        .ok_or(ApiError::NotFound)
+}
+
+/// The preview of `document`'s current version: only for the types of
+/// [`previews::preview_type`], served as the type its extension fixes, with the headers of a
+/// download but `Content-Disposition: inline`. Audio and video are served in one byte range
+/// when asked (`206`, `416`); text is the first MiB, only if it is UTF-8 (a character the cut
+/// splits is left out). `415 no_preview` for any other type and for text that is not UTF-8;
+/// `423 held {scan}` while the malware scanner holds the content; `204` if the document has
+/// no version yet.
+pub(crate) async fn preview_answer(
+    state: &AppState,
+    document: &records::Document,
+    range: Option<&HeaderValue>,
+) -> Result<Response, ApiError> {
+    let kind = previews::preview_type(&document.name).ok_or(ApiError::NoPreview)?;
+    let doc = document.id;
+    let Some(stored) = blocking(state, move |store| store.load(doc)).await? else {
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    };
+    if kind.kind != PreviewKind::Text {
+        return stored_answer(
+            state,
+            &document.name,
+            stored,
+            range,
+            Delivery::preview(kind),
+        )
+        .await;
+    }
+    require_available(state, &stored.content).await?;
+    let cut = stored.content.size() > previews::TEXT_PREVIEW_BYTES;
+    let start = read_start(state, &stored, previews::TEXT_PREVIEW_BYTES).await?;
+    let text = previews::text_preview(start, cut).ok_or(ApiError::NoPreview)?;
+    let mut headers = byte_headers(&document.name, &stored.revision, Delivery::preview(kind))?;
+    headers.insert(CONTENT_LENGTH, header_value(&text.len().to_string())?);
+    Ok((StatusCode::OK, headers, text).into_response())
+}
+
+/// At most the first `limit` bytes of `stored`'s content.
+async fn read_start(state: &AppState, stored: &Stored, limit: u64) -> Result<Vec<u8>, ApiError> {
+    let blob = match &stored.content {
+        Content::Inline(bytes) => {
+            let end = usize::try_from(limit).map_or(bytes.len(), |limit| limit.min(bytes.len()));
+            return Ok(bytes.get(..end).unwrap_or_default().to_vec());
+        }
+        Content::Blob(blob) => *blob,
+    };
+    let file = open_content(state, &stored.revision, blob).await?;
+    tokio::task::spawn_blocking(move || {
+        let mut start = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::Read::take(file, limit), &mut start)?;
+        Ok::<_, std::io::Error>(start)
+    })
+    .await
+    .map_err(|e| ApiError::unavailable(&e))?
+    .map_err(|e| ApiError::unavailable(&e))
+}
+
+/// `GET /api/docs/{id}/thumbnail`: a PNG of the document's current version at most 256 pixels
+/// on its longer side, made on the server the first time it is asked for and kept beside the
+/// content store (see [`previews::thumbnail`]). For PNG, JPEG, GIF (its first frame) and WebP
+/// files; `415 no_thumbnail` for any other type, for a document with no version, and for an
+/// image that cannot be decoded within the limits. `423 held {scan}` while the malware scanner
+/// holds the content; `404` if the caller has no role on the document. It may be cached
+/// privately for five minutes: it shows no more than the listing does.
+pub(crate) async fn thumbnail(
+    State(state): State<AppState>,
+    signed: Signed,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    let doc = DocId(parse_id(&id)?);
+    let document = viewed_document(&state, &signed, doc).await?;
+    if !previews::has_thumbnail(&document.name) {
+        return Err(ApiError::NoThumbnail);
+    }
+    let stored = blocking(&state, move |store| store.load(doc))
+        .await?
+        .ok_or(ApiError::NoThumbnail)?;
+    require_available(&state, &stored.content).await?;
+    // Content kept inline in Git predates the content store and is never an image.
+    let Content::Blob(blob) = stored.content else {
+        return Err(ApiError::NoThumbnail);
+    };
+    let made = state
+        .thumbnailer()
+        .make(Arc::clone(state.blobs()), blob.sha256)
+        .await;
+    let path = match made {
+        Ok(path) => path,
+        Err(e) => {
+            if matches!(
+                e,
+                ThumbError::Io(_)
+                    | ThumbError::Store(_)
+                    | ThumbError::Task(_)
+                    | ThumbError::Missing
+            ) {
+                eprintln!(
+                    "sharecraft-server: cannot make the thumbnail of content {}: {e}",
+                    blob.hex()
+                );
+            }
+            return Err(ApiError::NoThumbnail);
+        }
+    };
+    let png = match tokio::fs::read(&path).await {
+        Ok(png) => png,
+        // Erased meanwhile with its content.
+        Err(_) => return Err(ApiError::NoThumbnail),
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("image/png"));
+    headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    headers.insert(CONTENT_SECURITY_POLICY, HeaderValue::from_static("sandbox"));
+    headers.insert(
+        CACHE_CONTROL,
+        HeaderValue::from_static("private, max-age=300"),
+    );
+    headers.insert(CONTENT_LENGTH, header_value(&png.len().to_string())?);
+    Ok((StatusCode::OK, headers, png).into_response())
 }
 
 fn header_value(text: &str) -> Result<HeaderValue, ApiError> {
@@ -801,6 +1011,13 @@ pub(super) async fn create_uploaded(
 /// The `Content-Disposition` of a download of the file `name`: an attachment, with an ASCII
 /// fallback name for old clients and the real name in `filename*` (RFC 6266, RFC 8187).
 pub(crate) fn content_disposition(name: &str) -> String {
+    disposition("attachment", name)
+}
+
+/// The `Content-Disposition` `kind` (`attachment` or `inline`) of the file `name`, with an ASCII
+/// fallback name in which quotes, backslashes, `%`, control characters (line breaks among them)
+/// and anything not ASCII are `_`, and the real name percent-encoded in `filename*`.
+fn disposition(kind: &str, name: &str) -> String {
     let fallback: String = name
         .chars()
         .map(|c| {
@@ -821,7 +1038,7 @@ pub(crate) fn content_disposition(name: &str) -> String {
             let _ = write!(encoded, "%{byte:02X}");
         }
     }
-    format!("attachment; filename=\"{fallback}\"; filename*=UTF-8''{encoded}")
+    format!("{kind}; filename=\"{fallback}\"; filename*=UTF-8''{encoded}")
 }
 
 /// Whether RFC 8187 allows `byte` unescaped in an extended parameter value.
@@ -868,6 +1085,17 @@ mod tests {
             "attachment; filename=\"a_b_c_d_.xlsx\"; filename*=UTF-8''a%22b%5Cc%09d%7F.xlsx"
         );
         // Whatever the name, the header is one valid header value.
+        assert!(HeaderValue::from_str(&header).is_ok());
+    }
+
+    #[test]
+    fn inline_names_are_cleaned_as_downloads_are() {
+        let header = disposition("inline", "Re\"port\r\n\u{e9}t\u{e9}.html");
+        assert_eq!(
+            header,
+            "inline; filename=\"Re_port___t_.html\"; \
+             filename*=UTF-8''Re%22port%0D%0A%C3%A9t%C3%A9.html"
+        );
         assert!(HeaderValue::from_str(&header).is_ok());
     }
 

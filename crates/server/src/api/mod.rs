@@ -171,6 +171,8 @@ pub(crate) fn router() -> Router<AppState> {
             "/docs/{id}/content",
             get(content::download).put(content::save),
         )
+        .route("/docs/{id}/preview", get(content::preview))
+        .route("/docs/{id}/thumbnail", get(content::thumbnail))
         .route("/docs/{id}/access", get(nodes::access).put(nodes::share))
         .route("/docs/{id}/events", get(docs::events))
         .route(
@@ -199,12 +201,14 @@ pub(crate) fn router() -> Router<AppState> {
         .layer(middleware::from_fn(no_store))
 }
 
-/// Keeps every `/api` answer, errors included, out of caches.
+/// Keeps every `/api` answer, errors included, out of caches, unless it says otherwise itself
+/// (a thumbnail, cached privately for a few minutes).
 async fn no_store(request: Request, next: Next) -> Response {
     let mut response = next.run(request).await;
     response
         .headers_mut()
-        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        .entry(CACHE_CONTROL)
+        .or_insert(HeaderValue::from_static("no-store"));
     response
 }
 
@@ -309,6 +313,11 @@ pub(crate) enum ApiError {
     Held(ScanState),
     /// 422: not an ICAP scanner address (`icap://host[:port]/service`, no password).
     InvalidScannerUrl,
+    /// 415: the file is not of a type that has a preview, or a text file is not UTF-8.
+    NoPreview,
+    /// 415: no thumbnail is made for the file: not a PNG, JPEG, GIF or WebP image, or one that
+    /// cannot be decoded within the limits.
+    NoThumbnail,
     /// 422: the password is too short or too long.
     WeakPassword,
     /// 413: the body is larger than the route allows (16 KiB; file content, `max_file_bytes`).
@@ -413,6 +422,8 @@ impl ApiError {
             ApiError::BlockedFileType(_) => (StatusCode::UNPROCESSABLE_ENTITY, "blocked_file_type"),
             ApiError::FileTooLarge(_) => (StatusCode::PAYLOAD_TOO_LARGE, "file_too_large"),
             ApiError::Held(_) => (StatusCode::LOCKED, "held"),
+            ApiError::NoPreview => (StatusCode::UNSUPPORTED_MEDIA_TYPE, "no_preview"),
+            ApiError::NoThumbnail => (StatusCode::UNSUPPORTED_MEDIA_TYPE, "no_thumbnail"),
             ApiError::InvalidScannerUrl => {
                 (StatusCode::UNPROCESSABLE_ENTITY, "invalid_scanner_url")
             }

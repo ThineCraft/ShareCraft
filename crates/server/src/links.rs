@@ -3,7 +3,8 @@
 //! - `GET /l/{token}` serves the landing page (`link.html`) whatever the token; the page asks
 //!   `GET /api/l/{token}` what the link is.
 //! - `POST /api/l/{token}/redeem` opens a signed-in link for the signed-in caller.
-//! - `GET /api/l/{token}/children/{node}`, `…/content/{node}` and `…/text/{node}` are the
+//! - `GET /api/l/{token}/children/{node}`, `…/content/{node}`, `…/text/{node}` and
+//!   `…/preview/{node}` are the
 //!   anonymous routes: they take an anyone link's token only, check it on every request
 //!   ([`records::Db::anyone_link`]), and never read or set the session cookie.
 //!
@@ -31,7 +32,7 @@ use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
 use crate::AppState;
-use crate::api::content::{blocking, file_answer};
+use crate::api::content::{blocking, file_answer, preview_answer};
 use crate::api::nodes::{ChildrenPage, ChildrenQuery, node_id, rfc3339};
 use crate::api::{ApiError, recheck_below, recheck_person, to_completion};
 use crate::auth::{MaybeSigned, Signed};
@@ -48,6 +49,7 @@ pub(crate) fn api_router() -> Router<AppState> {
         .route("/{token}/children/{node}", get(children))
         .route("/{token}/content/{node}", get(content))
         .route("/{token}/text/{node}", get(text))
+        .route("/{token}/preview/{node}", get(preview))
         .fallback(|| async { ApiError::LinkNotFound })
 }
 
@@ -275,6 +277,21 @@ async fn content(
         Some(stored) => file_answer(&state, &document.name, stored, headers.get(RANGE)).await,
         None => Ok(StatusCode::NO_CONTENT.into_response()),
     }
+}
+
+/// `GET /api/l/{token}/preview/{node}`: a file's preview as of its last saved revision, by the
+/// rules of `GET /api/docs/{id}/preview` (see [`preview_answer`]): `415 no_preview` for a type
+/// with none, `423 held {scan}` while the malware scanner holds it, `204` if it has never been
+/// saved.
+async fn preview(
+    State(state): State<AppState>,
+    Path((token, node)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let token = token_of(&token)?;
+    let node = reached_id(&node)?;
+    let document = reached_document(&state, &token, node).await?;
+    preview_answer(&state, &document, headers.get(RANGE)).await
 }
 
 /// `GET /api/l/{token}/text/{node}`: a plain-text document's text as of its last saved

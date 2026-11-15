@@ -19,6 +19,7 @@ pub mod icap;
 pub mod libraries;
 mod links;
 mod members;
+pub mod previews;
 mod projection;
 mod room;
 mod scan;
@@ -79,6 +80,8 @@ struct Shared {
     uploads: Arc<Uploads>,
     /// The malware scan worker's turns and the contents it is scanning.
     scanner: scan::Scanner,
+    /// The turns for making thumbnails.
+    thumbnailer: previews::Thumbnailer,
     db: Db,
     editors: Editors,
     events: EventSink,
@@ -115,6 +118,7 @@ impl AppState {
                 blobs: Arc::new(Blobs::new(blobs)),
                 uploads: Arc::new(Uploads::new(uploads_dir)),
                 scanner: scan::Scanner::default(),
+                thumbnailer: previews::Thumbnailer::default(),
                 events: EventSink::start(db.clone()),
                 editors: Editors::load(&editors_dir),
                 db,
@@ -159,6 +163,10 @@ impl AppState {
 
     fn scanner(&self) -> &scan::Scanner {
         &self.shared.scanner
+    }
+
+    fn thumbnailer(&self) -> &previews::Thumbnailer {
+        &self.shared.thumbnailer
     }
 
     fn events(&self) -> &EventSink {

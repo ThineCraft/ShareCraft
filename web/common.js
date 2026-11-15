@@ -81,6 +81,10 @@ const MESSAGES = {
     'That file is larger than this library takes. Choose a smaller file or another library.',
   held:
     'This file cannot be opened yet: it is waiting for the malware scanner, or the scanner found a threat in it. An administrator can release it.',
+  no_preview:
+    'This file has no preview. Download it to open it.',
+  no_thumbnail:
+    'There is no thumbnail for this file.',
   invalid_scanner_url:
     'That is not a scanner address. Write it as icap://host/service or icap://host:port/service, with no user name or password.',
   invalid_library_settings:

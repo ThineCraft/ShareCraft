@@ -559,6 +559,8 @@ async fn held_content_is_never_served() {
     let bad = infected("table");
     let quarantined = upload(&server, &ann, &home, "Infected.xlsx", &bad).await;
     wait_scan(&server, &bad, |s| s == ScanState::Infected).await;
+    // The same content under a name that has a preview and a thumbnail.
+    let quarantined_png = upload(&server, &ann, &home, "Infected.png", &bad).await;
 
     // Held: the scanner fails, so it waits.
     fake.set(Behaviour {
@@ -568,6 +570,7 @@ async fn held_content_is_never_served() {
     let waiting = b"held until the scanner answers".to_vec();
     let held = upload(&server, &ann, &home, "Held.xlsx", &waiting).await;
     wait_scan(&server, &waiting, |s| s == ScanState::Failed).await;
+    let held_png = upload(&server, &ann, &home, "Held.png", &waiting).await;
     fake.set(Behaviour::default());
 
     // An older version infected, the current one clean.
@@ -677,6 +680,42 @@ async fn held_content_is_never_served() {
             "text document download",
             http.get(url(format!("/api/docs/{note}/content"))),
             "infected",
+        ),
+        (
+            "preview",
+            http.get(url(format!("/api/docs/{quarantined_png}/preview"))),
+            "infected",
+        ),
+        (
+            "held preview",
+            http.get(url(format!("/api/docs/{held_png}/preview"))),
+            "failed",
+        ),
+        (
+            "text document preview",
+            http.get(url(format!("/api/docs/{note}/preview"))),
+            "infected",
+        ),
+        (
+            "thumbnail",
+            http.get(url(format!("/api/docs/{quarantined_png}/thumbnail"))),
+            "infected",
+        ),
+        (
+            "held thumbnail",
+            http.get(url(format!("/api/docs/{held_png}/thumbnail"))),
+            "failed",
+        ),
+        (
+            "anyone link preview",
+            anon.get(url(format!("/api/l/{token}/preview/{quarantined_png}"))),
+            "infected",
+        ),
+        (
+            "anyone link held ranged preview",
+            anon.get(url(format!("/api/l/{token}/preview/{held_png}")))
+                .header(RANGE, "bytes=0-1"),
+            "failed",
         ),
         (
             "copy",
