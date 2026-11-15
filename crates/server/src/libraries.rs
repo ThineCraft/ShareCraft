@@ -152,7 +152,8 @@ pub async fn assets(
 /// The "New from template" choices of `library` for `actor`, who needs `view` on it: the
 /// files in the template libraries of its site that `actor` can view and whose content is
 /// available, by name. Files of another site, in a library of another kind, in the recycle
-/// bin, or held or quarantined by the malware scanner are never among them.
+/// bin, or held, quarantined or still pending at the malware scanner (even content an editor
+/// saved, which is not held elsewhere) are never among them.
 ///
 /// # Errors
 /// `NotFound` when the library is missing, deleted, not a library or not visible to `actor`;
@@ -175,8 +176,8 @@ pub async fn templates(
         }
     }
     let ids: Vec<DocId> = viewable.iter().map(|file| file.id).collect();
-    let held = db.scan_marks(&ids).await?;
-    viewable.retain(|file| !held.contains_key(&file.id));
+    let kept = db.templates_kept_back(&ids).await?;
+    viewable.retain(|file| !kept.contains_key(&file.id));
     Ok(viewable)
 }
 

@@ -430,7 +430,22 @@ impl Db {
             Option<time::OffsetDateTime>,
         );
         let rows: Vec<Row> = sqlx::query_as(
-            "with recursive below(id, library_id, depth) as (                  select n.id, n.id, 0 from libraries l join nodes n on n.id = l.id                  join nodes s on s.id = n.site_id                  where l.kind = 'template' and n.site_id = $1 and n.kind = 'library'                    and n.deleted_at is null and s.deleted_at is null                  union all                  select c.id, b.library_id, b.depth + 1 from nodes c join below b                    on c.parent_id = b.id                  where c.deleted_at is null and b.depth < 10000              )              select n.id, n.name, d.editor, b.library_id, lib.name, d.revised_at              from below b join nodes n on n.id = b.id              join documents d on d.id = n.id              join nodes lib on lib.id = b.library_id              where n.kind = 'document' and d.revision is not null              order by lower(n.name), n.id",
+            "with recursive below(id, library_id, depth) as ( \
+                 select n.id, n.id, 0 from libraries l join nodes n on n.id = l.id \
+                 join nodes s on s.id = n.site_id \
+                 where l.kind = 'template' and n.site_id = $1 and n.kind = 'library' \
+                   and n.deleted_at is null and s.deleted_at is null \
+                 union all \
+                 select c.id, b.library_id, b.depth + 1 from nodes c join below b \
+                   on c.parent_id = b.id \
+                 where c.deleted_at is null and b.depth < 10000 \
+             ) \
+             select n.id, n.name, d.editor, b.library_id, lib.name, d.revised_at \
+             from below b join nodes n on n.id = b.id \
+             join documents d on d.id = n.id \
+             join nodes lib on lib.id = b.library_id \
+             where n.kind = 'document' and d.revision is not null \
+             order by lower(n.name), n.id",
         )
         .bind(site.0)
         .fetch_all(self.pool())

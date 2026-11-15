@@ -335,6 +335,18 @@ impl ScannerSettings {
     /// Whether content in `state`, held for uploads when `hold`, is available.
     #[must_use]
     pub fn available(&self, state: ScanState, hold: bool) -> bool {
+        self.allows(state, hold)
+    }
+
+    /// Whether content in `state` may be offered and copied as a template ("New from
+    /// template"): as [`ScannerSettings::available`], except that pending content never is,
+    /// held or not, so a copy from a template is never made before its content is judged.
+    #[must_use]
+    pub fn offers_template(&self, state: ScanState) -> bool {
+        state != ScanState::Pending && self.allows(state, true)
+    }
+
+    fn allows(&self, state: ScanState, hold: bool) -> bool {
         match state {
             ScanState::Clean | ScanState::Released | ScanState::Unscanned => true,
             ScanState::Infected => false,
@@ -497,6 +509,57 @@ impl Db {
         }
         let settings = self.scanner_settings().await?;
         Ok((!settings.available(info.state, info.hold)).then_some(info.state))
+    }
+
+    /// `None` when the content `sha256` may be copied as a template (see
+    /// [`ScannerSettings::offers_template`]: as available, but never while pending), or the
+    /// state that keeps it back.
+    pub async fn template_availability(
+        &self,
+        sha256: &[u8; 32],
+    ) -> Result<Option<ScanState>, DbError> {
+        let Some(info) = self.scan_state(sha256).await? else {
+            return Ok(None);
+        };
+        if info.state == ScanState::Clean || info.state == ScanState::Unscanned {
+            return Ok(None);
+        }
+        let settings = self.scanner_settings().await?;
+        Ok((!settings.offers_template(info.state)).then_some(info.state))
+    }
+
+    /// The documents among `docs` whose current version's content may not be offered as a
+    /// template (see [`ScannerSettings::offers_template`]), each with the state that keeps it
+    /// back; the others are left out.
+    pub async fn templates_kept_back(
+        &self,
+        docs: &[DocId],
+    ) -> Result<HashMap<DocId, ScanState>, DbError> {
+        if docs.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let ids: Vec<uuid::Uuid> = docs.iter().map(|d| d.0).collect();
+        let rows: Vec<(uuid::Uuid, String)> = sqlx::query_as(
+            "select d.id, b.scan from documents d \
+             join blob_refs r on r.doc_id = d.id and r.revision = d.revision and not r.pending \
+             join blobs b on b.sha256 = r.sha256 \
+             where d.id = any($1) and b.scan not in ('clean', 'released', 'unscanned')",
+        )
+        .bind(&ids)
+        .fetch_all(self.pool())
+        .await?;
+        if rows.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let settings = self.scanner_settings().await?;
+        let mut kept = HashMap::new();
+        for (id, state) in rows {
+            let state = state_of(&state)?;
+            if !settings.offers_template(state) {
+                kept.insert(DocId(id), state);
+            }
+        }
+        Ok(kept)
     }
 
     /// Whether the content `sha256` is available (see the module documentation).

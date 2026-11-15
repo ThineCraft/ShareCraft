@@ -463,7 +463,7 @@ pub async fn apply(state: &AppState, actor: &User, op: TreeOp) -> Result<Applied
         TreeOp::ToSecondStage { id } => Some(plan_to_second_stage(state, actor, id).await?),
         TreeOp::Purge { id } => Some(plan_purge(state, Some(actor), id).await?),
         TreeOp::Copy { id, parent, name } => {
-            Some(plan_copy(state, actor, id, parent, name.as_deref()).await?)
+            Some(plan_copy(state, actor, id, parent, name.as_deref(), false).await?)
         }
         TreeOp::FromTemplate {
             library,
@@ -2601,13 +2601,16 @@ async fn plan_purge(
 
 /// Copies `id` into `destination` for `actor` (see [`apply`]): the new records, their files,
 /// the `node.copied` events naming the sources, and the latest version of each file, its
-/// content held (an old inline version written to the store first) and then claimed.
+/// content held (an old inline version written to the store first) and then claimed. For a
+/// copy from a template (`template`), content still pending at the malware scanner is refused
+/// too (`Held(Pending)`), even when an editor saved it and it is available elsewhere.
 async fn plan_copy(
     state: &AppState,
     actor: &User,
     id: NodeId,
     destination: NodeId,
     name: Option<&str>,
+    template: bool,
 ) -> Result<Plan, AccessError> {
     let db = state.db();
     let (node, access) = visible(db, actor, id).await?;
@@ -2769,11 +2772,17 @@ async fn plan_copy(
         let Some(stored) = stored else {
             continue;
         };
-        // Content the malware scanner holds is never copied.
-        if let Content::Blob(blob) = &stored.content
-            && let Some(scan) = db.availability(&blob.sha256).await?
-        {
-            return Err(AccessError::Held(scan));
+        // Content the malware scanner holds is never copied; nor, from a template, content
+        // it has not judged yet.
+        if let Content::Blob(blob) = &stored.content {
+            let kept = if template {
+                db.template_availability(&blob.sha256).await?
+            } else {
+                db.availability(&blob.sha256).await?
+            };
+            if let Some(scan) = kept {
+                return Err(AccessError::Held(scan));
+            }
         }
         let hold = match stored.content {
             Content::Blob(blob) => state.blobs().hold_stored(blob).await.ok_or_else(|| {
@@ -2880,7 +2889,8 @@ async fn plan_copy(
 /// "New from template" (see [`apply`]): the template file `template` copied into `library`,
 /// or into `parent` at or below it, through [`plan_copy`], so the quota, name cleaning, the
 /// policies of the library it goes into, `add` there, an archived site and held content all
-/// hold as for any copy. The template must be a live file in a live template library of the
+/// hold as for any copy, and content still pending at the scanner is refused even when an
+/// editor saved it (`Held(Pending)`). The template must be a live file in a live template library of the
 /// same site as `library` (`NotFound` otherwise, as for a template the person cannot view, so
 /// nothing of another site is told); `library` must be a library the person can see
 /// (`NotFound`), and `parent` a library or folder at or below it (`WrongPlace`). A name given
@@ -2932,7 +2942,7 @@ async fn plan_from_template(
             format!("{asked}{extension}")
         }
     });
-    plan_copy(state, actor, template, destination, name.as_deref()).await
+    plan_copy(state, actor, template, destination, name.as_deref(), true).await
 }
 
 /// Commits the first versions of the files a copy made, as one commit credited to `actor`,

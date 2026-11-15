@@ -20,8 +20,8 @@ use std::io::Cursor;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use collab_core::ids::DocId;
-use common::{Site, TestUser, spawn_server};
+use collab_core::ids::{DocId, Seq};
+use common::{Site, TestClient, TestUser, spawn_server};
 use fake_icap::{Behaviour, FakeIcap, eicar};
 use image::{DynamicImage, ImageFormat, Rgb, RgbImage};
 use records::ScanState;
@@ -357,6 +357,12 @@ async fn templates_listed_from_the_sites_template_libraries() {
             vec!["Budget.xlsx", "Claim.pdf", "Letter.docx"],
         );
     }
+    // Nor copied for her, nor from the bin, for anyone.
+    let (status, _) =
+        from_template(&server, &vera, &documents, json!({ "template": secret })).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = from_template(&server, &root, &documents, json!({ "template": gone })).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
     let (_, listed) = templates(&server, &vera, &documents).await;
     let first = &listed[0];
     assert_eq!(first["id"], budget.as_str(), "{listed}");
@@ -868,4 +874,91 @@ async fn grid_listing_marks_thumbnails() {
     let (status, page) = grid(format!("/api/nodes/{album}/children?view=grid&limit=50")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(page["items"].as_array().unwrap().len(), 50);
+}
+
+#[tokio::test]
+async fn pending_editor_saves_not_offered_until_clean() {
+    let server = spawn_server().await;
+    let fake = FakeIcap::start(
+        local(),
+        Behaviour {
+            slow: Some(Duration::from_secs(6)),
+            ..Behaviour::default()
+        },
+    )
+    .unwrap();
+    let root = server.admin("Root").await;
+    let (status, body) = call(
+        &server,
+        &root,
+        Method::PUT,
+        "/api/settings/scanner",
+        Some(json!({ "scanner_url": fake.url() })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let olive = server.user("Olive").await;
+    let (site, documents) = site_and_library(&server, &root, "Team").await;
+    let templates_lib = new_library(&server, &root, &site, "Templates", "template").await;
+    grant(&server, &root, &site, &olive, "editor").await;
+
+    // A template written in the text editor: its save is not held, but not yet scanned.
+    let (status, body) = call(
+        &server,
+        &olive,
+        Method::POST,
+        "/api/docs",
+        Some(json!({ "parent": templates_lib, "name": "Minutes.txt", "editor": "text" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let minutes = body["id"].as_str().unwrap().to_owned();
+    let text = "Minutes of the meeting, a template still being scanned";
+    let mut writer = TestClient::connect_as(&server, doc_id(&minutes), &olive).await;
+    writer.type_at(0, text).await;
+    writer
+        .pump_until(|c| c.pending() == 0 && c.seq() == Seq(1))
+        .await;
+    writer.wait_saved(Seq(1)).await;
+    writer.close().await;
+    let info = server
+        .records_db()
+        .scan_state(&sha(text.as_bytes()))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(info.state, ScanState::Pending, "{info:?}");
+    assert!(!info.hold, "{info:?}");
+    // Elsewhere it is available, as editor saves are.
+    let (status, _) = download(&server, &olive, &minutes).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // As a template it is neither offered nor copied while pending.
+    assert!(template_names(&server, &olive, &documents).await.is_empty());
+    let (status, body) =
+        from_template(&server, &olive, &documents, json!({ "template": minutes })).await;
+    assert_eq!(status, StatusCode::LOCKED, "{body}");
+    assert_eq!(body["error"], "held");
+    assert_eq!(body["scan"], "pending");
+    assert!(names(&server, &olive, &documents).await.is_empty());
+    // The view and add checks come first.
+    let vera = server.user("Vera").await;
+    grant(&server, &root, &site, &vera, "viewer").await;
+    let (status, body) =
+        from_template(&server, &vera, &documents, json!({ "template": minutes })).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    // Once the scanner has judged it clean, it is offered and copied.
+    wait_scan(&server, text.as_bytes(), |s| s == ScanState::Clean).await;
+    assert_eq!(
+        template_names(&server, &olive, &documents).await,
+        vec!["Minutes.txt"]
+    );
+    let (status, body) =
+        from_template(&server, &olive, &documents, json!({ "template": minutes })).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let copy = body["node"]["id"].as_str().unwrap().to_owned();
+    let (status, bytes) = download(&server, &olive, &copy).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(bytes, text.as_bytes());
 }
