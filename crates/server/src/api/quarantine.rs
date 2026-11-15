@@ -1,6 +1,7 @@
 //! The organisation's quarantine, for administrators only: content the malware scanner found
-//! infected, or holds (a failed scan, or over its size limit), with the documents whose
-//! current version names it. Administrators release it (it becomes available, recorded with
+//! infected, or holds (a failed scan, over its size limit, or an upload still waiting for the
+//! scanner, which may be stuck there once the scanner setting is cleared), with the documents
+//! whose current version names it. Administrators release it (it becomes available, recorded with
 //! who and why) or delete it (every document whose current version names it is purged,
 //! skipping the recycle bin, and the content erased once nothing names it). They can also
 //! queue the content stored before scanning for the scanner.
@@ -35,7 +36,7 @@ pub(crate) struct DocumentOut {
 #[derive(Serialize)]
 pub(crate) struct EntryOut {
     sha256: String,
-    /// `infected`, `failed` or `too_large`.
+    /// `infected`, `failed`, `too_large` or `pending` (an upload held while it waits).
     scan: ScanState,
     /// The threat's name, when infected.
     threat: Option<String>,
@@ -85,9 +86,10 @@ fn sha256_of(text: &str) -> Result<[u8; 32], ApiError> {
     parse_hex(&text.to_ascii_lowercase()).ok_or(ApiError::NotFound)
 }
 
-/// `GET /api/admin/quarantine`: every content that is infected, or held by a failed scan or
-/// the size limit, that some document's current version names, with those documents and their
-/// paths; the most recently scanned first. Administrators only (`403`).
+/// `GET /api/admin/quarantine`: every content that is infected, or held by a failed scan, the
+/// size limit or waiting for the scanner (`pending`), that some document's current version
+/// names, with those documents and their paths; the most recently scanned first.
+/// Administrators only (`403`).
 pub(crate) async fn list(
     State(state): State<AppState>,
     signed: Signed,
@@ -157,7 +159,7 @@ pub(crate) async fn delete(
         .map_err(|e| ApiError::unavailable(&e))?;
     if !matches!(
         held,
-        Some(ScanState::Infected | ScanState::Failed | ScanState::TooLarge)
+        Some(ScanState::Infected | ScanState::Failed | ScanState::TooLarge | ScanState::Pending)
     ) {
         return Err(ApiError::NotFound);
     }

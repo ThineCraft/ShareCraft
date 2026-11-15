@@ -1584,6 +1584,7 @@ const HELD_REASONS = Object.freeze({
   infected: 'Threat found',
   failed: 'The scanner could not check it',
   too_large: 'Larger than the scanner takes',
+  pending: 'Waiting for the scanner',
 });
 
 /**

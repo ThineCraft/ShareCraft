@@ -1254,6 +1254,9 @@ test('quarantine_text_names_the_threat_as_text', () => {
     // Content held by a failed scan has no threat; it says why it is held.
     const failed = texts(libs.quarantineRow({ ...entry, scan: 'failed', threat: null }, () => {}));
     assert.ok(failed.some((t) => /scanner/i.test(t)));
+    // An upload held while it waits for the scanner says so in words.
+    const waiting = texts(libs.quarantineRow({ ...entry, scan: 'pending', threat: null, scanned_at: null }, () => {}));
+    assert.ok(waiting.some((t) => t.includes('Waiting for the scanner')));
   } finally {
     delete globalThis.document;
   }

@@ -4,12 +4,14 @@
 //! New content is `pending` when a scanner is configured and `unscanned` when not; the scan
 //! worker moves it on to `clean`, `infected` (with the threat's name), `failed` (retried after
 //! 1, 5, 15 and then every 60 minutes) or `too_large`. An administrator may release content
-//! (`released`). Content is available when it is clean, released or unscanned; when it failed
-//! or is too large and the matching setting lets it through; when it is pending and only ever
-//! came from an editor's save, or was queued by "scan existing files" (`scan_hold` false: an
-//! upload naming it sets the hold). Clearing the scanner setting releases nothing: held content
-//! stays held, as when the scanner is down. Content stored while no scanner is configured is
-//! `unscanned`, and available.
+//! (`released`). Content is available when it is clean, released or unscanned. Content an
+//! upload named (`scan_hold`: an upload naming it sets the hold) is held while pending, and
+//! when it failed or is too large unless the matching setting lets it through. Content no
+//! upload ever named (an editor's save, content queued by "scan existing files") stays
+//! available whatever its scan state, until it is found infected: a scanner outage never
+//! locks what the editors saved. Infected content is never available. Clearing the scanner
+//! setting releases nothing: held content stays held, as when the scanner is down. Content
+//! stored while no scanner is configured is `unscanned`, and available.
 //!
 //! A `blobs` row is written here in a short transaction of its own, never while holding any
 //! other lock.
@@ -28,7 +30,7 @@ use crate::{AccessError, Db, DbError};
 
 /// The scanner's address, `icap://host[:port]/service`; empty for none.
 pub const SCANNER_URL: &str = "scanner_url";
-/// How long the scanner may take over any one step of a scan, in seconds (5 to 3600; 120).
+/// How long the scanner may take over a whole scan, in seconds (5 to 3600; 120).
 pub const SCANNER_TIMEOUT_SECONDS: &str = "scanner_timeout_seconds";
 /// The largest content sent to the scanner, in bytes (2 GiB by default).
 pub const SCANNER_MAX_BYTES: &str = "scanner_max_bytes";
@@ -351,8 +353,8 @@ impl ScannerSettings {
             ScanState::Clean | ScanState::Released | ScanState::Unscanned => true,
             ScanState::Infected => false,
             ScanState::Pending => !hold,
-            ScanState::Failed => self.unavailable_allow,
-            ScanState::TooLarge => self.too_large_allow,
+            ScanState::Failed => !hold || self.unavailable_allow,
+            ScanState::TooLarge => !hold || self.too_large_allow,
         }
     }
 }
@@ -670,7 +672,9 @@ impl Db {
     }
 
     /// At most `limit` contents due for the scanner as of `now`: pending or failed, due, and
-    /// named by some version (or a claim), the longest waiting first.
+    /// named by some version (or a claim); held content (an upload's) before any other, so the
+    /// backlog "scan existing files" queues never keeps uploads waiting, then the longest
+    /// waiting first.
     pub async fn due_scans(
         &self,
         now: OffsetDateTime,
@@ -684,7 +688,7 @@ impl Db {
              where b.scan in ('pending', 'failed') \
                and coalesce(b.next_scan_at, '-infinity') <= $1 \
                and exists (select 1 from blob_refs r where r.sha256 = b.sha256) \
-             order by b.next_scan_at nulls first, b.sha256 limit $2",
+             order by b.scan_hold desc, b.next_scan_at nulls first, b.sha256 limit $2",
         )
         .bind(now)
         .bind(limit)
@@ -813,9 +817,11 @@ impl Db {
         Ok(documents)
     }
 
-    /// The organisation's quarantine, for administrators: content that is infected, or held by
-    /// a failed scan or the size limit, that some document's current version names, each with
-    /// those documents and their paths. The most recently scanned first.
+    /// The organisation's quarantine, for administrators: content that is infected, held by a
+    /// failed scan or the size limit, or held while pending (an upload waiting for the
+    /// scanner, or stuck after the scanner setting was cleared), that some document's current
+    /// version names, each with those documents and their paths. The most recently scanned
+    /// first.
     pub async fn quarantine_list(&self) -> Result<Vec<QuarantineEntry>, DbError> {
         type Row = (
             String,
@@ -828,6 +834,7 @@ impl Db {
         let rows: Vec<Row> = sqlx::query_as(
             "select b.sha256, b.scan, b.scan_detail, b.size, b.scanned_at, b.scan_hold \
              from blobs b where b.scan in ('infected', 'failed', 'too_large') \
+                or (b.scan = 'pending' and b.scan_hold) \
              order by b.scanned_at desc nulls last, b.sha256",
         )
         .fetch_all(self.pool())
@@ -907,9 +914,15 @@ mod tests {
         };
         assert!(configured.available(ScanState::Pending, false));
         assert!(!configured.available(ScanState::Pending, true));
-        assert!(!configured.available(ScanState::Failed, false));
-        assert!(!configured.available(ScanState::TooLarge, false));
+        // Content no upload named (an editor's save, queued existing content) stays available
+        // when its scan fails or it is too large; held content does not.
+        assert!(configured.available(ScanState::Failed, false));
+        assert!(configured.available(ScanState::TooLarge, false));
+        assert!(!configured.available(ScanState::Failed, true));
+        assert!(!configured.available(ScanState::TooLarge, true));
         assert!(!configured.available(ScanState::Infected, false));
+        // Templates are offered only once judged, held or not.
+        assert!(!configured.offers_template(ScanState::Failed));
         assert!(configured.available(ScanState::Released, true));
         let allowing = ScannerSettings {
             unavailable_allow: true,

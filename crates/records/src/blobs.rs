@@ -38,13 +38,23 @@ fn size_of(blob: &BlobRef) -> i64 {
     i64::try_from(blob.size).unwrap_or(i64::MAX)
 }
 
-/// Creates the row of `blob` if there is none.
+/// Creates the row of `blob`, named by a revision recorded from Git, if there is none: when a
+/// scanner is configured, `pending` and held (`scan_hold`) until it is scanned, since its scan
+/// verdict, if it ever had one, lived only in a database that has been lost or restored from
+/// an older backup; `unscanned` otherwise. An existing row is left as it is.
 async fn upsert_blob(conn: &mut PgConnection, blob: &BlobRef) -> Result<(), sqlx::Error> {
-    sqlx::query("insert into blobs (sha256, size) values ($1, $2) on conflict (sha256) do nothing")
-        .bind(blob.hex())
-        .bind(size_of(blob))
-        .execute(&mut *conn)
-        .await?;
+    sqlx::query(
+        "insert into blobs (sha256, size, scan, next_scan_at, scan_hold) \
+         select $1, $2, case when s then 'pending' else 'unscanned' end, \
+                case when s then now() end, s \
+         from (select coalesce((select value #>> '{}' from settings \
+                                where key = 'scanner_url'), '') <> '' as s) configured \
+         on conflict (sha256) do nothing",
+    )
+    .bind(blob.hex())
+    .bind(size_of(blob))
+    .execute(&mut *conn)
+    .await?;
     Ok(())
 }
 
@@ -206,8 +216,9 @@ impl Db {
         Ok(())
     }
 
-    /// Records that `revision` of `doc` names `blob`: creates the blob's row if absent and the
-    /// completed row unless it exists. Used when a revision is recorded from Git.
+    /// Records that `revision` of `doc` names `blob`: creates the blob's row if absent (held
+    /// for the scanner when one is configured, see `upsert_blob`) and the completed row unless
+    /// it exists. Used when a revision is recorded from Git.
     pub async fn record_blob_ref(
         &self,
         doc: DocId,
