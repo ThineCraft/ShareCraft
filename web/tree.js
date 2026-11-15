@@ -252,9 +252,10 @@ export function parseCut(text) {
  * (a `ul[role=tree]`), expanded down to `path` (the steps from the library to the folder shown,
  * which is marked selected). A folder's children are fetched when it is expanded; which folders
  * were expanded is kept for the tab. Enter or a click opens a folder. `onDraw` runs after every
- * redraw. Returns `{ node(id), ancestry(id), refresh(), reveal() }`.
+ * redraw; `onOpen(node)` may open a folder itself (answering true). Returns `{ node(id),
+ * ancestry(id), refresh(), reveal(), show(id, steps) }`.
  */
-export function mountFolderTree({ list, root, path, currentId, onDraw = () => {} }) {
+export function mountFolderTree({ list, root, path, currentId, onDraw = () => {}, onOpen = () => false }) {
   const key = `sharecraft-tree-${root.id}`;
   let model = treeModel(root);
   let focusId = currentId;
@@ -323,7 +324,9 @@ export function mountFolderTree({ list, root, path, currentId, onDraw = () => {}
 
   function open(id) {
     const at = model.nodes[id];
-    if (at && id !== currentId) location.assign(pageFor(at.kind, at.id));
+    if (!at || id === currentId) return;
+    // The page may open the folder itself (it does while uploads run); otherwise it is loaded.
+    if (!onOpen(at)) location.assign(pageFor(at.kind, at.id));
   }
 
   /** The tree drawn again from the model; focus stays on the focused row when it was in the tree. */
@@ -446,5 +449,12 @@ export function mountFolderTree({ list, root, path, currentId, onDraw = () => {}
     expand: (id) => expand(id),
     refresh,
     reveal,
+    /** Marks `id` as the folder shown (opened in the page, with `steps` its path) and reveals it. */
+    show(id, steps) {
+      currentId = id;
+      focusId = id;
+      path = steps;
+      return reveal();
+    },
   };
 }

@@ -253,7 +253,7 @@ test('a name conflict asks once and applies a choice to the rest when asked', as
   });
   const outcomes = await queue.run([fileOf('x.pdf', 5), fileOf('y.pdf', 5)]);
   assert.equal(asked.length, 1);
-  assert.deepEqual(asked[0], { name: 'x.pdf', suggested: 'x (2).pdf' });
+  assert.deepEqual({ name: asked[0].name, suggested: asked[0].suggested }, { name: 'x.pdf', suggested: 'x (2).pdf' });
   assert.deepEqual(outcomes.map((o) => o.status), ['done', 'done']);
   assert.deepEqual(outcomes[0].kept, { from: 'x.pdf', to: 'x (2).pdf' });
   const finishes = server.log.filter((call) => call.url.startsWith('/api/uploads/sess/finish')).map((call) => call.url);
@@ -615,4 +615,105 @@ test('a finished upload the scanner holds says it is being checked', async () =>
   assert.ok(!done.checking);
   assert.equal(outcomeNote(done), 'Uploaded.');
   assert.equal(plain.log.at(-1).url, '/api/uploads/sess/finish');
+});
+
+// ---- pausing and cancelling one file ----
+
+test('a pause between chunks keeps the session, so a resume carries on from it', async () => {
+  const server = stubServer();
+  let queue;
+  queue = queueFor(server, {
+    onChange: (outcome) => {
+      if (outcome.status === 'uploading' && outcome.sent === 8 * MIB) queue.halt(outcome, 'pause');
+    },
+  });
+  const outcome = UploadQueue.outcomeFor(fileOf('x.pdf', 20 * MIB));
+  await queue.runOne(outcome);
+  assert.equal(outcome.status, 'paused');
+  assert.equal(outcome.keep, true);
+  assert.equal(outcome.sessionId, 'sess');
+  assert.equal(server.log.filter((call) => call.method === 'PUT').length, 1);
+  assert.ok(!server.log.some((call) => call.method === 'DELETE'), 'the session is kept');
+  // resumed: the server is asked what it holds and only the rest is sent
+  const again = UploadQueue.outcomeFor({ ...fileOf('x.pdf', 20 * MIB), resumeId: 'sess', parentId: 'lib' });
+  await queueFor(server).runOne(again);
+  assert.equal(again.status, 'done');
+  assert.equal(server.log.filter((call) => call.method === 'PUT').length, 3);
+});
+
+test('a cancel between chunks gives the session back', async () => {
+  const server = stubServer();
+  let queue;
+  queue = queueFor(server, {
+    onChange: (outcome) => {
+      if (outcome.status === 'uploading' && outcome.sent === 8 * MIB) queue.halt(outcome, 'cancel');
+    },
+  });
+  const outcome = UploadQueue.outcomeFor(fileOf('x.pdf', 20 * MIB));
+  await queue.runOne(outcome);
+  assert.equal(outcome.status, 'cancelled');
+  assert.equal(outcome.keep, false);
+  assert.ok(server.log.some((call) => call.method === 'DELETE' && call.url === '/api/uploads/sess'));
+});
+
+test('a chunk on its way is broken off when the file is halted', async () => {
+  const server = stubServer();
+  let queue;
+  let signal = null;
+  const fetch = async (url, init = {}) => {
+    if (init.method === 'PUT' && !signal) {
+      signal = init.signal;
+      queue.halt(outcome, 'pause');
+      assert.equal(signal.aborted, true);
+      throw new DOMException('aborted', 'AbortError');
+    }
+    return server.fetch(url, init);
+  };
+  queue = queueFor({ fetch });
+  const outcome = UploadQueue.outcomeFor(fileOf('x.pdf', 20 * MIB));
+  await queue.runOne(outcome);
+  assert.equal(outcome.status, 'paused');
+  assert.equal(outcome.keep, true);
+});
+
+test('a cancel while the file is being checked sends nothing', async () => {
+  const server = stubServer();
+  let queue;
+  const hash = async (file, onProgress) => {
+    queue.halt(outcome, 'cancel');
+    onProgress(8 * MIB);
+    return HASH;
+  };
+  queue = queueFor(server, { hash });
+  const outcome = UploadQueue.outcomeFor(fileOf('x.pdf', 20 * MIB));
+  await queue.runOne(outcome);
+  assert.equal(outcome.status, 'cancelled');
+  assert.equal(server.log.length, 0);
+});
+
+test('a name question waits in the row and a cancel answers it', async () => {
+  const server = stubServer({ finish: () => json(409, { error: 'name_taken', suggested: 'x (2).pdf' }) });
+  let queue;
+  const seen = [];
+  queue = queueFor(server, {
+    onChange: (outcome) => seen.push(outcome.status),
+    resolve: ({ outcome }) => {
+      setTimeout(() => queue.halt(outcome, 'cancel'), 0);
+      return new Promise(() => {}); // never answered
+    },
+  });
+  const outcome = UploadQueue.outcomeFor(fileOf('x.pdf', 5));
+  await queue.runOne(outcome);
+  assert.ok(seen.includes('conflict'));
+  assert.equal(outcome.suggested, 'x (2).pdf');
+  assert.equal(outcome.status, 'cancelled');
+  assert.ok(server.log.some((call) => call.method === 'DELETE'));
+});
+
+test('a finished upload knows its document, for Open', async () => {
+  const server = stubServer();
+  const outcome = UploadQueue.outcomeFor(fileOf('x.pdf', 5));
+  await queueFor(server).runOne(outcome);
+  assert.equal(outcome.docId, 'doc1');
+  assert.equal(outcome.editor, 'pdf');
 });

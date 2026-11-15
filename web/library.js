@@ -5,9 +5,11 @@
 import { EDITORS, newDocEditors, withExtension } from './editor-host.js';
 import {
   api,
+  breadcrumbs,
   bulkSummary,
   can,
   canPlaceHere,
+  confirmDialog,
   formatDate,
   formatSize,
   h,
@@ -34,17 +36,8 @@ import {
   siteChrome,
   typeListText,
 } from './common.js';
-import {
-  CONFLICT_CHOICES,
-  UploadQueue,
-  conflictQuestion,
-  filesFromDrop,
-  filesFromPicker,
-  outcomeNote,
-  progressOf,
-  progressText,
-  uploadsSummary,
-} from './upload.js';
+import { filesFromDrop, filesFromPicker } from './upload.js';
+import { createUploads, mountUploadTray } from './upload-tray.js';
 import { setupMenu } from './menu.js';
 import { sidebar } from './workspace.js';
 import { runLatestAction, showToast } from './toast.js';
@@ -74,27 +67,24 @@ const MISSING = 'This folder does not exist, or you do not have access to it.';
 
 const me = await requireMe();
 setupTopbar(me, error);
-const nodeId = queryId(location.search);
+// The folder shown. While uploads run, another folder of the same library is opened in this
+// page (see switchTo), so these change; everything else about the library stays.
+let nodeId = queryId(location.search);
 if (!nodeId) fail(MISSING);
-const here = await showCrumbs($('crumbs'), nodeId, { linkLast: false });
+let here = await showCrumbs($('crumbs'), nodeId, { linkLast: false });
 if (!here) {
   offerRequest(error, nodeId);
   fail(MISSING);
 }
-const self = here.path[here.path.length - 1];
+let self = here.path[here.path.length - 1];
 if (self.kind === 'site' || self.kind === 'document') {
   location.replace(pageFor(self.kind, self.id));
   await new Promise(() => {});
 }
-$('title').textContent = self.name;
-document.title = `${self.name} — ShareCraft`;
 // The library this place is in, with its kind and settings (a folder is judged by its library).
 const libraryStep = here.path.find((step) => step.kind === 'library');
 const libraryInfo = libraryStep ? await api('GET', `/libraries/${seg(libraryStep.id)}`) : null;
 const library = libraryInfo?.ok ? libraryInfo.data : null;
-$('kind').textContent =
-  (self.kind === 'library' ? libraryKindLabel(library?.kind) : 'Folder') +
-  (here.access ? ` · ${roleLine(here.access)}` : ' · Limited access');
 if (library?.description) {
   $('library-description').textContent = library.description;
   $('library-description').hidden = false;
@@ -108,25 +98,18 @@ if (library?.blocked_types?.length) accepts.push(`Does not take ${typeListText(l
 if (typeof library?.max_file_bytes === 'number') accepts.push(`Files up to ${formatSize(library.max_file_bytes)}.`);
 $('accepts').textContent = accepts.join(' ');
 $('drop-accepts').textContent = accepts.join(' ');
-const manageSite = can(here.access, 'manage_site') && libraryStep !== undefined;
 // The library-level links live in the More menu; an entry the person may not use is left out.
 const showEntry = (id, shown) => {
   $(id).hidden = !shown;
   $(id).closest('li').hidden = !shown;
 };
-showEntry('settings-link', manageSite);
 if (libraryStep) $('settings-link').href = `/library-settings.html?id=${seg(libraryStep.id)}`;
-showEntry('access-link', can(here.access, 'manage_access'));
-showEntry('explorer-link', can(here.access, 'manage_access'));
-$('explorer-link').href = `/explorer.html?root=${seg(nodeId)}`;
-$('access-link').href = `/access.html?id=${seg(nodeId)}`;
+let canAdd = false;
+showPlace();
 await siteChrome(here.path[0].id, { currentId: here.path.find((step) => step.kind === 'library')?.id, footer: true });
 
 $('bin-link').href = `/bin.html?site=${seg(here.path[0].id)}`;
 const siteId = here.path[0].id;
-const canAdd = can(here.access, 'add');
-$('accepts').hidden = !canAdd || accepts.length === 0;
-$('drop-target').textContent = self.name;
 setupMenu($('more-button'), $('more-menu'));
 
 // Everything the code below reads while the page is drawn is declared here, before the first
@@ -134,16 +117,20 @@ setupMenu($('more-button'), $('more-menu'));
 let items = [];
 let next = null;
 const selected = new Set(); // ids of the checked items
-const uploads = []; // every upload shown in the panel, as the queue reports it
-let uploadChain = Promise.resolve(); // uploads run one batch at a time
+// The uploads, in the tray at the bottom-right: they run whichever folder is on screen.
+const uploads = createUploads({
+  site: siteId,
+  release: (session) => api('DELETE', `/uploads/${seg(session)}`),
+  onChange: (entry) => tray.changed(entry),
+  onIdle: () => uploadsIdle(),
+});
+const tray = mountUploadTray({ uploads, openFolder: (id) => switchTo(id), confirm: confirmDialog });
+let switching = 0; // the latest folder asked for by switchTo; older answers are dropped
 let moving = []; // the items the move or copy dialog is for
 let moveMode = 'move';
 let trail = [];
 let moveRequest = 0; // the latest listing asked for; older answers are dropped
 let renaming = null;
-const uploadRows = new Map(); // outcome -> its list item
-const dirtyUploads = new Set(); // outcomes to redraw at the next frame
-let drawScheduled = false;
 const views = libraryViews(library?.kind);
 let view = 'list'; // 'grid' only in an image library
 let watcher = null; // loads a tile's thumbnail when it scrolls into view
@@ -578,7 +565,6 @@ function note(text, isError) {
 function setupNewMenu() {
   $('new-wrap').hidden = !canAdd;
   $('drop-hint').hidden = !canAdd;
-  if (!canAdd) return;
   const entries = newMenu({ folders: library?.folders, editors: docEditors, templates: templates.length });
   $('new-menu').replaceChildren(
     ...entries.map(({ key, label }) => {
@@ -675,14 +661,6 @@ $('pick-folder').addEventListener('change', (event) => {
   startUploads(filesFromPicker(event.target.files));
   event.target.value = '';
 });
-$('uploads-clear').addEventListener('click', () => {
-  for (let at = uploads.length - 1; at >= 0; at -= 1) {
-    if (['waiting', 'hashing', 'uploading'].includes(uploads[at].status)) continue;
-    forgetUpload(uploads[at]);
-  }
-  drawUploads();
-});
-
 // Files and folders dropped anywhere on the page go into this library or folder.
 // Items dragged from the table carry their own type (see tree.js), so they never open the overlay.
 const hasFiles = (event) => isFileDrag(event.dataTransfer?.types);
@@ -701,140 +679,98 @@ document.addEventListener('drop', async (event) => {
   startUploads(await filesFromDrop(event.dataTransfer));
 });
 
-/** Queues `files` (from a drop or a picker) behind any upload still running. */
+/** Queues `files` (from a drop or a picker) for the folder on screen, behind any still running. */
 function startUploads(files) {
   if (files.length === 0) return;
   note('', false);
-  const queue = new UploadQueue({
-    parent: nodeId,
-    site: siteId,
-    checkScans: true,
-    onChange: (outcome) => {
-      if (!uploads.includes(outcome)) uploads.push(outcome);
-      dirtyUploads.add(outcome);
-      scheduleDraw();
-    },
-    resolve: askConflict,
-  });
-  uploadChain = uploadChain
-    .then(() => queue.run(files))
-    .then(() => reload())
-    .catch(() => {});
+  uploads.add(files, { id: nodeId, name: self.name });
 }
 
-/** Redraws the panel at the next frame, once, however many changes came in (chunks arrive fast). */
-function scheduleDraw() {
-  if (drawScheduled) return;
-  drawScheduled = true;
-  const later = globalThis.requestAnimationFrame ?? ((fn) => setTimeout(fn, 50));
-  later(() => {
-    drawScheduled = false;
-    drawUploads();
-  });
+/** Every upload has stopped: the tray sums up and the folder on screen shows what arrived. */
+function uploadsIdle() {
+  tray.idle();
+  const arrived = uploads.entries.filter((entry) => entry.status === 'done');
+  if (arrived.some((entry) => entry.destination.id === nodeId)) reload();
+  else if (arrived.length) tree?.refresh();
 }
 
-/** Draws only the rows that changed; a row whose words are the same just moves its bar. */
-function drawUploads() {
-  $('upload-panel').hidden = uploads.length === 0;
-  for (const outcome of dirtyUploads) {
-    if (!uploads.includes(outcome)) continue;
-    const row = uploadRows.get(outcome);
-    if (!row) {
-      const made = uploadRow(outcome);
-      uploadRows.set(outcome, made);
-      $('uploads').append(made.item);
-    } else if (row.key !== uploadKey(outcome)) {
-      const made = uploadRow(outcome);
-      row.item.replaceChildren(...made.item.childNodes);
-      uploadRows.set(outcome, { ...made, item: row.item });
-    } else {
-      const bar = progressOf(outcome);
-      if (bar && row.bar) {
-        row.bar.max = bar.max;
-        row.bar.value = bar.value;
-      }
-      if (row.text) row.text.textContent = uploadText(outcome);
-    }
+// Leaving the page would stop the uploads, so the browser asks first.
+addEventListener('beforeunload', (event) => {
+  if (uploads.active() === 0) return;
+  event.preventDefault();
+  event.returnValue = '';
+});
+
+// While uploads run, a folder of this library opens in this page, so that they carry on.
+document.addEventListener('click', (event) => {
+  if (uploads.active() === 0 || event.defaultPrevented) return;
+  if (event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+  const link = event.target.closest?.('a[href]');
+  if (!link || link.target || link.hasAttribute('download')) return;
+  const url = new URL(link.href, location.href);
+  if (url.origin !== location.origin || url.pathname !== '/library.html') return;
+  const id = queryId(url.search);
+  if (!id) return;
+  event.preventDefault();
+  switchTo(id);
+});
+history.replaceState({ place: nodeId }, '');
+addEventListener('popstate', () => {
+  const id = queryId(location.search);
+  if (id && id !== nodeId) switchTo(id, { push: false });
+});
+
+/**
+ * Shows the folder `id` in this page when it is in the same library (anywhere else is opened
+ * the usual way): its breadcrumb, title, what may be done there and its contents.
+ */
+async function switchTo(id, { push = true } = {}) {
+  if (id === nodeId) {
+    await reload();
+    $('title').focus();
+    return;
   }
-  dirtyUploads.clear();
-  // Announced when the counts change, not for every chunk.
-  const summary = uploadsSummary(uploads);
-  if ($('upload-summary').textContent !== summary) $('upload-summary').textContent = summary;
+  const ask = (switching += 1);
+  const found = await api('GET', `/nodes/${seg(id)}`);
+  if (ask !== switching) return;
+  const path = found.ok ? found.data.path : null;
+  const last = path?.at(-1);
+  const inLibrary = last && ['library', 'folder'].includes(last.kind) && libraryStep && path.some((step) => step.id === libraryStep.id);
+  if (!inLibrary) {
+    location.assign(last ? pageFor(last.kind, last.id) : `/library.html?id=${seg(id)}`);
+    return;
+  }
+  if (push) history.pushState({ place: id }, '', pageFor(last.kind, id));
+  nodeId = id;
+  here = { path, access: found.data.access };
+  self = last;
+  $('crumbs').replaceChildren(breadcrumbs(path, { linkLast: false }));
+  markCrumbs();
+  note('', false);
+  showPlace();
+  tree?.show(id, path.slice(path.findIndex((step) => step.id === libraryStep.id)));
+  await reload();
+  scrollTo(0, 0);
+  $('title').focus();
 }
 
-/** Drops a row. A kept session that is not going to be resumed is given back to the server. */
-function forgetUpload(outcome, { release = true } = {}) {
-  if (release && outcome.keep && outcome.sessionId) api('DELETE', `/uploads/${seg(outcome.sessionId)}`);
-  uploads.splice(uploads.indexOf(outcome), 1);
-  uploadRows.get(outcome)?.item.remove();
-  uploadRows.delete(outcome);
-}
-
-/** What decides whether a row must be built again: anything but the bytes sent so far. */
-const uploadKey = (outcome) => `${outcome.status}|${outcome.message}|${outcome.retry}|${outcome.name}`;
-
-function uploadText(outcome) {
-  if (outcome.status === 'waiting') return 'Waiting';
-  if (outcome.status === 'hashing') return `Checking the file… ${progressText(outcome.hashed ?? 0, outcome.size)}`;
-  if (outcome.status === 'uploading') return progressText(outcome.sent, outcome.size);
-  return outcomeNote(outcome);
-}
-
-function uploadRow(outcome) {
-  const path = outcome.file.path?.length ? `${outcome.file.path.join(' / ')} / ` : '';
-  const text = h('small', {}, uploadText(outcome));
-  const progress = progressOf(outcome);
-  const bar =
-    progress && progress.max > 0
-      ? h('progress', { max: progress.max, value: progress.value, 'aria-label': `Progress of ${outcome.name}` })
-      : null;
-  const again = outcome.retry
-    ? h('button', { type: 'button', class: 'plain' }, outcome.keep ? 'Try again' : 'Upload again')
-    : null;
-  again?.addEventListener('click', () => {
-    forgetUpload(outcome, { release: false });
-    // A kept session only needs its finish sent again; otherwise the file goes up afresh.
-    startUploads([
-      outcome.keep
-        ? { ...outcome.file, resumeId: outcome.sessionId, resumeChoice: outcome.choice, parentId: outcome.parentId }
-        : outcome.file,
-    ]);
-  });
-  const item = h(
-    'li',
-    {},
-    h('span', { class: 'grow' }, h('strong', {}, `${path}${outcome.name}`), h('br'), text),
-    bar,
-    outcome.status === 'failed' ? h('small', { class: 'mark' }, 'Not uploaded') : null,
-    again,
-  );
-  return { item, text, bar, key: uploadKey(outcome) };
-}
-
-// The question asked when a name is taken: Replace, Keep both or Skip, for this file or the rest.
-const conflictDialog = $('conflict-dialog');
-function askConflict({ name, suggested }) {
-  return new Promise((resolve) => {
-    $('conflict-text').textContent = conflictQuestion(name, suggested);
-    $('conflict-all').checked = false;
-    let choice = 'skip'; // Escape skips this file only
-    let clicked = false;
-    for (const { value } of CONFLICT_CHOICES) {
-      const id = { replace: 'conflict-replace', keep_both: 'conflict-keep', skip: 'conflict-skip' }[value];
-      $(id).onclick = () => {
-        choice = value;
-        clicked = true;
-        conflictDialog.close();
-      };
-    }
-    // "Do this for the rest" counts only when a button was clicked, never for Escape.
-    conflictDialog.addEventListener(
-      'close',
-      () => resolve({ choice, all: clicked && $('conflict-all').checked }),
-      { once: true },
-    );
-    conflictDialog.showModal();
-  });
+/** The parts of the page that belong to the folder shown: title, role, links, New and drop. */
+function showPlace() {
+  $('title').textContent = self.name;
+  document.title = `${self.name} — ShareCraft`;
+  $('kind').textContent =
+    (self.kind === 'library' ? libraryKindLabel(library?.kind) : 'Folder') +
+    (here.access ? ` · ${roleLine(here.access)}` : ' · Limited access');
+  showEntry('settings-link', can(here.access, 'manage_site') && libraryStep !== undefined);
+  showEntry('access-link', can(here.access, 'manage_access'));
+  showEntry('explorer-link', can(here.access, 'manage_access'));
+  $('explorer-link').href = `/explorer.html?root=${seg(nodeId)}`;
+  $('access-link').href = `/access.html?id=${seg(nodeId)}`;
+  canAdd = can(here.access, 'add');
+  $('accepts').hidden = !canAdd || accepts.length === 0;
+  $('drop-target').textContent = self.name;
+  $('new-wrap').hidden = !canAdd;
+  $('drop-hint').hidden = !canAdd;
 }
 
 // ---- rename ----
@@ -1108,6 +1044,12 @@ function setupTree() {
     currentId: nodeId,
     onDraw: () => {
       dropAt = null;
+    },
+    // While uploads run, a folder chosen in the tree opens in this page.
+    onOpen: (node) => {
+      if (uploads.active() === 0) return false;
+      switchTo(node.id);
+      return true;
     },
   });
   tree.reveal();

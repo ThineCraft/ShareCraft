@@ -949,6 +949,45 @@ dialog.details-sheet[open]{animation:sheet-in .2s ease-out}
  .toast .toast-action,.toast .toast-close{min-height:44px;min-width:44px}
 }
 @media (forced-colors:active){.toast{border:1px solid CanvasText;border-left-width:4px}}
+/* the upload tray (upload-tray.js): docked at the bottom-right, a bottom sheet on phones; like
+   the toasts it is never themed by a site look */
+.upload-tray{position:fixed;right:16px;bottom:max(16px,env(safe-area-inset-bottom));z-index:55;display:flex;flex-direction:column;width:min(420px,calc(100vw - 32px));max-height:min(70vh,560px);border:1px solid var(--line);border-radius:10px;background:var(--paper);color:var(--text);box-shadow:0 10px 30px rgb(0 0 0/.22);overflow:hidden;--accent:#3156c9;--accent-ink:light-dark(#3156c9,#9db4ff);--on-accent:#fff;--soft:color-mix(in srgb,var(--accent) 11%,var(--paper))}
+.upload-tray[hidden]{display:none}
+body:has(>.upload-tray:not([hidden])){padding-bottom:110px}
+.tray-head{display:flex;align-items:flex-start;gap:4px 6px;padding:10px 8px 10px 14px;border-bottom:1px solid var(--line)}
+.upload-tray.minimised .tray-head{border-bottom:0}
+.tray-heading{flex:1;min-width:0}
+.tray-title{margin:0;font-size:14px;line-height:1.35;font-weight:600;overflow-wrap:anywhere}
+.tray-progress{display:block;width:100%;max-width:none;margin:6px 0 0}
+.tray-link{display:inline-block;margin-top:6px;font-size:13px}
+.tray-head button{flex:none;min-height:32px;padding:2px 10px;font-size:13px}
+.tray-head .tray-close{min-width:32px;padding:0;font-size:18px;line-height:1;color:var(--muted)}
+.tray-list{list-style:none;margin:0;padding:0;overflow-y:auto;overscroll-behavior:contain}
+.tray-list[hidden]{display:none}
+.tray-row{display:flex;align-items:flex-start;gap:8px;padding:8px 8px 8px 12px}
+.tray-row:nth-child(even){background:var(--band)}
+.tray-icon{flex:none;display:grid;place-items:center;width:24px;height:24px;font-weight:700}
+.tray-icon svg{width:22px;height:22px}
+.tray-tick{color:var(--ok)}
+.tray-bad{color:var(--stop-ink)}
+.tray-main{flex:1;min-width:0}
+.tray-main p{margin:0}
+.tray-name{font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tray-where,.tray-stats,.tray-note{font-size:12px;color:var(--muted);overflow-wrap:anywhere}
+.tray-main progress{display:block;width:100%;max-width:none;margin:4px 0 2px}
+.tray-error{font-size:12px;color:var(--stop-ink);overflow-wrap:anywhere}
+.tray-conflict{margin-top:6px;font-size:12px}
+.tray-conflict .check{min-height:28px;font-size:12px}
+.tray-choices{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0 2px}
+.tray-choices button{min-height:30px;padding:2px 10px;font-size:12px}
+.tray-actions{flex:none;display:flex;flex-direction:column;align-items:stretch;gap:4px}
+.tray-actions :is(button,.button){min-height:28px;padding:2px 10px;font-size:12px}
+@media (max-width:760px){
+ .upload-tray{left:0;right:0;bottom:0;width:auto;max-height:70vh;border-width:1px 0 0;border-radius:12px 12px 0 0;padding-bottom:env(safe-area-inset-bottom)}
+ .tray-head button,.tray-actions :is(button,.button),.tray-choices button,.tray-conflict .check{min-height:44px}
+ .tray-head .tray-close{min-width:44px}
+}
+@media (forced-colors:active){.upload-tray{border:1px solid CanvasText}}
 /* the Admin centre (admin-shell.js): a left column of sections from 800 pixels, a Section menu
    below that; the directory-like lists share a search header and an empty state */
 .page.admin-page{max-width:1140px}

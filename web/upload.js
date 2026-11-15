@@ -178,6 +178,14 @@ const unreadable = (e) => ['NotReadableError', 'NotFoundError', 'SecurityError']
 const readFailure = (name) =>
   `“${name}” could not be read. It may have been moved, deleted or be in use by another program. Check it and pick it again.`;
 
+/** Thrown when the person pauses or cancels a file: `kind` is 'pause' or 'cancel'. */
+class Halt extends Error {
+  constructor(kind) {
+    super(kind);
+    this.kind = kind;
+  }
+}
+
 class Stop extends Error {
   /** `keep`: the session is still open and a retry can finish it; `ended`: nothing to give back. */
   constructor(message, retry = false, { keep = false, ended = false } = {}) {
@@ -223,9 +231,9 @@ export class UploadQueue {
     this.folders = new Map();
   }
 
-  /** Uploads `files` in order; resolves with one outcome per file, never rejects. */
-  async run(files) {
-    const outcomes = files.map((file) => ({
+  /** The outcome a file starts with (`status` 'waiting'); `runOne` fills it in. */
+  static outcomeFor(file) {
+    return {
       file,
       name: file.name,
       size: file.size,
@@ -235,20 +243,57 @@ export class UploadQueue {
       renamed: null,
       kept: null,
       retry: false,
-    }));
+    };
+  }
+
+  /** Uploads `files` in order; resolves with one outcome per file, never rejects. */
+  async run(files) {
+    const outcomes = files.map((file) => UploadQueue.outcomeFor(file));
     for (const outcome of outcomes) this.onChange(outcome);
-    for (const outcome of outcomes) {
-      try {
-        await this.#one(outcome);
-      } catch (e) {
+    for (const outcome of outcomes) await this.runOne(outcome);
+    return outcomes;
+  }
+
+  /**
+   * Uploads the one file of `outcome` (made by `outcomeFor`); never rejects. A file halted with
+   * `halt` ends 'paused' (its session kept when it has one, so a later run with `resumeId`
+   * carries on) or 'cancelled' (its session given back).
+   */
+  async runOne(outcome) {
+    outcome.halt = null;
+    outcome.abort = typeof AbortController === 'function' ? new AbortController() : null;
+    try {
+      await this.#one(outcome);
+    } catch (e) {
+      if (e instanceof Halt) {
+        const paused = e.kind === 'pause';
+        Object.assign(outcome, { status: paused ? 'paused' : 'cancelled', message: '', retry: false });
+        outcome.keep = paused && Boolean(outcome.sessionId);
+        if (!outcome.keep) outcome.sessionId = undefined;
+      } else {
         outcome.status = 'failed';
         outcome.message = e instanceof Stop ? e.message : unreadable(e) ? readFailure(outcome.name) : messageFor('unknown');
         outcome.retry = e instanceof Stop && (e.retry || e.keep);
         outcome.keep = e instanceof Stop && e.keep;
       }
-      this.#change(outcome);
     }
-    return outcomes;
+    outcome.abort = null;
+    this.#change(outcome);
+    return outcome;
+  }
+
+  /**
+   * Pauses (`kind` 'pause') or cancels ('cancel') the file of `outcome` while it runs: a request
+   * on its way is broken off and the file stops before its next step.
+   */
+  halt(outcome, kind) {
+    outcome.halt = kind;
+    outcome.abort?.abort();
+    outcome.answerHalt?.();
+  }
+
+  #stopIfHalted(outcome) {
+    if (outcome.halt) throw new Halt(outcome.halt);
   }
 
   #change(outcome, fields = {}) {
@@ -308,13 +353,17 @@ export class UploadQueue {
     }
     if (!id) {
       this.#change(outcome, { status: 'hashing', message: 'Checking the file…', hashed: 0 });
-      const sha256 = await this.hash(file, (done) => this.#change(outcome, { sent: 0, hashed: done }));
+      const sha256 = await this.hash(file, (done) => {
+        this.#stopIfHalted(outcome);
+        this.#change(outcome, { sent: 0, hashed: done });
+      });
+      this.#stopIfHalted(outcome);
       const parent = file.version ? null : await this.#folderFor(file.path ?? []);
       outcome.parentId = parent;
       const body = file.version
         ? { doc: file.version.doc, base: file.version.base, size: file.size, sha256 }
         : { parent, name: file.name, size: file.size, sha256 };
-      const started = await this.#start(body, file);
+      const started = await this.#start(body, file, outcome);
       id = started.id;
       outcome.sessionId = id;
       cleaned = started.renamed ?? null;
@@ -325,17 +374,28 @@ export class UploadQueue {
       await this.#finish(outcome, id, cleaned);
     } catch (e) {
       // A session left open keeps its size reserved against the site's quota: give it back,
-      // unless it ended already or is being kept for a retry.
-      if (!(e instanceof Stop && (e.keep || e.ended))) await this.#call('DELETE', `/api/uploads/${seg(id)}`);
+      // unless it ended already or is being kept for a retry or a resume after a pause.
+      const kept = (e instanceof Stop && (e.keep || e.ended)) || (e instanceof Halt && e.kind === 'pause');
+      if (!kept) await this.#call('DELETE', `/api/uploads/${seg(id)}`);
       throw e;
     }
   }
 
-  async #start(body, file) {
+  async #start(body, file, outcome) {
     let failures = 0;
     for (;;) {
       const result = await this.#json('POST', '/api/uploads', body);
-      if (result.ok) return result.data;
+      if (result.ok) {
+        // Halted while the session was being made: kept for a pause, given back for a cancel.
+        if (outcome.halt && typeof result.data?.id === 'string') {
+          outcome.sessionId = result.data.id;
+          outcome.sent = result.data.received ?? 0;
+          if (outcome.halt !== 'pause') await this.#call('DELETE', `/api/uploads/${seg(result.data.id)}`);
+          throw new Halt(outcome.halt);
+        }
+        return result.data;
+      }
+      this.#stopIfHalted(outcome);
       if (result.error === 'network' && (failures += 1) < this.attempts) {
         await this.sleep(this.#backoff(failures));
         continue;
@@ -355,11 +415,15 @@ export class UploadQueue {
     let received = outcome.sent;
     let failures = 0;
     while (received < file.size) {
+      this.#stopIfHalted(outcome);
       const chunk = planChunks(file.size, received)[0];
       const result = await this.#call('PUT', url, {
         headers: { 'Content-Range': contentRange(chunk, file.size), 'Content-Type': 'application/octet-stream' },
         body: file.slice(chunk.start, chunk.end + 1),
+        signal: outcome.abort?.signal,
       });
+      // A paused file carries on later from what the server holds, which a resume asks for.
+      this.#stopIfHalted(outcome);
       if (result.ok) {
         received = result.data.received;
         failures = 0;
@@ -383,6 +447,7 @@ export class UploadQueue {
       if (failures >= this.attempts) throw new Stop(messageFor('network'), true, { keep: true });
       if (failures > 0) {
         await this.sleep(this.#backoff(failures));
+        this.#stopIfHalted(outcome);
         // The server's own count is the truth about what it holds.
         const asked = await this.#call('GET', url);
         if (asked.ok && typeof asked.data?.received === 'number') received = asked.data.received;
@@ -400,6 +465,7 @@ export class UploadQueue {
     let failures = 0;
     let lost = false; // an answer to the finish may have been lost on the way
     for (;;) {
+      this.#stopIfHalted(outcome);
       outcome.choice = choice;
       const query = choice ? `?on_conflict=${choice}` : '';
       const result = await this.#call('POST', `/api/uploads/${seg(id)}/finish${query}`);
@@ -411,6 +477,8 @@ export class UploadQueue {
         return this.#change(outcome, {
           status: 'done',
           sent: file.size,
+          docId: typeof data.id === 'string' ? data.id : (file.version?.doc ?? null),
+          editor: typeof data.editor === 'string' ? data.editor : null,
           name: data.name ?? outcome.name,
           renamed: kept ? cleaned : (cleaned ?? data.renamed ?? null),
           kept,
@@ -425,9 +493,20 @@ export class UploadQueue {
       }
       if (lost && result.status === 404) return this.#settleLost(outcome, cleaned);
       if (result.error === 'name_taken' && this.resolve && !choice) {
-        const answer = await this.resolve({ name: file.name, suggested: result.data?.suggested ?? '' });
+        // The question waits in the file's row; cancelling the file answers it (see halt).
+        const halted = new Promise((resolve) => {
+          outcome.answerHalt = () => resolve({ choice: null, all: false });
+        });
+        this.#change(outcome, { status: 'conflict', suggested: result.data?.suggested ?? '' });
+        const answer = await Promise.race([
+          this.resolve({ name: file.name, suggested: result.data?.suggested ?? '', outcome }),
+          halted,
+        ]);
+        outcome.answerHalt = null;
+        this.#stopIfHalted(outcome);
         choice = answer.choice;
         if (answer.all) this.rest = answer.choice;
+        this.#change(outcome, { status: 'uploading' });
         continue;
       }
       throw await this.#problem(result, file, true);
