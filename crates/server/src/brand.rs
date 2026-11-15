@@ -124,11 +124,16 @@ pub(crate) fn checked_theme(input: &ThemeInput) -> Result<Theme, BrandError> {
 // ---------------------------------------------------------------------------------------------
 // Judging images
 
-/// Whether `text` loads something from outside the image: an `@import`, or a `url()` that
-/// does not point inside it (`#id`).
+/// Whether `text` loads something from outside the image, or could hide that it does: an
+/// `@import`, `image-set(` or `src(`, a `url()` that does not point inside it (`#id`), a
+/// backslash (a CSS escape such as `u\72l(`) or a character reference (`u&#114;l(`, which
+/// XML decodes before CSS reads it).
 fn loads_outside(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
-    if lower.contains("@import") {
+    if ["@import", "image-set(", "src(", "\\", "&#"]
+        .iter()
+        .any(|bad| lower.contains(bad))
+    {
         return true;
     }
     lower.match_indices("url(").any(|(at, found)| {
@@ -151,8 +156,10 @@ fn local(name: &str) -> String {
     name.rsplit(':').next().unwrap_or(name).to_ascii_lowercase()
 }
 
-/// Elements that run code or embed other documents.
-const UNSAFE_ELEMENTS: [&str; 7] = [
+/// Elements that run code, embed other documents, or animate: an animation can set an
+/// attribute (an `href`, a handler) to a value no attribute check ever sees, so none is
+/// allowed in a brand image.
+const UNSAFE_ELEMENTS: [&str; 12] = [
     "script",
     "foreignobject",
     "iframe",
@@ -160,17 +167,36 @@ const UNSAFE_ELEMENTS: [&str; 7] = [
     "object",
     "handler",
     "listener",
+    "animate",
+    "set",
+    "animatemotion",
+    "animatetransform",
+    "discard",
 ];
 
-/// Whether `bytes` is a safe SVG: UTF-8, well-formed XML (no DOCTYPE) whose one root element
-/// is `svg`, with no element of [`UNSAFE_ELEMENTS`], no event handler (`on…`) attribute, no
-/// link (`href`) outside the image, and nothing that loads from outside (see
-/// [`loads_outside`]).
+/// Whether `bytes` is a safe SVG: UTF-8, well-formed XML (no DOCTYPE, and no processing
+/// instruction but one leading `<?xml …?>` declaration) whose one root element is `svg`, with
+/// no element of [`UNSAFE_ELEMENTS`], no event handler (`on…`) attribute, no link (`href`)
+/// outside the image, and nothing that loads from outside (see [`loads_outside`]).
 pub(crate) fn safe_svg(bytes: &[u8]) -> bool {
     let Ok(text) = std::str::from_utf8(bytes) else {
         return false;
     };
     let mut rest = text.strip_prefix('\u{feff}').unwrap_or(text);
+    // The XML declaration, if any, comes first of all and at most once.
+    if let Some(r) = rest.strip_prefix("<?xml") {
+        let Some(end) = r.find("?>") else {
+            return false;
+        };
+        let attributes = r.get(..end).unwrap_or_default();
+        if !attributes.starts_with(|c: char| c.is_ascii_whitespace())
+            || attributes.contains('<')
+            || loads_outside(attributes)
+        {
+            return false;
+        }
+        rest = r.get(end + 2..).unwrap_or_default();
+    }
     let mut open: Vec<&str> = Vec::new();
     let mut seen_root = false;
     loop {
@@ -199,18 +225,9 @@ pub(crate) fn safe_svg(bytes: &[u8]) -> bool {
             rest = r.get(end + 3..).unwrap_or_default();
             continue;
         }
-        if let Some(r) = rest.strip_prefix("<?") {
-            let Some(end) = r.find("?>") else {
-                return false;
-            };
-            if seen_root {
-                return false;
-            }
-            rest = r.get(end + 2..).unwrap_or_default();
-            continue;
-        }
-        if rest.starts_with("<!") {
-            // A DOCTYPE, with its entities, or anything else XML allows there.
+        if rest.starts_with("<!") || rest.starts_with("<?") {
+            // A DOCTYPE, with its entities, or anything else XML allows there; a processing
+            // instruction other than the leading declaration (`xml-stylesheet`, say).
             return false;
         }
         if let Some(r) = rest.strip_prefix("</") {
@@ -995,6 +1012,60 @@ mod tests {
             assert!(!safe_svg(svg.as_bytes()), "{svg}");
         }
         assert!(!safe_svg(&[0xff, 0xfe, b'<']));
+    }
+
+    #[test]
+    fn processing_instructions_refused_but_the_declaration() {
+        assert!(safe_svg(b"<?xml version=\"1.0\"?><svg/>"));
+        for svg in [
+            "<?xml-stylesheet href=\"https://evil.example/a.css\"?><svg/>",
+            "<?xml-stylesheet type=\"text/css\" href=\"#x\"?><svg/>",
+            "<?xml version=\"1.0\"?><?xml-stylesheet href=\"https://evil.example/\"?><svg/>",
+            "<?xml version=\"1.0\"?><?xml version=\"1.0\"?><svg/>",
+            "<!-- first --><?xml version=\"1.0\"?><svg/>",
+            "<?php echo 1 ?><svg/>",
+            "<svg><?pi data?></svg>",
+            "<?xml version=\"1.0\"",
+        ] {
+            assert!(!safe_svg(svg.as_bytes()), "{svg}");
+        }
+    }
+
+    #[test]
+    fn animations_refused() {
+        for svg in [
+            "<svg><a><set attributeName=\"href\" to=\"javascript:alert(1)\"/><text>x</text>\
+             </a></svg>",
+            "<svg><a><animate attributeName=\"xlink:href\" values=\"javascript:alert(1)\"/>\
+             </a></svg>",
+            "<svg><rect><animate attributeName=\"onclick\" to=\"alert(1)\"/></rect></svg>",
+            "<svg><rect><animate attributeName=\"x\" from=\"0\" to=\"10\" dur=\"1s\"/></rect>\
+             </svg>",
+            "<svg><rect><animateTransform attributeName=\"transform\" type=\"rotate\"/></rect>\
+             </svg>",
+            "<svg><rect><animateMotion path=\"M0 0\"/></rect></svg>",
+            "<svg><rect><discard begin=\"1s\"/></rect></svg>",
+            "<svg><svg:set xmlns:svg=\"http://www.w3.org/2000/svg\" attributeName=\"href\"/>\
+             </svg>",
+        ] {
+            assert!(!safe_svg(svg.as_bytes()), "{svg}");
+        }
+    }
+
+    #[test]
+    fn css_escapes_and_other_loaders_refused() {
+        for svg in [
+            "<svg><style>rect{fill:u\\72l(https://evil.example/)}</style></svg>",
+            "<svg><rect style=\"fill:u\\rl(https://evil.example/)\"/></svg>",
+            "<svg><rect style=\"background:image-set('https://evil.example/a.png' 1x)\"/></svg>",
+            "<svg><style>@font-face{src(https://evil.example/f.woff)}</style></svg>",
+            "<svg><rect style=\"fill:u&#114;l(https://evil.example/)\"/></svg>",
+            "<svg><style>rect{fill:IMAGE-SET(\"x.png\" 1x)}</style></svg>",
+        ] {
+            assert!(!safe_svg(svg.as_bytes()), "{svg}");
+        }
+        // A local url() is still fine.
+        assert!(safe_svg(b"<svg><rect style=\"fill:url(#g)\"/></svg>"));
     }
 
     #[test]
