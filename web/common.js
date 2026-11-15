@@ -1639,11 +1639,13 @@ function sideBySide(page, chrome, vertical) {
  * navigation take the colours (not `<html>`, so the editor stays untouched): the bar's mark
  * shows the site's thumbnail or logo instead (see [`frameMark`]), and the navigation stays
  * across the top.
+ * The focused editor frame passes `navigation: false`: no navigation row under its bar (the way
+ * back and the command palette reach the site instead).
  * `currentId` is marked as the current page. Answers `{ site, navigation, look }`, each null
  * when it could not be read; without the site the organisation defaults are used, and without
  * the look the page keeps its own.
  */
-export async function siteChrome(siteId, { currentId, place, footer = false, frame = false } = {}) {
+export async function siteChrome(siteId, { currentId, place, footer = false, frame = false, navigation: withNavigation = true } = {}) {
   const [site, navigation, look] = await Promise.all([
     api('GET', `/sites/${seg(siteId)}`),
     api('GET', `/sites/${seg(siteId)}/navigation`),
@@ -1668,7 +1670,7 @@ export async function siteChrome(siteId, { currentId, place, footer = false, fra
     applyLook(document.querySelector('.bar'), shown.look);
     applyLook(view, shown.look);
     frameMark(document.querySelector('.bar .mono'), shown.look);
-    placeChrome(view, place);
+    if (withNavigation) placeChrome(view, place);
   } else {
     placeSite(
       {

@@ -38,6 +38,7 @@ import {
   siteChrome,
 } from './common.js';
 import { forgetOpened, rememberOpened } from './start.js';
+import { setupEditorFrame } from './editor-frame.js';
 
 const FIRST_DELAY = 500;
 const MAX_DELAY = 8000;
@@ -62,6 +63,23 @@ const banner = $('banner');
 const bannerText = $('banner-text');
 const bannerActions = $('banner-actions');
 const editorArea = $('editor-area');
+const chrome = setupEditorFrame(frameBox, {
+  details: () =>
+    doc && !removed
+      ? [
+          { label: 'Name', value: doc.name },
+          { label: 'Opens in', value: editorName() },
+          { label: 'Your access', value: roleLine(doc.access) },
+          { label: 'Status', value: statusText.textContent },
+        ]
+      : [],
+  onRenamed: (node) => {
+    if (removed || !doc) return;
+    doc = { ...doc, name: node.name };
+    showDetail();
+    rememberOpened(me.id, { id: docId, name: doc.name, editor: doc.editor, site: path?.[0]?.name ?? '' });
+  },
+});
 
 // Every piece of state is declared here, before any code below runs.
 const clientId = crypto.randomUUID(); // this page load's connection
@@ -141,6 +159,7 @@ async function main() {
     return;
   }
   doc = detail.data;
+  chrome.setNodeId(docId);
   await showPlace();
   rememberOpened(me.id, { id: docId, name: doc.name, editor: doc.editor, site: path?.[0]?.name ?? '' });
   knownRevision = doc.revision ?? null;
@@ -229,7 +248,7 @@ async function waitWhileHeld() {
   downloadLink.hidden = true;
   statusPill.hidden = false;
   frameBox.dataset.state = 'connecting';
-  statusText.textContent = HELD_TEXT;
+  chrome.setStatus({ tone: 'connecting', word: HELD_TEXT });
   const line = h('p', { class: 'meta' }, 'It opens here as soon as the scanner has passed it. This page checks again every 10 seconds.');
   showViewer(h('p', { class: 'note' }, `${HELD_TEXT}.`), line);
   const ready = await pollHeld(
@@ -242,7 +261,7 @@ async function waitWhileHeld() {
   );
   if (removed) return;
   if (!ready) {
-    statusText.textContent = 'Still being checked';
+    chrome.setStatus({ tone: 'connecting', word: 'Still being checked' });
     line.textContent = 'The scanner has not finished with this file yet. Reload the page later to try again.';
     return;
   }
@@ -303,8 +322,8 @@ function editorName() {
 }
 
 function showDetail() {
-  $('title').textContent = doc.name;
-  $('docline').textContent = `${editorName()} · ${roleLine(doc.access)}`;
+  chrome.setName(doc.name);
+  chrome.setRenamable(can(doc.access, 'edit'));
   document.title = `${doc.name} — ShareCraft`;
 }
 
@@ -314,12 +333,9 @@ async function showPlace() {
   if (!here) return;
   folder = here.folder;
   path = here.path;
-  await siteChrome(path[0].id, { currentId: path.find((step) => step.kind === 'library')?.id, frame: true });
-  if (folder) {
-    $('back').href = pageFor(folder.kind, folder.id);
-    $('back').setAttribute('aria-label', `Back to ${folder.name}`);
-    $('back-text').textContent = folder.name;
-  }
+  await siteChrome(path[0].id, { frame: true, navigation: false });
+  chrome.setPlace(path, folder);
+  if (folder) $('back').href = pageFor(folder.kind, folder.id);
 }
 
 // Those who manage access get the Access link; everyone else does not.
@@ -371,8 +387,9 @@ function stopRemoved(reason) {
   setRole(null);
   saveButton.hidden = true;
   showDownload();
-  $('title').textContent = 'Document';
-  $('docline').textContent = '';
+  chrome.setName('Document');
+  chrome.setRenamable(false);
+  chrome.setPresence([], null);
   document.title = 'ShareCraft — Document';
   setBanner(null);
   const old = socket;
@@ -452,8 +469,11 @@ function handle(message) {
     case 'removed':
       stopRemoved(message.reason);
       break;
+    case 'people':
+      showPeople(message.participants);
+      break;
     default:
-      break; // `people`: this slim bar does not list them.
+      break;
   }
 }
 
@@ -463,6 +483,7 @@ function onJoined(message) {
   everJoined = true;
   delay = FIRST_DELAY;
   canEdit = message.can_edit === true;
+  showPeople(message.participants);
   const revision = message.revision ?? null;
   updateStatus({ type: 'online' });
   if (first) {
@@ -840,7 +861,12 @@ function downloadBytes(bytes, name) {
 function updateStatus(event) {
   status = nextStatus(status, event);
   frameBox.dataset.state = status.tone;
-  if (statusText.textContent !== status.text) statusText.textContent = status.text;
+  chrome.setStatus({ tone: status.tone, text: status.text });
+}
+
+// The other people in the file, as avatars in the bar (this person's own tabs left out).
+function showPeople(participants) {
+  if (!removed) chrome.setPresence(participants, typeof me?.id === 'string' ? me.id : null);
 }
 
 function setNotice(next) {

@@ -7,28 +7,30 @@
 <script src="./appearance.js"></script>
 <link rel="stylesheet" href="./style.css">
 </head>
-<body>
-<div class="frame" id="frame" data-state="connecting">
- <header class="bar">
-  <a class="back" id="back" href="/" aria-label="Back to sites"><span class="mono" aria-hidden="true">S</span><span id="back-text">Sites</span></a>
-  <div class="doc"><h1 id="title">Document</h1><span id="docline"></span></div>
+<body class="full">
+<div class="frame full editor-frame" id="frame" data-state="connecting">
+ <header class="bar ebar">
+  <a class="back" id="back" href="/" aria-label="Back to sites" title="Back to sites"><span class="chev" aria-hidden="true">‹</span><span class="mono" aria-hidden="true">S</span></a>
+  <div class="doc"><h1 id="title">Document</h1><nav id="crumbs" class="crumbs" aria-label="Breadcrumb"></nav></div>
   <span class="spacer"></span>
-  <a id="access-link" class="button plain" href="#" hidden>Access</a>
   <span class="status" role="status" aria-live="polite"><i aria-hidden="true"></i><span id="status">Loading…</span></span>
-  <nav id="crumbs" class="crumbs" aria-label="Breadcrumb"></nav>
+  <span id="presence" class="presence" role="img" hidden></span>
+  <span class="bar-actions">
+   <a id="access-link" class="button plain wide-only" href="#" hidden>Share</a>
+   <a id="download" class="button plain wide-only" download hidden>Download</a>
+   <button type="button" id="focus-toggle" class="plain wide-only" aria-pressed="false" aria-keyshortcuts="Control+Shift+F" title="Focus mode (Ctrl+Shift+F)">Focus</button>
+   <span class="menu-wrap"><button type="button" id="more" class="plain dots" aria-label="More">⋯</button><ul id="more-menu" class="menu end" aria-label="More"></ul></span>
+  </span>
  </header>
+ <button type="button" id="focus-exit" class="focus-exit" aria-keyshortcuts="Control+Shift+F" title="Exit focus (Ctrl+Shift+F)" hidden><i aria-hidden="true"></i>Exit focus</button>
+ <span id="focus-status" class="visually-hidden" role="status" aria-live="polite"></span>
+ <div id="banner" class="banner strip idle" role="status" aria-live="polite"><span id="banner-text"></span></div>
  <p id="problem" role="alert" class="problem"></p>
- <div class="body" id="editor" hidden>
-  <main class="main">
-   <p id="readonly-note" class="note" hidden>You can read this document but not change it.</p>
-   <label for="text" class="label">Document text</label>
-   <textarea id="text" spellcheck="true" readonly></textarea>
-  </main>
-  <aside aria-labelledby="people-heading">
-   <h2 id="people-heading">People here</h2>
-   <ul id="people"></ul>
-  </aside>
- </div>
+ <main class="doc-main editor-area" id="editor" hidden>
+  <p id="readonly-note" class="note" hidden>You can read this document but not change it.</p>
+  <label for="text" class="visually-hidden">Document text</label>
+  <textarea id="text" spellcheck="true" readonly></textarea>
+ </main>
 </div>
 <script type="module" src="./doc.js"></script>
 </body>

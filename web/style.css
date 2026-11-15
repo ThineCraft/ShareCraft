@@ -32,12 +32,6 @@ textarea{display:block;width:100%;min-height:420px;resize:vertical;border:1px so
 textarea:read-only{color:var(--muted)}
 aside{border-left:1px solid var(--line);padding:14px 16px}
 aside h2{font-size:13px;margin:0 0 8px}
-#people{list-style:none;margin:0;padding:0}
-#people li{display:flex;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid var(--line);font-size:13px;overflow-wrap:anywhere}
-#people li:last-child{border-bottom:0}
-.av{display:grid;place-items:center;width:28px;height:28px;border-radius:50%;font-size:10px;font-weight:600;border:2px solid var(--muted);color:var(--muted);flex:none}
-#people li.me .av{border-color:var(--accent-ink);color:var(--accent-ink)}
-#people small{color:var(--muted);font-size:11px}
 .empty{color:var(--muted);font-size:12px}
 @media (max-width:760px){
  body{padding:0 0 24px}
@@ -97,9 +91,65 @@ body.full{padding:0;height:100vh;height:100dvh;overflow:hidden}
 .frame.full .editor-area{flex:1 1 auto;min-height:0;display:flex;background:var(--bg)}
 .editor-area iframe{flex:1;display:block;width:100%;height:100%;border:0;background:var(--sheet)}
 @media (max-width:760px){
- .back span:last-child{display:none}
- .frame.full .doc span{display:none}
  .back,.banner .button,.banner button{min-height:44px}
+}
+/* the focused editor frame (round 8): one slim bar, a strip for banners, the editor the rest */
+.editor-frame .bar{flex-wrap:nowrap;height:48px;min-height:48px;padding:0 8px;gap:8px}
+.editor-frame .bar>*{flex:none}
+.editor-frame .bar .spacer{flex:1 1 0;min-width:0}
+.editor-frame .back{gap:2px;min-width:44px;min-height:40px;padding:4px 6px 4px 2px}
+.editor-frame .chev{font-size:20px;line-height:1;color:var(--muted)}
+.editor-frame .doc{flex:0 1 auto;min-width:0;justify-content:center;padding-left:4px;border-left:1px solid var(--line)}
+.editor-frame .doc h1{min-width:0;margin:0;font-size:14px;font-weight:600;line-height:1.3;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.editor-frame .doc-name{display:block;max-width:100%;min-height:0;margin:0;padding:0 4px;border:0;border-radius:5px;background:transparent;color:var(--text);font-weight:600;font-size:14px;line-height:1.3;text-align:left;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:text}
+.editor-frame .doc-name:hover{background:var(--soft)}
+.editor-frame .bar .crumbs{flex-basis:auto;min-width:0}
+.editor-frame .crumbs ol{flex-wrap:nowrap;font-size:11px;line-height:1.3;white-space:nowrap;overflow:hidden}
+.editor-frame .crumbs li{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis}
+.editor-frame .crumbs li:last-child{display:none}
+.editor-frame .crumbs a{color:var(--muted)}
+.editor-frame .crumbs a:hover{color:var(--accent-ink)}
+.frame.editor-frame[data-state] .status{flex:none;order:0;flex-basis:auto;gap:6px;padding:0 4px;border:0;border-radius:0;background:transparent;color:var(--muted);white-space:nowrap}
+.editor-frame .status i,.focus-exit i{width:8px;height:8px;border-radius:50%;background:var(--ok);flex:none}
+.editor-frame:is([data-state=saving],[data-state=connecting]) :is(.status,.focus-exit) i{background:var(--muted)}
+.editor-frame:is([data-state=offline],[data-state=notice]) :is(.status,.focus-exit) i{background:var(--warn-ink)}
+.editor-frame[data-state=failed] :is(.status,.focus-exit) i{background:var(--stop-ink)}
+.frame.editor-frame[data-state=failed] .status{color:var(--stop-ink)}
+.editor-frame[data-state=view] :is(.status,.focus-exit) i{background:transparent;box-shadow:inset 0 0 0 1.5px var(--muted)}
+.presence{display:flex;align-items:center;padding-left:6px}
+.presence .avatar.small{width:28px;height:28px;margin-left:-6px;font-size:11px;box-shadow:0 0 0 2px var(--paper)}
+.presence .avatar.read-only{opacity:.75}
+.presence .avatar.more{background:var(--band);color:var(--text);font-size:10px}
+.bar-actions{display:flex;align-items:center;gap:6px}
+.bar-actions .button,.bar-actions button{min-height:34px;padding:4px 12px}
+.bar-actions .dots{min-width:40px;padding:2px 8px;font-size:18px;line-height:1;letter-spacing:1px}
+.bar-actions button[aria-pressed=true]{background:var(--soft)}
+.menu .menu-text{display:block;padding:6px 12px;color:var(--muted);white-space:nowrap}
+.editor-frame .banner{padding:6px 12px;gap:6px 12px}
+.editor-frame .banner.idle{padding:0;border:0}
+.focus-exit{position:fixed;top:6px;left:50%;transform:translateX(-50%);z-index:40;gap:8px;min-height:36px;padding:4px 14px;border:1px solid var(--line);border-radius:999px;background:var(--paper);color:var(--text);box-shadow:0 2px 12px rgb(0 0 0/.2);opacity:.9}
+.focus-exit:hover,.focus-exit:focus-visible{opacity:1}
+dialog .facts{display:grid;grid-template-columns:minmax(0,max-content) minmax(0,1fr);margin:0 0 4px}
+dialog .facts dt,dialog .facts dd{margin:0;padding:6px 8px;overflow-wrap:anywhere}
+dialog .facts dt{color:var(--muted);font-size:12px}
+dialog .facts dt:nth-of-type(even),dialog .facts dd:nth-of-type(even){background:var(--band)}
+.frame.full .doc-main.editor-area{flex-direction:column;gap:8px;padding:12px}
+.doc-main .note{margin:0;max-width:960px;width:100%;align-self:center}
+.doc-main textarea{flex:1 1 auto;min-height:0;max-width:960px;width:100%;margin:0 auto;resize:none}
+@media (max-width:760px){
+ .editor-frame .bar .crumbs,.editor-frame .wide-only{display:none!important}
+ .editor-frame .bar{gap:4px;padding:0 4px}
+ .editor-frame .doc{padding-left:6px}
+ .bar-actions button,.bar-actions .dots,.focus-exit{min-height:44px}
+ .frame.full .doc-main.editor-area{padding:8px}
+ .doc-main textarea{min-height:0;padding:14px}
+}
+@media (max-width:480px){
+ .editor-frame .status span{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap}
+}
+@media (forced-colors:active){
+ .editor-frame .status i,.focus-exit i{forced-color-adjust:none;border:1px solid CanvasText}
+ .focus-exit{border:1px solid ButtonText}
 }
 /* colour banding: every second row of a list is shaded, in light and in dark mode */
 :root{--band:color-mix(in srgb,var(--text) 6%,transparent)}

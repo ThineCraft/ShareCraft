@@ -21,6 +21,7 @@ import {
   siteChrome,
 } from './common.js';
 import { forgetOpened, rememberOpened } from './start.js';
+import { setupEditorFrame } from './editor-frame.js';
 
 const FIRST_DELAY = 500;
 const MAX_DELAY = 8000;
@@ -30,7 +31,8 @@ const $ = (id) => document.getElementById(id);
 const frame = $('frame');
 const area = $('text');
 const statusLine = $('status');
-const peopleList = $('people');
+const stripBox = $('banner');
+const stripText = $('banner-text');
 const readonlyNote = $('readonly-note');
 const accessLink = $('access-link');
 
@@ -55,6 +57,26 @@ let path = [];          // the breadcrumb path as it was when the page loaded
 let folder = null;      // the step above the document in its breadcrumb, where closing goes
 let checking = false;   // a still-allowed check is in flight
 let closedBeforeJoin = 0; // closes in a row, before joining, while the document stayed open
+let info = null;        // the document as the server last described it
+let people = [];        // who is connected, as the client last listed them
+
+const chrome = setupEditorFrame(frame, {
+  details: () =>
+    info && !removedReason
+      ? [
+          { label: 'Name', value: info.name },
+          { label: 'Opens in', value: 'Text editor' },
+          { label: 'Your access', value: roleLine(info.access) },
+          { label: 'Status', value: statusLine.textContent },
+          { label: 'People here', value: people.map((person) => (person.me ? `${person.name} (you)` : person.name)).join(', ') },
+        ]
+      : [],
+  onRenamed: (node) => {
+    if (removedReason || !info) return;
+    showDetail({ ...info, name: node.name });
+    rememberOpened(me.id, { id: docId, name: node.name, editor: 'text', site: path?.[0]?.name ?? '' });
+  },
+});
 
 // Another document was chosen by editing the address.
 addEventListener('hashchange', () => location.reload());
@@ -82,6 +104,7 @@ if (detail.data.editor !== 'text') {
   location.replace(`/file.html?doc=${seg(docId)}`);
   await new Promise(() => {});
 }
+chrome.setNodeId(docId);
 showDetail(detail.data);
 await showPlace();
 rememberOpened(me.id, { id: docId, name: detail.data.name, editor: 'text', site: path?.[0]?.name ?? '' });
@@ -93,7 +116,7 @@ try {
   client = new Client();
 } catch (err) {
   console.error(err);
-  setStatus('failed', 'The editor could not be loaded. Run "cargo xtask web" and reload.');
+  setStatus('failed', 'The editor could not be loaded. Run "cargo xtask web" and reload.', 'Not available');
   throw err;
 }
 connect();
@@ -112,25 +135,23 @@ async function showPlace() {
   if (!here) return;
   folder = here.folder;
   path = here.path;
-  await siteChrome(path[0].id, { currentId: path.find((step) => step.kind === 'library')?.id, frame: true });
-  if (folder) {
-    $('back').href = pageFor(folder.kind, folder.id);
-    $('back').setAttribute('aria-label', `Back to ${folder.name}`);
-    $('back-text').textContent = folder.name;
-  }
+  await siteChrome(path[0].id, { frame: true, navigation: false });
+  chrome.setPlace(path, folder);
+  if (folder) $('back').href = pageFor(folder.kind, folder.id);
 }
 
 function showProblem(text) {
   $('editor').hidden = true;
   accessLink.hidden = true;
   showMessage($('problem'), text);
-  setStatus('failed', 'Not available');
+  setStatus('failed', 'Not available', 'Not available');
 }
 
-function showDetail(info) {
-  $('title').textContent = info.name;
-  $('docline').textContent = roleLine(info.access);
-  document.title = `${info.name} — ShareCraft`;
+function showDetail(next) {
+  info = next;
+  chrome.setName(next.name);
+  chrome.setRenamable(removedReason === '' && can(next.access, 'edit'));
+  document.title = `${next.name} — ShareCraft`;
 }
 
 // Those who manage access get the Access link; everyone else does not.
@@ -170,11 +191,12 @@ function stopRemoved(reason) {
   area.value = '';
   shown = '';
   applyEditable();
-  peopleList.replaceChildren();
+  showPeople([]);
   accessLink.hidden = true;
   roleCheck++;
-  $('title').textContent = 'Document';
-  $('docline').textContent = '';
+  info = null;
+  chrome.setName('Document');
+  chrome.setRenamable(false);
   document.title = 'ShareCraft — Document';
   const old = socket;
   socket = null;
@@ -437,46 +459,17 @@ function moveThrough(pos, { start_utf16: at, removed_utf16: removed, inserted_ut
 
 // ---- people and status ----
 
-function showPeople(people) {
-  peopleList.replaceChildren(
-    ...people.map((person) => {
-      const item = document.createElement('li');
-      const badge = document.createElement('span');
-      badge.className = 'av';
-      badge.setAttribute('aria-hidden', 'true');
-      badge.textContent = initials(person.name);
-      const name = document.createElement('span');
-      name.textContent = person.name;
-      item.append(badge, name);
-      const tags = [person.me ? 'you' : '', person.can_edit ? '' : 'read only'].filter(Boolean);
-      if (person.me) item.classList.add('me');
-      if (tags.length > 0) {
-        const small = document.createElement('small');
-        small.textContent = ` (${tags.join(', ')})`;
-        name.append(small);
-      }
-      return item;
-    }),
-  );
-  if (people.length === 0) {
-    const item = document.createElement('li');
-    item.className = 'empty';
-    item.textContent = 'Nobody is connected.';
-    peopleList.append(item);
-  }
-}
-
-function initials(name) {
-  const words = name.trim().split(/\s+/u).filter(Boolean);
-  const letters = words.slice(0, 2).map((w) => Array.from(w)[0] ?? '');
-  return letters.join('').toUpperCase() || '?';
+// The other people in the document, as avatars in the bar (the client marks this page as `me`).
+function showPeople(list) {
+  people = Array.isArray(list) ? list : [];
+  chrome.setPresence(people, null);
 }
 
 function render() {
   if (!client) return;
   const n = client.pending();
   if (removedReason) {
-    setStatus('failed', removedMessage(removedReason));
+    setStatus('failed', removedMessage(removedReason), 'Not available');
     return;
   }
   const waiting = `${n} ${n === 1 ? 'change' : 'changes'} waiting`;
@@ -490,15 +483,24 @@ function render() {
     // A failing save is never hidden by a notice; both are shown.
     setStatus('failed', notice ? `Saving failed, retrying. ${notice}` : 'Saving failed, retrying');
   } else if (notice) {
-    setStatus('notice', notice);
+    // The notice is said in the strip below the bar; the bar keeps the quiet save word.
+    setStatus('notice', notice, n > 0 || save?.state === 'saving' ? 'Saving…' : 'Saved');
   } else if (n > 0 || save?.state === 'saving') {
     setStatus('saving', 'Saving…');
+  } else if (!canEdit) {
+    setStatus('view', 'Read only');
   } else {
     setStatus('saved', 'Saved');
   }
 }
 
-function setStatus(state, text) {
+// The state colours the dot and the bar says a short word; what needs reading (a lost
+// connection, a conflict, a refused change) is said in the strip below the bar.
+function setStatus(state, text, word = '') {
   frame.dataset.state = state;
-  if (statusLine.textContent !== text) statusLine.textContent = text;
+  const label = chrome.setStatus({ tone: state, text, word });
+  const long = ['offline', 'failed', 'notice'].includes(state) ? label.detail : '';
+  const strip = long && long !== $('problem').textContent ? long : '';
+  if (stripText.textContent !== strip) stripText.textContent = strip;
+  stripBox.classList.toggle('idle', strip === '');
 }
