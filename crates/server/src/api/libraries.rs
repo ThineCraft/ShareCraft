@@ -1,5 +1,6 @@
 //! Libraries' kinds and settings: one library with its settings, changing them, making a
-//! library of a kind in a site, and the asset libraries.
+//! library of a kind in a site, the asset libraries, and "New from template": the template
+//! choices of a library and a new file copied from one.
 
 use axum::Json;
 use axum::extract::{Path, State};
@@ -11,12 +12,12 @@ use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use super::nodes::{NodeOut, node_id};
+use super::nodes::{Copied, NodeOut, node_id, rfc3339};
 use super::{ApiError, JsonBody, to_completion};
 use crate::AppState;
 use crate::auth::Signed;
 use crate::libraries::{self, LibraryEdit};
-use crate::tree;
+use crate::tree::{self, TreeOp};
 
 /// A field that may be given as `null`: absent is `None`, `null` is `Some(None)`.
 fn nullable<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
@@ -172,4 +173,80 @@ pub(crate) async fn assets(
             .map(|(node, settings)| library_out(node, settings))
             .collect(),
     ))
+}
+
+/// `GET /api/libraries/{id}/templates`: the "New from template" choices of the library, for
+/// someone who can view it (`404` otherwise): the files in the template libraries of its site
+/// that the caller can view and whose content is available, by name, each `{id, name, editor,
+/// library, library_name, revised_at}` (`library` is the template library it is in).
+pub(crate) async fn templates(
+    State(state): State<AppState>,
+    signed: Signed,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<Value>>, ApiError> {
+    let library = node_id(&id)?;
+    let found = libraries::templates(&state, &signed.session.user, library).await?;
+    Ok(Json(
+        found
+            .into_iter()
+            .map(|file| {
+                json!({
+                    "id": file.id.0.to_string(),
+                    "name": file.name,
+                    "editor": file.editor,
+                    "library": file.library.0.to_string(),
+                    "library_name": file.library_name,
+                    "revised_at": rfc3339(file.revised_at),
+                })
+            })
+            .collect(),
+    ))
+}
+
+/// The body of `POST /api/libraries/{id}/from-template`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FromTemplate {
+    /// The template file to copy.
+    template: String,
+    /// The folder in the library the new file goes into; the library itself if absent.
+    parent: Option<String>,
+    /// The new file's name; the template's if absent.
+    name: Option<String>,
+}
+
+/// `POST /api/libraries/{id}/from-template {template, parent?, name?}`: a new file in the
+/// library, or in its folder `parent`, copied from a template file of the same site through
+/// the copy path (see [`tree::apply`]): the template's latest version only, with no history.
+/// `201 {node, renamed}` as a copy answers. `404` for a template that is not a file the caller
+/// can view in a template library of the library's site; `400 wrong_place` for a `parent`
+/// outside the library; `403` without `add` there (`archived` on an archived site); `422
+/// blocked_file_type` / `413 file_too_large` for the library's policies; `507
+/// quota_exceeded`; `423 held {scan}` for a template the malware scanner holds.
+pub(crate) async fn from_template(
+    State(state): State<AppState>,
+    signed: Signed,
+    Path(id): Path<String>,
+    JsonBody(body): JsonBody<FromTemplate>,
+) -> Result<Response, ApiError> {
+    let library = node_id(&id)?;
+    let template = node_id(&body.template)?;
+    let parent = body.parent.as_deref().map(node_id).transpose()?;
+    let actor = signed.session.user;
+    let copied = to_completion(async move {
+        let op = TreeOp::FromTemplate {
+            library,
+            template,
+            parent,
+            name: body.name,
+        };
+        let applied = tree::apply(&state, &actor, op).await.map_err(|e| match e {
+            // The name asked for has another extension than the template's.
+            records::AccessError::WrongExtension => ApiError::InvalidName,
+            e => e.into(),
+        })?;
+        Ok(Copied::from(applied))
+    })
+    .await?;
+    Ok((StatusCode::CREATED, Json(copied)).into_response())
 }

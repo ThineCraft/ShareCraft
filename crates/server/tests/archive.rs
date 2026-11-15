@@ -532,6 +532,17 @@ async fn archived_site_refuses_every_write() {
     let notes = w.doc(&w.library, "Notes").await;
     let sheet = w.uploaded(&w.library, "Sheet.xlsx").await;
     let gone = w.doc(&w.library, "Gone").await;
+    let (status, body) = w
+        .call(
+            &w.root,
+            Method::POST,
+            &format!("/api/sites/{}/libraries", w.site),
+            Some(json!({ "name": "Templates", "kind": "template" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let templates = body["id"].as_str().unwrap().to_owned();
+    let template = w.uploaded(&templates, "Budget.xlsx").await;
     let (status, _) = w
         .call(&w.root, Method::DELETE, &format!("/api/nodes/{gone}"), None)
         .await;
@@ -681,6 +692,11 @@ async fn archived_site_refuses_every_write() {
                 Method::POST,
                 format!("/api/nodes/{outsider}/copy"),
                 Some(json!({ "parent": library })),
+            ),
+            write(
+                Method::POST,
+                format!("/api/libraries/{library}/from-template"),
+                Some(json!({ "template": template })),
             ),
             write(
                 Method::PUT,
@@ -863,7 +879,7 @@ async fn archived_site_refuses_every_write() {
     );
     assert_eq!(
         w.names(&w.root, &w.site).await.unwrap(),
-        vec!["Documents".to_owned()]
+        vec!["Documents".to_owned(), "Templates".to_owned()]
     );
     let usage = w
         .server

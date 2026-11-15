@@ -561,6 +561,37 @@ async fn held_content_is_never_served() {
     wait_scan(&server, &bad, |s| s == ScanState::Infected).await;
     // The same content under a name that has a preview and a thumbnail.
     let quarantined_png = upload(&server, &ann, &home, "Infected.png", &bad).await;
+    // The same content as a template of a team site Ann owns.
+    let (status, body) = call(
+        &server,
+        &admin,
+        Method::POST,
+        "/api/sites",
+        Some(json!({ "name": "Team" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let team = body["id"].as_str().unwrap().to_owned();
+    let (status, body) = call(
+        &server,
+        &admin,
+        Method::PUT,
+        &format!("/api/nodes/{team}/access"),
+        Some(json!({ "email": ann.email, "role": "owner" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let (status, body) = call(
+        &server,
+        &ann,
+        Method::POST,
+        &format!("/api/sites/{team}/libraries"),
+        Some(json!({ "name": "Templates", "kind": "template" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let templates = body["id"].as_str().unwrap().to_owned();
+    let quarantined_template = upload(&server, &ann, &templates, "Infected.xlsx", &bad).await;
 
     // Held: the scanner fails, so it waits.
     fake.set(Behaviour {
@@ -571,6 +602,7 @@ async fn held_content_is_never_served() {
     let held = upload(&server, &ann, &home, "Held.xlsx", &waiting).await;
     wait_scan(&server, &waiting, |s| s == ScanState::Failed).await;
     let held_png = upload(&server, &ann, &home, "Held.png", &waiting).await;
+    let held_template = upload(&server, &ann, &templates, "Held.xlsx", &waiting).await;
     fake.set(Behaviour::default());
 
     // An older version infected, the current one clean.
@@ -734,6 +766,18 @@ async fn held_content_is_never_served() {
             http.post(url(format!("/api/nodes/{note}/copy")))
                 .json(&json!({ "parent": home })),
             "infected",
+        ),
+        (
+            "new from template",
+            http.post(url(format!("/api/libraries/{templates}/from-template")))
+                .json(&json!({ "template": quarantined_template })),
+            "infected",
+        ),
+        (
+            "held new from template",
+            http.post(url(format!("/api/libraries/{templates}/from-template")))
+                .json(&json!({ "template": held_template })),
+            "failed",
         ),
     ];
     for (name, request, scan) in rows {

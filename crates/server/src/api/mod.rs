@@ -67,6 +67,11 @@ pub(crate) fn router() -> Router<AppState> {
             "/libraries/{id}",
             get(libraries::show).patch(libraries::change),
         )
+        .route("/libraries/{id}/templates", get(libraries::templates))
+        .route(
+            "/libraries/{id}/from-template",
+            post(libraries::from_template),
+        )
         .route("/assets", get(libraries::assets))
         .route(
             "/sites/{id}/hub",

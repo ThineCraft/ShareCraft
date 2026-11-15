@@ -45,8 +45,8 @@ pub use explorer::{
 };
 pub use groups::{Group, SiteGroup};
 pub use libraries::{
-    IMAGE_TYPES, LibraryChange, LibraryKind, LibrarySettings, MAX_LIBRARY_TYPES, is_extension,
-    validate_library_fields, validate_library_settings,
+    IMAGE_TYPES, LibraryChange, LibraryKind, LibrarySettings, MAX_LIBRARY_TYPES, TemplateFile,
+    is_extension, validate_library_fields, validate_library_settings,
 };
 pub use links::{AnyoneGrant, Link, LinkError, LinkKind, LinkToken};
 pub use navigation::{NavViewer, ResolvedItem, ResolvedTarget, SitesMirror};

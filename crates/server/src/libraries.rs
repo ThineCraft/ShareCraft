@@ -12,10 +12,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use collab_core::ids::NodeId;
+use collab_core::ids::{DocId, NodeId};
 use records::{
     AccessError, Db, DbError, LibraryChange, LibraryKind, LibrarySettings, NewEvent, Node,
-    NodeKind, Perms, User, validate_library_settings,
+    NodeKind, Perms, TemplateFile, User, validate_library_settings,
 };
 use revisions::{CheckpointError, GitError, LibraryRecord};
 use serde_json::{Map, Value, json};
@@ -147,6 +147,37 @@ pub async fn assets(
         }
     }
     Ok(out)
+}
+
+/// The "New from template" choices of `library` for `actor`, who needs `view` on it: the
+/// files in the template libraries of its site that `actor` can view and whose content is
+/// available, by name. Files of another site, in a library of another kind, in the recycle
+/// bin, or held or quarantined by the malware scanner are never among them.
+///
+/// # Errors
+/// `NotFound` when the library is missing, deleted, not a library or not visible to `actor`;
+/// otherwise the database error.
+pub async fn templates(
+    state: &AppState,
+    actor: &User,
+    library: NodeId,
+) -> Result<Vec<TemplateFile>, AccessError> {
+    let db = state.db();
+    let (node, _) = seen_library(db, actor, library).await?;
+    let mut viewable = Vec::new();
+    for file in db.template_files(node.site).await? {
+        let can_view = db
+            .effective_access(actor.id, NodeId(file.id.0))
+            .await?
+            .is_some_and(|access| access.perms.contains(Perms::VIEW));
+        if can_view {
+            viewable.push(file);
+        }
+    }
+    let ids: Vec<DocId> = viewable.iter().map(|file| file.id).collect();
+    let held = db.scan_marks(&ids).await?;
+    viewable.retain(|file| !held.contains_key(&file.id));
+    Ok(viewable)
 }
 
 /// Changes `library`'s kind or settings for `actor`, who needs `manage_site` on it; making it

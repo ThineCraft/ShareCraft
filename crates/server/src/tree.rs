@@ -85,6 +85,15 @@ pub enum TreeOp {
         parent: NodeId,
         name: Option<String>,
     },
+    /// Copies the template file `template` into the library `library`, or into its folder
+    /// `parent`, named `name` (given the template's extension when it lacks it) or as the
+    /// template is: "New from template" (see [`apply`]).
+    FromTemplate {
+        library: NodeId,
+        template: NodeId,
+        parent: Option<NodeId>,
+        name: Option<String>,
+    },
 }
 
 /// What [`apply`] did.
@@ -391,7 +400,8 @@ impl Default for Plan {
 /// into one from elsewhere; `BlockedFileType` or `FileTooLarge` for a file the policies of
 /// the library it would go into refuse (see [`check_policies`]): a renamed file's new name, a
 /// file moved into another library (or each file below a folder moved there) and every file a
-/// copy makes; `Held` for a copy of a file whose latest version the malware scanner holds;
+/// copy makes; `Held` for a copy of a file whose latest version the malware scanner holds
+/// (a copy from a template too, see [`plan_from_template`]);
 /// `OutOfStep` while the tree needs repair; otherwise the Git or database error.
 /// A restore is never refused for a policy: a file whose type is now refused is restored, and
 /// its listings mark it.
@@ -436,7 +446,8 @@ pub async fn apply(state: &AppState, actor: &User, op: TreeOp) -> Result<Applied
         | TreeOp::Restore { id }
         | TreeOp::ToSecondStage { id }
         | TreeOp::Purge { id }
-        | TreeOp::Copy { id, .. } => *id,
+        | TreeOp::Copy { id, .. }
+        | TreeOp::FromTemplate { library: id, .. } => *id,
     };
     let plan = match op {
         TreeOp::Create {
@@ -454,6 +465,12 @@ pub async fn apply(state: &AppState, actor: &User, op: TreeOp) -> Result<Applied
         TreeOp::Copy { id, parent, name } => {
             Some(plan_copy(state, actor, id, parent, name.as_deref()).await?)
         }
+        TreeOp::FromTemplate {
+            library,
+            template,
+            parent,
+            name,
+        } => Some(plan_from_template(state, actor, library, template, parent, name).await?),
     };
     let (deleted, renamed, id) = match plan {
         Some(mut plan) => {
@@ -2858,6 +2875,64 @@ async fn plan_copy(
         }),
         ..Plan::default()
     })
+}
+
+/// "New from template" (see [`apply`]): the template file `template` copied into `library`,
+/// or into `parent` at or below it, through [`plan_copy`], so the quota, name cleaning, the
+/// policies of the library it goes into, `add` there, an archived site and held content all
+/// hold as for any copy. The template must be a live file in a live template library of the
+/// same site as `library` (`NotFound` otherwise, as for a template the person cannot view, so
+/// nothing of another site is told); `library` must be a library the person can see
+/// (`NotFound`), and `parent` a library or folder at or below it (`WrongPlace`). A name given
+/// without the template's extension gets it.
+async fn plan_from_template(
+    state: &AppState,
+    actor: &User,
+    library: NodeId,
+    template: NodeId,
+    parent: Option<NodeId>,
+    name: Option<String>,
+) -> Result<Plan, AccessError> {
+    let db = state.db();
+    let (place, _) = visible(db, actor, library).await?;
+    if place.kind != NodeKind::Library || place.deleted {
+        return Err(AccessError::NotFound);
+    }
+    let (file, _) = visible(db, actor, template).await?;
+    let document = db.document(DocId(template.0)).await?;
+    let in_template_library = match db.library_of(template).await? {
+        Some(home) => db
+            .library_settings(home)
+            .await?
+            .is_some_and(|settings| settings.kind == LibraryKind::Template),
+        None => false,
+    };
+    let Some(document) = document.filter(|_| {
+        file.kind == NodeKind::Document
+            && !file.deleted
+            && file.site == place.site
+            && in_template_library
+    }) else {
+        return Err(AccessError::NotFound);
+    };
+    let destination = parent.unwrap_or(library);
+    if destination != library && !db.is_at_or_below(destination, library).await? {
+        return Err(AccessError::WrongPlace);
+    }
+    let name = name.map(|asked| {
+        let asked = asked.trim().to_owned();
+        let (_, extension) = split_extension(&file.name, document.editor);
+        let has = asked.len() >= extension.len()
+            && asked
+                .get(asked.len() - extension.len()..)
+                .is_some_and(|tail| tail.eq_ignore_ascii_case(extension));
+        if has {
+            asked
+        } else {
+            format!("{asked}{extension}")
+        }
+    });
+    plan_copy(state, actor, template, destination, name.as_deref()).await
 }
 
 /// Commits the first versions of the files a copy made, as one commit credited to `actor`,

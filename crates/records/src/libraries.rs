@@ -1,18 +1,20 @@
 //! Libraries' own settings: kind, description, folders, accepted and refused file types and the
 //! largest file, mirrored from their records in Git (`libraries/<xx>/<id>.json`) as site
-//! records are; the rules those settings keep; and the asset libraries.
+//! records are; the rules those settings keep; the asset libraries; and the files of a site's
+//! template libraries.
 
 use std::collections::HashSet;
 
-use collab_core::ids::{NodeId, UserId};
+use collab_core::ids::{DocId, NodeId, UserId};
 use revisions::{LIBRARY_SCHEMA, LibraryFields, LibraryRecord, MAX_DESCRIPTION_CHARS};
 use sqlx::postgres::PgRow;
 use sqlx::{PgConnection, Row};
 use uuid::Uuid;
 
+use crate::documents::parse_editor;
 use crate::events::{NewEvent, record};
 use crate::tree::NodeChange;
-use crate::{AccessError, Db, DbError, Perms};
+use crate::{AccessError, Db, DbError, Editor, Perms};
 
 /// The file types an image library accepts. Its own `allowed_types` may narrow this list but
 /// never widen it.
@@ -31,6 +33,20 @@ const CHECK_VIOLATION: &str = "23514";
 /// The columns of a `libraries` row as [`settings_from_row`] reads them.
 const LIBRARY_COLUMNS: &str =
     "id, kind, description, folders, allowed_types, blocked_types, max_file_bytes";
+
+/// A file in one of a site's template libraries: a "New from template" choice for whoever may
+/// view it and its content is available (the caller judges both).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TemplateFile {
+    /// The file's document.
+    pub id: DocId,
+    pub name: String,
+    pub editor: Editor,
+    /// The template library it is in, at any depth.
+    pub library: NodeId,
+    pub library_name: String,
+    pub revised_at: Option<time::OffsetDateTime>,
+}
 
 /// What a library is for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -398,6 +414,40 @@ impl Db {
         .fetch_all(self.pool())
         .await?;
         Ok(ids.into_iter().map(NodeId).collect())
+    }
+
+    /// The live files with at least one version in the live template libraries of the site
+    /// `site`, at any depth below them, by name ignoring case. Whoever asks: the caller keeps
+    /// those the person can view whose content is available. Empty for a deleted site. The
+    /// walk ends even if the data held a cycle.
+    pub async fn template_files(&self, site: NodeId) -> Result<Vec<TemplateFile>, DbError> {
+        type Row = (
+            Uuid,
+            String,
+            String,
+            Uuid,
+            String,
+            Option<time::OffsetDateTime>,
+        );
+        let rows: Vec<Row> = sqlx::query_as(
+            "with recursive below(id, library_id, depth) as (                  select n.id, n.id, 0 from libraries l join nodes n on n.id = l.id                  join nodes s on s.id = n.site_id                  where l.kind = 'template' and n.site_id = $1 and n.kind = 'library'                    and n.deleted_at is null and s.deleted_at is null                  union all                  select c.id, b.library_id, b.depth + 1 from nodes c join below b                    on c.parent_id = b.id                  where c.deleted_at is null and b.depth < 10000              )              select n.id, n.name, d.editor, b.library_id, lib.name, d.revised_at              from below b join nodes n on n.id = b.id              join documents d on d.id = n.id              join nodes lib on lib.id = b.library_id              where n.kind = 'document' and d.revision is not null              order by lower(n.name), n.id",
+        )
+        .bind(site.0)
+        .fetch_all(self.pool())
+        .await?;
+        rows.into_iter()
+            .map(|(id, name, editor, library, library_name, revised_at)| {
+                Ok(TemplateFile {
+                    id: DocId(id),
+                    name,
+                    editor: parse_editor(&editor)?,
+                    library: NodeId(library),
+                    library_name,
+                    revised_at,
+                })
+            })
+            .collect::<Result<_, sqlx::Error>>()
+            .map_err(DbError::from)
     }
 
     /// Mirrors one committed change of a library's settings, in one transaction: judges what

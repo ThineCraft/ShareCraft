@@ -15,8 +15,8 @@ use axum::response::{IntoResponse, Response};
 use collab_core::ids::{DocId, GroupId, NodeId, UserId};
 use protocol::RemovedReason;
 use records::{
-    Access, AccessError, AssignmentView, Crumb, Cursor, Db, Editor, LinkKind, Listed, Node,
-    NodeKind, Perms, Principal, PrincipalView, RoleRef, User,
+    Access, AccessError, AssignmentView, Crumb, Cursor, Db, Editor, LibraryKind, LinkKind, Listed,
+    Node, NodeKind, Perms, Principal, PrincipalView, RoleRef, User,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -33,6 +33,9 @@ use crate::tree::{self, TreeOp};
 const DEFAULT_LIMIT: u32 = 100;
 /// Most children listed at once.
 const MAX_LIMIT: u32 = 500;
+/// Children listed at once in the grid view of an image library, when the request names no
+/// limit, and at most.
+const GRID_LIMIT: u32 = 200;
 
 /// An RFC 3339 timestamp, or `None` when there is no time (or it cannot be written).
 pub(crate) fn rfc3339(time: Option<time::OffsetDateTime>) -> Option<String> {
@@ -148,14 +151,21 @@ pub(crate) async fn show(
 pub(crate) struct ChildrenQuery {
     after: Option<String>,
     limit: Option<u32>,
+    /// `grid` for the thumbnail grid of an image library.
+    view: Option<String>,
 }
 
 impl ChildrenQuery {
     /// The page asked for: where it starts and how many children at most. `422` for a limit
     /// outside 1 to 500 or an `after` that is not a `next`.
     pub(crate) fn page(&self) -> Result<(Option<Cursor>, u32), ApiError> {
-        let limit = self.limit.unwrap_or(DEFAULT_LIMIT);
-        if !(1..=MAX_LIMIT).contains(&limit) {
+        self.page_of(DEFAULT_LIMIT, MAX_LIMIT)
+    }
+
+    /// The page asked for, `default` children when no limit is named and at most `most`.
+    fn page_of(&self, default: u32, most: u32) -> Result<(Option<Cursor>, u32), ApiError> {
+        let limit = self.limit.unwrap_or(default);
+        if !(1..=most).contains(&limit) {
             return Err(ApiError::InvalidRequest);
         }
         let after = match self.after.as_deref() {
@@ -191,6 +201,11 @@ pub(crate) struct ChildOut {
     /// The threat's name, for a quarantined file.
     #[serde(skip_serializing_if = "Option::is_none")]
     threat: Option<String>,
+    /// `true` for a file whose thumbnail can be asked for (`GET /api/docs/{id}/thumbnail`): an
+    /// image of a type thumbnails are made for, with a version whose content is available.
+    /// Absent otherwise. Whether one can be made still depends on its bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thumbnail: Option<bool>,
 }
 
 impl From<Listed> for ChildOut {
@@ -206,6 +221,7 @@ impl From<Listed> for ChildOut {
             policy: None,
             scan: None,
             threat: None,
+            thumbnail: None,
         }
     }
 }
@@ -262,12 +278,30 @@ impl ChildrenPage {
         }
         Ok(self)
     }
+
+    /// The page, each file in it whose thumbnail can be asked for marked `"thumbnail": true`:
+    /// an image of a type thumbnails are made for, with a version, not held by the malware
+    /// scanner. Run after [`ChildrenPage::marked`], which marks the held ones.
+    fn with_thumbnails(mut self) -> Self {
+        for item in &mut self.items {
+            if item.kind == NodeKind::Document
+                && item.scan.is_none()
+                && item.revised_at.is_some()
+                && crate::previews::has_thumbnail(&item.name)
+            {
+                item.thumbnail = Some(true);
+            }
+        }
+        self
+    }
 }
 
-/// `GET /api/nodes/{id}/children?after=&limit=`: one page of the children the caller can see,
-/// folders before files, then by name. `limit` is 1 to 500 (100 if absent); `after` is the
-/// `next` of the previous page. A file the file policies there now refuse is marked
-/// `"policy": "blocked"`.
+/// `GET /api/nodes/{id}/children?after=&limit=&view=`: one page of the children the caller
+/// can see, folders before files, then by name. `limit` is 1 to 500 (100 if absent); `after`
+/// is the `next` of the previous page. `view=grid`, for an image library or a folder in one
+/// only (`422` elsewhere, and for any other view), pages the same way with 1 to 200 (200 if
+/// absent). A file the file policies there now refuse is marked `"policy": "blocked"`, and one
+/// whose thumbnail can be asked for `"thumbnail": true`.
 pub(crate) async fn children(
     State(state): State<AppState>,
     signed: Signed,
@@ -276,18 +310,48 @@ pub(crate) async fn children(
 ) -> Result<Json<ChildrenPage>, ApiError> {
     let id = node_id(&id)?;
     let Query(query) = query.map_err(|_| ApiError::BadRequest)?;
-    let (after, limit) = query.page()?;
     let db = state.db();
+    let grid = match query.view.as_deref() {
+        None => false,
+        Some("grid") => true,
+        Some(_) => return Err(ApiError::InvalidRequest),
+    };
+    let (after, limit) = if grid {
+        query.page_of(GRID_LIMIT, GRID_LIMIT)?
+    } else {
+        query.page()?
+    };
     let (listed, next) = db
         .children(signed.session.user.id, id, after.as_ref(), limit)
         .await
         .map_err(|e| ApiError::unavailable(&e))?
         .ok_or(ApiError::NotFound)?;
+    // Judged once the caller is known to see the place, so a refusal tells nothing more.
+    if grid && !in_image_library(db, id).await? {
+        return Err(ApiError::InvalidRequest);
+    }
     Ok(Json(
         ChildrenPage::of(listed, next.as_ref())
             .marked(db, id)
-            .await?,
+            .await?
+            .with_thumbnails(),
     ))
+}
+
+/// Whether `node` is an image library or lies in one.
+async fn in_image_library(db: &Db, node: NodeId) -> Result<bool, ApiError> {
+    let Some(library) = db
+        .library_of(node)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?
+    else {
+        return Ok(false);
+    };
+    let settings = db
+        .library_settings(library)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?;
+    Ok(settings.is_some_and(|settings| settings.kind == LibraryKind::Image))
 }
 
 /// A cursor as the opaque text a page passes back: its JSON, in hexadecimal.
@@ -470,14 +534,20 @@ pub(crate) async fn copy_one(
             AccessError::WrongExtension => ApiError::InvalidName,
             e => e.into(),
         })?;
-    let renamed = applied.renamed.map(|(_, from)| RenamedOut {
-        from,
-        to: applied.node.name.clone(),
-    });
-    Ok(Copied {
-        node: NodeOut::from(applied.node),
-        renamed,
-    })
+    Ok(Copied::from(applied))
+}
+
+impl From<tree::Applied> for Copied {
+    fn from(applied: tree::Applied) -> Self {
+        let renamed = applied.renamed.map(|(_, from)| RenamedOut {
+            from,
+            to: applied.node.name.clone(),
+        });
+        Copied {
+            node: NodeOut::from(applied.node),
+            renamed,
+        }
+    }
 }
 
 impl Copied {
