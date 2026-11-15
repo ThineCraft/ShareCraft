@@ -623,6 +623,21 @@ export function setupTopbar(me, error) {
     if (result.ok) location.assign('/signin.html');
     else showMessage(error, messageFor(result.error));
   });
+  startPalette(me);
+}
+
+/**
+ * Starts the command palette (palette.js) for the signed-in person `me`: Ctrl+K, Cmd+K or "/"
+ * opens it, and the account bar gets its button. Loaded on demand, so pages that never need it
+ * (and the tests) do not load it; setupTopbar calls this, pages without it call it themselves.
+ */
+export function startPalette(me) {
+  if (typeof document === 'undefined') return;
+  import('./palette.js')
+    .then((palette) => palette.setupPalette(me))
+    .catch(() => {
+      // without the palette the page still works through its own links
+    });
 }
 
 /** Puts `text` in `element`, followed by a link to `folder` (a crumb) when there is one. */

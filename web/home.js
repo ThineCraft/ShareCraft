@@ -19,6 +19,7 @@ import {
   siteMark,
 } from './common.js';
 import { fileIcon, fileKind, relativeTime } from './files.js';
+import { addPaletteActions } from './palette.js';
 import { forgetOpened, greeting, hourIn, readRecent, siteCardModel } from './start.js';
 
 const $ = (id) => document.getElementById(id);
@@ -55,6 +56,14 @@ $('new-site-button').addEventListener('click', () => {
 });
 $('new-site-cancel').addEventListener('click', () => newSiteDialog.close());
 newSiteDialog.addEventListener('close', () => $('new-site-button').focus());
+// The command palette's New site opens this dialog: here directly, from other pages through #new-site.
+if (me.is_admin) {
+  addPaletteActions(() => [{ key: 'new-site', label: 'New site', keywords: 'create add make site', run: () => $('new-site-button').click() }]);
+  if (location.hash === '#new-site') {
+    history.replaceState(null, '', location.pathname + location.search);
+    $('new-site-button').click();
+  }
+}
 
 $('new-site').addEventListener('submit', async (event) => {
   event.preventDefault();

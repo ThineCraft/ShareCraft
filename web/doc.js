@@ -12,6 +12,7 @@ import {
   removedMessage,
   removedReasonOf,
   requireMe,
+  startPalette,
   roleLine,
   seg,
   showCrumbs,
@@ -59,6 +60,7 @@ let closedBeforeJoin = 0; // closes in a row, before joining, while the document
 addEventListener('hashchange', () => location.reload());
 
 const me = await requireMe();
+startPalette(me);
 const docId = documentId();
 if (!docId) {
   showProblem(MISSING);

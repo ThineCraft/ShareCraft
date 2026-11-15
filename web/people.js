@@ -1,4 +1,4 @@
-import { api, h, messageFor, organisationChrome, requireMe, seg, showMessage } from './common.js';
+import { api, h, messageFor, organisationChrome, requireMe, seg, showMessage, startPalette } from './common.js';
 
 const $ = (id) => document.getElementById(id);
 const error = $('error');
@@ -12,6 +12,7 @@ try {
   throw err;
 }
 $('who').textContent = `Signed in as ${me.name}`;
+startPalette(me);
 await organisationChrome();
 
 if (!me.is_admin) {

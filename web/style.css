@@ -592,3 +592,42 @@ body.dragging .drop-overlay{display:flex}
  .card-band{border-bottom:1px solid CanvasText}
  .card-link:focus-visible::after{outline-color:Highlight}
 }
+/* command palette: the account bar's button and the dialog (neutral: never the site's colours) */
+.palette-button,.palette{--accent:#3156c9;--accent-ink:light-dark(#3156c9,#9db4ff);--on-accent:#fff;--soft:color-mix(in srgb,var(--accent) 11%,var(--paper))}
+.topbar .palette-button{gap:8px;min-width:0;color:var(--muted);font-weight:400}
+.topbar .palette-button:hover{color:var(--text);border-color:var(--muted)}
+.palette-button kbd,.palette kbd{display:inline-block;min-width:1.6em;padding:0 5px;border:1px solid var(--line);border-bottom-width:2px;border-radius:5px;background:var(--bg);color:var(--muted);font:11px/18px ui-monospace,'Cascadia Mono',monospace;text-align:center}
+.palette-glass{position:relative;display:inline-block;width:14px;height:14px;flex:none;border:2px solid currentColor;border-radius:50%;margin-right:3px}
+.palette-glass::after{content:'';position:absolute;right:-5px;bottom:-4px;width:6px;height:2px;background:currentColor;border-radius:1px;transform:rotate(45deg)}
+dialog.palette{max-width:min(640px,calc(100vw - 32px));margin:12vh auto auto;padding:0;overflow:hidden;box-shadow:0 18px 48px rgb(0 0 0/.3)}
+.palette-search{display:flex;align-items:center;gap:10px;padding:10px 14px;border-bottom:1px solid var(--line);color:var(--muted)}
+.palette-search input{flex:1;min-width:0;min-height:44px;padding:6px 0;border:0;background:transparent;color:var(--text);font-size:17px}
+.palette-search input:focus,.palette-search input:focus-visible{outline:none}
+.palette-search:focus-within{box-shadow:inset 0 -2px 0 var(--accent-ink)}
+.palette-list{max-height:min(56vh,460px);overflow:auto;overscroll-behavior:contain;padding:4px 6px 6px}
+.palette-group+.palette-group{margin-top:4px}
+.palette-heading{margin:0;padding:8px 10px 4px;color:var(--muted);font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase}
+.palette-option{display:flex;align-items:center;gap:10px;min-height:44px;padding:6px 10px;border-radius:8px;cursor:pointer}
+.palette-option:nth-child(odd){background:var(--band)}
+.palette-option[aria-selected=true]{background:var(--soft);box-shadow:inset 3px 0 0 var(--accent-ink)}
+.palette-option .site-mark{width:28px;height:28px;border-radius:6px;font-size:11px}
+.palette-option .file-icon{flex:none}
+.palette-action-mark{display:grid;place-items:center;width:24px;height:24px;flex:none;border:1px solid var(--line);border-radius:6px;color:var(--accent-ink);font-weight:600}
+.palette-text{display:flex;flex-direction:column;min-width:0}
+.palette-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.palette-name mark{background:transparent;color:var(--accent-ink);font-weight:700;text-decoration:underline;text-underline-offset:2px}
+.palette-text small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted);font-size:12px}
+.palette-note{margin:0;padding:0 16px}
+.palette-note:not(:empty){padding:8px 16px}
+.palette-keys{display:flex;flex-wrap:wrap;align-items:center;gap:4px;margin:0;padding:8px 14px;border-top:1px solid var(--line)}
+@media (max-width:600px){
+ .topbar .palette-button kbd,.topbar .palette-button-text{display:none}
+ .topbar .palette-button{min-width:44px;padding:6px 12px}
+ dialog.palette{max-width:calc(100vw - 16px);margin:8px auto auto}
+ .palette-list{max-height:calc(100dvh - 140px)}
+ .palette-keys{display:none}
+}
+@media (forced-colors:active){
+ .palette-option[aria-selected=true]{outline:2px solid Highlight;outline-offset:-2px}
+ .palette-name mark{color:Highlight}
+}

@@ -46,6 +46,7 @@ import {
   uploadsSummary,
 } from './upload.js';
 import { setupMenu } from './menu.js';
+import { addPaletteActions } from './palette.js';
 import { fileIcon, fileKind, nextSort, parseSort, relativeTime, sortDescription, sortEntries, typeLabel } from './files.js';
 
 const BULK_MAX = 500;
@@ -144,6 +145,13 @@ setupSort();
 setInterval(refreshTimes, 60_000);
 await setupTemplates();
 setupNewMenu();
+// The command palette offers the same uploads and New folder as the New menu, for people who may add.
+addPaletteActions(() => {
+  if (!canAdd) return [];
+  const actions = [{ key: 'upload-files', label: 'Upload files', detail: `To ${self.name}`, keywords: 'add files', run: () => $('pick-files').click() }];
+  if (library?.folders !== false) actions.push({ key: 'new-folder', label: 'New folder', detail: `In ${self.name}`, keywords: 'create add make folder', run: () => askCreate('folder') });
+  return actions;
+});
 $('select-all').addEventListener('change', () => {
   const all = $('select-all').checked;
   for (const item of items) {

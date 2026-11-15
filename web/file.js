@@ -30,6 +30,7 @@ import {
   pageFor,
   removedMessage,
   requireMe,
+  startPalette,
   roleLine,
   seg,
   showCrumbs,
@@ -119,6 +120,7 @@ main().catch((err) => showProblem(err?.message || messageFor('unknown')));
 
 async function main() {
   me = await requireMe();
+  startPalette(me);
   docId = documentId();
   if (!docId) {
     showProblem(MISSING_DOCUMENT);
