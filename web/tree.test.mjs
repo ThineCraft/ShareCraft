@@ -202,10 +202,10 @@ test('cut words and the kept cut list', () => {
 test('the library page has the folder tree, the Folders toggle and the cut bar', () => {
   const html = readFileSync(new URL('./library.html', import.meta.url), 'utf8');
   assert.match(html, /<ul id="folder-tree" role="tree" aria-labelledby="folder-tree-title"><\/ul>/);
-  assert.match(html, /id="folders-toggle"[^>]*aria-controls="folder-pane"[^>]*aria-expanded="false"/);
+  assert.match(html, /id="folders-toggle"[^>]*aria-haspopup="dialog"[^>]*aria-expanded="false"/);
   assert.match(html, /id="cut-bar"/);
   assert.doesNotMatch(html, /style=/);
   const css = readFileSync(new URL('./style.css', import.meta.url), 'utf8');
-  assert.match(css, /\.lib-body\.tree-col\{/);
+  assert.match(css, /\.side-body>\.chrome\+\.folder-pane\{/);
   assert.match(css, /\.drop-ok/);
 });

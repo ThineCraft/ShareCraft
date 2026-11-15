@@ -6,6 +6,7 @@ import {
   countText,
   firstLines,
   isToggleKey,
+  paneShown,
   paneModel,
   peopleIn,
   previewKind,
@@ -193,4 +194,13 @@ test('isToggleKey takes "i" alone, outside text fields, menus and other dialogs'
   const sheet = { classList: { contains: (name) => name === 'details-sheet' } };
   assert.equal(isToggleKey(key('i', target({ dialog: other }))), false);
   assert.equal(isToggleKey(key('i', target({ dialog: sheet })), { sheetOpen: true }), true);
+});
+
+test('the details pane shows only with something selected, and gives the room back otherwise', () => {
+  assert.equal(paneShown({ open: true, selected: true, wide: true }), 'column');
+  assert.equal(paneShown({ open: true, selected: true, wide: false }), 'sheet');
+  assert.equal(paneShown({ open: true, selected: false, wide: true }), null, 'no empty pane');
+  assert.equal(paneShown({ open: false, selected: true, wide: true }), null);
+  assert.equal(paneShown({ open: true, selected: true, wide: true, enabled: false }), null, 'not in the grid');
+  assert.equal(paneShown(), null);
 });

@@ -214,6 +214,16 @@ export function paneModel(entry, details = {}, { now = Date.now(), regional } = 
   };
 }
 
+/**
+ * Where the pane shows: 'column' beside the table on wide screens, 'sheet' on narrow ones, or
+ * null. It shows only while it is open, the list is shown (`enabled`) and an item is selected:
+ * with nothing selected there is no empty pane, and the table has the room.
+ */
+export function paneShown({ open = false, selected = false, wide = true, enabled = true } = {}) {
+  if (!open || !enabled || !selected) return null;
+  return wide ? 'column' : 'sheet';
+}
+
 /** Whether a key press toggles the pane: "i" alone, outside text fields, menus and other dialogs. */
 export function isToggleKey(event, { sheetOpen = false } = {}) {
   if (event.key !== 'i' && event.key !== 'I') return false;
@@ -290,7 +300,7 @@ export function createDetails({ pane, sheet, status, rows, page, entry, act, me,
   document.addEventListener('keydown', (event) => {
     if (!enabled() || !isToggleKey(event, { sheetOpen: sheet.open })) return;
     event.preventDefault();
-    if (open) return hide();
+    if (open && where()) return hide();
     const focusedRow = document.activeElement?.closest?.('#' + rows.id + ' tr');
     const id = focusedRow?.dataset.id ?? (selectedId && entry(selectedId) ? selectedId : rows.querySelector('tr')?.dataset.id);
     if (id) show(entry(id), { focus: !wide.matches });
@@ -320,13 +330,19 @@ export function createDetails({ pane, sheet, status, rows, page, entry, act, me,
     }
   }
 
-  /** Puts the content in the column or the sheet, as the screen's width says. */
+  /** Where the pane is now (see `paneShown`). */
+  function where() {
+    return paneShown({ open, selected: Boolean(selectedId && entry(selectedId)), wide: wide.matches, enabled: enabled() });
+  }
+
+  /** Puts the content in the column or the sheet, as the screen's width says; nothing selected, nowhere. */
   function place() {
-    const column = open && wide.matches && enabled();
-    pane.hidden = !column;
-    page.classList.toggle('details-open', column);
-    if (column) pane.replaceChildren(content);
-    else if (open && enabled()) {
+    const at = where();
+    if (at !== 'sheet' && sheet.open) sheet.close();
+    pane.hidden = at !== 'column';
+    page.classList.toggle('details-open', at === 'column');
+    if (at === 'column') pane.replaceChildren(content);
+    else if (at === 'sheet') {
       sheet.replaceChildren(content);
       if (!sheet.open) sheet.showModal();
     }
@@ -336,8 +352,9 @@ export function createDetails({ pane, sheet, status, rows, page, entry, act, me,
   /** Selects `item` and shows the pane. `focus` moves focus into the pane (from Details). */
   function show(item, { focus = false, delay = 0 } = {}) {
     if (!item) return;
+    const shown = where();
     select(item, delay);
-    if (!open) {
+    if (!open || !shown) {
       open = true;
       remember();
       place();
@@ -381,7 +398,9 @@ export function createDetails({ pane, sheet, status, rows, page, entry, act, me,
     clearTimeout(timer);
     details = {};
     previewFor = null;
-    draw();
+    // Kept open with nothing selected, the pane comes back with the first selection.
+    if (open && pane.hidden && !sheet.open) place();
+    else draw();
     loadedFor = null;
     timer = setTimeout(() => {
       status.textContent = paneModel(item).announce;

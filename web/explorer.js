@@ -302,7 +302,10 @@ function treeRow({ row, depth, open }, breaksMode) {
     });
     parts.push(more);
   }
-  return h('li', { class: 'tree-row', style: `--depth:${depth}` }, ...parts);
+  // The depth goes through CSSOM: a style attribute is refused by the page's Content-Security-Policy.
+  const li = h('li', { class: 'tree-row' }, ...parts);
+  li.style.setProperty('--depth', String(depth));
+  return li;
 }
 
 // ---- the details of one break ----

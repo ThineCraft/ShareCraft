@@ -46,6 +46,7 @@ import {
   uploadsSummary,
 } from './upload.js';
 import { setupMenu } from './menu.js';
+import { sidebar } from './workspace.js';
 import { runLatestAction, showToast } from './toast.js';
 import { buildUndo, isUndoKey, performUndo } from './undo.js';
 import { addPaletteActions } from './palette.js';
@@ -479,7 +480,8 @@ function row(item) {
         h(
           'div',
           { class: 'name-text' },
-          h('a', { href: pageFor(item.kind, item.id, item.editor), class: 'name-link' }, item.name),
+          // One line with an ellipsis on screen; the whole name stays in the text and the tooltip.
+          h('a', { href: pageFor(item.kind, item.id, item.editor), class: 'name-link', title: item.name }, item.name),
           ...itemMarks(item).map((mark) => h('small', { class: 'mark warn' }, mark)),
           // The narrow layout's second line; screen readers get the same from the cells.
           h(
@@ -1082,20 +1084,22 @@ $('move-here').addEventListener('click', async () => {
 // ---- the folder tree ----
 
 /**
- * The library's folder tree. From 1000 pixels, when the table keeps enough room beside it (and
- * beside the details pane), it is a column at the left that the Folders button hides and shows
- * (remembered); otherwise the Folders button shows it above the table.
+ * The library's folder tree, in the page's one sidebar beneath the site's links (see
+ * workspace.js): a column that folds to a rail from 1000 pixels, a drawer opened from the
+ * Folders (or Menu) button below that.
  */
 function setupTree() {
-  if (!libraryStep || library?.folders === false) return;
-  // Constants here, not at the top level: this runs before the lines below it in the module.
-  const TREE_COLUMN = 220 + 16; // the tree's column and its gap
-  const TABLE_ROOM = 520; // the least the table keeps beside it
-  const DETAILS_COLUMN = 380; // the details pane and its gap
   const page = $('lib-body').closest('.page');
-  const toggle = $('folders-toggle');
+  const side = sidebar(page);
+  side.opener($('folders-toggle'));
+  if (!libraryStep || library?.folders === false) {
+    $('folder-pane').remove();
+    if (side.state.side === 'none') side.dissolve();
+    return;
+  }
   const pane = $('folder-pane');
-  toggle.hidden = false;
+  pane.hidden = false;
+  side.folders(pane);
   const steps = here.path.slice(here.path.indexOf(libraryStep));
   tree = mountFolderTree({
     list: $('folder-tree'),
@@ -1107,41 +1111,6 @@ function setupTree() {
     },
   });
   tree.reveal();
-  const wide = globalThis.matchMedia?.('(min-width: 1000px)') ?? { matches: true, addEventListener() {} };
-  let columnOpen = true;
-  try {
-    columnOpen = localStorage.getItem('sharecraft-folder-tree') !== 'closed';
-  } catch {
-    // no storage: the column shows
-  }
-  let shortOpen = false;
-  let fits = false;
-  const layout = () => {
-    const room = $('lib-body').clientWidth - (page.classList.contains('details-open') ? DETAILS_COLUMN : 0);
-    fits = wide.matches && room >= TREE_COLUMN + TABLE_ROOM;
-    const open = fits ? columnOpen : shortOpen;
-    $('lib-body').classList.toggle('tree-col', fits && open);
-    pane.hidden = !open;
-    toggle.setAttribute('aria-expanded', String(open));
-    if (!open && pane.contains(document.activeElement)) toggle.focus();
-  };
-  toggle.addEventListener('click', () => {
-    if (fits) {
-      columnOpen = !columnOpen;
-      try {
-        localStorage.setItem('sharecraft-folder-tree', columnOpen ? 'open' : 'closed');
-      } catch {
-        // not remembered
-      }
-    } else shortOpen = !shortOpen;
-    layout();
-  });
-  wide.addEventListener('change', layout);
-  if ('ResizeObserver' in globalThis) new ResizeObserver(layout).observe($('lib-body'));
-  else globalThis.addEventListener('resize', layout);
-  // Opening or closing the details pane changes the room beside the table.
-  new MutationObserver(layout).observe(page, { attributes: true, attributeFilter: ['class'] });
-  layout();
 }
 
 /** Each breadcrumb step knows its place in the path, so that items can be dropped on it. */

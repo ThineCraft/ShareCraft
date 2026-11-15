@@ -347,7 +347,7 @@ export function mountFolderTree({ list, root, path, currentId, onDraw = () => {}
         { class: band.has(row.id) ? 'tree-row band' : 'tree-row' },
         twisty,
         h('span', { class: 'tree-icon', 'aria-hidden': 'true' }, fileIcon('folder')),
-        h('span', { class: 'tree-name' }, row.name),
+        h('span', { class: 'tree-name', title: row.name }, row.name),
         row.loading ? h('span', { class: 'meta tree-loading' }, 'Loading…') : null,
       );
       line.style.setProperty('--level', String(row.level - 1));

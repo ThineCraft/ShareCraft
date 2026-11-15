@@ -3,6 +3,7 @@
 
 import { CHECK_LABELS, MIN_RATIO, applyLook, parseColour } from './look.js';
 import { setupAccountMenu, setupWordmark } from './account.js';
+import { existingSidebar, sidebar } from './workspace.js';
 
 const MESSAGES = {
   invalid_credentials: 'That email and password do not match.',
@@ -1284,6 +1285,7 @@ export function navigationView(site, nav, { currentId, vertical = false, hubThum
     const inner = open.filter((button) => button !== toggle);
     const last = inner.at(-1) ?? (open.includes(toggle) ? toggle : null);
     if (!last) return;
+    event.preventDefault(); // only this closes: a drawer around the navigation stays open
     if (last === toggle) toggle.setAttribute('aria-expanded', 'false');
     else setOpen(last, view.querySelector(`#${last.getAttribute('aria-controls')}`), false);
     last.focus();
@@ -1609,24 +1611,21 @@ function placeSite({ header, chrome, footer, vertical }, place) {
   else if (footer && page) page.append(footer);
 }
 
-/** Lays `page` out with the navigation `chrome` in a left column beside the rest, or not. */
+/**
+ * Puts the navigation `chrome` at the top of the page's sidebar (see workspace.js) when it is
+ * vertical, or back above the workspace when it is not; a sidebar left with nothing to hold goes.
+ */
 function sideBySide(page, chrome, vertical) {
-  let main = page.querySelector(':scope > .side-main');
   if (vertical) {
-    if (!main) {
-      const rest = [];
-      for (let node = chrome.nextSibling; node; node = node.nextSibling) {
-        if (!node.matches?.('[data-site-footer]')) rest.push(node);
-      }
-      main = h('div', { class: 'side-main' });
-      chrome.after(main);
-      main.append(...rest);
-    }
+    sidebar(page).links(chrome);
     page.classList.add('nav-vertical');
-  } else {
-    if (main) main.replaceWith(...main.childNodes);
-    page.classList.remove('nav-vertical');
+    return;
   }
+  page.classList.remove('nav-vertical');
+  const side = existingSidebar(page);
+  if (!side) return;
+  side.links(null);
+  if (side.state.side === 'none') side.dissolve();
 }
 
 /**

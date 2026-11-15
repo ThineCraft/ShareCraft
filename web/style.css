@@ -412,12 +412,10 @@ input[type=file]{max-width:100%}
 .site-mark.initials{background:var(--mark-accent,#3156c9);border-color:transparent;color:#fff;font-weight:600;font-size:13px}
 .mono.pic{background:transparent;overflow:hidden}
 .mono.pic img{width:100%;height:100%;object-fit:contain}
-/* vertical navigation: the bars in a left column beside the page from 900 pixels, in the Menu below */
+/* vertical navigation: the bars at the top of the sidebar (see the workspace below), in the
+   drawer below 1000 pixels */
+.side-body>.chrome{margin:0;border-bottom:0;padding-bottom:8px}
 @media (min-width:900px){
- .page.nav-vertical{max-width:1040px;display:grid;grid-template-columns:220px minmax(0,1fr);column-gap:24px;align-items:start}
- .page.nav-vertical>*{grid-column:1/-1}
- .page.nav-vertical>.chrome{grid-column:1;border-bottom:0;padding-bottom:0}
- .page.nav-vertical>.side-main{grid-column:2;min-width:0}
  .chrome.vertical .navbar{flex-direction:column;align-items:stretch}
  .chrome.vertical .navbar ul{flex-direction:column;align-items:stretch}
  .chrome.vertical .navbar li{flex-wrap:wrap}
@@ -526,16 +524,20 @@ body.dragging .drop-overlay{display:flex}
 /* library page: the file table. Type icons are inline SVG coloured here, each at 3:1 or more on
    the row (paper, band and hover) in light and dark. Under 700 pixels the table folds to the name
    with a second line; the folded cells stay for screen readers */
-.files{width:100%;border-collapse:collapse;margin:0 0 12px;border-top:1px solid var(--line)}
+.files{width:100%;table-layout:fixed;border-collapse:collapse;margin:0 0 12px;border-top:1px solid var(--line)}
 .files th,.files td{padding:6px 8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:middle}
 .files th{font-size:12px;font-weight:600;color:var(--muted);white-space:nowrap}
 .files tbody tr:nth-child(even){background:var(--band)}
 .files tbody tr:hover{background:var(--soft)}
-.files .c-select,.files .c-actions{width:1%;white-space:nowrap}
+/* fixed widths for the small columns; the name takes the rest and stays on one line */
+.files .c-select{width:36px;white-space:nowrap}
+.files .c-actions{width:56px;white-space:nowrap}
 .files .c-select input{display:block;width:20px;height:20px;margin:0}
-.files .c-modified,.files .c-type{width:1%;white-space:nowrap;font-size:13px;color:var(--muted)}
+.files .c-modified,.files .c-type{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:13px;color:var(--muted)}
+.files .c-modified{width:124px}
+.files .c-type{width:120px}
 .files .c-modified time{color:var(--text)}
-.files .c-sharing{width:1%;white-space:nowrap}
+.files .c-sharing{width:128px;white-space:nowrap;overflow:hidden}
 .files .c-sharing .mark+.mark{margin-left:4px}
 .files .none{color:var(--muted)}
 .files button.sort{min-height:32px;padding:2px 6px;margin:0 -6px;border:0;border-radius:6px;background:transparent;color:var(--muted);font-weight:600;font-size:12px;gap:4px}
@@ -543,8 +545,8 @@ body.dragging .drop-overlay{display:flex}
 .files th[aria-sort] button.sort{color:var(--text)}
 .sort-arrow{font-size:10px;min-width:10px}
 .name-cell{display:flex;align-items:center;gap:10px;min-width:0}
-.name-text{display:flex;flex-wrap:wrap;align-items:center;gap:2px 8px;min-width:0}
-.files a.name-link{font-weight:600;color:var(--text);text-decoration:none;overflow-wrap:anywhere}
+.name-text{display:flex;flex:1 1 auto;flex-wrap:wrap;align-items:center;gap:2px 8px;min-width:0}
+.files a.name-link{flex:0 1 auto;min-width:0;max-width:100%;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;font-weight:600;color:var(--text);text-decoration:none}
 .files a.name-link:hover,.files a.name-link:focus-visible{color:var(--accent-ink);text-decoration:underline}
 .files .sub{display:none}
 .file-pic{display:grid;place-items:center;width:28px;height:28px;flex:none;border-radius:5px;overflow:hidden}
@@ -576,6 +578,20 @@ body.dragging .drop-overlay{display:flex}
  .files .sub{display:flex;flex-wrap:wrap;align-items:center;gap:2px 8px;flex-basis:100%;font-size:12px;color:var(--muted)}
  .files .sub>span+span::before{content:"·";margin-right:8px}
  .files td{padding:8px 6px}
+ .files{table-layout:auto}
+ .files td.c-name{width:100%;max-width:0}
+ .files .c-select input{width:24px;height:24px}
+ .files .menu-button.dots{min-width:44px;min-height:44px}
+}
+@container libmain (max-width:640px){
+ .files thead{display:none}
+ .files tbody :is(.c-modified,.c-type,.c-sharing){position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap;border:0}
+ .sort-narrow:not([hidden]){display:flex!important}
+ .files .sub{display:flex;flex-wrap:wrap;align-items:center;gap:2px 8px;flex-basis:100%;font-size:12px;color:var(--muted)}
+ .files .sub>span+span::before{content:"·";margin-right:8px}
+ .files td{padding:8px 6px}
+ .files{table-layout:auto}
+ .files td.c-name{width:100%;max-width:0}
  .files .c-select input{width:24px;height:24px}
  .files .menu-button.dots{min-width:44px;min-height:44px}
 }
@@ -684,15 +700,15 @@ dialog.palette{max-width:min(640px,calc(100vw - 32px));margin:12vh auto auto;pad
 }
 /* library page: the details pane. From 1100 pixels a column beside the table that stays while the
    selection moves; below that a sheet that slides in from the right (full width at 375 pixels) */
-.page.wide.details-open{max-width:1440px}
-.lib-body{min-width:0}
-.lib-main{min-width:0}
+#lib-body{min-width:0}
+/* the table folds to names with a second line when its own column is narrow (details open beside it) */
+.lib-main{min-width:0;container:libmain/inline-size}
 .files tbody tr.pickable{cursor:default}
 .files tbody tr.pickable:focus-visible{outline:2px solid var(--accent-ink);outline-offset:-2px}
 .files tbody tr[aria-current=true]{background:var(--soft)}
 .files tbody tr[aria-current=true]>td:first-child{box-shadow:inset 3px 0 0 var(--accent-ink)}
 @media (min-width:1100px){
- .details-open .lib-body{display:grid;grid-template-columns:minmax(0,1fr) minmax(300px,360px);gap:20px;align-items:start}
+ .details-open #lib-body{display:grid;grid-template-columns:minmax(0,1fr) minmax(280px,340px);gap:20px;align-items:start}
 }
 aside.details-pane{position:sticky;top:12px;max-height:calc(100vh - 24px);overflow:auto;padding:0;border:1px solid var(--line);border-radius:12px;background:var(--paper)}
 .details-content{display:flex;flex-direction:column;gap:12px;padding:12px 16px 16px}
@@ -804,7 +820,7 @@ dialog.details-sheet[open]{animation:sheet-in .2s ease-out}
 .library-card:hover .card-link{color:var(--accent-ink);text-decoration:underline}
 .lib-pic{display:grid;place-items:center;flex:none;width:44px;height:44px;border-radius:10px;background:color-mix(in srgb,var(--ic) 14%,var(--paper))}
 .lib-pic .file-icon{width:32px;height:32px}
-.lib-body{display:flex;flex-direction:column;gap:3px;flex:1;min-width:0}
+.library-card .lib-body{display:flex;flex-direction:column;gap:3px;flex:1;min-width:0}
 .lib-body h3{margin:0;font-size:15px;line-height:1.3}
 .lib-facts{margin:0;font-size:12px;color:var(--muted)}
 .lib-facts:empty{display:none}
@@ -1000,20 +1016,14 @@ dialog input[type=password]{width:100%}
  .admin-link[aria-current=page]{box-shadow:none;outline:2px solid Highlight;outline-offset:-2px}
  .empty-state{border-color:CanvasText}
 }
-/* library page: the folder tree. A column at the left of the table from 1000 pixels when there is
-   room beside the table (and the details pane); otherwise behind the Folders button, above the
-   table. Rows are banded by the page (every second visible row) */
-.folder-pane{margin:0 0 12px;padding:8px 6px;border:1px solid var(--line);border-radius:10px;background:var(--paper);max-height:50vh;overflow:auto;min-width:0}
-.lib-body:not(.tree-col)>.folder-pane{grid-column:1/-1}
-.page .folder-pane .pane-title{margin:0 6px 6px;font-size:12px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
-.lib-body.tree-col{display:grid;grid-template-columns:220px minmax(0,1fr);gap:16px;align-items:start}
-.lib-body.tree-col>.folder-pane{position:sticky;top:12px;max-height:calc(100vh - 24px);margin:0}
-@media (min-width:1100px){
- .details-open .lib-body.tree-col{grid-template-columns:200px minmax(0,1fr) minmax(300px,360px)}
-}
+/* library page: the folder tree, in the sidebar beneath the site's links (see the workspace).
+   Rows are banded by the page (every second visible row) */
+.folder-pane{margin:0;padding:4px 0;min-width:0}
+.side-body>.chrome+.folder-pane{margin-top:8px;padding-top:12px;border-top:1px solid var(--line)}
+.page .folder-pane .pane-title,.side-drawer .folder-pane .pane-title{margin:0 6px 6px;font-size:12px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
 [role=tree],[role=tree] [role=group]{list-style:none;margin:0;padding:0}
 [role=tree] li[role=treeitem]{outline:none}
-.tree-row{display:flex;align-items:center;gap:4px;min-height:32px;padding:2px 8px 2px calc(var(--level,0) * 16px + 2px);border-radius:6px;cursor:pointer;overflow-wrap:anywhere}
+.tree-row{display:flex;align-items:center;gap:4px;min-height:32px;padding:2px 8px 2px calc(var(--level,0) * 16px + 2px);border-radius:6px;cursor:pointer;min-width:0}
 .tree-row.band{background:var(--band)}
 .tree-row:hover{background:var(--soft)}
 li[role=treeitem]:focus-visible>.tree-row{outline:2px solid var(--accent-ink);outline-offset:-2px}
@@ -1021,7 +1031,7 @@ li[role=treeitem][aria-selected=true]>.tree-row{background:var(--soft);font-weig
 .twisty{display:grid;place-items:center;flex:none;width:22px;height:24px;color:var(--muted);font-size:12px}
 .tree-icon{display:grid;place-items:center;flex:none}
 .tree-icon .file-icon{width:18px;height:18px}
-.tree-name{min-width:0}
+.tree-name{min-width:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
 .tree-loading{font-size:12px;margin-left:4px}
 @media (max-width:760px){
  .tree-row{min-height:44px}
@@ -1047,3 +1057,50 @@ li[role=treeitem][aria-selected=true]>.tree-row{background:var(--soft);font-weig
  .files tbody tr.drop-no,.tree-row.drop-no,.crumbs .drop-no{outline-color:CanvasText}
  li[role=treeitem][aria-selected=true]>.tree-row{outline:1px solid Highlight}
 }
+/* the workspace of site pages (library, site home, Share, recycle bin, explorer): a wide fluid
+   page up to 1600 pixels, the site header as wide as the content, and one left sidebar holding
+   the site's links (vertical navigation) and the library's folder tree. From 1000 pixels the
+   sidebar is a column that folds to a slim rail; below that a drawer from a Menu or Folders button */
+.page.workspace{max-width:1600px;padding:0 24px 24px}
+.page.has-side:not(.workspace){max-width:1040px}
+.ws{display:block;min-width:0}
+.side-main{min-width:0}
+.side[hidden]{display:none}
+.side-open{margin:12px 0 0}
+.side-open:not([hidden])+*{margin-top:8px}
+@media (min-width:1000px){
+ .page.has-side[data-side=column] .ws,.page.has-side[data-side=rail] .ws{display:grid;grid-template-columns:220px minmax(0,1fr);column-gap:24px;align-items:start}
+ .page.has-side[data-side=rail] .ws{grid-template-columns:40px minmax(0,1fr);column-gap:16px}
+ .side{position:sticky;top:0;max-height:100vh;overflow:auto;margin-top:12px;padding:0 8px 16px 0;border-right:1px solid var(--line);overscroll-behavior:contain}
+ [data-side=rail] .side{padding-right:0;border-right:0}
+}
+.side-head{display:flex;justify-content:flex-end;margin:0 0 4px}
+[data-side=rail] .side-head{justify-content:center}
+.side-toggle{min-height:32px;min-width:32px;padding:2px 8px;border-color:transparent;color:var(--muted);font-size:16px;line-height:1}
+.side-toggle:hover{background:var(--soft);color:var(--text)}
+/* the drawer: a modal dialog sliding in from the left; the sidebar's content moves into it */
+dialog.side-drawer{position:fixed;inset:0 auto 0 0;margin:0;width:min(340px,88vw);max-width:none;height:100%;max-height:none;padding:0;border:0;border-right:1px solid var(--line);border-radius:0 12px 12px 0;background:var(--paper);color:var(--text);overflow:auto;box-shadow:0 8px 32px rgb(0 0 0/.25)}
+dialog.side-drawer::backdrop{background:rgb(0 0 0/.35)}
+.side-drawer-head{position:sticky;top:0;z-index:1;display:flex;align-items:center;gap:8px;padding:8px 8px 8px 16px;border-bottom:1px solid var(--line);background:var(--paper)}
+.side-drawer-title{flex:1;margin:0;font-size:15px}
+.side-close{min-width:44px;min-height:44px;font-size:20px;line-height:1}
+.side-drawer-body{padding:8px 12px 16px}
+.side-drawer .chrome .menu-toggle{display:none!important}
+.side-drawer .chrome .chrome-menu{display:block!important}
+.side-drawer .chrome .navbar,.side-drawer .chrome .navbar ul{flex-direction:column;align-items:stretch}
+.side-drawer .navbar .sub{position:static;flex-basis:100%;max-width:none;box-shadow:none;border:0;border-left:2px solid var(--line);border-radius:0;margin-left:12px;padding:0}
+.side-drawer .tree-row,.side-drawer .navbar li>a{min-height:44px}
+@media (prefers-reduced-motion:no-preference){
+ dialog.side-drawer[open]{animation:drawer-in .18s ease-out}
+}
+@keyframes drawer-in{from{transform:translateX(-100%)}to{transform:none}}
+@media (max-width:760px){
+ .page.workspace{padding:0 16px 24px}
+ .side-open{min-height:44px}
+}
+@media (forced-colors:active){
+ dialog.side-drawer{border:1px solid CanvasText}
+ .side{border-right-color:CanvasText}
+}
+/* pages read as a column (Share, recycle bin): the band is wide, the content keeps a reading width */
+.page.workspace.reading>:not(.topbar,[data-site-header],[data-chrome],.ws,[data-site-footer]),.page.workspace.reading .side-main>*{max-width:900px}
