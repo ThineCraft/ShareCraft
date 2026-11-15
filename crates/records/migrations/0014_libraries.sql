@@ -27,3 +27,31 @@ alter table documents add constraint documents_editor_check
 -- default.
 insert into settings (key, value) values ('blocked_file_types', '[]')
 on conflict (key) do nothing;
+
+-- Malware scanning: the result belongs to the content, so the same bytes are scanned once.
+-- Content stored before this, or while no scanner is configured, is 'unscanned'. 'pending'
+-- waits for the scanner, 'failed' is retried at `next_scan_at` (`scan_attempts` failures so
+-- far), 'too_large' is over the scanner's limit, 'infected' names the threat in
+-- `scan_detail`, and 'released' was let through by an administrator. `scan_hold` is set once
+-- any upload names the content: pending content is available only while it is not, that is
+-- only when it was only ever saved from an editor.
+alter table blobs
+  add column scan text not null default 'unscanned'
+    check (scan in ('pending', 'clean', 'infected', 'failed', 'too_large', 'unscanned',
+                    'released')),
+  add column scan_detail text check (char_length(scan_detail) <= 200),
+  add column scanned_at timestamptz,
+  add column scan_attempts integer not null default 0 check (scan_attempts >= 0),
+  add column next_scan_at timestamptz,
+  add column scan_hold boolean not null default false;
+create index blobs_scan_due on blobs (next_scan_at) where scan in ('pending', 'failed');
+create index blobs_scan_held on blobs (scan) where scan in ('infected', 'failed', 'too_large');
+
+-- The scanner, reached over ICAP: no scanner until an administrator names one.
+insert into settings (key, value) values
+  ('scanner_url', '""'),
+  ('scanner_timeout_seconds', '120'),
+  ('scanner_max_bytes', '2147483648'),
+  ('scanner_unavailable', '"hold"'),
+  ('scanner_too_large', '"hold"')
+on conflict (key) do nothing;

@@ -24,7 +24,7 @@ use std::time::Duration;
 use axum::extract::ws::Utf8Bytes;
 use collab_core::ids::{ClientId, DocId, SessionId, UserId};
 use protocol::{FileServerMsg, Participant, RemovedReason, SaveState, SeatState};
-use records::{Access, NewEvent};
+use records::{Access, NewEvent, Origin};
 use revisions::{Author, BlobRef, Checkpoint, Outcome, RevisionId};
 use serde_json::{Map, Value};
 use tokio::sync::{mpsc, oneshot};
@@ -283,6 +283,8 @@ struct Waiting {
 /// One write to the store, taken from the session when it starts.
 struct WriteJob {
     blob: BlobRef,
+    /// An uploaded version is held until scanned; a save from the editor is not.
+    origin: Origin,
     base: Option<RevisionId>,
     author: Author,
     fields: Map<String, Value>,
@@ -686,6 +688,10 @@ impl FileRoom {
             return None;
         }
         let save = self.waiting.take()?;
+        let origin = match &save.from {
+            Saver::Holder { .. } => Origin::EditorSave,
+            Saver::Uploader { .. } => Origin::Upload,
+        };
         let author = match &save.from {
             Saver::Holder { token } => {
                 let holder = self
@@ -729,6 +735,7 @@ impl FileRoom {
         self.broadcast_save(SaveState::Saving, None);
         Some(WriteJob {
             blob: save.blob,
+            origin,
             base: save.base,
             author,
             fields: self.fields.clone(),
@@ -983,14 +990,25 @@ async fn run(
             let file_name = room.name.clone();
             let recorder = recorder.clone();
             let blob = job.blob;
+            let origin = job.origin;
             running = Some(tokio::spawn(async move {
-                write_claimed(&blobs, db.as_ref(), store, doc, blob, move |store| {
-                    let result = job.write(doc, &file_name, store);
-                    if let (Ok(Outcome::Written(revision)), Some(recorder)) = (&result, &recorder) {
-                        recorder.written(job.base.as_ref(), revision);
-                    }
-                    result
-                })
+                write_claimed(
+                    &blobs,
+                    db.as_ref(),
+                    store,
+                    doc,
+                    blob,
+                    origin,
+                    move |store| {
+                        let result = job.write(doc, &file_name, store);
+                        if let (Ok(Outcome::Written(revision)), Some(recorder)) =
+                            (&result, &recorder)
+                        {
+                            recorder.written(job.base.as_ref(), revision);
+                        }
+                        result
+                    },
+                )
                 .await
             }));
         }

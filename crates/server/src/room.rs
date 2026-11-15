@@ -19,7 +19,7 @@ use collab_core::ids::{ClientId, DocId, OpId, Seq, SessionId, UserId};
 use collab_core::server_log::ServerLog;
 use collab_text::{TextDoc, TextOp};
 use protocol::{Participant, RemovedReason, Resume, RoomEpoch, SaveState, ServerMsg};
-use records::{Access, Db, NewEvent};
+use records::{Access, Db, NewEvent, Origin};
 use revisions::{Author, Outcome, RevisionId};
 use serde_json::{Map, Value};
 use tokio::sync::{mpsc, oneshot};
@@ -881,7 +881,13 @@ async fn run(
         db,
         events,
     } = storage;
-    let initial = match load_serving(load(&store, &blobs, doc), &mut access_rx, &mut name).await {
+    let initial = match load_serving(
+        load(&store, &blobs, db.as_ref(), doc),
+        &mut access_rx,
+        &mut name,
+    )
+    .await
+    {
         Ok(initial) => initial,
         Err(err) => {
             eprintln!("sharecraft-server: cannot open document {}: {err}", doc.0);
@@ -952,7 +958,7 @@ async fn run(
                             .map_err(WriteError::Failed)?;
                         let blob = held.blob();
                         let written =
-                            write_claimed(&blobs, db.as_ref(), store, doc, blob, move |store| {
+                            write_claimed(&blobs, db.as_ref(), store, doc, blob, Origin::EditorSave, move |store| {
                             let result = job.write(doc, &file_name, blob, store);
                             if let (Ok(Outcome::Written(revision)), Some(recorder)) =
                                 (&result, &recorder)
@@ -1050,10 +1056,12 @@ pub(crate) fn grace_end(since: Instant, grace: Duration) -> Instant {
 }
 
 /// Reads the document's current revision, its text from the content store (or inline, for a
-/// version saved before it), without blocking the async workers.
+/// version saved before it), without blocking the async workers. Content the malware scanner
+/// holds is not loaded: the room then refuses everyone, and a later join tries again.
 async fn load(
     store: &Arc<dyn Checkpointer>,
     blobs: &Arc<Blobs>,
+    db: Option<&Db>,
     doc: DocId,
 ) -> Result<Initial, String> {
     let store = Arc::clone(store);
@@ -1064,6 +1072,17 @@ async fn load(
     let Some(stored) = loaded else {
         return Ok(Initial::default());
     };
+    if let (Some(db), revisions::Content::Blob(blob)) = (db, &stored.content)
+        && let Some(scan) = db
+            .availability(&blob.sha256)
+            .await
+            .map_err(|e| e.to_string())?
+    {
+        return Err(format!(
+            "revision {} is held by the malware scanner ({scan})",
+            stored.revision
+        ));
+    }
     let bytes = blobs.read_all(stored.content).await?;
     let text = String::from_utf8(bytes)
         .map_err(|_| format!("revision {} is not valid UTF-8 text", stored.revision))?;

@@ -65,8 +65,9 @@ pub(crate) struct Visitor {
 /// `GET /ws/docs/{doc_id}`: upgrades to a WebSocket connected to that document: its text room,
 /// or its file session when the document is a file. The caller is the signed-in person (`401`
 /// without a session) and needs a role on the document; a document that does not exist and one
-/// they have no role on are both `404`. Any query string, such as the `name` older pages send,
-/// is ignored.
+/// they have no role on are both `404`. A document whose current version the malware scanner
+/// holds is `423 held {scan}`. Any query string, such as the `name` older pages send, is
+/// ignored.
 pub(crate) async fn upgrade(
     State(state): State<AppState>,
     Path(doc_id): Path<String>,
@@ -115,6 +116,10 @@ async fn visitor(
     // A file no editor opens has no session to join.
     if document.editor == Editor::Other {
         return Err(ApiError::BadRequest);
+    }
+    // Content the malware scanner holds is neither opened in an editor nor loaded into a room.
+    if let Some(scan) = crate::scan::held_state(state, doc).await? {
+        return Err(ApiError::Held(scan));
     }
     Ok(Visitor {
         user: session.user.id,

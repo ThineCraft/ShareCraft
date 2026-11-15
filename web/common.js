@@ -79,6 +79,10 @@ const MESSAGES = {
     'Files of that type are not allowed here. The library or the organisation blocks it; choose another file or another library.',
   file_too_large:
     'That file is larger than this library takes. Choose a smaller file or another library.',
+  held:
+    'This file cannot be opened yet: it is waiting for the malware scanner, or the scanner found a threat in it. An administrator can release it.',
+  invalid_scanner_url:
+    'That is not a scanner address. Write it as icap://host/service or icap://host:port/service, with no user name or password.',
   invalid_library_settings:
     'Those library settings are not allowed. File types are written like .png (at most 100 of them), and an image library accepts only image types.',
   invalid_template:

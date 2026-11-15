@@ -21,7 +21,7 @@ use records::{
     validate_document_name, validate_language, validate_node_name, validate_template_body,
     validate_time_zone,
 };
-use records::{check_name, check_size};
+use records::{Origin, check_name, check_size};
 use revisions::{
     Author, BlobRef, Checkpoint, CheckpointError, Content, GitError, LibraryFields, LibraryRecord,
     OrgNavigation, SITE_SCHEMA, SiteRecord, SitesChange, Stamp, TemplateBody, TemplateFolder,
@@ -391,7 +391,8 @@ impl Default for Plan {
 /// into one from elsewhere; `BlockedFileType` or `FileTooLarge` for a file the policies of
 /// the library it would go into refuse (see [`check_policies`]): a renamed file's new name, a
 /// file moved into another library (or each file below a folder moved there) and every file a
-/// copy makes; `OutOfStep` while the tree needs repair; otherwise the Git or database error.
+/// copy makes; `Held` for a copy of a file whose latest version the malware scanner holds;
+/// `OutOfStep` while the tree needs repair; otherwise the Git or database error.
 /// A restore is never refused for a policy: a file whose type is now refused is restored, and
 /// its listings mark it.
 ///
@@ -485,6 +486,61 @@ pub async fn apply(state: &AppState, actor: &User, op: TreeOp) -> Result<Applied
         deleted,
         renamed,
     })
+}
+
+/// Purges the file `doc` for `actor`, an administrator deleting quarantined content (the route
+/// checks that): its tree record marked deleted, unless it is in the recycle bin already, and
+/// purged, in one commit that skips the bin, mirrored with `node.purged` (`quarantined: true`);
+/// then each content its versions named that nothing names any more is erased. Whether it
+/// purged it (`false` for a file purged meanwhile, or not a file).
+///
+/// # Errors
+/// `OutOfStep` while the tree needs repair; otherwise the Git or database error.
+pub(crate) async fn purge_quarantined(
+    state: &AppState,
+    actor: &User,
+    doc: DocId,
+) -> Result<bool, AccessError> {
+    let _turn = state.tree_lock().lock().await;
+    ensure_in_step(state).await?;
+    let id: NodeId = doc.into();
+    let before = match git_record(state, id).await {
+        Ok(record) => record,
+        Err(AccessError::NotFound) => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    if before.purged.is_some() || before.kind != kind_word(NodeKind::Document) {
+        return Ok(false);
+    }
+    let stamp = Stamp {
+        at: now_text(),
+        by: author_of(actor),
+    };
+    let mut gone = before.clone();
+    if gone.deleted.is_none() {
+        gone.deleted = Some(stamp.clone());
+        gone.deleted_with = Some(id.0);
+    }
+    gone.purged = Some(stamp);
+    gone.bin_stage = None;
+    let plan = Plan {
+        id,
+        message: format!("Purge quarantined file {}", before.name),
+        events: vec![NewEvent {
+            kind: "node.purged",
+            actor: Some(actor.id),
+            subject: None,
+            document: Some(doc),
+            node: Some(id),
+            detail: json!({ "name": before.name, "items": 1, "quarantined": true }),
+        }],
+        records: vec![gone],
+        undo: vec![before],
+        ..Plan::default()
+    };
+    let done = commit(state, Some(actor), plan).await?;
+    erase_released(state, done).await;
+    Ok(true)
 }
 
 /// Purges, as the server, every recycle bin entry deleted [`records::BIN_DAYS`] days or more
@@ -2696,6 +2752,12 @@ async fn plan_copy(
         let Some(stored) = stored else {
             continue;
         };
+        // Content the malware scanner holds is never copied.
+        if let Content::Blob(blob) = &stored.content
+            && let Some(scan) = db.availability(&blob.sha256).await?
+        {
+            return Err(AccessError::Held(scan));
+        }
         let hold = match stored.content {
             Content::Blob(blob) => state.blobs().hold_stored(blob).await.ok_or_else(|| {
                 DbError::new(format!(
@@ -2746,7 +2808,11 @@ async fn plan_copy(
         )
     };
     let wanted: Vec<(BlobRef, DocId)> = versions.iter().map(|v| (v.blob, v.doc)).collect();
-    let claims = match state.blobs().claim_all(db, &wanted).await {
+    let claims = match state
+        .blobs()
+        .claim_all(db, &wanted, Origin::EditorSave)
+        .await
+    {
         Ok(claims) => claims,
         Err(e) => {
             if let Some(reservation) = reservation {

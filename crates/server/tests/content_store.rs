@@ -508,7 +508,10 @@ async fn startup_erasure_waits_for_a_clean_rebuild() {
     // Content nothing names: a file with no row, and one with a row but no claim left.
     let loose = server.blob(b"stored, never saved");
     let withdrawn = server.blob(b"save that failed");
-    let claim = db.claim_blob(withdrawn, doc).await.unwrap();
+    let claim = db
+        .claim_blob(withdrawn, doc, records::Origin::EditorSave)
+        .await
+        .unwrap();
     db.settle_claim(claim, None).await.unwrap();
     let later = OffsetDateTime::now_utc() + time::Duration::days(2);
 

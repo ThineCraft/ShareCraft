@@ -23,9 +23,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use axum::body::{Body, Bytes};
 use collab_core::ids::DocId;
 use futures_util::StreamExt;
-use records::{BLOB_REFS_DIRTY, ClaimId, Db, Reservation};
+use records::{BLOB_REFS_DIRTY, ClaimId, Db, Origin, Reservation};
 use revisions::{BlobError, BlobRef, BlobStore, CheckpointError, Content, Outcome, RevisionId};
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{Notify, RwLock, mpsc};
 
 use crate::AppState;
 use crate::checkpoint::{Checkpointer, WriteError};
@@ -48,6 +48,8 @@ pub(crate) struct Blobs {
     holds: Mutex<HashMap<[u8; 32], usize>>,
     /// When the sweeper last walked the store's files, as of the time it was given.
     walked: Mutex<Option<time::OffsetDateTime>>,
+    /// Told whenever content is claimed, which may be new content for the scanner.
+    claimed: Notify,
 }
 
 /// How often the sweeper walks the store's files.
@@ -109,7 +111,13 @@ impl Blobs {
             erasing: RwLock::new(()),
             holds: Mutex::new(HashMap::new()),
             walked: Mutex::new(None),
+            claimed: Notify::new(),
         }
+    }
+
+    /// Notified whenever content is claimed: the scan worker waits on it.
+    pub(crate) fn claimed(&self) -> &Notify {
+        &self.claimed
     }
 
     /// Whether a walk of the store's files is due as of `now`: on the first sweep since the
@@ -254,15 +262,17 @@ impl Blobs {
         &self,
         db: &Db,
         claims: &[(BlobRef, DocId)],
+        origin: Origin,
     ) -> Result<Vec<ClaimId>, String> {
         if claims.is_empty() {
             return Ok(Vec::new());
         }
         let _turn = self.erasing.read().await;
         let ids = db
-            .claim_blobs(claims)
+            .claim_blobs(claims, origin)
             .await
             .map_err(|e| format!("cannot claim the contents of a copy: {e}"))?;
+        self.claimed.notify_one();
         if let Some((blob, _)) = claims
             .iter()
             .find(|(blob, _)| !self.store.contains(&blob.sha256))
@@ -295,18 +305,21 @@ impl Blobs {
     }
 
     /// Claims `blob` for a version of `doc` about to be committed, and checks it is still in
-    /// the store. A claim for content erased meanwhile is withdrawn and fails.
+    /// the store, from `origin` (see [`Db::claim_blob`]). A claim for content erased meanwhile
+    /// is withdrawn and fails.
     pub(crate) async fn claim(
         &self,
         db: &Db,
         blob: BlobRef,
         doc: DocId,
+        origin: Origin,
     ) -> Result<ClaimId, String> {
         let _turn = self.erasing.read().await;
         let claim = db
-            .claim_blob(blob, doc)
+            .claim_blob(blob, doc, origin)
             .await
             .map_err(|e| format!("cannot claim content {}: {e}", blob.hex()))?;
+        self.claimed.notify_one();
         if !self.store.contains(&blob.sha256) {
             self.settle(db, claim, None).await;
             return Err(format!(
@@ -362,8 +375,8 @@ pub(crate) async fn flag_dirty(db: &Db) {
 }
 
 /// Commits a checkpoint naming `blob` with `write`, claiming the content first and settling the
-/// claim after, when there is a database to claim it in (`db`); without one, the content is
-/// only checked to be there. A version written is counted in its site's usage (see
+/// claim after, when there is a database to claim it in (`db`), as coming from `origin`;
+/// without one, the content is only checked to be there. A version written is counted in its site's usage (see
 /// [`count_usage`]); a caller that reserved its bytes then releases its reservation.
 pub(crate) async fn write_claimed(
     blobs: &Blobs,
@@ -371,12 +384,13 @@ pub(crate) async fn write_claimed(
     store: Arc<dyn Checkpointer>,
     doc: DocId,
     blob: BlobRef,
+    origin: Origin,
     write: impl FnOnce(&dyn Checkpointer) -> Result<Outcome, CheckpointError> + Send + 'static,
 ) -> Result<Outcome, WriteError> {
     let claim = match db {
         Some(db) => Some(
             blobs
-                .claim(db, blob, doc)
+                .claim(db, blob, doc, origin)
                 .await
                 .map_err(WriteError::Failed)?,
         ),

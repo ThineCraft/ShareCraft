@@ -20,6 +20,7 @@ mod quotas;
 mod requests;
 mod revisions;
 mod roles;
+mod scans;
 mod scopes;
 mod settings;
 mod sites;
@@ -59,6 +60,12 @@ pub use requests::{
 };
 pub use revisions::{RevisionRecord, RevisionRow};
 pub use roles::{Access, Perms, Principal, RoleDef, RoleRef};
+pub use scans::{
+    DueScan, HeldDocument, ICAP_PORT, MAX_SCAN_DETAIL, Origin, QuarantineEntry, RELEASE_REASON,
+    SCANNER_MAX_BYTES, SCANNER_SETTINGS, SCANNER_TIMEOUT_SECONDS, SCANNER_TOO_LARGE,
+    SCANNER_UNAVAILABLE, SCANNER_URL, ScanInfo, ScanMark, ScanResult, ScanState, ScannerSettings,
+    ScannerUrl, clean_detail, retry_after, valid_scanner_setting,
+};
 pub use scopes::{Crumb, Cursor, Listed, NodeAccess};
 pub use settings::{ANYONE_LINK_MAX_DAYS, ANYONE_LINKS, SharingSettings};
 pub use sites::{

@@ -12,6 +12,7 @@ mod libraries;
 mod links;
 mod navigation;
 pub(crate) mod nodes;
+mod quarantine;
 mod requests;
 mod roles;
 mod session;
@@ -30,7 +31,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use collab_core::ids::{DocId, NodeId, SessionId, UserId};
-use records::{AccessError, AccountError, FileType, LinkError, RequestError};
+use records::{AccessError, AccountError, FileType, LinkError, RequestError, ScanState};
 use serde::de::DeserializeOwned;
 use serde_json::json;
 use uuid::Uuid;
@@ -146,6 +147,10 @@ pub(crate) fn router() -> Router<AppState> {
             "/settings/files",
             get(settings::files).put(settings::change_files),
         )
+        .route(
+            "/settings/scanner",
+            get(settings::scanner).put(settings::change_scanner),
+        )
         .nest("/l", crate::links::api_router())
         .route("/nodes/{id}/inheritance/preview", get(explorer::preview))
         .route("/explorer/{root}", get(explorer::breaks))
@@ -178,6 +183,16 @@ pub(crate) fn router() -> Router<AppState> {
         .route("/admin/sites", get(admin::sites))
         .route("/admin/sites/{id}", delete(admin::purge_site))
         .route("/admin/sites/{id}/restore", post(admin::restore_site))
+        .route("/admin/scan-existing", post(quarantine::scan_existing))
+        .route("/admin/quarantine", get(quarantine::list))
+        .route(
+            "/admin/quarantine/{sha256}/release",
+            post(quarantine::release),
+        )
+        .route(
+            "/admin/quarantine/{sha256}/delete",
+            post(quarantine::delete),
+        )
         .fallback(|| async { ApiError::NotFound })
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .layer(middleware::from_fn(require_same_origin))
@@ -289,6 +304,11 @@ pub(crate) enum ApiError {
     /// 413: the file is larger than its library takes; the answer's `limit` is the library's
     /// limit in bytes.
     FileTooLarge(u64),
+    /// 423: the content is held by the malware scanner (waiting for it, failed, too large or
+    /// infected), so its bytes are not handed out; the answer's `scan` says which.
+    Held(ScanState),
+    /// 422: not an ICAP scanner address (`icap://host[:port]/service`, no password).
+    InvalidScannerUrl,
     /// 422: the password is too short or too long.
     WeakPassword,
     /// 413: the body is larger than the route allows (16 KiB; file content, `max_file_bytes`).
@@ -392,6 +412,10 @@ impl ApiError {
             ApiError::WrongExtension => (StatusCode::UNPROCESSABLE_ENTITY, "wrong_extension"),
             ApiError::BlockedFileType(_) => (StatusCode::UNPROCESSABLE_ENTITY, "blocked_file_type"),
             ApiError::FileTooLarge(_) => (StatusCode::PAYLOAD_TOO_LARGE, "file_too_large"),
+            ApiError::Held(_) => (StatusCode::LOCKED, "held"),
+            ApiError::InvalidScannerUrl => {
+                (StatusCode::UNPROCESSABLE_ENTITY, "invalid_scanner_url")
+            }
             ApiError::WeakPassword => (StatusCode::UNPROCESSABLE_ENTITY, "weak_password"),
             ApiError::TooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "too_large"),
             ApiError::NotJson => (StatusCode::UNSUPPORTED_MEDIA_TYPE, "not_json"),
@@ -455,6 +479,8 @@ impl From<AccessError> for ApiError {
             AccessError::FoldersOff => ApiError::FoldersOff,
             AccessError::BlockedFileType(file_type) => ApiError::BlockedFileType(file_type),
             AccessError::FileTooLarge(limit) => ApiError::FileTooLarge(limit),
+            AccessError::Held(scan) => ApiError::Held(scan),
+            AccessError::InvalidScannerUrl => ApiError::InvalidScannerUrl,
             // `POST /api/docs` answers this itself, naming the extension expected.
             AccessError::WrongExtension => ApiError::InvalidRequest,
             AccessError::NameTaken => ApiError::NameTaken,
@@ -630,6 +656,7 @@ impl IntoResponse for ApiError {
                 json!({ "error": code, "extension": file_type })
             }
             ApiError::FileTooLarge(limit) => json!({ "error": code, "limit": limit }),
+            ApiError::Held(scan) => json!({ "error": code, "scan": scan }),
             _ => json!({ "error": code }),
         };
         (status, Json(body)).into_response()

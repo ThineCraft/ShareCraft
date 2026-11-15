@@ -184,6 +184,13 @@ pub(crate) struct ChildOut {
     /// stays, marked. Absent otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     policy: Option<&'static str>,
+    /// `held` for a file whose current version the malware scanner holds, `quarantined` for
+    /// one whose current version is infected. Absent when it is available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scan: Option<&'static str>,
+    /// The threat's name, for a quarantined file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    threat: Option<String>,
 }
 
 impl From<Listed> for ChildOut {
@@ -197,6 +204,8 @@ impl From<Listed> for ChildOut {
             revised_at: rfc3339(child.revised_at),
             inherits: !child.node.unique_scope,
             policy: None,
+            scan: None,
+            threat: None,
         }
     }
 }
@@ -219,14 +228,27 @@ impl ChildrenPage {
     }
 
     /// The page, each file in it that the file policies where it is (in `parent`) now refuse
-    /// marked `"policy": "blocked"`.
+    /// marked `"policy": "blocked"`, and each file the malware scanner holds marked `"scan":
+    /// "held"`, or `"scan": "quarantined"` with its `threat`.
     pub(crate) async fn marked(mut self, db: &Db, parent: NodeId) -> Result<Self, ApiError> {
-        if !self
+        let files: Vec<DocId> = self
             .items
             .iter()
-            .any(|item| item.kind == NodeKind::Document)
-        {
+            .filter(|item| item.kind == NodeKind::Document)
+            .filter_map(|item| Uuid::parse_str(&item.id).ok().map(DocId))
+            .collect();
+        if files.is_empty() {
             return Ok(self);
+        }
+        let mut marks = db
+            .scan_marks(&files)
+            .await
+            .map_err(|e| ApiError::unavailable(&e))?;
+        for item in &mut self.items {
+            let mark = Uuid::parse_str(&item.id)
+                .ok()
+                .and_then(|id| marks.remove(&DocId(id)));
+            (item.scan, item.threat) = super::docs::scan_fields(mark);
         }
         let Some((library, org)) = tree::policies_at(db, parent).await? else {
             return Ok(self);
@@ -416,7 +438,8 @@ pub(crate) struct Copied {
 
 /// `POST /api/nodes/{id}/copy {parent, name?}`: copies the file or folder into the library or
 /// folder `parent` (see [`tree::apply`]): `view` on it and `add` on `parent` are needed. `201
-/// {node, renamed}`; `renamed` says so when the name had to change.
+/// {node, renamed}`; `renamed` says so when the name had to change. A file whose latest
+/// version the malware scanner holds is not copied: `423 held {scan}`.
 pub(crate) async fn copy(
     State(state): State<AppState>,
     signed: Signed,

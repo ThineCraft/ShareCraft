@@ -279,7 +279,8 @@ async fn content(
 
 /// `GET /api/l/{token}/text/{node}`: a plain-text document's text as of its last saved
 /// revision (unsaved live edits are not shown): `{id, name, text, revision}`, `revision` `null`
-/// and `text` empty if it has never been saved. `404 link_not_found` for any other file.
+/// and `text` empty if it has never been saved. `404 link_not_found` for any other file;
+/// `423 held {scan}` while the malware scanner holds the text.
 async fn text(
     State(state): State<AppState>,
     Path((token, node)): Path<(String, String)>,
@@ -294,6 +295,7 @@ async fn text(
     let stored = blocking(&state, move |store| store.load(doc)).await?;
     let (text, revision) = match stored {
         Some(stored) => {
+            crate::scan::require_available(&state, &stored.content).await?;
             let bytes = state
                 .blobs()
                 .read_all(stored.content)

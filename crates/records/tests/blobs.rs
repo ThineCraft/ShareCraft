@@ -29,7 +29,10 @@ async fn claims_hold_content_until_settled() {
     let blob = BlobRef::of(b"bytes");
     let (d1, d2) = (doc(), doc());
 
-    let first = db.claim_blob(blob, d1).await.unwrap();
+    let first = db
+        .claim_blob(blob, d1, records::Origin::EditorSave)
+        .await
+        .unwrap();
     assert!(!db.release_blob_if_unreferenced(&blob.sha256).await.unwrap());
     db.settle_claim(first, Some(REV_A)).await.unwrap();
     assert_eq!(
@@ -44,7 +47,10 @@ async fn claims_hold_content_until_settled() {
     assert_eq!(db.blob_refs_of(&blob.sha256).await.unwrap().len(), 1);
 
     // Another document's failed save leaves nothing behind.
-    let second = db.claim_blob(blob, d2).await.unwrap();
+    let second = db
+        .claim_blob(blob, d2, records::Origin::EditorSave)
+        .await
+        .unwrap();
     db.settle_claim(second, None).await.unwrap();
     assert_eq!(db.blob_refs_of(&blob.sha256).await.unwrap().len(), 1);
 
@@ -108,9 +114,14 @@ async fn unreferenced_and_stale_rows_are_found_by_age() {
     );
     let d = doc();
     db.record_blob_ref(d, kept, REV_A).await.unwrap();
-    let claim = db.claim_blob(loose, d).await.unwrap();
+    let claim = db
+        .claim_blob(loose, d, records::Origin::EditorSave)
+        .await
+        .unwrap();
     db.settle_claim(claim, None).await.unwrap();
-    db.claim_blob(young, d).await.unwrap();
+    db.claim_blob(young, d, records::Origin::EditorSave)
+        .await
+        .unwrap();
     sqlx::query("update blobs set created_at = now() - interval '2 days' where sha256 <> $1")
         .bind(young.hex())
         .execute(db.test_pool())
@@ -142,7 +153,10 @@ async fn rebuild_replaces_completed_rows_and_clears_flags_only_when_complete() {
     let (a, b) = (BlobRef::of(b"a"), BlobRef::of(b"b"));
     let d = doc();
     db.record_blob_ref(d, a, REV_A).await.unwrap();
-    let pending = db.claim_blob(b, d).await.unwrap();
+    let pending = db
+        .claim_blob(b, d, records::Origin::EditorSave)
+        .await
+        .unwrap();
 
     // A rebuild that could not read everything only adds.
     db.rebuild_blob_refs(&[(d, b, REV_B.to_owned())], false)
@@ -175,7 +189,9 @@ async fn rows_of_many_contents_at_once() {
     let test = TestDb::create().await;
     let db = &test.db;
     let with_row = BlobRef::of(b"has a row");
-    db.claim_blob(with_row, doc()).await.unwrap();
+    db.claim_blob(with_row, doc(), records::Origin::EditorSave)
+        .await
+        .unwrap();
     let mut asked: Vec<[u8; 32]> = (0..5000u32)
         .map(|n| BlobRef::of(&n.to_le_bytes()).sha256)
         .collect();

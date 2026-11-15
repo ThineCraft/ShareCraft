@@ -120,10 +120,19 @@ pub(crate) struct DocDetail {
     /// The caller's access: `{perms, roles}`.
     access: Access,
     revision: Option<String>,
+    /// `held` while the malware scanner holds the current version, `quarantined` when it is
+    /// infected; absent when it is available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scan: Option<&'static str>,
+    /// The threat's name, when quarantined.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    threat: Option<String>,
 }
 
 /// `GET /api/docs/{id}`: the document, if the caller has access to it. For a file no editor
-/// opens, `editor` is `other`: the page shows a preview or offers a download.
+/// opens, `editor` is `other`: the page shows a preview or offers a download. A document whose
+/// current version the malware scanner holds is marked `scan: held`, or `scan: quarantined`
+/// with `threat` when it is infected; its bytes are not handed out until it is available.
 pub(crate) async fn open(
     State(state): State<AppState>,
     signed: Signed,
@@ -141,13 +150,31 @@ pub(crate) async fn open(
         .await
         .map_err(|e| ApiError::unavailable(&e))?
         .ok_or(ApiError::NotFound)?;
+    let mark = db
+        .scan_mark(doc)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?;
+    let (scan, threat) = scan_fields(mark);
     Ok(Json(DocDetail {
         id: document.id.0.to_string(),
         name: document.name,
         editor: document.editor,
         access,
         revision: document.revision,
+        scan,
+        threat,
     }))
+}
+
+/// The `scan` and `threat` fields that mark a held (`held`) or infected (`quarantined`) file.
+pub(crate) fn scan_fields(
+    mark: Option<records::ScanMark>,
+) -> (Option<&'static str>, Option<String>) {
+    match mark {
+        None => (None, None),
+        Some(mark) if mark.quarantined() => (Some("quarantined"), mark.threat),
+        Some(_) => (Some("held"), None),
+    }
 }
 
 /// Most events `GET /api/docs/{id}/events` returns.

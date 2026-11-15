@@ -15,11 +15,13 @@ pub mod config;
 pub mod editors;
 mod events;
 mod file_room;
+pub mod icap;
 pub mod libraries;
 mod links;
 mod members;
 mod projection;
 mod room;
+mod scan;
 pub mod sites;
 pub mod templates;
 pub mod tree;
@@ -51,6 +53,7 @@ pub use links::sweep_once;
 pub use projection::{
     BlobReport, Report, UsageReport, rebuild, reconcile, reconcile_blobs, reconcile_usage,
 };
+pub use scan::scan_once;
 
 use api::uploads::Uploads;
 use auth::Throttle;
@@ -74,6 +77,8 @@ struct Shared {
     blobs: Arc<Blobs>,
     /// The upload sessions' part files and running hashes.
     uploads: Arc<Uploads>,
+    /// The malware scan worker's turns and the contents it is scanning.
+    scanner: scan::Scanner,
     db: Db,
     editors: Editors,
     events: EventSink,
@@ -109,6 +114,7 @@ impl AppState {
                 checkpointer,
                 blobs: Arc::new(Blobs::new(blobs)),
                 uploads: Arc::new(Uploads::new(uploads_dir)),
+                scanner: scan::Scanner::default(),
                 events: EventSink::start(db.clone()),
                 editors: Editors::load(&editors_dir),
                 db,
@@ -149,6 +155,10 @@ impl AppState {
 
     fn uploads(&self) -> &Arc<Uploads> {
         &self.shared.uploads
+    }
+
+    fn scanner(&self) -> &scan::Scanner {
+        &self.shared.scanner
     }
 
     fn events(&self) -> &EventSink {
@@ -409,7 +419,8 @@ pub async fn prepare(config: Config) -> std::io::Result<AppState> {
 }
 
 /// Serves `state` on `listener` until the process ends, with the expiry sweeper (see
-/// [`sweep_once`]) running every minute meanwhile; it stops when serving does.
+/// [`sweep_once`]) running every minute and the malware scan worker (see [`scan_once`])
+/// meanwhile; they stop when serving does.
 ///
 /// # Errors
 /// Returns an error if the listener is not on a loopback address, or if accepting connections
@@ -417,6 +428,7 @@ pub async fn prepare(config: Config) -> std::io::Result<AppState> {
 pub async fn serve_state(state: AppState, listener: TcpListener) -> std::io::Result<()> {
     require_loopback(listener.local_addr()?)?;
     let _sweeper = links::start_sweeper(state.clone());
+    let _scanner = scan::start_worker(state.clone());
     axum::serve(listener, router(state)).await
 }
 

@@ -8,9 +8,14 @@
 //!   debug build, one at a time, printing the times they measure;
 //! - `editors <list|build|compress|verify>` builds an editor from its fork and installs it into
 //!   `editors/<id>`, with Brotli and gzip copies of its files; `compress` adds the copies to an
-//!   editor already installed.
+//!   editor already installed;
+//! - `fake-icap [--port 1344] [--slow] [--fail]` runs a small ICAP server for development: content
+//!   holding the EICAR test string is infected, anything else clean.
 
 mod editors;
+// Also included by the server's tests, which use the parts the command does not.
+#[allow(dead_code)]
+mod fake_icap;
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -30,7 +35,8 @@ fn main() -> ExitCode {
         Some("test") => test(std::env::args_os().skip(2)),
         Some("scale") => scale(),
         Some("editors") => editors::dispatch(&std::env::args().skip(2).collect::<Vec<_>>()),
-        _ => Err("usage: cargo xtask <web|check|test|scale|editors>".to_owned()),
+        Some("fake-icap") => fake_icap::run(&std::env::args().skip(2).collect::<Vec<_>>()),
+        _ => Err("usage: cargo xtask <web|check|test|scale|editors|fake-icap>".to_owned()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

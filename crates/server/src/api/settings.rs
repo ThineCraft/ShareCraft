@@ -1,20 +1,27 @@
 //! The organisation's settings: sharing (whether anyone links may be made and used, and how
-//! long one may last), the regional defaults of sites (language and time zone), and the file
-//! types blocked everywhere.
+//! long one may last), the regional defaults of sites (language and time zone), the file
+//! types blocked everywhere, and the malware scanner.
 
 use axum::Json;
 use axum::extract::State;
 use records::{
     ANYONE_LINK_MAX_DAYS, ANYONE_LINKS, DEFAULT_LANGUAGE, DEFAULT_TIME_ZONE, RegionalDefaults,
-    SharingSettings, validate_language, validate_time_zone,
+    SCANNER_MAX_BYTES, SCANNER_TIMEOUT_SECONDS, SCANNER_TOO_LARGE, SCANNER_UNAVAILABLE,
+    SCANNER_URL, ScannerSettings, SharingSettings, valid_scanner_setting, validate_language,
+    validate_time_zone,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use super::{ApiError, JsonBody};
 use crate::AppState;
 use crate::auth::Signed;
+use crate::icap::Client;
+
+/// The longest the test of new scanner settings waits for the scanner.
+const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The longest `anyone_link_max_days` may be, as the records layer allows.
 const MAX_DAYS_LIMIT: i64 = 365;
@@ -250,4 +257,129 @@ pub(crate) async fn change_files(
         .set_blocked_file_types(signed.session.user.id, &change.blocked_file_types)
         .await?;
     Ok(Json(FilesOut { blocked_file_types }))
+}
+
+/// `GET /api/settings/scanner`.
+#[derive(Serialize)]
+pub(crate) struct ScannerOut {
+    scanner_url: String,
+    scanner_timeout_seconds: u64,
+    scanner_max_bytes: u64,
+    scanner_unavailable: &'static str,
+    scanner_too_large: &'static str,
+}
+
+impl From<ScannerSettings> for ScannerOut {
+    fn from(settings: ScannerSettings) -> Self {
+        let choice = |allow: bool| if allow { "allow" } else { "hold" };
+        ScannerOut {
+            scanner_url: settings.url_text,
+            scanner_timeout_seconds: settings.timeout_seconds,
+            scanner_max_bytes: settings.max_bytes,
+            scanner_unavailable: choice(settings.unavailable_allow),
+            scanner_too_large: choice(settings.too_large_allow),
+        }
+    }
+}
+
+/// `GET /api/settings/scanner`: the malware scanner settings, for administrators (`403`
+/// otherwise).
+pub(crate) async fn scanner(
+    State(state): State<AppState>,
+    signed: Signed,
+) -> Result<Json<ScannerOut>, ApiError> {
+    if !signed.session.user.is_admin {
+        return Err(ApiError::Forbidden);
+    }
+    let settings = state
+        .db()
+        .scanner_settings()
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?;
+    Ok(Json(settings.into()))
+}
+
+/// The body of `PUT /api/settings/scanner`: the settings to change, at least one.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ScannerChange {
+    /// `icap://host[:port]/service`, or empty for no scanner.
+    scanner_url: Option<Value>,
+    /// 5 to 3600.
+    scanner_timeout_seconds: Option<Value>,
+    /// At least 1.
+    scanner_max_bytes: Option<Value>,
+    /// `hold` or `allow`.
+    scanner_unavailable: Option<Value>,
+    /// `hold` or `allow`.
+    scanner_too_large: Option<Value>,
+}
+
+/// `PUT /api/settings/scanner {scanner_url?, scanner_timeout_seconds?, scanner_max_bytes?,
+/// scanner_unavailable?, scanner_too_large?}`: changes the settings given, for administrators
+/// (`403` otherwise), each recorded as `setting.changed`; `422 invalid_scanner_url` for an
+/// address that is not `icap://host[:port]/service` (no user name or password), `422
+/// invalid_request` for any other value it does not take, or none given; nothing is changed
+/// then. The scanner is then asked for its `OPTIONS`: the answer is `{ok: true, server}` when
+/// it answers (`server: null` with no scanner), `{ok: false, error}` when it does not. The
+/// settings are kept either way, so new files wait until the scanner can be reached. Both carry
+/// `settings`, as they then are.
+pub(crate) async fn change_scanner(
+    State(state): State<AppState>,
+    signed: Signed,
+    JsonBody(change): JsonBody<ScannerChange>,
+) -> Result<Json<Value>, ApiError> {
+    if !signed.session.user.is_admin {
+        return Err(ApiError::Forbidden);
+    }
+    let changes: Vec<(&str, Value)> = [
+        (SCANNER_URL, change.scanner_url),
+        (SCANNER_TIMEOUT_SECONDS, change.scanner_timeout_seconds),
+        (SCANNER_MAX_BYTES, change.scanner_max_bytes),
+        (SCANNER_UNAVAILABLE, change.scanner_unavailable),
+        (SCANNER_TOO_LARGE, change.scanner_too_large),
+    ]
+    .into_iter()
+    .filter_map(|(key, value)| value.map(|value| (key, value)))
+    .collect();
+    if changes.is_empty() {
+        return Err(ApiError::InvalidRequest);
+    }
+    // All checked first, so that a bad value never leaves another one changed.
+    for (key, value) in &changes {
+        if !valid_scanner_setting(key, value) {
+            return Err(if *key == SCANNER_URL {
+                ApiError::InvalidScannerUrl
+            } else {
+                ApiError::InvalidRequest
+            });
+        }
+    }
+    let db = state.db();
+    let actor = signed.session.user.id;
+    for (key, value) in changes {
+        db.set_setting(actor, key, value).await?;
+    }
+    state.scanner().wake();
+    let settings = db
+        .scanner_settings()
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?;
+    let mut answer = match &settings.url {
+        None => json!({ "ok": true, "server": null }),
+        Some(url) => {
+            let timeout = Duration::from_secs(settings.timeout_seconds).min(TEST_TIMEOUT);
+            match Client::new(url.clone(), timeout).options().await {
+                Ok(options) => json!({ "ok": true, "server": options.server.or(options.istag) }),
+                Err(e) => json!({ "ok": false, "error": e.to_string() }),
+            }
+        }
+    };
+    if let Some(object) = answer.as_object_mut() {
+        object.insert(
+            "settings".to_owned(),
+            serde_json::to_value(ScannerOut::from(settings)).unwrap_or(Value::Null),
+        );
+    }
+    Ok(Json(answer))
 }

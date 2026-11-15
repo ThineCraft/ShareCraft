@@ -14,7 +14,7 @@ use revisions::{BlobRef, hex, parse_hex};
 use sqlx::PgConnection;
 use time::OffsetDateTime;
 
-use crate::{Db, DbError};
+use crate::{Db, DbError, Origin};
 
 /// The flag set once by the upgrade to the content store.
 pub const BLOB_REFS_UPGRADE: &str = "blob_refs_upgrade";
@@ -48,6 +48,30 @@ async fn upsert_blob(conn: &mut PgConnection, blob: &BlobRef) -> Result<(), sqlx
     Ok(())
 }
 
+/// Creates the row of `blob`, claimed for a version from `origin`, if there is none: `pending`
+/// for the scanner when one is configured, `unscanned` otherwise. A claim from an upload holds
+/// the content (`scan_hold`) whether the row is new or not, locking it.
+async fn upsert_claimed(
+    conn: &mut PgConnection,
+    blob: &BlobRef,
+    origin: Origin,
+) -> Result<(), sqlx::Error> {
+    let conflict = match origin {
+        Origin::Upload => "on conflict (sha256) do update set scan_hold = true",
+        Origin::EditorSave => "on conflict (sha256) do nothing",
+    };
+    let statement = format!(
+        "insert into blobs (sha256, size, scan, next_scan_at, scan_hold)          select $1, $2, case when s then 'pending' else 'unscanned' end,                 case when s then now() end, $3          from (select coalesce((select value #>> '{{}}' from settings                                 where key = 'scanner_url'), '') <> '' as s) configured          {conflict}"
+    );
+    sqlx::query(sqlx::AssertSqlSafe(statement))
+        .bind(blob.hex())
+        .bind(size_of(blob))
+        .bind(origin == Origin::Upload)
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
 /// Writes the completed row naming `blob` from `revision` of `doc`, unless it exists.
 async fn insert_completed(
     conn: &mut PgConnection,
@@ -72,10 +96,17 @@ impl Db {
     /// absent, locks it `FOR SHARE` (so no erasure can run meanwhile) and writes a pending
     /// `blob_refs` row, in one transaction. Once this returns, nothing erases `blob` until the
     /// claim is settled; the caller checks that the file is still there (an erasure that ran
-    /// just before may have removed it).
-    pub async fn claim_blob(&self, blob: BlobRef, doc: DocId) -> Result<ClaimId, DbError> {
+    /// just before may have removed it). `origin` says where the content comes from: new
+    /// content waits for the scanner when one is configured, and an upload holds it until it
+    /// is scanned (see [`crate::ScanState`]).
+    pub async fn claim_blob(
+        &self,
+        blob: BlobRef,
+        doc: DocId,
+        origin: Origin,
+    ) -> Result<ClaimId, DbError> {
         let mut tx = self.pool().begin().await?;
-        upsert_blob(&mut tx, &blob).await?;
+        upsert_claimed(&mut tx, &blob, origin).await?;
         sqlx::query("select sha256 from blobs where sha256 = $1 for share")
             .bind(blob.hex())
             .fetch_one(&mut *tx)
@@ -95,14 +126,18 @@ impl Db {
     /// Claims several contents at once, as [`Db::claim_blob`] claims one, in one transaction:
     /// for each `(content, document)` a pending row, with every content's `blobs` row created
     /// if absent and locked `FOR SHARE`, by hash. Answers the claims in the order given. For a
-    /// copy, whose versions are committed together.
-    pub async fn claim_blobs(&self, claims: &[(BlobRef, DocId)]) -> Result<Vec<ClaimId>, DbError> {
+    /// copy, whose versions are committed together; all from `origin`.
+    pub async fn claim_blobs(
+        &self,
+        claims: &[(BlobRef, DocId)],
+        origin: Origin,
+    ) -> Result<Vec<ClaimId>, DbError> {
         let mut tx = self.pool().begin().await?;
         // By hash, so two claims of the same contents never wait on each other in turn.
         let blobs: std::collections::BTreeMap<String, BlobRef> =
             claims.iter().map(|(blob, _)| (blob.hex(), *blob)).collect();
         for blob in blobs.values() {
-            upsert_blob(&mut tx, blob).await?;
+            upsert_claimed(&mut tx, blob, origin).await?;
         }
         let hashes: Vec<String> = blobs.keys().cloned().collect();
         sqlx::query("select sha256 from blobs where sha256 = any($1) order by sha256 for share")

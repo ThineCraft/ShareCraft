@@ -778,7 +778,10 @@ async fn sweep_walks_the_store_hourly() {
     let db = w.server.records_db();
     let withdrawn = w.server.blob(b"claimed, then withdrawn");
     let doc = DocId(Uuid::new_v4());
-    let claim = db.claim_blob(withdrawn, doc).await.unwrap();
+    let claim = db
+        .claim_blob(withdrawn, doc, records::Origin::EditorSave)
+        .await
+        .unwrap();
     db.settle_claim(claim, None).await.unwrap();
     server::sweep_once(
         state,

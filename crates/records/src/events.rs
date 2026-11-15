@@ -113,6 +113,20 @@ impl Db {
             .map_err(DbError::from)
     }
 
+    /// The events of `kind`, such as `content.scanned`, oldest first.
+    pub async fn events_of_kind(&self, kind: &str) -> Result<Vec<Event>, DbError> {
+        let rows = sqlx::query(
+            "select id, at, kind, actor, subject, document_id, detail              from events where kind = $1 order by id",
+        )
+        .bind(kind)
+        .fetch_all(self.pool())
+        .await?;
+        rows.iter()
+            .map(event_from_row)
+            .collect::<Result<_, sqlx::Error>>()
+            .map_err(DbError::from)
+    }
+
     /// The events whose subject is `subject`, oldest first.
     pub async fn events_about(&self, subject: UserId) -> Result<Vec<Event>, DbError> {
         let rows = sqlx::query(

@@ -26,7 +26,7 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use collab_core::ids::{DocId, NodeId};
 use futures_util::Stream;
-use records::{AccessError, Editor, NameConflict, QuotaError, Reservation, User};
+use records::{AccessError, Editor, NameConflict, Origin, QuotaError, Reservation, User};
 use revisions::{
     Author, BlobRef, Checkpoint, CheckpointError, Content, Outcome, RevisionId, Stored,
 };
@@ -44,6 +44,7 @@ use crate::checkpoint::Checkpointer;
 use crate::file_room::SaveReply;
 use crate::projection::record_first;
 use crate::room::credited_name;
+use crate::scan::require_available;
 use crate::tree;
 use crate::{AppState, auth::Signed};
 
@@ -228,7 +229,7 @@ async fn site_of(state: &AppState, node: NodeId) -> Result<NodeId, ApiError> {
 /// `GET /api/docs/{id}/content[?revision=<id>]`: the document's bytes, as its current revision
 /// or the given one, or the one byte range asked for (see [`file_answer`]). `204` if the
 /// document has no revision yet; `404` if the caller has no role on it or the revision is not
-/// one of its own.
+/// one of its own; `423 held {scan}` while the malware scanner holds that version's content.
 pub(crate) async fn download(
     State(state): State<AppState>,
     signed: Signed,
@@ -339,13 +340,16 @@ fn span_of(range: Option<&HeaderValue>, size: u64) -> Span {
 /// policy), never cached, naming its revision, with `Accept-Ranges: bytes`. When `range` asks
 /// for one byte range it is `206` with that range and its `Content-Range`, or `416` if it
 /// starts beyond the end. The bytes stream from the content store (an old version's from Git);
-/// a version whose content is missing from the store is logged and answers `503`.
+/// a version whose content is missing from the store is logged and answers `503`. Content the
+/// malware scanner holds (see [`records::ScanState`]) answers `423 held {scan}`, whichever
+/// version it is.
 pub(crate) async fn file_answer(
     state: &AppState,
     name: &str,
     stored: Stored,
     range: Option<&HeaderValue>,
 ) -> Result<Response, ApiError> {
+    require_available(state, &stored.content).await?;
     let mut headers = HeaderMap::new();
     headers.insert(
         CONTENT_TYPE,
@@ -747,6 +751,7 @@ pub(super) async fn create_uploaded(
         Arc::clone(state.checkpointer()),
         id,
         blob,
+        Origin::Upload,
         move |store| {
             store.write(&Checkpoint {
                 doc: id,

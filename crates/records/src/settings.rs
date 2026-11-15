@@ -8,6 +8,7 @@ use sqlx::PgConnection;
 
 use crate::events::{NewEvent, record};
 use crate::policies::{BLOCKED_FILE_TYPES, valid_blocked_types};
+use crate::scans::{SCANNER_SETTINGS, SCANNER_URL, valid_scanner_setting};
 use crate::sites::{DEFAULT_LANGUAGE, DEFAULT_TIME_ZONE, validate_language, validate_time_zone};
 use crate::{AccessError, Db, DbError};
 
@@ -38,6 +39,7 @@ fn validate(key: &str, value: &Value) -> Result<(), AccessError> {
         DEFAULT_TIME_ZONE => validate_time_zone(text()).is_ok(),
         ANYONE_LINKS => value.is_boolean(),
         BLOCKED_FILE_TYPES => valid_blocked_types(value),
+        key if SCANNER_SETTINGS.contains(&key) => valid_scanner_setting(key, value),
         ANYONE_LINK_MAX_DAYS => value
             .as_i64()
             .is_some_and(|days| (1..=MAX_DAYS_LIMIT).contains(&days)),
@@ -47,6 +49,7 @@ fn validate(key: &str, value: &Value) -> Result<(), AccessError> {
         (true, _) => Ok(()),
         (false, DEFAULT_LANGUAGE) => Err(AccessError::InvalidLanguage),
         (false, DEFAULT_TIME_ZONE) => Err(AccessError::InvalidTimeZone),
+        (false, SCANNER_URL) => Err(AccessError::InvalidScannerUrl),
         (false, _) => Err(AccessError::InvalidSetting),
     }
 }
@@ -104,7 +107,8 @@ impl Db {
     /// boolean, `anyone_link_max_days` an integer from 1 to 365, `default_language` a language
     /// tag and `default_time_zone` a time zone name: `InvalidLanguage` and `InvalidTimeZone`
     /// for those; `blocked_file_types` a clean list of extensions, see
-    /// [`crate::clean_blocked_types`]). Records `setting.changed` with the values before and after, unless the value is unchanged. Switching
+    /// [`crate::clean_blocked_types`]; the scanner settings as [`crate::ScannerSettings`]
+    /// describes them, `InvalidScannerUrl` for an address that is not one). Records `setting.changed` with the values before and after, unless the value is unchanged. Switching
     /// `anyone_links` off stops every anyone link at once without revoking any.
     pub async fn set_setting(
         &self,

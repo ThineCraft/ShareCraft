@@ -230,6 +230,13 @@ pub enum AccessError {
     /// [`crate::check_size`]).
     #[error("that file is larger than the {0} bytes allowed there")]
     FileTooLarge(u64),
+    /// The content is held by the malware scanner (waiting, failed, too large or infected), so
+    /// its bytes are not handed out or copied; its scan state.
+    #[error("that file is held by the malware scanner ({0})")]
+    Held(crate::ScanState),
+    /// Not an ICAP scanner address (`icap://host[:port]/service`, no password).
+    #[error("that is not a scanner address")]
+    InvalidScannerUrl,
     #[error("a document with that id already exists")]
     Exists,
     #[error("something with that name is already in that place")]

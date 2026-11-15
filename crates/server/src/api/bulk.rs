@@ -8,7 +8,7 @@
 use axum::Json;
 use axum::extract::State;
 use collab_core::ids::NodeId;
-use records::FileType;
+use records::{FileType, ScanState};
 use serde::{Deserialize, Serialize};
 
 use super::nodes::{copy_one, delete_one, move_one, node_id};
@@ -57,6 +57,9 @@ pub(crate) struct ItemResult {
     /// For `file_too_large`, the library's limit in bytes.
     #[serde(skip_serializing_if = "Option::is_none")]
     limit: Option<u64>,
+    /// For `held`, the scan state that holds the file's content.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scan: Option<ScanState>,
     /// For a copy, the new item.
     #[serde(skip_serializing_if = "Option::is_none")]
     new_id: Option<String>,
@@ -115,6 +118,7 @@ pub(crate) async fn run(
                     error: None,
                     extension: None,
                     limit: None,
+                    scan: None,
                     new_id: done.new_id,
                     renamed: done.renamed,
                 },
@@ -128,6 +132,10 @@ pub(crate) async fn run(
                     },
                     limit: match e {
                         ApiError::FileTooLarge(limit) => Some(limit),
+                        _ => None,
+                    },
+                    scan: match e {
+                        ApiError::Held(scan) => Some(scan),
                         _ => None,
                     },
                     new_id: None,
