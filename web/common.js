@@ -384,6 +384,46 @@ export function itemActions({ kind, access }) {
 }
 
 /**
+ * The entries of an item's Actions menu on the library page, in order: `rename`, `move`, `copy`,
+ * `delete` and `access`, each only where the person may. Copy needs only sight of the item (the
+ * place it goes to is checked in the dialog), but a library is never copied.
+ */
+export function rowMenu(item) {
+  const allowed = itemActions(item);
+  const entries = [];
+  if (allowed.rename) entries.push('rename');
+  if (allowed.move) entries.push('move');
+  if (item.kind !== 'library') entries.push('copy');
+  if (allowed.remove) entries.push('delete');
+  if (allowed.access) entries.push('access');
+  return entries;
+}
+
+/** What each new-document kind is called in the New menu. */
+export const NEW_DOC_LABELS = Object.freeze({
+  text: 'Text document',
+  gridcraft: 'Spreadsheet (.xlsx)',
+  wordcraft: 'Document (.docx)',
+  solidcraft: 'Design (.solidcraft.json)',
+});
+
+/**
+ * The entries of the library page's New menu, in order, as `{ key, label }`: Folder (unless the
+ * library takes no folders), each document kind in `editors`, From a template (when there are
+ * templates), then Upload files and Upload a folder.
+ */
+export function newMenu({ folders = true, editors = [], templates = 0 } = {}) {
+  const entries = [];
+  if (folders !== false) entries.push({ key: 'folder', label: 'Folder' });
+  for (const editor of editors) {
+    if (Object.hasOwn(NEW_DOC_LABELS, editor)) entries.push({ key: `doc:${editor}`, label: NEW_DOC_LABELS[editor] });
+  }
+  if (templates > 0) entries.push({ key: 'template', label: 'From a template…' });
+  entries.push({ key: 'files', label: 'Upload files' }, { key: 'folder-upload', label: 'Upload a folder' });
+  return entries;
+}
+
+/**
  * What the explorer's "who" filter offers: the people and groups named on `assignments` (the
  * explorer's root) and on every break in `breaks` (as `GET /api/explorer/{root}` lists them),
  * the `groups` listed (`GET /api/groups`) and `members` (people seen as members of groups,

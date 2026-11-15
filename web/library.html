@@ -20,74 +20,38 @@
  <h1 id="title">Library</h1>
  <p id="kind" class="kind"></p>
  <p id="library-description" class="description" hidden></p>
- <div id="top-tools" class="toolbar" hidden>
-  <a id="settings-link" class="button plain" href="#" hidden>Library settings</a>
-  <a id="access-link" class="button plain" href="#">Access</a>
-  <a id="explorer-link" class="button plain" href="#">Inheritance explorer</a>
- </div>
- <p><a id="bin-link" class="button plain" href="#">Recycle bin</a></p>
  <p id="error" role="alert" class="msg"></p>
- <div id="edit-tools" hidden>
-  <form id="new-folder" class="row">
-   <div class="field">
-    <label for="folder-name">New folder</label>
-    <input type="text" id="folder-name" maxlength="120" autocomplete="off" required>
-   </div>
-   <button type="submit">New folder</button>
-  </form>
-  <form id="new-doc" class="row">
-   <div class="field">
-    <label for="doc-kind">New document</label>
-    <select id="doc-kind">
-     <option value="text" selected>Text document</option>
-     <option value="gridcraft">Spreadsheet (.xlsx)</option>
-     <option value="wordcraft">Document (.docx)</option>
-     <option value="solidcraft">Design (.solidcraft.json)</option>
-    </select>
-   </div>
-   <div class="field">
-    <label for="doc-name">Name (optional)</label>
-    <input type="text" id="doc-name" maxlength="120" autocomplete="off">
-   </div>
-   <button type="submit">New document</button>
-  </form>
-  <form id="from-template" class="row" hidden>
-   <div class="field">
-    <label for="template-choice">New from template</label>
-    <select id="template-choice"></select>
-   </div>
-   <div class="field">
-    <label for="template-name">Name (optional)</label>
-    <input type="text" id="template-name" maxlength="120" autocomplete="off">
-   </div>
-   <button type="submit">New from template</button>
-  </form>
-  <div id="drop-zone" class="drop" tabindex="-1">
-   <p><strong>Drop files or folders anywhere on this page to upload them here.</strong></p>
-   <p id="accepts" class="meta" hidden></p>
-   <div class="row">
-    <div class="field">
-     <label for="pick-files">Choose files</label>
-     <input type="file" id="pick-files" multiple>
-    </div>
-    <div class="field">
-     <label for="pick-folder">Choose a folder</label>
-     <input type="file" id="pick-folder" webkitdirectory>
-    </div>
-   </div>
-  </div>
- </div>
  <section id="upload-panel" aria-labelledby="upload-heading" hidden>
   <h2 id="upload-heading">Uploads</h2>
   <p id="upload-summary" role="status" aria-live="polite" class="meta"></p>
   <ul id="uploads" class="list"></ul>
   <p><button type="button" id="uploads-clear" class="plain">Clear finished</button></p>
  </section>
- <h2 id="items-heading">Contents</h2>
- <div id="view-switch" class="toolbar" role="group" aria-label="View" hidden>
-  <button type="button" id="view-list" class="plain" aria-pressed="true">List</button>
-  <button type="button" id="view-grid" class="plain" aria-pressed="false">Grid</button>
+ <h2 id="items-heading" class="visually-hidden">Contents</h2>
+ <div id="lib-toolbar" class="lib-toolbar">
+  <div id="new-wrap" class="menu-wrap" hidden>
+   <button type="button" id="new-button" class="menu-button">New <span class="caret" aria-hidden="true">▾</span></button>
+   <ul id="new-menu" class="menu" aria-label="New" hidden></ul>
+  </div>
+  <p id="drop-hint" class="meta drop-hint" hidden>or drop files anywhere on this page</p>
+  <span class="spacer"></span>
+  <div id="view-switch" class="view-switch" role="group" aria-label="View" hidden>
+   <button type="button" id="view-list" class="plain" aria-pressed="true">List</button>
+   <button type="button" id="view-grid" class="plain" aria-pressed="false">Grid</button>
+  </div>
+  <div class="menu-wrap">
+   <button type="button" id="more-button" class="plain menu-button" aria-label="More for this library">More <span class="caret" aria-hidden="true">▾</span></button>
+   <ul id="more-menu" class="menu end" aria-label="More for this library" hidden>
+    <li role="none"><a role="menuitem" id="settings-link" href="#" hidden>Library settings</a></li>
+    <li role="none"><a role="menuitem" id="access-link" href="#" hidden>Access</a></li>
+    <li role="none"><a role="menuitem" id="explorer-link" href="#" hidden>Inheritance explorer</a></li>
+    <li role="none"><a role="menuitem" id="bin-link" href="#">Recycle bin</a></li>
+   </ul>
+  </div>
  </div>
+ <p id="accepts" class="meta" hidden></p>
+ <input type="file" id="pick-files" multiple hidden tabindex="-1" aria-hidden="true">
+ <input type="file" id="pick-folder" webkitdirectory hidden tabindex="-1" aria-hidden="true">
  <div id="bulk-bar" class="toolbar" role="toolbar" aria-label="Selected items" hidden>
   <label class="check"><input type="checkbox" id="select-all"> Select all</label>
   <span id="selected-count" class="meta" role="status"></span>
@@ -104,6 +68,33 @@
  <p id="empty" hidden>There is nothing here yet.</p>
  <p><button type="button" id="more" class="plain" hidden>Show more</button></p>
 </div>
+
+<div id="drop-overlay" class="drop-overlay" aria-hidden="true">
+ <div class="drop-card">
+  <p class="drop-title">Drop to upload to <strong id="drop-target"></strong></p>
+  <p id="drop-accepts" class="meta"></p>
+ </div>
+</div>
+
+<dialog id="create-dialog" aria-labelledby="create-title">
+ <form id="create-form" method="dialog">
+  <h2 id="create-title">New folder</h2>
+  <div id="create-template-field" class="field" hidden>
+   <label for="create-template">Template</label>
+   <select id="create-template"></select>
+  </div>
+  <div class="field">
+   <label for="create-name" id="create-name-label">Name</label>
+   <input type="text" id="create-name" maxlength="120" autocomplete="off" aria-describedby="create-hint">
+  </div>
+  <p id="create-hint" class="meta"></p>
+  <p id="create-error" role="alert" class="msg"></p>
+  <div class="row end">
+   <button type="button" id="create-cancel" class="plain">Cancel</button>
+   <button type="submit" id="create-submit">Create</button>
+  </div>
+ </form>
+</dialog>
 
 <dialog id="rename-dialog" aria-labelledby="rename-title">
  <form id="rename-form" method="dialog">

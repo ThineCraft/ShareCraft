@@ -27,6 +27,8 @@ import {
   filterChoices,
   groupLabel,
   itemActions,
+  newMenu,
+  rowMenu,
   permsText,
   previewSections,
   principalParts,
@@ -296,6 +298,30 @@ test('each item offers only the actions its access allows', () => {
   assert.deepEqual(itemActions({ kind: 'library', access: OWNER }), {
     rename: true, move: false, remove: false, access: true,
   });
+});
+
+test('the Actions menu of a row lists what the person may do, in a fixed order', () => {
+  assert.deepEqual(rowMenu({ kind: 'document', access: VIEWER }), ['copy']);
+  assert.deepEqual(rowMenu({ kind: 'folder', access: null }), ['copy']);
+  assert.deepEqual(rowMenu({ kind: 'folder', access: EDITOR }), ['rename', 'move', 'copy', 'delete']);
+  assert.deepEqual(rowMenu({ kind: 'document', access: OWNER }), ['rename', 'move', 'copy', 'delete', 'access']);
+  // A library is never copied, moved or deleted from here.
+  assert.deepEqual(rowMenu({ kind: 'library', access: EDITOR }), []);
+  assert.deepEqual(rowMenu({ kind: 'library', access: OWNER }), ['rename', 'access']);
+});
+
+test('the New menu offers folders, the allowed document kinds, templates and uploads', () => {
+  const keys = (entries) => entries.map((entry) => entry.key);
+  assert.deepEqual(keys(newMenu({ editors: ['text', 'gridcraft', 'wordcraft', 'solidcraft'] })), [
+    'folder', 'doc:text', 'doc:gridcraft', 'doc:wordcraft', 'doc:solidcraft', 'files', 'folder-upload',
+  ]);
+  // A library that takes no folders and only images: uploads only.
+  assert.deepEqual(keys(newMenu({ folders: false, editors: [] })), ['files', 'folder-upload']);
+  assert.deepEqual(keys(newMenu({ editors: ['text', 'pdfcraft'], templates: 2 })), [
+    'folder', 'doc:text', 'template', 'files', 'folder-upload',
+  ]);
+  const labels = newMenu({ editors: ['gridcraft'], templates: 1 }).map((entry) => entry.label);
+  assert.deepEqual(labels, ['Folder', 'Spreadsheet (.xlsx)', 'From a template…', 'Upload files', 'Upload a folder']);
 });
 
 const child = (id, kind, inherits, access = OWNER) => ({ id, kind, name: id, inherits, access });

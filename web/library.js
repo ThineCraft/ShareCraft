@@ -16,7 +16,9 @@ import {
   libraryKindLabel,
   libraryViews,
   messageFor,
+  newMenu,
   policyRefusalText,
+  rowMenu,
   offerRequest,
   moveChoices,
   pageFor,
@@ -43,6 +45,7 @@ import {
   progressText,
   uploadsSummary,
 } from './upload.js';
+import { setupMenu } from './menu.js';
 
 const BULK_MAX = 500;
 const GRID_PAGE = 200; // the grid's page, the most the server answers at once
@@ -79,28 +82,25 @@ if (library?.description) {
   $('library-description').textContent = library.description;
   $('library-description').hidden = false;
 }
-$('edit-tools').hidden = !can(here.access, 'add');
-// New folder is hidden while the library takes no folders.
-$('new-folder').hidden = library?.folders === false;
 // New document offers only the editors whose files the library takes: none in an image library.
 const docEditors = newDocEditors(library?.effective_allowed_types ?? null, library?.blocked_types ?? []);
-for (const option of [...$('doc-kind').options]) {
-  if (!docEditors.includes(option.value)) option.remove();
-}
-$('new-doc').hidden = docEditors.length === 0;
 // What the library takes, so that a refusal is no surprise.
 const accepts = [];
 if (Array.isArray(library?.effective_allowed_types)) accepts.push(`Takes only ${typeListText(library.effective_allowed_types)}.`);
 if (library?.blocked_types?.length) accepts.push(`Does not take ${typeListText(library.blocked_types)}.`);
 if (typeof library?.max_file_bytes === 'number') accepts.push(`Files up to ${formatSize(library.max_file_bytes)}.`);
 $('accepts').textContent = accepts.join(' ');
-$('accepts').hidden = accepts.length === 0;
+$('drop-accepts').textContent = accepts.join(' ');
 const manageSite = can(here.access, 'manage_site') && libraryStep !== undefined;
-$('settings-link').hidden = !manageSite;
+// The library-level links live in the More menu; an entry the person may not use is left out.
+const showEntry = (id, shown) => {
+  $(id).hidden = !shown;
+  $(id).closest('li').hidden = !shown;
+};
+showEntry('settings-link', manageSite);
 if (libraryStep) $('settings-link').href = `/library-settings.html?id=${seg(libraryStep.id)}`;
-$('access-link').hidden = !can(here.access, 'manage_access');
-$('explorer-link').hidden = !can(here.access, 'manage_access');
-$('top-tools').hidden = !(can(here.access, 'manage_access') || manageSite);
+showEntry('access-link', can(here.access, 'manage_access'));
+showEntry('explorer-link', can(here.access, 'manage_access'));
 $('explorer-link').href = `/explorer.html?root=${seg(nodeId)}`;
 $('access-link').href = `/access.html?id=${seg(nodeId)}`;
 await siteChrome(here.path[0].id, { currentId: here.path.find((step) => step.kind === 'library')?.id, footer: true });
@@ -108,6 +108,9 @@ await siteChrome(here.path[0].id, { currentId: here.path.find((step) => step.kin
 $('bin-link').href = `/bin.html?site=${seg(here.path[0].id)}`;
 const siteId = here.path[0].id;
 const canAdd = can(here.access, 'add');
+$('accepts').hidden = !canAdd || accepts.length === 0;
+$('drop-target').textContent = self.name;
+setupMenu($('more-button'), $('more-menu'));
 
 // Everything the code below reads while the page is drawn is declared here, before the first
 // await: a `let` or `const` further down would still be unusable when `reload` draws the list.
@@ -129,10 +132,13 @@ const views = libraryViews(library?.kind);
 let view = 'list'; // 'grid' only in an image library
 let watcher = null; // loads a tile's thumbnail when it scrolls into view
 let templates = [];
+let creating = null; // what the create dialog makes: 'folder', 'doc:<editor>' or 'template'
+let actionsFor = null; // the item whose Actions menu was used last, so focus can go back to it
 
 $('more').addEventListener('click', () => loadPage());
 setupViews();
 await setupTemplates();
+setupNewMenu();
 $('select-all').addEventListener('change', () => {
   const all = $('select-all').checked;
   for (const item of items) {
@@ -172,8 +178,15 @@ function render() {
   watcher = null;
   const grid = view === 'grid';
   $('items').classList.toggle('grid', grid);
+  const lostFocus = document.activeElement === document.body || $('items').contains(document.activeElement);
   $('items').replaceChildren(...items.map(grid ? tile : row));
   showSelection();
+  // After a rename (or anything else chosen from a row's menu) focus goes back to that row's
+  // Actions button, when the row is still there and focus has not gone anywhere else.
+  if (lostFocus && actionsFor) {
+    const again = [...$('items').querySelectorAll('button[data-for]')].find((b) => b.dataset.for === actionsFor);
+    again?.focus();
+  }
 }
 
 // ---- the Grid / List switch of an image library ----
@@ -267,31 +280,12 @@ async function setupTemplates() {
   if (!canAdd || !libraryStep) return;
   const result = await api('GET', `/libraries/${seg(libraryStep.id)}/templates`);
   templates = result.ok ? result.data : [];
-  $('from-template').hidden = templates.length === 0;
-  $('template-choice').replaceChildren(
+  $('create-template').replaceChildren(
     ...templates.map((template) =>
       h('option', { value: template.id }, `${template.name} (${template.library_name})`),
     ),
   );
 }
-
-$('from-template').addEventListener('submit', async (event) => {
-  event.preventDefault();
-  note('', false);
-  const template = templates.find((t) => t.id === $('template-choice').value);
-  if (!template) return;
-  const body = { template: template.id };
-  if (self.kind === 'folder') body.parent = nodeId;
-  const name = $('template-name').value.trim();
-  if (name) body.name = name;
-  const result = await api('POST', `/libraries/${seg(libraryStep.id)}/from-template`, body);
-  if (!result.ok) {
-    return note(policyRefusalText(result.error, result.data, name || template.name) ?? messageFor(result.error), true);
-  }
-  $('template-name').value = '';
-  note(`“${result.data.node.name}” was made from the template ${template.name}.`, false);
-  await reload();
-});
 
 /** The bulk bar: Select all, how many are checked, and the buttons that need a selection. */
 function showSelection() {
@@ -320,24 +314,6 @@ function kindLabel(item) {
 }
 
 function row(item) {
-  const buttons = [];
-  const allowed = itemActions(item);
-  if (allowed.rename) buttons.push(action('Rename', item, askRename));
-  if (allowed.move) buttons.push(action('Move…', item, (one) => askMove([one], 'move')));
-  if (allowed.remove) buttons.push(action('Delete', item, (one) => askDelete([one])));
-  if (allowed.access) {
-    buttons.push(
-      h(
-        'a',
-        {
-          class: 'button plain',
-          href: `/access.html?id=${seg(item.id)}`,
-          'aria-label': `Access to ${item.name}`,
-        },
-        'Access',
-      ),
-    );
-  }
   const saved =
     item.kind === 'document'
       ? item.revised_at
@@ -357,24 +333,54 @@ function row(item) {
     'li',
     {},
     box,
-    h('span', { class: 'grow' }, h('a', { href: pageFor(item.kind, item.id, item.editor) }, item.name)),
-    h('small', {}, kindLabel(item)),
-    saved && h('small', {}, saved),
-    item.access ? null : h('small', { class: 'mark' }, 'Limited access'),
-    item.inherits || item.kind === 'library' ? null : h('small', { class: 'mark' }, 'Own permissions'),
-    ...itemMarks(item).map((mark) => h('small', { class: 'mark warn' }, mark)),
-    buttons.length ? h('span', { class: 'actions' }, ...buttons) : null,
+    h(
+      'span',
+      { class: 'grow' },
+      h('a', { href: pageFor(item.kind, item.id, item.editor) }, item.name),
+      h(
+        'span',
+        { class: 'details' },
+        h('small', {}, kindLabel(item)),
+        saved && h('small', {}, saved),
+        item.access ? null : h('small', { class: 'mark' }, 'Limited access'),
+        item.inherits || item.kind === 'library' ? null : h('small', { class: 'mark' }, 'Own permissions'),
+        ...itemMarks(item).map((mark) => h('small', { class: 'mark warn' }, mark)),
+      ),
+    ),
+    actionsMenu(item),
   );
 }
 
-function action(label, item, handler) {
+/** A row's Actions menu ("⋯"): Rename, Move…, Copy…, Delete and Access, as far as allowed. */
+function actionsMenu(item) {
+  const entries = rowMenu(item);
+  if (entries.length === 0) return null;
   const button = h(
     'button',
-    { type: 'button', class: 'plain', 'aria-label': `${label} ${item.name}` },
-    label,
+    { type: 'button', class: 'plain menu-button dots', 'aria-label': `Actions for ${item.name}`, 'data-for': item.id },
+    '⋯',
   );
-  button.addEventListener('click', () => handler(item));
-  return button;
+  const choose = (label, handler, danger = false) => {
+    const entry = h('button', { type: 'button', role: 'menuitem', class: danger ? 'danger' : null }, label);
+    entry.addEventListener('click', () => {
+      actionsFor = item.id;
+      handler();
+    });
+    return h('li', { role: 'none' }, entry);
+  };
+  const menu = h(
+    'ul',
+    { class: 'menu end', id: `actions-${item.id}`, 'aria-label': `Actions for ${item.name}` },
+    ...entries.map((entry) => {
+      if (entry === 'rename') return choose('Rename', () => askRename(item));
+      if (entry === 'move') return choose('Move…', () => askMove([item], 'move'));
+      if (entry === 'copy') return choose('Copy…', () => askMove([item], 'copy'));
+      if (entry === 'delete') return choose('Delete', () => askDelete([item]), true);
+      return h('li', { role: 'none' }, h('a', { role: 'menuitem', href: `/access.html?id=${seg(item.id)}` }, 'Access'));
+    }),
+  );
+  setupMenu(button, menu);
+  return h('span', { class: 'menu-wrap' }, button, menu);
 }
 
 function note(text, isError) {
@@ -384,31 +390,93 @@ function note(text, isError) {
 
 // ---- creating ----
 
-$('new-folder').addEventListener('submit', async (event) => {
-  event.preventDefault();
-  note('', false);
-  const result = await api('POST', `/nodes/${seg(nodeId)}/children`, {
-    kind: 'folder',
-    name: $('folder-name').value.trim(),
-  });
-  if (!result.ok) return note(messageFor(result.error), true);
-  $('folder-name').value = '';
-  note(`Folder “${result.data.name}” was created.`, false);
-  await reload();
-});
+/** Fills the New menu with what may be made here; people who may not add see no New button. */
+function setupNewMenu() {
+  $('new-wrap').hidden = !canAdd;
+  $('drop-hint').hidden = !canAdd;
+  if (!canAdd) return;
+  const entries = newMenu({ folders: library?.folders, editors: docEditors, templates: templates.length });
+  $('new-menu').replaceChildren(
+    ...entries.map(({ key, label }) => {
+      const entry = h('button', { type: 'button', role: 'menuitem' }, label);
+      entry.addEventListener('click', () => chooseNew(key));
+      return h('li', { role: 'none' }, entry);
+    }),
+  );
+  setupMenu($('new-button'), $('new-menu'));
+}
 
-$('new-doc').addEventListener('submit', async (event) => {
+/** What a New menu entry does: a file picker for uploads, otherwise the naming dialog. */
+function chooseNew(key) {
+  if (key === 'files') return $('pick-files').click();
+  if (key === 'folder-upload') return $('pick-folder').click();
+  askCreate(key);
+}
+
+const createDialog = $('create-dialog');
+$('create-cancel').addEventListener('click', () => createDialog.close());
+
+/** Opens the small dialog that names a new folder, document or copy of a template. */
+function askCreate(key) {
+  creating = key;
+  const folder = key === 'folder';
+  const template = key === 'template';
+  const editor = key.startsWith('doc:') ? key.slice(4) : null;
+  const extension = editor && Object.hasOwn(EDITORS, editor) ? EDITORS[editor].extension : null;
+  const titles = { text: 'New text document', gridcraft: 'New spreadsheet', wordcraft: 'New document', solidcraft: 'New design' };
+  $('create-title').textContent = folder ? 'New folder' : template ? 'New from a template' : (titles[editor] ?? 'New document');
+  $('create-template-field').hidden = !template;
+  $('create-name-label').textContent = folder ? 'Folder name' : 'Name (optional)';
+  $('create-name').required = folder;
+  $('create-name').value = '';
+  $('create-hint').textContent = folder
+    ? ''
+    : extension
+      ? `Leave it empty for a default name. The ending ${extension} is added for you.`
+      : 'Leave it empty for a default name.';
+  $('create-submit').textContent = folder ? 'Create folder' : template ? 'Create' : 'Create and open';
+  showMessage($('create-error'), '');
+  $('create-dialog').showModal();
+  (template ? $('create-template') : $('create-name')).focus();
+}
+
+$('create-form').addEventListener('submit', async (event) => {
   event.preventDefault();
+  const key = creating;
+  const name = $('create-name').value.trim();
+  const say = (text) => showMessage($('create-error'), text);
+  say('');
   note('', false);
-  const editor = $('doc-kind').value;
-  const name = $('doc-name').value.trim();
+  if (key === 'folder') {
+    if (!name) return say('Give the folder a name.');
+    const result = await api('POST', `/nodes/${seg(nodeId)}/children`, { kind: 'folder', name });
+    if (!result.ok) return say(messageFor(result.error));
+    createDialog.close();
+    note(`Folder “${result.data.name}” was created.`, false);
+    return reload();
+  }
+  if (key === 'template') {
+    const template = templates.find((t) => t.id === $('create-template').value);
+    if (!template) return say('Choose a template.');
+    const body = { template: template.id };
+    if (self.kind === 'folder') body.parent = nodeId;
+    if (name) body.name = name;
+    const result = await api('POST', `/libraries/${seg(libraryStep.id)}/from-template`, body);
+    if (!result.ok) {
+      return say(policyRefusalText(result.error, result.data, name || template.name) ?? messageFor(result.error));
+    }
+    createDialog.close();
+    note(`“${result.data.node.name}” was made from the template ${template.name}.`, false);
+    return reload();
+  }
+  const editor = key.slice(4);
   const extension = Object.hasOwn(EDITORS, editor) ? EDITORS[editor].extension : null;
   const body = { parent: nodeId, editor };
   if (extension) body.name = withExtension(name, extension);
   else if (name) body.name = name;
   const result = await api('POST', '/docs', body);
   if (result.ok) location.assign(pageFor('document', result.data.id, result.data.editor));
-  else note(result.data?.message ?? messageFor(result.error), true);
+  else say(result.data?.message ?? messageFor(result.error));
 });
 
 // ---- uploading ----
