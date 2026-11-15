@@ -18,41 +18,58 @@
  <h1 id="title">Inheritance explorer</h1>
  <p id="error" role="alert" class="msg"></p>
  <div id="content" hidden>
-  <p class="meta">Every place here that has access of its own, instead of taking it from the place above. You see only the places you manage access on.</p>
-  <form id="filters" class="filters">
-   <div class="field">
-    <label for="place">Place</label>
+  <p class="meta">A map of every place here: where access is the same as the place above, and where it is not. You see only the places you manage access on.</p>
+  <div id="filters" class="pmap-bar" role="group" aria-label="Filters">
+   <div class="pmap-place">
+    <label for="place">Start from</label>
     <select id="place"></select>
    </div>
-   <div class="field">
-    <label for="principal">Person or group</label>
-    <select id="principal"></select>
+   <div class="pmap-who">
+    <label for="who" class="sr">Person or group: type a name to show only the places that name them</label>
+    <div id="who-combo" class="combo pmap-combo">
+     <input type="text" id="who" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="who-options" autocomplete="off" spellcheck="false" placeholder="Person or group">
+    </div>
+    <ul id="who-options" role="listbox" aria-label="People and groups" class="combo-list" hidden></ul>
+    <span id="who-chip" class="person-chip pending-chip" hidden></span>
    </div>
-   <fieldset class="kinds">
-    <legend>Kind</legend>
-    <label class="check"><input type="checkbox" name="kind" value="site"> Site</label>
-    <label class="check"><input type="checkbox" name="kind" value="library"> Library</label>
-    <label class="check"><input type="checkbox" name="kind" value="folder"> Folder</label>
-    <label class="check"><input type="checkbox" name="kind" value="document"> File</label>
-   </fieldset>
-   <label class="check"><input type="checkbox" id="only"> Only exceptions</label>
-   <a id="export" class="button plain" href="#" download="inheritance.csv">Export CSV</a>
-  </form>
-  <p id="filter-note" class="meta" hidden>With a person, group or kind chosen, only the places that match are shown.</p>
-  <div class="split">
-   <section aria-labelledby="tree-heading">
-    <h2 id="tree-heading">Places</h2>
-    <ul id="tree" class="list tree" aria-labelledby="tree-heading"></ul>
+   <div class="pmap-kinds" role="group" aria-label="Kind">
+    <button type="button" class="chip-toggle" data-kind="site" aria-pressed="false">Site</button>
+    <button type="button" class="chip-toggle" data-kind="library" aria-pressed="false">Library</button>
+    <button type="button" class="chip-toggle" data-kind="folder" aria-pressed="false">Folder</button>
+    <button type="button" class="chip-toggle" data-kind="document" aria-pressed="false">File</button>
+   </div>
+   <button type="button" id="only" class="chip-toggle" aria-pressed="false" aria-describedby="filter-note">Only exceptions</button>
+   <a id="export" class="button secondary small pmap-export" href="#" download="inheritance.csv">Export CSV</a>
+  </div>
+  <p id="summary" class="pmap-summary" role="status" aria-live="polite"></p>
+  <p id="filter-note" class="meta" hidden>With a person, group or kind chosen, only the exceptions that match are shown, with the places above them.</p>
+  <div class="pmap">
+   <section class="pmap-main" aria-labelledby="tree-heading">
+    <h2 id="tree-heading" class="sr">Permission map</h2>
+    <ul id="tree" class="pmap-tree" role="tree" aria-labelledby="tree-heading" aria-describedby="tree-help"></ul>
+    <p id="tree-help" class="meta pmap-help">Arrow keys move and open places; Enter shows who has access.</p>
     <p id="tree-empty" class="meta" hidden>No place here has access of its own.</p>
-    <p><button type="button" id="more-breaks" class="plain" hidden>Show more places</button></p>
+    <p><button type="button" id="more-breaks" class="secondary" hidden>Show more places</button></p>
    </section>
-   <section id="detail" aria-labelledby="detail-heading" hidden>
-    <h2 id="detail-heading">Place</h2>
-    <div id="detail-body"></div>
-   </section>
+   <aside id="detail" class="pmap-panel" aria-labelledby="detail-heading">
+    <div class="pmap-panel-head">
+     <h2 id="detail-heading">Choose a place</h2>
+     <button type="button" id="detail-close" class="ghost small" hidden>Close</button>
+    </div>
+    <div id="detail-body"><p class="meta">Choose a place on the map to see who has access there, and how it differs from the place above.</p></div>
+   </aside>
   </div>
  </div>
 </div>
+
+<dialog id="detail-sheet" class="pmap-sheet" aria-labelledby="sheet-heading">
+ <div class="sheet-handle" aria-hidden="true"></div>
+ <div class="pmap-panel-head">
+  <h2 id="sheet-heading">Place</h2>
+  <button type="button" id="sheet-close" class="ghost small">Close</button>
+ </div>
+ <div id="sheet-body"></div>
+</dialog>
 
 <dialog id="restore-dialog" aria-labelledby="restore-title">
  <form id="restore-form" method="dialog">
