@@ -34,7 +34,7 @@ use reqwest::header::{
 };
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
-use server::previews::{PreviewKind, preview_type, thumb_path};
+use server::previews::{PreviewKind, ThumbError, no_thumb_path, preview_type, thumb_path};
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 
@@ -317,6 +317,29 @@ fn many_frames_gif(frames: usize) -> Vec<u8> {
     out
 }
 
+/// A progressive JPEG header for `width` x `height` and then `scans` scans of a few bytes
+/// each, as cheap to write as they would be costly to decode.
+fn progressive_jpeg(width: u16, height: u16, scans: usize) -> Vec<u8> {
+    let mut out = vec![0xFF, 0xD8];
+    // A quantisation table and a Huffman table, as a real file has.
+    out.extend([0xFF, 0xDB, 0x00, 0x43, 0x00]);
+    out.extend([1u8; 64]);
+    out.extend([0xFF, 0xC4, 0x00, 0x14, 0x00, 1]);
+    out.extend([0u8; 15]);
+    out.push(0);
+    // Start of a progressive frame, one component.
+    out.extend([0xFF, 0xC2, 0x00, 0x0B, 0x08]);
+    out.extend(height.to_be_bytes());
+    out.extend(width.to_be_bytes());
+    out.extend([0x01, 0x01, 0x11, 0x00]);
+    for _ in 0..scans {
+        out.extend([0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00]);
+        out.extend([0x00, 0x00]);
+    }
+    out.extend([0xFF, 0xD9]);
+    out
+}
+
 /// Bytes the fake scanner finds infected, a valid PNG first.
 fn infected_png() -> Vec<u8> {
     let mut bytes = picture(20, 20, ImageFormat::Png);
@@ -575,7 +598,7 @@ async fn previews_never_run_content() {
         (StatusCode::UNSUPPORTED_MEDIA_TYPE, "no_thumbnail")
     );
     let thumbs = server.data_dir.path().join("thumbs");
-    let made = walk(&thumbs);
+    let made = pngs(&thumbs);
     assert!(made.is_empty(), "{made:?}");
 
     // Names with quotes, line breaks and other scripts cannot break out of the header.
@@ -613,6 +636,14 @@ async fn previews_never_run_content() {
         header(&response, CONTENT_DISPOSITION),
         "inline; filename=\"_bersicht.txt\"; filename*=UTF-8''%C3%9Cbersicht.txt"
     );
+}
+
+/// The thumbnails under `dir`, recursively.
+fn pngs(dir: &std::path::Path) -> Vec<PathBuf> {
+    walk(dir)
+        .into_iter()
+        .filter(|path| path.extension().is_some_and(|ext| ext == "png"))
+        .collect()
 }
 
 /// Every file under `dir`, recursively.
@@ -812,6 +843,10 @@ async fn hostile_images_refused_quickly() {
             "Garbage.webp",
             b"RIFF\xff\xff\xff\xffWEBPVP8 garbage".to_vec(),
         ),
+        // A progressive JPEG of 5,000 scans: each scan would walk every pixel again.
+        ("Scans.jpg", progressive_jpeg(2_000, 2_000, 5_000)),
+        // Few enough scans, but 12,000 x 12,000 pixels walked 50 times.
+        ("Heavy.jpg", progressive_jpeg(12_000, 12_000, 50)),
     ];
     let mut docs = Vec::new();
     for (name, bytes) in &hostile {
@@ -830,30 +865,53 @@ async fn hostile_images_refused_quickly() {
         );
         docs.push(doc);
     }
-    // Each for the reason expected, decided before the pixels are decoded.
+    // Each failure is remembered: asked again, it is refused at once and not decoded again.
     let store = server.blobs();
+    for ((name, bytes), doc) in hostile.iter().zip(&docs) {
+        let mark = no_thumb_path(&store, &sha(bytes));
+        assert!(mark.is_file(), "{name}");
+        let started = Instant::now();
+        let (status, error) = refused(thumbnail(&server, &ann, doc).await).await;
+        assert_eq!(
+            (status, error.as_str()),
+            (StatusCode::UNSUPPORTED_MEDIA_TYPE, "no_thumbnail"),
+            "{name}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1), "{name}");
+        let error = server::previews::thumbnail(&store, &sha(bytes)).unwrap_err();
+        assert!(matches!(error, ThumbError::Remembered), "{name}: {error:?}");
+    }
+    // Each for the reason expected, decided before the pixels are decoded.
     for ((name, bytes), expected) in hostile.iter().zip([
         "TooLarge",
         "TooLarge",
         "Truncated",
         "TooManyFrames",
         "Decode",
+        "TooManyScans",
+        "TooLarge",
     ]) {
+        std::fs::remove_file(no_thumb_path(&store, &sha(bytes))).unwrap();
         let error = server::previews::thumbnail(&store, &sha(bytes)).unwrap_err();
         assert!(
             format!("{error:?}").starts_with(expected),
             "{name}: {error:?}"
         );
     }
-    // Nothing was kept, not even part of a file.
+    // Nothing was kept but the marks, not even part of a file.
     let thumbs = server.data_dir.path().join("thumbs");
-    let made = walk(&thumbs);
+    let made = pngs(&thumbs);
     assert!(made.is_empty(), "{made:?}");
+    assert_eq!(walk(&thumbs).len(), hostile.len());
     let tmp = server.data_dir.path().join("blobs").join("tmp");
     let left = walk(&tmp);
     assert!(left.is_empty(), "{left:?}");
 
-    // All at once, twice over, while a good image is asked for: the server keeps serving.
+    // All at once, twice over and forgotten, while a good image is asked for: the server
+    // keeps serving.
+    for (_, bytes) in &hostile {
+        std::fs::remove_file(no_thumb_path(&store, &sha(bytes))).unwrap();
+    }
     let good = picture(300, 300, ImageFormat::Png);
     let good_doc = upload(&server, &ann, &home, "Good.png", &good).await;
     let started = Instant::now();
@@ -876,7 +934,7 @@ async fn hostile_images_refused_quickly() {
         "took {:?}",
         started.elapsed()
     );
-    assert_eq!(walk(&thumbs).len(), 1);
+    assert_eq!(pngs(&thumbs).len(), 1);
 }
 
 #[tokio::test]
@@ -966,6 +1024,9 @@ async fn thumbnail_erased_with_its_blob() {
     let bad_thumb = thumb_path(&store, &sha(&bad));
     std::fs::create_dir_all(bad_thumb.parent().unwrap()).unwrap();
     std::fs::write(&bad_thumb, picture(2, 2, ImageFormat::Png)).unwrap();
+    // And a mark of having none goes with it too.
+    let bad_mark = no_thumb_path(&store, &sha(&bad));
+    std::fs::write(&bad_mark, b"").unwrap();
     let hash: String = sha(&bad).iter().map(|b| format!("{b:02x}")).collect();
     let (status, body) = call(
         &server,
@@ -978,6 +1039,7 @@ async fn thumbnail_erased_with_its_blob() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(!store.contains(&sha(&bad)));
     assert!(!bad_thumb.exists());
+    assert!(!bad_mark.exists());
 }
 
 fn local() -> SocketAddr {
@@ -1163,6 +1225,60 @@ async fn anyone_link_preview() {
         );
     }
 
+    // A folder below with permissions of its own: the link does not reach into it, and the
+    // preview answers as the download does. (Inheritance is broken before the link is made,
+    // or the link's assignment would be copied there.)
+    let own = folder(&server, &ann, &home, "Own").await;
+    let (status, body) = call(
+        &server,
+        &ann,
+        Method::POST,
+        &format!("/api/nodes/{own}/inheritance"),
+        Some(json!({ "inherit": false })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let hidden = upload(&server, &ann, &own, "Hidden.png", &png).await;
+    let visible = upload(&server, &ann, &home, "Visible.png", &png).await;
+    let (second, _) = anyone_link(&server, &admin, &ann, &home).await;
+    let (expiring, expiring_id) = anyone_link(&server, &admin, &ann, &home).await;
+    let answer_of = |path: String| {
+        let server = &server;
+        async move { refused(get(server, None, &path, None).await).await }
+    };
+    let same_as_download = |token: String, doc: String| {
+        let answer_of = &answer_of;
+        async move {
+            let preview = answer_of(format!("/api/l/{token}/preview/{doc}")).await;
+            let download = answer_of(format!("/api/l/{token}/content/{doc}")).await;
+            assert_eq!(preview, download, "{doc}");
+            preview
+        }
+    };
+    assert_eq!(
+        same_as_download(second.clone(), visible.clone()).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        same_as_download(second.clone(), hidden.clone()).await,
+        (StatusCode::NOT_FOUND, "link_not_found".to_owned())
+    );
+
+    // An expired link, before any sweep.
+    assert_eq!(
+        same_as_download(expiring.clone(), visible.clone()).await.0,
+        StatusCode::OK
+    );
+    sqlx::query("update links set expires_at = now() where id = $1")
+        .bind(uuid::Uuid::parse_str(&expiring_id).unwrap())
+        .execute(server.db.db.test_pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        same_as_download(expiring, visible.clone()).await,
+        (StatusCode::NOT_FOUND, "link_not_found".to_owned())
+    );
+
     // Revoked, it shows nothing.
     let (status, _) = call(
         &server,
@@ -1187,4 +1303,52 @@ async fn anyone_link_preview() {
         (status, error.as_str()),
         (StatusCode::NOT_FOUND, "link_not_found")
     );
+
+    // A link on an archived site: nothing, as for the download; the link is not revoked.
+    let site = server
+        .records_db()
+        .node(collab_core::ids::NodeId(
+            uuid::Uuid::parse_str(&home).unwrap(),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .site;
+    let (status, body) = call(
+        &server,
+        &admin,
+        Method::POST,
+        &format!("/api/sites/{}/archive", site.0),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        same_as_download(second.clone(), visible.clone()).await,
+        (StatusCode::NOT_FOUND, "link_not_found".to_owned())
+    );
+    let (status, body) = call(
+        &server,
+        &admin,
+        Method::POST,
+        &format!("/api/sites/{}/reactivate", site.0),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(same_as_download(second, visible).await.0, StatusCode::OK);
+}
+
+/// A folder named `name` made by `user` in `parent`.
+async fn folder(site: &Site, user: &TestUser, parent: &str, name: &str) -> String {
+    let (status, body) = call(
+        site,
+        user,
+        Method::POST,
+        &format!("/api/nodes/{parent}/children"),
+        Some(json!({ "kind": "folder", "name": name })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    body["id"].as_str().unwrap().to_owned()
 }

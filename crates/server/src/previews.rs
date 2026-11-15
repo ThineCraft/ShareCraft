@@ -8,11 +8,13 @@
 //! A thumbnail is made on the server the first time it is asked for, from PNG, JPEG, GIF (its
 //! first frame) and WebP, and kept at `<data>/thumbs/<xx>/<sha256>.png` (see [`thumbnail`]).
 //! Decoding is limited before anything is allocated: the size the header gives, the memory
-//! the decoded pixels need, the size of the file, and for a GIF the number of its frames,
-//! counted without decoding them. At most [`THUMBNAIL_TURNS`] are made at once, each off the
-//! async workers and within [`THUMBNAIL_TIME`] (see `Thumbnailer`). A thumbnail is written to
-//! a temporary file and renamed into place, so a failure leaves nothing behind; erasing a
-//! content erases its thumbnail (see [`erase_thumbnail`]).
+//! the decoded pixels need, the size of the file, for a GIF the number of its frames and for
+//! a JPEG the number of its scans (each counted by walking the file without decoding it), so
+//! the work of a decode is bounded too. At most [`THUMBNAIL_TURNS`] are made at once, each off
+//! the async workers and answered within [`THUMBNAIL_TIME`] (see `Thumbnailer`). A thumbnail is
+//! written to a temporary file and renamed into place, so a failure leaves nothing behind. Content
+//! that fails, or takes too long, is marked and never decoded again. Erasing a content erases
+//! its thumbnail and its mark (see [`erase_thumbnail`]).
 
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
@@ -33,6 +35,11 @@ pub const MAX_DECODE_BYTES: u64 = 256 << 20;
 pub const MAX_IMAGE_FILE_BYTES: u64 = 64 << 20;
 /// The most frames a GIF may have to get a thumbnail. Only the first is decoded.
 pub const MAX_GIF_FRAMES: usize = 1_000;
+/// The most scans a JPEG may have to get a thumbnail: decoding walks every pixel once per
+/// scan, and a progressive JPEG can hold thousands in a small file.
+pub const MAX_JPEG_SCANS: u64 = 64;
+/// The most pixels times scans a JPEG may need decoded to get a thumbnail.
+pub const MAX_JPEG_SCAN_PIXELS: u64 = 1_500_000_000;
 /// How many thumbnails are made at once.
 pub const THUMBNAIL_TURNS: usize = 2;
 /// The longest a thumbnail request waits for one to be made, its turn included.
@@ -175,6 +182,13 @@ pub fn thumb_path(store: &BlobStore, sha256: &[u8; 32]) -> PathBuf {
     thumbs_dir(store).join(prefix).join(format!("{name}.png"))
 }
 
+/// Where the mark that no thumbnail can be made of the content `sha256` of `store` is kept,
+/// whether or not it is there: `<data>/thumbs/<xx>/<sha256>.none`, an empty file.
+#[must_use]
+pub fn no_thumb_path(store: &BlobStore, sha256: &[u8; 32]) -> PathBuf {
+    thumb_path(store, sha256).with_extension("none")
+}
+
 /// Why no thumbnail was made.
 #[derive(Debug, thiserror::Error)]
 pub enum ThumbError {
@@ -184,12 +198,15 @@ pub enum ThumbError {
     /// The file is not a PNG, JPEG, GIF or WebP image.
     #[error("not an image a thumbnail is made from")]
     NotAnImage,
-    /// The image is larger than the limits allow.
+    /// The image is larger than the limits allow, or would take too much work to decode.
     #[error("the image is larger than a thumbnail is made from")]
     TooLarge,
     /// The GIF has more than [`MAX_GIF_FRAMES`] frames.
     #[error("the GIF has too many frames")]
     TooManyFrames,
+    /// The JPEG has more than [`MAX_JPEG_SCANS`] scans.
+    #[error("the JPEG has too many scans")]
+    TooManyScans,
     /// The file ends before the image does.
     #[error("the image is cut short")]
     Truncated,
@@ -208,21 +225,67 @@ pub enum ThumbError {
     /// The task making it failed.
     #[error("the thumbnail task failed: {0}")]
     Task(String),
+    /// An earlier attempt failed for good or took too long; the content is not decoded again.
+    #[error("no thumbnail can be made of this content")]
+    Remembered,
+}
+
+impl ThumbError {
+    /// Whether the failure belongs to the content, so trying again would fail again: such
+    /// content is marked and never decoded again. A missing file, the store, the file system
+    /// or the task failing is not remembered.
+    #[must_use]
+    pub fn is_lasting(&self) -> bool {
+        matches!(
+            self,
+            ThumbError::NotAnImage
+                | ThumbError::TooLarge
+                | ThumbError::TooManyFrames
+                | ThumbError::TooManyScans
+                | ThumbError::Truncated
+                | ThumbError::Decode(_)
+                | ThumbError::TimedOut
+        )
+    }
 }
 
 /// The thumbnail of the content `sha256` of `store`, made and kept if it is not kept yet: a
 /// PNG at most [`THUMBNAIL_SIDE`] pixels on its longer side, never enlarged. Blocks; the server
-/// calls it through a `Thumbnailer`.
+/// calls it through a `Thumbnailer`. A failure that belongs to the content (see
+/// [`ThumbError::is_lasting`]) is remembered with a mark beside the thumbnails (see
+/// [`no_thumb_path`]), and from then on the content is not decoded again.
 ///
 /// # Errors
 /// [`ThumbError`] when no thumbnail can be made: not a PNG, JPEG, GIF or WebP whatever its
-/// name, over the limits (see the module documentation), cut short or broken, or the store or
-/// the file system failing. Nothing is left behind then.
+/// name, over the limits (see the module documentation), cut short or broken, the store or
+/// the file system failing, or [`ThumbError::Remembered`] once one of those was recorded.
+/// No partial thumbnail is ever left behind.
 pub fn thumbnail(store: &BlobStore, sha256: &[u8; 32]) -> Result<PathBuf, ThumbError> {
     let path = thumb_path(store, sha256);
     if path.is_file() {
         return Ok(path);
     }
+    if no_thumb_path(store, sha256).is_file() {
+        return Err(ThumbError::Remembered);
+    }
+    match make_thumbnail(store, sha256, &path) {
+        Ok(()) => Ok(path),
+        Err(e) => {
+            if e.is_lasting()
+                && let Err(failed) = remember_failure(store, sha256)
+            {
+                eprintln!(
+                    "sharecraft-server: cannot mark content {} as having no thumbnail: {failed}",
+                    hex(sha256)
+                );
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Decodes the content `sha256` of `store` within the limits and keeps its thumbnail at `path`.
+fn make_thumbnail(store: &BlobStore, sha256: &[u8; 32], path: &Path) -> Result<(), ThumbError> {
     let file = store.open_blob(sha256)?.ok_or(ThumbError::Missing)?;
     let size = file.metadata()?.len();
     if size > MAX_IMAGE_FILE_BYTES {
@@ -235,8 +298,7 @@ pub fn thumbnail(store: &BlobStore, sha256: &[u8; 32]) -> Result<PathBuf, ThumbE
     let format = image::guess_format(&bytes).map_err(|_| ThumbError::NotAnImage)?;
     match format {
         ImageFormat::Png | ImageFormat::WebP => {}
-        ImageFormat::Jpeg if jpeg_complete(&bytes) => {}
-        ImageFormat::Jpeg => return Err(ThumbError::Truncated),
+        ImageFormat::Jpeg => check_jpeg(&bytes)?,
         ImageFormat::Gif => {
             gif_frames(&bytes)?;
         }
@@ -272,8 +334,7 @@ pub fn thumbnail(store: &BlobStore, sha256: &[u8; 32]) -> Result<PathBuf, ThumbE
     let small = DynamicImage::ImageRgba8(small.to_rgba8());
     let mut png = Vec::new();
     small.write_to(&mut Cursor::new(&mut png), ImageFormat::Png)?;
-    keep(store, sha256, &path, &png)?;
-    Ok(path)
+    keep(store, sha256, path, &png)
 }
 
 /// Writes `png` to a temporary file beside the content store and renames it to `path`. If the
@@ -308,28 +369,104 @@ fn keep(store: &BlobStore, sha256: &[u8; 32], path: &Path, png: &[u8]) -> Result
     Ok(())
 }
 
-/// Erases the thumbnail of the content `sha256` of `store`, if there is one; whether there was.
+/// Marks the content `sha256` of `store` as having no thumbnail, so it is not decoded again
+/// (see [`no_thumb_path`]). Erased with the content, as its thumbnail is; a mark made after the
+/// content was erased is removed again.
+///
+/// # Errors
+/// The I/O error.
+pub fn remember_failure(store: &BlobStore, sha256: &[u8; 32]) -> std::io::Result<()> {
+    let mark = no_thumb_path(store, sha256);
+    if let Some(dir) = mark.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::File::create(&mark)?;
+    if !store.contains(sha256) {
+        erase_thumbnail(store, sha256)?;
+    }
+    Ok(())
+}
+
+/// Erases the thumbnail of the content `sha256` of `store`, and its mark of having none; whether
+/// there was either.
 ///
 /// # Errors
 /// The I/O error for anything but a missing file.
 pub fn erase_thumbnail(store: &BlobStore, sha256: &[u8; 32]) -> std::io::Result<bool> {
-    match std::fs::remove_file(thumb_path(store, sha256)) {
-        Ok(()) => Ok(true),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(e),
+    let mut erased = false;
+    for path in [thumb_path(store, sha256), no_thumb_path(store, sha256)] {
+        match std::fs::remove_file(path) {
+            Ok(()) => erased = true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
     }
+    Ok(erased)
 }
 
-/// Whether a JPEG's last scan is followed by its end-of-image marker: a file cut short is not
-/// decoded (the decoder would fill what is missing).
-fn jpeg_complete(bytes: &[u8]) -> bool {
-    let marker = |second: u8| move |pair: &[u8]| pair == [0xFF, second];
-    let Some(scan) = bytes.windows(2).rposition(marker(0xDA)) else {
-        return false;
-    };
-    bytes
-        .get(scan..)
-        .is_some_and(|rest| rest.windows(2).any(marker(0xD9)))
+/// Checks a JPEG's structure without decoding it, by walking its segments and skipping over
+/// each scan's coded data: refused when it ends before its end-of-image marker (the decoder
+/// would fill what is missing), when it has more than [`MAX_JPEG_SCANS`] scans, or when its
+/// pixels times its scans pass [`MAX_JPEG_SCAN_PIXELS`]. Decoding walks every pixel once per
+/// scan, so these bound its work: a progressive JPEG can hold any number of scans in a small
+/// file.
+fn check_jpeg(bytes: &[u8]) -> Result<(), ThumbError> {
+    let byte = |at: usize| bytes.get(at).copied().ok_or(ThumbError::Truncated);
+    // After the start-of-image marker.
+    let mut at = 2;
+    let mut scans: u64 = 0;
+    let mut pixels: u64 = 0;
+    loop {
+        if byte(at)? != 0xFF {
+            return Err(ThumbError::Truncated);
+        }
+        // Fill bytes may come before a marker.
+        while byte(at + 1)? == 0xFF {
+            at += 1;
+        }
+        let marker = byte(at + 1)?;
+        at += 2;
+        match marker {
+            0xD9 if scans > 0 => return Ok(()),
+            0xD9 => return Err(ThumbError::Truncated),
+            // Markers with no segment.
+            0x01 | 0xD0..=0xD7 => {}
+            _ => {
+                let len = usize::from(byte(at)?) << 8 | usize::from(byte(at + 1)?);
+                if len < 2 {
+                    return Err(ThumbError::Truncated);
+                }
+                // A start of frame (not a table): its height and width.
+                if matches!(marker, 0xC0..=0xCF) && !matches!(marker, 0xC4 | 0xC8 | 0xCC) {
+                    let height = u64::from(u16::from_be_bytes([byte(at + 3)?, byte(at + 4)?]));
+                    let width = u64::from(u16::from_be_bytes([byte(at + 5)?, byte(at + 6)?]));
+                    pixels = width * height;
+                }
+                at += len;
+                if marker == 0xDA {
+                    scans += 1;
+                    if scans > MAX_JPEG_SCANS {
+                        return Err(ThumbError::TooManyScans);
+                    }
+                    if pixels.saturating_mul(scans) > MAX_JPEG_SCAN_PIXELS {
+                        return Err(ThumbError::TooLarge);
+                    }
+                    // The coded data, up to the next marker that is not a restart.
+                    loop {
+                        if byte(at)? == 0xFF {
+                            let next = byte(at + 1)?;
+                            if next != 0x00 && !(0xD0..=0xD7).contains(&next) {
+                                break;
+                            }
+                            at += 2;
+                        } else {
+                            at += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// The number of frames of the GIF `bytes`, counted by walking its blocks without decoding
@@ -394,22 +531,26 @@ impl Default for Thumbnailer {
 
 impl Thumbnailer {
     /// The thumbnail of the content `sha256` of `blobs`, made if needed (see [`thumbnail`]),
-    /// within [`THUMBNAIL_TIME`] counting the wait for a turn. A thumbnail still being made
-    /// when the time is up keeps its turn until it is done, so slow images never make more
-    /// than [`THUMBNAIL_TURNS`] at once; what it makes is kept for the next request.
+    /// within [`THUMBNAIL_TIME`] counting the wait for a turn; content marked as having none
+    /// answers [`ThumbError::Remembered`] at once. Content whose thumbnail takes longer is
+    /// marked too, so it is never decoded again. The decode still running then keeps its turn
+    /// until it really ends, so never more than [`THUMBNAIL_TURNS`] run at once; the limits
+    /// checked before decoding (see [`thumbnail`]) bound how long that can be. What it makes
+    /// is kept and served from then on.
     pub(crate) async fn make(
         &self,
         blobs: Arc<crate::blobs::Blobs>,
         sha256: [u8; 32],
     ) -> Result<PathBuf, ThumbError> {
         let path = thumb_path(blobs.store(), &sha256);
-        if tokio::fs::metadata(&path)
-            .await
-            .is_ok_and(|meta| meta.is_file())
-        {
+        if is_file(&path).await {
             return Ok(path);
         }
+        if is_file(&no_thumb_path(blobs.store(), &sha256)).await {
+            return Err(ThumbError::Remembered);
+        }
         let turns = Arc::clone(&self.turns);
+        let maker = Arc::clone(&blobs);
         let work = async move {
             let turn = turns
                 .acquire_owned()
@@ -417,15 +558,34 @@ impl Thumbnailer {
                 .map_err(|e| ThumbError::Task(e.to_string()))?;
             tokio::task::spawn_blocking(move || {
                 let _turn = turn;
-                thumbnail(blobs.store(), &sha256)
+                thumbnail(maker.store(), &sha256)
             })
             .await
             .map_err(|e| ThumbError::Task(e.to_string()))?
         };
-        tokio::time::timeout(THUMBNAIL_TIME, work)
-            .await
-            .map_err(|_| ThumbError::TimedOut)?
+        match tokio::time::timeout(THUMBNAIL_TIME, work).await {
+            Ok(made) => made,
+            Err(_) => {
+                let marked =
+                    tokio::task::spawn_blocking(move || remember_failure(blobs.store(), &sha256))
+                        .await;
+                if !matches!(marked, Ok(Ok(()))) {
+                    eprintln!(
+                        "sharecraft-server: cannot mark content {} as having no thumbnail",
+                        hex(&sha256)
+                    );
+                }
+                Err(ThumbError::TimedOut)
+            }
+        }
     }
+}
+
+/// Whether `path` is a file, without blocking the async workers.
+async fn is_file(path: &Path) -> bool {
+    tokio::fs::metadata(path)
+        .await
+        .is_ok_and(|meta| meta.is_file())
 }
 
 #[cfg(test)]
@@ -488,10 +648,47 @@ mod tests {
         assert!(matches!(gif_frames(b"GIF89"), Err(ThumbError::NotAnImage)));
     }
 
+    /// A JPEG of `scans` scans of a `width` × `height` frame, with `end` its end marker.
+    fn jpeg(width: u16, height: u16, scans: usize, end: bool) -> Vec<u8> {
+        let mut out = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x04, 0xFF, 0xD9];
+        out.extend([0xFF, 0xC2, 0x00, 0x0B, 0x08]);
+        out.extend(height.to_be_bytes());
+        out.extend(width.to_be_bytes());
+        out.extend([0x01, 0x01, 0x11, 0x00]);
+        for _ in 0..scans {
+            out.extend([0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00]);
+            // Coded data with a stuffed byte and a restart marker in it.
+            out.extend([0x12, 0xFF, 0x00, 0x34, 0xFF, 0xD3, 0x56]);
+        }
+        if end {
+            out.extend([0xFF, 0xD9]);
+        }
+        out
+    }
+
     #[test]
-    fn jpeg_needs_its_end_after_the_last_scan() {
-        assert!(jpeg_complete(&[0xFF, 0xD8, 0xFF, 0xDA, 1, 2, 0xFF, 0xD9]));
-        assert!(!jpeg_complete(&[0xFF, 0xD8, 0xFF, 0xDA, 1, 2]));
-        assert!(!jpeg_complete(&[0xFF, 0xD8, 0xFF, 0xD9]));
+    fn jpeg_scans_are_counted_without_decoding() {
+        assert!(check_jpeg(&jpeg(100, 100, 3, true)).is_ok());
+        // The end of an embedded segment does not count; the file's end does.
+        assert!(matches!(
+            check_jpeg(&jpeg(100, 100, 3, false)),
+            Err(ThumbError::Truncated)
+        ));
+        assert!(matches!(
+            check_jpeg(&jpeg(100, 100, 0, true)),
+            Err(ThumbError::Truncated)
+        ));
+        let limit = usize::try_from(MAX_JPEG_SCANS).unwrap();
+        assert!(check_jpeg(&jpeg(10, 10, limit, true)).is_ok());
+        assert!(matches!(
+            check_jpeg(&jpeg(10, 10, limit + 1, true)),
+            Err(ThumbError::TooManyScans)
+        ));
+        // 12,000 x 12,000 pixels: ten scans pass, twenty-five do not.
+        assert!(check_jpeg(&jpeg(12_000, 12_000, 10, true)).is_ok());
+        assert!(matches!(
+            check_jpeg(&jpeg(12_000, 12_000, 25, true)),
+            Err(ThumbError::TooLarge)
+        ));
     }
 }
