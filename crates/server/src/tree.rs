@@ -1931,6 +1931,8 @@ async fn plan_site(
         hub: None,
         joined_hub: None,
         navigation,
+        look: None,
+        themes: Vec::new(),
     };
     let undo = records.iter().map(|r| deleted(r, author.clone())).collect();
     let events = records.iter().map(|r| created_event(actor.id, r)).collect();

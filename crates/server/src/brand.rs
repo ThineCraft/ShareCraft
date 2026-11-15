@@ -51,6 +51,11 @@ pub(crate) enum BrandError {
     LowContrast(Vec<FailedPair>),
     /// `422 invalid_theme {"reason"}`: the theme breaks a rule other than contrast.
     InvalidTheme(String),
+    /// `422 invalid_look {"reason"}`: a site's look breaks a rule other than its theme's.
+    InvalidLook(String),
+    /// `409 image_gone {"slots"}`: the content of the images in these slots of a look is no
+    /// longer stored.
+    ImagesGone(Vec<&'static str>),
 }
 
 impl From<ApiError> for BrandError {
@@ -612,7 +617,7 @@ fn theme_detail(theme: &OrgTheme) -> Value {
 }
 
 /// The time now, in seconds since the Unix epoch.
-fn now_seconds() -> i64 {
+pub(crate) fn now_seconds() -> i64 {
     OffsetDateTime::now_utc().unix_timestamp()
 }
 
@@ -625,8 +630,8 @@ fn name_taken(brand: &OrgBrand, name: &str, except: Option<Uuid>) -> bool {
         .any(|t| Some(t.id) != except && t.name.to_lowercase() == wanted)
 }
 
-/// The brand-centre theme of `id` and `theme`, changed now.
-fn org_theme(id: Uuid, theme: Theme) -> OrgTheme {
+/// The brand-centre (or site) theme of `id` and `theme`, changed now.
+pub(crate) fn org_theme(id: Uuid, theme: Theme) -> OrgTheme {
     OrgTheme {
         id,
         name: theme.name,

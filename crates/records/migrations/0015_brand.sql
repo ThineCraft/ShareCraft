@@ -25,3 +25,10 @@ create table brand_refs (
   primary key (owner, sha256)
 );
 create index brand_refs_sha256 on brand_refs (sha256);
+
+-- A site's look and its own themes, mirrored from its record in Git (sites/<xx>/<id>.json,
+-- `look` and `themes`). A site with no look reads as the built-in ShareCraft theme with the
+-- defaults, as every site did before branding.
+alter table sites
+  add column look jsonb null,
+  add column themes jsonb not null default '[]';

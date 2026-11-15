@@ -1,17 +1,23 @@
-//! Sites' own settings: kind, description, language, time zone, archive stamp, hub and
-//! navigation, mirrored from their records in Git (`sites/<xx>/<id>.json`) as the tree is; the
-//! checks of languages, time zones and navigation; and a site's owners.
+//! Sites' own settings: kind, description, language, time zone, archive stamp, hub,
+//! navigation, look and own themes, mirrored from their records in Git (`sites/<xx>/<id>.json`)
+//! as the tree is; the checks of languages, time zones and navigation; and a site's owners.
+//!
+//! A site's look pins the brand images it uses (`brand_refs` rows owned by the site's id, see
+//! [`crate::brand`]), written whenever its row is: after the row, the content's `blobs` rows
+//! are locked `FOR SHARE`, then the pins written.
 
 use std::collections::HashSet;
 
 use collab_core::ids::{NodeId, UserId};
-use revisions::{MAX_DESCRIPTION_CHARS, NavItem, NavTarget};
+use revisions::brand::{ImageRef, Look};
+use revisions::{BlobRef, MAX_DESCRIPTION_CHARS, NavItem, NavTarget, SiteTheme};
 use serde_json::Value;
 use sqlx::postgres::PgRow;
 use sqlx::{PgConnection, Row};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use crate::brand::pin_images;
 use crate::events::{NewEvent, record};
 use crate::tree::{NodeChange, NodeRow, upsert_node};
 use crate::{AccessError, Db, DbError, Perms};
@@ -38,7 +44,7 @@ const MAX_AUDIENCE: usize = 10;
 
 /// The columns of a `sites` row as [`settings_from_row`] reads them.
 const SITE_COLUMNS: &str = "id, kind, description, language, time_zone, template, archived_at, \
-     archived_by, is_hub, hub_navigation, joined_hub, navigation, purging";
+     archived_by, is_hub, hub_navigation, joined_hub, navigation, look, themes, purging";
 
 /// What a site is for. Both start the same; a communication site is shown with its own label.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -94,6 +100,10 @@ pub struct SiteSettings {
     pub joined_hub: Option<NodeId>,
     /// Its own navigation; `None` for automatic (every library, by name).
     pub navigation: Option<Vec<NavItem>>,
+    /// Its look; `None` for the built-in ShareCraft theme with the defaults.
+    pub look: Option<Look>,
+    /// Its own themes.
+    pub themes: Vec<SiteTheme>,
     /// A purge of the deleted site has started and is not finished. Not part of its record.
     pub purging: bool,
 }
@@ -116,6 +126,8 @@ impl SiteSettings {
             hub_navigation: None,
             joined_hub: None,
             navigation: None,
+            look: None,
+            themes: Vec::new(),
             purging: false,
         }
     }
@@ -136,6 +148,30 @@ impl SiteSettings {
             && self.hub_navigation == other.hub_navigation
             && self.joined_hub == other.joined_hub
             && self.navigation == other.navigation
+            && self.look == other.look
+            && self.themes == other.themes
+    }
+
+    /// The brand images the site's look uses, each once.
+    #[must_use]
+    pub fn look_images(&self) -> Vec<&ImageRef> {
+        let mut images: Vec<&ImageRef> = Vec::new();
+        if let Some(look) = &self.look {
+            for image in [
+                &look.logo,
+                &look.thumbnail,
+                &look.header.image,
+                &look.footer.logo,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if !images.iter().any(|i| i.sha256 == image.sha256) {
+                    images.push(image);
+                }
+            }
+        }
+        images
     }
 }
 
@@ -320,6 +356,13 @@ fn settings_from_row(row: &PgRow) -> Result<SiteSettings, sqlx::Error> {
         hub_navigation: navigation("hub_navigation")?,
         joined_hub: row.try_get::<Option<Uuid>, _>("joined_hub")?.map(NodeId),
         navigation: navigation("navigation")?,
+        look: row
+            .try_get::<Option<Value>, _>("look")?
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|e| sqlx::Error::Decode(Box::new(e)))?,
+        themes: serde_json::from_value(row.try_get("themes")?)
+            .map_err(|e| sqlx::Error::Decode(Box::new(e)))?,
         purging: row.try_get("purging")?,
     })
 }
@@ -352,22 +395,33 @@ pub(crate) async fn ensure_site_row(
     Ok(())
 }
 
-/// Writes `settings` into the site's row, which the caller has locked if it exists; `purging`
-/// is left as it is.
+/// Writes `settings` into the site's row, which the caller has locked if it exists, then makes
+/// the site's pins the images its look uses (see [`pin_images`]); `purging` is left as it is.
+/// `repair` (a write from Git by nobody) creates the `blobs` rows of pinned content that has
+/// none; otherwise content erased meanwhile answers `ImageGone`, a refusal.
 pub(crate) async fn upsert_site(
     conn: &mut PgConnection,
     settings: &SiteSettings,
+    repair: bool,
 ) -> Result<(), AccessError> {
+    let look = settings
+        .look
+        .as_ref()
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(DbError::new)?;
+    let themes = serde_json::to_value(&settings.themes).map_err(DbError::new)?;
     sqlx::query(
         "insert into sites (id, kind, description, language, time_zone, template, archived_at, \
-             archived_by, is_hub, hub_navigation, joined_hub, navigation) \
-         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
+             archived_by, is_hub, hub_navigation, joined_hub, navigation, look, themes) \
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
          on conflict (id) do update set kind = excluded.kind, \
              description = excluded.description, language = excluded.language, \
              time_zone = excluded.time_zone, template = excluded.template, \
              archived_at = excluded.archived_at, archived_by = excluded.archived_by, \
              is_hub = excluded.is_hub, hub_navigation = excluded.hub_navigation, \
-             joined_hub = excluded.joined_hub, navigation = excluded.navigation",
+             joined_hub = excluded.joined_hub, navigation = excluded.navigation, \
+             look = excluded.look, themes = excluded.themes",
     )
     .bind(settings.id.0)
     .bind(settings.kind.as_str())
@@ -381,8 +435,14 @@ pub(crate) async fn upsert_site(
     .bind(navigation_value(settings.hub_navigation.as_ref())?)
     .bind(settings.joined_hub.map(|h| h.0))
     .bind(navigation_value(settings.navigation.as_ref())?)
-    .execute(conn)
+    .bind(look)
+    .bind(themes)
+    .execute(&mut *conn)
     .await?;
+    let owner = settings.id.0.to_string();
+    if !pin_images(conn, &owner, &settings.look_images(), repair).await? {
+        return Err(AccessError::ImageGone);
+    }
     Ok(())
 }
 
@@ -466,7 +526,7 @@ impl Db {
         for row in rows {
             upsert_node(&mut tx, row).await?;
         }
-        upsert_site(&mut tx, change.settings).await?;
+        upsert_site(&mut tx, change.settings, change.actor.is_none()).await?;
         for event in change.events {
             record(&mut tx, event).await?;
         }
@@ -723,14 +783,16 @@ pub(crate) async fn release_hub_rows(
 /// Deletes everything the purged site `site` owned besides its nodes (which stay as
 /// tombstones), in the transaction that purged its rows: the links, access requests and
 /// assignments of its nodes, its groups with their memberships and every assignment naming
-/// them, its upload sessions and its usage row; the sites that joined it as a hub leave it (see
-/// [`release_hub_rows`]), and its own row keeps no hub, no hub it joined and no hub
-/// navigation. Its groups are locked `FOR UPDATE`, by id, first.
+/// them, its upload sessions, its usage row and the pins of its look's brand images; the sites
+/// that joined it as a hub leave it (see [`release_hub_rows`]), and its own row keeps no hub,
+/// no hub it joined, no hub navigation, no look and no themes. Its groups are locked
+/// `FOR UPDATE`, by id, first. Answers the contents its pins named, for the caller to erase
+/// what nothing names any more.
 pub(crate) async fn purge_site_rows(
     conn: &mut PgConnection,
     actor: Option<UserId>,
     site: NodeId,
-) -> Result<(), sqlx::Error> {
+) -> Result<Vec<BlobRef>, sqlx::Error> {
     let groups: Vec<Uuid> =
         sqlx::query_scalar("select id from groups where site_id = $1 order by id for update")
             .bind(site.0)
@@ -775,14 +837,30 @@ pub(crate) async fn purge_site_rows(
         .bind(site.0)
         .execute(&mut *conn)
         .await?;
+    let unpinned: Vec<(String, i64)> = sqlx::query_as(
+        "delete from brand_refs r using blobs b \
+         where r.owner = $1 and b.sha256 = r.sha256 returning r.sha256, b.size",
+    )
+    .bind(site.0.to_string())
+    .fetch_all(&mut *conn)
+    .await?;
     release_hub_rows(&mut *conn, actor, site).await?;
     sqlx::query(
-        "update sites set joined_hub = null, is_hub = false, hub_navigation = null where id = $1",
+        "update sites set joined_hub = null, is_hub = false, hub_navigation = null, \
+             look = null, themes = '[]' where id = $1",
     )
     .bind(site.0)
     .execute(&mut *conn)
     .await?;
-    Ok(())
+    Ok(unpinned
+        .into_iter()
+        .filter_map(|(sha, size)| {
+            Some(BlobRef {
+                sha256: revisions::parse_hex(&sha)?,
+                size: u64::try_from(size).unwrap_or(0),
+            })
+        })
+        .collect())
 }
 
 /// Where a site is in its lifecycle.

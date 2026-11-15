@@ -41,13 +41,23 @@ impl IntoResponse for BrandError {
                 Json(json!({ "error": "invalid_theme", "reason": reason })),
             )
                 .into_response(),
+            BrandError::InvalidLook(reason) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({ "error": "invalid_look", "reason": reason })),
+            )
+                .into_response(),
+            BrandError::ImagesGone(slots) => (
+                StatusCode::CONFLICT,
+                Json(json!({ "error": "image_gone", "slots": slots })),
+            )
+                .into_response(),
         }
     }
 }
 
 /// Runs `change` on a task of its own and waits for it, so a change whose caller goes away
 /// still finishes (see [`super::to_completion`]).
-async fn completed<T: Send + 'static>(
+pub(crate) async fn completed<T: Send + 'static>(
     change: impl Future<Output = Result<T, BrandError>> + Send + 'static,
 ) -> Result<T, BrandError> {
     match tokio::spawn(change).await {
@@ -60,13 +70,13 @@ async fn completed<T: Send + 'static>(
 }
 
 /// The address a brand image is served at.
-fn image_url(sha256: &str) -> String {
+pub(crate) fn image_url(sha256: &str) -> String {
     format!("/api/brand/images/{sha256}")
 }
 
 /// A theme as the brand centre lists it: its colours as given (`null` for a derived dark
 /// colour) and as a page uses them (`resolved`).
-fn theme_out(id: &str, from: &str, theme: &Theme, changed_at: Option<i64>) -> Value {
+pub(crate) fn theme_out(id: &str, from: &str, theme: &Theme, changed_at: Option<i64>) -> Value {
     let resolved = check_theme(theme).ok();
     json!({
         "id": id,
@@ -157,6 +167,18 @@ pub(crate) struct NewTheme {
     secondary_dark: Option<String>,
 }
 
+impl From<NewTheme> for ThemeInput {
+    fn from(body: NewTheme) -> ThemeInput {
+        ThemeInput {
+            name: body.name,
+            primary: body.primary,
+            secondary: body.secondary,
+            primary_dark: body.primary_dark,
+            secondary_dark: body.secondary_dark,
+        }
+    }
+}
+
 /// Reads a field that may be given as `null`: absent is `None`, `null` is `Some(None)`.
 fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
     deserializer: D,
@@ -178,6 +200,24 @@ pub(crate) struct ThemeEdit {
     secondary_dark: Option<Option<String>>,
 }
 
+impl ThemeEdit {
+    /// The theme `current` with this edit's fields set, as typed.
+    pub(crate) fn applied_to(self, current: &Theme) -> ThemeInput {
+        let colour = |c: revisions::brand::Colour| c.to_string();
+        ThemeInput {
+            name: self.name.unwrap_or_else(|| current.name.clone()),
+            primary: self.primary.unwrap_or_else(|| colour(current.primary)),
+            secondary: self.secondary.unwrap_or_else(|| colour(current.secondary)),
+            primary_dark: self
+                .primary_dark
+                .unwrap_or_else(|| current.primary_dark.map(colour)),
+            secondary_dark: self
+                .secondary_dark
+                .unwrap_or_else(|| current.secondary_dark.map(colour)),
+        }
+    }
+}
+
 /// `POST /api/brand/themes {name, primary, secondary, primary_dark?, secondary_dark?}`: adds a
 /// theme (see [`brand::create_theme`]); `201` with the theme as listed. `403` unless a brand
 /// manager or administrator; `422 invalid_theme {reason}`; `422 low_contrast {pairs}`; `409
@@ -187,13 +227,7 @@ pub(crate) async fn create_theme(
     signed: Signed,
     JsonBody(body): JsonBody<NewTheme>,
 ) -> Result<Response, BrandError> {
-    let input = ThemeInput {
-        name: body.name,
-        primary: body.primary,
-        secondary: body.secondary,
-        primary_dark: body.primary_dark,
-        secondary_dark: body.secondary_dark,
-    };
+    let input = ThemeInput::from(body);
     let actor = signed.session.user;
     let theme = completed(async move { brand::create_theme(&state, &actor, &input).await }).await?;
     Ok((StatusCode::CREATED, Json(org_theme_out(&theme))).into_response())
@@ -218,18 +252,7 @@ pub(crate) async fn change_theme(
         .into_iter()
         .find(|t| t.id == id)
         .ok_or(ApiError::NotFound)?;
-    let colour = |c: revisions::brand::Colour| c.to_string();
-    let input = ThemeInput {
-        name: body.name.unwrap_or(current.name),
-        primary: body.primary.unwrap_or_else(|| colour(current.primary)),
-        secondary: body.secondary.unwrap_or_else(|| colour(current.secondary)),
-        primary_dark: body
-            .primary_dark
-            .unwrap_or_else(|| current.primary_dark.map(colour)),
-        secondary_dark: body
-            .secondary_dark
-            .unwrap_or_else(|| current.secondary_dark.map(colour)),
-    };
+    let input = body.applied_to(&current.theme());
     let theme =
         completed(async move { brand::change_theme(&state, &actor, id, &input).await }).await?;
     Ok(Json(org_theme_out(&theme)))

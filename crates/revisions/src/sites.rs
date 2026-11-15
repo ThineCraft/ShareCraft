@@ -13,7 +13,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::brand::OrgBrand;
+use crate::brand::{Look, MAX_SITE_THEMES, OrgBrand, OrgTheme};
 use crate::libraries::{LibraryFields, LibraryRecord, library_path};
 use crate::meta::Author;
 use crate::store::{
@@ -104,7 +104,23 @@ pub struct SiteRecord {
     pub joined_hub: Option<Uuid>,
     /// Its own navigation; `None` for automatic (every library, by name).
     pub navigation: Option<Vec<NavItem>>,
+    /// Its look; `None` (left out of the file) for the built-in ShareCraft theme and the
+    /// defaults, so a site whose look was never set keeps its record's exact bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub look: Option<Look>,
+    /// Its own themes, which only this site offers: at most 20, names unique ignoring case.
+    /// Left out of the file when there are none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub themes: Vec<SiteTheme>,
 }
+
+/// A site's own theme: the same shape as a brand-centre theme (an identifier, the theme and
+/// when it last changed), offered only by that site.
+pub type SiteTheme = OrgTheme;
+
+/// The site name a record's look is checked with: the record does not hold the name, and the
+/// server checks the look with the real one before writing it.
+const ANY_SITE_NAME: &str = "site";
 
 impl SiteRecord {
     /// Why the record cannot be stored or was stored wrongly, if so.
@@ -118,7 +134,22 @@ impl SiteRecord {
         if self.description.chars().count() > MAX_DESCRIPTION_CHARS {
             return Some("a description longer than 500 characters".to_owned());
         }
-        None
+        if let Some(problem) = self.look.as_ref().and_then(|l| l.problem(ANY_SITE_NAME)) {
+            return Some(format!("look: {problem}"));
+        }
+        if self.themes.len() > MAX_SITE_THEMES {
+            return Some(format!("at most {MAX_SITE_THEMES} site themes"));
+        }
+        let mut ids: Vec<Uuid> = self.themes.iter().map(|t| t.id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        let mut names: Vec<String> = self.themes.iter().map(|t| t.name.to_lowercase()).collect();
+        names.sort_unstable();
+        names.dedup();
+        if ids.len() != self.themes.len() || names.len() != self.themes.len() {
+            return Some("site theme identifiers and names (ignoring case) are unique".to_owned());
+        }
+        self.themes.iter().find_map(|t| t.theme().problem())
     }
 }
 
@@ -645,6 +676,8 @@ mod tests {
             hub: None,
             joined_hub: None,
             navigation: None,
+            look: None,
+            themes: Vec::new(),
         }
     }
 
@@ -728,6 +761,66 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(String::from_utf8(bytes).unwrap(), expected);
+    }
+
+    #[test]
+    fn site_look_and_themes_round_trip() {
+        let id = uuid("cd111111-1111-4111-8111-111111111111");
+        let plain = site(id);
+        let text = String::from_utf8(file_bytes(&plain).unwrap()).unwrap();
+        assert!(!text.contains("look") && !text.contains("themes"), "{text}");
+
+        let mut record = plain.clone();
+        record.look = Some(Look {
+            logo_alt: "Ours".into(),
+            ..Look::default()
+        });
+        record.themes.push(SiteTheme {
+            id: Uuid::new_v4(),
+            name: "Ours".into(),
+            primary: crate::brand::Colour::rgb(0x1f, 0x5f, 0x8b),
+            secondary: crate::brand::Colour::rgb(0x16, 0x34, 0x47),
+            primary_dark: None,
+            secondary_dark: None,
+            changed_at: 1_800_000_000,
+        });
+        let (_dir, store) = store();
+        let author = ann();
+        let records = [record.clone()];
+        let mut change = SitesChange::new(&author, "Change the look");
+        change.sites = &records;
+        store.write_sites(&change).unwrap();
+        assert_eq!(store.read_site_record(id).unwrap(), Some(record.clone()));
+
+        // A record that breaks a rule of its look or themes is never written.
+        let mut twice = record.clone();
+        let mut copy = twice.themes[0].clone();
+        copy.id = Uuid::new_v4();
+        copy.name = "OURS".into();
+        twice.themes.push(copy);
+        let mut many = record.clone();
+        many.themes = (0..21)
+            .map(|n| {
+                let mut theme = record.themes[0].clone();
+                theme.id = Uuid::new_v4();
+                theme.name = format!("Theme {n}");
+                theme
+            })
+            .collect();
+        let mut hidden = record.clone();
+        if let Some(look) = hidden.look.as_mut() {
+            look.header.hide_title = true;
+        }
+        for bad in [twice, many, hidden] {
+            let bad = [bad];
+            let mut change = SitesChange::new(&author, "Bad");
+            change.sites = &bad;
+            assert!(matches!(
+                store.write_sites(&change),
+                Err(CheckpointError::InvalidTreeChange(_))
+            ));
+        }
+        assert_eq!(store.read_site_record(id).unwrap(), Some(record));
     }
 
     #[test]

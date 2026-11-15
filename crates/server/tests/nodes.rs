@@ -233,6 +233,7 @@ async fn sites_are_listed_and_created_by_administrators() {
         json!([{
             "id": w.site, "name": "Team", "access": common::role_access("owner"),
             "kind": "team", "description": "", "hub": null, "is_hub": false, "archived": false,
+            "accent": "#3156c9",
         }])
     );
 
@@ -289,7 +290,7 @@ async fn sites_are_listed_and_created_by_administrators() {
     let (_, sites) = w.call(&ann, Method::GET, "/api/sites", None).await;
     assert_eq!(
         sites,
-        json!([{ "id": w.site, "name": "Team", "access": null, "kind": "team", "description": "", "hub": null, "is_hub": false, "archived": false }])
+        json!([{ "id": w.site, "name": "Team", "access": null, "kind": "team", "description": "", "hub": null, "is_hub": false, "archived": false, "accent": "#3156c9" }])
     );
     let (_, sites) = w.call(&bob, Method::GET, "/api/sites", None).await;
     assert_eq!(sites, json!([]));
@@ -1134,6 +1135,7 @@ async fn file_reached_only_through_its_path() {
         json!([{
             "id": w.site, "name": "Team", "access": null,
             "kind": "team", "description": "", "hub": null, "is_hub": false, "archived": false,
+            "accent": "#3156c9",
         }])
     );
     assert_eq!(w.names(&bob, &w.site).await.unwrap(), vec!["Documents"]);

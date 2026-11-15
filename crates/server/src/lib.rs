@@ -19,6 +19,7 @@ mod file_room;
 pub mod icap;
 pub mod libraries;
 mod links;
+mod looks;
 mod members;
 pub mod previews;
 mod projection;

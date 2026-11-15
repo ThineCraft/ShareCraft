@@ -95,6 +95,8 @@ pub(crate) fn new_site_record(id: NodeId, defaults: &RegionalDefaults) -> SiteRe
         hub: None,
         joined_hub: None,
         navigation: None,
+        look: None,
+        themes: Vec::new(),
     }
 }
 
@@ -130,6 +132,8 @@ pub(crate) fn settings_of(record: &SiteRecord) -> Result<SiteSettings, String> {
         hub_navigation: record.hub.as_ref().map(|hub| hub.navigation.clone()),
         joined_hub: record.joined_hub.map(NodeId),
         navigation: record.navigation.clone(),
+        look: record.look.clone(),
+        themes: record.themes.clone(),
         purging: false,
     })
 }
@@ -591,6 +595,13 @@ pub(crate) async fn repair_sites(state: &AppState, sites: &[NodeId]) -> bool {
         }
     };
     for site in sites {
+        let pins = match db.brand_pins(&site.0.to_string()).await {
+            Ok(pins) => pins,
+            Err(e) => {
+                eprintln!("sharecraft-server: could not repair sites: {e}");
+                return false;
+            }
+        };
         let record = match read_site_record(state.checkpointer(), *site).await {
             Ok(record) => record,
             Err(e) => {
@@ -602,7 +613,7 @@ pub(crate) async fn repair_sites(state: &AppState, sites: &[NodeId]) -> bool {
             }
         };
         let record = record.unwrap_or_else(|| new_site_record(*site, &defaults));
-        if let Err(e) = repair_site(db, &record, current.get(site)).await {
+        if let Err(e) = repair_site(db, &record, current.get(site), &pins).await {
             eprintln!("sharecraft-server: could not repair site {}: {e}", site.0);
             return false;
         }
@@ -684,15 +695,28 @@ pub(crate) async fn follow_defaults(state: &AppState) -> bool {
     all_written
 }
 
-/// Writes `record` into PostgreSQL if `current` differs from it, with `site.changed` marked as
-/// a repair. Returns whether it wrote.
+/// The pins a site's look asks for: each content its images name, with its type, by hash.
+fn wanted_pins(settings: &SiteSettings) -> Vec<(String, String)> {
+    let mut pins: Vec<(String, String)> = settings
+        .look_images()
+        .into_iter()
+        .map(|image| (image.sha256.clone(), image.media_type.clone()))
+        .collect();
+    pins.sort();
+    pins
+}
+
+/// Writes `record` into PostgreSQL, with the pins of its look's images, if `current` or the
+/// site's pins `pins` (each `(sha256, media_type)`, by hash) differ from it, with
+/// `site.changed` marked as a repair. Returns whether it wrote.
 async fn repair_site(
     db: &Db,
     record: &SiteRecord,
     current: Option<&SiteSettings>,
+    pins: &[(String, String)],
 ) -> Result<bool, String> {
     let settings = settings_of(record)?;
-    if current.is_some_and(|now| now.same_record(&settings)) {
+    if current.is_some_and(|now| now.same_record(&settings)) && wanted_pins(&settings) == pins {
         return Ok(false);
     }
     db.apply_site_change(SiteChange {
@@ -716,14 +740,17 @@ async fn repair_site(
 }
 
 /// Brings PostgreSQL's mirror of the site records, saved templates, library records and global
-/// navigation up to date with Git: every site of the tree (not purged) whose row is missing or
-/// differs is written from its record, or for a site with none from the organisation's current
-/// defaults, with `site.changed` marked `"repaired": true` (hubs before the sites that joined
-/// them); likewise each saved template (`template.saved`), then each library, after the sites
-/// (see [`crate::libraries::reconcile`], `library.changed`), the global navigation
+/// navigation up to date with Git: every site of the tree (not purged) whose row (look and own
+/// themes included) or the pins of its look's images are missing or differ is written from its
+/// record, or for a site with none from the organisation's current defaults, with
+/// `site.changed` marked `"repaired": true` (hubs before the sites that joined them); the pins
+/// of a site no longer in the tree are dropped (each owner counts as one row); likewise each
+/// saved template (`template.saved`), then each library, after the sites (see
+/// [`crate::libraries::reconcile`], `library.changed`), the global navigation
 /// (`navigation.changed`) and the brand centre with the images it pins (see
-/// [`crate::brand::reconcile`]; the brand centre counts as one row). A record that cannot be written, or whose site is not in the tree,
-/// does not stop the others; it is listed in the report.
+/// [`crate::brand::reconcile`]; the brand centre counts as one row). A record that cannot be
+/// written, or whose site is not in the tree, does not stop the others; it is listed in the
+/// report.
 ///
 /// # Errors
 /// The Git error if the records cannot be read (`Unsupported` for a store without them), or
@@ -760,6 +787,19 @@ pub async fn reconcile(store: Arc<dyn Checkpointer>, db: &Db) -> Result<SitesRep
         templates: templates.len(),
         ..SitesReport::default()
     };
+    let mut pins: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    for (owner, sha, media_type) in db.all_brand_pins().await? {
+        pins.entry(owner).or_default().push((sha, media_type));
+    }
+    // Pins of a site no longer in the tree (purged, or never mirrored) are dropped; the
+    // sweeper erases what nothing names any more.
+    for owner in pins.keys() {
+        let gone = Uuid::parse_str(owner).is_ok_and(|id| !sites.contains(&NodeId(id)));
+        if gone {
+            db.drop_brand_pins(owner).await?;
+            report.updated = report.updated.saturating_add(1);
+        }
+    }
 
     let mut by_site: HashMap<NodeId, SiteRecord> = HashMap::new();
     for record in records {
@@ -784,7 +824,10 @@ pub async fn reconcile(store: Arc<dyn Checkpointer>, db: &Db) -> Result<SitesRep
     // Hubs first, so a joined hub's row exists before the rows that name it.
     wanted.sort_by_key(|record| (record.joined_hub.is_some(), record.id));
     for record in &wanted {
-        match repair_site(db, record, current.get(&NodeId(record.id))).await {
+        let own = pins
+            .get(&record.id.to_string())
+            .map_or(&[][..], Vec::as_slice);
+        match repair_site(db, record, current.get(&NodeId(record.id)), own).await {
             Ok(true) => report.updated = report.updated.saturating_add(1),
             Ok(false) => {}
             Err(error) => report.failed.push((record.id, error)),
@@ -852,7 +895,7 @@ pub async fn reconcile(store: Arc<dyn Checkpointer>, db: &Db) -> Result<SitesRep
 
 /// The record of `site` in Git (`None` if it has none), and the record a change starts from:
 /// that one, or for a site with none a new record with the organisation's defaults.
-async fn record_and_start(
+pub(crate) async fn record_and_start(
     state: &AppState,
     site: NodeId,
 ) -> Result<(Option<SiteRecord>, SiteRecord), AccessError> {
@@ -868,7 +911,7 @@ async fn record_and_start(
 
 /// The live site `site` as `actor` sees it, with their access: `NotFound` unless it is a site
 /// they can see that is not deleted.
-async fn seen_site(
+pub(crate) async fn seen_site(
     state: &AppState,
     actor: &User,
     site: NodeId,
@@ -899,28 +942,28 @@ async fn admin_on(db: &Db, actor: &User, site: NodeId) -> Result<(), AccessError
 
 /// A change of site records: each changed site's record as Git held it (`None` if it had
 /// none) and as it is to be, with what its mirror must judge and record.
-struct SitesCommit {
+pub(crate) struct SitesCommit {
     /// The commit message.
-    message: String,
+    pub(crate) message: String,
     /// Each site's record before (`None` if Git had none) and after.
-    changed: Vec<(Option<SiteRecord>, SiteRecord)>,
+    pub(crate) changed: Vec<(Option<SiteRecord>, SiteRecord)>,
     /// Whether the actor must be an enabled administrator.
-    needs_admin: bool,
+    pub(crate) needs_admin: bool,
     /// Nodes the actor must hold the given permissions on.
-    needs: Vec<(NodeId, Perms)>,
+    pub(crate) needs: Vec<(NodeId, Perms)>,
     /// Sites whose rows are locked too, unchanged.
-    also_lock: Vec<NodeId>,
+    pub(crate) also_lock: Vec<NodeId>,
     /// A hub whose members leave it.
-    release_hub: Option<NodeId>,
+    pub(crate) release_hub: Option<NodeId>,
     /// The events recorded with the change.
-    events: Vec<NewEvent>,
+    pub(crate) events: Vec<NewEvent>,
 }
 
 /// Writes `commit`'s site records as one Git commit by `actor`, then mirrors them into
 /// PostgreSQL, judged again there; a refused change is taken back by a second commit, and a
 /// database failure after judging is repaired from Git or leaves the tree marked out of step.
 /// The caller holds the tree lock.
-async fn commit_sites(
+pub(crate) async fn commit_sites(
     state: &AppState,
     actor: &User,
     commit: SitesCommit,
@@ -998,7 +1041,7 @@ async fn commit_sites(
 }
 
 /// One event about `site` by `actor`.
-fn site_event(
+pub(crate) fn site_event(
     kind: &'static str,
     actor: &User,
     site: NodeId,

@@ -2,7 +2,7 @@
 //! owners, storage and quota, creating one, changing its settings, setting its quota,
 //! archiving and reactivating it, and a site's three groups.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -20,6 +20,7 @@ use super::nodes::{NodeOut, node_id};
 use super::{ApiError, JsonBody, to_completion};
 use crate::AppState;
 use crate::auth::Signed;
+use crate::looks;
 use crate::sites::{self, SiteEdit};
 use crate::tree;
 
@@ -46,6 +47,12 @@ pub(crate) struct SiteSummary {
     is_hub: bool,
     /// Whether it is archived; archived sites are listed only to people who manage them.
     archived: bool,
+    /// The address of its look's thumbnail, if it has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thumbnail_url: Option<String>,
+    /// Its light-mode accent, `#rrggbb`, from its effective look (the theme of the hub it
+    /// joined, if any).
+    accent: String,
 }
 
 /// The query of `GET /api/sites`.
@@ -65,11 +72,25 @@ pub(crate) async fn visible_sites(
     db: &Db,
     user: &User,
 ) -> Result<Vec<(Node, Option<Access>, SiteSettings)>, ApiError> {
+    Ok(visible_sites_and_all(db, user).await?.0)
+}
+
+/// The sites `user` can see (see [`visible_sites`]), and the settings of every site, by id.
+async fn visible_sites_and_all(
+    db: &Db,
+    user: &User,
+) -> Result<
+    (
+        Vec<(Node, Option<Access>, SiteSettings)>,
+        HashMap<NodeId, SiteSettings>,
+    ),
+    ApiError,
+> {
     let sites = db
         .sites_for(user.id)
         .await
         .map_err(|e| ApiError::unavailable(&e))?;
-    let mut settings: HashMap<NodeId, SiteSettings> = db
+    let settings: HashMap<NodeId, SiteSettings> = db
         .all_site_settings()
         .await
         .map_err(|e| ApiError::unavailable(&e))?
@@ -80,15 +101,16 @@ pub(crate) async fn visible_sites(
         .regional_defaults()
         .await
         .map_err(|e| ApiError::unavailable(&e))?;
-    Ok(sites
+    let visible = sites
         .into_iter()
         .map(|(node, access)| {
-            let row = settings.remove(&node.id).unwrap_or_else(|| {
+            let row = settings.get(&node.id).cloned().unwrap_or_else(|| {
                 SiteSettings::defaults(node.id, &defaults.language, &defaults.time_zone)
             });
             (node, access, row)
         })
-        .collect())
+        .collect();
+    Ok((visible, settings))
 }
 
 /// Whether `access` includes `manage_site`, or on an archived site would include it were the
@@ -141,7 +163,7 @@ pub(crate) async fn directory(
     hub: Option<NodeId>,
     kind: Option<SiteKind>,
 ) -> Result<Vec<SiteSummary>, ApiError> {
-    let sites = visible_sites(db, user).await?;
+    let (sites, all) = visible_sites_and_all(db, user).await?;
     let names: HashMap<NodeId, String> = sites
         .iter()
         .map(|(node, _, _)| (node.id, node.name.clone()))
@@ -150,6 +172,12 @@ pub(crate) async fn directory(
     if hub.is_some_and(|hub| !names.contains_key(&hub)) {
         return Ok(Vec::new());
     }
+    let deleted: HashSet<NodeId> = db
+        .deleted_sites()
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?
+        .into_iter()
+        .collect();
     Ok(sites
         .into_iter()
         .filter(|(node, access, settings)| {
@@ -158,20 +186,26 @@ pub(crate) async fn directory(
                 && kind.is_none_or(|kind| settings.kind == kind)
                 && hub.is_none_or(|hub| settings.joined_hub == Some(hub))
         })
-        .map(|(node, access, settings)| SiteSummary {
-            id: node.id.0.to_string(),
-            hub: settings.joined_hub.and_then(|hub| {
-                names.get(&hub).map(|name| SiteName {
-                    id: hub.0.to_string(),
-                    name: name.clone(),
-                })
-            }),
-            name: node.name,
-            access,
-            kind: settings.kind.as_str(),
-            description: settings.description,
-            is_hub: settings.is_hub,
-            archived: settings.archived_at.is_some(),
+        .map(|(node, access, settings)| {
+            let lender = looks::lending_hub_in(&settings, &all, &deleted);
+            let (thumbnail_url, accent) = looks::list_marks(&settings, lender);
+            SiteSummary {
+                id: node.id.0.to_string(),
+                hub: settings.joined_hub.and_then(|hub| {
+                    names.get(&hub).map(|name| SiteName {
+                        id: hub.0.to_string(),
+                        name: name.clone(),
+                    })
+                }),
+                name: node.name,
+                access,
+                kind: settings.kind.as_str(),
+                description: settings.description,
+                is_hub: settings.is_hub,
+                archived: settings.archived_at.is_some(),
+                thumbnail_url,
+                accent,
+            }
         })
         .collect())
 }

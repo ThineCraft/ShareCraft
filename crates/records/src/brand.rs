@@ -11,7 +11,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use collab_core::ids::UserId;
+use collab_core::ids::{NodeId, UserId};
 use revisions::BlobRef;
 use revisions::brand::{ImageRef, OrgBrand};
 use sqlx::PgConnection;
@@ -233,5 +233,119 @@ impl Db {
         }
         tx.commit().await?;
         Ok(())
+    }
+}
+
+/// One change of a site's look, as its `site.look_changed` event recorded it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LookChange {
+    /// The event's id.
+    pub event_id: i64,
+    /// When the change was made.
+    pub at: time::OffsetDateTime,
+    /// Who made it, with their name; `None` for the server, or an account since removed.
+    pub by: Option<(UserId, String)>,
+    /// The look before the change: `null` for none (the defaults).
+    pub before: serde_json::Value,
+    /// The look after the change: `null` for none.
+    pub after: serde_json::Value,
+}
+
+/// Reads one row of a `site.look_changed` query.
+fn look_change_from_row(row: &sqlx::postgres::PgRow) -> Result<LookChange, sqlx::Error> {
+    use sqlx::Row;
+    let actor: Option<uuid::Uuid> = row.try_get("actor")?;
+    let name: Option<String> = row.try_get("name")?;
+    let detail: serde_json::Value = row.try_get("detail")?;
+    let side = |key: &str| detail.get(key).cloned().unwrap_or(serde_json::Value::Null);
+    Ok(LookChange {
+        event_id: row.try_get("id")?,
+        at: row.try_get("at")?,
+        by: actor.zip(name).map(|(id, name)| (UserId(id), name)),
+        before: side("before"),
+        after: side("after"),
+    })
+}
+
+/// The changes of a site's look listed: `site.look_changed` events of the site that record
+/// what the look became (repairs from Git do not).
+const LOOK_CHANGES: &str = "select e.id, e.at, e.actor, u.name, e.detail from events e \
+     left join users u on u.id = e.actor \
+     where e.kind = 'site.look_changed' and e.node_id = $1 and e.detail ? 'after'";
+
+impl Db {
+    /// The latest `limit` changes of the look of `site`, newest first.
+    pub async fn look_changes(&self, site: NodeId, limit: i64) -> Result<Vec<LookChange>, DbError> {
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "{LOOK_CHANGES} order by e.id desc limit $2"
+        )))
+        .bind(site.0)
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await?;
+        rows.iter()
+            .map(look_change_from_row)
+            .collect::<Result<_, sqlx::Error>>()
+            .map_err(DbError::from)
+    }
+
+    /// The change of the look of `site` recorded by the event `event_id`; `None` if that event
+    /// is not one of its look's changes.
+    pub async fn look_change(
+        &self,
+        site: NodeId,
+        event_id: i64,
+    ) -> Result<Option<LookChange>, DbError> {
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!("{LOOK_CHANGES} and e.id = $2")))
+            .bind(site.0)
+            .bind(event_id)
+            .fetch_optional(self.pool())
+            .await?;
+        Ok(row.as_ref().map(look_change_from_row).transpose()?)
+    }
+
+    /// Every brand image pin, `(owner, sha256, media_type)`, by owner and hash: for comparing
+    /// with Git.
+    pub async fn all_brand_pins(&self) -> Result<Vec<(String, String, String)>, DbError> {
+        Ok(sqlx::query_as(
+            "select owner, sha256, media_type from brand_refs order by owner, sha256",
+        )
+        .fetch_all(self.pool())
+        .await?)
+    }
+
+    /// Deletes the pins of `owner`, a site that is no longer in the tree; answers how many.
+    /// The sweeper erases content nothing names any more.
+    pub async fn drop_brand_pins(&self, owner: &str) -> Result<u64, DbError> {
+        Ok(sqlx::query("delete from brand_refs where owner = $1")
+            .bind(owner)
+            .execute(self.pool())
+            .await?
+            .rows_affected())
+    }
+
+    /// The sites that are deleted (purged or not).
+    pub async fn deleted_sites(&self) -> Result<Vec<NodeId>, DbError> {
+        let ids: Vec<uuid::Uuid> = sqlx::query_scalar(
+            "select id from nodes where kind = 'site' and parent_id is null \
+               and deleted_at is not null",
+        )
+        .fetch_all(self.pool())
+        .await?;
+        Ok(ids.into_iter().map(NodeId).collect())
+    }
+
+    /// Which contents of `hashes` the content store has no row for: erased, or never stored.
+    pub async fn missing_blobs(&self, hashes: &[String]) -> Result<Vec<String>, DbError> {
+        let found: Vec<String> =
+            sqlx::query_scalar("select sha256 from blobs where sha256 = any($1)")
+                .bind(hashes)
+                .fetch_all(self.pool())
+                .await?;
+        Ok(hashes
+            .iter()
+            .filter(|h| !found.contains(h))
+            .cloned()
+            .collect())
     }
 }

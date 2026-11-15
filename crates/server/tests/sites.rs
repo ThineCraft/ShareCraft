@@ -301,6 +301,8 @@ async fn old_site_reads_defaults_and_writes_on_first_change() {
             hub: None,
             joined_hub: None,
             navigation: None,
+            look: None,
+            themes: Vec::new(),
         }
     );
     let (_, body) = show(&server, &root, &id).await;

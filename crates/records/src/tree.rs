@@ -399,8 +399,9 @@ struct PurgedVersions {
 /// committed.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct NodesApplied {
-    /// The contents the versions of the documents it purged named; nothing in `blob_refs`
-    /// names them for those documents any more, so each is erased if nothing else does.
+    /// The contents the versions of the documents it purged named, and those a purged site's
+    /// look pinned; nothing in `blob_refs` or `brand_refs` names them for those documents or
+    /// that site any more, so each is erased if nothing else does.
     pub released: Vec<BlobRef>,
     /// The ids of the `node.purged` and `site.purged` events it recorded.
     pub purge_events: Vec<i64>,
@@ -663,7 +664,7 @@ impl Db {
             upsert_node_with(&mut tx, row, ids).await?;
         }
         for site in change.new_sites {
-            upsert_site(&mut tx, site).await?;
+            upsert_site(&mut tx, site, change.actor.is_none()).await?;
         }
         for library in change.new_libraries {
             upsert_library(&mut tx, library).await?;
@@ -691,7 +692,11 @@ impl Db {
             done.released = gone.contents;
         }
         if let Some(site) = change.purge_site {
-            purge_site_rows(&mut tx, change.actor, site).await?;
+            for blob in purge_site_rows(&mut tx, change.actor, site).await? {
+                if !done.released.iter().any(|b| b.sha256 == blob.sha256) {
+                    done.released.push(blob);
+                }
+            }
         }
         for event in events {
             if PURGE_EVENTS.contains(&event.kind) {

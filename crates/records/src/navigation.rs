@@ -327,7 +327,7 @@ impl Db {
             release_hub_rows(&mut tx, Some(change.actor), hub).await?;
         }
         for settings in change.settings {
-            upsert_site(&mut tx, settings).await?;
+            upsert_site(&mut tx, settings, false).await?;
         }
         for event in change.events {
             record(&mut tx, event).await?;

@@ -644,6 +644,32 @@ async fn archived_site_refuses_every_write() {
                 format!("/api/sites/{site}/navigation"),
                 Some(json!({ "items": [] })),
             ),
+            // The site's look and its own themes.
+            write(
+                Method::PUT,
+                format!("/api/sites/{site}/look"),
+                Some(json!({ "look": { "theme": { "from": "builtin:plum" } } })),
+            ),
+            write(
+                Method::POST,
+                format!("/api/sites/{site}/look/rollback"),
+                Some(json!({ "event_id": 1 })),
+            ),
+            write(
+                Method::POST,
+                format!("/api/sites/{site}/themes"),
+                Some(json!({ "name": "Ours", "primary": "#1f5f8b", "secondary": "#163447" })),
+            ),
+            write(
+                Method::PATCH,
+                format!("/api/sites/{site}/themes/{}", Uuid::new_v4()),
+                Some(json!({ "name": "Mine" })),
+            ),
+            write(
+                Method::DELETE,
+                format!("/api/sites/{site}/themes/{}", Uuid::new_v4()),
+                None,
+            ),
             write(
                 Method::POST,
                 format!("/api/nodes/{site}/children"),

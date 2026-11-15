@@ -27,7 +27,7 @@ pub use libraries::{LIBRARY_KINDS, LIBRARY_SCHEMA, LibraryFields, LibraryRecord}
 pub use meta::{Author, Meta};
 pub use sites::{
     HubRecord, MAX_DESCRIPTION_CHARS, MAX_TEMPLATE_NAME_CHARS, NavItem, NavTarget, OrgNavigation,
-    SITE_KINDS, SITE_SCHEMA, SiteRecord, SitesChange, TemplateBody, TemplateFolder,
+    SITE_KINDS, SITE_SCHEMA, SiteRecord, SiteTheme, SitesChange, TemplateBody, TemplateFolder,
     TemplateLibrary, TemplateNavItem, TemplateNavTarget, TemplateRecord,
 };
 pub use store::{RevisionStore, is_valid_author_name};

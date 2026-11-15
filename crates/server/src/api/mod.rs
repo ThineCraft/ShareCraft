@@ -3,7 +3,7 @@
 
 mod admin;
 mod bin;
-mod brand;
+pub(crate) mod brand;
 mod bulk;
 pub(crate) mod content;
 mod docs;
@@ -11,6 +11,7 @@ mod explorer;
 mod groups;
 mod libraries;
 mod links;
+mod looks;
 mod navigation;
 pub(crate) mod nodes;
 mod quarantine;
@@ -92,6 +93,20 @@ pub(crate) fn router() -> Router<AppState> {
             get(navigation::global)
                 .put(navigation::set_global)
                 .layer(DefaultBodyLimit::max(navigation::MAX_NAVIGATION_BODY)),
+        )
+        .route(
+            "/sites/{id}/look",
+            get(looks::show)
+                .put(looks::set)
+                .layer(DefaultBodyLimit::max(looks::MAX_LOOK_BODY)),
+        )
+        .route("/sites/{id}/look/settings", get(looks::settings))
+        .route("/sites/{id}/look/history", get(looks::history))
+        .route("/sites/{id}/look/rollback", post(looks::rollback))
+        .route("/sites/{id}/themes", post(looks::create_theme))
+        .route(
+            "/sites/{id}/themes/{theme}",
+            patch(looks::change_theme).delete(looks::delete_theme),
         )
         .route("/brand", get(brand::show))
         .route("/brand/themes", post(brand::create_theme))
