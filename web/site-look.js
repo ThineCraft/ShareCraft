@@ -604,9 +604,10 @@ addEventListener('beforeunload', (event) => {
 if (settingsAnswer.data.in_hub) {
   const hub = settingsAnswer.data.in_hub;
   $('hub-note').hidden = false;
+  // A hub you cannot see is not named.
+  const named = !hub.hidden && hub.id && hub.name;
   $('hub-note').replaceChildren(
-    'This site is in the hub ',
-    h('a', { href: pageFor('site', hub.id) }, hub.name),
+    ...(named ? ['This site is in the hub ', h('a', { href: pageFor('site', hub.id) }, hub.name)] : ['This site is in a hub']),
     ', so its pages use the hub’s theme. The theme chosen here is kept and comes back if the site leaves the hub. The logo, header, navigation and footer are this site’s own.',
   );
 }

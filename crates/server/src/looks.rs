@@ -547,7 +547,7 @@ pub(crate) async fn set_look(
         )
         .await?;
     }
-    settings_answer(state, site).await
+    settings_answer(state, actor, site).await
 }
 
 /// Applies the look before (`Which::Before`) or after a change in the history of `site` as a
@@ -556,7 +556,7 @@ pub(crate) async fn set_look(
 ///
 /// # Errors
 /// `404` for no such entry of this site; `422 low_contrast` or `invalid_look` for a look that
-/// no longer passes; `409 image_gone {slots}` when the content of its images is gone;
+/// no longer passes; `409 image_gone {slots}` when the content of its images is gone or held;
 /// otherwise as [`set_look`].
 pub(crate) async fn rollback(
     state: &AppState,
@@ -594,11 +594,18 @@ pub(crate) async fn rollback(
             let used = slots(look);
             let hashes: Vec<String> = used.iter().map(|(_, i)| i.sha256.clone()).collect();
             let missing = db.missing_blobs(&hashes).await?;
-            let gone: Vec<&'static str> = used
-                .iter()
-                .filter(|(_, image)| missing.contains(&image.sha256))
-                .map(|(slot, _)| *slot)
-                .collect();
+            // Content no longer stored, or held (infected or awaiting the scanner) after a
+            // rescan, is never pinned again, as a `keep` of it is refused.
+            let mut gone: Vec<&'static str> = Vec::new();
+            for (slot, image) in &used {
+                let held = match revisions::parse_hex(&image.sha256) {
+                    Some(hash) => db.availability(&hash).await?.is_some(),
+                    None => true,
+                };
+                if held || missing.contains(&image.sha256) {
+                    gone.push(*slot);
+                }
+            }
             if !gone.is_empty() {
                 return Err(BrandError::ImagesGone(gone));
             }
@@ -615,7 +622,7 @@ pub(crate) async fn rollback(
         )
         .await?;
     }
-    settings_answer(state, site).await
+    settings_answer(state, actor, site).await
 }
 
 /// The site's settings as PostgreSQL mirrors them, or a record-less site's defaults.
@@ -663,8 +670,14 @@ fn site_theme_out(theme: &SiteTheme) -> Value {
     )
 }
 
-/// The look settings of `site`: `{look, themes, theme_source_changed, in_hub?: {id, name}}`.
-async fn settings_answer(state: &AppState, site: NodeId) -> Result<Value, BrandError> {
+/// The look settings of `site` for `actor`: `{look, themes, theme_source_changed, in_hub?}`.
+/// `in_hub` is `{id, name}` for a hub `actor` can see, as the effective look and `/hubs` name
+/// it, and `{hidden: true}` for one they cannot.
+async fn settings_answer(
+    state: &AppState,
+    actor: &User,
+    site: NodeId,
+) -> Result<Value, BrandError> {
     let db = state.db();
     let settings = site_settings(db, site).await?;
     let org = db.org_brand().await?;
@@ -674,14 +687,19 @@ async fn settings_answer(state: &AppState, site: NodeId) -> Result<Value, BrandE
         "themes": settings.themes.iter().map(site_theme_out).collect::<Vec<_>>(),
         "theme_source_changed": source_changed(&look, &org, &settings.themes),
     });
-    if let Some((hub, _)) = lending_hub(db, &settings).await?
-        && let Some(node) = db.node(hub).await?
-        && let Some(map) = out.as_object_mut()
-    {
-        map.insert(
-            "in_hub".into(),
-            json!({ "id": hub.0.to_string(), "name": node.name }),
-        );
+    if let Some((hub, _)) = lending_hub(db, &settings).await? {
+        let named = if db.path(actor.id, hub).await?.is_some() {
+            db.node(hub).await?
+        } else {
+            None
+        };
+        let in_hub = match named {
+            Some(node) => json!({ "id": hub.0.to_string(), "name": node.name }),
+            None => json!({ "hidden": true }),
+        };
+        if let Some(map) = out.as_object_mut() {
+            map.insert("in_hub".into(), in_hub);
+        }
     }
     Ok(out)
 }
@@ -696,7 +714,7 @@ pub(crate) async fn settings(
     site: NodeId,
 ) -> Result<Value, BrandError> {
     readable(state, actor, site).await?;
-    settings_answer(state, site).await
+    settings_answer(state, actor, site).await
 }
 
 /// The last [`HISTORY_LENGTH`] changes of the look of `site`, newest first, for `actor`, who

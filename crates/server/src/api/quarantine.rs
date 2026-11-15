@@ -143,8 +143,11 @@ pub(crate) async fn release(
 /// names the content (live or in the recycle bin), skipping the bin, then erases the content
 /// once nothing names it (an older version of another document may still name it). Recorded
 /// as `content.deleted {sha256, documents}` with the administrator. Answers `{sha256,
-/// documents, erased}`. Administrators only (`403`); `404` for content that is not infected or
-/// held.
+/// documents, erased, pinned_by_brand}`, `pinned_by_brand` naming who still uses the content as
+/// a brand image (`{owner: "org"}` for the brand centre, `{owner: "site", id, name}` for a
+/// site's look): such content is not erased and stays held, never served, until the brand
+/// changes; its pins are left alone. Administrators only (`403`); `404` for content that is not
+/// infected or held.
 pub(crate) async fn delete(
     State(state): State<AppState>,
     signed: Signed,
@@ -189,6 +192,11 @@ pub(crate) async fn delete(
             Ok(true) => false,
             Err(e) => return Err(ApiError::unavailable(&e)),
         };
+        let pinned_by_brand = if erased {
+            Vec::new()
+        } else {
+            brand_pins_of(db, &hash).await?
+        };
         db.append_event(&NewEvent {
             kind: "content.deleted",
             actor: Some(actor.id),
@@ -203,9 +211,37 @@ pub(crate) async fn delete(
             "sha256": revisions::hex(&hash),
             "documents": purged,
             "erased": erased,
+            "pinned_by_brand": pinned_by_brand,
         })))
     })
     .await
+}
+
+/// Who pins the content `hash` as a brand image, as quarantine delete answers it: the brand
+/// centre as `{owner: "org"}`, then each site as `{owner: "site", id, name}`.
+async fn brand_pins_of(db: &records::Db, hash: &[u8; 32]) -> Result<Vec<Value>, ApiError> {
+    let owners = db
+        .brand_pin_owners(hash)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?;
+    let mut out = Vec::with_capacity(owners.len());
+    for owner in owners {
+        if owner == records::BRAND_CENTRE_OWNER {
+            out.push(json!({ "owner": "org" }));
+            continue;
+        }
+        let Ok(id) = uuid::Uuid::parse_str(&owner) else {
+            continue;
+        };
+        let name = db
+            .node(collab_core::ids::NodeId(id))
+            .await
+            .map_err(|e| ApiError::unavailable(&e))?
+            .map(|node| node.name)
+            .unwrap_or_default();
+        out.push(json!({ "owner": "site", "id": owner, "name": name }));
+    }
+    Ok(out)
 }
 
 /// `POST /api/admin/scan-existing`: queues for the scanner every content stored before

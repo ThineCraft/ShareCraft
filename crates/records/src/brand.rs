@@ -154,6 +154,18 @@ impl Db {
         .await?)
     }
 
+    /// Who pins the content `sha256`: [`BRAND_CENTRE_OWNER`] for the brand centre, a site's id
+    /// for its look; the centre first, then the sites by id.
+    pub async fn brand_pin_owners(&self, sha256: &[u8; 32]) -> Result<Vec<String>, DbError> {
+        Ok(sqlx::query_scalar(
+            "select owner from brand_refs where sha256 = $1              order by owner <> $2, owner",
+        )
+        .bind(revisions::hex(sha256))
+        .bind(BRAND_CENTRE_OWNER)
+        .fetch_all(self.pool())
+        .await?)
+    }
+
     /// Whether `user` may change the brand centre's themes and images: an enabled account that
     /// is an administrator or one of the brand managers.
     pub async fn can_manage_brand(&self, user: UserId) -> Result<bool, DbError> {

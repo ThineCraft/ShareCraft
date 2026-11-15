@@ -1383,8 +1383,9 @@ const oneOf = (value, choices, fallback) => (choices.includes(value) ? value : f
  * The header of a site page for the effective look `look` (`GET /api/sites/{id}/look`, or null
  * when it could not be read: today's compact header). `site` is `{ id, name }`. The layout,
  * background and alignment are data attributes the style sheet draws; the logo has the look's
- * `logo_alt`; the name is always there, hidden for all but screen readers when the look hides
- * the title (which needs a logo), and shown again when the logo fails to load. An extended
+ * `logo_alt`, or none when that only repeats the site name; the name is always there, hidden
+ * for all but screen readers when the look hides the title (which needs a logo), and shown
+ * again when the logo fails to load. An extended
  * header with an image shows it through `<img>` under a fixed dark shade. Names are text only,
  * and only brand images are loaded (with `draft`, in Change the look's preview, also the
  * documents [`draftImageHref`] allows).
@@ -1400,7 +1401,10 @@ export function headerView(site, look, { draft = false } = {}) {
   const logoUrl = href(look?.logo_url);
   const hideTitle = Boolean(header.hide_title && logoUrl);
   const name = h('span', { class: hideTitle ? 'site-name sr' : 'site-name' }, site.name);
-  const alt = typeof look?.logo_alt === 'string' && look.logo_alt !== '' ? look.logo_alt : site.name;
+  // The name beside the logo names the link (shown, or for screen readers only), so a logo
+  // described by the name alone is decoration: read once, not twice.
+  const described = typeof look?.logo_alt === 'string' ? look.logo_alt.trim() : '';
+  const alt = described === '' || described === String(site.name ?? '').trim() ? '' : described;
   const logo = logoUrl
     ? brandImage(logoUrl, { class: 'site-logo', alt }, () => name.setAttribute('class', 'site-name'))
     : null;
@@ -1870,6 +1874,19 @@ export function adminSiteRow(site, onAction) {
 
 /** What a file page shows while the malware scanner holds a file. */
 export const HELD_TEXT = 'Being checked for malware';
+
+/**
+ * What the quarantine page says after a delete whose content the brand still uses
+ * (`pinned_by_brand` of `POST /api/admin/quarantine/{sha256}/delete`: `{owner: 'org'}` or
+ * `{owner: 'site', id, name}`), or null when nothing does. Plain text; names are put in as text.
+ */
+export function brandPinsText(pins) {
+  if (!Array.isArray(pins) || pins.length === 0) return null;
+  const users = pins.map((pin) => (pin?.owner === 'org' ? 'the brand centre' : `the look of site ${pin?.name ?? ''}`));
+  const listed =
+    users.length === 1 ? `by ${users[0]}` : `${users.slice(0, -1).map((u) => `by ${u}`).join(', ')} and by ${users.at(-1)}`;
+  return `Still used ${listed}; change the brand to remove it. Until then it stays held and is never shown.`;
+}
 
 /** The confirmation before an administrator deletes quarantined content. */
 export const QUARANTINE_DELETE_TEXT =

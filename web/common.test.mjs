@@ -1260,6 +1260,25 @@ test('quarantine_text_names_the_threat_as_text', () => {
   } finally {
     delete globalThis.document;
   }
+  // Content the brand still uses stays held; the page says who uses it, as text.
+  assert.equal(libs.brandPinsText([]), null);
+  assert.equal(libs.brandPinsText(undefined), null);
+  assert.equal(
+    libs.brandPinsText([{ owner: 'org' }]),
+    'Still used by the brand centre; change the brand to remove it. Until then it stays held and is never shown.',
+  );
+  assert.equal(
+    libs.brandPinsText([{ owner: 'site', id: SITE, name: '<b>Sales</b>' }]),
+    'Still used by the look of site <b>Sales</b>; change the brand to remove it. Until then it stays held and is never shown.',
+  );
+  assert.equal(
+    libs.brandPinsText([
+      { owner: 'org' },
+      { owner: 'site', id: SITE, name: 'Sales' },
+      { owner: 'site', id: DOC, name: 'Legal' },
+    ]),
+    'Still used by the brand centre, by the look of site Sales and by the look of site Legal; change the brand to remove it. Until then it stays held and is never shown.',
+  );
   assert.equal(
     libs.QUARANTINE_DELETE_TEXT,
     'Delete every file holding this content? They skip the recycle bin and cannot be restored.',
@@ -1612,7 +1631,7 @@ test('header_view_for_each_layout', () => {
       const logo = byClass(view, 'site-logo')[0];
       assert.equal(logo.tag, 'img');
       assert.equal(logo.attributes.src, IMAGE);
-      assert.equal(logo.attributes.alt, 'Sales');
+      assert.equal(logo.attributes.alt, '', 'the name beside it names the link');
       assert.deepEqual(texts(byClass(view, 'site-name')[0]), ['Sales']);
     }
     // An extended band shows its image through <img> under a fixed shade, aligned as set.
@@ -1658,6 +1677,29 @@ test('hidden_title_still_named_for_screen_readers', () => {
     // Without a logo the title cannot be hidden.
     const bare = headerView(SALES, look({ header: { hide_title: true } }));
     assert.ok(!byClass(bare, 'site-name')[0].attributes.class.split(' ').includes('sr'));
+  } finally {
+    delete globalThis.document;
+  }
+});
+
+test('logo_alt_matching_name_is_not_read_twice', () => {
+  lookDocument();
+  try {
+    // The default description (empty, or the server's substitute, the site name) and one equal
+    // to the name: the logo is decoration and the name names the link, once.
+    for (const logoAlt of ['', 'Sales', ' Sales ']) {
+      for (const hideTitle of [false, true]) {
+        const view = headerView(SALES, look({ logo_url: IMAGE, logo_alt: logoAlt, header: { hide_title: hideTitle } }));
+        assert.equal(byClass(view, 'site-logo')[0].attributes.alt, '', `${logoAlt} ${hideTitle}`);
+        const names = byClass(view, 'site-name');
+        assert.equal(names.length, 1);
+        assert.deepEqual(texts(names[0]), ['Sales']);
+        assert.equal(names[0].attributes.class.split(' ').includes('sr'), hideTitle);
+      }
+    }
+    // A description of its own is kept beside the name.
+    const own = headerView(SALES, look({ logo_url: IMAGE, logo_alt: 'Sales team logo' }));
+    assert.equal(byClass(own, 'site-logo')[0].attributes.alt, 'Sales team logo');
   } finally {
     delete globalThis.document;
   }

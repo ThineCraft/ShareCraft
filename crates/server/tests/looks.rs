@@ -2143,3 +2143,184 @@ async fn keep_refuses_unknown_and_gone_snapshots() {
         sha(&second)
     );
 }
+
+#[tokio::test]
+async fn rollback_refuses_held_images() {
+    let server = spawn_server().await;
+    let root = server.admin("Root").await;
+    let (team, documents) = create_site(&server, &root, "Team").await;
+    let first = png(24, 24);
+    let second = png(25, 25);
+    let first_doc = upload(&server, &root, &documents, "First.png", &first).await;
+    let second_doc = upload(&server, &root, &documents, "Second.png", &second).await;
+    set_look(
+        &server,
+        &root,
+        &team,
+        json!({ "theme": { "from": "builtin:sharecraft" }, "logo": { "doc": first_doc } }),
+    )
+    .await;
+    set_look(
+        &server,
+        &root,
+        &team,
+        json!({ "theme": { "from": "builtin:sharecraft" }, "logo": { "doc": second_doc } }),
+    )
+    .await;
+    // The first logo's content is still stored (its file names it), but a rescan finds it
+    // infected: it is held.
+    sqlx::query(
+        "update blobs set scan = 'infected', scan_detail = 'Test-Signature' where sha256 = $1",
+    )
+    .bind(sha(&first))
+    .execute(server.records_db().test_pool())
+    .await
+    .unwrap();
+    let listed = history(&server, &root, &team).await;
+    let before = tip(&server);
+
+    let (status, body) = rollback(
+        &server,
+        &root,
+        &team,
+        json!({ "event_id": listed[1]["event_id"] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body, json!({ "error": "image_gone", "slots": ["logo"] }));
+    assert_eq!(tip(&server), before);
+    assert_eq!(
+        look_in_git(&server, &team).unwrap().logo.unwrap().sha256,
+        sha(&second)
+    );
+    // The held content is not pinned again.
+    let pins = server.records_db().brand_pins(&team).await.unwrap();
+    assert!(
+        pins.iter().all(|(pinned, _)| *pinned != sha(&first)),
+        "{pins:?}"
+    );
+}
+
+#[tokio::test]
+async fn look_settings_hide_unseen_hub() {
+    let server = spawn_server().await;
+    let root = server.admin("Root").await;
+    let olive = server.user("Olive").await;
+    let (hub, _) = create_site(&server, &root, "Secret hub").await;
+    let (team, _) = create_site(&server, &root, "Team").await;
+    grant(&server, &root, &team, &olive, "owner").await;
+    let (status, body) = call(
+        &server,
+        Some(&root),
+        Method::PUT,
+        &format!("/api/sites/{hub}/hub"),
+        Some(json!({ "navigation": [] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = call(
+        &server,
+        Some(&root),
+        Method::PUT,
+        &format!("/api/sites/{team}/joined-hub"),
+        Some(json!({ "hub": hub })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Root can see the hub: named.
+    let shown = settings(&server, &root, &team).await;
+    assert_eq!(shown["in_hub"], json!({ "id": hub, "name": "Secret hub" }));
+    // Olive manages the site but cannot see the hub: told only that a hub's theme is in use.
+    let shown = settings(&server, &olive, &team).await;
+    assert_eq!(shown["in_hub"], json!({ "hidden": true }), "{shown}");
+    assert!(!shown.to_string().contains("Secret hub"), "{shown}");
+    assert!(!shown.to_string().contains(&hub), "{shown}");
+    // A look change answers the settings the same way.
+    let answer = set_look(&server, &olive, &team, builtin("builtin:plum")).await;
+    assert_eq!(answer["in_hub"], json!({ "hidden": true }), "{answer}");
+    // Once she can see the hub, it is named.
+    grant(&server, &root, &hub, &olive, "viewer").await;
+    let shown = settings(&server, &olive, &team).await;
+    assert_eq!(shown["in_hub"], json!({ "id": hub, "name": "Secret hub" }));
+}
+
+/// Marks the content `bytes` infected, as a rescan would.
+async fn mark_infected(server: &Site, bytes: &[u8]) {
+    sqlx::query(
+        "update blobs set scan = 'infected', scan_detail = 'Test-Signature' where sha256 = $1",
+    )
+    .bind(sha(bytes))
+    .execute(server.records_db().test_pool())
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn quarantine_delete_reports_brand_pins() {
+    let server = spawn_server().await;
+    let root = server.admin("Root").await;
+    let (team, documents) = create_site(&server, &root, "Team").await;
+    let (brand_site, _) = create_site(&server, &root, "Brand").await;
+    let assets = asset_library(&server, &root, &brand_site).await;
+    let logo = png(40, 20);
+    let doc = upload(&server, &root, &assets, "Logo.png", &logo).await;
+    let (status, body) = call(
+        &server,
+        Some(&root),
+        Method::POST,
+        "/api/brand/images",
+        Some(json!({ "doc": doc, "kind": "logo" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    set_look(
+        &server,
+        &root,
+        &team,
+        json!({ "theme": { "from": "builtin:sharecraft" }, "logo": { "doc": doc } }),
+    )
+    .await;
+    mark_infected(&server, &logo).await;
+
+    let (status, body) = call(
+        &server,
+        Some(&root),
+        Method::POST,
+        &format!("/api/admin/quarantine/{}/delete", sha(&logo)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["documents"], 1);
+    assert_eq!(body["erased"], false);
+    assert_eq!(
+        body["pinned_by_brand"],
+        json!([{ "owner": "org" }, { "owner": "site", "id": team, "name": "Team" }])
+    );
+    // The content stays, held: never served; the pins are left for the brand to change.
+    assert!(server.blobs().contains(&hash(&logo)));
+    assert_eq!(
+        fetch(&server, &root, &image_url(&logo)).await,
+        StatusCode::LOCKED
+    );
+    let db = server.records_db();
+    assert_eq!(db.brand_pins("org").await.unwrap().len(), 1);
+    assert_eq!(db.brand_pins(&team).await.unwrap().len(), 1);
+
+    // Content nothing pins is erased, with an empty list.
+    let plain = png(41, 21);
+    upload(&server, &root, &documents, "Plain.png", &plain).await;
+    mark_infected(&server, &plain).await;
+    let (status, body) = call(
+        &server,
+        Some(&root),
+        Method::POST,
+        &format!("/api/admin/quarantine/{}/delete", sha(&plain)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["erased"], true, "{body}");
+    assert_eq!(body["pinned_by_brand"], json!([]));
+}

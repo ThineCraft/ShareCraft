@@ -6,6 +6,7 @@
 import {
   QUARANTINE_DELETE_TEXT,
   api,
+  brandPinsText,
   confirmDialog,
   messageFor,
   organisationChrome,
@@ -49,7 +50,9 @@ async function remove(entry) {
   const result = await api('POST', `/admin/quarantine/${seg(entry.sha256)}/delete`);
   if (!result.ok) return showMessage(error, messageFor(result.error));
   const count = result.data?.documents ?? 0;
-  status.textContent = `Deleted ${count} ${count === 1 ? 'file' : 'files'} holding that content.`;
+  const deleted = `Deleted ${count} ${count === 1 ? 'file' : 'files'} holding that content.`;
+  const pinned = brandPinsText(result.data?.pinned_by_brand);
+  status.textContent = pinned ? `${deleted} ${pinned}` : deleted;
   await load();
 }
 
