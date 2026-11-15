@@ -38,3 +38,34 @@ opt-level = 3
 # Every file saved or uploaded is hashed with SHA-256 as it streams into the content store.
 [profile.dev.package.sha2]
 opt-level = 3
+
+# Sign-in hashes and checks passwords with Argon2 (and BLAKE2 within it); unoptimised, one
+# check costs about a second, which times out sign-ins under the full parallel test run.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
+
+# Thumbnails decode uploaded images with these codecs, under a time limit per decode;
+# unoptimised, real photos pass it in debug builds.
+[profile.dev.package.image]
+opt-level = 3
+
+[profile.dev.package.png]
+opt-level = 3
+
+[profile.dev.package.fdeflate]
+opt-level = 3
+
+[profile.dev.package.zune-jpeg]
+opt-level = 3
+
+[profile.dev.package.zune-core]
+opt-level = 3
+
+[profile.dev.package.gif]
+opt-level = 3
+
+[profile.dev.package.image-webp]
+opt-level = 3
