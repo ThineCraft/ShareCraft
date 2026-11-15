@@ -3,97 +3,105 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ShareCraft — Access</title>
+<title>ShareCraft — Share</title>
 <script src="./appearance.js"></script>
 <link rel="stylesheet" href="./style.css">
 </head>
 <body>
-<div class="page">
+<div class="page share-page">
  <nav class="topbar" aria-label="Account">
   <a class="wordmark" href="/" aria-label="ShareCraft, all sites"><span class="wordmark-word">ShareCraft</span></a>
   <span class="spacer"></span>
  </nav>
- <nav id="crumbs" class="crumbs" aria-label="Breadcrumb"></nav>
- <p id="status" role="status" aria-live="polite" class="meta"></p>
- <h1 id="title">Access</h1>
+ <p id="status" role="status" aria-live="polite" class="sr"></p>
+ <header class="share-head">
+  <h1 id="title">Share</h1>
+  <nav id="crumbs" class="crumbs share-trail" aria-label="Where this item is"></nav>
+  <p id="summary" class="share-summary" aria-live="polite"></p>
+  <div id="source-row" class="share-source" hidden>
+   <p id="source"></p>
+   <div class="share-source-actions">
+    <button type="button" id="inherit-toggle"></button>
+    <a id="explorer-link" class="button plain" href="#">Inheritance explorer</a>
+   </div>
+   <p id="inherit-note" class="meta"></p>
+  </div>
+ </header>
  <p id="error" role="alert" class="msg"></p>
  <div id="content" hidden>
-  <section aria-labelledby="source-heading">
-   <h2 id="source-heading">Where access comes from</h2>
-   <p id="source"></p>
-   <p id="inherit-note" class="meta"></p>
-   <p class="toolbar"><button type="button" id="inherit-toggle" class="plain"></button> <a id="explorer-link" class="button plain" href="#">Inheritance explorer</a></p>
-  </section>
-  <section aria-labelledby="people-heading">
-   <h2 id="people-heading">People and groups</h2>
-   <ul id="assignments" class="list" aria-labelledby="people-heading"></ul>
-   <p id="no-assignments" class="meta" hidden>Nobody has access here yet.</p>
-   <form id="share-form" class="row">
-    <div class="field">
-     <label for="share-email">Add a person by email</label>
-     <input type="email" id="share-email" autocomplete="off" required>
+  <section aria-labelledby="add-heading" class="share-add">
+   <h2 id="add-heading">Add people or groups</h2>
+   <form id="share-form" class="share-form" novalidate>
+    <div class="share-find">
+     <label for="share-find" class="sr">Add people or groups: type a name, a group or an email address</label>
+     <div class="combo">
+      <ul id="pending" class="pending-chips" aria-label="To be added" hidden></ul>
+      <input type="text" id="share-find" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="share-options" aria-describedby="share-find-hint" autocomplete="off" spellcheck="false" placeholder="Name, group or email">
+     </div>
+     <ul id="share-options" role="listbox" aria-label="Suggestions" class="combo-list" hidden></ul>
     </div>
     <div class="field">
      <label for="share-role">Role</label>
      <select id="share-role"></select>
     </div>
-    <button type="submit">Add person</button>
+    <button type="submit" id="share-submit">Share</button>
    </form>
-   <form id="group-form" class="row" hidden>
-    <div class="field">
-     <label for="group-pick">Add a group</label>
-     <select id="group-pick" required></select>
-    </div>
-    <div class="field">
-     <label for="group-role">Role</label>
-     <select id="group-role"></select>
-    </div>
-    <button type="submit">Add group</button>
-   </form>
+   <p id="share-find-hint" class="meta">Pick from the list or type an email address, then choose a role and Share. Several can be added at once.</p>
    <p id="share-hint" class="meta" hidden>Adding or changing someone here stops this item inheriting first, so the people above stay as they are and this item keeps a list of its own.</p>
   </section>
+  <section aria-labelledby="people-heading">
+   <h2 id="people-heading">Who has access</h2>
+   <ul id="assignments" class="list share-list" aria-labelledby="people-heading"></ul>
+   <p id="no-assignments" class="meta" hidden>Nobody has access here yet.</p>
+  </section>
   <section aria-labelledby="links-heading">
-   <h2 id="links-heading">Share by link</h2>
+   <div class="share-section-head">
+    <h2 id="links-heading">Links</h2>
+    <button type="button" id="link-make">Make a link</button>
+   </div>
    <p class="meta">A link gives access to this item to whoever opens it. A signed-in link works for people with an account here. A link for anyone needs no account and lets people view and download only.</p>
-   <form id="link-form" class="row">
-    <div class="field">
-     <label for="link-kind">Who can use it</label>
-     <select id="link-kind">
-      <option value="signed_in">People signed in here</option>
-      <option value="anyone" id="anyone-option" hidden>Anyone with the link</option>
-     </select>
-    </div>
-    <div class="field">
-     <label for="link-role">Role</label>
-     <select id="link-role"></select>
-    </div>
-    <div class="field">
-     <label for="link-days" id="link-days-label">Expires after (days)</label>
-     <input type="text" inputmode="numeric" id="link-days" autocomplete="off" size="6">
-    </div>
-    <button type="submit">Make link</button>
-   </form>
-   <p id="link-hint" class="meta"></p>
-   <div id="link-new" class="copybox" hidden>
-    <label for="link-url">Link address</label>
-    <div class="row">
-     <input type="text" id="link-url" readonly autocomplete="off" spellcheck="false">
-     <button type="button" id="link-copy" class="plain">Copy</button>
-    </div>
-    <p id="link-notice" class="note"></p>
-   </div>
-   <h3>Live links</h3>
    <p id="no-links" class="meta" hidden>This item has no live links.</p>
-   <div id="links-wrap" class="scroll" hidden>
-    <table class="banded" id="links">
-     <thead><tr><th>Link</th><th>Role</th><th>Expires</th><th>Used by</th><th><span class="sr">Action</span></th></tr></thead>
-     <tbody id="links-body"></tbody>
-    </table>
-   </div>
+   <ul id="links-list" class="link-cards" aria-labelledby="links-heading"></ul>
   </section>
  </div>
 </div>
 
+<dialog id="link-dialog" aria-labelledby="link-title">
+ <form id="link-form" method="dialog">
+  <h2 id="link-title">Make a link</h2>
+  <div id="link-fields">
+   <div class="field">
+    <label for="link-kind">Who can use it</label>
+    <select id="link-kind">
+     <option value="signed_in">People signed in here</option>
+     <option value="anyone" id="anyone-option" hidden>Anyone with the link</option>
+    </select>
+   </div>
+   <div class="field">
+    <label for="link-role">Role</label>
+    <select id="link-role"></select>
+   </div>
+   <div class="field">
+    <label for="link-days" id="link-days-label">Expires after (days)</label>
+    <input type="text" inputmode="numeric" id="link-days" autocomplete="off" size="6" aria-describedby="link-hint">
+   </div>
+   <p id="link-hint" class="meta"></p>
+  </div>
+  <div id="link-new" class="copybox" hidden>
+   <label for="link-url">Link address</label>
+   <div class="row">
+    <input type="text" id="link-url" readonly autocomplete="off" spellcheck="false">
+    <button type="button" id="link-copy" class="plain">Copy</button>
+   </div>
+   <p id="link-notice" class="note"></p>
+  </div>
+  <p id="link-error" role="alert" class="msg"></p>
+  <div class="row end">
+   <button type="button" id="link-cancel" class="plain">Cancel</button>
+   <button type="submit" id="link-submit">Make link</button>
+  </div>
+ </form>
+</dialog>
 <dialog id="inherit-dialog" aria-labelledby="inherit-title">
  <form id="inherit-form" method="dialog">
   <h2 id="inherit-title">Inherit again?</h2>
