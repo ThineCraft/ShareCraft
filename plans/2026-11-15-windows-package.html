@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ShareCraft — Windows Package: Implementation Plan</title>
+<style>
+:root{color-scheme:light dark;--ink:light-dark(#172f38,#e4ecef);--muted:light-dark(#536b72,#a9b9bf);--line:light-dark(#d7e2e3,#36454b);--paper:light-dark(#fff,#1d272b);--wash:light-dark(#f2f6f5,#141b1e);--accent:light-dark(#3156c9,#9db4ff);font:15px/1.6 Segoe UI,system-ui,sans-serif;color:var(--ink);background:var(--wash)}
+*{box-sizing:border-box}body{margin:0;padding:28px 18px 80px}main{max-width:940px;margin:auto}
+h1{font-size:1.9rem;letter-spacing:-.03em;line-height:1.2;margin:0 0 14px}h2{font-size:1.3rem;margin:38px 0 12px;padding-top:18px;border-top:1px solid var(--line)}h3{font-size:1.08rem;margin:30px 0 8px}h4{font-size:.95rem;margin:16px 0 6px}
+p{margin:0 0 12px}ul,ol{margin:0 0 12px;padding-left:22px}li{margin-bottom:6px}a{color:var(--accent)}
+code{font-family:Consolas,Menlo,monospace;font-size:.88em;background:light-dark(#e9efee,#263238);padding:1px 5px;border-radius:3px;overflow-wrap:anywhere}
+pre{background:var(--paper);border:1px solid var(--line);border-radius:7px;padding:12px 14px;overflow-x:auto;font:13px/1.5 Consolas,Menlo,monospace;margin:0 0 12px}pre code{background:none;padding:0;font-size:inherit}
+.note{border-left:4px solid var(--accent);background:var(--paper);padding:12px 16px;margin:0 0 14px}.note p:last-child{margin:0}
+.task{background:var(--paper);border:1px solid var(--line);border-radius:9px;padding:6px 20px 14px;margin:18px 0}
+ol.steps{list-style:none;padding-left:0}ol.steps>li{padding-left:28px;position:relative;margin-bottom:10px}ol.steps>li::before{content:"☐";position:absolute;left:2px;color:var(--muted)}
+table{border-collapse:collapse;width:100%;font-size:.9rem;background:var(--paper);margin-bottom:14px}th,td{border:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top}th{background:light-dark(#e8efed,#263238)}
+.small{font-size:.88rem;color:var(--muted)}
+tbody tr:nth-child(even) td{background:light-dark(#f4f8f7,#212b30)}
+ol.steps>li:nth-child(even),ul.band>li:nth-child(even),ol.band>li:nth-child(even){background:light-dark(#f4f8f7,#212b30);border-radius:4px}
+</style>
+</head>
+<body><main>
+<h1>A ready-to-run Windows package: implementation plan</h1>
+<p class="small">ShareCraft &middot; tooling &middot; Written 15 November 2026</p>
+<div class="note"><p><strong>For agentic workers:</strong> REQUIRED SUB-SKILL: use superpowers:subagent-driven-development or superpowers:executing-plans. Steps are checkboxes.</p></div>
+
+<p><strong>Goal:</strong> the owner copies one folder (or one zip) to another Windows 11 machine and double-clicks <code>Install ShareCraft.cmd</code>. A few minutes later ShareCraft is running in the browser with an administrator account, a malware scanner stand-in, and its own database. The other machine needs no compiler, no Git and no separately installed PostgreSQL, and nothing asks for administrator rights.</p>
+<p><strong>Architecture:</strong>
+<ul>
+<li><strong>Everything prebuilt:</strong> the package holds a release build of <code>sharecraft-server.exe</code> and <code>xtask.exe</code> (for the stand-in scanner), the <code>web/</code> pages with <code>web/pkg</code> built, and the four built editors.</li>
+<li><strong>Its own PostgreSQL:</strong> the package also carries a private copy of PostgreSQL 18 (only <code>bin</code>, <code>lib</code> and <code>share</code>). It comes from this machine's installation, so nothing is downloaded; the PostgreSQL licence allows this.</li>
+<li><strong>Installing, without administrator rights:</strong> a PowerShell script, run through a <code>.cmd</code> wrapper, copies the program into <code>%LOCALAPPDATA%\Programs\ShareCraft</code> and makes a database cluster under <code>%LOCALAPPDATA%\ShareCraft\db</code> on a free local port. It writes <code>.env</code> with a random password that is never shown, creates the first administrator (asking for the email, name and password), and adds Start-menu shortcuts.</li>
+<li><strong>Starting and stopping:</strong> Start starts PostgreSQL, the stand-in scanner and the server, then opens the browser. Stop shuts them down.</li>
+<li><strong>No Git needed:</strong> the server writes its Git repositories itself through the gix library, so Git is never called.</li>
+</ul></p>
+<p><strong>Tech stack:</strong> the existing workspace (release build), PowerShell 5.1 (built into Windows 11), and this machine's PostgreSQL 18 binaries. No new dependency.</p>
+<p><strong>Spec:</strong> the owner's request of 15 November 2026: "not to compile the app, just to install it and have it up and running", including Git and PostgreSQL if possible. Standing rule: Windows features must not need per-machine administrator work. Security rules: never print <code>.env</code>, database addresses or passwords.</p>
+
+<h2>Proposals in this plan for the owner to check</h2>
+<ol class="band">
+<li><strong>Per-user, no administrator rights:</strong> the package installs for the signed-in Windows user only, and does not register a Windows service. ShareCraft runs while the user's Start shortcut has it running, and an optional "Start when I sign in" choice adds a Startup shortcut.</li>
+<li><strong>The stand-in scanner (<code>fake-icap</code>) is set up and switched on,</strong> so malware scanning can be tried at once. The guide explains how to point it at a real ClamAV scanner later.</li>
+<li><strong>Still local only:</strong> ShareCraft keeps answering only on the machine itself (<code>http://127.0.0.1:&lt;port&gt;</code>), as today. Reaching it from other devices needs the production mode that is not built yet.</li>
+<li><strong>Built from the plan 3C branch</strong> once its final fixes pass, so the package has every feature to try. A new package can be made at any time with one command.</li>
+</ol>
+
+<h2>Not in this plan</h2>
+<ul class="band">
+<li>A signed <code>.msi</code>/<code>.exe</code> installer, automatic updates, a Windows service, HTTPS, access from other devices, and Linux or macOS packages.</li>
+</ul>
+
+<h2>Global constraints</h2>
+<ul class="band">
+<li><strong>Package layout:</strong>
+<ul>
+<li>Folder: <code>ShareCraft-&lt;version&gt;-windows/</code>.</li>
+<li>Scripts: <code>Install ShareCraft.cmd</code>, <code>scripts\install.ps1</code>, <code>scripts\start.ps1</code>, <code>scripts\stop.ps1</code> and <code>scripts\uninstall.ps1</code>.</li>
+<li>Program files: <code>bin\sharecraft-server.exe</code> and <code>bin\xtask.exe</code>; <code>web\</code>; <code>editors\</code> (with their <code>.br</code>/<code>.gz</code> copies).</li>
+<li>Database files: <code>pgsql\bin</code>, <code>pgsql\lib</code> and <code>pgsql\share</code>.</li>
+<li>Documents: <code>README.html</code> (the guide), <code>LICENCES.html</code>, and <code>VERSION</code> (the commit id and build date).</li>
+<li>Zipped as <code>ShareCraft-&lt;version&gt;-windows.zip</code>.</li>
+</ul></li>
+<li><strong>Made by</strong> <code>cargo xtask package [--out DIR]</code>. It builds release binaries into <code>CARGO_TARGET_DIR</code> and runs <code>cargo xtask web</code>. It copies the editors only if <code>cargo xtask editors</code> reports them installed and matching <code>editors.toml</code>; otherwise it refuses and says why. PostgreSQL is copied from <code>SHARECRAFT_PG_DIR</code>, or from <code>C:\Program Files\PostgreSQL\18</code> if that is not set; pgAdmin, documentation, symbols and the installer's own files are left out. It writes the zip and prints its path and size. It never copies <code>.env</code>, <code>data\</code> or any test file.</li>
+<li><strong>Installing</strong> (<code>install.ps1</code>, PowerShell 5.1, StrictMode, every step's exit code checked, stopping with a plain message on any failure):
+<ol>
+<li>It refuses if ShareCraft is already installed for this user, unless <code>-Reinstall</code> is given; a reinstall keeps the data and database.</li>
+<li>It copies the program to <code>%LOCALAPPDATA%\Programs\ShareCraft</code>.</li>
+<li>It picks the first free port from 5440 to 5460 for PostgreSQL, and from 8787 to 8799 for ShareCraft.</li>
+<li><code>initdb</code> makes the cluster under <code>%LOCALAPPDATA%\ShareCraft\db</code> with <code>--auth=scram-sha-256 --encoding=UTF8 --locale=C</code>, a random 32-character superuser password passed through <code>--pwfile</code> (a temporary file deleted at once), listening on <code>127.0.0.1</code> only.</li>
+<li>It creates a database role <code>sharecraft</code> with its own random password, and a database <code>sharecraft</code>.</li>
+<li>It writes <code>%LOCALAPPDATA%\ShareCraft\.env</code> holding <code>DATABASE_URL</code>, readable only by this user (the file's access list narrowed with <code>icacls</code> to the current user).</li>
+<li>It writes <code>%LOCALAPPDATA%\ShareCraft\settings.cmd</code>, setting <code>SHARECRAFT_ADDR</code>, <code>SHARECRAFT_DATA</code> (<code>%LOCALAPPDATA%\ShareCraft\data</code>), <code>SHARECRAFT_WEB</code> and <code>SHARECRAFT_EDITORS_DIR</code>.</li>
+<li>It runs <code>sharecraft-server add-user --admin</code>. The email and name are asked by the script; the password is asked by the server itself, never on a command line.</li>
+<li>It starts everything once and sets the scanner address to the stand-in scanner through the server's settings route, signed in as the new administrator.</li>
+<li>It adds Start-menu shortcuts: "ShareCraft" (start and open), "Stop ShareCraft", and "Uninstall ShareCraft".</li>
+<li>It opens the browser.</li>
+</ol>
+No step needs administrator rights. Passwords, the database address and <code>.env</code> are never printed or logged.</li>
+<li><strong>Start:</strong>
+<ul>
+<li>It starts PostgreSQL with <code>pg_ctl start -w</code>, if it is not already running.</li>
+<li>It starts the stand-in scanner and the server hidden, with their output going to <code>%LOCALAPPDATA%\ShareCraft\logs\</code>.</li>
+<li>It waits until the server answers, then opens the browser. If it is already running, it only opens the browser.</li>
+</ul>
+<strong>Stop:</strong>
+<ul>
+<li>It stops the server and the scanner by the process ids it recorded.</li>
+<li>It then stops PostgreSQL with <code>pg_ctl stop -m fast</code>.</li>
+</ul></li>
+<li><strong>Uninstall:</strong> it stops everything, then asks "Also delete all ShareCraft data and the database?" (default No) and removes only what was confirmed, plus the program and the shortcuts. Nothing is deleted without that confirmation.</li>
+<li><strong>The guide</strong> (<code>README.html</code>, plain English, banded tables in light and dark):
+<ul>
+<li>What it is; what you need (Windows 11 and about 2 GB free).</li>
+<li>How to install, sign in, start and stop.</li>
+<li>Where the data lives, and how to back it up (stop, then copy <code>%LOCALAPPDATA%\ShareCraft</code>).</li>
+<li>How to point the scanner at ClamAV.</li>
+<li>That the computer's own antivirus may remove test files.</li>
+<li>Limits (this machine only; no HTTPS) and how to uninstall.</li>
+</ul></li>
+</ul>
+
+<h2>Review focus</h2>
+<ol class="band">
+<li><strong>No secret leaks:</strong> no password or database address appears in the console, the logs, a command line visible in the process list, or the package itself. (Task 2: the script passes secrets through files that only this user can read, then deletes them, and a test inspects the package for <code>.env</code> or <code>data</code>.)</li>
+<li><strong>A second Install, or a port already in use,</strong> never overwrites an existing database or data folder. (Task 2, <code>-Reinstall</code>.)</li>
+<li><strong>Folder names with spaces or non-ASCII characters</strong> (for example <code>C:\Users\Zoë Smith</code>) work throughout. (Task 2 quotes every path; Task 3 checks it.)</li>
+</ol>
+
+<div class="task">
+<h3>Task 1: <code>cargo xtask package</code></h3>
+<p><strong>Files:</strong> create <code>xtask/src/package.rs</code>; modify <code>xtask/src/main.rs</code>; add the scripts and <code>README.html</code> under <code>packaging/windows/</code> (Task 2 writes them; this task copies them in).</p>
+<ol class="steps">
+<li>Write unit tests for the file-selection rules: PostgreSQL files kept and dropped; <code>.env</code>, <code>data</code> and <code>target</code> never copied; refusal when editors are missing or stale. Run them: they fail. Implement. Run <code>cargo xtask check</code>: it passes.</li>
+<li>Commit <code>feat(xtask): package a ready-to-run Windows build</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 2: the install, start, stop and uninstall scripts, and the guide</h3>
+<p><strong>Files:</strong> create <code>packaging/windows/Install ShareCraft.cmd</code>, <code>packaging/windows/scripts/{install,start,stop,uninstall,common}.ps1</code>, <code>packaging/windows/README.html</code> and <code>packaging/windows/tests/scripts.Tests.ps1</code>.</p>
+<ol class="steps">
+<li>Write Pester-free PowerShell self-tests, run by <code>powershell -File tests\scripts.Tests.ps1</code>:
+<ul>
+<li>Port picking skips a port that is in use.</li>
+<li>Paths with spaces and non-ASCII characters are quoted.</li>
+<li><code>.env</code> is written with a narrowed access list.</li>
+<li>Secrets never reach the console: output is captured and searched.</li>
+<li>A reinstall keeps the data.</li>
+</ul>
+Run them: they fail. Implement. Run them: they pass.</li>
+<li>Commit <code>feat(packaging): Windows install, start, stop and uninstall scripts and guide</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 3 (controller): make the package and try it</h3>
+<ol class="steps">
+<li>Run <code>cargo xtask package</code> from the plan 3C branch head.</li>
+<li>Install into a temporary Windows user profile folder, using a <code>%LOCALAPPDATA%</code> override pointing at a path that has a space and an accented letter.</li>
+<li>Run Start, sign in, upload a file and see it scanned, then run Stop, then Uninstall and keep the data. Record each step as checked or not, and give the owner the zip's path and size.</li>
+</ol></div>
+</main></body>
+
+
+</html>
