@@ -413,7 +413,8 @@ fn date_from_unix(seconds: u64) -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
-fn today() -> String {
+/// Today's date, `YYYY-MM-DD`, in UTC.
+pub fn today() -> String {
     let seconds = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs());
@@ -595,10 +596,63 @@ fn stale_copies(dir: &Path) -> Result<Vec<PathBuf>> {
 }
 
 fn verify_specs(root: &Path, specs: Vec<EditorSpec>) -> Result<()> {
+    let (checked, problems) = spec_problems(root, specs, false)?;
+    if problems.is_empty() {
+        println!("xtask: {checked} installed editor(s) match {EDITORS_TOML}");
+        Ok(())
+    } else {
+        Err(format!(
+            "installed editors do not match:
+  {}",
+            problems.join(
+                "
+  "
+            )
+        ))
+    }
+}
+
+/// Checks that every editor in `editors.toml` is installed and matches it, as a package needs
+/// them all. Returns the ids of the editors, to copy; refuses naming each one that is missing or
+/// does not match.
+pub fn require_all_installed(root: &Path) -> Result<Vec<String>> {
+    require_specs(root, read_editors(root)?)
+}
+
+fn require_specs(root: &Path, specs: Vec<EditorSpec>) -> Result<Vec<String>> {
+    let ids = specs.iter().map(|spec| spec.id.clone()).collect();
+    let (_, problems) = spec_problems(root, specs, true)?;
+    if problems.is_empty() {
+        Ok(ids)
+    } else {
+        Err(format!(
+            "the editors are not all installed and matching {EDITORS_TOML}:
+  {}",
+            problems.join(
+                "
+  "
+            )
+        ))
+    }
+}
+
+/// How many editors were checked, and what is wrong with them. An editor that is not installed
+/// is a problem only when `require_installed`; otherwise it is not checked.
+fn spec_problems(
+    root: &Path,
+    specs: Vec<EditorSpec>,
+    require_installed: bool,
+) -> Result<(usize, Vec<String>)> {
     let mut problems = Vec::new();
     let mut checked = 0;
     for spec in specs {
         let Some(manifest) = installed_manifest(root, &spec.id)? else {
+            if require_installed {
+                problems.push(format!(
+                    "{}: not installed; run `cargo xtask editors build {}`",
+                    spec.id, spec.id
+                ));
+            }
             continue;
         };
         checked += 1;
@@ -617,22 +671,14 @@ fn verify_specs(root: &Path, specs: Vec<EditorSpec>) -> Result<()> {
             ));
         }
     }
-    if problems.is_empty() {
-        println!("xtask: {checked} installed editor(s) match {EDITORS_TOML}");
-        Ok(())
-    } else {
-        Err(format!(
-            "installed editors do not match:\n  {}",
-            problems.join("\n  ")
-        ))
-    }
+    Ok((checked, problems))
 }
 
 // ---------------------------------------------------------------------------------------------
 // build
 
 /// Runs `git -C dir args…` and returns what it printed, without the trailing line break.
-fn git(dir: &Path, args: &[&str]) -> Result<String> {
+pub fn git(dir: &Path, args: &[&str]) -> Result<String> {
     let out = Command::new("git")
         .arg("-C")
         .arg(dir)
@@ -1191,7 +1237,7 @@ fn compress_and_report(id: &str, dir: &Path) -> Result<()> {
 }
 
 /// Bytes as megabytes, to one decimal place.
-fn megabytes(bytes: u64) -> String {
+pub fn megabytes(bytes: u64) -> String {
     format!("{:.1}", bytes as f64 / 1_048_576.0)
 }
 
@@ -1744,6 +1790,47 @@ checkout = "../GridCraft"
         assert!(error.contains("big.js.br"), "{error}");
         assert!(!error.contains("big.js.gz"), "{error}");
         assert!(error.contains("editors compress gridcraft"), "{error}");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_package_refuses_missing_editors() {
+        let (root, _dir, spec) = installed_gridcraft("require-missing");
+        let mut absent = spec.clone();
+        absent.id = "wordcraft".to_owned();
+        let error = require_specs(&root, vec![spec.clone(), absent]).unwrap_err();
+        assert!(error.contains("wordcraft: not installed"), "{error}");
+        assert!(error.contains("editors build wordcraft"), "{error}");
+        assert!(!error.contains("gridcraft"), "{error}");
+        // Verifying alone passes: it checks only what is installed.
+        verify_specs(&root, vec![spec]).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_package_refuses_editors_that_do_not_match() {
+        let (root, dir, mut spec) = installed_gridcraft("require-stale");
+        assert_eq!(
+            require_specs(&root, vec![spec.clone()]).unwrap(),
+            ["gridcraft"]
+        );
+        // A different commit recorded in editors.toml.
+        spec.commit = "2222222222222222222222222222222222222222".to_owned();
+        let error = require_specs(&root, vec![spec.clone()]).unwrap_err();
+        assert!(error.contains("gridcraft: it was built from"), "{error}");
+        // A compressed copy older than its file.
+        spec.commit = "1111111111111111111111111111111111111111".to_owned();
+        std::fs::write(dir.join("big.js"), "abcdefgh".repeat(300)).unwrap();
+        write_compressed_copies(&dir).unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(dir.join("big.js.gz"))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let error = require_specs(&root, vec![spec]).unwrap_err();
+        assert!(error.contains("big.js.gz"), "{error}");
         std::fs::remove_dir_all(&root).unwrap();
     }
 

@@ -11,12 +11,15 @@
 //!   editor already installed;
 //! - `fake-icap [--port 1344] [--preview 1024|none] [--slow] [--fail]` runs a small ICAP
 //!   server for development: content holding the EICAR test string is infected, anything else
-//!   clean.
+//!   clean;
+//! - `package [--out DIR]` makes a ready-to-run Windows package (release builds, the pages, the
+//!   editors and a private PostgreSQL) and zips it; see `package.rs`.
 
 mod editors;
 // Also included by the server's tests, which use the parts the command does not.
 #[allow(dead_code)]
 mod fake_icap;
+mod package;
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -37,7 +40,8 @@ fn main() -> ExitCode {
         Some("scale") => scale(),
         Some("editors") => editors::dispatch(&std::env::args().skip(2).collect::<Vec<_>>()),
         Some("fake-icap") => fake_icap::run(&std::env::args().skip(2).collect::<Vec<_>>()),
-        _ => Err("usage: cargo xtask <web|check|test|scale|editors|fake-icap>".to_owned()),
+        Some("package") => package::run_package(&std::env::args().skip(2).collect::<Vec<_>>()),
+        _ => Err("usage: cargo xtask <web|check|test|scale|editors|fake-icap|package>".to_owned()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
