@@ -3,9 +3,10 @@
 //!
 //! It answers `OPTIONS` for its one service, and `RESPMOD` by reading the encapsulated HTTP
 //! response body (chunked) a piece at a time, never whole, looking for the EICAR test string
-//! anywhere in it: found, it answers `200` with `X-Infection-Found` and `X-Virus-ID`; otherwise
-//! `204`. It honours a `Preview` it advertised (answering `100 Continue`, or at once when the
-//! preview holds the test string or ends the file with `ieof`). Its behaviour can be changed
+//! anywhere in it: found, it answers `200` with `X-Infection-Found` and `X-Virus-ID` (or, set
+//! to, `200` with a `403` block page and no infection header); otherwise `204` (or, set to,
+//! `200` with an HTTP `200`). It honours a `Preview` it advertised (answering `100 Continue`,
+//! or at once when the preview holds the test string or ends the file with `ieof`). Its behaviour can be changed
 //! while it runs, to be slow, fail, answer garbage, stall or drop the connection part way
 //! through a body, dribble its answer a byte at a time, or send a head that never ends.
 //!
@@ -70,6 +71,11 @@ pub struct Behaviour {
     pub dribble: Option<Duration>,
     /// Answers a scan with a status line and then headers without end.
     pub endless_head: bool,
+    /// Blocks infected files as some scanners do: `200` replacing the file with an HTTP `403`
+    /// block page, with no infection header at all.
+    pub block_page: bool,
+    /// Answers clean files `200`, giving back an HTTP `200` response, rather than `204`.
+    pub replace_clean: bool,
 }
 
 /// What the fake server has seen since it started.
@@ -541,13 +547,32 @@ fn respmod(
         )?;
         return Ok(true);
     }
-    if detector.found {
+    if detector.found && behaviour.block_page {
+        shared.counters.infected.fetch_add(1, Ordering::SeqCst);
+        let http = "HTTP/1.1 403 Forbidden\r\nContent-Type: text/html\r\n\r\n";
+        let page = "<html><body>This file was blocked.</body></html>";
+        let answer = format!(
+            "ICAP/1.0 200 OK\r\nISTag: \"fake-1\"\r\n\
+             Encapsulated: res-hdr=0, res-body={}\r\n\r\n{http}{:x}\r\n{page}\r\n0\r\n\r\n",
+            http.len(),
+            page.len()
+        );
+        writer.write_all(answer.as_bytes())?;
+    } else if detector.found {
         shared.counters.infected.fetch_add(1, Ordering::SeqCst);
         let http = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n";
         let answer = format!(
             "ICAP/1.0 200 OK\r\nISTag: \"fake-1\"\r\n\
              X-Infection-Found: Type=0; Resolution=2; Threat={THREAT};\r\n\
              X-Virus-ID: {THREAT}\r\nEncapsulated: res-hdr=0, null-body={}\r\n\r\n{http}",
+            http.len()
+        );
+        writer.write_all(answer.as_bytes())?;
+    } else if behaviour.replace_clean {
+        let http = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        let answer = format!(
+            "ICAP/1.0 200 OK\r\nISTag: \"fake-1\"\r\n\
+             Encapsulated: res-hdr=0, null-body={}\r\n\r\n{http}",
             http.len()
         );
         writer.write_all(answer.as_bytes())?;

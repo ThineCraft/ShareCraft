@@ -6,8 +6,12 @@
 //! `OPTIONS` advertises a `Preview`, the first bytes go first and the rest only if the scanner
 //! answers `100 Continue`. Each request uses a connection of its own, closed afterwards.
 //!
-//! `204`, or `200` without an infection header, is clean; `200` or `403` with
-//! `X-Infection-Found`, `X-Violations-Found` or `X-Virus-ID` is infected; anything else, a
+//! `204` is clean; `200` or `403` with `X-Infection-Found`, `X-Violations-Found` or
+//! `X-Virus-ID` (on the ICAP answer, or on the HTTP response it encapsulates) is infected. The
+//! request says `Allow: 204`, so a `200` means the scanner replaced the file: without an
+//! infection header it is clean only when the HTTP response it encapsulates has a `2xx` status
+//! (or it encapsulates none); any other status, such as a scanner's `403` block page, is
+//! infected, as "blocked by the scanner". Anything else, a
 //! malformed answer, a refused connection, an answer head over 64 KiB, or an exchange that
 //! takes longer than the timeout is an error, which the scan worker retries. The timeout covers
 //! the whole exchange: connecting, sending, and reading the full answer head, so a scanner that
@@ -280,7 +284,7 @@ impl Client {
             }
             let answer = self.read_answer(&mut stream).await?;
             if answer.status != 100 {
-                return verdict(&answer);
+                return self.conclude(&mut stream, &answer).await;
             }
             if ended {
                 return Err(IcapError::Malformed(
@@ -305,7 +309,7 @@ impl Client {
             return self.answer_after_failure(&mut stream, e).await;
         }
         let answer = self.read_answer(&mut stream).await?;
-        verdict(&answer)
+        self.conclude(&mut stream, &answer).await
     }
 
     /// Sends up to `limit` of the file's bytes as chunks, a piece at a time; how many it sent
@@ -352,13 +356,56 @@ impl Client {
             return Err(failure);
         }
         match self.read_answer(stream).await {
-            Ok(answer) if answer.status != 100 => verdict(&answer),
+            Ok(answer) if answer.status != 100 => self.conclude(stream, &answer).await,
             _ => Err(failure),
         }
     }
 
+    /// What the final answer `answer` says of the file, reading the head of the HTTP response
+    /// it encapsulates when that decides it (a `200` without an infection header).
+    async fn conclude(
+        &self,
+        stream: &mut TcpStream,
+        answer: &Answer,
+    ) -> Result<Verdict, IcapError> {
+        let encapsulated = if answer.status == 200 && threat(answer).is_none() {
+            self.read_encapsulated(stream, answer).await?
+        } else {
+            None
+        };
+        verdict(answer, encapsulated.as_ref())
+    }
+
+    /// The head of the HTTP response that `answer` encapsulates (`res-hdr` in its
+    /// `Encapsulated` header); `None` when it encapsulates none.
+    async fn read_encapsulated(
+        &self,
+        stream: &mut TcpStream,
+        answer: &Answer,
+    ) -> Result<Option<Answer>, IcapError> {
+        let Some(offset) = encapsulated_offset(answer, "res-hdr")? else {
+            return Ok(None);
+        };
+        // Whatever comes before it (an encapsulated request's head) is skipped.
+        let skip = usize::try_from(offset)
+            .ok()
+            .filter(|n| *n <= MAX_HEAD)
+            .ok_or(IcapError::Malformed("the encapsulated response is too far"))?;
+        let mut skipped = vec![0u8; skip];
+        self.step(stream.read_exact(&mut skipped), IcapError::Io)
+            .await?;
+        let head = self.read_head(stream).await?;
+        parse_http_head(&head).map(Some)
+    }
+
     /// Reads an answer's head: the status line and headers.
     async fn read_answer(&self, stream: &mut TcpStream) -> Result<Answer, IcapError> {
+        let head = self.read_head(stream).await?;
+        parse_head(&head)
+    }
+
+    /// Reads a head, up to and including the blank line that ends it.
+    async fn read_head(&self, stream: &mut TcpStream) -> Result<Vec<u8>, IcapError> {
         let mut head = Vec::new();
         let mut byte = [0u8; 1];
         // Byte by byte, so nothing after the head is consumed; heads are short.
@@ -376,18 +423,57 @@ impl Client {
             }
             head.extend_from_slice(&byte);
         }
-        parse_head(&head)
+        Ok(head)
     }
+}
+
+/// The offset `Encapsulated` gives the part `name` of an answer; `None` when it has no such
+/// part.
+fn encapsulated_offset(answer: &Answer, name: &str) -> Result<Option<u64>, IcapError> {
+    let Some(encapsulated) = answer.header("encapsulated") else {
+        return Ok(None);
+    };
+    for part in encapsulated.split(',') {
+        if let Some((part_name, offset)) = part.trim().split_once('=')
+            && part_name.trim().eq_ignore_ascii_case(name)
+        {
+            return offset
+                .trim()
+                .parse()
+                .map(Some)
+                .map_err(|_| IcapError::Malformed("an Encapsulated offset is not a number"));
+        }
+    }
+    Ok(None)
 }
 
 /// The status and headers of an answer's head.
 fn parse_head(head: &[u8]) -> Result<Answer, IcapError> {
+    parse_head_of(head, |version| version == "ICAP/1.0", "no ICAP status line")
+}
+
+/// The status and headers of the head of an encapsulated HTTP response.
+fn parse_http_head(head: &[u8]) -> Result<Answer, IcapError> {
+    parse_head_of(
+        head,
+        |version| version.starts_with("HTTP/1."),
+        "the encapsulated response has no HTTP status line",
+    )
+}
+
+/// The status and headers of a head whose status line starts with a version `versioned`
+/// accepts (`missing` otherwise).
+fn parse_head_of(
+    head: &[u8],
+    versioned: impl Fn(&str) -> bool,
+    missing: &'static str,
+) -> Result<Answer, IcapError> {
     let text = std::str::from_utf8(head).map_err(|_| IcapError::Malformed("not text"))?;
     let mut lines = text.split('\n').map(|line| line.trim_end_matches('\r'));
     let status_line = lines.next().unwrap_or_default();
     let mut parts = status_line.splitn(3, ' ');
-    if parts.next() != Some("ICAP/1.0") {
-        return Err(IcapError::Malformed("no ICAP status line"));
+    if !parts.next().is_some_and(versioned) {
+        return Err(IcapError::Malformed(missing));
     }
     let status = parts
         .next()
@@ -423,13 +509,24 @@ fn short_file() -> IcapError {
     ))
 }
 
-/// What a final answer says of the file.
-fn verdict(answer: &Answer) -> Result<Verdict, IcapError> {
+/// What the scanner is said to have found when it blocks a file without naming a threat.
+pub const BLOCKED: &str = "blocked by the scanner";
+
+/// What a final answer says of the file, with the head of the HTTP response it encapsulates
+/// when that was read (see [`Client::conclude`]).
+fn verdict(answer: &Answer, encapsulated: Option<&Answer>) -> Result<Verdict, IcapError> {
     match answer.status {
         204 => Ok(Verdict::Clean),
         200 | 403 => match threat(answer) {
             Some(threat) => Ok(Verdict::Infected(threat)),
-            None if answer.status == 200 => Ok(Verdict::Clean),
+            None if answer.status == 200 => match encapsulated {
+                // The scanner replaced the file with something other than a success: it
+                // blocked it.
+                Some(http) if !(200..300).contains(&http.status) => Ok(Verdict::Infected(
+                    threat(http).unwrap_or_else(|| BLOCKED.to_owned()),
+                )),
+                _ => Ok(Verdict::Clean),
+            },
             None => Err(IcapError::Status(answer.status)),
         },
         status => Err(IcapError::Status(status)),
@@ -484,32 +581,53 @@ mod tests {
     #[test]
     fn verdicts() {
         let clean = answer("ICAP/1.0 204 No Content\r\nISTag: x\r\n\r\n");
-        assert_eq!(verdict(&clean).unwrap(), Verdict::Clean);
+        assert_eq!(verdict(&clean, None).unwrap(), Verdict::Clean);
         let plain = answer("ICAP/1.0 200 OK\r\nEncapsulated: null-body=0\r\n\r\n");
-        assert_eq!(verdict(&plain).unwrap(), Verdict::Clean);
+        assert_eq!(verdict(&plain, None).unwrap(), Verdict::Clean);
+        // A 200 replacing the file: clean only when the replacement is a success.
+        let replaced = answer("ICAP/1.0 200 OK\r\nEncapsulated: res-hdr=0, res-body=40\r\n\r\n");
+        let ok = parse_http_head(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n").unwrap();
+        assert_eq!(verdict(&replaced, Some(&ok)).unwrap(), Verdict::Clean);
+        let page = parse_http_head(b"HTTP/1.1 403 Forbidden\r\n\r\n").unwrap();
+        assert_eq!(
+            verdict(&replaced, Some(&page)).unwrap(),
+            Verdict::Infected(BLOCKED.to_owned())
+        );
+        let named =
+            parse_http_head(b"HTTP/1.0 403 Forbidden\r\nX-Virus-ID: Worm.Z\r\n\r\n").unwrap();
+        assert_eq!(
+            verdict(&replaced, Some(&named)).unwrap(),
+            Verdict::Infected("Worm.Z".to_owned())
+        );
+        assert_eq!(encapsulated_offset(&replaced, "res-hdr").unwrap(), Some(0));
+        assert_eq!(encapsulated_offset(&plain, "res-hdr").unwrap(), None);
+        assert!(parse_http_head(b"ICAP/1.0 200 OK\r\n\r\n").is_err());
         let found = answer(
             "ICAP/1.0 200 OK\r\nX-Infection-Found: Type=0; Resolution=2; Threat=Bad.Thing;\r\n\r\n",
         );
         assert_eq!(
-            verdict(&found).unwrap(),
+            verdict(&found, None).unwrap(),
             Verdict::Infected("Bad.Thing".to_owned())
         );
         let id = answer("ICAP/1.0 403 Forbidden\r\nX-Virus-ID: Worm.X\r\n\r\n");
         assert_eq!(
-            verdict(&id).unwrap(),
+            verdict(&id, None).unwrap(),
             Verdict::Infected("Worm.X".to_owned())
         );
         let violations = answer(
             "ICAP/1.0 200 OK\r\nX-Violations-Found: 1\r\n\tfile.bin\r\n\tTrojan.Y\r\n\t2\r\n\t0\r\n\r\n",
         );
         assert_eq!(
-            verdict(&violations).unwrap(),
+            verdict(&violations, None).unwrap(),
             Verdict::Infected("Trojan.Y".to_owned())
         );
         let refused = answer("ICAP/1.0 403 Forbidden\r\n\r\n");
-        assert!(matches!(verdict(&refused), Err(IcapError::Status(403))));
+        assert!(matches!(
+            verdict(&refused, None),
+            Err(IcapError::Status(403))
+        ));
         let error = answer("ICAP/1.0 500 Server Error\r\n\r\n");
-        assert!(matches!(verdict(&error), Err(IcapError::Status(500))));
+        assert!(matches!(verdict(&error, None), Err(IcapError::Status(500))));
     }
 
     #[test]

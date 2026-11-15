@@ -483,6 +483,71 @@ async fn icap_infected_answers_as_real_scanners_send_them() {
     }
 }
 
+/// A scanner that blocks by replacing the file with an HTTP `403` page and no infection header
+/// blocks it: the file is infected, "blocked by the scanner"; a `200` giving back an HTTP `200`
+/// is clean. With and without a preview, through the client and through an upload.
+#[tokio::test]
+async fn icap_block_pages_without_an_infection_header_are_infected() {
+    for preview in [None, Some(DEFAULT_PREVIEW)] {
+        let fake = FakeIcap::start(
+            local(),
+            Behaviour {
+                preview,
+                block_page: true,
+                replace_clean: true,
+                ..Behaviour::default()
+            },
+        )
+        .unwrap();
+        let client = client(&fake);
+        for bad in [small_infected(), infected_of_size("large", 4096)] {
+            let verdict = client
+                .scan(bad.as_slice(), bad.len() as u64, "invoice.pdf")
+                .await
+                .unwrap();
+            assert_eq!(
+                verdict,
+                Verdict::Infected(server::icap::BLOCKED.to_owned()),
+                "{preview:?}, {} bytes",
+                bad.len()
+            );
+        }
+        let clean = vec![b'c'; 3000];
+        let verdict = client
+            .scan(clean.as_slice(), clean.len() as u64, "clean.bin")
+            .await
+            .unwrap();
+        assert_eq!(verdict, Verdict::Clean, "{preview:?}");
+    }
+
+    let Scanned {
+        server,
+        fake: _fake,
+        ann,
+        home,
+        ..
+    } = scanned(Behaviour {
+        block_page: true,
+        replace_clean: true,
+        ..previewing()
+    })
+    .await;
+    let bad = infected("block page");
+    let doc = upload(&server, &ann, &home, "Blocked.bin", &bad).await;
+    let state = wait_scan(&server, &bad, |s| {
+        matches!(
+            s,
+            ScanState::Infected | ScanState::Failed | ScanState::Clean
+        )
+    })
+    .await;
+    assert_eq!(state, ScanState::Infected);
+    let info = state_of(&server, &bad).await.unwrap();
+    assert_eq!(info.detail.as_deref(), Some(server::icap::BLOCKED));
+    let (status, _) = download(&server, &ann, &doc).await;
+    assert_eq!(status, StatusCode::LOCKED);
+}
+
 /// A small infected file, whose whole content fits the scanner's preview, and one exactly the
 /// preview's size, uploaded as anyone would: both found infected and quarantined, with the
 /// threat named.
@@ -1060,6 +1125,273 @@ async fn editor_saves_are_not_held_but_quarantined_when_infected() {
     let (status, _) = download(&server, &ann, &file).await;
     assert_eq!(status, StatusCode::OK);
     assert!(fake.seen().scans >= 2);
+}
+
+/// The quarantine as an administrator sees it: each content's hash and state.
+async fn quarantined(site: &Site, admin: &TestUser) -> Vec<(String, String)> {
+    let (status, body) = call(site, admin, Method::GET, "/api/admin/quarantine", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body.as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            (
+                entry["sha256"].as_str().unwrap().to_owned(),
+                entry["scan"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect()
+}
+
+/// While the scanner is down, a failed scan holds only what an upload named: a document saved
+/// from an editor and old content queued by "Scan existing files" stay available (and out of
+/// the quarantine); an upload is held and listed. Uploads are scanned before the backlog.
+#[tokio::test]
+async fn scanner_outage_holds_only_uploads() {
+    let server = spawn_server().await;
+    let admin = server.admin("Scan Admin").await;
+    let ann = server.user("Ann").await;
+    let home = server.home_of(&ann).await.0.to_string();
+    let old = b"stored before the scanner was set".to_vec();
+    let old_doc = upload(&server, &ann, &home, "Old.bin", &old).await;
+
+    // A scanner that is not there.
+    let url = format!("icap://127.0.0.1:{}/scan", free_port());
+    scanner(&server, &admin, json!({ "scanner_url": url })).await;
+
+    // Saved from an editor: the scan fails, the document stays available.
+    let (status, body) = call(
+        &server,
+        &ann,
+        Method::POST,
+        "/api/docs",
+        Some(json!({ "parent": home, "name": "Draft.txt", "editor": "text" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let draft = body["id"].as_str().unwrap().to_owned();
+    let text = "written while the scanner is down";
+    let mut writer =
+        TestClient::connect_as(&server, DocId(Uuid::parse_str(&draft).unwrap()), &ann).await;
+    writer.type_at(0, text).await;
+    writer
+        .pump_until(|c| c.pending() == 0 && c.seq() == Seq(1))
+        .await;
+    writer.wait_saved(Seq(1)).await;
+    wait_scan(&server, text.as_bytes(), |s| s == ScanState::Failed).await;
+    assert!(!state_of(&server, text.as_bytes()).await.unwrap().hold);
+    let (status, body) = download(&server, &ann, &draft).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        listed(&server, &ann, &home, &draft)
+            .await
+            .get("scan")
+            .is_none()
+    );
+    let status = handshake_status(ws_request(
+        server.addr,
+        &format!("/ws/docs/{draft}"),
+        Some(&ann.cookie),
+    ))
+    .await;
+    assert_eq!(status, 101, "the editor opens it again");
+
+    // Queued by "Scan existing files": the scan fails, the old content stays available.
+    let (status, body) = call(
+        &server,
+        &admin,
+        Method::POST,
+        "/api/admin/scan-existing",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    wait_scan(&server, &old, |s| s == ScanState::Failed).await;
+    let (status, body) = download(&server, &ann, &old_doc).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // An upload is held when its scan fails, and listed in the quarantine.
+    let uploaded = b"uploaded while the scanner is down".to_vec();
+    let file = upload(&server, &ann, &home, "Upload.bin", &uploaded).await;
+    wait_scan(&server, &uploaded, |s| s == ScanState::Failed).await;
+    let (status, body) = download(&server, &ann, &file).await;
+    assert_eq!(status, StatusCode::LOCKED, "{body}");
+    assert_eq!(body["scan"], "failed");
+    let listed_now = quarantined(&server, &admin).await;
+    assert_eq!(
+        listed_now,
+        vec![(hex(&sha(&uploaded)), "failed".to_owned())],
+        "only the upload is held"
+    );
+
+    // When all three are due again, the upload comes first although it failed last.
+    let later = OffsetDateTime::now_utc() + time::Duration::hours(2);
+    let due = server.records_db().due_scans(later, 3).await.unwrap();
+    assert!(due.len() >= 3, "{due:?}");
+    assert_eq!(due[0].blob.sha256, sha(&uploaded), "{due:?}");
+    let first = server.records_db().due_scans(later, 1).await.unwrap();
+    assert_eq!(first[0].blob.sha256, sha(&uploaded), "{first:?}");
+}
+
+/// Empties the content rows but those of `kept`, flags them for a rebuild, and rebuilds them
+/// from Git as the next start would.
+async fn rebuild_from_git(site: &Site, kept: &[u8; 32]) {
+    let db = site.records_db();
+    sqlx::query("delete from blob_refs")
+        .execute(db.test_pool())
+        .await
+        .unwrap();
+    sqlx::query("delete from blobs where sha256 <> $1")
+        .bind(hex(kept))
+        .execute(db.test_pool())
+        .await
+        .unwrap();
+    db.set_blob_refs_flag(records::BLOB_REFS_DIRTY)
+        .await
+        .unwrap();
+    let state = site.app_state().await;
+    let report = server::reconcile_blobs(&state, OffsetDateTime::now_utc())
+        .await
+        .unwrap();
+    assert!(report.rebuilt, "{report:?}");
+}
+
+/// Content rows rebuilt from Git (a lost database, or one restored from an older backup) come
+/// back held until scanned when a scanner is configured, and unscanned when none is; a row
+/// that still exists keeps its state.
+#[tokio::test]
+async fn content_rebuilt_from_git_is_held_until_scanned() {
+    let Scanned {
+        server,
+        fake,
+        admin,
+        ann,
+        home,
+    } = scanned(Behaviour::default()).await;
+    let state = server.app_state().await;
+    let good = b"content whose row is lost".to_vec();
+    let bad = infected("restored");
+    let good_doc = upload(&server, &ann, &home, "Good.bin", &good).await;
+    let bad_doc = upload(&server, &ann, &home, "Bad.bin", &bad).await;
+    wait_scan(&server, &good, |s| s == ScanState::Clean).await;
+    wait_scan(&server, &bad, |s| s == ScanState::Infected).await;
+
+    // The scanner is down while the rows are rebuilt.
+    let down = format!("icap://127.0.0.1:{}/scan", free_port());
+    scanner(&server, &admin, json!({ "scanner_url": down })).await;
+    rebuild_from_git(&server, &sha(&bad)).await;
+    let info = state_of(&server, &good).await.unwrap();
+    assert!(info.hold, "{info:?}");
+    assert!(
+        matches!(info.state, ScanState::Pending | ScanState::Failed),
+        "{info:?}"
+    );
+    let (status, body) = download(&server, &ann, &good_doc).await;
+    assert_eq!(status, StatusCode::LOCKED, "{body}");
+    // The row that was kept is neither downgraded nor upgraded.
+    assert_eq!(
+        state_of(&server, &bad).await.unwrap().state,
+        ScanState::Infected
+    );
+    let (status, _) = download(&server, &ann, &bad_doc).await;
+    assert_eq!(status, StatusCode::LOCKED);
+
+    // Once scanned, it is available again.
+    scanner(&server, &admin, json!({ "scanner_url": fake.url() })).await;
+    // The worker, woken by the setting, may be scanning it already; a failed attempt with the
+    // scanner that was down is retried here at once.
+    let deadline = tokio::time::Instant::now() + SCAN_WAIT;
+    while state_of(&server, &good).await.unwrap().state != ScanState::Clean {
+        assert!(tokio::time::Instant::now() < deadline, "never scanned");
+        server::scan_once(&state, OffsetDateTime::now_utc() + time::Duration::hours(2)).await;
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let (status, _) = download(&server, &ann, &good_doc).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // With no scanner, rebuilt rows are unscanned, and available.
+    scanner(&server, &admin, json!({ "scanner_url": "" })).await;
+    rebuild_from_git(&server, &sha(&bad)).await;
+    let info = state_of(&server, &good).await.unwrap();
+    assert_eq!(info.state, ScanState::Unscanned, "{info:?}");
+    assert!(!info.hold);
+    let (status, _) = download(&server, &ann, &good_doc).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        state_of(&server, &bad).await.unwrap().state,
+        ScanState::Infected
+    );
+}
+
+/// An upload held while it waits for the scanner is listed in the quarantine with its state,
+/// so that one stuck after the scanner setting is cleared can be found and released.
+#[tokio::test]
+async fn held_pending_uploads_are_listed_in_the_quarantine() {
+    let Scanned {
+        server,
+        fake,
+        admin,
+        ann,
+        home,
+    } = scanned(Behaviour {
+        slow: Some(Duration::from_secs(30)),
+        ..Behaviour::default()
+    })
+    .await;
+    let bytes = b"waiting for a scanner that goes away".to_vec();
+    let doc = upload(&server, &ann, &home, "Waiting.bin", &bytes).await;
+    // The scanner setting is cleared: nothing is released, and the upload stays held.
+    scanner(&server, &admin, json!({ "scanner_url": "" })).await;
+    let info = state_of(&server, &bytes).await.unwrap();
+    assert_eq!(info.state, ScanState::Pending);
+    assert!(info.hold);
+    let (status, _) = download(&server, &ann, &doc).await;
+    assert_eq!(status, StatusCode::LOCKED);
+    let (status, body) = call(&server, &admin, Method::GET, "/api/admin/quarantine", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let entry = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["sha256"] == hex(&sha(&bytes)))
+        .cloned()
+        .unwrap_or_else(|| panic!("not listed: {body}"));
+    assert_eq!(entry["scan"], "pending", "{entry}");
+    assert_eq!(entry["documents"][0]["id"], doc, "{entry}");
+    // An administrator can release it.
+    let (status, body) = call(
+        &server,
+        &admin,
+        Method::POST,
+        &format!("/api/admin/quarantine/{}/release", hex(&sha(&bytes))),
+        Some(json!({ "reason": "the scanner was retired" })),
+    )
+    .await;
+    assert!(status.is_success(), "{status}: {body}");
+    let (status, _) = download(&server, &ann, &doc).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(quarantined(&server, &admin).await.is_empty());
+
+    // Or delete it.
+    let other = b"another upload left waiting".to_vec();
+    scanner(&server, &admin, json!({ "scanner_url": fake.url() })).await;
+    let gone = upload(&server, &ann, &home, "Gone.bin", &other).await;
+    scanner(&server, &admin, json!({ "scanner_url": "" })).await;
+    assert_eq!(
+        state_of(&server, &other).await.unwrap().state,
+        ScanState::Pending
+    );
+    let (status, body) = call(
+        &server,
+        &admin,
+        Method::POST,
+        &format!("/api/admin/quarantine/{}/delete", hex(&sha(&other))),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, _) = download(&server, &ann, &gone).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
