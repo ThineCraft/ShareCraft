@@ -107,7 +107,7 @@ async function showPlace() {
   if (!here) return;
   folder = here.folder;
   path = here.path;
-  await siteChrome(path[0].id, { currentId: path.find((step) => step.kind === 'library')?.id });
+  await siteChrome(path[0].id, { currentId: path.find((step) => step.kind === 'library')?.id, frame: true });
   if (folder) {
     $('back').href = pageFor(folder.kind, folder.id);
     $('back').setAttribute('aria-label', `Back to ${folder.name}`);

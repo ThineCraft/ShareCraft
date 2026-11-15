@@ -40,7 +40,7 @@ if (!here) {
   fail(MISSING);
 }
 const site = here.path[here.path.length - 1];
-let info = (await siteChrome(siteId, { currentId: siteId })).site;
+let info = (await siteChrome(siteId, { currentId: siteId, footer: true })).site;
 $('title').textContent = site.name;
 document.title = `${site.name} — ShareCraft`;
 $('role').textContent = roleLine(here.access);
@@ -119,7 +119,7 @@ async function setHub(hub) {
   showMessage(error, '');
   const result = await api('PUT', `/sites/${seg(siteId)}/joined-hub`, { hub });
   if (!result.ok) return showMessage(error, messageFor(result.error));
-  info = (await siteChrome(siteId, { currentId: siteId })).site ?? result.data;
+  info = (await siteChrome(siteId, { currentId: siteId, footer: true })).site ?? result.data;
   await showAbout();
 }
 
@@ -234,7 +234,7 @@ function deleteLibraryButton(library) {
     const result = await api('DELETE', `/nodes/${seg(library.id)}`);
     if (!result.ok) return showMessage(error, messageFor(result.error));
     $('status').textContent = `The library ${library.name} is in the recycle bin.`;
-    info = (await siteChrome(siteId, { currentId: siteId })).site ?? info;
+    info = (await siteChrome(siteId, { currentId: siteId, footer: true })).site ?? info;
     await showLibraries();
   });
   return button;

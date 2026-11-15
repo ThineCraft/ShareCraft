@@ -1523,3 +1523,346 @@ test('thumbnails_load_their_route_and_survive_a_redraw', async () => {
   assert.equal(none.children[0].attributes.class, 'placeholder');
   assert.equal(none.children[0].textContent, 'No thumbnail');
 });
+
+// ---- the site's look: header, footer, vertical navigation, site cards and the frame bar ----
+
+import { directoryRow, footerView, frameMark, headerView, siteInitials, siteMark } from './common.js';
+
+// A document for the look's views: elements keep tag, attributes, children, listeners, `hidden`
+// and the style properties set through the CSS object model. Markup and style attributes throw.
+function lookDocument() {
+  const all = [];
+  globalThis.document = {
+    createElement(tag) {
+      const element = {
+        tag,
+        attributes: {},
+        children: [],
+        listeners: {},
+        hidden: false,
+        style: {
+          props: {},
+          setProperty(name, value) {
+            this.props[name] = value;
+          },
+        },
+        setAttribute(name, value) {
+          if (name === 'style') throw new Error('no style attribute is ever set');
+          this.attributes[name] = value;
+        },
+        getAttribute(name) {
+          return this.attributes[name] ?? null;
+        },
+        append(...nodes) {
+          this.children.push(...nodes);
+        },
+        replaceChildren(...nodes) {
+          this.children = nodes;
+        },
+        addEventListener(type, listener) {
+          this.listeners[type] = listener;
+        },
+        set innerHTML(_) {
+          throw new Error('innerHTML is never used');
+        },
+      };
+      all.push(element);
+      return element;
+    },
+    getElementById: () => null,
+    querySelector: () => null,
+    addEventListener() {},
+  };
+  return all;
+}
+
+/** Every element below `element` (itself included). */
+const elements = (element) =>
+  typeof element === 'string' ? [] : [element, ...element.children.flatMap(elements)];
+const byClass = (element, name) =>
+  elements(element).filter((e) => (e.attributes.class ?? '').split(' ').includes(name));
+
+const SHA = 'a'.repeat(64);
+const IMAGE = `/api/brand/images/${SHA}`;
+const OTHER_IMAGE = `/api/brand/images/${'b'.repeat(64)}`;
+const SALES = { id: SITE, name: 'Sales' };
+const HEADER = { layout: 'compact', background: 'none', align: 'left', hide_title: false };
+const FOOTER = { enabled: false, layout: 'simple', name: '', background: 'none', groups: [] };
+const look = (more = {}) => ({
+  logo_alt: 'Sales',
+  navigation: 'horizontal',
+  theme_from: 'site',
+  ...more,
+  header: { ...HEADER, ...more.header },
+  footer: { ...FOOTER, ...more.footer },
+});
+
+test('header_view_for_each_layout', () => {
+  const all = lookDocument();
+  try {
+    for (const layout of ['minimal', 'compact', 'standard', 'extended']) {
+      const view = headerView(SALES, look({ logo_url: IMAGE, header: { layout, background: 'strong' } }));
+      assert.equal(view.tag, 'header');
+      assert.equal(view.attributes['data-layout'], layout);
+      assert.equal(view.attributes['data-background'], 'strong');
+      assert.equal(view.attributes['data-align'], 'left');
+      const brand = byClass(view, 'site-brand')[0];
+      assert.equal(brand.tag, 'a');
+      assert.equal(brand.attributes.href, `/site.html?id=${SITE}`);
+      const logo = byClass(view, 'site-logo')[0];
+      assert.equal(logo.tag, 'img');
+      assert.equal(logo.attributes.src, IMAGE);
+      assert.equal(logo.attributes.alt, 'Sales');
+      assert.deepEqual(texts(byClass(view, 'site-name')[0]), ['Sales']);
+    }
+    // An extended band shows its image through <img> under a fixed shade, aligned as set.
+    const band = headerView(
+      SALES,
+      look({ header: { layout: 'extended', background: 'image', image_url: OTHER_IMAGE, align: 'centre' } }),
+    );
+    assert.equal(band.attributes['data-background'], 'image');
+    assert.equal(band.attributes['data-align'], 'centre');
+    const image = byClass(band, 'band-image')[0];
+    assert.equal(image.tag, 'img');
+    assert.equal(image.attributes.src, OTHER_IMAGE);
+    assert.equal(image.attributes.alt, '');
+    assert.equal(byClass(band, 'band-shade').length, 1);
+    // Only an extended header has an image or an alignment.
+    const compact = headerView(SALES, look({ header: { background: 'image', image_url: OTHER_IMAGE, align: 'right' } }));
+    assert.equal(compact.attributes['data-background'], 'none');
+    assert.equal(compact.attributes['data-align'], 'left');
+    assert.equal(byClass(compact, 'band-image').length, 0);
+    // No look (it could not be read): today's compact header with the name; unknown values too.
+    const plain = headerView(SALES, null);
+    assert.equal(plain.attributes['data-layout'], 'compact');
+    assert.equal(plain.attributes['data-background'], 'none');
+    assert.equal(byClass(plain, 'site-logo').length, 0);
+    assert.equal(headerView(SALES, look({ header: { layout: 'huge', background: 'url(x)' } })).attributes['data-layout'], 'compact');
+    // An image address that is not a brand image is never loaded.
+    const odd = headerView(SALES, look({ logo_url: 'https://evil.example/x.png' }));
+    assert.equal(byClass(odd, 'site-logo').length, 0);
+    assert.ok(!all.some((e) => e.tag === 'img' && !e.attributes.src.startsWith('/api/brand/images/')));
+  } finally {
+    delete globalThis.document;
+  }
+});
+
+test('hidden_title_still_named_for_screen_readers', () => {
+  lookDocument();
+  try {
+    const view = headerView(SALES, look({ logo_url: IMAGE, logo_alt: 'Sales team logo', header: { hide_title: true } }));
+    const name = byClass(view, 'site-name')[0];
+    assert.deepEqual(texts(name), ['Sales'], 'the name stays in the header');
+    assert.ok(name.attributes.class.split(' ').includes('sr'), 'shown only to screen readers');
+    assert.equal(byClass(view, 'site-logo')[0].attributes.alt, 'Sales team logo');
+    // Without a logo the title cannot be hidden.
+    const bare = headerView(SALES, look({ header: { hide_title: true } }));
+    assert.ok(!byClass(bare, 'site-name')[0].attributes.class.split(' ').includes('sr'));
+  } finally {
+    delete globalThis.document;
+  }
+});
+
+test('broken_logo_falls_back_to_name', () => {
+  lookDocument();
+  try {
+    // A held logo answers 423 and the browser fires `error`; the name shows instead.
+    const view = headerView(SALES, look({ logo_url: IMAGE, header: { hide_title: true } }));
+    const logo = byClass(view, 'site-logo')[0];
+    logo.listeners.error();
+    assert.equal(logo.hidden, true);
+    const name = byClass(view, 'site-name')[0];
+    assert.ok(!name.attributes.class.split(' ').includes('sr'), 'the name is shown');
+    // A broken band image leaves the shaded band.
+    const band = headerView(SALES, look({ header: { layout: 'extended', background: 'image', image_url: IMAGE } }));
+    const image = byClass(band, 'band-image')[0];
+    image.listeners.error();
+    assert.equal(image.hidden, true);
+  } finally {
+    delete globalThis.document;
+  }
+});
+
+test('footer_view_simple_and_extended', () => {
+  lookDocument();
+  try {
+    assert.equal(footerView(look()), null, 'a footer that is off is not drawn');
+    assert.equal(footerView(null), null);
+    const links = (n, prefix) => Array.from({ length: n }, (_, i) => ({ label: `${prefix} ${i + 1}`, url: `/p${i}` }));
+    const simple = footerView(
+      look({
+        footer: {
+          enabled: true,
+          layout: 'simple',
+          name: 'Sales team',
+          background: 'soft',
+          logo_url: IMAGE,
+          groups: [
+            { heading: 'Ignored', links: links(10, 'Link') },
+            { heading: 'Two', links: links(2, 'Other') },
+          ],
+        },
+      }),
+    );
+    assert.equal(simple.tag, 'footer');
+    assert.equal(simple.attributes['data-layout'], 'simple');
+    assert.equal(simple.attributes['data-background'], 'soft');
+    assert.ok(texts(simple).includes('Sales team'));
+    assert.equal(byClass(simple, 'footer-logo')[0].attributes.src, IMAGE);
+    assert.equal(byClass(simple, 'footer-heading').length, 0, 'a simple footer has no heading');
+    const simpleLinks = elements(simple).filter((e) => e.tag === 'a');
+    assert.equal(simpleLinks.length, 8, 'one group of at most 8 links');
+    assert.ok(!texts(simple).includes('Other 1'));
+
+    const groups = Array.from({ length: 5 }, (_, g) => ({ heading: `Group ${g + 1}`, links: links(9, `G${g + 1}`) }));
+    const extended = footerView(look({ footer: { enabled: true, layout: 'extended', name: '', background: 'strong', groups } }));
+    assert.equal(extended.attributes['data-layout'], 'extended');
+    assert.equal(extended.attributes['data-background'], 'strong');
+    const headings = byClass(extended, 'footer-heading');
+    assert.deepEqual(headings.map((e) => texts(e)[0]), ['Group 1', 'Group 2', 'Group 3', 'Group 4']);
+    assert.equal(elements(extended).filter((e) => e.tag === 'a').length, 32, 'four groups of 8 links');
+    // An unknown background is drawn as none.
+    assert.equal(footerView(look({ footer: { enabled: true, background: 'image' } })).attributes['data-background'], 'none');
+  } finally {
+    delete globalThis.document;
+  }
+});
+
+test('footer_links_rendered_as_text_with_safe_href', () => {
+  const all = lookDocument();
+  try {
+    const hostile = '<img src=x onerror="alert(1)">';
+    const groups = [
+      {
+        heading: '',
+        links: [
+          { label: hostile, url: 'https://example.org/' },
+          { label: 'Home', url: '/site.html' },
+          { label: 'Plain', url: 'http://example.org/' },
+          { label: 'Script', url: 'javascript:alert(1)' },
+          { label: 'Data', url: 'data:text/html,<b>x</b>' },
+          { label: 'Evil', url: '//evil.example' },
+          { label: 'Slash', url: '/\\evil' },
+          { label: 'Mail', url: 'mailto:a@example.org' },
+        ],
+      },
+    ];
+    const view = footerView(look({ footer: { enabled: true, layout: 'simple', name: hostile, groups } }));
+    assert.ok(!all.some((e) => e.tag === 'img'), 'no element is made from a label');
+    const drawn = texts(view);
+    for (const label of [hostile, 'Script', 'Data', 'Evil', 'Slash', 'Mail']) assert.ok(drawn.includes(label), label);
+    const anchors = all.filter((e) => e.tag === 'a');
+    assert.deepEqual(
+      anchors.map((a) => [a.attributes.href, a.attributes.rel ?? null, a.attributes.target ?? null]),
+      [
+        ['https://example.org/', 'noopener noreferrer', null],
+        ['/site.html', null, null],
+        ['http://example.org/', 'noopener noreferrer', null],
+      ],
+    );
+  } finally {
+    delete globalThis.document;
+  }
+});
+
+test('vertical_navigation_class', () => {
+  const all = lookDocument();
+  try {
+    const nav = {
+      global: [],
+      hub: { id: LIB, name: 'Hub', items: [] },
+      local: [{ id: 'l1', label: 'Plans', target: { node: LIB, kind: 'library' }, targeted: false, children: [] }],
+      automatic: false,
+    };
+    const across = navigationView(SALES, nav, {});
+    assert.deepEqual(across.attributes.class.split(' '), ['chrome']);
+    const down = navigationView(SALES, nav, { vertical: true, hubThumbnail: IMAGE });
+    assert.deepEqual(down.attributes.class.split(' '), ['chrome', 'vertical']);
+    // The hub bar shows the hub's thumbnail beside its name.
+    const thumb = all.find((e) => e.tag === 'img');
+    assert.equal(thumb.attributes.src, IMAGE);
+    assert.equal(thumb.attributes.alt, '');
+    thumb.listeners.error();
+    assert.equal(thumb.hidden, true);
+    navigationView(SALES, nav, { hubThumbnail: 'https://evil.example/x.png' });
+    assert.equal(all.filter((e) => e.tag === 'img').length, 1, 'only brand images are shown');
+  } finally {
+    delete globalThis.document;
+  }
+});
+
+test('site_card_initials_without_thumbnail', () => {
+  const all = lookDocument();
+  try {
+    assert.equal(siteInitials('Sales'), 'S');
+    assert.equal(siteInitials('  human   resources team '), 'HR');
+    assert.equal(siteInitials('ÉQUIPE été'), 'ÉÉ');
+    assert.equal(siteInitials('\u{1F600} smile'), '\u{1F600}S');
+    assert.equal(siteInitials(''), '?');
+    const card = siteMark({ id: SITE, name: 'Human Resources', accent: '#1f5f8b' });
+    assert.equal(card.attributes['aria-hidden'], 'true');
+    assert.ok(card.attributes.class.split(' ').includes('initials'));
+    assert.deepEqual(texts(card), ['HR']);
+    assert.equal(card.style.props['--mark-accent'], '#1f5f8b', 'set through the CSS object model');
+    assert.ok(!all.some((e) => e.tag === 'img'));
+    // A colour that is not #rrggbb is never set.
+    assert.deepEqual(siteMark({ name: 'X', accent: 'red;background:url(x)' }).style.props, {});
+    // With a thumbnail the picture shows; if it fails, the initials do.
+    const pictured = siteMark({ id: SITE, name: 'Sales', accent: '#1f5f8b', thumbnail_url: IMAGE });
+    const img = elements(pictured).find((e) => e.tag === 'img');
+    assert.equal(img.attributes.src, IMAGE);
+    assert.equal(img.attributes.alt, '');
+    const initials = byClass(pictured, 'site-initials')[0];
+    assert.equal(initials.hidden, true);
+    img.listeners.error();
+    assert.equal(img.hidden, true);
+    assert.equal(initials.hidden, false);
+    assert.ok(pictured.attributes.class.split(' ').includes('initials'));
+    // The directory row starts with the card's mark.
+    const row = directoryRow({ id: SITE, name: 'Sales', kind: 'team', accent: '#1f5f8b', access: null });
+    assert.ok(row.children[0].attributes.class.split(' ').includes('site-mark'));
+  } finally {
+    delete globalThis.document;
+  }
+});
+
+test('frame_bar_shows_the_thumbnail_or_logo', () => {
+  lookDocument();
+  try {
+    const mono = document.createElement('span');
+    mono.setAttribute('class', 'mono');
+    mono.append('S');
+    frameMark(mono, look({ thumbnail_url: IMAGE, logo_url: OTHER_IMAGE }));
+    assert.equal(mono.children[0].tag, 'img');
+    assert.equal(mono.children[0].attributes.src, IMAGE);
+    assert.equal(mono.attributes.class, 'mono pic');
+    mono.children[0].listeners.error();
+    assert.deepEqual(mono.children, ['S'], 'the letter comes back');
+    assert.equal(mono.attributes.class, 'mono');
+    frameMark(mono, look({ logo_url: OTHER_IMAGE }));
+    assert.equal(mono.children[0].attributes.src, OTHER_IMAGE);
+    frameMark(mono, null);
+    assert.deepEqual(mono.children, ['S']);
+    assert.doesNotThrow(() => frameMark(null, look()));
+  } finally {
+    delete globalThis.document;
+  }
+});
+
+test('messages_for_branding_errors', () => {
+  const general = messageFor('no_such_code');
+  const codes = [
+    'low_contrast',
+    'invalid_look',
+    'invalid_theme',
+    'not_an_image',
+    'image_too_large',
+    'image_gone',
+    'too_many',
+    'name_taken',
+    'held',
+  ];
+  const sentences = codes.map(messageFor);
+  for (const [at, code] of codes.entries()) assert.notEqual(sentences[at], general, code);
+  assert.equal(new Set(sentences).size, codes.length);
+});

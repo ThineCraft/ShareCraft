@@ -103,7 +103,7 @@ $('explorer-link').hidden = !can(here.access, 'manage_access');
 $('top-tools').hidden = !(can(here.access, 'manage_access') || manageSite);
 $('explorer-link').href = `/explorer.html?root=${seg(nodeId)}`;
 $('access-link').href = `/access.html?id=${seg(nodeId)}`;
-await siteChrome(here.path[0].id, { currentId: here.path.find((step) => step.kind === 'library')?.id });
+await siteChrome(here.path[0].id, { currentId: here.path.find((step) => step.kind === 'library')?.id, footer: true });
 
 $('bin-link').href = `/bin.html?site=${seg(here.path[0].id)}`;
 const siteId = here.path[0].id;

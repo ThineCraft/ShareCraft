@@ -106,3 +106,74 @@ test('look_tokens_use_light_dark', () => {
     '--header-ink': 'light-dark(#ffffff,#ffffff)',
   });
 });
+
+// ---- applying a look to the page ----
+
+import { applyLook } from './look.js';
+
+/** An element whose style only records `setProperty` and `removeProperty`; markup throws. */
+function rootElement() {
+  const set = {};
+  const removed = [];
+  return {
+    set,
+    removed,
+    style: {
+      setProperty(name, value) {
+        set[name] = value;
+      },
+      removeProperty(name) {
+        removed.push(name);
+        delete set[name];
+      },
+    },
+    setAttribute() {
+      throw new Error('no attribute is ever set');
+    },
+    set innerHTML(_) {
+      throw new Error('innerHTML is never used');
+    },
+  };
+}
+
+const SHARECRAFT = checkTheme({ primary: '#3156c9', secondary: '#233239' }).resolved;
+
+test('apply_look_sets_only_known_variables', () => {
+  const root = rootElement();
+  const effective = {
+    theme: {
+      light: { ...SHARECRAFT.light, extra: '#000000' },
+      dark: { ...SHARECRAFT.dark, extra: '#000000' },
+      '--bg': '#000000',
+    },
+    '--text': '#000000',
+  };
+  assert.equal(applyLook(root, effective), true);
+  assert.deepEqual(root.set, {
+    '--accent': 'light-dark(#3156c9,#748ddd)',
+    '--accent-ink': 'light-dark(#3156c9,#748ddd)',
+    '--on-accent': 'light-dark(#ffffff,#141c20)',
+    '--header-bg': 'light-dark(#233239,#233239)',
+    '--header-ink': 'light-dark(#ffffff,#ffffff)',
+  });
+  for (const never of ['--bg', '--paper', '--text', '--muted', '--line', '--ok', '--warn-bg', '--stop-ink']) {
+    assert.ok(!(never in root.set), never);
+  }
+});
+
+test('apply_look_refuses_non_hex', () => {
+  for (const bad of ['red;background:url(x)', 'red', '#3156c', '#3156c9;--bg:red', 'url(x)', '', null, 7]) {
+    const root = rootElement();
+    // An earlier, good look is taken away: the page falls back to its own colours.
+    applyLook(root, { theme: SHARECRAFT });
+    const effective = { theme: { light: { ...SHARECRAFT.light, header_bg: bad }, dark: SHARECRAFT.dark } };
+    assert.equal(applyLook(root, effective), false, String(bad));
+    assert.deepEqual(root.set, {}, String(bad));
+    assert.ok(root.removed.includes('--accent'));
+  }
+  // No theme at all (a look that could not be read) and no root are refused quietly.
+  assert.equal(applyLook(rootElement(), null), false);
+  assert.equal(applyLook(rootElement(), { theme: null }), false);
+  assert.equal(applyLook(null, { theme: SHARECRAFT }), false);
+  assert.equal(applyLook({}, { theme: SHARECRAFT }), false);
+});

@@ -259,3 +259,36 @@ export function lookTokens(effective) {
     '--header-ink': pair('header_ink'),
   };
 }
+
+/** The only variables a look may set on a page; every other colour is never themed. */
+export const LOOK_VARIABLES = Object.freeze(['--accent', '--accent-ink', '--on-accent', '--header-bg', '--header-ink']);
+
+const TOKEN = /^light-dark\(#[0-9a-fA-F]{6},#[0-9a-fA-F]{6}\)$/;
+
+/**
+ * Puts an effective look's colours on the page: the variables of [`lookTokens`] are set on
+ * `root` (the `<html>` element) through `style.setProperty`, which the page's Content Security
+ * Policy allows, never through markup or a `style` attribute. Each value is checked again to be
+ * `light-dark(#rrggbb,#rrggbb)` and only the five known variables are set. If anything fails
+ * the check (or there is no theme), nothing is set and an earlier look's variables are taken
+ * away, so the page shows its own colours. Answers whether the look was applied.
+ */
+export function applyLook(root, effective) {
+  const style = root?.style;
+  if (typeof style?.setProperty !== 'function') return false;
+  let tokens = null;
+  try {
+    tokens = lookTokens(effective);
+  } catch {
+    tokens = null;
+  }
+  const good =
+    tokens !== null &&
+    LOOK_VARIABLES.every((name) => typeof tokens[name] === 'string' && TOKEN.test(tokens[name]));
+  if (!good) {
+    for (const name of LOOK_VARIABLES) style.removeProperty?.(name);
+    return false;
+  }
+  for (const name of LOOK_VARIABLES) style.setProperty(name, tokens[name]);
+  return true;
+}

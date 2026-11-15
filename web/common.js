@@ -1,6 +1,8 @@
 // Shared by every page: calling the API, turning its error codes into sentences, and the
 // sign-in redirect. Pages hold no merging or permission logic; the server decides.
 
+import { applyLook } from './look.js';
+
 const MESSAGES = {
   invalid_credentials: 'That email and password do not match.',
   too_many_attempts: 'Too many attempts. Try again in a few minutes.',
@@ -91,6 +93,18 @@ const MESSAGES = {
     'Those library settings are not allowed. File types are written like .png (at most 100 of them), and an image library accepts only image types.',
   invalid_template:
     'That template cannot be used. It may be too large (at most 100 libraries, 5,000 folders and 20 levels), name things by identifier, or have a link that is not allowed.',
+  low_contrast:
+    'Those colours are too hard to read: some text or buttons fall below the contrast people need, in light or dark mode. Choose a suggested shade instead.',
+  invalid_look:
+    'That look cannot be applied. Check the header, footer and logo choices and the footer links (https:, http: or a path).',
+  invalid_theme:
+    'That theme cannot be used. Give it a name of 1 to 60 characters and colours written like #3156c9.',
+  not_an_image: 'That file is not an image ShareCraft can show. Use a PNG, JPEG, WebP, GIF or SVG image.',
+  image_too_large:
+    'That image is too large. A logo, thumbnail or icon can be at most 1 MB, a background at most 5 MB, and no more than 8,000 pixels across.',
+  image_gone:
+    'An image of that look no longer exists. Choose new images for the parts that lost theirs, then apply it again.',
+  too_many: 'There are already as many of those as allowed. Delete one first.',
 };
 
 /** What a document page says when the document is missing or the person has no access. */
@@ -1142,7 +1156,13 @@ function navItem(item, currentId) {
 
 /** One bar: a name (a link to `head.href` when there is one) and its items. */
 function navBar(kind, label, head, items, currentId) {
-  const name = head?.name == null ? null : head.href ? h('a', { class: 'navhead', href: head.href }, head.name) : h('span', { class: 'navhead' }, head.name);
+  const thumb = head?.thumb ? brandImage(head.thumb, { class: 'navthumb', alt: '' }) : null;
+  const name =
+    head?.name == null
+      ? null
+      : head.href
+        ? h('a', { class: 'navhead', href: head.href }, thumb, head.name)
+        : h('span', { class: 'navhead' }, thumb, head.name);
   return h(
     'div',
     { class: `navbar ${kind}`, 'data-bar': kind },
@@ -1158,14 +1178,19 @@ function navBar(kind, label, head, items, currentId) {
  * `nav` is `{ global, hub, local }` as `GET /api/sites/{id}/navigation` answers. At narrow
  * widths the bars fold behind a Menu button. Labels and names are drawn as text only, and an
  * address only becomes a link after [`safeHref`] accepts it. `currentId` is marked as the
- * current page.
+ * current page. With `vertical` (the site's look puts its navigation in a left column) the
+ * view gets the class `vertical`; `hubThumbnail` is the hub's thumbnail address, shown beside
+ * its name when it is a brand image.
  */
-export function navigationView(site, nav, { currentId } = {}) {
+export function navigationView(site, nav, { currentId, vertical = false, hubThumbnail = null } = {}) {
   const bars = [];
   if (nav?.global?.length) bars.push(navBar('global', 'Organisation', null, nav.global, currentId));
   if (nav?.hub) {
     const hub = nav.hub;
-    const head = hub.id != null && hub.name != null ? { name: hub.name, href: pageFor('site', hub.id) } : null;
+    const head =
+      hub.id != null && hub.name != null
+        ? { name: hub.name, href: pageFor('site', hub.id), thumb: brandImageHref(hubThumbnail) }
+        : null;
     if (head || hub.items?.length) bars.push(navBar('hub', 'Hub', head, hub.items ?? [], currentId));
   }
   if (site || nav?.local?.length) {
@@ -1179,7 +1204,7 @@ export function navigationView(site, nav, { currentId } = {}) {
   toggle.addEventListener('click', () => {
     toggle.setAttribute('aria-expanded', toggle.getAttribute('aria-expanded') === 'true' ? 'false' : 'true');
   });
-  const view = h('nav', { class: 'chrome', 'aria-label': 'Site navigation', 'data-chrome': '' }, toggle, menu);
+  const view = h('nav', { class: vertical ? 'chrome vertical' : 'chrome', 'aria-label': 'Site navigation', 'data-chrome': '' }, toggle, menu);
   view.hidden = bars.length === 0;
   // Escape closes what is open and goes back to the button that opened it.
   view.addEventListener('keydown', (event) => {
@@ -1222,27 +1247,260 @@ function placeChrome(view, place) {
   if (place) return place.replaceChildren(view);
   const old = document.querySelector('[data-chrome]');
   if (old) return old.replaceWith(view);
-  const bar = document.querySelector('.topbar, .bar');
+  const bar = document.querySelector('[data-site-header]') ?? document.querySelector('.topbar, .bar');
   if (bar) bar.after(view);
   else document.body?.prepend(view);
 }
 
+// ---- the site's look: colours, header, footer, site cards and the editor frame bar ----
+
+const BRAND_IMAGE = /^\/api\/brand\/images\/[0-9a-f]{64}$/;
+const HEX_COLOUR = /^#[0-9a-fA-F]{6}$/;
+const HEADER_LAYOUTS = ['minimal', 'compact', 'standard', 'extended'];
+const BACKGROUNDS = ['none', 'soft', 'strong'];
+const ALIGNS = ['left', 'centre', 'right'];
+const FOOTER_LINKS = 8;
+const FOOTER_GROUPS = 4;
+
+/** `url` if it is the address of a brand image (`/api/brand/images/{sha256}`), else null. */
+export function brandImageHref(url) {
+  return typeof url === 'string' && BRAND_IMAGE.test(url) ? url : null;
+}
+
 /**
- * The navigation of a page inside site `siteId`: fetches the site (`GET /api/sites/{id}`) and its
- * navigation once, sets the page's language and time zone (and `<html lang>`) to the site's,
- * and draws the bars (see [`navigationView`]) after the account bar, or in `place`.
- * `currentId` is marked as the current page. Answers `{ site, navigation }`, each null when it
- * could not be read; without the site the organisation defaults are used.
+ * An `<img>` of the brand image `url` with `attributes`, hidden if it fails to load (a held
+ * image answers 423); `onError` runs then too.
  */
-export async function siteChrome(siteId, { currentId, place } = {}) {
-  const [site, navigation] = await Promise.all([
+function brandImage(url, attributes, onError) {
+  const img = h('img', { ...attributes, src: url });
+  img.addEventListener('error', () => {
+    img.hidden = true;
+    onError?.();
+  });
+  return img;
+}
+
+const oneOf = (value, choices, fallback) => (choices.includes(value) ? value : fallback);
+
+/**
+ * The header of a site page for the effective look `look` (`GET /api/sites/{id}/look`, or null
+ * when it could not be read: today's compact header). `site` is `{ id, name }`. The layout,
+ * background and alignment are data attributes the style sheet draws; the logo has the look's
+ * `logo_alt`; the name is always there, hidden for all but screen readers when the look hides
+ * the title (which needs a logo), and shown again when the logo fails to load. An extended
+ * header with an image shows it through `<img>` under a fixed dark shade. Names are text only,
+ * and only brand images are loaded.
+ */
+export function headerView(site, look) {
+  const header = look?.header ?? {};
+  const layout = oneOf(header.layout, HEADER_LAYOUTS, 'compact');
+  const extended = layout === 'extended';
+  const imageUrl = extended && header.background === 'image' ? brandImageHref(header.image_url) : null;
+  const background = imageUrl ? 'image' : oneOf(header.background, BACKGROUNDS, 'none');
+  const align = extended ? oneOf(header.align, ALIGNS, 'left') : 'left';
+  const logoUrl = brandImageHref(look?.logo_url);
+  const hideTitle = Boolean(header.hide_title && logoUrl);
+  const name = h('span', { class: hideTitle ? 'site-name sr' : 'site-name' }, site.name);
+  const alt = typeof look?.logo_alt === 'string' && look.logo_alt !== '' ? look.logo_alt : site.name;
+  const logo = logoUrl
+    ? brandImage(logoUrl, { class: 'site-logo', alt }, () => name.setAttribute('class', 'site-name'))
+    : null;
+  const band = imageUrl
+    ? [brandImage(imageUrl, { class: 'band-image', alt: '' }), h('span', { class: 'band-shade', 'aria-hidden': 'true' })]
+    : [];
+  return h(
+    'header',
+    { class: 'site-header', 'data-site-header': '', 'data-layout': layout, 'data-background': background, 'data-align': align },
+    ...band,
+    h('a', { class: 'site-brand', href: pageFor('site', site.id) }, logo, name),
+  );
+}
+
+/**
+ * The address a footer link opens: `https:`, `http:` or a path starting with a single `/`
+ * (see [`safeHref`]), else null and the label is shown as text.
+ */
+function footerHref(url) {
+  const href = safeHref(url);
+  return href && !/^mailto:/i.test(href) ? href : null;
+}
+
+/** One footer link, opening in the same tab; one leaving ShareCraft is `noopener noreferrer`. */
+function footerLink(link) {
+  const href = footerHref(link?.url);
+  const label = String(link?.label ?? '');
+  if (!href) return h('li', {}, h('span', {}, label));
+  const external = !href.startsWith('/');
+  return h('li', {}, h('a', { href, rel: external ? 'noopener noreferrer' : null }, label));
+}
+
+/**
+ * The footer of a site page for the effective look `look`, or null when it is off (or the look
+ * could not be read). A simple footer has one group of at most 8 links and no heading; an
+ * extended one up to 4 groups of 8 under their headings. Text only; links through
+ * [`footerHref`]; only brand images are loaded.
+ */
+export function footerView(look) {
+  const footer = look?.footer;
+  if (!footer?.enabled) return null;
+  const layout = footer.layout === 'extended' ? 'extended' : 'simple';
+  const background = oneOf(footer.background, BACKGROUNDS, 'none');
+  const logoUrl = brandImageHref(footer.logo_url);
+  const name = typeof footer.name === 'string' ? footer.name : '';
+  const logo = logoUrl ? brandImage(logoUrl, { class: 'footer-logo', alt: name ? '' : (look.logo_alt ?? '') }) : null;
+  const groups = (Array.isArray(footer.groups) ? footer.groups : []).slice(0, layout === 'extended' ? FOOTER_GROUPS : 1);
+  const lists = groups.map((group) => {
+    const links = (Array.isArray(group?.links) ? group.links : []).slice(0, FOOTER_LINKS).map(footerLink);
+    const heading = layout === 'extended' && group?.heading ? h('h2', { class: 'footer-heading' }, String(group.heading)) : null;
+    return h('div', { class: 'footer-group' }, heading, links.length ? h('ul', { class: 'footer-links' }, ...links) : null);
+  });
+  return h(
+    'footer',
+    { class: 'site-footer', 'data-site-footer': '', 'data-layout': layout, 'data-background': background },
+    logo || name ? h('p', { class: 'footer-brand' }, logo, name || null) : null,
+    lists.length ? h('nav', { class: 'footer-groups', 'aria-label': 'Footer' }, ...lists) : null,
+  );
+}
+
+/** Up to two initials of a site's name (the first letters of its first two words), or `?`. */
+export function siteInitials(name) {
+  const words = String(name ?? '').trim().split(/\s+/).filter(Boolean);
+  const initials = words.slice(0, 2).map((word) => Array.from(word)[0].toLocaleUpperCase()).join('');
+  return initials || '?';
+}
+
+/**
+ * A site card's mark (a site as `GET /api/sites` lists it): its thumbnail, or its initials on
+ * its accent, which is set as `--mark-accent` through the CSS object model after it is checked
+ * to be `#rrggbb`. A thumbnail that fails to load gives way to the initials.
+ */
+export function siteMark(site) {
+  const thumb = brandImageHref(site?.thumbnail_url);
+  const initials = h('span', { class: 'site-initials' }, siteInitials(site?.name));
+  const mark = h('span', { class: thumb ? 'site-mark' : 'site-mark initials', 'aria-hidden': 'true' }, initials);
+  if (typeof site?.accent === 'string' && HEX_COLOUR.test(site.accent)) {
+    mark.style?.setProperty('--mark-accent', site.accent);
+  }
+  if (thumb) {
+    initials.hidden = true;
+    mark.append(
+      brandImage(thumb, { alt: '' }, () => {
+        initials.hidden = false;
+        mark.setAttribute('class', 'site-mark initials');
+      }),
+    );
+  }
+  return mark;
+}
+
+/**
+ * The editor frame bar's mark (`.mono`): the site's thumbnail, or its logo, in place of the
+ * letter; the letter comes back without either or when the picture fails to load.
+ */
+export function frameMark(mono, look) {
+  if (!mono) return;
+  const letter = () => {
+    mono.replaceChildren('S');
+    mono.setAttribute('class', 'mono');
+  };
+  const url = brandImageHref(look?.thumbnail_url) ?? brandImageHref(look?.logo_url);
+  if (!url) return letter();
+  mono.replaceChildren(brandImage(url, { alt: '' }, letter));
+  mono.setAttribute('class', 'mono pic');
+}
+
+/** Puts `view` in place of the page's element matching `selector`, or after `after`; null removes it. */
+function swapIn(selector, view, after) {
+  const old = document.querySelector(selector);
+  if (old && view) old.replaceWith(view);
+  else if (old) old.remove();
+  else if (view && after) after.after(view);
+}
+
+/**
+ * Puts a site page's parts in the page around its account bar: the header after it, the
+ * navigation after the header (or in `place`), the footer last; each replaces an earlier one.
+ * A vertical navigation needs the rest of the page beside it, so what follows the navigation
+ * (but the footer) is moved into `.side-main`, and moved back when the navigation is horizontal.
+ */
+function placeSite({ header, chrome, footer, vertical }, place) {
+  const top = document.querySelector('.topbar');
+  const page = top?.parentElement ?? null;
+  swapIn('[data-site-header]', header, top);
+  placeChrome(chrome, place);
+  if (page && !place) sideBySide(page, chrome, vertical && !chrome.hidden);
+  const old = document.querySelector('[data-site-footer]');
+  if (old && footer) old.replaceWith(footer);
+  else if (old) old.remove();
+  else if (footer && page) page.append(footer);
+}
+
+/** Lays `page` out with the navigation `chrome` in a left column beside the rest, or not. */
+function sideBySide(page, chrome, vertical) {
+  let main = page.querySelector(':scope > .side-main');
+  if (vertical) {
+    if (!main) {
+      const rest = [];
+      for (let node = chrome.nextSibling; node; node = node.nextSibling) {
+        if (!node.matches?.('[data-site-footer]')) rest.push(node);
+      }
+      main = h('div', { class: 'side-main' });
+      chrome.after(main);
+      main.append(...rest);
+    }
+    page.classList.add('nav-vertical');
+  } else {
+    if (main) main.replaceWith(...main.childNodes);
+    page.classList.remove('nav-vertical');
+  }
+}
+
+/**
+ * The look, header and navigation of a page inside site `siteId`: fetches the site
+ * (`GET /api/sites/{id}`), its navigation and its effective look once, sets the page's
+ * language and time zone (and `<html lang>`) to the site's, applies the look's colours (see
+ * `applyLook` in look.js), and draws the header after the account bar, the bars (see
+ * [`navigationView`]) after it or in `place`, and with `footer` the site's footer at the end.
+ * In the editor frame (`frame`) there is no header or footer: the bar's mark shows the site's
+ * thumbnail or logo instead (see [`frameMark`]), and the navigation stays across the top.
+ * `currentId` is marked as the current page. Answers `{ site, navigation, look }`, each null
+ * when it could not be read; without the site the organisation defaults are used, and without
+ * the look the page keeps its own.
+ */
+export async function siteChrome(siteId, { currentId, place, footer = false, frame = false } = {}) {
+  const [site, navigation, look] = await Promise.all([
     api('GET', `/sites/${seg(siteId)}`),
     api('GET', `/sites/${seg(siteId)}/navigation`),
+    api('GET', `/sites/${seg(siteId)}/look`),
   ]);
   if (site.ok) setRegional({ language: site.data.language, timeZone: site.data.time_zone });
   else await useOrganisationRegional();
-  const shown = { site: site.ok ? site.data : null, navigation: navigation.ok ? navigation.data : null };
-  placeChrome(navigationView(shown.site, shown.navigation, { currentId }), place);
+  const shown = {
+    site: site.ok ? site.data : null,
+    navigation: navigation.ok ? navigation.data : null,
+    look: look.ok && look.data && typeof look.data === 'object' ? look.data : null,
+  };
+  applyLook(document.documentElement, shown.look);
+  const vertical = !frame && shown.look?.navigation === 'vertical';
+  const view = navigationView(shown.site, shown.navigation, {
+    currentId,
+    vertical,
+    hubThumbnail: shown.look?.hub?.thumbnail_url,
+  });
+  if (frame) {
+    frameMark(document.querySelector('.bar .mono'), shown.look);
+    placeChrome(view, place);
+  } else {
+    placeSite(
+      {
+        header: shown.site ? headerView(shown.site, shown.look) : null,
+        chrome: view,
+        footer: footer ? footerView(shown.look) : null,
+        vertical,
+      },
+      place,
+    );
+  }
   return shown;
 }
 
@@ -1280,13 +1538,15 @@ export function directoryFilter(sites, text) {
 }
 
 /**
- * One site of the directory (as `GET /api/sites` lists it) as a list row: its name linked, its
- * kind, whether it is a hub or archived, the hub it joined, its description and the person's role.
+ * One site of the directory (as `GET /api/sites` lists it) as a list row: its mark (see
+ * [`siteMark`]), its name linked, its kind, whether it is a hub or archived, the hub it
+ * joined, its description and the person's role.
  */
 export function directoryRow(site) {
   return h(
     'li',
     {},
+    siteMark(site),
     h(
       'span',
       { class: 'grow' },
