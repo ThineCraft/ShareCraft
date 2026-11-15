@@ -39,6 +39,8 @@ import {
 } from './common.js';
 import { forgetOpened, rememberOpened } from './start.js';
 import { setupEditorFrame } from './editor-frame.js';
+import { createViewer } from './file-viewer.js';
+import { viewerList } from './viewer.js';
 
 const FIRST_DELAY = 500;
 const MAX_DELAY = 8000;
@@ -76,6 +78,7 @@ const chrome = setupEditorFrame(frameBox, {
   onRenamed: (node) => {
     if (removed || !doc) return;
     doc = { ...doc, name: node.name };
+    viewer.rename(docId, node.name);
     showDetail();
     rememberOpened(me.id, { id: docId, name: doc.name, editor: doc.editor, site: path?.[0]?.name ?? '' });
   },
@@ -119,6 +122,8 @@ let notice = null;          // a banner that stays until what it is about is ove
 let bannerKey = '';
 let roleCheck = 0;          // the latest role request; older answers are dropped
 let notReadyTimer = 0;
+let viewGen = 0;            // counts the files shown in the viewer; older answers are dropped
+const viewer = createViewer(editorArea, { onStep: (item) => stepTo(item) });
 const queue = new SaveQueue(upload, onQueue);
 
 addEventListener('beforeunload', (event) => {
@@ -166,6 +171,7 @@ async function main() {
   showDetail();
   setRole(doc.access);
   showDownload();
+  if (doc.editor === 'other') loadSiblings();
   await openAsChosen();
 }
 
@@ -173,99 +179,124 @@ async function main() {
 
 /** Opens the file as `fileView` chooses for it now. */
 async function openAsChosen() {
+  const gen = viewGen;
   const choice = fileView(doc);
   if (choice.view === 'quarantined') return showQuarantined(choice.threat);
-  if (choice.view === 'held') return waitWhileHeld();
+  if (choice.view === 'held') return waitWhileHeld(gen);
   if (choice.view === 'editor') return openEditor();
   statusPill.hidden = true;
   frameBox.dataset.state = 'view';
-  if (choice.view === 'preview') return showPreview(choice.kind);
+  if (choice.view === 'preview') return showPreview(choice.kind, gen);
   return showNoPreview();
 }
 
 const previewUrl = () => `/api/docs/${seg(docId)}/preview`;
 
-/** The viewer that takes the editor's place for a file no editor opens. */
-function showViewer(...children) {
-  editorArea.replaceChildren(h('div', { class: 'viewer' }, ...children));
+// An answer that comes back after the page moved on to another file (or was removed) is dropped.
+const stale = (gen) => removed || gen !== viewGen;
+
+function showPreview(kind, gen) {
+  if (kind === 'text') return showTextPreview(gen);
+  const url = previewUrl();
+  // A preview the browser cannot show (or that the server refuses) says why, or offers the download.
+  const failed = () => {
+    if (!stale(gen)) previewFailed(url, gen);
+  };
+  if (kind === 'image') viewer.showImage({ url, name: doc.name, onError: failed });
+  else viewer.showMedia(kind, { url, name: doc.name, onError: failed });
 }
 
-function showPreview(kind) {
-  const label = `Preview of ${doc.name}`;
-  if (kind === 'text') return showTextPreview();
-  let media;
-  if (kind === 'image') media = h('img', { src: previewUrl(), alt: label });
-  else if (kind === 'audio') media = h('audio', { src: previewUrl(), controls: true, preload: 'metadata', 'aria-label': label });
-  else media = h('video', { src: previewUrl(), controls: true, preload: 'metadata', playsinline: true, 'aria-label': label });
-  // A preview the browser cannot show (or that the server refuses) becomes the download offer.
-  media.addEventListener('error', () => {
-    if (!removed) showNoPreview();
-  });
-  showViewer(media);
+// Why a picture, sound or film did not show: the server is asked once (for one byte of it).
+async function previewFailed(url, gen) {
+  let code = 0;
+  try {
+    code = (await fetch(url, { credentials: 'same-origin', headers: { Range: 'bytes=0-0' } })).status;
+  } catch {
+    code = 0;
+  }
+  if (stale(gen)) return;
+  if (code === 404) return showMissing();
+  if (code === 423) return recheck(gen);
+  return showNoPreview(code === 0 ? messageFor('network') : '');
 }
 
 // Text is fetched and put in as text: never as markup, whatever the file holds.
-async function showTextPreview() {
+async function showTextPreview(gen) {
   let response;
   try {
     response = await fetch(previewUrl(), { credentials: 'same-origin' });
   } catch {
-    return showNoPreview(messageFor('network'));
+    if (!stale(gen)) showNoPreview(messageFor('network'));
+    return;
   }
-  if (removed) return;
+  if (stale(gen)) return;
   if (!response.ok) {
-    if (response.status === 404) return stopRemoved('missing');
-    if (response.status === 423) return recheck();
+    if (response.status === 404) return showMissing();
+    if (response.status === 423) return recheck(gen);
     return showNoPreview(response.status === 415 ? '' : messageFor('unavailable'));
   }
   const blob = await response.blob();
   const text = await blob.text();
-  if (removed) return;
-  const pre = h('pre', { class: 'text', 'aria-label': `Preview of ${doc.name}` });
-  pre.textContent = text;
-  const cut =
-    blob.size >= 1024 * 1024 ? h('p', { class: 'meta' }, 'Only the first 1 MiB is shown. Download the file to see all of it.') : null;
-  showViewer(cut, pre);
+  if (stale(gen)) return;
+  viewer.showText({ text, cut: blob.size >= 1024 * 1024, name: doc.name });
 }
 
 /** "No preview for this type", with Download (when there is a version to download). */
 function showNoPreview(why = '') {
-  const download = knownRevision
-    ? h('a', { class: 'button', href: contentUrl(knownRevision), download: '' }, 'Download')
-    : h('p', { class: 'meta' }, 'Not saved yet');
-  showViewer(h('p', {}, why || 'No preview for this type.'), download);
+  viewer.showMessage({
+    name: doc.name,
+    text: why || 'There is no preview for this type of file.',
+    detail: why || !knownRevision ? '' : 'Download it to open it on your computer.',
+    download: knownRevision ? contentUrl(knownRevision) : null,
+    noVersion: !knownRevision,
+  });
+}
+
+/** The file is gone, or no longer shared: said in the viewer, so the other files stay a step away. */
+function showMissing() {
+  statusPill.hidden = true;
+  frameBox.dataset.state = 'view';
+  downloadLink.hidden = true;
+  accessLink.hidden = true;
+  chrome.setRenamable(false);
+  viewer.showMessage({ name: doc?.name ?? '', text: MISSING_DOCUMENT });
 }
 
 function showQuarantined(threat) {
   statusPill.hidden = true;
   frameBox.dataset.state = 'failed';
   downloadLink.hidden = true;
-  showViewer(quarantineNotice(threat));
+  viewer.showMessage({ name: doc.name, node: quarantineNotice(threat), tone: 'stop' });
 }
 
 // The scanner holds the file: say so, and look again every 10 seconds, at most 30 times.
-async function waitWhileHeld() {
+async function waitWhileHeld(gen) {
   downloadLink.hidden = true;
   statusPill.hidden = false;
   frameBox.dataset.state = 'connecting';
   chrome.setStatus({ tone: 'connecting', word: HELD_TEXT });
-  const line = h('p', { class: 'meta' }, 'It opens here as soon as the scanner has passed it. This page checks again every 10 seconds.');
-  showViewer(h('p', { class: 'note' }, `${HELD_TEXT}.`), line);
+  const box = viewer.showMessage({
+    name: doc.name,
+    text: `${HELD_TEXT}.`,
+    detail: 'It opens here as soon as the scanner has passed it. This page checks again every 10 seconds.',
+  });
+  const line = box.querySelector('.meta');
+  const id = docId;
   const ready = await pollHeld(
     async () => {
-      const result = await api('GET', `/docs/${seg(docId)}`);
+      const result = await api('GET', `/docs/${seg(id)}`);
       if (!result.ok) return result.status === 404 ? { missing: true } : null;
       return result.data.scan === 'held' ? null : result.data;
     },
-    { stop: () => removed },
+    { stop: () => stale(gen) },
   );
-  if (removed) return;
+  if (stale(gen)) return;
   if (!ready) {
     chrome.setStatus({ tone: 'connecting', word: 'Still being checked' });
-    line.textContent = 'The scanner has not finished with this file yet. Reload the page later to try again.';
+    if (line) line.textContent = 'The scanner has not finished with this file yet. Reload the page later to try again.';
     return;
   }
-  if (ready.missing) return stopRemoved('missing');
+  if (ready.missing) return showMissing();
   doc = ready;
   knownRevision = doc.revision ?? null;
   showDetail();
@@ -275,15 +306,78 @@ async function waitWhileHeld() {
 }
 
 // A preview refused as held: the file was held meanwhile (a new version), so ask again.
-async function recheck() {
+async function recheck(gen) {
   const result = await api('GET', `/docs/${seg(docId)}`);
-  if (removed) return;
-  if (!result.ok) return result.status === 404 ? stopRemoved('missing') : showNoPreview(messageFor(result.error));
+  if (stale(gen)) return;
+  if (!result.ok) return result.status === 404 ? showMissing() : showNoPreview(messageFor(result.error));
   doc = result.data;
   knownRevision = doc.revision ?? null;
   showDownload();
   if (doc.scan) return openAsChosen();
   return showNoPreview(messageFor('held'));
+}
+
+// ---- stepping through the folder's files ----
+
+// The folder's files the viewer steps through, listed once (at most 5,000 entries).
+async function loadSiblings() {
+  const parent = path.length > 1 ? path[path.length - 2] : null;
+  if (!parent || removed) return;
+  const children = [];
+  let after = null;
+  for (let page = 0; page < 10; page += 1) {
+    const query = `limit=500${after ? `&after=${encodeURIComponent(after)}` : ''}`;
+    const result = await api('GET', `/nodes/${seg(parent.id)}/children?${query}`);
+    if (!result.ok) return;
+    children.push(...result.data.items);
+    after = result.data.next;
+    if (!after) break;
+  }
+  if (removed) return;
+  let sort = null;
+  try {
+    sort = localStorage.getItem('sharecraft-library-sort');
+  } catch {
+    sort = null; // no storage: by name
+  }
+  viewer.setList(viewerList(children, docId, sort), docId);
+}
+
+// Shows another file of the folder in place: the address, the bar and its actions follow.
+async function stepTo(item) {
+  const id = item?.id;
+  if (removed || !id || id === docId) return;
+  const gen = ++viewGen;
+  viewer.setCurrent(id);
+  const result = await api('GET', `/docs/${seg(id)}`);
+  if (stale(gen)) return;
+  if (result.ok && result.data.editor !== 'other') {
+    location.replace(`/file.html?doc=${seg(id)}`);
+    return;
+  }
+  docId = id;
+  history.replaceState(history.state, '', `${location.pathname}?doc=${encodeURIComponent(id)}`);
+  chrome.setNodeId(id);
+  doc = result.ok ? result.data : { id, name: item.name, editor: 'other', access: null, revision: null };
+  knownRevision = doc.revision ?? null;
+  showDetail();
+  setRole(doc.access);
+  showDownload();
+  if (!result.ok) {
+    if (result.status === 404) return showMissing();
+    statusPill.hidden = true;
+    frameBox.dataset.state = 'view';
+    viewer.showMessage({ name: doc.name, text: messageFor(result.error) });
+    return;
+  }
+  rememberOpened(me.id, { id, name: doc.name, editor: doc.editor, site: path?.[0]?.name ?? '' });
+  showCrumbs($('crumbs'), id, { linkLast: false }).then((here) => {
+    if (!here || stale(gen)) return;
+    path = here.path;
+    folder = here.folder;
+    chrome.setPlace(path, folder);
+  });
+  await openAsChosen();
 }
 
 async function openEditor() {

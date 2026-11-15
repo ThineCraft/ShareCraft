@@ -15,6 +15,7 @@ export const SCOPES = Object.freeze([
   { id: 'global', heading: 'Everywhere' },
   { id: 'library', heading: 'In a library' },
   { id: 'editor', heading: 'In the editor' },
+  { id: 'viewer', heading: 'In the viewer' },
 ]);
 
 /** Whether `platform` (navigator.platform) is a Mac, iPhone or iPad, where Cmd stands for Ctrl. */
