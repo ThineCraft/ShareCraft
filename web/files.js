@@ -207,6 +207,21 @@ const SHAPES = {
 };
 
 /**
+ * A name split for renaming, as desktop file managers do: `{ base, extension }`, where the
+ * extension is the last dot and what follows (".xlsx", ".gz" of "a.tar.gz"), selected out of
+ * the name when renaming starts. A folder, a name that starts with its only dot (".gitignore"),
+ * ends with a dot, or whose ending has a space or is longer than 16 characters has none.
+ */
+export function splitName(name, { folder = false } = {}) {
+  const text = String(name ?? '');
+  const dot = text.lastIndexOf('.');
+  if (folder || dot <= 0 || dot === text.length - 1) return { base: text, extension: '' };
+  const extension = text.slice(dot);
+  if (/\s/.test(extension) || extension.length > 17) return { base: text, extension: '' };
+  return { base: text.slice(0, dot), extension };
+}
+
+/**
  * The type icon of `kind` (see {@link fileKind}) as a 24 by 24 inline SVG, hidden from screen
  * readers. Its colours come from the stylesheet (`.file-icon.k-<kind>`), in light and dark.
  */

@@ -10,6 +10,7 @@
 import { initials, avatarColour } from './account.js';
 import { api, breadcrumbParts, h, messageFor, policyRefusalText, seg } from './common.js';
 import { setupMenu } from './menu.js';
+import { addShortcut, shortcuts } from './shortcuts.js';
 
 export const FOCUS_KEY = 'sharecraft-editor-focus';
 const NARROW = '(max-width: 760px)';
@@ -275,13 +276,20 @@ export function setupEditorFrame(frame, { details = () => [], onRenamed = () => 
   };
   focusButton.addEventListener('click', () => setFocus(true));
   exitButton.addEventListener('click', () => setFocus(false));
-  const onKey = (event) => {
-    if (!isFocusShortcut(event) || event.defaultPrevented) return;
-    event.preventDefault();
-    event.stopPropagation();
-    setFocus(!frame.classList.contains('focus'));
-  };
-  addEventListener('keydown', onKey);
+  // Works in fields and dialogs too, as it always has; `isFocusShortcut` also takes the F key of
+  // layouts where Shift gives another letter.
+  addShortcut({
+    keys: ['Mod+Shift+F'],
+    label: 'Focus mode: hide the bar, or show it again',
+    scope: 'editor',
+    inFields: true,
+    inMenus: true,
+    inDialogs: true,
+    frames: true,
+    stop: true,
+    when: (event) => isFocusShortcut(event),
+    run: () => setFocus(!frame.classList.contains('focus')),
+  });
   // An editor runs in a frame on this origin: the shortcut works there too. Editors drawn on a
   // canvas take every key for themselves, so the frame listens first (capture).
   frame.addEventListener(
@@ -289,7 +297,7 @@ export function setupEditorFrame(frame, { details = () => [], onRenamed = () => 
     (event) => {
       if (event.target?.tagName !== 'IFRAME') return;
       try {
-        event.target.contentWindow?.addEventListener('keydown', onKey, true);
+        shortcuts.listen(event.target.contentWindow, { frames: true });
       } catch {
         // Not reachable: the shortcut works outside the editor only.
       }

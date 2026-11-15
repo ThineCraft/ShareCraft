@@ -10,7 +10,10 @@
 
 import { api, can, h, kindLabel, messageFor, pageFor, seg, siteMark } from './common.js';
 import { fileIcon, fileKind } from './files.js';
+import { addShortcut, isTextField, openShortcutSheet, setupShortcutSheet } from './shortcuts.js';
 import { readRecent } from './start.js';
+
+export { isTextField };
 
 // ---- matching ----
 
@@ -189,18 +192,6 @@ export function paletteGroups({ me = {}, recent = [], sites = [], libraries = []
 
 // ---- keys ----
 
-const NOT_TEXT = new Set(['checkbox', 'radio', 'button', 'submit', 'reset', 'range', 'color', 'file', 'image']);
-
-/** Whether `target` (an element, or something shaped like one) takes typed text. */
-export function isTextField(target) {
-  if (!target) return false;
-  if (target.isContentEditable) return true;
-  const tag = String(target.tagName ?? '').toUpperCase();
-  if (tag === 'TEXTAREA' || tag === 'SELECT') return true;
-  if (tag === 'INPUT') return !NOT_TEXT.has(String(target.type ?? 'text').toLowerCase());
-  return false;
-}
-
 /**
  * Whether a key press opens the palette: Ctrl+K or Cmd+K anywhere but inside rich text being
  * edited (where editors use it for links), and "/" with no Ctrl, Cmd or Alt, outside any text
@@ -306,21 +297,23 @@ export function setupPalette(me) {
     if (spacer) spacer.after(button);
     else bar.append(button);
   }
-  document.addEventListener('keydown', (event) => {
-    if (paletteShortcut(event) !== 'open') return;
-    if (palette.isOpen()) {
-      // The shortcut again closes it; "/" is typed into its field as usual.
-      if (event.key !== '/') {
-        event.preventDefault();
-        palette.close();
-      }
-      return;
-    }
-    // Not on top of another open dialog: that one has the person's attention.
-    if (document.querySelector('dialog[open]')) return;
-    event.preventDefault();
-    palette.open();
+  addShortcut({
+    keys: ['Mod+K', '/'],
+    label: 'Search or jump to (the command palette)',
+    scope: 'global',
+    inFields: true,
+    inMenus: true,
+    inDialogs: true,
+    // The shortcut again closes it ("/" is typed into its field as usual); over another open
+    // dialog it waits, as that one has the person's attention.
+    when: (event, context) => paletteShortcut(event) === 'open' && (palette.isOpen() ? event.key !== '/' : !context.dialog),
+    run: () => (palette.isOpen() ? palette.close() : palette.open()),
   });
+  // "?" lists the shortcuts of the page; the palette offers the same list.
+  setupShortcutSheet();
+  addPaletteActions(() => [
+    { key: 'shortcuts', label: 'Keyboard shortcuts', detail: 'Press ? on any page', keywords: 'keys help hotkeys keyboard', run: () => openShortcutSheet() },
+  ]);
 }
 
 function createPalette(me) {

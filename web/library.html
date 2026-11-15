@@ -67,6 +67,9 @@
  </p>
  <ul id="bulk-results" class="list" hidden></ul>
  <p id="sort-status" class="visually-hidden" role="status" aria-live="polite"></p>
+ <p id="keys-status" class="visually-hidden" role="status" aria-live="polite"></p>
+ <p id="table-keys" class="visually-hidden">Up and Down move between rows, Space selects, Enter opens, F2 renames. Press question mark for every shortcut.</p>
+ <p id="rename-help" class="visually-hidden">Enter saves the new name, Escape keeps the old one.</p>
  <p id="sort-note" class="meta" hidden></p>
  <div id="lib-body" class="lib-body">
  <nav id="folder-pane" class="folder-pane" aria-labelledby="folder-tree-title" hidden>
@@ -85,7 +88,7 @@
    <option value="type:descending">Type, Z to A</option>
   </select>
  </div>
- <table id="file-table" class="files" aria-labelledby="items-heading" hidden>
+ <table id="file-table" class="files" aria-labelledby="items-heading" aria-describedby="table-keys" hidden>
   <thead>
    <tr>
     <th scope="col" class="c-select"><span class="visually-hidden">Select</span></th>

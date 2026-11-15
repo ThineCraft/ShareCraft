@@ -55,7 +55,9 @@ import {
   mountFolderTree,
   parseCut,
 } from './tree.js';
-import { fileIcon, fileKind, nextSort, parseSort, relativeTime, sortDescription, sortEntries, typeLabel } from './files.js';
+import { fileIcon, fileKind, nextSort, parseSort, relativeTime, sortDescription, sortEntries, splitName, typeLabel } from './files.js';
+import { addShortcut, isMacPlatform } from './shortcuts.js';
+import { extendSelection, moveIndex, selectionText, toggleSelection } from './selection.js';
 
 const BULK_MAX = 500;
 const GRID_PAGE = 200; // the grid's page, the most the server answers at once
@@ -144,7 +146,10 @@ let dropAt = null; // the element marked as where a drag would land
 let ghost = null; // the small "3 items" picture under the pointer while dragging
 let expandTimer = 0; // opens a tree folder held under a drag
 let cut = loadCut(); // items cut with Ctrl+X, waiting to be pasted in another folder (kept for the tab)
-const MAC = /Mac|iPhone|iPad/.test(globalThis.navigator?.platform ?? '');
+let anchor = null; // where Shift+Up or Shift+Down started extending the selection
+let anchorBase = new Set(); // what was selected when it started
+let inline = null; // the rename in place under way: { id, input }
+const MAC = isMacPlatform();
 const KEY_MOD = MAC ? { text: 'Command', aria: 'Meta' } : { text: 'Ctrl', aria: 'Control' };
 // The details pane beside the table (a sheet on narrow screens): preview, facts and access of
 // the selected row, with the row actions. Only for the list; the grid of an image library has none.
@@ -157,7 +162,7 @@ const details = createDetails({
   entry: (id) => items.find((item) => item.id === id) ?? null,
   act: (key, item) => {
     actionsFor = item.id;
-    if (key === 'rename') askRename(item);
+    if (key === 'rename') renameItem(item);
     else if (key === 'move') askMove([item], 'move');
     else if (key === 'delete') deleteItems([item]);
   },
@@ -197,6 +202,8 @@ async function reload() {
   items = [];
   next = null;
   selected.clear();
+  anchor = null;
+  inline = null;
   await loadPage();
   tree?.refresh();
 }
@@ -539,7 +546,11 @@ function actionsMenu(item) {
     { class: 'menu end', id: `actions-${item.id}`, 'aria-label': `Actions for ${item.name}` },
     ...entries.flatMap((entry) => {
       if (entry === 'details') return choose('Details', () => details.show(item, { focus: true }));
-      if (entry === 'rename') return choose('Rename', () => askRename(item));
+      if (entry === 'rename') {
+        const renameEntry = choose('Rename', () => renameItem(item));
+        renameEntry.firstChild.setAttribute('aria-keyshortcuts', 'F2');
+        return renameEntry;
+      }
       if (entry === 'move') {
         const cutEntry = choose('Cut', () => cutItems([item]));
         cutEntry.firstChild.setAttribute('aria-keyshortcuts', `${KEY_MOD.aria}+X`);
@@ -915,9 +926,12 @@ function offerUndo(undo) {
 }
 
 // Ctrl+Z (Cmd+Z) outside text fields and dialogs undoes the newest action still on screen.
-document.addEventListener('keydown', (event) => {
-  if (!isUndoKey(event) || document.querySelector('dialog[open]')) return;
-  if (runLatestAction()) event.preventDefault();
+addShortcut({
+  keys: ['Mod+Z'],
+  label: 'Undo the last delete, move or rename',
+  scope: 'library',
+  when: (event) => isUndoKey(event),
+  run: () => runLatestAction(),
 });
 
 // ---- move and copy (one dialog) ----
@@ -1275,29 +1289,367 @@ $('cut-cancel').addEventListener('click', () => cancelCut());
 $('bulk-cut').setAttribute('aria-keyshortcuts', `${KEY_MOD.aria}+X`);
 $('cut-paste').setAttribute('aria-keyshortcuts', `${KEY_MOD.aria}+V`);
 
-document.addEventListener('keydown', (event) => {
-  const what = clipboardKey(event);
-  if (!what || document.querySelector('dialog[open]') || event.target.closest?.('[role=menu]')) return;
-  if (what === 'cancel') {
-    if (!cut || dragging) return;
-    event.preventDefault();
-    cancelCut();
-  } else if (what === 'cut') {
-    const focused = document.activeElement?.closest?.('#file-rows tr[data-id]');
-    const list = selected.size
-      ? selectedItems()
-      : focused
-        ? items.filter((item) => item.id === focused.dataset.id)
-        : [];
-    if (list.length === 0) return;
-    event.preventDefault();
-    cutItems(list);
-  } else if (what === 'paste') {
-    if (!cut) return;
-    event.preventDefault();
-    pasteCut();
-  }
+/** What Ctrl+X cuts: the selected items, else the focused row's. */
+function cutList() {
+  const focused = document.activeElement?.closest?.('#file-rows tr[data-id]');
+  if (selected.size) return selectedItems();
+  return focused ? items.filter((item) => item.id === focused.dataset.id) : [];
+}
+
+addShortcut({
+  keys: ['Mod+X'],
+  label: 'Cut the selected items, to move them',
+  scope: 'library',
+  when: (event) => clipboardKey(event) === 'cut' && cutList().length > 0,
+  run: () => cutItems(cutList()),
 });
+addShortcut({
+  keys: ['Mod+V'],
+  label: 'Paste the cut items into this folder',
+  scope: 'library',
+  when: (event) => clipboardKey(event) === 'paste' && Boolean(cut),
+  run: () => pasteCut(),
+});
+addShortcut({
+  keys: ['Escape'],
+  label: 'Cancel a cut',
+  scope: 'library',
+  shown: () => Boolean(cut),
+  when: (event, context) => !context.dialog && clipboardKey(event) === 'cancel' && Boolean(cut) && !dragging,
+  run: () => cancelCut(),
+});
+
+// ---- the keyboard: the current row, selection, rename in place and the rest ----
+
+// Declarations, not consts: a row's menu can call these while the page is still loading.
+function fileRows() {
+  return [...$('file-rows').querySelectorAll('tr[data-id]')];
+}
+function rowFor(id) {
+  return fileRows().find((tr) => tr.dataset.id === id) ?? null;
+}
+function itemFor(id) {
+  return items.find((item) => item.id === id) ?? null;
+}
+function choosable(id) {
+  return itemFor(id)?.kind !== 'library';
+}
+
+/** The row a key press came from (not its Actions menu), or null. */
+function rowOf(event) {
+  const tr = event.target?.closest?.('#file-rows tr[data-id]');
+  return tr && !event.target.closest('.menu-wrap') && !event.target.closest('input.rename-inline') ? tr : null;
+}
+
+/** Whether keys for the files are meant here: focus in the table or grid, or on nothing in particular. */
+function inFiles(event) {
+  const target = event.target;
+  return target === document.body || Boolean(target?.closest?.('#file-table, #items, #bulk-bar, .details-pane, .details-sheet'));
+}
+
+/** The item of the focused row, else the current row's. */
+function currentItem() {
+  const tr = document.activeElement?.closest?.('#file-rows tr[data-id]');
+  return itemFor(tr?.dataset.id ?? details.current());
+}
+
+/** Makes `tr` the current row and focuses it; the details follow after a short pause. */
+function goToRow(tr, delay = 250) {
+  if (!tr) return;
+  tr.focus();
+  const item = itemFor(tr.dataset.id);
+  if (item) details.select(item, delay);
+}
+
+/** Replaces the selection, updates the boxes and the bar, and says how many are selected. */
+function setSelection(next) {
+  selected.clear();
+  for (const id of next) selected.add(id);
+  if (view === 'grid') render();
+  else {
+    for (const tr of fileRows()) {
+      const box = tr.querySelector('td.c-select input');
+      if (box) box.checked = selected.has(tr.dataset.id);
+    }
+    showSelection();
+  }
+  // The bar's count says "3 selected" by itself; an empty selection leaves it empty.
+  $('keys-status').textContent = selected.size === 0 ? selectionText(0) : '';
+}
+
+/** Up, Down, Home, End, Page Up and Page Down; with Shift the selection follows from the anchor. */
+function moveRow(event, extend) {
+  const trs = fileRows();
+  const tr = rowOf(event);
+  const at = trs.indexOf(tr);
+  const height = tr?.offsetHeight || 44;
+  const page = Math.max(1, Math.floor(innerHeight / height) - 2);
+  const to = moveIndex(event.key, at, trs.length, page);
+  if (to === null) return false;
+  const target = trs[to];
+  if (extend) {
+    if (!anchor || !rowFor(anchor)) {
+      anchor = tr.dataset.id;
+      anchorBase = new Set(selected);
+    }
+    setSelection(extendSelection(trs.map((row) => row.dataset.id), anchorBase, anchor, target.dataset.id, choosable));
+  } else anchor = null;
+  goToRow(target);
+  target.scrollIntoView?.({ block: 'nearest' });
+}
+
+function listShown() {
+  return view === 'list' && items.length > 0;
+}
+
+addShortcut({
+  keys: ['ArrowDown', 'ArrowUp'],
+  label: 'Move to the next or previous row',
+  scope: 'library',
+  shown: listShown,
+  when: (event) => listShown() && Boolean(rowOf(event)),
+  run: (event) => moveRow(event, false),
+});
+addShortcut({
+  keys: ['Home', 'End'],
+  label: 'Move to the first or last row',
+  scope: 'library',
+  shown: listShown,
+  when: (event) => listShown() && rowOf(event) === event.target,
+  run: (event) => moveRow(event, false),
+});
+addShortcut({
+  keys: ['PageDown', 'PageUp'],
+  label: 'Move a screen down or up',
+  scope: 'library',
+  shown: listShown,
+  when: (event) => listShown() && Boolean(rowOf(event)),
+  run: (event) => moveRow(event, false),
+});
+addShortcut({
+  keys: ['Shift+ArrowDown', 'Shift+ArrowUp'],
+  label: 'Select the rows you move over',
+  scope: 'library',
+  shown: listShown,
+  when: (event) => listShown() && Boolean(rowOf(event)),
+  run: (event) => moveRow(event, true),
+});
+addShortcut({
+  keys: ['Space'],
+  label: 'Select or unselect the current row',
+  scope: 'library',
+  shown: listShown,
+  when: (event) => listShown() && rowOf(event) === event.target && choosable(event.target.dataset.id),
+  run: (event) => {
+    anchor = null;
+    setSelection(toggleSelection(selected, event.target.dataset.id));
+  },
+});
+addShortcut({
+  keys: ['Mod+A'],
+  label: 'Select everything shown',
+  scope: 'library',
+  shown: () => items.length > 0,
+  when: (event) => items.some((item) => item.kind !== 'library') && inFiles(event),
+  run: () => {
+    anchor = null;
+    setSelection(items.filter((item) => item.kind !== 'library').map((item) => item.id));
+  },
+});
+addShortcut({
+  keys: ['Enter'],
+  label: 'Open the current row',
+  scope: 'library',
+  shown: listShown,
+  when: (event) => listShown() && rowOf(event) === event.target,
+  // Through its link, so that a folder opens in this page while uploads run.
+  run: (event) => event.target.querySelector('a.name-link')?.click(),
+});
+addShortcut({
+  keys: ['Backspace', 'Alt+ArrowUp'],
+  label: 'Go up to the folder above',
+  scope: 'library',
+  shown: () => here.path.length > 1,
+  when: () => here.path.length > 1,
+  run: () => goUp(),
+});
+addShortcut({
+  keys: ['F2'],
+  label: 'Rename the current row',
+  scope: 'library',
+  shown: listShown,
+  when: (event) => listShown() && inFiles(event) && Boolean(currentItem()),
+  run: () => {
+    const item = currentItem();
+    if (!itemActions(item).rename) {
+      showToast(`You cannot rename ${item.name}.`, { kind: 'error' });
+      return;
+    }
+    actionsFor = null;
+    renameInPlace(item, { back: 'row' });
+  },
+});
+addShortcut({
+  keys: ['Delete'],
+  label: 'Move the selected items to the recycle bin (with Undo)',
+  scope: 'library',
+  shown: () => items.length > 0,
+  when: (event) => inFiles(event) && (selected.size > 0 || (view === 'list' && Boolean(currentItem()))),
+  run: () => keyDelete(),
+});
+addShortcut({
+  keys: ['n'],
+  label: 'New folder',
+  scope: 'library',
+  shown: () => canAdd && library?.folders !== false,
+  when: () => canAdd && library?.folders !== false,
+  run: () => askCreate('folder'),
+});
+addShortcut({
+  keys: ['u'],
+  label: 'Upload files',
+  scope: 'library',
+  shown: () => canAdd,
+  when: () => canAdd,
+  run: () => $('pick-files').click(),
+});
+
+/** The folder above (or the site, above a library): in this page while uploads run, if it can. */
+function goUp() {
+  const parent = here.path[here.path.length - 2];
+  if (!parent) return;
+  if (uploads.active() > 0 && ['library', 'folder'].includes(parent.kind)) switchTo(parent.id);
+  else location.assign(pageFor(parent.kind, parent.id));
+}
+
+/** Delete from the keyboard: the selection, else the current row; focus goes to the row after. */
+async function keyDelete() {
+  const list = selected.size ? selectedItems() : [currentItem()].filter(Boolean);
+  if (list.length === 0) return;
+  const refused = list.find((item) => !itemActions(item).remove);
+  if (refused) {
+    showToast(list.length === 1 ? `You cannot delete ${refused.name}.` : `You cannot delete ${refused.name}, so nothing was deleted.`, { kind: 'error' });
+    return;
+  }
+  const gone = new Set(list.map((item) => item.id));
+  const order = fileRows().map((tr) => tr.dataset.id);
+  const from = order.indexOf(currentItem()?.id ?? list[0].id);
+  const after = order.slice(from + 1).find((id) => !gone.has(id)) ?? order.slice(0, Math.max(0, from)).reverse().find((id) => !gone.has(id)) ?? null;
+  const hadFocus = $('file-rows').contains(document.activeElement);
+  actionsFor = null;
+  await deleteItems(list);
+  const tr = after ? rowFor(after) : null;
+  if (tr && hadFocus) goToRow(tr, 0);
+}
+
+// ---- rename in place: the name cell becomes a field ----
+
+/** Rename from a menu: in place in the list, in the dialog in the grid. */
+function renameItem(item) {
+  if (view === 'list' && rowFor(item.id)) renameInPlace(item, { back: 'actions' });
+  else askRename(item);
+}
+
+/**
+ * Turns the name of `item`'s row into a field with the name selected up to its ending (as
+ * desktop file managers do). Enter saves it through the same request as the dialog, with the
+ * Undo toast; Escape, or leaving it unchanged, keeps the old name. Focus then goes back to the
+ * row (`back: 'row'`) or to its Actions button.
+ */
+function renameInPlace(item, { back = 'row' } = {}) {
+  const tr = rowFor(item.id);
+  const link = tr?.querySelector('a.name-link');
+  if (!link) return askRename(item);
+  if (inline?.input.isConnected) inline.input.blur();
+  const input = h('input', {
+    type: 'text',
+    class: 'rename-inline',
+    value: item.name,
+    maxlength: '255',
+    autocomplete: 'off',
+    spellcheck: 'false',
+    'aria-label': `New name for ${item.name}`,
+    'aria-describedby': 'rename-help',
+  });
+  const draggable = tr.draggable;
+  tr.draggable = false;
+  link.hidden = true;
+  link.after(input);
+  inline = { id: item.id, input };
+  let busy = false;
+  let finished = false;
+
+  const close = () => {
+    finished = true;
+    if (inline?.input === input) inline = null;
+    input.remove();
+    link.hidden = false;
+    tr.draggable = draggable;
+  };
+  const focusBack = () => {
+    const row = rowFor(item.id);
+    if (back === 'actions') row?.querySelector('button.menu-button')?.focus();
+    else if (row) goToRow(row, 0);
+  };
+  const finish = async (save, { left = false } = {}) => {
+    if (finished || busy) return;
+    const name = input.value.trim();
+    if (!save || name === item.name) {
+      const hadFocus = document.activeElement === input || document.activeElement === document.body;
+      close();
+      if (hadFocus) focusBack();
+      $('keys-status').textContent = 'Name not changed.';
+      return;
+    }
+    if (!name) {
+      if (left) return close(); // left empty: the old name stays
+      showToast('Give it a name, or press Escape to keep the old one.', { kind: 'error' });
+      input.focus();
+      return;
+    }
+    busy = true;
+    input.setAttribute('aria-busy', 'true');
+    input.readOnly = true;
+    const result = await api('PATCH', `/nodes/${seg(item.id)}`, { name });
+    busy = false;
+    input.removeAttribute('aria-busy');
+    input.readOnly = false;
+    if (!result.ok) {
+      showToast(policyRefusalText(result.error, result.data, name) ?? messageFor(result.error), { kind: 'error' });
+      // Focus that went elsewhere stays there, and the old name with it; otherwise try again.
+      if (left || document.activeElement !== input) close();
+      else if (input.isConnected) {
+        input.focus();
+        input.select();
+      }
+      return;
+    }
+    close();
+    if (back === 'row') actionsFor = null;
+    await reload();
+    focusBack();
+    offerUndo(buildUndo({ op: 'rename', id: item.id, name: result.data.name }, { id: item.id, name: item.name }));
+  };
+
+  input.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      finish(true);
+    } else if (event.key === 'Escape') {
+      event.preventDefault();
+      event.stopPropagation();
+      finish(false);
+    }
+  });
+  // Leaving the field saves, as on the desktop (unless the row was drawn again meanwhile).
+  input.addEventListener('blur', () => {
+    if (input.isConnected) finish(true, { left: true });
+  });
+  // A click in the field is not a click on the row.
+  input.addEventListener('click', (event) => event.stopPropagation());
+  input.focus();
+  input.setSelectionRange(0, splitName(item.name, { folder: item.kind !== 'document' }).base.length);
+}
 
 function fail(text) {
   showMessage(error, text);

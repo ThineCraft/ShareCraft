@@ -9,6 +9,7 @@
 // does not import common.js (common.js imports it).
 
 import { setupMenu } from './menu.js';
+import { openShortcutSheet } from './shortcuts.js';
 
 /**
  * The avatar colours: a background and the ink of the initials on it, for light and for dark.
@@ -155,6 +156,9 @@ export function setupAccountMenu(bar, me, { brandManager = Promise.resolve(false
       radio.setAttribute('aria-checked', String(radio.dataset.appearance === now));
     }
   };
+  // The Keyboard shortcuts sheet (shortcuts.js), also opened with "?" and from the palette.
+  const keysItem = el('button', { type: 'button', role: 'menuitem', 'aria-keyshortcuts': '?' }, 'Keyboard shortcuts');
+  keysItem.addEventListener('click', () => openShortcutSheet());
   const signOutItem = el('button', { type: 'button', role: 'menuitem' }, 'Sign out');
   signOutItem.addEventListener('click', () => signOut?.());
   const separator = () => el('li', { role: 'separator', class: 'menu-separator' });
@@ -169,6 +173,7 @@ export function setupAccountMenu(bar, me, { brandManager = Promise.resolve(false
     el('li', { role: 'none', class: 'menu-label', id: 'appearance-label', 'aria-hidden': 'true' }, 'Appearance'),
     el('li', { role: 'none' }, el('ul', { role: 'group', class: 'menu-group', 'aria-label': 'Appearance' }, ...radios)),
     separator(),
+    el('li', { role: 'none' }, keysItem),
     el('li', { role: 'none' }, signOutItem),
   );
   markChecked();

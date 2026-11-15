@@ -1143,3 +1143,17 @@ dialog.side-drawer::backdrop{background:rgb(0 0 0/.35)}
 }
 /* pages read as a column (Share, recycle bin): the band is wide, the content keeps a reading width */
 .page.workspace.reading>:not(.topbar,[data-site-header],[data-chrome],.ws,[data-site-footer]),.page.workspace.reading .side-main>*{max-width:900px}
+/* round 15: checked rows, rename in place and the Keyboard shortcuts sheet */
+.files tbody tr:has(td.c-select input:checked){background:color-mix(in srgb,var(--accent-ink) 12%,transparent)}
+.files tbody tr:has(td.c-select input:checked):nth-child(even){background:color-mix(in srgb,var(--accent-ink) 16%,transparent)}
+.files input.rename-inline{flex:1 1 12em;min-width:0;width:100%;max-width:100%;padding:2px 6px;font:inherit;font-weight:600}
+.shortcut-sheet{max-width:min(600px,calc(100vw - 32px))}
+.shortcut-sheet h3{margin:16px 0 4px;font-size:14px}
+.shortcut-groups{max-height:60vh;overflow:auto}
+.shortcut-table{width:100%;border-collapse:collapse}
+.shortcut-table td{padding:6px 8px;vertical-align:top;overflow-wrap:anywhere}
+.shortcut-table tbody tr:nth-child(even){background:var(--band)}
+.shortcut-keys{width:42%;white-space:normal}
+.shortcut-combo{display:inline-flex;flex-wrap:wrap;gap:3px;vertical-align:middle}
+.shortcut-sheet kbd{display:inline-block;min-width:1.8em;padding:0 6px;border:1px solid var(--line);border-bottom-width:2px;border-radius:5px;background:var(--bg);color:var(--text);font:12px/20px ui-monospace,'Cascadia Mono',monospace;text-align:center}
+@media (forced-colors:active){.files tbody tr:has(td.c-select input:checked){outline:1px solid Highlight;outline-offset:-1px}}

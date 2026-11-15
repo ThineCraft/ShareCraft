@@ -20,7 +20,7 @@ import {
 } from './common.js';
 import { EDITORS } from './editor-host.js';
 import { fileIcon, fileKind, relativeTime, typeLabel } from './files.js';
-import { isTextField } from './palette.js';
+import { addShortcut, isTextField } from './shortcuts.js';
 
 /** The width from which the pane is a column beside the table rather than a sheet. */
 export const WIDE_QUERY = '(min-width: 1100px)';
@@ -224,9 +224,9 @@ export function paneShown({ open = false, selected = false, wide = true, enabled
   return wide ? 'column' : 'sheet';
 }
 
-/** Whether a key press toggles the pane: "i" alone, outside text fields, menus and other dialogs. */
+/** Whether a key press toggles the pane: "i" or "d" alone, outside text fields, menus and other dialogs. */
 export function isToggleKey(event, { sheetOpen = false } = {}) {
-  if (event.key !== 'i' && event.key !== 'I') return false;
+  if (!['i', 'I', 'd', 'D'].includes(event.key)) return false;
   if (event.ctrlKey || event.metaKey || event.altKey || event.defaultPrevented) return false;
   const target = event.target;
   if (isTextField(target)) return false;
@@ -297,15 +297,16 @@ export function createDetails({ pane, sheet, status, rows, page, entry, act, me,
     }
     place();
   });
-  document.addEventListener('keydown', (event) => {
-    if (!enabled() || !isToggleKey(event, { sheetOpen: sheet.open })) return;
-    event.preventDefault();
-    if (open && where()) return hide();
-    const focusedRow = document.activeElement?.closest?.('#' + rows.id + ' tr');
-    const id = focusedRow?.dataset.id ?? (selectedId && entry(selectedId) ? selectedId : rows.querySelector('tr')?.dataset.id);
-    if (id) show(entry(id), { focus: !wide.matches });
+  // "i" (or "D") shows or hides the pane, through the page's shortcuts (shortcuts.js).
+  addShortcut({
+    keys: ['i', 'd'],
+    label: 'Show or hide the details of the current row',
+    scope: 'library',
+    inDialogs: true,
+    shown: () => enabled(),
+    when: (event) => enabled() && isToggleKey(event, { sheetOpen: sheet.open }),
+    run: () => toggle(),
   });
-  rows.addEventListener('keydown', onRowsKey);
   rows.addEventListener('click', (event) => {
     const tr = event.target.closest('tr');
     if (!tr || !tr.dataset.id || event.target.closest('a,button,input,label,.menu-wrap')) return;
@@ -364,6 +365,14 @@ export function createDetails({ pane, sheet, status, rows, page, entry, act, me,
     if (focus || !wide.matches) heading.focus();
   }
 
+  /** Hides the pane when it shows; otherwise shows it for the focused row (or the current, or the first). */
+  function toggle() {
+    if (open && where()) return hide();
+    const focusedRow = document.activeElement?.closest?.('#' + rows.id + ' tr');
+    const id = focusedRow?.dataset.id ?? (selectedId && entry(selectedId) ? selectedId : rows.querySelector('tr')?.dataset.id);
+    if (id) show(entry(id), { focus: !wide.matches });
+  }
+
   function hide() {
     if (!open) return;
     open = false;
@@ -408,39 +417,20 @@ export function createDetails({ pane, sheet, status, rows, page, entry, act, me,
     }, delay);
   }
 
-  /** The selected row is marked (aria-current) and is the table's one Tab stop. */
+  /**
+   * The current row is marked (aria-current) and is the table's one Tab stop (a roving
+   * tabindex): Tab enters the table at it, and goes on through its own box, name and Actions
+   * button; the other rows' controls are reached with the arrow keys first.
+   */
   function markRows() {
     const trs = [...rows.querySelectorAll('tr[data-id]')];
     const current = trs.find((tr) => tr.dataset.id === selectedId) ?? trs[0];
     for (const tr of trs) {
       tr.tabIndex = tr === current ? 0 : -1;
+      for (const control of tr.querySelectorAll(':scope > td > input, a.name-link, button.menu-button')) control.tabIndex = tr === current ? 0 : -1;
       if (tr.dataset.id === selectedId) tr.setAttribute('aria-current', 'true');
       else tr.removeAttribute('aria-current');
     }
-  }
-
-  function onRowsKey(event) {
-    const tr = event.target.closest('tr[data-id]');
-    if (!tr) return;
-    if (event.target.closest('.menu-wrap')) return; // the Actions menu has its own keys
-    if (event.altKey || event.ctrlKey || event.metaKey) return;
-    if ((event.key === 'Enter' || event.key === ' ') && event.target === tr) {
-      event.preventDefault();
-      show(entry(tr.dataset.id), { focus: false });
-      if (wide.matches) tr.focus();
-      return;
-    }
-    const trs = [...rows.querySelectorAll('tr[data-id]')];
-    const at = trs.indexOf(tr);
-    let to = null;
-    if (event.key === 'ArrowDown') to = trs[Math.min(trs.length - 1, at + 1)];
-    else if (event.key === 'ArrowUp') to = trs[Math.max(0, at - 1)];
-    else if ((event.key === 'Home' || event.key === 'End') && event.target === tr) to = event.key === 'Home' ? trs[0] : trs[trs.length - 1];
-    if (!to) return;
-    event.preventDefault();
-    to.focus();
-    const item = entry(to.dataset.id);
-    if (item) select(item, 250);
   }
 
   /** Fetches what the pane shows for `item`; answers for an item no longer selected are dropped. */
@@ -666,5 +656,10 @@ export function createDetails({ pane, sheet, status, rows, page, entry, act, me,
     },
     show,
     hide,
+    toggle,
+    /** Makes `item` the current row (the pane follows when it is open), after `delay` ms. */
+    select,
+    /** The id of the current row, or null. */
+    current: () => (selectedId && entry(selectedId) ? selectedId : null),
   };
 }
