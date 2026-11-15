@@ -199,14 +199,22 @@ pub(crate) fn safe_svg(bytes: &[u8]) -> bool {
     }
     let mut open: Vec<&str> = Vec::new();
     let mut seen_root = false;
+    // Every piece of text and CDATA in document order, comments left out: what any element's
+    // text content (a style sheet's, say) is a contiguous part of, so a `url(` or `@import`
+    // split by a comment, a CDATA section or a child element is still seen whole.
+    let mut all_text = String::new();
     loop {
         let Some(at) = rest.find('<') else {
-            return seen_root && open.is_empty() && rest.trim().is_empty();
+            return seen_root
+                && open.is_empty()
+                && rest.trim().is_empty()
+                && !loads_outside(&all_text);
         };
         let (between, tag) = rest.split_at(at);
         if (open.is_empty() && !between.trim().is_empty()) || loads_outside(between) {
             return false;
         }
+        all_text.push_str(between);
         rest = tag;
         if let Some(r) = rest.strip_prefix("<!--") {
             let Some(end) = r.find("-->") else {
@@ -219,9 +227,11 @@ pub(crate) fn safe_svg(bytes: &[u8]) -> bool {
             let Some(end) = r.find("]]>") else {
                 return false;
             };
-            if open.is_empty() || loads_outside(r.get(..end).unwrap_or_default()) {
+            let cdata = r.get(..end).unwrap_or_default();
+            if open.is_empty() || loads_outside(cdata) {
                 return false;
             }
+            all_text.push_str(cdata);
             rest = r.get(end + 3..).unwrap_or_default();
             continue;
         }
@@ -1066,6 +1076,26 @@ mod tests {
         }
         // A local url() is still fine.
         assert!(safe_svg(b"<svg><rect style=\"fill:url(#g)\"/></svg>"));
+    }
+
+    #[test]
+    fn style_text_checked_whole() {
+        for svg in [
+            "<svg><style>rect{fill:u<!---->rl(https://evil.example/)}</style></svg>",
+            "<svg><style>rect{fill:u<![CDATA[rl(https://evil.example/)]]>}</style></svg>",
+            "<svg><style><![CDATA[rect{fill:ur]]><![CDATA[l(https://evil.example/)}]]>\
+             </style></svg>",
+            "<svg><style>@im<!---->port 'https://evil.example/a.css';</style></svg>",
+            "<svg><style>@im<![CDATA[port 'https://evil.example/a.css';]]></style></svg>",
+            "<svg><style>rect{fill:url<!-- x -->(https://evil.example/)}</style></svg>",
+            "<svg><style>rect{fill:url(<!---->https://evil.example/)}</style></svg>",
+        ] {
+            assert!(!safe_svg(svg.as_bytes()), "{svg}");
+        }
+        // A split local url() is still fine.
+        assert!(safe_svg(
+            b"<svg><style>rect{fill:u<!---->rl(#g)}</style></svg>"
+        ));
     }
 
     #[test]
