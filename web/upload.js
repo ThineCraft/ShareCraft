@@ -4,7 +4,7 @@
 // retried from the offset the server reports. Nothing here touches the page: the library page
 // shows the queue's progress and answers its questions. Nothing runs at import.
 
-import { formatSize, goToSignIn, messageFor, quotaRefusalText, seg } from './common.js';
+import { formatSize, goToSignIn, messageFor, policyRefusalText, quotaRefusalText, seg } from './common.js';
 
 /** The size of one chunk: 8 MiB. */
 export const CHUNK = 8 * 1024 * 1024;
@@ -56,6 +56,7 @@ export function outcomeNote(outcome) {
   if (outcome.kept) {
     parts.push(`“${outcome.kept.from}” already existed, so this one was saved as “${outcome.kept.to}”.`);
   }
+  if (outcome.checking) parts.push('Being checked for malware: nobody can open it until the scanner has passed it.');
   return parts.length ? parts.join(' ') : 'Uploaded.';
 }
 
@@ -207,6 +208,7 @@ export class UploadQueue {
     fetch: fetcher = (...args) => globalThis.fetch(...args),
     hash = hashFile,
     sleep = sleepFor,
+    checkScans = false,
   } = {}) {
     this.parent = parent;
     this.site = site;
@@ -216,6 +218,7 @@ export class UploadQueue {
     this.fetch = fetcher;
     this.hash = hash;
     this.sleep = sleep;
+    this.checkScans = checkScans;
     this.rest = null; // the choice made "for the rest"
     this.folders = new Map();
   }
@@ -404,12 +407,14 @@ export class UploadQueue {
         if (result.data?.skipped) return this.#change(outcome, { status: 'skipped', message: '' });
         const data = result.data ?? {};
         const kept = choice === 'keep_both' && data.renamed ? data.renamed : null;
+        const checking = await this.#held(typeof data.id === 'string' ? data.id : file.version?.doc);
         return this.#change(outcome, {
           status: 'done',
           sent: file.size,
           name: data.name ?? outcome.name,
           renamed: kept ? cleaned : (cleaned ?? data.renamed ?? null),
           kept,
+          checking,
           message: '',
         });
       }
@@ -427,6 +432,17 @@ export class UploadQueue {
       }
       throw await this.#problem(result, file, true);
     }
+  }
+
+  /**
+   * Whether the malware scanner holds the document `doc` just uploaded (asked only when the
+   * queue was made with `checkScans`). A failed question counts as not held: the listing still
+   * marks the file.
+   */
+  async #held(doc) {
+    if (!this.checkScans || typeof doc !== 'string') return false;
+    const result = await this.#call('GET', `/api/docs/${seg(doc)}`);
+    return result.ok && result.data?.scan === 'held';
   }
 
   /**
@@ -504,6 +520,9 @@ export class UploadQueue {
         return new Stop(`“${file.name}” cannot be uploaded here: its name or kind is not supported.`);
       case 'name_taken':
         return new Stop(`A file named “${file.name}” is already here.`);
+      case 'blocked_file_type':
+      case 'file_too_large':
+        return new Stop(policyRefusalText(result.error, result.data, file.name));
       case 'unknown':
         if (finishing && result.status === 409 && result.data && 'current' in result.data) {
           return new Stop(

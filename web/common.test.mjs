@@ -1146,3 +1146,293 @@ test('regional choices and template refusals', () => {
     assert.notEqual(templateReasonText(reason), templateReasonText('no_such_reason'), reason);
   }
 });
+
+// ---- plan 3C: libraries, previews, scanning and quarantine ----
+
+import * as libs from './common.js';
+
+const DOC = '00000000-0000-4000-8000-0000000000d1';
+
+test('file_page_chooses_editor_preview_or_download', () => {
+  const view = (doc) => libs.fileView({ id: DOC, revision: 'r1', ...doc });
+  // An editor's file opens in its editor, as before.
+  assert.deepEqual(view({ name: 'Budget.xlsx', editor: 'gridcraft' }), { view: 'editor' });
+  assert.deepEqual(view({ name: 'Scan.pdf', editor: 'pdfcraft' }), { view: 'editor' });
+  // Any other file: a preview by its extension (the server's list), or a download.
+  assert.deepEqual(view({ name: 'Photo.JPG', editor: 'other' }), { view: 'preview', kind: 'image' });
+  assert.deepEqual(view({ name: 'logo.svg', editor: 'other' }), { view: 'preview', kind: 'image' });
+  assert.deepEqual(view({ name: 'talk.mp3', editor: 'other' }), { view: 'preview', kind: 'audio' });
+  assert.deepEqual(view({ name: 'clip.mov', editor: 'other' }), { view: 'preview', kind: 'video' });
+  assert.deepEqual(view({ name: 'notes.md', editor: 'other' }), { view: 'preview', kind: 'text' });
+  // A web page is only ever shown as text.
+  assert.deepEqual(view({ name: 'page.html', editor: 'other' }), { view: 'preview', kind: 'text' });
+  assert.deepEqual(view({ name: 'setup.exe', editor: 'other' }), { view: 'download' });
+  assert.deepEqual(view({ name: 'archive.tar.gz', editor: 'other' }), { view: 'download' });
+  assert.deepEqual(view({ name: '.png', editor: 'other' }), { view: 'download' });
+  assert.deepEqual(view({ name: 'noextension', editor: 'other' }), { view: 'download' });
+  // A file with no version has nothing to show.
+  assert.deepEqual(view({ name: 'Photo.png', editor: 'other', revision: null }), { view: 'download' });
+  // Held and quarantined come first, whatever the file is.
+  assert.deepEqual(view({ name: 'Budget.xlsx', editor: 'gridcraft', scan: 'held' }), { view: 'held' });
+  assert.deepEqual(view({ name: 'Photo.png', editor: 'other', scan: 'held' }), { view: 'held' });
+  assert.deepEqual(view({ name: 'Photo.png', editor: 'other', scan: 'quarantined', threat: 'Eicar-Test' }), {
+    view: 'quarantined',
+    threat: 'Eicar-Test',
+  });
+  assert.equal(libs.previewKindOf('a.webm'), 'video');
+  assert.equal(libs.previewKindOf('a.xlsx'), null);
+});
+
+test('held_file_polls_then_stops', async () => {
+  // Checks every 10 seconds; stops as soon as the check has an answer.
+  const waits = [];
+  const wait = async (ms) => {
+    waits.push(ms);
+  };
+  let checks = 0;
+  const ready = await libs.pollHeld(async () => (++checks === 4 ? { scan: null } : null), { wait });
+  assert.deepEqual(ready, { scan: null });
+  assert.equal(checks, 4);
+  assert.deepEqual(waits, [10_000, 10_000, 10_000, 10_000]);
+  // At most 30 times, then it gives up.
+  waits.length = 0;
+  checks = 0;
+  const never = await libs.pollHeld(async () => {
+    checks += 1;
+    return null;
+  }, { wait });
+  assert.equal(never, null);
+  assert.equal(checks, 30);
+  assert.equal(waits.length, 30);
+  // A page that is left stops it at once.
+  checks = 0;
+  const stopped = { stopped: false };
+  const early = await libs.pollHeld(async () => {
+    checks += 1;
+    if (checks === 2) stopped.stopped = true;
+    return null;
+  }, { wait, stop: () => stopped.stopped });
+  assert.equal(early, null);
+  assert.equal(checks, 2);
+});
+
+test('quarantine_text_names_the_threat_as_text', () => {
+  const threat = '<img src=x onerror=alert(1)>';
+  const text = libs.quarantineText(threat);
+  assert.ok(text.includes(threat));
+  assert.match(text, /An administrator can release or delete it/);
+  assert.match(libs.quarantineText(null), /An administrator can release or delete it/);
+  assert.equal(libs.HELD_TEXT, 'Being checked for malware');
+  const all = chromeDocument();
+  try {
+    const notice = libs.quarantineNotice(threat);
+    assert.ok(texts(notice).includes(threat), 'the threat is a string child, never markup');
+    assert.ok(!all.some((element) => element.tag === 'img'));
+    // A row of the administrators' quarantine list: threat, size, each document's path, as text.
+    const entry = {
+      sha256: 'ab'.repeat(32),
+      scan: 'infected',
+      threat,
+      size: 1536,
+      scanned_at: '2026-11-14T10:00:00Z',
+      documents: [
+        { id: DOC, name: '<b>x</b>.exe', path: 'Sales / Documents / <b>x</b>.exe', deleted: false },
+        { id: FILE, name: 'y.exe', path: 'Sales / Documents / y.exe', deleted: true },
+      ],
+    };
+    const actions = [];
+    const row = libs.quarantineRow(entry, (action, which) => actions.push([action, which.sha256]));
+    const words = texts(row);
+    assert.ok(words.includes(threat));
+    assert.ok(words.some((t) => t.includes('1.5 KB')));
+    assert.ok(words.includes('Sales / Documents / <b>x</b>.exe'));
+    assert.ok(words.some((t) => t.includes('recycle bin')));
+    const buttons = all.filter((element) => element.tag === 'button');
+    buttons.find((b) => b.children.includes('Release')).listeners.click();
+    buttons.find((b) => b.children.includes('Delete')).listeners.click();
+    assert.deepEqual(actions, [['release', entry.sha256], ['delete', entry.sha256]]);
+    // Content held by a failed scan has no threat; it says why it is held.
+    const failed = texts(libs.quarantineRow({ ...entry, scan: 'failed', threat: null }, () => {}));
+    assert.ok(failed.some((t) => /scanner/i.test(t)));
+  } finally {
+    delete globalThis.document;
+  }
+  assert.equal(
+    libs.QUARANTINE_DELETE_TEXT,
+    'Delete every file holding this content? They skip the recycle bin and cannot be restored.',
+  );
+});
+
+test('type_list_field_normalises', () => {
+  assert.deepEqual(libs.parseTypeList(' .PNG, jpg ,, .Tar.GZ , png'), { types: ['.png', '.jpg', '.tar.gz'] });
+  assert.deepEqual(libs.parseTypeList(''), { types: [] });
+  assert.deepEqual(libs.parseTypeList('  , '), { types: [] });
+  assert.ok(libs.parseTypeList('.p ng').error);
+  assert.ok(libs.parseTypeList('.').error, 'a dot alone is too short');
+  assert.deepEqual(libs.parseTypeList('.a'), { types: ['.a'] });
+  assert.ok(libs.parseTypeList(`.${'x'.repeat(20)}`).error, 'more than 20 characters');
+  assert.ok(libs.parseTypeList('..png').error);
+  assert.ok(libs.parseTypeList('.png.').error);
+  assert.ok(libs.parseTypeList('.pn/g').error);
+  const many = Array.from({ length: 101 }, (_, n) => `.t${n}`).join(',');
+  assert.ok(libs.parseTypeList(many).error, 'at most 100');
+  assert.equal(libs.typeListText(['.png', '.jpg']), '.png, .jpg');
+  assert.equal(libs.typeListText(null), '');
+  // The largest file, in MB: empty is no limit.
+  assert.deepEqual(libs.parseMegabytes(''), { bytes: null });
+  assert.deepEqual(libs.parseMegabytes('10'), { bytes: 10 * 1024 * 1024 });
+  assert.deepEqual(libs.parseMegabytes('0.5'), { bytes: 512 * 1024 });
+  assert.ok(libs.parseMegabytes('0').error);
+  assert.ok(libs.parseMegabytes('ten').error);
+  assert.equal(libs.megabytesText(10 * 1024 * 1024), '10');
+  assert.equal(libs.megabytesText(null), '');
+});
+
+test('grid_switch_only_for_image_libraries', () => {
+  assert.deepEqual(libs.libraryViews('image'), ['list', 'grid']);
+  for (const kind of ['document', 'template', 'asset', undefined]) assert.deepEqual(libs.libraryViews(kind), ['list'], kind);
+  assert.equal(libs.libraryKindLabel('image'), 'Image library');
+  assert.equal(libs.libraryKindLabel('document'), 'Document library');
+  assert.equal(libs.libraryKindLabel('template'), 'Template library');
+  assert.equal(libs.libraryKindLabel('asset'), 'Asset library');
+  // Asset is offered only to administrators.
+  assert.deepEqual(libs.libraryKindChoices(false).map((c) => c.value), ['document', 'image', 'template']);
+  assert.deepEqual(libs.libraryKindChoices(true).map((c) => c.value), ['document', 'image', 'template', 'asset']);
+  // Marks on a row: held, quarantined (with its threat, as text) and blocked.
+  assert.deepEqual(libs.itemMarks({ kind: 'document', scan: 'held' }), ['Being checked for malware']);
+  assert.deepEqual(libs.itemMarks({ kind: 'document', scan: 'quarantined', threat: 'Eicar' }), ['Quarantined: Eicar']);
+  assert.deepEqual(libs.itemMarks({ kind: 'document', policy: 'blocked' }), ['Type not allowed here']);
+  assert.deepEqual(libs.itemMarks({ kind: 'document' }), []);
+});
+
+test('thumbnails_retry_when_busy_then_give_up', async () => {
+  const waits = [];
+  const wait = async (ms) => {
+    waits.push(ms);
+  };
+  const answers = (list) => {
+    let at = 0;
+    return async () => list[Math.min(at++, list.length - 1)];
+  };
+  const png = { ok: true, status: 200, blob: async () => 'PNG' };
+  const busy = { ok: false, status: 503, blob: async () => null };
+  const none = { ok: false, status: 415, blob: async () => null };
+  assert.equal(await libs.loadThumbnail('/t', { fetch: answers([busy, busy, png]), wait }), 'PNG');
+  assert.deepEqual(waits, [1000, 2000]);
+  waits.length = 0;
+  assert.equal(await libs.loadThumbnail('/t', { fetch: answers([none]), wait }), null);
+  assert.deepEqual(waits, []);
+  assert.equal(await libs.loadThumbnail('/t', { fetch: answers([busy]), wait }), null);
+  assert.deepEqual(waits, [1000, 2000, 4000, 8000]);
+  const thrown = async () => {
+    throw new TypeError('offline');
+  };
+  assert.equal(await libs.loadThumbnail('/t', { fetch: thrown, wait }), null);
+});
+
+test('new_messages_for_new_error_codes', () => {
+  for (const code of [
+    'blocked_file_type',
+    'file_too_large',
+    'folders_off',
+    'held',
+    'no_preview',
+    'no_thumbnail',
+    'invalid_library_settings',
+    'invalid_scanner_url',
+  ]) {
+    assert.notEqual(messageFor(code), messageFor('no_such_code'), code);
+  }
+  // A refused type or size names what was refused, as the upload panel explains it.
+  assert.match(libs.policyRefusalText('blocked_file_type', { extension: '.exe' }, 'setup.exe'), /“setup\.exe”.*\.exe/);
+  assert.match(libs.policyRefusalText('blocked_file_type', { extension: '' }, 'README'), /“README”/);
+  assert.match(libs.policyRefusalText('file_too_large', { limit: 10 * 1024 * 1024 }, 'big.iso'), /“big\.iso”.*10(\.0)? MB/);
+  assert.equal(libs.policyRefusalText('name_taken', {}, 'x'), null);
+  assert.match(libs.libraryReasonText('not_an_image_type'), /image/);
+  assert.notEqual(libs.libraryReasonText('no_types'), libs.libraryReasonText('something_else'));
+});
+
+/** A document whose dialogs never fire `close` by themselves (as in a background tab). */
+function dialogDocument() {
+  const body = {
+    children: [],
+    append(node) {
+      this.children.push(node);
+    },
+  };
+  globalThis.document = {
+    body,
+    createElement(tag) {
+      const element = {
+        tag,
+        attributes: {},
+        children: [],
+        listeners: {},
+        open: false,
+        setAttribute(name, value) {
+          this.attributes[name] = value;
+        },
+        append(...nodes) {
+          this.children.push(...nodes);
+        },
+        addEventListener(type, listener) {
+          (this.listeners[type] ??= []).push(listener);
+        },
+        fire(type) {
+          for (const listener of this.listeners[type] ?? []) listener({ type, preventDefault() {} });
+        },
+        showModal() {
+          this.open = true;
+        },
+        close() {
+          this.open = false; // no `close` event: a hidden tab may never deliver one
+        },
+        remove() {
+          body.children = body.children.filter((child) => child !== this);
+        },
+        focus() {},
+      };
+      return element;
+    },
+  };
+  return body;
+}
+
+const findIn = (element, wanted) => {
+  if (typeof element === 'string') return null;
+  if (wanted(element)) return element;
+  for (const child of element.children) {
+    const found = findIn(child, wanted);
+    if (found) return found;
+  }
+  return null;
+};
+const buttonIn = (element, label) => findIn(element, (e) => e.tag === 'button' && e.children.includes(label));
+
+test('confirm_dialog_resolves_on_click', { timeout: 2000 }, async () => {
+  const body = dialogDocument();
+  try {
+    const yes = libs.confirmDialog('Delete it?', 'Delete');
+    const dialog = body.children[0];
+    buttonIn(dialog, 'Delete').fire('click');
+    assert.equal(await yes, true);
+    assert.equal(body.children.length, 0, 'the dialog is gone');
+    assert.equal(dialog.open, false);
+
+    const no = libs.confirmDialog('Delete it?', 'Delete');
+    buttonIn(body.children[0], 'Cancel').fire('click');
+    assert.equal(await no, false);
+
+    // Escape (the dialog's own close) still answers no, and a late close after a click changes nothing.
+    const escaped = libs.confirmDialog('Delete it?', 'Delete');
+    body.children[0].fire('close');
+    assert.equal(await escaped, false);
+    const clicked = libs.confirmDialog('Delete it?', 'Delete');
+    const again = body.children[0];
+    buttonIn(again, 'Delete').fire('click');
+    again.fire('close');
+    assert.equal(await clicked, true);
+  } finally {
+    delete globalThis.document;
+  }
+});

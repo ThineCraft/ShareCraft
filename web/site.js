@@ -4,6 +4,7 @@ import {
   formatDate,
   h,
   kindLabel,
+  libraryKindChoices,
   messageFor,
   offerRequest,
   pageFor,
@@ -57,12 +58,16 @@ $('explorer-link').href = `/explorer.html?root=${seg(siteId)}`;
 $('groups-link').href = `/groups.html?site=${seg(siteId)}`;
 $('bin-link').href = `/bin.html?site=${seg(siteId)}`;
 
+// A new library is a document, image or template library; administrators may make asset libraries.
+$('library-kind').replaceChildren(
+  ...libraryKindChoices(me.is_admin).map((choice) => h('option', { value: choice.value }, choice.label)),
+);
 $('new-library').addEventListener('submit', async (event) => {
   event.preventDefault();
   showMessage(error, '');
-  const result = await api('POST', `/nodes/${seg(siteId)}/children`, {
-    kind: 'library',
+  const result = await api('POST', `/sites/${seg(siteId)}/libraries`, {
     name: $('library-name').value.trim(),
+    kind: $('library-kind').value,
   });
   if (result.ok) location.assign(pageFor('library', result.data.id));
   else showMessage(error, messageFor(result.error));

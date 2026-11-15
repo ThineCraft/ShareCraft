@@ -16,8 +16,12 @@ import {
   seatBanner,
 } from './editor-host.js';
 import {
+  HELD_TEXT,
   MISSING_DOCUMENT,
   api,
+  fileView,
+  pollHeld,
+  quarantineNotice,
   can,
   goToSignIn,
   h,
@@ -136,7 +140,128 @@ async function main() {
   showDetail();
   setRole(doc.access);
   showDownload();
+  await openAsChosen();
+}
 
+// ---- what the page shows: the editor, a preview, a download, or why it cannot open ----
+
+/** Opens the file as `fileView` chooses for it now. */
+async function openAsChosen() {
+  const choice = fileView(doc);
+  if (choice.view === 'quarantined') return showQuarantined(choice.threat);
+  if (choice.view === 'held') return waitWhileHeld();
+  if (choice.view === 'editor') return openEditor();
+  statusPill.hidden = true;
+  frameBox.dataset.state = 'view';
+  if (choice.view === 'preview') return showPreview(choice.kind);
+  return showNoPreview();
+}
+
+const previewUrl = () => `/api/docs/${seg(docId)}/preview`;
+
+/** The viewer that takes the editor's place for a file no editor opens. */
+function showViewer(...children) {
+  editorArea.replaceChildren(h('div', { class: 'viewer' }, ...children));
+}
+
+function showPreview(kind) {
+  const label = `Preview of ${doc.name}`;
+  if (kind === 'text') return showTextPreview();
+  let media;
+  if (kind === 'image') media = h('img', { src: previewUrl(), alt: label });
+  else if (kind === 'audio') media = h('audio', { src: previewUrl(), controls: true, preload: 'metadata', 'aria-label': label });
+  else media = h('video', { src: previewUrl(), controls: true, preload: 'metadata', playsinline: true, 'aria-label': label });
+  // A preview the browser cannot show (or that the server refuses) becomes the download offer.
+  media.addEventListener('error', () => {
+    if (!removed) showNoPreview();
+  });
+  showViewer(media);
+}
+
+// Text is fetched and put in as text: never as markup, whatever the file holds.
+async function showTextPreview() {
+  let response;
+  try {
+    response = await fetch(previewUrl(), { credentials: 'same-origin' });
+  } catch {
+    return showNoPreview(messageFor('network'));
+  }
+  if (removed) return;
+  if (!response.ok) {
+    if (response.status === 404) return stopRemoved('missing');
+    if (response.status === 423) return recheck();
+    return showNoPreview(response.status === 415 ? '' : messageFor('unavailable'));
+  }
+  const blob = await response.blob();
+  const text = await blob.text();
+  if (removed) return;
+  const pre = h('pre', { class: 'text', 'aria-label': `Preview of ${doc.name}` });
+  pre.textContent = text;
+  const cut =
+    blob.size >= 1024 * 1024 ? h('p', { class: 'meta' }, 'Only the first 1 MiB is shown. Download the file to see all of it.') : null;
+  showViewer(cut, pre);
+}
+
+/** "No preview for this type", with Download (when there is a version to download). */
+function showNoPreview(why = '') {
+  const download = knownRevision
+    ? h('a', { class: 'button', href: contentUrl(knownRevision), download: '' }, 'Download')
+    : h('p', { class: 'meta' }, 'Not saved yet');
+  showViewer(h('p', {}, why || 'No preview for this type.'), download);
+}
+
+function showQuarantined(threat) {
+  statusPill.hidden = true;
+  frameBox.dataset.state = 'failed';
+  downloadLink.hidden = true;
+  showViewer(quarantineNotice(threat));
+}
+
+// The scanner holds the file: say so, and look again every 10 seconds, at most 30 times.
+async function waitWhileHeld() {
+  downloadLink.hidden = true;
+  statusPill.hidden = false;
+  frameBox.dataset.state = 'connecting';
+  statusText.textContent = HELD_TEXT;
+  const line = h('p', { class: 'meta' }, 'It opens here as soon as the scanner has passed it. This page checks again every 10 seconds.');
+  showViewer(h('p', { class: 'note' }, `${HELD_TEXT}.`), line);
+  const ready = await pollHeld(
+    async () => {
+      const result = await api('GET', `/docs/${seg(docId)}`);
+      if (!result.ok) return result.status === 404 ? { missing: true } : null;
+      return result.data.scan === 'held' ? null : result.data;
+    },
+    { stop: () => removed },
+  );
+  if (removed) return;
+  if (!ready) {
+    statusText.textContent = 'Still being checked';
+    line.textContent = 'The scanner has not finished with this file yet. Reload the page later to try again.';
+    return;
+  }
+  if (ready.missing) return stopRemoved('missing');
+  doc = ready;
+  knownRevision = doc.revision ?? null;
+  showDetail();
+  setRole(doc.access);
+  showDownload();
+  await openAsChosen();
+}
+
+// A preview refused as held: the file was held meanwhile (a new version), so ask again.
+async function recheck() {
+  const result = await api('GET', `/docs/${seg(docId)}`);
+  if (removed) return;
+  if (!result.ok) return result.status === 404 ? stopRemoved('missing') : showNoPreview(messageFor(result.error));
+  doc = result.data;
+  knownRevision = doc.revision ?? null;
+  showDownload();
+  if (doc.scan) return openAsChosen();
+  return showNoPreview(messageFor('held'));
+}
+
+async function openEditor() {
+  statusPill.hidden = false;
   const editors = await api('GET', '/editors');
   if (removed) return;
   if (!editors.ok) {
@@ -166,6 +291,7 @@ function documentId() {
 }
 
 function editorName() {
+  if (doc.editor === 'other') return 'File';
   return Object.hasOwn(EDITORS, doc.editor) ? EDITORS[doc.editor].name : doc.editor;
 }
 

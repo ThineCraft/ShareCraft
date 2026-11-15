@@ -13,6 +13,7 @@
   <a href="/people.html">People</a>
   <a href="/admin-sites.html">Manage sites</a>
   <a href="/templates.html">Templates</a>
+  <a href="/quarantine.html">Quarantine</a>
   <span class="spacer"></span>
   <span id="who" class="meta"></span>
  </nav>
@@ -45,6 +46,63 @@
    <div><button type="submit">Save</button></div>
    <p id="regional-msg" role="alert" class="msg"></p>
   </form>
+ </section>
+ <section id="files" aria-labelledby="files-heading" hidden>
+  <h2 id="files-heading">Blocked file types</h2>
+  <form id="files-form" class="stack">
+   <p class="meta">No library takes these types, whatever its own settings. Files already stored stay, and are marked.</p>
+   <div class="field">
+    <label for="blocked-types">File types blocked everywhere</label>
+    <input type="text" id="blocked-types" autocomplete="off" aria-describedby="blocked-note">
+    <small id="blocked-note" class="meta">Separated by commas, like .exe, .bat. Leave it empty to block none.</small>
+   </div>
+   <ul id="blocked-list" class="list" aria-label="Blocked now"></ul>
+   <div><button type="submit">Save</button></div>
+   <p id="files-msg" role="alert" class="msg"></p>
+  </form>
+ </section>
+ <section id="scanner" aria-labelledby="scanner-heading" hidden>
+  <h2 id="scanner-heading">Malware scanner</h2>
+  <form id="scanner-form" class="stack">
+   <p class="meta">Every new upload is sent to the organisation's own scanner over ICAP, and nobody can open it until the scanner has passed it. With no scanner, files are available at once.</p>
+   <div class="field">
+    <label for="scanner-url">Scanner address</label>
+    <input type="text" id="scanner-url" autocomplete="off" spellcheck="false" aria-describedby="scanner-url-note">
+    <small id="scanner-url-note" class="meta">Like icap://scanner.example.org/avscan (port 1344 unless given). Leave it empty for no scanner.</small>
+   </div>
+   <div class="field">
+    <label for="scanner-timeout">Longest wait for the scanner (seconds, 5 to 3600)</label>
+    <input type="text" id="scanner-timeout" inputmode="numeric" autocomplete="off">
+   </div>
+   <div class="field">
+    <label for="scanner-max">Largest file the scanner takes (MB)</label>
+    <input type="text" id="scanner-max" inputmode="decimal" autocomplete="off">
+   </div>
+   <div class="field">
+    <label for="scanner-unavailable">When the scanner cannot be reached</label>
+    <select id="scanner-unavailable">
+     <option value="hold">Hold new files until it can</option>
+     <option value="allow">Let new files through unscanned</option>
+    </select>
+   </div>
+   <div class="field">
+    <label for="scanner-too-large">Files larger than the scanner takes</label>
+    <select id="scanner-too-large">
+     <option value="hold">Hold them for an administrator</option>
+     <option value="allow">Let them through unscanned</option>
+    </select>
+   </div>
+   <div class="row">
+    <button type="submit">Save</button>
+    <button type="button" id="scanner-test" class="plain">Test</button>
+   </div>
+   <p id="scanner-msg" role="alert" class="msg"></p>
+  </form>
+  <h3>Files stored before scanning</h3>
+  <p class="meta">Files stored before the scanner was set up are not scanned unless you ask. They stay available while they wait.</p>
+  <p><button type="button" id="scan-existing" class="plain">Scan existing files</button></p>
+  <p id="scan-existing-msg" role="status" class="msg ok"></p>
+  <p><a href="/quarantine.html">Open the quarantine</a></p>
  </section>
  <section id="global" aria-labelledby="global-heading" hidden>
   <h2 id="global-heading">Global navigation</h2>

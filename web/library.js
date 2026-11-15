@@ -9,9 +9,15 @@ import {
   can,
   canPlaceHere,
   formatDate,
+  formatSize,
   h,
   itemActions,
+  itemMarks,
+  libraryKindLabel,
+  libraryViews,
+  loadThumbnail,
   messageFor,
+  policyRefusalText,
   offerRequest,
   moveChoices,
   pageFor,
@@ -24,6 +30,7 @@ import {
   showCrumbs,
   showMessage,
   siteChrome,
+  typeListText,
 } from './common.js';
 import {
   CONFLICT_CHOICES,
@@ -38,6 +45,7 @@ import {
 } from './upload.js';
 
 const BULK_MAX = 500;
+const GRID_PAGE = 200; // the grid's page, the most the server answers at once
 
 const PAGE = 50;
 const $ = (id) => document.getElementById(id);
@@ -60,11 +68,33 @@ if (self.kind === 'site' || self.kind === 'document') {
 }
 $('title').textContent = self.name;
 document.title = `${self.name} — ShareCraft`;
+// The library this place is in, with its kind and settings (a folder is judged by its library).
+const libraryStep = here.path.find((step) => step.kind === 'library');
+const libraryInfo = libraryStep ? await api('GET', `/libraries/${seg(libraryStep.id)}`) : null;
+const library = libraryInfo?.ok ? libraryInfo.data : null;
 $('kind').textContent =
-  (self.kind === 'library' ? 'Library' : 'Folder') +
+  (self.kind === 'library' ? libraryKindLabel(library?.kind) : 'Folder') +
   (here.access ? ` · ${roleLine(here.access)}` : ' · Limited access');
+if (library?.description) {
+  $('library-description').textContent = library.description;
+  $('library-description').hidden = false;
+}
 $('edit-tools').hidden = !can(here.access, 'add');
-$('top-tools').hidden = !can(here.access, 'manage_access');
+// New folder is hidden while the library takes no folders.
+$('new-folder').hidden = library?.folders === false;
+// What the library takes, so that a refusal is no surprise.
+const accepts = [];
+if (Array.isArray(library?.effective_allowed_types)) accepts.push(`Takes only ${typeListText(library.effective_allowed_types)}.`);
+if (library?.blocked_types?.length) accepts.push(`Does not take ${typeListText(library.blocked_types)}.`);
+if (typeof library?.max_file_bytes === 'number') accepts.push(`Files up to ${formatSize(library.max_file_bytes)}.`);
+$('accepts').textContent = accepts.join(' ');
+$('accepts').hidden = accepts.length === 0;
+const manageSite = can(here.access, 'manage_site') && libraryStep !== undefined;
+$('settings-link').hidden = !manageSite;
+if (libraryStep) $('settings-link').href = `/library-settings.html?id=${seg(libraryStep.id)}`;
+$('access-link').hidden = !can(here.access, 'manage_access');
+$('explorer-link').hidden = !can(here.access, 'manage_access');
+$('top-tools').hidden = !(can(here.access, 'manage_access') || manageSite);
 $('explorer-link').href = `/explorer.html?root=${seg(nodeId)}`;
 $('access-link').href = `/access.html?id=${seg(nodeId)}`;
 await siteChrome(here.path[0].id, { currentId: here.path.find((step) => step.kind === 'library')?.id });
@@ -89,8 +119,15 @@ let renaming = null;
 const uploadRows = new Map(); // outcome -> its list item
 const dirtyUploads = new Set(); // outcomes to redraw at the next frame
 let drawScheduled = false;
+const views = libraryViews(library?.kind);
+let view = 'list'; // 'grid' only in an image library
+const thumbUrls = new Set(); // blob: URLs of thumbnails shown, revoked when the list is drawn again
+let watcher = null; // loads a tile's thumbnail when it scrolls into view
+let templates = [];
 
 $('more').addEventListener('click', () => loadPage());
+setupViews();
+await setupTemplates();
 $('select-all').addEventListener('change', () => {
   const all = $('select-all').checked;
   for (const item of items) {
@@ -111,7 +148,8 @@ async function reload() {
 }
 
 async function loadPage() {
-  const query = `limit=${PAGE}${next ? `&after=${encodeURIComponent(next)}` : ''}`;
+  const grid = view === 'grid';
+  const query = `limit=${grid ? GRID_PAGE : PAGE}${grid ? '&view=grid' : ''}${next ? `&after=${encodeURIComponent(next)}` : ''}`;
   const result = await api('GET', `/nodes/${seg(nodeId)}/children?${query}`);
   if (!result.ok) {
     note(messageFor(result.error), true);
@@ -125,9 +163,141 @@ async function loadPage() {
 function render() {
   $('empty').hidden = items.length > 0;
   $('more').hidden = !next;
-  $('items').replaceChildren(...items.map(row));
+  for (const url of thumbUrls) URL.revokeObjectURL(url);
+  thumbUrls.clear();
+  watcher?.disconnect();
+  watcher = null;
+  const grid = view === 'grid';
+  $('items').classList.toggle('grid', grid);
+  $('items').replaceChildren(...items.map(grid ? tile : row));
   showSelection();
 }
+
+// ---- the Grid / List switch of an image library ----
+
+function setupViews() {
+  $('view-switch').hidden = views.length < 2;
+  if (views.length < 2) return;
+  try {
+    if (localStorage.getItem('sharecraft-library-view') === 'grid') view = 'grid';
+  } catch {
+    // no storage: the list is shown
+  }
+  for (const [id, which] of [['view-list', 'list'], ['view-grid', 'grid']]) {
+    $(id).addEventListener('click', async () => {
+      if (view === which) return;
+      view = which;
+      try {
+        localStorage.setItem('sharecraft-library-view', which);
+      } catch {
+        // not remembered; nothing else depends on it
+      }
+      showViewButtons();
+      await reload();
+    });
+  }
+  showViewButtons();
+}
+
+function showViewButtons() {
+  $('view-list').setAttribute('aria-pressed', String(view === 'list'));
+  $('view-grid').setAttribute('aria-pressed', String(view === 'grid'));
+}
+
+/** A tile of the grid: the thumbnail (loaded when it comes into view), the name and its marks. */
+function tile(item) {
+  const picture = h('div', { class: 'thumb', 'aria-hidden': 'true' });
+  if (item.thumbnail) {
+    picture.dataset.id = item.id;
+    watchThumbnail(picture);
+  } else {
+    picture.append(placeholder(item));
+  }
+  const box =
+    item.kind === 'library'
+      ? null
+      : h('input', { type: 'checkbox', 'aria-label': `Select ${item.name}`, checked: selected.has(item.id) });
+  box?.addEventListener('change', () => {
+    if (box.checked) selected.add(item.id);
+    else selected.delete(item.id);
+    showSelection();
+  });
+  return h(
+    'li',
+    {},
+    h('a', { href: pageFor(item.kind, item.id, item.editor), class: 'tile-link' }, picture, h('span', { class: 'tile-name' }, item.name)),
+    h('span', { class: 'tile-foot' }, box, ...itemMarks(item).map((mark) => h('small', { class: 'mark warn' }, mark))),
+  );
+}
+
+/** The plain placeholder of a tile with no thumbnail: what kind of item it is. */
+function placeholder(item) {
+  return h('span', { class: 'placeholder' }, item.kind === 'document' ? 'No thumbnail' : kindLabel(item));
+}
+
+function watchThumbnail(picture) {
+  if (!('IntersectionObserver' in globalThis)) {
+    showThumbnail(picture);
+    return;
+  }
+  watcher ??= new IntersectionObserver(
+    (entries) => {
+      for (const entry of entries) {
+        if (!entry.isIntersecting) continue;
+        watcher?.unobserve(entry.target);
+        showThumbnail(entry.target);
+      }
+    },
+    { rootMargin: '200px' },
+  );
+  watcher.observe(picture);
+}
+
+/** Asks for one thumbnail; a busy server is asked again, and a plain placeholder shows after. */
+async function showThumbnail(picture) {
+  const id = picture.dataset.id;
+  const blob = await loadThumbnail(`/api/docs/${seg(id)}/thumbnail`);
+  if (!picture.isConnected) return;
+  if (!blob) {
+    picture.replaceChildren(h('span', { class: 'placeholder' }, 'No thumbnail'));
+    return;
+  }
+  const url = URL.createObjectURL(blob);
+  thumbUrls.add(url);
+  picture.replaceChildren(h('img', { src: url, alt: '' }));
+}
+
+// ---- New from template ----
+
+async function setupTemplates() {
+  if (!canAdd || !libraryStep) return;
+  const result = await api('GET', `/libraries/${seg(libraryStep.id)}/templates`);
+  templates = result.ok ? result.data : [];
+  $('from-template').hidden = templates.length === 0;
+  $('template-choice').replaceChildren(
+    ...templates.map((template) =>
+      h('option', { value: template.id }, `${template.name} (${template.library_name})`),
+    ),
+  );
+}
+
+$('from-template').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  note('', false);
+  const template = templates.find((t) => t.id === $('template-choice').value);
+  if (!template) return;
+  const body = { template: template.id };
+  if (self.kind === 'folder') body.parent = nodeId;
+  const name = $('template-name').value.trim();
+  if (name) body.name = name;
+  const result = await api('POST', `/libraries/${seg(libraryStep.id)}/from-template`, body);
+  if (!result.ok) {
+    return note(policyRefusalText(result.error, result.data, name || template.name) ?? messageFor(result.error), true);
+  }
+  $('template-name').value = '';
+  note(`“${result.data.node.name}” was made from the template ${template.name}.`, false);
+  await reload();
+});
 
 /** The bulk bar: Select all, how many are checked, and the buttons that need a selection. */
 function showSelection() {
@@ -198,6 +368,7 @@ function row(item) {
     saved && h('small', {}, saved),
     item.access ? null : h('small', { class: 'mark' }, 'Limited access'),
     item.inherits || item.kind === 'library' ? null : h('small', { class: 'mark' }, 'Own permissions'),
+    ...itemMarks(item).map((mark) => h('small', { class: 'mark warn' }, mark)),
     buttons.length ? h('span', { class: 'actions' }, ...buttons) : null,
   );
 }
@@ -288,6 +459,7 @@ function startUploads(files) {
   const queue = new UploadQueue({
     parent: nodeId,
     site: siteId,
+    checkScans: true,
     onChange: (outcome) => {
       if (!uploads.includes(outcome)) uploads.push(outcome);
       dirtyUploads.add(outcome);
@@ -448,7 +620,9 @@ $('rename-form').addEventListener('submit', async (event) => {
   const item = renaming;
   const name = $('rename-name').value.trim();
   const result = await api('PATCH', `/nodes/${seg(item.id)}`, { name });
-  if (!result.ok) return showMessage($('rename-error'), messageFor(result.error));
+  if (!result.ok) {
+    return showMessage($('rename-error'), policyRefusalText(result.error, result.data, name) ?? messageFor(result.error));
+  }
   renameDialog.close();
   note(`Renamed to “${result.data.name}”.`, false);
   await reload();

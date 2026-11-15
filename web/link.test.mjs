@@ -175,3 +175,43 @@ test('a_link_that_does_not_work_shows_the_not_working_page', async () => {
   assert.deepEqual(none.errors, []);
   assert.equal(none.els.get('broken').hidden, false);
 });
+
+test('an_anyone_link_previews_other_files_and_hides_held_ones', async () => {
+  const other = { kind: 'document', id: 'd3', name: 'Photo.png', editor: 'other', revised_at: '2026-01-01T00:00:00Z' };
+  const image = await load({ routes: (path) => (path === '' ? reply(200, { kind: 'anyone', item: other }) : null) });
+  assert.deepEqual(image.errors, []);
+  assert.equal(image.els.get('preview-view').hidden, false);
+  const [img] = image.els.get('preview-body').children;
+  assert.ok(img.attrs.src.endsWith('/preview/d3'));
+  assert.equal(image.els.get('download').hidden, false);
+
+  const page = { ...other, id: 'd4', name: 'page.html' };
+  const markup = '<script>alert(1)</script>';
+  const text = await load({
+    routes: (path) => {
+      if (path === '') return reply(200, { kind: 'anyone', item: page });
+      if (path === '/preview/d4') return { ok: true, status: 200, text: async () => markup };
+      return null;
+    },
+  });
+  assert.deepEqual(text.errors, []);
+  const [pre] = text.els.get('preview-body').children;
+  assert.equal(pre.textContent, markup, 'a web page is shown as text');
+
+  const listed = await load({
+    routes: (path) => {
+      if (path === '') return reply(200, { kind: 'anyone', item: folder });
+      if (path.startsWith('/children/f1')) {
+        return reply(200, { items: [{ ...other, scan: 'held' }, { ...other, id: 'd5', name: 'x.exe' }], next: null });
+      }
+      return null;
+    },
+  });
+  assert.deepEqual(listed.errors, []);
+  const [heldRow, plainRow] = listed.els.get('items').children;
+  const words = (el) => (typeof el === 'string' ? [el] : [el.textContent, ...el.children.flatMap(words)]);
+  assert.ok(words(heldRow).includes('Being checked for malware'));
+  assert.ok(!words(heldRow).includes('Download'));
+  assert.ok(words(plainRow).includes('Download'));
+  assert.ok(!words(plainRow).includes('Preview'), 'no preview for a type the browser cannot show');
+});

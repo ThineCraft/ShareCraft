@@ -5,7 +5,17 @@
 // sign in has it kept in sessionStorage for the trip (sign-in returns to /link.html, which holds
 // no token); it is removed as soon as it is read.
 
-import { LINK_NOT_WORKING, fileOffer, h, messageFor, safeNext, seg, showMessage } from './common.js';
+import {
+  LINK_NOT_WORKING,
+  fileOffer,
+  h,
+  itemMarks,
+  messageFor,
+  previewKindOf,
+  safeNext,
+  seg,
+  showMessage,
+} from './common.js';
 
 const $ = (id) => document.getElementById(id);
 const PAGE = 50;
@@ -69,6 +79,8 @@ let next = null;
 let loading = 0; // the latest folder load; answers to older ones are dropped
 
 const contentUrl = (id) => `${base}/content/${seg(id)}`;
+const previewUrl = (id) => `${base}/preview/${seg(id)}`;
+let previewing = 0; // the latest preview asked for; older answers are dropped
 
 if (!token) {
   notWorking();
@@ -125,6 +137,7 @@ function showAnyone({ item }) {
   $('title').textContent = item.name;
   if (item.kind === 'document') {
     $('kind').textContent = item.editor === 'text' ? 'Text document' : 'File';
+    // A file no editor opens is previewed here when a browser can show it safely.
     $('file-tools').hidden = false;
     // A file never saved has nothing to download: "Not saved yet" takes the button's place.
     const offer = fileOffer(item.revised_at);
@@ -133,6 +146,7 @@ function showAnyone({ item }) {
     $('download').href = contentUrl(item.id);
     $('download').setAttribute('aria-label', `Download ${item.name}`);
     if (item.editor === 'text') showText(item.id);
+    else if (offer.download && previewable(item)) showPreview(item);
     return;
   }
   $('kind').textContent = 'Folder';
@@ -151,6 +165,7 @@ async function openFolder(at) {
   items = [];
   next = null;
   $('text-view').hidden = true;
+  closePreview();
   showTrail();
   await loadPage();
 }
@@ -201,7 +216,24 @@ function row(child) {
     return h('li', {}, h('span', { class: 'grow' }, open), h('small', {}, 'Folder'));
   }
   const text = child.editor === 'text';
+  const marks = itemMarks(child);
+  // Held or quarantined content cannot be read, previewed or downloaded: only its mark shows.
+  const held = Boolean(child.scan);
   const actions = [];
+  if (held) {
+    return h(
+      'li',
+      {},
+      h('span', { class: 'grow' }, child.name),
+      h('small', {}, text ? 'Text document' : 'File'),
+      ...marks.map((mark) => h('small', { class: 'mark warn' }, mark)),
+    );
+  }
+  if (!text && child.revised_at != null && previewable(child)) {
+    const look = h('button', { type: 'button', class: 'plain', 'aria-label': `Preview ${child.name}` }, 'Preview');
+    look.addEventListener('click', () => showPreview(child));
+    actions.push(look);
+  }
   if (text) {
     const view = h('button', { type: 'button', class: 'plain', 'aria-label': `Read ${child.name}` }, 'Read');
     view.addEventListener('click', () => showText(child.id));
@@ -220,6 +252,7 @@ function row(child) {
     h('span', { class: 'grow' }, child.name),
     h('small', {}, text ? 'Text document' : 'File'),
     offer.download ? h('small', {}, offer.saved) : null,
+    ...marks.map((mark) => h('small', { class: 'mark warn' }, mark)),
     h('span', { class: 'actions' }, ...actions),
   );
 }
@@ -235,4 +268,63 @@ async function showText(id) {
   $('text-body').textContent = result.data.revision === null ? '(This document has not been saved yet.)' : result.data.text;
   $('text-view').hidden = false;
   $('text-view').scrollIntoView?.({ block: 'nearest' });
+}
+
+// ---- previews of files no editor opens ----
+
+/** Whether `item` is a file no editor opens that has a preview. */
+function previewable(item) {
+  return item.editor === 'other' && previewKindOf(item.name) !== null;
+}
+
+function closePreview() {
+  previewing += 1;
+  $('preview-view').hidden = true;
+  $('preview-body').replaceChildren();
+}
+
+/**
+ * Shows the preview of `item`: an image, a player, or text put in as text. Never a frame: the
+ * file's bytes never run as a page.
+ */
+async function showPreview(item) {
+  const mine = ++previewing;
+  const kind = previewKindOf(item.name);
+  const label = `Preview of ${item.name}`;
+  $('preview-heading').textContent = item.name;
+  $('preview-view').hidden = false;
+  if (kind === 'text') {
+    $('preview-body').replaceChildren(h('p', { class: 'meta' }, 'Loading the preview…'));
+    let response;
+    try {
+      response = await fetch(previewUrl(item.id), { credentials: 'omit' });
+    } catch {
+      response = null;
+    }
+    if (mine !== previewing) return;
+    if (!response?.ok) {
+      if (response?.status === 404) return notWorking();
+      $('preview-body').replaceChildren(h('p', {}, previewProblem(response?.status)));
+      return;
+    }
+    const pre = h('pre', { class: 'text', 'aria-label': label });
+    pre.textContent = await response.text();
+    if (mine !== previewing) return;
+    $('preview-body').replaceChildren(pre);
+  } else {
+    let media;
+    if (kind === 'image') media = h('img', { src: previewUrl(item.id), alt: label, referrerpolicy: 'no-referrer' });
+    else media = h(kind, { src: previewUrl(item.id), controls: true, preload: 'metadata', 'aria-label': label });
+    media.addEventListener('error', () => {
+      if (mine === previewing) $('preview-body').replaceChildren(h('p', {}, previewProblem(0)));
+    });
+    $('preview-body').replaceChildren(media);
+  }
+  $('preview-view').scrollIntoView?.({ block: 'nearest' });
+}
+
+function previewProblem(status) {
+  if (status === 423) return messageFor('held');
+  if (status === 415) return 'No preview for this type. Download the file to open it.';
+  return 'The preview could not be shown. Download the file to open it.';
 }

@@ -587,3 +587,32 @@ test('the bar shows hashing progress while the file is checked, then bytes sent'
   assert.deepEqual(progressOf({ status: 'uploading', size: 100, hashed: 100, sent: 10 }), { value: 10, max: 100 });
   assert.equal(progressOf({ status: 'done', size: 100, sent: 100 }), null);
 });
+
+test('refused types and sizes are explained, at the start and at the finish', async () => {
+  const typed = stubServer({ start: () => json(422, { error: 'blocked_file_type', extension: '.exe' }) });
+  const [refused] = await queueFor(typed).run([fileOf('setup.exe', 5)]);
+  assert.equal(refused.status, 'failed');
+  assert.match(refused.message, /setup\.exe/);
+  assert.match(refused.message, /\.exe are not allowed/);
+  const sized = stubServer({ finish: () => json(413, { error: 'file_too_large', limit: 1024 * 1024 }) });
+  const [big] = await queueFor(sized).run([fileOf('big.iso', 5)]);
+  assert.equal(big.status, 'failed');
+  assert.match(big.message, /big\.iso/);
+  assert.match(big.message, /1(\.0)? MB/);
+});
+
+test('a finished upload the scanner holds says it is being checked', async () => {
+  const server = stubServer();
+  const fetch = async (url, init = {}) =>
+    url === '/api/docs/doc1' ? json(200, { id: 'doc1', name: 'x.pdf', scan: 'held' }) : server.fetch(url, init);
+  const [held] = await queueFor({ fetch }, { checkScans: true }).run([fileOf('x.pdf', 5)]);
+  assert.equal(held.status, 'done');
+  assert.equal(held.checking, true);
+  assert.match(outcomeNote(held), /Being checked for malware/);
+  // Without asking, the queue sends nothing more after the finish.
+  const plain = stubServer();
+  const [done] = await queueFor(plain).run([fileOf('x.pdf', 5)]);
+  assert.ok(!done.checking);
+  assert.equal(outcomeNote(done), 'Uploaded.');
+  assert.equal(plain.log.at(-1).url, '/api/uploads/sess/finish');
+});

@@ -960,7 +960,8 @@ export function parseQuotaGb(text) {
 /**
  * Asks the person to confirm before something is done: a dialog with `text`, a Cancel button
  * and a `label` button. Resolves true for the label, false for Cancel or Escape. The text is
- * put in as text only.
+ * put in as text only. A button click answers at once: a hidden or background tab may never
+ * deliver the dialog's `close` event, which only Escape relies on.
  */
 export function confirmDialog(text, label) {
   return new Promise((resolve) => {
@@ -968,16 +969,17 @@ export function confirmDialog(text, label) {
     const cancel = h('button', { type: 'button', class: 'plain' }, 'Cancel');
     const confirm = h('button', { type: 'button' }, label);
     dialog.append(h('p', {}, text), h('div', { class: 'row end' }, cancel, confirm));
-    let answer = false;
-    cancel.addEventListener('click', () => dialog.close());
-    confirm.addEventListener('click', () => {
-      answer = true;
-      dialog.close();
-    });
-    dialog.addEventListener('close', () => {
+    let answered = false;
+    const answer = (yes) => {
+      if (answered) return;
+      answered = true;
+      if (dialog.open) dialog.close();
       dialog.remove();
-      resolve(answer);
-    });
+      resolve(yes);
+    };
+    cancel.addEventListener('click', () => answer(false));
+    confirm.addEventListener('click', () => answer(true));
+    dialog.addEventListener('close', () => answer(false));
     document.body.append(dialog);
     dialog.showModal();
     cancel.focus();
@@ -1498,4 +1500,239 @@ export function adminSiteRow(site, onAction) {
     site.owners > 0 ? null : h('small', { class: 'mark warn' }, 'No enabled owner'),
     h('span', { class: 'actions' }, ...buttons),
   );
+}
+
+// ---- libraries: kinds and settings, previews, scanning and quarantine ----
+
+/** What a file page shows while the malware scanner holds a file. */
+export const HELD_TEXT = 'Being checked for malware';
+
+/** The confirmation before an administrator deletes quarantined content. */
+export const QUARANTINE_DELETE_TEXT =
+  'Delete every file holding this content? They skip the recycle bin and cannot be restored.';
+
+// The server's preview list (crates/server/src/previews.rs), by extension; anything else has none.
+const PREVIEW_KINDS = Object.freeze({
+  png: 'image', jpg: 'image', jpeg: 'image', gif: 'image', webp: 'image', avif: 'image', bmp: 'image', svg: 'image',
+  mp3: 'audio', ogg: 'audio', wav: 'audio', m4a: 'audio', flac: 'audio',
+  mp4: 'video', webm: 'video', mov: 'video',
+});
+const TEXT_PREVIEWS = new Set([
+  'txt', 'md', 'csv', 'tsv', 'log', 'json', 'xml', 'yaml', 'yml', 'toml', 'ini', 'rs', 'js', 'ts', 'py', 'java', 'c',
+  'h', 'cpp', 'cs', 'go', 'rb', 'php', 'sh', 'ps1', 'sql', 'css', 'html', 'htm',
+]);
+
+/**
+ * How a file named `name` is previewed, as the server decides it by its extension (what follows
+ * the last dot, with something before it): `image`, `audio`, `video`, `text`, or null for none.
+ * Web pages are text: they are only ever shown as text.
+ */
+export function previewKindOf(name) {
+  const text = String(name ?? '');
+  const dot = text.lastIndexOf('.');
+  if (dot <= 0 || dot === text.length - 1) return null;
+  const ext = text.slice(dot + 1).toLowerCase();
+  if (Object.hasOwn(PREVIEW_KINDS, ext)) return PREVIEW_KINDS[ext];
+  return TEXT_PREVIEWS.has(ext) ? 'text' : null;
+}
+
+/**
+ * What the file page shows for `doc` as `GET /api/docs/{id}` answers it: `{view: 'quarantined',
+ * threat}`, `{view: 'held'}`, `{view: 'editor'}` for an editor's file, `{view: 'preview', kind}`
+ * for any other file a browser can show safely, or `{view: 'download'}`.
+ */
+export function fileView(doc) {
+  if (doc.scan === 'quarantined') return { view: 'quarantined', threat: doc.threat ?? null };
+  if (doc.scan === 'held') return { view: 'held' };
+  if (doc.editor !== 'other') return { view: 'editor' };
+  const kind = doc.revision == null ? null : previewKindOf(doc.name);
+  return kind ? { view: 'preview', kind } : { view: 'download' };
+}
+
+/**
+ * Waits for a held file: every `every` milliseconds (10 seconds) it calls `check`, at most
+ * `times` (30) times. Resolves with the first answer `check` gives that is not null, or null
+ * when it gives up or `stop()` says the page no longer wants it.
+ */
+export async function pollHeld(check, { wait = sleep, every = 10_000, times = 30, stop = () => false } = {}) {
+  for (let tried = 0; tried < times; tried += 1) {
+    await wait(every);
+    if (stop()) return null;
+    const answer = await check();
+    if (answer != null) return answer;
+    if (stop()) return null;
+  }
+  return null;
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** The sentence for a quarantined file, naming the threat (put in as text by the callers). */
+export function quarantineText(threat) {
+  const found = threat ? `The malware scanner found ${threat} in this file.` : 'The malware scanner found a threat in this file.';
+  return `${found} It is quarantined: nobody can open or download it. An administrator can release or delete it.`;
+}
+
+/** A paragraph saying that a file is quarantined, with the threat's name as text. */
+export function quarantineNotice(threat) {
+  const rest = ' It is quarantined: nobody can open or download it. An administrator can release or delete it.';
+  if (!threat) return h('p', { class: 'note' }, quarantineText(null));
+  return h('p', { class: 'note' }, 'The malware scanner found ', h('strong', {}, threat), ` in this file.${rest}`);
+}
+
+const HELD_REASONS = Object.freeze({
+  infected: 'Threat found',
+  failed: 'The scanner could not check it',
+  too_large: 'Larger than the scanner takes',
+});
+
+/**
+ * A row of the administrators' quarantine list for `entry` (`GET /api/admin/quarantine`): the
+ * threat or why it is held, its size, each document's path, and Release and Delete buttons that
+ * call `onAction(action, entry)`. Everything from the server is text.
+ */
+export function quarantineRow(entry, onAction) {
+  const reason = HELD_REASONS[entry.scan] ?? 'Held';
+  const release = h('button', { type: 'button', class: 'plain', 'aria-label': `Release ${entry.threat ?? 'this content'}` }, 'Release');
+  const remove = h('button', { type: 'button', class: 'plain', 'aria-label': `Delete ${entry.threat ?? 'this content'}` }, 'Delete');
+  release.addEventListener('click', () => onAction('release', entry));
+  remove.addEventListener('click', () => onAction('delete', entry));
+  const documents = entry.documents ?? [];
+  return h(
+    'li',
+    { class: 'quarantine' },
+    h(
+      'span',
+      { class: 'grow' },
+      h('strong', {}, entry.threat ?? reason),
+      h('br'),
+      h('small', {}, `${reason} · ${formatSize(entry.size)}${entry.scanned_at ? ` · checked ${formatDate(entry.scanned_at)}` : ''}`),
+      documents.length
+        ? h(
+            'ul',
+            { class: 'paths' },
+            ...documents.map((doc) =>
+              h('li', {}, doc.path, doc.deleted ? h('small', {}, ' (in the recycle bin)') : null),
+            ),
+          )
+        : h('small', { class: 'meta' }, ' No file names it now.'),
+    ),
+    h('span', { class: 'actions' }, release, remove),
+  );
+}
+
+const EXTENSION = /^\.[a-z0-9]+(\.[a-z0-9]+)*$/;
+
+/**
+ * The file types typed in a comma-separated field, normalised as the server keeps them: trimmed,
+ * lower case, with a leading dot, once each. `{types}`, or `{error}` for one that is not 2 to 20
+ * letters, digits and dots, or more than 100.
+ */
+export function parseTypeList(text) {
+  const types = [];
+  for (const part of String(text ?? '').split(',')) {
+    let type = part.trim().toLowerCase();
+    if (type === '') continue;
+    if (!type.startsWith('.')) type = `.${type}`;
+    if (type.length < 2 || type.length > 20 || !EXTENSION.test(type)) {
+      return { error: `“${part.trim()}” is not a file type. Write types like .png or .tar.gz, separated by commas.` };
+    }
+    if (!types.includes(type)) types.push(type);
+  }
+  if (types.length > 100) return { error: 'List at most 100 file types.' };
+  return { types };
+}
+
+/** A list of file types as the comma-separated field shows it. */
+export const typeListText = (types) => (Array.isArray(types) ? types.join(', ') : '');
+
+/** The largest-file field (megabytes, decimals allowed): `{bytes}`, null when empty, or `{error}`. */
+export function parseMegabytes(text) {
+  const trimmed = String(text ?? '').trim();
+  if (trimmed === '') return { bytes: null };
+  if (!/^\d+(\.\d+)?$/.test(trimmed) || Number(trimmed) <= 0) {
+    return { error: 'Enter the largest file as a number of megabytes, or leave it empty for no limit.' };
+  }
+  return { bytes: Math.round(Number(trimmed) * 1024 * 1024) };
+}
+
+/** A byte count as the megabytes field shows it; '' for none. */
+export const megabytesText = (bytes) =>
+  typeof bytes === 'number' ? String(Math.round((bytes / (1024 * 1024)) * 100) / 100) : '';
+
+const LIBRARY_KINDS = Object.freeze([
+  { value: 'document', label: 'Document library' },
+  { value: 'image', label: 'Image library' },
+  { value: 'template', label: 'Template library' },
+  { value: 'asset', label: 'Asset library' },
+]);
+
+/** The name of a library kind. */
+export const libraryKindLabel = (kind) => LIBRARY_KINDS.find((k) => k.value === kind)?.label ?? 'Library';
+
+/** The kinds a person may choose: asset only for administrators. */
+export const libraryKindChoices = (isAdmin) => LIBRARY_KINDS.filter((k) => isAdmin || k.value !== 'asset');
+
+/** The views a library of `kind` offers: image libraries have a grid of thumbnails too. */
+export const libraryViews = (kind) => (kind === 'image' ? ['list', 'grid'] : ['list']);
+
+/** The marks a listed item carries: held, quarantined (with its threat) and blocked. */
+export function itemMarks(item) {
+  const marks = [];
+  if (item.scan === 'held') marks.push(HELD_TEXT);
+  if (item.scan === 'quarantined') marks.push(item.threat ? `Quarantined: ${item.threat}` : 'Quarantined');
+  if (item.policy === 'blocked') marks.push('Type not allowed here');
+  return marks;
+}
+
+/**
+ * A thumbnail from `url` as a Blob, or null when there is none (415, any refusal, or no
+ * connection). A busy server (503) is asked again after 1, 2, 4 and 8 seconds before giving up.
+ */
+export async function loadThumbnail(url, { fetch = globalThis.fetch, wait = sleep, tries = 5, first = 1000 } = {}) {
+  let delay = first;
+  for (let tried = 1; ; tried += 1) {
+    let response;
+    try {
+      response = await fetch(url, { credentials: 'same-origin' });
+    } catch {
+      return null;
+    }
+    if (response.ok) return response.blob();
+    if (response.status !== 503 || tried >= tries) return null;
+    await wait(delay);
+    delay *= 2;
+  }
+}
+
+/**
+ * The sentence for a file refused by the file policies, naming it and what was refused:
+ * `blocked_file_type {extension}` or `file_too_large {limit}`; null for any other error.
+ */
+export function policyRefusalText(error, data, name) {
+  if (error === 'blocked_file_type') {
+    const type = data?.extension ? `Files of type ${data.extension}` : 'Files of that type';
+    return `“${name}” was not accepted. ${type} are not allowed here: the library or the organisation blocks them.`;
+  }
+  if (error === 'file_too_large') {
+    const limit = typeof data?.limit === 'number' ? ` (at most ${formatSize(data.limit)})` : '';
+    return `“${name}” is larger than this library takes${limit}. Choose a smaller file or another library.`;
+  }
+  return null;
+}
+
+const LIBRARY_REASONS = Object.assign(Object.create(null), {
+  invalid_kind: 'That is not a kind of library.',
+  invalid_description: 'The description is too long. Use 500 characters or fewer.',
+  too_many_types: 'List at most 100 file types.',
+  invalid_extension: 'A file type is written like .png or .tar.gz: 2 to 20 letters, digits and dots.',
+  duplicate_type: 'A file type is listed twice.',
+  no_types: 'List at least one allowed type, or leave the field empty to allow every type.',
+  not_an_image_type: 'An image library accepts only image types (.png .jpg .jpeg .gif .webp .svg .avif .bmp .tif .tiff .heic).',
+  invalid_max_file_bytes: 'The largest file must be more than 0 MB.',
+});
+
+/** The sentence for an `invalid_library_settings` refusal's `reason`. */
+export function libraryReasonText(reason) {
+  return LIBRARY_REASONS[reason] ?? messageFor('invalid_library_settings');
 }
