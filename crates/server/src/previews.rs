@@ -11,14 +11,15 @@
 //! the decoded pixels need, the size of the file, for a GIF the number of its frames and for
 //! a JPEG the number of its scans (each counted by walking the file without decoding it), so
 //! the work of a decode is bounded too. At most [`THUMBNAIL_TURNS`] are made at once, each off
-//! the async workers and answered within [`THUMBNAIL_TIME`] (see `Thumbnailer`). A thumbnail is
+//! the async workers; a request waits at most [`THUMBNAIL_WAIT`] for a turn (then answers busy)
+//! and a decode has [`THUMBNAIL_TIME`] (see `Thumbnailer`). A thumbnail is
 //! written to a temporary file and renamed into place, so a failure leaves nothing behind. Content
 //! that fails, or takes too long, is marked and never decoded again. Erasing a content erases
 //! its thumbnail and its mark (see [`erase_thumbnail`]).
 
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
 use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader, Limits};
@@ -42,7 +43,11 @@ pub const MAX_JPEG_SCANS: u64 = 64;
 pub const MAX_JPEG_SCAN_PIXELS: u64 = 1_500_000_000;
 /// How many thumbnails are made at once.
 pub const THUMBNAIL_TURNS: usize = 2;
-/// The longest a thumbnail request waits for one to be made, its turn included.
+/// The longest a thumbnail request waits for a turn to make one; it then answers busy, and
+/// nothing is remembered.
+pub const THUMBNAIL_WAIT: Duration = Duration::from_secs(10);
+/// The longest a thumbnail may take to make once it has its turn; content that takes longer is
+/// remembered as having none.
 pub const THUMBNAIL_TIME: Duration = Duration::from_secs(10);
 /// How much of a text file a preview shows, at most.
 pub const TEXT_PREVIEW_BYTES: u64 = 1 << 20;
@@ -219,7 +224,11 @@ pub enum ThumbError {
     /// The content store failed.
     #[error("{0}")]
     Store(#[from] revisions::BlobError),
-    /// It took longer than [`THUMBNAIL_TIME`].
+    /// No turn came free within [`THUMBNAIL_WAIT`]; nothing was tried, and asking again later
+    /// may work.
+    #[error("too many thumbnails are being made")]
+    Busy,
+    /// Its decode took longer than [`THUMBNAIL_TIME`].
     #[error("making the thumbnail took too long")]
     TimedOut,
     /// The task making it failed.
@@ -519,52 +528,63 @@ fn gif_frames(bytes: &[u8]) -> Result<usize, ThumbError> {
 /// Makes thumbnails for the server: [`THUMBNAIL_TURNS`] at once, each in `spawn_blocking`.
 pub(crate) struct Thumbnailer {
     turns: Arc<Semaphore>,
+    /// How long a request waits for a turn ([`THUMBNAIL_WAIT`]; tests shorten it).
+    wait: std::sync::Mutex<Duration>,
 }
 
 impl Default for Thumbnailer {
     fn default() -> Self {
         Self {
             turns: Arc::new(Semaphore::new(THUMBNAIL_TURNS)),
+            wait: std::sync::Mutex::new(THUMBNAIL_WAIT),
         }
     }
 }
 
 impl Thumbnailer {
-    /// The thumbnail of the content `sha256` of `blobs`, made if needed (see [`thumbnail`]),
-    /// within [`THUMBNAIL_TIME`] counting the wait for a turn; content marked as having none
-    /// answers [`ThumbError::Remembered`] at once. Content whose thumbnail takes longer is
-    /// marked too, so it is never decoded again. The decode still running then keeps its turn
-    /// until it really ends, so never more than [`THUMBNAIL_TURNS`] run at once; the limits
-    /// checked before decoding (see [`thumbnail`]) bound how long that can be. What it makes
-    /// is kept and served from then on.
+    /// The thumbnail of the content `sha256` of `blobs`, made if needed (see [`thumbnail`]);
+    /// content marked as having none answers [`ThumbError::Remembered`] at once.
+    ///
+    /// A request waits at most [`THUMBNAIL_WAIT`] for a turn and then answers
+    /// [`ThumbError::Busy`], leaving no mark: the image was never looked at, and the page may
+    /// ask again. Once it has its turn, the decode has [`THUMBNAIL_TIME`]; content whose decode
+    /// takes longer is marked, so it is never decoded again. The decode still running then
+    /// keeps its turn until it really ends, so never more than [`THUMBNAIL_TURNS`] run at once;
+    /// the limits checked before decoding (see [`thumbnail`]) bound how long that can be. What
+    /// it makes is kept and served from then on.
     pub(crate) async fn make(
         &self,
         blobs: Arc<crate::blobs::Blobs>,
         sha256: [u8; 32],
     ) -> Result<PathBuf, ThumbError> {
         let path = thumb_path(blobs.store(), &sha256);
+        let mark = no_thumb_path(blobs.store(), &sha256);
         if is_file(&path).await {
             return Ok(path);
         }
-        if is_file(&no_thumb_path(blobs.store(), &sha256)).await {
+        if is_file(&mark).await {
             return Err(ThumbError::Remembered);
         }
-        let turns = Arc::clone(&self.turns);
-        let maker = Arc::clone(&blobs);
-        let work = async move {
-            let turn = turns
-                .acquire_owned()
-                .await
-                .map_err(|e| ThumbError::Task(e.to_string()))?;
-            tokio::task::spawn_blocking(move || {
-                let _turn = turn;
-                thumbnail(maker.store(), &sha256)
-            })
-            .await
-            .map_err(|e| ThumbError::Task(e.to_string()))?
+        let wait = *self.wait.lock().unwrap_or_else(PoisonError::into_inner);
+        let turn = match tokio::time::timeout(wait, Arc::clone(&self.turns).acquire_owned()).await {
+            Ok(Ok(turn)) => turn,
+            Ok(Err(e)) => return Err(ThumbError::Task(e.to_string())),
+            Err(_) => return Err(ThumbError::Busy),
         };
-        match tokio::time::timeout(THUMBNAIL_TIME, work).await {
-            Ok(made) => made,
+        // Made, or found unmakeable, by another request while this one waited.
+        if is_file(&path).await {
+            return Ok(path);
+        }
+        if is_file(&mark).await {
+            return Err(ThumbError::Remembered);
+        }
+        let maker = Arc::clone(&blobs);
+        let job = tokio::task::spawn_blocking(move || {
+            let _turn = turn;
+            thumbnail(maker.store(), &sha256)
+        });
+        match tokio::time::timeout(THUMBNAIL_TIME, job).await {
+            Ok(made) => made.map_err(|e| ThumbError::Task(e.to_string()))?,
             Err(_) => {
                 let marked =
                     tokio::task::spawn_blocking(move || remember_failure(blobs.store(), &sha256))
@@ -578,6 +598,17 @@ impl Thumbnailer {
                 Err(ThumbError::TimedOut)
             }
         }
+    }
+
+    /// Takes every turn, so no thumbnail is made until the answer is dropped. For tests.
+    pub(crate) async fn hold_turns(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let turns = u32::try_from(THUMBNAIL_TURNS).ok()?;
+        Arc::clone(&self.turns).acquire_many_owned(turns).await.ok()
+    }
+
+    /// Sets how long a request waits for a turn. For tests.
+    pub(crate) fn set_wait(&self, wait: Duration) {
+        *self.wait.lock().unwrap_or_else(PoisonError::into_inner) = wait;
     }
 }
 

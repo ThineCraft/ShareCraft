@@ -313,6 +313,8 @@ pub(crate) enum ApiError {
     Held(ScanState),
     /// 422: not an ICAP scanner address (`icap://host[:port]/service`, no password).
     InvalidScannerUrl,
+    /// 503: too much is being done at once to start this; asking again later may work.
+    Busy,
     /// 415: the file is not of a type that has a preview, or a text file is not UTF-8.
     NoPreview,
     /// 415: no thumbnail is made for the file: not a PNG, JPEG, GIF or WebP image, or one that
@@ -422,6 +424,7 @@ impl ApiError {
             ApiError::BlockedFileType(_) => (StatusCode::UNPROCESSABLE_ENTITY, "blocked_file_type"),
             ApiError::FileTooLarge(_) => (StatusCode::PAYLOAD_TOO_LARGE, "file_too_large"),
             ApiError::Held(_) => (StatusCode::LOCKED, "held"),
+            ApiError::Busy => (StatusCode::SERVICE_UNAVAILABLE, "busy"),
             ApiError::NoPreview => (StatusCode::UNSUPPORTED_MEDIA_TYPE, "no_preview"),
             ApiError::NoThumbnail => (StatusCode::UNSUPPORTED_MEDIA_TYPE, "no_thumbnail"),
             ApiError::InvalidScannerUrl => {

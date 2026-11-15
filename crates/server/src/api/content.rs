@@ -551,7 +551,8 @@ async fn read_start(state: &AppState, stored: &Stored, limit: u64) -> Result<Vec
 /// content store (see [`previews::thumbnail`]). For PNG, JPEG, GIF (its first frame) and WebP
 /// files; `415 no_thumbnail` for any other type, for a document with no version, and for an
 /// image that cannot be decoded within the limits. `423 held {scan}` while the malware scanner
-/// holds the content; `404` if the caller has no role on the document. It may be cached
+/// holds the content; `404` if the caller has no role on the document; `503 busy` when no turn
+/// to make it came free in time (nothing is remembered: asking again later may work). It may be cached
 /// privately for five minutes: it shows no more than the listing does.
 pub(crate) async fn thumbnail(
     State(state): State<AppState>,
@@ -577,6 +578,8 @@ pub(crate) async fn thumbnail(
         .await;
     let path = match made {
         Ok(path) => path,
+        // No turn came free: nothing is remembered, and the page may ask again.
+        Err(ThumbError::Busy) => return Err(ApiError::Busy),
         Err(e) => {
             if matches!(
                 e,

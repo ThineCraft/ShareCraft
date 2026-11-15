@@ -1352,3 +1352,36 @@ async fn folder(site: &Site, user: &TestUser, parent: &str, name: &str) -> Strin
     assert_eq!(status, StatusCode::CREATED, "{body}");
     body["id"].as_str().unwrap().to_owned()
 }
+
+#[tokio::test]
+async fn waiting_for_a_turn_is_not_remembered() {
+    let World { server, ann, home } = world().await;
+    let png = picture(300, 200, ImageFormat::Png);
+    let doc = upload(&server, &ann, &home, "Queued.png", &png).await;
+    let store = server.blobs();
+    let state = server.state().await;
+
+    // Both turns busy, as with two slow decodes: the request gives up waiting, answers busy
+    // and leaves no mark, since the image was never looked at.
+    state.set_thumbnail_wait(Duration::from_millis(200));
+    let turns = state.hold_thumbnail_turns().await.unwrap();
+    let started = Instant::now();
+    let (status, error) = refused(thumbnail(&server, &ann, &doc).await).await;
+    assert_eq!(
+        (status, error.as_str()),
+        (StatusCode::SERVICE_UNAVAILABLE, "busy")
+    );
+    assert!(started.elapsed() < QUICKLY, "took {:?}", started.elapsed());
+    assert!(!no_thumb_path(&store, &sha(&png)).exists());
+    assert!(!thumb_path(&store, &sha(&png)).exists());
+
+    // Asked again while waiting, it is made once a turn comes free.
+    state.set_thumbnail_wait(Duration::from_secs(10));
+    let (response, ()) = tokio::join!(thumbnail(&server, &ann, &doc), async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        drop(turns);
+    });
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(dimensions(&response.bytes().await.unwrap()), (256, 171));
+    assert!(!no_thumb_path(&store, &sha(&png)).exists());
+}

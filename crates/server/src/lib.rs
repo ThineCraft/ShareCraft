@@ -169,6 +169,19 @@ impl AppState {
         &self.shared.thumbnailer
     }
 
+    /// Takes every turn for making thumbnails until the answer is dropped, as long-running
+    /// decodes would. For tests.
+    #[doc(hidden)]
+    pub async fn hold_thumbnail_turns(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.shared.thumbnailer.hold_turns().await
+    }
+
+    /// Sets how long a thumbnail request waits for a turn. For tests.
+    #[doc(hidden)]
+    pub fn set_thumbnail_wait(&self, wait: std::time::Duration) {
+        self.shared.thumbnailer.set_wait(wait);
+    }
+
     fn events(&self) -> &EventSink {
         &self.shared.events
     }
