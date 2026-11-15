@@ -524,3 +524,68 @@ test('image_gone_draft_applied_as_it_is_keeps_its_other_snapshots', async () => 
   assert.equal(look.logo, undefined, 'the gone image is left out');
   assert.deepEqual(look.thumbnail, { keep: SHA_C }, 'the other snapshot is kept, not re-taken');
 });
+
+import { DEFAULT_LOOK, describeLookChange } from './look.js';
+
+test('describe_look_change_says_what_changed', () => {
+  const before = { ...structuredClone(STORED), logo: null };
+  const after = {
+    ...structuredClone(STORED),
+    theme: { name: 'Plum', primary: '#7a3e8f', secondary: '#3b2244' },
+    from: 'builtin:plum',
+    logo: ref(SHA_A, DOC_A, 'Logo.png'),
+    header: { layout: 'extended', background: 'none', align: 'left', hide_title: false },
+    navigation: 'vertical',
+    footer: { enabled: true, layout: 'simple', name: '', background: 'none', groups: [] },
+  };
+  assert.equal(
+    describeLookChange(before, after),
+    'Theme: ShareCraft to Plum; Logo added; Header: compact to extended; Navigation: horizontal to vertical; Footer turned on',
+  );
+  // Changed and removed images, and a footer turned off.
+  const swapped = { ...structuredClone(after), logo: ref(SHA_B, DOC_B, 'New.png') };
+  assert.equal(describeLookChange(after, swapped), 'Logo changed');
+  assert.equal(describeLookChange(swapped, { ...structuredClone(swapped), logo: null }), 'Logo removed');
+  assert.equal(describeLookChange(after, { ...structuredClone(after), footer: { ...after.footer, enabled: false } }), 'Footer turned off');
+  // Footer detail only counts while the footer is on; alignment and hidden title are named.
+  assert.equal(
+    describeLookChange(after, { ...structuredClone(after), footer: { ...after.footer, layout: 'extended', name: 'Sales' } }),
+    'Footer: layout simple to extended, name changed',
+  );
+  assert.equal(
+    describeLookChange(after, { ...structuredClone(after), header: { ...after.header, align: 'centre', background: 'strong' } }),
+    'Header: background none to strong, alignment left to centre',
+  );
+});
+
+test('describe_look_change_treats_no_look_as_the_defaults', () => {
+  assert.equal(describeLookChange(null, STORED), 'Logo added');
+  assert.equal(describeLookChange(null, { ...structuredClone(DEFAULT_LOOK), navigation: 'vertical' }), 'Navigation: horizontal to vertical');
+  assert.equal(describeLookChange(STORED, null), 'Logo removed');
+  assert.equal(describeLookChange(null, null), 'No visible change');
+  assert.equal(describeLookChange(STORED, structuredClone(STORED)), 'No visible change');
+});
+
+test('history_entry_before_previews_and_restores', async () => {
+  const { calls, send } = sender();
+  const session = lookSession({ siteId: SITE_ID, settings: settingsOf(STORED), themes: THEMES, brandImages: [], send });
+  const entry = { event_id: 4, look: STORED, before: null };
+  session.preview(entry, 'before');
+  assert.equal(session.draft.logo, null, 'no look before is the defaults');
+  assert.equal(session.draft.from, 'builtin:sharecraft');
+  assert.equal((await session.restore(entry, 'before')).ok, true);
+  assert.deepEqual(calls[0], { method: 'POST', path: `/sites/${SITE_ID}/look/rollback`, body: { event_id: 4, which: 'before' } });
+  // The default is the resulting look: no `which` is sent.
+  await session.restore(entry);
+  assert.deepEqual(calls[1].body, { event_id: 4 });
+  // A refused rollback of a before loads the before, not the after, as the draft.
+  const gone = lookSession({
+    siteId: SITE_ID,
+    settings: settingsOf(STORED),
+    send: async () => ({ ok: false, status: 409, error: 'image_gone', data: { slots: ['logo'] } }),
+  });
+  const result = await gone.restore({ event_id: 5, look: STORED, before: { ...structuredClone(STORED), navigation: 'vertical' } }, 'before');
+  assert.deepEqual(result.gone, ['logo']);
+  assert.equal(gone.draft.navigation, 'vertical');
+  assert.equal(gone.draft.logo, null);
+});

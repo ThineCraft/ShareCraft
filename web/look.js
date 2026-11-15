@@ -591,6 +591,61 @@ function canonical(value) {
   return JSON.stringify(value ?? null);
 }
 
+/** One image slot's change in words: added, removed or changed; null when it is the same. */
+function imageChange(name, from, to) {
+  const key = (image) => (image ? (image.sha256 ?? image.doc ?? image.brand_image ?? canonical(image)) : null);
+  if (key(from) === key(to)) return null;
+  if (!from) return `${name} added`;
+  if (!to) return `${name} removed`;
+  return `${name} changed`;
+}
+
+/** A field that went from one choice to another in words, or null when it did not. */
+function choiceChange(name, from, to) {
+  return from === to ? null : `${name} ${from} to ${to}`;
+}
+
+/**
+ * What changed between two looks as stored (`null` is the default look), for a history entry:
+ * for example "Theme: ShareCraft to Plum; logo added; header: compact to extended; footer turned
+ * on". "No visible change" when nothing a person sees differs.
+ */
+export function describeLookChange(before, after) {
+  const a = draftFromLook(before);
+  const b = draftFromLook(after);
+  const parts = [];
+  if (a.theme.name !== b.theme.name) parts.push(`Theme: ${a.theme.name} to ${b.theme.name}`);
+  else if (!sameTheme(a.theme, b.theme)) parts.push('Theme colours changed');
+  for (const text of [imageChange('Logo', a.logo, b.logo), imageChange('Thumbnail', a.thumbnail, b.thumbnail)]) {
+    if (text) parts.push(text);
+  }
+  if (a.logo_alt !== b.logo_alt) parts.push('Logo description changed');
+  const layout = a.header.layout === b.header.layout ? null : `${a.header.layout} to ${b.header.layout}`;
+  const header = [
+    choiceChange('background', a.header.background, b.header.background),
+    imageChange('image', a.header.image, b.header.image),
+    choiceChange('alignment', a.header.align, b.header.align),
+    a.header.hide_title !== b.header.hide_title ? (b.header.hide_title ? 'title hidden' : 'title shown') : null,
+  ].filter(Boolean);
+  if (layout) header.unshift(header.length ? `layout ${layout}` : layout);
+  if (header.length) parts.push(`Header: ${header.join(', ')}`);
+  if (a.navigation !== b.navigation) parts.push(`Navigation: ${a.navigation} to ${b.navigation}`);
+  if (a.footer.enabled !== b.footer.enabled) parts.push(`Footer turned ${b.footer.enabled ? 'on' : 'off'}`);
+  else if (b.footer.enabled) {
+    const footer = [
+      choiceChange('layout', a.footer.layout, b.footer.layout),
+      choiceChange('background', a.footer.background, b.footer.background),
+      imageChange('logo', a.footer.logo, b.footer.logo),
+      a.footer.name !== b.footer.name ? 'name changed' : null,
+      canonical(footerGroups(a.footer)) !== canonical(footerGroups(b.footer)) ? 'links changed' : null,
+    ].filter(Boolean);
+    if (footer.length) parts.push(`Footer: ${footer.join(', ')}`);
+  }
+  if (parts.length === 0) return 'No visible change';
+  const text = parts.join('; ');
+  return text[0].toUpperCase() + text.slice(1);
+}
+
 /**
  * The Change the look page's state for site `siteId`, without any DOM: the saved look (from
  * `settings`, the answer of `GET /api/sites/{id}/look/settings`) and a draft. Changes go to the
@@ -653,9 +708,9 @@ export function lookSession({ siteId, settings, themes = [], brandImages = [], s
       const named = draft.theme.name.trim() !== '';
       return { dirty, check, canApply: dirty && check.ok && named && !readOnly };
     },
-    /** Loads the look of history `entry` as the draft. */
-    preview(entry) {
-      draft = draftFromLook(entry?.look ?? null);
+    /** Loads the look of history `entry` (with `which` `'before'`, the look before it) as the draft. */
+    preview(entry, which = 'after') {
+      draft = draftFromLook((which === 'before' ? entry?.before : entry?.look) ?? null);
     },
     /** Sends the draft. Answers the `api` result; on success the answer is the saved look. */
     async apply() {
@@ -670,16 +725,18 @@ export function lookSession({ siteId, settings, themes = [], brandImages = [], s
      * content is gone (`409 image_gone`), the entry becomes the draft without them, and the
      * answer carries `gone`, the slots.
      */
-    async restore(entry) {
+    async restore(entry, which = 'after') {
       if (readOnly) return { ok: false, error: null };
-      const result = await send('POST', `${path}/look/rollback`, { event_id: entry.event_id });
+      const before = which === 'before';
+      const body = before ? { event_id: entry.event_id, which: 'before' } : { event_id: entry.event_id };
+      const result = await send('POST', `${path}/look/rollback`, body);
       if (result.ok) {
         take(result.data);
         return result;
       }
       if (result.error === 'image_gone') {
         const gone = Array.isArray(result.data?.slots) ? result.data.slots : [];
-        draft = withoutSlots(draftFromLook(entry.look ?? null), gone);
+        draft = withoutSlots(draftFromLook((before ? entry.before : entry.look) ?? null), gone);
         return { ...result, gone };
       }
       return result;

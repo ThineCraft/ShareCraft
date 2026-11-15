@@ -718,8 +718,8 @@ pub(crate) async fn settings(
 }
 
 /// The last [`HISTORY_LENGTH`] changes of the look of `site`, newest first, for `actor`, who
-/// manages it (archived or not): each `{event_id, at, by: {id, name} | null, look}`, `look`
-/// being what the change made it (`null` for none).
+/// manages it (archived or not): each `{event_id, at, by: {id, name} | null, look, before}`, `look`
+/// being what the change made it and `before` what it was (`null` for none).
 ///
 /// # Errors
 /// As [`settings`].
@@ -736,6 +736,7 @@ pub(crate) async fn history(
             "at": change.at.format(&Rfc3339).ok(),
             "by": change.by.map(|(id, name)| json!({ "id": id.0, "name": name })),
             "look": change.after,
+            "before": change.before,
         })
     };
     Ok(Value::Array(changes.into_iter().map(entry).collect()))

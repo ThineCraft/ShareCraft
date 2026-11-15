@@ -2324,3 +2324,31 @@ async fn quarantine_delete_reports_brand_pins() {
     assert_eq!(body["erased"], true, "{body}");
     assert_eq!(body["pinned_by_brand"], json!([]));
 }
+
+#[tokio::test]
+async fn rollback_to_before_the_first_change() {
+    let server = spawn_server().await;
+    let root = server.admin("Root").await;
+    let (team, _) = create_site(&server, &root, "Team").await;
+    set_look(&server, &root, &team, builtin("builtin:harbour")).await;
+    set_look(&server, &root, &team, builtin("builtin:plum")).await;
+    let listed = history(&server, &root, &team).await;
+    // Each entry says what the look was before it: none before the oldest, the older entry's
+    // look before the newer.
+    assert_eq!(listed[1]["before"], Value::Null);
+    assert_eq!(listed[0]["before"], listed[1]["look"]);
+    let first = listed[1]["event_id"].clone();
+    let (status, body) = rollback(
+        &server,
+        &root,
+        &team,
+        json!({ "event_id": first, "which": "before" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(look_in_git(&server, &team), None);
+    assert_eq!(
+        effective(&server, &root, &team).await["theme"],
+        resolved("builtin:sharecraft")
+    );
+}

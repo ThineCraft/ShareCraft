@@ -37,6 +37,7 @@ import {
   draftImageUrl,
   hexOf,
   lookSession,
+  describeLookChange,
   mayReplaceDraft,
   parseColour,
   previewEffective,
@@ -553,38 +554,50 @@ const SLOT_NAMES = { logo: 'the logo', thumbnail: 'the thumbnail', 'header.image
 function drawHistory() {
   $('history-empty').hidden = history.length > 0;
   $('history').replaceChildren(
-    ...history.map((entry, at) => {
+    ...history.flatMap((entry, at) => {
       const when = formatDate(entry.at);
       const who = entry.by?.name ?? 'Someone no longer here';
-      const theme = entry.look?.theme?.name ?? 'ShareCraft';
-      const preview = h('button', { type: 'button', class: 'plain', 'aria-label': `Preview the look of ${when}` }, 'Preview');
-      preview.addEventListener('click', async () => {
-        if (!(await mayReplaceDraft(session, () => confirmDialog('Previewing this look drops the changes you have not applied. Preview it?', 'Preview')))) return;
-        session.preview(entry);
-        fill();
-        note(`The look of ${when} is now the draft. Apply it to use it.`, true);
-        $('preview-heading').scrollIntoView?.({ block: 'start' });
-      });
-      const restore = readOnly ? null : h('button', { type: 'button', class: 'plain', 'aria-label': `Restore the look of ${when}` }, 'Restore');
-      restore?.addEventListener('click', () => restoreEntry(entry, when));
-      return h(
+      const summary = describeLookChange(entry.before, entry.look);
+      const actions = (which, label) => {
+        const preview = h('button', { type: 'button', class: 'plain', 'aria-label': `Preview the look ${label} of ${when}` }, 'Preview');
+        preview.addEventListener('click', async () => {
+          if (!(await mayReplaceDraft(session, () => confirmDialog('Previewing this look drops the changes you have not applied. Preview it?', 'Preview')))) return;
+          session.preview(entry, which);
+          fill();
+          note(`The look ${label} of ${when} is now the draft. Apply it to use it.`, true);
+          $('preview-heading').scrollIntoView?.({ block: 'start' });
+        });
+        const restore = readOnly ? null : h('button', { type: 'button', class: 'plain', 'aria-label': `Restore the look ${label} of ${when}` }, 'Restore');
+        restore?.addEventListener('click', () => restoreEntry(entry, when, which, label));
+        return [preview, restore];
+      };
+      const row = h(
         'li',
         {},
-        h('span', { class: 'grow' }, `${when}, by ${who}`, h('br'), h('small', {}, at === 0 ? `Theme ${theme} (the current look)` : `Theme ${theme}`)),
-        h('span', { class: 'actions' }, preview, restore),
+        h('span', { class: 'grow' }, `${when}, by ${who}`, h('br'), h('small', {}, at === 0 ? `${summary} (the current look)` : summary)),
+        h('span', { class: 'actions' }, ...actions('after', 'after the change')),
       );
+      // The oldest entry listed also offers the look before it, which no entry's own look is.
+      if (at !== history.length - 1) return [row];
+      const earlier = h(
+        'li',
+        {},
+        h('span', { class: 'grow' }, 'Before that change', h('br'), h('small', {}, entry.before ? 'The look it replaced' : 'The plain default look the site had')),
+        h('span', { class: 'actions' }, ...actions('before', 'before the change')),
+      );
+      return [row, earlier];
     }),
   );
 }
 
-async function restoreEntry(entry, when) {
+async function restoreEntry(entry, when, which = 'after', label = 'after the change') {
   note('');
   if (!(await mayReplaceDraft(session, () => confirmDialog('Restoring drops the changes you have not applied. Restore?', 'Restore')))) return;
-  const result = await session.restore(entry);
+  const result = await session.restore(entry, which);
   if (result.ok) {
     siteThemes = session.settings.themes ?? siteThemes;
     fill();
-    await afterChange(`The look of ${when} is applied again.`);
+    await afterChange(`The look ${label} of ${when} is applied again.`);
     return;
   }
   if (result.gone) {
