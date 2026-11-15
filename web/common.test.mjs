@@ -1866,3 +1866,76 @@ test('messages_for_branding_errors', () => {
   for (const [at, code] of codes.entries()) assert.notEqual(sentences[at], general, code);
   assert.equal(new Set(sentences).size, codes.length);
 });
+
+// ---- what the look never reaches: the account bar, the editor, and the accent on a tint ----
+
+import { readFileSync } from 'node:fs';
+
+const STYLE = readFileSync(new URL('./style.css', import.meta.url), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '');
+/** The declarations of every rule whose selector list is exactly `selector`, joined. */
+const declarations = (selector) =>
+  [...STYLE.matchAll(/([^{}]+)\{([^{}]*)\}/g)]
+    .filter(([, sel]) => sel.trim().split(/\s*,\s*/).includes(selector))
+    .map(([, , body]) => body)
+    .join(';');
+const variable = (body, name) => new RegExp(`(?:^|;)\\s*${name}:([^;]+)`).exec(body)?.[1].trim() ?? null;
+
+test('account_bar_keeps_default_colours', () => {
+  const root = declarations(':root');
+  const topbar = declarations('.topbar');
+  for (const name of ['--accent', '--accent-ink', '--on-accent', '--soft']) {
+    assert.ok(variable(topbar, name), `.topbar sets ${name}`);
+    assert.equal(variable(topbar, name), variable(root, name), `${name} as in :root`);
+  }
+});
+
+test('accent_text_never_on_soft_tint', () => {
+  const footerLinks = declarations('.site-footer[data-background=soft] a');
+  assert.equal(variable(footerLinks, 'color'), 'var(--text)');
+  assert.equal(variable(footerLinks, 'text-decoration'), 'underline', 'links still read as links');
+  assert.equal(variable(declarations('.site-header[data-background=soft] a'), 'color'), 'var(--text)');
+  for (const selector of ['.navbar a[aria-current]', '.sitenav a[aria-current]', '.navbar li>a:hover']) {
+    assert.equal(variable(declarations(selector), 'color'), 'var(--text)', selector);
+  }
+});
+
+test('frame_look_on_bar_and_navigation_only', async () => {
+  lookDocument();
+  const styled = () => {
+    const props = {};
+    return { props, setProperty: (name, value) => (props[name] = value), removeProperty: (name) => delete props[name] };
+  };
+  const html = { lang: 'en', style: styled() };
+  const bar = { style: styled() };
+  const mono = document.createElement('span');
+  document.documentElement = html;
+  document.querySelector = (selector) => (selector === '.bar' ? bar : selector === '.bar .mono' ? mono : null);
+  const theme = {
+    light: { accent: '#1f5f8b', accent_ink: '#1f5f8b', on_accent: '#ffffff', header_bg: '#163447', header_ink: '#ffffff' },
+    dark: { accent: '#6fa3c8', accent_ink: '#6fa3c8', on_accent: '#141c20', header_bg: '#163447', header_ink: '#ffffff' },
+  };
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    const body = url.endsWith('/navigation')
+      ? { global: [], hub: null, local: [], automatic: false }
+      : url.endsWith('/look')
+        ? look({ theme, thumbnail_url: IMAGE })
+        : { id: SITE, name: 'Sales', language: 'en-GB', time_zone: 'Europe/London', kind: 'team', description: '' };
+    return { ok: true, status: 200, json: async () => body };
+  };
+  try {
+    const place = document.createElement('div');
+    await siteChrome(SITE, { place, frame: true });
+    assert.deepEqual(html.style.props, {}, 'the editor page keeps its own colours');
+    assert.equal(bar.style.props['--accent'], 'light-dark(#1f5f8b,#6fa3c8)');
+    const nav = place.children[0];
+    assert.equal(nav.style.props['--accent-ink'], 'light-dark(#1f5f8b,#6fa3c8)');
+    assert.equal(mono.children[0].attributes.src, IMAGE);
+    // Outside the frame the whole page takes the look.
+    await siteChrome(SITE, { place });
+    assert.equal(html.style.props['--accent'], 'light-dark(#1f5f8b,#6fa3c8)');
+  } finally {
+    globalThis.fetch = realFetch;
+    delete globalThis.document;
+  }
+});

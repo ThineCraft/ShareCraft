@@ -1461,8 +1461,10 @@ function sideBySide(page, chrome, vertical) {
  * language and time zone (and `<html lang>`) to the site's, applies the look's colours (see
  * `applyLook` in look.js), and draws the header after the account bar, the bars (see
  * [`navigationView`]) after it or in `place`, and with `footer` the site's footer at the end.
- * In the editor frame (`frame`) there is no header or footer: the bar's mark shows the site's
- * thumbnail or logo instead (see [`frameMark`]), and the navigation stays across the top.
+ * In the editor frame (`frame`) there is no header or footer, and only the bar and the
+ * navigation take the colours (not `<html>`, so the editor stays untouched): the bar's mark
+ * shows the site's thumbnail or logo instead (see [`frameMark`]), and the navigation stays
+ * across the top.
  * `currentId` is marked as the current page. Answers `{ site, navigation, look }`, each null
  * when it could not be read; without the site the organisation defaults are used, and without
  * the look the page keeps its own.
@@ -1480,7 +1482,8 @@ export async function siteChrome(siteId, { currentId, place, footer = false, fra
     navigation: navigation.ok ? navigation.data : null,
     look: look.ok && look.data && typeof look.data === 'object' ? look.data : null,
   };
-  applyLook(document.documentElement, shown.look);
+  // In the editor frame only the bar and the navigation take the look: the editor stays neutral.
+  if (!frame) applyLook(document.documentElement, shown.look);
   const vertical = !frame && shown.look?.navigation === 'vertical';
   const view = navigationView(shown.site, shown.navigation, {
     currentId,
@@ -1488,6 +1491,8 @@ export async function siteChrome(siteId, { currentId, place, footer = false, fra
     hubThumbnail: shown.look?.hub?.thumbnail_url,
   });
   if (frame) {
+    applyLook(document.querySelector('.bar'), shown.look);
+    applyLook(view, shown.look);
     frameMark(document.querySelector('.bar .mono'), shown.look);
     placeChrome(view, place);
   } else {

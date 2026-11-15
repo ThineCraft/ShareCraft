@@ -73,6 +73,8 @@ select{padding:6px 8px;min-height:36px;background:var(--paper);border:1px solid 
 .list .grow{flex:1;min-width:160px}
 .list small,.meta{color:var(--muted);font-size:12px}
 .topbar{display:flex;flex-wrap:wrap;align-items:center;gap:8px 16px;padding:12px 0;border-bottom:1px solid var(--line)}
+/* the account bar is never themed: it keeps the default accent whatever the site's look sets on <html> */
+.topbar{--accent:#3156c9;--accent-ink:light-dark(#3156c9,#9db4ff);--on-accent:#fff;--soft:color-mix(in srgb,var(--accent) 11%,var(--paper))}
 .topbar .spacer{flex:1}
 .share{padding:14px 16px;border-top:1px solid var(--line)}
 .share h2{font-size:13px;margin:0 0 8px}
@@ -333,6 +335,13 @@ input[type=file]{max-width:100%}
 @media (max-width:600px){.site-header[data-layout=extended]{height:120px;padding:12px 16px}}
 .site-footer{display:flex;flex-wrap:wrap;align-items:flex-start;gap:12px 32px;margin:24px 0 0;padding:16px;border-top:1px solid var(--line);font-size:13px}
 .site-footer[data-background=soft]{background:var(--soft);border-radius:10px}
+/* text on --soft is drawn in --text, not the accent: the contrast checks cover the accent only on
+   the paper and the background. Links there keep an underline so they still read as links */
+.site-footer[data-background=soft] a,.site-header[data-background=soft] a{color:var(--text);text-decoration:underline}
+.site-header[data-background=soft] a.site-brand{text-decoration:none}
+.navbar li>a:hover,.navbar a[aria-current],.sitenav a[aria-current],.navbar button.sub-toggle[aria-expanded=true],#view-switch button[aria-pressed=true]{color:var(--text)}
+/* in the editor frame the look is set on the bar and the navigation only; their tint follows it */
+.bar,.frame>.chrome{--soft:color-mix(in srgb,var(--accent) 11%,var(--paper))}
 .site-footer[data-background=strong]{background:var(--header-bg);color:var(--header-ink);border-top:0;border-radius:10px}
 .site-footer[data-background=strong] a{color:inherit}
 .site-footer[data-background=strong] :focus-visible{outline-color:var(--header-ink)}
