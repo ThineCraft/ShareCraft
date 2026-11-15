@@ -1977,3 +1977,169 @@ async fn site_lists_carry_thumbnail_and_accent() {
     assert_eq!(seen["accent"], plum);
     assert_eq!(seen["thumbnail_url"], image_url(&thumb));
 }
+
+/// Whether `site`'s look pins the content `bytes`.
+async fn pinned_by(server: &Site, site: &str, bytes: &[u8]) -> bool {
+    let found: Option<String> =
+        sqlx::query_scalar("select sha256 from brand_refs where owner = $1 and sha256 = $2")
+            .bind(site)
+            .bind(sha(bytes))
+            .fetch_optional(server.records_db().test_pool())
+            .await
+            .unwrap();
+    found.is_some()
+}
+
+#[tokio::test]
+async fn keep_accepts_history_snapshots() {
+    let server = spawn_server().await;
+    let root = server.admin("Root").await;
+    let (team, documents) = create_site(&server, &root, "Team").await;
+    let first = png(12, 12);
+    let mark = png(13, 13);
+    let second = png(14, 14);
+    let first_doc = upload(&server, &root, &documents, "First.png", &first).await;
+    let mark_doc = upload(&server, &root, &documents, "Mark.png", &mark).await;
+    let second_doc = upload(&server, &root, &documents, "Second.png", &second).await;
+    set_look(
+        &server,
+        &root,
+        &team,
+        json!({ "theme": { "from": "builtin:sharecraft" }, "logo": { "doc": first_doc },
+                "thumbnail": { "doc": mark_doc } }),
+    )
+    .await;
+    // The look moves on: the first logo and the mark are no longer used by it.
+    set_look(
+        &server,
+        &root,
+        &team,
+        json!({ "theme": { "from": "builtin:sharecraft" }, "logo": { "doc": second_doc } }),
+    )
+    .await;
+    assert!(!pinned_by(&server, &team, &first).await);
+    // Their files change since: a snapshot is kept, never taken again from its document.
+    let (status, body) = call(
+        &server,
+        Some(&root),
+        Method::DELETE,
+        &format!("/api/nodes/{first_doc}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    // A look holding images named only by its history keeps those exact snapshots.
+    let answer = set_look(
+        &server,
+        &root,
+        &team,
+        json!({ "theme": { "from": "builtin:plum" },
+                "logo": { "keep": sha(&first) }, "thumbnail": { "keep": sha(&mark) } }),
+    )
+    .await;
+    assert_eq!(answer["look"]["logo"]["sha256"], sha(&first));
+    assert_eq!(answer["look"]["logo"]["name"], "First.png");
+    assert_eq!(answer["look"]["thumbnail"]["sha256"], sha(&mark));
+    let git = look_in_git(&server, &team).unwrap();
+    assert_eq!(git.logo.unwrap().sha256, sha(&first));
+    assert_eq!(git.thumbnail.unwrap().sha256, sha(&mark));
+    // Pinned again with the look change.
+    assert!(pinned_by(&server, &team, &first).await);
+    assert!(pinned_by(&server, &team, &mark).await);
+    assert_eq!(
+        fetch(&server, &root, &image_url(&first)).await,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn keep_refuses_unknown_and_gone_snapshots() {
+    let server = spawn_server().await;
+    let root = server.admin("Root").await;
+    let (team, documents) = create_site(&server, &root, "Team").await;
+    let (other, other_documents) = create_site(&server, &root, "Other").await;
+    let first = png(15, 15);
+    let mark = png(16, 16);
+    let second = png(17, 17);
+    let elsewhere = png(18, 18);
+    let first_doc = upload(&server, &root, &documents, "First.png", &first).await;
+    let mark_doc = upload(&server, &root, &documents, "Mark.png", &mark).await;
+    let second_doc = upload(&server, &root, &documents, "Second.png", &second).await;
+    let elsewhere_doc = upload(&server, &root, &other_documents, "Else.png", &elsewhere).await;
+    set_look(
+        &server,
+        &root,
+        &other,
+        json!({ "theme": { "from": "builtin:sharecraft" }, "logo": { "doc": elsewhere_doc } }),
+    )
+    .await;
+    set_look(
+        &server,
+        &root,
+        &team,
+        json!({ "theme": { "from": "builtin:sharecraft" }, "logo": { "doc": first_doc },
+                "thumbnail": { "doc": mark_doc } }),
+    )
+    .await;
+    // The first logo's file is deleted for good and the look moves on: its content is erased.
+    delete_for_good(&server, &root, &first_doc).await;
+    set_look(
+        &server,
+        &root,
+        &team,
+        json!({ "theme": { "from": "builtin:sharecraft" }, "logo": { "doc": second_doc } }),
+    )
+    .await;
+    assert!(!server.blobs().contains(&hash(&first)));
+    let before = tip(&server);
+
+    // Content no history entry of this site names: not even another site's look.
+    for unknown in [sha(&elsewhere), "0".repeat(64)] {
+        let (status, body) = put_look(
+            &server,
+            &root,
+            &team,
+            json!({ "theme": { "from": "builtin:sharecraft" }, "logo": { "keep": unknown } }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["error"], "invalid_look");
+    }
+    // A snapshot whose content is gone.
+    let (status, body) = put_look(
+        &server,
+        &root,
+        &team,
+        json!({ "theme": { "from": "builtin:sharecraft" }, "logo": { "keep": sha(&first) } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body, json!({ "error": "image_gone", "slots": ["logo"] }));
+    // A snapshot a rescan found infected.
+    sqlx::query(
+        "update blobs set scan = 'infected', scan_detail = 'Test-Signature' where sha256 = $1",
+    )
+    .bind(sha(&mark))
+    .execute(server.records_db().test_pool())
+    .await
+    .unwrap();
+    let (status, body) = put_look(
+        &server,
+        &root,
+        &team,
+        json!({ "theme": { "from": "builtin:sharecraft" }, "logo": { "keep": sha(&first) },
+                "thumbnail": { "keep": sha(&mark) } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(
+        body,
+        json!({ "error": "image_gone", "slots": ["logo", "thumbnail"] })
+    );
+    assert_eq!(tip(&server), before);
+    assert_eq!(
+        look_in_git(&server, &team).unwrap().logo.unwrap().sha256,
+        sha(&second)
+    );
+}

@@ -37,6 +37,7 @@ import {
   draftImageUrl,
   hexOf,
   lookSession,
+  mayReplaceDraft,
   parseColour,
   previewEffective,
   sameTheme,
@@ -557,7 +558,8 @@ function drawHistory() {
       const who = entry.by?.name ?? 'Someone no longer here';
       const theme = entry.look?.theme?.name ?? 'ShareCraft';
       const preview = h('button', { type: 'button', class: 'plain', 'aria-label': `Preview the look of ${when}` }, 'Preview');
-      preview.addEventListener('click', () => {
+      preview.addEventListener('click', async () => {
+        if (!(await mayReplaceDraft(session, () => confirmDialog('Previewing this look drops the changes you have not applied. Preview it?', 'Preview')))) return;
         session.preview(entry);
         fill();
         note(`The look of ${when} is now the draft. Apply it to use it.`, true);
@@ -577,7 +579,7 @@ function drawHistory() {
 
 async function restoreEntry(entry, when) {
   note('');
-  if (session.status().dirty && !(await confirmDialog('Restoring drops the changes you have not applied. Restore?', 'Restore'))) return;
+  if (!(await mayReplaceDraft(session, () => confirmDialog('Restoring drops the changes you have not applied. Restore?', 'Restore')))) return;
   const result = await session.restore(entry);
   if (result.ok) {
     siteThemes = session.settings.themes ?? siteThemes;

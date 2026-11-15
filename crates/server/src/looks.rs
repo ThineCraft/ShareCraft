@@ -43,8 +43,9 @@ pub(crate) const HISTORY_LENGTH: i64 = 50;
 // What a person sends
 
 /// An image chosen for a slot of a look: exactly one of `doc` (the current version of a
-/// document), `brand_image` (an image of the brand centre, by id) or `keep` (the image the look
-/// holds now with this content hash).
+/// document), `brand_image` (an image of the brand centre, by id) or `keep` (the image with this
+/// content hash that the look holds now, or that one of the last [`HISTORY_LENGTH`] entries of
+/// its history names, before or after, as the exact snapshot recorded then).
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ImageSlot {
@@ -217,15 +218,88 @@ struct SlotContext<'a> {
     site: NodeId,
     /// The images the look holds now, which `keep` may name.
     current: Vec<&'a ImageRef>,
+    /// The images the last [`HISTORY_LENGTH`] entries of the look's history name (before or
+    /// after), which `keep` may name too.
+    history: Vec<ImageRef>,
     org: &'a OrgBrand,
+}
+
+/// Every image the last [`HISTORY_LENGTH`] changes of the look of `site` name, before or after
+/// each change. An entry that cannot be read as a look names none.
+async fn history_images(db: &Db, site: NodeId) -> Result<Vec<ImageRef>, BrandError> {
+    let mut images: Vec<ImageRef> = Vec::new();
+    for change in db.look_changes(site, HISTORY_LENGTH).await? {
+        for side in [change.before, change.after] {
+            let Ok(look) = serde_json::from_value::<Look>(side) else {
+                continue;
+            };
+            for (_, image) in slots(&look) {
+                if !images.iter().any(|i| i.sha256 == image.sha256) {
+                    images.push(image.clone());
+                }
+            }
+        }
+    }
+    Ok(images)
+}
+
+/// Refuses with `409 image_gone {slots}` when an image `input` keeps from the look's history
+/// (not one the look holds now) has content that is no longer stored, or not available (held
+/// or quarantined after a rescan). Keeps of content the history does not name are left to
+/// [`slot_image`] to refuse.
+async fn history_keeps_available(
+    ctx: &SlotContext<'_>,
+    input: &LookInput,
+) -> Result<(), BrandError> {
+    let header = input.header.as_ref().and_then(|h| h.image.as_ref());
+    let footer = input.footer.as_ref().and_then(|f| f.logo.as_ref());
+    let kept: Vec<(&'static str, &str)> = [
+        ("logo", input.logo.as_ref()),
+        ("thumbnail", input.thumbnail.as_ref()),
+        ("header.image", header),
+        ("footer.logo", footer),
+    ]
+    .into_iter()
+    .filter_map(|(name, slot)| {
+        let slot = slot?;
+        if slot.doc.is_some() || slot.brand_image.is_some() {
+            return None;
+        }
+        let sha = slot.keep.as_deref()?;
+        let from_history = !ctx.current.iter().any(|i| i.sha256 == sha)
+            && ctx.history.iter().any(|i| i.sha256 == sha);
+        from_history.then_some((name, sha))
+    })
+    .collect();
+    if kept.is_empty() {
+        return Ok(());
+    }
+    let db = ctx.state.db();
+    let hashes: Vec<String> = kept.iter().map(|(_, sha)| (*sha).to_owned()).collect();
+    let missing = db.missing_blobs(&hashes).await?;
+    let mut gone = Vec::new();
+    for (name, sha) in kept {
+        let held = match revisions::parse_hex(sha) {
+            Some(hash) => db.availability(&hash).await?.is_some(),
+            None => true,
+        };
+        if held || missing.iter().any(|m| m == sha) {
+            gone.push(name);
+        }
+    }
+    if gone.is_empty() {
+        Ok(())
+    } else {
+        Err(BrandError::ImagesGone(gone))
+    }
 }
 
 /// The image `slot` asks for, for a slot of `kind`'s size.
 ///
 /// # Errors
 /// `InvalidLook` for a slot that gives no way or more than one, an unknown brand image, or a
-/// `keep` of an image the look does not hold; `413 image_too_large`; `423 held`; and those of
-/// [`image_from_doc`].
+/// `keep` of an image neither the look nor its history holds; `413 image_too_large`; `423
+/// held`; and those of [`image_from_doc`].
 async fn slot_image(
     ctx: &SlotContext<'_>,
     slot: Option<ImageSlot>,
@@ -259,10 +333,14 @@ async fn slot_image(
         (None, None, Some(sha)) => ctx
             .current
             .iter()
+            .copied()
+            .chain(ctx.history.iter())
             .find(|image| image.sha256 == sha)
-            .map(|image| Some((*image).clone()))
+            .map(|image| Some(image.clone()))
             .ok_or_else(|| {
-                BrandError::InvalidLook("only an image the look holds now can be kept".into())
+                BrandError::InvalidLook(
+                    "only an image the look holds now or had in its history can be kept".into(),
+                )
             }),
         _ => Err(BrandError::InvalidLook(
             "an image is given as one of {doc}, {brand_image} or {keep}".into(),
@@ -453,8 +531,10 @@ pub(crate) async fn set_look(
             actor,
             site,
             current: before.look.iter().flat_map(slots).map(|(_, i)| i).collect(),
+            history: history_images(state.db(), site).await?,
             org: &org,
         };
+        history_keeps_available(&ctx, &input).await?;
         let look = built_look(&ctx, &name, &before.themes, input).await?;
         commit_look(
             state,

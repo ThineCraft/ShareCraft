@@ -348,22 +348,21 @@ test('history_entry_loads_as_draft', () => {
   session.preview({ event_id: 1, look: null });
   assert.equal(session.draft.from, 'builtin:sharecraft');
   assert.equal(session.draft.logo, null);
-  // Applying a previewed look keeps what the site holds, re-chooses the rest from its document.
-  const input = lookInput(draftFromLook(older), { current: STORED, themes: THEMES, brandImages: [] });
+  // Applying a previewed look keeps its exact image snapshots, never re-taking them from their
+  // documents, even when the brand centre holds the same content.
+  const input = lookInput(draftFromLook(older), { themes: THEMES });
   assert.deepEqual(input.theme, { from: 'builtin:plum' });
-  assert.deepEqual(input.logo, { doc: DOC_B });
-  const withBrand = lookInput(draftFromLook(older), {
-    current: STORED,
-    themes: THEMES,
-    brandImages: [{ id: 'img-1', kind: 'logo', name: 'Old logo', url: `/api/brand/images/${SHA_B}` }],
-  });
-  assert.deepEqual(withBrand.logo, { brand_image: 'img-1' });
+  assert.deepEqual(input.logo, { keep: SHA_B });
+  assert.ok(!JSON.stringify(input).includes(DOC_B), 'no image is chosen from its document again');
+  // An image replaced in the picker is sent as chosen.
+  const replaced = draftFromLook(older);
+  replaced.logo = { doc: DOC_A, name: 'New.png' };
+  replaced.thumbnail = { brand_image: 'img-1', sha256: SHA_C, name: 'Mark' };
+  const chosen = lookInput(replaced, { themes: THEMES });
+  assert.deepEqual(chosen.logo, { doc: DOC_A });
+  assert.deepEqual(chosen.thumbnail, { brand_image: 'img-1' });
   // A theme changed since in the brand centre is sent as the copy the draft holds.
-  const changed = lookInput(draftFromLook(older), {
-    current: STORED,
-    themes: [{ ...THEMES[1], primary: '#6a2e7f' }],
-    brandImages: [],
-  });
+  const changed = lookInput(draftFromLook(older), { themes: [{ ...THEMES[1], primary: '#6a2e7f' }] });
   assert.deepEqual(changed.theme, { name: 'Plum', primary: '#7a3e8f', secondary: '#3b2244' });
 });
 
@@ -484,4 +483,44 @@ test('look_input_sends_only_what_the_layout_uses', () => {
   const session = lookSession({ siteId: SITE_ID, settings: settingsOf(STORED), themes: THEMES, brandImages: [], send });
   session.change((d) => d.footer.groups.push({ heading: '', links: [{ label: '', url: '' }] }));
   assert.equal(session.status().dirty, false);
+});
+
+import { mayReplaceDraft } from './look.js';
+
+test('history_preview_asks_before_dropping_changes', async () => {
+  const { send } = sender();
+  const session = lookSession({ siteId: SITE_ID, settings: settingsOf(STORED), themes: THEMES, brandImages: [], send });
+  const entry = { event_id: 4, look: { ...structuredClone(STORED), navigation: 'vertical' } };
+  let asked = 0;
+  const answer = (yes) => async () => {
+    asked += 1;
+    return yes;
+  };
+  // Nothing unapplied: no question.
+  assert.equal(await mayReplaceDraft(session, answer(false)), true);
+  assert.equal(asked, 0);
+  // Unapplied changes: asked, and kept when the person says no.
+  session.change((draft) => (draft.header.layout = 'standard'));
+  assert.equal(await mayReplaceDraft(session, answer(false)), false);
+  assert.equal(asked, 1);
+  assert.equal(session.draft.header.layout, 'standard', 'the draft is untouched');
+  // Replaced only after a yes.
+  assert.equal(await mayReplaceDraft(session, answer(true)), true);
+  session.preview(entry);
+  assert.equal(session.draft.navigation, 'vertical');
+});
+
+test('image_gone_draft_applied_as_it_is_keeps_its_other_snapshots', async () => {
+  const answers = [
+    { ok: false, status: 409, error: 'image_gone', data: { error: 'image_gone', slots: ['logo'] } },
+    { ok: true, status: 200, data: settingsOf(STORED) },
+  ];
+  const { calls, send } = sender(() => answers.shift());
+  const session = lookSession({ siteId: SITE_ID, settings: settingsOf(STORED), themes: THEMES, brandImages: [], send });
+  const older = { ...structuredClone(STORED), logo: ref(SHA_B, DOC_B, 'Gone.png'), thumbnail: ref(SHA_C, DOC_A, 'Mark.png') };
+  await session.restore({ event_id: 9, look: older });
+  assert.equal((await session.apply()).ok, true);
+  const look = calls[1].body.look;
+  assert.equal(look.logo, undefined, 'the gone image is left out');
+  assert.deepEqual(look.thumbnail, { keep: SHA_C }, 'the other snapshot is kept, not re-taken');
 });

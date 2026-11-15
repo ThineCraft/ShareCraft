@@ -476,37 +476,27 @@ export function previewEffective(draft, siteName) {
   return out;
 }
 
-/** Every image hash of a stored look. */
-function lookHashes(look) {
-  return [look?.logo, look?.thumbnail, look?.header?.image, look?.footer?.logo]
-    .map((image) => image?.sha256)
-    .filter((sha) => typeof sha === 'string');
-}
-
 /**
- * How a draft image is sent: `{doc}` or `{brand_image}` as chosen; an image the look holds now
- * as `{keep}`; else (an image from an earlier look) the brand-centre image with the same
- * content, or its document again; null for none.
+ * How a draft image is sent: `{doc}` or `{brand_image}` as chosen in the picker; an image the
+ * draft took from a stored look (the current one or a history entry) as `{keep}`, so its exact
+ * snapshot is kept and never taken again from its document; null for none. The server keeps
+ * an image the look holds now or one its history names, and answers `409 image_gone` when that
+ * content is no longer stored or available.
  */
-function slotInput(image, current, brandImages) {
+function slotInput(image) {
   if (!image) return null;
   if (typeof image.doc === 'string') return { doc: image.doc };
   if (typeof image.brand_image === 'string') return { brand_image: image.brand_image };
-  if (typeof image.sha256 !== 'string') return null;
-  if (lookHashes(current).includes(image.sha256)) return { keep: image.sha256 };
-  const brand = (brandImages ?? []).find((b) => shaOfUrl(b.url) === image.sha256);
-  if (brand) return { brand_image: brand.id };
-  return typeof image.from_doc === 'string' ? { doc: image.from_doc } : null;
+  return typeof image.sha256 === 'string' ? { keep: image.sha256 } : null;
 }
 
 /**
- * The body Apply sends as `look` (`PUT /api/sites/{id}/look`) for `draft`. `current` is the
- * look the site has now (stored), `themes` every theme the page offers (`{from, name,
- * primary, ...}`), `brandImages` the brand centre's images. A theme still the same as its
- * source is sent by its source; otherwise (custom, or changed or gone at its source) as the
- * colours the draft holds.
+ * The body Apply sends as `look` (`PUT /api/sites/{id}/look`) for `draft`. `themes` is every
+ * theme the page offers (`{from, name, primary, ...}`). A theme still the same as its source is
+ * sent by its source; otherwise (custom, or changed or gone at its source) as the colours the
+ * draft holds. Images are sent as [`slotInput`] says.
  */
-export function lookInput(draft, { current = null, themes = [], brandImages = [] } = {}) {
+export function lookInput(draft, { themes = [] } = {}) {
   const source = draft.from !== 'custom' ? themes.find((t) => t.from === draft.from) : null;
   const theme = source && sameTheme(source, draft.theme) ? { from: draft.from } : themeOf(draft.theme);
   // The draft keeps every choice while the person tries layouts; what is sent is only what the
@@ -533,7 +523,7 @@ export function lookInput(draft, { current = null, themes = [], brandImages = []
     },
   };
   const slot = (target, key, image) => {
-    const value = slotInput(image, current, brandImages);
+    const value = slotInput(image);
     if (value) target[key] = value;
   };
   slot(out, 'logo', draft.logo);
@@ -670,7 +660,7 @@ export function lookSession({ siteId, settings, themes = [], brandImages = [], s
     /** Sends the draft. Answers the `api` result; on success the answer is the saved look. */
     async apply() {
       if (!session.status().canApply) return { ok: false, error: null };
-      const body = { look: lookInput(draft, { current: saved?.look, themes, brandImages }) };
+      const body = { look: lookInput(draft, { themes }) };
       const result = await send('PUT', `${path}/look`, body);
       if (result.ok) take(result.data);
       return result;
@@ -701,6 +691,16 @@ export function lookSession({ siteId, settings, themes = [], brandImages = [], s
     },
   };
   return session;
+}
+
+/**
+ * Whether the draft of `session` may be replaced (by a history entry's Preview or Restore):
+ * at once when it has no changes that are not applied, else only when `ask()` (a confirmation
+ * the page shows) resolves true.
+ */
+export async function mayReplaceDraft(session, ask) {
+  if (!session.status().dirty) return true;
+  return Boolean(await ask());
 }
 
 /**
