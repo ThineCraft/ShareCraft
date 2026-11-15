@@ -672,7 +672,7 @@ impl Db {
     }
 
     /// At most `limit` contents due for the scanner as of `now`: pending or failed, due, and
-    /// named by some version (or a claim); held content (an upload's) before any other, so the
+    /// named by some version (or a claim) or pinned by a brand image; held content (an upload's) before any other, so the
     /// backlog "scan existing files" queues never keeps uploads waiting, then the longest
     /// waiting first.
     pub async fn due_scans(
@@ -687,7 +687,8 @@ impl Db {
              from blobs b \
              where b.scan in ('pending', 'failed') \
                and coalesce(b.next_scan_at, '-infinity') <= $1 \
-               and exists (select 1 from blob_refs r where r.sha256 = b.sha256) \
+               and (exists (select 1 from blob_refs r where r.sha256 = b.sha256) \
+                    or exists (select 1 from brand_refs p where p.sha256 = b.sha256)) \
              order by b.scan_hold desc, b.next_scan_at nulls first, b.sha256 limit $2",
         )
         .bind(now)
@@ -708,15 +709,16 @@ impl Db {
             .collect())
     }
 
-    /// Queues every unscanned content that some version names for the scanner; how many. It
-    /// stays available while it waits (its hold cleared: it was available before), and is
-    /// quarantined if the scanner finds it infected.
+    /// Queues every unscanned content that some version names, or a brand image pins, for the
+    /// scanner; how many. It stays available while it waits (its hold cleared: it was
+    /// available before), and is quarantined if the scanner finds it infected.
     pub async fn queue_unscanned(&self) -> Result<u64, DbError> {
         let done = sqlx::query(
             "update blobs b set scan = 'pending', next_scan_at = now(), scan_attempts = 0, \
                  scan_hold = false \
              where b.scan = 'unscanned' \
-               and exists (select 1 from blob_refs r where r.sha256 = b.sha256)",
+               and (exists (select 1 from blob_refs r where r.sha256 = b.sha256) \
+                    or exists (select 1 from brand_refs p where p.sha256 = b.sha256))",
         )
         .execute(self.pool())
         .await?;

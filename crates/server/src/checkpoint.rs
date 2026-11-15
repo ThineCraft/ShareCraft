@@ -186,6 +186,14 @@ pub trait Checkpointer: Send + Sync + 'static {
     fn read_org_navigation(&self) -> Result<Option<revisions::OrgNavigation>, CheckpointError> {
         Err(CheckpointError::Unsupported)
     }
+
+    /// The organisation's brand centre; `None` if none was ever recorded.
+    ///
+    /// # Errors
+    /// Whatever the store reports; `Unsupported` unless the implementation keeps it.
+    fn read_org_brand(&self) -> Result<Option<revisions::brand::OrgBrand>, CheckpointError> {
+        Err(CheckpointError::Unsupported)
+    }
 }
 
 impl Checkpointer for RevisionStore {
@@ -272,6 +280,10 @@ impl Checkpointer for RevisionStore {
 
     fn read_org_navigation(&self) -> Result<Option<revisions::OrgNavigation>, CheckpointError> {
         RevisionStore::read_org_navigation(self)
+    }
+
+    fn read_org_brand(&self) -> Result<Option<revisions::brand::OrgBrand>, CheckpointError> {
+        RevisionStore::read_org_brand(self)
     }
 }
 

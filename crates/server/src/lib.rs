@@ -9,6 +9,7 @@
 mod api;
 mod auth;
 mod blobs;
+mod brand;
 mod checkpoint;
 pub mod cli;
 pub mod config;

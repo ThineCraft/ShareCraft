@@ -22,6 +22,7 @@ use records::{
     validate_time_zone,
 };
 use records::{Origin, check_name, check_size};
+use revisions::brand::OrgBrand;
 use revisions::{
     Author, BlobRef, Checkpoint, CheckpointError, Content, GitError, LibraryFields, LibraryRecord,
     OrgNavigation, SITE_SCHEMA, SiteRecord, SitesChange, Stamp, TemplateBody, TemplateFolder,
@@ -189,9 +190,9 @@ pub(crate) struct PendingUndo {
 
 /// What takes a change back, written as one commit: tree records, site records, sites whose
 /// record is removed (their creation taken back), saved templates put back, templates whose
-/// record is removed (their saving taken back), the global navigation put back, library
-/// records put back and libraries whose record is removed (a creation, or the first change of
-/// a library with no record, taken back).
+/// record is removed (their saving taken back), the global navigation put back, the brand
+/// centre put back, library records put back and libraries whose record is removed (a
+/// creation, or the first change of a library with no record, taken back).
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Undo {
     pub(crate) records: Vec<TreeRecord>,
@@ -201,6 +202,8 @@ pub(crate) struct Undo {
     pub(crate) removed_templates: Vec<Uuid>,
     /// The global navigation put back.
     pub(crate) org_navigation: Option<OrgNavigation>,
+    /// The brand centre put back.
+    pub(crate) org_brand: Option<OrgBrand>,
     pub(crate) libraries: Vec<LibraryRecord>,
     pub(crate) removed_libraries: Vec<Uuid>,
 }
@@ -213,6 +216,7 @@ impl Undo {
             && self.templates.is_empty()
             && self.removed_templates.is_empty()
             && self.org_navigation.is_none()
+            && self.org_brand.is_none()
             && self.libraries.is_empty()
             && self.removed_libraries.is_empty()
     }
@@ -3226,6 +3230,7 @@ pub(crate) async fn write_records(
         change.templates = &records.templates;
         change.removed_templates = &records.removed_templates;
         change.org_navigation = records.org_navigation.as_ref();
+        change.org_brand = records.org_brand.as_ref();
         change.libraries = &records.libraries;
         change.removed_libraries = &records.removed_libraries;
         store.write_sites(&change).map(|_| ())

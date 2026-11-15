@@ -3,6 +3,7 @@
 
 mod admin;
 mod bin;
+mod brand;
 mod bulk;
 pub(crate) mod content;
 mod docs;
@@ -92,6 +93,18 @@ pub(crate) fn router() -> Router<AppState> {
                 .put(navigation::set_global)
                 .layer(DefaultBodyLimit::max(navigation::MAX_NAVIGATION_BODY)),
         )
+        .route("/brand", get(brand::show))
+        .route("/brand/themes", post(brand::create_theme))
+        .route(
+            "/brand/themes/{id}",
+            patch(brand::change_theme).delete(brand::delete_theme),
+        )
+        .route("/brand/images", post(brand::add_image))
+        .route(
+            "/brand/images/{id}",
+            get(brand::image).delete(brand::remove_image),
+        )
+        .route("/brand/managers", put(brand::set_managers))
         .route("/hubs", get(navigation::hubs))
         .route("/hubs/{id}/sites", get(navigation::hub_sites))
         .route("/sites/{id}/template", post(templates::save))
@@ -369,6 +382,16 @@ pub(crate) enum ApiError {
     InvalidRange,
     /// 507: the site has no room left under its storage quota for what would be stored.
     QuotaExceeded,
+    /// 422: the file is not a brand image: not PNG, JPEG, WebP, GIF or a safe SVG, judged by
+    /// its content.
+    NotAnImage,
+    /// 413: the image is larger than its slot takes (1 MiB, or 5 MiB for a background), or
+    /// more than 8,000 pixels on a side.
+    ImageTooLarge,
+    /// 409: a brand image's content is no longer stored.
+    ImageGone,
+    /// 409: there are already as many as allowed; the answer's `limit` says how many.
+    TooMany(usize),
     /// 503: the database failed.
     Unavailable,
 }
@@ -456,6 +479,10 @@ impl ApiError {
             ApiError::TooManyUploads => (StatusCode::TOO_MANY_REQUESTS, "too_many_uploads"),
             ApiError::InvalidRange => (StatusCode::BAD_REQUEST, "invalid_range"),
             ApiError::QuotaExceeded => (StatusCode::INSUFFICIENT_STORAGE, "quota_exceeded"),
+            ApiError::NotAnImage => (StatusCode::UNPROCESSABLE_ENTITY, "not_an_image"),
+            ApiError::ImageTooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "image_too_large"),
+            ApiError::ImageGone => (StatusCode::CONFLICT, "image_gone"),
+            ApiError::TooMany(_) => (StatusCode::CONFLICT, "too_many"),
             ApiError::Unavailable => (StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
         }
     }
@@ -512,6 +539,7 @@ impl From<AccessError> for ApiError {
             AccessError::NotAHub => ApiError::NotAHub,
             AccessError::IsHub => ApiError::IsHub,
             AccessError::QuotaExceeded => ApiError::QuotaExceeded,
+            AccessError::ImageGone => ApiError::ImageGone,
             // The server picks a fresh random id, so a clash is not the caller's doing.
             AccessError::Exists | AccessError::Db(_) | AccessError::Unjudged(_) => {
                 ApiError::unavailable(&e)
@@ -676,6 +704,7 @@ impl IntoResponse for ApiError {
             }
             ApiError::FileTooLarge(limit) => json!({ "error": code, "limit": limit }),
             ApiError::Held(scan) => json!({ "error": code, "scan": scan }),
+            ApiError::TooMany(limit) => json!({ "error": code, "limit": limit }),
             _ => json!({ "error": code }),
         };
         (status, Json(body)).into_response()

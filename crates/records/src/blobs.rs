@@ -42,7 +42,10 @@ fn size_of(blob: &BlobRef) -> i64 {
 /// scanner is configured, `pending` and held (`scan_hold`) until it is scanned, since its scan
 /// verdict, if it ever had one, lived only in a database that has been lost or restored from
 /// an older backup; `unscanned` otherwise. An existing row is left as it is.
-async fn upsert_blob(conn: &mut PgConnection, blob: &BlobRef) -> Result<(), sqlx::Error> {
+pub(crate) async fn upsert_blob(
+    conn: &mut PgConnection,
+    blob: &BlobRef,
+) -> Result<(), sqlx::Error> {
     sqlx::query(
         "insert into blobs (sha256, size, scan, next_scan_at, scan_hold) \
          select $1, $2, case when s then 'pending' else 'unscanned' end, \
@@ -233,8 +236,9 @@ impl Db {
     }
 
     /// Deletes the row of the content `sha256` if no `blob_refs` row names it, pending ones
-    /// included, with the row locked `FOR UPDATE` while counting. Answers whether nothing names
-    /// it now (also when it had no row), in which case the caller erases the file.
+    /// included, and no brand image pins it (`brand_refs`, see [`crate::BrandChange`]), with
+    /// the row locked `FOR UPDATE` while counting. Answers whether nothing names it now (also
+    /// when it had no row), in which case the caller erases the file.
     pub async fn release_blob_if_unreferenced(&self, sha256: &[u8; 32]) -> Result<bool, DbError> {
         let hash = hex(sha256);
         let mut tx = self.pool().begin().await?;
@@ -246,10 +250,13 @@ impl Db {
         if found.is_none() {
             return Ok(true);
         }
-        let named: i64 = sqlx::query_scalar("select count(*) from blob_refs where sha256 = $1")
-            .bind(&hash)
-            .fetch_one(&mut *tx)
-            .await?;
+        let named: i64 = sqlx::query_scalar(
+            "select (select count(*) from blob_refs where sha256 = $1) \
+                    + (select count(*) from brand_refs where sha256 = $1)",
+        )
+        .bind(&hash)
+        .fetch_one(&mut *tx)
+        .await?;
         if named > 0 {
             return Ok(false);
         }
@@ -293,7 +300,8 @@ impl Db {
         Ok(found)
     }
 
-    /// The contents with a row created before `before` that no `blob_refs` row names.
+    /// The contents with a row created before `before` that no `blob_refs` row names and no
+    /// brand image pins.
     pub async fn unreferenced_blobs(
         &self,
         before: OffsetDateTime,
@@ -302,6 +310,7 @@ impl Db {
             "select b.sha256 from blobs b \
              where b.created_at < $1 \
                and not exists (select 1 from blob_refs r where r.sha256 = b.sha256) \
+               and not exists (select 1 from brand_refs p where p.sha256 = b.sha256) \
              order by b.sha256",
         )
         .bind(before)

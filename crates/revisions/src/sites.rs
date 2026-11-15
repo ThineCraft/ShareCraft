@@ -3,7 +3,8 @@
 //!
 //! A site's record lives at `sites/<first two hex digits of the id>/<id>.json` beside its tree
 //! record, a saved template at `templates/<xx>/<id>.json`, and the global navigation at
-//! `org/navigation.json`. `refs/sharecraft/sites` names the last commit that changed any of
+//! `org/navigation.json` and the brand centre at `org/brand.json` (see [`crate::brand`]).
+//! `refs/sharecraft/sites` names the last commit that changed any of
 //! them. A change that also changes the tree (creating a site, renaming one) writes both in one
 //! commit, which moves `refs/sharecraft/tree` as well.
 
@@ -12,6 +13,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::brand::OrgBrand;
 use crate::libraries::{LibraryFields, LibraryRecord, library_path};
 use crate::meta::Author;
 use crate::store::{
@@ -35,6 +37,8 @@ const SITES_DIR: &str = "sites";
 const TEMPLATES_DIR: &str = "templates";
 /// Where the organisation's global navigation is recorded.
 const ORG_NAVIGATION_PATH: &str = "org/navigation.json";
+/// Where the organisation's brand centre is recorded.
+const ORG_BRAND_PATH: &str = "org/brand.json";
 
 /// Where a navigation link leads.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -281,6 +285,8 @@ pub struct SitesChange<'a> {
     pub removed_templates: &'a [Uuid],
     /// The global navigation, if it changes.
     pub org_navigation: Option<&'a OrgNavigation>,
+    /// The brand centre, if it changes.
+    pub org_brand: Option<&'a OrgBrand>,
     /// Library records to write, each replacing any stored for the same library.
     pub libraries: &'a [LibraryRecord],
     /// Libraries whose record is removed: a creation taken back.
@@ -300,13 +306,14 @@ impl<'a> SitesChange<'a> {
             templates: &[],
             removed_templates: &[],
             org_navigation: None,
+            org_brand: None,
             libraries: &[],
             removed_libraries: &[],
         }
     }
 
-    /// Whether the change writes nothing of sites, libraries, templates or the global
-    /// navigation.
+    /// Whether the change writes nothing of sites, libraries, templates, the global navigation
+    /// or the brand centre.
     fn is_empty(&self) -> bool {
         self.libraries.is_empty()
             && self.removed_libraries.is_empty()
@@ -315,6 +322,7 @@ impl<'a> SitesChange<'a> {
             && self.templates.is_empty()
             && self.removed_templates.is_empty()
             && self.org_navigation.is_none()
+            && self.org_brand.is_none()
     }
 }
 
@@ -416,7 +424,8 @@ impl RevisionStore {
     pub fn write_sites(&self, change: &SitesChange<'_>) -> Result<RevisionId, CheckpointError> {
         if change.is_empty() {
             return Err(CheckpointError::InvalidTreeChange(
-                "a sites change needs at least one site, library, template or navigation record"
+                "a sites change needs at least one site, library, template, navigation or brand \
+                 record"
                     .into(),
             ));
         }
@@ -455,6 +464,12 @@ impl RevisionStore {
                 return Err(CheckpointError::InvalidTreeChange(problem));
             }
             files.push((ORG_NAVIGATION_PATH.to_owned(), file_bytes(navigation)?));
+        }
+        if let Some(brand) = change.org_brand {
+            if let Some(problem) = brand.problem() {
+                return Err(CheckpointError::InvalidTreeChange(problem));
+            }
+            files.push((ORG_BRAND_PATH.to_owned(), file_bytes(brand)?));
         }
         let removed: Vec<String> = change
             .removed_sites
@@ -559,6 +574,26 @@ impl RevisionStore {
             ));
         }
         Ok(Some(navigation))
+    }
+
+    /// The brand centre on `main`; `None` if none was ever recorded.
+    ///
+    /// # Errors
+    /// `Corrupt` if it cannot be read or breaks a rule of [`OrgBrand::problem`], otherwise the
+    /// Git error.
+    pub fn read_org_brand(&self) -> Result<Option<OrgBrand>, CheckpointError> {
+        let repo = self.repo()?;
+        let Some(commit) = main_tip(&repo)? else {
+            return Ok(None);
+        };
+        let Some(bytes) = read_blob(&commit.tree()?, ORG_BRAND_PATH)? else {
+            return Ok(None);
+        };
+        let brand: OrgBrand = parse(&commit, ORG_BRAND_PATH, &bytes)?;
+        if let Some(problem) = brand.problem() {
+            return Err(corrupt(&commit, format!("{ORG_BRAND_PATH}: {problem}")));
+        }
+        Ok(Some(brand))
     }
 }
 
@@ -801,6 +836,45 @@ mod tests {
         let text = r#"{"kind": "team", "language": "en", "time_zone": "UTC",
             "libraries": [], "navigation": null, "files": []}"#;
         assert!(serde_json::from_str::<TemplateBody>(text).is_err());
+    }
+
+    #[test]
+    fn brand_centre_round_trip() {
+        let (_dir, store) = store();
+        assert_eq!(store.read_org_brand().unwrap(), None);
+        let mut brand = OrgBrand::default();
+        brand.managers.push(Uuid::new_v4());
+        brand.themes.push(crate::brand::OrgTheme {
+            id: Uuid::new_v4(),
+            name: "Ours".into(),
+            primary: crate::brand::Colour::rgb(0x31, 0x56, 0xc9),
+            secondary: crate::brand::Colour::rgb(0x23, 0x32, 0x39),
+            primary_dark: None,
+            secondary_dark: None,
+            changed_at: 1_800_000_000,
+        });
+        let author = ann();
+        let mut change = SitesChange::new(&author, "Change the brand centre");
+        change.org_brand = Some(&brand);
+        store.write_sites(&change).unwrap();
+        assert_eq!(store.read_org_brand().unwrap(), Some(brand.clone()));
+        let repo = store.repo().unwrap();
+        let tip = main_tip(&repo).unwrap().unwrap();
+        let bytes = read_blob(&tip.tree().unwrap(), "org/brand.json")
+            .unwrap()
+            .unwrap();
+        assert_eq!(bytes, file_bytes(&brand).unwrap());
+
+        // A record that breaks a rule is never written.
+        let mut bad = brand.clone();
+        bad.managers.push(bad.managers[0]);
+        let mut change = SitesChange::new(&author, "Bad");
+        change.org_brand = Some(&bad);
+        assert!(matches!(
+            store.write_sites(&change),
+            Err(CheckpointError::InvalidTreeChange(_))
+        ));
+        assert_eq!(store.read_org_brand().unwrap(), Some(brand));
     }
 
     #[test]

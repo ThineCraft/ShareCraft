@@ -720,8 +720,9 @@ async fn repair_site(
 /// differs is written from its record, or for a site with none from the organisation's current
 /// defaults, with `site.changed` marked `"repaired": true` (hubs before the sites that joined
 /// them); likewise each saved template (`template.saved`), then each library, after the sites
-/// (see [`crate::libraries::reconcile`], `library.changed`), and the global navigation
-/// (`navigation.changed`). A record that cannot be written, or whose site is not in the tree,
+/// (see [`crate::libraries::reconcile`], `library.changed`), the global navigation
+/// (`navigation.changed`) and the brand centre with the images it pins (see
+/// [`crate::brand::reconcile`]; the brand centre counts as one row). A record that cannot be written, or whose site is not in the tree,
 /// does not stop the others; it is listed in the report.
 ///
 /// # Errors
@@ -842,6 +843,10 @@ pub async fn reconcile(store: Arc<dyn Checkpointer>, db: &Db) -> Result<SitesRep
         db.apply_global_navigation(&items, Some(event)).await?;
         report.updated = report.updated.saturating_add(1);
     }
+
+    // After the sites, as a site's look pins brand images as the brand centre does.
+    let brand = crate::brand::reconcile(Arc::clone(&store), db).await?;
+    report.updated = report.updated.saturating_add(brand);
     Ok(report)
 }
 

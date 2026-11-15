@@ -267,6 +267,10 @@ pub enum AccessError {
     /// The site has no room left under its storage quota for what would be stored.
     #[error("the site's storage quota would be exceeded")]
     QuotaExceeded,
+    /// A brand image's content is no longer in the content store: it was erased after the
+    /// image was chosen.
+    #[error("that image is no longer stored")]
+    ImageGone,
     /// The tree in PostgreSQL no longer matches Git and could not be repaired yet; tree changes
     /// wait until it is.
     #[error("the content tree is being repaired; try again shortly")]
