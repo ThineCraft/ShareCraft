@@ -226,7 +226,31 @@ async fn is_at_or_below_walks_parents() {
 
 #[test]
 fn validate_node_name_rules() {
-    for c in ['"', '*', ':', '<', '>', '?', '/', '\\', '|', '\n', '\u{0}'] {
+    for c in [
+        '"',
+        '*',
+        ':',
+        '<',
+        '>',
+        '?',
+        '/',
+        '\\',
+        '|',
+        '\n',
+        '\u{0}',
+        // Invisible and direction-changing format characters.
+        '\u{202A}',
+        '\u{202E}',
+        '\u{2066}',
+        '\u{2069}',
+        '\u{200B}',
+        '\u{200F}',
+        '\u{FEFF}',
+        '\u{00AD}',
+        '\u{2060}',
+        '\u{061C}',
+        '\u{E0041}',
+    ] {
         let name = format!("a{c}b");
         assert_eq!(
             validate_node_name(&name),
@@ -247,6 +271,12 @@ fn validate_node_name_rules() {
         validate_node_name("  Q3 report (final).xlsx "),
         Ok("Q3 report (final).xlsx")
     );
+    assert_eq!(
+        validate_node_name("Invoice\u{202E}fdp.exe"),
+        Err(AccessError::InvalidName)
+    );
+    // Letters of any script, and visible symbols, stay.
+    assert!(validate_node_name("R\u{e9}sum\u{e9} \u{2013} \u{6771}\u{4eac} \u{2713}.txt").is_ok());
 }
 
 /// A new site's `sites` row takes exactly the values its record in Git was written with, not

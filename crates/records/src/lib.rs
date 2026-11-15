@@ -78,7 +78,9 @@ pub use templates::{
     check_template_size, validate_template_body, validate_template_description,
     validate_template_name,
 };
-pub use tree::{Node, NodeChange, NodeKind, NodeRow, NodesApplied, validate_node_name};
+pub use tree::{
+    Node, NodeChange, NodeKind, NodeRow, NodesApplied, is_format_char, validate_node_name,
+};
 pub use uploads::{
     NameConflict, NewUpload, UPLOADS_PER_PERSON, UploadError, UploadSession, UploadTarget,
 };

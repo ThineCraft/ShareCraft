@@ -17,7 +17,7 @@ use protocol::RemovedReason;
 use records::{
     Access, AccessError, BinStage, ClaimId, Db, DbError, Document, Editor, LibraryKind,
     LibrarySettings, NewEvent, Node, NodeChange, NodeKind, NodeRow, NodesApplied, OrgPolicy, Perms,
-    QuotaError, Reservation, SiteKind, SiteSettings, User, validate_description,
+    QuotaError, Reservation, SiteKind, SiteSettings, User, is_format_char, validate_description,
     validate_document_name, validate_language, validate_node_name, validate_template_body,
     validate_time_zone,
 };
@@ -3261,7 +3261,8 @@ fn find_home(tree: &[TreeRecord]) -> Option<(NodeId, NodeId)> {
         })
 }
 
-/// `name` made acceptable as a node name: refused and control characters become `_`, as does
+/// `name` made acceptable as a node name: refused, control and invisible format characters
+/// (see [`records::is_format_char`]) become `_`, as does
 /// a trailing dot (after trailing spaces are trimmed); a name Windows keeps for a device gets
 /// `_` after its first part (see [`not_a_device`]); an empty name becomes "Untitled"; a long one
 /// is shortened before its extension.
@@ -3270,7 +3271,7 @@ pub(crate) fn clean_name(name: &str, editor: Editor) -> String {
         .trim()
         .chars()
         .map(|c| {
-            if c.is_control() || REFUSED_CHARS.contains(&c) {
+            if c.is_control() || is_format_char(c) || REFUSED_CHARS.contains(&c) {
                 '_'
             } else {
                 c
@@ -3315,7 +3316,8 @@ fn not_a_device(name: &str) -> String {
     }
 }
 
-/// `name` made acceptable as a folder name: refused and control characters become `_`, as does
+/// `name` made acceptable as a folder name: refused, control and invisible format characters
+/// become `_`, as does
 /// a trailing dot (after trailing spaces are trimmed); a name Windows keeps for a device gets
 /// `_` after its first part; an empty name becomes "Untitled"; a long one is shortened.
 pub(crate) fn clean_folder_name(name: &str) -> String {
@@ -3323,7 +3325,7 @@ pub(crate) fn clean_folder_name(name: &str) -> String {
         .trim()
         .chars()
         .map(|c| {
-            if c.is_control() || REFUSED_CHARS.contains(&c) {
+            if c.is_control() || is_format_char(c) || REFUSED_CHARS.contains(&c) {
                 '_'
             } else {
                 c
@@ -3530,6 +3532,16 @@ mod tests {
     fn names_are_cleaned_and_made_unique() {
         assert_eq!(clean_name("x:y.docx", Editor::WordCraft), "x_y.docx");
         assert_eq!(clean_name("a?b*c", Editor::Text), "a_b_c");
+        // Invisible and direction-changing characters cannot disguise an extension.
+        assert_eq!(
+            clean_name("Invoice\u{202E}fdp.exe", Editor::Other),
+            "Invoice_fdp.exe"
+        );
+        assert_eq!(
+            clean_name("a\u{200B}b\u{FEFF}\u{2066}c.txt", Editor::Text),
+            "a_b__c.txt"
+        );
+        assert_eq!(clean_folder_name("Q3\u{200F}\u{061C}"), "Q3__");
         assert_eq!(clean_name("notes.", Editor::Text), "notes_");
         assert_eq!(clean_name("  ", Editor::Text), "Untitled");
         assert_eq!(clean_name(".xlsx", Editor::GridCraft), "Untitled.xlsx");

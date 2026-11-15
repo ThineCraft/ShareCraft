@@ -516,6 +516,8 @@ async fn bad_file_names_are_refused() {
         ("a/b.xlsx", "a_b.xlsx"),
         ("c\\d.xlsx", "c_d.xlsx"),
         ("tab\t.xlsx", "tab_.xlsx"),
+        ("Invoice\u{202E}xslx.xlsx", "Invoice_xslx.xlsx"),
+        ("a\u{200B}b\u{FEFF}.xlsx", "a_b_.xlsx"),
         (long.as_str(), shortened.as_str()),
     ] {
         let response = upload(&server, &ann, name, b"data".to_vec()).await;
@@ -539,8 +541,8 @@ async fn bad_file_names_are_refused() {
     let response = upload(&server, &ann, "Empty.xlsx", Vec::new()).await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
-    // Only the four cleaned names were made.
-    assert_eq!(documents_of(&server, &ann).await, 4);
+    // Only the six cleaned names were made.
+    assert_eq!(documents_of(&server, &ann).await, 6);
 }
 
 #[tokio::test]

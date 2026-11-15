@@ -719,6 +719,33 @@ async fn rename_needs_editor_and_owner_for_libraries_and_sites() {
         w.patch(&ed, &doc, json!({ "name": "a:b" })).await,
         (StatusCode::UNPROCESSABLE_ENTITY, error("invalid_name"))
     );
+    // Invisible and direction-changing characters, which can make one extension look like
+    // another, are refused in a rename and in a new name.
+    for name in [
+        "Invoice\u{202E}fdp.exe",
+        "a\u{200B}b",
+        "\u{2066}x\u{2069}",
+        "x\u{FEFF}",
+    ] {
+        assert_eq!(
+            w.patch(&ed, &doc, json!({ "name": name })).await,
+            (StatusCode::UNPROCESSABLE_ENTITY, error("invalid_name")),
+            "{name:?}"
+        );
+        let (status, body) = w
+            .call(
+                &ed,
+                Method::POST,
+                &format!("/api/nodes/{}/children", w.library),
+                Some(json!({ "kind": "folder", "name": name })),
+            )
+            .await;
+        assert_eq!(
+            (status, body),
+            (StatusCode::UNPROCESSABLE_ENTITY, error("invalid_name")),
+            "{name:?}"
+        );
+    }
     assert_eq!(
         w.patch(&ed, &doc, json!({})).await,
         (StatusCode::UNPROCESSABLE_ENTITY, error("invalid_request"))

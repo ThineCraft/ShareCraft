@@ -126,8 +126,42 @@ impl NodeRow {
     }
 }
 
-/// Checks a name for any node: 1 to 120 characters after trimming, no control characters,
-/// none of `" * : < > ? / \ |`, and no trailing dot. Returns the trimmed name.
+/// Whether `c` is an invisible format character (Unicode general category `Cf`): the
+/// direction controls (U+202A to U+202E, U+2066 to U+2069, U+200E, U+200F, U+061C), the
+/// zero-width characters (U+200B to U+200D, U+2060 to U+2064, U+FEFF), the soft hyphen, tag
+/// characters and the like. In a name they can make one extension look like another
+/// (`Invoice` + U+202E + `fdp.exe` shows as `Invoiceexe.pdf`), so names never hold them.
+#[must_use]
+pub fn is_format_char(c: char) -> bool {
+    matches!(
+        u32::from(c),
+        0x00AD
+            | 0x0600..=0x0605
+            | 0x061C
+            | 0x06DD
+            | 0x070F
+            | 0x0890..=0x0891
+            | 0x08E2
+            | 0x180E
+            | 0x200B..=0x200F
+            | 0x202A..=0x202E
+            | 0x2060..=0x2064
+            | 0x2066..=0x206F
+            | 0xFEFF
+            | 0xFFF9..=0xFFFB
+            | 0x110BD
+            | 0x110CD
+            | 0x13430..=0x1343F
+            | 0x1BCA0..=0x1BCA3
+            | 0x1D173..=0x1D17A
+            | 0xE0001
+            | 0xE0020..=0xE007F
+    )
+}
+
+/// Checks a name for any node: 1 to 120 characters after trimming, no control characters, no
+/// invisible format characters (see [`is_format_char`]), none of `" * : < > ? / \ |`, and no
+/// trailing dot. Returns the trimmed name.
 pub fn validate_node_name(name: &str) -> Result<&str, AccessError> {
     let name = name.trim();
     let length = name.chars().count();
@@ -135,7 +169,7 @@ pub fn validate_node_name(name: &str) -> Result<&str, AccessError> {
         && !name.ends_with('.')
         && !name
             .chars()
-            .any(|c| c.is_control() || REFUSED_CHARS.contains(&c));
+            .any(|c| c.is_control() || is_format_char(c) || REFUSED_CHARS.contains(&c));
     if well_formed {
         Ok(name)
     } else {
