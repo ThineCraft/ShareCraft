@@ -29,7 +29,7 @@ table.banded tbody tr:nth-child(even)>td{background:light-dark(#f4f8f7,#212b30)}
 </header>
 <div class="layout">
 <nav aria-label="Document contents"><p>In this document</p>
-<a href="#need">01 · What you need</a><a href="#build">02 · Build and check</a><a href="#admin">03 · The first administrator</a><a href="#run">04 · Run it and sign in</a><a href="#settings">05 · Settings</a><a href="#accounts">06 · Accounts and signing in</a><a href="#sharing">07 · Sharing and roles</a><a href="#removed">08 · What a removed person sees</a><a href="#data">09 · Where data is kept</a><a href="#index">10 · The revision index</a><a href="#events">11 · Events</a><a href="#stop">12 · Stopping the server, and notices</a><a href="#editors">13 · Building the editors</a><a href="#files">14 · Opening a file document</a><a href="#session">15 · File session, seat and saving</a><a href="#content">16 · Content routes</a><a href="#tree">17 · The content tree and routes</a><a href="#treegit">18 · The tree in Git and PostgreSQL</a><a href="#upgrade">19 · Upgrading</a><a href="#policy">20 · The editor pages' policy</a><a href="#limits">21 · Known limits</a><a href="#scale">22 · A library of 100,000 files</a><a href="#groups">23 · Groups, roles and the explorer</a><a href="#links">24 · Sharing links and requests</a><a href="#storage">25 · Files, bin and quotas</a><a href="#sites">26 · Sites and navigation</a><a href="#libraries">27 · Libraries</a><a href="#licences">28 · Licences</a>
+<a href="#need">01 · What you need</a><a href="#build">02 · Build and check</a><a href="#admin">03 · The first administrator</a><a href="#run">04 · Run it and sign in</a><a href="#settings">05 · Settings</a><a href="#accounts">06 · Accounts and signing in</a><a href="#sharing">07 · Sharing and roles</a><a href="#removed">08 · What a removed person sees</a><a href="#data">09 · Where data is kept</a><a href="#index">10 · The revision index</a><a href="#events">11 · Events</a><a href="#stop">12 · Stopping the server, and notices</a><a href="#editors">13 · Building the editors</a><a href="#files">14 · Opening a file document</a><a href="#session">15 · File session, seat and saving</a><a href="#content">16 · Content routes</a><a href="#tree">17 · The content tree and routes</a><a href="#treegit">18 · The tree in Git and PostgreSQL</a><a href="#upgrade">19 · Upgrading</a><a href="#policy">20 · The editor pages' policy</a><a href="#limits">21 · Known limits</a><a href="#scale">22 · A library of 100,000 files</a><a href="#groups">23 · Groups, roles and the explorer</a><a href="#links">24 · Sharing links and requests</a><a href="#storage">25 · Files, bin and quotas</a><a href="#sites">26 · Sites and navigation</a><a href="#libraries">27 · Libraries</a><a href="#branding">28 · Branding</a><a href="#licences">29 · Licences</a>
 </nav>
 <main id="main">
 <div class="toolbar"><span class="small">Standalone HTML · Print-ready · No external assets</span><button type="button" onclick="window.print()">Print / Save PDF</button></div>
@@ -1395,7 +1395,7 @@ refs/sharecraft/sites                                          the last commit t
 </tbody></table></div>
 
 <h3>Upgrading: migration 0014</h3>
-<p><code>0014_libraries</code> adds the <code>libraries</code> table (a row with the defaults for every existing library), widens the editor check on documents to take <code>other</code>, adds the scan columns to <code>blobs</code> (every existing row is <code>unscanned</code>) and adds the settings rows for the blocked types and the scanner. The server also starts keeping thumbnails in a new <code>thumbs</code> folder of the data folder, and builds with the <code>image</code> crate (section 28). Like the earlier migrations it is <strong>one way</strong>: a server from before this plan cannot run against the database afterwards. <strong>Back up the data folder and the database together before upgrading</strong> (section 19). The first start after the upgrade writes no library files; each is written at the library's first change.</p>
+<p><code>0014_libraries</code> adds the <code>libraries</code> table (a row with the defaults for every existing library), widens the editor check on documents to take <code>other</code>, adds the scan columns to <code>blobs</code> (every existing row is <code>unscanned</code>) and adds the settings rows for the blocked types and the scanner. The server also starts keeping thumbnails in a new <code>thumbs</code> folder of the data folder, and builds with the <code>image</code> crate (section 29). Like the earlier migrations it is <strong>one way</strong>: a server from before this plan cannot run against the database afterwards. <strong>Back up the data folder and the database together before upgrading</strong> (section 19). The first start after the upgrade writes no library files; each is written at the library's first change.</p>
 
 <h3>What was checked, and what was not</h3>
 <p>The server and web tests pass. The pages were also checked by hand in a browser on 14 November 2026 against a real server and database after migration 0014, with the stand-in scanner: scanner settings and Test; uploads of a <code>.png</code>, <code>.zip</code>, <code>.txt</code> and <code>.html</code>, each held and then available; previews of an image, text and an HTML file shown as text, and "No preview for this type" for a <code>.zip</code>; an image library with a grid of thumbnails and a <code>.zip</code> refused with a plain message; a template library and New from template; folders off; the organisation's block list (<code>.exe, .bat</code>, with <code>Setup.EXE</code> refused); the scanner stopped, a new upload waiting, and the scanner restarted with the file clean about 80 seconds later; the Quarantine page with a file holding the test string quarantined with its threat name, Release with a reason, and Delete with its confirmation; and the library page at 375 pixels wide in dark mode with banded rows. There were no errors in the server log.</p>
@@ -1412,7 +1412,180 @@ refs/sharecraft/sites                                          the last commit t
 <p><strong>Debug builds and the tests.</strong> The workspace's <code>Cargo.toml</code> builds <code>argon2</code> and <code>blake2</code> (password checks at sign-in) and the image codecs the thumbnails use (<code>image</code>, <code>png</code>, <code>fdeflate</code>, <code>zune-jpeg</code>, <code>zune-core</code>, <code>gif</code>, <code>image-webp</code>) optimised even in debug builds. Unoptimised, one sign-in took about a second, and under the full parallel test run some tests timed out signing in at their start; real photos also ran past the thumbnail time limit.</p>
 </section>
 
-<section id="licences"><h2>28 / Licences</h2>
+<section id="branding"><h2>28 / Branding: the brand centre and site looks</h2>
+<p>Added on 15 November 2026 (plan 4A, on the branch <code>platform-branding</code>, not yet merged). The organisation now keeps approved themes and brand images in one <strong>brand centre</strong>. Each site can have its own <strong>look</strong>: a theme that works in light and dark mode, a logo and a logo thumbnail, a header layout, a navigation style and a footer. Owners preview a look before they apply it, and can go back to an earlier one. ShareCraft's own controls stay neutral. Status colours and warnings are never recoloured. Branding never gives or takes away access. The owner's decisions behind this are D40 to D45 in <a href="scope.html">scope.html</a>. Font packages, copying a look from another site, branding in templates, limiting owners to approved options, mega menus, the browser-tab icon and branded emails wait for plan 4B (D40).</p>
+<div class="note"><p><strong>Who does what.</strong> Anyone signed in can read the brand centre and see brand images. <strong>Brand managers</strong> and administrators change the brand centre's themes and images. Only administrators name the brand managers (D45). A person with <code>manage_site</code> (a site's Owners) changes the site's look and its own themes. On an archived site, look and theme changes answer <code>403 archived</code>, but the look is still shown.</p></div>
+
+<h3>The records</h3>
+<p>Both records follow the pattern of the site records (section 26): one Git commit per change, mirrored into PostgreSQL afterwards with its event and judged again there, taken back by a second commit if the database refuses, and repaired from Git at start. The start-up reconcile rebuilds <code>org_brand</code>, each site's look and themes, and the image pins (below) from Git.</p>
+<pre><code>org/brand.json                                       the brand centre
+sites/&lt;xx&gt;/&lt;site id&gt;.json                          a site's settings, now with look and themes</code></pre>
+<ul>
+<li><strong>The brand centre</strong>, <code>org/brand.json</code>, holds <code>schema</code> (1), <code>managers</code> (account ids), <code>themes</code> (each with an <code>id</code>, its colours and <code>changed_at</code>) and <code>images</code> (each <code>{id, kind, image}</code>, the kind being <code>logo</code>, <code>icon</code> or <code>background</code>). With no file it reads as an empty centre. It is mirrored as the single row of <code>org_brand</code>.</li>
+<li><strong>A site's look</strong> is the field <code>look</code> on the site's record, and the site's own themes are <code>themes</code> on the same record. Both are left out of the file when empty, so a site that never changed its look keeps its exact bytes. A site with no look reads as the built-in ShareCraft theme with the defaults below, so it looks as it did before. They are mirrored into <code>sites.look</code> and <code>sites.themes</code>.</li>
+<li><strong>A theme</strong> is <code>{name, primary, secondary, primary_dark?, secondary_dark?}</code>. The primary is the accent: links, buttons, the focus ring and the bar stripe. The secondary is the background of a strong header or footer. A dark colour left out is worked out from the light one. Colours are <code>#rrggbb</code>, typed in either case and kept in lower case. A name is 1 to 60 characters.</li>
+<li><strong>Themes are copied into the look</strong> (D44). A look holds its theme's colours, and <code>from</code> notes where they came from: <code>builtin:&lt;id&gt;</code>, <code>org:&lt;id&gt;</code>, <code>site:&lt;id&gt;</code> or <code>custom</code>. Editing or deleting a brand-centre theme never changes a site. Change the look marks a theme whose source has changed or gone since it was applied (<code>theme_source_changed</code>).</li>
+</ul>
+<div class="table-wrap"><table class="banded"><caption>Limits of the brand records</caption>
+<thead><tr><th>What</th><th>Limit</th></tr></thead>
+<tbody>
+<tr><td>Brand centre</td><td>50 themes, 100 images, 20 managers. Theme names are unique, ignoring case.</td></tr>
+<tr><td>A site's own themes</td><td>20, names unique within the site, ignoring case. Only that site offers them.</td></tr>
+<tr><td>Logo description (<code>logo_alt</code>)</td><td>0 to 120 characters. Empty means the site's name.</td></tr>
+<tr><td>Brand image name</td><td>1 to 120 characters.</td></tr>
+<tr><td>Header</td><td><code>layout</code>: <code>minimal</code>, <code>compact</code> (the default), <code>standard</code> or <code>extended</code>. <code>background</code>: <code>none</code> (the default), <code>soft</code>, <code>strong</code> or <code>image</code>. An image and an alignment (<code>left</code>, <code>centre</code>, <code>right</code>) only with the extended layout, and the image only with the <code>image</code> background. <code>hide_title</code> needs a logo.</td></tr>
+<tr><td>Navigation</td><td><code>horizontal</code> (the default) or <code>vertical</code>.</td></tr>
+<tr><td>Footer</td><td>Off by default. <code>simple</code>: one group of at most 8 links, no heading. <code>extended</code>: at most 4 groups of 8 links. Name 0 to 80 characters, heading 0 to 40, link label 1 to 60, address up to 2,000. Background <code>none</code>, <code>soft</code> or <code>strong</code>; an optional footer logo.</td></tr>
+<tr><td>Footer link addresses</td><td><code>https://</code> or <code>http://</code> followed by an address, or a path on this server with one leading <code>/</code>. Spaces, control characters, invisible characters and backslashes are refused, so <code>javascript:</code>, <code>data:</code>, <code>//evil.example</code> and <code>/\evil</code> are all refused.</td></tr>
+<tr><td>All text</td><td>Trimmed. Control and invisible format characters are refused, as for names (section 25). Pages show it as text, never as markup.</td></tr>
+<tr><td>Body of <code>PUT /api/sites/&lt;id&gt;/look</code></td><td>256 KiB.</td></tr>
+</tbody></table></div>
+
+<h3>Contrast rules and the built-in themes</h3>
+<p>Unreadable colours are refused (D43). Every theme, wherever it is set, must reach WCAG AA, <strong>4.5:1</strong>, in light and dark mode. That covers brand-centre themes, site themes, a custom theme in a look, and a rollback to an older look (checked again in case the rules change). The check is in Rust (<code>revisions::brand::check_theme</code>), and the server's answer is final. The same check runs in the page (<code>web/look.js</code>) for live feedback while a theme is typed. Both are tested against one table, <code>web/look-vectors.json</code>.</p>
+<div class="table-wrap"><table class="banded"><caption>The six checks, each at least 4.5:1</caption>
+<thead><tr><th>Check</th><th>What must be readable</th></tr></thead>
+<tbody>
+<tr><td><code>primary_on_light</code></td><td>The primary on light paper (<code>#ffffff</code>) and on the light background (<code>#f5f7f8</code>); the lower ratio is reported.</td></tr>
+<tr><td><code>button_on_primary</code></td><td>White button text on the primary.</td></tr>
+<tr><td><code>primary_dark_on_dark</code></td><td>The dark primary on dark paper (<code>#202a2e</code>) and on the dark background (<code>#141c20</code>).</td></tr>
+<tr><td><code>button_on_primary_dark</code></td><td>Button text on the dark primary: white or <code>#141c20</code>, whichever reads better.</td></tr>
+<tr><td><code>header_on_secondary</code></td><td>Header text (white or <code>#141c20</code>) on the secondary.</td></tr>
+<tr><td><code>header_on_secondary_dark</code></td><td>Header text on the dark secondary.</td></tr>
+</tbody></table></div>
+<ul>
+<li><strong>Dark colours.</strong> A dark colour left out keeps the light colour's hue and saturation. The dark primary is made lighter, 1% at a time, until it passes. The dark secondary is the secondary itself if it passes, or is made darker 1% at a time until it does. If nothing passes, the check fails.</li>
+<li><strong>Suggestions.</strong> A failing colour that was typed gets the passing shade nearest to it (same hue and saturation, lightness searched 1% at a time both ways). A derived colour gets none: change the light one.</li>
+<li><strong>Refusal.</strong> <code>422 low_contrast {"pairs": [{"check", "ratio", "suggestion"}]}</code>, with every failing pair in the order above and ratios rounded to 2 decimals. The page marks each failing pair with its ratio and a Use suggested button, and keeps Apply off while anything fails.</li>
+<li><strong>A stored theme that no longer passes</strong> (if the rules are tightened later) is shown with the ShareCraft theme's colours instead.</li>
+</ul>
+<div class="table-wrap"><table class="banded"><caption>Built-in themes (each passes every check; dark colours are derived)</caption>
+<thead><tr><th>Id</th><th>Name</th><th>Primary</th><th>Secondary</th></tr></thead>
+<tbody>
+<tr><td><code>builtin:sharecraft</code></td><td>ShareCraft (the default)</td><td><code>#3156c9</code></td><td><code>#233239</code></td></tr>
+<tr><td><code>builtin:harbour</code></td><td>Harbour</td><td><code>#1f5f8b</code></td><td><code>#163447</code></td></tr>
+<tr><td><code>builtin:plum</code></td><td>Plum</td><td><code>#7a3e8f</code></td><td><code>#3b2244</code></td></tr>
+<tr><td><code>builtin:rust</code></td><td>Rust</td><td><code>#a3431c</code></td><td><code>#40261b</code></td></tr>
+<tr><td><code>builtin:forest</code></td><td>Forest</td><td><code>#2f6b3a</code></td><td><code>#1f3324</code></td></tr>
+<tr><td><code>builtin:graphite</code></td><td>Graphite</td><td><code>#4a5560</code></td><td><code>#1f262c</code></td></tr>
+</tbody></table></div>
+<p><strong>Never themed:</strong> the status colours (<code>--ok</code>, <code>--warn-*</code>, <code>--stop-*</code>), text, muted text, lines, page and paper backgrounds, the account bar, permission warnings and the held and quarantine marks. Pages set only five colour variables (<code>--accent</code>, <code>--accent-ink</code>, <code>--on-accent</code>, <code>--header-bg</code>, <code>--header-ink</code>), through the CSS object model after checking each value again, so the page security policy is unchanged.</p>
+
+<h3>Brand images are snapshots</h3>
+<p>Choosing an image records a snapshot of the file as it is then: <code>{sha256, media_type, bytes, width?, height?, name, from_doc}</code>. A later change to the file, or its deletion, leaves the brand as it was until the image is chosen again. Anyone signed in can see a brand image, even without access to the library it came from (D41). Choosing one needs <code>view</code> on the document.</p>
+<ul>
+<li><strong>Where from.</strong> The brand centre takes images from asset libraries (section 27). A site's look also takes images from that site's own libraries. Anywhere else is <code>400 wrong_place</code>.</li>
+<li><strong>Types</strong>, judged by the content and never by the name: PNG, JPEG, WebP, GIF and SVG. Anything else is <code>422 not_an_image</code>. Raster images may be at most 8,000 by 8,000 pixels, read from the header only.</li>
+<li><strong>Sizes.</strong> A logo, thumbnail, footer logo or icon at most 1 MiB; a header image or background at most 5 MiB (<code>413 image_too_large</code>).</li>
+<li><strong>Available only.</strong> Content held by the malware scanner (D37) cannot be chosen (<code>423 held</code>).</li>
+<li><strong>SVG.</strong> It must be UTF-8, well-formed XML with an <code>svg</code> root, no DOCTYPE and no processing instruction other than a leading XML declaration. Scripts, event handlers, foreign objects, frames, links outside the image, style imports and <code>url()</code> outside the image are refused. So are <strong>animation elements</strong> (<code>animate</code>, <code>set</code>, <code>animateMotion</code>, <code>animateTransform</code>, <code>discard</code>), any <strong>character reference</strong> (<code>&amp;#</code>) and any <strong>backslash</strong>, because they can hide a link or a handler from the checks. Some harmless SVGs are refused too; export the logo again without them.</li>
+</ul>
+<h3>The image route</h3>
+<p><code>GET /api/brand/images/&lt;sha256&gt;</code> serves a brand image to anyone signed in. A signed-out visitor, and content that neither the brand centre nor a current site look names, get <code>404</code>. Content that is no longer available (a rescan found it infected, say) answers <code>423 held</code>. Pages show these images only through <code>&lt;img&gt;</code>.</p>
+<div class="table-wrap"><table class="banded"><caption>Headers of a brand image</caption>
+<thead><tr><th>Header</th><th>Value</th></tr></thead>
+<tbody>
+<tr><td><code>Content-Type</code></td><td>The type judged from the content when the image was chosen.</td></tr>
+<tr><td><code>X-Content-Type-Options</code></td><td><code>nosniff</code></td></tr>
+<tr><td><code>Content-Security-Policy</code></td><td><code>sandbox; default-src 'none'; style-src 'unsafe-inline'</code>, so nothing in it runs or loads, even when opened alone.</td></tr>
+<tr><td><code>Cache-Control</code></td><td><code>private, max-age=31536000, immutable</code> (the address names the exact content).</td></tr>
+<tr><td><code>Content-Disposition</code></td><td>None.</td></tr>
+</tbody></table></div>
+<h3>Pinning: <code>brand_refs</code></h3>
+<p>An image in use pins its content in the content store (section 25). The table <code>brand_refs</code> has one row per content and owner: <code>org</code> for the brand centre, or a site's id for its look. A row is written in the same transaction as the mirror change that names the image, after the content's <code>blobs</code> row is locked. Erasure counts these rows as it counts versions, so content is never erased while a brand image uses it. When the last use goes (an image removed, a logo switched, a site purged), the content is erased unless something else names it. Reconcile rebuilds the rows from Git.</p>
+<p><strong>Quarantine delete</strong> (section 27) does not erase content that the brand centre or a site look still uses. Its answer has <code>erased: false</code> and <code>pinned_by_brand</code>, which names who uses it (<code>{owner: "org"}</code> or <code>{owner: "site", id, name}</code>), and the quarantine page says so in plain words. <strong>Change the brand to remove it</strong>: take the image out of the brand centre or the look. Until then the content stays held and is never served.</p>
+
+<h3>The hub rule</h3>
+<p>A site that joined a hub uses the <strong>hub's theme</strong> (D42). Its own logo, header, navigation style and footer stay its own. Its own theme is kept, unused, and comes back when it leaves the hub. The owner can still edit it while the site is in a hub, and Change the look says the hub's theme is in use. The rule is worked out each time a look is read and never written, so joining, leaving, the hub changing its theme, unregistering the hub, and archiving or deleting it never overwrite a site's own theme. An archived hub still lends its theme; a deleted one does not. The hub is named only to people who can see it.</p>
+
+<h3>How pages show the look</h3>
+<ul>
+<li><strong>Where.</strong> The site, library, bin, explorer and access pages show the look. The footer is shown only on site and library pages. In an editor frame the letter mark is replaced by the thumbnail (or the logo) and the bar stripe takes the theme; there is no footer, and the editor itself is not restyled. The site directory and a hub's site list show each site's thumbnail, or its initials on its accent colour.</li>
+<li><strong>Header layouts.</strong> Minimal is one row with a 24-pixel logo. Compact is today's bar with a 32-pixel logo. Standard has a 48-pixel logo and a larger title. Extended is a band 160 pixels high (120 below 600 pixels), with the image covering it under a fixed dark overlay so the white title stays readable. If a logo fails to load or answers <code>423</code>, the site name is shown instead. A logo whose description is empty or equals the site name gets an empty <code>alt</code>, so a screen reader reads the name once.</li>
+<li><strong>Vertical navigation</strong> puts <strong>all three bars</strong> (organisation, hub and site) in the left column at 900 pixels and wider, and in the Menu below that. The plan said only the site's bar; the three share one navigation and one Menu button, so they move together.</li>
+<li><strong>Footer links</strong> open in the same tab; links to other sites get <code>rel="noopener noreferrer"</code>. A link that fails the address rules is never drawn as a link.</li>
+</ul>
+
+<h3>History and rollback</h3>
+<ul>
+<li>Every look change records <code>site.look_changed {name, before, after}</code> (and <code>rollback</code>, the entry it went back to). Applying the same look again records nothing.</li>
+<li><code>GET /api/sites/&lt;id&gt;/look/history</code> lists the last 50 changes, newest first, each <code>{event_id, at, by, look, before}</code>. The History list says what each change did, for example "Theme: ShareCraft to Plum; Logo added".</li>
+<li><code>POST /api/sites/&lt;id&gt;/look/rollback {event_id, which?}</code> applies that entry's look again as a new change, checked again like any look. <code>which</code> is <code>after</code> (the default) or <code>before</code>. <strong>Restoring the look before the first change:</strong> the oldest listed entry is followed by a "Before that change" row with Preview and Restore; restoring a <code>before</code> that is <code>null</code> gives the default look.</li>
+<li><strong>History snapshots are kept.</strong> Applying a previewed history entry keeps that entry's image snapshots. It does not take the image from its source file again. An image slot may be sent as <code>{keep: sha256}</code> for an image the look holds now, or that one of its last 50 history entries names, before or after.</li>
+<li><strong>A restore refuses images whose content is no longer available</strong>: no longer stored, held, or quarantined. It answers <code>409 image_gone {slots}</code>, even for an image the current look also holds, and the page then loads that look as a draft without those images. Restoring never makes a site newly depend on held content.</li>
+</ul>
+
+<h3>Routes</h3>
+<div class="table-wrap"><table class="banded"><caption>New and changed routes. "Brand manager" includes administrators; "Admin" means an enabled administrator.</caption>
+<thead><tr><th>Route</th><th>Who may call it</th><th>What it does</th></tr></thead>
+<tbody>
+<tr><td><code>GET /api/brand</code></td><td>Anyone signed in</td><td><code>{themes, images, can_manage}</code>: built-in themes first, then the organisation's, each with its <code>resolved</code> colours; images <code>{id, kind, name, url}</code>. Administrators also get <code>managers</code>.</td></tr>
+<tr><td><code>POST /api/brand/themes</code></td><td>Brand manager</td><td>Adds a theme (201).</td></tr>
+<tr><td><code>PATCH /api/brand/themes/&lt;id&gt;</code>, <code>DELETE …</code></td><td>Brand manager</td><td>Changes a theme (each field given is set; a dark colour set to <code>null</code> is derived again), or deletes it (204). Sites that copied it keep their copy.</td></tr>
+<tr><td><code>POST /api/brand/images {doc, kind, name?}</code></td><td>Brand manager, with <code>view</code> on the document</td><td>Adds the document's current version from an asset library as a brand image (201).</td></tr>
+<tr><td><code>PATCH /api/brand/images/&lt;id&gt; {name}</code>, <code>DELETE …</code></td><td>Brand manager</td><td>Renames or removes a brand image.</td></tr>
+<tr><td><code>PUT /api/brand/managers {users}</code></td><td>Admin</td><td>Names the brand managers (204). Each must exist and be enabled.</td></tr>
+<tr><td><code>GET /api/brand/images/&lt;sha256&gt;</code></td><td>Anyone signed in</td><td>The image, as described above.</td></tr>
+<tr><td><code>GET /api/sites/&lt;id&gt;/look</code></td><td>Anyone who can see the site</td><td>The effective look, with the hub rule applied: <code>{theme: {light, dark}, logo_url?, thumbnail_url?, logo_alt, header, navigation, footer, theme_from, hub?}</code>.</td></tr>
+<tr><td><code>GET /api/sites/&lt;id&gt;/look/settings</code></td><td><code>manage_site</code> (archived too)</td><td><code>{look, themes, theme_source_changed, in_hub?}</code>. A hub the caller cannot see is <code>{hidden: true}</code>, with no name.</td></tr>
+<tr><td><code>PUT /api/sites/&lt;id&gt;/look {look}</code></td><td><code>manage_site</code></td><td>Sets the look. A theme is <code>{from}</code> (copied) or a full custom theme. An image slot is <code>{doc}</code>, <code>{brand_image}</code> or <code>{keep: sha256}</code>. Answers the settings.</td></tr>
+<tr><td><code>GET /api/sites/&lt;id&gt;/look/history</code></td><td><code>manage_site</code> (archived too)</td><td>The last 50 changes.</td></tr>
+<tr><td><code>POST /api/sites/&lt;id&gt;/look/rollback {event_id, which?}</code></td><td><code>manage_site</code></td><td>Restores an entry's look after or before the change.</td></tr>
+<tr><td><code>POST /api/sites/&lt;id&gt;/themes</code>, <code>PATCH …/themes/&lt;theme&gt;</code>, <code>DELETE …</code></td><td><code>manage_site</code></td><td>The site's own themes.</td></tr>
+<tr><td><code>GET /api/sites</code>, <code>GET /api/hubs/&lt;id&gt;/sites</code></td><td>As before</td><td>Each site now carries <code>thumbnail_url?</code> and <code>accent</code>, from its effective look.</td></tr>
+<tr><td><code>POST /api/admin/quarantine/&lt;sha256&gt;/delete</code></td><td>Admin</td><td>Now also answers <code>pinned_by_brand</code> (see Pinning).</td></tr>
+</tbody></table></div>
+
+<h3>New events</h3>
+<div class="table-wrap"><table class="banded"><caption>Events recorded (section 11 says how an owner reads them)</caption>
+<thead><tr><th>Event</th><th>When</th></tr></thead>
+<tbody>
+<tr><td><code>brand.theme_changed</code></td><td>A brand-centre theme was created, updated or deleted, with the theme.</td></tr>
+<tr><td><code>brand.image_changed</code></td><td>A brand image was added, renamed or removed.</td></tr>
+<tr><td><code>brand.managers_changed</code></td><td>The brand managers were named.</td></tr>
+<tr><td><code>site.look_changed</code></td><td>A site's look changed, with <code>before</code> and <code>after</code>; <code>rollback</code> when it was a restore.</td></tr>
+<tr><td><code>site.theme_changed</code></td><td>One of a site's own themes was created, updated or deleted.</td></tr>
+</tbody></table></div>
+
+<h3>New error codes</h3>
+<div class="table-wrap"><table class="banded"><caption>New answers (each has a plain-English message on the pages)</caption>
+<thead><tr><th>Answer</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td><code>422 low_contrast {pairs}</code></td><td>A theme fails a contrast check.</td></tr>
+<tr><td><code>422 invalid_theme {reason}</code>, <code>422 invalid_look {reason}</code></td><td>A theme or look breaks another rule.</td></tr>
+<tr><td><code>422 not_an_image</code></td><td>The file is not a PNG, JPEG, WebP, GIF or safe SVG.</td></tr>
+<tr><td><code>413 image_too_large</code></td><td>Over the slot's size, or over 8,000 pixels a side.</td></tr>
+<tr><td><code>423 held</code></td><td>The image's content is held by the malware scanner.</td></tr>
+<tr><td><code>409 image_gone {slots}</code></td><td>An image's content is no longer stored or no longer available.</td></tr>
+<tr><td><code>409 too_many {limit}</code>, <code>409 name_taken</code></td><td>A limit of the brand records is reached; a theme name is already used.</td></tr>
+</tbody></table></div>
+
+<h3>The upgrade: migration 0015</h3>
+<p><code>0015_brand</code> adds the <code>org_brand</code> table with one row holding an empty brand centre, the <code>brand_refs</code> table, and the columns <code>sites.look</code> (empty) and <code>sites.themes</code> (an empty list). Existing sites keep their records and look as they did. The first start finds the rows, pins and Git in step and writes nothing. Like the earlier migrations it is <strong>one way</strong>: a server from before this plan refuses to start on the upgraded database. <strong>Back up the data folder and the PostgreSQL database together first</strong>, as in section 19.</p>
+
+<h3>What was checked, and what was not</h3>
+<p>The server and web tests pass (<code>cargo xtask check</code>). The pages were also checked by hand in a browser on 15 November 2026, against a real server and database after migration 0015, with the stand-in scanner:</p>
+<ul>
+<li>As an administrator in the brand centre: a theme with a too-light primary refused live (2.28:1 and 2.45:1 shown, Save off), Use suggested fixing it, and saving it; a logo and a background added from a new asset library through the picker, after their scans.</li>
+<li>The image route's headers, exactly as above.</li>
+<li>Change the look for Home: theme, logo, thumbnail, an extended header with a centred image, vertical navigation, and an extended strong footer with a link. The preview changed only the preview. A <code>javascript:</code> link was refused in plain English and nothing was saved; HTML in a footer label was shown as text.</li>
+<li>The look on the site, library, bin, explorer and access pages (the footer only on site and library pages), and in a GridCraft editor frame (thumbnail in the bar, themed stripe, no footer, editor untouched). The account bar kept its default colours. Dark and light buttons were right. At 375 pixels: the band was 120 pixels, nothing scrolled sideways, and the navigation was in the Menu.</li>
+<li>The hub rule: a site set to Rust showed the hub's theme, then Plum when the hub took Plum, Rust after leaving, and Plum after joining again, with the hub note on Change the look.</li>
+<li>History: Restore of an earlier entry applied it, and Cancel dropped a draft.</li>
+<li>A person who is not an administrator and has no access to the asset library saw the thumbnail and the brand image, could not manage the brand centre, did not see the managers, and got <code>404</code> for the look settings. A signed-out request for a brand image answered <code>404</code>.</li>
+</ul>
+<p><strong>Not checked:</strong> a screen reader; other browsers; an archived site with a look; brand managers who are not administrators; the vertical column at 900 pixels and wider (the window was 683 pixels wide); a theme deleted while in use (the server tests cover it).</p>
+<p><strong>Found in that check and fixed since:</strong> the look before the oldest listed change (for example the original default) could not be restored from the page; it now can, from the "Before that change" row. History entries all read alike; each now says what it changed. The fixed History page was not checked in the browser again.</p>
+<p><strong>Left as they are</strong> (for plan 4B or later):</p>
+<ul>
+<li>A browser that has a brand image cached keeps showing it for up to a year after its content is quarantined, as the header allows; the server answers <code>423</code>.</li>
+<li>History, settings and events carry each image's source document id and file name to everyone who manages the site, even if they cannot view that document.</li>
+<li>Quarantine delete does not remove brand pins itself (see Pinning).</li>
+<li>The image picker loads every thumbnail at once; focus is lost after choosing or renaming an image; an archived site's look controls stay editable, though Apply and Restore are hidden and the server refuses.</li>
+</ul>
+</section>
+
+<section id="licences"><h2>29 / Licences</h2>
 <p>ShareCraft is licensed <strong>MIT OR Apache-2.0</strong>; the texts are in <code>LICENSE-MIT</code> and <code>LICENSE-APACHE</code>. <code>cargo xtask check</code> refuses any dependency whose licence has no non-copyleft option (GPL, LGPL, AGPL, MPL, EUPL, CDDL, SSPL).</p>
 <p>The <code>revisions</code> crate stores documents in Git using <code>gix</code> (gitoxide), a Git implementation written in Rust and licensed MIT or Apache 2.0. No C library is involved and no copyleft code is linked. Repositories it writes are ordinary Git repositories: the <code>git</code> command line reads them as usual.</p>
 <p>Time zones and dates are handled by the <code>jiff</code> crate, licensed MIT or Unlicense (the choice is ours, and we take MIT). No copyleft code is linked.</p>
@@ -1420,7 +1593,7 @@ refs/sharecraft/sites                                          the last commit t
 <p>The four editors are licensed MIT or Apache 2.0, by their original authors. They are not part of ShareCraft's code and are not compiled into the server. The build tool copies each fork's licence, notice and attribution files into the installed editor's <code>licenses/</code> folder; what each fork changed is listed in its <code>NOTICE</code> and in <a href="editors.html">editors.html</a>.</p>
 </section>
 
-<footer>ShareCraft · ThineCraft · Building and running · Updated 14 November 2026<br>Describes the development build after the third Stage 1 plan (editors, one person at a time; merged into <code>main</code> on 10 November 2026) and the follow-up (editors keep their document when hosted), the first Stage 2 plan (the content tree and inherited permissions), and the second (groups, roles and the inheritance explorer; on the branch <code>platform-groups-roles</code>, not yet merged), and the third (sharing links and access requests; on the branch <code>platform-links-requests</code>, not yet merged), then plan 3A (files; merged into <code>main</code> on 14 November 2026), plan 3B (sites; merged into <code>main</code> on 14 November 2026) and plan 3C (libraries; on the branch <code>platform-libraries</code>, not yet merged). Not a release.</footer>
+<footer>ShareCraft · ThineCraft · Building and running · Updated 15 November 2026<br>Describes the development build after the third Stage 1 plan (editors, one person at a time; merged into <code>main</code> on 10 November 2026) and the follow-up (editors keep their document when hosted), the first Stage 2 plan (the content tree and inherited permissions), and the second (groups, roles and the inheritance explorer; on the branch <code>platform-groups-roles</code>, not yet merged), and the third (sharing links and access requests; on the branch <code>platform-links-requests</code>, not yet merged), then plan 3A (files; merged into <code>main</code> on 14 November 2026), plan 3B (sites; merged into <code>main</code> on 14 November 2026) and plan 3C (libraries; on the branch <code>platform-libraries</code>, not yet merged), and plan 4A (branding; on the branch <code>platform-branding</code>, not yet merged). Not a release.</footer>
 </main></div>
 </body>
 </html>
