@@ -29,7 +29,7 @@ table.banded tbody tr:nth-child(even)>td{background:light-dark(#f4f8f7,#212b30)}
 </header>
 <div class="layout">
 <nav aria-label="Document contents"><p>In this document</p>
-<a href="#need">01 · What you need</a><a href="#build">02 · Build and check</a><a href="#admin">03 · The first administrator</a><a href="#run">04 · Run it and sign in</a><a href="#settings">05 · Settings</a><a href="#accounts">06 · Accounts and signing in</a><a href="#sharing">07 · Sharing and roles</a><a href="#removed">08 · What a removed person sees</a><a href="#data">09 · Where data is kept</a><a href="#index">10 · The revision index</a><a href="#events">11 · Events</a><a href="#stop">12 · Stopping the server, and notices</a><a href="#editors">13 · Building the editors</a><a href="#files">14 · Opening a file document</a><a href="#session">15 · File session, seat and saving</a><a href="#content">16 · Content routes</a><a href="#tree">17 · The content tree and routes</a><a href="#treegit">18 · The tree in Git and PostgreSQL</a><a href="#upgrade">19 · Upgrading</a><a href="#policy">20 · The editor pages' policy</a><a href="#limits">21 · Known limits</a><a href="#scale">22 · A library of 100,000 files</a><a href="#groups">23 · Groups, roles and the explorer</a><a href="#links">24 · Sharing links and requests</a><a href="#storage">25 · Files, bin and quotas</a><a href="#sites">26 · Sites and navigation</a><a href="#licences">27 · Licences</a>
+<a href="#need">01 · What you need</a><a href="#build">02 · Build and check</a><a href="#admin">03 · The first administrator</a><a href="#run">04 · Run it and sign in</a><a href="#settings">05 · Settings</a><a href="#accounts">06 · Accounts and signing in</a><a href="#sharing">07 · Sharing and roles</a><a href="#removed">08 · What a removed person sees</a><a href="#data">09 · Where data is kept</a><a href="#index">10 · The revision index</a><a href="#events">11 · Events</a><a href="#stop">12 · Stopping the server, and notices</a><a href="#editors">13 · Building the editors</a><a href="#files">14 · Opening a file document</a><a href="#session">15 · File session, seat and saving</a><a href="#content">16 · Content routes</a><a href="#tree">17 · The content tree and routes</a><a href="#treegit">18 · The tree in Git and PostgreSQL</a><a href="#upgrade">19 · Upgrading</a><a href="#policy">20 · The editor pages' policy</a><a href="#limits">21 · Known limits</a><a href="#scale">22 · A library of 100,000 files</a><a href="#groups">23 · Groups, roles and the explorer</a><a href="#links">24 · Sharing links and requests</a><a href="#storage">25 · Files, bin and quotas</a><a href="#sites">26 · Sites and navigation</a><a href="#libraries">27 · Libraries</a><a href="#licences">28 · Licences</a>
 </nav>
 <main id="main">
 <div class="toolbar"><span class="small">Standalone HTML · Print-ready · No external assets</span><button type="button" onclick="window.print()">Print / Save PDF</button></div>
@@ -1027,7 +1027,7 @@ size &lt;the size in bytes, written without leading zeros&gt;
 </section>
 
 <section id="sites"><h2>26 / Sites: templates, lifecycle, hubs and navigation</h2>
-<p>Added on 14 November 2026 (plan 3B, on the branch <code>platform-sites</code>, not yet merged). A site now has a kind, a description, a language and a time zone. It can be made from a template, archived, deleted and restored, made a hub or joined to one, and given a navigation bar. The permission rules of sections 17 and 23 apply unchanged, with the exceptions named below. The owner's decisions behind this are D32 to D36 in <a href="scope.html">scope.html</a>.</p>
+<p>Added on 14 November 2026 (plan 3B, built on the branch <code>platform-sites</code> and merged into <code>main</code> on 14 November 2026 as <code>40a1dbc</code>). A site now has a kind, a description, a language and a time zone. It can be made from a template, archived, deleted and restored, made a hub or joined to one, and given a navigation bar. The permission rules of sections 17 and 23 apply unchanged, with the exceptions named below. The owner's decisions behind this are D32 to D36 in <a href="scope.html">scope.html</a>.</p>
 <div class="note"><p><strong>Who does what.</strong> Only administrators create, archive, reactivate, delete, restore and permanently delete sites, make a hub, unregister a hub, edit the global navigation and manage templates. A person with <code>manage_site</code> (a site's Owners) changes the site's settings and its own navigation, joins it to a hub or leaves, and deletes a library to the bin.</p></div>
 <h3>The Git layout</h3>
 <p>Site settings are kept in Git beside the content tree, one JSON file each, in the library repository (section 18). A change that also changes the tree (creating or renaming a site) writes both in one commit.</p>
@@ -1157,14 +1157,268 @@ refs/sharecraft/sites                                the last commit that change
 <p><strong>Found in that check and left as they are:</strong> after restoring a library the navigation bar is stale until the page is reloaded; an archived site's page shows administrators the quota form but not its usage; a library page in an archived site has no archived notice; "Remove quota" shows when a site has no quota; the directory's top bar has no links to Manage sites and Templates (they are on the People and Organisation settings pages); a confirmation box finishes only when the browser reports the dialog closed. Navigation links to text documents go through <code>/file.html</code>, which forwards them to the text editor. The browser's wasm text client must be rebuilt (<code>cargo xtask web</code>) for a text page to say a site was archived.</p>
 </section>
 
-<section id="licences"><h2>27 / Licences</h2>
+<section id="libraries"><h2>27 / Libraries: kinds, any file type, scanning, previews and policies</h2>
+<p>Added on 14 November 2026 (plan 3C, on the branch <code>platform-libraries</code>, not yet merged). A library now has a kind and settings, can hold a file of any type, checks each new file with a malware scanner the organisation runs, shows previews and thumbnails, and can be told which file types and sizes it takes. The permission rules of sections 17 and 23 apply unchanged. The owner's decisions behind this are D37 to D39 in <a href="scope.html">scope.html</a>.</p>
+<div class="note"><p><strong>Who does what.</strong> A person with <code>manage_site</code> (a site's Owners) changes a library's kind and settings and makes libraries. Only administrators make a library of the <code>asset</code> kind, change a library away from it, set the organisation's blocked file types, set up the scanner, release or delete quarantined files, and ask for the old files to be scanned.</p></div>
+
+<h3>Library records in Git</h3>
+<p>Each library has a second Git record beside its tree record, in the same repository (section 18). It holds the library's kind and settings.</p>
+<pre><code>libraries/&lt;first two hex digits of the id&gt;/&lt;library id&gt;.json    one library's kind and settings
+refs/sharecraft/sites                                          the last commit that changed any site, template or library record</code></pre>
+<p>A library file holds these fields, in this order, written with two-space indents and a final newline: <code>schema</code> (1), <code>id</code>, <code>kind</code>, <code>description</code> (0 to 500 characters), <code>folders</code> (true or false), <code>allowed_types</code> (a list of extensions, or null for every type), <code>blocked_types</code> (a list) and <code>max_file_bytes</code> (a number, or null for no limit of the library's own). Lists are written over several lines, as in site files. An extension is lower case with its leading dot (<code>.png</code>, <code>.tar.gz</code>), 2 to 20 characters of letters, digits and dots, and a list holds at most 100.</p>
+<ul>
+<li><strong>Old libraries have no file.</strong> A library made before this plan is read as a document library with no description, folders on, every type allowed, nothing blocked and no limit. Its file is written the first time it is changed. Changing the defaults later does not matter for these: they are the defaults.</li>
+<li><strong>One commit.</strong> A library made through the new route writes its file in the same commit as its tree record. A change to the settings is one commit, mirrored into the <code>libraries</code> table in PostgreSQL after it, judged again there, and taken back by a second commit if refused. This is how site records work (section 26).</li>
+<li><strong>Compared at every start.</strong> The server compares each library's row with its file and repairs a row that differs, as for sites. The start-up line now names site, library and template records.</li>
+<li><strong>Templates carry library settings.</strong> A site saved as a template keeps each library's kind and settings in a <code>settings</code> object inside that library's entry, left out when they are the defaults, so templates and packages from before this plan are unchanged. A package with none is read as document libraries with the defaults. A site made from a template recreates its libraries with those settings.</li>
+<li>A purged library keeps its row and file, as a purged site does.</li>
+</ul>
+
+<h3>Kinds</h3>
+<div class="table-wrap"><table class="banded"><caption>The four kinds</caption>
+<thead><tr><th>Kind</th><th>What it is</th><th>Rules</th></tr></thead>
+<tbody>
+<tr><td><code>document</code></td><td>The ordinary library, and the kind every older library is.</td><td>Takes what its settings allow.</td></tr>
+<tr><td><code>image</code></td><td>Pictures. The library page offers a grid of thumbnails beside the list.</td><td>Takes only <code>.png .jpg .jpeg .gif .webp .svg .avif .bmp .tif .tiff .heic</code>. Its own <code>allowed_types</code> can narrow this list but never widen it (<code>not_an_image_type</code>). Text documents are refused too, so the page does not offer New document.</td></tr>
+<tr><td><code>template</code></td><td>The files of a site's &ldquo;New from template&rdquo; choices.</td><td>See "Template and image libraries" below.</td></tr>
+<tr><td><code>asset</code></td><td>Logos and brand images, which branding (plan 4) will use.</td><td>Only administrators make one or change one away from the kind. Its other settings are its managers' to change. <code>GET /api/assets</code> lists the ones a person can view.</td></tr>
+</tbody></table></div>
+<p><strong>Changing the kind or any setting never touches the files already in the library.</strong> A file the new settings would refuse stays, and the listings mark it <code>"policy": "blocked"</code>; the page shows "Type not allowed here".</p>
+
+<h3>Folders off</h3>
+<p>A library with <code>folders</code> set to false refuses new folders, and the copy of a folder into it, and the move of a folder into it from another library, with <code>409 folders_off</code>. Folders already there stay. They can be emptied, deleted, restored, and moved around inside the same library. A site made from a template recreates the template's folders even in a folders-off library.</p>
+
+<h3>Any file type</h3>
+<p>A file that no editor opens is a document with the new editor value <code>other</code>. It has versions, a recycle bin entry, sharing and quota like any file. It opens as a preview where its type has one, and otherwise offers a download. Which name gets which editor:</p>
+<ul>
+<li>A name ending in an editor's own extension (<code>.txt</code>, <code>.xlsx</code>, <code>.docx</code>, <code>.pdf</code>, <code>.solidcraft.json</code>) opens in that editor, as before. Every other name is <code>other</code>.</li>
+<li><strong>Rename rules.</strong> An editor's file keeps its extension. An <code>other</code> file may take any extension except an editor's, which answers <code>422 wrong_extension</code>. Every new name is checked against the file policies below.</li>
+<li><code>POST /api/docs</code> with <code>editor: "other"</code> answers <code>400 upload_required</code>: such a file can only come in by upload. New versions come through upload sessions, as for editors' files. The editors' seat save refuses an <code>other</code> file, and a WebSocket to one answers <code>400</code>, since it has no editor.</li>
+<li>A name that is blocked is refused wherever it is typed, including a new text document in an image library.</li>
+</ul>
+
+<h3>File policies</h3>
+<p>A name is refused with <code>422 blocked_file_type {"extension"}</code> when its extension is in the organisation's block list, or when its library does not take it. A size over the library's <code>max_file_bytes</code> is refused with <code>413 file_too_large {"limit"}</code>. No type is blocked by default.</p>
+<ul>
+<li><strong>The order of the checks:</strong> the organisation's block list, then the library's <code>blocked_types</code>, then its effective allowed list (its <code>allowed_types</code>, or the image list for an image library, or every type); the name before the size.</li>
+<li><strong>The extension</strong> is the longest suffix of the name that is in the list being checked, matched without regard to case, so <code>.tar.gz</code> is tried before <code>.gz</code>. When a list does not hold the name's type, the answer names the name's own suffix from its last dot, or an empty string if it has none that can be an extension.</li>
+<li><strong>The organisation's list:</strong> <code>GET /api/settings/files</code> and <code>PUT /api/settings/files {blocked_file_types}</code>, administrators only. Entries are trimmed and lower-cased; a list that is not at most 100 valid, distinct extensions is <code>422 invalid_request</code>. The change is recorded as <code>setting.changed</code> and holds the tree lock while it is made.</li>
+</ul>
+<div class="table-wrap"><table class="banded"><caption>Where the policies are checked</caption>
+<thead><tr><th>Path into a library</th><th>What is checked</th></tr></thead>
+<tbody>
+<tr><td>An upload session starts, and again when it finishes (new file or new version)</td><td>Name, then the size the session declared. A refusal at the finish leaves the session open.</td></tr>
+<tr><td>A single-request upload (<code>POST /api/docs/upload</code>)</td><td>Name and declared <code>Content-Length</code> first; the actual size again once stored.</td></tr>
+<tr><td>A new text document</td><td>Name.</td></tr>
+<tr><td>A rename</td><td>The new name, when it changes.</td></tr>
+<tr><td>A copy, single or bulk, and New from template</td><td>Every file the copy makes: its name, then its size from the stored content.</td></tr>
+<tr><td>A move into <em>another</em> library, single or bulk</td><td>The file, or every live file below a moved folder: name, and the size of the current version. A move inside one library is not checked, since nothing new enters it.</td></tr>
+<tr><td>Restore from the recycle bin</td><td>Not refused. A restored file the policies now refuse is restored and marked.</td></tr>
+<tr><td>The editors' seat saves</td><td>Not checked. See the ruling below.</td></tr>
+</tbody></table></div>
+<p>A bulk item that is refused reports <code>extension</code> or <code>limit</code> in its own result. A folder move or copy is refused as a whole if any file in it is refused.</p>
+<div class="note"><p><strong>A ruling: editor saves are not held to a library's largest-file limit.</strong> An editor's save is the person's own work. Refusing it would lose what they have typed. So a spreadsheet can grow past the library's <code>max_file_bytes</code> while it is being edited. The limit governs what comes in from outside (uploads, copies, moves), not what the editors write.</p></div>
+
+<h3>Malware scanning over ICAP</h3>
+<p>The organisation runs its own scanner. ShareCraft talks to it over ICAP (RFC 3507) and never scans itself. The client is written in the server and has no extra dependency. Scanning is off until an administrator gives an address on the Sharing settings page (<strong>Malware scanner</strong>) or with <code>PUT /api/settings/scanner</code>.</p>
+<div class="table-wrap"><table class="banded"><caption>The scanner settings (administrators only)</caption>
+<thead><tr><th>Setting</th><th>Default</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td><code>scanner_url</code></td><td>empty</td><td><code>icap://host[:port]/service</code>, port 1344 if left out, an IPv6 host in brackets. No user name or password is accepted, so none can be stored. Empty means no scanner. A bad address is <code>422 invalid_scanner_url</code>.</td></tr>
+<tr><td><code>scanner_timeout_seconds</code></td><td>120 (5 to 3600)</td><td>The deadline for the <em>whole</em> scan: connecting, sending the file and reading the full answer. See the warning below.</td></tr>
+<tr><td><code>scanner_max_bytes</code></td><td>2 GiB</td><td>Content over this is not sent to the scanner. It is recorded <code>too_large</code>.</td></tr>
+<tr><td><code>scanner_unavailable</code></td><td><code>hold</code></td><td><code>hold</code>: content whose scan failed waits. <code>allow</code>: it is available anyway.</td></tr>
+<tr><td><code>scanner_too_large</code></td><td><code>hold</code></td><td><code>hold</code>: content over the size limit waits for an administrator. <code>allow</code>: it is available.</td></tr>
+</tbody></table></div>
+<p><code>PUT /api/settings/scanner</code> checks every value before changing any, records each change as <code>setting.changed</code>, then asks the scanner for its options and answers <code>{ok, server}</code> or <code>{ok: false, error}</code>. The settings are kept even when that test fails, so a scanner can be named before it is running (files wait meanwhile). The page's Test button sends the saved address again to run the same test, and records a <code>setting.changed</code> with no change.</p>
+<h4>How a scan goes</h4>
+<ul>
+<li>A worker sends each new content to the scanner as an ICAP <code>RESPMOD</code> request, the file as a chunked HTTP response body read from the content store in 64 KiB pieces. It is never held whole in memory. It asks <code>OPTIONS</code> first and honours the scanner's <code>Preview</code> and <code>100 Continue</code>. It runs at most 2 scans at once, wakes on every new upload and on settings changes, and looks for due work every 5 seconds.</li>
+<li><code>204</code>, or <code>200</code> with no infection header, is clean. <code>200</code> or <code>403</code> with <code>X-Infection-Found</code>, <code>X-Violations-Found</code> or <code>X-Virus-ID</code> is infected, and the threat name is kept (200 characters at most). Anything else, a bad answer, a refused connection or running out of time is a failure.</li>
+<li><strong>The result belongs to the content, not to the file.</strong> It is kept in the <code>blobs</code> row, so the same bytes uploaded twice are scanned once. Scan results live in the database, not in Git.</li>
+<li><strong>Retries.</strong> A failed scan is tried again after 1 minute, then 5, then 15, then every 60 minutes, for ever. Meanwhile the content stays held (unless <code>scanner_unavailable</code> is <code>allow</code>) and in the store.</li>
+</ul>
+<div class="table-wrap"><table class="banded"><caption>Scan states (the <code>scan</code> column of <code>blobs</code>)</caption>
+<thead><tr><th>State</th><th>Meaning</th><th>Available to open?</th></tr></thead>
+<tbody>
+<tr><td><code>pending</code></td><td>Waiting for the scanner.</td><td>No for an upload. Yes for content only ever saved by an editor, or queued by "Scan existing files". See below.</td></tr>
+<tr><td><code>clean</code></td><td>The scanner passed it.</td><td>Yes.</td></tr>
+<tr><td><code>infected</code></td><td>The scanner found a threat; its name is in <code>scan_detail</code>.</td><td>No. Quarantined.</td></tr>
+<tr><td><code>failed</code></td><td>The scanner could not be reached or gave no answer. Retried.</td><td>Only when <code>scanner_unavailable</code> is <code>allow</code>.</td></tr>
+<tr><td><code>too_large</code></td><td>Over <code>scanner_max_bytes</code>.</td><td>Only when <code>scanner_too_large</code> is <code>allow</code>.</td></tr>
+<tr><td><code>unscanned</code></td><td>Stored before the upgrade, or while no scanner was configured.</td><td>Yes.</td></tr>
+<tr><td><code>released</code></td><td>An administrator let it through.</td><td>Yes.</td></tr>
+</tbody></table></div>
+<h4>What is held, and for whom</h4>
+<ul>
+<li><strong>With no scanner configured</strong>, new content is <code>unscanned</code> and available at once. Content already found infected stays held. Clearing the scanner's address does not release content that is waiting or has failed.</li>
+<li><strong>Uploads are held until clean</strong>: a new file, a new version, and a copy made by New from template. Held means held for everybody, the uploader and administrators included. Administrators have one way through, Release.</li>
+<li><strong>Editor saves are scanned afterwards, not held.</strong> Holding them would stop people reopening a spreadsheet they had just saved. A save that is found infected is quarantined as soon as the scanner says so. The content's hold is decided once, for the content: if the same bytes were also uploaded, they are held. A text document's checkpoint is new content each time, so a text document being typed into causes a scan for each checkpoint. A text room that is open when its content is found infected keeps the text for the people already in it; new joins and downloads are refused.</li>
+<li><strong>A template whose content is still pending</strong> (an editor save not yet scanned) is not offered, and New from template with it answers <code>423 held</code> with <code>scan: "pending"</code>.</li>
+<li><strong>Routes that answer <code>423 held {"scan"}</code>:</strong> download, ranged download, a download of an older version, preview, thumbnail, an anyone link's download, text and preview, opening in an editor (the WebSocket upgrade, and the text room), copy (single and bulk), and New from template. Listing, renaming, moving, deleting and sharing still work. <code>GET /api/docs/&lt;id&gt;</code> still answers 200, with <code>scan</code> and <code>threat</code>, so the page can say why.</li>
+<li><strong>The marks.</strong> The document's own answer and every children listing, the anyone-link listing included, carry <code>"scan": "held"</code> or <code>"scan": "quarantined"</code> and, for the second, <code>threat</code>. Everybody who can see the file sees them. After an upload finishes, the upload panel asks once whether the file is held and says "Being checked for malware"; a file's page says the same, hides Download, and asks again every 10 seconds for up to 5 minutes.</li>
+</ul>
+<div class="note"><p><strong>Large files and the 120-second deadline.</strong> <code>scanner_timeout_seconds</code> covers the whole exchange, not each step, so a scanner that dribbles its answer cannot tie up a worker. The cost is that a very large file over a slow link to the scanner can run out of time. At the 2 GiB default limit, 120 seconds needs about 17 MiB a second. The scan is then recorded <code>failed</code> and retried, and would fail again. Raise the setting (up to 3600) for large files, or lower <code>scanner_max_bytes</code> so they wait for an administrator instead.</p></div>
+
+<h3>Files from before the upgrade, and "Scan existing files"</h3>
+<p>Content stored before the upgrade is <code>unscanned</code>. It was all editors' files, so it stays available and is not scanned automatically. An administrator can press <strong>Scan existing files</strong> on the Sharing settings page, or <code>POST /api/admin/scan-existing</code>, which queues all of it and answers how many files were queued (<code>{queued}</code>).</p>
+<ul>
+<li>Queued content stays available while it waits (state <code>pending</code>, no hold), and is quarantined if it turns out infected. So an infected old file can still be downloaded until its scan finishes.</li>
+<li>If the scan of queued content fails, it is held like a new upload, under the setting <code>scanner_unavailable: hold</code>.</li>
+<li>Content whose record was rebuilt from Git (section 10) is <code>unscanned</code>, whatever it was before.</li>
+</ul>
+
+<h3>Quarantine: release and delete</h3>
+<p>A file whose current version is infected is <strong>quarantined</strong>. Everyone who can see it sees the mark and the threat's name. Only administrators see the organisation's list, on the Quarantine page (<code>GET /api/admin/quarantine</code>), which also lists content held because its scan failed or it was too large. Site owners and the uploader cannot release it.</p>
+<ul>
+<li><strong>Release</strong> (<code>POST /api/admin/quarantine/&lt;sha256&gt;/release {reason}</code>): the reason is 3 to 500 characters. The content is marked <code>released</code> for every file that names it, and <code>content.released</code> records who, why and the state it was in. It works for infected, failed, too-large and pending content; anything else is <code>404</code>. A release made while a scan is running wins over its result.</li>
+<li><strong>Delete</strong> (<code>POST /api/admin/quarantine/&lt;sha256&gt;/delete</code>): purges every file whose <em>current</em> version names that content, skipping the recycle bin, and erases the content and its thumbnail once nothing names it. Content an older version still names stays. The page asks for confirmation and says how many files were deleted. <code>content.deleted</code> records who and how many. It cannot be undone.</li>
+</ul>
+
+<h3>Trying it: <code>cargo xtask fake-icap</code></h3>
+<p>A real ICAP server is not needed to see the whole thing work. <code>cargo xtask fake-icap</code> runs a small stand-in on <code>127.0.0.1</code> that finds the standard EICAR test string anywhere in a file, reports it as <code>Eicar-Test-Signature</code> and calls everything else clean. Then set the scanner address to <code>icap://127.0.0.1:1344/scan</code>.</p>
+<div class="table-wrap"><table class="banded"><caption>Options of <code>cargo xtask fake-icap</code></caption>
+<thead><tr><th>Option</th><th>Effect</th></tr></thead>
+<tbody>
+<tr><td><code>--port 1344</code></td><td>The port. 1344 is the ICAP default.</td></tr>
+<tr><td><code>--preview 1024</code></td><td>The <code>Preview</code> size it advertises. 1024 is the default, as with c-icap's ClamAV service. <code>--preview none</code> advertises none, so every file is sent whole.</td></tr>
+<tr><td><code>--slow</code></td><td>Waits 5 seconds before each answer, so you can watch a file being checked.</td></tr>
+<tr><td><code>--fail</code></td><td>Answers every scan with an ICAP server error, so files wait and are retried.</td></tr>
+</tbody></table></div>
+<p>Stopping it while a file is uploading shows the held-and-retried path; starting it again lets the file through at its next retry (the first retry is after a minute).</p>
+<div class="note"><p><strong>Do not keep the EICAR test file on a computer with antivirus.</strong> The bare 68-byte string is exactly what antivirus removes. The tests build it from parts at run time and never begin a file with it, for this reason. To test with a real file, put some other text before the string.</p></div>
+<h4>A real scanner</h4>
+<p>This section does not walk through installing one. The usual choice is ClamAV with <strong>c-icap</strong> and its ClamAV service module, run on a machine the organisation controls. The address then looks like <code>icap://scanner.example:1344/srv_clamav</code>; the service name is whatever the scanner calls its service. ShareCraft understands the headers <code>X-Infection-Found</code>, <code>X-Violations-Found</code> and <code>X-Virus-ID</code>. It was tested against the stand-in only (see "What was checked").</p>
+
+<h3>Your computer's own antivirus can delete stored files</h3>
+<div class="note"><p><strong>Warning.</strong> Antivirus on the computer that runs ShareCraft scans the data folder like any other folder, and it may delete a stored file. This happened on 14 November 2026: Windows Defender removed the EICAR test file from <code>data\blobs</code> (and, a minute before, from <code>data\uploads</code>), so the scan found the content missing.</p></div>
+<ul>
+<li><strong>What ShareCraft then shows.</strong> A content whose bytes have vanished cannot be scanned, so the scan is recorded <code>failed</code>, with the detail "the content is not in the store". The file stays held, listed for administrators on the Quarantine page without a threat name, and is retried on the schedule above. It is never let through by accident. An administrator can delete it there. A file that was already clean and then vanished cannot be downloaded.</li>
+<li><strong>What to decide.</strong> Uploads are already scanned by the ICAP scanner, so an organisation should decide whether to exclude the data folder (<code>SHARECRAFT_DATA</code>, section 9) from the host's scanning. Excluding it avoids files disappearing from under the server. Not excluding it adds a second scanner, at the cost of the problem above. Either is a choice for the organisation; ShareCraft does not make it.</li>
+<li>Backups should be taken as in section 19, from a copy of the data folder made before the antivirus has had its way, or with the folder excluded.</li>
+</ul>
+
+<h3>Previews</h3>
+<p><code>GET /api/docs/&lt;id&gt;/preview</code> (needs <code>view</code>, and available content) serves a file for the page to show. It chooses by the file's extension only, never by its bytes, and serves a short list of types a browser can show without running anything. Every other type answers <code>415 no_preview</code>, and a file with no version yet answers <code>204</code>. PDF still opens in PdfCraft, and the editors' files in their editors, as before.</p>
+<div class="table-wrap"><table class="banded"><caption>What has a preview</caption>
+<thead><tr><th>Kind</th><th>Extensions</th><th>Served as</th></tr></thead>
+<tbody>
+<tr><td>Images</td><td><code>png jpg jpeg gif webp avif bmp svg</code></td><td>The image's own type; <code>.svg</code> as <code>image/svg+xml</code>. Always whole.</td></tr>
+<tr><td>Audio</td><td><code>mp3 ogg wav m4a flac</code></td><td><code>audio/mpeg</code>, <code>audio/ogg</code>, <code>audio/wav</code>, <code>audio/mp4</code>, <code>audio/flac</code>. One range at a time (<code>206</code>, <code>416</code>).</td></tr>
+<tr><td>Video</td><td><code>mp4 webm mov</code></td><td><code>video/mp4</code> (also for <code>.mov</code>), <code>video/webm</code>. One range at a time.</td></tr>
+<tr><td>Text</td><td><code>txt md csv tsv log json xml yaml yml toml ini rs js ts py java c h cpp cs go rb php sh ps1 sql css html htm</code></td><td><code>text/plain; charset=utf-8</code>, the first 1 MiB. <code>415</code> unless the text is valid UTF-8 (a character cut by the 1 MiB limit is dropped).</td></tr>
+</tbody></table></div>
+<p><strong>The headers.</strong> Every preview carries the download's protections, apart from the disposition: a fixed <code>Content-Type</code> from the table, <code>Content-Disposition: inline</code> with the file name cleaned (quotes, backslashes, <code>%</code>, control characters and line breaks become <code>_</code>, and the full name goes in <code>filename*</code>), <code>X-Content-Type-Options: nosniff</code>, <code>Content-Security-Policy: sandbox</code>, <code>Cache-Control: no-store</code> and the revision header.</p>
+<p><strong>Why HTML is text only.</strong> A web page or script from someone else must never run on ShareCraft's address. <code>.html</code> and <code>.htm</code> are served as <code>text/plain</code>, so they show as source. An <code>.svg</code> can hold script, so it is shown only through an <code>&lt;img&gt;</code> element, which runs none, with the <code>sandbox</code> policy besides, and gets no thumbnail. A <code>.png</code> that is really HTML is served as <code>image/png</code> with <code>nosniff</code>, and the browser shows a broken image. The page puts text in with <code>textContent</code>, never as HTML.</p>
+<p><strong>Anyone links.</strong> <code>GET /api/l/&lt;token&gt;/preview/&lt;node&gt;</code> previews a file reached by an anyone link, folder links included, on the same rules and with the answers the link's content route gives (expired, archived site, or beyond a folder with its own permissions: <code>404 link_not_found</code>). It sets no cookie, sends no referrer and is never cached. The page shows held and quarantined files only as marks. There is no thumbnail route for links.</p>
+
+<h3>Thumbnails</h3>
+<p><code>GET /api/docs/&lt;id&gt;/thumbnail</code> (needs <code>view</code> and available content) answers a PNG of at most 256 pixels on its longer side, made from png, jpeg, gif (the first frame) and webp. Never enlarged. Anything else, or an image that cannot be read, answers <code>415 no_thumbnail</code>.</p>
+<div class="table-wrap"><table class="banded"><caption>Limits that keep a hostile image from using up the server</caption>
+<thead><tr><th>Limit</th><th>Value</th></tr></thead>
+<tbody>
+<tr><td>Size of the image file</td><td>64 MiB</td></tr>
+<tr><td>Dimensions, and the memory for the decoded picture plus the file</td><td>12,000 by 12,000 pixels, and 256 MiB. Read from the header, before any buffer is made.</td></tr>
+<tr><td>Frames in a GIF</td><td>1,000, counted without decoding</td></tr>
+<tr><td>A JPEG's scans</td><td>64 at most, and the pixels times the scans must stay under 1.5 billion. A file cut short is refused.</td></tr>
+<tr><td>Time to decode one</td><td>10 seconds</td></tr>
+<tr><td>Made at the same time</td><td>2, each off the server's request workers</td></tr>
+<tr><td>Waiting for a turn</td><td>10 seconds, then <code>503 busy</code></td></tr>
+</tbody></table></div>
+<ul>
+<li><strong>Made when first asked for</strong> and kept at <code>&lt;data&gt;/thumbs/&lt;xx&gt;/&lt;sha256&gt;.png</code>, with <code>Cache-Control: private, max-age=300</code>. The same content in two libraries has one thumbnail. Erasing the content erases its thumbnail.</li>
+<li><strong>The <code>.none</code> mark.</strong> When an image fails for a lasting reason (not an image, too large, too many frames or scans, cut short, a decode error, or the 10 seconds passing), an empty file <code>&lt;sha256&gt;.none</code> is kept beside it, and later requests answer <code>415</code> at once without opening the file. Failures that are not the image's fault (content missing, a disk error) leave no mark.</li>
+<li><strong>503 busy.</strong> When both turns stay taken for 10 seconds, the request answers <code>503 {"error": "busy"}</code> and leaves no mark, since nothing was tried. The grid asks again after 1, 2, 4 and 8 seconds, then shows a plain "No thumbnail" box. This matters in a grid of 200, where most requests queue.</li>
+<li>The page loads a thumbnail as an <code>&lt;img&gt;</code> pointing at this route. A <code>blob:</code> address is not used: the page's security policy (section 20) does not allow one.</li>
+<li>A children listing marks <code>"thumbnail": true</code> on image files with available content. <code>GET /api/nodes/&lt;id&gt;/children?view=grid</code> lists up to 200 at a time (<code>limit</code>, with the same cursor), for an image library; anywhere else, and for any other <code>view</code>, it is <code>422 invalid_request</code>.</li>
+</ul>
+
+<h3>Template and image libraries</h3>
+<ul>
+<li><strong>Template libraries.</strong> The live files in a site's <code>template</code> libraries, at any depth, are that site's &ldquo;New from template&rdquo; choices in every library of the site. <code>GET /api/libraries/&lt;id&gt;/templates</code> lists the ones the person can view and whose content is available (so not held, infected, or still pending), by name, each <code>{id, name, editor, library, library_name, revised_at}</code>. A file with no version yet is not offered. Nothing from another site is ever offered or reachable (<code>404</code>).</li>
+<li><strong>New from template.</strong> <code>POST /api/libraries/&lt;id&gt;/from-template {template, parent?, name?}</code> copies one into the library, or into its folder <code>parent</code>, through the ordinary copy path (section 25): the person needs <code>view</code> on the template and <code>add</code> where it goes, and the quota, name cleaning, <code>(2)</code> uniqueness, file policies and folders-off all apply. The copy is the template's latest version only, with no history. A name given without the template's extension gets it. It answers <code>201 {node, renamed}</code>, as a copy does. The library page shows a New from template form when there is any template and the person can add.</li>
+<li><strong>Image libraries</strong> take only the image types, show the List and Grid switch (the choice is remembered in the viewer's own browser), and lazy-load thumbnails as tiles come into view.</li>
+</ul>
+
+<h3>Routes</h3>
+<div class="table-wrap"><table class="banded"><caption>New routes. "Admin" means an enabled administrator.</caption>
+<thead><tr><th>Route</th><th>Who may call it</th><th>What it does</th></tr></thead>
+<tbody>
+<tr><td><code>GET /api/libraries/&lt;id&gt;</code></td><td>Anyone who can view it</td><td>The library's kind and settings, and <code>effective_allowed_types</code> (what it takes in effect; null for every type). <code>404</code> otherwise.</td></tr>
+<tr><td><code>PATCH /api/libraries/&lt;id&gt;</code></td><td><code>manage_site</code> (<code>asset</code> kind also needs an administrator)</td><td>Sets <code>description</code>, <code>kind</code>, <code>folders</code>, <code>allowed_types</code>, <code>blocked_types</code>, <code>max_file_bytes</code>; only fields given. One commit, <code>library.changed</code>. <code>403 archived</code> on an archived site.</td></tr>
+<tr><td><code>POST /api/sites/&lt;id&gt;/libraries {name, kind?}</code></td><td><code>manage_site</code> (<code>asset</code> kind also needs an administrator)</td><td>Makes a library (<code>document</code> if no kind), with the default settings. 201.</td></tr>
+<tr><td><code>GET /api/assets</code></td><td>Anyone signed in</td><td>The asset libraries they can view, by name, with their settings.</td></tr>
+<tr><td><code>GET /api/libraries/&lt;id&gt;/templates</code></td><td>Anyone who can view the library</td><td>The "New from template" choices of its site.</td></tr>
+<tr><td><code>POST /api/libraries/&lt;id&gt;/from-template</code></td><td><code>add</code> in the library or folder, and <code>view</code> on the template</td><td>Copies a template in. <code>201 {node, renamed}</code>.</td></tr>
+<tr><td><code>GET /api/docs/&lt;id&gt;/preview</code></td><td><code>view</code></td><td>The preview, if the type has one.</td></tr>
+<tr><td><code>GET /api/docs/&lt;id&gt;/thumbnail</code></td><td><code>view</code></td><td>A 256-pixel PNG of an image.</td></tr>
+<tr><td><code>GET /api/l/&lt;token&gt;/preview/&lt;node&gt;</code></td><td>Anyone holding a live link that reaches the file</td><td>The same preview, without signing in.</td></tr>
+<tr><td><code>GET /api/nodes/&lt;id&gt;/children?view=grid</code></td><td>As the ordinary listing</td><td>Up to 200 at a time, in an image library only.</td></tr>
+<tr><td><code>GET /api/settings/files</code>, <code>PUT /api/settings/files</code></td><td>Admin</td><td>The organisation's blocked file types.</td></tr>
+<tr><td><code>GET /api/settings/scanner</code>, <code>PUT /api/settings/scanner</code></td><td>Admin</td><td>The five scanner settings; the PUT tests the scanner.</td></tr>
+<tr><td><code>GET /api/admin/quarantine</code></td><td>Admin</td><td>Infected and held content, with threat or reason, size, scan time and the paths of the files that name it.</td></tr>
+<tr><td><code>POST /api/admin/quarantine/&lt;sha256&gt;/release {reason}</code></td><td>Admin</td><td>Lets content through. Answers <code>{sha256, scan}</code>.</td></tr>
+<tr><td><code>POST /api/admin/quarantine/&lt;sha256&gt;/delete</code></td><td>Admin</td><td>Purges the files that name it and erases it. Answers <code>{sha256, documents, erased}</code>.</td></tr>
+<tr><td><code>POST /api/admin/scan-existing</code></td><td>Admin</td><td>Queues the unscanned content. Answers <code>{queued}</code>.</td></tr>
+</tbody></table></div>
+<p>Changed answers: <code>POST /api/docs/upload</code>, upload sessions, rename, move, copy and bulk now apply the policies. The upload finish and every children listing can carry <code>scan</code>, <code>threat</code>, <code>policy</code> and <code>thumbnail</code>. The write routes above answer <code>403 archived</code> on an archived site.</p>
+<p>The web pages that go with them: Library settings (<code>library-settings.html</code>, for <code>manage_site</code>), Quarantine (<code>quarantine.html</code>, administrators), and on the Sharing settings page the blocked types, the scanner and Scan existing files. New library on a site page has a Kind choice, and asset is offered to administrators only.</p>
+
+<h3>New events</h3>
+<div class="table-wrap"><table class="banded"><caption>Events recorded (section 11 says how an owner reads them)</caption>
+<thead><tr><th>Event</th><th>When</th></tr></thead>
+<tbody>
+<tr><td><code>library.changed</code></td><td>A library's settings changed (<code>name</code> and <code>fields</code>, each with <code>from</code> and <code>to</code>), or a row was repaired from Git.</td></tr>
+<tr><td><code>content.scanned</code></td><td>A scan ended: <code>sha256</code>, <code>result</code> and <code>detail</code> (the threat, or the reason it failed). It has no actor.</td></tr>
+<tr><td><code>content.released</code></td><td>An administrator released content: <code>sha256</code>, <code>reason</code>, and the state it was <code>from</code>. The actor is the administrator.</td></tr>
+<tr><td><code>content.deleted</code></td><td>An administrator deleted quarantined content: <code>sha256</code> and <code>documents</code> (how many).</td></tr>
+<tr><td><code>setting.changed</code></td><td>Also for <code>blocked_file_types</code> and the five scanner settings.</td></tr>
+<tr><td><code>node.purged</code></td><td>Also for each file a quarantine delete purged, with <code>quarantined</code> set.</td></tr>
+</tbody></table></div>
+<h3>New error codes</h3>
+<div class="table-wrap"><table class="banded"><caption>New answers</caption>
+<thead><tr><th>Answer</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td><code>422 blocked_file_type {extension}</code></td><td>The name's type is blocked by the organisation or not taken by the library.</td></tr>
+<tr><td><code>413 file_too_large {limit}</code></td><td>Over the library's largest file, in bytes.</td></tr>
+<tr><td><code>409 folders_off</code></td><td>The library takes no new folders.</td></tr>
+<tr><td><code>423 held {scan}</code></td><td>The scanner has not passed this content. <code>scan</code> is its state.</td></tr>
+<tr><td><code>415 no_preview</code>, <code>415 no_thumbnail</code></td><td>The type has none, or the thumbnail cannot be made.</td></tr>
+<tr><td><code>503 busy</code></td><td>Both thumbnail turns stayed taken for 10 seconds. Ask again.</td></tr>
+<tr><td><code>422 invalid_library_settings {reason}</code></td><td>One of <code>invalid_schema</code>, <code>invalid_kind</code>, <code>invalid_description</code>, <code>too_many_types</code>, <code>invalid_extension</code>, <code>duplicate_type</code>, <code>no_types</code> (an empty allowed list; null means every type), <code>not_an_image_type</code>, <code>invalid_max_file_bytes</code>, or <code>refused</code> (the database's own check refused it).</td></tr>
+<tr><td><code>422 invalid_scanner_url</code></td><td>The scanner address is not <code>icap://host[:port]/service</code>, or has a user name.</td></tr>
+<tr><td><code>422 wrong_extension</code></td><td>An <code>other</code> file renamed to an editor's extension.</td></tr>
+<tr><td><code>400 upload_required</code></td><td>A file of type <code>other</code> can only be uploaded.</td></tr>
+</tbody></table></div>
+
+<h3>Upgrading: migration 0014</h3>
+<p><code>0014_libraries</code> adds the <code>libraries</code> table (a row with the defaults for every existing library), widens the editor check on documents to take <code>other</code>, adds the scan columns to <code>blobs</code> (every existing row is <code>unscanned</code>) and adds the settings rows for the blocked types and the scanner. The server also starts keeping thumbnails in a new <code>thumbs</code> folder of the data folder, and builds with the <code>image</code> crate (section 28). Like the earlier migrations it is <strong>one way</strong>: a server from before this plan cannot run against the database afterwards. <strong>Back up the data folder and the database together before upgrading</strong> (section 19). The first start after the upgrade writes no library files; each is written at the library's first change.</p>
+
+<h3>What was checked, and what was not</h3>
+<p>The server and web tests pass. The pages were also checked by hand in a browser on 14 November 2026 against a real server and database after migration 0014, with the stand-in scanner: scanner settings and Test; uploads of a <code>.png</code>, <code>.zip</code>, <code>.txt</code> and <code>.html</code>, each held and then available; previews of an image, text and an HTML file shown as text, and "No preview for this type" for a <code>.zip</code>; an image library with a grid of thumbnails and a <code>.zip</code> refused with a plain message; a template library and New from template; folders off; the organisation's block list (<code>.exe, .bat</code>, with <code>Setup.EXE</code> refused); the scanner stopped, a new upload waiting, and the scanner restarted with the file clean about 80 seconds later; the Quarantine page with a file holding the test string quarantined with its threat name, Release with a reason, and Delete with its confirmation; and the library page at 375 pixels wide in dark mode with banded rows. There were no errors in the server log.</p>
+<p><strong>Not checked:</strong> audio and video previews in the browser; anyone-link previews in the browser (the server tests cover them); another person's view of a quarantined file in the browser; Firefox and Safari; a screen reader; a real ICAP scanner (ClamAV with c-icap was not installed, so only the stand-in was used).</p>
+<p><strong>Found in that check and fixed:</strong> the thumbnails in the grid showed as broken images, because the page's policy refuses <code>blob:</code> images (they now load from the route, and six thumbnails were seen); the image library offered New document for types it would refuse (it now offers only what the library takes). A small infected file seemed to be failing its scan, but the cause was the computer's own antivirus deleting the stored test file, described above; the scanner client was right and a test now covers small infected files inside an ICAP preview.</p>
+<p><strong>Left as they are:</strong></p>
+<ul>
+<li>Names may hold invisible Unicode (a right-to-left override, zero-width characters), so a name can look like another extension. The policies judge the real characters.</li>
+<li>A copy's <code>(2)</code> goes before the last dot, so <code>a.tar.gz</code> becomes <code>a.tar (2).gz</code>.</li>
+<li>A single-file anyone link to a held file still shows Download, and its preview is refused with <code>423</code>.</li>
+<li>The library settings page shows the largest file in megabytes, so saving a value it rounded sends a slightly different limit.</li>
+<li>The template list judges access one file at a time, which is slow for thousands of templates.</li>
+<li>The scanner's Test records a <code>setting.changed</code> even when nothing changed.</li>
+<li>Under the full parallel test run, a few server tests time out signing in at their start. Run alone, they pass.</li>
+</ul>
+</section>
+
+<section id="licences"><h2>28 / Licences</h2>
 <p>ShareCraft is licensed <strong>MIT OR Apache-2.0</strong>; the texts are in <code>LICENSE-MIT</code> and <code>LICENSE-APACHE</code>. <code>cargo xtask check</code> refuses any dependency whose licence has no non-copyleft option (GPL, LGPL, AGPL, MPL, EUPL, CDDL, SSPL).</p>
 <p>The <code>revisions</code> crate stores documents in Git using <code>gix</code> (gitoxide), a Git implementation written in Rust and licensed MIT or Apache 2.0. No C library is involved and no copyleft code is linked. Repositories it writes are ordinary Git repositories: the <code>git</code> command line reads them as usual.</p>
 <p>Time zones and dates are handled by the <code>jiff</code> crate, licensed MIT or Unlicense (the choice is ours, and we take MIT). No copyleft code is linked.</p>
+<p>Thumbnails are made with the <code>image</code> crate, licensed MIT or Apache 2.0 (we take MIT). It is built with only its PNG, JPEG, GIF and WebP decoders and its PNG encoder, and the crates those bring with them carry the same kind of licence. No copyleft code is linked.</p>
 <p>The four editors are licensed MIT or Apache 2.0, by their original authors. They are not part of ShareCraft's code and are not compiled into the server. The build tool copies each fork's licence, notice and attribution files into the installed editor's <code>licenses/</code> folder; what each fork changed is listed in its <code>NOTICE</code> and in <a href="editors.html">editors.html</a>.</p>
 </section>
 
-<footer>ShareCraft · ThineCraft · Building and running · Updated 14 November 2026<br>Describes the development build after the third Stage 1 plan (editors, one person at a time; merged into <code>main</code> on 10 November 2026) and the follow-up (editors keep their document when hosted), the first Stage 2 plan (the content tree and inherited permissions), and the second (groups, roles and the inheritance explorer; on the branch <code>platform-groups-roles</code>, not yet merged), and the third (sharing links and access requests; on the branch <code>platform-links-requests</code>, not yet merged), then plan 3A (files; merged into <code>main</code> on 14 November 2026) and plan 3B (sites; on the branch <code>platform-sites</code>, not yet merged). Not a release.</footer>
+<footer>ShareCraft · ThineCraft · Building and running · Updated 14 November 2026<br>Describes the development build after the third Stage 1 plan (editors, one person at a time; merged into <code>main</code> on 10 November 2026) and the follow-up (editors keep their document when hosted), the first Stage 2 plan (the content tree and inherited permissions), and the second (groups, roles and the inheritance explorer; on the branch <code>platform-groups-roles</code>, not yet merged), and the third (sharing links and access requests; on the branch <code>platform-links-requests</code>, not yet merged), then plan 3A (files; merged into <code>main</code> on 14 November 2026), plan 3B (sites; merged into <code>main</code> on 14 November 2026) and plan 3C (libraries; on the branch <code>platform-libraries</code>, not yet merged). Not a release.</footer>
 </main></div>
 </body>
 </html>
