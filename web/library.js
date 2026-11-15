@@ -47,6 +47,7 @@ import {
 } from './upload.js';
 import { setupMenu } from './menu.js';
 import { addPaletteActions } from './palette.js';
+import { createDetails } from './details.js';
 import { fileIcon, fileKind, nextSort, parseSort, relativeTime, sortDescription, sortEntries, typeLabel } from './files.js';
 
 const BULK_MAX = 500;
@@ -137,6 +138,24 @@ let templates = [];
 let creating = null; // what the create dialog makes: 'folder', 'doc:<editor>' or 'template'
 let actionsFor = null; // the item whose Actions menu was used last, so focus can go back to it
 let sort = loadSort(); // the list's order, remembered per viewer
+// The details pane beside the table (a sheet on narrow screens): preview, facts and access of
+// the selected row, with the row actions. Only for the list; the grid of an image library has none.
+const details = createDetails({
+  pane: $('details-pane'),
+  sheet: $('details-sheet'),
+  status: $('details-status'),
+  rows: $('file-rows'),
+  page: $('lib-body').closest('.page'),
+  entry: (id) => items.find((item) => item.id === id) ?? null,
+  act: (key, item) => {
+    actionsFor = item.id;
+    if (key === 'rename') askRename(item);
+    else if (key === 'move') askMove([item], 'move');
+    else if (key === 'delete') askDelete([item]);
+  },
+  me,
+  enabled: () => view === 'list',
+});
 
 $('more').addEventListener('click', () => loadPage());
 setupViews();
@@ -202,6 +221,7 @@ function render() {
   $('file-rows').replaceChildren(...(grid ? [] : sortEntries(items, sort.key, sort.direction).map(row)));
   showSort();
   showSelection();
+  details.redraw();
   // After a rename (or anything else chosen from a row's menu) focus goes back to that row's
   // Actions button, when the row is still there and focus has not gone anywhere else.
   if (lostFocus && actionsFor) {
@@ -420,7 +440,7 @@ function row(item) {
   }
   const type = typeLabel(item);
   const modified = modifiedCell(item);
-  return h(
+  const tr = h(
     'tr',
     {},
     h('td', { class: 'c-select' }, box),
@@ -452,6 +472,8 @@ function row(item) {
     h('td', { class: 'c-sharing' }, ...sharingMarks(item)),
     h('td', { class: 'c-actions' }, actionsMenu(item)),
   );
+  details.row(tr, item);
+  return tr;
 }
 
 /** The Modified cell: "5 minutes ago", with the exact time in its title and for screen readers. */
@@ -477,10 +499,9 @@ function sharingMarks(item) {
   ].filter(Boolean);
 }
 
-/** A row's Actions menu ("⋯"): Rename, Move…, Copy…, Delete and Access, as far as allowed. */
+/** A row's Actions menu ("⋯"): Details, then Rename, Move…, Copy…, Delete and Access, as far as allowed. */
 function actionsMenu(item) {
-  const entries = rowMenu(item);
-  if (entries.length === 0) return null;
+  const entries = ['details', ...rowMenu(item)];
   const button = h(
     'button',
     { type: 'button', class: 'plain menu-button dots', 'aria-label': `Actions for ${item.name}`, 'data-for': item.id },
@@ -498,6 +519,7 @@ function actionsMenu(item) {
     'ul',
     { class: 'menu end', id: `actions-${item.id}`, 'aria-label': `Actions for ${item.name}` },
     ...entries.map((entry) => {
+      if (entry === 'details') return choose('Details', () => details.show(item, { focus: true }));
       if (entry === 'rename') return choose('Rename', () => askRename(item));
       if (entry === 'move') return choose('Move…', () => askMove([item], 'move'));
       if (entry === 'copy') return choose('Copy…', () => askMove([item], 'copy'));

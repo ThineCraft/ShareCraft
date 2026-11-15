@@ -66,6 +66,8 @@
  <ul id="bulk-results" class="list" hidden></ul>
  <p id="sort-status" class="visually-hidden" role="status" aria-live="polite"></p>
  <p id="sort-note" class="meta" hidden></p>
+ <div id="lib-body" class="lib-body">
+ <div class="lib-main">
  <div id="sort-narrow" class="sort-narrow" hidden>
   <label for="sort-select">Sort by</label>
   <select id="sort-select">
@@ -93,7 +95,13 @@
  <ul id="items" class="list" aria-labelledby="items-heading" hidden></ul>
  <p id="empty" hidden>There is nothing here yet.</p>
  <p><button type="button" id="more" class="plain" hidden>Show more</button></p>
+ </div>
+ <aside id="details-pane" class="details-pane" aria-labelledby="details-heading" hidden></aside>
+ </div>
+ <p id="details-status" class="visually-hidden" role="status" aria-live="polite"></p>
 </div>
+
+<dialog id="details-sheet" class="details-sheet" aria-labelledby="details-heading"></dialog>
 
 <div id="drop-overlay" class="drop-overlay" aria-hidden="true">
  <div class="drop-card">
