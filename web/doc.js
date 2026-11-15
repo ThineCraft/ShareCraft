@@ -19,6 +19,7 @@ import {
   linkNearestPlace,
   siteChrome,
 } from './common.js';
+import { forgetOpened, rememberOpened } from './start.js';
 
 const FIRST_DELAY = 500;
 const MAX_DELAY = 8000;
@@ -57,7 +58,7 @@ let closedBeforeJoin = 0; // closes in a row, before joining, while the document
 // Another document was chosen by editing the address.
 addEventListener('hashchange', () => location.reload());
 
-await requireMe();
+const me = await requireMe();
 const docId = documentId();
 if (!docId) {
   showProblem(MISSING);
@@ -68,6 +69,7 @@ if (!detail.ok) {
   if (detail.status === 404) {
     showProblem(MISSING);
     offerRequest($('problem'), docId);
+    forgetOpened(me.id, docId); // gone, or no longer shared: off the start page's Recently opened
   } else {
     showProblem(messageFor(detail.error));
   }
@@ -80,6 +82,7 @@ if (detail.data.editor !== 'text') {
 }
 showDetail(detail.data);
 await showPlace();
+rememberOpened(me.id, { id: docId, name: detail.data.name, editor: 'text', site: path?.[0]?.name ?? '' });
 $('editor').hidden = false;
 setRole(detail.data.access);
 

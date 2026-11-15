@@ -533,3 +533,62 @@ body.dragging .drop-overlay{display:flex}
  .file-icon .ink{fill:Canvas}
  .file-icon .line,.file-icon .fold{stroke:Canvas}
 }
+/* the start page (index.html): a greeting with one large search field, Filters behind a
+   disclosure, the Recently opened strip and the site cards. A card's name is its one link,
+   stretched over the whole card; the band takes the site's accent through --card-accent */
+.page.start{max-width:1240px}
+.start-head{padding:8px 0 4px}
+.start-title{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px 16px}
+.page .start-title h1{font-size:26px;line-height:1.25;margin:16px 0 8px;overflow-wrap:anywhere}
+.start-find{display:flex;flex-wrap:wrap;align-items:center;gap:6px 12px;margin:4px 0 0}
+.find-label{flex-basis:100%;font-size:13px}
+.start-find input[type=search]{flex:1 1 320px;max-width:680px;min-width:0;min-height:48px;padding:10px 14px;border:1px solid var(--line);border-radius:10px;background:var(--paper);font-size:16px}
+.start-find input[type=search]:focus-visible{border-color:var(--accent-ink)}
+.start-filters{flex-basis:100%}
+.start-filters summary{display:inline-flex;align-items:center;gap:6px;min-height:36px;padding:4px 14px;border:1px solid var(--line);border-radius:20px;background:var(--paper);color:var(--accent-ink);cursor:pointer;list-style:none}
+.start-filters summary::-webkit-details-marker{display:none}
+.start-filters summary::after{content:"▾" / "";font-size:11px}
+.start-filters[open] summary::after{content:"▴" / ""}
+.start-filters summary:hover{background:var(--soft)}
+.start-filters .filters{margin:10px 0 0;align-items:flex-end}
+.start-section h2{margin:24px 0 10px}
+.start-section .meta:empty{display:none}
+.recent{list-style:none;display:flex;flex-wrap:wrap;gap:8px;margin:0;padding:0}
+.recent-file{display:flex;align-items:center;gap:10px;flex:0 1 270px;min-width:0;padding:6px 4px 6px 12px;border:1px solid var(--line);border-radius:10px;background:var(--paper)}
+.recent-text{display:flex;flex-direction:column;flex:1;min-width:0;line-height:1.35}
+.recent-text a{font-weight:600;color:var(--text);text-decoration:none;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.recent-text a:hover,.recent-text a:focus-visible{color:var(--accent-ink);text-decoration:underline}
+.recent-text small{color:var(--muted);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.recent .remove{flex:none;min-width:32px;min-height:32px;padding:0;border-color:transparent;color:var(--muted);font-size:18px;line-height:1}
+.recent .remove:hover{color:var(--stop-ink);background:var(--stop-bg)}
+.site-cards{list-style:none;display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:14px;margin:0 0 12px;padding:0}
+.site-card{position:relative;display:flex;flex-direction:column;min-width:0;border:1px solid var(--line);border-radius:12px;background:var(--paper);transition:border-color .15s,box-shadow .15s}
+.site-card:hover{border-color:var(--accent-ink);box-shadow:0 4px 16px rgb(0 0 0/.1)}
+.card-band{display:flex;align-items:flex-end;height:52px;padding:0 14px;border-radius:11px 11px 0 0;background:var(--card-accent,var(--accent))}
+.card-band .site-mark{width:44px;height:44px;transform:translateY(50%);border:2px solid var(--paper);border-radius:10px;font-size:15px}
+.card-body{display:flex;flex-direction:column;flex:1;gap:4px;padding:30px 14px 14px;min-width:0}
+.card-body h3{margin:0;font-size:16px;line-height:1.3}
+.card-link{color:var(--text);text-decoration:none;overflow-wrap:anywhere}
+.card-link::after{content:"";position:absolute;inset:0;border-radius:12px}
+.card-link:focus-visible{outline:none}
+.card-link:focus-visible::after{outline:2px solid var(--accent-ink);outline-offset:2px}
+.site-card:hover .card-link{color:var(--accent-ink);text-decoration:underline}
+.card-badges{display:flex;flex-wrap:wrap;gap:4px;margin:0}
+.card-kind,.card-role{margin:0;font-size:12px;color:var(--muted)}
+.card-description{margin:0;font-size:13px;overflow-wrap:anywhere;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;line-clamp:2;overflow:hidden}
+.card-role{margin-top:auto;padding-top:6px}
+/* one column: the cards and the recent files read as rows, so every second one is shaded */
+@media (max-width:600px){
+ .page .start-title h1{font-size:22px}
+ .site-cards{grid-template-columns:minmax(0,1fr)}
+ .site-card:nth-child(even),.recent-file:nth-child(even){background-image:linear-gradient(var(--band),var(--band))}
+ .recent-file{flex-basis:100%}
+}
+@media (max-width:760px){
+ .start-filters summary,.recent .remove{min-height:44px;min-width:44px}
+}
+@media (prefers-reduced-motion:reduce){.site-card{transition:none}}
+@media (forced-colors:active){
+ .card-band{border-bottom:1px solid CanvasText}
+ .card-link:focus-visible::after{outline-color:Highlight}
+}

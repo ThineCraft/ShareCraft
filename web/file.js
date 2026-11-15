@@ -36,6 +36,7 @@ import {
   linkNearestPlace,
   siteChrome,
 } from './common.js';
+import { forgetOpened, rememberOpened } from './start.js';
 
 const FIRST_DELAY = 500;
 const MAX_DELAY = 8000;
@@ -126,7 +127,10 @@ async function main() {
   const detail = await api('GET', `/docs/${seg(docId)}`);
   if (!detail.ok) {
     showProblem(detail.status === 404 ? MISSING_DOCUMENT : messageFor(detail.error));
-    if (detail.status === 404) offerRequest($('problem'), docId);
+    if (detail.status === 404) {
+      offerRequest($('problem'), docId);
+      forgetOpened(me.id, docId); // gone, or no longer shared: off the start page's Recently opened
+    }
     return;
   }
   if (detail.data.editor === 'text') {
@@ -136,6 +140,7 @@ async function main() {
   }
   doc = detail.data;
   await showPlace();
+  rememberOpened(me.id, { id: docId, name: doc.name, editor: doc.editor, site: path?.[0]?.name ?? '' });
   knownRevision = doc.revision ?? null;
   showDetail();
   setRole(doc.access);
