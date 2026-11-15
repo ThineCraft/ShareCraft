@@ -1,0 +1,470 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ShareCraft — Branding (Plan 4A): Implementation Plan</title>
+<style>
+:root{color-scheme:light dark;--ink:light-dark(#172f38,#e4ecef);--muted:light-dark(#536b72,#a9b9bf);--line:light-dark(#d7e2e3,#36454b);--paper:light-dark(#fff,#1d272b);--wash:light-dark(#f2f6f5,#141b1e);--accent:light-dark(#3156c9,#9db4ff);font:15px/1.6 Segoe UI,system-ui,sans-serif;color:var(--ink);background:var(--wash)}
+*{box-sizing:border-box}body{margin:0;padding:28px 18px 80px}main{max-width:940px;margin:auto}
+h1{font-size:1.9rem;letter-spacing:-.03em;line-height:1.2;margin:0 0 14px}h2{font-size:1.3rem;margin:38px 0 12px;padding-top:18px;border-top:1px solid var(--line)}h3{font-size:1.08rem;margin:30px 0 8px}h4{font-size:.95rem;margin:16px 0 6px}
+p{margin:0 0 12px}ul,ol{margin:0 0 12px;padding-left:22px}li{margin-bottom:6px}a{color:var(--accent)}
+code{font-family:Consolas,Menlo,monospace;font-size:.88em;background:light-dark(#e9efee,#263238);padding:1px 5px;border-radius:3px;overflow-wrap:anywhere}
+pre{background:var(--paper);border:1px solid var(--line);border-radius:7px;padding:12px 14px;overflow-x:auto;font:13px/1.5 Consolas,Menlo,monospace;margin:0 0 12px}pre code{background:none;padding:0;font-size:inherit}
+.note{border-left:4px solid var(--accent);background:var(--paper);padding:12px 16px;margin:0 0 14px}.note p:last-child{margin:0}
+.task{background:var(--paper);border:1px solid var(--line);border-radius:9px;padding:6px 20px 14px;margin:18px 0}
+ol.steps{list-style:none;padding-left:0}ol.steps>li{padding-left:28px;position:relative;margin-bottom:10px}ol.steps>li::before{content:"☐";position:absolute;left:2px;color:var(--muted)}
+table{border-collapse:collapse;width:100%;font-size:.9rem;background:var(--paper);margin-bottom:14px}th,td{border:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top}th{background:light-dark(#e8efed,#263238)}
+.small{font-size:.88rem;color:var(--muted)}
+tbody tr:nth-child(even) td{background:light-dark(#f4f8f7,#212b30)}
+ol.steps>li:nth-child(even),ul.band>li:nth-child(even),ol.band>li:nth-child(even){background:light-dark(#f4f8f7,#212b30);border-radius:4px}
+</style>
+</head>
+<body><main>
+<h1>Plan 4A, branding: themes, logos, headers and footers: implementation plan</h1>
+<p class="small">ShareCraft &middot; Stage 2, platform track &middot; Written 15 November 2026</p>
+<div class="note"><p><strong>For agentic workers:</strong> REQUIRED SUB-SKILL: use superpowers:subagent-driven-development or superpowers:executing-plans. Steps are checkboxes.</p></div>
+
+<p><strong>Goal:</strong> an organisation can keep approved themes and brand images in one brand centre. Each site can then have its own look: a theme that works in light and dark, a logo and logo thumbnail, a header layout, a navigation style and a footer. Owners preview a look before applying it and can go back to an earlier one. ShareCraft's own controls stay neutral, and status colours and warnings are never recoloured.</p>
+<p><strong>Architecture:</strong>
+<ul>
+<li><strong>Records:</strong> the brand centre is a Git JSON record, <code>org/brand.json</code>. A site's look is a new <code>look</code> field on its existing site record. Both follow the established pattern: one commit per change, mirrored to PostgreSQL afterwards, taken back if the database refuses, and repaired at start.</li>
+<li><strong>Images:</strong> brand images are snapshots. Applying an image pins its content in the content store, so later changes to the library file do not touch the brand. A new route serves the image to anyone signed in.</li>
+<li><strong>Pages:</strong> each page fetches the site's effective look (with the hub rule already applied). <code>siteChrome</code> then sets the theme's colour variables through the CSS object model, which the current Content Security Policy allows, and builds the header and footer. Previews use the same function on a draft.</li>
+<li><strong>Contrast:</strong> the contrast check and the dark-colour derivation exist twice, in Rust (authoritative) and in JavaScript (live feedback). Both are tested against one shared table of test values.</li>
+</ul></p>
+<p><strong>Tech stack:</strong> the existing workspace (axum, sqlx, gix and the <code>image</code> crate for image sizes), and plain HTML and JS pages with node tests. No new dependency.</p>
+<p><strong>Spec:</strong> <a href="../scope.html">scope.html</a>:
+<ul>
+<li>SC-25, organisation and site branding;</li>
+<li>D13 (own identity, not SharePoint's look);</li>
+<li>D23 and D31 (plan 4 is branding);</li>
+<li>D39 (asset libraries hold logos and brand images);</li>
+<li>acceptance test A18.</li>
+</ul></p>
+
+<h2>Proposals in this plan for the owner to check</h2>
+<p class="small">The owner asked for the plan to be written without stopping for questions. These are the choices it makes. Each is cheap to change before the build starts.</p>
+<ol class="band">
+<li><strong>Plan 4 is split in two:</strong>
+<ul>
+<li>This plan, <strong>4A</strong>, covers the brand centre (themes and brand images), site looks, Change the look with preview, history and rollback, the hub rule, and the look carried into the editor frame.</li>
+<li><strong>4B</strong> covers font packages, copying branding from another site, branding in site templates and the API, limiting site owners to approved options (including hiding the default themes), mega menus, the browser-tab icon, and branded emails and portals.</li>
+</ul></li>
+<li><strong>Brand images are snapshots seen by anyone signed in.</strong>
+<ul>
+<li>Applying an image copies a reference to its exact content.</li>
+<li>Everyone signed in can see it, even without access to the asset library it came from.</li>
+<li>A changed or deleted library file does not change the brand until the image is chosen again.</li>
+</ul></li>
+<li><strong>The hub rule:</strong>
+<ul>
+<li>A site in a hub uses the hub's theme.</li>
+<li>Its own logo, header, navigation style and footer stay its own.</li>
+<li>Its own theme is kept, unused, and comes back when it leaves the hub.</li>
+<li>The owner can still edit it while the site is in a hub; the page says the hub's theme is in use.</li>
+</ul></li>
+<li><strong>Unreadable colours are refused.</strong>
+<ul>
+<li>A look whose text or buttons fall below WCAG AA contrast (4.5:1) in light or dark mode cannot be applied.</li>
+<li>The page shows which pair fails and suggests the nearest passing shade.</li>
+</ul></li>
+<li><strong>Themes are copied into the look.</strong>
+<ul>
+<li>A site look holds its theme's colours, plus a note of where the theme came from.</li>
+<li>Editing or deleting a brand-centre theme never breaks a site.</li>
+<li>Change the look marks a theme whose source has changed since it was applied.</li>
+</ul></li>
+<li><strong>Brand managers:</strong> administrators name the brand managers. Brand managers and administrators look after the brand centre.</li>
+</ol>
+
+<h2>Not in this plan</h2>
+<ul class="band">
+<li>Everything listed for 4B above.</li>
+<li>A branded sign-in page.</li>
+<li>Theming inside the editors themselves: their own pages are not restyled, only the frame around them.</li>
+<li>Custom style sheets or scripts, which SC-25 excludes.</li>
+<li>Page-editor section backgrounds, which wait for SC-09.</li>
+</ul>
+
+<h2>Global constraints</h2>
+<ul class="band">
+<li><strong>Colours</strong> are <code>#rrggbb</code>. Input is accepted in upper or lower case and stored in lower case.</li>
+<li><strong>A theme</strong> is <code>{name (1&ndash;60), primary, secondary, primary_dark?, secondary_dark?}</code>:
+<ul>
+<li><code>primary</code> is the accent: links, buttons, the focus ring and the bar stripe.</li>
+<li><code>secondary</code> is the background of a strong header or footer.</li>
+<li>When a dark value is left out, it is derived (see Contrast).</li>
+<li>The page reference colours, from <code>web/style.css</code>, are: light paper <code>#ffffff</code>, dark paper <code>#202a2e</code>, light background <code>#f5f7f8</code> and dark background <code>#141c20</code>.</li>
+</ul></li>
+<li><strong>Contrast</strong> (WCAG 2.x relative luminance), shared by Rust and JS. All of these must reach 4.5:1:
+<ol>
+<li>primary on light paper and on light background;</li>
+<li>white button text on primary;</li>
+<li>primary_dark on dark paper and on dark background;</li>
+<li>the button text on primary_dark (white or <code>#141c20</code>, whichever is higher);</li>
+<li>the header text on secondary, and on secondary_dark (each takes white or <code>#141c20</code>, whichever is higher).</li>
+</ol>
+<ul>
+<li><strong>Deriving a dark value:</strong> keep the hue and saturation in HSL.
+<ul>
+<li>For <code>primary_dark</code>, raise the lightness in steps of 1% until checks 3 and 4 pass.</li>
+<li>For <code>secondary_dark</code>, use <code>secondary</code> unchanged if check 5 passes. Otherwise lower the lightness in steps of 1% until it passes.</li>
+<li>If nothing passes, the dark value is reported as failing.</li>
+<li>For the built-in themes, this gives dark accents between 4.51:1 and 4.70:1. For example, ShareCraft's <code>#3156c9</code> gives <code>#748ddd</code>.</li>
+</ul></li>
+<li><strong>Suggestions:</strong> a failing light colour gets the passing HSL lightness nearest to its own, searched 1% at a time in both directions.</li>
+<li><strong>Refusal:</strong> <code>422 low_contrast {"pairs":[{"check","ratio","suggestion"}]}</code>, with ratios rounded to 2 decimals.</li>
+<li><strong>Shared test values:</strong> <code>web/look-vectors.json</code>, read by the Rust tests through <code>include_str!</code> and by <code>web/look.test.mjs</code>.</li>
+</ul></li>
+<li><strong>Built-in themes</strong> (light primary / secondary; dark values derived):
+<table><tr><th>Id</th><th>Name</th><th>Primary</th><th>Secondary</th></tr>
+<tr><td><code>builtin:sharecraft</code></td><td>ShareCraft</td><td><code>#3156c9</code></td><td><code>#233239</code></td></tr>
+<tr><td><code>builtin:harbour</code></td><td>Harbour</td><td><code>#1f5f8b</code></td><td><code>#163447</code></td></tr>
+<tr><td><code>builtin:plum</code></td><td>Plum</td><td><code>#7a3e8f</code></td><td><code>#3b2244</code></td></tr>
+<tr><td><code>builtin:rust</code></td><td>Rust</td><td><code>#a3431c</code></td><td><code>#40261b</code></td></tr>
+<tr><td><code>builtin:forest</code></td><td>Forest</td><td><code>#2f6b3a</code></td><td><code>#1f3324</code></td></tr>
+<tr><td><code>builtin:graphite</code></td><td>Graphite</td><td><code>#4a5560</code></td><td><code>#1f262c</code></td></tr></table>
+Each one passes every check. A test proves it.</li>
+<li><strong>Brand images:</strong>
+<ul>
+<li>Types: <code>png</code>, <code>jpeg</code>, <code>webp</code>, <code>gif</code> and <code>svg</code>, judged by the file's content and not by its name. The image crate's format guess is used for raster images; SVG must parse as XML whose root element is <code>svg</code>.</li>
+<li>Size limits: logo, thumbnail and icon at most 1 MiB; background at most 5 MiB.</li>
+<li>Raster images: at most 8,000 &times; 8,000 pixels, read from the header only.</li>
+<li>The image's content must be available (D37) when it is chosen.</li>
+<li>Chosen from a document id the person can view: any image in an asset library they can view, or any image in the site's own libraries (for that site's look).</li>
+<li><code>ImageRef = {sha256, media_type, bytes, width?, height?, name, from_doc}</code>.</li>
+</ul></li>
+<li><strong>Serving brand images:</strong> <code>GET /api/brand/images/{sha256}</code>.
+<ul>
+<li>Signed in only.</li>
+<li><code>404</code> unless the content is named by the brand centre or by a current site look. <code>423 held</code> if the content is no longer available, for example after a rescan found it infected.</li>
+<li>Headers: the recorded <code>media_type</code>, <code>X-Content-Type-Options: nosniff</code>, <code>Content-Security-Policy: sandbox; default-src 'none'; style-src 'unsafe-inline'</code>, <code>Cache-Control: private, max-age=31536000, immutable</code>, and no <code>Content-Disposition</code>.</li>
+<li>Pages only ever show these images through <code>&lt;img&gt;</code>.</li>
+</ul></li>
+<li><strong>Pinning images:</strong>
+<ul>
+<li>Table <code>brand_refs (sha256 references blobs, owner text)</code>, where <code>owner</code> is <code>org</code> or a site id.</li>
+<li>It is written in the same transaction as the mirror change, with the <code>blobs</code> row locked <code>FOR SHARE</code>, following the claim pattern in <code>records::blobs</code>.</li>
+<li><code>release_blob_if_unreferenced</code> also counts <code>brand_refs</code>.</li>
+<li>A purged site loses its rows.</li>
+<li>Reconcile rebuilds the table from Git.</li>
+</ul></li>
+<li><strong>The brand centre record</strong>, <code>org/brand.json</code>:
+<ul>
+<li>Shape: <code>{schema:1, managers:[uuid], themes:[{id, ...theme, changed_at}], images:[{id, kind: logo|icon|background, image: ImageRef}]}</code>.</li>
+<li>Limits: at most 50 themes, 100 images and 20 managers.</li>
+<li>Theme names are unique, ignoring case.</li>
+</ul></li>
+<li><strong>A site's look</strong>, <code>SiteRecord.look: Option&lt;Look&gt;</code> (absent means the built-in ShareCraft theme with the defaults below), and <code>SiteRecord.themes: Vec&lt;Theme with id&gt;</code> (at most 20, site-only). A <code>Look</code> holds:
+<ul>
+<li><code>theme</code>: a copy of the theme, plus <code>from: "builtin:&lt;id&gt;" | "org:&lt;id&gt;" | "site:&lt;id&gt;" | "custom"</code>.</li>
+<li><code>logo?</code>, <code>thumbnail?</code> (both <code>ImageRef</code>), and <code>logo_alt</code>, 0&ndash;120 characters; empty means the site name.</li>
+<li><code>header</code>: <code>{layout: minimal|compact|standard|extended, background: none|soft|strong|image, image?: ImageRef, align: left|centre|right, hide_title: bool}</code>.
+<ul>
+<li>The default is <code>compact</code> with <code>none</code>.</li>
+<li><code>image</code> and <code>align</code> apply only to <code>extended</code>.</li>
+<li><code>hide_title</code> needs a logo.</li>
+</ul></li>
+<li><code>navigation</code>: <code>horizontal|vertical</code>. Vertical puts the local bar in a left column at 900 pixels and wider, and in the existing Menu at narrower widths.</li>
+<li><code>footer</code>: <code>{enabled, layout: simple|extended, logo?: ImageRef, name (0&ndash;80), background: none|soft|strong, groups:[{heading (0&ndash;40), links:[{label (1&ndash;60), url}]}]}</code>.
+<ul>
+<li>Simple: one group, at most 8 links, no heading.</li>
+<li>Extended: at most 4 groups of 8 links.</li>
+<li>Each <code>url</code> is <code>https://</code>, <code>http://</code> or a path starting with a single <code>/</code>.</li>
+</ul></li>
+</ul>
+All text is trimmed. Control and invisible format characters are refused, using the same cleaning as names (3C).</li>
+<li><strong>Who may do what:</strong>
+<ul>
+<li>Reading the brand centre: anyone signed in.</li>
+<li>Changing themes and images: brand managers and administrators.</li>
+<li>Changing managers: administrators.</li>
+<li>A site's look and site themes: <code>manage_site</code>.</li>
+<li>On an archived site, look and theme changes answer <code>403 archived</code>, but the look is still shown.</li>
+<li>Branding never grants or removes access.</li>
+</ul></li>
+<li><strong>Effective look</strong>, <code>GET /api/sites/{id}/look</code> (view on the site): <code>{theme: {light:{accent, accent_ink, header_bg, header_ink}, dark:{...}}, logo_url?, thumbnail_url?, logo_alt, header, navigation, footer, theme_from: "site"|"hub", hub?: {id, name, thumbnail_url?}}</code>.
+<ul>
+<li>A site in a hub takes the theme of the hub's own look.</li>
+<li>Everything else comes from the site.</li>
+</ul></li>
+<li><strong>Never themed:</strong> <code>--ok</code>, <code>--warn-*</code>, <code>--stop-*</code>, <code>--text</code>, <code>--muted</code>, <code>--line</code>, <code>--bg</code>, <code>--paper</code>, the account bar, permission warnings and the held or quarantine marks. The focus ring stays at least 2 pixels and uses <code>--accent-ink</code>, which the contrast checks cover.</li>
+<li><strong>History:</strong>
+<ul>
+<li>Every look change records <code>site.look_changed {before, after}</code>.</li>
+<li><code>GET /api/sites/{id}/look/history</code> (<code>manage_site</code>) lists the last 50 changes, newest first: <code>{event_id, at, by, look}</code>.</li>
+<li><code>POST /api/sites/{id}/look/rollback {event_id}</code> applies that entry's <code>before</code> or <code>after</code> as the new look, checked again. An image whose content is gone answers <code>409 image_gone {"slots"}</code>; the page then loads that look as a draft without those images.</li>
+</ul></li>
+<li><strong>Events:</strong> <code>brand.theme_changed</code> (created, updated or deleted, with the theme), <code>brand.image_changed</code> (added or removed), <code>brand.managers_changed</code>, <code>site.look_changed</code> and <code>site.theme_changed</code>.</li>
+<li><strong>Errors</strong> (each with a plain-English message in <code>common.js</code>):
+<ul>
+<li><code>low_contrast</code> 422</li>
+<li><code>invalid_look</code> 422 <code>{"reason"}</code></li>
+<li><code>invalid_theme</code> 422 <code>{"reason"}</code></li>
+<li><code>not_an_image</code> 422</li>
+<li><code>image_too_large</code> 413</li>
+<li><code>held</code> 423</li>
+<li><code>image_gone</code> 409</li>
+<li><code>too_many</code> 409 <code>{"limit"}</code></li>
+<li><code>name_taken</code> 409</li>
+</ul></li>
+<li><strong>Locking order:</strong> unchanged from 3C. The brand-centre record is a single row, <code>org_brand</code>, locked before node rows when a change touches both (only reconcile does). <code>brand_refs</code> rows are written after <code>blobs</code> are locked.</li>
+<li><strong>Upgrade:</strong> migration <code>0015_brand.sql</code> adds the following and is one way:
+<ul>
+<li><code>org_brand (id boolean primary key check (id), record jsonb)</code>;</li>
+<li><code>sites.look jsonb null</code> and <code>sites.themes jsonb not null default '[]'</code>;</li>
+<li><code>brand_refs</code>.</li>
+</ul>
+Existing sites read with no look, so they look as they do today.</li>
+</ul>
+
+<h2>Review focus</h2>
+<ol class="band">
+<li><strong>Branding cannot run code or load anything from outside.</strong> Covered by Task 2, <code>brand_inputs_never_run</code>:
+<ul>
+<li>an SVG logo containing a script, an <code>onload</code> handler or an external <code>href</code>;</li>
+<li>a theme name or footer label holding HTML;</li>
+<li>a footer link with <code>javascript:</code>, <code>data:</code>, <code>//evil.example</code> or <code>/\evil</code>;</li>
+<li>a colour such as <code>red;background:url(x)</code>;</li>
+<li>a PNG that is really HTML.</li>
+</ul>
+Each is refused or shown as text, and nothing reaches the page as markup or as a style.</li>
+<li><strong>A brand image never outlives its last reference or disappears while still used.</strong> Covered by Task 2, <code>brand_images_pinned_until_unreferenced</code>:
+<ul>
+<li>the source file is deleted and its bin emptied while a look uses its image;</li>
+<li>a look switches logos;</li>
+<li>a site is purged;</li>
+<li>a theme is deleted while a site uses a copy.</li>
+</ul></li>
+<li><strong>Unreadable looks are refused on every path that sets colours.</strong> Covered by Task 1, <code>every_check_on_every_path</code>, and Task 3, <code>rollback_rechecks_contrast</code>. The paths are:
+<ul>
+<li>brand-centre themes;</li>
+<li>site themes;</li>
+<li>a custom theme in a look;</li>
+<li>a rollback to an older look, re-checked in case the rules change later;</li>
+<li>a derived dark value that cannot pass.</li>
+</ul></li>
+<li><strong>The hub rule holds through every hub change:</strong> joining, leaving, the hub changing its theme, the hub being unregistered, and the hub being archived or deleted. The effective look is right after each, and the site's own theme is never overwritten. (Task 3, <code>hub_rule_through_every_change</code>.)</li>
+<li><strong>Looks survive the records model's failure paths:</strong> a look change refused by the database is taken back from Git; a start after a crash between commit and mirror shows the committed look; reconcile rebuilds <code>org_brand</code>, <code>sites.look</code> and <code>brand_refs</code> from Git. (Tasks 2 and 3, <code>look_change_refused_by_database_is_taken_back</code>, <code>reconcile_rebuilds_brand_from_git</code>.)</li>
+</ol>
+
+<div class="task">
+<h3>Task 1: brand records, contrast and dark colours (pure code)</h3>
+<p><strong>Files:</strong>
+<ul>
+<li><strong>Create:</strong> <code>crates/revisions/src/brand.rs</code>, <code>web/look-vectors.json</code>, <code>web/look.js</code>, <code>web/look.test.mjs</code>.</li>
+<li><strong>Modify:</strong> <code>crates/revisions/src/lib.rs</code>.</li>
+</ul></p>
+<ul class="band">
+<li><strong>Rust</strong> (<code>revisions::brand</code>):
+<ul>
+<li>Types: <code>Colour</code> (parses <code>#rrggbb</code>), <code>Theme</code>, <code>ImageRef</code>, <code>Look</code>, <code>Header</code>, <code>Footer</code> and <code>OrgBrand</code>, with serde <code>deny_unknown_fields</code>.</li>
+<li><code>contrast(a: Colour, b: Colour) -&gt; f64</code>.</li>
+<li><code>derive_dark(c: Colour, role: Role) -&gt; Option&lt;Colour&gt;</code>.</li>
+<li><code>check_theme(&amp;Theme) -&gt; Result&lt;ResolvedTheme, Vec&lt;FailedPair&gt;&gt;</code>, where <code>ResolvedTheme</code> holds the light and dark accent, accent ink, header background and header ink.</li>
+<li><code>Look::problem(&amp;self, site_name: &amp;str) -&gt; Option&lt;String&gt;</code> and <code>OrgBrand::problem()</code> for every limit in Global constraints.</li>
+<li><code>BUILT_IN_THEMES</code>.</li>
+<li><code>safe_link(url: &amp;str) -&gt; bool</code>.</li>
+</ul></li>
+<li><strong>JS</strong> (<code>web/look.js</code>, all pure): <code>parseColour</code>, <code>contrast</code>, <code>deriveDark</code>, <code>checkTheme</code> and <code>lookTokens(effective)</code>. <code>lookTokens</code> returns a map of CSS variables to <code>light-dark(a,b)</code> values for <code>--accent</code>, <code>--accent-ink</code>, <code>--header-bg</code> and <code>--header-ink</code>.</li>
+</ul>
+<ol class="steps">
+<li>Write the shared table, <code>look-vectors.json</code>: colour pairs with WCAG ratios worked out by hand (black on white is 21, <code>#3156c9</code> on white, <code>#767676</code> on white is 4.54), derived dark values, failing themes with their expected suggestions, and each built-in theme.</li>
+<li>Write failing Rust tests:
+<ul>
+<li><code>contrast_matches_shared_vectors</code></li>
+<li><code>derive_dark_matches_shared_vectors</code></li>
+<li><code>built_in_themes_pass_every_check</code></li>
+<li><code>every_check_on_every_path</code> (each of the checks failing alone gives exactly that pair)</li>
+<li><code>colour_parsing_refuses_anything_but_hex</code></li>
+<li><code>look_limits_refused</code></li>
+<li><code>footer_links_must_be_safe</code></li>
+<li><code>records_round_trip_exact_bytes</code></li>
+</ul>
+Write failing JS tests with the same names in <code>look.test.mjs</code>, plus <code>look_tokens_use_light_dark</code>.</li>
+<li>Run: they fail. Implement. Run <code>cargo xtask check</code> and the web tests: they pass.</li>
+<li>Commit <code>feat: brand records, contrast checks and dark colours</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 2: the brand centre and brand images on the server</h3>
+<p><strong>Files:</strong>
+<ul>
+<li><strong>Create:</strong> <code>crates/records/migrations/0015_brand.sql</code>, <code>crates/records/src/brand.rs</code>, <code>crates/server/src/brand.rs</code>, <code>crates/server/src/api/brand.rs</code>, <code>crates/server/tests/brand.rs</code>.</li>
+<li><strong>Modify:</strong> <code>crates/revisions/src/sites.rs</code> (<code>SitesChange</code> carries <code>org_brand</code>), <code>crates/records/src/blobs.rs</code> (<code>brand_refs</code> in the erasure check), <code>crates/server/src/sites.rs</code> (reconcile order: brand after sites), <code>crates/server/src/api/mod.rs</code>, <code>crates/server/src/lib.rs</code>.</li>
+</ul></p>
+<ul class="band">
+<li><strong>Routes:</strong>
+<ul>
+<li><code>GET /api/brand</code> (signed in): <code>{themes (built-in first, then the organisation's), images:[{id, kind, name, url}], can_manage}</code>. <code>managers</code> is shown to administrators only.</li>
+<li><code>POST /api/brand/themes</code>, <code>PATCH /api/brand/themes/{id}</code> and <code>DELETE /api/brand/themes/{id}</code>: a brand manager or administrator.</li>
+<li><code>POST /api/brand/images {doc, kind, name?}</code> (also needs view on <code>doc</code>) and <code>DELETE /api/brand/images/{id}</code>.</li>
+<li><code>PUT /api/brand/managers {users}</code>: administrators only. Each user must exist and be enabled.</li>
+<li><code>GET /api/brand/images/{sha256}</code> as in Global constraints.</li>
+</ul></li>
+<li><strong>Choosing an image</strong> is one helper, <code>brand::image_from_doc(db, actor, doc, kind) -&gt; Result&lt;ImageRef&gt;</code>. It checks view, the type by content, the size, the dimensions and availability. Task 3 reuses it.</li>
+<li><strong>Each change</strong> is one commit to <code>org/brand.json</code>, mirrored to <code>org_brand</code> and <code>brand_refs</code> with its event. It is taken back on refusal and repaired on a database failure, as in <code>sites::change</code>.</li>
+</ul>
+<ol class="steps">
+<li>Write failing tests:
+<ul>
+<li><code>brand_centre_needs_manager_or_admin</code></li>
+<li><code>managers_set_by_admins_only</code></li>
+<li><code>themes_created_renamed_deleted</code> (with <code>name_taken</code>, <code>too_many</code> and <code>low_contrast</code>)</li>
+<li><code>image_from_asset_library_needs_view</code></li>
+<li><code>image_type_judged_by_content</code></li>
+<li><code>image_limits_refused</code></li>
+<li><code>held_image_refused_and_served_as_held</code></li>
+<li><code>brand_images_served_to_anyone_signed_in</code> (and <code>404</code> for unnamed content and for a signed-out visitor)</li>
+<li><code>brand_image_headers</code></li>
+<li><code>brand_inputs_never_run</code></li>
+<li><code>brand_images_pinned_until_unreferenced</code></li>
+<li><code>reconcile_rebuilds_brand_from_git</code></li>
+<li><code>brand_change_refused_by_database_is_taken_back</code></li>
+</ul></li>
+<li>Run: they fail. Implement. Run <code>cargo xtask check</code>: it passes.</li>
+<li>Commit <code>feat: brand centre with themes, brand images and managers</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 3: site looks, the hub rule, history and rollback</h3>
+<p><strong>Files:</strong>
+<ul>
+<li><strong>Create:</strong> <code>crates/server/src/looks.rs</code>, <code>crates/server/tests/looks.rs</code>.</li>
+<li><strong>Modify:</strong> <code>crates/revisions/src/sites.rs</code> (<code>SiteRecord.look</code> and <code>themes</code>, both skipped when empty, so unchanged sites keep their exact bytes), <code>crates/records/src/sites.rs</code> (<code>SiteSettings</code>, <code>upsert_site</code>, <code>SITE_COLUMNS</code>, <code>brand_refs</code> per site), <code>crates/server/src/sites.rs</code> (<code>settings_of</code>, reconcile, purge, site list), <code>crates/server/src/api/mod.rs</code>, <code>crates/server/tests/archive.rs</code> (the new routes added to the archive table).</li>
+</ul></p>
+<ul class="band">
+<li><strong>Routes:</strong>
+<ul>
+<li><code>GET /api/sites/{id}/look</code>: the effective look (view on the site).</li>
+<li><code>GET /api/sites/{id}/look/settings</code> (<code>manage_site</code>): <code>{look, themes, theme_source_changed: bool, in_hub?: {id, name}}</code>.</li>
+<li><code>PUT /api/sites/{id}/look {look}</code> (<code>manage_site</code>).
+<ul>
+<li>Image slots are given as <code>{doc}</code> for a new choice, <code>{brand_image}</code> for one from the brand centre, or <code>{keep: sha256}</code> for the current one.</li>
+<li>A theme is given as <code>{from}</code> for built-in, organisation or site themes, which the server copies, or as a full custom theme.</li>
+</ul></li>
+<li><code>POST</code>, <code>PATCH</code> and <code>DELETE /api/sites/{id}/themes[/{id}]</code> (<code>manage_site</code>).</li>
+<li><code>GET /api/sites/{id}/look/history</code> and <code>POST /api/sites/{id}/look/rollback</code>.</li>
+</ul></li>
+<li><strong>Site lists:</strong> <code>GET /api/sites</code> and the hub's site list gain <code>thumbnail_url?</code> and <code>accent</code>, taken from the effective look.</li>
+<li><strong>Hub changes:</strong> <code>join_hub</code>, <code>set_hub</code> and <code>unregister_hub</code> need no record change, because the effective look is worked out when it is read. A test proves this.</li>
+</ul>
+<ol class="steps">
+<li>Write failing tests:
+<ul>
+<li><code>look_needs_manage_site</code></li>
+<li><code>look_round_trip_and_defaults</code> (a site with no look reads the ShareCraft defaults, and its record bytes are unchanged)</li>
+<li><code>theme_copied_and_source_change_marked</code></li>
+<li><code>site_themes_stay_in_their_site</code></li>
+<li><code>hide_title_needs_logo</code></li>
+<li><code>image_slots_resolved</code></li>
+<li><code>hub_rule_through_every_change</code></li>
+<li><code>history_lists_last_fifty</code></li>
+<li><code>rollback_restores_and_records</code></li>
+<li><code>rollback_rechecks_contrast</code></li>
+<li><code>rollback_with_missing_image_is_image_gone</code></li>
+<li><code>archived_site_refuses_look_changes_but_shows_look</code></li>
+<li><code>purged_site_releases_its_images</code></li>
+<li><code>look_change_refused_by_database_is_taken_back</code></li>
+<li><code>reconcile_rebuilds_looks_from_git</code></li>
+<li><code>branding_never_changes_access</code></li>
+<li><code>site_lists_carry_thumbnail_and_accent</code></li>
+</ul></li>
+<li>Run: they fail. Implement. Run <code>cargo xtask check</code>: it passes.</li>
+<li>Commit <code>feat: site looks with hub inheritance, history and rollback</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 4: pages carry the look</h3>
+<p><strong>Files:</strong>
+<ul>
+<li><strong>Modify:</strong> <code>web/common.js</code> (<code>siteChrome</code> fetches the look and calls <code>applyLook</code>; <code>headerView</code>, <code>footerView</code>, error messages), <code>web/look.js</code> (<code>applyLook(root, effective)</code>), <code>web/style.css</code> (header layouts, footer, vertical navigation, logo in <code>.bar</code>), <code>web/home.js</code> and <code>web/site.js</code> (site cards with the thumbnail, or initials on the accent), <code>web/file.js</code> and <code>web/doc.js</code> (the frame bar), <code>web/common.test.mjs</code>, <code>web/look.test.mjs</code>.</li>
+</ul></p>
+<ul class="band">
+<li><strong><code>applyLook</code></strong> sets variables only through <code>style.setProperty</code>, and only from <code>lookTokens</code> output whose values are re-checked against <code>#rrggbb</code>. It never sets <code>innerHTML</code> or a <code>style</code> attribute.</li>
+<li><strong>Header layouts:</strong>
+<ul>
+<li><code>minimal</code>: one row, logo 24 pixels high.</li>
+<li><code>compact</code>: today's bar, logo 32 pixels high.</li>
+<li><code>standard</code>: logo 48 pixels high and the title 1.4rem.</li>
+<li><code>extended</code>: a band 160 pixels high (120 below 600 pixels) with the image as an <code>&lt;img&gt;</code> covering it. A fixed dark overlay keeps the white title at 4.5:1. The logo is aligned as set.</li>
+</ul>
+Backgrounds: <code>soft</code> uses <code>--soft</code>, and <code>strong</code> uses <code>--header-bg</code> with <code>--header-ink</code>. The logo has the <code>logo_alt</code> text. When the image answers <code>423</code> or fails to load, the site name is shown instead.</li>
+<li><strong>Footer:</strong> shown on site and library pages, never in the editor frame. Links open in the same tab; external ones get <code>rel="noopener noreferrer"</code>.</li>
+<li><strong>Editor frame:</strong> the <code>.mono</code> letter is replaced by the thumbnail (or the logo), and the bar stripe uses the theme. The editor inside the frame is untouched.</li>
+<li><strong>Hub bar:</strong> shows the hub's thumbnail beside its name.</li>
+</ul>
+<ol class="steps">
+<li>Write failing JS tests:
+<ul>
+<li><code>apply_look_sets_only_known_variables</code></li>
+<li><code>apply_look_refuses_non_hex</code></li>
+<li><code>header_view_for_each_layout</code></li>
+<li><code>hidden_title_still_named_for_screen_readers</code></li>
+<li><code>broken_logo_falls_back_to_name</code></li>
+<li><code>footer_view_simple_and_extended</code></li>
+<li><code>footer_links_rendered_as_text_with_safe_href</code></li>
+<li><code>vertical_navigation_class</code></li>
+<li><code>site_card_initials_without_thumbnail</code></li>
+</ul></li>
+<li>Run: they fail. Implement. Run the web tests and <code>cargo xtask check</code>: they pass.</li>
+<li>Commit <code>feat: pages show the site's look</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 5: Change the look and the brand centre pages</h3>
+<p><strong>Files:</strong>
+<ul>
+<li><strong>Create:</strong> <code>web/site-look.html</code>, <code>web/site-look.js</code>, <code>web/brand-centre.html</code>, <code>web/brand-centre.js</code>, <code>web/image-picker.js</code> (pure parts tested).</li>
+<li><strong>Modify:</strong> <code>web/site-settings.html</code> and <code>.js</code> (a "Change the look" link for owners), <code>web/admin-sites.html</code> and <code>.js</code> (a "Brand centre" link for administrators and brand managers), <code>web/look.test.mjs</code>, <code>web/common.test.mjs</code>.</li>
+</ul></p>
+<ul class="band">
+<li><strong>Change the look</strong> (owners): sections for Theme, Header, Navigation and Footer.
+<ul>
+<li>Every change updates a <strong>preview</strong>, a scaled copy of the header, a library row, the buttons and the footer, in light and dark side by side. It uses <code>applyLook</code> on the preview element only.</li>
+<li><strong>Apply</strong> saves. <strong>Cancel</strong> drops the draft. <strong>History</strong> lists the earlier looks, each with Preview and Restore.</li>
+<li>The live contrast check marks each failing pair with its ratio and a <strong>Use suggested</strong> button, and Apply stays disabled while anything fails.</li>
+<li>In a hub, a note says the hub's theme is in use.</li>
+</ul></li>
+<li><strong>Brand centre</strong> (brand managers and administrators): themes as a banded list with swatches (create, edit with the same live check, delete), brand images as a grid (add from the picker, rename, remove), and managers (administrators only, picked from people).</li>
+<li><strong>Image picker:</strong> a dialog listing the image files in the asset libraries the person can view, plus, on Change the look, that site's libraries. It shows thumbnails, works with the keyboard and filters by name.</li>
+<li><strong>Layout:</strong> both pages work at 375 pixels and in dark mode, and lists are banded.</li>
+</ul>
+<ol class="steps">
+<li>Write failing JS tests:
+<ul>
+<li><code>draft_changes_never_saved_until_apply</code></li>
+<li><code>apply_disabled_while_contrast_fails</code></li>
+<li><code>use_suggested_fixes_the_pair</code></li>
+<li><code>history_entry_loads_as_draft</code></li>
+<li><code>image_gone_loads_without_images</code></li>
+<li><code>picker_filters_and_lists_only_images</code></li>
+<li><code>brand_centre_hides_managers_from_non_admins</code></li>
+</ul></li>
+<li>Run: they fail. Implement. Run the web tests and <code>cargo xtask check</code>: they pass.</li>
+<li>Commit <code>feat: Change the look and brand centre pages</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 6 (controller): browser check and documents</h3>
+<ol class="steps">
+<li>Back up the data folder and the database. Build the server into J:, then start the <code>sharecraft-server</code> preview.</li>
+<li>Check the parts of A18 that this plan covers, and record each as checked or not:
+<ol>
+<li>As a brand manager, create a theme and add a logo and a background from an asset library.</li>
+<li>As a site owner, give two sites distinct looks: a theme, a logo and thumbnail, an extended header with an image, vertical navigation and an extended footer.</li>
+<li>Check the look on the site, library, access, explorer and bin pages and in a GridCraft editor frame, at 375 pixels and at desktop width, in light and dark.</li>
+<li>Check preview and cancel, a refused low-contrast theme with its suggestion, history and restore, and a site joining and leaving a hub.</li>
+<li>Check that a person without access to the asset library sees the logo, and that access lists are the same before and after.</li>
+</ol></li>
+<li>Update the documents:
+<ul>
+<li>Add a branding section to <code>BUILDING.html</code>, before Licences: the records, routes, the upgrade (migration 0015, one way, back up first) and the contrast rules.</li>
+<li>Record the proposals above as decisions D40 to D45 in <code>scope.html</code>.</li>
+<li>Add the progress note to <code>sequencing.html</code>.</li>
+</ul></li>
+<li>Commit <code>docs: branding (plan 4A)</code>.</li>
+</ol></div>
+</main></body>
+</html>
