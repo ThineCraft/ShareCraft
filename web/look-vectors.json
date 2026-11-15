@@ -1,0 +1,410 @@
+{
+  "_about": "Shared by crates/revisions/src/brand.rs (include_str!) and web/look.test.mjs. Ratios are WCAG 2.x, rounded to 2 decimals.",
+  "contrast": [
+    {
+      "a": "#000000",
+      "b": "#ffffff",
+      "ratio": 21
+    },
+    {
+      "a": "#ffffff",
+      "b": "#000000",
+      "ratio": 21
+    },
+    {
+      "a": "#ffffff",
+      "b": "#ffffff",
+      "ratio": 1
+    },
+    {
+      "a": "#3156c9",
+      "b": "#ffffff",
+      "ratio": 6.35
+    },
+    {
+      "a": "#767676",
+      "b": "#ffffff",
+      "ratio": 4.54
+    },
+    {
+      "a": "#777777",
+      "b": "#ffffff",
+      "ratio": 4.48
+    },
+    {
+      "a": "#767676",
+      "b": "#f5f7f8",
+      "ratio": 4.23
+    },
+    {
+      "a": "#3156c9",
+      "b": "#f5f7f8",
+      "ratio": 5.91
+    },
+    {
+      "a": "#ffffff",
+      "b": "#202a2e",
+      "ratio": 14.66
+    },
+    {
+      "a": "#ffffff",
+      "b": "#141c20",
+      "ratio": 17.26
+    },
+    {
+      "a": "#141c20",
+      "b": "#202a2e",
+      "ratio": 1.18
+    },
+    {
+      "a": "#748ddd",
+      "b": "#202a2e",
+      "ratio": 4.61
+    },
+    {
+      "a": "#748ddd",
+      "b": "#141c20",
+      "ratio": 5.42
+    },
+    {
+      "a": "#ffffff",
+      "b": "#748ddd",
+      "ratio": 3.18
+    },
+    {
+      "a": "#141c20",
+      "b": "#748ddd",
+      "ratio": 5.42
+    },
+    {
+      "a": "#233239",
+      "b": "#ffffff",
+      "ratio": 13.23
+    },
+    {
+      "a": "#ff0000",
+      "b": "#00ff00",
+      "ratio": 2.91
+    },
+    {
+      "a": "#7b7b7b",
+      "b": "#ffffff",
+      "ratio": 4.23
+    },
+    {
+      "a": "#7b7b7b",
+      "b": "#141c20",
+      "ratio": 4.08
+    }
+  ],
+  "derive_dark": [
+    {
+      "from": "#3156c9",
+      "role": "primary",
+      "dark": "#748ddd"
+    },
+    {
+      "from": "#1f5f8b",
+      "role": "primary",
+      "dark": "#3c96d4"
+    },
+    {
+      "from": "#7a3e8f",
+      "role": "primary",
+      "dark": "#b37cc6"
+    },
+    {
+      "from": "#a3431c",
+      "role": "primary",
+      "dark": "#de6f41"
+    },
+    {
+      "from": "#2f6b3a",
+      "role": "primary",
+      "dark": "#48a459"
+    },
+    {
+      "from": "#4a5560",
+      "role": "primary",
+      "dark": "#8492a0"
+    },
+    {
+      "from": "#000000",
+      "role": "primary",
+      "dark": "#8f8f8f"
+    },
+    {
+      "from": "#ffffff",
+      "role": "primary",
+      "dark": "#ffffff"
+    },
+    {
+      "from": "#ff0000",
+      "role": "primary",
+      "dark": "#ff5252"
+    },
+    {
+      "from": "#233239",
+      "role": "secondary",
+      "dark": "#233239"
+    },
+    {
+      "from": "#7b7b7b",
+      "role": "secondary",
+      "dark": "#767676"
+    },
+    {
+      "from": "#ffffff",
+      "role": "secondary",
+      "dark": "#ffffff"
+    },
+    {
+      "from": "#cccccc",
+      "role": "secondary",
+      "dark": "#cccccc"
+    }
+  ],
+  "failing_themes": [
+    {
+      "note": "primary_on_light alone: grey that reads on white but not on the light background",
+      "theme": {
+        "name": "Test",
+        "primary": "#767676",
+        "secondary": "#233239"
+      },
+      "pairs": [
+        {
+          "check": "primary_on_light",
+          "ratio": 4.23,
+          "suggestion": "#717171"
+        }
+      ]
+    },
+    {
+      "note": "both light checks: pale primary",
+      "theme": {
+        "name": "Test",
+        "primary": "#cccccc",
+        "secondary": "#233239"
+      },
+      "pairs": [
+        {
+          "check": "primary_on_light",
+          "ratio": 1.49,
+          "suggestion": "#707070"
+        },
+        {
+          "check": "button_on_primary",
+          "ratio": 1.61,
+          "suggestion": "#707070"
+        }
+      ]
+    },
+    {
+      "note": "primary_dark_on_dark alone: explicit dark primary too close to the dark paper",
+      "theme": {
+        "name": "Test",
+        "primary": "#3156c9",
+        "secondary": "#233239",
+        "primary_dark": "#3a4a52"
+      },
+      "pairs": [
+        {
+          "check": "primary_dark_on_dark",
+          "ratio": 1.59,
+          "suggestion": "#7a94a1"
+        }
+      ]
+    },
+    {
+      "note": "header_on_secondary alone: mid grey header, derived dark header passes",
+      "theme": {
+        "name": "Test",
+        "primary": "#3156c9",
+        "secondary": "#7b7b7b"
+      },
+      "pairs": [
+        {
+          "check": "header_on_secondary",
+          "ratio": 4.23,
+          "suggestion": "#767676"
+        }
+      ]
+    },
+    {
+      "note": "header_on_secondary_dark alone: explicit dark header that neither white nor ink reads on",
+      "theme": {
+        "name": "Test",
+        "primary": "#3156c9",
+        "secondary": "#233239",
+        "secondary_dark": "#7b7b7b"
+      },
+      "pairs": [
+        {
+          "check": "header_on_secondary_dark",
+          "ratio": 4.23,
+          "suggestion": "#767676"
+        }
+      ]
+    },
+    {
+      "note": "everything at once: explicit dark values that fail too",
+      "theme": {
+        "name": "Test",
+        "primary": "#cccccc",
+        "secondary": "#7b7b7b",
+        "primary_dark": "#3a4a52",
+        "secondary_dark": "#7b7b7b"
+      },
+      "pairs": [
+        {
+          "check": "primary_on_light",
+          "ratio": 1.49,
+          "suggestion": "#707070"
+        },
+        {
+          "check": "button_on_primary",
+          "ratio": 1.61,
+          "suggestion": "#707070"
+        },
+        {
+          "check": "primary_dark_on_dark",
+          "ratio": 1.59,
+          "suggestion": "#7a94a1"
+        },
+        {
+          "check": "header_on_secondary",
+          "ratio": 4.23,
+          "suggestion": "#767676"
+        },
+        {
+          "check": "header_on_secondary_dark",
+          "ratio": 4.23,
+          "suggestion": "#767676"
+        }
+      ]
+    }
+  ],
+  "built_in_themes": [
+    {
+      "id": "builtin:sharecraft",
+      "name": "ShareCraft",
+      "primary": "#3156c9",
+      "secondary": "#233239",
+      "resolved": {
+        "light": {
+          "accent": "#3156c9",
+          "accent_ink": "#ffffff",
+          "header_bg": "#233239",
+          "header_ink": "#ffffff"
+        },
+        "dark": {
+          "accent": "#748ddd",
+          "accent_ink": "#141c20",
+          "header_bg": "#233239",
+          "header_ink": "#ffffff"
+        }
+      }
+    },
+    {
+      "id": "builtin:harbour",
+      "name": "Harbour",
+      "primary": "#1f5f8b",
+      "secondary": "#163447",
+      "resolved": {
+        "light": {
+          "accent": "#1f5f8b",
+          "accent_ink": "#ffffff",
+          "header_bg": "#163447",
+          "header_ink": "#ffffff"
+        },
+        "dark": {
+          "accent": "#3c96d4",
+          "accent_ink": "#141c20",
+          "header_bg": "#163447",
+          "header_ink": "#ffffff"
+        }
+      }
+    },
+    {
+      "id": "builtin:plum",
+      "name": "Plum",
+      "primary": "#7a3e8f",
+      "secondary": "#3b2244",
+      "resolved": {
+        "light": {
+          "accent": "#7a3e8f",
+          "accent_ink": "#ffffff",
+          "header_bg": "#3b2244",
+          "header_ink": "#ffffff"
+        },
+        "dark": {
+          "accent": "#b37cc6",
+          "accent_ink": "#141c20",
+          "header_bg": "#3b2244",
+          "header_ink": "#ffffff"
+        }
+      }
+    },
+    {
+      "id": "builtin:rust",
+      "name": "Rust",
+      "primary": "#a3431c",
+      "secondary": "#40261b",
+      "resolved": {
+        "light": {
+          "accent": "#a3431c",
+          "accent_ink": "#ffffff",
+          "header_bg": "#40261b",
+          "header_ink": "#ffffff"
+        },
+        "dark": {
+          "accent": "#de6f41",
+          "accent_ink": "#141c20",
+          "header_bg": "#40261b",
+          "header_ink": "#ffffff"
+        }
+      }
+    },
+    {
+      "id": "builtin:forest",
+      "name": "Forest",
+      "primary": "#2f6b3a",
+      "secondary": "#1f3324",
+      "resolved": {
+        "light": {
+          "accent": "#2f6b3a",
+          "accent_ink": "#ffffff",
+          "header_bg": "#1f3324",
+          "header_ink": "#ffffff"
+        },
+        "dark": {
+          "accent": "#48a459",
+          "accent_ink": "#141c20",
+          "header_bg": "#1f3324",
+          "header_ink": "#ffffff"
+        }
+      }
+    },
+    {
+      "id": "builtin:graphite",
+      "name": "Graphite",
+      "primary": "#4a5560",
+      "secondary": "#1f262c",
+      "resolved": {
+        "light": {
+          "accent": "#4a5560",
+          "accent_ink": "#ffffff",
+          "header_bg": "#1f262c",
+          "header_ink": "#ffffff"
+        },
+        "dark": {
+          "accent": "#8492a0",
+          "accent_ink": "#141c20",
+          "header_bg": "#1f262c",
+          "header_ink": "#ffffff"
+        }
+      }
+    }
+  ]
+}

@@ -8,6 +8,7 @@
 //! inline in Git and are read as before.
 
 mod blobs;
+pub mod brand;
 mod libraries;
 mod meta;
 mod sites;
