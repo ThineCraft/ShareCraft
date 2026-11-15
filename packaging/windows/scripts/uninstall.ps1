@@ -11,12 +11,19 @@ param([switch]$Yes, [switch]$DeleteData, [switch]$KeepData)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'common.ps1')
+# ShareCraft's programs use only ShareCraft's own database settings, never the user's.
+Clear-DatabaseEnvironment
 
 function Wait-ForEnter {
     if (-not $Yes) { [void](Read-Host 'Press Enter to close this window') }
 }
 
 try {
+    # The program folder is about to go, and Windows will not delete a process's working
+    # folder: leave it (the Start-menu shortcut used to start this script inside it).
+    $away = $env:LOCALAPPDATA
+    [System.Environment]::CurrentDirectory = $away
+    Set-Location -LiteralPath $away
     if ($DeleteData -and $KeepData) { throw 'Give -DeleteData or -KeepData, not both.' }
     $paths = Get-ShareCraftPaths
     if (-not (Test-ShareCraftInstalled -Paths $paths) -and -not (Test-Path -LiteralPath $paths.StartMenu)) {
@@ -29,8 +36,6 @@ try {
         Wait-ForEnter
         exit 0
     }
-    # The program folder is about to go; work from somewhere else.
-    Set-Location -LiteralPath $env:TEMP
     $pgBin = $paths.PgBin
     Stop-ShareCraft -Paths $paths -PgBin $pgBin
 

@@ -160,12 +160,57 @@ function Set-OwnerOnlyAccess {
 }
 
 function Write-SecretFile {
-    # Writes text holding a secret: the file is made empty, narrowed to this user, and only
-    # then filled, so the secret never sits in a file others can read. UTF-8 without a BOM.
+    # Writes text holding a secret, UTF-8 without a BOM. A new file beside it is made empty,
+    # narrowed to this user, and only then filled, so the secret never sits in a file others
+    # can read; then it replaces the old file in one step. If anything fails, the old file
+    # (for .env, the only copy of the database password) is left exactly as it was, never
+    # empty or missing.
     param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Content)
-    [System.IO.File]::WriteAllText($Path, '', $script:Utf8NoBom)
-    Set-OwnerOnlyAccess -Path $Path
-    [System.IO.File]::WriteAllText($Path, $Content, $script:Utf8NoBom)
+    $folder = Split-Path -Parent $Path
+    $new = Join-Path $folder ('.' + [System.IO.Path]::GetFileName($Path) + '.new-' + [guid]::NewGuid().ToString('N'))
+    try {
+        [System.IO.File]::WriteAllText($new, '', $script:Utf8NoBom)
+        Set-OwnerOnlyAccess -Path $new
+        [System.IO.File]::WriteAllText($new, $Content, $script:Utf8NoBom)
+        if (Test-Path -LiteralPath $Path) {
+            # Narrow the old file too (its content untouched), so the swap never widens access.
+            Set-OwnerOnlyAccess -Path $Path
+            [System.IO.File]::Replace($new, $Path, [NullString]::Value)
+        } else {
+            [System.IO.File]::Move($new, $Path)
+        }
+    } finally {
+        if (Test-Path -LiteralPath $new) { Remove-Item -LiteralPath $new -Force }
+    }
+}
+
+function Clear-DatabaseEnvironment {
+    # Removes DATABASE_URL and every PG* variable from this process's environment, so that
+    # neither the server (whose own variables beat .env) nor psql, pg_ctl or initdb (which read
+    # PGHOST, PGPORT, PGPASSWORD, PGSERVICE and the rest) can be sent to another database by
+    # the user's own settings. Only this process and the programs it starts are affected.
+    foreach ($item in @(Get-ChildItem Env:)) {
+        if ($item.Name -match '^(PG|DATABASE_URL$)') { Remove-Item -LiteralPath "Env:$($item.Name)" }
+    }
+}
+
+function Initialize-SafeTemp {
+    # The helper that starts programs is compiled into TEMP, and the compiler cannot write to a
+    # folder whose name has letters outside the Windows code page. Points TEMP and TMP (for
+    # this process and what it starts) at the folder's plain-ASCII short name when needed.
+    $temp = $env:TEMP
+    if (-not $temp) { $temp = $env:TMP }
+    if (-not $temp -or -not (Test-Path -LiteralPath $temp -PathType Container)) {
+        throw "Windows' temporary folder for this user (TEMP) is not set or does not exist. Nothing was changed."
+    }
+    try {
+        $safe = ConvertTo-PgSafePath -Path $temp
+    } catch {
+        throw ("Windows' temporary folder for this user, $temp, has letters other than plain English ones and this drive keeps no short (8.3) name for it, " +
+            'so ShareCraft cannot prepare its helper there. Nothing was changed.')
+    }
+    $env:TEMP = $safe
+    $env:TMP = $safe
 }
 
 function New-DatabaseUrl {
@@ -402,8 +447,13 @@ function Start-Detached {
         [switch]$Wait,
         [int]$TimeoutSeconds = 600
     )
-    if (-not ('ShareCraftLauncher' -as [type])) { Add-Type -TypeDefinition $script:LauncherSource }
-    if (-not $WorkingDirectory) { $WorkingDirectory = (Get-Location).ProviderPath }
+    if (-not ('ShareCraftLauncher' -as [type])) {
+        Initialize-SafeTemp
+        Add-Type -TypeDefinition $script:LauncherSource
+    }
+    # Never the current folder by default: a program left running (a database started by
+    # pg_ctl) would hold it, for example the unzipped package the installer runs from.
+    if (-not $WorkingDirectory) { $WorkingDirectory = $env:SystemRoot }
     $line = (@(ConvertTo-CommandLineArgument -Value $FilePath) + @($Arguments | ForEach-Object { ConvertTo-CommandLineArgument -Value $_ })) -join ' '
     $code = 0
     $id = [ShareCraftLauncher]::Start($FilePath, $line, $WorkingDirectory, $StdOut, $StdErr, [bool]$Wait, $TimeoutSeconds * 1000, [ref]$code)
@@ -615,7 +665,9 @@ function New-ShareCraftShortcut {
     $link = $shell.CreateShortcut($Path)
     $link.TargetPath = Get-WindowsPowerShell
     $link.Arguments = Join-CommandLine -Arguments $arguments
-    $link.WorkingDirectory = Split-Path -Parent $Script
+    # Never a folder inside the program: Windows will not delete a process's working folder,
+    # so Uninstall could not remove the program.
+    $link.WorkingDirectory = $env:LOCALAPPDATA
     $link.Description = $Description
     $link.Save()
 }
@@ -728,7 +780,7 @@ function Start-Postgres {
     if (-not (Test-Path -LiteralPath $log)) { [System.IO.File]::WriteAllText($log, '') }
     Invoke-Native -FilePath (Get-PgTool $PgBin 'pg_ctl') `
         -Arguments @('start', '-w', '-t', '60', '-s', '-D', (ConvertTo-PgSafePath $Paths.Db), '-l', (ConvertTo-PgSafePath $log)) `
-        -What "Starting the database (its log is $log)" -OutputBase (Join-Path $Paths.Logs 'pg_ctl') | Out-Null
+        -What "Starting the database (its log is $log)" -OutputBase (Join-Path $Paths.Logs 'pg_ctl') -WorkingDirectory $Paths.Root | Out-Null
 }
 
 function Stop-Postgres {
@@ -889,6 +941,8 @@ function Start-ShareCraft {
     # %LOCALAPPDATA%\ShareCraft\logs), waits up to 60 seconds for the server to answer, then
     # opens the browser. If it already runs, it only opens the browser.
     param([Parameter(Mandatory)]$Paths, [switch]$NoBrowser, [int]$WaitSeconds = 60)
+    # The server must read only its own .env, and the database tools only what they are given.
+    Clear-DatabaseEnvironment
     if (-not (Test-Path -LiteralPath $Paths.SettingsFile)) {
         throw "ShareCraft is not installed for this Windows user ($($Paths.SettingsFile) is missing). Run Install ShareCraft.cmd first."
     }

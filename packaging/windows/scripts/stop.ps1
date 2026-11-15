@@ -8,6 +8,8 @@ param([switch]$Gui)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'common.ps1')
+# ShareCraft's programs use only ShareCraft's own database settings, never the user's.
+Clear-DatabaseEnvironment
 
 try {
     $paths = Get-ShareCraftPaths

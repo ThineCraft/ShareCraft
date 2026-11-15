@@ -21,6 +21,8 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'common.ps1')
+# ShareCraft's programs use only ShareCraft's own database settings, never the user's.
+Clear-DatabaseEnvironment
 
 function Read-Required {
     param([Parameter(Mandatory)][string]$Prompt, [Parameter(Mandatory)][string]$Pattern, [Parameter(Mandatory)][string]$Hint)
@@ -81,6 +83,7 @@ function Add-Administrator {
     # sharecraft-server add-user --admin; the server asks for the password itself. Up to three
     # tries, for a password it refuses.
     param([Parameter(Mandatory)]$Paths, [Parameter(Mandatory)][string]$Email, [Parameter(Mandatory)][string]$Name)
+    Clear-DatabaseEnvironment   # the server must read only ShareCraft's .env
     Write-Step ''
     Write-Step "Now choose the password for $Email (at least 10 characters). It is not shown as you type."
     for ($try = 1; $try -le 3; $try++) {
@@ -117,6 +120,8 @@ function Install-ShareCraft {
     # The database programs need a plain-ASCII path to everything below LOCALAPPDATA: find out
     # now, before copying anything, whether one exists.
     ConvertTo-PgSafePath -Path $env:LOCALAPPDATA | Out-Null
+    # The helper that starts programs is compiled in TEMP, which needs a plain-ASCII path too.
+    Initialize-SafeTemp
 
     Write-Step "Installing ShareCraft for $env:USERNAME"
     Write-Step "  program: $($paths.Program)"

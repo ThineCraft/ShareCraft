@@ -170,7 +170,8 @@ footer{border-top:1px solid var(--line);padding-top:16px;color:var(--muted);font
 <li><strong>For one Windows user.</strong> It is installed for the Windows user who ran the installer. Other people can still have ShareCraft accounts and use them from this computer's browser.</li>
 <li><strong>Not a Windows service.</strong> It runs while started and stops when you sign out.</li>
 <li><strong>No automatic updates</strong> and no signed installer. Windows may warn about running the scripts; that is expected.</li>
-<li><strong>Folder names.</strong> A Windows user folder with spaces or letters such as <code>&euml;</code> (for example <code>C:\Users\Zo&euml; Smith</code>) works: the database programs cannot read such letters, so the scripts give them the folder's short name instead (like <code>ZOSMIT~1</code>), which Windows keeps on the system drive. On a drive where Windows keeps no short names, the installer stops before copying anything and says so.</li>
+<li><strong>Folder names.</strong> A Windows user folder with spaces or letters such as <code>&euml;</code> (for example <code>C:\Users\Zo&euml; Smith</code>) works: the database programs cannot read such letters, so the scripts give them the folder's short name instead (like <code>ZOSMIT~1</code>), which Windows keeps on the system drive. The same goes for Windows' temporary folder. On a drive where Windows keeps no short names, the installer stops before copying anything and says so.</li>
+<li><strong>Your own database settings are ignored.</strong> If your account has <code>DATABASE_URL</code> or <code>PGHOST</code>-style settings for other work, ShareCraft's scripts set them aside for ShareCraft's own programs, so it always uses its own database.</li>
 </ul>
 </section>
 
@@ -213,7 +214,7 @@ footer{border-top:1px solid var(--line);padding-top:16px;color:var(--muted);font
 <p><strong>Checked</strong>, on the build computer (Windows 11, Windows PowerShell 5.1):</p>
 <ul>
 <li>The scripts' automated self-tests: port picking, quoting of folder names with spaces and non-ASCII letters, the narrowed access list on <code>.env</code>, that no password reaches the window or the files around it, that a reinstall keeps data and the database, and that uninstalling keeps data unless told otherwise.</li>
-<li>One full install from the package zip into a temporary profile folder whose name had a space and an <code>&euml;</code>: the database was made, the administrator could sign in, the scanner address was set, Stop and Start worked, a second install was refused, a reinstall kept the data, and uninstalling with deletion confirmed removed everything. The installer was given its answers by a script there, not typed.</li>
+<li>One full install from the package zip into a temporary profile folder whose name had a space and an <code>&euml;</code>: the database was made, the administrator could sign in, the scanner address was set, Stop and Start worked, a second install was refused, a reinstall kept the data, and uninstalling with deletion confirmed removed everything, also when started with its working folder inside the program, as its Start-menu shortcut did. A second run did the same with a temporary folder holding Chinese and accented letters and with <code>DATABASE_URL</code> and <code>PG</code> settings pointing elsewhere. The installer was given its answers by a script there, not typed.</li>
 </ul>
 <p><strong>Not checked:</strong></p>
 <ul>

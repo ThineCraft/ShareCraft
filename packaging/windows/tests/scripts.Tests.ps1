@@ -48,6 +48,8 @@ function Test {
     param([Parameter(Mandatory)][string]$Name, [Parameter(Mandatory)][scriptblock]$Body)
     $savedLocal = $env:LOCALAPPDATA
     $savedRoaming = $env:APPDATA
+    $savedTemp = $env:TEMP
+    $savedTmp = $env:TMP
     try {
         if (-not $script:Loaded) { throw 'scripts\common.ps1 could not be loaded' }
         & $Body
@@ -60,7 +62,11 @@ function Test {
     } finally {
         $env:LOCALAPPDATA = $savedLocal
         $env:APPDATA = $savedRoaming
-        Remove-Item Env:PGPASSFILE -ErrorAction SilentlyContinue
+        $env:TEMP = $savedTemp
+        $env:TMP = $savedTmp
+        foreach ($name in 'PGPASSFILE', 'DATABASE_URL', 'PGHOST', 'PGHOSTADDR', 'PGPORT', 'PGUSER', 'PGPASSWORD', 'PGDATABASE', 'PGSERVICE') {
+            Remove-Item "Env:$name" -ErrorAction SilentlyContinue
+        }
     }
 }
 
@@ -243,7 +249,9 @@ Test 'a shortcut keeps a script path with spaces and non-ASCII letters whole' {
     Assert-True ($read.Arguments.Contains("-File `"$script`"")) "the script path is quoted whole: $($read.Arguments)"
     Assert-True ($read.Arguments.Contains('-WindowStyle Hidden')) 'hidden'
     Assert-True ($read.Arguments.EndsWith('-Gui')) 'the script argument follows'
-    Assert-Equal (Split-Path -Parent $script) $read.WorkingDirectory 'working folder'
+    # Never a folder inside the program: Windows will not delete a process's working folder,
+    # so Uninstall run from its shortcut could not remove the program.
+    Assert-Equal $env:LOCALAPPDATA $read.WorkingDirectory 'working folder'
 }
 
 Test 'a path with non-ASCII letters reaches the database tools in plain ASCII, or is refused plainly' {
@@ -286,7 +294,7 @@ Test '.env is written with an access list narrowed to this user' {
     $text = [System.Text.Encoding]::UTF8.GetString($bytes)
     Assert-True ($text -ceq "DATABASE_URL=$url`n") 'the file holds DATABASE_URL only'
     Assert-True ($url -ceq "postgres://sharecraft:$secret@127.0.0.1:5440/sharecraft") 'the address form'
-    Assert-Equal $url (Read-EnvDatabaseUrl -Path $path) 'read back'
+    Assert-True ($url -ceq (Read-EnvDatabaseUrl -Path $path)) 'read back (not shown: it holds a password)'
 
     $acl = Get-Acl -LiteralPath $path
     Assert-True $acl.AreAccessRulesProtected 'inheritance is removed'
@@ -540,6 +548,125 @@ Test 'a program started in the background can have its log read while it runs' {
     } finally {
         if (-not $process.HasExited) { $process.Kill() }
     }
+}
+
+# --- Fix round 1 -------------------------------------------------------------------------------
+
+function Invoke-ChildPowerShell {
+    # Runs a script file in a new Windows PowerShell, hidden, in the given working folder, with
+    # this process's environment; answers the exit code.
+    param([Parameter(Mandatory)][string]$Script, [string[]]$Arguments = @(), [Parameter(Mandatory)][string]$WorkingDirectory, [int]$TimeoutSeconds = 180)
+    $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $line = Join-CommandLine -Arguments (@('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $Script) + $Arguments)
+    $p = Start-Process -FilePath $ps -ArgumentList $line -WorkingDirectory $WorkingDirectory -WindowStyle Hidden -PassThru
+    $null = $p.Handle
+    if (-not $p.WaitForExit($TimeoutSeconds * 1000)) { $p.Kill(); throw "$Script did not finish within $TimeoutSeconds seconds" }
+    $p.ExitCode
+}
+
+Test 'uninstall removes everything when its working folder is inside the program (as from its shortcut)' {
+    $folder = New-TestFolder
+    Use-TestProfile -Folder $folder
+    $paths = Get-ShareCraftPaths
+    New-InstalledState -Paths $paths
+    # The fake package has no real pg_ctl; the database part of Stop is not what is tested here.
+    Remove-Item -LiteralPath (Join-Path $paths.Program 'pgsql') -Recurse -Force
+    foreach ($name in 'common.ps1', 'uninstall.ps1') {
+        Copy-Item -LiteralPath (Join-Path $script:Here "..\scripts\$name") -Destination (Join-Path $paths.Program "scripts\$name") -Force
+    }
+    New-Item -ItemType Directory -Force -Path $paths.StartMenu | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $paths.StartMenu 'ShareCraft.lnk'), 'x')
+    $scripts = Join-Path $paths.Program 'scripts'
+    $code = Invoke-ChildPowerShell -Script (Join-Path $scripts 'uninstall.ps1') -Arguments @('-Yes', '-DeleteData') -WorkingDirectory $scripts
+    Assert-Equal 0 $code 'uninstall exit code'
+    Assert-True (-not (Test-Path -LiteralPath $paths.Program)) 'the program folder is removed'
+    Assert-True (-not (Test-Path -LiteralPath $paths.StartMenu)) 'the shortcuts are removed'
+    Assert-True (-not (Test-Path -LiteralPath $paths.Root)) 'the confirmed data deletion is done'
+}
+
+Test 'native programs start when TEMP has letters outside the code page' {
+    $folder = New-TestFolder
+    $odd = Join-Path $folder ('tmp ' + [char]0x5F20 + [char]0x4F1F + " $($script:Accent)")
+    New-Item -ItemType Directory -Force -Path $odd | Out-Null
+    $out = Join-Path $folder 'launched.txt'
+    $probe = Join-Path $folder 'probe.ps1'
+    $common = (Resolve-Path (Join-Path $script:Here '..\scripts\common.ps1')).Path
+    [System.IO.File]::WriteAllText($probe, @"
+param([string]`$Common, [string]`$Out)
+Set-StrictMode -Version Latest
+`$ErrorActionPreference = 'Stop'
+. `$Common
+`$cmd = Join-Path `$env:SystemRoot 'System32\cmd.exe'
+`$r = Invoke-Native -FilePath `$cmd -Arguments @('/c', 'echo', 'launched') -What 'echo'
+[System.IO.File]::WriteAllText(`$Out, `$r.Output)
+"@, (New-Object System.Text.UTF8Encoding $true))
+    # A fresh process, so the launcher is compiled there with that TEMP.
+    $env:TEMP = $odd
+    $env:TMP = $odd
+    $code = Invoke-ChildPowerShell -Script $probe -Arguments @('-Common', $common, '-Out', $out) -WorkingDirectory $folder
+    Assert-Equal 0 $code 'exit code'
+    Assert-True ((Test-Path -LiteralPath $out) -and ([System.IO.File]::ReadAllText($out) -match 'launched')) 'the program ran and its output came back'
+}
+
+Test 'a TEMP with letters outside the code page is changed to its plain-ASCII short name' {
+    $folder = New-TestFolder
+    $odd = Join-Path $folder ('tmp ' + [char]0x5F20 + [char]0x4F1F + " $($script:Accent)")
+    New-Item -ItemType Directory -Force -Path $odd | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $odd 'marker.txt'), 'same')
+    $env:TEMP = $odd
+    $env:TMP = $odd
+    $message = $null
+    try { Initialize-SafeTemp } catch { $message = $_.Exception.Message }
+    if ($null -eq $message) {
+        Assert-True ($env:TEMP -match '^[ -~]+$') "TEMP is plain ASCII: $env:TEMP"
+        Assert-Equal $env:TEMP $env:TMP 'TMP follows TEMP'
+        Assert-Equal 'same' ([System.IO.File]::ReadAllText((Join-Path $env:TEMP 'marker.txt'))) 'the same folder'
+    } else {
+        Assert-True ($message -match 'temporary folder') "a plain refusal, got: $message"
+    }
+}
+
+Test '.env is never left empty or missing when writing it fails' {
+    $folder = New-TestFolder
+    $path = Join-Path $folder '.env'
+    $old = New-DatabaseUrl -Password (New-RandomSecret) -Port 5440
+    Write-EnvFile -Path $path -DatabaseUrl $old
+    $before = [System.IO.File]::ReadAllText($path)
+    # Narrowing the access list fails part way, as a killed icacls would.
+    function Set-OwnerOnlyAccess { param([string]$Path, [switch]$Folder) throw 'narrowing failed' }
+    Assert-Throws { Write-EnvFile -Path $path -DatabaseUrl (New-DatabaseUrl -Password (New-RandomSecret) -Port 5441) } 'narrowing failed' 'the failure comes through' | Out-Null
+    Remove-Item Function:\Set-OwnerOnlyAccess
+    Assert-True ($before -ceq [System.IO.File]::ReadAllText($path)) '.env still holds the old address (not shown: it holds a password)'
+    Assert-Equal 1 @(Get-ChildItem -LiteralPath $folder -Force).Count 'no half-written file is left beside it'
+    # And a write that succeeds replaces it whole, still narrowed, with nothing left over.
+    $new = New-DatabaseUrl -Password (New-RandomSecret) -Port 5442
+    Write-EnvFile -Path $path -DatabaseUrl $new
+    Assert-True ($new -ceq (Read-EnvDatabaseUrl -Path $path)) 'the new address (not shown: it holds a password)'
+    $rules = @((Get-Acl -LiteralPath $path).GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
+    Assert-Equal 1 $rules.Count 'one access rule after replacing'
+    Assert-Equal 1 @(Get-ChildItem -LiteralPath $folder -Force).Count 'only .env is there'
+}
+
+Test 'programs ShareCraft starts never see another DATABASE_URL or PG* setting' {
+    $folder = New-TestFolder
+    $env:DATABASE_URL = 'postgres://nobody:wrong@192.0.2.1:1/elsewhere'
+    $env:PGHOST = '192.0.2.1'
+    $env:PGPORT = '1'
+    $env:PGPASSWORD = 'wrong'
+    $env:PGSERVICE = 'elsewhere'
+    Clear-DatabaseEnvironment
+    $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $r = Invoke-Native -FilePath $ps -Arguments @('-NoProfile', '-Command', "(Get-ChildItem Env: | Where-Object { `$_.Name -match '^(PG|DATABASE_URL`$)' } | ForEach-Object Name) -join ','; 'end'") -What 'listing' -OutputFolder $folder
+    Assert-Equal 'end' $r.Output.Trim() "the child saw: $($r.Output.Trim())"
+    foreach ($name in 'install.ps1', 'start.ps1', 'stop.ps1', 'uninstall.ps1') {
+        $text = [System.IO.File]::ReadAllText((Join-Path $script:Here "..\scripts\$name"))
+        Assert-True ($text -match '(?m)^\s*Clear-DatabaseEnvironment') "$name clears them before it starts anything"
+    }
+    # Start clears them itself, also when called on its own.
+    Use-TestProfile -Folder $folder
+    $env:DATABASE_URL = 'postgres://nobody:wrong@192.0.2.1:1/elsewhere'
+    try { Start-ShareCraft -Paths (Get-ShareCraftPaths) -NoBrowser | Out-Null } catch { }
+    Assert-True ($null -eq $env:DATABASE_URL) 'Start-ShareCraft removed DATABASE_URL'
 }
 
 # --- The package -------------------------------------------------------------------------------
