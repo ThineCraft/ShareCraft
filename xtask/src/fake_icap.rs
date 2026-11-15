@@ -1,5 +1,5 @@
 //! A small ICAP server (RFC 3507) for development and tests: `cargo xtask fake-icap [--port
-//! 1344] [--slow] [--fail]`, and started in-process by the server's tests.
+//! 1344] [--preview 1024|none] [--slow] [--fail]`, and started in-process by the server's tests.
 //!
 //! It answers `OPTIONS` for its one service, and `RESPMOD` by reading the encapsulated HTTP
 //! response body (chunked) a piece at a time, never whole, looking for the EICAR test string
@@ -26,6 +26,9 @@ use std::time::Duration;
 
 /// The service the fake server offers, as in `icap://127.0.0.1:1344/scan`.
 pub const SERVICE: &str = "scan";
+/// The `Preview` size `cargo xtask fake-icap` advertises unless told otherwise: c-icap's ClamAV
+/// service asks for the same.
+pub const DEFAULT_PREVIEW: usize = 1024;
 /// The threat name the fake server reports.
 pub const THREAT: &str = "Eicar-Test-Signature";
 /// How long `--slow` waits before answering each scan.
@@ -556,13 +559,17 @@ fn respmod(
     Ok(true)
 }
 
-/// `cargo xtask fake-icap [--port 1344] [--slow] [--fail]`: runs until the process ends.
+/// `cargo xtask fake-icap [--port 1344] [--preview 1024|none] [--slow] [--fail]`: runs until
+/// the process ends. It advertises a preview of [`DEFAULT_PREVIEW`] bytes unless told otherwise.
 ///
 /// # Errors
 /// An argument it does not know, or a port it cannot listen on.
 pub fn run(args: &[String]) -> Result<(), String> {
     let mut port: u16 = 1344;
-    let mut behaviour = Behaviour::default();
+    let mut behaviour = Behaviour {
+        preview: Some(DEFAULT_PREVIEW),
+        ..Behaviour::default()
+    };
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -572,12 +579,21 @@ pub fn run(args: &[String]) -> Result<(), String> {
                     .and_then(|p| p.parse().ok())
                     .ok_or("--port needs a port number")?;
             }
+            "--preview" => {
+                behaviour.preview = match args.next().map(String::as_str) {
+                    Some("none") => None,
+                    size => Some(
+                        size.and_then(|n| n.parse().ok())
+                            .ok_or("--preview needs a size in bytes, or none")?,
+                    ),
+                };
+            }
             "--slow" => behaviour.slow = Some(SLOW),
             "--fail" => behaviour.fail = true,
             other => {
                 return Err(format!(
                     "unknown argument {other}; usage: cargo xtask fake-icap [--port 1344] \
-                     [--slow] [--fail]"
+                     [--preview 1024|none] [--slow] [--fail]"
                 ));
             }
         }

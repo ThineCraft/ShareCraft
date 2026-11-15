@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use collab_core::ids::{DocId, Seq};
 use common::{Site, TestClient, TestServer, TestUser, handshake_status, spawn_server, ws_request};
-use fake_icap::{Behaviour, FakeIcap, THREAT, eicar};
+use fake_icap::{Behaviour, DEFAULT_PREVIEW, FakeIcap, THREAT, eicar};
 use records::{ScanState, ScannerUrl};
 use reqwest::header::RANGE;
 use reqwest::{Method, StatusCode};
@@ -52,6 +52,30 @@ fn infected(label: &str) -> Vec<u8> {
     bytes.extend_from_slice(&eicar());
     bytes.extend_from_slice(b"\nend of report\n");
     bytes
+}
+
+/// A small file the fake scanner finds infected, small enough to fit a preview whole: one byte,
+/// then the test string.
+fn small_infected() -> Vec<u8> {
+    let mut bytes = b"#".to_vec();
+    bytes.extend_from_slice(&eicar());
+    bytes
+}
+
+/// A file the fake scanner finds infected, exactly `size` bytes long.
+fn infected_of_size(label: &str, size: usize) -> Vec<u8> {
+    let mut bytes = infected(label);
+    assert!(bytes.len() <= size);
+    bytes.resize(size, b'.');
+    bytes
+}
+
+/// A fake scanner that asks for a preview as real ones do ([`DEFAULT_PREVIEW`] bytes).
+fn previewing() -> Behaviour {
+    Behaviour {
+        preview: Some(DEFAULT_PREVIEW),
+        ..Behaviour::default()
+    }
 }
 
 fn sha(bytes: &[u8]) -> [u8; 32] {
@@ -270,6 +294,33 @@ async fn icap_clean_and_infected_verdicts() {
     assert_eq!(fake.seen().scans, 3);
     assert_eq!(fake.seen().infected, 1);
 
+    // With a preview, as real scanners ask: a small infected file, and one exactly the
+    // preview's size, fit the preview whole (`ieof`) and are answered without a `100 Continue`.
+    let with_preview = FakeIcap::start(local(), previewing()).unwrap();
+    let previewed = crate::client(&with_preview);
+    let size = DEFAULT_PREVIEW;
+    for (bad, name) in [
+        (small_infected(), "small.txt"),
+        (infected_of_size("exact", size), "exact.bin"),
+    ] {
+        let verdict = previewed
+            .scan(bad.as_slice(), bad.len() as u64, name)
+            .await
+            .unwrap();
+        assert_eq!(verdict, Verdict::Infected(THREAT.to_owned()), "{name}");
+    }
+    let clean = vec![b'c'; size];
+    let verdict = previewed
+        .scan(clean.as_slice(), clean.len() as u64, "clean.bin")
+        .await
+        .unwrap();
+    assert_eq!(verdict, Verdict::Clean);
+    let seen = with_preview.seen();
+    assert_eq!(
+        (seen.previews, seen.ieofs, seen.continues, seen.infected),
+        (3, 3, 0, 2)
+    );
+
     // Not an ICAP address.
     for text in [
         "http://127.0.0.1/scan",
@@ -375,6 +426,96 @@ async fn icap_requests_use_crlf_only() {
             "{text}"
         );
     }
+}
+
+/// The infected answers real scanners give (c-icap with ClamAV: `200` with `X-Infection-Found`
+/// and an encapsulated HTTP response, with or without a body; or `403` with `X-Virus-ID`),
+/// right after a preview that held the whole file, right after a preview without a
+/// `100 Continue`, and after the whole file.
+#[tokio::test]
+async fn icap_infected_answers_as_real_scanners_send_them() {
+    const WITH_BODY: &[u8] = b"ICAP/1.0 200 OK\r\nISTag: \"x\"\r\n\
+        X-Infection-Found: Type=0; Resolution=2; Threat=Eicar-Test-Signature;\r\n\
+        Encapsulated: res-hdr=0, res-body=71\r\n\r\n\
+        HTTP/1.1 403 Forbidden\r\nContent-Type: text/html\r\nContent-Length: 11\r\n\r\n\
+        b\r\nVirus found\r\n0\r\n\r\n";
+    const NULL_BODY: &[u8] = b"ICAP/1.0 200 OK\r\nISTag: \"x\"\r\n\
+        X-Infection-Found: Type=0; Resolution=2; Threat=Eicar-Test-Signature;\r\n\
+        Encapsulated: res-hdr=0, null-body=46\r\n\r\n\
+        HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n";
+    const VIRUS_ID: &[u8] = b"ICAP/1.0 403 Forbidden\r\nX-Virus-ID: Eicar-Test-Signature\r\n\
+        Encapsulated: null-body=0\r\n\r\n";
+    let small = small_infected();
+    let large = infected_of_size("large", 4096);
+    for answer in [WITH_BODY, NULL_BODY, VIRUS_ID] {
+        for (preview, body) in [
+            (Some(1024), small.as_slice()),
+            (Some(small.len() as u64), small.as_slice()),
+            (Some(1024), large.as_slice()),
+            (None, small.as_slice()),
+        ] {
+            let (addr, sent) = capture(answer);
+            let client = Client::new(
+                ScannerUrl::parse(&format!("icap://{addr}/scan")).unwrap(),
+                Duration::from_secs(10),
+            );
+            let options = server::icap::Options {
+                preview,
+                ..server::icap::Options::default()
+            };
+            let verdict = client
+                .scan_with(&options, body, body.len() as u64, "file.bin")
+                .await;
+            let label = format!(
+                "{preview:?}, {} bytes, {}",
+                body.len(),
+                String::from_utf8_lossy(&answer[..20])
+            );
+            assert_eq!(
+                verdict.unwrap(),
+                Verdict::Infected(THREAT.to_owned()),
+                "{label}"
+            );
+            let request = sent.recv().unwrap();
+            let ieof = preview.is_some_and(|n| body.len() as u64 <= n);
+            assert_eq!(request.ends_with(b"\r\n0; ieof\r\n\r\n"), ieof, "{label}");
+        }
+    }
+}
+
+/// A small infected file, whose whole content fits the scanner's preview, and one exactly the
+/// preview's size, uploaded as anyone would: both found infected and quarantined, with the
+/// threat named.
+#[tokio::test]
+async fn infected_files_within_the_preview_are_quarantined() {
+    let Scanned {
+        server,
+        fake,
+        ann,
+        home,
+        ..
+    } = scanned(previewing()).await;
+    let small = small_infected();
+    let exact = infected_of_size("exact", DEFAULT_PREVIEW);
+    let mut docs = Vec::new();
+    for (name, bytes) in [("Small.txt", &small), ("Exact.bin", &exact)] {
+        let doc = upload(&server, &ann, &home, name, bytes).await;
+        let state = wait_scan(&server, bytes, |s| {
+            matches!(s, ScanState::Infected | ScanState::Failed)
+        })
+        .await;
+        let info = state_of(&server, bytes).await.unwrap();
+        assert_eq!(state, ScanState::Infected, "{name}: {info:?}");
+        assert_eq!(info.detail.as_deref(), Some(THREAT), "{name}");
+        docs.push(doc);
+    }
+    for doc in &docs {
+        let entry = listed(&server, &ann, &home, doc).await;
+        assert_eq!(entry["scan"], "quarantined", "{entry}");
+        assert_eq!(entry["threat"], THREAT, "{entry}");
+    }
+    let seen = fake.seen();
+    assert_eq!((seen.ieofs, seen.continues, seen.infected), (2, 0, 2));
 }
 
 #[tokio::test]

@@ -9,8 +9,9 @@
 //! - `editors <list|build|compress|verify>` builds an editor from its fork and installs it into
 //!   `editors/<id>`, with Brotli and gzip copies of its files; `compress` adds the copies to an
 //!   editor already installed;
-//! - `fake-icap [--port 1344] [--slow] [--fail]` runs a small ICAP server for development: content
-//!   holding the EICAR test string is infected, anything else clean.
+//! - `fake-icap [--port 1344] [--preview 1024|none] [--slow] [--fail]` runs a small ICAP
+//!   server for development: content holding the EICAR test string is infected, anything else
+//!   clean.
 
 mod editors;
 // Also included by the server's tests, which use the parts the command does not.
