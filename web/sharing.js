@@ -15,7 +15,7 @@ import {
   messageFor,
   organisationChrome,
   requireMe,
-  startPalette,
+  setupTopbar,
   showMessage,
   timeZoneChoices,
 } from './common.js';
@@ -32,8 +32,7 @@ try {
   status.textContent = err.message;
   throw err;
 }
-$('who').textContent = `Signed in as ${me.name}`;
-startPalette(me);
+setupTopbar(me, error);
 await organisationChrome();
 
 let globalEditor = null;

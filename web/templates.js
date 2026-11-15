@@ -10,7 +10,7 @@ import {
   messageFor,
   organisationChrome,
   requireMe,
-  startPalette,
+  setupTopbar,
   seg,
   showMessage,
   templateReasonText,
@@ -30,8 +30,7 @@ try {
   status.textContent = err.message;
   throw err;
 }
-$('who').textContent = `Signed in as ${me.name}`;
-startPalette(me);
+setupTopbar(me, error);
 await organisationChrome();
 
 if (!me.is_admin) {

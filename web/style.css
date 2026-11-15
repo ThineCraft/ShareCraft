@@ -72,10 +72,11 @@ select{padding:6px 8px;min-height:36px;background:var(--paper);border:1px solid 
 .list li{display:flex;flex-wrap:wrap;align-items:center;gap:6px 12px;padding:10px 8px;border-bottom:1px solid var(--line);overflow-wrap:anywhere}
 .list .grow{flex:1;min-width:160px}
 .list small,.meta{color:var(--muted);font-size:12px}
-.topbar{display:flex;flex-wrap:wrap;align-items:center;gap:8px 16px;padding:12px 0;border-bottom:1px solid var(--line)}
+.topbar{display:flex;flex-wrap:nowrap;align-items:center;gap:12px;min-height:44px;padding:8px 0;border-bottom:1px solid var(--line)}
 /* the account bar is never themed: it keeps the default accent whatever the site's look sets on <html> */
 .topbar{--accent:#3156c9;--accent-ink:light-dark(#3156c9,#9db4ff);--on-accent:#fff;--soft:color-mix(in srgb,var(--accent) 11%,var(--paper))}
-.topbar .spacer{flex:1}
+.topbar>*{flex:none}
+.topbar .spacer{flex:1 1 0;min-width:0}
 .share{padding:14px 16px;border-top:1px solid var(--line)}
 .share h2{font-size:13px;margin:0 0 8px}
 .msg:empty,.problem:empty{padding:0}
@@ -691,4 +692,49 @@ dialog.details-sheet[open]{animation:sheet-in .2s ease-out}
 @media (forced-colors:active){
  .files tbody tr[aria-current=true]>td:first-child{box-shadow:none;border-left:3px solid Highlight}
  .details-preview,aside.details-pane{border:1px solid CanvasText}
+}
+/* the account bar (round 6): the ShareCraft wordmark, search, the avatar and its account menu. One
+   row at every width, never themed by a site's look (the colours below are fixed) */
+.wordmark{display:inline-flex;align-items:center;gap:8px;min-height:44px;padding:0 6px 0 0;border-radius:8px;color:var(--text);font-size:16px;font-weight:700;letter-spacing:-.01em;text-decoration:none;white-space:nowrap}
+.wordmark:hover .wordmark-word{text-decoration:underline;text-underline-offset:3px}
+.wordmark:focus-visible{outline:2px solid var(--accent-ink);outline-offset:2px}
+.wordmark-mark{flex:none;width:26px;height:26px}
+.wordmark-tile{fill:#3156c9}
+.wordmark-line{fill:none;stroke:#fff;stroke-width:2;stroke-linecap:round}
+.wordmark-dot{fill:#fff}
+.avatar-button,.topbar .avatar-button{width:44px;height:44px;min-height:44px;padding:0;border:0;border-radius:50%;background:transparent}
+.avatar{display:grid;place-items:center;width:36px;height:36px;border-radius:50%;background:light-dark(var(--avatar-light-bg),var(--avatar-dark-bg));color:light-dark(var(--avatar-light-ink),var(--avatar-dark-ink));font-size:14px;font-weight:700;line-height:1;letter-spacing:.02em;box-shadow:0 0 0 1px var(--line)}
+.avatar-button:hover .avatar,.avatar-button[aria-expanded=true] .avatar{box-shadow:0 0 0 3px var(--paper),0 0 0 5px var(--accent-ink)}
+.avatar-button:focus-visible{outline:2px solid var(--accent-ink);outline-offset:1px}
+.account-wrap .account-menu{min-width:240px;max-width:min(320px,calc(100vw - 32px))}
+.account-menu .account-head{display:flex;flex-direction:column;gap:2px;padding:8px 12px 6px}
+.account-name{font-weight:600;overflow-wrap:anywhere}
+.account-email{color:var(--muted);font-size:12px;overflow-wrap:anywhere}
+.menu .menu-separator{height:1px;margin:4px 0;background:var(--line)}
+.menu .menu-label{padding:8px 12px 2px;color:var(--muted);font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase}
+.menu-group{margin:0;padding:0;list-style:none}
+.menu [role=menuitemradio]{display:flex;align-items:center;justify-content:flex-start;gap:10px;width:100%;min-height:36px;padding:6px 12px;border:0;border-radius:6px;background:transparent;color:var(--text);font-weight:400;text-align:left;white-space:nowrap;cursor:pointer}
+.menu [role=menuitemradio]:hover,.menu [role=menuitemradio]:focus{background:var(--soft)}
+.menu [role=menuitemradio]:focus-visible{outline:2px solid var(--accent-ink);outline-offset:-2px}
+.radio-dot{box-sizing:border-box;flex:none;width:16px;height:16px;border:2px solid var(--muted);border-radius:50%}
+[aria-checked=true]>.radio-dot{border-color:var(--accent-ink);background:radial-gradient(circle,var(--accent-ink) 0 3px,transparent 3.5px)}
+.topbar #requests-link{gap:6px}
+/* the administration pages' own links, under the account bar */
+.subnav{display:flex;flex-wrap:wrap;gap:0 16px;padding:4px 0;border-bottom:1px solid var(--line);font-size:13px}
+.subnav a{display:inline-flex;align-items:center;min-height:36px}
+.subnav:not(:has(a:not([hidden]))){display:none}
+@media (max-width:760px){
+ .menu [role=menuitemradio]{min-height:44px}
+ .subnav a{min-height:44px}
+}
+@media (max-width:600px){
+ .topbar{gap:8px}
+ .topbar .requests-text{display:none}
+ .topbar #requests-link{padding:6px 10px}
+ .topbar #requests-link::before{content:'';box-sizing:border-box;width:16px;height:11px;border:2px solid currentColor;border-top-width:0;border-radius:0 0 3px 3px}
+}
+@media (forced-colors:active){
+ .avatar{border:1px solid CanvasText}
+ [aria-checked=true]>.radio-dot{forced-color-adjust:none;border-color:Highlight;background:Highlight}
+ .menu [role=menuitemradio]:focus{outline:2px solid CanvasText}
 }

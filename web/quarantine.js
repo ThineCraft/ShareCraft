@@ -12,7 +12,7 @@ import {
   organisationChrome,
   quarantineRow,
   requireMe,
-  startPalette,
+  setupTopbar,
   seg,
   showMessage,
 } from './common.js';
@@ -24,8 +24,7 @@ const dialog = $('release-dialog');
 let releasing = null; // the entry the release dialog is for
 
 const me = await requireMe();
-$('who').textContent = `Signed in as ${me.name}`;
-startPalette(me);
+setupTopbar(me, error);
 await organisationChrome();
 
 if (!me.is_admin) {

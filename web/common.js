@@ -2,6 +2,7 @@
 // sign-in redirect. Pages hold no merging or permission logic; the server decides.
 
 import { CHECK_LABELS, MIN_RATIO, applyLook, parseColour } from './look.js';
+import { setupAccountMenu, setupWordmark } from './account.js';
 
 const MESSAGES = {
   invalid_credentials: 'That email and password do not match.',
@@ -611,18 +612,28 @@ export function queryId(search, name = 'id') {
 }
 
 /**
- * Fills the account bar of a page: who is signed in, the People link for administrators and
- * Sign out. The page holds `who`, `people-link` and `sign-out`; `error` receives failures.
+ * Fills the account bar (`.topbar`) of a page: the ShareCraft wordmark linking to the start page,
+ * the command palette's search button and the avatar with the account menu (account.js): who is
+ * signed in, People and Brand centre for those who may use them, Appearance and Sign out. `error`
+ * receives failures.
  */
 export function setupTopbar(me, error) {
-  const $ = (id) => document.getElementById(id);
-  $('who').textContent = `Signed in as ${me.name}`;
-  $('people-link').hidden = !me.is_admin;
-  $('sign-out').addEventListener('click', async () => {
-    const result = await api('DELETE', '/session');
-    if (result.ok) location.assign('/signin.html');
-    else showMessage(error, messageFor(result.error));
-  });
+  const bar = document.querySelector('.topbar');
+  if (bar) {
+    setupWordmark(bar);
+    if (!bar.querySelector('.spacer')) bar.append(h('span', { class: 'spacer' }));
+    const brandManager = me.is_admin
+      ? Promise.resolve(true)
+      : api('GET', '/brand').then((result) => Boolean(result.ok && result.data?.can_manage));
+    setupAccountMenu(bar, me, {
+      brandManager,
+      signOut: async () => {
+        const result = await api('DELETE', '/session');
+        if (result.ok) location.assign('/signin.html');
+        else if (error) showMessage(error, messageFor(result.error));
+      },
+    });
+  }
   startPalette(me);
 }
 

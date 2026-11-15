@@ -13,7 +13,7 @@ import {
   organisationChrome,
   purgeSiteText,
   requireMe,
-  startPalette,
+  setupTopbar,
   seg,
   showMessage,
 } from './common.js';
@@ -29,8 +29,7 @@ try {
   status.textContent = err.message;
   throw err;
 }
-$('who').textContent = `Signed in as ${me.name}`;
-startPalette(me);
+setupTopbar(me, error);
 await organisationChrome();
 
 // The brand centre is looked after by administrators and the brand managers they name.

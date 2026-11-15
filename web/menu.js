@@ -84,9 +84,12 @@ function listenOnce() {
   );
 }
 
+// Entries: plain items, and radio or checkbox items (which keep the menu open when chosen).
+const ITEM = '[role="menuitem"],[role="menuitemradio"],[role="menuitemcheckbox"]';
+
 /** The entries of `menu` that are shown, in order. */
 export function menuItems(menu) {
-  return [...menu.querySelectorAll('[role="menuitem"]')].filter(
+  return [...menu.querySelectorAll(ITEM)].filter(
     (item) => !item.hidden && !item.closest('[hidden]:not([role="menu"])') && !item.disabled,
   );
 }
@@ -108,7 +111,7 @@ export function setupMenu(button, menu) {
   menu.hidden = true;
 
   const prepare = () => {
-    for (const item of menu.querySelectorAll('[role="menuitem"]')) item.tabIndex = -1;
+    for (const item of menu.querySelectorAll(ITEM)) item.tabIndex = -1;
   };
 
   const close = (refocus) => {
