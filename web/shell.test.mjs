@@ -3,8 +3,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { SHELL_TABS, currentTab, recentRow } from './shell.js';
 
-test('four tabs in thumb order, each with a label and an icon', () => {
-  assert.deepEqual(SHELL_TABS.map((tab) => tab.label), ['Home', 'Search', 'Recent', 'You']);
+test('five tabs in thumb order, each with a label and an icon', () => {
+  assert.deepEqual(SHELL_TABS.map((tab) => tab.label), ['Home', 'Search', 'Recent', 'Inbox', 'You']);
   for (const tab of SHELL_TABS) assert.ok(tab.icon.length > 0 && tab.icon.every((d) => /^[Mm]/.test(d)), tab.key);
 });
 

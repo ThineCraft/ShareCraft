@@ -1,7 +1,8 @@
 // The phone-first shell (round 20). Below 700 pixels wide, or with a finger below 900, pages
 // with the account bar get a tab bar at the bottom, in thumb reach: Home (the start page), Search
 // (the command palette as a full-screen sheet), Recent (the files opened lately, from start.js's
-// store, as a bottom sheet) and You (the account menu as a bottom sheet). The account bar at the
+// store, as a bottom sheet), Inbox (round 23: inbox.js's notifications as a bottom sheet, with
+// the count of new ones on the tab; the bell in the top bar steps aside) and You (the account menu as a bottom sheet). The account bar at the
 // top keeps the wordmark and the page's one context action (marked data-shell-action, such as a
 // library's New), which moves up there. The tab bar steps aside while the on-screen keyboard is
 // up. A long press (half a second, a finger held still) on a library row or card opens its
@@ -20,6 +21,7 @@ export const SHELL_TABS = Object.freeze([
   { key: 'home', label: 'Home', icon: ['M3 11.5 12 4l9 7.5', 'M5.5 9.5V20h4.5v-5.5h4V20h4.5V9.5'] },
   { key: 'search', label: 'Search', icon: ['M10.5 4a6.5 6.5 0 1 1 0 13 6.5 6.5 0 0 1 0-13z', 'm15.5 15.5 4.5 4.5'] },
   { key: 'recent', label: 'Recent', icon: ['M12 3.5a8.5 8.5 0 1 1 0 17 8.5 8.5 0 0 1 0-17z', 'M12 7.5V12l3 2'] },
+  { key: 'inbox', label: 'Inbox', icon: ['M6 16.5V11a6 6 0 0 1 12 0v5.5l1.5 2h-15z', 'M10 20.5a2 2 0 0 0 4 0'] },
   { key: 'you', label: 'You', icon: ['M12 4a4 4 0 1 1 0 8 4 4 0 0 1 0-8z', 'M4.5 20.5c.8-3.6 3.8-5.5 7.5-5.5s6.7 1.9 7.5 5.5'] },
 ]);
 
@@ -74,13 +76,17 @@ export function setupShell(me, { account } = {}) {
     const attrs = { type: 'button', class: 'tab', 'data-tab': key, 'aria-expanded': 'false' };
     if (key === 'search') Object.assign(attrs, { 'aria-haspopup': 'dialog', 'aria-label': 'Search or jump to' });
     if (key === 'recent') Object.assign(attrs, { 'aria-haspopup': 'dialog', 'aria-label': 'Recently opened files' });
+    if (key === 'inbox') {
+      Object.assign(attrs, { 'aria-haspopup': 'dialog', 'aria-label': 'Inbox', 'aria-controls': 'inbox-panel' });
+      inner[0].append(h('span', { class: 'inbox-count', 'aria-hidden': 'true', hidden: true }));
+    }
     if (key === 'you') Object.assign(attrs, { 'aria-haspopup': 'menu', 'aria-controls': 'account-menu', 'aria-label': `You: ${me.name || me.email || 'your account'}` });
     return h('button', attrs, ...inner);
   };
   const tabs = SHELL_TABS.map(tab);
   const bar = h('nav', { class: 'tabbar', 'aria-label': 'Main' }, h('ul', {}, ...tabs.map((item) => h('li', {}, item))));
   document.body.append(bar);
-  const [, searchTab, recentTab, youTab] = tabs;
+  const [, searchTab, recentTab, inboxTab, youTab] = tabs;
 
   searchTab.addEventListener('click', () => {
     import('./palette.js').then((palette) => palette.openPalette(searchTab)).catch(() => {});
@@ -89,6 +95,10 @@ export function setupShell(me, { account } = {}) {
     if (youTab.getAttribute('aria-expanded') === 'true') account?.close(true);
     else account?.open('first', youTab);
   });
+  inboxTab.addEventListener('click', () => {
+    import('./inbox.js').then((inbox) => inbox.openInbox(inboxTab)).catch(() => {});
+  });
+  import('./inbox.js').then((inbox) => inbox.paintCounts()).catch(() => {});
   const recent = recentSheet(me, recentTab);
   recentTab.addEventListener('click', () => recent.open());
 

@@ -634,9 +634,23 @@ export function setupTopbar(me, error) {
         else if (error) showMessage(error, messageFor(result.error));
       },
     });
+    startInbox(me, bar);
     startShell(me, account);
   }
   startPalette(me);
+}
+
+/**
+ * Starts the notifications inbox (inbox.js, round 23): the bell in the account bar, between
+ * search and the avatar, and the light polling behind its count. Loaded on demand.
+ */
+function startInbox(me, bar) {
+  if (typeof document === 'undefined') return;
+  import('./inbox.js')
+    .then((inbox) => inbox.setupInbox(me, { bar }))
+    .catch(() => {
+      // without the inbox, requests are still on the Access requests page
+    });
 }
 
 /**

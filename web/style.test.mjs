@@ -155,3 +155,24 @@ test('buttons have the three looks, a danger modifier and the sizes', () => {
   assert.ok(coarse.length, 'touch sizes on coarse pointers');
   assert.ok(selectors.some((s) => s.startsWith('.card,') && /\.site-card/.test(s) && /\.library-card/.test(s) && /\.link-card/.test(s) && /\.bin-list/.test(s) && /\.recent-file/.test(s)), 'one card surface');
 });
+
+test('nested folders stay indented in the folder tree and the permission map (round 23 check)', () => {
+  const rules = parseRules(SOURCE);
+  // The round-12 folder tree indents each row by its --level (tree.js sets it per row).
+  const treeRow = rules.find((rule) => rule.selector === '.tree-row' && rule.at.length === 0);
+  assert.ok(treeRow, 'a .tree-row rule');
+  const padding = treeRow.declarations.find(([property]) => property === 'padding' || property === 'padding-left');
+  assert.match(padding?.[1] ?? '', /var\(--level/);
+  // Nothing may override that indent with !important (round 22 removed such a rule).
+  for (const rule of rules) {
+    if (!/\.tree-row/.test(rule.selector)) continue;
+    for (const [property, value] of rule.declarations) {
+      if (/^padding/.test(property)) assert.doesNotMatch(value, /!important/, `${rule.selector} { ${property}: ${value} }`);
+    }
+  }
+  // The permission map indents nested groups, and its step outranks the plain tree group reset.
+  const group = rules.find((rule) => rule.selector === '.pmap-tree .pmap-group');
+  assert.match(group?.declarations.find(([property]) => property === 'padding-left')?.[1] ?? '', /var\(--pmap-step\)/);
+  const reset = rules.findIndex((rule) => rule.selector.includes('[role=tree] [role=group]'));
+  assert.ok(reset >= 0 && reset < rules.indexOf(group), 'the map indent comes after the tree reset');
+});
