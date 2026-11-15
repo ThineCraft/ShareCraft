@@ -72,6 +72,24 @@ export function withExtension(name, extension) {
   return classifySave(extension, trimmed) === 'save' ? trimmed : `${trimmed}${extension}`;
 }
 
+/** The editors "New document" can start an empty file in, in the order it offers them. */
+export const NEW_DOC_EDITORS = Object.freeze(['text', 'gridcraft', 'wordcraft', 'solidcraft']);
+
+/**
+ * The editors "New document" offers in a library that takes only the types `allowed` (null:
+ * every type) and refuses the types `blocked`: those whose own files it would take, a text
+ * document counting as `.txt`. None in an image library, so the form is hidden there.
+ */
+export function newDocEditors(allowed, blocked = []) {
+  const lower = (list) => (Array.isArray(list) ? list.map((type) => String(type).toLowerCase()) : null);
+  const takes = lower(allowed);
+  const refuses = lower(blocked) ?? [];
+  return NEW_DOC_EDITORS.filter((id) => {
+    const type = id === 'text' ? '.txt' : EDITORS[id].extension;
+    return (takes === null || takes.includes(type)) && !refuses.includes(type);
+  });
+}
+
 const tag = (value) => Object.prototype.toString.call(value);
 
 // A copy of `bytes` if they are an ArrayBuffer or a Uint8Array (from any window), else null.

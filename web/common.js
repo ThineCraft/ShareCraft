@@ -1706,6 +1706,42 @@ export async function loadThumbnail(url, { fetch = globalThis.fetch, wait = slee
 }
 
 /**
+ * Shows in `picture` (a tile's thumbnail box) the thumbnail at `url` as an image that loads
+ * the route itself: the pages' policy takes images from their own origin only, so a `blob:`
+ * URL would show as a broken image. Should the image fail, the route is asked once more through
+ * `load` ({@link loadThumbnail}), which waits out a busy server: the image again when it then
+ * answers, the plain placeholder otherwise. Nothing is drawn into a box no longer in the page.
+ * `doc` makes the elements (the page's document; a test's stand-in).
+ */
+export function showThumbnail(picture, url, { load = loadThumbnail, doc = globalThis.document } = {}) {
+  const show = (retry) => {
+    const img = doc.createElement('img');
+    img.setAttribute('alt', '');
+    img.addEventListener(
+      'error',
+      async () => {
+        if (!picture.isConnected) return;
+        const again = retry && (await load(url)) !== null;
+        if (!picture.isConnected) return;
+        if (again) {
+          show(false);
+          return;
+        }
+        const none = doc.createElement('span');
+        none.setAttribute('class', 'placeholder');
+        none.textContent = 'No thumbnail';
+        picture.replaceChildren(none);
+      },
+      { once: true },
+    );
+    img.setAttribute('src', url);
+    picture.replaceChildren(img);
+    return img;
+  };
+  return show(true);
+}
+
+/**
  * The sentence for a file refused by the file policies, naming it and what was refused:
  * `blocked_file_type {extension}` or `file_too_large {limit}`; null for any other error.
  */

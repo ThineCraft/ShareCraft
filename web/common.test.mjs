@@ -1436,3 +1436,87 @@ test('confirm_dialog_resolves_on_click', { timeout: 2000 }, async () => {
     delete globalThis.document;
   }
 });
+
+// A stand-in document for showThumbnail: elements that keep their attributes and listeners.
+function thumbnailDocument() {
+  const element = (tag) => ({
+    tag,
+    attributes: {},
+    listeners: {},
+    textContent: '',
+    setAttribute(name, value) {
+      this.attributes[name] = String(value);
+    },
+    addEventListener(type, listener) {
+      this.listeners[type] = listener;
+    },
+  });
+  const picture = () => ({
+    isConnected: true,
+    children: [],
+    replaceChildren(...children) {
+      this.children = children;
+    },
+  });
+  return { doc: { createElement: element }, picture };
+}
+
+test('thumbnails_load_their_route_and_survive_a_redraw', async () => {
+  const { doc, picture } = thumbnailDocument();
+  const url = '/api/docs/d1/thumbnail';
+  // The image loads the route itself: the page's policy refuses blob: images.
+  const first = picture();
+  const img = libs.showThumbnail(first, url, { doc, load: async () => assert.fail('not asked') });
+  assert.equal(first.children.length, 1);
+  assert.equal(first.children[0], img);
+  assert.equal(img.tag, 'img');
+  assert.equal(img.attributes.src, url);
+  assert.equal(img.attributes.alt, '');
+
+  // The server is busy: while the retry is in flight the list is drawn again. The new tile's
+  // image keeps its own live address, and the old, removed tile is not drawn into.
+  let answer;
+  const pending = new Promise((resolve) => {
+    answer = resolve;
+  });
+  const busy = picture();
+  const busyImg = libs.showThumbnail(busy, url, { doc, load: () => pending });
+  const failed = busyImg.listeners.error();
+  busy.isConnected = false;
+  const redrawn = picture();
+  const redrawnImg = libs.showThumbnail(redrawn, url, { doc, load: async () => null });
+  answer('PNG');
+  await failed;
+  assert.deepEqual(busy.children, [busyImg]);
+  assert.equal(redrawn.children[0], redrawnImg);
+  assert.equal(redrawnImg.attributes.src, url);
+  assert.ok(!JSON.stringify([busy, redrawn]).includes('blob:'));
+
+  // Busy, then answered: the image again; failing again shows the placeholder, asked no more.
+  let asked = 0;
+  const later = picture();
+  const laterImg = libs.showThumbnail(later, url, {
+    doc,
+    load: async () => {
+      asked += 1;
+      return 'PNG';
+    },
+  });
+  await laterImg.listeners.error();
+  assert.equal(asked, 1);
+  const again = later.children[0];
+  assert.notEqual(again, laterImg);
+  assert.equal(again.tag, 'img');
+  assert.equal(again.attributes.src, url);
+  await again.listeners.error();
+  assert.equal(asked, 1);
+  assert.equal(later.children[0].tag, 'span');
+  assert.equal(later.children[0].textContent, 'No thumbnail');
+
+  // No thumbnail at all: the placeholder.
+  const none = picture();
+  const noneImg = libs.showThumbnail(none, url, { doc, load: async () => null });
+  await noneImg.listeners.error();
+  assert.equal(none.children[0].attributes.class, 'placeholder');
+  assert.equal(none.children[0].textContent, 'No thumbnail');
+});

@@ -6,6 +6,7 @@ import {
   connect,
   classifySave,
   editorUrl,
+  newDocEditors,
   nextStatus,
   noticeAfter,
   parseHostMessage,
@@ -861,4 +862,16 @@ test('only_the_two_newest_exports_are_kept', async () => {
     [3],
   );
   host.close();
+});
+
+test('new_document_offers_only_editors_the_library_takes', () => {
+  const all = ['text', 'gridcraft', 'wordcraft', 'solidcraft'];
+  assert.deepEqual(newDocEditors(null), all);
+  assert.deepEqual(newDocEditors(undefined), all);
+  // An image library takes the image types only: nothing to offer, so the form is hidden.
+  assert.deepEqual(newDocEditors(['.png', '.jpg', '.jpeg', '.gif', '.webp']), []);
+  assert.deepEqual(newDocEditors(['.XLSX', '.txt']), ['text', 'gridcraft']);
+  assert.deepEqual(newDocEditors(['.solidcraft.json']), ['solidcraft']);
+  // Types the library blocks are not offered either.
+  assert.deepEqual(newDocEditors(null, ['.docx', '.TXT']), ['gridcraft', 'solidcraft']);
 });

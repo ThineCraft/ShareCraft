@@ -2,7 +2,7 @@
 // do with each item. The server decides who may do what; this page only offers what the roles
 // it was told allow and shows the server's refusals as plain sentences.
 
-import { EDITORS, withExtension } from './editor-host.js';
+import { EDITORS, newDocEditors, withExtension } from './editor-host.js';
 import {
   api,
   bulkSummary,
@@ -15,7 +15,6 @@ import {
   itemMarks,
   libraryKindLabel,
   libraryViews,
-  loadThumbnail,
   messageFor,
   policyRefusalText,
   offerRequest,
@@ -27,6 +26,7 @@ import {
   selectionState,
   seg,
   setupTopbar,
+  showThumbnail,
   showCrumbs,
   showMessage,
   siteChrome,
@@ -82,6 +82,12 @@ if (library?.description) {
 $('edit-tools').hidden = !can(here.access, 'add');
 // New folder is hidden while the library takes no folders.
 $('new-folder').hidden = library?.folders === false;
+// New document offers only the editors whose files the library takes: none in an image library.
+const docEditors = newDocEditors(library?.effective_allowed_types ?? null, library?.blocked_types ?? []);
+for (const option of [...$('doc-kind').options]) {
+  if (!docEditors.includes(option.value)) option.remove();
+}
+$('new-doc').hidden = docEditors.length === 0;
 // What the library takes, so that a refusal is no surprise.
 const accepts = [];
 if (Array.isArray(library?.effective_allowed_types)) accepts.push(`Takes only ${typeListText(library.effective_allowed_types)}.`);
@@ -121,7 +127,6 @@ const dirtyUploads = new Set(); // outcomes to redraw at the next frame
 let drawScheduled = false;
 const views = libraryViews(library?.kind);
 let view = 'list'; // 'grid' only in an image library
-const thumbUrls = new Set(); // blob: URLs of thumbnails shown, revoked when the list is drawn again
 let watcher = null; // loads a tile's thumbnail when it scrolls into view
 let templates = [];
 
@@ -163,8 +168,6 @@ async function loadPage() {
 function render() {
   $('empty').hidden = items.length > 0;
   $('more').hidden = !next;
-  for (const url of thumbUrls) URL.revokeObjectURL(url);
-  thumbUrls.clear();
   watcher?.disconnect();
   watcher = null;
   const grid = view === 'grid';
@@ -237,7 +240,7 @@ function placeholder(item) {
 
 function watchThumbnail(picture) {
   if (!('IntersectionObserver' in globalThis)) {
-    showThumbnail(picture);
+    showThumbnail(picture, thumbnailUrl(picture));
     return;
   }
   watcher ??= new IntersectionObserver(
@@ -245,7 +248,7 @@ function watchThumbnail(picture) {
       for (const entry of entries) {
         if (!entry.isIntersecting) continue;
         watcher?.unobserve(entry.target);
-        showThumbnail(entry.target);
+        showThumbnail(entry.target, thumbnailUrl(entry.target));
       }
     },
     { rootMargin: '200px' },
@@ -253,18 +256,9 @@ function watchThumbnail(picture) {
   watcher.observe(picture);
 }
 
-/** Asks for one thumbnail; a busy server is asked again, and a plain placeholder shows after. */
-async function showThumbnail(picture) {
-  const id = picture.dataset.id;
-  const blob = await loadThumbnail(`/api/docs/${seg(id)}/thumbnail`);
-  if (!picture.isConnected) return;
-  if (!blob) {
-    picture.replaceChildren(h('span', { class: 'placeholder' }, 'No thumbnail'));
-    return;
-  }
-  const url = URL.createObjectURL(blob);
-  thumbUrls.add(url);
-  picture.replaceChildren(h('img', { src: url, alt: '' }));
+/** The thumbnail route of a tile's box (a declaration: tiles are drawn before this line runs). */
+function thumbnailUrl(picture) {
+  return `/api/docs/${seg(picture.dataset.id)}/thumbnail`;
 }
 
 // ---- New from template ----
