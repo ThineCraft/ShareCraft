@@ -19,6 +19,7 @@ import {
   showMessage,
   timeZoneChoices,
 } from './common.js';
+import { mountAdminShell } from './admin-shell.js';
 import { navigationBody, navigationEditor, placePicker } from './navigation.js';
 
 const $ = (id) => document.getElementById(id);
@@ -33,6 +34,7 @@ try {
   throw err;
 }
 setupTopbar(me, error);
+mountAdminShell({ me, current: 'settings' });
 await organisationChrome();
 
 let globalEditor = null;

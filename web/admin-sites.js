@@ -17,6 +17,7 @@ import {
   seg,
   showMessage,
 } from './common.js';
+import { listFilter, mountAdminShell } from './admin-shell.js';
 
 const $ = (id) => document.getElementById(id);
 const error = $('error');
@@ -34,7 +35,18 @@ await organisationChrome();
 
 // The brand centre is looked after by administrators and the brand managers they name.
 const brand = me.is_admin ? null : await api('GET', '/brand');
-$('brand-link').hidden = !(me.is_admin || brand?.data?.can_manage);
+mountAdminShell({ me, current: 'sites', brandManager: me.is_admin || Boolean(brand?.data?.can_manage) });
+
+const STATE_WORDS = { active: 'Active live', archived: 'Archived', deleted: 'Deleted' };
+const filter = listFilter({
+  id: 'find-site',
+  label: 'Find a site by name, state or hub',
+  nouns: ['site', 'sites'],
+  fields: ['name', (site) => STATE_WORDS[site.state] ?? site.state, (site) => (site.kind === 'communication' ? 'Communication' : 'Team'), 'hub.name', (site) => (site.is_hub ? 'Hub' : '')],
+  list: $('sites'),
+  empty: 'There are no sites yet.',
+});
+$('sites').before(filter.element);
 
 if (!me.is_admin) {
   status.textContent = brand?.data?.can_manage
@@ -49,8 +61,7 @@ async function showSites() {
   const result = await api('GET', '/admin/sites');
   if (!result.ok) return showMessage(error, messageFor(result.error));
   const sites = result.data;
-  $('sites').replaceChildren(...sites.map((site) => adminSiteRow(site, act)));
-  $('empty').hidden = sites.length > 0;
+  filter.set(sites.map((site) => ({ row: site, element: adminSiteRow(site, act) })));
   const ownerless = sites.filter((site) => site.state !== 'deleted' && site.owners === 0).length;
   $('no-owner').hidden = ownerless === 0;
   $('no-owner').textContent =

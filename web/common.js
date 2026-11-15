@@ -614,7 +614,7 @@ export function queryId(search, name = 'id') {
 /**
  * Fills the account bar (`.topbar`) of a page: the ShareCraft wordmark linking to the start page,
  * the command palette's search button and the avatar with the account menu (account.js): who is
- * signed in, People and Brand centre for those who may use them, Appearance and Sign out. `error`
+ * signed in, Admin centre and Brand centre for those who may use them, Appearance and Sign out. `error`
  * receives failures.
  */
 export function setupTopbar(me, error) {

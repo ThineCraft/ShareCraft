@@ -16,6 +16,7 @@ import {
   showMessage,
   organisationChrome,
 } from './common.js';
+import { listFilter, mountAdminShell } from './admin-shell.js';
 
 const $ = (id) => document.getElementById(id);
 const error = $('error');
@@ -23,7 +24,18 @@ const status = $('status');
 
 const me = await requireMe();
 setupTopbar(me, error);
+mountAdminShell({ me, current: 'roles' });
 await organisationChrome();
+
+const filter = listFilter({
+  id: 'find-role',
+  label: 'Find a role by name or permission',
+  nouns: ['role', 'roles'],
+  fields: ['name', (role) => permsText(role.perms), (role) => (role.builtin ? 'Built in' : 'Custom')],
+  list: $('roles'),
+  empty: 'There are no roles.',
+});
+$('roles').before(filter.element);
 
 if (!me.is_admin) {
   status.textContent = 'Only administrators can manage roles.';
@@ -61,7 +73,7 @@ function ticked(scope) {
 async function showRoles() {
   const result = await api('GET', '/roles');
   if (!result.ok) return note(messageFor(result.error), true);
-  $('roles').replaceChildren(...result.data.map(roleRow));
+  filter.set(result.data.map((role) => ({ row: role, element: roleRow(role) })));
 }
 
 function roleRow(role) {

@@ -18,6 +18,7 @@ import {
   organisationChrome,
   siteChrome,
 } from './common.js';
+import { listFilter, mountAdminShell } from './admin-shell.js';
 
 const $ = (id) => document.getElementById(id);
 const error = $('error');
@@ -27,8 +28,25 @@ setupTopbar(me, error);
 const siteId = queryId(location.search, 'site');
 const groupId = queryId(location.search, 'id');
 const MISSING = 'These groups do not exist, or you cannot see them.';
-if (siteId) await siteChrome(siteId);
-else await organisationChrome();
+// A site's own groups belong to that site, so its pages' chrome; every other view is the Admin centre.
+if (siteId) {
+  $('admin-nav').hidden = true;
+  document.querySelector('.admin-layout')?.classList.add('no-nav');
+  await siteChrome(siteId);
+} else {
+  mountAdminShell({ me, current: 'groups' });
+  await organisationChrome();
+}
+
+const filter = listFilter({
+  id: 'find-group',
+  label: 'Find a group',
+  nouns: ['group', 'groups'],
+  fields: ['name', (group) => (group.site ? `site ${group.site.name}` : 'organisation group')],
+  list: $('groups'),
+  empty: 'There are no groups you can see.',
+});
+$('groups').before(filter.element);
 
 $('new-group').hidden = !(me.is_admin && !siteId && !groupId);
 $('new-group').addEventListener('submit', async (event) => {
@@ -57,7 +75,7 @@ async function load() {
     const site = list[0]?.site;
     $('title').textContent = site ? `Groups of ${site.name}` : 'Groups';
     document.title = `${$('title').textContent} — ShareCraft`;
-    $('site-link').hidden = false;
+    $('site-back').hidden = false;
     $('site-link').href = pageFor('site', siteId);
     $('site-link').textContent = site?.name ?? 'Site';
   } else if (groupId) {
@@ -71,15 +89,25 @@ async function load() {
     if (!result.ok) return failed(result);
     list = result.data;
   }
-  $('empty').hidden = list.length > 0;
   const sections = [];
   for (const group of list) sections.push(await section(group));
-  $('groups').replaceChildren(...sections);
+  if (siteId || groupId) {
+    // One site's three groups, or one group: nothing to search.
+    filter.element.hidden = true;
+    $('empty').hidden = list.length > 0;
+    $('groups').hidden = false;
+    $('groups').replaceChildren(...sections);
+  } else {
+    $('empty').hidden = true;
+    filter.set(list.map((group, at) => ({ row: group, element: sections[at] })));
+  }
 }
 
 function failed(result) {
   $('empty').hidden = true;
-  $('groups').replaceChildren();
+  filter.set([]);
+  filter.element.hidden = true;
+  document.querySelector('.empty-state').hidden = true;
   note(result.status === 404 ? MISSING : messageFor(result.error), true);
 }
 

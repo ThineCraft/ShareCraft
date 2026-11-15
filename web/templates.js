@@ -16,6 +16,7 @@ import {
   templateReasonText,
   templateRefusal,
 } from './common.js';
+import { listFilter, mountAdminShell } from './admin-shell.js';
 
 const $ = (id) => document.getElementById(id);
 const error = $('error');
@@ -31,7 +32,18 @@ try {
   throw err;
 }
 setupTopbar(me, error);
+mountAdminShell({ me, current: 'templates' });
 await organisationChrome();
+
+const filter = listFilter({
+  id: 'find-template',
+  label: 'Find a template',
+  nouns: ['template', 'templates'],
+  fields: ['name', 'description', (template) => kindLabel(template.kind), (template) => (template.built_in ? 'Built in' : 'Saved')],
+  list: $('templates'),
+  empty: 'There are no templates yet. Import a package below.',
+});
+$('templates').before(filter.element);
 
 if (!me.is_admin) {
   status.textContent = 'Only administrators can manage templates.';
@@ -49,7 +61,7 @@ function note(text, ok = false) {
 async function showTemplates() {
   const result = await api('GET', '/templates');
   if (!result.ok) return showMessage(error, messageFor(result.error));
-  $('templates').replaceChildren(...result.data.map(templateRow));
+  filter.set(result.data.map((template) => ({ row: template, element: templateRow(template) })));
 }
 
 /** One template: name, kind, description, Download package and, for a saved one, Delete. Text only. */

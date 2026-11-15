@@ -16,12 +16,14 @@ import {
   showMessage,
   organisationChrome,
 } from './common.js';
+import { mountAdminShell } from './admin-shell.js';
 
 const $ = (id) => document.getElementById(id);
 const error = $('error');
 
 const me = await requireMe();
 setupTopbar(me, error);
+mountAdminShell({ me, current: 'requests' });
 await organisationChrome();
 
 const rolesResult = await api('GET', '/roles');

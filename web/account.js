@@ -1,5 +1,5 @@
 // The account bar's right-hand end: a round avatar with the person's initials that opens the
-// account menu (round 1's menu.js): who is signed in, People and Brand centre for those who may
+// account menu (round 1's menu.js): who is signed in, Admin centre and Brand centre for those who may
 // use them, Appearance (System, Light, Dark: appearance.js keeps and applies it) and Sign out.
 //
 // The bar is never themed by a site's look, and neither is the avatar: its colour comes from the
@@ -139,7 +139,7 @@ export function setupAccountMenu(bar, me, { brandManager = Promise.resolve(false
     el('span', { class: 'account-name' }, name),
     me.email && me.email !== name ? el('span', { class: 'account-email' }, me.email) : null,
   );
-  const people = el('li', { role: 'none', hidden: !me.is_admin }, el('a', { role: 'menuitem', href: '/people.html' }, 'People'));
+  const people = el('li', { role: 'none', hidden: !me.is_admin }, el('a', { role: 'menuitem', href: '/people.html' }, 'Admin centre'));
   const brandItem = el('li', { role: 'none', hidden: !me.is_admin }, el('a', { role: 'menuitem', href: '/brand-centre.html' }, 'Brand centre'));
   const radios = APPEARANCE_CHOICES.map(({ value, label }) => {
     const radio = el('button', { type: 'button', role: 'menuitemradio', 'aria-checked': 'false', 'data-appearance': value }, el('span', { class: 'radio-dot', 'aria-hidden': 'true' }), label);

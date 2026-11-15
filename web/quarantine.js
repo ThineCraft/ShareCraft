@@ -16,6 +16,7 @@ import {
   seg,
   showMessage,
 } from './common.js';
+import { mountAdminShell } from './admin-shell.js';
 
 const $ = (id) => document.getElementById(id);
 const error = $('error');
@@ -25,6 +26,7 @@ let releasing = null; // the entry the release dialog is for
 
 const me = await requireMe();
 setupTopbar(me, error);
+mountAdminShell({ me, current: 'quarantine' });
 await organisationChrome();
 
 if (!me.is_admin) {

@@ -133,7 +133,7 @@ export function paletteGroups({ me = {}, recent = [], sites = [], libraries = []
   if (current && (manages || me.is_admin)) add('site-settings', 'Site settings', `/site-settings.html?id=${seg(current.id)}`, { detail: current.name, keywords: 'quota hub description archive' });
   if (current && manages) add('bin', 'Recycle bin', `/bin.html?site=${seg(current.id)}`, { detail: current.name, keywords: 'deleted restore trash' });
   if (me.is_admin || brandManager) add('brand', 'Brand centre', '/brand-centre.html', { keywords: 'themes colours colors images logos' });
-  if (me.is_admin) add('people', 'People', '/people.html', { keywords: 'users accounts administrators' });
+  if (me.is_admin) add('people', 'People', '/people.html', { keywords: 'users accounts administrators admin centre add a person' });
   add('start', 'Start page', '/', { keywords: 'home sites' });
   const keys = new Set(pageActions.map((action) => action.key));
   const actions = [...pageActions.map((action) => ({ kind: 'action', ...action })), ...general.filter((action) => !keys.has(action.key))];

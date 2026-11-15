@@ -769,13 +769,8 @@ dialog.details-sheet[open]{animation:sheet-in .2s ease-out}
 .radio-dot{box-sizing:border-box;flex:none;width:16px;height:16px;border:2px solid var(--muted);border-radius:50%}
 [aria-checked=true]>.radio-dot{border-color:var(--accent-ink);background:radial-gradient(circle,var(--accent-ink) 0 3px,transparent 3.5px)}
 .topbar #requests-link{gap:6px}
-/* the administration pages' own links, under the account bar */
-.subnav{display:flex;flex-wrap:wrap;gap:0 16px;padding:4px 0;border-bottom:1px solid var(--line);font-size:13px}
-.subnav a{display:inline-flex;align-items:center;min-height:36px}
-.subnav:not(:has(a:not([hidden]))){display:none}
 @media (max-width:760px){
  .menu [role=menuitemradio]{min-height:44px}
- .subnav a{min-height:44px}
 }
 @media (max-width:600px){
  .topbar{gap:8px}
@@ -938,3 +933,70 @@ dialog.details-sheet[open]{animation:sheet-in .2s ease-out}
  .toast .toast-action,.toast .toast-close{min-height:44px;min-width:44px}
 }
 @media (forced-colors:active){.toast{border:1px solid CanvasText;border-left-width:4px}}
+/* the Admin centre (admin-shell.js): a left column of sections from 800 pixels, a Section menu
+   below that; the directory-like lists share a search header and an empty state */
+.page.admin-page{max-width:1140px}
+.admin-layout{margin-top:4px}
+.admin-nav{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 0;border-bottom:1px solid var(--line)}
+.admin-title{margin:0;color:var(--muted);font-size:12px;font-weight:600;letter-spacing:.06em;text-transform:uppercase}
+.admin-nav-list{display:none;list-style:none;margin:0;padding:0}
+.admin-link{display:flex;align-items:center;gap:10px;min-height:40px;padding:6px 10px;border-radius:8px;color:var(--text);text-decoration:none}
+.admin-link:hover{background:var(--soft)}
+.admin-link[aria-current=page]{background:var(--soft);color:var(--accent-ink);font-weight:600;box-shadow:inset 3px 0 0 var(--accent-ink)}
+.admin-icon{flex:none;width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
+.admin-link:not([aria-current]) .admin-icon{color:var(--muted)}
+.admin-section-button{gap:6px;min-height:44px;color:var(--text)}
+.admin-section-label{color:var(--muted)}
+.admin-section-name{font-weight:600}
+.admin-caret{font-size:11px;color:var(--muted)}
+.admin-section-menu{min-width:240px}
+.admin-section-menu .admin-link{min-height:44px;padding:6px 12px;border-radius:6px}
+.admin-section-menu .admin-link[aria-current=page]{box-shadow:inset 3px 0 0 var(--accent-ink)}
+.admin-section-menu .admin-link:focus-visible{outline:2px solid var(--accent-ink);outline-offset:-2px}
+.admin-main{min-width:0}
+.admin-head{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px 16px}
+.page .admin-head h1{margin:20px 0 4px}
+.admin-summary{margin:0 0 12px;color:var(--muted)}
+.admin-summary:empty{display:none}
+.admin-layout.no-nav{display:block}
+.admin-layout.no-nav .admin-nav{display:none}
+.site-back{margin:12px 0 0;font-size:13px}
+@media (min-width:800px){
+ .admin-layout{display:grid;grid-template-columns:220px minmax(0,1fr);column-gap:32px;align-items:start}
+ .admin-nav{position:sticky;top:12px;display:block;padding:20px 0 0;border-bottom:0}
+ .admin-title{padding:0 10px 8px}
+ .admin-nav-list{display:flex;flex-direction:column;gap:2px}
+ .admin-section-wrap{display:none}
+}
+.list-filter{display:flex;flex-wrap:wrap;align-items:flex-end;justify-content:space-between;gap:6px 16px;margin:8px 0 10px}
+.list-filter .field{flex:1 1 260px;max-width:420px;margin:0}
+.list-filter input[type=search]{width:100%}
+.filter-count{margin:0;color:var(--muted);font-size:12px}
+.empty-state{display:flex;flex-direction:column;align-items:flex-start;gap:10px;margin:0 0 12px;padding:20px;border:1px dashed var(--line);border-radius:10px;color:var(--muted)}
+.empty-state p{margin:0}
+.people-list li.person{flex-wrap:nowrap;gap:12px}
+.people-list .person-text{display:flex;flex-direction:column;min-width:0}
+.people-list .person-name{font-weight:600;overflow-wrap:anywhere}
+.people-list .person-email{overflow-wrap:anywhere}
+.people-list .person-marks{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:4px}
+.people-list li.disabled .avatar{opacity:.55}
+.people-list li.disabled .person-name{color:var(--muted)}
+.password-row{display:flex;gap:8px}
+.password-row input{flex:1;min-width:0}
+.password-hint.ok{color:var(--ok)}
+dialog input[type=password]{width:100%}
+#groups>section{padding:4px 12px 8px;border-bottom:1px solid var(--line)}
+#groups>section:nth-child(even){background:var(--band)}
+#groups:not(:empty){border-top:1px solid var(--line)}
+@media (max-width:760px){
+ .password-row button{min-height:44px}
+}
+@media (max-width:520px){
+ .people-list li.person{flex-wrap:wrap}
+ .people-list .person-text{flex:1 1 0}
+ .people-list .person-marks{order:3;flex-basis:100%;justify-content:flex-start;padding-left:48px}
+}
+@media (forced-colors:active){
+ .admin-link[aria-current=page]{box-shadow:none;outline:2px solid Highlight;outline-offset:-2px}
+ .empty-state{border-color:CanvasText}
+}

@@ -19,16 +19,18 @@ import {
   showMessage,
   themeSwatches,
 } from './common.js';
+import { mountAdminShell } from './admin-shell.js';
 import { pickImage } from './image-picker.js';
 import { CHECK_FIELD, THEME_FIELDS, brandCentreSections, checkTheme, deriveDark, hexOf, parseColour, themeOf } from './look.js';
 
 const $ = (id) => document.getElementById(id);
 const error = $('error');
 const status = $('status');
+const KIND_LABELS = { logo: 'Logo', icon: 'Icon', background: 'Background' };
 
 const me = await requireMe();
 setupTopbar(me, error);
-$('admin-link').hidden = !me.is_admin;
+mountAdminShell({ me, current: 'brand' });
 await organisationChrome();
 
 let brand = null;
@@ -196,7 +198,6 @@ async function deleteTheme(theme) {
 
 // ---- brand images ----
 
-const KIND_LABELS = { logo: 'Logo', icon: 'Icon', background: 'Background' };
 
 function drawImages() {
   $('images-empty').hidden = brand.images.length > 0;

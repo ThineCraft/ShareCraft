@@ -61,6 +61,7 @@ let people = []; // accounts to suggest: GET /api/admin/users, which only admini
 let links = []; // the live links of this item, as GET /api/nodes/{id}/links lists them
 let revoking = null;
 let pending = []; // chosen in the Add box, not yet shared: { kind, id, name, email?, detail }
+let menuCount = 0; // numbers the role menus, for their ids
 // Addresses of links made while this page is open. The server shows an address once, when the
 // link is made, and keeps no copy; it lives only in this page until it is closed or reloaded.
 const madeNow = new Map();
@@ -232,7 +233,6 @@ function detailOf(principal) {
   return sub ? `${kind} · ${sub}` : kind;
 }
 
-let menuCount = 0;
 
 function assignmentRow({ principal, role, perms }) {
   if (principal.kind === 'link') {
