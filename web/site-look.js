@@ -1,9 +1,14 @@
-// Change the look, for the people who manage a site: its theme (built-in, organisation, site or
-// custom colours, with the live contrast check and "Use suggested"), its logo, thumbnail and
-// header, its navigation style and its footer. Every change goes to a draft shown in a preview
-// in light and dark mode side by side; Apply saves it, Cancel drops it. History lists the earlier
-// looks, each with Preview (load it as the draft) and Restore (apply it again). The draft and
-// what Apply sends live in look.js (lookSession); the server checks everything again.
+// Change the look, for the people who manage a site: a look studio. On wide screens the controls
+// sit at the left in tabs (Theme, Header, Navigation, Footer, History) with Apply and Cancel
+// pinned under them, and the preview stays in view at the right with a Light / Dark / Phone
+// switch; below 1100 pixels the tabs stack as an accordion and the preview opens in a full-screen
+// sheet. The theme is chosen from a gallery of cards (built-in, organisation and site themes, then
+// Custom colours with the live contrast check and "Use suggested"); the header layout and
+// background and the navigation are chosen from small pictures; logo, thumbnail and header image
+// are tiles. Every change goes to a draft; Apply saves it, Cancel drops it. History lists the
+// earlier looks, each with Preview (load it as the draft) and Restore (apply it again). The draft
+// and what Apply sends live in look.js (lookSession), the studio's state in look-studio.js; the
+// server checks everything again.
 
 import {
   api,
@@ -41,8 +46,25 @@ import {
   mayReplaceDraft,
   parseColour,
   previewEffective,
+  previewPalettes,
   sameTheme,
 } from './look.js';
+import {
+  STUDIO_PARTS,
+  STUDIO_WIDE,
+  changedParts,
+  chosenCard,
+  partFromHash,
+  previewPanes,
+  selectTab,
+  studioState,
+  studioView,
+  studioWide,
+  swatchModel,
+  tabKey,
+  themeGallery,
+  toggleSection,
+} from './look-studio.js';
 
 const $ = (id) => document.getElementById(id);
 const error = $('error');
@@ -92,8 +114,213 @@ function note(text, ok = false) {
 
 $('archived-banner').hidden = !readOnly;
 $('content').hidden = false;
-$('actions').hidden = readOnly;
-$('history-section').hidden = false;
+// An archived site keeps the bar for its Preview button (narrow screens), not Apply and Cancel.
+$('actions').classList.toggle('read-only', readOnly);
+for (const id of ['apply', 'cancel', 'apply-note']) $(id).hidden = readOnly;
+
+// ---- the studio: tabs on wide screens, an accordion below them ----
+
+const wideQuery = matchMedia(`(min-width: ${STUDIO_WIDE}px)`);
+let studio = studioState(partFromHash(location.hash));
+// The room the studio has: the page less a site's sidebar when it has one.
+const isWide = () => studioWide(window.innerWidth, $('content').parentElement?.clientWidth ?? 0);
+let wasWide = null;
+
+function drawStudio() {
+  const wide = isWide();
+  wasWide = wide;
+  const view = studioView(studio, wide);
+  $('content').classList.toggle('wide', wide);
+  $('studio-tabs').hidden = !wide;
+  for (const part of STUDIO_PARTS) {
+    const shown = view[part];
+    const section = $(`part-${part}`);
+    const tab = $(`tab-${part}`);
+    section.hidden = shown.hidden;
+    $(`body-${part}`).hidden = shown.bodyHidden;
+    $(`toggle-${part}`).setAttribute('aria-expanded', String(shown.expanded));
+    tab.setAttribute('aria-selected', String(shown.selected));
+    tab.tabIndex = shown.selected ? 0 : -1;
+    if (wide) {
+      section.setAttribute('role', 'tabpanel');
+      section.setAttribute('aria-labelledby', `tab-${part}`);
+    } else {
+      section.removeAttribute('role');
+      section.setAttribute('aria-labelledby', `toggle-${part}`);
+    }
+  }
+}
+
+/** Keeps the part in the address, so a reload comes back to it. */
+function rememberPart(part) {
+  try {
+    window.history.replaceState(null, '', `${location.pathname}${location.search}#${part}`);
+  } catch {
+    // an address that cannot be replaced only loses the remembered tab
+  }
+}
+
+for (const part of STUDIO_PARTS) {
+  $(`tab-${part}`).addEventListener('click', () => {
+    studio = selectTab(studio, part);
+    rememberPart(part);
+    drawStudio();
+  });
+  $(`toggle-${part}`).addEventListener('click', () => {
+    studio = toggleSection(studio, part);
+    if (studio.open.includes(part)) rememberPart(part);
+    drawStudio();
+  });
+}
+
+// A link to another part (#footer) opens it.
+addEventListener('hashchange', () => {
+  const part = partFromHash(location.hash);
+  if (!part) return;
+  studio = selectTab(studio, part);
+  drawStudio();
+});
+
+// Arrow keys, Home and End move along the tabs and show the tab they land on.
+$('studio-tabs').addEventListener('keydown', (event) => {
+  const tabs = [...$('studio-tabs').querySelectorAll('[role=tab]')];
+  const at = tabs.indexOf(document.activeElement);
+  const next = at < 0 ? null : tabKey(event.key, at, tabs.length);
+  if (next === null) return;
+  event.preventDefault();
+  const part = tabs[next].dataset.part;
+  studio = selectTab(studio, part);
+  rememberPart(part);
+  drawStudio();
+  tabs[next].focus();
+});
+
+function layoutChanged() {
+  if (isWide() === wasWide) return;
+  if (isWide() && $('preview-sheet').open) $('preview-sheet').close();
+  drawStudio();
+}
+wideQuery.addEventListener('change', layoutChanged);
+// The sidebar folding to a rail or opening again changes the room without changing the window.
+new ResizeObserver(layoutChanged).observe($('content').parentElement);
+
+// ---- the preview's place: at the right on wide screens, in a full-screen sheet below them ----
+
+function openPreviewSheet() {
+  if (wasWide || $('preview-sheet').open) return;
+  $('preview-sheet').append($('studio-preview'));
+  $('preview-sheet').showModal();
+  $('preview-close').focus();
+}
+
+$('preview-open').addEventListener('click', openPreviewSheet);
+$('preview-close').addEventListener('click', () => $('preview-sheet').close());
+$('preview-sheet').addEventListener('close', () => {
+  $('content').append($('studio-preview'));
+  if (!wasWide) $('preview-open').focus();
+});
+
+let previewMode = 'light';
+for (const radio of document.querySelectorAll('input[name=preview-mode]')) {
+  radio.addEventListener('change', () => {
+    previewMode = radio.value;
+    showPreviewMode();
+  });
+}
+
+function showPreviewMode() {
+  const panes = previewPanes(previewMode);
+  $('preview-light').hidden = !panes.light;
+  $('preview-dark').hidden = !panes.dark;
+  $('preview-stage').classList.toggle('phone', panes.phone);
+}
+
+// ---- picture choices: radio cards with a small drawing ----
+
+let choiceCount = 0;
+
+/**
+ * A radio card in the radio group `name`: a native radio (so arrows move between the cards), a
+ * small drawing `art`, a title and a line of `hint`. `onPick(value)` runs when it is chosen.
+ */
+function radioCard(name, value, title, hint, art, onPick) {
+  choiceCount += 1;
+  const id = `${name}-${choiceCount}`;
+  const input = h('input', { type: 'radio', name, value, id, class: 'pick-input', disabled: readOnly, 'aria-describedby': hint ? `${id}-hint` : null });
+  input.addEventListener('change', () => {
+    if (input.checked) onPick(value);
+  });
+  return h(
+    'label',
+    { class: 'pick-card', for: id },
+    input,
+    art,
+    h('span', { class: 'pick-title' }, title),
+    hint ? h('span', { class: 'pick-hint', id: `${id}-hint` }, hint) : null,
+  );
+}
+
+/** Marks the card of `value` in the radio group inside `box`. */
+function checkCard(box, value) {
+  for (const input of box.querySelectorAll('input[type=radio]')) input.checked = input.value === value;
+}
+
+/** A small drawing of a page: a header band, a navigation and lines of content. */
+function pageArt(attributes) {
+  return h(
+    'span',
+    { class: 'page-art', 'aria-hidden': 'true', ...attributes },
+    h('span', { class: 'pa-band' }, h('span', { class: 'pa-logo' }), h('span', { class: 'pa-title' })),
+    h('span', { class: 'pa-nav' }, h('span'), h('span'), h('span')),
+    h('span', { class: 'pa-body' }, h('span'), h('span'), h('span')),
+  );
+}
+
+const LAYOUTS = [
+  ['minimal', 'Minimal', 'One slim row'],
+  ['compact', 'Compact', 'A small logo and title'],
+  ['standard', 'Standard', 'A larger logo and title'],
+  ['extended', 'Extended', 'A tall band'],
+];
+const BACKGROUNDS = [
+  ['none', 'None', 'The page colour'],
+  ['soft', 'Soft', 'A tint of the primary colour'],
+  ['strong', 'Strong', 'The secondary colour'],
+  ['image', 'Image', 'Extended layout only'],
+];
+const NAVIGATIONS = [
+  ['horizontal', 'Across the top', 'Links in a row under the header'],
+  ['vertical', 'In a column at the left', 'In the Menu on narrow screens'],
+];
+
+$('header-layout').replaceChildren(
+  ...LAYOUTS.map(([value, title, hint]) =>
+    radioCard('header-layout', value, title, hint, pageArt({ 'data-layout': value }), (v) => {
+      session.change((draft) => {
+        draft.header.layout = v;
+        if (draft.header.layout !== 'extended' && draft.header.background === 'image') draft.header.background = 'none';
+      });
+      fillHeader();
+      refresh();
+    }),
+  ),
+);
+$('header-background').replaceChildren(
+  ...BACKGROUNDS.map(([value, title, hint]) =>
+    radioCard('header-background', value, title, hint, pageArt({ 'data-background': value }), (v) => {
+      session.change((draft) => (draft.header.background = v));
+      refresh();
+    }),
+  ),
+);
+$('navigation-choice').replaceChildren(
+  ...NAVIGATIONS.map(([value, title, hint]) =>
+    radioCard('navigation', value, title, hint, pageArt({ 'data-navigation': value }), (v) => {
+      session.change((draft) => (draft.navigation = v));
+      refresh();
+    }),
+  ),
+);
 
 // ---- the theme ----
 
@@ -107,7 +334,6 @@ $('colour-fields').replaceChildren(...Object.values(colours).map((field) => fiel
 
 function colourChanged(field, value) {
   session.setColour(field, value);
-  $('theme-choice').value = 'custom';
   showDerived();
   refresh();
 }
@@ -124,37 +350,82 @@ function showDerived() {
   if (!theme.secondary_dark) colours.secondary_dark.set('', derived(theme.secondary, 'secondary'));
 }
 
-function fillThemeChoice() {
-  const option = (theme) => h('option', { value: theme.from }, theme.name);
-  const groups = [
-    ['Built in', (brand.themes ?? []).filter((t) => t.builtin)],
-    ['Organisation', (brand.themes ?? []).filter((t) => !t.builtin)],
-    ['This site', siteThemes],
-  ].filter(([, themes]) => themes.length);
-  $('theme-choice').replaceChildren(
-    ...groups.map(([label, themes]) => h('optgroup', { label }, ...themes.map(option))),
-    h('option', { value: 'custom' }, 'Custom colours'),
+/** A small page in one mode: its secondary colour as the band, its primary as a button and a link. */
+function miniPage(scheme, colour) {
+  const mini = h(
+    'span',
+    { class: 'tc-mini', 'data-scheme': scheme, 'aria-hidden': 'true' },
+    h('span', { class: 'tc-band' }),
+    h('span', { class: 'tc-line' }),
+    h('span', { class: 'tc-button' }),
   );
+  mini.style.setProperty('--tc-primary', colour.primary);
+  mini.style.setProperty('--tc-secondary', colour.secondary);
+  return mini;
 }
 
-$('theme-choice').addEventListener('change', () => {
-  const value = $('theme-choice').value;
-  const theme = allThemes().find((t) => t.from === value);
+/** Puts the colours of `model` (a swatchModel) into a theme card's two small pages. */
+function paintCard(card, model) {
+  const [light, dark] = card.querySelectorAll('.tc-mini');
+  for (const [mini, colour] of [
+    [light, model.light],
+    [dark, model.dark],
+  ]) {
+    mini.style.setProperty('--tc-primary', colour.primary);
+    mini.style.setProperty('--tc-secondary', colour.secondary);
+  }
+  card.querySelector('.tc-colours').textContent =
+    `Light mode: primary ${model.light.primary}, secondary ${model.light.secondary}. Dark mode: primary ${model.dark.primary}, secondary ${model.dark.secondary}.`;
+}
+
+/** One card of the gallery for `model`; `title` and `sub` default to the theme's name. */
+function themeCard(model, title = model.name, sub = '') {
+  choiceCount += 1;
+  const id = `theme-card-${choiceCount}`;
+  const input = h('input', { type: 'radio', name: 'theme-card', value: model.from, id, class: 'pick-input', disabled: readOnly, 'aria-describedby': `${id}-colours` });
+  input.addEventListener('change', () => {
+    if (input.checked) themeChosen(model.from);
+  });
+  const card = h(
+    'label',
+    { class: 'theme-card', for: id },
+    input,
+    h('span', { class: 'tc-pages' }, miniPage('light', model.light), miniPage('dark', model.dark)),
+    h('span', { class: 'tc-name' }, title),
+    sub ? h('span', { class: 'tc-sub' }, sub) : null,
+    h('span', { class: 'tc-colours visually-hidden', id: `${id}-colours` }),
+  );
+  paintCard(card, model);
+  return card;
+}
+
+function themeChosen(from) {
+  const theme = allThemes().find((t) => t.from === from);
   if (theme) session.chooseTheme(theme);
   else session.change((draft) => (draft.from = 'custom'));
   fillTheme();
   refresh();
-});
+}
+
+let customCard = null;
+
+/** The gallery: a group per kind of theme, then Custom colours. Drawn again when the themes change. */
+function fillThemeChoice() {
+  const groups = themeGallery(brand.themes ?? [], siteThemes).map(({ label, cards }) =>
+    h('div', { class: 'theme-group' }, h('h3', { class: 'theme-group-label' }, label), h('div', { class: 'theme-cards' }, ...cards.map((model) => themeCard(model)))),
+  );
+  customCard = themeCard({ ...swatchModel(session.draft.theme), from: 'custom' }, 'Custom colours', 'Your own primary and secondary');
+  customCard.classList.add('custom');
+  $('theme-gallery').replaceChildren(...groups, h('div', { class: 'theme-group' }, h('h3', { class: 'theme-group-label' }, 'Your own'), h('div', { class: 'theme-cards' }, customCard)));
+}
 
 $('theme-name').addEventListener('input', () => {
   session.setName($('theme-name').value);
-  $('theme-choice').value = 'custom';
   refresh();
 });
 
 function fillTheme() {
-  const { theme, from } = session.draft;
-  $('theme-choice').value = allThemes().some((t) => t.from === from) ? from : 'custom';
+  const { theme } = session.draft;
   $('theme-name').value = theme.name;
   for (const [field, control] of Object.entries(colours)) control.set(theme[field] ?? '');
   showDerived();
@@ -205,7 +476,7 @@ function showSiteThemes() {
   $('site-themes').hidden = siteThemes.length === 0;
   $('site-themes').replaceChildren(
     ...siteThemes.map((theme) => {
-      const remove = h('button', { type: 'button', class: 'plain', 'aria-label': `Delete the theme ${theme.name}`, disabled: readOnly }, 'Delete');
+      const remove = h('button', { type: 'button', class: 'secondary small', 'aria-label': `Delete the theme ${theme.name}`, disabled: readOnly }, 'Delete');
       remove.addEventListener('click', () => deleteSiteTheme(theme));
       return h('li', {}, themeSwatches(theme), h('span', { class: 'grow' }, theme.name), remove);
     }),
@@ -256,6 +527,7 @@ const SLOTS = {
   },
 };
 
+/** An image slot as a tile: the picture, what it is for, the image's name, Change and Remove. */
 function drawSlot(slot) {
   const image = slot.get();
   const url = draftImageHref(draftImageUrl(image));
@@ -264,11 +536,14 @@ function drawSlot(slot) {
     const img = h('img', { src: url, alt: '' });
     img.addEventListener('error', () => (img.hidden = true));
     picture.append(img);
+  } else {
+    picture.append(h('span', { class: 'slot-empty' }, 'No picture'));
   }
-  const what = slot.label.split(' (')[0].toLowerCase();
-  const choose = h('button', { type: 'button', class: 'plain', disabled: readOnly }, image ? `Change the ${what}` : `Choose a ${what}`);
+  const [what, why] = slot.label.split(' (');
+  const name = what.toLowerCase();
+  const choose = h('button', { type: 'button', class: 'secondary small', disabled: readOnly }, image ? `Change the ${name}` : `Choose a ${name}`);
   choose.addEventListener('click', async () => {
-    const picked = await pickImage({ siteId, brandImages: brand.images ?? [], title: `Choose the ${what}` });
+    const picked = await pickImage({ siteId, brandImages: brand.images ?? [], title: `Choose the ${name}` });
     if (!picked) return;
     slot.set(picked);
     if (slot === SLOTS.header) session.change((draft) => (draft.header.background = 'image'));
@@ -276,14 +551,22 @@ function drawSlot(slot) {
     drawSlot(slot);
     refresh();
   });
-  const remove = image ? h('button', { type: 'button', class: 'plain', disabled: readOnly, 'aria-label': `Remove the ${what}` }, 'Remove') : null;
+  const remove = image ? h('button', { type: 'button', class: 'ghost small', disabled: readOnly, 'aria-label': `Remove the ${name}` }, 'Remove') : null;
   remove?.addEventListener('click', () => {
     slot.set(null);
     drawSlot(slot);
     refresh();
   });
   $(slot.box).replaceChildren(
-    h('div', { class: 'slot' }, h('span', { class: 'slot-label' }, slot.label), picture, h('span', { class: 'slot-name' }, image?.name ?? 'None'), choose, remove),
+    h(
+      'div',
+      { class: 'slot card' },
+      picture,
+      h('span', { class: 'slot-label' }, what),
+      why ? h('span', { class: 'slot-why' }, why[0].toUpperCase() + why.slice(1).replace(/\)$/, '')) : null,
+      h('span', { class: 'slot-name' }, image?.name ?? 'None'),
+      h('span', { class: 'slot-actions' }, choose, remove),
+    ),
   );
 }
 
@@ -292,27 +575,15 @@ function drawSlot(slot) {
 function fillHeader() {
   const { draft } = session;
   $('logo-alt').value = draft.logo_alt;
-  $('header-layout').value = draft.header.layout;
-  $('header-background').value = draft.header.background;
+  checkCard($('header-layout'), draft.header.layout);
+  checkCard($('header-background'), draft.header.background);
   $('header-align').value = draft.header.align;
   $('hide-title').checked = draft.header.hide_title;
-  $(draft.navigation === 'vertical' ? 'nav-vertical' : 'nav-horizontal').checked = true;
+  checkCard($('navigation-choice'), draft.navigation);
 }
 
 $('logo-alt').addEventListener('input', () => {
   session.change((draft) => (draft.logo_alt = $('logo-alt').value));
-  refresh();
-});
-$('header-layout').addEventListener('change', () => {
-  session.change((draft) => {
-    draft.header.layout = $('header-layout').value;
-    if (draft.header.layout !== 'extended' && draft.header.background === 'image') draft.header.background = 'none';
-  });
-  fillHeader();
-  refresh();
-});
-$('header-background').addEventListener('change', () => {
-  session.change((draft) => (draft.header.background = $('header-background').value));
   refresh();
 });
 $('header-align').addEventListener('change', () => {
@@ -323,12 +594,6 @@ $('hide-title').addEventListener('change', () => {
   session.change((draft) => (draft.header.hide_title = $('hide-title').checked));
   refresh();
 });
-for (const id of ['nav-horizontal', 'nav-vertical']) {
-  $(id).addEventListener('change', () => {
-    session.change((draft) => (draft.navigation = $(id).value));
-    refresh();
-  });
-}
 
 // ---- footer ----
 
@@ -373,7 +638,10 @@ function textField(label, value, maxlength, onInput) {
   return h('div', { class: 'field' }, h('label', { for: id }, label), input);
 }
 
-/** The footer's groups of links, as many as its layout allows; the draft keeps the rest. */
+// The footer groups folded shut, by their place; drawing again keeps them folded.
+const foldedGroups = new Set();
+
+/** The footer's groups of links as cards that fold, as many as its layout allows; the draft keeps the rest. */
 function drawGroups() {
   const { footer } = session.draft;
   const extended = footer.layout === 'extended';
@@ -382,8 +650,14 @@ function drawGroups() {
   if (footer.groups.length === 0) footer.groups.push({ heading: '', links: [] });
   const groups = session.draft.footer.groups.slice(0, limit);
   const boxes = groups.map((group, at) => {
+    const title = () => {
+      const count = `${group.links.length} of ${FOOTER_LINK_LIMIT} links`;
+      if (!extended) return `Links, ${count}`;
+      return `Group ${at + 1}${group.heading.trim() ? `: ${group.heading.trim()}` : ''}, ${count}`;
+    };
+    const summary = h('summary', {}, title());
     const links = group.links.map((link, i) => {
-      const remove = h('button', { type: 'button', class: 'plain', disabled: readOnly, 'aria-label': `Remove link ${i + 1}` }, 'Remove');
+      const remove = h('button', { type: 'button', class: 'ghost small', disabled: readOnly, 'aria-label': `Remove link ${i + 1}` }, 'Remove');
       remove.addEventListener('click', () => {
         group.links.splice(i, 1);
         drawGroups();
@@ -397,28 +671,44 @@ function drawGroups() {
         remove,
       );
     });
-    const add = h('button', { type: 'button', class: 'plain', disabled: readOnly || group.links.length >= FOOTER_LINK_LIMIT }, 'Add a link');
+    const add = h('button', { type: 'button', class: 'secondary small', disabled: readOnly || group.links.length >= FOOTER_LINK_LIMIT }, 'Add a link');
     add.addEventListener('click', () => {
       group.links.push({ label: '', url: '' });
       drawGroups();
       refresh();
     });
     const removeGroup =
-      extended && groups.length > 1 ? h('button', { type: 'button', class: 'plain', disabled: readOnly }, `Remove group ${at + 1}`) : null;
+      extended && groups.length > 1 ? h('button', { type: 'button', class: 'ghost small', disabled: readOnly }, `Remove group ${at + 1}`) : null;
     removeGroup?.addEventListener('click', () => {
       session.draft.footer.groups.splice(at, 1);
+      foldedGroups.clear();
       drawGroups();
       refresh();
     });
-    return h(
-      'div',
-      { class: 'footer-group', role: 'group', 'aria-label': extended ? `Group ${at + 1}` : 'Links' },
-      extended ? textField(`Group ${at + 1} heading`, group.heading, 40, (v) => (group.heading = v)) : h('p', { class: 'meta' }, 'Links (at most 8). Addresses start with https://, http:// or /.'),
-      links.length ? h('ul', { class: 'list' }, ...links) : null,
-      h('div', { class: 'toolbar' }, add, removeGroup),
+    const card = h(
+      'details',
+      { class: 'footer-group card', open: !foldedGroups.has(at) },
+      summary,
+      h(
+        'div',
+        { class: 'footer-group-body' },
+        extended
+          ? textField(`Group ${at + 1} heading`, group.heading, 40, (v) => {
+              group.heading = v;
+              summary.textContent = title();
+            })
+          : h('p', { class: 'meta' }, 'Links (at most 8). Addresses start with https://, http:// or /.'),
+        links.length ? h('ul', { class: 'list' }, ...links) : null,
+        h('div', { class: 'toolbar' }, add, removeGroup),
+      ),
     );
+    card.addEventListener('toggle', () => {
+      if (card.open) foldedGroups.delete(at);
+      else foldedGroups.add(at);
+    });
+    return card;
   });
-  const addGroup = extended ? h('button', { type: 'button', class: 'plain', disabled: readOnly || groups.length >= limit }, 'Add a group') : null;
+  const addGroup = extended ? h('button', { type: 'button', class: 'secondary small', disabled: readOnly || groups.length >= limit }, 'Add a group') : null;
   addGroup?.addEventListener('click', () => {
     session.change((draft) => draft.footer.groups.push({ heading: '', links: [] }));
     drawGroups();
@@ -456,7 +746,7 @@ function drawPreview() {
       'div',
       { class: 'preview-buttons' },
       h('button', { type: 'button', tabindex: '-1' }, 'Upload'),
-      h('button', { type: 'button', class: 'plain', tabindex: '-1' }, 'New folder'),
+      h('button', { type: 'button', class: 'secondary', tabindex: '-1' }, 'New folder'),
       h('a', { href: '#' }, 'A link'),
     );
     panel.replaceChildren(
@@ -468,9 +758,36 @@ function drawPreview() {
   }
 }
 
+/** The draft's colours on the small drawings of the header and navigation choices. */
+function paintChoices() {
+  const { light } = previewPalettes(session.draft.theme);
+  for (const id of ['part-header', 'part-navigation']) {
+    $(id).style.setProperty('--studio-primary', light.accent);
+    $(id).style.setProperty('--studio-secondary', light.header_bg);
+  }
+}
+
+/** The gallery's marked card, the Custom card's colours, and whether the colour fields show. */
+function showTheme(check) {
+  const chosen = chosenCard(session.draft, allThemes());
+  checkCard($('theme-gallery'), chosen);
+  if (customCard) paintCard(customCard, { ...swatchModel(session.draft.theme), from: 'custom' });
+  // The colour fields show for custom colours, and for any theme whose colours do not read.
+  $('custom-theme').hidden = chosen !== 'custom' && check.ok;
+}
+
+/** The marks on the tabs (and accordion headings) of the parts with changes not applied yet. */
+function showChangedParts() {
+  const changed = changedParts(session.draft, session.settings?.look ?? null);
+  for (const part of STUDIO_PARTS) {
+    for (const mark of document.querySelectorAll(`#tab-${part} .tab-mark, #toggle-${part} .tab-mark`)) mark.hidden = !changed.includes(part);
+  }
+}
+
 /** After every change: the preview, the contrast check, which fields apply, and Apply. */
 function refresh() {
   drawPreview();
+  paintChoices();
   const status = session.status();
   $('pairs').replaceChildren(
     ...contrastRows(status.check, (pair) => {
@@ -480,14 +797,17 @@ function refresh() {
       colours[CHECK_FIELD[pair.check]]?.input.focus();
     }),
   );
+  showTheme(status.check);
   const { draft } = session;
   const extended = draft.header.layout === 'extended';
-  $('header-background').querySelector('option[value=image]').disabled = !extended;
+  const imageCard = $('header-background').querySelector('input[value=image]');
+  imageCard.disabled = readOnly || !extended;
   $('align-field').hidden = !extended;
   $('header-image-slot').hidden = !(extended && draft.header.background === 'image');
   $('hide-title').disabled = readOnly || !draft.logo;
   $('footer-fields').hidden = !draft.footer.enabled;
   showSource();
+  showChangedParts();
   $('apply').disabled = !status.canApply;
   $('cancel').disabled = readOnly || !status.dirty;
   let why = '';
@@ -496,6 +816,7 @@ function refresh() {
   else if (status.dirty) why = 'You have changes that are not applied yet.';
   else why = 'This is the site’s current look.';
   $('apply-note').textContent = why;
+  $('actions').classList.toggle('dirty', status.dirty);
 }
 
 /** Puts the whole draft into the form and redraws. */
@@ -559,15 +880,16 @@ function drawHistory() {
       const who = entry.by?.name ?? 'Someone no longer here';
       const summary = describeLookChange(entry.before, entry.look);
       const actions = (which, label) => {
-        const preview = h('button', { type: 'button', class: 'plain', 'aria-label': `Preview the look ${label} of ${when}` }, 'Preview');
+        const preview = h('button', { type: 'button', class: 'secondary small', 'aria-label': `Preview the look ${label} of ${when}` }, 'Preview');
         preview.addEventListener('click', async () => {
           if (!(await mayReplaceDraft(session, () => confirmDialog('Previewing this look drops the changes you have not applied. Preview it?', 'Preview')))) return;
           session.preview(entry, which);
           fill();
           note(`The look ${label} of ${when} is now the draft. Apply it to use it.`, true);
-          $('preview-heading').scrollIntoView?.({ block: 'start' });
+          // On wide screens the preview is already in view; below them it opens in its sheet.
+          openPreviewSheet();
         });
-        const restore = readOnly ? null : h('button', { type: 'button', class: 'plain', 'aria-label': `Restore the look ${label} of ${when}` }, 'Restore');
+        const restore = readOnly ? null : h('button', { type: 'button', class: 'secondary small', 'aria-label': `Restore the look ${label} of ${when}` }, 'Restore');
         restore?.addEventListener('click', () => restoreEntry(entry, when, which, label));
         return [preview, restore];
       };
@@ -625,6 +947,8 @@ if (settingsAnswer.data.in_hub) {
   );
 }
 if (!brandAnswer.ok) note(`The brand centre could not be read: ${messageFor(brandAnswer.error)}`);
+drawStudio();
+showPreviewMode();
 showSiteThemes();
 fill();
 drawHistory();
