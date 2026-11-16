@@ -777,8 +777,10 @@ mod tests {
         if with_packaging {
             for rel in [
                 "packaging/windows/Install ShareCraft.cmd",
+                "packaging/windows/Set public address.cmd",
                 "packaging/windows/README.html",
                 "packaging/windows/scripts/install.ps1",
+                "packaging/windows/scripts/public-address.ps1",
                 "packaging/windows/scripts/start.ps1",
                 "packaging/windows/tests/install.Tests.ps1",
                 "packaging/windows/.env",
@@ -841,6 +843,7 @@ mod tests {
                 "Install ShareCraft.cmd",
                 "LICENCES.html",
                 "README.html",
+                "Set public address.cmd",
                 "VERSION",
                 "bin/sharecraft-server.exe",
                 "bin/xtask.exe",
@@ -856,6 +859,7 @@ mod tests {
                 "pgsql/lib/plpgsql.dll",
                 "pgsql/share/postgres.bki",
                 "scripts/install.ps1",
+                "scripts/public-address.ps1",
                 "scripts/start.ps1",
                 "web/common.js",
                 "web/index.html",
@@ -879,6 +883,18 @@ mod tests {
         }
         // A second run into the same folder is refused; the command removes it first.
         assert!(stage(&sources, &folder).is_err());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn package_includes_public_address_script() {
+        let base = scratch("public-address");
+        let sources = fake_sources(&base, true);
+        let folder = base.join("out").join("p");
+        stage(&sources, &folder).unwrap();
+        let files = listing(&folder);
+        assert!(files.contains(&"Set public address.cmd".to_owned()));
+        assert!(files.contains(&"scripts/public-address.ps1".to_owned()));
         std::fs::remove_dir_all(&base).unwrap();
     }
 

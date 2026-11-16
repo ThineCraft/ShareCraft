@@ -595,7 +595,10 @@ function Write-SettingsFile {
         [Parameter(Mandatory)][string]$Path,
         [Parameter(Mandatory)][int]$AppPort,
         [Parameter(Mandatory)][int]$PgPort,
-        [Parameter(Mandatory)][int]$IcapPort
+        [Parameter(Mandatory)][int]$IcapPort,
+        [string]$PublicUrl,
+        [string]$TrustedProxies,
+        [string]$HstsSeconds
     )
     $paths = Get-ShareCraftPaths
     $lines = @(
@@ -609,6 +612,9 @@ function Write-SettingsFile {
         "@set `"SHARECRAFT_PG_PORT=$PgPort`"",
         "@set `"SHARECRAFT_ICAP_PORT=$IcapPort`""
     )
+    if ($PublicUrl) { $lines += "@set `"SHARECRAFT_PUBLIC_URL=$PublicUrl`"" }
+    if ($TrustedProxies) { $lines += "@set `"SHARECRAFT_TRUSTED_PROXIES=$TrustedProxies`"" }
+    if ($HstsSeconds) { $lines += "@set `"SHARECRAFT_HSTS_SECONDS=$HstsSeconds`"" }
     $text = ($lines -join "`r`n") + "`r`n"
     foreach ($ch in $text.ToCharArray()) {
         if ([int]$ch -gt 127) {
@@ -616,6 +622,32 @@ function Write-SettingsFile {
         }
     }
     [System.IO.File]::WriteAllText($Path, $text, [System.Text.Encoding]::ASCII)
+}
+
+function Write-InstallSettingsFile {
+    # Writes settings during installation. On a reinstall, keep the optional production-mode
+    # settings while replacing the ports and program paths chosen by this installer run.
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][int]$AppPort,
+        [Parameter(Mandatory)][int]$PgPort,
+        [Parameter(Mandatory)][int]$IcapPort,
+        [hashtable]$OldSettings
+    )
+    $optional = @{}
+    if ($OldSettings) {
+        foreach ($name in 'SHARECRAFT_PUBLIC_URL', 'SHARECRAFT_TRUSTED_PROXIES', 'SHARECRAFT_HSTS_SECONDS') {
+            if ($OldSettings.ContainsKey($name)) {
+                $parameter = switch ($name) {
+                    'SHARECRAFT_PUBLIC_URL' { 'PublicUrl' }
+                    'SHARECRAFT_TRUSTED_PROXIES' { 'TrustedProxies' }
+                    'SHARECRAFT_HSTS_SECONDS' { 'HstsSeconds' }
+                }
+                $optional[$parameter] = $OldSettings[$name]
+            }
+        }
+    }
+    Write-SettingsFile -Path $Path -AppPort $AppPort -PgPort $PgPort -IcapPort $IcapPort @optional
 }
 
 function Read-SettingsFile {
@@ -934,6 +966,22 @@ function Set-ServerEnvironment {
     foreach ($name in 'SHARECRAFT_ADDR', 'SHARECRAFT_DATA', 'SHARECRAFT_WEB', 'SHARECRAFT_EDITORS_DIR') {
         Set-Item -Path "Env:$name" -Value $Settings[$name]
     }
+    foreach ($name in 'SHARECRAFT_PUBLIC_URL', 'SHARECRAFT_TRUSTED_PROXIES', 'SHARECRAFT_HSTS_SECONDS') {
+        if ($Settings.ContainsKey($name)) {
+            Set-Item -Path "Env:$name" -Value $Settings[$name]
+        } else {
+            Remove-Item -Path "Env:$name" -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Get-ShareCraftBrowserAddress {
+    # The public HTTPS address in production, or the loopback HTTP address in development.
+    param([Parameter(Mandatory)][hashtable]$Settings)
+    if ($Settings.ContainsKey('SHARECRAFT_PUBLIC_URL')) {
+        return $Settings.SHARECRAFT_PUBLIC_URL.TrimEnd('/') + '/'
+    }
+    "http://127.0.0.1:$(Get-AppPort -Settings $Settings)/"
 }
 
 function Start-ShareCraft {
@@ -948,7 +996,7 @@ function Start-ShareCraft {
     }
     $settings = Read-SettingsFile -Path $Paths.SettingsFile
     $port = Get-AppPort -Settings $settings
-    $address = "http://127.0.0.1:$port/"
+    $address = Get-ShareCraftBrowserAddress -Settings $settings
     Initialize-StateFolders -Paths $Paths
     Set-ServerEnvironment -Settings $settings
 

@@ -167,7 +167,7 @@ function Install-ShareCraft {
             Write-ClusterSettings -Paths $paths -Port $ports.Pg
             $rolePassword = Get-UrlPassword -Url (Read-EnvDatabaseUrl -Path $paths.EnvFile)
             Write-EnvFile -Path $paths.EnvFile -DatabaseUrl (New-DatabaseUrl -Password $rolePassword -Port $ports.Pg)
-            Write-SettingsFile -Path $paths.SettingsFile -AppPort $ports.App -PgPort $ports.Pg -IcapPort $ports.Icap
+            Write-InstallSettingsFile -Path $paths.SettingsFile -AppPort $ports.App -PgPort $ports.Pg -IcapPort $ports.Icap -OldSettings $oldSettings
             Start-Postgres -Paths $paths -PgBin $paths.PgBin
             if ($oldSettings -and [int]$oldSettings.SHARECRAFT_ICAP_PORT -ne $ports.Icap) {
                 # Follow the stand-in scanner to its new port, unless an administrator chose another scanner.
@@ -180,7 +180,7 @@ function Install-ShareCraft {
             $rolePassword = New-RandomSecret
             New-Cluster -Paths $paths -PgBin $paths.PgBin -SuperPassword $superPassword
             Write-ClusterSettings -Paths $paths -Port $ports.Pg
-            Write-SettingsFile -Path $paths.SettingsFile -AppPort $ports.App -PgPort $ports.Pg -IcapPort $ports.Icap
+            Write-InstallSettingsFile -Path $paths.SettingsFile -AppPort $ports.App -PgPort $ports.Pg -IcapPort $ports.Icap
             Start-Postgres -Paths $paths -PgBin $paths.PgBin
             New-ShareCraftDatabase -Paths $paths -PgBin $paths.PgBin -Port $ports.Pg -SuperPassword $superPassword -RolePassword $rolePassword
             $superPassword = $null
