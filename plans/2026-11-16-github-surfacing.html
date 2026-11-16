@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ShareCraft — GitHub surfacing: Implementation Plan</title>
+<style>
+:root{color-scheme:light dark;--ink:light-dark(#172f38,#e4ecef);--muted:light-dark(#536b72,#a9b9bf);--line:light-dark(#d7e2e3,#36454b);--paper:light-dark(#fff,#1d272b);--wash:light-dark(#f2f6f5,#141b1e);--accent:light-dark(#3156c9,#9db4ff);font:15px/1.6 Segoe UI,system-ui,sans-serif;color:var(--ink);background:var(--wash)}
+*{box-sizing:border-box}body{margin:0;padding:28px 18px 80px}main{max-width:940px;margin:auto}
+h1{font-size:1.9rem;letter-spacing:-.03em;line-height:1.2;margin:0 0 14px}h2{font-size:1.3rem;margin:38px 0 12px;padding-top:18px;border-top:1px solid var(--line)}h3{font-size:1.08rem;margin:30px 0 8px}h4{font-size:.95rem;margin:16px 0 6px}
+p{margin:0 0 12px}ul,ol{margin:0 0 12px;padding-left:22px}li{margin-bottom:6px}a{color:var(--accent)}
+code{font-family:Consolas,Menlo,monospace;font-size:.88em;background:light-dark(#e9efee,#263238);padding:1px 5px;border-radius:3px;overflow-wrap:anywhere}
+pre{background:var(--paper);border:1px solid var(--line);border-radius:7px;padding:12px 14px;overflow-x:auto;font:13px/1.5 Consolas,Menlo,monospace;margin:0 0 12px}pre code{background:none;padding:0;font-size:inherit}
+.note{border-left:4px solid var(--accent);background:var(--paper);padding:12px 16px;margin:0 0 14px}.note p:last-child{margin:0}
+.task{background:var(--paper);border:1px solid var(--line);border-radius:9px;padding:6px 20px 14px;margin:18px 0}
+ol.steps{list-style:none;padding-left:0}ol.steps>li{padding-left:28px;position:relative;margin-bottom:10px}ol.steps>li::before{content:"☐";position:absolute;left:2px;color:var(--muted)}
+table{border-collapse:collapse;width:100%;font-size:.9rem;background:var(--paper);margin-bottom:14px}th,td{border:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top}th{background:light-dark(#e8efed,#263238)}
+.small{font-size:.88rem;color:var(--muted)}
+tbody tr:nth-child(even) td{background:light-dark(#f4f8f7,#212b30)}
+ol.steps>li:nth-child(even),ul.band>li:nth-child(even),ol.band>li:nth-child(even){background:light-dark(#f4f8f7,#212b30);border-radius:4px}
+</style>
+</head>
+<body><main>
+<h1>GitHub surfacing: a library whose files live in a GitHub repository: implementation plan</h1>
+<p class="small">ShareCraft &middot; Stage 2 platform plan 5, phase A1 of SC-27 (storage-source libraries) &middot; Written 16 November 2026 &middot; Draft for the owner</p>
+<div class="note"><p><strong>For agentic workers:</strong> REQUIRED SUB-SKILL: use superpowers:subagent-driven-development or superpowers:executing-plans. Steps are checkboxes.</p></div>
+
+<p><strong>Goal:</strong> an administrator connects a library to a branch of a GitHub repository (public, or private with a read-only token). The repository's documents appear in the library as folders and files, kept in step with the branch within minutes (seconds when a webhook is set up). Everything ShareCraft already does over a file works on them: permissions and inheritance, sharing links, previews, thumbnails, malware scanning and file-type limits. They cannot be changed in ShareCraft yet (read-only, section "Not in this plan").</p>
+<p><strong>Architecture:</strong></p>
+<ul>
+<li><strong>The connection is an attribute of a library, not a fifth kind.</strong> A <code>library_sources</code> row marks a library as connected and holds the repository, branch, folder, state and sync bookmark. <code>library_sources</code> and <code>source_items</code> (which node holds which repository path and Git blob ID) are new PostgreSQL tables. The kind stays document, image, template or asset, so kinds, settings and templates are untouched.</li>
+<li><strong>Items are real tree nodes.</strong> Each repository folder and file becomes an ordinary <code>nodes</code> row, and each file an ordinary document with a stored revision. Listings, access checks, scan gates, previews, links and the DriveCraft feed all key on those rows, and the survey of the code (16 November 2026) found no cheap way to feed them virtual items. This is a deliberate change from the design's cache model (s3-surfacing-design.html, section 10): for a repository of documents the bytes are mirrored into the content store, and the repository stays the authority. See proposal 2.</li>
+<li><strong>A sync engine</strong> reads the branch through GitHub's REST API: the branch head with a conditional request (an unchanged branch costs no rate limit), the tree, then the changed files, by a single tarball when many changed and by single blob requests when few. A pure function plans the difference (add, change, remove, move); an apply step writes it using the existing upload and tree functions, as a system sync attributed to the person who connected the library.</li>
+<li><strong>A worker and a webhook</strong> trigger syncs: the worker polls due libraries on the sweeper's pattern; <code>POST /hooks/github/{library}</code>, verified by HMAC-SHA256, wakes the worker at once.</li>
+<li><strong>Secrets</strong> (the token, the webhook secret) are stored only as AES-256-GCM ciphertext, under a key file in the data folder. No secret appears in Git, events, logs, API responses or error text.</li>
+</ul>
+<p><strong>Tech stack:</strong> the existing workspace, plus new dependencies, each of which approving this plan approves (proposal 5): <code>reqwest</code> with rustls (no native TLS and, to avoid a C build tool on Windows, the <code>ring</code> provider) for the HTTPS client; <code>tar</code> and <code>flate2</code> for the tarball; <code>aes-gcm</code> for secret storage; <code>hmac</code> for webhook signatures. Licences must be MIT or Apache 2.0 (D17). The server has no HTTPS client today, and <code>gix</code> is built here without a network transport, so cloning with Git is not available; the GitHub API is both simpler and cheaper.</p>
+<p><strong>Spec:</strong> <a href="../s3-surfacing-design.html">s3-surfacing-design.html</a> v0.3 (sections 03 to 11 and 14, and the Git table in section 13) and <a href="../scope.html">scope.html</a> SC-02, SC-11, SC-21, D09, D24, D28, D39. Plans 1 to 4B are the base. Owner decisions of 16 November 2026: sources are built in the order GitHub, file share, S3 (first on Cloudflare R2); saves to a Git repository will be direct commits; no versioning is required of a store.</p>
+
+<h2>Proposals in this plan for the owner to check</h2>
+<p>These are choices the plan makes that the owner's answers did not settle. Approving the plan approves them; any can be changed before building.</p>
+<ol>
+<li><strong>Read-only first.</strong> The design puts write-back in phase C. This plan ends with a library that mirrors GitHub and refuses changes. Direct commits (decided) follow in a separate plan, <em>5B</em>, which needs the version and lock work of Stage 3 only for check-out, not for commits (see "Not in this plan").</li>
+<li><strong>The bytes are mirrored into the content store.</strong> A connected library holds a copy of each allowed file (up to caps), so every existing feature works unchanged. The copy is rebuildable from GitHub, and the library's size and file count are capped (default 50,000 files, 2 GiB, both settable by an administrator). The lazy cache model of the design stays the plan for S3, where buckets are far larger.</li>
+<li><strong>Source settings are kept in PostgreSQL and the event log, not as a Git record.</strong> The sync bookmark is operational, and the repository, branch and folder are small. Putting the settings into the library's Git record (D24) can follow without changing behaviour.</li>
+<li><strong>Who may connect.</strong> Anyone who may create a library in the site (a site owner or an administrator). The token field is write-only: it can be replaced or cleared, never shown.</li>
+<li><strong>New dependencies</strong> as listed under Tech stack.</li>
+<li><strong>Attribution.</strong> Synced files and versions are credited to the person who connected the library, with the commit ID and the GitHub author's name in the revision's note. Crediting each GitHub author needs a mapping to ShareCraft accounts, which does not exist.</li>
+<li><strong>Removed files go to the recycle bin</strong> (D29), so a repository mistake can be undone in ShareCraft for 93 days. Only the sync can remove files from a connected library; people cannot.</li>
+<li><strong>Disconnecting keeps the files.</strong> The library becomes an ordinary library holding the last synced copy, and can then be edited. Reconnecting starts again and does not merge.</li>
+<li><strong>Symbolic links and submodules are hidden</strong> and counted, not followed.</li>
+</ol>
+
+<h2>Not in this plan</h2>
+<ul>
+<li><strong>Plan 5B, write-back as direct commits.</strong> An upload, rename, delete or editor checkpoint in a connected library becoming a commit through the Git Data API (blob, tree, commit, then a branch update that GitHub refuses if the branch moved). The sync engine here already records the commit each node came from, which is the base 5B needs; the replay-on-new-head rule and the sibling-copy conflict rule are written in the design (sections 06 and 13).</li>
+<li>The file-share source (phase A2) and the S3 source (A3). The <code>RepoRef</code>/<code>GithubClient</code> split here is the point where a general <code>StorageSource</code> trait is extracted when the second source is built, not before (YAGNI), and the design's trait stays the target.</li>
+<li>DriveCraft sync (phase B). Connected libraries are ordinary nodes, so they appear in the SC-23 feed when it exists; the capabilities block (read-only flag) is added then.</li>
+<li>GitHub Apps, OAuth sign-in, GitHub Enterprise Server hosts other than through the configured API address, pull requests, LFS pointer resolution, per-author attribution, and any full-text search.</li>
+<li>Putting the connection settings in Git (proposal 3).</li>
+</ul>
+
+<h2>Global constraints</h2>
+<ul>
+<li>Rust 2024; workspace lints deny <code>unwrap_used</code>, <code>expect_used</code>, <code>panic</code>, <code>indexing_slicing</code>; <code>unsafe_code</code> is forbidden. New code follows them, tests included (the existing tests carry <code>#![allow(clippy::unwrap_used, ...)]</code> at the top).</li>
+<li>Build output goes to J: (<code>CARGO_TARGET_DIR=J:\cargo-target\sharecraft</code>). Tests: <code>cargo xtask test -p server --test &lt;name&gt;</code> and <code>cargo xtask test -p records --test &lt;name&gt;</code>; they need <code>TEST_DATABASE_URL</code> (PostgreSQL 18, port 5433). Never print <code>.env</code>, database URLs, tokens or passwords.</li>
+<li>No secret in plain text anywhere: not in PostgreSQL, Git, events, logs, API responses, panics or error strings. A token-bearing type has a redacting <code>Debug</code>, as <code>DatabaseUrl</code> does in <code>config.rs</code>.</li>
+<li>Migrations are immutable once applied: this plan adds <code>0017_sources.sql</code> and edits no earlier migration.</li>
+<li>Windows features must not need per-machine administrator work: the secret key is a file in the data folder, created on first use, with no installer step.</li>
+<li>HTTPS only to GitHub. The API base address comes from configuration (default <code>https://api.github.com</code>); a plain <code>http</code> address is accepted only when <code>SHARECRAFT_GITHUB_API</code> is set explicitly, which the tests do for their fake server. A user can never choose the address.</li>
+<li>Web pages are plain HTML and JavaScript in <code>web/</code>, no build step, light and dark, 375 px wide up, keyboard and screen-reader usable; tables and long lists carry alternating row shading.</li>
+<li>Documents are HTML, never Markdown, with alternating row shading (BUILDING.html).</li>
+<li>Commits end with <code>Co-Authored-By: Claude Opus 5.5 &lt;noreply@anthropic.com&gt;</code>. Work on a branch; do not merge or push without the owner.</li>
+<li>Subagents use Opus 5.5 or Sonnet, with the model named on each dispatch.</li>
+</ul>
+
+<h2>Review focus</h2>
+<p>Inputs and conditions the design implies but the happy path never meets. Each has a test in the task that owns the code.</p>
+<ol>
+<li><strong>Names that cannot be ShareCraft names.</strong> Git allows <code>A.md</code> and <code>a.md</code> together, names ending in a dot, and names over 255 characters. Expected: the first path in sort order keeps its name, the other is shown with a visible suffix and counted, and nothing is silently dropped (Task 4).</li>
+<li><strong>Symbolic links and submodules.</strong> A tree entry of mode 120000 or type commit must not become a file with the link target as its content. Expected: hidden and counted (Task 4).</li>
+<li><strong>A sync that fails or is cut short must not delete anything.</strong> A truncated tree, a dropped connection, a repository over the caps: the library keeps what it had and the status says why (Task 4).</li>
+<li><strong>A deleted branch, a revoked token, a renamed or deleted repository.</strong> Expected: state <em>not connected</em> with a plain message, files still readable, no retry loop (Task 7).</li>
+<li><strong>A secret leaking.</strong> Plant a token and a webhook secret and scan every API response, event row and captured log line for them (Task 6).</li>
+</ol>
+
+<h2>File structure</h2>
+<table><thead><tr><th>File</th><th>Responsibility</th></tr></thead><tbody>
+<tr><td><code>crates/records/migrations/0017_sources.sql</code> (new)</td><td><code>secrets</code>, <code>library_sources</code>, <code>source_items</code>.</td></tr>
+<tr><td><code>crates/records/src/sources.rs</code> (new)</td><td>Source types and every database operation on them, including the sealed-secret rows.</td></tr>
+<tr><td><code>crates/server/src/secrets.rs</code> (new)</td><td><code>SecretBox</code>: the key file and AES-256-GCM sealing. Knows nothing of GitHub.</td></tr>
+<tr><td><code>crates/server/src/github.rs</code> (new)</td><td><code>GithubClient</code>: the HTTP calls, conditional requests, rate-limit handling, tarball reading. Knows nothing of libraries.</td></tr>
+<tr><td><code>crates/server/src/source_sync.rs</code> (new)</td><td>The planner (pure), the apply step, <code>sync_once</code>, the worker.</td></tr>
+<tr><td><code>crates/server/src/webhooks.rs</code> (new)</td><td>The GitHub webhook route and its signature check.</td></tr>
+<tr><td><code>crates/server/src/api/sources.rs</code> (new)</td><td>Connect, show, change, sync now, webhook secret, disconnect.</td></tr>
+<tr><td><code>crates/server/src/{lib.rs, config.rs, api/mod.rs, api/nodes.rs, api/content.rs, api/uploads.rs, api/docs.rs, api/bin.rs, ws.rs}</code> (modify)</td><td>Wiring, configuration, the read-only guard.</td></tr>
+<tr><td><code>crates/server/tests/common/fake_github.rs</code> (new)</td><td>A fake GitHub API server for tests, built on axum.</td></tr>
+<tr><td><code>crates/records/tests/sources.rs</code>, <code>crates/server/tests/{secrets.rs, github_client.rs, source_sync.rs, source_readonly.rs, source_api.rs, source_worker.rs}</code> (new)</td><td>Tests, one file per task.</td></tr>
+<tr><td><code>web/{library.js, library.html, library-settings.js, library-settings.html, site.js, common.js}</code>, <code>web/source-panel.js</code> (new), <code>web/source-panel.test.mjs</code> (new)</td><td>Banner, source panel, connect form.</td></tr>
+<tr><td><code>BUILDING.html</code>, <code>scope.html</code>, <code>sequencing.html</code> (modify)</td><td>Section 28 for what was built; SC-27 and its decisions; progress note.</td></tr>
+</tbody></table>
+<p class="small">Task order: 1, 2 and 3 are independent. 4 needs 2 and 3. 5 needs 2. 6 needs 1, 4 and 5. 7 needs 4 and 6. 8 needs 6 and 7. 9 is last. Each task leaves the workspace green and ends in a commit.</p>
+
+<h3>Task 1: sealed secrets</h3>
+<div class="task">
+<p><strong>Files:</strong> create <code>crates/server/src/secrets.rs</code>, <code>crates/server/tests/secrets.rs</code>; modify <code>crates/server/Cargo.toml</code> (<code>aes-gcm</code>), <code>crates/server/src/lib.rs</code> (<code>pub mod secrets;</code>).</p>
+<p><strong>Interfaces.</strong> Produces:</p>
+<pre><code>pub struct Sealed { pub key_id: u32, pub nonce: [u8; 12], pub ciphertext: Vec&lt;u8&gt; }
+pub struct SecretBox { /* 32-byte key, key_id */ }
+impl SecretBox {
+    pub fn open_or_create(data_dir: &amp;Path) -&gt; Result&lt;SecretBox, SecretError&gt;;
+    pub fn seal(&amp;self, plain: &amp;[u8], context: &amp;[u8]) -&gt; Sealed;
+    pub fn unseal(&amp;self, sealed: &amp;Sealed, context: &amp;[u8]) -&gt; Result&lt;Vec&lt;u8&gt;, SecretError&gt;;
+}
+pub struct Secret(String);   // redacting Debug and Display; Secret::expose(&amp;self) -&gt; &amp;str
+pub enum SecretError { Unreadable(String), WrongKey, Corrupt }</code></pre>
+<p><code>context</code> is authenticated data: the owner of the secret (for example <code>b"source-token:&lt;library-uuid&gt;"</code>), so a ciphertext copied to another row fails to open. <code>Sealed</code> lives in the server for now; Task 2 stores its three fields as columns.</p>
+<ol class="steps">
+<li>Write failing tests in <code>tests/secrets.rs</code>: <code>seal_then_unseal_round_trips</code>; <code>another_context_fails</code> (<code>unseal</code> with a different <code>context</code> returns <code>WrongKey</code>); <code>a_flipped_byte_fails</code>; <code>two_seals_of_one_value_differ</code> (fresh nonce each time); <code>key_file_is_created_once_and_reused</code> (open twice on one temp dir: the second box unseals what the first sealed; the file holds 32 bytes); <code>debug_and_display_hide_the_value</code> (<code>format!("{:?}", Secret::new("ghp_x"))</code> does not contain <code>ghp_x</code>); <code>a_short_key_file_is_refused</code> (a 5-byte file gives <code>Unreadable</code>, and is not overwritten).</li>
+<li>Run <code>cargo xtask test -p server --test secrets</code>. Expected: fails to compile (module missing).</li>
+<li>Implement <code>secrets.rs</code>. The key file is <code>secret.key</code> in the data folder, 32 bytes from <code>getrandom</code>, created with <code>create_new</code> so two starts cannot both write it; on Unix mode 0600; on Windows the data folder's own access rules apply and nothing needs administrator rights. <code>key_id</code> is 1 and is stored so a later key rotation can tell old rows from new.</li>
+<li>Run the tests. Expected: all pass. Run <code>cargo clippy -p server --all-targets</code>; expected: no new warnings.</li>
+<li>Commit: <code>feat: sealed secrets with a key file in the data folder</code>.</li>
+</ol></div>
+
+<h3>Task 2: source records</h3>
+<div class="task">
+<p><strong>Files:</strong> create <code>crates/records/migrations/0017_sources.sql</code>, <code>crates/records/src/sources.rs</code>, <code>crates/records/tests/sources.rs</code>; modify <code>crates/records/src/lib.rs</code> (export), <code>crates/records/src/settings.rs</code> (two setting keys, see below).</p>
+<p><strong>Interfaces.</strong> Consumes the tree and library types in <code>records</code> (<code>NodeId</code>, <code>UserId</code>, <code>library_of(node) -&gt; Option&lt;NodeId&gt;</code> at <code>libraries.rs:389</code>). Produces:</p>
+<pre><code>pub struct SecretId(pub Uuid);
+pub struct SealedRow { pub key_id: u32, pub nonce: [u8; 12], pub ciphertext: Vec&lt;u8&gt; }
+pub enum SourceKind { Github }                       // as_str / parse, 'github'
+pub enum SourceState { Connecting, Ok, Syncing, NotConnected, RateLimited, Failed }
+pub struct NewSource { pub library: NodeId, pub kind: SourceKind, pub owner: String, pub repo: String,
+                       pub branch: String, pub folder: String /* "" = whole repository */,
+                       pub token: Option&lt;SecretId&gt;, pub poll_seconds: u32, pub connected_by: UserId }
+pub struct SourceConfig { /* NewSource fields + webhook_secret: Option&lt;SecretId&gt; */ }
+pub struct SourceStatus { pub state: SourceState, pub last_commit: Option&lt;String&gt;, pub etag: Option&lt;String&gt;,
+    pub last_checked_at: Option&lt;OffsetDateTime&gt;, pub last_synced_at: Option&lt;OffsetDateTime&gt;,
+    pub last_error: Option&lt;String&gt;, pub retry_at: Option&lt;OffsetDateTime&gt;,
+    pub files: i64, pub bytes: i64, pub hidden: i64 }
+pub struct SourceItem { pub node: NodeId, pub path: String, pub blob_sha: Option&lt;String&gt; /* None for folders */, pub size: i64 }
+impl Db {
+  pub async fn put_secret(&amp;self, s: &amp;SealedRow) -&gt; Result&lt;SecretId, DbError&gt;;
+  pub async fn get_secret(&amp;self, id: SecretId) -&gt; Result&lt;Option&lt;SealedRow&gt;, DbError&gt;;
+  pub async fn delete_secret(&amp;self, id: SecretId) -&gt; Result&lt;(), DbError&gt;;
+  pub async fn connect_source(&amp;self, s: &amp;NewSource) -&gt; Result&lt;(), AccessError&gt;;   // library must exist, be empty, and not already connected
+  pub async fn source_of(&amp;self, library: NodeId) -&gt; Result&lt;Option&lt;(SourceConfig, SourceStatus)&gt;, DbError&gt;;
+  pub async fn source_library_of(&amp;self, node: NodeId) -&gt; Result&lt;Option&lt;NodeId&gt;, DbError&gt;; // the connected library containing node, if any
+  pub async fn set_source_status(&amp;self, library: NodeId, u: &amp;StatusUpdate) -&gt; Result&lt;(), DbError&gt;;
+  pub async fn change_source(&amp;self, library: NodeId, c: &amp;SourceChange) -&gt; Result&lt;(), AccessError&gt;; // branch, folder, poll_seconds, token, webhook_secret; a changed branch or folder clears last_commit and etag
+  pub async fn source_items(&amp;self, library: NodeId) -&gt; Result&lt;Vec&lt;SourceItem&gt;, DbError&gt;;
+  pub async fn upsert_source_items(&amp;self, library: NodeId, items: &amp;[SourceItem]) -&gt; Result&lt;(), DbError&gt;;
+  pub async fn remove_source_items(&amp;self, library: NodeId, nodes: &amp;[NodeId]) -&gt; Result&lt;(), DbError&gt;;
+  pub async fn due_sources(&amp;self, now: OffsetDateTime, limit: i64) -&gt; Result&lt;Vec&lt;NodeId&gt;, DbError&gt;;
+  pub async fn disconnect_source(&amp;self, library: NodeId) -&gt; Result&lt;Vec&lt;SecretId&gt;, DbError&gt;; // returns the secrets to delete
+}</code></pre>
+<p>Tables (all in <code>0017_sources.sql</code>): <code>secrets(id uuid pk, key_id int, nonce bytea check length 12, ciphertext bytea, created_at)</code>; <code>library_sources(library_id uuid pk references libraries(id), kind, owner, repo, branch, folder, token_secret uuid null, webhook_secret uuid null, poll_seconds int check between 60 and 86400, connected_by uuid, state, last_commit, etag, last_checked_at, last_synced_at, last_error (check char_length &lt;= 300), retry_at, files, bytes, hidden)</code>; <code>source_items(library_id, path, node_id uuid unique references nodes(id), blob_sha, size, primary key (library_id, path))</code>. Settings: <code>source_max_files</code> (default 50000) and <code>source_max_bytes</code> (default 2147483648), validated in <code>validate()</code> and read by Task 4; add them to the settings API only if the page needs them (it does not in this plan: administrators change them with the existing settings call).</p>
+<ol class="steps">
+<li>Write failing tests in <code>tests/sources.rs</code> using <code>TestDb::create()</code> and the helpers in <code>tests/common</code>: <code>connect_then_read_back</code>; <code>connecting_a_non_empty_library_is_refused</code> (a library with one file, <code>AccessError::LibraryNotEmpty</code> as a new variant); <code>connecting_twice_is_refused</code>; <code>source_library_of_finds_the_library_for_a_file_deep_inside</code> and <code>returns_none_for_an_ordinary_library</code>; <code>changing_branch_clears_the_bookmark</code>; <code>items_round_trip_and_path_is_unique</code>; <code>due_sources_returns_a_source_past_its_poll_time_and_not_one_in_backoff</code> (a source with <code>retry_at</code> in the future is not due; one in <code>not_connected</code> is not due); <code>disconnect_returns_the_secret_ids_and_removes_the_rows_but_not_the_nodes</code>; <code>poll_seconds_below_60_is_refused</code>; <code>a_secret_row_holds_only_ciphertext</code> (put a known plaintext's sealed form; select every column of <code>secrets</code> as text; the plaintext is not present).</li>
+<li>Run <code>cargo xtask test -p records --test sources</code>. Expected: fails to compile.</li>
+<li>Write the migration and <code>sources.rs</code> to the signatures above. <code>LibraryNotEmpty</code> and <code>SourceExists</code> are new <code>AccessError</code> variants (HTTP 409, codes <code>library_not_empty</code> and <code>source_exists</code>; wire them where <code>AccessError</code> maps to <code>ApiError</code>). Keep <code>last_error</code> to plain sentences: nothing from a response body is stored.</li>
+<li>Run the tests. Expected: all pass. Run the whole records suite (<code>cargo xtask test -p records</code>); expected: no regressions, including the upgrade tests that migrate step by step.</li>
+<li>Commit: <code>feat: source records for connected libraries</code>.</li>
+</ol></div>
+
+<h3>Task 3: GitHub client and a fake GitHub</h3>
+<div class="task">
+<p><strong>Files:</strong> create <code>crates/server/src/github.rs</code>, <code>crates/server/tests/common/fake_github.rs</code>, <code>crates/server/tests/github_client.rs</code>; modify <code>crates/server/Cargo.toml</code> (<code>reqwest</code> with <code>default-features = false, features = ["rustls", "stream"]</code> using the <code>ring</code> provider, <code>tar</code>, <code>flate2</code>; dev: <code>tar</code>, <code>flate2</code>), <code>crates/server/src/config.rs</code> (<code>github_api: String</code> from <code>SHARECRAFT_GITHUB_API</code>, default <code>https://api.github.com</code>; accepted only if <code>https</code>, or if set explicitly), <code>crates/server/tests/common/mod.rs</code> (<code>mod fake_github;</code> and a helper to start one).</p>
+<p><strong>Interfaces.</strong> Produces:</p>
+<pre><code>pub struct RepoRef { pub owner: String, pub repo: String }          // parse("owner/repo") rejects anything else
+pub struct GithubClient { /* reqwest::Client, base Url */ }
+impl GithubClient {
+  pub fn new(base: &amp;str) -&gt; Result&lt;GithubClient, GithubError&gt;;
+  pub async fn repo(&amp;self, r: &amp;RepoRef, token: Option&lt;&amp;Secret&gt;) -&gt; Result&lt;RepoInfo, GithubError&gt;;   // { private, size_kb, default_branch, archived }
+  pub async fn head(&amp;self, r: &amp;RepoRef, branch: &amp;str, token: Option&lt;&amp;Secret&gt;, etag: Option&lt;&amp;str&gt;) -&gt; Result&lt;Head, GithubError&gt;;
+  pub async fn tree(&amp;self, r: &amp;RepoRef, tree_sha: &amp;str, token: Option&lt;&amp;Secret&gt;) -&gt; Result&lt;Vec&lt;TreeEntry&gt;, GithubError&gt;;
+  pub async fn blob(&amp;self, r: &amp;RepoRef, sha: &amp;str, token: Option&lt;&amp;Secret&gt;, limit: u64) -&gt; Result&lt;Vec&lt;u8&gt;, GithubError&gt;;
+  pub async fn tarball(&amp;self, r: &amp;RepoRef, commit: &amp;str, token: Option&lt;&amp;Secret&gt;, dest: &amp;Path, limit: u64) -&gt; Result&lt;(), GithubError&gt;;
+}
+pub enum Head { NotModified, Moved { commit: String, tree: String, etag: Option&lt;String&gt; } }
+pub struct TreeEntry { pub path: String, pub kind: EntryKind /* File, Dir, Symlink, Submodule */, pub sha: String, pub size: u64 }
+pub enum GithubError { NotFound, Unauthorized, RateLimited { retry_at: OffsetDateTime }, Truncated, TooLarge, Network(String), Other(String) }
+pub fn for_each_in_tarball(path: &amp;Path, f: &amp;mut dyn FnMut(&amp;str, &amp;mut dyn Read, u64) -&gt; io::Result&lt;()&gt;) -&gt; io::Result&lt;()&gt;; // paths relative to the repository root
+pub fn git_blob_id(data: &amp;[u8]) -&gt; String;   // SHA-1 of "blob &lt;len&gt;\0" + data, lower-case hex; use gix's hashing
+</code></pre>
+<p>Endpoints used: <code>GET /repos/{o}/{r}</code>; <code>GET /repos/{o}/{r}/commits/{branch}</code> with <code>If-None-Match</code> (the commit's <code>sha</code> and <code>commit.tree.sha</code>); <code>GET /repos/{o}/{r}/git/trees/{sha}?recursive=1</code> (<code>truncated: true</code> gives <code>Truncated</code>); <code>GET /repos/{o}/{r}/git/blobs/{sha}</code> with <code>Accept: application/vnd.github.raw+json</code>; <code>GET /repos/{o}/{r}/tarball/{commit}</code>. Headers: <code>Authorization: Bearer</code> only when a token is given; <code>X-GitHub-Api-Version: 2022-11-28</code>; a fixed <code>User-Agent: ThineCraft-ShareCraft</code> with no personal detail. A 403 or 429 with <code>x-ratelimit-remaining: 0</code> or <code>retry-after</code> is <code>RateLimited</code> with the reset time; 401 is <code>Unauthorized</code>; 404 is <code>NotFound</code> (GitHub answers 404 for a private repository the token cannot see, and the message must say "not found, or the token cannot see it"). Redirects are followed only to the same host family GitHub uses for tarballs (<code>codeload.github.com</code>, or the base host in tests), never elsewhere. No token is ever put in a URL or an error string.</p>
+<ol class="steps">
+<li>Write the fake in <code>tests/common/fake_github.rs</code>: an axum app on <code>127.0.0.1:0</code> over an in-memory model (<code>FakeRepo { branches, commits, trees, blobs }</code>) with <code>commit(branch, files: &amp;[(&amp;str, Vec&lt;u8&gt;)]) -&gt; CommitId</code>, <code>delete_branch</code>, <code>force_truncate_trees()</code>, <code>require_token(&amp;str)</code> (else 404 for private), <code>rate_limit_next(reset)</code>, and request counters per endpoint. It serves the endpoints above with ETag and 304 behaviour, and builds the tarball with the real <code>tar</code> and <code>flate2</code> under a top folder <code>owner-repo-&lt;sha&gt;/</code>.</li>
+<li>Write failing tests in <code>tests/github_client.rs</code>: <code>repo_reads_the_basics</code>; <code>head_returns_commit_tree_and_etag_then_not_modified_with_that_etag</code> (and the fake saw one full request, one conditional); <code>tree_lists_files_dirs_symlinks_and_submodules_with_sizes</code>; <code>a_truncated_tree_is_an_error_not_a_short_list</code>; <code>blob_returns_raw_bytes_and_git_blob_id_matches_the_tree_sha</code>; <code>blob_over_the_limit_is_too_large_without_reading_it_all</code>; <code>tarball_streams_to_a_file_and_for_each_in_tarball_strips_the_top_folder</code>; <code>private_repo_without_token_is_not_found_and_with_token_is_found</code>; <code>revoked_token_is_unauthorized</code>; <code>rate_limited_carries_the_reset_time</code>; <code>token_never_appears_in_any_error_text</code> (force each error with token <code>ghp_secret123</code>; <code>format!("{err:?}{err}")</code> lacks it); <code>a_redirect_to_another_host_is_refused</code>; <code>repo_ref_rejects_paths_traversal_and_extra_slashes</code>.</li>
+<li>Run <code>cargo xtask test -p server --test github_client</code>. Expected: fails to compile.</li>
+<li>Implement <code>github.rs</code>. First confirm the dependency set builds on Windows with the J: target and no C toolchain beyond what the repository already needs; if the <code>ring</code> provider does not build, stop and report to the owner before choosing another (proposal 5). Record each new crate's licence in the commit message.</li>
+<li>Run the tests. Expected: all pass. <code>cargo xtask check</code>; expected: green.</li>
+<li>Commit: <code>feat: GitHub API client and a fake GitHub for tests</code>.</li>
+</ol></div>
+
+<h3>Task 4: the sync engine</h3>
+<div class="task">
+<p><strong>Files:</strong> create <code>crates/server/src/source_sync.rs</code>, <code>crates/server/tests/source_sync.rs</code>; modify <code>crates/server/src/lib.rs</code> (<code>pub mod source_sync;</code>, re-export <code>sync_once</code>), <code>crates/server/src/api/content.rs</code> and <code>api/uploads.rs</code> (make <code>create_uploaded</code> and <code>store_version</code> <code>pub(crate)</code>; do not copy them), <code>crates/server/src/tree.rs</code> (a <code>pub(crate)</code> way to create a folder and to move to the bin without the HTTP layer if none exists; reuse what <code>nodes::create</code> and the bin call).</p>
+<p><strong>Interfaces.</strong> Consumes Tasks 1 to 3 and the existing <code>tree::check_policies(db, place, name, size) -&gt; Result&lt;(), AccessError&gt;</code> (<code>tree.rs:~996</code>), <code>Db::library_settings</code>, <code>Blobs::write_bytes</code>, <code>create_uploaded</code>, <code>store_version</code>. Produces:</p>
+<pre><code>pub struct Entry { pub path: String, pub sha: String, pub size: u64, pub dir: bool }
+pub struct Plan { pub add: Vec&lt;Entry&gt;, pub change: Vec&lt;(SourceItem, Entry)&gt;, pub remove: Vec&lt;SourceItem&gt;,
+                  pub moves: Vec&lt;(SourceItem, Entry)&gt;, pub unchanged: usize }
+pub fn plan(wanted: &amp;[Entry], known: &amp;[SourceItem]) -&gt; Plan;              // pure
+pub fn shown_names(entries: Vec&lt;TreeEntry&gt;, folder: &amp;str) -&gt; (Vec&lt;Entry&gt;, Hidden); // filters, strips the folder prefix, resolves collisions
+pub struct Hidden { pub symlinks: usize, pub submodules: usize, pub policy: usize, pub too_big: usize, pub unnameable: usize }
+pub struct SyncReport { pub commit: String, pub added: usize, pub changed: usize, pub removed: usize, pub moved: usize, pub hidden: Hidden, pub bytes: u64 }
+pub enum SyncError { NotConnected(String), RateLimited(OffsetDateTime), Failed(String) }
+pub async fn sync_once(state: &amp;AppState, library: NodeId, now: OffsetDateTime) -&gt; Result&lt;Option&lt;SyncReport&gt;, SyncError>; // None: branch unchanged</code></pre>
+<p><strong>Rules the engine follows.</strong> One sync at a time per library (a PostgreSQL advisory lock keyed on the library; a second caller returns <code>Ok(None)</code>). Read the head with the stored etag; <code>NotModified</code> or an unchanged commit only updates <code>last_checked_at</code>. Read the tree; filter to the folder; apply file policy per file with <code>tree::check_policies</code> and the largest file (D39), counting hidden. A repository over <code>source_max_files</code> or <code>source_max_bytes</code> fails with a plain message before anything is written. Names: split on <code>/</code>; a segment that ShareCraft refuses (empty, <code>.</code>, <code>..</code>, control characters, over 255 characters) hides the file as <code>unnameable</code>; two siblings equal ignoring case keep the first in byte order and give the others <code>name (2).ext</code>, <code>name (3).ext</code> and count them. Plan: same path and same blob ID is unchanged; same path, different blob ID is a change (a new version of the same document, same id); a vanished path and a new path with the same blob ID, exactly one each, is a move (same node, same document, renamed or re-parented); everything else is add or remove. Fetch: more than 20 files to read means one tarball to a temp file in <code>data_dir/uploads</code> and one pass through it, otherwise one blob request per file, four at a time. Every byte read is checked with <code>git_blob_id</code> against the tree's ID; a mismatch fails the sync. Write: folders first (shallowest first), then files, through the existing upload functions, as the connecting user, with the commit ID and the GitHub author's name in the revision note; removals go to the recycle bin and folders left empty are removed after the files. <strong>Nothing is applied until every wanted byte has been read and checked</strong>; apply then runs file by file and records each in <code>source_items</code> as it goes, so a crash leaves a state the next sync repairs (items not in <code>source_items</code> but present as nodes are found by path and adopted, not duplicated). Sync bytes do not count against the site's quota. Event kinds: <code>source.synced</code> with the counts and commit, <code>source.failed</code> with a plain reason; neither carries a token or a response body.</p>
+<ol class="steps">
+<li>Write failing pure tests for <code>plan</code> and <code>shown_names</code> (no database): <code>unchanged_changed_added_removed</code>; <code>a_rename_with_the_same_blob_is_a_move</code>; <code>two_files_with_one_blob_are_not_mistaken_for_a_move</code> (ambiguous: add and remove); <code>case_collisions_keep_the_first_and_suffix_the_rest</code> (<code>A.md</code> and <code>a.md</code>); <code>a_file_named_a_dot_dot_is_unnameable</code>; <code>symlinks_and_submodules_are_hidden_and_counted</code>; <code>folder_prefix_is_stripped_and_outside_files_are_ignored</code>; <code>empty_names_and_names_over_255_are_unnameable</code>.</li>
+<li>Write failing integration tests in <code>tests/source_sync.rs</code> against the fake GitHub and <code>spawn_server()</code>: <code>first_sync_creates_folders_and_files_with_the_right_bytes</code> (download each through <code>/api/docs/{id}/content</code> as a viewer and compare); <code>second_sync_with_no_change_makes_one_conditional_request_and_no_blob_requests</code>; <code>an_edited_file_becomes_a_new_version_of_the_same_document</code> (same id, two revisions); <code>a_deleted_file_goes_to_the_recycle_bin_and_its_empty_folder_is_removed</code>; <code>a_moved_file_keeps_its_node_and_its_permissions</code> (give a user access to the file, move it in the repo, sync, the user still has it and the node id is unchanged); <code>many_changes_use_one_tarball_and_few_use_blob_requests</code> (counters); <code>a_corrupt_blob_fails_the_sync_and_changes_nothing</code>; <code>a_truncated_tree_keeps_existing_files_and_reports_it</code>; <code>a_repository_over_the_cap_fails_before_writing</code>; <code>sync_ignores_the_site_quota</code>; <code>blocked_file_types_are_hidden_and_counted</code> (library blocks <code>.exe</code>); <code>the_scan_gate_applies</code> (<code>fake-icap</code>-style: an infected file is withheld from download, as for an upload); <code>a_second_sync_at_the_same_time_returns_none</code> (advisory lock); <code>events_carry_counts_but_no_token</code>; <code>case_collision_shows_a_suffixed_name_in_the_listing_and_counts_it</code>.</li>
+<li>Run <code>cargo xtask test -p server --test source_sync</code>. Expected: fails to compile or fails.</li>
+<li>Implement <code>source_sync.rs</code> to the interfaces and rules above. Keep <code>plan</code> and <code>shown_names</code> free of I/O.</li>
+<li>Run the tests. Expected: all pass; run <code>cargo xtask test -p server --test libraries --test uploads --test scan</code>; expected: no regressions.</li>
+<li>Commit: <code>feat: sync a library from a GitHub branch</code>.</li>
+</ol></div>
+
+<h3>Task 5: connected libraries are read-only</h3>
+<div class="task">
+<p><strong>Files:</strong> modify <code>crates/server/src/api/nodes.rs</code>, <code>api/docs.rs</code>, <code>api/content.rs</code>, <code>api/uploads.rs</code>, <code>api/bin.rs</code>, <code>ws.rs</code> (and <code>file_room.rs</code> / <code>room.rs</code> only if the seat is decided there), <code>crates/server/src/api/mod.rs</code> (error mapping); create <code>crates/server/tests/source_readonly.rs</code>. The guard lives in the handlers, <strong>not</strong> in <code>tree.rs</code>, so the sync engine can still use the tree functions.</p>
+<p><strong>Interfaces.</strong> Consumes <code>Db::source_library_of</code>. Produces <code>pub(crate) async fn require_not_connected(db: &amp;Db, node: NodeId) -&gt; Result&lt;(), ApiError&gt;</code> in <code>api/nodes.rs</code>, returning a new <code>ApiError::SourceReadOnly</code> (HTTP 409, code <code>source_read_only</code>, message <em>"This library is kept in step with a GitHub repository, so it cannot be changed here."</em>), and a read-only seat for editors opened on a file inside a connected library.</p>
+<p>Apply it to: create folder or file under a node (<code>nodes::create</code>, <code>docs::create</code>); every upload entry (<code>content::upload</code>, <code>uploads::start</code>, <code>chunk</code>, <code>finish</code>); rename and move (<code>nodes</code> patch), checking <em>both</em> the source and the destination; copy <em>into</em> a connected library (copying out is allowed); delete to the bin (<code>nodes</code> delete); restoring from the bin into a connected library; template saves into one; editor checkpoints and a new editor session (the seat is read-only). Enumerate the routes with <code>grep -n "post(\|put(\|patch(\|delete(" crates/server/src/api/mod.rs</code> and classify every one as <em>touches a node's content or place</em> or <em>does not</em>; the test below fails if a route is added without a decision.</p>
+<ol class="steps">
+<li>Write failing tests in <code>tests/source_readonly.rs</code>: a table-driven <code>every_content_route_refuses_in_a_connected_library</code> (one row per route classified above, with the request each needs; each returns 409 <code>source_read_only</code> for an owner, and for an administrator too); <code>the_same_routes_work_in_an_ordinary_library</code> (same table, expect success); <code>copying_out_of_a_connected_library_works</code>; <code>moving_out_is_refused</code>; <code>reading_listing_previewing_and_sharing_still_work</code> (access changes, links, requests are allowed: they change who sees the files, not the files); <code>an_editor_opens_a_connected_file_read_only</code> (a websocket join gets a viewer seat and a save is refused); <code>a_route_list_guard</code>: parse the router source text for route registrations and fail if the number differs from a recorded list, so a new route forces a decision (document this in the test).</li>
+<li>Run <code>cargo xtask test -p server --test source_readonly</code>. Expected: fails.</li>
+<li>Implement the guard and the seat rule. Use <code>Db::source_library_of(node)</code>, one query per request; do not cache.</li>
+<li>Run the new tests and the full server suite (<code>cargo xtask test -p server</code>). Expected: all pass.</li>
+<li>Commit: <code>feat: libraries connected to a source are read-only in ShareCraft</code>.</li>
+</ol></div>
+
+<h3>Task 6: the API for connecting and managing a source</h3>
+<div class="task">
+<p><strong>Files:</strong> create <code>crates/server/src/api/sources.rs</code>, <code>crates/server/tests/source_api.rs</code>; modify <code>api/mod.rs</code> (routes), <code>crates/server/src/lib.rs</code> (<code>AppState</code> gains <code>secrets: Arc&lt;SecretBox&gt;</code> and <code>github: Arc&lt;GithubClient&gt;</code>, built in <code>prepare</code> from the config; tests can replace the client's base address).</p>
+<p><strong>Interfaces.</strong> Consumes Tasks 1 to 5 and the access checks <code>require_manager(db, user, node)</code> (<code>nodes.rs:799</code>). Produces these routes (all under <code>/api</code>, JSON, same-origin checked like every other):</p>
+<table><thead><tr><th>Route</th><th>Who</th><th>Body and answer</th></tr></thead><tbody>
+<tr><td><code>POST /sites/{id}/libraries/github</code></td><td>those who may create a library in the site</td><td>{<code>name</code>, <code>repository</code>: "owner/repo", <code>branch</code>?, <code>folder</code>?, <code>token</code>?, <code>kind</code>? (default document)} &rarr; 201 {<code>id</code>, <code>source</code>}. Creates the library, runs the probe (repository exists and is visible, branch exists, size under the cap, not archived is only a warning), seals the token, connects, and starts the first sync in the background. A failed probe creates nothing.</td></tr>
+<tr><td><code>GET /libraries/{id}/source</code></td><td>anyone who can open the library</td><td>{<code>kind</code>, <code>repository</code>, <code>branch</code>, <code>folder</code>, <code>state</code>, <code>last_commit</code> (7 characters), <code>last_synced_at</code>, <code>last_checked_at</code>, <code>last_error</code>, <code>files</code>, <code>bytes</code>, <code>hidden</code>, <code>token_set</code>: bool, <code>webhook</code>: {<code>url</code>, <code>configured</code>: bool}}. Never a secret.</td></tr>
+<tr><td><code>PATCH /libraries/{id}/source</code></td><td>library owners</td><td>{<code>branch</code>?, <code>folder</code>?, <code>poll_seconds</code>?, <code>token</code>?, <code>clear_token</code>?}. A new branch or folder reprobes, clears the bookmark and syncs.</td></tr>
+<tr><td><code>POST /libraries/{id}/source/sync</code></td><td>library owners</td><td>202; wakes the worker for this library.</td></tr>
+<tr><td><code>POST /libraries/{id}/source/webhook</code></td><td>library owners</td><td>Generates a 32-byte secret, seals it, answers once with {<code>url</code>, <code>secret</code>} (hex). Calling it again replaces the secret and says so.</td></tr>
+<tr><td><code>DELETE /libraries/{id}/source</code></td><td>library owners</td><td>Disconnects (proposal 8): secrets deleted, files kept, 204. Event <code>source.disconnected</code>.</td></tr>
+</tbody></table>
+<p>The webhook <code>url</code> is built with <code>Deployment::link_origin</code> (<code>deployment.rs:142</code>) so it is the public address in production mode. Errors: <code>repository_not_found</code> (message as in Task 3), <code>token_rejected</code>, <code>branch_not_found</code>, <code>repository_too_large</code>, plus the existing codes.</p>
+<ol class="steps">
+<li>Write failing tests in <code>tests/source_api.rs</code> (fake GitHub, <code>spawn_server_config</code> with the API address set): <code>connect_creates_a_library_and_the_first_sync_fills_it</code> (poll the listing until files appear, with the 5 s <code>TIMEOUT</code>); <code>a_failed_probe_creates_no_library</code> (wrong repository, missing branch, over the cap); <code>a_private_repository_needs_a_token</code>; <code>show_never_returns_a_secret</code> and <code>no_secret_in_any_response_event_or_log</code> (plant <code>ghp_planted_token_1</code> and the generated webhook secret; fetch every route's answer, every <code>events</code> row's <code>detail</code> as text, and the captured log output; none contains either); <code>the_token_is_stored_only_as_ciphertext</code> (read the <code>secrets</code> table directly); <code>only_site_creators_may_connect_and_only_owners_may_change</code> (a viewer, an editor, a stranger: 403 or 404 as the existing routes answer); <code>patch_branch_reprobes_and_resyncs</code>; <code>clear_token_removes_the_secret_row</code>; <code>webhook_secret_is_shown_once</code>; <code>disconnect_keeps_files_and_makes_the_library_editable</code> (an upload then succeeds); <code>connecting_an_existing_non_empty_library_is_refused</code> is covered in records, so here only <code>the_create_route_makes_its_own_empty_library</code>.</li>
+<li>Run <code>cargo xtask test -p server --test source_api</code>. Expected: fails.</li>
+<li>Implement <code>api/sources.rs</code> and the wiring. Reject a <code>repository</code> that is not exactly <code>owner/repo</code> with the characters GitHub allows, and a <code>folder</code> containing <code>..</code>, a leading <code>/</code> or a backslash.</li>
+<li>Run the new tests and <code>cargo xtask test -p server</code>. Expected: pass.</li>
+<li>Commit: <code>feat: connect, show, change and disconnect a GitHub source</code>.</li>
+</ol></div>
+
+<h3>Task 7: the worker, backoff and the webhook</h3>
+<div class="task">
+<p><strong>Files:</strong> modify <code>crates/server/src/source_sync.rs</code> (worker), <code>crates/server/src/lib.rs</code> (<code>serve_state</code> starts it; the webhook route is registered next to <code>/l/{token}</code>, outside <code>/api</code>, because GitHub sends no <code>Origin</code>; re-export <code>source_tick_once</code>), <code>crates/server/Cargo.toml</code> (<code>hmac</code>); create <code>crates/server/src/webhooks.rs</code>, <code>crates/server/tests/source_worker.rs</code>.</p>
+<p><strong>Interfaces.</strong> Produces <code>pub fn start_worker(state: AppState) -&gt; Worker</code> (abort on drop, <code>tokio::select!</code> on a <code>Notify</code> and a 60 s tick, as <code>scan::start_worker</code>), <code>pub async fn tick_once(state: &amp;AppState, now: OffsetDateTime) -&gt; usize</code> (syncs every due library, returns how many ran; tests call it with a chosen <code>now</code>), and <code>POST /hooks/github/{library}</code>. A wake handle lives in <code>AppState</code>: <code>state.sources().wake(library)</code>.</p>
+<p><strong>Rules.</strong> Due means: state is <code>ok</code>, <code>failed</code> or <code>connecting</code>; <code>last_checked_at + poll_seconds &lt;= now</code>; and <code>retry_at</code> is not in the future. After <code>RateLimited(t)</code>: state <code>rate_limited</code>, <code>retry_at = t</code>. After <code>Unauthorized</code>, <code>NotFound</code> or a missing branch: state <code>not_connected</code> with the plain message, <strong>no further automatic attempts</strong> until an owner changes the source or presses Sync (which clears the state). After a network failure or other error: state <code>failed</code>, back off <code>min(60 s &times; 2^n, 1 h)</code> with <code>n</code> counted in memory per library; a success resets it. At most two libraries sync at once. Webhook: <code>X-Hub-Signature-256: sha256=&lt;hex&gt;</code> is the HMAC-SHA256 of the raw body with the unsealed secret, compared in constant time; <code>ping</code> answers 200; <code>push</code> for <code>refs/heads/&lt;branch&gt;</code> wakes the library and answers 202, other pushes and events answer 204; an unknown library, a library with no webhook secret, and a bad signature all answer 404 and 401 respectively without telling which part was wrong beyond that; body limit 5 MiB, read in full before the check; failures count towards the existing per-address throttle (extend <code>lib.rs::source</code>, which counts 404s under <code>/api/l/</code>, to cover <code>/hooks/</code>). The delivery's content is never trusted for anything but the branch name.</p>
+<ol class="steps">
+<li>Write failing tests in <code>tests/source_worker.rs</code>: <code>tick_syncs_a_due_library_and_not_one_checked_a_minute_ago</code>; <code>poll_interval_is_respected</code> (drive <code>now</code>); <code>a_rate_limit_sets_a_retry_time_and_no_request_is_made_before_it</code> (the fake counts); <code>a_revoked_token_stops_retrying_until_an_owner_acts</code> (three ticks, one request; then <code>PATCH</code> with a new token and it syncs); <code>a_deleted_branch_is_not_connected_and_files_stay_readable</code>; <code>a_network_failure_backs_off_and_recovers</code>; <code>a_renamed_repository_gives_a_plain_message</code>; <code>webhook_with_a_good_signature_syncs_within_the_timeout_without_waiting_for_the_poll</code>; <code>webhook_bad_signature_is_401_and_does_nothing</code>; <code>webhook_for_another_branch_is_204_and_does_nothing</code>; <code>webhook_ping_is_200</code>; <code>webhook_without_a_secret_set_is_404</code>; <code>webhook_failures_are_throttled</code> (61 bad signatures from one address, then 429); <code>webhook_works_through_the_trusted_proxy_in_production_mode</code> (<code>Deployment::production_for_tests</code>); <code>webhook_secret_replacement_invalidates_the_old_one</code>; <code>an_oversized_body_is_refused</code>.</li>
+<li>Run <code>cargo xtask test -p server --test source_worker</code>. Expected: fails.</li>
+<li>Implement the worker, the backoff and <code>webhooks.rs</code>. The HMAC key is the unsealed secret; it is never logged and the unsealed value is dropped after the check.</li>
+<li>Run the tests and the full server suite. Expected: pass.</li>
+<li>Commit: <code>feat: keep connected libraries current by polling and GitHub webhooks</code>.</li>
+</ol></div>
+
+<h3>Task 8: pages</h3>
+<div class="task">
+<p><strong>Files:</strong> create <code>web/source-panel.js</code>, <code>web/source-panel.test.mjs</code>; modify <code>web/library.html</code> and <code>web/library.js</code> (banner), <code>web/library-settings.html</code> and <code>web/library-settings.js</code> (source panel), <code>web/site.js</code> (connect form), <code>web/common.js</code> (shared labels), <code>web/prefetch.js</code> if a new page is added (none is).</p>
+<p><strong>Interfaces.</strong> Consumes the Task 6 routes. Produces in <code>source-panel.js</code> (pure, unit-tested): <code>sourceSummary(source) -&gt; { headline, detail, tone }</code> (tone one of <code>ok</code>, <code>working</code>, <code>attention</code>), <code>sourceStateText(state)</code>, <code>relativeTime(iso, now)</code>, <code>validRepository(text) -&gt; boolean</code>, <code>webhookInstructions(webhook, secret) -&gt; string[]</code>.</p>
+<p><strong>What people see.</strong></p>
+<ul>
+<li><strong>Library page:</strong> under the library title, a banner: <em>"Kept in step with github.com/owner/repo (branch main). Updated 4 minutes ago. This library cannot be changed here."</em> A state other than ok changes the text and tone: <em>Updating&hellip;</em>, <em>Waiting for GitHub (rate limit) until 14:20</em>, <em>Not connected: the token was refused. Files shown are from the last update.</em> Owners also see <strong>Update now</strong>. "New", upload, rename, move and delete controls are hidden, and the <em>accepts</em> line adds "N files hidden by file rules" when <code>hidden</code> is above zero, with a plain list (links, submodules, names, types, size) in a details element.</li>
+<li><strong>Library settings:</strong> a <em>Source</em> section: repository, branch and folder (editable), poll interval, token (a password field that is empty with "set" or "not set" beside it, a Replace and a Remove), the webhook box (Create webhook secret shows the address and secret once, with the four steps to add it in GitHub), and Disconnect, behind a confirmation that says the files stay.</li>
+<li><strong>New library:</strong> in the create-library form a choice <em>Empty library</em> or <em>From a GitHub repository</em>; the latter asks for the repository, branch, folder and token, explains that a public repository needs no token and that a read-only fine-grained token is enough, and shows the probe's error in place.</li>
+</ul>
+<ol class="steps">
+<li>Write failing tests in <code>web/source-panel.test.mjs</code> (run as the other <code>web/*.test.mjs</code> are): <code>sourceSummary</code> for each state, with the exact headline text above; <code>relativeTime</code> for seconds, minutes, hours, days; <code>validRepository</code> accepts <code>owner/repo</code>, <code>a-b/c.d_e</code> and refuses <code>owner</code>, <code>owner/repo/extra</code>, <code>../x</code>, an empty string and a full URL; <code>webhookInstructions</code> includes the address and secret exactly once each and never the token.</li>
+<li>Run the tests. Expected: fail (module missing).</li>
+<li>Implement <code>source-panel.js</code>, then the three pages. Reuse <code>h()</code>, <code>formatSize</code> and the existing banner and form styles; no new framework. Labels are associated with fields, the banner is a <code>role="status"</code> region that updates without stealing focus, tone is never colour alone, and the page works at 375 px and in dark mode.</li>
+<li>Run the JavaScript tests, then check in the browser pane against a server pointed at a fake GitHub (<code>cargo xtask</code> has <code>fake-icap</code>; a small <code>fake-github</code> subcommand is added here, reusing the Task 3 fake, only if the check cannot be done with a real public repository): connect, watch the banner go from updating to ok, open a file and a preview, try to upload and see the control absent, open settings, create and read the webhook instructions, disconnect, then upload.</li>
+<li>Commit: <code>feat: pages for connected libraries</code>.</li>
+</ol></div>
+
+<h3>Task 9 (controller): a real repository, and the records</h3>
+<div class="task">
+<p>The controller does this task, not a subagent.</p>
+<ol class="steps">
+<li>Ask the owner for a go-ahead and a repository: a public one needs no token. Never use a private repository or the owner's token without being given it for this purpose. Connect it through the pages, with the API address left at the default, and check: the first sync fills the library; a later commit on GitHub appears within the poll interval; a document opens and previews; the file-type limits hide what they should; the banner is right at 375 px and in dark mode; no token appears anywhere (use a throwaway token only if the owner supplies one).</li>
+<li>Check the webhook only if the server has a public address (production mode); otherwise say it was checked by tests against the fake only.</li>
+<li>Run <code>cargo xtask check</code> and the full test run. Report the results, including anything not checked.</li>
+<li>Update <code>BUILDING.html</code> with a new section 28 (what was built, the tables, the routes, the guard, the limits, the rate-limit behaviour, how to test with the fake), <code>scope.html</code> (SC-27 and decisions D61 to D63 for: connected libraries as an attribute; the order of sources; mirroring for Git sources), and <code>sequencing.html</code> (a progress note on the platform track, version 0.16). All three are HTML with alternating row shading.</li>
+<li>Commit: <code>docs: record GitHub surfacing</code>. Do not merge or push.</li>
+</ol></div>
+
+<h2>Self-review</h2>
+<ul>
+<li><strong>Design coverage:</strong> read-only surfacing, folders from paths, versions (the repository's blob and commit IDs; history shown is ShareCraft's own, because Git history in the UI is part of 5B), change detection by conditional polling and webhook, credentials sealed, permissions over the tree, scanning and previews and file-type limits and recycle bin through real nodes, and the DriveCraft path by being ordinary nodes. Not covered here by choice: write-back (5B), repository history display, per-author attribution, LFS.</li>
+<li><strong>Known cost of the mirror (proposal 2):</strong> disk use in the data folder grows with the repository, and the first sync of a large repository is one tarball download. The caps and the status page make that visible. Nothing here changes the design's lazy-cache plan for S3.</li>
+<li><strong>Not yet verified:</strong> that <code>reqwest</code> with rustls and the <code>ring</code> provider builds on the owner's Windows setup and its licences; that the quota bypass is a small change in <code>plan_create</code>; that the existing editor seat can be made read-only without touching the spine. Each is a first step in the task that depends on it, and each stops and reports rather than choosing around it.</li>
+</ul>
+</main></body></html>
