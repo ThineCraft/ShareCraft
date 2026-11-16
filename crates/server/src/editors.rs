@@ -20,7 +20,8 @@ use tower_http::services::ServeDir;
 
 use crate::AppState;
 use crate::api::ApiError;
-use crate::auth::{Signed, same_origin};
+use crate::auth::Signed;
+use crate::deployment::SameOrigin;
 
 /// The name of an editor's manifest, in the editor's folder.
 const MANIFEST: &str = "editor.json";
@@ -206,7 +207,7 @@ async fn guard(
         Err(ApiError::Unavailable) => return ApiError::Unavailable.into_response(),
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
     }
-    if !same_origin(request.headers()) {
+    if !SameOrigin::of(request.extensions()) {
         return StatusCode::NOT_FOUND.into_response();
     }
     let Some((id, rest)) = split_path(request.uri().path()) else {

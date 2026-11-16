@@ -322,6 +322,7 @@ fn library(data_dir: &Path) -> PathBuf {
 fn config(data_dir: &Path, db: &TestDb) -> Config {
     Config {
         addr: "127.0.0.1:0".parse().unwrap(),
+        deployment: Default::default(),
         data_dir: data_dir.to_path_buf(),
         web_dir: data_dir.join("web"),
         checkpoint_idle: Duration::from_millis(100),

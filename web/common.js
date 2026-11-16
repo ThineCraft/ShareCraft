@@ -14,6 +14,8 @@ setupPrefetch();
 const MESSAGES = {
   invalid_credentials: 'That email and password do not match.',
   too_many_attempts: 'Too many attempts. Try again in a few minutes.',
+  https_required:
+    'This address must be opened with https://. Ask your administrator to check the proxy settings.',
   not_signed_in: 'You are not signed in.',
   no_such_user: 'No account has that email address.',
   last_owner: 'There must be at least one owner. Make someone else an owner first.',
@@ -150,6 +152,18 @@ export function removedReasonOf(data) {
 /** The sentence for an API error code; unknown codes get a general one. */
 export function messageFor(code) {
   return Object.hasOwn(MESSAGES, code) ? MESSAGES[code] : 'Something went wrong. Try again.';
+}
+
+/**
+ * The sentence for too many sign-in attempts, saying how long to wait when the server said:
+ * `seconds` from its `retry_after`. Whole minutes, rounded up; under a minute says so.
+ */
+export function tooManyAttemptsMessage(seconds) {
+  const wait = Number(seconds);
+  if (!Number.isFinite(wait) || wait <= 0) return MESSAGES.too_many_attempts;
+  if (wait < 60) return 'Too many attempts. Try again in less than a minute.';
+  const minutes = Math.ceil(wait / 60);
+  return `Too many attempts. Try again in ${minutes} minute${minutes === 1 ? '' : 's'}.`;
 }
 
 /** The sentence for a refused "Inherit again": only an owner of the place above may do it. */

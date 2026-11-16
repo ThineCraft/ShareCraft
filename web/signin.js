@@ -1,4 +1,4 @@
-import { api, messageFor, safeNext, showMessage } from './common.js';
+import { api, messageFor, safeNext, showMessage, tooManyAttemptsMessage } from './common.js';
 
 const form = document.getElementById('form');
 const email = document.getElementById('email');
@@ -21,6 +21,11 @@ form.addEventListener('submit', async (event) => {
     return;
   }
   password.value = '';
-  showMessage(error, messageFor(result.error));
+  showMessage(
+    error,
+    result.error === 'too_many_attempts'
+      ? tooManyAttemptsMessage(result.data?.retry_after)
+      : messageFor(result.error),
+  );
   password.focus();
 });

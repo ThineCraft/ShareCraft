@@ -492,3 +492,47 @@ async fn simultaneous_disables_of_different_admins_do_not_deadlock() {
         );
     }
 }
+
+#[tokio::test]
+async fn unrecorded_sign_in_hands_back_the_failure_event() {
+    let test = TestDb::create().await;
+    let ann = test
+        .db
+        .create_user(None, new_user("ann@x.test", "Ann", false))
+        .await
+        .unwrap();
+    let count = || async {
+        sqlx::query_scalar::<_, i64>("select count(*) from events")
+            .fetch_one(test.db.test_pool())
+            .await
+            .unwrap()
+    };
+    let before = count().await;
+    // Nothing is written before the answer: neither for an unknown email nor a wrong password.
+    let unknown = test
+        .db
+        .sign_in_unrecorded("nobody@x.test", PASSWORD)
+        .await
+        .unwrap_err();
+    assert!(matches!(unknown.error, SignInError::Invalid));
+    assert!(unknown.event.is_none());
+    let wrong = test
+        .db
+        .sign_in_unrecorded("ann@x.test", "not the password")
+        .await
+        .unwrap_err();
+    assert!(matches!(wrong.error, SignInError::Invalid));
+    let event = wrong
+        .event
+        .expect("a known account's failure is handed back");
+    assert_eq!(event.kind, "sign_in.failed");
+    assert_eq!(event.subject, Some(ann.id));
+    assert_eq!(event.detail["reason"], "wrong_password");
+    assert_eq!(count().await, before, "nothing written before the answer");
+    assert!(
+        test.db
+            .sign_in_unrecorded("ann@x.test", PASSWORD)
+            .await
+            .is_ok()
+    );
+}

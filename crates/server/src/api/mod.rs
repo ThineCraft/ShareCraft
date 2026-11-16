@@ -1,5 +1,6 @@
-//! The JSON API under `/api`. Every request must pass [`same_origin`], and any request other
-//! than `GET` must also carry `Origin`. Errors are `{"error": "<code>"}`.
+//! The JSON API under `/api`. Every request must pass the origin check
+//! ([`crate::deployment::Deployment::same_origin`]), and any request other than `GET` must also
+//! carry `Origin`. Errors are `{"error": "<code>"}`.
 
 mod admin;
 mod bin;
@@ -39,7 +40,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::AppState;
-use crate::auth::same_origin;
+use crate::deployment::SameOrigin;
 use crate::room::AccessChange;
 
 /// Largest request body accepted.
@@ -249,9 +250,10 @@ async fn no_store(request: Request, next: Next) -> Response {
 
 /// Refuses requests from other origins, and requests that change something without `Origin`.
 async fn require_same_origin(request: Request, next: Next) -> Response {
-    let headers = request.headers();
     let origin_needed = request.method() != Method::GET;
-    if !same_origin(headers) || (origin_needed && !headers.contains_key(ORIGIN)) {
+    if !SameOrigin::of(request.extensions())
+        || (origin_needed && !request.headers().contains_key(ORIGIN))
+    {
         return ApiError::Forbidden.into_response();
     }
     next.run(request).await
@@ -380,6 +382,8 @@ pub(crate) enum ApiError {
     ExpiryTooLong,
     /// 400: the expiry has already passed.
     ExpiryInPast,
+    /// 403: production mode, and the proxy received the request over plain HTTP.
+    HttpsRequired,
     /// 429: too many requests for access in the last day.
     TooManyRequests,
     /// 409: the request for access was decided already.
@@ -487,6 +491,7 @@ impl ApiError {
             ApiError::ExpiryRequired => (StatusCode::BAD_REQUEST, "expiry_required"),
             ApiError::ExpiryTooLong => (StatusCode::BAD_REQUEST, "expiry_too_long"),
             ApiError::ExpiryInPast => (StatusCode::BAD_REQUEST, "expiry_in_past"),
+            ApiError::HttpsRequired => (StatusCode::FORBIDDEN, "https_required"),
             ApiError::TooManyRequests => (StatusCode::TOO_MANY_REQUESTS, "too_many_requests"),
             ApiError::AlreadyDecided => (StatusCode::CONFLICT, "already_decided"),
             ApiError::MessageTooLong => (StatusCode::BAD_REQUEST, "message_too_long"),
@@ -832,6 +837,7 @@ mod tests {
     fn state_for(test: &TestDb, dir: &std::path::Path) -> AppState {
         let config = Config {
             addr: "127.0.0.1:0".parse().unwrap(),
+            deployment: Default::default(),
             data_dir: dir.to_path_buf(),
             web_dir: dir.join("web"),
             checkpoint_idle: Duration::from_secs(600),
