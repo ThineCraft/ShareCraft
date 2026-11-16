@@ -1387,6 +1387,10 @@ impl Look {
             if let Some(p) = fonts.package.problem() {
                 return Some(format!("fonts: {p}"));
             }
+            let built_in = BUILT_IN_FONT_PACKAGES.iter().find(|b| b.id == fonts.from);
+            if built_in.is_some_and(|b| b.package() != fonts.package) {
+                return Some("a built-in font package is kept exactly as it is".to_owned());
+            }
         }
         self.header_problem().or_else(|| self.footer_problem())
     }
@@ -1726,11 +1730,75 @@ pub enum Actor {
     Admin,
 }
 
+/// The records a look's named sources are checked against: the brand centre and the site's own
+/// themes and font packages, exactly as the server holds them now.
+#[derive(Clone, Copy, Debug)]
+pub struct KnownSources<'a> {
+    /// The organisation's brand centre.
+    pub org: &'a OrgBrand,
+    /// The site's own themes.
+    pub site_themes: &'a [SiteTheme],
+    /// The site's own font packages.
+    pub site_packages: &'a [FontPackage],
+}
+
+/// The identifier after `prefix` in `from`, if it is a canonical UUID.
+fn source_id(from: &str, prefix: &str) -> Option<Uuid> {
+    let id = from.strip_prefix(prefix)?;
+    Uuid::parse_str(id).ok().filter(|u| u.to_string() == id)
+}
+
+/// Whether the theme of `look` is the copy of the source it names: a built-in theme exactly, an
+/// `org:` theme the brand centre's theme of that identifier, a `site:` theme the site's own.
+/// `custom` names no source and answers `true`; an unknown identifier, or a copy whose name or
+/// colours differ from its source, answers `false`.
+#[must_use]
+pub fn theme_matches_source(look: &Look, known: &KnownSources<'_>) -> bool {
+    let from = look.from.as_str();
+    if from == "custom" {
+        return true;
+    }
+    if let Some(built_in) = BUILT_IN_THEMES.iter().find(|t| t.id == from) {
+        return built_in.theme() == look.theme;
+    }
+    let in_org =
+        source_id(from, "org:").and_then(|id| known.org.themes.iter().find(|t| t.id == id));
+    let in_site =
+        source_id(from, "site:").and_then(|id| known.site_themes.iter().find(|t| t.id == id));
+    in_org.or(in_site).is_some_and(|t| t.theme() == look.theme)
+}
+
+/// Whether the fonts of `look` are the copy of the package they name, the same way as
+/// [`theme_matches_source`]: a built-in package exactly, an `org:` package the brand centre's
+/// of that identifier, a `site:` package the site's own. A look without fonts answers `true`.
+#[must_use]
+pub fn fonts_match_source(look: &Look, known: &KnownSources<'_>) -> bool {
+    let Some(fonts) = &look.fonts else {
+        return true;
+    };
+    let from = fonts.from.as_str();
+    if let Some(built_in) = BUILT_IN_FONT_PACKAGES.iter().find(|b| b.id == from) {
+        return built_in.package() == fonts.package;
+    }
+    let in_org =
+        source_id(from, "org:").and_then(|id| known.org.font_packages.iter().find(|p| p.id == id));
+    let in_site =
+        source_id(from, "site:").and_then(|id| known.site_packages.iter().find(|p| p.id == id));
+    in_org.or(in_site).is_some_and(|p| *p == fonts.package)
+}
+
 /// What `policy` refuses to `actor` in a change of a site's look, in plain words, each problem
 /// once. `site_themes` and `site_packages` are the site-only themes and font packages this
 /// request makes or changes (empty when it makes none). Nothing is refused to a brand manager
 /// or an administrator, and nothing while every limit is off. A look already stored is never
 /// checked again; the policy applies to the next change.
+///
+/// A look names where its theme and fonts came from, and a label is not trusted: `known` holds
+/// the brand centre and the site's own records as the server has them, and a theme or font
+/// package whose copy does not equal what its label names (a built-in one changed, an `org:` or
+/// `site:` identifier nobody has, or colours or fonts that differ from that source) counts as a
+/// custom colour scheme, or as site-only fonts, whatever it is labelled. A built-in theme is
+/// hidden by `hide_builtin_themes` only when it really is the built-in one.
 ///
 /// Images need the brand centre's images to be told apart from a site's own: see
 /// [`image_policy_problems`].
@@ -1738,6 +1806,7 @@ pub enum Actor {
 pub fn policy_problems(
     look: &Look,
     policy: &BrandPolicy,
+    known: &KnownSources<'_>,
     site_themes: &[SiteTheme],
     site_packages: &[FontPackage],
     actor: Actor,
@@ -1746,19 +1815,22 @@ pub fn policy_problems(
     if actor != Actor::Owner {
         return problems;
     }
-    if policy.hide_builtin_themes && look.from.starts_with("builtin:") {
+    let theme_ok = theme_matches_source(look, known);
+    if policy.hide_builtin_themes && look.from.starts_with("builtin:") && theme_ok {
         problems.push("built-in themes are turned off for site owners".to_owned());
     }
-    if !policy.custom_colours && look.from == "custom" {
+    if !policy.custom_colours && (look.from == "custom" || !theme_ok) {
         problems.push("custom colours are turned off for site owners".to_owned());
     }
-    if !policy.site_themes && (look.from.starts_with("site:") || !site_themes.is_empty()) {
+    if !policy.site_themes
+        && ((look.from.starts_with("site:") && theme_ok) || !site_themes.is_empty())
+    {
         problems.push("site-only themes are turned off for site owners".to_owned());
     }
     let site_font_used = look
         .fonts
         .as_ref()
-        .is_some_and(|f| f.from.starts_with("site:"));
+        .is_some_and(|f| !fonts_match_source(look, known) || f.from.starts_with("site:"));
     if !policy.site_fonts && (site_font_used || !site_packages.is_empty()) {
         problems.push("site-only font packages are turned off for site owners".to_owned());
     }
@@ -3025,6 +3097,182 @@ mod tests {
         assert!(brand.problem().is_some());
     }
 
+    /// The sources a look's labels name, made to hold exactly the copies the look carries.
+    fn pp(
+        look: &Look,
+        policy: &BrandPolicy,
+        site_themes: &[SiteTheme],
+        site_packages: &[FontPackage],
+        actor: Actor,
+    ) -> Vec<String> {
+        let theme_id = |prefix: &str| {
+            look.from
+                .strip_prefix(prefix)
+                .map(|id| Uuid::parse_str(id).unwrap())
+        };
+        let as_theme = |id: Uuid| OrgTheme {
+            id,
+            name: look.theme.name.clone(),
+            primary: look.theme.primary,
+            secondary: look.theme.secondary,
+            primary_dark: look.theme.primary_dark,
+            secondary_dark: look.theme.secondary_dark,
+            changed_at: 1,
+        };
+        let mut org = OrgBrand::default();
+        org.themes.extend(theme_id("org:").map(as_theme));
+        let own_themes: Vec<SiteTheme> = theme_id("site:").map(as_theme).into_iter().collect();
+        let mut own_packages = Vec::new();
+        if let Some(fonts) = &look.fonts {
+            if fonts.from.starts_with("org:") {
+                org.font_packages.push(fonts.package.clone());
+            } else if fonts.from.starts_with("site:") {
+                own_packages.push(fonts.package.clone());
+            }
+        }
+        let known = KnownSources {
+            org: &org,
+            site_themes: &own_themes,
+            site_packages: &own_packages,
+        };
+        policy_problems(look, policy, &known, site_themes, site_packages, actor)
+    }
+
+    #[test]
+    fn labels_must_match_their_sources() {
+        let mut org = OrgBrand::default();
+        let org_id = uuid(1);
+        let org_theme = OrgTheme {
+            id: org_id,
+            name: "Dusk".into(),
+            primary: colour("#3156c9"),
+            secondary: colour("#233239"),
+            primary_dark: None,
+            secondary_dark: None,
+            changed_at: 1,
+        };
+        org.themes.push(org_theme.clone());
+        let org_package = package("Pair");
+        org.font_packages.push(org_package.clone());
+        let known = KnownSources {
+            org: &org,
+            site_themes: &[],
+            site_packages: &[],
+        };
+        let strict = BrandPolicy {
+            hide_builtin_themes: false,
+            custom_colours: false,
+            site_themes: true,
+            site_images: true,
+            site_fonts: false,
+        };
+        let check = |look: &Look| policy_problems(look, &strict, &known, &[], &[], Actor::Owner);
+        let pink = Theme {
+            name: "Pink".into(),
+            primary: colour("#aa1166"),
+            secondary: colour("#233239"),
+            primary_dark: None,
+            secondary_dark: None,
+        };
+        let custom = "custom colours are turned off for site owners";
+        let fonts = "site-only font packages are turned off for site owners";
+
+        // Honest labels pass: the built-in theme, the brand centre's theme and package.
+        assert!(check(&Look::default()).is_empty());
+        let honest = Look {
+            theme: org_theme.theme(),
+            from: format!("org:{org_id}"),
+            fonts: Some(LookFonts {
+                package: org_package.clone(),
+                from: format!("org:{}", org_package.id),
+            }),
+            ..Look::default()
+        };
+        assert!(check(&honest).is_empty());
+        for built_in in BUILT_IN_FONT_PACKAGES {
+            let look = Look {
+                fonts: Some(LookFonts {
+                    package: built_in.package(),
+                    from: built_in.id.into(),
+                }),
+                ..Look::default()
+            };
+            assert!(check(&look).is_empty(), "{}", built_in.id);
+        }
+
+        // A built-in label on other colours is a custom theme.
+        let spoofed = Look {
+            theme: pink.clone(),
+            ..Look::default()
+        };
+        assert_eq!(check(&spoofed), [custom]);
+        // An org label with an id the brand centre does not have.
+        let unknown = Look {
+            theme: pink.clone(),
+            from: format!("org:{}", uuid(77)),
+            ..Look::default()
+        };
+        assert_eq!(check(&unknown), [custom]);
+        // An org label whose colours differ from that org theme.
+        let edited = Look {
+            theme: pink,
+            from: format!("org:{org_id}"),
+            ..Look::default()
+        };
+        assert_eq!(check(&edited), [custom]);
+        // A site label for a theme the site does not have.
+        let not_there = Look {
+            from: format!("site:{}", uuid(78)),
+            ..Look::default()
+        };
+        assert_eq!(check(&not_there), [custom]);
+
+        // The same three for fonts: a built-in label on uploaded fonts, an org label with an
+        // unknown id, and an org label on a package that differs from the brand centre's.
+        let with_fonts = |package: FontPackage, from: String| Look {
+            fonts: Some(LookFonts { package, from }),
+            ..Look::default()
+        };
+        assert_eq!(
+            check(&with_fonts(package("Mine"), "builtin:system".into())),
+            [fonts]
+        );
+        assert_eq!(
+            check(&with_fonts(
+                FontPackage {
+                    roles: BUILT_IN_FONT_PACKAGES[1].roles,
+                    ..BUILT_IN_FONT_PACKAGES[1].package()
+                },
+                "builtin:system".into()
+            )),
+            [fonts]
+        );
+        assert_eq!(
+            check(&with_fonts(package("Mine"), format!("org:{}", uuid(77)))),
+            [fonts]
+        );
+        let changed = FontPackage {
+            name: "Changed".into(),
+            ..org_package.clone()
+        };
+        assert_eq!(
+            check(&with_fonts(changed, format!("org:{}", org_package.id))),
+            [fonts]
+        );
+        // A hidden built-in theme stays hidden only for the real one.
+        let hide = BrandPolicy {
+            hide_builtin_themes: true,
+            ..BrandPolicy::default()
+        };
+        let real = policy_problems(&Look::default(), &hide, &known, &[], &[], Actor::Owner);
+        assert_eq!(real, ["built-in themes are turned off for site owners"]);
+        // Administrators are never limited by a label either.
+        assert!(policy_problems(&spoofed, &strict, &known, &[], &[], Actor::Admin).is_empty());
+        // A built-in font package that is not exactly the built-in one is not stored at all.
+        let bad = with_fonts(package("Mine"), "builtin:system".into());
+        assert!(bad.problem("Site").is_some());
+    }
+
     #[test]
     fn policy_problems_by_actor() {
         let none: [SiteTheme; 0] = [];
@@ -3047,7 +3295,7 @@ mod tests {
         let site_fonts = Look {
             fonts: Some(LookFonts {
                 package: package("Pair"),
-                from: format!("site:{}", uuid(4)),
+                from: format!("site:{}", package("x").id),
             }),
             ..Look::default()
         };
@@ -3060,7 +3308,7 @@ mod tests {
         for actor in [Actor::Owner, Actor::BrandManager, Actor::Admin] {
             for look in [&Look::default(), &custom, &site_look, &site_fonts] {
                 assert_eq!(
-                    policy_problems(
+                    pp(
                         look,
                         &open,
                         std::slice::from_ref(&site_theme),
@@ -3079,25 +3327,25 @@ mod tests {
         };
         assert!(!hide.is_default());
         assert_eq!(
-            policy_problems(&Look::default(), &hide, &none, &no_packages, Actor::Owner),
+            pp(&Look::default(), &hide, &none, &no_packages, Actor::Owner),
             ["built-in themes are turned off for site owners"]
         );
         let org_look = Look {
             from: format!("org:{}", uuid(1)),
             ..Look::default()
         };
-        assert!(policy_problems(&org_look, &hide, &none, &no_packages, Actor::Owner).is_empty());
+        assert!(pp(&org_look, &hide, &none, &no_packages, Actor::Owner).is_empty());
 
         let no_custom = BrandPolicy {
             custom_colours: false,
             ..BrandPolicy::default()
         };
         assert_eq!(
-            policy_problems(&custom, &no_custom, &none, &no_packages, Actor::Owner),
+            pp(&custom, &no_custom, &none, &no_packages, Actor::Owner),
             ["custom colours are turned off for site owners"]
         );
         assert!(
-            policy_problems(
+            pp(
                 &Look::default(),
                 &no_custom,
                 &none,
@@ -3112,7 +3360,7 @@ mod tests {
             ..BrandPolicy::default()
         };
         assert_eq!(
-            policy_problems(
+            pp(
                 &site_look,
                 &no_site_themes,
                 &none,
@@ -3123,7 +3371,7 @@ mod tests {
         );
         // Making a site theme is refused the same way.
         assert_eq!(
-            policy_problems(
+            pp(
                 &Look::default(),
                 &no_site_themes,
                 std::slice::from_ref(&site_theme),
@@ -3138,7 +3386,7 @@ mod tests {
             ..BrandPolicy::default()
         };
         assert_eq!(
-            policy_problems(
+            pp(
                 &site_fonts,
                 &no_site_fonts,
                 &none,
@@ -3148,7 +3396,7 @@ mod tests {
             ["site-only font packages are turned off for site owners"]
         );
         assert_eq!(
-            policy_problems(
+            pp(
                 &Look::default(),
                 &no_site_fonts,
                 &none,
@@ -3161,12 +3409,12 @@ mod tests {
         let org_fonts = Look {
             fonts: Some(LookFonts {
                 package: package("Pair"),
-                from: format!("org:{}", uuid(4)),
+                from: format!("org:{}", package("x").id),
             }),
             ..Look::default()
         };
         assert!(
-            policy_problems(
+            pp(
                 &org_fonts,
                 &no_site_fonts,
                 &none,
@@ -3184,7 +3432,7 @@ mod tests {
             site_images: false,
             site_fonts: false,
         };
-        let all = policy_problems(
+        let all = pp(
             &Look {
                 from: "custom".into(),
                 ..site_fonts.clone()
@@ -3208,7 +3456,7 @@ mod tests {
         for actor in [Actor::BrandManager, Actor::Admin] {
             for look in [&Look::default(), &custom, &site_look, &site_fonts] {
                 assert!(
-                    policy_problems(
+                    pp(
                         look,
                         &strict,
                         std::slice::from_ref(&site_theme),

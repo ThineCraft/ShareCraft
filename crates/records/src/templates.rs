@@ -105,7 +105,8 @@ pub fn check_template_size(body: &TemplateBody) -> Result<(), AccessError> {
 /// name, or two alike in one place, ignoring case; cleaning names first avoids this),
 /// `invalid_library_settings` (a library's kind or settings that break the rules of
 /// [`crate::validate_library_settings`]), and `invalid_navigation` (the rules of a site's navigation, with libraries named rather than
-/// identified, and audiences of `owners`, `members` or `visitors`).
+/// identified, and audiences of `owners`, `members` or `visitors`), and `invalid_look` (a look
+/// that breaks the rules of [`revisions::brand::TemplateLook::problem`]).
 pub fn validate_template_body(body: &TemplateBody) -> Result<(), AccessError> {
     let refuse = |reason: &'static str| Err(AccessError::InvalidTemplate(reason));
     if !SITE_KINDS.contains(&body.kind.as_str()) {
@@ -132,6 +133,11 @@ pub fn validate_template_body(body: &TemplateBody) -> Result<(), AccessError> {
         && !navigation_acceptable(items)
     {
         return refuse("invalid_navigation");
+    }
+    if let Some(look) = &body.look
+        && look.problem().is_some()
+    {
+        return refuse("invalid_look");
     }
     Ok(())
 }
@@ -333,6 +339,26 @@ mod tests {
             Err(AccessError::InvalidTemplate(reason)) => reason,
             other => panic!("not refused: {other:?}"),
         }
+    }
+
+    #[test]
+    fn template_looks_are_validated() {
+        let look = |from: &str| -> revisions::brand::TemplateLook {
+            serde_json::from_value(serde_json::json!({
+                "theme": {"name": "Dusk", "primary": "#3156c9", "secondary": "#233239"},
+                "from": from,
+                "logo_alt": "",
+                "header": {"layout": "compact", "background": "none", "align": "left", "hide_title": false},
+                "navigation": "horizontal",
+                "footer": {"enabled": false, "layout": "simple", "name": "", "background": "none", "groups": []}
+            }))
+            .unwrap()
+        };
+        let mut ok = body();
+        ok.look = Some(look("builtin:harbour"));
+        assert_eq!(validate_template_body(&ok), Ok(()));
+        ok.look = Some(look("javascript:1"));
+        assert_eq!(refused(&ok), "invalid_look");
     }
 
     #[test]

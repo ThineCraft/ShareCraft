@@ -750,6 +750,16 @@ async fn hostile_template_package_refused() {
     let mut name = good_package();
     name["name"] = json!("x".repeat(81));
     cases.push(refused("invalid_name", name));
+    let mut look = good_package();
+    look["body"]["look"] = json!({
+        "theme": {"name": "Dusk", "primary": "#3156c9", "secondary": "#233239"},
+        "from": "javascript:1",
+        "logo_alt": "",
+        "header": {"layout": "compact", "background": "none", "align": "left", "hide_title": false},
+        "navigation": "horizontal",
+        "footer": {"enabled": false, "layout": "simple", "name": "", "background": "none", "groups": []}
+    });
+    cases.push(refused("invalid_look", look));
 
     let mut large = serde_json::to_vec(&good_package()).unwrap();
     large.resize(1024 * 1024 + 1, b' ');
