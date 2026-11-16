@@ -28,7 +28,13 @@ use std::process::{Command, ExitCode};
 
 const WASM_TARGET: &str = "wasm32-unknown-unknown";
 /// Crates that must keep compiling for the browser.
-const WASM_CRATES: [&str; 4] = ["collab-core", "collab-text", "protocol", "web-client"];
+const WASM_CRATES: [&str; 5] = [
+    "collab-core",
+    "collab-live",
+    "collab-text",
+    "protocol",
+    "web-client",
+];
 
 type Result<T> = std::result::Result<T, String>;
 
