@@ -1,0 +1,427 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ShareCraft — Branding (Plan 4B): Implementation Plan</title>
+<style>
+:root{color-scheme:light dark;--ink:light-dark(#172f38,#e4ecef);--muted:light-dark(#536b72,#a9b9bf);--line:light-dark(#d7e2e3,#36454b);--paper:light-dark(#fff,#1d272b);--wash:light-dark(#f2f6f5,#141b1e);--accent:light-dark(#3156c9,#9db4ff);font:15px/1.6 Segoe UI,system-ui,sans-serif;color:var(--ink);background:var(--wash)}
+*{box-sizing:border-box}body{margin:0;padding:28px 18px 80px}main{max-width:940px;margin:auto}
+h1{font-size:1.9rem;letter-spacing:-.03em;line-height:1.2;margin:0 0 14px}h2{font-size:1.3rem;margin:38px 0 12px;padding-top:18px;border-top:1px solid var(--line)}h3{font-size:1.08rem;margin:30px 0 8px}h4{font-size:.95rem;margin:16px 0 6px}
+p{margin:0 0 12px}ul,ol{margin:0 0 12px;padding-left:22px}li{margin-bottom:6px}a{color:var(--accent)}
+code{font-family:Consolas,Menlo,monospace;font-size:.88em;background:light-dark(#e9efee,#263238);padding:1px 5px;border-radius:3px;overflow-wrap:anywhere}
+pre{background:var(--paper);border:1px solid var(--line);border-radius:7px;padding:12px 14px;overflow-x:auto;font:13px/1.5 Consolas,Menlo,monospace;margin:0 0 12px}pre code{background:none;padding:0;font-size:inherit}
+.note{border-left:4px solid var(--accent);background:var(--paper);padding:12px 16px;margin:0 0 14px}.note p:last-child{margin:0}
+.task{background:var(--paper);border:1px solid var(--line);border-radius:9px;padding:6px 20px 14px;margin:18px 0}
+ol.steps{list-style:none;padding-left:0}ol.steps>li{padding-left:28px;position:relative;margin-bottom:10px}ol.steps>li::before{content:"☐";position:absolute;left:2px;color:var(--muted)}
+table{border-collapse:collapse;width:100%;font-size:.9rem;background:var(--paper);margin-bottom:14px}th,td{border:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top}th{background:light-dark(#e8efed,#263238)}
+.small{font-size:.88rem;color:var(--muted)}
+tbody tr:nth-child(even) td{background:light-dark(#f4f8f7,#212b30)}
+ol.steps>li:nth-child(even),ul.band>li:nth-child(even),ol.band>li:nth-child(even){background:light-dark(#f4f8f7,#212b30);border-radius:4px}
+</style>
+</head>
+<body><main>
+<h1>Plan 4B, branding: fonts, copying, templates, limits and tab icons: implementation plan</h1>
+<p class="small">ShareCraft &middot; Stage 2, platform track &middot; Written 15 November 2026</p>
+<div class="note"><p><strong>For agentic workers:</strong> REQUIRED SUB-SKILL: use superpowers:subagent-driven-development or superpowers:executing-plans. Steps are checkboxes.</p></div>
+
+<p><strong>Goal:</strong> plan 4B completes SC-25. It adds:
+<ul>
+<li>font packages, kept in the brand centre and in sites;</li>
+<li>copying a look from another site;</li>
+<li>looks inside site templates and template packages, and applying a look to many sites at once;</li>
+<li>organisation limits on what site owners may choose;</li>
+<li>a browser-tab icon for each site;</li>
+<li>a mega menu style for horizontal navigation.</li>
+</ul></p>
+<p><strong>Architecture:</strong> it builds on plan 4A (merged, <code>6839afc</code>):
+<ul>
+<li><strong>Records:</strong> new fields go on the existing records, <code>org/brand.json</code> and the <code>look</code> and <code>themes</code> fields of site records. Each new field has a default and is left out of the file when it holds that default, so existing records keep their exact bytes.</li>
+<li><strong>Fonts:</strong> font files are snapshots, like brand images. They are pinned in <code>brand_refs</code>, served from a signed-in route, and loaded by pages through the <code>FontFace</code> JavaScript API. That needs no change to the Content Security Policy, because fonts come from the same origin.</li>
+<li><strong>Templates:</strong> templates carry a look. It refers only to brand-centre images and fonts, by their ids, so a template holds no files.</li>
+<li><strong>Limits:</strong> limits are one policy in the brand centre. One server check enforces it on every path that sets a site's look.</li>
+</ul></p>
+<p><strong>Tech stack:</strong> the existing workspace and the pages in <code>web/</code>, including the UX-round modules: <code>look-studio.js</code>, <code>brand-centre.js</code>, <code>new-site-wizard.js</code>, <code>admin-shell.js</code>, <code>menu.js</code> and <code>toast.js</code>. No new dependency.</p>
+<p><strong>Spec:</strong> <a href="../scope.html">scope.html</a>:
+<ul>
+<li>SC-25: fonts; site-level branding and copying; provisioning and API; the brand centre limits; reach (the tab icon);</li>
+<li>D40, the 4B list;</li>
+<li>acceptance test A18 (the parts left after 4A).</li>
+</ul></p>
+
+<h2>Proposals in this plan for the owner to check</h2>
+<p class="small">These are the choices the plan makes. Each is cheap to change before the build starts.</p>
+<ol class="band">
+<li><strong>Font files come from asset libraries, like images.</strong>
+<ul>
+<li>Accepted: <code>woff2</code>, <code>woff</code>, <code>ttf</code> and <code>otf</code>, at most 2 MiB each, judged by their content.</li>
+<li>Whoever adds a font confirms that the organisation holds its licence. The record notes who confirmed it, and when.</li>
+<li>Fonts are never loaded from outside the installation.</li>
+</ul></li>
+<li><strong>A font package pairs a display font with a content font</strong> and maps them to four text roles: title, heading, body and interactive. Every role always falls back to the system fonts.
+<ul>
+<li>Two built-in packages: System (today's look) and Classic, which uses system serif headings and needs no files.</li>
+</ul></li>
+<li><strong>Limits apply to site owners only.</strong> Administrators and brand managers may always choose anything.
+<ul>
+<li>The limits: hide the built-in themes; allow custom colours; allow site-only themes; allow images from the site's own libraries; allow site-only font packages.</li>
+<li>Every limit starts off, so nothing changes until an administrator sets one.</li>
+<li>Looks that already exist keep working. The limits apply to the next change.</li>
+</ul></li>
+<li><strong>Copying a look</strong> needs view access on the site it comes from and <code>manage_site</code> on the site it goes to. It copies the look itself; site-only themes and font packages are copied only when asked.</li>
+<li><strong>Templates carry a look.</strong>
+<ul>
+<li>Saving a template from a site keeps its look, but drops images that came from the site's own libraries, and says which.</li>
+<li>Importing a package drops references to brand-centre images or fonts that this organisation doesn't have, and lists them.</li>
+</ul></li>
+<li><strong>Applying a look to many sites at once is for administrators only.</strong>
+<ul>
+<li>One request covers at most 200 sites. Each site gets its own commit and its own history entry, and the answer reports a result per site.</li>
+<li>Limits don't apply, because an administrator is acting.</li>
+</ul></li>
+<li><strong>The tab icon:</strong>
+<ul>
+<li>A site's look may name an icon image. Without one, the thumbnail is used. Without either, the organisation's default icon from the brand centre is used, and failing that, ShareCraft's own icon.</li>
+<li>Pages outside any site use the organisation's icon.</li>
+</ul></li>
+<li><strong>Mega menu:</strong> horizontal navigation can show each top-level link's children as a full-width panel, in columns, instead of a dropdown list. Audiences still decide who sees each link.</li>
+</ol>
+
+<h2>Not in this plan</h2>
+<ul class="band">
+<li>Branded notification emails and public portals: those features don't exist yet (SC-13, SC-18), so each will use its site's look when it is built.</li>
+<li>A branded sign-in page.</li>
+<li>Variable-font axis controls.</li>
+<li>Fonts inside the editors, whose own pages stay untouched.</li>
+<li>Deferred minor points from plan 4A, unless a task here touches the same code.</li>
+</ul>
+
+<h2>Global constraints</h2>
+<ul class="band">
+<li><strong>Font files:</strong>
+<ul>
+<li>The type is judged by content:
+<ul>
+<li><code>woff2</code> starts with <code>wOF2</code>;</li>
+<li><code>woff</code> with <code>wOFF</code>;</li>
+<li><code>ttf</code> with <code>00 01 00 00</code> or <code>true</code>;</li>
+<li><code>otf</code> with <code>OTTO</code>.</li>
+</ul>
+Anything else answers <code>422 not_a_font</code>.</li>
+<li>Size: at most 2 MiB (<code>413 font_too_large</code>).</li>
+<li>The content must be available (D37).</li>
+<li><code>FontRef = {sha256, media_type (font/woff2 | font/woff | font/ttf | font/otf), bytes, name, from_doc, licence: {confirmed_by, confirmed_at}}</code>.</li>
+<li>The brand centre holds at most 30 font files.</li>
+</ul></li>
+<li><strong>Serving fonts:</strong> <code>GET /api/brand/fonts/{sha256}</code>.
+<ul>
+<li>Signed in only.</li>
+<li><code>404</code> unless <code>brand_refs</code> names the content; <code>423 held</code> if it is not available.</li>
+<li>Headers: the recorded media type, <code>X-Content-Type-Options: nosniff</code>, <code>Content-Security-Policy: sandbox; default-src 'none'</code>, <code>Cache-Control: private, max-age=31536000, immutable</code>, and <code>Cross-Origin-Resource-Policy: same-origin</code>.</li>
+</ul></li>
+<li><strong>A font package:</strong>
+<ul>
+<li>Shape: <code>{id, name (1&ndash;60), display?: FontRef, content?: FontRef, roles: {title, heading, body, interactive}}</code>.</li>
+<li>Each role is one of <code>display</code>, <code>content</code>, <code>system</code> or <code>system-serif</code>, and must not name a font the package lacks.</li>
+<li>Built-in packages:
+<ul>
+<li><code>builtin:system</code>: every role <code>system</code>.</li>
+<li><code>builtin:classic</code>: title and heading <code>system-serif</code>; body and interactive <code>system</code>.</li>
+</ul></li>
+<li>Limits: at most 20 packages in the brand centre and 10 site-only packages per site.</li>
+</ul></li>
+<li><strong>Family names</strong> on the page are generated, never taken from user text: <code>sc-&lt;first 12 hex characters of the sha256&gt;</code>.
+<ul>
+<li>The system stacks are fixed strings in <code>look.js</code>. System: <code>ui-sans-serif, system-ui, 'Segoe UI', sans-serif</code>. System serif: <code>ui-serif, Georgia, 'Times New Roman', serif</code>.</li>
+<li>CSS variables <code>--font-title</code>, <code>--font-heading</code>, <code>--font-body</code> and <code>--font-interactive</code> are set through <code>setProperty</code>, and their values are re-checked against a fixed pattern.</li>
+<li>The account bar, the never-themed list from 4A, code and monospace text keep the system fonts.</li>
+</ul></li>
+<li><strong>Look additions:</strong>
+<ul>
+<li><code>fonts?: {package copy, from: "builtin:&lt;id&gt;" | "org:&lt;id&gt;" | "site:&lt;id&gt;"}</code>;</li>
+<li><code>icon?: ImageRef</code>, which must be png or svg, square within 10 %, at least 32 px for png, and at most 256 KiB;</li>
+<li><code>navigation</code> gains <code>menu: cascading | mega</code> (default <code>cascading</code>); <code>mega</code> applies to horizontal navigation only.</li>
+</ul></li>
+<li><strong>OrgBrand additions:</strong>
+<ul>
+<li><code>fonts: [{id, font: FontRef}]</code>;</li>
+<li><code>font_packages: [...]</code>;</li>
+<li><code>default_icon?: brand image id</code> (kind <code>icon</code>);</li>
+<li><code>policy: {hide_builtin_themes: false, custom_colours: true, site_themes: true, site_images: true, site_fonts: true}</code>.</li>
+</ul></li>
+<li><strong>SiteRecord additions:</strong> <code>font_packages: [...]</code>, left out of the file when empty.</li>
+<li><strong>The policy check:</strong> <code>policy_problems(look, policy, site_themes, actor) -&gt; Vec&lt;Problem&gt;</code>.
+<ul>
+<li>It runs on these paths:
+<ul>
+<li><code>PUT look</code>;</li>
+<li>copy;</li>
+<li>rollback;</li>
+<li>creating site themes and site font packages;</li>
+<li>creating a site from a template, when the creator is not an administrator.</li>
+</ul></li>
+<li>Administrators and brand managers are never limited.</li>
+<li>A refusal answers <code>409 not_allowed {"problems":[...]}</code>, listing each problem in words, for example "custom colours are turned off for site owners".</li>
+<li>A look already stored is never changed by a policy change.</li>
+</ul></li>
+<li><strong>Copying:</strong> <code>POST /api/sites/{id}/look/copy {from: site id, themes?: bool, fonts?: bool}</code>.
+<ul>
+<li>Needs <code>manage_site</code> on the target and view on the source.</li>
+<li>Images and fonts are pinned to the target as snapshots, in one commit.</li>
+<li>The change is recorded as <code>site.look_changed</code> with <code>copied_from</code>.</li>
+<li>An archived target answers <code>403 archived</code>.</li>
+</ul></li>
+<li><strong>Templates:</strong> <code>TemplateBody</code> gains <code>look?: TemplateLook</code>.
+<ul>
+<li><code>TemplateLook</code> is a look whose images and fonts are references: <code>{brand_image: id}</code> or <code>{brand_font: id}</code>.</li>
+<li>Saving from a site turns pinned snapshots that match a brand-centre entry into references, and drops the rest. The answer lists them as <code>dropped: [{slot, name}]</code>.</li>
+<li>Creating a site from a template resolves the references, pins them and writes the look in the site's first commit. Unresolved references are dropped and reported in the create answer.</li>
+<li>Importing a package keeps unresolved references out, and reports them.</li>
+</ul></li>
+<li><strong>Applying to many sites:</strong> <code>POST /api/admin/looks/apply {sites: [id] (1&ndash;200), source: {look} | {from_site} | {template}}</code>.
+<ul>
+<li>Administrators only.</li>
+<li>Processed one site at a time, each with its own commit and history entry.</li>
+<li>The answer is <code>{results: [{site, ok, error?}]}</code>.</li>
+<li>Archived sites are skipped with <code>archived</code>.</li>
+</ul></li>
+<li><strong>Effective look additions</strong> (<code>GET /api/sites/{id}/look</code>):
+<ul>
+<li><code>fonts: {title, heading, body, interactive}</code>, each <code>{family, url?}</code>, where <code>url</code> is <code>/api/brand/fonts/{sha256}</code>;</li>
+<li><code>icon_url</code>;</li>
+<li><code>navigation_menu</code>.</li>
+</ul>
+The hub rule from 4A also covers fonts: a site in a hub takes the hub's fonts as well as its theme.</li>
+<li><strong>Organisation brand route:</strong> <code>GET /api/brand</code> adds fonts, font packages, the policy and <code>default_icon_url</code>.
+<ul>
+<li><code>PUT /api/brand/policy</code>: administrators only.</li>
+<li>Font routes: <code>POST/DELETE /api/brand/fonts[/{id}]</code> and <code>POST/PATCH/DELETE /api/brand/font-packages[/{id}]</code>, for brand managers and administrators.</li>
+<li>Site font packages: <code>POST/PATCH/DELETE /api/sites/{id}/font-packages[/{id}]</code>, needing <code>manage_site</code> and the policy.</li>
+</ul></li>
+<li><strong>Events:</strong>
+<ul>
+<li><code>brand.font_changed</code>;</li>
+<li><code>brand.font_package_changed</code>;</li>
+<li><code>brand.policy_changed</code> (before and after);</li>
+<li><code>site.look_changed</code> with <code>copied_from</code> or <code>applied_by_admin</code>;</li>
+<li><code>site.font_package_changed</code>.</li>
+</ul></li>
+<li><strong>Errors</strong> (each with a plain-English message in <code>common.js</code>):
+<ul>
+<li><code>not_a_font</code> 422</li>
+<li><code>font_too_large</code> 413</li>
+<li><code>licence_not_confirmed</code> 422</li>
+<li><code>invalid_font_package</code> 422 <code>{"reason"}</code></li>
+<li><code>not_allowed</code> 409 <code>{"problems"}</code></li>
+<li><code>not_an_icon</code> 422</li>
+<li><code>too_many</code> 409</li>
+<li><code>name_taken</code> 409</li>
+</ul></li>
+<li><strong>Pinning:</strong> fonts use <code>brand_refs</code> exactly as images do. The owner is <code>org</code> or a site id, written in the same transaction with the blob locked <code>FOR SHARE</code>, and reconcile rebuilds it from Git. A template's references pin nothing until a site is created from it.</li>
+<li><strong>Upgrade:</strong> no migration is expected, because the new fields live in the existing jsonb columns. If a task finds it needs one, it adds <code>0016_brand_fonts.sql</code>, and BUILDING says so. Existing records keep their exact bytes.</li>
+</ul>
+
+<h2>Review focus</h2>
+<ol class="band">
+<li><strong>A font file can never run code or inject style.</strong> Covered by Task 1 (<code>font_sniffing</code>) and Task 2 (<code>font_inputs_never_run</code>):
+<ul>
+<li>an HTML or SVG file renamed <code>.woff2</code>;</li>
+<li>a font name holding <code>"; } body { display:none</code>;</li>
+<li>a package name with markup;</li>
+<li>a <code>--font-*</code> value that is not generated.</li>
+</ul>
+Each is refused or shown as text, and the page sets only generated family names.</li>
+<li><strong>The limits hold on every path that sets a look:</strong> PUT, copy, rollback, site themes and font packages, template create by a non-administrator, and the bulk apply bypass for administrators only. Covered by Task 2, <code>policy_holds_on_every_path</code>.</li>
+<li><strong>Fonts are pinned and released exactly like images:</strong> when the source file is deleted and its bin emptied, a package is deleted while a look uses its fonts, a look is copied, a site is purged, a template-created site is made, or reconcile runs. Covered by Task 2, <code>fonts_pinned_until_unreferenced</code>, and Task 3, <code>template_sites_pin_their_fonts</code>.</li>
+<li><strong>Templates never smuggle files or leak site-only content</strong> into other sites: saving from a site with site-library images; importing a package from another organisation with unknown ids; a template made by an administrator used by a site owner under limits. Covered by Task 3, <code>templates_carry_only_brand_centre_references</code>.</li>
+<li><strong>Mega menus stay accessible and respect audiences:</strong> keyboard (disclosure pattern, Escape, Tab out), screen-reader names, 375 px (falls back to the Menu drawer), and audience-hidden children never sent to people outside the audience. Covered by Task 4, <code>mega_menu_keyboard_and_audiences</code>.</li>
+</ol>
+
+<div class="task">
+<h3>Task 1: records, font sniffing and the policy check (pure code)</h3>
+<p><strong>Files:</strong>
+<ul>
+<li><strong>Modify:</strong> <code>crates/revisions/src/brand.rs</code> (<code>FontRef</code>, <code>FontPackage</code>, <code>FontRole</code>, <code>BrandPolicy</code>, <code>TemplateLook</code>, and <code>Look</code>/<code>OrgBrand</code>/<code>Navigation</code> additions), <code>crates/revisions/src/sites.rs</code> (<code>SiteRecord.font_packages</code>, <code>TemplateBody.look</code>), <code>web/look.js</code> (<code>fontTokens</code>, fixed stacks), <code>web/look-vectors.json</code>, <code>web/look.test.mjs</code>.</li>
+</ul></p>
+<ul class="band">
+<li><code>sniff_font(bytes: &amp;[u8]) -&gt; Option&lt;FontKind&gt;</code>.</li>
+<li><code>FontPackage::problem()</code>.</li>
+<li><code>BrandPolicy::default()</code>, with every limit off.</li>
+<li><code>policy_problems(look, policy, site_themes, site_packages, actor: Actor) -&gt; Vec&lt;String&gt;</code>, where <code>Actor</code> is <code>Owner</code>, <code>BrandManager</code> or <code>Admin</code>.</li>
+<li><code>family_name(sha256) -&gt; String</code>.</li>
+<li><code>icon_problem(&amp;ImageRef)</code>.</li>
+<li>In JS: <code>fontTokens(effectiveFonts)</code> returns only <code>--font-*</code> values built from the fixed stacks and <code>sc-[0-9a-f]{12}</code> names.</li>
+</ul>
+<ol class="steps">
+<li>Write failing tests:
+<ul>
+<li><code>font_sniffing</code> (each kind, a renamed HTML file, an SVG, an empty file, a 3-byte file)</li>
+<li><code>font_package_problems</code></li>
+<li><code>policy_problems_by_actor</code></li>
+<li><code>new_fields_keep_existing_bytes</code> (4A records round-trip unchanged)</li>
+<li><code>icon_problems</code></li>
+<li><code>family_names_are_generated</code></li>
+</ul>
+And in JS:
+<ul>
+<li><code>font_tokens_only_generated_values</code></li>
+<li><code>font_tokens_fall_back_to_system</code></li>
+</ul></li>
+<li>Run: they fail. Implement. Run <code>cargo xtask check</code> and the web tests: they pass.</li>
+<li>Commit <code>feat: font packages, brand policy and template looks in the records</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 2: fonts, limits, copying and the tab icon on the server</h3>
+<p><strong>Files:</strong>
+<ul>
+<li><strong>Create:</strong> <code>crates/server/tests/brand_fonts.rs</code>, <code>crates/server/tests/brand_policy.rs</code>.</li>
+<li><strong>Modify:</strong> <code>crates/server/src/brand.rs</code> (<code>font_from_doc</code>, pins), <code>crates/server/src/api/brand.rs</code>, <code>crates/server/src/looks.rs</code> and <code>api/looks.rs</code> (policy on every path, copy, effective fonts/icon/menu, site font packages), <code>crates/records/src/brand.rs</code> (font pins), <code>crates/server/src/api/mod.rs</code>, <code>crates/server/tests/archive.rs</code> (new routes in the archive table).</li>
+</ul></p>
+<ol class="steps">
+<li>Write failing tests:
+<ul>
+<li><code>fonts_added_from_asset_libraries_need_licence_confirmation</code></li>
+<li><code>font_type_judged_by_content</code></li>
+<li><code>font_route_headers</code></li>
+<li><code>font_inputs_never_run</code></li>
+<li><code>fonts_pinned_until_unreferenced</code></li>
+<li><code>font_packages_org_and_site</code> (limits, <code>name_taken</code>, roles naming missing fonts)</li>
+<li><code>policy_set_by_admins_only</code></li>
+<li><code>policy_holds_on_every_path</code></li>
+<li><code>existing_looks_survive_a_policy_change</code></li>
+<li><code>copy_look_needs_view_and_manage</code></li>
+<li><code>copy_pins_snapshots_and_records_history</code></li>
+<li><code>effective_look_carries_fonts_icon_and_menu</code> (hub rule included)</li>
+<li><code>icon_falls_back_thumbnail_then_org_default</code></li>
+<li><code>reconcile_rebuilds_font_pins</code></li>
+</ul></li>
+<li>Run: they fail. Implement. Run <code>cargo xtask check</code>: it passes.</li>
+<li>Commit <code>feat: brand fonts, owner limits, copying looks and tab icons</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 3: looks in templates and applying to many sites</h3>
+<p><strong>Files:</strong>
+<ul>
+<li><strong>Create:</strong> <code>crates/server/tests/template_looks.rs</code>.</li>
+<li><strong>Modify:</strong> <code>crates/server/src/templates.rs</code> (save, package export/import, <code>shape_for</code> applying the look), <code>crates/server/src/sites.rs</code> (create writes the look in the first commit), <code>crates/server/src/api/brand.rs</code> or a new <code>api/admin_looks.rs</code> (bulk apply), <code>crates/server/src/api/mod.rs</code>.</li>
+</ul></p>
+<ol class="steps">
+<li>Write failing tests:
+<ul>
+<li><code>saving_a_template_keeps_the_look_as_references</code> (site-library images dropped and listed)</li>
+<li><code>templates_carry_only_brand_centre_references</code></li>
+<li><code>package_import_reports_unknown_references</code></li>
+<li><code>template_sites_pin_their_fonts</code> (and images)</li>
+<li><code>template_create_respects_policy_for_owners</code></li>
+<li><code>bulk_apply_is_for_admins</code></li>
+<li><code>bulk_apply_reports_per_site</code> (an archived site, a missing site, 201 sites refused)</li>
+<li><code>bulk_apply_records_history_per_site</code></li>
+<li><code>built_in_templates_unchanged</code></li>
+</ul></li>
+<li>Run: they fail. Implement. Run <code>cargo xtask check</code>: it passes.</li>
+<li>Commit <code>feat: looks in templates and applying a look to many sites</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 4: pages: fonts, tab icon and mega menu on every site page</h3>
+<p><strong>Files:</strong>
+<ul>
+<li><strong>Modify:</strong> <code>web/common.js</code> (<code>siteChrome</code>: load fonts with <code>FontFace</code> from the effective look, set <code>--font-*</code>, set the tab icon <code>&lt;link rel="icon"&gt;</code>, choose the mega menu; plain-English messages for the new errors), <code>web/look.js</code>, <code>web/style.css</code> (font roles on titles, headings, body and controls through the tokens; the mega panel), <code>web/navigation.js</code> (mega rendering helpers), <code>web/common.test.mjs</code>, <code>web/navigation.test.mjs</code>.</li>
+</ul></p>
+<ul class="band">
+<li><strong>Font loading:</strong> fonts load with <code>font-display: swap</code> semantics. A font that fails to load leaves the system stack, with no error shown to readers.</li>
+<li><strong>Tab icon:</strong> organisation pages use the organisation icon, or ShareCraft's own.</li>
+<li><strong>Mega menu:</strong>
+<ul>
+<li>Each top-level item with children is a disclosure button opening a full-width panel, with children in columns (headings for second-level items that have their own children).</li>
+<li>Keys: Escape closes and returns focus; arrows move between top-level buttons; Tab moves through panel links.</li>
+<li>Below 700 px it falls back to the existing Menu drawer.</li>
+</ul></li>
+</ul>
+<ol class="steps">
+<li>Write failing tests:
+<ul>
+<li><code>fonts_applied_only_from_generated_names</code></li>
+<li><code>font_failure_keeps_system_stack</code></li>
+<li><code>tab_icon_set_and_replaced</code></li>
+<li><code>mega_menu_keyboard_and_audiences</code> (audience-filtered input shown as given; no hidden child rendered)</li>
+<li><code>mega_menu_falls_back_on_phones</code></li>
+<li><code>account_bar_keeps_system_fonts</code></li>
+</ul></li>
+<li>Run: they fail. Implement. Run the web tests and <code>cargo xtask check</code>: they pass.</li>
+<li>Commit <code>feat: pages use the site's fonts, tab icon and mega menu</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 5: pages: brand centre, look studio, templates and bulk apply</h3>
+<p><strong>Files:</strong>
+<ul>
+<li><strong>Modify:</strong> <code>web/brand-centre.html</code>/<code>.js</code>, <code>web/site-look.html</code>/<code>.js</code> with <code>web/look-studio.js</code>, <code>web/new-site-wizard.js</code> and <code>web/new-site.js</code>, <code>web/templates.html</code>/<code>.js</code>, <code>web/admin-sites.html</code>/<code>.js</code>, <code>web/image-picker.js</code> (a font mode), and their tests.</li>
+</ul></p>
+<ul class="band">
+<li><strong>Brand centre:</strong>
+<ul>
+<li>A Fonts section: add from the asset library picker in font mode; a licence confirmation checkbox, required; each font shown with a live specimen ("The quick brown fox…" in that font, loaded through <code>FontFace</code>); remove.</li>
+<li>Font packages: create and edit with a role mapping and a live specimen of title, heading, body and button.</li>
+<li>A Default tab icon slot.</li>
+<li>A "Limits for site owners" section for administrators: five switches with plain-English explanations, saved with a toast.</li>
+</ul></li>
+<li><strong>Look studio:</strong>
+<ul>
+<li>A Fonts tab: a package gallery with specimens, and site packages if allowed.</li>
+<li>An Icon slot in the Header tab.</li>
+<li>A Menu style chooser (Dropdown / Mega) in the Navigation tab, shown for horizontal navigation.</li>
+<li>"Copy from another site…": a dialog listing the sites the person can view, with options for site themes and font packages, previewed as a draft before Apply.</li>
+<li>Choices the limits forbid are disabled, with the reason, and never hidden silently.</li>
+</ul></li>
+<li><strong>Templates:</strong>
+<ul>
+<li>The admin list shows each template's look as a swatch and font sample.</li>
+<li>Saving a template reports dropped images.</li>
+<li>Import reports unresolved references.</li>
+<li>The New site wizard's template cards show the template's look.</li>
+</ul></li>
+<li><strong>Admin Sites:</strong> select sites, then "Apply a look…": a dialog choosing from a site, a template or the brand centre's themes and packages, with a preview; a progress list with per-site results and a summary toast.</li>
+</ul>
+<ol class="steps">
+<li>Write failing tests:
+<ul>
+<li><code>licence_checkbox_required</code></li>
+<li><code>specimen_uses_generated_family</code></li>
+<li><code>limits_disable_with_reasons</code></li>
+<li><code>copy_dialog_loads_draft_only</code></li>
+<li><code>bulk_apply_summary</code></li>
+<li><code>template_card_shows_look</code></li>
+</ul></li>
+<li>Run: they fail. Implement. Run the web tests and <code>cargo xtask check</code>: they pass.</li>
+<li>Commit <code>feat: fonts, limits, copying, template looks and bulk apply in the pages</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 6 (controller): browser check and documents</h3>
+<ol class="steps">
+<li>Back up the data folder and the database, build the server into J:, and start the preview.</li>
+<li>Check the rest of A18, recording each check as done or not:
+<ol>
+<li>As a brand manager, add two fonts (licence confirmed) and make a package.</li>
+<li>As a site owner, apply it and see headings and body change on the site pages but not in the account bar or the editors.</li>
+<li>Set a tab icon.</li>
+<li>Switch to a mega menu, and use it by keyboard and at 375 px.</li>
+<li>Copy branding to a second site.</li>
+<li>Save a template from the branded site and create a site from it.</li>
+<li>As an administrator, turn on two limits and see the owner's choices disabled with reasons.</li>
+<li>Apply a look to two sites at once.</li>
+<li>Light and dark mode.</li>
+</ol></li>
+<li>Update the documents:
+<ul>
+<li>BUILDING.html: a section after 28 for 4B.</li>
+<li>scope.html: the proposals as D46 to D53.</li>
+<li>sequencing.html: the progress note.</li>
+</ul></li>
+<li>Commit <code>docs: branding (plan 4B)</code>.</li>
+</ol></div>
+</main></body>
+</html>
