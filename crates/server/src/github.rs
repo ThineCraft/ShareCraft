@@ -7,8 +7,10 @@
 //! error. Redirects are followed only to the API's own host or to `codeload.github.com`,
 //! where GitHub sends tarball downloads.
 
+use std::cell::Cell;
 use std::io::{self, Read};
 use std::path::Path;
+use std::rc::Rc;
 use std::time::Duration;
 
 use reqwest::header::{
@@ -688,18 +690,86 @@ pub struct TarLimits {
 /// # Errors
 /// Any error reading the file or from `f`. `InvalidData` for a path that is not UTF-8, starts
 /// with `/`, holds a backslash, a `:` (a drive or stream), an empty, `.` or `..` component, or
-/// lies outside one top folder. `FileTooLarge` when an entry, the total, or the number of
-/// entries passes `limits`. Nothing is passed to `f` after the first error.
+/// lies outside one top folder, or holds a control character. `FileTooLarge` when an entry,
+/// the total, or the number of entries passes `limits`, or when the decompressed stream
+/// (headers and padding included) passes the total with room for headers. Nothing is passed to `f` after the first error.
 pub fn for_each_in_tarball(
     path: &Path,
     limits: &TarLimits,
     f: &mut dyn FnMut(&str, &mut dyn Read, u64) -> io::Result<()>,
 ) -> io::Result<()> {
-    let invalid = |why: &str| io::Error::new(io::ErrorKind::InvalidData, why.to_owned());
-    let too_large = |why: &str| io::Error::new(io::ErrorKind::FileTooLarge, why.to_owned());
     let file = std::fs::File::open(path)?;
     let gz = flate2::read::GzDecoder::new(io::BufReader::new(file));
-    let mut archive = tar::Archive::new(gz);
+    let tripped = Rc::new(Cell::new(false));
+    let capped = Capped {
+        inner: gz,
+        left: decompressed_cap(limits),
+        tripped: tripped.clone(),
+    };
+    let result = read_entries(tar::Archive::new(capped), limits, f);
+    // Whatever error the cap surfaced as (tar may wrap it), it is reported as the cap.
+    if result.is_err() && tripped.get() {
+        return Err(too_large(TOO_MUCH_EXPANSION));
+    }
+    result
+}
+
+/// The fixed message for a tarball that expands past its limits.
+const TOO_MUCH_EXPANSION: &str = "the tarball expands to more than the limit allows";
+/// Room allowed per entry, beyond its contents, for its header, extension headers (a long
+/// name or pax record) and padding.
+const PER_ENTRY_OVERHEAD: u64 = 4096;
+/// Room allowed once, beyond everything else, for the end of the archive.
+const ARCHIVE_OVERHEAD: u64 = 1 << 20;
+
+/// The most decompressed bytes a tarball within `limits` can hold, with room for headers.
+fn decompressed_cap(limits: &TarLimits) -> u64 {
+    let entries = u64::try_from(limits.max_entries).unwrap_or(u64::MAX);
+    limits
+        .max_total_bytes
+        .saturating_add(entries.saturating_mul(PER_ENTRY_OVERHEAD))
+        .saturating_add(ARCHIVE_OVERHEAD)
+}
+
+fn too_large(why: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::FileTooLarge, why.to_owned())
+}
+
+/// A reader that fails once more than `left` bytes have come through it, so nothing read
+/// from it (a header, an extension header tar reads whole into memory, padding or a skipped
+/// entry) can expand past the cap. Records in `tripped` that it failed.
+struct Capped<R> {
+    inner: R,
+    left: u64,
+    tripped: Rc<Cell<bool>>,
+}
+
+impl<R: Read> Read for Capped<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.tripped.get() {
+            return Err(too_large(TOO_MUCH_EXPANSION));
+        }
+        let n = self.inner.read(buf)?;
+        match self.left.checked_sub(n as u64) {
+            Some(left) => {
+                self.left = left;
+                Ok(n)
+            }
+            None => {
+                self.tripped.set(true);
+                Err(too_large(TOO_MUCH_EXPANSION))
+            }
+        }
+    }
+}
+
+/// The loop of [`for_each_in_tarball`] over `archive`.
+fn read_entries<R: Read>(
+    mut archive: tar::Archive<R>,
+    limits: &TarLimits,
+    f: &mut dyn FnMut(&str, &mut dyn Read, u64) -> io::Result<()>,
+) -> io::Result<()> {
+    let invalid = |why: &str| io::Error::new(io::ErrorKind::InvalidData, why.to_owned());
     let mut top: Option<String> = None;
     let mut entries: usize = 0;
     let mut total: u64 = 0;
@@ -719,9 +789,7 @@ pub fn for_each_in_tarball(
         }
         total = total.saturating_add(size);
         if total > limits.max_total_bytes {
-            return Err(too_large(
-                "the tarball expands to more than the limit allows",
-            ));
+            return Err(too_large(TOO_MUCH_EXPANSION));
         }
         if !entry.header().entry_type().is_file() {
             continue;
@@ -752,7 +820,13 @@ fn repository_path(text: &str) -> Option<(&str, &str)> {
     if text.starts_with('/') || text.contains('\\') {
         return None;
     }
-    let plain = |part: &str| !part.is_empty() && part != "." && part != ".." && !part.contains(':');
+    let plain = |part: &str| {
+        !part.is_empty()
+            && part != "."
+            && part != ".."
+            && !part.contains(':')
+            && !part.bytes().any(|b| b.is_ascii_control())
+    };
     if !text.split('/').all(plain) {
         return None;
     }

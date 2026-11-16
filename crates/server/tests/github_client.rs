@@ -655,3 +655,129 @@ async fn a_bare_403_is_a_rate_limit_only_when_it_says_so() {
     let text = format!("{err:?}{err}");
     assert!(!text.contains("Resource not accessible"), "{text}");
 }
+
+/// What an extension header written by [`extension_tarball`] holds.
+enum Payload<'a> {
+    Bytes(&'a [u8]),
+    /// This many zero bytes, written in pieces (they compress to almost nothing).
+    Zeros(u64),
+}
+
+/// A gzipped tarball at a new path in `dir`: one extension header of `kind` (a GNU long name,
+/// or a pax local header) carrying `payload`, then the regular file `top/after.md`.
+fn extension_tarball(
+    dir: &std::path::Path,
+    kind: tar::EntryType,
+    payload: Payload<'_>,
+) -> std::path::PathBuf {
+    use std::io::Write;
+    let path = dir.join(format!("x{}.tar.gz", uuid::Uuid::new_v4().simple()));
+    let file = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
+    let mut gz = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
+    let block = |gz: &mut dyn Write, name: &[u8], kind: tar::EntryType, size: u64| {
+        let mut header = tar::Header::new_gnu();
+        header.as_gnu_mut().unwrap().name[..name.len()].copy_from_slice(name);
+        header.set_entry_type(kind);
+        header.set_mode(0o644);
+        header.set_size(size);
+        header.set_cksum();
+        gz.write_all(header.as_bytes()).unwrap();
+    };
+    let pad = |gz: &mut dyn Write, size: u64| {
+        let rest = (512 - size % 512) % 512;
+        gz.write_all(&vec![0u8; rest as usize]).unwrap();
+    };
+    let size = match payload {
+        Payload::Bytes(bytes) => bytes.len() as u64,
+        Payload::Zeros(n) => n,
+    };
+    block(&mut gz, b"././@LongLink", kind, size);
+    match payload {
+        Payload::Bytes(bytes) => gz.write_all(bytes).unwrap(),
+        Payload::Zeros(n) => {
+            let piece = vec![0u8; 1 << 20];
+            let mut left = n;
+            while left > 0 {
+                let now = left.min(piece.len() as u64);
+                gz.write_all(&piece[..now as usize]).unwrap();
+                left -= now;
+            }
+        }
+    }
+    pad(&mut gz, size);
+    block(&mut gz, b"top/after.md", tar::EntryType::Regular, 1);
+    gz.write_all(b"x").unwrap();
+    pad(&mut gz, 1);
+    gz.write_all(&[0u8; 1024]).unwrap();
+    gz.finish().unwrap().flush().unwrap();
+    path
+}
+
+#[test]
+fn a_huge_extension_header_is_refused_before_it_is_read_into_memory() {
+    let dir = tempfile::tempdir().unwrap();
+    let limits = TarLimits {
+        max_entry_bytes: 1 << 20,
+        max_total_bytes: 1 << 20,
+        max_entries: 100,
+    };
+    for kind in [tar::EntryType::GNULongName, tar::EntryType::XHeader] {
+        // 256 MiB of zeros declared in one header; a few hundred KiB once compressed.
+        let path = extension_tarball(dir.path(), kind, Payload::Zeros(256 << 20));
+        assert!(std::fs::metadata(&path).unwrap().len() < 2 << 20);
+        let started = std::time::Instant::now();
+        let (seen, result) = read_all(&path, &limits);
+        let err = result.expect_err("a huge extension header was accepted");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::FileTooLarge,
+            "{kind:?}: {err}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "the tarball expands to more than the limit allows",
+            "{kind:?}"
+        );
+        assert!(seen.is_empty(), "{kind:?}: {seen:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{kind:?} took {:?}",
+            started.elapsed()
+        );
+    }
+}
+
+#[test]
+fn control_characters_in_tarball_paths_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    for bad in [
+        &b"top/a\x01b"[..],
+        b"top/a\x1fb",
+        b"top/a\x7fb",
+        b"top/a\tb",
+    ] {
+        let path = raw_tarball(
+            dir.path(),
+            &[
+                (b"top/first.md", b"1"),
+                (bad, b"bad"),
+                (b"top/later.md", b"2"),
+            ],
+        );
+        let (seen, result) = read_all(&path, &ROOMY);
+        let shown = String::from_utf8_lossy(bad);
+        let err = result.expect_err(&format!("{shown:?} was accepted"));
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{shown:?}");
+        assert_eq!(seen, ["first.md"], "{shown:?}");
+    }
+    // NUL cannot end a short name early, but a GNU long name can carry one inside it.
+    let path = extension_tarball(
+        dir.path(),
+        tar::EntryType::GNULongName,
+        Payload::Bytes(b"top/a\0b.md\0"),
+    );
+    let (seen, result) = read_all(&path, &ROOMY);
+    let err = result.expect_err("a NUL in a path was accepted");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(seen.is_empty(), "{seen:?}");
+}
