@@ -188,6 +188,20 @@ async fn wait_scan(site: &Site, bytes: &[u8], done: impl Fn(ScanState) -> bool) 
     }
 }
 
+/// Runs one round of due scans as of `now`, waiting first for the scan that just recorded its
+/// result to let go of the content: `wait_scan` can see a result before that scan has finished,
+/// and `scan_once` leaves content still being scanned to that scan.
+async fn rescan(state: &server::AppState, now: OffsetDateTime) {
+    let deadline = tokio::time::Instant::now() + SCAN_WAIT;
+    while server::scan_once(state, now).await == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no scan became due as of {now}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 async fn state_of(site: &Site, bytes: &[u8]) -> Option<records::ScanInfo> {
     site.records_db().scan_state(&sha(bytes)).await.unwrap()
 }
@@ -1435,7 +1449,7 @@ async fn scanner_failures_hold_and_retry() {
         state_of(&server, &refused).await.unwrap().state,
         ScanState::Failed
     );
-    server::scan_once(
+    rescan(
         &state,
         OffsetDateTime::now_utc() + time::Duration::minutes(2),
     )
@@ -1464,7 +1478,7 @@ async fn scanner_failures_hold_and_retry() {
     let (status, _) = download(&server, &ann, &doc).await;
     assert_eq!(status, StatusCode::LOCKED);
     fake.set(Behaviour::default());
-    server::scan_once(
+    rescan(
         &state,
         OffsetDateTime::now_utc() + time::Duration::minutes(2),
     )
@@ -1485,7 +1499,7 @@ async fn scanner_failures_hold_and_retry() {
     let (status, _) = download(&server, &ann, &doc).await;
     assert_eq!(status, StatusCode::LOCKED);
     fake.set(Behaviour::default());
-    server::scan_once(
+    rescan(
         &state,
         OffsetDateTime::now_utc() + time::Duration::minutes(2),
     )
@@ -1520,7 +1534,7 @@ async fn scanner_failures_hold_and_retry() {
     let (status, _) = download(&server, &ann, &doc).await;
     assert_eq!(status, StatusCode::LOCKED);
     fake.set(Behaviour::default());
-    server::scan_once(
+    rescan(
         &state,
         OffsetDateTime::now_utc() + time::Duration::minutes(2),
     )
@@ -1548,7 +1562,7 @@ async fn scanner_failures_hold_and_retry() {
     let (status, _) = download(&server, &ann, &doc).await;
     assert_eq!(status, StatusCode::LOCKED);
     let fake = fake_on(port, &Behaviour::default());
-    server::scan_once(
+    rescan(
         &state,
         OffsetDateTime::now_utc() + time::Duration::minutes(2),
     )
@@ -1576,7 +1590,7 @@ async fn scanner_failures_hold_and_retry() {
             .next_scan_at
             .unwrap()
             + time::Duration::seconds(1);
-        server::scan_once(&state, now).await;
+        rescan(&state, now).await;
         let info = state_of(&server, &failing).await.unwrap();
         assert_eq!(info.state, ScanState::Failed);
         assert_eq!(info.attempts, attempts);
@@ -1591,7 +1605,7 @@ async fn scanner_failures_hold_and_retry() {
     // The content was never lost.
     assert!(server.blobs().contains(&sha(&failing)));
     fake.set(Behaviour::default());
-    server::scan_once(&state, now + time::Duration::minutes(61)).await;
+    rescan(&state, now + time::Duration::minutes(61)).await;
     assert_eq!(
         state_of(&server, &failing).await.unwrap().state,
         ScanState::Clean
