@@ -670,6 +670,29 @@ async fn archived_site_refuses_every_write() {
                 format!("/api/sites/{site}/themes/{}", Uuid::new_v4()),
                 None,
             ),
+            // Copying a look in, and the site's own font packages.
+            write(
+                Method::POST,
+                format!("/api/sites/{site}/look/copy"),
+                Some(json!({ "from": other })),
+            ),
+            write(
+                Method::POST,
+                format!("/api/sites/{site}/font-packages"),
+                Some(json!({ "name": "Ours", "roles": {
+                    "title": "system-serif", "heading": "system-serif",
+                    "body": "system", "interactive": "system" } })),
+            ),
+            write(
+                Method::PATCH,
+                format!("/api/sites/{site}/font-packages/{}", Uuid::new_v4()),
+                Some(json!({ "name": "Mine" })),
+            ),
+            write(
+                Method::DELETE,
+                format!("/api/sites/{site}/font-packages/{}", Uuid::new_v4()),
+                None,
+            ),
             write(
                 Method::POST,
                 format!("/api/nodes/{site}/children"),

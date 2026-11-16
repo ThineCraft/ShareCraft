@@ -37,7 +37,9 @@ pub use accounts::{
 pub use adoption::{Adoption, Unplaced};
 pub use bin::{BIN_DAYS, BinCursor, BinEntry, BinStage, BinState};
 pub use blobs::{BLOB_REFS_DIRTY, BLOB_REFS_UPGRADE, ClaimId, StaleClaim};
-pub use brand::{BRAND_CENTRE_OWNER, BrandChange, BrandNeeds, LookChange};
+pub use brand::{
+    BRAND_CENTRE_OWNER, BrandChange, BrandNeeds, LookChange, Pin, org_pins, site_pins,
+};
 pub use db::{Db, DbError};
 pub use documents::{AccessError, Document, Editor, Grant, validate_document_name};
 pub use events::{Event, NewEvent};

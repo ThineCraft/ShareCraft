@@ -1,12 +1,18 @@
-//! The organisation's brand centre: its themes, brand images and brand managers, recorded in
+//! The organisation's brand centre: its themes, brand images, fonts, font packages, default
+//! tab icon, the limits on site owners (the brand policy) and the brand managers, recorded in
 //! Git at `org/brand.json` (see [`revisions::brand`]) and mirrored into PostgreSQL, and
-//! choosing a brand image from a document.
+//! choosing a brand image or font file from a document.
 //!
 //! Each change is one commit, written under the tree lock, then mirrored with its event
-//! (`brand.theme_changed`, `brand.image_changed` or `brand.managers_changed`), judged again
-//! there; a refused change is taken back by a second commit, and a database failure after
-//! judging is repaired from Git once or leaves the tree marked out of step. The start-up
-//! reconcile rebuilds the mirror and the centre's image pins from Git (see [`reconcile`]).
+//! (`brand.theme_changed`, `brand.image_changed`, `brand.font_changed`,
+//! `brand.font_package_changed`, `brand.policy_changed` or `brand.managers_changed`), judged
+//! again there; a refused change is taken back by a second commit, and a database failure
+//! after judging is repaired from Git once or leaves the tree marked out of step. The start-up
+//! reconcile rebuilds the mirror and the centre's pins from Git (see [`reconcile`]).
+//!
+//! A font file is a snapshot as an image is, chosen only once the person adding it confirms
+//! the organisation holds its licence; its type is judged by its first bytes, and a page loads
+//! it under a family name made from its hash, never from its name.
 //!
 //! A brand image is a snapshot: choosing one records its content's hash, type, size and
 //! dimensions, and pins the content in the content store, so a later change to the file or
@@ -23,12 +29,14 @@ use std::sync::atomic::Ordering;
 use collab_core::ids::{DocId, NodeId};
 use records::{
     AccessError, BRAND_CENTRE_OWNER, BrandChange, BrandNeeds, Db, DbError, LibraryKind, NewEvent,
-    Perms, User,
+    Perms, User, org_pins,
 };
 use revisions::brand::{
-    BrandImage, Colour, FailedPair, ImageKind, ImageRef, MAX_IMAGE_NAME_CHARS, MAX_IMAGE_SIDE,
-    MAX_MANAGERS, MAX_ORG_IMAGES, MAX_ORG_THEMES, OrgBrand, OrgTheme, Theme, check_theme,
-    clean_text,
+    Actor, BrandFont, BrandImage, BrandPolicy, Colour, FailedPair, FontPackage, FontRef, FontRole,
+    FontRoles, ImageKind, ImageRef, Licence, MAX_FONT_BYTES, MAX_IMAGE_NAME_CHARS, MAX_IMAGE_SIDE,
+    MAX_MANAGERS, MAX_ORG_FONT_PACKAGES, MAX_ORG_FONTS, MAX_ORG_IMAGES, MAX_ORG_THEMES,
+    MAX_THEME_NAME_CHARS, OrgBrand, OrgTheme, Theme, check_theme, clean_text, icon_problem,
+    sniff_font,
 };
 use revisions::{CheckpointError, Content, GitError};
 use serde_json::{Value, json};
@@ -56,6 +64,11 @@ pub(crate) enum BrandError {
     /// `409 image_gone {"slots"}`: the content of the images in these slots of a look is no
     /// longer stored.
     ImagesGone(Vec<&'static str>),
+    /// `422 invalid_font_package {"reason"}`: a font package breaks one of its rules.
+    InvalidFontPackage(String),
+    /// `409 not_allowed {"problems"}`: the brand policy does not let this person make this
+    /// change; each problem in words.
+    NotAllowed(Vec<String>),
 }
 
 impl From<ApiError> for BrandError {
@@ -375,6 +388,92 @@ pub(crate) async fn image_from_doc(
     kind: ImageKind,
     site: Option<NodeId>,
 ) -> Result<ImageRef, ApiError> {
+    let chosen = doc_content(
+        state,
+        actor,
+        doc,
+        site,
+        (
+            kind.max_bytes(),
+            ApiError::NotAnImage,
+            ApiError::ImageTooLarge,
+        ),
+    )
+    .await?;
+    let (media_type, size) = judge_image(&chosen.bytes)?;
+    Ok(ImageRef {
+        sha256: chosen.sha256,
+        media_type: media_type.to_owned(),
+        bytes: chosen.size,
+        width: size.map(|(w, _)| w),
+        height: size.map(|(_, h)| h),
+        name: image_name(&chosen.name).unwrap_or_else(|| "Image".to_owned()),
+        from_doc: doc.0,
+    })
+}
+
+/// Chooses the current version of the document `doc` as a font file for `actor`, who has
+/// confirmed (`licence_confirmed`) that the organisation holds its licence; the record notes
+/// who, and when. Where it may come from, and the checks of access and availability, are
+/// those of [`image_from_doc`]. Its type is judged by its content (see
+/// [`revisions::brand::sniff_font`]), and it is named after the document.
+///
+/// # Errors
+/// `422 licence_not_confirmed` first of all; then as [`image_from_doc`], with `422 not_a_font`
+/// and `413 font_too_large` (past 2 MiB) in place of the image errors.
+pub(crate) async fn font_from_doc(
+    state: &AppState,
+    actor: &User,
+    doc: DocId,
+    site: Option<NodeId>,
+    licence_confirmed: bool,
+) -> Result<FontRef, ApiError> {
+    if !licence_confirmed {
+        return Err(ApiError::LicenceNotConfirmed);
+    }
+    let chosen = doc_content(
+        state,
+        actor,
+        doc,
+        site,
+        (MAX_FONT_BYTES, ApiError::NotAFont, ApiError::FontTooLarge),
+    )
+    .await?;
+    let kind = sniff_font(&chosen.bytes).ok_or(ApiError::NotAFont)?;
+    Ok(FontRef {
+        sha256: chosen.sha256,
+        media_type: kind.media_type().to_owned(),
+        bytes: chosen.size,
+        name: image_name(&chosen.name).unwrap_or_else(|| "Font".to_owned()),
+        from_doc: doc.0,
+        licence: Licence {
+            confirmed_by: actor.id.0,
+            confirmed_at: now_seconds(),
+        },
+    })
+}
+
+/// The current content of a document chosen for the brand: its bytes, hash, size and the
+/// document's name.
+struct DocContent {
+    bytes: Vec<u8>,
+    sha256: String,
+    size: u64,
+    name: String,
+}
+
+/// The current content of the document `doc` for `actor`, who needs `view` on it, from an
+/// asset library or, with `site`, one of that site's libraries; available, not empty and at
+/// most `limits.0` bytes (`limits.1` for content that is missing or empty, `limits.2` for
+/// content too large).
+async fn doc_content(
+    state: &AppState,
+    actor: &User,
+    doc: DocId,
+    site: Option<NodeId>,
+    limits: (u64, ApiError, ApiError),
+) -> Result<DocContent, ApiError> {
+    let (max_bytes, unusable, too_large) = limits;
     let db = state.db();
     let unavailable = |e: DbError| ApiError::unavailable(&e);
     let access = db
@@ -411,18 +510,18 @@ pub(crate) async fn image_from_doc(
     }
     let stored = crate::api::content::blocking(state, move |store| store.load(doc))
         .await?
-        .ok_or(ApiError::NotAnImage)?;
+        .ok_or(unusable)?;
     let Content::Blob(blob) = stored.content else {
-        return Err(ApiError::NotAnImage);
+        return Err(unusable);
     };
     if let Some(scan) = db.availability(&blob.sha256).await.map_err(unavailable)? {
         return Err(ApiError::Held(scan));
     }
     if blob.size == 0 {
-        return Err(ApiError::NotAnImage);
+        return Err(unusable);
     }
-    if blob.size > kind.max_bytes() {
-        return Err(ApiError::ImageTooLarge);
+    if blob.size > max_bytes {
+        return Err(too_large);
     }
     let blobs = Arc::clone(state.blobs());
     let limit = blob.size;
@@ -446,15 +545,11 @@ pub(crate) async fn image_from_doc(
         );
         ApiError::Unavailable
     })?;
-    let (media_type, size) = judge_image(&bytes)?;
-    Ok(ImageRef {
+    Ok(DocContent {
+        bytes,
         sha256: blob.hex(),
-        media_type: media_type.to_owned(),
-        bytes: blob.size,
-        width: size.map(|(w, _)| w),
-        height: size.map(|(_, h)| h),
-        name: image_name(&document.name).unwrap_or_else(|| "Image".to_owned()),
-        from_doc: doc.0,
+        size: blob.size,
+        name: document.name,
     })
 }
 
@@ -588,12 +683,11 @@ async fn change_brand<T>(
     }
 }
 
-/// The contents `brand`'s images name.
+/// The contents `brand` pins: its images, fonts and the fonts of its packages.
 fn pinned(brand: &OrgBrand) -> BTreeSet<String> {
-    brand
-        .images
-        .iter()
-        .map(|i| i.image.sha256.clone())
+    org_pins(brand)
+        .into_iter()
+        .map(|pin| pin.sha256.to_owned())
         .collect()
 }
 
@@ -835,6 +929,10 @@ pub(crate) async fn remove_image(
             .position(|i| i.id == id)
             .ok_or(ApiError::NotFound)?;
         let old = brand.images.remove(at);
+        // The organisation's default icon goes with its image.
+        if brand.default_icon == Some(id) {
+            brand.default_icon = None;
+        }
         Ok(Edited {
             message: format!("Remove the image {} from the brand centre", old.image.name),
             events: vec![brand_event(
@@ -939,14 +1037,474 @@ pub(crate) async fn set_managers(
 }
 
 // ---------------------------------------------------------------------------------------------
+// Fonts
+
+/// The font `font` as an event describes it.
+fn font_detail(font: &BrandFont) -> Value {
+    json!({
+        "id": font.id,
+        "name": font.font.name,
+        "sha256": font.font.sha256,
+        "media_type": font.font.media_type,
+    })
+}
+
+/// A name typed for a font: trimmed, 1 to 120 characters with no control or invisible
+/// characters.
+///
+/// # Errors
+/// `422 invalid_request` otherwise.
+fn typed_font_name(name: &str) -> Result<String, ApiError> {
+    Ok(clean_text(name)
+        .filter(|n| (1..=MAX_IMAGE_NAME_CHARS).contains(&n.chars().count()))
+        .ok_or(ApiError::InvalidRequest)?
+        .to_owned())
+}
+
+/// Adds the current version of the document `doc` to the brand centre as a font for `actor`, a
+/// brand manager or administrator who can view it and confirms the organisation holds its
+/// licence (see [`font_from_doc`]), named `name` or else after the document, with
+/// `brand.font_changed` (`added`). Its content is pinned from then on. Answers the font.
+///
+/// # Errors
+/// `403`; those of [`font_from_doc`]; `422 invalid_request` for a bad name; `409 too_many
+/// {limit: 30}`; `409 image_gone` when the content was erased meanwhile; otherwise `503`.
+pub(crate) async fn add_font(
+    state: &AppState,
+    actor: &User,
+    doc: DocId,
+    licence_confirmed: bool,
+    name: Option<&str>,
+) -> Result<BrandFont, BrandError> {
+    if !allowed(state.db(), actor, BrandNeeds::Manager).await? {
+        return Err(ApiError::Forbidden.into());
+    }
+    let mut font = font_from_doc(state, actor, doc, None, licence_confirmed).await?;
+    if let Some(name) = name {
+        font.name = typed_font_name(name)?;
+    }
+    change_brand(state, actor, BrandNeeds::Manager, |brand| {
+        if brand.fonts.len() >= MAX_ORG_FONTS {
+            return Err(ApiError::TooMany(MAX_ORG_FONTS).into());
+        }
+        let added = BrandFont {
+            id: Uuid::new_v4(),
+            font,
+        };
+        brand.fonts.push(added.clone());
+        Ok(Edited {
+            message: format!("Add the font {} to the brand centre", added.font.name),
+            events: vec![brand_event(
+                "brand.font_changed",
+                actor,
+                json!({ "action": "added", "font": font_detail(&added) }),
+            )],
+            answer: added,
+        })
+    })
+    .await
+}
+
+/// Removes the font `id` from the brand centre for `actor`, with `brand.font_changed`
+/// (`removed`). Packages and looks that hold a copy of it keep their copy; its content is
+/// erased once nothing names or pins it.
+///
+/// # Errors
+/// `403`; `404` for no such font; otherwise `503`.
+pub(crate) async fn remove_font(
+    state: &AppState,
+    actor: &User,
+    id: Uuid,
+) -> Result<(), BrandError> {
+    change_brand(state, actor, BrandNeeds::Manager, |brand| {
+        let at = brand
+            .fonts
+            .iter()
+            .position(|f| f.id == id)
+            .ok_or(ApiError::NotFound)?;
+        let old = brand.fonts.remove(at);
+        Ok(Edited {
+            message: format!("Remove the font {} from the brand centre", old.font.name),
+            events: vec![brand_event(
+                "brand.font_changed",
+                actor,
+                json!({ "action": "removed", "font": font_detail(&old) }),
+            )],
+            answer: (),
+        })
+    })
+    .await
+}
+
+// ---------------------------------------------------------------------------------------------
+// Font packages
+
+/// Where a font of a package comes from, as sent.
+#[derive(Clone, Debug)]
+pub(crate) enum FontChoice {
+    /// A font of the brand centre, by id.
+    BrandFont(Uuid),
+    /// The current version of a document, with the licence confirmed or not.
+    Doc { doc: DocId, licence_confirmed: bool },
+}
+
+/// A change of a font package as sent: each field given is set (`Some(None)` removes a font).
+/// A new package gives its name and roles.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PackageEdit {
+    pub(crate) name: Option<String>,
+    pub(crate) display: Option<Option<FontChoice>>,
+    pub(crate) content: Option<Option<FontChoice>>,
+    pub(crate) roles: Option<FontRoles>,
+}
+
+/// A [`PackageEdit`] with its fonts found.
+pub(crate) struct ResolvedEdit {
+    name: Option<String>,
+    display: Option<Option<FontRef>>,
+    content: Option<Option<FontRef>>,
+    roles: Option<FontRoles>,
+}
+
+/// The fonts of `edit` found for `actor`: a brand font among the brand centre's (`org`); a
+/// document only for a site's package (`site`), from its libraries or an asset library (see
+/// [`font_from_doc`]).
+///
+/// # Errors
+/// `InvalidFontPackage` for an unknown brand font, or a document for the brand centre; those
+/// of [`font_from_doc`].
+pub(crate) async fn resolve_edit(
+    state: &AppState,
+    actor: &User,
+    org: &OrgBrand,
+    site: Option<NodeId>,
+    edit: PackageEdit,
+) -> Result<ResolvedEdit, BrandError> {
+    let mut fonts = Vec::new();
+    for choice in [edit.display, edit.content] {
+        let resolved = match choice {
+            None => None,
+            Some(None) => Some(None),
+            Some(Some(FontChoice::BrandFont(id))) => {
+                let found = org.fonts.iter().find(|f| f.id == id).ok_or_else(|| {
+                    BrandError::InvalidFontPackage("there is no such brand font".into())
+                })?;
+                Some(Some(found.font.clone()))
+            }
+            Some(Some(FontChoice::Doc {
+                doc,
+                licence_confirmed,
+            })) => {
+                if site.is_none() {
+                    return Err(BrandError::InvalidFontPackage(
+                        "the brand centre's packages use the brand centre's fonts".into(),
+                    ));
+                }
+                Some(Some(
+                    font_from_doc(state, actor, doc, site, licence_confirmed).await?,
+                ))
+            }
+        };
+        fonts.push(resolved);
+    }
+    let mut fonts = fonts.into_iter();
+    Ok(ResolvedEdit {
+        name: edit.name,
+        display: fonts.next().flatten(),
+        content: fonts.next().flatten(),
+        roles: edit.roles,
+    })
+}
+
+/// `package` with `edit` applied, checked: the name trimmed, 1 to 60 characters with no
+/// control or invisible characters, and every rule of [`FontPackage::problem`].
+///
+/// # Errors
+/// `InvalidFontPackage` with the reason.
+pub(crate) fn edited_package(
+    mut package: FontPackage,
+    edit: ResolvedEdit,
+) -> Result<FontPackage, BrandError> {
+    if let Some(name) = edit.name {
+        let name = clean_text(&name).ok_or_else(|| {
+            BrandError::InvalidFontPackage(
+                "a package name holds no control or invisible characters".into(),
+            )
+        })?;
+        if !(1..=MAX_THEME_NAME_CHARS).contains(&name.chars().count()) {
+            return Err(BrandError::InvalidFontPackage(
+                "a package name is 1 to 60 characters".into(),
+            ));
+        }
+        name.clone_into(&mut package.name);
+    }
+    if let Some(display) = edit.display {
+        package.display = display;
+    }
+    if let Some(content) = edit.content {
+        package.content = content;
+    }
+    if let Some(roles) = edit.roles {
+        package.roles = roles;
+    }
+    if let Some(problem) = package.problem() {
+        return Err(BrandError::InvalidFontPackage(problem));
+    }
+    Ok(package)
+}
+
+/// A new package of `id` with nothing set yet: [`edited_package`] fills it.
+pub(crate) fn blank_package(id: Uuid) -> FontPackage {
+    FontPackage {
+        id,
+        name: String::new(),
+        display: None,
+        content: None,
+        roles: FontRoles {
+            title: FontRole::System,
+            heading: FontRole::System,
+            body: FontRole::System,
+            interactive: FontRole::System,
+        },
+    }
+}
+
+/// Whether another package than `except` of `packages` is named `name`, ignoring case.
+pub(crate) fn package_name_taken(
+    packages: &[FontPackage],
+    name: &str,
+    except: Option<Uuid>,
+) -> bool {
+    let wanted = name.to_lowercase();
+    packages
+        .iter()
+        .any(|p| Some(p.id) != except && p.name.to_lowercase() == wanted)
+}
+
+/// Adds a font package to the brand centre for `actor`, a brand manager or administrator, with
+/// `brand.font_package_changed` (`created`). Its fonts are the brand centre's. Answers the
+/// package.
+///
+/// # Errors
+/// `403`; `422 invalid_font_package {reason}`; `409 name_taken`; `409 too_many {limit: 20}`;
+/// otherwise `503`.
+pub(crate) async fn create_package(
+    state: &AppState,
+    actor: &User,
+    edit: PackageEdit,
+) -> Result<FontPackage, BrandError> {
+    let db = state.db();
+    if !allowed(db, actor, BrandNeeds::Manager).await? {
+        return Err(ApiError::Forbidden.into());
+    }
+    let org = db.org_brand().await?;
+    let resolved = resolve_edit(state, actor, &org, None, edit).await?;
+    let package = edited_package(blank_package(Uuid::new_v4()), resolved)?;
+    change_brand(state, actor, BrandNeeds::Manager, |brand| {
+        if package_name_taken(&brand.font_packages, &package.name, None) {
+            return Err(ApiError::NameTaken.into());
+        }
+        if brand.font_packages.len() >= MAX_ORG_FONT_PACKAGES {
+            return Err(ApiError::TooMany(MAX_ORG_FONT_PACKAGES).into());
+        }
+        brand.font_packages.push(package.clone());
+        Ok(Edited {
+            message: format!("Add the font package {} to the brand centre", package.name),
+            events: vec![brand_event(
+                "brand.font_package_changed",
+                actor,
+                json!({ "action": "created", "package": package }),
+            )],
+            answer: package,
+        })
+    })
+    .await
+}
+
+/// Changes the font package `id` of the brand centre for `actor` with `edit`, with
+/// `brand.font_package_changed` (`updated`, before and after). Looks that copied it keep their
+/// copy. The same package again changes nothing. Answers the package.
+///
+/// # Errors
+/// As [`create_package`], with `404` for no such package.
+pub(crate) async fn change_package(
+    state: &AppState,
+    actor: &User,
+    id: Uuid,
+    edit: PackageEdit,
+) -> Result<FontPackage, BrandError> {
+    let db = state.db();
+    if !allowed(db, actor, BrandNeeds::Manager).await? {
+        return Err(ApiError::Forbidden.into());
+    }
+    let org = db.org_brand().await?;
+    let resolved = resolve_edit(state, actor, &org, None, edit).await?;
+    change_brand(state, actor, BrandNeeds::Manager, |brand| {
+        let at = brand
+            .font_packages
+            .iter()
+            .position(|p| p.id == id)
+            .ok_or(ApiError::NotFound)?;
+        let old = brand
+            .font_packages
+            .get(at)
+            .cloned()
+            .ok_or(ApiError::NotFound)?;
+        let changed = edited_package(old.clone(), resolved)?;
+        if package_name_taken(&brand.font_packages, &changed.name, Some(id)) {
+            return Err(ApiError::NameTaken.into());
+        }
+        if let Some(slot) = brand.font_packages.get_mut(at) {
+            *slot = changed.clone();
+        }
+        Ok(Edited {
+            message: format!("Change the font package {} of the brand centre", old.name),
+            events: vec![brand_event(
+                "brand.font_package_changed",
+                actor,
+                json!({ "action": "updated", "before": old, "package": changed }),
+            )],
+            answer: changed,
+        })
+    })
+    .await
+}
+
+/// Deletes the font package `id` from the brand centre for `actor`, with
+/// `brand.font_package_changed` (`deleted`). Looks that copied it keep their copy.
+///
+/// # Errors
+/// `403`; `404` for no such package; otherwise `503`.
+pub(crate) async fn delete_package(
+    state: &AppState,
+    actor: &User,
+    id: Uuid,
+) -> Result<(), BrandError> {
+    change_brand(state, actor, BrandNeeds::Manager, |brand| {
+        let at = brand
+            .font_packages
+            .iter()
+            .position(|p| p.id == id)
+            .ok_or(ApiError::NotFound)?;
+        let old = brand.font_packages.remove(at);
+        Ok(Edited {
+            message: format!("Delete the font package {} from the brand centre", old.name),
+            events: vec![brand_event(
+                "brand.font_package_changed",
+                actor,
+                json!({ "action": "deleted", "package": old }),
+            )],
+            answer: (),
+        })
+    })
+    .await
+}
+
+// ---------------------------------------------------------------------------------------------
+// The policy and the default icon
+
+/// A change of the brand policy as sent: each limit given is set.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct PolicyEdit {
+    pub(crate) hide_builtin_themes: Option<bool>,
+    pub(crate) custom_colours: Option<bool>,
+    pub(crate) site_themes: Option<bool>,
+    pub(crate) site_images: Option<bool>,
+    pub(crate) site_fonts: Option<bool>,
+}
+
+/// Sets the limits on site owners for `actor`, an enabled administrator, with
+/// `brand.policy_changed {before, after}`. Looks already stored are never changed; the limits
+/// apply to the next change. The same policy again changes nothing. Answers the policy.
+///
+/// # Errors
+/// `403` for anyone else; otherwise `503`.
+pub(crate) async fn set_policy(
+    state: &AppState,
+    actor: &User,
+    edit: PolicyEdit,
+) -> Result<BrandPolicy, BrandError> {
+    change_brand(state, actor, BrandNeeds::Admin, |brand| {
+        let before = brand.policy;
+        let set = |given: Option<bool>, now: bool| given.unwrap_or(now);
+        let after = BrandPolicy {
+            hide_builtin_themes: set(edit.hide_builtin_themes, before.hide_builtin_themes),
+            custom_colours: set(edit.custom_colours, before.custom_colours),
+            site_themes: set(edit.site_themes, before.site_themes),
+            site_images: set(edit.site_images, before.site_images),
+            site_fonts: set(edit.site_fonts, before.site_fonts),
+        };
+        brand.policy = after;
+        Ok(Edited {
+            message: "Change the brand policy".to_owned(),
+            events: vec![brand_event(
+                "brand.policy_changed",
+                actor,
+                json!({ "before": before, "after": after }),
+            )],
+            answer: after,
+        })
+    })
+    .await
+}
+
+/// Makes the brand image `image` the organisation's default tab icon (`None`: no default) for
+/// `actor`, a brand manager or administrator, with `brand.image_changed` (`default_icon`).
+///
+/// # Errors
+/// `403`; `404` for no such image; `422 not_an_icon` for an image that is not of kind `icon`
+/// or cannot be an icon (see [`icon_problem`]); otherwise `503`.
+pub(crate) async fn set_default_icon(
+    state: &AppState,
+    actor: &User,
+    image: Option<Uuid>,
+) -> Result<(), BrandError> {
+    change_brand(state, actor, BrandNeeds::Manager, |brand| {
+        if let Some(id) = image {
+            let found = brand
+                .images
+                .iter()
+                .find(|i| i.id == id)
+                .ok_or(ApiError::NotFound)?;
+            if found.kind != ImageKind::Icon || icon_problem(&found.image).is_some() {
+                return Err(ApiError::NotAnIcon.into());
+            }
+        }
+        let before = std::mem::replace(&mut brand.default_icon, image);
+        Ok(Edited {
+            message: "Set the organisation's default icon".to_owned(),
+            events: vec![brand_event(
+                "brand.image_changed",
+                actor,
+                json!({ "action": "default_icon", "before": before, "image": image }),
+            )],
+            answer: (),
+        })
+    })
+    .await
+}
+
+/// Who `actor` is to the brand policy: an enabled administrator, a brand manager, or else a
+/// site owner (the only one the policy limits).
+pub(crate) async fn actor_kind(db: &Db, actor: &User) -> Result<Actor, DbError> {
+    if allowed(db, actor, BrandNeeds::Admin).await? {
+        Ok(Actor::Admin)
+    } else if db.can_manage_brand(actor.id).await? {
+        Ok(Actor::BrandManager)
+    } else {
+        Ok(Actor::Owner)
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Reconcile
 
-/// The pins `brand` asks for: each content its images name, with its type, by hash.
+/// The pins `brand` asks for: each content its images, fonts and packages name, with its
+/// type, by hash.
 fn wanted_pins(brand: &OrgBrand) -> Vec<(String, String)> {
-    let mut pins: Vec<(String, String)> = brand
-        .images
-        .iter()
-        .map(|i| (i.image.sha256.clone(), i.image.media_type.clone()))
+    let mut pins: Vec<(String, String)> = org_pins(brand)
+        .into_iter()
+        .map(|pin| (pin.sha256.to_owned(), pin.media_type.to_owned()))
         .collect();
     pins.sort();
     pins.dedup_by(|a, b| a.0 == b.0);
@@ -989,8 +1547,20 @@ pub(crate) async fn reconcile(store: Arc<dyn Checkpointer>, db: &Db) -> Result<u
     if row.themes != record.themes {
         events.push(repaired("brand.theme_changed"));
     }
-    if row.images != record.images || pins != wanted_pins(&record) {
+    if row.images != record.images
+        || row.default_icon != record.default_icon
+        || pins != wanted_pins(&record)
+    {
         events.push(repaired("brand.image_changed"));
+    }
+    if row.fonts != record.fonts {
+        events.push(repaired("brand.font_changed"));
+    }
+    if row.font_packages != record.font_packages {
+        events.push(repaired("brand.font_package_changed"));
+    }
+    if row.policy != record.policy {
+        events.push(repaired("brand.policy_changed"));
     }
     db.apply_org_brand(BrandChange {
         record: &record,

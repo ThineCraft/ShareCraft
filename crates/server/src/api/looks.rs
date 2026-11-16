@@ -9,7 +9,7 @@ use collab_core::ids::NodeId;
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::brand::{NewTheme, ThemeEdit, completed};
+use super::brand::{NewPackage, NewTheme, PackageEditBody, ThemeEdit, completed};
 use super::{JsonBody, parse_id};
 use crate::AppState;
 use crate::auth::Signed;
@@ -164,5 +164,87 @@ pub(crate) async fn delete_theme(
     let theme = parse_id(&theme)?;
     let actor = signed.session.user;
     completed(async move { looks::delete_theme(&state, &actor, site, theme).await }).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// The body of `POST /api/sites/{id}/look/copy`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CopyBody {
+    from: String,
+    #[serde(default)]
+    themes: bool,
+    #[serde(default)]
+    fonts: bool,
+}
+
+/// `POST /api/sites/{id}/look/copy {from, themes?, fonts?}`: copies the look of the site
+/// `from` onto this one, with its own themes and font packages when asked (see
+/// [`looks::copy_look`]); answers the look settings. View on the source and `manage_site` on
+/// the target (`403 archived` on an archived target); `409 not_allowed {problems}`.
+pub(crate) async fn copy(
+    State(state): State<AppState>,
+    signed: Signed,
+    Path(id): Path<String>,
+    JsonBody(body): JsonBody<CopyBody>,
+) -> Result<Json<Value>, BrandError> {
+    let site = site_id(&id)?;
+    let from = site_id(&body.from)?;
+    let actor = signed.session.user;
+    let answer = completed(async move {
+        looks::copy_look(&state, &actor, site, from, (body.themes, body.fonts)).await
+    })
+    .await?;
+    Ok(Json(answer))
+}
+
+/// `POST /api/sites/{id}/font-packages {name, display?, content?, roles}`: adds a font package
+/// only this site offers, its fonts from the brand centre (`{brand_font}`) or a document of
+/// the site's own libraries or an asset library (`{doc, licence_confirmed}`; see
+/// [`looks::create_package`]); `201` with the package as listed.
+pub(crate) async fn create_package(
+    State(state): State<AppState>,
+    signed: Signed,
+    Path(id): Path<String>,
+    JsonBody(body): JsonBody<NewPackage>,
+) -> Result<Response, BrandError> {
+    let site = site_id(&id)?;
+    let edit = body.edit()?;
+    let actor = signed.session.user;
+    let package =
+        completed(async move { looks::create_package(&state, &actor, site, edit).await }).await?;
+    Ok((StatusCode::CREATED, Json(package)).into_response())
+}
+
+/// `PATCH /api/sites/{id}/font-packages/{package}`: changes one of the site's own font
+/// packages; each field given is set, a font set to `null` removed (see
+/// [`looks::change_package`]).
+pub(crate) async fn change_package(
+    State(state): State<AppState>,
+    signed: Signed,
+    Path((id, package)): Path<(String, String)>,
+    JsonBody(body): JsonBody<PackageEditBody>,
+) -> Result<Json<Value>, BrandError> {
+    let site = site_id(&id)?;
+    let package = parse_id(&package)?;
+    let edit = body.edit()?;
+    let actor = signed.session.user;
+    let answer =
+        completed(async move { looks::change_package(&state, &actor, site, package, edit).await })
+            .await?;
+    Ok(Json(answer))
+}
+
+/// `DELETE /api/sites/{id}/font-packages/{package}`: deletes one of the site's own font
+/// packages; `204`. A look that copied it keeps its copy.
+pub(crate) async fn delete_package(
+    State(state): State<AppState>,
+    signed: Signed,
+    Path((id, package)): Path<(String, String)>,
+) -> Result<StatusCode, BrandError> {
+    let site = site_id(&id)?;
+    let package = parse_id(&package)?;
+    let actor = signed.session.user;
+    completed(async move { looks::delete_package(&state, &actor, site, package).await }).await?;
     Ok(StatusCode::NO_CONTENT)
 }

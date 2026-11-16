@@ -9,7 +9,7 @@
 use std::collections::HashSet;
 
 use collab_core::ids::{NodeId, UserId};
-use revisions::brand::{ImageRef, Look};
+use revisions::brand::{FontPackage, ImageRef, Look};
 use revisions::{BlobRef, MAX_DESCRIPTION_CHARS, NavItem, NavTarget, SiteTheme};
 use serde_json::Value;
 use sqlx::postgres::PgRow;
@@ -17,7 +17,7 @@ use sqlx::{PgConnection, Row};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::brand::pin_images;
+use crate::brand::{Pin, pin_contents, site_pins};
 use crate::events::{NewEvent, record};
 use crate::tree::{NodeChange, NodeRow, upsert_node};
 use crate::{AccessError, Db, DbError, Perms};
@@ -44,7 +44,8 @@ const MAX_AUDIENCE: usize = 10;
 
 /// The columns of a `sites` row as [`settings_from_row`] reads them.
 const SITE_COLUMNS: &str = "id, kind, description, language, time_zone, template, archived_at, \
-     archived_by, is_hub, hub_navigation, joined_hub, navigation, look, themes, purging";
+     archived_by, is_hub, hub_navigation, joined_hub, navigation, look, themes, font_packages, \
+     purging";
 
 /// What a site is for. Both start the same; a communication site is shown with its own label.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -104,6 +105,8 @@ pub struct SiteSettings {
     pub look: Option<Look>,
     /// Its own themes.
     pub themes: Vec<SiteTheme>,
+    /// Its own font packages.
+    pub font_packages: Vec<FontPackage>,
     /// A purge of the deleted site has started and is not finished. Not part of its record.
     pub purging: bool,
 }
@@ -128,6 +131,7 @@ impl SiteSettings {
             navigation: None,
             look: None,
             themes: Vec::new(),
+            font_packages: Vec::new(),
             purging: false,
         }
     }
@@ -150,6 +154,14 @@ impl SiteSettings {
             && self.navigation == other.navigation
             && self.look == other.look
             && self.themes == other.themes
+            && self.font_packages == other.font_packages
+    }
+
+    /// The content the site pins: the images and fonts of its look and the fonts of its own
+    /// font packages, each once (see [`site_pins`]).
+    #[must_use]
+    pub fn pins(&self) -> Vec<Pin<'_>> {
+        site_pins(self.look.as_ref(), &self.font_packages)
     }
 
     /// The brand images the site's look uses, each once.
@@ -160,6 +172,7 @@ impl SiteSettings {
             for image in [
                 &look.logo,
                 &look.thumbnail,
+                &look.icon,
                 &look.header.image,
                 &look.footer.logo,
             ]
@@ -363,6 +376,8 @@ fn settings_from_row(row: &PgRow) -> Result<SiteSettings, sqlx::Error> {
             .map_err(|e| sqlx::Error::Decode(Box::new(e)))?,
         themes: serde_json::from_value(row.try_get("themes")?)
             .map_err(|e| sqlx::Error::Decode(Box::new(e)))?,
+        font_packages: serde_json::from_value(row.try_get("font_packages")?)
+            .map_err(|e| sqlx::Error::Decode(Box::new(e)))?,
         purging: row.try_get("purging")?,
     })
 }
@@ -396,7 +411,7 @@ pub(crate) async fn ensure_site_row(
 }
 
 /// Writes `settings` into the site's row, which the caller has locked if it exists, then makes
-/// the site's pins the images its look uses (see [`pin_images`]); `purging` is left as it is.
+/// the site's pins what it uses (see [`SiteSettings::pins`]); `purging` is left as it is.
 /// `repair` (a write from Git by nobody) creates the `blobs` rows of pinned content that has
 /// none; otherwise content erased meanwhile answers `ImageGone`, a refusal.
 pub(crate) async fn upsert_site(
@@ -411,17 +426,20 @@ pub(crate) async fn upsert_site(
         .transpose()
         .map_err(DbError::new)?;
     let themes = serde_json::to_value(&settings.themes).map_err(DbError::new)?;
+    let font_packages = serde_json::to_value(&settings.font_packages).map_err(DbError::new)?;
     sqlx::query(
         "insert into sites (id, kind, description, language, time_zone, template, archived_at, \
-             archived_by, is_hub, hub_navigation, joined_hub, navigation, look, themes) \
-         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
+             archived_by, is_hub, hub_navigation, joined_hub, navigation, look, themes, \
+             font_packages) \
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) \
          on conflict (id) do update set kind = excluded.kind, \
              description = excluded.description, language = excluded.language, \
              time_zone = excluded.time_zone, template = excluded.template, \
              archived_at = excluded.archived_at, archived_by = excluded.archived_by, \
              is_hub = excluded.is_hub, hub_navigation = excluded.hub_navigation, \
              joined_hub = excluded.joined_hub, navigation = excluded.navigation, \
-             look = excluded.look, themes = excluded.themes",
+             look = excluded.look, themes = excluded.themes, \
+             font_packages = excluded.font_packages",
     )
     .bind(settings.id.0)
     .bind(settings.kind.as_str())
@@ -437,10 +455,11 @@ pub(crate) async fn upsert_site(
     .bind(navigation_value(settings.navigation.as_ref())?)
     .bind(look)
     .bind(themes)
+    .bind(font_packages)
     .execute(&mut *conn)
     .await?;
     let owner = settings.id.0.to_string();
-    if !pin_images(conn, &owner, &settings.look_images(), repair).await? {
+    if !pin_contents(conn, &owner, &settings.pins(), repair).await? {
         return Err(AccessError::ImageGone);
     }
     Ok(())
@@ -847,7 +866,7 @@ pub(crate) async fn purge_site_rows(
     release_hub_rows(&mut *conn, actor, site).await?;
     sqlx::query(
         "update sites set joined_hub = null, is_hub = false, hub_navigation = null, \
-             look = null, themes = '[]' where id = $1",
+             look = null, themes = '[]', font_packages = '[]' where id = $1",
     )
     .bind(site.0)
     .execute(&mut *conn)

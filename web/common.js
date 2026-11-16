@@ -113,6 +113,16 @@ const MESSAGES = {
   image_gone:
     'An image of that look no longer exists. Choose new images for the parts that lost theirs, then apply it again.',
   too_many: 'There are already as many of those as allowed. Delete one first.',
+  not_a_font: 'That file is not a font ShareCraft can use. Use a WOFF2, WOFF, TTF or OTF font file.',
+  font_too_large: 'That font file is too large. A font can be at most 2 MB.',
+  licence_not_confirmed:
+    'Confirm that your organisation holds the licence for this font before adding it.',
+  invalid_font_package:
+    'That font package cannot be saved. Give it a name of 1 to 60 characters, and set each text role only in a font the package has.',
+  not_allowed:
+    'Your organisation does not let site owners make that choice. Choose from what the brand centre offers, or ask an administrator.',
+  not_an_icon:
+    'That image cannot be a tab icon. Use a square PNG (at least 32 pixels across) or SVG, at most 256 KB.',
 };
 
 /** What a document page says when the document is missing or the person has no access. */

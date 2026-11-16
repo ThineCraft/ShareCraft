@@ -1,6 +1,7 @@
-//! The brand centre over HTTP: reading it (anyone signed in), its themes and images (brand
-//! managers and administrators), naming the brand managers (administrators), and serving a
-//! brand image to anyone signed in.
+//! The brand centre over HTTP: reading it (anyone signed in), its themes, images, fonts, font
+//! packages and default icon (brand managers and administrators), naming the brand managers
+//! and setting the limits on site owners (administrators), and serving a brand image or font
+//! file to anyone signed in.
 
 use std::io::Read;
 use std::sync::Arc;
@@ -11,10 +12,13 @@ use axum::extract::{Path, State};
 use axum::http::header::{
     CACHE_CONTROL, CONTENT_LENGTH, CONTENT_SECURITY_POLICY, CONTENT_TYPE, X_CONTENT_TYPE_OPTIONS,
 };
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use collab_core::ids::{DocId, UserId};
-use revisions::brand::{BUILT_IN_THEMES, BrandImage, ImageKind, OrgTheme, Theme, check_theme};
+use revisions::brand::{
+    BUILT_IN_FONT_PACKAGES, BUILT_IN_THEMES, BrandFont, BrandImage, FontPackage, FontRef,
+    FontRoles, ImageKind, OrgBrand, OrgTheme, Theme, check_theme, family_name,
+};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -22,10 +26,13 @@ use uuid::Uuid;
 use super::{ApiError, JsonBody, parse_id};
 use crate::AppState;
 use crate::auth::{MaybeSigned, Signed};
-use crate::brand::{self, BrandError, ThemeInput};
+use crate::brand::{self, BrandError, FontChoice, PackageEdit, PolicyEdit, ThemeInput};
 
 /// The policy a brand image is served with: nothing in it runs or loads, even opened alone.
 const IMAGE_POLICY: &str = "sandbox; default-src 'none'; style-src 'unsafe-inline'";
+
+/// The policy a font file is served with: nothing in it runs or loads, even opened alone.
+const FONT_POLICY: &str = "sandbox; default-src 'none'";
 
 impl IntoResponse for BrandError {
     fn into_response(self) -> Response {
@@ -49,6 +56,16 @@ impl IntoResponse for BrandError {
             BrandError::ImagesGone(slots) => (
                 StatusCode::CONFLICT,
                 Json(json!({ "error": "image_gone", "slots": slots })),
+            )
+                .into_response(),
+            BrandError::InvalidFontPackage(reason) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({ "error": "invalid_font_package", "reason": reason })),
+            )
+                .into_response(),
+            BrandError::NotAllowed(problems) => (
+                StatusCode::CONFLICT,
+                Json(json!({ "error": "not_allowed", "problems": problems })),
             )
                 .into_response(),
         }
@@ -92,6 +109,16 @@ pub(crate) fn theme_out(id: &str, from: &str, theme: &Theme, changed_at: Option<
     })
 }
 
+/// The address of the organisation's default tab icon, if it has one.
+pub(crate) fn default_icon_url(centre: &OrgBrand) -> Option<String> {
+    let id = centre.default_icon?;
+    centre
+        .images
+        .iter()
+        .find(|i| i.id == id)
+        .map(|i| image_url(&i.image.sha256))
+}
+
 /// An organisation theme as listed.
 fn org_theme_out(theme: &OrgTheme) -> Value {
     let id = theme.id.to_string();
@@ -113,10 +140,58 @@ fn image_out(image: &BrandImage) -> Value {
     })
 }
 
-/// `GET /api/brand`: the brand centre for anyone signed in, `{themes, images, can_manage}`:
-/// the built-in themes first, then the organisation's; each image `{id, kind, name, url}`;
-/// whether the caller may change themes and images. Administrators also get `managers`, each
-/// `{id, name, email}`.
+/// The address a font file is served at.
+pub(crate) fn font_url(sha256: &str) -> String {
+    format!("/api/brand/fonts/{sha256}")
+}
+
+/// A font file as a package or the brand centre shows it: `{name, media_type, family, url}`,
+/// the family generated from its hash (never from its name).
+pub(crate) fn font_ref_out(font: &FontRef) -> Value {
+    json!({
+        "name": font.name,
+        "media_type": font.media_type,
+        "family": family_name(&font.sha256),
+        "url": font_url(&font.sha256),
+    })
+}
+
+/// A brand-centre font as listed: `{id, name, media_type, family, url, licence}`.
+fn font_out(font: &BrandFont) -> Value {
+    let mut out = font_ref_out(&font.font);
+    if let Some(map) = out.as_object_mut() {
+        map.insert("id".into(), json!(font.id));
+        map.insert("licence".into(), json!(font.font.licence));
+    }
+    out
+}
+
+/// A font package as listed: `{id, from, name, builtin, display, content, roles}`, `from`
+/// being what a look names it by (`org:<id>`, `site:<id>`; a built-in's id).
+pub(crate) fn package_out(package: &FontPackage, from: &str, id: &str, builtin: bool) -> Value {
+    json!({
+        "id": id,
+        "from": from,
+        "name": package.name,
+        "builtin": builtin,
+        "display": package.display.as_ref().map(font_ref_out),
+        "content": package.content.as_ref().map(font_ref_out),
+        "roles": package.roles,
+    })
+}
+
+/// An organisation font package as listed.
+fn org_package_out(package: &FontPackage) -> Value {
+    let id = package.id.to_string();
+    package_out(package, &format!("org:{id}"), &id, false)
+}
+
+/// `GET /api/brand`: the brand centre for anyone signed in, `{themes, images, fonts,
+/// font_packages, policy, default_icon, default_icon_url, can_manage}`: the built-in themes
+/// and font packages first, then the organisation's; each image `{id, kind, name, url}`; each
+/// font `{id, name, media_type, family, url, licence}`; the limits on site owners; the
+/// organisation's default tab icon (`null` for none); whether the caller may change the centre.
+/// Administrators also get `managers`, each `{id, name, email}`.
 pub(crate) async fn show(
     State(state): State<AppState>,
     signed: Signed,
@@ -131,9 +206,19 @@ pub(crate) async fn show(
         .map(|t| theme_out(t.id, t.id, &t.theme(), None))
         .collect();
     themes.extend(centre.themes.iter().map(org_theme_out));
+    let mut packages: Vec<Value> = BUILT_IN_FONT_PACKAGES
+        .iter()
+        .map(|p| package_out(&p.package(), p.id, p.id, true))
+        .collect();
+    packages.extend(centre.font_packages.iter().map(org_package_out));
     let mut out = json!({
         "themes": themes,
         "images": centre.images.iter().map(image_out).collect::<Vec<_>>(),
+        "fonts": centre.fonts.iter().map(font_out).collect::<Vec<_>>(),
+        "font_packages": packages,
+        "policy": centre.policy,
+        "default_icon": centre.default_icon,
+        "default_icon_url": default_icon_url(&centre),
         "can_manage": can_manage,
     });
     if user.is_admin {
@@ -373,17 +458,50 @@ pub(crate) async fn image(
     MaybeSigned(signed): MaybeSigned,
     Path(sha256): Path<String>,
 ) -> Result<Response, ApiError> {
-    if signed.is_none() {
+    serve(&state, signed.is_some(), &sha256, Served::Image).await
+}
+
+/// `GET /api/brand/fonts/{sha256}`: a font file's bytes, for anyone signed in, as the type
+/// recorded when it was chosen, with `nosniff`, `sandbox; default-src 'none'`, readable by
+/// this origin only (`Cross-Origin-Resource-Policy: same-origin`) and cached privately for a
+/// year. `404` for a signed-out visitor and for content that no brand font, font package or
+/// look names; `423 held {scan}` once the content is not available.
+pub(crate) async fn font(
+    State(state): State<AppState>,
+    MaybeSigned(signed): MaybeSigned,
+    Path(sha256): Path<String>,
+) -> Result<Response, ApiError> {
+    serve(&state, signed.is_some(), &sha256, Served::Font).await
+}
+
+/// What a brand file route serves.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Served {
+    Image,
+    Font,
+}
+
+/// Serves the brand content `sha256` as `what` to a signed-in caller (see [`image`] and
+/// [`font`]).
+async fn serve(
+    state: &AppState,
+    signed_in: bool,
+    sha256: &str,
+    what: Served,
+) -> Result<Response, ApiError> {
+    if !signed_in {
         return Err(ApiError::NotFound);
     }
-    let hash = match revisions::parse_hex(&sha256) {
+    let hash = match revisions::parse_hex(sha256) {
         Some(hash) if revisions::hex(&hash) == sha256 => hash,
         _ => return Err(ApiError::NotFound),
     };
     let db = state.db();
-    let media_type = db
-        .brand_image_type(&hash)
-        .await
+    let found = match what {
+        Served::Image => db.brand_image_type(&hash).await,
+        Served::Font => db.brand_font_type(&hash).await,
+    };
+    let media_type = found
         .map_err(|e| ApiError::unavailable(&e))?
         .ok_or(ApiError::NotFound)?;
     if let Some(scan) = db
@@ -406,21 +524,278 @@ pub(crate) async fn image(
     .map_err(|e| ApiError::unavailable(&e))?
     .map_err(|e| ApiError::unavailable(&e))?
     .ok_or_else(|| {
-        eprintln!("sharecraft-server: brand image {sha256} is missing from the content store");
+        eprintln!("sharecraft-server: brand content {sha256} is missing from the content store");
         ApiError::Unavailable
     })?;
     let header = |text: &str| HeaderValue::from_str(text).map_err(|e| ApiError::unavailable(&e));
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, header(&media_type)?);
     headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
-    headers.insert(
-        CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static(IMAGE_POLICY),
-    );
+    let policy = match what {
+        Served::Image => IMAGE_POLICY,
+        Served::Font => FONT_POLICY,
+    };
+    headers.insert(CONTENT_SECURITY_POLICY, HeaderValue::from_static(policy));
+    if what == Served::Font {
+        headers.insert(
+            HeaderName::from_static("cross-origin-resource-policy"),
+            HeaderValue::from_static("same-origin"),
+        );
+    }
     headers.insert(
         CACHE_CONTROL,
         HeaderValue::from_static("private, max-age=31536000, immutable"),
     );
     headers.insert(CONTENT_LENGTH, header(&bytes.len().to_string())?);
     Ok((StatusCode::OK, headers, Body::from(bytes)).into_response())
+}
+
+/// The body of `POST /api/brand/fonts`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NewFont {
+    doc: String,
+    #[serde(default)]
+    licence_confirmed: bool,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// `POST /api/brand/fonts {doc, licence_confirmed, name?}`: adds the current version of a font
+/// file in an asset library the caller can view to the brand centre, once they confirm the
+/// organisation holds its licence (see [`brand::add_font`]); `201 {id, name, media_type,
+/// family, url, licence}`. `403` unless a brand manager or administrator; `422
+/// licence_not_confirmed`; `404`; `400 wrong_place`; `422 not_a_font`; `413 font_too_large`;
+/// `423 held {scan}`; `409 too_many {limit}`.
+pub(crate) async fn add_font(
+    State(state): State<AppState>,
+    signed: Signed,
+    JsonBody(body): JsonBody<NewFont>,
+) -> Result<Response, BrandError> {
+    let doc = DocId(parse_id(&body.doc)?);
+    let actor = signed.session.user;
+    let font = completed(async move {
+        brand::add_font(
+            &state,
+            &actor,
+            doc,
+            body.licence_confirmed,
+            body.name.as_deref(),
+        )
+        .await
+    })
+    .await?;
+    Ok((StatusCode::CREATED, Json(font_out(&font))).into_response())
+}
+
+/// `DELETE /api/brand/fonts/{id}`: removes a font from the brand centre (see
+/// [`brand::remove_font`]); `204`. `403`; `404` for no such font.
+pub(crate) async fn remove_font(
+    State(state): State<AppState>,
+    signed: Signed,
+    Path(id): Path<String>,
+) -> Result<StatusCode, BrandError> {
+    let id = parse_id(&id)?;
+    let actor = signed.session.user;
+    completed(async move { brand::remove_font(&state, &actor, id).await }).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// A font of a package as sent: `{brand_font: id}`, or `{doc: id, licence_confirmed}` for a
+/// site's own package.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FontChoiceBody {
+    #[serde(default)]
+    brand_font: Option<String>,
+    #[serde(default)]
+    doc: Option<String>,
+    #[serde(default)]
+    licence_confirmed: Option<bool>,
+}
+
+impl FontChoiceBody {
+    /// The choice this body makes.
+    ///
+    /// # Errors
+    /// `422 invalid_font_package` for neither or both ways; `422 invalid_request` for an id
+    /// that is not one.
+    fn choice(self) -> Result<FontChoice, BrandError> {
+        match (self.brand_font, self.doc) {
+            (Some(id), None) if self.licence_confirmed.is_none() => {
+                Ok(FontChoice::BrandFont(parse_id(&id)?))
+            }
+            (None, Some(doc)) => Ok(FontChoice::Doc {
+                doc: DocId(parse_id(&doc)?),
+                licence_confirmed: self.licence_confirmed.unwrap_or(false),
+            }),
+            _ => Err(BrandError::InvalidFontPackage(
+                "a font is given as {brand_font} or {doc, licence_confirmed}".into(),
+            )),
+        }
+    }
+}
+
+/// The body of `POST /api/brand/font-packages` and `POST /api/sites/{id}/font-packages`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NewPackage {
+    name: String,
+    #[serde(default)]
+    display: Option<FontChoiceBody>,
+    #[serde(default)]
+    content: Option<FontChoiceBody>,
+    roles: FontRoles,
+}
+
+impl NewPackage {
+    /// The new package as a change of a blank one.
+    ///
+    /// # Errors
+    /// As [`FontChoiceBody::choice`].
+    pub(crate) fn edit(self) -> Result<PackageEdit, BrandError> {
+        Ok(PackageEdit {
+            name: Some(self.name),
+            display: Some(self.display.map(FontChoiceBody::choice).transpose()?),
+            content: Some(self.content.map(FontChoiceBody::choice).transpose()?),
+            roles: Some(self.roles),
+        })
+    }
+}
+
+/// The body of `PATCH /api/brand/font-packages/{id}` and its site counterpart: each field given
+/// is set; a font set to `null` is removed.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PackageEditBody {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default, deserialize_with = "present")]
+    display: Option<Option<FontChoiceBody>>,
+    #[serde(default, deserialize_with = "present")]
+    content: Option<Option<FontChoiceBody>>,
+    #[serde(default)]
+    roles: Option<FontRoles>,
+}
+
+impl PackageEditBody {
+    /// The change this body asks for.
+    ///
+    /// # Errors
+    /// As [`FontChoiceBody::choice`].
+    pub(crate) fn edit(self) -> Result<PackageEdit, BrandError> {
+        let font = |given: Option<Option<FontChoiceBody>>| {
+            given
+                .map(|f| f.map(FontChoiceBody::choice).transpose())
+                .transpose()
+        };
+        Ok(PackageEdit {
+            name: self.name,
+            display: font(self.display)?,
+            content: font(self.content)?,
+            roles: self.roles,
+        })
+    }
+}
+
+/// `POST /api/brand/font-packages {name, display?, content?, roles}`: adds a font package of
+/// brand-centre fonts (see [`brand::create_package`]); `201` with the package as listed. `403`;
+/// `422 invalid_font_package {reason}`; `409 name_taken`; `409 too_many {limit}`.
+pub(crate) async fn create_package(
+    State(state): State<AppState>,
+    signed: Signed,
+    JsonBody(body): JsonBody<NewPackage>,
+) -> Result<Response, BrandError> {
+    let edit = body.edit()?;
+    let actor = signed.session.user;
+    let package =
+        completed(async move { brand::create_package(&state, &actor, edit).await }).await?;
+    Ok((StatusCode::CREATED, Json(org_package_out(&package))).into_response())
+}
+
+/// `PATCH /api/brand/font-packages/{id}`: changes a font package of the brand centre (see
+/// [`brand::change_package`]); the package as listed. `404` for no such package; otherwise as
+/// [`create_package`].
+pub(crate) async fn change_package(
+    State(state): State<AppState>,
+    signed: Signed,
+    Path(id): Path<String>,
+    JsonBody(body): JsonBody<PackageEditBody>,
+) -> Result<Json<Value>, BrandError> {
+    let id = parse_id(&id)?;
+    let edit = body.edit()?;
+    let actor = signed.session.user;
+    let package =
+        completed(async move { brand::change_package(&state, &actor, id, edit).await }).await?;
+    Ok(Json(org_package_out(&package)))
+}
+
+/// `DELETE /api/brand/font-packages/{id}`: deletes a font package of the brand centre; `204`.
+/// Looks that copied it keep their copy. `403`; `404`.
+pub(crate) async fn delete_package(
+    State(state): State<AppState>,
+    signed: Signed,
+    Path(id): Path<String>,
+) -> Result<StatusCode, BrandError> {
+    let id = parse_id(&id)?;
+    let actor = signed.session.user;
+    completed(async move { brand::delete_package(&state, &actor, id).await }).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// The body of `PUT /api/brand/policy`: each limit given is set.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PolicyBody {
+    #[serde(default)]
+    hide_builtin_themes: Option<bool>,
+    #[serde(default)]
+    custom_colours: Option<bool>,
+    #[serde(default)]
+    site_themes: Option<bool>,
+    #[serde(default)]
+    site_images: Option<bool>,
+    #[serde(default)]
+    site_fonts: Option<bool>,
+}
+
+/// `PUT /api/brand/policy {hide_builtin_themes?, custom_colours?, site_themes?, site_images?,
+/// site_fonts?}`: sets the limits on site owners (see [`brand::set_policy`]); the policy.
+/// Administrators only (`403`).
+pub(crate) async fn set_policy(
+    State(state): State<AppState>,
+    signed: Signed,
+    JsonBody(body): JsonBody<PolicyBody>,
+) -> Result<Json<Value>, BrandError> {
+    let edit = PolicyEdit {
+        hide_builtin_themes: body.hide_builtin_themes,
+        custom_colours: body.custom_colours,
+        site_themes: body.site_themes,
+        site_images: body.site_images,
+        site_fonts: body.site_fonts,
+    };
+    let actor = signed.session.user;
+    let policy = completed(async move { brand::set_policy(&state, &actor, edit).await }).await?;
+    Ok(Json(json!(policy)))
+}
+
+/// The body of `PUT /api/brand/default-icon`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DefaultIcon {
+    image: Option<String>,
+}
+
+/// `PUT /api/brand/default-icon {image: id | null}`: makes a brand image of kind `icon` the
+/// organisation's default tab icon, or clears it (see [`brand::set_default_icon`]); `204`.
+/// `403` unless a brand manager or administrator; `404` for no such image; `422 not_an_icon`.
+pub(crate) async fn set_default_icon(
+    State(state): State<AppState>,
+    signed: Signed,
+    JsonBody(body): JsonBody<DefaultIcon>,
+) -> Result<StatusCode, BrandError> {
+    let image = body.image.as_deref().map(parse_id).transpose()?;
+    let actor = signed.session.user;
+    completed(async move { brand::set_default_icon(&state, &actor, image).await }).await?;
+    Ok(StatusCode::NO_CONTENT)
 }

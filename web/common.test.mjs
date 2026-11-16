@@ -1936,6 +1936,12 @@ test('messages_for_branding_errors', () => {
     'too_many',
     'name_taken',
     'held',
+    'not_a_font',
+    'font_too_large',
+    'licence_not_confirmed',
+    'invalid_font_package',
+    'not_allowed',
+    'not_an_icon',
   ];
   const sentences = codes.map(messageFor);
   for (const [at, code] of codes.entries()) assert.notEqual(sentences[at], general, code);

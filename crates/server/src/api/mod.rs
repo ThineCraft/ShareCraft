@@ -103,6 +103,12 @@ pub(crate) fn router() -> Router<AppState> {
         .route("/sites/{id}/look/settings", get(looks::settings))
         .route("/sites/{id}/look/history", get(looks::history))
         .route("/sites/{id}/look/rollback", post(looks::rollback))
+        .route("/sites/{id}/look/copy", post(looks::copy))
+        .route("/sites/{id}/font-packages", post(looks::create_package))
+        .route(
+            "/sites/{id}/font-packages/{package}",
+            patch(looks::change_package).delete(looks::delete_package),
+        )
         .route("/sites/{id}/themes", post(looks::create_theme))
         .route(
             "/sites/{id}/themes/{theme}",
@@ -122,6 +128,18 @@ pub(crate) fn router() -> Router<AppState> {
                 .delete(brand::remove_image),
         )
         .route("/brand/managers", put(brand::set_managers))
+        .route("/brand/fonts", post(brand::add_font))
+        .route(
+            "/brand/fonts/{id}",
+            get(brand::font).delete(brand::remove_font),
+        )
+        .route("/brand/font-packages", post(brand::create_package))
+        .route(
+            "/brand/font-packages/{id}",
+            patch(brand::change_package).delete(brand::delete_package),
+        )
+        .route("/brand/policy", put(brand::set_policy))
+        .route("/brand/default-icon", put(brand::set_default_icon))
         .route("/hubs", get(navigation::hubs))
         .route("/hubs/{id}/sites", get(navigation::hub_sites))
         .route("/sites/{id}/template", post(templates::save))
@@ -409,6 +427,15 @@ pub(crate) enum ApiError {
     ImageGone,
     /// 409: there are already as many as allowed; the answer's `limit` says how many.
     TooMany(usize),
+    /// 422: the file is not a font: not woff2, woff, ttf or otf, judged by its content.
+    NotAFont,
+    /// 413: the font file is larger than 2 MiB.
+    FontTooLarge,
+    /// 422: a font is added only once the organisation's licence for it is confirmed.
+    LicenceNotConfirmed,
+    /// 422: the image cannot be a tab icon: a png or svg, square within 10 %, a png at least
+    /// 32 pixels a side, at most 256 KiB; or a brand image that is not of kind `icon`.
+    NotAnIcon,
     /// 503: the database failed.
     Unavailable,
 }
@@ -500,6 +527,12 @@ impl ApiError {
             ApiError::ImageTooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "image_too_large"),
             ApiError::ImageGone => (StatusCode::CONFLICT, "image_gone"),
             ApiError::TooMany(_) => (StatusCode::CONFLICT, "too_many"),
+            ApiError::NotAFont => (StatusCode::UNPROCESSABLE_ENTITY, "not_a_font"),
+            ApiError::FontTooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "font_too_large"),
+            ApiError::LicenceNotConfirmed => {
+                (StatusCode::UNPROCESSABLE_ENTITY, "licence_not_confirmed")
+            }
+            ApiError::NotAnIcon => (StatusCode::UNPROCESSABLE_ENTITY, "not_an_icon"),
             ApiError::Unavailable => (StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
         }
     }

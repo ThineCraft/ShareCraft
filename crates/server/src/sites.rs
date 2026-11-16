@@ -135,6 +135,7 @@ pub(crate) fn settings_of(record: &SiteRecord) -> Result<SiteSettings, String> {
         navigation: record.navigation.clone(),
         look: record.look.clone(),
         themes: record.themes.clone(),
+        font_packages: record.font_packages.clone(),
         purging: false,
     })
 }
@@ -696,12 +697,13 @@ pub(crate) async fn follow_defaults(state: &AppState) -> bool {
     all_written
 }
 
-/// The pins a site's look asks for: each content its images name, with its type, by hash.
+/// The pins a site asks for: each content its look and its own font packages name, with its type,
+/// by hash.
 fn wanted_pins(settings: &SiteSettings) -> Vec<(String, String)> {
     let mut pins: Vec<(String, String)> = settings
-        .look_images()
+        .pins()
         .into_iter()
-        .map(|image| (image.sha256.clone(), image.media_type.clone()))
+        .map(|pin| (pin.sha256.to_owned(), pin.media_type.to_owned()))
         .collect();
     pins.sort();
     pins

@@ -1,9 +1,9 @@
 //! The mirror of the organisation's brand centre (`org/brand.json` in Git) and the pins its
-//! images hold in the content store.
+//! images and fonts hold in the content store.
 //!
-//! The centre is one row of `org_brand`, which always exists. Each brand image in use pins its
-//! content with a `brand_refs` row naming its owner (`org` for the centre, a site's id for a
-//! site's look); erasure counts these rows as it counts `blob_refs` (see
+//! The centre is one row of `org_brand`, which always exists. Each brand image or font in use
+//! pins its content with a `brand_refs` row naming its owner (`org` for the centre, a site's id
+//! for a site's look and its own font packages, see [`site_pins`]); erasure counts these rows as it counts `blob_refs` (see
 //! [`Db::release_blob_if_unreferenced`]). A change is judged and written in one transaction:
 //! the actor's account row `FOR SHARE`, then the `org_brand` row `FOR UPDATE`, then the
 //! `blobs` rows of newly pinned content `FOR SHARE`, by hash, then the `brand_refs` rows. Git
@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use collab_core::ids::{NodeId, UserId};
 use revisions::BlobRef;
-use revisions::brand::{ImageRef, OrgBrand};
+use revisions::brand::{FontPackage, FontRef, ImageRef, Look, OrgBrand};
 use sqlx::PgConnection;
 
 use crate::blobs::upsert_blob;
@@ -47,30 +47,118 @@ pub struct BrandChange<'a> {
     pub events: Vec<NewEvent>,
 }
 
-/// The content of `image` as the content store names it; `None` for a malformed hash, which
-/// [`ImageRef::problem`] refuses before anything is stored.
-fn blob_of(image: &ImageRef) -> Option<BlobRef> {
+/// Content a brand record pins: its hash, the type it is served as and its size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pin<'a> {
+    /// The content's SHA-256, as the records write it.
+    pub sha256: &'a str,
+    /// The type it was judged to be when chosen: an image or a font type.
+    pub media_type: &'a str,
+    /// Its size in bytes.
+    pub bytes: u64,
+}
+
+impl<'a> From<&'a ImageRef> for Pin<'a> {
+    fn from(image: &'a ImageRef) -> Pin<'a> {
+        Pin {
+            sha256: &image.sha256,
+            media_type: &image.media_type,
+            bytes: image.bytes,
+        }
+    }
+}
+
+impl<'a> From<&'a FontRef> for Pin<'a> {
+    fn from(font: &'a FontRef) -> Pin<'a> {
+        Pin {
+            sha256: &font.sha256,
+            media_type: &font.media_type,
+            bytes: font.bytes,
+        }
+    }
+}
+
+/// Adds `pin` to `pins` unless its content is there already.
+fn add_pin<'a>(pins: &mut Vec<Pin<'a>>, pin: Pin<'a>) {
+    if !pins.iter().any(|p| p.sha256 == pin.sha256) {
+        pins.push(pin);
+    }
+}
+
+/// The font files of `package`.
+fn package_fonts(package: &FontPackage) -> impl Iterator<Item = &FontRef> {
+    package.display.iter().chain(package.content.iter())
+}
+
+/// What the brand centre `brand` pins, each content once: its images, its fonts and the font
+/// files its packages hold copies of.
+#[must_use]
+pub fn org_pins(brand: &OrgBrand) -> Vec<Pin<'_>> {
+    let mut pins = Vec::new();
+    for image in &brand.images {
+        add_pin(&mut pins, Pin::from(&image.image));
+    }
+    for font in &brand.fonts {
+        add_pin(&mut pins, Pin::from(&font.font));
+    }
+    for font in brand.font_packages.iter().flat_map(package_fonts) {
+        add_pin(&mut pins, Pin::from(font));
+    }
+    pins
+}
+
+/// What a site pins, each content once: the images of its look (logo, thumbnail, icon, header
+/// image, footer logo), the fonts of its look, and the fonts of its own font packages.
+#[must_use]
+pub fn site_pins<'a>(look: Option<&'a Look>, packages: &'a [FontPackage]) -> Vec<Pin<'a>> {
+    let mut pins = Vec::new();
+    if let Some(look) = look {
+        for image in [
+            &look.logo,
+            &look.thumbnail,
+            &look.icon,
+            &look.header.image,
+            &look.footer.logo,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            add_pin(&mut pins, Pin::from(image));
+        }
+        for font in look.fonts.iter().flat_map(|f| package_fonts(&f.package)) {
+            add_pin(&mut pins, Pin::from(font));
+        }
+    }
+    for font in packages.iter().flat_map(package_fonts) {
+        add_pin(&mut pins, Pin::from(font));
+    }
+    pins
+}
+
+/// The content of `pin` as the content store names it; `None` for a malformed hash, which the
+/// records' checks refuse before anything is stored.
+fn blob_of(pin: &Pin<'_>) -> Option<BlobRef> {
     Some(BlobRef {
-        sha256: revisions::parse_hex(&image.sha256)?,
-        size: image.bytes,
+        sha256: revisions::parse_hex(pin.sha256)?,
+        size: pin.bytes,
     })
 }
 
-/// Makes the pins of `owner` exactly `images`, on `conn` (a transaction holding whatever the
+/// Makes the pins of `owner` exactly `pins`, on `conn` (a transaction holding whatever the
 /// owner's change locks). Content newly pinned has its `blobs` row locked `FOR SHARE`, by hash,
 /// before its row is written; with `create_missing` (a repair from Git) a missing `blobs` row
 /// is created first, otherwise it means the content was erased meanwhile and nothing is
 /// written: answers `false`. Pins no longer wanted are deleted; the caller then erases content
 /// nothing names any more.
-pub(crate) async fn pin_images(
+pub(crate) async fn pin_contents(
     conn: &mut PgConnection,
     owner: &str,
-    images: &[&ImageRef],
+    pins: &[Pin<'_>],
     create_missing: bool,
 ) -> Result<bool, sqlx::Error> {
-    let wanted: BTreeMap<String, &ImageRef> = images
+    let wanted: BTreeMap<String, &Pin<'_>> = pins
         .iter()
-        .map(|image| (image.sha256.clone(), *image))
+        .map(|pin| (pin.sha256.to_owned(), pin))
         .collect();
     let existing: BTreeSet<String> =
         sqlx::query_scalar::<_, String>("select sha256 from brand_refs where owner = $1")
@@ -79,20 +167,20 @@ pub(crate) async fn pin_images(
             .await?
             .into_iter()
             .collect();
-    let new: Vec<&ImageRef> = wanted
+    let new: Vec<&Pin<'_>> = wanted
         .iter()
         .filter(|(sha, _)| !existing.contains(*sha))
-        .map(|(_, image)| *image)
+        .map(|(_, pin)| *pin)
         .collect();
     if !new.is_empty() {
         if create_missing {
-            for image in &new {
-                if let Some(blob) = blob_of(image) {
+            for pin in &new {
+                if let Some(blob) = blob_of(pin) {
                     upsert_blob(conn, &blob).await?;
                 }
             }
         }
-        let hashes: Vec<String> = new.iter().map(|image| image.sha256.clone()).collect();
+        let hashes: Vec<String> = new.iter().map(|pin| pin.sha256.to_owned()).collect();
         let locked: Vec<String> = sqlx::query_scalar(
             "select sha256 from blobs where sha256 = any($1) order by sha256 for share",
         )
@@ -102,11 +190,11 @@ pub(crate) async fn pin_images(
         if locked.len() != hashes.len() {
             return Ok(false);
         }
-        for image in &new {
+        for pin in &new {
             sqlx::query("insert into brand_refs (sha256, owner, media_type) values ($1, $2, $3)")
-                .bind(&image.sha256)
+                .bind(pin.sha256)
                 .bind(owner)
-                .bind(&image.media_type)
+                .bind(pin.media_type)
                 .execute(&mut *conn)
                 .await?;
         }
@@ -143,11 +231,24 @@ impl Db {
         .await?)
     }
 
-    /// The type the content `sha256` is served as, if the brand centre or a site's look names
-    /// it; `None` if nothing does.
+    /// The image type the content `sha256` is served as, if the brand centre or a site's look
+    /// names it as an image; `None` if nothing does.
     pub async fn brand_image_type(&self, sha256: &[u8; 32]) -> Result<Option<String>, DbError> {
         Ok(sqlx::query_scalar(
-            "select media_type from brand_refs where sha256 = $1 order by owner limit 1",
+            "select media_type from brand_refs where sha256 = $1 and media_type like 'image/%' \
+             order by owner limit 1",
+        )
+        .bind(revisions::hex(sha256))
+        .fetch_optional(self.pool())
+        .await?)
+    }
+
+    /// The font type the content `sha256` is served as, if the brand centre, a site's look or a
+    /// site's own font package names it as a font; `None` if nothing does.
+    pub async fn brand_font_type(&self, sha256: &[u8; 32]) -> Result<Option<String>, DbError> {
+        Ok(sqlx::query_scalar(
+            "select media_type from brand_refs where sha256 = $1 and media_type like 'font/%' \
+             order by owner limit 1",
         )
         .bind(revisions::hex(sha256))
         .fetch_optional(self.pool())
@@ -236,8 +337,8 @@ impl Db {
         .bind(&value)
         .execute(&mut *tx)
         .await?;
-        let images: Vec<&ImageRef> = change.record.images.iter().map(|i| &i.image).collect();
-        if !pin_images(&mut tx, BRAND_CENTRE_OWNER, &images, change.actor.is_none()).await? {
+        let pins = org_pins(change.record);
+        if !pin_contents(&mut tx, BRAND_CENTRE_OWNER, &pins, change.actor.is_none()).await? {
             return Err(AccessError::ImageGone);
         }
         for event in change.events {
