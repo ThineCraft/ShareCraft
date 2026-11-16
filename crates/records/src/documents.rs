@@ -237,6 +237,12 @@ pub enum AccessError {
     /// Not an ICAP scanner address (`icap://host[:port]/service`, no password).
     #[error("that is not a scanner address")]
     InvalidScannerUrl,
+    /// A library is connected to a source only while it is empty.
+    #[error("that library is not empty")]
+    LibraryNotEmpty,
+    /// The library is connected to a source already.
+    #[error("that library is already connected to a source")]
+    SourceExists,
     #[error("a document with that id already exists")]
     Exists,
     #[error("something with that name is already in that place")]

@@ -359,6 +359,10 @@ pub(crate) enum ApiError {
     InvalidLibrarySettings(&'static str),
     /// 409: the library's folders are off: no new folder, and no folder moved or copied in.
     FoldersOff,
+    /// 409: a library is connected to a source only while it is empty.
+    LibraryNotEmpty,
+    /// 409: the library is connected to a source already.
+    SourceExists,
     /// 422: the name does not keep its editor's extension, or a file no editor opens would
     /// take an editor's extension.
     WrongExtension,
@@ -501,6 +505,8 @@ impl ApiError {
                 (StatusCode::UNPROCESSABLE_ENTITY, "invalid_library_settings")
             }
             ApiError::FoldersOff => (StatusCode::CONFLICT, "folders_off"),
+            ApiError::LibraryNotEmpty => (StatusCode::CONFLICT, "library_not_empty"),
+            ApiError::SourceExists => (StatusCode::CONFLICT, "source_exists"),
             ApiError::WrongExtension => (StatusCode::UNPROCESSABLE_ENTITY, "wrong_extension"),
             ApiError::BlockedFileType(_) => (StatusCode::UNPROCESSABLE_ENTITY, "blocked_file_type"),
             ApiError::FileTooLarge(_) => (StatusCode::PAYLOAD_TOO_LARGE, "file_too_large"),
@@ -583,6 +589,8 @@ impl From<AccessError> for ApiError {
             AccessError::InvalidTemplate(reason) => ApiError::InvalidTemplate(reason),
             AccessError::InvalidLibrarySettings(reason) => ApiError::InvalidLibrarySettings(reason),
             AccessError::FoldersOff => ApiError::FoldersOff,
+            AccessError::LibraryNotEmpty => ApiError::LibraryNotEmpty,
+            AccessError::SourceExists => ApiError::SourceExists,
             AccessError::BlockedFileType(file_type) => ApiError::BlockedFileType(file_type),
             AccessError::FileTooLarge(limit) => ApiError::FileTooLarge(limit),
             AccessError::Held(scan) => ApiError::Held(scan),
