@@ -27,6 +27,9 @@ pub enum IdError {
     /// A participant's counter has run out.
     #[error("no more ids can be made")]
     Exhausted,
+    /// The client holds no place yet, so it has no participant number to make ids under.
+    #[error("no place in the session yet")]
+    NoPlace,
 }
 
 /// Makes new ids for one participant, counting on from 0.
