@@ -27,8 +27,9 @@ use collab_core::ids::{DocId, NodeId};
 use futures_util::{StreamExt, TryStreamExt};
 use records::{
     DEFAULT_SOURCE_MAX_BYTES, DEFAULT_SOURCE_MAX_FILES, Editor, NewEvent, NodeKind,
-    SOURCE_MAX_BYTES, SOURCE_MAX_FILES, SourceConfig, SourceItem, SourceState, SourceStatus, User,
-    check_name, check_size, is_format_char, validate_document_name, validate_node_name,
+    SOURCE_MAX_BYTES, SOURCE_MAX_FILES, SourceConfig, SourceItem, SourceState, SourceStatus,
+    UploadTarget, User, check_name, check_size, is_format_char, validate_document_name,
+    validate_node_name,
 };
 use revisions::RevisionId;
 use serde_json::json;
@@ -344,6 +345,68 @@ pub enum SyncError {
 #[must_use]
 pub fn token_context(library: NodeId) -> Vec<u8> {
     format!("source-token:{}", library.0).into_bytes()
+}
+
+/// The authenticated context the webhook secret of `library` is sealed with.
+#[must_use]
+pub fn webhook_context(library: NodeId) -> Vec<u8> {
+    format!("source-webhook:{}", library.0).into_bytes()
+}
+
+/// Abandons every upload session whose file would go into the connected library `library`
+/// (into it or anything below it), whoever started it: a session started while the library
+/// was still empty and ordinary must not finish into it once it is connected. Answers how many
+/// were abandoned; failures are logged.
+pub async fn abandon_uploads_into(state: &AppState, library: NodeId) -> usize {
+    let db = state.db();
+    let site = match db.node(library).await {
+        Ok(Some(node)) => node.site,
+        Ok(None) => return 0,
+        Err(e) => {
+            eprintln!("sharecraft-server: database failure: {e}");
+            return 0;
+        }
+    };
+    let sessions = match db.uploads_in_site(site).await {
+        Ok(sessions) => sessions,
+        Err(e) => {
+            eprintln!("sharecraft-server: database failure: {e}");
+            return 0;
+        }
+    };
+    let mut abandoned = 0;
+    for id in sessions {
+        let session = match db.upload_session(id).await {
+            Ok(Some(session)) => session,
+            // Finished or abandoned meanwhile.
+            Ok(None) => continue,
+            Err(e) => {
+                eprintln!("sharecraft-server: database failure: {e}");
+                continue;
+            }
+        };
+        let place = match session.target {
+            UploadTarget::NewFile { parent } => parent,
+            UploadTarget::NewVersion { doc } => doc.into(),
+        };
+        match db.source_library_of(place).await {
+            Ok(Some(found)) if found == library => {}
+            Ok(_) => continue,
+            Err(e) => {
+                eprintln!("sharecraft-server: database failure: {e}");
+                continue;
+            }
+        }
+        match crate::api::uploads::abandon_session(state, id).await {
+            Ok(()) => abandoned += 1,
+            Err(e) => eprintln!(
+                "sharecraft-server: could not abandon an upload into library {}: {}",
+                library.0,
+                e.code()
+            ),
+        }
+    }
+    abandoned
 }
 
 /// Puts every connection left `syncing` and last checked before `before` back to
@@ -767,7 +830,10 @@ fn github_error(e: GithubError) -> SyncError {
 }
 
 /// The connection's token, opened, if it has one.
-async fn token_of(state: &AppState, config: &SourceConfig) -> Result<Option<Secret>, SyncError> {
+pub(crate) async fn token_of(
+    state: &AppState,
+    config: &SourceConfig,
+) -> Result<Option<Secret>, SyncError> {
     let Some(id) = config.token else {
         return Ok(None);
     };
@@ -829,7 +895,7 @@ async fn connector(
 }
 
 /// The caps on what one library mirrors: files and bytes.
-async fn caps(state: &AppState) -> Result<(usize, u64), SyncError> {
+pub(crate) async fn caps(state: &AppState) -> Result<(usize, u64), SyncError> {
     let db = state.db();
     let read = |value: Option<serde_json::Value>, default: i64| {
         value

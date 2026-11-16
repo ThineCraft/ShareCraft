@@ -22,6 +22,7 @@ mod roles;
 mod session;
 mod settings;
 mod sites;
+mod sources;
 mod templates;
 pub(crate) mod uploads;
 
@@ -71,6 +72,15 @@ pub(crate) fn router() -> Router<AppState> {
         .route("/sites/{id}/reactivate", post(sites::reactivate))
         .route("/sites/{id}/groups", get(sites::groups))
         .route("/sites/{id}/libraries", post(libraries::create))
+        .route("/sites/{id}/libraries/github", post(sources::connect))
+        .route(
+            "/libraries/{id}/source",
+            get(sources::show)
+                .patch(sources::change)
+                .delete(sources::disconnect),
+        )
+        .route("/libraries/{id}/source/sync", post(sources::sync_now))
+        .route("/libraries/{id}/source/webhook", post(sources::webhook))
         .route(
             "/libraries/{id}",
             get(libraries::show).patch(libraries::change),
@@ -371,6 +381,16 @@ pub(crate) enum ApiError {
     /// is created, changed, moved, copied in, deleted or restored here; administrators too.
     /// The answer's `message` says so in words.
     SourceReadOnly,
+    /// 422: GitHub has no such repository, or the token given (or none) cannot see it; the
+    /// answer's `message` says so in words.
+    RepositoryNotFound,
+    /// 422: GitHub refused the token given; the answer's `message` says so in words.
+    TokenRejected,
+    /// 422: the repository has no such branch; the answer's `message` says so in words.
+    BranchNotFound,
+    /// 422: the repository holds more than this server mirrors for one library (its bytes, or
+    /// its files below the folder); the answer's `message` says so in words.
+    RepositoryTooLarge,
     /// 422: the name does not keep its editor's extension, or a file no editor opens would
     /// take an editor's extension.
     WrongExtension,
@@ -516,6 +536,14 @@ impl ApiError {
             ApiError::LibraryNotEmpty => (StatusCode::CONFLICT, "library_not_empty"),
             ApiError::SourceExists => (StatusCode::CONFLICT, "source_exists"),
             ApiError::SourceReadOnly => (StatusCode::CONFLICT, "source_read_only"),
+            ApiError::RepositoryNotFound => {
+                (StatusCode::UNPROCESSABLE_ENTITY, "repository_not_found")
+            }
+            ApiError::TokenRejected => (StatusCode::UNPROCESSABLE_ENTITY, "token_rejected"),
+            ApiError::BranchNotFound => (StatusCode::UNPROCESSABLE_ENTITY, "branch_not_found"),
+            ApiError::RepositoryTooLarge => {
+                (StatusCode::UNPROCESSABLE_ENTITY, "repository_too_large")
+            }
             ApiError::WrongExtension => (StatusCode::UNPROCESSABLE_ENTITY, "wrong_extension"),
             ApiError::BlockedFileType(_) => (StatusCode::UNPROCESSABLE_ENTITY, "blocked_file_type"),
             ApiError::FileTooLarge(_) => (StatusCode::PAYLOAD_TOO_LARGE, "file_too_large"),
@@ -797,6 +825,22 @@ impl IntoResponse for ApiError {
             ApiError::Held(scan) => json!({ "error": code, "scan": scan }),
             ApiError::TooMany(limit) => json!({ "error": code, "limit": limit }),
             ApiError::SourceReadOnly => json!({ "error": code, "message": SOURCE_READ_ONLY }),
+            ApiError::RepositoryNotFound => json!({
+                "error": code,
+                "message": "The repository was not found, or the token cannot see it.",
+            }),
+            ApiError::TokenRejected => json!({
+                "error": code,
+                "message": "GitHub refused the token: it is wrong, expired or revoked, or may                             not read this repository.",
+            }),
+            ApiError::BranchNotFound => json!({
+                "error": code,
+                "message": "The repository has no such branch.",
+            }),
+            ApiError::RepositoryTooLarge => json!({
+                "error": code,
+                "message": "The repository holds more than this server mirrors for one library.",
+            }),
             _ => json!({ "error": code }),
         };
         (status, Json(body)).into_response()
