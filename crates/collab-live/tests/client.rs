@@ -19,7 +19,8 @@ use serde_json::{Value, json};
 
 const FORMAT: &str = "stand-in/1";
 
-fn client_id(n: u128) -> ClientId {
+/// Another person's client.
+fn other(n: u128) -> ClientId {
     serde_json::from_value(json!(format!("00000000-0000-0000-0000-{n:012x}"))).unwrap()
 }
 
@@ -45,7 +46,7 @@ fn empty_catchup() -> String {
 fn entry_full(
     seq: u64,
     participant: u32,
-    client: u128,
+    client: ClientId,
     local: u64,
     seen: u64,
     payload: &str,
@@ -60,7 +61,7 @@ fn entry_full(
             "seed": seed,
             "kind": "change",
             "participant": participant,
-            "client": client_id(client),
+            "client": client,
             "local": local,
             "seen": seen,
             "payload": payload,
@@ -70,7 +71,14 @@ fn entry_full(
     .to_string()
 }
 
-fn entry(seq: u64, participant: u32, client: u128, local: u64, seen: u64, payload: &str) -> String {
+fn entry(
+    seq: u64,
+    participant: u32,
+    client: ClientId,
+    local: u64,
+    seen: u64,
+    payload: &str,
+) -> String {
     entry_full(
         seq,
         participant,
@@ -98,14 +106,16 @@ fn set(id: LiveId, text: &str) -> String {
     })
 }
 
-/// A client for `client` at `participant`, driven into `Live` on an empty document.
-fn live<E: LiveEditor>(editor: &mut E, client: u128, participant: u32) -> LiveClient<E> {
-    let mut live = LiveClient::new(LiveConfig {
-        client: client_id(client),
+fn config() -> LiveConfig {
+    LiveConfig {
         format: FORMAT.to_owned(),
-        resume: None,
         crashed_at: None,
-    });
+    }
+}
+
+/// A new client at `participant`, driven into `Live` on an empty document.
+fn live<E: LiveEditor>(editor: &mut E, participant: u32) -> LiveClient<E> {
+    let mut live = LiveClient::new(config());
     let join = live.connected(0);
     assert_eq!(join.len(), 1);
     live.receive(editor, &joined(participant), 0).unwrap();
@@ -150,7 +160,7 @@ impl LiveEditor for Counting {
 #[test]
 fn own_change_is_shown_and_sent() {
     let mut doc = StandIn::new("a");
-    let mut client = live(&mut doc, 1, 1);
+    let mut client = live(&mut doc, 1);
     let id = client.new_ids(1).unwrap();
     let step = client
         .local(&mut doc, insert(id, "a"), Mode::ShowAtOnce, 10)
@@ -172,13 +182,17 @@ fn confirmation_without_others_does_not_go_back() {
         doc: StandIn::new("a"),
         restores: 0,
     };
-    let mut client = live(&mut doc, 1, 1);
+    let mut client = live(&mut doc, 1);
     let id = client.new_ids(1).unwrap();
     client
         .local(&mut doc, insert(id, "a"), Mode::ShowAtOnce, 10)
         .unwrap();
     let step = client
-        .receive(&mut doc, &entry(1, 1, 1, 1, 0, &insert(id, "a")), 20)
+        .receive(
+            &mut doc,
+            &entry(1, 1, client.client(), 1, 0, &insert(id, "a")),
+            20,
+        )
         .unwrap();
     assert_eq!(doc.restores, 0);
     assert_eq!(client.pending(), 0);
@@ -197,7 +211,7 @@ fn confirmation_without_others_does_not_go_back() {
 #[test]
 fn others_change_rolls_back_and_reruns() {
     let mut doc = StandIn::new("a");
-    let mut client = live(&mut doc, 1, 1);
+    let mut client = live(&mut doc, 1);
     let mine = client.new_ids(1).unwrap();
     client
         .local(&mut doc, insert(mine, "a"), Mode::ShowAtOnce, 10)
@@ -205,7 +219,7 @@ fn others_change_rolls_back_and_reruns() {
     let step = client
         .receive(
             &mut doc,
-            &entry(1, 2, 2, 1, 0, &insert(LiveId(2, 0), "x")),
+            &entry(1, 2, other(2), 1, 0, &insert(LiveId(2, 0), "x")),
             20,
         )
         .unwrap();
@@ -225,11 +239,11 @@ fn others_change_rolls_back_and_reruns() {
 #[test]
 fn racing_changes_converge() {
     // Both start from a line someone else wrote, then change it at the same moment.
-    let base = entry(1, 3, 3, 1, 0, &insert(LiveId(3, 0), "base"));
+    let base = entry(1, 3, other(3), 1, 0, &insert(LiveId(3, 0), "base"));
     let mut doc_a = StandIn::new("a");
     let mut doc_b = StandIn::new("b");
-    let mut a = live(&mut doc_a, 1, 1);
-    let mut b = live(&mut doc_b, 2, 2);
+    let mut a = live(&mut doc_a, 1);
+    let mut b = live(&mut doc_b, 2);
     a.receive(&mut doc_a, &base, 5).unwrap();
     b.receive(&mut doc_b, &base, 5).unwrap();
 
@@ -251,10 +265,10 @@ fn racing_changes_converge() {
 
     // The server's order: A's two, then B's two, all made against seen 1.
     let order = [
-        entry(2, 1, 1, 1, 1, &a_set),
-        entry(3, 1, 1, 2, 1, &a_ins),
-        entry(4, 2, 2, 1, 1, &b_set),
-        entry(5, 2, 2, 2, 1, &b_ins),
+        entry(2, 1, a.client(), 1, 1, &a_set),
+        entry(3, 1, a.client(), 2, 1, &a_ins),
+        entry(4, 2, b.client(), 1, 1, &b_set),
+        entry(5, 2, b.client(), 2, 1, &b_ins),
     ];
     for frame in &order {
         a.receive(&mut doc_a, frame, 20).unwrap();
@@ -285,7 +299,7 @@ fn racing_changes_converge() {
 #[test]
 fn wait_for_server_is_not_shown_until_confirmed() {
     let mut doc = StandIn::new("a");
-    let mut client = live(&mut doc, 1, 1);
+    let mut client = live(&mut doc, 1);
     let id = client.new_ids(1).unwrap();
     let step = client
         .local(&mut doc, insert(id, "a"), Mode::WaitForServer, 10)
@@ -294,7 +308,11 @@ fn wait_for_server_is_not_shown_until_confirmed() {
     assert_eq!(sent(&step.send).len(), 1);
     assert_eq!(client.pending(), 1);
     client
-        .receive(&mut doc, &entry(1, 1, 1, 1, 0, &insert(id, "a")), 20)
+        .receive(
+            &mut doc,
+            &entry(1, 1, client.client(), 1, 0, &insert(id, "a")),
+            20,
+        )
         .unwrap();
     assert_eq!(doc.lines(), vec!["a"]);
     assert_eq!(client.pending(), 0);
@@ -303,13 +321,17 @@ fn wait_for_server_is_not_shown_until_confirmed() {
 #[test]
 fn stamped_change_is_reapplied_with_server_stamp() {
     let mut doc = StandIn::new("a");
-    let mut client = live(&mut doc, 1, 1);
+    let mut client = live(&mut doc, 1);
     let id = client.new_ids(1).unwrap();
     client
         .local(&mut doc, insert(id, "a"), Mode::ShowAtOnce, 10)
         .unwrap();
     client
-        .receive(&mut doc, &entry(1, 1, 1, 1, 0, &insert(id, "a")), 20)
+        .receive(
+            &mut doc,
+            &entry(1, 1, client.client(), 1, 0, &insert(id, "a")),
+            20,
+        )
         .unwrap();
     let stamp = StandIn::op(&StandInOp::Stamp { id });
     client
@@ -319,7 +341,7 @@ fn stamped_change_is_reapplied_with_server_stamp() {
     client
         .receive(
             &mut doc,
-            &entry_full(2, 1, 1, 2, 1, &stamp, 1_763_290_000_000, 42),
+            &entry_full(2, 1, client.client(), 2, 1, &stamp, 1_763_290_000_000, 42),
             40,
         )
         .unwrap();
@@ -333,7 +355,7 @@ fn sixty_four_folds_then_goes_back() {
         doc: StandIn::new("a"),
         restores: 0,
     };
-    let mut client = live(&mut doc, 1, 1);
+    let mut client = live(&mut doc, 1);
     let mut payloads = Vec::new();
     for _ in 0..65 {
         let id = client.new_ids(1).unwrap();
@@ -346,7 +368,11 @@ fn sixty_four_folds_then_goes_back() {
     for (n, payload) in payloads.iter().take(64).enumerate() {
         let seq = n as u64 + 1;
         client
-            .receive(&mut doc, &entry(seq, 1, 1, seq, 0, payload), 20)
+            .receive(
+                &mut doc,
+                &entry(seq, 1, client.client(), seq, 0, payload),
+                20,
+            )
             .unwrap();
     }
     assert_eq!(doc.restores, 1);
@@ -358,7 +384,7 @@ fn sixty_four_folds_then_goes_back() {
 #[test]
 fn refusal_takes_the_change_back() {
     let mut doc = StandIn::new("a");
-    let mut client = live(&mut doc, 1, 1);
+    let mut client = live(&mut doc, 1);
     let first = client.new_ids(1).unwrap();
     let second = client.new_ids(1).unwrap();
     client
@@ -381,11 +407,11 @@ fn refusal_takes_the_change_back() {
 #[test]
 fn losing_edit_rights_drops_waiting_changes() {
     let mut doc = StandIn::new("a");
-    let mut client = live(&mut doc, 1, 1);
+    let mut client = live(&mut doc, 1);
     client
         .receive(
             &mut doc,
-            &entry(1, 2, 2, 1, 0, &insert(LiveId(2, 0), "agreed")),
+            &entry(1, 2, other(2), 1, 0, &insert(LiveId(2, 0), "agreed")),
             5,
         )
         .unwrap();
@@ -419,11 +445,11 @@ fn losing_edit_rights_drops_waiting_changes() {
 #[test]
 fn out_of_order_entry_is_an_error() {
     let mut doc = StandIn::new("a");
-    let mut client = live(&mut doc, 1, 1);
+    let mut client = live(&mut doc, 1);
     let error = client
         .receive(
             &mut doc,
-            &entry(2, 2, 2, 1, 0, &insert(LiveId(2, 0), "x")),
+            &entry(2, 2, other(2), 1, 0, &insert(LiveId(2, 0), "x")),
             5,
         )
         .unwrap_err();
@@ -441,7 +467,7 @@ fn out_of_order_entry_is_an_error() {
 #[test]
 fn own_entry_out_of_turn_is_desync() {
     let mut doc = StandIn::new("a");
-    let mut client = live(&mut doc, 1, 1);
+    let mut client = live(&mut doc, 1);
     let first = client.new_ids(1).unwrap();
     let second = client.new_ids(1).unwrap();
     client
@@ -452,7 +478,11 @@ fn own_entry_out_of_turn_is_desync() {
         .unwrap();
     // The server confirms local 2 before local 1.
     let error = client
-        .receive(&mut doc, &entry(1, 1, 1, 2, 0, &insert(second, "two")), 20)
+        .receive(
+            &mut doc,
+            &entry(1, 1, client.client(), 2, 0, &insert(second, "two")),
+            20,
+        )
         .unwrap_err();
     assert!(matches!(error, ClientError::Desync(_)));
     // A refusal for a change that is not first in line is a desync too.
@@ -466,7 +496,7 @@ fn own_entry_out_of_turn_is_desync() {
 #[test]
 fn oversized_local_change_is_refused() {
     let mut doc = StandIn::new("a");
-    let mut client = live(&mut doc, 1, 1);
+    let mut client = live(&mut doc, 1);
     let error = client
         .local(&mut doc, "x".repeat(262_145), Mode::ShowAtOnce, 10)
         .unwrap_err();
@@ -482,12 +512,7 @@ fn oversized_local_change_is_refused() {
 #[test]
 fn local_change_before_live_is_refused() {
     let mut doc = StandIn::new("a");
-    let mut client: LiveClient<StandIn> = LiveClient::new(LiveConfig {
-        client: client_id(1),
-        format: FORMAT.to_owned(),
-        resume: None,
-        crashed_at: None,
-    });
+    let mut client: LiveClient<StandIn> = LiveClient::new(config());
     assert_eq!(
         client
             .local(&mut doc, insert(LiveId(1, 0), "a"), Mode::ShowAtOnce, 0)
@@ -500,7 +525,7 @@ fn local_change_before_live_is_refused() {
 #[test]
 fn crashing_local_change_is_taken_back() {
     let mut doc = StandIn::new("a");
-    let mut client = live(&mut doc, 1, 1);
+    let mut client = live(&mut doc, 1);
     let id = client.new_ids(1).unwrap();
     client
         .local(&mut doc, insert(id, "kept"), Mode::ShowAtOnce, 10)
@@ -519,9 +544,209 @@ fn crashing_local_change_is_taken_back() {
 #[test]
 fn malformed_frame_is_an_error() {
     let mut doc = StandIn::new("a");
-    let mut client = live(&mut doc, 1, 1);
+    let mut client = live(&mut doc, 1);
     assert!(matches!(
         client.receive(&mut doc, "not json", 5).unwrap_err(),
         ClientError::Malformed(_)
     ));
+}
+
+/// The server's answer to a join that kept the place `participant`.
+fn joined_kept(participant: u32) -> String {
+    let mut frame: Value = serde_json::from_str(&joined(participant)).unwrap();
+    frame["place"] = json!({ "is": "kept" });
+    frame.to_string()
+}
+
+fn catchup(base: u64, from: u64, head: u64) -> String {
+    json!({ "type": "catchup", "base": base, "revision": null, "from": from, "head": head })
+        .to_string()
+}
+
+#[test]
+fn refusal_after_access_loss_is_ignored() {
+    let mut doc = StandIn::new("a");
+    let mut client = live(&mut doc, 1);
+    for text in ["one", "two"] {
+        let id = client.new_ids(1).unwrap();
+        client
+            .local(&mut doc, insert(id, text), Mode::ShowAtOnce, 10)
+            .unwrap();
+    }
+    let access = json!({ "type": "access", "can_edit": false }).to_string();
+    client.receive(&mut doc, &access, 20).unwrap();
+    // The server refused both before it saw the role change reach the client.
+    for local in [1, 2] {
+        let refused =
+            json!({ "type": "refused", "local": local, "reason": "read_only" }).to_string();
+        let step = client.receive(&mut doc, &refused, 30).unwrap();
+        assert_eq!(step, Default::default());
+    }
+    assert_eq!(client.phase(), Phase::Live);
+    assert!(doc.lines().is_empty());
+    // A refusal of a number this client never gave out is still out of step.
+    let never = json!({ "type": "refused", "local": 3, "reason": "read_only" }).to_string();
+    assert!(matches!(
+        client.receive(&mut doc, &never, 40).unwrap_err(),
+        ClientError::Desync(_)
+    ));
+}
+
+#[test]
+fn fresh_clients_get_different_ids() {
+    let first: LiveClient<StandIn> = LiveClient::new(config());
+    let second: LiveClient<StandIn> = LiveClient::new(config());
+    assert_ne!(first.client(), second.client());
+    assert_eq!(first.resume(), None);
+    // The join frame names the client's own identifier and no place.
+    let mut third: LiveClient<StandIn> = LiveClient::new(config());
+    let join: Value = serde_json::from_str(&third.connected(0)[0]).unwrap();
+    assert_eq!(join["client"], json!(third.client()));
+    assert_eq!(join["resume"], Value::Null);
+    assert_eq!(join["seen"], Value::Null);
+}
+
+#[test]
+fn reconnect_keeps_local_numbers_and_ids() {
+    let mut doc = StandIn::new("a");
+    let mut client = live(&mut doc, 1);
+    let first = client.new_ids(1).unwrap();
+    assert_eq!(first, LiveId(1, 0));
+    client
+        .local(&mut doc, insert(first, "one"), Mode::ShowAtOnce, 10)
+        .unwrap();
+
+    client.disconnected(20);
+    let join: Value = serde_json::from_str(&client.connected(30)[0]).unwrap();
+    assert_eq!(join["client"], json!(client.client()));
+    assert_eq!(join["resume"]["participant"], 1);
+    assert_eq!(join["seen"], 0);
+    client.receive(&mut doc, &joined_kept(1), 40).unwrap();
+    let step = client.receive(&mut doc, &catchup(0, 0, 0), 40).unwrap();
+    assert_eq!(client.phase(), Phase::Live);
+    // The unconfirmed change goes again under its own number.
+    let resent = sent(&step.send);
+    assert_eq!(resent.len(), 1);
+    assert_eq!(resent[0]["local"], 1);
+
+    // New work carries on from where the client was.
+    let second = client.new_ids(1).unwrap();
+    assert_eq!(second, LiveId(1, 1));
+    let step = client
+        .local(&mut doc, insert(second, "two"), Mode::ShowAtOnce, 50)
+        .unwrap();
+    assert_eq!(sent(&step.send)[0]["local"], 2);
+    assert_eq!(doc.lines(), vec!["one", "two"]);
+}
+
+#[test]
+fn own_confirmation_with_other_content_is_desync() {
+    let mut doc = StandIn::new("a");
+    let mut client = live(&mut doc, 1);
+    let id = client.new_ids(1).unwrap();
+    client
+        .local(&mut doc, insert(id, "mine"), Mode::ShowAtOnce, 10)
+        .unwrap();
+    let error = client
+        .receive(
+            &mut doc,
+            &entry(1, 1, client.client(), 1, 0, &insert(id, "not mine")),
+            20,
+        )
+        .unwrap_err();
+    assert!(matches!(error, ClientError::Desync(_)));
+    assert_eq!(client.pending(), 1);
+}
+
+#[test]
+fn others_entry_lands_after_folded_own_entries() {
+    let mut doc = Counting {
+        doc: StandIn::new("a"),
+        restores: 0,
+    };
+    let mut client = live(&mut doc, 1);
+    let a = client.new_ids(1).unwrap();
+    let b = client.new_ids(1).unwrap();
+    client
+        .local(&mut doc, insert(a, "a"), Mode::ShowAtOnce, 10)
+        .unwrap();
+    client
+        .local(&mut doc, insert(b, "b"), Mode::ShowAtOnce, 10)
+        .unwrap();
+    // "a" is confirmed and folded; "b" still waits.
+    client
+        .receive(
+            &mut doc,
+            &entry(1, 1, client.client(), 1, 0, &insert(a, "a")),
+            20,
+        )
+        .unwrap();
+    assert_eq!(doc.restores, 0);
+    client
+        .receive(
+            &mut doc,
+            &entry(2, 2, other(2), 1, 0, &insert(LiveId(2, 0), "x")),
+            30,
+        )
+        .unwrap();
+    assert_eq!(doc.doc.lines(), vec!["a", "x", "b"]);
+    assert_eq!(doc.restores, 1);
+    assert_eq!(client.agreed_seq(), Seq(2));
+    assert_eq!(client.pending(), 1);
+}
+
+#[test]
+fn own_earlier_entry_met_again_from_the_base_is_applied() {
+    let mut doc = StandIn::new("a");
+    let mut client = live(&mut doc, 1);
+    let one = client.new_ids(1).unwrap();
+    let two = client.new_ids(1).unwrap();
+    client
+        .local(&mut doc, insert(one, "one"), Mode::ShowAtOnce, 10)
+        .unwrap();
+    client
+        .receive(
+            &mut doc,
+            &entry(1, 1, client.client(), 1, 0, &insert(one, "one")),
+            20,
+        )
+        .unwrap();
+    client
+        .local(&mut doc, insert(two, "two"), Mode::ShowAtOnce, 30)
+        .unwrap();
+
+    // After a drop the server sends the log from the base again.
+    client.disconnected(40);
+    client.connected(50);
+    client.receive(&mut doc, &joined_kept(1), 50).unwrap();
+    let step = client.receive(&mut doc, &catchup(0, 0, 1), 50).unwrap();
+    assert!(step.events.contains(&Event::LoadBase {
+        revision: None,
+        at: Seq(0),
+    }));
+    client
+        .receive(
+            &mut doc,
+            &entry(1, 1, client.client(), 1, 0, &insert(one, "one")),
+            60,
+        )
+        .unwrap();
+    doc = StandIn::new("a");
+    let step = client.base_ready(&mut doc, 70).unwrap();
+    assert!(step.events.iter().any(|event| matches!(
+        event,
+        Event::Applied {
+            seq: Seq(1),
+            own: true,
+            ..
+        }
+    )));
+    assert_eq!(client.phase(), Phase::Live);
+    assert_eq!(client.pending(), 1);
+    assert_eq!(client.agreed_seq(), Seq(1));
+    assert_eq!(doc.lines(), vec!["one", "two"]);
+    let resent = sent(&step.send);
+    assert_eq!(resent.len(), 1);
+    assert_eq!(resent[0]["local"], 2);
+    assert_eq!(resent[0]["seen"], 1);
 }

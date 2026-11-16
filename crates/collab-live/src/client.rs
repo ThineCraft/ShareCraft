@@ -71,8 +71,9 @@ pub struct EntryView<'a> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Outcome {
     pub effect: Effect,
-    /// Whether the result depended on the stamp, so a change shown before the server stamped
-    /// it must be applied again with the real stamp.
+    /// Whether the result depended on the stamp or the position (`seq`), which are missing
+    /// while a change waits for the server; such a change must be applied again with the real
+    /// ones once the server has put it in order.
     pub read_stamp: bool,
 }
 
@@ -104,14 +105,16 @@ pub enum Mode {
 }
 
 /// What the host gives a new client.
+///
+/// A loaded editor is always a new client: [`LiveClient::new`] makes a fresh random
+/// [`ClientId`], and a place in the session is only ever resumed by the same running client
+/// after its connection dropped, so its local numbers and lasting ids carry on in memory. No
+/// identifier or place is taken from the host, so a reload can never claim an old client's
+/// numbers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LiveConfig {
-    /// This client's identifier, kept across its reconnects.
-    pub client: ClientId,
     /// The format of the changes the editor makes and reads.
     pub format: String,
-    /// The place the client held, kept by the host across reloads.
-    pub resume: Option<LiveResume>,
     /// The host's crash note: the entry the editor stopped in, if any.
     pub crashed_at: Option<Seq>,
 }
@@ -254,6 +257,8 @@ struct Pending {
 /// The library's side of one editor in a live session.
 pub struct LiveClient<E: LiveEditor> {
     config: LiveConfig,
+    /// This client's identifier, made fresh by [`LiveClient::new`].
+    client: ClientId,
     phase: Phase,
     session: Option<LiveSessionId>,
     participant: Option<ParticipantNo>,
@@ -285,6 +290,7 @@ impl<E: LiveEditor> LiveClient<E> {
     pub fn new(config: LiveConfig) -> Self {
         LiveClient {
             config,
+            client: ClientId(uuid::Uuid::new_v4()),
             phase: Phase::Offline,
             session: None,
             participant: None,
@@ -315,7 +321,7 @@ impl<E: LiveEditor> LiveClient<E> {
             pending.sent = false;
         }
         let join = LiveClientMsg::LiveJoin {
-            client: self.config.client,
+            client: self.client,
             protocol: LIVE_PROTOCOL,
             format: self.config.format.clone(),
             resume: self.resume(),
@@ -408,6 +414,13 @@ impl<E: LiveEditor> LiveClient<E> {
             },
             LiveServerMsg::Refused { local, reason } => {
                 let first = self.pending.front().map(|pending| pending.local);
+                // A refusal of a change the client already took off its queue (for example one
+                // dropped when the person lost the right to edit) has nothing left to undo.
+                let already_gone =
+                    local.0 < self.next_local && first.is_none_or(|first| local.0 < first.0);
+                if already_gone {
+                    return Ok(step);
+                }
                 if first != Some(local) {
                     return Err(ClientError::Desync(format!(
                         "refusal of {local:?} while {first:?} is first in line"
@@ -602,15 +615,20 @@ impl<E: LiveEditor> LiveClient<E> {
         self.participant
     }
 
-    /// The place to name when joining again, for the host to keep across reloads.
+    /// The place this client names when it joins again after a dropped connection.
     pub fn resume(&self) -> Option<LiveResume> {
         match (self.session, self.participant) {
             (Some(session), Some(participant)) => Some(LiveResume {
                 session,
                 participant,
             }),
-            _ => self.config.resume,
+            _ => None,
         }
+    }
+
+    /// This client's identifier, made fresh for every new client.
+    pub fn client(&self) -> ClientId {
+        self.client
     }
 
     /// Whether the person may make changes.
@@ -689,7 +707,12 @@ impl<E: LiveEditor> LiveClient<E> {
                 ..
             } => (participant, client, local, payload, cancelled),
         };
-        let own = client == self.config.client;
+        let own = client == self.client;
+        if own && local.0 >= self.next_local {
+            return Err(ClientError::Desync(format!(
+                "own change {local:?} was never made"
+            )));
+        }
         let first = self.pending.front().map(|pending| pending.local);
         // An own change confirmed now must be the first in line. An own change with a lower
         // number was confirmed before (it is met again when catching up from the base) and
@@ -698,6 +721,17 @@ impl<E: LiveEditor> LiveClient<E> {
         if confirms && first != Some(local) {
             return Err(ClientError::Desync(format!(
                 "own change {local:?} confirmed while {first:?} is first in line"
+            )));
+        }
+        if confirms
+            && !cancelled
+            && self
+                .pending
+                .front()
+                .is_some_and(|pending| pending.payload != payload)
+        {
+            return Err(ClientError::Desync(format!(
+                "own change {local:?} came back with a different content"
             )));
         }
         if cancelled {
