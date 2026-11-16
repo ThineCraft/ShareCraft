@@ -1,0 +1,927 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ShareCraft — GridCraft Co-authoring (Plan G2): Implementation Plan</title>
+<style>
+:root{color-scheme:light dark;--ink:light-dark(#172f38,#e4ecef);--muted:light-dark(#536b72,#a9b9bf);--line:light-dark(#d7e2e3,#36454b);--paper:light-dark(#fff,#1d272b);--wash:light-dark(#f2f6f5,#141b1e);--accent:light-dark(#3156c9,#9db4ff);font:15px/1.6 Segoe UI,system-ui,sans-serif;color:var(--ink);background:var(--wash)}
+*{box-sizing:border-box}body{margin:0;padding:28px 18px 80px}main{max-width:940px;margin:auto}
+h1{font-size:1.9rem;letter-spacing:-.03em;line-height:1.2;margin:0 0 14px}h2{font-size:1.3rem;margin:38px 0 12px;padding-top:18px;border-top:1px solid var(--line)}h3{font-size:1.08rem;margin:30px 0 8px}h4{font-size:.95rem;margin:16px 0 6px}
+p{margin:0 0 12px}ul,ol{margin:0 0 12px;padding-left:22px}li{margin-bottom:6px}a{color:var(--accent)}
+code{font-family:Consolas,Menlo,monospace;font-size:.88em;background:light-dark(#e9efee,#263238);padding:1px 5px;border-radius:3px;overflow-wrap:anywhere}
+pre{background:var(--paper);border:1px solid var(--line);border-radius:7px;padding:12px 14px;overflow-x:auto;font:13px/1.5 Consolas,Menlo,monospace;margin:0 0 12px}pre code{background:none;padding:0;font-size:inherit}
+.note{border-left:4px solid var(--accent);background:var(--paper);padding:12px 16px;margin:0 0 14px}.note p:last-child{margin:0}
+.task{background:var(--paper);border:1px solid var(--line);border-radius:9px;padding:6px 20px 14px;margin:18px 0}
+ol.steps{list-style:none;padding-left:0}ol.steps>li{padding-left:28px;position:relative;margin-bottom:10px}ol.steps>li::before{content:"☐";position:absolute;left:2px;color:var(--muted)}
+table{border-collapse:collapse;width:100%;font-size:.9rem;background:var(--paper);margin-bottom:14px}th,td{border:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top}th{background:light-dark(#e8efed,#263238)}
+.small{font-size:.88rem;color:var(--muted)}
+tbody tr:nth-child(even) td{background:light-dark(#f4f8f7,#212b30)}
+ol.steps>li:nth-child(even),ul.band>li:nth-child(even),ol.band>li:nth-child(even){background:light-dark(#f4f8f7,#212b30);border-radius:4px}
+</style>
+</head>
+<body><main>
+<h1>GridCraft live co-authoring, plan G2: the shared library and the opaque-entry room: implementation plan</h1>
+<p class="small">ShareCraft &middot; Stage 2, editor track &middot; Written 16 November 2026</p>
+<div class="note"><p><strong>For agentic workers:</strong> REQUIRED SUB-SKILL: use superpowers:subagent-driven-development or superpowers:executing-plans. Steps are checkboxes.</p></div>
+
+<p><strong>Goal:</strong> build the two halves of live co-authoring that know nothing about spreadsheets:
+<ul>
+<li><strong>the shared collaboration library</strong>, a Rust crate that each editor fork builds in. It joins a session, sends a person's changes, resends them after a dropped connection, sends the heartbeat every minute, keeps the agreed and shown states, goes back and re-runs waiting changes, and makes lasting identities;</li>
+<li><strong>the opaque-entry room on the server.</strong> It puts every change in one order, stamps it, keeps it in PostgreSQL before passing it on, never looks inside it, ends a person's place after three missed heartbeats, ends the session when the last person has gone, and applies the cancelling rule.</li>
+</ul>
+Everything is tested with a small stand-in document, so no GridCraft code is needed.</p>
+<p><strong>Why now:</strong> G2 does not depend on G1's results (see the G1 plan's road table), so it can be built while the owner decides on G1's "go with conditions". G3 (GridCraft) and G5 (the bridge) both build on it.</p>
+<p><strong>Architecture:</strong>
+<ul>
+<li>A new crate, <code>crates/collab-live</code>, holds the library. It does no input or output of its own: the host hands it each frame received and the current time in milliseconds, and it returns the frames to send and what happened. So the same code serves the browser build and the desktop build, and every rule can be tested without a network.</li>
+<li>The wire messages go in a new module of the existing <code>protocol</code> crate, <code>protocol::live</code>, beside the text and file messages.</li>
+<li>The server gets a third kind of room, the live room (<code>crates/server/src/live_room.rs</code>), reached through the existing <code>/ws/docs/{doc_id}</code> address for documents whose editor is listed in a new setting that is empty by default. The server depends on <code>protocol</code> only. It uses <code>collab-live</code> only in its tests.</li>
+<li>The log is kept in four new PostgreSQL tables, added by migration <code>0017_live_log.sql</code>, through a new module <code>crates/records/src/live.rs</code>.</li>
+<li>The text room (<code>room.rs</code>) and the file session (<code>file_room.rs</code>) do not change (C15, C17).</li>
+</ul></p>
+<p><strong>Tech stack:</strong> the ShareCraft Rust workspace (edition 2024); <code>serde</code>, <code>serde_json</code>, <code>thiserror</code> and <code>uuid</code> as already used; <code>proptest</code> 1.12.0 for property tests (already a test dependency of <code>collab-text</code>); <code>sqlx</code> and PostgreSQL through <code>records</code>; <code>tokio</code> with paused time for timing tests. No new runtime dependency.</p>
+<p><strong>Spec:</strong>
+<ul>
+<li><a href="../co-authoring-approach.html">co-authoring-approach.html</a> v1.1: C1 to C23, above all section 04 (how it works, the session and the heartbeat, returning clients), section 05 (log on disk, retention), section 10 (the shared library), section 11 (spine changes) and section 12 (risks);</li>
+<li><a href="../gridcraft-coauthoring-proofs.html">gridcraft-coauthoring-proofs.html</a> section 10: agreement across platforms uses entered content only;</li>
+<li><a href="../scope.html">scope.html</a>: D12, D15, D16, D20 to D22; <a href="../sequencing.html">sequencing.html</a>: the spine rules S1 to S7 and Stage 2's editor track (A07, A17).</li>
+</ul></p>
+
+<h2>The road (for context)</h2>
+<table>
+<tr><th>Plan</th><th>What it builds</th><th>Where</th></tr>
+<tr><td>G1 (done)</td><td>The proofs and the go/no-go report.</td><td>GridCraft tests, ShareCraft documents</td></tr>
+<tr><td>G2 (this)</td><td>The shared collaboration library and the opaque-entry room, with its log in PostgreSQL. Tested with a stand-in document.</td><td>ShareCraft</td></tr>
+<tr><td>G3</td><td>GridCraft identities, target-explicit shared commands, the apply loop with rollback and re-run, per-person undo.</td><td>GridCraft</td></tr>
+<tr><td>G4</td><td>Checkpoint tickets, second-hash verification, returning clients and major versions, the unsaved-log limit.</td><td>ShareCraft and GridCraft</td></tr>
+<tr><td>G5</td><td>The host bridge, presence, notices in the frame, the A07/A17 acceptance run.</td><td>Both</td></tr>
+</table>
+
+<h2>What G2 reuses, generalises or replaces from Stage 1</h2>
+<table>
+<tr><th>Stage 1 code</th><th>In G2</th></tr>
+<tr><td><code>collab-core</code> ids: <code>ClientId</code>, <code>DocId</code>, <code>UserId</code>, <code>SessionId</code>, <code>Seq</code></td><td>Reused unchanged.</td></tr>
+<tr><td><code>collab-core</code> <code>Document</code> trait, <code>ServerLog</code> (server merges by transforming)</td><td>Not used by the live room. Kept for the text room until it moves (C15).</td></tr>
+<tr><td><code>collab-core</code> <code>ClientState</code> (one change in flight, a queue, resend)</td><td>Generalised in <code>collab-live</code>: several changes in flight in order, resend after reconnect, and rollback and re-run in place of transforming. <code>ClientState</code> stays for text.</td></tr>
+<tr><td><code>collab-text</code> (text transform)</td><td>Untouched. It moves into the library with WordCraft (Stage 3, section 09).</td></tr>
+<tr><td><code>protocol</code> text and file messages; <code>RemovedReason</code></td><td>Unchanged. <code>RemovedReason</code> is reused by the live messages. New module <code>protocol::live</code>.</td></tr>
+<tr><td><code>web-client</code> (the text page's WebAssembly client)</td><td>Untouched. GridCraft builds <code>collab-live</code> into its own WebAssembly in G3 and G5.</td></tr>
+<tr><td>Server <code>members.rs</code> (<code>Members</code>, <code>Frames</code>, <code>AccessRules</code>, <code>apply_access</code>)</td><td>Reused: the live room's connections are a <code>Members&lt;LiveFrames&gt;</code>, so role changes, removals and the <code>editing.*</code> events work as in the other rooms.</td></tr>
+<tr><td>Server <code>ws.rs</code> (<code>upgrade</code>, <code>visitor</code>, <code>join_with</code>, <code>recheck_after_join</code>, <code>relay</code>)</td><td>Reused; generalised so a document can be a text, file or live document (<code>Visitor.is_file</code> becomes <code>Visitor.kind</code>).</td></tr>
+<tr><td>Server <code>room.rs</code> registry (<code>Rooms</code>, <code>Link</code>)</td><td>Generalised: <code>Link</code> gains <code>Live(LiveLink)</code> and <code>Rooms</code> gains <code>open_live</code>. The text room itself is unchanged, including its 60-second grace rule, which the live room does not use (C21).</td></tr>
+<tr><td>Server <code>checkpoint.rs</code> (<code>Schedule</code>)</td><td>Not used: the live room writes no checkpoints until G4.</td></tr>
+<tr><td><code>records</code> (<code>Db</code>, <code>TestDb</code>, events)</td><td>Reused. New module <code>live.rs</code> and migration 0017.</td></tr>
+</table>
+
+<h2>Proposals in this plan for the owner to check</h2>
+<p>The spec settles the design. These are the choices this plan makes where it does not.</p>
+<ol class="band">
+<li><strong>Names and places.</strong> The library is the crate <code>collab-live</code>; its messages are in <code>protocol::live</code>. The server never depends on the library (only its tests do), so no editor-facing code is built into the server (S6).</li>
+<li><strong>The library does no input or output.</strong> The host passes in frames and the time; the library returns frames and events. This is how the existing text client is built (<code>web-client</code>'s <code>ClientInner</code>) and lets one library serve the browser and the desktop.</li>
+<li><strong>A change's content is text</strong> (UTF-8 inside a JSON string), at most 262,144 bytes. GridCraft's commands are already JSON. The server stores it as bytes and never reads it.</li>
+<li><strong>The format version is a short name</strong> such as <code>gridcraft/1</code>: 1 to 64 characters from <code>a-z 0-9 . _ / -</code>. The live protocol has its own number, 1. A session takes the format of its kept entries, or, when none are kept, of its first joiner.</li>
+<li><strong>Log positions never restart.</strong> They continue for the life of the document, across sessions and server restarts. The text room restarts them for each room lifetime. Continuing them lets a returning client's "position last seen" mean the same thing later (G4).</li>
+<li><strong>Participant numbers are never reused within a document</strong>, so lasting identities (participant number plus a counter) are unique for the whole document, not only one session. This makes G4's returning clients simpler.</li>
+<li><strong>Each change is numbered by its sender</strong>: the client id plus a local number from 1. The server takes them strictly in order. A repeat is dropped silently. A refusal is final and uses up its number, so the sender's later changes keep their order.</li>
+<li><strong>The server stamps each change</strong> with its own clock time in milliseconds and a random 32-bit starting point for random numbers. 32 bits keeps the number exact in JavaScript.</li>
+<li><strong>Rate limit:</strong> the room accepts at most 30 changes a second from one client, with bursts up to 120; beyond that a change is refused. The library paces itself to 20 a second, so a working editor never meets the limit.</li>
+<li><strong>A dropped connection keeps the person's place.</strong> Only a "leave" message (the page closing) or the expiry ends it. The heartbeat carries one number, the last log position the client applied; it is still not written to the log.</li>
+<li><strong>A server restart continues the session.</strong> Everyone who held a place gets a fresh three minutes from the moment the room loads again, because the time the server was down is not their fault.</li>
+<li><strong>A database failure ends the room</strong> without a message. Clients reconnect and resend; nothing is stored twice, because repeats are dropped.</li>
+<li><strong>The cancelling rule in detail.</strong>
+<ul>
+<li>The "editing clients in the session when the entry was sent" are those holding a place with editing rights when the server ordered it. They are stored with the entry.</li>
+<li>"Moved past it" means any message from that client stating it has applied the entry's position or later (a heartbeat or a change).</li>
+<li>Reports are kept in memory only. A client re-reports on every join until it hears the verdict.</li>
+<li>The cancellation is a log entry of its own. Clients that applied the cancelled entry load the base again and replay the log without it.</li>
+<li>A client that reported an entry that stands is told "this device cannot open the document as it now is" and loses its place.</li>
+</ul></li>
+<li><strong>Confirming your own change normally costs nothing.</strong> When nothing else arrived in between, the library does not go back and re-run; it trusts what is shown, up to 64 confirmed changes. It goes back only when another person's change arrives, when 64 have built up, or when the editor says the change read the clock or a random number (its server stamp may differ from the time used to show it).</li>
+<li><strong>"Wait for the server" is chosen per change</strong> by the fork (C13). The library does not decide which commands are heavy.</li>
+<li><strong>Identity tables:</strong> an identity is two 32-bit numbers (participant, counter). Participant 0 names the rows that were in the base document, so an untouched sheet is one run. Deleted identities are remembered as runs, with the position they were at and the identity just above them.</li>
+<li><strong>How the room is reached.</strong> Same address as today; the server picks the live room for documents whose editor is in the new setting <code>Config.live_editors</code>, empty by default. No real document uses the live room until G5 turns it on for GridCraft.</li>
+<li><strong>Left out of G2:</strong>
+<ul>
+<li>the limit on editing participants (exclusive check-out in the live room), until a one-seat editor moves to it;</li>
+<li>large content beside the log, the unsaved-log limit and agreement fingerprints, which go to G4 with checkpoints;</li>
+<li>the personal undo lists, which go to G3 with GridCraft's undo.</li>
+</ul></li>
+<li><strong>Retention:</strong> entries are removed by an hourly sweep 30 days after a verified revision covers them (C18, C22). Nothing marks them covered until G4, so in G2 every entry is kept. Each document's head position is kept for ever (one row), so positions never go back. Purging a document from the bin deletes its log.</li>
+<li><strong>The stand-in document</strong> is a list of lines, each with a lasting identity. It has five commands (insert before a line, delete, set text, write the stamp, crash on a named device), so it exercises order, a change that does nothing, the stamps and both kinds of crash.</li>
+<li><strong>New event kinds</strong> (S7):
+<ul>
+<li><code>live.session_started</code></li>
+<li><code>live.session_ended</code></li>
+<li><code>live.client_expired</code></li>
+<li><code>live.client_returned</code></li>
+<li><code>live.entry_cancelled</code></li>
+<li><code>live.entry_failed_on_device</code></li>
+</ul>
+Their details are positions and counts only, never content.</li>
+</ol>
+
+<h2>Not in this plan</h2>
+<ul class="band">
+<li>Any GridCraft code, and any change to the text room, the file session, the text page or the GridCraft frame page.</li>
+<li>Checkpoints: tickets, uploads at a log position, second-hash verification, unverified revisions, the session data beside the file, major versions, and the log limit with its pause (G4). G2 leaves one hook for G4: <code>Db::mark_live_verified</code>.</li>
+<li>Returning clients beyond the basics: G2 gives a returning client a new participant number and orders its waiting changes as normal entries; storing major versions for it is G4.</li>
+<li>Presence content, the host bridge, notices in the frame, desktop sign-in (G5).</li>
+<li>Agreement fingerprints, which compare entered content only (G4, per the proofs report section 10).</li>
+<li>Large content uploaded beside the log (C20; G4).</li>
+</ul>
+
+<h2>Left for G4 and G5</h2>
+<table>
+<tr><th>Item</th><th>Plan</th><th>What G2 leaves ready</th></tr>
+<tr><td>Checkpoint tickets and uploads at a log position; credit to everyone since the last checkpoint</td><td>G4</td><td>Entries record who sent them; positions are stable across restarts.</td></tr>
+<tr><td>Second-hash verification; "verified": false revisions; re-deriving later</td><td>G4</td><td><code>live_logs.verified_through</code> and <code>Db::mark_live_verified</code>; the join's <code>Catchup</code> already names a base position and revision (always position 0 and no revision in G2).</td></tr>
+<tr><td>Session data (identity tables) stored beside the file</td><td>G4</td><td><code>OrderedIds</code> and <code>IdMaker</code> are serialisable.</td></tr>
+<tr><td>Returning clients' major versions; late changes from an ended session</td><td>G4</td><td>The <code>returning</code> place and the <code>live.client_returned</code> event; participant numbers unique per document.</td></tr>
+<tr><td>Unsaved-log limit and pause (C19); large content (C20); agreement fingerprints</td><td>G4</td><td>Entries are held in memory from the base, so a limit can count them.</td></tr>
+<tr><td>Host bridge, presence content, notices, two real browsers (A07/A17)</td><td>G5</td><td><code>LivePerson</code> lists who holds a place and who is connected.</td></tr>
+<tr><td>Turning the live room on for GridCraft</td><td>G5</td><td><code>Config.live_editors</code>.</td></tr>
+</table>
+
+<h2>Global constraints</h2>
+<ul class="band">
+<li><strong>Exact values:</strong>
+<ul>
+<li>heartbeat every 60,000 ms; expiry after 3 missed heartbeats, that is 180,000 ms without any message (C21);</li>
+<li>any message from a client counts as a sign of life;</li>
+<li>the session ends when the last place holder has left or expired; the 60-second grace rule does not apply to live rooms;</li>
+<li>entries are kept until a verified revision covers them, then for 30 days (C18, C22);</li>
+<li>a change's content is at most 262,144 bytes; one WebSocket message stays at most 1 MiB (<code>ws.rs</code>);</li>
+<li>the live protocol number is 1;</li>
+<li>a format name is 1 to 64 characters from <code>a-z 0-9 . _ / -</code>;</li>
+<li>the server allows 30 changes a second per client, bursts up to 120; the library sends at most 20 a second;</li>
+<li>the library folds at most 64 confirmed changes before going back.</li>
+</ul></li>
+<li><strong>The server never reads a change's content</strong> (S6, C1). No server code parses, inspects or changes the payload. It is stored and sent byte for byte.</li>
+<li><strong>Entries are written to PostgreSQL before they are sent to anyone</strong> (section 05).</li>
+<li><strong>Applying a received entry reads nothing that belongs to one person</strong>; the library hands the editor only the entry, its server stamp and its sender's participant number (section 03).</li>
+<li><strong>No computed values cross the wire or are compared by the server</strong>; cross-platform agreement uses entered content only (proofs report, section 10).</li>
+<li><strong>The library</strong> depends only on <code>collab-core</code>, <code>protocol</code>, <code>serde</code>, <code>serde_json</code> and <code>thiserror</code>; MIT or Apache 2.0, no copyleft (section 10). It has no clocks, threads, sockets or randomness of its own, and builds for <code>wasm32-unknown-unknown</code>: add <code>collab-live</code> to <code>WASM_CRATES</code> in <code>xtask/src/main.rs</code>.</li>
+<li><strong>Workspace lints:</strong> no <code>unwrap</code>, <code>expect</code>, <code>panic</code> or slice indexing outside tests; <code>unsafe</code> is forbidden.</li>
+<li><strong>Migrations</strong> keep LF line endings and are never edited once applied (BUILDING.html section 02). The new one is <code>crates/records/migrations/0017_live_log.sql</code>.</li>
+<li><strong>Checks:</strong> every task ends with <code>cargo xtask check</code> passing. Database tests run through <code>cargo xtask test</code> (it loads <code>TEST_DATABASE_URL</code>); a database test is never skipped.</li>
+<li><strong>Commits</strong> follow the repository's style (<code>feat:</code>, <code>test:</code>, <code>docs:</code>, <code>fix:</code>) and end with <code>Co-Authored-By: Claude Opus 5.5 &lt;noreply@anthropic.com&gt;</code>. Nothing is pushed without the owner's go-ahead.</li>
+</ul>
+
+<h2>Review focus</h2>
+<p>The conditions most likely to hurt a person that the happy-path tests would not catch. Each has a named test in the task that owns it.</p>
+<ol class="band">
+<li><strong>A hostile or malformed entry.</strong> A frame that is not JSON closes only that connection. A payload that is not valid for the editor, or that looks like a server message, is stored and relayed byte for byte and does nothing in every editor alike. Over-long content, a wrong format, a position ahead of the log, a number out of order and a viewer's change are each refused, and the room carries on for everyone else. (Task 8, <code>hostile_entries_are_refused_and_room_carries_on</code>; Task 11, <code>malformed_payload_is_relayed_verbatim_and_does_nothing</code>; Task 3, <code>malformed_payload_has_no_effect</code>.)</li>
+<li><strong>A reconnect that resends.</strong> A client that drops after sending, possibly after the server stored its change, reconnects, catches up and resends. Each change is in the log exactly once, in the sender's order, and the client's shown state equals everyone else's. (Task 5, <code>reconnect_resends_only_unconfirmed</code>; Task 11, <code>reconnect_resends_without_duplicating</code>.)</li>
+<li><strong>Two clients racing.</strong> Two people change the same line at the same moment, each against the same position. The server picks one order; both editors end with the same lines, with the later change standing, and neither person's view is left showing a state nobody agreed. (Task 4, <code>racing_changes_converge</code>; Task 6, <code>random_sessions_converge</code>; Task 11, <code>racing_entries_get_one_order</code>.)</li>
+<li><strong>A heartbeat expiry while an entry is in flight.</strong>
+<ul>
+<li>An entry that arrives just before the expiry counts as a sign of life.</li>
+<li>One that arrives after the server ended the place is ignored, not stored.</li>
+<li>The client rejoins as returning and resends; the change is stored once.</li>
+<li>An entry stored just before the expiry, whose confirmation was lost, is not stored again when resent.</li>
+</ul>
+(Task 9, <code>entry_in_flight_at_expiry_is_stored_once</code>; Task 11, <code>expiry_with_entry_in_flight_commits_once</code>.)</li>
+<li><strong>The log survives a server restart.</strong> After a stop mid-session, a new server serves the same entries with the same positions, stamps and content. Positions continue without a gap or a repeat; a client resending what was stored before the stop is not stored twice; places are kept. (Task 7, <code>log_reloads_exactly</code>; Task 9, <code>loaded_session_continues_with_fresh_expiry</code>; Task 11, <code>log_survives_server_restart</code>.)</li>
+<li><strong>The database fails during a change.</strong> The change is not sent to anyone. The room ends, clients reconnect, and the resent change is stored once. (Task 8, <code>store_failure_ends_room_without_broadcast</code>.)</li>
+</ol>
+
+<h2>File map</h2>
+<table>
+<tr><th>File</th><th>Responsibility</th></tr>
+<tr><td><code>crates/protocol/src/live.rs</code> (new)</td><td>Live wire messages and their limits.</td></tr>
+<tr><td><code>crates/collab-live/src/lib.rs</code>, <code>ids.rs</code>, <code>client.rs</code>, <code>stand_in.rs</code> (new)</td><td>The library: identity tables, the client state machine, and the stand-in document (feature <code>stand-in</code>).</td></tr>
+<tr><td><code>crates/collab-live/tests/support/sim.rs</code>, <code>tests/client.rs</code>, <code>tests/convergence.rs</code> (new)</td><td>A small in-memory orderer that plays the server, and the library's tests.</td></tr>
+<tr><td><code>crates/records/migrations/0017_live_log.sql</code>, <code>crates/records/src/live.rs</code> (new); <code>tests/live.rs</code> (new)</td><td>The log in PostgreSQL.</td></tr>
+<tr><td><code>crates/server/src/live_store.rs</code>, <code>live_room.rs</code>, <code>live_cancel.rs</code> (new)</td><td>The storage seam, the room, the cancelling rule.</td></tr>
+<tr><td><code>crates/server/src/room.rs</code>, <code>ws.rs</code>, <code>config.rs</code>, <code>lib.rs</code>, <code>tree.rs</code> (changed)</td><td>Registry, routing, settings, sweeper, purge.</td></tr>
+<tr><td><code>crates/server/tests/live_room.rs</code>, <code>tests/common/live.rs</code> (new)</td><td>End-to-end tests over WebSocket with the real library and the stand-in.</td></tr>
+</table>
+
+<div class="task">
+<h3>Task 1: the live wire messages</h3>
+<p><strong>Files:</strong> create <code>crates/protocol/src/live.rs</code>; add <code>pub mod live;</code> to <code>crates/protocol/src/lib.rs</code>.</p>
+<p><strong>Produces</strong> (every later task uses these names):</p>
+<pre><code>pub const LIVE_PROTOCOL: u32 = 1;
+pub const MAX_PAYLOAD_BYTES: usize = 262_144;
+pub const MAX_FORMAT_LEN: usize = 64;
+pub const HEARTBEAT_MS: u64 = 60_000;
+pub const EXPIRY_MISSES: u32 = 3;
+pub fn valid_format(format: &amp;str) -&gt; bool;          // 1..=64 chars of a-z 0-9 . _ / -
+
+#[serde(transparent)] pub struct LiveSessionId(pub Uuid);
+#[serde(transparent)] pub struct ParticipantNo(pub u32);   // from 1, never reused in a document
+#[serde(transparent)] pub struct LocalNo(pub u64);         // from 1 per client id
+
+pub struct LiveResume { pub session: LiveSessionId, pub participant: ParticipantNo }
+
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum LiveClientMsg {
+    LiveJoin { client: ClientId, protocol: u32, format: String,
+               resume: Option&lt;LiveResume&gt;, seen: Option&lt;Seq&gt; },
+    Entry { local: LocalNo, seen: Seq, format: String, payload: String },
+    Heartbeat { seen: Seq },
+    Report { seq: Seq },
+    Resync,
+    Leave,
+}
+
+#[serde(tag = "is", rename_all = "snake_case")]
+pub enum Place { New, Kept, Returning { previous: ParticipantNo } }
+
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum LiveServerMsg {
+    LiveJoined { session: LiveSessionId, participant: ParticipantNo, place: Place,
+                 can_edit: bool, heartbeat_ms: u64, people: Vec&lt;LivePerson&gt; },
+    Catchup { base: Seq, revision: Option&lt;String&gt;, from: Seq, head: Seq }, // entries from+1..=head follow
+    Entry { entry: LiveEntry },
+    Refused { local: LocalNo, reason: RefusedReason },
+    CannotOpen { seq: Seq },
+    People { people: Vec&lt;LivePerson&gt; },
+    Access { can_edit: bool },
+    Incompatible { protocol: u32, format: String },   // last frame
+    Expired,                                          // last frame; join again
+    Removed { reason: RemovedReason },                // last frame; do not reconnect
+}
+
+pub struct LiveEntry { pub seq: Seq, pub at_ms: i64, pub seed: u32,
+                       #[serde(flatten)] pub body: EntryBody }
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EntryBody {
+    Change { participant: ParticipantNo, client: ClientId, local: LocalNo, seen: Seq,
+             payload: String, cancelled: bool },        // payload "" when cancelled
+    Cancel { cancels: Seq, reports: u32 },
+}
+pub struct LivePerson { pub participant: ParticipantNo, pub client: ClientId, pub user: UserId,
+                        pub name: String, pub can_edit: bool, pub connected: bool }
+#[serde(rename_all = "snake_case")]
+pub enum RefusedReason { ReadOnly, WrongFormat, TooLarge, RateLimited, BaseAhead, OutOfOrder,
+                         #[serde(other)] Unknown }</code></pre>
+<p>The tag <code>live_join</code> differs from the text and file <code>join</code>, so a live client can never be taken for another kind. <code>LiveServerMsg</code>'s <code>Debug</code> leaves payloads out, as <code>Outbound</code>'s does.</p>
+<ol class="steps">
+<li>Write failing tests in <code>live.rs</code>:
+<ul>
+<li><code>live_message_tags_are_pinned</code>: an exhaustive <code>match</code> per enum, as in <code>file.rs</code>'s <code>file_message_tags_are_pinned</code>, pinning <code>live_join, entry, heartbeat, report, resync, leave</code> and <code>live_joined, catchup, entry, refused, cannot_open, people, access, incompatible, expired, removed</code>.</li>
+<li><code>entry_wire_form_is_pinned</code>: a change serialises exactly as <code>{"seq":5,"at_ms":1763290000000,"seed":42,"kind":"change","participant":2,"client":"00000000-0000-0000-0000-000000000001","local":7,"seen":4,"payload":"{\"op\":\"x\"}","cancelled":false}</code>, and a cancel as <code>{"seq":6,"at_ms":1,"seed":0,"kind":"cancel","cancels":5,"reports":2}</code>; both read back equal.</li>
+<li><code>place_wire_form_is_pinned</code>: <code>{"is":"new"}</code>, <code>{"is":"kept"}</code>, <code>{"is":"returning","previous":3}</code>.</li>
+<li><code>client_messages_refuse_unknown_fields</code>: a <code>live_join</code> with an extra field fails to parse; a text client's <code>{"type":"join","client":…,"resume":null}</code> fails to parse as <code>LiveClientMsg</code>.</li>
+<li><code>unknown_refused_reason_reads_as_unknown</code>: <code>"made_up"</code> reads as <code>RefusedReason::Unknown</code>.</li>
+<li><code>format_names_are_checked</code>: <code>valid_format("gridcraft/1")</code> and a 64-character name are true; <code>""</code>, 65 characters, <code>"GridCraft/1"</code>, <code>"grid craft"</code> and <code>"grid\u{0}"</code> are false.</li>
+<li><code>debug_leaves_payload_out</code>: <code>format!("{:?}", LiveServerMsg::Entry{..})</code> does not contain the payload text.</li>
+</ul></li>
+<li>Run <code>cargo xtask test -p protocol</code>: the new tests fail to compile. Implement. Run again: all pass.</li>
+<li>Commit <code>feat: live session wire messages</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 2: the library crate and the identity tables</h3>
+<p><strong>Files:</strong> create <code>crates/collab-live/Cargo.toml</code> (workspace package fields and lints; dependencies <code>collab-core</code>, <code>protocol</code>, <code>serde</code> with <code>derive</code>, <code>serde_json</code>, <code>thiserror</code>; dev-dependency <code>proptest = "1.12.0"</code>; feature <code>stand-in = []</code>), <code>src/lib.rs</code> (<code>#![forbid(unsafe_code)]</code>, modules), <code>src/ids.rs</code>. Modify <code>xtask/src/main.rs</code>: <code>WASM_CRATES</code> becomes 5 long with <code>"collab-live"</code>.</p>
+<p><strong>Produces:</strong></p>
+<pre><code>#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct LiveId(pub u32, pub u32);          // (participant, counter); participant 0 = base rows
+
+pub struct IdMaker { /* participant, next counter */ }
+impl IdMaker {
+    pub fn new(participant: ParticipantNo) -&gt; IdMaker;            // counter starts at 0
+    pub fn take(&amp;mut self, count: u32) -&gt; Result&lt;LiveId, IdError&gt;; // first of `count` consecutive ids
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct OrderedIds { /* live runs, deleted runs */ }
+pub enum Lookup { At(u32), Deleted { was_at: u32, after: Option&lt;LiveId&gt; }, Unknown }
+impl OrderedIds {
+    pub fn base(len: u32) -&gt; OrderedIds;          // LiveId(0,0)..LiveId(0,len-1), one run
+    pub fn len(&amp;self) -&gt; u32;
+    pub fn runs(&amp;self) -&gt; usize;
+    pub fn id_at(&amp;self, pos: u32) -&gt; Option&lt;LiveId&gt;;
+    pub fn find(&amp;self, id: LiveId) -&gt; Lookup;
+    pub fn insert(&amp;mut self, at: u32, first: LiveId, count: u32) -&gt; Result&lt;(), IdError&gt;;
+    pub fn delete(&amp;mut self, at: u32, count: u32) -&gt; Result&lt;(), IdError&gt;;
+    pub fn move_block(&amp;mut self, from: u32, count: u32, to: u32) -&gt; Result&lt;(), IdError&gt;;
+}
+pub enum IdError { OutOfRange { at: u32, count: u32, len: u32 }, Taken(LiveId), Exhausted }</code></pre>
+<ul class="band">
+<li>Runs are consecutive counters of one participant. Adjacent runs that continue each other merge.</li>
+<li><code>insert</code> refuses an id already live or deleted (<code>Taken</code>): a hostile entry cannot make two rows share an identity.</li>
+<li>A deleted block is remembered as one deleted run. It keeps the position its first id had and the live id just above the block (<code>None</code> at the top).</li>
+<li><code>move_block</code>'s <code>to</code> is a position in the list after the block is taken out.</li>
+<li><code>IdMaker::take</code> fails with <code>Exhausted</code> past counter <code>u32::MAX</code>.</li>
+</ul>
+<ol class="steps">
+<li>Write failing tests in <code>src/ids.rs</code>:
+<ul>
+<li><code>untouched_sheet_is_one_run</code>: <code>OrderedIds::base(1_048_576)</code> has <code>runs() == 1</code>, <code>id_at(5) == Some(LiveId(0,5))</code>, <code>find(LiveId(0,1_048_575)) == At(1_048_575)</code>.</li>
+<li><code>insert_then_find</code>: insert <code>LiveId(2,0)</code> count 3 at position 5 of a base of 10; <code>find(LiveId(2,1)) == At(6)</code>, <code>find(LiveId(0,5)) == At(8)</code>, <code>len() == 13</code>.</li>
+<li><code>deleted_ids_remember_where_they_were</code>: delete 2 at position 3 of a base of 10; <code>find(LiveId(0,4)) == Deleted { was_at: 4, after: Some(LiveId(0,2)) }</code>; deleting at position 0 gives <code>after: None</code>.</li>
+<li><code>reusing_an_id_is_refused</code>: inserting a live id or a deleted id gives <code>Taken</code> and changes nothing.</li>
+<li><code>out_of_range_is_refused</code>: insert at <code>len()+1</code>, delete past the end and a move past the end each give <code>OutOfRange</code> and change nothing.</li>
+<li><code>id_maker_counts_on</code>: <code>take(3)</code> then <code>take(1)</code> give <code>LiveId(p,0)</code> and <code>LiveId(p,3)</code>; past <code>u32::MAX</code> gives <code>Exhausted</code>.</li>
+<li><code>ordered_ids_match_a_plain_list</code> (proptest, 512 cases, up to 200 random inserts, deletes and moves on a base of 0 to 50): after each step every <code>id_at</code> and <code>find</code> agrees with a plain <code>Vec&lt;LiveId&gt;</code> model and a plain deleted-map model, and <code>runs()</code> never exceeds the model's count of breaks plus one.</li>
+<li><code>ordered_ids_round_trip_as_json</code>.</li>
+</ul></li>
+<li>Run <code>cargo xtask test -p collab-live</code>: fail. Implement. Pass. Run <code>cargo xtask check</code>: it builds <code>collab-live</code> for WebAssembly and passes.</li>
+<li>Commit <code>feat: collab-live crate with lasting identity tables</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 3: the stand-in document</h3>
+<p><strong>Files:</strong> create <code>crates/collab-live/src/client.rs</code> with the editor hooks below only (<code>LiveClient</code> comes in Task 4), and <code>crates/collab-live/src/stand_in.rs</code>, compiled only with feature <code>stand-in</code>.</p>
+<p><strong>Produces</strong> (the editor hooks, used by every later library task):</p>
+<pre><code>pub trait LiveEditor {
+    type Snapshot;
+    fn snapshot(&amp;self) -&gt; Self::Snapshot;                 // take a copy of what is shown
+    fn restore(&amp;mut self, snapshot: &amp;Self::Snapshot);     // go back to a copy
+    fn apply(&amp;mut self, entry: &amp;EntryView&lt;'_&gt;) -&gt; Result&lt;Outcome, Crash&gt;;
+    fn note_applying(&amp;mut self, seq: Option&lt;Seq&gt;) {}     // keep the crash note (host-side storage)
+}
+pub struct Stamp { pub at_ms: i64, pub seed: u32 }
+pub struct EntryView&lt;'a&gt; { pub seq: Option&lt;Seq&gt;,          // None while still waiting
+                           pub participant: ParticipantNo, pub own: bool,
+                           pub stamp: Option&lt;Stamp&gt;,      // None while still waiting
+                           pub payload: &amp;'a str }
+pub struct Outcome { pub effect: Effect, pub read_stamp: bool }
+pub enum Effect { Applied, NoEffect { reason: String } }
+pub struct Crash;                                         // the editor stopped in this entry
+
+// stand_in.rs
+#[derive(Clone, Debug, PartialEq)]
+pub struct StandIn { /* device name, lines: Vec&lt;(LiveId, String)&gt;, ids: OrderedIds */ }
+#[derive(Serialize, Deserialize)] #[serde(tag = "op", rename_all = "snake_case")]
+pub enum StandInOp {
+    Insert { before: Option&lt;LiveId&gt;, id: LiveId, text: String },  // None = at the end
+    Delete { id: LiveId },
+    Set { id: LiveId, text: String },
+    Stamp { id: LiveId },          // sets the line to "{at_ms}/{seed}", or "local" while waiting
+    CrashIf { device: String },    // Err(Crash) on the device with this name, nothing elsewhere
+}
+impl StandIn {
+    pub fn new(device: &amp;str) -&gt; StandIn;            // empty: the base in G2
+    pub fn lines(&amp;self) -&gt; Vec&lt;String&gt;;
+    pub fn op(op: &amp;StandInOp) -&gt; String;             // the payload text for an op
+}
+impl LiveEditor for StandIn { type Snapshot = StandIn; /* … */ }</code></pre>
+<p>Outcomes are the conflict principles of C8 in miniature: an insert before a line that is gone, a set or delete of a line that is gone, a reused id, a text over 1,000 characters and a payload that does not parse all give <code>NoEffect</code> with a reason, on every device alike. Only <code>Stamp</code> reports <code>read_stamp: true</code>.</p>
+<ol class="steps">
+<li>Write failing tests in <code>stand_in.rs</code>:
+<ul>
+<li><code>insert_set_delete</code>: three inserts at the end, a set and a delete give the expected <code>lines()</code>.</li>
+<li><code>insert_before_names_a_line</code>: inserting before the first line's id puts the new line first.</li>
+<li><code>edits_to_a_deleted_line_do_nothing</code>: set and delete of a deleted id, and insert before it, each give <code>NoEffect</code> and leave <code>lines()</code> as it was.</li>
+<li><code>malformed_payload_has_no_effect</code>: <code>"not json"</code>, <code>"{\"op\":\"unknown\"}"</code>, <code>"{\"type\":\"joined\"}"</code> and a 1,001-character text each give <code>NoEffect</code>.</li>
+<li><code>stamp_uses_the_server_stamp</code>: with <code>stamp: Some(Stamp{at_ms: 1000, seed: 7})</code> the line is <code>"1000/7"</code> and <code>read_stamp</code> is true; with <code>None</code> it is <code>"local"</code>.</li>
+<li><code>crash_only_on_the_named_device</code>: <code>CrashIf{device:"b"}</code> gives <code>Err(Crash)</code> on <code>StandIn::new("b")</code> and <code>Applied</code> with no change on <code>"a"</code>.</li>
+<li><code>restore_goes_back</code>: snapshot, apply two ops, restore: <code>lines()</code> equals the snapshot's.</li>
+</ul></li>
+<li>Run <code>cargo xtask test -p collab-live --features stand-in</code>: fail. Implement. Pass.</li>
+<li>Commit <code>feat: editor hooks and a stand-in document for live sessions</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 4: the client: agreed and shown states</h3>
+<p><strong>Files:</strong> <code>crates/collab-live/src/client.rs</code> (add <code>LiveClient</code>); create <code>crates/collab-live/tests/client.rs</code> (uses <code>--features stand-in</code>; declare <code>required-features = ["stand-in"]</code> for the test targets in <code>Cargo.toml</code>).</p>
+<p><strong>Consumes:</strong> Task 1's messages; Task 3's hooks and <code>StandIn</code>.</p>
+<p><strong>Produces:</strong></p>
+<pre><code>pub enum Mode { ShowAtOnce, WaitForServer }
+pub struct LiveConfig { pub client: ClientId, pub format: String,
+                        pub resume: Option&lt;LiveResume&gt;,     // kept by the host across reloads
+                        pub crashed_at: Option&lt;Seq&gt; }       // the host's crash note, if any
+pub struct Step { pub send: Vec&lt;String&gt;, pub events: Vec&lt;Event&gt; }
+pub enum Event {
+    LoadBase { revision: Option&lt;String&gt;, at: Seq },
+    Applied { seq: Seq, own: bool, effect: Effect },
+    Refused { local: LocalNo, reason: RefusedReason },
+    DroppedPending { count: usize },
+    Crashed { seq: Seq }, CannotOpen { seq: Seq },
+    Returned { previous: ParticipantNo, now: ParticipantNo },
+    People(Vec&lt;LivePerson&gt;), AccessChanged { can_edit: bool },
+    Expired, Incompatible { protocol: u32, format: String }, Removed { reason: RemovedReason },
+}
+pub enum Phase { Offline, Joining, LoadingBase, CatchingUp, Live, Resyncing,
+                 Stalled { at: Seq }, Closed }
+pub enum ClientError { Malformed(String), OutOfOrder { expected: Seq, got: Seq }, Desync(String) }
+pub enum LocalError { NotLive, ReadOnly, TooLarge, Crashed }
+
+impl&lt;E: LiveEditor&gt; LiveClient&lt;E&gt; {
+    pub fn new(config: LiveConfig) -&gt; Self;
+    pub fn connected(&amp;mut self, now_ms: u64) -&gt; Vec&lt;String&gt;;           // [live_join]
+    pub fn disconnected(&amp;mut self, now_ms: u64);
+    pub fn receive(&amp;mut self, editor: &amp;mut E, frame: &amp;str, now_ms: u64) -&gt; Result&lt;Step, ClientError&gt;;
+    pub fn base_ready(&amp;mut self, editor: &amp;mut E, now_ms: u64) -&gt; Result&lt;Step, ClientError&gt;;
+    pub fn local(&amp;mut self, editor: &amp;mut E, payload: String, mode: Mode, now_ms: u64)
+        -&gt; Result&lt;Step, LocalError&gt;;
+    pub fn tick(&amp;mut self, now_ms: u64) -&gt; Vec&lt;String&gt;;
+    pub fn leave(&amp;mut self) -&gt; Option&lt;String&gt;;
+    pub fn new_ids(&amp;mut self, count: u32) -&gt; Result&lt;LiveId, IdError&gt;;
+    pub fn phase(&amp;self) -&gt; Phase;
+    pub fn agreed_seq(&amp;self) -&gt; Seq;
+    pub fn pending(&amp;self) -&gt; usize;
+    pub fn participant(&amp;self) -&gt; Option&lt;ParticipantNo&gt;;
+    pub fn resume(&amp;self) -&gt; Option&lt;LiveResume&gt;;
+    pub fn can_edit(&amp;self) -&gt; bool;
+}</code></pre>
+<p>This task covers <code>local</code> and entries, confirmations and refusals arriving while <code>Live</code>. Task 5 covers joining and the connection. Tests in this task drive a client straight into <code>Live</code> with a hand-written <code>live_joined</code> and an empty <code>catchup</code>.</p>
+<p><strong>The state</strong>, which the signatures do not determine:</p>
+<ul class="band">
+<li><code>agreed</code>: an <code>Option&lt;E::Snapshot&gt;</code>. <code>None</code> means what is shown is exactly the agreed state, so nothing needs copying.</li>
+<li><code>folded</code>: own entries confirmed by the server but not yet in the agreed copy (at most 64).</li>
+<li><code>pending</code>: own changes not yet confirmed, in order, each with its local number, the <code>seen</code> it was made at, its payload, its mode, whether it was sent, and whether showing it read the stamp.</li>
+</ul>
+<p><strong>The rules:</strong></p>
+<ol class="band">
+<li><strong>A local change.</strong> Refused if not <code>Live</code> (<code>NotLive</code>), if the person may not edit (<code>ReadOnly</code>), or if it is over 262,144 bytes (<code>TooLarge</code>); nothing changes then.
+<ul>
+<li>If <code>agreed</code> is <code>None</code>, take <code>agreed = snapshot()</code> first.</li>
+<li>In <code>ShowAtOnce</code> mode, apply it with <code>seq: None</code> and <code>stamp: None</code>. On <code>Crash</code>, <code>restore(agreed)</code>, re-run the other waiting changes and return <code>LocalError::Crashed</code>; nothing is sent.</li>
+<li>Queue it with the next local number and <code>seen = agreed_seq</code>.</li>
+</ul></li>
+<li><strong>An entry must be at <code>agreed_seq + 1</code></strong>, or <code>OutOfOrder</code> is returned and the host reconnects. Then:
+<ul>
+<li>A cancelled change only moves <code>agreed_seq</code> on.</li>
+<li>Another person's change, when <code>agreed</code> is <code>None</code>, is applied straight to the editor, between <code>note_applying(Some(seq))</code> and <code>note_applying(None)</code>.</li>
+<li>Otherwise the library goes back and re-runs: <code>restore(agreed)</code>, apply each folded entry and the new entry with their server stamps, <code>agreed = snapshot()</code>, empty <code>folded</code>, then re-apply each waiting <code>ShowAtOnce</code> change with <code>stamp: None</code>.</li>
+</ul></li>
+<li><strong>Own entry confirmed.</strong> Its local number must be the first waiting change's (otherwise <code>Desync</code>). Take it off the queue.
+<ul>
+<li>If it was shown and did not read the stamp, add it to <code>folded</code>. If nothing is waiting now, set <code>agreed = None</code> and empty <code>folded</code>. If <code>folded</code> reaches 64, go back and re-run.</li>
+<li>Otherwise (it was waiting for the server, or it read the stamp) go back and re-run with it.</li>
+</ul></li>
+<li><strong>A refusal</strong> must name the first waiting change (otherwise <code>Desync</code>). Take it off the queue; if it was shown, go back and re-run without it. Emit <code>Event::Refused</code>.</li>
+<li><strong>Losing the right to edit</strong> (<code>Access { can_edit: false }</code>) drops every waiting change (go back and re-run with none) and emits <code>DroppedPending</code> with the count (S5).</li>
+</ol>
+<p>A <code>Crash</code> while applying a received entry is Task 6. A waiting change whose re-run crashes is left out of what is shown until it is confirmed.</p>
+<ol class="steps">
+<li>Write failing tests in <code>tests/client.rs</code>, each with <code>StandIn</code> and hand-written frames:
+<ul>
+<li><code>own_change_is_shown_and_sent</code>: after <code>local(Insert …)</code>, <code>lines()</code> shows it, <code>send</code> holds one <code>entry</code> with <code>local: 1</code> and <code>seen: 0</code>, <code>pending() == 1</code>.</li>
+<li><code>confirmation_without_others_does_not_go_back</code>: a counting <code>StandIn</code> wrapper records calls; confirming one change makes no <code>restore</code> call and leaves <code>pending() == 0</code>.</li>
+<li><code>others_change_rolls_back_and_reruns</code>: with own line "a" waiting, another person's insert of "x" at seq 1 gives <code>lines()</code> with "x" applied first and "a" re-run, and <code>agreed_seq() == 1</code>.</li>
+<li><code>racing_changes_converge</code>: two clients each make a change against seen 0; both are fed the same server order (A's then B's); both end with equal <code>lines()</code>, equal to applying the two in that order to a fresh <code>StandIn</code>.</li>
+<li><code>wait_for_server_is_not_shown_until_confirmed</code>: <code>lines()</code> is unchanged after <code>local(…, WaitForServer)</code> and shows the change after its confirmation.</li>
+<li><code>stamped_change_is_reapplied_with_server_stamp</code>: a <code>Stamp</code> line shows <code>"local"</code>, then <code>"1763290000000/42"</code> after confirmation.</li>
+<li><code>sixty_four_folds_then_goes_back</code>: 64 confirmations while one more change waits cause exactly one <code>restore</code>.</li>
+<li><code>refusal_takes_the_change_back</code>: a <code>refused</code> for local 1 removes its line, keeps local 2's line, emits <code>Refused { reason: TooLarge }</code>.</li>
+<li><code>losing_edit_rights_drops_waiting_changes</code>: <code>access { can_edit: false }</code> with 2 waiting gives <code>DroppedPending { count: 2 }</code>, the agreed lines only, and <code>local</code> then fails with <code>ReadOnly</code>.</li>
+<li><code>out_of_order_entry_is_an_error</code>, <code>own_entry_out_of_turn_is_desync</code>, <code>oversized_local_change_is_refused</code> (262,145 bytes gives <code>TooLarge</code>; 262,144 is accepted).</li>
+</ul></li>
+<li>Run <code>cargo xtask test -p collab-live --features stand-in</code>: fail. Implement. Pass.</li>
+<li>Commit <code>feat: agreed and shown states with rollback and re-run</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 5: the client: joining, resending and the heartbeat</h3>
+<p><strong>Files:</strong> <code>crates/collab-live/src/client.rs</code>; tests in <code>tests/client.rs</code>.</p>
+<p><strong>Consumes:</strong> Task 4's <code>LiveClient</code>.</p>
+<ul class="band">
+<li><strong><code>connected(now)</code></strong> returns one <code>live_join</code> with <code>LIVE_PROTOCOL</code>, the format, the resume, and <code>seen: Some(agreed_seq)</code> if the client has a state, else <code>None</code>. Phase becomes <code>Joining</code>.</li>
+<li><strong><code>live_joined</code></strong> stores the session, participant number, rights and heartbeat interval.
+<ul>
+<li>A <code>returning</code> place emits <code>Returned</code> and starts a fresh <code>IdMaker</code> for the new number. Waiting changes are kept: they keep their original <code>seen</code> and local numbers.</li>
+<li><code>resume()</code> now returns the new session and number.</li>
+</ul></li>
+<li><strong><code>catchup</code>:</strong>
+<ul>
+<li>If <code>from == agreed_seq</code> and the client has a state, phase becomes <code>CatchingUp</code>.</li>
+<li>Otherwise phase becomes <code>LoadingBase</code>: emit <code>LoadBase { revision, at: base }</code> and hold entries until the host has reset the editor to the base and called <code>base_ready</code>. Then <code>agreed = None</code>, <code>agreed_seq = base</code>, apply held entries, and re-run waiting changes.</li>
+<li>When <code>agreed_seq</code> reaches <code>head</code>, phase becomes <code>Live</code> and every waiting change still unconfirmed is sent again, in order, within the pace limit.</li>
+</ul></li>
+<li><strong><code>tick(now)</code></strong> sends <code>heartbeat { seen: agreed_seq }</code> when at least <code>heartbeat_ms</code> (60,000) has passed since the last heartbeat, whatever else was sent. It also sends unsent changes so that no more than 20 entry frames go in any 1,000 ms.</li>
+<li><strong><code>disconnected</code></strong> marks every waiting change unsent; phase <code>Offline</code>.</li>
+<li><strong>Last frames:</strong>
+<ul>
+<li><code>expired</code> emits <code>Expired</code>; the client stays able to join again.</li>
+<li><code>incompatible</code>, <code>removed</code> and <code>cannot_open</code> emit their event and move to <code>Closed</code>, where every call is refused.</li>
+<li><code>leave()</code> returns one <code>leave</code> frame and moves to <code>Closed</code>.</li>
+</ul></li>
+<li><strong>Viewers</strong> (<code>can_edit: false</code>) receive and apply everything and send heartbeats, never entries.</li>
+</ul>
+<ol class="steps">
+<li>Write failing tests:
+<ul>
+<li><code>join_from_nothing_loads_the_base</code>: <code>live_joined</code> plus <code>catchup{base:0, revision:null, from:0, head:2}</code> emits <code>LoadBase { revision: None, at: Seq(0) }</code>; after <code>base_ready</code> and two entries the phase is <code>Live</code>.</li>
+<li><code>rejoin_with_kept_place_catches_up_from_seen</code>: <code>connected</code> after a drop sends <code>seen: 3</code>; a <code>catchup{from:3}</code> causes no <code>LoadBase</code>.</li>
+<li><code>reconnect_resends_only_unconfirmed</code>: three changes sent, the first confirmed in the catch-up; after <code>head</code> is reached exactly locals 2 and 3 are sent, in that order.</li>
+<li><code>returning_client_keeps_waiting_changes</code>: place <code>returning{previous:2}</code> gives <code>Returned { previous: 2, now: 5 }</code>; the resent entries carry their original <code>seen</code>; <code>new_ids(1)</code> gives <code>LiveId(5,0)</code>.</li>
+<li><code>heartbeat_every_minute_whatever_else_is_sent</code>: <code>tick</code> at 59,999 ms after joining sends no heartbeat even after entries; at 60,000 ms it sends <code>{"type":"heartbeat","seen":N}</code>; the next is due at 120,000 ms.</li>
+<li><code>sending_is_paced</code>: 50 changes made at once send 20 frames now, 20 more at <code>tick(now+1000)</code> and 10 at <code>tick(now+2000)</code>.</li>
+<li><code>viewer_never_sends_entries</code>, <code>closed_client_refuses_everything</code>, <code>expired_client_can_join_again</code>, <code>incompatible_format_closes</code>.</li>
+</ul></li>
+<li>Run, fail, implement, pass (<code>cargo xtask test -p collab-live --features stand-in</code>).</li>
+<li>Commit <code>feat: join, resend, heartbeat and pacing in the live client</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 6: the client: crashes and cancellation; the convergence test</h3>
+<p><strong>Files:</strong> <code>crates/collab-live/src/client.rs</code>; create <code>crates/collab-live/tests/support/sim.rs</code> and <code>tests/convergence.rs</code>.</p>
+<ul class="band">
+<li><strong>A crash on a received entry</strong> (<code>apply</code> returns <code>Err(Crash)</code>): phase <code>Stalled { at: seq }</code>; send <code>report { seq }</code>; emit <code>Crashed</code>. Later entries are held, not applied, and heartbeats go on stating <code>seen = seq - 1</code>, so the client never counts as having moved past it.</li>
+<li><strong>Starting with <code>crashed_at: Some(s)</code></strong> (the host's note after the editor stopped and was loaded again): join with <code>seen: None</code>, load the base, apply up to <code>s - 1</code>, then stall at <code>s</code> and report it. Every later join reports it again until a verdict arrives.</li>
+<li><strong>A cancel record for <code>s</code>:</strong>
+<ul>
+<li>If this client is stalled at <code>s</code>, it skips <code>s</code> and applies the held entries.</li>
+<li>If it had applied <code>s</code>, it sends <code>resync</code>. Phase becomes <code>Resyncing</code>, then the server's <code>catchup</code> from the base is handled as in Task 5, waiting changes kept and re-run.</li>
+</ul></li>
+<li><strong>The simulated server</strong> (<code>tests/support/sim.rs</code>) keeps an ordered log in memory, stamps entries with a counter time and seed, drops repeats by (client, local), refuses read-only changes and serves <code>catchup</code> and <code>resync</code>. It lets a test choose when each frame is delivered. It does not test the real room (Tasks 8 to 11 do); it only gives the library an honest partner.</li>
+</ul>
+<ol class="steps">
+<li>Write failing tests:
+<ul>
+<li><code>crash_stalls_and_reports</code>: a <code>CrashIf{device:"b"}</code> entry at seq 3 stalls client "b" at 3, sends <code>{"type":"report","seq":3}</code>; entry 4 is held; the next heartbeat states <code>seen: 2</code>.</li>
+<li><code>restart_after_crash_stops_before_the_entry</code>: a new client with <code>crashed_at: Some(Seq(3))</code> applies 1 and 2 only, then reports 3.</li>
+<li><code>cancel_unstalls_the_reporter</code>: a cancel record for 3 makes the stalled client apply 4 without 3.</li>
+<li><code>cancel_makes_others_resync</code>: a client that applied 3 sends <code>resync</code>; after the base and the catch-up its <code>lines()</code> equal a fresh replay without 3, and its waiting change is still shown.</li>
+<li><code>cannot_open_closes</code>.</li>
+<li><code>random_sessions_converge</code> (proptest, 256 cases, in <code>tests/convergence.rs</code>): three clients, up to 60 random stand-in changes, random delivery delays, random disconnects with reconnection, one random <code>WaitForServer</code> change in five. After all frames are delivered: every client has <code>pending() == 0</code>, all three <code>lines()</code> are equal, and they equal a fresh <code>StandIn</code> with the simulated server's log applied in order.</li>
+</ul></li>
+<li>Run, fail, implement, pass.</li>
+<li>Commit <code>feat: crash reports and cancellation in the live client; convergence test</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 7: the log in PostgreSQL</h3>
+<p><strong>Files:</strong> create <code>crates/records/migrations/0017_live_log.sql</code> (LF endings), <code>crates/records/src/live.rs</code>, <code>crates/records/tests/live.rs</code>; modify <code>crates/records/src/lib.rs</code> (module and exports).</p>
+<p><strong>The migration</strong> (exact columns; comments in the file say what each holds):</p>
+<pre><code>create table live_logs (
+  document_id uuid primary key references documents(id) on delete cascade,
+  head bigint not null default 0,            -- newest position ever given; never goes back
+  last_participant integer not null default 0,
+  format text,                               -- format of the kept entries; null when none
+  verified_through bigint not null default 0,-- set by G4: entries at or below are covered
+  verified_at timestamptz);
+create table live_sessions (
+  id uuid primary key,
+  document_id uuid not null references documents(id) on delete cascade,
+  format text not null, first_seq bigint not null,
+  started_at timestamptz not null, ended_at timestamptz);
+create unique index live_sessions_one_open on live_sessions (document_id) where ended_at is null;
+create table live_participants (
+  session_id uuid not null references live_sessions(id) on delete cascade,
+  number integer not null check (number &gt;= 1),
+  client_id uuid not null, user_id uuid not null references users(id),
+  joined_at timestamptz not null, gone_at timestamptz,
+  gone_reason text check (gone_reason in ('left','expired','removed','cannot_open')),
+  primary key (session_id, number));
+create table live_clients (
+  document_id uuid not null references documents(id) on delete cascade,
+  client_id uuid not null, user_id uuid not null references users(id),
+  next_local bigint not null default 1,
+  primary key (document_id, client_id));
+create table live_entries (
+  document_id uuid not null references documents(id) on delete cascade,
+  seq bigint not null check (seq &gt;= 1),
+  session_id uuid not null references live_sessions(id),
+  kind text not null check (kind in ('change','cancel')),
+  client_id uuid, local bigint, participant integer, user_id uuid references users(id),
+  seen bigint not null default 0, at timestamptz not null, seed bigint not null,
+  format text not null, payload bytea not null default '',
+  witnesses integer[] not null default '{}',
+  cancels bigint, reports integer, cancelled_by bigint,
+  primary key (document_id, seq));
+create unique index live_entries_by_client on live_entries (document_id, client_id, local)
+  where kind = 'change';</code></pre>
+<p><strong>Produces</strong> (plain numbers and ids, so <code>records</code> does not depend on <code>protocol</code>):</p>
+<pre><code>pub enum GoneReason { Left, Expired, Removed, CannotOpen }
+pub struct LiveLoaded { pub head: Seq, pub last_participant: u32, pub format: Option&lt;String&gt;,
+                        pub verified_through: Seq, pub entries: Vec&lt;LiveEntryRow&gt;,   // seq &gt; verified_through
+                        pub open_session: Option&lt;LiveSessionRow&gt;,
+                        pub clients: Vec&lt;(ClientId, UserId, u64)&gt; }                  // next_local
+pub struct LiveSessionRow { pub id: Uuid, pub format: String, pub first_seq: Seq,
+                            pub started_at: OffsetDateTime, pub participants: Vec&lt;LiveParticipantRow&gt; }
+pub struct LiveParticipantRow { pub number: u32, pub client: ClientId, pub user: UserId,
+                                pub joined_at: OffsetDateTime, pub gone: Option&lt;GoneReason&gt; }
+pub enum LiveEntryRow { Change { seq: Seq, session: Uuid, client: ClientId, local: u64, participant: u32,
+                                 user: UserId, seen: Seq, at: OffsetDateTime, seed: u32, format: String,
+                                 payload: Vec&lt;u8&gt;, witnesses: Vec&lt;u32&gt;, cancelled_by: Option&lt;Seq&gt; },
+                        Cancel { seq: Seq, session: Uuid, at: OffsetDateTime, seed: u32, cancels: Seq, reports: u32 } }
+pub struct NewLiveChange&lt;'a&gt; { pub seq: Seq, pub session: Uuid, pub client: ClientId, pub local: u64,
+                               pub participant: u32, pub user: UserId, pub seen: Seq, pub at: OffsetDateTime,
+                               pub seed: u32, pub format: &amp;'a str, pub payload: &amp;'a [u8], pub witnesses: &amp;'a [u32] }
+
+impl Db {
+    pub async fn load_live(&amp;self, doc: DocId) -&gt; Result&lt;LiveLoaded, DbError&gt;;
+    pub async fn start_live_session(&amp;self, doc: DocId, session: Uuid, format: &amp;str, at: OffsetDateTime) -&gt; Result&lt;(), DbError&gt;;
+    pub async fn add_live_participant(&amp;self, doc: DocId, session: Uuid, client: ClientId, user: UserId, at: OffsetDateTime) -&gt; Result&lt;u32, DbError&gt;;
+    pub async fn end_live_place(&amp;self, session: Uuid, number: u32, reason: GoneReason, at: OffsetDateTime) -&gt; Result&lt;(), DbError&gt;;
+    pub async fn append_live_change(&amp;self, doc: DocId, change: &amp;NewLiveChange&lt;'_&gt;) -&gt; Result&lt;(), DbError&gt;;
+    pub async fn consume_live_local(&amp;self, doc: DocId, client: ClientId, user: UserId, local: u64) -&gt; Result&lt;(), DbError&gt;;
+    pub async fn end_live_session(&amp;self, session: Uuid, at: OffsetDateTime) -&gt; Result&lt;(), DbError&gt;;
+}</code></pre>
+<ul class="band">
+<li><code>add_live_participant</code> takes the next number from <code>live_logs.last_participant</code> in the same transaction and returns it.</li>
+<li><code>append_live_change</code> is one transaction:
+<ul>
+<li>insert the row;</li>
+<li>set <code>live_logs.head = seq</code> only where it was <code>seq - 1</code>, and fail if no row matched (a second writer, or a stale room);</li>
+<li>set <code>live_logs.format</code>;</li>
+<li>upsert <code>live_clients.next_local = local + 1</code>.</li>
+</ul></li>
+<li><code>consume_live_local</code> only upserts <code>next_local = local + 1</code>, for a final refusal.</li>
+<li>Every function creates the <code>live_logs</code> row on first use.</li>
+<li><code>seed</code> is stored as <code>bigint</code> from a <code>u32</code>; <code>payload</code> as <code>bytea</code> holding the UTF-8 bytes.</li>
+</ul>
+<ol class="steps">
+<li>Write failing tests in <code>tests/live.rs</code> (with <code>TestDb::create()</code> and the shared helpers in <code>tests/common/mod.rs</code> for a user and a document):
+<ul>
+<li><code>empty_document_loads_empty</code>: head 0, no entries, no open session.</li>
+<li><code>log_reloads_exactly</code>: three appended changes reload with identical fields, payload bytes (including a <code>\u{0}</code> and a 4-byte character) and order; head 3; <code>clients</code> holds <code>next_local</code> 4.</li>
+<li><code>head_never_skips_or_repeats</code>: appending seq 2 when head is 0 fails; appending seq 1 twice fails the second time; head stays as it was after each failure.</li>
+<li><code>same_client_local_cannot_be_stored_twice</code>: two changes with the same client and local fail the second time.</li>
+<li><code>participant_numbers_are_never_reused</code>: numbers 1, 2 in a first session, then 3 in a second session after the first ended.</li>
+<li><code>one_open_session_per_document</code>: starting a second open session fails.</li>
+<li><code>places_and_sessions_end</code>: <code>end_live_place(…, Expired)</code> and <code>end_live_session</code> load back as gone and as no open session.</li>
+<li><code>consumed_local_moves_next_local</code>.</li>
+<li><code>migration_0017_upgrades_a_0016_database</code>: <code>TestDb::create_at(Some(16))</code> then <code>migrate()</code> succeeds and <code>load_live</code> works.</li>
+</ul></li>
+<li>Run <code>cargo xtask test -p records --test live</code>: fail. Implement. Pass, and the existing <code>migration_files_have_no_carriage_returns</code> still passes.</li>
+<li>Commit <code>feat: live session log in PostgreSQL (migration 0017)</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 8: the room: places, ordering and refusals</h3>
+<p><strong>Files:</strong> create <code>crates/server/src/live_store.rs</code> and <code>crates/server/src/live_room.rs</code>; register both in <code>crates/server/src/lib.rs</code>.</p>
+<p><strong>Consumes:</strong> Task 1's messages; Task 7's <code>Db</code> functions; <code>members.rs</code>.</p>
+<p><strong>Produces:</strong></p>
+<pre><code>// live_store.rs: the seam that lets the room be tested without a database
+pub(crate) trait LiveStore: Send + Sync + 'static {
+    // one method per Task 7 Db function, same names and arguments, each returning
+    // impl Future&lt;Output = Result&lt;_, DbError&gt;&gt; + Send
+}
+impl LiveStore for records::Db { /* delegates */ }
+#[cfg(test)] pub(crate) struct MemStore { /* in memory; fail_next() makes the next write fail */ }
+
+// live_room.rs
+pub(crate) struct LiveTiming { pub heartbeat: Duration, pub misses: u32 }   // 60 s, 3
+pub(crate) const RATE_PER_SECOND: u32 = 30;
+pub(crate) const RATE_BURST: u32 = 120;
+pub(crate) enum LiveCommand {
+    Join { conn: ConnId, client: ClientId, user: UserId, session: SessionId, name: String, role: Access,
+           protocol: u32, format: String, resume: Option&lt;LiveResume&gt;, seen: Option&lt;Seq&gt;,
+           tx: mpsc::Sender&lt;Outbound&gt;, accepted: oneshot::Sender&lt;JoinReply&gt; },
+    Entry { conn: ConnId, client: ClientId, local: LocalNo, seen: Seq, format: String, payload: String },
+    Heartbeat { conn: ConnId, client: ClientId, seen: Seq },
+    Report { conn: ConnId, client: ClientId, seq: Seq },
+    Resync { conn: ConnId, client: ClientId },
+    Leave { conn: ConnId, client: ClientId },
+    Disconnected { conn: ConnId, client: ClientId },
+}
+pub(crate) struct RoomFailed(pub DbError);
+pub(crate) struct LiveRoom&lt;S: LiveStore&gt; { /* … */ }
+impl&lt;S: LiveStore&gt; LiveRoom&lt;S&gt; {
+    pub(crate) async fn load(doc: DocId, store: S, events: EventSink, timing: LiveTiming) -&gt; Result&lt;Self, RoomFailed&gt;;
+    pub(crate) async fn handle(&amp;mut self, cmd: LiveCommand) -&gt; Result&lt;(), RoomFailed&gt;;
+    pub(crate) async fn settle(&amp;mut self) -&gt; Result&lt;(), RoomFailed&gt;;    // writes queued place ends; ends an empty session
+    pub(crate) fn has_session(&amp;self) -&gt; bool;
+}
+struct LiveFrames;   // implements members::Frames with LiveServerMsg::People/Access/Removed</code></pre>
+<p><strong>Join</strong> (after <code>Members::admit</code>, which refuses a client id owned by another account):</p>
+<ul class="band">
+<li>A protocol other than 1, an invalid format name, or a format other than the kept entries' (or the open session's) gets <code>incompatible</code> as its last frame.</li>
+<li>With no open session, the room starts one (<code>live.session_started</code>, detail <code>{"format"}</code>).</li>
+<li><code>kept</code>: the resume names the open session and a number this client holds a place under.</li>
+<li><code>returning { previous }</code>: the resume names another session, a gone place, or a place this client once held; it gets a new number and the event <code>live.client_returned</code> with <code>{"participant","previous"}</code>.</li>
+<li><code>new</code>: no resume.</li>
+<li>The connection is sent, as one <code>Outbound::Many</code>: <code>live_joined</code>, then <code>catchup { base: verified_through, revision: null, from, head }</code>, then every entry after <code>from</code>. <code>from</code> is <code>seen</code> when <code>base ≤ seen ≤ head</code>, else <code>base</code>.</li>
+<li>Cancelled changes go out with <code>payload: ""</code> and <code>cancelled: true</code>.</li>
+<li>Everyone gets <code>people</code>.</li>
+</ul>
+<p><strong>Entry</strong>, checked in this order. "Consumed" means the refusal is final and uses up its number (<code>consume_live_local</code>).</p>
+<table>
+<tr><th>Condition</th><th>Result</th></tr>
+<tr><td>Not a current member on this connection, or its place has ended</td><td>Ignored.</td></tr>
+<tr><td><code>local &lt; next_local</code></td><td>Ignored: a repeat.</td></tr>
+<tr><td><code>local &gt; next_local</code></td><td><code>refused out_of_order</code>, not consumed.</td></tr>
+<tr><td>Not allowed to edit</td><td><code>refused read_only</code>, consumed.</td></tr>
+<tr><td>Format differs from the session's</td><td><code>refused wrong_format</code>, consumed.</td></tr>
+<tr><td>Payload over 262,144 bytes</td><td><code>refused too_large</code>, consumed.</td></tr>
+<tr><td><code>seen &gt; head</code></td><td><code>refused base_ahead</code>, consumed.</td></tr>
+<tr><td>Rate bucket empty (refills 30 a second, holds 120)</td><td><code>refused rate_limited</code>, consumed.</td></tr>
+<tr><td>Otherwise</td><td>Committed (below).</td></tr>
+</table>
+<p>Committing: <code>seq = head + 1</code>, <code>at</code> = the server's clock, <code>seed</code> = 32 random bits (<code>getrandom</code>), witnesses = the numbers of everyone holding a place with editing rights. Store it with <code>append_live_change</code>; only then send <code>entry</code> to every connected member, the sender included. Every message from a member, refused or not, counts as a sign of life (Task 9 uses this).</p>
+<p>A <code>RoomFailed</code> from any store call ends the room: the run loop (Task 11) drops every connection without a frame, and nothing about the failed change has been sent.</p>
+<ol class="steps">
+<li>Write failing unit tests in <code>live_room.rs</code> with <code>MemStore</code>, under <code>#[tokio::test(start_paused = true)]</code>:
+<ul>
+<li><code>first_join_starts_a_session</code>: <code>live_joined</code> with participant 1, place <code>new</code>, then <code>catchup{base:0,from:0,head:0}</code>.</li>
+<li><code>entries_are_numbered_stamped_and_sent_to_all</code>: two members; A's entry arrives at both as seq 1 with A's participant number, a stamp at or after the time before the call, and the payload byte for byte.</li>
+<li><code>racing_entries_are_ordered_by_arrival</code>: A's and B's entries, both <code>seen: 0</code>, become seq 1 and 2 in arrival order, and both members get both in that order.</li>
+<li><code>repeat_is_dropped_silently</code>: resending local 1 after it was committed sends nothing and stores nothing.</li>
+<li><code>hostile_entries_are_refused_and_room_carries_on</code>: one test, one member each: local 3 when 1 is next (<code>out_of_order</code>, and local 1 is still accepted next); a viewer (<code>read_only</code>); format <code>"other/1"</code> (<code>wrong_format</code>); 262,145 bytes (<code>too_large</code>); <code>seen: 99</code> (<code>base_ahead</code>). After each, another member's valid entry still commits at the next position.</li>
+<li><code>rate_limit_refuses_after_the_burst</code>: 121 entries at one instant: 120 committed, the 121st <code>rate_limited</code>; after advancing 1 s, 30 more commit.</li>
+<li><code>store_failure_ends_room_without_broadcast</code>: <code>fail_next()</code> then an entry: <code>handle</code> returns <code>RoomFailed</code> and no member's queue holds an <code>entry</code> frame.</li>
+<li><code>incompatible_join_is_told_and_not_admitted</code>: protocol 2, and format <code>"gridcraft/2"</code> against a session of <code>"gridcraft/1"</code>, each get <code>incompatible</code> and are not in <code>people</code>.</li>
+<li><code>kept_and_returning_places</code>: a resume naming the open session and a held place gets <code>kept</code> with the same number; after that place ends, the same resume gets <code>returning{previous}</code> with the next unused number.</li>
+<li><code>catchup_honours_seen</code>: after 5 entries a join with <code>seen: 3</code> gets <code>from: 3</code> and entries 4 and 5; <code>seen: 9</code> gets <code>from: 0</code> and all 5.</li>
+</ul></li>
+<li>Run <code>cargo xtask test -p server --lib live_room</code>: fail. Implement. Pass.</li>
+<li>Commit <code>feat: opaque-entry room: places, ordering and refusals</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 9: the room: heartbeat expiry, leaving, session end and reloading</h3>
+<p><strong>Files:</strong> <code>crates/server/src/live_room.rs</code>.</p>
+<p><strong>Produces:</strong></p>
+<pre><code>impl&lt;S: LiveStore&gt; LiveRoom&lt;S&gt; {
+    pub(crate) fn next_expiry(&amp;self) -&gt; Option&lt;Instant&gt;;          // earliest last-heard + heartbeat × misses
+    pub(crate) async fn expire_due(&amp;mut self) -&gt; Result&lt;(), RoomFailed&gt;;
+}</code></pre>
+<ul class="band">
+<li><strong>Last heard:</strong> each place holder's last-heard time is set by every message they send (any kind, refused or not) and by their join.</li>
+<li><strong>Expiry:</strong> at last-heard plus 180 s (3 × 60 s) the place ends with <code>expired</code>.
+<ul>
+<li>If still connected, the connection gets <code>expired</code> as its last frame.</li>
+<li>Event <code>live.client_expired</code> with <code>{"participant"}</code>.</li>
+<li>Everyone else gets <code>people</code>.</li>
+</ul></li>
+<li><strong><code>Disconnected</code></strong> removes the connection from <code>Members</code> but keeps the place. <strong><code>Leave</code></strong> ends the place with <code>left</code>.</li>
+<li><strong>Session end:</strong> when no place is held (all left, expired or removed), <code>settle</code> ends the session (<code>live.session_ended</code> with <code>{"head","entries"}</code>, where <code>entries</code> counts changes in this session). <code>has_session()</code> is then false.</li>
+<li><strong>Reloading:</strong> on <code>load</code> with an open session, every place still held gets last-heard = now, so a restart costs nobody their place (proposal 11).</li>
+</ul>
+<ol class="steps">
+<li>Write failing tests (paused time):
+<ul>
+<li><code>three_missed_heartbeats_expire</code>: a member silent for 179.999 s keeps its place; at 180 s it gets <code>expired</code> and is gone from <code>people</code>.</li>
+<li><code>any_message_counts_as_life</code>: a member that sends only entries (no heartbeats) every 100 s never expires over 600 s; a refused entry also counts.</li>
+<li><code>disconnect_keeps_the_place</code>: <code>Disconnected</code> then a join with the resume within 180 s gets <code>kept</code> with the same number.</li>
+<li><code>entry_in_flight_at_expiry_is_stored_once</code>:
+<ul>
+<li>(a) An entry handled at 179.9 s commits and pushes the expiry to 359.9 s.</li>
+<li>(b) After expiry at 180 s, an entry on the old connection is ignored (head unchanged). A join with the resume gets <code>returning</code>, and the resent entry (same client, local 1) commits once.</li>
+<li>(c) An entry committed at 100 s and resent after a <code>returning</code> join is dropped as a repeat; head unchanged.</li>
+</ul></li>
+<li><code>last_place_gone_ends_session</code>: after the last <code>Leave</code>, <code>settle</code> stores the session end and <code>has_session()</code> is false; a new join starts a new session whose participant numbers continue.</li>
+<li><code>loaded_session_continues_with_fresh_expiry</code>: <code>MemStore</code> with an open session whose two places were last heard long ago; after <code>load</code>, neither expires before 180 s, and a join with one's resume gets <code>kept</code>.</li>
+<li><code>viewers_hold_places_too</code>: a viewer's heartbeat keeps its place, and its expiry alone can end the session.</li>
+</ul></li>
+<li>Run, fail, implement, pass.</li>
+<li>Commit <code>feat: heartbeat expiry and session end in the live room</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 10: the cancelling rule</h3>
+<p><strong>Files:</strong> create <code>crates/server/src/live_cancel.rs</code>; use it from <code>live_room.rs</code>. Add to Task 7's <code>Db</code> (and the <code>LiveStore</code> trait):</p>
+<pre><code>pub async fn cancel_live_entry(&amp;self, doc: DocId, cancel: &amp;NewLiveCancel) -&gt; Result&lt;(), DbError&gt;;
+pub struct NewLiveCancel { pub seq: Seq, pub session: Uuid, pub cancels: Seq, pub reports: u32,
+                           pub at: OffsetDateTime, pub seed: u32 }
+// one transaction: insert the cancel row, set cancelled_by on the change, advance head as for a change
+
+// live_cancel.rs: pure, no I/O
+pub(crate) struct CancelBook { /* per reported seq: witnesses still counting, reporters, stands */ }
+pub(crate) enum Verdict { Cancel { seq: Seq, reporters: Vec&lt;u32&gt; }, Stands { seq: Seq, reporters: Vec&lt;u32&gt; } }
+impl CancelBook {
+    pub(crate) fn report(&amp;mut self, seq: Seq, witnesses: &amp;[u32], reporter: u32,
+                         seen_of: &amp;dyn Fn(u32) -&gt; Seq) -&gt; Option&lt;Verdict&gt;;
+    pub(crate) fn seen(&amp;mut self, participant: u32, seen: Seq) -&gt; Vec&lt;Verdict&gt;;
+    pub(crate) fn gone(&amp;mut self, participant: u32) -&gt; Vec&lt;Verdict&gt;;
+}</code></pre>
+<p><strong>The rule</strong> (C3, section 04, proposal 13), for a reported change at <code>s</code>:</p>
+<ul class="band">
+<li>It <strong>stands</strong> as soon as any witness has stated <code>seen ≥ s</code> (in a heartbeat or a change). Every reporter, now and later, gets <code>cannot_open { seq: s }</code> as its last frame. Its place ends with <code>cannot_open</code>, and the event <code>live.entry_failed_on_device</code> with <code>{"seq"}</code> is recorded once per reporter.</li>
+<li>It is <strong>cancelled</strong> when it has at least one report and every witness still counting has reported. A witness stops counting when its place ends; a report stays counted after its sender's place ends.
+<ul>
+<li>A cancel record is stored at <code>head + 1</code> with the number of reports, then sent to everyone as an <code>entry</code> of kind <code>cancel</code>.</li>
+<li>Event <code>live.entry_cancelled</code> with <code>{"seq","at","reports"}</code>.</li>
+</ul></li>
+<li><strong>Ignored:</strong> a report from someone who may not edit; a report for a position that is not a kept, uncancelled change; and a repeat report.</li>
+<li><strong>Reporters who are not witnesses</strong> (they joined later) count toward "at least one report" but are not needed for "every witness".</li>
+<li><strong><code>Resync</code></strong> sends that connection a fresh <code>catchup</code> from the base with every entry.</li>
+<li><strong>Reports are kept in memory only</strong>; after a reload, clients report again.</li>
+</ul>
+<ol class="steps">
+<li>Write failing unit tests in <code>live_cancel.rs</code>:
+<ul>
+<li><code>all_witnesses_report_cancels</code>: witnesses {1,2}; reports from 1 then 2 give <code>Cancel{reporters:[1,2]}</code> on the second.</li>
+<li><code>one_witness_moved_past_stands</code>: witnesses {1,2}; 2 states <code>seen: s</code>; a report from 1 gives <code>Stands{reporters:[1]}</code>.</li>
+<li><code>expired_witness_stops_counting</code>: witnesses {1,2}; report from 1; <code>gone(2)</code> gives <code>Cancel</code>.</li>
+<li><code>one_person_cannot_cancel_alone</code>: witnesses {1,2}; report from 1 only gives no verdict.</li>
+<li><code>reports_survive_the_reporter_leaving</code>: witnesses {1,2}; report from 1; <code>gone(1)</code>; report from 2 gives <code>Cancel</code>.</li>
+<li><code>late_joiner_report</code>: witnesses {1}; 1 gone without reporting; a report from 3 (not a witness) gives <code>Cancel</code>.</li>
+</ul>
+And room tests in <code>live_room.rs</code>:
+<ul>
+<li><code>cancel_is_logged_and_sent</code>: the cancel record is seq <code>head+1</code>, every member gets it, and a later joiner's catch-up has the change with <code>cancelled: true</code> and <code>payload: ""</code>.</li>
+<li><code>viewer_report_is_ignored</code>.</li>
+<li><code>standing_entry_removes_the_reporter</code>: the reporter gets <code>cannot_open</code>; the other member is unaffected.</li>
+<li><code>resync_resends_from_base</code>.</li>
+</ul></li>
+<li>Run (<code>cargo xtask test -p server --lib live_</code> and <code>-p records --test live</code>), fail, implement, pass.</li>
+<li>Commit <code>feat: cancelling rule for entries that crash editors</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 11: wiring the room in, and end-to-end tests</h3>
+<p><strong>Files:</strong> modify <code>crates/server/src/room.rs</code> (<code>Link::Live(LiveLink)</code>, <code>Rooms::open_live</code>), <code>live_room.rs</code> (<code>LiveLink</code>, <code>start_live</code>, the run loop), <code>ws.rs</code>, <code>config.rs</code>, <code>lib.rs</code> (<code>AppState::open_live_room</code>); add <code>collab-live = { path = "../collab-live", features = ["stand-in"] }</code> to the server's <code>[dev-dependencies]</code>; create <code>crates/server/tests/common/live.rs</code> and <code>crates/server/tests/live_room.rs</code>.</p>
+<p><strong>Produces:</strong></p>
+<pre><code>// config.rs
+pub live_editors: Vec&lt;Editor&gt;,     // default empty: no document uses the live room
+pub live_heartbeat: Duration,      // default 60 s; tests shorten it; expiry is 3×
+
+// ws.rs: Visitor.is_file: bool becomes
+pub(crate) enum RoomKind { Text, File, Live }
+// Live when the document's editor is in config.live_editors; else as today
+
+// room.rs
+pub(crate) enum Link { Text(RoomLink), File(FileLink), Live(LiveLink) }
+pub(crate) fn open_live(self: &amp;Arc&lt;Self&gt;, doc: DocId, db: Db, events: EventSink, timing: LiveTiming) -&gt; LiveLink;
+// closed if a text room or file session is open for doc, and the other two likewise refuse a live doc
+
+// tests/common/live.rs
+pub struct LiveTestClient { /* socket, LiveClient&lt;StandIn&gt;, StandIn, a ms clock */ }
+impl LiveTestClient {
+    pub async fn connect(site: &amp;Site, doc: DocId, user: &amp;TestUser, device: &amp;str) -&gt; LiveTestClient;
+    pub async fn reconnect(&amp;mut self, site: &amp;Site);
+    pub async fn insert(&amp;mut self, text: &amp;str) -&gt; LiveId;      // a new line at the end
+    pub async fn send_raw(&amp;mut self, frame: &amp;str);
+    pub async fn pump_until(&amp;mut self, done: impl Fn(&amp;LiveTestClient) -&gt; bool);
+    pub fn lines(&amp;self) -&gt; Vec&lt;String&gt;;
+    pub fn client(&amp;self) -&gt; &amp;LiveClient&lt;StandIn&gt;;
+}</code></pre>
+<ul class="band">
+<li><strong>The run loop</strong> follows <code>room.rs</code>'s <code>run</code>: load (failure refuses waiting joins with <code>refuse_waiting</code>), then <code>select!</code> with access changes first, commands, and <code>sleep_until(next_expiry)</code>. After each step it calls <code>settle</code>. It ends when <code>has_session()</code> is false and both channels are empty, or on <code>RoomFailed</code> (connections dropped without a frame).</li>
+<li><strong>Access changes</strong> use <code>members::apply_access</code> through <code>AccessRules</code>. A removed member's place ends with <code>removed</code>, queued and written by <code>settle</code>.</li>
+<li><strong><code>live_session</code> in <code>ws.rs</code></strong>:
+<ul>
+<li>The first frame must parse as <code>LiveClientMsg::LiveJoin</code>.</li>
+<li>Later frames map one-to-one to <code>LiveCommand</code>s; a second <code>live_join</code> or an unparseable frame ends that connection, as <code>relay</code> does today.</li>
+<li>When the socket ends the room is sent <code>Disconnected</code>, not <code>Leave</code>.</li>
+</ul></li>
+</ul>
+<ol class="steps">
+<li>Write failing tests in <code>tests/live_room.rs</code>. Each uses a GridCraft document created with <code>create_file_document</code>, a server whose config has <code>live_editors = vec![Editor::GridCraft]</code>, <code>live_heartbeat</code> = 1 s, and <code>LiveTestClient</code>s:
+<ul>
+<li><code>two_clients_converge_on_stand_in</code>: Ann and Bob each insert 20 lines, interleaved; both end with equal <code>lines()</code> of 40.</li>
+<li><code>racing_entries_get_one_order</code>: both insert before the same line at once; both end with the same order, and the later entry in the log sits next to that line.</li>
+<li><code>reconnect_resends_without_duplicating</code>: Ann sends 3, her socket is closed before the confirmations are read, she reconnects; the log has exactly 3 of her changes (<code>load_live</code>), in her order, and her <code>pending()</code> is 0.</li>
+<li><code>expiry_with_entry_in_flight_commits_once</code>: Ann stops ticking for 4 s (expiry 3 s), then sends; she gets <code>expired</code>, rejoins as <code>returning</code>, and the change is stored once.</li>
+<li><code>log_survives_server_restart</code> (with <code>StoppableServer</code> on one data folder and database): Ann sends 3, the server stops, a new one starts. Bob joins and gets 3 entries with the same seq, <code>at_ms</code>, <code>seed</code> and payload as <code>load_live</code> had before the stop. Ann reconnects with her resume, gets <code>kept</code>, and her next change is seq 4.</li>
+<li><code>malformed_payload_is_relayed_verbatim_and_does_nothing</code>: Ann sends raw entries whose payloads are <code>"not json"</code> and <code>"{\"type\":\"live_joined\"}"</code>; Bob receives both byte for byte; both editors' <code>lines()</code> are unchanged.</li>
+<li><code>garbage_frame_closes_only_that_connection</code>: Ann sends <code>"}{"</code>; her connection closes; Bob keeps sending.</li>
+<li><code>viewer_receives_but_cannot_send</code>, <code>revoking_access_removes_from_live_room</code> (S5: <code>removed { access_revoked }</code>), <code>lowered_role_drops_waiting_changes</code>.</li>
+<li><code>crash_on_some_devices_is_cancelled</code>: Ann on device "a", Bob on device "b"; Ann sends <code>CrashIf{device:"b"}</code> and <code>CrashIf{device:"a"}</code> in one go. Both editors crash on one of them, report, and receive a cancel. A late joiner's catch-up shows both cancel records.</li>
+<li><code>crash_on_one_device_stands</code>: Ann on "a", Bob on "b", Cy on "c"; <code>CrashIf{device:"b"}</code> stands once Ann's heartbeat shows she moved past it; Bob gets <code>cannot_open</code>.</li>
+<li><code>text_and_file_documents_are_unchanged</code>: with <code>live_editors</code> empty, a GridCraft document still opens a file session and a text document a text room (the existing suites stay green too).</li>
+<li><code>events_are_recorded</code>: the <code>events</code> table holds <code>live.session_started</code>, <code>live.client_expired</code>, <code>live.session_ended</code> with positions and counts only, and no payload text anywhere in their details.</li>
+</ul></li>
+<li>Run <code>cargo xtask test -p server --test live_room</code>: fail. Implement. Pass. Then run <code>cargo xtask test -p server</code>: every existing suite, <code>two_sessions</code> included, still passes.</li>
+<li>Commit <code>feat: live room reachable over WebSocket; end-to-end tests with the stand-in</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 12: retention</h3>
+<p><strong>Files:</strong> <code>crates/records/src/live.rs</code> and <code>tests/live.rs</code>; <code>crates/server/src/live_room.rs</code> (sweeper); <code>crates/server/src/lib.rs</code> (<code>serve_state</code> starts it); <code>crates/server/src/tree.rs</code> (<code>purge_due</code> and <code>purge_site</code> call <code>delete_live_log</code> for each purged document).</p>
+<p><strong>Produces:</strong></p>
+<pre><code>pub const LIVE_KEEP_DAYS: i64 = 30;
+pub struct LiveSwept { pub entries: u64, pub sessions: u64, pub clients: u64 }
+impl Db {
+    pub async fn mark_live_verified(&amp;self, doc: DocId, through: Seq, at: OffsetDateTime) -&gt; Result&lt;(), DbError&gt;; // for G4
+    pub async fn sweep_live(&amp;self, now: OffsetDateTime) -&gt; Result&lt;LiveSwept, DbError&gt;;
+    pub async fn delete_live_log(&amp;self, doc: DocId) -&gt; Result&lt;(), DbError&gt;;
+}
+// server: pub async fn sweep_live_once(state: &amp;AppState, now: OffsetDateTime) -&gt; u64;  every 3,600 s</code></pre>
+<ul class="band">
+<li><code>sweep_live</code> deletes entries at or below <code>verified_through</code> where <code>verified_at</code> is more than 30 days before <code>now</code>.</li>
+<li>It then deletes ended sessions older than 30 days that no remaining entry names, and <code>live_clients</code> rows of documents with no kept entry and no open session.</li>
+<li>It never touches <code>live_logs</code>, so head positions never go back.</li>
+<li><code>mark_live_verified</code> never moves <code>verified_through</code> backwards.</li>
+</ul>
+<ol class="steps">
+<li>Write failing tests:
+<ul>
+<li><code>unverified_entries_are_kept</code>: entries 100 days old with nothing verified survive a sweep.</li>
+<li><code>verified_entries_go_after_thirty_days</code>: verified through 2 at day 0; a sweep at day 29 keeps all; at day 30 plus 1 s entries 1 and 2 go, entry 3 stays.</li>
+<li><code>head_survives_a_full_sweep</code>: after every entry is swept, the next change is still <code>head + 1</code>.</li>
+<li><code>verified_through_never_goes_back</code>.</li>
+<li><code>purging_a_document_deletes_its_log</code> (server test, through the bin's purge).</li>
+</ul></li>
+<li>Run, fail, implement, pass.</li>
+<li>Commit <code>feat: thirty-day retention of verified live entries</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 13: documents and the final check</h3>
+<ol class="steps">
+<li>Add a BUILDING.html section, in plain English with banded tables: what the live room is, that it is off for every document until G5, migration 0017 (one way; back up the data folder and database together first), the new settings, the events, and the retention rule.</li>
+<li>Add a progress note to the Stage 2 card in sequencing.html (G2 built, on branch <code>gridcraft-coauthoring-g2</code>, not merged), and a version line.</li>
+<li>Run <code>cargo xtask check</code>: it prints <code>xtask: all checks passed</code>.</li>
+<li>Commit <code>docs: live room and shared library (plan G2)</code>. Ask before pushing or merging.</li>
+</ol></div>
+
+<h2>Spec coverage</h2>
+<table>
+<tr><th>Spec item</th><th>Task</th></tr>
+<tr><td>Opaque entries with last-seen position and format version; server adds position, sender, time (§04)</td><td>1, 8</td></tr>
+<tr><td>Agreed and shown states; rollback and re-run; two modes (§04, C13)</td><td>4</td></tr>
+<tr><td>Join, rejoin, waiting queue, resend, heartbeat every minute (§10, C21)</td><td>5, 9</td></tr>
+<tr><td>Expiry after three misses; any message is life; session ends with the last client (C21)</td><td>9</td></tr>
+<tr><td>Returning client rejoins as a new participant and sends waiting changes on top (§04, §10)</td><td>5, 8, 9</td></tr>
+<tr><td>Identity tables with remembered deletions; ids from participant number and counter (§06, §10)</td><td>2, 5</td></tr>
+<tr><td>Time and random starting point from each entry (§03, §10)</td><td>1, 3, 4, 8</td></tr>
+<tr><td>Log in PostgreSQL before sending; survives restart (§05)</td><td>7, 8, 11</td></tr>
+<tr><td>Cancelling rule; crash note and report; desktop panic as crash (C3, §04)</td><td>6, 10, 11</td></tr>
+<tr><td>Role check, duplicate resends, size and rate (§11); S5 on role change</td><td>8, 11</td></tr>
+<tr><td>Format version pinned per session; other version told to reload (C14, §11)</td><td>1, 8</td></tr>
+<tr><td>Kept 30 days after covered (C18, C22)</td><td>12</td></tr>
+<tr><td>Events (S7, §11)</td><td>8, 9, 10, 11</td></tr>
+<tr><td>Text room unchanged (C15); seats unchanged (C17)</td><td>11</td></tr>
+</table>
+</main></body>
+</html>
