@@ -41,6 +41,9 @@ pub enum SecretError {
     /// The value did not open: wrong key, wrong context or altered ciphertext.
     #[error("the secret did not open with this key and context")]
     WrongKey,
+    /// Randomness or encryption failed; nothing was sealed.
+    #[error("the secret could not be sealed")]
+    Failed,
     /// The stored value is malformed.
     #[error("the stored secret is malformed")]
     Corrupt,
@@ -76,6 +79,24 @@ impl fmt::Display for Secret {
     }
 }
 
+/// Creates `path`, which must not exist, holding `bytes`, flushed to disk (mode 0600 on Unix).
+fn write_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    let result = file.write_all(bytes).and_then(|()| file.sync_all());
+    if result.is_err() {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+    }
+    result
+}
+
 /// Seals and unseals values under the key from the data folder.
 pub struct SecretBox {
     key: [u8; KEY_LEN],
@@ -98,26 +119,34 @@ impl SecretBox {
         let path = data_dir.join(KEY_FILE);
         let unreadable = |e: std::io::Error| SecretError::Unreadable(e.kind().to_string());
         let mut key = [0u8; KEY_LEN];
-        getrandom::fill(&mut key).map_err(|_| SecretError::Unreadable("no randomness".into()))?;
+        getrandom::fill(&mut key).map_err(|_| SecretError::Failed)?;
 
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        match options.open(&path) {
-            Ok(mut file) => {
-                file.write_all(&key).map_err(unreadable)?;
-                file.sync_all().map_err(unreadable)?;
-            }
-            Err(e) if e.kind() == ErrorKind::AlreadyExists => {
-                let bytes = std::fs::read(&path).map_err(unreadable)?;
-                key = <[u8; KEY_LEN]>::try_from(bytes.as_slice())
-                    .map_err(|_| SecretError::Unreadable("wrong length".into()))?;
-            }
-            Err(e) => return Err(unreadable(e)),
+        // On Windows the key file inherits the data folder's access rules, so the data folder
+        // must be private to the server's account.
+        // Write a private temporary file first, so no other start can read a partial key.
+        let mut suffix = [0u8; 8];
+        getrandom::fill(&mut suffix).map_err(|_| SecretError::Failed)?;
+        let tmp = data_dir.join(format!("{KEY_FILE}.tmp-{}", u64::from_le_bytes(suffix)));
+        write_new(&tmp, &key).map_err(unreadable)?;
+        let installed = match std::fs::hard_link(&tmp, &path) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => Ok(false),
+            // No hard links on this filesystem: create the file directly, and remove it again
+            // if writing it fails.
+            Err(_) => match write_new(&path, &key) {
+                Ok(()) => Ok(true),
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => Ok(false),
+                Err(e) => {
+                    let _ = std::fs::remove_file(&path);
+                    Err(e)
+                }
+            },
+        };
+        let _ = std::fs::remove_file(&tmp);
+        if !installed.map_err(unreadable)? {
+            let bytes = std::fs::read(&path).map_err(unreadable)?;
+            key = <[u8; KEY_LEN]>::try_from(bytes.as_slice())
+                .map_err(|_| SecretError::Unreadable("wrong length".into()))?;
         }
         Ok(SecretBox {
             key,
@@ -131,28 +160,26 @@ impl SecretBox {
 
     /// Encrypts `plain` bound to `context`, under a fresh nonce.
     ///
-    /// Encryption cannot fail for any realistic input; if it ever did, the empty ciphertext
-    /// returned would fail to open rather than store the value in the clear.
-    #[must_use]
-    pub fn seal(&self, plain: &[u8], context: &[u8]) -> Sealed {
+    /// # Errors
+    /// `Failed` when no random nonce is available or the encryption fails.
+    pub fn seal(&self, plain: &[u8], context: &[u8]) -> Result<Sealed, SecretError> {
         let mut nonce = [0u8; NONCE_LEN];
-        let ciphertext = match (getrandom::fill(&mut nonce), self.cipher()) {
-            (Ok(()), Ok(cipher)) => cipher
-                .encrypt(
-                    (&nonce).into(),
-                    Payload {
-                        msg: plain,
-                        aad: context,
-                    },
-                )
-                .unwrap_or_default(),
-            _ => Vec::new(),
-        };
-        Sealed {
+        getrandom::fill(&mut nonce).map_err(|_| SecretError::Failed)?;
+        let ciphertext = self
+            .cipher()?
+            .encrypt(
+                (&nonce).into(),
+                Payload {
+                    msg: plain,
+                    aad: context,
+                },
+            )
+            .map_err(|_| SecretError::Failed)?;
+        Ok(Sealed {
             key_id: self.key_id,
             nonce,
             ciphertext,
-        }
+        })
     }
 
     /// Decrypts `sealed`, which must have been sealed with the same `context`.
