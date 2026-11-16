@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="ShareCraft report: the G1 proofs for GridCraft live co-authoring (two engines, desktop against browser, save and reopen, rollback timings) and the go/no-go recommendation.">
+<title>ShareCraft — GridCraft Co-authoring Proofs</title>
+<style>
+:root{color-scheme:light dark;--ink:light-dark(#172f38,#e4ecef);--muted:light-dark(#536b72,#a9b9bf);--line:light-dark(#d7e2e3,#36454b);--accent:light-dark(#086959,#7fd9bb);--paper:light-dark(#fff,#1d272b);--wash:light-dark(#f2f6f5,#141b1e);font-family:Segoe UI,Arial,sans-serif;color:var(--ink);background:var(--wash);line-height:1.65}
+*{box-sizing:border-box}body{margin:0}a{color:var(--accent);text-underline-offset:3px}a:focus-visible,button:focus-visible{outline:3px solid #b66e00;outline-offset:4px}.skip{position:absolute;left:1rem;top:-5rem;background:var(--paper);padding:1rem;z-index:20}.skip:focus{top:1rem}
+.cover{background:#123e3b;color:#fff;padding:66px max(24px,calc((100vw - 1160px)/2));border-bottom:8px solid #71d8b5}.eyebrow{text-transform:uppercase;letter-spacing:.17em;font-size:.76rem;font-weight:700;color:#a7e7d1}.cover h1{font-size:clamp(2.6rem,6vw,4.6rem);letter-spacing:-.05em;line-height:1.05;margin:18px 0}.cover .lede{font-size:1.2rem;max-width:770px;color:#e0eee9}.meta{display:flex;flex-wrap:wrap;gap:10px 28px;color:#c4ded5;font-size:.88rem}.layout{display:grid;grid-template-columns:225px minmax(0,1fr);gap:48px;max-width:1210px;margin:auto;padding:40px 25px 80px}nav{position:sticky;top:24px;align-self:start;max-height:90vh;overflow:auto;font-size:.88rem}nav p{font-weight:700;margin:0 0 12px}nav a{display:block;padding:7px 0;text-decoration:none;color:var(--muted)}nav a:hover{color:var(--accent)}main{min-width:0}section{scroll-margin-top:25px;margin:0 0 38px}h2{font-size:1.7rem;line-height:1.25;letter-spacing:-.025em;margin:0 0 18px}h3{font-size:1.13rem;line-height:1.4;margin:0 0 12px}p{margin:0 0 16px}.note{padding:20px 23px;border-left:4px solid var(--accent);background:light-dark(#e5f0ec,#1c302c)}.note p:last-child{margin-bottom:0}.cards{display:grid;gap:17px}.module{background:var(--paper);padding:25px;border:1px solid var(--line);border-radius:9px;break-inside:avoid}.tag{display:inline-block;font-size:.7rem;letter-spacing:.05em;text-transform:uppercase;border-radius:4px;padding:3px 7px;background:light-dark(#e2f1e9,#1f3a2e);color:light-dark(#155438,#a8e0c4);margin:0 0 12px}.spine{background:light-dark(#fff0d5,#3d3115);color:light-dark(#775110,#f0d08a)}.parallel{background:light-dark(#e8ecfb,#252d48);color:light-dark(#344e91,#b3c2f2)}ul,ol{padding-left:22px;margin:0}li{margin:0 0 9px}li:last-child{margin-bottom:0}code{font-family:Consolas,Menlo,monospace;font-size:.9em;background:light-dark(#eaf0ef,#263238);padding:1px 5px;border-radius:3px;overflow-wrap:anywhere}.rid{font-weight:700;color:var(--accent);white-space:nowrap}table{border-collapse:collapse;width:100%;font-size:.91rem;background:var(--paper)}th,td{border:1px solid var(--line);padding:12px 14px;text-align:left;vertical-align:top}th{background:light-dark(#e8efed,#263238)}caption{text-align:left;font-weight:700;padding:0 0 10px}.table-wrap{overflow-x:auto}.small{font-size:.88rem;color:var(--muted)}.toolbar{display:flex;justify-content:space-between;align-items:center;gap:20px;margin-bottom:26px}button{background:var(--accent);color:light-dark(#fff,#10231f);border:0;border-radius:5px;padding:10px 15px;font:inherit;cursor:pointer}footer{border-top:1px solid var(--line);padding-top:22px;font-size:.86rem;color:var(--muted)}
+@media(max-width:850px){.layout{grid-template-columns:1fr;gap:28px}nav{position:static;max-height:none;display:flex;flex-wrap:wrap;gap:3px 18px;border-bottom:1px solid var(--line);padding-bottom:20px}nav p{width:100%;margin-bottom:0}.cover{padding:40px 25px}.module{padding:20px}}
+@media print{:root{color-scheme:light}@page{size:A4;margin:17mm}html,body{background:white;font-size:10pt}.cover{padding:12mm 0;background:white;color:var(--ink);border-bottom:3px solid var(--accent)}.cover .lede,.meta,.eyebrow{color:var(--ink)}.layout{display:block;padding:10mm 0;margin:0;max-width:none}nav,.toolbar button,.skip{display:none}.module{border-radius:0;padding:5mm}.note{background:#f4f4f4}h2,h3{break-after:avoid}a{color:inherit}tr{break-inside:avoid}.table-wrap{overflow:visible}}
+.group td{background:light-dark(#e8efed,#263238);font-weight:700}
+.owner{background:light-dark(#fbe6d4,#43301c);color:light-dark(#7a3d06,#f4c89a)}.decided{display:inline-block;font-size:.72rem;letter-spacing:.04em;text-transform:uppercase;font-weight:700;border-radius:4px;padding:2px 6px;margin:0 6px 4px 0;background:light-dark(#fbe6d4,#43301c);color:light-dark(#7a3d06,#f4c89a)}
+tbody tr:nth-child(even)>td,tbody tr:nth-child(even)>th{background:light-dark(#f3f8f6,#222e32)}tbody tr.group>td{background:light-dark(#e8efed,#263238)}
+:is(ul,ol):has(>li:nth-child(6))>li{padding:7px 10px;border-radius:4px}:is(ul,ol):has(>li:nth-child(6))>li:nth-child(even){background:light-dark(#eef4f2,#212c30)}
+</style>
+</head>
+<body data-project="ShareCraft" data-status="g1-proofs-report">
+<a class="skip" href="#main">Skip to report</a>
+<header class="cover">
+<p class="eyebrow">ThineCraft / ShareCraft report</p>
+<h1>GridCraft co-authoring: the proofs</h1>
+<p class="lede">Before anything is built for live co-authoring in GridCraft, plan G1 tested the four things the adopted design rests on (C16, “proofs first”). This report gives each result, its evidence, and a recommendation: go, with conditions.</p>
+<div class="meta"><span>Version 0.1 · For the owner’s decision</span><span>16 November 2026</span><span>Reports against <a href="co-authoring-approach.html" style="color:inherit">co-authoring-approach.html</a> (C1, C5, C7, C9, C12, C16, section 12) and <a href="sequencing.html" style="color:inherit">sequencing.html</a> (Stage 2 editor track)</span></div>
+</header>
+<div class="layout">
+<nav aria-label="Report contents"><p>In this report</p>
+<a href="#verdict">01 · Recommendation</a><a href="#results">02 · The four proofs</a><a href="#engines">03 · Two engines</a><a href="#platforms">04 · Desktop and browser</a><a href="#save">05 · Save and reopen</a><a href="#timing">06 · Rollback and re-run</a><a href="#selection">07 · Commands that read the selection</a><a href="#audit">08 · Determinism audit</a><a href="#fixes">09 · Engine fixes made</a><a href="#conditions">10 · Conditions for G3 to G5</a><a href="#notproved">11 · Not proved</a><a href="#decisions">12 · Decisions asked</a><a href="#evidence">13 · Evidence and commits</a>
+</nav>
+<main id="main">
+<div class="toolbar"><span class="small">Standalone HTML · Print-ready · No external assets</span><button type="button" onclick="window.print()">Print / Save PDF</button></div>
+
+<section id="verdict"><h2>01 / Recommendation</h2>
+<div class="note"><p><strong>Go, with conditions.</strong> The core of the design holds. Two copies of the engine given the same changes end in the same workbook, the browser build agrees with the desktop on everything people type, and saving is deterministic. Three results change details of the design rather than its shape:</p>
+<ul>
+<li><strong>Computed values can differ in the last digit between desktop and browser</strong> (64 of 1,584 maths cells, all by the smallest possible step; 3 of them visible as 15-digit text). Agreement checks must not compare computed values across platforms, or both builds must use the same maths library. Desktop editors stay out of shared sessions until one of these is in place, as C16 already says.</li>
+<li><strong>Re-running a row or column insert or delete on a 100,000-cell workbook takes about the whole desktop budget</strong> (43 to 60 ms against 50 ms). Cell edits and formatting re-run in under 1 ms each. G3 either makes structural re-runs cheaper or uses the design’s “wait for the server” mode for structural changes on large workbooks.</li>
+<li><strong>Save and reopen is lossless only if the reopened file is recalculated</strong>, and 8 of 10,000 random histories still lose a row height. Checkpoints must be loaded with a full recalculation, and the row-height loss is fixed in G4.</li>
+</ul></div>
+<p>None of these needs a different architecture. They are listed with the plan that owns each in <a href="#conditions">section 10</a>; the owner’s decisions are in <a href="#decisions">section 12</a>.</p>
+</section>
+
+<section id="results"><h2>02 / The four proofs</h2>
+<div class="table-wrap"><table>
+<thead><tr><th scope="col">Proof</th><th scope="col">Threshold proposed in G1</th><th scope="col">Result</th><th scope="col">Verdict</th></tr></thead>
+<tbody>
+<tr><td>Two engines given the same ordered changes end in the same workbook.</td><td>Agree on every step of 10,000 random sequences.</td><td>10,000 sequences, 625,130 steps; every step agreed on both fingerprints.</td><td>Met</td></tr>
+<tr><td>Desktop and browser give the same results.</td><td>Entered content always equal; computed values equal except listed last-digit differences.</td><td>All 26 stored histories equal on both fingerprints. Maths grid: entered content equal; 64 of 1,584 computed cells differ by exactly 1 ULP, all listed; 6 texts in 3 cells differ at 15 significant digits.</td><td>Met as worded, with a finding (section 04)</td></tr>
+<tr><td>Saving and reopening loses nothing.</td><td>Lossless for everything shared commands can make.</td><td>Saving is byte-for-byte deterministic on 10,034 cases. Lossless when the reopened file is recalculated, except 8 of 10,000 sequences (0.08 %) that lose a row height.</td><td>Not fully met; G4</td></tr>
+<tr><td>Rolling back and re-applying is fast enough.</td><td>10 pending changes on 100,000 cells: at most 50 ms desktop, 150 ms browser, at p95.</td><td>Desktop 58 to 79 ms over three controlled runs; browser build under Node 47 ms. Content and formatting alone: 7 ms on the desktop.</td><td>Desktop not met for structural changes; browser met</td></tr>
+</tbody></table></div>
+</section>
+
+<section id="engines"><h2>03 / Two engines agree</h2>
+<p>Each random history is a list of shared commands with explicit sheets and ranges, never relying on the selection, drawn by a seeded generator: 1 to 6 sheets, formulas from 40 common functions including cross-sheet references, and about 15 % structural changes. Two engines in one process apply it. After every step their outcome and two SHA-256 fingerprints are compared: <em>entered</em> (what people typed and formatted, sheet structure, names) and <em>computed</em> (every calculated value, by its exact bits). Before every step the second engine’s selection and active sheet are moved at random, so a command that secretly reads the selection would show up.</p>
+<div class="table-wrap"><table>
+<thead><tr><th scope="col">Measure</th><th scope="col">Value</th></tr></thead>
+<tbody>
+<tr><td>Sequences and steps</td><td>10,000 sequences (seeds 100000 to 109999), 625,130 steps, 18.5 % structural</td></tr>
+<tr><td>Steps that changed what was entered</td><td>463,024 of 509,684 non-structural steps (90.8 %)</td></tr>
+<tr><td>Steps that changed a computed value</td><td>443,516 of 625,130 steps (70.9 %)</td></tr>
+<tr><td>Disagreements</td><td>None</td></tr>
+<tr><td>Run time</td><td>About 5 minutes, release build, x86_64 Windows, on the final code (<code>f92a4178</code>); an earlier run gave the same counts</td></tr>
+<tr><td>On every push</td><td>500 random sequences, 26 stored histories, and hand-written histories with known final values, so a pass cannot come from both engines being wrong the same way</td></tr>
+<tr><td>Proof the check can fail</td><td>One extra step on the second engine is caught, naming the step and the cell</td></tr>
+</tbody></table></div>
+<p class="small">Scope: identical histories from a new workbook, in one process, on one platform. Filters are not driven (section 07). It proves nothing yet about rolling back and re-applying against applying straight through, or about a client that loaded a checkpoint; those are G3 and G4 tests.</p>
+</section>
+
+<section id="platforms"><h2>04 / Desktop and browser</h2>
+<p>The browser build (WebAssembly) replays the same 26 stored histories and compares them against fingerprints recorded on the desktop. All agree, entered and computed. Because those histories use few maths functions, a separate grid was added: 36 maths formulas over 44 inputs, covering logarithms, exponentials, square roots, fractional powers, trigonometric and hyperbolic functions and their inverses, and number display near powers of ten.</p>
+<div class="table-wrap"><table>
+<thead><tr><th scope="col">Check</th><th scope="col">Result</th></tr></thead>
+<tbody>
+<tr><td>Entered content</td><td>Identical everywhere</td></tr>
+<tr><td>Computed values</td><td>64 of 1,584 cells differ, every one by exactly 1 ULP, about one part in 10<sup>16</sup>. POWER 21, ^ 6, ATAN2 8, ATANH 7, COSH 6, SINH 4, ACOSH 3, ASINH 3, TANH 2; ASIN, SIN, COS and TAN 1 each. LN, LOG, LOG10, EXP, SQRT, ACOS, ATAN and ROUND agree exactly.</td></tr>
+<tr><td>Displayed text</td><td>The same under General, <code>#,##0.00</code> and <code>0.0000000000</code>. At 15 significant digits (joining with text, the formula bar, a 15-digit scientific format), 3 cells differ: <code>SIN(π/4)</code> shows 0.707106781186548 on the desktop and 0.707106781186547 in the browser, <code>POWER(2,-0.5)</code> the same, and <code>1e5^0.37</code> 5.49540873857625 against 5.49540873857624.</td></tr>
+<tr><td>How it is guarded</td><td>Every value difference and every text difference is in a committed list that is checked exactly, so a new or vanished difference fails the test. A failure names the root cell, every function in its formula with its evaluated arguments, and the precedents’ values on both sides.</td></tr>
+</tbody></table></div>
+<p><strong>What it means.</strong> The desktop uses the platform’s maths library and the browser uses Rust’s. A 1-ULP difference is invisible in a normal cell, but it shows in 15-digit text, and at a rounding boundary it could change a comparison, a ROUND or a displayed value (the grid did not hit one). So the computed fingerprint cannot be the agreement check across platforms. Section 12 of the approach already named the answer: one maths library written in Rust in both builds. Until then, desktop editors stay out of shared sessions (C16).</p>
+<p class="small">Measured on x86_64 Windows (MSVC) against wasm32 under Node 24, with the test runner 0.2.129. Linux and macOS desktops and real browsers were not measured.</p>
+</section>
+
+<section id="save"><h2>05 / Save and reopen</h2>
+<p>Every history’s final workbook was saved as .xlsx, reopened and compared three ways: saving twice gives identical bytes; reopening and recalculating gives the same fingerprints; and save, reopen, save gives the same bytes again. The requested edge cases were included: sheet names that need quoting, renamed and deleted sheets referred to by formulas, very large and very small numbers, empty strings against empty cells, and merged areas.</p>
+<div class="table-wrap"><table>
+<thead><tr><th scope="col">Check</th><th scope="col">Result</th></tr></thead>
+<tbody>
+<tr><td>Saving is deterministic</td><td>Passed on all 10,034 cases</td></tr>
+<tr><td>Lossless after reopening with recalculation</td><td>Passed except 8 of 10,000 sequences (0.08 %): reopening re-fits a row height from the values (wrapped formula text grew, or <code>#CIRC!</code> stored as 0). Kept as a test that fails once the loss is fixed.</td></tr>
+<tr><td>Reopened from stored values only</td><td>Not lossless: <code>#CIRC!</code> comes back as 0, and <code>#SPILL!</code> and <code>#CALC!</code> as <code>#VALUE!</code>. A checkpoint must therefore be loaded with a full recalculation.</td></tr>
+<tr><td>Fixed in G1</td><td>Empty column records are no longer written; row heights are written precisely enough to read back, and above 409.5 pt in hundredths; borders re-fit their rows; the fingerprint skips blank default cells and reads dynamic arrays the way a file writes them.</td></tr>
+</tbody></table></div>
+<p class="small">Filters are not covered, because the filter commands are not yet shared (section 07).</p>
+</section>
+
+<section id="timing"><h2>06 / Rolling back and re-running</h2>
+<p>When someone else’s change arrives before yours is agreed, the editor goes back to the agreed workbook and re-applies its own pending changes on top. The timed work is: copy the agreed workbook, then apply the pending commands, each with the recalculation it normally does. Release builds, one discarded warm-up, 30 measured runs, p95. The desktop ran three times as separate processes, at high priority on the performance cores. The workbook has two 100-column sheets, 20 % formulas, whole-column sums and cross-sheet references.</p>
+<div class="table-wrap"><table>
+<thead><tr><th scope="col">100,000 cells, 10 pending changes</th><th scope="col">Desktop p95</th><th scope="col">Browser build p95 (Node)</th><th scope="col">Budget</th></tr></thead>
+<tbody>
+<tr><td>Mixed, as proposed (content, formatting and one row insert)</td><td>78.6, 58.2 and 71.3 ms</td><td>47.2 ms</td><td>50 ms desktop · 150 ms browser</td></tr>
+<tr><td>Content and formatting only</td><td>7.2 to 7.4 ms</td><td>5.3 ms</td><td>Well inside</td></tr>
+<tr><td>Exactly one row insert among them</td><td>65.5 to 70.8 ms</td><td>46.4 ms</td><td>Desktop over</td></tr>
+<tr><td>One command alone: content or format</td><td>0.3 to 1 ms</td><td>Under 1 ms</td><td>—</td></tr>
+<tr><td>One command alone: row or column insert or delete</td><td>43 to 60 ms (p50)</td><td>33 to 39 ms</td><td>About the whole desktop budget</td></tr>
+</tbody></table></div>
+<p><strong>What it means.</strong> Re-running ordinary edits is cheap. A structural change is expensive because it rewrites references and recalculates the whole workbook. G3 should either make structural re-runs cheaper (for example one recalculation per batch instead of per command, proven to give the same result) or, as the design already allows, apply structural changes on large workbooks only once the server has agreed them (“wait for the server”).</p>
+<p class="small">Qualifiers: the workbook’s formulas are cheap, so real workbooks may be slower. The browser figure is one run under Node, not pinned and not in a real browser. The browser build being faster than the desktop is unexplained; the copy alone takes 1.0 to 1.3 ms on the desktop against 0.3 ms, which points at the Windows memory allocator, not yet tested. A first figure of 97 ms included an extra full recalculation the design never does; it is kept in the evidence and not used here.</p>
+</section>
+
+<section id="selection"><h2>07 / Commands that read the selection</h2>
+<p>A shared command must act only on what it is told, never on the sender’s or receiver’s selection. Reading the command code found these, which are now input for G3:</p>
+<div class="table-wrap"><table>
+<thead><tr><th scope="col">Command</th><th scope="col">What it reads</th><th scope="col">Consequence</th></tr></thead>
+<tbody>
+<tr><td>Filter on and off (<code>data.filter</code>)</td><td>A toggle that looks for a table at the active cell</td><td>Two people toggling at once cancel out. Left out of the proofs; G3 needs explicit set-filter and clear-filter commands.</td></tr>
+<tr><td><code>data.filterBy</code>, <code>data.clearFilter</code>, <code>data.reapply</code></td><td>No sheet parameter: always the active sheet</td><td>Left out of the proofs; G3 adds explicit targets.</td></tr>
+<tr><td>Underline and double underline</td><td>The active cell’s underline, even when told on or off</td><td>G3 fix.</td></tr>
+<tr><td>Increase and decrease font size</td><td>Steps from the active cell’s size</td><td>G3: send the resulting size.</td></tr>
+<tr><td>Format Cells</td><td>Checks the change against the active cell’s style</td><td>Could be accepted on one client and refused on another; G3 fix.</td></tr>
+<tr><td>Bold, italic, wrap text, align left, centre and right</td><td>Toggle from the active cell when “on” is not given</td><td>Shared only in the explicit form, as proved in G1.</td></tr>
+<tr><td>Insert and delete sheet</td><td>Make the new sheet active; reset the selection</td><td>The workbook agrees, but a remote change must not move a co-author’s view: G3’s apply loop keeps the view.</td></tr>
+</tbody></table></div>
+</section>
+
+<section id="audit"><h2>08 / Determinism audit</h2>
+<p>Every hash map, clock, random source, use of a memory address and floating-point path in the engine, model, calculation, formula, functions and xlsx code was classed as safe, fixed in G1, or left for G3, with the reason. The full audit is <code>docs/coauthor-determinism.md</code> in the GridCraft fork.</p>
+<div class="table-wrap"><table>
+<thead><tr><th scope="col">Left for G3 or later</th><th scope="col">Why it matters</th><th scope="col">Fix proposed</th></tr></thead>
+<tbody>
+<tr><td>NOW and TODAY</td><td>Each client has its own clock</td><td>The command carries the originator’s time, or the agreed time</td></tr>
+<tr><td>RAND, RANDBETWEEN, RANDARRAY</td><td>The random state lives in the calculator, not the workbook, so a rollback or reload draws other numbers</td><td>Keep the random state with the agreed workbook, or treat volatile results as the server’s</td></tr>
+<tr><td>Dates typed without a year</td><td>Read the system clock, so two clients either side of New Year differ</td><td>The originator sends the full date</td></tr>
+<tr><td>Maths library differences</td><td>Section 04</td><td>One maths library in both builds, or the server’s computed values are the agreed ones</td></tr>
+<tr><td>Conditional formats, validation lists, Advanced Filter and pivot calculated fields</td><td>Use the system clock and a fixed random seed</td><td>Pass the session’s clock and seed</td></tr>
+<tr><td>Iterative calculation, manual calculation, more than 8 spill rounds</td><td>Results depend on calculation history</td><td>A full recalculation after each agreed step, or per-workbook settings</td></tr>
+<tr><td>AutoFit column width, password salts, the random-number tool, macro time limits, cell pictures</td><td>Depend on the machine, and are not shared commands</td><td>The originator sends the result</td></tr>
+<tr><td>Undo history depth</td><td>Differs between platforms</td><td>Per-person undo must not assume the same depth</td></tr>
+</tbody></table></div>
+</section>
+
+<section id="fixes"><h2>09 / Engine fixes made in G1</h2>
+<p>These change GridCraft’s behaviour for everyone, not only for co-authoring, and were reviewed as such.</p>
+<div class="table-wrap"><table>
+<thead><tr><th scope="col">Fix</th><th scope="col">Commit</th></tr></thead>
+<tbody>
+<tr><td>RAND takes a seed, so volatile results repeat across engines</td><td><code>3983ca7c</code></td></tr>
+<tr><td>Overlapping dynamic arrays read the first anchor, not hash order</td><td><code>1031573d</code></td></tr>
+<tr><td>Column records that carry nothing are not written</td><td><code>68571017</code></td></tr>
+<tr><td>Row heights are written precisely enough to read back, and above 409.5 pt in hundredths</td><td><code>23f94b5f</code>, <code>723f2f70</code></td></tr>
+<tr><td>Borders re-fit the rows they store cells in</td><td><code>4b362647</code></td></tr>
+</tbody></table></div>
+</section>
+
+<section id="conditions"><h2>10 / Conditions for G3 to G5</h2>
+<div class="table-wrap"><table>
+<thead><tr><th scope="col">Condition</th><th scope="col">Plan</th></tr></thead>
+<tbody>
+<tr><td>Make filters, underline, font-size steps and Format Cells target-explicit; keep a co-author’s view when applying others’ commands.</td><td>G3</td></tr>
+<tr><td>Structural changes on large workbooks: a cheaper re-run proven equal to straight application, or “wait for the server”. Re-measure with heavier formulas.</td><td>G3</td></tr>
+<tr><td>Clock, random state and year-less dates carried in the command or the agreed state.</td><td>G3</td></tr>
+<tr><td>A test that rolling back and re-applying gives the same workbook as applying straight through.</td><td>G3</td></tr>
+<tr><td>Checkpoints load with a full recalculation; fix the row-height loss (8 of 10,000).</td><td>G4</td></tr>
+<tr><td>Agreement checks across platforms use entered content only, until both builds share one maths library.</td><td>G4</td></tr>
+<tr><td>Re-run the browser checks and timings in real browsers (Chrome, Edge, Firefox).</td><td>G5</td></tr>
+<tr><td>Desktop GridCraft joins shared sessions only once both builds use one maths library (C16).</td><td>After G5</td></tr>
+</tbody></table></div>
+</section>
+
+<section id="notproved"><h2>11 / Not proved</h2>
+<ul>
+<li>Real browsers: every browser-build result ran under Node.</li>
+<li>Linux and macOS desktops.</li>
+<li>Filters, in any proof.</li>
+<li>Rolling back and re-applying against applying straight through, and clients that loaded a checkpoint.</li>
+<li>Workbooks with expensive formulas. Larger workbooks were timed only for reference: 1,000,000 cells take about 1 s for 10 mixed changes on the desktop.</li>
+<li>A 1-ULP difference at a rounding boundary changing a comparison or a displayed value.</li>
+<li>Why the browser build is faster than the desktop.</li>
+</ul>
+</section>
+
+<section id="decisions"><h2>12 / Decisions asked of the owner</h2>
+<div class="table-wrap"><table>
+<thead><tr><th scope="col">Decision</th><th scope="col">Recommendation</th></tr></thead>
+<tbody>
+<tr><td>Go, go with conditions, or no-go for G3 to G5</td><td>Go, with the conditions in section 10</td></tr>
+<tr><td>Structural changes on large workbooks</td><td>Start with “wait for the server” above a workbook-size threshold, and adopt a cheaper re-run in G3 only if it is proven equal</td></tr>
+<tr><td>Computed values across platforms</td><td>One Rust maths library in both builds, as section 12 of the approach proposed; until then, compare entered content only across platforms</td></tr>
+<tr><td>The fork branch <code>coauthor-proofs</code></td><td>Push it and open a pull request into the fork’s <code>sharecraft</code> branch. It waits for your go-ahead.</td></tr>
+</tbody></table></div>
+</section>
+
+<section id="evidence"><h2>13 / Evidence and commits</h2>
+<p>The code is in the GridCraft fork, branch <code>coauthor-proofs</code>, made from <code>sharecraft</code> at <code>017d0b9d</code> and ending at <code>4de1cfcb</code> (28 commits). Each task was built, reviewed, fixed where needed and re-reviewed; the whole branch then had a final review and one round of fixes. Codex built the first versions of the browser comparison and the timings, and Claude reviewed and completed them.</p>
+<div class="table-wrap"><table>
+<thead><tr><th scope="col">Task</th><th scope="col">Commits</th><th scope="col">Main tests</th></tr></thead>
+<tbody>
+<tr><td>1. Workbook fingerprint</td><td><code>d7fe9336</code>, <code>dba599ee</code>, <code>93951043</code></td><td><code>fingerprint_sensitivity</code></td></tr>
+<tr><td>2. Two-engine replay</td><td><code>3983ca7c</code>, <code>538d97b4</code>, <code>43d635b0</code>, <code>699fc517</code></td><td><code>two_engines_agree_on_random_sequences</code>, <code>long_replay</code>, <code>replay_matches_hand_written_expectations</code></td></tr>
+<tr><td>3. Determinism audit</td><td><code>1031573d</code>, <code>965571a1</code>, <code>c6e43608</code>, <code>f92a4178</code>, <code>4de1cfcb</code></td><td><code>overlapping_spills_in_a_pass_read_the_first_anchor</code></td></tr>
+<tr><td>4. Desktop against browser</td><td><code>f1f88924</code>, <code>0557e38b</code>, <code>3e6b613e</code>, <code>49a31b28</code>, <code>bd4183d6</code></td><td><code>wasm_matches_native_fixtures</code> and the maths grid</td></tr>
+<tr><td>5. Save and reopen</td><td><code>68571017</code>, <code>23f94b5f</code>, <code>4b362647</code>, <code>6f612608</code>, <code>d241414e</code>, <code>723f2f70</code>, <code>0985d8bb</code></td><td><code>save_reload_lossless</code>, <code>save_reload_save_is_stable</code>, <code>save_is_deterministic</code></td></tr>
+<tr><td>6. Rollback timings</td><td><code>595df7db</code>, <code>34536e24</code>, <code>d0f5983b</code>, <code>91481b71</code></td><td>Ignored release tests, desktop and browser</td></tr>
+</tbody></table></div>
+<p class="small">Tests at the end of G1: engine 902 unit and 127 integration tests passing; xlsx 368; calculation 118; browser build 6. New test-only dependency: <code>wasm-bindgen-test</code> 0.3.79 (MIT or Apache-2.0), run with <code>wasm-bindgen-test-runner</code> 0.2.129 installed in its own folder on J:.</p>
+</section>
+
+<footer><p>ShareCraft · GridCraft co-authoring proofs (plan G1) · Version 0.1 · 16 November 2026</p></footer>
+</main>
+</div>
+</body>
+</html>
