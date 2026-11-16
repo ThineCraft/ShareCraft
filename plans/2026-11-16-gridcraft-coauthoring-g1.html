@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ShareCraft — GridCraft Co-authoring (Plan G1): Implementation Plan</title>
+<style>
+:root{color-scheme:light dark;--ink:light-dark(#172f38,#e4ecef);--muted:light-dark(#536b72,#a9b9bf);--line:light-dark(#d7e2e3,#36454b);--paper:light-dark(#fff,#1d272b);--wash:light-dark(#f2f6f5,#141b1e);--accent:light-dark(#3156c9,#9db4ff);font:15px/1.6 Segoe UI,system-ui,sans-serif;color:var(--ink);background:var(--wash)}
+*{box-sizing:border-box}body{margin:0;padding:28px 18px 80px}main{max-width:940px;margin:auto}
+h1{font-size:1.9rem;letter-spacing:-.03em;line-height:1.2;margin:0 0 14px}h2{font-size:1.3rem;margin:38px 0 12px;padding-top:18px;border-top:1px solid var(--line)}h3{font-size:1.08rem;margin:30px 0 8px}h4{font-size:.95rem;margin:16px 0 6px}
+p{margin:0 0 12px}ul,ol{margin:0 0 12px;padding-left:22px}li{margin-bottom:6px}a{color:var(--accent)}
+code{font-family:Consolas,Menlo,monospace;font-size:.88em;background:light-dark(#e9efee,#263238);padding:1px 5px;border-radius:3px;overflow-wrap:anywhere}
+pre{background:var(--paper);border:1px solid var(--line);border-radius:7px;padding:12px 14px;overflow-x:auto;font:13px/1.5 Consolas,Menlo,monospace;margin:0 0 12px}pre code{background:none;padding:0;font-size:inherit}
+.note{border-left:4px solid var(--accent);background:var(--paper);padding:12px 16px;margin:0 0 14px}.note p:last-child{margin:0}
+.task{background:var(--paper);border:1px solid var(--line);border-radius:9px;padding:6px 20px 14px;margin:18px 0}
+ol.steps{list-style:none;padding-left:0}ol.steps>li{padding-left:28px;position:relative;margin-bottom:10px}ol.steps>li::before{content:"☐";position:absolute;left:2px;color:var(--muted)}
+table{border-collapse:collapse;width:100%;font-size:.9rem;background:var(--paper);margin-bottom:14px}th,td{border:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top}th{background:light-dark(#e8efed,#263238)}
+.small{font-size:.88rem;color:var(--muted)}
+tbody tr:nth-child(even) td{background:light-dark(#f4f8f7,#212b30)}
+ol.steps>li:nth-child(even),ul.band>li:nth-child(even),ol.band>li:nth-child(even){background:light-dark(#f4f8f7,#212b30);border-radius:4px}
+</style>
+</head>
+<body><main>
+<h1>GridCraft live co-authoring, plan G1: the proofs: implementation plan</h1>
+<p class="small">ShareCraft &middot; Stage 2, editor track &middot; Written 16 November 2026</p>
+<div class="note"><p><strong>For agentic workers:</strong> REQUIRED SUB-SKILL: use superpowers:subagent-driven-development or superpowers:executing-plans. Steps are checkboxes.</p></div>
+
+<p><strong>Goal:</strong> before anything is built for live co-authoring in GridCraft, prove the things the agreed design depends on, or show where they fail. The proofs are:
+<ul>
+<li>Two copies of the spreadsheet engine, given the same ordered changes, end in the same workbook.</li>
+<li>The engine in the browser (WebAssembly) and on the desktop give the same results.</li>
+<li>Saving and reopening loses nothing.</li>
+<li>Rolling back and re-applying changes is fast enough on large workbooks.</li>
+</ul>
+G1 ends with a go/no-go report.</p>
+<p><strong>Why first:</strong> the co-authoring approach (<a href="../co-authoring-approach.html">co-authoring-approach.html</a>, adopted 11 November 2026, decision C16) puts these proofs before any building. Every later plan rests on them. If they fail, the design changes before money is spent on the rest.</p>
+<p><strong>Architecture:</strong>
+<ul>
+<li>All code is tests and small engine fixes in the GridCraft fork (<code>H:\Source\repos\ThineCraft\GridCraft</code>), on a new branch <code>coauthor-proofs</code> made from <code>sharecraft</code> (<code>017d0b9d</code>).</li>
+<li>ShareCraft gets only the report and document updates.</li>
+<li>The fork's house rules apply there (<code>AGENTS.md</code>): no panics or <code>unsafe</code> outside tests, the licence allowlist, and no agent attribution in pull requests or commits.</li>
+</ul></p>
+<p><strong>Tech stack:</strong>
+<ul>
+<li>GridCraft's Rust workspace and its existing <code>engine/tests/it/command_sequence_fuzz.rs</code>.</li>
+<li><code>wasm-bindgen-test</code> (MIT/Apache, test-only) run by the <code>wasm-bindgen-test-runner</code> 0.2.130 already installed here, under Node, for the browser-engine runs.</li>
+<li>No new runtime dependency.</li>
+</ul></p>
+<p><strong>Spec:</strong>
+<ul>
+<li>co-authoring-approach.html: C1, C5, C7, C9, C12 and C16, and the open items in §12;</li>
+<li>scope.html: D12, D15, D16, D20 to D22, and the spine rules S1 to S7;</li>
+<li>sequencing.html: Stage 2's editor track, with exit tests A07 and A17 for GridCraft.</li>
+</ul></p>
+
+<h2>The road after G1 (for context; each gets its own plan)</h2>
+<table>
+<tr><th>Plan</th><th>What it builds</th><th>Where</th></tr>
+<tr><td>G1 (this)</td><td>The proofs and the go/no-go report.</td><td>GridCraft tests, ShareCraft documents</td></tr>
+<tr><td>G2</td><td>The shared collaboration library (join, resend, heartbeat, agreed and shown states, id tables) and an opaque-entry room on the server, with its log kept in PostgreSQL. Tested with a stand-in document.</td><td>ShareCraft</td></tr>
+<tr><td>G3</td><td>GridCraft identities for sheets, rows and columns; the first shared commands made target-explicit; the apply loop with rollback and re-run; per-person undo.</td><td>GridCraft</td></tr>
+<tr><td>G4</td><td>Checkpoint tickets, second-hash verification, returning clients and major versions, the unsaved-log limit.</td><td>ShareCraft and GridCraft</td></tr>
+<tr><td>G5</td><td>The host bridge, presence, notices in the frame, and the A07/A17 acceptance run with two real browsers.</td><td>Both</td></tr>
+</table>
+<p class="small">G2 does not depend on G1's results and could run in parallel. G3 to G5 wait for a "go".</p>
+
+<h2>Proposals in this plan for the owner to check</h2>
+<ol class="band">
+<li><strong>Plan the editor track in five plans (G1 to G5)</strong>, and start with the proofs alone.</li>
+<li><strong>The candidate shared commands for Stage 2</strong> are the ones the design names:
+<ul>
+<li>cell content (set, clear);</li>
+<li>number format, font, fill, borders and alignment;</li>
+<li>insert and delete rows and columns;</li>
+<li>add, rename and delete sheets;</li>
+<li>set and clear a filter.</li>
+</ul>
+The proofs use only these, with explicit targets. Every other command stays one-person-at-a-time until a later plan.</li>
+<li><strong>Go/no-go thresholds:</strong>
+<ul>
+<li>Two engines agree on every step of 10,000 random sequences.</li>
+<li>Desktop and browser agree on entered content always, and on computed values except listed last-digit differences.</li>
+<li>Save and reopen is lossless for everything the shared commands can make.</li>
+<li>Re-applying 10 pending changes on a 100,000-cell workbook takes at most 50 ms on the desktop and 150 ms in the browser, judged by the 95th percentile (the time that 95 % of runs come in under). Above that, the design's "wait for the server" mode covers those commands.</li>
+</ul></li>
+<li><strong>Small determinism fixes are made in G1</strong> (ordered maps where order leaks into results, the fixed clock and random seed). Larger ones are listed for G3.</li>
+<li><strong>Codex builds two well-bounded tasks</strong> (Tasks 4 and 6), at your request. Claude reviews every task the same way.</li>
+<li><strong>The fork branch stays local</strong> until you approve pushing it and opening a pull request into the fork's <code>sharecraft</code> branch (house rule 8).</li>
+</ol>
+
+<h2>Not in this plan</h2>
+<ul class="band">
+<li>Any server, protocol or page change in ShareCraft.</li>
+<li>Making commands target-explicit beyond what the proofs need.</li>
+<li>Identities, the apply loop, undo, presence and checkpoints (G2 to G5).</li>
+<li>Desktop GridCraft joining sessions.</li>
+</ul>
+
+<h2>Global constraints</h2>
+<ul class="band">
+<li><strong>Fingerprint</strong> (<code>engine::fingerprint</code>): two SHA-256 digests over a canonical walk of the workbook, sheets in order.
+<ul>
+<li><code>entered</code> covers, for each sheet:
+<ul>
+<li>the name and hidden state;</li>
+<li>each non-empty cell's row, column, formula text (normalised by the existing formula printer) or literal value, and its resolved style (number format, font, fill, borders, alignment as values, never style ids);</li>
+<li>row heights and column widths that differ from the default, and hidden rows and columns;</li>
+<li>merges, sorted;</li>
+<li>the filter range and criteria.</li>
+</ul>
+It also covers defined names, sorted.</li>
+<li><code>computed</code> covers each cell's computed value. Numbers are written as their IEEE-754 bits; errors by code.</li>
+<li>Excluded: active sheet, selection, scroll, zoom, frozen panes, the undo history and the command journal.</li>
+<li>The walk never iterates a hash map without sorting first.</li>
+</ul></li>
+<li><strong>Determinism inputs:</strong>
+<ul>
+<li>Every run sets <code>fixed_now</code> (<code>calc/src/recalc.rs</code>) and a RAND seed taken from the sequence's seed.</li>
+<li>Two engines in one process already use different hash-map seeds, so in-process comparisons do exercise hash order.</li>
+</ul></li>
+<li><strong>Sequences:</strong>
+<ul>
+<li>A sequence is a JSON file <code>{seed, now, steps:[{id, params}]}</code> of shared commands with explicit sheet and range parameters (never relying on the selection).</li>
+<li>Generated by a seeded generator: 1 to 6 sheets, up to 200 rows by 30 columns of content, formulas drawn from a list of 40 common functions including cross-sheet references, and structural changes in about 15 % of steps.</li>
+<li>Stored fixtures go in <code>crates/engine/tests/fixtures/coauthor/</code>, with 20 checked in. CI runs 500 random sequences; a long run of 10,000 is done once and reported.</li>
+</ul></li>
+<li><strong>Measurement:</strong> rollback and re-run is timed as clone the agreed workbook, apply N pending commands, and rebuild calculation. Native times are measured with <code>std::time::Instant</code> in a release test (<code>#[ignore]</code> by default). Browser times are measured with <code>performance.now()</code> under the wasm test runner. Each run gives p50 and p95 over 30 repetitions.</li>
+<li><strong>House rules (fork):</strong>
+<ul>
+<li>No panics or <code>unsafe</code> in non-test code.</li>
+<li>New test dependencies come from the licence allowlist and are recorded.</li>
+<li>Commits and pull requests carry no agent attribution.</li>
+<li><code>cargo fmt</code>, <code>cargo clippy</code> and the existing tests stay green: <code>cargo test -p gridcraft-engine</code> and the workspace check the fork's CI runs.</li>
+</ul></li>
+</ul>
+
+<h2>Review focus</h2>
+<ol class="band">
+<li><strong>The fingerprint really covers what a co-author would see.</strong> A test changes each covered property alone (a style, a merge, a hidden row, a filter, a defined name) and the fingerprint must change. A test changes only view state, and it must not change. (Task 1, <code>fingerprint_sensitivity</code>.)</li>
+<li><strong>A "pass" cannot come from both engines being wrong the same way.</strong> The replay compares with independent expectations for a fixed set of hand-written sequences (known final cells and values), not only engine against engine. (Task 2, <code>replay_matches_hand_written_expectations</code>.)</li>
+<li><strong>Browser runs use the same sequences and compare the same digests.</strong> The fixtures are byte-identical inputs. A mismatch prints the first differing cell, not just "differs". (Task 4, <code>wasm_matches_native_fixtures</code>.)</li>
+<li><strong>Save and reopen covers what shared commands make, including edge cases:</strong> formulas with sheet names that need quoting, a renamed and a deleted sheet referred to by formulas (<code>#REF!</code>), very large and very small numbers, empty strings versus empty cells, merged areas, and filters. (Task 5, <code>save_reload_lossless</code>.)</li>
+<li><strong>Timings are honest:</strong> release builds, a warm-up excluded, the workbook sizes stated, and the machine noted. A threshold miss is reported as a finding, not tuned away. (Task 6.)</li>
+</ol>
+
+<div class="task">
+<h3>Task 1: the fingerprint</h3>
+<p><strong>Files:</strong> create <code>crates/engine/src/fingerprint.rs</code> (exported) and <code>crates/engine/tests/it/fingerprint.rs</code>.</p>
+<ul class="band">
+<li><code>pub fn fingerprint(session: &amp;Session, doc: DocId) -&gt; Fingerprint</code>, where <code>Fingerprint { entered: [u8; 32], computed: [u8; 32] }</code>.</li>
+<li><code>pub fn first_difference(a: &amp;Session, b: &amp;Session, doc) -&gt; Option&lt;String&gt;</code> describes the first differing item, for test messages.</li>
+<li>Use the existing SHA-256 the workspace already depends on. If there is none, use a licence-allowlisted crate and record it.</li>
+</ul>
+<ol class="steps">
+<li>Write failing tests:
+<ul>
+<li><code>fingerprint_sensitivity</code> (each covered property changes the digest; view state does not)</li>
+<li><code>fingerprint_is_order_independent</code> (two sessions built through different hash seeds give equal digests)</li>
+<li><code>first_difference_names_the_cell</code></li>
+</ul></li>
+<li>Run them: they fail. Implement. Run the engine tests: they pass.</li>
+<li>Commit <code>test: workbook fingerprint for co-authoring proofs</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 2: the two-engine replay and the sequence generator</h3>
+<p><strong>Files:</strong> create <code>crates/engine/tests/it/coauthor_replay.rs</code> and <code>crates/engine/tests/support/sequences.rs</code> (generator and JSON form); modify <code>crates/engine/tests/it/main.rs</code> or its module list. Add fixtures under <code>crates/engine/tests/fixtures/coauthor/</code>.</p>
+<ul class="band">
+<li>The generator emits only the candidate shared commands, with explicit targets.</li>
+<li>Before any run, a command that still reads the selection when given explicit parameters is recorded in a list, <code>selection_readers.md</code> in the fixtures folder, as input for G3, and left out of generation.</li>
+</ul>
+<ol class="steps">
+<li>Write failing tests:
+<ul>
+<li><code>two_engines_agree_on_random_sequences</code> (500 seeds in CI; fingerprints compared after every step)</li>
+<li><code>replay_matches_hand_written_expectations</code> (6 hand-written sequences with known cells and values)</li>
+<li><code>fixtures_round_trip_as_json</code></li>
+<li><code>volatile_functions_agree_with_fixed_now_and_seed</code> (NOW, TODAY, RAND, RANDBETWEEN)</li>
+</ul></li>
+<li>Run them: they fail. Implement. Fix small determinism problems found (ordered maps, sorted iteration, a fixed clock and seed) in the engine with a test each, and list larger ones in the task report. Run the engine tests: they pass.</li>
+<li>Commit <code>test: two-engine replay of shared commands</code>, plus one <code>fix:</code> commit per determinism fix.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 3: the long run and the determinism audit</h3>
+<p><strong>Files:</strong> a <code>#[ignore]</code> test <code>long_replay</code> in <code>coauthor_replay.rs</code>; a written audit at <code>docs/coauthor-determinism.md</code> in the fork (the fork's documents are Markdown).</p>
+<ul class="band">
+<li>Run 10,000 sequences.</li>
+<li>Audit every <code>HashMap</code> and <code>HashSet</code> in <code>engine</code>, <code>model</code>, <code>calc</code>, <code>formula</code>, <code>functions</code> and <code>xlsx</code> for iteration whose order can reach a result, a written file or the fingerprint. Classify each as safe, fixed in G1, or left for G3, with a reason each.</li>
+</ul>
+<ol class="steps">
+<li>Run <code>long_replay</code> in release. Record seeds that fail. Turn each failure into a fixture and a fix, or into an audit entry for G3.</li>
+<li>Commit <code>docs: determinism audit for co-authoring</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 4 (Codex): desktop versus browser</h3>
+<p><strong>Files:</strong> create <code>crates/engine/tests/wasm_replay.rs</code>, compiled for <code>wasm32-unknown-unknown</code> with <code>wasm-bindgen-test</code> in Node mode; a native test <code>write_native_digests</code> that records each fixture's digests to <code>fixtures/coauthor/native-digests.json</code>; and a short README in the fixtures folder saying how to run both.</p>
+<ul class="band">
+<li>The browser test replays the same fixtures and compares the digests with the native file.</li>
+<li>On a mismatch it prints the first differing cell (Review focus 3).</li>
+<li>Computed-value differences in the last bits of a float are reported by function name with the inputs.</li>
+</ul>
+<ol class="steps">
+<li>Write the tests: <code>wasm_matches_native_fixtures</code> and <code>native_digests_are_current</code>, which fails when the fixtures change and the digests weren't regenerated.</li>
+<li>Run the native side, then <code>cargo test --target wasm32-unknown-unknown -p gridcraft-engine --test wasm_replay</code> with <code>CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner</code>.</li>
+<li>Record the results: agree, or a list of differences.</li>
+<li>Commit <code>test: browser engine matches desktop on shared-command fixtures</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 5: save and reopen</h3>
+<p><strong>Files:</strong> create <code>crates/engine/tests/it/coauthor_save_reload.rs</code> (using the <code>xlsx</code> crate's writer and reader through the engine's existing save and open paths).</p>
+<ol class="steps">
+<li>Write failing tests:
+<ul>
+<li><code>save_reload_lossless</code>: <code>entered</code> and <code>computed</code> digests are equal after save and reopen, for every fixture and the edge cases in Review focus 4.</li>
+<li><code>save_is_deterministic</code>: two engines in the same state write identical bytes.</li>
+<li><code>save_reload_save_is_stable</code>: writing, reopening and writing again gives identical bytes.</li>
+</ul></li>
+<li>Run them. Fix small losses with a test each, and list larger ones for G3/G4, noting whether the "reload at every checkpoint" fallback would be needed.</li>
+<li>Commit <code>test: save and reopen are lossless for shared commands</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 6 (Codex): rollback and re-run timings</h3>
+<p><strong>Files:</strong> create <code>crates/engine/tests/it/coauthor_timing.rs</code> (<code>#[ignore]</code>, release only), with a browser counterpart in <code>wasm_replay.rs</code> behind its own ignored test. Generated workbooks have 10,000, 100,000 and 1,000,000 cells, about 20 % of them formulas, including whole-column sums and cross-sheet references.</p>
+<ol class="steps">
+<li>For each size, time p50 and p95 over 30 repetitions of: cloning the agreed workbook; applying 1, 10 and 50 pending commands; rebuilding calculation.</li>
+<li>Run native and browser. Write the table into the task report with the machine and build details.</li>
+<li>Commit <code>test: timings for rollback and re-run</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 7 (controller): the go/no-go report and documents</h3>
+<ol class="steps">
+<li>Write <code>docs/gridcraft-coauthoring-proofs.html</code> in ShareCraft, in plain English with banded tables:
+<ul>
+<li>each proof, its result and its evidence (commits, counts, timings);</li>
+<li>the selection-reading commands found;</li>
+<li>the determinism audit summary;</li>
+<li>save and reopen gaps;</li>
+<li>a clear go, go with conditions, or no-go, with what changes in the design if no-go.</li>
+</ul></li>
+<li>Update co-authoring-approach.html §12, marking open items as measured or answered with links. Add a progress note to sequencing.html.</li>
+<li>Commit the ShareCraft documents on a work branch. Ask before pushing the fork branch or opening its pull request.</li>
+</ol></div>
+</main></body>
+</html>
