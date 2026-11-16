@@ -23,6 +23,7 @@ mod links;
 mod looks;
 mod members;
 pub mod previews;
+pub mod secrets;
 mod projection;
 mod room;
 mod scan;
