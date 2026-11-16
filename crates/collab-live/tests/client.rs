@@ -750,3 +750,499 @@ fn own_earlier_entry_met_again_from_the_base_is_applied() {
     assert_eq!(resent[0]["local"], 2);
     assert_eq!(resent[0]["seen"], 1);
 }
+
+// ---- Task 5: joining, resending, the heartbeat and pacing ----
+
+fn joined_as(participant: u32, place: Value, can_edit: bool) -> String {
+    let mut frame: Value = serde_json::from_str(&joined(participant)).unwrap();
+    frame["place"] = place;
+    frame["can_edit"] = json!(can_edit);
+    frame.to_string()
+}
+
+/// The entry frames among `frames`.
+fn entries(frames: &[String]) -> Vec<Value> {
+    sent(frames)
+        .into_iter()
+        .filter(|frame| frame["type"] == "entry")
+        .collect()
+}
+
+fn heartbeats(frames: &[String]) -> Vec<String> {
+    frames
+        .iter()
+        .filter(|frame| frame.contains("\"heartbeat\""))
+        .cloned()
+        .collect()
+}
+
+/// A `StandIn` that records who each applied change was shown as coming from.
+struct Recording {
+    doc: StandIn,
+    applied: Vec<(Option<Seq>, ParticipantNo, bool)>,
+}
+
+impl LiveEditor for Recording {
+    type Snapshot = StandIn;
+
+    fn snapshot(&self) -> StandIn {
+        self.doc.snapshot()
+    }
+
+    fn restore(&mut self, snapshot: &StandIn) {
+        self.doc.restore(snapshot);
+    }
+
+    fn apply(&mut self, entry: &EntryView<'_>) -> Result<Outcome, Crash> {
+        self.applied.push((entry.seq, entry.participant, entry.own));
+        self.doc.apply(entry)
+    }
+}
+
+#[test]
+fn join_from_nothing_loads_the_base() {
+    let mut doc = StandIn::new("a");
+    let mut client: LiveClient<StandIn> = LiveClient::new(config());
+    let join: Value = serde_json::from_str(&client.connected(0)[0]).unwrap();
+    assert_eq!(join["type"], "live_join");
+    assert_eq!(join["protocol"], 1);
+    assert_eq!(join["format"], FORMAT);
+    assert_eq!(client.phase(), Phase::Joining);
+    client.receive(&mut doc, &joined(1), 0).unwrap();
+    let step = client.receive(&mut doc, &catchup(0, 0, 2), 0).unwrap();
+    assert_eq!(
+        step.events,
+        vec![Event::LoadBase {
+            revision: None,
+            at: Seq(0),
+        }]
+    );
+    assert_eq!(client.phase(), Phase::LoadingBase);
+    client.base_ready(&mut doc, 10).unwrap();
+    assert_eq!(client.phase(), Phase::CatchingUp);
+    client
+        .receive(
+            &mut doc,
+            &entry(1, 2, other(2), 1, 0, &insert(LiveId(2, 0), "x")),
+            20,
+        )
+        .unwrap();
+    assert_eq!(client.phase(), Phase::CatchingUp);
+    client
+        .receive(
+            &mut doc,
+            &entry(2, 2, other(2), 2, 1, &insert(LiveId(2, 1), "y")),
+            20,
+        )
+        .unwrap();
+    assert_eq!(client.phase(), Phase::Live);
+    assert_eq!(client.agreed_seq(), Seq(2));
+    assert_eq!(doc.lines(), vec!["x", "y"]);
+}
+
+#[test]
+fn rejoin_with_kept_place_catches_up_from_seen() {
+    let mut doc = StandIn::new("a");
+    let mut client = live(&mut doc, 1);
+    for seq in 1..=3u64 {
+        client
+            .receive(
+                &mut doc,
+                &entry(
+                    seq,
+                    2,
+                    other(2),
+                    seq,
+                    seq - 1,
+                    &insert(LiveId(2, seq as u32), "x"),
+                ),
+                10,
+            )
+            .unwrap();
+    }
+    client.disconnected(20);
+    assert_eq!(client.phase(), Phase::Offline);
+    let join: Value = serde_json::from_str(&client.connected(30)[0]).unwrap();
+    assert_eq!(join["seen"], 3);
+    assert_eq!(join["resume"]["participant"], 1);
+    client.receive(&mut doc, &joined_kept(1), 30).unwrap();
+    let step = client.receive(&mut doc, &catchup(0, 3, 4), 30).unwrap();
+    assert!(
+        !step
+            .events
+            .iter()
+            .any(|event| matches!(event, Event::LoadBase { .. }))
+    );
+    assert_eq!(client.phase(), Phase::CatchingUp);
+    client
+        .receive(
+            &mut doc,
+            &entry(4, 2, other(2), 4, 3, &insert(LiveId(2, 9), "y")),
+            40,
+        )
+        .unwrap();
+    assert_eq!(client.phase(), Phase::Live);
+    assert_eq!(doc.lines(), vec!["x", "x", "x", "y"]);
+}
+
+#[test]
+fn reconnect_resends_only_unconfirmed() {
+    let mut doc = StandIn::new("a");
+    let mut client = live(&mut doc, 1);
+    let mut payloads = Vec::new();
+    for text in ["one", "two", "three"] {
+        let id = client.new_ids(1).unwrap();
+        let payload = insert(id, text);
+        let step = client
+            .local(&mut doc, payload.clone(), Mode::ShowAtOnce, 10)
+            .unwrap();
+        assert_eq!(entries(&step.send).len(), 1);
+        payloads.push(payload);
+    }
+    client.disconnected(20);
+    client.connected(30);
+    client.receive(&mut doc, &joined_kept(1), 30).unwrap();
+    let step = client.receive(&mut doc, &catchup(0, 0, 1), 30).unwrap();
+    assert!(step.send.is_empty(), "nothing goes before the head");
+    assert_eq!(client.tick(31), Vec::<String>::new());
+    // The server stored local 1 before the drop.
+    let step = client
+        .receive(
+            &mut doc,
+            &entry(1, 1, client.client(), 1, 0, &payloads[0]),
+            40,
+        )
+        .unwrap();
+    assert_eq!(client.phase(), Phase::Live);
+    let resent = entries(&step.send);
+    assert_eq!(resent.len(), 2);
+    assert_eq!(resent[0]["local"], 2);
+    assert_eq!(resent[0]["payload"], payloads[1]);
+    assert_eq!(resent[1]["local"], 3);
+    assert_eq!(resent[1]["payload"], payloads[2]);
+    assert_eq!(client.pending(), 2);
+    assert_eq!(doc.lines(), vec!["one", "two", "three"]);
+    // Nothing is sent twice on the same connection.
+    assert!(entries(&client.tick(5_000)).is_empty());
+}
+
+#[test]
+fn returning_client_keeps_waiting_changes() {
+    let mut doc = Recording {
+        doc: StandIn::new("a"),
+        applied: Vec::new(),
+    };
+    let mut client = live(&mut doc, 2);
+    let first = client.new_ids(1).unwrap();
+    assert_eq!(first, LiveId(2, 0));
+    client
+        .local(&mut doc, insert(first, "one"), Mode::ShowAtOnce, 10)
+        .unwrap();
+    client
+        .receive(
+            &mut doc,
+            &entry(1, 3, other(3), 1, 0, &insert(LiveId(3, 0), "x")),
+            20,
+        )
+        .unwrap();
+    let second = client.new_ids(1).unwrap();
+    client
+        .local(&mut doc, insert(second, "two"), Mode::ShowAtOnce, 30)
+        .unwrap();
+
+    // The place expired while the client was away.
+    client.disconnected(40);
+    let join: Value = serde_json::from_str(&client.connected(200_000)[0]).unwrap();
+    assert_eq!(join["resume"]["participant"], 2);
+    let mark = doc.applied.len();
+    let step = client
+        .receive(
+            &mut doc,
+            &joined_as(5, json!({ "is": "returning", "previous": 2 }), true),
+            200_000,
+        )
+        .unwrap();
+    assert!(step.events.contains(&Event::Returned {
+        previous: ParticipantNo(2),
+        now: ParticipantNo(5),
+    }));
+    assert_eq!(client.participant(), Some(ParticipantNo(5)));
+    assert_eq!(client.resume().unwrap().participant, ParticipantNo(5));
+    // The waiting changes are shown again under the new number.
+    let rerun: Vec<_> = doc.applied[mark..]
+        .iter()
+        .filter(|(seq, _, _)| seq.is_none())
+        .collect();
+    assert_eq!(rerun.len(), 2);
+    assert!(
+        rerun
+            .iter()
+            .all(|(_, participant, own)| *participant == ParticipantNo(5) && *own)
+    );
+    assert_eq!(doc.doc.lines(), vec!["x", "one", "two"]);
+
+    let step = client
+        .receive(&mut doc, &catchup(0, 1, 1), 200_000)
+        .unwrap();
+    assert_eq!(client.phase(), Phase::Live);
+    let resent = entries(&step.send);
+    assert_eq!(resent.len(), 2);
+    assert_eq!(resent[0]["local"], 1);
+    assert_eq!(resent[0]["seen"], 0);
+    assert_eq!(resent[1]["local"], 2);
+    assert_eq!(resent[1]["seen"], 1);
+    assert_eq!(client.new_ids(1).unwrap(), LiveId(5, 0));
+}
+
+#[test]
+fn heartbeat_every_minute_whatever_else_is_sent() {
+    let mut doc = StandIn::new("a");
+    let mut client: LiveClient<StandIn> = LiveClient::new(config());
+    let start = 1_000;
+    client.connected(start);
+    client.receive(&mut doc, &joined(1), start).unwrap();
+    client.receive(&mut doc, &empty_catchup(), start).unwrap();
+    client.base_ready(&mut doc, start).unwrap();
+    client
+        .receive(
+            &mut doc,
+            &entry(1, 2, other(2), 1, 0, &insert(LiveId(2, 0), "x")),
+            start + 5,
+        )
+        .unwrap();
+    for at in [10_000, 30_000, 59_000] {
+        let id = client.new_ids(1).unwrap();
+        let step = client
+            .local(&mut doc, insert(id, "x"), Mode::ShowAtOnce, start + at)
+            .unwrap();
+        assert_eq!(entries(&step.send).len(), 1);
+        assert!(heartbeats(&client.tick(start + at)).is_empty());
+    }
+    assert!(heartbeats(&client.tick(start + 59_999)).is_empty());
+    let frames = client.tick(start + 60_000);
+    assert_eq!(frames, vec![r#"{"type":"heartbeat","seen":1}"#.to_owned()]);
+    assert!(client.tick(start + 60_001).is_empty());
+    assert!(heartbeats(&client.tick(start + 119_999)).is_empty());
+    assert_eq!(heartbeats(&client.tick(start + 120_000)).len(), 1);
+}
+
+#[test]
+fn sending_is_paced() {
+    let mut doc = StandIn::new("a");
+    let mut client = live(&mut doc, 1);
+    let now = 10_000;
+    let mut first = Vec::new();
+    for _ in 0..50 {
+        let id = client.new_ids(1).unwrap();
+        let step = client
+            .local(&mut doc, insert(id, "x"), Mode::ShowAtOnce, now)
+            .unwrap();
+        first.extend(entries(&step.send));
+    }
+    assert_eq!(first.len(), 20);
+    assert_eq!(doc.lines().len(), 50, "every change is shown at once");
+    assert!(entries(&client.tick(now + 999)).is_empty());
+    let second = entries(&client.tick(now + 1_000));
+    assert_eq!(second.len(), 20);
+    assert!(entries(&client.tick(now + 1_500)).is_empty());
+    let third = entries(&client.tick(now + 2_000));
+    assert_eq!(third.len(), 10);
+    let locals: Vec<u64> = first
+        .iter()
+        .chain(&second)
+        .chain(&third)
+        .map(|frame| frame["local"].as_u64().unwrap())
+        .collect();
+    assert_eq!(locals, (1..=50).collect::<Vec<u64>>());
+    assert!(entries(&client.tick(now + 3_000)).is_empty());
+}
+
+#[test]
+fn viewer_never_sends_entries() {
+    let mut doc = StandIn::new("a");
+    let mut client: LiveClient<StandIn> = LiveClient::new(config());
+    client.connected(0);
+    client
+        .receive(&mut doc, &joined_as(1, json!({ "is": "new" }), false), 0)
+        .unwrap();
+    client.receive(&mut doc, &empty_catchup(), 0).unwrap();
+    client.base_ready(&mut doc, 0).unwrap();
+    assert_eq!(client.phase(), Phase::Live);
+    assert!(!client.can_edit());
+    assert_eq!(
+        client
+            .local(&mut doc, insert(LiveId(1, 0), "a"), Mode::ShowAtOnce, 10)
+            .unwrap_err(),
+        LocalError::ReadOnly
+    );
+    let step = client
+        .receive(
+            &mut doc,
+            &entry(1, 2, other(2), 1, 0, &insert(LiveId(2, 0), "x")),
+            20,
+        )
+        .unwrap();
+    assert!(step.send.is_empty());
+    assert_eq!(doc.lines(), vec!["x"]);
+    let frames = client.tick(60_000);
+    assert_eq!(frames, vec![r#"{"type":"heartbeat","seen":1}"#.to_owned()]);
+}
+
+#[test]
+fn rejoining_as_viewer_drops_waiting_changes() {
+    let mut doc = StandIn::new("a");
+    let mut client = live(&mut doc, 1);
+    let id = client.new_ids(1).unwrap();
+    client
+        .local(&mut doc, insert(id, "one"), Mode::ShowAtOnce, 10)
+        .unwrap();
+    client.disconnected(20);
+    client.connected(30);
+    // The person became a viewer while the connection was down.
+    let step = client
+        .receive(&mut doc, &joined_as(1, json!({ "is": "kept" }), false), 30)
+        .unwrap();
+    assert!(step.events.contains(&Event::DroppedPending { count: 1 }));
+    assert_eq!(client.pending(), 0);
+    assert!(doc.lines().is_empty());
+    let step = client.receive(&mut doc, &catchup(0, 0, 0), 30).unwrap();
+    assert_eq!(client.phase(), Phase::Live);
+    assert!(step.send.is_empty());
+    assert!(entries(&client.tick(5_000)).is_empty());
+}
+
+#[test]
+fn closed_client_refuses_everything() {
+    let last_frames = [
+        json!({ "type": "removed", "reason": "access_revoked" }).to_string(),
+        json!({ "type": "incompatible", "protocol": 1, "format": "other/1" }).to_string(),
+        json!({ "type": "cannot_open", "seq": 1 }).to_string(),
+    ];
+    for last in &last_frames {
+        let mut doc = StandIn::new("a");
+        let mut client = live(&mut doc, 1);
+        let id = client.new_ids(1).unwrap();
+        client
+            .local(&mut doc, insert(id, "one"), Mode::ShowAtOnce, 10)
+            .unwrap();
+        let step = client.receive(&mut doc, last, 20).unwrap();
+        assert_eq!(step.events.len(), 1);
+        assert!(step.send.is_empty());
+        assert_eq!(client.phase(), Phase::Closed);
+
+        assert!(client.connected(30).is_empty());
+        assert!(client.tick(1_000_000).is_empty());
+        assert_eq!(
+            client
+                .local(&mut doc, insert(LiveId(1, 5), "two"), Mode::ShowAtOnce, 40)
+                .unwrap_err(),
+            LocalError::NotLive
+        );
+        let frame = entry(1, 2, other(2), 1, 0, &insert(LiveId(2, 0), "x"));
+        assert_eq!(
+            client.receive(&mut doc, &frame, 50).unwrap(),
+            Default::default()
+        );
+        assert_eq!(
+            client.receive(&mut doc, "not json", 50).unwrap(),
+            Default::default()
+        );
+        assert!(client.base_ready(&mut doc, 60).is_err());
+        assert!(client.new_ids(1).is_err());
+        assert_eq!(client.leave(), None);
+        client.disconnected(70);
+        assert_eq!(client.phase(), Phase::Closed);
+        assert_eq!(doc.lines(), vec!["one"]);
+    }
+}
+
+#[test]
+fn leave_sends_one_frame_and_closes() {
+    let mut doc = StandIn::new("a");
+    let mut client = live(&mut doc, 1);
+    assert_eq!(client.leave(), Some(r#"{"type":"leave"}"#.to_owned()));
+    assert_eq!(client.phase(), Phase::Closed);
+    assert_eq!(client.leave(), None);
+    assert!(client.tick(120_000).is_empty());
+}
+
+#[test]
+fn expired_client_can_join_again() {
+    let mut doc = StandIn::new("a");
+    let mut client = live(&mut doc, 1);
+    let id = client.new_ids(1).unwrap();
+    client
+        .local(&mut doc, insert(id, "one"), Mode::ShowAtOnce, 10)
+        .unwrap();
+    let step = client
+        .receive(&mut doc, &json!({ "type": "expired" }).to_string(), 20)
+        .unwrap();
+    assert_eq!(step.events, vec![Event::Expired]);
+    assert_eq!(client.phase(), Phase::Offline);
+    assert!(client.tick(200_000).is_empty());
+    let join = client.connected(200_000);
+    assert_eq!(join.len(), 1);
+    let join: Value = serde_json::from_str(&join[0]).unwrap();
+    assert_eq!(join["type"], "live_join");
+    assert_eq!(join["resume"]["participant"], 1);
+    assert_eq!(join["seen"], 0);
+    assert_eq!(client.phase(), Phase::Joining);
+    assert_eq!(client.pending(), 1);
+}
+
+#[test]
+fn incompatible_format_closes() {
+    let mut doc = StandIn::new("a");
+    let mut client: LiveClient<StandIn> = LiveClient::new(config());
+    client.connected(0);
+    let step = client
+        .receive(
+            &mut doc,
+            &json!({ "type": "incompatible", "protocol": 1, "format": "grid/1" }).to_string(),
+            0,
+        )
+        .unwrap();
+    assert_eq!(
+        step.events,
+        vec![Event::Incompatible {
+            protocol: 1,
+            format: "grid/1".to_owned(),
+        }]
+    );
+    assert_eq!(client.phase(), Phase::Closed);
+    assert!(client.connected(10).is_empty());
+}
+
+#[test]
+fn participant_zero_is_refused() {
+    let mut doc = StandIn::new("a");
+    let mut client: LiveClient<StandIn> = LiveClient::new(config());
+    client.connected(0);
+    assert!(matches!(
+        client.receive(&mut doc, &joined(0), 0).unwrap_err(),
+        ClientError::Desync(_)
+    ));
+    assert_eq!(client.participant(), None);
+    assert_eq!(client.resume(), None);
+    assert!(client.new_ids(1).is_err());
+    // Without an accepted join the catch-up is out of step too, so the client never goes live.
+    assert!(matches!(
+        client.receive(&mut doc, &empty_catchup(), 0).unwrap_err(),
+        ClientError::Desync(_)
+    ));
+    assert_eq!(client.phase(), Phase::Joining);
+}
+
+#[test]
+fn kept_place_under_another_number_is_desync() {
+    let mut doc = StandIn::new("a");
+    let mut client = live(&mut doc, 1);
+    client.disconnected(10);
+    client.connected(20);
+    assert!(matches!(
+        client.receive(&mut doc, &joined_kept(4), 20).unwrap_err(),
+        ClientError::Desync(_)
+    ));
+    assert_eq!(client.participant(), Some(ParticipantNo(1)));
+    assert_eq!(client.new_ids(1).unwrap(), LiveId(1, 0));
+}

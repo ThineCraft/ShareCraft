@@ -95,6 +95,13 @@ pub struct Crash;
 /// back and takes a new copy.
 pub const MAX_FOLDED: usize = 64;
 
+/// The most entry frames the client sends in any [`PACE_WINDOW_MS`]. The server allows more
+/// (30 a second, bursts up to 120), so a paced client is never refused for its rate.
+pub const MAX_ENTRIES_PER_WINDOW: usize = 20;
+
+/// The window [`MAX_ENTRIES_PER_WINDOW`] counts over, in milliseconds.
+pub const PACE_WINDOW_MS: u64 = 1_000;
+
 /// When a local change is shown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -264,8 +271,14 @@ pub struct LiveClient<E: LiveEditor> {
     participant: Option<ParticipantNo>,
     ids: Option<IdMaker>,
     can_edit: bool,
+    /// Whether the server accepted the join on the current connection.
+    joined: bool,
     heartbeat_ms: u64,
+    /// When the last heartbeat (or the join) was sent.
     last_heartbeat_ms: u64,
+    /// When each of the latest entry frames was sent, oldest first; at most
+    /// [`MAX_ENTRIES_PER_WINDOW`], all within the last [`PACE_WINDOW_MS`].
+    entry_times: VecDeque<u64>,
     /// Whether the editor holds a state of this session (a base and entries on it).
     has_state: bool,
     /// A copy of the agreed state; `None` means what is shown is exactly the agreed state,
@@ -296,8 +309,10 @@ impl<E: LiveEditor> LiveClient<E> {
             participant: None,
             ids: None,
             can_edit: false,
+            joined: false,
             heartbeat_ms: HEARTBEAT_MS,
             last_heartbeat_ms: 0,
+            entry_times: VecDeque::new(),
             has_state: false,
             agreed: None,
             agreed_seq: Seq(0),
@@ -316,6 +331,9 @@ impl<E: LiveEditor> LiveClient<E> {
             return Vec::new();
         }
         self.phase = Phase::Joining;
+        self.joined = false;
+        self.held.clear();
+        // The join is a sign of life: the next heartbeat is due a full interval after it.
         self.last_heartbeat_ms = now_ms;
         for pending in &mut self.pending {
             pending.sent = false;
@@ -337,6 +355,9 @@ impl<E: LiveEditor> LiveClient<E> {
             return;
         }
         self.phase = Phase::Offline;
+        self.joined = false;
+        // Entries held for this connection come again in the next catch-up.
+        self.held.clear();
         for pending in &mut self.pending {
             pending.sent = false;
         }
@@ -349,12 +370,13 @@ impl<E: LiveEditor> LiveClient<E> {
         frame: &str,
         now_ms: u64,
     ) -> Result<Step, ClientError> {
-        let msg: LiveServerMsg = serde_json::from_str(frame)
-            .map_err(|error| ClientError::Malformed(error.to_string()))?;
         let mut step = Step::default();
         if self.phase == Phase::Closed {
+            // Nothing more is read once closed, and nothing here asks the host to reconnect.
             return Ok(step);
         }
+        let msg: LiveServerMsg = serde_json::from_str(frame)
+            .map_err(|error| ClientError::Malformed(error.to_string()))?;
         match msg {
             LiveServerMsg::LiveJoined {
                 session,
@@ -364,20 +386,15 @@ impl<E: LiveEditor> LiveClient<E> {
                 heartbeat_ms,
                 people,
             } => {
-                if self.ids.is_none() || self.participant != Some(participant) {
-                    self.ids = Some(IdMaker::new(participant));
-                }
-                if let Place::Returning { previous } = place {
-                    step.events.push(Event::Returned {
-                        previous,
-                        now: participant,
-                    });
-                }
-                self.session = Some(session);
-                self.participant = Some(participant);
-                self.can_edit = can_edit;
-                self.heartbeat_ms = heartbeat_ms;
-                self.last_heartbeat_ms = now_ms;
+                self.joined_with(
+                    editor,
+                    session,
+                    participant,
+                    place,
+                    can_edit,
+                    heartbeat_ms,
+                    &mut step,
+                )?;
                 step.events.push(Event::People(people));
             }
             LiveServerMsg::Catchup {
@@ -386,6 +403,11 @@ impl<E: LiveEditor> LiveClient<E> {
                 from,
                 head,
             } => {
+                if !self.joined {
+                    return Err(ClientError::Desync(
+                        "catch-up before the join was accepted".to_owned(),
+                    ));
+                }
                 self.head = head;
                 if self.has_state && from == self.agreed_seq {
                     self.phase = Phase::CatchingUp;
@@ -395,12 +417,12 @@ impl<E: LiveEditor> LiveClient<E> {
                     self.base_at = base;
                     step.events.push(Event::LoadBase { revision, at: base });
                 }
-                self.check_live(&mut step);
+                self.check_live(now_ms, &mut step);
             }
             LiveServerMsg::Entry { entry } => match self.phase {
                 Phase::Live | Phase::CatchingUp => {
                     self.take_entry(editor, entry, &mut step)?;
-                    self.check_live(&mut step);
+                    self.check_live(now_ms, &mut step);
                 }
                 Phase::LoadingBase | Phase::Resyncing | Phase::Stalled { .. } => {
                     self.held.push(entry);
@@ -442,17 +464,7 @@ impl<E: LiveEditor> LiveClient<E> {
             LiveServerMsg::Access { can_edit } => {
                 self.can_edit = can_edit;
                 if !can_edit {
-                    // S5: a person who may no longer edit loses what they had not sent in.
-                    let count = self.pending.len();
-                    let any_shown = self.pending.iter().any(|pending| pending.shown);
-                    self.pending.clear();
-                    if any_shown {
-                        self.go_back(editor, None);
-                    }
-                    self.settle();
-                    if count > 0 {
-                        step.events.push(Event::DroppedPending { count });
-                    }
+                    self.drop_pending(editor, &mut step);
                 }
                 step.events.push(Event::AccessChanged { can_edit });
             }
@@ -474,7 +486,6 @@ impl<E: LiveEditor> LiveClient<E> {
 
     /// The host has reset the editor to the base named by [`Event::LoadBase`].
     pub fn base_ready(&mut self, editor: &mut E, now_ms: u64) -> Result<Step, ClientError> {
-        let _ = now_ms;
         let mut step = Step::default();
         if self.phase != Phase::LoadingBase {
             return Err(ClientError::Desync(
@@ -505,7 +516,7 @@ impl<E: LiveEditor> LiveClient<E> {
         {
             self.go_back(editor, None);
         }
-        self.check_live(&mut step);
+        self.check_live(now_ms, &mut step);
         Ok(step)
     }
 
@@ -517,7 +528,6 @@ impl<E: LiveEditor> LiveClient<E> {
         mode: Mode,
         now_ms: u64,
     ) -> Result<Step, LocalError> {
-        let _ = now_ms;
         if self.phase != Phase::Live {
             return Err(LocalError::NotLive);
         }
@@ -563,21 +573,27 @@ impl<E: LiveEditor> LiveClient<E> {
             effect,
         });
         let mut step = Step::default();
-        self.send_unsent(&mut step.send);
+        self.send_unsent(now_ms, &mut step.send);
         Ok(step)
     }
 
     /// Time passed: returns the heartbeat when it is due, and any changes not yet sent.
+    ///
+    /// The heartbeat goes every `heartbeat_ms` whatever else was sent. Changes go at most
+    /// [`MAX_ENTRIES_PER_WINDOW`] in any [`PACE_WINDOW_MS`]; the ones held back by the pace go
+    /// on a later tick, so the host calls this often (every few hundred milliseconds) while
+    /// [`LiveClient::unsent`] is above zero, and at least once a second otherwise.
     pub fn tick(&mut self, now_ms: u64) -> Vec<String> {
         let mut send = Vec::new();
-        let connected = !matches!(self.phase, Phase::Offline | Phase::Joining | Phase::Closed);
+        let connected =
+            self.joined && !matches!(self.phase, Phase::Offline | Phase::Joining | Phase::Closed);
         if connected && now_ms.saturating_sub(self.last_heartbeat_ms) >= self.heartbeat_ms {
             self.last_heartbeat_ms = now_ms;
             send.push(frame(&LiveClientMsg::Heartbeat {
                 seen: self.agreed_seq,
             }));
         }
-        self.send_unsent(&mut send);
+        self.send_unsent(now_ms, &mut send);
         send
     }
 
@@ -591,7 +607,14 @@ impl<E: LiveEditor> LiveClient<E> {
     }
 
     /// Makes `count` new lasting ids under this client's participant number.
+    ///
+    /// Refused with [`IdError::NoPlace`] before the first join is accepted and once the client
+    /// is closed. Ids are never made under participant 0, which names the base rows: the
+    /// client refuses a join that gives it that number.
     pub fn new_ids(&mut self, count: u32) -> Result<LiveId, IdError> {
+        if self.phase == Phase::Closed {
+            return Err(IdError::NoPlace);
+        }
         self.ids.as_mut().ok_or(IdError::NoPlace)?.take(count)
     }
 
@@ -608,6 +631,11 @@ impl<E: LiveEditor> LiveClient<E> {
     /// How many own changes wait for the server.
     pub fn pending(&self) -> usize {
         self.pending.len()
+    }
+
+    /// How many waiting changes have not gone out on the current connection.
+    pub fn unsent(&self) -> usize {
+        self.pending.iter().filter(|pending| !pending.sent).count()
     }
 
     /// This client's place, once joined.
@@ -640,12 +668,24 @@ impl<E: LiveEditor> LiveClient<E> {
         self.participant.unwrap_or(ParticipantNo(0))
     }
 
-    /// Sends every waiting change not yet sent on this connection, in order.
-    fn send_unsent(&mut self, send: &mut Vec<String>) {
+    /// Sends the waiting changes not yet sent on this connection, in order, as far as the pace
+    /// allows. What is sent is always a prefix of the queue.
+    fn send_unsent(&mut self, now_ms: u64, send: &mut Vec<String>) {
         if self.phase != Phase::Live || !self.can_edit {
             return;
         }
+        while self
+            .entry_times
+            .front()
+            .is_some_and(|&at| at.saturating_add(PACE_WINDOW_MS) <= now_ms)
+        {
+            self.entry_times.pop_front();
+        }
         for pending in self.pending.iter_mut().filter(|pending| !pending.sent) {
+            if self.entry_times.len() >= MAX_ENTRIES_PER_WINDOW {
+                break;
+            }
+            self.entry_times.push_back(now_ms);
             pending.sent = true;
             send.push(frame(&LiveClientMsg::Entry {
                 local: pending.local,
@@ -657,10 +697,80 @@ impl<E: LiveEditor> LiveClient<E> {
     }
 
     /// Moves from catching up to live once the log's head is reached.
-    fn check_live(&mut self, step: &mut Step) {
+    fn check_live(&mut self, now_ms: u64, step: &mut Step) {
         if self.phase == Phase::CatchingUp && self.agreed_seq >= self.head {
             self.phase = Phase::Live;
-            self.send_unsent(&mut step.send);
+            self.send_unsent(now_ms, &mut step.send);
+        }
+    }
+
+    /// Takes the server's acceptance of a join.
+    #[allow(clippy::too_many_arguments)]
+    fn joined_with(
+        &mut self,
+        editor: &mut E,
+        session: LiveSessionId,
+        participant: ParticipantNo,
+        place: Place,
+        can_edit: bool,
+        heartbeat_ms: u64,
+        step: &mut Step,
+    ) -> Result<(), ClientError> {
+        if self.phase != Phase::Joining || self.joined {
+            return Err(ClientError::Desync(
+                "join accepted while not joining".to_owned(),
+            ));
+        }
+        if participant.0 == 0 {
+            // Participant 0 names the base rows; ids made under it would clash with them.
+            return Err(ClientError::Desync(
+                "participant 0 names the base document".to_owned(),
+            ));
+        }
+        if place == Place::Kept && self.participant.is_some_and(|held| held != participant) {
+            return Err(ClientError::Desync(format!(
+                "place kept under {participant:?}, not {:?}",
+                self.participant
+            )));
+        }
+        // A kept place keeps its id maker, so ids carry on; any other number starts afresh.
+        if self.ids.is_none() || self.participant != Some(participant) {
+            self.ids = Some(IdMaker::new(participant));
+        }
+        let renumbered = self.participant.is_some_and(|held| held != participant);
+        self.session = Some(session);
+        self.participant = Some(participant);
+        self.can_edit = can_edit;
+        self.heartbeat_ms = heartbeat_ms;
+        self.joined = true;
+        if let Place::Returning { previous } = place {
+            step.events.push(Event::Returned {
+                previous,
+                now: participant,
+            });
+        }
+        if !can_edit {
+            // The person lost the right to edit while away (S5).
+            self.drop_pending(editor, step);
+        } else if renumbered && self.pending.iter().any(|pending| pending.shown) {
+            // Waiting changes are shown again as coming from the new number. They keep their
+            // local numbers and `seen`, and go to the server as normal entries.
+            self.go_back(editor, None);
+        }
+        Ok(())
+    }
+
+    /// Drops every waiting change because the person may no longer edit (S5).
+    fn drop_pending(&mut self, editor: &mut E, step: &mut Step) {
+        let count = self.pending.len();
+        let any_shown = self.pending.iter().any(|pending| pending.shown);
+        self.pending.clear();
+        if any_shown {
+            self.go_back(editor, None);
+        }
+        self.settle();
+        if count > 0 {
+            step.events.push(Event::DroppedPending { count });
         }
     }
 
