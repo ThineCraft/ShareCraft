@@ -327,12 +327,16 @@ a.navhead{text-decoration:none}
 .navbar.mega{position:relative}
 .navbar.mega li.has-mega{position:static}
 .navbar .mega-panel{position:absolute;top:100%;left:0;right:0;z-index:20;padding:var(--space-3) var(--space-4);background:var(--paper);border:1px solid var(--line);border-radius:var(--radius-md);box-shadow:var(--shadow-2)}
-.navbar .mega-columns{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:var(--space-2) var(--space-5)}
+.navbar .mega-columns{display:grid;grid-template-columns:repeat(var(--mega-columns,1),minmax(0,1fr));gap:var(--space-2) var(--space-5);max-width:calc(var(--mega-columns,1) * 240px)}
+.navbar .mega-columns[data-columns="2"]{--mega-columns:2}
+.navbar .mega-columns[data-columns="3"]{--mega-columns:3}
+.navbar .mega-columns[data-columns="4"]{--mega-columns:4}
+/* narrower wide screens: at most two columns side by side */
+@media (min-width:761px) and (max-width:1000px){.navbar .mega-columns:is([data-columns="3"],[data-columns="4"]){--mega-columns:2}}
 .navbar .mega-panel ul{flex-direction:column;align-items:stretch;flex-wrap:nowrap;gap:0}
 .navbar .mega-overview{margin:0 0 var(--space-2);font-weight:600}
 .navbar .mega-overview a{display:inline-block;padding:var(--space-1) var(--space-3);border-radius:var(--radius-sm)}
-.navbar .mega-heading{margin:0;padding:var(--space-1) var(--space-3);font-family:var(--font-heading);font-weight:600;color:var(--muted)}
-.navbar .mega-heading a{color:inherit}
+.navbar .mega-heading{margin:0 0 var(--space-1);padding:var(--space-1) var(--space-3);font-family:var(--font-heading);font-size:var(--text-md);font-weight:600;color:var(--text)}
 .site-facts .description{white-space:pre-wrap}
 .list .description{color:var(--text);font-size:var(--text-sm)}
 input[type=search]{border:1px solid var(--line);background:var(--paper);border-radius:var(--radius-sm);padding:7px var(--space-3);min-height:var(--control)}
@@ -349,7 +353,7 @@ input[type=search]{border:1px solid var(--line);background:var(--paper);border-r
  .navbar .sub{position:static;flex-basis:100%;max-width:none;box-shadow:none;border:0;border-left:2px solid var(--line);border-radius:0;margin-left:var(--space-3);padding:0}
  .navbar.mega li.has-mega{position:relative}
  .navbar .mega-panel{position:static;flex-basis:100%;box-shadow:none;border:0;border-left:2px solid var(--line);border-radius:0;margin-left:var(--space-3);padding:0}
- .navbar .mega-columns{display:block}
+ .navbar .mega-columns{display:block;max-width:none}
  .navbar .mega-overview a,.navbar .mega-heading{min-height:var(--control-touch);display:flex;align-items:center}
  input[type=search]{min-height:var(--control-touch)}
 }

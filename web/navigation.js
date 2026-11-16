@@ -59,19 +59,25 @@ export function countItems(items) {
 
 // ---- the mega menu: helpers for drawing a site's horizontal navigation as panels (common.js) ----
 
+/** The most links a mega column holds before another column is added (up to the most columns). */
+export const MEGA_COLUMN_LINKS = 6;
+/** The most columns a mega panel has. */
+export const MEGA_COLUMNS = 4;
+
 /**
  * The columns of the mega panel of a top-level item whose children are `children` (resolved
- * navigation items, as the server sent them), as `[{heading, items}]` in their order: children
- * without children of their own run together in one column (`heading` null), and each child
- * with children heads a column of its own children. Nothing is added or left out.
+ * navigation items, as the server sent them; links go one level deep), as a list of columns,
+ * each a list of items: one column for every 6 links, 1 to 4 columns, balanced and filled top
+ * to bottom in order (13 links give 5, 5 and 3). Nothing is added or left out; no children,
+ * no columns.
  */
 export function megaColumns(children) {
+  const items = [...(children ?? [])];
+  if (!items.length) return [];
+  const count = Math.min(MEGA_COLUMNS, Math.ceil(items.length / MEGA_COLUMN_LINKS));
+  const size = Math.ceil(items.length / count);
   const columns = [];
-  for (const child of children ?? []) {
-    if (child.children?.length) columns.push({ heading: child, items: child.children });
-    else if (columns.at(-1)?.heading === null) columns.at(-1).items.push(child);
-    else columns.push({ heading: null, items: [child] });
-  }
+  for (let at = 0; at < items.length; at += size) columns.push(items.slice(at, at + size));
   return columns;
 }
 

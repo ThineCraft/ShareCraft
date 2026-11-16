@@ -289,28 +289,34 @@ const SEEN = {
   local: [
     navLink(1, 'Teams', [navLink(11, 'Sales', [], { targeted: true }), navLink(12, 'Legal')]),
     navLink(2, 'News'),
+    // a heading (no target of its own) over 13 links: navigation goes one level deep, as the server keeps it
     {
       id: 'i3',
       label: 'Help',
       target: null,
       targeted: false,
-      children: [
-        { id: 'i31', label: 'Guides', target: null, targeted: false, children: [navLink(311, 'Start here')] },
-        navLink(32, 'Mail us'),
-      ],
+      children: Array.from({ length: 13 }, (_, n) => navLink(301 + n, `Guide ${n + 1}`)),
     },
   ],
   automatic: false,
 };
 
 test('mega_menu_keyboard_and_audiences', () => {
-  // The columns: links without children together, a link with children as a headed column, in order.
-  const help = SEEN.local[2].children;
-  assert.deepEqual(
-    megaColumns(help).map((column) => [column.heading?.label ?? null, column.items.map((item) => item.label)]),
-    [['Guides', ['Start here']], [null, ['Mail us']]],
-  );
-  assert.deepEqual(megaColumns([navLink(1, 'A'), navLink(2, 'B')]).length, 1);
+  // The columns: the children spread over 1 to 4 balanced columns (at most 6 links in each
+  // until 4 columns), filled top to bottom, in order; nothing added or left out.
+  const many = (count) => Array.from({ length: count }, (_, n) => navLink(n + 1, `L${n + 1}`));
+  const shape = (columns) => columns.map((column) => column.map((item) => item.label));
+  assert.deepEqual(shape(megaColumns(many(1))), [['L1']]);
+  assert.deepEqual(shape(megaColumns(many(6))), [['L1', 'L2', 'L3', 'L4', 'L5', 'L6']]);
+  const thirteen = shape(megaColumns(many(13)));
+  assert.equal(thirteen.length, 3);
+  assert.deepEqual(thirteen.map((column) => column.length), [5, 5, 3]);
+  assert.deepEqual(thirteen.flat(), many(13).map((item) => item.label), 'in order, top to bottom');
+  const twentyFour = shape(megaColumns(many(24)));
+  assert.equal(twentyFour.length, 4);
+  assert.deepEqual(twentyFour.map((column) => column.length), [6, 6, 6, 6]);
+  assert.deepEqual(twentyFour.flat(), many(24).map((item) => item.label));
+  assert.equal(megaColumns(many(40)).length, 4, 'never more than 4 columns');
   assert.deepEqual(megaColumns([]), []);
   // Arrows move between the top-level controls and wrap; Home and End go to either end.
   assert.equal(megaStep('ArrowRight', 0, 3), 1);
@@ -333,7 +339,14 @@ test('mega_menu_keyboard_and_audiences', () => {
     const links = below(local).filter((e) => e.tag === 'a');
     assert.deepEqual(
       links.map((a) => a.attributes.href),
-      [`/site.html?id=${SITE}`, '/page-1', '/page-11', '/page-12', '/page-2', '/page-311', '/page-32'],
+      [
+        `/site.html?id=${SITE}`,
+        '/page-1',
+        '/page-11',
+        '/page-12',
+        '/page-2',
+        ...Array.from({ length: 13 }, (_, n) => `/page-${301 + n}`),
+      ],
     );
     assert.deepEqual(classed(local, 'mark').map(textOf), ['Targeted'], 'a targeted link is marked');
 
@@ -349,12 +362,27 @@ test('mega_menu_keyboard_and_audiences', () => {
       assert.equal(button.attributes['aria-controls'], panels[at].attributes.id);
       assert.equal(panels[at].hidden, true);
     }
-    // The link of an item with children opens from its panel; a column with children is headed.
-    assert.equal(below(panels[0]).filter((e) => e.tag === 'a')[0].attributes.href, '/page-1');
-    const heading = classed(panels[1], 'mega-heading')[0];
-    assert.equal(textOf(heading), 'Guides');
-    const headed = below(panels[1]).find((e) => e.tag === 'ul' && e.attributes['aria-labelledby'] === heading.attributes.id);
-    assert.deepEqual(below(headed).filter((e) => e.tag === 'a').map((a) => a.attributes.href), ['/page-311']);
+    // Each panel is headed by its item's label; an item with a target is reached by "Go to"
+    // first; the links are spread over balanced columns, each list named by the heading.
+    for (const [at, label] of ['Teams', 'Help'].entries()) {
+      const heading = classed(panels[at], 'mega-heading')[0];
+      assert.equal(textOf(heading), label);
+      assert.equal(panels[at].attributes['aria-labelledby'], heading.attributes.id);
+    }
+    const goTo = below(panels[0]).filter((e) => e.tag === 'a')[0];
+    assert.equal(goTo.attributes.href, '/page-1');
+    assert.equal(textOf(goTo), 'Go to Teams');
+    assert.equal(classed(panels[1], 'mega-overview').length, 0, 'a heading without a target has no Go to link');
+    const helpColumns = classed(panels[1], 'mega-column');
+    assert.equal(helpColumns.length, 3);
+    assert.equal(classed(panels[1], 'mega-columns')[0].attributes['data-columns'], '3');
+    assert.deepEqual(
+      helpColumns.map((column) => below(column).filter((e) => e.tag === 'a').length),
+      [5, 5, 3],
+    );
+    const helpHead = classed(panels[1], 'mega-heading')[0].attributes.id;
+    assert.ok(helpColumns.every((column) => column.tag === 'ul' && column.attributes['aria-labelledby'] === helpHead));
+    assert.equal(classed(panels[0], 'mega-column').length, 1, 'two links make one column');
 
     // Opening one panel closes the other.
     buttons[0].listeners.click();
@@ -440,7 +468,7 @@ test('mega_menu_falls_back_on_phones', () => {
     for (const options of [{ menu: 'mega', vertical: true }, { menu: 'cascading' }, { menu: '<b>mega</b>' }, {}]) {
       const other = navigationView({ id: SITE, name: 'Sales site' }, SEEN, options);
       assert.equal(classed(other, 'mega-panel').length, 0, JSON.stringify(options));
-      assert.equal(classed(other, 'sub').length, 4, JSON.stringify(options));
+      assert.equal(classed(other, 'sub').length, 3, JSON.stringify(options));
     }
   } finally {
     delete globalThis.document;

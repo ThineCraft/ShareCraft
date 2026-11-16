@@ -1296,20 +1296,13 @@ function navItem(item, currentId) {
 
 const TARGETED_TITLE = 'Shown only to the groups it is aimed at, and to you because you manage it';
 
-/** A link to a resolved navigation target, marked when it is the current page; else the label as text. */
-function megaLink(item, currentId) {
-  const href = navHref(item.target);
-  if (!href) return item.label;
-  const current = item.target?.node != null && item.target.node === currentId;
-  return h('a', { href, 'aria-current': current ? 'page' : null }, item.label);
-}
 
 /**
  * One top-level item of a mega menu, as `{li, control}` (`control` is what the arrows move
  * to). Without children it is drawn as in the dropdowns. With children it is a disclosure
- * button, named by its label, for a full-width panel: the item's own link first (when it has
- * one), then the children in columns (see `megaColumns` in navigation.js), each child that has
- * children of its own heading a column. Escape closes the panel and goes back to its button;
+ * button, named by its label, for a full-width panel headed by the label: a "Go to" link to the
+ * item first (when it has a target), then its children spread over balanced columns (see
+ * `megaColumns` in navigation.js), each list named by the heading. Escape closes the panel and goes back to its button;
  * focus moving out of the item (Tab) closes it; opening one panel closes the others in `open`.
  * Only the items the server sent are drawn: it has already left out what the reader's
  * audiences do not see.
@@ -1322,14 +1315,23 @@ function megaItem(item, currentId, panels) {
   }
   menus += 1;
   const id = `nav-mega-${menus}`;
-  const overview = navHref(item.target) ? h('p', { class: 'mega-overview' }, megaLink(item, currentId)) : null;
-  const columns = megaColumns(item.children).map((column, n) => {
-    const headId = column.heading ? `${id}-head-${n}` : null;
-    const head = column.heading ? h('p', { class: 'mega-heading', id: headId }, megaLink(column.heading, currentId)) : null;
-    const list = h('ul', { 'aria-labelledby': headId }, ...column.items.map((child) => navItem(child, currentId)));
-    return h('div', { class: 'mega-column' }, head, list);
-  });
-  const panel = h('div', { class: 'mega-panel', id }, overview, h('div', { class: 'mega-columns' }, ...columns));
+  const headId = `${id}-head`;
+  const heading = h('p', { class: 'mega-heading', id: headId }, item.label);
+  const href = navHref(item.target);
+  const current = item.target?.node != null && item.target.node === currentId;
+  const overview = href
+    ? h('p', { class: 'mega-overview' }, h('a', { href, 'aria-current': current ? 'page' : null }, `Go to ${item.label}`))
+    : null;
+  const lists = megaColumns(item.children).map((column) =>
+    h('ul', { class: 'mega-column', 'aria-labelledby': headId }, ...column.map((child) => navItem(child, currentId))),
+  );
+  const panel = h(
+    'div',
+    { class: 'mega-panel', id, role: 'group', 'aria-labelledby': headId },
+    heading,
+    overview,
+    h('div', { class: 'mega-columns', 'data-columns': String(lists.length) }, ...lists),
+  );
   panel.hidden = true;
   const button = h(
     'button',
