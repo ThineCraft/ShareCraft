@@ -292,6 +292,33 @@ function pageArt(attributes) {
   );
 }
 
+let customCard = null;
+const allPackages = () => [...(brand.font_packages ?? []), ...sitePackages];
+let fieldCount = 0;
+
+// The footer groups folded shut, by their place; drawing again keeps them folded.
+const foldedGroups = new Set();
+
+const PREVIEW_ROWS = [
+  ['Quarterly report.docx', 'Edited today'],
+  ['Brand guide.pdf', 'Edited yesterday'],
+  ['Team photo.jpg', 'Edited last week'],
+];
+
+const SLOT_NAMES = { logo: 'the logo', thumbnail: 'the thumbnail', icon: 'the tab icon', 'header.image': 'the header image', 'footer.logo': 'the footer logo' };
+
+/** The parts of the studio a person edits; while another site's look is loaded they wait. */
+const EDITED_PARTS = ['theme', 'fonts', 'header', 'navigation', 'footer'];
+
+const colours = {
+  primary: colourField('colour-primary', 'Primary (links, buttons, focus ring)', { onInput: (v) => colourChanged('primary', v) }),
+  secondary: colourField('colour-secondary', 'Secondary (a strong header or footer)', { onInput: (v) => colourChanged('secondary', v) }),
+  primary_dark: colourField('colour-primary-dark', 'Primary in dark mode', { optional: true, onInput: (v) => colourChanged('primary_dark', v) }),
+  secondary_dark: colourField('colour-secondary-dark', 'Secondary in dark mode', { optional: true, onInput: (v) => colourChanged('secondary_dark', v) }),
+};
+
+$('colour-fields').replaceChildren(...Object.values(colours).map((field) => field.element));
+
 const LAYOUTS = [
   ['minimal', 'Minimal', 'One slim row'],
   ['compact', 'Compact', 'A small logo and title'],
@@ -351,14 +378,6 @@ $('menu-choice').replaceChildren(
 );
 
 // ---- the theme ----
-
-const colours = {
-  primary: colourField('colour-primary', 'Primary (links, buttons, focus ring)', { onInput: (v) => colourChanged('primary', v) }),
-  secondary: colourField('colour-secondary', 'Secondary (a strong header or footer)', { onInput: (v) => colourChanged('secondary', v) }),
-  primary_dark: colourField('colour-primary-dark', 'Primary in dark mode', { optional: true, onInput: (v) => colourChanged('primary_dark', v) }),
-  secondary_dark: colourField('colour-secondary-dark', 'Secondary in dark mode', { optional: true, onInput: (v) => colourChanged('secondary_dark', v) }),
-};
-$('colour-fields').replaceChildren(...Object.values(colours).map((field) => field.element));
 
 function colourChanged(field, value) {
   session.setColour(field, value);
@@ -445,8 +464,6 @@ function themeChosen(from) {
   fillTheme();
   refresh();
 }
-
-let customCard = null;
 
 /** The gallery: a group per kind of theme, then Custom colours. Drawn again when the themes change. */
 function fillThemeChoice() {
@@ -552,8 +569,6 @@ async function deleteSiteTheme(theme) {
 }
 
 // ---- fonts: the package gallery and the site's own packages ----
-
-const allPackages = () => [...(brand.font_packages ?? []), ...sitePackages];
 
 /** One card of the font gallery: the package's name and a specimen in its fonts. */
 function packageCard(card) {
@@ -868,7 +883,6 @@ $('footer-name').addEventListener('input', () => {
   refresh();
 });
 
-let fieldCount = 0;
 /** A labelled text box whose input runs `onInput`. */
 function textField(label, value, maxlength, onInput) {
   fieldCount += 1;
@@ -881,9 +895,6 @@ function textField(label, value, maxlength, onInput) {
   });
   return h('div', { class: 'field' }, h('label', { for: id }, label), input);
 }
-
-// The footer groups folded shut, by their place; drawing again keeps them folded.
-const foldedGroups = new Set();
 
 /** The footer's groups of links as cards that fold, as many as its layout allows; the draft keeps the rest. */
 function drawGroups() {
@@ -962,12 +973,6 @@ function drawGroups() {
 }
 
 // ---- the preview, the check and Apply ----
-
-const PREVIEW_ROWS = [
-  ['Quarterly report.docx', 'Edited today'],
-  ['Brand guide.pdf', 'Edited yesterday'],
-  ['Team photo.jpg', 'Edited last week'],
-];
 
 /** Draws the draft in each preview element, light and dark, with applyLook on that element only. */
 function drawPreview() {
@@ -1132,8 +1137,6 @@ async function loadHistory() {
   drawHistory();
 }
 
-const SLOT_NAMES = { logo: 'the logo', thumbnail: 'the thumbnail', icon: 'the tab icon', 'header.image': 'the header image', 'footer.logo': 'the footer logo' };
-
 function drawHistory() {
   $('history-empty').hidden = history.length > 0;
   $('history').replaceChildren(
@@ -1195,9 +1198,6 @@ async function restoreEntry(entry, when, which = 'after', label = 'after the cha
 }
 
 // ---- copying the look of another site ----
-
-/** The parts of the studio a person edits; while another site's look is loaded they wait. */
-const EDITED_PARTS = ['theme', 'fonts', 'header', 'navigation', 'footer'];
 
 /** The banner while a copy is loaded, and the parts made inert until Apply or Cancel. */
 function showCopy() {

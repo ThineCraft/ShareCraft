@@ -66,28 +66,6 @@ const banner = $('banner');
 const bannerText = $('banner-text');
 const bannerActions = $('banner-actions');
 const editorArea = $('editor-area');
-const chrome = setupEditorFrame(frameBox, {
-  details: () =>
-    doc && !removed
-      ? [
-          { label: 'Name', value: doc.name },
-          { label: 'Opens in', value: editorName() },
-          { label: 'Your access', value: roleLine(doc.access) },
-          { label: 'Status', value: statusText.textContent },
-        ]
-      : [],
-  onActivity: ({ opener }) => {
-    if (removed || !doc) return;
-    activityPanel().open({ id: docId, name: doc.name, me, opener });
-  },
-  onRenamed: (node) => {
-    if (removed || !doc) return;
-    doc = { ...doc, name: node.name };
-    viewer.rename(docId, node.name);
-    showDetail();
-    rememberOpened(me.id, { id: docId, name: doc.name, editor: doc.editor, site: path?.[0]?.name ?? '' });
-  },
-});
 
 // Every piece of state is declared here, before any code below runs.
 const clientId = crypto.randomUUID(); // this page load's connection
@@ -127,9 +105,48 @@ let notice = null;          // a banner that stays until what it is about is ove
 let bannerKey = '';
 let roleCheck = 0;          // the latest role request; older answers are dropped
 let notReadyTimer = 0;
+let chrome = null;          // the frame's header and panels, set up once the viewer and queue exist
 let viewGen = 0;            // counts the files shown in the viewer; older answers are dropped
-const viewer = createViewer(editorArea, { onStep: (item) => stepTo(item) });
+const previewUrl = () => `/api/docs/${seg(docId)}/preview`;
+
+// An answer that comes back after the page moved on to another file (or was removed) is dropped.
+const stale = (gen) => removed || gen !== viewGen;
+
+// Whether leaving the page now would lose work: unsaved changes in the editor, or a copy the
+// server has not stored.
+const somethingToLose = () => editorDirty || queue.kept !== null || mine !== null;
+
+const canSave = () => holder && !savingStopped && !removed;
+
+// Whether this page is the one editing, for the status: a page that stopped saving says
+// "Not saved", not "View only", unless it lost the right to edit with nothing to lose.
+const editing = () => (holder || (savingStopped !== '' && (!lostEdit || somethingToLose()))) && !removed;
+
 const queue = new SaveQueue(upload, onQueue);
+const viewer = createViewer(editorArea, { onStep: (item) => stepTo(item) });
+
+chrome = setupEditorFrame(frameBox, {
+  details: () =>
+    doc && !removed
+      ? [
+          { label: 'Name', value: doc.name },
+          { label: 'Opens in', value: editorName() },
+          { label: 'Your access', value: roleLine(doc.access) },
+          { label: 'Status', value: statusText.textContent },
+        ]
+      : [],
+  onActivity: ({ opener }) => {
+    if (removed || !doc) return;
+    activityPanel().open({ id: docId, name: doc.name, me, opener });
+  },
+  onRenamed: (node) => {
+    if (removed || !doc) return;
+    doc = { ...doc, name: node.name };
+    viewer.rename(docId, node.name);
+    showDetail();
+    rememberOpened(me.id, { id: docId, name: doc.name, editor: doc.editor, site: path?.[0]?.name ?? '' });
+  },
+});
 
 addEventListener('beforeunload', (event) => {
   if (removed) return;
@@ -194,11 +211,6 @@ async function openAsChosen() {
   if (choice.view === 'preview') return showPreview(choice.kind, gen);
   return showNoPreview();
 }
-
-const previewUrl = () => `/api/docs/${seg(docId)}/preview`;
-
-// An answer that comes back after the page moved on to another file (or was removed) is dropped.
-const stale = (gen) => removed || gen !== viewGen;
 
 function showPreview(kind, gen) {
   if (kind === 'text') return showTextPreview(gen);
@@ -651,10 +663,6 @@ function loseSeat(next) {
   render();
 }
 
-// Whether leaving the page now would lose work: unsaved changes in the editor, or a copy the
-// server has not stored.
-const somethingToLose = () => editorDirty || queue.kept !== null || mine !== null;
-
 // This person's rights changed while connected. The page stays as it is: the role line and the
 // Access link follow the server's answer, and the seat follows the server's `seat` message (a
 // holder who may no longer edit is sent `seat: free` next, which stops saving).
@@ -707,11 +715,6 @@ function takeSeat(next) {
   holder = next?.state === 'yours' && typeof next.token === 'string' && !savingStopped;
   seatToken = holder ? next.token : null;
 }
-
-const canSave = () => holder && !savingStopped && !removed;
-// Whether this page is the one editing, for the status: a page that stopped saving says
-// "Not saved", not "View only", unless it lost the right to edit with nothing to lose.
-const editing = () => (holder || (savingStopped !== '' && (!lostEdit || somethingToLose()))) && !removed;
 
 // The page will not upload again: it says why and offers the person's copy and a reload.
 function stopSaving(text) {

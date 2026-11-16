@@ -169,9 +169,9 @@ async function load() {
   if ($('kind').value) query.set('kind', $('kind').value);
   if ($('hub').value) query.set('hub', $('hub').value);
   const text = query.toString();
-  const mine = ++asked;
+  const turn = ++asked;
   const result = await api('GET', `/sites${text ? `?${text}` : ''}`);
-  if (mine !== asked) return;
+  if (turn !== asked) return;
   if (!result.ok) {
     showMessage(error, messageFor(result.error));
     return;

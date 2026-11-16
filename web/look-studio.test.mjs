@@ -15,7 +15,7 @@ import {
   themeGallery,
   toggleSection,
 } from './look-studio.js';
-import { draftFromLook } from './look.js';
+import { draftFromLook, lookSession } from './look.js';
 
 test('the studio starts on the theme, or on the part the address names', () => {
   assert.deepEqual(studioState(), { tab: 'theme', open: ['theme'] });
@@ -245,4 +245,38 @@ test('a kept font copy whose package changed in the brand centre is noted and it
   assert.equal(gone.checked, '');
   assert.match(gone.note, /no longer offered/);
   assert.deepEqual(fontsChoice(draftFromLook({ from: 'builtin:plum' }), changed, offered), { checked: 'builtin:system', note: null });
+});
+
+test('the changed marks agree with the pending check: none on a saved look, some exactly when Apply has work', () => {
+  const look = {
+    theme: { name: 'Harbour', primary: '#3171c8', secondary: '#22324a' },
+    from: 'org:t1',
+    logo: { sha256: 'a'.repeat(64), name: 'Logo.png', media_type: 'image/png', from_doc: 'd1' },
+    header: { layout: 'extended', background: 'soft', align: 'left', hide_title: false },
+    navigation: 'horizontal',
+    menu: 'mega',
+    footer: { enabled: true, layout: 'simple', name: 'Harbour', groups: [{ heading: 'Help', links: [{ label: 'Ask', url: '/ask' }] }] },
+    fonts: { from: 'org:p1', package: { name: 'Craft', display: { name: 'A' }, content: { name: 'B' } } },
+  };
+  const session = lookSession({ siteId: 's', settings: { look }, send: async () => ({ ok: false }) });
+  const agree = () => assert.equal(changedParts(session.draft, session.settings.look).length > 0, session.status().dirty);
+  assert.deepEqual(changedParts(session.draft, look), []);
+  agree();
+  // The same image with its fields in another order is not a change.
+  session.change((draft) => {
+    draft.logo = { from_doc: 'd1', media_type: 'image/png', name: 'Logo.png', sha256: 'a'.repeat(64) };
+  });
+  assert.deepEqual(changedParts(session.draft, look), []);
+  agree();
+  session.change((draft) => {
+    draft.footer.groups[0].links[0].url = '/help';
+  });
+  assert.deepEqual(changedParts(session.draft, look), ['footer']);
+  agree();
+  session.cancel();
+  session.change((draft) => {
+    draft.fonts = { ...draft.fonts, keep: false };
+  });
+  assert.deepEqual(changedParts(session.draft, look), ['fonts']);
+  agree();
 });

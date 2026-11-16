@@ -27,6 +27,8 @@ const error = $('error');
 const status = $('status');
 /** The largest package the server takes, in bytes. */
 const MAX_PACKAGE = 1024 * 1024;
+let brandFonts = null; // GET /api/brand's fonts, once read
+const looks = new Map(); // template id -> its look card (null: none), from its package
 
 let me;
 try {
@@ -61,9 +63,6 @@ function note(text, ok = false) {
   $('import-msg').classList.toggle('ok', ok);
   showMessage($('import-msg'), text);
 }
-
-let brandFonts = null; // GET /api/brand's fonts, once read
-const looks = new Map(); // template id -> its look card (null: none), from its package
 
 async function showTemplates() {
   const [result, brand] = await Promise.all([api('GET', '/templates'), brandFonts ? null : api('GET', '/brand')]);

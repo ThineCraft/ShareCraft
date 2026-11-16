@@ -776,8 +776,11 @@ export function footerGroups(footer) {
     .filter((group) => group.heading.trim() !== '' || group.links.length > 0);
 }
 
-/** The draft as it would be sent, to tell whether it differs from the saved look. */
-function comparable(draft) {
+/**
+ * The draft as it would be sent, to tell whether it differs from the saved look. The session's
+ * dirty check and the studio's changed marks (look-studio.js `changedParts`) both compare this.
+ */
+export function comparable(draft) {
   return { ...draft, footer: { ...draft.footer, groups: footerGroups(draft.footer) } };
 }
 
@@ -801,7 +804,7 @@ export function withoutSlots(draft, slots) {
 }
 
 /** A text form of `value` with the keys of every object sorted, to compare drafts. */
-function canonical(value) {
+export function canonical(value) {
   if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
   if (value && typeof value === 'object') {
     return `{${Object.keys(value)

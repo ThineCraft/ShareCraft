@@ -60,6 +60,11 @@ let checking = false;   // a still-allowed check is in flight
 let closedBeforeJoin = 0; // closes in a row, before joining, while the document stayed open
 let info = null;        // the document as the server last described it
 let people = [];        // who is connected, as the client last listed them
+let me = null;          // the signed-in person, once known
+let docId = null;       // the document this page shows, once read from the address
+
+const isHigh = (unit) => unit >= 0xd800 && unit <= 0xdbff;
+const isLow = (unit) => unit >= 0xdc00 && unit <= 0xdfff;
 
 const chrome = setupEditorFrame(frame, {
   details: () =>
@@ -86,9 +91,9 @@ const chrome = setupEditorFrame(frame, {
 // Another document was chosen by editing the address.
 addEventListener('hashchange', () => location.reload());
 
-const me = await requireMe();
+me = await requireMe();
 startPalette(me);
-const docId = documentId();
+docId = documentId();
 if (!docId) {
   showProblem(MISSING);
   throw new Error('no document');
@@ -433,9 +438,6 @@ function difference(before, after) {
     inserted: after.slice(prefix, after.length - suffix),
   };
 }
-
-const isHigh = (unit) => unit >= 0xd800 && unit <= 0xdbff;
-const isLow = (unit) => unit >= 0xdc00 && unit <= 0xdfff;
 
 // Shows text changed by someone else, keeping the selection on the same characters.
 function showRemote(text, edits) {

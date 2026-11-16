@@ -120,14 +120,7 @@ setupMenu($('more-button'), $('more-menu'));
 let items = [];
 let next = null;
 const selected = new Set(); // ids of the checked items
-// The uploads, in the tray at the bottom-right: they run whichever folder is on screen.
-const uploads = createUploads({
-  site: siteId,
-  release: (session) => api('DELETE', `/uploads/${seg(session)}`),
-  onChange: (entry) => tray.changed(entry),
-  onIdle: () => uploadsIdle(),
-});
-const tray = mountUploadTray({ uploads, openFolder: (id) => switchTo(id), confirm: confirmDialog });
+let tray = null; // the upload tray, made just after the uploads it shows
 let switching = 0; // the latest folder asked for by switchTo; older answers are dropped
 let moving = []; // the items the move or copy dialog is for
 let moveMode = 'move';
@@ -152,6 +145,11 @@ let anchorBase = new Set(); // what was selected when it started
 let inline = null; // the rename in place under way: { id, input }
 const MAC = isMacPlatform();
 const KEY_MOD = MAC ? { text: 'Command', aria: 'Meta' } : { text: 'Ctrl', aria: 'Control' };
+const UNDO_KEYS = `${KEY_MOD.text}+Z`;
+const moveDialog = $('move-dialog');
+const renameDialog = $('rename-dialog');
+const movingIds = () => moving.map((item) => item.id);
+
 // The details pane beside the table (a sheet on narrow screens): preview, facts and access of
 // the selected row, with the row actions. Only for the list; the grid of an image library has none.
 const details = createDetails({
@@ -170,6 +168,16 @@ const details = createDetails({
   me,
   enabled: () => view === 'list',
 });
+
+// The uploads, in the tray at the bottom-right: they run whichever folder is on screen.
+const uploads = createUploads({
+  site: siteId,
+  release: (session) => api('DELETE', `/uploads/${seg(session)}`),
+  onChange: (entry) => tray.changed(entry),
+  onIdle: () => uploadsIdle(),
+});
+
+tray = mountUploadTray({ uploads, openFolder: (id) => switchTo(id), confirm: confirmDialog });
 
 $('more').addEventListener('click', () => loadPage());
 setupViews();
@@ -818,7 +826,6 @@ function showPlace() {
 
 // ---- rename ----
 
-const renameDialog = $('rename-dialog');
 $('rename-cancel').addEventListener('click', () => renameDialog.close());
 
 function askRename(item) {
@@ -936,8 +943,6 @@ async function runBulk(op, list, place, from = nodeId) {
 
 // ---- undo: a toast's Undo button, or Ctrl+Z ----
 
-const UNDO_KEYS = `${KEY_MOD.text}+Z`;
-
 /** Says what was done, with an Undo button that reverses it and then says how that went. */
 function offerUndo(undo) {
   if (!undo) return;
@@ -968,7 +973,6 @@ addShortcut({
 
 // ---- move and copy (one dialog) ----
 
-const moveDialog = $('move-dialog');
 $('move-cancel').addEventListener('click', () => moveDialog.close());
 
 function askMove(list, mode) {
@@ -982,8 +986,6 @@ function askMove(list, mode) {
   moveDialog.showModal();
   browse();
 }
-
-const movingIds = () => moving.map((item) => item.id);
 
 // Lists the places inside the last step of `trail` (the sites at the top).
 async function browse() {

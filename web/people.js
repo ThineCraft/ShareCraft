@@ -15,6 +15,9 @@ const error = $('error');
 const status = $('status');
 const dialog = $('add-dialog');
 
+const passwordInput = $('password');
+const toggle = $('password-toggle');
+
 // The search field is in place from the start, so the list does not move when it comes.
 const filter = listFilter({
   id: 'find-person',
@@ -143,9 +146,6 @@ async function copyEmail(person) {
 }
 
 // ---- Add a person ----
-
-const passwordInput = $('password');
-const toggle = $('password-toggle');
 
 function showHint() {
   const check = passwordCheck(passwordInput.value);

@@ -3,7 +3,7 @@
 // Light / Dark / Phone switch, the theme gallery's cards and which parts of the draft differ from
 // the saved look. site-look.js wires these to the page.
 
-import { draftFromLook, packageFonts, previewPalettes, sameTheme } from './look.js';
+import { canonical, comparable, draftFromLook, packageFonts, previewPalettes } from './look.js';
 
 /** The parts of the look, in the order of the tabs. */
 export const STUDIO_PARTS = Object.freeze(['theme', 'fonts', 'header', 'navigation', 'footer', 'history']);
@@ -131,37 +131,27 @@ export function chosenCard(draft, themes = []) {
   return draft?.from !== 'custom' && themes.some((t) => t.from === draft?.from) ? draft.from : 'custom';
 }
 
-const same = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
-
-/** The links of a footer that would be sent: empty groups and links left out. */
-function footerShape(footer) {
-  const groups = (footer.groups ?? [])
-    .map((g) => ({ heading: String(g.heading ?? ''), links: (g.links ?? []).filter((l) => l.label || l.url) }))
-    .filter((g) => g.heading || g.links.length);
-  return { ...footer, groups };
-}
+/** The fields of a draft each tab holds; together they are every field of a draft. */
+const PART_FIELDS = Object.freeze({
+  theme: ['from', 'theme'],
+  fonts: ['fonts'],
+  header: ['logo', 'thumbnail', 'icon', 'logo_alt', 'header'],
+  navigation: ['navigation', 'menu'],
+  footer: ['footer'],
+});
 
 /**
  * The parts of `draft` that differ from the saved look `savedLook` (null for the default look),
- * for the marks on the tabs: a subset of theme, header, navigation and footer.
+ * for the marks on the tabs: a subset of theme, fonts, header, navigation and footer. It compares
+ * the draft as it would be sent, the way the session's `status().dirty` does, so a part is marked
+ * exactly when the draft has a change there that Apply would send.
  */
 export function changedParts(draft, savedLook) {
-  const saved = draftFromLook(savedLook ?? null);
-  const parts = [];
-  if (draft.from !== saved.from || !sameTheme(draft.theme, saved.theme)) parts.push('theme');
-  if ((draft.fonts?.from ?? null) !== (saved.fonts?.from ?? null) || Boolean(draft.fonts?.keep) !== Boolean(saved.fonts?.keep)) parts.push('fonts');
-  if (
-    !same(draft.logo, saved.logo) ||
-    !same(draft.thumbnail, saved.thumbnail) ||
-    !same(draft.icon, saved.icon) ||
-    draft.logo_alt !== saved.logo_alt ||
-    !same(draft.header, saved.header)
-  ) {
-    parts.push('header');
-  }
-  if (draft.navigation !== saved.navigation || draft.menu !== saved.menu) parts.push('navigation');
-  if (!same(footerShape(draft.footer), footerShape(saved.footer))) parts.push('footer');
-  return parts;
+  const now = comparable(draft);
+  const was = comparable(draftFromLook(savedLook ?? null));
+  return Object.entries(PART_FIELDS)
+    .filter(([, fields]) => fields.some((field) => canonical(now[field]) !== canonical(was[field])))
+    .map(([part]) => part);
 }
 
 // ---- Fonts ----

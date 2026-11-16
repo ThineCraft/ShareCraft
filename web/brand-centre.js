@@ -52,6 +52,33 @@ await organisationChrome();
 
 let brand = null;
 let sections = { edit: false, managers: false };
+let editing = null; // the theme being edited (null: a new one)
+let working = themeOf({ name: '', primary: '#3156c9', secondary: '#233239' });
+
+const colours = {
+  primary: colourField('colour-primary', 'Primary (links, buttons, focus ring)', { onInput: (v) => setColour('primary', v) }),
+  secondary: colourField('colour-secondary', 'Secondary (a strong header or footer)', { onInput: (v) => setColour('secondary', v) }),
+  primary_dark: colourField('colour-primary-dark', 'Primary in dark mode', { optional: true, onInput: (v) => setColour('primary_dark', v) }),
+  secondary_dark: colourField('colour-secondary-dark', 'Secondary in dark mode', { optional: true, onInput: (v) => setColour('secondary_dark', v) }),
+};
+
+$('colour-fields').replaceChildren(...Object.values(colours).map((field) => field.element));
+
+let chosen = null; // the document picked for the image being added
+const FORMATS = { 'font/woff2': 'WOFF2', 'font/woff': 'WOFF', 'font/ttf': 'TTF', 'font/otf': 'OTF' };
+let chosenFont = null; // the document picked for the font being added
+let editingPackage = null; // the package being edited (null: a new one)
+const roleSelects = {};
+
+$('package-roles').replaceChildren(
+  ...ROLES.map(([role, label]) => {
+    const select = h('select', { id: `role-${role}` });
+    select.addEventListener('change', drawPackageSpecimen);
+    roleSelects[role] = select;
+    return h('div', { class: 'field' }, h('label', { for: `role-${role}` }, label), select);
+  }),
+);
+
 await load();
 
 /** Reads the brand centre again and draws every section. */
@@ -116,17 +143,6 @@ function drawThemes() {
     }),
   );
 }
-
-let editing = null; // the theme being edited (null: a new one)
-let working = themeOf({ name: '', primary: '#3156c9', secondary: '#233239' });
-
-const colours = {
-  primary: colourField('colour-primary', 'Primary (links, buttons, focus ring)', { onInput: (v) => setColour('primary', v) }),
-  secondary: colourField('colour-secondary', 'Secondary (a strong header or footer)', { onInput: (v) => setColour('secondary', v) }),
-  primary_dark: colourField('colour-primary-dark', 'Primary in dark mode', { optional: true, onInput: (v) => setColour('primary_dark', v) }),
-  secondary_dark: colourField('colour-secondary-dark', 'Secondary in dark mode', { optional: true, onInput: (v) => setColour('secondary_dark', v) }),
-};
-$('colour-fields').replaceChildren(...Object.values(colours).map((field) => field.element));
 
 function setColour(field, value) {
   const text = String(value ?? '').trim();
@@ -252,8 +268,6 @@ function drawImages() {
     }),
   );
 }
-
-let chosen = null; // the document picked for the image being added
 
 $('add-image').addEventListener('click', async () => {
   note('images-msg', '');
@@ -432,8 +446,6 @@ function confirmedText(licence) {
   return when && !Number.isNaN(when.getTime()) ? `Licence confirmed ${when.toLocaleDateString()}` : 'Licence confirmed';
 }
 
-const FORMATS = { 'font/woff2': 'WOFF2', 'font/woff': 'WOFF', 'font/ttf': 'TTF', 'font/otf': 'OTF' };
-
 function drawFonts() {
   const fonts = brand.fonts ?? [];
   $('fonts-empty').hidden = fonts.length > 0;
@@ -455,8 +467,6 @@ function drawFonts() {
     }),
   );
 }
-
-let chosenFont = null; // the document picked for the font being added
 
 /** Add font stays off until the form is complete, and says why. */
 function checkFontForm() {
@@ -542,17 +552,6 @@ function drawPackages() {
     }),
   );
 }
-
-let editingPackage = null; // the package being edited (null: a new one)
-const roleSelects = {};
-$('package-roles').replaceChildren(
-  ...ROLES.map(([role, label]) => {
-    const select = h('select', { id: `role-${role}` });
-    select.addEventListener('change', drawPackageSpecimen);
-    roleSelects[role] = select;
-    return h('div', { class: 'field' }, h('label', { for: `role-${role}` }, label), select);
-  }),
-);
 
 /** The package as the form holds it. */
 function packageFormState() {

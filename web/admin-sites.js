@@ -38,6 +38,39 @@ const $ = (id) => document.getElementById(id);
 const error = $('error');
 const status = $('status');
 
+let sites = [];
+const selected = new Set(); // the ids of the live sites selected
+
+/** What each action asks first (null: nothing is taken away), sends, and says when done. */
+const ACTIONS = {
+  archive: {
+    ask: (site) => [archiveSiteText(site), 'Archive'],
+    send: (site) => api('POST', `/sites/${seg(site.id)}/archive`),
+    done: (site) => `${site.name} is archived.`,
+  },
+  reactivate: {
+    ask: null,
+    send: (site) => api('POST', `/sites/${seg(site.id)}/reactivate`),
+    done: (site) => `${site.name} is active again.`,
+  },
+  delete: {
+    ask: (site) => [deleteSiteText(site), 'Delete site'],
+    send: (site) => api('DELETE', `/sites/${seg(site.id)}`),
+    done: (site) => `${site.name} is deleted. It can be restored for 93 days.`,
+  },
+  restore: {
+    ask: null,
+    send: (site) => api('POST', `/admin/sites/${seg(site.id)}/restore`),
+    done: (site, data) =>
+      data?.renamed_from ? `${data.renamed_from} is restored as ${data.name}, since its name was taken.` : `${site.name} is restored.`,
+  },
+  purge: {
+    ask: (site) => [purgeSiteText(site), 'Delete permanently'],
+    send: (site) => api('DELETE', `/admin/sites/${seg(site.id)}`),
+    done: (site) => `${site.name} was deleted permanently.`,
+  },
+};
+
 let me;
 try {
   me = await requireMe();
@@ -71,9 +104,6 @@ if (!me.is_admin) {
   $('content').hidden = false;
   await showSites();
 }
-
-let sites = [];
-const selected = new Set(); // the ids of the live sites selected
 
 /** A site's row with a checkbox to select it (live sites only: a deleted site has no look to change). */
 function siteRow(site) {
@@ -119,36 +149,6 @@ async function showSites() {
       ? 'One site has no enabled owner. Nobody but administrators can manage it.'
       : `${ownerless} sites have no enabled owner. Nobody but administrators can manage them.`;
 }
-
-/** What each action asks first (null: nothing is taken away), sends, and says when done. */
-const ACTIONS = {
-  archive: {
-    ask: (site) => [archiveSiteText(site), 'Archive'],
-    send: (site) => api('POST', `/sites/${seg(site.id)}/archive`),
-    done: (site) => `${site.name} is archived.`,
-  },
-  reactivate: {
-    ask: null,
-    send: (site) => api('POST', `/sites/${seg(site.id)}/reactivate`),
-    done: (site) => `${site.name} is active again.`,
-  },
-  delete: {
-    ask: (site) => [deleteSiteText(site), 'Delete site'],
-    send: (site) => api('DELETE', `/sites/${seg(site.id)}`),
-    done: (site) => `${site.name} is deleted. It can be restored for 93 days.`,
-  },
-  restore: {
-    ask: null,
-    send: (site) => api('POST', `/admin/sites/${seg(site.id)}/restore`),
-    done: (site, data) =>
-      data?.renamed_from ? `${data.renamed_from} is restored as ${data.name}, since its name was taken.` : `${site.name} is restored.`,
-  },
-  purge: {
-    ask: (site) => [purgeSiteText(site), 'Delete permanently'],
-    send: (site) => api('DELETE', `/admin/sites/${seg(site.id)}`),
-    done: (site) => `${site.name} was deleted permanently.`,
-  },
-};
 
 async function act(action, site) {
   showMessage(error, '');

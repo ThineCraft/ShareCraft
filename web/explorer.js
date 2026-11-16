@@ -95,6 +95,26 @@ let focusId = null;
 const filtering = () => filter.principal !== '' || filter.kinds.length > 0;
 const useBreaks = () => only || filtering();
 
+/** The break the server described for `id`, from the filtered or the unfiltered list. */
+const breakOf = (id) => broken.tree?.breaks.get(id) ?? everything.items.find((item) => item.node.id === id) ?? null;
+
+/**
+ * Whether `row` has permissions of its own. With a filter, a place on the path to a match is in
+ * the tree without matching itself; it may still be a break (the site, say), which the unfiltered
+ * list knows.
+ */
+const ownOf = (row) => row.unique || (useBreaks() && everything.items.some((item) => item.node.id === row.id));
+
+const treeItem = (id) => [...$('tree').querySelectorAll('li[role=treeitem]')].find((li) => li.dataset.id === id) ?? null;
+const SVG = 'http://www.w3.org/2000/svg';
+const keyIcon = () => strokeIcon(['M10.5 13.5a4.5 4.5 0 1 1 3-3L21 18v3h-3v-2h-2v-2h-2z', 'M7.5 8.5h.01'], 'pmap-key');
+let asked = 0;
+let sheetOpener = null;
+let stopDrag = null;
+const SIGNS = { added: '+', removed: '−', changed: '→' };
+const SR_WORD = { added: 'Added: ', removed: 'Removed: ', changed: 'Changed: ' };
+let restoring = null;
+
 // ---- the controls ----
 
 $('content').hidden = false;
@@ -387,16 +407,6 @@ async function loadChildren(row, counts) {
   lazy.more.set(row.id, result.data.next);
 }
 
-/** The break the server described for `id`, from the filtered or the unfiltered list. */
-const breakOf = (id) => broken.tree?.breaks.get(id) ?? everything.items.find((item) => item.node.id === id) ?? null;
-
-/**
- * Whether `row` has permissions of its own. With a filter, a place on the path to a match is in
- * the tree without matching itself; it may still be a break (the site, say), which the unfiltered
- * list knows.
- */
-const ownOf = (row) => row.unique || (useBreaks() && everything.items.some((item) => item.node.id === row.id));
-
 /** The assignments of the place `id` above a break: from a break loaded, or asked for once. */
 function entriesAbove(id) {
   const loaded = breakOf(id);
@@ -478,8 +488,6 @@ function render() {
   list.replaceChildren(top);
   if (hadFocus) treeItem(focusId)?.focus();
 }
-
-const treeItem = (id) => [...$('tree').querySelectorAll('li[role=treeitem]')].find((li) => li.dataset.id === id) ?? null;
 
 function placeItem(entry, counts, index) {
   const { row } = entry;
@@ -639,8 +647,6 @@ function setupTree() {
 
 // ---- icons ----
 
-const SVG = 'http://www.w3.org/2000/svg';
-
 function strokeIcon(paths, className) {
   const svg = document.createElementNS(SVG, 'svg');
   for (const [name, value] of Object.entries({ viewBox: '0 0 24 24', width: 18, height: 18, class: className, 'aria-hidden': 'true', focusable: 'false' })) {
@@ -663,13 +669,7 @@ function kindIcon(row) {
   return icon;
 }
 
-const keyIcon = () => strokeIcon(['M10.5 13.5a4.5 4.5 0 1 1 3-3L21 18v3h-3v-2h-2v-2h-2z', 'M7.5 8.5h.01'], 'pmap-key');
-
 // ---- the panel: who has access to one place, and how it differs from above ----
-
-let asked = 0;
-let sheetOpener = null;
-let stopDrag = null;
 
 function setupSheet() {
   const sheet = $('detail-sheet');
@@ -803,9 +803,6 @@ function peopleView(entries) {
   ];
 }
 
-const SIGNS = { added: '+', removed: '−', changed: '→' };
-const SR_WORD = { added: 'Added: ', removed: 'Removed: ', changed: 'Changed: ' };
-
 function diffView(found, diff) {
   const source = found.inherited_from;
   if (!source || diff === undefined) {
@@ -896,8 +893,6 @@ function inheritsView(row, access) {
 }
 
 // ---- restoring ----
-
-let restoring = null;
 
 async function openRestore(node) {
   note('', false);
