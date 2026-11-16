@@ -1649,8 +1649,8 @@ async fn fonts_keep_after_source_package_deleted() {
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{fonts}: {body}");
     }
 
-    // A kept copy is still held to the policy: its source is gone, so it counts as site-only
-    // fonts, which an owner may not keep while they are turned off.
+    // A kept copy is the look already stored, so a policy change does not stand in its way:
+    // its source is gone, yet an owner keeps it while site-only fonts are turned off.
     let (status, body) = call(
         &server,
         Some(&root),
@@ -1660,17 +1660,14 @@ async fn fonts_keep_after_source_package_deleted() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    let (status, body) = put_look(
+    let answer = set_look(
         &server,
         &olive,
         &team,
         json!({ "theme": { "from": "builtin:plum" }, "fonts": { "keep": true } }),
     )
     .await;
-    assert_eq!(
-        (status, &body["error"]),
-        (StatusCode::CONFLICT, &json!("not_allowed"))
-    );
+    assert_eq!(answer["look"]["fonts"], kept_fonts);
     set_look(
         &server,
         &root,
@@ -1725,6 +1722,92 @@ async fn fonts_keep_after_source_package_deleted() {
         effective(&server, &root, &team).await["fonts"]["body"]["url"],
         font_url(&own)
     );
+}
+
+#[tokio::test]
+async fn kept_font_copy_survives_a_brand_centre_edit() {
+    let server = spawn_server().await;
+    let root = server.admin("Root").await;
+    let olive = server.user("Olive").await;
+    let (team, _, assets) = site_with_assets(&server, &root, "Team").await;
+    grant(&server, &root, &team, &olive, "owner").await;
+    let font_id = add_font(
+        &server,
+        &root,
+        &upload(&server, &root, &assets, "Brand.woff2", &woff2(61)).await,
+    )
+    .await;
+    let (status, body) = new_package(
+        &server,
+        &root,
+        json!({ "name": "Brand", "display": { "brand_font": font_id },
+                "roles": roles("display", "display", "system", "system") }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let package = body["id"].as_str().unwrap().to_owned();
+    set_look(
+        &server,
+        &olive,
+        &team,
+        json!({ "theme": { "from": "builtin:plum" },
+                "fonts": { "from": format!("org:{package}") } }),
+    )
+    .await;
+    let kept_fonts = settings(&server, &olive, &team).await["look"]["fonts"].clone();
+    assert_eq!(
+        settings(&server, &olive, &team).await["fonts_source_changed"],
+        false
+    );
+
+    // Site-only font packages are turned off, then the brand centre edits the package.
+    let (status, body) = call(
+        &server,
+        Some(&root),
+        Method::PUT,
+        "/api/brand/policy",
+        Some(json!({ "site_fonts": false })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = call(
+        &server,
+        Some(&root),
+        Method::PATCH,
+        &format!("/api/brand/font-packages/{package}"),
+        Some(json!({ "name": "Brand 2",
+                     "roles": roles("display", "system", "system", "system") })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        settings(&server, &olive, &team).await["fonts_source_changed"],
+        true
+    );
+
+    // The owner still saves a header change, keeping the copy unchanged.
+    let answer = set_look(
+        &server,
+        &olive,
+        &team,
+        json!({ "theme": { "from": "builtin:plum" }, "fonts": { "keep": true },
+                "header": { "layout": "extended" } }),
+    )
+    .await;
+    assert_eq!(answer["look"]["fonts"], kept_fonts);
+    assert_eq!(answer["look"]["header"]["layout"], "extended");
+
+    // Taking the package again takes the new version, which the policy allows.
+    let answer = set_look(
+        &server,
+        &olive,
+        &team,
+        json!({ "theme": { "from": "builtin:plum" },
+                "fonts": { "from": format!("org:{package}") } }),
+    )
+    .await;
+    assert_eq!(answer["look"]["fonts"]["package"]["name"], "Brand 2");
+    assert_eq!(answer["fonts_source_changed"], false);
 }
 
 #[tokio::test]

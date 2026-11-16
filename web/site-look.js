@@ -62,8 +62,8 @@ import {
   changedParts,
   choiceLimit,
   chosenCard,
-  chosenPackage,
   copyChoices,
+  fontsChoice,
   packageGallery,
   partFromHash,
   previewPanes,
@@ -602,16 +602,16 @@ function fillPackages() {
   $('site-package-why').textContent = limits.siteFonts.disabled ? limits.siteFonts.reason : '';
 }
 
-/** The marked card, and a note when the look keeps a copy of fonts no longer offered. */
+/**
+ * The marked card, and a note when the look keeps a copy of fonts no longer offered, or of a
+ * package changed at its source since (whose card stays unmarked until it is chosen again).
+ */
 function showFonts() {
-  const chosen = chosenPackage(session.draft);
-  const offered = chosen === 'builtin:system' || allPackages().some((p) => p.from === chosen);
-  checkCard($('package-gallery'), offered ? chosen : '');
-  const fonts = session.draft.fonts;
-  $('fonts-source-note').hidden = offered || !fonts;
-  if (!offered && fonts) {
-    $('fonts-source-note').textContent = `This look keeps its own copy of the fonts ${fonts.name}, which are no longer offered here. Choose a package to change them.`;
-  }
+  const offered = allPackages().map((p) => p.from);
+  const { checked, note } = fontsChoice(session.draft, session.settings, offered);
+  checkCard($('package-gallery'), checked);
+  $('fonts-source-note').hidden = !note;
+  $('fonts-source-note').textContent = note ?? '';
 }
 
 async function deleteSitePackage(pkg) {

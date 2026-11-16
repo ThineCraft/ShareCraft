@@ -3,8 +3,8 @@
 // Delete permanently for deleted ones, each asked first where it takes something away. A link
 // to the Brand centre for administrators and brand managers. Live sites can be selected, and
 // "Apply a look…" applies one look to them all: another site's, a template's, or a brand-centre
-// theme and font package, previewed first, then applied in rounds with a progress list of
-// per-site results and a summary toast.
+// theme and font package (which changes only the theme and fonts), previewed first, then
+// applied in rounds with a progress list of per-site results and a summary toast.
 
 import {
   adminSiteRow,
@@ -23,7 +23,15 @@ import {
 } from './common.js';
 import { listFilter, mountAdminShell } from './admin-shell.js';
 import { lookCardElement } from './look-card-view.js';
-import { applyChunks, brandLookCard, bulkApplySummary, effectiveLookCard, templateLookCard } from './look-cards.js';
+import {
+  BULK_LOOK_WARNINGS,
+  applyChunks,
+  brandBulkSource,
+  brandLookCard,
+  bulkApplySummary,
+  effectiveLookCard,
+  templateLookCard,
+} from './look-cards.js';
 import { showToast } from './toast.js';
 
 const $ = (id) => document.getElementById(id);
@@ -196,17 +204,10 @@ function chosenSource() {
     return { kind, source: { template: id }, ready: Boolean(id) && Boolean(templateLooks.get(id)) };
   }
   const theme = $('source-theme').value;
-  const fonts = $('source-package').value;
-  const look = { theme: { from: theme } };
-  if (fonts && fonts !== 'builtin:system') look.fonts = { from: fonts };
-  return { kind, source: { look }, ready: Boolean(theme) };
+  return { kind, source: brandBulkSource(theme, $('source-package').value), ready: Boolean(theme) };
 }
 
-const WARNINGS = {
-  site: 'Each selected site gets the whole look of that site: its theme, fonts, pictures, header, navigation style and footer. The site’s own themes and font packages are not copied.',
-  template: 'Each selected site gets the whole look the template carries. Brand-centre pictures and fonts it names are pinned to each site.',
-  brand: 'Each selected site’s whole look is replaced: it gets this theme and these fonts, and its pictures, header and footer go back to the defaults.',
-};
+const WARNINGS = BULK_LOOK_WARNINGS;
 
 /** The preview of the chosen look, and whether Apply is on (saying why when it is not). */
 async function showChoice() {

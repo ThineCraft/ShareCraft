@@ -131,3 +131,19 @@ test('the bulk preview of a site in a hub shows the site’s own look', () => {
   assert.deepEqual(card.dark, { primary: '#8fd19e', secondary: '#16301c' });
   assert.deepEqual(card.fonts, system);
 });
+
+import { BULK_LOOK_WARNINGS, brandBulkSource } from './look-cards.js';
+
+test('a brand-centre theme and package applied in bulk change only the theme and fonts', () => {
+  const text = BULK_LOOK_WARNINGS.brand;
+  assert.doesNotMatch(text, /whole look/);
+  assert.doesNotMatch(text, /replace/i);
+  assert.doesNotMatch(text, /go back to the defaults/);
+  assert.match(text, /theme and fonts/);
+  assert.match(text, /logo/);
+  assert.match(text, /footer/);
+  assert.match(BULK_LOOK_WARNINGS.site, /whole look/);
+  assert.deepEqual(brandBulkSource('org:t1', 'org:p1'), { brand: { theme: 'org:t1', fonts: 'org:p1' } });
+  assert.deepEqual(brandBulkSource('builtin:plum', 'builtin:system'), { brand: { theme: 'builtin:plum' } });
+  assert.deepEqual(brandBulkSource('builtin:plum', ''), { brand: { theme: 'builtin:plum' } });
+});

@@ -1,6 +1,7 @@
 //! Applying a look to many sites at once, for administrators: one look given in full, the look
-//! of another site, or the look a template carries, applied to each site in turn, each with its
-//! own commit and history entry (see [`crate::looks`]).
+//! of another site, the look a template carries, or a brand-centre theme and font package
+//! (which change only the theme and fonts), applied to each site in turn, each with its own
+//! commit and history entry (see [`crate::looks`]).
 
 use axum::Json;
 use axum::extract::State;
@@ -37,6 +38,18 @@ pub(crate) enum Source {
     FromSite(String),
     /// The look this template carries: a saved template's id (a built-in carries none).
     Template(String),
+    /// A brand-centre theme and font package: only each site's theme and fonts change.
+    Brand(BrandSource),
+}
+
+/// A theme and font package to apply, each named as a look names its source (`builtin:<id>`
+/// or `org:<id>`); no `fonts` for the system fonts.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BrandSource {
+    theme: String,
+    #[serde(default)]
+    fonts: Option<String>,
 }
 
 /// The body of `POST /api/admin/looks/apply`.
@@ -47,11 +60,13 @@ pub(crate) struct ApplyBody {
     source: Source,
 }
 
-/// `POST /api/admin/looks/apply {sites: [id], source: {look} | {from_site} | {template}}`:
+/// `POST /api/admin/looks/apply {sites: [id], source: {look} | {from_site} | {template} |
+/// {brand: {theme, fonts?}}}`:
 /// applies one look to each of 1 to 200 sites, in the order given (an id given twice is applied
 /// once). Administrators only (`403`), who are never limited by the brand policy. Each site is
 /// changed as `PUT /api/sites/{id}/look`, a copy, or a site made from the template would change
-/// it, with its own commit and its own `site.look_changed` entry marked `applied_by_admin`; the
+/// it (a `brand` source changes only its theme and fonts, keeping its logo, thumbnail, tab
+/// icon, header, navigation, menu and footer), with its own commit and its own `site.look_changed` entry marked `applied_by_admin`; the
 /// same look again changes nothing. `422 invalid_request` for no sites, more than 200, or a
 /// source site that is not an id; `422 invalid_template {reason: "no_look"}` for a template
 /// that carries no look; `404` for an unknown template. `200` with `{results: [{site, ok,
@@ -79,6 +94,7 @@ pub(crate) async fn apply(
     let applied = match body.source {
         Source::Look(input) => Applied::Look(input),
         Source::FromSite(from) => Applied::FromSite(parse(&from)?),
+        Source::Brand(brand) => Applied::Brand(brand),
         Source::Template(id) => {
             let look = crate::templates::look_of(&state, &actor, &id)
                 .await?
@@ -112,6 +128,8 @@ enum Applied {
     FromSite(NodeId),
     /// The look of the template with this id.
     Template(String, Box<TemplateLook>),
+    /// A brand-centre theme and font package.
+    Brand(BrandSource),
 }
 
 /// Applies `applied` to `site` for `actor`, an administrator, marking its history entry
@@ -134,6 +152,11 @@ async fn apply_one(
         }
         Applied::Template(id, look) => {
             looks::apply_template_look(state, actor, site, id, look).await
+        }
+        Applied::Brand(brand) => {
+            let chosen = (brand.theme.as_str(), brand.fonts.as_deref());
+            looks::apply_brand(state, actor, site, chosen, marked()).await?;
+            Ok(Vec::new())
         }
     }
 }

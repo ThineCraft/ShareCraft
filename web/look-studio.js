@@ -188,6 +188,32 @@ export function chosenPackage(draft) {
   return draft?.fonts?.from ?? 'builtin:system';
 }
 
+/** The note shown while the look keeps a copy of a package that has changed at its source since. */
+export const FONTS_SOURCE_CHANGED = 'This font package changed in the brand centre — choose it again to use the new version.';
+
+/**
+ * Which font card the gallery marks for `draft` and the note beside it, `{checked, note}`
+ * (`checked` '' for none, `note` null for none). `settings` is the look settings
+ * (`{look, fonts_source_changed}`) and `offered` the sources of the packages offered. A kept
+ * copy (the stored one, unchanged) of a package that has changed at its source since is noted
+ * and its card left unmarked, so choosing it takes the new version; a kept copy of a package
+ * no longer offered is noted the same way.
+ */
+export function fontsChoice(draft, settings, offered = []) {
+  const chosen = chosenPackage(draft);
+  const fonts = draft?.fonts ?? null;
+  const isOffered = chosen === 'builtin:system' || offered.includes(chosen);
+  if (!isOffered && fonts) {
+    return {
+      checked: '',
+      note: `This look keeps its own copy of the fonts ${fonts.name}, which are no longer offered here. Choose a package to change them.`,
+    };
+  }
+  const stale = Boolean(fonts?.keep) && Boolean(settings?.fonts_source_changed) && settings?.look?.fonts?.from === fonts?.from;
+  if (stale) return { checked: '', note: FONTS_SOURCE_CHANGED };
+  return { checked: isOffered ? chosen : '', note: null };
+}
+
 // ---- The limits for site owners ----
 
 /** The choices the brand policy can turn off, in the order the studio shows them. */

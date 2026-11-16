@@ -29,7 +29,7 @@ use revisions::brand::{
     FontRef, FontRole, FooterGroup, FooterLayout, Header, HeaderLayout, ImageKind, ImageRef,
     KnownSources, Look, LookFonts, MAX_SITE_FONT_PACKAGES, MAX_SITE_THEMES, MenuStyle, Navigation,
     OrgBrand, OrgTheme, ResolvedTheme, TemplateLook, Theme, check_theme, clean_text, family_name,
-    icon_problem, image_policy_problems, policy_problems,
+    fonts_match_source, icon_problem, image_policy_problems, policy_problems,
 };
 use revisions::{SiteRecord, SiteTheme};
 use serde::Deserialize;
@@ -774,14 +774,96 @@ pub(crate) async fn change_look(
         org: &org,
     };
     history_keeps_available(&ctx, &input).await?;
+    let kept_fonts = matches!(
+        input.fonts,
+        Some(FontsChoice {
+            from: None,
+            keep: true
+        })
+    );
     let look = built_look(&ctx, &name, &before, input).await?;
-    allow_look(state, actor, &org, &look, &before, (&[], &[])).await?;
+    allow_look(
+        state,
+        actor,
+        &org,
+        &judged(&look, &before, kept_fonts),
+        &before,
+        (&[], &[]),
+    )
+    .await?;
     commit_look(
         state,
         actor,
         site,
         &name,
         (stored.clone(), before.clone()),
+        Some(look),
+        extra,
+    )
+    .await
+}
+
+/// `look` as the brand policy judges it, for a site whose record is `before`: fonts kept as
+/// they are (`kept_fonts`, a `{keep: true}`) that equal the copy the site holds now are the
+/// look already stored, so they are left out and not judged against their source again (a
+/// change of the source, or of the policy, applies to the next choice); anything else is
+/// judged as it is.
+fn judged(look: &Look, before: &SiteRecord, kept_fonts: bool) -> Look {
+    let stored = before.look.as_ref().and_then(|l| l.fonts.as_ref());
+    let mut out = look.clone();
+    if kept_fonts && look.fonts.is_some() && look.fonts.as_ref() == stored {
+        out.fonts = None;
+    }
+    out
+}
+
+/// Applies a brand-centre theme `theme` and font package `fonts` (both as `from`; no package
+/// for the system fonts) to `site` for `actor`, who needs `manage_site` on it, with the fields
+/// `extra` in its event's detail. Only the theme and fonts change: the site's logo, thumbnail,
+/// tab icon, header, navigation, menu and footer stay as they are, so its history records only
+/// those two parts as changed. Checked as any look is.
+///
+/// # Errors
+/// `422 invalid_theme` or `low_contrast` for the theme, `invalid_look` for an unknown package
+/// or a look that no longer passes; otherwise as [`set_look`].
+pub(crate) async fn apply_brand(
+    state: &AppState,
+    actor: &User,
+    site: NodeId,
+    (theme, fonts): (&str, Option<&str>),
+    extra: Extra,
+) -> Result<(), BrandError> {
+    let _turn = state.tree_lock().lock().await;
+    ensure_in_step(state).await?;
+    let name = managed(state, actor, site).await?;
+    let (stored, before) = record_and_start(state, site).await?;
+    let org = state.db().org_brand().await?;
+    let choice = ThemeChoice {
+        from: Some(theme.to_owned()),
+        ..ThemeChoice::default()
+    };
+    let (theme, from) = chosen_theme(choice, &org, &before.themes)?;
+    let fonts = match fonts {
+        Some(fonts) => Some(LookFonts {
+            package: source_package(fonts, &org, &before.font_packages)?,
+            from: fonts.to_owned(),
+        }),
+        None => None,
+    };
+    let mut look = before.look.clone().unwrap_or_default();
+    look.theme = theme;
+    look.from = from;
+    look.fonts = fonts;
+    if let Some(problem) = look.problem(&name) {
+        return Err(BrandError::InvalidLook(problem));
+    }
+    allow_look(state, actor, &org, &look, &before, (&[], &[])).await?;
+    commit_look(
+        state,
+        actor,
+        site,
+        &name,
+        (stored, before),
         Some(look),
         extra,
     )
@@ -907,7 +989,8 @@ fn site_package_out(package: &FontPackage) -> Value {
 }
 
 /// The look settings of `site` for `actor`: `{look, themes, font_packages,
-/// theme_source_changed, in_hub?}`.
+/// theme_source_changed, fonts_source_changed, in_hub?}`. `fonts_source_changed` is whether the
+/// look keeps a copy of a font package that has changed at its source since, or is gone.
 /// `in_hub` is `{id, name}` for a hub `actor` can see, as the effective look and `/hubs` name
 /// it, and `{hidden: true}` for one they cannot.
 async fn settings_answer(
@@ -928,6 +1011,14 @@ async fn settings_answer(
             .map(site_package_out)
             .collect::<Vec<_>>(),
         "theme_source_changed": source_changed(&look, &org, &settings.themes),
+        "fonts_source_changed": !fonts_match_source(
+            &look,
+            &KnownSources {
+                org: &org,
+                site_themes: &settings.themes,
+                site_packages: &settings.font_packages,
+            },
+        ),
     });
     if let Some((hub, _)) = lending_hub(db, &settings).await? {
         let named = if db.path(actor.id, hub).await?.is_some() {

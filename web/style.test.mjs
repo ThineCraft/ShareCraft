@@ -176,3 +176,19 @@ test('nested folders stay indented in the folder tree and the permission map (ro
   const reset = rules.findIndex((rule) => rule.selector.includes('[role=tree] [role=group]'));
   assert.ok(reset >= 0 && reset < rules.indexOf(group), 'the map indent comes after the tree reset');
 });
+
+test('mega menu columns are banded like the dropdowns, in light and dark', () => {
+  const rules = parseRules(SOURCE);
+  const banded = (selector) =>
+    rules.some(
+      (rule) =>
+        rule.at.length === 0 &&
+        rule.selector.split(',').map((s) => s.trim()).includes(selector) &&
+        rule.declarations.some(([property, value]) => property === 'background' && value === 'var(--band)'),
+    );
+  assert.ok(banded('.navbar .sub li:nth-child(even)'));
+  assert.ok(banded('.navbar .mega-panel li:nth-child(even)'));
+  // The band is a mix of the text colour, so it follows the light and dark text colours.
+  const band = rules.find((rule) => rule.selector === ':root' && rule.declarations.some(([p]) => p === '--band'));
+  assert.match(band.declarations.find(([p]) => p === '--band')[1], /var\(--text\)/);
+});

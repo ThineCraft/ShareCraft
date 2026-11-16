@@ -334,6 +334,7 @@ a.navhead{text-decoration:none}
 /* narrower wide screens: at most two columns side by side */
 @media (min-width:761px) and (max-width:1000px){.navbar .mega-columns:is([data-columns="3"],[data-columns="4"]){--mega-columns:2}}
 .navbar .mega-panel ul{flex-direction:column;align-items:stretch;flex-wrap:nowrap;gap:0}
+.navbar .mega-panel li:nth-child(even){background:var(--band)}
 .navbar .mega-overview{margin:0 0 var(--space-2);font-weight:600}
 .navbar .mega-overview a{display:inline-block;padding:var(--space-1) var(--space-3);border-radius:var(--radius-sm)}
 .navbar .mega-heading{margin:0 0 var(--space-1);padding:var(--space-1) var(--space-3);font-family:var(--font-heading);font-size:var(--text-md);font-weight:600;color:var(--text)}

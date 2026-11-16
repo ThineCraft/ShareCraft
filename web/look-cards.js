@@ -72,6 +72,24 @@ export function brandLookCard(theme, pkg = null) {
   };
 }
 
+/** What applying a look to the selected sites does, for each source (`site`, `template`, `brand`). */
+export const BULK_LOOK_WARNINGS = Object.freeze({
+  site: 'Each selected site gets the whole look of that site: its theme, fonts, pictures, header, navigation style and footer. The site’s own themes and font packages are not copied.',
+  template: 'Each selected site gets the whole look the template carries. Brand-centre pictures and fonts it names are pinned to each site.',
+  brand: 'Each selected site gets this theme and fonts. Its logo, thumbnail, tab icon, header, navigation, menu and footer stay as they are.',
+});
+
+/**
+ * The `source` of `POST /api/admin/looks/apply` for a brand-centre theme `theme` and font
+ * package `fonts` (both as `from`): `{brand: {theme, fonts?}}`, the fonts left out for the
+ * system fonts or none.
+ */
+export function brandBulkSource(theme, fonts) {
+  const brand = { theme };
+  if (fonts && fonts !== 'builtin:system') brand.fonts = fonts;
+  return { brand };
+}
+
 /** The slots of a look in words. */
 const SLOT_WORDS = Object.freeze({
   logo: 'the logo',

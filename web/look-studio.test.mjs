@@ -223,3 +223,26 @@ test('the tabs mark fonts, the tab icon and the menu style as changes', () => {
   assert.ok(STUDIO_PARTS.includes('fonts'));
   assert.equal(STUDIO_PARTS.indexOf('fonts'), 1, 'Fonts come after Theme');
 });
+
+import { FONTS_SOURCE_CHANGED, fontsChoice } from './look-studio.js';
+
+test('a kept font copy whose package changed in the brand centre is noted and its card left unchosen', () => {
+  const pkg = { name: 'Brand', roles: { title: 'display', heading: 'display', body: 'system', interactive: 'system' } };
+  const look = { from: 'builtin:plum', fonts: { from: 'org:p1', package: pkg } };
+  const offered = ['builtin:system', 'builtin:classic', 'org:p1'];
+  const draft = draftFromLook(look);
+  // The source is unchanged: the card is chosen and there is no note.
+  assert.deepEqual(fontsChoice(draft, { look, fonts_source_changed: false }, offered), { checked: 'org:p1', note: null });
+  // Changed at its source: the note asks to choose it again, and no card is chosen.
+  const changed = { look, fonts_source_changed: true };
+  assert.equal(FONTS_SOURCE_CHANGED, 'This font package changed in the brand centre — choose it again to use the new version.');
+  assert.deepEqual(fontsChoice(draft, changed, offered), { checked: '', note: FONTS_SOURCE_CHANGED });
+  // Once it is picked (sent as {from}), its card is chosen and the note goes.
+  const picked = { ...draft, fonts: { ...draft.fonts, keep: false } };
+  assert.deepEqual(fontsChoice(picked, changed, offered), { checked: 'org:p1', note: null });
+  // A copy of a package no longer offered keeps the older note; the system fonts are always offered.
+  const gone = fontsChoice(draft, changed, ['builtin:system']);
+  assert.equal(gone.checked, '');
+  assert.match(gone.note, /no longer offered/);
+  assert.deepEqual(fontsChoice(draftFromLook({ from: 'builtin:plum' }), changed, offered), { checked: 'builtin:system', note: null });
+});

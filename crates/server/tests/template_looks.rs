@@ -989,6 +989,112 @@ async fn bulk_apply_reports_per_site() {
 }
 
 #[tokio::test]
+async fn bulk_theme_and_fonts_keep_each_sites_identity() {
+    let server = spawn_server().await;
+    let root = server.admin("Root").await;
+    let b = branded(&server, &root).await;
+    let second = plain_site(&server, &root, "Second").await;
+    set_look(
+        &server,
+        &root,
+        &second,
+        json!({
+            "theme": { "from": "builtin:sharecraft" },
+            "logo_alt": "Second",
+            "header": { "layout": "standard", "background": "soft" },
+            "navigation": "vertical",
+            "footer": { "enabled": true, "name": "Second Co" },
+        }),
+    )
+    .await;
+    let before_events = events(&server, "site.look_changed").await.len();
+    let looks_before = [
+        record(&server, &b.site).look.unwrap(),
+        record(&server, &second).look.unwrap(),
+    ];
+
+    let (status, answer) = apply(
+        &server,
+        Some(&root),
+        json!({ "sites": [b.site, second],
+                "source": { "brand": { "theme": "builtin:forest",
+                                       "fonts": "builtin:classic" } } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(
+        answer["results"],
+        json!([{ "site": b.site, "ok": true }, { "site": second, "ok": true }]),
+        "{answer}"
+    );
+    for (site, before) in [&b.site, &second].into_iter().zip(&looks_before) {
+        let after = record(&server, site).look.unwrap();
+        assert_eq!(after.from, "builtin:forest");
+        assert_eq!(after.fonts.as_ref().unwrap().from, "builtin:classic");
+        // Everything but the theme and fonts is the site's own, as it was.
+        let mut expected = before.clone();
+        expected.theme = after.theme.clone();
+        expected.from = after.from.clone();
+        expected.fonts = after.fonts.clone();
+        assert_eq!(after, expected);
+    }
+    assert_eq!(
+        record(&server, &b.site).look.unwrap().logo.unwrap().sha256,
+        sha(&b.logo)
+    );
+    assert_eq!(
+        record(&server, &b.site)
+            .look
+            .unwrap()
+            .thumbnail
+            .unwrap()
+            .sha256,
+        sha(&b.thumb)
+    );
+
+    // Each history entry changes only the theme and the fonts.
+    let changed = events(&server, "site.look_changed").await;
+    assert_eq!(changed.len(), before_events + 2);
+    for detail in &changed[before_events..] {
+        assert_eq!(detail["applied_by_admin"], true, "{detail}");
+        let mut before = detail["before"].clone();
+        let mut after = detail["after"].clone();
+        for side in [&mut before, &mut after] {
+            let map = side.as_object_mut().unwrap();
+            for key in ["theme", "from", "fonts"] {
+                map.remove(key);
+            }
+        }
+        assert_eq!(before, after, "{detail}");
+        assert_ne!(
+            detail["before"]["from"], detail["after"]["from"],
+            "{detail}"
+        );
+    }
+
+    // Without a package the sites take the system fonts; an unknown source is refused.
+    let (status, answer) = apply(
+        &server,
+        Some(&root),
+        json!({ "sites": [second], "source": { "brand": { "theme": "builtin:plum" } } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    let look = record(&server, &second).look.unwrap();
+    assert!(look.fonts.is_none());
+    assert_eq!(look.footer.name, "Second Co");
+    let (status, answer) = apply(
+        &server,
+        Some(&root),
+        json!({ "sites": [second],
+                "source": { "brand": { "theme": "builtin:plum", "fonts": "builtin:nothing" } } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer["results"][0]["ok"], false, "{answer}");
+}
+
+#[tokio::test]
 async fn bulk_apply_records_history_per_site() {
     let server = spawn_server().await;
     let root = server.admin("Root").await;
