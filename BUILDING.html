@@ -29,7 +29,7 @@ table.banded tbody tr:nth-child(even)>td{background:light-dark(#f4f8f7,#212b30)}
 </header>
 <div class="layout">
 <nav aria-label="Document contents"><p>In this document</p>
-<a href="#need">01 · What you need</a><a href="#build">02 · Build and check</a><a href="#admin">03 · The first administrator</a><a href="#run">04 · Run it and sign in</a><a href="#settings">05 · Settings</a><a href="#accounts">06 · Accounts and signing in</a><a href="#sharing">07 · Sharing and roles</a><a href="#removed">08 · What a removed person sees</a><a href="#data">09 · Where data is kept</a><a href="#index">10 · The revision index</a><a href="#events">11 · Events</a><a href="#stop">12 · Stopping the server, and notices</a><a href="#editors">13 · Building the editors</a><a href="#files">14 · Opening a file document</a><a href="#session">15 · File session, seat and saving</a><a href="#content">16 · Content routes</a><a href="#tree">17 · The content tree and routes</a><a href="#treegit">18 · The tree in Git and PostgreSQL</a><a href="#upgrade">19 · Upgrading</a><a href="#policy">20 · The editor pages' policy</a><a href="#limits">21 · Known limits</a><a href="#scale">22 · A library of 100,000 files</a><a href="#groups">23 · Groups, roles and the explorer</a><a href="#links">24 · Sharing links and requests</a><a href="#storage">25 · Files, bin and quotas</a><a href="#sites">26 · Sites and navigation</a><a href="#libraries">27 · Libraries</a><a href="#branding">28 · Branding</a><a href="#licences">29 · Licences</a>
+<a href="#need">01 · What you need</a><a href="#build">02 · Build and check</a><a href="#admin">03 · The first administrator</a><a href="#run">04 · Run it and sign in</a><a href="#settings">05 · Settings</a><a href="#accounts">06 · Accounts and signing in</a><a href="#sharing">07 · Sharing and roles</a><a href="#removed">08 · What a removed person sees</a><a href="#data">09 · Where data is kept</a><a href="#index">10 · The revision index</a><a href="#events">11 · Events</a><a href="#stop">12 · Stopping the server, and notices</a><a href="#editors">13 · Building the editors</a><a href="#files">14 · Opening a file document</a><a href="#session">15 · File session, seat and saving</a><a href="#content">16 · Content routes</a><a href="#tree">17 · The content tree and routes</a><a href="#treegit">18 · The tree in Git and PostgreSQL</a><a href="#upgrade">19 · Upgrading</a><a href="#policy">20 · The editor pages' policy</a><a href="#limits">21 · Known limits</a><a href="#scale">22 · A library of 100,000 files</a><a href="#groups">23 · Groups, roles and the explorer</a><a href="#links">24 · Sharing links and requests</a><a href="#storage">25 · Files, bin and quotas</a><a href="#sites">26 · Sites and navigation</a><a href="#libraries">27 · Libraries</a><a href="#branding">28 · Branding</a><a href="#branding2">29 · Branding, part two</a><a href="#licences">30 · Licences</a>
 </nav>
 <main id="main">
 <div class="toolbar"><span class="small">Standalone HTML · Print-ready · No external assets</span><button type="button" onclick="window.print()">Print / Save PDF</button></div>
@@ -1395,7 +1395,7 @@ refs/sharecraft/sites                                          the last commit t
 </tbody></table></div>
 
 <h3>Upgrading: migration 0014</h3>
-<p><code>0014_libraries</code> adds the <code>libraries</code> table (a row with the defaults for every existing library), widens the editor check on documents to take <code>other</code>, adds the scan columns to <code>blobs</code> (every existing row is <code>unscanned</code>) and adds the settings rows for the blocked types and the scanner. The server also starts keeping thumbnails in a new <code>thumbs</code> folder of the data folder, and builds with the <code>image</code> crate (section 29). Like the earlier migrations it is <strong>one way</strong>: a server from before this plan cannot run against the database afterwards. <strong>Back up the data folder and the database together before upgrading</strong> (section 19). The first start after the upgrade writes no library files; each is written at the library's first change.</p>
+<p><code>0014_libraries</code> adds the <code>libraries</code> table (a row with the defaults for every existing library), widens the editor check on documents to take <code>other</code>, adds the scan columns to <code>blobs</code> (every existing row is <code>unscanned</code>) and adds the settings rows for the blocked types and the scanner. The server also starts keeping thumbnails in a new <code>thumbs</code> folder of the data folder, and builds with the <code>image</code> crate (section 30). Like the earlier migrations it is <strong>one way</strong>: a server from before this plan cannot run against the database afterwards. <strong>Back up the data folder and the database together before upgrading</strong> (section 19). The first start after the upgrade writes no library files; each is written at the library's first change.</p>
 
 <h3>What was checked, and what was not</h3>
 <p>The server and web tests pass. The pages were also checked by hand in a browser on 14 November 2026 against a real server and database after migration 0014, with the stand-in scanner: scanner settings and Test; uploads of a <code>.png</code>, <code>.zip</code>, <code>.txt</code> and <code>.html</code>, each held and then available; previews of an image, text and an HTML file shown as text, and "No preview for this type" for a <code>.zip</code>; an image library with a grid of thumbnails and a <code>.zip</code> refused with a plain message; a template library and New from template; folders off; the organisation's block list (<code>.exe, .bat</code>, with <code>Setup.EXE</code> refused); the scanner stopped, a new upload waiting, and the scanner restarted with the file clean about 80 seconds later; the Quarantine page with a file holding the test string quarantined with its threat name, Release with a reason, and Delete with its confirmation; and the library page at 375 pixels wide in dark mode with banded rows. There were no errors in the server log.</p>
@@ -1413,7 +1413,7 @@ refs/sharecraft/sites                                          the last commit t
 </section>
 
 <section id="branding"><h2>28 / Branding: the brand centre and site looks</h2>
-<p>Added on 15 November 2026 (plan 4A, on the branch <code>platform-branding</code>, not yet merged). The organisation now keeps approved themes and brand images in one <strong>brand centre</strong>. Each site can have its own <strong>look</strong>: a theme that works in light and dark mode, a logo and a logo thumbnail, a header layout, a navigation style and a footer. Owners preview a look before they apply it, and can go back to an earlier one. ShareCraft's own controls stay neutral. Status colours and warnings are never recoloured. Branding never gives or takes away access. The owner's decisions behind this are D40 to D45 in <a href="scope.html">scope.html</a>. Font packages, copying a look from another site, branding in templates, limiting owners to approved options, mega menus, the browser-tab icon and branded emails wait for plan 4B (D40).</p>
+<p>Added on 15 November 2026 (plan 4A, on the branch <code>platform-branding</code>, not yet merged). The organisation now keeps approved themes and brand images in one <strong>brand centre</strong>. Each site can have its own <strong>look</strong>: a theme that works in light and dark mode, a logo and a logo thumbnail, a header layout, a navigation style and a footer. Owners preview a look before they apply it, and can go back to an earlier one. ShareCraft's own controls stay neutral. Status colours and warnings are never recoloured. Branding never gives or takes away access. The owner's decisions behind this are D40 to D45 in <a href="scope.html">scope.html</a>. Font packages, copying a look from another site, branding in templates, limiting owners to approved options, mega menus and the browser-tab icon came with plan 4B (section 29). Branded emails wait for the features that send them.</p>
 <div class="note"><p><strong>Who does what.</strong> Anyone signed in can read the brand centre and see brand images. <strong>Brand managers</strong> and administrators change the brand centre's themes and images. Only administrators name the brand managers (D45). A person with <code>manage_site</code> (a site's Owners) changes the site's look and its own themes. On an archived site, look and theme changes answer <code>403 archived</code>, but the look is still shown.</p></div>
 
 <h3>The records</h3>
@@ -1493,11 +1493,11 @@ sites/&lt;xx&gt;/&lt;site id&gt;.json                          a site's settings
 </tbody></table></div>
 <h3>Pinning: <code>brand_refs</code></h3>
 <p>An image in use pins its content in the content store (section 25). The table <code>brand_refs</code> has one row per content and owner: <code>org</code> for the brand centre, or a site's id for its look. A row is written in the same transaction as the mirror change that names the image, after the content's <code>blobs</code> row is locked. Erasure counts these rows as it counts versions, so content is never erased while a brand image uses it. When the last use goes (an image removed, a logo switched, a site purged), the content is erased unless something else names it. Reconcile rebuilds the rows from Git.</p>
-<div class="note"><p><strong>Upgrade: migration 0016 (plan 4B, brand fonts).</strong> Font files are pinned in <code>brand_refs</code> exactly as images are, so <code>0016_brand_fonts.sql</code> widens the check on <code>brand_refs.media_type</code> to the four font types (<code>font/woff2</code>, <code>font/woff</code>, <code>font/ttf</code>, <code>font/otf</code>) and adds <code>sites.font_packages</code> (a site's own font packages, mirrored from its record; empty for every existing site). Nothing else changes: existing records keep their exact bytes, and reconcile fills the new column from Git. A server from before plan 4B refuses to start on the upgraded database (it finds a migration it does not know), so back up the database before upgrading. Fonts are served at <code>GET /api/brand/fonts/&lt;sha256&gt;</code> to anyone signed in, with <code>Content-Security-Policy: sandbox; default-src 'none'</code> and <code>Cross-Origin-Resource-Policy: same-origin</code>.</p></div>
+<p>Plan 4B pins font files in <code>brand_refs</code> the same way (section 29).</p>
 <p><strong>Quarantine delete</strong> (section 27) does not erase content that the brand centre or a site look still uses. Its answer has <code>erased: false</code> and <code>pinned_by_brand</code>, which names who uses it (<code>{owner: "org"}</code> or <code>{owner: "site", id, name}</code>), and the quarantine page says so in plain words. <strong>Change the brand to remove it</strong>: take the image out of the brand centre or the look. Until then the content stays held and is never served.</p>
 
 <h3>The hub rule</h3>
-<p>A site that joined a hub uses the <strong>hub's theme</strong> (D42). Its own logo, header, navigation style and footer stay its own. Its own theme is kept, unused, and comes back when it leaves the hub. The owner can still edit it while the site is in a hub, and Change the look says the hub's theme is in use. The rule is worked out each time a look is read and never written, so joining, leaving, the hub changing its theme, unregistering the hub, and archiving or deleting it never overwrite a site's own theme. An archived hub still lends its theme; a deleted one does not. The hub is named only to people who can see it.</p>
+<p>A site that joined a hub uses the <strong>hub's theme and the hub's fonts</strong> (D42; fonts since plan 4B, section 29). Its own logo, header, navigation style, tab icon and footer stay its own. Its own theme and fonts are kept, unused, and comes back when it leaves the hub. The owner can still edit it while the site is in a hub, and Change the look says the hub's theme is in use. The rule is worked out each time a look is read and never written, so joining, leaving, the hub changing its theme, unregistering the hub, and archiving or deleting it never overwrite a site's own theme. An archived hub still lends its theme; a deleted one does not. The hub is named only to people who can see it.</p>
 
 <h3>How pages show the look</h3>
 <ul>
@@ -1586,7 +1586,216 @@ sites/&lt;xx&gt;/&lt;site id&gt;.json                          a site's settings
 </ul>
 </section>
 
-<section id="licences"><h2>29 / Licences</h2>
+<section id="branding2"><h2>29 / Branding, part two: fonts, owner limits, copying, templates and tab icons</h2>
+<p>Added on 16 November 2026 (plan 4B, on the branch <code>platform-branding-4b</code>, not yet merged). It finishes SC-25 and builds on section 28. It adds font packages, limits on what site owners may choose, copying a look from another site, looks inside site templates, applying a look to many sites at once, a browser-tab icon for each site, and a mega menu. The owner's decisions behind it are D46 to D53 in <a href="scope.html">scope.html</a>. <strong>Not in this plan:</strong> branded notification emails and public portals (those features do not exist yet, SC-13 and SC-18), a branded sign-in page, variable-font controls, and fonts inside the editors.</p>
+<div class="note"><p><strong>Who does what.</strong> Brand managers and administrators add fonts, make font packages and set the default tab icon. Only administrators set the limits on site owners, and only they apply a look to many sites at once. A person with <code>manage_site</code> changes a site's look, its own font packages, and copies a look onto it. The limits bind only site owners; administrators and brand managers may always choose anything.</p></div>
+
+<h3>Fonts</h3>
+<p>A font file is a snapshot, like a brand image (section 28): <code>{sha256, media_type, bytes, name, from_doc, licence: {confirmed_by, confirmed_at}}</code>. A later change to the file, or its deletion, leaves the brand as it was. Choosing one needs <code>view</code> on the document.</p>
+<ul>
+<li><strong>Where from.</strong> The brand centre takes fonts from asset libraries (<code>POST /api/brand/fonts {doc, licence_confirmed, name?}</code>). A site's own font package may also take them from that site's own libraries. Anywhere else is <code>400 wrong_place</code>.</li>
+<li><strong>Licence.</strong> Whoever adds a font confirms that the organisation holds its licence. Without <code>licence_confirmed: true</code> the answer is <code>422 licence_not_confirmed</code>, and the page keeps Add off until the box is ticked. The record notes who confirmed it and when.</li>
+<li><strong>Size and state.</strong> At most 2 MiB (<code>413 font_too_large</code>). Content held by the malware scanner cannot be chosen (<code>423 held</code>). The brand centre holds at most 30 fonts.</li>
+<li><strong>Names on the page are generated.</strong> Pages load a font under the family <code>sc-</code> followed by the first 12 hex characters of its SHA-256, never under its own name or any text a person typed. Fonts are never loaded from outside the installation.</li>
+</ul>
+<div class="table-wrap"><table class="banded"><caption>Font types, judged by the first bytes of the content and never by the name. Anything else is <code>422 not_a_font</code>.</caption>
+<thead><tr><th>Type</th><th>The file starts with</th></tr></thead>
+<tbody>
+<tr><td><code>font/woff2</code></td><td><code>wOF2</code></td></tr>
+<tr><td><code>font/woff</code></td><td><code>wOFF</code></td></tr>
+<tr><td><code>font/ttf</code></td><td>The bytes <code>00 01 00 00</code>, or <code>true</code></td></tr>
+<tr><td><code>font/otf</code></td><td><code>OTTO</code></td></tr>
+</tbody></table></div>
+
+<h3>The font route</h3>
+<p><code>GET /api/brand/fonts/&lt;sha256&gt;</code> serves a font to anyone signed in. A signed-out visitor, and content that no brand font, font package or look names, get <code>404</code>. Content that is no longer available answers <code>423 held</code>. Pages load fonts only through the browser's <code>FontFace</code> API from this route, so the page security policy is unchanged.</p>
+<div class="table-wrap"><table class="banded"><caption>Headers of a font</caption>
+<thead><tr><th>Header</th><th>Value</th></tr></thead>
+<tbody>
+<tr><td><code>Content-Type</code></td><td>The type judged from the content when the font was added.</td></tr>
+<tr><td><code>X-Content-Type-Options</code></td><td><code>nosniff</code></td></tr>
+<tr><td><code>Content-Security-Policy</code></td><td><code>sandbox; default-src 'none'</code></td></tr>
+<tr><td><code>Cache-Control</code></td><td><code>private, max-age=31536000, immutable</code></td></tr>
+<tr><td><code>Cross-Origin-Resource-Policy</code></td><td><code>same-origin</code>, so only this server's pages can load it.</td></tr>
+</tbody></table></div>
+<p><strong>Pinning.</strong> Fonts pin their content in <code>brand_refs</code> exactly as images do (section 28): one row per content and owner (<code>org</code> or a site's id), written in the same transaction as the change, with the content's <code>blobs</code> row locked. When the last use goes (a font removed, a package deleted, a look changed, a site purged), the content is erased unless something else names it. Reconcile rebuilds the rows from Git. A template's references pin nothing until a site is made from it.</p>
+
+<h3>Font packages and roles</h3>
+<p>A font package pairs a <strong>display</strong> font with a <strong>content</strong> font and gives each of four text roles one of <code>display</code>, <code>content</code>, <code>system</code> or <code>system-serif</code>. Its shape is <code>{id, name, display?, content?, roles: {title, heading, body, interactive}}</code>. A role may not name a font the package lacks (<code>422 invalid_font_package {reason}</code>). Names are 1 to 60 characters and unique, ignoring case (<code>409 name_taken</code>). The brand centre holds at most 20 packages, and each site at most 10 of its own (<code>409 too_many</code>).</p>
+<div class="table-wrap"><table class="banded"><caption>The four roles</caption>
+<thead><tr><th>Role</th><th>Where it shows</th><th>CSS variable</th></tr></thead>
+<tbody>
+<tr><td>Title</td><td>The site name and the page title.</td><td><code>--font-title</code></td></tr>
+<tr><td>Heading</td><td>Headings, including mega menu column headings.</td><td><code>--font-heading</code></td></tr>
+<tr><td>Body</td><td>Body text and list rows.</td><td><code>--font-body</code></td></tr>
+<tr><td>Interactive</td><td>Buttons and other controls.</td><td><code>--font-interactive</code></td></tr>
+</tbody></table></div>
+<div class="table-wrap"><table class="banded"><caption>Built-in packages (no files)</caption>
+<thead><tr><th>Id</th><th>Roles</th></tr></thead>
+<tbody>
+<tr><td><code>builtin:system</code></td><td>Every role uses the system fonts. This is the look before plan 4B.</td></tr>
+<tr><td><code>builtin:classic</code></td><td>Title and heading use the system serif fonts; body and interactive use the system fonts.</td></tr>
+</tbody></table></div>
+<ul>
+<li><strong>Packages are copied into the look</strong>, as themes are (D44). A look holds <code>fonts: {package copy, from}</code>, where <code>from</code> is <code>builtin:&lt;id&gt;</code>, <code>org:&lt;id&gt;</code> or <code>site:&lt;id&gt;</code>. Editing or deleting a package never changes a site. The look settings say <code>fonts_source_changed</code>, and Change the look shows "This package changed in the brand centre — choose it again to use the new version" and leaves the card unchosen until it is picked again.</li>
+<li><strong>Keeping the copy.</strong> <code>PUT /api/sites/&lt;id&gt;/look</code> takes <code>fonts</code> as <code>{from}</code> (copy that package now) or <code>{keep: true}</code> (keep the copy the look holds, even after its source is gone).</li>
+<li><strong>Fixed fallbacks.</strong> Every role falls back to the system fonts. The stacks are fixed strings in <code>web/look.js</code>: system is <code>ui-sans-serif, system-ui, 'Segoe UI', sans-serif</code>; system serif is <code>ui-serif, Georgia, 'Times New Roman', serif</code>. A font that fails to load leaves the system stack, with no error shown.</li>
+<li><strong>Never restyled:</strong> the account bar, the never-themed list from section 28, code and monospace text, and the editors. Pages set the four <code>--font-*</code> variables through the CSS object model, and each value is checked against a fixed pattern first.</li>
+</ul>
+
+<h3>Limits for site owners</h3>
+<p>The brand centre keeps one policy of five switches. <strong>Every limit starts off</strong>, so nothing changes until an administrator sets one (<code>PUT /api/brand/policy</code>, administrators only, recorded as <code>brand.policy_changed</code> with before and after). The limits bind <strong>site owners only</strong>: a person with <code>manage_site</code> who is neither an administrator nor a brand manager. In Change the look, a choice a limit forbids is shown disabled with the reason, never hidden.</p>
+<div class="table-wrap"><table class="banded"><caption>The limits</caption>
+<thead><tr><th>Switch</th><th>Off by default means</th><th>When set, a site owner cannot</th></tr></thead>
+<tbody>
+<tr><td><code>hide_builtin_themes</code></td><td><code>false</code>: built-in themes offered</td><td>Choose a built-in theme.</td></tr>
+<tr><td><code>custom_colours</code></td><td><code>true</code>: own colours allowed</td><td>Type their own colours.</td></tr>
+<tr><td><code>site_themes</code></td><td><code>true</code>: site themes allowed</td><td>Make or use themes only their site offers.</td></tr>
+<tr><td><code>site_images</code></td><td><code>true</code>: site images allowed</td><td>Use images from the site's own libraries (only brand-centre images).</td></tr>
+<tr><td><code>site_fonts</code></td><td><code>true</code>: site fonts allowed</td><td>Make or use font packages only their site offers.</td></tr>
+</tbody></table></div>
+<ul>
+<li><strong>Every path is checked</strong> by one server check: setting a look, rolling back, copying, making or changing a site theme or site font package, and making a site from a template when the person is not an administrator. Today only administrators make sites, so that last path is covered by unit tests only.</li>
+<li><strong>Refusal.</strong> <code>409 not_allowed {"problems": [...]}</code>, each problem in words, for example "custom colours are turned off for site owners".</li>
+<li><strong>Labels are not trusted.</strong> A theme or package whose copy differs from the source its <code>from</code> names counts as custom colours, or as site-only fonts, whatever it is labelled.</li>
+<li><strong>Ruling: a stored look is never changed by a limit.</strong> Turning a limit on applies to the next change. Looks already stored keep working.</li>
+<li><strong>Ruling: a kept font copy is never judged again.</strong> <code>fonts: {keep: true}</code> keeps the stored copy, so it is not checked against its source or the limits again. That holds after a brand manager edits or deletes the package, and after <code>site_fonts</code> is turned off. An owner may keep an old copy for as long as they like.</li>
+</ul>
+
+<h3>Copying a look</h3>
+<p><code>POST /api/sites/&lt;id&gt;/look/copy {from, themes?, fonts?}</code> copies another site's look onto this one. It needs <code>view</code> on the source and <code>manage_site</code> on the target; an archived target answers <code>403 archived</code>. The look itself (theme, images, fonts, header, navigation, menu, footer and tab icon) is copied as snapshots pinned to the target, in one commit, recorded as <code>site.look_changed</code> with <code>copied_from</code>. It is checked like any look and held to the limits.</p>
+<ul>
+<li><strong>Site themes and site font packages</strong> are copied only when asked (<code>themes: true</code>, <code>fonts: true</code>). A theme copied from a site theme that is not copied becomes <code>custom</code>.</li>
+<li><strong>Ruling: the look's own site font package always comes along.</strong> If the look's fonts come from one of the source site's own packages, that one package is copied into the target as a site package, even with <code>fonts: false</code>, so the copy stays complete and can be saved again. It counts as site-only fonts under the limits, and can fail with <code>name_taken</code> or <code>too_many</code> on the target.</li>
+<li><strong>The source's own look is copied</strong>, not a hub's. The copy dialog previews it as a draft before Apply (see <code>own</code> below).</li>
+</ul>
+
+<h3>The tab icon</h3>
+<p>A look may name an <strong>icon</strong>: a PNG or SVG brand image, square within 10%, at least 32 pixels a side for a PNG, and at most 256 KiB (<code>422 not_an_icon</code> otherwise). Pages set the tab icon (<code>&lt;link rel="icon"&gt;</code>) in this order:</p>
+<div class="table-wrap"><table class="banded"><caption>Tab icon fallback order</caption>
+<thead><tr><th>Order</th><th>Icon</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>The site look's own icon.</td></tr>
+<tr><td>2</td><td>The site's thumbnail.</td></tr>
+<tr><td>3</td><td>The organisation's default icon, a brand image of kind <code>icon</code> set with <code>PUT /api/brand/default-icon {image}</code>.</td></tr>
+<tr><td>4</td><td>ShareCraft's own icon, <code>web/favicon.svg</code> (served at <code>/favicon.svg</code>).</td></tr>
+</tbody></table></div>
+<p>Pages outside any site use the organisation's default icon, or ShareCraft's own. The icon is part of a site's own look, so a site in a hub keeps its own icon.</p>
+
+<h3>The mega menu</h3>
+<p>A look's <code>menu</code> is <code>cascading</code> (the dropdown lists from section 26; the default) or <code>mega</code>. Mega works with horizontal navigation only; with vertical navigation the look is refused (<code>422 invalid_look</code>, "a mega menu needs horizontal navigation").</p>
+<ul>
+<li><strong>The panel.</strong> Each top-level link with sub-links becomes a button that opens a full-width panel under the bar. Navigation has one level of sub-links, so the panel holds those links spread over balanced columns: one column for every 6 links, at most 4 (9 links make columns of 5 and 4). Between 761 and 1,000 pixels wide, at most 2 columns sit side by side. Rows are banded in light and dark mode.</li>
+<li><strong>Keys.</strong> Escape closes the panel and returns focus to its button; the arrow keys move between top-level buttons; Tab moves through the panel's links.</li>
+<li><strong>Audiences</strong> still decide who sees each link. A hidden link is never sent to people outside its audience.</li>
+<li><strong>Phones.</strong> At 760 pixels and narrower there is no panel: the navigation is in the Menu drawer, as before, with the sub-links as a nested list.</li>
+</ul>
+
+<h3>The effective look and the hub rule</h3>
+<p><code>GET /api/sites/&lt;id&gt;/look</code> now also gives <code>fonts</code> (<code>{title, heading, body, interactive}</code>, each <code>{family, url?}</code>), <code>icon_url</code> (<code>null</code> means ShareCraft's own) and <code>navigation_menu</code>. A site in a hub takes the hub's theme <strong>and fonts</strong> (section 28). For such a site it also gives <code>own: {theme, fonts}</code>: the site's own theme and fonts, resolved the same way. That is what copying the site's look writes, so the copy and bulk-apply previews use <code>own</code> when it is there.</p>
+
+<h3>Looks in templates</h3>
+<p>A saved template may carry a look (<code>TemplateBody.look</code>). Its images and fonts are <strong>references only</strong>, <code>{brand_image: id}</code> or <code>{brand_font: id}</code>, so a template holds no files. Built-in templates carry no look and are unchanged.</p>
+<ul>
+<li><strong>Saving from a site</strong> (<code>POST /api/sites/&lt;id&gt;/template</code>) turns each pinned snapshot that matches a brand-centre entry into a reference, and leaves the rest out. The answer lists them as <code>dropped: [{slot, name}]</code>; the slots are <code>logo</code>, <code>thumbnail</code>, <code>icon</code>, <code>header.image</code>, <code>footer.logo</code>, <code>fonts.display</code> and <code>fonts.content</code>. A site-only font package travels as its name, roles and brand-font references.</li>
+<li><strong>Making a site from a template</strong> resolves the references, pins them and writes the look in the site's first commit. References that cannot be filled are left out and listed in the create answer as <code>unresolved: [{slot, id}]</code>.</li>
+<li><strong>Importing a package</strong> (<code>POST /api/templates/import</code>) leaves out references to brand-centre images or fonts this organisation does not have, and lists them as <code>unresolved</code>.</li>
+<li><strong>Pages.</strong> The Templates list and the New site wizard's cards show each template's look as a swatch and font sample, read from <code>GET /api/templates/&lt;id&gt;/package</code>; <code>GET /api/templates</code> is unchanged.</li>
+</ul>
+
+<h3>Applying a look to many sites</h3>
+<p><code>POST /api/admin/looks/apply {sites, source}</code>, from Admin › Sites: select sites, then Apply a look…. <strong>Administrators only</strong> (<code>403</code>). One request covers <strong>1 to 200 sites</strong> (<code>422 invalid_request</code> otherwise); a site given twice is applied once. Sites are changed one at a time, each with its own commit and its own <code>site.look_changed</code> entry marked <code>applied_by_admin</code>. The limits do not apply, because an administrator is acting. Applying the same look again changes nothing.</p>
+<div class="table-wrap"><table class="banded"><caption>Sources of a bulk apply</caption>
+<thead><tr><th>Source</th><th>What each site gets</th></tr></thead>
+<tbody>
+<tr><td><code>{look}</code></td><td>A whole look, as <code>PUT /api/sites/&lt;id&gt;/look</code> takes it.</td></tr>
+<tr><td><code>{from_site: id}</code></td><td>That site's look, as a copy makes it, without its own themes and font packages.</td></tr>
+<tr><td><code>{template: id}</code></td><td>The look a saved template carries, as a site made from it would get. A template with no look is <code>422 invalid_template {reason: "no_look"}</code>.</td></tr>
+<tr><td><code>{brand: {theme, fonts?}}</code></td><td>A brand-centre or built-in theme and font package. <strong>Ruling: only the theme and fonts change</strong>; each site keeps its logo, thumbnail, tab icon, header, navigation, menu and footer.</td></tr>
+</tbody></table></div>
+<p>The answer is <code>200 {results: [{site, ok, error?, unresolved?}]}</code>, one per site, in order. A refused site gives the error its own request would give: <code>archived</code> for an archived site, <code>not_found</code> for a missing one. The page shows a progress list with each site's result and a summary toast.</p>
+
+<h3>Routes</h3>
+<div class="table-wrap"><table class="banded"><caption>New and changed routes. "Brand manager" includes administrators; "Admin" means an enabled administrator.</caption>
+<thead><tr><th>Route</th><th>Who may call it</th><th>What it does</th></tr></thead>
+<tbody>
+<tr><td><code>GET /api/brand</code></td><td>Anyone signed in</td><td>Now also <code>fonts</code> (each <code>{id, name, media_type, family, url, licence}</code>), <code>font_packages</code> (built-ins first), <code>policy</code>, <code>default_icon</code> and <code>default_icon_url</code>.</td></tr>
+<tr><td><code>POST /api/brand/fonts</code>, <code>DELETE …/&lt;id&gt;</code></td><td>Brand manager, with <code>view</code> on the document</td><td>Adds a font from an asset library (201), or removes one (204).</td></tr>
+<tr><td><code>GET /api/brand/fonts/&lt;sha256&gt;</code></td><td>Anyone signed in</td><td>The font, as described above.</td></tr>
+<tr><td><code>POST /api/brand/font-packages</code>, <code>PATCH …/&lt;id&gt;</code>, <code>DELETE …</code></td><td>Brand manager</td><td>The brand centre's font packages. Looks that copied one keep their copy.</td></tr>
+<tr><td><code>PUT /api/brand/policy</code></td><td>Admin</td><td>Sets any of the five limits; answers the policy.</td></tr>
+<tr><td><code>PUT /api/brand/default-icon {image}</code></td><td>Brand manager</td><td>Sets (or, with <code>null</code>, clears) the organisation's default tab icon (204).</td></tr>
+<tr><td><code>POST /api/sites/&lt;id&gt;/font-packages</code>, <code>PATCH …/&lt;package&gt;</code>, <code>DELETE …</code></td><td><code>manage_site</code>, and the limits</td><td>The site's own font packages, from brand-centre fonts (<code>{brand_font}</code>) or a document (<code>{doc, licence_confirmed}</code>).</td></tr>
+<tr><td><code>POST /api/sites/&lt;id&gt;/look/copy</code></td><td><code>view</code> on the source, <code>manage_site</code> on the target</td><td>Copies a look; answers the look settings.</td></tr>
+<tr><td><code>GET /api/sites/&lt;id&gt;/look</code></td><td>Anyone who can see the site</td><td>Adds <code>fonts</code>, <code>icon_url</code>, <code>navigation_menu</code> and, in a hub, <code>own</code>.</td></tr>
+<tr><td><code>GET /api/sites/&lt;id&gt;/look/settings</code></td><td><code>manage_site</code></td><td>Adds <code>font_packages</code> and <code>fonts_source_changed</code>.</td></tr>
+<tr><td><code>PUT /api/sites/&lt;id&gt;/look</code></td><td><code>manage_site</code>, and the limits</td><td>Now also takes <code>fonts</code>, <code>icon</code> and <code>menu</code>.</td></tr>
+<tr><td><code>POST /api/sites/&lt;id&gt;/template</code>, <code>POST /api/templates/import</code>, <code>POST /api/sites</code></td><td>Admin</td><td>Now carry a template's look, with <code>dropped</code> or <code>unresolved</code>.</td></tr>
+<tr><td><code>POST /api/admin/looks/apply</code></td><td>Admin</td><td>Applies a look to 1 to 200 sites.</td></tr>
+</tbody></table></div>
+
+<h3>New events</h3>
+<div class="table-wrap"><table class="banded"><caption>Events recorded (section 11 says how an owner reads them)</caption>
+<thead><tr><th>Event</th><th>When</th></tr></thead>
+<tbody>
+<tr><td><code>brand.font_changed</code></td><td>A brand-centre font was added or removed.</td></tr>
+<tr><td><code>brand.font_package_changed</code></td><td>A brand-centre font package was created, changed or deleted.</td></tr>
+<tr><td><code>brand.policy_changed</code></td><td>The limits changed, with <code>before</code> and <code>after</code>.</td></tr>
+<tr><td><code>brand.image_changed</code></td><td>Now also when the default tab icon is set or cleared (<code>default_icon</code>).</td></tr>
+<tr><td><code>site.look_changed</code></td><td>Now also with <code>copied_from</code> (a copy) or <code>applied_by_admin</code> (a bulk apply).</td></tr>
+<tr><td><code>site.font_package_changed</code></td><td>One of a site's own font packages was created, changed or deleted.</td></tr>
+</tbody></table></div>
+
+<h3>New error codes</h3>
+<div class="table-wrap"><table class="banded"><caption>New answers (each has a plain-English message on the pages)</caption>
+<thead><tr><th>Answer</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td><code>422 not_a_font</code></td><td>The file is not a WOFF2, WOFF, TTF or OTF font.</td></tr>
+<tr><td><code>413 font_too_large</code></td><td>The font is over 2 MiB.</td></tr>
+<tr><td><code>422 licence_not_confirmed</code></td><td>The licence box was not ticked.</td></tr>
+<tr><td><code>422 invalid_font_package {reason}</code></td><td>A package breaks a rule, such as a role naming a font it lacks.</td></tr>
+<tr><td><code>409 not_allowed {problems}</code></td><td>A limit for site owners forbids the change.</td></tr>
+<tr><td><code>422 not_an_icon</code></td><td>The image cannot be a tab icon.</td></tr>
+<tr><td><code>409 too_many {limit}</code>, <code>409 name_taken</code></td><td>Now also for fonts and font packages.</td></tr>
+</tbody></table></div>
+
+<h3>Page scripts: the boot-order test</h3>
+<p>The browser pass found three pages that stopped drawing with "Cannot access … before initialization". A page script ran code at load that reached a module-level <code>const</code> or <code>let</code> declared further down. <code>web/page-boot.test.mjs</code> now checks every page script loaded by a page in <code>web/</code>. <strong>The rule:</strong> code that runs at the top level of a page script, and every top-level function it reaches, must not use a top-level <code>const</code>, <code>let</code> or <code>class</code> declared on a later line. So put module-level constants and state above the code that starts the page, and declare a value that is only known later as <code>let name;</code> near the top. The check goes by name, so a local variable with the same name as a later top-level one also counts; rename one of them.</p>
+
+<h3>The upgrade: migration 0016</h3>
+<p><code>0016_brand_fonts.sql</code> widens the check on <code>brand_refs.media_type</code> to the four font types and adds <code>sites.font_packages</code> (an empty list for every existing site). Existing records keep their exact bytes, and the first start finds the rows, pins and Git in step. Like the earlier migrations it is <strong>one way</strong>: a server from before this plan refuses to start on the upgraded database. <strong>Back up the data folder and the PostgreSQL database together first</strong>, as in section 19.</p>
+
+<h3>What was checked, and what was not</h3>
+<p>The server and web tests pass (945 server tests at <code>3cc5a67</code>; 523 web tests at <code>892dd87</code>). The pages were also checked by hand in a browser on 16 November 2026, against a real server and database after migration 0016 (backed up first), with the stand-in scanner and two SIL OFL test fonts:</p>
+<div class="table-wrap"><table class="banded"><caption>Browser pass, 16 November 2026</caption>
+<thead><tr><th>Area</th><th>What was seen</th></tr></thead>
+<tbody>
+<tr><td>Brand centre fonts</td><td>Add stayed off until the licence box was ticked. Specimens loaded under generated family names. A package used the display font for title and heading, and the content font for body and controls.</td></tr>
+<tr><td>Fonts on a site</td><td>Applied to Home through the Fonts tab. The heading and site name used the display font; body and rows the content font; the account bar and code kept the system fonts.</td></tr>
+<tr><td>Tab icon</td><td>Set from the thumbnail.</td></tr>
+<tr><td>Mega menu</td><td>A link with 9 sub-links opened a panel with two banded columns of 5 and 4. Escape closed it and returned focus. At 375 pixels there was no panel, the Menu button was shown, and nothing scrolled sideways.</td></tr>
+<tr><td>Copying</td><td>Home's look copied to Projects: theme, title font, logo and extended header.</td></tr>
+<tr><td>Bulk apply</td><td>A built-in theme and a font package applied to two sites; Projects kept its logo and header.</td></tr>
+<tr><td>Templates</td><td>A template saved from Home dropped nothing (its images were brand-centre images). A site made from it carried the theme, fonts, logo, header and icon.</td></tr>
+<tr><td>Hub</td><td>Projects left its hub and joined it again.</td></tr>
+<tr><td>Limits</td><td>After the fixes below: the brand centre drew every section, and two limits were turned off and on again and saved.</td></tr>
+</tbody></table></div>
+<p><strong>Found in that check and fixed since:</strong> the brand centre stopped after its Fonts section once any font existed; the Templates list did not draw; and the admin Sites list (with Apply a look…) did not draw. All three were the boot-order fault above, and were checked again in the browser after the fix. Change the look's "(changed)" marks are now worked out from the pending changes.</p>
+<p><strong>Not checked:</strong> a site owner under limits in the browser (only administrators had owner rights; the server tests cover it); a real phone; a screen reader; and the bulk apply dialog and template pages beyond their lists.</p>
+<p><strong>Left as they are</strong> (for later):</p>
+<div class="table-wrap"><table class="banded"><caption>Known small issues</caption>
+<thead><tr><th>Where</th><th>Issue</th></tr></thead>
+<tbody>
+<tr><td>Brand centre</td><td><code>GET /api/brand</code> shows who confirmed each font's licence (an account id) to everyone signed in.</td></tr>
+<tr><td>Limits</td><td>Editing an existing site theme or site font package counts as making one under the limits.</td></tr>
+<tr><td>Copying</td><td>Copying from a site with no look gives the default look, which is refused while built-in themes are hidden.</td></tr>
+<tr><td>Fonts on pages</td><td>Fonts arrive after the page measures its skeleton, so headings can shift slightly. Organisation pages fetch the whole brand centre to find the icon.</td></tr>
+<tr><td>Look studio and bulk dialog</td><td>Focus can move behind the narrow preview sheet; bulk progress is not announced to screen readers; the "dropped" sentence says pictures when fonts were dropped too.</td></tr>
+<tr><td>Mega menu</td><td>A column heading drops the targeted mark; a tall panel can be clipped in an editor frame.</td></tr>
+</tbody></table></div>
+</section>
+
+<section id="licences"><h2>30 / Licences</h2>
 <p>ShareCraft is licensed <strong>MIT OR Apache-2.0</strong>; the texts are in <code>LICENSE-MIT</code> and <code>LICENSE-APACHE</code>. <code>cargo xtask check</code> refuses any dependency whose licence has no non-copyleft option (GPL, LGPL, AGPL, MPL, EUPL, CDDL, SSPL).</p>
 <p>The <code>revisions</code> crate stores documents in Git using <code>gix</code> (gitoxide), a Git implementation written in Rust and licensed MIT or Apache 2.0. No C library is involved and no copyleft code is linked. Repositories it writes are ordinary Git repositories: the <code>git</code> command line reads them as usual.</p>
 <p>Time zones and dates are handled by the <code>jiff</code> crate, licensed MIT or Unlicense (the choice is ours, and we take MIT). No copyleft code is linked.</p>
@@ -1594,7 +1803,7 @@ sites/&lt;xx&gt;/&lt;site id&gt;.json                          a site's settings
 <p>The four editors are licensed MIT or Apache 2.0, by their original authors. They are not part of ShareCraft's code and are not compiled into the server. The build tool copies each fork's licence, notice and attribution files into the installed editor's <code>licenses/</code> folder; what each fork changed is listed in its <code>NOTICE</code> and in <a href="editors.html">editors.html</a>.</p>
 </section>
 
-<footer>ShareCraft · ThineCraft · Building and running · Updated 15 November 2026<br>Describes the development build after the third Stage 1 plan (editors, one person at a time; merged into <code>main</code> on 10 November 2026) and the follow-up (editors keep their document when hosted), the first Stage 2 plan (the content tree and inherited permissions), and the second (groups, roles and the inheritance explorer; on the branch <code>platform-groups-roles</code>, not yet merged), and the third (sharing links and access requests; on the branch <code>platform-links-requests</code>, not yet merged), then plan 3A (files; merged into <code>main</code> on 14 November 2026), plan 3B (sites; merged into <code>main</code> on 14 November 2026) and plan 3C (libraries; on the branch <code>platform-libraries</code>, not yet merged), and plan 4A (branding; on the branch <code>platform-branding</code>, not yet merged). Not a release.</footer>
+<footer>ShareCraft · ThineCraft · Building and running · Updated 16 November 2026<br>Describes the development build after the third Stage 1 plan (editors, one person at a time; merged into <code>main</code> on 10 November 2026) and the follow-up (editors keep their document when hosted), the first Stage 2 plan (the content tree and inherited permissions), and the second (groups, roles and the inheritance explorer; on the branch <code>platform-groups-roles</code>, not yet merged), and the third (sharing links and access requests; on the branch <code>platform-links-requests</code>, not yet merged), then plan 3A (files; merged into <code>main</code> on 14 November 2026), plan 3B (sites; merged into <code>main</code> on 14 November 2026) and plan 3C (libraries; on the branch <code>platform-libraries</code>, not yet merged), plan 4A (branding; on the branch <code>platform-branding</code>, not yet merged) and plan 4B (branding, part two; on the branch <code>platform-branding-4b</code>, not yet merged). Not a release.</footer>
 </main></div>
 </body>
 </html>
