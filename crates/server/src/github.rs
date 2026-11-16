@@ -35,6 +35,8 @@ const MAX_JSON_BYTES: u64 = 64 << 20;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long a response may go without sending a byte.
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long a whole request other than a tarball download may take, its body included.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Installs the ring TLS provider for this process; later calls do nothing. Every HTTPS client
 /// in the process needs it, and [`GithubClient::new`] calls it.
@@ -139,6 +141,8 @@ pub enum GithubError {
     /// GitHub answers `404` for a private repository the token cannot see, too.
     #[error("the repository or branch was not found, or the token cannot see it")]
     NotFound,
+    /// `401`, or a bare `403` (one that names no rate limit), which can mean a token that
+    /// lacks permission to read the repository's contents.
     #[error(
         "GitHub refused the token: it is wrong, expired or revoked, or may not read this \
          repository's contents"
@@ -257,7 +261,14 @@ impl GithubClient {
             #[serde(default)]
             archived: bool,
         }
-        let response = self.get(self.url(r, &[])?, token, HeaderMap::new()).await?;
+        let response = self
+            .get(
+                self.url(r, &[])?,
+                token,
+                HeaderMap::new(),
+                Some(REQUEST_TIMEOUT),
+            )
+            .await?;
         let answer: Answer = read_json(response).await?;
         Ok(RepoInfo {
             private: answer.private,
@@ -302,7 +313,12 @@ impl GithubClient {
             headers.insert(IF_NONE_MATCH, value);
         }
         let response = self
-            .get(self.url(r, &["commits", branch])?, token, headers)
+            .get(
+                self.url(r, &["commits", branch])?,
+                token,
+                headers,
+                Some(REQUEST_TIMEOUT),
+            )
             .await?;
         if response.status() == StatusCode::NOT_MODIFIED {
             return Ok(Head::NotModified);
@@ -349,7 +365,9 @@ impl GithubClient {
         }
         let mut url = self.url(r, &["git", "trees", object_id(tree_sha)?])?;
         url.query_pairs_mut().append_pair("recursive", "1");
-        let response = self.get(url, token, HeaderMap::new()).await?;
+        let response = self
+            .get(url, token, HeaderMap::new(), Some(REQUEST_TIMEOUT))
+            .await?;
         let answer: Answer = read_json(response).await?;
         if answer.truncated {
             return Err(GithubError::Truncated);
@@ -402,7 +420,7 @@ impl GithubClient {
             HeaderValue::from_static("application/vnd.github.raw+json"),
         );
         let url = self.url(r, &["git", "blobs", object_id(sha)?])?;
-        let response = self.get(url, token, headers).await?;
+        let response = self.get(url, token, headers, Some(REQUEST_TIMEOUT)).await?;
         read_capped(response, limit).await
     }
 
@@ -423,7 +441,7 @@ impl GithubClient {
         limit: u64,
     ) -> Result<(), GithubError> {
         let url = self.url(r, &["tarball", object_id(commit)?])?;
-        let response = self.get(url, token, HeaderMap::new()).await?;
+        let response = self.get(url, token, HeaderMap::new(), None).await?;
         if response.content_length().is_some_and(|len| len > limit) {
             return Err(GithubError::TooLarge);
         }
@@ -447,12 +465,14 @@ impl GithubClient {
     }
 
     /// Sends a `GET` to `url` with `headers`, and `token` as a bearer token when given, and
-    /// turns GitHub's refusals into errors.
+    /// turns GitHub's refusals into errors. `whole_request` limits the whole exchange, body
+    /// included; without it only each read is limited (a tarball may take long in all).
     async fn get(
         &self,
         url: Url,
         token: Option<&Secret>,
         headers: HeaderMap,
+        whole_request: Option<Duration>,
     ) -> Result<reqwest::Response, GithubError> {
         let mut request = self.http.get(url).headers(headers);
         if let Some(token) = token {
@@ -463,26 +483,34 @@ impl GithubClient {
             value.set_sensitive(true);
             request = request.header(AUTHORIZATION, value);
         }
+        if let Some(limit) = whole_request {
+            request = request.timeout(limit);
+        }
         let response = request.send().await.map_err(request_error)?;
-        refusal(&response).map_or(Ok(response), Err)
+        refusal(response).await
     }
 }
 
-/// The error for an answer GitHub refused or failed with, if it did.
-fn refusal(response: &reqwest::Response) -> Option<GithubError> {
+/// `response` if GitHub answered it, or the error for its refusal or failure.
+async fn refusal(response: reqwest::Response) -> Result<reqwest::Response, GithubError> {
     let status = response.status();
     if status.is_success() || status == StatusCode::NOT_MODIFIED {
-        return None;
+        return Ok(response);
     }
-    Some(match status {
+    Err(match status {
         StatusCode::UNAUTHORIZED => GithubError::Unauthorized,
         StatusCode::FORBIDDEN | StatusCode::TOO_MANY_REQUESTS => {
-            match rate_limit_reset(response.headers()) {
+            match rate_limit_reset(response.headers(), OffsetDateTime::now_utc()) {
                 Some(retry_at) => GithubError::RateLimited { retry_at },
                 None if status == StatusCode::TOO_MANY_REQUESTS => GithubError::RateLimited {
-                    retry_at: OffsetDateTime::now_utc() + Duration::from_secs(60),
+                    retry_at: in_seconds(DEFAULT_RETRY_SECONDS),
                 },
-                // A token without read access to the contents is refused with 403.
+                // A secondary rate limit or abuse detection may answer a bare 403 that says so
+                // only in its body.
+                None if mentions_secondary_limit(response).await => GithubError::RateLimited {
+                    retry_at: in_seconds(DEFAULT_RETRY_SECONDS),
+                },
+                // A token without read access to the contents is refused with a bare 403.
                 None => GithubError::Unauthorized,
             }
         }
@@ -494,22 +522,68 @@ fn refusal(response: &reqwest::Response) -> Option<GithubError> {
     })
 }
 
-/// When a rate-limited request may be retried: from `retry-after` (seconds), or from
-/// `x-ratelimit-reset` when `x-ratelimit-remaining` is 0. `None` when neither says.
-fn rate_limit_reset(headers: &HeaderMap) -> Option<OffsetDateTime> {
+/// How long to wait when GitHub says it is limiting requests but not until when.
+const DEFAULT_RETRY_SECONDS: u64 = 60;
+/// The longest `retry-after` believed, in seconds: one hour.
+const MAX_RETRY_AFTER_SECONDS: u64 = 60 * 60;
+/// The furthest `x-ratelimit-reset` believed, in seconds from now: one day.
+const MAX_RESET_SECONDS: u64 = 24 * 60 * 60;
+/// How much of a 403's body is read to look for a rate-limit message.
+const MAX_REFUSAL_BODY: usize = 4096;
+
+/// Now plus `seconds`, or now if that cannot be represented.
+fn in_seconds(seconds: u64) -> OffsetDateTime {
+    after(OffsetDateTime::now_utc(), seconds)
+}
+
+/// `from` plus `seconds`, or `from` if that cannot be represented.
+fn after(from: OffsetDateTime, seconds: u64) -> OffsetDateTime {
+    i64::try_from(seconds)
+        .ok()
+        .and_then(|s| from.checked_add(time::Duration::seconds(s)))
+        .unwrap_or(from)
+}
+
+/// Whether the first [`MAX_REFUSAL_BODY`] bytes of a refusal's body mention a secondary rate
+/// limit or abuse detection. The body itself is never kept or shown.
+async fn mentions_secondary_limit(mut response: reqwest::Response) -> bool {
+    let mut body = Vec::new();
+    while body.len() < MAX_REFUSAL_BODY {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                let room = MAX_REFUSAL_BODY.saturating_sub(body.len());
+                body.extend(chunk.iter().take(room));
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+    let text = String::from_utf8_lossy(&body).to_lowercase();
+    text.contains("secondary rate limit") || text.contains("abuse")
+}
+
+/// When a rate-limited request may be retried, judged at `now`: from `retry-after` (seconds,
+/// at most an hour), or from `x-ratelimit-reset` when `x-ratelimit-remaining` is 0 (at most a
+/// day ahead). `None` when neither says.
+fn rate_limit_reset(headers: &HeaderMap, now: OffsetDateTime) -> Option<OffsetDateTime> {
     let text = |name| {
         headers
             .get(name)
             .and_then(|v: &HeaderValue| v.to_str().ok())
     };
     if let Some(seconds) = text(RETRY_AFTER.as_str()).and_then(|s| s.trim().parse::<u64>().ok()) {
-        return Some(OffsetDateTime::now_utc() + Duration::from_secs(seconds));
+        return Some(after(now, seconds.min(MAX_RETRY_AFTER_SECONDS)));
     }
     if text("x-ratelimit-remaining").map(str::trim) == Some("0") {
+        let latest = after(now, MAX_RESET_SECONDS);
         let reset = text("x-ratelimit-reset")
             .and_then(|s| s.trim().parse::<i64>().ok())
-            .and_then(|epoch| OffsetDateTime::from_unix_timestamp(epoch).ok());
-        return Some(reset.unwrap_or_else(|| OffsetDateTime::now_utc() + Duration::from_secs(60)));
+            .map(|epoch| match OffsetDateTime::from_unix_timestamp(epoch) {
+                Ok(reset) => reset.min(latest),
+                // Out of range: so far ahead that the cap applies.
+                Err(_) if epoch > 0 => latest,
+                Err(_) => now,
+            });
+        return Some(reset.unwrap_or_else(|| after(now, DEFAULT_RETRY_SECONDS)));
     }
     None
 }
@@ -591,53 +665,98 @@ async fn write_capped(
     file.sync_all().await.map_err(write_error)
 }
 
+/// Caps on what reading a tarball may expand to, checked against each entry's header before
+/// its contents are decoded, so a small download cannot expand without bound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TarLimits {
+    /// The largest single entry, in bytes.
+    pub max_entry_bytes: u64,
+    /// The most bytes all entries together may hold.
+    pub max_total_bytes: u64,
+    /// The most entries of any kind (files, folders, links, headers).
+    pub max_entries: usize,
+}
+
 /// Calls `f` with each regular file in the gzipped tarball at `path` (as
 /// [`GithubClient::tarball`] saves it): its path relative to the repository root (the
 /// tarball's top folder, `owner-repo-<sha>/`, taken off), its contents and its size. Folders,
 /// symbolic links and other entries are skipped; the tree says what they are.
 ///
+/// The paths given to `f` are repository keys (`/`-separated names, each a plain name), never
+/// paths on disk; never join one to a folder to write a file.
+///
 /// # Errors
-/// Any error reading the file or from `f`; `InvalidData` for an entry outside one top folder,
-/// with a `.` or `..` component, or with a path that is not UTF-8.
+/// Any error reading the file or from `f`. `InvalidData` for a path that is not UTF-8, starts
+/// with `/`, holds a backslash, a `:` (a drive or stream), an empty, `.` or `..` component, or
+/// lies outside one top folder. `FileTooLarge` when an entry, the total, or the number of
+/// entries passes `limits`. Nothing is passed to `f` after the first error.
 pub fn for_each_in_tarball(
     path: &Path,
+    limits: &TarLimits,
     f: &mut dyn FnMut(&str, &mut dyn Read, u64) -> io::Result<()>,
 ) -> io::Result<()> {
+    let invalid = |why: &str| io::Error::new(io::ErrorKind::InvalidData, why.to_owned());
+    let too_large = |why: &str| io::Error::new(io::ErrorKind::FileTooLarge, why.to_owned());
     let file = std::fs::File::open(path)?;
     let gz = flate2::read::GzDecoder::new(io::BufReader::new(file));
     let mut archive = tar::Archive::new(gz);
     let mut top: Option<String> = None;
+    let mut entries: usize = 0;
+    let mut total: u64 = 0;
     for entry in archive.entries()? {
         let mut entry = entry?;
+        entries = entries.saturating_add(1);
+        if entries > limits.max_entries {
+            return Err(too_large(
+                "the tarball has more entries than the limit allows",
+            ));
+        }
+        let size = entry.size();
+        if size > limits.max_entry_bytes {
+            return Err(too_large(
+                "a file in the tarball is larger than the limit allows",
+            ));
+        }
+        total = total.saturating_add(size);
+        if total > limits.max_total_bytes {
+            return Err(too_large(
+                "the tarball expands to more than the limit allows",
+            ));
+        }
         if !entry.header().entry_type().is_file() {
             continue;
         }
-        let invalid = |why: &str| io::Error::new(io::ErrorKind::InvalidData, why.to_owned());
-        let raw = entry.path_bytes();
-        let text = std::str::from_utf8(&raw).map_err(|_| invalid("a path is not UTF-8"))?;
-        let mut parts = text.split('/').filter(|part| !part.is_empty());
-        let first = parts.next().unwrap_or_default();
-        let rest: Vec<&str> = parts.collect();
-        if rest.is_empty()
-            || rest
-                .iter()
-                .chain([&first])
-                .any(|p| matches!(*p, "." | ".."))
-        {
-            return Err(invalid("an entry is outside the repository's folder"));
-        }
-        match &top {
-            Some(top) if top != first => {
-                return Err(invalid("the tarball has more than one top folder"));
+        let relative = {
+            let raw = entry.path_bytes();
+            let text = std::str::from_utf8(&raw).map_err(|_| invalid("a path is not UTF-8"))?;
+            let (first, rest) = repository_path(text)
+                .ok_or_else(|| invalid("an entry's path is not a plain path in the repository"))?;
+            match &top {
+                Some(top) if top != first => {
+                    return Err(invalid("the tarball has more than one top folder"));
+                }
+                Some(_) => {}
+                None => top = Some(first.to_owned()),
             }
-            Some(_) => {}
-            None => top = Some(first.to_owned()),
-        }
-        let relative = rest.join("/");
-        let size = entry.size();
+            rest.to_owned()
+        };
         f(&relative, &mut entry, size)?;
     }
     Ok(())
+}
+
+/// Splits a tarball entry's path into its top folder and the path below it, if every
+/// component is a plain name: no leading `/`, no backslash, no `:`, and no empty, `.` or `..`
+/// component. A path with nothing below the top folder is refused too.
+fn repository_path(text: &str) -> Option<(&str, &str)> {
+    if text.starts_with('/') || text.contains('\\') {
+        return None;
+    }
+    let plain = |part: &str| !part.is_empty() && part != "." && part != ".." && !part.contains(':');
+    if !text.split('/').all(plain) {
+        return None;
+    }
+    text.split_once('/')
 }
 
 /// Git's id for a blob holding `data`: the SHA-1 of `blob <len>\0` and `data`, lower-case

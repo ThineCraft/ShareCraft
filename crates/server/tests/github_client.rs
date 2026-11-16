@@ -15,13 +15,20 @@ use std::time::Duration;
 use common::fake_github::{FakeEntry, FakeGithub};
 use common::start_fake_github;
 use server::github::{
-    EntryKind, GithubClient, GithubError, Head, RepoRef, TreeEntry, for_each_in_tarball,
+    EntryKind, GithubClient, GithubError, Head, RepoRef, TarLimits, TreeEntry, for_each_in_tarball,
     git_blob_id,
 };
 use server::secrets::Secret;
 use time::OffsetDateTime;
 
 const TOKEN: &str = "ghp_secret123";
+
+/// Limits no well-formed test tarball comes near.
+const ROOMY: TarLimits = TarLimits {
+    max_entry_bytes: 1 << 20,
+    max_total_bytes: 10 << 20,
+    max_entries: 1000,
+};
 
 fn octo() -> RepoRef {
     RepoRef::parse("octo/docs").unwrap()
@@ -226,7 +233,7 @@ async fn tarball_streams_to_a_file_and_for_each_in_tarball_strips_the_top_folder
     assert_eq!(fake.count("codeload"), 1);
 
     let mut seen = BTreeMap::new();
-    for_each_in_tarball(&dest, &mut |path, reader, size| {
+    for_each_in_tarball(&dest, &ROOMY, &mut |path, reader, size| {
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes)?;
         assert_eq!(bytes.len() as u64, size, "{path}");
@@ -455,4 +462,196 @@ async fn repo_ref_rejects_paths_traversal_and_extra_slashes() {
     ] {
         assert!(RepoRef::parse(bad).is_err(), "{bad:?} was accepted");
     }
+}
+
+/// A gzipped tarball at a new path in `dir`, holding regular files with exactly these raw
+/// names (written into the header by hand, so names `tar` itself refuses can be made).
+fn raw_tarball(dir: &std::path::Path, entries: &[(&[u8], &[u8])]) -> std::path::PathBuf {
+    let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    let mut builder = tar::Builder::new(gz);
+    for (name, data) in entries {
+        let mut header = tar::Header::new_gnu();
+        header.as_gnu_mut().unwrap().name[..name.len()].copy_from_slice(name);
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_mode(0o644);
+        header.set_size(data.len() as u64);
+        header.set_cksum();
+        builder.append(&header, *data).unwrap();
+    }
+    let bytes = builder.into_inner().unwrap().finish().unwrap();
+    let path = dir.join(format!("t{}.tar.gz", uuid::Uuid::new_v4().simple()));
+    std::fs::write(&path, bytes).unwrap();
+    path
+}
+
+/// Reads `path` with `limits`, returning the paths given to the callback and the result.
+fn read_all(path: &std::path::Path, limits: &TarLimits) -> (Vec<String>, std::io::Result<()>) {
+    let mut seen = Vec::new();
+    let result = for_each_in_tarball(path, limits, &mut |name, reader, _| {
+        std::io::copy(reader, &mut std::io::sink())?;
+        seen.push(name.to_owned());
+        Ok(())
+    });
+    (seen, result)
+}
+
+#[test]
+fn tarball_paths_must_be_plain_repository_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let good = raw_tarball(dir.path(), &[(b"top/a.md", b"a"), (b"top/sub/b.md", b"b")]);
+    let (seen, result) = read_all(&good, &ROOMY);
+    result.unwrap();
+    assert_eq!(seen, ["a.md", "sub/b.md"]);
+
+    for bad in [
+        &b"top/../x"[..],
+        b"top/a\\b",
+        b"top/C:/x",
+        b"top/x:stream",
+        b"/etc/x",
+        b"/top/x",
+        b"top//x",
+        b"top/./x",
+        b"top/x/",
+        b"other/x",
+        b"C:/x",
+        b"\\\\server\\share\\x",
+    ] {
+        let path = raw_tarball(
+            dir.path(),
+            &[
+                (b"top/first.md", b"1"),
+                (bad, b"bad"),
+                (b"top/later.md", b"2"),
+            ],
+        );
+        let (seen, result) = read_all(&path, &ROOMY);
+        let shown = String::from_utf8_lossy(bad);
+        let err = result.expect_err(&format!("{shown} was accepted"));
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{shown}");
+        assert_eq!(seen, ["first.md"], "{shown}");
+    }
+    // Reading writes nothing: only the tarballs are in the folder.
+    let names: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert!(names.iter().all(|n| n.ends_with(".tar.gz")), "{names:?}");
+}
+
+#[test]
+fn tarball_limits_stop_expansion_before_the_callback() {
+    let dir = tempfile::tempdir().unwrap();
+    let check = |entries: &[(&[u8], &[u8])], limits: TarLimits, expected: &[&str]| {
+        let path = raw_tarball(dir.path(), entries);
+        let (seen, result) = read_all(&path, &limits);
+        let err = result.expect_err("over the limit was accepted");
+        assert_eq!(err.kind(), std::io::ErrorKind::FileTooLarge);
+        let text = err.to_string();
+        assert!(!text.contains("big") && !text.contains("top/"), "{text}");
+        assert_eq!(seen, expected);
+    };
+    let small = vec![b's'; 60];
+    let big = vec![b'b'; 1000];
+    // One entry over the per-entry cap.
+    check(
+        &[
+            (b"top/first.md", &small),
+            (b"top/big.bin", &big),
+            (b"top/later.md", &small),
+        ],
+        TarLimits {
+            max_entry_bytes: 100,
+            ..ROOMY
+        },
+        &["first.md"],
+    );
+    // The total passes its cap on the second entry.
+    check(
+        &[
+            (b"top/first.md", &small),
+            (b"top/second.md", &small),
+            (b"top/later.md", &small),
+        ],
+        TarLimits {
+            max_total_bytes: 100,
+            ..ROOMY
+        },
+        &["first.md"],
+    );
+    // Too many entries.
+    check(
+        &[
+            (b"top/first.md", &small),
+            (b"top/second.md", &small),
+            (b"top/later.md", &small),
+        ],
+        TarLimits {
+            max_entries: 2,
+            ..ROOMY
+        },
+        &["first.md", "second.md"],
+    );
+}
+
+#[tokio::test]
+async fn huge_rate_limit_waits_are_capped_without_overflow() {
+    let fake = fake().await;
+    fake.commit("main", &files());
+    let github = client(&fake);
+
+    fake.retry_after_next(u64::MAX);
+    let before = OffsetDateTime::now_utc();
+    let Err(GithubError::RateLimited { retry_at }) = github.repo(&octo(), None).await else {
+        panic!("expected a rate limit");
+    };
+    let wait = retry_at - before;
+    assert!(
+        wait >= time::Duration::seconds(3599) && wait <= time::Duration::seconds(3602),
+        "{wait}"
+    );
+
+    for epoch in [i64::MAX, 253_402_300_800 /* year 10000 */] {
+        fake.rate_limit_next_epoch(epoch);
+        let before = OffsetDateTime::now_utc();
+        let Err(GithubError::RateLimited { retry_at }) = github.repo(&octo(), None).await else {
+            panic!("expected a rate limit");
+        };
+        let wait = retry_at - before;
+        assert!(
+            wait >= time::Duration::hours(24) - time::Duration::seconds(1)
+                && wait <= time::Duration::hours(24) + time::Duration::seconds(2),
+            "{epoch}: {wait}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_bare_403_is_a_rate_limit_only_when_it_says_so() {
+    let fake = fake().await;
+    fake.commit("main", &files());
+    let github = client(&fake);
+
+    fake.forbid_next("You have exceeded a secondary rate limit. Please wait a few minutes.");
+    let before = OffsetDateTime::now_utc();
+    let Err(GithubError::RateLimited { retry_at }) = github.repo(&octo(), None).await else {
+        panic!("expected a rate limit");
+    };
+    let wait = retry_at - before;
+    assert!(
+        wait >= time::Duration::seconds(59) && wait <= time::Duration::seconds(62),
+        "{wait}"
+    );
+
+    fake.forbid_next("You have triggered an abuse detection mechanism.");
+    assert!(matches!(
+        github.repo(&octo(), None).await,
+        Err(GithubError::RateLimited { .. })
+    ));
+
+    fake.forbid_next("Resource not accessible by personal access token");
+    let err = github.repo(&octo(), None).await.unwrap_err();
+    assert_eq!(err, GithubError::Unauthorized);
+    let text = format!("{err:?}{err}");
+    assert!(!text.contains("Resource not accessible"), "{text}");
 }

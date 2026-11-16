@@ -70,8 +70,10 @@ struct Model {
     made: u64,
     truncate_trees: bool,
     hold_open_blobs: bool,
-    /// The reset time for the next request's primary rate-limit answer.
-    rate_limit_next: Option<OffsetDateTime>,
+    /// The reset time (seconds since 1970) for the next request's primary rate-limit answer.
+    rate_limit_next: Option<i64>,
+    /// The message of a bare 403 the next request is answered with.
+    forbid_next: Option<String>,
     /// Seconds for the next request's `429` with `retry-after`.
     retry_after_next: Option<u64>,
     /// A status the next request is answered with; its body echoes the `Authorization` header.
@@ -226,7 +228,19 @@ impl FakeGithub {
 
     /// The next request is refused by the primary rate limit, which resets at `reset`.
     pub fn rate_limit_next(&self, reset: OffsetDateTime) {
+        self.model.lock().unwrap().rate_limit_next = Some(reset.unix_timestamp());
+    }
+
+    /// Like [`FakeGithub::rate_limit_next`], with the reset given as raw seconds since 1970,
+    /// however far off.
+    pub fn rate_limit_next_epoch(&self, reset: i64) {
         self.model.lock().unwrap().rate_limit_next = Some(reset);
+    }
+
+    /// The next request is answered with a bare 403 (no rate-limit headers) whose message is
+    /// `message`.
+    pub fn forbid_next(&self, message: &str) {
+        self.model.lock().unwrap().forbid_next = Some(message.to_owned());
     }
 
     /// The next request is refused by a secondary rate limit: `429` with `retry-after`.
@@ -356,7 +370,7 @@ async fn handle(State(shared): State<Shared>, request: Request) -> Response {
             StatusCode::FORBIDDEN,
             [
                 ("x-ratelimit-remaining", "0".to_owned()),
-                ("x-ratelimit-reset", reset.unix_timestamp().to_string()),
+                ("x-ratelimit-reset", reset.to_string()),
             ],
             r#"{"message":"API rate limit exceeded"}"#,
         )
@@ -373,6 +387,12 @@ async fn handle(State(shared): State<Shared>, request: Request) -> Response {
     let authorization = headers
         .get(header::AUTHORIZATION)
         .map(|v| v.to_str().unwrap().to_owned());
+    if let Some(message) = model.forbid_next.take() {
+        return json(
+            StatusCode::FORBIDDEN,
+            serde_json::json!({ "message": message }),
+        );
+    }
     if let Some(status) = model.fail_next.take() {
         let echoed = authorization.clone().unwrap_or_default();
         return (
