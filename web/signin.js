@@ -6,6 +6,9 @@ const password = document.getElementById('password');
 const submit = document.getElementById('submit');
 const error = document.getElementById('error');
 
+// The page starts with the button off, so the form is never sent before this script handles it.
+submit.disabled = false;
+
 form.addEventListener('submit', async (event) => {
   event.preventDefault();
   showMessage(error, '');
