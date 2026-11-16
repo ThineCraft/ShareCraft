@@ -356,7 +356,7 @@ async fn replace_target(
 /// Saves the content `held` as a new version of `doc` (named `name`) made from `base`, for
 /// `user`, through the document's file session, opened again if it ends before answering.
 /// Content not saved is erased unless something else names it.
-pub(super) async fn store_version(
+pub(crate) async fn store_version(
     state: &AppState,
     user: &User,
     doc: DocId,

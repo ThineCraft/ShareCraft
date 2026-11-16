@@ -86,7 +86,8 @@ impl Env {
             checkpointer,
             blobs,
             test.db.clone(),
-        );
+        )
+        .unwrap();
         Env {
             dir,
             test,
@@ -1400,7 +1401,8 @@ async fn store_without_tree_is_reported() {
         Arc::new(NoTree),
         blobs,
         test.db.clone(),
-    );
+    )
+    .unwrap();
     let password = Uuid::new_v4().simple().to_string();
     let admin = test
         .db

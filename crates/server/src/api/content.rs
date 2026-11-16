@@ -893,7 +893,7 @@ pub(crate) async fn upload(
 }
 
 /// What [`create_uploaded`] made.
-pub(super) enum Created {
+pub(crate) enum Created {
     /// The document `doc`, with its first revision; `body` describes it.
     Done { doc: DocId, body: Value },
     /// The document was made but its content could not be stored: the answer to give.
@@ -907,7 +907,7 @@ pub(super) enum Created {
 /// the document was made, the document stays, empty, and the answer is `503` naming it. With
 /// `keep_both`, a name taken meanwhile is chosen again (the first free `name (2)`, `name (3)`
 /// …) rather than refused, so the upload is not lost.
-pub(super) async fn create_uploaded(
+pub(crate) async fn create_uploaded(
     state: &AppState,
     user: &User,
     parent: NodeId,

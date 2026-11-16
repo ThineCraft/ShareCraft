@@ -72,6 +72,7 @@ pub use projection::{
     BlobReport, Report, UsageReport, rebuild, reconcile, reconcile_blobs, reconcile_usage,
 };
 pub use scan::scan_once;
+pub use source_sync::sync_once;
 
 use api::uploads::Uploads;
 use auth::{MAX_ADDRESS_FAILURES, MAX_LINK_MISSES, PasswordChecks, Throttle};
@@ -119,22 +120,33 @@ struct Shared {
     /// Take-backs of refused tree changes that could not be written to Git yet; written before
     /// the reconcile that brings the tree back in step.
     tree_undos: std::sync::Mutex<Vec<tree::PendingUndo>>,
+    /// Seals and opens the secrets connected libraries use.
+    secrets: Arc<secrets::SecretBox>,
+    /// The client for the configured GitHub API address.
+    github: Arc<github::GithubClient>,
 }
 
 impl AppState {
     /// State for a server with no rooms open yet, loading and saving documents through
     /// `checkpointer`, their bytes in the content store `blobs`, and keeping accounts and
-    /// sessions in `db`.
-    #[must_use]
+    /// sessions in `db`. The secret key is opened (or made) in `config.data_dir`, and the
+    /// GitHub client is set up for `config.github_api`.
+    ///
+    /// # Errors
+    /// If the secret key file cannot be read or made, or the GitHub client cannot be set up.
     pub fn new(
         config: Config,
         checkpointer: Arc<dyn Checkpointer>,
         blobs: BlobStore,
         db: Db,
-    ) -> Self {
+    ) -> std::io::Result<Self> {
         let editors_dir = config.editors_dir.clone();
         let uploads_dir = uploads_path(&config.data_dir);
-        Self {
+        let secrets = secrets::SecretBox::open_or_create(&config.data_dir)
+            .map_err(|e| std::io::Error::other(format!("cannot open the secret key: {e}")))?;
+        let github = github::GithubClient::new(&config.github_api)
+            .map_err(|e| std::io::Error::other(format!("cannot set up the GitHub client: {e}")))?;
+        Ok(Self {
             shared: Arc::new(Shared {
                 config,
                 rooms: Arc::new(Rooms::default()),
@@ -154,8 +166,22 @@ impl AppState {
                 tree_lock: tokio::sync::Mutex::new(()),
                 tree_out_of_step: AtomicBool::new(false),
                 tree_undos: std::sync::Mutex::new(Vec::new()),
+                secrets: Arc::new(secrets),
+                github: Arc::new(github),
             }),
-        }
+        })
+    }
+
+    /// Seals and opens the secrets of connected libraries.
+    #[must_use]
+    pub fn secrets(&self) -> &secrets::SecretBox {
+        &self.shared.secrets
+    }
+
+    /// The client for the configured GitHub API address.
+    #[must_use]
+    pub fn github(&self) -> &github::GithubClient {
+        &self.shared.github
     }
 
     /// The settings the server runs with.
@@ -596,7 +622,12 @@ pub async fn prepare(config: Config) -> std::io::Result<AppState> {
             doc.0
         );
     }
-    let state = AppState::new(config, store, blobs, db);
+    let state = AppState::new(config, store, blobs, db)?;
+    // No sync runs before the server starts: one left `syncing` was cut short.
+    let stale = source_sync::recover_stale_syncs(&state, time::OffsetDateTime::now_utc()).await;
+    if stale > 0 {
+        println!("Connected libraries whose sync was cut short, to sync again: {stale}");
+    }
     let blob_report = reconcile_blobs(&state, time::OffsetDateTime::now_utc())
         .await
         .map_err(|e| std::io::Error::other(format!("cannot list the documents in Git: {e}")))?;

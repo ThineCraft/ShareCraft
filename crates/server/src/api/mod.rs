@@ -898,7 +898,7 @@ mod tests {
         };
         let store = RevisionStore::open(&crate::library_path(dir)).unwrap();
         let blobs = revisions::BlobStore::open(&crate::blobs_path(dir)).unwrap();
-        AppState::new(config, Arc::new(store), blobs, test.db.clone())
+        AppState::new(config, Arc::new(store), blobs, test.db.clone()).unwrap()
     }
 
     /// The owner's request to remove Bob's grant is cancelled (its future dropped) after the

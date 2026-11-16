@@ -211,6 +211,17 @@ pub struct SourceItem {
     pub size: i64,
 }
 
+/// The turn to sync one library (see [`Db::try_lock_source`]); dropping it gives the turn up.
+pub struct SourceLock {
+    _tx: sqlx::Transaction<'static, sqlx::Postgres>,
+}
+
+impl std::fmt::Debug for SourceLock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SourceLock")
+    }
+}
+
 const SOURCE_COLUMNS: &str = "library_id, kind, owner, repo, branch, folder, token_secret, \
     webhook_secret, poll_seconds, connected_by, state, last_commit, etag, last_checked_at, \
     last_synced_at, last_error, retry_at, files, bytes, hidden";
@@ -576,6 +587,34 @@ impl Db {
         .fetch_all(self.pool())
         .await?;
         Ok(ids.into_iter().map(NodeId).collect())
+    }
+
+    /// Takes the turn to sync `library`, if nobody holds it: a transaction-scoped PostgreSQL
+    /// advisory lock, held until the answer is dropped (its transaction then ends and the lock
+    /// goes, also when the process dies). `None` while someone else holds it.
+    pub async fn try_lock_source(&self, library: NodeId) -> Result<Option<SourceLock>, DbError> {
+        let mut tx = self.pool().begin().await?;
+        let got: bool = sqlx::query_scalar(
+            "select pg_try_advisory_xact_lock(hashtextextended('source-sync:' || $1::text, 0))",
+        )
+        .bind(library.0)
+        .fetch_one(&mut *tx)
+        .await?;
+        Ok(got.then_some(SourceLock { _tx: tx }))
+    }
+
+    /// Puts every connection left in state `syncing` and last checked before `before` (or
+    /// never) back to `connecting`, so it is due again: a sync that stopped with its process
+    /// left it so. Returns how many.
+    pub async fn reset_stale_syncs(&self, before: OffsetDateTime) -> Result<u64, DbError> {
+        let done = sqlx::query(
+            "update library_sources set state = 'connecting' \
+             where state = 'syncing' and (last_checked_at is null or last_checked_at < $1)",
+        )
+        .bind(before)
+        .execute(self.pool())
+        .await?;
+        Ok(done.rows_affected())
     }
 
     /// Ends the connection of `library`: removes its items and its connection, keeping every

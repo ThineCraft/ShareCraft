@@ -567,7 +567,7 @@ impl Copied {
 /// Called after the file `doc` was renamed: its room, if open, stores later revisions under
 /// the name now recorded. The name is read and sent under the document's access lock, so the
 /// room hears two renames in the order they were recorded.
-async fn after_rename(state: &AppState, doc: DocId) {
+pub(crate) async fn after_rename(state: &AppState, doc: DocId) {
     let rooms = state.rooms();
     let _in_order = rooms.order_access(doc).await;
     match state.db().document(doc).await {

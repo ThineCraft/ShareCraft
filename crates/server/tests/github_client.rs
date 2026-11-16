@@ -79,13 +79,18 @@ async fn head_returns_commit_tree_and_etag_then_not_modified_with_that_etag() {
     let fake = fake().await;
     let first = fake.commit("main", &files());
     let github = client(&fake);
-    let Head::Moved { commit, tree, etag } =
-        github.head(&octo(), "main", None, None).await.unwrap()
+    let Head::Moved {
+        commit,
+        tree,
+        etag,
+        author,
+    } = github.head(&octo(), "main", None, None).await.unwrap()
     else {
         panic!("expected a commit");
     };
     assert_eq!(commit, first.sha);
     assert_eq!(tree, first.tree);
+    assert_eq!(author.as_deref(), Some(common::fake_github::AUTHOR_NAME));
     let etag = etag.expect("an etag");
     assert_eq!(
         github

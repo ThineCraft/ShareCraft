@@ -18,6 +18,9 @@ use base64::Engine;
 use futures_util::StreamExt;
 use time::OffsetDateTime;
 
+/// The author name every commit of the fake carries.
+pub const AUTHOR_NAME: &str = "Octo Cat";
+
 /// A commit the fake made: its id and its root tree's id.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommitId {
@@ -254,6 +257,14 @@ impl FakeGithub {
         self.model.lock().unwrap().fail_next = Some(status);
     }
 
+    /// The blob endpoint serves `sha` with its first byte changed from now on (same length), as
+    /// a corrupted download would arrive. Tarballs are unaffected.
+    pub fn corrupt_blob(&self, sha: &str) {
+        let mut model = self.model.lock().unwrap();
+        let bytes = model.repo.blobs.get_mut(sha).unwrap();
+        bytes[0] ^= 0xff;
+    }
+
     /// Blob bodies from now on are sent in full but never end.
     pub fn hold_open_blob_bodies(&self) {
         self.model.lock().unwrap().hold_open_blobs = true;
@@ -451,7 +462,10 @@ async fn handle(State(shared): State<Shared>, request: Request) -> Response {
             let tree = model.repo.commits.get(&sha).unwrap().0.clone();
             let mut response = json(
                 StatusCode::OK,
-                serde_json::json!({ "sha": sha, "commit": { "tree": { "sha": tree } } }),
+                serde_json::json!({ "sha": sha, "commit": {
+                    "tree": { "sha": tree },
+                    "author": { "name": AUTHOR_NAME, "email": "octo@example.invalid" },
+                } }),
             );
             response
                 .headers_mut()

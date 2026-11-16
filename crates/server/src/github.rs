@@ -106,11 +106,13 @@ pub struct RepoInfo {
 pub enum Head {
     /// Unchanged since the ETag given.
     NotModified,
-    /// The branch's commit, its root tree, and the ETag to give next time.
+    /// The branch's commit, its root tree, and the ETag to give next time; `author` is the
+    /// commit author's name as Git records it, when GitHub gives one (never an email).
     Moved {
         commit: String,
         tree: String,
         etag: Option<String>,
+        author: Option<String>,
     },
 }
 
@@ -297,8 +299,15 @@ impl GithubClient {
             sha: String,
         }
         #[derive(Deserialize)]
+        struct Person {
+            #[serde(default)]
+            name: Option<String>,
+        }
+        #[derive(Deserialize)]
         struct Commit {
             tree: Tree,
+            #[serde(default)]
+            author: Option<Person>,
         }
         #[derive(Deserialize)]
         struct Answer {
@@ -335,6 +344,7 @@ impl GithubClient {
             commit: answer.sha,
             tree: answer.commit.tree.sha,
             etag,
+            author: answer.commit.author.and_then(|a| a.name),
         })
     }
 

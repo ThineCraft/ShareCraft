@@ -738,7 +738,7 @@ pub async fn spawn_server_with_grace(
     let listener = tokio::net::TcpListener::bind(config.addr).await.unwrap();
     let addr = listener.local_addr().unwrap();
     let blobs = BlobStore::open(&server::blobs_path(data_dir.path())).unwrap();
-    let state = AppState::new(config, checkpointer, blobs, db.db.clone());
+    let state = AppState::new(config, checkpointer, blobs, db.db.clone()).unwrap();
     tokio::spawn(fail_loudly(server::serve_state(state.clone(), listener)));
     TestServer {
         site: Site::ready(addr, db.db.clone(), state),
