@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub mod file;
+pub mod live;
 
 pub use file::{FileClientMsg, FileServerMsg, SeatState};
 
