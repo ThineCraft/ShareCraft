@@ -1,0 +1,398 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ShareCraft — Production mode: Implementation Plan</title>
+<style>
+:root{color-scheme:light dark;--ink:light-dark(#172f38,#e4ecef);--muted:light-dark(#536b72,#a9b9bf);--line:light-dark(#d7e2e3,#36454b);--paper:light-dark(#fff,#1d272b);--wash:light-dark(#f2f6f5,#141b1e);--accent:light-dark(#3156c9,#9db4ff);font:15px/1.6 Segoe UI,system-ui,sans-serif;color:var(--ink);background:var(--wash)}
+*{box-sizing:border-box}body{margin:0;padding:28px 18px 80px}main{max-width:940px;margin:auto}
+h1{font-size:1.9rem;letter-spacing:-.03em;line-height:1.2;margin:0 0 14px}h2{font-size:1.3rem;margin:38px 0 12px;padding-top:18px;border-top:1px solid var(--line)}h3{font-size:1.08rem;margin:30px 0 8px}h4{font-size:.95rem;margin:16px 0 6px}
+p{margin:0 0 12px}ul,ol{margin:0 0 12px;padding-left:22px}li{margin-bottom:6px}a{color:var(--accent)}
+code{font-family:Consolas,Menlo,monospace;font-size:.88em;background:light-dark(#e9efee,#263238);padding:1px 5px;border-radius:3px;overflow-wrap:anywhere}
+pre{background:var(--paper);border:1px solid var(--line);border-radius:7px;padding:12px 14px;overflow-x:auto;font:13px/1.5 Consolas,Menlo,monospace;margin:0 0 12px}pre code{background:none;padding:0;font-size:inherit}
+.note{border-left:4px solid var(--accent);background:var(--paper);padding:12px 16px;margin:0 0 14px}.note p:last-child{margin:0}
+.task{background:var(--paper);border:1px solid var(--line);border-radius:9px;padding:6px 20px 14px;margin:18px 0}
+ol.steps{list-style:none;padding-left:0}ol.steps>li{padding-left:28px;position:relative;margin-bottom:10px}ol.steps>li::before{content:"☐";position:absolute;left:2px;color:var(--muted)}
+table{border-collapse:collapse;width:100%;font-size:.9rem;background:var(--paper);margin-bottom:14px}th,td{border:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top}th{background:light-dark(#e8efed,#263238)}
+.small{font-size:.88rem;color:var(--muted)}
+tbody tr:nth-child(even) td{background:light-dark(#f4f8f7,#212b30)}
+ol.steps>li:nth-child(even),ul.band>li:nth-child(even),ol.band>li:nth-child(even){background:light-dark(#f4f8f7,#212b30);border-radius:4px}
+</style>
+</head>
+<body><main>
+<h1>Production mode: ShareCraft at a public HTTPS address, behind a reverse proxy or tunnel: implementation plan</h1>
+<p class="small">ShareCraft &middot; Stage 2, platform track &middot; Written 15 November 2026</p>
+<div class="note"><p><strong>For agentic workers:</strong> REQUIRED SUB-SKILL: use superpowers:subagent-driven-development or superpowers:executing-plans. Steps are checkboxes.</p></div>
+
+<p><strong>Why:</strong> the owner installed the Windows package on another computer, put it behind a proxy at a public address, and could not sign in. That is the development build working as designed: it refuses any <code>Host</code> that is not a loopback name, and any <code>Origin</code> that is not <code>http://&lt;that host&gt;</code>. A production mode was always planned (scope section 06, &ldquo;Deployment &amp; upgrades&rdquo;; BUILDING section 21) but never built.</p>
+<p><strong>Goal:</strong> one setting, <code>SHARECRAFT_PUBLIC_URL</code>, turns on production mode. An installation can then be used safely at an address such as <code>https://share.example.com</code>, with a reverse proxy or tunnel in front that handles HTTPS. Production mode adds:
+<ul>
+<li>an origin check against the configured public address, keeping the cross-site request protection the loopback check gives today;</li>
+<li>forwarded headers trusted only from configured proxy addresses;</li>
+<li><code>Secure</code> cookies with the <code>__Host-</code> prefix, HSTS, and the existing Content Security Policy and security headers;</li>
+<li>sign-in protection fit for the internet: limits per account and per address, a lock with a stated wait, answers that take the same time whether or not an account exists;</li>
+<li>anyone links and access-request pages that work at the public address;</li>
+<li>a way to turn it on in the Windows package, with the README guide updated.</li>
+</ul></p>
+<p><strong>Architecture:</strong>
+<ul>
+<li><strong>One description of the deployment.</strong> A new module, <code>crates/server/src/deployment.rs</code>, holds <code>Deployment::Development</code> (today's behaviour, byte for byte) or <code>Deployment::Production {public, proxies, hsts}</code>. <code>Config</code> builds it, <code>AppState</code> carries it, and every check that today assumes loopback asks it instead.</li>
+<li><strong>Where a request came from is worked out once.</strong> A middleware reads the connection's peer address (axum's <code>ConnectInfo</code>) and, only when that peer is a trusted proxy, the forwarded headers. It stores a <code>Source {client_ip, https, host_ok}</code> in the request's extensions. The origin check, the sign-in limits and the plain-HTTP refusal all read <code>Source</code>, never the raw headers.</li>
+<li><strong>HTTPS lives in the proxy.</strong> ShareCraft never terminates TLS itself and never answers the internet directly: in production it accepts requests only from its trusted proxies, and only those the proxy says arrived over HTTPS.</li>
+<li><strong>Development mode does not change.</strong> With <code>SHARECRAFT_PUBLIC_URL</code> unset, every existing test passes untouched, the cookie keeps its name, and the server still refuses a non-loopback address.</li>
+</ul></p>
+<p><strong>Tech stack:</strong> the existing workspace, the pages in <code>web/</code>, and the Windows package scripts in <code>packaging/windows</code> (Windows PowerShell 5.1, Pester tests). The server needs no new dependency: CIDR matching is a few lines over <code>std::net::IpAddr</code>. The browser check's local HTTPS proxy is a choice for the owner (proposal 10).</p>
+<p><strong>Spec:</strong> <a href="../scope.html">scope.html</a>:
+<ul>
+<li>section 06, Security (encryption in transit, authorisation at every boundary) and Deployment &amp; upgrades (self-hosted reference deployment, configuration and secrets);</li>
+<li>SC-11, sharing links, access requests and session handling;</li>
+<li>BUILDING.html section 04 (the loopback rule and its variables), section 21 (known limits) and section 24 (links and access requests).</li>
+</ul></p>
+
+<h2>Proposals in this plan for the owner to check</h2>
+<p class="small">These are the choices the plan makes. Each is cheap to change before the build starts.</p>
+<ol class="band">
+<li><strong>Production mode is turned on by one setting, <code>SHARECRAFT_PUBLIC_URL</code></strong>, for example <code>https://share.example.com</code>.
+<ul>
+<li>It must start with <code>https://</code>. It may carry a port (<code>https://share.example.com:8443</code>), but no path, query, fragment, user name or password.</li>
+<li>One public address only. A second name for the same installation (for example <code>www.</code>) is the proxy's job to redirect.</li>
+<li>Serving ShareCraft under a path (<code>https://example.com/share/</code>) is not supported: the pages, the API and the editors all assume they sit at <code>/</code>.</li>
+</ul></li>
+<li><strong>Trusted proxies are named by address, in <code>SHARECRAFT_TRUSTED_PROXIES</code></strong>: a comma-separated list of IP addresses or ranges (<code>127.0.0.1, ::1, 10.0.0.0/24</code>).
+<ul>
+<li>When it is unset in production mode, it means <code>127.0.0.1, ::1</code>: a proxy or tunnel on the same computer. That is the Windows package's case.</li>
+<li>Ranges wider than <code>/8</code> (IPv4) or <code>/32</code> (IPv6), and <code>0.0.0.0/0</code> or <code>::/0</code>, are refused at start: trusting everyone would let anyone forge their address.</li>
+</ul></li>
+<li><strong>Which forwarded headers are read:</strong> <code>X-Forwarded-For</code>, <code>X-Forwarded-Proto</code> and <code>X-Forwarded-Host</code>, and only when the connection comes from a trusted proxy. From anyone else they are ignored.
+<ul>
+<li>The client is found by reading <code>X-Forwarded-For</code> from the right and skipping trusted proxies; the first address that is not a trusted proxy is the client. A client cannot forge its address by sending its own <code>X-Forwarded-For</code>, because its own entries sit to the left of the one the proxy adds.</li>
+<li>The standard <code>Forwarded</code> header (RFC 7239) is not read in this plan. Caddy, nginx, IIS and the common tunnels all send the <code>X-Forwarded-*</code> ones.</li>
+</ul></li>
+<li><strong>In production mode, the server answers only through its proxies.</strong>
+<ul>
+<li>A request from an address that is not a trusted proxy gets <code>403</code> for everything except <code>GET /healthz</code> from loopback (the Windows Start shortcut uses it).</li>
+<li>Using ShareCraft directly at <code>http://127.0.0.1:8787</code> on the server computer stops working in production mode; people there use the public address too. This keeps one cookie, one origin and one set of rules.</li>
+</ul></li>
+<li><strong>Plain HTTP stays refused.</strong>
+<ul>
+<li>A request the proxy says arrived over plain HTTP (<code>X-Forwarded-Proto</code> is not <code>https</code>, or is missing): a <code>GET</code> or <code>HEAD</code> for a page is redirected (<code>308</code>) to the same path at the public address; anything else gets <code>403 https_required</code>.</li>
+<li>The server refuses to start with an <code>http://</code> public address, or with a non-loopback <code>SHARECRAFT_ADDR</code> in development mode (as today).</li>
+</ul></li>
+<li><strong>The session cookie in production mode</strong> is <code>__Host-sharecraft_session=…; Secure; HttpOnly; SameSite=Lax; Path=/; Max-Age=…</code>.
+<ul>
+<li>The <code>__Host-</code> prefix makes browsers refuse it unless it is <code>Secure</code>, has <code>Path=/</code> and no <code>Domain</code>, so another site on a neighbouring subdomain cannot plant or overwrite it.</li>
+<li><code>SameSite</code> stays <code>Lax</code>: links from email or chat to a ShareCraft page must arrive signed in. The origin check, not <code>SameSite</code>, is what stops cross-site changes.</li>
+<li>Switching modes signs everyone out once, because the cookie's name changes. That is intended.</li>
+</ul></li>
+<li><strong>HSTS:</strong> <code>Strict-Transport-Security: max-age=31536000</code> on every production answer, without <code>includeSubDomains</code> or <code>preload</code>, because ShareCraft cannot know what else runs under the owner's domain.
+<ul>
+<li><code>SHARECRAFT_HSTS_SECONDS</code> can shorten it (for example <code>300</code> while trying production mode for the first time) or set it to <code>0</code>, which sends <code>max-age=0</code> to withdraw it.</li>
+</ul></li>
+<li><strong>Sign-in limits:</strong>
+<ul>
+<li><strong>Per account</strong> (kept from today): 5 failures within 15 minutes lock that email address until the oldest failure is 15 minutes old. While locked, even the right password is refused. The answer is <code>429 too_many_attempts</code> with <code>Retry-After</code> in seconds, and the sign-in page says when to try again.</li>
+<li><strong>Per address</strong> (new): 30 failures within 15 minutes from one client address lock that address out of signing in, for any account, the same way. An IPv6 client counts as its <code>/64</code>, since one person usually holds a whole <code>/64</code>.</li>
+<li><strong>Everyone at once</strong> (new): at most as many password checks run together as the computer has processor cores (at least 2). Others wait up to 10 seconds, then get <code>503 busy</code>. This stops a flood of guesses from taking the whole computer, because each check (Argon2) is deliberately slow.</li>
+<li>The counts stay in memory and reset on restart, as today. An attacker cannot restart the server, and keeping them in memory needs no database write per guess.</li>
+<li>No lock is permanent, and nothing is sent to the account holder. An administrator sees each lock as a <code>sign_in.locked</code> event, recorded once per lock.</li>
+</ul></li>
+<li><strong>The Windows package turns production mode on with one command</strong>, run from the installed program folder:
+<pre><code>"%LOCALAPPDATA%\Programs\ShareCraft\Set public address.cmd" https://share.example.com</code></pre>
+<ul>
+<li>It checks the address, writes it to <code>settings.cmd</code>, restarts ShareCraft and says what the proxy must send. <code>-Off</code> goes back to this-computer-only use.</li>
+<li>The package keeps listening on <code>127.0.0.1</code> only, so the proxy or tunnel runs on the same computer. Listening on the network would need a Windows Firewall rule, which needs administrator rights; the package avoids that.</li>
+<li>The README gives worked examples for two setups: a tunnel run by the Windows user (no open ports, no administrator rights), and Caddy on the same computer. It names no tunnel provider as the right one.</li>
+</ul></li>
+<li><strong>The browser check needs a local HTTPS proxy.</strong> Two ways, for the owner to choose:
+<ul>
+<li><strong>(a, proposed)</strong> a small <code>cargo xtask tls-proxy</code> command for development only: HTTPS on <code>127.0.0.1:8443</code> with a self-signed certificate for <code>sharecraft.localhost</code>, adding the forwarded headers. It adds <code>tokio-rustls</code> and <code>rcgen</code> to <code>xtask</code> only, never to the server, and installs nothing on the computer.</li>
+<li><strong>(b)</strong> Caddy installed on the build computer, which needs the owner's go-ahead to install.</li>
+</ul>
+Either way, the owner checks once on the real installation at the real public address; the build computer cannot do that.</li>
+</ol>
+
+<h2>Not in this plan</h2>
+<ul class="band">
+<li>TLS inside ShareCraft itself (certificates, ACME). The proxy or tunnel does it.</li>
+<li>Single sign-on, multi-factor sign-in and password reset by email (SC-11). Production mode makes them more urgent; each is its own plan.</li>
+<li>A Windows service, or starting before anyone signs in to Windows.</li>
+<li>Serving under a path, or at more than one public address.</li>
+<li>Rate limits on routes other than sign-in and anyone-link lookups. The API's other routes all need a session.</li>
+<li>Linux and macOS packages. The server settings work there unchanged; only the Windows scripts are updated here.</li>
+</ul>
+
+<h2>Global constraints</h2>
+<ul class="band">
+<li><strong>Settings</strong> (read in <code>Config::from_env</code>; none is a secret, all are safe to print):
+<table>
+<thead><tr><th>Variable</th><th>Default</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td><code>SHARECRAFT_PUBLIC_URL</code></td><td>unset</td><td>Unset: development mode, exactly as today. Set: production mode at this <code>https://</code> origin.</td></tr>
+<tr><td><code>SHARECRAFT_TRUSTED_PROXIES</code></td><td><code>127.0.0.1, ::1</code> in production; ignored in development</td><td>Addresses and ranges whose forwarded headers are believed.</td></tr>
+<tr><td><code>SHARECRAFT_HSTS_SECONDS</code></td><td><code>31536000</code></td><td>The HSTS <code>max-age</code>; <code>0</code> withdraws it.</td></tr>
+<tr><td><code>SHARECRAFT_ADDR</code></td><td><code>127.0.0.1:8787</code></td><td>Unchanged in development (loopback only). In production any address is allowed, because untrusted peers are refused anyway.</td></tr>
+</tbody>
+</table></li>
+<li><strong>Refusals at start</strong> (each a <code>ConfigError</code> with a plain-English message, and the process exits):
+<ul>
+<li><code>PublicUrlNotHttps</code>: the public address starts with anything but <code>https://</code>.</li>
+<li><code>BadPublicUrl</code>: not a URL, or it has a path other than <code>/</code>, a query, a fragment, a user name or password, or a host that is not lowercase ASCII (international names must be given in their <code>xn--</code> form).</li>
+<li><code>BadTrustedProxies</code>: an entry is not an address or range, or a range is wider than allowed (proposal 2).</li>
+<li><code>ProxiesWithoutPublicUrl</code>: <code>SHARECRAFT_TRUSTED_PROXIES</code> is set but the public address is not, so the owner meant production mode and missed a setting.</li>
+<li><code>NotLoopback</code>: as today, in development mode only.</li>
+</ul></li>
+<li><strong>Start-up message:</strong> development mode prints today's two lines unchanged. Production mode prints <code>ShareCraft server listening on &lt;addr&gt;</code>, then <code>Production mode: public address https://share.example.com, trusted proxies 127.0.0.1, ::1</code>.</li>
+<li><strong>The source of a request</strong> (<code>Source</code>, set by one middleware in front of every route, including the static files and the WebSocket):
+<ul>
+<li>Development: <code>client_ip</code> is the peer; <code>https</code> is false; nothing forwarded is read.</li>
+<li>Production, peer is a trusted proxy: <code>client_ip</code> comes from <code>X-Forwarded-For</code> as in proposal 3 (the peer itself if the header is missing or unreadable); <code>https</code> is true only if the last <code>X-Forwarded-Proto</code> value is exactly <code>https</code>; the host is <code>X-Forwarded-Host</code> if present, otherwise <code>Host</code>.</li>
+<li>Production, peer is not a trusted proxy: <code>403</code> with a plain-text body, except <code>GET /healthz</code> from loopback.</li>
+<li>Several <code>X-Forwarded-Host</code> or <code>X-Forwarded-Proto</code> headers, or a list in one, are read from the last value, which is the one the nearest proxy wrote.</li>
+</ul></li>
+<li><strong>The origin check</strong> (<code>same_origin</code> becomes <code>Deployment::same_origin(&amp;HeaderMap, &amp;Source)</code>; used by <code>require_same_origin</code> in <code>api/mod.rs</code>, by <code>ws.rs</code> and by <code>editors.rs</code>):
+<ul>
+<li>Development: unchanged, byte for byte.</li>
+<li>Production: the host (port included, default <code>443</code> left out on both sides) must equal the public address's host, ignoring case; <code>Source.https</code> must be true; and, if <code>Origin</code> is present, it must equal the public origin exactly, ignoring case. <code>Origin: null</code> is refused.</li>
+<li>As today, every <code>/api</code> request other than <code>GET</code> must carry <code>Origin</code>. That rule, with the exact-origin match, is the cross-site request protection, and it does not change.</li>
+<li>The WebSocket refusal message changes from &ldquo;only local, same-origin connections are allowed&rdquo; to &ldquo;only same-origin connections are allowed&rdquo; in both modes.</li>
+</ul></li>
+<li><strong>Cookies</strong> (<code>auth.rs</code>): the name and attributes come from <code>Deployment</code>.
+<ul>
+<li>Development: <code>sharecraft_session=…; HttpOnly; SameSite=Lax; Path=/; Max-Age=…</code>, as today.</li>
+<li>Production: proposal 6. The cleared cookie uses the same name and attributes with <code>Max-Age=0</code>.</li>
+<li>Production reads only <code>__Host-sharecraft_session</code>; a leftover development cookie is ignored, never accepted.</li>
+</ul></li>
+<li><strong>Security headers</strong> (<code>security_headers</code> in <code>lib.rs</code>):
+<ul>
+<li>Kept in both modes, with the same rule that an answer's own value wins: <code>Content-Security-Policy</code> (<code>default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; frame-src 'self'; frame-ancestors 'none'</code>), an editor's own policy, a download's sandbox, <code>X-Content-Type-Options: nosniff</code>, <code>Referrer-Policy: same-origin</code>, and <code>no-referrer</code> on link pages.</li>
+<li>Production adds <code>Strict-Transport-Security</code> on every answer, errors and the <code>308</code> redirect included, but not on <code>403</code> answers to untrusted peers (they never came over HTTPS).</li>
+<li><code>'self'</code> in the policy already means the public origin when the page is loaded from it; no address is written into the policy.</li>
+</ul></li>
+<li><strong>Addresses the server writes:</strong> every address built from <code>Host</code> today is built from the public address in production. Known: <code>link_url</code> in <code>api/links.rs</code>. Task 5 greps for <code>http://</code> and <code>HOST</code> across <code>crates/server/src</code> and <code>web/</code> to find any other. Development keeps <code>http://&lt;Host&gt;</code>.</li>
+<li><strong>Sign-in</strong> (<code>api/session.rs</code>, <code>auth.rs</code>, <code>records/src/accounts.rs</code>):
+<ul>
+<li>The order of checks is: the address limit, then the account limit, then a slot from the password-check pool, then the password. Each limit refusal answers the same <code>429 too_many_attempts</code> with <code>Retry-After</code>, whether or not the account exists.</li>
+<li>Timing: an unknown email already pays for one Argon2 check against the dummy hash. The remaining difference, the <code>sign_in.failed</code> event written only for a known account, moves to a task spawned after the answer is decided, so the answer's time does not depend on whether the account exists.</li>
+<li>The address limit is keyed by <code>Source.client_ip</code>, so in development every attempt counts against <code>127.0.0.1</code>. The development limit stays at 30, which tests and a single person never reach.</li>
+<li>Password rules are unchanged: 10 to the maximum length in <code>accounts.rs</code>, Argon2 hashing, longer passwords checked against the dummy hash.</li>
+<li>Both throttle tables keep today's bound (10,000 entries) and today's eviction rule.</li>
+</ul></li>
+<li><strong>Anyone-link lookups:</strong> an address that gets 60 <code>404 link_not_found</code> answers within 15 minutes gets <code>429 too_many_attempts</code> for <code>/api/l/</code> until the oldest is 15 minutes old. Tokens are long and random, so this only slows mass guessing; working links are never counted.</li>
+<li><strong>Events:</strong> <code>sign_in.locked</code> <code>{by: "account" | "address", until}</code>, recorded once when a lock starts, with the account as subject when known. The client address is recorded in it, and nowhere else new.</li>
+<li><strong>Errors</strong> (each with a plain-English message in <code>common.js</code>):
+<ul>
+<li><code>too_many_attempts</code> 429 (kept; now with <code>Retry-After</code>)</li>
+<li><code>busy</code> 503 with <code>Retry-After: 10</code></li>
+<li><code>https_required</code> 403</li>
+<li><code>forbidden</code> 403 (kept, for a failed origin check)</li>
+</ul></li>
+<li><strong>Upgrade:</strong> no database migration. An installation that sets nothing behaves exactly as before.</li>
+</ul>
+
+<h2>Review focus</h2>
+<ol class="band">
+<li><strong>Nobody can forge where a request came from.</strong> Covered by Task 2, <code>forwarded_headers_only_from_trusted_proxies</code>:
+<ul>
+<li>an untrusted peer sending <code>X-Forwarded-For</code>, <code>X-Forwarded-Proto: https</code> and <code>X-Forwarded-Host</code>;</li>
+<li>a client behind the trusted proxy adding its own <code>X-Forwarded-For: 1.2.3.4</code> before the proxy's entry;</li>
+<li>a chain of two trusted proxies;</li>
+<li>repeated and comma-joined header values, empty values, and values that are not addresses.</li>
+</ul>
+Each gives the right client address, or a refusal, never the forged one.</li>
+<li><strong>Cross-site requests stay refused at the public address.</strong> Covered by Task 2, <code>public_origin_check</code>: <code>Origin</code> of another site, of <code>http://</code> the public host, of the public host with another port, of <code>null</code>, and missing on a <code>POST</code>; a <code>Host</code> of another name (DNS rebinding); and the same for the WebSocket and editor routes.</li>
+<li><strong>Nothing works over plain HTTP in production</strong>, and development mode is unchanged. Covered by Task 2, <code>plain_http_refused</code>, and the existing tests, which run in development mode and must pass untouched.</li>
+<li><strong>The cookie is never sent or accepted unsafely.</strong> Covered by Task 3, <code>production_cookie_attributes</code> and <code>development_cookie_ignored_in_production</code>.</li>
+<li><strong>Sign-in reveals nothing and cannot be hammered.</strong> Covered by Task 4: <code>limits_per_account_and_address</code>, <code>locked_even_with_right_password</code>, <code>same_work_for_unknown_and_known_accounts</code> (counts Argon2 checks and database writes before the answer, rather than timing them) and <code>password_checks_are_pooled</code>.</li>
+</ol>
+
+<div class="task">
+<h3>Task 1: settings and the deployment description (pure code)</h3>
+<p><strong>Files:</strong>
+<ul>
+<li><strong>Create:</strong> <code>crates/server/src/deployment.rs</code> (<code>Deployment</code>, <code>PublicUrl</code>, <code>TrustedProxies</code>, <code>IpRange</code>).</li>
+<li><strong>Modify:</strong> <code>crates/server/src/config.rs</code> (<code>Config.deployment</code>, the new variables and errors, <code>from_values</code> taking a <code>Settings</code> struct instead of a growing list of arguments), <code>crates/server/src/lib.rs</code> (module, <code>AppState::deployment()</code>, the start-up message).</li>
+</ul></p>
+<ul class="band">
+<li><code>PublicUrl::parse(&amp;str) -&gt; Result&lt;PublicUrl, ConfigError&gt;</code>, holding the lowercase host, the port if not 443, and <code>origin()</code> (<code>https://host[:port]</code>).</li>
+<li><code>IpRange::parse</code> for <code>1.2.3.4</code>, <code>1.2.3.0/24</code>, <code>::1</code>, <code>fd00::/48</code>; <code>contains(IpAddr)</code>, treating an IPv4-mapped IPv6 peer (<code>::ffff:1.2.3.4</code>) as its IPv4 address.</li>
+<li><code>TrustedProxies::contains(IpAddr)</code>; the production default.</li>
+<li><code>Deployment::is_production()</code>, <code>cookie_name()</code>, <code>hsts_value()</code>.</li>
+<li><code>parse_addr</code> keeps the loopback refusal for development only.</li>
+</ul>
+<ol class="steps">
+<li>Write failing tests:
+<ul>
+<li><code>public_url_parsing</code> (accepted forms; refused: <code>http://</code>, a path, a query, a fragment, user info, upper case, a non-ASCII host, an empty host, port 0)</li>
+<li><code>trusted_proxy_ranges</code> (single addresses, ranges, IPv4-mapped peers, too-wide ranges refused, <code>0.0.0.0/0</code> refused)</li>
+<li><code>unset_public_url_is_development</code> (every field as today; <code>defaults_are_local</code> still passes)</li>
+<li><code>production_allows_any_listen_address</code></li>
+<li><code>proxies_without_public_url_refused</code></li>
+<li><code>hsts_seconds_setting</code></li>
+</ul></li>
+<li>Run: they fail. Implement. Run <code>cargo xtask check</code>: it passes.</li>
+<li>Commit <code>feat: production mode settings: public address, trusted proxies, HSTS</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 2: requests through the proxy, and the origin check</h3>
+<p><strong>Files:</strong>
+<ul>
+<li><strong>Modify:</strong> <code>crates/server/src/lib.rs</code> (<code>serve_state</code> uses <code>into_make_service_with_connect_info::&lt;SocketAddr&gt;()</code>; <code>require_loopback</code> applies in development only; the <code>source</code> middleware outermost), <code>crates/server/src/auth.rs</code> (<code>same_origin</code> moves behind <code>Deployment</code>), <code>crates/server/src/api/mod.rs</code>, <code>crates/server/src/ws.rs</code>, <code>crates/server/src/editors.rs</code>, <code>crates/server/src/deployment.rs</code> (<code>Source</code>, <code>source_of</code>).</li>
+<li><strong>Create:</strong> <code>crates/server/tests/production.rs</code>, with a helper in <code>tests/common</code> that starts a production server on loopback and sends requests as a proxy would (setting the forwarded headers), and one that connects from a second loopback address (<code>127.0.0.2</code>) to act as an untrusted peer.</li>
+</ul></p>
+<ul class="band">
+<li><code>source_of(peer, &amp;HeaderMap, &amp;Deployment) -&gt; Result&lt;Source, Refusal&gt;</code> is pure, so most cases are unit tests.</li>
+<li>The middleware answers refusals itself: <code>403</code> for an untrusted peer; <code>308</code> or <code>403 https_required</code> for plain HTTP (proposal 5).</li>
+<li>The redirect target is built from the public address and the request's path and query only, never from a header.</li>
+<li>Tests that call <code>router(state).oneshot(...)</code> without a connection get no <code>ConnectInfo</code>; the middleware then treats the request as from loopback, but only in development mode. In production a missing peer is refused.</li>
+</ul>
+<ol class="steps">
+<li>Write failing tests:
+<ul>
+<li><code>forwarded_headers_only_from_trusted_proxies</code> (review focus 1)</li>
+<li><code>public_origin_check</code> (review focus 2)</li>
+<li><code>plain_http_refused</code> (the redirect for pages, <code>https_required</code> for the API, start refused with an <code>http://</code> address)</li>
+<li><code>untrusted_peer_refused_except_health</code></li>
+<li><code>websocket_and_editors_at_public_address</code></li>
+<li><code>development_mode_unchanged</code> (the existing <code>same_origin_needs_a_loopback_host_and_a_matching_origin</code> cases, run through the new function)</li>
+</ul></li>
+<li>Run: they fail. Implement. Run <code>cargo xtask check</code> and the whole server test suite: they pass, the existing tests untouched.</li>
+<li>Commit <code>feat: production mode: trusted proxies and the public origin check</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 3: cookies and security headers on HTTPS</h3>
+<p><strong>Files:</strong>
+<ul>
+<li><strong>Modify:</strong> <code>crates/server/src/auth.rs</code> (<code>session_cookie</code>, <code>cleared_cookie</code> and <code>session_token</code> take the <code>Deployment</code>), <code>crates/server/src/api/session.rs</code>, <code>crates/server/src/lib.rs</code> (<code>security_headers</code> adds HSTS in production), any other place that sets or reads the cookie (Task 3 greps for <code>COOKIE</code>).</li>
+<li><strong>Test:</strong> <code>crates/server/tests/production.rs</code>.</li>
+</ul></p>
+<ol class="steps">
+<li>Write failing tests:
+<ul>
+<li><code>production_cookie_attributes</code> (sign in through the proxy helper: <code>__Host-</code> name, <code>Secure</code>, <code>HttpOnly</code>, <code>SameSite=Lax</code>, <code>Path=/</code>, no <code>Domain</code>; sign out clears the same name)</li>
+<li><code>development_cookie_ignored_in_production</code></li>
+<li><code>hsts_on_every_production_answer</code> (a page, an API success, an API error, the redirect, a WebSocket refusal; not on an untrusted-peer refusal; never in development)</li>
+<li><code>existing_headers_kept_in_production</code> (CSP, <code>nosniff</code>, <code>Referrer-Policy</code>, an editor's own CSP, a download's sandbox, a link page's <code>no-referrer</code>)</li>
+</ul></li>
+<li>Run: they fail. Implement. Run <code>cargo xtask check</code>: it passes.</li>
+<li>Commit <code>feat: production mode: __Host- Secure cookie and HSTS</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 4: sign-in protection for the internet</h3>
+<p><strong>Files:</strong>
+<ul>
+<li><strong>Modify:</strong> <code>crates/server/src/auth.rs</code> (<code>Throttle</code> becomes generic over its key, with a limit and a <code>retry_after(now)</code>; an <code>AddressKey</code> that folds IPv6 to <code>/64</code>), <code>crates/server/src/api/session.rs</code> (the order of checks; <code>Retry-After</code>), <code>crates/server/src/lib.rs</code> (the address throttle, the link-lookup throttle and the password-check pool in <code>AppState</code>), <code>crates/records/src/accounts.rs</code> (the failure event written after the answer), <code>crates/server/src/links.rs</code> (the lookup limit), <code>crates/server/src/api/mod.rs</code> (<code>busy</code>, <code>Retry-After</code> on <code>too_many_attempts</code>), <code>web/signin.js</code> and <code>web/common.js</code> (messages: &ldquo;Too many attempts. Try again in 12 minutes.&rdquo;).</li>
+<li><strong>Test:</strong> unit tests in <code>auth.rs</code>; <code>crates/server/tests/accounts.rs</code> and <code>tests/production.rs</code>; the page's web test.</li>
+</ul></p>
+<ul class="band">
+<li>The password-check pool is a <code>tokio::sync::Semaphore</code> sized by <code>std::thread::available_parallelism()</code>, at least 2. The wait is <code>tokio::time::timeout(10 s)</code>.</li>
+<li><code>records::Db::sign_in</code> returns what to record instead of recording it; the handler spawns the write. A test hook counts Argon2 checks and database writes before the answer.</li>
+<li>A lock's <code>sign_in.locked</code> event is recorded when the count first reaches the limit, not on every refusal.</li>
+</ul>
+<ol class="steps">
+<li>Write failing tests:
+<ul>
+<li><code>limits_per_account_and_address</code> (5 for one account from many addresses; 30 across many accounts from one address; IPv6 addresses in one <code>/64</code> share a count; a different <code>/64</code> does not)</li>
+<li><code>locked_even_with_right_password</code></li>
+<li><code>retry_after_is_stated</code></li>
+<li><code>same_work_for_unknown_and_known_accounts</code></li>
+<li><code>password_checks_are_pooled</code> (more simultaneous attempts than slots: the extra ones wait, and answer <code>busy</code> after the wait)</li>
+<li><code>lock_recorded_once</code></li>
+<li><code>link_lookup_limit</code> (60 unknown tokens from one address, then <code>429</code>; working links never counted)</li>
+<li>web: <code>signin_shows_wait_time</code></li>
+</ul></li>
+<li>Run: they fail. Implement. Run <code>cargo xtask check</code> and the web tests: they pass.</li>
+<li>Commit <code>feat: sign-in limits per account and address, pooled password checks</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 5: anyone links and access requests at the public address</h3>
+<p><strong>Files:</strong>
+<ul>
+<li><strong>Modify:</strong> <code>crates/server/src/api/links.rs</code> (<code>link_url</code> takes the <code>Deployment</code>: the public origin in production, <code>http://&lt;Host&gt;</code> in development) and any other address built from <code>Host</code> that the grep finds. The pages need no change: they use relative addresses and <code>location.origin</code>, and the &ldquo;links only work on the local machine&rdquo; warning lives only in BUILDING section 24 (Task 7).</li>
+<li><strong>Test:</strong> <code>crates/server/tests/links.rs</code>, <code>crates/server/tests/requests.rs</code> and <code>tests/production.rs</code>.</li>
+</ul></p>
+<ol class="steps">
+<li>Write failing tests:
+<ul>
+<li><code>link_address_is_public</code> (created through the proxy helper: <code>https://share.example.com/l/&lt;token&gt;</code>; the request's own <code>Host</code> or <code>X-Forwarded-Host</code> is never copied in)</li>
+<li><code>anyone_link_works_signed_out_at_public_address</code> (the landing page, children, content, preview; no cookie set or read; <code>no-referrer</code> kept)</li>
+<li><code>signed_in_link_and_access_request_at_public_address</code> (redeem with the <code>__Host-</code> cookie; ask for access from a link; an owner decides it)</li>
+</ul></li>
+<li>Run: they fail. Implement. Run <code>cargo xtask check</code>: it passes.</li>
+<li>Commit <code>feat: links and access requests at the public address</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 6: the Windows package</h3>
+<p><strong>Files:</strong>
+<ul>
+<li><strong>Create:</strong> <code>packaging/windows/Set public address.cmd</code> and <code>packaging/windows/scripts/public-address.ps1</code>.</li>
+<li><strong>Modify:</strong> <code>packaging/windows/scripts/common.ps1</code> (<code>Write-SettingsFile</code> and <code>Read-SettingsFile</code> carry the optional <code>SHARECRAFT_PUBLIC_URL</code>, <code>SHARECRAFT_TRUSTED_PROXIES</code> and <code>SHARECRAFT_HSTS_SECONDS</code>; <code>Set-ServerEnvironment</code> passes them on; the browser opens the public address when one is set; <code>SHARECRAFT_ADDR</code> must still be <code>127.0.0.1:&lt;port&gt;</code>), <code>install.ps1</code> (a reinstall keeps the public address), <code>xtask/src/package.rs</code> (copies the new files; its listing test names them), <code>packaging/windows/tests/scripts.Tests.ps1</code>, <code>packaging/windows/README.html</code>.</li>
+</ul></p>
+<ul class="band">
+<li><code>public-address.ps1 -Url https://…</code>:
+<ul>
+<li>checks the form (proposal 1) before writing anything, so a mistake leaves the settings as they were;</li>
+<li>writes the settings, stops and starts ShareCraft, waits for <code>/healthz</code>;</li>
+<li>prints, in plain English: the address to give the proxy (<code>http://127.0.0.1:&lt;port&gt;</code>), the headers it must send (<code>Host</code> or <code>X-Forwarded-Host</code>, <code>X-Forwarded-For</code>, <code>X-Forwarded-Proto: https</code>), that WebSockets must be passed through, and that the request size limit must allow at least 9 MB (uploads come in 8 MiB parts).</li>
+</ul></li>
+<li><code>-Off</code> removes the three settings and restarts; <code>-Status</code> shows the current mode. No variant asks for or writes a secret.</li>
+<li><strong>README</strong>, a new section &ldquo;Using ShareCraft from other computers&rdquo; after Signing in:
+<ul>
+<li>what production mode is and what it is not (ShareCraft does no HTTPS itself; the computer must stay on and signed in);</li>
+<li>two worked setups: a tunnel run as the Windows user, and Caddy on the same computer, with a minimal Caddyfile (<code>share.example.com { reverse_proxy 127.0.0.1:8787 }</code>, which sends the right headers by default);</li>
+<li>for nginx or IIS, the four things to set: pass <code>Host</code>, set <code>X-Forwarded-For</code> and <code>X-Forwarded-Proto</code>, pass WebSocket upgrades, allow bodies of 9 MB;</li>
+<li>a checklist: sign in at the public address, make an anyone link and open it in a private window, open a document in an editor;</li>
+<li>the security advice: use strong passwords for every account, keep the computer updated, start with a short HSTS time;</li>
+<li>a troubleshooting table: &ldquo;Forbidden&rdquo; (the address does not match, or the proxy sends the wrong host), &ldquo;https required&rdquo; (the proxy does not send <code>X-Forwarded-Proto</code>), signed out on every page (the browser is on <code>http://</code>), editors never connect (WebSockets not passed), uploads fail at 1 MB (the proxy's size limit).</li>
+</ul>
+Section 9, Limits, changes &ldquo;This computer only&rdquo; to describe both modes, and &ldquo;No HTTPS&rdquo; to say HTTPS is the proxy's job.</li>
+</ul>
+<ol class="steps">
+<li>Write failing Pester tests:
+<ul>
+<li><code>settings round-trip with and without a public address</code></li>
+<li><code>public address is checked before anything is written</code> (<code>http://</code>, a path, spaces, quotes and <code>%</code> refused; settings unchanged)</li>
+<li><code>off removes production settings</code></li>
+<li><code>reinstall keeps the public address</code></li>
+<li><code>settings still refuse a non-loopback SHARECRAFT_ADDR</code></li>
+</ul>
+And in <code>xtask</code>: <code>package_includes_public_address_script</code>.</li>
+<li>Run: they fail. Implement. Run the Pester tests and <code>cargo xtask check</code>: they pass.</li>
+<li>Build the package into J: and install it into a temporary profile folder as the existing package checks do; run <code>Set public address.cmd</code> with <code>https://sharecraft.localhost:8443</code>, then <code>-Status</code>, then <code>-Off</code>, and record each result.</li>
+<li>Commit <code>feat: Windows package: Set public address, and the README guide</code>.</li>
+</ol></div>
+
+<div class="task">
+<h3>Task 7 (controller): browser check and documents</h3>
+<ol class="steps">
+<li>If the owner chose proposal 10 (a): add <code>cargo xtask tls-proxy</code> (<code>--listen 127.0.0.1:8443 --to 127.0.0.1:8787 --name sharecraft.localhost</code>), with a test that it adds the forwarded headers and passes WebSocket upgrades through. Commit <code>test: xtask tls-proxy for checking production mode locally</code>.</li>
+<li>Back up the data folder and the database, build the server into J:, and start it with <code>SHARECRAFT_PUBLIC_URL=https://sharecraft.localhost:8443</code> behind the local HTTPS proxy. Accept the self-signed certificate in the browser pane for this check only.</li>
+<li>Check, recording each as done or not:
+<ol>
+<li>Sign in at the public address. In the browser's storage view, the cookie is <code>__Host-sharecraft_session</code>, <code>Secure</code>, <code>HttpOnly</code>.</li>
+<li>Open a site, a library and a document in an editor; type in two windows at once (the WebSocket works through the proxy).</li>
+<li>Upload a file over 8 MiB.</li>
+<li>Make an anyone link; it reads <code>https://sharecraft.localhost:8443/l/…</code>; open it in a private window, signed out.</li>
+<li>Make a signed-in link; open it as another person; ask for access; decide the request as the owner.</li>
+<li>Fail sign-in six times: the sixth says how long to wait.</li>
+<li><code>http://127.0.0.1:8787</code> directly: pages load, but sign-in is refused with a plain message.</li>
+<li>Response headers on a page: CSP, HSTS, <code>nosniff</code>, <code>Referrer-Policy</code>.</li>
+<li>Light and dark mode, and 375 px, on the sign-in page's new wait message.</li>
+</ol></li>
+<li>Restart without <code>SHARECRAFT_PUBLIC_URL</code> and confirm development mode at <code>http://127.0.0.1:8787</code> as before.</li>
+<li>Update the documents:
+<ul>
+<li>BUILDING.html: section 04 gains the new variables and both modes; a new section before Licences, &ldquo;Production mode&rdquo;; section 21 drops &ldquo;local connections only&rdquo;; section 24's link note says links use the public address in production.</li>
+<li>scope.html: the proposals as decisions, numbered after plan 4B's (D54 onward); section 06 notes what production mode does and does not yet cover (no single sign-on, no multi-factor sign-in).</li>
+<li>sequencing.html: the progress note.</li>
+</ul></li>
+<li>Commit <code>docs: production mode</code>.</li>
+<li>Ask the owner to try the real installation at its real public address with the README checklist, and record the result in the README's &ldquo;What has and has not been checked&rdquo;.</li>
+</ol></div>
+</main></body>
+</html>
