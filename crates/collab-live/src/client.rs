@@ -102,6 +102,10 @@ pub const MAX_ENTRIES_PER_WINDOW: usize = 20;
 /// The window [`MAX_ENTRIES_PER_WINDOW`] counts over, in milliseconds.
 pub const PACE_WINDOW_MS: u64 = 1_000;
 
+/// The shortest heartbeat interval the client takes from the server; the longest is
+/// [`HEARTBEAT_MS`].
+pub const MIN_HEARTBEAT_MS: u64 = 1_000;
+
 /// When a local change is shown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -255,6 +259,9 @@ struct Pending {
     sent: bool,
     /// Whether it is applied in what is shown now.
     shown: bool,
+    /// The participant number it was shown under, which may differ from the one the server
+    /// stored it under after the client returned with a new number.
+    shown_as: ParticipantNo,
     /// Whether showing it read the (missing) stamp.
     read_stamp: bool,
     /// What showing it did.
@@ -569,6 +576,7 @@ impl<E: LiveEditor> LiveClient<E> {
             mode,
             sent: false,
             shown,
+            shown_as: self.own_participant(),
             read_stamp,
             effect,
         });
@@ -583,7 +591,13 @@ impl<E: LiveEditor> LiveClient<E> {
     /// [`MAX_ENTRIES_PER_WINDOW`] in any [`PACE_WINDOW_MS`]; the ones held back by the pace go
     /// on a later tick, so the host calls this often (every few hundred milliseconds) while
     /// [`LiveClient::unsent`] is above zero, and at least once a second otherwise.
+    ///
+    /// Every `now_ms` the host passes must come from a monotonic clock (`performance.now()` in
+    /// the browser, `Instant` on the desktop), never the wall clock. If it goes backwards all
+    /// the same, the client starts its heartbeat and pacing timers again from the new time
+    /// rather than stall.
     pub fn tick(&mut self, now_ms: u64) -> Vec<String> {
+        self.clock_check(now_ms);
         let mut send = Vec::new();
         let connected =
             self.joined && !matches!(self.phase, Phase::Offline | Phase::Joining | Phase::Closed);
@@ -674,6 +688,7 @@ impl<E: LiveEditor> LiveClient<E> {
         if self.phase != Phase::Live || !self.can_edit {
             return;
         }
+        self.clock_check(now_ms);
         while self
             .entry_times
             .front()
@@ -701,6 +716,17 @@ impl<E: LiveEditor> LiveClient<E> {
         if self.phase == Phase::CatchingUp && self.agreed_seq >= self.head {
             self.phase = Phase::Live;
             self.send_unsent(now_ms, &mut step.send);
+        }
+    }
+
+    /// Starts the timers again from `now_ms` if the host's clock went back before them, so a
+    /// clock that jumps back never stops the heartbeat or holds the pace window shut.
+    fn clock_check(&mut self, now_ms: u64) {
+        if now_ms < self.last_heartbeat_ms {
+            self.last_heartbeat_ms = now_ms;
+        }
+        if self.entry_times.back().is_some_and(|&at| now_ms < at) {
+            self.entry_times.clear();
         }
     }
 
@@ -741,7 +767,8 @@ impl<E: LiveEditor> LiveClient<E> {
         self.session = Some(session);
         self.participant = Some(participant);
         self.can_edit = can_edit;
-        self.heartbeat_ms = heartbeat_ms;
+        // A server's interval outside 1 s to 60 s would flood it or let the place expire.
+        self.heartbeat_ms = heartbeat_ms.clamp(MIN_HEARTBEAT_MS, HEARTBEAT_MS);
         self.joined = true;
         if let Place::Returning { previous } = place {
             step.events.push(Event::Returned {
@@ -864,7 +891,7 @@ impl<E: LiveEditor> LiveClient<E> {
             payload,
         };
         if confirms && let Some(confirmed) = self.pending.pop_front() {
-            if confirmed.shown && !confirmed.read_stamp {
+            if confirmed.shown && !confirmed.read_stamp && confirmed.shown_as == participant {
                 // Already shown as the server ordered it: keep it on top of the copy.
                 self.folded.push(ordered);
                 self.agreed_seq = seq;
@@ -1010,6 +1037,7 @@ impl<E: LiveEditor> LiveClient<E> {
             match result {
                 Ok(outcome) => {
                     pending.shown = true;
+                    pending.shown_as = participant;
                     pending.read_stamp = outcome.read_stamp;
                     pending.effect = Some(outcome.effect);
                 }

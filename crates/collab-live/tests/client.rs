@@ -1246,3 +1246,116 @@ fn kept_place_under_another_number_is_desync() {
     assert_eq!(client.participant(), Some(ParticipantNo(1)));
     assert_eq!(client.new_ids(1).unwrap(), LiveId(1, 0));
 }
+
+// ---- Task 5, fix round 1 ----
+
+#[test]
+fn clock_going_backwards_does_not_stall() {
+    let mut doc = StandIn::new("a");
+    let mut client: LiveClient<StandIn> = LiveClient::new(config());
+    let start = 100_000;
+    client.connected(start);
+    client.receive(&mut doc, &joined(1), start).unwrap();
+    client.receive(&mut doc, &empty_catchup(), start).unwrap();
+    client.base_ready(&mut doc, start).unwrap();
+    let mut first = 0;
+    for _ in 0..21 {
+        let id = client.new_ids(1).unwrap();
+        let step = client
+            .local(&mut doc, insert(id, "x"), Mode::ShowAtOnce, start)
+            .unwrap();
+        first += entries(&step.send).len();
+    }
+    assert_eq!(first, 20);
+    // The host's clock jumps back by 95 seconds.
+    let frames = client.tick(5_000);
+    assert_eq!(entries(&frames).len(), 1, "the pace window starts again");
+    assert!(heartbeats(&frames).is_empty());
+    assert!(heartbeats(&client.tick(64_999)).is_empty());
+    assert_eq!(heartbeats(&client.tick(65_000)).len(), 1);
+    assert_eq!(heartbeats(&client.tick(125_000)).len(), 1);
+}
+
+#[test]
+fn rerun_under_new_number_is_not_folded_as_stored() {
+    let mut doc = Recording {
+        doc: StandIn::new("a"),
+        applied: Vec::new(),
+    };
+    let mut client = live(&mut doc, 2);
+    let id = client.new_ids(1).unwrap();
+    let payload = insert(id, "one");
+    client
+        .local(&mut doc, payload.clone(), Mode::ShowAtOnce, 10)
+        .unwrap();
+    // The server stored it under participant 2, then the place expired before it was confirmed.
+    client.disconnected(20);
+    client.connected(200_000);
+    client
+        .receive(
+            &mut doc,
+            &joined_as(5, json!({ "is": "returning", "previous": 2 }), true),
+            200_000,
+        )
+        .unwrap();
+    client
+        .receive(&mut doc, &catchup(0, 0, 1), 200_000)
+        .unwrap();
+    let mark = doc.applied.len();
+    client
+        .receive(
+            &mut doc,
+            &entry(1, 2, client.client(), 1, 0, &payload),
+            200_010,
+        )
+        .unwrap();
+    // The stored entry is applied as stored, under participant 2, not folded from the re-run.
+    assert!(
+        doc.applied[mark..].contains(&(Some(Seq(1)), ParticipantNo(2), true)),
+        "applied: {:?}",
+        &doc.applied[mark..]
+    );
+    assert_eq!(client.pending(), 0);
+    assert_eq!(client.phase(), Phase::Live);
+    assert_eq!(doc.doc.lines(), vec!["one"]);
+}
+
+#[test]
+fn pace_window_carries_across_a_reconnect() {
+    let mut doc = StandIn::new("a");
+    let mut client = live(&mut doc, 1);
+    let now = 10_000;
+    for _ in 0..20 {
+        let id = client.new_ids(1).unwrap();
+        client
+            .local(&mut doc, insert(id, "x"), Mode::ShowAtOnce, now)
+            .unwrap();
+    }
+    client.disconnected(now + 100);
+    client.connected(now + 200);
+    client
+        .receive(&mut doc, &joined_kept(1), now + 200)
+        .unwrap();
+    let step = client
+        .receive(&mut doc, &catchup(0, 0, 0), now + 200)
+        .unwrap();
+    assert!(entries(&step.send).is_empty(), "the window is still full");
+    assert!(entries(&client.tick(now + 999)).is_empty());
+    assert_eq!(entries(&client.tick(now + 1_000)).len(), 20);
+}
+
+#[test]
+fn server_heartbeat_interval_is_clamped() {
+    let mut doc = StandIn::new("a");
+    for (given, due) in [(0u64, 1_000u64), (500_000, 60_000)] {
+        let mut client: LiveClient<StandIn> = LiveClient::new(config());
+        client.connected(0);
+        let mut frame: Value = serde_json::from_str(&joined(1)).unwrap();
+        frame["heartbeat_ms"] = json!(given);
+        client.receive(&mut doc, &frame.to_string(), 0).unwrap();
+        client.receive(&mut doc, &empty_catchup(), 0).unwrap();
+        client.base_ready(&mut doc, 0).unwrap();
+        assert!(heartbeats(&client.tick(due - 1)).is_empty());
+        assert_eq!(heartbeats(&client.tick(due)).len(), 1);
+    }
+}
