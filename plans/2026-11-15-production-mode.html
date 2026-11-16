@@ -33,7 +33,8 @@ ol.steps>li:nth-child(even),ul.band>li:nth-child(even),ol.band>li:nth-child(even
 <li><code>Secure</code> cookies with the <code>__Host-</code> prefix, HSTS, and the existing Content Security Policy and security headers;</li>
 <li>sign-in protection fit for the internet: limits per account and per address, a lock with a stated wait, answers that take the same time whether or not an account exists;</li>
 <li>anyone links and access-request pages that work at the public address;</li>
-<li>a way to turn it on in the Windows package, with the README guide updated.</li>
+<li>a way to turn it on in the Windows package, with the README guide updated;</li>
+<li>a new installer zip, built from the finished branch, that the owner can install over the copy on the other computer with <code>-Reinstall</code>.</li>
 </ul></p>
 <p><strong>Architecture:</strong>
 <ul>
@@ -363,7 +364,7 @@ Section 9, Limits, changes &ldquo;This computer only&rdquo; to describe both mod
 </ul>
 And in <code>xtask</code>: <code>package_includes_public_address_script</code>.</li>
 <li>Run: they fail. Implement. Run the Pester tests and <code>cargo xtask check</code>: they pass.</li>
-<li>Build the package into J: and install it into a temporary profile folder as the existing package checks do; run <code>Set public address.cmd</code> with <code>https://sharecraft.localhost:8443</code>, then <code>-Status</code>, then <code>-Off</code>, and record each result.</li>
+<li>Build the package with <code>cargo xtask package</code> (into <code>J:\sharecraft-package</code>) and install it from its zip, not the folder, into a temporary profile folder as the existing package checks do; run <code>Set public address.cmd</code> with <code>https://sharecraft.localhost:8443</code>, then <code>-Status</code>, then <code>-Off</code>, and record each result.</li>
 <li>Commit <code>feat: Windows package: Set public address, and the README guide</code>.</li>
 </ol></div>
 
@@ -392,7 +393,15 @@ And in <code>xtask</code>: <code>package_includes_public_address_script</code>.<
 <li>sequencing.html: the progress note.</li>
 </ul></li>
 <li>Commit <code>docs: production mode</code>.</li>
-<li>Ask the owner to try the real installation at its real public address with the README checklist, and record the result in the README's &ldquo;What has and has not been checked&rdquo;.</li>
+<li><strong>Update the installer zip.</strong> With every change committed and the working tree clean (so the version is not marked <code>modified</code>), run <code>cargo xtask package</code>. It writes <code>J:\sharecraft-package\ShareCraft-0.1.0-&lt;commit&gt;-windows.zip</code> and its folder, named by the branch head. Then:
+<ul>
+<li>check that the zip holds <code>Set public address.cmd</code>, <code>scripts\public-address.ps1</code> and the new README section, and that <code>VERSION</code> names the branch head;</li>
+<li>install it from the zip into a temporary profile folder with <code>-Reinstall</code> over a copy of the previous package's install, and check that documents and accounts are kept and that <code>Set public address.cmd</code> works;</li>
+<li>record the zip's name and size in BUILDING and in the report to the owner;</li>
+<li>leave the older zips in <code>J:\sharecraft-package</code> alone; removing them is the owner's call.</li>
+</ul>
+If a later fix changes anything after this, build the zip again from the new head, so the zip always matches the last commit.</li>
+<li>Ask the owner to install the new zip on the other computer with <code>"Install ShareCraft.cmd" -Reinstall</code>, then try it at its real public address with the README checklist, and record the result in the README's &ldquo;What has and has not been checked&rdquo;.</li>
 </ol></div>
 </main></body>
 </html>
