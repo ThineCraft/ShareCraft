@@ -57,6 +57,7 @@ footer{border-top:1px solid var(--line);padding-top:16px;color:var(--muted);font
 <li><a href="#need">What you need</a></li>
 <li><a href="#install">Installing</a></li>
 <li><a href="#signin">Signing in</a></li>
+<li><a href="#public">Using ShareCraft from other computers</a></li>
 <li><a href="#startstop">Starting and stopping</a></li>
 <li><a href="#data">Where your data lives, and backups</a></li>
 <li><a href="#scanner">The malware scanner, and ClamAV</a></li>
@@ -75,7 +76,8 @@ footer{border-top:1px solid var(--line);padding-top:16px;color:var(--muted);font
 <thead><tr><th>Item</th><th>What it is</th></tr></thead>
 <tbody>
 <tr><td><code>Install ShareCraft.cmd</code></td><td>Double-click this to install.</td></tr>
-<tr><td><code>scripts\</code></td><td>The install, start, stop and uninstall scripts (Windows PowerShell).</td></tr>
+<tr><td><code>Set public address.cmd</code></td><td>Turns production mode on or off after installation.</td></tr>
+<tr><td><code>scripts\</code></td><td>The install, start, stop, public-address and uninstall scripts (Windows PowerShell).</td></tr>
 <tr><td><code>bin\sharecraft-server.exe</code></td><td>The ShareCraft server.</td></tr>
 <tr><td><code>bin\xtask.exe</code></td><td>The project's helper program. Here it runs only the stand-in malware scanner.</td></tr>
 <tr><td><code>web\</code>, <code>editors\</code></td><td>The pages and the four file editors.</td></tr>
@@ -123,10 +125,64 @@ footer{border-top:1px solid var(--line);padding-top:16px;color:var(--muted);font
 
 <section id="signin"><h2>4. Signing in</h2>
 <p>Open the address the installer showed, for example <code>http://127.0.0.1:8787/</code>, and sign in with the administrator's email address and password. As administrator you can add people on the People page, make sites, and change the organisation settings.</p>
-<p>Use <code>127.0.0.1</code> or <code>localhost</code> in the address; other names for the computer are refused.</p>
+<p>In this-computer-only mode, use <code>127.0.0.1</code> or <code>localhost</code> in the address; other names for the computer are refused. Section 5 explains how to use one public address instead.</p>
+<p>Once you are signed in, the foot of every page names the build that is running, for example <strong>ShareCraft 0.1.0-6a18271</strong>. It matches the name of the zip it came from (<code>ShareCraft-0.1.0-6a18271-windows.zip</code>) and the <code>VERSION</code> file, so you can tell whether a computer runs the latest copy. People who are not signed in are not shown it.</p>
 </section>
 
-<section id="startstop"><h2>5. Starting and stopping</h2>
+<section id="public"><h2>5. Using ShareCraft from other computers</h2>
+<p>Production mode lets people use one public HTTPS address, such as <code>https://share.example.com</code>. A reverse proxy or tunnel receives HTTPS and sends the request to ShareCraft on the same computer. ShareCraft checks that public address, trusts forwarded request details only from the proxy, uses secure browser cookies and sends an HSTS security header.</p>
+<div class="warn"><p><strong>ShareCraft does not provide HTTPS itself.</strong> Do not expose its loopback HTTP port directly. The proxy or tunnel must provide HTTPS. The ShareCraft computer must stay on, signed in to Windows and running ShareCraft.</p></div>
+<p>ShareCraft continues to listen only on <code>127.0.0.1</code>. Production mode does not open a Windows Firewall port, does not need administrator rights and does not turn ShareCraft into a Windows service. On the ShareCraft computer, use the public address too; the direct <code>http://127.0.0.1</code> address is only the proxy target and health check.</p>
+
+<h3>Turn production mode on</h3>
+<ol>
+<li>Set up a tunnel or reverse proxy using one of the examples below.</li>
+<li>Open a Command Prompt in <code>%LOCALAPPDATA%\Programs\ShareCraft</code>.</li>
+<li>Start with a short HSTS time while checking the setup:</li>
+</ol>
+<pre><code>"Set public address.cmd" -Url https://share.example.com -HstsSeconds 300</code></pre>
+<p>The command checks the address before changing anything, restarts ShareCraft, waits for it to answer, and prints the proxy settings. The address must be lowercase and start with <code>https://</code>. A port is allowed; a path, query, fragment, user name or password is not.</p>
+<p>When the setup works, run the command again with <code>-HstsSeconds 31536000</code> for one year. Use <code>"Set public address.cmd" -Status</code> to show the current mode. Use <code>"Set public address.cmd" -Off</code> to return to this-computer-only mode.</p>
+
+<h3>Setup A: a tunnel run as your Windows user</h3>
+<p>Choose a tunnel that gives you an HTTPS address and can forward HTTP and WebSockets. Run its program as the same Windows user who runs ShareCraft. Point the tunnel at <code>http://127.0.0.1:8787</code>, using the actual port shown by the command. This needs no incoming network port, no Windows Firewall change and no administrator rights. Follow the tunnel's own instructions to make it start when you sign in if that is wanted. No particular tunnel provider is required or recommended here.</p>
+
+<h3>Setup B: Caddy on the same computer</h3>
+<p>If you use Caddy, run it on the ShareCraft computer and put this in its Caddyfile, changing the name and port:</p>
+<pre><code>share.example.com {
+    reverse_proxy 127.0.0.1:8787
+}</code></pre>
+<p>Caddy obtains and serves HTTPS and sends the needed forwarded headers by default. Its process, like ShareCraft, must keep running.</p>
+
+<h3>nginx or IIS</h3>
+<p>Configure nginx or IIS to send requests to the loopback target printed by the command. Four details matter:</p>
+<ol>
+<li>Pass the original <code>Host</code>, or set <code>X-Forwarded-Host</code> to the public host.</li>
+<li>Set <code>X-Forwarded-For</code> to carry the visitor's address and <code>X-Forwarded-Proto</code> to <code>https</code>.</li>
+<li>Pass WebSocket upgrades through.</li>
+<li>Allow request bodies of at least 9 MB; ShareCraft sends uploads in 8 MiB parts.</li>
+</ol>
+
+<h3>Check the setup</h3>
+<ul>
+<li>Sign in at the public HTTPS address.</li>
+<li>Make an anyone link and open it in a private browser window.</li>
+<li>Open a document in an editor and confirm that it connects and saves.</li>
+</ul>
+<p>Use strong, different passwords for every ShareCraft account, and keep Windows, the browser, the proxy or tunnel, and ShareCraft updated.</p>
+
+<div class="table-wrap"><table class="banded"><caption>Production-mode problems</caption>
+<thead><tr><th>What you see</th><th>What to check</th></tr></thead>
+<tbody>
+<tr><td><strong>Forbidden</strong></td><td>The public address may not match, or the proxy may be sending the wrong <code>Host</code> or <code>X-Forwarded-Host</code>.</td></tr>
+<tr><td><strong>https required</strong></td><td>The proxy is not sending <code>X-Forwarded-Proto: https</code>.</td></tr>
+<tr><td>You are signed out on every page</td><td>Open the <code>https://</code> public address, not an <code>http://</code> address.</td></tr>
+<tr><td>Editors never connect</td><td>Make sure the proxy passes WebSocket upgrades.</td></tr>
+<tr><td>Uploads fail, often at 1 MB</td><td>Raise the proxy's request-body size limit to at least 9 MB.</td></tr>
+</tbody></table></div>
+</section>
+
+<section id="startstop"><h2>6. Starting and stopping</h2>
 <div class="table-wrap"><table class="banded"><caption>Start-menu shortcuts</caption>
 <thead><tr><th>Shortcut</th><th>What it does</th></tr></thead>
 <tbody>
@@ -139,7 +195,7 @@ footer{border-top:1px solid var(--line);padding-top:16px;color:var(--muted);font
 <div class="note"><p><strong>Stop after saving.</strong> Stopping ends ShareCraft at once. Changes typed in the last few seconds (at most 30 seconds) before stopping may be lost; everything saved before that is kept. Wait until the page says <em>Saved</em> before you stop.</p></div>
 </section>
 
-<section id="data"><h2>6. Where your data lives, and backups</h2>
+<section id="data"><h2>7. Where your data lives, and backups</h2>
 <p>Everything that is yours is in one folder: <code>%LOCALAPPDATA%\ShareCraft</code>. The documents are in <code>data</code>, and accounts, sharing and history are in the database in <code>db</code>. Both are needed; neither is enough alone.</p>
 <h3>To make a backup</h3>
 <ol>
@@ -152,21 +208,21 @@ footer{border-top:1px solid var(--line);padding-top:16px;color:var(--muted);font
 <p>Stop ShareCraft, put the copied folder back as <code>%LOCALAPPDATA%\ShareCraft</code> (replacing what is there), and start ShareCraft again. To restore on another computer, or for another Windows user, install there first, stop it, replace the folder, then run the installer again with <code>-Reinstall</code> (next sections) so it checks the ports.</p>
 </section>
 
-<section id="scanner"><h2>7. The malware scanner, and ClamAV</h2>
+<section id="scanner"><h2>8. The malware scanner, and ClamAV</h2>
 <p>ShareCraft can send every uploaded file to a malware scanner before anyone may open it. So that this can be tried at once, the installer switches on a <strong>stand-in scanner</strong>. It is not antivirus: it only recognises the standard EICAR test text (a harmless string made for testing scanners) and calls every other file clean.</p>
 <p>To use a real scanner, run ClamAV with c-icap (its ClamAV service) on a computer you control, then, signed in as administrator, open <strong>Organisation settings</strong> (the address ends in <code>/sharing.html</code>), find <strong>Malware scanner</strong>, and set the scanner address to your scanner's, for example <code>icap://scanner.example.org:1344/srv_clamav</code>. The part after the last <code>/</code> is whatever your scanner calls its service. Saving tests the address at once and says whether the scanner answered.</p>
 <p>The stand-in keeps running in the background after that; it does no harm. To switch scanning off altogether, empty the scanner address.</p>
 <p>ShareCraft has been tested only against the stand-in, not against a real ClamAV. Try a real scanner with a test file before relying on it.</p>
 </section>
 
-<section id="antivirus"><h2>8. Your computer's own antivirus</h2>
+<section id="antivirus"><h2>9. Your computer's own antivirus</h2>
 <div class="warn"><p><strong>Windows Security (or other antivirus) may delete files ShareCraft has stored.</strong> It watches the data folder like any other folder. If you upload the EICAR test file to try the scanner, your antivirus may remove the stored copy, and ShareCraft then reports the file's content as missing. This is your antivirus working, not a fault in ShareCraft. To try the scanner, use a file with some other text before the test string, and delete it afterwards.</p></div>
 </section>
 
-<section id="limits"><h2>9. Limits</h2>
+<section id="limits"><h2>10. Limits</h2>
 <ul>
-<li><strong>This computer only.</strong> ShareCraft answers only at <code>http://127.0.0.1:&lt;port&gt;</code> on this computer. Phones, other computers and other people on your network cannot reach it. That needs a production mode that is not built yet.</li>
-<li><strong>No HTTPS.</strong> The connection is plain HTTP, which is acceptable only because it never leaves the computer.</li>
+<li><strong>This computer only, unless production mode is set.</strong> In the normal mode, ShareCraft is available only at <code>http://127.0.0.1:&lt;port&gt;</code> on this computer. In production mode, other people reach the one public HTTPS address through a proxy or tunnel on this computer; ShareCraft itself still listens only on loopback.</li>
+<li><strong>HTTPS is the proxy's job.</strong> ShareCraft does not handle certificates or HTTPS. In production mode, the proxy or tunnel must provide HTTPS and send the forwarded headers described in section 5.</li>
 <li><strong>For one Windows user.</strong> It is installed for the Windows user who ran the installer. Other people can still have ShareCraft accounts and use them from this computer's browser.</li>
 <li><strong>Not a Windows service.</strong> It runs while started and stops when you sign out.</li>
 <li><strong>No automatic updates</strong> and no signed installer. Windows may warn about running the scripts; that is expected.</li>
@@ -175,7 +231,7 @@ footer{border-top:1px solid var(--line);padding-top:16px;color:var(--muted);font
 </ul>
 </section>
 
-<section id="reinstall"><h2>10. Installing a newer copy</h2>
+<section id="reinstall"><h2>11. Installing a newer copy</h2>
 <p>To install a newer (or the same) copy over the one you have, keeping all documents, accounts and the database:</p>
 <ol>
 <li>Unzip the new copy anywhere.</li>
@@ -186,7 +242,7 @@ footer{border-top:1px solid var(--line);padding-top:16px;color:var(--muted);font
 <p>It stops ShareCraft, replaces the program in <code>%LOCALAPPDATA%\Programs\ShareCraft</code>, keeps <code>%LOCALAPPDATA%\ShareCraft</code> as it is (only the port numbers change, if another program has taken one meanwhile), and starts ShareCraft again. It does not ask for an administrator, because the accounts are kept. The new server brings the database up to date by itself when it starts.</p>
 </section>
 
-<section id="uninstall"><h2>11. Uninstalling</h2>
+<section id="uninstall"><h2>12. Uninstalling</h2>
 <p>Choose <strong>Uninstall ShareCraft</strong> in the Start menu. It asks first whether to remove ShareCraft, stops everything, then asks:</p>
 <p><strong>Also delete all ShareCraft data and the database? [y/N]</strong></p>
 <ul>
@@ -196,11 +252,11 @@ footer{border-top:1px solid var(--line);padding-top:16px;color:var(--muted);font
 <p>Nothing is deleted without that answer. The uninstaller does not touch this folder (the one you installed from); delete it yourself when you no longer need it.</p>
 </section>
 
-<section id="trouble"><h2>12. When something goes wrong</h2>
+<section id="trouble"><h2>13. When something goes wrong</h2>
 <div class="table-wrap"><table class="banded"><caption>Common problems</caption>
 <thead><tr><th>What you see</th><th>What to do</th></tr></thead>
 <tbody>
-<tr><td>"ShareCraft is already installed for this Windows user"</td><td>Nothing was changed. To install over it and keep your data, use <code>-Reinstall</code> (section 10). To start afresh, uninstall and delete the data first (section 11).</td></tr>
+<tr><td>"ShareCraft is already installed for this Windows user"</td><td>Nothing was changed. To install over it and keep your data, use <code>-Reinstall</code> (section 11). To start afresh, uninstall and delete the data first (section 12).</td></tr>
 <tr><td>"There is no free port for ..."</td><td>Other programs use every port in that range. Close one of them, or restart Windows, and run the installer again.</td></tr>
 <tr><td>"ShareCraft did not answer within 60 seconds"</td><td>It may still be starting on a slow disk: try the address again a minute later. Otherwise read <code>logs\server.err.log</code> in <code>%LOCALAPPDATA%\ShareCraft</code>.</td></tr>
 <tr><td>"Starting the database ... failed"</td><td>Read <code>logs\postgresql.log</code>. A database that was not stopped cleanly usually starts again after Stop ShareCraft and then ShareCraft.</td></tr>
@@ -210,10 +266,10 @@ footer{border-top:1px solid var(--line);padding-top:16px;color:var(--muted);font
 <p>The logs never contain the database password or address. If you ask someone for help, send the log files, never <code>.env</code>.</p>
 </section>
 
-<section id="checked"><h2>13. What has and has not been checked</h2>
+<section id="checked"><h2>14. What has and has not been checked</h2>
 <p><strong>Checked</strong>, on the build computer (Windows 11, Windows PowerShell 5.1):</p>
 <ul>
-<li>The scripts' automated self-tests: port picking, quoting of folder names with spaces and non-ASCII letters, the narrowed access list on <code>.env</code>, that no password reaches the window or the files around it, that a reinstall keeps data and the database, and that uninstalling keeps data unless told otherwise.</li>
+<li>The scripts' automated self-tests: port picking, quoting of folder names with spaces and non-ASCII letters, the narrowed access list on <code>.env</code>, that no password reaches the window or the files around it, production-address validation and removal, that a reinstall keeps data, the database and the public address, and that uninstalling keeps data unless told otherwise.</li>
 <li>One full install from the package zip into a temporary profile folder whose name had a space and an <code>&euml;</code>: the database was made, the administrator could sign in, the scanner address was set, Stop and Start worked, a second install was refused, a reinstall kept the data, and uninstalling with deletion confirmed removed everything, also when started with its working folder inside the program, as its Start-menu shortcut did. A second run did the same with a temporary folder holding Chinese and accented letters and with <code>DATABASE_URL</code> and <code>PG</code> settings pointing elsewhere. The installer was given its answers by a script there, not typed.</li>
 </ul>
 <p><strong>Not checked:</strong></p>
@@ -224,6 +280,7 @@ footer{border-top:1px solid var(--line);padding-top:16px;color:var(--muted);font
 <li>SmartScreen or antivirus warnings on another computer, and computers where scripts are restricted by an organisation's policy.</li>
 <li>A real ClamAV scanner.</li>
 <li>Restoring a backup on another computer.</li>
+<li>Production mode at a real public address, through a real reverse proxy or tunnel. The server side was checked through a local HTTPS proxy on the build computer only.</li>
 </ul>
 </section>
 

@@ -1,0 +1,60 @@
+# Runs the project's full check (`cargo xtask check`) on GitHub's Linux runners for every push
+# and pull request, so long builds and the test suite do not have to run on a developer's machine.
+# The check needs a PostgreSQL database for the tests; it is a throwaway service container here.
+name: check
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: sharecraft
+          POSTGRES_PASSWORD: ci-only-throwaway
+          POSTGRES_DB: sharecraft_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U sharecraft -d sharecraft_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      # A throwaway database inside this job only; nothing secret.
+      TEST_DATABASE_URL: postgres://sharecraft:ci-only-throwaway@localhost:5432/sharecraft_test
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
+      RUST_BACKTRACE: short
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
+
+      - name: Cache the build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Node for the page-script tests
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Full check
+        run: cargo xtask check

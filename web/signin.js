@@ -1,10 +1,13 @@
-import { api, messageFor, safeNext, showMessage } from './common.js';
+import { api, messageFor, safeNext, showMessage, tooManyAttemptsMessage } from './common.js';
 
 const form = document.getElementById('form');
 const email = document.getElementById('email');
 const password = document.getElementById('password');
 const submit = document.getElementById('submit');
 const error = document.getElementById('error');
+
+// The page starts with the button off, so the form is never sent before this script handles it.
+submit.disabled = false;
 
 form.addEventListener('submit', async (event) => {
   event.preventDefault();
@@ -21,6 +24,11 @@ form.addEventListener('submit', async (event) => {
     return;
   }
   password.value = '';
-  showMessage(error, messageFor(result.error));
+  showMessage(
+    error,
+    result.error === 'too_many_attempts'
+      ? tooManyAttemptsMessage(result.data?.retry_after)
+      : messageFor(result.error),
+  );
   password.focus();
 });

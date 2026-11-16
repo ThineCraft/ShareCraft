@@ -13,6 +13,7 @@ mod brand;
 mod checkpoint;
 pub mod cli;
 pub mod config;
+pub mod deployment;
 pub mod editors;
 mod events;
 mod file_room;
@@ -30,23 +31,34 @@ pub mod templates;
 pub mod tree;
 mod ws;
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use axum::Router;
-use axum::extract::Request;
-use axum::http::HeaderValue;
+use axum::extract::{ConnectInfo, Request, State};
 use axum::http::header::{
-    CACHE_CONTROL, CONTENT_SECURITY_POLICY, REFERRER_POLICY, X_CONTENT_TYPE_OPTIONS,
+    CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, LOCATION, REFERRER_POLICY,
+    STRICT_TRANSPORT_SECURITY, X_CONTENT_TYPE_OPTIONS,
 };
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use collab_core::ids::DocId;
 use records::Db;
 use revisions::{BlobStore, RevisionStore};
 use tokio::net::TcpListener;
 use tower_http::services::ServeDir;
+
+use deployment::{Deployment, Production, Refusal, SameOrigin};
+
+/// This build's version: what `cargo xtask package` names it (`0.1.0-6a18271`, from
+/// `SHARECRAFT_BUILD` at compile time), or the crate's version marked `-dev` for any other build.
+pub const VERSION: &str = match option_env!("SHARECRAFT_BUILD") {
+    Some(version) => version,
+    None => concat!(env!("CARGO_PKG_VERSION"), "-dev"),
+};
 
 pub use api::uploads::uploads_path;
 pub use blobs::blobs_path;
@@ -59,7 +71,7 @@ pub use projection::{
 pub use scan::scan_once;
 
 use api::uploads::Uploads;
-use auth::Throttle;
+use auth::{MAX_ADDRESS_FAILURES, MAX_LINK_MISSES, PasswordChecks, Throttle};
 use blobs::Blobs;
 use checkpoint::Timing;
 use editors::Editors;
@@ -87,7 +99,14 @@ struct Shared {
     db: Db,
     editors: Editors,
     events: EventSink,
+    /// Failed sign-ins per email.
     throttle: Throttle,
+    /// Failed sign-ins per client address.
+    address_throttle: Throttle,
+    /// Unknown anyone-link tokens asked about per client address.
+    link_throttle: Throttle,
+    /// The password checks that may run at once.
+    password_checks: PasswordChecks,
     next_conn: AtomicU64,
     /// Held for the whole of each tree change, so changes are judged and written one at a time.
     tree_lock: tokio::sync::Mutex<()>,
@@ -125,6 +144,9 @@ impl AppState {
                 editors: Editors::load(&editors_dir),
                 db,
                 throttle: Throttle::default(),
+                address_throttle: Throttle::new(MAX_ADDRESS_FAILURES),
+                link_throttle: Throttle::new(MAX_LINK_MISSES),
+                password_checks: PasswordChecks::default(),
                 next_conn: AtomicU64::new(1),
                 tree_lock: tokio::sync::Mutex::new(()),
                 tree_out_of_step: AtomicBool::new(false),
@@ -137,6 +159,12 @@ impl AppState {
     #[must_use]
     pub fn config(&self) -> &Config {
         &self.shared.config
+    }
+
+    /// How the server is reached: development or production mode.
+    #[must_use]
+    pub fn deployment(&self) -> &Deployment {
+        &self.shared.config.deployment
     }
 
     /// The database of accounts, sessions and access grants.
@@ -190,6 +218,31 @@ impl AppState {
 
     fn throttle(&self) -> &Throttle {
         &self.shared.throttle
+    }
+
+    fn address_throttle(&self) -> &Throttle {
+        &self.shared.address_throttle
+    }
+
+    fn link_throttle(&self) -> &Throttle {
+        &self.shared.link_throttle
+    }
+
+    fn password_checks(&self) -> &PasswordChecks {
+        &self.shared.password_checks
+    }
+
+    /// Takes every password-check turn until the answer is dropped, as a flood of sign-ins
+    /// would. For tests.
+    #[doc(hidden)]
+    pub async fn hold_password_checks(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.shared.password_checks.hold_all().await
+    }
+
+    /// Sets how long a sign-in waits for a password-check turn. For tests.
+    #[doc(hidden)]
+    pub fn set_password_wait(&self, wait: std::time::Duration) {
+        self.shared.password_checks.set_wait(wait);
     }
 
     fn rooms(&self) -> &Rooms {
@@ -266,8 +319,10 @@ impl AppState {
 ///   (see the `links` module);
 /// - anything else is a static file from `web_dir`.
 ///
-/// Every response carries the security headers (see [`security_headers`]); `/api` answers are
-/// never cached, and nothing under `/l/` or `/api/l/` is cached or sent as a referrer.
+/// Every request first passes [`source`], which works out where it came from and, in production
+/// mode, refuses what did not come through a trusted proxy over HTTPS. Every response it lets
+/// through carries the security headers (see [`security_headers`]); `/api` answers are never
+/// cached, and nothing under `/l/` or `/api/l/` is cached or sent as a referrer.
 pub fn router(state: AppState) -> Router {
     let files = Router::new()
         .fallback_service(ServeDir::new(&state.config().web_dir))
@@ -280,8 +335,100 @@ pub fn router(state: AppState) -> Router {
         .merge(editors::router(state.clone()))
         .fallback_service(files)
         .layer(middleware::from_fn(links::link_headers))
-        .layer(middleware::from_fn(security_headers))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            security_headers,
+        ))
+        .layer(middleware::from_fn_with_state(state.clone(), source))
         .with_state(state)
+}
+
+/// Works out where a request came from ([`deployment::Source`]) and whether it passes the origin
+/// check ([`SameOrigin`]), and stores both in the request for the routes and guards.
+///
+/// In production mode it answers itself, before any route, for a request that did not come
+/// from a trusted proxy (`403`, except `GET /healthz` from loopback) and for one the proxy
+/// received over plain HTTP: a page `GET` or `HEAD` is redirected (`308`) to the public
+/// address, anything else is `403 https_required`.
+async fn source(State(state): State<AppState>, mut request: Request, next: Next) -> Response {
+    let deployment = state.deployment();
+    let peer = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|info| info.0);
+    let health = request.method() == Method::GET && request.uri().path() == "/healthz";
+    let source = match deployment.source_of(peer, request.headers(), health) {
+        Ok(source) => source,
+        Err(Refusal::Untrusted) => return untrusted_answer(),
+    };
+    if let Some(production) = deployment.production()
+        && !source.https
+        && !health
+    {
+        return plain_http_answer(production, &request);
+    }
+    let same_origin = deployment.same_origin(request.headers(), &source);
+    let link_lookup = request.uri().path().starts_with("/api/l/");
+    let address = auth::Throttle::address_key(source.client_ip);
+    request.extensions_mut().insert(SameOrigin(same_origin));
+    request.extensions_mut().insert(source);
+    if !link_lookup {
+        return next.run(request).await;
+    }
+    // Guessing anyone-link tokens: an address with 60 answers of `link_not_found` in the last
+    // 15 minutes is refused until the oldest is 15 minutes old. A link used as meant is never
+    // counted.
+    let throttle = state.link_throttle();
+    if throttle.blocked(&address, std::time::Instant::now()) {
+        let mut refused = api::ApiError::TooManyAttempts.into_response();
+        let headers = refused.headers_mut();
+        headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        headers.insert(REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+        add_headers(headers, deployment.production().map(|p| p.hsts_seconds));
+        return refused;
+    }
+    let response = next.run(request).await;
+    if response.status() == StatusCode::NOT_FOUND {
+        throttle.note_failure(&address, std::time::Instant::now());
+    }
+    response
+}
+
+/// The answer to a request that did not come from a trusted proxy, in production mode. It
+/// carries no HSTS: it never came over HTTPS.
+fn untrusted_answer() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        [
+            (CONTENT_TYPE, "text/plain; charset=utf-8"),
+            (X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        "This ShareCraft server answers only through its reverse proxy, at its public address.\n",
+    )
+        .into_response()
+}
+
+/// The answer to a request the proxy received over plain HTTP: pages are redirected to the same
+/// path at the public address, everything else is refused.
+fn plain_http_answer(production: &Production, request: &Request) -> Response {
+    let path = request.uri().path();
+    let page = matches!(*request.method(), Method::GET | Method::HEAD)
+        && !path.starts_with("/api/")
+        && !path.starts_with("/ws/");
+    let mut response = if page {
+        let target = request.uri().path_and_query().map_or("/", |pq| pq.as_str());
+        let location = format!("{}{target}", production.public.origin());
+        match HeaderValue::from_str(&location) {
+            Ok(location) => {
+                (StatusCode::PERMANENT_REDIRECT, [(LOCATION, location)]).into_response()
+            }
+            Err(_) => api::ApiError::HttpsRequired.into_response(),
+        }
+    } else {
+        api::ApiError::HttpsRequired.into_response()
+    };
+    add_security_headers(response.headers_mut(), production.hsts_seconds);
+    response
 }
 
 /// What a page may load: its own files only, no inline script or style, and WebAssembly. It may
@@ -300,9 +447,26 @@ async fn no_cache(request: Request, next: Next) -> Response {
 /// Adds the security headers to every response: pages, API, WebSocket handshake and errors.
 /// Each is added only where the answer does not carry its own: an editor's
 /// Content-Security-Policy, a download's sandbox and a link page's `no-referrer` stay.
-async fn security_headers(request: Request, next: Next) -> Response {
+/// In production mode it also adds `Strict-Transport-Security`.
+async fn security_headers(State(state): State<AppState>, request: Request, next: Next) -> Response {
     let mut response = next.run(request).await;
-    let headers = response.headers_mut();
+    let hsts = state.deployment().production().map(|p| p.hsts_seconds);
+    add_headers(response.headers_mut(), hsts);
+    response
+}
+
+/// The security headers of a production answer made before the routes.
+fn add_security_headers(headers: &mut HeaderMap, hsts_seconds: u64) {
+    add_headers(headers, Some(hsts_seconds));
+}
+
+/// Adds the security headers `headers` lacks, and HSTS with `hsts_seconds` when given.
+fn add_headers(headers: &mut HeaderMap, hsts_seconds: Option<u64>) {
+    if let Some(seconds) = hsts_seconds
+        && let Ok(value) = HeaderValue::from_str(&format!("max-age={seconds}"))
+    {
+        headers.insert(STRICT_TRANSPORT_SECURITY, value);
+    }
     for (name, value) in [
         (CONTENT_SECURITY_POLICY, CONTENT_SECURITY_POLICY_VALUE),
         (X_CONTENT_TYPE_OPTIONS, "nosniff"),
@@ -312,22 +476,32 @@ async fn security_headers(request: Request, next: Next) -> Response {
             headers.insert(name, HeaderValue::from_static(value));
         }
     }
-    response
 }
 
-/// Serves `config` on `listener` until the process ends: checks that the listener is on a
-/// loopback address, makes the server's state with [`prepare`], prints the address it listens
-/// on and that it runs in development mode, then accepts connections.
+/// Serves `config` on `listener` until the process ends: in development mode checks that the
+/// listener is on a loopback address, makes the server's state with [`prepare`], prints the
+/// address it listens on and its mode, then accepts connections.
 ///
 /// # Errors
-/// Returns an error if the listener is not on a loopback address, if [`prepare`] fails, or if
-/// accepting connections fails.
+/// Returns an error if, in development mode, the listener is not on a loopback address, if
+/// [`prepare`] fails, or if accepting connections fails.
 pub async fn serve(config: Config, listener: TcpListener) -> std::io::Result<()> {
     let addr = listener.local_addr()?;
-    require_loopback(addr)?;
+    require_loopback(&config.deployment, addr)?;
     let state = prepare(config).await?;
-    println!("ShareCraft server listening on http://{addr}");
-    println!("WARNING: development mode, local connections only");
+    match state.deployment().production() {
+        None => {
+            println!("ShareCraft {VERSION} listening on http://{addr}");
+            println!("WARNING: development mode, local connections only");
+        }
+        Some(production) => {
+            println!("ShareCraft {VERSION} listening on {addr}");
+            println!(
+                "Production mode: public address {}, trusted proxies {}",
+                production.public, production.proxies
+            );
+        }
+    }
     serve_state(state, listener).await
 }
 
@@ -446,18 +620,23 @@ pub async fn prepare(config: Config) -> std::io::Result<AppState> {
 /// meanwhile; they stop when serving does.
 ///
 /// # Errors
-/// Returns an error if the listener is not on a loopback address, or if accepting connections
-/// fails.
+/// Returns an error if, in development mode, the listener is not on a loopback address, or if
+/// accepting connections fails.
 pub async fn serve_state(state: AppState, listener: TcpListener) -> std::io::Result<()> {
-    require_loopback(listener.local_addr()?)?;
+    require_loopback(state.deployment(), listener.local_addr()?)?;
     let _sweeper = links::start_sweeper(state.clone());
     let _scanner = scan::start_worker(state.clone());
-    axum::serve(listener, router(state)).await
+    axum::serve(
+        listener,
+        router(state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
 }
 
-/// The server only ever listens on a loopback address.
-fn require_loopback(addr: std::net::SocketAddr) -> std::io::Result<()> {
-    if addr.ip().is_loopback() {
+/// In development mode the server only ever listens on a loopback address. In production mode
+/// any address is allowed: [`source`] refuses every peer that is not a trusted proxy.
+fn require_loopback(deployment: &Deployment, addr: SocketAddr) -> std::io::Result<()> {
+    if deployment.is_production() || addr.ip().is_loopback() {
         return Ok(());
     }
     Err(std::io::Error::new(
@@ -480,10 +659,15 @@ mod tests {
     // bound in tests: on Windows that raises a firewall prompt.
     #[test]
     fn non_loopback_listener_is_refused() {
-        let err = require_loopback("0.0.0.0:8787".parse().unwrap()).unwrap_err();
+        let dev = Deployment::Development;
+        let err = require_loopback(&dev, "0.0.0.0:8787".parse().unwrap()).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-        assert!(require_loopback("192.168.1.5:80".parse().unwrap()).is_err());
-        assert!(require_loopback("127.0.0.1:0".parse().unwrap()).is_ok());
-        assert!(require_loopback("[::1]:0".parse().unwrap()).is_ok());
+        assert!(require_loopback(&dev, "192.168.1.5:80".parse().unwrap()).is_err());
+        assert!(require_loopback(&dev, "127.0.0.1:0".parse().unwrap()).is_ok());
+        assert!(require_loopback(&dev, "[::1]:0".parse().unwrap()).is_ok());
+        // Production mode may listen anywhere: only trusted proxies are answered.
+        let prod =
+            Deployment::production_for_tests("https://share.example.com", "10.0.0.1").unwrap();
+        assert!(require_loopback(&prod, "0.0.0.0:8787".parse().unwrap()).is_ok());
     }
 }

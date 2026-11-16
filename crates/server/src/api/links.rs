@@ -70,8 +70,8 @@ impl From<Link> for LinkOut {
 pub(crate) struct NewLinkOut {
     #[serde(flatten)]
     link: LinkOut,
-    /// `http://<the address the caller is using>/l/<token>`. Shown only now: the token is not
-    /// stored.
+    /// `<origin>/l/<token>`: the public address in production mode, `http://<the address the
+    /// caller is using>` in development. Shown only now: the token is not stored.
     url: String,
 }
 
@@ -120,12 +120,17 @@ pub(crate) async fn create(
         }
         None => None,
     };
-    // The API's guard has checked that `Host` names this machine.
-    let host = headers
-        .get(HOST)
-        .and_then(|value| value.to_str().ok())
-        .ok_or(ApiError::Forbidden)?
-        .to_owned();
+    // The API's guard has checked that `Host` names this machine; production mode ignores it
+    // and names the public address.
+    let origin = match state.deployment().production() {
+        Some(production) => production.public.origin().to_owned(),
+        None => state.deployment().link_origin(
+            headers
+                .get(HOST)
+                .and_then(|value| value.to_str().ok())
+                .ok_or(ApiError::Forbidden)?,
+        ),
+    };
     let actor = signed.session.user.id;
     // Breaking inheritance copies what the node inherited, and a new link has no members: no
     // open session's access changes, so nothing is rechecked.
@@ -133,7 +138,7 @@ pub(crate) async fn create(
         .db()
         .create_link(actor, node, new.kind, &new.role, expires_at)
         .await?;
-    let url = link_url(&host, &token);
+    let url = link_url(&origin, &token);
     Ok((
         StatusCode::CREATED,
         Json(NewLinkOut {
@@ -144,9 +149,9 @@ pub(crate) async fn create(
         .into_response())
 }
 
-/// The address of the link with `token` on the server reached as `host`.
-fn link_url(host: &str, token: &LinkToken) -> String {
-    format!("http://{host}/l/{}", token.as_url_value())
+/// The address of the link with `token` on the server whose pages come from `origin`.
+fn link_url(origin: &str, token: &LinkToken) -> String {
+    format!("{origin}/l/{}", token.as_url_value())
 }
 
 /// `DELETE /api/links/{id}`: revokes the link at once. Needs `manage_access` on its item. A

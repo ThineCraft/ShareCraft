@@ -177,6 +177,40 @@ impl From<sqlx::Error> for SignInError {
     }
 }
 
+/// A failed sign-in, from [`Db::sign_in_unrecorded`]: the error, and the event to record for a
+/// known account, which has not been written.
+#[derive(Debug)]
+pub struct SignInFailure {
+    /// `Invalid`, or the database failure.
+    pub error: SignInError,
+    /// `sign_in.failed` for a known account; `None` for an unknown email or a database failure.
+    pub event: Option<Box<NewEvent>>,
+}
+
+impl SignInFailure {
+    fn invalid(event: Option<NewEvent>) -> Self {
+        SignInFailure {
+            error: SignInError::Invalid,
+            event: event.map(Box::new),
+        }
+    }
+}
+
+impl From<DbError> for SignInFailure {
+    fn from(e: DbError) -> Self {
+        SignInFailure {
+            error: SignInError::Db(e),
+            event: None,
+        }
+    }
+}
+
+impl From<sqlx::Error> for SignInFailure {
+    fn from(e: sqlx::Error) -> Self {
+        SignInFailure::from(DbError::from(e))
+    }
+}
+
 fn validate_email(email: &str) -> Result<&str, AccountError> {
     let email = email.trim();
     let bad_char = |c: char| c.is_whitespace() || c.is_control();
@@ -478,7 +512,8 @@ impl Db {
         Ok(())
     }
 
-    /// Checks an email and password and starts a session.
+    /// Checks an email and password and starts a session, recording a failure for a known
+    /// account as `sign_in.failed`.
     ///
     /// Every failure is `Invalid`, and an unknown email costs as much work as a wrong password.
     pub async fn sign_in(
@@ -486,6 +521,26 @@ impl Db {
         email: &str,
         password: &str,
     ) -> Result<(Session, SessionToken), SignInError> {
+        match self.sign_in_unrecorded(email, password).await {
+            Ok(signed_in) => Ok(signed_in),
+            Err(failure) => {
+                if let Some(event) = failure.event {
+                    let mut conn = self.pool().acquire().await?;
+                    record(&mut conn, *event).await?;
+                }
+                Err(failure.error)
+            }
+        }
+    }
+
+    /// Like [`Db::sign_in`], but a failure's `sign_in.failed` event is handed back instead of
+    /// written, so the caller can answer first and write it afterwards. Then nothing but the
+    /// one password check separates the answers for an unknown email and a wrong password.
+    pub async fn sign_in_unrecorded(
+        &self,
+        email: &str,
+        password: &str,
+    ) -> Result<(Session, SessionToken), SignInFailure> {
         let sql = format!(
             "select {USER_COLUMNS}, password_hash from users where lower(email) = lower($1)"
         );
@@ -499,7 +554,7 @@ impl Db {
         let too_long = password.chars().count() > MAX_PASSWORD_CHARS;
         let Some(row) = row else {
             verify_password(if too_long { "" } else { password }, dummy).await?;
-            return Err(SignInError::Invalid);
+            return Err(SignInFailure::invalid(None));
         };
         let user = user_from_row(&row)?;
         let hash: String = row.try_get("password_hash")?;
@@ -515,20 +570,14 @@ impl Db {
             } else {
                 "wrong_password"
             };
-            let mut conn = self.pool().acquire().await?;
-            record(
-                &mut conn,
-                NewEvent {
-                    kind: "sign_in.failed",
-                    actor: None,
-                    subject: Some(user.id),
-                    document: None,
-                    node: None,
-                    detail: json!({ "reason": reason }),
-                },
-            )
-            .await?;
-            return Err(SignInError::Invalid);
+            return Err(SignInFailure::invalid(Some(NewEvent {
+                kind: "sign_in.failed",
+                actor: None,
+                subject: Some(user.id),
+                document: None,
+                node: None,
+                detail: json!({ "reason": reason }),
+            })));
         }
 
         let token = SessionToken::generate()
@@ -551,7 +600,7 @@ impl Db {
         .fetch_optional(&mut *tx)
         .await?;
         let Some(expires_at) = expires_at else {
-            return Err(SignInError::Invalid);
+            return Err(SignInFailure::invalid(None));
         };
         record(
             &mut tx,

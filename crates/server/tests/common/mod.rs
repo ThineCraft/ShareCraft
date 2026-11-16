@@ -348,6 +348,34 @@ impl Site {
         }
     }
 
+    /// Signs the account `name` (created on first use) in through `client`, which reaches a
+    /// production-mode server as its proxy would, posting to `url`. Returns the sign-in
+    /// response and the account's id and email; the password stays with the harness.
+    pub async fn sign_in_through(
+        &self,
+        name: &str,
+        is_admin: bool,
+        client: &reqwest::Client,
+        url: &str,
+    ) -> (reqwest::Response, UserId, String) {
+        let account = self.account(name, is_admin).await;
+        let response = client
+            .post(url)
+            .json(&serde_json::json!({
+                "email": account.email,
+                "password": account.password,
+            }))
+            .send()
+            .await
+            .unwrap();
+        (response, account.id, account.email)
+    }
+
+    /// The email of the account `name`, created on first use.
+    pub async fn email_of(&self, name: &str) -> String {
+        self.account(name, false).await.email
+    }
+
     async fn account(&self, name: &str, is_admin: bool) -> Account {
         let email = {
             let accounts = self.accounts.lock().unwrap();
@@ -495,6 +523,7 @@ pub fn session_cookie(headers: &HeaderMap) -> Option<String> {
 pub fn config_at(data_dir: &Path, db: &TestDb) -> Config {
     Config {
         addr: "127.0.0.1:0".parse().unwrap(),
+        deployment: Default::default(),
         data_dir: data_dir.to_path_buf(),
         web_dir: data_dir.join("web"),
         checkpoint_idle: Duration::from_millis(100),

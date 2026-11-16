@@ -5,6 +5,8 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::deployment::Deployment;
+
 /// Address used when `SHARECRAFT_ADDR` is not set.
 pub const DEFAULT_ADDR: &str = "127.0.0.1:8787";
 /// Data directory used when `SHARECRAFT_DATA` is not set.
@@ -20,8 +22,10 @@ pub const DEFAULT_MAX_FILE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 /// How the server runs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
-    /// Address to listen on; always a loopback address.
+    /// Address to listen on: a loopback address in development mode, any in production mode.
     pub addr: SocketAddr,
+    /// Development mode, or production mode at a public address behind trusted proxies.
+    pub deployment: Deployment,
     /// Where documents are stored: the library repositories, and the content store in
     /// `blobs`.
     pub data_dir: PathBuf,
@@ -91,6 +95,45 @@ pub enum ConfigError {
     /// The file size limit is not a whole number of bytes above zero.
     #[error("SHARECRAFT_MAX_FILE_BYTES {0:?} is not a number of bytes above zero")]
     BadMaxFileBytes(String),
+    /// The public address is not an `https://` address.
+    #[error(
+        "SHARECRAFT_PUBLIC_URL {0:?} does not start with https://; production mode is HTTPS only, \
+         with HTTPS handled by the reverse proxy or tunnel"
+    )]
+    PublicUrlNotHttps(String),
+    /// The public address is not a plain `https://host[:port]`.
+    #[error(
+        "SHARECRAFT_PUBLIC_URL {0:?} is not an address like https://share.example.com: give the \
+         host in lowercase (international names in their xn-- form) and an optional port, with no \
+         path, query, user name or password"
+    )]
+    BadPublicUrl(String),
+    /// A trusted proxy entry is not an address or an allowed range.
+    #[error(
+        "SHARECRAFT_TRUSTED_PROXIES entry {0:?} is not an IP address or range such as 127.0.0.1 \
+         or 10.0.0.0/24; ranges wider than /8 (IPv4) or /32 (IPv6) are refused"
+    )]
+    BadTrustedProxies(String),
+    /// Trusted proxies are named, but no public address.
+    #[error(
+        "SHARECRAFT_TRUSTED_PROXIES is set but SHARECRAFT_PUBLIC_URL is not; set the public \
+         address too to use production mode"
+    )]
+    ProxiesWithoutPublicUrl,
+    /// The HSTS time is not a whole number of seconds.
+    #[error("SHARECRAFT_HSTS_SECONDS {0:?} is not a whole number of seconds")]
+    BadHstsSeconds(String),
+}
+
+/// The raw production-mode settings, as read from the environment.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DeploymentValues<'a> {
+    /// `SHARECRAFT_PUBLIC_URL`.
+    pub public_url: Option<&'a str>,
+    /// `SHARECRAFT_TRUSTED_PROXIES`.
+    pub trusted_proxies: Option<&'a str>,
+    /// `SHARECRAFT_HSTS_SECONDS`.
+    pub hsts_seconds: Option<&'a str>,
 }
 
 impl Config {
@@ -109,7 +152,15 @@ impl Config {
         let editors = read_var("SHARECRAFT_EDITORS_DIR")?;
         let max_file_bytes = read_var("SHARECRAFT_MAX_FILE_BYTES")?;
         let database = read_var(DATABASE_VARIABLE)?;
-        Self::from_values(
+        let public_url = read_var("SHARECRAFT_PUBLIC_URL")?;
+        let trusted_proxies = read_var("SHARECRAFT_TRUSTED_PROXIES")?;
+        let hsts_seconds = read_var("SHARECRAFT_HSTS_SECONDS")?;
+        Self::from_values_in(
+            DeploymentValues {
+                public_url: public_url.as_deref(),
+                trusted_proxies: trusted_proxies.as_deref(),
+                hsts_seconds: hsts_seconds.as_deref(),
+            },
             addr.as_deref(),
             data.as_deref(),
             web.as_deref(),
@@ -117,6 +168,42 @@ impl Config {
             editors.as_deref(),
             max_file_bytes.as_deref(),
         )
+    }
+
+    /// Like [`Config::from_values`], in the mode `deployment` describes: production mode when
+    /// it names a public address, which allows a listening address that is not loopback.
+    ///
+    /// # Errors
+    /// As [`Config::from_values`], and the production-mode errors of
+    /// [`Deployment::from_values`].
+    pub fn from_values_in(
+        deployment: DeploymentValues<'_>,
+        addr: Option<&str>,
+        data_dir: Option<&str>,
+        web_dir: Option<&str>,
+        database_url: Option<&str>,
+        editors_dir: Option<&str>,
+        max_file_bytes: Option<&str>,
+    ) -> Result<Self, ConfigError> {
+        let deployment = Deployment::from_values(
+            deployment.public_url,
+            deployment.trusted_proxies,
+            deployment.hsts_seconds,
+        )?;
+        let production = deployment.is_production();
+        let mut config = Self::from_values(
+            if production { None } else { addr },
+            data_dir,
+            web_dir,
+            database_url,
+            editors_dir,
+            max_file_bytes,
+        )?;
+        if production {
+            config.addr = parse_any_addr(addr.unwrap_or(DEFAULT_ADDR))?;
+        }
+        config.deployment = deployment;
+        Ok(config)
     }
 
     /// Builds the settings from the given values, using the defaults for any that are `None`,
@@ -144,6 +231,7 @@ impl Config {
         };
         Ok(Self {
             addr,
+            deployment: Deployment::Development,
             data_dir: PathBuf::from(data_dir.unwrap_or(DEFAULT_DATA)),
             web_dir: PathBuf::from(web_dir.unwrap_or(DEFAULT_WEB)),
             checkpoint_idle: Duration::from_secs(2),
@@ -177,7 +265,17 @@ fn database_url_from(value: Option<&str>) -> Result<DatabaseUrl, ConfigError> {
     }
 }
 
-/// Parses a listening address and refuses any that is not loopback.
+/// Parses a listening address, any IP address and port, for production mode.
+///
+/// # Errors
+/// `BadAddr` if `s` is not an IP address and port.
+pub fn parse_any_addr(s: &str) -> Result<SocketAddr, ConfigError> {
+    s.trim()
+        .parse()
+        .map_err(|_| ConfigError::BadAddr(s.to_owned()))
+}
+
+/// Parses a listening address and refuses any that is not loopback, for development mode.
 ///
 /// # Errors
 /// `BadAddr` if `s` is not an IP address and port, `NotLoopback` if the host is not a loopback
@@ -248,6 +346,71 @@ mod tests {
                 Config::from_values(None, None, None, Some("postgres://local"), None, Some(bad));
             assert_eq!(result, Err(ConfigError::BadMaxFileBytes(bad.into())));
         }
+    }
+
+    fn values<'a>(public: Option<&'a str>, proxies: Option<&'a str>) -> DeploymentValues<'a> {
+        DeploymentValues {
+            public_url: public,
+            trusted_proxies: proxies,
+            hsts_seconds: None,
+        }
+    }
+
+    fn config_in(
+        public: Option<&str>,
+        proxies: Option<&str>,
+        addr: Option<&str>,
+    ) -> Result<Config, ConfigError> {
+        Config::from_values_in(
+            values(public, proxies),
+            addr,
+            None,
+            None,
+            Some("postgres://local"),
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn unset_public_url_is_development() {
+        let c = config_in(None, None, None).unwrap();
+        assert_eq!(c.deployment, Deployment::Development);
+        let plain =
+            Config::from_values(None, None, None, Some("postgres://local"), None, None).unwrap();
+        assert_eq!(c, plain);
+        assert_eq!(
+            config_in(None, None, Some("0.0.0.0:8787")),
+            Err(ConfigError::NotLoopback("0.0.0.0:8787".parse().unwrap()))
+        );
+    }
+
+    #[test]
+    fn production_allows_any_listen_address() {
+        let public = Some("https://share.example.com");
+        let c = config_in(public, None, Some("0.0.0.0:8787")).unwrap();
+        assert!(c.deployment.is_production());
+        assert_eq!(c.addr, "0.0.0.0:8787".parse().unwrap());
+        let default = config_in(public, None, None).unwrap();
+        assert_eq!(default.addr, "127.0.0.1:8787".parse().unwrap());
+        assert_eq!(
+            config_in(public, None, Some("nowhere")),
+            Err(ConfigError::BadAddr("nowhere".into()))
+        );
+    }
+
+    #[test]
+    fn proxies_without_public_url_refused() {
+        assert_eq!(
+            config_in(None, Some("127.0.0.1"), None),
+            Err(ConfigError::ProxiesWithoutPublicUrl)
+        );
+        assert_eq!(
+            config_in(Some("http://share.example.com"), None, None),
+            Err(ConfigError::PublicUrlNotHttps(
+                "http://share.example.com".into()
+            ))
+        );
     }
 
     #[test]

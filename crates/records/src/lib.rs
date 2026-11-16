@@ -32,7 +32,8 @@ mod tree;
 mod uploads;
 
 pub use accounts::{
-    AccountError, NewUser, SESSION_LIFETIME, Session, SessionToken, SignInError, User,
+    AccountError, NewUser, SESSION_LIFETIME, Session, SessionToken, SignInError, SignInFailure,
+    User,
 };
 pub use adoption::{Adoption, Unplaced};
 pub use bin::{BIN_DAYS, BinCursor, BinEntry, BinStage, BinState};

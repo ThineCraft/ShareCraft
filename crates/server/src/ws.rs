@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use collab_core::ids::{ClientId, DocId, SessionId, UserId};
 use collab_text::TextOp;
@@ -20,7 +20,8 @@ use uuid::Uuid;
 
 use crate::AppState;
 use crate::api::ApiError;
-use crate::auth::{Signed, same_origin};
+use crate::auth::Signed;
+use crate::deployment::SameOrigin;
 use crate::file_room::{FileCommand, FileLink};
 use crate::room::{
     AccessChange, Command, ConnId, JoinReply, OUTBOUND_CAPACITY, Outbound, RoomLink,
@@ -71,14 +72,14 @@ pub(crate) struct Visitor {
 pub(crate) async fn upgrade(
     State(state): State<AppState>,
     Path(doc_id): Path<String>,
-    headers: HeaderMap,
+    same_origin: Option<axum::Extension<SameOrigin>>,
     signed: Result<Signed, ApiError>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    if !same_origin(&headers) {
+    if !same_origin.is_some_and(|s| s.0.0) {
         return (
             StatusCode::FORBIDDEN,
-            "only local, same-origin connections are allowed",
+            "only same-origin connections are allowed",
         )
             .into_response();
     }

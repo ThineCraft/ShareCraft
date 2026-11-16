@@ -20,6 +20,7 @@ mod editors;
 #[allow(dead_code)]
 mod fake_icap;
 mod package;
+mod tls_proxy;
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -41,7 +42,11 @@ fn main() -> ExitCode {
         Some("editors") => editors::dispatch(&std::env::args().skip(2).collect::<Vec<_>>()),
         Some("fake-icap") => fake_icap::run(&std::env::args().skip(2).collect::<Vec<_>>()),
         Some("package") => package::run_package(&std::env::args().skip(2).collect::<Vec<_>>()),
-        _ => Err("usage: cargo xtask <web|check|test|scale|editors|fake-icap|package>".to_owned()),
+        Some("tls-proxy") => tls_proxy::run(&std::env::args().skip(2).collect::<Vec<_>>()),
+        _ => Err(
+            "usage: cargo xtask <web|check|test|scale|editors|fake-icap|package|tls-proxy>"
+                .to_owned(),
+        ),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

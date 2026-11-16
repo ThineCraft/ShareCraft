@@ -88,8 +88,11 @@ async fn sign_in_sets_an_http_only_cookie_and_me_answers() {
             "name": "Ann",
             "is_admin": false,
             "open_requests": 0,
+            "version": server::VERSION,
         })
     );
+    // A test build is not a packaged one: its version says so.
+    assert!(server::VERSION.ends_with("-dev"), "{}", server::VERSION);
 }
 
 #[tokio::test]
@@ -202,10 +205,13 @@ async fn sixth_failed_attempt_is_refused() {
             (StatusCode::UNAUTHORIZED, error("invalid_credentials"))
         );
     }
-    let answer = status_and_body(sign_in(&server, "ann@x.test", PASSWORD).await).await;
-    assert_eq!(
-        answer,
-        (StatusCode::TOO_MANY_REQUESTS, error("too_many_attempts"))
+    let (status, body) = status_and_body(sign_in(&server, "ann@x.test", PASSWORD).await).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(body["error"], "too_many_attempts");
+    assert!(
+        body["retry_after"]
+            .as_u64()
+            .is_some_and(|s| s > 0 && s <= 900)
     );
 
     // Other emails are not affected.
@@ -233,10 +239,13 @@ async fn simultaneous_attempts_cannot_pass_the_limit() {
         .count();
     assert!(checked <= 5, "{statuses:?}");
     assert_eq!(checked + refused, 10, "{statuses:?}");
-    let answer = status_and_body(sign_in(&server, "ann@x.test", PASSWORD).await).await;
-    assert_eq!(
-        answer,
-        (StatusCode::TOO_MANY_REQUESTS, error("too_many_attempts"))
+    let (status, body) = status_and_body(sign_in(&server, "ann@x.test", PASSWORD).await).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(body["error"], "too_many_attempts");
+    assert!(
+        body["retry_after"]
+            .as_u64()
+            .is_some_and(|s| s > 0 && s <= 900)
     );
 }
 

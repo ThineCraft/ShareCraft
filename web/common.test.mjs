@@ -39,6 +39,7 @@ import {
   visibleTree,
   inheritAgainMessage,
   messageFor,
+  tooManyAttemptsMessage,
   moveChoices,
   noSourceText,
   rolesWithin,
@@ -178,6 +179,8 @@ test('every error code of the tree and access routes has its own sentence', () =
     'not_deleted',
     'not_a_hub',
     'is_hub',
+    'https_required',
+    'busy',
   ]) {
     assert.notEqual(messageFor(code), general, code);
   }
@@ -2385,5 +2388,15 @@ test('account_bar_keeps_system_fonts', () => {
   // Code and other fixed-width text keep their monospace stacks.
   for (const selector of ['pre.text', '.copybox input', '.details-text', '.pv-lines']) {
     assert.match(variable(declarations(selector), 'font') ?? '', /ui-monospace/, selector);
+  }
+});
+
+test('signin_shows_wait_time', () => {
+  assert.equal(tooManyAttemptsMessage(840), 'Too many attempts. Try again in 14 minutes.');
+  assert.equal(tooManyAttemptsMessage(61), 'Too many attempts. Try again in 2 minutes.');
+  assert.equal(tooManyAttemptsMessage(60), 'Too many attempts. Try again in 1 minute.');
+  assert.equal(tooManyAttemptsMessage(5), 'Too many attempts. Try again in less than a minute.');
+  for (const unknown of [undefined, null, 0, -3, 'soon']) {
+    assert.equal(tooManyAttemptsMessage(unknown), messageFor('too_many_attempts'));
   }
 });

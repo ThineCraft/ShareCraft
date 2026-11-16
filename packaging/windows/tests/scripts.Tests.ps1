@@ -22,9 +22,10 @@ $script:Loaded = $false
 
 try {
     . (Join-Path $script:Here '..\scripts\common.ps1')
+    . (Join-Path $script:Here '..\scripts\public-address.ps1')
     $script:Loaded = $true
 } catch {
-    Write-Host "cannot load scripts\common.ps1: $($_.Exception.Message)"
+    Write-Host "cannot load the Windows scripts: $($_.Exception.Message)"
 }
 
 # --- A small test harness ----------------------------------------------------------------------
@@ -64,7 +65,8 @@ function Test {
         $env:APPDATA = $savedRoaming
         $env:TEMP = $savedTemp
         $env:TMP = $savedTmp
-        foreach ($name in 'PGPASSFILE', 'DATABASE_URL', 'PGHOST', 'PGHOSTADDR', 'PGPORT', 'PGUSER', 'PGPASSWORD', 'PGDATABASE', 'PGSERVICE') {
+        foreach ($name in 'PGPASSFILE', 'DATABASE_URL', 'PGHOST', 'PGHOSTADDR', 'PGPORT', 'PGUSER', 'PGPASSWORD', 'PGDATABASE', 'PGSERVICE',
+            'SHARECRAFT_PUBLIC_URL', 'SHARECRAFT_TRUSTED_PROXIES', 'SHARECRAFT_HSTS_SECONDS') {
             Remove-Item "Env:$name" -ErrorAction SilentlyContinue
         }
     }
@@ -360,7 +362,7 @@ Test 'a failing step that handled a secret does not show its output' {
     Assert-True ($loud -match 'visible') 'a plain step shows what it said'
 }
 
-Test 'settings.cmd holds the addresses and folders, never a secret' {
+Test 'settings round-trip with and without a public address' {
     $folder = New-TestFolder
     Use-TestProfile -Folder $folder
     $paths = Get-ShareCraftPaths
@@ -376,6 +378,123 @@ Test 'settings.cmd holds the addresses and folders, never a secret' {
     Assert-Equal '5442' $s.SHARECRAFT_PG_PORT 'database port'
     Assert-Equal '1346' $s.SHARECRAFT_ICAP_PORT 'scanner port'
     Assert-True ($s.SHARECRAFT_DATA.Contains("Zo$($script:Accent) Smith")) 'the non-ASCII folder comes back'
+    Assert-True (-not $s.ContainsKey('SHARECRAFT_PUBLIC_URL')) 'development mode has no public address'
+    Assert-True (-not $s.ContainsKey('SHARECRAFT_TRUSTED_PROXIES')) 'development mode has no trusted proxies setting'
+    Assert-True (-not $s.ContainsKey('SHARECRAFT_HSTS_SECONDS')) 'development mode has no HSTS setting'
+
+    Write-SettingsFile -Path $paths.SettingsFile -AppPort 8791 -PgPort 5442 -IcapPort 1346 `
+        -PublicUrl 'https://share.example.com:8443/' -TrustedProxies '127.0.0.1, ::1, 10.0.0.0/24' -HstsSeconds '300'
+    $s = Read-SettingsFile -Path $paths.SettingsFile
+    Assert-Equal 'https://share.example.com:8443/' $s.SHARECRAFT_PUBLIC_URL 'public address'
+    Assert-Equal '127.0.0.1, ::1, 10.0.0.0/24' $s.SHARECRAFT_TRUSTED_PROXIES 'trusted proxies'
+    Assert-Equal '300' $s.SHARECRAFT_HSTS_SECONDS 'HSTS seconds'
+}
+
+Test 'public address is checked before anything is written' {
+    $folder = New-TestFolder
+    Use-TestProfile -Folder $folder
+    $paths = Get-ShareCraftPaths
+    Initialize-StateFolders -Paths $paths
+    Write-SettingsFile -Path $paths.SettingsFile -AppPort 8791 -PgPort 5442 -IcapPort 1346
+    $before = Get-FileSha $paths.SettingsFile
+    $script:PublicAddressRestarts = 0
+    function Restart-ShareCraftForPublicAddress { $script:PublicAddressRestarts++ }
+    foreach ($bad in 'http://share.example.com', 'https://share.example.com/a', 'https://share example.com',
+        'https://share.example.com"', 'https://share.example.com%', 'https://Share.example.com',
+        'https://share.example.com?x=1', 'https://share.example.com#x', 'https://me@share.example.com',
+        'https://share.example.com:0') {
+        Assert-Throws { Invoke-PublicAddress -Paths $paths -Url $bad } 'valid HTTPS public address' "refuse $bad" | Out-Null
+        Assert-Equal $before (Get-FileSha $paths.SettingsFile) "settings unchanged for $bad"
+    }
+    foreach ($bad in '127.0.0.1%', '1.2.3', '10.0.0.0/7', '::/0') {
+        Assert-Throws { Invoke-PublicAddress -Paths $paths -Url 'https://share.example.com' -TrustedProxies $bad } `
+            'comma-separated list' "bad trusted proxies $bad" | Out-Null
+        Assert-Equal $before (Get-FileSha $paths.SettingsFile) "settings unchanged for bad trusted proxies $bad"
+    }
+    Assert-Throws { Invoke-PublicAddress -Paths $paths -Url 'https://share.example.com' -HstsSeconds '3.5' } `
+        'whole number' 'bad HSTS seconds' | Out-Null
+    Assert-Equal $before (Get-FileSha $paths.SettingsFile) 'settings unchanged for bad HSTS seconds'
+    Assert-Equal 0 $script:PublicAddressRestarts 'invalid addresses never restart ShareCraft'
+}
+
+Test 'public address command restarts and explains the proxy settings' {
+    $folder = New-TestFolder
+    Use-TestProfile -Folder $folder
+    $paths = Get-ShareCraftPaths
+    Initialize-StateFolders -Paths $paths
+    Write-SettingsFile -Path $paths.SettingsFile -AppPort 8791 -PgPort 5442 -IcapPort 1346
+    $script:PublicAddressRestarts = 0
+    function Restart-ShareCraftForPublicAddress { param($Paths) $script:PublicAddressRestarts++ }
+    $output = & {
+        Invoke-PublicAddress -Paths $paths -Url 'https://share.example.com:8443/' `
+            -TrustedProxies '127.0.0.1, ::1' -HstsSeconds '300'
+        Invoke-PublicAddress -Paths $paths -Status
+    } *>&1 | Out-String
+    $s = Read-SettingsFile -Path $paths.SettingsFile
+    Assert-Equal 'https://share.example.com:8443/' $s.SHARECRAFT_PUBLIC_URL 'public address written'
+    Assert-Equal '127.0.0.1, ::1' $s.SHARECRAFT_TRUSTED_PROXIES 'trusted proxies written'
+    Assert-Equal '300' $s.SHARECRAFT_HSTS_SECONDS 'HSTS seconds written'
+    Assert-Equal 1 $script:PublicAddressRestarts 'ShareCraft restarted once; status did not restart it'
+    foreach ($expected in 'http://127.0.0.1:8791', 'Host', 'X-Forwarded-Host', 'X-Forwarded-For',
+        'X-Forwarded-Proto: https', 'WebSocket', '9 MB', '8 MiB') {
+        Assert-True ($output.Contains($expected)) "instructions mention $expected"
+    }
+}
+
+Test 'off removes production settings' {
+    $folder = New-TestFolder
+    Use-TestProfile -Folder $folder
+    $paths = Get-ShareCraftPaths
+    Initialize-StateFolders -Paths $paths
+    Write-SettingsFile -Path $paths.SettingsFile -AppPort 8791 -PgPort 5442 -IcapPort 1346 `
+        -PublicUrl 'https://share.example.com' -TrustedProxies '127.0.0.1, ::1' -HstsSeconds '300'
+    $script:PublicAddressRestarts = 0
+    function Restart-ShareCraftForPublicAddress { param($Paths) $script:PublicAddressRestarts++ }
+    Invoke-PublicAddress -Paths $paths -Off
+    $s = Read-SettingsFile -Path $paths.SettingsFile
+    Assert-True (-not $s.ContainsKey('SHARECRAFT_PUBLIC_URL')) 'public address removed'
+    Assert-True (-not $s.ContainsKey('SHARECRAFT_TRUSTED_PROXIES')) 'trusted proxies removed'
+    Assert-True (-not $s.ContainsKey('SHARECRAFT_HSTS_SECONDS')) 'HSTS seconds removed'
+    Assert-Equal '127.0.0.1:8791' $s.SHARECRAFT_ADDR 'local address kept'
+    Assert-Equal 1 $script:PublicAddressRestarts 'ShareCraft restarted once'
+}
+
+Test 'settings still refuse a non-loopback SHARECRAFT_ADDR' {
+    $folder = New-TestFolder
+    Use-TestProfile -Folder $folder
+    $paths = Get-ShareCraftPaths
+    Initialize-StateFolders -Paths $paths
+    Write-SettingsFile -Path $paths.SettingsFile -AppPort 8791 -PgPort 5442 -IcapPort 1346 `
+        -PublicUrl 'https://share.example.com'
+    $text = [System.IO.File]::ReadAllText($paths.SettingsFile).Replace('127.0.0.1:8791', '0.0.0.0:8791')
+    [System.IO.File]::WriteAllText($paths.SettingsFile, $text, [System.Text.Encoding]::ASCII)
+    Assert-Throws { Read-SettingsFile -Path $paths.SettingsFile } '127\.0\.0\.1:<port>' 'non-loopback listen address' | Out-Null
+}
+
+Test 'server environment and browser address use production settings' {
+    $settings = @{
+        SHARECRAFT_ADDR = '127.0.0.1:8791'
+        SHARECRAFT_DATA = 'C:\data'
+        SHARECRAFT_WEB = 'C:\web'
+        SHARECRAFT_EDITORS_DIR = 'C:\editors'
+        SHARECRAFT_PUBLIC_URL = 'https://share.example.com:8443/'
+        SHARECRAFT_TRUSTED_PROXIES = '127.0.0.1, ::1'
+        SHARECRAFT_HSTS_SECONDS = '300'
+    }
+    Set-ServerEnvironment -Settings $settings
+    Assert-Equal 'https://share.example.com:8443/' $env:SHARECRAFT_PUBLIC_URL 'server public address'
+    Assert-Equal '127.0.0.1, ::1' $env:SHARECRAFT_TRUSTED_PROXIES 'server trusted proxies'
+    Assert-Equal '300' $env:SHARECRAFT_HSTS_SECONDS 'server HSTS seconds'
+    Assert-Equal 'https://share.example.com:8443/' (Get-ShareCraftBrowserAddress -Settings $settings) 'production browser address'
+
+    $settings.Remove('SHARECRAFT_PUBLIC_URL')
+    $settings.Remove('SHARECRAFT_TRUSTED_PROXIES')
+    $settings.Remove('SHARECRAFT_HSTS_SECONDS')
+    Set-ServerEnvironment -Settings $settings
+    Assert-True ($null -eq $env:SHARECRAFT_PUBLIC_URL) 'stale public address removed from environment'
+    Assert-True ($null -eq $env:SHARECRAFT_TRUSTED_PROXIES) 'stale trusted proxies removed from environment'
+    Assert-True ($null -eq $env:SHARECRAFT_HSTS_SECONDS) 'stale HSTS seconds removed from environment'
+    Assert-Equal 'http://127.0.0.1:8791/' (Get-ShareCraftBrowserAddress -Settings $settings) 'development browser address'
 }
 
 # --- Reinstalling and uninstalling -------------------------------------------------------------
@@ -428,6 +547,22 @@ Test 'a reinstall replaces the program and keeps the data, database and .env' {
         Assert-Equal $kept[$name] (Get-FileSha $name) "unchanged: $name"
     }
     Assert-Equal $envAcl (Get-Acl -LiteralPath $paths.EnvFile).Sddl '.env keeps its access list'
+}
+
+Test 'reinstall keeps the public address' {
+    $folder = New-TestFolder
+    Use-TestProfile -Folder $folder
+    $paths = Get-ShareCraftPaths
+    Initialize-StateFolders -Paths $paths
+    Write-SettingsFile -Path $paths.SettingsFile -AppPort 8792 -PgPort 5443 -IcapPort 1347 `
+        -PublicUrl 'https://share.example.com' -TrustedProxies '127.0.0.1, ::1' -HstsSeconds '300'
+    $old = Read-SettingsFile -Path $paths.SettingsFile
+    Write-InstallSettingsFile -Path $paths.SettingsFile -AppPort 8793 -PgPort 5444 -IcapPort 1348 -OldSettings $old
+    $new = Read-SettingsFile -Path $paths.SettingsFile
+    Assert-Equal 'https://share.example.com' $new.SHARECRAFT_PUBLIC_URL 'public address kept'
+    Assert-Equal '127.0.0.1, ::1' $new.SHARECRAFT_TRUSTED_PROXIES 'trusted proxies kept'
+    Assert-Equal '300' $new.SHARECRAFT_HSTS_SECONDS 'HSTS seconds kept'
+    Assert-Equal '127.0.0.1:8793' $new.SHARECRAFT_ADDR 'new app port written'
 }
 
 Test 'a reinstall keeps the ports it had, and moves only a port now taken' {

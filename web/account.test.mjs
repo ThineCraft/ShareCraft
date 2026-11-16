@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
-import { AVATAR_PALETTE, avatarColour, initials } from './account.js';
+import { AVATAR_PALETTE, avatarColour, initials, versionText } from './account.js';
 import { DARK_BACKGROUND, DARK_PAPER, LIGHT_BACKGROUND, LIGHT_PAPER, MIN_RATIO, contrast } from './look.js';
 import { menuItems } from './menu.js';
 
@@ -127,4 +127,14 @@ test('appearance.js keeps a new choice, and still applies it when storage is blo
   assert.equal(blocked.api.get(), 'system');
   blocked.api.set('dark');
   assert.equal(blocked.props.get('color-scheme'), 'dark');
+});
+
+test('version_shown_at_the_foot_of_signed_in_pages', () => {
+  assert.equal(versionText('0.1.0-6a18271'), 'ShareCraft 0.1.0-6a18271');
+  assert.equal(versionText('0.1.0-dev'), 'ShareCraft 0.1.0-dev');
+  assert.equal(versionText('0.1.0-6a18271-modified'), 'ShareCraft 0.1.0-6a18271-modified');
+  // Nothing that is not a plain version is shown.
+  for (const bad of [undefined, null, '', 42, '<b>1</b>', '1.0 beta', 'x'.repeat(41)]) {
+    assert.equal(versionText(bad), null, String(bad));
+  }
 });
