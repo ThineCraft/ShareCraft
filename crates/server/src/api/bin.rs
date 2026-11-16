@@ -16,7 +16,7 @@ use records::{BinCursor, BinEntry, BinStage, Editor, NodeKind};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-use super::nodes::{NodeOut, node_id, rfc3339};
+use super::nodes::{NodeOut, node_id, restore_checked, rfc3339};
 use super::{ApiError, to_completion};
 use crate::AppState;
 use crate::auth::Signed;
@@ -149,7 +149,12 @@ pub(crate) struct Restored {
 /// `POST /api/bin/{id}/restore`: restores the entry, with everything deleted with it, where it
 /// was (see [`tree::apply`]). `200 {node, renamed}`; `404` unless the caller sees the entry;
 /// `403` without the permission; `409 parent_in_bin` when a folder above it is in the bin and
-/// the caller may not restore it.
+/// the caller may not restore it; `409 source_read_only` for an entry that would go back into a
+/// library connected to a source.
+///
+/// Removing an entry (`DELETE /api/bin/{id}`) is not refused there: an entry is no longer the
+/// library's live content, and the sync never brings an entry back, so only a restore would
+/// change what the library mirrors.
 pub(crate) async fn restore(
     State(state): State<AppState>,
     signed: Signed,
@@ -158,7 +163,7 @@ pub(crate) async fn restore(
     let id = node_id(&id)?;
     let actor = signed.session.user;
     let applied = to_completion(async move {
-        let applied = tree::apply(&state, &actor, TreeOp::Restore { id }).await?;
+        let applied = restore_checked(&state, &actor, id).await?;
         let renamed = match &applied.renamed {
             Some((node, from)) => {
                 let now = state

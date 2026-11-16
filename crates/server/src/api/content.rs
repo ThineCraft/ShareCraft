@@ -703,6 +703,9 @@ pub(crate) async fn save(
     if !access.can_edit() {
         return Err(access.refusal().into());
     }
+    // A file of a connected library opens with a read-only seat, so nobody holds a token for
+    // it; refused in words all the same, before the body is read.
+    super::nodes::require_not_connected(db, doc.into()).await?;
     let document = db
         .document(doc)
         .await
@@ -802,7 +805,8 @@ fn saved(revision: &RevisionId, changed: bool) -> Response {
 /// and are claimed for the revision before it is committed. Content stored for an upload that
 /// is then refused, or fails, is erased unless something else names it. If they cannot be
 /// stored after the document was made, the document stays, empty, and the answer is `503`
-/// naming it.
+/// naming it. `409 source_read_only` in a library connected to a source, before the body is
+/// read.
 pub(crate) async fn upload(
     State(state): State<AppState>,
     signed: Signed,
@@ -815,6 +819,8 @@ pub(crate) async fn upload(
     let choice = conflict_choice(query.on_conflict.as_deref())?;
     let (name, editor, cleaned_from) = clean_upload_name(&asked)?;
     let user = signed.session.user;
+    // A replace is a new version of a file in `parent`, so the one check covers both.
+    super::nodes::require_not_connected_for(state.db(), user.id, parent).await?;
     let declared = request
         .headers()
         .get(CONTENT_LENGTH)

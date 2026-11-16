@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 use crate::AppState;
 use crate::api::ApiError;
+use crate::api::nodes::seat_access;
 use crate::auth::Signed;
 use crate::deployment::SameOrigin;
 use crate::file_room::{FileCommand, FileLink};
@@ -68,7 +69,8 @@ pub(crate) struct Visitor {
 /// without a session) and needs a role on the document; a document that does not exist and one
 /// they have no role on are both `404`. A document whose current version the malware scanner
 /// holds is `423 held {scan}`. Any query string, such as the `name` older pages send, is
-/// ignored.
+/// ignored. A file of a library connected to a source opens read-only for everyone (see
+/// [`crate::api::nodes::read_only_seat`]): it is kept in step with its repository.
 pub(crate) async fn upgrade(
     State(state): State<AppState>,
     Path(doc_id): Path<String>,
@@ -107,8 +109,8 @@ async fn visitor(
     let role = db
         .doc_access(session.user.id, doc)
         .await
-        .map_err(|e| ApiError::unavailable(&e))?
-        .ok_or(ApiError::NotFound)?;
+        .map_err(|e| ApiError::unavailable(&e))?;
+    let role = seat_access(db, doc, role).await.ok_or(ApiError::NotFound)?;
     let document = db
         .document(doc)
         .await
@@ -441,12 +443,14 @@ async fn recheck_after_join(
             }
         },
         Ok(Some(_)) => match db.doc_access(visitor.user, doc).await {
-            Ok(role) if role.as_ref() == Some(&visitor.role) => None,
-            Ok(None) if is_deleted(state, doc).await => Some(AccessChange::Deleted),
-            Ok(role) => Some(AccessChange::SetAccess {
-                user: visitor.user,
-                role,
-            }),
+            Ok(role) => match seat_access(db, doc, role).await {
+                role if role.as_ref() == Some(&visitor.role) => None,
+                None if is_deleted(state, doc).await => Some(AccessChange::Deleted),
+                role => Some(AccessChange::SetAccess {
+                    user: visitor.user,
+                    role,
+                }),
+            },
             Err(e) => {
                 eprintln!("sharecraft-server: database failure: {e}");
                 return Recheck::Unavailable;

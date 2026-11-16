@@ -50,6 +50,114 @@ pub(crate) fn node_id(text: &str) -> Result<NodeId, ApiError> {
     parse_id(text).map(NodeId)
 }
 
+/// `409 source_read_only` if `node` is, or lies in, a library connected to a source: such a
+/// library is kept in step with its repository, so nothing in it is created, changed, moved,
+/// copied in, deleted or restored through the API, by anyone, administrators included (they
+/// disconnect the source instead). One query, never cached: a library connected or
+/// disconnected a moment ago is judged as it now is.
+///
+/// The guard belongs in the HTTP handlers (and the editor's seat, see [`read_only_seat`]),
+/// never in [`tree::apply`], [`move_one`], [`delete_one`] or the upload functions, which the
+/// sync engine calls directly to change the library.
+pub(crate) async fn require_not_connected(db: &Db, node: NodeId) -> Result<(), ApiError> {
+    match db
+        .source_library_of(node)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?
+    {
+        Some(_) => Err(ApiError::SourceReadOnly),
+        None => Ok(()),
+    }
+}
+
+/// [`require_not_connected`] for a handler that has not yet checked `user`'s access, so that a
+/// refusal tells nothing to someone who cannot see the place: `404` instead, unless they have
+/// access to `node` or to its connected library (a recycle-bin entry is judged by the library).
+pub(crate) async fn require_not_connected_for(
+    db: &Db,
+    user: UserId,
+    node: NodeId,
+) -> Result<(), ApiError> {
+    let library = db
+        .source_library_of(node)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?;
+    let Some(library) = library else {
+        return Ok(());
+    };
+    for place in [node, library] {
+        if db
+            .effective_access(user, place)
+            .await
+            .map_err(|e| ApiError::unavailable(&e))?
+            .is_some()
+        {
+            return Err(ApiError::SourceReadOnly);
+        }
+    }
+    Err(ApiError::NotFound)
+}
+
+/// `access` to a file of a connected library, as its editor's seat gets it: without `add`,
+/// `edit` and `delete`, so it opens read-only and is never given the editing seat. What else it
+/// holds (viewing, managing access) is kept.
+pub(crate) fn read_only_seat(access: Access) -> Access {
+    let changes =
+        (Perms::ADD.bits() | Perms::EDIT.bits() | Perms::DELETE.bits()) & !Perms::VIEW.bits();
+    let perms = Perms::from_bits(access.perms.bits() & !changes).unwrap_or(Perms::VIEW);
+    Access { perms, ..access }
+}
+
+/// `access`, read for `doc`'s editor seat, made read-only (see [`read_only_seat`]) when `doc`
+/// lies in a connected library. If that cannot be told, it is made read-only too: the safe
+/// side.
+pub(crate) async fn seat_access(db: &Db, doc: DocId, access: Option<Access>) -> Option<Access> {
+    let access = access?;
+    match db.source_library_of(doc.into()).await {
+        Ok(None) => Some(access),
+        Ok(Some(_)) => Some(read_only_seat(access)),
+        Err(e) => {
+            eprintln!("sharecraft-server: database failure: {e}");
+            Some(read_only_seat(access))
+        }
+    }
+}
+
+/// [`move_one`] for a request: refused (see [`require_not_connected_for`]) when the item or
+/// the place it goes to is in a connected library. A move out takes an item out of the
+/// mirror, and a move in adds one, so both are refused.
+pub(crate) async fn move_checked(
+    state: &AppState,
+    actor: &User,
+    id: NodeId,
+    parent: NodeId,
+) -> Result<Node, ApiError> {
+    require_not_connected_for(state.db(), actor.id, id).await?;
+    require_not_connected_for(state.db(), actor.id, parent).await?;
+    move_one(state, actor, id, parent).await
+}
+
+/// [`delete_one`] for a request: refused when the item is in a connected library.
+pub(crate) async fn delete_checked(
+    state: &AppState,
+    actor: &User,
+    id: NodeId,
+) -> Result<(), ApiError> {
+    require_not_connected_for(state.db(), actor.id, id).await?;
+    delete_one(state, actor, id).await
+}
+
+/// A restore from the recycle bin for a request: refused when the entry would go back into a
+/// connected library (it is judged by where it was, which is where it returns).
+pub(crate) async fn restore_checked(
+    state: &AppState,
+    actor: &User,
+    id: NodeId,
+) -> Result<tree::Applied, ApiError> {
+    require_not_connected_for(state.db(), actor.id, id).await?;
+    Ok(tree::apply(state, actor, TreeOp::Restore { id }).await?)
+}
+
 /// A node as answered by the routes that create or change one.
 #[derive(Serialize)]
 pub(crate) struct NodeOut {
@@ -398,6 +506,7 @@ pub(crate) async fn create(
     let kind: NodeKind =
         serde_json::from_value(Value::String(new.kind)).map_err(|_| ApiError::InvalidRequest)?;
     let actor = signed.session.user;
+    require_not_connected_for(state.db(), actor.id, parent).await?;
     let node = to_completion(async move {
         let op = TreeOp::Create {
             parent: Some(parent),
@@ -436,6 +545,11 @@ pub(crate) async fn change(
         return Err(ApiError::InvalidRequest);
     }
     let actor = signed.session.user;
+    // Both the item and where it would go: nothing is renamed if the move would be refused.
+    require_not_connected_for(state.db(), actor.id, id).await?;
+    if let Some(parent) = parent {
+        require_not_connected_for(state.db(), actor.id, parent).await?;
+    }
     let node = to_completion(async move {
         let mut node = None;
         if let Some(name) = change.name {
@@ -519,7 +633,8 @@ pub(crate) async fn copy(
 }
 
 /// Copies `id` into `parent` for `actor`, named `name` or as it is. Run inside
-/// [`to_completion`].
+/// [`to_completion`]. A copy into a connected library is refused (`409 source_read_only`); a
+/// copy out of one is an ordinary copy.
 pub(crate) async fn copy_one(
     state: &AppState,
     actor: &User,
@@ -527,6 +642,7 @@ pub(crate) async fn copy_one(
     parent: NodeId,
     name: Option<String>,
 ) -> Result<Copied, ApiError> {
+    require_not_connected_for(state.db(), actor.id, parent).await?;
     let applied = tree::apply(state, actor, TreeOp::Copy { id, parent, name })
         .await
         .map_err(|e| match e {
@@ -595,7 +711,7 @@ pub(crate) async fn remove(
 ) -> Result<StatusCode, ApiError> {
     let id = node_id(&id)?;
     let actor = signed.session.user;
-    to_completion(async move { delete_one(&state, &actor, id).await }).await?;
+    to_completion(async move { delete_checked(&state, &actor, id).await }).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

@@ -47,6 +47,10 @@ use crate::room::AccessChange;
 /// Largest request body accepted.
 const MAX_BODY: usize = 16 * 1024;
 
+/// The `message` of `409 source_read_only`.
+const SOURCE_READ_ONLY: &str =
+    "This library is kept in step with a GitHub repository, so it cannot be changed here.";
+
 /// The `/api` routes, to be nested under `/api`. Unknown paths answer `404 {"error":"not_found"}`
 /// and pass the same guard as the others. File content is the only thing allowed a body larger
 /// than [`MAX_BODY`]: it is streamed into the content store, up to the largest file allowed
@@ -363,6 +367,10 @@ pub(crate) enum ApiError {
     LibraryNotEmpty,
     /// 409: the library is connected to a source already.
     SourceExists,
+    /// 409: the library is kept in step with a source (a GitHub repository), so nothing in it
+    /// is created, changed, moved, copied in, deleted or restored here; administrators too.
+    /// The answer's `message` says so in words.
+    SourceReadOnly,
     /// 422: the name does not keep its editor's extension, or a file no editor opens would
     /// take an editor's extension.
     WrongExtension,
@@ -507,6 +515,7 @@ impl ApiError {
             ApiError::FoldersOff => (StatusCode::CONFLICT, "folders_off"),
             ApiError::LibraryNotEmpty => (StatusCode::CONFLICT, "library_not_empty"),
             ApiError::SourceExists => (StatusCode::CONFLICT, "source_exists"),
+            ApiError::SourceReadOnly => (StatusCode::CONFLICT, "source_read_only"),
             ApiError::WrongExtension => (StatusCode::UNPROCESSABLE_ENTITY, "wrong_extension"),
             ApiError::BlockedFileType(_) => (StatusCode::UNPROCESSABLE_ENTITY, "blocked_file_type"),
             ApiError::FileTooLarge(_) => (StatusCode::PAYLOAD_TOO_LARGE, "file_too_large"),
@@ -730,6 +739,15 @@ async fn recheck(state: &AppState, mut docs: Vec<DocId>, only: Option<UserId>) {
     docs.dedup();
     for doc in docs {
         let _in_order = rooms.order_access(doc).await;
+        // A file of a connected library stays read-only whatever role is read (one query per
+        // document; a failure to tell counts as connected).
+        let connected = match db.source_library_of(doc.into()).await {
+            Ok(library) => library.is_some(),
+            Err(e) => {
+                eprintln!("sharecraft-server: database failure: {e}");
+                true
+            }
+        };
         for user in rooms.connected_users(doc).await {
             if only.is_some_and(|only| only != user) {
                 continue;
@@ -740,6 +758,11 @@ async fn recheck(state: &AppState, mut docs: Vec<DocId>, only: Option<UserId>) {
                     eprintln!("sharecraft-server: database failure: {e}");
                     None
                 }
+            };
+            let access = if connected {
+                access.map(nodes::read_only_seat)
+            } else {
+                access
             };
             rooms.send_to(doc, AccessChange::SetAccess { user, role: access });
         }
@@ -773,6 +796,7 @@ impl IntoResponse for ApiError {
             ApiError::FileTooLarge(limit) => json!({ "error": code, "limit": limit }),
             ApiError::Held(scan) => json!({ "error": code, "scan": scan }),
             ApiError::TooMany(limit) => json!({ "error": code, "limit": limit }),
+            ApiError::SourceReadOnly => json!({ "error": code, "message": SOURCE_READ_ONLY }),
             _ => json!({ "error": code }),
         };
         (status, Json(body)).into_response()

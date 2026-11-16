@@ -12,7 +12,7 @@ use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use super::nodes::{Copied, NodeOut, node_id, rfc3339};
+use super::nodes::{Copied, NodeOut, node_id, require_not_connected_for, rfc3339};
 use super::{ApiError, JsonBody, to_completion};
 use crate::AppState;
 use crate::auth::Signed;
@@ -222,7 +222,8 @@ pub(crate) struct FromTemplate {
 /// can view in a template library of the library's site; `400 wrong_place` for a `parent`
 /// outside the library; `403` without `add` there (`archived` on an archived site); `422
 /// blocked_file_type` / `413 file_too_large` for the library's policies; `507
-/// quota_exceeded`; `423 held {scan}` for a template the malware scanner holds.
+/// quota_exceeded`; `423 held {scan}` for a template the malware scanner holds; `409
+/// source_read_only` for a library connected to a source.
 pub(crate) async fn from_template(
     State(state): State<AppState>,
     signed: Signed,
@@ -233,6 +234,8 @@ pub(crate) async fn from_template(
     let template = node_id(&body.template)?;
     let parent = body.parent.as_deref().map(node_id).transpose()?;
     let actor = signed.session.user;
+    // The folder must lie in the library, which `tree::apply` checks; the library decides.
+    require_not_connected_for(state.db(), actor.id, library).await?;
     let copied = to_completion(async move {
         let op = TreeOp::FromTemplate {
             library,

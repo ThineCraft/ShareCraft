@@ -71,6 +71,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use super::content::{Created, create_uploaded, discard, query_of, save_answer};
+use super::nodes::require_not_connected_for;
 use super::{ApiError, JsonBody, parse_id, to_completion};
 use crate::auth::Signed;
 use crate::blobs::{ChannelReader, Held, release};
@@ -405,6 +406,7 @@ pub(crate) async fn start(
     let (target, name, base, site) = match (body.parent, body.doc) {
         (Some(parent), None) => {
             let parent = NodeId(parse_id(&parent)?);
+            require_not_connected_for(db, user.id, parent).await?;
             let asked = body.name.ok_or(ApiError::BadRequest)?;
             if body.base.is_some() {
                 return Err(ApiError::BadRequest);
@@ -429,6 +431,7 @@ pub(crate) async fn start(
         }
         (None, Some(doc)) => {
             let doc = DocId(parse_id(&doc)?);
+            require_not_connected_for(db, user.id, doc.into()).await?;
             let base = match &body.base {
                 Some(text) => Some(RevisionId::from_str(text).map_err(|_| ApiError::BadRequest)?),
                 None => None,
@@ -585,6 +588,17 @@ async fn refuse_archived(state: &AppState, session: &UploadSession) -> Result<()
     Ok(())
 }
 
+/// `409 source_read_only` if the session's file goes into a library connected to a source
+/// (connected after the session started, while the library was empty). Sending to it and
+/// finishing it are refused; abandoning it is not.
+async fn refuse_connected(state: &AppState, session: &UploadSession) -> Result<(), ApiError> {
+    let place = match session.target {
+        UploadTarget::NewFile { parent } => parent,
+        UploadTarget::NewVersion { doc } => doc.into(),
+    };
+    require_not_connected_for(state.db(), session.owner, place).await
+}
+
 /// Abandons the upload session `id`, whoever it belongs to, once any request on it is done:
 /// its row (releasing its reservation), its part file, and what this process knows of it.
 pub(crate) async fn abandon_session(state: &AppState, id: Uuid) -> Result<(), ApiError> {
@@ -708,6 +722,7 @@ pub(crate) async fn chunk(
     let user = signed.session.user;
     let session = owned(&state, id, &user).await?;
     refuse_archived(&state, &session).await?;
+    refuse_connected(&state, &session).await?;
     let range = headers
         .get(CONTENT_RANGE)
         .and_then(|value| value.to_str().ok())
@@ -925,6 +940,7 @@ pub(crate) async fn finish(
     let user = signed.session.user;
     let session = owned(&state, id, &user).await?;
     refuse_archived(&state, &session).await?;
+    refuse_connected(&state, &session).await?;
     to_completion(async move {
         let turn = state.uploads().turn(id);
         let mut progress = turn.lock().await;

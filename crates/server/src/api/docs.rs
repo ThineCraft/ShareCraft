@@ -13,7 +13,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
-use super::nodes::require_reading_manager;
+use super::nodes::{require_not_connected_for, require_reading_manager};
 use super::{ApiError, JsonBody, parse_id, to_completion};
 use crate::AppState;
 use crate::auth::Signed;
@@ -47,7 +47,8 @@ fn refused(code: &str, message: &str) -> Response {
 /// `parent`, of which the caller must be an editor. The document inherits its access from
 /// there. `201` with the document and the caller's access to it. Its name is checked against
 /// the file policies there (`422 blocked_file_type {extension}`). An empty PDF, or an empty
-/// file no editor opens (`other`), is `400 upload_required`.
+/// file no editor opens (`other`), is `400 upload_required`. `409 source_read_only` in a
+/// library connected to a source.
 pub(crate) async fn create(
     State(state): State<AppState>,
     signed: Signed,
@@ -77,6 +78,7 @@ pub(crate) async fn create(
     let name = new.name.unwrap_or_else(|| DEFAULT_NAME.to_owned());
     let actor = signed.session.user;
     let user = actor.id;
+    require_not_connected_for(state.db(), user, parent).await?;
     let created =
         to_completion({
             let state = state.clone();

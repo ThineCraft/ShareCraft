@@ -3,7 +3,9 @@
 //! `POST /api/bulk {op, items, parent?}` takes up to [`MAX_ITEMS`] items. Each is one operation
 //! through the same path as the single-item route (`PATCH /api/nodes/{id}` for a move,
 //! `POST /api/nodes/{id}/copy`, `DELETE /api/nodes/{id}`, `POST /api/bin/{id}/restore`), with
-//! its own result, in the order given: one failing does not stop the others.
+//! its own result, in the order given: one failing does not stop the others. An item in, or
+//! going into, a library connected to a source is refused as the single-item route refuses it
+//! (`source_read_only`).
 
 use axum::Json;
 use axum::extract::State;
@@ -11,11 +13,10 @@ use collab_core::ids::NodeId;
 use records::{FileType, ScanState};
 use serde::{Deserialize, Serialize};
 
-use super::nodes::{copy_one, delete_one, move_one, node_id};
+use super::nodes::{copy_one, delete_checked, move_checked, node_id, restore_checked};
 use super::{ApiError, JsonBody, to_completion};
 use crate::AppState;
 use crate::auth::Signed;
-use crate::tree::{self, TreeOp};
 
 /// Most items one request may name.
 pub(crate) const MAX_ITEMS: usize = 500;
@@ -158,7 +159,7 @@ async fn one(
     parent: Option<NodeId>,
 ) -> Result<Done, ApiError> {
     match (op, parent) {
-        (BulkOp::Move, Some(parent)) => move_one(state, actor, id, parent)
+        (BulkOp::Move, Some(parent)) => move_checked(state, actor, id, parent)
             .await
             .map(|_| Done::default()),
         (BulkOp::Copy, Some(parent)) => {
@@ -168,9 +169,11 @@ async fn one(
                 renamed: copied.renamed().map(|(from, to)| Renamed { from, to }),
             })
         }
-        (BulkOp::Delete, _) => delete_one(state, actor, id).await.map(|()| Done::default()),
+        (BulkOp::Delete, _) => delete_checked(state, actor, id)
+            .await
+            .map(|()| Done::default()),
         (BulkOp::Restore, _) => {
-            let applied = tree::apply(state, actor, TreeOp::Restore { id }).await?;
+            let applied = restore_checked(state, actor, id).await?;
             let renamed = match applied.renamed {
                 Some((node, from)) => {
                     let to = state
