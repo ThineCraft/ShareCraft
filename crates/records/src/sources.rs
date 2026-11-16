@@ -521,6 +521,19 @@ impl Db {
             .map_err(DbError::from)
     }
 
+    /// The nodes of the items of `library` that are live: not deleted (in the bin or purged)
+    /// and not missing. Reads only.
+    pub async fn live_source_nodes(&self, library: NodeId) -> Result<Vec<NodeId>, DbError> {
+        let ids: Vec<Uuid> = sqlx::query_scalar(
+            "select i.node_id from source_items i join nodes n on n.id = i.node_id \
+             where i.library_id = $1 and n.deleted_at is null",
+        )
+        .bind(library.0)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(ids.into_iter().map(NodeId).collect())
+    }
+
     /// Records `items` for `library`: a path already recorded takes the new node, blob and
     /// size. In one transaction, so a node held at two paths refuses the whole batch.
     pub async fn upsert_source_items(

@@ -213,6 +213,16 @@ impl FakeGithub {
         CommitId { sha, tree }
     }
 
+    /// Points `branch` at the earlier commit `sha`, as a force-push back would.
+    pub fn reset_branch(&self, branch: &str, sha: &str) {
+        let mut model = self.model.lock().unwrap();
+        assert!(model.repo.commits.contains_key(sha), "no such commit");
+        model
+            .repo
+            .branches
+            .insert(branch.to_owned(), sha.to_owned());
+    }
+
     /// Deletes `branch`; its commits stay readable by id.
     pub fn delete_branch(&self, branch: &str) {
         self.model.lock().unwrap().repo.branches.remove(branch);

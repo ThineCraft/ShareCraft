@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use collab_core::ids::{DocId, NodeId};
 use common::fake_github::{AUTHOR_NAME, FakeGithub};
-use common::{TIMEOUT, TestServer, TestUser, spawn_server_config, start_fake_github};
+use common::{FileClient, TIMEOUT, TestServer, TestUser, spawn_server_config, start_fake_github};
 use records::{NewSource, Principal, SealedRow, SourceKind, SourceState, SourceStatus};
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
@@ -822,4 +822,249 @@ async fn items_left_unrecorded_by_a_crash_are_adopted_not_duplicated() {
     assert_eq!(download(&env.server, &env.admin, a).await.1, b"a, edited");
     let items = db.source_items(env.library).await.unwrap();
     assert_eq!(items.len(), 3);
+}
+
+/// Deletes `id` to the recycle bin as `env`'s administrator, outside the sync.
+async fn delete_outside(env: &Env, id: NodeId) {
+    let (status, body) = call(
+        &env.server,
+        &env.admin,
+        Method::DELETE,
+        &format!("/api/nodes/{}", id.0),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+}
+
+#[tokio::test]
+async fn a_file_moved_out_of_a_viewers_folder_ends_their_session() {
+    let env = Env::new().await;
+    env.fake.commit(
+        "main",
+        &files(&[("shared/sheet.xlsx", "cells"), ("private/keep.md", "kept")]),
+    );
+    env.synced().await;
+    let shared = env.node_at("shared").await;
+    let sheet = env.node_at("shared/sheet.xlsx").await;
+    let bob = env.server.user("Bob").await;
+    env.server
+        .records_db()
+        .set_node_access(
+            env.admin.id,
+            shared,
+            Principal::User(bob.id),
+            Some("viewer"),
+        )
+        .await
+        .unwrap();
+    let mut session = FileClient::connect_as(&env.server, DocId(sheet.0), &bob).await;
+
+    env.fake.commit(
+        "main",
+        &files(&[("private/sheet.xlsx", "cells"), ("private/keep.md", "kept")]),
+    );
+    assert_eq!(env.synced().await.moved, 1);
+    assert_eq!(env.node_at("private/sheet.xlsx").await, sheet);
+    // Bob may not see where it went: his open session ends, as for a move made by hand.
+    session
+        .pump_until(|c| c.removed.is_some() || c.closed)
+        .await;
+    assert_eq!(
+        download(&env.server, &bob, sheet).await.0,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn a_folder_replaced_by_a_file_of_its_name_syncs() {
+    let env = Env::new().await;
+    env.fake.commit(
+        "main",
+        &files(&[("docs/a.md", "a"), ("docs/b.md", "b"), ("keep.md", "k")]),
+    );
+    env.synced().await;
+    let a = env.node_at("docs/a.md").await;
+    let folder = env.node_at("docs").await;
+
+    env.fake
+        .commit("main", &files(&[("docs", "now a file"), ("keep.md", "k")]));
+    let report = env.synced().await;
+    assert_eq!((report.added, report.removed), (1, 2));
+    assert!(env.in_bin(a).await && env.in_bin(folder).await);
+    let docs = env.node_at("docs").await;
+    assert_ne!(docs, folder);
+    assert_eq!(
+        download(&env.server, &env.admin, docs).await.1,
+        b"now a file"
+    );
+    assert_eq!(env.sync().await, Ok(None));
+}
+
+#[tokio::test]
+async fn a_file_moved_onto_the_name_of_a_gone_folder_syncs() {
+    let env = Env::new().await;
+    env.fake.commit(
+        "main",
+        &files(&[("X/note.md", "the note"), ("keep.md", "k")]),
+    );
+    env.synced().await;
+    let note = env.node_at("X/note.md").await;
+    let folder = env.node_at("X").await;
+
+    // The folder goes and its one file takes its name, in another case.
+    env.fake
+        .commit("main", &files(&[("x", "the note"), ("keep.md", "k")]));
+    let report = env.synced().await;
+    assert_eq!(report.moved, 1);
+    assert!(env.in_bin(folder).await);
+    assert_eq!(env.node_at("x").await, note);
+    assert_eq!(download(&env.server, &env.admin, note).await.1, b"the note");
+    assert_eq!(env.sync().await, Ok(None));
+}
+
+#[tokio::test]
+async fn a_move_and_rename_does_not_collide_at_the_destination() {
+    let env = Env::new().await;
+    env.fake.commit(
+        "main",
+        &files(&[("a/x.md", "moving"), ("b/x.md", "staying")]),
+    );
+    env.synced().await;
+    let moving = env.node_at("a/x.md").await;
+    let staying = env.node_at("b/x.md").await;
+
+    env.fake.commit(
+        "main",
+        &files(&[("b/y.md", "moving"), ("b/x.md", "staying")]),
+    );
+    assert_eq!(env.synced().await.moved, 1);
+    assert_eq!(env.node_at("b/y.md").await, moving);
+    assert_eq!(env.node_at("b/x.md").await, staying);
+    assert_eq!(
+        download(&env.server, &env.admin, staying).await.1,
+        b"staying"
+    );
+    assert_eq!(env.find("a").await, None);
+    assert_eq!(env.sync().await, Ok(None));
+}
+
+#[tokio::test]
+async fn nodes_deleted_outside_the_sync_come_back() {
+    let env = Env::new().await;
+    env.fake.commit(
+        "main",
+        &files(&[
+            ("loose.md", "loose"),
+            ("dir/inner.md", "inner"),
+            ("other.md", "o"),
+        ]),
+    );
+    env.synced().await;
+    delete_outside(&env, env.node_at("loose.md").await).await;
+    delete_outside(&env, env.node_at("dir").await).await;
+
+    env.fake.commit(
+        "main",
+        &files(&[
+            ("loose.md", "loose"),
+            ("dir/inner.md", "inner"),
+            ("other.md", "o"),
+            ("new.md", "new"),
+        ]),
+    );
+    env.synced().await;
+    let loose = env.node_at("loose.md").await;
+    assert_eq!(download(&env.server, &env.admin, loose).await.1, b"loose");
+    let inner = env.node_at("dir/inner.md").await;
+    assert_eq!(download(&env.server, &env.admin, inner).await.1, b"inner");
+    assert!(env.find("new.md").await.is_some());
+    let items = env
+        .server
+        .records_db()
+        .source_items(env.library)
+        .await
+        .unwrap();
+    assert_eq!(items.len(), 5);
+    assert_eq!(env.sync().await, Ok(None));
+}
+
+#[tokio::test]
+async fn a_failed_fetch_leaves_source_items_untouched() {
+    let env = Env::new().await;
+    env.fake
+        .commit("main", &files(&[("a.md", "a"), ("b.md", "b")]));
+    env.synced().await;
+    delete_outside(&env, env.node_at("a.md").await).await;
+    let db = env.server.records_db();
+    let before = db.source_items(env.library).await.unwrap();
+
+    env.fake.commit(
+        "main",
+        &files(&[("a.md", "a, edited"), ("b.md", "b"), ("c.md", "c")]),
+    );
+    let c = git_blob_id(b"c");
+    env.fake.corrupt_blob(&c);
+    assert!(matches!(env.sync().await, Err(SyncError::Failed(_))));
+    assert_eq!(db.source_items(env.library).await.unwrap(), before);
+
+    env.fake.corrupt_blob(&c); // back as it was
+    env.synced().await;
+    let a = env.node_at("a.md").await;
+    assert_eq!(download(&env.server, &env.admin, a).await.1, b"a, edited");
+}
+
+#[tokio::test]
+async fn a_force_push_back_after_a_half_applied_sync_syncs_again() {
+    let env = Env::new().await;
+    let first = env.fake.commit("main", &files(&[("a.md", "one")]));
+    env.synced().await;
+    let a = env.node_at("a.md").await;
+    // Something not from the repository holds a name the next commit needs.
+    let (status, body) = call(
+        &env.server,
+        &env.admin,
+        Method::POST,
+        &format!("/api/nodes/{}/children", env.library.0),
+        Some(json!({ "kind": "folder", "name": "new.md" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    env.fake
+        .commit("main", &files(&[("a.md", "two"), ("new.md", "new")]));
+    let failed = env.sync().await;
+    assert!(matches!(failed, Err(SyncError::Failed(_))), "{failed:?}");
+    // Applied as far as it went: the edit is in.
+    assert_eq!(download(&env.server, &env.admin, a).await.1, b"two");
+
+    env.fake.reset_branch("main", &first.sha);
+    let report = env.synced().await;
+    assert_eq!(report.changed, 1);
+    assert_eq!(download(&env.server, &env.admin, a).await.1, b"one");
+}
+
+#[tokio::test]
+async fn hidden_files_do_not_push_their_siblings_to_a_suffix() {
+    let env = Env::new().await;
+    let (status, body) = call(
+        &env.server,
+        &env.admin,
+        Method::PATCH,
+        &format!("/api/libraries/{}", env.library.0),
+        Some(json!({ "max_file_bytes": 5 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    env.fake
+        .commit("main", &files(&[("A.md", "far too long"), ("a.md", "ok")]));
+    let report = env.synced().await;
+    assert_eq!(report.hidden.too_big, 1);
+    assert_eq!(report.hidden.renamed, 0);
+    let names: Vec<String> = env
+        .children(env.library)
+        .await
+        .into_iter()
+        .map(|(n, _, _)| n)
+        .collect();
+    assert_eq!(names, ["a.md"]);
 }

@@ -28,7 +28,7 @@ use futures_util::{StreamExt, TryStreamExt};
 use records::{
     DEFAULT_SOURCE_MAX_BYTES, DEFAULT_SOURCE_MAX_FILES, Editor, NewEvent, NodeKind,
     SOURCE_MAX_BYTES, SOURCE_MAX_FILES, SourceConfig, SourceItem, SourceState, SourceStatus, User,
-    check_name, check_size, validate_document_name, validate_node_name,
+    check_name, check_size, is_format_char, validate_document_name, validate_node_name,
 };
 use revisions::RevisionId;
 use serde_json::json;
@@ -37,7 +37,7 @@ use uuid::Uuid;
 
 use crate::AppState;
 use crate::api::content::{Created, create_uploaded};
-use crate::api::nodes::{after_rename, delete_one};
+use crate::api::nodes::{after_rename, delete_one, move_one};
 use crate::api::uploads::{store_version, uploads_path};
 use crate::blobs::Held;
 use crate::file_room::SaveReply;
@@ -416,7 +416,7 @@ async fn finish(
     config: &SourceConfig,
     before: SourceStatus,
     now: OffsetDateTime,
-    outcome: Result<Outcome, SyncError>,
+    outcome: Result<Outcome, Failure>,
 ) -> Result<Option<SyncReport>, SyncError> {
     let library = config.library;
     let mut status = SourceStatus {
@@ -444,6 +444,8 @@ async fn finish(
             status.retry_at = None;
             status.files = i64::try_from(files).unwrap_or(i64::MAX);
             status.bytes = i64::try_from(report.bytes).unwrap_or(i64::MAX);
+            // Files not shown at all. Files shown under a suffixed name (`renamed`) are shown,
+            // so they are not counted here; the `source.synced` event carries their number.
             status.hidden = i64::try_from(report.hidden.total()).unwrap_or(i64::MAX);
             state.events().emit(NewEvent {
                 kind: "source.synced",
@@ -464,7 +466,11 @@ async fn finish(
             });
             Ok(Some(report))
         }
-        Err(e) => {
+        Err(Failure { error: e, applying }) => {
+            if applying {
+                // Half applied: never answered as unchanged, even at the last commit.
+                status.etag = Some(DIRTY_ETAG.to_owned());
+            }
             status.state = match e {
                 SyncError::NotConnected(_) => SourceState::NotConnected,
                 SyncError::RateLimited(_) => SourceState::RateLimited,
@@ -501,12 +507,32 @@ fn short(commit: &str) -> &str {
     commit.get(..7).unwrap_or(commit)
 }
 
+/// The `etag` recorded after a sync failed while applying: the library may be half way between
+/// two commits, so the next sync reads the branch in full (no conditional request) and applies
+/// its plan even when the branch is back at `last_commit`. It is never sent to GitHub.
+const DIRTY_ETAG: &str = "sharecraft:applied-in-part";
+
+/// A failed sync, and whether it failed while applying (see [`DIRTY_ETAG`]).
+struct Failure {
+    error: SyncError,
+    applying: bool,
+}
+
+impl From<SyncError> for Failure {
+    fn from(error: SyncError) -> Self {
+        Failure {
+            error,
+            applying: false,
+        }
+    }
+}
+
 /// The sync itself: reads, checks, then applies.
 async fn run(
     state: &AppState,
     config: &SourceConfig,
     status: &SourceStatus,
-) -> Result<Outcome, SyncError> {
+) -> Result<Outcome, Failure> {
     let db = state.db();
     let library = config.library;
     let repo = RepoRef::parse(&format!("{}/{}", config.owner, config.repo)).map_err(|_| {
@@ -517,8 +543,10 @@ async fn run(
     let token = token_of(state, config).await?;
     let token = token.as_ref();
     let github = state.github();
+    let dirty = status.etag.as_deref() == Some(DIRTY_ETAG);
+    let sent_etag = if dirty { None } else { status.etag.as_deref() };
     let head = github
-        .head(&repo, &config.branch, token, status.etag.as_deref())
+        .head(&repo, &config.branch, token, sent_etag)
         .await
         .map_err(github_error)?;
     let (commit, tree_sha, etag, author) = match head {
@@ -534,7 +562,7 @@ async fn run(
             author,
         } => (commit, tree, etag, author),
     };
-    if status.last_commit.as_deref() == Some(commit.as_str()) {
+    if !dirty && status.last_commit.as_deref() == Some(commit.as_str()) {
         return Ok(Outcome::Unchanged {
             etag: etag.or_else(|| status.etag.clone()),
         });
@@ -544,10 +572,10 @@ async fn run(
         .tree(&repo, &tree_sha, token)
         .await
         .map_err(github_error)?;
-    let whole = Whole::of(&tree);
-    let (mut shown, mut hidden) = shown_names(tree, &config.folder);
+    let whole = Whole::of(&tree).ok_or_else(too_big_to_add)?;
 
-    // The library's file policies and the largest file the server takes.
+    // The library's file policies and the largest file the server takes, judged before names
+    // are given, so a hidden file never pushes a shown sibling to a suffix.
     let policies = tree::policies_at(db, library).await.map_err(|e| {
         eprintln!(
             "sharecraft-server: cannot read the policies of library {}: {e}",
@@ -556,56 +584,70 @@ async fn run(
         failed("The library's file policies could not be read, so nothing was changed.")
     })?;
     let largest = state.config().max_file_bytes;
-    shown.retain(|entry| {
-        if entry.dir {
-            return true;
-        }
-        let name = last_name(&entry.path);
-        if let Some((settings, org)) = &policies {
-            if check_name(name, settings, org).is_err() {
-                hidden.policy += 1;
+    let mut refused = Hidden::default();
+    let folder = config.folder.trim_matches('/');
+    let tree: Vec<TreeEntry> = tree
+        .into_iter()
+        .filter(|entry| {
+            if entry.kind != EntryKind::File || below(&entry.path, folder).is_none() {
+                return true;
+            }
+            let name = last_name(&entry.path);
+            if let Some((settings, org)) = &policies {
+                if check_name(name, settings, org).is_err() {
+                    refused.policy += 1;
+                    return false;
+                }
+                if check_size(entry.size, settings).is_err() {
+                    refused.too_big += 1;
+                    return false;
+                }
+            }
+            if entry.size > largest {
+                refused.too_big += 1;
                 return false;
             }
-            if check_size(entry.size, settings).is_err() {
-                hidden.too_big += 1;
-                return false;
-            }
-        }
-        if entry.size > largest {
-            hidden.too_big += 1;
-            return false;
-        }
-        true
-    });
-    prune_folders(&mut shown);
+            true
+        })
+        .collect();
+    let (shown, mut hidden) = shown_names(tree, folder);
+    hidden.policy = refused.policy;
+    hidden.too_big = refused.too_big;
 
     let files = shown.iter().filter(|e| !e.dir).count();
-    let bytes: u64 = shown.iter().filter(|e| !e.dir).map(|e| e.size).sum();
+    let bytes =
+        total_size(shown.iter().filter(|e| !e.dir).map(|e| e.size)).ok_or_else(too_big_to_add)?;
     let (max_files, max_bytes) = caps(state).await?;
     if files > max_files {
         return Err(failed(&format!(
             "The repository has {files} files to show, more than the {max_files} this server \
              mirrors for one library, so nothing was changed."
-        )));
+        ))
+        .into());
     }
     if bytes > max_bytes {
         return Err(failed(&format!(
             "The repository's files hold {bytes} bytes, more than the {max_bytes} this server \
              mirrors for one library, so nothing was changed."
-        )));
+        ))
+        .into());
     }
 
-    let mut known = db.source_items(library).await.map_err(db_failed)?;
-    let mut plan = plan(&shown, &known);
-    // An item whose node is gone (outside the sync) is forgotten, and its file read again.
-    let lost = lost_items(state, &plan).await?;
-    if !lost.is_empty() {
-        db.remove_source_items(library, &lost)
-            .await
-            .map_err(db_failed)?;
-        known.retain(|item| !lost.contains(&item.node));
-        plan = self::plan(&shown, &known);
-    }
+    // Every recorded item whose node is gone (deleted outside the sync) is planned as if it
+    // were not there, so it is made again. Nothing is written yet: the rows of the lost items
+    // are dropped only when applying starts.
+    let recorded = db.source_items(library).await.map_err(db_failed)?;
+    let live: HashSet<NodeId> = db
+        .live_source_nodes(library)
+        .await
+        .map_err(db_failed)?
+        .into_iter()
+        .collect();
+    let (known, lost): (Vec<SourceItem>, Vec<SourceItem>) = recorded
+        .into_iter()
+        .partition(|item| live.contains(&item.node));
+    let lost: Vec<NodeId> = lost.into_iter().map(|item| item.node).collect();
+    let plan = plan(&shown, &known);
 
     let mut needed: HashMap<String, u64> = HashMap::new();
     for entry in plan
@@ -630,7 +672,12 @@ async fn run(
     )
     .await?;
 
-    let counts = apply(state, library, &user, &known, plan, &fetched).await?;
+    let counts = apply(state, library, &user, &known, &lost, plan, &fetched)
+        .await
+        .map_err(|error| Failure {
+            error,
+            applying: true,
+        })?;
     drop(fetched);
     Ok(Outcome::Synced {
         report: SyncReport {
@@ -650,6 +697,40 @@ async fn run(
 /// `Failed` with `message`.
 fn failed(message: &str) -> SyncError {
     SyncError::Failed(message.to_owned())
+}
+
+/// The error for sizes that overflow when added up.
+fn too_big_to_add() -> SyncError {
+    failed("The repository lists sizes too large to add up, so nothing was changed.")
+}
+
+/// The sum of `sizes`; `None` if it overflows.
+fn total_size(mut sizes: impl Iterator<Item = u64>) -> Option<u64> {
+    sizes.try_fold(0u64, u64::checked_add)
+}
+
+/// `path` relative to `folder` (no outer slashes; empty for the whole repository), if it is
+/// below it.
+fn below<'a>(path: &'a str, folder: &str) -> Option<&'a str> {
+    let relative = if folder.is_empty() {
+        Some(path)
+    } else {
+        path.strip_prefix(folder)
+            .and_then(|rest| rest.strip_prefix('/'))
+    };
+    relative.filter(|r| !r.is_empty())
+}
+
+/// A GitHub author name fit to be shown: control and invisible format characters dropped,
+/// trimmed, at most [`MAX_AUTHOR_CHARS`]; `None` if nothing is left.
+fn clean_author(author: &str) -> Option<String> {
+    let kept: String = author
+        .chars()
+        .filter(|c| !c.is_control() && !is_format_char(*c))
+        .collect();
+    let cut: String = kept.trim().chars().take(MAX_AUTHOR_CHARS).collect();
+    let cut = cut.trim_end().to_owned();
+    (!cut.is_empty()).then_some(cut)
 }
 
 /// The error for a database failure, which is logged.
@@ -738,9 +819,7 @@ async fn connector(
             )
         })?;
     let by: String = author
-        .map(|a| a.chars().filter(|c| !c.is_control()).collect::<String>())
-        .map(|a| a.trim().chars().take(MAX_AUTHOR_CHARS).collect::<String>())
-        .filter(|a| !a.is_empty())
+        .and_then(clean_author)
         .map(|a| format!(" by {a}"))
         .unwrap_or_default();
     Ok(User {
@@ -772,36 +851,6 @@ async fn caps(state: &AppState) -> Result<(usize, u64), SyncError> {
     ))
 }
 
-/// Drops the folders of `shown` that hold no file.
-fn prune_folders(shown: &mut Vec<Entry>) {
-    let mut holding = HashSet::new();
-    for entry in shown.iter().filter(|e| !e.dir) {
-        let mut path = entry.path.as_str();
-        while let Some((parent, _)) = path.rsplit_once('/') {
-            holding.insert(parent.to_owned());
-            path = parent;
-        }
-    }
-    shown.retain(|e| !e.dir || holding.contains(&e.path));
-}
-
-/// The nodes of the items `plan` moves or changes that are gone (deleted or missing).
-async fn lost_items(state: &AppState, plan: &Plan) -> Result<Vec<NodeId>, SyncError> {
-    let mut lost = Vec::new();
-    for item in plan
-        .moves
-        .iter()
-        .map(|(item, _)| item)
-        .chain(plan.change.iter().map(|(item, _)| item))
-    {
-        let node = state.db().node(item.node).await.map_err(db_failed)?;
-        if node.is_none_or(|n| n.deleted) {
-            lost.push(item.node);
-        }
-    }
-    Ok(lost)
-}
-
 /// The whole tree's size: its entries, and its files' bytes and the largest.
 #[derive(Clone, Copy, Debug)]
 struct Whole {
@@ -811,12 +860,13 @@ struct Whole {
 }
 
 impl Whole {
-    fn of(tree: &[TreeEntry]) -> Whole {
-        Whole {
+    /// `None` when the sizes overflow when added up.
+    fn of(tree: &[TreeEntry]) -> Option<Whole> {
+        Some(Whole {
             entries: tree.len(),
-            bytes: tree.iter().map(|e| e.size).sum(),
+            bytes: total_size(tree.iter().map(|e| e.size))?,
             largest: tree.iter().map(|e| e.size).max().unwrap_or(0),
-        }
+        })
     }
 }
 
@@ -1033,17 +1083,27 @@ struct Applying<'a> {
 }
 
 /// Applies `plan` in `library` for `user`, with the bytes `fetched` (blob id to stored
-/// content): files removed first (freeing their names), then folders made, shallowest first,
-/// then files moved, changed and added, and last the folders gone, deepest first. Each item is
-/// recorded as it is done.
+/// content). First the rows of the `lost` items (nodes gone outside the sync) are dropped;
+/// then files removed (freeing their names), folders made, shallowest first, files moved (out
+/// of the folders that go; under a temporary name where the final one is still taken), the
+/// folders gone binned, deepest first, the moved files given their final names, and last the
+/// files changed and added. Each item is recorded as it is done.
 async fn apply(
     state: &AppState,
     library: NodeId,
     user: &User,
     known: &[SourceItem],
+    lost: &[NodeId],
     plan: Plan,
     fetched: &HashMap<String, Held>,
 ) -> Result<Counts, SyncError> {
+    if !lost.is_empty() {
+        state
+            .db()
+            .remove_source_items(library, lost)
+            .await
+            .map_err(db_failed)?;
+    }
     let mut work = Applying {
         state,
         library,
@@ -1074,9 +1134,20 @@ async fn apply(
     for entry in plan.add.iter().filter(|e| e.dir) {
         work.add_folder(entry, &mut gone_folders).await?;
     }
+    let mut waiting = Vec::new();
     for (item, entry) in &plan.moves {
-        work.move_file(item, entry).await?;
+        if let Some(later) = work.move_file(item, entry).await? {
+            waiting.push(later);
+        }
         counts.moved += 1;
+    }
+    let mut gone_folders: Vec<SourceItem> = gone_folders.into_values().collect();
+    gone_folders.sort_by(|a, b| b.path.cmp(&a.path));
+    for item in gone_folders {
+        work.to_bin(&item).await?;
+    }
+    for (node, entry) in waiting {
+        work.final_name(node, entry).await?;
     }
     for (item, entry) in &plan.change {
         work.new_version(item.node, entry).await?;
@@ -1086,12 +1157,22 @@ async fn apply(
         work.add_file(entry).await?;
         counts.added += 1;
     }
-    let mut gone_folders: Vec<SourceItem> = gone_folders.into_values().collect();
-    gone_folders.sort_by(|a, b| b.path.cmp(&a.path));
-    for item in gone_folders {
-        work.to_bin(&item).await?;
-    }
     Ok(counts)
+}
+
+/// `name` with a suffix no other name has, before the extension its editor needs: the
+/// temporary name of a file moved to where its final name is still taken.
+fn temporary_name(name: &str) -> String {
+    let editor = Editor::for_file_name(name);
+    let lower = name.to_lowercase();
+    let split = match editor.native_extension() {
+        Some(ext) if lower.ends_with(ext) => name.len().saturating_sub(ext.len()),
+        _ => name.rfind('.').filter(|dot| *dot > 0).unwrap_or(name.len()),
+    };
+    let (stem, extension) = name.split_at_checked(split).unwrap_or((name, ""));
+    let tag = Uuid::new_v4().simple().to_string();
+    let suffix = format!(" ~sync {}", tag.get(..8).unwrap_or(&tag));
+    tree::fit(stem, extension, &suffix)
 }
 
 impl Applying<'_> {
@@ -1232,39 +1313,84 @@ impl Applying<'_> {
             })
     }
 
-    /// Moves or renames the node of `item` to where `entry` is.
-    async fn move_file(&self, item: &SourceItem, entry: &Entry) -> Result<(), SyncError> {
+    /// Renames the file `node` to `name`, telling its open session.
+    async fn rename(&self, node: NodeId, name: &str, path: &str) -> Result<(), SyncError> {
+        self.change(
+            TreeOp::Rename {
+                id: node,
+                name: name.to_owned(),
+            },
+            path,
+        )
+        .await?;
+        after_rename(self.state, DocId(node.0)).await;
+        Ok(())
+    }
+
+    /// Moves the node of `item` to where `entry` is, as a move by hand is made: through
+    /// [`move_one`], which rechecks the open sessions below it, so anyone who cannot see the
+    /// new place loses the file. A file that is also renamed first takes a temporary name, so
+    /// its old name cannot collide where it goes. When its final name is still taken there (by
+    /// a folder about to go), the node and entry are answered, for [`Applying::final_name`]
+    /// once the folders are gone; otherwise it is renamed and recorded now.
+    async fn move_file(
+        &self,
+        item: &SourceItem,
+        entry: &Entry,
+    ) -> Result<Option<(NodeId, Entry)>, SyncError> {
         let parent = self.folder(parent_path(&entry.path))?;
         let name = last_name(&entry.path);
-        let node = self
-            .state
-            .db()
+        let db = self.state.db();
+        let node = db
             .node(item.node)
             .await
             .map_err(db_failed)?
             .ok_or_else(|| failed(&format!("{} is gone, so the sync stopped.", item.path)))?;
-        if node.parent != Some(parent) {
-            self.change(
-                TreeOp::Move {
-                    id: node.id,
-                    parent,
-                },
-                &entry.path,
-            )
-            .await?;
+        let free = db
+            .name_free(parent, name, Some(node.id))
+            .await
+            .map_err(db_failed)?;
+        let moving = node.parent != Some(parent);
+        // Where the final name is free and only the folder changes, the node moves as it is.
+        if !free || (moving && node.name != name) {
+            self.rename(node.id, &temporary_name(name), &entry.path)
+                .await?;
         }
-        if node.name != name {
-            self.change(
-                TreeOp::Rename {
-                    id: node.id,
-                    name: name.to_owned(),
-                },
-                &entry.path,
-            )
-            .await?;
-            after_rename(self.state, DocId(node.id.0)).await;
+        if moving {
+            move_one(self.state, self.user, node.id, parent)
+                .await
+                .map_err(|e| {
+                    eprintln!(
+                        "sharecraft-server: sync could not move {}: {e:?}",
+                        entry.path
+                    );
+                    failed(&format!(
+                        "{} could not be moved, so the sync stopped.",
+                        entry.path
+                    ))
+                })?;
         }
-        self.record(node.id, entry).await
+        if !free {
+            return Ok(Some((node.id, entry.clone())));
+        }
+        self.final_name(node.id, entry.clone()).await?;
+        Ok(None)
+    }
+
+    /// Gives the moved file `node` the name of `entry`, if it has not, and records it.
+    async fn final_name(&self, node: NodeId, entry: Entry) -> Result<(), SyncError> {
+        let name = last_name(&entry.path);
+        let current = self
+            .state
+            .db()
+            .node(node)
+            .await
+            .map_err(db_failed)?
+            .ok_or_else(|| failed(&format!("{} is gone, so the sync stopped.", entry.path)))?;
+        if current.name != name {
+            self.rename(node, name, &entry.path).await?;
+        }
+        self.record(node, &entry).await
     }
 
     /// Stores the content of `entry` as a new version of the file `node`, through its file
@@ -1418,6 +1544,46 @@ mod tests {
             .filter(|e| !e.dir)
             .map(|e| e.path.as_str())
             .collect()
+    }
+
+    #[test]
+    fn sizes_that_overflow_are_refused_not_wrapped() {
+        assert_eq!(total_size([1, 2, 3].into_iter()), Some(6));
+        assert_eq!(total_size([u64::MAX, 1].into_iter()), None);
+        let huge = |path: &str| TreeEntry {
+            path: path.to_owned(),
+            kind: EntryKind::File,
+            sha: "s".to_owned(),
+            size: u64::MAX / 2 + 1,
+        };
+        assert!(Whole::of(&[huge("a"), huge("b")]).is_none());
+        assert!(Whole::of(&[huge("a")]).is_some());
+    }
+
+    #[test]
+    fn author_names_lose_control_and_format_characters() {
+        assert_eq!(
+            clean_author("Octo\u{202E}Cat\u{200B}\n").as_deref(),
+            Some("OctoCat")
+        );
+        assert_eq!(clean_author(" \u{2066}\t "), None);
+        let long = "n".repeat(300);
+        assert_eq!(clean_author(&long).map(|a| a.chars().count()), Some(100));
+    }
+
+    #[test]
+    fn temporary_names_keep_the_editor_extension() {
+        for name in ["report.docx", "model.solidcraft.json", "notes.md", "README"] {
+            let temporary = temporary_name(name);
+            assert_ne!(temporary, name);
+            assert_eq!(
+                Editor::for_file_name(&temporary),
+                Editor::for_file_name(name),
+                "{temporary}"
+            );
+            assert!(nameable(&temporary, true), "{temporary}");
+        }
+        assert!(temporary_name("model.solidcraft.json").ends_with(".solidcraft.json"));
     }
 
     #[test]
