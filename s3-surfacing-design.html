@@ -1,0 +1,388 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="ShareCraft sequencing plan: live co-authoring is built first as the spine of the platform, in Rust, and every other module forms alongside it.">
+<title>ShareCraft — S3 Surfacing libraries</title>
+<style>
+:root{--ink:#172f38;--muted:#536b72;--line:#d7e2e3;--accent:#086959;--paper:#fff;--wash:#f2f6f5;font-family:Segoe UI,Arial,sans-serif;color:var(--ink);background:var(--wash);line-height:1.65}
+*{box-sizing:border-box}body{margin:0}a{color:var(--accent);text-underline-offset:3px}a:focus-visible,button:focus-visible{outline:3px solid #b66e00;outline-offset:4px}.skip{position:absolute;left:1rem;top:-5rem;background:white;padding:1rem;z-index:20}.skip:focus{top:1rem}
+.cover{background:#123e3b;color:#fff;padding:66px max(24px,calc((100vw - 1160px)/2));border-bottom:8px solid #71d8b5}.eyebrow{text-transform:uppercase;letter-spacing:.17em;font-size:.76rem;font-weight:700;color:#a7e7d1}.cover h1{font-size:clamp(2.6rem,6vw,4.6rem);letter-spacing:-.05em;line-height:1.05;margin:18px 0}.cover .lede{font-size:1.2rem;max-width:770px;color:#e0eee9}.meta{display:flex;flex-wrap:wrap;gap:10px 28px;color:#c4ded5;font-size:.88rem}.layout{display:grid;grid-template-columns:225px minmax(0,1fr);gap:48px;max-width:1210px;margin:auto;padding:40px 25px 80px}nav{position:sticky;top:24px;align-self:start;max-height:90vh;overflow:auto;font-size:.88rem}nav p{font-weight:700;margin:0 0 12px}nav a{display:block;padding:7px 0;text-decoration:none;color:var(--muted)}nav a:hover{color:var(--accent)}main{min-width:0}section{scroll-margin-top:25px;margin:0 0 38px}h2{font-size:1.7rem;line-height:1.25;letter-spacing:-.025em;margin:0 0 18px}h3{font-size:1.13rem;line-height:1.4;margin:0 0 12px}p{margin:0 0 16px}.note{padding:20px 23px;border-left:4px solid var(--accent);background:#e5f0ec}.note p:last-child{margin-bottom:0}.cards{display:grid;gap:17px}.module{background:var(--paper);padding:25px;border:1px solid var(--line);border-radius:9px;break-inside:avoid}.tag{display:inline-block;font-size:.7rem;letter-spacing:.05em;text-transform:uppercase;border-radius:4px;padding:3px 7px;background:#e2f1e9;color:#155438;margin:0 0 12px}.spine{background:#fff0d5;color:#775110}.parallel{background:#e8ecfb;color:#344e91}ul,ol{padding-left:22px;margin:0}li{margin:0 0 9px}li:last-child{margin-bottom:0}.rid{font-weight:700;color:var(--accent);white-space:nowrap}table{border-collapse:collapse;width:100%;font-size:.91rem;background:white}th,td{border:1px solid var(--line);padding:12px 14px;text-align:left;vertical-align:top}th{background:#e8efed}caption{text-align:left;font-weight:700;padding:0 0 10px}.table-wrap{overflow-x:auto}.small{font-size:.88rem;color:var(--muted)}.toolbar{display:flex;justify-content:space-between;align-items:center;gap:20px;margin-bottom:26px}button{background:var(--accent);color:white;border:0;border-radius:5px;padding:10px 15px;font:inherit;cursor:pointer}footer{border-top:1px solid var(--line);padding-top:22px;font-size:.86rem;color:var(--muted)}
+@media(max-width:850px){.layout{grid-template-columns:1fr;gap:28px}nav{position:static;max-height:none;display:flex;flex-wrap:wrap;gap:3px 18px;border-bottom:1px solid var(--line);padding-bottom:20px}nav p{width:100%;margin-bottom:0}.cover{padding:40px 25px}.module{padding:20px}}
+@media print{@page{size:A4;margin:17mm}html,body{background:white;font-size:10pt}.cover{padding:12mm 0;background:white;color:var(--ink);border-bottom:3px solid var(--accent)}.cover .lede,.meta,.eyebrow{color:var(--ink)}.layout{display:block;padding:10mm 0;margin:0;max-width:none}nav,.toolbar button,.skip{display:none}.module{border-radius:0;padding:5mm}.note{background:#f4f4f4}h2,h3{break-after:avoid}a{color:inherit}tr{break-inside:avoid}.table-wrap{overflow:visible}}
+/* Dark mode: the same page in dark colours; light mode is unchanged. */
+:root{color-scheme:light dark;--ink:light-dark(#172f38,#dce8e6);--muted:light-dark(#536b72,#9db3b6);--line:light-dark(#d7e2e3,#34474c);--accent:light-dark(#086959,#6fd3b8);--paper:light-dark(#fff,#1a2427);--wash:light-dark(#f2f6f5,#11191b)}body{background:var(--wash)}.skip,table{background:var(--paper)}th{background:light-dark(#e8efed,#243236)}.note{background:light-dark(#e5f0ec,#1b2f2a)}.tag{background:light-dark(#e2f1e9,#1d3a2e);color:light-dark(#155438,#a7e7d1)}.proposal,.spine{background:light-dark(#fff0d5,#3b2f15);color:light-dark(#775110,#f1d08f)}.integration,.parallel{background:light-dark(#e8ecfb,#222a45);color:light-dark(#344e91,#b7c5f6)}button{color:light-dark(#fff,#0b1f1c)}a:focus-visible,button:focus-visible{outline-color:light-dark(#b66e00,#f0b04a)}tbody tr:nth-child(even)>td{background:light-dark(#f4f8f7,#212b30)}
+@media print{:root{color-scheme:light}html,body{background:white}.note{background:#f4f4f4}}
+</style>
+</head>
+<body>
+<style>
+pre{background:light-dark(#eef3f2,#0d1517);border:1px solid var(--line);border-radius:7px;padding:14px 16px;overflow:auto;font-size:.84rem;line-height:1.5}
+code{font-family:Consolas,"Cascadia Mono",monospace;font-size:.92em}
+.table-wrap{overflow-x:auto;margin:0 0 20px}
+.table-wrap table{border-collapse:collapse;width:100%;font-size:.92rem}
+.table-wrap th,.table-wrap td{border:1px solid var(--line);padding:9px 11px;text-align:left;vertical-align:top}
+.decide{border-left:4px solid light-dark(#b66e00,#f0b04a);background:light-dark(#fff0d5,#3b2f15);padding:16px 20px;margin:0 0 16px}
+.decide p:last-child{margin-bottom:0}
+</style>
+<a class="skip" href="#main">Skip to design</a>
+<header class="cover">
+<p class="eyebrow">ThineCraft / ShareCraft / Design proposal</p>
+<h1>S3 Surfacing libraries</h1>
+<p class="lede">A document library whose files live in an existing S3 bucket. ShareCraft shows the objects as files and folders, applies its own permissions and features over them, and lets DriveCraft sync them to computers like any other library. Azure Blob Storage plugs into the same design later.</p>
+<div class="meta"><span>Version 0.1 · Draft for the owner's decision</span><span>16 November 2026</span><span>Companion to <a href="scope.html" style="color:inherit">Scope of Works v0.17</a> and <a href="sequencing.html" style="color:inherit">Sequencing v0.14</a></span></div>
+</header>
+<div class="layout">
+<nav aria-label="Document contents"><p>In this document</p>
+<a href="#intent">01 · Intent and shape</a><a href="#decisions-short">02 · Decisions for the owner</a><a href="#source">03 · The storage source</a><a href="#model">04 · Modelling objects</a><a href="#modes">05 · Read-only and read-write</a><a href="#conflicts">06 · Conflicting writes</a><a href="#changes">07 · Change detection</a><a href="#creds">08 · Credentials</a><a href="#perms">09 · Permissions</a><a href="#features">10 · Existing features</a><a href="#sync">11 · DriveCraft sync</a><a href="#costs">12 · Costs</a><a href="#azure">13 · Azure follow-on</a><a href="#placement">14 · Where it sits</a><a href="#open">15 · Open questions</a><a href="#approaches">16 · Approaches considered</a>
+</nav>
+<main id="main">
+<div class="toolbar"><span class="small">Standalone HTML · Print-ready · No external assets</span><button type="button" onclick="window.print()">Print / Save PDF</button></div>
+
+<section id="intent"><h2>01 / Intent and shape</h2>
+<div class="note"><p><strong>Status.</strong> This is a design proposal. The owner's words of 16 November 2026 are the only direction: <em>"A new type of Document library that is S3 Surfacing. The ability to connect to an S3 source and surface them as files in SharePoint with the ability to Sync using DriveCraft. I think we'd have to do the same for Azure as well, but S3 is more popular."</em> Everything else here is proposed and nothing is built. Section 02 lists the decisions that need the owner.</p></div>
+<p><strong>What it is.</strong> A fifth library kind, alongside document, image, template and asset (D39). An administrator connects it to a bucket, and optionally a prefix inside it. From then on the bucket's objects appear in ShareCraft as files in folders. People open, preview, search and share them in the browser, and sync them to their computers with DriveCraft. The bytes stay in the bucket. ShareCraft is the front door, not a copy.</p>
+<p><strong>Why.</strong> Organisations already hold large file estates in object storage: archives, media, exports from other systems, backups people need to reach. SharePoint cannot show them as a library without migrating them. A ShareCraft library that surfaces them gives those files permissions, links, search, previews and desktop sync without a migration and without a second copy to pay for.</p>
+<p><strong>Goals.</strong></p>
+<ul>
+<li>Connect AWS S3 and S3-compatible stores (MinIO, Ceph RGW, Cloudflare R2, Backblaze B2 and the like) through one source type.</li>
+<li>Show keys as folders and files, with stable identities, so links, permissions and DriveCraft's catalog survive.</li>
+<li>Keep the bucket the authority for bytes. Never silently overwrite or delete something that changed in S3.</li>
+<li>Sync with DriveCraft through the same API contract as any ShareCraft library (SC-23), with no special client mode beyond what the contract already says.</li>
+<li>Build around a storage-source abstraction so Azure Blob Storage is a second implementation, not a redesign.</li>
+</ul>
+<p><strong>Non-goals.</strong></p>
+<ul>
+<li>Not a migration tool. Moving the bytes into ShareCraft is SC-17 and stays separate.</li>
+<li>Not a general object browser for developers: no bucket policy editing, no lifecycle-rule management, no bucket creation.</li>
+<li>Not a mount of the bucket as a drive on the server. ShareCraft speaks the S3 API.</li>
+<li>Not an S3 server. ShareCraft does not expose an S3-compatible endpoint for its own libraries.</li>
+</ul>
+<p><strong>Anti-goals</strong> (a failure even if it technically works).</p>
+<ul>
+<li>A surfaced library that lets a person see an object ShareCraft's permissions say they may not.</li>
+<li>Any path that writes to the bucket without going through the collaboration spine's checkpoint and conflict rule (S3 and S4 in sequencing.html). D15 forbids a second save path.</li>
+<li>A surprise bill: a sync, a search index or a scan that reads a whole bucket without anyone having been told the cost.</li>
+<li>A secret that appears in Git, a log, an event, an error message or a backup in readable form.</li>
+</ul>
+<p><strong>The shape in one picture.</strong></p>
+<pre>
+ S3 bucket / prefix                ShareCraft server                         People
+ ┌───────────────┐   list/get/put  ┌──────────────────────────────┐  HTTPS  ┌─────────┐
+ │ objects       │◄───────────────►│ StorageSource (S3 | Azure)   │◄───────►│ browser │
+ │ versions      │                 │ surfaced tree + change log   │         └─────────┘
+ │ events (SQS)  │────────────────►│ permissions, features        │  SC-23  ┌───────────┐
+ └───────────────┘   change feed   │ cache (content store)        │◄───────►│ DriveCraft│
+                                   └──────────────────────────────┘         └───────────┘
+</pre>
+</section>
+
+<section id="decisions-short"><h2>02 / Decisions for the owner</h2>
+<p>Each decision has a recommendation. The rest of the document is written on the recommended answer. Proposed numbers D61 onward are placeholders until the owner accepts them into the scope's register.</p>
+<div class="table-wrap"><table><thead><tr><th>#</th><th>Decision</th><th>Recommendation</th><th>Why it needs the owner</th></tr></thead><tbody>
+<tr><td>1</td><td>Where the surfaced tree is recorded.</td><td>In PostgreSQL only, rebuilt from the bucket. Git holds the library record, its settings and ShareCraft's own metadata about items, never one JSON file per object.</td><td>Departs from D24 (tree in Git as JSON, one file per node). A bucket can hold millions of keys; a Git file per key does not scale, and the bucket is the authority anyway.</td></tr>
+<tr><td>2</td><td>Where the bytes are authoritative.</td><td>The bucket. ShareCraft keeps a bounded cache in its content store, keyed by SHA-256, and never treats the cache as the record.</td><td>Departs from D28 for this kind of library (bytes in the content store, pointers in Git).</td></tr>
+<tr><td>3</td><td>Read-only first, then read-write.</td><td>Ship read-only browse, preview and sync-down first. Add write-back (upload, edit, rename, delete, co-authoring) in a second phase, and require bucket versioning for it.</td><td>Write-back changes data in a bucket other systems depend on. The owner decides how far to go and when.</td></tr>
+<tr><td>4</td><td>What happens when S3 changed under an open edit.</td><td>Never overwrite. The stale save is refused and kept as a sibling copy named for the person and time (the same rule as S4 and DriveCraft's conflict copy).</td><td>It decides who loses work in the unavoidable case.</td></tr>
+<tr><td>5</td><td>Credentials in the first release.</td><td>IAM role from the server's environment (default credential chain) and access keys stored encrypted with a server secret key. No keys in Git, logs, events or backups in readable form.</td><td>Security posture. Also fixes where the secret key lives on a Windows install without per-machine admin work.</td></tr>
+<tr><td>6</td><td>Change detection in the first release.</td><td>Polling by listing, with an optional S3 Event Notification queue (SQS) for near-instant changes. Inventory reports later, for very large buckets.</td><td>Trades freshness against request cost and setup effort the customer must do in AWS.</td></tr>
+<tr><td>7</td><td>Permissions over the bucket.</td><td>ShareCraft permissions govern who sees what. The connection uses one service identity, scoped by IAM to the bucket and prefix. No per-person S3 identity in the first release.</td><td>It means someone with direct S3 access bypasses ShareCraft's permissions, and the reverse. Needs to be said to administrators plainly.</td></tr>
+<tr><td>8</td><td>How bytes reach DriveCraft and browsers.</td><td>Through ShareCraft (stream and cache) by default. Pre-signed direct download from S3 is an opt-in per library.</td><td>Direct download saves bandwidth and bypasses ShareCraft's scan and audit.</td></tr>
+<tr><td>9</td><td>Where it sits in the plan.</td><td>A platform-track module, SC-27, in three phases (section 14). It does not delay GridCraft co-authoring.</td><td>Sequencing is the owner's call (D15).</td></tr>
+<tr><td>10</td><td>Which Rust S3 client.</td><td>The AWS SDK for Rust (<code>aws-sdk-s3</code>, Apache-2.0) behind the source trait; check licence and feature coverage at build time (D17, D19 rules).</td><td>A library choice the owner has reserved for review.</td></tr>
+</tbody></table></div>
+</section>
+
+<section id="source"><h2>03 / The storage source</h2>
+<p>The library never talks to S3 directly. It talks to a <strong>storage source</strong>, a small Rust trait that describes what ShareCraft needs from any object store. S3 is the first implementation. Azure Blob Storage is the second (section 13). The trait is sketched here so the S3 specifics stay on one side of it.</p>
+<pre>
+trait StorageSource: Send + Sync {
+    /// What this store can do. Probed when the source is connected and re-probed on request.
+    fn capabilities(&amp;self) -&gt; Capabilities;
+    /// Check the connection: credentials, bucket, prefix, versioning, notifications.
+    async fn probe(&amp;self) -&gt; ProbeReport;
+
+    /// One page of keys under a prefix. With a delimiter, folders come back as prefixes.
+    async fn list(&amp;self, prefix: &amp;str, delimiter: Option&lt;char&gt;, page: Option&lt;PageToken&gt;) -&gt; Result&lt;ListPage&gt;;
+    async fn list_versions(&amp;self, key: &amp;str, page: Option&lt;PageToken&gt;) -&gt; Result&lt;VersionPage&gt;;
+    async fn head(&amp;self, key: &amp;str, version: Option&lt;&amp;VersionId&gt;) -&gt; Result&lt;ObjectInfo&gt;;
+    async fn get(&amp;self, key: &amp;str, version: Option&lt;&amp;VersionId&gt;, range: Option&lt;Range&gt;) -&gt; Result&lt;ByteStream&gt;;
+
+    /// Writes. `precondition` carries the revision the caller based its change on.
+    async fn put(&amp;self, key: &amp;str, body: ByteStream, precondition: Precondition, checksum: Sha256) -> Result&lt;ObjectInfo&gt;;
+    async fn copy(&amp;self, from: &amp;ObjectRef, to_key: &amp;str, precondition: Precondition) -&gt; Result&lt;ObjectInfo&gt;;
+    async fn delete(&amp;self, key: &amp;str, version: Option&lt;&amp;VersionId&gt;, precondition: Precondition) -&gt; Result&lt;DeleteOutcome&gt;;
+
+    /// Push-style change detection, where the store offers it.
+    async fn change_feed(&amp;self) -&gt; Result&lt;Option&lt;Box&lt;dyn ChangeFeed&gt;&gt;&gt;;
+}
+
+struct Capabilities {
+    versioning: Versioning,          // Off | Enabled | Suspended | Unknown
+    conditional_write: bool,         // If-Match / If-None-Match on put
+    additional_checksums: bool,      // x-amz-checksum-sha256 or equivalent
+    notifications: Vec&lt;FeedKind&gt;,    // SqsQueue | Webhook | EventGrid ...
+    inventory: bool,
+    object_lock: bool,
+    archive_tiers: bool,             // objects that must be restored before reading
+    real_directories: bool,          // Azure hierarchical namespace; false for S3
+}
+</pre>
+<p>Capabilities are probed, not assumed. S3-compatible stores differ: some lack versioning, conditional writes, notifications or additional checksums. The library settings page shows the probe result in plain words ("This bucket has no versioning, so write-back is not offered"), and features switch themselves on and off from it. The probe never changes the bucket.</p>
+</section>
+
+<section id="model"><h2>04 / How the library models S3 objects</h2>
+<h3>Keys become folders</h3>
+<p>S3 has no folders. A key such as <code>reports/2026/q3/summary.pdf</code> is one flat name. ShareCraft splits keys on <code>/</code> after removing the configured prefix. <code>reports</code>, <code>reports/2026</code> and <code>reports/2026/q3</code> each become a folder in the tree, and <code>summary.pdf</code> becomes a file in the last one. A folder exists in ShareCraft while any key lies beneath it. The surfaced tree is a projection of the listing.</p>
+<ul>
+<li><strong>Folder marker objects.</strong> A zero-byte object whose key ends in <code>/</code> (what the AWS console makes for "Create folder") is read as an explicit, possibly empty folder and is hidden as a file. When ShareCraft creates an empty folder in read-write mode it writes the same kind of marker.</li>
+<li><strong>Keys that cannot be shown.</strong> Empty segments (<code>a//b</code>), <code>.</code> or <code>..</code> segments, control characters and invalid UTF-8 cannot be a ShareCraft name. They are not dropped. They are listed in an administrator report ("Not shown, and why"), with a count on the library page.</li>
+<li><strong>Names that collide in ShareCraft but not in S3.</strong> ShareCraft's names are unique among siblings regardless of case (<code>nodes_sibling_name</code>), and Windows cannot hold <code>Report.pdf</code> and <code>report.pdf</code> together. S3 can. The first key in key order keeps the name; the others are shown with a visible suffix (<code>report (S3 copy 2).pdf</code>) and flagged. The same rule serves names Windows refuses (a colon, a trailing dot, <code>CON</code>). DriveCraft already has a path-check and a Problems view for refused names (<code>paths.rs</code>, <code>problems.rs</code>); the server flags first so the person sees it in the browser too.</li>
+<li><strong>Depth and size.</strong> Keys can be 1,024 bytes; Windows paths cannot. Over-long paths are flagged the same way and held out of sync.</li>
+</ul>
+
+<h3>Identity</h3>
+<p>Spine rule S1 says every item has an identifier independent of its name and location. A surfaced item gets a UUID, kept in a mapping table keyed by (library, key). The mapping stays when an object is deleted, for the tombstone retention period, so a key deleted and re-created keeps its identity, its links and its ShareCraft metadata. A rename made in ShareCraft (read-write mode) is a server-side copy plus delete in S3 and moves the mapping, so the identity survives the rename. A rename made directly in S3 looks like a delete and a create. The scan treats a vanished key and a new key with the same size, ETag and modified time in the same pass as a <em>probable move</em>, keeps the identity, and records it for the administrator. Anything less certain is a delete and a create.</p>
+
+<h3>Versions</h3>
+<div class="table-wrap"><table><thead><tr><th>Bucket state</th><th>What a "version" is</th><th>What version history shows</th></tr></thead><tbody>
+<tr><td>Versioning enabled</td><td>The S3 <code>versionId</code>. The current version is the latest non-delete-marker.</td><td>Every S3 version, with time, size, ETag and, for those written through ShareCraft, the person who saved. A delete marker shows as a deletion. Restoring an old version copies it forward as a new version; nothing is erased.</td></tr>
+<tr><td>Versioning off or suspended</td><td>The ETag together with the size and modified time. Only the current version exists.</td><td>One entry, "current", with a note: <em>this bucket keeps no history</em>. ShareCraft does not invent a history it cannot restore.</td></tr>
+</tbody></table></div>
+<p>The ETag is the revision identifier that spine rule S4 needs ("this checkpoint is based on revision X"). It is <strong>not</strong> a content hash for multipart or KMS-encrypted objects, so ShareCraft uses it only to detect change, never to prove content. Content identity is a SHA-256 that ShareCraft computes when it first streams the bytes, or reads from the object when it was written with an additional SHA-256 checksum. An object ShareCraft has never read has a size, an ETag and a modified time but no SHA-256, and the interface says "not yet read" rather than showing an empty hash.</p>
+
+<h3>Metadata</h3>
+<ul>
+<li><strong>From S3, read-only:</strong> content type, content disposition, storage class, last modified, size, ETag, version ID, user metadata (<code>x-amz-meta-*</code>) and object tags. They appear as read-only <em>S3 properties</em>; user metadata and tags can be shown as columns on request.</li>
+<li><strong>ShareCraft's own metadata</strong> (columns, content types, managed metadata, SC-04 to SC-06 and SC-26) is stored in ShareCraft's JSON records and PostgreSQL, keyed by the item's identity, as for any library. It is <strong>not</strong> written into the object. Writing it back as user metadata would need a copy-in-place of every object, creating a new version, costing a request each, and failing for objects over 5 GB without multipart copy. An option to write chosen fields back as object tags can be added later.</li>
+<li><strong>File type and preview</strong> come from the extension and the sniffed content, not from S3's content type alone, which is often wrong (<code>binary/octet-stream</code>).</li>
+</ul>
+
+<h3>Storage classes</h3>
+<p>Objects in an archive tier (Glacier Flexible Retrieval, Deep Archive) are listed but cannot be read until restored. They show as <em>Archived: restore needed</em>, with a "Request restore" action for people who may, after a cost note (section 12). Sync leaves them out and reports them as a notice (section 11). Instant-retrieval classes behave as normal objects.</p>
+
+<h3>Records kept for each source</h3>
+<pre>
+storage_sources   id, kind (s3|azure), endpoint, region, bucket, prefix, credential_ref,
+                  mode (read_only|read_write), capabilities (json), state, polled_at, ...
+surfaced_items    item_id (uuid), library_id, source_id, key, parent_item_id, kind,
+                  size, etag, version_id, mtime, sha256 (null until read), storage_class,
+                  scan_state, first_seen_seq, last_seen_seq, deleted_at (tombstone)
+source_changes    seq (bigserial), library_id, item_id, change (add|edit|delete|move), at
+                  — the library's own change log, fed by detection and by ShareCraft writes
+secrets           id, algorithm, key_id, nonce, ciphertext          (see section 08)
+</pre>
+<p><code>source_changes.seq</code> is what the DriveCraft cursor is made from (section 11). Surfaced items live in their own table, not in <code>nodes</code>, so a bucket of ten million objects does not bloat the content tree; tree and explorer views read both. This table split is a proposal; plan 3A to 3C code should be read again before the build plan fixes it.</p>
+</section>
+
+<section id="modes"><h2>05 / Read-only and read-write surfacing</h2>
+<p>A source is connected in one of two modes. A library can be moved from read-only to read-write by an administrator, after the probe says it is safe. It can be moved back at any time.</p>
+<div class="table-wrap"><table><thead><tr><th>Action</th><th>Read-only</th><th>Read-write</th></tr></thead><tbody>
+<tr><td>Browse, open, preview, download, search, share links</td><td>Yes</td><td>Yes</td></tr>
+<tr><td>Sync down with DriveCraft</td><td>Yes (DriveCraft marks the folder read-only; its changes are never sent up)</td><td>Yes, in both directions</td></tr>
+<tr><td>Upload a new file</td><td>No</td><td>Conditional write, refused if the key now exists (<code>If-None-Match: *</code>)</td></tr>
+<tr><td>Edit in a ShareCraft editor</td><td>Opens read-only</td><td>Live session; checkpoint writes a new S3 version (section 10)</td></tr>
+<tr><td>Rename, move</td><td>No</td><td>Server-side copy then delete; identity kept. Not atomic, not free for large objects</td></tr>
+<tr><td>Delete</td><td>No</td><td>Delete marker (versioned bucket) or reserved-prefix holding area (section 10)</td></tr>
+<tr><td>Metadata and permissions held in ShareCraft</td><td>Yes (these live in ShareCraft)</td><td>Yes</td></tr>
+</tbody></table></div>
+<p><strong>Read-only is a ShareCraft promise, backed by the credential.</strong> The administrator is advised to give a read-only library a read-only credential (<code>s3:GetObject</code>, <code>s3:ListBucket</code>, <code>s3:GetObjectVersion</code>). The probe tries no write; it reads the policy where it can and says "this credential appears able to write" if so. A read-only library can be made safe by IAM alone, which is the stronger statement.</p>
+<p><strong>Read-write requirements.</strong> Versioning on (so that an overwrite or delete is recoverable outside ShareCraft), a credential allowed <code>PutObject</code>, <code>DeleteObject</code> and <code>CopyObject</code> on the prefix, and, preferably, conditional-write support. Without conditional writes the server does a HEAD-then-PUT, which leaves a small race window; the settings page says so, and this is the main reason to prefer the real AWS service or a conditional-write-capable store for read-write.</p>
+<p><strong>Every write goes through the spine.</strong> An edit, an upload from the browser, a DriveCraft upload and an editor checkpoint all arrive as "a change based on revision R". The server compares R to the current ETag or version and either writes with the matching precondition or refuses with a conflict (S4). There is no other way to write.</p>
+</section>
+
+<section id="conflicts"><h2>06 / Conflicting writes made directly in S3</h2>
+<p>Other systems write to the bucket: applications, pipelines, people with the AWS console. ShareCraft cannot stop them, and does not try. Four cases need a rule.</p>
+<div class="table-wrap"><table><thead><tr><th>Case</th><th>What ShareCraft does</th></tr></thead><tbody>
+<tr><td>A file changes in S3 while nobody in ShareCraft has it open</td><td>Change detection updates the item (new ETag, size, version). Browsers show the new version; DriveCraft receives an edit in its next delta. No conflict exists.</td></tr>
+<tr><td>A file changes in S3 while a ShareCraft session is open</td><td>The session keeps going on its base revision. A banner says <em>"This file changed in the bucket at 14:02. Your changes will be saved as a copy."</em> At checkpoint, the conditional write is refused by S3 (precondition failed) or caught by the ETag check, and ShareCraft saves a <strong>sibling copy</strong>, <code>name (edited by Ana 2026-11-16 14:20).ext</code>, as a new object. Nothing already in S3 is overwritten.</td></tr>
+<tr><td>A DriveCraft upload is based on an ETag S3 has since replaced</td><td>The upload is refused with a conflict (<code>RemoteError::Conflict</code>, as DriveCraft already handles). DriveCraft keeps the local file as a conflict copy and downloads the new remote version, as it does with SharePoint.</td></tr>
+<tr><td>A file is deleted in S3 while it is open, or being synced</td><td>The item becomes a tombstone. An open session is told the file is gone and offered "Save my copy to this folder". DriveCraft receives a delete; if the person has local unsynced changes, DriveCraft keeps the file, as it already does (<em>left on</em>, <code>left_on.rs</code>).</td></tr>
+<tr><td>Two ShareCraft users edit the same file</td><td>Co-authoring, not a conflict: one session, as D22. Only the checkpoint meets S3.</td></tr>
+</tbody></table></div>
+<p><strong>The residual risk.</strong> With no conditional writes (some S3-compatible stores), a write by another system between ShareCraft's HEAD and PUT can be overwritten. With versioning on it remains recoverable as an earlier S3 version, and ShareCraft records it as an event ("overwrote version X written outside ShareCraft") so an administrator can find it. The settings page names this exposure when it applies.</p>
+<p><strong>Echo suppression.</strong> ShareCraft's own writes come back as S3 events or appear in the next listing. Each write records the resulting ETag and version ID, so detection can recognise and ignore its own change instead of announcing it as someone else's edit.</p>
+</section>
+
+<section id="changes"><h2>07 / Change detection</h2>
+<p>ShareCraft must learn that the bucket changed, so browsers and DriveCraft stay current. The three mechanisms are cumulative, not alternatives. The first always runs. The others lower latency and cost for those who set them up.</p>
+<div class="table-wrap"><table><thead><tr><th>Mechanism</th><th>How it works</th><th>Latency</th><th>Strengths</th><th>Weaknesses</th></tr></thead><tbody>
+<tr><td><strong>Polling (always on)</strong></td><td>List the prefix on a schedule and compare with <code>surfaced_items</code>. Changed ETag, size, modified time or version marks an item changed; a missing key a tombstone. The list is paged (up to 1,000 keys per request) and resumable.</td><td>Minutes (set per library; default 5 min, doubling when nothing has changed, down to 1 min on demand)</td><td>Needs nothing from the customer beyond read access. Works on every S3-compatible store.</td><td>Cost and time grow with object count; there is no "changed since" listing in S3, so each pass lists everything. The scheduler caps frequency by a cost budget (section 12).</td></tr>
+<tr><td><strong>Event notifications (optional)</strong></td><td>The bucket sends <code>ObjectCreated</code>, <code>ObjectRemoved</code> and restore events to an SQS queue (or EventBridge, or an HTTPS endpoint through SNS). ShareCraft long-polls the queue, and for each event updates just that key.</td><td>Seconds</td><td>Cheap, precise, near real time. MinIO, Ceph and R2 have comparable features, shown by the probe.</td><td>At-least-once, possibly out of order, occasionally lost. The customer must create the queue and policy. ShareCraft therefore uses events only as hints, applies each with the event's sequencer to ignore stale ones, and still runs a slow poll (hourly, default) to reconcile.</td></tr>
+<tr><td><strong>Inventory (optional, large buckets)</strong></td><td>S3 Inventory writes a daily or weekly manifest (CSV, ORC or Parquet) of all objects into another bucket. ShareCraft reads it to reconcile instead of listing.</td><td>24 to 48 hours</td><td>Far cheaper than listing for tens of millions of keys; includes encryption, storage class, checksum and version columns.</td><td>Slow. Not on S3-compatibles in general. Never the only signal.</td></tr>
+</tbody></table></div>
+<p><strong>Reconciliation is the safety net.</strong> Whatever delivers hints, a full or inventory-based reconciliation runs on a slower schedule and brings the table to the bucket's truth. Every item carries <code>last_seen_seq</code>: after a complete pass, an item not seen is a tombstone. A pass that failed part-way records nothing as deleted.</p>
+<p><strong>The change log.</strong> Each applied change gets a <code>seq</code> in <code>source_changes</code> and publishes an event on the spine's stream (S7) so audit, search indexing, notifications and the DriveCraft delta all read one source. If a table is rebuilt from a fresh listing, a new epoch starts and DriveCraft is told to resynchronise (<code>RemoteError::ResyncRequired</code> already exists for this case).</p>
+<p><strong>Initial scan.</strong> Connecting a large bucket starts a background import with progress shown on the library page ("1.2 million of about 4 million objects"). The library is usable while the import runs, with a "listing still in progress" notice. Folders appear as they are discovered. The listing count estimate comes from the probe or the Inventory manifest where there is one.</p>
+</section>
+
+<section id="creds"><h2>08 / Credentials</h2>
+<p>A source's credential is the most sensitive thing this feature holds. The rule is absolute: <strong>no secret is stored in plain text, and none is ever written to Git, an event, a log line, an error message or a backup export in readable form.</strong></p>
+<div class="table-wrap"><table><thead><tr><th>Method</th><th>Use</th><th>What ShareCraft stores</th></tr></thead><tbody>
+<tr><td><strong>Ambient identity (preferred)</strong></td><td>ShareCraft runs where the cloud gives it an identity: an EC2 instance profile, ECS or EKS role, or web-identity token. The AWS default credential chain is used. Cross-account access uses <code>AssumeRole</code> with an <em>external ID</em> to avoid the confused-deputy problem.</td><td>Only the role ARN and external ID. No secret at all.</td></tr>
+<tr><td><strong>Access key and secret</strong></td><td>The universal method, and the only one for most S3-compatible stores and for ShareCraft on a Windows PC or an on-premises server.</td><td>The access key ID is stored as a label. The secret is stored only as ciphertext (below).</td></tr>
+<tr><td><strong>Anonymous</strong></td><td>A public bucket, read-only.</td><td>Nothing.</td></tr>
+<tr><td><strong>Federated per-person access</strong> (not in the first release)</td><td>Short-lived credentials per signed-in person through web-identity federation, so S3's own policy applies to them.</td><td>Needs an identity provider ShareCraft does not have yet (the open item in the scope's tenancy and identity decision).</td></tr>
+</tbody></table></div>
+<p><strong>Protecting a stored secret.</strong></p>
+<ul>
+<li><strong>Envelope encryption.</strong> Each secret is encrypted with AES-256-GCM under a <em>secret key</em> held by the server, never in PostgreSQL or Git. The database row holds the algorithm, key ID, nonce and ciphertext. Key IDs allow rotation: a new key is added, secrets are re-encrypted in the background and the old key is retired.</li>
+<li><strong>Where the secret key lives.</strong> On Windows, in a file in the installation's data folder readable only by the account the server runs as, created at first start, so no administrator step is needed (the owner's rule on per-machine admin work). Where an operating-system store is available, the key can be sealed under it (DPAPI at user scope, or a cloud key-management service); these are options, not the requirement. <strong>Decision 5 asks the owner to confirm this.</strong> The consequence to state: a backup of the database alone cannot read the secrets; a backup that also contains the key file can. The backup guidance says to keep them apart.</li>
+<li><strong>Write-only in the interface.</strong> After saving, the secret is never shown again; the form shows "set" and offers "replace". Nothing in an API response or event carries it. Redaction is tested by a standing test that scans logs and responses for planted secrets.</li>
+<li><strong>Least privilege, checked.</strong> The setup page gives a ready-made minimal IAM policy for the bucket and prefix, read-only or read-write, to copy. The probe reports a credential that can do far more than needed ("can write and delete everywhere in this account") as a warning, not a block.</li>
+<li><strong>Rotation and failure.</strong> A failed authentication marks the source <em>Not connected</em>, keeps the last known tree readable (stale, with a banner) and sends an alert to the library's owners. It does not retry in a loop that could lock the account.</li>
+<li><strong>Who can manage.</strong> Creating and changing a source is a site-owner action with an administrator role; the credential itself can be replaced but never read. Every change is in the event log with the person, never the value.</li>
+<li><strong>Egress and endpoints.</strong> Only HTTPS endpoints are accepted, with certificate checks on. A custom endpoint (S3-compatible store) must be explicitly entered by an administrator, and ShareCraft refuses addresses in private or link-local ranges unless an administrator allows that range, so the feature cannot be used to make the server probe its own network.</li>
+</ul>
+</section>
+
+<section id="perms"><h2>09 / Permissions mapping</h2>
+<p>ShareCraft's permissions (SC-11: sites, libraries, folders and files, inheritance with breaks, groups and roles, sharing links) apply to the surfaced tree exactly as they do to any library. The surfaced items are nodes with ids, so access can be given, inherited and broken at any folder or file, and the inheritance explorer shows where each person's access comes from.</p>
+<div class="table-wrap"><table><thead><tr><th>Layer</th><th>Who decides</th><th>What it means</th></tr></thead><tbody>
+<tr><td>What ShareCraft can reach</td><td>The S3 credential's IAM policy and the library's prefix</td><td>The outer limit. Nobody can see through ShareCraft what the credential cannot read.</td></tr>
+<tr><td>Who can see and do what in the library</td><td>ShareCraft roles and inheritance</td><td>The only layer ShareCraft users meet. Viewer, Editor, Owner and custom roles keep their meaning. An Editor in a read-only library can edit metadata held in ShareCraft but cannot change the files.</td></tr>
+<tr><td>What S3 itself allows</td><td>Bucket policy, ACLs, Object Lock</td><td>Not read by ShareCraft for authorisation. ShareCraft does not translate S3 ACLs into ShareCraft permissions.</td></tr>
+</tbody></table></div>
+<p><strong>The honest consequence.</strong> All ShareCraft users reach S3 through one service identity. ShareCraft is the only place its permissions are enforced. Someone with direct S3 access, an application with the same credential or a person using the AWS console is outside ShareCraft's permission model, and ShareCraft's audit trail does not see their reads. The library page says so. S3 server access logs or CloudTrail data events remain the record for those accesses.</p>
+<p><strong>Starting access.</strong> A new surfaced library starts with only its creator as owner, and everything below inherits. No access is derived from the bucket. A bulk helper maps <em>prefixes to groups</em> ("<code>finance/</code> visible to the Finance group") by breaking inheritance at those folders; it is a convenience over ordinary SC-11 operations, and its result is visible in the inheritance explorer.</p>
+<p><strong>Items that appear later.</strong> A new object inherits from the folder it lands in. A new top-level prefix inherits from the library. Where a folder has its own permissions, new objects in it follow them, so an object written by another system into a restricted folder is restricted from the first moment ShareCraft sees it. The lag between the write and the next detection is a visibility gap in the other direction: the object is not yet shown.</p>
+<p><strong>Links.</strong> Sharing links (including anyone links) work on surfaced files. An anyone link serves bytes through ShareCraft with the link's expiry. It never exposes a pre-signed URL or the bucket name. If the object is deleted in S3, the link stops working.</p>
+<p><strong>Later: per-person S3 identities.</strong> With an identity provider (scope decision on tenancy and identity), ShareCraft could pass the signed-in person's identity to S3 so that S3's own policy decides too. That makes ShareCraft enforcement and S3 enforcement agree by construction. It is a different, larger design and is deliberately not in the first release.</p>
+</section>
+
+<section id="features"><h2>10 / What existing features do over surfaced files</h2>
+<p>Each row says what the feature does <em>today</em> (built or planned in the current scope) and what changes over a surfaced file. "Cost" means requests or egress against the customer's bucket.</p>
+<div class="table-wrap"><table><thead><tr><th>Feature</th><th>Over surfaced files</th><th>Limits and costs</th></tr></thead><tbody>
+<tr><td><strong>Search</strong> (SC-10, Stage 5)</td><td>Names, paths, S3 properties, tags and ShareCraft metadata are indexed from the listing at no extra cost. Full-text is opt-in per library, for chosen file types under a size cap, indexed from the cache or a streamed read, and shows "indexed N of M files".</td><td>Full-text indexing reads every indexed object once (GET and egress or in-region transfer). The library page shows an estimate first and asks for a go-ahead. Permission trimming works as for any library.</td></tr>
+<tr><td><strong>Previews and thumbnails</strong> (plan 3C)</td><td>Same safe-type rules. The first preview streams the object into the cache, makes the preview or thumbnail, and keeps the derived image in ShareCraft.</td><td>Thumbnails for a large image library read every image once. Thumbnails are generated on demand by default, not all in advance. Over-large files show an icon and "too large to preview".</td></tr>
+<tr><td><strong>Antivirus scanning</strong> (ICAP, scan states per content)</td><td>Scan on first read, not on listing: a file is streamed into a temporary store, hashed and scanned before it is served or synced. The result is kept against the content hash (<code>blobs.scan</code>), so the same bytes are scanned once. Infected files are withheld from open, download and sync, shown with the threat name, and releasable by an administrator as today.</td><td>The first open of an unscanned file is slower. Objects over the scanner's limit are <em>too large</em>, the existing state. A "scan the library" action exists for those who want it, with a cost estimate, and does not run by default. Pre-signed direct download bypasses scanning, which is why it is off by default (decision 8).</td></tr>
+<tr><td><strong>Recycle bin</strong> (D29, two stages, 93 days)</td><td>With versioning, ShareCraft's delete writes a delete marker and records it; the first stage lists what ShareCraft deleted, restore removes the marker, and the second stage (site managers) deletes the versions permanently, the only step that erases anything and always asks. Without versioning, read-write delete is not offered unless the administrator accepts that deletes are permanent, or enables a <em>holding area</em>: ShareCraft first copies the object under a reserved prefix (<code>.sharecraft-bin/</code>, hidden from the library, skipped by detection) and deletes the original.</td><td>Deletes made directly in S3 are not in ShareCraft's bin; they are tombstones with an S3 version still behind them if versioning is on, and a "Restore from S3 version" action is offered to owners. S3 lifecycle rules, not ShareCraft, expire noncurrent versions; ShareCraft shows what remains and does not promise 93 days the bucket may not honour. The holding area costs storage.</td></tr>
+<tr><td><strong>Version history</strong> (SC-08)</td><td>Shows S3 versions where versioning is on (section 04). Restore is copy-forward. Check-out and locking exist as ShareCraft-side locks, which only bind people using ShareCraft or DriveCraft, since S3 has no lock a person at the console would respect.</td><td>No versioning means one version. Listing versions costs a request per page of 1,000, so history is fetched per file when opened, not for the whole library.</td></tr>
+<tr><td><strong>Retention, records and audit</strong> (SC-12, Stage 5)</td><td>Retention labels, records declarations and holds are ShareCraft records on the item identity, and they block deletion and edit <em>through ShareCraft</em>. Audit covers actions through ShareCraft. Where the bucket has S3 Object Lock, ShareCraft shows the lock (mode, retain-until, legal hold) as read-only properties, and, in read-write mode with Object Lock enabled, can apply a legal hold or retention when a record is declared (a later phase).</td><td><strong>A ShareCraft retention policy cannot stop an S3 deletion.</strong> Only Object Lock or IAM can. The library page and any records report must say this. A library that is subject to a compliance requirement should be required to have Object Lock or a read-only credential before records can be declared on it.</td></tr>
+<tr><td><strong>Co-authoring</strong> (D15, D22, S1 to S7)</td><td>Opening an editable file in read-write mode starts a session: the base bytes are fetched into the cache, the session runs in ShareCraft as for any file, and a checkpoint is one conditional PUT, creating one S3 version. Presence, per-person undo and attribution are unchanged. Read-only libraries open the same editors read-only.</td><td>Each checkpoint is a PUT and, with versioning, a stored version. Checkpoints to S3 are coalesced (at session end, on an interval and on explicit Save) so a long session does not create hundreds of versions. The Git revision for a surfaced file records the S3 version ID, ETag and the SHA-256, with the people credited. The bytes are in the bucket, not in the content store (decision 2). Archive-tier and over-size files do not open in editors.</td></tr>
+<tr><td><strong>Quotas</strong> (plan 3A)</td><td>Surfaced bytes do not count against the site's storage quota; the cache has its own size cap.</td><td>The cache is bounded with least-recently-used eviction, and nothing in it is the only copy.</td></tr>
+<tr><td><strong>Events and audit trail</strong> (S7)</td><td>Open, download, share and every ShareCraft write are events as usual. Changes detected in the bucket are events too, marked as detected, with no person attached.</td><td>Reads by other systems are not seen (section 09).</td></tr>
+<tr><td><strong>Branding, navigation, sites</strong></td><td>No difference.</td><td></td></tr>
+</tbody></table></div>
+<p><strong>The cache.</strong> The content store (D28: files named by SHA-256) doubles as the cache. A fetched object is written there once, and a second library or person gets the cached copy. Because the cache holds copies of content, it inherits ShareCraft's erasure rules: eviction is safe because the bucket remains the authority. The cache and the quota systems are separate, and surfaced content is never the only holder of its bytes.</p>
+</section>
+
+<section id="sync"><h2>11 / The contract DriveCraft sync needs</h2>
+<h3>How DriveCraft syncs today</h3>
+<p>Read from <code>H:\Source\repos\ThineCraft\DriveCraft\src</code> on 16 November 2026. The sync engine (<code>engine.rs</code>) is written against a <code>Remote</code> trait (<code>remote.rs</code>), "so that ShareCraft can be added later as a second implementation". Microsoft Graph (<code>graph.rs</code>) is the only implementation. The trait asks for exactly these things:</p>
+<ul>
+<li><code>delta(drive, link)</code> returns pages of <code>RemoteItem</code> plus either a <code>next_link</code> (more pages) or a <code>delta_link</code> (the bookmark for next time), and can answer <code>ResyncRequired</code>.</li>
+<li><code>download(drive, item, dest)</code> returning size and hash; <code>upload(drive, target, src, mtime)</code> where the target is <code>New{parent,name}</code> or <code>Replace{item, etag}</code>, failing with <code>Conflict</code> if the etag is stale.</li>
+<li><code>create_folder</code>, <code>delete(item, etag)</code>, <code>move_item</code>, <code>child</code>, <code>children</code>, <code>item</code>.</li>
+<li><code>permissions(drive, items)</code> and <code>identity()</code>, so the client can tell what the person may do (own-permission items, groups).</li>
+</ul>
+<p>A <code>RemoteItem</code> has: <code>id</code>, <code>parent_id</code>, <code>name</code>, kind (file, folder, other), <code>size</code>, <code>etag</code>, <code>ctag</code>, <code>hash</code> (optional), <code>mtime_ns</code>, <code>is_root</code>, <code>deleted</code>, <code>own_permissions</code>. The client catalog (SQLite) keeps the server part apart from the per-machine part; a conflict leaves a conflict copy; a deletion held back by local changes is "left on"; refused names go to the Problems view; a per-library seed is stored in the library itself.</p>
+<p>The SC-23 API that ShareCraft owes DriveCraft is <strong>not built</strong>: it is in Stage 4, and DriveCraft's own scope says "the ShareCraft connector waits on that API's design". Signing in to ShareCraft from DriveCraft is refused today (<code>main.rs</code>). So the surfaced library does not need its own sync protocol. It needs to be a library that SC-23 serves like any other.</p>
+
+<h3>What a surfaced library must provide through SC-23</h3>
+<div class="table-wrap"><table><thead><tr><th>DriveCraft needs</th><th>How a surfaced library provides it</th></tr></thead><tbody>
+<tr><td>Stable item ids; folders; parent links</td><td>Item identity from <code>surfaced_items</code> (section 04). Folder ids are mapped from prefixes.</td></tr>
+<tr><td><code>etag</code> (changes when anything changes) and <code>ctag</code> (when content changes)</td><td>The ETag with version ID for the etag; the ETag for the ctag (an S3 PUT always changes the content). A change to ShareCraft-held metadata alone changes the etag only, not the ctag.</td></tr>
+<tr><td><code>hash</code></td><td>SHA-256 from the object's additional checksum, or computed on first read and kept. <strong>Unknown for objects ShareCraft has not read.</strong> The contract allows no hash (the field is optional in the trait); the client verifies a download against the size and the SHA-256 ShareCraft states in the download response header, and ShareCraft computes it as it streams. DriveCraft's use of QuickXorHash is for Microsoft Graph; the ShareCraft connector uses SHA-256, which D28 already makes ShareCraft's content identity. <em>I have not read how <code>engine.rs</code> behaves in every path when the hash is missing; the build plan must test it.</em></td></tr>
+<tr><td><code>mtime_ns</code></td><td>S3 LastModified. Objects have no separate created and modified times, and no filesystem timestamps. A writer through DriveCraft can store the local time in an object metadata key (<code>x-amz-meta-sc-mtime</code>) so a round trip keeps it.</td></tr>
+<tr><td>Delta feed with a resumable cursor, tombstones and "resync required"</td><td>The cursor is the epoch and <code>source_changes.seq</code>. Items returned are those with seq above the cursor, with <code>deleted: true</code> for tombstones. Tombstones are kept for a fixed period (SC-23 decision, scope decision 6); an older cursor gets <code>ResyncRequired</code>. First enumeration is the whole tree from <code>surfaced_items</code>, paged, started consistently at a seq so changes made during it are not missed.</td></tr>
+<tr><td>Permissions and identity</td><td>Effective ShareCraft permissions per item, as SC-23 returns for any library. Items with their own permissions are flagged <code>own_permissions</code>; DriveCraft's seed and access logic then work unchanged.</td></tr>
+<tr><td>Upload (<code>New</code> and <code>Replace</code> with etag), delete, move, create folder</td><td>Read-write libraries: the checks in sections 05 and 06. Read-only libraries refuse with <code>Forbidden</code>, and advertise read-only so DriveCraft sets the local folder read-only and never queues an upload.</td></tr>
+<tr><td>Large files, interruption, resume</td><td>Range downloads straight from S3 through the proxy. Uploads use S3 multipart with per-part checksums and a resumable session id, so a laptop that sleeps in a 20 GB upload resumes rather than restarts. Part size is chosen to stay under S3's 10,000-part limit. Part and request counts are reported in the cost section.</td></tr>
+<tr><td>Unavailable items</td><td>An item the library cannot supply right now (archive tier, infected, too long a path, not-yet-surfaceable name) is returned with an <code>unavailable</code> reason. <strong>This is a small addition to the contract</strong>: the Graph <code>RemoteItem</code> has no such field, only the kind <em>Other</em>. DriveCraft would show these in its Problems view with the reason and not delete the local copy.</td></tr>
+<tr><td>Library capabilities</td><td>A small capabilities block on the library: read-only or read-write; case-insensitive names; maximum path length; hash algorithm; whether metadata edits are accepted. Another small addition to the contract, useful to every library, which surfaced libraries need.</td></tr>
+</tbody></table></div>
+<h3>What does not fit well, and how it is handled</h3>
+<ul>
+<li><strong>Size.</strong> DriveCraft keeps every file whole on disk; "files on demand are not part of this", and I found no folder-selection feature in its catalog or engine. Syncing a 2 TB bucket downloads 2 TB. The contract cannot fix that. It needs <strong>folder-level selection in DriveCraft</strong> (sync this prefix only) before surfaced libraries of any size are sensible, and an advisory on the library ("about 2.1 TB; DriveCraft will copy everything you select"). A request to the DriveCraft side, not built here.</li>
+<li><strong>Cost multiplication.</strong> Many computers each pulling the same bytes would each trigger S3 egress. The cache in ShareCraft answers the second and later requests for the same object (section 12).</li>
+<li><strong>Modification times and attributes.</strong> No local permissions, ACLs or extended attributes are stored in S3. Those are not synced for any ShareCraft library either.</li>
+<li><strong>Move and rename</strong> are copy and delete in S3, so a rename of a folder of 100,000 objects is 100,000 copies and deletes. It is refused above a configured count unless the owner confirms the cost. DriveCraft's rename detection must not turn a local folder rename into that without warning; the server's refusal returns a clear message the client shows.</li>
+<li><strong>Delta from outside.</strong> A bulk change in S3 (a million objects written by a pipeline) becomes a large delta. The server paginates, and DriveCraft's existing pacing (<code>pace.rs</code>) applies.</li>
+</ul>
+<p><strong>Not needed from DriveCraft.</strong> It will not read the bucket, hold an S3 credential or know the library is surfaced, except for the capabilities block and <code>unavailable</code> reason. It must never be given a pre-signed URL unless the owner enables direct download (decision 8). If so, the URL is short-lived, one object, and the hash and scan result are still checked from ShareCraft's answer.</p>
+</section>
+
+<section id="costs"><h2>12 / Costs</h2>
+<p>The customer pays AWS (or the other provider) for what ShareCraft does to their bucket. ShareCraft should know the bill it is causing, and say so before the cost happens. Prices below are indicative list prices for US regions as I recall them; <strong>they must be re-checked against the provider's current price list before anything is promised</strong>, and S3-compatible stores price differently (some charge no egress at all).</p>
+<div class="table-wrap"><table><thead><tr><th>Charge</th><th>Indicative rate (S3 Standard)</th><th>What causes it in this design</th></tr></thead><tbody>
+<tr><td>LIST, PUT, COPY, POST requests</td><td>About $0.005 per 1,000</td><td>Polling (one request per 1,000 keys per pass), checkpoints, uploads, renames, delete-holding copies.</td></tr>
+<tr><td>GET, HEAD requests</td><td>About $0.0004 per 1,000</td><td>Opens, previews, syncs, scans, full-text indexing, HEADs before writes.</td></tr>
+<tr><td>Data transfer out to the internet</td><td>About $0.09 per GB after a small monthly free allowance</td><td>Bytes flowing to wherever ShareCraft runs when it is not in the same AWS region. Transfer to a server in the same region is free of egress charge.</td></tr>
+<tr><td>Archive retrieval</td><td>Per GB and per request, by tier</td><td>"Request restore" on an archived object.</td></tr>
+<tr><td>Versions and holding area</td><td>Storage for every stored version</td><td>Each checkpoint and ShareCraft delete in a versioned bucket adds a stored version or marker; the holding area keeps a copy.</td></tr>
+<tr><td>Inventory</td><td>About $0.0025 per million objects listed</td><td>If enabled.</td></tr>
+<tr><td>SQS</td><td>Cents per million requests</td><td>If event notifications are enabled.</td></tr>
+</tbody></table></div>
+<p><strong>Worked examples</strong> (illustrative, from the rates above):</p>
+<ul>
+<li><strong>Polling.</strong> 5 million objects is 5,000 LIST requests per pass, about $0.025. Every 5 minutes for a month is about 8,600 passes, about $215. Every hour, about $18. Events with an hourly reconcile cost almost nothing. <strong>Polling a large bucket every five minutes is a poor default.</strong> The scheduler therefore sets the interval from the object count and a monthly <em>request budget</em> that the administrator sees and can change.</li>
+<li><strong>Sync.</strong> A 500 GB library synced by 30 people over the internet is 15 TB of egress, about $1,350, if every pull comes from S3. With ShareCraft's cache the first pull fetches 500 GB (about $45), and the other 29 are served from the cache. The cache must therefore be sized for the working set, and the settings page shows hit rate.</li>
+<li><strong>Full-text indexing.</strong> 200 GB of Office and PDF files, read once: about $18 of egress, plus a GET per file. The estimate is shown before it starts.</li>
+</ul>
+<p><strong>Controls.</strong> (1) A monthly request and transfer <em>budget</em> per source, with a warning at 80% and a pause (reads continue from cache, detection slows) at 100%, with the administrator's override. (2) Cost estimates before expensive actions: full indexing, scan the library, thumbnail the library, initial import, bulk rename. (3) A usage panel per library: requests by kind, bytes out, cache hit rate, an estimated bill for the month. (4) A suggestion, when ShareCraft's location and the bucket's region differ, to move the server or use a gateway endpoint. ShareCraft sees only its own requests; the AWS bill is the authority, and the panel says so.</p>
+</section>
+
+<section id="azure"><h2>13 / The Azure follow-on</h2>
+<p>The design above is built around the <code>StorageSource</code> trait so that Azure Blob Storage is a second implementation behind it, with the library, tree, permissions, cache, features and DriveCraft contract untouched. How the concepts line up:</p>
+<div class="table-wrap"><table><thead><tr><th>Concept</th><th>S3</th><th>Azure Blob Storage</th><th>Effect on the trait</th></tr></thead><tbody>
+<tr><td>Container of objects</td><td>Bucket (+ prefix)</td><td>Storage account and container (+ prefix)</td><td>Source settings differ; the library sees "source + prefix".</td></tr>
+<tr><td>Folders</td><td>Keys with <code>/</code></td><td>Names with <code>/</code>; with <strong>hierarchical namespace</strong> (Data Lake Gen2), real directories with atomic rename</td><td><code>real_directories</code> capability. Rename becomes cheap and atomic where available.</td></tr>
+<tr><td>Revision for change detection</td><td>ETag</td><td>ETag (strong)</td><td>None.</td></tr>
+<tr><td>History</td><td>Versioning, version IDs</td><td>Blob versioning, version IDs; also snapshots and soft delete</td><td>None.</td></tr>
+<tr><td>Safe write</td><td>Conditional write (<code>If-Match</code>, <code>If-None-Match</code>)</td><td>Conditional headers (<code>If-Match</code>, <code>If-None-Match</code>) have long been supported</td><td>Same <code>Precondition</code>.</td></tr>
+<tr><td>Change detection</td><td>Event Notifications (SQS), Inventory, polling</td><td><strong>Event Grid</strong> (to a storage queue or webhook), <strong>change feed</strong> (an ordered, durable log of changes, where enabled), blob inventory, polling</td><td><code>ChangeFeed</code> implementation per kind. The Azure change feed is ordered and replayable, a better source than S3's, so Azure may need less reconciliation.</td></tr>
+<tr><td>Credentials</td><td>IAM role, access keys</td><td><strong>Managed identity</strong>, service principal (Entra ID), SAS token, account key</td><td>New credential kinds; the same encrypted storage and write-only rule. Role assignment <em>Storage Blob Data Reader</em> or <em>Contributor</em> at container scope is the least-privilege form.</td></tr>
+<tr><td>Immutability</td><td>Object Lock</td><td>Immutable storage (time-based retention, legal hold)</td><td>Same <code>object_lock</code> capability for the records feature.</td></tr>
+<tr><td>Cold storage</td><td>Glacier tiers</td><td>Cool, Cold and Archive tiers; Archive needs rehydration</td><td>Same <code>archive_tiers</code> capability and "restore needed" state.</td></tr>
+<tr><td>Checksum</td><td>Additional SHA-256 checksum</td><td>Content-MD5 and (for some operations) CRC64</td><td>SHA-256 is computed by ShareCraft when not provided; the item shows "not yet read" until then.</td></tr>
+<tr><td>Costs</td><td>Requests, egress, retrieval</td><td>Operations, egress, early deletion and rehydration charges</td><td>The cost panel is generic; the rates are per source kind.</td></tr>
+</tbody></table></div>
+<p><strong>Rule for the first build.</strong> No S3-specific word may leak above the trait: <code>versionId</code>, <code>ETag</code>, <code>SQS</code> and <code>bucket</code> become <code>VersionId</code>, <code>Revision</code>, <code>FeedKind</code> and <code>container</code> in the library code and in the user interface text ("storage source", "container"). A second implementation is the proof, and it is not built now. To keep the abstraction honest, the build plan includes an in-memory fake <code>StorageSource</code> (also needed for tests without AWS) with deliberately different behaviour, such as real directories and no conditional writes.</p>
+<p><strong>Other stores.</strong> Google Cloud Storage and Backblaze B2's native API would also fit the trait. The owner has already excluded Google Drive for DriveCraft; Cloud Storage is a different product and is not decided here. S3-compatible endpoints cover B2, R2, Wasabi, MinIO and Ceph in the first release.</p>
+<p><strong>Rust library.</strong> Whether to use a unifying crate such as <code>object_store</code> (one API over S3, Azure and Google) or each vendor's own SDK is a build-time decision (decision 10). My recommendation is each vendor's SDK behind our own trait, because the features this design depends on (version listing, conditional writes, additional checksums, event queues, restore) are where unifying crates are thinnest. The cost is more code per store.</p>
+</section>
+
+<section id="placement"><h2>14 / Where it sits in the build order</h2>
+<p><strong>Proposal: a platform-track module, scope reference SC-27 "Storage-source libraries", delivered in three phases that attach to stages that already exist.</strong> It is not a new stage, and it does not take the editor track's place. Co-authoring stays first (D15); nothing here writes outside the spine.</p>
+<div class="table-wrap"><table><thead><tr><th>Phase</th><th>Attaches to</th><th>Delivers</th><th>Depends on</th></tr></thead><tbody>
+<tr><td><strong>A. Read-only surfacing</strong></td><td>After Stage 2 libraries (plan 3C), as its own plan, before or alongside Stage 3. It can be built while the editor track proceeds.</td><td>Storage-source trait and S3 implementation; library kind; encrypted credentials and probe; tree from listing with polling and optional event queue; browse, download, preview, permissions and links; read-only scan on first read; cache; budget and cost panel. <em>Exit: connect a real bucket and an S3-compatible store (MinIO), browse and open files with permissions enforced, change a key in the bucket and see it within the polling interval, with no secret findable in the database, Git, logs or events.</em></td><td>Plans 3A to 3C (nodes, files, libraries, scans, previews), plan 2 (permissions). No new spine rule.</td></tr>
+<tr><td><strong>B. DriveCraft sync</strong></td><td>Stage 4, with SC-23.</td><td>The surfaced library served by the SC-23 API like any other library, with the small additions in section 11 (capabilities block, <code>unavailable</code> reason, SHA-256). Exit extends A16: a client enumerates, syncs and receives deltas from a surfaced library, including after an expired cursor, a bulk S3 change and a read-only library.</td><td>SC-23 and the change feed; DriveCraft's ShareCraft connector; DriveCraft folder selection (section 11).</td></tr>
+<tr><td><strong>C. Read-write, versions and records</strong></td><td>After Stage 3 (versions, check-out and locking), with the editors that are live by then.</td><td>Write-back through the spine; conflict copies; versioned history; recycle bin behaviour; co-authoring over surfaced files; Object Lock for records (with Stage 5's SC-12).</td><td>SC-08 (Stage 3), spine S2 to S4 and the live editors, decision 3.</td></tr>
+<tr><td><strong>D. Azure and inventory</strong></td><td>After C, or earlier if a customer needs it.</td><td>Azure Blob implementation; S3 Inventory reconcile; federated identities if an identity provider then exists.</td><td>Decision 10; identity provider decision.</td></tr>
+</tbody></table></div>
+<p><strong>Proposed wording for sequencing.html</strong> (added as a clearly proposed note under the stage table, with a version entry; the stages and their order do not change): <em>"Proposed, not adopted: S3 surfacing libraries (SC-27, s3-surfacing-design.html). Phase A (read-only) follows plan 3C and runs beside the editor track; phase B rides with Stage 4's DriveCraft API; phase C follows Stage 3; phase D (Azure) after that."</em></p>
+<p><strong>Why not earlier.</strong> Phase A needs only what plans 3A to 3C built, so it could start now, in a separate branch, without touching the GridCraft co-authoring work. It is placed after the in-progress co-authoring proofs only because the owner's rule is that co-authoring is built first. Phases B and C are tied to Stages 3 and 4 because they need versions, locking and the sync API, none of which exist yet.</p>
+<p><strong>Standing proof.</strong> The two-session co-authoring test (sequencing section 05) must stay green. Phase C adds a case: two people co-author a file in a read-write surfaced library, a third party overwrites the object in the bucket mid-session, and the checkpoint is saved as a sibling copy without losing either party's edits.</p>
+</section>
+
+<section id="open"><h2>15 / Open questions</h2>
+<ol>
+<li><strong>Is the tree really kept out of Git?</strong> Decision 1 breaks D24 for this kind. The alternative, Git records for folders and for the items that carry ShareCraft-specific data (metadata, own permissions), is possible; it keeps D24's spirit and bounds Git by what ShareCraft adds, not by bucket size. Which does the owner prefer?</li>
+<li><strong>How big a bucket must be supported?</strong> 100,000 objects, 10 million, a billion? The scope's 100,000-file DriveCraft target belongs to the client and not to ShareCraft. The answer sets polling versus event-only, whether Inventory is required rather than optional, and table sizing.</li>
+<li><strong>Whose AWS account pays and operates the setup?</strong> A customer who owns a bucket must create IAM policies and optionally queues. How much of that can ShareCraft script (a downloadable CloudFormation or Terraform snippet) rather than describe?</li>
+<li><strong>Where does a typical ShareCraft run?</strong> In the same AWS region as the bucket (cheap, fast), on-premises, or on the owner's Windows PC? It changes egress cost, latency and what "ambient identity" can mean.</li>
+<li><strong>Is a ShareCraft-side lock acceptable?</strong> Check-out over a surfaced file binds only ShareCraft and DriveCraft users. Is that enough, or should read-write surfaced libraries not offer check-out?</li>
+<li><strong>Should DriveCraft be able to sync a surfaced library as read-only only, at first?</strong> It would remove the largest write-back risk from phase B.</li>
+<li><strong>Which S3-compatible stores must work at launch?</strong> MinIO is the easiest to test locally. Each other store has quirks in listing, checksums and conditional writes, and "S3-compatible" is not a guarantee.</li>
+<li><strong>Object Lock and compliance.</strong> Is a records declaration on a surfaced file allowed without Object Lock behind it, with the warning, or refused?</li>
+<li><strong>The path through a firewall.</strong> A ShareCraft behind a corporate firewall cannot receive S3 event webhooks. SQS polling works from inside; webhooks need production mode's public address. Which is supported first? (This design puts SQS first.)</li>
+<li><strong>Multi-source libraries.</strong> One library over several buckets or prefixes ("mount" prefixes as top-level folders)? The record model allows it; the interface and permissions explanation are heavier. Out of the first release unless the owner wants it.</li>
+<li><strong>Verification debt.</strong> Nothing here has been run against a real bucket. The AWS price figures, S3's conditional-write coverage in compatible stores, SDK licence and feature coverage in Rust, and DriveCraft's handling of a missing hash all need checking before the build plan is fixed.</li>
+</ol>
+</section>
+
+<section id="approaches"><h2>16 / Approaches considered</h2>
+<p>Three ways to build "S3 in a ShareCraft library" were weighed. The owner's request, taken with the existing code, points to the second.</p>
+<div class="table-wrap"><table><thead><tr><th>Approach</th><th>What it is</th><th>For</th><th>Against</th></tr></thead><tbody>
+<tr><td>1. Import</td><td>Copy bucket contents into an ordinary ShareCraft library (a migration, SC-17), perhaps repeated.</td><td>Simplest. Reuses everything. No special permissions model.</td><td>Not what was asked: a second copy to pay for, always stale, and nothing flows back. It is the right answer for customers who want to leave S3, and stays available.</td></tr>
+<tr><td><strong>2. Surface (recommended)</strong></td><td>The bucket stays the authority. ShareCraft keeps a projection of the tree, a bounded cache, and its own metadata and permissions, and writes back through the spine.</td><td>Matches "surface them as files... with the ability to Sync". One copy of the data. Azure fits behind the same trait.</td><td>New change detection, conflict handling and cost controls. Retention is weaker than for ordinary libraries (section 10).</td></tr>
+<tr><td>3. Gateway</td><td>Expose ShareCraft as an S3 or WebDAV front end over the bucket, or let DriveCraft talk to S3 directly with its own credentials.</td><td>Least work in ShareCraft. DriveCraft could sync any bucket on its own.</td><td>Bypasses ShareCraft permissions, scans, links and audit; puts S3 credentials on every computer; breaks the rule that DriveCraft uses only the SC-23 API and gets no unrestricted credentials.</td></tr>
+</tbody></table></div>
+<p class="small">The decisions that turn approach 2 into a build plan are listed in section 02. No product code is written until the owner accepts the design.</p>
+</section>
+
+<footer>ShareCraft · ThineCraft · S3 Surfacing libraries v0.1 · 16 November 2026<br>Proposal for the owner's decision, not an approved design. Read with Scope of Works v0.17 and Sequencing Plan v0.14.</footer>
+</main></div>
+</body></html>
