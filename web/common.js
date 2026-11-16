@@ -1,7 +1,8 @@
 // Shared by every page: calling the API, turning its error codes into sentences, and the
 // sign-in redirect. Pages hold no merging or permission logic; the server decides.
 
-import { CHECK_LABELS, MIN_RATIO, applyLook, parseColour } from './look.js';
+import { CHECK_LABELS, MIN_RATIO, applyFonts, applyLook, parseColour } from './look.js';
+import { megaColumns, megaStep } from './navigation.js';
 import { setupAccountMenu, setupWordmark } from './account.js';
 import { existingSidebar, sidebar } from './workspace.js';
 import { prefetchCache, prefetchKey, setupPrefetch } from './prefetch.js';
@@ -1293,8 +1294,89 @@ function navItem(item, currentId) {
   return h('li', { class: 'has-sub' }, label, toggle, targeted, sub);
 }
 
-/** One bar: a name (a link to `head.href` when there is one) and its items. */
-function navBar(kind, label, head, items, currentId) {
+const TARGETED_TITLE = 'Shown only to the groups it is aimed at, and to you because you manage it';
+
+/** A link to a resolved navigation target, marked when it is the current page; else the label as text. */
+function megaLink(item, currentId) {
+  const href = navHref(item.target);
+  if (!href) return item.label;
+  const current = item.target?.node != null && item.target.node === currentId;
+  return h('a', { href, 'aria-current': current ? 'page' : null }, item.label);
+}
+
+/**
+ * One top-level item of a mega menu, as `{li, control}` (`control` is what the arrows move
+ * to). Without children it is drawn as in the dropdowns. With children it is a disclosure
+ * button, named by its label, for a full-width panel: the item's own link first (when it has
+ * one), then the children in columns (see `megaColumns` in navigation.js), each child that has
+ * children of its own heading a column. Escape closes the panel and goes back to its button;
+ * focus moving out of the item (Tab) closes it; opening one panel closes the others in `open`.
+ * Only the items the server sent are drawn: it has already left out what the reader's
+ * audiences do not see.
+ */
+function megaItem(item, currentId, panels) {
+  if (!item.children?.length) {
+    const li = navItem(item, currentId);
+    const first = li.children[0];
+    return { li, control: first?.getAttribute?.('href') != null ? first : null }; // a heading is not focusable
+  }
+  menus += 1;
+  const id = `nav-mega-${menus}`;
+  const overview = navHref(item.target) ? h('p', { class: 'mega-overview' }, megaLink(item, currentId)) : null;
+  const columns = megaColumns(item.children).map((column, n) => {
+    const headId = column.heading ? `${id}-head-${n}` : null;
+    const head = column.heading ? h('p', { class: 'mega-heading', id: headId }, megaLink(column.heading, currentId)) : null;
+    const list = h('ul', { 'aria-labelledby': headId }, ...column.items.map((child) => navItem(child, currentId)));
+    return h('div', { class: 'mega-column' }, head, list);
+  });
+  const panel = h('div', { class: 'mega-panel', id }, overview, h('div', { class: 'mega-columns' }, ...columns));
+  panel.hidden = true;
+  const button = h(
+    'button',
+    { type: 'button', class: 'sub-toggle heading mega-toggle', 'aria-expanded': 'false', 'aria-controls': id },
+    item.label,
+    h('span', { 'aria-hidden': 'true' }, ' ▾'),
+  );
+  const targeted = item.targeted ? h('small', { class: 'mark', title: TARGETED_TITLE }, 'Targeted') : null;
+  button.addEventListener('click', () => {
+    const open = button.getAttribute('aria-expanded') !== 'true';
+    if (open) for (const [other, otherPanel] of panels) if (other !== button) setOpen(other, otherPanel, false);
+    setOpen(button, panel, open);
+  });
+  panels.push([button, panel]);
+  const li = h('li', { class: 'has-mega' }, button, targeted, panel);
+  li.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape' || button.getAttribute('aria-expanded') !== 'true') return;
+    event.preventDefault(); // only the panel closes: the Menu drawer around it stays open
+    setOpen(button, panel, false);
+    button.focus();
+  });
+  // Focus moving to something outside the item (Tab out of the panel) closes it; a click
+  // elsewhere is left to the outside-click closer.
+  li.addEventListener('focusout', (event) => {
+    const next = event.relatedTarget;
+    if (next && !li.contains?.(next)) setOpen(button, panel, false);
+  });
+  return { li, control: button };
+}
+
+/** The top-level list of a mega menu: its items, the arrow keys moving between their buttons and links. */
+function megaList(label, items, currentId) {
+  const panels = [];
+  const drawn = items.map((item) => megaItem(item, currentId, panels));
+  const controls = drawn.map((entry) => entry.control).filter(Boolean);
+  const list = h('ul', { 'aria-label': label }, ...drawn.map((entry) => entry.li));
+  list.addEventListener('keydown', (event) => {
+    const next = megaStep(event.key, controls.indexOf(event.target), controls.length);
+    if (next === null || typeof controls[next]?.focus !== 'function') return;
+    event.preventDefault();
+    controls[next].focus();
+  });
+  return list;
+}
+
+/** One bar: a name (a link to `head.href` when there is one) and its items; `mega` draws a mega menu. */
+function navBar(kind, label, head, items, currentId, { mega = false } = {}) {
   const thumb = head?.thumb ? brandImage(head.thumb, { class: 'navthumb', alt: '' }) : null;
   const name =
     head?.name == null
@@ -1302,12 +1384,10 @@ function navBar(kind, label, head, items, currentId) {
       : head.href
         ? h('a', { class: 'navhead', href: head.href }, thumb, head.name)
         : h('span', { class: 'navhead' }, thumb, head.name);
-  return h(
-    'div',
-    { class: `navbar ${kind}`, 'data-bar': kind },
-    name,
-    items.length ? h('ul', { 'aria-label': label }, ...items.map((item) => navItem(item, currentId))) : null,
-  );
+  let list = null;
+  if (items.length && mega) list = megaList(label, items, currentId);
+  else if (items.length) list = h('ul', { 'aria-label': label }, ...items.map((item) => navItem(item, currentId)));
+  return h('div', { class: mega ? `navbar ${kind} mega` : `navbar ${kind}`, 'data-bar': kind }, name, list);
 }
 
 /**
@@ -1319,9 +1399,13 @@ function navBar(kind, label, head, items, currentId) {
  * address only becomes a link after [`safeHref`] accepts it. `currentId` is marked as the
  * current page. With `vertical` (the site's look puts its navigation in a left column) the
  * view gets the class `vertical`; `hubThumbnail` is the hub's thumbnail address, shown beside
- * its name when it is a brand image.
+ * its name when it is a brand image. With `menu: 'mega'` (the look's `navigation_menu`) a
+ * horizontal site bar shows each item's children as a full-width panel (see [`megaItem`]);
+ * vertical navigation, and the organisation's and the hub's bars, keep their dropdowns. In the
+ * Menu drawer at narrow widths a panel reads as a nested list (the style sheet).
  */
-export function navigationView(site, nav, { currentId, vertical = false, hubThumbnail = null } = {}) {
+export function navigationView(site, nav, { currentId, vertical = false, hubThumbnail = null, menu: menuStyle = 'cascading' } = {}) {
+  const mega = menuStyle === 'mega' && !vertical;
   const bars = [];
   if (nav?.global?.length) bars.push(navBar('global', 'Organisation', null, nav.global, currentId));
   if (nav?.hub) {
@@ -1334,7 +1418,7 @@ export function navigationView(site, nav, { currentId, vertical = false, hubThum
   }
   if (site || nav?.local?.length) {
     const head = site ? { name: site.name, href: pageFor('site', site.id) } : null;
-    bars.push(navBar('local', 'This site', head, nav?.local ?? [], currentId));
+    bars.push(navBar('local', 'This site', head, nav?.local ?? [], currentId, { mega }));
   }
   menus += 1;
   const id = `nav-menu-${menus}`;
@@ -1347,7 +1431,7 @@ export function navigationView(site, nav, { currentId, vertical = false, hubThum
   view.hidden = bars.length === 0;
   // Escape closes what is open and goes back to the button that opened it.
   view.addEventListener('keydown', (event) => {
-    if (event.key !== 'Escape') return;
+    if (event.key !== 'Escape' || event.defaultPrevented) return; // a mega panel closed itself
     const open = [...(view.querySelectorAll?.('button[aria-expanded="true"]') ?? [])];
     const inner = open.filter((button) => button !== toggle);
     const last = inner.at(-1) ?? (open.includes(toggle) ? toggle : null);
@@ -1405,6 +1489,29 @@ const FOOTER_GROUPS = 4;
 /** `url` if it is the address of a brand image (`/api/brand/images/{sha256}`), else null. */
 export function brandImageHref(url) {
   return typeof url === 'string' && BRAND_IMAGE.test(url) ? url : null;
+}
+
+/** ShareCraft's own tab icon, the account bar's mark. */
+export const SHARECRAFT_ICON = '/favicon.svg';
+
+/**
+ * Sets the page's tab icon to `url` when it is a brand image (a site's icon or thumbnail, or the
+ * organisation's default icon), else to ShareCraft's own: the `<link rel="icon">` in the page's
+ * head takes the address (one is added when the page has none). Answers the link, or null
+ * without a head.
+ */
+export function setTabIcon(url) {
+  const head = globalThis.document?.head;
+  if (!head) return null;
+  const href = brandImageHref(url) ?? SHARECRAFT_ICON;
+  const old = head.querySelector?.('link[rel~="icon"]');
+  if (old) {
+    old.setAttribute('href', href);
+    return old;
+  }
+  const link = h('link', { rel: 'icon', href });
+  head.append(link);
+  return link;
 }
 
 const DRAFT_IMAGE = /^\/api\/docs\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/(preview|thumbnail)$/i;
@@ -1698,11 +1805,12 @@ function sideBySide(page, chrome, vertical) {
 /**
  * The look, header and navigation of a page inside site `siteId`: fetches the site
  * (`GET /api/sites/{id}`), its navigation and its effective look once, sets the page's
- * language and time zone (and `<html lang>`) to the site's, applies the look's colours (see
- * `applyLook` in look.js), and draws the header after the account bar, the bars (see
- * [`navigationView`]) after it or in `place`, and with `footer` the site's footer at the end.
+ * language and time zone (and `<html lang>`) to the site's, applies the look's colours and
+ * fonts (see `applyLook` and `applyFonts` in look.js), sets the tab icon (see [`setTabIcon`]),
+ * and draws the header after the account bar, the bars (see [`navigationView`], with the
+ * look's menu style) after it or in `place`, and with `footer` the site's footer at the end.
  * In the editor frame (`frame`) there is no header or footer, and only the bar and the
- * navigation take the colours (not `<html>`, so the editor stays untouched): the bar's mark
+ * navigation take the colours and fonts (not `<html>`, so the editor stays untouched): the bar's mark
  * shows the site's thumbnail or logo instead (see [`frameMark`]), and the navigation stays
  * across the top.
  * The focused editor frame passes `navigation: false`: no navigation row under its bar (the way
@@ -1725,16 +1833,24 @@ export async function siteChrome(siteId, { currentId, place, footer = false, fra
     look: look.ok && look.data && typeof look.data === 'object' ? look.data : null,
   };
   // In the editor frame only the bar and the navigation take the look: the editor stays neutral.
-  if (!frame) applyLook(document.documentElement, shown.look);
+  if (!frame) {
+    applyLook(document.documentElement, shown.look);
+    applyFonts(document.documentElement, shown.look?.fonts);
+  }
+  setTabIcon(shown.look?.icon_url);
   const vertical = !frame && shown.look?.navigation === 'vertical';
   const view = navigationView(shown.site, shown.navigation, {
     currentId,
     vertical,
     hubThumbnail: shown.look?.hub?.thumbnail_url,
+    menu: shown.look?.navigation_menu,
   });
   if (frame) {
-    applyLook(document.querySelector('.bar'), shown.look);
+    const bar = document.querySelector('.bar');
+    applyLook(bar, shown.look);
     applyLook(view, shown.look);
+    applyFonts(bar, shown.look?.fonts);
+    applyFonts(view, shown.look?.fonts);
     frameMark(document.querySelector('.bar .mono'), shown.look);
     if (withNavigation) placeChrome(view, place);
   } else {
@@ -1761,10 +1877,12 @@ async function useOrganisationRegional() {
 
 /**
  * The navigation of a page outside any site: the organisation's language and time zone and its
- * global bar (`GET /api/navigation`), drawn after the account bar or in `place`.
+ * global bar (`GET /api/navigation`), drawn after the account bar or in `place`. The tab icon
+ * is the organisation's default icon (`GET /api/brand`), or ShareCraft's own.
  */
 export async function organisationChrome({ place } = {}) {
-  const [, navigation] = await Promise.all([useOrganisationRegional(), api('GET', '/navigation')]);
+  const [, navigation, brand] = await Promise.all([useOrganisationRegional(), api('GET', '/navigation'), api('GET', '/brand')]);
+  setTabIcon(brand.ok ? brand.data?.default_icon_url : null);
   const global = navigation.ok ? navigation.data.items : [];
   placeChrome(navigationView(null, { global, hub: null, local: [] }), place);
   if (!place) rememberChrome();

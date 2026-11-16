@@ -57,6 +57,39 @@ export function countItems(items) {
   return items.reduce((sum, item) => sum + 1 + countItems(item.children ?? []), 0);
 }
 
+// ---- the mega menu: helpers for drawing a site's horizontal navigation as panels (common.js) ----
+
+/**
+ * The columns of the mega panel of a top-level item whose children are `children` (resolved
+ * navigation items, as the server sent them), as `[{heading, items}]` in their order: children
+ * without children of their own run together in one column (`heading` null), and each child
+ * with children heads a column of its own children. Nothing is added or left out.
+ */
+export function megaColumns(children) {
+  const columns = [];
+  for (const child of children ?? []) {
+    if (child.children?.length) columns.push({ heading: child, items: child.children });
+    else if (columns.at(-1)?.heading === null) columns.at(-1).items.push(child);
+    else columns.push({ heading: null, items: [child] });
+  }
+  return columns;
+}
+
+/**
+ * Where focus goes among a mega menu's `count` top-level buttons and links for the key `key`,
+ * from the one at `index`: ArrowRight and ArrowLeft move to the next and previous (wrapping),
+ * Home and End to the first and last. Null for any other key, or when focus is not on one of
+ * them (inside a panel, Tab moves through the links and the arrows are left alone).
+ */
+export function megaStep(key, index, count) {
+  if (!(index >= 0 && index < count)) return null;
+  if (key === 'ArrowRight') return (index + 1) % count;
+  if (key === 'ArrowLeft') return (index - 1 + count) % count;
+  if (key === 'Home') return 0;
+  if (key === 'End') return count - 1;
+  return null;
+}
+
 /** A version-4 UUID for a new item. */
 function freshId() {
   if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();

@@ -330,6 +330,110 @@ export function fontTokens(effectiveFonts) {
   return tokens;
 }
 
+/** A brand font's address: the only place a page loads a font from (the same origin). */
+const FONT_URL = /^\/api\/brand\/fonts\/([0-9a-f]{64})$/;
+
+/** The faces asked for so far, for each `document.fonts`: family to a promise of whether it loaded. */
+const asked = new WeakMap();
+
+/**
+ * Loads one brand font into the page under its generated family name, and answers a promise of
+ * whether it loaded (it never rejects). `family` must be `sc-` and 12 lowercase hexadecimal
+ * characters, and `url` `/api/brand/fonts/` with the 64-character hash whose first 12 characters
+ * are those of `family`; anything else loads nothing. The face is made with the `FontFace` API
+ * (`display: swap`: text shows in the fallback stack until the font arrives) and added to
+ * `document.fonts`, so no markup, `<style>` or Content Security Policy change is needed. A face
+ * that fails to load is taken out of `document.fonts` again, so its roles fall back to the
+ * system stack. A family asked for again answers the first promise. `env` replaces `FontFace`
+ * and `document.fonts` (tests).
+ */
+export function loadFontFace(family, url, env = {}) {
+  const Face = 'FontFace' in env ? env.FontFace : globalThis.FontFace;
+  const fonts = 'fonts' in env ? env.fonts : globalThis.document?.fonts;
+  const sha = typeof url === 'string' ? FONT_URL.exec(url)?.[1] : null;
+  const good = typeof family === 'string' && GENERATED_FAMILY.test(family) && sha && family === `sc-${sha.slice(0, 12)}`;
+  if (!good || typeof Face !== 'function' || typeof fonts?.add !== 'function') return Promise.resolve(false);
+  let known = asked.get(fonts);
+  if (!known) asked.set(fonts, (known = new Map()));
+  if (known.has(family)) return known.get(family);
+  let face;
+  try {
+    face = new Face(family, `url(${url})`, { display: 'swap' });
+    fonts.add(face);
+  } catch {
+    return Promise.resolve(false);
+  }
+  const done = Promise.resolve()
+    .then(() => face.load())
+    .then(
+      () => true,
+      () => {
+        try {
+          fonts.delete?.(face);
+        } catch {
+          // nothing to take away
+        }
+        return false;
+      },
+    );
+  known.set(family, done);
+  return done;
+}
+
+const FONT_VALUES = new Set([SYSTEM, SYSTEM_SERIF]);
+const FONT_VALUE = /^sc-[0-9a-f]{12}, /;
+
+/** Whether `value` may be a `--font-*` variable: a fixed stack, or a generated name before the system stack. */
+function fontValueOk(value) {
+  return typeof value === 'string' && (FONT_VALUES.has(value) || (FONT_VALUE.test(value) && value.slice(17) === SYSTEM));
+}
+
+/** What each root last had set by [`applyFonts`], so that a late failure changes only its own roles. */
+const appliedFonts = new WeakMap();
+
+/**
+ * Puts an effective look's fonts (`{title, heading, body, interactive}`, each `{family, url?}`)
+ * on `root` (`<html>`, or the editor frame's bar and navigation) through `style.setProperty`:
+ * the four variables of [`fontTokens`], each checked again against the fixed forms. A role
+ * whose family is generated takes it only when its address is that font's brand-font address,
+ * and the font is loaded with [`loadFontFace`]; when it fails the role goes back to the system
+ * stack, and nobody is told (readers see the system font). Without fonts (the look could not be
+ * read) the variables are taken away, so the page shows its own. Answers a promise that settles
+ * when every font has loaded or failed.
+ */
+export function applyFonts(root, effectiveFonts, env) {
+  const style = root?.style;
+  if (typeof style?.setProperty !== 'function') return Promise.resolve();
+  if (effectiveFonts == null || typeof effectiveFonts !== 'object') {
+    for (const name of FONT_VARIABLES) style.removeProperty?.(name);
+    appliedFonts.delete(root);
+    return Promise.resolve();
+  }
+  const tokens = fontTokens(effectiveFonts);
+  const loads = [];
+  for (const name of FONT_VARIABLES) {
+    const font = effectiveFonts[name.slice('--font-'.length)];
+    if (!FONT_VALUE.test(tokens[name])) continue;
+    const sha = typeof font?.url === 'string' ? FONT_URL.exec(font.url)?.[1] : null;
+    if (!sha || font.family !== `sc-${sha.slice(0, 12)}`) {
+      tokens[name] = SYSTEM;
+      continue;
+    }
+    const value = tokens[name];
+    loads.push(
+      loadFontFace(font.family, font.url, env).then((ok) => {
+        if (ok || appliedFonts.get(root)?.[name] !== value) return;
+        style.setProperty(name, SYSTEM);
+        appliedFonts.get(root)[name] = SYSTEM;
+      }),
+    );
+  }
+  for (const name of FONT_VARIABLES) if (!fontValueOk(tokens[name])) tokens[name] = SYSTEM;
+  for (const name of FONT_VARIABLES) style.setProperty(name, tokens[name]);
+  appliedFonts.set(root, { ...tokens });
+  return Promise.all(loads).then(() => undefined);
+}
+
 // ---- Change the look: the draft, what Apply sends, the preview and the session ----
 //
 // A draft is a look as the server stores it (`GET /api/sites/{id}/look/settings` answers

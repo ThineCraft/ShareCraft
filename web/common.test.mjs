@@ -2121,3 +2121,269 @@ test('contrast_rows_name_each_failing_pair_with_its_suggestion', () => {
     delete globalThis.document;
   }
 });
+
+// ---- plan 4B: the site's fonts, the tab icon, and the account bar's own fonts ----
+
+import { organisationChrome } from './common.js';
+import { SYSTEM, SYSTEM_SERIF } from './look.js';
+
+const FONT_A = 'c'.repeat(64);
+const FONT_B = 'd'.repeat(64);
+const familyOf = (sha) => `sc-${sha.slice(0, 12)}`;
+const fontUrl = (sha) => `/api/brand/fonts/${sha}`;
+const literal = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+/** Every value a `--font-*` variable may hold: a generated name before a fixed stack, or a stack. */
+const FONT_VALUE = new RegExp(`^(?:sc-[0-9a-f]{12}, )?${literal(SYSTEM)}$|^${literal(SYSTEM_SERIF)}$`);
+const FONT_NAMES = ['--font-title', '--font-heading', '--font-body', '--font-interactive'];
+
+/** A style object set through the CSS object model only. */
+const styled = () => {
+  const props = {};
+  return { props, setProperty: (name, value) => (props[name] = value), removeProperty: (name) => delete props[name] };
+};
+
+/** `FontFace` and `document.fonts` stand-ins: faces in `failing` fail to load. */
+function fontWorld(failing = []) {
+  const made = [];
+  const faces = new Set();
+  globalThis.FontFace = class {
+    constructor(family, source, descriptors) {
+      Object.assign(this, { family, source, descriptors });
+      made.push(this);
+    }
+    load() {
+      return failing.includes(this.family) ? Promise.reject(new Error('network')) : Promise.resolve(this);
+    }
+  };
+  document.fonts = { add: (face) => faces.add(face), delete: (face) => faces.delete(face), has: (face) => faces.has(face) };
+  return { made, faces };
+}
+
+/** A fetch stand-in answering the site, its navigation and the look `effective`. */
+function siteServer(effective) {
+  return async (url) => {
+    const body = url.endsWith('/navigation')
+      ? { global: [], hub: null, local: [], automatic: false }
+      : url.endsWith('/look')
+        ? effective
+        : { id: SITE, name: 'Sales', language: 'en-GB', time_zone: 'Europe/London', kind: 'team', description: '' };
+    return { ok: true, status: 200, json: async () => body };
+  };
+}
+
+const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+test('fonts_applied_only_from_generated_names', async () => {
+  lookDocument();
+  const html = { lang: 'en', style: styled() };
+  const bar = { style: styled() };
+  document.documentElement = html;
+  document.querySelector = (selector) => (selector === '.bar' ? bar : null);
+  const { made, faces } = fontWorld();
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = siteServer(
+    look({
+      fonts: {
+        title: { family: familyOf(FONT_A), url: fontUrl(FONT_A) },
+        heading: { family: 'system-serif' },
+        // user text never becomes a family, and an address must be a brand font of that name
+        body: { family: '"; } body { display:none', url: fontUrl(FONT_B) },
+        interactive: { family: familyOf(FONT_B), url: 'https://evil.example/x.woff2' },
+      },
+    }),
+  );
+  try {
+    const place = document.createElement('div');
+    await siteChrome(SITE, { place });
+    await settle();
+    assert.equal(html.style.props['--font-title'], `${familyOf(FONT_A)}, ${SYSTEM}`);
+    assert.equal(html.style.props['--font-heading'], SYSTEM_SERIF);
+    assert.equal(html.style.props['--font-body'], SYSTEM);
+    assert.equal(html.style.props['--font-interactive'], SYSTEM);
+    for (const name of FONT_NAMES) assert.match(html.style.props[name], FONT_VALUE, name);
+    // Only the one good font is loaded, from the same origin, with swap.
+    assert.equal(made.length, 1);
+    assert.equal(made[0].family, familyOf(FONT_A));
+    assert.equal(made[0].source, `url(${fontUrl(FONT_A)})`);
+    assert.equal(made[0].descriptors.display, 'swap');
+    assert.ok(faces.has(made[0]));
+
+    // A family whose address names another font, and a bad address shape, are refused too.
+    globalThis.fetch = siteServer(
+      look({
+        fonts: {
+          title: { family: familyOf(FONT_B), url: fontUrl(FONT_A) },
+          heading: { family: familyOf(FONT_B), url: `${fontUrl(FONT_B)}?x=1` },
+          body: { family: familyOf(FONT_B).toUpperCase(), url: fontUrl(FONT_B) },
+          interactive: { family: 'system' },
+        },
+      }),
+    );
+    await siteChrome(SITE, { place });
+    await settle();
+    for (const name of FONT_NAMES) assert.equal(html.style.props[name], SYSTEM, name);
+    assert.equal(made.length, 1, 'nothing more is loaded');
+
+    // In the editor frame only the bar and the navigation take the fonts.
+    const framed = { lang: 'en', style: styled() };
+    document.documentElement = framed;
+    const serif = { family: 'system-serif' };
+    globalThis.fetch = siteServer(look({ fonts: { title: serif, heading: serif, body: { family: 'system' }, interactive: { family: 'system' } } }));
+    await siteChrome(SITE, { place, frame: true });
+    assert.deepEqual(framed.style.props, {}, 'the editor page keeps its own fonts');
+    assert.equal(bar.style.props['--font-title'], SYSTEM_SERIF);
+    assert.equal(place.children[0].style.props['--font-heading'], SYSTEM_SERIF);
+  } finally {
+    globalThis.fetch = realFetch;
+    delete globalThis.FontFace;
+    delete globalThis.document;
+  }
+});
+
+test('font_failure_keeps_system_stack', async () => {
+  const all = lookDocument();
+  const html = { lang: 'en', style: styled() };
+  document.documentElement = html;
+  const { made, faces } = fontWorld([familyOf(FONT_A)]);
+  const realFetch = globalThis.fetch;
+  const fonts = {
+    title: { family: familyOf(FONT_A), url: fontUrl(FONT_A) },
+    heading: { family: familyOf(FONT_A), url: fontUrl(FONT_A) },
+    body: { family: familyOf(FONT_B), url: fontUrl(FONT_B) },
+    interactive: { family: 'system' },
+  };
+  globalThis.fetch = siteServer(look({ fonts }));
+  const errors = [];
+  const realError = console.error;
+  console.error = (...args) => errors.push(args);
+  try {
+    const place = document.createElement('div');
+    await siteChrome(SITE, { place });
+    await settle();
+    // The failed font gives its roles the system stack; the one that loaded stays.
+    assert.equal(html.style.props['--font-title'], SYSTEM);
+    assert.equal(html.style.props['--font-heading'], SYSTEM);
+    assert.equal(html.style.props['--font-body'], `${familyOf(FONT_B)}, ${SYSTEM}`);
+    assert.equal(html.style.props['--font-interactive'], SYSTEM);
+    assert.equal(made.filter((face) => face.family === familyOf(FONT_A)).length, 1, 'one face for both roles');
+    assert.ok(!faces.has(made.find((face) => face.family === familyOf(FONT_A))), 'the failed face is taken away');
+    // Readers are told nothing: no message, no error.
+    assert.deepEqual(errors, []);
+    assert.ok(!all.some((element) => /error|message|problem/.test(element.attributes.class ?? '')));
+    // Without FontFace (an old browser) every role keeps the system stack.
+    delete globalThis.FontFace;
+    const older = { lang: 'en', style: styled() };
+    document.documentElement = older;
+    document.fonts = undefined;
+    await siteChrome(SITE, { place });
+    await settle();
+    for (const name of FONT_NAMES) assert.equal(older.style.props[name], SYSTEM, name);
+  } finally {
+    console.error = realError;
+    globalThis.fetch = realFetch;
+    delete globalThis.FontFace;
+    delete globalThis.document;
+  }
+});
+
+test('tab_icon_set_and_replaced', async () => {
+  lookDocument();
+  document.documentElement = { lang: 'en', style: styled() };
+  const icons = () => head.children.filter((child) => child.attributes?.rel === 'icon');
+  const head = {
+    children: [],
+    querySelector(selector) {
+      assert.equal(selector, 'link[rel~="icon"]');
+      return icons()[0] ?? null;
+    },
+    append(...nodes) {
+      this.children.push(...nodes);
+    },
+  };
+  document.head = head;
+  const realFetch = globalThis.fetch;
+  try {
+    const place = document.createElement('div');
+    // A page without an icon link gets one.
+    globalThis.fetch = siteServer(look({ icon_url: IMAGE }));
+    await siteChrome(SITE, { place });
+    assert.equal(icons().length, 1);
+    assert.equal(icons()[0].tag, 'link');
+    assert.equal(icons()[0].attributes.href, IMAGE);
+    // The next look replaces it; null is ShareCraft's own icon.
+    globalThis.fetch = siteServer(look({ icon_url: OTHER_IMAGE }));
+    await siteChrome(SITE, { place });
+    assert.equal(icons().length, 1);
+    assert.equal(icons()[0].attributes.href, OTHER_IMAGE);
+    globalThis.fetch = siteServer(look({ icon_url: null }));
+    await siteChrome(SITE, { place });
+    assert.equal(icons()[0].attributes.href, '/favicon.svg');
+    // Anything but a brand image is never the icon.
+    for (const bad of ['https://evil.example/x.png', 'javascript:alert(1)', fontUrl(FONT_A), `${IMAGE}?x`, 42]) {
+      globalThis.fetch = siteServer(look({ icon_url: bad }));
+      await siteChrome(SITE, { place });
+      assert.equal(icons()[0].attributes.href, '/favicon.svg', String(bad));
+    }
+    assert.equal(icons().length, 1);
+    // In the editor frame too: the tab belongs to the site.
+    globalThis.fetch = siteServer(look({ icon_url: IMAGE }));
+    await siteChrome(SITE, { place, frame: true });
+    assert.equal(icons()[0].attributes.href, IMAGE);
+
+    // Organisation pages: the organisation's default icon, else ShareCraft's own.
+    const orgServer = (brand) => async (url) => {
+      const body = url.endsWith('/brand')
+        ? brand
+        : url.endsWith('/navigation')
+          ? { items: [] }
+          : { default_language: 'en-GB', default_time_zone: 'Europe/London' };
+      const ok = brand !== null || !url.endsWith('/brand');
+      return { ok, status: ok ? 200 : 503, json: async () => body ?? { error: 'unavailable' } };
+    };
+    globalThis.fetch = orgServer({ default_icon_url: OTHER_IMAGE });
+    await organisationChrome({ place });
+    assert.equal(icons()[0].attributes.href, OTHER_IMAGE);
+    globalThis.fetch = orgServer({ default_icon_url: null });
+    await organisationChrome({ place });
+    assert.equal(icons()[0].attributes.href, '/favicon.svg');
+    globalThis.fetch = orgServer(null);
+    await organisationChrome({ place });
+    assert.equal(icons()[0].attributes.href, '/favicon.svg');
+  } finally {
+    globalThis.fetch = realFetch;
+    delete globalThis.document;
+  }
+  // ShareCraft's own icon is the account bar's mark: a static picture with nothing that runs.
+  const favicon = readFileSync(new URL('./favicon.svg', import.meta.url), 'utf8');
+  assert.match(favicon, /^<svg [^>]*xmlns="http:\/\/www\.w3\.org\/2000\/svg"/);
+  assert.match(favicon, /#3156c9/);
+  assert.doesNotMatch(favicon, /<script|\son\w+=|href=|<foreignObject/i);
+  // Every page names it, so a page that draws no chrome still has ShareCraft's icon.
+  for (const page of ['index.html', 'site.html', 'doc.html', 'signin.html', 'link.html']) {
+    const html = readFileSync(new URL(`./${page}`, import.meta.url), 'utf8');
+    assert.match(html, /<link rel="icon" href="\/favicon\.svg">/, page);
+  }
+});
+
+test('account_bar_keeps_system_fonts', () => {
+  const squash = (text) => (text ?? '').replace(/\s+/g, '');
+  const root = declarations(':root');
+  assert.equal(squash(variable(root, '--font-system')), squash(SYSTEM), 'the system stack is the one in look.js');
+  for (const name of FONT_NAMES) assert.equal(variable(root, name), 'var(--font-system)', `${name} defaults to the system stack`);
+  // The page's text takes the roles: body, headings, the site's title and controls.
+  assert.match(variable(root, 'font') ?? '', /var\(--font-body\)$/);
+  assert.equal(variable(declarations('h1'), 'font-family'), 'var(--font-heading)');
+  assert.equal(variable(declarations('.site-name'), 'font-family'), 'var(--font-title)');
+  assert.equal(variable(declarations('button'), 'font-family'), 'var(--font-interactive)');
+  // The account bar and the never-themed parts set every role back to the system stack, and
+  // their own text too (a variable is resolved where it is used, so both are needed).
+  for (const selector of ['.topbar', '.palette', '.inbox', '.toasts', '.upload-tray', '.tabbar', '.shell-sheet']) {
+    const body = declarations(selector);
+    for (const name of FONT_NAMES) assert.equal(variable(body, name), 'var(--font-system)', `${selector} ${name}`);
+    assert.equal(variable(body, 'font-family'), 'var(--font-system)', selector);
+  }
+  // Code and other fixed-width text keep their monospace stacks.
+  for (const selector of ['pre.text', '.copybox input', '.details-text', '.pv-lines']) {
+    assert.match(variable(declarations(selector), 'font') ?? '', /ui-monospace/, selector);
+  }
+});

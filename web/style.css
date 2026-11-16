@@ -15,13 +15,25 @@
 --shadow-2:0 2px 4px light-dark(rgb(16 24 32/.06),rgb(0 0 0/.3)),0 8px 24px light-dark(rgb(16 24 32/.12),rgb(0 0 0/.42));
 --shadow-3:0 4px 8px light-dark(rgb(16 24 32/.08),rgb(0 0 0/.34)),0 18px 48px light-dark(rgb(16 24 32/.2),rgb(0 0 0/.55));
 --ease:cubic-bezier(.2,0,0,1);--dur-fast:120ms;--dur:200ms;
-font:var(--text-md)/var(--leading) ui-sans-serif,system-ui,'Segoe UI',sans-serif;color:var(--text);background:var(--bg)}
+/* the four text roles (plan 4B). A site's look sets them on <html> through setProperty (look.js
+   applyFonts): a generated family name before this stack, or the serif stack; never user text */
+--font-system:ui-sans-serif,system-ui,'Segoe UI',sans-serif;
+--font-title:var(--font-system);--font-heading:var(--font-system);--font-body:var(--font-system);--font-interactive:var(--font-system);
+font:var(--text-md)/var(--leading) var(--font-body);color:var(--text);background:var(--bg)}
 @media (prefers-reduced-motion:reduce){:root{--dur-fast:0s;--dur:0s}}
 /* phones and tablets: every control is a 44 pixel target */
 @media (pointer:coarse){:root{--control-sm:44px;--control:44px}}
 *{box-sizing:border-box}
 body{margin:0;padding:var(--space-5) var(--space-4) 40px;background:var(--bg)}
 input,textarea,button,select{font:inherit;color:inherit}
+/* the text roles: headings, controls and the navigation take the site's fonts; body text takes
+   --font-body from the root. Code and other fixed-width text keep their own monospace stacks */
+h1,h2,h3,h4,h5,h6{font-family:var(--font-heading)}
+button,.button,select,.navbar{font-family:var(--font-interactive)}
+.bar,.chrome{font-family:var(--font-body)}
+/* the account bar and the product's own parts never take a site's fonts: each sets the roles
+   back (for what is inside) and its own text (a variable is resolved where it is used) */
+.topbar,.palette,.inbox,.toasts,.upload-tray,.tabbar,.shell-sheet{--font-title:var(--font-system);--font-heading:var(--font-system);--font-body:var(--font-system);--font-interactive:var(--font-system);font-family:var(--font-system)}
 [hidden]{display:none!important}
 :focus-visible{outline:2px solid var(--accent-ink);outline-offset:2px}
 .frame{max-width:1040px;margin:0 auto;background:var(--paper);border:1px solid var(--line);border-radius:var(--radius-lg);overflow:clip}
@@ -309,6 +321,18 @@ a.navhead{text-decoration:none}
 .navbar .sub{position:absolute;top:100%;left:0;z-index:20;flex-direction:column;align-items:stretch;flex-wrap:nowrap;gap:0;min-width:200px;max-width:min(320px,calc(100vw - 32px));padding:var(--space-1);background:var(--paper);border:1px solid var(--line);border-radius:var(--radius-sm);box-shadow:var(--shadow-2)}
 .navbar .sub li:nth-child(even){background:var(--band)}
 .navbar .mark{margin-left:2px}
+/* the mega menu (a look's menu style, horizontal navigation only): each top-level item with
+   children opens a full-width panel of columns under the bar. In the Menu drawer (phones) the
+   panel is a nested list in the flow, like the dropdowns (below) */
+.navbar.mega{position:relative}
+.navbar.mega li.has-mega{position:static}
+.navbar .mega-panel{position:absolute;top:100%;left:0;right:0;z-index:20;padding:var(--space-3) var(--space-4);background:var(--paper);border:1px solid var(--line);border-radius:var(--radius-md);box-shadow:var(--shadow-2)}
+.navbar .mega-columns{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:var(--space-2) var(--space-5)}
+.navbar .mega-panel ul{flex-direction:column;align-items:stretch;flex-wrap:nowrap;gap:0}
+.navbar .mega-overview{margin:0 0 var(--space-2);font-weight:600}
+.navbar .mega-overview a{display:inline-block;padding:var(--space-1) var(--space-3);border-radius:var(--radius-sm)}
+.navbar .mega-heading{margin:0;padding:var(--space-1) var(--space-3);font-family:var(--font-heading);font-weight:600;color:var(--muted)}
+.navbar .mega-heading a{color:inherit}
 .site-facts .description{white-space:pre-wrap}
 .list .description{color:var(--text);font-size:var(--text-sm)}
 input[type=search]{border:1px solid var(--line);background:var(--paper);border-radius:var(--radius-sm);padding:7px var(--space-3);min-height:var(--control)}
@@ -323,6 +347,10 @@ input[type=search]{border:1px solid var(--line);background:var(--paper);border-r
  .navhead{min-height:var(--control-touch);display:flex;align-items:center}
  .navbar button.sub-toggle{min-height:var(--control-touch);min-width:var(--control-touch)}
  .navbar .sub{position:static;flex-basis:100%;max-width:none;box-shadow:none;border:0;border-left:2px solid var(--line);border-radius:0;margin-left:var(--space-3);padding:0}
+ .navbar.mega li.has-mega{position:relative}
+ .navbar .mega-panel{position:static;flex-basis:100%;box-shadow:none;border:0;border-left:2px solid var(--line);border-radius:0;margin-left:var(--space-3);padding:0}
+ .navbar .mega-columns{display:block}
+ .navbar .mega-overview a,.navbar .mega-heading{min-height:var(--control-touch);display:flex;align-items:center}
  input[type=search]{min-height:var(--control-touch)}
 }
 /* the site directory's filters and a site's facts: fields share the row and wrap; one column when narrow */
@@ -402,7 +430,7 @@ input[type=file]{max-width:100%}
 .site-header[data-background=strong] :focus-visible{outline-color:var(--header-ink)}
 .site-brand{position:relative;display:flex;align-items:center;gap:var(--space-3);min-width:0;color:inherit;font-weight:600;font-size:var(--text-lg);text-decoration:none}
 .site-brand:hover .site-name{text-decoration:underline}
-.site-name{overflow-wrap:anywhere}
+.site-name{overflow-wrap:anywhere;font-family:var(--font-title)}
 .site-logo{display:block;height:32px;width:auto;max-width:240px;object-fit:contain;flex:none}
 .site-header[data-layout=minimal]{min-height:var(--control);padding:var(--space-1) var(--space-3)}
 .site-header[data-layout=minimal] .site-logo{height:24px}
