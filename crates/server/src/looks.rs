@@ -118,12 +118,17 @@ pub(crate) struct LookInput {
     menu: Option<MenuStyle>,
 }
 
-/// The fonts chosen for a look: the font package `from` names (`builtin:<id>`, `org:<id>` or
-/// `site:<id>`), which is copied.
+/// The fonts chosen for a look: exactly one of `from`, the font package it names
+/// (`builtin:<id>`, `org:<id>` or `site:<id>`), which is copied; or `keep: true`, the copy the
+/// look holds now, unchanged (none if it holds none), which still works once its source is
+/// gone.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct FontsChoice {
-    from: String,
+    #[serde(default)]
+    from: Option<String>,
+    #[serde(default)]
+    keep: bool,
 }
 
 /// Which side of a history entry a rollback applies.
@@ -551,10 +556,22 @@ async fn built_look(
         None => (defaults.theme.clone(), defaults.from.clone()),
     };
     let fonts = match input.fonts {
-        Some(choice) => Some(LookFonts {
-            package: source_package(&choice.from, ctx.org, &record.font_packages)?,
-            from: choice.from,
+        Some(FontsChoice {
+            from: Some(from),
+            keep: false,
+        }) => Some(LookFonts {
+            package: source_package(&from, ctx.org, &record.font_packages)?,
+            from,
         }),
+        Some(FontsChoice {
+            from: None,
+            keep: true,
+        }) => record.look.as_ref().and_then(|l| l.fonts.clone()),
+        Some(_) => {
+            return Err(BrandError::InvalidLook(
+                "fonts are given as {from} or {keep: true}".into(),
+            ));
+        }
         None => None,
     };
     let icon = slot_image(ctx, input.icon, ImageKind::Icon).await?;
@@ -1469,7 +1486,9 @@ fn merged<T: Clone + PartialEq>(
 /// Copies the look of the site `from` onto `site` for `actor`, who needs view on `from` and
 /// `manage_site` on `site`: the look itself (its theme, images, fonts and the rest, as
 /// snapshots pinned to `site`), and with `themes` and `fonts` the source's own themes and font
-/// packages too. A copied theme from a site theme that is not copied becomes `custom`. The
+/// packages too. A copied theme from a site theme that is not copied becomes `custom`; fonts
+/// from a package of the source site's own always bring that one package along (as a site package
+/// of the target, held to the policy as site-only fonts), so the copy keeps its source. The
 /// look is checked as any look is, and held to the brand policy; one sites commit records it
 /// with `site.look_changed {name, before, after, copied_from}`. Answers the look settings.
 ///
@@ -1509,17 +1528,31 @@ pub(crate) async fn copy_look(
         } else {
             Vec::new()
         };
-        let made_packages = if fonts {
-            merged(
-                &mut after.font_packages,
-                &source.font_packages,
-                MAX_SITE_FONT_PACKAGES,
-                |p| p.id,
-                |p| &p.name,
-            )?
+        // The source's own packages when asked; otherwise still the one its look's fonts came
+        // from, so the copy keeps a source in the target (and is held to the policy as
+        // site-only fonts).
+        let looks_package: Vec<FontPackage> = source
+            .look
+            .as_ref()
+            .and_then(|l| l.fonts.as_ref())
+            .and_then(|f| f.from.strip_prefix("site:"))
+            .and_then(|id| Uuid::parse_str(id).ok())
+            .and_then(|id| source.font_packages.iter().find(|p| p.id == id))
+            .cloned()
+            .into_iter()
+            .collect();
+        let brought: &[FontPackage] = if fonts {
+            &source.font_packages
         } else {
-            Vec::new()
+            &looks_package
         };
+        let made_packages = merged(
+            &mut after.font_packages,
+            brought,
+            MAX_SITE_FONT_PACKAGES,
+            |p| p.id,
+            |p| &p.name,
+        )?;
         let mut look = source.look.clone();
         if let Some(look) = &mut look {
             if look.from.starts_with("site:") && !themes {

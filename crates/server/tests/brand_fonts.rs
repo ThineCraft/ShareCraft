@@ -1560,3 +1560,169 @@ async fn reconcile_rebuilds_font_pins() {
         );
     }
 }
+
+#[tokio::test]
+async fn fonts_keep_after_source_package_deleted() {
+    let server = spawn_server().await;
+    let root = server.admin("Root").await;
+    let olive = server.user("Olive").await;
+    let (team, documents, assets) = site_with_assets(&server, &root, "Team").await;
+    grant(&server, &root, &team, &olive, "owner").await;
+    let bytes = woff2(51);
+    let font_id = add_font(
+        &server,
+        &root,
+        &upload(&server, &root, &assets, "Brand.woff2", &bytes).await,
+    )
+    .await;
+    let (status, body) = new_package(
+        &server,
+        &root,
+        json!({ "name": "Brand", "display": { "brand_font": font_id },
+                "roles": roles("display", "display", "system", "system") }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let package = body["id"].as_str().unwrap().to_owned();
+    set_look(
+        &server,
+        &olive,
+        &team,
+        json!({ "theme": { "from": "builtin:plum" },
+                "fonts": { "from": format!("org:{package}") } }),
+    )
+    .await;
+    let kept_fonts = settings(&server, &olive, &team).await["look"]["fonts"].clone();
+
+    // The source package is deleted: naming it fails, keeping the copy works.
+    let (status, _) = call(
+        &server,
+        Some(&root),
+        Method::DELETE,
+        &format!("/api/brand/font-packages/{package}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, body) = put_look(
+        &server,
+        &olive,
+        &team,
+        json!({ "theme": { "from": "builtin:forest" },
+                "fonts": { "from": format!("org:{package}") } }),
+    )
+    .await;
+    assert_eq!(
+        (status, &body["error"]),
+        (StatusCode::UNPROCESSABLE_ENTITY, &json!("invalid_look"))
+    );
+    let answer = set_look(
+        &server,
+        &olive,
+        &team,
+        json!({ "theme": { "from": "builtin:forest" }, "fonts": { "keep": true } }),
+    )
+    .await;
+    assert_eq!(answer["look"]["fonts"], kept_fonts);
+    assert_eq!(answer["look"]["from"], "builtin:forest");
+    assert_eq!(
+        effective(&server, &olive, &team).await["fonts"]["title"]["url"],
+        font_url(&bytes)
+    );
+    assert_eq!(
+        server.records_db().brand_pins(&team).await.unwrap(),
+        vec![(sha(&bytes), "font/woff2".to_owned())]
+    );
+    // Both ways at once, or neither, are refused.
+    for fonts in [
+        json!({ "keep": true, "from": "builtin:system" }),
+        json!({}),
+        json!({ "keep": false }),
+    ] {
+        let (status, body) = put_look(
+            &server,
+            &olive,
+            &team,
+            json!({ "theme": { "from": "builtin:forest" }, "fonts": fonts }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{fonts}: {body}");
+    }
+
+    // A kept copy is still held to the policy: its source is gone, so it counts as site-only
+    // fonts, which an owner may not keep while they are turned off.
+    let (status, body) = call(
+        &server,
+        Some(&root),
+        Method::PUT,
+        "/api/brand/policy",
+        Some(json!({ "site_fonts": false })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = put_look(
+        &server,
+        &olive,
+        &team,
+        json!({ "theme": { "from": "builtin:plum" }, "fonts": { "keep": true } }),
+    )
+    .await;
+    assert_eq!(
+        (status, &body["error"]),
+        (StatusCode::CONFLICT, &json!("not_allowed"))
+    );
+    set_look(
+        &server,
+        &root,
+        &team,
+        json!({ "theme": { "from": "builtin:plum" }, "fonts": { "keep": true } }),
+    )
+    .await;
+
+    // A site package's copy is kept the same way once the package is gone.
+    let own = woff2(52);
+    let own_doc = upload(&server, &root, &documents, "Own.woff2", &own).await;
+    let (status, body) = new_site_package(
+        &server,
+        &root,
+        &team,
+        json!({ "name": "Ours", "content": { "doc": own_doc, "licence_confirmed": true },
+                "roles": roles("system", "system", "content", "content") }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let site_package = body["id"].as_str().unwrap().to_owned();
+    set_look(
+        &server,
+        &root,
+        &team,
+        json!({ "theme": { "from": "builtin:plum" },
+                "fonts": { "from": format!("site:{site_package}") } }),
+    )
+    .await;
+    let (status, _) = call(
+        &server,
+        Some(&root),
+        Method::DELETE,
+        &format!("/api/sites/{team}/font-packages/{site_package}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let answer = set_look(
+        &server,
+        &root,
+        &team,
+        json!({ "theme": { "from": "builtin:sharecraft" }, "fonts": { "keep": true } }),
+    )
+    .await;
+    assert_eq!(
+        answer["look"]["fonts"]["from"],
+        format!("site:{site_package}")
+    );
+    assert!(server.blobs().contains(&hash(&own)));
+    assert_eq!(
+        effective(&server, &root, &team).await["fonts"]["body"]["url"],
+        font_url(&own)
+    );
+}

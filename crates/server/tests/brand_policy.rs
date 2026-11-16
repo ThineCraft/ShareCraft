@@ -956,8 +956,11 @@ async fn copy_pins_snapshots_and_records_history() {
     let (status, body) = copy(&server, Some(&root), &other, json!({ "from": source })).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let plain = record(&server, &other);
-    assert!(plain.themes.is_empty() && plain.font_packages.is_empty());
+    assert!(plain.themes.is_empty());
     assert_eq!(plain.look.as_ref().unwrap().from, "custom");
+    // The package its fonts came from comes along all the same.
+    assert_eq!(plain.font_packages.len(), 1);
+    assert_eq!(plain.font_packages[0].id.to_string(), package);
 
     // The source lets go of everything: the target keeps its snapshots.
     set_look(
@@ -990,4 +993,105 @@ async fn copy_pins_snapshots_and_records_history() {
         format!("/api/brand/fonts/{}", sha(&font))
     );
     assert_eq!(seen["navigation_menu"], "mega");
+}
+
+/// A source site whose look's fonts come from a package of its own holding a font file from
+/// its own library, made by `root`: the site's id, the package's id and the font's bytes.
+async fn source_with_site_fonts(server: &TestServer, root: &TestUser) -> (String, String, Vec<u8>) {
+    let (source, documents, _) = site_with_assets(server, root, "Source").await;
+    let font = woff2(17);
+    let font_doc = upload(server, root, &documents, "Own.woff2", &font).await;
+    let (status, body) = call(
+        server,
+        Some(root),
+        Method::POST,
+        &format!("/api/sites/{source}/font-packages"),
+        Some(
+            json!({ "name": "Ours", "display": { "doc": font_doc, "licence_confirmed": true },
+                     "roles": roles("display", "display", "system", "system") }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let package = body["id"].as_str().unwrap().to_owned();
+    set_look(
+        server,
+        root,
+        &source,
+        json!({ "theme": { "from": "builtin:plum" },
+                "fonts": { "from": format!("site:{package}") } }),
+    )
+    .await;
+    (source, package, font)
+}
+
+#[tokio::test]
+async fn copy_brings_the_looks_site_font_package() {
+    let server = spawn_server().await;
+    let root = server.admin("Root").await;
+    let olive = server.user("Olive").await;
+    let (source, package, font) = source_with_site_fonts(&server, &root).await;
+    let (target, _, _) = site_with_assets(&server, &root, "Target").await;
+    grant(&server, &root, &target, &olive, "owner").await;
+    grant(&server, &root, &source, &olive, "viewer").await;
+
+    // Without fonts asked for, the one package the look's fonts came from comes along.
+    let (status, body) = copy(&server, Some(&olive), &target, json!({ "from": source })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let copied = record(&server, &target);
+    assert_eq!(copied.font_packages.len(), 1);
+    assert_eq!(copied.font_packages[0].id.to_string(), package);
+    let fonts = copied.look.as_ref().unwrap().fonts.as_ref().unwrap();
+    assert_eq!(fonts.from, format!("site:{package}"));
+    assert_eq!(fonts.package, copied.font_packages[0]);
+    assert_eq!(body["font_packages"][0]["id"], json!(package));
+    assert_eq!(
+        server.records_db().brand_pins(&target).await.unwrap(),
+        vec![(sha(&font), "font/woff2".to_owned())]
+    );
+    // The target's look can be saved again with its fonts named by their new source.
+    set_look(
+        &server,
+        &olive,
+        &target,
+        json!({ "theme": { "from": "builtin:plum" },
+                "fonts": { "from": format!("site:{package}") } }),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn brought_site_font_package_refused_for_owners() {
+    let server = spawn_server().await;
+    let root = server.admin("Root").await;
+    let olive = server.user("Olive").await;
+    let (source, _, _) = source_with_site_fonts(&server, &root).await;
+    let (target, _, _) = site_with_assets(&server, &root, "Target").await;
+    grant(&server, &root, &target, &olive, "owner").await;
+    grant(&server, &root, &source, &olive, "viewer").await;
+    set_policy(&server, &root, json!({ "site_fonts": false })).await;
+    let bytes = record_bytes(&server, &target);
+    let before = tip(&server);
+
+    // The brought package counts as site-only fonts: the copy is refused as a whole.
+    let (status, body) = copy(&server, Some(&olive), &target, json!({ "from": source })).await;
+    let found = problems(status, &body);
+    assert!(
+        mentions(&found, "site-only font packages are turned off"),
+        "{found:?}"
+    );
+    assert_eq!(tip(&server), before);
+    assert_eq!(record_bytes(&server, &target), bytes);
+    assert!(
+        server
+            .records_db()
+            .brand_pins(&target)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    // An administrator is not limited.
+    let (status, body) = copy(&server, Some(&root), &target, json!({ "from": source })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(record(&server, &target).font_packages.len(), 1);
 }
