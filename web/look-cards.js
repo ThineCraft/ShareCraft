@@ -4,7 +4,7 @@
 // to many sites, in words. The templates list, the New site wizard and the admin Sites page draw
 // them (see lookCardElement in look-card-view.js).
 
-import { packageFonts, previewPalettes } from './look.js';
+import { ownLook, packageFonts, previewPalettes } from './look.js';
 
 /** A card's colours: the primary and secondary in light and dark mode, from a page's palettes. */
 function colours(palettes) {
@@ -38,10 +38,13 @@ export function templateLookCard(look, brandFonts = []) {
 }
 
 /**
- * What a card shows for a site's look, from its effective look (`GET /api/sites/{id}/look`):
+ * What a card shows for a site's look, from its effective look (`GET /api/sites/{id}/look`),
+ * with the site's own theme and fonts when it is in a hub (see `ownLook`):
  * `{name, light, dark, fonts, text}`. Null when the look could not be read.
  */
 export function effectiveLookCard(effective, siteName) {
+  // A site in a hub shows the hub's theme and fonts; the card shows the site's own, which a copy gets.
+  effective = ownLook(effective);
   if (!effective?.theme?.light || !effective?.theme?.dark) return null;
   return {
     name: String(siteName ?? ''),

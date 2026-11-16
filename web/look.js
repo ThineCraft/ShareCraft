@@ -434,6 +434,19 @@ export function applyFonts(root, effectiveFonts, env) {
   return Promise.all(loads).then(() => undefined);
 }
 
+/**
+ * The look a site's own record holds, from its effective look (`GET /api/sites/{id}/look`): a
+ * site in a hub shows the hub's theme and fonts, and the answer then gives the site's own as
+ * `own: {theme, fonts}`, which is what copying the site writes. Previews of a copy use this.
+ */
+export function ownLook(effective) {
+  if (!effective || typeof effective !== 'object') return effective;
+  const own = effective.own;
+  if (!own || typeof own !== 'object' || !own.theme) return effective;
+  const { own: _own, ...rest } = effective;
+  return { ...rest, theme: own.theme, fonts: own.fonts ?? rest.fonts, theme_from: 'site' };
+}
+
 /** The four text roles, in the order the font variables are listed. */
 const ROLE_NAMES = Object.freeze(['title', 'heading', 'body', 'interactive']);
 
@@ -915,7 +928,7 @@ export function lookSession({ siteId, settings, themes = [], brandImages = [], s
      */
     effective(siteName) {
       if (!copy) return previewEffective(draft, siteName);
-      const shown = clone(copy.effective);
+      const shown = clone(ownLook(copy.effective));
       if (!shown.logo_alt || shown.logo_alt === copy.name) shown.logo_alt = siteName;
       shown.theme_from = 'site';
       return shown;

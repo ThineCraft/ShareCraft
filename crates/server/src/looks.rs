@@ -1062,7 +1062,9 @@ pub(crate) fn lending_hub_in<'a>(
 /// The effective look of `site` for `actor`, who can see it (access to it, or somewhere inside
 /// it): `{theme: {light, dark}, fonts: {title, heading, body, interactive}, logo_url?,
 /// thumbnail_url?, icon_url, logo_alt, header, navigation, navigation_menu, footer, theme_from:
-/// "site" | "hub", hub?: {id, name, thumbnail_url?}}`. The theme and fonts come from the hub
+/// "site" | "hub", hub?: {id, name, thumbnail_url?}, own?: {theme, fonts}}`. `own`, given only
+/// when the theme and fonts come from a hub, is the site's own theme and fonts, resolved as
+/// `theme` and `fonts` are: what copying the site's look writes. The theme and fonts come from the hub
 /// the site joined, if any (see the module documentation), everything else from the site; `hub`
 /// is named only to people who can see it. An empty logo description is the site's name. The
 /// tab icon is the look's icon, else its thumbnail, else the organisation's default icon; `null`
@@ -1132,6 +1134,17 @@ pub(crate) async fn effective(
     if let Some(map) = out.as_object_mut() {
         map.insert("header".into(), header_out);
         map.insert("footer".into(), footer_out);
+        // A site in a hub shows the hub's theme and fonts; its own (what copying it writes)
+        // are given too, resolved the same way, so a preview of a copy shows what it gets.
+        if hub.is_some() {
+            map.insert(
+                "own".into(),
+                json!({
+                    "theme": palettes(own.look.as_ref()),
+                    "fonts": fonts_out(own.look.as_ref()),
+                }),
+            );
+        }
     }
     if let Some((hub, settings)) = &hub
         && db.path(actor.id, *hub).await?.is_some()

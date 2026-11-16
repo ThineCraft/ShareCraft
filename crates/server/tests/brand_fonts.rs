@@ -1726,3 +1726,63 @@ async fn fonts_keep_after_source_package_deleted() {
         font_url(&own)
     );
 }
+
+#[tokio::test]
+async fn effective_look_gives_a_hub_members_own_theme_and_fonts() {
+    let server = spawn_server().await;
+    let root = server.admin("Root").await;
+    let vic = server.user("Vic").await;
+    let (hub, _, _) = site_with_assets(&server, &root, "Hub").await;
+    let (team, _, _) = site_with_assets(&server, &root, "Team").await;
+    grant(&server, &root, &team, &vic, "viewer").await;
+    set_look(
+        &server,
+        &root,
+        &hub,
+        json!({ "theme": { "from": "builtin:plum" }, "fonts": { "from": "builtin:classic" } }),
+    )
+    .await;
+    set_look(
+        &server,
+        &root,
+        &team,
+        json!({ "theme": { "from": "builtin:forest" } }),
+    )
+    .await;
+    // Outside a hub the effective look is the site's own, and `own` is left out.
+    let alone = effective(&server, &vic, &team).await;
+    assert_eq!(alone["theme_from"], "site");
+    assert!(alone.get("own").is_none(), "{alone}");
+
+    let (status, body) = call(
+        &server,
+        Some(&root),
+        Method::PUT,
+        &format!("/api/sites/{hub}/hub"),
+        Some(json!({ "navigation": [] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = call(
+        &server,
+        Some(&root),
+        Method::PUT,
+        &format!("/api/sites/{team}/joined-hub"),
+        Some(json!({ "hub": hub })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // In the hub the page shows the hub's theme and fonts; `own` gives the site's own, resolved
+    // as the effective look resolves them, which is what copying the site writes.
+    let joined = effective(&server, &vic, &team).await;
+    assert_eq!(joined["theme_from"], "hub");
+    assert_eq!(
+        joined["fonts"]["title"],
+        json!({ "family": "system-serif" })
+    );
+    assert_eq!(joined["own"]["theme"], alone["theme"]);
+    assert_eq!(joined["own"]["fonts"], alone["fonts"]);
+    assert_eq!(joined["own"]["fonts"], system_fonts());
+    assert_ne!(joined["own"]["theme"], joined["theme"]);
+}

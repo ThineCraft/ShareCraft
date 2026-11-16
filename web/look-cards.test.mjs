@@ -115,3 +115,19 @@ test('a brand-centre theme and package make a card', () => {
   assert.equal(brandLookCard({ name: 'Plum', primary: '#7a3e8f', secondary: '#3b2244' }).text, 'The theme Plum, with the system fonts.');
   assert.equal(brandLookCard(null), null);
 });
+
+test('the bulk preview of a site in a hub shows the site’s own look', () => {
+  const hub = { light: { accent: '#7a3e8f', header_bg: '#3b2244' }, dark: { accent: '#c9a0d9', header_bg: '#2a1830' } };
+  const own = { light: { accent: '#2e6b3a', header_bg: '#1d3b24' }, dark: { accent: '#8fd19e', header_bg: '#16301c' } };
+  const system = { title: { family: 'system' }, heading: { family: 'system' }, body: { family: 'system' }, interactive: { family: 'system' } };
+  const effective = {
+    theme: hub,
+    fonts: { title: { family: FAMILY, url: `/api/brand/fonts/${SHA}` }, heading: { family: 'system' }, body: { family: 'system' }, interactive: { family: 'system' } },
+    theme_from: 'hub',
+    own: { theme: own, fonts: system },
+  };
+  const card = effectiveLookCard(effective, 'Member');
+  assert.deepEqual(card.light, { primary: '#2e6b3a', secondary: '#1d3b24' });
+  assert.deepEqual(card.dark, { primary: '#8fd19e', secondary: '#16301c' });
+  assert.deepEqual(card.fonts, system);
+});

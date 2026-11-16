@@ -668,7 +668,7 @@ test('font_tokens_fall_back_to_system', () => {
 
 // ---- Plan 4B pages: specimens, the draft's fonts, icon and menu, and copying a look ----
 
-import { applyFonts, fontAsPackage, packageFonts } from './look.js';
+import { applyFonts, fontAsPackage, ownLook, packageFonts } from './look.js';
 
 /** A stand-in for `FontFace` and `document.fonts` that records every face asked for. */
 function fontEnv() {
@@ -825,4 +825,42 @@ test('copy_dialog_loads_draft_only', async () => {
   assert.equal(archived.status().canApply, false);
   assert.equal((await archived.apply()).ok, false);
   assert.equal(calls.length, 1);
+});
+
+test('copy_preview_shows_a_hub_members_own_look', () => {
+  const SOURCE = '33333333-3333-4333-8333-333333333333';
+  const { calls, send } = sender();
+  const session = lookSession({ siteId: SITE_ID, settings: settingsOf(STORED), themes: THEMES, brandImages: [], send });
+  const hubTheme = {
+    light: { accent: '#7a3e8f', accent_ink: '#7a3e8f', on_accent: '#ffffff', header_bg: '#3b2244', header_ink: '#ffffff' },
+    dark: { accent: '#c9a0d9', accent_ink: '#c9a0d9', on_accent: '#141c20', header_bg: '#2a1830', header_ink: '#ffffff' },
+  };
+  const ownTheme = {
+    light: { accent: '#2e6b3a', accent_ink: '#2e6b3a', on_accent: '#ffffff', header_bg: '#1d3b24', header_ink: '#ffffff' },
+    dark: { accent: '#8fd19e', accent_ink: '#8fd19e', on_accent: '#141c20', header_bg: '#16301c', header_ink: '#ffffff' },
+  };
+  const serif = { title: { family: 'system-serif' }, heading: { family: 'system-serif' }, body: { family: 'system' }, interactive: { family: 'system' } };
+  const system = { title: { family: 'system' }, heading: { family: 'system' }, body: { family: 'system' }, interactive: { family: 'system' } };
+  // A site in a hub: the page shows the hub's theme and fonts, `own` is what a copy writes.
+  const effective = {
+    theme: hubTheme,
+    fonts: serif,
+    logo_alt: 'Member',
+    header: { layout: 'compact', background: 'none', align: 'left', hide_title: false },
+    navigation: 'horizontal',
+    navigation_menu: 'cascading',
+    footer: { enabled: false, layout: 'simple', name: '', background: 'none', groups: [] },
+    theme_from: 'hub',
+    own: { theme: ownTheme, fonts: system },
+  };
+  session.loadCopy({ id: SOURCE, name: 'Member' }, effective, {});
+  const shown = session.effective('Sales');
+  assert.deepEqual(shown.theme, ownTheme, 'the copy preview shows the source site’s own theme');
+  assert.deepEqual(shown.fonts, system, 'and its own fonts');
+  assert.equal(shown.theme_from, 'site');
+  assert.equal('own' in shown, false);
+  assert.equal(calls.length, 0);
+  // Without `own` (a site not in a hub) the effective look is the site's own already.
+  assert.deepEqual(ownLook({ theme: hubTheme, fonts: serif }), { theme: hubTheme, fonts: serif });
+  assert.equal(ownLook(null), null);
 });
