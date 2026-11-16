@@ -19,12 +19,13 @@ use std::time::Duration;
 use collab_core::ids::{DocId, NodeId};
 use common::fake_github::{AUTHOR_NAME, FakeGithub};
 use common::{FileClient, TIMEOUT, TestServer, TestUser, spawn_server_config, start_fake_github};
-use records::{NewSource, Principal, SealedRow, SourceKind, SourceState, SourceStatus};
+use records::{NewSource, NodeKind, Principal, SealedRow, SourceKind, SourceState, SourceStatus};
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 use server::AppState;
 use server::github::git_blob_id;
 use server::source_sync::{SyncError, SyncReport, recover_stale_syncs, sync_once, token_context};
+use server::tree::{self, TreeOp};
 use sqlx::Connection;
 use time::OffsetDateTime;
 
@@ -824,17 +825,22 @@ async fn items_left_unrecorded_by_a_crash_are_adopted_not_duplicated() {
     assert_eq!(items.len(), 3);
 }
 
+/// Changes the tree as `env`'s administrator, outside the sync. Through the tree functions,
+/// as a repair or another server would: the API refuses changes in a connected library.
+async fn outside(env: &Env, op: TreeOp) {
+    let admin = env
+        .server
+        .records_db()
+        .user(env.admin.id)
+        .await
+        .unwrap()
+        .unwrap();
+    tree::apply(&env.state, &admin, op).await.unwrap();
+}
+
 /// Deletes `id` to the recycle bin as `env`'s administrator, outside the sync.
 async fn delete_outside(env: &Env, id: NodeId) {
-    let (status, body) = call(
-        &env.server,
-        &env.admin,
-        Method::DELETE,
-        &format!("/api/nodes/{}", id.0),
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    outside(env, TreeOp::Delete { id }).await;
 }
 
 #[tokio::test]
@@ -1021,15 +1027,16 @@ async fn a_force_push_back_after_a_half_applied_sync_syncs_again() {
     env.synced().await;
     let a = env.node_at("a.md").await;
     // Something not from the repository holds a name the next commit needs.
-    let (status, body) = call(
-        &env.server,
-        &env.admin,
-        Method::POST,
-        &format!("/api/nodes/{}/children", env.library.0),
-        Some(json!({ "kind": "folder", "name": "new.md" })),
+    outside(
+        &env,
+        TreeOp::Create {
+            parent: Some(env.library),
+            kind: NodeKind::Folder,
+            name: "new.md".to_owned(),
+            id: NodeId(uuid::Uuid::new_v4()),
+        },
     )
     .await;
-    assert_eq!(status, StatusCode::CREATED, "{body}");
     env.fake
         .commit("main", &files(&[("a.md", "two"), ("new.md", "new")]));
     let failed = env.sync().await;

@@ -399,17 +399,23 @@ impl Db {
     }
 
     /// The connected library that contains `node` (or is `node`), if it is in one.
+    ///
+    /// One statement: the walk up to the library (as [`Db::library_of`]) and its connection.
     pub async fn source_library_of(&self, node: NodeId) -> Result<Option<NodeId>, DbError> {
-        let Some(library) = self.library_of(node).await? else {
-            return Ok(None);
-        };
-        let connected: bool = sqlx::query_scalar(
-            "select exists (select 1 from library_sources where library_id = $1)",
+        let found: Option<Uuid> = sqlx::query_scalar(
+            "with recursive up(id, parent_id, kind, depth) as ( \
+                 select id, parent_id, kind, 0 from nodes where id = $1 \
+                 union all \
+                 select n.id, n.parent_id, n.kind, up.depth + 1 \
+                 from nodes n join up on n.id = up.parent_id \
+                 where up.kind <> 'library' and up.depth < 10000 \
+             ) select up.id from up join library_sources s on s.library_id = up.id \
+               where up.kind = 'library' limit 1",
         )
-        .bind(library.0)
-        .fetch_one(self.pool())
+        .bind(node.0)
+        .fetch_optional(self.pool())
         .await?;
-        Ok(connected.then_some(library))
+        Ok(found.map(NodeId))
     }
 
     /// Writes the status of the connection of `library`; every field is written as given. A

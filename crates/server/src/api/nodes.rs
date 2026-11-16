@@ -71,8 +71,9 @@ pub(crate) async fn require_not_connected(db: &Db, node: NodeId) -> Result<(), A
 }
 
 /// [`require_not_connected`] for a handler that has not yet checked `user`'s access, so that a
-/// refusal tells nothing to someone who cannot see the place: `404` instead, unless they have
-/// access to `node` or to its connected library (a recycle-bin entry is judged by the library).
+/// refusal tells nothing to someone who cannot see the node: `404` for them, as the other
+/// routes answer. A recycle-bin entry, which nobody has access to as such, is judged by its
+/// connected library instead.
 pub(crate) async fn require_not_connected_for(
     db: &Db,
     user: UserId,
@@ -85,15 +86,28 @@ pub(crate) async fn require_not_connected_for(
     let Some(library) = library else {
         return Ok(());
     };
-    for place in [node, library] {
-        if db
-            .effective_access(user, place)
+    let unavailable = |e: records::DbError| ApiError::unavailable(&e);
+    if db
+        .effective_access(user, node)
+        .await
+        .map_err(unavailable)?
+        .is_some()
+    {
+        return Err(ApiError::SourceReadOnly);
+    }
+    let in_bin = db
+        .node(node)
+        .await
+        .map_err(unavailable)?
+        .is_some_and(|found| found.deleted);
+    if in_bin
+        && db
+            .effective_access(user, library)
             .await
-            .map_err(|e| ApiError::unavailable(&e))?
+            .map_err(unavailable)?
             .is_some()
-        {
-            return Err(ApiError::SourceReadOnly);
-        }
+    {
+        return Err(ApiError::SourceReadOnly);
     }
     Err(ApiError::NotFound)
 }
@@ -121,20 +135,6 @@ pub(crate) async fn seat_access(db: &Db, doc: DocId, access: Option<Access>) -> 
             Some(read_only_seat(access))
         }
     }
-}
-
-/// [`move_one`] for a request: refused (see [`require_not_connected_for`]) when the item or
-/// the place it goes to is in a connected library. A move out takes an item out of the
-/// mirror, and a move in adds one, so both are refused.
-pub(crate) async fn move_checked(
-    state: &AppState,
-    actor: &User,
-    id: NodeId,
-    parent: NodeId,
-) -> Result<Node, ApiError> {
-    require_not_connected_for(state.db(), actor.id, id).await?;
-    require_not_connected_for(state.db(), actor.id, parent).await?;
-    move_one(state, actor, id, parent).await
 }
 
 /// [`delete_one`] for a request: refused when the item is in a connected library.
@@ -627,14 +627,16 @@ pub(crate) async fn copy(
     let id = node_id(&id)?;
     let parent = node_id(&body.parent)?;
     let actor = signed.session.user;
+    // Into a connected library: refused. Out of one: an ordinary copy.
+    require_not_connected_for(state.db(), actor.id, parent).await?;
     let copied =
         to_completion(async move { copy_one(&state, &actor, id, parent, body.name).await }).await?;
     Ok((StatusCode::CREATED, Json(copied)).into_response())
 }
 
 /// Copies `id` into `parent` for `actor`, named `name` or as it is. Run inside
-/// [`to_completion`]. A copy into a connected library is refused (`409 source_read_only`); a
-/// copy out of one is an ordinary copy.
+/// [`to_completion`]. The caller refuses a copy into a connected library first (see
+/// [`require_not_connected_for`]); a copy out of one is an ordinary copy.
 pub(crate) async fn copy_one(
     state: &AppState,
     actor: &User,
@@ -642,7 +644,6 @@ pub(crate) async fn copy_one(
     parent: NodeId,
     name: Option<String>,
 ) -> Result<Copied, ApiError> {
-    require_not_connected_for(state.db(), actor.id, parent).await?;
     let applied = tree::apply(state, actor, TreeOp::Copy { id, parent, name })
         .await
         .map_err(|e| match e {

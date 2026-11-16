@@ -13,7 +13,9 @@ use collab_core::ids::NodeId;
 use records::{FileType, ScanState};
 use serde::{Deserialize, Serialize};
 
-use super::nodes::{copy_one, delete_checked, move_checked, node_id, restore_checked};
+use super::nodes::{
+    copy_one, delete_checked, move_one, node_id, require_not_connected_for, restore_checked,
+};
 use super::{ApiError, JsonBody, to_completion};
 use crate::AppState;
 use crate::auth::Signed;
@@ -107,9 +109,17 @@ pub(crate) async fn run(
     let op = body.op;
     let results = to_completion(async move {
         let mut results = Vec::with_capacity(body.items.len());
+        // Where a move or copy goes is judged once for every item: into a connected library,
+        // each is refused as the single-item route refuses it.
+        let into = match parent {
+            Some(parent) => require_not_connected_for(state.db(), actor.id, parent)
+                .await
+                .err(),
+            None => None,
+        };
         for item in body.items {
             let done = match node_id(&item) {
-                Ok(id) => one(&state, &actor, op, id, parent).await,
+                Ok(id) => one(&state, &actor, op, id, parent, into).await,
                 Err(e) => Err(e),
             };
             results.push(match done {
@@ -150,19 +160,31 @@ pub(crate) async fn run(
     Ok(Json(results))
 }
 
-/// Does `op` to `id` for `actor`.
+/// Does `op` to `id` for `actor`. `into` is the refusal of `parent`, judged once by the caller
+/// (`source_read_only` for a connected library).
 async fn one(
     state: &AppState,
     actor: &records::User,
     op: BulkOp,
     id: NodeId,
     parent: Option<NodeId>,
+    into: Option<ApiError>,
 ) -> Result<Done, ApiError> {
     match (op, parent) {
-        (BulkOp::Move, Some(parent)) => move_checked(state, actor, id, parent)
-            .await
-            .map(|_| Done::default()),
+        (BulkOp::Move, Some(parent)) => {
+            // Out of a connected library: refused too.
+            require_not_connected_for(state.db(), actor.id, id).await?;
+            if let Some(refused) = into {
+                return Err(refused);
+            }
+            move_one(state, actor, id, parent)
+                .await
+                .map(|_| Done::default())
+        }
         (BulkOp::Copy, Some(parent)) => {
+            if let Some(refused) = into {
+                return Err(refused);
+            }
             let copied = copy_one(state, actor, id, parent, None).await?;
             Ok(Done {
                 new_id: Some(copied.id().to_owned()),

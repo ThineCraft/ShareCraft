@@ -12,6 +12,11 @@
 //! and [`the_same_routes_work_in_an_ordinary_library`] drive. `Seat` is the editor websocket,
 //! which opens a connected file with a viewer's seat. Every other route that changes something
 //! is `Allowed`, with the reason it does not change the library's files. `Read` changes nothing.
+//!
+//! Accepted race (ruling of 16 November 2026): a handler checks the connection, then writes; a
+//! `connect_source` committed between the two lets that one write through. Connecting needs an
+//! empty library, so only a write into an empty library can slip in, and Task 6's connect route
+//! abandons the library's upload sessions.
 
 #![allow(
     clippy::unwrap_used,
@@ -84,6 +89,7 @@ const ROUTES: &[(&str, Decision)] = &[
     ),
     (
         "DELETE /api/sites/{id}",
+        // Ruling: a lifecycle exception; the library keeps its connection through a restore.
         Allowed("site lifecycle: the whole site goes to the bin, its connection with it"),
     ),
     (
@@ -191,6 +197,7 @@ const ROUTES: &[(&str, Decision)] = &[
     ),
     ("GET /api/templates/{id}/package", Read),
     ("GET /api/sites/{id}/bin", Read),
+    // Ruling: a security and lifecycle exception, purging is always possible.
     (
         "DELETE /api/bin/{id}",
         Allowed(
@@ -317,10 +324,12 @@ const ROUTES: &[(&str, Decision)] = &[
     ("POST /api/admin/users/{id}/enable", Allowed("accounts")),
     ("POST /api/admin/looks/apply", Allowed("sites' looks")),
     ("GET /api/admin/sites", Read),
+    // Ruling: a lifecycle exception; the purge removes the connection, its items and secrets.
     (
         "DELETE /api/admin/sites/{id}",
         Allowed("site lifecycle: purges a deleted site, its connection with it"),
     ),
+    // Ruling: a lifecycle exception, as deleting the site is.
     (
         "POST /api/admin/sites/{id}/restore",
         Allowed("site lifecycle"),
@@ -334,6 +343,7 @@ const ROUTES: &[(&str, Decision)] = &[
         "POST /api/admin/quarantine/{sha256}/release",
         Allowed("lets held content through: its scan state, not the files"),
     ),
+    // Ruling: a security exception; the purge removes the file's item record too.
     (
         "POST /api/admin/quarantine/{sha256}/delete",
         Allowed(
@@ -368,10 +378,30 @@ const MOUNTS: &[&str] = &[
     "nest(\"/l\",crate::links::api_router())",
     // editors.rs: an installed editor's static files, read only.
     "nest_service(\"/editors\",files)",
+    // api/mod.rs: unknown paths answer 404.
+    "fallback(||async{ApiError::NotFound})",
+    // links.rs: unknown link paths answer 404.
+    "fallback(||async{ApiError::LinkNotFound})",
 ];
 
+/// Calls on a router that register something. Any other call whose name mentions one of
+/// [`REGISTERING_WORDS`] fails [`registered`]: it may register routes this parser cannot see.
+const REGISTRATIONS: &[&str] = &[
+    "route",
+    "route_service",
+    "nest",
+    "nest_service",
+    "merge",
+    "fallback",
+    "fallback_service",
+];
+const REGISTERING_WORDS: &[&str] = &["route", "nest", "merge", "fallback", "service"];
+
 /// The routes and mounts registered between `start` and `end` in the source file `file` (below
-/// `crates/server/src`), each route as `METHOD <prefix><path>`.
+/// `crates/server/src`), each route as `METHOD <prefix><path>` (`SERVICE <prefix><path>` for a
+/// `route_service`). Fails on any registration it cannot read: a route without a literal path
+/// or without a method it knows, a method router built otherwise (`any`, `on`, a service), or a
+/// registering call it does not know.
 fn registered(file: &str, start: &str, end: &str, prefix: &str) -> (Vec<String>, Vec<String>) {
     let path = format!("{}/src/{file}", env!("CARGO_MANIFEST_DIR"));
     let text = std::fs::read_to_string(&path).unwrap();
@@ -386,17 +416,30 @@ fn registered(file: &str, start: &str, end: &str, prefix: &str) -> (Vec<String>,
     let mut routes = Vec::new();
     let mut mounts = Vec::new();
     let mut at = 0;
-    while let Some(found) = next_call(body, at) {
-        let (name, open) = found;
+    while let Some((name, open)) = next_call(body, at) {
+        if !REGISTRATIONS.contains(&name.as_str()) {
+            assert!(
+                !REGISTERING_WORDS.iter().any(|w| name.contains(w)),
+                "{file}: cannot classify the routes of `.{name}(`"
+            );
+            at = open + 1;
+            continue;
+        }
         let close = matching(body, open);
         let args = &body[open + 1..close];
-        if name == "route" {
-            let quote = args.find('"').unwrap();
-            let len = args[quote + 1..].find('"').unwrap();
-            let route = &args[quote + 1..quote + 1 + len];
-            let rest = &args[quote + 2 + len..];
-            for method in methods(rest) {
-                routes.push(format!("{method} {prefix}{route}"));
+        if name == "route" || name == "route_service" {
+            let path = literal_path(args)
+                .unwrap_or_else(|| panic!("{file}: a route without a literal path: {args}"));
+            let rest = &args[args.find('"').unwrap_or(0) + path.len() + 2..];
+            if name == "route_service" {
+                routes.push(format!("SERVICE {prefix}{path}"));
+            } else {
+                let found = methods(rest);
+                assert!(
+                    !found.is_empty(),
+                    "{file}: no method found for {path}: {rest}"
+                );
+                routes.extend(found.into_iter().map(|m| format!("{m} {prefix}{path}")));
             }
         } else {
             let squeezed: String = args.chars().filter(|c| !c.is_whitespace()).collect();
@@ -407,18 +450,40 @@ fn registered(file: &str, start: &str, end: &str, prefix: &str) -> (Vec<String>,
     (routes, mounts)
 }
 
-/// The next `.route(`, `.nest(`, `.nest_service(`, `.merge(` or `.fallback_service(` at or
-/// after `at`: its name and where its `(` is.
-fn next_call(body: &str, at: usize) -> Option<(&'static str, usize)> {
-    ["route", "nest", "nest_service", "merge", "fallback_service"]
-        .into_iter()
-        .filter_map(|name| {
-            let needle = format!(".{name}(");
-            body[at..]
-                .find(&needle)
-                .map(|i| (name, at + i + needle.len() - 1))
-        })
-        .min_by_key(|(_, open)| *open)
+/// The string literal that starts `args`, after whitespace.
+fn literal_path(args: &str) -> Option<&str> {
+    let trimmed = args.trim_start();
+    let inner = trimmed.strip_prefix('"')?;
+    let len = inner.find('"')?;
+    Some(&inner[..len])
+}
+
+/// The next method call (`.name(`) at or after `at`: its name and where its `(` is.
+fn next_call(body: &str, at: usize) -> Option<(String, usize)> {
+    let bytes = body.as_bytes();
+    let mut i = at;
+    while let Some(dot) = body[i..].find('.') {
+        let start = i + dot + 1;
+        let mut end = start;
+        while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+            end += 1;
+        }
+        if end > start && end < bytes.len() && bytes[end] == b'(' {
+            return Some((body[start..end].to_owned(), end));
+        }
+        i = start;
+    }
+    None
+}
+
+/// Whether `text` calls `word` (`name(`) as a whole name, not as the end of a longer one.
+fn called(text: &str, word: &str) -> bool {
+    text.match_indices(word).any(|(at, _)| {
+        !text[..at]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_')
+    })
 }
 
 /// Where the `)` that closes the `(` at `open` is.
@@ -459,6 +524,23 @@ fn methods(text: &str) -> Vec<&'static str> {
             from = at + word.len();
         }
     }
+    // Method routers built any other way would hide their methods from this parser.
+    for word in [
+        "any(",
+        "on(",
+        "on_service(",
+        "get_service(",
+        "post_service(",
+    ] {
+        assert!(
+            !called(text, word),
+            "a method router this parser cannot read: {text}"
+        );
+    }
+    assert!(
+        !text.contains("MethodRouter") && !text.contains("method_routing"),
+        "a method router this parser cannot read: {text}"
+    );
     found.sort_unstable();
     found.into_iter().map(|(_, method)| method).collect()
 }
@@ -1234,6 +1316,14 @@ async fn every_content_route_refuses_in_a_connected_library() {
         out
     };
     let outside_before = env.tree(&fx.outside).await;
+    let library_id = NodeId(fx.library.parse().unwrap());
+    let library_before = env
+        .server
+        .records_db()
+        .node(library_id)
+        .await
+        .unwrap()
+        .unwrap();
 
     for (user, who) in [(&env.olive, "owner"), (&env.admin, "administrator")] {
         for row in ROWS {
@@ -1243,6 +1333,20 @@ async fn every_content_route_refuses_in_a_connected_library() {
     }
 
     assert_eq!(env.tree(&fx.library).await, before, "the library changed");
+    // RenameLibrary and DeleteLibrary left the library itself as it was.
+    let library_after = env
+        .server
+        .records_db()
+        .node(library_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        library_after.name, library_before.name,
+        "the library was renamed"
+    );
+    assert!(!library_after.deleted, "the library was deleted");
+    assert_eq!(library_after.parent, library_before.parent);
     let mut revisions_after = Vec::new();
     for (_, id) in &before {
         revisions_after.push(
@@ -1551,6 +1655,67 @@ async fn reading_listing_previewing_and_sharing_still_work() {
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Someone who sees the library but not a folder that keeps its own access learns nothing
+    // about that folder's items from a refused change either: 404, as elsewhere.
+    let carol = env.server.user("Carol Partial").await;
+    let db = env.server.records_db();
+    db.set_node_access(
+        env.admin.id,
+        NodeId(fx.library.parse().unwrap()),
+        Principal::User(carol.id),
+        Some("editor"),
+    )
+    .await
+    .unwrap();
+    let (status, body) = env
+        .call(
+            &env.admin,
+            Method::POST,
+            &format!("/api/nodes/{}/inheritance", fx.other),
+            Some(json!({ "inherit": false })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    db.set_node_access(
+        env.admin.id,
+        NodeId(fx.other.parse().unwrap()),
+        Principal::User(carol.id),
+        None,
+    )
+    .await
+    .unwrap();
+    let hidden = fx.item("kept.txt");
+    let (status, _) = env
+        .call(&carol, Method::GET, &format!("/api/nodes/{hidden}"), None)
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "Carol cannot see kept.txt");
+    for (method, path, body) in [
+        (Method::DELETE, format!("/api/nodes/{hidden}"), None),
+        (
+            Method::PATCH,
+            format!("/api/nodes/{hidden}"),
+            Some(json!({ "name": "x.txt" })),
+        ),
+        (
+            Method::POST,
+            format!("/api/nodes/{}/children", fx.other),
+            Some(json!({ "kind": "folder", "name": "x" })),
+        ),
+    ] {
+        let (status, answered) = env.call(&carol, method, &path, body).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}: {answered}");
+    }
+    // What she can see (a file that still inherits from the library) is refused in words.
+    let answered = env
+        .call(
+            &carol,
+            Method::DELETE,
+            &format!("/api/nodes/{}", fx.item("version.txt")),
+            None,
+        )
+        .await;
+    assert_refused(Act::Delete, "Carol", &answered);
 
     // Someone who cannot see the library learns nothing from a refused change.
     let (status, body) = env
