@@ -6,4 +6,7 @@
 //! threads, sockets or randomness, so the same code serves the browser and the desktop.
 #![forbid(unsafe_code)]
 
+pub mod client;
 pub mod ids;
+#[cfg(feature = "stand-in")]
+pub mod stand_in;
