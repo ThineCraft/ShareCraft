@@ -446,6 +446,12 @@ async fn after_purge(
         .bind(&ids)
         .execute(&mut *conn)
         .await?;
+    // A purged node of a connected library no longer holds its repository path; the next sync
+    // that sees the path adds it afresh.
+    sqlx::query("delete from source_items where node_id = any($1)")
+        .bind(&ids)
+        .execute(&mut *conn)
+        .await?;
     sqlx::query(
         "update access_requests set decided_at = now(), decision = 'closed' \
          where decided_at is null and node_id = any($1)",

@@ -803,7 +803,8 @@ pub(crate) async fn release_hub_rows(
 /// tombstones), in the transaction that purged its rows: the links, access requests and
 /// assignments of its nodes, its groups with their memberships and every assignment naming
 /// them, its upload sessions, its usage row and the pins of its look's brand images; the sites
-/// that joined it as a hub leave it (see [`release_hub_rows`]), and its own row keeps no hub,
+/// that joined it as a hub leave it (see [`release_hub_rows`]), its connected libraries lose
+/// their connection, item records and sealed secrets, and its own row keeps no hub,
 /// no hub it joined, no hub navigation, no look and no themes. Its groups are locked
 /// `FOR UPDATE`, by id, first. Answers the contents its pins named, for the caller to erase
 /// what nothing names any more.
@@ -846,6 +847,32 @@ pub(crate) async fn purge_site_rows(
         .await?;
     sqlx::query("delete from groups where id = any($1)")
         .bind(&groups)
+        .execute(&mut *conn)
+        .await?;
+    // Its connected libraries: their item records, their connections, then the sealed secrets
+    // those connections named (nothing else names a secret).
+    sqlx::query(
+        "delete from source_items where library_id in \
+             (select id from nodes where site_id = $1 and kind = 'library')",
+    )
+    .bind(site.0)
+    .execute(&mut *conn)
+    .await?;
+    let sealed: Vec<(Option<Uuid>, Option<Uuid>)> = sqlx::query_as(
+        "delete from library_sources where library_id in \
+             (select id from nodes where site_id = $1 and kind = 'library') \
+         returning token_secret, webhook_secret",
+    )
+    .bind(site.0)
+    .fetch_all(&mut *conn)
+    .await?;
+    let sealed: Vec<Uuid> = sealed
+        .into_iter()
+        .flat_map(|(token, webhook)| [token, webhook])
+        .flatten()
+        .collect();
+    sqlx::query("delete from secrets where id = any($1)")
+        .bind(&sealed)
         .execute(&mut *conn)
         .await?;
     sqlx::query("delete from upload_sessions where site_id = $1")
