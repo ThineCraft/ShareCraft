@@ -37,7 +37,7 @@ Everything is tested with a small stand-in document, so no GridCraft code is nee
 <li>A new crate, <code>crates/collab-live</code>, holds the library. It does no input or output of its own: the host hands it each frame received and the current time in milliseconds, and it returns the frames to send and what happened. So the same code serves the browser build and the desktop build, and every rule can be tested without a network.</li>
 <li>The wire messages go in a new module of the existing <code>protocol</code> crate, <code>protocol::live</code>, beside the text and file messages.</li>
 <li>The server gets a third kind of room, the live room (<code>crates/server/src/live_room.rs</code>), reached through the existing <code>/ws/docs/{doc_id}</code> address for documents whose editor is listed in a new setting that is empty by default. The server depends on <code>protocol</code> only. It uses <code>collab-live</code> only in its tests.</li>
-<li>The log is kept in four new PostgreSQL tables, added by migration <code>0017_live_log.sql</code>, through a new module <code>crates/records/src/live.rs</code>.</li>
+<li>The log is kept in four new PostgreSQL tables, added by migration <code>0018_live_log.sql</code>, through a new module <code>crates/records/src/live.rs</code>.</li>
 <li>The text room (<code>room.rs</code>) and the file session (<code>file_room.rs</code>) do not change (C15, C17).</li>
 </ul></p>
 <p><strong>Tech stack:</strong> the ShareCraft Rust workspace (edition 2024); <code>serde</code>, <code>serde_json</code>, <code>thiserror</code> and <code>uuid</code> as already used; <code>proptest</code> 1.12.0 for property tests (already a test dependency of <code>collab-text</code>); <code>sqlx</code> and PostgreSQL through <code>records</code>; <code>tokio</code> with paused time for timing tests. No new runtime dependency.</p>
@@ -71,7 +71,7 @@ Everything is tested with a small stand-in document, so no GridCraft code is nee
 <tr><td>Server <code>ws.rs</code> (<code>upgrade</code>, <code>visitor</code>, <code>join_with</code>, <code>recheck_after_join</code>, <code>relay</code>)</td><td>Reused; generalised so a document can be a text, file or live document (<code>Visitor.is_file</code> becomes <code>Visitor.kind</code>).</td></tr>
 <tr><td>Server <code>room.rs</code> registry (<code>Rooms</code>, <code>Link</code>)</td><td>Generalised: <code>Link</code> gains <code>Live(LiveLink)</code> and <code>Rooms</code> gains <code>open_live</code>. The text room itself is unchanged, including its 60-second grace rule, which the live room does not use (C21).</td></tr>
 <tr><td>Server <code>checkpoint.rs</code> (<code>Schedule</code>)</td><td>Not used: the live room writes no checkpoints until G4.</td></tr>
-<tr><td><code>records</code> (<code>Db</code>, <code>TestDb</code>, events)</td><td>Reused. New module <code>live.rs</code> and migration 0017.</td></tr>
+<tr><td><code>records</code> (<code>Db</code>, <code>TestDb</code>, events)</td><td>Reused. New module <code>live.rs</code> and migration 0018.</td></tr>
 </table>
 
 <h2>Proposals in this plan for the owner to check</h2>
@@ -163,7 +163,8 @@ Their details are positions and counts only, never content.</li>
 <li><strong>No computed values cross the wire or are compared by the server</strong>; cross-platform agreement uses entered content only (proofs report, section 10).</li>
 <li><strong>The library</strong> depends only on <code>collab-core</code>, <code>protocol</code>, <code>serde</code>, <code>serde_json</code> and <code>thiserror</code>; MIT or Apache 2.0, no copyleft (section 10). It has no clocks, threads, sockets or randomness of its own, and builds for <code>wasm32-unknown-unknown</code>: add <code>collab-live</code> to <code>WASM_CRATES</code> in <code>xtask/src/main.rs</code>.</li>
 <li><strong>Workspace lints:</strong> no <code>unwrap</code>, <code>expect</code>, <code>panic</code> or slice indexing outside tests; <code>unsafe</code> is forbidden.</li>
-<li><strong>Migrations</strong> keep LF line endings and are never edited once applied (BUILDING.html section 02). The new one is <code>crates/records/migrations/0017_live_log.sql</code>.</li>
+<li><strong>Migration number:</strong> 0018, because the GitHub surfacing plan (branch <code>github-surfacing</code>) already takes 0017. Whichever plan merges second checks the number again and renumbers if needed.</li>
+<li><strong>Migrations</strong> keep LF line endings and are never edited once applied (BUILDING.html section 02). The new one is <code>crates/records/migrations/0018_live_log.sql</code>.</li>
 <li><strong>Checks:</strong> every task ends with <code>cargo xtask check</code> passing. Database tests run through <code>cargo xtask test</code> (it loads <code>TEST_DATABASE_URL</code>); a database test is never skipped.</li>
 <li><strong>Commits</strong> follow the repository's style (<code>feat:</code>, <code>test:</code>, <code>docs:</code>, <code>fix:</code>) and end with <code>Co-Authored-By: Claude Opus 5.5 &lt;noreply@anthropic.com&gt;</code>. Nothing is pushed without the owner's go-ahead.</li>
 </ul>
@@ -192,7 +193,7 @@ Their details are positions and counts only, never content.</li>
 <tr><td><code>crates/protocol/src/live.rs</code> (new)</td><td>Live wire messages and their limits.</td></tr>
 <tr><td><code>crates/collab-live/src/lib.rs</code>, <code>ids.rs</code>, <code>client.rs</code>, <code>stand_in.rs</code> (new)</td><td>The library: identity tables, the client state machine, and the stand-in document (feature <code>stand-in</code>).</td></tr>
 <tr><td><code>crates/collab-live/tests/support/sim.rs</code>, <code>tests/client.rs</code>, <code>tests/convergence.rs</code> (new)</td><td>A small in-memory orderer that plays the server, and the library's tests.</td></tr>
-<tr><td><code>crates/records/migrations/0017_live_log.sql</code>, <code>crates/records/src/live.rs</code> (new); <code>tests/live.rs</code> (new)</td><td>The log in PostgreSQL.</td></tr>
+<tr><td><code>crates/records/migrations/0018_live_log.sql</code>, <code>crates/records/src/live.rs</code> (new); <code>tests/live.rs</code> (new)</td><td>The log in PostgreSQL.</td></tr>
 <tr><td><code>crates/server/src/live_store.rs</code>, <code>live_room.rs</code>, <code>live_cancel.rs</code> (new)</td><td>The storage seam, the room, the cancelling rule.</td></tr>
 <tr><td><code>crates/server/src/room.rs</code>, <code>ws.rs</code>, <code>config.rs</code>, <code>lib.rs</code>, <code>tree.rs</code> (changed)</td><td>Registry, routing, settings, sweeper, purge.</td></tr>
 <tr><td><code>crates/server/tests/live_room.rs</code>, <code>tests/common/live.rs</code> (new)</td><td>End-to-end tests over WebSocket with the real library and the stand-in.</td></tr>
@@ -538,7 +539,7 @@ impl&lt;E: LiveEditor&gt; LiveClient&lt;E&gt; {
 
 <div class="task">
 <h3>Task 7: the log in PostgreSQL</h3>
-<p><strong>Files:</strong> create <code>crates/records/migrations/0017_live_log.sql</code> (LF endings), <code>crates/records/src/live.rs</code>, <code>crates/records/tests/live.rs</code>; modify <code>crates/records/src/lib.rs</code> (module and exports).</p>
+<p><strong>Files:</strong> create <code>crates/records/migrations/0018_live_log.sql</code> (LF endings), <code>crates/records/src/live.rs</code>, <code>crates/records/tests/live.rs</code>; modify <code>crates/records/src/lib.rs</code> (module and exports).</p>
 <p><strong>The migration</strong> (exact columns; comments in the file say what each holds):</p>
 <pre><code>create table live_logs (
   document_id uuid primary key references documents(id) on delete cascade,
@@ -629,10 +630,10 @@ impl Db {
 <li><code>one_open_session_per_document</code>: starting a second open session fails.</li>
 <li><code>places_and_sessions_end</code>: <code>end_live_place(…, Expired)</code> and <code>end_live_session</code> load back as gone and as no open session.</li>
 <li><code>consumed_local_moves_next_local</code>.</li>
-<li><code>migration_0017_upgrades_a_0016_database</code>: <code>TestDb::create_at(Some(16))</code> then <code>migrate()</code> succeeds and <code>load_live</code> works.</li>
+<li><code>migration_0018_upgrades_a_0017_database</code>: <code>TestDb::create_at(Some(17))</code> then <code>migrate()</code> succeeds and <code>load_live</code> works.</li>
 </ul></li>
 <li>Run <code>cargo xtask test -p records --test live</code>: fail. Implement. Pass, and the existing <code>migration_files_have_no_carriage_returns</code> still passes.</li>
-<li>Commit <code>feat: live session log in PostgreSQL (migration 0017)</code>.</li>
+<li>Commit <code>feat: live session log in PostgreSQL (migration 0018)</code>.</li>
 </ol></div>
 
 <div class="task">
@@ -899,7 +900,7 @@ impl Db {
 <div class="task">
 <h3>Task 13: documents and the final check</h3>
 <ol class="steps">
-<li>Add a BUILDING.html section, in plain English with banded tables: what the live room is, that it is off for every document until G5, migration 0017 (one way; back up the data folder and database together first), the new settings, the events, and the retention rule.</li>
+<li>Add a BUILDING.html section, in plain English with banded tables: what the live room is, that it is off for every document until G5, migration 0018 (one way; back up the data folder and database together first), the new settings, the events, and the retention rule.</li>
 <li>Add a progress note to the Stage 2 card in sequencing.html (G2 built, on branch <code>gridcraft-coauthoring-g2</code>, not merged), and a version line.</li>
 <li>Run <code>cargo xtask check</code>: it prints <code>xtask: all checks passed</code>.</li>
 <li>Commit <code>docs: live room and shared library (plan G2)</code>. Ask before pushing or merging.</li>
