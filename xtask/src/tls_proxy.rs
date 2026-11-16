@@ -177,7 +177,8 @@ async fn proxy_connection(
     let path = request_parts
         .next()
         .ok_or_else(|| "request path is missing".to_owned())?;
-    println!("{method} {path}");
+    // Only the first part of the path: link addresses carry their token after it.
+    println!("{method} {}", first_segment(path));
     let rewritten = rewrite_head(&head, client_ip)?;
     let mut upstream = TcpStream::connect(to)
         .await
@@ -210,6 +211,19 @@ async fn read_head(reader: &mut (impl AsyncRead + Unpin)) -> Result<Vec<u8>> {
         if head.ends_with(b"\r\n\r\n") {
             return Ok(head);
         }
+    }
+}
+
+/// The first segment of a request path (`/l/<token>` is shown as `/l/...`), so no link token
+/// reaches the console.
+fn first_segment(path: &str) -> String {
+    let path = path.split(['?', '#']).next().unwrap_or("");
+    let mut parts = path.trim_start_matches('/').splitn(2, '/');
+    let first = parts.next().unwrap_or("");
+    if parts.next().is_some() {
+        format!("/{first}/...")
+    } else {
+        format!("/{first}")
     }
 }
 
@@ -379,6 +393,14 @@ mod tests {
             response,
             b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n"
         );
+    }
+
+    #[test]
+    fn logged_path_hides_tokens() {
+        assert_eq!(first_segment("/l/abcdef"), "/l/...");
+        assert_eq!(first_segment("/api/l/abcdef/children/x"), "/api/...");
+        assert_eq!(first_segment("/signin.html?next=/l/abc"), "/signin.html");
+        assert_eq!(first_segment("/"), "/");
     }
 
     #[test]
