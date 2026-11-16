@@ -17,6 +17,8 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::sites::SiteTheme;
+
 /// The least contrast ratio text needs (WCAG AA for normal text).
 pub const MIN_CONTRAST: f64 = 4.5;
 /// The most themes the brand centre holds.
@@ -59,6 +61,20 @@ pub const IMAGE_MEDIA_TYPES: [&str; 5] = [
     "image/gif",
     "image/svg+xml",
 ];
+/// The most fonts the brand centre holds.
+pub const MAX_ORG_FONTS: usize = 30;
+/// The most font packages the brand centre holds.
+pub const MAX_ORG_FONT_PACKAGES: usize = 20;
+/// The most font packages of one site's own.
+pub const MAX_SITE_FONT_PACKAGES: usize = 10;
+/// The largest font file, in bytes (2 MiB).
+pub const MAX_FONT_BYTES: u64 = 2 * 1024 * 1024;
+/// The largest tab icon, in bytes (256 KiB).
+pub const MAX_ICON_BYTES: u64 = 256 * 1024;
+/// The fewest pixels along either side of a png tab icon.
+pub const MIN_ICON_SIDE: u32 = 32;
+/// The media types a font may have, judged by the content and recorded with it.
+pub const FONT_MEDIA_TYPES: [&str; 4] = ["font/woff2", "font/woff", "font/ttf", "font/otf"];
 /// The format version of `org/brand.json`; currently 1.
 pub const BRAND_SCHEMA: u32 = 1;
 
@@ -736,12 +752,7 @@ impl ImageRef {
     /// ([`MAX_LOGO_BYTES`] or [`MAX_BACKGROUND_BYTES`]).
     #[must_use]
     pub fn problem(&self, max_bytes: u64) -> Option<String> {
-        let hash_ok = self.sha256.len() == 64
-            && self
-                .sha256
-                .bytes()
-                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
-        if !hash_ok {
+        if !is_sha256(&self.sha256) {
             return Some("an image's hash is 64 lowercase hexadecimal characters".to_owned());
         }
         if !IMAGE_MEDIA_TYPES.contains(&self.media_type.as_str()) {
@@ -781,6 +792,326 @@ impl ImageKind {
             ImageKind::Logo | ImageKind::Icon => MAX_LOGO_BYTES,
             ImageKind::Background => MAX_BACKGROUND_BYTES,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Fonts
+
+/// What a font file is, judged by its content (never by its name or the type it was sent as).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FontKind {
+    /// A WOFF2 font (`wOF2`).
+    Woff2,
+    /// A WOFF font (`wOFF`).
+    Woff,
+    /// A TrueType font (`00 01 00 00` or `true`).
+    Ttf,
+    /// An OpenType font with CFF outlines (`OTTO`).
+    Otf,
+}
+
+impl FontKind {
+    /// The media type recorded with a font of this kind: one of [`FONT_MEDIA_TYPES`].
+    #[must_use]
+    pub fn media_type(self) -> &'static str {
+        match self {
+            FontKind::Woff2 => "font/woff2",
+            FontKind::Woff => "font/woff",
+            FontKind::Ttf => "font/ttf",
+            FontKind::Otf => "font/otf",
+        }
+    }
+}
+
+/// What kind of font `bytes` is, from its first four bytes alone: `wOF2` is woff2, `wOFF` woff,
+/// `00 01 00 00` or `true` ttf and `OTTO` otf. Anything else (a web page or picture renamed
+/// `.woff2`, an empty file, a file shorter than four bytes) is `None`.
+#[must_use]
+pub fn sniff_font(bytes: &[u8]) -> Option<FontKind> {
+    match bytes.get(..4)? {
+        b"wOF2" => Some(FontKind::Woff2),
+        b"wOFF" => Some(FontKind::Woff),
+        [0, 1, 0, 0] | b"true" => Some(FontKind::Ttf),
+        b"OTTO" => Some(FontKind::Otf),
+        _ => None,
+    }
+}
+
+/// The family name a page loads a font file under: `sc-` and the first 12 hexadecimal
+/// characters of its SHA-256. It is made from the hash alone, never from a font's name or any
+/// other text a person typed, so it can be written into a style safely. Whatever is passed, the
+/// answer is `sc-` and 12 lowercase hexadecimal characters (a character that is not one is
+/// replaced by `0`, and a short hash is padded with `0`); real hashes are never changed.
+#[must_use]
+pub fn family_name(sha256: &str) -> String {
+    let mut name = String::from("sc-");
+    let digits = sha256
+        .chars()
+        .map(|c| {
+            if c.is_ascii_hexdigit() {
+                c.to_ascii_lowercase()
+            } else {
+                '0'
+            }
+        })
+        .chain(std::iter::repeat('0'));
+    name.extend(digits.take(12));
+    name
+}
+
+/// Whether `text` is a SHA-256 as the records write it: 64 lowercase hexadecimal characters.
+fn is_sha256(text: &str) -> bool {
+    text.len() == 64 && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Who confirmed that the organisation holds the licence of a font, and when.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Licence {
+    /// The account that confirmed it.
+    pub confirmed_by: Uuid,
+    /// When, in seconds since the Unix epoch; positive.
+    pub confirmed_at: i64,
+}
+
+/// A font file: a snapshot of a file's content, like an [`ImageRef`], with a record of the
+/// licence confirmation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FontRef {
+    /// The content's SHA-256, 64 lowercase hexadecimal characters.
+    pub sha256: String,
+    /// The type, judged by the content: one of [`FONT_MEDIA_TYPES`].
+    pub media_type: String,
+    /// The size in bytes; at most [`MAX_FONT_BYTES`].
+    pub bytes: u64,
+    /// The file's name when it was chosen; shown as text only.
+    pub name: String,
+    /// The document it was chosen from.
+    pub from_doc: Uuid,
+    /// Who confirmed the organisation holds its licence, and when.
+    pub licence: Licence,
+}
+
+impl FontRef {
+    /// Why the reference cannot be stored, if so: the hash, the type, the size (1 byte to 2
+    /// MiB), the name (text of 1 to 120 characters) and the licence confirmation.
+    #[must_use]
+    pub fn problem(&self) -> Option<String> {
+        if !is_sha256(&self.sha256) {
+            return Some("a font's hash is 64 lowercase hexadecimal characters".to_owned());
+        }
+        if !FONT_MEDIA_TYPES.contains(&self.media_type.as_str()) {
+            return Some("a font is woff2, woff, ttf or otf".to_owned());
+        }
+        if self.bytes == 0 || self.bytes > MAX_FONT_BYTES {
+            return Some(format!("a font is at most {MAX_FONT_BYTES} bytes"));
+        }
+        if self.licence.confirmed_at <= 0 {
+            return Some("a font needs its licence confirmed".to_owned());
+        }
+        text_problem("font name", &self.name, 1, MAX_IMAGE_NAME_CHARS)
+    }
+}
+
+/// A font of the brand centre.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrandFont {
+    /// The font's lasting identifier.
+    pub id: Uuid,
+    /// The font file.
+    pub font: FontRef,
+}
+
+/// What a text role of a font package is set in. Serialised in kebab case.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FontRole {
+    /// The package's display font; the package must have one.
+    Display,
+    /// The package's content font; the package must have one.
+    Content,
+    /// The system sans-serif fonts.
+    System,
+    /// The system serif fonts.
+    SystemSerif,
+}
+
+/// The font of each of the four text roles of a page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FontRoles {
+    /// The site title.
+    pub title: FontRole,
+    /// Headings.
+    pub heading: FontRole,
+    /// Running text.
+    pub body: FontRole,
+    /// Buttons, tabs and other controls.
+    pub interactive: FontRole,
+}
+
+impl FontRoles {
+    /// The four roles with their names, in the order of the fields.
+    fn named(self) -> [(&'static str, FontRole); 4] {
+        [
+            ("title", self.title),
+            ("heading", self.heading),
+            ("body", self.body),
+            ("interactive", self.interactive),
+        ]
+    }
+}
+
+/// A font package: a display font and a content font, with the four text roles mapped onto
+/// them or onto the system fonts. Every role falls back to the system fonts when a file cannot
+/// be loaded.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FontPackage {
+    /// The package's lasting identifier; the nil identifier in the copy of a built-in package
+    /// that a look holds.
+    pub id: Uuid,
+    /// Its name: 1 to 60 characters, shown as text only.
+    pub name: String,
+    /// The display font, if the package has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<FontRef>,
+    /// The content font, if the package has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<FontRef>,
+    /// What each role is set in; a role names only a font the package has.
+    pub roles: FontRoles,
+}
+
+impl FontPackage {
+    /// Why the package cannot be stored, if so: its name, its font files, and each role, which
+    /// must not name a display or content font the package lacks.
+    #[must_use]
+    pub fn problem(&self) -> Option<String> {
+        if let Some(p) = text_problem("font package name", &self.name, 1, MAX_THEME_NAME_CHARS) {
+            return Some(p);
+        }
+        for (what, font) in [
+            ("display font", &self.display),
+            ("content font", &self.content),
+        ] {
+            if let Some(p) = font.as_ref().and_then(FontRef::problem) {
+                return Some(format!("{what}: {p}"));
+            }
+        }
+        for (role, value) in self.roles.named() {
+            let lacking = match value {
+                FontRole::Display if self.display.is_none() => Some("display"),
+                FontRole::Content if self.content.is_none() => Some("content"),
+                _ => None,
+            };
+            if let Some(font) = lacking {
+                return Some(format!(
+                    "the {role} role uses the {font} font, which this package does not have"
+                ));
+            }
+        }
+        None
+    }
+}
+
+/// A built-in font package: roles only, no files.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BuiltInFontPackage {
+    /// The identifier, `builtin:<name>`.
+    pub id: &'static str,
+    /// The display name.
+    pub name: &'static str,
+    /// What each role is set in; only system fonts.
+    pub roles: FontRoles,
+}
+
+impl BuiltInFontPackage {
+    /// The package as a look keeps its copy: the nil identifier, and no files.
+    #[must_use]
+    pub fn package(&self) -> FontPackage {
+        FontPackage {
+            id: Uuid::nil(),
+            name: self.name.to_owned(),
+            display: None,
+            content: None,
+            roles: self.roles,
+        }
+    }
+}
+
+/// The font packages every installation has: System (today's look) and Classic, which sets
+/// the title and headings in the system serif fonts. Neither needs a file.
+pub const BUILT_IN_FONT_PACKAGES: [BuiltInFontPackage; 2] = [
+    BuiltInFontPackage {
+        id: "builtin:system",
+        name: "System",
+        roles: FontRoles {
+            title: FontRole::System,
+            heading: FontRole::System,
+            body: FontRole::System,
+            interactive: FontRole::System,
+        },
+    },
+    BuiltInFontPackage {
+        id: "builtin:classic",
+        name: "Classic",
+        roles: FontRoles {
+            title: FontRole::SystemSerif,
+            heading: FontRole::SystemSerif,
+            body: FontRole::System,
+            interactive: FontRole::System,
+        },
+    },
+];
+
+/// Whether `text` names where a font package came from: `builtin:system`, `builtin:classic`,
+/// `org:<uuid>` or `site:<uuid>`.
+#[must_use]
+pub fn font_source_ok(text: &str) -> bool {
+    BUILT_IN_FONT_PACKAGES.iter().any(|p| p.id == text)
+        || prefixed_uuid_ok(text, "org:")
+        || prefixed_uuid_ok(text, "site:")
+}
+
+/// Whether `text` is `prefix` and a lowercase hyphenated UUID.
+fn prefixed_uuid_ok(text: &str, prefix: &str) -> bool {
+    text.strip_prefix(prefix)
+        .is_some_and(|id| Uuid::parse_str(id).is_ok_and(|u| u.to_string() == id))
+}
+
+/// Whether the sides of an icon are equal within 10 %.
+fn square_within_a_tenth(width: u32, height: u32) -> bool {
+    let (w, h) = (u64::from(width), u64::from(height));
+    w.max(h) * 10 <= w.min(h) * 11
+}
+
+/// Why `image` cannot be a site's tab icon, if so: it passes the usual image checks with the
+/// icon's size limit ([`MAX_ICON_BYTES`]), is a png or an svg, and is square within 10 %. A png
+/// must say its size and be at least 32 pixels a side; an svg need not say its size.
+#[must_use]
+pub fn icon_problem(image: &ImageRef) -> Option<String> {
+    if let Some(p) = image.problem(MAX_ICON_BYTES) {
+        return Some(p);
+    }
+    let square = || "an icon is square, within 10 %".to_owned();
+    match (image.media_type.as_str(), image.width, image.height) {
+        ("image/png", Some(w), Some(h)) => {
+            if w.min(h) < MIN_ICON_SIDE {
+                Some(format!(
+                    "a png icon is at least {MIN_ICON_SIDE} pixels a side"
+                ))
+            } else {
+                (!square_within_a_tenth(w, h)).then(square)
+            }
+        }
+        ("image/png", _, _) => Some("a png icon needs its size".to_owned()),
+        ("image/svg+xml", Some(w), Some(h)) => (!square_within_a_tenth(w, h)).then(square),
+        ("image/svg+xml", _, _) => None,
+        _ => Some("an icon is a png or an svg".to_owned()),
     }
 }
 
@@ -867,6 +1198,25 @@ pub enum Navigation {
     Vertical,
 }
 
+/// How the children of a top-level link of horizontal navigation are shown.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MenuStyle {
+    /// A dropdown list under the link (the default).
+    #[default]
+    Cascading,
+    /// A full-width panel of columns; horizontal navigation only.
+    Mega,
+}
+
+impl MenuStyle {
+    /// Whether this is the default, which a record leaves out of its file.
+    #[must_use]
+    pub fn is_cascading(&self) -> bool {
+        *self == MenuStyle::Cascading
+    }
+}
+
 /// How much a footer holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -929,7 +1279,19 @@ impl Default for Footer {
     }
 }
 
-/// A site's look: its theme (a copy), logo, header, navigation style and footer.
+/// The fonts of a look: a copy of a font package, so editing or deleting the source never
+/// breaks the site.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LookFonts {
+    /// The copy of the package.
+    pub package: FontPackage,
+    /// Where it came from: `builtin:system`, `builtin:classic`, `org:<uuid>` or `site:<uuid>`.
+    pub from: String,
+}
+
+/// A site's look: its theme (a copy), logo, header, navigation style and footer, and
+/// optionally its fonts, tab icon and menu style.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Look {
@@ -951,6 +1313,17 @@ pub struct Look {
     pub navigation: Navigation,
     /// The footer.
     pub footer: Footer,
+    /// The fonts; `None` (left out of the file) for the system fonts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fonts: Option<LookFonts>,
+    /// The browser-tab icon: a png or an svg, square within 10 %, at most 256 KiB; `None`
+    /// (left out of the file) to use the thumbnail, then the organisation's icon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<ImageRef>,
+    /// How the children of a link of horizontal navigation are shown; left out of the file
+    /// when it is `cascading`.
+    #[serde(default, skip_serializing_if = "MenuStyle::is_cascading")]
+    pub menu: MenuStyle,
 }
 
 impl Default for Look {
@@ -965,6 +1338,9 @@ impl Default for Look {
             header: Header::default(),
             navigation: Navigation::Horizontal,
             footer: Footer::default(),
+            fonts: None,
+            icon: None,
+            menu: MenuStyle::Cascading,
         }
     }
 }
@@ -993,6 +1369,23 @@ impl Look {
         for (what, image) in [("logo", &self.logo), ("thumbnail", &self.thumbnail)] {
             if let Some(p) = image.as_ref().and_then(|i| i.problem(MAX_LOGO_BYTES)) {
                 return Some(format!("{what}: {p}"));
+            }
+        }
+        if let Some(p) = self.icon.as_ref().and_then(icon_problem) {
+            return Some(format!("icon: {p}"));
+        }
+        if self.menu == MenuStyle::Mega && self.navigation != Navigation::Horizontal {
+            return Some("a mega menu needs horizontal navigation".to_owned());
+        }
+        if let Some(fonts) = &self.fonts {
+            if !font_source_ok(&fonts.from) {
+                return Some(
+                    "fonts come from builtin:system, builtin:classic, org:<id> or site:<id>"
+                        .to_owned(),
+                );
+            }
+            if let Some(p) = fonts.package.problem() {
+                return Some(format!("fonts: {p}"));
             }
         }
         self.header_problem().or_else(|| self.footer_problem())
@@ -1086,9 +1479,322 @@ fn theme_source_ok(text: &str) -> bool {
             .iter()
             .any(|t| t.id.strip_prefix("builtin:") == Some(id));
     }
-    text.strip_prefix("org:")
-        .or_else(|| text.strip_prefix("site:"))
-        .is_some_and(|id| Uuid::parse_str(id).is_ok_and(|u| u.to_string() == id))
+    prefixed_uuid_ok(text, "org:") || prefixed_uuid_ok(text, "site:")
+}
+
+// ---------------------------------------------------------------------------------------------
+// Template looks
+
+/// An image a template's look refers to: a brand-centre image by its identifier, never a file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TemplateImage {
+    /// `{"brand_image": id}`.
+    BrandImage(Uuid),
+}
+
+/// A font a template's look refers to: a brand-centre font by its identifier, never a file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TemplateFontRef {
+    /// `{"brand_font": id}`.
+    BrandFont(Uuid),
+}
+
+/// A [`Header`] whose image is a reference.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TemplateHeader {
+    /// The layout.
+    pub layout: HeaderLayout,
+    /// The background.
+    pub background: Background,
+    /// The background image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<TemplateImage>,
+    /// Where the content sits.
+    pub align: Align,
+    /// Whether the site's name is left out because the logo says it.
+    pub hide_title: bool,
+}
+
+/// A [`Footer`] whose logo is a reference.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TemplateFooter {
+    /// Whether the footer is shown.
+    pub enabled: bool,
+    /// The layout.
+    pub layout: FooterLayout,
+    /// A logo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logo: Option<TemplateImage>,
+    /// The name shown.
+    pub name: String,
+    /// The background.
+    pub background: Background,
+    /// The link groups.
+    pub groups: Vec<FooterGroup>,
+}
+
+/// A [`FontPackage`] whose fonts are references, without an identifier.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TemplateFontPackage {
+    /// The package's name.
+    pub name: String,
+    /// The display font.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<TemplateFontRef>,
+    /// The content font.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<TemplateFontRef>,
+    /// What each role is set in.
+    pub roles: FontRoles,
+}
+
+/// The fonts of a template's look.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TemplateFonts {
+    /// The package.
+    pub package: TemplateFontPackage,
+    /// Where the package came from, as in [`LookFonts::from`].
+    pub from: String,
+}
+
+/// A look a template carries: a [`Look`] whose images and fonts are references to brand-centre
+/// entries, so a template holds no files. A site made from the template gets them pinned.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TemplateLook {
+    /// The theme.
+    pub theme: Theme,
+    /// Where the theme came from, as in [`Look::from`].
+    pub from: String,
+    /// The logo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logo: Option<TemplateImage>,
+    /// The logo thumbnail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumbnail: Option<TemplateImage>,
+    /// What the logo shows.
+    pub logo_alt: String,
+    /// The header.
+    pub header: TemplateHeader,
+    /// The navigation style.
+    pub navigation: Navigation,
+    /// The footer.
+    pub footer: TemplateFooter,
+    /// The fonts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fonts: Option<TemplateFonts>,
+    /// The tab icon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<TemplateImage>,
+    /// The menu style.
+    #[serde(default, skip_serializing_if = "MenuStyle::is_cascading")]
+    pub menu: MenuStyle,
+}
+
+impl TemplateLook {
+    /// Why the look cannot be stored, if so: every rule of [`Look::problem`] that does not
+    /// depend on a file (text, layouts, links, theme source, font roles). Whether a reference
+    /// names something the organisation has is for the server to say.
+    #[must_use]
+    pub fn problem(&self) -> Option<String> {
+        self.stand_in().problem(ANY_TEMPLATE_SITE_NAME)
+    }
+
+    /// A [`Look`] with a valid placeholder in each place this look has a reference.
+    fn stand_in(&self) -> Look {
+        let image = |r: &Option<TemplateImage>| {
+            r.map(|_| ImageRef {
+                sha256: "0".repeat(64),
+                media_type: "image/png".to_owned(),
+                bytes: 1,
+                width: Some(MIN_ICON_SIDE),
+                height: Some(MIN_ICON_SIDE),
+                name: "reference".to_owned(),
+                from_doc: Uuid::nil(),
+            })
+        };
+        let font = |r: &Option<TemplateFontRef>| {
+            r.map(|_| FontRef {
+                sha256: "0".repeat(64),
+                media_type: "font/woff2".to_owned(),
+                bytes: 1,
+                name: "reference".to_owned(),
+                from_doc: Uuid::nil(),
+                licence: Licence {
+                    confirmed_by: Uuid::nil(),
+                    confirmed_at: 1,
+                },
+            })
+        };
+        Look {
+            theme: self.theme.clone(),
+            from: self.from.clone(),
+            logo: image(&self.logo),
+            thumbnail: image(&self.thumbnail),
+            logo_alt: self.logo_alt.clone(),
+            header: Header {
+                layout: self.header.layout,
+                background: self.header.background,
+                image: image(&self.header.image),
+                align: self.header.align,
+                hide_title: self.header.hide_title,
+            },
+            navigation: self.navigation,
+            footer: Footer {
+                enabled: self.footer.enabled,
+                layout: self.footer.layout,
+                logo: image(&self.footer.logo),
+                name: self.footer.name.clone(),
+                background: self.footer.background,
+                groups: self.footer.groups.clone(),
+            },
+            fonts: self.fonts.as_ref().map(|f| LookFonts {
+                package: FontPackage {
+                    id: Uuid::nil(),
+                    name: f.package.name.clone(),
+                    display: font(&f.package.display),
+                    content: font(&f.package.content),
+                    roles: f.package.roles,
+                },
+                from: f.from.clone(),
+            }),
+            icon: image(&self.icon),
+            menu: self.menu,
+        }
+    }
+}
+
+/// The site name a template's look is checked with: a template has none.
+const ANY_TEMPLATE_SITE_NAME: &str = "site";
+
+// ---------------------------------------------------------------------------------------------
+// The brand policy
+
+/// The limits on what site owners may choose, kept in the brand centre. The first limit is a
+/// restriction when `true`; the others are permissions and restrict when `false`. Every limit
+/// starts off ([`BrandPolicy::default`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct BrandPolicy {
+    /// Whether the built-in themes are hidden from site owners.
+    pub hide_builtin_themes: bool,
+    /// Whether site owners may choose their own colours.
+    pub custom_colours: bool,
+    /// Whether site owners may make themes only their site offers.
+    pub site_themes: bool,
+    /// Whether site owners may use images from their site's own libraries.
+    pub site_images: bool,
+    /// Whether site owners may make font packages only their site offers.
+    pub site_fonts: bool,
+}
+
+impl Default for BrandPolicy {
+    /// Every limit off: nothing is restricted.
+    fn default() -> BrandPolicy {
+        BrandPolicy {
+            hide_builtin_themes: false,
+            custom_colours: true,
+            site_themes: true,
+            site_images: true,
+            site_fonts: true,
+        }
+    }
+}
+
+impl BrandPolicy {
+    /// Whether every limit is off; a record in that state leaves the policy out of its file.
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        *self == BrandPolicy::default()
+    }
+}
+
+/// Who is changing a site's look. Only site owners are limited by the policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Actor {
+    /// A site owner (a person with `manage_site`, who is neither of the others).
+    Owner,
+    /// A brand manager.
+    BrandManager,
+    /// An administrator.
+    Admin,
+}
+
+/// What `policy` refuses to `actor` in a change of a site's look, in plain words, each problem
+/// once. `site_themes` and `site_packages` are the site-only themes and font packages this
+/// request makes or changes (empty when it makes none). Nothing is refused to a brand manager
+/// or an administrator, and nothing while every limit is off. A look already stored is never
+/// checked again; the policy applies to the next change.
+///
+/// Images need the brand centre's images to be told apart from a site's own: see
+/// [`image_policy_problems`].
+#[must_use]
+pub fn policy_problems(
+    look: &Look,
+    policy: &BrandPolicy,
+    site_themes: &[SiteTheme],
+    site_packages: &[FontPackage],
+    actor: Actor,
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    if actor != Actor::Owner {
+        return problems;
+    }
+    if policy.hide_builtin_themes && look.from.starts_with("builtin:") {
+        problems.push("built-in themes are turned off for site owners".to_owned());
+    }
+    if !policy.custom_colours && look.from == "custom" {
+        problems.push("custom colours are turned off for site owners".to_owned());
+    }
+    if !policy.site_themes && (look.from.starts_with("site:") || !site_themes.is_empty()) {
+        problems.push("site-only themes are turned off for site owners".to_owned());
+    }
+    let site_font_used = look
+        .fonts
+        .as_ref()
+        .is_some_and(|f| f.from.starts_with("site:"));
+    if !policy.site_fonts && (site_font_used || !site_packages.is_empty()) {
+        problems.push("site-only font packages are turned off for site owners".to_owned());
+    }
+    problems
+}
+
+/// What `policy` refuses to `actor` among the images of `look`: with `site_images` off, a site
+/// owner may use only images the brand centre holds (`brand_images`, matched by content), so
+/// each logo, thumbnail, icon, header image or footer logo that is not one is a problem. Nothing
+/// is refused to a brand manager or an administrator, or while the limit is off.
+#[must_use]
+pub fn image_policy_problems(
+    look: &Look,
+    policy: &BrandPolicy,
+    brand_images: &[BrandImage],
+    actor: Actor,
+) -> Vec<String> {
+    if actor != Actor::Owner || policy.site_images {
+        return Vec::new();
+    }
+    [
+        ("logo", &look.logo),
+        ("thumbnail", &look.thumbnail),
+        ("icon", &look.icon),
+        ("header image", &look.header.image),
+        ("footer logo", &look.footer.logo),
+    ]
+    .into_iter()
+    .filter_map(|(slot, image)| {
+        let image = image.as_ref()?;
+        let known = brand_images.iter().any(|b| b.image.sha256 == image.sha256);
+        (!known).then(|| {
+            format!("{slot}: images from the site's own libraries are turned off for site owners")
+        })
+    })
+    .collect()
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1154,6 +1860,19 @@ pub struct OrgBrand {
     pub themes: Vec<OrgTheme>,
     /// The approved brand images.
     pub images: Vec<BrandImage>,
+    /// The approved fonts: at most 30. Left out of the file when there are none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fonts: Vec<BrandFont>,
+    /// The approved font packages: at most 20, names unique ignoring case. Left out of the
+    /// file when there are none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub font_packages: Vec<FontPackage>,
+    /// The organisation's default tab icon: a brand image of kind `icon`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_icon: Option<Uuid>,
+    /// The limits on site owners; left out of the file while every limit is off.
+    #[serde(default, skip_serializing_if = "BrandPolicy::is_default")]
+    pub policy: BrandPolicy,
 }
 
 impl Default for OrgBrand {
@@ -1164,6 +1883,10 @@ impl Default for OrgBrand {
             managers: Vec::new(),
             themes: Vec::new(),
             images: Vec::new(),
+            fonts: Vec::new(),
+            font_packages: Vec::new(),
+            default_icon: None,
+            policy: BrandPolicy::default(),
         }
     }
 }
@@ -1201,9 +1924,50 @@ impl OrgBrand {
         if let Some(p) = self.themes.iter().find_map(|t| t.theme().problem()) {
             return Some(p);
         }
-        self.images
+        if let Some(p) = self
+            .images
             .iter()
             .find_map(|i| i.image.problem(i.kind.max_bytes()))
+        {
+            return Some(p);
+        }
+        self.font_problem()
+    }
+
+    /// The part of [`OrgBrand::problem`] about fonts, font packages and the default icon.
+    fn font_problem(&self) -> Option<String> {
+        if self.fonts.len() > MAX_ORG_FONTS {
+            return Some(format!("at most {MAX_ORG_FONTS} fonts"));
+        }
+        if self.font_packages.len() > MAX_ORG_FONT_PACKAGES {
+            return Some(format!("at most {MAX_ORG_FONT_PACKAGES} font packages"));
+        }
+        if has_duplicates(self.fonts.iter().map(|f| f.id)) {
+            return Some("a font identifier is used twice".to_owned());
+        }
+        if has_duplicates(self.font_packages.iter().map(|p| p.id)) {
+            return Some("a font package identifier is used twice".to_owned());
+        }
+        if has_duplicates(self.font_packages.iter().map(|p| p.name.to_lowercase())) {
+            return Some("font package names are unique, ignoring case".to_owned());
+        }
+        if let Some(p) = self.fonts.iter().find_map(|f| f.font.problem()) {
+            return Some(p);
+        }
+        if let Some(p) = self.font_packages.iter().find_map(FontPackage::problem) {
+            return Some(p);
+        }
+        let is_icon = |id: Uuid| {
+            self.images
+                .iter()
+                .any(|i| i.id == id && i.kind == ImageKind::Icon)
+        };
+        match self.default_icon {
+            Some(id) if !is_icon(id) => {
+                Some("the default icon is a brand image of kind icon".to_owned())
+            }
+            _ => None,
+        }
     }
 }
 
@@ -1219,7 +1983,8 @@ fn has_duplicates<T: Ord>(values: impl Iterator<Item = T>) -> bool {
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
-    clippy::indexing_slicing
+    clippy::indexing_slicing,
+    clippy::field_reassign_with_default
 )]
 mod tests {
     use serde_json::{Value, json};
@@ -1742,6 +2507,7 @@ mod tests {
                     ..image(1234)
                 },
             }],
+            ..OrgBrand::default()
         };
         let text = String::from_utf8(file_bytes(&brand).unwrap()).unwrap();
         let expected = format!(
@@ -1860,5 +2626,849 @@ mod tests {
         let back: Look = serde_json::from_str(&text).unwrap();
         assert_eq!(back, look);
         assert_eq!(file_bytes(&back).unwrap(), text.as_bytes());
+    }
+
+    // ---- Plan 4B: fonts, the policy, icons ------------------------------------------------
+
+    fn font(name: &str) -> FontRef {
+        FontRef {
+            sha256: "cd".repeat(32),
+            media_type: "font/woff2".into(),
+            bytes: 50_000,
+            name: name.into(),
+            from_doc: doc(),
+            licence: Licence {
+                confirmed_by: doc(),
+                confirmed_at: 1_763_200_000,
+            },
+        }
+    }
+
+    fn roles(
+        title: FontRole,
+        heading: FontRole,
+        body: FontRole,
+        interactive: FontRole,
+    ) -> FontRoles {
+        FontRoles {
+            title,
+            heading,
+            body,
+            interactive,
+        }
+    }
+
+    fn package(name: &str) -> FontPackage {
+        FontPackage {
+            id: Uuid::parse_str("33333333-3333-4333-8333-333333333333").unwrap(),
+            name: name.into(),
+            display: Some(font("Display.woff2")),
+            content: Some(font("Content.woff2")),
+            roles: roles(
+                FontRole::Display,
+                FontRole::Display,
+                FontRole::Content,
+                FontRole::System,
+            ),
+        }
+    }
+
+    fn uuid(n: u8) -> Uuid {
+        Uuid::from_bytes([n; 16])
+    }
+
+    #[test]
+    fn font_sniffing() {
+        let table = vectors();
+        let rows = table["font_sniffing"].as_array().unwrap();
+        assert!(rows.len() >= 8);
+        for row in rows {
+            let bytes: Vec<u8> = row["hex"]
+                .as_str()
+                .unwrap()
+                .as_bytes()
+                .chunks(2)
+                .map(|p| u8::from_str_radix(std::str::from_utf8(p).unwrap(), 16).unwrap())
+                .collect();
+            let want = row["kind"].as_str().map(|k| match k {
+                "woff2" => FontKind::Woff2,
+                "woff" => FontKind::Woff,
+                "ttf" => FontKind::Ttf,
+                _ => FontKind::Otf,
+            });
+            assert_eq!(sniff_font(&bytes), want, "{}", row["note"]);
+        }
+        assert_eq!(sniff_font(b"wOF2\0\0\0\0"), Some(FontKind::Woff2));
+        assert_eq!(sniff_font(b"wOFF\0\0\0\0"), Some(FontKind::Woff));
+        assert_eq!(sniff_font(&[0, 1, 0, 0, 9]), Some(FontKind::Ttf));
+        assert_eq!(sniff_font(b"true\0"), Some(FontKind::Ttf));
+        assert_eq!(sniff_font(b"OTTO\0"), Some(FontKind::Otf));
+        // A renamed web page or picture is not a font, whatever its name says.
+        assert_eq!(sniff_font(b"<!doctype html><title>x</title>"), None);
+        assert_eq!(
+            sniff_font(b"<svg xmlns='http://www.w3.org/2000/svg'/>"),
+            None
+        );
+        assert_eq!(sniff_font(b""), None);
+        assert_eq!(sniff_font(b"wOF"), None);
+        assert_eq!(sniff_font(&[0, 1, 0]), None);
+        // Only the start counts, and case matters.
+        assert_eq!(sniff_font(b"woff2"), None);
+        assert_eq!(sniff_font(b" wOF2"), None);
+        assert_eq!(FontKind::Woff2.media_type(), "font/woff2");
+        assert_eq!(FontKind::Woff.media_type(), "font/woff");
+        assert_eq!(FontKind::Ttf.media_type(), "font/ttf");
+        assert_eq!(FontKind::Otf.media_type(), "font/otf");
+        for kind in [
+            FontKind::Woff2,
+            FontKind::Woff,
+            FontKind::Ttf,
+            FontKind::Otf,
+        ] {
+            assert!(FONT_MEDIA_TYPES.contains(&kind.media_type()));
+        }
+    }
+
+    #[test]
+    fn font_package_problems() {
+        assert_eq!(package("Brand pair").problem(), None);
+        // Names are text: markup and CSS are kept as text, never run.
+        assert_eq!(package("<b>x</b>").problem(), None);
+        assert_eq!(package("\"; } body { display:none").problem(), None);
+        for bad in ["", " x", "x ", "a\nb", "a\u{202e}b"] {
+            assert!(package(bad).problem().is_some(), "{bad:?}");
+        }
+        assert_eq!(package(&"n".repeat(60)).problem(), None);
+        assert!(package(&"n".repeat(61)).problem().is_some());
+
+        // A role names only a font the package has.
+        let mut p = package("P");
+        p.display = None;
+        assert!(p.problem().unwrap().contains("display"));
+        let mut p = package("P");
+        p.content = None;
+        assert!(p.problem().unwrap().contains("content"));
+        let mut p = package("P");
+        p.display = None;
+        p.content = None;
+        p.roles = roles(
+            FontRole::System,
+            FontRole::SystemSerif,
+            FontRole::System,
+            FontRole::System,
+        );
+        assert_eq!(p.problem(), None);
+        // Fonts the roles do not use are allowed.
+        let mut p = package("P");
+        p.roles = roles(
+            FontRole::System,
+            FontRole::System,
+            FontRole::System,
+            FontRole::System,
+        );
+        assert_eq!(p.problem(), None);
+
+        // The font files: hash, type, size, name and licence.
+        let broken = |change: fn(&mut FontRef)| {
+            let mut p = package("P");
+            let mut f = font("Display.woff2");
+            change(&mut f);
+            p.display = Some(f);
+            p.problem()
+        };
+        assert!(broken(|f| f.sha256 = "AB".repeat(32)).is_some());
+        assert!(broken(|f| f.sha256 = "ab".repeat(31)).is_some());
+        assert!(broken(|f| f.media_type = "font/eot".into()).is_some());
+        assert!(broken(|f| f.media_type = "text/html".into()).is_some());
+        assert!(broken(|f| f.bytes = 0).is_some());
+        assert_eq!(broken(|f| f.bytes = MAX_FONT_BYTES), None);
+        assert!(broken(|f| f.bytes = MAX_FONT_BYTES + 1).is_some());
+        assert!(broken(|f| f.name = String::new()).is_some());
+        assert!(broken(|f| f.name = "a\u{0}b".into()).is_some());
+        assert_eq!(
+            broken(|f| f.name = "\"; } body { display:none".into()),
+            None
+        );
+        assert!(broken(|f| f.licence.confirmed_at = 0).is_some());
+
+        // The two built-in packages need no files.
+        let [system, classic] = BUILT_IN_FONT_PACKAGES;
+        assert_eq!(system.id, "builtin:system");
+        assert_eq!(classic.id, "builtin:classic");
+        assert_eq!(
+            system.roles,
+            roles(
+                FontRole::System,
+                FontRole::System,
+                FontRole::System,
+                FontRole::System
+            )
+        );
+        assert_eq!(
+            classic.roles,
+            roles(
+                FontRole::SystemSerif,
+                FontRole::SystemSerif,
+                FontRole::System,
+                FontRole::System
+            )
+        );
+        for built_in in BUILT_IN_FONT_PACKAGES {
+            assert_eq!(built_in.package().problem(), None, "{}", built_in.id);
+            assert!(built_in.package().display.is_none());
+            assert!(built_in.package().content.is_none());
+        }
+        assert!(font_source_ok("builtin:system"));
+        assert!(font_source_ok("builtin:classic"));
+        assert!(font_source_ok("org:11111111-1111-4111-8111-111111111111"));
+        assert!(font_source_ok("site:11111111-1111-4111-8111-111111111111"));
+        for bad in ["custom", "builtin:harbour", "org:x", "", "org:", "site:ABC"] {
+            assert!(!font_source_ok(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn family_names_are_generated() {
+        let table = vectors();
+        for row in table["family_names"].as_array().unwrap() {
+            assert_eq!(
+                family_name(row["sha256"].as_str().unwrap()),
+                row["family"].as_str().unwrap()
+            );
+        }
+        assert_eq!(family_name(&"ab".repeat(32)), "sc-abababababab");
+        // Only the first 12 characters count, so equal files share one name.
+        assert_eq!(
+            family_name(&format!("0123456789ab{}", "f".repeat(52))),
+            "sc-0123456789ab"
+        );
+        // Whatever is passed, the answer is `sc-` and 12 lowercase hexadecimal characters.
+        for hostile in [
+            "",
+            "x",
+            "\"; } body { display:none",
+            "<script>alert(1)</script>",
+        ] {
+            let name = family_name(hostile);
+            assert_eq!(name.len(), 15, "{hostile:?} -> {name:?}");
+            assert!(name.starts_with("sc-"));
+            assert!(
+                name[3..]
+                    .bytes()
+                    .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+                "{name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn icon_problems() {
+        let png = |w: u32, h: u32, bytes: u64| ImageRef {
+            media_type: "image/png".into(),
+            width: Some(w),
+            height: Some(h),
+            bytes,
+            ..image(0)
+        };
+        assert_eq!(icon_problem(&png(64, 64, 1000)), None);
+        assert_eq!(icon_problem(&png(32, 32, 1000)), None);
+        assert_eq!(icon_problem(&png(64, 70, 1000)), None);
+        assert_eq!(icon_problem(&png(70, 64, 1000)), None);
+        assert_eq!(icon_problem(&png(512, 512, MAX_ICON_BYTES)), None);
+        // Too small, not square within 10 %, too large, or no size known.
+        assert!(icon_problem(&png(31, 31, 1000)).unwrap().contains("32"));
+        assert!(icon_problem(&png(64, 71, 1000)).unwrap().contains("square"));
+        assert!(icon_problem(&png(71, 64, 1000)).unwrap().contains("square"));
+        assert!(icon_problem(&png(64, 128, 1000)).is_some());
+        assert!(icon_problem(&png(64, 64, MAX_ICON_BYTES + 1)).is_some());
+        assert!(icon_problem(&png(64, 64, 0)).is_some());
+        let no_size = ImageRef {
+            width: None,
+            height: None,
+            ..png(64, 64, 1000)
+        };
+        assert!(icon_problem(&no_size).is_some());
+        // Other formats are not icons.
+        for media in ["image/jpeg", "image/webp", "image/gif"] {
+            let other = ImageRef {
+                media_type: media.into(),
+                ..png(64, 64, 1000)
+            };
+            assert!(icon_problem(&other).is_some(), "{media}");
+        }
+        // An svg may leave its size out; if it has one it is square too.
+        let svg = ImageRef {
+            media_type: "image/svg+xml".into(),
+            width: None,
+            height: None,
+            ..png(64, 64, 1000)
+        };
+        assert_eq!(icon_problem(&svg), None);
+        let small_svg = ImageRef {
+            width: Some(16),
+            height: Some(16),
+            ..svg.clone()
+        };
+        assert_eq!(icon_problem(&small_svg), None);
+        let wide_svg = ImageRef {
+            width: Some(100),
+            height: Some(40),
+            ..svg.clone()
+        };
+        assert!(icon_problem(&wide_svg).is_some());
+        let big_svg = ImageRef {
+            bytes: MAX_ICON_BYTES + 1,
+            ..svg
+        };
+        assert!(icon_problem(&big_svg).is_some());
+        // The usual reference checks still apply (hash, name).
+        let bad_hash = ImageRef {
+            sha256: "nope".into(),
+            ..png(64, 64, 1000)
+        };
+        assert!(icon_problem(&bad_hash).is_some());
+    }
+
+    #[test]
+    fn look_additions_refused() {
+        let mut look = Look::default();
+        look.icon = Some(ImageRef {
+            media_type: "image/jpeg".into(),
+            ..image(1000)
+        });
+        assert!(look.problem("Site").unwrap().starts_with("icon: "));
+        look.icon = None;
+        look.menu = MenuStyle::Mega;
+        assert_eq!(look.problem("Site"), None);
+        look.navigation = Navigation::Vertical;
+        assert!(look.problem("Site").unwrap().contains("horizontal"));
+        look.navigation = Navigation::Horizontal;
+        look.fonts = Some(LookFonts {
+            package: package("Pair"),
+            from: "builtin:harbour".into(),
+        });
+        assert!(look.problem("Site").is_some());
+        look.fonts = Some(LookFonts {
+            package: FontPackage {
+                name: String::new(),
+                ..package("x")
+            },
+            from: "org:11111111-1111-4111-8111-111111111111".into(),
+        });
+        assert!(look.problem("Site").is_some());
+        look.fonts = Some(LookFonts {
+            package: package("Pair"),
+            from: "org:11111111-1111-4111-8111-111111111111".into(),
+        });
+        assert_eq!(look.problem("Site"), None);
+        // A package copied from a built-in one carries the nil identifier and no files.
+        look.fonts = Some(LookFonts {
+            package: BUILT_IN_FONT_PACKAGES[1].package(),
+            from: "builtin:classic".into(),
+        });
+        assert_eq!(look.problem("Site"), None);
+        assert_eq!(BUILT_IN_FONT_PACKAGES[1].package().id, Uuid::nil());
+    }
+
+    #[test]
+    fn org_brand_font_limits_refused() {
+        let entry = |n: u8| BrandFont {
+            id: uuid(n),
+            font: font("F.woff2"),
+        };
+        let mut brand = OrgBrand::default();
+        brand.fonts = (1..=30).map(entry).collect();
+        assert_eq!(brand.problem(), None);
+        brand.fonts.push(entry(31));
+        assert!(brand.problem().unwrap().contains("30"));
+        brand.fonts.truncate(2);
+        brand.fonts[1].id = uuid(1);
+        assert!(brand.problem().is_some());
+        brand.fonts[1].id = uuid(2);
+        brand.fonts[1].font.bytes = 0;
+        assert!(brand.problem().is_some());
+
+        let mut brand = OrgBrand::default();
+        brand.font_packages = (1..=20)
+            .map(|n| FontPackage {
+                id: uuid(n),
+                name: format!("Package {n}"),
+                ..package("x")
+            })
+            .collect();
+        assert_eq!(brand.problem(), None);
+        brand.font_packages.push(FontPackage {
+            id: uuid(21),
+            name: "Package 21".into(),
+            ..package("x")
+        });
+        assert!(brand.problem().unwrap().contains("20"));
+        brand.font_packages.truncate(2);
+        brand.font_packages[1].name = "PACKAGE 1".into();
+        assert!(brand.problem().unwrap().contains("unique"));
+        brand.font_packages[1].name = "Package 2".into();
+        brand.font_packages[1].id = uuid(1);
+        assert!(brand.problem().is_some());
+
+        // The default icon is a brand image of kind icon.
+        let mut brand = OrgBrand::default();
+        brand.images.push(BrandImage {
+            id: uuid(7),
+            kind: ImageKind::Logo,
+            image: image(100),
+        });
+        brand.default_icon = Some(uuid(7));
+        assert!(brand.problem().unwrap().contains("icon"));
+        brand.images[0].kind = ImageKind::Icon;
+        assert_eq!(brand.problem(), None);
+        brand.default_icon = Some(uuid(8));
+        assert!(brand.problem().is_some());
+    }
+
+    #[test]
+    fn policy_problems_by_actor() {
+        let none: [SiteTheme; 0] = [];
+        let no_packages: [FontPackage; 0] = [];
+        let site_theme = SiteTheme {
+            id: uuid(9),
+            name: "Mine".into(),
+            primary: colour("#3156c9"),
+            secondary: colour("#233239"),
+            primary_dark: None,
+            secondary_dark: None,
+            changed_at: 1,
+        };
+        let mut custom = Look::default();
+        custom.from = "custom".into();
+        let site_look = Look {
+            from: format!("site:{}", uuid(9)),
+            ..Look::default()
+        };
+        let site_fonts = Look {
+            fonts: Some(LookFonts {
+                package: package("Pair"),
+                from: format!("site:{}", uuid(4)),
+            }),
+            ..Look::default()
+        };
+
+        // Every limit starts off: nothing is refused to anyone.
+        let open = BrandPolicy::default();
+        assert!(open.is_default());
+        assert!(!open.hide_builtin_themes);
+        assert!(open.custom_colours && open.site_themes && open.site_images && open.site_fonts);
+        for actor in [Actor::Owner, Actor::BrandManager, Actor::Admin] {
+            for look in [&Look::default(), &custom, &site_look, &site_fonts] {
+                assert_eq!(
+                    policy_problems(
+                        look,
+                        &open,
+                        std::slice::from_ref(&site_theme),
+                        &[package("P")],
+                        actor
+                    ),
+                    Vec::<String>::new()
+                );
+            }
+        }
+
+        // Each limit refuses its own thing to a site owner, in words, and only that.
+        let hide = BrandPolicy {
+            hide_builtin_themes: true,
+            ..BrandPolicy::default()
+        };
+        assert!(!hide.is_default());
+        assert_eq!(
+            policy_problems(&Look::default(), &hide, &none, &no_packages, Actor::Owner),
+            ["built-in themes are turned off for site owners"]
+        );
+        let org_look = Look {
+            from: format!("org:{}", uuid(1)),
+            ..Look::default()
+        };
+        assert!(policy_problems(&org_look, &hide, &none, &no_packages, Actor::Owner).is_empty());
+
+        let no_custom = BrandPolicy {
+            custom_colours: false,
+            ..BrandPolicy::default()
+        };
+        assert_eq!(
+            policy_problems(&custom, &no_custom, &none, &no_packages, Actor::Owner),
+            ["custom colours are turned off for site owners"]
+        );
+        assert!(
+            policy_problems(
+                &Look::default(),
+                &no_custom,
+                &none,
+                &no_packages,
+                Actor::Owner
+            )
+            .is_empty()
+        );
+
+        let no_site_themes = BrandPolicy {
+            site_themes: false,
+            ..BrandPolicy::default()
+        };
+        assert_eq!(
+            policy_problems(
+                &site_look,
+                &no_site_themes,
+                &none,
+                &no_packages,
+                Actor::Owner
+            ),
+            ["site-only themes are turned off for site owners"]
+        );
+        // Making a site theme is refused the same way.
+        assert_eq!(
+            policy_problems(
+                &Look::default(),
+                &no_site_themes,
+                std::slice::from_ref(&site_theme),
+                &no_packages,
+                Actor::Owner
+            ),
+            ["site-only themes are turned off for site owners"]
+        );
+
+        let no_site_fonts = BrandPolicy {
+            site_fonts: false,
+            ..BrandPolicy::default()
+        };
+        assert_eq!(
+            policy_problems(
+                &site_fonts,
+                &no_site_fonts,
+                &none,
+                &no_packages,
+                Actor::Owner
+            ),
+            ["site-only font packages are turned off for site owners"]
+        );
+        assert_eq!(
+            policy_problems(
+                &Look::default(),
+                &no_site_fonts,
+                &none,
+                &[package("P")],
+                Actor::Owner
+            ),
+            ["site-only font packages are turned off for site owners"]
+        );
+        // Built-in and organisation packages are always fine.
+        let org_fonts = Look {
+            fonts: Some(LookFonts {
+                package: package("Pair"),
+                from: format!("org:{}", uuid(4)),
+            }),
+            ..Look::default()
+        };
+        assert!(
+            policy_problems(
+                &org_fonts,
+                &no_site_fonts,
+                &none,
+                &no_packages,
+                Actor::Owner
+            )
+            .is_empty()
+        );
+
+        // Everything off at once: one problem for each, none twice.
+        let strict = BrandPolicy {
+            hide_builtin_themes: true,
+            custom_colours: false,
+            site_themes: false,
+            site_images: false,
+            site_fonts: false,
+        };
+        let all = policy_problems(
+            &Look {
+                from: "custom".into(),
+                ..site_fonts.clone()
+            },
+            &strict,
+            std::slice::from_ref(&site_theme),
+            &[package("P")],
+            Actor::Owner,
+        );
+        // Custom colours, a site-only theme made, a site-only package used and one made.
+        assert_eq!(all.len(), 3, "{all:?}");
+        let mut sorted = all.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), all.len());
+        for p in &all {
+            assert!(p.ends_with("turned off for site owners"), "{p}");
+        }
+
+        // Brand managers and administrators are never limited.
+        for actor in [Actor::BrandManager, Actor::Admin] {
+            for look in [&Look::default(), &custom, &site_look, &site_fonts] {
+                assert!(
+                    policy_problems(
+                        look,
+                        &strict,
+                        std::slice::from_ref(&site_theme),
+                        &[package("P")],
+                        actor
+                    )
+                    .is_empty()
+                );
+            }
+        }
+
+        // Images from the site's own libraries are told apart by the brand centre's images.
+        let brand_image = BrandImage {
+            id: uuid(5),
+            kind: ImageKind::Logo,
+            image: image(100),
+        };
+        let own = ImageRef {
+            sha256: "ee".repeat(32),
+            ..image(100)
+        };
+        let mut look = Look::default();
+        look.logo = Some(image(100));
+        look.thumbnail = Some(own.clone());
+        look.icon = Some(own.clone());
+        look.header.layout = HeaderLayout::Extended;
+        look.header.background = Background::Image;
+        look.header.image = Some(own.clone());
+        look.footer.logo = Some(own);
+        let images = std::slice::from_ref(&brand_image);
+        assert!(image_policy_problems(&look, &open, images, Actor::Owner).is_empty());
+        let no_images = BrandPolicy {
+            site_images: false,
+            ..BrandPolicy::default()
+        };
+        let problems = image_policy_problems(&look, &no_images, images, Actor::Owner);
+        assert_eq!(problems.len(), 4, "{problems:?}");
+        assert!(problems.iter().all(|p| p.contains("site's own libraries")));
+        for slot in ["thumbnail", "icon", "header image", "footer logo"] {
+            assert!(problems.iter().any(|p| p.starts_with(slot)), "{slot}");
+        }
+        for actor in [Actor::BrandManager, Actor::Admin] {
+            assert!(image_policy_problems(&look, &no_images, images, actor).is_empty());
+        }
+    }
+
+    /// Records written by plan 4A, as their files are: the new fields must neither appear nor
+    /// change a byte when such a record is read and written back.
+    #[test]
+    fn new_fields_keep_existing_bytes() {
+        let brand = format!(
+            r##"{{
+  "schema": 1,
+  "managers": [
+    "5e5e5e5e-5e5e-45e5-85e5-5e5e5e5e5e5e"
+  ],
+  "themes": [
+    {{
+      "id": "11111111-1111-4111-8111-111111111111",
+      "name": "Dusk",
+      "primary": "#3156c9",
+      "secondary": "#233239",
+      "primary_dark": "#9db4ff",
+      "changed_at": 1763200000
+    }}
+  ],
+  "images": [
+    {{
+      "id": "22222222-2222-4222-8222-222222222222",
+      "kind": "icon",
+      "image": {{
+        "sha256": "{hash}",
+        "media_type": "image/png",
+        "bytes": 1234,
+        "width": 64,
+        "height": 64,
+        "name": "mark.png",
+        "from_doc": "5e5e5e5e-5e5e-45e5-85e5-5e5e5e5e5e5e"
+      }}
+    }}
+  ]
+}}
+"##,
+            hash = "ab".repeat(32)
+        );
+        let record: OrgBrand = serde_json::from_str(&brand).unwrap();
+        assert!(record.fonts.is_empty() && record.font_packages.is_empty());
+        assert_eq!(record.default_icon, None);
+        assert!(record.policy.is_default());
+        assert_eq!(file_bytes(&record).unwrap(), brand.as_bytes());
+
+        let site = r##"{
+  "schema": 1,
+  "id": "44444444-4444-4444-8444-444444444444",
+  "kind": "team",
+  "description": "",
+  "language": "en",
+  "time_zone": "UTC",
+  "template": null,
+  "archived": null,
+  "hub": null,
+  "joined_hub": null,
+  "navigation": null,
+  "look": {
+    "theme": {
+      "name": "ShareCraft",
+      "primary": "#3156c9",
+      "secondary": "#233239"
+    },
+    "from": "builtin:sharecraft",
+    "logo_alt": "",
+    "header": {
+      "layout": "compact",
+      "background": "none",
+      "align": "left",
+      "hide_title": false
+    },
+    "navigation": "horizontal",
+    "footer": {
+      "enabled": false,
+      "layout": "simple",
+      "name": "",
+      "background": "none",
+      "groups": []
+    }
+  },
+  "themes": [
+    {
+      "id": "11111111-1111-4111-8111-111111111111",
+      "name": "Dusk",
+      "primary": "#3156c9",
+      "secondary": "#233239",
+      "changed_at": 1763200000
+    }
+  ]
+}
+"##;
+        let record: crate::sites::SiteRecord = serde_json::from_str(site).unwrap();
+        assert!(record.font_packages.is_empty());
+        let look = record.look.as_ref().unwrap();
+        assert!(look.fonts.is_none() && look.icon.is_none());
+        assert_eq!(look.menu, MenuStyle::Cascading);
+        assert_eq!(file_bytes(&record).unwrap(), site.as_bytes());
+
+        // A bare site and a bare template body too.
+        let bare = r##"{
+  "schema": 1,
+  "id": "44444444-4444-4444-8444-444444444444",
+  "kind": "team",
+  "description": "",
+  "language": "en",
+  "time_zone": "UTC",
+  "template": null,
+  "archived": null,
+  "hub": null,
+  "joined_hub": null,
+  "navigation": null
+}
+"##;
+        let record: crate::sites::SiteRecord = serde_json::from_str(bare).unwrap();
+        assert_eq!(file_bytes(&record).unwrap(), bare.as_bytes());
+        let body = r##"{
+  "kind": "team",
+  "language": "en",
+  "time_zone": "UTC",
+  "libraries": [],
+  "navigation": null
+}
+"##;
+        let record: crate::sites::TemplateBody = serde_json::from_str(body).unwrap();
+        assert!(record.look.is_none());
+        assert_eq!(file_bytes(&record).unwrap(), body.as_bytes());
+
+        // The new fields, once set, are written and read back.
+        let mut brand = OrgBrand::default();
+        brand.fonts = vec![BrandFont {
+            id: uuid(1),
+            font: font("Inter.woff2"),
+        }];
+        brand.font_packages = vec![package("Pair")];
+        brand.default_icon = Some(uuid(2));
+        brand.policy.site_images = false;
+        let text = String::from_utf8(file_bytes(&brand).unwrap()).unwrap();
+        for key in [
+            "\"fonts\"",
+            "\"font_packages\"",
+            "\"default_icon\"",
+            "\"policy\"",
+            "\"licence\"",
+            "\"confirmed_by\"",
+            "\"site_images\": false",
+            // A policy with one limit set keeps every field.
+            "\"hide_builtin_themes\": false",
+        ] {
+            assert!(text.contains(key), "{key}");
+        }
+        let back: OrgBrand = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, brand);
+        assert_eq!(file_bytes(&back).unwrap(), text.as_bytes());
+
+        let mut look = Look::default();
+        look.fonts = Some(LookFonts {
+            package: package("Pair"),
+            from: "builtin:classic".into(),
+        });
+        look.icon = Some(image(500));
+        look.menu = MenuStyle::Mega;
+        let text = String::from_utf8(file_bytes(&look).unwrap()).unwrap();
+        assert!(text.contains("\"menu\": \"mega\""));
+        let back: Look = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, look);
+        assert_eq!(file_bytes(&back).unwrap(), text.as_bytes());
+        let wide = text.replace("\"menu\": \"mega\"", "\"menu\": \"wide\"");
+        assert!(serde_json::from_str::<Look>(&wide).is_err());
+        assert!(serde_json::from_str::<BrandPolicy>(r#"{"extra": true}"#).is_err());
+        assert!(serde_json::from_str::<FontRef>(r#"{"extra": true}"#).is_err());
+    }
+
+    #[test]
+    fn template_look_holds_references_only() {
+        let text = r##"{
+  "theme": {"name": "Dusk", "primary": "#3156c9", "secondary": "#233239"},
+  "from": "org:11111111-1111-4111-8111-111111111111",
+  "logo": {"brand_image": "22222222-2222-4222-8222-222222222222"},
+  "logo_alt": "",
+  "header": {"layout": "compact", "background": "none", "align": "left", "hide_title": false},
+  "navigation": "horizontal",
+  "footer": {"enabled": false, "layout": "simple", "name": "", "background": "none", "groups": []},
+  "fonts": {
+    "package": {
+      "name": "Pair",
+      "display": {"brand_font": "33333333-3333-4333-8333-333333333333"},
+      "roles": {"title": "display", "heading": "display", "body": "system", "interactive": "system"}
+    },
+    "from": "org:44444444-4444-4444-8444-444444444444"
+  }
+}"##;
+        let look: TemplateLook = serde_json::from_str(text).unwrap();
+        assert_eq!(look.problem(), None);
+        assert_eq!(
+            look.logo,
+            Some(TemplateImage::BrandImage(
+                Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap()
+            ))
+        );
+        let back = serde_json::to_value(&look).unwrap();
+        assert_eq!(back, serde_json::from_str::<Value>(text).unwrap());
+        // A file or a pinned snapshot is not a reference.
+        let with_file = text.replace(
+            r#"{"brand_image": "22222222-2222-4222-8222-222222222222"}"#,
+            r#"{"sha256": "ab"}"#,
+        );
+        assert!(serde_json::from_str::<TemplateLook>(&with_file).is_err());
+        // A role cannot name a font the package lacks.
+        let mut bad = look.clone();
+        bad.fonts.as_mut().unwrap().package.roles.body = FontRole::Content;
+        assert!(bad.problem().unwrap().contains("content"));
+        // A bad theme source is refused as in a look.
+        let mut bad = look;
+        bad.from = "javascript:1".into();
+        assert!(bad.problem().is_some());
     }
 }

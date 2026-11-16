@@ -13,7 +13,9 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::brand::{Look, MAX_SITE_THEMES, OrgBrand, OrgTheme};
+use crate::brand::{
+    FontPackage, Look, MAX_SITE_FONT_PACKAGES, MAX_SITE_THEMES, OrgBrand, OrgTheme, TemplateLook,
+};
 use crate::libraries::{LibraryFields, LibraryRecord, library_path};
 use crate::meta::Author;
 use crate::store::{
@@ -112,6 +114,10 @@ pub struct SiteRecord {
     /// Left out of the file when there are none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub themes: Vec<SiteTheme>,
+    /// Its own font packages, which only this site offers: at most 10, names unique ignoring
+    /// case. Left out of the file when there are none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub font_packages: Vec<FontPackage>,
 }
 
 /// A site's own theme: the same shape as a brand-centre theme (an identifier, the theme and
@@ -149,7 +155,30 @@ impl SiteRecord {
         if ids.len() != self.themes.len() || names.len() != self.themes.len() {
             return Some("site theme identifiers and names (ignoring case) are unique".to_owned());
         }
-        self.themes.iter().find_map(|t| t.theme().problem())
+        if let Some(p) = self.themes.iter().find_map(|t| t.theme().problem()) {
+            return Some(p);
+        }
+        if self.font_packages.len() > MAX_SITE_FONT_PACKAGES {
+            return Some(format!(
+                "at most {MAX_SITE_FONT_PACKAGES} site font packages"
+            ));
+        }
+        let mut ids: Vec<Uuid> = self.font_packages.iter().map(|p| p.id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        let mut names: Vec<String> = self
+            .font_packages
+            .iter()
+            .map(|p| p.name.to_lowercase())
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        if ids.len() != self.font_packages.len() || names.len() != self.font_packages.len() {
+            return Some(
+                "site font package identifiers and names (ignoring case) are unique".to_owned(),
+            );
+        }
+        self.font_packages.iter().find_map(FontPackage::problem)
     }
 }
 
@@ -220,6 +249,10 @@ pub struct TemplateBody {
     pub libraries: Vec<TemplateLibrary>,
     /// The site's navigation; `None` for automatic.
     pub navigation: Option<Vec<TemplateNavItem>>,
+    /// The look the site gets, with references to brand-centre images and fonts instead of
+    /// files; left out of the file when the template carries none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub look: Option<TemplateLook>,
 }
 
 /// Contents of `templates/<xx>/<id>.json`: a template saved from a site or imported. Field
@@ -678,6 +711,7 @@ mod tests {
             navigation: None,
             look: None,
             themes: Vec::new(),
+            font_packages: Vec::new(),
         }
     }
 
@@ -897,6 +931,7 @@ mod tests {
                     audience: vec!["members".into()],
                     children: Vec::new(),
                 }]),
+                look: None,
             },
         };
         let navigation = OrgNavigation {

@@ -303,6 +303,7 @@ async fn old_site_reads_defaults_and_writes_on_first_change() {
             navigation: None,
             look: None,
             themes: Vec::new(),
+            font_packages: Vec::new(),
         }
     );
     let (_, body) = show(&server, &root, &id).await;

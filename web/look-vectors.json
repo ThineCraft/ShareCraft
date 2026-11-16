@@ -418,5 +418,80 @@
         }
       }
     }
-  ]
+  ],
+  "font_sniffing": [
+    {
+      "note": "woff2",
+      "hex": "774f46320001000000",
+      "kind": "woff2"
+    },
+    {
+      "note": "woff",
+      "hex": "774f4646000100000000",
+      "kind": "woff"
+    },
+    {
+      "note": "ttf with 00 01 00 00",
+      "hex": "0001000000100080",
+      "kind": "ttf"
+    },
+    {
+      "note": "ttf with true",
+      "hex": "7472756500100080",
+      "kind": "ttf"
+    },
+    {
+      "note": "otf",
+      "hex": "4f54544f00100080",
+      "kind": "otf"
+    },
+    {
+      "note": "html renamed .woff2",
+      "hex": "3c21646f63747970652068746d6c3e3c7469746c653e783c2f7469746c653e",
+      "kind": null
+    },
+    {
+      "note": "svg renamed .woff2",
+      "hex": "3c73766720786d6c6e733d27687474703a2f2f7777772e77332e6f72672f323030302f737667272f3e",
+      "kind": null
+    },
+    {
+      "note": "empty file",
+      "hex": "",
+      "kind": null
+    },
+    {
+      "note": "3-byte file",
+      "hex": "774f46",
+      "kind": null
+    },
+    {
+      "note": "3 bytes of a ttf header",
+      "hex": "000100",
+      "kind": null
+    },
+    {
+      "note": "lower case woff2 magic",
+      "hex": "776f666632",
+      "kind": null
+    }
+  ],
+  "family_names": [
+    {
+      "sha256": "abababababababababababababababababababababababababababababababab",
+      "family": "sc-abababababab"
+    },
+    {
+      "sha256": "0123456789abcdef000000000000000000000000000000000000000000000000",
+      "family": "sc-0123456789ab"
+    },
+    {
+      "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "family": "sc-ffffffffffff"
+    }
+  ],
+  "font_stacks": {
+    "system": "ui-sans-serif, system-ui, 'Segoe UI', sans-serif",
+    "system_serif": "ui-serif, Georgia, 'Times New Roman', serif"
+  }
 }

@@ -264,6 +264,7 @@ impl SiteShape {
             time_zone: self.time_zone.clone(),
             libraries: self.libraries.clone(),
             navigation: self.navigation.clone(),
+            look: None,
         }
     }
 }
@@ -1933,6 +1934,7 @@ async fn plan_site(
         navigation,
         look: None,
         themes: Vec::new(),
+        font_packages: Vec::new(),
     };
     let undo = records.iter().map(|r| deleted(r, author.clone())).collect();
     let events = records.iter().map(|r| created_event(actor.id, r)).collect();

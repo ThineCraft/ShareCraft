@@ -415,6 +415,9 @@ async fn built_look(
             background: footer_in.background.unwrap_or(footer_default.background),
             groups,
         },
+        fonts: None,
+        icon: None,
+        menu: revisions::brand::MenuStyle::Cascading,
     };
     if let Some(problem) = look.problem(site_name) {
         return Err(BrandError::InvalidLook(problem));

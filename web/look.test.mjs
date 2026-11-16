@@ -2,7 +2,18 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
-import { checkTheme, contrast, deriveDark, hexOf, lookTokens, parseColour } from './look.js';
+import {
+  checkTheme,
+  contrast,
+  deriveDark,
+  FONT_VARIABLES,
+  fontTokens,
+  hexOf,
+  lookTokens,
+  parseColour,
+  SYSTEM,
+  SYSTEM_SERIF,
+} from './look.js';
 
 // The same table the Rust tests read (crates/revisions/src/brand.rs).
 const vectors = JSON.parse(readFileSync(new URL('./look-vectors.json', import.meta.url), 'utf8'));
@@ -588,4 +599,69 @@ test('history_entry_before_previews_and_restores', async () => {
   assert.deepEqual(result.gone, ['logo']);
   assert.equal(gone.draft.navigation, 'vertical');
   assert.equal(gone.draft.logo, null);
+});
+
+// ---- Plan 4B: fonts ----
+
+const ROLES = ['title', 'heading', 'body', 'interactive'];
+
+test('font_tokens_only_generated_values', () => {
+  // The stacks are fixed strings, the same ones the table holds.
+  assert.equal(SYSTEM, vectors.font_stacks.system);
+  assert.equal(SYSTEM_SERIF, vectors.font_stacks.system_serif);
+  assert.deepEqual([...FONT_VARIABLES], ['--font-title', '--font-heading', '--font-body', '--font-interactive']);
+
+  const { sha256, family } = vectors.family_names[0];
+  const tokens = fontTokens({
+    title: { family, url: `/api/brand/fonts/${sha256}` },
+    heading: { family: 'system-serif' },
+    body: { family: 'system' },
+    interactive: { family: vectors.family_names[1].family },
+  });
+  assert.deepEqual(Object.keys(tokens), [...FONT_VARIABLES]);
+  assert.equal(tokens['--font-title'], `${family}, ${SYSTEM}`);
+  assert.equal(tokens['--font-heading'], SYSTEM_SERIF);
+  assert.equal(tokens['--font-body'], SYSTEM);
+  assert.equal(tokens['--font-interactive'], `${vectors.family_names[1].family}, ${SYSTEM}`);
+
+  // Whatever the server sends, every value is built from a fixed stack and a generated name.
+  const allowed = /^(sc-[0-9a-f]{12}, )?(ui-sans-serif, system-ui, 'Segoe UI', sans-serif|ui-serif, Georgia, 'Times New Roman', serif)$/;
+  const hostile = [
+    '"; } body { display:none',
+    'Comic Sans MS',
+    'sc-ABCDEF123456',
+    'sc-abcdef12345',
+    'sc-abcdef1234567',
+    'sc-abcdef123456; color:red',
+    'sc-abcdef123456, evil',
+    'url(https://evil.example/x)',
+    '</style><script>1</script>',
+    '',
+    7,
+    null,
+    { toString: () => 'sc-abcdef123456' },
+  ];
+  for (const bad of hostile) {
+    const out = fontTokens({ title: { family: bad }, heading: { family: bad }, body: { family: bad }, interactive: { family: bad } });
+    for (const name of FONT_VARIABLES) {
+      assert.match(out[name], allowed, `${String(bad)}`);
+      assert.equal(out[name], SYSTEM, `${String(bad)} is not generated`);
+    }
+  }
+  for (const value of Object.values(tokens)) assert.match(value, allowed);
+});
+
+test('font_tokens_fall_back_to_system', () => {
+  const system = Object.fromEntries(FONT_VARIABLES.map((name) => [name, SYSTEM]));
+  for (const missing of [undefined, null, {}, [], 'x', 5, { title: null }, { title: 'system' }]) {
+    assert.deepEqual(fontTokens(missing), system, JSON.stringify(missing));
+  }
+  // One role missing falls back alone.
+  const { family } = vectors.family_names[0];
+  const partial = fontTokens({ title: { family }, body: { family: 'system' } });
+  assert.equal(partial['--font-title'], `${family}, ${SYSTEM}`);
+  assert.equal(partial['--font-heading'], SYSTEM);
+  assert.equal(partial['--font-body'], SYSTEM);
+  assert.equal(partial['--font-interactive'], SYSTEM);
+  assert.deepEqual(Object.keys(partial), ROLES.map((r) => `--font-${r}`));
 });

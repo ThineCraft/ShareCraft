@@ -317,6 +317,7 @@ mod tests {
                 audience: vec!["members".into()],
                 children: Vec::new(),
             }]),
+            look: None,
         }
     }
 

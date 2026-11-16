@@ -97,6 +97,7 @@ pub(crate) fn new_site_record(id: NodeId, defaults: &RegionalDefaults) -> SiteRe
         navigation: None,
         look: None,
         themes: Vec::new(),
+        font_packages: Vec::new(),
     }
 }
 

@@ -293,6 +293,43 @@ export function applyLook(root, effective) {
   return true;
 }
 
+// ---- Fonts ----
+//
+// A page never takes a font family from user text. A font file is loaded under a generated
+// family name, `sc-` and the first 12 hexadecimal characters of its hash, and the four
+// `--font-*` variables hold that name followed by one of two fixed fallback stacks.
+
+/** The system sans-serif stack: today's look, and the fallback of every role. */
+export const SYSTEM = "ui-sans-serif, system-ui, 'Segoe UI', sans-serif";
+
+/** The system serif stack, used by the built-in Classic package. */
+export const SYSTEM_SERIF = "ui-serif, Georgia, 'Times New Roman', serif";
+
+/** The only font variables a look may set on a page, one for each text role. */
+export const FONT_VARIABLES = Object.freeze(['--font-title', '--font-heading', '--font-body', '--font-interactive']);
+
+const GENERATED_FAMILY = /^sc-[0-9a-f]{12}$/;
+
+/**
+ * The font variables of an effective look's `fonts` (`{title, heading, body, interactive}`,
+ * each `{family, url?}` as `GET /api/sites/{id}/look` answers): always all four, as
+ * `{'--font-title': value, ...}`. A family `system-serif` gives the fixed serif stack; a
+ * generated name (`sc-` and 12 lowercase hexadecimal characters) gives that name before the
+ * fixed system stack; anything else, or nothing, gives the system stack. No other text can
+ * reach a value.
+ */
+export function fontTokens(effectiveFonts) {
+  const tokens = {};
+  for (const name of FONT_VARIABLES) {
+    const family = effectiveFonts?.[name.slice('--font-'.length)]?.family;
+    let value = SYSTEM;
+    if (family === 'system-serif') value = SYSTEM_SERIF;
+    else if (typeof family === 'string' && GENERATED_FAMILY.test(family)) value = `${family}, ${SYSTEM}`;
+    tokens[name] = value;
+  }
+  return tokens;
+}
+
 // ---- Change the look: the draft, what Apply sends, the preview and the session ----
 //
 // A draft is a look as the server stores it (`GET /api/sites/{id}/look/settings` answers

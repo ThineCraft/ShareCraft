@@ -111,6 +111,7 @@ pub fn built_in_body(name: &str, defaults: &RegionalDefaults) -> Option<Template
             folders: Vec::new(),
         }],
         navigation: None,
+        look: None,
     })
 }
 
@@ -643,6 +644,7 @@ pub async fn save_from_site(
             .navigation
             .as_ref()
             .map(|items| template_navigation(items, &tree, site.0, &own_groups)),
+        look: None,
     };
     check_template_size(&body)?;
     let cleaned = clean_shape(&mut body);
