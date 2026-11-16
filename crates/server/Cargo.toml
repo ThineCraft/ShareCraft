@@ -21,16 +21,23 @@ axum = { version = "0.8.9", features = ["ws"] }
 collab-core = { path = "../collab-core" }
 collab-text = { path = "../collab-text" }
 dotenvy = "0.15.7"
+flate2 = "1.1.11"
 futures-util = "0.3.34"
 getrandom = "0.4.3"
+gix = { version = "0.90.0", default-features = false, features = ["sha1"] }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 protocol = { path = "../protocol" }
 records = { path = "../records" }
+# HTTPS to GitHub: rustls with the ring provider (no C build tool beyond the one ring already
+# needs). The provider is installed by `github::install_tls_provider`.
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "stream"] }
 revisions = { path = "../revisions" }
 rpassword = "7.5.4"
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11.1"
+tar = "0.4.46"
 thiserror = "2.0.21"
 time = { version = "0.3.55", features = ["formatting", "parsing"] }
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "fs", "io-util"] }
@@ -39,12 +46,13 @@ uuid = { version = "1.29.2", features = ["v4"] }
 
 [dev-dependencies]
 base64 = "0.23.1"
-gix = { version = "0.90.0", default-features = false, features = ["sha1"] }
+flate2 = "1.1.11"
 records = { path = "../records", features = ["test-support"] }
 revisions = { path = "../revisions", features = ["test-support"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "query", "stream"] }
 sha2 = "0.11.1"
 sqlx = { version = "0.9.0", default-features = false, features = ["postgres", "runtime-tokio"] }
+tar = "0.4.46"
 tempfile = "3.27.0"
 tokio = { version = "1.54.1", features = ["test-util"] }
 tokio-tungstenite = "0.30.0"

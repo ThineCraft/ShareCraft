@@ -17,6 +17,7 @@ pub mod deployment;
 pub mod editors;
 mod events;
 mod file_room;
+pub mod github;
 pub mod icap;
 pub mod libraries;
 mod links;

@@ -18,6 +18,8 @@ pub const DEFAULT_EDITORS: &str = "./editors";
 /// Largest file a document may hold, in bytes, when `SHARECRAFT_MAX_FILE_BYTES` is not set:
 /// 10 GiB.
 pub const DEFAULT_MAX_FILE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+/// GitHub's API address, used when `SHARECRAFT_GITHUB_API` is not set.
+pub const DEFAULT_GITHUB_API: &str = "https://api.github.com";
 
 /// How the server runs.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -51,6 +53,10 @@ pub struct Config {
     /// How long a chunk of an upload may go without sending a byte before it is cut off,
     /// keeping what arrived; a stalled connection would otherwise hold its session for ever.
     pub upload_idle: Duration,
+    /// The GitHub API address connected libraries are read from: `https://api.github.com`
+    /// unless `SHARECRAFT_GITHUB_API` names another (a plain `http://` address only then, for
+    /// a test server). People using ShareCraft never choose it.
+    pub github_api: String,
 }
 
 /// A database URL. It usually holds a password, so `Debug` never shows it.
@@ -123,6 +129,14 @@ pub enum ConfigError {
     /// The HSTS time is not a whole number of seconds.
     #[error("SHARECRAFT_HSTS_SECONDS {0:?} is not a whole number of seconds")]
     BadHstsSeconds(String),
+    /// The GitHub API address is not a plain `https://` or `http://` address. The value is not
+    /// repeated: it might hold a password.
+    #[error(
+        "SHARECRAFT_GITHUB_API is not an address like https://api.github.com: give an \
+         https:// (or, for a test server, http://) address with no user name, password, query \
+         or fragment"
+    )]
+    BadGithubApi,
 }
 
 /// The raw production-mode settings, as read from the environment.
@@ -138,13 +152,13 @@ pub struct DeploymentValues<'a> {
 
 impl Config {
     /// Reads `SHARECRAFT_ADDR`, `SHARECRAFT_DATA`, `SHARECRAFT_WEB`, `SHARECRAFT_EDITORS_DIR` and
-    /// `SHARECRAFT_MAX_FILE_BYTES`, using the defaults for any that are unset, and
-    /// `DATABASE_URL`, which is required.
+    /// `SHARECRAFT_MAX_FILE_BYTES` and `SHARECRAFT_GITHUB_API`, using the defaults for any that
+    /// are unset, and `DATABASE_URL`, which is required.
     ///
     /// # Errors
     /// `BadAddr` or `NotLoopback` for an unusable address, `BadMaxFileBytes` for an unusable
-    /// limit, `NotUnicode` for an unreadable variable, `NoDatabase` when `DATABASE_URL` is unset
-    /// or empty.
+    /// limit, `BadGithubApi` for an unusable GitHub address, `NotUnicode` for an unreadable
+    /// variable, `NoDatabase` when `DATABASE_URL` is unset or empty.
     pub fn from_env() -> Result<Self, ConfigError> {
         let addr = read_var("SHARECRAFT_ADDR")?;
         let data = read_var("SHARECRAFT_DATA")?;
@@ -155,7 +169,8 @@ impl Config {
         let public_url = read_var("SHARECRAFT_PUBLIC_URL")?;
         let trusted_proxies = read_var("SHARECRAFT_TRUSTED_PROXIES")?;
         let hsts_seconds = read_var("SHARECRAFT_HSTS_SECONDS")?;
-        Self::from_values_in(
+        let github_api = github_api_from(read_var("SHARECRAFT_GITHUB_API")?.as_deref())?;
+        let mut config = Self::from_values_in(
             DeploymentValues {
                 public_url: public_url.as_deref(),
                 trusted_proxies: trusted_proxies.as_deref(),
@@ -167,7 +182,9 @@ impl Config {
             database.as_deref(),
             editors.as_deref(),
             max_file_bytes.as_deref(),
-        )
+        )?;
+        config.github_api = github_api;
+        Ok(config)
     }
 
     /// Like [`Config::from_values`], in the mode `deployment` describes: production mode when
@@ -242,6 +259,7 @@ impl Config {
             editors_dir: PathBuf::from(editors_dir.unwrap_or(DEFAULT_EDITORS)),
             max_file_bytes,
             upload_idle: Duration::from_secs(60),
+            github_api: DEFAULT_GITHUB_API.to_owned(),
         })
     }
 }
@@ -263,6 +281,30 @@ fn database_url_from(value: Option<&str>) -> Result<DatabaseUrl, ConfigError> {
         Some(url) if !url.is_empty() => Ok(DatabaseUrl::new(url)),
         _ => Err(ConfigError::NoDatabase),
     }
+}
+
+/// The GitHub API address from `SHARECRAFT_GITHUB_API`'s value: [`DEFAULT_GITHUB_API`] when it
+/// is unset, otherwise the value trimmed and without a trailing `/`. A set value may be
+/// `http://` (a test server); only setting the variable explicitly allows that.
+///
+/// # Errors
+/// `BadGithubApi` for a value that is not an `https://` or `http://` address with a host, or
+/// that holds a user name, password, query or fragment.
+pub fn github_api_from(value: Option<&str>) -> Result<String, ConfigError> {
+    let Some(value) = value else {
+        return Ok(DEFAULT_GITHUB_API.to_owned());
+    };
+    let bad = || ConfigError::BadGithubApi;
+    let trimmed = value.trim().trim_end_matches('/');
+    let rest = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .ok_or_else(bad)?;
+    let host = rest.split('/').next().unwrap_or_default();
+    if host.is_empty() || rest.contains(['@', '?', '#', ' ', '\\']) {
+        return Err(bad());
+    }
+    Ok(trimmed.to_owned())
 }
 
 /// Parses a listening address, any IP address and port, for production mode.
@@ -322,6 +364,32 @@ mod tests {
         assert_eq!(c.write_timeout, Duration::from_secs(10));
         assert_eq!(c.editors_dir, PathBuf::from("./editors"));
         assert_eq!(c.max_file_bytes, 10 * 1024 * 1024 * 1024);
+        assert_eq!(c.github_api, "https://api.github.com");
+    }
+
+    #[test]
+    fn github_api_is_https_unless_set_explicitly() {
+        assert_eq!(github_api_from(None).unwrap(), "https://api.github.com");
+        assert_eq!(
+            github_api_from(Some(" https://ghe.example.com/api/v3/ ")).unwrap(),
+            "https://ghe.example.com/api/v3"
+        );
+        // A test server: plain HTTP, only because the variable was set.
+        assert_eq!(
+            github_api_from(Some("http://127.0.0.1:4567")).unwrap(),
+            "http://127.0.0.1:4567"
+        );
+        for bad in [
+            "",
+            "api.github.com",
+            "ftp://api.github.com",
+            "https://",
+            "https://user:pw@api.github.com",
+            "https://api.github.com?x=1",
+            "https://api.github.com#frag",
+        ] {
+            assert_eq!(github_api_from(Some(bad)), Err(ConfigError::BadGithubApi));
+        }
     }
 
     #[test]

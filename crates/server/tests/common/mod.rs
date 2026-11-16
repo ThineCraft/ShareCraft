@@ -37,6 +37,15 @@ use tokio_tungstenite::tungstenite::handshake::client::Request;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use uuid::Uuid;
 
+pub mod fake_github;
+
+/// Starts a fake GitHub serving the empty public repository `owner/name` on `127.0.0.1:0`;
+/// it stops when dropped. Point a server at it with
+/// `spawn_server_config(|c| c.github_api = fake.origin())`.
+pub async fn start_fake_github(owner: &str, name: &str) -> fake_github::FakeGithub {
+    fake_github::FakeGithub::start(owner, name).await
+}
+
 /// How long any wait in a test may take before it fails.
 pub const TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -276,6 +285,7 @@ impl Site {
         if let Some(user) = as_user {
             headers.insert(COOKIE, HeaderValue::from_str(&user.cookie).unwrap());
         }
+        server::github::install_tls_provider();
         reqwest::Client::builder()
             .default_headers(headers)
             .timeout(TIMEOUT)
@@ -521,6 +531,8 @@ pub fn session_cookie(headers: &HeaderMap) -> Option<String> {
 
 /// The settings of a test server storing under `data_dir` and recording in `db`'s schema.
 pub fn config_at(data_dir: &Path, db: &TestDb) -> Config {
+    // Every HTTP client in this process, the tests' own included, needs the TLS provider.
+    server::github::install_tls_provider();
     Config {
         addr: "127.0.0.1:0".parse().unwrap(),
         deployment: Default::default(),
@@ -534,6 +546,7 @@ pub fn config_at(data_dir: &Path, db: &TestDb) -> Config {
         editors_dir: data_dir.join("editors"),
         max_file_bytes: 64 << 20,
         upload_idle: Duration::from_secs(60),
+        github_api: server::config::DEFAULT_GITHUB_API.to_owned(),
     }
 }
 
