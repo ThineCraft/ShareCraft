@@ -22,7 +22,7 @@ use records::{
     validate_time_zone,
 };
 use records::{Origin, check_name, check_size};
-use revisions::brand::OrgBrand;
+use revisions::brand::{FontPackage, Look, OrgBrand, TemplateLook};
 use revisions::{
     Author, BlobRef, Checkpoint, CheckpointError, Content, GitError, LibraryFields, LibraryRecord,
     OrgNavigation, SITE_SCHEMA, SiteRecord, SitesChange, Stamp, TemplateBody, TemplateFolder,
@@ -35,6 +35,7 @@ use uuid::Uuid;
 
 use crate::AppState;
 use crate::blobs::{Held, commit as commit_reservation, release};
+use crate::brand::BrandError;
 use crate::checkpoint::Checkpointer;
 use crate::projection::record_first;
 use crate::room::credited_name;
@@ -239,6 +240,8 @@ pub struct SiteShape {
     pub libraries: Vec<TemplateLibrary>,
     /// Its navigation, libraries named and audiences by purpose; `None` for automatic.
     pub navigation: Option<Vec<TemplateNavItem>>,
+    /// Its look, images and fonts as references to the brand centre; `None` for the default.
+    pub look: Option<TemplateLook>,
 }
 
 impl SiteShape {
@@ -253,6 +256,7 @@ impl SiteShape {
             time_zone: body.time_zone,
             libraries: body.libraries,
             navigation: body.navigation,
+            look: body.look,
         })
     }
 
@@ -264,9 +268,22 @@ impl SiteShape {
             time_zone: self.time_zone.clone(),
             libraries: self.libraries.clone(),
             navigation: self.navigation.clone(),
-            look: None,
+            look: self.look.clone(),
         }
     }
+}
+
+/// The look a new site is made with, worked out from its shape's (see
+/// [`crate::looks::template_site_look`]): the look with its images and fonts as snapshots, the
+/// site's own font package it brings, and the references that were left out.
+#[derive(Clone, Debug, Default)]
+pub struct NewSiteLook {
+    /// The look; `None` for the default.
+    pub look: Option<Look>,
+    /// The site's own font packages.
+    pub font_packages: Vec<FontPackage>,
+    /// The references of the shape's look that were left out.
+    pub unresolved: Vec<crate::templates::Unresolved>,
 }
 
 /// A change worked out and judged, ready to be committed and mirrored.
@@ -1651,7 +1668,9 @@ async fn plan_create(
         let defaults = db.regional_defaults().await?;
         let shape = crate::templates::built_in_shape(crate::templates::TEAM, &defaults)
             .ok_or(AccessError::NotFound)?;
-        return Ok(Some(plan_site(state, actor, id, &name, shape).await?));
+        return Ok(Some(
+            plan_site(state, actor, id, &name, shape, NewSiteLook::default()).await?,
+        ));
     }
     let parent = parent.ok_or(AccessError::WrongPlace)?;
     let (parent_node, access) = visible(db, actor, parent).await?;
@@ -1826,41 +1845,60 @@ pub async fn create_library(
 /// three groups (empty but for the creator, who joins Owners) and a `node.created` event for
 /// each node. The navigation's library names become the new libraries (an item naming a
 /// library the shape does not hold is left out, with its children) and its audiences the new
-/// site's groups of those purposes. Answers the site as PostgreSQL then holds it.
+/// site's groups of those purposes. The shape's look is written in the same commit, its images
+/// and fonts resolved from the brand centre and pinned to the site (see
+/// [`crate::looks::template_site_look`]; references it cannot fill are left out and answered),
+/// held to the brand policy when the creator is not an administrator. Answers the site as
+/// PostgreSQL then holds it, and the references left out.
 ///
 /// # Errors
 /// `Forbidden` unless `actor` is an enabled administrator; `InvalidName`, `NameTaken`;
 /// `InvalidSetting` for a description over 500 characters, `InvalidLanguage`,
 /// `InvalidTimeZone`; `InvalidTemplate` for a shape that breaks a template's rules; `Exists`
-/// for an id already used; `OutOfStep` while the tree needs repair; otherwise the Git or
-/// database error.
-pub async fn create_site(
+/// for an id already used; `OutOfStep` while the tree needs repair; the look's refusals
+/// (`low_contrast`, `invalid_look`, `not_allowed`); otherwise the Git or database error.
+pub(crate) async fn create_site(
     state: &AppState,
     actor: &User,
     id: NodeId,
     name: &str,
     shape: SiteShape,
-) -> Result<Applied, AccessError> {
+) -> Result<(Applied, Vec<crate::templates::Unresolved>), BrandError> {
     let _turn = state.tree_lock().lock().await;
     ensure_in_step(state).await?;
-    let plan = plan_site(state, actor, id, name, shape).await?;
+    if !is_admin(state.db(), actor).await? {
+        return Err(AccessError::Forbidden.into());
+    }
+    let look = match &shape.look {
+        Some(template) => {
+            let name = validate_node_name(name)?;
+            crate::looks::template_site_look(state, actor, template, name).await?
+        }
+        None => NewSiteLook::default(),
+    };
+    let unresolved = look.unresolved.clone();
+    let plan = plan_site(state, actor, id, name, shape, look).await?;
     let done = commit(state, Some(actor), plan).await?;
     erase_released(state, done).await;
     let node = state.db().node(id).await?.ok_or(AccessError::NotFound)?;
-    Ok(Applied {
-        node,
-        deleted: Vec::new(),
-        renamed: None,
-    })
+    Ok((
+        Applied {
+            node,
+            deleted: Vec::new(),
+            renamed: None,
+        },
+        unresolved,
+    ))
 }
 
-/// Works out a new site from `shape` (see [`create_site`]).
+/// Works out a new site from `shape`, with the look `look` (see [`create_site`]).
 async fn plan_site(
     state: &AppState,
     actor: &User,
     id: NodeId,
     name: &str,
     shape: SiteShape,
+    look: NewSiteLook,
 ) -> Result<Plan, AccessError> {
     let db = state.db();
     let name = validate_node_name(name)?.to_owned();
@@ -1932,9 +1970,9 @@ async fn plan_site(
         hub: None,
         joined_hub: None,
         navigation,
-        look: None,
+        look: look.look,
         themes: Vec::new(),
-        font_packages: Vec::new(),
+        font_packages: look.font_packages,
     };
     let undo = records.iter().map(|r| deleted(r, author.clone())).collect();
     let events = records.iter().map(|r| created_event(actor.id, r)).collect();

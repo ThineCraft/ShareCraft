@@ -46,8 +46,9 @@ pub(crate) struct SaveBody {
 /// `POST /api/sites/{id}/template {name, description?}`: saves the site's shape as a template
 /// (see [`templates::save_from_site`]). Administrators only (`403`); `404` for anything but a
 /// live site; `422 invalid_template` with a `reason` for a name or description that breaks the
-/// rules or a site too large for a template. `201` with the template as listed and `cleaned`,
-/// the names made under older rules that had to change (`[{from, to}]`).
+/// rules or a site too large for a template. `201` with the template as listed, `cleaned`, the
+/// names made under older rules that had to change (`[{from, to}]`), and `dropped`, the files
+/// of the site's look that the brand centre does not hold, left out (`[{slot, name}]`).
 pub(crate) async fn save(
     State(state): State<AppState>,
     signed: Signed,
@@ -57,9 +58,13 @@ pub(crate) async fn save(
     let site = node_id(&id)?;
     let actor = signed.session.user;
     to_completion(async move {
-        let (record, cleaned) =
+        let saved =
             templates::save_from_site(&state, &actor, site, &body.name, &body.description).await?;
-        Ok((StatusCode::CREATED, Json(answered(&record, &cleaned))).into_response())
+        let mut out = answered(&saved.template, &saved.cleaned);
+        if let Some(fields) = out.as_object_mut() {
+            fields.insert("dropped".to_owned(), json!(saved.dropped));
+        }
+        Ok((StatusCode::CREATED, Json(out)).into_response())
     })
     .await
 }
@@ -90,8 +95,9 @@ pub(crate) async fn package(
 /// `POST /api/templates/import <package>`: imports a template package (see
 /// [`templates::read_package`]) as a new saved template. Administrators only (`403`).
 /// `422 invalid_template` with a `reason` for a package refused; `413` for a body over 2 MiB.
-/// `201` with the template as listed and `cleaned`, the names that had to change
-/// (`[{from, to}]`).
+/// `201` with the template as listed, `cleaned`, the names that had to change
+/// (`[{from, to}]`), and `unresolved`, the references of its look to brand-centre images and
+/// fonts this organisation cannot fill, left out (`[{slot, id}]`).
 pub(crate) async fn import(
     State(state): State<AppState>,
     signed: Signed,
@@ -106,8 +112,12 @@ pub(crate) async fn import(
         .await
         .map_err(|e| ApiError::unavailable(&e))??;
     to_completion(async move {
-        let record = templates::import(&state, &actor, package, &cleaned).await?;
-        Ok((StatusCode::CREATED, Json(answered(&record, &cleaned))).into_response())
+        let (record, unresolved) = templates::import(&state, &actor, package, &cleaned).await?;
+        let mut out = answered(&record, &cleaned);
+        if let Some(fields) = out.as_object_mut() {
+            fields.insert("unresolved".to_owned(), json!(unresolved));
+        }
+        Ok((StatusCode::CREATED, Json(out)).into_response())
     })
     .await
 }

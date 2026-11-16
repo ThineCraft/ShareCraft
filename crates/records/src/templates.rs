@@ -106,7 +106,8 @@ pub fn check_template_size(body: &TemplateBody) -> Result<(), AccessError> {
 /// `invalid_library_settings` (a library's kind or settings that break the rules of
 /// [`crate::validate_library_settings`]), and `invalid_navigation` (the rules of a site's navigation, with libraries named rather than
 /// identified, and audiences of `owners`, `members` or `visitors`), and `invalid_look` (a look
-/// that breaks the rules of [`revisions::brand::TemplateLook::problem`]).
+/// that breaks the rules of [`revisions::brand::TemplateLook::problem`], or whose theme is not
+/// readable by [`revisions::brand::check_theme`]).
 pub fn validate_template_body(body: &TemplateBody) -> Result<(), AccessError> {
     let refuse = |reason: &'static str| Err(AccessError::InvalidTemplate(reason));
     if !SITE_KINDS.contains(&body.kind.as_str()) {
@@ -135,7 +136,7 @@ pub fn validate_template_body(body: &TemplateBody) -> Result<(), AccessError> {
         return refuse("invalid_navigation");
     }
     if let Some(look) = &body.look
-        && look.problem().is_some()
+        && (look.problem().is_some() || revisions::brand::check_theme(&look.theme).is_err())
     {
         return refuse("invalid_look");
     }

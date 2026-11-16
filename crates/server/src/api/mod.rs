@@ -2,6 +2,7 @@
 //! than `GET` must also carry `Origin`. Errors are `{"error": "<code>"}`.
 
 mod admin;
+mod admin_looks;
 mod bin;
 pub(crate) mod brand;
 mod bulk;
@@ -235,6 +236,10 @@ pub(crate) fn router() -> Router<AppState> {
         .route("/admin/users", get(admin::users).post(admin::create))
         .route("/admin/users/{id}/disable", post(admin::disable))
         .route("/admin/users/{id}/enable", post(admin::enable))
+        .route(
+            "/admin/looks/apply",
+            post(admin_looks::apply).layer(DefaultBodyLimit::max(admin_looks::MAX_APPLY_BODY)),
+        )
         .route("/admin/sites", get(admin::sites))
         .route("/admin/sites/{id}", delete(admin::purge_site))
         .route("/admin/sites/{id}/restore", post(admin::restore_site))

@@ -18,6 +18,11 @@ use records::{
     TemplateRow, User, check_template_size, validate_template_body, validate_template_description,
     validate_template_name,
 };
+use revisions::brand::{
+    BUILT_IN_FONT_PACKAGES, Background, FontPackage, FontRef, FontRole, Footer, Header, ImageKind,
+    ImageRef, Look, LookFonts, OrgBrand, TemplateFontPackage, TemplateFontRef, TemplateFonts,
+    TemplateFooter, TemplateHeader, TemplateImage, TemplateLook, icon_problem,
+};
 use revisions::{
     CheckpointError, GitError, LibraryFields, NavItem, NavTarget, SITE_SCHEMA, SiteRecord, Stamp,
     TemplateBody, TemplateFolder, TemplateLibrary, TemplateNavItem, TemplateNavTarget,
@@ -119,6 +124,333 @@ pub fn built_in_body(name: &str, defaults: &RegionalDefaults) -> Option<Template
 #[must_use]
 pub fn built_in_shape(name: &str, defaults: &RegionalDefaults) -> Option<SiteShape> {
     SiteShape::from_body(name, built_in_body(name, defaults)?)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Looks in templates
+
+/// A file of a site's look that a template saved from the site leaves out, because the brand
+/// centre has no entry with its content: an image or font from the site's own libraries.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Dropped {
+    /// The slot it was in: `logo`, `thumbnail`, `icon`, `header.image`, `footer.logo`,
+    /// `fonts.display` or `fonts.content`.
+    pub slot: &'static str,
+    /// The file's name as the look recorded it.
+    pub name: String,
+}
+
+/// A reference of a template's look that is left out because it names nothing usable here: a
+/// brand-centre image or font this organisation does not have (any more), an image too large
+/// for its slot or not an icon, or content no longer available.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Unresolved {
+    /// The slot, as in [`Dropped::slot`].
+    pub slot: &'static str,
+    /// The brand-centre identifier it named.
+    pub id: Uuid,
+}
+
+/// The kind of image each image slot of a look takes, in slot order.
+const IMAGE_SLOTS: [(&str, ImageKind); 5] = [
+    ("logo", ImageKind::Logo),
+    ("thumbnail", ImageKind::Logo),
+    ("icon", ImageKind::Icon),
+    ("header.image", ImageKind::Background),
+    ("footer.logo", ImageKind::Logo),
+];
+
+/// The brand image `id` of `org` if a look can hold it in `slot`: no larger than the slot
+/// takes, and a usable tab icon in `icon`.
+#[must_use]
+pub fn usable_image<'a>(org: &'a OrgBrand, slot: &str, id: Uuid) -> Option<&'a ImageRef> {
+    let kind = IMAGE_SLOTS.iter().find(|(name, _)| *name == slot)?.1;
+    let image = &org.images.iter().find(|b| b.id == id)?.image;
+    let fits = image.bytes <= kind.max_bytes();
+    let icon_ok = slot != "icon" || icon_problem(image).is_none();
+    (fits && icon_ok).then_some(image)
+}
+
+/// The brand font `id` of `org`, if it has one.
+#[must_use]
+pub fn usable_font(org: &OrgBrand, id: Uuid) -> Option<&FontRef> {
+    org.fonts.iter().find(|f| f.id == id).map(|f| &f.font)
+}
+
+/// `look`'s image `image` as a template refers to it: the brand image with the same content,
+/// or `None`, noted in `dropped` as `slot`.
+fn image_reference(
+    org: &OrgBrand,
+    slot: &'static str,
+    image: Option<&ImageRef>,
+    dropped: &mut Vec<Dropped>,
+) -> Option<TemplateImage> {
+    let image = image?;
+    match org.images.iter().find(|b| b.image.sha256 == image.sha256) {
+        Some(found) => Some(TemplateImage::BrandImage(found.id)),
+        None => {
+            dropped.push(Dropped {
+                slot,
+                name: image.name.clone(),
+            });
+            None
+        }
+    }
+}
+
+/// `font` as a template refers to it: the brand font with the same content, or `None`, noted
+/// in `dropped` as `slot`.
+fn font_reference(
+    org: &OrgBrand,
+    slot: &'static str,
+    font: Option<&FontRef>,
+    dropped: &mut Vec<Dropped>,
+) -> Option<TemplateFontRef> {
+    let font = font?;
+    match org.fonts.iter().find(|f| f.font.sha256 == font.sha256) {
+        Some(found) => Some(TemplateFontRef::BrandFont(found.id)),
+        None => {
+            dropped.push(Dropped {
+                slot,
+                name: font.name.clone(),
+            });
+            None
+        }
+    }
+}
+
+/// A site's `look` as a template keeps it: each image and font that the brand centre `org`
+/// holds (by content) becomes a reference to it, and every other is left out and answered as
+/// dropped, in slot order. A theme from the site's own themes keeps its colours as custom ones,
+/// since no other site has that theme. What the left-out files needed is undone (see
+/// [`tidy`]).
+#[must_use]
+pub fn template_look_of(look: &Look, org: &OrgBrand) -> (TemplateLook, Vec<Dropped>) {
+    let mut dropped = Vec::new();
+    let logo = image_reference(org, "logo", look.logo.as_ref(), &mut dropped);
+    let thumbnail = image_reference(org, "thumbnail", look.thumbnail.as_ref(), &mut dropped);
+    let icon = image_reference(org, "icon", look.icon.as_ref(), &mut dropped);
+    let header_image = image_reference(
+        org,
+        "header.image",
+        look.header.image.as_ref(),
+        &mut dropped,
+    );
+    let footer_logo = image_reference(org, "footer.logo", look.footer.logo.as_ref(), &mut dropped);
+    let fonts = look.fonts.as_ref().map(|fonts| {
+        let display = font_reference(
+            org,
+            "fonts.display",
+            fonts.package.display.as_ref(),
+            &mut dropped,
+        );
+        let content = font_reference(
+            org,
+            "fonts.content",
+            fonts.package.content.as_ref(),
+            &mut dropped,
+        );
+        TemplateFonts {
+            package: TemplateFontPackage {
+                name: fonts.package.name.clone(),
+                display,
+                content,
+                roles: fonts.package.roles,
+            },
+            from: fonts.from.clone(),
+        }
+    });
+    let from = if look.from.starts_with("site:") {
+        "custom".to_owned()
+    } else {
+        look.from.clone()
+    };
+    let mut out = TemplateLook {
+        theme: look.theme.clone(),
+        from,
+        logo,
+        thumbnail,
+        logo_alt: look.logo_alt.clone(),
+        header: TemplateHeader {
+            layout: look.header.layout,
+            background: look.header.background,
+            image: header_image,
+            align: look.header.align,
+            hide_title: look.header.hide_title,
+        },
+        navigation: look.navigation,
+        footer: TemplateFooter {
+            enabled: look.footer.enabled,
+            layout: look.footer.layout,
+            logo: footer_logo,
+            name: look.footer.name.clone(),
+            background: look.footer.background,
+            groups: look.footer.groups.clone(),
+        },
+        fonts,
+        icon,
+        menu: look.menu,
+    };
+    tidy(&mut out);
+    (out, dropped)
+}
+
+/// Undoes what references left out of `look` were needed for, so it stays a look a site can
+/// hold: an image background without its image goes back to none, a title hidden behind a
+/// logo that is gone is shown, and a text role set in a font that is gone uses the system
+/// fonts.
+fn tidy(look: &mut TemplateLook) {
+    if look.header.image.is_none() && look.header.background == Background::Image {
+        look.header.background = Header::default().background;
+    }
+    if look.logo.is_none() {
+        look.header.hide_title = false;
+    }
+    if let Some(fonts) = &mut look.fonts {
+        let (display, content) = (
+            fonts.package.display.is_some(),
+            fonts.package.content.is_some(),
+        );
+        let roles = &mut fonts.package.roles;
+        for role in [
+            &mut roles.title,
+            &mut roles.heading,
+            &mut roles.body,
+            &mut roles.interactive,
+        ] {
+            if (*role == FontRole::Display && !display) || (*role == FontRole::Content && !content)
+            {
+                *role = FontRole::System;
+            }
+        }
+    }
+}
+
+/// Leaves out of `look` each reference that `keep_image` (given the slot and identifier) or
+/// `keep_font` refuses, then tidies it (see [`tidy`]). Answers what was left out, in slot
+/// order.
+pub fn prune_references(
+    look: &mut TemplateLook,
+    keep_image: &dyn Fn(&'static str, Uuid) -> bool,
+    keep_font: &dyn Fn(Uuid) -> bool,
+) -> Vec<Unresolved> {
+    let mut unresolved = Vec::new();
+    for (slot, image) in [
+        ("logo", &mut look.logo),
+        ("thumbnail", &mut look.thumbnail),
+        ("icon", &mut look.icon),
+        ("header.image", &mut look.header.image),
+        ("footer.logo", &mut look.footer.logo),
+    ] {
+        if let Some(TemplateImage::BrandImage(id)) = *image
+            && !keep_image(slot, id)
+        {
+            *image = None;
+            unresolved.push(Unresolved { slot, id });
+        }
+    }
+    if let Some(fonts) = &mut look.fonts {
+        for (slot, font) in [
+            ("fonts.display", &mut fonts.package.display),
+            ("fonts.content", &mut fonts.package.content),
+        ] {
+            if let Some(TemplateFontRef::BrandFont(id)) = *font
+                && !keep_font(id)
+            {
+                *font = None;
+                unresolved.push(Unresolved { slot, id });
+            }
+        }
+    }
+    tidy(look);
+    unresolved
+}
+
+/// Leaves out of `look` each reference the brand centre `org` cannot fill (see
+/// [`usable_image`], [`usable_font`]). Answers what was left out.
+pub fn prune_unknown(look: &mut TemplateLook, org: &OrgBrand) -> Vec<Unresolved> {
+    prune_references(
+        look,
+        &|slot, id| usable_image(org, slot, id).is_some(),
+        &|id| usable_font(org, id).is_some(),
+    )
+}
+
+/// The site look `look` makes with the brand centre `org`: each reference becomes a snapshot
+/// of the brand centre's file (a reference it cannot fill is left out; prune first to report
+/// it). The font package copy takes the identifier its source names (the nil one for a
+/// built-in package, as a look's copy of one has).
+#[must_use]
+pub fn look_from_references(look: &TemplateLook, org: &OrgBrand) -> Look {
+    let image = |slot: &str, r: Option<TemplateImage>| {
+        r.and_then(|TemplateImage::BrandImage(id)| usable_image(org, slot, id).cloned())
+    };
+    let font = |r: Option<TemplateFontRef>| {
+        r.and_then(|TemplateFontRef::BrandFont(id)| usable_font(org, id).cloned())
+    };
+    let fonts = look.fonts.as_ref().map(|fonts| {
+        let built_in = BUILT_IN_FONT_PACKAGES.iter().any(|b| b.id == fonts.from);
+        let id = fonts
+            .from
+            .split_once(':')
+            .filter(|_| !built_in)
+            .and_then(|(_, id)| Uuid::parse_str(id).ok())
+            .unwrap_or_else(Uuid::nil);
+        LookFonts {
+            package: FontPackage {
+                id,
+                name: fonts.package.name.clone(),
+                display: font(fonts.package.display),
+                content: font(fonts.package.content),
+                roles: fonts.package.roles,
+            },
+            from: fonts.from.clone(),
+        }
+    });
+    Look {
+        theme: look.theme.clone(),
+        from: look.from.clone(),
+        logo: image("logo", look.logo),
+        thumbnail: image("thumbnail", look.thumbnail),
+        logo_alt: look.logo_alt.clone(),
+        header: Header {
+            layout: look.header.layout,
+            background: look.header.background,
+            image: image("header.image", look.header.image),
+            align: look.header.align,
+            hide_title: look.header.hide_title,
+        },
+        navigation: look.navigation,
+        footer: Footer {
+            enabled: look.footer.enabled,
+            layout: look.footer.layout,
+            logo: image("footer.logo", look.footer.logo),
+            name: look.footer.name.clone(),
+            background: look.footer.background,
+            groups: look.footer.groups.clone(),
+        },
+        fonts,
+        icon: image("icon", look.icon),
+        menu: look.menu,
+    }
+}
+
+/// The look the template `template` carries (a built-in's name, which carries none, or a
+/// saved template's id that is not deleted), for `actor`, an administrator.
+///
+/// # Errors
+/// `Forbidden` for anyone else; `NotFound` for an unknown or deleted template; otherwise the
+/// database error.
+pub async fn look_of(
+    state: &AppState,
+    actor: &User,
+    template: &str,
+) -> Result<Option<TemplateLook>, AccessError> {
+    require_admin(state, actor).await?;
+    if BUILT_INS.contains(&template) {
+        return Ok(None);
+    }
+    Ok(body_of(&live_template(state, template).await?)?.look)
 }
 
 /// `Forbidden` unless `actor` is an enabled administrator as the database holds them now.
@@ -586,12 +918,25 @@ fn template_navigation(
     convert(items, &library_of, own_groups)
 }
 
+/// A template saved from a site, with what changed on the way.
+#[derive(Clone, Debug)]
+pub struct SavedTemplate {
+    /// The template.
+    pub template: TemplateRecord,
+    /// The names that had to change.
+    pub cleaned: Vec<Cleaned>,
+    /// The files of the site's look that were left out (see [`template_look_of`]).
+    pub dropped: Vec<Dropped>,
+}
+
 /// Saves the shape of the site `site` as a new template named `name`, for `actor`, an
 /// administrator: its live libraries, each with its kind and settings, and folders (no files,
 /// nothing in its recycle bin), its kind, language, time zone and navigation (see
-/// [`template_navigation`]), as its records in Git hold them. Names made under older rules are cleaned as an imported package's are (see
-/// [`clean_shape`]), and the links to them follow. One commit, mirrored with `template.saved`
-/// (with the names cleaned). Answers the template and the names that changed.
+/// [`template_navigation`]), and its look with its images and fonts as references to the brand
+/// centre (see [`template_look_of`]), as its records in Git hold them. Names made under older
+/// rules are cleaned as an imported package's are (see [`clean_shape`]), and the links to them
+/// follow. One commit, mirrored with `template.saved` (with the names cleaned and the files
+/// dropped). Answers the template, the names that changed and the files dropped.
 ///
 /// # Errors
 /// `Forbidden` for anyone else; `InvalidTemplate` for a name or description that breaks the
@@ -604,7 +949,7 @@ pub async fn save_from_site(
     site: NodeId,
     name: &str,
     description: &str,
-) -> Result<(TemplateRecord, Vec<Cleaned>), AccessError> {
+) -> Result<SavedTemplate, AccessError> {
     require_admin(state, actor).await?;
     let name = validate_template_name(name)?.to_owned();
     validate_template_description(description)?;
@@ -646,6 +991,12 @@ pub async fn save_from_site(
             .map(|items| template_navigation(items, &tree, site.0, &own_groups)),
         look: None,
     };
+    let mut dropped = Vec::new();
+    if let Some(look) = &record.look {
+        let (kept, left_out) = template_look_of(look, &db.org_brand().await?);
+        body.look = Some(kept);
+        dropped = left_out;
+    }
     check_template_size(&body)?;
     let cleaned = clean_shape(&mut body);
     validate_template_body(&body)?;
@@ -661,6 +1012,7 @@ pub async fn save_from_site(
             "name": template.name,
             "site": site.0,
             "cleaned": cleaned,
+            "dropped": dropped,
         }),
     };
     let message = format!("Save template {}", template.name);
@@ -669,7 +1021,11 @@ pub async fn save_from_site(
         ..Undo::default()
     };
     commit_template(state, actor, &message, &template, undo, event).await?;
-    Ok((template, cleaned))
+    Ok(SavedTemplate {
+        template,
+        cleaned,
+        dropped,
+    })
 }
 
 /// A new template record made by `actor` now.
@@ -694,8 +1050,10 @@ fn new_template(
 }
 
 /// Imports `package` (read by [`read_package`], with the names that were `cleaned`) as a new
-/// saved template, for `actor`, an administrator. One commit, mirrored with
-/// `template.imported` (its name and the names cleaned).
+/// saved template, for `actor`, an administrator. Its look keeps only the references this
+/// organisation's brand centre can fill (see [`prune_unknown`]); the others are left out and
+/// answered. One commit, mirrored with `template.imported` (its name, the names cleaned and the
+/// references left out).
 ///
 /// # Errors
 /// `Forbidden` for anyone else; `OutOfStep` while the tree needs repair; otherwise the Git or
@@ -703,12 +1061,17 @@ fn new_template(
 pub async fn import(
     state: &AppState,
     actor: &User,
-    package: TemplatePackage,
+    mut package: TemplatePackage,
     cleaned: &[Cleaned],
-) -> Result<TemplateRecord, AccessError> {
+) -> Result<(TemplateRecord, Vec<Unresolved>), AccessError> {
     require_admin(state, actor).await?;
     let _turn = state.tree_lock().lock().await;
     ensure_in_step(state).await?;
+    let mut unresolved = Vec::new();
+    if let Some(look) = &mut package.body.look {
+        unresolved = prune_unknown(look, &state.db().org_brand().await?);
+        validate_template_body(&package.body)?;
+    }
     let template = new_template(actor, package.name, package.description, package.body);
     let event = NewEvent {
         kind: "template.imported",
@@ -716,7 +1079,12 @@ pub async fn import(
         subject: None,
         document: None,
         node: None,
-        detail: json!({ "template": template.id, "name": template.name, "cleaned": cleaned }),
+        detail: json!({
+            "template": template.id,
+            "name": template.name,
+            "cleaned": cleaned,
+            "unresolved": unresolved,
+        }),
     };
     let message = format!("Import template {}", template.name);
     let undo = Undo {
@@ -724,7 +1092,7 @@ pub async fn import(
         ..Undo::default()
     };
     commit_template(state, actor, &message, &template, undo, event).await?;
-    Ok(template)
+    Ok((template, unresolved))
 }
 
 /// Deletes the saved template `id` for `actor`, an administrator: its record is kept, marked

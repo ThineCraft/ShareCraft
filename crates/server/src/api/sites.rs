@@ -15,11 +15,13 @@ use serde_json::{Value, json};
 use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
+use super::brand::completed;
 use super::groups::{GroupOut, answered};
 use super::nodes::{NodeOut, node_id};
 use super::{ApiError, JsonBody, to_completion};
 use crate::AppState;
 use crate::auth::Signed;
+use crate::brand::BrandError;
 use crate::looks;
 use crate::sites::{self, SiteEdit};
 use crate::tree;
@@ -229,6 +231,8 @@ pub(crate) struct NewSiteOut {
     site: NodeOut,
     /// Its Owners, Members and Visitors groups.
     groups: Vec<GroupOut>,
+    /// The references of the template's look this organisation could not fill, left out.
+    unresolved: Vec<crate::templates::Unresolved>,
 }
 
 /// The groups of `site` that `user` may see, Owners, Members and Visitors in that order.
@@ -248,21 +252,23 @@ async fn site_groups(db: &Db, user: &User, site: NodeId) -> Result<Vec<GroupOut>
 /// from a template (`team` when none is given; a built-in's name or a saved template's id),
 /// with the template's libraries, folders, kind, language, time zone and navigation, the
 /// fields given overriding the template's, and its three groups, Owners, Members and Visitors,
-/// assigned Owner, Editor and Viewer on it; the creator becomes a member of its Owners group
+/// assigned Owner, Editor and Viewer on it; the creator becomes a member of its Owners group,
+/// and the template's look is written in the same commit with its images and fonts pinned
 /// (see [`tree::create_site`]). Administrators only (`403`). `422 invalid_request` for a
 /// template that is neither a built-in nor an id, or a description over 500 characters, `404`
 /// for an unknown or deleted template, `422 invalid_language` or `invalid_time_zone`. `201`
-/// with the site and its groups.
+/// with the site, its groups, and `unresolved`: the references of the template's look to
+/// brand-centre images and fonts that could not be filled, left out (`[{slot, id}]`).
 pub(crate) async fn create(
     State(state): State<AppState>,
     signed: Signed,
     JsonBody(new): JsonBody<NewSite>,
-) -> Result<Response, ApiError> {
+) -> Result<Response, BrandError> {
     let actor = signed.session.user;
     let creator = actor.clone();
-    let site = {
+    let (site, unresolved) = {
         let state = state.clone();
-        to_completion(async move {
+        completed(async move {
             let mut shape =
                 crate::templates::shape_for(&state, &actor, new.template.as_deref()).await?;
             if let Some(description) = new.description {
@@ -275,9 +281,9 @@ pub(crate) async fn create(
                 shape.time_zone = time_zone;
             }
             let id = NodeId(Uuid::new_v4());
-            Ok(tree::create_site(&state, &actor, id, &new.name, shape)
-                .await?
-                .node)
+            let (applied, unresolved) =
+                tree::create_site(&state, &actor, id, &new.name, shape).await?;
+            Ok((applied.node, unresolved))
         })
         .await?
     };
@@ -285,6 +291,7 @@ pub(crate) async fn create(
     let out = NewSiteOut {
         site: NodeOut::from(site),
         groups,
+        unresolved,
     };
     Ok((StatusCode::CREATED, Json(out)).into_response())
 }

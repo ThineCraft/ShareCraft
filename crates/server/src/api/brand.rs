@@ -34,40 +34,60 @@ const IMAGE_POLICY: &str = "sandbox; default-src 'none'; style-src 'unsafe-inlin
 /// The policy a font file is served with: nothing in it runs or loads, even opened alone.
 const FONT_POLICY: &str = "sandbox; default-src 'none'";
 
-impl IntoResponse for BrandError {
-    fn into_response(self) -> Response {
-        match self {
-            BrandError::Api(e) => e.into_response(),
+impl BrandError {
+    /// The status and body of the answer, for every refusal but [`BrandError::Api`], which
+    /// answers as its [`ApiError`] does.
+    fn status_and_body(&self) -> Option<(StatusCode, Value)> {
+        Some(match self {
+            BrandError::Api(_) => return None,
             BrandError::LowContrast(pairs) => (
                 StatusCode::UNPROCESSABLE_ENTITY,
-                Json(json!({ "error": "low_contrast", "pairs": pairs })),
-            )
-                .into_response(),
+                json!({ "error": "low_contrast", "pairs": pairs }),
+            ),
             BrandError::InvalidTheme(reason) => (
                 StatusCode::UNPROCESSABLE_ENTITY,
-                Json(json!({ "error": "invalid_theme", "reason": reason })),
-            )
-                .into_response(),
+                json!({ "error": "invalid_theme", "reason": reason }),
+            ),
             BrandError::InvalidLook(reason) => (
                 StatusCode::UNPROCESSABLE_ENTITY,
-                Json(json!({ "error": "invalid_look", "reason": reason })),
-            )
-                .into_response(),
+                json!({ "error": "invalid_look", "reason": reason }),
+            ),
             BrandError::ImagesGone(slots) => (
                 StatusCode::CONFLICT,
-                Json(json!({ "error": "image_gone", "slots": slots })),
-            )
-                .into_response(),
+                json!({ "error": "image_gone", "slots": slots }),
+            ),
             BrandError::InvalidFontPackage(reason) => (
                 StatusCode::UNPROCESSABLE_ENTITY,
-                Json(json!({ "error": "invalid_font_package", "reason": reason })),
-            )
-                .into_response(),
+                json!({ "error": "invalid_font_package", "reason": reason }),
+            ),
             BrandError::NotAllowed(problems) => (
                 StatusCode::CONFLICT,
-                Json(json!({ "error": "not_allowed", "problems": problems })),
-            )
-                .into_response(),
+                json!({ "error": "not_allowed", "problems": problems }),
+            ),
+        })
+    }
+
+    /// The refusal as one result among many: `{"error": "<code>"}` with the details its own
+    /// answer gives (`reason`, `pairs`, `slots` or `problems`).
+    pub(crate) fn as_result(&self) -> Value {
+        match self.status_and_body() {
+            Some((_, body)) => body,
+            None => match self {
+                BrandError::Api(e) => json!({ "error": e.code() }),
+                _ => json!({ "error": ApiError::Unavailable.code() }),
+            },
+        }
+    }
+}
+
+impl IntoResponse for BrandError {
+    fn into_response(self) -> Response {
+        if let BrandError::Api(e) = self {
+            return e.into_response();
+        }
+        match self.status_and_body() {
+            Some((status, body)) => (status, Json(body)).into_response(),
+            None => ApiError::Unavailable.into_response(),
         }
     }
 }

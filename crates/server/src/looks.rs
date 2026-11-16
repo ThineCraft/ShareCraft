@@ -28,8 +28,8 @@ use revisions::brand::{
     Actor, Align, BUILT_IN_FONT_PACKAGES, BUILT_IN_THEMES, Background, BuiltInTheme, FontPackage,
     FontRef, FontRole, FooterGroup, FooterLayout, Header, HeaderLayout, ImageKind, ImageRef,
     KnownSources, Look, LookFonts, MAX_SITE_FONT_PACKAGES, MAX_SITE_THEMES, MenuStyle, Navigation,
-    OrgBrand, OrgTheme, ResolvedTheme, Theme, check_theme, clean_text, family_name, icon_problem,
-    image_policy_problems, policy_problems,
+    OrgBrand, OrgTheme, ResolvedTheme, TemplateLook, Theme, check_theme, clean_text, family_name,
+    icon_problem, image_policy_problems, policy_problems,
 };
 use revisions::{SiteRecord, SiteTheme};
 use serde::Deserialize;
@@ -45,7 +45,10 @@ use crate::brand::{
     image_from_doc, org_theme, package_name_taken, resolve_edit,
 };
 use crate::sites::{SitesCommit, commit_sites, record_and_start, seen_site, site_event};
-use crate::tree::{ensure_in_step, require};
+use crate::templates::{
+    Unresolved, look_from_references, prune_references, usable_font, usable_image,
+};
+use crate::tree::{NewSiteLook, ensure_in_step, require};
 
 /// How many changes of a look its history lists.
 pub(crate) const HISTORY_LENGTH: i64 = 50;
@@ -468,21 +471,21 @@ fn source_package(
 // ---------------------------------------------------------------------------------------------
 // The brand policy
 
-/// What the brand policy refuses `kind` in `look` for a site whose own records (themes and
-/// font packages, including any this request makes) are `record`, and which makes or changes
-/// `new_themes` and `new_packages`: [`policy_problems`] and [`image_policy_problems`] together,
-/// each problem once.
+/// What the brand policy refuses `kind` in `look` for a site whose own themes and font
+/// packages (including any this request makes) are `own`, and which makes or changes the
+/// themes and packages `new`: [`policy_problems`] and [`image_policy_problems`] together, each
+/// problem once.
 fn problems(
     look: &Look,
     org: &OrgBrand,
-    record: &SiteRecord,
+    own: (&[SiteTheme], &[FontPackage]),
     new: (&[SiteTheme], &[FontPackage]),
     kind: Actor,
 ) -> Vec<String> {
     let known = KnownSources {
         org,
-        site_themes: &record.themes,
-        site_packages: &record.font_packages,
+        site_themes: own.0,
+        site_packages: own.1,
     };
     let mut found = policy_problems(look, &org.policy, &known, new.0, new.1, kind);
     for problem in image_policy_problems(look, &org.policy, &org.images, kind) {
@@ -494,7 +497,8 @@ fn problems(
 }
 
 /// Refuses with `409 not_allowed {problems}` a look `actor` may not set under the brand policy
-/// of `org` (see [`problems`]); administrators and brand managers are never refused.
+/// of `org` on a site whose own themes and font packages are `record`'s (see [`problems`]);
+/// administrators and brand managers are never refused.
 async fn allow_look(
     state: &AppState,
     actor: &User,
@@ -504,7 +508,8 @@ async fn allow_look(
     new: (&[SiteTheme], &[FontPackage]),
 ) -> Result<(), BrandError> {
     let kind = actor_kind(state.db(), actor).await?;
-    let found = problems(look, org, record, new, kind);
+    let own = (record.themes.as_slice(), record.font_packages.as_slice());
+    let found = problems(look, org, own, new, kind);
     if found.is_empty() {
         Ok(())
     } else {
@@ -528,8 +533,9 @@ async fn allow_records(
     }
     let kind = actor_kind(state.db(), actor).await?;
     let neutral = Look::default();
-    let without = problems(&neutral, org, after, (&[], &[]), kind);
-    let added: Vec<String> = problems(&neutral, org, after, new, kind)
+    let own = (after.themes.as_slice(), after.font_packages.as_slice());
+    let without = problems(&neutral, org, own, (&[], &[]), kind);
+    let added: Vec<String> = problems(&neutral, org, own, new, kind)
         .into_iter()
         .filter(|p| !without.contains(p))
         .collect();
@@ -672,8 +678,9 @@ async fn erase_unused(state: &AppState, before: &SiteRecord, after: &SiteRecord)
 
 /// Writes `look` as the look of `site` (named `name`) for `actor`, whose record Git holds as
 /// `start.0` (`None` if it has none; `start.1` is where the change starts), with
-/// `site.look_changed {name, before, after}` (and `rollback`, the entry it goes back to). The
-/// same look again writes nothing. The caller holds the tree lock.
+/// `site.look_changed {name, before, after}` and the fields `extra` (`rollback`, the entry it
+/// goes back to; `applied_by_admin`). The same look again writes nothing. The caller holds the
+/// tree lock.
 async fn commit_look(
     state: &AppState,
     actor: &User,
@@ -681,7 +688,7 @@ async fn commit_look(
     name: &str,
     start: (Option<SiteRecord>, SiteRecord),
     look: Option<Look>,
-    rollback: Option<i64>,
+    extra: Extra,
 ) -> Result<(), BrandError> {
     let (stored, before) = start;
     if before.look == look {
@@ -689,10 +696,10 @@ async fn commit_look(
     }
     let mut after = before.clone();
     after.look = look;
-    let mut detail = json!({ "name": name, "before": before.look, "after": after.look });
-    if let (Some(id), Some(map)) = (rollback, detail.as_object_mut()) {
-        map.insert("rollback".into(), json!(id));
-    }
+    let detail = with_extra(
+        json!({ "name": name, "before": before.look, "after": after.look }),
+        extra,
+    );
     commit_sites(
         state,
         actor,
@@ -711,6 +718,19 @@ async fn commit_look(
     Ok(())
 }
 
+/// Fields added to a `site.look_changed` event's detail.
+pub(crate) type Extra = Vec<(&'static str, Value)>;
+
+/// `detail` (an object) with the fields `extra`.
+fn with_extra(mut detail: Value, extra: Extra) -> Value {
+    if let Some(map) = detail.as_object_mut() {
+        for (key, value) in extra {
+            map.insert(key.to_owned(), value);
+        }
+    }
+    detail
+}
+
 /// Sets the look of `site` to `input` for `actor`, who needs `manage_site` on it (see
 /// [`built_look`] for what is checked). Answers the look settings (see [`settings`]).
 ///
@@ -724,35 +744,48 @@ pub(crate) async fn set_look(
     site: NodeId,
     input: LookInput,
 ) -> Result<Value, BrandError> {
-    {
-        let _turn = state.tree_lock().lock().await;
-        ensure_in_step(state).await?;
-        let name = managed(state, actor, site).await?;
-        let (stored, before) = record_and_start(state, site).await?;
-        let org = state.db().org_brand().await?;
-        let ctx = SlotContext {
-            state,
-            actor,
-            site,
-            current: before.look.iter().flat_map(slots).map(|(_, i)| i).collect(),
-            history: history_images(state.db(), site).await?,
-            org: &org,
-        };
-        history_keeps_available(&ctx, &input).await?;
-        let look = built_look(&ctx, &name, &before, input).await?;
-        allow_look(state, actor, &org, &look, &before, (&[], &[])).await?;
-        commit_look(
-            state,
-            actor,
-            site,
-            &name,
-            (stored.clone(), before.clone()),
-            Some(look),
-            None,
-        )
-        .await?;
-    }
+    change_look(state, actor, site, input, Vec::new()).await?;
     settings_answer(state, actor, site).await
+}
+
+/// Sets the look of `site` to `input` for `actor` as [`set_look`] does, with the fields `extra`
+/// in its event's detail.
+///
+/// # Errors
+/// As [`set_look`].
+pub(crate) async fn change_look(
+    state: &AppState,
+    actor: &User,
+    site: NodeId,
+    input: LookInput,
+    extra: Extra,
+) -> Result<(), BrandError> {
+    let _turn = state.tree_lock().lock().await;
+    ensure_in_step(state).await?;
+    let name = managed(state, actor, site).await?;
+    let (stored, before) = record_and_start(state, site).await?;
+    let org = state.db().org_brand().await?;
+    let ctx = SlotContext {
+        state,
+        actor,
+        site,
+        current: before.look.iter().flat_map(slots).map(|(_, i)| i).collect(),
+        history: history_images(state.db(), site).await?,
+        org: &org,
+    };
+    history_keeps_available(&ctx, &input).await?;
+    let look = built_look(&ctx, &name, &before, input).await?;
+    allow_look(state, actor, &org, &look, &before, (&[], &[])).await?;
+    commit_look(
+        state,
+        actor,
+        site,
+        &name,
+        (stored.clone(), before.clone()),
+        Some(look),
+        extra,
+    )
+    .await
 }
 
 /// Applies the look before (`Which::Before`) or after a change in the history of `site` as a
@@ -815,7 +848,7 @@ pub(crate) async fn rollback(
             &name,
             (stored, before),
             look,
-            Some(event_id),
+            vec![("rollback", json!(event_id))],
         )
         .await?;
     }
@@ -1504,6 +1537,23 @@ pub(crate) async fn copy_look(
     from: NodeId,
     copy: (bool, bool),
 ) -> Result<Value, BrandError> {
+    copy_into(state, actor, site, from, copy, Vec::new()).await?;
+    settings_answer(state, actor, site).await
+}
+
+/// Copies the look of `from` onto `site` for `actor` as [`copy_look`] does, with the fields
+/// `extra` in its event's detail.
+///
+/// # Errors
+/// As [`copy_look`].
+pub(crate) async fn copy_into(
+    state: &AppState,
+    actor: &User,
+    site: NodeId,
+    from: NodeId,
+    copy: (bool, bool),
+    extra: Extra,
+) -> Result<(), BrandError> {
     let (themes, fonts) = copy;
     {
         let _turn = state.tree_lock().lock().await;
@@ -1586,12 +1636,15 @@ pub(crate) async fn copy_look(
         )
         .await?;
         if after != before {
-            let detail = json!({
-                "name": name,
-                "before": before.look,
-                "after": after.look,
-                "copied_from": from.0,
-            });
+            let detail = with_extra(
+                json!({
+                    "name": name,
+                    "before": before.look,
+                    "after": after.look,
+                    "copied_from": from.0,
+                }),
+                extra,
+            );
             commit_sites(
                 state,
                 actor,
@@ -1609,7 +1662,196 @@ pub(crate) async fn copy_look(
             erase_unused(state, &before, &after).await;
         }
     }
-    settings_answer(state, actor, site).await
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Looks from templates
+
+/// The hashes among `hashes` whose content is no longer stored, or not available (held or
+/// quarantined after a rescan): content that is never pinned again.
+async fn unavailable(db: &Db, hashes: Vec<String>) -> Result<HashSet<String>, BrandError> {
+    let missing = db.missing_blobs(&hashes).await?;
+    let mut gone: HashSet<String> = missing.into_iter().collect();
+    for sha in hashes {
+        let held = match revisions::parse_hex(&sha) {
+            Some(hash) => db.availability(&hash).await?.is_some(),
+            None => true,
+        };
+        if held {
+            gone.insert(sha);
+        }
+    }
+    Ok(gone)
+}
+
+/// The content hashes of the brand-centre files `template` refers to that `org` has.
+fn referenced_hashes(template: &TemplateLook, org: &OrgBrand) -> Vec<String> {
+    let look = look_from_references(template, org);
+    let mut out: Vec<String> = slots(&look)
+        .into_iter()
+        .map(|(_, image)| image.sha256.clone())
+        .chain(
+            font_slots(&look)
+                .into_iter()
+                .map(|(_, font)| font.sha256.clone()),
+        )
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The site look `template` makes for a site named `site_name` whose own font packages are
+/// `own_packages`: each reference resolved from the brand centre `org` to a snapshot, and each
+/// that names nothing usable (see [`usable_image`], [`usable_font`]) or content no longer
+/// available left out and answered. Fonts from a site's own package come with that package (as
+/// a copy of a look does): the site's own package equal to it, or else a new one, answered so
+/// the caller adds it. The look is checked as any look is.
+///
+/// # Errors
+/// `422 low_contrast` or `invalid_look`; otherwise `503`.
+async fn resolve_template(
+    db: &Db,
+    org: &OrgBrand,
+    template: &TemplateLook,
+    own_packages: &[FontPackage],
+    site_name: &str,
+) -> Result<(Look, Option<FontPackage>, Vec<Unresolved>), BrandError> {
+    let gone = unavailable(db, referenced_hashes(template, org)).await?;
+    let mut pruned = template.clone();
+    let unresolved = prune_references(
+        &mut pruned,
+        &|slot, id| usable_image(org, slot, id).is_some_and(|i| !gone.contains(&i.sha256)),
+        &|id| usable_font(org, id).is_some_and(|f| !gone.contains(&f.sha256)),
+    );
+    let mut look = look_from_references(&pruned, org);
+    let mut brought = None;
+    if let Some(fonts) = &mut look.fonts
+        && fonts.from.starts_with("site:")
+    {
+        let same = own_packages.iter().find(|p| {
+            p.name == fonts.package.name
+                && p.display == fonts.package.display
+                && p.content == fonts.package.content
+                && p.roles == fonts.package.roles
+        });
+        let id = match same {
+            Some(package) => package.id,
+            None => Uuid::new_v4(),
+        };
+        fonts.package.id = id;
+        fonts.from = format!("site:{id}");
+        if same.is_none() {
+            brought = Some(fonts.package.clone());
+        }
+    }
+    check_theme(&look.theme).map_err(BrandError::LowContrast)?;
+    if let Some(problem) = look.problem(site_name) {
+        return Err(BrandError::InvalidLook(problem));
+    }
+    Ok((look, brought, unresolved))
+}
+
+/// What the brand policy of `org` refuses `kind` in `look` as the look of a new site whose
+/// only own records are the font packages `packages` it brings (see [`problems`]).
+fn new_site_problems(
+    look: &Look,
+    org: &OrgBrand,
+    packages: &[FontPackage],
+    kind: Actor,
+) -> Vec<String> {
+    problems(look, org, (&[], packages), (&[], packages), kind)
+}
+
+/// The look a new site named `site_name` made by `actor` from a template with the look
+/// `template` gets (see [`resolve_template`]), with the font package it brings. The brand
+/// policy holds when the creator is not an administrator (today only administrators create
+/// sites, so it is the rule for when others may).
+///
+/// # Errors
+/// `422 low_contrast` or `invalid_look`; `409 not_allowed {problems}`; otherwise `503`.
+pub(crate) async fn template_site_look(
+    state: &AppState,
+    actor: &User,
+    template: &TemplateLook,
+    site_name: &str,
+) -> Result<NewSiteLook, BrandError> {
+    let db = state.db();
+    let org = db.org_brand().await?;
+    let (look, brought, unresolved) = resolve_template(db, &org, template, &[], site_name).await?;
+    let font_packages: Vec<FontPackage> = brought.into_iter().collect();
+    let kind = actor_kind(db, actor).await?;
+    let found = new_site_problems(&look, &org, &font_packages, kind);
+    if !found.is_empty() {
+        return Err(BrandError::NotAllowed(found));
+    }
+    Ok(NewSiteLook {
+        look: Some(look),
+        font_packages,
+        unresolved,
+    })
+}
+
+/// Applies the look `look` of the template `template` to `site` for `actor`, an administrator
+/// applying looks to many sites: resolved as for a new site (see [`resolve_template`]), the
+/// font package it brings added to the site's own, one sites commit with
+/// `site.look_changed {name, before, after, template, applied_by_admin}`; the same look again
+/// writes nothing. Answers the references left out.
+///
+/// # Errors
+/// As [`set_look`]; `409 name_taken` / `too_many` for the package it brings.
+pub(crate) async fn apply_template_look(
+    state: &AppState,
+    actor: &User,
+    site: NodeId,
+    template: &str,
+    look: &TemplateLook,
+) -> Result<Vec<Unresolved>, BrandError> {
+    let _turn = state.tree_lock().lock().await;
+    ensure_in_step(state).await?;
+    let name = managed(state, actor, site).await?;
+    let (stored, before) = record_and_start(state, site).await?;
+    let db = state.db();
+    let org = db.org_brand().await?;
+    let (resolved, brought, unresolved) =
+        resolve_template(db, &org, look, &before.font_packages, &name).await?;
+    let mut after = before.clone();
+    let brought: Vec<FontPackage> = brought.into_iter().collect();
+    let made = merged(
+        &mut after.font_packages,
+        &brought,
+        MAX_SITE_FONT_PACKAGES,
+        |p| p.id,
+        |p| &p.name,
+    )?;
+    allow_look(state, actor, &org, &resolved, &after, (&[], &made)).await?;
+    after.look = Some(resolved);
+    if after != before {
+        let detail = json!({
+            "name": name,
+            "before": before.look,
+            "after": after.look,
+            "template": template,
+            "applied_by_admin": true,
+        });
+        commit_sites(
+            state,
+            actor,
+            SitesCommit {
+                message: format!("Apply a template's look to {name}"),
+                changed: vec![(stored, after.clone())],
+                needs_admin: true,
+                needs: vec![(site, Perms::MANAGE_SITE)],
+                also_lock: Vec::new(),
+                release_hub: None,
+                events: vec![site_event("site.look_changed", actor, site, detail)],
+            },
+        )
+        .await?;
+        erase_unused(state, &before, &after).await;
+    }
+    Ok(unresolved)
 }
 
 #[cfg(test)]
@@ -1651,6 +1893,52 @@ mod tests {
         all.insert(hub.id, settings_with(hub.look.clone(), None, false));
         assert!(lending_hub_in(&own, &all, &none).is_none());
         assert_eq!(list_marks(&own, None).1, "#2f6b3a");
+    }
+
+    #[test]
+    fn template_looks_hold_owners_to_the_policy() {
+        let mut org = OrgBrand {
+            policy: revisions::brand::BrandPolicy {
+                hide_builtin_themes: true,
+                custom_colours: false,
+                site_themes: false,
+                site_images: false,
+                site_fonts: false,
+            },
+            ..OrgBrand::default()
+        };
+        let template: TemplateLook = serde_json::from_value(serde_json::json!({
+            "theme": { "name": "Ours", "primary": "#1f5f8b", "secondary": "#163447" },
+            "from": "custom",
+            "logo_alt": "",
+            "header": { "layout": "compact", "background": "none", "align": "left",
+                        "hide_title": false },
+            "navigation": "horizontal",
+            "footer": { "enabled": false, "layout": "simple", "name": "", "background": "none",
+                        "groups": [] },
+            "fonts": { "package": { "name": "Ours", "roles": { "title": "system-serif",
+                       "heading": "system", "body": "system", "interactive": "system" } },
+                       "from": format!("site:{}", Uuid::new_v4()) },
+        }))
+        .unwrap();
+        let mut look = look_from_references(&template, &org);
+        let package = look.fonts.as_ref().unwrap().package.clone();
+        look.fonts.as_mut().unwrap().from = format!("site:{}", package.id);
+        let packages = vec![package];
+        let owner = new_site_problems(&look, &org, &packages, Actor::Owner);
+        assert!(
+            owner.iter().any(|p| p.contains("custom colours")),
+            "{owner:?}"
+        );
+        assert!(
+            owner.iter().any(|p| p.contains("site-only font packages")),
+            "{owner:?}"
+        );
+        assert!(new_site_problems(&look, &org, &packages, Actor::BrandManager).is_empty());
+        assert!(new_site_problems(&look, &org, &packages, Actor::Admin).is_empty());
+        // The same look from an open brand centre is fine for an owner too.
+        org.policy = revisions::brand::BrandPolicy::default();
+        assert!(new_site_problems(&look, &org, &packages, Actor::Owner).is_empty());
     }
 
     #[test]
