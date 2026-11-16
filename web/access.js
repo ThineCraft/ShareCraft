@@ -33,6 +33,7 @@ import { avatarColour, initials } from './account.js';
 import { setupMenu } from './menu.js';
 import { showToast } from './toast.js';
 import { accessSummary, comboboxFilter, looksLikeEmail, permsSentence, sortEntries } from './share.js';
+import { settle, settleAll } from './skeleton.js';
 
 const $ = (id) => document.getElementById(id);
 const error = $('error');
@@ -723,8 +724,12 @@ $('revoke-form').addEventListener('submit', async (event) => {
 // Everything above is wired; now the page is drawn.
 await refresh();
 await refreshLinks();
+// The head is drawn: its height is remembered; what could not be drawn is put back (skeleton.js).
+settle(document.querySelector('.share-head'), { drawn: Boolean(state) });
+settleAll();
 
 function fail(text) {
+  settleAll();
   showMessage(error, text);
   throw new Error(text);
 }

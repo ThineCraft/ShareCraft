@@ -4,6 +4,12 @@
 import { CHECK_LABELS, MIN_RATIO, applyLook, parseColour } from './look.js';
 import { setupAccountMenu, setupWordmark } from './account.js';
 import { existingSidebar, sidebar } from './workspace.js';
+import { prefetchCache, prefetchKey, setupPrefetch } from './prefetch.js';
+import { connection } from './connection.js';
+import { rememberChrome } from './skeleton.js';
+
+// Pointing at a link to another page asks for its first answers early (prefetch.js).
+setupPrefetch();
 
 const MESSAGES = {
   invalid_credentials: 'That email and password do not match.',
@@ -160,16 +166,38 @@ export function inheritAgainMessage(code) {
  * package, say).
  */
 export async function api(method, path, body, { raw = false } = {}) {
+  // A read the page is about to make may have been asked for already, when the person pointed at
+  // the link that opened this page (prefetch.js); a change empties what was kept.
+  const cache = prefetchCache();
+  const key = body === undefined ? prefetchKey(method, path) : null;
+  if (key) {
+    const kept = cache?.take(key);
+    if (kept) return { ok: true, status: kept.status, data: kept.data, error: null };
+  } else cache?.clear();
   const init = { method, credentials: 'same-origin', headers: {} };
   if (body !== undefined) {
     init.headers['Content-Type'] = 'application/json';
     init.body = raw ? body : JSON.stringify(body);
   }
+  // The connection banner (connection.js) hears of every failure and every answer. While the
+  // browser is offline nothing is sent: the request waits for the connection. A read that could
+  // not reach the server is asked again once it can; a change is never sent twice.
+  const link = connection();
   let response;
-  try {
-    response = await fetch(`/api${path}`, init);
-  } catch {
-    return { ok: false, status: 0, data: null, error: 'network' };
+  for (let tries = 0; ; tries += 1) {
+    if (link && globalThis.navigator?.onLine === false && !(await link.whenBack())) {
+      return { ok: false, status: 0, data: null, error: 'network' };
+    }
+    try {
+      response = await fetch(`/api${path}`, init);
+      link?.reached();
+      break;
+    } catch {
+      link?.lost();
+      if (!link || method !== 'GET' || tries >= 2 || !(await link.whenBack())) {
+        return { ok: false, status: 0, data: null, error: 'network' };
+      }
+    }
   }
   let data = null;
   if (response.status !== 204) {
@@ -189,6 +217,7 @@ export const seg = (value) => encodeURIComponent(value);
 
 /** Opens the sign-in page, which brings the person back to this page and hash afterwards. */
 export function goToSignIn() {
+  prefetchCache()?.clear();
   const next = location.pathname + location.search + location.hash;
   location.replace(`/signin.html?next=${encodeURIComponent(next)}`);
 }
@@ -1708,6 +1737,8 @@ export async function siteChrome(siteId, { currentId, place, footer = false, fra
       },
       place,
     );
+    // The heights the header and navigation took, so that the next visit reserves them (skeleton.js).
+    rememberChrome();
   }
   return shown;
 }
@@ -1726,6 +1757,7 @@ export async function organisationChrome({ place } = {}) {
   const [, navigation] = await Promise.all([useOrganisationRegional(), api('GET', '/navigation')]);
   const global = navigation.ok ? navigation.data.items : [];
   placeChrome(navigationView(null, { global, hub: null, local: [] }), place);
+  if (!place) rememberChrome();
 }
 
 /** `Team site` or `Communication site`. */

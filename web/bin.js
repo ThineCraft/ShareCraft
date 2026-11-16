@@ -46,6 +46,7 @@ import { extendSelection, moveIndex, selectionText, toggleSelection } from './se
 import { addShortcut, isMacPlatform } from './shortcuts.js';
 import { runLatestAction, showToast } from './toast.js';
 import { buildUndo, isUndoKey, performUndo } from './undo.js';
+import { settle, settleAll } from './skeleton.js';
 
 const PAGE = 500; // entries asked for at a time
 const LOAD = 2000; // entries loaded before "Show more" asks for the rest
@@ -121,6 +122,10 @@ $('clear-filters').addEventListener('click', () => {
 });
 registerKeys();
 await reload();
+// The head and the bar are drawn: their heights are remembered (skeleton.js).
+settle($('bin-head'));
+settle($('bin-bar'));
+settleAll();
 
 /** Forgets the last Empty's summary so it does not linger over another listing. */
 function clearSummary() {
@@ -781,6 +786,7 @@ function registerKeys() {
 }
 
 function fail(text) {
+  settleAll();
   showMessage(error, text);
   throw new Error(text);
 }

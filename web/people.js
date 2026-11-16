@@ -8,23 +8,14 @@ import { avatarColour, initials } from './account.js';
 import { setupMenu } from './menu.js';
 import { listFilter, mountAdminShell, passwordCheck, peopleSummary } from './admin-shell.js';
 import { showToast } from './toast.js';
+import { settleAll } from './skeleton.js';
 
 const $ = (id) => document.getElementById(id);
 const error = $('error');
 const status = $('status');
 const dialog = $('add-dialog');
 
-let me;
-try {
-  me = await requireMe();
-} catch (err) {
-  status.textContent = err.message;
-  throw err;
-}
-setupTopbar(me, error);
-mountAdminShell({ me, current: 'people' });
-await organisationChrome();
-
+// The search field is in place from the start, so the list does not move when it comes.
 const filter = listFilter({
   id: 'find-person',
   label: 'Find a person by name or email',
@@ -35,6 +26,18 @@ const filter = listFilter({
 });
 $('users').before(filter.element);
 
+let me;
+try {
+  me = await requireMe();
+} catch (err) {
+  settleAll();
+  status.textContent = err.message;
+  throw err;
+}
+setupTopbar(me, error);
+mountAdminShell({ me, current: 'people' });
+await organisationChrome();
+
 if (!me.is_admin) {
   status.textContent = 'Only administrators can manage people.';
 } else {
@@ -43,6 +46,7 @@ if (!me.is_admin) {
   $('add-button').addEventListener('click', openAdd);
   await showUsers();
 }
+settleAll(); // what could not be drawn is put back as it was (skeleton.js)
 
 async function showUsers() {
   const result = await api('GET', '/admin/users');

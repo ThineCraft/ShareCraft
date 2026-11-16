@@ -32,6 +32,7 @@ import { buildUndo, performUndo } from './undo.js';
 import { relativeTime } from './files.js';
 import { libraryCardModel, libraryIcon, ownerChip, recentAcrossLibraries, recentIcon } from './site-home.js';
 import { checklistModel, readWelcome, showChecklist, unsetParts, unsetText, writeWelcome } from './new-site.js';
+import { settle, settleAll } from './skeleton.js';
 
 const $ = (id) => document.getElementById(id);
 const error = $('error');
@@ -144,6 +145,7 @@ async function refreshSite(fallback) {
 }
 
 showAbout();
+settle($('about'), { drawn: Boolean(info) }); // its placeholder goes (skeleton.js)
 
 // ---- Join or leave a hub… ----
 
@@ -504,6 +506,8 @@ $('gs-dismiss').addEventListener('click', () => {
 
 if (mayGetStarted()) await readChecklistFacts();
 await showLibraries();
+settle($('get-started'));
+settleAll(); // whatever the page could not draw is put back as it was
 // What the wizard could not set on the new site is said once, with the way to try again.
 if (unset.length) {
   showToast(unsetText(unset), {
@@ -530,6 +534,7 @@ if (info?.is_hub) {
 }
 
 function fail(text) {
+  settleAll();
   showMessage(error, text);
   throw new Error(text);
 }

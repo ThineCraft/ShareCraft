@@ -22,6 +22,7 @@ import { fileIcon, fileKind, relativeTime } from './files.js';
 import { setupNewSiteWizard } from './new-site-wizard.js';
 import { addPaletteActions } from './palette.js';
 import { forgetOpened, greeting, hourIn, readRecent, siteCardModel } from './start.js';
+import { settleAll } from './skeleton.js';
 
 const $ = (id) => document.getElementById(id);
 const error = $('error');
@@ -30,6 +31,7 @@ let me;
 try {
   me = await requireMe();
 } catch (err) {
+  settleAll();
   $('status').textContent = err.message;
   throw err;
 }
@@ -145,6 +147,7 @@ $('clear-filters').addEventListener('click', () => {
   load();
 });
 await load();
+settleAll(); // what could not be drawn (the cards, when they could not be read) is put back (skeleton.js)
 
 /** Keeps the search in the address (`?q=&kind=&hub=`), so it can be reloaded or shared. */
 function remember() {

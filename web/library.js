@@ -58,6 +58,7 @@ import {
 import { fileIcon, fileKind, nextSort, parseSort, relativeTime, sortDescription, sortEntries, splitName, typeLabel } from './files.js';
 import { addShortcut, isMacPlatform } from './shortcuts.js';
 import { extendSelection, moveIndex, selectionText, toggleSelection } from './selection.js';
+import { settleAll, softly } from './skeleton.js';
 
 const BULK_MAX = 500;
 const GRID_PAGE = 200; // the grid's page, the most the server answers at once
@@ -193,6 +194,7 @@ $('select-all').addEventListener('change', () => {
   render();
 });
 await reload();
+settleAll(); // what could not be drawn is put back as it was (skeleton.js)
 setupTree();
 markCrumbs();
 // Upload files on a new site's Get started list arrives as #upload: the New menu opens on Upload
@@ -208,19 +210,31 @@ if (location.hash === '#upload') {
 // ---- the listing ----
 
 async function reload() {
+  clearList();
+  await loadPage();
+  tree?.refresh();
+}
+
+function clearList() {
   items = [];
   next = null;
   selected.clear();
   anchor = null;
   inline = null;
-  await loadPage();
-  tree?.refresh();
+}
+
+/** The query of a page of the listing after `after` (null for the first). */
+function listQuery(after) {
+  const grid = view === 'grid';
+  return `limit=${grid ? GRID_PAGE : PAGE}${grid ? '&view=grid' : ''}${after ? `&after=${encodeURIComponent(after)}` : ''}`;
 }
 
 async function loadPage() {
-  const grid = view === 'grid';
-  const query = `limit=${grid ? GRID_PAGE : PAGE}${grid ? '&view=grid' : ''}${next ? `&after=${encodeURIComponent(next)}` : ''}`;
-  const result = await api('GET', `/nodes/${seg(nodeId)}/children?${query}`);
+  takePage(await api('GET', `/nodes/${seg(nodeId)}/children?${listQuery(next)}`));
+}
+
+/** Adds the page of the listing `result` answered, or says why there is none. */
+function takePage(result) {
   if (!result.ok) {
     note(messageFor(result.error), true);
     return;
@@ -761,16 +775,24 @@ async function switchTo(id, { push = true } = {}) {
     location.assign(last ? pageFor(last.kind, last.id) : `/library.html?id=${seg(id)}`);
     return;
   }
-  if (push) history.pushState({ place: id }, '', pageFor(last.kind, id));
-  nodeId = id;
-  here = { path, access: found.data.access };
-  self = last;
-  $('crumbs').replaceChildren(breadcrumbs(path, { linkLast: false }));
-  markCrumbs();
-  note('', false);
-  showPlace();
-  tree?.show(id, path.slice(path.findIndex((step) => step.id === libraryStep.id)));
-  await reload();
+  // The new folder's first page is read before anything changes, so that the swap is one soft
+  // crossfade (a view transition, skeleton.js) from the old folder to the new one.
+  const first = await api('GET', `/nodes/${seg(id)}/children?${listQuery(null)}`);
+  if (ask !== switching) return;
+  await softly(() => {
+    if (push) history.pushState({ place: id }, '', pageFor(last.kind, id));
+    nodeId = id;
+    here = { path, access: found.data.access };
+    self = last;
+    $('crumbs').replaceChildren(breadcrumbs(path, { linkLast: false }));
+    markCrumbs();
+    note('', false);
+    showPlace();
+    tree?.show(id, path.slice(path.findIndex((step) => step.id === libraryStep.id)));
+    clearList();
+    takePage(first);
+    tree?.refresh();
+  });
   scrollTo(0, 0);
   $('title').focus();
 }
@@ -1662,6 +1684,7 @@ function renameInPlace(item, { back = 'row' } = {}) {
 }
 
 function fail(text) {
+  settleAll();
   showMessage(error, text);
   throw new Error(text);
 }

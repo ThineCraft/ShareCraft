@@ -1819,3 +1819,44 @@ dialog h4.theme-group-label{margin:0 0 var(--space-2);font-size:var(--text-xs);f
 .gs-hint{color:var(--muted);font-size:var(--text-sm)}
 .gs-done{margin:var(--space-2) 0 0;color:var(--ok);font-weight:600}
 @media (forced-colors:active){.gs-item.done .gs-tick,.ws.current .ws-number{background:Highlight;border-color:Highlight;color:HighlightText}}
+/* ---- round 25: skeleton screens, the connection banner and soft page changes ----
+   Placeholders sit in the very elements and classes of what is coming (cards, rows, header band), so
+   nothing moves when it comes; grey bars stand on the text line they replace. The shimmer is gentle
+   and never runs under reduced motion. */
+:root{--sk:color-mix(in srgb,var(--text) 9%,transparent);--sk-shine:color-mix(in srgb,var(--paper) 60%,transparent)}
+.sk{display:inline-block;vertical-align:middle;width:var(--sk-w,60%);max-width:100%;height:.8em;border-radius:var(--radius-sm);background:var(--sk)}
+.sk-box{display:block;flex:none;max-width:none}
+.sk-icon{width:24px;height:24px}
+.sk-check{width:20px;height:20px}
+.sk-control{width:var(--control);height:var(--control-sm)}
+.sk-item{pointer-events:none;user-select:none}
+.sk-item:is(.site-card,.library-card,.recent-file):hover{border-color:var(--line);box-shadow:var(--shadow-1)}
+.sk-item .card-band,.sk-item .lib-pic,.sk-item .avatar{background:var(--sk);box-shadow:none}
+.sk-item .file-pic{display:grid}
+.sk-item.bin-group .bin-row .actions{margin-left:auto}
+.sk-item .chip{border-color:transparent;background:var(--sk)}
+.sk-item .chip .sk{background:transparent}
+ol.sk-item li+li::before{color:var(--line)}
+.sk-header{height:var(--sk-h,52px);min-height:0;background:var(--sk)}
+.sk-chrome{height:var(--sk-h,41px)}
+.sk-reserve{min-height:var(--sk-min)}
+#about[aria-busy=true]>:not(.sk-item){display:none}
+[aria-busy=true][inert],[inert]>[aria-busy=true]{cursor:progress}
+@media (prefers-reduced-motion:no-preference){
+ .sk,.sk-header,.sk-item .card-band,.sk-item .lib-pic,.sk-item .avatar{background-image:linear-gradient(100deg,transparent 30%,var(--sk-shine) 50%,transparent 70%);background-size:300% 100%;background-repeat:no-repeat;animation:sk-shimmer 1.6s ease-in-out infinite}
+}
+@keyframes sk-shimmer{from{background-position:100% 0}to{background-position:0 0}}
+@media (forced-colors:active){.sk,.sk-header,.sk-item .card-band,.sk-item .lib-pic,.sk-item .avatar{background:GrayText;forced-color-adjust:none}}
+/* the connection banner: slim and neutral, floating at the top so the page does not move under it */
+.conn-banner{position:fixed;top:max(var(--space-2),env(safe-area-inset-top));left:50%;z-index:70;display:flex;align-items:center;gap:var(--space-2) var(--space-3);width:max-content;max-width:calc(100vw - 32px);min-height:var(--control);margin:0;padding:var(--space-1) var(--space-2) var(--space-1) var(--space-4);transform:translateX(-50%);border:1px solid var(--line);border-radius:var(--radius-pill);background:var(--paper);color:var(--text);box-shadow:var(--shadow-2);font-size:var(--text-sm)}
+.conn-banner::before{content:"";flex:none;width:8px;height:8px;border-radius:50%;background:var(--muted)}
+.conn-banner .conn-text{overflow-wrap:anywhere}
+.conn-banner .conn-retry{flex:none;min-height:var(--control-sm);padding:var(--space-1) var(--space-3)}
+@media (max-width:600px){.conn-banner{left:8px;right:8px;width:auto;max-width:none;transform:none;border-radius:var(--radius-md)}}
+@media (forced-colors:active){.conn-banner{border-color:CanvasText}.conn-banner::before{background:CanvasText}}
+/* soft page changes: a short crossfade between pages and in-page folder switches, where the browser
+   has view transitions; none under reduced motion */
+@media (prefers-reduced-motion:no-preference){
+ @view-transition{navigation:auto}
+ ::view-transition-old(root),::view-transition-new(root){animation-duration:180ms;animation-timing-function:var(--ease)}
+}
