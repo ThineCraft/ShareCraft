@@ -59,7 +59,8 @@ pub fn run_package(args: &[String]) -> Result<()> {
     check_postgres(&postgres)?;
     let version = version_info(&root)?;
 
-    run(cargo(&root).args([
+    // The server shows this version at the foot of its signed-in pages.
+    run(cargo(&root).env("SHARECRAFT_BUILD", &version.name).args([
         "build",
         "--release",
         "-p",

@@ -34,6 +34,9 @@ pub(crate) struct Me {
     is_admin: bool,
     /// How many open requests for access the person may decide, for a badge.
     open_requests: i64,
+    /// This build's version, shown at the foot of every signed-in page. Only signed-in people
+    /// see it, so strangers cannot tell which build answers.
+    version: &'static str,
 }
 
 /// `POST /api/session`: checks the email and password and sets the session cookie.
@@ -184,5 +187,6 @@ pub(crate) async fn me(
         name: user.name,
         is_admin: user.is_admin,
         open_requests,
+        version: crate::VERSION,
     }))
 }

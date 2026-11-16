@@ -88,8 +88,11 @@ async fn sign_in_sets_an_http_only_cookie_and_me_answers() {
             "name": "Ann",
             "is_admin": false,
             "open_requests": 0,
+            "version": server::VERSION,
         })
     );
+    // A test build is not a packaged one: its version says so.
+    assert!(server::VERSION.ends_with("-dev"), "{}", server::VERSION);
 }
 
 #[tokio::test]

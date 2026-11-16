@@ -2,7 +2,7 @@
 // sign-in redirect. Pages hold no merging or permission logic; the server decides.
 
 import { CHECK_LABELS, MIN_RATIO, applyLook, parseColour } from './look.js';
-import { setupAccountMenu, setupWordmark } from './account.js';
+import { setupAccountMenu, setupWordmark, showVersion } from './account.js';
 import { existingSidebar, sidebar } from './workspace.js';
 import { prefetchCache, prefetchKey, setupPrefetch } from './prefetch.js';
 import { connection } from './connection.js';
@@ -679,6 +679,7 @@ export function setupTopbar(me, error) {
     });
     startInbox(me, bar);
     startShell(me, account);
+    showVersion(me.version);
   }
   startPalette(me);
 }

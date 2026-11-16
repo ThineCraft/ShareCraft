@@ -1860,3 +1860,6 @@ ol.sk-item li+li::before{color:var(--line)}
  @view-transition{navigation:auto}
  ::view-transition-old(root),::view-transition-new(root){animation-duration:180ms;animation-timing-function:var(--ease)}
 }
+
+/* The build's version at the foot of signed-in pages (account.js showVersion). */
+.build-version{margin:var(--space-6) auto 0;padding:0 var(--space-4);max-width:1200px;text-align:center;color:var(--muted);font-size:var(--text-xs)}

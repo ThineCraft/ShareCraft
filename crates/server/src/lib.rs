@@ -53,6 +53,13 @@ use tower_http::services::ServeDir;
 
 use deployment::{Deployment, Production, Refusal, SameOrigin};
 
+/// This build's version: what `cargo xtask package` names it (`0.1.0-6a18271`, from
+/// `SHARECRAFT_BUILD` at compile time), or the crate's version marked `-dev` for any other build.
+pub const VERSION: &str = match option_env!("SHARECRAFT_BUILD") {
+    Some(version) => version,
+    None => concat!(env!("CARGO_PKG_VERSION"), "-dev"),
+};
+
 pub use api::uploads::uploads_path;
 pub use blobs::blobs_path;
 pub use checkpoint::{Checkpointer, library_path};
@@ -484,11 +491,11 @@ pub async fn serve(config: Config, listener: TcpListener) -> std::io::Result<()>
     let state = prepare(config).await?;
     match state.deployment().production() {
         None => {
-            println!("ShareCraft server listening on http://{addr}");
+            println!("ShareCraft {VERSION} listening on http://{addr}");
             println!("WARNING: development mode, local connections only");
         }
         Some(production) => {
-            println!("ShareCraft server listening on {addr}");
+            println!("ShareCraft {VERSION} listening on {addr}");
             println!(
                 "Production mode: public address {}, trusted proxies {}",
                 production.public, production.proxies

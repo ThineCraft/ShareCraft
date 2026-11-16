@@ -124,6 +124,23 @@ function appearanceNow() {
  * `brandManager` is a promise of whether the person manages the brand (administrators always
  * see Brand centre); `signOut()` signs out. Returns the menu's controls.
  */
+/**
+ * The words at the foot of a signed-in page naming this build, such as "ShareCraft 0.1.0-6a18271",
+ * or null when the server named none or something that is not a plain version.
+ */
+export function versionText(version) {
+  if (typeof version !== 'string' || !/^[0-9A-Za-z.+-]{1,40}$/.test(version)) return null;
+  return `ShareCraft ${version}`;
+}
+
+/** Adds the build's version at the foot of the page, once. */
+export function showVersion(version) {
+  const text = versionText(version);
+  if (!text || typeof document === 'undefined' || document.getElementById('build-version')) return;
+  const foot = el('footer', { id: 'build-version', class: 'build-version' }, text);
+  document.body.append(foot);
+}
+
 export function setupAccountMenu(bar, me, { brandManager = Promise.resolve(false), signOut } = {}) {
   const name = me.name || me.email || 'You';
   const colour = avatarColour(me.id ?? me.email ?? name);
