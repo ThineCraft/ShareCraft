@@ -1,7 +1,8 @@
 // The image picker: a dialog listing the image files of the asset libraries the person can view
 // (and, on Change the look, the libraries of that site, and the brand centre's images), with
-// thumbnails, a name filter and keyboard use. The listing and the filter are pure and tested;
-// the server judges every image again when it is chosen.
+// thumbnails, a name filter and keyboard use. In font mode it lists font files instead. The
+// listing and the filter are pure and tested; the server judges every file again when it is
+// chosen.
 
 import { api, h, seg, showThumbnail } from './common.js';
 
@@ -14,8 +15,26 @@ const MAX_FOLDERS = 200;
 /** At most this many images are listed. */
 const MAX_IMAGES = 2000;
 
+/** The file names brand fonts may have (judged again by content). */
+const FONT_NAME = /.\.(woff2?|ttf|otf)$/i;
+
 /** Whether `name` is the name of an image file a brand may use. */
 export const isImageName = (name) => typeof name === 'string' && IMAGE_NAME.test(name);
+
+/** Whether `name` is the name of a font file a brand may use. */
+export const isFontName = (name) => typeof name === 'string' && FONT_NAME.test(name);
+
+/**
+ * The font files among `items` of `library`, by name, as [`imageEntries`] lists images: each
+ * `{doc, name, library, thumb: null}` (a font has no thumbnail).
+ */
+export function fontEntries(items, library) {
+  return (Array.isArray(items) ? items : [])
+    .filter((item) => item?.kind === 'document' && isFontName(item.name))
+    .filter((item) => !item.scan && item.policy !== 'blocked')
+    .map((item) => ({ doc: item.id, name: item.name, library: String(library?.name ?? ''), thumb: null }))
+    .sort((a, b) => a.name.localeCompare(b.name) || a.library.localeCompare(b.library));
+}
 
 /**
  * The image files among `items` (a page of `GET /api/nodes/{id}/children`) of `library`
@@ -71,8 +90,8 @@ async function librariesFor(siteId) {
   return libraries;
 }
 
-/** The image entries of `libraries`, their folders opened breadth first within the limits. */
-async function gather(libraries) {
+/** The entries (by `entriesOf`, images by default) of `libraries`, their folders opened breadth first within the limits. */
+async function gather(libraries, entriesOf = imageEntries) {
   const entries = [];
   let opened = 0;
   for (const library of libraries) {
@@ -80,7 +99,7 @@ async function gather(libraries) {
     while (queue.length && opened < MAX_FOLDERS && entries.length < MAX_IMAGES) {
       const items = await children(queue.shift());
       opened += 1;
-      entries.push(...imageEntries(items, library));
+      entries.push(...entriesOf(items, library));
       for (const item of items) if (item.kind === 'folder') queue.push(item.id);
     }
   }
@@ -102,20 +121,26 @@ function arrowKeys(list) {
 
 /**
  * Opens the picker. `siteId` adds that site's libraries; `brandImages` (the brand centre's
- * images, `{id, name, url}`) are offered first. Resolves `{doc, name}` for a library file,
- * `{brand_image, sha256, name}` for a brand image, or null for Cancel or Escape.
+ * images, `{id, name, url}`) are offered first. `mode` `'font'` lists font files instead of
+ * images (and no brand images). `brandOnly`, a sentence, offers the brand images alone and
+ * says why the libraries are not listed (the brand policy). Resolves `{doc, name}` for a library
+ * file, `{brand_image, sha256, name}` for a brand image, or null for Cancel or Escape.
  */
-export function pickImage({ siteId = null, brandImages = [], title = 'Choose an image' } = {}) {
+export function pickImage({ siteId = null, brandImages = [], title = 'Choose an image', mode = 'image', brandOnly = null } = {}) {
+  const fonts = mode === 'font';
+  const noun = fonts ? ['font file', 'font files'] : ['image', 'images'];
   return new Promise((resolve) => {
     const filter = h('input', { type: 'text', id: 'picker-filter', autocomplete: 'off', 'aria-describedby': 'picker-status' });
-    const status = h('p', { id: 'picker-status', class: 'meta', role: 'status', 'aria-live': 'polite' }, 'Looking for images…');
-    const list = h('ul', { class: 'list grid picker', 'aria-label': 'Images' });
+    const status = h('p', { id: 'picker-status', class: 'meta', role: 'status', 'aria-live': 'polite' }, `Looking for ${noun[1]}…`);
+    const list = h('ul', { class: 'list grid picker', 'aria-label': fonts ? 'Font files' : 'Images' });
+    const limit = brandOnly ? h('p', { class: 'note' }, brandOnly) : null;
     const cancel = h('button', { type: 'button', class: 'plain' }, 'Cancel');
     const dialog = h(
       'dialog',
       { 'aria-label': title, class: 'picker-dialog' },
       h('h2', {}, title),
       h('div', { class: 'field' }, h('label', { for: 'picker-filter' }, 'Filter by name'), filter),
+      limit,
       status,
       list,
       h('div', { class: 'row end' }, cancel),
@@ -132,7 +157,7 @@ export function pickImage({ siteId = null, brandImages = [], title = 'Choose an 
     dialog.addEventListener('close', () => answer(null));
     arrowKeys(list);
 
-    const brand = (brandImages ?? [])
+    const brand = (fonts ? [] : (brandImages ?? []))
       .filter((image) => typeof image?.url === 'string')
       .map((image) => ({
         brand_image: image.id,
@@ -154,15 +179,16 @@ export function pickImage({ siteId = null, brandImages = [], title = 'Choose an 
       button.addEventListener('click', () =>
         answer(entry.brand_image ? { brand_image: entry.brand_image, sha256: entry.sha256, name: entry.name } : { doc: entry.doc, name: entry.name }),
       );
-      showThumbnail(picture, entry.thumb);
+      if (entry.thumb) showThumbnail(picture, entry.thumb);
+      else picture.append(h('span', { class: 'placeholder' }, 'Aa'));
       return h('li', {}, button);
     };
     const show = (done) => {
       const shown = filterImages(entries, filter.value);
       list.replaceChildren(...shown.map(tile));
-      if (!done) status.textContent = 'Looking for images…';
-      else if (!entries.length) status.textContent = 'There are no images in the libraries you can see.';
-      else status.textContent = shown.length === 1 ? '1 image' : `${shown.length} images`;
+      if (!done) status.textContent = `Looking for ${noun[1]}…`;
+      else if (!entries.length) status.textContent = brandOnly ? 'There are no brand images yet.' : `There are no ${noun[1]} in the libraries you can see.`;
+      else status.textContent = shown.length === 1 ? `1 ${noun[0]}` : `${shown.length} ${noun[1]}`;
     };
     let loaded = false;
     filter.addEventListener('input', () => show(loaded));
@@ -170,8 +196,7 @@ export function pickImage({ siteId = null, brandImages = [], title = 'Choose an 
     dialog.showModal();
     filter.focus();
     show(false);
-    librariesFor(siteId)
-      .then(gather)
+    (brandOnly ? Promise.resolve([]) : librariesFor(siteId).then((libraries) => gather(libraries, fonts ? fontEntries : imageEntries)))
       .then((found) => {
         entries = brand.concat(found);
         loaded = true;

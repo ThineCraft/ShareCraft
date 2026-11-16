@@ -4,6 +4,7 @@
 // localStorage wrappers at the end never throw. new-site-wizard.js and site.js draw them.
 
 import { kindLabel, libraryKindLabel } from './common.js';
+import { templateLookCard } from './look-cards.js';
 
 // ---- the wizard's steps ----
 
@@ -151,11 +152,13 @@ function navLabel(item) {
  * `id`, `name`, `kind` and `kindLabel`, `description` (the package's, else a sentence for the
  * kind), `builtIn`, `libraries` (`[{ name, kind, icon, kindLabel, folders }]`), `navigation`
  * (the top links' labels, or null for automatic navigation), `navigationText` in words,
- * `language` and `timeZone` (the template's, '' when unknown), `known` (the package arrived)
- * and `text`, the whole card in one sentence for screen readers.
+ * `language` and `timeZone` (the template's, '' when unknown), `known` (the package arrived),
+ * `look` (the look the template carries, see [`templateLookCard`], its fonts found among
+ * `brandFonts`; null for none) and `text`, the whole card in one sentence for screen readers.
  */
-export function templateSummary(template, pkg = null) {
+export function templateSummary(template, pkg = null, brandFonts = []) {
   const body = pkg?.body ?? null;
+  const look = templateLookCard(body?.look ?? null, brandFonts);
   const kind = body?.kind ?? template?.kind ?? 'team';
   const builtIn = template?.built_in === true;
   const description =
@@ -200,7 +203,8 @@ export function templateSummary(template, pkg = null) {
     language: String(body?.language ?? ''),
     timeZone: String(body?.time_zone ?? ''),
     known: Boolean(body),
-    text: [name === kindLabel(kind) ? `${name}.` : `${name}. ${kindLabel(kind)}${builtIn ? '' : ', saved template'}.`, description, librariesText, navigationText]
+    look,
+    text: [name === kindLabel(kind) ? `${name}.` : `${name}. ${kindLabel(kind)}${builtIn ? '' : ', saved template'}.`, description, librariesText, navigationText, look?.text]
       .filter(Boolean)
       .map((part) => (/[.!?]$/.test(part) ? part : `${part}.`))
       .join(' '),

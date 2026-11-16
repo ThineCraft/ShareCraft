@@ -1,6 +1,8 @@
 // Site templates, for administrators: the built-in Team and Communication templates and the
-// saved ones, each downloadable as a package; importing a package (refused with its reason, or
-// accepted with the names that had to change); deleting a saved template.
+// saved ones, each with the look it carries (its theme's colours and a sample of its fonts) and
+// downloadable as a package; importing a package (refused with its reason, or accepted with the
+// names that had to change and the brand-centre references its look could not keep); deleting
+// a saved template.
 
 import {
   api,
@@ -17,6 +19,8 @@ import {
   templateRefusal,
 } from './common.js';
 import { listFilter, mountAdminShell } from './admin-shell.js';
+import { lookCardElement } from './look-card-view.js';
+import { templateLookCard, templateLookReport } from './look-cards.js';
 
 const $ = (id) => document.getElementById(id);
 const error = $('error');
@@ -58,10 +62,33 @@ function note(text, ok = false) {
   showMessage($('import-msg'), text);
 }
 
+let brandFonts = null; // GET /api/brand's fonts, once read
+const looks = new Map(); // template id -> its look card (null: none), from its package
+
 async function showTemplates() {
-  const result = await api('GET', '/templates');
+  const [result, brand] = await Promise.all([api('GET', '/templates'), brandFonts ? null : api('GET', '/brand')]);
   if (!result.ok) return showMessage(error, messageFor(result.error));
+  if (!brandFonts) brandFonts = brand?.ok && Array.isArray(brand.data.fonts) ? brand.data.fonts : [];
   filter.set(result.data.map((template) => ({ row: template, element: templateRow(template) })));
+  // Each saved template's look arrives from its package; the built-ins carry none.
+  await Promise.all(
+    result.data
+      .filter((template) => !template.built_in && !looks.has(template.id))
+      .map(async (template) => {
+        const answer = await api('GET', `/templates/${seg(template.id)}/package`);
+        looks.set(template.id, answer.ok ? templateLookCard(answer.data?.body?.look ?? null, brandFonts) : null);
+        const box = document.querySelector(`[data-template-look="${CSS.escape(template.id)}"]`);
+        if (box) box.replaceChildren(lookOf(template));
+      }),
+  );
+}
+
+/** The look a template carries, as a card; words for one without a look. */
+function lookOf(template) {
+  if (template.built_in) return h('small', { class: 'meta' }, 'Look: the organisation’s default');
+  if (!looks.has(template.id)) return h('small', { class: 'meta' }, 'Reading its look…');
+  const card = looks.get(template.id);
+  return card ? lookCardElement(card) : h('small', { class: 'meta' }, 'Look: the organisation’s default');
 }
 
 /** One template: name, kind, description, Download package and, for a saved one, Delete. Text only. */
@@ -92,6 +119,7 @@ function templateRow(template) {
       h('small', {}, template.built_in ? `Built in · makes a ${kindLabel(template.kind)}` : `Saved · makes a ${kindLabel(template.kind)}`),
       template.description ? h('br') : null,
       template.description ? h('span', { class: 'description' }, template.description) : null,
+      h('span', { class: 'template-look', 'data-template-look': template.id }, lookOf(template)),
     ),
     h('span', { class: 'actions' }, download, remove),
   );
@@ -126,10 +154,15 @@ $('import').addEventListener('submit', async (event) => {
   const result = await api('POST', '/templates/import', text, { raw: true });
   if (!result.ok) return note(templateRefusal(result));
   const cleaned = result.data.cleaned ?? [];
+  const lookReport = templateLookReport({ unresolved: result.data.unresolved ?? [] });
   note(
-    cleaned.length
-      ? `The template ${result.data.name} was imported. Some names were not allowed and were changed:`
-      : `The template ${result.data.name} was imported.`,
+    [
+      `The template ${result.data.name} was imported.`,
+      lookReport,
+      cleaned.length ? 'Some names were not allowed and were changed:' : '',
+    ]
+      .filter(Boolean)
+      .join(' '),
     true,
   );
   $('import-cleaned').replaceChildren(...cleaned.map((change) => h('li', {}, `${change.from} → ${change.to}`)));

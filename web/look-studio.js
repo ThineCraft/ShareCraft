@@ -3,10 +3,10 @@
 // Light / Dark / Phone switch, the theme gallery's cards and which parts of the draft differ from
 // the saved look. site-look.js wires these to the page.
 
-import { draftFromLook, previewPalettes, sameTheme } from './look.js';
+import { draftFromLook, packageFonts, previewPalettes, sameTheme } from './look.js';
 
 /** The parts of the look, in the order of the tabs. */
-export const STUDIO_PARTS = Object.freeze(['theme', 'header', 'navigation', 'footer', 'history']);
+export const STUDIO_PARTS = Object.freeze(['theme', 'fonts', 'header', 'navigation', 'footer', 'history']);
 
 /** The window width in CSS pixels from which the controls and the preview sit side by side. */
 export const STUDIO_WIDE = 1100;
@@ -149,10 +149,96 @@ export function changedParts(draft, savedLook) {
   const saved = draftFromLook(savedLook ?? null);
   const parts = [];
   if (draft.from !== saved.from || !sameTheme(draft.theme, saved.theme)) parts.push('theme');
-  if (!same(draft.logo, saved.logo) || !same(draft.thumbnail, saved.thumbnail) || draft.logo_alt !== saved.logo_alt || !same(draft.header, saved.header)) {
+  if ((draft.fonts?.from ?? null) !== (saved.fonts?.from ?? null) || Boolean(draft.fonts?.keep) !== Boolean(saved.fonts?.keep)) parts.push('fonts');
+  if (
+    !same(draft.logo, saved.logo) ||
+    !same(draft.thumbnail, saved.thumbnail) ||
+    !same(draft.icon, saved.icon) ||
+    draft.logo_alt !== saved.logo_alt ||
+    !same(draft.header, saved.header)
+  ) {
     parts.push('header');
   }
-  if (draft.navigation !== saved.navigation) parts.push('navigation');
+  if (draft.navigation !== saved.navigation || draft.menu !== saved.menu) parts.push('navigation');
   if (!same(footerShape(draft.footer), footerShape(saved.footer))) parts.push('footer');
   return parts;
+}
+
+// ---- Fonts ----
+
+/**
+ * The font gallery's groups, in order and without empty ones: built-in and organisation
+ * packages from `brandPackages` (`GET /api/brand`'s `font_packages`), then `sitePackages`, each
+ * as `{ label, cards }`, a card `{from, name, fonts}` with `fonts` the specimen's (see
+ * [`packageFonts`]).
+ */
+export function packageGallery(brandPackages = [], sitePackages = []) {
+  const card = (pkg) => ({ from: String(pkg?.from ?? ''), name: String(pkg?.name ?? '').trim() || 'Untitled', fonts: packageFonts(pkg) });
+  return [
+    ['Built in', (brandPackages ?? []).filter((p) => p.builtin)],
+    ['Organisation', (brandPackages ?? []).filter((p) => !p.builtin)],
+    ['This site', sitePackages ?? []],
+  ]
+    .filter(([, packages]) => packages.length)
+    .map(([label, packages]) => ({ label, cards: packages.map(card) }));
+}
+
+/** The card the font gallery marks for `draft`: its package's source, or System for none. */
+export function chosenPackage(draft) {
+  return draft?.fonts?.from ?? 'builtin:system';
+}
+
+// ---- The limits for site owners ----
+
+/** The choices the brand policy can turn off, in the order the studio shows them. */
+export const STUDIO_LIMITS = Object.freeze(['builtinThemes', 'customColours', 'siteThemes', 'siteImages', 'siteFonts']);
+
+/** Each limit: the policy field, whether `true` restricts, and why the choice is off, in words. */
+const LIMIT_RULES = Object.freeze({
+  builtinThemes: ['hide_builtin_themes', true, 'Built-in themes are turned off for site owners by your organisation. Choose one of its themes.'],
+  customColours: ['custom_colours', false, 'Custom colours are turned off for site owners by your organisation. Choose one of its themes.'],
+  siteThemes: ['site_themes', false, 'Themes for one site are turned off for site owners by your organisation.'],
+  siteImages: ['site_images', false, 'Pictures from the site’s own libraries are turned off for site owners by your organisation. Choose a brand-centre image.'],
+  siteFonts: ['site_fonts', false, 'Font packages for one site are turned off for site owners by your organisation.'],
+});
+
+/**
+ * What the brand policy `policy` (`GET /api/brand`'s `policy`) turns off for the person:
+ * `limited` is true for a site owner (not an administrator or brand manager, who are never
+ * limited). For each of [`STUDIO_LIMITS`] `{disabled, reason}`: a choice turned off always
+ * comes with the sentence that says why; one allowed has none. A missing policy limits nothing.
+ */
+export function studioLimits(policy, limited) {
+  const out = {};
+  for (const key of STUDIO_LIMITS) {
+    const [field, restricts, reason] = LIMIT_RULES[key];
+    const value = policy?.[field];
+    const off = Boolean(limited) && typeof value === 'boolean' && value === restricts;
+    out[key] = off ? { disabled: true, reason } : { disabled: false, reason: '' };
+  }
+  return out;
+}
+
+/**
+ * The limit a gallery choice `from` falls under (`kind` `'themes'` or `'fonts'`), or null when
+ * nothing limits it: built-in themes, custom colours, a site's own themes or font packages.
+ * Organisation themes and packages and the built-in packages are always allowed.
+ */
+export function choiceLimit(from, limits, kind = 'themes') {
+  const value = String(from ?? '');
+  let limit = null;
+  if (kind === 'fonts') limit = value.startsWith('site:') ? limits?.siteFonts : null;
+  else if (value === 'custom') limit = limits?.customColours;
+  else if (value.startsWith('builtin:')) limit = limits?.builtinThemes;
+  else if (value.startsWith('site:')) limit = limits?.siteThemes;
+  return limit?.disabled ? limit : null;
+}
+
+// ---- Copying another site's look ----
+
+/** The sites a look can be copied from: every site in `sites` (`GET /api/sites`) but `currentId`, by name. */
+export function copyChoices(sites, currentId) {
+  return (Array.isArray(sites) ? sites : [])
+    .filter((site) => site && site.id !== currentId)
+    .sort((a, b) => String(a.name ?? '').localeCompare(String(b.name ?? ''), undefined, { sensitivity: 'base' }));
 }

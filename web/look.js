@@ -434,6 +434,51 @@ export function applyFonts(root, effectiveFonts, env) {
   return Promise.all(loads).then(() => undefined);
 }
 
+/** The four text roles, in the order the font variables are listed. */
+const ROLE_NAMES = Object.freeze(['title', 'heading', 'body', 'interactive']);
+
+/**
+ * A font file of a package as an effective look names it (`{family, url}`), or null: a look's own
+ * copy names it by content hash (`{sha256}`), the brand centre lists it with its generated
+ * family and address (`{family, url}`), which must agree. Anything else is no font.
+ */
+function fileFont(font) {
+  if (!font || typeof font !== 'object') return null;
+  if (typeof font.sha256 === 'string' && SHA256.test(font.sha256)) {
+    return { family: `sc-${font.sha256.slice(0, 12)}`, url: `/api/brand/fonts/${font.sha256}` };
+  }
+  const sha = typeof font.url === 'string' ? FONT_URL.exec(font.url)?.[1] : null;
+  return sha && font.family === `sc-${sha.slice(0, 12)}` ? { family: font.family, url: font.url } : null;
+}
+
+/**
+ * The fonts of a font package (as the brand centre or a site lists it, or a look's copy) as an
+ * effective look's `fonts`: `{title, heading, body, interactive}`, each `{family, url?}`, so
+ * [`applyFonts`] draws a specimen or a preview with it. A role set in `display` or `content`
+ * takes that font when the package has it (with its generated family), else the system fonts;
+ * `system-serif` gives the serif stack; no package gives the system fonts.
+ */
+export function packageFonts(pkg) {
+  const out = {};
+  for (const role of ROLE_NAMES) {
+    const choice = pkg?.roles?.[role];
+    let value = { family: 'system' };
+    if (choice === 'system-serif') value = { family: 'system-serif' };
+    else if (choice === 'display' || choice === 'content') value = fileFont(pkg?.[choice]) ?? value;
+    out[role] = value;
+  }
+  return out;
+}
+
+/** One brand-centre font (`{id, name, family, url}`) as a package with every role in it, for its specimen. */
+export function fontAsPackage(font) {
+  return {
+    name: String(font?.name ?? ''),
+    display: font ?? null,
+    roles: { title: 'display', heading: 'display', body: 'display', interactive: 'display' },
+  };
+}
+
 // ---- Change the look: the draft, what Apply sends, the preview and the session ----
 //
 // A draft is a look as the server stores it (`GET /api/sites/{id}/look/settings` answers
@@ -523,7 +568,20 @@ export function draftFromLook(look) {
       background: footer.background,
       groups: clone(Array.isArray(footer.groups) ? footer.groups : []),
     },
+    fonts: draftFonts(base.fonts),
+    icon: draftImage(base.icon),
+    menu: base.menu === 'mega' ? 'mega' : 'cascading',
   };
+}
+
+/**
+ * The fonts of a stored look as a draft holds them: null for the system fonts, else `{from,
+ * name, keep, package}`, `keep` true while they are the copy the look holds (sent as `{keep:
+ * true}`, so a package changed or gone at its source is not copied again).
+ */
+function draftFonts(fonts) {
+  if (!fonts || typeof fonts !== 'object' || !fonts.package || typeof fonts.from !== 'string') return null;
+  return { from: fonts.from, name: String(fonts.package.name ?? ''), keep: true, package: clone(fonts.package) };
 }
 
 /** Whether two themes have the same name and colours (a dark colour left out is derived). */
@@ -614,6 +672,9 @@ export function previewEffective(draft, siteName) {
   };
   put(out, 'logo_url', draft.logo);
   put(out, 'thumbnail_url', draft.thumbnail);
+  put(out, 'icon_url', draft.icon ?? draft.thumbnail);
+  out.fonts = packageFonts(draft.fonts?.package ?? null);
+  out.navigation_menu = draft.menu === 'mega' ? 'mega' : 'cascading';
   return out;
 }
 
@@ -671,6 +732,11 @@ export function lookInput(draft, { themes = [] } = {}) {
   slot(out, 'thumbnail', draft.thumbnail);
   slot(out.header, 'image', band);
   slot(out.footer, 'logo', draft.footer.logo);
+  slot(out, 'icon', draft.icon);
+  // The dropdown is the default; a mega menu is for navigation across the top only.
+  if (draft.menu === 'mega' && draft.navigation === 'horizontal') out.menu = 'mega';
+  // No fonts are the system fonts; the copy the look holds is kept as it is.
+  if (draft.fonts) out.fonts = draft.fonts.keep ? { keep: true } : { from: draft.fonts.from };
   return out;
 }
 
@@ -714,6 +780,7 @@ export function withoutSlots(draft, slots) {
     if (slot === 'thumbnail') out.thumbnail = null;
     if (slot === 'header.image') out.header.image = null;
     if (slot === 'footer.logo') out.footer.logo = null;
+    if (slot === 'icon') out.icon = null;
   }
   if (out.header.background === 'image' && !out.header.image) out.header.background = 'none';
   if (!out.logo) out.header.hide_title = false;
@@ -740,6 +807,9 @@ function imageChange(name, from, to) {
   if (!to) return `${name} removed`;
   return `${name} changed`;
 }
+
+/** The menu styles in words. */
+const MENU_WORDS = Object.freeze({ cascading: 'dropdown', mega: 'mega' });
 
 /** A field that went from one choice to another in words, or null when it did not. */
 function choiceChange(name, from, to) {
@@ -770,7 +840,14 @@ export function describeLookChange(before, after) {
   ].filter(Boolean);
   if (layout) header.unshift(header.length ? `layout ${layout}` : layout);
   if (header.length) parts.push(`Header: ${header.join(', ')}`);
+  const fontsName = (fonts) => (fonts ? fonts.name || 'Untitled' : 'System');
+  if (fontsName(a.fonts) !== fontsName(b.fonts)) parts.push(`Fonts: ${fontsName(a.fonts)} to ${fontsName(b.fonts)}`);
+  else if (canonical(a.fonts?.package ?? null) !== canonical(b.fonts?.package ?? null)) parts.push('Fonts changed');
+  const icon = imageChange('Tab icon', a.icon, b.icon);
+  if (icon) parts.push(icon);
   if (a.navigation !== b.navigation) parts.push(`Navigation: ${a.navigation} to ${b.navigation}`);
+  const menu = choiceChange('Menu style', MENU_WORDS[a.menu], MENU_WORDS[b.menu]);
+  if (menu) parts.push(menu);
   if (a.footer.enabled !== b.footer.enabled) parts.push(`Footer turned ${b.footer.enabled ? 'on' : 'off'}`);
   else if (b.footer.enabled) {
     const footer = [
@@ -798,10 +875,13 @@ export function describeLookChange(before, after) {
 export function lookSession({ siteId, settings, themes = [], brandImages = [], send, readOnly = false }) {
   let saved = settings;
   let draft = draftFromLook(saved?.look);
+  // Another site's look loaded to copy (`{from, name, themes, fonts, effective}`), or null.
+  let copy = null;
   const path = `/sites/${encodeURIComponent(siteId)}`;
   const take = (answer) => {
     saved = answer;
     draft = draftFromLook(saved?.look);
+    copy = null;
   };
   const session = {
     get draft() {
@@ -809,6 +889,41 @@ export function lookSession({ siteId, settings, themes = [], brandImages = [], s
     },
     get settings() {
       return saved;
+    },
+    /** The look being copied from another site, `{from, name, themes, fonts}`, or null. */
+    get copy() {
+      return copy ? { from: copy.from, name: copy.name, themes: copy.themes, fonts: copy.fonts } : null;
+    },
+    /**
+     * Loads the look of `source` (`{id, name}`, a site the person can see) to copy, from its
+     * effective look (`GET /api/sites/{id}/look`), with its own themes and font packages when
+     * `options.themes` / `options.fonts`. Nothing is sent: the preview shows it until Apply
+     * copies it or Cancel drops it.
+     */
+    loadCopy(source, effective, options = {}) {
+      copy = {
+        from: String(source?.id ?? ''),
+        name: String(source?.name ?? ''),
+        themes: options.themes === true,
+        fonts: options.fonts === true,
+        effective: clone(effective ?? {}),
+      };
+    },
+    /**
+     * What the preview shows: the look being copied (its logo description becomes this site's
+     * name when it was the other site's), else the draft (see [`previewEffective`]).
+     */
+    effective(siteName) {
+      if (!copy) return previewEffective(draft, siteName);
+      const shown = clone(copy.effective);
+      if (!shown.logo_alt || shown.logo_alt === copy.name) shown.logo_alt = siteName;
+      shown.theme_from = 'site';
+      return shown;
+    },
+    /** Puts the font package `pkg` (as listed, `{from, name, ...}`) in the draft; null or System for the system fonts. */
+    chooseFonts(pkg) {
+      if (!pkg || pkg.from === 'builtin:system') draft.fonts = null;
+      else draft.fonts = { from: pkg.from, name: String(pkg.name ?? ''), keep: false, package: clone(pkg) };
     },
     /** Changes the draft with `edit(draft)`. */
     change(edit) {
@@ -841,10 +956,12 @@ export function lookSession({ siteId, settings, themes = [], brandImages = [], s
     /** Drops the draft: back to the saved look. */
     cancel() {
       draft = draftFromLook(saved?.look);
+      copy = null;
     },
     /** `{dirty, check, canApply}`: Apply needs a change, every pair passing, a name and a live site. */
     status() {
       const check = checkTheme(draft.theme);
+      if (copy) return { dirty: true, check, canApply: !readOnly };
       const dirty = canonical(comparable(draft)) !== canonical(comparable(draftFromLook(saved?.look)));
       const named = draft.theme.name.trim() !== '';
       return { dirty, check, canApply: dirty && check.ok && named && !readOnly };
@@ -852,10 +969,17 @@ export function lookSession({ siteId, settings, themes = [], brandImages = [], s
     /** Loads the look of history `entry` (with `which` `'before'`, the look before it) as the draft. */
     preview(entry, which = 'after') {
       draft = draftFromLook((which === 'before' ? entry?.before : entry?.look) ?? null);
+      copy = null;
     },
     /** Sends the draft. Answers the `api` result; on success the answer is the saved look. */
     async apply() {
       if (!session.status().canApply) return { ok: false, error: null };
+      if (copy) {
+        const body = { from: copy.from, themes: copy.themes, fonts: copy.fonts };
+        const result = await send('POST', `${path}/look/copy`, body);
+        if (result.ok) take(result.data);
+        return result;
+      }
       const body = { look: lookInput(draft, { themes }) };
       const result = await send('PUT', `${path}/look`, body);
       if (result.ok) take(result.data);
@@ -878,6 +1002,7 @@ export function lookSession({ siteId, settings, themes = [], brandImages = [], s
       if (result.error === 'image_gone') {
         const gone = Array.isArray(result.data?.slots) ? result.data.slots : [];
         draft = withoutSlots(draftFromLook((before ? entry.before : entry.look) ?? null), gone);
+        copy = null;
         return { ...result, gone };
       }
       return result;

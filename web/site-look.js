@@ -6,9 +6,13 @@
 // Custom colours with the live contrast check and "Use suggested"); the header layout and
 // background and the navigation are chosen from small pictures; logo, thumbnail and header image
 // are tiles. Every change goes to a draft; Apply saves it, Cancel drops it. History lists the
-// earlier looks, each with Preview (load it as the draft) and Restore (apply it again). The draft
-// and what Apply sends live in look.js (lookSession), the studio's state in look-studio.js; the
-// server checks everything again.
+// earlier looks, each with Preview (load it as the draft) and Restore (apply it again). Fonts are
+// chosen from a gallery of font packages with specimens (and the site's own packages, which can
+// be made here when allowed); the Header has a tab icon slot and Navigation a menu style.
+// "Copy from another site…" loads another site's look as the draft; Apply copies it. Choices
+// the organisation's limits turn off for site owners are shown disabled, each saying why. The
+// draft and what Apply sends live in look.js (lookSession), the studio's state in
+// look-studio.js; the server checks everything again.
 
 import {
   api,
@@ -32,20 +36,23 @@ import {
   siteChrome,
   themeSwatches,
 } from './common.js';
+import { ROLES, roleChoices } from './brand-fonts.js';
 import { pickImage } from './image-picker.js';
+import { fontSpecimen } from './look-card-view.js';
 import {
   CHECK_FIELD,
   FOOTER_GROUP_LIMIT,
   FOOTER_LINK_LIMIT,
+  applyFonts,
   applyLook,
   deriveDark,
   draftImageUrl,
   hexOf,
   lookSession,
+  packageFonts,
   describeLookChange,
   mayReplaceDraft,
   parseColour,
-  previewEffective,
   previewPalettes,
   sameTheme,
 } from './look.js';
@@ -53,10 +60,15 @@ import {
   STUDIO_PARTS,
   STUDIO_WIDE,
   changedParts,
+  choiceLimit,
   chosenCard,
+  chosenPackage,
+  copyChoices,
+  packageGallery,
   partFromHash,
   previewPanes,
   selectTab,
+  studioLimits,
   studioState,
   studioView,
   studioWide,
@@ -88,8 +100,12 @@ const [settingsAnswer, brandAnswer, historyAnswer] = await Promise.all([
   api('GET', `/sites/${seg(siteId)}/look/history`),
 ]);
 if (!settingsAnswer.ok) fail(messageFor(settingsAnswer.error));
-const brand = brandAnswer.ok ? brandAnswer.data : { themes: [], images: [] };
+const brand = brandAnswer.ok ? brandAnswer.data : { themes: [], images: [], font_packages: [], fonts: [] };
+// The organisation's limits apply to site owners only: administrators and brand managers can
+// always choose anything (`can_manage` is true for them).
+const limits = studioLimits(brand.policy, !brand.can_manage);
 let siteThemes = settingsAnswer.data.themes ?? [];
+let sitePackages = settingsAnswer.data.font_packages ?? [];
 const allThemes = () => [...(brand.themes ?? []), ...siteThemes];
 const session = lookSession({
   siteId,
@@ -116,7 +132,7 @@ $('archived-banner').hidden = !readOnly;
 $('content').hidden = false;
 // An archived site keeps the bar for its Preview button (narrow screens), not Apply and Cancel.
 $('actions').classList.toggle('read-only', readOnly);
-for (const id of ['apply', 'cancel', 'apply-note']) $(id).hidden = readOnly;
+for (const id of ['apply', 'cancel', 'apply-note', 'copy-open']) $(id).hidden = readOnly;
 
 // ---- the studio: tabs on wide screens, an accordion below them ----
 
@@ -321,6 +337,18 @@ $('navigation-choice').replaceChildren(
     }),
   ),
 );
+const MENUS = [
+  ['cascading', 'Dropdown', 'A list under each top link'],
+  ['mega', 'Mega menu', 'A wide panel of columns; the Menu on phones'],
+];
+$('menu-choice').replaceChildren(
+  ...MENUS.map(([value, title, hint]) =>
+    radioCard('menu-style', value, title, hint, pageArt({ 'data-menu': value }), (v) => {
+      session.change((draft) => (draft.menu = v));
+      refresh();
+    }),
+  ),
+);
 
 // ---- the theme ----
 
@@ -382,7 +410,17 @@ function paintCard(card, model) {
 function themeCard(model, title = model.name, sub = '') {
   choiceCount += 1;
   const id = `theme-card-${choiceCount}`;
-  const input = h('input', { type: 'radio', name: 'theme-card', value: model.from, id, class: 'pick-input', disabled: readOnly, 'aria-describedby': `${id}-colours` });
+  // A choice the organisation's limits turn off is shown disabled, saying why.
+  const limit = choiceLimit(model.from, limits);
+  const input = h('input', {
+    type: 'radio',
+    name: 'theme-card',
+    value: model.from,
+    id,
+    class: 'pick-input',
+    disabled: readOnly || Boolean(limit),
+    'aria-describedby': limit ? `${id}-colours ${id}-why` : `${id}-colours`,
+  });
   input.addEventListener('change', () => {
     if (input.checked) themeChosen(model.from);
   });
@@ -393,6 +431,7 @@ function themeCard(model, title = model.name, sub = '') {
     h('span', { class: 'tc-pages' }, miniPage('light', model.light), miniPage('dark', model.dark)),
     h('span', { class: 'tc-name' }, title),
     sub ? h('span', { class: 'tc-sub' }, sub) : null,
+    limit ? h('span', { class: 'choice-why', id: `${id}-why` }, limit.reason) : null,
     h('span', { class: 'tc-colours visually-hidden', id: `${id}-colours` }),
   );
   paintCard(card, model);
@@ -453,6 +492,20 @@ $('source-update').addEventListener('click', () => {
   refresh();
 });
 
+// Saving a theme for this site, and typing colours, follow the organisation's limits.
+if (limits.siteThemes.disabled) {
+  $('save-site-theme').disabled = true;
+  $('save-site-theme').setAttribute('aria-describedby', 'site-theme-why');
+  $('save-site-theme').after(h('span', { class: 'choice-why', id: 'site-theme-why' }, ` ${limits.siteThemes.reason}`));
+}
+if (limits.customColours.disabled) {
+  $('custom-theme').prepend(h('p', { class: 'choice-why', id: 'custom-why' }, limits.customColours.reason));
+  for (const control of [$('theme-name'), ...Object.values(colours).map((field) => field.input)]) {
+    control.disabled = true;
+    control.setAttribute('aria-describedby', 'custom-why');
+  }
+}
+
 $('save-site-theme').addEventListener('click', async () => {
   note('');
   const { theme } = session.draft;
@@ -498,7 +551,186 @@ async function deleteSiteTheme(theme) {
   note(`Deleted the theme ${theme.name}.`, true);
 }
 
-// ---- images: logo, thumbnail, header image, footer logo ----
+// ---- fonts: the package gallery and the site's own packages ----
+
+const allPackages = () => [...(brand.font_packages ?? []), ...sitePackages];
+
+/** One card of the font gallery: the package's name and a specimen in its fonts. */
+function packageCard(card) {
+  choiceCount += 1;
+  const id = `package-card-${choiceCount}`;
+  const limit = choiceLimit(card.from, limits, 'fonts');
+  const input = h('input', {
+    type: 'radio',
+    name: 'package-card',
+    value: card.from,
+    id,
+    class: 'pick-input',
+    disabled: readOnly || Boolean(limit),
+    'aria-describedby': limit ? `${id}-why` : null,
+  });
+  input.addEventListener('change', () => {
+    if (!input.checked) return;
+    session.chooseFonts(allPackages().find((p) => p.from === card.from) ?? null);
+    refresh();
+  });
+  return h(
+    'label',
+    { class: 'pick-card package-card', for: id },
+    input,
+    fontSpecimen(card.fonts, 'small'),
+    h('span', { class: 'pick-title' }, card.name),
+    limit ? h('span', { class: 'choice-why', id: `${id}-why` }, limit.reason) : null,
+  );
+}
+
+function fillPackages() {
+  const groups = packageGallery(brand.font_packages ?? [], sitePackages).map(({ label, cards }) =>
+    h('div', { class: 'theme-group' }, h('h3', { class: 'theme-group-label' }, label), h('div', { class: 'package-cards' }, ...cards.map(packageCard))),
+  );
+  $('package-gallery').replaceChildren(...groups);
+  $('site-packages-empty').hidden = sitePackages.length > 0;
+  $('site-packages').replaceChildren(
+    ...sitePackages.map((pkg) => {
+      const remove = h('button', { type: 'button', class: 'secondary small', 'aria-label': `Delete the font package ${pkg.name}`, disabled: readOnly }, 'Delete');
+      remove.addEventListener('click', () => deleteSitePackage(pkg));
+      return h('li', {}, h('span', { class: 'grow' }, pkg.name), remove);
+    }),
+  );
+  const off = readOnly || limits.siteFonts.disabled;
+  $('new-site-package').disabled = off;
+  $('site-package-why').textContent = limits.siteFonts.disabled ? limits.siteFonts.reason : '';
+}
+
+/** The marked card, and a note when the look keeps a copy of fonts no longer offered. */
+function showFonts() {
+  const chosen = chosenPackage(session.draft);
+  const offered = chosen === 'builtin:system' || allPackages().some((p) => p.from === chosen);
+  checkCard($('package-gallery'), offered ? chosen : '');
+  const fonts = session.draft.fonts;
+  $('fonts-source-note').hidden = offered || !fonts;
+  if (!offered && fonts) {
+    $('fonts-source-note').textContent = `This look keeps its own copy of the fonts ${fonts.name}, which are no longer offered here. Choose a package to change them.`;
+  }
+}
+
+async function deleteSitePackage(pkg) {
+  note('');
+  const sure = await confirmDialog(`Delete the font package ${pkg.name}? A look that uses it keeps its own copy.`, 'Delete package');
+  if (!sure) return;
+  const result = await api('DELETE', `/sites/${seg(siteId)}/font-packages/${seg(pkg.id)}`);
+  if (!result.ok) return note(messageFor(result.error));
+  sitePackages = sitePackages.filter((p) => p.id !== pkg.id);
+  fillPackages();
+  refresh();
+  note(`Deleted the font package ${pkg.name}.`, true);
+}
+
+// A package for this site: each font from the brand centre or a font file of a library, whose
+// licence the person confirms.
+const siteFonts = { display: null, content: null }; // {brand_font, name, family, url} | {doc, name, confirmed}
+const spRoles = {};
+
+function drawSiteFontChoice(which, label) {
+  const chosen = siteFonts[which];
+  const select = h('select', { id: `sp-${which}` });
+  select.replaceChildren(
+    h('option', { value: '' }, 'None'),
+    ...(brand.fonts ?? []).map((font) => h('option', { value: font.id }, font.name)),
+    h('option', { value: 'file' }, chosen?.doc ? `File: ${chosen.name}` : 'A font file from a library…'),
+  );
+  select.value = chosen?.brand_font ?? (chosen?.doc ? 'file' : '');
+  select.addEventListener('change', async () => {
+    if (select.value === 'file') {
+      const picked = await pickImage({ siteId, title: `Choose the ${which} font file`, mode: 'font' });
+      siteFonts[which] = picked?.doc ? { doc: picked.doc, name: picked.name, confirmed: false } : siteFonts[which];
+    } else if (select.value) {
+      const font = (brand.fonts ?? []).find((f) => f.id === select.value);
+      siteFonts[which] = font ? { brand_font: font.id, name: font.name, family: font.family, url: font.url } : null;
+    } else {
+      siteFonts[which] = null;
+    }
+    drawSitePackageForm();
+  });
+  const parts = [h('label', { for: `sp-${which}` }, label), select];
+  if (chosen?.doc) {
+    const box = h('input', { type: 'checkbox', id: `sp-${which}-licence` });
+    box.checked = chosen.confirmed;
+    box.addEventListener('change', () => {
+      chosen.confirmed = box.checked;
+      checkSitePackage();
+    });
+    parts.push(h('label', { class: 'check', for: `sp-${which}-licence` }, box, ' Our organisation holds the licence for this font.'));
+  }
+  return h('div', { class: 'field' }, ...parts);
+}
+
+function drawSitePackageForm() {
+  $('sp-fonts').replaceChildren(drawSiteFontChoice('display', 'Display font'), drawSiteFontChoice('content', 'Content font'));
+  const has = { display: Boolean(siteFonts.display), content: Boolean(siteFonts.content) };
+  $('sp-roles').replaceChildren(
+    ...ROLES.map(([role, label]) => {
+      const select = h('select', { id: `sp-role-${role}` });
+      const choices = roleChoices(has);
+      select.replaceChildren(
+        ...choices.map((c) => h('option', { value: c.value, disabled: c.disabled }, c.disabled ? `${c.label} (${c.reason.replace(/\.$/, '').toLowerCase()})` : c.label)),
+      );
+      const before = spRoles[role];
+      select.value = choices.some((c) => c.value === before && !c.disabled) ? before : 'system';
+      spRoles[role] = select.value;
+      select.addEventListener('change', () => {
+        spRoles[role] = select.value;
+        checkSitePackage();
+      });
+      return h('div', { class: 'field' }, h('label', { for: `sp-role-${role}` }, label), select);
+    }),
+  );
+  checkSitePackage();
+}
+
+/** The live specimen (brand-centre fonts only: a file is shown once saved) and why Save is off. */
+function checkSitePackage() {
+  const listed = (font) => (font?.brand_font ? font : null);
+  $('sp-specimen').replaceChildren(fontSpecimen(packageFonts({ display: listed(siteFonts.display), content: listed(siteFonts.content), roles: { ...spRoles } })));
+  let why = '';
+  if (!$('sp-name').value.trim()) why = 'Give the package a name.';
+  else if (Object.values(siteFonts).some((f) => f?.doc && !f.confirmed)) why = 'Confirm that your organisation holds the licence for each font file.';
+  $('sp-save').disabled = Boolean(why);
+  $('sp-why').textContent = why;
+}
+
+$('sp-name').addEventListener('input', checkSitePackage);
+$('new-site-package').addEventListener('click', () => {
+  siteFonts.display = null;
+  siteFonts.content = null;
+  for (const [role] of ROLES) spRoles[role] = 'system';
+  $('sp-name').value = '';
+  $('site-package-form').hidden = false;
+  drawSitePackageForm();
+  $('sp-name').focus();
+});
+$('sp-cancel').addEventListener('click', () => ($('site-package-form').hidden = true));
+$('site-package-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  checkSitePackage();
+  if ($('sp-save').disabled) return;
+  const fontBody = (font) => (!font ? null : font.brand_font ? { brand_font: font.brand_font } : { doc: font.doc, licence_confirmed: font.confirmed === true });
+  const result = await api('POST', `/sites/${seg(siteId)}/font-packages`, {
+    name: $('sp-name').value.trim(),
+    display: fontBody(siteFonts.display),
+    content: fontBody(siteFonts.content),
+    roles: { ...spRoles },
+  });
+  if (!result.ok) return note(messageFor(result.error) + reasonOf(result) + problemsOf(result));
+  sitePackages = [...sitePackages, result.data];
+  $('site-package-form').hidden = true;
+  session.chooseFonts(result.data);
+  fillPackages();
+  refresh();
+  note(`Saved ${result.data.name} as a font package of this site. Apply to use it.`, true);
+});
+
+// ---- images: logo, thumbnail, header image, footer logo, tab icon ----
 
 const SLOTS = {
   logo: {
@@ -525,6 +757,12 @@ const SLOTS = {
     get: () => session.draft.footer.logo,
     set: (image) => session.change((draft) => (draft.footer.logo = image)),
   },
+  icon: {
+    box: 'icon-slot',
+    label: 'Tab icon (a square PNG or SVG; without one, the thumbnail)',
+    get: () => session.draft.icon,
+    set: (image) => session.change((draft) => (draft.icon = image)),
+  },
 };
 
 /** An image slot as a tile: the picture, what it is for, the image's name, Change and Remove. */
@@ -543,7 +781,12 @@ function drawSlot(slot) {
   const name = what.toLowerCase();
   const choose = h('button', { type: 'button', class: 'secondary small', disabled: readOnly }, image ? `Change the ${name}` : `Choose a ${name}`);
   choose.addEventListener('click', async () => {
-    const picked = await pickImage({ siteId, brandImages: brand.images ?? [], title: `Choose the ${name}` });
+    const picked = await pickImage({
+      siteId,
+      brandImages: brand.images ?? [],
+      title: `Choose the ${name}`,
+      brandOnly: limits.siteImages.disabled ? limits.siteImages.reason : null,
+    });
     if (!picked) return;
     slot.set(picked);
     if (slot === SLOTS.header) session.change((draft) => (draft.header.background = 'image'));
@@ -580,6 +823,7 @@ function fillHeader() {
   $('header-align').value = draft.header.align;
   $('hide-title').checked = draft.header.hide_title;
   checkCard($('navigation-choice'), draft.navigation);
+  checkCard($('menu-choice'), draft.menu);
 }
 
 $('logo-alt').addEventListener('input', () => {
@@ -727,13 +971,14 @@ const PREVIEW_ROWS = [
 
 /** Draws the draft in each preview element, light and dark, with applyLook on that element only. */
 function drawPreview() {
-  const effective = previewEffective(session.draft, info.name);
+  const effective = session.effective(info.name);
   for (const [id, label] of [
     ['preview-light', 'Light mode'],
     ['preview-dark', 'Dark mode'],
   ]) {
     const panel = $(id);
     applyLook(panel, effective);
+    applyFonts(panel, effective.fonts);
     const nav = h(
       'ul',
       { class: 'preview-nav' },
@@ -806,12 +1051,17 @@ function refresh() {
   $('header-image-slot').hidden = !(extended && draft.header.background === 'image');
   $('hide-title').disabled = readOnly || !draft.logo;
   $('footer-fields').hidden = !draft.footer.enabled;
+  $('menu-part').hidden = draft.navigation !== 'horizontal';
+  $('menu-off').hidden = draft.navigation === 'horizontal';
+  showFonts();
+  showCopy();
   showSource();
   showChangedParts();
   $('apply').disabled = !status.canApply;
   $('cancel').disabled = readOnly || !status.dirty;
   let why = '';
-  if (status.dirty && !status.check.ok) why = 'Fix the colours that do not read before applying.';
+  if (session.copy) why = `Apply copies the look of ${session.copy.name} to this site.`;
+  else if (status.dirty && !status.check.ok) why = 'Fix the colours that do not read before applying.';
   else if (status.dirty && !draft.theme.name.trim()) why = 'Give the theme a name before applying.';
   else if (status.dirty) why = 'You have changes that are not applied yet.';
   else why = 'This is the site’s current look.';
@@ -822,6 +1072,7 @@ function refresh() {
 /** Puts the whole draft into the form and redraws. */
 function fill() {
   fillThemeChoice();
+  fillPackages();
   fillTheme();
   fillHeader();
   fillFooter();
@@ -832,15 +1083,20 @@ function fill() {
 $('apply').addEventListener('click', async () => {
   note('');
   $('apply').disabled = true;
+  const copying = session.copy?.name ?? null;
   const result = await session.apply();
+  if (result.ok && copying) result.copied = copying;
   if (!result.ok) {
-    if (result.error) note(messageFor(result.error) + reasonOf(result));
+    if (result.error) note(messageFor(result.error) + reasonOf(result) + problemsOf(result));
     refresh();
     return;
   }
+  const copied = result.copied;
   siteThemes = session.settings.themes ?? siteThemes;
+  sitePackages = session.settings.font_packages ?? sitePackages;
+  session.setChoices({ themes: allThemes() });
   fill();
-  await afterChange('The new look is applied.');
+  await afterChange(copied ? `The look of ${copied} is copied to this site.` : 'The new look is applied.');
 });
 
 $('cancel').addEventListener('click', () => {
@@ -848,6 +1104,12 @@ $('cancel').addEventListener('click', () => {
   fill();
   note('The draft was dropped.', true);
 });
+
+/** The problems of a `not_allowed` refusal, in words. */
+function problemsOf(result) {
+  const problems = Array.isArray(result.data?.problems) ? result.data.problems.filter((p) => typeof p === 'string') : [];
+  return problems.length ? `: ${problems.join('; ')}.` : '';
+}
 
 /** A refusal's reason, when the server gave one (`invalid_look`, `invalid_theme`). */
 function reasonOf(result) {
@@ -870,7 +1132,7 @@ async function loadHistory() {
   drawHistory();
 }
 
-const SLOT_NAMES = { logo: 'the logo', thumbnail: 'the thumbnail', 'header.image': 'the header image', 'footer.logo': 'the footer logo' };
+const SLOT_NAMES = { logo: 'the logo', thumbnail: 'the thumbnail', icon: 'the tab icon', 'header.image': 'the header image', 'footer.logo': 'the footer logo' };
 
 function drawHistory() {
   $('history-empty').hidden = history.length > 0;
@@ -918,6 +1180,7 @@ async function restoreEntry(entry, when, which = 'after', label = 'after the cha
   const result = await session.restore(entry, which);
   if (result.ok) {
     siteThemes = session.settings.themes ?? siteThemes;
+    sitePackages = session.settings.font_packages ?? sitePackages;
     fill();
     await afterChange(`The look ${label} of ${when} is applied again.`);
     return;
@@ -928,8 +1191,89 @@ async function restoreEntry(entry, when, which = 'after', label = 'after the cha
     note(`Some images of that look are no longer stored (${names}). It is loaded as a draft without them: choose new ones or apply it as it is.`);
     return;
   }
-  note(messageFor(result.error) + reasonOf(result));
+  note(messageFor(result.error) + reasonOf(result) + problemsOf(result));
 }
+
+// ---- copying the look of another site ----
+
+/** The parts of the studio a person edits; while another site's look is loaded they wait. */
+const EDITED_PARTS = ['theme', 'fonts', 'header', 'navigation', 'footer'];
+
+/** The banner while a copy is loaded, and the parts made inert until Apply or Cancel. */
+function showCopy() {
+  const copy = session.copy;
+  $('copy-banner').hidden = !copy;
+  if (copy) {
+    const extras = [copy.themes ? 'its own themes' : null, copy.fonts ? 'its own font packages' : null].filter(Boolean);
+    $('copy-text').textContent =
+      `The preview shows the look of ${copy.name}${extras.length ? `, with ${extras.join(' and ')}` : ''}. Apply copies it to this site; Cancel goes back. The other parts can be changed after that.`;
+  }
+  for (const part of EDITED_PARTS) $(`body-${part}`).inert = Boolean(copy);
+}
+
+let copySites = null; // GET /api/sites, once read
+let copyChosen = null;
+
+/** The site list of the dialog, filtered, as radio buttons. */
+function drawCopySites() {
+  const wanted = $('copy-filter').value.trim().toLocaleLowerCase();
+  const shown = copyChoices(copySites ?? [], siteId).filter((site) => !wanted || String(site.name).toLocaleLowerCase().includes(wanted));
+  $('copy-count').textContent = copySites === null ? 'Looking for sites…' : shown.length === 1 ? '1 site' : `${shown.length} sites`;
+  $('copy-sites').replaceChildren(
+    ...shown.map((site) => {
+      const id = `copy-site-${site.id}`;
+      const input = h('input', { type: 'radio', name: 'copy-site', id, value: site.id });
+      input.checked = copyChosen?.id === site.id;
+      input.addEventListener('change', () => {
+        copyChosen = site;
+        $('copy-load').disabled = false;
+        $('copy-load-why').textContent = '';
+      });
+      return h('li', {}, h('label', { class: 'check', for: id }, input, ` ${site.name}`));
+    }),
+  );
+}
+
+$('copy-open').addEventListener('click', async () => {
+  if (!(await mayReplaceDraft(session, () => confirmDialog('Copying another site’s look drops the changes you have not applied. Go on?', 'Go on')))) return;
+  copyChosen = null;
+  $('copy-filter').value = '';
+  $('copy-load').disabled = true;
+  $('copy-load-why').textContent = 'Choose a site first.';
+  showMessage($('copy-msg'), '');
+  for (const [box, limit] of [
+    ['copy-themes', limits.siteThemes],
+    ['copy-fonts', limits.siteFonts],
+  ]) {
+    $(box).checked = false;
+    $(box).disabled = limit.disabled;
+    $(`${box}-why`).textContent = limit.disabled ? limit.reason : '';
+  }
+  $('copy-dialog').showModal();
+  $('copy-filter').focus();
+  drawCopySites();
+  if (copySites === null) {
+    const result = await api('GET', '/sites');
+    copySites = result.ok && Array.isArray(result.data) ? result.data : [];
+    if (!result.ok) showMessage($('copy-msg'), messageFor(result.error));
+    drawCopySites();
+  }
+});
+$('copy-filter').addEventListener('input', drawCopySites);
+$('copy-cancel').addEventListener('click', () => $('copy-dialog').close());
+$('copy-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  if (!copyChosen) return;
+  const source = copyChosen;
+  const result = await api('GET', `/sites/${seg(source.id)}/look`);
+  if (!result.ok) return showMessage($('copy-msg'), messageFor(result.error));
+  session.loadCopy(source, result.data, { themes: $('copy-themes').checked, fonts: $('copy-fonts').checked });
+  $('copy-dialog').close();
+  refresh();
+  note(`The look of ${source.name} is loaded as the draft. Apply to copy it.`, true);
+  openPreviewSheet();
+  $('copy-open').focus();
+});
 
 // Leaving with changes not applied asks first.
 addEventListener('beforeunload', (event) => {
@@ -951,4 +1295,7 @@ drawStudio();
 showPreviewMode();
 showSiteThemes();
 fill();
+if (limits.customColours.disabled || limits.builtinThemes.disabled || limits.siteImages.disabled || limits.siteThemes.disabled || limits.siteFonts.disabled) {
+  $('limits-note').hidden = false;
+}
 drawHistory();

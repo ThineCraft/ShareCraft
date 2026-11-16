@@ -19,12 +19,14 @@
  <h1 id="title">Change the look</h1>
  <p id="archived-banner" class="note" hidden>This site is archived. Its look is shown but cannot be changed.</p>
  <p id="hub-note" class="note" hidden></p>
+ <p id="limits-note" class="meta" hidden>Your organisation limits some choices for site owners. Those choices are shown turned off, each with the reason.</p>
  <p id="error" role="alert" class="msg"></p>
 
  <div id="content" class="studio" hidden>
   <div class="studio-controls">
    <div id="studio-tabs" class="studio-tabs" role="tablist" aria-label="Parts of the look">
     <button type="button" role="tab" id="tab-theme" data-part="theme" aria-controls="part-theme">Theme<span class="tab-mark" hidden><span class="visually-hidden"> (changed)</span></span></button>
+    <button type="button" role="tab" id="tab-fonts" data-part="fonts" aria-controls="part-fonts">Fonts<span class="tab-mark" hidden><span class="visually-hidden"> (changed)</span></span></button>
     <button type="button" role="tab" id="tab-header" data-part="header" aria-controls="part-header">Header<span class="tab-mark" hidden><span class="visually-hidden"> (changed)</span></span></button>
     <button type="button" role="tab" id="tab-navigation" data-part="navigation" aria-controls="part-navigation">Navigation<span class="tab-mark" hidden><span class="visually-hidden"> (changed)</span></span></button>
     <button type="button" role="tab" id="tab-footer" data-part="footer" aria-controls="part-footer">Footer<span class="tab-mark" hidden><span class="visually-hidden"> (changed)</span></span></button>
@@ -55,6 +57,35 @@
     </div>
    </section>
 
+   <section id="part-fonts" class="studio-part" data-part="fonts">
+    <h2 class="part-head"><button type="button" class="part-toggle" id="toggle-fonts" aria-controls="body-fonts">Fonts<span class="tab-mark" hidden><span class="visually-hidden"> (changed)</span></span></button></h2>
+    <div id="body-fonts" class="part-body">
+     <p id="fonts-source-note" class="note" hidden></p>
+     <p id="package-gallery-label" class="meta">Choose a font package. Each card shows the site title and a line of text in its fonts. Every kind of text falls back to the system fonts.</p>
+     <div id="package-gallery" class="theme-gallery" role="radiogroup" aria-labelledby="package-gallery-label"></div>
+     <h3 id="site-packages-heading">This site's font packages</h3>
+     <p id="site-packages-empty" class="meta">This site has no font packages of its own.</p>
+     <ul id="site-packages" class="list" aria-labelledby="site-packages-heading"></ul>
+     <div class="toolbar"><button type="button" id="new-site-package" class="secondary" aria-describedby="site-package-why">New package for this site</button> <span id="site-package-why" class="choice-why"></span></div>
+     <form id="site-package-form" class="custom-theme card" hidden>
+      <h3>New package for this site</h3>
+      <div class="field">
+       <label for="sp-name">Name</label>
+       <input type="text" id="sp-name" maxlength="60" autocomplete="off" required>
+      </div>
+      <div id="sp-fonts" class="field-pair"></div>
+      <h4>Which font each kind of text uses</h4>
+      <div id="sp-roles" class="role-grid"></div>
+      <div id="sp-specimen"></div>
+      <div class="toolbar">
+       <button type="submit" id="sp-save" aria-describedby="sp-why">Save package</button>
+       <button type="button" id="sp-cancel" class="plain">Cancel</button>
+       <span id="sp-why" class="choice-why" aria-live="polite"></span>
+      </div>
+     </form>
+    </div>
+   </section>
+
    <section id="part-header" class="studio-part" data-part="header">
     <h2 class="part-head"><button type="button" class="part-toggle" id="toggle-header" aria-controls="body-header">Header<span class="tab-mark" hidden><span class="visually-hidden"> (changed)</span></span></button></h2>
     <div id="body-header" class="part-body">
@@ -75,6 +106,7 @@
       <div id="logo-slot"></div>
       <div id="thumbnail-slot"></div>
       <div id="header-image-slot"></div>
+      <div id="icon-slot"></div>
      </div>
      <div class="field">
       <label for="logo-alt">Logo description</label>
@@ -90,6 +122,12 @@
     <div id="body-navigation" class="part-body">
      <h3 id="navigation-label">Where the site's links go</h3>
      <div id="navigation-choice" class="pick-grid two" role="radiogroup" aria-labelledby="navigation-label"></div>
+     <div id="menu-part">
+      <h3 id="menu-label">Menu style</h3>
+      <p class="meta" id="menu-note">How the links under a top link open.</p>
+      <div id="menu-choice" class="pick-grid two" role="radiogroup" aria-labelledby="menu-label" aria-describedby="menu-note"></div>
+     </div>
+     <p id="menu-off" class="meta" hidden>The menu style applies to links across the top. Links in a column at the left always open as a list.</p>
     </div>
    </section>
 
@@ -134,6 +172,9 @@
     </div>
    </section>
 
+   <p id="copy-banner" class="note copy-banner" hidden><span id="copy-text"></span></p>
+   <div class="toolbar"><button type="button" id="copy-open" class="secondary" aria-haspopup="dialog">Copy from another site…</button></div>
+
    <div id="actions" class="action-bar">
     <button type="button" id="apply" disabled>Apply</button>
     <button type="button" id="cancel" class="secondary" disabled>Cancel</button>
@@ -161,6 +202,28 @@
   </aside>
  </div>
  <dialog id="preview-sheet" class="preview-sheet" aria-labelledby="preview-heading"></dialog>
+ <dialog id="copy-dialog" class="wide-dialog" aria-labelledby="copy-heading">
+  <form id="copy-form" method="dialog">
+   <h2 id="copy-heading">Copy the look of another site</h2>
+   <p class="meta">The look loads as a draft. Nothing changes until you apply it.</p>
+   <div class="field">
+    <label for="copy-filter">Find a site</label>
+    <input type="text" id="copy-filter" autocomplete="off" aria-describedby="copy-count">
+   </div>
+   <p id="copy-count" class="meta" role="status" aria-live="polite"></p>
+   <ul id="copy-sites" class="list site-choices" aria-label="Sites you can see"></ul>
+   <label class="check"><input type="checkbox" id="copy-themes" aria-describedby="copy-themes-why"> Also copy that site's own themes</label>
+   <p id="copy-themes-why" class="choice-why"></p>
+   <label class="check"><input type="checkbox" id="copy-fonts" aria-describedby="copy-fonts-why"> Also copy that site's own font packages</label>
+   <p id="copy-fonts-why" class="choice-why"></p>
+   <p id="copy-msg" role="alert" class="msg"></p>
+   <div class="row end">
+    <button type="button" id="copy-cancel" class="plain">Cancel</button>
+    <button type="submit" id="copy-load" disabled aria-describedby="copy-load-why">Load as draft</button>
+   </div>
+   <p id="copy-load-why" class="choice-why">Choose a site first.</p>
+  </form>
+ </dialog>
 </div>
 <script type="module" src="./site-look.js"></script>
 </body>

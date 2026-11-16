@@ -148,3 +148,78 @@ test('two panes need a wide window and room beside the site sidebar',() => {
   assert.equal(studioWide(1099, 1099), false);
   assert.equal(studioWide(1200, 800), false);
 });
+
+// ---- Plan 4B: fonts, limits and copying ----
+
+import { STUDIO_LIMITS, choiceLimit, copyChoices, packageGallery, studioLimits } from './look-studio.js';
+
+test('limits_disable_with_reasons', () => {
+  const closed = { hide_builtin_themes: true, custom_colours: false, site_themes: false, site_images: false, site_fonts: false };
+  const open = { hide_builtin_themes: false, custom_colours: true, site_themes: true, site_images: true, site_fonts: true };
+  // A site owner under every limit: each choice is disabled, and each says why in words.
+  const limited = studioLimits(closed, true);
+  assert.deepEqual(Object.keys(limited), STUDIO_LIMITS);
+  for (const key of STUDIO_LIMITS) {
+    assert.equal(limited[key].disabled, true, key);
+    assert.match(limited[key].reason, /turned off for site owners/, key);
+    assert.match(limited[key].reason, /^[A-Z].*\.$/, `${key} is a sentence`);
+  }
+  // Nothing is ever disabled without a reason, and nothing has a reason when allowed.
+  for (const [policy, who] of [
+    [open, true],
+    [closed, false],
+    [undefined, true],
+  ]) {
+    for (const value of Object.values(studioLimits(policy, who))) assert.deepEqual(value, { disabled: false, reason: '' });
+  }
+  // One limit at a time disables only its own choices.
+  const custom = studioLimits({ ...open, custom_colours: false }, true);
+  assert.equal(custom.customColours.disabled, true);
+  assert.equal(custom.builtinThemes.disabled, false);
+  // The gallery's cards, the site-only packages and the copy options are matched to their limit.
+  assert.equal(choiceLimit('builtin:plum', limited), limited.builtinThemes);
+  assert.equal(choiceLimit('custom', limited), limited.customColours);
+  assert.equal(choiceLimit('site:t1', limited), limited.siteThemes);
+  assert.equal(choiceLimit('site:p1', limited, 'fonts'), limited.siteFonts);
+  assert.equal(choiceLimit('builtin:classic', limited, 'fonts'), null, 'built-in font packages are never limited');
+  assert.equal(choiceLimit('org:t1', limited), null, 'organisation themes are always allowed');
+  // An administrator or brand manager is never limited.
+  assert.equal(choiceLimit('custom', studioLimits(closed, false)), null);
+});
+
+test('the font gallery groups built-in, organisation and site packages with their specimens', () => {
+  const sha = 'a'.repeat(64);
+  const brand = [
+    { id: 'builtin:system', from: 'builtin:system', name: 'System', builtin: true, roles: { title: 'system', heading: 'system', body: 'system', interactive: 'system' } },
+    { id: 'builtin:classic', from: 'builtin:classic', name: 'Classic', builtin: true, roles: { title: 'system-serif', heading: 'system-serif', body: 'system', interactive: 'system' } },
+    { id: 'p1', from: 'org:p1', name: 'Pair', builtin: false, display: { name: 'D', family: `sc-${'a'.repeat(12)}`, url: `/api/brand/fonts/${sha}` }, roles: { title: 'display', heading: 'display', body: 'system', interactive: 'system' } },
+  ];
+  const site = [{ id: 's1', from: 'site:s1', name: 'Ours', roles: { title: 'system', heading: 'system', body: 'system', interactive: 'system' } }];
+  const groups = packageGallery(brand, site);
+  assert.deepEqual(groups.map((g) => g.label), ['Built in', 'Organisation', 'This site']);
+  assert.deepEqual(groups[0].cards.map((c) => c.from), ['builtin:system', 'builtin:classic']);
+  assert.equal(groups[1].cards[0].fonts.title.family, `sc-${'a'.repeat(12)}`);
+  assert.equal(groups[0].cards[1].fonts.heading.family, 'system-serif');
+  assert.deepEqual(packageGallery([], []), []);
+});
+
+test('the copy dialog lists the other sites the person can see, by name', () => {
+  const sites = [
+    { id: 'b', name: 'beta' },
+    { id: 'me', name: 'Sales' },
+    { id: 'a', name: 'Alpha' },
+    { id: 'z', name: 'Zed', archived: true },
+  ];
+  assert.deepEqual(copyChoices(sites, 'me').map((s) => s.id), ['a', 'b', 'z']);
+  assert.deepEqual(copyChoices(null, 'me'), []);
+});
+
+test('the tabs mark fonts, the tab icon and the menu style as changes', () => {
+  const draft = draftFromLook(null);
+  draft.fonts = { from: 'builtin:classic', name: 'Classic', keep: false };
+  draft.icon = { brand_image: 'i1', sha256: 'b'.repeat(64), name: 'Icon' };
+  draft.menu = 'mega';
+  assert.deepEqual(changedParts(draft, null), ['fonts', 'header', 'navigation']);
+  assert.ok(STUDIO_PARTS.includes('fonts'));
+  assert.equal(STUDIO_PARTS.indexOf('fonts'), 1, 'Fonts come after Theme');
+});

@@ -22,6 +22,7 @@ import {
   templateRefusal,
   timeZoneChoices,
 } from './common.js';
+import { templateLookReport } from './look-cards.js';
 import { navigationBody, navigationEditor, newItem, placePicker } from './navigation.js';
 
 const $ = (id) => document.getElementById(id);
@@ -271,11 +272,17 @@ $('save-template').addEventListener('submit', async (event) => {
   });
   if (!result.ok) return note('template-msg', templateRefusal(result));
   const cleaned = result.data.cleaned ?? [];
+  // Pictures from the site's own libraries never go into a template; the answer names them.
+  const lookReport = templateLookReport({ dropped: result.data.dropped ?? [] });
   note(
     'template-msg',
-    cleaned.length
-      ? `The template ${result.data.name} was saved. Some names were not allowed and were changed in it:`
-      : `The template ${result.data.name} was saved.`,
+    [
+      `The template ${result.data.name} was saved.`,
+      lookReport,
+      cleaned.length ? 'Some names were not allowed and were changed in it:' : '',
+    ]
+      .filter(Boolean)
+      .join(' '),
     true,
   );
   $('template-cleaned').replaceChildren(...cleaned.map((change) => h('li', {}, `${change.from} → ${change.to}`)));

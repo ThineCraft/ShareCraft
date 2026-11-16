@@ -21,7 +21,7 @@
  <p id="status" role="status" aria-live="polite" class="meta"></p>
  <p id="error" role="alert" class="msg"></p>
  <div id="content" hidden>
-  <p class="meta">The organisation's approved themes and brand images. Site owners choose from them when they change the look of a site. A site keeps a copy of the theme it uses, so changing or deleting a theme here never breaks a site.</p>
+  <p class="meta">The organisation's approved themes, brand images, fonts and font packages. Site owners choose from them when they change the look of a site. A site keeps a copy of the theme it uses, so changing or deleting a theme here never breaks a site.</p>
   <p id="read-only" class="note" hidden>Only brand managers and administrators can change the brand centre.</p>
 
   <section aria-labelledby="themes-heading">
@@ -72,6 +72,81 @@
     </div>
    </form>
    <p id="images-msg" role="alert" class="msg"></p>
+  </section>
+
+  <section aria-labelledby="icon-heading">
+   <h2 id="icon-heading">Default tab icon</h2>
+   <p class="meta">Shown in the browser tab of pages outside any site, and of sites with no icon or thumbnail of their own. Without one, ShareCraft's own icon is used.</p>
+   <div id="icon-slot" class="slot-grid"></div>
+   <p id="icon-msg" role="alert" class="msg"></p>
+  </section>
+
+  <section aria-labelledby="fonts-heading">
+   <h2 id="fonts-heading">Fonts</h2>
+   <p class="meta">WOFF2, WOFF, TTF or OTF files of at most 2 MB, chosen from asset libraries. Each is a snapshot, served only to people signed in here. Up to 30 fonts.</p>
+   <ul id="fonts" class="list font-list" aria-labelledby="fonts-heading"></ul>
+   <p id="fonts-empty" class="meta" hidden>There are no fonts yet. Pages use the system fonts.</p>
+   <div class="toolbar"><button type="button" id="add-font" hidden>Add a font</button></div>
+   <form id="font-form" class="theme-form" hidden>
+    <h3>Add <span id="font-chosen"></span></h3>
+    <div class="field">
+     <label for="font-name">Name</label>
+     <input type="text" id="font-name" maxlength="120" autocomplete="off" required>
+    </div>
+    <div id="font-form-specimen"></div>
+    <label class="check"><input type="checkbox" id="font-licence" aria-describedby="font-licence-note"> Our organisation holds a licence that lets us use this font on our sites.</label>
+    <p id="font-licence-note" class="meta">Required. ShareCraft records who confirmed it and when.</p>
+    <div class="toolbar">
+     <button type="submit" id="save-font" disabled aria-describedby="font-why">Add font</button>
+     <button type="button" id="cancel-font" class="plain">Cancel</button>
+     <span id="font-why" class="choice-why" aria-live="polite"></span>
+    </div>
+   </form>
+   <p id="fonts-msg" role="alert" class="msg"></p>
+  </section>
+
+  <section aria-labelledby="packages-heading">
+   <h2 id="packages-heading">Font packages</h2>
+   <p class="meta">A package pairs a display font with a content font and sets the font of each kind of text. Site owners choose a package in Change the look. Every role falls back to the system fonts.</p>
+   <ul id="packages" class="list package-list" aria-labelledby="packages-heading"></ul>
+   <div class="toolbar"><button type="button" id="new-package" hidden>New font package</button></div>
+   <form id="package-form" class="theme-form" hidden>
+    <h3 id="package-form-heading">New font package</h3>
+    <div class="field">
+     <label for="package-name">Name</label>
+     <input type="text" id="package-name" maxlength="60" autocomplete="off" required>
+    </div>
+    <div class="field-pair">
+     <div class="field">
+      <label for="package-display">Display font (titles and headings)</label>
+      <select id="package-display"></select>
+     </div>
+     <div class="field">
+      <label for="package-content">Content font (running text)</label>
+      <select id="package-content"></select>
+     </div>
+    </div>
+    <h4>Which font each kind of text uses</h4>
+    <div id="package-roles" class="role-grid"></div>
+    <h4>Specimen</h4>
+    <div id="package-specimen"></div>
+    <div class="toolbar">
+     <button type="submit" id="save-package">Save package</button>
+     <button type="button" id="cancel-package" class="plain">Cancel</button>
+    </div>
+    <p id="package-msg" role="alert" class="msg"></p>
+   </form>
+   <p id="packages-msg" role="alert" class="msg"></p>
+  </section>
+
+  <section id="limits-section" aria-labelledby="limits-heading" hidden>
+   <h2 id="limits-heading">Limits for site owners</h2>
+   <p class="meta">For administrators. These limit what site owners may choose when they change the look of a site. Administrators and brand managers can always choose anything. A look already set stays as it is; the limits apply to its next change.</p>
+   <form id="limits-form">
+    <ul id="limits" class="limits" aria-labelledby="limits-heading"></ul>
+    <div class="toolbar"><button type="submit" id="save-limits" disabled>Save limits</button> <span id="limits-why" class="choice-why" aria-live="polite">No changes to save.</span></div>
+   </form>
+   <p id="limits-msg" role="alert" class="msg"></p>
   </section>
 
   <section id="managers-section" aria-labelledby="managers-heading" hidden>

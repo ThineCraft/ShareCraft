@@ -23,8 +23,55 @@
  <div id="content" hidden>
   <p class="meta">Every site, live, archived or deleted. An archived site is read-only and hidden from the directory until it is reactivated. A deleted site can be restored for 93 days, then it is erased.</p>
   <p id="no-owner" class="note" hidden></p>
+  <div class="bulk-bar">
+   <button type="button" id="apply-look" class="secondary" aria-haspopup="dialog" aria-describedby="selected-count" disabled>Apply a look…</button>
+   <span id="selected-count" class="choice-why" aria-live="polite">Select sites to apply a look to them.</span>
+   <button type="button" id="clear-selection" class="ghost small" hidden>Clear the selection</button>
+  </div>
   <ul id="sites" class="list" aria-label="Sites"></ul>
   </div>
+  <dialog id="look-dialog" class="wide-dialog" aria-labelledby="look-heading">
+   <form id="look-form" method="dialog">
+    <h2 id="look-heading">Apply a look</h2>
+    <p id="look-for" class="meta"></p>
+    <fieldset class="stack">
+     <legend>Where the look comes from</legend>
+     <label class="check"><input type="radio" name="look-source" value="site" checked> The look of another site</label>
+     <label class="check"><input type="radio" name="look-source" value="template"> The look a template carries</label>
+     <label class="check"><input type="radio" name="look-source" value="brand"> A theme and font package from the brand centre</label>
+    </fieldset>
+    <div id="from-site" class="field">
+     <label for="source-site">Site</label>
+     <select id="source-site"></select>
+    </div>
+    <div id="from-template" class="field" hidden>
+     <label for="source-template">Template</label>
+     <select id="source-template" aria-describedby="template-why"></select>
+     <small id="template-why" class="choice-why"></small>
+    </div>
+    <div id="from-brand" class="field-pair" hidden>
+     <div class="field">
+      <label for="source-theme">Theme</label>
+      <select id="source-theme"></select>
+     </div>
+     <div class="field">
+      <label for="source-package">Fonts</label>
+      <select id="source-package"></select>
+     </div>
+    </div>
+    <h3>Preview</h3>
+    <div id="look-preview" aria-live="polite"></div>
+    <p id="look-warning" class="note"></p>
+    <p id="look-msg" role="alert" class="msg"></p>
+    <h3 id="progress-heading" hidden>Progress</h3>
+    <ul id="apply-progress" class="list apply-progress" aria-labelledby="progress-heading" hidden></ul>
+    <div class="row end">
+     <button type="button" id="look-close" class="plain">Cancel</button>
+     <button type="submit" id="look-apply" aria-describedby="look-apply-why">Apply</button>
+    </div>
+    <p id="look-apply-why" class="choice-why"></p>
+   </form>
+  </dialog>
   </main>
  </div>
 </div>

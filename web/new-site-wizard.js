@@ -20,6 +20,7 @@ import {
   writeWelcome,
   descriptionProblem,
 } from './new-site.js';
+import { lookCardElement } from './look-card-view.js';
 import { libraryIcon } from './site-home.js';
 
 const $ = (id) => document.getElementById(id);
@@ -44,6 +45,7 @@ export function setupNewSiteWizard(me, opener) {
   let templates = []; // as GET /api/templates lists them
   const packages = new Map(); // template id -> package, or null when it could not be read
   let brandThemes = null; // GET /api/brand's themes, once read
+  let brandFonts = []; // GET /api/brand's fonts, for the fonts of the templates' looks
   let hubs = null; // GET /api/hubs, once read
   let taken = []; // the names of the sites the page knows
   let regionalFor = null; // the template whose language and time zone the fields hold
@@ -52,13 +54,17 @@ export function setupNewSiteWizard(me, opener) {
 
   const summaryOf = (id) => {
     const template = templates.find((t) => t.id === id) ?? { id, name: id, kind: id === 'communication' ? 'communication' : 'team', built_in: true };
-    return templateSummary(template, packages.get(id) ?? null);
+    return templateSummary(template, packages.get(id) ?? null, brandFonts);
   };
 
   // ---- loading what the steps show ----
 
   async function loadTemplates() {
-    const result = await api('GET', '/templates');
+    const [result, brand] = await Promise.all([api('GET', '/templates'), api('GET', '/brand')]);
+    if (brand.ok) {
+      brandFonts = Array.isArray(brand.data.fonts) ? brand.data.fonts : [];
+      brandThemes ??= brand.data.themes ?? [];
+    }
     templates = result.ok && result.data.length
       ? result.data
       : [
@@ -170,6 +176,8 @@ export function setupNewSiteWizard(me, opener) {
       ),
       h('span', { class: 'tp-description' }, summary.description),
       preview,
+      // A template that carries a look shows it: its theme's colours and a sample of its fonts.
+      summary.look ? lookCardElement(summary.look) : null,
       h('span', { class: 'visually-hidden', id: `${input.id}-text` }, summary.text),
     );
   }
@@ -443,7 +451,9 @@ export function setupNewSiteWizard(me, opener) {
       const theme = (brandThemes ?? []).find((t) => t.from === plan.theme);
       let ok = false;
       if (theme) {
-        const draft = draftFromLook(null);
+        // The theme goes onto the look the site was made with, so a template's look keeps the rest.
+        const current = await api('GET', `/sites/${seg(siteId)}/look/settings`);
+        const draft = draftFromLook(current.ok ? current.data.look : null);
         draft.theme = themeOf(theme);
         draft.from = theme.from;
         const result = await api('PUT', `/sites/${seg(siteId)}/look`, { look: lookInput(draft, { themes: brandThemes }) });

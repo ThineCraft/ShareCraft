@@ -224,3 +224,29 @@ test('the welcome state is remembered per site and viewer, and never throws', ()
   store.setItem(welcomeKey('u3', 's1'), '{nonsense');
   assert.deepEqual(readWelcome('u3', 's1', store), { dismissed: false, baseline: null });
 });
+
+test('template_card_shows_look', () => {
+  const sha = '9'.repeat(64);
+  const brandFonts = [{ id: 'font-1', name: 'Display.woff2', family: `sc-${'9'.repeat(12)}`, url: `/api/brand/fonts/${sha}` }];
+  const look = {
+    theme: { name: 'Plum', primary: '#7a3e8f', secondary: '#3b2244' },
+    from: 'builtin:plum',
+    logo_alt: '',
+    header: { layout: 'compact', background: 'none', align: 'left', hide_title: false },
+    navigation: 'horizontal',
+    footer: { enabled: false, layout: 'simple', name: '', background: 'none', groups: [] },
+    fonts: { from: 'org:p1', package: { name: 'Pair', display: { brand_font: 'font-1' }, roles: { title: 'display', heading: 'display', body: 'system', interactive: 'system' } } },
+  };
+  const template = { id: 'abc', name: 'Project site', description: 'For projects.', built_in: false, kind: 'team' };
+  const summary = templateSummary(template, { body: { kind: 'team', libraries: [], navigation: null, look } }, brandFonts);
+  assert.equal(summary.look.name, 'Plum');
+  assert.equal(summary.look.light.primary, '#7a3e8f');
+  assert.equal(summary.look.fonts.title.family, `sc-${'9'.repeat(12)}`);
+  assert.match(summary.text, /Look: the theme Plum, with the fonts Pair\./);
+  // A template without a look (the built-ins) shows none, and its card says nothing about one.
+  const plain = templateSummary(template, { body: { kind: 'team', libraries: [], navigation: null } }, brandFonts);
+  assert.equal(plain.look, null);
+  assert.doesNotMatch(plain.text, /Look:/);
+  // Until the package arrives there is no look either.
+  assert.equal(templateSummary(template).look, null);
+});

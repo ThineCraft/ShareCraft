@@ -638,6 +638,42 @@ input[type=color]{width:44px;height:36px;padding:2px;border:1px solid var(--line
 .swatches{display:inline-flex;gap:var(--space-1);align-items:center;flex:none}
 .pairs li .ratio{font-variant-numeric:tabular-nums}
 .pairs li.pass{color:var(--muted)}
+/* font specimens and look cards (plan 4B): the fonts come from the --font-* variables applyFonts
+   sets on the box, so only generated family names and the fixed stacks ever reach the page */
+.look-preview{font-family:var(--font-body)}
+.font-specimen{display:flex;flex-direction:column;gap:2px;min-width:0;padding:var(--space-2);border:1px solid var(--line);border-radius:var(--radius-sm);background:var(--paper);color:var(--text);font-family:var(--font-body);overflow:hidden}
+.font-specimen .sp-title{font-family:var(--font-title);font-size:var(--text-lg);font-weight:600;overflow-wrap:anywhere}
+.font-specimen .sp-heading{font-family:var(--font-heading);font-size:var(--text-md);font-weight:600}
+.font-specimen .sp-body{font-family:var(--font-body);font-size:var(--text-sm);overflow-wrap:anywhere}
+.font-specimen .sp-button{align-self:flex-start;margin-top:var(--space-1);padding:2px var(--space-3);border-radius:var(--radius-sm);background:var(--accent);color:var(--on-accent);font-family:var(--font-interactive);font-size:var(--text-sm)}
+.font-specimen.small{padding:var(--space-1) var(--space-2)}
+.font-specimen.small .sp-title{font-size:var(--text-md)}
+.font-specimen.small .sp-body{font-size:var(--text-xs);white-space:nowrap;text-overflow:ellipsis;overflow:hidden}
+.look-card{display:grid;gap:var(--space-2);min-width:0}
+.look-card.none{color:var(--muted);font-size:var(--text-sm)}
+.look-card-text{color:var(--muted);font-size:var(--text-xs)}
+.font-list li,.package-list li{flex-wrap:wrap}
+.font-list .font-specimen,.package-list .font-specimen{flex:1 1 240px}
+.package-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:var(--space-2)}
+.package-card .font-specimen{border:0;padding:var(--space-1) 0;background:transparent}
+.choice-why{color:var(--muted);font-size:var(--text-xs)}
+.limits{display:flex;flex-direction:column;gap:var(--space-2);margin:0 0 var(--space-3);padding:0;list-style:none}
+.limits li{display:flex;flex-direction:column;gap:2px;padding:var(--space-2) var(--space-3);border-radius:var(--radius-sm)}
+.limits li:nth-child(even){background:var(--band)}
+.limits .check{font-size:var(--text-md);font-weight:600}
+.limits .meta{margin:0 0 0 calc(var(--space-2) + 18px)}
+.role-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:0 var(--space-4)}
+.role-grid .field{max-width:none}
+.copy-banner{display:flex;flex-wrap:wrap;align-items:center;gap:var(--space-2)}
+.site-choices{max-height:50vh;overflow:auto;margin:0 0 var(--space-3)}
+.site-choices li{padding:var(--space-1) var(--space-2)}
+.apply-progress li .grow{min-width:0;overflow-wrap:anywhere}
+.apply-progress li.failed small{color:var(--stop-ink)}
+.admin-site .select-site{flex:none;align-self:flex-start;margin-top:var(--space-1)}
+.bulk-bar{display:flex;flex-wrap:wrap;align-items:center;gap:var(--space-2);margin:0 0 var(--space-3)}
+dialog.wide-dialog{max-width:min(720px,calc(100vw - 32px))}
+.wide-dialog .look-card{max-width:320px}
+.template-look{display:block;max-width:320px;margin-top:var(--space-2)}
 /* image slots as tiles: the picture, what it is for, its name, Change and Remove */
 .slot-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:var(--space-3);margin:0 0 var(--space-4)}
 .slot-grid>div:empty{display:none}
@@ -1892,3 +1928,6 @@ ol.sk-item li+li::before{color:var(--line)}
  @view-transition{navigation:auto}
  ::view-transition-old(root),::view-transition-new(root){animation-duration:180ms;animation-timing-function:var(--ease)}
 }
+.wide-dialog fieldset{margin:0 0 var(--space-3);padding:0;border:0;gap:var(--space-1)}
+.wide-dialog legend{margin:0 0 var(--space-1);padding:0;font-size:var(--text-sm);font-weight:600;color:var(--text)}
+.wide-dialog h3{margin:var(--space-3) 0 var(--space-2);font-size:var(--text-md)}

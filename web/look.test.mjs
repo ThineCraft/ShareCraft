@@ -665,3 +665,164 @@ test('font_tokens_fall_back_to_system', () => {
   assert.equal(partial['--font-interactive'], SYSTEM);
   assert.deepEqual(Object.keys(partial), ROLES.map((r) => `--font-${r}`));
 });
+
+// ---- Plan 4B pages: specimens, the draft's fonts, icon and menu, and copying a look ----
+
+import { applyFonts, fontAsPackage, packageFonts } from './look.js';
+
+/** A stand-in for `FontFace` and `document.fonts` that records every face asked for. */
+function fontEnv() {
+  const faces = [];
+  class Face {
+    constructor(family, source, options) {
+      faces.push({ family, source, options });
+    }
+    load() {
+      return Promise.resolve(this);
+    }
+  }
+  return { faces, env: { FontFace: Face, fonts: { add() {}, delete() {} } } };
+}
+
+test('specimen_uses_generated_family', async () => {
+  const sha = 'd'.repeat(64);
+  const family = `sc-${'d'.repeat(12)}`;
+  const url = `/api/brand/fonts/${sha}`;
+  // A package as the brand centre lists it: its fonts with generated families and addresses.
+  const listed = {
+    name: 'Pair',
+    display: { name: 'Brand Display.woff2', family, url },
+    content: null,
+    roles: { title: 'display', heading: 'display', body: 'system', interactive: 'system-serif' },
+  };
+  const fonts = packageFonts(listed);
+  assert.deepEqual(fonts, {
+    title: { family, url },
+    heading: { family, url },
+    body: { family: 'system' },
+    interactive: { family: 'system-serif' },
+  });
+  // A look's own copy names its fonts by content hash: the same family and address.
+  const stored = { name: 'Pair', display: { sha256: sha, name: 'Brand Display.woff2' }, roles: listed.roles };
+  assert.deepEqual(packageFonts(stored), fonts);
+  // A role naming a font the package lacks, and no package at all, are the system fonts.
+  assert.deepEqual(packageFonts({ roles: { title: 'content', heading: 'system', body: 'system', interactive: 'system' } }).title, { family: 'system' });
+  assert.deepEqual(packageFonts(null).body, { family: 'system' });
+  // The specimen is drawn with applyFonts: the generated family before the system stack, loaded
+  // from the brand font address through FontFace.
+  const { faces, env } = fontEnv();
+  const specimen = rootElement();
+  await applyFonts(specimen, fonts, env);
+  assert.equal(specimen.set['--font-title'], `${family}, ${SYSTEM}`);
+  assert.equal(specimen.set['--font-body'], SYSTEM);
+  assert.equal(specimen.set['--font-interactive'], SYSTEM_SERIF);
+  assert.deepEqual(faces.map((f) => [f.family, f.source]), [[family, `url(${url})`]]);
+  // One brand-centre font shown alone sets every role in it.
+  const alone = fontAsPackage({ id: 'f1', name: 'Brand Display.woff2', family, url });
+  assert.deepEqual(Object.values(packageFonts(alone)), [1, 2, 3, 4].map(() => ({ family, url })));
+  // A name or family that is user text never reaches the page, and nothing is loaded for it.
+  const hostile = '"; } body { display:none';
+  const evil = { name: hostile, display: { name: hostile, family: hostile, url: 'https://evil.test/x.woff2' }, roles: listed.roles };
+  const bad = fontEnv();
+  const target = rootElement();
+  await applyFonts(target, packageFonts(evil), bad.env);
+  assert.equal(target.set['--font-title'], SYSTEM);
+  assert.equal(bad.faces.length, 0);
+  const wrongUrl = fontAsPackage({ name: 'x', family, url: `/api/brand/images/${sha}` });
+  assert.deepEqual(packageFonts(wrongUrl).title, { family: 'system' });
+  for (const value of Object.values(target.set)) assert.doesNotMatch(value, /display:none|evil/);
+});
+
+test('the draft keeps fonts, the tab icon and the menu style, and sends them', () => {
+  const sha = 'e'.repeat(64);
+  const look = {
+    ...structuredClone(STORED),
+    fonts: { from: 'org:p1', package: { id: 'p1', name: 'Pair', display: { sha256: sha, name: 'D.woff2' }, roles: { title: 'display', heading: 'display', body: 'system', interactive: 'system' } } },
+    icon: ref(SHA_C, DOC_A, 'Icon.png'),
+    menu: 'mega',
+  };
+  const draft = draftFromLook(look);
+  assert.equal(draft.fonts.from, 'org:p1');
+  assert.equal(draft.fonts.keep, true);
+  assert.equal(draft.icon.sha256, SHA_C);
+  assert.equal(draft.menu, 'mega');
+  const input = lookInput(draft, { themes: THEMES });
+  assert.deepEqual(input.fonts, { keep: true }, 'the copy the look holds is kept');
+  assert.deepEqual(input.icon, { keep: SHA_C });
+  assert.equal(input.menu, 'mega');
+  // The preview shows the fonts as the effective look would.
+  assert.equal(previewEffective(draft, 'Sales').fonts.title.family, `sc-${'e'.repeat(12)}`);
+  assert.equal(previewEffective(draft, 'Sales').navigation_menu, 'mega');
+  // A package chosen is sent by its source; the system fonts and the dropdown are left out.
+  draft.fonts = { from: 'builtin:classic', name: 'Classic', keep: false };
+  assert.deepEqual(lookInput(draft, { themes: THEMES }).fonts, { from: 'builtin:classic' });
+  draft.fonts = null;
+  draft.menu = 'cascading';
+  draft.icon = null;
+  const plain = lookInput(draft, { themes: THEMES });
+  assert.equal('fonts' in plain, false);
+  assert.equal('menu' in plain, false);
+  assert.equal('icon' in plain, false);
+  // A mega menu is for navigation across the top only.
+  draft.menu = 'mega';
+  draft.navigation = 'vertical';
+  assert.equal('menu' in lookInput(draft, { themes: THEMES }), false);
+  // A look without them has none.
+  const none = draftFromLook(STORED);
+  assert.equal(none.fonts, null);
+  assert.equal(none.icon, null);
+  assert.equal(none.menu, 'cascading');
+  assert.match(describeLookChange(STORED, look), /Fonts: System to Pair/);
+  assert.match(describeLookChange(STORED, look), /tab icon added/i);
+  assert.match(describeLookChange(STORED, look), /menu style dropdown to mega/i);
+});
+
+test('copy_dialog_loads_draft_only', async () => {
+  const SOURCE = '22222222-2222-4222-8222-222222222222';
+  const copied = { ...structuredClone(STORED), navigation: 'vertical' };
+  const { calls, send } = sender(() => ({ ok: true, status: 200, data: settingsOf(copied) }));
+  const session = lookSession({ siteId: SITE_ID, settings: settingsOf(STORED), themes: THEMES, brandImages: [], send });
+  const effective = {
+    theme: {
+      light: { accent: '#7a3e8f', accent_ink: '#7a3e8f', on_accent: '#ffffff', header_bg: '#3b2244', header_ink: '#ffffff' },
+      dark: { accent: '#c9a0d9', accent_ink: '#c9a0d9', on_accent: '#141c20', header_bg: '#2a1830', header_ink: '#ffffff' },
+    },
+    fonts: { title: { family: 'system-serif' }, heading: { family: 'system-serif' }, body: { family: 'system' }, interactive: { family: 'system' } },
+    logo_alt: 'Marketing',
+    header: { layout: 'standard', background: 'strong', align: 'left', hide_title: false },
+    navigation: 'vertical',
+    navigation_menu: 'cascading',
+    footer: { enabled: false, layout: 'simple', name: '', background: 'none', groups: [] },
+    theme_from: 'site',
+  };
+  session.loadCopy({ id: SOURCE, name: 'Marketing' }, effective, { themes: true, fonts: false });
+  assert.equal(calls.length, 0, 'choosing a site to copy from saves nothing');
+  assert.deepEqual(session.copy, { from: SOURCE, name: 'Marketing', themes: true, fonts: false });
+  assert.equal(session.status().dirty, true);
+  assert.equal(session.status().canApply, true);
+  // The preview shows the other site's look, under this site's name.
+  const shown = session.effective('Sales');
+  assert.equal(shown.theme.light.accent, '#7a3e8f');
+  assert.equal(shown.navigation, 'vertical');
+  assert.equal(shown.logo_alt, 'Sales');
+  // Cancel drops it, still without a call.
+  session.cancel();
+  assert.equal(session.copy, null);
+  assert.equal(session.status().dirty, false);
+  assert.equal(session.effective('Sales').theme.light.accent, '#3156c9');
+  assert.equal(calls.length, 0);
+  // Apply copies it: one request, the copy route, with the options chosen.
+  session.loadCopy({ id: SOURCE, name: 'Marketing' }, effective, { themes: false, fonts: true });
+  const result = await session.apply();
+  assert.equal(result.ok, true);
+  assert.deepEqual(calls, [{ method: 'POST', path: `/sites/${SITE_ID}/look/copy`, body: { from: SOURCE, themes: false, fonts: true } }]);
+  assert.equal(session.copy, null);
+  assert.equal(session.status().dirty, false);
+  assert.equal(session.draft.navigation, 'vertical', 'the copied look is now the saved one');
+  // An archived site never copies.
+  const archived = lookSession({ siteId: SITE_ID, settings: settingsOf(STORED), themes: THEMES, brandImages: [], send, readOnly: true });
+  archived.loadCopy({ id: SOURCE, name: 'Marketing' }, effective, {});
+  assert.equal(archived.status().canApply, false);
+  assert.equal((await archived.apply()).ok, false);
+  assert.equal(calls.length, 1);
+});
