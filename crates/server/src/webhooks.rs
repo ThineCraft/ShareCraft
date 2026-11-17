@@ -73,9 +73,15 @@ pub(crate) async fn github(
     State(state): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
-    Delivery { body, .. }: Delivery,
+    Delivery { body, _turn }: Delivery,
 ) -> Response {
-    let Ok(uuid) = Uuid::parse_str(&id) else {
+    let response = handle(&state, &id, &headers, &body).await;
+    drop(_turn);
+    response
+}
+
+async fn handle(state: &AppState, id: &str, headers: &HeaderMap, body: &Bytes) -> Response {
+    let Ok(uuid) = Uuid::parse_str(id) else {
         return bare(StatusCode::NOT_FOUND);
     };
     let library = NodeId(uuid);
@@ -123,7 +129,7 @@ pub(crate) async fn github(
         let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(&key) else {
             return bare(StatusCode::NOT_FOUND);
         };
-        mac.update(&body);
+        mac.update(body);
         // Constant time. The opened secret goes when this block ends.
         mac.verify_slice(&signature).is_ok()
     };
@@ -138,7 +144,7 @@ pub(crate) async fn github(
         "ping" => bare(StatusCode::OK),
         "push" => {
             let wanted = format!("refs/heads/{}", config.branch);
-            let ours = serde_json::from_slice::<Push>(&body).is_ok_and(|p| p.reference == wanted);
+            let ours = serde_json::from_slice::<Push>(body).is_ok_and(|p| p.reference == wanted);
             if ours {
                 state.sources().wake(library);
                 bare(StatusCode::ACCEPTED)

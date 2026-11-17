@@ -187,6 +187,17 @@ pub struct SourceStatus {
 /// A new status for [`Db::set_source_status`]: every field is written as given.
 pub type StatusUpdate = SourceStatus;
 
+/// The result of conditionally moving a worker-selected source to `syncing`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceSyncTransition {
+    /// The source was still eligible under the generation the worker read and now is syncing.
+    Started,
+    /// The source generation moved after the worker read it.
+    Superseded,
+    /// The source no longer exists or is no longer eligible for an automatic sync.
+    Ineligible,
+}
+
 /// What [`Db::change_source`] changes; `None` leaves a field alone. For the two secrets,
 /// `Some(None)` takes the secret away. Changing the branch or folder clears the sync bookmark
 /// (`last_commit` and `etag`), as what was mirrored no longer says where the new place stands.
@@ -526,6 +537,42 @@ impl Db {
         .execute(self.pool())
         .await?;
         Ok(done.rows_affected() > 0)
+    }
+
+    /// Moves `library` to `syncing` for a worker only if the generation and every automatic
+    /// eligibility predicate still hold in this statement.
+    pub async fn mark_source_syncing_if_eligible(
+        &self,
+        library: NodeId,
+        now: OffsetDateTime,
+        generation: i64,
+    ) -> Result<SourceSyncTransition, DbError> {
+        let result: i32 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "with updated as (\
+                 update library_sources set state = 'syncing', last_checked_at = $1 \
+                  where library_id = $2 and generation = $3 \
+                    and exists(select 1 {SYNCABLE} \
+                         and s.library_id = $2 \
+                         and s.state in ('connecting', 'ok', 'rate_limited', 'failed')) \
+                  returning 1\
+             ) \
+             select case \
+                 when exists(select 1 from updated) then 1 \
+                 when exists(select 1 from library_sources \
+                              where library_id = $2 and generation <> $3) then -1 \
+                 else 0 \
+             end"
+        )))
+        .bind(now)
+        .bind(library.0)
+        .bind(generation)
+        .fetch_one(self.pool())
+        .await?;
+        Ok(match result {
+            1 => SourceSyncTransition::Started,
+            -1 => SourceSyncTransition::Superseded,
+            _ => SourceSyncTransition::Ineligible,
+        })
     }
 
     /// Makes the connection of `library` due at once: state `connecting`, never checked, no

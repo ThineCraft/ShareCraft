@@ -35,14 +35,14 @@ use collab_core::ids::{DocId, NodeId};
 use futures_util::{StreamExt, TryStreamExt};
 use records::{
     DEFAULT_SOURCE_MAX_BYTES, DEFAULT_SOURCE_MAX_FILES, Editor, NewEvent, NodeKind,
-    SOURCE_MAX_BYTES, SOURCE_MAX_FILES, SourceConfig, SourceItem, SourceState, SourceStatus,
-    UploadTarget, User, check_name, check_size, is_format_char, validate_document_name,
-    validate_node_name,
+    SOURCE_MAX_BYTES, SOURCE_MAX_FILES, SourceConfig, SourceItem, SourceLock, SourceState,
+    SourceStatus, SourceSyncTransition, UploadTarget, User, check_name, check_size, is_format_char,
+    validate_document_name, validate_node_name,
 };
 use revisions::RevisionId;
 use serde_json::json;
 use time::OffsetDateTime;
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::{Notify, OwnedRwLockWriteGuard, RwLock, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 use uuid::Uuid;
 
@@ -456,6 +456,8 @@ pub struct Sources {
     failures: Mutex<HashMap<NodeId, u32>>,
     /// Taken by each running sync.
     turns: Arc<Semaphore>,
+    /// A test seam held immediately before a worker starts a chosen source.
+    start_gate: Arc<RwLock<()>>,
     /// Told when a library is woken.
     wake: Notify,
 }
@@ -467,6 +469,7 @@ impl Default for Sources {
             running: Mutex::new(HashMap::new()),
             failures: Mutex::new(HashMap::new()),
             turns: Arc::new(Semaphore::new(MAX_SYNCS)),
+            start_gate: Arc::new(RwLock::new(())),
             wake: Notify::new(),
         }
     }
@@ -490,6 +493,15 @@ impl Sources {
     /// Forgets the failures in a row of `library`: someone changed the connection.
     pub(crate) fn forget_failures(&self, library: NodeId) {
         lock(&self.failures).remove(&library);
+    }
+
+    /// Holds worker source starts until the returned guard is dropped.
+    ///
+    /// This is a test seam for changes recorded after a worker takes its global turn but before
+    /// it atomically starts the source.
+    #[doc(hidden)]
+    pub async fn hold_starts(&self) -> OwnedRwLockWriteGuard<()> {
+        Arc::clone(&self.start_gate).write_owned().await
     }
 
     fn take_pending(&self) -> Vec<NodeId> {
@@ -551,6 +563,7 @@ pub async fn tick_once(state: &AppState, now: OffsetDateTime) -> usize {
 
 /// Starts the syncs of the libraries woken or due as of `now` in `running`; how many.
 async fn start_due(state: &AppState, now: OffsetDateTime, running: &mut JoinSet<()>) -> usize {
+    recover_stale_syncs(state, now.checked_sub(STALE_SYNC).unwrap_or(now)).await;
     let sources = state.sources();
     let db = state.db();
     let woken = sources.take_pending();
@@ -582,20 +595,109 @@ async fn start_due(state: &AppState, now: OffsetDateTime, running: &mut JoinSet<
         running.spawn({
             let state = state.clone();
             async move {
-                let again = sync_one(&state, library, now).await;
-                if state.sources().done(library) {
-                    state.sources().wake(library);
-                } else if again {
-                    let state = state.clone();
-                    tokio::spawn(async move {
-                        tokio::time::sleep(AGAIN_SOON).await;
-                        state.sources().wake(library);
-                    });
-                }
+                let mut guard = RunningGuard::new(state.clone(), library);
+                guard.retry_soon = sync_one(&state, library, now).await;
             }
         });
     }
     started
+}
+
+/// Removes a child from the in-memory running set whether it returns or is aborted with its
+/// worker. A wake received while it ran is restored; a busy or superseded start is retried soon.
+struct RunningGuard {
+    state: AppState,
+    library: NodeId,
+    retry_soon: bool,
+}
+
+impl RunningGuard {
+    fn new(state: AppState, library: NodeId) -> Self {
+        Self {
+            state,
+            library,
+            retry_soon: false,
+        }
+    }
+}
+
+impl Drop for RunningGuard {
+    fn drop(&mut self) {
+        let sources = self.state.sources();
+        if sources.done(self.library) {
+            sources.wake(self.library);
+        } else if self.retry_soon {
+            let state = self.state.clone();
+            let library = self.library;
+            tokio::spawn(async move {
+                tokio::time::sleep(AGAIN_SOON).await;
+                state.sources().wake(library);
+            });
+        } else if sources.has_pending() {
+            sources.wake.notify_one();
+        }
+    }
+}
+
+/// A worker start after its per-library advisory lock has been considered.
+enum WorkerStart {
+    Started(Box<StartedSync>),
+    BusyOrSuperseded,
+    Ineligible,
+}
+
+struct StartedSync {
+    source_lock: SourceLock,
+    config: SourceConfig,
+    status: SourceStatus,
+    generation: i64,
+}
+
+async fn start_worker_sync(state: &AppState, library: NodeId, now: OffsetDateTime) -> WorkerStart {
+    let db = state.db();
+    let source_lock = match db.try_lock_source(library).await {
+        Ok(Some(source_lock)) => source_lock,
+        Ok(None) => return WorkerStart::BusyOrSuperseded,
+        Err(e) => {
+            eprintln!("sharecraft-server: database failure: {e}");
+            return WorkerStart::Ineligible;
+        }
+    };
+    let generation = match db.source_generation(library).await {
+        Ok(Some(generation)) => generation,
+        Ok(None) => return WorkerStart::Ineligible,
+        Err(e) => {
+            eprintln!("sharecraft-server: database failure: {e}");
+            return WorkerStart::Ineligible;
+        }
+    };
+    let (config, status) = match db.source_of(library).await {
+        Ok(Some(source)) => source,
+        Ok(None) => return WorkerStart::Ineligible,
+        Err(e) => {
+            eprintln!("sharecraft-server: database failure: {e}");
+            return WorkerStart::Ineligible;
+        }
+    };
+    let start_guard = state.sources().start_gate.read().await;
+    let transition = db
+        .mark_source_syncing_if_eligible(library, now, generation)
+        .await;
+    drop(start_guard);
+    match transition {
+        Ok(SourceSyncTransition::Started) => WorkerStart::Started(Box::new(StartedSync {
+            source_lock,
+            config,
+            status,
+            generation,
+        })),
+        Ok(SourceSyncTransition::Superseded) => WorkerStart::BusyOrSuperseded,
+        Ok(SourceSyncTransition::Ineligible) => WorkerStart::Ineligible,
+        Err(e) => {
+            eprintln!("sharecraft-server: database failure: {e}");
+            WorkerStart::Ineligible
+        }
+    }
 }
 
 /// Syncs `library` as of `now`, taking a turn first, and keeps the back-off: after a failure
@@ -607,23 +709,22 @@ async fn sync_one(state: &AppState, library: NodeId, now: OffsetDateTime) -> boo
     let Ok(_turn) = Arc::clone(&state.sources().turns).acquire_owned().await else {
         return false;
     };
-    match state.db().source_is_syncable(library, now).await {
-        Ok(true) => {}
-        Ok(false) => {
-            return match state.db().source_sync_is_busy(library, now).await {
-                Ok(busy) => busy,
-                Err(e) => {
-                    eprintln!("sharecraft-server: database failure: {e}");
-                    false
-                }
-            };
+    let outcome = match start_worker_sync(state, library, now).await {
+        WorkerStart::Started(started) => {
+            let StartedSync {
+                source_lock,
+                config,
+                status,
+                generation,
+            } = *started;
+            let outcome = run(state, &config, &status).await;
+            let finished = finish(state, &config, status, now, outcome, generation).await;
+            drop(source_lock);
+            finished
         }
-        Err(e) => {
-            eprintln!("sharecraft-server: database failure: {e}");
-            return false;
-        }
-    }
-    let outcome = sync_once(state, library, now).await;
+        WorkerStart::BusyOrSuperseded => return true,
+        WorkerStart::Ineligible => return false,
+    };
     let current = match state.db().source_of(library).await {
         Ok(Some((_, status))) => status.state,
         // Disconnected meanwhile.

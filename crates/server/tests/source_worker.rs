@@ -548,6 +548,38 @@ async fn stale_rate_limit_is_still_waited_out() {
 }
 
 #[tokio::test]
+async fn a_rate_limit_recorded_while_the_worker_waits_for_the_source_lock_is_preserved() {
+    let env = Env::without_worker().await;
+    let now = env.checked().await + seconds(300);
+    let retry_at = now + seconds(3600);
+    let before = env.fake.count("commits");
+    let start_gate = env.state.sources().hold_starts().await;
+    let ticking = {
+        let state = env.state.clone();
+        tokio::spawn(async move { server::source_tick_once(&state, now).await })
+    };
+    // The worker has taken its global turn and checked the old eligibility before this seam.
+    // Record a newer reason that the source must not start before releasing it.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    env.server
+        .records_db()
+        .rate_limit_source(env.library, retry_at, "GitHub rate limit reached.", None)
+        .await
+        .unwrap();
+    drop(start_gate);
+    assert_eq!(ticking.await.unwrap(), 1);
+
+    let status = env.status().await;
+    assert_eq!(status.state, SourceState::RateLimited, "{status:?}");
+    assert_eq!(status.retry_at, Some(retry_at));
+    assert_eq!(
+        env.fake.count("commits"),
+        before,
+        "the stale worker decision must not make a GitHub request"
+    );
+}
+
+#[tokio::test]
 async fn a_revoked_token_stops_retrying_until_an_owner_acts() {
     let env = Env::with_token(Some("ghp_first_token")).await;
     env.fake.require_token("ghp_second_token");
@@ -773,6 +805,33 @@ async fn dropping_the_worker_stops_running_and_waiting_syncs() {
         trees,
         "in-flight syncs must stop when their worker is dropped"
     );
+
+    // Simulate the normal stale-sync recovery point, then start a fresh worker over the same
+    // AppState. Dropping the first worker must not leave its in-memory running entry behind.
+    let mut stale = env.status().await;
+    stale.state = SourceState::Syncing;
+    stale.last_checked_at = Some(OffsetDateTime::now_utc() - seconds(20 * 60));
+    env.server
+        .records_db()
+        .set_source_status(env.library, &stale)
+        .await
+        .unwrap();
+    let restarted = server::source_sync::start_worker(env.state.clone());
+    env.state.sources().wake(env.library);
+    let recovered = env.settled().await;
+    assert_eq!(recovered.state, SourceState::Ok, "{recovered:?}");
+
+    let latest = env.fake.commit(
+        "main",
+        &files(&[
+            ("a.md", "first"),
+            ("guide/b.md", "b"),
+            ("d.md", "after restart"),
+        ]),
+    );
+    env.state.sources().wake(env.library);
+    env.wait_commit(&latest.sha).await;
+    drop(restarted);
 }
 
 #[tokio::test]
@@ -1130,6 +1189,63 @@ async fn webhook_bodies_over_the_in_flight_limit_are_refused() {
         request.abort();
     }
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn webhook_handlers_keep_the_in_flight_permit_after_the_body_is_read() {
+    let env = Env::new().await;
+    let secret = env.webhook_secret().await;
+    let body = b"{}";
+    let signed = signature(&secret, body);
+    let mut connection = sqlx::PgConnection::connect(&env.server.db.url())
+        .await
+        .unwrap();
+    let mut blocker = connection.begin().await.unwrap();
+    // The throttle middleware reads `library_sources` before extraction. Hold the handler at
+    // its later secret read, after the delivery body and its in-flight permit were acquired.
+    sqlx::query("lock table secrets in access exclusive mode")
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+
+    let client = reqwest::Client::new();
+    let url = env.server.url(&format!("/hooks/github/{}", env.library.0));
+    let mut held = Vec::new();
+    for _ in 0..8 {
+        let client = client.clone();
+        let url = url.clone();
+        let signed = signed.clone();
+        held.push(tokio::spawn(async move {
+            client
+                .post(url)
+                .header("x-github-event", "push")
+                .header("x-hub-signature-256", signed)
+                .body("{}")
+                .send()
+                .await
+        }));
+    }
+    // Each small body has been sent in full; the handlers are now held at their first DB read.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let excess = tokio::time::timeout(
+        Duration::from_millis(500),
+        client
+            .post(url)
+            .header("x-github-event", "push")
+            .header("x-hub-signature-256", signed)
+            .body("{}")
+            .send(),
+    )
+    .await
+    .expect("an excess delivery was admitted while eight handlers were still running")
+    .unwrap();
+    assert_eq!(excess.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    blocker.rollback().await.unwrap();
+    for request in held {
+        request.abort();
+    }
 }
 
 #[tokio::test]
