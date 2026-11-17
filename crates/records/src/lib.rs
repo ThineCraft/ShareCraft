@@ -15,6 +15,7 @@ mod explorer;
 mod groups;
 mod libraries;
 mod links;
+mod live;
 mod navigation;
 pub mod policies;
 mod quotas;
@@ -54,6 +55,10 @@ pub use libraries::{
     is_extension, validate_library_fields, validate_library_settings,
 };
 pub use links::{AnyoneGrant, Link, LinkError, LinkKind, LinkToken};
+pub use live::{
+    GoneReason, LiveEntryRow, LiveLoaded, LiveLocal, LiveParticipantRow, LiveSessionRow,
+    NewLiveChange,
+};
 pub use navigation::{NavViewer, ResolvedItem, ResolvedTarget, SitesMirror};
 pub use policies::{
     BLOCKED_FILE_TYPES, FileType, OrgPolicy, PolicyError, check_name, check_size,
