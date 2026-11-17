@@ -37,6 +37,8 @@ use tokio_tungstenite::tungstenite::handshake::client::Request;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use uuid::Uuid;
 
+pub mod live;
+
 /// How long any wait in a test may take before it fails.
 pub const TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -530,6 +532,8 @@ pub fn config_at(data_dir: &Path, db: &TestDb) -> Config {
         checkpoint_max: Duration::from_secs(30),
         room_grace: LONG_GRACE,
         write_timeout: Duration::from_secs(10),
+        live_editors: Vec::new(),
+        live_heartbeat: Duration::from_secs(60),
         database_url: server::config::DatabaseUrl::new(db.url()),
         editors_dir: data_dir.join("editors"),
         max_file_bytes: 64 << 20,

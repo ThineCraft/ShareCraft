@@ -5,6 +5,8 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use records::Editor;
+
 use crate::deployment::Deployment;
 
 /// Address used when `SHARECRAFT_ADDR` is not set.
@@ -42,6 +44,10 @@ pub struct Config {
     /// client that stopped reading would otherwise keep its connection task, and its place in
     /// the room, forever.
     pub write_timeout: Duration,
+    /// Editors whose documents use the live room. Empty by default, so the room is opt-in.
+    pub live_editors: Vec<Editor>,
+    /// How often a live client sends a heartbeat. Its place expires after three periods.
+    pub live_heartbeat: Duration,
     /// The PostgreSQL database holding accounts, sessions and access grants.
     pub database_url: DatabaseUrl,
     /// Where the built editors are installed, one folder per editor, served at `/editors`.
@@ -238,6 +244,8 @@ impl Config {
             checkpoint_max: Duration::from_secs(30),
             room_grace: Duration::from_secs(60),
             write_timeout: Duration::from_secs(10),
+            live_editors: Vec::new(),
+            live_heartbeat: Duration::from_secs(60),
             database_url,
             editors_dir: PathBuf::from(editors_dir.unwrap_or(DEFAULT_EDITORS)),
             max_file_bytes,
@@ -320,6 +328,8 @@ mod tests {
         assert_eq!(c.checkpoint_max, Duration::from_secs(30));
         assert_eq!(c.room_grace, Duration::from_secs(60));
         assert_eq!(c.write_timeout, Duration::from_secs(10));
+        assert!(c.live_editors.is_empty());
+        assert_eq!(c.live_heartbeat, Duration::from_secs(60));
         assert_eq!(c.editors_dir, PathBuf::from("./editors"));
         assert_eq!(c.max_file_bytes, 10 * 1024 * 1024 * 1024);
     }

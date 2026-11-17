@@ -21,9 +21,7 @@ pub mod icap;
 pub mod libraries;
 mod links;
 mod live_cancel;
-#[allow(dead_code)] // Wired into the room registry and WebSocket path by plan G2 Task 11.
 mod live_room;
-#[allow(dead_code)] // Used by the live room once Task 11 wires that room into the server.
 mod live_store;
 mod looks;
 mod members;
@@ -82,6 +80,7 @@ use checkpoint::Timing;
 use editors::Editors;
 use events::EventSink;
 use file_room::FileLink;
+use live_room::{LiveLink, LiveTiming};
 use room::{RoomLink, Rooms, Storage};
 
 /// Shared state of a running server.
@@ -305,6 +304,19 @@ impl AppState {
                 events: self.shared.events.clone(),
             },
             self.shared.config.room_grace,
+        )
+    }
+
+    /// The command channel of `doc`'s live room, opening it if needed.
+    fn open_live_room(&self, doc: DocId) -> LiveLink {
+        self.shared.rooms.open_live(
+            doc,
+            self.shared.db.clone(),
+            self.shared.events.clone(),
+            LiveTiming {
+                heartbeat: self.shared.config.live_heartbeat,
+                misses: protocol::live::EXPIRY_MISSES,
+            },
         )
     }
 }

@@ -1,0 +1,474 @@
+//! Live rooms over real WebSockets with real `collab-live` clients and the stand-in editor.
+
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+
+mod common;
+
+use std::time::Duration;
+
+use collab_core::ids::{DocId, Seq};
+use collab_live::client::{Event, LocalError, Mode, Phase};
+use collab_live::stand_in::StandInOp;
+use common::live::{FORMAT, LiveTestClient};
+use common::{
+    FileClient, Site, StoppableServer, TestClient, TestServer, TestUser, new_doc,
+    spawn_server_config, wait_events,
+};
+use protocol::RemovedReason;
+use protocol::live::{EntryBody, LiveClientMsg, LiveServerMsg, LocalNo, Place, RefusedReason};
+use records::{Editor, LiveEntryRow};
+use reqwest::StatusCode;
+use tempfile::tempdir;
+
+fn live_config(config: &mut server::Config) {
+    config.live_editors = vec![Editor::GridCraft];
+    config.live_heartbeat = Duration::from_secs(1);
+}
+
+async fn live_server() -> TestServer {
+    spawn_server_config(live_config).await
+}
+
+async fn shared_live(server: &TestServer) -> (DocId, TestUser, TestUser) {
+    let doc = new_doc();
+    let ann = server.user("Ann").await;
+    let bob = server.user("Bob").await;
+    server.create_file_document(doc, &ann).await;
+    share(server, &ann, doc, &bob, "editor").await;
+    (doc, ann, bob)
+}
+
+async fn share(site: &Site, owner: &TestUser, doc: DocId, user: &TestUser, role: &str) {
+    let response = site
+        .http(Some(owner))
+        .put(site.url(&format!("/api/docs/{}/access", doc.0)))
+        .json(&serde_json::json!({ "email": user.email, "role": role }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+}
+
+async fn revoke(site: &Site, owner: &TestUser, doc: DocId, user: &TestUser) {
+    let response = site
+        .http(Some(owner))
+        .delete(site.url(&format!("/api/docs/{}/access/user/{}", doc.0, user.id.0)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn two_clients_converge_on_stand_in() {
+    let server = live_server().await;
+    let (doc, ann, bob) = shared_live(&server).await;
+    let mut a = LiveTestClient::connect(&server, doc, &ann, "a").await;
+    let mut b = LiveTestClient::connect(&server, doc, &bob, "b").await;
+    for n in 0..20 {
+        a.insert(&format!("a{n}")).await;
+        b.insert(&format!("b{n}")).await;
+    }
+    a.pump_until(|c| c.client().agreed_seq() == Seq(40) && c.client().pending() == 0)
+        .await;
+    b.pump_until(|c| c.client().agreed_seq() == Seq(40) && c.client().pending() == 0)
+        .await;
+    assert_eq!(a.lines(), b.lines());
+    assert_eq!(a.lines().len(), 40);
+}
+
+#[tokio::test]
+async fn racing_entries_get_one_order() {
+    let server = live_server().await;
+    let (doc, ann, bob) = shared_live(&server).await;
+    let mut a = LiveTestClient::connect(&server, doc, &ann, "a").await;
+    let mut b = LiveTestClient::connect(&server, doc, &bob, "b").await;
+    let anchor = a.insert("anchor").await;
+    a.pump_until(|c| c.client().pending() == 0).await;
+    b.pump_until(|c| c.client().agreed_seq() == Seq(1)).await;
+    a.insert_before(Some(anchor), "ann").await;
+    b.insert_before(Some(anchor), "bob").await;
+    a.pump_until(|c| c.client().agreed_seq() == Seq(3) && c.client().pending() == 0)
+        .await;
+    b.pump_until(|c| c.client().agreed_seq() == Seq(3) && c.client().pending() == 0)
+        .await;
+    assert_eq!(a.lines(), b.lines());
+    let loaded = server.records_db().load_live(doc).await.unwrap();
+    let later = match &loaded.entries[2] {
+        LiveEntryRow::Change { payload, .. } => String::from_utf8(payload.clone()).unwrap(),
+        other => panic!("later entry is {other:?}"),
+    };
+    let later_text = if later.contains("ann") { "ann" } else { "bob" };
+    let at = a
+        .lines()
+        .iter()
+        .position(|line| line == later_text)
+        .unwrap();
+    assert_eq!(a.lines().get(at + 1).map(String::as_str), Some("anchor"));
+}
+
+#[tokio::test]
+async fn reconnect_resends_without_duplicating() {
+    let server = live_server().await;
+    let (doc, ann, bob) = shared_live(&server).await;
+    let mut a = LiveTestClient::connect(&server, doc, &ann, "a").await;
+    let mut b = LiveTestClient::connect(&server, doc, &bob, "b").await;
+    for text in ["one", "two", "three"] {
+        a.insert(text).await;
+    }
+    b.pump_until(|c| c.client().agreed_seq() == Seq(3)).await;
+    a.disconnect();
+    a.reconnect(&server).await;
+    a.pump_until(|c| c.client().phase() == Phase::Live && c.client().pending() == 0)
+        .await;
+    let loaded = server.records_db().load_live(doc).await.unwrap();
+    let locals = loaded
+        .entries
+        .iter()
+        .filter_map(|row| match row {
+            LiveEntryRow::Change { client, local, .. } if *client == a.client().client() => {
+                Some(*local)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(locals, vec![1, 2, 3]);
+}
+
+#[tokio::test]
+async fn expiry_with_entry_in_flight_commits_once() {
+    let server = live_server().await;
+    let (doc, ann, bob) = shared_live(&server).await;
+    let mut a = LiveTestClient::connect(&server, doc, &ann, "a").await;
+    let mut b = LiveTestClient::connect(&server, doc, &bob, "b").await;
+    a.insert("in flight").await;
+    b.pump_until(|c| c.client().agreed_seq() == Seq(1)).await;
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    a.pump_without_tick_until(|client| client.has_event(|event| matches!(event, Event::Expired)))
+        .await;
+    a.reconnect(&server).await;
+    a.pump_until(|c| c.client().phase() == Phase::Live && c.client().pending() == 0)
+        .await;
+    assert!(matches!(a.last_place(), Some(Place::Returning { .. })));
+    let loaded = server.records_db().load_live(doc).await.unwrap();
+    assert_eq!(loaded.entries.len(), 1);
+}
+
+#[tokio::test]
+async fn log_survives_server_restart() {
+    let data = tempdir().unwrap();
+    let db = records::test_support::TestDb::create().await;
+    let mut first = StoppableServer::start(data.path(), &db, live_config);
+    let doc = new_doc();
+    let ann = first.user("Ann").await;
+    first.create_file_document(doc, &ann).await;
+    let mut a = LiveTestClient::connect(&first, doc, &ann, "a").await;
+    for text in ["one", "two", "three"] {
+        a.insert(text).await;
+    }
+    a.pump_until(|c| c.client().agreed_seq() == Seq(3) && c.client().pending() == 0)
+        .await;
+    let before = first.records_db().load_live(doc).await.unwrap();
+    first.stop();
+
+    let second = StoppableServer::start(data.path(), &db, live_config);
+    let bob = second.user("Bob").await;
+    share(&second, &ann, doc, &bob, "editor").await;
+    let b = LiveTestClient::connect(&second, doc, &bob, "b").await;
+    assert_eq!(b.lines(), vec!["one", "two", "three"]);
+    let after = second.records_db().load_live(doc).await.unwrap();
+    assert_eq!(before.entries, after.entries);
+
+    a.reconnect(&second).await;
+    a.pump_until(|c| c.client().phase() == Phase::Live).await;
+    assert_eq!(a.last_place(), Some(Place::Kept));
+    a.insert("four").await;
+    a.pump_until(|c| c.client().agreed_seq() == Seq(4) && c.client().pending() == 0)
+        .await;
+    assert_eq!(
+        second.records_db().load_live(doc).await.unwrap().head,
+        Seq(4)
+    );
+}
+
+#[tokio::test]
+async fn malformed_payload_is_relayed_verbatim_and_does_nothing() {
+    let server = live_server().await;
+    let (doc, ann, bob) = shared_live(&server).await;
+    let mut a = LiveTestClient::connect(&server, doc, &ann, "a").await;
+    let mut b = LiveTestClient::connect(&server, doc, &bob, "b").await;
+    for payload in ["not json", "{\"type\":\"live_joined\"}"] {
+        a.payload(payload.to_owned(), Mode::ShowAtOnce)
+            .await
+            .unwrap();
+    }
+    a.pump_until(|c| c.client().agreed_seq() == Seq(2) && c.client().pending() == 0)
+        .await;
+    b.pump_until(|c| c.client().agreed_seq() == Seq(2)).await;
+    assert!(a.lines().is_empty() && b.lines().is_empty());
+    let relayed = b
+        .messages
+        .iter()
+        .filter_map(|message| match message {
+            LiveServerMsg::Entry {
+                entry:
+                    protocol::live::LiveEntry {
+                        body: EntryBody::Change { payload, .. },
+                        ..
+                    },
+            } => Some(payload.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(relayed, vec!["not json", "{\"type\":\"live_joined\"}"]);
+}
+
+#[tokio::test]
+async fn garbage_frame_closes_only_that_connection() {
+    let server = live_server().await;
+    let (doc, ann, bob) = shared_live(&server).await;
+    let mut a = LiveTestClient::connect(&server, doc, &ann, "a").await;
+    let mut b = LiveTestClient::connect(&server, doc, &bob, "b").await;
+    a.send_raw("}{").await;
+    a.wait_closed().await;
+    b.insert("still live").await;
+    b.pump_until(|c| c.client().pending() == 0).await;
+    assert_eq!(b.lines(), vec!["still live"]);
+}
+
+#[tokio::test]
+async fn viewer_receives_but_cannot_send() {
+    let server = live_server().await;
+    let doc = new_doc();
+    let ann = server.user("Ann").await;
+    let vic = server.user("Vic").await;
+    server.create_file_document(doc, &ann).await;
+    share(&server, &ann, doc, &vic, "viewer").await;
+    let mut a = LiveTestClient::connect(&server, doc, &ann, "a").await;
+    let mut v = LiveTestClient::connect(&server, doc, &vic, "v").await;
+    assert_eq!(
+        v.payload("no".to_owned(), Mode::ShowAtOnce).await,
+        Err(LocalError::ReadOnly)
+    );
+    let raw = LiveClientMsg::Entry {
+        local: LocalNo(1),
+        seen: Seq(0),
+        format: FORMAT.to_owned(),
+        payload: "hostile".to_owned(),
+    };
+    v.send_raw(&serde_json::to_string(&raw).unwrap()).await;
+    while !v.messages.iter().any(|message| {
+        matches!(
+            message,
+            LiveServerMsg::Refused {
+                reason: RefusedReason::ReadOnly,
+                ..
+            }
+        )
+    }) {
+        v.receive_raw_only().await;
+    }
+    a.insert("visible").await;
+    v.pump_until(|c| c.lines() == ["visible"] && c.client().agreed_seq() == Seq(1))
+        .await;
+}
+
+#[tokio::test]
+async fn revoking_access_removes_from_live_room() {
+    let server = live_server().await;
+    let (doc, ann, bob) = shared_live(&server).await;
+    let mut a = LiveTestClient::connect(&server, doc, &ann, "a").await;
+    let mut b = LiveTestClient::connect(&server, doc, &bob, "b").await;
+    revoke(&server, &ann, doc, &bob).await;
+    b.pump_until(|c| {
+        c.has_event(|event| {
+            matches!(
+                event,
+                Event::Removed {
+                    reason: RemovedReason::AccessRevoked
+                }
+            )
+        })
+    })
+    .await;
+    b.wait_closed().await;
+    a.pump_until(|c| {
+        c.messages.iter().any(|message| matches!(message, LiveServerMsg::People { people } if people.iter().all(|person| person.user != bob.id)))
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn revoking_a_disconnected_place_ends_it_as_removed() {
+    let server = live_server().await;
+    let (doc, ann, bob) = shared_live(&server).await;
+    let _a = LiveTestClient::connect(&server, doc, &ann, "a").await;
+    let mut b = LiveTestClient::connect(&server, doc, &bob, "b").await;
+    let participant = b.client().participant().unwrap().0;
+    b.disconnect();
+    revoke(&server, &ann, doc, &bob).await;
+    let removed = tokio::time::timeout(common::TIMEOUT, async {
+        loop {
+            let loaded = server.records_db().load_live(doc).await.unwrap();
+            if loaded.participants.iter().any(|place| {
+                place.number == participant && place.gone == Some(records::GoneReason::Removed)
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    if removed.is_err() {
+        let loaded = server.records_db().load_live(doc).await.unwrap();
+        panic!("disconnected place was not removed promptly: {loaded:?}");
+    }
+}
+
+#[tokio::test]
+async fn lowered_role_drops_waiting_changes() {
+    let server = live_server().await;
+    let (doc, ann, bob) = shared_live(&server).await;
+    let mut b = LiveTestClient::connect(&server, doc, &bob, "b").await;
+    for n in 0..21 {
+        b.insert(&format!("b{n}")).await;
+    }
+    share(&server, &ann, doc, &bob, "viewer").await;
+    b.pump_until(|c| {
+        c.has_event(|event| matches!(event, Event::DroppedPending { count } if *count > 0))
+    })
+    .await;
+    assert_eq!(b.client().pending(), 0);
+    assert!(!b.client().can_edit());
+}
+
+#[tokio::test]
+async fn crash_on_some_devices_is_cancelled() {
+    let server = live_server().await;
+    let (doc, ann, bob) = shared_live(&server).await;
+    let mut a = LiveTestClient::connect(&server, doc, &ann, "failing-device").await;
+    let mut b = LiveTestClient::connect(&server, doc, &bob, "failing-device").await;
+    a.change(
+        StandInOp::CrashIf {
+            device: "failing-device".into(),
+        },
+        Mode::WaitForServer,
+    )
+    .await
+    .unwrap();
+    a.change(
+        StandInOp::CrashIf {
+            device: "failing-device".into(),
+        },
+        Mode::WaitForServer,
+    )
+    .await
+    .unwrap();
+    b.pump_until(|c| matches!(c.client().phase(), Phase::Stalled { at: Seq(1) }))
+        .await;
+    a.pump_until(|c| matches!(c.client().phase(), Phase::Stalled { at: Seq(1) }))
+        .await;
+    a.pump_until(|c| matches!(c.client().phase(), Phase::Stalled { at: Seq(2) }))
+        .await;
+    b.pump_until(|c| matches!(c.client().phase(), Phase::Stalled { at: Seq(2) }))
+        .await;
+    a.pump_until(|c| c.client().agreed_seq().0 >= 4).await;
+    b.pump_until(|c| c.client().agreed_seq().0 >= 4).await;
+    let cy = server.user("Cy").await;
+    share(&server, &ann, doc, &cy, "editor").await;
+    let c = LiveTestClient::connect(&server, doc, &cy, "c").await;
+    let cancels = c
+        .messages
+        .iter()
+        .filter(|message| matches!(message, LiveServerMsg::Entry { entry } if matches!(entry.body, EntryBody::Cancel { .. })))
+        .count();
+    assert_eq!(cancels, 2);
+}
+
+#[tokio::test]
+async fn crash_on_one_device_stands() {
+    let server = live_server().await;
+    let (doc, ann, bob) = shared_live(&server).await;
+    let cy = server.user("Cy").await;
+    share(&server, &ann, doc, &cy, "editor").await;
+    let mut a = LiveTestClient::connect(&server, doc, &ann, "a").await;
+    let mut b = LiveTestClient::connect(&server, doc, &bob, "b").await;
+    let mut c = LiveTestClient::connect(&server, doc, &cy, "c").await;
+    a.change(
+        StandInOp::CrashIf { device: "b".into() },
+        Mode::WaitForServer,
+    )
+    .await
+    .unwrap();
+    a.pump_until(|client| client.client().agreed_seq() == Seq(1))
+        .await;
+    c.pump_until(|client| client.client().agreed_seq() == Seq(1))
+        .await;
+    b.pump_until(|client| matches!(client.client().phase(), Phase::Stalled { at: Seq(1) }))
+        .await;
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    a.tick_now().await;
+    b.pump_until(|client| client.client().phase() == Phase::Closed)
+        .await;
+    assert!(b.has_event(|event| matches!(event, Event::CannotOpen { seq: Seq(1) })));
+}
+
+#[tokio::test]
+async fn text_and_file_documents_are_unchanged() {
+    let server = spawn_server_config(|config| {
+        assert!(config.live_editors.is_empty());
+    })
+    .await;
+    let ann = server.user("Ann").await;
+    let file = new_doc();
+    server.create_file_document(file, &ann).await;
+    let file_client = FileClient::connect_as(&server, file, &ann).await;
+    assert!(file_client.joined);
+    let text = new_doc();
+    server.give_access(text, &ann).await;
+    let text_client = TestClient::connect_as(&server, text, &ann).await;
+    assert!(text_client.joined);
+}
+
+#[tokio::test]
+async fn events_are_recorded() {
+    let server = live_server().await;
+    let doc = new_doc();
+    let ann = server.user("Ann").await;
+    server.create_file_document(doc, &ann).await;
+    let _a = LiveTestClient::connect(&server, doc, &ann, "a").await;
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let events = wait_events(&server.db.db, doc, |events| {
+        [
+            "live.session_started",
+            "live.client_expired",
+            "live.session_ended",
+        ]
+        .iter()
+        .all(|kind| events.iter().any(|event| event.kind == *kind))
+    })
+    .await;
+    for event in events
+        .iter()
+        .filter(|event| event.kind.starts_with("live."))
+    {
+        let detail = event.detail.to_string();
+        assert!(!detail.contains("payload"));
+        assert!(!detail.contains("secret text"));
+        match event.kind.as_str() {
+            "live.session_started" => assert_eq!(event.detail, serde_json::json!({})),
+            "live.client_expired" => {
+                assert_eq!(event.detail, serde_json::json!({ "participant": 1 }))
+            }
+            "live.session_ended" => {
+                assert_eq!(event.detail, serde_json::json!({ "head": 0, "entries": 0 }))
+            }
+            other => panic!("unexpected live event {other}"),
+        }
+    }
+}

@@ -882,6 +882,8 @@ mod tests {
             checkpoint_max: Duration::from_secs(600),
             room_grace: Duration::from_secs(60),
             write_timeout: Duration::from_secs(10),
+            live_editors: Vec::new(),
+            live_heartbeat: Duration::from_secs(60),
             database_url: DatabaseUrl::new(test.url()),
             editors_dir: dir.join("editors"),
             max_file_bytes: 64 << 20,

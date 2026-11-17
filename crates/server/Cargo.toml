@@ -38,6 +38,7 @@ uuid = { version = "1.29.2", features = ["v4"] }
 
 [dev-dependencies]
 base64 = "0.23.1"
+collab-live = { path = "../collab-live", features = ["stand-in"] }
 gix = { version = "0.90.0", default-features = false, features = ["sha1"] }
 records = { path = "../records", features = ["test-support"] }
 revisions = { path = "../revisions", features = ["test-support"] }

@@ -22,9 +22,12 @@ use uuid::Uuid;
 use crate::events::EventSink;
 use crate::live_cancel::{CancelBook, Verdict};
 use crate::live_store::LiveStore;
-use crate::members::{Admission, Frames, Member, Members};
-use crate::room::{ConnId, JoinReply, Outbound};
+use crate::members::{self, AccessRules, Admission, Frames, Member, Members};
+use crate::room::{
+    AccessChange, ConnId, JoinReply, Outbound, Place as RegistryPlace, refuse_waiting, sleep_until,
+};
 
+#[derive(Clone, Copy)]
 pub(crate) struct LiveTiming {
     pub heartbeat: Duration,
     pub misses: u32,
@@ -32,6 +35,37 @@ pub(crate) struct LiveTiming {
 
 pub(crate) const RATE_PER_SECOND: u32 = 30;
 pub(crate) const RATE_BURST: u32 = 120;
+
+const COMMAND_CAPACITY: usize = 1024;
+
+/// The two channels into a running live room.
+#[derive(Clone, Debug)]
+pub(crate) struct LiveLink {
+    pub commands: mpsc::Sender<LiveCommand>,
+    pub access: mpsc::UnboundedSender<AccessChange>,
+}
+
+impl LiveLink {
+    /// A link whose room has ended: every send to it fails.
+    pub(crate) fn closed() -> Self {
+        let (commands, _) = mpsc::channel(1);
+        let (access, _) = mpsc::unbounded_channel();
+        Self { commands, access }
+    }
+}
+
+/// Starts one live-room task and returns its channels.
+pub(crate) fn start_live(
+    place: RegistryPlace,
+    db: records::Db,
+    events: EventSink,
+    timing: LiveTiming,
+) -> LiveLink {
+    let (commands, command_rx) = mpsc::channel(COMMAND_CAPACITY);
+    let (access, access_rx) = mpsc::unbounded_channel();
+    tokio::spawn(run(place, db, events, timing, command_rx, access_rx));
+    LiveLink { commands, access }
+}
 
 pub(crate) enum LiveCommand {
     Join {
@@ -100,6 +134,7 @@ struct Session {
 struct LivePlace {
     client: ClientId,
     user: UserId,
+    sign_in: Option<SessionId>,
     name: String,
     can_edit: bool,
     held: bool,
@@ -221,6 +256,7 @@ impl<S: LiveStore> LiveRoom<S> {
                         LivePlace {
                             client: place.client,
                             user: place.user,
+                            sign_in: None,
                             name: String::new(),
                             can_edit: false,
                             held: place.gone.is_none(),
@@ -429,7 +465,7 @@ impl<S: LiveStore> LiveRoom<S> {
                 subject: Some(request.user),
                 document: Some(self.doc),
                 node: Some(self.doc.into()),
-                detail: serde_json::json!({ "format": request.format }),
+                detail: serde_json::json!({}),
             });
             self.session = Some(Session {
                 id,
@@ -495,6 +531,7 @@ impl<S: LiveStore> LiveRoom<S> {
             let stated = request.seen.unwrap_or(Seq(0)).min(self.head);
             if let Some(existing) = session.places.get_mut(&participant) {
                 existing.user = request.user;
+                existing.sign_in = Some(request.sign_in);
                 existing.name = request.name.clone();
                 existing.can_edit = request.role.can_edit();
                 existing.held = true;
@@ -506,6 +543,7 @@ impl<S: LiveStore> LiveRoom<S> {
                     LivePlace {
                         client: request.client,
                         user: request.user,
+                        sign_in: Some(request.sign_in),
                         name: request.name.clone(),
                         can_edit: request.role.can_edit(),
                         held: true,
@@ -1169,6 +1207,152 @@ impl<S: LiveStore> LiveRoom<S> {
         });
         let _ = self.members.send(None, &Outbound::One(frame));
     }
+
+    fn prepare_access(&mut self, change: &AccessChange) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        let ending = session
+            .places
+            .iter()
+            .filter(|(_, place)| place.held)
+            .filter(|(_, place)| match change {
+                AccessChange::SetAccess { user, role: None }
+                | AccessChange::RemoveUser { user } => place.user == *user,
+                AccessChange::EndSession { session } => place.sign_in == Some(*session),
+                AccessChange::Deleted | AccessChange::Ended { .. } => true,
+                AccessChange::SetAccess { role: Some(_), .. }
+                | AccessChange::Renamed { .. }
+                | AccessChange::ConnectedUsers { .. } => false,
+            })
+            .map(|(participant, _)| (session.id, *participant, GoneReason::Removed))
+            .collect::<Vec<_>>();
+        for pending in ending {
+            if !self.pending_ends.contains(&pending) {
+                self.pending_ends.push(pending);
+            }
+        }
+    }
+}
+
+impl<S: LiveStore> AccessRules for LiveRoom<S> {
+    fn change_role(&mut self, user: UserId, role: Access) {
+        let can_edit = role.can_edit();
+        if let Some(session) = &mut self.session {
+            for place in session
+                .places
+                .values_mut()
+                .filter(|place| place.user == user)
+            {
+                place.can_edit = can_edit;
+            }
+        }
+        let change = self.members.change_role(user, role);
+        if change.changed || change.departed.any() {
+            self.broadcast_people();
+        }
+    }
+
+    fn remove(&mut self, which: &dyn Fn(&Member) -> bool, reason: RemovedReason) {
+        let ending = self
+            .members
+            .iter()
+            .filter(|member| which(member))
+            .filter_map(|member| {
+                let session = self.session.as_ref()?;
+                let participant = session.places.iter().find_map(|(number, place)| {
+                    (place.client == member.client && place.held).then_some(*number)
+                })?;
+                Some((session.id, participant, GoneReason::Removed))
+            })
+            .collect::<Vec<_>>();
+        for pending in ending {
+            if !self.pending_ends.contains(&pending) {
+                self.pending_ends.push(pending);
+            }
+        }
+        let _ = self.members.remove(which, reason);
+    }
+
+    fn rename(&mut self, _name: String) {}
+
+    fn connected_users(&self) -> Vec<UserId> {
+        let mut users = members::users_of(self.members.iter());
+        for user in self
+            .session
+            .as_ref()
+            .into_iter()
+            .flat_map(|session| session.places.values())
+            .filter(|place| place.held)
+            .map(|place| place.user)
+        {
+            if !users.contains(&user) {
+                users.push(user);
+            }
+        }
+        users
+    }
+}
+
+/// Loads and runs one live room. Access changes have priority over commands, and expiry is
+/// driven by the earliest held place. A store failure ends the task and drops every connection.
+async fn run(
+    place: RegistryPlace,
+    db: records::Db,
+    events: EventSink,
+    timing: LiveTiming,
+    mut rx: mpsc::Receiver<LiveCommand>,
+    mut access_rx: mpsc::UnboundedReceiver<AccessChange>,
+) {
+    let doc = place.doc();
+    let mut room = match LiveRoom::load(doc, db, events, timing).await {
+        Ok(room) => room,
+        Err(error) => {
+            eprintln!(
+                "sharecraft-server: cannot open live document {}: {error}",
+                doc.0
+            );
+            place.close();
+            access_rx.close();
+            refuse_waiting(&mut rx, |command| match command {
+                LiveCommand::Join { accepted, .. } => Some(accepted),
+                _ => None,
+            });
+            return;
+        }
+    };
+    let mut access_open = true;
+    loop {
+        let handled = tokio::select! {
+            biased;
+            change = access_rx.recv(), if access_open => match change {
+                Some(change) => {
+                    room.prepare_access(&change);
+                    members::apply_access(&mut room, change);
+                    true
+                }
+                None => {
+                    access_open = false;
+                    true
+                }
+            },
+            command = rx.recv() => match command {
+                Some(command) => room.handle(command).await.is_ok(),
+                None => false,
+            },
+            () = sleep_until(room.next_expiry()) => room.expire_due().await.is_ok(),
+        };
+        if !handled || room.settle().await.is_err() {
+            break;
+        }
+        if !room.has_session() && rx.is_empty() && access_rx.is_empty() {
+            break;
+        }
+    }
+    place.close();
+    access_rx.close();
+    rx.close();
+    while rx.try_recv().is_ok() {}
 }
 
 struct JoinRequest {
@@ -1513,7 +1697,7 @@ mod tests {
         ));
         let started = event_rx.recv().await.unwrap();
         assert_eq!(started.kind, "live.session_started");
-        assert_eq!(started.detail, serde_json::json!({ "format": FORMAT }));
+        assert_eq!(started.detail, serde_json::json!({}));
         assert!(room.has_session());
     }
 
