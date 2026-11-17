@@ -31,6 +31,7 @@ use crate::blobs::{Blobs, write_claimed};
 use crate::checkpoint::{Checkpointer, Finished, SaveJob, Schedule, Timing, WriteError};
 use crate::events::{EventSink, error_text};
 use crate::file_room::{self, FileLink};
+use crate::live_room::{self, LiveLink, LiveTiming};
 use crate::members::{self, AccessRules, Admission, Frames, Member, Members};
 use crate::projection::Recorder;
 
@@ -623,6 +624,8 @@ pub(crate) enum Link {
     Text(RoomLink),
     /// A file document's session.
     File(FileLink),
+    /// A live document's opaque-entry room.
+    Live(LiveLink),
 }
 
 impl Link {
@@ -631,6 +634,7 @@ impl Link {
         match self {
             Link::Text(link) => &link.access,
             Link::File(link) => &link.access,
+            Link::Live(link) => &link.access,
         }
     }
 
@@ -639,6 +643,7 @@ impl Link {
         match self {
             Link::Text(link) => link.commands.is_closed(),
             Link::File(link) => link.commands.is_closed(),
+            Link::Live(link) => link.commands.is_closed(),
         }
     }
 }
@@ -682,6 +687,7 @@ impl Rooms {
             return match &handle.link {
                 Link::Text(link) => link.clone(),
                 Link::File(_) => RoomLink::closed(),
+                Link::Live(_) => RoomLink::closed(),
             };
         }
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
@@ -722,6 +728,7 @@ impl Rooms {
             return match &handle.link {
                 Link::File(link) => link.clone(),
                 Link::Text(_) => FileLink::closed(),
+                Link::Live(_) => FileLink::closed(),
             };
         }
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
@@ -735,6 +742,41 @@ impl Rooms {
             doc,
             RoomHandle {
                 link: Link::File(link.clone()),
+                generation,
+            },
+        );
+        link
+    }
+
+    /// The command channel of `doc`'s live room, starting it if it is not open. A text room
+    /// or file session already open for the same document makes the returned link closed.
+    pub(crate) fn open_live(
+        self: &Arc<Self>,
+        doc: DocId,
+        db: Db,
+        events: EventSink,
+        timing: LiveTiming,
+    ) -> LiveLink {
+        let mut open = self.open.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(handle) = open.get(&doc)
+            && !handle.link.is_closed()
+        {
+            return match &handle.link {
+                Link::Live(link) => link.clone(),
+                Link::Text(_) | Link::File(_) => LiveLink::closed(),
+            };
+        }
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        let place = Place {
+            rooms: Arc::clone(self),
+            doc,
+            generation,
+        };
+        let link = live_room::start_live(place, db, events, timing);
+        open.insert(
+            doc,
+            RoomHandle {
+                link: Link::Live(link.clone()),
                 generation,
             },
         );

@@ -21,6 +21,9 @@ pub mod github;
 pub mod icap;
 pub mod libraries;
 mod links;
+mod live_cancel;
+mod live_room;
+mod live_store;
 mod looks;
 mod members;
 pub mod previews;
@@ -71,6 +74,7 @@ pub use blobs::blobs_path;
 pub use checkpoint::{Checkpointer, library_path};
 pub use config::{Config, ConfigError};
 pub use links::sweep_once;
+pub use live_room::sweep_live_once;
 pub use projection::{
     BlobReport, Report, UsageReport, rebuild, reconcile, reconcile_blobs, reconcile_usage,
 };
@@ -85,6 +89,7 @@ use checkpoint::Timing;
 use editors::Editors;
 use events::EventSink;
 use file_room::FileLink;
+use live_room::{LiveLink, LiveTiming};
 use room::{RoomLink, Rooms, Storage};
 
 /// Shared state of a running server.
@@ -359,6 +364,19 @@ impl AppState {
                 events: self.shared.events.clone(),
             },
             self.shared.config.room_grace,
+        )
+    }
+
+    /// The command channel of `doc`'s live room, opening it if needed.
+    fn open_live_room(&self, doc: DocId) -> LiveLink {
+        self.shared.rooms.open_live(
+            doc,
+            self.shared.db.clone(),
+            self.shared.events.clone(),
+            LiveTiming {
+                heartbeat: self.shared.config.live_heartbeat,
+                misses: protocol::live::EXPIRY_MISSES,
+            },
         )
     }
 }
@@ -726,9 +744,9 @@ pub async fn prepare(config: Config) -> std::io::Result<AppState> {
 }
 
 /// Serves `state` on `listener` until the process ends, with the expiry sweeper (see
-/// [`sweep_once`]) running every minute, the malware scan worker (see [`scan_once`]) and the
-/// sync worker of connected libraries (see [`source_tick_once`]) meanwhile; they stop when
-/// serving does.
+/// [`sweep_once`]) running every minute, live-log retention every hour, the malware scan worker
+/// (see [`scan_once`]), and the sync worker of connected libraries (see [`source_tick_once`])
+/// meanwhile; they stop when serving does.
 ///
 /// # Errors
 /// Returns an error if, in development mode, the listener is not on a loopback address, or if
@@ -736,6 +754,7 @@ pub async fn prepare(config: Config) -> std::io::Result<AppState> {
 pub async fn serve_state(state: AppState, listener: TcpListener) -> std::io::Result<()> {
     require_loopback(state.deployment(), listener.local_addr()?)?;
     let _sweeper = links::start_sweeper(state.clone());
+    let _live_sweeper = live_room::start_sweeper(state.clone());
     let _scanner = scan::start_worker(state.clone());
     // `prepare` has put syncs cut short by an earlier process back to `connecting` already.
     let _syncer = source_sync::start_worker(state.clone());

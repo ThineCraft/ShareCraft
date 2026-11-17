@@ -11,6 +11,7 @@ use collab_core::ids::{ClientId, DocId, SessionId, UserId};
 use collab_text::TextOp;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
+use protocol::live::{LiveClientMsg, LiveServerMsg};
 use protocol::{ClientMsg, FileClientMsg, FileServerMsg, RemovedReason, Resume, ServerMsg};
 use records::{Access, Editor};
 use time::OffsetDateTime;
@@ -24,6 +25,7 @@ use crate::api::nodes::seat_access;
 use crate::auth::Signed;
 use crate::deployment::SameOrigin;
 use crate::file_room::{FileCommand, FileLink};
+use crate::live_room::{LiveCommand, LiveLink};
 use crate::room::{
     AccessChange, Command, ConnId, JoinReply, OUTBOUND_CAPACITY, Outbound, RoomLink,
 };
@@ -60,8 +62,15 @@ pub(crate) struct Visitor {
     pub(crate) role: Access,
     /// The document's name, which a room opened for this connection stores checkpoints under.
     pub(crate) doc_name: String,
-    /// Whether the document is a file, opened in a file session rather than a text room.
-    pub(crate) is_file: bool,
+    /// Which mutually exclusive kind of room opens this document.
+    pub(crate) kind: RoomKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RoomKind {
+    Text,
+    File,
+    Live,
 }
 
 /// `GET /ws/docs/{doc_id}`: upgrades to a WebSocket connected to that document: its text room,
@@ -130,7 +139,13 @@ async fn visitor(
         expires_at: session.expires_at,
         name: session.user.name,
         role,
-        is_file: document.editor.is_file(),
+        kind: if state.config().live_editors.contains(&document.editor) {
+            RoomKind::Live
+        } else if document.editor.is_file() {
+            RoomKind::File
+        } else {
+            RoomKind::Text
+        },
         doc_name: document.name,
     })
 }
@@ -155,10 +170,11 @@ async fn connection(state: AppState, doc: DocId, visitor: Visitor, socket: WebSo
         limit,
     };
     // The first data message must be the right kind of `Join`; anything else closes.
-    let stalled = match first_text(session.stream).await {
-        Some(first) if visitor.is_file => file_session(&mut session, &first).await,
-        Some(first) => text_session(&mut session, &first).await,
-        None => false,
+    let stalled = match (first_text(session.stream).await, visitor.kind) {
+        (Some(first), RoomKind::File) => file_session(&mut session, &first).await,
+        (Some(first), RoomKind::Live) => live_session(&mut session, &first).await,
+        (Some(first), RoomKind::Text) => text_session(&mut session, &first).await,
+        (None, _) => false,
     };
     if stalled {
         // The client is not reading, so a close would wait as long as the frame that timed
@@ -306,6 +322,71 @@ async fn file_session(s: &mut Session<'_>, first: &str) -> bool {
     stalled
 }
 
+/// A live document's connection. The first frame must be `live_join`; every later live frame
+/// maps one-to-one to a room command. A dropped socket keeps its place until expiry.
+async fn live_session(s: &mut Session<'_>, first: &str) -> bool {
+    let Ok(LiveClientMsg::LiveJoin {
+        client,
+        protocol,
+        format,
+        resume,
+        seen,
+    }) = serde_json::from_str::<LiveClientMsg>(first)
+    else {
+        return false;
+    };
+    let conn = s.state.next_conn();
+    let Some((room, out_rx)) = join_live_room(
+        s.state, s.doc, conn, client, s.visitor, protocol, format, resume, seen,
+    )
+    .await
+    else {
+        return false;
+    };
+    let stalled = match recheck_after_join(s.state, s.doc, &room.access, s.visitor).await {
+        Recheck::Keep => {
+            let read = |text: &str| match serde_json::from_str::<LiveClientMsg>(text) {
+                Ok(LiveClientMsg::Entry {
+                    local,
+                    seen,
+                    format,
+                    payload,
+                }) => Some(LiveCommand::Entry {
+                    conn,
+                    client,
+                    local,
+                    seen,
+                    format,
+                    payload,
+                }),
+                Ok(LiveClientMsg::Heartbeat { seen }) => {
+                    Some(LiveCommand::Heartbeat { conn, client, seen })
+                }
+                Ok(LiveClientMsg::Report { seq }) => {
+                    Some(LiveCommand::Report { conn, client, seq })
+                }
+                Ok(LiveClientMsg::Resync) => Some(LiveCommand::Resync { conn, client }),
+                Ok(LiveClientMsg::Leave) => Some(LiveCommand::Leave { conn, client }),
+                Ok(LiveClientMsg::LiveJoin { .. }) | Err(_) => None,
+            };
+            relay(s, &room.commands, &room.access, out_rx, read).await == Ended::WriteTimedOut
+        }
+        Recheck::Removed(reason) => {
+            *s.unread = Some(out_rx);
+            write_removed(s, &LiveServerMsg::Removed { reason }).await
+        }
+        Recheck::Unavailable => {
+            drop(out_rx);
+            false
+        }
+    };
+    let _ = room
+        .commands
+        .send(LiveCommand::Disconnected { conn, client })
+        .await;
+    stalled
+}
+
 /// Writes the one `Removed` frame a connection removed right after its join gets. Returns
 /// whether the write timed out.
 async fn write_removed(s: &mut Session<'_>, removed: &impl serde::Serialize) -> bool {
@@ -388,6 +469,39 @@ async fn join_file_room(
             session: visitor.session,
             name: visitor.name.clone(),
             role: visitor.role.clone(),
+            tx,
+            accepted,
+        },
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn join_live_room(
+    state: &AppState,
+    doc: DocId,
+    conn: ConnId,
+    client: ClientId,
+    visitor: &Visitor,
+    protocol: u32,
+    format: String,
+    resume: Option<protocol::live::LiveResume>,
+    seen: Option<collab_core::ids::Seq>,
+) -> Option<(LiveLink, mpsc::Receiver<Outbound>)> {
+    join_with(
+        || state.open_live_room(doc),
+        |room| &room.commands,
+        |tx, accepted| LiveCommand::Join {
+            conn,
+            client,
+            user: visitor.user,
+            session: visitor.session,
+            name: visitor.name.clone(),
+            role: visitor.role.clone(),
+            protocol,
+            format: format.clone(),
+            resume,
+            seen,
             tx,
             accepted,
         },

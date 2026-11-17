@@ -38,6 +38,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use uuid::Uuid;
 
 pub mod fake_github;
+pub mod live;
 
 /// Starts a fake GitHub serving the empty public repository `owner/name` on `127.0.0.1:0`;
 /// it stops when dropped. Point a server at it with
@@ -542,6 +543,8 @@ pub fn config_at(data_dir: &Path, db: &TestDb) -> Config {
         checkpoint_max: Duration::from_secs(30),
         room_grace: LONG_GRACE,
         write_timeout: Duration::from_secs(10),
+        live_editors: Vec::new(),
+        live_heartbeat: Duration::from_secs(60),
         database_url: server::config::DatabaseUrl::new(db.url()),
         editors_dir: data_dir.join("editors"),
         max_file_bytes: 64 << 20,

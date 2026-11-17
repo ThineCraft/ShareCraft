@@ -285,6 +285,9 @@ pub enum AccessError {
     /// nothing was written, and the change was not found to be allowed.
     #[error("the change could not be judged: {0}")]
     Unjudged(DbError),
+    /// COMMIT failed, so whether PostgreSQL applied the transaction is not known.
+    #[error("the database commit outcome is unknown: {0}")]
+    CommitOutcomeUnknown(DbError),
     #[error(transparent)]
     Db(#[from] DbError),
 }

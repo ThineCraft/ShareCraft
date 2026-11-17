@@ -871,8 +871,8 @@ async fn a_rate_limit_survives_a_generation_change_and_is_never_shortened() {
 }
 
 #[tokio::test]
-async fn populated_schema_migrates_stepwise_through_sources_generation_and_original_paths() {
-    let test = TestDb::create_at(Some(16)).await;
+async fn populated_schema_migrates_from_live_log_to_github_sources() {
+    let test = TestDb::create_at(Some(18)).await;
     let ann = user(&test, "MigrationAnn", true).await;
     let site = site(&test, "Migration Site", Some(ann.id)).await;
     let library = put(
@@ -884,7 +884,7 @@ async fn populated_schema_migrates_stepwise_through_sources_generation_and_origi
         "Migration Library",
     )
     .await;
-    test.db.migrate_to(17).await.unwrap();
+    test.db.migrate_to(19).await.unwrap();
     let token = test
         .db
         .put_secret(&sealed(b"migration cipher"))
@@ -904,8 +904,9 @@ async fn populated_schema_migrates_stepwise_through_sources_generation_and_origi
     test.db.connect_source(&source).await.unwrap();
     let document = document_in(&test, ann.id, library, site, "A.md").await;
     sqlx::query(
-        "insert into source_items (library_id, path, node_id, blob_sha, size) \
-         values ($1, 'A.md', $2, 'blob-one', 7)",
+        "insert into source_items \
+         (library_id, path, repository_path, node_id, blob_sha, size) \
+         values ($1, 'A.md', 'docs/A.md', $2, 'blob-one', 7)",
     )
     .bind(library.0)
     .bind(NodeId::from(document).0)
@@ -913,7 +914,6 @@ async fn populated_schema_migrates_stepwise_through_sources_generation_and_origi
     .await
     .unwrap();
 
-    test.db.migrate_to(18).await.unwrap();
     let generation: i64 =
         sqlx::query_scalar("select generation from library_sources where library_id = $1")
             .bind(library.0)
@@ -922,7 +922,6 @@ async fn populated_schema_migrates_stepwise_through_sources_generation_and_origi
             .unwrap();
     assert_eq!(generation, 0);
 
-    test.db.migrate_to(19).await.unwrap();
     let row = sqlx::query(
         "select path, repository_path, blob_sha, size from source_items where library_id = $1",
     )
@@ -931,7 +930,7 @@ async fn populated_schema_migrates_stepwise_through_sources_generation_and_origi
     .await
     .unwrap();
     assert_eq!(row.get::<String, _>("path"), "A.md");
-    assert_eq!(row.get::<String, _>("repository_path"), "A.md");
+    assert_eq!(row.get::<String, _>("repository_path"), "docs/A.md");
     assert_eq!(
         row.get::<Option<String>, _>("blob_sha").as_deref(),
         Some("blob-one")

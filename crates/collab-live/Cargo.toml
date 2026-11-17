@@ -1,0 +1,33 @@
+[package]
+name = "collab-live"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# The small stand-in document the library's own tests and the server's tests use.
+stand-in = []
+
+[dependencies]
+collab-core = { path = "../collab-core" }
+protocol = { path = "../protocol" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+# A new client makes its own random identifier (see `LiveConfig`).
+uuid = { version = "1.29.2", features = ["v4", "js"] }
+
+[dev-dependencies]
+proptest = "1.12.0"
+
+[[test]]
+name = "client"
+required-features = ["stand-in"]
+
+[[test]]
+name = "convergence"
+required-features = ["stand-in"]

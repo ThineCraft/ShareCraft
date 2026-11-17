@@ -444,6 +444,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "collab-live"
+version = "0.1.0"
+dependencies = [
+ "collab-core",
+ "proptest",
+ "protocol",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
 name = "collab-text"
 version = "0.1.0"
 dependencies = [
@@ -3033,6 +3046,7 @@ dependencies = [
  "axum",
  "base64 0.23.1",
  "collab-core",
+ "collab-live",
  "collab-text",
  "dotenvy",
  "flate2",

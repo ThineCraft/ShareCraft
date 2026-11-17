@@ -38,17 +38,24 @@ create table library_sources (
   files bigint not null default 0 check (files >= 0),
   bytes bigint not null default 0 check (bytes >= 0),
   -- Entries that were not mirrored (links, submodules, over-long or clashing names).
-  hidden bigint not null default 0 check (hidden >= 0)
+  hidden bigint not null default 0 check (hidden >= 0),
+  -- Moved on by every configuration change and by "Sync now". A sync records its result only
+  -- if the generation is still the one it started with.
+  generation bigint not null default 0
 );
 create index library_sources_due on library_sources (last_checked_at)
   where state in ('connecting', 'ok', 'rate_limited', 'failed');
 
 create table source_items (
   library_id uuid not null references library_sources(library_id),
+  -- The displayed path may carry a collision suffix.
   path text not null,
+  -- The original repository path is the stable identity of the repository entry.
+  repository_path text not null,
   node_id uuid not null unique references nodes(id),
   -- Null for a folder.
   blob_sha text,
   size bigint not null default 0 check (size >= 0),
-  primary key (library_id, path)
+  primary key (library_id, repository_path),
+  constraint source_items_display_path_key unique (library_id, path)
 );

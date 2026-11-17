@@ -1,6 +1,6 @@
 //! The content tree: sites, libraries, folders and files, mirrored from Git into PostgreSQL.
 
-use collab_core::ids::{GroupId, NodeId, UserId};
+use collab_core::ids::{DocId, GroupId, NodeId, UserId};
 use revisions::{BlobRef, parse_hex};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgRow;
@@ -632,7 +632,8 @@ impl Db {
     ///
     /// A database failure before the change was judged allowed (the connection lost while
     /// locking, or the tree changing on every attempt) is `Unjudged`: nothing was written, and
-    /// the change must be treated as refused. `Db` is a failure after it was judged allowed.
+    /// the change must be treated as refused. `Db` is a statement failure after it was judged
+    /// allowed; `CommitOutcomeUnknown` means COMMIT failed, so whether it took effect is unknown.
     pub async fn apply_nodes(&self, change: NodeChange<'_>) -> Result<NodesApplied, AccessError> {
         let (mut tx, locked) = self.judged(&change).await.map_err(|e| match e {
             AccessError::Db(e) => AccessError::Unjudged(e),
@@ -697,6 +698,13 @@ impl Db {
             }
             done.released = gone.contents;
         }
+        let purged_documents: Vec<DocId> = change
+            .rows
+            .iter()
+            .filter(|row| row.kind == NodeKind::Document && row.purged_at.is_some())
+            .map(|row| DocId(row.id.0))
+            .collect();
+        crate::live::delete_live_logs(&mut tx, &purged_documents).await?;
         if let Some(site) = change.purge_site {
             for blob in purge_site_rows(&mut tx, change.actor, site).await? {
                 if !done.released.iter().any(|b| b.sha256 == blob.sha256) {
@@ -712,7 +720,9 @@ impl Db {
                 record(&mut tx, event).await?;
             }
         }
-        tx.commit().await?;
+        tx.commit()
+            .await
+            .map_err(|e| AccessError::CommitOutcomeUnknown(e.into()))?;
         Ok(done)
     }
 
