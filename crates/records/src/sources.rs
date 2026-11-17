@@ -227,6 +227,16 @@ const SOURCE_COLUMNS: &str = "library_id, kind, owner, repo, branch, folder, tok
     webhook_secret, poll_seconds, connected_by, state, last_commit, etag, last_checked_at, \
     last_synced_at, last_error, retry_at, files, bytes, hidden";
 
+/// `from … where …` for the connections whose library is live in a live site that is not
+/// archived and whose retry time (`$1` is now) has passed or is unset; the caller adds more
+/// conditions with `and`.
+const SYNCABLE: &str = "from library_sources s \
+    join nodes n on n.id = s.library_id \
+    join nodes site on site.id = n.site_id \
+    left join sites st on st.id = n.site_id \
+    where n.deleted_at is null and site.deleted_at is null and st.archived_at is null \
+      and (s.retry_at is null or s.retry_at <= $1)";
+
 fn decode(what: &str, value: &str) -> sqlx::Error {
     sqlx::Error::Decode(format!("unknown {what} {value:?}").into())
 }
@@ -687,26 +697,81 @@ impl Db {
     /// waiting first: in state `connecting`, `ok`, `rate_limited` or `failed` (not `syncing`,
     /// and not `not_connected`, which waits for someone to change it), whose `retry_at` has
     /// passed or is unset, and which were last checked at least `poll_seconds` ago or never.
+    /// A library in the recycle bin, or in a site that is in the bin or archived, is never due.
     pub async fn due_sources(
         &self,
         now: OffsetDateTime,
         limit: i64,
     ) -> Result<Vec<NodeId>, DbError> {
-        let ids: Vec<Uuid> = sqlx::query_scalar(
-            "select s.library_id from library_sources s join nodes n on n.id = s.library_id \
-             where s.state in ('connecting', 'ok', 'rate_limited', 'failed') \
-               and n.deleted_at is null \
-               and (s.retry_at is null or s.retry_at <= $1) \
+        let ids: Vec<Uuid> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "select s.library_id {SYNCABLE} \
+               and s.state in ('connecting', 'ok', 'rate_limited', 'failed') \
                and (s.last_checked_at is null \
                     or s.last_checked_at + make_interval(secs => s.poll_seconds) <= $1) \
              order by s.last_checked_at asc nulls first, s.library_id \
-             limit $2",
-        )
+             limit $2"
+        )))
         .bind(now)
         .bind(limit)
         .fetch_all(self.pool())
         .await?;
         Ok(ids.into_iter().map(NodeId).collect())
+    }
+
+    /// Those of `libraries` that may be synced at `now` without waiting for their poll time
+    /// (a wake: a webhook delivery, a change): as [`Db::due_sources`] judges, but also in state
+    /// `syncing` (a sync asked for while one runs is tried again after it) and whatever the time
+    /// since the last check. A connection that stopped (`not_connected`) or waits for a retry
+    /// time still waits.
+    pub async fn wakeable_sources(
+        &self,
+        now: OffsetDateTime,
+        libraries: &[NodeId],
+    ) -> Result<Vec<NodeId>, DbError> {
+        if libraries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let wanted: Vec<Uuid> = libraries.iter().map(|l| l.0).collect();
+        let ids: Vec<Uuid> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "select s.library_id {SYNCABLE} \
+               and s.state in ('connecting', 'ok', 'rate_limited', 'failed', 'syncing') \
+               and s.library_id = any($2) \
+             order by s.library_id"
+        )))
+        .bind(now)
+        .bind(&wanted)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(ids.into_iter().map(NodeId).collect())
+    }
+
+    /// Sets the retry time of the connection of `library` to `until`, if its last sync failed
+    /// (state `failed`) and nothing changed it since; whether it did.
+    pub async fn back_off_source(
+        &self,
+        library: NodeId,
+        until: OffsetDateTime,
+    ) -> Result<bool, DbError> {
+        let done = sqlx::query(
+            "update library_sources set retry_at = $2 \
+             where library_id = $1 and state = 'failed'",
+        )
+        .bind(library.0)
+        .bind(until)
+        .execute(self.pool())
+        .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    /// Replaces the recorded `etag` of the connection of `library` with `etag` (a marker that
+    /// the library may be about to be half way between two commits), leaving everything else.
+    pub async fn mark_source_etag(&self, library: NodeId, etag: &str) -> Result<(), DbError> {
+        sqlx::query("update library_sources set etag = $2 where library_id = $1")
+            .bind(library.0)
+            .bind(etag)
+            .execute(self.pool())
+            .await?;
+        Ok(())
     }
 
     /// Takes the turn to sync `library`, if nobody holds it: a transaction-scoped PostgreSQL

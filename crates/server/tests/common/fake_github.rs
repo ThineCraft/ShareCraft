@@ -246,6 +246,12 @@ impl FakeGithub {
         self.model.lock().unwrap().repo.branches.remove(branch);
     }
 
+    /// Renames the repository to `name`: the old name is no longer found, as for a repository
+    /// renamed (with no redirect left) or deleted.
+    pub fn rename_repo(&self, name: &str) {
+        self.model.lock().unwrap().name = name.to_owned();
+    }
+
     /// Every tree listing from now on is truncated, as GitHub's is for a very large tree.
     pub fn force_truncate_trees(&self) {
         self.model.lock().unwrap().truncate_trees = true;

@@ -16,12 +16,20 @@
 //! never refused for its quota. Uploaded content is held for the malware scanner as any upload
 //! is. One sync at a time per library: a PostgreSQL advisory lock.
 //!
+//! The worker ([`start_worker`], [`tick_once`]) syncs the libraries that are due (their poll
+//! time passed and no retry time ahead) every minute, and a library at once when it is woken
+//! ([`Sources::wake`]: a webhook delivery, a change of the connection). At most [`MAX_SYNCS`]
+//! run at once. A rate limit is waited out (`retry_at`); a connection that no longer works
+//! (`not_connected`) is not tried again until an owner changes it or presses "Sync now"; any
+//! other failure is retried after a back-off of a minute, doubled for each failure in a row, at
+//! most an hour.
+//!
 //! No token, response body or other secret reaches an event, a log line, `last_error` or an
 //! error: every message here is a plain sentence of ours.
 
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use collab_core::ids::{DocId, NodeId};
 use futures_util::{StreamExt, TryStreamExt};
@@ -34,6 +42,8 @@ use records::{
 use revisions::RevisionId;
 use serde_json::json;
 use time::OffsetDateTime;
+use tokio::sync::{Notify, Semaphore};
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::AppState;
@@ -422,8 +432,243 @@ pub async fn recover_stale_syncs(state: &AppState, before: OffsetDateTime) -> us
     }
 }
 
-/// Syncs `library` with its branch as of `now`: `Ok(None)` when the branch is unchanged (or
-/// another sync of it is running), otherwise what changed. The connection's status says how it
+/// The most syncs that run at once.
+pub const MAX_SYNCS: usize = 2;
+/// How often the worker looks for due libraries when nothing wakes it.
+const POLL: std::time::Duration = std::time::Duration::from_secs(60);
+/// How soon a library is tried again when its sync found it busy or changed meanwhile.
+const AGAIN_SOON: std::time::Duration = std::time::Duration::from_secs(1);
+/// The most due libraries taken at a time.
+const BATCH: i64 = 32;
+/// The wait after a first failed sync, in seconds; it doubles with each failure in a row.
+const FIRST_BACK_OFF: i64 = 60;
+/// The longest wait after failed syncs, in seconds.
+const MAX_BACK_OFF: i64 = 60 * 60;
+
+/// The sync worker's shared state: the libraries woken (a set, so wakes coalesce), the ones
+/// being synced, the failures in a row of each, and the turns.
+pub struct Sources {
+    /// Woken and not yet looked at.
+    pending: Mutex<HashSet<NodeId>>,
+    /// Being synced (or waiting for a turn); `true` when woken again meanwhile.
+    running: Mutex<HashMap<NodeId, bool>>,
+    /// Failed syncs in a row, for the back-off. Kept in memory only.
+    failures: Mutex<HashMap<NodeId, u32>>,
+    /// Taken by each running sync.
+    turns: Arc<Semaphore>,
+    /// Told when a library is woken.
+    wake: Notify,
+}
+
+impl Default for Sources {
+    fn default() -> Self {
+        Sources {
+            pending: Mutex::new(HashSet::new()),
+            running: Mutex::new(HashMap::new()),
+            failures: Mutex::new(HashMap::new()),
+            turns: Arc::new(Semaphore::new(MAX_SYNCS)),
+            wake: Notify::new(),
+        }
+    }
+}
+
+/// Locks `m`, also if a holder panicked.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+impl Sources {
+    /// Asks the worker to sync `library` at once, without waiting for its poll time (a webhook
+    /// delivery, a change of the connection). Wakes before it runs coalesce into one sync; a
+    /// wake while it runs syncs it again after. A connection that stopped (`not_connected`) or
+    /// waits for a retry time is not synced by a wake.
+    pub fn wake(&self, library: NodeId) {
+        lock(&self.pending).insert(library);
+        self.wake.notify_one();
+    }
+
+    /// Forgets the failures in a row of `library`: someone changed the connection.
+    pub(crate) fn forget_failures(&self, library: NodeId) {
+        lock(&self.failures).remove(&library);
+    }
+
+    fn take_pending(&self) -> Vec<NodeId> {
+        std::mem::take(&mut *lock(&self.pending))
+            .into_iter()
+            .collect()
+    }
+
+    fn has_pending(&self) -> bool {
+        !lock(&self.pending).is_empty()
+    }
+
+    /// Takes `library` to sync; `false` if it is being synced already, which then, if `woken`,
+    /// syncs it again after.
+    fn start(&self, library: NodeId, woken: bool) -> bool {
+        let mut running = lock(&self.running);
+        match running.get_mut(&library) {
+            Some(again) => {
+                *again |= woken;
+                false
+            }
+            None => {
+                running.insert(library, false);
+                true
+            }
+        }
+    }
+
+    /// Gives `library` up after its sync; whether it was woken meanwhile.
+    fn done(&self, library: NodeId) -> bool {
+        lock(&self.running).remove(&library).unwrap_or(false)
+    }
+
+    /// The wait after a failed sync of `library`: 60 seconds, doubled for each failure in a
+    /// row before it, at most an hour. Counts this failure.
+    fn back_off(&self, library: NodeId) -> time::Duration {
+        let mut failures = lock(&self.failures);
+        let before = failures.entry(library).or_insert(0);
+        let seconds = (0..*before).fold(FIRST_BACK_OFF, |s, _| (s * 2).min(MAX_BACK_OFF));
+        *before = before.saturating_add(1).min(32);
+        time::Duration::seconds(seconds)
+    }
+}
+
+/// Syncs every library that is woken (see [`Sources::wake`]) or due (see
+/// [`records::Db::due_sources`]) as of `now`, at most [`MAX_SYNCS`] at once, and waits for
+/// them. Answers how many syncs it started. A library already being synced is left to that
+/// sync.
+pub async fn tick_once(state: &AppState, now: OffsetDateTime) -> usize {
+    let started = start_due(state, now).await;
+    let count = started.len();
+    for sync in started {
+        if let Err(e) = sync.await {
+            eprintln!("sharecraft-server: a sync did not finish: {e}");
+        }
+    }
+    count
+}
+
+/// Starts the syncs of the libraries woken or due as of `now`, each on a task of its own;
+/// their handles.
+async fn start_due(state: &AppState, now: OffsetDateTime) -> Vec<JoinHandle<()>> {
+    let sources = state.sources();
+    let db = state.db();
+    let woken = sources.take_pending();
+    let mut chosen: Vec<(NodeId, bool)> = Vec::new();
+    match db.wakeable_sources(now, &woken).await {
+        Ok(ids) => chosen.extend(ids.into_iter().map(|id| (id, true))),
+        Err(e) => {
+            eprintln!("sharecraft-server: database failure: {e}");
+            // Kept, to be looked at again soon.
+            lock(&sources.pending).extend(woken);
+        }
+    }
+    match db.due_sources(now, BATCH).await {
+        Ok(ids) => {
+            for id in ids {
+                if !chosen.iter().any(|(c, _)| *c == id) {
+                    chosen.push((id, false));
+                }
+            }
+        }
+        Err(e) => eprintln!("sharecraft-server: database failure: {e}"),
+    }
+    chosen
+        .into_iter()
+        .filter(|(library, woken)| sources.start(*library, *woken))
+        .map(|(library, _)| {
+            let state = state.clone();
+            tokio::spawn(async move {
+                let again = sync_one(&state, library, now).await;
+                if state.sources().done(library) {
+                    state.sources().wake(library);
+                } else if again {
+                    let state = state.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(AGAIN_SOON).await;
+                        state.sources().wake(library);
+                    });
+                }
+            })
+        })
+        .collect()
+}
+
+/// Syncs `library` as of `now`, taking a turn first, and keeps the back-off: after a failure
+/// worth retrying (`failed`) no sync is tried before 60 seconds, doubled for each failure in a
+/// row, at most an hour; a success, or a stop for someone to act on (`not_connected`), starts
+/// the count over. Whether it is to be tried again soon: it was busy (`Ok(None)` while
+/// another sync of it ran), or changed meanwhile (due again at once).
+async fn sync_one(state: &AppState, library: NodeId, now: OffsetDateTime) -> bool {
+    let Ok(_turn) = Arc::clone(&state.sources().turns).acquire_owned().await else {
+        return false;
+    };
+    let outcome = sync_once(state, library, now).await;
+    let current = match state.db().source_of(library).await {
+        Ok(Some((_, status))) => status.state,
+        // Disconnected meanwhile.
+        Ok(None) => return false,
+        Err(e) => {
+            eprintln!("sharecraft-server: database failure: {e}");
+            return false;
+        }
+    };
+    let sources = state.sources();
+    match (outcome, current) {
+        (Err(SyncError::Failed(_)), SourceState::Failed) => {
+            let until = now.checked_add(sources.back_off(library)).unwrap_or(now);
+            if let Err(e) = state.db().back_off_source(library, until).await {
+                eprintln!("sharecraft-server: database failure: {e}");
+            }
+            false
+        }
+        (_, SourceState::Ok | SourceState::NotConnected) => {
+            sources.forget_failures(library);
+            false
+        }
+        (_, SourceState::Connecting | SourceState::Syncing) => true,
+        _ => false,
+    }
+}
+
+/// The sync worker, running until dropped.
+pub struct Worker {
+    task: JoinHandle<()>,
+}
+
+impl Drop for Worker {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Starts the sync worker: it starts the syncs of woken and due libraries whenever a library
+/// is woken and every minute (every second while a woken library waits), without waiting for
+/// them to finish.
+pub fn start_worker(state: AppState) -> Worker {
+    let task = tokio::spawn(async move {
+        loop {
+            // Started syncs run on their own tasks; `Sources::running` keeps each single.
+            drop(start_due(&state, OffsetDateTime::now_utc()).await);
+            let wait = if state.sources().has_pending() {
+                AGAIN_SOON
+            } else {
+                POLL
+            };
+            tokio::select! {
+                () = state.sources().wake.notified() => {}
+                () = tokio::time::sleep(wait) => {}
+            }
+        }
+    });
+    Worker { task }
+}
+
+/// Syncs `library` with its branch as of `now`: `Ok(None)` when the branch is unchanged, when
+/// another sync of it is running, or when its connection changed before this sync began (it is
+/// then due again at once; see [`Sources`] for how the worker tries again), otherwise what
+/// changed. The connection's status says how it
 /// went; `source.synced` (counts and the short commit id) or `source.failed` (the reason) is
 /// recorded. A connection left `syncing` by a sync cut short over [`STALE_SYNC`] ago is made
 /// due again first.
@@ -497,12 +742,15 @@ async fn finish(
         last_checked_at: Some(now),
         ..before
     };
+    // Recorded only with the status: a sync whose connection changed meanwhile records neither.
+    let event: Option<NewEvent>;
     let answer = match outcome {
         Ok(Outcome::Unchanged { etag }) => {
             status.state = SourceState::Ok;
             status.etag = etag;
             status.last_error = None;
             status.retry_at = None;
+            event = None;
             Ok(None)
         }
         Ok(Outcome::Synced {
@@ -521,7 +769,7 @@ async fn finish(
             // Files not shown at all. Files shown under a suffixed name (`renamed`) are shown,
             // so they are not counted here; the `source.synced` event carries their number.
             status.hidden = i64::try_from(report.hidden.total()).unwrap_or(i64::MAX);
-            state.events().emit(NewEvent {
+            event = Some(NewEvent {
                 kind: "source.synced",
                 actor: None,
                 subject: None,
@@ -556,7 +804,7 @@ async fn finish(
             };
             let reason = e.to_string();
             status.last_error = Some(reason.clone());
-            state.events().emit(NewEvent {
+            event = Some(NewEvent {
                 kind: "source.failed",
                 actor: None,
                 subject: None,
@@ -569,13 +817,24 @@ async fn finish(
     };
     let db = state.db();
     let recorded = match db.set_source_status_if(library, &status, generation).await {
-        Ok(true) => Ok(()),
+        Ok(true) => {
+            if let Some(event) = event {
+                state.events().emit(event);
+            }
+            Ok(())
+        }
         // Changed meanwhile: due again at once, still marked if the library is half applied.
         Ok(false) => {
             let dirty = (status.etag.as_deref() == Some(DIRTY_ETAG)).then_some(DIRTY_ETAG);
             db.requeue_source(library, dirty).await
         }
-        Err(e) => Err(e),
+        Err(e) => {
+            // What happened is still worth recording.
+            if let Some(event) = event {
+                state.events().emit(event);
+            }
+            Err(e)
+        }
     };
     if let Err(e) = recorded {
         eprintln!(
@@ -591,8 +850,8 @@ fn short(commit: &str) -> &str {
     commit.get(..7).unwrap_or(commit)
 }
 
-/// The `etag` recorded after a sync failed while applying: the library may be half way between
-/// two commits, so the next sync reads the branch in full (no conditional request) and applies
+/// The `etag` recorded as a sync starts applying (and kept when it fails or is cut short while
+/// applying): the library may be half way between two commits, so the next sync reads the branch in full (no conditional request) and applies
 /// its plan even when the branch is back at `last_commit`. It is never sent to GitHub.
 const DIRTY_ETAG: &str = "sharecraft:applied-in-part";
 
@@ -756,6 +1015,12 @@ async fn run(
     )
     .await?;
 
+    // Marked half applied before anything changes, so a sync cut short by the process ending
+    // never answers unchanged later, even when the branch is back at the last commit. A sync
+    // that finishes replaces the marker with the branch's entity tag.
+    db.mark_source_etag(library, DIRTY_ETAG)
+        .await
+        .map_err(db_failed)?;
     let counts = apply(state, library, &user, &known, &lost, plan, &fetched)
         .await
         .map_err(|error| Failure {

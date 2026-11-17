@@ -32,6 +32,7 @@ pub mod sites;
 pub mod source_sync;
 pub mod templates;
 pub mod tree;
+mod webhooks;
 mod ws;
 
 use std::net::SocketAddr;
@@ -39,6 +40,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use axum::Router;
+use axum::extract::DefaultBodyLimit;
 use axum::extract::{ConnectInfo, Request, State};
 use axum::http::header::{
     CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, LOCATION, REFERRER_POLICY,
@@ -47,7 +49,7 @@ use axum::http::header::{
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use collab_core::ids::DocId;
 use records::Db;
 use revisions::{BlobStore, RevisionStore};
@@ -73,6 +75,7 @@ pub use projection::{
 };
 pub use scan::scan_once;
 pub use source_sync::sync_once;
+pub use source_sync::tick_once as source_tick_once;
 
 use api::uploads::Uploads;
 use auth::{MAX_ADDRESS_FAILURES, MAX_LINK_MISSES, PasswordChecks, Throttle};
@@ -124,6 +127,8 @@ struct Shared {
     secrets: Arc<secrets::SecretBox>,
     /// The client for the configured GitHub API address.
     github: Arc<github::GithubClient>,
+    /// The sync worker's wakes, turns and back-off.
+    sources: source_sync::Sources,
 }
 
 impl AppState {
@@ -168,8 +173,16 @@ impl AppState {
                 tree_undos: std::sync::Mutex::new(Vec::new()),
                 secrets: Arc::new(secrets),
                 github: Arc::new(github),
+                sources: source_sync::Sources::default(),
             }),
         })
+    }
+
+    /// The sync worker of connected libraries: [`source_sync::Sources::wake`] asks it to sync a
+    /// library at once.
+    #[must_use]
+    pub fn sources(&self) -> &source_sync::Sources {
+        &self.shared.sources
     }
 
     /// Seals and opens the secrets of connected libraries.
@@ -346,6 +359,8 @@ impl AppState {
 ///   installed editor's files, for a signed-in caller;
 /// - `GET /l/{token}` is a sharing link's landing page, and `/api/l/{token}…` what it reaches
 ///   (see the `links` module);
+/// - `POST /hooks/github/{library}` takes GitHub's webhook deliveries for a connected library
+///   (see the `webhooks` module); it is outside `/api`, as GitHub sends no `Origin`;
 /// - anything else is a static file from `web_dir`.
 ///
 /// Every request first passes [`source`], which works out where it came from and, in production
@@ -361,6 +376,10 @@ pub fn router(state: AppState) -> Router {
         .nest("/api", api::router())
         .route("/ws/docs/{doc_id}", get(ws::upgrade))
         .route("/l/{token}", get(links::page))
+        .route(
+            "/hooks/github/{library}",
+            post(webhooks::github).layer(DefaultBodyLimit::max(webhooks::MAX_BODY)),
+        )
         .merge(editors::router(state.clone()))
         .fallback_service(files)
         .layer(middleware::from_fn(links::link_headers))
@@ -398,15 +417,16 @@ async fn source(State(state): State<AppState>, mut request: Request, next: Next)
     }
     let same_origin = deployment.same_origin(request.headers(), &source);
     let link_lookup = request.uri().path().starts_with("/api/l/");
+    let hook = request.uri().path().starts_with("/hooks/");
     let address = auth::Throttle::address_key(source.client_ip);
     request.extensions_mut().insert(SameOrigin(same_origin));
     request.extensions_mut().insert(source);
-    if !link_lookup {
+    if !link_lookup && !hook {
         return next.run(request).await;
     }
-    // Guessing anyone-link tokens: an address with 60 answers of `link_not_found` in the last
-    // 15 minutes is refused until the oldest is 15 minutes old. A link used as meant is never
-    // counted.
+    // Guessing anyone-link tokens or webhook signatures: an address with 60 answers of
+    // `link_not_found`, or of a webhook `404` or `401`, in the last 15 minutes is refused until
+    // the oldest is 15 minutes old. A link used as meant, or a delivery taken, is never counted.
     let throttle = state.link_throttle();
     if throttle.blocked(&address, std::time::Instant::now()) {
         let mut refused = api::ApiError::TooManyAttempts.into_response();
@@ -417,7 +437,9 @@ async fn source(State(state): State<AppState>, mut request: Request, next: Next)
         return refused;
     }
     let response = next.run(request).await;
-    if response.status() == StatusCode::NOT_FOUND {
+    let failed = response.status() == StatusCode::NOT_FOUND
+        || (hook && response.status() == StatusCode::UNAUTHORIZED);
+    if failed {
         throttle.note_failure(&address, std::time::Instant::now());
     }
     response
@@ -650,8 +672,9 @@ pub async fn prepare(config: Config) -> std::io::Result<AppState> {
 }
 
 /// Serves `state` on `listener` until the process ends, with the expiry sweeper (see
-/// [`sweep_once`]) running every minute and the malware scan worker (see [`scan_once`])
-/// meanwhile; they stop when serving does.
+/// [`sweep_once`]) running every minute, the malware scan worker (see [`scan_once`]) and the
+/// sync worker of connected libraries (see [`source_tick_once`]) meanwhile; they stop when
+/// serving does.
 ///
 /// # Errors
 /// Returns an error if, in development mode, the listener is not on a loopback address, or if
@@ -660,6 +683,8 @@ pub async fn serve_state(state: AppState, listener: TcpListener) -> std::io::Res
     require_loopback(state.deployment(), listener.local_addr()?)?;
     let _sweeper = links::start_sweeper(state.clone());
     let _scanner = scan::start_worker(state.clone());
+    // `prepare` has put syncs cut short by an earlier process back to `connecting` already.
+    let _syncer = source_sync::start_worker(state.clone());
     axum::serve(
         listener,
         router(state).into_make_service_with_connect_info::<SocketAddr>(),

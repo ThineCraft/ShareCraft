@@ -18,7 +18,6 @@ use records::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use time::OffsetDateTime;
 use uuid::Uuid;
 
 use super::nodes::{node_id, require_manager, rfc3339};
@@ -28,9 +27,7 @@ use crate::auth::Signed;
 use crate::github::{EntryKind, GithubError, Head, RepoRef};
 use crate::libraries;
 use crate::secrets::Secret;
-use crate::source_sync::{
-    abandon_uploads_into, caps, sync_once, token_context, token_of, webhook_context,
-};
+use crate::source_sync::{abandon_uploads_into, caps, token_context, token_of, webhook_context};
 use crate::tree::{self, TreeOp};
 
 /// Seconds between polls of a new connection.
@@ -44,36 +41,15 @@ const MAX_TOKEN_BYTES: usize = 1000;
 /// The bytes of a webhook secret.
 const WEBHOOK_SECRET_BYTES: usize = 32;
 
-/// Starts a sync of `library` in the background. Its outcome is recorded in the connection's
-/// status and the event log, so nothing waits for it, and nothing about it can fail the
-/// request that asked for it. A sync already running (which read the connection before a
-/// change, and so records nothing of its result) is waited for, trying its turn once a second
-/// for up to [`WAKE_WAIT`]; past that the connection stays due (`connecting`) for the worker.
-// Task 7 replaces this with a wake of the worker (which must coalesce wakes).
+/// Asks the sync worker to sync `library` at once, after an owner acted on its connection: its
+/// failures in a row are forgotten (no back-off left from before). The outcome is recorded in
+/// the connection's status and the event log, so nothing waits for it, and nothing about it
+/// can fail the request that asked for it. A sync already running (which read the connection
+/// before the change, and so records nothing of its result) is followed by another.
 fn wake(state: &AppState, library: NodeId) {
-    let state = state.clone();
-    tokio::spawn(async move {
-        let deadline = tokio::time::Instant::now() + WAKE_WAIT;
-        loop {
-            if let Ok(Some(turn)) = state.db().try_lock_source(library).await {
-                // Free now. Should another sync take the turn before this one, it read the
-                // connection after the change, which is all that matters.
-                drop(turn);
-                break;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return;
-            }
-            tokio::time::sleep(WAKE_RETRY).await;
-        }
-        let _ = sync_once(&state, library, OffsetDateTime::now_utc()).await;
-    });
+    state.sources().forget_failures(library);
+    state.sources().wake(library);
 }
-
-/// How long a wake keeps trying for its turn.
-const WAKE_WAIT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
-/// How often a wake tries for its turn.
-const WAKE_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Whether `branch` is a branch name Git takes: not empty, `.` or `..`; no `..`, `@{`,
 /// backslash or control character; not starting with `-` or `/`, not ending with `/` or
@@ -643,7 +619,9 @@ pub(crate) async fn change(
 }
 
 /// `POST /api/libraries/{id}/source/sync`: "Sync now", for owners of the library. `202`; the
-/// sync runs in the background and its outcome shows in the connection's status.
+/// sync runs in the background and its outcome shows in the connection's status. It also ends
+/// a stop (`not_connected`) and a back-off after failures (`failed`); a rate limit is still
+/// waited out, as GitHub would refuse.
 pub(crate) async fn sync_now(
     State(state): State<AppState>,
     signed: Signed,
@@ -651,6 +629,7 @@ pub(crate) async fn sync_now(
 ) -> Result<Response, ApiError> {
     let library = node_id(&id)?;
     require_manager(state.db(), signed.session.user.id, library).await?;
+    let (_, status) = source_of(&state, library).await?;
     // A sync under way may have read the branch before what is to be synced now: it records
     // nothing of its result, and the one woken here reads the branch afresh.
     if !state
@@ -660,6 +639,16 @@ pub(crate) async fn sync_now(
         .map_err(|e| ApiError::unavailable(&e))?
     {
         return Err(ApiError::NotFound);
+    }
+    if matches!(
+        status.state,
+        records::SourceState::NotConnected | records::SourceState::Failed
+    ) {
+        state
+            .db()
+            .requeue_source(library, None)
+            .await
+            .map_err(|e| ApiError::unavailable(&e))?;
     }
     wake(&state, library);
     Ok(StatusCode::ACCEPTED.into_response())

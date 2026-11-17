@@ -3039,6 +3039,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.4.3",
  "gix",
+ "hmac",
  "image",
  "protocol",
  "records",

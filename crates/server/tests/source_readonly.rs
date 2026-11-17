@@ -384,6 +384,10 @@ const ROUTES: &[(&str, Decision)] = &[
     ("GET /healthz", Read),
     ("GET /ws/docs/{doc_id}", Seat),
     ("GET /l/{token}", Read),
+    (
+        "POST /hooks/github/{library}",
+        Allowed("only wakes the sync worker, which keeps the library in step with its branch"),
+    ),
 ];
 
 /// The routers nested or merged into the server's, besides the routes above, as the source
@@ -604,7 +608,7 @@ fn a_route_list_guard() {
         unclassified.is_empty() && gone.is_empty(),
         "routes not classified in ROUTES: {unclassified:?}; recorded but not registered: {gone:?}"
     );
-    assert_eq!(routes.len(), 150, "the number of registered routes changed");
+    assert_eq!(routes.len(), 151, "the number of registered routes changed");
     let mut mounts_sorted = mounts.clone();
     mounts_sorted.sort();
     let mut expected: Vec<String> = MOUNTS.iter().map(|m| (*m).to_owned()).collect();

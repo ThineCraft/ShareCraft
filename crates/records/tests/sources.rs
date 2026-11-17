@@ -430,6 +430,111 @@ async fn due_sources_returns_a_source_past_its_poll_time_and_not_one_in_backoff(
 }
 
 #[tokio::test]
+async fn archived_or_deleted_sites_are_never_due_or_wakeable() {
+    let f = fixture().await;
+    let db = &f.test.db;
+    db.connect_source(&new_source(&f, f.library)).await.unwrap();
+    let now = OffsetDateTime::now_utc();
+    assert_eq!(db.due_sources(now, 10).await.unwrap(), [f.library]);
+    assert_eq!(
+        db.wakeable_sources(now, &[f.library, f.site])
+            .await
+            .unwrap(),
+        [f.library]
+    );
+    let archived = sqlx::query("update sites set archived_at = now() where id = $1")
+        .bind(f.site.0)
+        .execute(db.test_pool())
+        .await
+        .unwrap();
+    assert_eq!(archived.rows_affected(), 1);
+    assert!(db.due_sources(now, 10).await.unwrap().is_empty());
+    assert!(
+        db.wakeable_sources(now, &[f.library])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    sqlx::query("update sites set archived_at = null where id = $1")
+        .bind(f.site.0)
+        .execute(db.test_pool())
+        .await
+        .unwrap();
+    // Only the site's own node is in the bin.
+    sqlx::query("update nodes set deleted_at = now(), deleted_with = id where id = $1")
+        .bind(f.site.0)
+        .execute(db.test_pool())
+        .await
+        .unwrap();
+    assert!(db.due_sources(now, 10).await.unwrap().is_empty());
+    assert!(
+        db.wakeable_sources(now, &[f.library])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    sqlx::query("update nodes set deleted_at = null, deleted_with = null where id = $1")
+        .bind(f.site.0)
+        .execute(db.test_pool())
+        .await
+        .unwrap();
+    assert_eq!(db.due_sources(now, 10).await.unwrap(), [f.library]);
+}
+
+#[tokio::test]
+async fn wakeable_ignores_the_poll_time_but_not_a_stop_or_a_retry_time() {
+    let f = fixture().await;
+    let db = &f.test.db;
+    db.connect_source(&new_source(&f, f.library)).await.unwrap();
+    // Whole microseconds, as PostgreSQL keeps them.
+    let now = OffsetDateTime::now_utc().replace_nanosecond(0).unwrap();
+    let only = [f.library];
+    let wake = || db.wakeable_sources(now, &only);
+    let mut s = status(SourceState::Ok);
+    s.last_checked_at = Some(now);
+    db.set_source_status(f.library, &s).await.unwrap();
+    assert!(db.due_sources(now, 10).await.unwrap().is_empty());
+    assert_eq!(wake().await.unwrap(), [f.library]);
+    s.state = SourceState::Syncing;
+    db.set_source_status(f.library, &s).await.unwrap();
+    assert_eq!(wake().await.unwrap(), [f.library]);
+    s.state = SourceState::NotConnected;
+    db.set_source_status(f.library, &s).await.unwrap();
+    assert!(wake().await.unwrap().is_empty());
+    s.state = SourceState::Failed;
+    db.set_source_status(f.library, &s).await.unwrap();
+    assert_eq!(wake().await.unwrap(), [f.library]);
+    // A back-off is set only on a failed connection.
+    assert!(
+        db.back_off_source(f.library, now + Duration::seconds(60))
+            .await
+            .unwrap()
+    );
+    assert!(wake().await.unwrap().is_empty());
+    let (_, read) = db.source_of(f.library).await.unwrap().unwrap();
+    assert_eq!(read.retry_at, Some(now + Duration::seconds(60)));
+    s.state = SourceState::Ok;
+    s.retry_at = None;
+    db.set_source_status(f.library, &s).await.unwrap();
+    assert!(
+        !db.back_off_source(f.library, now + Duration::seconds(60))
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        db.source_of(f.library).await.unwrap().unwrap().1.retry_at,
+        None
+    );
+    // The half-applied marker replaces the entity tag only.
+    db.mark_source_etag(f.library, "marker").await.unwrap();
+    let (_, read) = db.source_of(f.library).await.unwrap().unwrap();
+    assert_eq!(read.etag.as_deref(), Some("marker"));
+    assert_eq!(read.state, SourceState::Ok);
+    assert!(wake().await.unwrap().len() == 1);
+    assert!(db.wakeable_sources(now, &[]).await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn disconnect_returns_the_secret_ids_and_removes_the_rows_but_not_the_nodes() {
     let f = fixture().await;
     let db = &f.test.db;

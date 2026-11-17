@@ -25,6 +25,8 @@ flate2 = "1.1.11"
 futures-util = "0.3.34"
 getrandom = "0.4.3"
 gix = { version = "0.90.0", default-features = false, features = ["sha1"] }
+# Webhook signatures (HMAC-SHA256, checked in constant time).
+hmac = "0.13.0"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 protocol = { path = "../protocol" }
 records = { path = "../records" }
