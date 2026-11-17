@@ -465,7 +465,7 @@ fn out_of_order_entry_is_an_error() {
 }
 
 #[test]
-fn own_entry_out_of_turn_is_desync() {
+fn refusal_out_of_turn_is_desync() {
     let mut doc = StandIn::new("a");
     let mut client = live(&mut doc, 1);
     let first = client.new_ids(1).unwrap();
@@ -476,21 +476,66 @@ fn own_entry_out_of_turn_is_desync() {
     client
         .local(&mut doc, insert(second, "two"), Mode::ShowAtOnce, 10)
         .unwrap();
-    // The server confirms local 2 before local 1.
-    let error = client
-        .receive(
-            &mut doc,
-            &entry(1, 1, client.client(), 2, 0, &insert(second, "two")),
-            20,
-        )
-        .unwrap_err();
-    assert!(matches!(error, ClientError::Desync(_)));
-    // A refusal for a change that is not first in line is a desync too.
+    // A refusal for a change that is not first in line is out of step.
     let refused = json!({ "type": "refused", "local": 2, "reason": "rate_limited" }).to_string();
     assert!(matches!(
         client.receive(&mut doc, &refused, 20).unwrap_err(),
         ClientError::Desync(_)
     ));
+    assert_eq!(client.pending(), 2);
+}
+
+#[test]
+fn own_entry_past_the_first_in_line_means_the_earlier_were_refused() {
+    // Found by the convergence test: local 1 was refused while the person was briefly a
+    // viewer, local 2 was stored, and the connection dropped before either answer arrived.
+    let mut doc = StandIn::new("a");
+    let mut client = live(&mut doc, 1);
+    let first = client.new_ids(1).unwrap();
+    let second = client.new_ids(1).unwrap();
+    client
+        .local(&mut doc, insert(first, "one"), Mode::ShowAtOnce, 10)
+        .unwrap();
+    client
+        .local(&mut doc, insert(second, "two"), Mode::ShowAtOnce, 10)
+        .unwrap();
+    let step = client
+        .receive(
+            &mut doc,
+            &entry(1, 1, client.client(), 2, 0, &insert(second, "two")),
+            20,
+        )
+        .unwrap();
+    // The server takes numbers in order, so local 1 will never be stored.
+    assert!(step.events.contains(&Event::Refused {
+        local: LocalNo(1),
+        reason: RefusedReason::Unknown,
+    }));
+    assert_eq!(doc.lines(), vec!["two"]);
+    assert_eq!(client.pending(), 0);
+    assert_eq!(client.agreed_seq(), Seq(1));
+    // The lost refusal, if it is sent again, is ignored.
+    let refused = json!({ "type": "refused", "local": 1, "reason": "read_only" }).to_string();
+    assert_eq!(
+        client.receive(&mut doc, &refused, 30).unwrap(),
+        Default::default()
+    );
+    // Content that differs from the waiting change is still out of step.
+    let third = client.new_ids(1).unwrap();
+    client
+        .local(&mut doc, insert(third, "three"), Mode::ShowAtOnce, 40)
+        .unwrap();
+    assert!(matches!(
+        client
+            .receive(
+                &mut doc,
+                &entry(2, 1, client.client(), 3, 1, &insert(third, "other")),
+                50,
+            )
+            .unwrap_err(),
+        ClientError::Desync(_)
+    ));
+    assert_eq!(client.pending(), 1);
 }
 
 #[test]
@@ -1358,4 +1403,435 @@ fn server_heartbeat_interval_is_clamped() {
         assert!(heartbeats(&client.tick(due - 1)).is_empty());
         assert_eq!(heartbeats(&client.tick(due)).len(), 1);
     }
+}
+
+// ---- Task 6: crashes and cancellation ----
+
+fn crash_if(device: &str) -> String {
+    StandIn::op(&StandInOp::CrashIf {
+        device: device.to_owned(),
+    })
+}
+
+/// A cancel record at `seq` for the change at `cancels`.
+fn cancel(seq: u64, cancels: u64) -> String {
+    json!({
+        "type": "entry",
+        "entry": {
+            "seq": seq,
+            "at_ms": 1_000 + seq as i64,
+            "seed": 0,
+            "kind": "cancel",
+            "cancels": cancels,
+            "reports": 1,
+        }
+    })
+    .to_string()
+}
+
+/// A change as a catch-up sends it once it was cancelled: empty, and marked.
+fn cancelled(seq: u64, participant: u32, client: ClientId, local: u64, seen: u64) -> String {
+    let mut frame: Value =
+        serde_json::from_str(&entry(seq, participant, client, local, seen, "")).unwrap();
+    frame["entry"]["cancelled"] = json!(true);
+    frame.to_string()
+}
+
+fn config_crashed(at: u64) -> LiveConfig {
+    LiveConfig {
+        format: FORMAT.to_owned(),
+        crashed_at: Some(Seq(at)),
+    }
+}
+
+/// A `StandIn` that keeps the crash note as a host would, and records what it applied.
+struct Noting {
+    doc: StandIn,
+    note: Option<Seq>,
+    applied: Vec<Option<Seq>>,
+}
+
+impl Noting {
+    fn new(device: &str) -> Noting {
+        Noting {
+            doc: StandIn::new(device),
+            note: None,
+            applied: Vec::new(),
+        }
+    }
+}
+
+impl LiveEditor for Noting {
+    type Snapshot = StandIn;
+
+    fn snapshot(&self) -> StandIn {
+        self.doc.snapshot()
+    }
+
+    fn restore(&mut self, snapshot: &StandIn) {
+        self.doc.restore(snapshot);
+    }
+
+    fn apply(&mut self, entry: &EntryView<'_>) -> Result<Outcome, Crash> {
+        self.applied.push(entry.seq);
+        self.doc.apply(entry)
+    }
+
+    fn note_applying(&mut self, seq: Option<Seq>) {
+        self.note = seq;
+    }
+}
+
+const ANN: u128 = 1;
+
+/// Entries 1 and 2 ("one", "two") from Ann, participant 1.
+fn first_two() -> [String; 2] {
+    [
+        entry(1, 1, other(ANN), 1, 0, &insert(LiveId(1, 0), "one")),
+        entry(2, 1, other(ANN), 2, 1, &insert(LiveId(1, 1), "two")),
+    ]
+}
+
+fn crash_three() -> String {
+    entry(3, 1, other(ANN), 3, 2, &crash_if("b"))
+}
+
+fn four() -> String {
+    entry(4, 1, other(ANN), 4, 3, &insert(LiveId(1, 3), "four"))
+}
+
+#[test]
+fn crash_stalls_and_reports() {
+    let mut doc = Noting::new("b");
+    let mut client = live(&mut doc, 2);
+    for frame in first_two() {
+        client.receive(&mut doc, &frame, 5).unwrap();
+    }
+    let step = client.receive(&mut doc, &crash_three(), 10).unwrap();
+    assert_eq!(client.phase(), Phase::Stalled { at: Seq(3) });
+    assert_eq!(step.send, vec![r#"{"type":"report","seq":3}"#.to_owned()]);
+    assert!(step.events.contains(&Event::Crashed { seq: Seq(3) }));
+    assert_eq!(
+        doc.note,
+        Some(Seq(3)),
+        "the crash note stays until a verdict"
+    );
+    assert_eq!(client.agreed_seq(), Seq(2));
+
+    // Entry 4 is held, not applied.
+    let step = client.receive(&mut doc, &four(), 20).unwrap();
+    assert_eq!(step, Default::default());
+    assert_eq!(doc.doc.lines(), vec!["one", "two"]);
+    assert!(!doc.applied.contains(&Some(Seq(4))));
+    assert_eq!(client.phase(), Phase::Stalled { at: Seq(3) });
+
+    // The heartbeat never claims the client moved past the entry.
+    assert_eq!(
+        client.tick(60_000),
+        vec![r#"{"type":"heartbeat","seen":2}"#.to_owned()]
+    );
+    // No change is taken while stalled.
+    assert_eq!(
+        client
+            .local(
+                &mut doc,
+                insert(LiveId(2, 0), "x"),
+                Mode::ShowAtOnce,
+                60_001
+            )
+            .unwrap_err(),
+        LocalError::NotLive
+    );
+}
+
+#[test]
+fn restart_after_crash_stops_before_the_entry() {
+    let mut doc = Noting::new("b");
+    let mut client: LiveClient<Noting> = LiveClient::new(config_crashed(3));
+    let join: Value = serde_json::from_str(&client.connected(0)[0]).unwrap();
+    assert_eq!(join["seen"], Value::Null);
+    assert_eq!(join["resume"], Value::Null);
+    client.receive(&mut doc, &joined(4), 0).unwrap();
+    let step = client.receive(&mut doc, &catchup(0, 0, 4), 0).unwrap();
+    assert!(step.events.contains(&Event::LoadBase {
+        revision: None,
+        at: Seq(0),
+    }));
+    for frame in first_two() {
+        client.receive(&mut doc, &frame, 0).unwrap();
+    }
+    client.receive(&mut doc, &crash_three(), 0).unwrap();
+    client.receive(&mut doc, &four(), 0).unwrap();
+    doc.doc = StandIn::new("b");
+    let step = client.base_ready(&mut doc, 10).unwrap();
+    assert_eq!(doc.applied, vec![Some(Seq(1)), Some(Seq(2))]);
+    assert_eq!(doc.doc.lines(), vec!["one", "two"]);
+    assert_eq!(step.send, vec![r#"{"type":"report","seq":3}"#.to_owned()]);
+    assert!(step.events.contains(&Event::Crashed { seq: Seq(3) }));
+    assert_eq!(client.phase(), Phase::Stalled { at: Seq(3) });
+    assert_eq!(client.agreed_seq(), Seq(2));
+
+    // Every later join reports it again until a verdict arrives.
+    client.disconnected(20);
+    let join: Value = serde_json::from_str(&client.connected(30)[0]).unwrap();
+    assert_eq!(join["seen"], 2);
+    client.receive(&mut doc, &joined_kept(4), 30).unwrap();
+    client.receive(&mut doc, &catchup(0, 2, 4), 30).unwrap();
+    let step = client.receive(&mut doc, &crash_three(), 30).unwrap();
+    assert_eq!(step.send, vec![r#"{"type":"report","seq":3}"#.to_owned()]);
+    assert_eq!(client.phase(), Phase::Stalled { at: Seq(3) });
+    assert_eq!(doc.applied, vec![Some(Seq(1)), Some(Seq(2))]);
+}
+
+#[test]
+fn cancel_unstalls_the_reporter() {
+    // A reloaded client stalled before the entry: its editor is exactly the agreed state.
+    let mut doc = Noting::new("b");
+    doc.note = Some(Seq(3));
+    let mut client: LiveClient<Noting> = LiveClient::new(config_crashed(3));
+    client.connected(0);
+    client.receive(&mut doc, &joined(4), 0).unwrap();
+    client.receive(&mut doc, &catchup(0, 0, 3), 0).unwrap();
+    client.base_ready(&mut doc, 0).unwrap();
+    for frame in first_two() {
+        client.receive(&mut doc, &frame, 0).unwrap();
+    }
+    client.receive(&mut doc, &crash_three(), 0).unwrap();
+    client.receive(&mut doc, &four(), 5).unwrap();
+    assert_eq!(client.phase(), Phase::Stalled { at: Seq(3) });
+
+    let step = client.receive(&mut doc, &cancel(5, 3), 10).unwrap();
+    assert!(step.send.is_empty(), "no resync is needed: {:?}", step.send);
+    assert_eq!(doc.doc.lines(), vec!["one", "two", "four"]);
+    assert!(!doc.applied.contains(&Some(Seq(3))));
+    assert_eq!(client.phase(), Phase::Live);
+    assert_eq!(client.agreed_seq(), Seq(5));
+    assert_eq!(doc.note, None, "the verdict clears the crash note");
+    assert!(step.events.iter().any(|event| matches!(
+        event,
+        Event::Applied {
+            seq: Seq(4),
+            own: false,
+            ..
+        }
+    )));
+}
+
+#[test]
+fn crash_while_going_back_keeps_waiting_changes_and_cancel_unstalls() {
+    let mut doc = Noting::new("b");
+    let mut client = live(&mut doc, 2);
+    for frame in first_two() {
+        client.receive(&mut doc, &frame, 5).unwrap();
+    }
+    let mine = client.new_ids(1).unwrap();
+    client
+        .local(&mut doc, insert(mine, "mine"), Mode::ShowAtOnce, 6)
+        .unwrap();
+    // Ann's crashing entry arrives while a change waits, so the client goes back to apply it.
+    let step = client.receive(&mut doc, &crash_three(), 10).unwrap();
+    assert_eq!(step.send, vec![r#"{"type":"report","seq":3}"#.to_owned()]);
+    assert_eq!(client.phase(), Phase::Stalled { at: Seq(3) });
+    // What is shown is the agreed state with the waiting change, not the crash's leftovers.
+    assert_eq!(doc.doc.lines(), vec!["one", "two", "mine"]);
+    assert_eq!(client.pending(), 1);
+
+    client.receive(&mut doc, &four(), 20).unwrap();
+    let step = client.receive(&mut doc, &cancel(5, 3), 30).unwrap();
+    assert!(step.send.iter().all(|frame| !frame.contains("resync")));
+    assert_eq!(doc.doc.lines(), vec!["one", "two", "four", "mine"]);
+    assert_eq!(client.phase(), Phase::Live);
+    assert_eq!(client.agreed_seq(), Seq(5));
+    assert_eq!(client.pending(), 1);
+    assert_eq!(doc.note, None);
+}
+
+#[test]
+fn cancel_after_a_crash_in_place_loads_the_base_again() {
+    // With nothing waiting the entry was applied straight to the editor, which the crash may
+    // have left half changed, so the client loads the base again rather than trust it.
+    let mut doc = Noting::new("b");
+    let mut client = live(&mut doc, 2);
+    for frame in first_two() {
+        client.receive(&mut doc, &frame, 5).unwrap();
+    }
+    client.receive(&mut doc, &crash_three(), 10).unwrap();
+    client.receive(&mut doc, &four(), 20).unwrap();
+    let step = client.receive(&mut doc, &cancel(5, 3), 30).unwrap();
+    assert_eq!(step.send, vec![r#"{"type":"resync"}"#.to_owned()]);
+    assert_eq!(client.phase(), Phase::Resyncing);
+    assert_eq!(doc.note, None);
+
+    let step = client.receive(&mut doc, &catchup(0, 0, 5), 40).unwrap();
+    assert!(step.events.contains(&Event::LoadBase {
+        revision: None,
+        at: Seq(0),
+    }));
+    doc.doc = StandIn::new("b");
+    client.base_ready(&mut doc, 40).unwrap();
+    let mut send = Vec::new();
+    for frame in [
+        first_two()[0].clone(),
+        first_two()[1].clone(),
+        cancelled(3, 1, other(ANN), 3, 2),
+        four(),
+        cancel(5, 3),
+    ] {
+        send.extend(client.receive(&mut doc, &frame, 40).unwrap().send);
+    }
+    assert!(send.is_empty(), "{send:?}");
+    assert_eq!(doc.doc.lines(), vec!["one", "two", "four"]);
+    assert_eq!(client.phase(), Phase::Live);
+    assert_eq!(client.agreed_seq(), Seq(5));
+}
+
+#[test]
+fn cancel_makes_others_resync() {
+    let mut doc = StandIn::new("a");
+    let mut client = live(&mut doc, 2);
+    let three = entry(3, 1, other(ANN), 3, 2, &insert(LiveId(1, 2), "three"));
+    for frame in first_two().iter().chain([&three]) {
+        client.receive(&mut doc, frame, 5).unwrap();
+    }
+    let mine = client.new_ids(1).unwrap();
+    let step = client
+        .local(&mut doc, insert(mine, "mine"), Mode::ShowAtOnce, 6)
+        .unwrap();
+    assert_eq!(entries(&step.send).len(), 1);
+    client.receive(&mut doc, &four(), 7).unwrap();
+    assert_eq!(doc.lines(), vec!["one", "two", "three", "four", "mine"]);
+
+    // Someone else's editor could not apply 3, and the server cancelled it.
+    let step = client.receive(&mut doc, &cancel(5, 3), 10).unwrap();
+    assert_eq!(step.send, vec![r#"{"type":"resync"}"#.to_owned()]);
+    assert_eq!(client.phase(), Phase::Resyncing);
+    // Entries that cross the resync are held, then dropped for the catch-up's copies.
+    let six = entry(6, 3, other(3), 1, 5, &insert(LiveId(3, 0), "six"));
+    client.receive(&mut doc, &six, 11).unwrap();
+
+    let step = client.receive(&mut doc, &catchup(0, 0, 6), 20).unwrap();
+    assert!(step.events.contains(&Event::LoadBase {
+        revision: None,
+        at: Seq(0),
+    }));
+    doc = StandIn::new("a");
+    client.base_ready(&mut doc, 20).unwrap();
+    let log = [
+        first_two()[0].clone(),
+        first_two()[1].clone(),
+        cancelled(3, 1, other(ANN), 3, 2),
+        four(),
+        cancel(5, 3),
+        six,
+    ];
+    let mut sent_again = Vec::new();
+    for frame in &log {
+        let step = client.receive(&mut doc, frame, 20).unwrap();
+        sent_again.extend(step.send);
+    }
+    assert_eq!(client.phase(), Phase::Live);
+    assert_eq!(client.agreed_seq(), Seq(6));
+
+    // A fresh replay without 3.
+    let mut fresh = StandIn::new("fresh");
+    for payload in [
+        insert(LiveId(1, 0), "one"),
+        insert(LiveId(1, 1), "two"),
+        insert(LiveId(1, 3), "four"),
+        insert(LiveId(3, 0), "six"),
+    ] {
+        fresh
+            .apply(&EntryView {
+                seq: None,
+                participant: ParticipantNo(1),
+                own: false,
+                stamp: None,
+                payload: &payload,
+            })
+            .unwrap();
+    }
+    let mut shown = fresh.lines();
+    shown.push("mine".to_owned());
+    // The waiting change is still shown, on top, and was not sent a second time.
+    assert_eq!(doc.lines(), shown);
+    assert_eq!(client.pending(), 1);
+    assert!(entries(&sent_again).is_empty(), "{sent_again:?}");
+    assert!(sent_again.iter().all(|frame| !frame.contains("resync")));
+}
+
+#[test]
+fn cancel_of_an_entry_never_applied_does_not_resync() {
+    // A client catching up from the base meets the change already cancelled.
+    let mut doc = StandIn::new("a");
+    let mut client: LiveClient<StandIn> = LiveClient::new(config());
+    client.connected(0);
+    client.receive(&mut doc, &joined(2), 0).unwrap();
+    client.receive(&mut doc, &catchup(0, 0, 5), 0).unwrap();
+    client.base_ready(&mut doc, 0).unwrap();
+    let mut send = Vec::new();
+    for frame in [
+        first_two()[0].clone(),
+        first_two()[1].clone(),
+        cancelled(3, 1, other(ANN), 3, 2),
+        four(),
+        cancel(5, 3),
+    ] {
+        send.extend(client.receive(&mut doc, &frame, 0).unwrap().send);
+    }
+    assert!(send.is_empty(), "{send:?}");
+    assert_eq!(client.phase(), Phase::Live);
+    assert_eq!(doc.lines(), vec!["one", "two", "four"]);
+}
+
+#[test]
+fn restart_after_the_verdict_skips_the_cancelled_entry() {
+    let mut doc = Noting::new("b");
+    doc.note = Some(Seq(3));
+    let mut client: LiveClient<Noting> = LiveClient::new(config_crashed(3));
+    client.connected(0);
+    client.receive(&mut doc, &joined(4), 0).unwrap();
+    client.receive(&mut doc, &catchup(0, 0, 5), 0).unwrap();
+    client.base_ready(&mut doc, 0).unwrap();
+    let mut send = Vec::new();
+    for frame in [
+        first_two()[0].clone(),
+        first_two()[1].clone(),
+        cancelled(3, 1, other(ANN), 3, 2),
+        four(),
+        cancel(5, 3),
+    ] {
+        send.extend(client.receive(&mut doc, &frame, 0).unwrap().send);
+    }
+    assert!(send.is_empty(), "{send:?}");
+    assert_eq!(client.phase(), Phase::Live);
+    assert_eq!(doc.doc.lines(), vec!["one", "two", "four"]);
+    assert_eq!(doc.note, None);
+}
+
+#[test]
+fn cannot_open_closes() {
+    let mut doc = Noting::new("b");
+    let mut client = live(&mut doc, 2);
+    for frame in first_two() {
+        client.receive(&mut doc, &frame, 5).unwrap();
+    }
+    client.receive(&mut doc, &crash_three(), 10).unwrap();
+    let step = client
+        .receive(
+            &mut doc,
+            &json!({ "type": "cannot_open", "seq": 3 }).to_string(),
+            20,
+        )
+        .unwrap();
+    assert_eq!(step.events, vec![Event::CannotOpen { seq: Seq(3) }]);
+    assert!(step.send.is_empty());
+    assert_eq!(client.phase(), Phase::Closed);
+    assert_eq!(doc.note, None, "the verdict clears the crash note");
+    assert!(client.tick(120_000).is_empty());
+    assert!(client.connected(130_000).is_empty());
+    assert_eq!(
+        client.receive(&mut doc, &four(), 140_000).unwrap(),
+        Default::default()
+    );
+    assert_eq!(doc.doc.lines(), vec!["one", "two"]);
 }

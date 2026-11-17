@@ -10,7 +10,7 @@
 //! person's own waiting changes on top. When the server's order differs from what is shown,
 //! the client goes back to its copy of the agreed state and re-runs.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 
 use collab_core::ids::{ClientId, Seq};
 use protocol::RemovedReason;
@@ -126,7 +126,10 @@ pub enum Mode {
 pub struct LiveConfig {
     /// The format of the changes the editor makes and reads.
     pub format: String,
-    /// The host's crash note: the entry the editor stopped in, if any.
+    /// The host's crash note: the entry the editor stopped in, if any, as kept through
+    /// [`LiveEditor::note_applying`] when the editor stopped and was loaded again. The new
+    /// client loads the base, applies the entries before it, and stalls at it without applying
+    /// it, reporting it on every join until the server's verdict.
     pub crashed_at: Option<Seq>,
 }
 
@@ -145,14 +148,17 @@ pub enum Event {
     LoadBase { revision: Option<String>, at: Seq },
     /// The entry at `seq` was applied to the agreed state.
     Applied { seq: Seq, own: bool, effect: Effect },
-    /// The server refused a change; it is no longer shown.
+    /// The server refused a change; it is no longer shown. The reason is
+    /// [`RefusedReason::Unknown`] when the refusal itself was lost with a connection and the
+    /// client learned of it from a later own change being stored.
     Refused {
         local: LocalNo,
         reason: RefusedReason,
     },
     /// Waiting changes were dropped because the person may no longer edit.
     DroppedPending { count: usize },
-    /// The editor stopped in the entry at `seq`.
+    /// The editor stopped in the entry at `seq`, now or before a reload; the client reported
+    /// it and waits for the server's verdict: a cancel record, or [`Event::CannotOpen`].
     Crashed { seq: Seq },
     /// The document cannot be opened from the log.
     CannotOpen { seq: Seq },
@@ -188,7 +194,10 @@ pub enum Phase {
     Live,
     /// Waiting for the log again from the base.
     Resyncing,
-    /// The editor stopped in the entry at `at`; later entries are held.
+    /// The editor stopped in the entry at `at`; later entries are held and the heartbeat
+    /// states `at - 1` until the server's verdict. When the server cancels the entry, the
+    /// client passes over it and applies the held ones, or, if the crash happened while
+    /// applying straight to the editor (which may be left half changed), loads the base again.
     Stalled { at: Seq },
     /// Finished; every call is refused.
     Closed,
@@ -303,11 +312,19 @@ pub struct LiveClient<E: LiveEditor> {
     held: Vec<LiveEntry>,
     /// The base position named by the catch-up while loading the base.
     base_at: Seq,
+    /// The entry the editor stopped in, until a verdict on it arrives: the stall survives
+    /// reconnects, and a client started with a crash note begins with it.
+    stalled_at: Option<Seq>,
+    /// Changes passed over without being applied since the base was loaded: those that came
+    /// cancelled, and the one a cancel record unstalled. A cancel record for anything else
+    /// at or before the agreed position means the editor applied a cancelled change.
+    skipped: BTreeSet<Seq>,
 }
 
 impl<E: LiveEditor> LiveClient<E> {
     /// A client that has not connected yet.
     pub fn new(config: LiveConfig) -> Self {
+        let stalled_at = config.crashed_at;
         LiveClient {
             config,
             client: ClientId(uuid::Uuid::new_v4()),
@@ -329,6 +346,8 @@ impl<E: LiveEditor> LiveClient<E> {
             next_local: 1,
             held: Vec::new(),
             base_at: Seq(0),
+            stalled_at,
+            skipped: BTreeSet::new(),
         }
     }
 
@@ -431,7 +450,18 @@ impl<E: LiveEditor> LiveClient<E> {
                     self.take_entry(editor, entry, &mut step)?;
                     self.check_live(now_ms, &mut step);
                 }
-                Phase::LoadingBase | Phase::Resyncing | Phase::Stalled { .. } => {
+                Phase::Stalled { at } => {
+                    let verdict = matches!(
+                        entry.body,
+                        EntryBody::Cancel { cancels, .. } if cancels == at
+                    );
+                    self.held.push(entry);
+                    if verdict {
+                        self.unstall(editor, &mut step)?;
+                        self.check_live(now_ms, &mut step);
+                    }
+                }
+                Phase::LoadingBase | Phase::Resyncing => {
                     self.held.push(entry);
                 }
                 Phase::Offline | Phase::Joining | Phase::Closed => {
@@ -464,6 +494,10 @@ impl<E: LiveEditor> LiveClient<E> {
                 step.events.push(Event::Refused { local, reason });
             }
             LiveServerMsg::CannotOpen { seq } => {
+                // The verdict: this device cannot open the document as it now is.
+                if self.stalled_at.take().is_some() {
+                    editor.note_applying(None);
+                }
                 self.phase = Phase::Closed;
                 step.events.push(Event::CannotOpen { seq });
             }
@@ -504,22 +538,22 @@ impl<E: LiveEditor> LiveClient<E> {
         self.folded.clear();
         self.agreed_seq = self.base_at;
         self.has_state = true;
+        self.skipped.clear();
+        if self.stalled_at.is_some_and(|at| at <= self.base_at) {
+            // The stored revision already covers the entry the note names.
+            self.stalled_at = None;
+            editor.note_applying(None);
+        }
         for pending in &mut self.pending {
             pending.shown = false;
         }
         self.phase = Phase::CatchingUp;
-        let mut rest = std::mem::take(&mut self.held).into_iter();
-        for entry in rest.by_ref() {
-            self.take_entry(editor, entry, &mut step)?;
-            if matches!(self.phase, Phase::Stalled { .. }) {
-                break;
-            }
-        }
-        self.held.extend(rest);
-        if self
-            .pending
-            .iter()
-            .any(|pending| pending.mode == Mode::ShowAtOnce && !pending.shown)
+        self.apply_held(editor, &mut step)?;
+        if self.has_state
+            && self
+                .pending
+                .iter()
+                .any(|pending| pending.mode == Mode::ShowAtOnce && !pending.shown)
         {
             self.go_back(editor, None);
         }
@@ -831,8 +865,21 @@ impl<E: LiveEditor> LiveClient<E> {
             seed: entry.seed,
         };
         let (participant, client, local, payload, cancelled) = match entry.body {
-            EntryBody::Cancel { .. } => {
+            EntryBody::Cancel { cancels, .. } => {
+                // The editor applied the change now cancelled: it goes back to the base and
+                // replays the log without it.
+                let applied = cancels <= self.agreed_seq
+                    && cancels > self.base_at
+                    && !self.skipped.contains(&cancels);
                 self.agreed_seq = seq;
+                if self.stalled_at == Some(seq) {
+                    // A crash note cannot name a cancel record, which is never applied.
+                    self.stalled_at = None;
+                    editor.note_applying(None);
+                }
+                if applied {
+                    self.resync(step);
+                }
                 return Ok(());
             }
             EntryBody::Change {
@@ -844,6 +891,20 @@ impl<E: LiveEditor> LiveClient<E> {
                 ..
             } => (participant, client, local, payload, cancelled),
         };
+        if self.stalled_at == Some(seq) {
+            if cancelled {
+                // The verdict came while the client was away or reloading.
+                self.stalled_at = None;
+                editor.note_applying(None);
+            } else {
+                // The editor stopped in this entry before: it is not applied again.
+                self.stall(seq, step);
+                return Ok(());
+            }
+        }
+        if cancelled {
+            self.skipped.insert(seq);
+        }
         let own = client == self.client;
         if own && local.0 >= self.next_local {
             return Err(ClientError::Desync(format!(
@@ -851,25 +912,22 @@ impl<E: LiveEditor> LiveClient<E> {
             )));
         }
         let first = self.pending.front().map(|pending| pending.local);
-        // An own change confirmed now must be the first in line. An own change with a lower
-        // number was confirmed before (it is met again when catching up from the base) and
-        // is applied like anyone's.
+        // An own change at or after the first in line confirms a waiting change. An own change
+        // with a lower number was confirmed before (it is met again when catching up from the
+        // base) and is applied like anyone's.
         let confirms = own && first.is_some_and(|first| local.0 >= first.0);
-        if confirms && first != Some(local) {
-            return Err(ClientError::Desync(format!(
-                "own change {local:?} confirmed while {first:?} is first in line"
-            )));
-        }
-        if confirms
-            && !cancelled
-            && self
-                .pending
-                .front()
-                .is_some_and(|pending| pending.payload != payload)
-        {
-            return Err(ClientError::Desync(format!(
-                "own change {local:?} came back with a different content"
-            )));
+        if confirms {
+            let Some(waiting) = self.pending.iter().find(|pending| pending.local == local) else {
+                return Err(ClientError::Desync(format!(
+                    "own change {local:?} was stored but is not waiting"
+                )));
+            };
+            if !cancelled && waiting.payload != payload {
+                return Err(ClientError::Desync(format!(
+                    "own change {local:?} came back with a different content"
+                )));
+            }
+            self.drop_refused_before(editor, local, step);
         }
         if cancelled {
             // A cancelled change only moves the agreed position on.
@@ -909,10 +967,11 @@ impl<E: LiveEditor> LiveClient<E> {
             }
             // It waited for the server, or its result depends on the stamp.
             let result = self.go_back(editor, Some(&ordered));
-            self.after_received(result, seq, own, step);
+            self.after_received(editor, result, seq, own, false, step);
             return Ok(());
         }
-        let result = if self.agreed.is_none() {
+        let direct = self.agreed.is_none();
+        let result = if direct {
             editor.note_applying(Some(seq));
             let result = editor.apply(&ordered.view());
             if result.is_ok() {
@@ -922,16 +981,20 @@ impl<E: LiveEditor> LiveClient<E> {
         } else {
             self.go_back(editor, Some(&ordered))
         };
-        self.after_received(result, seq, own, step);
+        self.after_received(editor, result, seq, own, direct, step);
         Ok(())
     }
 
     /// Records the result of applying a received entry.
+    ///
+    /// `direct` says the entry was applied straight to the editor, with no copy to go back to.
     fn after_received(
         &mut self,
+        editor: &mut E,
         result: Option<Result<Outcome, Crash>>,
         seq: Seq,
         own: bool,
+        direct: bool,
         step: &mut Step,
     ) {
         match result {
@@ -944,12 +1007,92 @@ impl<E: LiveEditor> LiveClient<E> {
                 });
             }
             Some(Err(Crash)) => {
-                self.phase = Phase::Stalled { at: seq };
-                step.send.push(frame(&LiveClientMsg::Report { seq }));
-                step.events.push(Event::Crashed { seq });
+                self.stalled_at = Some(seq);
+                if direct {
+                    // The crash may have left the editor half changed and there is no copy to
+                    // go back to: the base is loaded again before anything more is applied.
+                    self.has_state = false;
+                } else {
+                    // Back to the agreed copy and the folded entries, kept by `go_back`, with
+                    // the waiting changes re-run on top: what was shown before the entry.
+                    let _ = self.go_back(editor, None);
+                }
+                self.stall(seq, step);
             }
             None => {}
         }
+    }
+
+    /// Takes off the waiting changes numbered below `local`, an own change the server stored.
+    ///
+    /// The server takes each client's numbers in increasing order, so a change waiting with
+    /// a lower number was refused and will never be stored; its refusal was lost with a
+    /// connection. Each is reported as [`Event::Refused`] with [`RefusedReason::Unknown`].
+    fn drop_refused_before(&mut self, editor: &mut E, local: LocalNo, step: &mut Step) {
+        let mut any_shown = false;
+        while let Some(front) = self.pending.front()
+            && front.local < local
+        {
+            let gone = front.local;
+            any_shown |= front.shown;
+            self.pending.pop_front();
+            step.events.push(Event::Refused {
+                local: gone,
+                reason: RefusedReason::Unknown,
+            });
+        }
+        if any_shown {
+            self.go_back(editor, None);
+        }
+    }
+
+    /// Stops at the entry `seq` the editor cannot apply and reports it; later entries are held
+    /// until a verdict.
+    fn stall(&mut self, seq: Seq, step: &mut Step) {
+        self.phase = Phase::Stalled { at: seq };
+        step.send.push(frame(&LiveClientMsg::Report { seq }));
+        step.events.push(Event::Crashed { seq });
+    }
+
+    /// A cancel record for the entry the client stalled at: it passes over that entry and
+    /// applies the held ones, or, if the crash may have damaged the editor, loads the base
+    /// again.
+    fn unstall(&mut self, editor: &mut E, step: &mut Step) -> Result<(), ClientError> {
+        let Some(at) = self.stalled_at.take() else {
+            return Ok(());
+        };
+        editor.note_applying(None);
+        if !self.has_state {
+            self.resync(step);
+            return Ok(());
+        }
+        self.skipped.insert(at);
+        self.agreed_seq = at;
+        self.phase = Phase::CatchingUp;
+        self.apply_held(editor, step)
+    }
+
+    /// Asks for the log again from the base. Held entries come again in the new catch-up.
+    fn resync(&mut self, step: &mut Step) {
+        self.has_state = false;
+        self.held.clear();
+        self.phase = Phase::Resyncing;
+        step.send.push(frame(&LiveClientMsg::Resync));
+    }
+
+    /// Applies the held entries in order, until the client stalls or resyncs.
+    fn apply_held(&mut self, editor: &mut E, step: &mut Step) -> Result<(), ClientError> {
+        let mut rest = std::mem::take(&mut self.held).into_iter();
+        for entry in rest.by_ref() {
+            self.take_entry(editor, entry, step)?;
+            if self.phase != Phase::CatchingUp {
+                break;
+            }
+        }
+        if matches!(self.phase, Phase::Stalled { .. }) {
+            self.held.extend(rest);
+        }
+        Ok(())
     }
 
     /// Goes back to the agreed copy, applies the folded entries and `extra` with their server

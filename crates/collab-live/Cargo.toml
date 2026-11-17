@@ -27,3 +27,7 @@ proptest = "1.12.0"
 [[test]]
 name = "client"
 required-features = ["stand-in"]
+
+[[test]]
+name = "convergence"
+required-features = ["stand-in"]
