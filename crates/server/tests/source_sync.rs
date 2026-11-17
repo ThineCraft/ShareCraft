@@ -749,6 +749,59 @@ async fn case_collision_shows_a_suffixed_name_in_the_listing_and_counts_it() {
 }
 
 #[tokio::test]
+async fn a_later_literal_collision_name_does_not_take_the_existing_files_identity() {
+    let env = Env::new().await;
+    env.fake
+        .commit("main", &files(&[("A.md", "upper"), ("a.md", "lower")]));
+    env.synced().await;
+    let upper = env.node_at("A.md").await;
+    let lower = env.node_at("a (2).md").await;
+
+    env.fake.commit(
+        "main",
+        &files(&[
+            ("A.md", "upper"),
+            ("a.md", "lower"),
+            ("a (2).md", "literal"),
+        ]),
+    );
+    env.synced().await;
+
+    assert_eq!(env.node_at("A.md").await, upper);
+    assert_eq!(env.node_at("a (2).md").await, lower);
+    assert_eq!(download(&env.server, &env.admin, lower).await.1, b"lower");
+    let literal = env.node_at("a (3).md").await;
+    assert_ne!(literal, lower);
+    assert_eq!(
+        download(&env.server, &env.admin, literal).await.1,
+        b"literal"
+    );
+}
+
+#[tokio::test]
+async fn collision_display_allocations_stay_with_the_same_nodes_across_syncs() {
+    let env = Env::new().await;
+    env.fake
+        .commit("main", &files(&[("A.md", "upper"), ("a.md", "lower")]));
+    env.synced().await;
+    let upper = env.node_at("A.md").await;
+    let lower = env.node_at("a (2).md").await;
+
+    env.fake.commit(
+        "main",
+        &files(&[("A.md", "upper"), ("a.md", "lower edited"), ("z.md", "z")]),
+    );
+    env.synced().await;
+
+    assert_eq!(env.node_at("A.md").await, upper);
+    assert_eq!(env.node_at("a (2).md").await, lower);
+    assert_eq!(
+        download(&env.server, &env.admin, lower).await.1,
+        b"lower edited"
+    );
+}
+
+#[tokio::test]
 async fn a_folder_of_the_repository_is_mirrored_alone() {
     let env = Env::connected(None, "docs").await;
     env.fake.commit(
@@ -953,6 +1006,51 @@ async fn a_move_and_rename_does_not_collide_at_the_destination() {
     );
     assert_eq!(env.find("a").await, None);
     assert_eq!(env.sync().await, Ok(None));
+}
+
+#[tokio::test]
+async fn an_interrupted_move_is_repaired_after_the_branch_reverts() {
+    const DIRTY: &str = "sharecraft:applied-in-part";
+    let env = Env::new().await;
+    let original = env
+        .fake
+        .commit("main", &files(&[("old/a.md", "a"), ("keep.md", "k")]));
+    env.synced().await;
+    let file = env.node_at("old/a.md").await;
+    let new_parent = NodeId(uuid::Uuid::new_v4());
+    outside(
+        &env,
+        TreeOp::Create {
+            parent: Some(env.library),
+            kind: NodeKind::Folder,
+            name: "new".into(),
+            id: new_parent,
+        },
+    )
+    .await;
+    outside(
+        &env,
+        TreeOp::Move {
+            id: file,
+            parent: new_parent,
+        },
+    )
+    .await;
+    assert_eq!(env.node_at("new/a.md").await, file);
+
+    env.fake.reset_branch("main", &original.sha);
+    let mut status = env.status().await;
+    status.etag = Some(DIRTY.into());
+    env.server
+        .records_db()
+        .set_source_status(env.library, &status)
+        .await
+        .unwrap();
+
+    env.synced().await;
+    assert_eq!(env.node_at("old/a.md").await, file);
+    assert_eq!(env.find("new/a.md").await, None);
+    assert_ne!(env.status().await.etag.as_deref(), Some(DIRTY));
 }
 
 #[tokio::test]

@@ -19,12 +19,13 @@ use std::time::Duration;
 use collab_core::ids::NodeId;
 use common::fake_github::FakeGithub;
 use common::{TIMEOUT, TestServer, TestUser, spawn_server_config, start_fake_github};
-use records::{NewSource, Principal, SourceKind};
+use records::{NewSource, NodeKind, Principal, SourceKind, SourceState};
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 use server::AppState;
 use server::source_sync::abandon_uploads_into;
-use sqlx::Connection;
+use sqlx::{Connection, Row};
+use time::OffsetDateTime;
 
 const OWNER: &str = "octo-org";
 const REPO: &str = "docs";
@@ -1393,6 +1394,124 @@ async fn a_failed_connection_leaves_no_library() {
             )
             .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+}
+
+#[tokio::test]
+async fn a_failed_connection_bins_instead_of_purging_a_library_that_gained_content() {
+    let env = Env::new().await;
+    env.fake.commit("main", &files(&[("x.md", "x")]));
+    let mut conn = env.sql().await;
+    for statement in [
+        "create function pause_then_refuse_source() returns trigger language plpgsql as \
+         $$ begin perform pg_sleep(2); raise exception 'refused for the test'; end $$",
+        "create trigger pause_then_refuse_source before insert on library_sources \
+         for each row execute function pause_then_refuse_source()",
+    ] {
+        sqlx::query(statement).execute(&mut conn).await.unwrap();
+    }
+
+    let request = env.connect(
+        &env.admin,
+        json!({ "name": "Kept", "repository": "octo-org/docs" }),
+    );
+    let concurrent_create = async {
+        let library = loop {
+            let found: Option<uuid::Uuid> = sqlx::query_scalar(
+                "select id from nodes where name = 'Kept' and deleted_at is null",
+            )
+            .fetch_optional(&mut conn)
+            .await
+            .unwrap();
+            if let Some(id) = found {
+                break NodeId(id);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        let actor = env
+            .server
+            .records_db()
+            .user(env.admin.id)
+            .await
+            .unwrap()
+            .unwrap();
+        server::tree::apply(
+            &env.state,
+            &actor,
+            server::tree::TreeOp::Create {
+                parent: Some(library),
+                kind: NodeKind::Folder,
+                name: "Concurrent".into(),
+                id: NodeId(uuid::Uuid::new_v4()),
+            },
+        )
+        .await
+        .unwrap();
+        library
+    };
+    let ((status, answer), library) = tokio::join!(request, concurrent_create);
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{answer}");
+
+    let library_row = env
+        .server
+        .records_db()
+        .node(library)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        library_row.deleted,
+        "the non-empty library was not sent to the bin"
+    );
+    let row = sqlx::query("select purged_at, bin_stage from nodes where id = $1")
+        .bind(library.0)
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+    assert!(row.get::<Option<OffsetDateTime>, _>("purged_at").is_none());
+    assert_eq!(row.get::<Option<i16>, _>("bin_stage"), Some(1));
+    assert_eq!(
+        env.count(
+            "select count(*) from nodes where name = 'Concurrent' and deleted_at is not null and purged_at is null",
+        )
+        .await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn poll_only_change_preserves_a_future_rate_limit_but_token_change_resets_it() {
+    let env = Env::new().await;
+    env.fake.commit("main", &files(&[("x.md", "x")]));
+    let library = env.connected("Docs", json!({})).await;
+    env.wait_names(library, &["x.md"]).await;
+    env.wait_source(library, |s| s["state"] == "ok").await;
+    let db = env.server.records_db();
+    let (_, mut limited) = db.source_of(library).await.unwrap().unwrap();
+    let retry_at =
+        OffsetDateTime::now_utc().replace_nanosecond(0).unwrap() + time::Duration::hours(1);
+    limited.state = SourceState::RateLimited;
+    limited.retry_at = Some(retry_at);
+    limited.last_error = Some("Rate limited for the test".into());
+    db.set_source_status(library, &limited).await.unwrap();
+    let before = env.fake.count("commits");
+
+    let (status, answer) = env.patch(library, json!({ "poll_seconds": 600 })).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (_, still_limited) = db.source_of(library).await.unwrap().unwrap();
+    assert_eq!(still_limited.state, SourceState::RateLimited);
+    assert_eq!(still_limited.retry_at, Some(retry_at));
+    assert_eq!(env.fake.count("commits"), before);
+
+    let (status, answer) = env.patch(library, json!({ "token": "replacement" })).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    let (_, reset) = db.source_of(library).await.unwrap().unwrap();
+    assert_ne!(reset.retry_at, Some(retry_at));
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    while env.fake.count("commits") == before {
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 

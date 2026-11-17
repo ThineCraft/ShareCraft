@@ -6,9 +6,18 @@ import {
   relativeTime,
   sourceStateText,
   sourceSummary,
+  shouldReload,
   validRepository,
   webhookInstructions,
 } from './source-panel.js';
+
+test('shouldReload follows a changed commit or a completed update', () => {
+  assert.equal(shouldReload({ state: 'ok', last_commit: 'one' }, { state: 'ok', last_commit: 'two' }), true);
+  assert.equal(shouldReload({ state: 'connecting', last_commit: null }, { state: 'ok', last_commit: null }), true);
+  assert.equal(shouldReload({ state: 'syncing', last_commit: 'one' }, { state: 'ok', last_commit: 'one' }), true);
+  assert.equal(shouldReload({ state: 'ok', last_commit: 'one' }, { state: 'ok', last_commit: 'one' }), false);
+  assert.equal(shouldReload(null, { state: 'ok', last_commit: 'one' }), false);
+});
 
 test('sourceAccess distinguishes a missing source from connected and uncertain responses', () => {
   const connected = { repository: 'owner/repo', branch: 'main', state: 'ok' };

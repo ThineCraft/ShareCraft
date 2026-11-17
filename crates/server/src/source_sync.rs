@@ -74,7 +74,10 @@ const VERSION_ATTEMPTS: usize = 3;
 /// One item of the repository as the library shows it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
+    /// The collision-adjusted path displayed in the library.
     pub path: String,
+    /// The original path in the repository, below the configured folder.
+    pub repository_path: String,
     pub sha: String,
     pub size: u64,
     pub dir: bool,
@@ -126,20 +129,39 @@ impl Hidden {
 /// what is in it.
 #[must_use]
 pub fn plan(wanted: &[Entry], known: &[SourceItem]) -> Plan {
+    plan_with_repairs(wanted, known, &HashSet::new())
+}
+
+fn plan_with_repairs(wanted: &[Entry], known: &[SourceItem], repairs: &HashSet<NodeId>) -> Plan {
     let known_at: HashMap<&str, &SourceItem> = known
         .iter()
-        .map(|item| (item.path.as_str(), item))
+        .map(|item| (item.repository_path.as_str(), item))
         .collect();
-    let wanted_paths: HashSet<&str> = wanted.iter().map(|e| e.path.as_str()).collect();
+    let wanted_paths: HashSet<&str> = wanted.iter().map(|e| e.repository_path.as_str()).collect();
     let mut plan = Plan::default();
     let mut new = Vec::new();
     for entry in wanted {
-        match known_at.get(entry.path.as_str()) {
+        match known_at.get(entry.repository_path.as_str()) {
             None => new.push(entry),
             Some(item) => match (&item.blob_sha, entry.dir) {
-                (None, true) => {}
-                (Some(sha), false) if *sha == entry.sha => plan.unchanged += 1,
-                (Some(_), false) => plan.change.push(((*item).clone(), entry.clone())),
+                (None, true) if item.path == entry.path && !repairs.contains(&item.node) => {}
+                (Some(sha), false)
+                    if *sha == entry.sha
+                        && item.path == entry.path
+                        && !repairs.contains(&item.node) =>
+                {
+                    plan.unchanged += 1;
+                }
+                (Some(sha), false) if *sha == entry.sha => {
+                    plan.moves.push(((*item).clone(), entry.clone()));
+                }
+                (Some(_), false) if item.path == entry.path && !repairs.contains(&item.node) => {
+                    plan.change.push(((*item).clone(), entry.clone()));
+                }
+                (Some(_), false) => {
+                    plan.moves.push(((*item).clone(), entry.clone()));
+                    plan.change.push(((*item).clone(), entry.clone()));
+                }
                 // A folder that became a file, or the other way round.
                 _ => {
                     plan.remove.push((*item).clone());
@@ -150,7 +172,7 @@ pub fn plan(wanted: &[Entry], known: &[SourceItem]) -> Plan {
     }
     let vanished: Vec<&SourceItem> = known
         .iter()
-        .filter(|item| !wanted_paths.contains(item.path.as_str()))
+        .filter(|item| !wanted_paths.contains(item.repository_path.as_str()))
         .collect();
 
     let mut new_by_blob: HashMap<&str, usize> = HashMap::new();
@@ -217,6 +239,34 @@ fn join(parent: &str, name: &str) -> String {
     }
 }
 
+/// The unsuffixed collision family of `name`, when it already ends in ` (2)` or later. This
+/// lets a new literal `a (2).md` continue the existing `a.md`, `a (2).md` allocation as
+/// `a (3).md`, rather than starting a second suffix family.
+fn collision_base_name(name: &str, editor: Editor) -> Option<String> {
+    let lower = name.to_lowercase();
+    let split = match editor.native_extension() {
+        Some(ext) if lower.ends_with(ext) => name.len().checked_sub(ext.len())?,
+        _ => name.rfind('.').filter(|dot| *dot > 0).unwrap_or(name.len()),
+    };
+    let (stem, extension) = name.split_at_checked(split)?;
+    let open = stem.rfind(" (")?;
+    let number = stem.get(open + 2..stem.len().checked_sub(1)?)?;
+    if !stem.ends_with(')') || number.parse::<u32>().ok().is_none_or(|n| n < 2) {
+        return None;
+    }
+    Some(format!("{}{extension}", stem.get(..open)?))
+}
+
+fn allocated_file_name(name: &str, names: &HashSet<String>) -> String {
+    let editor = Editor::for_file_name(name);
+    let candidate = if names.contains(&name.to_lowercase()) {
+        collision_base_name(name, editor).unwrap_or_else(|| name.to_owned())
+    } else {
+        name.to_owned()
+    };
+    unique_node_name(&candidate, Some(editor), names)
+}
+
 /// Whether ShareCraft takes `name` as it is for a folder (`file` false) or a file: no empty,
 /// `.` or `..` name, no control, invisible or refused character, no name over the length
 /// limit or ending in a dot, nothing trimmed, and for a file a name its editor accepts.
@@ -239,6 +289,17 @@ fn nameable(name: &str, file: bool) -> bool {
 /// The result is in path order, each folder before what is in it.
 #[must_use]
 pub fn shown_names(entries: Vec<TreeEntry>, folder: &str) -> (Vec<Entry>, Hidden) {
+    shown_names_with_allocations(entries, folder, &[])
+}
+
+/// As [`shown_names`], preserving the displayed names already allocated to surviving repository
+/// paths. Reserved names are claimed before new literal paths, so adding `a (2).md` cannot take
+/// that displayed name away from an existing case-collision sibling.
+fn shown_names_with_allocations(
+    entries: Vec<TreeEntry>,
+    folder: &str,
+    allocated: &[SourceItem],
+) -> (Vec<Entry>, Hidden) {
     let folder = folder.trim_matches('/');
     let mut hidden = Hidden::default();
     let mut files: Vec<(String, String, u64)> = Vec::new();
@@ -271,6 +332,29 @@ pub fn shown_names(entries: Vec<TreeEntry>, folder: &str) -> (Vec<Entry>, Hidden
     }
     files.sort_by(|a, b| a.0.cmp(&b.0));
 
+    let mut wanted = HashSet::new();
+    for (path, _, _) in &files {
+        wanted.insert(path.clone());
+        let mut parent = parent_path(path);
+        while !parent.is_empty() {
+            wanted.insert(parent.to_owned());
+            parent = parent_path(parent);
+        }
+    }
+    let mut reserved: HashMap<String, HashMap<String, String>> = HashMap::new();
+    for item in allocated
+        .iter()
+        .filter(|item| wanted.contains(&item.repository_path))
+    {
+        reserved
+            .entry(parent_path(&item.repository_path).to_owned())
+            .or_default()
+            .insert(
+                item.repository_path.clone(),
+                last_name(&item.path).to_owned(),
+            );
+    }
+
     // Shown path of each folder, by its path in the repository; lower-cased names taken in
     // each shown folder.
     let mut folders: HashMap<String, String> = HashMap::new();
@@ -284,13 +368,22 @@ pub fn shown_names(entries: Vec<TreeEntry>, folder: &str) -> (Vec<Entry>, Hidden
         let mut original = String::new();
         let mut parent = String::new();
         for part in parts {
+            let original_parent = original.clone();
             original = join(&original, part);
             if let Some(known) = folders.get(&original) {
                 parent = known.clone();
                 continue;
             }
             let names = taken.entry(parent.clone()).or_default();
-            let given = unique_node_name(part, None, names);
+            if let Some(for_parent) = reserved.get(&original_parent) {
+                names.extend(for_parent.values().map(|name| name.to_lowercase()));
+            }
+            let given = reserved
+                .get(&original_parent)
+                .and_then(|for_parent| for_parent.get(&original))
+                .filter(|name| nameable(name, false))
+                .cloned()
+                .unwrap_or_else(|| unique_node_name(part, None, names));
             if given != part {
                 hidden.renamed += 1;
             }
@@ -299,6 +392,7 @@ pub fn shown_names(entries: Vec<TreeEntry>, folder: &str) -> (Vec<Entry>, Hidden
             folders.insert(original.clone(), at.clone());
             shown.push(Entry {
                 path: at.clone(),
+                repository_path: original.clone(),
                 sha: String::new(),
                 size: 0,
                 dir: true,
@@ -306,13 +400,23 @@ pub fn shown_names(entries: Vec<TreeEntry>, folder: &str) -> (Vec<Entry>, Hidden
             parent = at;
         }
         let names = taken.entry(parent.clone()).or_default();
-        let given = unique_node_name(name, Some(Editor::for_file_name(name)), names);
+        let original_parent = parent_path(&path);
+        if let Some(for_parent) = reserved.get(original_parent) {
+            names.extend(for_parent.values().map(|name| name.to_lowercase()));
+        }
+        let given = reserved
+            .get(original_parent)
+            .and_then(|for_parent| for_parent.get(&path))
+            .filter(|allocated| nameable(allocated, true))
+            .cloned()
+            .unwrap_or_else(|| allocated_file_name(name, names));
         if given != name {
             hidden.renamed += 1;
         }
         names.insert(given.to_lowercase());
         shown.push(Entry {
             path: join(&parent, &given),
+            repository_path: path,
             sha,
             size,
             dir: false,
@@ -1114,7 +1218,8 @@ async fn run(
             true
         })
         .collect();
-    let (shown, mut hidden) = shown_names(tree, folder);
+    let recorded = db.source_items(library).await.map_err(db_failed)?;
+    let (shown, mut hidden) = shown_names_with_allocations(tree, folder, &recorded);
     hidden.policy = refused.policy;
     hidden.too_big = refused.too_big;
 
@@ -1137,21 +1242,49 @@ async fn run(
         .into());
     }
 
-    // Every recorded item whose node is gone (deleted outside the sync) is planned as if it
-    // were not there, so it is made again. Nothing is written yet: the rows of the lost items
-    // are dropped only when applying starts.
-    let recorded = db.source_items(library).await.map_err(db_failed)?;
-    let live: HashSet<NodeId> = db
-        .live_source_nodes(library)
+    // A tracked node is usable only when it is live at the displayed parent and name recorded
+    // for it. A live file elsewhere is kept as a repair candidate so the planner moves the same
+    // node back; a missing/deleted node (and a misplaced folder) is planned as lost.
+    let locations: HashMap<NodeId, _> = db
+        .source_item_locations(library)
         .await
         .map_err(db_failed)?
         .into_iter()
+        .map(|location| (location.node, location))
         .collect();
-    let (known, lost): (Vec<SourceItem>, Vec<SourceItem>) = recorded
-        .into_iter()
-        .partition(|item| live.contains(&item.node));
-    let lost: Vec<NodeId> = lost.into_iter().map(|item| item.node).collect();
-    let plan = plan(&shown, &known);
+    let mut ordered = recorded;
+    ordered.sort_by_key(|item| item.path.matches('/').count());
+    let mut known = Vec::new();
+    let mut lost = Vec::new();
+    let mut repairs = HashSet::new();
+    let mut valid_folders: HashMap<String, NodeId> = HashMap::new();
+    for item in ordered {
+        let expected_parent = if parent_path(&item.path).is_empty() {
+            Some(library)
+        } else {
+            valid_folders.get(parent_path(&item.path)).copied()
+        };
+        let location = locations.get(&item.node);
+        let live = location.is_some_and(|at| !at.deleted && at.name.is_some());
+        let correct = live
+            && expected_parent.is_some_and(|parent| {
+                location.is_some_and(|at| {
+                    at.parent == Some(parent) && at.name.as_deref() == Some(last_name(&item.path))
+                })
+            });
+        if correct {
+            if item.blob_sha.is_none() {
+                valid_folders.insert(item.path.clone(), item.node);
+            }
+            known.push(item);
+        } else if live && item.blob_sha.is_some() {
+            repairs.insert(item.node);
+            known.push(item);
+        } else {
+            lost.push(item.node);
+        }
+    }
+    let plan = plan_with_repairs(&shown, &known, &repairs);
 
     let mut needed: HashMap<String, u64> = HashMap::new();
     for entry in plan
@@ -1704,16 +1837,14 @@ impl Applying<'_> {
     /// Records `node` as holding `entry`, replacing any item it held before.
     async fn record(&self, node: NodeId, entry: &Entry) -> Result<(), SyncError> {
         let db = self.state.db();
-        db.remove_source_items(self.library, &[node])
-            .await
-            .map_err(db_failed)?;
         let item = SourceItem {
             node,
             path: entry.path.clone(),
+            repository_path: entry.repository_path.clone(),
             blob_sha: (!entry.dir).then(|| entry.sha.clone()),
             size: i64::try_from(entry.size).unwrap_or(i64::MAX),
         };
-        db.upsert_source_items(self.library, std::slice::from_ref(&item))
+        db.replace_source_item(self.library, &item)
             .await
             .map_err(db_failed)
     }
@@ -2023,6 +2154,7 @@ mod tests {
     fn file(path: &str, sha: &str) -> Entry {
         Entry {
             path: path.to_owned(),
+            repository_path: path.to_owned(),
             sha: sha.to_owned(),
             size: 1,
             dir: false,
@@ -2033,6 +2165,7 @@ mod tests {
         SourceItem {
             node: NodeId(Uuid::new_v4()),
             path: path.to_owned(),
+            repository_path: path.to_owned(),
             blob_sha: Some(sha.to_owned()),
             size: 1,
         }
@@ -2160,11 +2293,13 @@ mod tests {
         let folder = SourceItem {
             node: NodeId(Uuid::new_v4()),
             path: "docs".to_owned(),
+            repository_path: "docs".to_owned(),
             blob_sha: None,
             size: 0,
         };
         let wanted = [Entry {
             path: "docs".to_owned(),
+            repository_path: "docs".to_owned(),
             sha: String::new(),
             size: 0,
             dir: true,

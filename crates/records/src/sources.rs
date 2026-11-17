@@ -216,11 +216,22 @@ pub struct SourceChange {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SourceItem {
     pub node: NodeId,
-    /// The path in the repository, below the mirrored folder.
+    /// The collision-adjusted path displayed in the library.
     pub path: String,
+    /// The original path in the repository, below the mirrored folder. This is its identity.
+    pub repository_path: String,
     /// The Git blob of a file; `None` for a folder.
     pub blob_sha: Option<String>,
     pub size: i64,
+}
+
+/// Where a tracked source item's node actually is. A missing node has no name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceItemLocation {
+    pub node: NodeId,
+    pub parent: Option<NodeId>,
+    pub name: Option<String>,
+    pub deleted: bool,
 }
 
 /// The turn to sync one library (see [`Db::try_lock_source`]); dropping it gives the turn up.
@@ -592,6 +603,35 @@ impl Db {
         Ok(())
     }
 
+    /// Makes a source due unless it is under an active rate limit. Poll cadence and webhook
+    /// secret changes use this: neither changes what GitHub request is authorized or addressed,
+    /// so waking before `retry_at` would only repeat a request GitHub has already refused.
+    pub async fn requeue_source_preserving_rate_limit(
+        &self,
+        library: NodeId,
+        etag: Option<&str>,
+        now: OffsetDateTime,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "update library_sources set \
+                 state = case when state = 'rate_limited' and retry_at > $3 \
+                              then state else 'connecting' end, \
+                 last_checked_at = case when state = 'rate_limited' and retry_at > $3 \
+                                        then last_checked_at else null end, \
+                 retry_at = case when state = 'rate_limited' and retry_at > $3 \
+                                 then retry_at else null end, \
+                 last_error = case when state = 'rate_limited' and retry_at > $3 \
+                                    then last_error else null end, \
+                 etag = coalesce($2, etag) where library_id = $1",
+        )
+        .bind(library.0)
+        .bind(etag)
+        .bind(now)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
     /// Records a rate limit independently of a sync generation: the retry time can only move
     /// later, and `etag`, when given, marks a possibly half-applied sync. This is used when an
     /// owner changed or requeued the connection while the rate-limited request was in flight.
@@ -691,8 +731,8 @@ impl Db {
     /// The items of `library`, by path.
     pub async fn source_items(&self, library: NodeId) -> Result<Vec<SourceItem>, DbError> {
         let rows = sqlx::query(
-            "select node_id, path, blob_sha, size from source_items \
-             where library_id = $1 order by path",
+            "select node_id, path, repository_path, blob_sha, size from source_items \
+             where library_id = $1 order by repository_path",
         )
         .bind(library.0)
         .fetch_all(self.pool())
@@ -702,8 +742,36 @@ impl Db {
                 Ok(SourceItem {
                     node: NodeId(row.try_get("node_id")?),
                     path: row.try_get("path")?,
+                    repository_path: row.try_get("repository_path")?,
                     blob_sha: row.try_get("blob_sha")?,
                     size: row.try_get("size")?,
+                })
+            })
+            .collect::<Result<_, sqlx::Error>>()
+            .map_err(DbError::from)
+    }
+
+    /// The actual parent, name and liveness of every tracked node, in one read.
+    pub async fn source_item_locations(
+        &self,
+        library: NodeId,
+    ) -> Result<Vec<SourceItemLocation>, DbError> {
+        let rows = sqlx::query(
+            "select i.node_id, n.parent_id, n.name, \
+                    coalesce(n.deleted_at is not null, true) as deleted \
+             from source_items i left join nodes n on n.id = i.node_id \
+             where i.library_id = $1",
+        )
+        .bind(library.0)
+        .fetch_all(self.pool())
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(SourceItemLocation {
+                    node: NodeId(row.try_get("node_id")?),
+                    parent: row.try_get::<Option<Uuid>, _>("parent_id")?.map(NodeId),
+                    name: row.try_get("name")?,
+                    deleted: row.try_get("deleted")?,
                 })
             })
             .collect::<Result<_, sqlx::Error>>()
@@ -733,19 +801,59 @@ impl Db {
         let mut tx = self.pool().begin().await?;
         for item in items {
             sqlx::query(
-                "insert into source_items (library_id, path, node_id, blob_sha, size) \
-                 values ($1, $2, $3, $4, $5) \
-                 on conflict (library_id, path) do update set node_id = excluded.node_id, \
+                "insert into source_items \
+                     (library_id, path, repository_path, node_id, blob_sha, size) \
+                 values ($1, $2, $3, $4, $5, $6) \
+                 on conflict (library_id, repository_path) do update set \
+                     path = excluded.path, node_id = excluded.node_id, \
                      blob_sha = excluded.blob_sha, size = excluded.size",
             )
             .bind(library.0)
             .bind(&item.path)
+            .bind(&item.repository_path)
             .bind(item.node.0)
             .bind(&item.blob_sha)
             .bind(item.size)
             .execute(&mut *tx)
             .await?;
         }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Atomically makes `item` the sole tracking row held by its node. Repository path is the
+    /// identity; displayed path is only a collision-adjusted location.
+    pub async fn replace_source_item(
+        &self,
+        library: NodeId,
+        item: &SourceItem,
+    ) -> Result<(), DbError> {
+        let mut tx = self.pool().begin().await?;
+        sqlx::query(
+            "delete from source_items where library_id = $1 and node_id = $2 \
+             and repository_path <> $3",
+        )
+        .bind(library.0)
+        .bind(item.node.0)
+        .bind(&item.repository_path)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "insert into source_items \
+                 (library_id, path, repository_path, node_id, blob_sha, size) \
+             values ($1, $2, $3, $4, $5, $6) \
+             on conflict (library_id, repository_path) do update set \
+                 path = excluded.path, node_id = excluded.node_id, \
+                 blob_sha = excluded.blob_sha, size = excluded.size",
+        )
+        .bind(library.0)
+        .bind(&item.path)
+        .bind(&item.repository_path)
+        .bind(item.node.0)
+        .bind(&item.blob_sha)
+        .bind(item.size)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(())
     }

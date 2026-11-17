@@ -291,12 +291,14 @@ async fn items_round_trip_and_path_is_unique() {
             SourceItem {
                 node: folder,
                 path: "docs".into(),
+                repository_path: "docs".into(),
                 blob_sha: None,
                 size: 0,
             },
             SourceItem {
                 node: file.into(),
                 path: "docs/a.txt".into(),
+                repository_path: "docs/a.txt".into(),
                 blob_sha: Some("sha1".into()),
                 size: 5,
             },
@@ -318,6 +320,7 @@ async fn items_round_trip_and_path_is_unique() {
         &[SourceItem {
             node: file.into(),
             path: "docs/a.txt".into(),
+            repository_path: "docs/a.txt".into(),
             blob_sha: Some("sha2".into()),
             size: 9,
         }],
@@ -336,6 +339,7 @@ async fn items_round_trip_and_path_is_unique() {
             &[SourceItem {
                 node: file.into(),
                 path: "docs/elsewhere.txt".into(),
+                repository_path: "docs/elsewhere.txt".into(),
                 blob_sha: Some("sha3".into()),
                 size: 1,
             }],
@@ -350,6 +354,7 @@ async fn items_round_trip_and_path_is_unique() {
         &[SourceItem {
             node: other.into(),
             path: "docs/b.txt".into(),
+            repository_path: "docs/b.txt".into(),
             blob_sha: Some("sha4".into()),
             size: 2,
         }],
@@ -594,6 +599,7 @@ async fn disconnect_returns_the_secret_ids_and_removes_the_rows_but_not_the_node
         &[SourceItem {
             node: doc.into(),
             path: "a.txt".into(),
+            repository_path: "a.txt".into(),
             blob_sha: Some("sha".into()),
             size: 1,
         }],
@@ -862,4 +868,100 @@ async fn a_rate_limit_survives_a_generation_change_and_is_never_shortened() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn populated_schema_migrates_stepwise_through_sources_generation_and_original_paths() {
+    let test = TestDb::create_at(Some(16)).await;
+    let ann = user(&test, "MigrationAnn", true).await;
+    let site = site(&test, "Migration Site", Some(ann.id)).await;
+    let library = put(
+        &test,
+        new_id(),
+        NodeKind::Library,
+        Some(site),
+        site,
+        "Migration Library",
+    )
+    .await;
+    test.db.migrate_to(17).await.unwrap();
+    let token = test
+        .db
+        .put_secret(&sealed(b"migration cipher"))
+        .await
+        .unwrap();
+    let mut source = NewSource {
+        library,
+        kind: SourceKind::Github,
+        owner: "migration-owner".into(),
+        repo: "migration-repo".into(),
+        branch: "main".into(),
+        folder: String::new(),
+        token: Some(token),
+        poll_seconds: 300,
+        connected_by: ann.id,
+    };
+    test.db.connect_source(&source).await.unwrap();
+    let document = document_in(&test, ann.id, library, site, "A.md").await;
+    sqlx::query(
+        "insert into source_items (library_id, path, node_id, blob_sha, size) \
+         values ($1, 'A.md', $2, 'blob-one', 7)",
+    )
+    .bind(library.0)
+    .bind(NodeId::from(document).0)
+    .execute(test.db.test_pool())
+    .await
+    .unwrap();
+
+    test.db.migrate_to(18).await.unwrap();
+    let generation: i64 =
+        sqlx::query_scalar("select generation from library_sources where library_id = $1")
+            .bind(library.0)
+            .fetch_one(test.db.test_pool())
+            .await
+            .unwrap();
+    assert_eq!(generation, 0);
+
+    test.db.migrate_to(19).await.unwrap();
+    let row = sqlx::query(
+        "select path, repository_path, blob_sha, size from source_items where library_id = $1",
+    )
+    .bind(library.0)
+    .fetch_one(test.db.test_pool())
+    .await
+    .unwrap();
+    assert_eq!(row.get::<String, _>("path"), "A.md");
+    assert_eq!(row.get::<String, _>("repository_path"), "A.md");
+    assert_eq!(
+        row.get::<Option<String>, _>("blob_sha").as_deref(),
+        Some("blob-one")
+    );
+    assert_eq!(row.get::<i64, _>("size"), 7);
+    assert_eq!(
+        test.db.get_secret(token).await.unwrap(),
+        Some(sealed(b"migration cipher"))
+    );
+
+    source.poll_seconds = 600;
+    test.db
+        .change_source(
+            library,
+            &SourceChange {
+                poll_seconds: Some(source.poll_seconds),
+                ..SourceChange::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        test.db
+            .source_of(library)
+            .await
+            .unwrap()
+            .unwrap()
+            .0
+            .poll_seconds,
+        600
+    );
+    assert_eq!(test.db.source_items(library).await.unwrap().len(), 1);
 }

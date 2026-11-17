@@ -136,10 +136,10 @@ impl SecretBox {
             Err(_) => match write_new(&path, &key) {
                 Ok(()) => Ok(true),
                 Err(e) if e.kind() == ErrorKind::AlreadyExists => Ok(false),
-                Err(e) => {
-                    let _ = std::fs::remove_file(&path);
-                    Err(e)
-                }
+                // `write_new` removes only the file it successfully created when its own write
+                // fails. A second removal here would be unowned: another process could install
+                // the key between that cleanup and this arm, and we must never delete its key.
+                Err(e) => Err(e),
             },
         };
         let _ = std::fs::remove_file(&tmp);

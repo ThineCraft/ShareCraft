@@ -795,6 +795,16 @@ impl Db {
         Ok(row.as_ref().map(node_from_row).transpose()?)
     }
 
+    /// Whether `id` has ever had a direct child, including one now in the recycle bin.
+    pub async fn has_any_children(&self, id: NodeId) -> Result<bool, DbError> {
+        Ok(
+            sqlx::query_scalar("select exists (select 1 from nodes where parent_id = $1)")
+                .bind(id.0)
+                .fetch_one(self.pool())
+                .await?,
+        )
+    }
+
     /// Whether `node` is `ancestor` or lies anywhere below it. False if `node` does not exist.
     /// The walk ends even if the data held a cycle.
     pub async fn is_at_or_below(&self, node: NodeId, ancestor: NodeId) -> Result<bool, DbError> {

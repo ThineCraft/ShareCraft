@@ -59,7 +59,7 @@ import { fileIcon, fileKind, nextSort, parseSort, relativeTime, sortDescription,
 import { addShortcut, isMacPlatform } from './shortcuts.js';
 import { extendSelection, moveIndex, selectionText, toggleSelection } from './selection.js';
 import { settleAll, softly } from './skeleton.js';
-import { sourceAccess, sourceControlsEnabled, sourceStateText, sourceSummary } from './source-panel.js';
+import { shouldReload, sourceAccess, sourceControlsEnabled, sourceStateText, sourceSummary } from './source-panel.js';
 
 const BULK_MAX = 500;
 const GRID_PAGE = 200; // the grid's page, the most the server answers at once
@@ -285,13 +285,16 @@ async function refreshSource() {
   $('source-sync').disabled = true;
   const result = await api('GET', `/libraries/${seg(libraryStep.id)}/source`);
   const controlsWereEnabled = sourceControls();
+  const previous = source;
   sourceAccessState = sourceAccess(result);
   source = sourceAccessState === 'connected' ? result.data : null;
   if (sourceAccessState === 'unknown') showMessage(error, messageFor(result.error));
   else showMessage(error, '');
   showPlace();
   renderSource();
-  if (controlsWereEnabled !== sourceControls()) render();
+  if (sourceAccessState === 'connected' && shouldReload(previous, source)) {
+    await reload({ preserve: true });
+  } else if (controlsWereEnabled !== sourceControls()) render();
   if (sourceAccessState === 'none') {
     await setupTemplates();
     setupNewMenu();
@@ -314,9 +317,25 @@ async function updateSourceNow() {
 
 // ---- the listing ----
 
-async function reload() {
+async function reload({ preserve = false } = {}) {
+  const keptSelection = preserve ? new Set(selected) : new Set();
+  const active = preserve ? document.activeElement : null;
+  const focusedId = active?.closest?.('[data-id]')?.dataset.id ?? null;
+  const focusedAction = active?.matches?.('button.menu-button') ?? false;
   clearList();
+  for (const id of keptSelection) selected.add(id);
   await loadPage();
+  if (preserve) {
+    const visible = new Set(items.map((item) => item.id));
+    for (const id of selected) if (!visible.has(id)) selected.delete(id);
+    showSelection();
+    if (focusedId) {
+      const row = [...document.querySelectorAll('#items [data-id], #file-rows [data-id]')].find(
+        (element) => element.dataset.id === focusedId,
+      );
+      (focusedAction ? row?.querySelector('button.menu-button') : row)?.focus();
+    }
+  }
   tree?.refresh();
 }
 

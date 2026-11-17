@@ -436,12 +436,31 @@ pub(crate) async fn connect(
         .into_response())
 }
 
-/// Removes `library`, made a moment ago by `actor` for a connection that then failed, for good:
-/// to the recycle bin, its second stage, and purged, so it is in neither the site nor the bin.
-/// A failure is logged.
+/// Removes `library`, made a moment ago by `actor` for a connection that then failed. It is
+/// deleted first, closing the create race. Only a library that still has no children is then
+/// purged; if concurrent user content reached it, the library and that content stay recoverable
+/// in the recycle bin. A failure is logged.
 async fn purge_new_library(state: &AppState, actor: &User, library: NodeId) {
+    if let Err(e) = tree::apply(state, actor, TreeOp::Delete { id: library }).await {
+        eprintln!(
+            "sharecraft-server: library {} could not be removed after its connection failed: {e}",
+            library.0
+        );
+        return;
+    }
+    match state.db().has_any_children(library).await {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(e) => {
+            eprintln!(
+                "sharecraft-server: library {} stayed in the recycle bin after its connection \
+                 failed because its contents could not be checked: {e}",
+                library.0
+            );
+            return;
+        }
+    }
     for op in [
-        TreeOp::Delete { id: library },
         TreeOp::ToSecondStage { id: library },
         TreeOp::Purge { id: library },
     ] {
@@ -598,11 +617,23 @@ pub(crate) async fn change(
             // The change moved the generation on, so a sync under way records nothing of its
             // result: the connection is due again (also one that had stopped, `not_connected`,
             // or waits to retry) and a sync is woken.
-            state
-                .db()
-                .requeue_source(library, None)
-                .await
-                .map_err(|e| ApiError::unavailable(&e))?;
+            // A new token, branch or folder changes the request and may reset a rate limit.
+            // Poll-only changes do not, so an active GitHub retry time must remain authoritative.
+            let resets_rate_limit =
+                change.token.is_some() || change.branch.is_some() || change.folder.is_some();
+            if resets_rate_limit {
+                state.db().requeue_source(library, None).await
+            } else {
+                state
+                    .db()
+                    .requeue_source_preserving_rate_limit(
+                        library,
+                        None,
+                        time::OffsetDateTime::now_utc(),
+                    )
+                    .await
+            }
+            .map_err(|e| ApiError::unavailable(&e))?;
             emit(
                 &state,
                 "source.changed",
@@ -718,7 +749,11 @@ pub(crate) async fn webhook(
             // result), so the connection is synced again.
             state
                 .db()
-                .requeue_source(library, None)
+                .requeue_source_preserving_rate_limit(
+                    library,
+                    None,
+                    time::OffsetDateTime::now_utc(),
+                )
                 .await
                 .map_err(|e| ApiError::unavailable(&e))?;
             emit(

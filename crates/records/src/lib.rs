@@ -82,8 +82,8 @@ pub use sites::{
 pub use sources::{
     DEFAULT_SOURCE_MAX_BYTES, DEFAULT_SOURCE_MAX_FILES, MAX_POLL_SECONDS, MAX_SOURCE_ERROR_CHARS,
     MIN_POLL_SECONDS, NewSource, SOURCE_MAX_BYTES, SOURCE_MAX_FILES, SealedRow, SecretId,
-    SourceChange, SourceConfig, SourceItem, SourceKind, SourceLock, SourceState, SourceStatus,
-    SourceSyncTransition, StatusUpdate,
+    SourceChange, SourceConfig, SourceItem, SourceItemLocation, SourceKind, SourceLock,
+    SourceState, SourceStatus, SourceSyncTransition, StatusUpdate,
 };
 pub use templates::{
     MAX_PACKAGE_BYTES, MAX_TEMPLATE_DEPTH, MAX_TEMPLATE_FOLDERS, MAX_TEMPLATE_LIBRARIES,

@@ -18,6 +18,13 @@ export function sourceControlsEnabled(access) {
   return access === 'none';
 }
 
+/** Whether a refreshed source status means the visible folder may have changed. */
+export function shouldReload(previous, next) {
+  if (previous === null || typeof previous !== 'object' || next === null || typeof next !== 'object') return false;
+  if ((previous.last_commit ?? null) !== (next.last_commit ?? null)) return true;
+  return ['connecting', 'syncing'].includes(previous.state) && next.state === 'ok';
+}
+
 /** The short, visible label for a source state. */
 export function sourceStateText(state) {
   return {
