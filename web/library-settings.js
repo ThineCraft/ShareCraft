@@ -178,9 +178,10 @@ $('source-settings').addEventListener('submit', async (event) => {
   if (branch !== source.branch) change.branch = branch;
   if (folder !== (source.folder ?? '')) change.folder = folder;
   if (pollSeconds !== source.poll_seconds) change.poll_seconds = pollSeconds;
-  const token = $('source-token').value;
-  if (token !== '') change.token = token;
-  $('source-token').value = '';
+  const tokenField = $('source-token');
+  const replacingToken = tokenField.value !== '';
+  if (replacingToken) change.token = tokenField.value;
+  tokenField.value = '';
   if (Object.keys(change).length === 0) {
     showSource();
     showMessage($('source-saved'), 'Nothing has changed.');
@@ -188,7 +189,10 @@ $('source-settings').addEventListener('submit', async (event) => {
   }
   const result = await api('PATCH', `/libraries/${seg(libraryId)}/source`, change);
   if (!result.ok) {
-    showMessage($('source-error'), sourceError(result.error));
+    showMessage(
+      $('source-error'),
+      `${sourceError(result.error)}${replacingToken ? ' Retype the replacement token before trying again.' : ''}`,
+    );
     return;
   }
   source = result.data;
@@ -218,11 +222,19 @@ $('source-token-remove').addEventListener('click', async () => {
   showMessage($('source-saved'), 'Token removed. An update has started.');
 });
 
+function hideWebhookSecret() {
+  $('webhook-steps').replaceChildren();
+  $('webhook-once').textContent = '';
+  $('webhook-reveal').hidden = true;
+}
+
+$('webhook-dismiss').addEventListener('click', hideWebhookSecret);
+addEventListener('pagehide', hideWebhookSecret);
+
 $('webhook-create').addEventListener('click', async () => {
   if (source === null) return;
   showMessage($('webhook-error'), '');
-  $('webhook-reveal').hidden = true;
-  $('webhook-steps').replaceChildren();
+  hideWebhookSecret();
   const result = await api('POST', `/libraries/${seg(libraryId)}/source/webhook`);
   if (!result.ok) return showMessage($('webhook-error'), messageFor(result.error));
   const lines = webhookInstructions(result.data, result.data.secret);
@@ -246,9 +258,7 @@ $('source-disconnect').addEventListener('click', async () => {
   const result = await api('DELETE', `/libraries/${seg(libraryId)}/source`);
   if (!result.ok) return showMessage($('disconnect-error'), messageFor(result.error));
   source = null;
-  $('webhook-steps').replaceChildren();
-  $('webhook-once').textContent = '';
-  $('webhook-reveal').hidden = true;
+  hideWebhookSecret();
   showSource();
   showMessage($('saved'), 'Disconnected from GitHub. The files stay in this library.');
 });

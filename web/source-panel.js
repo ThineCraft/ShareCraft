@@ -3,6 +3,21 @@
 const READ_ONLY = 'This library cannot be changed here.';
 const LAST_UPDATE = `Files shown are from the last update. ${READ_ONLY}`;
 
+/** Classifies the source lookup without treating a failed lookup as proof there is no source. */
+export function sourceAccess(result) {
+  if (!result?.ok) return result?.status === 404 ? 'none' : 'unknown';
+  const source = result.data;
+  return source !== null && typeof source === 'object' && typeof source.repository === 'string' &&
+      typeof source.branch === 'string' && typeof source.state === 'string'
+    ? 'connected'
+    : 'unknown';
+}
+
+/** Source-managed libraries and uncertain source lookups are both read-only. */
+export function sourceControlsEnabled(access) {
+  return access === 'none';
+}
+
 /** The short, visible label for a source state. */
 export function sourceStateText(state) {
   return {

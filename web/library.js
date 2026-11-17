@@ -59,7 +59,7 @@ import { fileIcon, fileKind, nextSort, parseSort, relativeTime, sortDescription,
 import { addShortcut, isMacPlatform } from './shortcuts.js';
 import { extendSelection, moveIndex, selectionText, toggleSelection } from './selection.js';
 import { settleAll, softly } from './skeleton.js';
-import { sourceStateText, sourceSummary } from './source-panel.js';
+import { sourceAccess, sourceControlsEnabled, sourceStateText, sourceSummary } from './source-panel.js';
 
 const BULK_MAX = 500;
 const GRID_PAGE = 200; // the grid's page, the most the server answers at once
@@ -90,11 +90,16 @@ const libraryStep = here.path.find((step) => step.kind === 'library');
 const libraryInfo = libraryStep ? await api('GET', `/libraries/${seg(libraryStep.id)}`) : null;
 const library = libraryInfo?.ok ? libraryInfo.data : null;
 let source = null;
+let sourceAccessState = 'unknown';
 if (libraryStep) {
   const sourceAnswer = await api('GET', `/libraries/${seg(libraryStep.id)}/source`);
-  if (sourceAnswer.ok) source = sourceAnswer.data;
-  else if (sourceAnswer.status !== 404) showMessage(error, messageFor(sourceAnswer.error));
+  sourceAccessState = sourceAccess(sourceAnswer);
+  if (sourceAccessState === 'connected') source = sourceAnswer.data;
+  else if (sourceAccessState === 'unknown') showMessage(error, messageFor(sourceAnswer.error));
+} else {
+  sourceAccessState = 'none';
 }
+const sourceControls = () => sourceControlsEnabled(sourceAccessState);
 if (library?.description) {
   $('library-description').textContent = library.description;
   $('library-description').hidden = false;
@@ -157,9 +162,9 @@ const UNDO_KEYS = `${KEY_MOD.text}+Z`;
 const moveDialog = $('move-dialog');
 const renameDialog = $('rename-dialog');
 const movingIds = () => moving.map((item) => item.id);
-const mayRename = (item) => source === null && itemActions(item).rename;
-const mayMove = (item) => source === null && itemActions(item).move;
-const mayRemove = (item) => source === null && itemActions(item).remove;
+const mayRename = (item) => sourceControls() && itemActions(item).rename;
+const mayMove = (item) => sourceControls() && itemActions(item).move;
+const mayRemove = (item) => sourceControls() && itemActions(item).remove;
 
 // The details pane beside the table (a sheet on narrow screens): preview, facts and access of
 // the selected row, with the row actions. Only for the list; the grid of an image library has none.
@@ -178,11 +183,14 @@ const details = createDetails({
   },
   me,
   enabled: () => view === 'list',
-  readOnly: () => source !== null,
+  readOnly: () => !sourceControls(),
 });
 
 renderSource();
-$('source-sync').addEventListener('click', updateSourceNow);
+$('source-sync').addEventListener('click', () => {
+  if (sourceAccessState === 'unknown') refreshSource();
+  else updateSourceNow();
+});
 
 // The uploads, in the tray at the bottom-right: they run whichever folder is on screen.
 const uploads = createUploads({
@@ -242,8 +250,21 @@ function showAccepts() {
 
 function renderSource() {
   const banner = $('source-banner');
-  banner.hidden = source === null;
-  if (source === null) {
+  clearTimeout(sourceTimer);
+  sourceTimer = null;
+  banner.hidden = sourceAccessState === 'none';
+  if (sourceAccessState === 'none') {
+    showAccepts();
+    return;
+  }
+  if (sourceAccessState === 'unknown') {
+    banner.dataset.tone = 'attention';
+    $('source-state').textContent = 'Read only';
+    $('source-headline').textContent = 'Could not check whether this library is connected to GitHub.';
+    $('source-detail').textContent = 'This library stays read-only until its source status is known.';
+    $('source-sync').textContent = 'Retry';
+    $('source-sync').hidden = false;
+    $('source-sync').disabled = false;
     showAccepts();
     return;
   }
@@ -252,26 +273,33 @@ function renderSource() {
   $('source-state').textContent = sourceStateText(source.state);
   $('source-headline').textContent = summary.headline;
   $('source-detail').textContent = summary.detail;
+  $('source-sync').textContent = 'Update now';
   $('source-sync').hidden = !can(here.access, 'manage_site');
   $('source-sync').disabled = ['connecting', 'syncing'].includes(source.state);
   showAccepts();
-  clearTimeout(sourceTimer);
   sourceTimer = ['connecting', 'syncing'].includes(source.state) ? setTimeout(refreshSource, 10_000) : null;
 }
 
 async function refreshSource() {
-  if (!libraryStep || source === null) return;
+  if (!libraryStep) return;
+  $('source-sync').disabled = true;
   const result = await api('GET', `/libraries/${seg(libraryStep.id)}/source`);
-  if (result.ok) source = result.data;
-  else if (result.status === 404) {
-    source = null;
-    showPlace();
-  }
+  const controlsWereEnabled = sourceControls();
+  sourceAccessState = sourceAccess(result);
+  source = sourceAccessState === 'connected' ? result.data : null;
+  if (sourceAccessState === 'unknown') showMessage(error, messageFor(result.error));
+  else showMessage(error, '');
+  showPlace();
   renderSource();
+  if (controlsWereEnabled !== sourceControls()) render();
+  if (sourceAccessState === 'none') {
+    await setupTemplates();
+    setupNewMenu();
+  }
 }
 
 async function updateSourceNow() {
-  if (!libraryStep || source === null) return;
+  if (!libraryStep || sourceAccessState !== 'connected') return;
   $('source-sync').disabled = true;
   showMessage(error, '');
   const result = await api('POST', `/libraries/${seg(libraryStep.id)}/source/sync`);
@@ -522,7 +550,7 @@ function showSelection() {
   $('select-note').hidden = !next;
   $('select-note').textContent = `Select all covers the ${choosable.length} items loaded so far. Use Show more to load the rest.`;
   const allowed = selectedItems().map(itemActions);
-  for (const id of ['bulk-move', 'bulk-cut', 'bulk-delete']) $(id).hidden = source !== null;
+  for (const id of ['bulk-move', 'bulk-cut', 'bulk-copy', 'bulk-delete']) $(id).hidden = !sourceControls();
   $('bulk-move').disabled = state.count === 0 || !allowed.every((a) => a.move);
   $('bulk-cut').disabled = $('bulk-move').disabled;
   $('bulk-copy').disabled = state.count === 0;
@@ -629,7 +657,10 @@ function sharingMarks(item) {
 
 /** A row's Actions menu ("⋯"): Details, then Rename, Move…, Copy…, Delete and Access, as far as allowed. */
 function actionsMenu(item) {
-  const entries = ['details', ...rowMenu(item).filter((entry) => source === null || !['rename', 'move', 'delete'].includes(entry))];
+  const entries = [
+    'details',
+    ...rowMenu(item).filter((entry) => sourceControls() || !['rename', 'move', 'copy', 'delete'].includes(entry)),
+  ];
   const button = h(
     'button',
     { type: 'button', class: 'plain menu-button dots', 'aria-label': `Actions for ${item.name}`, 'data-for': item.id },
@@ -887,7 +918,7 @@ function showPlace() {
   showEntry('explorer-link', can(here.access, 'manage_access'));
   $('explorer-link').href = `/explorer.html?root=${seg(nodeId)}`;
   $('access-link').href = `/access.html?id=${seg(nodeId)}`;
-  canAdd = can(here.access, 'add') && source === null;
+  canAdd = can(here.access, 'add') && sourceControls();
   showAccepts();
   $('drop-target').textContent = self.name;
   $('new-wrap').hidden = !canAdd;
@@ -1324,7 +1355,7 @@ function saveCut() {
 
 /** Whether the cut items may be pasted here, as `canDrop` answers. */
 function pasteVerdict() {
-  if (source !== null) return { ok: false, reason: 'This library cannot be changed here.' };
+  if (!sourceControls()) return { ok: false, reason: 'This library cannot be changed here.' };
   const place = { id: nodeId, name: self.name, kind: self.kind, access: here.access };
   return canDrop(cut.items, place, here.path.map((step) => step.id), { from: cut.from });
 }
@@ -1347,7 +1378,7 @@ function cutItems(list) {
 
 /** The bar that says what is cut, with Paste here and Cancel; the cut rows are dimmed. */
 function showCut() {
-  $('cut-bar').hidden = !cut || source !== null;
+  $('cut-bar').hidden = !cut || !sourceControls();
   const ids = new Set(cut && cut.from === nodeId ? cut.items.map((item) => item.id) : []);
   for (const tr of $('file-rows').querySelectorAll('tr[data-id]')) tr.classList.toggle('cut', ids.has(tr.dataset.id));
   if (!cut) return;
@@ -1405,16 +1436,16 @@ addShortcut({
   keys: ['Mod+X'],
   label: 'Cut the selected items, to move them',
   scope: 'library',
-  shown: () => source === null,
-  when: (event) => source === null && clipboardKey(event) === 'cut' && cutList().length > 0,
+  shown: () => sourceControls(),
+  when: (event) => sourceControls() && clipboardKey(event) === 'cut' && cutList().length > 0,
   run: () => cutItems(cutList()),
 });
 addShortcut({
   keys: ['Mod+V'],
   label: 'Paste the cut items into this folder',
   scope: 'library',
-  shown: () => source === null,
-  when: (event) => source === null && clipboardKey(event) === 'paste' && Boolean(cut),
+  shown: () => sourceControls(),
+  when: (event) => sourceControls() && clipboardKey(event) === 'paste' && Boolean(cut),
   run: () => pasteCut(),
 });
 addShortcut({
@@ -1584,8 +1615,8 @@ addShortcut({
   keys: ['F2'],
   label: 'Rename the current row',
   scope: 'library',
-  shown: () => source === null && listShown(),
-  when: (event) => source === null && listShown() && inFiles(event) && Boolean(currentItem()),
+  shown: () => sourceControls() && listShown(),
+  when: (event) => sourceControls() && listShown() && inFiles(event) && Boolean(currentItem()),
   run: () => {
     const item = currentItem();
     if (!mayRename(item)) {
@@ -1600,8 +1631,8 @@ addShortcut({
   keys: ['Delete'],
   label: 'Move the selected items to the recycle bin (with Undo)',
   scope: 'library',
-  shown: () => source === null && items.length > 0,
-  when: (event) => source === null && inFiles(event) && (selected.size > 0 || (view === 'list' && Boolean(currentItem()))),
+  shown: () => sourceControls() && items.length > 0,
+  when: (event) => sourceControls() && inFiles(event) && (selected.size > 0 || (view === 'list' && Boolean(currentItem()))),
   run: () => keyDelete(),
 });
 addShortcut({

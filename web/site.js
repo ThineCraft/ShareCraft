@@ -298,16 +298,18 @@ $('new-library').addEventListener('submit', async (event) => {
   say('');
   $('new-library-submit').disabled = true;
   let result;
+  let sentGithubToken = false;
   if (fromGithub) {
     const body = { name, repository, kind: $('library-kind').value };
     const branch = $('github-branch').value.trim();
     const folder = $('github-folder').value.trim();
-    const token = $('github-token').value;
     if (branch) body.branch = branch;
     if (folder) body.folder = folder;
-    if (token) body.token = token;
+    const tokenField = $('github-token');
+    sentGithubToken = tokenField.value !== '';
+    if (sentGithubToken) body.token = tokenField.value;
+    tokenField.value = '';
     result = await api('POST', `/sites/${seg(siteId)}/libraries/github`, body);
-    $('github-token').value = '';
   } else {
     result = await api('POST', `/sites/${seg(siteId)}/libraries`, { name, kind: $('library-kind').value });
   }
@@ -317,7 +319,7 @@ $('new-library').addEventListener('submit', async (event) => {
     const text = fromGithub && result.error === 'invalid_request'
       ? 'Check the repository, branch, folder and token, then try again.'
       : messageFor(result.error);
-    say(text);
+    say(`${text}${sentGithubToken ? ' Retype the token before trying again.' : ''}`);
   }
 });
 

@@ -1,12 +1,29 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  sourceAccess,
+  sourceControlsEnabled,
   relativeTime,
   sourceStateText,
   sourceSummary,
   validRepository,
   webhookInstructions,
 } from './source-panel.js';
+
+test('sourceAccess distinguishes a missing source from connected and uncertain responses', () => {
+  const connected = { repository: 'owner/repo', branch: 'main', state: 'ok' };
+  assert.equal(sourceAccess({ ok: false, status: 404, error: 'not_found' }), 'none');
+  assert.equal(sourceAccess({ ok: false, status: 500, error: 'server_error' }), 'unknown');
+  assert.equal(sourceAccess({ ok: false, status: 0, error: 'network' }), 'unknown');
+  assert.equal(sourceAccess({ ok: true, status: 200, data: connected }), 'connected');
+  assert.equal(sourceAccess({ ok: true, status: 200, data: null }), 'unknown');
+});
+
+test('source controls stay disabled while source access is unknown', () => {
+  assert.equal(sourceControlsEnabled('unknown'), false);
+  assert.equal(sourceControlsEnabled('connected'), false);
+  assert.equal(sourceControlsEnabled('none'), true);
+});
 
 const NOW = Date.parse('2026-11-17T14:24:00Z');
 const base = {
