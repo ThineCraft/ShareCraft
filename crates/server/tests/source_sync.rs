@@ -19,7 +19,9 @@ use std::time::Duration;
 use collab_core::ids::{DocId, NodeId};
 use common::fake_github::{AUTHOR_NAME, FakeGithub};
 use common::{FileClient, TIMEOUT, TestServer, TestUser, spawn_server_config, start_fake_github};
-use records::{NewSource, NodeKind, Principal, SealedRow, SourceKind, SourceState, SourceStatus};
+use records::{
+    LinkKind, NewSource, NodeKind, Principal, SealedRow, SourceKind, SourceState, SourceStatus,
+};
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 use server::AppState;
@@ -727,13 +729,13 @@ async fn events_carry_counts_but_no_token() {
 }
 
 #[tokio::test]
-async fn case_collision_shows_a_suffixed_name_in_the_listing_and_counts_it() {
+async fn case_collision_numbers_both_names_and_downloads_the_right_content() {
     let env = Env::new().await;
     env.fake
         .commit("main", &files(&[("a.md", "lower"), ("A.md", "upper")]));
     let report = env.synced().await;
     assert_eq!(report.added, 2);
-    assert_eq!(report.hidden.renamed, 1);
+    assert_eq!(report.hidden.renamed, 2);
     let mut names: Vec<String> = env
         .children(env.library)
         .await
@@ -741,8 +743,8 @@ async fn case_collision_shows_a_suffixed_name_in_the_listing_and_counts_it() {
         .map(|(n, _, _)| n)
         .collect();
     names.sort();
-    assert_eq!(names, ["A.md", "a (2).md"]);
-    let upper = env.node_at("A.md").await;
+    assert_eq!(names, ["A (1).md", "a (2).md"]);
+    let upper = env.node_at("A (1).md").await;
     let lower = env.node_at("a (2).md").await;
     assert_eq!(download(&env.server, &env.admin, upper).await.1, b"upper");
     assert_eq!(download(&env.server, &env.admin, lower).await.1, b"lower");
@@ -754,7 +756,7 @@ async fn a_later_literal_collision_name_does_not_take_the_existing_files_identit
     env.fake
         .commit("main", &files(&[("A.md", "upper"), ("a.md", "lower")]));
     env.synced().await;
-    let upper = env.node_at("A.md").await;
+    let upper = env.node_at("A (1).md").await;
     let lower = env.node_at("a (2).md").await;
 
     env.fake.commit(
@@ -767,10 +769,10 @@ async fn a_later_literal_collision_name_does_not_take_the_existing_files_identit
     );
     env.synced().await;
 
-    assert_eq!(env.node_at("A.md").await, upper);
-    assert_eq!(env.node_at("a (2).md").await, lower);
+    assert_eq!(env.node_at("A (1).md").await, upper);
+    assert_eq!(env.node_at("a (3).md").await, lower);
     assert_eq!(download(&env.server, &env.admin, lower).await.1, b"lower");
-    let literal = env.node_at("a (3).md").await;
+    let literal = env.node_at("a (2).md").await;
     assert_ne!(literal, lower);
     assert_eq!(
         download(&env.server, &env.admin, literal).await.1,
@@ -779,12 +781,67 @@ async fn a_later_literal_collision_name_does_not_take_the_existing_files_identit
 }
 
 #[tokio::test]
-async fn collision_display_allocations_stay_with_the_same_nodes_across_syncs() {
+async fn a_growing_collision_group_renumbers_existing_nodes_without_losing_access_or_links() {
     let env = Env::new().await;
     env.fake
         .commit("main", &files(&[("A.md", "upper"), ("a.md", "lower")]));
     env.synced().await;
-    let upper = env.node_at("A.md").await;
+    let upper = env.node_at("A (1).md").await;
+    let lower = env.node_at("a (2).md").await;
+    let carol = env.server.user("Carol").await;
+    let db = env.server.records_db();
+    db.set_node_access(
+        env.admin.id,
+        upper,
+        Principal::User(carol.id),
+        Some("viewer"),
+    )
+    .await
+    .unwrap();
+    let (link, _) = db
+        .create_link(env.admin.id, lower, LinkKind::SignedIn, "viewer", None)
+        .await
+        .unwrap();
+
+    env.fake.commit(
+        "main",
+        &files(&[("A.MD", "new first"), ("A.md", "upper"), ("a.md", "lower")]),
+    );
+    let report = env.synced().await;
+
+    assert_eq!(report.hidden.renamed, 3);
+    assert_eq!(env.node_at("A (2).md").await, upper);
+    assert_eq!(env.node_at("a (3).md").await, lower);
+    assert_eq!(download(&env.server, &carol, upper).await.1, b"upper");
+    assert_eq!(db.link(link.id).await.unwrap().unwrap().node, lower);
+}
+
+#[tokio::test]
+async fn a_shrinking_collision_group_returns_the_survivor_to_its_plain_name() {
+    let env = Env::new().await;
+    env.fake
+        .commit("main", &files(&[("A.md", "upper"), ("a.md", "lower")]));
+    env.synced().await;
+    let survivor = env.node_at("a (2).md").await;
+
+    env.fake.commit("main", &files(&[("a.md", "lower")]));
+    let report = env.synced().await;
+
+    assert_eq!(report.hidden.renamed, 0);
+    assert_eq!(env.node_at("a.md").await, survivor);
+    assert_eq!(
+        download(&env.server, &env.admin, survivor).await.1,
+        b"lower"
+    );
+}
+
+#[tokio::test]
+async fn collision_names_are_deterministic_across_changed_syncs() {
+    let env = Env::new().await;
+    env.fake
+        .commit("main", &files(&[("A.md", "upper"), ("a.md", "lower")]));
+    env.synced().await;
+    let upper = env.node_at("A (1).md").await;
     let lower = env.node_at("a (2).md").await;
 
     env.fake.commit(
@@ -793,7 +850,7 @@ async fn collision_display_allocations_stay_with_the_same_nodes_across_syncs() {
     );
     env.synced().await;
 
-    assert_eq!(env.node_at("A.md").await, upper);
+    assert_eq!(env.node_at("A (1).md").await, upper);
     assert_eq!(env.node_at("a (2).md").await, lower);
     assert_eq!(
         download(&env.server, &env.admin, lower).await.1,

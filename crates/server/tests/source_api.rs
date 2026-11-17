@@ -305,6 +305,50 @@ async fn connect_creates_a_library_and_the_first_sync_fills_it() {
 }
 
 #[tokio::test]
+async fn connected_library_api_lists_both_numbered_case_collisions_with_their_content() {
+    let env = Env::new().await;
+    env.fake.commit(
+        "main",
+        &files(&[("Readme.md", "mixed"), ("readme.md", "lower")]),
+    );
+    let library = env.connected("Collision mirror", json!({})).await;
+    env.wait_names(library, &["Readme (1).md", "readme (2).md"])
+        .await;
+
+    let (status, page) = env
+        .call(
+            &env.admin,
+            Method::GET,
+            &format!("/api/nodes/{}/children", library.0),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let mut content = Vec::new();
+    for item in page["items"].as_array().unwrap() {
+        let name = item["name"].as_str().unwrap().to_owned();
+        let id = item["id"].as_str().unwrap();
+        let response = env
+            .server
+            .http(Some(&env.admin))
+            .get(env.server.url(&format!("/api/docs/{id}/content")))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{name}");
+        content.push((name, response.bytes().await.unwrap().to_vec()));
+    }
+    content.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        content,
+        [
+            ("Readme (1).md".to_owned(), b"mixed".to_vec()),
+            ("readme (2).md".to_owned(), b"lower".to_vec()),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn the_create_route_makes_its_own_empty_library() {
     let env = Env::new().await;
     env.fake.commit("main", &files(&[("a.md", "a")]));

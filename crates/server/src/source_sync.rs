@@ -239,8 +239,9 @@ fn join(parent: &str, name: &str) -> String {
     }
 }
 
-/// The unsuffixed collision family of `name`, when it already ends in ` (2)` or later. This
-/// lets a new literal `a (2).md` continue the existing `a.md`, `a (2).md` allocation as
+/// The unsuffixed collision family of `name`, when it already ends in a numbered suffix. This
+/// lets a generated `a (1).md` that meets a literal name continue as `a (2).md`, and lets a
+/// new literal `a (2).md` continue the existing `a.md`, `a (2).md` allocation as
 /// `a (3).md`, rather than starting a second suffix family.
 fn collision_base_name(name: &str, editor: Editor) -> Option<String> {
     let lower = name.to_lowercase();
@@ -251,10 +252,24 @@ fn collision_base_name(name: &str, editor: Editor) -> Option<String> {
     let (stem, extension) = name.split_at_checked(split)?;
     let open = stem.rfind(" (")?;
     let number = stem.get(open + 2..stem.len().checked_sub(1)?)?;
-    if !stem.ends_with(')') || number.parse::<u32>().ok().is_none_or(|n| n < 2) {
+    if !stem.ends_with(')') || number.parse::<u32>().ok().is_none_or(|n| n < 1) {
         return None;
     }
     Some(format!("{}{extension}", stem.get(..open)?))
+}
+
+/// `name` with `number` before the extension, using the same extension split as collision
+/// allocation. The ordinary uniqueness allocator advances this number if the generated name
+/// is also a literal repository name in the folder.
+fn numbered_file_name(name: &str, number: usize) -> String {
+    let editor = Editor::for_file_name(name);
+    let lower = name.to_lowercase();
+    let split = match editor.native_extension() {
+        Some(ext) if lower.ends_with(ext) => name.len().saturating_sub(ext.len()),
+        _ => name.rfind('.').filter(|dot| *dot > 0).unwrap_or(name.len()),
+    };
+    let (stem, extension) = name.split_at_checked(split).unwrap_or((name, ""));
+    tree::fit(stem, extension, &format!(" ({number})"))
 }
 
 fn allocated_file_name(name: &str, names: &HashSet<String>) -> String {
@@ -282,9 +297,10 @@ fn nameable(name: &str, file: bool) -> bool {
 ///
 /// Symbolic links and submodules are hidden and counted, never shown as files. A file with a
 /// name ShareCraft refuses anywhere in its path (see [`nameable`]) is hidden and counted as
-/// unnameable. Siblings whose names are equal ignoring case keep the first in byte order; the
-/// others are shown as `name (2).ext`, `name (3).ext` … and counted as renamed. Folders are
-/// shown only when they hold a shown file. Policy and size are judged by the caller.
+/// unnameable. Files whose sibling names are equal ignoring case are ordered by original
+/// repository path byte order and all shown with numbered suffixes starting at `(1)`; every
+/// member is counted as renamed. Folders retain the ordinary first-name-wins allocation and
+/// are shown only when they hold a shown file. Policy and size are judged by the caller.
 ///
 /// The result is in path order, each folder before what is in it.
 #[must_use]
@@ -292,9 +308,9 @@ pub fn shown_names(entries: Vec<TreeEntry>, folder: &str) -> (Vec<Entry>, Hidden
     shown_names_with_allocations(entries, folder, &[])
 }
 
-/// As [`shown_names`], preserving the displayed names already allocated to surviving repository
-/// paths. Reserved names are claimed before new literal paths, so adding `a (2).md` cannot take
-/// that displayed name away from an existing case-collision sibling.
+/// As [`shown_names`], preserving displayed folder allocations. File allocations are recomputed
+/// from original repository paths so a collision group can grow, shrink and renumber while the
+/// source identity remains attached to the same node.
 fn shown_names_with_allocations(
     entries: Vec<TreeEntry>,
     folder: &str,
@@ -332,6 +348,32 @@ fn shown_names_with_allocations(
     }
     files.sort_by(|a, b| a.0.cmp(&b.0));
 
+    // Collision membership and numbering come only from original repository siblings. Because
+    // `files` is in path byte order, insertion order is the required numbering order. Literal
+    // names outside a collision group are reserved so generated `(1)`, `(2)` ... names advance
+    // through the ordinary case-insensitive uniqueness mechanism instead of displacing them.
+    let mut groups: HashMap<(String, String), Vec<String>> = HashMap::new();
+    for (path, _, _) in &files {
+        groups
+            .entry((parent_path(path).to_owned(), last_name(path).to_lowercase()))
+            .or_default()
+            .push(path.clone());
+    }
+    let mut collision_numbers = HashMap::new();
+    let mut plain_file_names: HashMap<String, HashSet<String>> = HashMap::new();
+    for ((parent, _), paths) in groups {
+        if paths.len() > 1 {
+            for (index, path) in paths.into_iter().enumerate() {
+                collision_numbers.insert(path, index + 1);
+            }
+        } else if let Some(path) = paths.first() {
+            plain_file_names
+                .entry(parent)
+                .or_default()
+                .insert(last_name(path).to_lowercase());
+        }
+    }
+
     let mut wanted = HashSet::new();
     for (path, _, _) in &files {
         wanted.insert(path.clone());
@@ -344,7 +386,7 @@ fn shown_names_with_allocations(
     let mut reserved: HashMap<String, HashMap<String, String>> = HashMap::new();
     for item in allocated
         .iter()
-        .filter(|item| wanted.contains(&item.repository_path))
+        .filter(|item| item.blob_sha.is_none() && wanted.contains(&item.repository_path))
     {
         reserved
             .entry(parent_path(&item.repository_path).to_owned())
@@ -378,6 +420,9 @@ fn shown_names_with_allocations(
             if let Some(for_parent) = reserved.get(&original_parent) {
                 names.extend(for_parent.values().map(|name| name.to_lowercase()));
             }
+            if let Some(literals) = plain_file_names.get(&original_parent) {
+                names.extend(literals.iter().cloned());
+            }
             let given = reserved
                 .get(&original_parent)
                 .and_then(|for_parent| for_parent.get(&original))
@@ -404,12 +449,19 @@ fn shown_names_with_allocations(
         if let Some(for_parent) = reserved.get(original_parent) {
             names.extend(for_parent.values().map(|name| name.to_lowercase()));
         }
-        let given = reserved
-            .get(original_parent)
-            .and_then(|for_parent| for_parent.get(&path))
-            .filter(|allocated| nameable(allocated, true))
-            .cloned()
-            .unwrap_or_else(|| allocated_file_name(name, names));
+        if let Some(literals) = plain_file_names.get(original_parent) {
+            names.extend(literals.iter().cloned());
+        }
+        let given = collision_numbers.get(&path).map_or_else(
+            || name.to_owned(),
+            |number| {
+                // A collision member may never fall back to the unsuffixed base when a literal
+                // numbered name is taken: every member must remain visibly numbered.
+                let mut unavailable = names.clone();
+                unavailable.insert(name.to_lowercase());
+                allocated_file_name(&numbered_file_name(name, *number), &unavailable)
+            },
+        );
         if given != name {
             hidden.renamed += 1;
         }
@@ -2311,7 +2363,7 @@ mod tests {
     }
 
     #[test]
-    fn case_collisions_keep_the_first_and_suffix_the_rest() {
+    fn case_collisions_number_every_file_and_leave_other_siblings_unchanged() {
         let (shown, hidden) = shown_names(
             vec![
                 tree("a.md", EntryKind::File, "s2"),
@@ -2324,18 +2376,80 @@ mod tests {
         assert_eq!(
             paths(&shown),
             [
-                "A.md",
+                "A (1).md",
                 "Docs",
                 "Docs/x.md",
                 "a (2).md",
                 "docs (2)",
-                "docs (2)/y.md"
+                "docs (2)/y.md",
             ]
         );
         let lower = shown.iter().find(|e| e.path == "a (2).md").unwrap();
         assert_eq!(lower.sha, "s2");
-        assert_eq!(hidden.renamed, 2);
+        assert_eq!(hidden.renamed, 3);
         assert_eq!(hidden.unnameable, 0);
+    }
+
+    #[test]
+    fn three_way_case_collision_is_numbered_by_original_path_byte_order() {
+        let (shown, hidden) = shown_names(
+            vec![
+                tree("readme.md", EntryKind::File, "s3"),
+                tree("README.md", EntryKind::File, "s1"),
+                tree("Readme.md", EntryKind::File, "s2"),
+                tree("notes.md", EntryKind::File, "s4"),
+            ],
+            "",
+        );
+        assert_eq!(
+            paths(&shown),
+            [
+                "README (1).md",
+                "Readme (2).md",
+                "notes.md",
+                "readme (3).md",
+            ]
+        );
+        assert_eq!(hidden.renamed, 3);
+    }
+
+    #[test]
+    fn case_collision_in_a_subfolder_numbers_only_that_folders_group() {
+        let (shown, hidden) = shown_names(
+            vec![
+                tree("docs/Readme.md", EntryKind::File, "s1"),
+                tree("docs/readme.md", EntryKind::File, "s2"),
+                tree("Readme.md", EntryKind::File, "s3"),
+            ],
+            "",
+        );
+        assert_eq!(
+            paths(&shown),
+            [
+                "Readme.md",
+                "docs",
+                "docs/Readme (1).md",
+                "docs/readme (2).md"
+            ]
+        );
+        assert_eq!(hidden.renamed, 2);
+    }
+
+    #[test]
+    fn literal_numbered_name_stays_plain_and_collision_group_remains_unique() {
+        let (shown, hidden) = shown_names(
+            vec![
+                tree("Readme.md", EntryKind::File, "s1"),
+                tree("readme.md", EntryKind::File, "s2"),
+                tree("Readme (1).md", EntryKind::File, "s3"),
+            ],
+            "",
+        );
+        assert_eq!(
+            paths(&shown),
+            ["Readme (1).md", "Readme (2).md", "readme (3).md"]
+        );
+        assert_eq!(hidden.renamed, 2);
     }
 
     #[test]
