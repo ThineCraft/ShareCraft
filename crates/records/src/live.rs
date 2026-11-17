@@ -12,6 +12,37 @@ use uuid::Uuid;
 
 use crate::{Db, DbError};
 
+pub(crate) async fn delete_live_logs(
+    conn: &mut PgConnection,
+    documents: &[DocId],
+) -> Result<(), sqlx::Error> {
+    if documents.is_empty() {
+        return Ok(());
+    }
+    let ids: Vec<Uuid> = documents.iter().map(|document| document.0).collect();
+    sqlx::query("delete from live_entries where document_id = any($1)")
+        .bind(&ids)
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query("delete from live_refusals where document_id = any($1)")
+        .bind(&ids)
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query("delete from live_sessions where document_id = any($1)")
+        .bind(&ids)
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query("delete from live_clients where document_id = any($1)")
+        .bind(&ids)
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query("delete from live_logs where document_id = any($1)")
+        .bind(&ids)
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
 /// How long entries covered by a verified revision and final refusals are retained.
 pub const LIVE_KEEP_DAYS: i64 = 30;
 
@@ -847,7 +878,10 @@ impl Db {
         let entries = sqlx::query(
             "delete from live_entries e using live_logs l \
              where e.document_id = l.document_id and e.seq <= l.verified_through \
-               and l.verified_at < $1",
+               and l.verified_at < $1 \
+               and not exists (select 1 from live_sessions s \
+                               where s.document_id = e.document_id \
+                                 and s.ended_at is null and e.seq >= s.first_seq)",
         )
         .bind(cutoff)
         .execute(&mut *tx)
@@ -886,26 +920,7 @@ impl Db {
     /// Deletes every part of `doc`'s live log when the document is permanently purged.
     pub async fn delete_live_log(&self, doc: DocId) -> Result<(), DbError> {
         let mut tx = self.pool().begin().await?;
-        sqlx::query("delete from live_entries where document_id = $1")
-            .bind(doc.0)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("delete from live_refusals where document_id = $1")
-            .bind(doc.0)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("delete from live_sessions where document_id = $1")
-            .bind(doc.0)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("delete from live_clients where document_id = $1")
-            .bind(doc.0)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("delete from live_logs where document_id = $1")
-            .bind(doc.0)
-            .execute(&mut *tx)
-            .await?;
+        delete_live_logs(&mut tx, &[doc]).await?;
         tx.commit().await?;
         Ok(())
     }

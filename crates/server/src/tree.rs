@@ -500,7 +500,6 @@ pub async fn apply(state: &AppState, actor: &User, op: TreeOp) -> Result<Applied
             let renamed = plan.renamed.take();
             let contents = plan.contents.take();
             let target = plan.id;
-            let live_logs = purged_documents(&plan);
             match commit(state, Some(actor), plan).await {
                 Ok(done) => erase_released(state, done).await,
                 Err(e) => {
@@ -513,7 +512,6 @@ pub async fn apply(state: &AppState, actor: &User, op: TreeOp) -> Result<Applied
                     return Err(e);
                 }
             }
-            delete_live_logs(db, &live_logs).await?;
             if let Some(contents) = contents {
                 store_copied(state, actor, contents).await?;
             }
@@ -602,9 +600,7 @@ pub async fn purge_due(state: &AppState, now: OffsetDateTime) -> usize {
             let _turn = state.tree_lock().lock().await;
             ensure_in_step(&state).await?;
             let plan = plan_purge(&state, None, id).await?;
-            let live_logs = purged_documents(&plan);
             let done = commit(&state, None, plan).await?;
-            delete_live_logs(state.db(), &live_logs).await?;
             erase_released(&state, done).await;
             Ok::<_, AccessError>(())
         })
@@ -728,7 +724,7 @@ pub async fn purge_site(
     {
         crate::sites::end_site_activity(state, site, RemovedReason::Deleted).await;
     }
-    let (done, live_logs) = {
+    let done = {
         let _turn = state.tree_lock().lock().await;
         ensure_in_step(state).await?;
         let node = db
@@ -746,12 +742,7 @@ pub async fn purge_site(
         }
         db.set_site_purging(site, true).await?;
         let purged = match plan_purge_site(state, actor, &record).await {
-            Ok(plan) => {
-                let live_logs = purged_documents(&plan);
-                commit(state, actor, plan)
-                    .await
-                    .map(|done| (done, live_logs))
-            }
+            Ok(plan) => commit(state, actor, plan).await,
             Err(error) => Err(error),
         };
         match purged {
@@ -762,7 +753,6 @@ pub async fn purge_site(
             }
         }
     };
-    delete_live_logs(db, &live_logs).await?;
     erase_released(state, done).await;
     db.set_site_purging(site, false).await?;
     Ok(())
@@ -861,24 +851,6 @@ async fn plan_purge_site(
         purge_site: Some(id),
         ..Plan::default()
     })
-}
-
-/// Documents this tree change permanently purges, including rows already purged in Git that
-/// a resumed site purge still needs to finish in PostgreSQL.
-fn purged_documents(plan: &Plan) -> Vec<DocId> {
-    plan.records
-        .iter()
-        .chain(&plan.also_rows)
-        .filter(|record| record.purged.is_some() && record.kind == kind_word(NodeKind::Document))
-        .map(|record| DocId(record.id))
-        .collect()
-}
-
-async fn delete_live_logs(db: &Db, documents: &[DocId]) -> Result<(), AccessError> {
-    for document in documents {
-        db.delete_live_log(*document).await?;
-    }
-    Ok(())
 }
 
 /// Purges, as the server, every deleted site whose purge a stop interrupted, then every site
@@ -1346,8 +1318,10 @@ pub(crate) async fn ensure_in_step(state: &AppState) -> Result<(), AccessError> 
 /// by a second one and the error answered; nothing is repaired from Git. If the database fails
 /// after the change was judged allowed, the nodes are reconciled from Git once (a new file is
 /// first taken back, as Git does not hold its editor); if that fails too, the tree is marked
-/// out of step. A take-back that cannot be written also marks it out of step, and is kept to
-/// be written before the next reconcile (see [`ensure_in_step`]).
+/// out of step. A purge of documents is taken back instead, so reconciliation cannot split
+/// its live-log cleanup into separate transactions. A take-back that cannot be written also
+/// marks the tree out of step, and is kept to be written before the next reconcile (see
+/// [`ensure_in_step`]).
 ///
 /// `actor` is `None` for a change the server makes on its own (a purge when an item's time in
 /// the bin is up), credited to "ShareCraft" and judged by nobody. Answers what PostgreSQL
@@ -1366,6 +1340,9 @@ async fn commit(
         .map(to_row)
         .collect::<Result<Vec<_>, _>>()
         .map_err(DbError::new)?;
+    let purges_live_logs = rows
+        .iter()
+        .any(|row| row.kind == NodeKind::Document && row.purged_at.is_some());
     // A purge resumed after Git recorded it has nothing left to write there.
     let writes = !(plan.records.is_empty()
         && plan.sites.is_empty()
@@ -1425,6 +1402,12 @@ async fn commit(
                  {error}",
                 plan.id.0
             );
+            if purges_live_logs {
+                if !take_back_all(state, author, &plan.message, undo).await {
+                    state.tree_out_of_step().store(true, Ordering::SeqCst);
+                }
+                return Err(AccessError::Db(error));
+            }
             // Git does not hold a new file's editor: new files are taken back.
             let taken_back = (plan.document.is_none() && plan.copies.is_empty())
                 || take_back_all(state, author.clone(), &plan.message, undo).await;

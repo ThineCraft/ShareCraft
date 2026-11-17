@@ -877,6 +877,7 @@ async fn verified_entries_go_after_thirty_days() {
         .mark_live_verified(s.doc, Seq(2), at(0))
         .await
         .unwrap();
+    s.test.db.end_live_session(session, at(1)).await.unwrap();
 
     assert_eq!(
         s.test
@@ -910,6 +911,44 @@ async fn verified_entries_go_after_thirty_days() {
             .await
             .unwrap();
     assert_eq!(kept, [3]);
+}
+
+#[tokio::test]
+async fn verified_entries_in_an_open_session_survive() {
+    let s = setup().await;
+    let session = session(&s, 0).await;
+    let one = client();
+    for seq in 1..=2 {
+        s.test
+            .db
+            .append_live_change(
+                s.doc,
+                &change(seq, session, one, s.ann, seq, b"change", &[]),
+            )
+            .await
+            .unwrap();
+    }
+    s.test
+        .db
+        .mark_live_verified(s.doc, Seq(2), at(0))
+        .await
+        .unwrap();
+
+    let swept = s
+        .test
+        .db
+        .sweep_live(at(0) + Duration::days(30) + Duration::seconds(1))
+        .await
+        .unwrap();
+
+    assert_eq!(swept.entries, 0);
+    let kept: Vec<i64> =
+        sqlx::query_scalar("select seq from live_entries where document_id = $1 order by seq")
+            .bind(s.doc.0)
+            .fetch_all(s.test.db.test_pool())
+            .await
+            .unwrap();
+    assert_eq!(kept, [1, 2]);
 }
 
 #[tokio::test]
@@ -973,6 +1012,7 @@ async fn verified_through_never_goes_back() {
         .mark_live_verified(s.doc, Seq(1), at(10))
         .await
         .unwrap();
+    s.test.db.end_live_session(session, at(11)).await.unwrap();
 
     assert_eq!(
         s.test.db.load_live(s.doc).await.unwrap().verified_through,

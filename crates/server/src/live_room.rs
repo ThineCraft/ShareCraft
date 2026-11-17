@@ -1,6 +1,7 @@
 //! The opaque-entry live room.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::future::Future;
 use std::time::Duration;
 
 use axum::extract::ws::Utf8Bytes;
@@ -62,12 +63,25 @@ impl Drop for LiveSweeper {
 
 /// Starts the live-log retention sweep now and every hour.
 pub(crate) fn start_sweeper(state: crate::AppState) -> LiveSweeper {
+    start_sweeper_task(move || {
+        let state = state.clone();
+        async move {
+            sweep_live_once(&state, OffsetDateTime::now_utc()).await;
+        }
+    })
+}
+
+fn start_sweeper_task<F, Fut>(mut sweep: F) -> LiveSweeper
+where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
     LiveSweeper(tokio::spawn(async move {
         let mut every = tokio::time::interval(LIVE_SWEEP_EVERY);
         every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             every.tick().await;
-            sweep_live_once(&state, OffsetDateTime::now_utc()).await;
+            sweep().await;
         }
     }))
 }
@@ -1537,6 +1551,8 @@ fn reason_from_store(reason: &str) -> RefusedReason {
     clippy::unwrap_used
 )]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use collab_core::ids::{ClientId, DocId, Seq, SessionId, UserId};
@@ -1546,7 +1562,7 @@ mod tests {
     use tokio::sync::{mpsc, oneshot};
     use uuid::Uuid;
 
-    use super::{LiveCommand, LiveRoom, LiveTiming};
+    use super::{LiveCommand, LiveRoom, LiveTiming, start_sweeper_task};
     use crate::events::EventSink;
     use crate::live_store::MemStore;
     use crate::members::builtin_access;
@@ -1586,6 +1602,34 @@ mod tests {
         .await
         .unwrap();
         (room, store)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_sweeper_runs_now_hourly_and_stops_when_dropped() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&calls);
+        let sweeper = start_sweeper_task(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(())
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the first sweep runs now");
+
+        tokio::time::advance(Duration::from_secs(3_599)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "the boundary starts a sweep"
+        );
+
+        drop(sweeper);
+        tokio::time::advance(Duration::from_secs(3_600)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "drop stops later sweeps");
     }
 
     fn messages(outbound: Outbound) -> Vec<LiveServerMsg> {

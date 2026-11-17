@@ -1,6 +1,6 @@
 //! The content tree: sites, libraries, folders and files, mirrored from Git into PostgreSQL.
 
-use collab_core::ids::{GroupId, NodeId, UserId};
+use collab_core::ids::{DocId, GroupId, NodeId, UserId};
 use revisions::{BlobRef, parse_hex};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgRow;
@@ -691,6 +691,13 @@ impl Db {
             }
             done.released = gone.contents;
         }
+        let purged_documents: Vec<DocId> = change
+            .rows
+            .iter()
+            .filter(|row| row.kind == NodeKind::Document && row.purged_at.is_some())
+            .map(|row| DocId(row.id.0))
+            .collect();
+        crate::live::delete_live_logs(&mut tx, &purged_documents).await?;
         if let Some(site) = change.purge_site {
             for blob in purge_site_rows(&mut tx, change.actor, site).await? {
                 if !done.released.iter().any(|b| b.sha256 == blob.sha256) {

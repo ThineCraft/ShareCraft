@@ -955,6 +955,60 @@ async fn site_purge_keeps_blobs_other_sites_name() {
 }
 
 #[tokio::test]
+async fn site_purge_rolls_back_all_live_logs_when_deletion_fails() {
+    let w = world().await;
+    let a = w.doc(&w.library, "A").await;
+    let b = w.doc(&w.library, "B").await;
+    for doc in [&a, &b] {
+        w.server
+            .records_db()
+            .load_live(DocId(uuid(doc)))
+            .await
+            .unwrap();
+    }
+    sqlx::raw_sql(
+        "create sequence live_log_delete_attempt; \
+         create function fail_second_live_log_delete() returns trigger language plpgsql as $$ \
+         begin if nextval('live_log_delete_attempt') = 2 then \
+           raise exception using errcode = 'unique_violation', message = 'refused'; \
+         end if; return old; end $$; \
+         create trigger fail_second_live_log_delete before delete on live_logs \
+         for each row execute function fail_second_live_log_delete();",
+    )
+    .execute(w.server.records_db().test_pool())
+    .await
+    .unwrap();
+    let (status, _) = w.delete_site(&w.root, &w.site).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, _) = w.purge_site(&w.root, &w.site).await;
+
+    assert!(status.is_server_error());
+    for doc in [&a, &b] {
+        let count: i64 =
+            sqlx::query_scalar("select count(*) from live_logs where document_id = $1")
+                .bind(uuid(doc))
+                .fetch_one(w.server.records_db().test_pool())
+                .await
+                .unwrap();
+        assert_eq!(count, 1, "{doc}");
+        assert!(row(&w.server, doc).await.purged_at.is_none(), "{doc}");
+        assert!(
+            w.server
+                .store()
+                .read_tree_record(uuid(doc))
+                .unwrap()
+                .unwrap()
+                .purged
+                .is_none(),
+            "{doc}"
+        );
+    }
+    let (status, body) = w.restore_site(&w.root, &w.site).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
 async fn refused_purge_leaves_site_restorable() {
     let w = world().await;
     let (status, _) = w.delete_site(&w.root, &w.site).await;
