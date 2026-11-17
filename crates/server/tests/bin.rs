@@ -907,6 +907,25 @@ async fn purging_a_document_deletes_its_log() {
 }
 
 #[tokio::test]
+async fn reconcile_deletes_a_purged_documents_stale_live_log() {
+    let w = world().await;
+    let doc = w.doc(&w.root, &w.library, "Draft").await;
+    let id = doc_id(&doc);
+    assert_eq!(w.delete(&w.root, &doc).await, StatusCode::NO_CONTENT);
+    w.purge(&doc).await;
+    w.server.records_db().load_live(id).await.unwrap();
+    assert_eq!(live_log_count(&w, &doc).await, 1);
+
+    let report = server::tree::reconcile(Arc::new(w.server.store()), &w.server.records_db())
+        .await
+        .unwrap();
+
+    assert!(report.failed.is_empty(), "{:?}", report.failed);
+    assert_eq!(report.updated, 0);
+    assert_eq!(live_log_count(&w, &doc).await, 0);
+}
+
+#[tokio::test]
 async fn log_deletion_failure_rolls_back_document_purge() {
     let w = world().await;
     let doc = w.doc(&w.root, &w.library, "Draft").await;
@@ -930,6 +949,60 @@ async fn log_deletion_failure_rolls_back_document_purge() {
 
     assert!(w.row(&doc).await.purged_at.is_none());
     assert_eq!(live_log_count(&w, &doc).await, 1);
+}
+
+#[tokio::test]
+async fn commit_error_keeps_document_purge_for_reconcile() {
+    let w = world().await;
+    let doc = w.doc(&w.root, &w.library, "Draft").await;
+    w.server.records_db().load_live(doc_id(&doc)).await.unwrap();
+    assert_eq!(w.delete(&w.root, &doc).await, StatusCode::NO_CONTENT);
+    assert_eq!(w.bin_remove(&w.root, &doc).await, StatusCode::NO_CONTENT);
+    sqlx::raw_sql(
+        "create function fail_purge_commit() returns trigger language plpgsql as $$ \
+         begin raise exception 'commit failed'; end $$; \
+         create constraint trigger fail_purge_commit after update on nodes \
+         deferrable initially deferred for each row \
+         when (new.purged_at is not null and old.purged_at is null) \
+         execute function fail_purge_commit();",
+    )
+    .execute(w.server.records_db().test_pool())
+    .await
+    .unwrap();
+
+    assert!(
+        w.bin_remove(&w.root, &doc).await.is_server_error(),
+        "the injected commit failure is returned"
+    );
+
+    assert!(
+        w.record(&doc).purged.is_some(),
+        "an uncertain commit outcome keeps the purge in Git"
+    );
+    assert!(w.row(&doc).await.purged_at.is_none());
+    assert_eq!(live_log_count(&w, &doc).await, 1);
+    let (status, _) = w
+        .call(
+            &w.root,
+            Method::POST,
+            &format!("/api/nodes/{}/children", w.library),
+            Some(json!({ "kind": "folder", "name": "Blocked while out of step" })),
+        )
+        .await;
+    assert!(
+        status.is_server_error(),
+        "tree changes wait while reconcile still fails"
+    );
+
+    sqlx::raw_sql("drop trigger fail_purge_commit on nodes; drop function fail_purge_commit();")
+        .execute(w.server.records_db().test_pool())
+        .await
+        .unwrap();
+    w.folder(&w.root, &w.library, "After reconcile").await;
+
+    assert!(w.record(&doc).purged.is_some());
+    assert!(w.row(&doc).await.purged_at.is_some());
+    assert_eq!(live_log_count(&w, &doc).await, 0);
 }
 
 #[tokio::test]

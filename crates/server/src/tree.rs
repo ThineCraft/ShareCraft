@@ -1318,10 +1318,10 @@ pub(crate) async fn ensure_in_step(state: &AppState) -> Result<(), AccessError> 
 /// by a second one and the error answered; nothing is repaired from Git. If the database fails
 /// after the change was judged allowed, the nodes are reconciled from Git once (a new file is
 /// first taken back, as Git does not hold its editor); if that fails too, the tree is marked
-/// out of step. A purge of documents is taken back instead, so reconciliation cannot split
-/// its live-log cleanup into separate transactions. A take-back that cannot be written also
-/// marks the tree out of step, and is kept to be written before the next reconcile (see
-/// [`ensure_in_step`]).
+/// out of step. A purge statement failure is taken back so its live-log cleanup remains in the
+/// same transaction. When COMMIT's outcome is unknown, Git is kept and the tree is marked out
+/// of step for [`ensure_in_step`] to reconcile. A take-back that cannot be written also marks
+/// the tree out of step, and is kept to be written before the next reconcile.
 ///
 /// `actor` is `None` for a change the server makes on its own (a purge when an item's time in
 /// the bin is up), credited to "ShareCraft" and judged by nobody. Answers what PostgreSQL
@@ -1396,6 +1396,15 @@ async fn commit(
         .await;
     match applied {
         Ok(done) => Ok(done),
+        Err(AccessError::CommitOutcomeUnknown(error)) => {
+            eprintln!(
+                "sharecraft-server: tree change to node {} may or may not be in the database: \
+                 {error}",
+                plan.id.0
+            );
+            state.tree_out_of_step().store(true, Ordering::SeqCst);
+            Err(AccessError::CommitOutcomeUnknown(error))
+        }
         Err(AccessError::Db(error)) => {
             eprintln!(
                 "sharecraft-server: tree change to node {} is in Git but not in the database: \
@@ -1599,7 +1608,14 @@ async fn repair(db: &Db, record: &TreeRecord, current: Option<&NodeRow>) -> Resu
     let row = to_row(record)?.normalized();
     let kind = match current {
         None => "node.created",
-        Some(now) if same(now, &row) => return Ok(false),
+        Some(now) if same(now, &row) => {
+            if row.kind == NodeKind::Document && row.purged_at.is_some() {
+                db.delete_live_log(DocId(row.id.0))
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            return Ok(false);
+        }
         Some(now) if now.purged_at.is_none() && row.purged_at.is_some() => "node.purged",
         Some(now) if now.deleted_at.is_some() && row.deleted_at.is_none() => "node.created",
         Some(now) if now.deleted_at.is_none() && row.deleted_at.is_some() => "node.deleted",
