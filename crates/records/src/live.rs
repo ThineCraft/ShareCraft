@@ -61,6 +61,8 @@ pub struct LiveLoaded {
     pub entries: Vec<LiveEntryRow>,
     /// The open session, if any.
     pub open_session: Option<LiveSessionRow>,
+    /// Every participant ever given a place in this document, including ended sessions.
+    pub participants: Vec<LiveParticipantRow>,
     /// Every client of the document: its id, its person and its next local number (one past
     /// the highest number stored or finally refused).
     pub clients: Vec<(ClientId, UserId, u64)>,
@@ -414,6 +416,27 @@ impl Db {
             }
         };
 
+        let participants = sqlx::query(
+            "select p.number, p.client_id, p.user_id, p.joined_at, p.gone_reason \
+             from live_participants p join live_sessions s on s.id = p.session_id \
+             where s.document_id = $1 order by p.number",
+        )
+        .bind(doc.0)
+        .fetch_all(&mut *tx)
+        .await?
+        .iter()
+        .map(|p| {
+            let gone: Option<String> = p.try_get("gone_reason")?;
+            Ok(LiveParticipantRow {
+                number: unnumber(p.try_get("number")?)?,
+                client: ClientId(p.try_get("client_id")?),
+                user: UserId(p.try_get("user_id")?),
+                joined_at: p.try_get("joined_at")?,
+                gone: gone.as_deref().map(GoneReason::parse).transpose()?,
+            })
+        })
+        .collect::<Result<Vec<_>, DbError>>()?;
+
         let clients = sqlx::query(
             "select client_id, user_id, next_local from live_clients \
              where document_id = $1 order by client_id",
@@ -439,6 +462,7 @@ impl Db {
             verified_through: Seq(unsigned(verified_through)?),
             entries,
             open_session,
+            participants,
             clients,
         })
     }

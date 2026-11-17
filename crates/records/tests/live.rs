@@ -113,6 +113,7 @@ async fn empty_document_loads_empty() {
     assert_eq!(loaded.verified_through, Seq(0));
     assert!(loaded.entries.is_empty());
     assert!(loaded.open_session.is_none());
+    assert!(loaded.participants.is_empty());
     assert!(loaded.clients.is_empty());
 }
 
@@ -323,6 +324,36 @@ async fn participant_numbers_are_never_reused() {
         3
     );
     assert_eq!(db.load_live(s.doc).await.unwrap().last_participant, 3);
+}
+
+#[tokio::test]
+async fn load_keeps_participants_from_ended_sessions() {
+    let s = setup().await;
+    let first = session(&s, 0).await;
+    let old_client = client();
+    let old_number = s
+        .test
+        .db
+        .add_live_participant(s.doc, first, old_client, s.ann, at(1))
+        .await
+        .unwrap();
+    s.test
+        .db
+        .end_live_place(first, old_number, GoneReason::Left, at(2))
+        .await
+        .unwrap();
+    s.test.db.end_live_session(first, at(3)).await.unwrap();
+
+    let loaded = s.test.db.load_live(s.doc).await.unwrap();
+    assert!(loaded.open_session.is_none());
+    assert!(matches!(
+        loaded.participants.as_slice(),
+        [place]
+            if place.number == old_number
+                && place.client == old_client
+                && place.user == s.ann
+                && place.gone == Some(GoneReason::Left)
+    ));
 }
 
 #[tokio::test]

@@ -91,6 +91,7 @@ impl From<DbError> for RoomFailed {
 struct Session {
     id: LiveSessionId,
     format: String,
+    first_seq: Seq,
     places: HashMap<ParticipantNo, LivePlace>,
 }
 
@@ -101,6 +102,7 @@ struct LivePlace {
     can_edit: bool,
     held: bool,
     seen: Seq,
+    last_heard: Instant,
 }
 
 struct RateBucket {
@@ -177,13 +179,24 @@ impl<S: LiveStore> LiveRoom<S> {
             .map(wire_entry)
             .collect::<Result<Vec<_>, _>>()?;
         let mut known_places = HashMap::new();
+        let mut clients = loaded
+            .clients
+            .iter()
+            .map(|(client, user, next)| (*client, (*user, *next)))
+            .collect::<HashMap<_, _>>();
+        let mut members = Members::new(doc, events.clone());
+        for place in &loaded.participants {
+            known_places.insert(ParticipantNo(place.number), place.client);
+            clients.entry(place.client).or_insert((place.user, 1));
+            let _ = members.claim(place.client, place.user);
+        }
+        let now = Instant::now();
         let session = loaded.open_session.map(|open| {
             let places = open
                 .participants
                 .into_iter()
                 .map(|place| {
                     let participant = ParticipantNo(place.number);
-                    known_places.insert(participant, place.client);
                     (
                         participant,
                         LivePlace {
@@ -193,6 +206,7 @@ impl<S: LiveStore> LiveRoom<S> {
                             can_edit: false,
                             held: place.gone.is_none(),
                             seen: Seq(0),
+                            last_heard: now,
                         },
                     )
                 })
@@ -200,6 +214,7 @@ impl<S: LiveStore> LiveRoom<S> {
             Session {
                 id: LiveSessionId(open.id),
                 format: open.format,
+                first_seq: open.first_seq,
                 places,
             }
         });
@@ -208,18 +223,14 @@ impl<S: LiveStore> LiveRoom<S> {
             store,
             events: events.clone(),
             timing,
-            members: Members::new(doc, events),
+            members,
             head: loaded.head,
             verified_through: loaded.verified_through,
             format: loaded.format,
             entries,
             session,
             known_places,
-            clients: loaded
-                .clients
-                .into_iter()
-                .map(|(client, user, next)| (client, (user, next)))
-                .collect(),
+            clients,
             rates: HashMap::new(),
             pending_ends: Vec::new(),
         })
@@ -266,23 +277,25 @@ impl<S: LiveStore> LiveRoom<S> {
                 payload,
             } => self.entry(conn, client, local, seen, format, payload).await,
             LiveCommand::Heartbeat { conn, client, seen } => {
+                self.note_life(conn, client);
                 self.note_seen(conn, client, seen);
                 Ok(())
             }
             LiveCommand::Report { conn, client, seq } => {
+                self.note_life(conn, client);
                 self.note_seen(conn, client, seq);
                 Ok(())
             }
             LiveCommand::Resync { conn, client } => {
-                let _ = self.current_participant(conn, client);
+                self.note_life(conn, client);
                 Ok(())
             }
             LiveCommand::Leave { conn, client } => {
-                self.leave(conn, client, true);
-                Ok(())
+                self.note_life(conn, client);
+                self.leave(conn, client).await
             }
             LiveCommand::Disconnected { conn, client } => {
-                self.leave(conn, client, false);
+                self.disconnect(conn, client);
                 Ok(())
             }
         }
@@ -290,17 +303,62 @@ impl<S: LiveStore> LiveRoom<S> {
 
     pub(crate) async fn settle(&mut self) -> Result<(), RoomFailed> {
         let at = OffsetDateTime::now_utc();
-        for (session, participant, reason) in self.pending_ends.drain(..) {
+        while let Some((session, participant, reason)) = self.pending_ends.first().copied() {
             self.store
                 .end_live_place(session.0, participant.0, reason, at)
                 .await?;
+            self.pending_ends.remove(0);
+            self.apply_place_end(session, participant, reason);
         }
         let should_end = self
             .session
             .as_ref()
             .is_some_and(|session| session.places.values().all(|place| !place.held));
-        if should_end && let Some(session) = self.session.take() {
-            self.store.end_live_session(session.id.0, at).await?;
+        if should_end && let Some(session) = &self.session {
+            let session_id = session.id;
+            let entries = self
+                .head
+                .0
+                .saturating_sub(session.first_seq.0.saturating_sub(1));
+            self.store.end_live_session(session_id.0, at).await?;
+            self.events.emit(NewEvent {
+                kind: "live.session_ended",
+                actor: None,
+                subject: None,
+                document: Some(self.doc),
+                node: Some(self.doc.into()),
+                detail: serde_json::json!({ "head": self.head.0, "entries": entries }),
+            });
+            self.session = None;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn next_expiry(&self) -> Option<Instant> {
+        let lifetime = self.timing.heartbeat.saturating_mul(self.timing.misses);
+        self.session
+            .as_ref()
+            .into_iter()
+            .flat_map(|session| session.places.values())
+            .filter(|place| place.held)
+            .map(|place| place.last_heard + lifetime)
+            .min()
+    }
+
+    pub(crate) async fn expire_due(&mut self) -> Result<(), RoomFailed> {
+        let now = Instant::now();
+        let lifetime = self.timing.heartbeat.saturating_mul(self.timing.misses);
+        let due = self
+            .session
+            .as_ref()
+            .into_iter()
+            .flat_map(|session| &session.places)
+            .filter_map(|(participant, place)| {
+                (place.held && place.last_heard + lifetime <= now).then_some(*participant)
+            })
+            .collect::<Vec<_>>();
+        for participant in due {
+            self.end_place(participant, GoneReason::Expired).await?;
         }
         Ok(())
     }
@@ -354,6 +412,7 @@ impl<S: LiveStore> LiveRoom<S> {
             self.session = Some(Session {
                 id,
                 format: request.format.clone(),
+                first_seq: Seq(self.head.0.saturating_add(1)),
                 places: HashMap::new(),
             });
         }
@@ -420,6 +479,7 @@ impl<S: LiveStore> LiveRoom<S> {
                     can_edit: request.role.can_edit(),
                     held: true,
                     seen: request.seen.unwrap_or(Seq(0)).min(self.head),
+                    last_heard: Instant::now(),
                 },
             );
         }
@@ -496,6 +556,7 @@ impl<S: LiveStore> LiveRoom<S> {
         let Some(participant) = self.current_participant(conn, client) else {
             return Ok(());
         };
+        self.note_life(conn, client);
         let (user, can_edit) = match self
             .members
             .iter()
@@ -631,19 +692,111 @@ impl<S: LiveStore> LiveRoom<S> {
         }
     }
 
-    fn leave(&mut self, conn: ConnId, client: ClientId, ends_place: bool) {
-        let participant = self.current_participant(conn, client);
+    fn note_life(&mut self, conn: ConnId, client: ClientId) {
+        let Some(participant) = self.current_participant(conn, client) else {
+            return;
+        };
+        if let Some(place) = self
+            .session
+            .as_mut()
+            .and_then(|session| session.places.get_mut(&participant))
+        {
+            place.last_heard = Instant::now();
+        }
+    }
+
+    async fn leave(&mut self, conn: ConnId, client: ClientId) -> Result<(), RoomFailed> {
+        let Some(participant) = self.current_participant(conn, client) else {
+            return Ok(());
+        };
+        self.end_place(participant, GoneReason::Left).await
+    }
+
+    fn disconnect(&mut self, conn: ConnId, client: ClientId) {
         if self.members.leave(conn, client).is_none() {
             return;
         }
-        if ends_place
-            && let (Some(participant), Some(session)) = (participant, &mut self.session)
-            && let Some(place) = session.places.get_mut(&participant)
-            && place.held
+        self.broadcast_people();
+    }
+
+    async fn end_place(
+        &mut self,
+        participant: ParticipantNo,
+        reason: GoneReason,
+    ) -> Result<(), RoomFailed> {
+        let Some(session) = self.session.as_ref() else {
+            return Ok(());
+        };
+        if session
+            .places
+            .get(&participant)
+            .is_none_or(|place| !place.held)
         {
-            place.held = false;
-            self.pending_ends
-                .push((session.id, participant, GoneReason::Left));
+            return Ok(());
+        }
+        let session_id = session.id;
+        if let Err(error) = self
+            .store
+            .end_live_place(
+                session_id.0,
+                participant.0,
+                reason,
+                OffsetDateTime::now_utc(),
+            )
+            .await
+        {
+            let pending = (session_id, participant, reason);
+            if !self.pending_ends.contains(&pending) {
+                self.pending_ends.push(pending);
+            }
+            return Err(error.into());
+        }
+        self.pending_ends
+            .retain(|pending| *pending != (session_id, participant, reason));
+        self.apply_place_end(session_id, participant, reason);
+        Ok(())
+    }
+
+    fn apply_place_end(
+        &mut self,
+        session_id: LiveSessionId,
+        participant: ParticipantNo,
+        reason: GoneReason,
+    ) {
+        let Some(place) = self
+            .session
+            .as_mut()
+            .filter(|session| session.id == session_id)
+            .and_then(|session| session.places.get_mut(&participant))
+        else {
+            return;
+        };
+        if !place.held {
+            return;
+        }
+        place.held = false;
+        let client = place.client;
+        if reason == GoneReason::Expired {
+            let _ = self.members.send(
+                Some(client),
+                &Outbound::One(encode(&LiveServerMsg::Expired)),
+            );
+            self.events.emit(NewEvent {
+                kind: "live.client_expired",
+                actor: None,
+                subject: Some(place.user),
+                document: Some(self.doc),
+                node: Some(self.doc.into()),
+                detail: serde_json::json!({ "participant": participant.0 }),
+            });
+        }
+        if let Some(conn) = self
+            .members
+            .iter()
+            .find(|member| member.client == client)
+            .map(|member| member.conn)
+        {
+            let _ = self.members.leave(conn, client);
         }
         self.broadcast_people();
     }
@@ -1339,5 +1492,353 @@ mod tests {
             );
             assert_eq!(entries(joined.initial).len(), count);
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn three_missed_heartbeats_expire() {
+        let (mut room, _) = room().await;
+        let mut ann = join_as(&mut room, 1, 1, 11, "editor", FORMAT, None, None).await;
+        let mut bob = join_as(&mut room, 2, 2, 12, "editor", FORMAT, None, None).await;
+        let _ = drain(&mut ann.rx);
+
+        tokio::time::advance(Duration::from_millis(179_999)).await;
+        room.handle(LiveCommand::Heartbeat {
+            conn: bob.conn,
+            client: bob.client,
+            seen: Seq(0),
+        })
+        .await
+        .unwrap();
+        room.expire_due().await.unwrap();
+        assert!(drain(&mut ann.rx).is_empty());
+        assert_eq!(
+            room.next_expiry(),
+            Some(tokio::time::Instant::now() + Duration::from_millis(1))
+        );
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        room.expire_due().await.unwrap();
+        assert!(matches!(
+            drain(&mut ann.rx).as_slice(),
+            [LiveServerMsg::Expired]
+        ));
+        assert!(drain(&mut bob.rx).iter().any(|message| matches!(
+            message,
+            LiveServerMsg::People { people }
+                if people.iter().all(|person| person.participant != ann.participant)
+        )));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn any_message_counts_as_life() {
+        let (mut room, _) = room().await;
+        let ann = join_as(&mut room, 1, 1, 11, "editor", FORMAT, None, None).await;
+        for local in 1..=6 {
+            tokio::time::advance(Duration::from_secs(100)).await;
+            let format = if local == 2 { "wrong/1" } else { FORMAT };
+            let seen = room.head.0;
+            entry(&mut room, &ann, local, seen, format, local.to_string())
+                .await
+                .unwrap();
+            room.expire_due().await.unwrap();
+            assert!(
+                room.people()
+                    .iter()
+                    .any(|person| person.participant == ann.participant)
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disconnect_keeps_the_place() {
+        let (mut room, _) = room().await;
+        let ann = join_as(&mut room, 1, 1, 11, "editor", FORMAT, None, None).await;
+        let resume = Some(LiveResume {
+            session: ann.session,
+            participant: ann.participant,
+        });
+        room.handle(LiveCommand::Disconnected {
+            conn: ann.conn,
+            client: ann.client,
+        })
+        .await
+        .unwrap();
+        tokio::time::advance(Duration::from_secs(179)).await;
+        room.expire_due().await.unwrap();
+
+        let kept = join_as(&mut room, 2, 1, 11, "editor", FORMAT, resume, Some(Seq(0))).await;
+        assert_eq!(kept.participant, ann.participant);
+        assert_eq!(kept.place, Place::Kept);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn entry_in_flight_at_expiry_is_stored_once() {
+        {
+            let (mut room, store) = room().await;
+            let ann = join_as(&mut room, 1, 1, 11, "editor", FORMAT, None, None).await;
+            tokio::time::advance(Duration::from_millis(179_900)).await;
+            entry(&mut room, &ann, 1, 0, FORMAT, "just-in-time".into())
+                .await
+                .unwrap();
+            tokio::time::advance(Duration::from_millis(100_000)).await;
+            room.expire_due().await.unwrap();
+            assert_eq!(store.entry_count(), 1);
+            assert!(
+                room.people()
+                    .iter()
+                    .any(|person| person.participant == ann.participant)
+            );
+        }
+
+        {
+            let (mut room, store) = room().await;
+            let ann = join_as(&mut room, 1, 1, 11, "editor", FORMAT, None, None).await;
+            let resume = Some(LiveResume {
+                session: ann.session,
+                participant: ann.participant,
+            });
+            tokio::time::advance(Duration::from_secs(180)).await;
+            room.expire_due().await.unwrap();
+            entry(&mut room, &ann, 1, 0, FORMAT, "ignored".into())
+                .await
+                .unwrap();
+            assert_eq!(store.entry_count(), 0);
+
+            let returned =
+                join_as(&mut room, 2, 1, 11, "editor", FORMAT, resume, Some(Seq(0))).await;
+            assert_eq!(
+                returned.place,
+                Place::Returning {
+                    previous: ann.participant
+                }
+            );
+            entry(&mut room, &returned, 1, 0, FORMAT, "resent".into())
+                .await
+                .unwrap();
+            entry(&mut room, &returned, 1, 0, FORMAT, "resent-again".into())
+                .await
+                .unwrap();
+            assert_eq!(store.entry_count(), 1);
+        }
+
+        {
+            let (mut room, store) = room().await;
+            let ann = join_as(&mut room, 1, 1, 11, "editor", FORMAT, None, None).await;
+            let resume = Some(LiveResume {
+                session: ann.session,
+                participant: ann.participant,
+            });
+            tokio::time::advance(Duration::from_secs(100)).await;
+            entry(&mut room, &ann, 1, 0, FORMAT, "stored".into())
+                .await
+                .unwrap();
+            tokio::time::advance(Duration::from_secs(180)).await;
+            room.expire_due().await.unwrap();
+            let returned =
+                join_as(&mut room, 2, 1, 11, "editor", FORMAT, resume, Some(Seq(1))).await;
+            entry(&mut room, &returned, 1, 0, FORMAT, "repeat".into())
+                .await
+                .unwrap();
+            assert_eq!(store.entry_count(), 1);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn last_place_gone_ends_session() {
+        let store = MemStore::new();
+        let (events, mut event_rx) = EventSink::channel();
+        let mut room = LiveRoom::load(DocId(id(100)), store, events, timing())
+            .await
+            .unwrap();
+        let ann = join_as(&mut room, 1, 1, 11, "editor", FORMAT, None, None).await;
+        let started = event_rx.recv().await.unwrap();
+        assert_eq!(started.kind, "live.session_started");
+        entry(&mut room, &ann, 1, 0, FORMAT, "one".into())
+            .await
+            .unwrap();
+        room.handle(LiveCommand::Leave {
+            conn: ann.conn,
+            client: ann.client,
+        })
+        .await
+        .unwrap();
+        room.settle().await.unwrap();
+        assert!(!room.has_session());
+        let mut ended = None;
+        while let Ok(event) = event_rx.try_recv() {
+            if event.kind == "live.session_ended" {
+                ended = Some(event);
+            }
+        }
+        let ended = ended.expect("session-ended event");
+        assert_eq!(ended.detail, serde_json::json!({ "head": 1, "entries": 1 }));
+
+        let bob = join_as(&mut room, 2, 2, 12, "editor", FORMAT, None, None).await;
+        assert_eq!(bob.participant, ParticipantNo(2));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn loaded_session_continues_with_fresh_expiry() {
+        let (mut original, store) = room().await;
+        let ann = join_as(&mut original, 1, 1, 11, "editor", FORMAT, None, None).await;
+        let _bob = join_as(&mut original, 2, 2, 12, "editor", FORMAT, None, None).await;
+        let resume = Some(LiveResume {
+            session: ann.session,
+            participant: ann.participant,
+        });
+        tokio::time::advance(Duration::from_secs(1_000)).await;
+        drop(original);
+
+        let mut loaded = LiveRoom::load(DocId(id(100)), store, EventSink::discard(), timing())
+            .await
+            .unwrap();
+        tokio::time::advance(Duration::from_millis(179_999)).await;
+        loaded.expire_due().await.unwrap();
+        assert_eq!(loaded.people().len(), 2);
+        let kept = join_as(&mut loaded, 3, 1, 11, "editor", FORMAT, resume, None).await;
+        assert_eq!(kept.place, Place::Kept);
+        assert_eq!(kept.participant, ann.participant);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn viewers_hold_places_too() {
+        let (mut room, _) = room().await;
+        let viewer = join_as(&mut room, 1, 1, 11, "viewer", FORMAT, None, None).await;
+        tokio::time::advance(Duration::from_secs(100)).await;
+        room.handle(LiveCommand::Heartbeat {
+            conn: viewer.conn,
+            client: viewer.client,
+            seen: Seq(0),
+        })
+        .await
+        .unwrap();
+        tokio::time::advance(Duration::from_secs(179)).await;
+        room.expire_due().await.unwrap();
+        assert!(room.has_session());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        room.expire_due().await.unwrap();
+        room.settle().await.unwrap();
+        assert!(!room.has_session());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reload_restores_client_ownership() {
+        let (mut original, store) = room().await;
+        let ann = join_as(&mut original, 1, 1, 11, "editor", FORMAT, None, None).await;
+        let resume = Some(LiveResume {
+            session: ann.session,
+            participant: ann.participant,
+        });
+        drop(original);
+        let mut loaded = LiveRoom::load(DocId(id(100)), store, EventSink::discard(), timing())
+            .await
+            .unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+        let (accepted, answer) = oneshot::channel();
+        loaded
+            .handle(LiveCommand::Join {
+                conn: 2,
+                client: ann.client,
+                user: UserId(id(99)),
+                session: SessionId(id(1099)),
+                name: "Impostor".into(),
+                role: builtin_access("editor"),
+                protocol: 1,
+                format: FORMAT.into(),
+                resume,
+                seen: Some(Seq(0)),
+                tx,
+                accepted,
+            })
+            .await
+            .unwrap();
+        assert_eq!(answer.await.unwrap(), JoinReply::Refused);
+        assert!(drain(&mut rx).is_empty());
+        assert!(matches!(
+            loaded.people().as_slice(),
+            [person]
+                if person.participant == ann.participant
+                    && person.client == ann.client
+                    && person.user == UserId(id(11))
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ended_session_place_is_returning_after_reload() {
+        let (mut original, store) = room().await;
+        let ann = join_as(&mut original, 1, 1, 11, "editor", FORMAT, None, None).await;
+        let resume = Some(LiveResume {
+            session: ann.session,
+            participant: ann.participant,
+        });
+        original
+            .handle(LiveCommand::Leave {
+                conn: ann.conn,
+                client: ann.client,
+            })
+            .await
+            .unwrap();
+        original.settle().await.unwrap();
+        drop(original);
+
+        let mut loaded = LiveRoom::load(DocId(id(100)), store, EventSink::discard(), timing())
+            .await
+            .unwrap();
+        let returned = join_as(&mut loaded, 2, 1, 11, "editor", FORMAT, resume, None).await;
+        assert_eq!(returned.participant, ParticipantNo(2));
+        assert_eq!(
+            returned.place,
+            Place::Returning {
+                previous: ann.participant
+            }
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_place_settlement_stays_pending_and_unpublished() {
+        let (mut room, store) = room().await;
+        let mut ann = join_as(&mut room, 1, 1, 11, "editor", FORMAT, None, None).await;
+        let mut bob = join_as(&mut room, 2, 2, 12, "editor", FORMAT, None, None).await;
+        let _ = drain(&mut ann.rx);
+        store.fail_next();
+        assert!(
+            room.handle(LiveCommand::Leave {
+                conn: ann.conn,
+                client: ann.client,
+            })
+            .await
+            .is_err()
+        );
+        assert!(drain(&mut ann.rx).is_empty());
+        assert!(drain(&mut bob.rx).is_empty());
+        assert!(
+            room.people()
+                .iter()
+                .any(|person| person.participant == ann.participant)
+        );
+
+        room.settle().await.unwrap();
+        assert!(drain(&mut bob.rx).iter().any(|message| matches!(
+            message,
+            LiveServerMsg::People { people }
+                if people.iter().all(|person| person.participant != ann.participant)
+        )));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_session_settlement_keeps_session() {
+        let (mut room, store) = room().await;
+        let ann = join_as(&mut room, 1, 1, 11, "editor", FORMAT, None, None).await;
+        room.handle(LiveCommand::Leave {
+            conn: ann.conn,
+            client: ann.client,
+        })
+        .await
+        .unwrap();
+        store.fail_next();
+        assert!(room.settle().await.is_err());
+        assert!(room.has_session());
+        room.settle().await.unwrap();
+        assert!(!room.has_session());
     }
 }

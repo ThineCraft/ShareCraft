@@ -166,6 +166,7 @@ mod memory {
         verified_through: Seq,
         entries: Vec<LiveEntryRow>,
         open_session: Option<LiveSessionRow>,
+        participants: Vec<LiveParticipantRow>,
         clients: HashMap<ClientId, (UserId, u64)>,
         locals: HashMap<(ClientId, u64), LiveLocal>,
     }
@@ -179,6 +180,7 @@ mod memory {
                 verified_through: Seq(0),
                 entries: Vec::new(),
                 open_session: None,
+                participants: Vec::new(),
                 clients: HashMap::new(),
                 locals: HashMap::new(),
             }
@@ -230,6 +232,7 @@ mod memory {
                 verified_through: memory.verified_through,
                 entries: memory.entries.clone(),
                 open_session: memory.open_session.clone(),
+                participants: memory.participants.clone(),
                 clients: memory
                     .clients
                     .iter()
@@ -282,13 +285,15 @@ mod memory {
                 return Err(DbError::new("participant zero is reserved"));
             }
             if let Some(open) = &mut memory.open_session {
-                open.participants.push(LiveParticipantRow {
+                let participant = LiveParticipantRow {
                     number,
                     client,
                     user,
                     joined_at: at,
                     gone: None,
-                });
+                };
+                open.participants.push(participant.clone());
+                memory.participants.push(participant);
             }
             Ok(number)
         }
@@ -301,14 +306,23 @@ mod memory {
             _at: OffsetDateTime,
         ) -> Result<(), DbError> {
             let mut state = self.write()?;
-            let place = state
+            let memory = state
                 .docs
                 .values_mut()
-                .filter_map(|doc| doc.open_session.as_mut())
-                .find(|open| open.id == session)
+                .find(|doc| doc.open_session.as_ref().map(|open| open.id) == Some(session))
+                .ok_or_else(|| DbError::new("live place does not exist"))?;
+            let place = memory
+                .open_session
+                .as_mut()
                 .and_then(|open| open.participants.iter_mut().find(|p| p.number == number))
                 .ok_or_else(|| DbError::new("live place does not exist"))?;
             place.gone.get_or_insert(reason);
+            let historical = memory
+                .participants
+                .iter_mut()
+                .find(|place| place.number == number)
+                .ok_or_else(|| DbError::new("historical live place does not exist"))?;
+            historical.gone.get_or_insert(reason);
             Ok(())
         }
 
