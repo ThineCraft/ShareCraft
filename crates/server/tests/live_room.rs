@@ -64,6 +64,32 @@ async fn revoke(site: &Site, owner: &TestUser, doc: DocId, user: &TestUser) {
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
 }
 
+fn assert_stored_client_entry(sent: &LiveClientMsg, stored: &LiveEntryRow) {
+    match (sent, stored) {
+        (
+            LiveClientMsg::Entry {
+                local,
+                seen,
+                format,
+                payload,
+            },
+            LiveEntryRow::Change {
+                local: stored_local,
+                seen: stored_seen,
+                format: stored_format,
+                payload: stored_payload,
+                ..
+            },
+        ) => {
+            assert_eq!(local.0, *stored_local);
+            assert_eq!(*seen, *stored_seen);
+            assert_eq!(format, stored_format);
+            assert_eq!(payload.as_bytes(), stored_payload);
+        }
+        (sent, stored) => panic!("client entry {sent:?} does not match stored row {stored:?}"),
+    }
+}
+
 #[tokio::test]
 async fn two_clients_converge_on_stand_in() {
     let server = live_server().await;
@@ -146,17 +172,32 @@ async fn expiry_with_entry_in_flight_commits_once() {
     let (doc, ann, bob) = shared_live(&server).await;
     let mut a = LiveTestClient::connect(&server, doc, &ann, "a").await;
     let mut b = LiveTestClient::connect(&server, doc, &bob, "b").await;
+    b.pump_until(|client| {
+        client.messages.iter().any(|message| {
+            matches!(message, LiveServerMsg::People { people } if people.iter().all(|person| person.user != ann.id))
+        })
+    })
+    .await;
     a.insert("in flight").await;
-    b.pump_until(|c| c.client().agreed_seq() == Seq(1)).await;
-    tokio::time::sleep(Duration::from_secs(4)).await;
+    let original = a.outbound_messages.last().unwrap().clone();
     a.pump_without_tick_until(|client| client.has_event(|event| matches!(event, Event::Expired)))
         .await;
+    assert_eq!(a.client().pending(), 1);
+    let sent_before_reconnect = a.outbound_messages.len();
     a.reconnect(&server).await;
     a.pump_until(|c| c.client().phase() == Phase::Live && c.client().pending() == 0)
         .await;
     assert!(matches!(a.last_place(), Some(Place::Returning { .. })));
+    assert!(a.outbound_messages[sent_before_reconnect..].contains(&original));
     let loaded = server.records_db().load_live(doc).await.unwrap();
-    assert_eq!(loaded.entries.len(), 1);
+    let stored = loaded
+        .entries
+        .iter()
+        .filter(|row| matches!(row, LiveEntryRow::Change { client, local: 1, .. } if *client == a.client().client()))
+        .collect::<Vec<_>>();
+    assert_eq!(stored.len(), 1);
+    assert_stored_client_entry(&original, stored[0]);
+    assert_eq!(a.client().pending(), 0);
 }
 
 #[tokio::test]
@@ -168,11 +209,15 @@ async fn log_survives_server_restart() {
     let ann = first.user("Ann").await;
     first.create_file_document(doc, &ann).await;
     let mut a = LiveTestClient::connect(&first, doc, &ann, "a").await;
-    for text in ["one", "two", "three"] {
+    for text in ["one", "two"] {
         a.insert(text).await;
     }
-    a.pump_until(|c| c.client().agreed_seq() == Seq(3) && c.client().pending() == 0)
+    a.pump_until(|c| c.client().agreed_seq() == Seq(2) && c.client().pending() == 0)
         .await;
+    a.drop_next_entry_frame();
+    a.insert("three").await;
+    let unconfirmed = a.outbound_messages.last().unwrap().clone();
+    assert_eq!(a.client().pending(), 1);
     let before = first.records_db().load_live(doc).await.unwrap();
     first.stop();
 
@@ -180,13 +225,78 @@ async fn log_survives_server_restart() {
     let bob = second.user("Bob").await;
     share(&second, &ann, doc, &bob, "editor").await;
     let b = LiveTestClient::connect(&second, doc, &bob, "b").await;
-    assert_eq!(b.lines(), vec!["one", "two", "three"]);
+    assert_eq!(b.lines(), vec!["one", "two"]);
+    let caught_up = b
+        .messages
+        .iter()
+        .filter_map(|message| match message {
+            LiveServerMsg::Entry { entry } => Some(entry),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(caught_up.len(), before.entries.len());
+    for (entry, row) in caught_up.iter().zip(&before.entries) {
+        match (&entry.body, row) {
+            (
+                EntryBody::Change {
+                    participant,
+                    client,
+                    local,
+                    seen,
+                    payload,
+                    ..
+                },
+                LiveEntryRow::Change {
+                    seq,
+                    client: stored_client,
+                    local: stored_local,
+                    participant: stored_participant,
+                    seen: stored_seen,
+                    at,
+                    seed,
+                    payload: stored_payload,
+                    ..
+                },
+            ) => {
+                assert_eq!(entry.seq, *seq);
+                assert_eq!(*client, *stored_client);
+                assert_eq!(local.0, *stored_local);
+                assert_eq!(participant.0, *stored_participant);
+                assert_eq!(
+                    i128::from(entry.at_ms),
+                    at.unix_timestamp_nanos() / 1_000_000
+                );
+                assert_eq!(entry.seed, *seed);
+                assert_eq!(*seen, *stored_seen);
+                assert_eq!(payload.as_bytes(), stored_payload);
+            }
+            (body, row) => panic!("caught-up entry {body:?} does not match stored row {row:?}"),
+        }
+    }
     let after = second.records_db().load_live(doc).await.unwrap();
     assert_eq!(before.entries, after.entries);
 
+    let sent_before_reconnect = a.outbound_messages.len();
     a.reconnect(&second).await;
-    a.pump_until(|c| c.client().phase() == Phase::Live).await;
+    a.pump_until(|c| c.client().phase() == Phase::Live && c.client().pending() == 0)
+        .await;
     assert_eq!(a.last_place(), Some(Place::Kept));
+    assert!(a.outbound_messages[sent_before_reconnect..].contains(&unconfirmed));
+    let after_resend = second.records_db().load_live(doc).await.unwrap();
+    assert_eq!(after_resend.head, Seq(3));
+    assert_eq!(
+        &after_resend.entries[..before.entries.len()],
+        before.entries.as_slice()
+    );
+    assert_eq!(after_resend.entries.len(), before.entries.len() + 1);
+    let resent = after_resend
+        .entries
+        .iter()
+        .filter(|row| matches!(row, LiveEntryRow::Change { client, local: 3, .. } if *client == a.client().client()))
+        .collect::<Vec<_>>();
+    assert_eq!(resent.len(), 1);
+    assert_stored_client_entry(&unconfirmed, resent[0]);
+    assert_eq!(a.client().pending(), 0);
     a.insert("four").await;
     a.pump_until(|c| c.client().agreed_seq() == Seq(4) && c.client().pending() == 0)
         .await;

@@ -7,7 +7,7 @@ use collab_live::client::{Event, LiveClient, LiveConfig, LocalError, Mode, Phase
 use collab_live::ids::LiveId;
 use collab_live::stand_in::{StandIn, StandInOp};
 use futures_util::{SinkExt, StreamExt};
-use protocol::live::{LiveServerMsg, Place};
+use protocol::live::{LiveClientMsg, LiveServerMsg, Place};
 use tokio_tungstenite::tungstenite::Message;
 
 use super::{Site, Socket, TIMEOUT, TestUser, open_socket};
@@ -22,7 +22,9 @@ pub struct LiveTestClient {
     socket: Option<Socket>,
     client: LiveClient<StandIn>,
     editor: StandIn,
+    drop_next_entry_frame: bool,
     pub events: Vec<Event>,
+    pub outbound_messages: Vec<LiveClientMsg>,
     pub messages: Vec<LiveServerMsg>,
     pub raw_messages: Vec<String>,
 }
@@ -40,7 +42,9 @@ impl LiveTestClient {
                 crashed_at: None,
             }),
             editor: StandIn::new(device),
+            drop_next_entry_frame: false,
             events: Vec::new(),
+            outbound_messages: Vec::new(),
             messages: Vec::new(),
             raw_messages: Vec::new(),
         };
@@ -100,6 +104,10 @@ impl LiveTestClient {
     pub async fn send_raw(&mut self, frame: &str) {
         let socket = self.socket.as_mut().expect("client is connected");
         socket.send(Message::text(frame)).await.unwrap();
+    }
+
+    pub fn drop_next_entry_frame(&mut self) {
+        self.drop_next_entry_frame = true;
     }
 
     pub async fn pump_until(&mut self, done: impl Fn(&LiveTestClient) -> bool) {
@@ -247,6 +255,16 @@ impl LiveTestClient {
 
     async fn send_frames(&mut self, frames: Vec<String>) {
         for frame in frames {
+            let message = serde_json::from_str(&frame).expect("live client frame");
+            let drop =
+                self.drop_next_entry_frame && matches!(&message, LiveClientMsg::Entry { .. });
+            if drop {
+                self.drop_next_entry_frame = false;
+            }
+            self.outbound_messages.push(message);
+            if drop {
+                continue;
+            }
             self.send_raw(&frame).await;
         }
     }
