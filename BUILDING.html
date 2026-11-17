@@ -30,7 +30,7 @@ ul.band>li:nth-child(even){background:light-dark(#f4f8f7,#212b30);border-radius:
 </header>
 <div class="layout">
 <nav aria-label="Document contents"><p>In this document</p>
-<a href="#need">01 · What you need</a><a href="#build">02 · Build and check</a><a href="#admin">03 · The first administrator</a><a href="#run">04 · Run it and sign in</a><a href="#settings">05 · Settings</a><a href="#accounts">06 · Accounts and signing in</a><a href="#sharing">07 · Sharing and roles</a><a href="#removed">08 · What a removed person sees</a><a href="#data">09 · Where data is kept</a><a href="#index">10 · The revision index</a><a href="#events">11 · Events</a><a href="#stop">12 · Stopping the server, and notices</a><a href="#editors">13 · Building the editors</a><a href="#files">14 · Opening a file document</a><a href="#session">15 · File session, seat and saving</a><a href="#content">16 · Content routes</a><a href="#tree">17 · The content tree and routes</a><a href="#treegit">18 · The tree in Git and PostgreSQL</a><a href="#upgrade">19 · Upgrading</a><a href="#policy">20 · The editor pages' policy</a><a href="#limits">21 · Known limits</a><a href="#scale">22 · A library of 100,000 files</a><a href="#groups">23 · Groups, roles and the explorer</a><a href="#links">24 · Sharing links and requests</a><a href="#storage">25 · Files, bin and quotas</a><a href="#sites">26 · Sites and navigation</a><a href="#libraries">27 · Libraries</a><a href="#branding">28 · Branding</a><a href="#production">29 · Production mode</a><a href="#branding2">30 · Branding, part two</a><a href="#licences">31 · Licences</a>
+<a href="#need">01 · What you need</a><a href="#build">02 · Build and check</a><a href="#admin">03 · The first administrator</a><a href="#run">04 · Run it and sign in</a><a href="#settings">05 · Settings</a><a href="#accounts">06 · Accounts and signing in</a><a href="#sharing">07 · Sharing and roles</a><a href="#removed">08 · What a removed person sees</a><a href="#data">09 · Where data is kept</a><a href="#index">10 · The revision index</a><a href="#events">11 · Events</a><a href="#stop">12 · Stopping the server, and notices</a><a href="#editors">13 · Building the editors</a><a href="#files">14 · Opening a file document</a><a href="#session">15 · File session, seat and saving</a><a href="#content">16 · Content routes</a><a href="#tree">17 · The content tree and routes</a><a href="#treegit">18 · The tree in Git and PostgreSQL</a><a href="#upgrade">19 · Upgrading</a><a href="#policy">20 · The editor pages' policy</a><a href="#limits">21 · Known limits</a><a href="#scale">22 · A library of 100,000 files</a><a href="#groups">23 · Groups, roles and the explorer</a><a href="#links">24 · Sharing links and requests</a><a href="#storage">25 · Files, bin and quotas</a><a href="#sites">26 · Sites and navigation</a><a href="#libraries">27 · Libraries</a><a href="#branding">28 · Branding</a><a href="#production">29 · Production mode</a><a href="#branding2">30 · Branding, part two</a><a href="#licences">31 · Licences</a><a href="#live-room">32 · Shared live room</a>
 </nav>
 <main id="main">
 <div class="toolbar"><span class="small">Standalone HTML · Print-ready · No external assets</span><button type="button" onclick="window.print()">Print / Save PDF</button></div>
@@ -1850,7 +1850,60 @@ sites/&lt;xx&gt;/&lt;site id&gt;.json                          a site's settings
 <p>The four editors are licensed MIT or Apache 2.0, by their original authors. They are not part of ShareCraft's code and are not compiled into the server. The build tool copies each fork's licence, notice and attribution files into the installed editor's <code>licenses/</code> folder; what each fork changed is listed in its <code>NOTICE</code> and in <a href="editors.html">editors.html</a>.</p>
 </section>
 
-<footer>ShareCraft · ThineCraft · Building and running · Updated 16 November 2026<br>Describes the development build after the third Stage 1 plan (editors, one person at a time; merged into <code>main</code> on 10 November 2026) and the follow-up (editors keep their document when hosted), the first Stage 2 plan (the content tree and inherited permissions), and the second (groups, roles and the inheritance explorer; on the branch <code>platform-groups-roles</code>, not yet merged), and the third (sharing links and access requests; on the branch <code>platform-links-requests</code>, not yet merged), then plan 3A (files; merged into <code>main</code> on 14 November 2026), plan 3B (sites; merged into <code>main</code> on 14 November 2026) and plan 3C (libraries; on the branch <code>platform-libraries</code>, not yet merged), plan 4A (branding; on the branch <code>platform-branding</code>, not yet merged) and plan 4B (branding, part two; on the branch <code>platform-branding-4b</code>, not yet merged). Not a release.</footer>
+<section id="live-room"><h2>32 / The shared collaboration library and live room</h2>
+<p>The <strong>live room</strong> is the server room for editors that understand ShareCraft&rsquo;s live protocol. An editor sends an opaque change: the server does not read or alter its content. The room gives changes one order, writes each one to PostgreSQL before sending it on, and sends that order to every participant. The shared <code>collab-live</code> library in each editor keeps the agreed document and the person&rsquo;s shown document, resends unconfirmed changes after a reconnect, sends the heartbeat, and goes back and re-runs waiting changes when the agreed order changes.</p>
+<div class="note"><p><strong>The live room is off for every document in this build.</strong> <code>Config.live_editors</code> is empty by default and remains empty until G5 wires the real browser and desktop hosts. Text documents still use the text room and file documents still use the existing one-person file session. Setting an editor in <code>Config.live_editors</code> is a code-level opt-in for tests and later integration; there is no user setting for it yet.</p></div>
+
+<h3>Settings and fixed limits</h3>
+<div class="table-wrap"><table class="banded"><caption>The new server settings</caption>
+<thead><tr><th>Setting</th><th>Default</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td><code>Config.live_editors</code></td><td>Empty</td><td>Only documents belonging to an editor in this list use the live room. G5 will turn it on for GridCraft after the host bridge exists.</td></tr>
+<tr><td><code>Config.live_heartbeat</code></td><td>60 seconds</td><td>How often a live client says it is still present. Any message counts. Its place expires after three missed periods: 180 seconds without a message.</td></tr>
+</tbody></table></div>
+<p>The live protocol is version 1. A change may contain at most 262,144 bytes. The server accepts at most 30 changes a second from one client, with a burst of 120; the library sends at most 20 a second. The room ends as soon as its last place holder leaves or expires; the text room&rsquo;s 60-second grace period does not apply.</p>
+
+<h3>The upgrade: migration 0018</h3>
+<p><code>crates/records/migrations/0018_live_log.sql</code> adds the live logs, sessions, participants, stored client numbers and refusals. <strong>This migration is one way.</strong> Before starting this build against an existing installation, stop ShareCraft and back up the data folder and the PostgreSQL database together, from the same stopped point. Restoring only one of them can leave Git and the database describing different documents.</p>
+<p>Migration 0018 has that number because the GitHub-surfacing branch already uses 0017. Whichever branch merges second must check the migrations then and renumber its unapplied migration if 0018 is no longer free. As section 02 says, an applied migration is never edited.</p>
+
+<h3>Log retention and purge</h3>
+<p>The server runs a live-log retention sweep when it starts and then once an hour. An entry is kept until a verified revision covers its log position. It is then kept for a further 30 days before the sweep removes its detail. Unverified entries stay. The document&rsquo;s log head stays even when all covered entry detail has gone, so positions never repeat or move backwards.</p>
+<p>Purging a document deletes its live logs inside the same PostgreSQL purge transaction. If the outcome of <code>COMMIT</code> is unknown, ShareCraft keeps the Git purge and leaves the normal Git-first reconcile to make PostgreSQL agree; it does not take the purge back on the assumption that the commit failed.</p>
+
+<h3>New events</h3>
+<div class="table-wrap"><table class="banded"><caption>Live-room events recorded for a document (section 11 says how an owner reads them)</caption>
+<thead><tr><th>Event</th><th>When it is recorded</th></tr></thead>
+<tbody>
+<tr><td><code>live.session_started</code></td><td>The first client starts a new live session.</td></tr>
+<tr><td><code>live.client_returned</code></td><td>A client whose earlier place ended returns as a new participant.</td></tr>
+<tr><td><code>live.client_expired</code></td><td>A place ends after three missed heartbeats.</td></tr>
+<tr><td><code>live.entry_cancelled</code></td><td>Every remaining editing witness reports that an entry failed, so the room cancels it for everyone.</td></tr>
+<tr><td><code>live.entry_failed_on_device</code></td><td>An entry stands but one participant&rsquo;s device cannot apply it, so that participant is told it cannot open the document as it now is.</td></tr>
+<tr><td><code>live.session_ended</code></td><td>The last place ends; the event records the ending head and the number of entries in the session.</td></tr>
+</tbody></table></div>
+
+<h3>Rules settled while it was built</h3>
+<div class="table-wrap"><table class="banded"><caption>Implementation rulings carried forward to G3, G4 and G5</caption>
+<thead><tr><th>Area</th><th>Rule</th></tr></thead>
+<tbody>
+<tr><td>Reloads</td><td>A page reload is a new client. The library makes its own <code>ClientId</code>; only the same in-memory client resumes after a dropped connection.</td></tr>
+<tr><td>Repeats</td><td>A repeated change is keyed by document, client and local number: <code>(document, client, local)</code>.</td></tr>
+<tr><td>Local numbers</td><td>Numbers may skip. A number above the next expected number is accepted, but an unseen number below it is refused as <code>out_of_order</code>. A stored number is a repeat and a refused number is refused again.</td></tr>
+<tr><td>Viewer failures</td><td>A viewer&rsquo;s crash report never helps cancel a change. If the change stands and the viewer remains stuck on it, the viewer is told <code>cannot_open</code>.</td></tr>
+<tr><td>Purges</td><td>Live logs are deleted inside the purge transaction. A purge whose <code>COMMIT</code> outcome is unknown is left for reconcile, as described above.</td></tr>
+</tbody></table></div>
+
+<h3>What was checked, and what was not</h3>
+<p>The shared library, protocol, PostgreSQL log, live room, reconnect and repeat handling, expiry, cancellation, restart recovery, retention, purge and coexistence with the text and file rooms have automated tests. The tests use a small stand-in document, not GridCraft.</p>
+<ul>
+<li><strong>No real editor is connected yet.</strong> GridCraft integration is G3.</li>
+<li><strong>No checkpoint is written yet.</strong> Checkpoint tickets, uploads, verification, major versions and the saved session data are G4.</li>
+<li><strong>Real browsers and the host bridge are not wired.</strong> Presence and turning on <code>Config.live_editors</code> are G5.</li>
+</ul>
+</section>
+
+<footer>ShareCraft · ThineCraft · Building and running · Updated 17 November 2026<br>Describes the development build through GridCraft co-authoring plan G2: the shared collaboration library and live room are built on <code>gridcraft-coauthoring-g2</code> and not yet merged or enabled for any document. Not a release.</footer>
 </main></div>
 </body>
 </html>

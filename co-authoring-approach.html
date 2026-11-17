@@ -23,11 +23,11 @@ tbody tr:nth-child(even)>td,tbody tr:nth-child(even)>th{background:light-dark(#f
 <p class="eyebrow">ThineCraft / ShareCraft decision paper</p>
 <h1>Co-authoring in the real editors</h1>
 <p class="lede">Who reconciles two people's changes, who writes the saved file, and what the rules are for a spreadsheet. Adopted by the owner on 11 November 2026, ahead of the Stage 2 plan.</p>
-<div class="meta"><span>Version 1.1 · Adopted by the owner, 11 November 2026; G1 results added 16 November 2026</span><span>11 November 2026</span><span>Changes in 1.0: every decision adopted as recommended (<a href="#changes10" style="color:inherit">list</a>)</span><span>Companion to <a href="sequencing.html" style="color:inherit">sequencing.html</a>, <a href="editor-readiness.html" style="color:inherit">editor-readiness.html</a> and <a href="scope.html" style="color:inherit">scope.html</a> (D16, D22, SC-15)</span></div>
+<div class="meta"><span>Version 1.2 · Adopted by the owner, 11 November 2026; G2 build notes added 17 November 2026</span><span>17 November 2026</span><span>Changes in 1.2: G2 built the shared library and live room (<a href="#changes12" style="color:inherit">list</a>)</span><span>Companion to <a href="sequencing.html" style="color:inherit">sequencing.html</a>, <a href="editor-readiness.html" style="color:inherit">editor-readiness.html</a> and <a href="scope.html" style="color:inherit">scope.html</a> (D16, D22, SC-15)</span></div>
 </header>
 <div class="layout">
 <nav aria-label="Document contents"><p>In this document</p>
-<a href="#summary">01 · Summary</a><a href="#today">02 · What exists today</a><a href="#options">03 · Who reconciles</a><a href="#shape">04 · How it works</a><a href="#checkpoint">05 · Who writes the checkpoint</a><a href="#identities">06 · GridCraft: identities</a><a href="#conflicts">07 · GridCraft: conflict rules</a><a href="#undo">08 · GridCraft: undo</a><a href="#others">09 · The other editors</a><a href="#library">10 · Shared library and forks</a><a href="#spine">11 · Changes to the spine</a><a href="#risks">12 · Risks and open questions</a><a href="#outofscope">13 · Out of scope</a><a href="#decisions">14 · Decisions asked</a><a href="#method">15 · How this was established</a><a href="#changes03">Changes in v0.3</a><a href="#changes10">Changes in v1.0</a><a href="#changes11">Changes in v1.1</a>
+<a href="#summary">01 · Summary</a><a href="#today">02 · What exists today</a><a href="#options">03 · Who reconciles</a><a href="#shape">04 · How it works</a><a href="#checkpoint">05 · Who writes the checkpoint</a><a href="#identities">06 · GridCraft: identities</a><a href="#conflicts">07 · GridCraft: conflict rules</a><a href="#undo">08 · GridCraft: undo</a><a href="#others">09 · The other editors</a><a href="#library">10 · Shared library and forks</a><a href="#spine">11 · Changes to the spine</a><a href="#risks">12 · Risks and open questions</a><a href="#outofscope">13 · Out of scope</a><a href="#decisions">14 · Decisions asked</a><a href="#method">15 · How this was established</a><a href="#changes03">Changes in v0.3</a><a href="#changes10">Changes in v1.0</a><a href="#changes11">Changes in v1.1</a><a href="#changes12">Changes in v1.2</a>
 </nav>
 <main id="main">
 <div class="toolbar"><span class="small">Standalone HTML · Print-ready · No external assets</span><button type="button" onclick="window.print()">Print / Save PDF</button></div>
@@ -41,6 +41,7 @@ tbody tr:nth-child(even)>td,tbody tr:nth-child(even)>th{background:light-dark(#f
 <li><strong>What a change says.</strong> A change names the things it touches by a lasting identity, not by a position. "Row 5" becomes "the row with this identity", so it still means the same row after someone inserts a row above it.</li>
 <li><strong>The evidence supports this, with five amendments.</strong> They are listed in the note below. None of them points to a different option. One adds a part the provisional recommendation did not have: a way to cancel a bad change for everyone.</li>
 <li><strong>Revised after an independent review, then after the owner's decisions.</strong> Version 0.2 kept the recommendation and corrected how it is carried out. Version 0.3 records the owner's decisions, drops the server-side helper process that version 0.2 proposed, and adds desktop editors to the sessions. Version 1.0 records the owner's adoption of every decision as recommended. Section 15 lists what changed.</li>
+<li><strong>G2 is built, but not yet connected to GridCraft.</strong> Version 1.2 records the shared library and opaque-entry server room built on <code>gridcraft-coauthoring-g2</code>, not yet merged. The room is off for every document until G5. G3 supplies the real editor, G4 the checkpoints, and G5 the browser and desktop host bridge.</li>
 <li><strong>The saved file.</strong> While people are connected, one person's editor uploads the file at a stated point in the list of changes, and a second editor confirms it. The server keeps the list on disk until the file is stored. If everyone leaves before that, the changes stay on disk, and the next person to open the document has their editor apply them and save.</li>
 <li><strong>GridCraft.</strong> Sheets, rows and columns get identities that last for the session. A cell is its row and its column. GridCraft's existing code already keeps every stored formula right when rows and columns move. What is new is the same care for the change that is still on its way.</li>
 </ul>
@@ -455,8 +456,17 @@ tbody tr:nth-child(even)>td,tbody tr:nth-child(even)>th{background:light-dark(#f
 </ul>
 <h3 id="changes11">Changes in version 1.1, after the G1 proofs</h3>
 <p>Plan G1 ran the proofs C16 asks for before any building (16 November 2026). The design is unchanged. Four rows in section 12 now say what was measured, with links to <a href="gridcraft-coauthoring-proofs.html">gridcraft-coauthoring-proofs.html</a>: the two-engine replay, save and reopen, the cost of re-running, and desktop against browser. The report recommends going ahead with conditions, which the owner has not yet decided.</p>
+<h3 id="changes12">Changes in version 1.2, after the G2 build</h3>
+<p>Plan G2 built the shared collaboration library and opaque-entry live room on <code>gridcraft-coauthoring-g2</code> (17 November 2026). The adopted design is unchanged. The live room is off for every document until G5 because <code>Config.live_editors</code> is empty. There is no real GridCraft editor yet (G3), no checkpoint (G4), and no real browser or host bridge (G5).</p>
+<ul>
+<li><strong>Client identity:</strong> a page reload is a new client, and the library makes its own <code>ClientId</code>. Only the same in-memory client resumes after a dropped connection.</li>
+<li><strong>Repeats and order:</strong> repeats are keyed by <code>(document, client, local)</code>. Skipped local numbers are accepted, but an unseen number below the next expected one is refused as out of order.</li>
+<li><strong>Viewers and failed entries:</strong> a viewer&rsquo;s crash report never helps cancel a change. A viewer stuck on an entry that stands is told <code>cannot_open</code>.</li>
+<li><strong>Purges:</strong> live logs are deleted inside the purge transaction. A purge whose <code>COMMIT</code> outcome is unknown is left to the normal reconcile path.</li>
+<li><strong>Migration number:</strong> G2 uses migration 0018 because the GitHub-surfacing branch already takes 0017. Whichever branch merges second checks the number and renumbers its unapplied migration.</li>
+</ul>
 </section>
 
-<footer>ShareCraft · ThineCraft · Co-authoring Approach v1.1 · 16 November 2026<br>Adopted by the owner on 11 November 2026, as recommended. Read with Scope of Works v0.9 (D22) and Sequencing Plan v0.4.</footer>
+<footer>ShareCraft · ThineCraft · Co-authoring Approach v1.2 · 17 November 2026<br>Adopted by the owner on 11 November 2026, as recommended. Read with Scope of Works v0.18 (D22) and Sequencing Plan v0.16.</footer>
 </main></div>
 </body></html>
