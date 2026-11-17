@@ -57,7 +57,7 @@ pub use libraries::{
 pub use links::{AnyoneGrant, Link, LinkError, LinkKind, LinkToken};
 pub use live::{
     GoneReason, LiveEntryRow, LiveLoaded, LiveLocal, LiveParticipantRow, LiveSessionRow,
-    NewLiveChange,
+    NewLiveCancel, NewLiveChange,
 };
 pub use navigation::{NavViewer, ResolvedItem, ResolvedTarget, SitesMirror};
 pub use policies::{

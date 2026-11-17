@@ -143,6 +143,18 @@ pub struct NewLiveChange<'a> {
     pub witnesses: &'a [u32],
 }
 
+/// A cancel record to store at the head of the log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NewLiveCancel {
+    /// Must be the head plus one.
+    pub seq: Seq,
+    pub session: Uuid,
+    pub cancels: Seq,
+    pub reports: u32,
+    pub at: OffsetDateTime,
+    pub seed: u32,
+}
+
 /// What became of one of a client's local numbers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LiveLocal {
@@ -655,6 +667,71 @@ impl Db {
             return Err(DbError::new(format!(
                 "{} is not a live session of {}",
                 change.session, doc.0
+            )));
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Stores a cancel record at the head of `doc`'s log, empties the cancelled change and
+    /// points it at the new record, all in one transaction.
+    pub async fn cancel_live_entry(
+        &self,
+        doc: DocId,
+        cancel: &NewLiveCancel,
+    ) -> Result<(), DbError> {
+        let seq = signed(cancel.seq.0)?;
+        let cancels = signed(cancel.cancels.0)?;
+        let mut tx = self.pool().begin().await?;
+        ensure_log(&mut tx, doc).await?;
+        let moved =
+            sqlx::query("update live_logs set head = $2 where document_id = $1 and head = $2 - 1")
+                .bind(doc.0)
+                .bind(seq)
+                .execute(&mut *tx)
+                .await?;
+        if moved.rows_affected() != 1 {
+            return Err(DbError::new(format!(
+                "position {seq} does not follow the head of {}",
+                doc.0
+            )));
+        }
+        let format: Option<String> = sqlx::query_scalar(
+            "update live_entries set cancelled_by = $3, payload = '' \
+             where document_id = $1 and seq = $2 and kind = 'change' \
+                   and cancelled_by is null returning format",
+        )
+        .bind(doc.0)
+        .bind(cancels)
+        .bind(seq)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let format = format.ok_or_else(|| {
+            DbError::new(format!(
+                "position {cancels} is not an uncancelled change of {}",
+                doc.0
+            ))
+        })?;
+        let stored = sqlx::query(
+            "insert into live_entries (document_id, seq, session_id, kind, at, seed, format, \
+                                       cancels, reports) \
+             select $1, $2, $3, 'cancel', $4, $5, $6, $7, $8 \
+             where exists (select 1 from live_sessions where id = $3 and document_id = $1)",
+        )
+        .bind(doc.0)
+        .bind(seq)
+        .bind(cancel.session)
+        .bind(cancel.at)
+        .bind(i64::from(cancel.seed))
+        .bind(format)
+        .bind(cancels)
+        .bind(number(cancel.reports)?)
+        .execute(&mut *tx)
+        .await?;
+        if stored.rows_affected() != 1 {
+            return Err(DbError::new(format!(
+                "{} is not a live session of {}",
+                cancel.session, doc.0
             )));
         }
         tx.commit().await?;

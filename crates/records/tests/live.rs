@@ -11,7 +11,7 @@ mod common;
 use collab_core::ids::{ClientId, DocId, Seq, UserId};
 use common::{Gate, tree, user, wait_blocked};
 use records::test_support::TestDb;
-use records::{GoneReason, LiveEntryRow, LiveLocal, NewLiveChange};
+use records::{GoneReason, LiveEntryRow, LiveLocal, NewLiveCancel, NewLiveChange};
 use sqlx::Connection;
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
@@ -242,6 +242,74 @@ async fn cancel_rows_load_back() {
             reports: 2,
         }
     );
+}
+
+#[tokio::test]
+async fn cancel_live_entry_is_atomic() {
+    let s = setup().await;
+    let session = session(&s, 0).await;
+    let one = client();
+    s.test
+        .db
+        .append_live_change(s.doc, &change(1, session, one, s.ann, 1, b"crash", &[1, 2]))
+        .await
+        .unwrap();
+
+    s.test
+        .db
+        .cancel_live_entry(
+            s.doc,
+            &NewLiveCancel {
+                seq: Seq(2),
+                session,
+                cancels: Seq(1),
+                reports: 2,
+                at: at(2),
+                seed: 17,
+            },
+        )
+        .await
+        .unwrap();
+
+    let loaded = s.test.db.load_live(s.doc).await.unwrap();
+    assert_eq!(loaded.head, Seq(2));
+    assert!(matches!(
+        &loaded.entries[0],
+        LiveEntryRow::Change {
+            cancelled_by: Some(Seq(2)),
+            payload,
+            ..
+        } if payload.is_empty()
+    ));
+    assert!(matches!(
+        loaded.entries[1],
+        LiveEntryRow::Cancel {
+            seq: Seq(2),
+            cancels: Seq(1),
+            reports: 2,
+            seed: 17,
+            ..
+        }
+    ));
+
+    assert!(
+        s.test
+            .db
+            .cancel_live_entry(
+                s.doc,
+                &NewLiveCancel {
+                    seq: Seq(3),
+                    session,
+                    cancels: Seq(1),
+                    reports: 1,
+                    at: at(3),
+                    seed: 18,
+                },
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(head(&s).await, Seq(2));
 }
 
 #[tokio::test]

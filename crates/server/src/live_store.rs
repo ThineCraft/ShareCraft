@@ -3,7 +3,7 @@
 use std::future::Future;
 
 use collab_core::ids::{ClientId, DocId, UserId};
-use records::{Db, DbError, GoneReason, LiveLoaded, LiveLocal, NewLiveChange};
+use records::{Db, DbError, GoneReason, LiveLoaded, LiveLocal, NewLiveCancel, NewLiveChange};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -39,6 +39,12 @@ pub(crate) trait LiveStore: Send + Sync + 'static {
         &self,
         doc: DocId,
         change: &NewLiveChange<'_>,
+    ) -> impl Future<Output = Result<(), DbError>> + Send;
+
+    fn cancel_live_entry(
+        &self,
+        doc: DocId,
+        cancel: &NewLiveCancel,
     ) -> impl Future<Output = Result<(), DbError>> + Send;
 
     fn consume_live_local(
@@ -107,6 +113,10 @@ impl LiveStore for Db {
         change: &NewLiveChange<'_>,
     ) -> Result<(), DbError> {
         Db::append_live_change(self, doc, change).await
+    }
+
+    async fn cancel_live_entry(&self, doc: DocId, cancel: &NewLiveCancel) -> Result<(), DbError> {
+        Db::cancel_live_entry(self, doc, cancel).await
     }
 
     async fn consume_live_local(
@@ -369,6 +379,46 @@ mod memory {
                 .entry(change.client)
                 .and_modify(|(_, current)| *current = (*current).max(next))
                 .or_insert((change.user, next));
+            Ok(())
+        }
+
+        async fn cancel_live_entry(
+            &self,
+            doc: DocId,
+            cancel: &NewLiveCancel,
+        ) -> Result<(), DbError> {
+            let mut state = self.write()?;
+            let memory = state.docs.entry(doc).or_default();
+            if cancel.seq.0 != memory.head.0 + 1 {
+                return Err(DbError::new("cancel does not follow live head"));
+            }
+            if memory.open_session.as_ref().map(|open| open.id) != Some(cancel.session) {
+                return Err(DbError::new("live session is not open"));
+            }
+            let Some(index) = memory.entries.iter().position(|entry| {
+                matches!(entry, LiveEntryRow::Change { seq, cancelled_by: None, .. } if *seq == cancel.cancels)
+            }) else {
+                return Err(DbError::new("cancel target is not an uncancelled change"));
+            };
+            let Some(LiveEntryRow::Change {
+                payload,
+                cancelled_by,
+                ..
+            }) = memory.entries.get_mut(index)
+            else {
+                return Err(DbError::new("cancel target is not a change"));
+            };
+            payload.clear();
+            *cancelled_by = Some(cancel.seq);
+            memory.entries.push(LiveEntryRow::Cancel {
+                seq: cancel.seq,
+                session: cancel.session,
+                at: cancel.at,
+                seed: cancel.seed,
+                cancels: cancel.cancels,
+                reports: cancel.reports,
+            });
+            memory.head = cancel.seq;
             Ok(())
         }
 
