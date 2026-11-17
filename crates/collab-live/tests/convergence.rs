@@ -12,11 +12,11 @@
 #[path = "support/sim.rs"]
 mod sim;
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 
-use collab_core::ids::Seq;
+use collab_core::ids::{ClientId, Seq};
 use collab_live::client::{
-    EntryView, Event, LiveClient, LiveConfig, LiveEditor, Mode, Phase, Stamp, Step,
+    Crash, EntryView, Event, LiveClient, LiveConfig, LiveEditor, Mode, Outcome, Phase, Stamp, Step,
 };
 use collab_live::ids::LiveId;
 use collab_live::stand_in::{StandIn, StandInOp};
@@ -28,28 +28,101 @@ const FORMAT: &str = "stand-in/1";
 const DEVICES: [&str; 3] = ["a", "b", "c"];
 const MAX_CHANGES: usize = 60;
 
+/// A device's editor, whose crashes leave it half changed, and the host's crash note, which
+/// survives a reload.
+struct Host {
+    doc: StandIn,
+    note: Option<Seq>,
+    /// Entries the editor on this device stopped in, kept across reloads.
+    crashed: HashSet<Seq>,
+    /// Entries the editor was asked to apply again after stopping in them: the client must
+    /// never do that (the stall and the crash note prevent it).
+    again: Vec<Seq>,
+}
+
+impl LiveEditor for Host {
+    type Snapshot = StandIn;
+
+    fn snapshot(&self) -> StandIn {
+        self.doc.snapshot()
+    }
+
+    fn restore(&mut self, snapshot: &StandIn) {
+        self.doc.restore(snapshot);
+    }
+
+    fn apply(&mut self, entry: &EntryView<'_>) -> Result<Outcome, Crash> {
+        if let Some(seq) = entry.seq
+            && self.crashed.contains(&seq)
+        {
+            self.again.push(seq);
+        }
+        let result = self.doc.apply(entry);
+        if result.is_err()
+            && let Some(seq) = entry.seq
+        {
+            self.crashed.insert(seq);
+        }
+        result
+    }
+
+    fn note_applying(&mut self, seq: Option<Seq>) {
+        self.note = seq;
+    }
+}
+
 /// One device: an editor, its client, and the frames it sent that the server has not read.
 struct Device {
     name: &'static str,
-    doc: StandIn,
-    client: LiveClient<StandIn>,
+    doc: Host,
+    client: LiveClient<Host>,
     conn: Option<ConnId>,
     to_server: VecDeque<String>,
     now: u64,
+    /// Whether the client asked for the base and the host has not loaded it yet.
+    loading: bool,
+    /// How many changes this client took (its local numbers are 1 to `made`).
+    made: u64,
+    /// Local numbers the client reported refused.
+    refused: Vec<u64>,
+    /// Local numbers dropped because the person lost the right to edit.
+    dropped: Vec<u64>,
 }
 
 impl Device {
-    fn new(name: &'static str, crashed_at: Option<Seq>, now: u64) -> Device {
+    /// A new client on a fresh device.
+    fn new(name: &'static str) -> Device {
+        Device::reloaded(name, None, HashSet::new(), Vec::new(), 0)
+    }
+
+    /// A new client; `note` is the host's crash note, kept across a reload, as are the
+    /// records of where the editor crashed.
+    fn reloaded(
+        name: &'static str,
+        note: Option<Seq>,
+        crashed: HashSet<Seq>,
+        again: Vec<Seq>,
+        now: u64,
+    ) -> Device {
         Device {
             name,
-            doc: StandIn::new(name),
+            doc: Host {
+                doc: StandIn::damaging(name),
+                note,
+                crashed,
+                again,
+            },
             client: LiveClient::new(LiveConfig {
                 format: FORMAT.to_owned(),
-                crashed_at,
+                crashed_at: note,
             }),
             conn: None,
             to_server: VecDeque::new(),
             now,
+            loading: false,
+            made: 0,
+            refused: Vec::new(),
+            dropped: Vec::new(),
         }
     }
 }
@@ -61,19 +134,19 @@ struct World {
     ids: Vec<LiveId>,
     changes: usize,
     texts: u64,
+    /// Every (client, local) any client, reloaded ones included, reported refused.
+    refused: Vec<(ClientId, u64)>,
 }
 
 impl World {
     fn new() -> World {
         World {
             sim: Sim::new(FORMAT),
-            devices: DEVICES
-                .iter()
-                .map(|name| Device::new(name, None, 0))
-                .collect(),
+            devices: DEVICES.iter().map(|name| Device::new(name)).collect(),
             ids: Vec::new(),
             changes: 0,
             texts: 0,
+            refused: Vec::new(),
         }
     }
 
@@ -86,17 +159,24 @@ impl World {
                 Event::LoadBase { revision, at: base } => {
                     prop_assert_eq!(revision, None);
                     prop_assert_eq!(base, Seq(0));
+                    // The host loads the base later (`base_ready`), so entries may be held.
+                    self.devices[at].loading = true;
+                }
+                Event::Refused { local, .. } => {
                     let device = &mut self.devices[at];
-                    device.doc = StandIn::new(device.name);
-                    let step = device
-                        .client
-                        .base_ready(&mut device.doc, device.now)
-                        .map_err(|error| TestCaseError::fail(format!("base_ready: {error}")))?;
-                    self.handle(at, step)?;
+                    device.refused.push(local.0);
+                    self.refused.push((device.client.client(), local.0));
+                }
+                Event::DroppedPending { count } => {
+                    // The waiting changes are always the latest ones made.
+                    let device = &mut self.devices[at];
+                    let first = device.made + 1 - count as u64;
+                    device.dropped.extend(first..=device.made);
                 }
                 Event::Expired => {
                     // The server closed the connection after this last frame.
                     let device = &mut self.devices[at];
+                    device.loading = false;
                     if let Some(conn) = device.conn.take() {
                         self.sim.drop_conn(conn);
                     }
@@ -126,8 +206,23 @@ impl World {
         Ok(())
     }
 
+    /// The host has loaded the base the client asked for.
+    fn base_ready(&mut self, at: usize) -> Result<(), TestCaseError> {
+        let device = &mut self.devices[at];
+        if !std::mem::take(&mut device.loading) || device.client.phase() != Phase::LoadingBase {
+            return Ok(());
+        }
+        device.doc.doc = StandIn::damaging(device.name);
+        let step = device
+            .client
+            .base_ready(&mut device.doc, device.now)
+            .map_err(|error| TestCaseError::fail(format!("base_ready: {error}")))?;
+        self.handle(at, step)
+    }
+
     fn disconnect(&mut self, at: usize) {
         let device = &mut self.devices[at];
+        device.loading = false;
         if let Some(conn) = device.conn.take() {
             self.sim.drop_conn(conn);
             device.to_server.clear();
@@ -223,20 +318,23 @@ impl World {
             .local(&mut device.doc, StandIn::op(&op), mode, device.now)
         {
             self.changes += 1;
+            device.made += 1;
             self.handle(at, step)?;
         }
         Ok(())
     }
 
-    /// The page is loaded again: a new client, with the crash note if it was stalled.
+    /// The page is loaded again: a new client, started with the host's crash note.
     fn reload(&mut self, at: usize) {
         self.disconnect(at);
-        let old = &self.devices[at];
-        let crashed_at = match old.client.phase() {
-            Phase::Stalled { at } => Some(at),
-            _ => None,
-        };
-        let device = Device::new(old.name, crashed_at, old.now);
+        let old = &mut self.devices[at];
+        let device = Device::reloaded(
+            old.name,
+            old.doc.note,
+            std::mem::take(&mut old.doc.crashed),
+            std::mem::take(&mut old.doc.again),
+            old.now,
+        );
         self.devices[at] = device;
     }
 
@@ -258,12 +356,17 @@ impl World {
             self.sim.set_can_edit(client, true);
         }
         for _ in 0..2_000 {
+            self.sim.give_verdicts();
             for at in 0..self.devices.len() {
                 self.connect(at)?;
             }
             for _ in 0..1_000 {
                 let mut moved = false;
                 for at in 0..self.devices.len() {
+                    if self.devices[at].loading {
+                        moved = true;
+                        self.base_ready(at)?;
+                    }
                     let device = &self.devices[at];
                     let to_server = device.to_server.len();
                     let to_client = device.conn.map_or(0, |conn| self.sim.waiting(conn));
@@ -290,6 +393,36 @@ impl World {
             .map(|device| (device.client.phase(), device.client.pending()))
             .collect();
         Err(TestCaseError::fail(format!("never settled: {phases:?}")))
+    }
+
+    /// No change reported refused is in the log, and every change a client still running made
+    /// is in the log, refused, or dropped for lost edit rights.
+    fn check_refusals(&self) -> Result<(), TestCaseError> {
+        let stored: HashSet<(ClientId, u64)> = self
+            .sim
+            .log()
+            .iter()
+            .filter_map(|entry| match &entry.body {
+                EntryBody::Change { client, local, .. } => Some((*client, local.0)),
+                EntryBody::Cancel { .. } => None,
+            })
+            .collect();
+        for refused in &self.refused {
+            prop_assert!(!stored.contains(refused), "{refused:?} refused but stored");
+        }
+        for device in &self.devices {
+            let client = device.client.client();
+            for local in 1..=device.made {
+                prop_assert!(
+                    stored.contains(&(client, local))
+                        || device.refused.contains(&local)
+                        || device.dropped.contains(&local),
+                    "device {} change {local} was lost",
+                    device.name
+                );
+            }
+        }
+        Ok(())
     }
 
     /// A fresh document with the server's log applied in order.
@@ -357,6 +490,10 @@ enum Action {
     Reload {
         device: usize,
     },
+    BaseReady {
+        device: usize,
+    },
+    Verdicts,
 }
 
 fn action() -> impl Strategy<Value = Action> {
@@ -373,12 +510,20 @@ fn action() -> impl Strategy<Value = Action> {
         2 => device.clone().prop_map(|device| Action::Reconnect { device }),
         1 => device.clone().prop_map(|device| Action::Expire { device }),
         1 => (device.clone(), any::<bool>()).prop_map(|(device, can_edit)| Action::Access { device, can_edit }),
-        1 => device.prop_map(|device| Action::Reload { device }),
+        1 => device.clone().prop_map(|device| Action::Reload { device }),
+        3 => device.prop_map(|device| Action::BaseReady { device }),
+        2 => Just(Action::Verdicts),
     ]
 }
 
 fn run(actions: &[Action]) -> Result<(), TestCaseError> {
+    run_with(actions, true)
+}
+
+/// Runs a session; `delay_verdicts` says whether verdicts wait for a `Verdicts` action.
+fn run_with(actions: &[Action], delay_verdicts: bool) -> Result<(), TestCaseError> {
     let mut world = World::new();
+    world.sim.delay_verdicts = delay_verdicts;
     // Everyone joins first, so the early changes have somewhere to go.
     world.settle()?;
     for action in actions {
@@ -403,11 +548,13 @@ fn run(actions: &[Action]) -> Result<(), TestCaseError> {
                 world.sim.set_can_edit(client, can_edit);
             }
             Action::Reload { device } => world.reload(device),
+            Action::BaseReady { device } => world.base_ready(device)?,
+            Action::Verdicts => world.sim.give_verdicts(),
         }
     }
     world.settle()?;
 
-    let expected = world.replay().lines();
+    let expected = world.replay();
     for device in &world.devices {
         prop_assert_eq!(device.client.pending(), 0);
         prop_assert_eq!(device.client.phase(), Phase::Live);
@@ -415,8 +562,22 @@ fn run(actions: &[Action]) -> Result<(), TestCaseError> {
             device.client.agreed_seq(),
             Seq(world.sim.log().len() as u64)
         );
-        prop_assert_eq!(&device.doc.lines(), &expected, "device {}", device.name);
+        prop_assert_eq!(device.doc.note, None, "device {}", device.name);
+        prop_assert!(
+            device.doc.again.is_empty(),
+            "device {} applied {:?} again after crashing in it",
+            device.name,
+            device.doc.again
+        );
+        // Lines, ids and the id table alike, not only the texts.
+        prop_assert_eq!(
+            device.doc.doc.content(),
+            expected.content(),
+            "device {}",
+            device.name
+        );
     }
+    world.check_refusals()?;
     Ok(())
 }
 
@@ -424,8 +585,11 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 
     #[test]
-    fn random_sessions_converge(actions in prop::collection::vec(action(), 0..400)) {
-        run(&actions)?;
+    fn random_sessions_converge(
+        actions in prop::collection::vec(action(), 0..400),
+        delay_verdicts in any::<bool>(),
+    ) {
+        run_with(&actions, delay_verdicts)?;
     }
 }
 
@@ -468,10 +632,17 @@ fn scripted_session_converges() {
     world.sim.expire(b);
     world.deliver_to_server(1, 10);
     world.settle().unwrap();
-    let expected = world.replay().lines();
-    assert!(!expected.is_empty());
+    let expected = world.replay();
+    assert!(!expected.lines().is_empty());
+    world.check_refusals().unwrap();
     for device in &world.devices {
-        assert_eq!(device.doc.lines(), expected, "device {}", device.name);
+        assert_eq!(
+            device.doc.doc.content(),
+            expected.content(),
+            "device {}",
+            device.name
+        );
+        assert_eq!(device.doc.note, None);
         assert_eq!(device.client.pending(), 0);
     }
     let cancels = world
@@ -485,4 +656,168 @@ fn scripted_session_converges() {
         world.sim.resyncs > 0,
         "a's editor applied both and loaded the base again"
     );
+}
+
+/// Sessions the random runs found when the review's three faults were put back, kept so each
+/// is always tried.
+mod found {
+    use super::{Action::*, run, run_with};
+
+    /// A own waiting change that crashes the editor, confirmed during a catch-up from the base
+    /// before any copy exists (review I1).
+    #[test]
+    fn own_crash_confirmed_during_a_base_catch_up() {
+        run_with(
+            &[
+                Change {
+                    device: 2,
+                    kind: 9,
+                    pick: 1254765286747124472,
+                    wait: false,
+                },
+                ToServer {
+                    device: 2,
+                    count: 1,
+                },
+                Change {
+                    device: 2,
+                    kind: 9,
+                    pick: 1819974019953870530,
+                    wait: true,
+                },
+                ToClient {
+                    device: 0,
+                    count: 1,
+                },
+            ],
+            false,
+        )
+        .unwrap();
+    }
+
+    /// A verdict that reaches a reloaded client while it loads the base (review I2).
+    #[test]
+    fn verdict_held_while_a_reloaded_client_loads_the_base() {
+        let mut actions = vec![
+            Change {
+                device: 0,
+                kind: 0,
+                pick: 0,
+                wait: false
+            };
+            15
+        ];
+        actions.extend([
+            Access {
+                device: 2,
+                can_edit: false,
+            },
+            Change {
+                device: 1,
+                kind: 9,
+                pick: 5668238091124939601,
+                wait: false,
+            },
+            ToServer {
+                device: 1,
+                count: 1,
+            },
+            Reconnect { device: 0 },
+            Change {
+                device: 0,
+                kind: 0,
+                pick: 0,
+                wait: false,
+            },
+            Change {
+                device: 0,
+                kind: 0,
+                pick: 0,
+                wait: false,
+            },
+            ToClient {
+                device: 2,
+                count: 2,
+            },
+            ToServer {
+                device: 2,
+                count: 1,
+            },
+            Reload { device: 2 },
+            Reconnect { device: 2 },
+            ToServer {
+                device: 2,
+                count: 1,
+            },
+        ]);
+        run(&actions).unwrap();
+    }
+
+    /// A reload while waiting for a verdict after an expiry and a base load (review I3).
+    #[test]
+    fn reload_while_waiting_for_a_verdict() {
+        run(&[
+            Change {
+                device: 1,
+                kind: 0,
+                pick: 0,
+                wait: false,
+            },
+            Change {
+                device: 1,
+                kind: 0,
+                pick: 0,
+                wait: false,
+            },
+            Change {
+                device: 1,
+                kind: 0,
+                pick: 0,
+                wait: false,
+            },
+            Access {
+                device: 1,
+                can_edit: false,
+            },
+            Change {
+                device: 0,
+                kind: 0,
+                pick: 0,
+                wait: false,
+            },
+            Change {
+                device: 0,
+                kind: 0,
+                pick: 0,
+                wait: false,
+            },
+            Change {
+                device: 0,
+                kind: 9,
+                pick: 3671932346002311409,
+                wait: false,
+            },
+            ToServer {
+                device: 0,
+                count: 3,
+            },
+            Expire { device: 1 },
+            ToClient {
+                device: 1,
+                count: 5,
+            },
+            Reconnect { device: 1 },
+            ToServer {
+                device: 1,
+                count: 1,
+            },
+            ToClient {
+                device: 1,
+                count: 3,
+            },
+            BaseReady { device: 1 },
+            Reload { device: 1 },
+        ])
+        .unwrap();
+    }
 }

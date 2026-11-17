@@ -22,6 +22,9 @@ pub struct StandIn {
     lines: Vec<(LiveId, String)>,
     /// The same ids in order, and the deleted ones.
     ids: OrderedIds,
+    /// Whether a crash leaves the document half changed, as a real editor's might: a line
+    /// `"JUNK"` is added before `Err(Crash)` is returned.
+    damage_on_crash: bool,
 }
 
 /// One change to a [`StandIn`].
@@ -51,7 +54,22 @@ impl StandIn {
             device: device.to_owned(),
             lines: Vec::new(),
             ids: OrderedIds::base(0),
+            damage_on_crash: false,
         }
+    }
+
+    /// An empty document on `device` whose crashes leave a `"JUNK"` line behind.
+    pub fn damaging(device: &str) -> StandIn {
+        StandIn {
+            damage_on_crash: true,
+            ..StandIn::new(device)
+        }
+    }
+
+    /// The lines with their ids, and the id table, without the device: what two devices that
+    /// agree hold alike.
+    pub fn content(&self) -> (&[(LiveId, String)], &OrderedIds) {
+        (&self.lines, &self.ids)
     }
 
     /// The lines' texts, in order.
@@ -157,6 +175,11 @@ impl LiveEditor for StandIn {
             }
             StandInOp::CrashIf { device } => {
                 if device == self.device {
+                    if self.damage_on_crash {
+                        // An id no change names; the count keeps it new after earlier junk.
+                        let junk = LiveId(u32::MAX, u32::try_from(self.lines.len()).unwrap_or(0));
+                        let _ = self.insert(None, junk, "JUNK");
+                    }
                     return Err(Crash);
                 }
                 Ok(())
@@ -359,6 +382,23 @@ mod tests {
         assert_eq!(outcome.effect, Effect::Applied);
         assert!(!outcome.read_stamp);
         assert_eq!(a, before);
+    }
+
+    #[test]
+    fn damaging_crash_leaves_junk() {
+        let op = StandInOp::CrashIf {
+            device: "b".to_owned(),
+        };
+        let mut b = StandIn::damaging("b");
+        applied(&mut b, &insert_end(A, "one"));
+        assert_eq!(run(&mut b, &op), Err(Crash));
+        assert_eq!(b.lines(), vec!["one", "JUNK"]);
+        assert_eq!(run(&mut b, &op), Err(Crash));
+        assert_eq!(b.lines(), vec!["one", "JUNK", "JUNK"]);
+        // Elsewhere it still does nothing.
+        let mut a = StandIn::damaging("a");
+        assert_eq!(run(&mut a, &op).unwrap().effect, Effect::Applied);
+        assert!(a.lines().is_empty());
     }
 
     #[test]

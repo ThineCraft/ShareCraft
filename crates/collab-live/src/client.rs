@@ -898,7 +898,7 @@ impl<E: LiveEditor> LiveClient<E> {
                 editor.note_applying(None);
             } else {
                 // The editor stopped in this entry before: it is not applied again.
-                self.stall(seq, step);
+                self.stall(editor, seq, step);
                 return Ok(());
             }
         }
@@ -965,9 +965,12 @@ impl<E: LiveEditor> LiveClient<E> {
                 });
                 return Ok(());
             }
-            // It waited for the server, or its result depends on the stamp.
+            // It waited for the server, or its result depends on the stamp. With no copy (a
+            // catch-up from the base, before the waiting changes are re-run), going back
+            // restores nothing: the change is applied straight to the editor.
+            let direct = self.agreed.is_none();
             let result = self.go_back(editor, Some(&ordered));
-            self.after_received(editor, result, seq, own, false, step);
+            self.after_received(editor, result, seq, own, direct, step);
             return Ok(());
         }
         let direct = self.agreed.is_none();
@@ -975,7 +978,7 @@ impl<E: LiveEditor> LiveClient<E> {
             editor.note_applying(Some(seq));
             let result = editor.apply(&ordered.view());
             if result.is_ok() {
-                editor.note_applying(None);
+                editor.note_applying(self.stalled_at);
             }
             Some(result)
         } else {
@@ -1017,7 +1020,7 @@ impl<E: LiveEditor> LiveClient<E> {
                     // the waiting changes re-run on top: what was shown before the entry.
                     let _ = self.go_back(editor, None);
                 }
-                self.stall(seq, step);
+                self.stall(editor, seq, step);
             }
             None => {}
         }
@@ -1048,7 +1051,11 @@ impl<E: LiveEditor> LiveClient<E> {
 
     /// Stops at the entry `seq` the editor cannot apply and reports it; later entries are held
     /// until a verdict.
-    fn stall(&mut self, seq: Seq, step: &mut Step) {
+    ///
+    /// The crash note names `seq` until the verdict, so a reload while waiting stops before
+    /// the entry again.
+    fn stall(&mut self, editor: &mut E, seq: Seq, step: &mut Step) {
+        editor.note_applying(Some(seq));
         self.phase = Phase::Stalled { at: seq };
         step.send.push(frame(&LiveClientMsg::Report { seq }));
         step.events.push(Event::Crashed { seq });
@@ -1080,7 +1087,8 @@ impl<E: LiveEditor> LiveClient<E> {
         step.send.push(frame(&LiveClientMsg::Resync));
     }
 
-    /// Applies the held entries in order, until the client stalls or resyncs.
+    /// Applies the held entries in order, until the client stalls or resyncs. If it stalls
+    /// and the verdict is already among the held entries, it unstalls at once.
     fn apply_held(&mut self, editor: &mut E, step: &mut Step) -> Result<(), ClientError> {
         let mut rest = std::mem::take(&mut self.held).into_iter();
         for entry in rest.by_ref() {
@@ -1089,8 +1097,15 @@ impl<E: LiveEditor> LiveClient<E> {
                 break;
             }
         }
-        if matches!(self.phase, Phase::Stalled { .. }) {
+        if let Phase::Stalled { at } = self.phase {
             self.held.extend(rest);
+            let verdict_held = self.held.iter().any(
+                |entry| matches!(entry.body, EntryBody::Cancel { cancels, .. } if cancels == at),
+            );
+            if verdict_held {
+                // Bounded: each round consumes at least the entry stalled at.
+                return self.unstall(editor, step);
+            }
         }
         Ok(())
     }
@@ -1117,7 +1132,7 @@ impl<E: LiveEditor> LiveClient<E> {
                 if result.is_err() {
                     return Some(result);
                 }
-                editor.note_applying(None);
+                editor.note_applying(self.stalled_at);
                 Some(result)
             }
             None => None,

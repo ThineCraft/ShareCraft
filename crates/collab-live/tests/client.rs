@@ -1570,6 +1570,7 @@ fn restart_after_crash_stops_before_the_entry() {
     assert!(step.events.contains(&Event::Crashed { seq: Seq(3) }));
     assert_eq!(client.phase(), Phase::Stalled { at: Seq(3) });
     assert_eq!(client.agreed_seq(), Seq(2));
+    assert_eq!(doc.note, Some(Seq(3)), "the note survives the catch-up");
 
     // Every later join reports it again until a verdict arrives.
     client.disconnected(20);
@@ -1581,6 +1582,7 @@ fn restart_after_crash_stops_before_the_entry() {
     assert_eq!(step.send, vec![r#"{"type":"report","seq":3}"#.to_owned()]);
     assert_eq!(client.phase(), Phase::Stalled { at: Seq(3) });
     assert_eq!(doc.applied, vec![Some(Seq(1)), Some(Seq(2))]);
+    assert_eq!(doc.note, Some(Seq(3)));
 }
 
 #[test]
@@ -1834,4 +1836,114 @@ fn cannot_open_closes() {
         Default::default()
     );
     assert_eq!(doc.doc.lines(), vec!["one", "two"]);
+}
+
+// ---- Task 6, fix round 1: the review's probes ----
+
+fn damaging(device: &str) -> Noting {
+    Noting {
+        doc: StandIn::damaging(device),
+        note: None,
+        applied: Vec::new(),
+    }
+}
+
+#[test]
+fn verdict_held_while_the_base_loads_is_seen() {
+    // I2: the cancel record arrives with the catch-up, before the host has loaded the base.
+    let mut doc = damaging("b");
+    doc.note = Some(Seq(3));
+    let mut client: LiveClient<Noting> = LiveClient::new(config_crashed(3));
+    client.connected(0);
+    client.receive(&mut doc, &joined(4), 0).unwrap();
+    client.receive(&mut doc, &catchup(0, 0, 4), 0).unwrap();
+    for frame in [
+        first_two()[0].clone(),
+        first_two()[1].clone(),
+        crash_three(),
+        cancel(4, 3),
+    ] {
+        client.receive(&mut doc, &frame, 0).unwrap();
+    }
+    doc.doc = StandIn::damaging("b");
+    let step = client.base_ready(&mut doc, 0).unwrap();
+    assert_eq!(step.send, vec![r#"{"type":"report","seq":3}"#.to_owned()]);
+    assert_eq!(client.phase(), Phase::Live);
+    assert_eq!(client.agreed_seq(), Seq(4));
+    assert_eq!(doc.note, None);
+    client
+        .receive(
+            &mut doc,
+            &entry(5, 1, other(ANN), 4, 4, &insert(LiveId(1, 3), "five")),
+            0,
+        )
+        .unwrap();
+    assert_eq!(doc.doc.lines(), vec!["one", "two", "five"]);
+    assert!(!doc.applied.contains(&Some(Seq(3))));
+}
+
+#[test]
+fn crash_note_survives_the_catch_up_after_a_restart() {
+    // I3: entries applied before the stall must not wipe the host's note.
+    let mut doc = damaging("b");
+    doc.note = Some(Seq(3));
+    let mut client: LiveClient<Noting> = LiveClient::new(config_crashed(3));
+    client.connected(0);
+    client.receive(&mut doc, &joined(4), 0).unwrap();
+    client.receive(&mut doc, &catchup(0, 0, 3), 0).unwrap();
+    doc.doc = StandIn::damaging("b");
+    client.base_ready(&mut doc, 0).unwrap();
+    for frame in first_two() {
+        client.receive(&mut doc, &frame, 0).unwrap();
+        assert_eq!(doc.note, Some(Seq(3)));
+    }
+    client.receive(&mut doc, &crash_three(), 0).unwrap();
+    assert_eq!(client.phase(), Phase::Stalled { at: Seq(3) });
+    assert_eq!(doc.note, Some(Seq(3)));
+    assert_eq!(doc.doc.lines(), vec!["one", "two"]);
+}
+
+#[test]
+fn own_crash_while_catching_up_from_the_base_is_a_crash_in_place() {
+    // I1: with no copy yet, confirming a waiting change that is not shown applies it straight
+    // to the editor, so a crash there must not make the damaged editor the agreed copy.
+    let mut doc = damaging("b");
+    let mut client = live(&mut doc, 2);
+    let one = entry(1, 1, other(ANN), 1, 0, &insert(LiveId(1, 0), "one"));
+    client.receive(&mut doc, &one, 1).unwrap();
+    client
+        .local(&mut doc, crash_if("b"), Mode::WaitForServer, 2)
+        .unwrap();
+    let id = client.new_ids(1).unwrap();
+    client
+        .local(&mut doc, insert(id, "mine"), Mode::ShowAtOnce, 3)
+        .unwrap();
+    client.disconnected(4);
+    client.connected(5);
+    client.receive(&mut doc, &joined_kept(2), 5).unwrap();
+    // The server sends the log from the base; its entry 2 is this client's crashing change.
+    client.receive(&mut doc, &catchup(0, 0, 2), 5).unwrap();
+    let mine = entry(2, 2, client.client(), 1, 1, &crash_if("b"));
+    client.receive(&mut doc, &one, 5).unwrap();
+    client.receive(&mut doc, &mine, 5).unwrap();
+    doc.doc = StandIn::damaging("b");
+    let step = client.base_ready(&mut doc, 6).unwrap();
+    assert_eq!(step.send, vec![r#"{"type":"report","seq":2}"#.to_owned()]);
+    assert_eq!(client.phase(), Phase::Stalled { at: Seq(2) });
+
+    // The verdict: the client does not trust the damaged editor and loads the base again.
+    let step = client.receive(&mut doc, &cancel(3, 2), 7).unwrap();
+    assert_eq!(step.send, vec![r#"{"type":"resync"}"#.to_owned()]);
+    client.receive(&mut doc, &catchup(0, 0, 3), 8).unwrap();
+    doc.doc = StandIn::damaging("b");
+    client.base_ready(&mut doc, 8).unwrap();
+    let mut cancelled_mine: Value = serde_json::from_str(&mine).unwrap();
+    cancelled_mine["entry"]["payload"] = json!("");
+    cancelled_mine["entry"]["cancelled"] = json!(true);
+    for frame in [one, cancelled_mine.to_string(), cancel(3, 2)] {
+        client.receive(&mut doc, &frame, 8).unwrap();
+    }
+    assert_eq!(client.phase(), Phase::Live);
+    assert_eq!(doc.doc.lines(), vec!["one", "mine"]);
+    assert_eq!(client.pending(), 1);
 }

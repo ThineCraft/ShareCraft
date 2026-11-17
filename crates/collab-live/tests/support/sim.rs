@@ -63,6 +63,12 @@ pub struct Sim {
     pub returning: usize,
     /// How many changes were refused.
     pub refusals: usize,
+    /// Whether a reported change waits for [`Sim::give_verdicts`] instead of being cancelled
+    /// at once, so a verdict can reach a client long after its report, for example while it
+    /// loads the base again.
+    pub delay_verdicts: bool,
+    /// Reported changes waiting for their verdict.
+    awaiting: Vec<Seq>,
 }
 
 impl Sim {
@@ -86,6 +92,8 @@ impl Sim {
             resyncs: 0,
             returning: 0,
             refusals: 0,
+            delay_verdicts: false,
+            awaiting: Vec::new(),
         }
     }
 
@@ -356,6 +364,24 @@ impl Sim {
             return;
         };
         self.reports.push((participant, seq));
+        if self.delay_verdicts {
+            if !self.awaiting.contains(&seq) {
+                self.awaiting.push(seq);
+            }
+            return;
+        }
+        self.cancel(seq);
+    }
+
+    /// Cancels every reported change still waiting for its verdict.
+    pub fn give_verdicts(&mut self) {
+        for seq in std::mem::take(&mut self.awaiting) {
+            self.cancel(seq);
+        }
+    }
+
+    /// Cancels the change at `seq`, unless it is not a change or is cancelled already.
+    fn cancel(&mut self, seq: Seq) {
         let Some(reported) = self.log.get_mut((seq.0 as usize).wrapping_sub(1)) else {
             return;
         };
