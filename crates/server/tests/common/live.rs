@@ -23,6 +23,8 @@ pub struct LiveTestClient {
     client: LiveClient<StandIn>,
     editor: StandIn,
     drop_next_entry_frame: bool,
+    drop_next_server_entry_frame: bool,
+    dropped_server_entry_frames: usize,
     pub events: Vec<Event>,
     pub outbound_messages: Vec<LiveClientMsg>,
     pub messages: Vec<LiveServerMsg>,
@@ -43,6 +45,8 @@ impl LiveTestClient {
             }),
             editor: StandIn::new(device),
             drop_next_entry_frame: false,
+            drop_next_server_entry_frame: false,
+            dropped_server_entry_frames: 0,
             events: Vec::new(),
             outbound_messages: Vec::new(),
             messages: Vec::new(),
@@ -108,6 +112,21 @@ impl LiveTestClient {
 
     pub fn drop_next_entry_frame(&mut self) {
         self.drop_next_entry_frame = true;
+    }
+
+    pub fn drop_next_server_entry_frame(&mut self) {
+        self.drop_next_server_entry_frame = true;
+    }
+
+    pub fn dropped_server_entry_frames(&self) -> usize {
+        self.dropped_server_entry_frames
+    }
+
+    pub async fn resend_entry(&mut self, message: &LiveClientMsg) {
+        assert!(matches!(message, LiveClientMsg::Entry { .. }));
+        self.outbound_messages.push(message.clone());
+        self.send_raw(&serde_json::to_string(message).unwrap())
+            .await;
     }
 
     pub async fn pump_until(&mut self, done: impl Fn(&LiveTestClient) -> bool) {
@@ -222,8 +241,13 @@ impl LiveTestClient {
     }
 
     async fn take_server_frame(&mut self, frame: &str) {
-        self.raw_messages.push(frame.to_owned());
         let message: LiveServerMsg = serde_json::from_str(frame).expect("live server frame");
+        if self.drop_next_server_entry_frame && matches!(&message, LiveServerMsg::Entry { .. }) {
+            self.drop_next_server_entry_frame = false;
+            self.dropped_server_entry_frames += 1;
+            return;
+        }
+        self.raw_messages.push(frame.to_owned());
         self.messages.push(message);
         let now_ms = self.now_ms();
         let step = self

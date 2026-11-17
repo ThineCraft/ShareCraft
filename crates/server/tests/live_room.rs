@@ -167,6 +167,54 @@ async fn reconnect_resends_without_duplicating() {
 }
 
 #[tokio::test]
+async fn resent_entry_reaching_the_server_twice_is_stored_once() {
+    let server = live_server().await;
+    let (doc, ann, _) = shared_live(&server).await;
+    let mut a = LiveTestClient::connect(&server, doc, &ann, "a").await;
+    a.drop_next_server_entry_frame();
+    a.insert("once").await;
+    let original = a.outbound_messages.last().unwrap().clone();
+    a.pump_without_tick_until(|client| client.dropped_server_entry_frames() == 1)
+        .await;
+    assert_eq!(a.client().pending(), 1);
+    let before_resend = server.records_db().load_live(doc).await.unwrap();
+    assert_eq!(before_resend.head, Seq(1));
+
+    a.disconnect();
+    a.reconnect(&server).await;
+    assert_eq!(a.client().pending(), 1);
+    a.resend_entry(&original).await;
+    assert_eq!(
+        a.outbound_messages
+            .iter()
+            .filter(|message| **message == original)
+            .count(),
+        2
+    );
+    a.send_raw(&serde_json::to_string(&LiveClientMsg::Leave).unwrap())
+        .await;
+    a.wait_closed().await;
+
+    let after_resend = server.records_db().load_live(doc).await.unwrap();
+    let stored = after_resend
+        .entries
+        .iter()
+        .filter(|row| matches!(row, LiveEntryRow::Change { client, local: 1, .. } if *client == a.client().client()))
+        .collect::<Vec<_>>();
+    assert_eq!(stored.len(), 1);
+    assert_stored_client_entry(&original, stored[0]);
+    assert_eq!(after_resend.head, before_resend.head);
+    assert_eq!(a.client().pending(), 0);
+    assert!(!a.messages.iter().any(|message| matches!(
+        message,
+        LiveServerMsg::Refused {
+            local: LocalNo(1),
+            reason: RefusedReason::OutOfOrder,
+        }
+    )));
+}
+
+#[tokio::test]
 async fn expiry_with_entry_in_flight_commits_once() {
     let server = live_server().await;
     let (doc, ann, bob) = shared_live(&server).await;
@@ -208,12 +256,31 @@ async fn log_survives_server_restart() {
     let doc = new_doc();
     let ann = first.user("Ann").await;
     first.create_file_document(doc, &ann).await;
-    let mut a = LiveTestClient::connect(&first, doc, &ann, "a").await;
+    let bob = first.user("Bob").await;
+    share(&first, &ann, doc, &bob, "editor").await;
+    let mut a = LiveTestClient::connect(&first, doc, &ann, "failing-device").await;
+    let mut b = LiveTestClient::connect(&first, doc, &bob, "failing-device").await;
     for text in ["one", "two"] {
         a.insert(text).await;
     }
     a.pump_until(|c| c.client().agreed_seq() == Seq(2) && c.client().pending() == 0)
         .await;
+    b.pump_until(|c| c.client().agreed_seq() == Seq(2)).await;
+    a.change(
+        StandInOp::CrashIf {
+            device: "failing-device".into(),
+        },
+        Mode::WaitForServer,
+    )
+    .await
+    .unwrap();
+    a.pump_until(|c| matches!(c.client().phase(), Phase::Stalled { at: Seq(3) }))
+        .await;
+    b.pump_until(|c| matches!(c.client().phase(), Phase::Stalled { at: Seq(3) }))
+        .await;
+    a.pump_until(|c| c.client().agreed_seq() == Seq(4) && c.client().pending() == 0)
+        .await;
+    b.pump_until(|c| c.client().agreed_seq() == Seq(4)).await;
     a.drop_next_entry_frame();
     a.insert("three").await;
     let unconfirmed = a.outbound_messages.last().unwrap().clone();
@@ -222,11 +289,11 @@ async fn log_survives_server_restart() {
     first.stop();
 
     let second = StoppableServer::start(data.path(), &db, live_config);
-    let bob = second.user("Bob").await;
-    share(&second, &ann, doc, &bob, "editor").await;
-    let b = LiveTestClient::connect(&second, doc, &bob, "b").await;
-    assert_eq!(b.lines(), vec!["one", "two"]);
-    let caught_up = b
+    let cy = second.user("Cy").await;
+    share(&second, &ann, doc, &cy, "editor").await;
+    let c = LiveTestClient::connect(&second, doc, &cy, "c").await;
+    assert_eq!(c.lines(), vec!["one", "two"]);
+    let caught_up = c
         .messages
         .iter()
         .filter_map(|message| match message {
@@ -244,7 +311,7 @@ async fn log_survives_server_restart() {
                     local,
                     seen,
                     payload,
-                    ..
+                    cancelled,
                 },
                 LiveEntryRow::Change {
                     seq,
@@ -255,6 +322,7 @@ async fn log_survives_server_restart() {
                     at,
                     seed,
                     payload: stored_payload,
+                    cancelled_by,
                     ..
                 },
             ) => {
@@ -268,7 +336,32 @@ async fn log_survives_server_restart() {
                 );
                 assert_eq!(entry.seed, *seed);
                 assert_eq!(*seen, *stored_seen);
-                assert_eq!(payload.as_bytes(), stored_payload);
+                assert_eq!(*cancelled, cancelled_by.is_some());
+                if cancelled_by.is_some() {
+                    assert!(payload.is_empty());
+                } else {
+                    assert_eq!(payload.as_bytes(), stored_payload);
+                }
+            }
+            (
+                EntryBody::Cancel { cancels, reports },
+                LiveEntryRow::Cancel {
+                    seq,
+                    at,
+                    seed,
+                    cancels: stored_cancels,
+                    reports: stored_reports,
+                    ..
+                },
+            ) => {
+                assert_eq!(entry.seq, *seq);
+                assert_eq!(
+                    i128::from(entry.at_ms),
+                    at.unix_timestamp_nanos() / 1_000_000
+                );
+                assert_eq!(entry.seed, *seed);
+                assert_eq!(*cancels, *stored_cancels);
+                assert_eq!(*reports, *stored_reports);
             }
             (body, row) => panic!("caught-up entry {body:?} does not match stored row {row:?}"),
         }
@@ -283,7 +376,7 @@ async fn log_survives_server_restart() {
     assert_eq!(a.last_place(), Some(Place::Kept));
     assert!(a.outbound_messages[sent_before_reconnect..].contains(&unconfirmed));
     let after_resend = second.records_db().load_live(doc).await.unwrap();
-    assert_eq!(after_resend.head, Seq(3));
+    assert_eq!(after_resend.head, Seq(5));
     assert_eq!(
         &after_resend.entries[..before.entries.len()],
         before.entries.as_slice()
@@ -292,17 +385,17 @@ async fn log_survives_server_restart() {
     let resent = after_resend
         .entries
         .iter()
-        .filter(|row| matches!(row, LiveEntryRow::Change { client, local: 3, .. } if *client == a.client().client()))
+        .filter(|row| matches!(row, LiveEntryRow::Change { client, local: 4, .. } if *client == a.client().client()))
         .collect::<Vec<_>>();
     assert_eq!(resent.len(), 1);
     assert_stored_client_entry(&unconfirmed, resent[0]);
     assert_eq!(a.client().pending(), 0);
     a.insert("four").await;
-    a.pump_until(|c| c.client().agreed_seq() == Seq(4) && c.client().pending() == 0)
+    a.pump_until(|c| c.client().agreed_seq() == Seq(6) && c.client().pending() == 0)
         .await;
     assert_eq!(
         second.records_db().load_live(doc).await.unwrap().head,
-        Seq(4)
+        Seq(6)
     );
 }
 
