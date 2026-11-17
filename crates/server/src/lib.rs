@@ -20,6 +20,10 @@ mod file_room;
 pub mod icap;
 pub mod libraries;
 mod links;
+#[allow(dead_code)] // Wired into the room registry and WebSocket path by plan G2 Task 11.
+mod live_room;
+#[allow(dead_code)] // Used by the live room once Task 11 wires that room into the server.
+mod live_store;
 mod looks;
 mod members;
 pub mod previews;
