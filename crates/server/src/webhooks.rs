@@ -2,19 +2,20 @@
 //!
 //! A delivery is taken only when its `X-Hub-Signature-256` is the HMAC-SHA256 of the raw body
 //! under the library's webhook secret (the secret's hexadecimal text, as GitHub was given it),
-//! compared in constant time. The body (at most [`MAX_BODY`]) is read in full before the check.
-//! Nothing in a delivery is trusted but the branch name of a push, which only decides whether
-//! the library is woken: the sync itself reads the branch from GitHub.
+//! compared in constant time. At most [`MAX_IN_FLIGHT`] bodies are handled at once; excess is
+//! refused before its body is read. A taken body (at most [`MAX_BODY`]) is read in full before
+//! the check. Nothing in a delivery is trusted but the branch name of a push, which only decides
+//! whether the library is woken: the sync itself reads the branch from GitHub.
 //!
 //! Answers: `200` for a `ping`; `202` for a `push` to the connected branch, which wakes the sync
 //! worker; `204` for any other push or event; `401` for a missing or wrong signature; `404` for
 //! an address that names no connected library, or one with no webhook secret. No answer says
 //! more, and no secret, signature or body reaches a log line, an event or an error. `401` and
-//! `404` answers count towards the per-address throttle (see `lib.rs`), so guessing is refused
-//! with `429`.
+//! `404` answers count towards the webhook throttle (per address and library for existing
+//! libraries, address-only for unknown ones; see `lib.rs`), so guessing is refused with `429`.
 
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{FromRequest, Path, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use collab_core::ids::NodeId;
@@ -30,6 +31,29 @@ use crate::source_sync::webhook_context;
 /// The largest delivery taken: 5 MiB (GitHub caps its payloads at 25 MiB, but a push of a
 /// documents repository is far smaller, and only its branch name is read).
 pub(crate) const MAX_BODY: usize = 5 << 20;
+/// The most webhook bodies read or handled at once across this server.
+pub(crate) const MAX_IN_FLIGHT: usize = 8;
+
+/// A body read only after taking a global webhook turn. The permit stays held through the
+/// handler, and an excess request is refused before its body is polled.
+pub(crate) struct Delivery {
+    body: Bytes,
+    _turn: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl FromRequest<AppState> for Delivery {
+    type Rejection = Response;
+
+    async fn from_request(request: Request, state: &AppState) -> Result<Self, Self::Rejection> {
+        let Some(turn) = state.webhook_turn() else {
+            return Err(bare(StatusCode::TOO_MANY_REQUESTS));
+        };
+        let body = Bytes::from_request(request, state)
+            .await
+            .map_err(IntoResponse::into_response)?;
+        Ok(Delivery { body, _turn: turn })
+    }
+}
 
 /// The parts of a push delivery that are read.
 #[derive(Deserialize)]
@@ -49,7 +73,7 @@ pub(crate) async fn github(
     State(state): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
-    body: Bytes,
+    Delivery { body, .. }: Delivery,
 ) -> Response {
     let Ok(uuid) = Uuid::parse_str(&id) else {
         return bare(StatusCode::NOT_FOUND);

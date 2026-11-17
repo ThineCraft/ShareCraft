@@ -616,6 +616,25 @@ pub async fn spawn_server_config(edit: impl FnOnce(&mut Config)) -> TestServer {
     }
 }
 
+/// Starts a server like [`spawn_server_config`] but without the background workers. Tests that
+/// need to own and drop one particular worker start it themselves.
+pub async fn spawn_server_config_without_workers(edit: impl FnOnce(&mut Config)) -> TestServer {
+    let data_dir = tempfile::tempdir().unwrap();
+    let db = TestDb::create().await;
+    let mut config = config_at(data_dir.path(), &db);
+    edit(&mut config);
+    let listener = tokio::net::TcpListener::bind(config.addr).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let state = server::prepare(config).await.unwrap();
+    let app = server::router(state.clone()).into_make_service_with_connect_info::<SocketAddr>();
+    tokio::spawn(fail_loudly(async move { axum::serve(listener, app).await }));
+    TestServer {
+        site: Site::ready(addr, db.db.clone(), state),
+        data_dir,
+        db,
+    }
+}
+
 /// A server on its own runtime. Stopping it ends every connection, room and task at once, as
 /// stopping the server process would, and leaves its data directory for a new server.
 pub struct StoppableServer {

@@ -19,7 +19,10 @@ use std::time::Duration;
 
 use collab_core::ids::NodeId;
 use common::fake_github::FakeGithub;
-use common::{TIMEOUT, TestServer, TestUser, spawn_server_config, start_fake_github};
+use common::{
+    TIMEOUT, TestServer, TestUser, spawn_server_config, spawn_server_config_without_workers,
+    start_fake_github,
+};
 use records::{SealedRow, SourceChange, SourceState, SourceStatus};
 use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::{Method, StatusCode};
@@ -48,6 +51,45 @@ struct Env {
 impl Env {
     async fn new() -> Env {
         Env::with_token(None).await
+    }
+
+    /// A connected and initially synced library served without an automatic source worker.
+    async fn without_worker() -> Env {
+        let fake = start_fake_github(OWNER, REPO).await;
+        fake.commit("main", &files(&[("a.md", "first"), ("guide/b.md", "b")]));
+        let origin = fake.origin();
+        let server = spawn_server_config_without_workers(|c| c.github_api = origin).await;
+        let admin = server.admin("Ada Admin").await;
+        let harness = common::Site::library(&server).await;
+        let site = server
+            .records_db()
+            .node(harness)
+            .await
+            .unwrap()
+            .unwrap()
+            .site;
+        let state = server.app_state().await;
+        let (status, answer) = call(
+            &server,
+            &admin,
+            Method::POST,
+            &format!("/api/sites/{}/libraries/github", site.0),
+            Some(json!({ "name": "Mirror", "repository": format!("{OWNER}/{REPO}") })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{answer}");
+        let library = NodeId(answer["id"].as_str().unwrap().parse().unwrap());
+        sync_once(&state, library, OffsetDateTime::now_utc())
+            .await
+            .unwrap();
+        Env {
+            server,
+            fake,
+            admin,
+            site,
+            library,
+            state,
+        }
     }
 
     /// Like [`Env::new`], the repository readable only with `token` when given.
@@ -106,6 +148,41 @@ impl Env {
             .1
     }
 
+    /// Adds another connected library in the same site and waits for its first sync.
+    async fn add_library(&self, name: &str) -> NodeId {
+        let (status, answer) = self
+            .call(
+                Method::POST,
+                &format!("/api/sites/{}/libraries/github", self.site.0),
+                Some(json!({ "name": name, "repository": format!("{OWNER}/{REPO}") })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{answer}");
+        let library = NodeId(answer["id"].as_str().unwrap().parse().unwrap());
+        let _ = sync_once(&self.state, library, OffsetDateTime::now_utc())
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        loop {
+            let status = self
+                .server
+                .records_db()
+                .source_of(library)
+                .await
+                .unwrap()
+                .unwrap()
+                .1;
+            if status.state == SourceState::Ok && status.last_checked_at.is_some() {
+                return library;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the added library never settled: {status:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
     /// Waits until no sync of the library is due at once or running, and answers its status.
     async fn settled(&self) -> SourceStatus {
         let deadline = tokio::time::Instant::now() + TIMEOUT;
@@ -155,15 +232,21 @@ impl Env {
 
     /// A new webhook secret, made through the API; waits for the sync it starts.
     async fn webhook_secret(&self) -> String {
+        let secret = self.webhook_secret_for(self.library).await;
+        self.settled().await;
+        secret
+    }
+
+    /// A new webhook secret for `library`, made through the API.
+    async fn webhook_secret_for(&self, library: NodeId) -> String {
         let (status, answer) = self
             .call(
                 Method::POST,
-                &format!("/api/libraries/{}/source/webhook", self.library.0),
+                &format!("/api/libraries/{}/source/webhook", library.0),
                 None,
             )
             .await;
         assert_eq!(status, StatusCode::OK, "{answer}");
-        self.settled().await;
         answer["secret"].as_str().unwrap().to_owned()
     }
 
@@ -202,11 +285,19 @@ impl Env {
 
     /// `POST /hooks/github/{library}` from GitHub (no `Origin`, no cookie).
     async fn hook(&self, event: &str, body: &[u8], signature: Option<&str>) -> StatusCode {
+        self.hook_for(self.library, event, body, signature).await
+    }
+
+    async fn hook_for(
+        &self,
+        library: NodeId,
+        event: &str,
+        body: &[u8],
+        signature: Option<&str>,
+    ) -> StatusCode {
         hook(
             &reqwest::Client::new(),
-            &self
-                .server
-                .url(&format!("/hooks/github/{}", self.library.0)),
+            &self.server.url(&format!("/hooks/github/{}", library.0)),
             event,
             body,
             signature,
@@ -409,6 +500,51 @@ async fn a_rate_limit_sets_a_retry_time_and_no_request_is_made_before_it() {
     let status = env.status().await;
     assert_eq!(status.state, SourceState::Ok);
     assert_eq!(status.retry_at, None);
+
+    stale_rate_limit_is_still_waited_out().await;
+}
+
+async fn stale_rate_limit_is_still_waited_out() {
+    let env = Env::new().await;
+    env.fake.commit(
+        "main",
+        &files(&[("a.md", "first"), ("guide/b.md", "b"), ("c.md", "new")]),
+    );
+    let held = env.fake.hold_blobs().await;
+    let running = {
+        let state = env.state.clone();
+        let library = env.library;
+        tokio::spawn(async move { sync_once(&state, library, OffsetDateTime::now_utc()).await })
+    };
+    env.fake.wait_blob_held().await;
+
+    let reset = OffsetDateTime::now_utc() + seconds(3600);
+    env.fake.rate_limit_next(reset);
+    let (status, answer) = env
+        .call(
+            Method::POST,
+            &format!("/api/libraries/{}/source/sync", env.library.0),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{answer}");
+    let asked = env.fake.count("commits");
+
+    drop(held);
+    assert!(running.await.unwrap().is_err());
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let status = env.status().await;
+    assert_eq!(status.state, SourceState::RateLimited, "{status:?}");
+    assert_eq!(
+        status.retry_at.map(OffsetDateTime::unix_timestamp),
+        Some(reset.unix_timestamp())
+    );
+    assert_eq!(
+        env.fake.count("commits"),
+        asked,
+        "no GitHub request before the stale sync's rate limit expires"
+    );
 }
 
 #[tokio::test]
@@ -606,6 +742,40 @@ async fn wakes_for_one_library_are_coalesced() {
 }
 
 #[tokio::test]
+async fn dropping_the_worker_stops_running_and_waiting_syncs() {
+    let env = Env::without_worker().await;
+    let second = env.add_library("Mirror Two").await;
+    let third = env.add_library("Mirror Three").await;
+    env.fake.commit(
+        "main",
+        &files(&[("a.md", "first"), ("guide/b.md", "b"), ("c.md", "new")]),
+    );
+    let held = env.fake.hold_commits().await;
+    let commits = env.fake.count("commits");
+    let trees = env.fake.count("trees");
+    let worker = server::source_sync::start_worker(env.state.clone());
+    for library in [env.library, second, third] {
+        env.state.sources().wake(library);
+    }
+    env.fake.wait_commits_held(2).await;
+
+    drop(worker);
+    drop(held);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    assert_eq!(
+        env.fake.count("commits"),
+        commits + 2,
+        "the permit-waiting sync must not start"
+    );
+    assert_eq!(
+        env.fake.count("trees"),
+        trees,
+        "in-flight syncs must stop when their worker is dropped"
+    );
+}
+
+#[tokio::test]
 async fn a_wake_while_a_sync_runs_is_tried_again_after_it() {
     let env = Env::new().await;
     let c2 = env
@@ -679,6 +849,48 @@ async fn libraries_of_archived_or_deleted_sites_are_not_synced() {
         .await
         .unwrap();
     assert_eq!(env.tick(checked + seconds(900)).await, 1);
+
+    library_archived_while_waiting_for_a_turn_is_not_synced().await;
+}
+
+async fn library_archived_while_waiting_for_a_turn_is_not_synced() {
+    let env = Env::new().await;
+    let second = env.add_library("Mirror Two").await;
+    let third = env.add_library("Mirror Three").await;
+    // `settled` observes the status write; let the worker also remove each from its in-memory
+    // running set before this tick deliberately takes all three.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    env.fake.commit(
+        "main",
+        &files(&[("a.md", "first"), ("guide/b.md", "b"), ("c.md", "new")]),
+    );
+    let held = env.fake.hold_commits().await;
+    let commits = env.fake.count("commits");
+    for library in [env.library, second, third] {
+        env.state.sources().wake(library);
+    }
+    env.fake.wait_commits_held(2).await;
+
+    let archived = sqlx::query("update sites set archived_at = now() where id = $1")
+        .bind(env.site.0)
+        .execute(env.server.records_db().test_pool())
+        .await;
+    assert_eq!(archived.unwrap().rows_affected(), 1);
+    drop(held);
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    while env.fake.count("commits") < commits + 2 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "two syncs did not finish"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        env.fake.count("commits"),
+        commits + 2,
+        "the library waiting for a turn must be rechecked before GitHub"
+    );
 }
 
 #[tokio::test]
@@ -853,7 +1065,9 @@ async fn webhook_without_a_secret_set_is_404() {
 #[tokio::test]
 async fn webhook_failures_are_throttled() {
     let env = Env::new().await;
-    let secret = env.webhook_secret().await;
+    let second = env.add_library("Mirror Two").await;
+    let secret = env.webhook_secret_for(second).await;
+    env.webhook_secret().await;
     let body = push("refs/heads/main");
     let bad = signature("wrong", &body);
     for i in 0..60 {
@@ -867,21 +1081,55 @@ async fn webhook_failures_are_throttled() {
         env.hook("push", &body, Some(&bad)).await,
         StatusCode::TOO_MANY_REQUESTS
     );
-    // Refused before the check, even when signed right.
+    // A different library from the same address has its own failure bucket.
     assert_eq!(
-        env.hook("push", &body, Some(&signature(&secret, &body)))
+        env.hook_for(second, "push", &body, Some(&signature(&secret, &body)))
             .await,
-        StatusCode::TOO_MANY_REQUESTS
+        StatusCode::ACCEPTED
     );
-    // The API itself is not affected.
-    let (status, _) = env
-        .call(
-            Method::GET,
-            &format!("/api/libraries/{}/source", env.library.0),
-            None,
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK);
+    // Anyone-link guesses use their original, separate bucket.
+    let (status, _) = env.call(Method::GET, "/api/l/not-a-link-token", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    webhook_bodies_over_the_in_flight_limit_are_refused().await;
+}
+
+async fn webhook_bodies_over_the_in_flight_limit_are_refused() {
+    use futures_util::StreamExt as _;
+
+    let env = Env::new().await;
+    let client = reqwest::Client::new();
+    let url = env.server.url(&format!("/hooks/github/{}", env.library.0));
+    let mut held = Vec::new();
+    for _ in 0..8 {
+        let client = client.clone();
+        let url = url.clone();
+        held.push(tokio::spawn(async move {
+            let body =
+                futures_util::stream::once(async { Ok::<Vec<u8>, std::io::Error>(b"{".to_vec()) })
+                    .chain(futures_util::stream::pending());
+            client
+                .post(url)
+                .header("x-github-event", "push")
+                .body(reqwest::Body::wrap_stream(body))
+                .send()
+                .await
+        }));
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let status = client
+        .post(url)
+        .header("x-github-event", "push")
+        .body("{}")
+        .send()
+        .await
+        .unwrap()
+        .status();
+    for request in held {
+        request.abort();
+    }
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
 }
 
 #[tokio::test]

@@ -50,11 +50,12 @@ use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use collab_core::ids::DocId;
+use collab_core::ids::{DocId, NodeId};
 use records::Db;
 use revisions::{BlobStore, RevisionStore};
 use tokio::net::TcpListener;
 use tower_http::services::ServeDir;
+use uuid::Uuid;
 
 use deployment::{Deployment, Production, Refusal, SameOrigin};
 
@@ -112,6 +113,10 @@ struct Shared {
     address_throttle: Throttle,
     /// Unknown anyone-link tokens asked about per client address.
     link_throttle: Throttle,
+    /// Failed webhook authentication, separately from anyone-link guesses.
+    webhook_throttle: Throttle,
+    /// Webhook bodies being read or handled.
+    webhook_turns: Arc<tokio::sync::Semaphore>,
     /// The password checks that may run at once.
     password_checks: PasswordChecks,
     next_conn: AtomicU64,
@@ -166,6 +171,8 @@ impl AppState {
                 throttle: Throttle::default(),
                 address_throttle: Throttle::new(MAX_ADDRESS_FAILURES),
                 link_throttle: Throttle::new(MAX_LINK_MISSES),
+                webhook_throttle: Throttle::new(MAX_LINK_MISSES),
+                webhook_turns: Arc::new(tokio::sync::Semaphore::new(webhooks::MAX_IN_FLIGHT)),
                 password_checks: PasswordChecks::default(),
                 next_conn: AtomicU64::new(1),
                 tree_lock: tokio::sync::Mutex::new(()),
@@ -268,6 +275,16 @@ impl AppState {
 
     fn link_throttle(&self) -> &Throttle {
         &self.shared.link_throttle
+    }
+
+    fn webhook_throttle(&self) -> &Throttle {
+        &self.shared.webhook_throttle
+    }
+
+    fn webhook_turn(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        Arc::clone(&self.shared.webhook_turns)
+            .try_acquire_owned()
+            .ok()
     }
 
     fn password_checks(&self) -> &PasswordChecks {
@@ -424,25 +441,62 @@ async fn source(State(state): State<AppState>, mut request: Request, next: Next)
     if !link_lookup && !hook {
         return next.run(request).await;
     }
-    // Guessing anyone-link tokens or webhook signatures: an address with 60 answers of
-    // `link_not_found`, or of a webhook `404` or `401`, in the last 15 minutes is refused until
-    // the oldest is 15 minutes old. A link used as meant, or a delivery taken, is never counted.
-    let throttle = state.link_throttle();
-    if throttle.blocked(&address, std::time::Instant::now()) {
-        let mut refused = api::ApiError::TooManyAttempts.into_response();
-        let headers = refused.headers_mut();
-        headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
-        headers.insert(REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
-        add_headers(headers, deployment.production().map(|p| p.hsts_seconds));
-        return refused;
+    if link_lookup {
+        // Anyone-link throttling remains address-only and independent of webhooks.
+        let throttle = state.link_throttle();
+        if throttle.blocked(&address, std::time::Instant::now()) {
+            return throttled(deployment.production().map(|p| p.hsts_seconds));
+        }
+        let response = next.run(request).await;
+        if response.status() == StatusCode::NOT_FOUND {
+            throttle.note_failure(&address, std::time::Instant::now());
+        }
+        return response;
+    }
+
+    // Existing libraries have a bucket per address and library. Malformed and unknown library
+    // addresses share a separate address-only webhook bucket. A database failure is left for
+    // the handler to answer and is not counted as an authentication failure.
+    let id = request
+        .uri()
+        .path()
+        .strip_prefix("/hooks/github/")
+        .and_then(|id| Uuid::parse_str(id).ok())
+        .map(NodeId);
+    let key = match id {
+        Some(library) => match state.db().source_of(library).await {
+            Ok(Some(_)) => Some(format!("library:{address}:{}", library.0)),
+            Ok(None) => Some(format!("unknown:{address}")),
+            Err(_) => None,
+        },
+        None => Some(format!("unknown:{address}")),
+    };
+    let throttle = state.webhook_throttle();
+    if key
+        .as_deref()
+        .is_some_and(|key| throttle.blocked(key, std::time::Instant::now()))
+    {
+        return throttled(deployment.production().map(|p| p.hsts_seconds));
     }
     let response = next.run(request).await;
-    let failed = response.status() == StatusCode::NOT_FOUND
-        || (hook && response.status() == StatusCode::UNAUTHORIZED);
-    if failed {
-        throttle.note_failure(&address, std::time::Instant::now());
+    if matches!(
+        response.status(),
+        StatusCode::NOT_FOUND | StatusCode::UNAUTHORIZED
+    ) && let Some(key) = key
+    {
+        throttle.note_failure(&key, std::time::Instant::now());
     }
     response
+}
+
+/// A throttled answer with the same security and privacy headers as other early answers.
+fn throttled(hsts_seconds: Option<u64>) -> Response {
+    let mut refused = api::ApiError::TooManyAttempts.into_response();
+    let headers = refused.headers_mut();
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    add_headers(headers, hsts_seconds);
+    refused
 }
 
 /// The answer to a request that did not come from a trusted proxy, in production mode. It

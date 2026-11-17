@@ -482,6 +482,42 @@ async fn archived_or_deleted_sites_are_never_due_or_wakeable() {
 }
 
 #[tokio::test]
+async fn syncable_is_rechecked_from_live_state_and_retry_time() {
+    let f = fixture().await;
+    let db = &f.test.db;
+    db.connect_source(&new_source(&f, f.library)).await.unwrap();
+    let now = OffsetDateTime::now_utc().replace_nanosecond(0).unwrap();
+    assert!(db.source_is_syncable(f.library, now).await.unwrap());
+
+    let mut status = status(SourceState::Failed);
+    status.retry_at = Some(now + Duration::minutes(1));
+    db.set_source_status(f.library, &status).await.unwrap();
+    assert!(!db.source_is_syncable(f.library, now).await.unwrap());
+    assert!(
+        db.source_is_syncable(f.library, now + Duration::minutes(1))
+            .await
+            .unwrap()
+    );
+    status.state = SourceState::Syncing;
+    status.retry_at = None;
+    db.set_source_status(f.library, &status).await.unwrap();
+    assert!(!db.source_is_syncable(f.library, now).await.unwrap());
+    assert!(db.source_sync_is_busy(f.library, now).await.unwrap());
+
+    sqlx::query("update sites set archived_at = now() where id = $1")
+        .bind(f.site.0)
+        .execute(db.test_pool())
+        .await
+        .unwrap();
+    assert!(
+        !db.source_is_syncable(f.library, now + Duration::minutes(1))
+            .await
+            .unwrap()
+    );
+    assert!(!db.source_sync_is_busy(f.library, now).await.unwrap());
+}
+
+#[tokio::test]
 async fn wakeable_ignores_the_poll_time_but_not_a_stop_or_a_retry_time() {
     let f = fixture().await;
     let db = &f.test.db;
@@ -769,4 +805,39 @@ async fn a_sync_of_an_old_generation_records_nothing_but_a_requeue() {
     assert!(db.set_source_status_if(f.library, &done, 1).await.unwrap());
     let (_, s) = db.source_of(f.library).await.unwrap().unwrap();
     assert_eq!(s.last_commit.as_deref(), Some("abc"));
+}
+
+#[tokio::test]
+async fn a_rate_limit_survives_a_generation_change_and_is_never_shortened() {
+    let f = fixture().await;
+    let db = &f.test.db;
+    db.connect_source(&new_source(&f, f.library)).await.unwrap();
+    let now = OffsetDateTime::now_utc().replace_nanosecond(0).unwrap();
+    let later = now + Duration::hours(1);
+
+    assert!(db.bump_source_generation(f.library).await.unwrap());
+    db.requeue_source(f.library, None).await.unwrap();
+    db.rate_limit_source(f.library, later, "GitHub rate limit", None)
+        .await
+        .unwrap();
+    db.rate_limit_source(
+        f.library,
+        now + Duration::minutes(5),
+        "shorter",
+        Some("dirty"),
+    )
+    .await
+    .unwrap();
+
+    let (_, status) = db.source_of(f.library).await.unwrap().unwrap();
+    assert_eq!(status.state, SourceState::RateLimited);
+    assert_eq!(status.retry_at, Some(later));
+    assert_eq!(status.last_error.as_deref(), Some("shorter"));
+    assert_eq!(status.etag.as_deref(), Some("dirty"));
+    assert!(
+        db.due_sources(later - Duration::seconds(1), 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }

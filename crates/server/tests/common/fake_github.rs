@@ -94,6 +94,8 @@ pub struct FakeGithub {
     model: Arc<Mutex<Model>>,
     blob_gate: Arc<tokio::sync::RwLock<()>>,
     blobs_waiting: Arc<AtomicUsize>,
+    commit_gate: Arc<tokio::sync::RwLock<()>>,
+    commits_waiting: Arc<AtomicUsize>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -123,11 +125,15 @@ impl FakeGithub {
         }));
         let blob_gate = Arc::new(tokio::sync::RwLock::new(()));
         let blobs_waiting = Arc::new(AtomicUsize::new(0));
+        let commit_gate = Arc::new(tokio::sync::RwLock::new(()));
+        let commits_waiting = Arc::new(AtomicUsize::new(0));
         let app = Router::new().fallback(handle).with_state(Shared {
             model: model.clone(),
             addr,
             blob_gate: blob_gate.clone(),
             blobs_waiting: blobs_waiting.clone(),
+            commit_gate: commit_gate.clone(),
+            commits_waiting: commits_waiting.clone(),
         });
         let task = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
@@ -137,6 +143,8 @@ impl FakeGithub {
             model,
             blob_gate,
             blobs_waiting,
+            commit_gate,
+            commits_waiting,
             task,
         }
     }
@@ -346,6 +354,23 @@ impl FakeGithub {
         }
     }
 
+    /// Holds every commit request until the answer is dropped.
+    pub async fn hold_commits(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        self.commit_gate.clone().write_owned().await
+    }
+
+    /// Waits until `count` commit requests are held by [`FakeGithub::hold_commits`].
+    pub async fn wait_commits_held(&self, count: usize) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while self.commits_waiting.load(Ordering::SeqCst) < count {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{count} commit requests did not arrive"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
     /// The headers of the last request received.
     pub fn last_headers(&self) -> HeaderMap {
         self.model.lock().unwrap().last_headers.clone()
@@ -365,6 +390,8 @@ struct Shared {
     addr: SocketAddr,
     blob_gate: Arc<tokio::sync::RwLock<()>>,
     blobs_waiting: Arc<AtomicUsize>,
+    commit_gate: Arc<tokio::sync::RwLock<()>>,
+    commits_waiting: Arc<AtomicUsize>,
 }
 
 fn json(status: StatusCode, value: serde_json::Value) -> Response {
@@ -405,6 +432,11 @@ fn decode(segment: &str) -> String {
 
 async fn handle(State(shared): State<Shared>, request: Request) -> Response {
     let path = request.uri().path().to_owned();
+    if path.contains("/commits/") {
+        shared.commits_waiting.fetch_add(1, Ordering::SeqCst);
+        drop(shared.commit_gate.read().await);
+        shared.commits_waiting.fetch_sub(1, Ordering::SeqCst);
+    }
     if path.contains("/git/blobs/") {
         shared.blobs_waiting.fetch_add(1, Ordering::SeqCst);
         drop(shared.blob_gate.read().await);

@@ -43,7 +43,7 @@ use revisions::RevisionId;
 use serde_json::json;
 use time::OffsetDateTime;
 use tokio::sync::{Notify, Semaphore};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use uuid::Uuid;
 
 use crate::AppState;
@@ -539,19 +539,18 @@ impl Sources {
 /// them. Answers how many syncs it started. A library already being synced is left to that
 /// sync.
 pub async fn tick_once(state: &AppState, now: OffsetDateTime) -> usize {
-    let started = start_due(state, now).await;
-    let count = started.len();
-    for sync in started {
-        if let Err(e) = sync.await {
+    let mut running = JoinSet::new();
+    let count = start_due(state, now, &mut running).await;
+    while let Some(sync) = running.join_next().await {
+        if let Err(e) = sync {
             eprintln!("sharecraft-server: a sync did not finish: {e}");
         }
     }
     count
 }
 
-/// Starts the syncs of the libraries woken or due as of `now`, each on a task of its own;
-/// their handles.
-async fn start_due(state: &AppState, now: OffsetDateTime) -> Vec<JoinHandle<()>> {
+/// Starts the syncs of the libraries woken or due as of `now` in `running`; how many.
+async fn start_due(state: &AppState, now: OffsetDateTime, running: &mut JoinSet<()>) -> usize {
     let sources = state.sources();
     let db = state.db();
     let woken = sources.take_pending();
@@ -574,12 +573,15 @@ async fn start_due(state: &AppState, now: OffsetDateTime) -> Vec<JoinHandle<()>>
         }
         Err(e) => eprintln!("sharecraft-server: database failure: {e}"),
     }
-    chosen
+    let mut started = 0;
+    for (library, _) in chosen
         .into_iter()
         .filter(|(library, woken)| sources.start(*library, *woken))
-        .map(|(library, _)| {
+    {
+        started += 1;
+        running.spawn({
             let state = state.clone();
-            tokio::spawn(async move {
+            async move {
                 let again = sync_one(&state, library, now).await;
                 if state.sources().done(library) {
                     state.sources().wake(library);
@@ -590,9 +592,10 @@ async fn start_due(state: &AppState, now: OffsetDateTime) -> Vec<JoinHandle<()>>
                         state.sources().wake(library);
                     });
                 }
-            })
-        })
-        .collect()
+            }
+        });
+    }
+    started
 }
 
 /// Syncs `library` as of `now`, taking a turn first, and keeps the back-off: after a failure
@@ -604,6 +607,22 @@ async fn sync_one(state: &AppState, library: NodeId, now: OffsetDateTime) -> boo
     let Ok(_turn) = Arc::clone(&state.sources().turns).acquire_owned().await else {
         return false;
     };
+    match state.db().source_is_syncable(library, now).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return match state.db().source_sync_is_busy(library, now).await {
+                Ok(busy) => busy,
+                Err(e) => {
+                    eprintln!("sharecraft-server: database failure: {e}");
+                    false
+                }
+            };
+        }
+        Err(e) => {
+            eprintln!("sharecraft-server: database failure: {e}");
+            return false;
+        }
+    }
     let outcome = sync_once(state, library, now).await;
     let current = match state.db().source_of(library).await {
         Ok(Some((_, status))) => status.state,
@@ -648,9 +667,15 @@ impl Drop for Worker {
 /// them to finish.
 pub fn start_worker(state: AppState) -> Worker {
     let task = tokio::spawn(async move {
+        let mut running = JoinSet::new();
         loop {
-            // Started syncs run on their own tasks; `Sources::running` keeps each single.
-            drop(start_due(&state, OffsetDateTime::now_utc()).await);
+            while let Some(finished) = running.try_join_next() {
+                if let Err(e) = finished {
+                    eprintln!("sharecraft-server: a sync did not finish: {e}");
+                }
+            }
+            // The JoinSet owns every started sync, so dropping this worker stops them too.
+            start_due(&state, OffsetDateTime::now_utc(), &mut running).await;
             let wait = if state.sources().has_pending() {
                 AGAIN_SOON
             } else {
@@ -665,13 +690,12 @@ pub fn start_worker(state: AppState) -> Worker {
     Worker { task }
 }
 
-/// Syncs `library` with its branch as of `now`: `Ok(None)` when the branch is unchanged, when
-/// another sync of it is running, or when its connection changed before this sync began (it is
-/// then due again at once; see [`Sources`] for how the worker tries again), otherwise what
-/// changed. The connection's status says how it
-/// went; `source.synced` (counts and the short commit id) or `source.failed` (the reason) is
-/// recorded. A connection left `syncing` by a sync cut short over [`STALE_SYNC`] ago is made
-/// due again first.
+/// Syncs `library` with its branch as of `now`. `Ok(None)` means no new report: either the
+/// branch was unchanged or this sync was busy/superseded. Callers other than the worker must
+/// check the source state to tell which. Otherwise the answer says what changed. The
+/// connection's status says how it went; `source.synced` (counts and the short commit id) or
+/// `source.failed` (the reason) is recorded. A connection left `syncing` by a sync cut short
+/// over [`STALE_SYNC`] ago is made due again first.
 ///
 /// # Errors
 /// `NotConnected` when the library is not connected, or the repository, branch, token or the
@@ -826,15 +850,15 @@ async fn finish(
         // Changed meanwhile: due again at once, still marked if the library is half applied.
         Ok(false) => {
             let dirty = (status.etag.as_deref() == Some(DIRTY_ETAG)).then_some(DIRTY_ETAG);
-            db.requeue_source(library, dirty).await
-        }
-        Err(e) => {
-            // What happened is still worth recording.
-            if let Some(event) = event {
-                state.events().emit(event);
+            if let (SourceState::RateLimited, Some(until), Some(error)) =
+                (status.state, status.retry_at, status.last_error.as_deref())
+            {
+                db.rate_limit_source(library, until, error, dirty).await
+            } else {
+                db.requeue_source(library, dirty).await
             }
-            Err(e)
         }
+        Err(e) => Err(e),
     };
     if let Err(e) = recorded {
         eprintln!(

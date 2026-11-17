@@ -545,6 +545,31 @@ impl Db {
         Ok(())
     }
 
+    /// Records a rate limit independently of a sync generation: the retry time can only move
+    /// later, and `etag`, when given, marks a possibly half-applied sync. This is used when an
+    /// owner changed or requeued the connection while the rate-limited request was in flight.
+    pub async fn rate_limit_source(
+        &self,
+        library: NodeId,
+        until: OffsetDateTime,
+        error: &str,
+        etag: Option<&str>,
+    ) -> Result<(), DbError> {
+        let error: String = error.chars().take(MAX_SOURCE_ERROR_CHARS).collect();
+        sqlx::query(
+            "update library_sources set state = 'rate_limited', \
+                 retry_at = greatest(coalesce(retry_at, $2), $2), last_error = $3, \
+                 etag = coalesce($4, etag) where library_id = $1",
+        )
+        .bind(library.0)
+        .bind(until)
+        .bind(error)
+        .bind(etag)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
     /// Changes the connection of `library` as `c` says. `NotFound` if it has none;
     /// `InvalidSetting` for a poll time outside 60 to 86 400 seconds. A changed branch or
     /// folder clears `last_commit` and `etag`. Every change moves the generation on (see
@@ -743,6 +768,44 @@ impl Db {
         .fetch_all(self.pool())
         .await?;
         Ok(ids.into_iter().map(NodeId).collect())
+    }
+
+    /// Whether `library` is eligible to begin a sync at `now`, checked in one statement: its
+    /// library and site are live, the site is not archived, its retry time has passed, and its
+    /// state is one the worker may run. `rate_limited` becomes eligible when that retry passes.
+    pub async fn source_is_syncable(
+        &self,
+        library: NodeId,
+        now: OffsetDateTime,
+    ) -> Result<bool, DbError> {
+        let eligible: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "select exists(select 1 {SYNCABLE} \
+               and s.library_id = $2 \
+               and s.state in ('connecting', 'ok', 'rate_limited', 'failed'))"
+        )))
+        .bind(now)
+        .bind(library.0)
+        .fetch_one(self.pool())
+        .await?;
+        Ok(eligible)
+    }
+
+    /// Whether `library` is live and waiting for another sync to finish. Such a wake is retried
+    /// soon; an archived, deleted, stopped or backed-off source is not.
+    pub async fn source_sync_is_busy(
+        &self,
+        library: NodeId,
+        now: OffsetDateTime,
+    ) -> Result<bool, DbError> {
+        let busy: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "select exists(select 1 {SYNCABLE} \
+               and s.library_id = $2 and s.state = 'syncing')"
+        )))
+        .bind(now)
+        .bind(library.0)
+        .fetch_one(self.pool())
+        .await?;
+        Ok(busy)
     }
 
     /// Sets the retry time of the connection of `library` to `until`, if its last sync failed
