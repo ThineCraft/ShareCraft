@@ -5,6 +5,7 @@
 import {
   api,
   can,
+  confirmDialog,
   formatSize,
   h,
   libraryKindChoices,
@@ -24,10 +25,15 @@ import {
   siteChrome,
   typeListText,
 } from './common.js';
+import { webhookInstructions } from './source-panel.js';
 
 const $ = (id) => document.getElementById(id);
 const error = $('error');
 const MISSING = 'This library does not exist, or you do not have access to it.';
+const sourceError = (code) =>
+  code === 'invalid_request'
+    ? 'Check the branch, folder, poll interval and token, then try again.'
+    : messageFor(code);
 
 const me = await requireMe();
 setupTopbar(me, error);
@@ -48,6 +54,15 @@ if (!first.ok) fail(first.status === 404 ? MISSING : messageFor(first.error));
 let library = first.data;
 show(library);
 $('settings').hidden = false;
+
+let source = null;
+const sourceAnswer = await api('GET', `/libraries/${seg(libraryId)}/source`);
+if (sourceAnswer.ok) {
+  source = sourceAnswer.data;
+  showSource();
+} else if (sourceAnswer.status !== 404) {
+  showMessage(error, messageFor(sourceAnswer.error));
+}
 
 function fail(text) {
   showMessage(error, text);
@@ -123,4 +138,117 @@ $('settings').addEventListener('submit', async (event) => {
   }
   show(result.data);
   showMessage($('saved'), 'Saved. Files already in the library stay; any the new settings refuse are marked.');
+});
+
+/** Fills the connected repository form without ever putting a token into it. */
+function showSource() {
+  $('source-section').hidden = source === null;
+  if (source === null) return;
+  $('source-repository').textContent = `github.com/${source.repository}`;
+  $('source-branch').value = source.branch;
+  $('source-folder').value = source.folder ?? '';
+  $('source-poll').value = String(source.poll_seconds);
+  $('source-token').value = '';
+  $('source-token-state').textContent = source.token_set ? '— set' : '— not set';
+  $('source-token-remove').hidden = !source.token_set;
+  $('webhook-state').textContent = source.webhook?.configured
+    ? 'A webhook secret is configured. Creating another replaces it.'
+    : 'No webhook secret is configured.';
+}
+
+$('source-settings').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  if (source === null) return;
+  showMessage($('source-error'), '');
+  showMessage($('source-saved'), '');
+  const branch = $('source-branch').value.trim();
+  const folder = $('source-folder').value.trim();
+  const pollSeconds = Number($('source-poll').value);
+  if (!branch) {
+    showMessage($('source-error'), 'Give the branch a name.');
+    $('source-branch').focus();
+    return;
+  }
+  if (!Number.isInteger(pollSeconds) || pollSeconds < 60 || pollSeconds > 86_400) {
+    showMessage($('source-error'), 'Check every must be a whole number from 60 to 86,400 seconds.');
+    $('source-poll').focus();
+    return;
+  }
+  const change = {};
+  if (branch !== source.branch) change.branch = branch;
+  if (folder !== (source.folder ?? '')) change.folder = folder;
+  if (pollSeconds !== source.poll_seconds) change.poll_seconds = pollSeconds;
+  const token = $('source-token').value;
+  if (token !== '') change.token = token;
+  $('source-token').value = '';
+  if (Object.keys(change).length === 0) {
+    showSource();
+    showMessage($('source-saved'), 'Nothing has changed.');
+    return;
+  }
+  const result = await api('PATCH', `/libraries/${seg(libraryId)}/source`, change);
+  if (!result.ok) {
+    showMessage($('source-error'), sourceError(result.error));
+    return;
+  }
+  source = result.data;
+  showSource();
+  showMessage($('source-saved'), 'Source settings saved. An update has started.');
+});
+
+$('source-token-replace').addEventListener('click', () => {
+  showMessage($('source-error'), '');
+  if ($('source-token').value === '') {
+    showMessage($('source-error'), 'Enter the replacement token.');
+    $('source-token').focus();
+    return;
+  }
+  $('source-settings').requestSubmit();
+});
+
+$('source-token-remove').addEventListener('click', async () => {
+  if (source === null || !source.token_set) return;
+  showMessage($('source-error'), '');
+  showMessage($('source-saved'), '');
+  $('source-token').value = '';
+  const result = await api('PATCH', `/libraries/${seg(libraryId)}/source`, { clear_token: true });
+  if (!result.ok) return showMessage($('source-error'), sourceError(result.error));
+  source = result.data;
+  showSource();
+  showMessage($('source-saved'), 'Token removed. An update has started.');
+});
+
+$('webhook-create').addEventListener('click', async () => {
+  if (source === null) return;
+  showMessage($('webhook-error'), '');
+  $('webhook-reveal').hidden = true;
+  $('webhook-steps').replaceChildren();
+  const result = await api('POST', `/libraries/${seg(libraryId)}/source/webhook`);
+  if (!result.ok) return showMessage($('webhook-error'), messageFor(result.error));
+  const lines = webhookInstructions(result.data, result.data.secret);
+  $('webhook-once').textContent = result.data.replaced
+    ? 'The earlier secret was replaced. Copy these details now; they are shown only once.'
+    : 'Copy these details now; the secret is shown only once.';
+  $('webhook-steps').replaceChildren(...lines.map((line) => h('li', {}, line)));
+  $('webhook-reveal').hidden = false;
+  source = { ...source, webhook: { ...source.webhook, configured: true } };
+  $('webhook-state').textContent = 'A webhook secret is configured. Creating another replaces it.';
+});
+
+$('source-disconnect').addEventListener('click', async () => {
+  if (source === null) return;
+  showMessage($('disconnect-error'), '');
+  const sure = await confirmDialog(
+    `Disconnect github.com/${source.repository}? Updates from GitHub stop, but the files stay in this library.`,
+    'Disconnect repository',
+  );
+  if (!sure) return $('source-disconnect').focus();
+  const result = await api('DELETE', `/libraries/${seg(libraryId)}/source`);
+  if (!result.ok) return showMessage($('disconnect-error'), messageFor(result.error));
+  source = null;
+  $('webhook-steps').replaceChildren();
+  $('webhook-once').textContent = '';
+  $('webhook-reveal').hidden = true;
+  showSource();
+  showMessage($('saved'), 'Disconnected from GitHub. The files stay in this library.');
 });

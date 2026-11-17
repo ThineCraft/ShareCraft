@@ -102,6 +102,14 @@ const MESSAGES = {
     'That is not a scanner address. Write it as icap://host/service or icap://host:port/service, with no user name or password.',
   invalid_library_settings:
     'Those library settings are not allowed. File types are written like .png (at most 100 of them), and an image library accepts only image types.',
+  repository_not_found: 'The repository was not found, or the token cannot see it.',
+  token_rejected: 'GitHub refused the token. Check that it is current and has Contents: read access to this repository.',
+  branch_not_found: 'That branch was not found in the repository.',
+  repository_too_large: 'That repository is too large to connect as a library.',
+  source_read_only: 'This library is kept in step with a GitHub repository, so it cannot be changed here.',
+  source_busy: 'An update is running. Wait for it to finish, then try again.',
+  source_exists: 'This library is already connected to a repository.',
+  library_not_empty: 'Only an empty library can be connected to a repository.',
   invalid_template:
     'That template cannot be used. It may be too large (at most 100 libraries, 5,000 folders and 20 levels), name things by identifier, or have a link that is not allowed.',
   low_contrast:

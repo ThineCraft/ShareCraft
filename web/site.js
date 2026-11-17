@@ -33,6 +33,7 @@ import { relativeTime } from './files.js';
 import { libraryCardModel, libraryIcon, ownerChip, recentAcrossLibraries, recentIcon } from './site-home.js';
 import { checklistModel, readWelcome, showChecklist, unsetParts, unsetText, writeWelcome } from './new-site.js';
 import { settle, settleAll } from './skeleton.js';
+import { validRepository } from './source-panel.js';
 
 const $ = (id) => document.getElementById(id);
 const error = $('error');
@@ -263,22 +264,61 @@ $('library-kind').replaceChildren(
 );
 const mayAddLibrary = () => manageSite && !info?.archived;
 
+function githubLibraryChosen() {
+  return document.querySelector('input[name="library-source"]:checked')?.value === 'github';
+}
+
+function showGithubLibraryFields() {
+  const chosen = githubLibraryChosen();
+  $('github-library-fields').hidden = !chosen;
+  $('github-repository').required = chosen;
+}
+
+for (const choice of document.querySelectorAll('input[name="library-source"]')) {
+  choice.addEventListener('change', showGithubLibraryFields);
+}
+
 $('new-library-cancel').addEventListener('click', () => $('new-library-dialog').close());
 $('new-library').addEventListener('submit', async (event) => {
   event.preventDefault();
-  const say = (text) => showMessage($('new-library-error'), text);
+  const say = (text, field = null) => {
+    showMessage($('new-library-error'), text);
+    if (field) field.focus();
+    else if (text) $('new-library-error').focus();
+  };
   const name = $('library-name').value.trim();
   if (!name) {
-    say('Give the library a name.');
-    $('library-name').focus();
-    return;
+    return say('Give the library a name.', $('library-name'));
+  }
+  const fromGithub = githubLibraryChosen();
+  const repository = $('github-repository').value.trim();
+  if (fromGithub && !validRepository(repository)) {
+    return say('Write the repository as owner/repository, not as a web address.', $('github-repository'));
   }
   say('');
   $('new-library-submit').disabled = true;
-  const result = await api('POST', `/sites/${seg(siteId)}/libraries`, { name, kind: $('library-kind').value });
+  let result;
+  if (fromGithub) {
+    const body = { name, repository, kind: $('library-kind').value };
+    const branch = $('github-branch').value.trim();
+    const folder = $('github-folder').value.trim();
+    const token = $('github-token').value;
+    if (branch) body.branch = branch;
+    if (folder) body.folder = folder;
+    if (token) body.token = token;
+    result = await api('POST', `/sites/${seg(siteId)}/libraries/github`, body);
+    $('github-token').value = '';
+  } else {
+    result = await api('POST', `/sites/${seg(siteId)}/libraries`, { name, kind: $('library-kind').value });
+  }
   $('new-library-submit').disabled = false;
   if (result.ok) location.assign(pageFor('library', result.data.id));
-  else say(messageFor(result.error));
+  else {
+    const text = fromGithub && result.error === 'invalid_request'
+      ? 'Check the repository, branch, folder and token, then try again.'
+      : messageFor(result.error);
+    say(text);
+  }
 });
 
 function newLibraryCard() {
@@ -291,6 +331,9 @@ function newLibraryCard() {
   button.addEventListener('click', () => {
     $('library-name').value = '';
     $('library-kind').value = 'document';
+    document.querySelector('input[name="library-source"][value="empty"]').checked = true;
+    for (const id of ['github-repository', 'github-branch', 'github-folder', 'github-token']) $(id).value = '';
+    showGithubLibraryFields();
     showMessage($('new-library-error'), '');
     openDialog($('new-library-dialog'), $('library-name'), button);
   });

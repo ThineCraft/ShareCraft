@@ -143,7 +143,7 @@ export function peopleIn(access) {
  * `{ label, value, exact?, loading? }`, the held text, the access part, Open and the other
  * actions, each only where the person may.
  */
-export function paneModel(entry, details = {}, { now = Date.now(), regional } = {}) {
+export function paneModel(entry, details = {}, { now = Date.now(), regional, readOnly = false } = {}) {
   const kind = previewKind(entry);
   const folder = kind === 'folder';
   const editor = editorName(entry);
@@ -196,9 +196,9 @@ export function paneModel(entry, details = {}, { now = Date.now(), regional } = 
   const downloadable = !folder && entry.revised_at && !['held', 'quarantined'].includes(kind);
   if (downloadable) actions.push({ key: 'download', label: 'Download', href: `/api/docs/${seg(entry.id)}/content` });
   if (allowed.access) actions.push({ key: 'access', label: 'Share and access', href: `/access.html?id=${seg(entry.id)}` });
-  if (allowed.rename) actions.push({ key: 'rename', label: 'Rename' });
-  if (allowed.move) actions.push({ key: 'move', label: 'Move…' });
-  if (allowed.remove) actions.push({ key: 'delete', label: 'Delete', danger: true });
+  if (!readOnly && allowed.rename) actions.push({ key: 'rename', label: 'Rename' });
+  if (!readOnly && allowed.move) actions.push({ key: 'move', label: 'Move…' });
+  if (!readOnly && allowed.remove) actions.push({ key: 'delete', label: 'Delete', danger: true });
 
   return {
     id: entry.id,
@@ -258,7 +258,7 @@ async function getJson(path, signal) {
  * page's own dialogs; `me` is the signed-in account. Returns what the page calls: `row(tr,
  * item)` for each row it draws, `redraw()` after it redraws the table, `show(item, options)`.
  */
-export function createDetails({ pane, sheet, status, rows, page, entry, act, me, enabled = () => true }) {
+export function createDetails({ pane, sheet, status, rows, page, entry, act, me, enabled = () => true, readOnly = () => false }) {
   const wide = globalThis.matchMedia?.(WIDE_QUERY) ?? { matches: true, addEventListener() {} };
   let open = false; // the pane is shown (the column or the sheet)
   let selectedId = null;
@@ -508,7 +508,7 @@ export function createDetails({ pane, sheet, status, rows, page, entry, act, me,
       icon.classList.add('big');
       return h('div', { class: 'details-icon' }, icon);
     };
-    const model = paneModel(item, details);
+    const model = paneModel(item, details, { readOnly: readOnly() });
     if (kind === 'quarantined' || kind === 'held') {
       previewBox.replaceChildren(h('div', { class: 'details-held', role: 'note' }, ...model.held.map((line) => h('p', {}, line))));
     } else if (kind === 'image') {
@@ -577,7 +577,7 @@ export function createDetails({ pane, sheet, status, rows, page, entry, act, me,
       info.replaceChildren(h('p', { class: 'meta details-empty' }, 'Choose a file or folder to see its details: click its row, or move to it with the arrow keys.'));
       return;
     }
-    const model = paneModel(item, details);
+    const model = paneModel(item, details, { readOnly: readOnly() });
     if (previewFor !== item.id && controller) drawPreview(item, model.kind, controller.signal);
     const facts = h(
       'dl',

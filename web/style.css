@@ -87,6 +87,8 @@ a{color:var(--accent-ink)}
 .row .field{margin:0}
 .check{display:flex;align-items:center;gap:var(--space-2);font-size:var(--text-sm);color:var(--text)}
 .check input{width:18px;height:18px}
+.choice-set{display:flex;flex-direction:column;gap:var(--space-2);margin:0 0 var(--space-4);padding:0;border:0}
+.choice-set legend{margin-bottom:var(--space-2);font-size:var(--text-sm);color:var(--muted)}
 /* buttons: three looks only. Primary (the default): the accent filled. Secondary (.secondary, and the
    older .plain): a quiet outline. Ghost (.ghost): text only, a tint on hover. .danger turns any of
    them to the stop colours; .small is the 32 pixel size, .icon a square one for a single glyph */
@@ -114,6 +116,19 @@ select{padding-right:var(--space-2)}
 .msg.ok{background:var(--soft);color:var(--text)}
 .problem{margin:0;padding:var(--space-4);background:var(--stop-bg);color:var(--stop-ink)}
 .note{margin:0 0 var(--space-3);padding:var(--space-2) var(--space-3);border-radius:var(--radius-sm);background:var(--warn-bg);color:var(--warn-ink);font-size:var(--text-sm)}
+.source-banner{display:flex;flex-wrap:wrap;align-items:center;gap:var(--space-2) var(--space-3);margin:0 0 var(--space-3);padding:var(--space-3);border:1px solid var(--line);border-left:4px solid var(--ok);border-radius:var(--radius-md);background:var(--paper);font-size:var(--text-sm)}
+.source-banner[hidden]{display:none}
+.source-banner[data-tone=working]{border-left-color:var(--accent-ink)}
+.source-banner[data-tone=attention]{border-left-color:var(--warn-ink);background:var(--warn-bg)}
+.source-state{flex:none;padding:2px var(--space-2);border:1px solid currentColor;border-radius:var(--radius-pill);font-weight:600}
+.source-copy{display:flex;flex:1 1 340px;min-width:0;flex-direction:column;gap:2px;overflow-wrap:anywhere}
+.source-copy>span{color:var(--muted)}
+.source-banner[data-tone=attention] .source-copy>span{color:inherit}
+.accepts details{margin-top:var(--space-1)}
+.accepts details p{margin:var(--space-2) 0 var(--space-1)}
+.accepts details ul{margin:0;padding-left:var(--space-5)}
+@media (max-width:480px){.source-banner button{width:100%}}
+@media (forced-colors:active){.source-banner{border-color:CanvasText}.source-state{border-color:CanvasText}}
 .list{list-style:none;margin:0 0 var(--space-3);padding:0;border-top:1px solid var(--line)}
 .list li{display:flex;flex-wrap:wrap;align-items:center;gap:var(--space-2) var(--space-3);padding:var(--space-3) var(--space-2);border-bottom:1px solid var(--line);overflow-wrap:anywhere}
 .list .grow{flex:1;min-width:160px}
@@ -367,6 +382,14 @@ input[type=search]{border:1px solid var(--line);background:var(--paper);border-r
 textarea.short{min-height:84px;padding:var(--space-2) var(--space-3);font:inherit;border-radius:var(--radius-sm);border-color:var(--line);background:var(--paper)}
 .page .stack .field{max-width:none}
 .page .stack input[type=text],.page .stack select{width:100%}
+.page .stack input:is([type=password],[type=number]){width:100%}
+.source-box{max-width:640px;margin-top:var(--space-4);padding:var(--space-3) var(--space-4);border:1px solid var(--line);border-radius:var(--radius-md);background:var(--paper)}
+.source-box h3{margin:0 0 var(--space-2);font-size:var(--text-md)}
+.source-box p{overflow-wrap:anywhere}
+.one-time{margin-top:var(--space-3);padding:var(--space-3);border:2px solid var(--accent-ink);border-radius:var(--radius-md);background:var(--soft);overflow-wrap:anywhere}
+.one-time ol{margin-bottom:0;padding-left:var(--space-5)}
+.one-time li+li{margin-top:var(--space-2)}
+.danger-zone{border-color:color-mix(in srgb,var(--stop-ink) 35%,var(--line))}
 input[type=file]{max-width:100%}
 .mark.warn{border-color:transparent;background:var(--warn-bg);color:var(--warn-ink)}
 .list li.admin-site .actions{margin-left:auto}

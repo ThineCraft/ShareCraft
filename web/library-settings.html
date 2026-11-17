@@ -54,6 +54,59 @@
   <div><button type="submit">Save</button></div>
   <p id="saved" role="status" class="msg ok"></p>
  </form>
+
+ <section id="source-section" aria-labelledby="source-heading" hidden>
+  <h2 id="source-heading">Source</h2>
+  <p class="meta">This library is kept in step with a GitHub repository. Its files cannot be changed in ShareCraft.</p>
+  <p><strong>Repository</strong><br><span id="source-repository"></span></p>
+  <form id="source-settings" class="stack">
+   <div class="field">
+    <label for="source-branch">Branch</label>
+    <input type="text" id="source-branch" autocomplete="off" required>
+   </div>
+   <div class="field">
+    <label for="source-folder">Folder</label>
+    <input type="text" id="source-folder" autocomplete="off" aria-describedby="source-folder-note">
+    <small id="source-folder-note" class="meta">Leave empty for the whole repository.</small>
+   </div>
+   <div class="field">
+    <label for="source-poll">Check every (seconds)</label>
+    <input type="number" id="source-poll" min="60" max="86400" step="1" required aria-describedby="source-poll-note">
+    <small id="source-poll-note" class="meta">From 60 seconds to 86,400 seconds.</small>
+   </div>
+   <div class="field">
+    <label for="source-token">GitHub token <span id="source-token-state" class="meta"></span></label>
+    <input type="password" id="source-token" autocomplete="new-password" aria-describedby="source-token-note">
+    <small id="source-token-note" class="meta">Leave empty to keep the current token.</small>
+   </div>
+   <div class="row">
+    <button type="submit">Save source settings</button>
+    <button type="button" id="source-token-replace" class="plain">Replace token</button>
+    <button type="button" id="source-token-remove" class="plain">Remove token</button>
+   </div>
+   <p id="source-saved" role="status" class="msg ok"></p>
+   <p id="source-error" role="alert" class="msg"></p>
+  </form>
+
+  <section class="source-box" aria-labelledby="webhook-heading">
+   <h3 id="webhook-heading">GitHub webhook</h3>
+   <p>A webhook updates this library after a push. Its secret is shown only once, when it is created.</p>
+   <p id="webhook-state" class="meta"></p>
+   <button type="button" id="webhook-create" class="plain">Create webhook secret</button>
+   <div id="webhook-reveal" class="one-time" role="status" aria-live="polite" hidden>
+    <strong id="webhook-once"></strong>
+    <ol id="webhook-steps"></ol>
+   </div>
+   <p id="webhook-error" role="alert" class="msg"></p>
+  </section>
+
+  <section class="source-box danger-zone" aria-labelledby="disconnect-heading">
+   <h3 id="disconnect-heading">Disconnect</h3>
+   <p>Disconnecting stops updates from GitHub. The files stay in this library.</p>
+   <button type="button" id="source-disconnect" class="danger">Disconnect repository</button>
+   <p id="disconnect-error" role="alert" class="msg"></p>
+  </section>
+ </section>
 </div>
 <script type="module" src="./library-settings.js"></script>
 </body>

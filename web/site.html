@@ -81,7 +81,34 @@
    <label for="library-kind">Kind</label>
    <select id="library-kind"></select>
   </div>
-  <p id="new-library-error" role="alert" class="msg"></p>
+  <fieldset class="choice-set">
+   <legend>Start with</legend>
+   <label class="check"><input type="radio" name="library-source" value="empty" checked> Empty library</label>
+   <label class="check"><input type="radio" name="library-source" value="github"> From a GitHub repository</label>
+  </fieldset>
+  <div id="github-library-fields" hidden>
+   <div class="field">
+    <label for="github-repository">Repository</label>
+    <input type="text" id="github-repository" autocomplete="off" placeholder="owner/repository" aria-describedby="github-repository-note">
+    <small id="github-repository-note" class="meta">Write the GitHub repository as owner/repository.</small>
+   </div>
+   <div class="field">
+    <label for="github-branch">Branch</label>
+    <input type="text" id="github-branch" autocomplete="off" placeholder="Default branch" aria-describedby="github-branch-note">
+    <small id="github-branch-note" class="meta">Leave empty to use the repository's default branch.</small>
+   </div>
+   <div class="field">
+    <label for="github-folder">Folder</label>
+    <input type="text" id="github-folder" autocomplete="off" aria-describedby="github-folder-note">
+    <small id="github-folder-note" class="meta">Leave empty to use the whole repository.</small>
+   </div>
+   <div class="field">
+    <label for="github-token">GitHub token</label>
+    <input type="password" id="github-token" autocomplete="new-password" aria-describedby="github-token-note">
+    <small id="github-token-note" class="meta">A public repository needs no token. For a private repository, a read-only fine-grained token with Contents: read is enough.</small>
+   </div>
+  </div>
+  <p id="new-library-error" role="alert" class="msg" tabindex="-1"></p>
   <div class="row end">
    <button type="button" id="new-library-cancel" class="plain">Cancel</button>
    <button type="submit" id="new-library-submit">Create library</button>

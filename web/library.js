@@ -59,6 +59,7 @@ import { fileIcon, fileKind, nextSort, parseSort, relativeTime, sortDescription,
 import { addShortcut, isMacPlatform } from './shortcuts.js';
 import { extendSelection, moveIndex, selectionText, toggleSelection } from './selection.js';
 import { settleAll, softly } from './skeleton.js';
+import { sourceStateText, sourceSummary } from './source-panel.js';
 
 const BULK_MAX = 500;
 const GRID_PAGE = 200; // the grid's page, the most the server answers at once
@@ -88,6 +89,12 @@ if (self.kind === 'site' || self.kind === 'document') {
 const libraryStep = here.path.find((step) => step.kind === 'library');
 const libraryInfo = libraryStep ? await api('GET', `/libraries/${seg(libraryStep.id)}`) : null;
 const library = libraryInfo?.ok ? libraryInfo.data : null;
+let source = null;
+if (libraryStep) {
+  const sourceAnswer = await api('GET', `/libraries/${seg(libraryStep.id)}/source`);
+  if (sourceAnswer.ok) source = sourceAnswer.data;
+  else if (sourceAnswer.status !== 404) showMessage(error, messageFor(sourceAnswer.error));
+}
 if (library?.description) {
   $('library-description').textContent = library.description;
   $('library-description').hidden = false;
@@ -99,7 +106,7 @@ const accepts = [];
 if (Array.isArray(library?.effective_allowed_types)) accepts.push(`Takes only ${typeListText(library.effective_allowed_types)}.`);
 if (library?.blocked_types?.length) accepts.push(`Does not take ${typeListText(library.blocked_types)}.`);
 if (typeof library?.max_file_bytes === 'number') accepts.push(`Files up to ${formatSize(library.max_file_bytes)}.`);
-$('accepts').textContent = accepts.join(' ');
+$('accepts-text').textContent = accepts.join(' ');
 $('drop-accepts').textContent = accepts.join(' ');
 // The library-level links live in the More menu; an entry the person may not use is left out.
 const showEntry = (id, shown) => {
@@ -143,12 +150,16 @@ let cut = loadCut(); // items cut with Ctrl+X, waiting to be pasted in another f
 let anchor = null; // where Shift+Up or Shift+Down started extending the selection
 let anchorBase = new Set(); // what was selected when it started
 let inline = null; // the rename in place under way: { id, input }
+let sourceTimer = null; // polls only while the source is connecting or syncing
 const MAC = isMacPlatform();
 const KEY_MOD = MAC ? { text: 'Command', aria: 'Meta' } : { text: 'Ctrl', aria: 'Control' };
 const UNDO_KEYS = `${KEY_MOD.text}+Z`;
 const moveDialog = $('move-dialog');
 const renameDialog = $('rename-dialog');
 const movingIds = () => moving.map((item) => item.id);
+const mayRename = (item) => source === null && itemActions(item).rename;
+const mayMove = (item) => source === null && itemActions(item).move;
+const mayRemove = (item) => source === null && itemActions(item).remove;
 
 // The details pane beside the table (a sheet on narrow screens): preview, facts and access of
 // the selected row, with the row actions. Only for the list; the grid of an image library has none.
@@ -167,7 +178,11 @@ const details = createDetails({
   },
   me,
   enabled: () => view === 'list',
+  readOnly: () => source !== null,
 });
+
+renderSource();
+$('source-sync').addEventListener('click', updateSourceNow);
 
 // The uploads, in the tray at the bottom-right: they run whichever folder is on screen.
 const uploads = createUploads({
@@ -213,6 +228,60 @@ if (location.hash === '#upload') {
     $('new-button').click();
     $('new-menu').querySelector('[data-key="files"]')?.focus();
   }
+}
+
+// ---- repository source ----
+
+function showAccepts() {
+  const hidden = Number(source?.hidden) > 0 ? Number(source.hidden) : 0;
+  $('source-hidden').hidden = hidden === 0;
+  $('source-hidden-summary').textContent = hidden === 1 ? '1 file hidden by file rules' : `${hidden} files hidden by file rules`;
+  $('accepts-text').textContent = canAdd ? accepts.join(' ') : '';
+  $('accepts').hidden = !(canAdd && accepts.length > 0) && hidden === 0;
+}
+
+function renderSource() {
+  const banner = $('source-banner');
+  banner.hidden = source === null;
+  if (source === null) {
+    showAccepts();
+    return;
+  }
+  const summary = sourceSummary(source);
+  banner.dataset.tone = summary.tone;
+  $('source-state').textContent = sourceStateText(source.state);
+  $('source-headline').textContent = summary.headline;
+  $('source-detail').textContent = summary.detail;
+  $('source-sync').hidden = !can(here.access, 'manage_site');
+  $('source-sync').disabled = ['connecting', 'syncing'].includes(source.state);
+  showAccepts();
+  clearTimeout(sourceTimer);
+  sourceTimer = ['connecting', 'syncing'].includes(source.state) ? setTimeout(refreshSource, 10_000) : null;
+}
+
+async function refreshSource() {
+  if (!libraryStep || source === null) return;
+  const result = await api('GET', `/libraries/${seg(libraryStep.id)}/source`);
+  if (result.ok) source = result.data;
+  else if (result.status === 404) {
+    source = null;
+    showPlace();
+  }
+  renderSource();
+}
+
+async function updateSourceNow() {
+  if (!libraryStep || source === null) return;
+  $('source-sync').disabled = true;
+  showMessage(error, '');
+  const result = await api('POST', `/libraries/${seg(libraryStep.id)}/source/sync`);
+  if (!result.ok) {
+    $('source-sync').disabled = false;
+    showMessage(error, messageFor(result.error));
+    return;
+  }
+  source = { ...source, state: 'syncing' };
+  renderSource();
 }
 
 // ---- the listing ----
@@ -453,6 +522,7 @@ function showSelection() {
   $('select-note').hidden = !next;
   $('select-note').textContent = `Select all covers the ${choosable.length} items loaded so far. Use Show more to load the rest.`;
   const allowed = selectedItems().map(itemActions);
+  for (const id of ['bulk-move', 'bulk-cut', 'bulk-delete']) $(id).hidden = source !== null;
   $('bulk-move').disabled = state.count === 0 || !allowed.every((a) => a.move);
   $('bulk-cut').disabled = $('bulk-move').disabled;
   $('bulk-copy').disabled = state.count === 0;
@@ -527,7 +597,7 @@ function row(item) {
   details.row(tr, item);
   // A row the person may move can be dragged onto a folder (the link inside is not dragged on its own).
   // (Not with a finger: there a held row opens its Actions sheet, shell.js.)
-  if (itemActions(item).move && !globalThis.matchMedia?.('(pointer: coarse)').matches) {
+  if (mayMove(item) && !globalThis.matchMedia?.('(pointer: coarse)').matches) {
     tr.draggable = true;
     tr.querySelector('a.name-link').draggable = false;
   }
@@ -559,7 +629,7 @@ function sharingMarks(item) {
 
 /** A row's Actions menu ("⋯"): Details, then Rename, Move…, Copy…, Delete and Access, as far as allowed. */
 function actionsMenu(item) {
-  const entries = ['details', ...rowMenu(item)];
+  const entries = ['details', ...rowMenu(item).filter((entry) => source === null || !['rename', 'move', 'delete'].includes(entry))];
   const button = h(
     'button',
     { type: 'button', class: 'plain menu-button dots', 'aria-label': `Actions for ${item.name}`, 'data-for': item.id },
@@ -817,8 +887,8 @@ function showPlace() {
   showEntry('explorer-link', can(here.access, 'manage_access'));
   $('explorer-link').href = `/explorer.html?root=${seg(nodeId)}`;
   $('access-link').href = `/access.html?id=${seg(nodeId)}`;
-  canAdd = can(here.access, 'add');
-  $('accepts').hidden = !canAdd || accepts.length === 0;
+  canAdd = can(here.access, 'add') && source === null;
+  showAccepts();
   $('drop-target').textContent = self.name;
   $('new-wrap').hidden = !canAdd;
   $('drop-hint').hidden = !canAdd;
@@ -1153,7 +1223,7 @@ $('file-rows').addEventListener('dragstart', (event) => {
     id: entry.id,
     name: entry.name,
     kind: entry.kind,
-    movable: itemActions(entry).move,
+    movable: mayMove(entry),
   }));
   dragging = { items: list, from: nodeId };
   event.dataTransfer.effectAllowed = 'move';
@@ -1254,13 +1324,14 @@ function saveCut() {
 
 /** Whether the cut items may be pasted here, as `canDrop` answers. */
 function pasteVerdict() {
+  if (source !== null) return { ok: false, reason: 'This library cannot be changed here.' };
   const place = { id: nodeId, name: self.name, kind: self.kind, access: here.access };
   return canDrop(cut.items, place, here.path.map((step) => step.id), { from: cut.from });
 }
 
 /** Cuts the items of `list` that the person may move; they are moved when pasted in another folder. */
 function cutItems(list) {
-  const movable = list.filter((item) => itemActions(item).move);
+  const movable = list.filter(mayMove);
   if (movable.length === 0) {
     showToast(list.length === 1 ? `You cannot move ${list[0].name}.` : 'You cannot move these items.', { kind: 'error' });
     return;
@@ -1276,7 +1347,7 @@ function cutItems(list) {
 
 /** The bar that says what is cut, with Paste here and Cancel; the cut rows are dimmed. */
 function showCut() {
-  $('cut-bar').hidden = !cut;
+  $('cut-bar').hidden = !cut || source !== null;
   const ids = new Set(cut && cut.from === nodeId ? cut.items.map((item) => item.id) : []);
   for (const tr of $('file-rows').querySelectorAll('tr[data-id]')) tr.classList.toggle('cut', ids.has(tr.dataset.id));
   if (!cut) return;
@@ -1334,14 +1405,16 @@ addShortcut({
   keys: ['Mod+X'],
   label: 'Cut the selected items, to move them',
   scope: 'library',
-  when: (event) => clipboardKey(event) === 'cut' && cutList().length > 0,
+  shown: () => source === null,
+  when: (event) => source === null && clipboardKey(event) === 'cut' && cutList().length > 0,
   run: () => cutItems(cutList()),
 });
 addShortcut({
   keys: ['Mod+V'],
   label: 'Paste the cut items into this folder',
   scope: 'library',
-  when: (event) => clipboardKey(event) === 'paste' && Boolean(cut),
+  shown: () => source === null,
+  when: (event) => source === null && clipboardKey(event) === 'paste' && Boolean(cut),
   run: () => pasteCut(),
 });
 addShortcut({
@@ -1511,11 +1584,11 @@ addShortcut({
   keys: ['F2'],
   label: 'Rename the current row',
   scope: 'library',
-  shown: listShown,
-  when: (event) => listShown() && inFiles(event) && Boolean(currentItem()),
+  shown: () => source === null && listShown(),
+  when: (event) => source === null && listShown() && inFiles(event) && Boolean(currentItem()),
   run: () => {
     const item = currentItem();
-    if (!itemActions(item).rename) {
+    if (!mayRename(item)) {
       showToast(`You cannot rename ${item.name}.`, { kind: 'error' });
       return;
     }
@@ -1527,8 +1600,8 @@ addShortcut({
   keys: ['Delete'],
   label: 'Move the selected items to the recycle bin (with Undo)',
   scope: 'library',
-  shown: () => items.length > 0,
-  when: (event) => inFiles(event) && (selected.size > 0 || (view === 'list' && Boolean(currentItem()))),
+  shown: () => source === null && items.length > 0,
+  when: (event) => source === null && inFiles(event) && (selected.size > 0 || (view === 'list' && Boolean(currentItem()))),
   run: () => keyDelete(),
 });
 addShortcut({
@@ -1560,7 +1633,7 @@ function goUp() {
 async function keyDelete() {
   const list = selected.size ? selectedItems() : [currentItem()].filter(Boolean);
   if (list.length === 0) return;
-  const refused = list.find((item) => !itemActions(item).remove);
+  const refused = list.find((item) => !mayRemove(item));
   if (refused) {
     showToast(list.length === 1 ? `You cannot delete ${refused.name}.` : `You cannot delete ${refused.name}, so nothing was deleted.`, { kind: 'error' });
     return;

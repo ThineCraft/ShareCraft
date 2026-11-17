@@ -55,6 +55,11 @@ test('paneModel gives a file its facts, Open, Download and the actions the perso
   assert.equal(model.announce, 'cat.png, png image.');
 });
 
+test('paneModel hides content-changing actions in a read-only connected library', () => {
+  const model = paneModel(doc('cat.png'), { size: 2048, access: undefined }, { now: NOW, regional: UTC, readOnly: true });
+  assert.deepEqual(model.actions.map((action) => action.key), ['download', 'access']);
+});
+
 test('paneModel says Loading for a size not yet known, and leaves out an unknown one', () => {
   const loading = paneModel(doc('a.txt'), {}, { now: NOW, regional: UTC });
   assert.deepEqual(loading.facts[1], { label: 'Size', value: 'Loading…', loading: true });
