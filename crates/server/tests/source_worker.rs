@@ -217,6 +217,36 @@ impl Env {
         }
     }
 
+    /// Waits until every `library` mirrors `commit`.
+    async fn wait_libraries_commit(&self, libraries: &[NodeId], commit: &str) {
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        loop {
+            let mut pending = Vec::new();
+            for &library in libraries {
+                let status = self
+                    .server
+                    .records_db()
+                    .source_of(library)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .1;
+                if status.last_commit.as_deref() != Some(commit) || status.state != SourceState::Ok
+                {
+                    pending.push((library, status));
+                }
+            }
+            if pending.is_empty() {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the libraries never reached {commit}: {pending:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
     /// When the library was last checked.
     async fn checked(&self) -> OffsetDateTime {
         self.status().await.last_checked_at.unwrap()
@@ -560,7 +590,7 @@ async fn a_rate_limit_recorded_while_the_worker_waits_for_the_source_lock_is_pre
     };
     // The worker has taken its global turn and checked the old eligibility before this seam.
     // Record a newer reason that the source must not start before releasing it.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    env.state.sources().wait_start_held().await;
     env.server
         .records_db()
         .rate_limit_source(env.library, retry_at, "GitHub rate limit reached.", None)
@@ -831,6 +861,41 @@ async fn dropping_the_worker_stops_running_and_waiting_syncs() {
     );
     env.state.sources().wake(env.library);
     env.wait_commit(&latest.sha).await;
+    drop(restarted);
+
+    dropping_the_worker_before_children_enter_clears_every_running_entry().await;
+}
+
+async fn dropping_the_worker_before_children_enter_clears_every_running_entry() {
+    let env = Env::without_worker().await;
+    let second = env.add_library("Mirror Two").await;
+    let third = env.add_library("Mirror Three").await;
+    let libraries = [env.library, second, third];
+    let latest = env.fake.commit(
+        "main",
+        &files(&[
+            ("a.md", "first"),
+            ("guide/b.md", "b"),
+            ("unpolled.md", "after restart"),
+        ]),
+    );
+    let child_gate = env.state.sources().hold_child_starts().await;
+    let worker = server::source_sync::start_worker(env.state.clone());
+    for library in libraries {
+        env.state.sources().wake(library);
+    }
+    env.state.sources().wait_child_start().await;
+
+    // Every child exists but is paused before entering the body that used to construct its
+    // RunningGuard. Cancelling the owner must still clear all three running-map entries.
+    drop(worker);
+    drop(child_gate);
+
+    let restarted = server::source_sync::start_worker(env.state.clone());
+    for library in libraries {
+        env.state.sources().wake(library);
+    }
+    env.wait_libraries_commit(&libraries, &latest.sha).await;
     drop(restarted);
 }
 

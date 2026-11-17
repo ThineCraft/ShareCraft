@@ -419,9 +419,10 @@ pub async fn abandon_uploads_into(state: &AppState, library: NodeId) -> usize {
     abandoned
 }
 
-/// Puts every connection left `syncing` and last checked before `before` back to
-/// `connecting`, so it is due again; how many. The server's start calls it with the time it
-/// starts (no sync runs before), [`sync_once`] with [`STALE_SYNC`] ago. A failure is logged.
+/// Puts each connection left `syncing` and last checked before `before` back to `connecting`
+/// when its source advisory lock is free, so it is due again; how many. The server's start calls
+/// it with the time it starts (no sync of this process runs before), [`sync_once`] with
+/// [`STALE_SYNC`] ago. A failure is logged.
 pub async fn recover_stale_syncs(state: &AppState, before: OffsetDateTime) -> usize {
     match state.db().reset_stale_syncs(before).await {
         Ok(n) => usize::try_from(n).unwrap_or(usize::MAX),
@@ -458,6 +459,12 @@ pub struct Sources {
     turns: Arc<Semaphore>,
     /// A test seam held immediately before a worker starts a chosen source.
     start_gate: Arc<RwLock<()>>,
+    /// Signals a worker waiting at [`Sources::start_gate`].
+    start_held: Notify,
+    /// A test seam held as a spawned worker child enters its future.
+    child_start_gate: Arc<RwLock<()>>,
+    /// Signals that a worker child reached [`Sources::child_start_gate`].
+    child_started: Notify,
     /// Told when a library is woken.
     wake: Notify,
 }
@@ -470,6 +477,9 @@ impl Default for Sources {
             failures: Mutex::new(HashMap::new()),
             turns: Arc::new(Semaphore::new(MAX_SYNCS)),
             start_gate: Arc::new(RwLock::new(())),
+            start_held: Notify::new(),
+            child_start_gate: Arc::new(RwLock::new(())),
+            child_started: Notify::new(),
             wake: Notify::new(),
         }
     }
@@ -502,6 +512,24 @@ impl Sources {
     #[doc(hidden)]
     pub async fn hold_starts(&self) -> OwnedRwLockWriteGuard<()> {
         Arc::clone(&self.start_gate).write_owned().await
+    }
+
+    /// Waits until a worker reaches the held pre-transition start gate.
+    #[doc(hidden)]
+    pub async fn wait_start_held(&self) {
+        self.start_held.notified().await;
+    }
+
+    /// Holds spawned worker children before they enter their sync future.
+    #[doc(hidden)]
+    pub async fn hold_child_starts(&self) -> OwnedRwLockWriteGuard<()> {
+        Arc::clone(&self.child_start_gate).write_owned().await
+    }
+
+    /// Waits until a spawned worker child is held by [`Sources::hold_child_starts`].
+    #[doc(hidden)]
+    pub async fn wait_child_start(&self) {
+        self.child_started.notified().await;
     }
 
     fn take_pending(&self) -> Vec<NodeId> {
@@ -592,11 +620,14 @@ async fn start_due(state: &AppState, now: OffsetDateTime, running: &mut JoinSet<
         .filter(|(library, woken)| sources.start(*library, *woken))
     {
         started += 1;
+        let mut guard = RunningGuard::new(state.clone(), library);
         running.spawn({
             let state = state.clone();
             async move {
-                let mut guard = RunningGuard::new(state.clone(), library);
-                guard.retry_soon = sync_one(&state, library, now).await;
+                state.sources().child_started.notify_one();
+                let child_start = state.sources().child_start_gate.read().await;
+                drop(child_start);
+                guard.finish(sync_one(&state, library, now).await);
             }
         });
     }
@@ -618,6 +649,10 @@ impl RunningGuard {
             library,
             retry_soon: false,
         }
+    }
+
+    fn finish(&mut self, retry_soon: bool) {
+        self.retry_soon = retry_soon;
     }
 }
 
@@ -679,6 +714,7 @@ async fn start_worker_sync(state: &AppState, library: NodeId, now: OffsetDateTim
             return WorkerStart::Ineligible;
         }
     };
+    state.sources().start_held.notify_one();
     let start_guard = state.sources().start_gate.read().await;
     let transition = db
         .mark_source_syncing_if_eligible(library, now, generation)

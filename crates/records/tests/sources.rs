@@ -808,6 +808,28 @@ async fn a_sync_of_an_old_generation_records_nothing_but_a_requeue() {
 }
 
 #[tokio::test]
+async fn stale_sync_recovery_skips_a_source_whose_advisory_lock_is_held() {
+    let f = fixture().await;
+    let db = &f.test.db;
+    db.connect_source(&new_source(&f, f.library)).await.unwrap();
+    let now = OffsetDateTime::now_utc();
+    let before = now - Duration::minutes(15);
+    let mut syncing = status(SourceState::Syncing);
+    syncing.last_checked_at = Some(now - Duration::minutes(20));
+    db.set_source_status(f.library, &syncing).await.unwrap();
+
+    let source_lock = db.try_lock_source(f.library).await.unwrap().unwrap();
+    assert_eq!(db.reset_stale_syncs(before).await.unwrap(), 0);
+    let (_, still_running) = db.source_of(f.library).await.unwrap().unwrap();
+    assert_eq!(still_running.state, SourceState::Syncing);
+
+    drop(source_lock);
+    assert_eq!(db.reset_stale_syncs(before).await.unwrap(), 1);
+    let (_, recovered) = db.source_of(f.library).await.unwrap().unwrap();
+    assert_eq!(recovered.state, SourceState::Connecting);
+}
+
+#[tokio::test]
 async fn a_rate_limit_survives_a_generation_change_and_is_never_shortened() {
     let f = fixture().await;
     let db = &f.test.db;

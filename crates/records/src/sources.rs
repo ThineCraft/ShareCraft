@@ -898,18 +898,46 @@ impl Db {
         Ok(got.then_some(SourceLock { _tx: tx }))
     }
 
-    /// Puts every connection left in state `syncing` and last checked before `before` (or
-    /// never) back to `connecting`, so it is due again: a sync that stopped with its process
-    /// left it so. Returns how many.
+    /// Puts each connection left in state `syncing` and last checked before `before` (or never)
+    /// back to `connecting` when its source advisory lock can be taken, so it is due again: a
+    /// sync that stopped with its process left it so. A source still holding its lock is skipped.
+    /// Returns how many.
     pub async fn reset_stale_syncs(&self, before: OffsetDateTime) -> Result<u64, DbError> {
-        let done = sqlx::query(
-            "update library_sources set state = 'connecting' \
-             where state = 'syncing' and (last_checked_at is null or last_checked_at < $1)",
+        let stale: Vec<Uuid> = sqlx::query_scalar(
+            "select library_id from library_sources \
+             where state = 'syncing' and (last_checked_at is null or last_checked_at < $1) \
+             order by library_id",
         )
         .bind(before)
-        .execute(self.pool())
+        .fetch_all(self.pool())
         .await?;
-        Ok(done.rows_affected())
+        let mut reset = 0_u64;
+        for library in stale {
+            let mut tx = self.pool().begin().await?;
+            let got: bool = sqlx::query_scalar(
+                "select pg_try_advisory_xact_lock(\
+                    hashtextextended('source-sync:' || $1::text, 0))",
+            )
+            .bind(library)
+            .fetch_one(&mut *tx)
+            .await?;
+            if !got {
+                tx.rollback().await?;
+                continue;
+            }
+            let done = sqlx::query(
+                "update library_sources set state = 'connecting' \
+                 where library_id = $2 and state = 'syncing' \
+                   and (last_checked_at is null or last_checked_at < $1)",
+            )
+            .bind(before)
+            .bind(library)
+            .execute(&mut *tx)
+            .await?;
+            reset += done.rows_affected();
+            tx.commit().await?;
+        }
+        Ok(reset)
     }
 
     /// Ends the connection of `library`: removes its items and its connection, keeping every
