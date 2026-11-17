@@ -153,6 +153,7 @@ pub(crate) struct LiveRoom<S: LiveStore> {
     witnesses: HashMap<Seq, Vec<u32>>,
     cancel_book: CancelBook,
     viewer_reports: HashMap<Seq, BTreeSet<u32>>,
+    resolved_reports: BTreeSet<(Seq, u32)>,
     session: Option<Session>,
     known_places: HashMap<ParticipantNo, ClientId>,
     clients: HashMap<ClientId, (UserId, u64)>,
@@ -249,6 +250,7 @@ impl<S: LiveStore> LiveRoom<S> {
             witnesses,
             cancel_book,
             viewer_reports: HashMap::new(),
+            resolved_reports: BTreeSet::new(),
             session,
             known_places,
             clients,
@@ -327,7 +329,7 @@ impl<S: LiveStore> LiveRoom<S> {
                 .await?;
             self.pending_ends.remove(0);
             self.apply_place_end(session, participant, reason);
-            let verdicts = self.cancel_book.gone(participant.0);
+            let verdicts = self.gone_verdicts(participant);
             self.apply_verdicts(verdicts).await?;
         }
         let should_end = self
@@ -825,8 +827,34 @@ impl<S: LiveStore> LiveRoom<S> {
         self.pending_ends
             .retain(|pending| *pending != (session_id, participant, reason));
         self.apply_place_end(session_id, participant, reason);
-        let verdicts = self.cancel_book.gone(participant.0);
+        let verdicts = self.gone_verdicts(participant);
         self.apply_verdicts(verdicts).await
+    }
+
+    fn gone_verdicts(&mut self, participant: ParticipantNo) -> Vec<Verdict> {
+        let mut verdicts = self.cancel_book.gone(participant.0);
+        let resolved = verdicts
+            .iter()
+            .map(|verdict| match verdict {
+                Verdict::Cancel { seq, .. } | Verdict::Stands { seq, .. } => *seq,
+            })
+            .collect::<BTreeSet<_>>();
+        let held = self.seen_positions();
+        verdicts.extend(
+            self.viewer_reports
+                .keys()
+                .filter(|seq| !resolved.contains(seq))
+                .filter(|seq| {
+                    self.witnesses.get(seq).is_some_and(|witnesses| {
+                        witnesses.iter().all(|witness| !held.contains_key(witness))
+                    })
+                })
+                .map(|seq| Verdict::Stands {
+                    seq: *seq,
+                    reporters: Vec::new(),
+                }),
+        );
+        verdicts
     }
 
     fn apply_place_end(
@@ -1059,26 +1087,34 @@ impl<S: LiveStore> LiveRoom<S> {
         participant: ParticipantNo,
         seq: Seq,
     ) -> Result<Vec<Verdict>, RoomFailed> {
-        let Some((session, client, user)) = self.session.as_ref().and_then(|session| {
+        if self.resolved_reports.contains(&(seq, participant.0)) {
+            return Ok(Vec::new());
+        }
+        let Some((session, client, user, held)) = self.session.as_ref().and_then(|session| {
             session
                 .places
                 .get(&participant)
-                .and_then(|place| place.held.then_some((session.id, place.client, place.user)))
+                .map(|place| (session.id, place.client, place.user, place.held))
         }) else {
             return Ok(Vec::new());
         };
-        self.store
-            .end_live_place(
-                session.0,
-                participant.0,
-                GoneReason::CannotOpen,
-                OffsetDateTime::now_utc(),
-            )
-            .await?;
-        let _ = self.members.send(
-            Some(client),
-            &Outbound::One(encode(&LiveServerMsg::CannotOpen { seq })),
-        );
+        if held {
+            self.store
+                .end_live_place(
+                    session.0,
+                    participant.0,
+                    GoneReason::CannotOpen,
+                    OffsetDateTime::now_utc(),
+                )
+                .await?;
+        }
+        self.resolved_reports.insert((seq, participant.0));
+        if held {
+            let _ = self.members.send(
+                Some(client),
+                &Outbound::One(encode(&LiveServerMsg::CannotOpen { seq })),
+            );
+        }
         self.events.emit(NewEvent {
             kind: "live.entry_failed_on_device",
             actor: Some(user),
@@ -1087,8 +1123,12 @@ impl<S: LiveStore> LiveRoom<S> {
             node: Some(self.doc.into()),
             detail: serde_json::json!({ "seq": seq.0 }),
         });
-        self.apply_place_end(session, participant, GoneReason::CannotOpen);
-        Ok(self.cancel_book.gone(participant.0))
+        if held {
+            self.apply_place_end(session, participant, GoneReason::CannotOpen);
+            Ok(self.gone_verdicts(participant))
+        } else {
+            Ok(Vec::new())
+        }
     }
 
     fn witnesses(&self) -> Vec<u32> {
@@ -1573,6 +1613,45 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn witness_leaving_causes_cancellation() {
+        let (mut room, store) = room().await;
+        let mut ann = join_as(&mut room, 1, 1, 11, "editor", FORMAT, None, None).await;
+        let bob = join_as(&mut room, 2, 2, 12, "editor", FORMAT, None, None).await;
+        let _ = drain(&mut ann.rx);
+        entry(&mut room, &ann, 1, 0, FORMAT, "crashes-ann".into())
+            .await
+            .unwrap();
+        let _ = drain(&mut ann.rx);
+
+        room.handle(LiveCommand::Report {
+            conn: ann.conn,
+            client: ann.client,
+            seq: Seq(1),
+        })
+        .await
+        .unwrap();
+        room.handle(LiveCommand::Leave {
+            conn: bob.conn,
+            client: bob.client,
+        })
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            entries(drain(&mut ann.rx)).as_slice(),
+            [protocol::live::LiveEntry {
+                seq: Seq(2),
+                body: EntryBody::Cancel {
+                    cancels: Seq(1),
+                    reports: 1
+                },
+                ..
+            }]
+        ));
+        assert_eq!(store.entry_count(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn viewer_report_is_ignored() {
         let (mut room, _) = room().await;
         let mut ann = join_as(&mut room, 1, 1, 11, "editor", FORMAT, None, None).await;
@@ -1664,6 +1743,62 @@ mod tests {
                 }
             }
         )));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lone_viewer_reporter_gets_cannot_open_when_witnesses_leave() {
+        let store = MemStore::new();
+        let (events, mut event_rx) = EventSink::channel();
+        let mut room = LiveRoom::load(DocId(id(100)), store.clone(), events, timing())
+            .await
+            .unwrap();
+        let ann = join_as(&mut room, 1, 1, 11, "editor", FORMAT, None, None).await;
+        let bob = join_as(&mut room, 2, 2, 12, "editor", FORMAT, None, None).await;
+        let mut viewer = join_as(&mut room, 3, 3, 13, "viewer", FORMAT, None, None).await;
+        entry(&mut room, &ann, 1, 0, FORMAT, "only-viewer-stalls".into())
+            .await
+            .unwrap();
+        let _ = drain(&mut viewer.rx);
+        room.handle(LiveCommand::Report {
+            conn: viewer.conn,
+            client: viewer.client,
+            seq: Seq(1),
+        })
+        .await
+        .unwrap();
+
+        room.handle(LiveCommand::Leave {
+            conn: ann.conn,
+            client: ann.client,
+        })
+        .await
+        .unwrap();
+        assert!(
+            drain(&mut viewer.rx)
+                .iter()
+                .all(|message| !matches!(message, LiveServerMsg::CannotOpen { .. }))
+        );
+        room.handle(LiveCommand::Leave {
+            conn: bob.conn,
+            client: bob.client,
+        })
+        .await
+        .unwrap();
+
+        let messages = drain(&mut viewer.rx);
+        assert!(
+            messages
+                .iter()
+                .any(|message| matches!(message, LiveServerMsg::CannotOpen { seq: Seq(1) }))
+        );
+        assert!(entries(messages).is_empty());
+        assert_eq!(store.entry_count(), 1);
+        let failures = std::iter::from_fn(|| event_rx.try_recv().ok())
+            .filter(|event| event.kind == "live.entry_failed_on_device")
+            .collect::<Vec<_>>();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].actor, Some(UserId(id(13))));
+        assert_eq!(failures[0].detail, serde_json::json!({ "seq": 1 }));
     }
 
     #[tokio::test(start_paused = true)]
@@ -1812,6 +1947,50 @@ mod tests {
                 .iter()
                 .any(|person| person.participant == bob.participant)
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reporter_leaving_before_entry_stands_still_records_failure_once() {
+        let store = MemStore::new();
+        let (events, mut event_rx) = EventSink::channel();
+        let mut room = LiveRoom::load(DocId(id(100)), store, events, timing())
+            .await
+            .unwrap();
+        let ann = join_as(&mut room, 1, 1, 11, "editor", FORMAT, None, None).await;
+        let bob = join_as(&mut room, 2, 2, 12, "editor", FORMAT, None, None).await;
+        entry(&mut room, &ann, 1, 0, FORMAT, "stands-after-leave".into())
+            .await
+            .unwrap();
+        room.handle(LiveCommand::Report {
+            conn: ann.conn,
+            client: ann.client,
+            seq: Seq(1),
+        })
+        .await
+        .unwrap();
+        room.handle(LiveCommand::Leave {
+            conn: ann.conn,
+            client: ann.client,
+        })
+        .await
+        .unwrap();
+
+        for _ in 0..2 {
+            room.handle(LiveCommand::Heartbeat {
+                conn: bob.conn,
+                client: bob.client,
+                seen: Seq(1),
+            })
+            .await
+            .unwrap();
+        }
+
+        let failures = std::iter::from_fn(|| event_rx.try_recv().ok())
+            .filter(|event| event.kind == "live.entry_failed_on_device")
+            .collect::<Vec<_>>();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].actor, Some(UserId(id(11))));
+        assert_eq!(failures[0].detail, serde_json::json!({ "seq": 1 }));
     }
 
     #[tokio::test(start_paused = true)]
