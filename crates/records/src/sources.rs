@@ -190,7 +190,8 @@ pub type StatusUpdate = SourceStatus;
 /// What [`Db::change_source`] changes; `None` leaves a field alone. For the two secrets,
 /// `Some(None)` takes the secret away. Changing the branch or folder clears the sync bookmark
 /// (`last_commit` and `etag`), as what was mirrored no longer says where the new place stands.
-/// The secrets replaced or removed are the caller's to delete.
+/// The secrets replaced or removed are the caller's to delete: [`Db::change_source`] answers
+/// them.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SourceChange {
     pub branch: Option<String>,
@@ -425,15 +426,36 @@ impl Db {
         library: NodeId,
         u: &StatusUpdate,
     ) -> Result<(), DbError> {
+        self.write_status(library, u, None).await?;
+        Ok(())
+    }
+
+    /// [`Db::set_source_status`] only while the connection's generation is still `generation`
+    /// (see [`Db::source_generation`]): whether it was written.
+    pub async fn set_source_status_if(
+        &self,
+        library: NodeId,
+        u: &StatusUpdate,
+        generation: i64,
+    ) -> Result<bool, DbError> {
+        self.write_status(library, u, Some(generation)).await
+    }
+
+    async fn write_status(
+        &self,
+        library: NodeId,
+        u: &StatusUpdate,
+        generation: Option<i64>,
+    ) -> Result<bool, DbError> {
         let error: Option<String> = u
             .last_error
             .as_ref()
             .map(|e| e.chars().take(MAX_SOURCE_ERROR_CHARS).collect());
-        sqlx::query(
+        let done = sqlx::query(
             "update library_sources set state = $2, last_commit = $3, etag = $4, \
                  last_checked_at = $5, last_synced_at = $6, last_error = $7, retry_at = $8, \
                  files = $9, bytes = $10, hidden = $11 \
-             where library_id = $1",
+             where library_id = $1 and ($12::bigint is null or generation = $12)",
         )
         .bind(library.0)
         .bind(u.state.as_str())
@@ -446,6 +468,68 @@ impl Db {
         .bind(u.files)
         .bind(u.bytes)
         .bind(u.hidden)
+        .bind(generation)
+        .execute(self.pool())
+        .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    /// The generation of the connection of `library`, if it has one: moved on by every
+    /// [`Db::change_source`] and [`Db::bump_source_generation`]. A sync reads it as it starts
+    /// and records its result only if it has not moved (see [`Db::set_source_status_if`]).
+    pub async fn source_generation(&self, library: NodeId) -> Result<Option<i64>, DbError> {
+        Ok(
+            sqlx::query_scalar("select generation from library_sources where library_id = $1")
+                .bind(library.0)
+                .fetch_optional(self.pool())
+                .await?,
+        )
+    }
+
+    /// Moves the generation of the connection of `library` on, so a sync under way records
+    /// nothing of its result; whether there is a connection.
+    pub async fn bump_source_generation(&self, library: NodeId) -> Result<bool, DbError> {
+        let done = sqlx::query(
+            "update library_sources set generation = generation + 1 where library_id = $1",
+        )
+        .bind(library.0)
+        .execute(self.pool())
+        .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    /// Marks the connection of `library` as syncing, checked at `now`, if its generation is
+    /// still `generation`; whether it was.
+    pub async fn mark_source_syncing(
+        &self,
+        library: NodeId,
+        now: OffsetDateTime,
+        generation: i64,
+    ) -> Result<bool, DbError> {
+        let done = sqlx::query(
+            "update library_sources set state = 'syncing', last_checked_at = $2 \
+             where library_id = $1 and generation = $3",
+        )
+        .bind(library.0)
+        .bind(now)
+        .bind(generation)
+        .execute(self.pool())
+        .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    /// Makes the connection of `library` due at once: state `connecting`, never checked, no
+    /// retry time or error. The bookmark stays, except that `etag`, when given, replaces the
+    /// recorded one (a marker that the library may be half way between two commits). Nothing
+    /// happens if the library has no connection.
+    pub async fn requeue_source(&self, library: NodeId, etag: Option<&str>) -> Result<(), DbError> {
+        sqlx::query(
+            "update library_sources set state = 'connecting', last_checked_at = null, \
+                 retry_at = null, last_error = null, etag = coalesce($2, etag) \
+             where library_id = $1",
+        )
+        .bind(library.0)
+        .bind(etag)
         .execute(self.pool())
         .await?;
         Ok(())
@@ -453,12 +537,15 @@ impl Db {
 
     /// Changes the connection of `library` as `c` says. `NotFound` if it has none;
     /// `InvalidSetting` for a poll time outside 60 to 86 400 seconds. A changed branch or
-    /// folder clears `last_commit` and `etag`.
+    /// folder clears `last_commit` and `etag`. Every change moves the generation on (see
+    /// [`Db::source_generation`]). Answers the secrets the change replaced or removed, read
+    /// under the connection's row lock, for the caller to delete: of two changes made at once
+    /// each answers what it displaced, so none is left behind.
     pub async fn change_source(
         &self,
         library: NodeId,
         c: &SourceChange,
-    ) -> Result<(), AccessError> {
+    ) -> Result<Vec<SecretId>, AccessError> {
         if c.poll_seconds.is_some_and(|s| !poll_ok(s)) {
             return Err(AccessError::InvalidSetting);
         }
@@ -467,15 +554,28 @@ impl Db {
             .map(|s| i32::try_from(s).map_err(|_| AccessError::InvalidSetting))
             .transpose()?;
         let mut tx = self.pool().begin().await?;
-        let current: Option<(String, String)> = sqlx::query_as(
-            "select branch, folder from library_sources where library_id = $1 for update",
+        type Current = (String, String, Option<Uuid>, Option<Uuid>);
+        let current: Option<Current> = sqlx::query_as(
+            "select branch, folder, token_secret, webhook_secret from library_sources \
+             where library_id = $1 for update",
         )
         .bind(library.0)
         .fetch_optional(&mut *tx)
         .await?;
-        let Some((branch, folder)) = current else {
+        let Some((branch, folder, token, webhook)) = current else {
             return Err(AccessError::NotFound);
         };
+        let displaced = |old: Option<Uuid>, new: Option<Option<SecretId>>| match new {
+            Some(new) if old != new.map(|id| id.0) => old.map(SecretId),
+            _ => None,
+        };
+        let gone: Vec<SecretId> = [
+            displaced(token, c.token),
+            displaced(webhook, c.webhook_secret),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
         let moved = c.branch.as_ref().is_some_and(|b| *b != branch)
             || c.folder.as_ref().is_some_and(|f| *f != folder);
         sqlx::query(
@@ -486,7 +586,8 @@ impl Db {
                  token_secret = case when $5 then $6 else token_secret end, \
                  webhook_secret = case when $7 then $8 else webhook_secret end, \
                  last_commit = case when $9 then null else last_commit end, \
-                 etag = case when $9 then null else etag end \
+                 etag = case when $9 then null else etag end, \
+                 generation = generation + 1 \
              where library_id = $1",
         )
         .bind(library.0)
@@ -502,7 +603,7 @@ impl Db {
         .await
         .map_err(refused)?;
         tx.commit().await?;
-        Ok(())
+        Ok(gone)
     }
 
     /// The items of `library`, by path.

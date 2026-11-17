@@ -572,3 +572,96 @@ async fn the_source_limits_are_settings_only_administrators_change() {
         Err(AccessError::InvalidSetting)
     );
 }
+
+#[tokio::test]
+async fn change_source_answers_the_secrets_it_displaces_and_moves_the_generation() {
+    let f = fixture().await;
+    let db = &f.test.db;
+    let first = db.put_secret(&sealed(b"one")).await.unwrap();
+    let mut new = new_source(&f, f.library);
+    new.token = Some(first);
+    db.connect_source(&new).await.unwrap();
+    assert_eq!(db.source_generation(f.library).await.unwrap(), Some(0));
+
+    // Nothing of a secret changes: nothing displaced, and the generation still moves.
+    let displaced = db
+        .change_source(
+            f.library,
+            &SourceChange {
+                poll_seconds: Some(600),
+                ..SourceChange::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(displaced.is_empty());
+    assert_eq!(db.source_generation(f.library).await.unwrap(), Some(1));
+
+    let second = db.put_secret(&sealed(b"two")).await.unwrap();
+    let hook = db.put_secret(&sealed(b"hook")).await.unwrap();
+    let displaced = db
+        .change_source(
+            f.library,
+            &SourceChange {
+                token: Some(Some(second)),
+                webhook_secret: Some(Some(hook)),
+                ..SourceChange::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(displaced, vec![first]);
+    let displaced = db
+        .change_source(
+            f.library,
+            &SourceChange {
+                token: Some(None),
+                webhook_secret: Some(None),
+                ..SourceChange::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(displaced, vec![second, hook]);
+    assert_eq!(db.source_generation(f.library).await.unwrap(), Some(3));
+    assert!(db.bump_source_generation(f.library).await.unwrap());
+    assert_eq!(db.source_generation(f.library).await.unwrap(), Some(4));
+    assert_eq!(db.source_generation(f.site).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn a_sync_of_an_old_generation_records_nothing_but_a_requeue() {
+    let f = fixture().await;
+    let db = &f.test.db;
+    db.connect_source(&new_source(&f, f.library)).await.unwrap();
+    let now = OffsetDateTime::now_utc();
+    assert!(db.mark_source_syncing(f.library, now, 0).await.unwrap());
+    let (_, s) = db.source_of(f.library).await.unwrap().unwrap();
+    assert_eq!(s.state, SourceState::Syncing);
+
+    db.change_source(
+        f.library,
+        &SourceChange {
+            folder: Some("docs".into()),
+            ..SourceChange::default()
+        },
+    )
+    .await
+    .unwrap();
+    let mut done = status(SourceState::Ok);
+    done.last_commit = Some("abc".into());
+    done.etag = Some("\"e\"".into());
+    assert!(!db.set_source_status_if(f.library, &done, 0).await.unwrap());
+    assert!(!db.mark_source_syncing(f.library, now, 0).await.unwrap());
+    db.requeue_source(f.library, Some("dirty")).await.unwrap();
+    let (_, s) = db.source_of(f.library).await.unwrap().unwrap();
+    assert_eq!(s.state, SourceState::Connecting);
+    assert_eq!(s.last_commit, None);
+    assert_eq!(s.etag.as_deref(), Some("dirty"));
+    assert_eq!(s.last_checked_at, None);
+    assert!(db.due_sources(now, 10).await.unwrap().contains(&f.library));
+
+    assert!(db.set_source_status_if(f.library, &done, 1).await.unwrap());
+    let (_, s) = db.source_of(f.library).await.unwrap().unwrap();
+    assert_eq!(s.last_commit.as_deref(), Some("abc"));
+}

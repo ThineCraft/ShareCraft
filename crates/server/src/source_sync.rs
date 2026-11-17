@@ -443,22 +443,29 @@ pub async fn sync_once(
     let Some(_turn) = db.try_lock_source(library).await.map_err(db_failed)? else {
         return Ok(None);
     };
-    let Some((config, status)) = db.source_of(library).await.map_err(db_failed)? else {
-        return Err(SyncError::NotConnected(
-            "This library is not connected to a repository.".to_owned(),
-        ));
-    };
-    // Holding the lock, nothing else is syncing it: a `syncing` state here was cut short.
-    let syncing = SourceStatus {
-        state: SourceState::Syncing,
-        last_checked_at: Some(now),
-        ..status.clone()
-    };
-    db.set_source_status(library, &syncing)
+    let not_connected =
+        || SyncError::NotConnected("This library is not connected to a repository.".to_owned());
+    // Read before the configuration: a change between the two reads moves the generation, so
+    // this sync then records nothing (see `finish`).
+    let generation = db
+        .source_generation(library)
         .await
-        .map_err(db_failed)?;
+        .map_err(db_failed)?
+        .ok_or_else(not_connected)?;
+    let Some((config, status)) = db.source_of(library).await.map_err(db_failed)? else {
+        return Err(not_connected());
+    };
+    // Holding the lock, nothing else is syncing it: a `syncing` state here was cut short. If
+    // the connection changed since it was read, the sync woken by that change does the work.
+    if !db
+        .mark_source_syncing(library, now, generation)
+        .await
+        .map_err(db_failed)?
+    {
+        return Ok(None);
+    }
     let outcome = run(state, &config, &status).await;
-    finish(state, &config, status, now, outcome).await
+    finish(state, &config, status, now, outcome, generation).await
 }
 
 /// What a sync that did not fail found.
@@ -473,13 +480,17 @@ enum Outcome {
     },
 }
 
-/// Records how the sync of `config` went, as of `now`, in its status and the event log.
+/// Records how the sync of `config` went, as of `now`, in its status and the event log. The
+/// status is written only if the connection is still at `generation`: a change made meanwhile
+/// (another branch or folder, a token, "Sync now") must not be undone by this sync's bookmark.
+/// Then the connection is only made due again at once, marked half applied when it is.
 async fn finish(
     state: &AppState,
     config: &SourceConfig,
     before: SourceStatus,
     now: OffsetDateTime,
     outcome: Result<Outcome, Failure>,
+    generation: i64,
 ) -> Result<Option<SyncReport>, SyncError> {
     let library = config.library;
     let mut status = SourceStatus {
@@ -556,7 +567,17 @@ async fn finish(
             Err(e)
         }
     };
-    if let Err(e) = state.db().set_source_status(library, &status).await {
+    let db = state.db();
+    let recorded = match db.set_source_status_if(library, &status, generation).await {
+        Ok(true) => Ok(()),
+        // Changed meanwhile: due again at once, still marked if the library is half applied.
+        Ok(false) => {
+            let dirty = (status.etag.as_deref() == Some(DIRTY_ETAG)).then_some(DIRTY_ETAG);
+            db.requeue_source(library, dirty).await
+        }
+        Err(e) => Err(e),
+    };
+    if let Err(e) = recorded {
         eprintln!(
             "sharecraft-server: cannot record the sync of library {}: {e}",
             library.0

@@ -955,15 +955,19 @@ fn no_secret_in_any_response_event_or_log() {
     written.push_str(&String::from_utf8_lossy(&output.stderr));
     let generated = std::fs::read_to_string(&secrets_file).unwrap_or_default();
     let generated: Vec<&str> = generated.lines().filter(|l| !l.is_empty()).collect();
-    assert!(
-        !written.contains(TOKEN),
-        "the token is in the output of the scenario"
-    );
-    for secret in &generated {
+    for needle in [TOKEN.to_owned(), hex(TOKEN.as_bytes())] {
         assert!(
-            !written.contains(secret),
-            "a webhook secret is in the output of the scenario"
+            !written.contains(&needle),
+            "the token is in the output of the scenario"
         );
+    }
+    for secret in &generated {
+        for needle in [(*secret).to_owned(), hex(secret.as_bytes())] {
+            assert!(
+                !written.contains(&needle),
+                "a webhook secret is in the output of the scenario"
+            );
+        }
     }
     assert!(
         output.status.success() && written.contains(DONE),
@@ -1165,4 +1169,326 @@ async fn leak_scenario() {
         }
     }
     println!("{DONE}");
+}
+
+impl Env {
+    /// Waits, at most fifteen seconds, until the connection of `library` satisfies `done`.
+    async fn wait_source(&self, library: NodeId, done: impl Fn(&Value) -> bool) -> Value {
+        let deadline = tokio::time::Instant::now() + LONG;
+        loop {
+            let (_, shown) = self.show(&self.admin, library).await;
+            if done(&shown) {
+                return shown;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "{shown}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Waits, at most fifteen seconds, until `library` holds exactly `expected` at its top.
+    async fn wait_names_long(&self, library: NodeId, expected: &[&str]) {
+        let deadline = tokio::time::Instant::now() + LONG;
+        loop {
+            let names = self.names(&self.admin, library).await;
+            if names == expected {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the library holds {names:?}, not {expected:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Starts a sync of `library` that is held reading blobs: a new commit on `branch` with
+    /// `files`, then "Sync now"; answers once the sync waits.
+    async fn held_sync(
+        &self,
+        library: NodeId,
+        branch: &str,
+        files: &[(&str, Vec<u8>)],
+    ) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        let hold = self.fake.hold_blobs().await;
+        self.fake.commit(branch, files);
+        let (status, _) = self
+            .call(
+                &self.admin,
+                Method::POST,
+                &format!("/api/libraries/{}/source/sync", library.0),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        self.fake.wait_blob_held().await;
+        hold
+    }
+
+    async fn patch(&self, library: NodeId, body: Value) -> (StatusCode, Value) {
+        self.call(
+            &self.admin,
+            Method::PATCH,
+            &format!("/api/libraries/{}/source", library.0),
+            Some(body),
+        )
+        .await
+    }
+}
+
+/// How long the tests of changes made during a sync wait for the outcome.
+const LONG: Duration = Duration::from_secs(15);
+
+#[tokio::test]
+async fn patch_folder_during_sync_resyncs() {
+    let env = Env::new().await;
+    env.fake
+        .commit("main", &files(&[("a/x.md", "x1"), ("b/y.md", "y")]));
+    let library = env.connected("Docs", json!({ "folder": "a" })).await;
+    env.wait_names(library, &["x.md"]).await;
+    let hold = env
+        .held_sync(
+            library,
+            "main",
+            &files(&[("a/x.md", "x2"), ("b/y.md", "y")]),
+        )
+        .await;
+    let (status, answer) = env.patch(library, json!({ "folder": "b" })).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    drop(hold);
+    env.wait_names_long(library, &["y.md"]).await;
+    let shown = env
+        .wait_source(library, |s| s["state"] == "ok" && s["folder"] == "b")
+        .await;
+    assert_eq!(shown["files"], 1);
+}
+
+#[tokio::test]
+async fn patch_branch_during_sync_resyncs() {
+    let env = Env::new().await;
+    env.fake.commit("main", &files(&[("x.md", "x1")]));
+    let next = env.fake.commit("next", &files(&[("y.md", "y")]));
+    let library = env.connected("Docs", json!({ "branch": "main" })).await;
+    env.wait_names(library, &["x.md"]).await;
+    let hold = env
+        .held_sync(library, "main", &files(&[("x.md", "x2")]))
+        .await;
+    let (status, answer) = env.patch(library, json!({ "branch": "next" })).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    drop(hold);
+    env.wait_names_long(library, &["y.md"]).await;
+    env.wait_source(library, |s| {
+        s["state"] == "ok" && s["branch"] == "next" && s["last_commit"] == next.sha[..7]
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn patch_poll_seconds_during_sync_keeps_its_result() {
+    let env = Env::new().await;
+    env.fake.commit("main", &files(&[("x.md", "x1")]));
+    let library = env.connected("Docs", json!({})).await;
+    env.wait_names(library, &["x.md"]).await;
+    env.wait_source(library, |s| s["state"] == "ok").await;
+    let hold = env
+        .held_sync(library, "main", &files(&[("x.md", "x2"), ("z.md", "z")]))
+        .await;
+    let head = env.fake.last_commit("main");
+    let (status, answer) = env.patch(library, json!({ "poll_seconds": 600 })).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    drop(hold);
+    env.wait_names_long(library, &["x.md", "z.md"]).await;
+    env.wait_source(library, |s| {
+        s["state"] == "ok" && s["poll_seconds"] == 600 && s["last_commit"] == head[..7]
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn disconnect_while_a_sync_runs_is_refused() {
+    let env = Env::new().await;
+    env.fake.commit("main", &files(&[("x.md", "x1")]));
+    let library = env.connected("Docs", json!({ "token": TOKEN })).await;
+    env.wait_names(library, &["x.md"]).await;
+    let hold = env
+        .held_sync(library, "main", &files(&[("x.md", "x2"), ("z.md", "z")]))
+        .await;
+    let path = format!("/api/libraries/{}/source", library.0);
+    let (status, answer) = env.call(&env.admin, Method::DELETE, &path, None).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{answer}");
+    assert_eq!(answer["error"], "source_busy");
+    assert_eq!(
+        answer["message"],
+        "A sync is running; try again in a moment."
+    );
+    assert_eq!(env.count("select count(*) from library_sources").await, 1);
+    drop(hold);
+    env.wait_names_long(library, &["x.md", "z.md"]).await;
+    let deadline = tokio::time::Instant::now() + LONG;
+    loop {
+        let (status, _) = env.call(&env.admin, Method::DELETE, &path, None).await;
+        if status == StatusCode::NO_CONTENT {
+            break;
+        }
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(env.count("select count(*) from secrets").await, 0);
+    assert_eq!(env.count("select count(*) from source_items").await, 0);
+    // Nothing changes the library after the disconnect.
+    env.fake.commit("main", &files(&[("w.md", "w")]));
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(env.names(&env.admin, library).await, ["x.md", "z.md"]);
+}
+
+#[tokio::test]
+async fn a_failed_connection_leaves_no_library() {
+    let env = Env::new().await;
+    env.fake.commit("main", &files(&[("x.md", "x")]));
+    let mut conn = env.sql().await;
+    for statement in [
+        "create function refuse_source() returns trigger language plpgsql as \
+         $$ begin raise exception 'refused for the test'; end $$",
+        "create trigger refuse_source before insert on library_sources \
+         for each row execute function refuse_source()",
+    ] {
+        sqlx::query(statement).execute(&mut conn).await.unwrap();
+    }
+    let (status, answer) = env
+        .connect(
+            &env.admin,
+            json!({ "name": "Doomed", "repository": "octo-org/docs", "token": TOKEN }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{answer}");
+    assert_eq!(
+        env.count("select count(*) from nodes where name = 'Doomed' and deleted_at is null")
+            .await,
+        0
+    );
+    assert_eq!(env.count("select count(*) from secrets").await, 0);
+    let (status, bin) = env
+        .call_text(
+            &env.admin,
+            Method::GET,
+            &format!("/api/sites/{}/bin", env.site.0),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!bin.contains("Doomed"), "{bin}");
+    let site_items = env.names(&env.admin, env.site).await;
+    assert!(!site_items.iter().any(|n| n == "Doomed"), "{site_items:?}");
+    let ids: Vec<uuid::Uuid> = sqlx::query_scalar("select id from nodes where name = 'Doomed'")
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+    for id in ids {
+        let (status, _) = env
+            .call(
+                &env.admin,
+                Method::GET,
+                &format!("/api/libraries/{id}"),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+}
+
+#[tokio::test]
+async fn concurrent_token_changes_leave_one_sealed_row() {
+    let env = Env::new().await;
+    env.fake.commit("main", &files(&[("x.md", "x")]));
+    let library = env.connected("Docs", json!({ "token": TOKEN })).await;
+    env.wait_names(library, &["x.md"]).await;
+    let (first, second) = tokio::join!(
+        env.patch(library, json!({ "token": "ghp_first_one" })),
+        env.patch(library, json!({ "token": "ghp_second_one" })),
+    );
+    assert_eq!(first.0, StatusCode::OK, "{}", first.1);
+    assert_eq!(second.0, StatusCode::OK, "{}", second.1);
+    assert_eq!(env.count("select count(*) from secrets").await, 1);
+    let hook = format!("/api/libraries/{}/source/webhook", library.0);
+    let (a, b) = tokio::join!(
+        env.call(&env.admin, Method::POST, &hook, None),
+        env.call(&env.admin, Method::POST, &hook, None),
+    );
+    assert_eq!(a.0, StatusCode::OK);
+    assert_eq!(b.0, StatusCode::OK);
+    assert_eq!(env.count("select count(*) from secrets").await, 2);
+}
+
+#[tokio::test]
+async fn a_patch_that_changes_nothing_records_no_event() {
+    let env = Env::new().await;
+    env.fake.commit("main", &files(&[("x.md", "x")]));
+    let library = env.connected("Docs", json!({ "branch": "main" })).await;
+    env.wait_names(library, &["x.md"]).await;
+    let (status, _) = env
+        .patch(library, json!({ "branch": "main", "folder": "" }))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = env.patch(library, json!({ "poll_seconds": 600 })).await;
+    assert_eq!(status, StatusCode::OK);
+    let db = env.server.records_db();
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    loop {
+        let changed = db.events_of_kind("source.changed").await.unwrap();
+        if !changed.is_empty() {
+            assert_eq!(changed.len(), 1);
+            assert_eq!(changed[0].detail["fields"], json!(["poll_seconds"]));
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[tokio::test]
+async fn show_of_a_library_in_the_bin_is_not_found() {
+    let env = Env::new().await;
+    env.fake.commit("main", &files(&[("x.md", "x")]));
+    let library = env.connected("Docs", json!({})).await;
+    env.wait_names(library, &["x.md"]).await;
+    let admin = env
+        .server
+        .records_db()
+        .user(env.admin.id)
+        .await
+        .unwrap()
+        .unwrap();
+    server::tree::apply(
+        &env.state,
+        &admin,
+        server::tree::TreeOp::Delete { id: library },
+    )
+    .await
+    .unwrap();
+    let (status, _) = env.show(&env.admin, library).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn a_taken_name_costs_no_github_request() {
+    let env = Env::new().await;
+    env.fake.commit("main", &files(&[("x.md", "x")]));
+    let (status, _) = env
+        .call(
+            &env.admin,
+            Method::POST,
+            &format!("/api/sites/{}/libraries", env.site.0),
+            Some(json!({ "name": "Taken" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, answer) = env
+        .connect(
+            &env.admin,
+            json!({ "name": "taken", "repository": "octo-org/docs" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{answer}");
+    assert_eq!(answer["error"], "name_taken");
+    assert_eq!(env.fake.count("repo"), 0);
 }

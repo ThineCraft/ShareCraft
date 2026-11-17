@@ -14,14 +14,14 @@ use axum::response::{IntoResponse, Response};
 use collab_core::ids::NodeId;
 use records::{
     LibraryKind, NewEvent, NewSource, Perms, SealedRow, SecretId, SourceChange, SourceConfig,
-    SourceKind, SourceState, SourceStatus, User,
+    SourceKind, SourceStatus, User,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use super::nodes::{delete_one, node_id, require_manager, rfc3339};
+use super::nodes::{node_id, require_manager, rfc3339};
 use super::{ApiError, JsonBody, to_completion};
 use crate::AppState;
 use crate::auth::Signed;
@@ -31,7 +31,7 @@ use crate::secrets::Secret;
 use crate::source_sync::{
     abandon_uploads_into, caps, sync_once, token_context, token_of, webhook_context,
 };
-use crate::tree;
+use crate::tree::{self, TreeOp};
 
 /// Seconds between polls of a new connection.
 const DEFAULT_POLL_SECONDS: u32 = 300;
@@ -46,32 +46,34 @@ const WEBHOOK_SECRET_BYTES: usize = 32;
 
 /// Starts a sync of `library` in the background. Its outcome is recorded in the connection's
 /// status and the event log, so nothing waits for it, and nothing about it can fail the
-/// request that asked for it. A sync already running (which may have read the connection
-/// before a change) is waited for, up to [`WAKE_WAIT`], so the change is synced after it.
-// Task 7 replaces this with a wake of the worker.
+/// request that asked for it. A sync already running (which read the connection before a
+/// change, and so records nothing of its result) is waited for, trying its turn once a second
+/// for up to [`WAKE_WAIT`]; past that the connection stays due (`connecting`) for the worker.
+// Task 7 replaces this with a wake of the worker (which must coalesce wakes).
 fn wake(state: &AppState, library: NodeId) {
     let state = state.clone();
     tokio::spawn(async move {
         let deadline = tokio::time::Instant::now() + WAKE_WAIT;
         loop {
-            match state.db().try_lock_source(library).await {
-                Ok(Some(turn)) => {
-                    drop(turn);
-                    break;
-                }
-                Ok(None) if tokio::time::Instant::now() < deadline => {
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                }
-                // Still busy, or the database failed: try once anyway.
-                _ => break,
+            if let Ok(Some(turn)) = state.db().try_lock_source(library).await {
+                // Free now. Should another sync take the turn before this one, it read the
+                // connection after the change, which is all that matters.
+                drop(turn);
+                break;
             }
+            if tokio::time::Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep(WAKE_RETRY).await;
         }
         let _ = sync_once(&state, library, OffsetDateTime::now_utc()).await;
     });
 }
 
-/// How long a wake waits for a sync already running.
-const WAKE_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+/// How long a wake keeps trying for its turn.
+const WAKE_WAIT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+/// How often a wake tries for its turn.
+const WAKE_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Whether `branch` is a branch name Git takes: not empty, `.` or `..`; no `..`, `@{`,
 /// backslash or control character; not starting with `-` or `/`, not ending with `/` or
@@ -369,6 +371,15 @@ pub(crate) async fn connect(
     if kind == LibraryKind::Asset && !actor.is_admin {
         return Err(ApiError::Forbidden);
     }
+    // A taken name costs no request to GitHub; `create_library` checks it again.
+    if !state
+        .db()
+        .name_free(site, &name, None)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?
+    {
+        return Err(ApiError::NameTaken);
+    }
 
     let probed = probe(
         &state,
@@ -419,16 +430,7 @@ pub(crate) async fn connect(
                 })
                 .await;
             if let Err(e) = connected {
-                // Something reached the new library first: it goes to the recycle bin rather
-                // than staying unconnected.
-                if let Err(gone) = delete_one(&state, &actor, library).await {
-                    eprintln!(
-                        "sharecraft-server: library {} could not be removed after its \
-                         connection failed: {}",
-                        library.0,
-                        gone.code()
-                    );
-                }
+                purge_new_library(&state, &actor, library).await;
                 if let Some(id) = token {
                     forget_secret(&state, id).await;
                 }
@@ -458,6 +460,26 @@ pub(crate) async fn connect(
         .into_response())
 }
 
+/// Removes `library`, made a moment ago by `actor` for a connection that then failed, for good:
+/// to the recycle bin, its second stage, and purged, so it is in neither the site nor the bin.
+/// A failure is logged.
+async fn purge_new_library(state: &AppState, actor: &User, library: NodeId) {
+    for op in [
+        TreeOp::Delete { id: library },
+        TreeOp::ToSecondStage { id: library },
+        TreeOp::Purge { id: library },
+    ] {
+        if let Err(e) = tree::apply(state, actor, op).await {
+            eprintln!(
+                "sharecraft-server: library {} could not be removed after its connection \
+                 failed: {e}",
+                library.0
+            );
+            return;
+        }
+    }
+}
+
 /// `GET /api/libraries/{id}/source`: the connection of the library (see [`source_out`]), for
 /// anyone who can open the library; `404` otherwise, and for a library that is not connected.
 pub(crate) async fn show(
@@ -467,14 +489,8 @@ pub(crate) async fn show(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     let library = node_id(&id)?;
-    let seen = state
-        .db()
-        .effective_access(signed.session.user.id, library)
-        .await
-        .map_err(|e| ApiError::unavailable(&e))?;
-    if seen.is_none() {
-        return Err(ApiError::NotFound);
-    }
+    // Whoever may see the library as `GET /api/libraries/{id}` shows it (not in the bin).
+    libraries::show(&state, &signed.session.user, library).await?;
     let origin = origin(&state, &headers)?;
     Ok(Json(answer_of(&state, &origin, library).await?))
 }
@@ -496,9 +512,11 @@ pub(crate) struct ChangeBody {
 /// clear_token?}`: changes the connection, for owners of the library (`404` for those who
 /// cannot see it, `403` for the others). A new branch, folder or token is probed first, as
 /// connecting is (the same `422` answers change nothing), then clears the sync bookmark (for
-/// a new branch or folder), puts the connection back to `connecting` and syncs. A replaced or
-/// cleared token's sealed row is deleted. `422 invalid_request` for both `token` and
-/// `clear_token`, or a poll time outside 60 to 86 400 seconds. Answers the connection.
+/// a new branch or folder). Any change puts the connection back to `connecting` and syncs; a
+/// sync under way records nothing of its result (see [`crate::source_sync::sync_once`]). A
+/// replaced or cleared token's sealed row is deleted. A request that changes nothing writes
+/// and records nothing. `422 invalid_request` for both `token` and `clear_token`, or a poll
+/// time outside 60 to 86 400 seconds. Answers the connection.
 pub(crate) async fn change(
     State(state): State<AppState>,
     signed: Signed,
@@ -527,7 +545,13 @@ pub(crate) async fn change(
 
     let branch = body.branch.filter(|b| *b != config.branch);
     let folder = body.folder.filter(|f| *f != config.folder);
+    let poll_seconds = body.poll_seconds.filter(|s| *s != config.poll_seconds);
+    // Clearing a token that is not there changes nothing.
+    let clear = clear && config.token.is_some();
     let new_token = token.is_some() || clear;
+    if branch.is_none() && folder.is_none() && poll_seconds.is_none() && !new_token {
+        return Ok(Json(answer_of(&state, &origin, library).await?));
+    }
     let reprobe = branch.is_some() || folder.is_some() || new_token;
     if reprobe {
         let repo = RepoRef::parse(&format!("{}/{}", config.owner, config.repo))
@@ -557,7 +581,7 @@ pub(crate) async fn change(
     if folder.is_some() {
         fields.push("folder");
     }
-    if body.poll_seconds.is_some() {
+    if poll_seconds.is_some() {
         fields.push("poll_seconds");
     }
     if token.is_some() {
@@ -568,7 +592,6 @@ pub(crate) async fn change(
     }
     {
         let state = state.clone();
-        let poll_seconds = body.poll_seconds;
         to_completion(async move {
             let stored = match token {
                 Some(token) => Some(
@@ -584,37 +607,26 @@ pub(crate) async fn change(
                 token: if clear { Some(None) } else { stored.map(Some) },
                 webhook_secret: None,
             };
-            if let Err(e) = state.db().change_source(library, &change).await {
-                if let Some(id) = stored {
-                    forget_secret(&state, id).await;
+            let displaced = match state.db().change_source(library, &change).await {
+                Ok(displaced) => displaced,
+                Err(e) => {
+                    if let Some(id) = stored {
+                        forget_secret(&state, id).await;
+                    }
+                    return Err(e.into());
                 }
-                return Err(e.into());
+            };
+            for id in displaced {
+                forget_secret(&state, id).await;
             }
-            if new_token && let Some(old) = config.token {
-                forget_secret(&state, old).await;
-            }
-            if reprobe {
-                // Ready for a sync: a connection that stopped (`not_connected`) or waits to
-                // retry is due again.
-                if let Some((_, status)) = state
-                    .db()
-                    .source_of(library)
-                    .await
-                    .map_err(|e| ApiError::unavailable(&e))?
-                {
-                    let ready = SourceStatus {
-                        state: SourceState::Connecting,
-                        last_error: None,
-                        retry_at: None,
-                        ..status
-                    };
-                    state
-                        .db()
-                        .set_source_status(library, &ready)
-                        .await
-                        .map_err(|e| ApiError::unavailable(&e))?;
-                }
-            }
+            // The change moved the generation on, so a sync under way records nothing of its
+            // result: the connection is due again (also one that had stopped, `not_connected`,
+            // or waits to retry) and a sync is woken.
+            state
+                .db()
+                .requeue_source(library, None)
+                .await
+                .map_err(|e| ApiError::unavailable(&e))?;
             emit(
                 &state,
                 "source.changed",
@@ -622,9 +634,7 @@ pub(crate) async fn change(
                 library,
                 json!({ "fields": fields }),
             );
-            if reprobe {
-                wake(&state, library);
-            }
+            wake(&state, library);
             Ok(())
         })
         .await?;
@@ -641,7 +651,16 @@ pub(crate) async fn sync_now(
 ) -> Result<Response, ApiError> {
     let library = node_id(&id)?;
     require_manager(state.db(), signed.session.user.id, library).await?;
-    source_of(&state, library).await?;
+    // A sync under way may have read the branch before what is to be synced now: it records
+    // nothing of its result, and the one woken here reads the branch afresh.
+    if !state
+        .db()
+        .bump_source_generation(library)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?
+    {
+        return Err(ApiError::NotFound);
+    }
     wake(&state, library);
     Ok(StatusCode::ACCEPTED.into_response())
 }
@@ -673,7 +692,7 @@ pub(crate) async fn webhook(
     let library = node_id(&id)?;
     let actor = signed.session.user;
     require_manager(state.db(), actor.id, library).await?;
-    let (config, _) = source_of(&state, library).await?;
+    source_of(&state, library).await?;
     let origin = origin(&state, &headers)?;
     let mut bytes = [0u8; WEBHOOK_SECRET_BYTES];
     getrandom::fill(&mut bytes).map_err(|_| {
@@ -681,8 +700,7 @@ pub(crate) async fn webhook(
         ApiError::Unavailable
     })?;
     let secret = Secret::new(hex(&bytes));
-    let replaced = config.webhook_secret.is_some();
-    {
+    let replaced = {
         let state = state.clone();
         let secret = secret.clone();
         to_completion(async move {
@@ -696,13 +714,24 @@ pub(crate) async fn webhook(
                 webhook_secret: Some(Some(stored)),
                 ..SourceChange::default()
             };
-            if let Err(e) = state.db().change_source(library, &change).await {
-                forget_secret(&state, stored).await;
-                return Err(e.into());
+            let displaced = match state.db().change_source(library, &change).await {
+                Ok(displaced) => displaced,
+                Err(e) => {
+                    forget_secret(&state, stored).await;
+                    return Err(e.into());
+                }
+            };
+            let replaced = !displaced.is_empty();
+            for id in displaced {
+                forget_secret(&state, id).await;
             }
-            if let Some(old) = config.webhook_secret {
-                forget_secret(&state, old).await;
-            }
+            // Every change moves the generation on (a sync under way records nothing of its
+            // result), so the connection is synced again.
+            state
+                .db()
+                .requeue_source(library, None)
+                .await
+                .map_err(|e| ApiError::unavailable(&e))?;
             emit(
                 &state,
                 "source.webhook_set",
@@ -710,10 +739,11 @@ pub(crate) async fn webhook(
                 library,
                 json!({ "replaced": replaced }),
             );
-            Ok(())
+            wake(&state, library);
+            Ok(replaced)
         })
-        .await?;
-    }
+        .await?
+    };
     Ok(Json(json!({
         "url": webhook_url(&origin, library),
         "secret": secret.expose(),
@@ -723,8 +753,9 @@ pub(crate) async fn webhook(
 
 /// `DELETE /api/libraries/{id}/source`: disconnects the library, for owners of it: its files
 /// stay as they are and it becomes an ordinary library again; the connection's sealed secrets
-/// are deleted. `204`; `404` for a library that is not connected. Recorded as
-/// `source.disconnected`.
+/// are deleted. `204`; `404` for a library that is not connected; `409 source_busy` while a
+/// sync of it runs. The library's sync turn is held until everything is removed, so no sync
+/// changes the library after the answer. Recorded as `source.disconnected`.
 pub(crate) async fn disconnect(
     State(state): State<AppState>,
     signed: Signed,
@@ -735,6 +766,12 @@ pub(crate) async fn disconnect(
     require_manager(state.db(), actor.id, library).await?;
     let (config, _) = source_of(&state, library).await?;
     to_completion(async move {
+        let turn = state
+            .db()
+            .try_lock_source(library)
+            .await
+            .map_err(|e| ApiError::unavailable(&e))?
+            .ok_or(ApiError::SourceBusy)?;
         let secrets = state
             .db()
             .disconnect_source(library)
@@ -743,6 +780,7 @@ pub(crate) async fn disconnect(
         for id in secrets {
             forget_secret(&state, id).await;
         }
+        drop(turn);
         emit(
             &state,
             "source.disconnected",

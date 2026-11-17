@@ -7,6 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Write;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::Router;
@@ -91,6 +92,8 @@ struct Model {
 pub struct FakeGithub {
     pub addr: SocketAddr,
     model: Arc<Mutex<Model>>,
+    blob_gate: Arc<tokio::sync::RwLock<()>>,
+    blobs_waiting: Arc<AtomicUsize>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -118,14 +121,24 @@ impl FakeGithub {
             name: name.to_owned(),
             ..Model::default()
         }));
+        let blob_gate = Arc::new(tokio::sync::RwLock::new(()));
+        let blobs_waiting = Arc::new(AtomicUsize::new(0));
         let app = Router::new().fallback(handle).with_state(Shared {
             model: model.clone(),
             addr,
+            blob_gate: blob_gate.clone(),
+            blobs_waiting: blobs_waiting.clone(),
         });
         let task = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
-        FakeGithub { addr, model, task }
+        FakeGithub {
+            addr,
+            model,
+            blob_gate,
+            blobs_waiting,
+            task,
+        }
     }
 
     /// `http://127.0.0.1:<port>`, the API base address to give the client.
@@ -223,6 +236,11 @@ impl FakeGithub {
             .insert(branch.to_owned(), sha.to_owned());
     }
 
+    /// The commit `branch` points at.
+    pub fn last_commit(&self, branch: &str) -> String {
+        self.model.lock().unwrap().repo.branches[branch].clone()
+    }
+
     /// Deletes `branch`; its commits stay readable by id.
     pub fn delete_branch(&self, branch: &str) {
         self.model.lock().unwrap().repo.branches.remove(branch);
@@ -304,6 +322,24 @@ impl FakeGithub {
         model.counts.get(endpoint).copied().unwrap_or(0)
     }
 
+    /// Holds every blob request until the answer is dropped: a sync that reads blobs waits in
+    /// the middle, before it changes anything.
+    pub async fn hold_blobs(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        self.blob_gate.clone().write_owned().await
+    }
+
+    /// Waits (at most five seconds) until a blob request is held by [`FakeGithub::hold_blobs`].
+    pub async fn wait_blob_held(&self) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while self.blobs_waiting.load(Ordering::SeqCst) == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no blob request arrived"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
     /// The headers of the last request received.
     pub fn last_headers(&self) -> HeaderMap {
         self.model.lock().unwrap().last_headers.clone()
@@ -321,6 +357,8 @@ fn size_kb(model: &Model) -> u64 {
 struct Shared {
     model: Arc<Mutex<Model>>,
     addr: SocketAddr,
+    blob_gate: Arc<tokio::sync::RwLock<()>>,
+    blobs_waiting: Arc<AtomicUsize>,
 }
 
 fn json(status: StatusCode, value: serde_json::Value) -> Response {
@@ -361,6 +399,11 @@ fn decode(segment: &str) -> String {
 
 async fn handle(State(shared): State<Shared>, request: Request) -> Response {
     let path = request.uri().path().to_owned();
+    if path.contains("/git/blobs/") {
+        shared.blobs_waiting.fetch_add(1, Ordering::SeqCst);
+        drop(shared.blob_gate.read().await);
+        shared.blobs_waiting.fetch_sub(1, Ordering::SeqCst);
+    }
     let headers = request.headers().clone();
     let mut model = shared.model.lock().unwrap();
     model.last_headers = headers.clone();

@@ -391,6 +391,9 @@ pub(crate) enum ApiError {
     /// 422: the repository holds more than this server mirrors for one library (its bytes, or
     /// its files below the folder); the answer's `message` says so in words.
     RepositoryTooLarge,
+    /// 409: a sync of the library is running, so its connection cannot be removed now; the
+    /// answer's `message` says so in words.
+    SourceBusy,
     /// 422: the name does not keep its editor's extension, or a file no editor opens would
     /// take an editor's extension.
     WrongExtension,
@@ -541,6 +544,7 @@ impl ApiError {
             }
             ApiError::TokenRejected => (StatusCode::UNPROCESSABLE_ENTITY, "token_rejected"),
             ApiError::BranchNotFound => (StatusCode::UNPROCESSABLE_ENTITY, "branch_not_found"),
+            ApiError::SourceBusy => (StatusCode::CONFLICT, "source_busy"),
             ApiError::RepositoryTooLarge => {
                 (StatusCode::UNPROCESSABLE_ENTITY, "repository_too_large")
             }
@@ -831,7 +835,11 @@ impl IntoResponse for ApiError {
             }),
             ApiError::TokenRejected => json!({
                 "error": code,
-                "message": "GitHub refused the token: it is wrong, expired or revoked, or may                             not read this repository.",
+                "message": "GitHub refused the token: it is wrong, expired or revoked, or cannot read this repository.",
+            }),
+            ApiError::SourceBusy => json!({
+                "error": code,
+                "message": "A sync is running; try again in a moment.",
             }),
             ApiError::BranchNotFound => json!({
                 "error": code,
