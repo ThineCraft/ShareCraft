@@ -12,6 +12,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::libraries::ensure_library_row;
+use crate::quotas::recompute_site_usage;
 use crate::{AccessError, Db, DbError};
 
 /// PostgreSQL's code for a row a check constraint refuses.
@@ -368,15 +369,15 @@ impl Db {
             return Err(AccessError::InvalidSetting);
         }
         let mut tx = self.pool().begin().await?;
-        let node: Option<(String, Option<OffsetDateTime>)> =
-            sqlx::query_as("select kind, deleted_at from nodes where id = $1 for update")
+        let node: Option<(String, Option<OffsetDateTime>, Uuid)> =
+            sqlx::query_as("select kind, deleted_at, site_id from nodes where id = $1 for update")
                 .bind(s.library.0)
                 .fetch_optional(&mut *tx)
                 .await?;
-        match node {
-            Some((kind, None)) if kind == "library" => {}
+        let site = match node {
+            Some((kind, None, site)) if kind == "library" => NodeId(site),
             _ => return Err(AccessError::NotFound),
-        }
+        };
         ensure_library_row(&mut tx, s.library).await?;
         let exists: bool = sqlx::query_scalar(
             "select exists (select 1 from library_sources where library_id = $1)",
@@ -413,6 +414,7 @@ impl Db {
         .execute(&mut *tx)
         .await
         .map_err(refused)?;
+        recompute_site_usage(&mut tx, site).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -1053,14 +1055,14 @@ impl Db {
     /// had no connection.
     pub async fn disconnect_source(&self, library: NodeId) -> Result<Vec<SecretId>, DbError> {
         let mut tx = self.pool().begin().await?;
-        let row: Option<(Option<Uuid>, Option<Uuid>)> = sqlx::query_as(
-            "select token_secret, webhook_secret from library_sources \
-             where library_id = $1 for update",
+        let row: Option<(Option<Uuid>, Option<Uuid>, Uuid)> = sqlx::query_as(
+            "select s.token_secret, s.webhook_secret, n.site_id from library_sources s \
+             join nodes n on n.id = s.library_id where s.library_id = $1 for update of s",
         )
         .bind(library.0)
         .fetch_optional(&mut *tx)
         .await?;
-        let Some((token, webhook)) = row else {
+        let Some((token, webhook, site)) = row else {
             return Ok(Vec::new());
         };
         sqlx::query("delete from source_items where library_id = $1")
@@ -1071,6 +1073,7 @@ impl Db {
             .bind(library.0)
             .execute(&mut *tx)
             .await?;
+        recompute_site_usage(&mut tx, NodeId(site)).await?;
         tx.commit().await?;
         Ok([token, webhook]
             .into_iter()

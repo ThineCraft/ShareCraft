@@ -551,6 +551,50 @@ async fn sync_ignores_the_site_quota() {
         download(&env.server, &env.admin, id).await.1,
         b"far more than one byte"
     );
+    assert_eq!(
+        env.server.records_db().site_usage(site).await.unwrap().used,
+        0
+    );
+
+    env.fake.commit(
+        "main",
+        &files(&[
+            ("big.md", "a later version that is larger still"),
+            ("more.md", "and more"),
+        ]),
+    );
+    assert_eq!(env.synced().await.changed, 1);
+    assert_eq!(
+        env.server.records_db().site_usage(site).await.unwrap().used,
+        0
+    );
+
+    let (status, ordinary) = call(
+        &env.server,
+        &env.admin,
+        Method::POST,
+        &format!("/api/sites/{}/libraries", site.0),
+        Some(json!({ "name": "Ordinary" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{ordinary}");
+    let ordinary: &str = ordinary["id"].as_str().unwrap();
+    let upload = |name: &'static str| {
+        env.server
+            .http(Some(&env.admin))
+            .post(env.server.url("/api/docs/upload"))
+            .query(&[("parent", ordinary), ("name", name)])
+            .body(vec![b'x'])
+            .send()
+    };
+    assert_eq!(
+        upload("one.txt").await.unwrap().status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        upload("two.txt").await.unwrap().status(),
+        StatusCode::INSUFFICIENT_STORAGE
+    );
 }
 
 #[tokio::test]

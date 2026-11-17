@@ -286,7 +286,6 @@ impl Site {
         if let Some(user) = as_user {
             headers.insert(COOKIE, HeaderValue::from_str(&user.cookie).unwrap());
         }
-        server::github::install_tls_provider();
         reqwest::Client::builder()
             .default_headers(headers)
             .timeout(TIMEOUT)
@@ -532,8 +531,6 @@ pub fn session_cookie(headers: &HeaderMap) -> Option<String> {
 
 /// The settings of a test server storing under `data_dir` and recording in `db`'s schema.
 pub fn config_at(data_dir: &Path, db: &TestDb) -> Config {
-    // Every HTTP client in this process, the tests' own included, needs the TLS provider.
-    server::github::install_tls_provider();
     Config {
         addr: "127.0.0.1:0".parse().unwrap(),
         deployment: Default::default(),

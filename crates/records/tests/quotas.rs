@@ -13,10 +13,11 @@
 mod common;
 
 use collab_core::ids::{DocId, NodeId, UserId};
-use common::{document_in, new_id, put, site, user};
+use common::{delete, document_in, new_id, put, site, user};
 use records::test_support::TestDb;
 use records::{
-    NewUpload, NodeKind, NodeRow, QuotaError, RevisionRecord, UploadError, UploadTarget,
+    NewSource, NewUpload, NodeKind, NodeRow, QuotaError, RevisionRecord, SourceKind, UploadError,
+    UploadTarget,
 };
 use serde_json::json;
 use time::OffsetDateTime;
@@ -296,6 +297,101 @@ async fn usage_rebuild_counts_live_and_binned_versions() {
     db.set_site_quota(root.id, other, Some(1)).await.unwrap();
     db.add_usage(live, 5).await.unwrap();
     assert_eq!(db.site_usage(other).await.unwrap().used, 35);
+}
+
+/// Every version below a connected library is outside site usage, including through a rebuild
+/// and purge; disconnecting makes the surviving files ordinary and counts all their versions.
+#[tokio::test]
+async fn connected_library_versions_are_exempt_until_disconnect() {
+    let test = TestDb::create().await;
+    let db = &test.db;
+    let root = user(&test, "Root", true).await;
+    let (site, ordinary_library) = site_with_library(&test, root.id).await;
+    let mirror = put(
+        &test,
+        new_id(),
+        NodeKind::Library,
+        Some(site),
+        site,
+        "Mirror",
+    )
+    .await;
+    let already_binned = document_in(&test, root.id, mirror, site, "already-binned.txt").await;
+    assert!(
+        db.append_revision(None, &record(already_binned, 1, 25))
+            .await
+            .unwrap()
+    );
+    db.add_usage(already_binned, 25).await.unwrap();
+    delete(&test, already_binned.into()).await;
+    assert_eq!(db.site_usage(site).await.unwrap().used, 25);
+    db.connect_source(&NewSource {
+        library: mirror,
+        kind: SourceKind::Github,
+        owner: "octo".into(),
+        repo: "docs".into(),
+        branch: "main".into(),
+        folder: String::new(),
+        token: None,
+        poll_seconds: 300,
+        connected_by: root.id,
+    })
+    .await
+    .unwrap();
+    assert_eq!(db.site_usage(site).await.unwrap().used, 0);
+
+    let ordinary = document_in(&test, root.id, ordinary_library, site, "ordinary.txt").await;
+    let mirrored = document_in(&test, root.id, mirror, site, "mirrored.txt").await;
+    let purged = document_in(&test, root.id, mirror, site, "purged.txt").await;
+    for (doc, number, size) in [
+        (ordinary, 1, 7),
+        (mirrored, 1, 100),
+        (mirrored, 2, 50),
+        (purged, 1, 1_000),
+    ] {
+        let parent = (number > 1).then(|| record(doc, number - 1, 100).revision);
+        assert!(
+            db.append_revision(parent.as_deref(), &record(doc, number, size))
+                .await
+                .unwrap()
+        );
+        db.add_usage(doc, size).await.unwrap();
+    }
+    assert_eq!(db.site_usage(site).await.unwrap().used, 7);
+
+    db.flag_usage_rebuild().await.unwrap();
+    db.rebuild_usage(true).await.unwrap();
+    assert_eq!(db.site_usage(site).await.unwrap().used, 7);
+
+    let old = db.node(purged.into()).await.unwrap().unwrap();
+    db.apply_node(
+        &NodeRow {
+            id: purged.into(),
+            kind: old.kind,
+            parent: old.parent,
+            site: old.site,
+            name: old.name,
+            deleted_at: Some(OffsetDateTime::now_utc()),
+            deleted_by: Some(root.id),
+            created_by: old.created_by,
+            created_at: old.created_at,
+            deleted_with: Some(purged.into()),
+            bin_stage: None,
+            purged_at: Some(OffsetDateTime::now_utc()),
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(db.site_usage(site).await.unwrap().used, 7);
+
+    db.set_site_quota(root.id, site, Some(1)).await.unwrap();
+    db.disconnect_source(mirror).await.unwrap();
+    assert_eq!(db.site_usage(site).await.unwrap().used, 182);
+    assert!(matches!(
+        db.reserve_bytes(site, 1).await,
+        Err(QuotaError::Exceeded)
+    ));
 }
 
 /// Versions recorded before sizes were kept are listed for the rebuild to read from Git.

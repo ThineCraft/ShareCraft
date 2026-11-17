@@ -1,8 +1,9 @@
 //! Site quotas: how many bytes each site holds and may hold.
 //!
-//! A site's usage (`used`) is the sum of the sizes of every version of every item in it, live
-//! and in its bins, inline old versions included; a purged item's versions are given back, and
-//! a file moved to another site takes its versions' sizes there. A save, upload or copy first
+//! A site's usage (`used`) is the sum of the sizes of every version of every ordinary item in it,
+//! live and in its bins, inline old versions included; connected libraries are exempt until they
+//! are disconnected, a purged item's versions are given back, and a file moved to another site
+//! takes its versions' sizes there. A save, upload or copy first
 //! reserves its bytes ([`Db::reserve_bytes`]) with the site's row locked `FOR UPDATE`, refused
 //! (`QuotaError::Exceeded`) when the site would go over its quota; once its commit is in, the
 //! reservation becomes usage, and a failure releases it. An open upload session holds its
@@ -115,6 +116,14 @@ fn bytes_of(value: i64) -> u64 {
     u64::try_from(value).unwrap_or(0)
 }
 
+/// Whether the source schema has been installed. Migration tests exercise quota operations on
+/// older schemas, where connected-library exemptions do not exist yet.
+async fn source_schema_exists(conn: &mut PgConnection) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar("select to_regclass('library_sources') is not null")
+        .fetch_one(conn)
+        .await
+}
+
 /// Whether `extra` more bytes fit in a site holding `used` and `reserved` under `quota`.
 pub(crate) fn fits(used: u64, reserved: u64, quota: Option<u64>, extra: u64) -> bool {
     quota.is_none_or(|quota| {
@@ -223,6 +232,23 @@ pub(crate) async fn usage_changes(
         .into_iter()
         .map(|(id, site, purged)| (id, (NodeId(site), purged)))
         .collect();
+    let exempt: BTreeSet<Uuid> = if source_schema_exists(&mut *conn).await? {
+        sqlx::query_scalar(
+            "with recursive up(origin, id, parent_id) as ( \
+                 select n.id, n.id, n.parent_id from nodes n where n.id = any($1) \
+                 union \
+                 select up.origin, n.id, n.parent_id from nodes n join up on up.parent_id = n.id \
+             ) select distinct up.origin from up \
+               join library_sources s on s.library_id = up.id",
+        )
+        .bind(&ids)
+        .fetch_all(&mut *conn)
+        .await?
+        .into_iter()
+        .collect()
+    } else {
+        BTreeSet::new()
+    };
     let mut changes = UsageChanges::default();
     let mut sites = BTreeSet::new();
     for row in rows {
@@ -230,7 +256,7 @@ pub(crate) async fn usage_changes(
             continue;
         };
         if row.purged_at.is_some() {
-            if !was_purged {
+            if !was_purged && !exempt.contains(&row.id.0) {
                 changes.freed.entry(site).or_default().push(row.id.0);
                 sites.insert(site);
             }
@@ -249,14 +275,59 @@ pub(crate) async fn usage_changes(
     Ok(changes)
 }
 
-/// The sum of the sizes of every recorded version of the documents `ids`.
+/// The sum of the sizes of every recorded version of the documents `ids` that is not below a
+/// connected source library.
 async fn versions_size(conn: &mut PgConnection, ids: &[Uuid]) -> Result<i64, sqlx::Error> {
+    if !source_schema_exists(&mut *conn).await? {
+        return sqlx::query_scalar(
+            "select coalesce(sum(size), 0)::bigint from revisions where document_id = any($1)",
+        )
+        .bind(ids)
+        .fetch_one(conn)
+        .await;
+    }
     sqlx::query_scalar(
-        "select coalesce(sum(size), 0)::bigint from revisions where document_id = any($1)",
+        "with recursive up(origin, id, parent_id) as ( \
+             select n.id, n.id, n.parent_id from nodes n where n.id = any($1) \
+             union \
+             select up.origin, n.id, n.parent_id from nodes n join up on up.parent_id = n.id \
+         ), exempt as ( \
+             select distinct up.origin from up \
+             join library_sources s on s.library_id = up.id \
+         ) \
+         select coalesce(sum(r.size), 0)::bigint from revisions r \
+         where r.document_id = any($1) \
+           and not exists (select 1 from exempt e where e.origin = r.document_id)",
     )
     .bind(ids)
     .fetch_one(conn)
     .await
+}
+
+/// Recomputes one site's counted usage after a library is connected or disconnected. The
+/// caller's transaction makes the source change and this total visible together.
+pub(crate) async fn recompute_site_usage(
+    conn: &mut PgConnection,
+    site: NodeId,
+) -> Result<(), sqlx::Error> {
+    lock_usage(conn, &[site]).await?;
+    sqlx::query(
+        "with recursive source_nodes(id) as ( \
+             select s.library_id from library_sources s \
+             join nodes l on l.id = s.library_id where l.site_id = $1 \
+             union \
+             select n.id from nodes n join source_nodes s on n.parent_id = s.id \
+         ) \
+         update site_usage u set used = coalesce( \
+             (select sum(r.size) from revisions r join nodes n on n.id = r.document_id \
+              where n.site_id = $1 and n.purged_at is null \
+                and not exists (select 1 from source_nodes s where s.id = n.id)), 0) \
+         where u.site_id = $1",
+    )
+    .bind(site.0)
+    .execute(conn)
+    .await?;
+    Ok(())
 }
 
 /// Applies `changes` to the usage rows [`usage_changes`] locked. With `judged` (a person's
@@ -427,17 +498,31 @@ impl Db {
     }
 
     /// Adds `bytes` to the usage of the site holding `doc`, whatever its quota: a version of
-    /// `doc` was just committed. Nothing for a document with no node.
+    /// `doc` was just committed. Nothing for a document with no node or below a connected
+    /// library, whose mirrored versions do not consume the site's quota.
     pub async fn add_usage(&self, doc: DocId, bytes: u64) -> Result<(), DbError> {
-        sqlx::query(
+        let mut conn = self.pool().acquire().await?;
+        let sql = if source_schema_exists(&mut conn).await? {
+            "with recursive up(id, parent_id, kind, site_id, depth) as ( \
+                 select id, parent_id, kind, site_id, 0 from nodes where id = $1 \
+                 union all \
+                 select n.id, n.parent_id, n.kind, n.site_id, up.depth + 1 \
+                 from nodes n join up on n.id = up.parent_id \
+                 where up.kind <> 'library' and up.depth < 10000 \
+             ) insert into site_usage (site_id, used) \
+             select site_id, $2 from up where depth = 0 \
+               and not exists (select 1 from up join library_sources s on s.library_id = up.id) \
+             on conflict (site_id) do update set used = site_usage.used + excluded.used"
+        } else {
             "insert into site_usage (site_id, used) \
              select site_id, $2 from nodes where id = $1 \
-             on conflict (site_id) do update set used = site_usage.used + excluded.used",
-        )
-        .bind(doc.0)
-        .bind(column(bytes))
-        .execute(self.pool())
-        .await?;
+             on conflict (site_id) do update set used = site_usage.used + excluded.used"
+        };
+        sqlx::query(sql)
+            .bind(doc.0)
+            .bind(column(bytes))
+            .execute(&mut *conn)
+            .await?;
         Ok(())
     }
 
@@ -548,9 +633,10 @@ impl Db {
     }
 
     /// Sets every site's usage to the sum of the recorded sizes of every version of every
-    /// item in it that is not purged (live or in its bins), in one transaction; a version
-    /// whose size is not known counts nothing. With `complete` (every size was known), the
-    /// flags asking for this are cleared.
+    /// ordinary item in it that is not purged (live or in its bins), in one transaction;
+    /// descendants of connected libraries are exempt and a version whose size is not known
+    /// counts nothing. With `complete` (every size was known), the flags asking for this are
+    /// cleared.
     pub async fn rebuild_usage(&self, complete: bool) -> Result<(), DbError> {
         let mut tx = self.pool().begin().await?;
         sqlx::query(
@@ -562,13 +648,21 @@ impl Db {
         sqlx::query("select site_id from site_usage order by site_id for update")
             .fetch_all(&mut *tx)
             .await?;
-        sqlx::query(
+        let sql = if source_schema_exists(&mut tx).await? {
+            "with recursive source_nodes(id) as ( \
+                 select library_id from library_sources \
+                 union \
+                 select n.id from nodes n join source_nodes s on n.parent_id = s.id \
+             ) update site_usage u set used = coalesce( \
+                 (select sum(r.size) from revisions r join nodes n on n.id = r.document_id \
+                  where n.site_id = u.site_id and n.purged_at is null \
+                    and not exists (select 1 from source_nodes s where s.id = n.id)), 0)"
+        } else {
             "update site_usage u set used = coalesce( \
                  (select sum(r.size) from revisions r join nodes n on n.id = r.document_id \
-                  where n.site_id = u.site_id and n.purged_at is null), 0)",
-        )
-        .execute(&mut *tx)
-        .await?;
+                  where n.site_id = u.site_id and n.purged_at is null), 0)"
+        };
+        sqlx::query(sql).execute(&mut *tx).await?;
         if complete {
             sqlx::query("delete from usage_flags where name in ($1, $2)")
                 .bind(USAGE_UPGRADE)

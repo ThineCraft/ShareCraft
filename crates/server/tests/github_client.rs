@@ -42,6 +42,11 @@ fn client(fake: &FakeGithub) -> GithubClient {
     GithubClient::new(&fake.origin()).unwrap()
 }
 
+#[test]
+fn https_api_base_constructs_a_client() {
+    GithubClient::new("https://api.github.com").unwrap();
+}
+
 fn files() -> Vec<(&'static str, Vec<u8>)> {
     vec![
         ("README.md", b"# Docs\n".to_vec()),

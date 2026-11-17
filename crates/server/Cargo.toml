@@ -30,12 +30,11 @@ hmac = "0.13.0"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 protocol = { path = "../protocol" }
 records = { path = "../records" }
-# HTTPS to GitHub: rustls with the ring provider (no C build tool beyond the one ring already
-# needs). The provider is installed by `github::install_tls_provider`.
-reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "stream"] }
+# HTTPS to GitHub through the operating system: Schannel on Windows, Security.framework on
+# macOS, and the system OpenSSL library on Linux.
+reqwest = { version = "0.13.5", default-features = false, features = ["native-tls", "stream"] }
 revisions = { path = "../revisions" }
 rpassword = "7.5.4"
-rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11.1"

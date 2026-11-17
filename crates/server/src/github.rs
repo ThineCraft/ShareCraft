@@ -40,13 +40,6 @@ const READ_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a whole request other than a tarball download may take, its body included.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Installs the ring TLS provider for this process; later calls do nothing. Every HTTPS client
-/// in the process needs it, and [`GithubClient::new`] calls it.
-pub fn install_tls_provider() {
-    // An error means a provider is installed already, which is all that is needed.
-    let _ = rustls::crypto::ring::default_provider().install_default();
-}
-
 /// A repository on GitHub, `owner/repo`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepoRef {
@@ -193,7 +186,6 @@ impl GithubClient {
     /// `Other` if `base` is not an `http(s)://` address without credentials or query, or the
     /// client cannot be set up.
     pub fn new(base: &str) -> Result<GithubClient, GithubError> {
-        install_tls_provider();
         let bad = || GithubError::Other("the GitHub API address is not usable".to_owned());
         let base = Url::parse(base.trim()).map_err(|_| bad())?;
         let https = match base.scheme() {
