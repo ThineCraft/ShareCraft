@@ -979,15 +979,22 @@ async fn head_survives_a_full_sweep() {
     assert_eq!(swept.clients, 1);
     let loaded = s.test.db.load_live(s.doc).await.unwrap();
     assert_eq!(loaded.head, Seq(1));
+    assert_eq!(loaded.format, None);
     assert!(loaded.participants.is_empty());
     assert!(loaded.clients.is_empty());
-    let second = session(&s, 1).await;
+    let second_format = "stand-in/2";
+    let second = Uuid::new_v4();
     s.test
         .db
-        .append_live_change(s.doc, &change(2, second, client(), s.bob, 1, b"new", &[]))
+        .start_live_session(s.doc, second, second_format, at(1))
         .await
         .unwrap();
-    assert_eq!(head(&s).await, Seq(2));
+    let mut next = change(2, second, client(), s.bob, 1, b"new", &[]);
+    next.format = second_format;
+    s.test.db.append_live_change(s.doc, &next).await.unwrap();
+    let loaded = s.test.db.load_live(s.doc).await.unwrap();
+    assert_eq!(loaded.head, Seq(2));
+    assert_eq!(loaded.format.as_deref(), Some(second_format));
 }
 
 #[tokio::test]

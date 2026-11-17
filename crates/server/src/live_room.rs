@@ -423,9 +423,12 @@ impl<S: LiveStore> LiveRoom<S> {
         if should_end && let Some(session) = &self.session {
             let session_id = session.id;
             let entries = self
-                .head
-                .0
-                .saturating_sub(session.first_seq.0.saturating_sub(1));
+                .entries
+                .iter()
+                .filter(|entry| {
+                    entry.seq >= session.first_seq && matches!(entry.body, EntryBody::Change { .. })
+                })
+                .count();
             self.store.end_live_session(session_id.0, at).await?;
             self.events.emit(NewEvent {
                 kind: "live.session_ended",
@@ -513,7 +516,7 @@ impl<S: LiveStore> LiveRoom<S> {
                 subject: Some(request.user),
                 document: Some(self.doc),
                 node: Some(self.doc.into()),
-                detail: serde_json::json!({}),
+                detail: serde_json::json!({ "format": request.format }),
             });
             self.session = Some(Session {
                 id,
@@ -681,6 +684,10 @@ impl<S: LiveStore> LiveRoom<S> {
             return Ok(());
         }
         self.note_life(conn, client);
+        if !store_local(local.0) || !store_number(seen.0) {
+            self.refuse(client, local, RefusedReason::OutOfOrder);
+            return Ok(());
+        }
         let verdicts = self.note_seen(conn, client, seen);
         self.apply_verdicts(verdicts).await?;
         let Some(participant) = self.current_participant(conn, client) else {
@@ -720,6 +727,8 @@ impl<S: LiveStore> LiveRoom<S> {
             Some(RefusedReason::TooLarge)
         } else if seen > self.head {
             Some(RefusedReason::BaseAhead)
+        } else if self.head.0 >= i64::MAX as u64 {
+            Some(RefusedReason::OutOfOrder)
         } else if !self
             .rates
             .entry(client)
@@ -1542,6 +1551,16 @@ fn reason_from_store(reason: &str) -> RefusedReason {
     }
 }
 
+/// PostgreSQL stores live positions as signed 64-bit integers.
+fn store_number(value: u64) -> bool {
+    i64::try_from(value).is_ok()
+}
+
+/// A stored local also advances `next_local`, so it must leave room for `local + 1`.
+fn store_local(value: u64) -> bool {
+    value < i64::MAX as u64
+}
+
 #[cfg(test)]
 #[allow(
     clippy::too_many_arguments,
@@ -1775,7 +1794,7 @@ mod tests {
         ));
         let started = event_rx.recv().await.unwrap();
         assert_eq!(started.kind, "live.session_started");
-        assert_eq!(started.detail, serde_json::json!({}));
+        assert_eq!(started.detail, serde_json::json!({ "format": FORMAT }));
         assert!(room.has_session());
     }
 
@@ -2743,6 +2762,43 @@ mod tests {
 
         let bob = join_as(&mut room, 2, 2, 12, "editor", FORMAT, None, None).await;
         assert_eq!(bob.participant, ParticipantNo(2));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn session_end_counts_changes_not_cancel_records() {
+        let store = MemStore::new();
+        let (events, mut event_rx) = EventSink::channel();
+        let mut room = LiveRoom::load(DocId(id(100)), store, events, timing())
+            .await
+            .unwrap();
+        let ann = join_as(&mut room, 1, 1, 11, "editor", FORMAT, None, None).await;
+        let bob = join_as(&mut room, 2, 2, 12, "editor", FORMAT, None, None).await;
+        entry(&mut room, &ann, 1, 0, FORMAT, "cancelled".into())
+            .await
+            .unwrap();
+        for member in [&ann, &bob] {
+            room.handle(LiveCommand::Report {
+                conn: member.conn,
+                client: member.client,
+                seq: Seq(1),
+            })
+            .await
+            .unwrap();
+        }
+        for member in [&ann, &bob] {
+            room.handle(LiveCommand::Leave {
+                conn: member.conn,
+                client: member.client,
+            })
+            .await
+            .unwrap();
+        }
+        room.settle().await.unwrap();
+
+        let ended = std::iter::from_fn(|| event_rx.try_recv().ok())
+            .find(|event| event.kind == "live.session_ended")
+            .expect("session-ended event");
+        assert_eq!(ended.detail, serde_json::json!({ "head": 2, "entries": 1 }));
     }
 
     #[tokio::test(start_paused = true)]

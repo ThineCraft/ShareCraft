@@ -445,6 +445,42 @@ async fn garbage_frame_closes_only_that_connection() {
 }
 
 #[tokio::test]
+async fn out_of_range_local_is_refused_without_ending_the_room() {
+    let server = live_server().await;
+    let (doc, ann, bob) = shared_live(&server).await;
+    let mut a = LiveTestClient::connect(&server, doc, &ann, "a").await;
+    let mut b = LiveTestClient::connect(&server, doc, &bob, "b").await;
+    let hostile = LiveClientMsg::Entry {
+        local: LocalNo(i64::MAX as u64 + 1),
+        seen: Seq(0),
+        format: FORMAT.to_owned(),
+        payload: "hostile".to_owned(),
+    };
+
+    a.send_raw(&serde_json::to_string(&hostile).unwrap()).await;
+    while !a.messages.iter().any(|message| {
+        matches!(
+            message,
+            LiveServerMsg::Refused {
+                local: LocalNo(local),
+                reason: RefusedReason::OutOfOrder,
+            } if *local == i64::MAX as u64 + 1
+        )
+    }) {
+        a.receive_raw_only().await;
+    }
+
+    b.insert("still live").await;
+    b.pump_until(|client| client.client().pending() == 0).await;
+    a.pump_until(|client| client.lines() == ["still live"])
+        .await;
+    assert_eq!(
+        server.records_db().load_live(doc).await.unwrap().head,
+        Seq(1)
+    );
+}
+
+#[tokio::test]
 async fn viewer_receives_but_cannot_send() {
     let server = live_server().await;
     let doc = new_doc();
@@ -664,7 +700,9 @@ async fn events_are_recorded() {
         assert!(!detail.contains("payload"));
         assert!(!detail.contains("secret text"));
         match event.kind.as_str() {
-            "live.session_started" => assert_eq!(event.detail, serde_json::json!({})),
+            "live.session_started" => {
+                assert_eq!(event.detail, serde_json::json!({ "format": FORMAT }))
+            }
             "live.client_expired" => {
                 assert_eq!(event.detail, serde_json::json!({ "participant": 1 }))
             }

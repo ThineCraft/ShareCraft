@@ -909,6 +909,15 @@ impl Db {
         .execute(&mut *tx)
         .await?
         .rows_affected();
+        sqlx::query(
+            "update live_logs l set format = null where format is not null \
+               and not exists (select 1 from live_entries e \
+                               where e.document_id = l.document_id) \
+               and not exists (select 1 from live_sessions s \
+                               where s.document_id = l.document_id and s.ended_at is null)",
+        )
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(LiveSwept {
             entries,
