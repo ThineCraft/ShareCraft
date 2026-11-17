@@ -68,6 +68,7 @@ pub use blobs::blobs_path;
 pub use checkpoint::{Checkpointer, library_path};
 pub use config::{Config, ConfigError};
 pub use links::sweep_once;
+pub use live_room::sweep_live_once;
 pub use projection::{
     BlobReport, Report, UsageReport, rebuild, reconcile, reconcile_blobs, reconcile_usage,
 };
@@ -633,8 +634,8 @@ pub async fn prepare(config: Config) -> std::io::Result<AppState> {
 }
 
 /// Serves `state` on `listener` until the process ends, with the expiry sweeper (see
-/// [`sweep_once`]) running every minute and the malware scan worker (see [`scan_once`])
-/// meanwhile; they stop when serving does.
+/// [`sweep_once`]) running every minute, live-log retention every hour, and the malware scan
+/// worker (see [`scan_once`]) meanwhile; they stop when serving does.
 ///
 /// # Errors
 /// Returns an error if, in development mode, the listener is not on a loopback address, or if
@@ -642,6 +643,7 @@ pub async fn prepare(config: Config) -> std::io::Result<AppState> {
 pub async fn serve_state(state: AppState, listener: TcpListener) -> std::io::Result<()> {
     require_loopback(state.deployment(), listener.local_addr()?)?;
     let _sweeper = links::start_sweeper(state.clone());
+    let _live_sweeper = live_room::start_sweeper(state.clone());
     let _scanner = scan::start_worker(state.clone());
     axum::serve(
         listener,

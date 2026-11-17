@@ -844,6 +844,196 @@ async fn each_local_is_stored_refused_or_unseen() {
 }
 
 #[tokio::test]
+async fn unverified_entries_are_kept() {
+    let s = setup().await;
+    let session = session(&s, 0).await;
+    let one = client();
+    let mut old = change(1, session, one, s.ann, 1, b"old", &[]);
+    old.at = at(0) - Duration::days(100);
+    s.test.db.append_live_change(s.doc, &old).await.unwrap();
+
+    let swept = s.test.db.sweep_live(at(0)).await.unwrap();
+    assert_eq!(swept.entries, 0);
+    assert_eq!(s.test.db.load_live(s.doc).await.unwrap().entries.len(), 1);
+}
+
+#[tokio::test]
+async fn verified_entries_go_after_thirty_days() {
+    let s = setup().await;
+    let session = session(&s, 0).await;
+    let one = client();
+    for seq in 1..=3 {
+        s.test
+            .db
+            .append_live_change(
+                s.doc,
+                &change(seq, session, one, s.ann, seq, b"change", &[]),
+            )
+            .await
+            .unwrap();
+    }
+    s.test
+        .db
+        .mark_live_verified(s.doc, Seq(2), at(0))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        s.test
+            .db
+            .sweep_live(at(0) + Duration::days(29))
+            .await
+            .unwrap()
+            .entries,
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("select count(*) from live_entries where document_id = $1")
+            .bind(s.doc.0)
+            .fetch_one(s.test.db.test_pool())
+            .await
+            .unwrap(),
+        3
+    );
+
+    let swept = s
+        .test
+        .db
+        .sweep_live(at(0) + Duration::days(30) + Duration::seconds(1))
+        .await
+        .unwrap();
+    assert_eq!(swept.entries, 2);
+    let kept: Vec<i64> =
+        sqlx::query_scalar("select seq from live_entries where document_id = $1 order by seq")
+            .bind(s.doc.0)
+            .fetch_all(s.test.db.test_pool())
+            .await
+            .unwrap();
+    assert_eq!(kept, [3]);
+}
+
+#[tokio::test]
+async fn head_survives_a_full_sweep() {
+    let s = setup().await;
+    let first = session(&s, 0).await;
+    let one = client();
+    s.test
+        .db
+        .append_live_change(s.doc, &change(1, first, one, s.ann, 1, b"old", &[]))
+        .await
+        .unwrap();
+    s.test
+        .db
+        .mark_live_verified(s.doc, Seq(1), at(0))
+        .await
+        .unwrap();
+    s.test.db.end_live_session(first, at(0)).await.unwrap();
+    let swept = s
+        .test
+        .db
+        .sweep_live(at(0) + Duration::days(31))
+        .await
+        .unwrap();
+
+    assert_eq!(swept.entries, 1);
+    assert_eq!(swept.sessions, 1);
+    assert_eq!(swept.clients, 1);
+    let loaded = s.test.db.load_live(s.doc).await.unwrap();
+    assert_eq!(loaded.head, Seq(1));
+    assert!(loaded.participants.is_empty());
+    assert!(loaded.clients.is_empty());
+    let second = session(&s, 1).await;
+    s.test
+        .db
+        .append_live_change(s.doc, &change(2, second, client(), s.bob, 1, b"new", &[]))
+        .await
+        .unwrap();
+    assert_eq!(head(&s).await, Seq(2));
+}
+
+#[tokio::test]
+async fn verified_through_never_goes_back() {
+    let s = setup().await;
+    let session = session(&s, 0).await;
+    let one = client();
+    for seq in 1..=2 {
+        s.test
+            .db
+            .append_live_change(s.doc, &change(seq, session, one, s.ann, seq, b"x", &[]))
+            .await
+            .unwrap();
+    }
+    s.test
+        .db
+        .mark_live_verified(s.doc, Seq(2), at(0))
+        .await
+        .unwrap();
+    s.test
+        .db
+        .mark_live_verified(s.doc, Seq(1), at(10))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        s.test.db.load_live(s.doc).await.unwrap().verified_through,
+        Seq(2)
+    );
+    assert_eq!(
+        s.test
+            .db
+            .sweep_live(at(0) + Duration::days(30) + Duration::seconds(1))
+            .await
+            .unwrap()
+            .entries,
+        2,
+        "the backward mark did not restart the retention clock"
+    );
+}
+
+#[tokio::test]
+async fn old_refusals_are_swept_and_stay_out_of_order() {
+    let s = setup().await;
+    session(&s, 0).await;
+    let one = client();
+    s.test
+        .db
+        .consume_live_local(
+            s.doc,
+            one,
+            s.ann,
+            1,
+            "read_only",
+            at(0) - Duration::days(31),
+        )
+        .await
+        .unwrap();
+    s.test
+        .db
+        .consume_live_local(s.doc, one, s.ann, 2, "read_only", at(0))
+        .await
+        .unwrap();
+
+    s.test.db.sweep_live(at(0)).await.unwrap();
+    assert_eq!(
+        s.test.db.live_local(s.doc, one, 1).await.unwrap(),
+        LiveLocal::Unseen
+    );
+    let error = s
+        .test
+        .db
+        .consume_live_local(s.doc, one, s.ann, 1, "read_only", at(1))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("out of order"), "{error}");
+    assert_eq!(
+        s.test.db.live_local(s.doc, one, 2).await.unwrap(),
+        LiveLocal::Refused {
+            reason: "read_only".to_string()
+        }
+    );
+}
+
+#[tokio::test]
 async fn a_client_belongs_to_one_person() {
     let s = setup().await;
     let session = session(&s, 0).await;

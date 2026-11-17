@@ -798,6 +798,35 @@ async fn purging_a_folder_keeps_separate_entries() {
 }
 
 #[tokio::test]
+async fn purging_a_document_deletes_its_log() {
+    let w = world().await;
+    let doc = w.doc(&w.root, &w.library, "Draft").await;
+    let id = doc_id(&doc);
+    w.server.records_db().load_live(id).await.unwrap();
+    let pool = w.server.records_db().test_pool().clone();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("select count(*) from live_logs where document_id = $1")
+            .bind(id.0)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        1
+    );
+
+    assert_eq!(w.delete(&w.root, &doc).await, StatusCode::NO_CONTENT);
+    w.purge(&doc).await;
+
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("select count(*) from live_logs where document_id = $1")
+            .bind(id.0)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
 async fn purged_items_are_tombstones_without_access() {
     let w = world().await;
     let bob = w.server.user("Bob").await;

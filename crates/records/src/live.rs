@@ -12,6 +12,17 @@ use uuid::Uuid;
 
 use crate::{Db, DbError};
 
+/// How long entries covered by a verified revision and final refusals are retained.
+pub const LIVE_KEEP_DAYS: i64 = 30;
+
+/// Rows removed by one live-log retention sweep.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LiveSwept {
+    pub entries: u64,
+    pub sessions: u64,
+    pub clients: u64,
+}
+
 /// Why a place in a live session ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum GoneReason {
@@ -803,6 +814,100 @@ impl Db {
     ) -> Result<LiveLocal, DbError> {
         let mut conn = self.pool().acquire().await?;
         local_disposition(&mut conn, doc, client, signed(local)?).await
+    }
+
+    /// Marks entries through `through` as covered by a verified revision. A stale mark does
+    /// not move the verified position backwards or restart its retention period.
+    pub async fn mark_live_verified(
+        &self,
+        doc: DocId,
+        through: Seq,
+        at: OffsetDateTime,
+    ) -> Result<(), DbError> {
+        let mut tx = self.pool().begin().await?;
+        ensure_log(&mut tx, doc).await?;
+        sqlx::query(
+            "update live_logs set verified_through = $2, verified_at = $3 \
+             where document_id = $1 and verified_through < $2",
+        )
+        .bind(doc.0)
+        .bind(signed(through.0)?)
+        .bind(at)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Removes live-log detail past its retention period while keeping every document's log
+    /// row and head position forever.
+    pub async fn sweep_live(&self, now: OffsetDateTime) -> Result<LiveSwept, DbError> {
+        let cutoff = now - time::Duration::days(LIVE_KEEP_DAYS);
+        let mut tx = self.pool().begin().await?;
+        let entries = sqlx::query(
+            "delete from live_entries e using live_logs l \
+             where e.document_id = l.document_id and e.seq <= l.verified_through \
+               and l.verified_at < $1",
+        )
+        .bind(cutoff)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        sqlx::query("delete from live_refusals where at < $1")
+            .bind(cutoff)
+            .execute(&mut *tx)
+            .await?;
+        let sessions = sqlx::query(
+            "delete from live_sessions s where s.ended_at < $1 \
+               and not exists (select 1 from live_entries e where e.session_id = s.id)",
+        )
+        .bind(cutoff)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        let clients = sqlx::query(
+            "delete from live_clients c \
+             where not exists (select 1 from live_entries e \
+                               where e.document_id = c.document_id) \
+               and not exists (select 1 from live_sessions s \
+                               where s.document_id = c.document_id and s.ended_at is null)",
+        )
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        Ok(LiveSwept {
+            entries,
+            sessions,
+            clients,
+        })
+    }
+
+    /// Deletes every part of `doc`'s live log when the document is permanently purged.
+    pub async fn delete_live_log(&self, doc: DocId) -> Result<(), DbError> {
+        let mut tx = self.pool().begin().await?;
+        sqlx::query("delete from live_entries where document_id = $1")
+            .bind(doc.0)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("delete from live_refusals where document_id = $1")
+            .bind(doc.0)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("delete from live_sessions where document_id = $1")
+            .bind(doc.0)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("delete from live_clients where document_id = $1")
+            .bind(doc.0)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("delete from live_logs where document_id = $1")
+            .bind(doc.0)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     /// Ends the session `session`. A session already ended keeps its end. Fails when there is

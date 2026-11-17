@@ -37,6 +37,40 @@ pub(crate) const RATE_PER_SECOND: u32 = 30;
 pub(crate) const RATE_BURST: u32 = 120;
 
 const COMMAND_CAPACITY: usize = 1024;
+const LIVE_SWEEP_EVERY: Duration = Duration::from_secs(3_600);
+
+/// Sweeps retained live-log detail once, logging a database failure for the next hourly pass.
+/// Answers how many entries were removed.
+pub async fn sweep_live_once(state: &crate::AppState, now: OffsetDateTime) -> u64 {
+    match state.db().sweep_live(now).await {
+        Ok(swept) => swept.entries,
+        Err(error) => {
+            eprintln!("sharecraft-server: database failure: {error}");
+            0
+        }
+    }
+}
+
+/// The running live-log retention sweeper. Dropping it stops the task.
+pub(crate) struct LiveSweeper(tokio::task::JoinHandle<()>);
+
+impl Drop for LiveSweeper {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Starts the live-log retention sweep now and every hour.
+pub(crate) fn start_sweeper(state: crate::AppState) -> LiveSweeper {
+    LiveSweeper(tokio::spawn(async move {
+        let mut every = tokio::time::interval(LIVE_SWEEP_EVERY);
+        every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            every.tick().await;
+            sweep_live_once(&state, OffsetDateTime::now_utc()).await;
+        }
+    }))
+}
 
 /// The two channels into a running live room.
 #[derive(Clone, Debug)]

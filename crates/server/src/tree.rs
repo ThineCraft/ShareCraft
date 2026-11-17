@@ -500,6 +500,7 @@ pub async fn apply(state: &AppState, actor: &User, op: TreeOp) -> Result<Applied
             let renamed = plan.renamed.take();
             let contents = plan.contents.take();
             let target = plan.id;
+            let live_logs = purged_documents(&plan);
             match commit(state, Some(actor), plan).await {
                 Ok(done) => erase_released(state, done).await,
                 Err(e) => {
@@ -512,6 +513,7 @@ pub async fn apply(state: &AppState, actor: &User, op: TreeOp) -> Result<Applied
                     return Err(e);
                 }
             }
+            delete_live_logs(db, &live_logs).await?;
             if let Some(contents) = contents {
                 store_copied(state, actor, contents).await?;
             }
@@ -600,7 +602,9 @@ pub async fn purge_due(state: &AppState, now: OffsetDateTime) -> usize {
             let _turn = state.tree_lock().lock().await;
             ensure_in_step(&state).await?;
             let plan = plan_purge(&state, None, id).await?;
+            let live_logs = purged_documents(&plan);
             let done = commit(&state, None, plan).await?;
+            delete_live_logs(state.db(), &live_logs).await?;
             erase_released(&state, done).await;
             Ok::<_, AccessError>(())
         })
@@ -724,7 +728,7 @@ pub async fn purge_site(
     {
         crate::sites::end_site_activity(state, site, RemovedReason::Deleted).await;
     }
-    let done = {
+    let (done, live_logs) = {
         let _turn = state.tree_lock().lock().await;
         ensure_in_step(state).await?;
         let node = db
@@ -742,7 +746,12 @@ pub async fn purge_site(
         }
         db.set_site_purging(site, true).await?;
         let purged = match plan_purge_site(state, actor, &record).await {
-            Ok(plan) => commit(state, actor, plan).await,
+            Ok(plan) => {
+                let live_logs = purged_documents(&plan);
+                commit(state, actor, plan)
+                    .await
+                    .map(|done| (done, live_logs))
+            }
             Err(error) => Err(error),
         };
         match purged {
@@ -753,6 +762,7 @@ pub async fn purge_site(
             }
         }
     };
+    delete_live_logs(db, &live_logs).await?;
     erase_released(state, done).await;
     db.set_site_purging(site, false).await?;
     Ok(())
@@ -851,6 +861,24 @@ async fn plan_purge_site(
         purge_site: Some(id),
         ..Plan::default()
     })
+}
+
+/// Documents this tree change permanently purges, including rows already purged in Git that
+/// a resumed site purge still needs to finish in PostgreSQL.
+fn purged_documents(plan: &Plan) -> Vec<DocId> {
+    plan.records
+        .iter()
+        .chain(&plan.also_rows)
+        .filter(|record| record.purged.is_some() && record.kind == kind_word(NodeKind::Document))
+        .map(|record| DocId(record.id))
+        .collect()
+}
+
+async fn delete_live_logs(db: &Db, documents: &[DocId]) -> Result<(), AccessError> {
+    for document in documents {
+        db.delete_live_log(*document).await?;
+    }
+    Ok(())
 }
 
 /// Purges, as the server, every deleted site whose purge a stop interrupted, then every site
