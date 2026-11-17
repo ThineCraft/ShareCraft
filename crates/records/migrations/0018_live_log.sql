@@ -45,7 +45,8 @@ create table live_participants (
   primary key (session_id, number));
 
 -- Each client of a document, the person it belongs to, and one past the highest local number
--- stored or finally refused. It never goes back; local numbers increase but may skip.
+-- stored or finally refused. It never goes back; local numbers may skip forwards, while an
+-- unseen number below it is out of order.
 create table live_clients (
   document_id uuid not null references documents(id) on delete cascade,
   client_id uuid not null,

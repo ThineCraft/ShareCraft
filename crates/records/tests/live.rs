@@ -9,9 +9,10 @@
 mod common;
 
 use collab_core::ids::{ClientId, DocId, Seq, UserId};
-use common::{tree, user};
+use common::{Gate, tree, user, wait_blocked};
 use records::test_support::TestDb;
 use records::{GoneReason, LiveEntryRow, LiveLocal, NewLiveChange};
+use sqlx::Connection;
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
@@ -85,6 +86,21 @@ async fn session(s: &Setup, step: i64) -> Uuid {
 
 async fn head(s: &Setup) -> Seq {
     s.test.db.load_live(s.doc).await.unwrap().head
+}
+
+async fn live_log_gate(s: &Setup) -> Gate {
+    let mut conn = sqlx::PgConnection::connect(&s.test.url()).await.unwrap();
+    let pid = sqlx::query_scalar("select pg_backend_pid()")
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+    sqlx::query("begin").execute(&mut conn).await.unwrap();
+    sqlx::query("select document_id from live_logs where document_id = $1 for update")
+        .bind(s.doc.0)
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    Gate { conn, pid }
 }
 
 #[tokio::test]
@@ -463,20 +479,194 @@ async fn next_local_never_goes_back() {
     let session = session(&s, 0).await;
     let one = client();
     let db = &s.test.db;
-    // Local numbers may skip: 5 is stored, then a refusal and a change for lower numbers.
+    // Local numbers may skip forwards, but an unseen number behind that skip is out of order.
     db.append_live_change(s.doc, &change(1, session, one, s.ann, 5, b"x", &[]))
         .await
         .unwrap();
-    db.consume_live_local(s.doc, one, s.ann, 2, "too_large", at(2))
-        .await
-        .unwrap();
-    db.append_live_change(s.doc, &change(2, session, one, s.ann, 3, b"y", &[]))
-        .await
-        .unwrap();
+    assert!(
+        db.consume_live_local(s.doc, one, s.ann, 2, "too_large", at(2))
+            .await
+            .is_err()
+    );
+    assert!(
+        db.append_live_change(s.doc, &change(2, session, one, s.ann, 3, b"y", &[]))
+            .await
+            .is_err()
+    );
     assert_eq!(
         db.load_live(s.doc).await.unwrap().clients,
         vec![(one, s.ann, 6)]
     );
+    assert_eq!(head(&s).await, Seq(1));
+    assert_eq!(
+        db.live_local(s.doc, one, 2).await.unwrap(),
+        LiveLocal::Unseen
+    );
+    assert_eq!(
+        db.live_local(s.doc, one, 3).await.unwrap(),
+        LiveLocal::Unseen
+    );
+}
+
+#[tokio::test]
+async fn unseen_number_below_next_local_is_out_of_order() {
+    let s = setup().await;
+    let session = session(&s, 0).await;
+    let one = client();
+    let db = &s.test.db;
+    db.consume_live_local(s.doc, one, s.ann, 4, "read_only", at(1))
+        .await
+        .unwrap();
+
+    let refusal = db
+        .consume_live_local(s.doc, one, s.ann, 2, "wrong_format", at(2))
+        .await
+        .unwrap_err();
+    assert!(refusal.to_string().contains("out of order"));
+    let append = db
+        .append_live_change(s.doc, &change(1, session, one, s.ann, 3, b"x", &[]))
+        .await
+        .unwrap_err();
+    assert!(append.to_string().contains("out of order"));
+    assert_eq!(
+        db.load_live(s.doc).await.unwrap().clients,
+        vec![(one, s.ann, 5)]
+    );
+    assert_eq!(
+        db.live_local(s.doc, one, 2).await.unwrap(),
+        LiveLocal::Unseen
+    );
+    assert_eq!(
+        db.live_local(s.doc, one, 3).await.unwrap(),
+        LiveLocal::Unseen
+    );
+    assert_eq!(head(&s).await, Seq(0));
+}
+
+#[tokio::test]
+async fn concurrent_appends_for_the_same_seq_have_one_winner() {
+    let s = setup().await;
+    let session = session(&s, 0).await;
+    let second = s.test.connect_again().await;
+
+    for round in 0..8u64 {
+        let seq = round + 1;
+        let (one, two) = (client(), client());
+        s.test
+            .db
+            .consume_live_local(s.doc, one, s.ann, 1, "read_only", at(1))
+            .await
+            .unwrap();
+        second
+            .consume_live_local(s.doc, two, s.bob, 1, "read_only", at(1))
+            .await
+            .unwrap();
+        let gate = live_log_gate(&s).await;
+        let first_db = s.test.db.clone();
+        let second_db = second.clone();
+        let doc = s.doc;
+        let ann = s.ann;
+        let bob = s.bob;
+        let first = tokio::spawn(async move {
+            first_db
+                .append_live_change(doc, &change(seq, session, one, ann, 2, b"a", &[]))
+                .await
+        });
+        let other = tokio::spawn(async move {
+            second_db
+                .append_live_change(doc, &change(seq, session, two, bob, 2, b"b", &[]))
+                .await
+        });
+        wait_blocked(&s.test, gate.pid, 2).await;
+        gate.open().await;
+
+        let results = [first.await.unwrap(), other.await.unwrap()];
+        assert_eq!(
+            results.iter().filter(|result| result.is_ok()).count(),
+            1,
+            "round {round}: {results:?}"
+        );
+        let conflict = results
+            .iter()
+            .find_map(|result| result.as_ref().err())
+            .unwrap();
+        assert!(
+            conflict.to_string().contains("does not follow the head"),
+            "round {round}: {conflict}"
+        );
+        let loaded = s.test.db.load_live(s.doc).await.unwrap();
+        assert_eq!(loaded.head, Seq(seq), "round {round}");
+        assert_eq!(loaded.entries.len(), usize::try_from(seq).unwrap());
+        let locals: Vec<_> = loaded
+            .clients
+            .iter()
+            .filter(|(client, _, _)| *client == one || *client == two)
+            .map(|(client, _, next)| (*client, *next))
+            .collect();
+        assert_eq!(locals.len(), 2);
+        assert_eq!(locals.iter().filter(|(_, next)| *next == 3).count(), 1);
+        assert_eq!(locals.iter().filter(|(_, next)| *next == 2).count(), 1);
+    }
+}
+
+#[tokio::test]
+async fn concurrent_append_and_refusal_record_one_disposition() {
+    let s = setup().await;
+    let session = session(&s, 0).await;
+    let second = s.test.connect_again().await;
+
+    for round in 0..8u64 {
+        let seq = head(&s).await.0 + 1;
+        let one = client();
+        let gate = live_log_gate(&s).await;
+        let append_db = s.test.db.clone();
+        let refuse_db = second.clone();
+        let doc = s.doc;
+        let ann = s.ann;
+        let append = tokio::spawn(async move {
+            append_db
+                .append_live_change(doc, &change(seq, session, one, ann, 1, b"x", &[]))
+                .await
+        });
+        let refuse = tokio::spawn(async move {
+            refuse_db
+                .consume_live_local(doc, one, ann, 1, "read_only", at(2))
+                .await
+        });
+        wait_blocked(&s.test, gate.pid, 2).await;
+        gate.open().await;
+
+        let results = [append.await.unwrap(), refuse.await.unwrap()];
+        assert_eq!(
+            results.iter().filter(|result| result.is_ok()).count(),
+            1,
+            "round {round}: {results:?}"
+        );
+        let disposition_count: i64 = sqlx::query_scalar(
+            "select (select count(*) from live_entries \
+                     where document_id = $1 and client_id = $2 and local = 1) + \
+                    (select count(*) from live_refusals \
+                     where document_id = $1 and client_id = $2 and local = 1)",
+        )
+        .bind(s.doc.0)
+        .bind(one.0)
+        .fetch_one(s.test.db.test_pool())
+        .await
+        .unwrap();
+        assert_eq!(disposition_count, 1, "round {round}");
+        let disposition = s.test.db.live_local(s.doc, one, 1).await.unwrap();
+        match disposition {
+            LiveLocal::Stored { seq: stored } => {
+                assert!(results[0].is_ok(), "round {round}: {results:?}");
+                assert_eq!(stored, Seq(seq));
+            }
+            LiveLocal::Refused { reason } => {
+                assert!(results[1].is_ok(), "round {round}: {results:?}");
+                assert_eq!(reason, "read_only");
+            }
+            LiveLocal::Unseen => panic!("round {round}: no disposition was recorded"),
+        }
+    }
 }
 
 #[tokio::test]

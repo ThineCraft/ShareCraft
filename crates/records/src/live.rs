@@ -204,8 +204,62 @@ async fn session_doc(conn: &mut PgConnection, session: Uuid) -> Result<DocId, Db
     Ok(doc)
 }
 
-/// Moves `client`'s next local number up to `local + 1`, never down, recording it as
-/// `user`'s on first use. Fails when the client belongs to someone else.
+async fn local_disposition(
+    conn: &mut PgConnection,
+    doc: DocId,
+    client: ClientId,
+    local: i64,
+) -> Result<LiveLocal, DbError> {
+    let row = sqlx::query(
+        "select (select seq from live_entries \
+                 where document_id = $1 and client_id = $2 and local = $3 \
+                   and kind = 'change') as seq, \
+                (select reason from live_refusals \
+                 where document_id = $1 and client_id = $2 and local = $3) as reason",
+    )
+    .bind(doc.0)
+    .bind(client.0)
+    .bind(local)
+    .fetch_one(&mut *conn)
+    .await?;
+    let seq: Option<i64> = row.try_get("seq")?;
+    let reason: Option<String> = row.try_get("reason")?;
+    Ok(match (seq, reason) {
+        (Some(seq), _) => LiveLocal::Stored {
+            seq: Seq(unsigned(seq)?),
+        },
+        (None, Some(reason)) => LiveLocal::Refused { reason },
+        (None, None) => LiveLocal::Unseen,
+    })
+}
+
+/// Returns `client`'s next local number, checking that it belongs to `user`.
+async fn next_local(
+    conn: &mut PgConnection,
+    doc: DocId,
+    client: ClientId,
+    user: UserId,
+) -> Result<Option<i64>, DbError> {
+    let row = sqlx::query(
+        "select user_id, next_local from live_clients \
+         where document_id = $1 and client_id = $2",
+    )
+    .bind(doc.0)
+    .bind(client.0)
+    .fetch_optional(&mut *conn)
+    .await?;
+    match row {
+        Some(row) if row.try_get::<Uuid, _>("user_id")? != user.0 => Err(DbError::new(format!(
+            "client {} belongs to another person",
+            client.0
+        ))),
+        Some(row) => Ok(Some(row.try_get("next_local")?)),
+        None => Ok(None),
+    }
+}
+
+/// Moves `client`'s next local number to `local + 1`, recording it as `user`'s on first use.
+/// The caller has established that the number is unseen and not behind `next_local`.
 async fn use_local(
     conn: &mut PgConnection,
     doc: DocId,
@@ -522,18 +576,26 @@ impl Db {
                 doc.0
             )));
         }
-        let refused: Option<String> = sqlx::query_scalar(
-            "select reason from live_refusals \
-             where document_id = $1 and client_id = $2 and local = $3",
-        )
-        .bind(doc.0)
-        .bind(change.client.0)
-        .bind(local)
-        .fetch_optional(&mut *tx)
-        .await?;
-        if let Some(reason) = refused {
+        match local_disposition(&mut tx, doc, change.client, local).await? {
+            LiveLocal::Stored { seq } => {
+                return Err(DbError::new(format!(
+                    "local {local} of client {} is stored at {}",
+                    change.client.0, seq.0
+                )));
+            }
+            LiveLocal::Refused { reason } => {
+                return Err(DbError::new(format!(
+                    "local {local} of client {} was refused ({reason})",
+                    change.client.0
+                )));
+            }
+            LiveLocal::Unseen => {}
+        }
+        if let Some(next) = next_local(&mut tx, doc, change.client, change.user).await?
+            && local < next
+        {
             return Err(DbError::new(format!(
-                "local {local} of client {} was refused ({reason})",
+                "local {local} of client {} is out of order (next local is {next})",
                 change.client.0
             )));
         }
@@ -592,18 +654,25 @@ impl Db {
         let signed_local = signed(local)?;
         let mut tx = self.pool().begin().await?;
         lock_log(&mut tx, doc).await?;
-        let stored: Option<i64> = sqlx::query_scalar(
-            "select seq from live_entries \
-             where document_id = $1 and client_id = $2 and local = $3 and kind = 'change'",
-        )
-        .bind(doc.0)
-        .bind(client.0)
-        .bind(signed_local)
-        .fetch_optional(&mut *tx)
-        .await?;
-        if let Some(seq) = stored {
+        match local_disposition(&mut tx, doc, client, signed_local).await? {
+            LiveLocal::Stored { seq } => {
+                return Err(DbError::new(format!(
+                    "local {local} of client {} is stored at {}",
+                    client.0, seq.0
+                )));
+            }
+            LiveLocal::Refused { .. } => {
+                next_local(&mut tx, doc, client, user).await?;
+                tx.commit().await?;
+                return Ok(());
+            }
+            LiveLocal::Unseen => {}
+        }
+        if let Some(next) = next_local(&mut tx, doc, client, user).await?
+            && signed_local < next
+        {
             return Err(DbError::new(format!(
-                "local {local} of client {} is stored at {seq}",
+                "local {local} of client {} is out of order (next local is {next})",
                 client.0
             )));
         }
@@ -631,27 +700,8 @@ impl Db {
         client: ClientId,
         local: u64,
     ) -> Result<LiveLocal, DbError> {
-        let row = sqlx::query(
-            "select (select seq from live_entries \
-                     where document_id = $1 and client_id = $2 and local = $3 \
-                       and kind = 'change') as seq, \
-                    (select reason from live_refusals \
-                     where document_id = $1 and client_id = $2 and local = $3) as reason",
-        )
-        .bind(doc.0)
-        .bind(client.0)
-        .bind(signed(local)?)
-        .fetch_one(self.pool())
-        .await?;
-        let seq: Option<i64> = row.try_get("seq")?;
-        let reason: Option<String> = row.try_get("reason")?;
-        Ok(match (seq, reason) {
-            (Some(seq), _) => LiveLocal::Stored {
-                seq: Seq(unsigned(seq)?),
-            },
-            (None, Some(reason)) => LiveLocal::Refused { reason },
-            (None, None) => LiveLocal::Unseen,
-        })
+        let mut conn = self.pool().acquire().await?;
+        local_disposition(&mut conn, doc, client, signed(local)?).await
     }
 
     /// Ends the session `session`. A session already ended keeps its end. Fails when there is
