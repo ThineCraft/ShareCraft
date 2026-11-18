@@ -59,6 +59,19 @@ pub(crate) struct Listing<S> {
     pub seen: S,
 }
 
+/// One snapshot of a source's per-library limits for a sync.
+#[derive(Clone, Copy)]
+pub(crate) struct SourceCaps {
+    pub max_files: usize,
+    pub max_bytes: Option<u64>,
+}
+
+impl SourceCaps {
+    pub fn exceeded_by(self, files: usize, bytes: u64) -> bool {
+        files > self.max_files || self.max_bytes.is_some_and(|maximum| bytes > maximum)
+    }
+}
+
 /// A connected-library storage source.
 pub(crate) trait StorageSource: Send + Sync {
     type Seen: Send + Sync;
@@ -73,16 +86,20 @@ pub(crate) trait StorageSource: Send + Sync {
         dirty: bool,
     ) -> impl Future<Output = Result<Look<Self::Seen>, SyncError>> + Send;
 
-    fn caps(
+    fn list(
         &self,
         state: &AppState,
-    ) -> impl Future<Output = Result<(usize, Option<u64>), SyncError>> + Send;
+        listing: &mut Listing<Self::Seen>,
+    ) -> impl Future<Output = Result<(), SyncError>> + Send;
+
+    fn caps(&self, state: &AppState) -> impl Future<Output = Result<SourceCaps, SyncError>> + Send;
 
     fn fetch(
         &self,
         state: &AppState,
         config: &SourceConfig,
         listing: &Listing<Self::Seen>,
+        caps: SourceCaps,
         needed: &HashMap<String, u64>,
     ) -> impl Future<Output = Result<HashMap<String, Held>, SyncError>> + Send;
 }

@@ -54,7 +54,7 @@ use crate::blobs::Held;
 use crate::file_room::SaveReply;
 use crate::github::{GithubError, Head, RepoRef, TarLimits, for_each_in_tarball, git_blob_id};
 use crate::secrets::{Sealed, Secret};
-use crate::source::{ContentMode, EntryKind, Listing, Look, StorageSource, TreeEntry};
+use crate::source::{ContentMode, EntryKind, Listing, Look, SourceCaps, StorageSource, TreeEntry};
 use crate::tree::{self, TreeOp, unique_node_name};
 
 /// More files than this to read are read from one tarball rather than one by one.
@@ -1203,7 +1203,8 @@ pub(crate) struct GithubSeen {
     repo: RepoRef,
     token: Option<Secret>,
     commit: String,
-    whole: Whole,
+    tree: String,
+    whole: Option<Whole>,
 }
 
 /// GitHub as a connected-library storage source.
@@ -1250,13 +1251,8 @@ impl StorageSource for GithubSource {
                 author,
             } => (commit, tree, etag, author),
         };
-        let entries = github
-            .tree(&repo, &tree_sha, token.as_ref())
-            .await
-            .map_err(github_error)?;
-        let whole = Whole::of(&entries).ok_or_else(too_big_to_add)?;
         Ok(Look::Listing(Listing {
-            entries,
+            entries: Vec::new(),
             bookmark: commit.clone(),
             etag,
             credit: author,
@@ -1266,12 +1262,32 @@ impl StorageSource for GithubSource {
                 repo,
                 token,
                 commit,
-                whole,
+                tree: tree_sha,
+                whole: None,
             },
         }))
     }
 
-    async fn caps(&self, state: &AppState) -> Result<(usize, Option<u64>), SyncError> {
+    async fn list(
+        &self,
+        state: &AppState,
+        listing: &mut Listing<Self::Seen>,
+    ) -> Result<(), SyncError> {
+        let entries = state
+            .github()
+            .tree(
+                &listing.seen.repo,
+                &listing.seen.tree,
+                listing.seen.token.as_ref(),
+            )
+            .await
+            .map_err(github_error)?;
+        listing.seen.whole = Some(Whole::of(&entries).ok_or_else(too_big_to_add)?);
+        listing.entries = entries;
+        Ok(())
+    }
+
+    async fn caps(&self, state: &AppState) -> Result<SourceCaps, SyncError> {
         let db = state.db();
         let read = |value: Option<serde_json::Value>, default: i64| {
             value
@@ -1287,10 +1303,10 @@ impl StorageSource for GithubSource {
             db.setting(SOURCE_MAX_BYTES).await.map_err(db_failed)?,
             DEFAULT_SOURCE_MAX_BYTES,
         );
-        Ok((
-            usize::try_from(files).unwrap_or(usize::MAX),
-            Some(u64::try_from(bytes).unwrap_or(u64::MAX)),
-        ))
+        Ok(SourceCaps {
+            max_files: usize::try_from(files).unwrap_or(usize::MAX),
+            max_bytes: Some(u64::try_from(bytes).unwrap_or(u64::MAX)),
+        })
     }
 
     async fn fetch(
@@ -1298,22 +1314,21 @@ impl StorageSource for GithubSource {
         state: &AppState,
         config: &SourceConfig,
         listing: &Listing<Self::Seen>,
+        caps: SourceCaps,
         needed: &HashMap<String, u64>,
     ) -> Result<HashMap<String, Held>, SyncError> {
-        let (_, max_bytes) = self.caps(state).await?;
-        let max_bytes = max_bytes.unwrap_or(u64::MAX);
+        let whole = listing.seen.whole.ok_or_else(too_big_to_add)?;
         let reading = Reading {
             repo: &listing.seen.repo,
             token: listing.seen.token.as_ref(),
             commit: &listing.seen.commit,
             folder: config.folder.trim_matches('/'),
-            whole: listing.seen.whole,
-            max_bytes,
+            whole,
         };
         if needed.is_empty() {
             return Ok(HashMap::new());
         }
-        if needed.len() > TARBALL_FROM && reading.whole.bytes <= reading.max_bytes {
+        if caps.tarball_worth_trying(needed.len(), whole) {
             match by_tarball(state, &reading, needed).await {
                 Ok(fetched) => return Ok(fetched),
                 Err(TarFailure::Failed(e)) => return Err(e),
@@ -1353,6 +1368,7 @@ async fn run<S: StorageSource>(
         });
     }
     let user = connector(state, config, &listing.bookmark, listing.credit.as_deref()).await?;
+    source.list(state, &mut listing).await?;
 
     // The library's file policies and the largest file the server takes, judged before names
     // are given, so a hidden file never pushes a shown sibling to a suffix.
@@ -1402,21 +1418,23 @@ async fn run<S: StorageSource>(
     let files = shown.iter().filter(|e| !e.dir).count();
     let bytes =
         total_size(shown.iter().filter(|e| !e.dir).map(|e| e.size)).ok_or_else(too_big_to_add)?;
-    let (max_files, max_bytes) = source.caps(state).await?;
-    if files > max_files {
-        return Err(failed(&format!(
-            "The repository has {files} files to show, more than the {max_files} this server \
-             mirrors for one library, so nothing was changed."
-        ))
-        .into());
-    }
-    if max_bytes.is_some_and(|max_bytes| bytes > max_bytes) {
-        let max_bytes = max_bytes.unwrap_or(u64::MAX);
-        return Err(failed(&format!(
-            "The repository's files hold {bytes} bytes, more than the {max_bytes} this server \
-             mirrors for one library, so nothing was changed."
-        ))
-        .into());
+    let caps = source.caps(state).await?;
+    if caps.exceeded_by(files, bytes) {
+        if files > caps.max_files {
+            return Err(failed(&format!(
+                "The repository has {files} files to show, more than the {} this server \
+                 mirrors for one library, so nothing was changed.",
+                caps.max_files
+            ))
+            .into());
+        }
+        if let Some(max_bytes) = caps.max_bytes {
+            return Err(failed(&format!(
+                "The repository's files hold {bytes} bytes, more than the {max_bytes} this server \
+                 mirrors for one library, so nothing was changed."
+            ))
+            .into());
+        }
     }
 
     // A tracked node is usable only when it is live at the displayed parent and name recorded
@@ -1472,7 +1490,7 @@ async fn run<S: StorageSource>(
     {
         needed.insert(entry.sha.clone(), entry.size);
     }
-    let fetched = source.fetch(state, config, &listing, &needed).await?;
+    let fetched = source.fetch(state, config, &listing, caps, &needed).await?;
 
     // Marked half applied before anything changes, so a sync cut short by the process ending
     // never answers unchanged later, even when the branch is back at the last commit. A sync
@@ -1650,8 +1668,8 @@ async fn connector(
 
 /// The caps on what one library mirrors: files and bytes.
 pub(crate) async fn caps(state: &AppState) -> Result<(usize, u64), SyncError> {
-    let (files, bytes) = GithubSource.caps(state).await?;
-    Ok((files, bytes.unwrap_or(u64::MAX)))
+    let caps = GithubSource.caps(state).await?;
+    Ok((caps.max_files, caps.max_bytes.unwrap_or(u64::MAX)))
 }
 
 /// The whole tree's size: its entries, and its files' bytes and the largest.
@@ -1660,6 +1678,15 @@ struct Whole {
     entries: usize,
     bytes: u64,
     largest: u64,
+}
+
+impl SourceCaps {
+    fn tarball_worth_trying(self, needed: usize, whole: Whole) -> bool {
+        needed > TARBALL_FROM
+            && self
+                .max_bytes
+                .is_some_and(|max_bytes| whole.bytes <= max_bytes)
+    }
 }
 
 impl Whole {
@@ -1681,7 +1708,6 @@ struct Reading<'a> {
     /// The mirrored folder, without outer slashes.
     folder: &'a str,
     whole: Whole,
-    max_bytes: u64,
 }
 
 /// Why reading the tarball did not work.
@@ -2343,6 +2369,28 @@ mod tests {
         };
         assert!(Whole::of(&[huge("a"), huge("b")]).is_none());
         assert!(Whole::of(&[huge("a")]).is_some());
+    }
+
+    #[test]
+    fn one_cap_snapshot_drives_enforcement_and_tarball_selection() {
+        let whole = Whole {
+            entries: 25,
+            bytes: 80,
+            largest: 4,
+        };
+        let snapshot = SourceCaps {
+            max_files: 30,
+            max_bytes: Some(100),
+        };
+        assert!(!snapshot.exceeded_by(25, 80));
+        assert!(snapshot.tarball_worth_trying(25, whole));
+
+        let changed_later = SourceCaps {
+            max_files: 30,
+            max_bytes: Some(50),
+        };
+        assert!(changed_later.exceeded_by(25, 80));
+        assert!(!changed_later.tarball_worth_trying(25, whole));
     }
 
     #[test]
