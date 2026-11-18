@@ -1036,32 +1036,43 @@ impl Db {
         .execute(&mut *tx)
         .await?;
         let restored: Option<(String, Option<Uuid>)> = sqlx::query_as(
-            "insert into documents (id, name, editor, created_by) \
-             select id, name, $2, created_by from nodes where id = $1 and kind = 'document' \
-             on conflict (id) do nothing returning name, created_by",
+            "select name, created_by from nodes where id = $1 and kind = 'document' \
+             and not exists (select 1 from documents where id = $1)",
         )
         .bind(e.node.0)
-        .bind(Editor::Other.id())
         .fetch_optional(&mut *tx)
         .await?;
         if let Some((name, created_by)) = restored {
-            record(
-                &mut tx,
-                NewEvent {
-                    kind: "document.created",
-                    actor: created_by.map(UserId),
-                    subject: None,
-                    document: Some(DocId(e.node.0)),
-                    node: Some(e.node),
-                    detail: json!({
-                        "name": name,
-                        "editor": Editor::Other.id(),
-                        "uploaded": true,
-                        "bytes": e.size,
-                    }),
-                },
+            let editor = Editor::for_file_name(&name);
+            let inserted = sqlx::query(
+                "insert into documents (id, name, editor, created_by) values ($1, $2, $3, $4) \
+                 on conflict (id) do nothing",
             )
+            .bind(e.node.0)
+            .bind(&name)
+            .bind(editor.id())
+            .bind(created_by)
+            .execute(&mut *tx)
             .await?;
+            if inserted.rows_affected() == 1 {
+                record(
+                    &mut tx,
+                    NewEvent {
+                        kind: "document.created",
+                        actor: created_by.map(UserId),
+                        subject: None,
+                        document: Some(DocId(e.node.0)),
+                        node: Some(e.node),
+                        detail: json!({
+                            "name": name,
+                            "editor": editor.id(),
+                            "uploaded": true,
+                            "bytes": e.size,
+                        }),
+                    },
+                )
+                .await?;
+            }
         }
         tx.commit().await?;
         Ok(())

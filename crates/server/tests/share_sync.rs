@@ -492,9 +492,12 @@ async fn sync_repairs_documents_missing_after_a_batch_commit_crash() {
         .synced_at(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(60))
         .await;
     assert_eq!(repaired.added, 2);
-    for id in &file_ids {
+    for (id, editor) in file_ids
+        .iter()
+        .zip([records::Editor::GridCraft, records::Editor::PdfCraft])
+    {
         let document = db.document(DocId(*id)).await.unwrap().unwrap();
-        assert_eq!(document.editor, records::Editor::Other);
+        assert_eq!(document.editor, editor);
         assert_eq!(document.revision, None);
         let external = db.external_item(NodeId(*id)).await.unwrap().unwrap();
         assert_eq!(external.revision.len(), 40);
