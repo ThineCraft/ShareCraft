@@ -20,7 +20,8 @@ use collab_core::ids::{DocId, NodeId};
 use common::fake_github::{AUTHOR_NAME, FakeGithub};
 use common::{FileClient, TIMEOUT, TestServer, TestUser, spawn_server_config, start_fake_github};
 use records::{
-    LinkKind, NewSource, NodeKind, Principal, SealedRow, SourceKind, SourceState, SourceStatus,
+    LinkKind, NewSource, NodeKind, Principal, SealedRow, SourceKind, SourceMode, SourceState,
+    SourceStatus,
 };
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
@@ -81,6 +82,8 @@ impl Env {
             repo: REPO.to_owned(),
             branch: "main".to_owned(),
             folder: folder.to_owned(),
+            location: None,
+            mode: SourceMode::ReadOnly,
             token,
             poll_seconds: 300,
             connected_by: admin.id,

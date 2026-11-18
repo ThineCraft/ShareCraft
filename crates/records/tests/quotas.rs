@@ -16,8 +16,8 @@ use collab_core::ids::{DocId, NodeId, UserId};
 use common::{delete, document_in, new_id, put, site, user};
 use records::test_support::TestDb;
 use records::{
-    NewSource, NewUpload, NodeKind, NodeRow, QuotaError, RevisionRecord, SourceKind, UploadError,
-    UploadTarget,
+    NewSource, NewUpload, NodeKind, NodeRow, QuotaError, RevisionRecord, SourceKind, SourceMode,
+    UploadError, UploadTarget,
 };
 use serde_json::json;
 use time::OffsetDateTime;
@@ -332,6 +332,8 @@ async fn connected_library_versions_are_exempt_until_disconnect() {
         repo: "docs".into(),
         branch: "main".into(),
         folder: String::new(),
+        location: None,
+        mode: SourceMode::ReadOnly,
         token: None,
         poll_seconds: 300,
         connected_by: root.id,

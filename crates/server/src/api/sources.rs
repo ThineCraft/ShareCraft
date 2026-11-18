@@ -14,7 +14,7 @@ use axum::response::{IntoResponse, Response};
 use collab_core::ids::NodeId;
 use records::{
     LibraryKind, NewEvent, NewSource, Perms, SealedRow, SecretId, SourceChange, SourceConfig,
-    SourceKind, SourceStatus, User,
+    SourceKind, SourceMode, SourceStatus, User,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -400,6 +400,8 @@ pub(crate) async fn connect(
                     repo: repo.repo,
                     branch,
                     folder,
+                    location: None,
+                    mode: SourceMode::ReadOnly,
                     token,
                     poll_seconds: DEFAULT_POLL_SECONDS,
                     connected_by: actor.id,

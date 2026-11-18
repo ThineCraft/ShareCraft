@@ -19,7 +19,7 @@ use std::time::Duration;
 use collab_core::ids::NodeId;
 use common::fake_github::FakeGithub;
 use common::{TIMEOUT, TestServer, TestUser, spawn_server_config, start_fake_github};
-use records::{NewSource, NodeKind, Principal, SourceKind, SourceState};
+use records::{NewSource, NodeKind, Principal, SourceKind, SourceMode, SourceState};
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 use server::AppState;
@@ -951,6 +951,8 @@ async fn connecting_abandons_uploads_into_the_library() {
             repo: REPO.to_owned(),
             branch: "main".to_owned(),
             folder: String::new(),
+            location: None,
+            mode: SourceMode::ReadOnly,
             token: None,
             poll_seconds: 300,
             connected_by: env.admin.id,

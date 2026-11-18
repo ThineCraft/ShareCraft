@@ -33,7 +33,7 @@ use collab_core::ids::{DocId, NodeId};
 use common::fake_github::FakeGithub;
 use common::{FileClient, TestServer, TestUser, spawn_server_config, start_fake_github};
 use protocol::{FileServerMsg, SeatState};
-use records::{NewSource, NodeKind, Principal, SourceKind};
+use records::{NewSource, NodeKind, Principal, SourceKind, SourceMode};
 use reqwest::header::CONTENT_RANGE;
 use reqwest::{Method, StatusCode};
 use revisions::BlobRef;
@@ -1093,6 +1093,8 @@ impl Env {
                 repo: REPO.to_owned(),
                 branch: "main".to_owned(),
                 folder: String::new(),
+                location: None,
+                mode: SourceMode::ReadOnly,
                 token: None,
                 poll_seconds: 300,
                 connected_by: self.admin.id,

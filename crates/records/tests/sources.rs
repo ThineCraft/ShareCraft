@@ -11,8 +11,8 @@ use collab_core::ids::{NodeId, UserId};
 use common::{document_in, new_id, put, site, user};
 use records::test_support::TestDb;
 use records::{
-    AccessError, NewSource, NodeKind, SealedRow, SourceChange, SourceItem, SourceKind, SourceState,
-    SourceStatus,
+    AccessError, NewSource, NodeKind, SealedRow, SourceChange, SourceConfig, SourceItem,
+    SourceKind, SourceMode, SourceState, SourceStatus,
 };
 use sqlx::Row;
 use time::{Duration, OffsetDateTime};
@@ -45,6 +45,8 @@ fn new_source(f: &Fixture, library: NodeId) -> NewSource {
         repo: "docs".into(),
         branch: "main".into(),
         folder: String::new(),
+        location: None,
+        mode: SourceMode::ReadOnly,
         token: None,
         poll_seconds: 300,
         connected_by: f.user,
@@ -890,19 +892,19 @@ async fn populated_schema_migrates_from_live_log_to_github_sources() {
         .put_secret(&sealed(b"migration cipher"))
         .await
         .unwrap();
-    let mut source = NewSource {
-        library,
-        kind: SourceKind::Github,
-        owner: "migration-owner".into(),
-        repo: "migration-repo".into(),
-        branch: "main".into(),
-        folder: String::new(),
-        token: Some(token),
-        poll_seconds: 300,
-        connected_by: ann.id,
-    };
-    test.db.connect_source(&source).await.unwrap();
     let document = document_in(&test, ann.id, library, site, "A.md").await;
+    sqlx::query(
+        "insert into library_sources \
+         (library_id, kind, owner, repo, branch, folder, token_secret, poll_seconds, \
+          connected_by, generation) \
+         values ($1, 'github', 'migration-owner', 'migration-repo', 'main', '', $2, 300, $3, 7)",
+    )
+    .bind(library.0)
+    .bind(token.0)
+    .bind(ann.id.0)
+    .execute(test.db.test_pool())
+    .await
+    .unwrap();
     sqlx::query(
         "insert into source_items \
          (library_id, path, repository_path, node_id, blob_sha, size) \
@@ -920,7 +922,7 @@ async fn populated_schema_migrates_from_live_log_to_github_sources() {
             .fetch_one(test.db.test_pool())
             .await
             .unwrap();
-    assert_eq!(generation, 0);
+    assert_eq!(generation, 7);
 
     let row = sqlx::query(
         "select path, repository_path, blob_sha, size from source_items where library_id = $1",
@@ -941,12 +943,68 @@ async fn populated_schema_migrates_from_live_log_to_github_sources() {
         Some(sealed(b"migration cipher"))
     );
 
-    source.poll_seconds = 600;
+    test.db.migrate_to(20).await.unwrap();
+
+    let migrated =
+        sqlx::query("select location, mode, generation from library_sources where library_id = $1")
+            .bind(library.0)
+            .fetch_one(test.db.test_pool())
+            .await
+            .unwrap();
+    assert_eq!(migrated.get::<Option<String>, _>("location"), None);
+    assert_eq!(migrated.get::<String, _>("mode"), "read_only");
+    assert_eq!(migrated.get::<i64, _>("generation"), 7);
+    let migrated_items = test.db.source_items(library).await.unwrap();
+    assert_eq!(migrated_items.len(), 1);
+    assert_eq!(migrated_items[0].repository_path, "docs/A.md");
+    assert_eq!(migrated_items[0].blob_sha.as_deref(), Some("blob-one"));
+
+    let current_library = put(
+        &test,
+        new_id(),
+        NodeKind::Library,
+        Some(site),
+        site,
+        "Current Library",
+    )
+    .await;
+    let current = NewSource {
+        library: current_library,
+        kind: SourceKind::Github,
+        owner: "current-owner".into(),
+        repo: "current-repo".into(),
+        branch: "main".into(),
+        folder: String::new(),
+        location: None,
+        mode: SourceMode::ReadOnly,
+        token: None,
+        poll_seconds: 300,
+        connected_by: ann.id,
+    };
+    test.db.connect_source(&current).await.unwrap();
+    assert_eq!(
+        test.db.source_of(current_library).await.unwrap().unwrap().0,
+        SourceConfig {
+            library: current_library,
+            kind: SourceKind::Github,
+            owner: "current-owner".into(),
+            repo: "current-repo".into(),
+            branch: "main".into(),
+            folder: String::new(),
+            location: None,
+            mode: SourceMode::ReadOnly,
+            token: None,
+            webhook_secret: None,
+            poll_seconds: 300,
+            connected_by: ann.id,
+        }
+    );
+
     test.db
         .change_source(
             library,
             &SourceChange {
-                poll_seconds: Some(source.poll_seconds),
+                poll_seconds: Some(600),
                 ..SourceChange::default()
             },
         )
