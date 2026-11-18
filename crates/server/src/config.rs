@@ -22,6 +22,8 @@ pub const DEFAULT_EDITORS: &str = "./editors";
 pub const DEFAULT_MAX_FILE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 /// GitHub's API address, used when `SHARECRAFT_GITHUB_API` is not set.
 pub const DEFAULT_GITHUB_API: &str = "https://api.github.com";
+/// Tree nodes a file-share sync creates in one Git commit and PostgreSQL transaction.
+pub const DEFAULT_SOURCE_CREATE_BATCH_SIZE: usize = 200;
 
 /// How the server runs.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -63,6 +65,9 @@ pub struct Config {
     /// unless `SHARECRAFT_GITHUB_API` names another (a plain `http://` address only then, for
     /// a test server). People using ShareCraft never choose it.
     pub github_api: String,
+    /// Maximum tree nodes a file-share sync creates in one batch. GitHub and HTTP tree writes
+    /// do not use this setting.
+    pub source_create_batch_size: usize,
 }
 
 /// A database URL. It usually holds a password, so `Debug` never shows it.
@@ -268,6 +273,7 @@ impl Config {
             max_file_bytes,
             upload_idle: Duration::from_secs(60),
             github_api: DEFAULT_GITHUB_API.to_owned(),
+            source_create_batch_size: DEFAULT_SOURCE_CREATE_BATCH_SIZE,
         })
     }
 }
@@ -375,6 +381,7 @@ mod tests {
         assert_eq!(c.editors_dir, PathBuf::from("./editors"));
         assert_eq!(c.max_file_bytes, 10 * 1024 * 1024 * 1024);
         assert_eq!(c.github_api, "https://api.github.com");
+        assert_eq!(c.source_create_batch_size, DEFAULT_SOURCE_CREATE_BATCH_SIZE);
     }
 
     #[test]

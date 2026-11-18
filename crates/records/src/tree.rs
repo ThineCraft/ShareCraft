@@ -4,12 +4,12 @@ use collab_core::ids::{DocId, GroupId, NodeId, UserId};
 use revisions::{BlobRef, parse_hex};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgRow;
-use sqlx::{PgConnection, Row};
+use sqlx::{PgConnection, Postgres, QueryBuilder, Row};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::documents::UNIQUE_VIOLATION;
-use crate::events::{NewEvent, record, record_with_id};
+use crate::events::{NewEvent, record, record_many, record_with_id};
 use crate::groups::{
     add_site_owner, all_locked, ensure_site_groups, groups_judged_by, lock_groups,
 };
@@ -21,6 +21,7 @@ use crate::scopes::{
     LOCK_ATTEMPTS, access_with, judged_roles, lock_segment_with, lock_top_down, scopes_of, segment,
 };
 use crate::sites::{SiteSettings, ensure_site_row, purge_site_rows, upsert_site};
+use crate::sources::{ExternalEntry, SourceItem, record_source_items_with};
 use crate::{AccessError, Db, DbError, Editor, Perms};
 
 const MAX_NAME_CHARS: usize = 120;
@@ -222,6 +223,16 @@ pub struct NodeChange<'a> {
     /// Records each of these nodes, among `rows`, as a new document opened in its editor,
     /// created by `actor`: the files of a copy.
     pub copies: &'a [(NodeId, Editor)],
+    /// Other new documents among `rows`, each with its editor.
+    pub documents: &'a [(NodeId, Editor)],
+    /// The external source whose items are attached atomically with `rows`.
+    pub external_library: Option<NodeId>,
+    /// Ordinary source items (folders for an external batch) attached atomically with `rows`.
+    pub source_items: &'a [SourceItem],
+    /// External source items attached atomically with `rows`.
+    pub external_items: &'a [ExternalEntry],
+    /// This is a creation-only batch, so rows and documents may use multi-row inserts.
+    pub bulk_create: bool,
     /// How many of the last `needs` are places below a folder being deleted: a refusal on one of
     /// them is `ForbiddenBelow`.
     pub needs_below: usize,
@@ -313,6 +324,47 @@ async fn upsert_node_with(
             .await?;
     }
     Ok(())
+}
+
+/// Inserts a creation-only batch. Parents precede children in `rows`; PostgreSQL checks their
+/// foreign keys at the end of the statement. No row has a unique scope of its own.
+async fn insert_nodes_bulk(conn: &mut PgConnection, rows: &[NodeRow]) -> Result<(), AccessError> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let normalized: Vec<NodeRow> = rows.iter().map(NodeRow::normalized).collect();
+    let mut query = QueryBuilder::<Postgres>::new(
+        "insert into nodes \
+         (id, kind, parent_id, site_id, name, unique_scope, deleted_at, deleted_by, \
+          created_by, created_at, deleted_with, bin_stage, purged_at) ",
+    );
+    query.push_values(&normalized, |mut values, row| {
+        values
+            .push_bind(row.id.0)
+            .push_bind(row.kind.as_str())
+            .push_bind(row.parent.map(|parent| parent.0))
+            .push_bind(row.site.0)
+            .push_bind(&row.name)
+            .push_bind(false)
+            .push_bind(row.deleted_at)
+            .push_bind(row.deleted_by.map(|user| user.0))
+            .push_bind(row.created_by.map(|user| user.0))
+            .push_bind(row.created_at)
+            .push_bind(row.deleted_with.map(|node| node.0))
+            .push_bind(row.bin_stage)
+            .push_bind(row.purged_at);
+    });
+    match query.build().execute(conn).await {
+        Ok(_) => Ok(()),
+        Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some(UNIQUE_VIOLATION) => {
+            if error.constraint() == Some("nodes_pkey") {
+                Err(AccessError::Exists)
+            } else {
+                Err(AccessError::NameTaken)
+            }
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// The live links a tree change revokes because it deletes their item or a node above it, each
@@ -504,7 +556,13 @@ async fn judge(
     // first, otherwise in any order), and before any group or role: every transaction takes
     // all the node rows it needs before a group, so none can hold a group while waiting for a
     // node that another holds while waiting for that group.
-    let written: Vec<NodeId> = change.rows.iter().map(|row| row.id).collect();
+    // A creation-only batch has no existing row to lock. Its ordered multi-row INSERT takes
+    // the needed locks, and the unique constraints still judge ids and sibling names.
+    let written: Vec<NodeId> = if change.bulk_create {
+        Vec::new()
+    } else {
+        change.rows.iter().map(|row| row.id).collect()
+    };
     let (deleted, sites) = deleting(change);
     let purged = purging(change);
     if !change.needs_admin && change.needs.is_empty() {
@@ -513,7 +571,11 @@ async fn judge(
         lock_library_rows(&mut *conn, change.libraries).await?;
         let doomed = lock_links_below(&mut *conn, &deleted, &sites).await?;
         let purged_links = lock_links_of(&mut *conn, &purged).await?;
-        let usage = usage_changes(&mut *conn, change.rows).await?;
+        let usage = if change.bulk_create {
+            UsageChanges::default()
+        } else {
+            usage_changes(&mut *conn, change.rows).await?
+        };
         lock_groups(
             &mut *conn,
             [],
@@ -555,7 +617,11 @@ async fn judge(
     lock_library_rows(&mut *conn, change.libraries).await?;
     let doomed = lock_links_below(&mut *conn, &deleted, &sites).await?;
     let purged_links = lock_links_of(&mut *conn, &purged).await?;
-    let usage = usage_changes(&mut *conn, change.rows).await?;
+    let usage = if change.bulk_create {
+        UsageChanges::default()
+    } else {
+        usage_changes(&mut *conn, change.rows).await?
+    };
     let judged = groups_judged_by(&mut *conn, actor, &scopes).await?;
     lock_groups(
         &mut *conn,
@@ -643,32 +709,74 @@ impl Db {
             .document
             .zip(change.rows.first())
             .map(|(editor, row)| (row.id, editor));
-        for (id, editor) in first.iter().chain(change.copies) {
-            let Some(row) = change.rows.iter().find(|row| row.id == *id) else {
-                return Err(DbError::new("a new document has no node among the rows").into());
-            };
-            let inserted = sqlx::query(
-                "insert into documents (id, name, editor, created_by) values ($1, $2, $3, $4)",
-            )
-            .bind(row.id.0)
-            .bind(&row.name)
-            .bind(editor.id())
-            .bind(change.actor.map(|u| u.0))
-            .execute(&mut *tx)
-            .await;
-            match inserted {
+        let documents: Vec<(NodeId, Editor)> = first
+            .iter()
+            .chain(change.copies)
+            .chain(change.documents)
+            .copied()
+            .collect();
+        if change.bulk_create && !documents.is_empty() {
+            let mut query = QueryBuilder::<Postgres>::new(
+                "insert into documents (id, name, editor, created_by) ",
+            );
+            query.push_values(&documents, |mut values, (id, editor)| {
+                let name = change
+                    .rows
+                    .iter()
+                    .find(|row| row.id == *id)
+                    .map(|row| row.name.as_str())
+                    .unwrap_or_default();
+                values
+                    .push_bind(id.0)
+                    .push_bind(name)
+                    .push_bind(editor.id())
+                    .push_bind(change.actor.map(|user| user.0));
+            });
+            match query.build().execute(&mut *tx).await {
                 Ok(_) => {}
                 Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some(UNIQUE_VIOLATION) => {
                     return Err(AccessError::Exists);
                 }
                 Err(e) => return Err(e.into()),
             }
+        } else {
+            for (id, editor) in &documents {
+                let Some(row) = change.rows.iter().find(|row| row.id == *id) else {
+                    return Err(DbError::new("a new document has no node among the rows").into());
+                };
+                let inserted = sqlx::query(
+                    "insert into documents (id, name, editor, created_by) values ($1, $2, $3, $4)",
+                )
+                .bind(row.id.0)
+                .bind(&row.name)
+                .bind(editor.id())
+                .bind(change.actor.map(|u| u.0))
+                .execute(&mut *tx)
+                .await;
+                match inserted {
+                    Ok(_) => {}
+                    Err(sqlx::Error::Database(e))
+                        if e.code().as_deref() == Some(UNIQUE_VIOLATION) =>
+                    {
+                        return Err(AccessError::Exists);
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
         }
         // `judge` has locked every row written, in the one order, before any group or role.
-        let first = change.rows.first().map(|row| row.id);
-        for row in change.rows {
-            let ids = change.site_group_ids.filter(|_| Some(row.id) == first);
-            upsert_node_with(&mut tx, row, ids).await?;
+        if change.bulk_create {
+            insert_nodes_bulk(&mut tx, change.rows).await?;
+        } else {
+            let first = change.rows.first().map(|row| row.id);
+            for row in change.rows {
+                let ids = change.site_group_ids.filter(|_| Some(row.id) == first);
+                upsert_node_with(&mut tx, row, ids).await?;
+            }
+        }
+        if let Some(library) = change.external_library {
+            record_source_items_with(&mut tx, library, change.source_items, change.external_items)
+                .await?;
         }
         for site in change.new_sites {
             upsert_site(&mut tx, site, change.actor.is_none()).await?;
@@ -711,6 +819,10 @@ impl Db {
                     done.released.push(blob);
                 }
             }
+        }
+        if change.bulk_create {
+            record_many(&mut tx, &events).await?;
+            events.clear();
         }
         for event in events {
             if PURGE_EVENTS.contains(&event.kind) {
@@ -865,6 +977,35 @@ impl Db {
         .fetch_all(self.pool())
         .await?;
         Ok(names)
+    }
+
+    /// Every undeleted child of `parent`, for a caller that must resolve many names at once.
+    pub async fn live_children(&self, parent: NodeId) -> Result<Vec<Node>, DbError> {
+        let rows = sqlx::query(
+            "select id, kind, parent_id, site_id, name, unique_scope, \
+                    (deleted_at is not null) as deleted, created_by, created_at \
+             from nodes where parent_id = $1 and deleted_at is null",
+        )
+        .bind(parent.0)
+        .fetch_all(self.pool())
+        .await?;
+        rows.iter()
+            .map(node_from_row)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(DbError::from)
+    }
+
+    /// Whether any id is already a node or document in PostgreSQL.
+    pub async fn any_node_id_used(&self, ids: &[NodeId]) -> Result<bool, DbError> {
+        let ids: Vec<Uuid> = ids.iter().map(|id| id.0).collect();
+        sqlx::query_scalar(
+            "select exists (select 1 from nodes where id = any($1) \
+                            union all select 1 from documents where id = any($1))",
+        )
+        .bind(ids)
+        .fetch_one(self.pool())
+        .await
+        .map_err(DbError::from)
     }
 
     /// The undeleted child of `parent` named `name`, ignoring case, if there is one: the item a

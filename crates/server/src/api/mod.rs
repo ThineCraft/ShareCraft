@@ -978,6 +978,7 @@ mod tests {
             max_file_bytes: 64 << 20,
             upload_idle: Duration::from_secs(60),
             github_api: crate::config::DEFAULT_GITHUB_API.to_owned(),
+            source_create_batch_size: crate::config::DEFAULT_SOURCE_CREATE_BATCH_SIZE,
         };
         let store = RevisionStore::open(&crate::library_path(dir)).unwrap();
         let blobs = revisions::BlobStore::open(&crate::blobs_path(dir)).unwrap();

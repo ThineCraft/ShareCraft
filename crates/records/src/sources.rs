@@ -6,8 +6,8 @@
 //! A secret is stored as ciphertext only. The key that seals it lives outside the database.
 
 use collab_core::ids::{NodeId, UserId};
-use sqlx::Row;
 use sqlx::postgres::PgRow;
+use sqlx::{PgConnection, Postgres, QueryBuilder, Row};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -288,6 +288,70 @@ pub enum Unavailable {
     Gone,
     TooLarge,
     Locked,
+}
+
+/// Writes every source row belonging to a tree batch through the tree projection's existing
+/// transaction. Folders use `items`; external documents use `external` so their revision and
+/// modified time are established atomically with their node and document rows.
+pub(crate) async fn record_source_items_with(
+    conn: &mut PgConnection,
+    library: NodeId,
+    items: &[SourceItem],
+    external: &[ExternalEntry],
+) -> Result<(), DbError> {
+    if !items.is_empty() {
+        let mut query = QueryBuilder::<Postgres>::new(
+            "insert into source_items \
+             (library_id, path, repository_path, node_id, blob_sha, size) ",
+        );
+        query.push_values(items, |mut values, item| {
+            values
+                .push_bind(library.0)
+                .push_bind(&item.path)
+                .push_bind(&item.repository_path)
+                .push_bind(item.node.0)
+                .push_bind(&item.blob_sha)
+                .push_bind(item.size);
+        });
+        query.build().execute(&mut *conn).await?;
+    }
+    if !external.is_empty() {
+        let values: Vec<_> = external
+            .iter()
+            .map(|entry| {
+                let size = i64::try_from(entry.size).map_err(DbError::new)?;
+                let modified =
+                    OffsetDateTime::from_unix_timestamp_nanos(i128::from(entry.mtime_ns))
+                        .map_err(DbError::new)?;
+                Ok((
+                    entry,
+                    external_tag(entry.size, entry.mtime_ns),
+                    size,
+                    new_external_revision(),
+                    modified,
+                ))
+            })
+            .collect::<Result<Vec<_>, DbError>>()?;
+        let mut query = QueryBuilder::<Postgres>::new(
+            "insert into source_items \
+             (library_id, path, repository_path, node_id, blob_sha, size, revision, modified_at) ",
+        );
+        query.push_values(
+            &values,
+            |mut row, (entry, tag, size, revision, modified)| {
+                row.push_bind(library.0)
+                    .push_bind(&entry.path)
+                    .push_bind(&entry.repository_path)
+                    .push_bind(entry.node.0)
+                    .push_bind(tag)
+                    .push_bind(*size)
+                    .push_bind(revision)
+                    .push_bind(*modified);
+            },
+        );
+        query.build().execute(&mut *conn).await?;
+    }
+    Ok(())
 }
 
 impl Unavailable {

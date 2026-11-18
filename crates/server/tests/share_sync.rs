@@ -42,8 +42,13 @@ struct Env {
 
 impl Env {
     async fn new() -> Self {
+        Self::new_with_batch(server::config::DEFAULT_SOURCE_CREATE_BATCH_SIZE).await
+    }
+
+    async fn new_with_batch(source_create_batch_size: usize) -> Self {
         let server = spawn_server_config_without_workers(|config| {
             config.max_file_bytes = 512 * 1024 * 1024;
+            config.source_create_batch_size = source_create_batch_size;
         })
         .await;
         let admin = server.admin("Ada Admin").await;
@@ -146,6 +151,228 @@ fn tree_head(server: &TestServer) -> gix::ObjectId {
         .unwrap()
         .id()
         .detach()
+}
+
+fn commit_count(server: &TestServer) -> usize {
+    let repo = gix::open(server.library()).unwrap();
+    let main = repo.find_reference("refs/heads/main").unwrap().id();
+    repo.rev_walk([main]).all().unwrap().count()
+}
+
+#[tokio::test]
+async fn configured_batch_of_500_nodes_is_one_commit_with_correct_parents() {
+    let server = spawn_server_config_without_workers(|config| {
+        config.max_file_bytes = 512 * 1024 * 1024;
+        config.source_create_batch_size = 500;
+    })
+    .await;
+    let admin = server.admin("Ada Admin").await;
+    let library = common::Site::library(&server).await;
+    let state = server.app_state().await;
+    let fake = FakeShare::new(ROOT);
+    state.shares().set_fs(Arc::new(fake.clone()));
+    let db = server.records_db();
+    db.set_setting(admin.id, SHARE_ROOTS, json!([ROOT]))
+        .await
+        .unwrap();
+    db.connect_source(&NewSource {
+        library,
+        kind: SourceKind::Share,
+        owner: String::new(),
+        repo: String::new(),
+        branch: String::new(),
+        folder: String::new(),
+        location: Some(ROOT.to_owned()),
+        mode: SourceMode::ReadOnly,
+        token: None,
+        poll_seconds: 60,
+        connected_by: admin.id,
+    })
+    .await
+    .unwrap();
+    for number in 0..499 {
+        fake.put(&format!("only-folder/file-{number:03}.txt"), b"x");
+    }
+    let before = commit_count(&server);
+
+    let report = sync_once(&state, library, OffsetDateTime::UNIX_EPOCH)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(report.added, 499);
+    assert_eq!(commit_count(&server), before + 1);
+    let items = db.source_items(library).await.unwrap();
+    assert_eq!(items.len(), 500);
+    let folder = items
+        .iter()
+        .find(|item| item.path == "only-folder")
+        .unwrap();
+    for number in 0..499 {
+        let path = format!("only-folder/file-{number:03}.txt");
+        let item = items.iter().find(|item| item.path == path).unwrap();
+        let node = db.node(item.node).await.unwrap().unwrap();
+        assert_eq!(node.parent, Some(folder.node), "{path}");
+        assert_eq!(node.name, format!("file-{number:03}.txt"));
+    }
+}
+
+#[tokio::test]
+async fn batch_database_failure_is_atomic_and_the_next_sync_repairs_it() {
+    let env = Env::new().await;
+    for number in 0..300 {
+        env.fake.put(&format!("file-{number:03}.txt"), b"x");
+    }
+    sqlx::query(
+        "create function fail_share_batch_node() returns trigger language plpgsql as $$ \
+         begin if new.name = 'file-150.txt' then raise exception 'injected batch failure'; \
+         end if; return new; end $$",
+    )
+    .execute(env.server.records_db().test_pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "create trigger fail_share_batch_node before insert or update on nodes \
+         for each row execute function fail_share_batch_node()",
+    )
+    .execute(env.server.records_db().test_pool())
+    .await
+    .unwrap();
+
+    assert!(matches!(
+        env.sync_at(OffsetDateTime::UNIX_EPOCH).await,
+        Err(SyncError::Failed(_))
+    ));
+    assert!(
+        env.server
+            .records_db()
+            .source_items(env.library)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    sqlx::query("drop trigger fail_share_batch_node on nodes")
+        .execute(env.server.records_db().test_pool())
+        .await
+        .unwrap();
+    sqlx::query("drop function fail_share_batch_node()")
+        .execute(env.server.records_db().test_pool())
+        .await
+        .unwrap();
+    let repaired = env
+        .synced_at(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(60))
+        .await;
+    assert_eq!(repaired.added, 300);
+    assert_eq!(
+        env.server
+            .records_db()
+            .source_items(env.library)
+            .await
+            .unwrap()
+            .len(),
+        300
+    );
+}
+
+#[tokio::test]
+async fn reconcile_rebuilds_the_batch_created_tree_from_git() {
+    let env = Env::new().await;
+    env.fake.put("parent/first.txt", b"one");
+    env.fake.put("parent/second.txt", b"two");
+    env.synced_at(OffsetDateTime::UNIX_EPOCH).await;
+    let folder = env.item("parent").await;
+    let first = env.item("parent/first.txt").await;
+    let second = env.item("parent/second.txt").await;
+    let mut before = Vec::new();
+    for id in [folder.node, first.node, second.node] {
+        before.push(env.server.records_db().node(id).await.unwrap().unwrap());
+    }
+
+    sqlx::query("delete from source_items where node_id = any($1)")
+        .bind(vec![folder.node.0, first.node.0, second.node.0])
+        .execute(env.server.records_db().test_pool())
+        .await
+        .unwrap();
+    sqlx::query("delete from nodes where id = any($1)")
+        .bind(vec![folder.node.0, first.node.0, second.node.0])
+        .execute(env.server.records_db().test_pool())
+        .await
+        .unwrap();
+    let report = server::tree::reconcile(Arc::new(env.server.store()), &env.server.records_db())
+        .await
+        .unwrap();
+
+    assert_eq!(report.updated, 3);
+    assert!(report.failed.is_empty(), "{:?}", report.failed);
+    for expected in before {
+        let actual = env
+            .server
+            .records_db()
+            .node(expected.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(actual.name, expected.name);
+        assert_eq!(actual.parent, expected.parent);
+        assert_eq!(actual.kind, expected.kind);
+    }
+}
+
+#[tokio::test]
+async fn generation_change_recorded_in_a_batch_stops_before_the_next_batch() {
+    let server = spawn_server_config_without_workers(|config| {
+        config.source_create_batch_size = 50;
+    })
+    .await;
+    let admin = server.admin("Ada Admin").await;
+    let library = common::Site::library(&server).await;
+    let state = server.app_state().await;
+    let fake = FakeShare::new(ROOT);
+    state.shares().set_fs(Arc::new(fake.clone()));
+    let db = server.records_db();
+    db.set_setting(admin.id, SHARE_ROOTS, json!([ROOT]))
+        .await
+        .unwrap();
+    db.connect_source(&NewSource {
+        library,
+        kind: SourceKind::Share,
+        owner: String::new(),
+        repo: String::new(),
+        branch: String::new(),
+        folder: String::new(),
+        location: Some(ROOT.to_owned()),
+        mode: SourceMode::ReadOnly,
+        token: None,
+        poll_seconds: 60,
+        connected_by: admin.id,
+    })
+    .await
+    .unwrap();
+    for number in 0..120 {
+        fake.put(&format!("file-{number:03}.txt"), b"x");
+    }
+    sqlx::query(
+        "create function bump_share_generation() returns trigger language plpgsql as $$ \
+         begin update library_sources set generation = generation + 1 \
+         where library_id = new.library_id; return new; end $$",
+    )
+    .execute(db.test_pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "create trigger bump_share_generation after insert on source_items \
+         for each row execute function bump_share_generation()",
+    )
+    .execute(db.test_pool())
+    .await
+    .unwrap();
+
+    assert!(matches!(
+        sync_once(&state, library, OffsetDateTime::UNIX_EPOCH).await,
+        Err(SyncError::Failed(_))
+    ));
+    assert_eq!(db.source_items(library).await.unwrap().len(), 50);
 }
 
 #[tokio::test]
@@ -739,7 +966,7 @@ async fn a_generation_change_stops_a_long_apply() {
 
 #[tokio::test]
 async fn a_generation_change_stops_folder_heavy_apply_and_next_sync_completes() {
-    let env = Env::new().await;
+    let env = Env::new_with_batch(20).await;
     for number in 0..200 {
         env.fake.put(&format!("folder-{number:03}/file.txt"), b"x");
     }
@@ -758,7 +985,7 @@ async fn a_generation_change_stops_folder_heavy_apply_and_next_sync_completes() 
             .into_iter()
             .filter(|item| item.blob_sha.is_none())
             .count();
-        if folders >= 5 {
+        if folders >= 20 {
             break;
         }
         assert!(
@@ -785,7 +1012,7 @@ async fn a_generation_change_stops_folder_heavy_apply_and_next_sync_completes() 
         .filter(|item| item.blob_sha.is_none())
         .count();
     assert!(
-        folders_after_stop <= 105,
+        folders_after_stop <= 40,
         "created {folders_after_stop} of 200 folders after the generation changed"
     );
 
@@ -885,7 +1112,8 @@ async fn github_sync_is_unaffected() {
 #[tokio::test]
 #[ignore = "task-card performance measurement"]
 async fn measure_first_listing_of_2000_files() {
-    let env = Env::new().await;
+    // Exercise the configurable large-listing batch while the production default remains 200.
+    let env = Env::new_with_batch(500).await;
     env.server
         .records_db()
         .set_setting(env.admin.id, SOURCE_MAX_FILES, json!(2_100))

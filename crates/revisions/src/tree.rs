@@ -220,6 +220,73 @@ impl RevisionStore {
         let _guard = self.lock();
         let repo = self.repo()?;
         let parent = main_tip(&repo)?;
+        let mut tree_dir = match parent.as_ref() {
+            Some(parent) => match parent.tree()?.lookup_entry_by_path(TREE_DIR)? {
+                Some(entry) => decoded_tree(&repo, entry.object_id())?,
+                None => gix::objs::Tree::default(),
+            },
+            None => gix::objs::Tree::default(),
+        };
+        let mut shards: BTreeMap<String, gix::objs::Tree> = BTreeMap::new();
+        for (id, bytes) in files {
+            let shard_name = shard(id);
+            if !shards.contains_key(&shard_name) {
+                let existing = tree_dir
+                    .entries
+                    .iter()
+                    .find(|entry| entry.mode.is_tree() && entry.filename == shard_name)
+                    .map(|entry| decoded_tree(&repo, entry.oid))
+                    .transpose()?
+                    .unwrap_or_default();
+                shards.insert(shard_name.clone(), existing);
+            }
+            let blob = repo.write_blob(&bytes)?.detach();
+            let file_name = format!("{id}.json");
+            let sub = shards.get_mut(&shard_name).ok_or_else(|| {
+                CheckpointError::InvalidTreeChange(format!(
+                    "cannot prepare tree shard {shard_name}"
+                ))
+            })?;
+            if let Some(entry) = sub
+                .entries
+                .iter_mut()
+                .find(|entry| entry.filename == file_name)
+            {
+                entry.mode = EntryKind::Blob.into();
+                entry.oid = blob;
+            } else {
+                sub.entries.push(gix::objs::tree::Entry {
+                    mode: EntryKind::Blob.into(),
+                    filename: file_name.into(),
+                    oid: blob,
+                });
+            }
+            let flat_name = format!("{id}.json");
+            tree_dir.entries.retain(|entry| entry.filename != flat_name);
+        }
+        for (name, mut sub) in shards {
+            sub.entries.sort();
+            let oid = repo.write_object(&sub).map_err(GitError::new)?.detach();
+            if let Some(entry) = tree_dir
+                .entries
+                .iter_mut()
+                .find(|entry| entry.filename == name)
+            {
+                entry.mode = EntryKind::Tree.into();
+                entry.oid = oid;
+            } else {
+                tree_dir.entries.push(gix::objs::tree::Entry {
+                    mode: EntryKind::Tree.into(),
+                    filename: name.into(),
+                    oid,
+                });
+            }
+        }
+        tree_dir.entries.sort();
+        let tree_oid = repo
+            .write_object(&tree_dir)
+            .map_err(GitError::new)?
+            .detach();
         let mut message = change.message.to_owned();
         if !message.ends_with('\n') {
             message.push('\n');
@@ -232,11 +299,7 @@ impl RevisionStore {
             TREE_REF,
             ref_target(&repo, TREE_REF)?,
             |editor| {
-                for (id, bytes) in files {
-                    let blob = repo.write_blob(&bytes)?.detach();
-                    editor.upsert(record_path(id), EntryKind::Blob, blob)?;
-                    editor.remove(flat_path(id).as_str())?;
-                }
+                editor.upsert(TREE_DIR, EntryKind::Tree, tree_oid)?;
                 Ok(())
             },
         )?;

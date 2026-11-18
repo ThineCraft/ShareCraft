@@ -27,6 +27,7 @@
 //! No token, response body or other secret reaches an event, a log line, `last_error` or an
 //! error: every message here is a plain sentence of ours.
 
+use std::collections::hash_map::Entry as HashEntry;
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -34,8 +35,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use collab_core::ids::{DocId, NodeId};
 use futures_util::{StreamExt, TryStreamExt};
 use records::{
-    DEFAULT_SOURCE_MAX_BYTES, DEFAULT_SOURCE_MAX_FILES, Editor, ExternalEntry, NewEvent, NodeKind,
-    SOURCE_MAX_BYTES, SOURCE_MAX_FILES, SourceConfig, SourceItem, SourceKind, SourceLock,
+    DEFAULT_SOURCE_MAX_BYTES, DEFAULT_SOURCE_MAX_FILES, Editor, ExternalEntry, NewEvent, Node,
+    NodeKind, SOURCE_MAX_BYTES, SOURCE_MAX_FILES, SourceConfig, SourceItem, SourceKind, SourceLock,
     SourceState, SourceStatus, SourceSyncTransition, UploadTarget, User, check_name, check_size,
     is_format_char, validate_document_name, validate_node_name,
 };
@@ -2113,10 +2114,29 @@ async fn apply(
         applied_operations = applied_operations.saturating_add(1);
         check_generation(state, library, generation, applied_operations).await?;
     }
-    for entry in plan.add.iter().filter(|e| e.dir) {
-        work.add_folder(entry, &mut gone_folders).await?;
-        applied_operations = applied_operations.saturating_add(1);
-        check_generation(state, library, generation, applied_operations).await?;
+    if matches!(mode, ContentMode::External) {
+        let adds: Vec<&Entry> = plan
+            .add
+            .iter()
+            .filter(|entry| entry.dir)
+            .chain(plan.add.iter().filter(|entry| !entry.dir))
+            .collect();
+        let added = work
+            .add_external_batches(
+                &adds,
+                &mut gone_folders,
+                state.config().source_create_batch_size.max(1),
+                generation,
+            )
+            .await?;
+        counts.added = counts.added.saturating_add(added);
+        applied_operations = applied_operations.saturating_add(adds.len());
+    } else {
+        for entry in plan.add.iter().filter(|e| e.dir) {
+            work.add_folder(entry, &mut gone_folders).await?;
+            applied_operations = applied_operations.saturating_add(1);
+            check_generation(state, library, generation, applied_operations).await?;
+        }
     }
     let mut waiting = Vec::new();
     for (item, entry) in &plan.moves {
@@ -2145,11 +2165,13 @@ async fn apply(
         applied_operations = applied_operations.saturating_add(1);
         check_generation(state, library, generation, applied_operations).await?;
     }
-    for entry in plan.add.iter().filter(|e| !e.dir) {
-        work.add_file(entry).await?;
-        counts.added += 1;
-        applied_operations = applied_operations.saturating_add(1);
-        check_generation(state, library, generation, applied_operations).await?;
+    if !matches!(mode, ContentMode::External) {
+        for entry in plan.add.iter().filter(|e| !e.dir) {
+            work.add_file(entry).await?;
+            counts.added += 1;
+            applied_operations = applied_operations.saturating_add(1);
+            check_generation(state, library, generation, applied_operations).await?;
+        }
     }
     Ok(counts)
 }
@@ -2192,7 +2214,155 @@ fn temporary_name(name: &str) -> String {
     tree::fit(stem, extension, &suffix)
 }
 
+fn external_mtime(entry: &Entry) -> Result<i64, SyncError> {
+    let prefix = format!("x{}-", entry.size);
+    entry
+        .sha
+        .strip_prefix(&prefix)
+        .and_then(|text| text.parse::<i64>().ok())
+        .ok_or_else(|| failed("A file on the share had an invalid change tag."))
+}
+
 impl Applying<'_> {
+    /// Creates new share nodes in count-bounded commits. Existing untracked nodes keep the
+    /// adopt-by-path replacement used before batching.
+    async fn add_external_batches(
+        &mut self,
+        entries: &[&Entry],
+        gone: &mut HashMap<NodeId, SourceItem>,
+        batch_size: usize,
+        generation: i64,
+    ) -> Result<usize, SyncError> {
+        let mut batch = Vec::with_capacity(batch_size);
+        let mut added_files = 0_usize;
+        let mut children: HashMap<NodeId, HashMap<String, Option<Node>>> = HashMap::new();
+        let mut git_ids = tree::external_tree_ids(self.state).await.map_err(|e| {
+            eprintln!("sharecraft-server: sync could not read the content tree: {e:?}");
+            failed("The content tree could not be read, so the sync stopped.")
+        })?;
+        for entry in entries {
+            let parent = self.folder(parent_path(&entry.path))?;
+            let name = last_name(&entry.path);
+            if let HashEntry::Vacant(slot) = children.entry(parent) {
+                let known = self
+                    .state
+                    .db()
+                    .live_children(parent)
+                    .await
+                    .map_err(db_failed)?
+                    .into_iter()
+                    .map(|node| (node.name.to_lowercase(), Some(node)))
+                    .collect();
+                slot.insert(known);
+            }
+            let existing = children
+                .get(&parent)
+                .and_then(|known| known.get(&name.to_lowercase()))
+                .cloned()
+                .flatten();
+            if entry.dir {
+                match existing {
+                    Some(node)
+                        if node.kind == NodeKind::Folder && !self.tracked.contains(&node.id) =>
+                    {
+                        self.record(node.id, entry).await?;
+                        self.folders.insert(entry.path.clone(), node.id);
+                        continue;
+                    }
+                    Some(node)
+                        if node.kind == NodeKind::Folder && gone.remove(&node.id).is_some() =>
+                    {
+                        if node.name != name {
+                            self.change(
+                                TreeOp::Rename {
+                                    id: node.id,
+                                    name: name.to_owned(),
+                                },
+                                &entry.path,
+                            )
+                            .await?;
+                        }
+                        self.record(node.id, entry).await?;
+                        self.folders.insert(entry.path.clone(), node.id);
+                        continue;
+                    }
+                    Some(_) => return Err(taken(&entry.path)),
+                    None => {}
+                }
+            } else {
+                match existing {
+                    Some(node)
+                        if node.kind == NodeKind::Document && !self.tracked.contains(&node.id) =>
+                    {
+                        self.record(node.id, entry).await?;
+                        added_files = added_files.saturating_add(1);
+                        continue;
+                    }
+                    Some(_) => return Err(taken(&entry.path)),
+                    None => {}
+                }
+            }
+            let id = NodeId(Uuid::new_v4());
+            if let Some(known) = children.get_mut(&parent) {
+                known.insert(name.to_lowercase(), None);
+            }
+            if entry.dir {
+                self.folders.insert(entry.path.clone(), id);
+            } else {
+                added_files = added_files.saturating_add(1);
+            }
+            let mtime_ns = if entry.dir { 0 } else { external_mtime(entry)? };
+            batch.push(tree::ExternalNodeCreate {
+                id,
+                parent,
+                name: name.to_owned(),
+                path: entry.path.clone(),
+                repository_path: entry.repository_path.clone(),
+                size: entry.size,
+                mtime_ns,
+                editor: (!entry.dir).then(|| Editor::for_file_name(name)),
+            });
+            if batch.len() == batch_size {
+                self.commit_external_batch(&batch, generation, &git_ids)
+                    .await?;
+                git_ids.extend(batch.iter().map(|create| create.id.0));
+                batch.clear();
+            }
+        }
+        if !batch.is_empty() {
+            self.commit_external_batch(&batch, generation, &git_ids)
+                .await?;
+        }
+        Ok(added_files)
+    }
+
+    async fn commit_external_batch(
+        &self,
+        batch: &[tree::ExternalNodeCreate],
+        generation: i64,
+        git_ids: &HashSet<Uuid>,
+    ) -> Result<(), SyncError> {
+        tree::create_external_nodes(self.state, self.user, self.library, batch, git_ids)
+            .await
+            .map_err(|e| {
+                eprintln!("sharecraft-server: sync could not add a file-share batch: {e:?}");
+                failed("A batch of file-share items could not be added, so the sync stopped.")
+            })?;
+        let current = self
+            .state
+            .db()
+            .source_generation(self.library)
+            .await
+            .map_err(db_failed)?;
+        if current == Some(generation) {
+            Ok(())
+        } else {
+            Err(failed(
+                "The source changed while its files were being listed, so the sync stopped.",
+            ))
+        }
+    }
+
     /// The node of the folder at `path` (the library at the top).
     fn folder(&self, path: &str) -> Result<NodeId, SyncError> {
         if path.is_empty() {
@@ -2209,12 +2379,7 @@ impl Applying<'_> {
     async fn record(&self, node: NodeId, entry: &Entry) -> Result<(), SyncError> {
         let db = self.state.db();
         if matches!(self.mode, ContentMode::External) && !entry.dir {
-            let prefix = format!("x{}-", entry.size);
-            let mtime_ns = entry
-                .sha
-                .strip_prefix(&prefix)
-                .and_then(|text| text.parse::<i64>().ok())
-                .ok_or_else(|| failed("A file on the share had an invalid change tag."))?;
+            let mtime_ns = external_mtime(entry)?;
             return db
                 .record_external_item(
                     self.library,
