@@ -388,6 +388,77 @@ async fn an_unreadable_sub_folder_keeps_what_was_known_below_it() {
 }
 
 #[tokio::test]
+async fn unreadable_files_ignore_new_policy_and_cache_limits() {
+    let env = Env::new().await;
+    env.fake.put("private/kept.exe", b"MZ");
+    env.fake.put("private/large.txt", b"large");
+    env.state
+        .shares()
+        .set_fs(Arc::new(LargeListingShare(env.fake.clone())));
+    env.synced_at(OffsetDateTime::UNIX_EPOCH).await;
+    let before = [
+        env.item("private/kept.exe").await,
+        env.item("private/large.txt").await,
+    ];
+    let before_names = [
+        env.server
+            .records_db()
+            .node(before[0].node)
+            .await
+            .unwrap()
+            .unwrap()
+            .name,
+        env.server
+            .records_db()
+            .node(before[1].node)
+            .await
+            .unwrap()
+            .unwrap()
+            .name,
+    ];
+
+    env.fake.deny("private");
+    let (status, body) = call(
+        &env.server,
+        &env.admin,
+        Method::PATCH,
+        &format!("/api/libraries/{}", env.library.0),
+        Some(json!({ "blocked_types": [".exe"] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    env.server
+        .records_db()
+        .set_setting(
+            env.admin.id,
+            SHARE_CACHE_MAX_BYTES,
+            json!(256 * 1024 * 1024_u64),
+        )
+        .await
+        .unwrap();
+
+    env.sync_at(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(60))
+        .await
+        .unwrap();
+    env.sync_at(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(120))
+        .await
+        .unwrap();
+
+    for (item, name) in before.into_iter().zip(before_names) {
+        assert_eq!(env.item(&item.path).await, item);
+        let node = env
+            .server
+            .records_db()
+            .node(item.node)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(node.name, name);
+        assert!(!node.deleted);
+    }
+}
+
+#[tokio::test]
 async fn over_the_file_cap_changes_nothing() {
     let env = Env::new().await;
     env.server
@@ -664,6 +735,76 @@ async fn a_generation_change_stops_a_long_apply() {
             .unwrap()
             .is_some()
     );
+}
+
+#[tokio::test]
+async fn a_generation_change_stops_folder_heavy_apply_and_next_sync_completes() {
+    let env = Env::new().await;
+    for number in 0..200 {
+        env.fake.put(&format!("folder-{number:03}/file.txt"), b"x");
+    }
+    let state = env.state.clone();
+    let library = env.library;
+    let task =
+        tokio::spawn(async move { sync_once(&state, library, OffsetDateTime::UNIX_EPOCH).await });
+    let deadline = tokio::time::Instant::now() + common::TIMEOUT;
+    loop {
+        let folders = env
+            .server
+            .records_db()
+            .source_items(env.library)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|item| item.blob_sha.is_none())
+            .count();
+        if folders >= 5 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "folder apply did not start"
+        );
+        tokio::task::yield_now().await;
+    }
+    env.server
+        .records_db()
+        .bump_source_generation(env.library)
+        .await
+        .unwrap();
+
+    assert!(matches!(task.await.unwrap(), Err(SyncError::Failed(_))));
+    let after_stop = env
+        .server
+        .records_db()
+        .source_items(env.library)
+        .await
+        .unwrap();
+    let folders_after_stop = after_stop
+        .iter()
+        .filter(|item| item.blob_sha.is_none())
+        .count();
+    assert!(
+        folders_after_stop <= 105,
+        "created {folders_after_stop} of 200 folders after the generation changed"
+    );
+
+    env.synced_at(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(60))
+        .await;
+    let completed = env
+        .server
+        .records_db()
+        .source_items(env.library)
+        .await
+        .unwrap();
+    assert_eq!(
+        completed
+            .iter()
+            .filter(|item| item.blob_sha.is_none())
+            .count(),
+        200
+    );
+    assert_eq!(completed.len(), 400);
 }
 
 #[tokio::test]

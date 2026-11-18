@@ -1313,8 +1313,9 @@ impl StorageSource for GithubSource {
                 author,
             } => (commit, tree, etag, author),
         };
-        Ok(Look::Listing(Listing {
+        Ok(Look::Listing(Box::new(Listing {
             entries: Vec::new(),
+            protected: HashSet::new(),
             bookmark: commit.clone(),
             etag,
             credit: author,
@@ -1327,7 +1328,7 @@ impl StorageSource for GithubSource {
                 tree: tree_sha,
                 whole: None,
             },
-        }))
+        })))
     }
 
     async fn list(
@@ -1424,7 +1425,7 @@ async fn run<S: StorageSource>(
                 listing_detail: None,
             });
         }
-        Look::Listing(listing) => listing,
+        Look::Listing(listing) => *listing,
     };
     if !dirty
         && !listing.bookmark.is_empty()
@@ -1437,6 +1438,12 @@ async fn run<S: StorageSource>(
     }
     let user = connector(state, config, &listing.bookmark, listing.credit.as_deref()).await?;
     source.list(state, &mut listing).await?;
+    let recorded = db.source_items(library).await.map_err(db_failed)?;
+    let protected_paths: HashSet<String> = recorded
+        .iter()
+        .filter(|item| listing.protected.contains(&item.node))
+        .map(|item| item.repository_path.clone())
+        .collect();
 
     // The library's file policies and the largest file the server takes, judged before names
     // are given, so a hidden file never pushes a shown sibling to a suffix.
@@ -1457,6 +1464,9 @@ async fn run<S: StorageSource>(
     let tree: Vec<TreeEntry> = std::mem::take(&mut listing.entries)
         .into_iter()
         .filter(|entry| {
+            if protected_paths.contains(entry.path.as_str()) {
+                return false;
+            }
             if entry.kind != EntryKind::File || below(&entry.path, folder).is_none() {
                 return true;
             }
@@ -1478,8 +1488,20 @@ async fn run<S: StorageSource>(
             true
         })
         .collect();
-    let recorded = db.source_items(library).await.map_err(db_failed)?;
-    let (shown, mut hidden) = shown_names_with_allocations(tree, folder, &recorded);
+    let (mut shown, mut hidden) = shown_names_with_allocations(tree, folder, &recorded);
+    shown.extend(
+        recorded
+            .iter()
+            .filter(|item| listing.protected.contains(&item.node))
+            .map(|item| Entry {
+                path: item.path.clone(),
+                repository_path: item.repository_path.clone(),
+                sha: item.blob_sha.clone().unwrap_or_default(),
+                size: u64::try_from(item.size).unwrap_or(0),
+                dir: item.blob_sha.is_none(),
+            }),
+    );
+    shown.sort_by(|left, right| left.path.cmp(&right.path));
     hidden.symlinks = hidden.symlinks.saturating_add(refused.symlinks);
     hidden.submodules = hidden.submodules.saturating_add(refused.submodules);
     hidden.policy = hidden.policy.saturating_add(refused.policy);
@@ -1530,6 +1552,13 @@ async fn run<S: StorageSource>(
     let mut repairs = HashSet::new();
     let mut valid_folders: HashMap<String, NodeId> = HashMap::new();
     for item in ordered {
+        if listing.protected.contains(&item.node) {
+            if item.blob_sha.is_none() {
+                valid_folders.insert(item.path.clone(), item.node);
+            }
+            known.push(item);
+            continue;
+        }
         let expected_parent = if parent_path(&item.path).is_empty() {
             Some(library)
         } else {
@@ -1555,7 +1584,17 @@ async fn run<S: StorageSource>(
             lost.push(item.node);
         }
     }
-    let mut plan = plan_with_repairs(&shown, &known, &repairs);
+    let plannable_shown: Vec<Entry> = shown
+        .iter()
+        .filter(|entry| !protected_paths.contains(&entry.repository_path))
+        .cloned()
+        .collect();
+    let plannable_known: Vec<SourceItem> = known
+        .iter()
+        .filter(|item| !listing.protected.contains(&item.node))
+        .cloned()
+        .collect();
+    let mut plan = plan_with_repairs(&plannable_shown, &plannable_known, &repairs);
     if matches!(source.content(), ContentMode::External) {
         let zero_moves: Vec<(SourceItem, Entry)> = plan
             .moves
@@ -2057,7 +2096,7 @@ async fn apply(
         fetched,
     };
     let mut counts = Counts::default();
-    let mut file_operations = 0_usize;
+    let mut applied_operations = 0_usize;
     let (gone_folders, gone_files): (Vec<SourceItem>, Vec<SourceItem>) = plan
         .remove
         .into_iter()
@@ -2071,11 +2110,13 @@ async fn apply(
     for item in gone_files {
         work.to_bin(&item).await?;
         counts.removed += 1;
-        file_operations = file_operations.saturating_add(1);
-        check_generation(state, library, generation, file_operations).await?;
+        applied_operations = applied_operations.saturating_add(1);
+        check_generation(state, library, generation, applied_operations).await?;
     }
     for entry in plan.add.iter().filter(|e| e.dir) {
         work.add_folder(entry, &mut gone_folders).await?;
+        applied_operations = applied_operations.saturating_add(1);
+        check_generation(state, library, generation, applied_operations).await?;
     }
     let mut waiting = Vec::new();
     for (item, entry) in &plan.moves {
@@ -2083,28 +2124,32 @@ async fn apply(
             waiting.push(later);
         }
         counts.moved += 1;
-        file_operations = file_operations.saturating_add(1);
-        check_generation(state, library, generation, file_operations).await?;
+        applied_operations = applied_operations.saturating_add(1);
+        check_generation(state, library, generation, applied_operations).await?;
     }
     let mut gone_folders: Vec<SourceItem> = gone_folders.into_values().collect();
     gone_folders.sort_by(|a, b| b.path.cmp(&a.path));
     for item in gone_folders {
         work.to_bin(&item).await?;
+        applied_operations = applied_operations.saturating_add(1);
+        check_generation(state, library, generation, applied_operations).await?;
     }
     for (node, entry) in waiting {
         work.final_name(node, entry).await?;
+        applied_operations = applied_operations.saturating_add(1);
+        check_generation(state, library, generation, applied_operations).await?;
     }
     for (item, entry) in &plan.change {
         work.new_version(item.node, entry).await?;
         counts.changed += 1;
-        file_operations = file_operations.saturating_add(1);
-        check_generation(state, library, generation, file_operations).await?;
+        applied_operations = applied_operations.saturating_add(1);
+        check_generation(state, library, generation, applied_operations).await?;
     }
     for entry in plan.add.iter().filter(|e| !e.dir) {
         work.add_file(entry).await?;
         counts.added += 1;
-        file_operations = file_operations.saturating_add(1);
-        check_generation(state, library, generation, file_operations).await?;
+        applied_operations = applied_operations.saturating_add(1);
+        check_generation(state, library, generation, applied_operations).await?;
     }
     Ok(counts)
 }
@@ -2113,9 +2158,9 @@ async fn check_generation(
     state: &AppState,
     library: NodeId,
     generation: i64,
-    file_operations: usize,
+    applied_operations: usize,
 ) -> Result<(), SyncError> {
-    if !file_operations.is_multiple_of(100) {
+    if !applied_operations.is_multiple_of(100) {
         return Ok(());
     }
     let current = state

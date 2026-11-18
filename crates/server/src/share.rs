@@ -1,6 +1,6 @@
 //! Read-only access to file shares and bounded directory listings.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -335,6 +335,7 @@ impl StorageSource for ShareSource {
             .await
             .map_err(|error| listing_failed(error, &settings))?;
 
+        let mut protected = HashSet::new();
         if !listed.unreadable.is_empty() {
             let known = state
                 .db()
@@ -342,16 +343,21 @@ impl StorageSource for ShareSource {
                 .await
                 .map_err(database_failed)?;
             for item in known {
-                let below_unreadable = listed.unreadable.iter().any(|folder| {
-                    item.repository_path
-                        .strip_prefix(folder)
-                        .is_some_and(|tail| tail.starts_with('/'))
+                let protected_by_unreadable = listed.unreadable.iter().any(|folder| {
+                    item.repository_path == *folder
+                        || item
+                            .repository_path
+                            .strip_prefix(folder)
+                            .is_some_and(|tail| tail.starts_with('/'))
                 });
-                if !below_unreadable
-                    || listed
-                        .entries
-                        .iter()
-                        .any(|entry| entry.path == item.repository_path)
+                if !protected_by_unreadable {
+                    continue;
+                }
+                protected.insert(item.node);
+                if listed
+                    .entries
+                    .iter()
+                    .any(|entry| entry.path == item.repository_path)
                 {
                     continue;
                 }
@@ -371,15 +377,16 @@ impl StorageSource for ShareSource {
                 .sort_by(|left, right| left.path.cmp(&right.path));
         }
 
-        Ok(Look::Listing(Listing {
+        Ok(Look::Listing(Box::new(Listing {
             entries: listed.entries,
+            protected,
             bookmark: String::new(),
             etag: None,
             credit: None,
             hidden: listed.hidden,
             took: listed.took,
             seen: (),
-        }))
+        })))
     }
 
     async fn list(

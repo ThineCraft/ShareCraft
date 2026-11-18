@@ -1,9 +1,10 @@
 //! The source-independent seam used by connected-library synchronisation.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::time::Duration;
 
+use collab_core::ids::NodeId;
 use records::{SourceConfig, SourceStatus};
 
 use crate::AppState;
@@ -44,12 +45,14 @@ pub(crate) enum ContentMode {
 /// What asking a source for its current contents found.
 pub(crate) enum Look<S> {
     Unchanged { etag: Option<String> },
-    Listing(Listing<S>),
+    Listing(Box<Listing<S>>),
 }
 
 /// A complete source listing and the source-specific state needed to fetch its content.
 pub(crate) struct Listing<S> {
     pub entries: Vec<TreeEntry>,
+    /// Tracked identities carried through because their share folder could not be read.
+    pub protected: HashSet<NodeId>,
     pub bookmark: String,
     pub etag: Option<String>,
     pub credit: Option<String>,
