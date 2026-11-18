@@ -106,7 +106,7 @@ const MESSAGES = {
   token_rejected: 'GitHub refused the token. Check that it is current and has Contents: read access to this repository.',
   branch_not_found: 'That branch was not found in the repository.',
   repository_too_large: 'That repository is too large to connect as a library.',
-  source_read_only: 'This library is kept in step with a GitHub repository, so it cannot be changed here.',
+  source_read_only: 'This library is kept in step with an outside source, so it cannot be changed here.',
   source_busy: 'An update is running. Wait for it to finish, then try again.',
   source_exists: 'This library is already connected to a repository.',
   library_not_empty: 'Only an empty library can be connected to a repository.',

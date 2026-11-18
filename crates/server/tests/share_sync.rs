@@ -492,10 +492,10 @@ async fn sync_repairs_documents_missing_after_a_batch_commit_crash() {
         .synced_at(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(60))
         .await;
     assert_eq!(repaired.added, 2);
-    for (id, editor) in file_ids
-        .iter()
-        .zip([records::Editor::GridCraft, records::Editor::PdfCraft])
-    {
+    for (id, (editor, bytes)) in file_ids.iter().zip([
+        (records::Editor::GridCraft, b"one".as_slice()),
+        (records::Editor::PdfCraft, b"two".as_slice()),
+    ]) {
         let document = db.document(DocId(*id)).await.unwrap().unwrap();
         assert_eq!(document.editor, editor);
         assert_eq!(document.revision, None);
@@ -524,7 +524,8 @@ async fn sync_repairs_documents_missing_after_a_batch_commit_crash() {
             .send()
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.bytes().await.unwrap(), bytes);
     }
     let (status, children) = call(
         &env.server,

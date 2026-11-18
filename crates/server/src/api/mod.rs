@@ -50,7 +50,10 @@ const MAX_BODY: usize = 16 * 1024;
 
 /// The `message` of `409 source_read_only`.
 const SOURCE_READ_ONLY: &str =
-    "This library is kept in step with a GitHub repository, so it cannot be changed here.";
+    "This library is kept in step with an outside source, so it cannot be changed here.";
+
+const SOURCE_COPY_UNAVAILABLE: &str = "Files in this library are read from a file share when \
+opened and cannot be copied here yet. Download the file instead.";
 
 /// The `/api` routes, to be nested under `/api`. Unknown paths answer `404 {"error":"not_found"}`
 /// and pass the same guard as the others. File content is the only thing allowed a body larger
@@ -383,6 +386,11 @@ pub(crate) enum ApiError {
     /// is created, changed, moved, copied in, deleted or restored here; administrators too.
     /// The answer's `message` says so in words.
     SourceReadOnly,
+    /// 409: the file share cannot currently supply this file. The reason is a stable public
+    /// classification and never operating-system text or a path.
+    SourceUnavailable(&'static str),
+    /// 409: Phase 1 cannot copy a file or folder out of a file-share library.
+    SourceCopyUnavailable,
     /// 422: GitHub has no such repository, or the token given (or none) cannot see it; the
     /// answer's `message` says so in words.
     RepositoryNotFound,
@@ -542,6 +550,8 @@ impl ApiError {
             ApiError::SourceExists => (StatusCode::CONFLICT, "source_exists"),
             ApiError::ShareLocationInUse => (StatusCode::CONFLICT, "share_location_in_use"),
             ApiError::SourceReadOnly => (StatusCode::CONFLICT, "source_read_only"),
+            ApiError::SourceUnavailable(_) => (StatusCode::CONFLICT, "source_unavailable"),
+            ApiError::SourceCopyUnavailable => (StatusCode::CONFLICT, "source_copy_unavailable"),
             ApiError::RepositoryNotFound => {
                 (StatusCode::UNPROCESSABLE_ENTITY, "repository_not_found")
             }
@@ -834,6 +844,14 @@ impl IntoResponse for ApiError {
             ApiError::Held(scan) => json!({ "error": code, "scan": scan }),
             ApiError::TooMany(limit) => json!({ "error": code, "limit": limit }),
             ApiError::SourceReadOnly => json!({ "error": code, "message": SOURCE_READ_ONLY }),
+            ApiError::SourceUnavailable(reason) => json!({
+                "error": code,
+                "reason": reason,
+                "message": source_unavailable_message(reason),
+            }),
+            ApiError::SourceCopyUnavailable => {
+                json!({ "error": code, "message": SOURCE_COPY_UNAVAILABLE })
+            }
             ApiError::RepositoryNotFound => json!({
                 "error": code,
                 "message": "The repository was not found, or the token cannot see it.",
@@ -857,6 +875,18 @@ impl IntoResponse for ApiError {
             _ => json!({ "error": code }),
         };
         (status, Json(body)).into_response()
+    }
+}
+
+fn source_unavailable_message(reason: &str) -> &'static str {
+    match reason {
+        "gone" => "The file is no longer available on the file share.",
+        "denied" => "The server is not allowed to read this file from the file share.",
+        "offline" => "The file share is unavailable. Try again later.",
+        "changing" => "The file changed while it was being read. Try again.",
+        "too_large" => "The file is too large to cache from the file share.",
+        "not_approved" => "The file share location is no longer approved.",
+        _ => "The file is unavailable from the file share.",
     }
 }
 
