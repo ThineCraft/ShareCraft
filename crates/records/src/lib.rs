@@ -34,6 +34,7 @@ pub mod test_support;
 mod tree;
 mod uploads;
 
+pub use ::revisions::BlobRef;
 pub use accounts::{
     AccountError, NewUser, SESSION_LIFETIME, Session, SessionToken, SignInError, SignInFailure,
     User,
