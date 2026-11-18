@@ -5,15 +5,17 @@
 //!
 //! A secret is stored as ciphertext only. The key that seals it lives outside the database.
 
-use collab_core::ids::{NodeId, UserId};
+use collab_core::ids::{DocId, NodeId, UserId};
+use serde_json::json;
 use sqlx::postgres::PgRow;
 use sqlx::{PgConnection, Postgres, QueryBuilder, Row};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use crate::events::{NewEvent, record};
 use crate::libraries::ensure_library_row;
 use crate::quotas::recompute_site_usage;
-use crate::{AccessError, Db, DbError, SharePath};
+use crate::{AccessError, Db, DbError, Editor, SharePath};
 
 /// PostgreSQL's code for a row a check constraint refuses.
 const CHECK_VIOLATION: &str = "23514";
@@ -982,7 +984,9 @@ impl Db {
     }
 
     /// Atomically records the file-share metadata for `e`. A new content tag receives a new
-    /// external revision and forgets content learned for the old tag.
+    /// external revision and forgets content learned for the old tag. If reconcile restored the
+    /// node from Git after a crashed creation batch, its missing document row is restored as an
+    /// ordinary external file in this transaction too.
     pub async fn record_external_item(
         &self,
         library: NodeId,
@@ -1031,6 +1035,34 @@ impl Db {
         .bind(modified)
         .execute(&mut *tx)
         .await?;
+        let restored: Option<(String, Option<Uuid>)> = sqlx::query_as(
+            "insert into documents (id, name, editor, created_by) \
+             select id, name, $2, created_by from nodes where id = $1 and kind = 'document' \
+             on conflict (id) do nothing returning name, created_by",
+        )
+        .bind(e.node.0)
+        .bind(Editor::Other.id())
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some((name, created_by)) = restored {
+            record(
+                &mut tx,
+                NewEvent {
+                    kind: "document.created",
+                    actor: created_by.map(UserId),
+                    subject: None,
+                    document: Some(DocId(e.node.0)),
+                    node: Some(e.node),
+                    detail: json!({
+                        "name": name,
+                        "editor": Editor::Other.id(),
+                        "uploaded": true,
+                        "bytes": e.size,
+                    }),
+                },
+            )
+            .await?;
+        }
         tx.commit().await?;
         Ok(())
     }

@@ -24,6 +24,21 @@ pub const DEFAULT_MAX_FILE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 pub const DEFAULT_GITHUB_API: &str = "https://api.github.com";
 /// Tree nodes a file-share sync creates in one Git commit and PostgreSQL transaction.
 pub const DEFAULT_SOURCE_CREATE_BATCH_SIZE: usize = 200;
+/// Largest safe file-share creation batch. This keeps allocations bounded and leaves the
+/// records layer comfortably below PostgreSQL's 65,535 bind-parameter limit.
+pub const MAX_SOURCE_CREATE_BATCH_SIZE: usize = 1_000;
+
+/// Coerces a configured file-share creation batch to the supported inclusive range 1..=1,000.
+#[must_use]
+pub const fn normalize_source_create_batch_size(value: usize) -> usize {
+    if value == 0 {
+        1
+    } else if value > MAX_SOURCE_CREATE_BATCH_SIZE {
+        MAX_SOURCE_CREATE_BATCH_SIZE
+    } else {
+        value
+    }
+}
 
 /// How the server runs.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -162,6 +177,12 @@ pub struct DeploymentValues<'a> {
 }
 
 impl Config {
+    /// The configured file-share creation batch, normalized to the documented safe range.
+    #[must_use]
+    pub(crate) const fn normalized_source_create_batch_size(&self) -> usize {
+        normalize_source_create_batch_size(self.source_create_batch_size)
+    }
+
     /// Reads `SHARECRAFT_ADDR`, `SHARECRAFT_DATA`, `SHARECRAFT_WEB`, `SHARECRAFT_EDITORS_DIR` and
     /// `SHARECRAFT_MAX_FILE_BYTES` and `SHARECRAFT_GITHUB_API`, using the defaults for any that
     /// are unset, and `DATABASE_URL`, which is required.
@@ -382,6 +403,14 @@ mod tests {
         assert_eq!(c.max_file_bytes, 10 * 1024 * 1024 * 1024);
         assert_eq!(c.github_api, "https://api.github.com");
         assert_eq!(c.source_create_batch_size, DEFAULT_SOURCE_CREATE_BATCH_SIZE);
+    }
+
+    #[test]
+    fn source_create_batch_size_is_normalized_to_the_safe_range() {
+        assert_eq!(normalize_source_create_batch_size(0), 1);
+        assert_eq!(normalize_source_create_batch_size(1), 1);
+        assert_eq!(normalize_source_create_batch_size(1_000_000), 1_000);
+        assert_eq!(normalize_source_create_batch_size(usize::MAX), 1_000);
     }
 
     #[test]

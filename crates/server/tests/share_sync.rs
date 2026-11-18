@@ -276,6 +276,119 @@ async fn batch_database_failure_is_atomic_and_the_next_sync_repairs_it() {
 }
 
 #[tokio::test]
+async fn folder_only_batch_database_failure_takes_back_the_whole_batch() {
+    let env = Env::new().await;
+    for number in 0..300 {
+        env.fake.put(&format!("folder-{number:03}/file.txt"), b"x");
+    }
+    sqlx::query(
+        "create function fail_share_folder_batch() returns trigger language plpgsql as $$ \
+         begin if new.name = 'folder-150' then raise exception 'injected folder failure'; \
+         end if; return new; end $$",
+    )
+    .execute(env.server.records_db().test_pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "create trigger fail_share_folder_batch before insert or update on nodes \
+         for each row execute function fail_share_folder_batch()",
+    )
+    .execute(env.server.records_db().test_pool())
+    .await
+    .unwrap();
+
+    assert!(matches!(
+        env.sync_at(OffsetDateTime::UNIX_EPOCH).await,
+        Err(SyncError::Failed(_))
+    ));
+    assert!(
+        env.server
+            .records_db()
+            .source_items(env.library)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        env.server
+            .records_db()
+            .live_child_names(env.library)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn a_folder_replaced_by_a_file_is_added_after_the_folder_is_binned() {
+    let env = Env::new().await;
+    env.fake.put("docs/old.txt", b"old");
+    env.synced_at(OffsetDateTime::UNIX_EPOCH).await;
+    let old_folder = env.item("docs").await.node;
+
+    env.fake.remove("docs");
+    env.fake.put("docs", b"now a file");
+    assert!(matches!(
+        env.sync_at(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(60))
+            .await,
+        Err(SyncError::Failed(_))
+    ));
+    let report = env
+        .synced_at(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(120))
+        .await;
+
+    assert_eq!(report.added, 1);
+    assert!(env.in_bin(old_folder).await);
+    let replacement = env.item("docs").await;
+    assert_ne!(replacement.node, old_folder);
+    assert!(replacement.blob_sha.is_some());
+}
+
+#[tokio::test]
+async fn generation_change_during_adoption_stops_at_the_batch_boundary() {
+    let env = Env::new_with_batch(50).await;
+    for number in 0..120 {
+        env.fake.put(&format!("file-{number:03}.txt"), b"x");
+    }
+    env.synced_at(OffsetDateTime::UNIX_EPOCH).await;
+    sqlx::query("delete from source_items where library_id = $1")
+        .bind(env.library.0)
+        .execute(env.server.records_db().test_pool())
+        .await
+        .unwrap();
+    sqlx::query(
+        "create function bump_generation_during_adoption() returns trigger language plpgsql as $$ \
+         begin update library_sources set generation = generation + 1 \
+         where library_id = new.library_id; return new; end $$",
+    )
+    .execute(env.server.records_db().test_pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "create trigger bump_generation_during_adoption after insert on source_items \
+         for each row execute function bump_generation_during_adoption()",
+    )
+    .execute(env.server.records_db().test_pool())
+    .await
+    .unwrap();
+
+    assert!(matches!(
+        env.sync_at(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(60))
+            .await,
+        Err(SyncError::Failed(_))
+    ));
+    assert_eq!(
+        env.server
+            .records_db()
+            .source_items(env.library)
+            .await
+            .unwrap()
+            .len(),
+        50
+    );
+}
+
+#[tokio::test]
 async fn reconcile_rebuilds_the_batch_created_tree_from_git() {
     let env = Env::new().await;
     env.fake.put("parent/first.txt", b"one");
@@ -317,6 +430,124 @@ async fn reconcile_rebuilds_the_batch_created_tree_from_git() {
         assert_eq!(actual.parent, expected.parent);
         assert_eq!(actual.kind, expected.kind);
     }
+}
+
+#[tokio::test]
+async fn sync_repairs_documents_missing_after_a_batch_commit_crash() {
+    let env = Env::new().await;
+    env.fake.put("parent/first.xlsx", b"one");
+    env.fake.put("parent/second.pdf", b"two");
+    env.synced_at(OffsetDateTime::UNIX_EPOCH).await;
+    let folder = env.item("parent").await;
+    let files = [
+        env.item("parent/first.xlsx").await,
+        env.item("parent/second.pdf").await,
+    ];
+    let file_ids: Vec<_> = files.iter().map(|item| item.node.0).collect();
+    let all_ids = vec![folder.node.0, file_ids[0], file_ids[1]];
+    let db = env.server.records_db();
+    let site = db.node(env.library).await.unwrap().unwrap().site;
+    let usage = db.site_usage(site).await.unwrap();
+
+    // Model a process loss after Git committed but before the PostgreSQL mirror committed.
+    sqlx::query("delete from source_items where node_id = any($1)")
+        .bind(&all_ids)
+        .execute(db.test_pool())
+        .await
+        .unwrap();
+    sqlx::query(
+        "update library_sources set etag = null, last_commit = null, last_checked_at = null \
+         where library_id = $1",
+    )
+    .bind(env.library.0)
+    .execute(db.test_pool())
+    .await
+    .unwrap();
+    sqlx::query("delete from events where node_id = any($1)")
+        .bind(&all_ids)
+        .execute(db.test_pool())
+        .await
+        .unwrap();
+    sqlx::query("delete from documents where id = any($1)")
+        .bind(&file_ids)
+        .execute(db.test_pool())
+        .await
+        .unwrap();
+    sqlx::query("delete from nodes where id = any($1)")
+        .bind(&all_ids)
+        .execute(db.test_pool())
+        .await
+        .unwrap();
+
+    let reconciled = server::tree::reconcile(Arc::new(env.server.store()), &db)
+        .await
+        .unwrap();
+    assert_eq!(reconciled.updated, 3);
+    assert!(reconciled.failed.is_empty(), "{:?}", reconciled.failed);
+    for id in &file_ids {
+        assert_eq!(db.document(DocId(*id)).await.unwrap(), None);
+    }
+
+    let repaired = env
+        .synced_at(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(60))
+        .await;
+    assert_eq!(repaired.added, 2);
+    for id in &file_ids {
+        let document = db.document(DocId(*id)).await.unwrap().unwrap();
+        assert_eq!(document.editor, records::Editor::Other);
+        assert_eq!(document.revision, None);
+        let external = db.external_item(NodeId(*id)).await.unwrap().unwrap();
+        assert_eq!(external.revision.len(), 40);
+        assert!(
+            external
+                .revision
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        );
+
+        let (status, _) = call(
+            &env.server,
+            &env.admin,
+            Method::GET,
+            &format!("/api/docs/{id}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let response = env
+            .server
+            .http(Some(&env.admin))
+            .get(env.server.url(&format!("/api/docs/{id}/content")))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+    let (status, children) = call(
+        &env.server,
+        &env.admin,
+        Method::GET,
+        &format!("/api/nodes/{}/children", folder.node.0),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(children["items"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        db.events_of_kind("document.created").await.unwrap().len(),
+        2
+    );
+    assert_eq!(db.site_usage(site).await.unwrap(), usage);
+
+    assert_eq!(
+        env.sync_at(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(120))
+            .await,
+        Ok(None)
+    );
+    assert_eq!(
+        db.events_of_kind("document.created").await.unwrap().len(),
+        2
+    );
 }
 
 #[tokio::test]
@@ -1113,7 +1344,7 @@ async fn github_sync_is_unaffected() {
 #[ignore = "task-card performance measurement"]
 async fn measure_first_listing_of_2000_files() {
     // Exercise the configurable large-listing batch while the production default remains 200.
-    let env = Env::new_with_batch(500).await;
+    let env = Env::new_with_batch(1_000).await;
     env.server
         .records_db()
         .set_setting(env.admin.id, SOURCE_MAX_FILES, json!(2_100))

@@ -333,38 +333,46 @@ async fn insert_nodes_bulk(conn: &mut PgConnection, rows: &[NodeRow]) -> Result<
         return Ok(());
     }
     let normalized: Vec<NodeRow> = rows.iter().map(NodeRow::normalized).collect();
-    let mut query = QueryBuilder::<Postgres>::new(
-        "insert into nodes \
-         (id, kind, parent_id, site_id, name, unique_scope, deleted_at, deleted_by, \
-          created_by, created_at, deleted_with, bin_stage, purged_at) ",
-    );
-    query.push_values(&normalized, |mut values, row| {
-        values
-            .push_bind(row.id.0)
-            .push_bind(row.kind.as_str())
-            .push_bind(row.parent.map(|parent| parent.0))
-            .push_bind(row.site.0)
-            .push_bind(&row.name)
-            .push_bind(false)
-            .push_bind(row.deleted_at)
-            .push_bind(row.deleted_by.map(|user| user.0))
-            .push_bind(row.created_by.map(|user| user.0))
-            .push_bind(row.created_at)
-            .push_bind(row.deleted_with.map(|node| node.0))
-            .push_bind(row.bin_stage)
-            .push_bind(row.purged_at);
-    });
-    match query.build().execute(conn).await {
-        Ok(_) => Ok(()),
-        Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some(UNIQUE_VIOLATION) => {
-            if error.constraint() == Some("nodes_pkey") {
-                Err(AccessError::Exists)
-            } else {
-                Err(AccessError::NameTaken)
+    // Each row binds 13 values. Five thousand leaves headroom below PostgreSQL's 65,535
+    // parameter ceiling even if the statement gains a few fixed binds later.
+    const ROWS_PER_INSERT: usize = 5_000;
+    for rows in normalized.chunks(ROWS_PER_INSERT) {
+        let mut query = QueryBuilder::<Postgres>::new(
+            "insert into nodes \
+             (id, kind, parent_id, site_id, name, unique_scope, deleted_at, deleted_by, \
+              created_by, created_at, deleted_with, bin_stage, purged_at) ",
+        );
+        query.push_values(rows, |mut values, row| {
+            values
+                .push_bind(row.id.0)
+                .push_bind(row.kind.as_str())
+                .push_bind(row.parent.map(|parent| parent.0))
+                .push_bind(row.site.0)
+                .push_bind(&row.name)
+                .push_bind(false)
+                .push_bind(row.deleted_at)
+                .push_bind(row.deleted_by.map(|user| user.0))
+                .push_bind(row.created_by.map(|user| user.0))
+                .push_bind(row.created_at)
+                .push_bind(row.deleted_with.map(|node| node.0))
+                .push_bind(row.bin_stage)
+                .push_bind(row.purged_at);
+        });
+        match query.build().execute(&mut *conn).await {
+            Ok(_) => {}
+            Err(sqlx::Error::Database(error))
+                if error.code().as_deref() == Some(UNIQUE_VIOLATION) =>
+            {
+                return if error.constraint() == Some("nodes_pkey") {
+                    Err(AccessError::Exists)
+                } else {
+                    Err(AccessError::NameTaken)
+                };
             }
+            Err(error) => return Err(error.into()),
         }
-        Err(error) => Err(error.into()),
     }
+    Ok(())
 }
 
 /// The live links a tree change revokes because it deletes their item or a node above it, each

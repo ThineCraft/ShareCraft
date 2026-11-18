@@ -2115,6 +2115,28 @@ async fn apply(
         check_generation(state, library, generation, applied_operations).await?;
     }
     if matches!(mode, ContentMode::External) {
+        // A file replacing a folder needs that folder's name freed before the combined batch is
+        // created. Other gone folders stay until after moves, preserving the existing ordering.
+        let file_add_paths: HashSet<&str> = plan
+            .add
+            .iter()
+            .filter(|entry| !entry.dir)
+            .map(|entry| entry.path.as_str())
+            .collect();
+        let replaced_folders: Vec<NodeId> = gone_folders
+            .iter()
+            .filter(|(_, item)| file_add_paths.contains(item.path.as_str()))
+            .map(|(node, _)| *node)
+            .collect();
+        for node in replaced_folders {
+            let Some(item) = gone_folders.remove(&node) else {
+                continue;
+            };
+            work.to_bin(&item).await?;
+            work.folders.remove(&item.path);
+            applied_operations = applied_operations.saturating_add(1);
+            check_generation(state, library, generation, applied_operations).await?;
+        }
         let adds: Vec<&Entry> = plan
             .add
             .iter()
@@ -2125,7 +2147,7 @@ async fn apply(
             .add_external_batches(
                 &adds,
                 &mut gone_folders,
-                state.config().source_create_batch_size.max(1),
+                state.config().normalized_source_create_batch_size(),
                 generation,
             )
             .await?;
@@ -2235,6 +2257,7 @@ impl Applying<'_> {
     ) -> Result<usize, SyncError> {
         let mut batch = Vec::with_capacity(batch_size);
         let mut added_files = 0_usize;
+        let mut adopted_since_check = 0_usize;
         let mut children: HashMap<NodeId, HashMap<String, Option<Node>>> = HashMap::new();
         let mut git_ids = tree::external_tree_ids(self.state).await.map_err(|e| {
             eprintln!("sharecraft-server: sync could not read the content tree: {e:?}");
@@ -2267,6 +2290,11 @@ impl Applying<'_> {
                     {
                         self.record(node.id, entry).await?;
                         self.folders.insert(entry.path.clone(), node.id);
+                        adopted_since_check = adopted_since_check.saturating_add(1);
+                        if adopted_since_check == batch_size {
+                            self.ensure_external_generation(generation).await?;
+                            adopted_since_check = 0;
+                        }
                         continue;
                     }
                     Some(node)
@@ -2284,6 +2312,11 @@ impl Applying<'_> {
                         }
                         self.record(node.id, entry).await?;
                         self.folders.insert(entry.path.clone(), node.id);
+                        adopted_since_check = adopted_since_check.saturating_add(1);
+                        if adopted_since_check == batch_size {
+                            self.ensure_external_generation(generation).await?;
+                            adopted_since_check = 0;
+                        }
                         continue;
                     }
                     Some(_) => return Err(taken(&entry.path)),
@@ -2296,6 +2329,11 @@ impl Applying<'_> {
                     {
                         self.record(node.id, entry).await?;
                         added_files = added_files.saturating_add(1);
+                        adopted_since_check = adopted_since_check.saturating_add(1);
+                        if adopted_since_check == batch_size {
+                            self.ensure_external_generation(generation).await?;
+                            adopted_since_check = 0;
+                        }
                         continue;
                     }
                     Some(_) => return Err(taken(&entry.path)),
@@ -2333,6 +2371,9 @@ impl Applying<'_> {
             self.commit_external_batch(&batch, generation, &git_ids)
                 .await?;
         }
+        if adopted_since_check > 0 {
+            self.ensure_external_generation(generation).await?;
+        }
         Ok(added_files)
     }
 
@@ -2348,6 +2389,10 @@ impl Applying<'_> {
                 eprintln!("sharecraft-server: sync could not add a file-share batch: {e:?}");
                 failed("A batch of file-share items could not be added, so the sync stopped.")
             })?;
+        self.ensure_external_generation(generation).await
+    }
+
+    async fn ensure_external_generation(&self, generation: i64) -> Result<(), SyncError> {
         let current = self
             .state
             .db()

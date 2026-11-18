@@ -1612,9 +1612,15 @@ async fn commit(
                 return Err(AccessError::Db(error));
             }
             // Git does not hold a new file's editor: new files are taken back.
-            let taken_back =
+            // An external creation batch is one logical operation even when it contains only
+            // folders. Never repair part of a refused batch node by node: remove the whole Git
+            // batch, leaving the next listing to retry it atomically.
+            let taken_back = if plan.external_library.is_some() {
+                take_back_all(state, author.clone(), &plan.message, undo).await
+            } else {
                 (plan.document.is_none() && plan.copies.is_empty() && plan.documents.is_empty())
-                    || take_back_all(state, author.clone(), &plan.message, undo).await;
+                    || take_back_all(state, author.clone(), &plan.message, undo).await
+            };
             let ids: Vec<Uuid> = plan
                 .records
                 .iter()
