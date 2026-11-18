@@ -446,7 +446,7 @@ impl Db {
              join documents d on d.id = n.id \
              left join source_items si on si.node_id = n.id \
              join nodes lib on lib.id = b.library_id \
-             where n.kind = 'document' and d.revision is not null \
+             where n.kind = 'document' and coalesce(d.revision, si.revision) is not null \
              order by lower(n.name), n.id",
         )
         .bind(site.0)

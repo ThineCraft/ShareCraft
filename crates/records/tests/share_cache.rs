@@ -267,6 +267,54 @@ async fn coldest_cached_orders_by_last_use_and_touch_moves_an_entry_back() {
 }
 
 #[tokio::test]
+async fn pinning_cached_content_with_an_older_time_does_not_move_last_use_backwards() {
+    let test = TestDb::create().await;
+    let zero = OffsetDateTime::UNIX_EPOCH;
+    let peer = BlobRef::of(b"peer pin");
+    let reused = BlobRef::of(b"reused pin");
+    test.db
+        .pin_cached(&peer, zero + Duration::hours(2))
+        .await
+        .unwrap();
+    test.db
+        .pin_cached(&reused, zero + Duration::hours(3))
+        .await
+        .unwrap();
+
+    test.db
+        .pin_cached(&reused, zero + Duration::hours(1))
+        .await
+        .unwrap();
+
+    assert_eq!(test.db.coldest_cached(2).await.unwrap(), vec![peer, reused]);
+}
+
+#[tokio::test]
+async fn an_older_touch_does_not_move_last_use_backwards() {
+    let test = TestDb::create().await;
+    let zero = OffsetDateTime::UNIX_EPOCH;
+    let peer = BlobRef::of(b"peer touch");
+    let reused = BlobRef::of(b"reused touch");
+    test.db
+        .pin_cached(&peer, zero + Duration::hours(2))
+        .await
+        .unwrap();
+    test.db
+        .pin_cached(&reused, zero + Duration::hours(3))
+        .await
+        .unwrap();
+
+    assert!(
+        test.db
+            .touch_cached(&reused.sha256, zero + Duration::hours(1))
+            .await
+            .unwrap()
+    );
+
+    assert_eq!(test.db.coldest_cached(2).await.unwrap(), vec![peer, reused]);
+}
+
+#[tokio::test]
 async fn cached_bytes_sums_sizes() {
     let test = TestDb::create().await;
     let first = BlobRef::of(b"1234");
@@ -377,4 +425,32 @@ async fn an_ordinary_never_saved_file_still_lists_without_a_time() {
         .find(|item| item.node.id == doc.into())
         .unwrap();
     assert_eq!(listed.revised_at, None);
+}
+
+#[tokio::test]
+async fn an_external_file_in_a_template_library_is_listed() {
+    let fixture = share_fixture().await;
+    sqlx::query("update libraries set kind = 'template' where id = $1")
+        .bind(fixture.library.0)
+        .execute(fixture.test.db.test_pool())
+        .await
+        .unwrap();
+    let modified = OffsetDateTime::UNIX_EPOCH + Duration::days(30);
+    let blob = BlobRef::of(b"external template");
+    let external = external_document(&fixture, "External.txt", &blob, modified).await;
+    document_in(
+        &fixture.test,
+        fixture.owner,
+        fixture.library,
+        fixture.site,
+        "Ordinary draft.txt",
+    )
+    .await;
+
+    let files = fixture.test.db.template_files(fixture.site).await.unwrap();
+
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].id, external);
+    assert_eq!(files[0].name, "External.txt");
+    assert_eq!(files[0].revised_at, Some(modified));
 }

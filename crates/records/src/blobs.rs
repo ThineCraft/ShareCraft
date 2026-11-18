@@ -117,7 +117,7 @@ impl Db {
         sqlx::query(
             "insert into source_cache (sha256, size, last_used_at) values ($1, $2, $3) \
              on conflict (sha256) do update set size = excluded.size, \
-                 last_used_at = excluded.last_used_at",
+                 last_used_at = greatest(source_cache.last_used_at, excluded.last_used_at)",
         )
         .bind(blob.hex())
         .bind(size_of(blob))
@@ -134,11 +134,14 @@ impl Db {
         sha256: &[u8; 32],
         now: OffsetDateTime,
     ) -> Result<bool, DbError> {
-        let done = sqlx::query("update source_cache set last_used_at = $2 where sha256 = $1")
-            .bind(hex(sha256))
-            .bind(now)
-            .execute(self.pool())
-            .await?;
+        let done = sqlx::query(
+            "update source_cache set last_used_at = greatest(source_cache.last_used_at, $2) \
+             where sha256 = $1",
+        )
+        .bind(hex(sha256))
+        .bind(now)
+        .execute(self.pool())
+        .await?;
         Ok(done.rows_affected() > 0)
     }
 
