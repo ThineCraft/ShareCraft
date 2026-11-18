@@ -3,6 +3,7 @@
 use std::io::{self, ErrorKind};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::mpsc;
 use std::time::Duration;
 
 use collab_core::ids::{DocId, NodeId};
@@ -21,6 +22,7 @@ pub const SHARE_READS: usize = 4;
 pub const READ_WAIT: Duration = Duration::from_secs(20);
 pub const SCAN_WAIT: Duration = Duration::from_secs(20);
 pub const STAT_WAIT: Duration = Duration::from_secs(5);
+pub const OPERATION_WAIT: Duration = Duration::from_secs(30);
 pub const OFFLINE_FOR: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,15 +59,64 @@ struct ReadLease {
 }
 
 struct LeaseReader {
-    inner: Box<dyn io::Read + Send>,
-    _lease: Arc<ReadLease>,
+    requests: mpsc::Sender<ReadRequest>,
+    timeout: Duration,
 }
 
 impl io::Read for LeaseReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.inner
-            .read(buf)
-            .map_err(|error| io::Error::new(error.kind(), ShareReaderError(error)))
+        let (reply, answer) = mpsc::sync_channel(1);
+        self.requests
+            .send(ReadRequest {
+                length: buf.len(),
+                reply,
+            })
+            .map_err(|_| io::Error::other("file share reader stopped"))?;
+        match answer.recv_timeout(self.timeout) {
+            Ok(Ok(bytes)) => {
+                let length = bytes.len();
+                buf.get_mut(..length)
+                    .ok_or_else(|| io::Error::other("file share reader returned too much"))?
+                    .copy_from_slice(&bytes);
+                Ok(length)
+            }
+            Ok(Err(error)) => Err(io::Error::new(error.kind(), ShareReaderError(error))),
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(io::Error::new(
+                ErrorKind::TimedOut,
+                ShareReaderError(io::Error::new(
+                    ErrorKind::TimedOut,
+                    "file share read timed out",
+                )),
+            )),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err(io::Error::other("file share reader stopped"))
+            }
+        }
+    }
+}
+
+struct ReadRequest {
+    length: usize,
+    reply: mpsc::SyncSender<io::Result<Vec<u8>>>,
+}
+
+impl LeaseReader {
+    fn new(mut inner: Box<dyn io::Read + Send>, lease: Arc<ReadLease>, timeout: Duration) -> Self {
+        let (requests, work) = mpsc::channel::<ReadRequest>();
+        tokio::task::spawn_blocking(move || {
+            let _lease = lease;
+            while let Ok(request) = work.recv() {
+                let mut bytes = vec![0; request.length];
+                let result = inner.read(&mut bytes).map(|length| {
+                    bytes.truncate(length);
+                    bytes
+                });
+                if request.reply.send(result).is_err() {
+                    break;
+                }
+            }
+        });
+        Self { requests, timeout }
     }
 }
 
@@ -168,12 +219,14 @@ pub async fn materialise(state: &AppState, node: NodeId) -> Result<Option<Ready>
     });
 
     let mut attempt = 0;
+    let mut cas_retried = false;
     let (held, old_hash) = loop {
         match canonical(
             Arc::clone(&fs),
             root_path.clone(),
             file_path.clone(),
             Some(Arc::clone(&lease)),
+            state.shares().operation_timeout(),
         )
         .await
         {
@@ -257,6 +310,7 @@ pub async fn materialise(state: &AppState, node: NodeId) -> Result<Option<Ready>
             root_path.clone(),
             file_path.clone(),
             Some(Arc::clone(&lease)),
+            state.shares().operation_timeout(),
         )
         .await
         {
@@ -284,10 +338,11 @@ pub async fn materialise(state: &AppState, node: NodeId) -> Result<Option<Ready>
             }
             Err(FsError::Failed) => return Err(ExternalError::Failed),
         };
-        let reader = Box::new(LeaseReader {
-            inner: reader,
-            _lease: Arc::clone(&lease),
-        });
+        let reader = Box::new(LeaseReader::new(
+            reader,
+            Arc::clone(&lease),
+            state.shares().operation_timeout(),
+        ));
         let held = match state.blobs().write_reader(reader, before.size).await {
             Ok(held) => held,
             Err(BlobError::TooLarge { .. }) if attempt == 0 => {
@@ -319,33 +374,52 @@ pub async fn materialise(state: &AppState, node: NodeId) -> Result<Option<Ready>
             || after.kind != FsKind::File
             || after.size != before.size
             || after.mtime_ns != before.mtime_ns;
-        if !torn {
+        if torn {
+            discard(state, held).await;
+            if attempt == 1 {
+                return Err(ExternalError::Changing);
+            }
+            attempt += 1;
+            continue;
+        }
+
+        let blob = held.blob();
+        let now = OffsetDateTime::now_utc();
+        state
+            .db()
+            .pin_cached(&blob, now)
+            .await
+            .map_err(database_failed)?;
+        state.blobs().claimed().notify_one();
+        if let Some(revision) = state
+            .db()
+            .set_external_content(node, &item.tag, &blob.sha256, now)
+            .await
+            .map_err(database_failed)?
+        {
+            item.revision = revision;
             break (held, old_hash);
         }
+
         discard(state, held).await;
-        if attempt == 1 {
+        state.sources().wake(item.library);
+        if cas_retried {
             return Err(ExternalError::Changing);
         }
-        attempt += 1;
+        cas_retried = true;
+        let approved = approved_item(state, node)
+            .await?
+            .ok_or(ExternalError::Gone)?;
+        remembered_refusal(&approved.item)?;
+        item = approved.item;
+        root_path = approved.root_path;
+        file_path = approved.file_path;
+        cache_max = approved.cache_max;
     };
     drop(lease);
 
     let blob = held.blob();
-    let now = OffsetDateTime::now_utc();
-    state
-        .db()
-        .pin_cached(&blob, now)
-        .await
-        .map_err(database_failed)?;
-    state.blobs().claimed().notify_one();
-    let recorded = state
-        .db()
-        .set_external_content(node, &item.tag, &blob.sha256, now)
-        .await
-        .map_err(database_failed)?;
-    if !recorded {
-        state.sources().wake(item.library);
-    } else if old_hash.is_some_and(|old| old != blob.sha256) {
+    if old_hash.is_some_and(|old| old != blob.sha256) {
         eprintln!(
             "sharecraft-server: share content changed without a new stat for node {}",
             node.0
@@ -620,17 +694,20 @@ async fn canonical(
     root: PathBuf,
     file: PathBuf,
     hold: Option<Arc<ReadLease>>,
+    timeout: Duration,
 ) -> Result<PathBuf, FsError> {
-    tokio::task::spawn_blocking(move || {
+    let task = tokio::task::spawn_blocking(move || {
         let _hold = hold;
         fs.canonical(&root, &file)
-    })
-    .await
-    .map_err(|error| {
-        eprintln!("sharecraft-server: share canonical task failed: {error}");
-        FsError::Failed
-    })?
-    .map_err(|error| classify(&error))
+    });
+    match tokio::time::timeout(timeout, task).await {
+        Ok(Ok(result)) => result.map_err(|error| classify(&error)),
+        Ok(Err(error)) => {
+            eprintln!("sharecraft-server: share canonical task failed: {error}");
+            Err(FsError::Failed)
+        }
+        Err(_) => Err(FsError::Offline),
+    }
 }
 
 async fn open(
@@ -638,17 +715,20 @@ async fn open(
     root: PathBuf,
     file: PathBuf,
     hold: Option<Arc<ReadLease>>,
+    timeout: Duration,
 ) -> Result<Box<dyn io::Read + Send>, FsError> {
-    tokio::task::spawn_blocking(move || {
+    let task = tokio::task::spawn_blocking(move || {
         let _hold = hold;
         fs.open(&root, &file)
-    })
-    .await
-    .map_err(|error| {
-        eprintln!("sharecraft-server: share open task failed: {error}");
-        FsError::Failed
-    })?
-    .map_err(|error| classify(&error))
+    });
+    match tokio::time::timeout(timeout, task).await {
+        Ok(Ok(result)) => result.map_err(|error| classify(&error)),
+        Ok(Err(error)) => {
+            eprintln!("sharecraft-server: share open task failed: {error}");
+            Err(FsError::Failed)
+        }
+        Err(_) => Err(FsError::Offline),
+    }
 }
 
 fn classify(error: &io::Error) -> FsError {

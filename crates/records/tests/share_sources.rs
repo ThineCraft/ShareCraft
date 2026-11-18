@@ -358,6 +358,7 @@ async fn a_changed_tag_clears_the_hash_and_makes_a_new_revision_and_an_unchanged
             .set_external_content(node, &first_tag, &[7; 32], OffsetDateTime::UNIX_EPOCH)
             .await
             .unwrap()
+            .is_some()
     );
     let with_content = f.test.db.external_item(node).await.unwrap().unwrap();
 
@@ -402,11 +403,12 @@ async fn set_external_content_is_refused_when_the_tag_moved() {
     f.test.db.record_external_item(f.library, &e).await.unwrap();
 
     assert!(
-        !f.test
+        f.test
             .db
             .set_external_content(node, "x99-99", &[9; 32], OffsetDateTime::UNIX_EPOCH)
             .await
             .unwrap()
+            .is_none()
     );
     let item = f.test.db.external_item(node).await.unwrap().unwrap();
     assert_eq!(item.tag, external_tag(e.size, e.mtime_ns));

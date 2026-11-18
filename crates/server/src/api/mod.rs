@@ -550,6 +550,9 @@ impl ApiError {
             ApiError::SourceExists => (StatusCode::CONFLICT, "source_exists"),
             ApiError::ShareLocationInUse => (StatusCode::CONFLICT, "share_location_in_use"),
             ApiError::SourceReadOnly => (StatusCode::CONFLICT, "source_read_only"),
+            ApiError::SourceUnavailable("offline") => {
+                (StatusCode::SERVICE_UNAVAILABLE, "source_unavailable")
+            }
             ApiError::SourceUnavailable(_) => (StatusCode::CONFLICT, "source_unavailable"),
             ApiError::SourceCopyUnavailable => (StatusCode::CONFLICT, "source_copy_unavailable"),
             ApiError::RepositoryNotFound => {

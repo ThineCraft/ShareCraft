@@ -1119,25 +1119,30 @@ impl Db {
         .map_err(DbError::from)
     }
 
-    /// Records materialised content only if `tag` is still the item's current tag.
+    /// Records materialised content only if `tag` is still the item's current tag, returning its
+    /// revision. Content that changed without a new tag atomically receives a new revision.
     pub async fn set_external_content(
         &self,
         node: NodeId,
         tag: &str,
         sha256: &[u8; 32],
         at: OffsetDateTime,
-    ) -> Result<bool, DbError> {
-        let done = sqlx::query(
-            "update source_items set content_sha256 = $3, read_at = $4, unavailable = null \
-             where node_id = $1 and blob_sha = $2",
+    ) -> Result<Option<String>, DbError> {
+        let revision = sqlx::query_scalar(
+            "update source_items set \
+                 revision = case when content_sha256 is not null and content_sha256 <> $3 \
+                                 then $5 else revision end, \
+                 content_sha256 = $3, read_at = $4, unavailable = null \
+             where node_id = $1 and blob_sha = $2 returning revision",
         )
         .bind(node.0)
         .bind(tag)
         .bind(encode_sha256(sha256))
         .bind(at)
-        .execute(self.pool())
+        .bind(new_external_revision())
+        .fetch_optional(self.pool())
         .await?;
-        Ok(done.rows_affected() > 0)
+        Ok(revision)
     }
 
     /// Moves an external item's stat and revision only if `old_tag` is still current.

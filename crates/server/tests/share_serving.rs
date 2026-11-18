@@ -389,9 +389,14 @@ async fn an_infected_file_is_423_everywhere_and_listed_as_quarantined() {
     assert_eq!(page["items"][0]["scan"], "quarantined");
 }
 
-async fn assert_source_unavailable(env: Env, path: &str, reason: &str) {
+async fn assert_source_unavailable_status(
+    env: Env,
+    path: &str,
+    reason: &str,
+    expected: StatusCode,
+) {
     let (status, body) = body_json(env.download(&env.viewer, path).await).await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(status, expected, "{body}");
     assert_eq!(body["error"], "source_unavailable");
     assert_eq!(body["reason"], reason);
     assert!(
@@ -399,6 +404,10 @@ async fn assert_source_unavailable(env: Env, path: &str, reason: &str) {
             .as_str()
             .is_some_and(|message| !message.contains(ROOT))
     );
+}
+
+async fn assert_source_unavailable(env: Env, path: &str, reason: &str) {
+    assert_source_unavailable_status(env, path, reason, StatusCode::CONFLICT).await;
 }
 
 #[tokio::test]
@@ -416,10 +425,16 @@ async fn a_denied_file_is_409_source_unavailable_denied() {
 }
 
 #[tokio::test]
-async fn an_uncached_offline_file_is_409_source_unavailable_offline() {
+async fn an_uncached_offline_file_is_503_source_unavailable_offline() {
     let env = Env::new(&[("offline.txt", b"offline", 1)]).await;
     env.fake.offline(true);
-    assert_source_unavailable(env, "offline.txt", "offline").await;
+    assert_source_unavailable_status(
+        env,
+        "offline.txt",
+        "offline",
+        StatusCode::SERVICE_UNAVAILABLE,
+    )
+    .await;
 }
 
 #[tokio::test]

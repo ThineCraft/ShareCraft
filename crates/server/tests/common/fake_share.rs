@@ -21,6 +21,8 @@ struct Inner {
     denied: Mutex<HashSet<PathBuf>>,
     offline: AtomicBool,
     slow_open: Mutex<HashMap<PathBuf, Duration>>,
+    slow_read: Mutex<HashMap<PathBuf, Duration>>,
+    slow_stat: Mutex<HashMap<PathBuf, Duration>>,
     slow_list: Mutex<Duration>,
     vanish_on_open: Mutex<HashSet<PathBuf>>,
     change_during_read: Mutex<HashMap<PathBuf, VecDeque<Vec<u8>>>>,
@@ -33,6 +35,10 @@ struct Inner {
     stats: AtomicUsize,
     opens: Mutex<HashMap<PathBuf, usize>>,
     open_started: AtomicUsize,
+    active_opens: AtomicUsize,
+    maximum_active_opens: AtomicUsize,
+    read_started: AtomicUsize,
+    stat_delayed: AtomicUsize,
     opened_paths: Mutex<Vec<PathBuf>>,
 }
 
@@ -61,6 +67,8 @@ impl FakeShare {
                 denied: Mutex::new(HashSet::new()),
                 offline: AtomicBool::new(false),
                 slow_open: Mutex::new(HashMap::new()),
+                slow_read: Mutex::new(HashMap::new()),
+                slow_stat: Mutex::new(HashMap::new()),
                 slow_list: Mutex::new(Duration::ZERO),
                 vanish_on_open: Mutex::new(HashSet::new()),
                 change_during_read: Mutex::new(HashMap::new()),
@@ -73,6 +81,10 @@ impl FakeShare {
                 stats: AtomicUsize::new(0),
                 opens: Mutex::new(HashMap::new()),
                 open_started: AtomicUsize::new(0),
+                active_opens: AtomicUsize::new(0),
+                maximum_active_opens: AtomicUsize::new(0),
+                read_started: AtomicUsize::new(0),
+                stat_delayed: AtomicUsize::new(0),
                 opened_paths: Mutex::new(Vec::new()),
             }),
         }
@@ -175,6 +187,34 @@ impl FakeShare {
 
     pub fn slow_open(&self, path: &str, duration: Duration) {
         self.slow_opens().insert(self.path(path), duration);
+    }
+
+    pub fn slow_read(&self, path: &str, duration: Duration) {
+        self.inner
+            .slow_read
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(self.path(path), duration);
+    }
+
+    pub fn read_started(&self) -> usize {
+        self.inner.read_started.load(Ordering::SeqCst)
+    }
+
+    pub fn maximum_active_opens(&self) -> usize {
+        self.inner.maximum_active_opens.load(Ordering::SeqCst)
+    }
+
+    pub fn slow_stat(&self, path: &str, duration: Duration) {
+        self.inner
+            .slow_stat
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(self.path(path), duration);
+    }
+
+    pub fn stat_delayed(&self) -> usize {
+        self.inner.stat_delayed.load(Ordering::SeqCst)
     }
 
     pub fn slow_list(&self, duration: Duration) {
@@ -503,12 +543,29 @@ impl ShareFs for FakeShare {
             node.bytes = changed;
             node.mtime_ns = node.mtime_ns.saturating_add(1);
         }
+        drop(nodes);
+        let delay = self
+            .inner
+            .slow_stat
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(path)
+            .copied();
+        if let Some(delay) = delay {
+            self.inner.stat_delayed.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(delay);
+        }
         Ok(stat)
     }
 
     fn open(&self, approved_root: &Path, path: &Path) -> io::Result<Box<dyn Read + Send>> {
         self.unavailable(path)?;
         self.inner.open_started.fetch_add(1, Ordering::SeqCst);
+        let active = self.inner.active_opens.fetch_add(1, Ordering::SeqCst) + 1;
+        self.inner
+            .maximum_active_opens
+            .fetch_max(active, Ordering::SeqCst);
+        let _active = ActiveList(&self.inner.active_opens);
         let delay = self.slow_opens().get(path).copied();
         if let Some(delay) = delay {
             std::thread::sleep(delay);
@@ -561,12 +618,45 @@ impl ShareFs for FakeShare {
                 read_once: false,
             }));
         }
+        if let Some(delay) = self
+            .inner
+            .slow_read
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(path)
+            .copied()
+        {
+            return Ok(Box::new(SlowReader {
+                bytes: Cursor::new(bytes),
+                delay,
+                started: Arc::clone(&self.inner),
+                delayed: false,
+            }));
+        }
         Ok(Box::new(Cursor::new(bytes)) as Box<dyn Read + Send>)
     }
 
     fn canonical(&self, approved_root: &Path, path: &Path) -> io::Result<PathBuf> {
         self.unavailable(path)?;
         self.contained(approved_root, path)
+    }
+}
+
+struct SlowReader {
+    bytes: Cursor<Vec<u8>>,
+    delay: Duration,
+    started: Arc<Inner>,
+    delayed: bool,
+}
+
+impl Read for SlowReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if !self.delayed {
+            self.delayed = true;
+            self.started.read_started.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(self.delay);
+        }
+        self.bytes.read(buf)
     }
 }
 

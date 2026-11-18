@@ -235,6 +235,7 @@ pub struct Shares {
     flights: Arc<Mutex<HashMap<NodeId, Arc<tokio::sync::Mutex<()>>>>>,
     offline_until: Mutex<HashMap<NodeId, Instant>>,
     read_wait: RwLock<Duration>,
+    operation_timeout: RwLock<Duration>,
     cache_max_bytes_for_tests: Mutex<Option<u64>>,
 }
 
@@ -254,6 +255,7 @@ impl Shares {
             flights: Arc::new(Mutex::new(HashMap::new())),
             offline_until: Mutex::new(HashMap::new()),
             read_wait: RwLock::new(crate::external::READ_WAIT),
+            operation_timeout: RwLock::new(crate::external::OPERATION_WAIT),
             cache_max_bytes_for_tests: Mutex::new(None),
         }
     }
@@ -327,6 +329,13 @@ impl Shares {
             .insert(library, Instant::now() + for_time);
     }
 
+    pub(crate) fn operation_timeout(&self) -> Duration {
+        *self
+            .operation_timeout
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     pub(crate) fn cache_max_bytes(&self, configured: u64) -> u64 {
         self.cache_max_bytes_for_tests
             .lock()
@@ -341,6 +350,18 @@ impl Shares {
             .read_wait
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = wait;
+    }
+
+    /// Sets the caller-side share operation deadline without changing its 30-second production
+    /// default. Safe Rust cannot cancel a blocked operating-system read: up to four stuck OS
+    /// operations can therefore occupy the read permits until the OS releases them. Cancelling
+    /// those operations would require unsafe code or a new crate.
+    #[doc(hidden)]
+    pub fn set_operation_timeout(&self, timeout: Duration) {
+        *self
+            .operation_timeout
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = timeout;
     }
 
     /// Overrides cache accounting for integration tests without relaxing persisted settings.

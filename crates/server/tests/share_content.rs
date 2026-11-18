@@ -14,7 +14,7 @@ mod fake_icap;
 
 use std::io::ErrorKind;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use collab_core::ids::{DocId, NodeId};
 use common::fake_share::FakeShare;
@@ -234,6 +234,7 @@ async fn a_file_changed_without_a_new_time_is_noticed_when_it_is_read_again_afte
     let env = Env::new(&[("same.txt", b"first", 7)]).await;
     let first = env.ready("same.txt").await;
     let old = first.blob;
+    let old_revision = first.revision.clone();
     drop(first);
     env.state.shares().set_cache_max_bytes_for_tests(0);
     assert_eq!(evict(&env.state).await, 1);
@@ -244,7 +245,10 @@ async fn a_file_changed_without_a_new_time_is_noticed_when_it_is_read_again_afte
 
     assert_eq!(env.bytes(&second), b"other");
     assert_ne!(second.blob, old);
-    assert_eq!(env.item("same.txt").await.sha256, Some(sha(b"other")));
+    let current = env.item("same.txt").await;
+    assert_eq!(current.sha256, Some(sha(b"other")));
+    assert_ne!(second.revision, old_revision);
+    assert_eq!(second.revision, current.revision);
 }
 
 #[tokio::test]
@@ -388,6 +392,77 @@ async fn offline_is_remembered_so_later_reads_do_not_wait_again() {
         Err(ExternalError::Offline)
     ));
     assert_eq!(env.fake.stats(), stats);
+}
+
+#[tokio::test]
+async fn hung_opens_time_out_mark_the_library_offline_and_keep_reads_bounded() {
+    let env = Env::new(&[
+        ("hung-0.txt", b"zero", 1),
+        ("hung-1.txt", b"one!", 1),
+        ("hung-2.txt", b"two!", 1),
+        ("hung-3.txt", b"three", 1),
+        ("later.txt", b"later", 1),
+    ])
+    .await;
+    env.state
+        .shares()
+        .set_operation_timeout(Duration::from_millis(150));
+    let mut tasks = Vec::new();
+    for n in 0..4 {
+        let path = format!("hung-{n}.txt");
+        env.fake.slow_open(&path, Duration::from_millis(500));
+        let node = env.item(&path).await.node;
+        let state = env.state.clone();
+        tasks.push(tokio::spawn(async move { materialise(&state, node).await }));
+    }
+    wait_until(|| env.fake.open_started() == 4).await;
+
+    let started = Instant::now();
+    for task in tasks {
+        assert!(matches!(task.await.unwrap(), Err(ExternalError::Offline)));
+    }
+    assert!(started.elapsed() < Duration::from_millis(300));
+    let opens = env.fake.open_started();
+    let later = env.item("later.txt").await.node;
+    let second_started = Instant::now();
+
+    assert!(matches!(
+        materialise(&env.state, later).await,
+        Err(ExternalError::Offline)
+    ));
+    assert!(second_started.elapsed() < Duration::from_millis(20));
+    assert_eq!(env.fake.open_started(), opens);
+    assert!(env.fake.maximum_active_opens() <= 4);
+}
+
+#[tokio::test]
+async fn a_hung_read_chunk_times_out_and_marks_the_library_offline() {
+    let env = Env::new(&[
+        ("slow-read.txt", b"content", 1),
+        ("later.txt", b"later!", 1),
+    ])
+    .await;
+    env.state
+        .shares()
+        .set_operation_timeout(Duration::from_millis(30));
+    env.fake
+        .slow_read("slow-read.txt", Duration::from_millis(300));
+    let node = env.item("slow-read.txt").await.node;
+    let started = Instant::now();
+
+    assert!(matches!(
+        materialise(&env.state, node).await,
+        Err(ExternalError::Offline)
+    ));
+    assert!(started.elapsed() < Duration::from_millis(200));
+    let opens = env.fake.open_started();
+    let later = env.item("later.txt").await.node;
+
+    assert!(matches!(
+        materialise(&env.state, later).await,
+        Err(ExternalError::Offline)
+    ));
+    assert_eq!(env.fake.open_started(), opens);
 }
 
 #[tokio::test]
@@ -757,26 +832,28 @@ async fn content_also_named_by_a_stored_version_is_not_erased_by_eviction() {
 }
 
 #[tokio::test]
-async fn a_read_that_finishes_after_the_listing_moved_the_tag_records_nothing() {
+async fn a_read_that_finishes_after_the_listing_moved_the_tag_retries_current_content() {
     let env = Env::new(&[("race.txt", b"first", 1)]).await;
     let item = env.item("race.txt").await;
-    env.fake.slow_open("race.txt", Duration::from_millis(150));
+    env.fake.slow_read("race.txt", Duration::from_millis(150));
     let state = env.state.clone();
     let read = tokio::spawn(async move { materialise(&state, item.node).await });
-    wait_until(|| env.fake.opens("race.txt") > 0).await;
+    wait_until(|| env.fake.read_started() == 1).await;
+    env.fake.slow_stat("race.txt", Duration::from_millis(150));
+    wait_until(|| env.fake.stat_delayed() == 1).await;
+    env.fake.put_at("race.txt", b"second", 2);
     env.db()
         .set_external_stat(item.node, &item.tag, 6, 2)
         .await
         .unwrap();
 
     let ready = read.await.unwrap().unwrap().unwrap();
+    let current = env.item("race.txt").await;
 
-    assert_eq!(env.bytes(&ready), b"first");
-    assert!(env.item("race.txt").await.sha256.is_none());
-    assert_eq!(
-        server::source_tick_once(&env.state, OffsetDateTime::UNIX_EPOCH).await,
-        1
-    );
+    assert_eq!(env.bytes(&ready), b"second");
+    assert_eq!(ready.revision, current.revision);
+    assert_ne!(ready.revision, item.revision);
+    assert_eq!(current.sha256, Some(sha(b"second")));
 }
 
 #[tokio::test]
