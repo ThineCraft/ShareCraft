@@ -63,38 +63,44 @@ struct LeaseReader {
 
 impl io::Read for LeaseReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.inner.read(buf)
+        self.inner
+            .read(buf)
+            .map_err(|error| io::Error::new(error.kind(), ShareReaderError(error)))
     }
+}
+
+#[derive(Debug)]
+struct ShareReaderError(io::Error);
+
+impl std::fmt::Display for ShareReaderError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("file share reader failed")
+    }
+}
+
+impl std::error::Error for ShareReaderError {}
+
+struct ApprovedItem {
+    item: ExternalItem,
+    root_path: PathBuf,
+    file_path: PathBuf,
+    cache_max: u64,
 }
 
 /// Materialises one live share-backed document. Ordinary and GitHub documents answer `None`.
 pub async fn materialise(state: &AppState, node: NodeId) -> Result<Option<Ready>, ExternalError> {
-    let Some(mut item) = state
-        .db()
-        .external_item(node)
-        .await
-        .map_err(database_failed)?
-    else {
+    if approved_item(state, node).await?.is_none() {
         return Ok(None);
-    };
-    let settings = state.db().share_settings().await.map_err(database_failed)?;
-    let location = SharePath::parse(&item.location).map_err(|_| ExternalError::NotApproved)?;
-    let root = approved_root(&location, &settings.roots)
-        .cloned()
-        .ok_or(ExternalError::NotApproved)?;
-    let file = location
-        .join(&item.repository_path)
-        .map_err(|_| ExternalError::NotApproved)?;
-    let root_path = root.to_path_buf();
-    let file_path = file.to_path_buf();
+    }
 
     let flight = Arc::new(state.shares().flight(node).await);
-    item = state
-        .db()
-        .external_item(node)
-        .await
-        .map_err(database_failed)?
+    let approved = approved_item(state, node)
+        .await?
         .ok_or(ExternalError::Gone)?;
+    let item = approved.item;
+    let root_path = approved.root_path;
+    let file_path = approved.file_path;
+    remembered_refusal(&item)?;
 
     if state.shares().offline(item.library) {
         return cached_while_offline(state, &item).await.map(Some);
@@ -123,19 +129,18 @@ pub async fn materialise(state: &AppState, node: NodeId) -> Result<Option<Ready>
             .await
             .map_err(database_failed)?;
         state.sources().wake(item.library);
-        item = state
-            .db()
-            .external_item(node)
-            .await
-            .map_err(database_failed)?
-            .ok_or(ExternalError::Gone)?;
     }
 
+    let approved = approved_item(state, node)
+        .await?
+        .ok_or(ExternalError::Gone)?;
+    let item = approved.item;
+    let cache_max = approved.cache_max;
+    remembered_refusal(&item)?;
     if let Some(ready) = cached(state, &item).await? {
         return Ok(Some(ready));
     }
 
-    let cache_max = state.shares().cache_max_bytes(settings.cache_max_bytes);
     if first.size > state.config().max_file_bytes || first.size > cache_max / 2 {
         state
             .db()
@@ -149,6 +154,14 @@ pub async fn materialise(state: &AppState, node: NodeId) -> Result<Option<Ready>
         .read_turn()
         .await
         .ok_or(ExternalError::Busy)?;
+    let approved = approved_item(state, node)
+        .await?
+        .ok_or(ExternalError::Gone)?;
+    let mut item = approved.item;
+    let mut root_path = approved.root_path;
+    let mut file_path = approved.file_path;
+    let mut cache_max = approved.cache_max;
+    remembered_refusal(&item)?;
     let lease = Arc::new(ReadLease {
         _read: read,
         _flight: Arc::clone(&flight),
@@ -214,6 +227,30 @@ pub async fn materialise(state: &AppState, node: NodeId) -> Result<Option<Ready>
                 .map_err(database_failed)?;
             return Err(ExternalError::TooLarge);
         }
+        let approved = approved_item(state, node)
+            .await?
+            .ok_or(ExternalError::Gone)?;
+        remembered_refusal(&approved.item)?;
+        if approved.root_path != root_path
+            || approved.file_path != file_path
+            || approved.item.tag != item.tag
+        {
+            item = approved.item;
+            root_path = approved.root_path;
+            file_path = approved.file_path;
+            cache_max = approved.cache_max;
+            continue;
+        }
+        item = approved.item;
+        cache_max = approved.cache_max;
+        if before.size > state.config().max_file_bytes || before.size > cache_max / 2 {
+            state
+                .db()
+                .set_external_unavailable(node, &item.tag, Some(Unavailable::TooLarge))
+                .await
+                .map_err(database_failed)?;
+            return Err(ExternalError::TooLarge);
+        }
         let old_hash = item.sha256;
         let reader = match open(
             Arc::clone(&fs),
@@ -257,7 +294,12 @@ pub async fn materialise(state: &AppState, node: NodeId) -> Result<Option<Ready>
                 attempt += 1;
                 continue;
             }
-            Err(error) => return Err(blob_failed(error)),
+            Err(error) => {
+                if let Some(error) = reader_error(&error) {
+                    return stat_refusal(state, &item, error).await;
+                }
+                return Err(blob_failed(error));
+            }
         };
         let after = match timed_stat(
             Arc::clone(&fs),
@@ -328,6 +370,43 @@ pub async fn materialise(state: &AppState, node: NodeId) -> Result<Option<Ready>
         held,
         revision: item.revision,
     }))
+}
+
+async fn approved_item(
+    state: &AppState,
+    node: NodeId,
+) -> Result<Option<ApprovedItem>, ExternalError> {
+    let Some(item) = state
+        .db()
+        .external_item(node)
+        .await
+        .map_err(database_failed)?
+    else {
+        return Ok(None);
+    };
+    let settings = state.db().share_settings().await.map_err(database_failed)?;
+    let location = SharePath::parse(&item.location).map_err(|_| ExternalError::NotApproved)?;
+    let root = approved_root(&location, &settings.roots)
+        .cloned()
+        .ok_or(ExternalError::NotApproved)?;
+    let file = location
+        .join(&item.repository_path)
+        .map_err(|_| ExternalError::NotApproved)?;
+    Ok(Some(ApprovedItem {
+        item,
+        root_path: root.to_path_buf(),
+        file_path: file.to_path_buf(),
+        cache_max: state.shares().cache_max_bytes(settings.cache_max_bytes),
+    }))
+}
+
+fn remembered_refusal(item: &ExternalItem) -> Result<(), ExternalError> {
+    match item.unavailable {
+        Some(Unavailable::Gone) => Err(ExternalError::Gone),
+        Some(Unavailable::Denied) => Err(ExternalError::Denied),
+        Some(Unavailable::TooLarge) => Err(ExternalError::TooLarge),
+        Some(Unavailable::Locked) | None => Ok(()),
+    }
 }
 
 async fn cached(state: &AppState, item: &ExternalItem) -> Result<Option<Ready>, ExternalError> {
@@ -590,6 +669,16 @@ fn classify(error: &io::Error) -> FsError {
             FsError::Failed
         }
     }
+}
+
+fn reader_error(error: &BlobError) -> Option<FsError> {
+    let BlobError::Io(error) = error else {
+        return None;
+    };
+    error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<ShareReaderError>())
+        .map(|source| classify(&source.0))
 }
 
 async fn stat_refusal(

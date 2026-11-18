@@ -360,6 +360,16 @@ impl Shares {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .len()
     }
+
+    /// Reports the node-flight references so integration tests can observe a queued waiter.
+    #[doc(hidden)]
+    pub fn flight_references_for_tests(&self, node: NodeId) -> usize {
+        self.flights
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&node)
+            .map_or(0, Arc::strong_count)
+    }
 }
 
 pub(crate) struct Flight {

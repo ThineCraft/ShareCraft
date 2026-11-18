@@ -12,6 +12,7 @@ mod common;
 #[allow(dead_code)]
 mod fake_icap;
 
+use std::io::ErrorKind;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -404,6 +405,82 @@ async fn a_withdrawn_root_refuses_even_cached_content() {
         materialise(&env.state, node).await,
         Err(ExternalError::NotApproved)
     ));
+}
+
+#[tokio::test]
+async fn a_waiter_rechecks_root_approval_after_the_flight() {
+    let env = Env::new(&[("held.txt", b"held", 1)]).await;
+    env.fake.slow_open("held.txt", Duration::from_millis(500));
+    let node = env.item("held.txt").await.node;
+    let holder_state = env.state.clone();
+    let holder = tokio::spawn(async move { materialise(&holder_state, node).await });
+    wait_until(|| env.fake.open_started() == 1).await;
+
+    let waiter_state = env.state.clone();
+    let waiter = tokio::spawn(async move { materialise(&waiter_state, node).await });
+    wait_until(|| env.state.shares().flight_references_for_tests(node) >= 5).await;
+    env.db()
+        .set_setting(env.admin.id, SHARE_ROOTS, json!([]))
+        .await
+        .unwrap();
+
+    let held = holder.await.unwrap().unwrap().unwrap();
+    drop(held);
+    assert!(matches!(
+        waiter.await.unwrap(),
+        Err(ExternalError::NotApproved)
+    ));
+    assert_eq!(env.fake.opens("held.txt"), 1);
+}
+
+async fn assert_mid_stream_failure(
+    kind: ErrorKind,
+    expected: ExternalError,
+    unavailable: Option<Unavailable>,
+) {
+    let env = Env::new(&[("fault.txt", b"fault bytes", 1)]).await;
+    let node = env.item("fault.txt").await.node;
+    env.fake.fail_during_read("fault.txt", kind);
+
+    assert!(matches!(
+        materialise(&env.state, node).await,
+        Err(error) if error == expected
+    ));
+    assert_eq!(env.item("fault.txt").await.unavailable, unavailable);
+    let stats = env.fake.stats();
+    let opens = env.fake.opens("fault.txt");
+
+    assert!(matches!(
+        materialise(&env.state, node).await,
+        Err(error) if error == expected
+    ));
+    assert_eq!(env.fake.stats(), stats);
+    assert_eq!(env.fake.opens("fault.txt"), opens);
+}
+
+#[tokio::test]
+async fn mid_stream_not_found_marks_the_item_gone_and_is_remembered() {
+    assert_mid_stream_failure(
+        ErrorKind::NotFound,
+        ExternalError::Gone,
+        Some(Unavailable::Gone),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn mid_stream_permission_denied_marks_the_item_denied_and_is_remembered() {
+    assert_mid_stream_failure(
+        ErrorKind::PermissionDenied,
+        ExternalError::Denied,
+        Some(Unavailable::Denied),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn mid_stream_connection_reset_marks_the_library_offline_and_is_remembered() {
+    assert_mid_stream_failure(ErrorKind::ConnectionReset, ExternalError::Offline, None).await;
 }
 
 #[tokio::test]

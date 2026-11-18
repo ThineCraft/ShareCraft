@@ -26,6 +26,7 @@ struct Inner {
     change_during_read: Mutex<HashMap<PathBuf, VecDeque<Vec<u8>>>>,
     change_after_stat: Mutex<HashMap<PathBuf, VecDeque<Vec<u8>>>>,
     truncate_read: Mutex<HashMap<PathBuf, usize>>,
+    read_error: Mutex<HashMap<PathBuf, io::ErrorKind>>,
     lists: AtomicUsize,
     active_lists: AtomicUsize,
     maximum_active_lists: AtomicUsize,
@@ -65,6 +66,7 @@ impl FakeShare {
                 change_during_read: Mutex::new(HashMap::new()),
                 change_after_stat: Mutex::new(HashMap::new()),
                 truncate_read: Mutex::new(HashMap::new()),
+                read_error: Mutex::new(HashMap::new()),
                 lists: AtomicUsize::new(0),
                 active_lists: AtomicUsize::new(0),
                 maximum_active_lists: AtomicUsize::new(0),
@@ -204,6 +206,10 @@ impl FakeShare {
         self.truncations().insert(self.path(path), at);
     }
 
+    pub fn fail_during_read(&self, path: &str, kind: io::ErrorKind) {
+        self.read_errors().insert(self.path(path), kind);
+    }
+
     pub fn lists(&self) -> usize {
         self.inner.lists.load(Ordering::SeqCst)
     }
@@ -299,6 +305,13 @@ impl FakeShare {
     fn truncations(&self) -> std::sync::MutexGuard<'_, HashMap<PathBuf, usize>> {
         self.inner
             .truncate_read
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn read_errors(&self) -> std::sync::MutexGuard<'_, HashMap<PathBuf, io::ErrorKind>> {
+        self.inner
+            .read_error
             .lock()
             .unwrap_or_else(|e| e.into_inner())
     }
@@ -540,14 +553,35 @@ impl ShareFs for FakeShare {
             node.mtime_ns = node.mtime_ns.saturating_add(1);
         }
         let at = self.truncations().get(path).copied().unwrap_or(bytes.len());
-        Ok(
-            Box::new(Cursor::new(bytes.into_iter().take(at).collect::<Vec<_>>()))
-                as Box<dyn Read + Send>,
-        )
+        let bytes = bytes.into_iter().take(at).collect::<Vec<_>>();
+        if let Some(kind) = self.read_errors().remove(path) {
+            return Ok(Box::new(FailingReader {
+                bytes: Cursor::new(bytes),
+                kind,
+                read_once: false,
+            }));
+        }
+        Ok(Box::new(Cursor::new(bytes)) as Box<dyn Read + Send>)
     }
 
     fn canonical(&self, approved_root: &Path, path: &Path) -> io::Result<PathBuf> {
         self.unavailable(path)?;
         self.contained(approved_root, path)
+    }
+}
+
+struct FailingReader {
+    bytes: Cursor<Vec<u8>>,
+    kind: io::ErrorKind,
+    read_once: bool,
+}
+
+impl Read for FailingReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.read_once {
+            return Err(io::Error::new(self.kind, "injected read failure"));
+        }
+        self.read_once = true;
+        self.bytes.read(buf)
     }
 }
