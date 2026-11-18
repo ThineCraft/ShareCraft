@@ -9,6 +9,10 @@ use sqlx::PgConnection;
 use crate::events::{NewEvent, record};
 use crate::policies::{BLOCKED_FILE_TYPES, valid_blocked_types};
 use crate::scans::{SCANNER_SETTINGS, SCANNER_URL, valid_scanner_setting};
+use crate::share_paths::{
+    SHARE_CACHE_MAX_BYTES, SHARE_LIST_SECONDS, SHARE_ROOTS, valid_cache_setting,
+    valid_list_setting, valid_roots_setting,
+};
 use crate::sites::{DEFAULT_LANGUAGE, DEFAULT_TIME_ZONE, validate_language, validate_time_zone};
 use crate::sources::{SOURCE_MAX_BYTES, SOURCE_MAX_FILES};
 use crate::{AccessError, Db, DbError};
@@ -42,6 +46,9 @@ fn validate(key: &str, value: &Value) -> Result<(), AccessError> {
         BLOCKED_FILE_TYPES => valid_blocked_types(value),
         key if SCANNER_SETTINGS.contains(&key) => valid_scanner_setting(key, value),
         SOURCE_MAX_FILES | SOURCE_MAX_BYTES => value.as_i64().is_some_and(|n| n >= 1),
+        SHARE_ROOTS => valid_roots_setting(value),
+        SHARE_CACHE_MAX_BYTES => valid_cache_setting(value),
+        SHARE_LIST_SECONDS => valid_list_setting(value),
         ANYONE_LINK_MAX_DAYS => value
             .as_i64()
             .is_some_and(|days| (1..=MAX_DAYS_LIMIT).contains(&days)),
