@@ -73,6 +73,8 @@ fn status(state: SourceState) -> SourceStatus {
         files: 0,
         bytes: 0,
         hidden: 0,
+        hidden_detail: serde_json::json!({}),
+        next_check_at: None,
     }
 }
 

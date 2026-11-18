@@ -76,6 +76,7 @@ pub(crate) fn router() -> Router<AppState> {
         .route("/sites/{id}/groups", get(sites::groups))
         .route("/sites/{id}/libraries", post(libraries::create))
         .route("/sites/{id}/libraries/github", post(sources::connect))
+        .route("/sites/{id}/libraries/share", post(sources::connect_share))
         .route(
             "/libraries/{id}/source",
             get(sources::show)
@@ -84,6 +85,10 @@ pub(crate) fn router() -> Router<AppState> {
         )
         .route("/libraries/{id}/source/sync", post(sources::sync_now))
         .route("/libraries/{id}/source/webhook", post(sources::webhook))
+        .route(
+            "/settings/shares",
+            get(settings::shares).put(settings::change_shares),
+        )
         .route(
             "/libraries/{id}",
             get(libraries::show).patch(libraries::change),
@@ -358,6 +363,12 @@ pub(crate) enum ApiError {
     /// 422: a well-formed request with a value that makes no sense, such as an unknown role or
     /// an id that is not an id.
     InvalidRequest,
+    /// 422: a file-share path is not a safe absolute path.
+    InvalidSharePath(&'static str),
+    /// 422: a safe path is outside every administrator-approved root.
+    ShareNotApproved,
+    /// 422: the approved folder cannot be listed.
+    ShareUnreachable(&'static str),
     /// 422: not an acceptable document or person name.
     InvalidName,
     /// 422: not an acceptable email address.
@@ -536,6 +547,13 @@ impl ApiError {
             ApiError::IsHub => (StatusCode::CONFLICT, "is_hub"),
             ApiError::LastAdmin => (StatusCode::CONFLICT, "last_admin"),
             ApiError::InvalidRequest => (StatusCode::UNPROCESSABLE_ENTITY, "invalid_request"),
+            ApiError::InvalidSharePath(_) => {
+                (StatusCode::UNPROCESSABLE_ENTITY, "invalid_share_path")
+            }
+            ApiError::ShareNotApproved => (StatusCode::UNPROCESSABLE_ENTITY, "share_not_approved"),
+            ApiError::ShareUnreachable(_) => {
+                (StatusCode::UNPROCESSABLE_ENTITY, "share_unreachable")
+            }
             ApiError::InvalidName => (StatusCode::UNPROCESSABLE_ENTITY, "invalid_name"),
             ApiError::InvalidEmail => (StatusCode::UNPROCESSABLE_ENTITY, "invalid_email"),
             ApiError::InvalidLanguage => (StatusCode::UNPROCESSABLE_ENTITY, "invalid_language"),
@@ -837,6 +855,16 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, code) = self.status_and_code();
         let body = match self {
+            ApiError::InvalidSharePath(reason) => json!({
+                "error": code,
+                "reason": reason,
+                "message": share_path_message(reason),
+            }),
+            ApiError::ShareUnreachable(reason) => json!({
+                "error": code,
+                "reason": reason,
+                "message": share_unreachable_message(reason),
+            }),
             ApiError::InvalidTemplate(reason) | ApiError::InvalidLibrarySettings(reason) => {
                 json!({ "error": code, "reason": reason })
             }
@@ -878,6 +906,26 @@ impl IntoResponse for ApiError {
             _ => json!({ "error": code }),
         };
         (status, Json(body)).into_response()
+    }
+}
+
+fn share_path_message(reason: &str) -> &'static str {
+    match reason {
+        "relative" => "Enter an absolute server or network path.",
+        "traversal" => "The path cannot contain a parent-folder step.",
+        "device" => "Device paths cannot be used as file shares.",
+        "stream" => "Alternate data streams cannot be used as file shares.",
+        "too_long" => "The file-share path is too long.",
+        "whole_drive" => "Approve a folder rather than a whole drive or administrative share.",
+        _ => "The file-share path contains a name that cannot be used.",
+    }
+}
+
+fn share_unreachable_message(reason: &str) -> &'static str {
+    match reason {
+        "not_found" => "The file-share folder was not found.",
+        "denied" => "The server is not allowed to list the file-share folder.",
+        _ => "The file-share folder is unavailable. Try again later.",
     }
 }
 

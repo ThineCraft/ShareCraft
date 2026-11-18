@@ -6,6 +6,9 @@
 //! reach the database, and no answer, event, log line or error carries one: the only exception
 //! is the webhook secret in the one answer that generates it.
 
+use std::io;
+use std::time::{Duration, Instant};
+
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::header::HOST;
@@ -13,20 +16,22 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use collab_core::ids::NodeId;
 use records::{
-    LibraryKind, NewEvent, NewSource, Perms, SealedRow, SecretId, SourceChange, SourceConfig,
-    SourceKind, SourceMode, SourceStatus, User,
+    LibraryKind, NewEvent, NewSource, Perms, SealedRow, SecretId, SharePath, SourceChange,
+    SourceConfig, SourceKind, SourceMode, SourceStatus, User, approved_root, valid_root,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use super::nodes::{node_id, require_manager, rfc3339};
+use super::nodes::{delete_one, node_id, require_manager, rfc3339};
+use super::settings::{overlaps_data_folder, path_reason};
 use super::{ApiError, JsonBody, to_completion};
 use crate::AppState;
 use crate::auth::Signed;
 use crate::github::{EntryKind, GithubError, Head, RepoRef};
 use crate::libraries;
 use crate::secrets::Secret;
+use crate::share::FsBudget;
 use crate::source_sync::{abandon_uploads_into, caps, token_context, token_of, webhook_context};
 use crate::tree::{self, TreeOp};
 
@@ -231,7 +236,29 @@ fn webhook_url(origin: &str, library: NodeId) -> String {
 
 /// A connection as the routes answer it. Never a secret, and never the sync bookmark's entity
 /// tag; the commit is cut to seven characters.
-fn source_out(origin: &str, config: &SourceConfig, status: &SourceStatus) -> Value {
+fn source_out(
+    origin: &str,
+    config: &SourceConfig,
+    status: &SourceStatus,
+    reveal_path: bool,
+) -> Value {
+    if config.kind == SourceKind::Share {
+        return json!({
+            "kind": "share",
+            "mode": config.mode.as_str(),
+            "path": if reveal_path { config.location.clone() } else { None },
+            "state": status.state.as_str(),
+            "last_synced_at": rfc3339(status.last_synced_at),
+            "last_checked_at": rfc3339(status.last_checked_at),
+            "last_error": status.last_error,
+            "files": status.files,
+            "bytes": status.bytes,
+            "hidden": status.hidden,
+            "hidden_by": status.hidden_detail,
+            "poll_seconds": config.poll_seconds,
+            "next_check_at": rfc3339(status.next_check_at),
+        });
+    }
     json!({
         "kind": config.kind.as_str(),
         "repository": format!("{}/{}", config.owner, config.repo),
@@ -268,9 +295,22 @@ async fn source_of(
 }
 
 /// The connection of `library` as answered, read afresh.
-async fn answer_of(state: &AppState, origin: &str, library: NodeId) -> Result<Value, ApiError> {
+async fn answer_of(
+    state: &AppState,
+    origin: &str,
+    library: NodeId,
+    reveal_path: bool,
+) -> Result<Value, ApiError> {
     let (config, status) = source_of(state, library).await?;
-    Ok(source_out(origin, &config, &status))
+    let mut answer = source_out(origin, &config, &status, reveal_path);
+    if config.kind == SourceKind::Share
+        && status.state == records::SourceState::Syncing
+        && let Some(files) = state.shares().listing_progress(library)
+        && let Some(object) = answer.as_object_mut()
+    {
+        object.insert("listing_now".to_owned(), json!({ "files_so_far": files }));
+    }
+    Ok(answer)
 }
 
 /// Records `kind` about `library`, done by `actor`.
@@ -421,7 +461,7 @@ pub(crate) async fn connect(
         })
         .await?;
     }
-    let source = answer_of(&state, &origin, library).await?;
+    let source = answer_of(&state, &origin, library, true).await?;
     let warnings: Vec<&str> = if probed.archived {
         vec!["archived"]
     } else {
@@ -433,6 +473,146 @@ pub(crate) async fn connect(
             "id": library.0.to_string(),
             "source": source,
             "warnings": warnings,
+        })),
+    )
+        .into_response())
+}
+
+/// The body of `POST /api/sites/{id}/libraries/share`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ConnectShareBody {
+    name: String,
+    path: String,
+    kind: Option<String>,
+    mode: Option<String>,
+}
+
+fn share_probe_error(error: &io::Error) -> ApiError {
+    match error.kind() {
+        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory => {
+            ApiError::ShareUnreachable("not_found")
+        }
+        io::ErrorKind::PermissionDenied => ApiError::ShareUnreachable("denied"),
+        _ => ApiError::ShareUnreachable("offline"),
+    }
+}
+
+/// Makes a new read-only library backed by an administrator-approved file-share folder.
+pub(crate) async fn connect_share(
+    State(state): State<AppState>,
+    signed: Signed,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    JsonBody(body): JsonBody<ConnectShareBody>,
+) -> Result<Response, ApiError> {
+    let site = node_id(&id)?;
+    let actor = signed.session.user;
+
+    // Access is judged before the path is parsed or the file system is touched.
+    let (place, access) = tree::visible(state.db(), &actor, site).await?;
+    if place.kind != records::NodeKind::Site {
+        return Err(ApiError::WrongPlace);
+    }
+    tree::require(&access, Perms::MANAGE_SITE)?;
+
+    let kind = match body.kind.as_deref() {
+        None | Some("document") => LibraryKind::Document,
+        Some("image") => LibraryKind::Image,
+        Some(_) => return Err(ApiError::InvalidRequest),
+    };
+    if body.mode.as_deref().is_some_and(|mode| mode != "read_only") {
+        return Err(ApiError::InvalidRequest);
+    }
+    let name = records::validate_node_name(&body.name)
+        .map_err(ApiError::from)?
+        .to_owned();
+    let path = SharePath::parse(&body.path)
+        .map_err(|reason| ApiError::InvalidSharePath(path_reason(reason)))?;
+    valid_root(&path).map_err(|reason| ApiError::InvalidSharePath(path_reason(reason)))?;
+    let settings = state
+        .db()
+        .share_settings()
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?;
+    let approved = approved_root(&path, &settings.roots)
+        .cloned()
+        .ok_or(ApiError::ShareNotApproved)?;
+    if overlaps_data_folder(&state, &path).await {
+        return Err(ApiError::ShareNotApproved);
+    }
+    if !state
+        .db()
+        .name_free(site, &name, None)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?
+    {
+        return Err(ApiError::NameTaken);
+    }
+
+    // Probe only the connected folder itself; recursive walking belongs to the first listing.
+    let fs = state.shares().fs();
+    let approved_path = approved.to_path_buf();
+    let share_path = path.to_path_buf();
+    let max_files = settings.max_files;
+    let max_time = Duration::from_secs(settings.list_seconds);
+    tokio::task::spawn_blocking(move || {
+        fs.list(
+            &approved_path,
+            &share_path,
+            &FsBudget::new(max_files, Instant::now() + max_time),
+        )
+    })
+    .await
+    .map_err(|_| ApiError::ShareUnreachable("offline"))?
+    .map_err(|error| share_probe_error(&error))?;
+
+    let library = NodeId(Uuid::new_v4());
+    let location = path.display();
+    let origin = origin(&state, &headers)?;
+    {
+        let state = state.clone();
+        let actor = actor.clone();
+        to_completion(async move {
+            tree::create_library(&state, &actor, site, library, &name, kind).await?;
+            if let Err(error) = state
+                .db()
+                .connect_source(&NewSource {
+                    library,
+                    kind: SourceKind::Share,
+                    owner: String::new(),
+                    repo: String::new(),
+                    branch: String::new(),
+                    folder: String::new(),
+                    location: Some(location),
+                    mode: SourceMode::ReadOnly,
+                    token: None,
+                    poll_seconds: DEFAULT_POLL_SECONDS,
+                    connected_by: actor.id,
+                })
+                .await
+            {
+                purge_new_library(&state, &actor, library).await;
+                return Err(error.into());
+            }
+            abandon_uploads_into(&state, library).await;
+            emit(
+                &state,
+                "source.connected",
+                &actor,
+                library,
+                json!({ "kind": "share" }),
+            );
+            wake(&state, library);
+            Ok(())
+        })
+        .await?;
+    }
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "id": library.0.to_string(),
+            "source": answer_of(&state, &origin, library, true).await?,
         })),
     )
         .into_response())
@@ -489,7 +669,15 @@ pub(crate) async fn show(
     // Whoever may see the library as `GET /api/libraries/{id}` shows it (not in the bin).
     libraries::show(&state, &signed.session.user, library).await?;
     let origin = origin(&state, &headers)?;
-    Ok(Json(answer_of(&state, &origin, library).await?))
+    let reveal_path = state
+        .db()
+        .effective_access(signed.session.user.id, library)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?
+        .is_some_and(|access| access.can_manage_access());
+    Ok(Json(
+        answer_of(&state, &origin, library, reveal_path).await?,
+    ))
 }
 
 /// The body of `PATCH /api/libraries/{id}/source`.
@@ -525,6 +713,14 @@ pub(crate) async fn change(
     let actor = signed.session.user;
     require_manager(state.db(), actor.id, library).await?;
     let (config, _) = source_of(&state, library).await?;
+    if config.kind == SourceKind::Share
+        && (body.branch.is_some()
+            || body.folder.is_some()
+            || body.token.is_some()
+            || body.clear_token.is_some())
+    {
+        return Err(ApiError::InvalidRequest);
+    }
     let clear = body.clear_token == Some(true);
     if clear && body.token.is_some() {
         return Err(ApiError::InvalidRequest);
@@ -547,7 +743,7 @@ pub(crate) async fn change(
     let clear = clear && config.token.is_some();
     let new_token = token.is_some() || clear;
     if branch.is_none() && folder.is_none() && poll_seconds.is_none() && !new_token {
-        return Ok(Json(answer_of(&state, &origin, library).await?));
+        return Ok(Json(answer_of(&state, &origin, library, true).await?));
     }
     let reprobe = branch.is_some() || folder.is_some() || new_token;
     if reprobe {
@@ -648,7 +844,7 @@ pub(crate) async fn change(
         })
         .await?;
     }
-    Ok(Json(answer_of(&state, &origin, library).await?))
+    Ok(Json(answer_of(&state, &origin, library, true).await?))
 }
 
 /// `POST /api/libraries/{id}/source/sync`: "Sync now", for owners of the library. `202`; the
@@ -714,7 +910,10 @@ pub(crate) async fn webhook(
     let library = node_id(&id)?;
     let actor = signed.session.user;
     require_manager(state.db(), actor.id, library).await?;
-    source_of(&state, library).await?;
+    let (config, _) = source_of(&state, library).await?;
+    if config.kind == SourceKind::Share {
+        return Err(ApiError::InvalidRequest);
+    }
     let origin = origin(&state, &headers)?;
     let mut bytes = [0u8; WEBHOOK_SECRET_BYTES];
     getrandom::fill(&mut bytes).map_err(|_| {
@@ -792,12 +991,42 @@ pub(crate) async fn disconnect(
     require_manager(state.db(), actor.id, library).await?;
     let (config, _) = source_of(&state, library).await?;
     to_completion(async move {
-        let turn = state
-            .db()
-            .try_lock_source(library)
-            .await
-            .map_err(|e| ApiError::unavailable(&e))?
-            .ok_or(ApiError::SourceBusy)?;
+        if config.kind == SourceKind::Share {
+            state
+                .db()
+                .bump_source_generation(library)
+                .await
+                .map_err(|e| ApiError::unavailable(&e))?;
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let turn = loop {
+            if let Some(turn) = state
+                .db()
+                .try_lock_source(library)
+                .await
+                .map_err(|e| ApiError::unavailable(&e))?
+            {
+                break turn;
+            }
+            if config.kind != SourceKind::Share || tokio::time::Instant::now() >= deadline {
+                return Err(ApiError::SourceBusy);
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        let removed = if config.kind == SourceKind::Share {
+            let children = state
+                .db()
+                .live_children(library)
+                .await
+                .map_err(|e| ApiError::unavailable(&e))?;
+            let count = children.len();
+            for child in children {
+                delete_one(&state, &actor, child.id).await?;
+            }
+            count
+        } else {
+            0
+        };
         let secrets = state
             .db()
             .disconnect_source(library)
@@ -807,13 +1036,12 @@ pub(crate) async fn disconnect(
             forget_secret(&state, id).await;
         }
         drop(turn);
-        emit(
-            &state,
-            "source.disconnected",
-            &actor,
-            library,
-            json!({ "repository": format!("{}/{}", config.owner, config.repo) }),
-        );
+        let detail = if config.kind == SourceKind::Share {
+            json!({ "kind": "share", "removed": removed })
+        } else {
+            json!({ "repository": format!("{}/{}", config.owner, config.repo) })
+        };
+        emit(&state, "source.disconnected", &actor, library, detail);
         Ok(StatusCode::NO_CONTENT.into_response())
     })
     .await

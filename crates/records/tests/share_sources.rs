@@ -597,6 +597,9 @@ async fn next_check_at_delays_due_and_a_requeue_clears_it() {
     );
 
     assert!(f.test.db.due_sources(now, 10).await.unwrap().is_empty());
+    let (_, status) = f.test.db.source_of(f.library).await.unwrap().unwrap();
+    assert_eq!(status.next_check_at, Some(now + Duration::hours(1)));
+    assert_eq!(status.hidden_detail, serde_json::json!({"hidden": 2}));
     f.test.db.requeue_source(f.library, None).await.unwrap();
     assert_eq!(f.test.db.due_sources(now, 10).await.unwrap(), [f.library]);
     let next: Option<OffsetDateTime> =

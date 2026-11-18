@@ -113,6 +113,10 @@ const ROUTES: &[(&str, Decision)] = &[
         "POST /api/sites/{id}/libraries/github",
         Allowed("makes a new library and connects it; no existing library's files change"),
     ),
+    (
+        "POST /api/sites/{id}/libraries/share",
+        Allowed("makes a new library and connects it; no existing library's files change"),
+    ),
     ("GET /api/libraries/{id}", Read),
     ("GET /api/libraries/{id}/source", Read),
     (
@@ -313,6 +317,8 @@ const ROUTES: &[(&str, Decision)] = &[
         "PUT /api/settings/scanner",
         Allowed("organisation settings"),
     ),
+    ("GET /api/settings/shares", Read),
+    ("PUT /api/settings/shares", Allowed("organisation settings")),
     ("GET /api/nodes/{id}/inheritance/preview", Read),
     ("GET /api/explorer/{root}", Read),
     ("GET /api/explorer/{root}/counts", Read),
@@ -611,7 +617,7 @@ fn a_route_list_guard() {
         unclassified.is_empty() && gone.is_empty(),
         "routes not classified in ROUTES: {unclassified:?}; recorded but not registered: {gone:?}"
     );
-    assert_eq!(routes.len(), 151, "the number of registered routes changed");
+    assert_eq!(routes.len(), 154, "the number of registered routes changed");
     let mut mounts_sorted = mounts.clone();
     mounts_sorted.sort();
     let mut expected: Vec<String> = MOUNTS.iter().map(|m| (*m).to_owned()).collect();

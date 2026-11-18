@@ -221,6 +221,10 @@ pub struct SourceStatus {
     pub bytes: i64,
     /// Entries not mirrored.
     pub hidden: i64,
+    /// Source-specific detail behind `hidden`; empty for sources without detail.
+    pub hidden_detail: serde_json::Value,
+    /// The next scheduled source check, when the source has its own schedule.
+    pub next_check_at: Option<OffsetDateTime>,
 }
 
 /// A new status for [`Db::set_source_status`]: every field is written as given.
@@ -418,7 +422,8 @@ impl std::fmt::Debug for SourceLock {
 
 const SOURCE_COLUMNS: &str = "library_id, kind, owner, repo, branch, folder, location, mode, \
     token_secret, webhook_secret, poll_seconds, connected_by, state, last_commit, etag, \
-    last_checked_at, last_synced_at, last_error, retry_at, files, bytes, hidden";
+    last_checked_at, last_synced_at, last_error, retry_at, files, bytes, hidden, hidden_detail, \
+    next_check_at";
 
 /// `from … where …` for the connections whose library is live in a live site that is not
 /// archived and whose retry time (`$1` is now) has passed or is unset; the caller adds more
@@ -466,6 +471,8 @@ fn source_from_row(row: &PgRow) -> Result<(SourceConfig, SourceStatus), sqlx::Er
         files: row.try_get("files")?,
         bytes: row.try_get("bytes")?,
         hidden: row.try_get("hidden")?,
+        hidden_detail: row.try_get("hidden_detail")?,
+        next_check_at: row.try_get("next_check_at")?,
     };
     Ok((config, status))
 }
@@ -737,8 +744,9 @@ impl Db {
         let done = sqlx::query(
             "update library_sources set state = $2, last_commit = $3, etag = $4, \
                  last_checked_at = $5, last_synced_at = $6, last_error = $7, retry_at = $8, \
-                 files = $9, bytes = $10, hidden = $11 \
-             where library_id = $1 and ($12::bigint is null or generation = $12)",
+                 files = $9, bytes = $10, hidden = $11, hidden_detail = $12, \
+                 next_check_at = $13 \
+             where library_id = $1 and ($14::bigint is null or generation = $14)",
         )
         .bind(library.0)
         .bind(u.state.as_str())
@@ -751,6 +759,8 @@ impl Db {
         .bind(u.files)
         .bind(u.bytes)
         .bind(u.hidden)
+        .bind(&u.hidden_detail)
+        .bind(u.next_check_at)
         .bind(generation)
         .execute(self.pool())
         .await?;

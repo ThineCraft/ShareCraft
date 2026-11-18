@@ -237,6 +237,7 @@ pub struct Shares {
     read_wait: RwLock<Duration>,
     operation_timeout: RwLock<Duration>,
     cache_max_bytes_for_tests: Mutex<Option<u64>>,
+    listing_progress: Mutex<HashMap<NodeId, Arc<AtomicUsize>>>,
 }
 
 impl Default for Shares {
@@ -257,6 +258,7 @@ impl Shares {
             read_wait: RwLock::new(crate::external::READ_WAIT),
             operation_timeout: RwLock::new(crate::external::OPERATION_WAIT),
             cache_max_bytes_for_tests: Mutex::new(None),
+            listing_progress: Mutex::new(HashMap::new()),
         }
     }
 
@@ -275,6 +277,29 @@ impl Shares {
             .fs
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = fs;
+    }
+
+    /// Files accepted so far by a share listing currently in progress.
+    #[must_use]
+    pub fn listing_progress(&self, library: NodeId) -> Option<usize> {
+        self.listing_progress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&library)
+            .map(|count| count.load(Ordering::SeqCst))
+    }
+
+    fn begin_listing(&self, library: NodeId) -> ListingProgress<'_> {
+        let count = Arc::new(AtomicUsize::new(0));
+        self.listing_progress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(library, Arc::clone(&count));
+        ListingProgress {
+            owner: self,
+            library,
+            count,
+        }
     }
 
     /// Takes the single-flight turn for one external node. Its map entry disappears when the
@@ -393,6 +418,34 @@ impl Shares {
     }
 }
 
+struct ListingProgress<'a> {
+    owner: &'a Shares,
+    library: NodeId,
+    count: Arc<AtomicUsize>,
+}
+
+impl ListingProgress<'_> {
+    fn counter(&self) -> &AtomicUsize {
+        &self.count
+    }
+}
+
+impl Drop for ListingProgress<'_> {
+    fn drop(&mut self) {
+        let mut progress = self
+            .owner
+            .listing_progress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if progress
+            .get(&self.library)
+            .is_some_and(|current| Arc::ptr_eq(current, &self.count))
+        {
+            progress.remove(&self.library);
+        }
+    }
+}
+
 pub(crate) struct Flight {
     node: NodeId,
     lock: Arc<tokio::sync::Mutex<()>>,
@@ -473,9 +526,17 @@ impl StorageSource for ShareSource {
             at_once: 4,
             max_depth: 100,
         };
-        let mut listed = list_share(state.shares().fs(), approved, &root, &limits)
-            .await
-            .map_err(|error| listing_failed(error, &settings))?;
+        let progress = state.shares().begin_listing(config.library);
+        let listed = list_share_progress(
+            state.shares().fs(),
+            approved,
+            &root,
+            &limits,
+            Some(progress.counter()),
+        )
+        .await;
+        drop(progress);
+        let mut listed = listed.map_err(|error| listing_failed(error, &settings))?;
 
         let mut protected = HashSet::new();
         if !listed.unreadable.is_empty() {
@@ -619,6 +680,16 @@ pub async fn list_share(
     approved_root: &SharePath,
     root: &SharePath,
     limits: &ListLimits,
+) -> Result<ShareListing, ListError> {
+    list_share_progress(fs, approved_root, root, limits, None).await
+}
+
+async fn list_share_progress(
+    fs: Arc<dyn ShareFs>,
+    approved_root: &SharePath,
+    root: &SharePath,
+    limits: &ListLimits,
+    progress: Option<&AtomicUsize>,
 ) -> Result<ShareListing, ListError> {
     let started = Instant::now();
     let deadline = started.checked_add(limits.max_time).unwrap_or(started);
@@ -770,6 +841,9 @@ pub async fn list_share(
                             sha: external_tag(child.size, child.mtime_ns),
                             size: child.size,
                         });
+                        if let Some(progress) = progress {
+                            progress.fetch_add(1, Ordering::SeqCst);
+                        }
                     }
                     FsKind::Dir => {
                         entries.push(TreeEntry {
