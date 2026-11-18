@@ -231,12 +231,11 @@ fn attributes(_meta: &fs::Metadata) -> u32 {
 /// Shared file-share read state.
 pub struct Shares {
     fs: RwLock<Arc<dyn ShareFs>>,
-    #[allow(dead_code)]
     read: Arc<tokio::sync::Semaphore>,
-    #[allow(dead_code)]
-    flights: Mutex<HashMap<NodeId, Arc<tokio::sync::Mutex<()>>>>,
-    #[allow(dead_code)]
+    flights: Arc<Mutex<HashMap<NodeId, Arc<tokio::sync::Mutex<()>>>>>,
     offline_until: Mutex<HashMap<NodeId, Instant>>,
+    read_wait: RwLock<Duration>,
+    cache_max_bytes_for_tests: Mutex<Option<u64>>,
 }
 
 impl Default for Shares {
@@ -251,9 +250,11 @@ impl Shares {
     pub fn new(fs: Arc<dyn ShareFs>) -> Self {
         Self {
             fs: RwLock::new(fs),
-            read: Arc::new(tokio::sync::Semaphore::new(4)),
-            flights: Mutex::new(HashMap::new()),
+            read: Arc::new(tokio::sync::Semaphore::new(crate::external::SHARE_READS)),
+            flights: Arc::new(Mutex::new(HashMap::new())),
             offline_until: Mutex::new(HashMap::new()),
+            read_wait: RwLock::new(crate::external::READ_WAIT),
+            cache_max_bytes_for_tests: Mutex::new(None),
         }
     }
 
@@ -272,6 +273,116 @@ impl Shares {
             .fs
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = fs;
+    }
+
+    /// Takes the single-flight turn for one external node. Its map entry disappears when the
+    /// last holder or waiter drops, including when a request is cancelled.
+    pub(crate) async fn flight(&self, node: NodeId) -> Flight {
+        let lock = {
+            let mut flights = self
+                .flights
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            Arc::clone(
+                flights
+                    .entry(node)
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+            )
+        };
+        let mut flight = Flight {
+            node,
+            lock,
+            guard: None,
+            flights: Arc::clone(&self.flights),
+        };
+        flight.guard = Some(Arc::clone(&flight.lock).lock_owned().await);
+        flight
+    }
+
+    pub(crate) async fn read_turn(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let wait = *self
+            .read_wait
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        tokio::time::timeout(wait, Arc::clone(&self.read).acquire_owned())
+            .await
+            .ok()
+            .and_then(Result::ok)
+    }
+
+    pub(crate) fn offline(&self, library: NodeId) -> bool {
+        let now = Instant::now();
+        let mut offline = self
+            .offline_until
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        offline.retain(|_, until| *until > now);
+        offline.get(&library).is_some_and(|until| *until > now)
+    }
+
+    pub(crate) fn mark_offline(&self, library: NodeId, for_time: Duration) {
+        self.offline_until
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(library, Instant::now() + for_time);
+    }
+
+    pub(crate) fn cache_max_bytes(&self, configured: u64) -> u64 {
+        self.cache_max_bytes_for_tests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or(configured)
+    }
+
+    /// Sets the Busy wait without changing its 20-second production default.
+    #[doc(hidden)]
+    pub fn set_read_wait(&self, wait: Duration) {
+        *self
+            .read_wait
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = wait;
+    }
+
+    /// Overrides cache accounting for integration tests without relaxing persisted settings.
+    #[doc(hidden)]
+    pub fn set_cache_max_bytes_for_tests(&self, bytes: u64) {
+        *self
+            .cache_max_bytes_for_tests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(bytes);
+    }
+
+    /// Number of node-flight entries. Used to prove cancellation cleanup in integration tests.
+    #[doc(hidden)]
+    pub fn flight_count_for_tests(&self) -> usize {
+        self.flights
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+}
+
+pub(crate) struct Flight {
+    node: NodeId,
+    lock: Arc<tokio::sync::Mutex<()>>,
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    flights: Arc<Mutex<HashMap<NodeId, Arc<tokio::sync::Mutex<()>>>>>,
+}
+
+impl Drop for Flight {
+    fn drop(&mut self) {
+        self.guard.take();
+        let mut flights = self
+            .flights
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if Arc::strong_count(&self.lock) == 2
+            && flights
+                .get(&self.node)
+                .is_some_and(|entry| Arc::ptr_eq(entry, &self.lock))
+        {
+            flights.remove(&self.node);
+        }
     }
 }
 

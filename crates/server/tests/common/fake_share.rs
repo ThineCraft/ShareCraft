@@ -1,6 +1,6 @@
 //! An in-memory file share used by the file-share integration tests.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -23,13 +23,15 @@ struct Inner {
     slow_open: Mutex<HashMap<PathBuf, Duration>>,
     slow_list: Mutex<Duration>,
     vanish_on_open: Mutex<HashSet<PathBuf>>,
-    change_during_read: Mutex<HashMap<PathBuf, Vec<u8>>>,
+    change_during_read: Mutex<HashMap<PathBuf, VecDeque<Vec<u8>>>>,
+    change_after_stat: Mutex<HashMap<PathBuf, VecDeque<Vec<u8>>>>,
     truncate_read: Mutex<HashMap<PathBuf, usize>>,
     lists: AtomicUsize,
     active_lists: AtomicUsize,
     maximum_active_lists: AtomicUsize,
     stats: AtomicUsize,
     opens: Mutex<HashMap<PathBuf, usize>>,
+    open_started: AtomicUsize,
     opened_paths: Mutex<Vec<PathBuf>>,
 }
 
@@ -61,12 +63,14 @@ impl FakeShare {
                 slow_list: Mutex::new(Duration::ZERO),
                 vanish_on_open: Mutex::new(HashSet::new()),
                 change_during_read: Mutex::new(HashMap::new()),
+                change_after_stat: Mutex::new(HashMap::new()),
                 truncate_read: Mutex::new(HashMap::new()),
                 lists: AtomicUsize::new(0),
                 active_lists: AtomicUsize::new(0),
                 maximum_active_lists: AtomicUsize::new(0),
                 stats: AtomicUsize::new(0),
                 opens: Mutex::new(HashMap::new()),
+                open_started: AtomicUsize::new(0),
                 opened_paths: Mutex::new(Vec::new()),
             }),
         }
@@ -181,7 +185,19 @@ impl FakeShare {
 
     pub fn change_during_read(&self, path: &str, new_bytes: impl AsRef<[u8]>) {
         self.changes()
-            .insert(self.path(path), new_bytes.as_ref().to_vec());
+            .entry(self.path(path))
+            .or_default()
+            .push_back(new_bytes.as_ref().to_vec());
+    }
+
+    pub fn change_after_stat(&self, path: &str, new_bytes: impl AsRef<[u8]>) {
+        self.inner
+            .change_after_stat
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(self.path(path))
+            .or_default()
+            .push_back(new_bytes.as_ref().to_vec());
     }
 
     pub fn truncate_read(&self, path: &str, at: usize) {
@@ -210,6 +226,10 @@ impl FakeShare {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    pub fn open_started(&self) -> usize {
+        self.inner.open_started.load(Ordering::SeqCst)
     }
 
     fn path(&self, path: &str) -> PathBuf {
@@ -269,7 +289,7 @@ impl FakeShare {
             .unwrap_or_else(|e| e.into_inner())
     }
 
-    fn changes(&self) -> std::sync::MutexGuard<'_, HashMap<PathBuf, Vec<u8>>> {
+    fn changes(&self) -> std::sync::MutexGuard<'_, HashMap<PathBuf, VecDeque<Vec<u8>>>> {
         self.inner
             .change_during_read
             .lock()
@@ -446,17 +466,38 @@ impl ShareFs for FakeShare {
         self.inner.stats.fetch_add(1, Ordering::SeqCst);
         self.unavailable(path)?;
         let canonical = self.canonical(approved_root, path)?;
-        let nodes = self.nodes();
-        nodes
+        let mut nodes = self.nodes();
+        let stat = nodes
             .get(path)
             .or_else(|| nodes.get(&canonical))
             .map(Node::stat)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "missing"))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "missing"))?;
+        let changed = {
+            let mut changes = self
+                .inner
+                .change_after_stat
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let changed = changes.get_mut(path).and_then(VecDeque::pop_front);
+            if changes.get(path).is_some_and(VecDeque::is_empty) {
+                changes.remove(path);
+            }
+            changed
+        };
+        if let Some(changed) = changed
+            && let Some(node) = nodes.get_mut(&canonical)
+        {
+            node.bytes = changed;
+            node.mtime_ns = node.mtime_ns.saturating_add(1);
+        }
+        Ok(stat)
     }
 
     fn open(&self, approved_root: &Path, path: &Path) -> io::Result<Box<dyn Read + Send>> {
         self.unavailable(path)?;
-        if let Some(delay) = self.slow_opens().get(path).copied() {
+        self.inner.open_started.fetch_add(1, Ordering::SeqCst);
+        let delay = self.slow_opens().get(path).copied();
+        if let Some(delay) = delay {
             std::thread::sleep(delay);
         }
         let canonical = self.canonical(approved_root, path)?;
@@ -486,7 +527,15 @@ impl ShareFs for FakeShare {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a file"));
         }
         let bytes = node.bytes.clone();
-        if let Some(changed) = self.changes().remove(path) {
+        let changed = {
+            let mut changes = self.changes();
+            let changed = changes.get_mut(path).and_then(VecDeque::pop_front);
+            if changes.get(path).is_some_and(VecDeque::is_empty) {
+                changes.remove(path);
+            }
+            changed
+        };
+        if let Some(changed) = changed {
             node.bytes = changed;
             node.mtime_ns = node.mtime_ns.saturating_add(1);
         }
