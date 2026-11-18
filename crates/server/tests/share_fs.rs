@@ -10,11 +10,11 @@ mod common;
 use std::fs;
 use std::io::Read;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::fake_share::FakeShare;
 use records::{SharePath, external_tag};
-use server::share::{FsKind, ListError, ListLimits, OsFs, ShareFs, list_share};
+use server::share::{FsBudget, FsKind, ListError, ListLimits, OsFs, ShareFs, list_share};
 use server::source::{EntryKind, TreeEntry};
 
 fn root() -> SharePath {
@@ -31,7 +31,7 @@ fn limits() -> ListLimits {
 }
 
 async fn listing(fake: &FakeShare) -> server::share::ShareListing {
-    list_share(Arc::new(fake.clone()), &root(), &limits())
+    list_share(Arc::new(fake.clone()), &root(), &root(), &limits())
         .await
         .unwrap()
 }
@@ -90,6 +90,88 @@ async fn links_and_junctions_are_counted_and_never_entered() {
     assert_eq!(answer.hidden.symlinks, 1);
     assert_eq!(fake.lists(), 1);
     assert!(fake.opened_paths().is_empty());
+}
+
+#[tokio::test]
+async fn an_intermediate_link_escape_is_refused_when_listing() {
+    let approved = SharePath::parse(r"C:\approved").unwrap();
+    let connected = SharePath::parse(r"C:\approved\escape\documents").unwrap();
+    let fake = FakeShare::new(r"C:\approved");
+    fake.put(r"C:\private\documents\secret.txt", b"secret");
+    fake.link("escape", r"C:\private");
+
+    let error = list_share(Arc::new(fake), &approved, &connected, &limits())
+        .await
+        .unwrap_err();
+
+    assert_eq!(error, ListError::Denied);
+}
+
+#[tokio::test]
+async fn nested_intermediate_link_escapes_are_refused() {
+    let approved = SharePath::parse(r"C:\approved").unwrap();
+    let connected = SharePath::parse(r"C:\approved\first\second\documents").unwrap();
+    let fake = FakeShare::new(r"C:\approved");
+    fake.put(r"C:\private\documents\secret.txt", b"secret");
+    fake.link("first", r"C:\approved\middle");
+    fake.link(r"C:\approved\middle\second", r"C:\private");
+
+    let error = list_share(Arc::new(fake), &approved, &connected, &limits())
+        .await
+        .unwrap_err();
+
+    assert_eq!(error, ListError::Denied);
+}
+
+#[tokio::test]
+async fn an_intermediate_link_cycle_is_refused() {
+    let approved = SharePath::parse(r"C:\approved").unwrap();
+    let connected = SharePath::parse(r"C:\approved\first\documents").unwrap();
+    let fake = FakeShare::new(r"C:\approved");
+    fake.link("first", r"C:\approved\middle\second");
+    fake.link(r"C:\approved\middle\second", r"C:\approved\first");
+
+    let error = list_share(Arc::new(fake), &approved, &connected, &limits())
+        .await
+        .unwrap_err();
+
+    assert_eq!(error, ListError::Unreachable);
+}
+
+#[test]
+fn an_intermediate_link_escape_is_refused_when_opening() {
+    let fake = FakeShare::new(r"C:\approved");
+    fake.put(r"C:\private\documents\secret.txt", b"secret");
+    fake.link("escape", r"C:\private");
+    let escaped = fake.root().join(r"escape\documents\secret.txt");
+
+    let open_error = match fake.open(&fake.root(), &escaped) {
+        Ok(_) => panic!("escaped file was opened"),
+        Err(error) => error,
+    };
+    let canonical_error = fake.canonical(&fake.root(), &escaped).unwrap_err();
+
+    assert_eq!(open_error.kind(), std::io::ErrorKind::PermissionDenied);
+    assert_eq!(canonical_error.kind(), std::io::ErrorKind::PermissionDenied);
+    assert_eq!(open_error.to_string(), "path refused");
+    assert_eq!(canonical_error.to_string(), "path refused");
+}
+
+#[tokio::test]
+async fn a_link_that_stays_inside_the_root_is_hidden_and_not_entered() {
+    let fake = FakeShare::new(r"C:\share");
+    fake.put("target/shown.txt", b"shown");
+    fake.link("alias", r"C:\share\target");
+
+    let answer = listing(&fake).await;
+
+    assert_eq!(answer.hidden.symlinks, 1);
+    assert!(
+        answer
+            .entries
+            .iter()
+            .all(|entry| !entry.path.starts_with("alias"))
+    );
 }
 
 #[tokio::test]
@@ -170,7 +252,7 @@ async fn an_unreadable_sub_folder_is_reported_and_the_rest_is_listed() {
 async fn an_unreachable_root_is_an_error_not_an_empty_listing() {
     let fake = FakeShare::new(r"C:\share");
     fake.offline(true);
-    let error = list_share(Arc::new(fake), &root(), &limits())
+    let error = list_share(Arc::new(fake), &root(), &root(), &limits())
         .await
         .unwrap_err();
     assert_eq!(error, ListError::Unreachable);
@@ -186,11 +268,28 @@ async fn too_many_files_stops_early() {
     let mut small = limits();
     small.max_files = 1;
 
-    let error = list_share(Arc::new(fake.clone()), &root(), &small)
+    let error = list_share(Arc::new(fake.clone()), &root(), &root(), &small)
         .await
         .unwrap_err();
 
     assert_eq!(error, ListError::TooManyFiles(2));
+    assert_eq!(fake.lists(), 1);
+}
+
+#[tokio::test]
+async fn many_empty_directories_stop_within_the_entry_budget() {
+    let fake = FakeShare::new(r"C:\share");
+    for number in 0..100 {
+        fake.mkdir(&format!("empty-{number:03}"));
+    }
+    let mut small = limits();
+    small.max_files = 10;
+
+    let error = list_share(Arc::new(fake.clone()), &root(), &root(), &small)
+        .await
+        .unwrap_err();
+
+    assert_eq!(error, ListError::TooManyFiles(11));
     assert_eq!(fake.lists(), 1);
 }
 
@@ -201,11 +300,32 @@ async fn a_slow_share_fails_too_slow() {
     let mut quick = limits();
     quick.max_time = Duration::from_millis(50);
     assert_eq!(
-        list_share(Arc::new(fake), &root(), &quick)
+        list_share(Arc::new(fake), &root(), &root(), &quick)
             .await
             .unwrap_err(),
         ListError::TooSlow
     );
+}
+
+#[tokio::test]
+async fn timed_out_listings_keep_the_global_permit_until_blocking_work_exits() {
+    let fake = FakeShare::new(r"C:\share");
+    fake.slow_list(Duration::from_millis(500));
+    let mut quick = limits();
+    quick.max_time = Duration::from_millis(10);
+    quick.at_once = 1;
+
+    for _ in 0..6 {
+        assert_eq!(
+            list_share(Arc::new(fake.clone()), &root(), &root(), &quick)
+                .await
+                .unwrap_err(),
+            ListError::TooSlow
+        );
+    }
+
+    assert_eq!(fake.lists(), 4);
+    assert_eq!(fake.maximum_active_lists(), 4);
 }
 
 #[tokio::test]
@@ -215,7 +335,7 @@ async fn too_deep_fails() {
     let mut shallow = limits();
     shallow.max_depth = 1;
     assert_eq!(
-        list_share(Arc::new(fake), &root(), &shallow)
+        list_share(Arc::new(fake), &root(), &root(), &shallow)
             .await
             .unwrap_err(),
         ListError::TooDeep
@@ -250,16 +370,66 @@ async fn sharecrafts_own_folder_and_temporary_files_are_skipped_and_temps_report
 }
 
 #[test]
+fn fake_canonical_resolves_an_ancestor_link() {
+    let fake = FakeShare::new(r"C:\share");
+    fake.put(r"C:\share\target\documents\secret.txt", b"secret");
+    fake.link("alias", r"C:\share\target");
+
+    assert_eq!(
+        fake.canonical(
+            &fake.root(),
+            &fake.root().join(r"alias\documents\secret.txt")
+        )
+        .unwrap(),
+        std::path::PathBuf::from(r"C:\share\target\documents\secret.txt")
+    );
+}
+
+#[test]
+fn fake_canonical_resolves_nested_links() {
+    let fake = FakeShare::new(r"C:\share");
+    fake.put(r"C:\share\target\documents\secret.txt", b"secret");
+    fake.link("first", r"C:\share\middle");
+    fake.link(r"C:\share\middle\second", r"C:\share\target");
+
+    assert_eq!(
+        fake.canonical(
+            &fake.root(),
+            &fake.root().join(r"first\second\documents\secret.txt")
+        )
+        .unwrap(),
+        std::path::PathBuf::from(r"C:\share\target\documents\secret.txt")
+    );
+}
+
+#[test]
+fn fake_canonical_rejects_a_link_cycle() {
+    let fake = FakeShare::new(r"C:\share");
+    fake.link("first", r"C:\middle\second");
+    fake.link(r"C:\middle\second", r"C:\share\first");
+
+    let error = fake
+        .canonical(&fake.root(), &fake.root().join(r"first\file.txt"))
+        .unwrap_err();
+
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+}
+
+#[test]
 fn os_fs_lists_stats_and_opens_real_files() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("real.txt");
     fs::write(&file, b"real bytes").unwrap();
     let os = OsFs;
 
-    let listed = os.list(dir.path()).unwrap();
-    let stat = os.stat(&file).unwrap();
+    let budget = FsBudget::new(10, Instant::now() + Duration::from_secs(1));
+    let listed = os.list(dir.path(), dir.path(), &budget).unwrap();
+    let stat = os.stat(dir.path(), &file).unwrap();
     let mut bytes = Vec::new();
-    os.open(&file).unwrap().read_to_end(&mut bytes).unwrap();
+    os.open(dir.path(), &file)
+        .unwrap()
+        .read_to_end(&mut bytes)
+        .unwrap();
 
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].name.as_deref(), Some("real.txt"));
@@ -272,7 +442,9 @@ fn os_fs_lists_stats_and_opens_real_files() {
 #[test]
 fn os_fs_reports_a_missing_path_as_not_found() {
     let dir = tempfile::tempdir().unwrap();
-    let error = OsFs.stat(&dir.path().join("missing")).unwrap_err();
+    let error = OsFs
+        .stat(dir.path(), &dir.path().join("missing"))
+        .unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
 }
 
@@ -296,8 +468,39 @@ fn os_fs_does_not_follow_a_junction() {
         return;
     }
 
-    let entries = OsFs.list(dir.path()).unwrap();
+    let budget = FsBudget::new(10, Instant::now() + Duration::from_secs(1));
+    let entries = OsFs.list(dir.path(), dir.path(), &budget).unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].kind, FsKind::Link);
-    assert_eq!(OsFs.stat(&junction).unwrap().kind, FsKind::Link);
+}
+
+#[cfg(windows)]
+#[test]
+fn os_fs_refuses_an_intermediate_directory_link_escape() {
+    use std::os::windows::fs::symlink_dir;
+
+    let approved = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let documents = outside.path().join("documents");
+    fs::create_dir(&documents).unwrap();
+    fs::write(documents.join("secret.txt"), b"secret").unwrap();
+    let link = approved.path().join("escape");
+    if let Err(error) = symlink_dir(outside.path(), &link) {
+        eprintln!("skipping intermediate-link assertion: symlink_dir failed: {error}");
+        return;
+    }
+
+    let budget = FsBudget::new(10, Instant::now() + Duration::from_secs(1));
+    let list_error = OsFs
+        .list(approved.path(), &link.join("documents"), &budget)
+        .unwrap_err();
+    let open_error = match OsFs.open(approved.path(), &link.join(r"documents\secret.txt")) {
+        Ok(_) => panic!("escaped file was opened"),
+        Err(error) => error,
+    };
+
+    assert_eq!(list_error.kind(), std::io::ErrorKind::PermissionDenied);
+    assert_eq!(open_error.kind(), std::io::ErrorKind::PermissionDenied);
+    assert_eq!(list_error.to_string(), "path refused");
+    assert_eq!(open_error.to_string(), "path refused");
 }

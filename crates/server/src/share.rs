@@ -4,7 +4,8 @@ use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use collab_core::ids::NodeId;
@@ -50,42 +51,91 @@ pub struct FsStat {
 }
 
 /// The Phase 1 file-system seam. It deliberately has no write operation.
+///
+/// Every operation receives the approved root and performs its own canonical containment check,
+/// so a caller cannot accidentally list or open through an unchecked ancestor link. There remains
+/// a small accepted check-then-use window if an ancestor is replaced after canonicalization and
+/// before the operating-system operation; closing it needs handle-relative APIs that require
+/// unsafe code or another crate. Canonicalization is therefore done immediately before use.
+///
+/// Hard-linked files are a known residual risk: stable Rust exposes no Windows link-count API, so
+/// this seam cannot identify two names for the same file object without unsafe code or a new crate.
 pub trait ShareFs: Send + Sync + 'static {
-    /// Lists one folder and never follows a link.
-    fn list(&self, dir: &Path) -> io::Result<Vec<FsEntry>>;
+    /// Lists one folder within `approved_root`, never follows its final link, and stops at `budget`.
+    fn list(&self, approved_root: &Path, dir: &Path, budget: &FsBudget)
+    -> io::Result<Vec<FsEntry>>;
     /// Reads metadata and never follows a link.
-    fn stat(&self, path: &Path) -> io::Result<FsStat>;
-    /// Opens one file read-only.
-    fn open(&self, path: &Path) -> io::Result<Box<dyn Read + Send>>;
-    /// Resolves links for a containment check.
-    fn canonical(&self, path: &Path) -> io::Result<PathBuf>;
+    fn stat(&self, approved_root: &Path, path: &Path) -> io::Result<FsStat>;
+    /// Opens one contained file read-only.
+    fn open(&self, approved_root: &Path, path: &Path) -> io::Result<Box<dyn Read + Send>>;
+    /// Resolves links and refuses a result outside `approved_root`.
+    fn canonical(&self, approved_root: &Path, path: &Path) -> io::Result<PathBuf>;
+}
+
+/// A deadline and shared entry allowance used by all folder reads in one listing.
+#[derive(Clone)]
+pub struct FsBudget {
+    remaining: Arc<AtomicUsize>,
+    deadline: Instant,
+}
+
+impl FsBudget {
+    #[must_use]
+    pub fn new(max_entries: usize, deadline: Instant) -> Self {
+        Self {
+            remaining: Arc::new(AtomicUsize::new(max_entries)),
+            deadline,
+        }
+    }
+
+    /// Claims room for one enumerated entry.
+    pub fn claim(&self) -> io::Result<()> {
+        if Instant::now() >= self.deadline {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "listing timed out"));
+        }
+        self.remaining
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .map(|_| ())
+            .map_err(|_| io::Error::new(io::ErrorKind::FileTooLarge, "entry limit exceeded"))
+    }
 }
 
 /// The operating-system implementation of [`ShareFs`].
 pub struct OsFs;
 
 impl ShareFs for OsFs {
-    fn list(&self, dir: &Path) -> io::Result<Vec<FsEntry>> {
+    fn list(
+        &self,
+        approved_root: &Path,
+        dir: &Path,
+        budget: &FsBudget,
+    ) -> io::Result<Vec<FsEntry>> {
+        canonical_within(approved_root, dir)?;
         let dir_meta = fs::symlink_metadata(dir)?;
         if kind(&dir_meta) != FsKind::Dir {
             return Err(io::Error::new(io::ErrorKind::NotADirectory, "not a folder"));
         }
-        fs::read_dir(dir)?
-            .map(|answer| {
-                let entry = answer?;
-                let meta = fs::symlink_metadata(entry.path())?;
-                Ok(FsEntry {
-                    name: entry.file_name().into_string().ok(),
-                    kind: kind(&meta),
-                    size: meta.len(),
-                    mtime_ns: modified_ns(&meta),
-                    attributes: attributes(&meta),
-                })
-            })
-            .collect()
+        let canonical = canonical_within(approved_root, dir)?;
+        let mut entries = Vec::new();
+        for answer in fs::read_dir(canonical)? {
+            let entry = answer?;
+            budget.claim()?;
+            let meta = fs::symlink_metadata(entry.path())?;
+            entries.push(FsEntry {
+                name: entry.file_name().into_string().ok(),
+                kind: kind(&meta),
+                size: meta.len(),
+                mtime_ns: modified_ns(&meta),
+                attributes: attributes(&meta),
+            });
+        }
+        Ok(entries)
     }
 
-    fn stat(&self, path: &Path) -> io::Result<FsStat> {
+    fn stat(&self, approved_root: &Path, path: &Path) -> io::Result<FsStat> {
+        canonical_within(approved_root, path)?;
         let meta = fs::symlink_metadata(path)?;
         Ok(FsStat {
             kind: kind(&meta),
@@ -95,13 +145,47 @@ impl ShareFs for OsFs {
         })
     }
 
-    fn open(&self, path: &Path) -> io::Result<Box<dyn Read + Send>> {
-        fs::File::open(path).map(|file| Box::new(file) as Box<dyn Read + Send>)
+    fn open(&self, approved_root: &Path, path: &Path) -> io::Result<Box<dyn Read + Send>> {
+        canonical_within(approved_root, path)?;
+        let meta = fs::symlink_metadata(path)?;
+        if kind(&meta) != FsKind::File {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a file"));
+        }
+        let canonical = canonical_within(approved_root, path)?;
+        fs::File::open(canonical).map(|file| Box::new(file) as Box<dyn Read + Send>)
     }
 
-    fn canonical(&self, path: &Path) -> io::Result<PathBuf> {
-        fs::canonicalize(path)
+    fn canonical(&self, approved_root: &Path, path: &Path) -> io::Result<PathBuf> {
+        canonical_within(approved_root, path)
     }
+}
+
+fn canonical_within(approved_root: &Path, path: &Path) -> io::Result<PathBuf> {
+    let canonical_root = fs::canonicalize(approved_root)?;
+    let canonical_path = fs::canonicalize(path)?;
+    let root = share_path_from_canonical(&canonical_root)?;
+    let candidate = share_path_from_canonical(&canonical_path)?;
+    if candidate.is_within(&root) {
+        Ok(canonical_path)
+    } else {
+        Err(path_refused())
+    }
+}
+
+fn share_path_from_canonical(path: &Path) -> io::Result<SharePath> {
+    let text = path.to_str().ok_or_else(path_refused)?;
+    let normal = if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        text.to_string()
+    };
+    SharePath::parse(&normal).map_err(|_| path_refused())
+}
+
+fn path_refused() -> io::Error {
+    io::Error::new(io::ErrorKind::PermissionDenied, "path refused")
 }
 
 fn kind(meta: &fs::Metadata) -> FsKind {
@@ -232,20 +316,34 @@ struct FolderAnswer {
     answer: io::Result<Vec<FsEntry>>,
 }
 
+fn blocking_permits() -> &'static Arc<tokio::sync::Semaphore> {
+    static PERMITS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    PERMITS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(4)))
+}
+
 /// Walks a share breadth first on blocking threads and returns only a complete listing.
 pub async fn list_share(
     fs: Arc<dyn ShareFs>,
+    approved_root: &SharePath,
     root: &SharePath,
     limits: &ListLimits,
 ) -> Result<ShareListing, ListError> {
     let started = Instant::now();
+    let deadline = started.checked_add(limits.max_time).unwrap_or(started);
+    let budget = FsBudget::new(limits.max_files, deadline);
+    let approved_path = approved_root.to_path_buf();
     let root_path = root.to_path_buf();
     let stat_fs = Arc::clone(&fs);
+    let stat_approved = approved_path.clone();
     let stat_path = root_path.clone();
+    let stat_permit = acquire_permit(started, limits.max_time).await?;
     let stat = wait_for(
         started,
         limits.max_time,
-        tokio::task::spawn_blocking(move || stat_fs.stat(&stat_path)),
+        tokio::task::spawn_blocking(move || {
+            let _permit = stat_permit;
+            stat_fs.stat(&stat_approved, &stat_path)
+        }),
     )
     .await?;
     let stat = stat.map_err(|error| kind_of_failure(&error))?;
@@ -258,7 +356,6 @@ pub async fn list_share(
     let mut hidden = Hidden::default();
     let mut unreadable = Vec::new();
     let mut temps = Vec::new();
-    let mut files = 0_usize;
     let at_once = limits.at_once.max(1);
 
     while !queue.is_empty() {
@@ -270,9 +367,15 @@ pub async fn list_share(
             let Some((path, relative, depth, root)) = queue.pop_front() else {
                 break;
             };
+            let permit = acquire_permit(started, limits.max_time).await?;
             let turn_fs = Arc::clone(&fs);
+            let turn_approved = approved_path.clone();
+            let turn_budget = budget.clone();
             turns.spawn_blocking(move || FolderAnswer {
-                answer: turn_fs.list(&path),
+                answer: {
+                    let _permit = permit;
+                    turn_fs.list(&turn_approved, &path, &turn_budget)
+                },
                 path,
                 relative,
                 depth,
@@ -294,11 +397,21 @@ pub async fn list_share(
             let folder = joined.map_err(|_| ListError::Unreachable)?;
             let children = match folder.answer {
                 Ok(children) => children,
+                Err(error) if error.kind() == io::ErrorKind::TimedOut => {
+                    return Err(ListError::TooSlow);
+                }
+                Err(error) if error.kind() == io::ErrorKind::FileTooLarge => {
+                    return Err(ListError::TooManyFiles(limits.max_files.saturating_add(1)));
+                }
                 Err(error) if folder.root => {
                     if error.kind() == io::ErrorKind::NotADirectory {
                         return Err(ListError::NotAFolder);
                     }
                     return Err(kind_of_failure(&error));
+                }
+                Err(error) if is_path_refusal(&error) => {
+                    hidden.symlinks = hidden.symlinks.saturating_add(1);
+                    continue;
                 }
                 Err(_) => {
                     hidden.unreadable = hidden.unreadable.saturating_add(1);
@@ -359,10 +472,6 @@ pub async fn list_share(
                 }
                 match child.kind {
                     FsKind::File => {
-                        files = files.saturating_add(1);
-                        if files > limits.max_files {
-                            return Err(ListError::TooManyFiles(files));
-                        }
                         entries.push(TreeEntry {
                             path: relative,
                             kind: EntryKind::File,
@@ -395,6 +504,24 @@ pub async fn list_share(
         temps,
         took: started.elapsed(),
     })
+}
+
+async fn acquire_permit(
+    started: Instant,
+    maximum: Duration,
+) -> Result<tokio::sync::OwnedSemaphorePermit, ListError> {
+    let remaining = maximum.saturating_sub(started.elapsed());
+    if remaining.is_zero() {
+        return Err(ListError::TooSlow);
+    }
+    tokio::time::timeout(remaining, Arc::clone(blocking_permits()).acquire_owned())
+        .await
+        .map_err(|_| ListError::TooSlow)?
+        .map_err(|_| ListError::Unreachable)
+}
+
+fn is_path_refusal(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::PermissionDenied && error.to_string() == "path refused"
 }
 
 async fn wait_for<T>(

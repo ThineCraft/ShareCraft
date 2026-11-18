@@ -7,7 +7,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use server::share::{FsEntry, FsKind, FsStat, ShareFs};
+use records::SharePath;
+use server::share::{FsBudget, FsEntry, FsKind, FsStat, ShareFs};
 
 #[derive(Clone)]
 pub struct FakeShare {
@@ -25,6 +26,8 @@ struct Inner {
     change_during_read: Mutex<HashMap<PathBuf, Vec<u8>>>,
     truncate_read: Mutex<HashMap<PathBuf, usize>>,
     lists: AtomicUsize,
+    active_lists: AtomicUsize,
+    maximum_active_lists: AtomicUsize,
     stats: AtomicUsize,
     opens: Mutex<HashMap<PathBuf, usize>>,
     opened_paths: Mutex<Vec<PathBuf>>,
@@ -60,6 +63,8 @@ impl FakeShare {
                 change_during_read: Mutex::new(HashMap::new()),
                 truncate_read: Mutex::new(HashMap::new()),
                 lists: AtomicUsize::new(0),
+                active_lists: AtomicUsize::new(0),
+                maximum_active_lists: AtomicUsize::new(0),
                 stats: AtomicUsize::new(0),
                 opens: Mutex::new(HashMap::new()),
                 opened_paths: Mutex::new(Vec::new()),
@@ -191,6 +196,10 @@ impl FakeShare {
         self.inner.stats.load(Ordering::SeqCst)
     }
 
+    pub fn maximum_active_lists(&self) -> usize {
+        self.inner.maximum_active_lists.load(Ordering::SeqCst)
+    }
+
     pub fn opens(&self, path: &str) -> usize {
         self.opens_map().get(&self.path(path)).copied().unwrap_or(0)
     }
@@ -287,6 +296,75 @@ impl FakeShare {
         }
         Ok(())
     }
+
+    fn resolve(&self, path: &Path) -> io::Result<PathBuf> {
+        let nodes = self.nodes();
+        let mut current = path.to_path_buf();
+        let mut seen = HashSet::new();
+        loop {
+            if !seen.insert(current.clone()) {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "link cycle"));
+            }
+
+            let components: Vec<_> = current
+                .components()
+                .map(|component| component.as_os_str().to_owned())
+                .collect();
+            let mut prefix = PathBuf::new();
+            let mut replacement = None;
+            for (position, component) in components.iter().enumerate() {
+                prefix.push(component);
+                let Some(target) = nodes.get(&prefix).and_then(|node| node.target.as_ref()) else {
+                    continue;
+                };
+                let mut resolved = target.clone();
+                for suffix in components.iter().skip(position.saturating_add(1)) {
+                    resolved.push(suffix);
+                }
+                replacement = Some(resolved);
+                break;
+            }
+
+            if let Some(resolved) = replacement {
+                current = resolved;
+                continue;
+            }
+            return nodes
+                .contains_key(&current)
+                .then_some(current)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "missing"));
+        }
+    }
+
+    fn contained(&self, approved_root: &Path, path: &Path) -> io::Result<PathBuf> {
+        let root = self.resolve(approved_root)?;
+        let candidate = self.resolve(path)?;
+        let root = root
+            .to_str()
+            .and_then(|text| SharePath::parse(text).ok())
+            .ok_or_else(path_refused)?;
+        let parsed = candidate
+            .to_str()
+            .and_then(|text| SharePath::parse(text).ok())
+            .ok_or_else(path_refused)?;
+        if parsed.is_within(&root) {
+            Ok(candidate)
+        } else {
+            Err(path_refused())
+        }
+    }
+}
+
+struct ActiveList<'a>(&'a AtomicUsize);
+
+impl Drop for ActiveList<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn path_refused() -> io::Error {
+    io::Error::new(io::ErrorKind::PermissionDenied, "path refused")
 }
 
 impl Node {
@@ -312,51 +390,86 @@ impl Node {
 }
 
 impl ShareFs for FakeShare {
-    fn list(&self, dir: &Path) -> io::Result<Vec<FsEntry>> {
+    fn list(
+        &self,
+        approved_root: &Path,
+        dir: &Path,
+        budget: &FsBudget,
+    ) -> io::Result<Vec<FsEntry>> {
         self.inner.lists.fetch_add(1, Ordering::SeqCst);
+        let active = self.inner.active_lists.fetch_add(1, Ordering::SeqCst) + 1;
+        self.inner
+            .maximum_active_lists
+            .fetch_max(active, Ordering::SeqCst);
+        let _active = ActiveList(&self.inner.active_lists);
         self.unavailable(dir)?;
         let delay = *self.slow_listing();
         if !delay.is_zero() {
             std::thread::sleep(delay);
         }
+        let canonical = self.canonical(approved_root, dir)?;
+        if self
+            .nodes()
+            .get(dir)
+            .is_some_and(|node| node.kind == FsKind::Link)
+        {
+            return Err(io::Error::new(io::ErrorKind::NotADirectory, "not a folder"));
+        }
+        let dir = self.canonical(approved_root, &canonical)?;
         let nodes = self.nodes();
-        let Some(parent) = nodes.get(dir) else {
+        let Some(parent) = nodes.get(&dir) else {
             return Err(io::Error::new(io::ErrorKind::NotFound, "missing"));
         };
         if parent.kind != FsKind::Dir {
             return Err(io::Error::new(io::ErrorKind::NotADirectory, "not a folder"));
         }
-        let mut entries: Vec<FsEntry> = nodes
+        let mut children: Vec<_> = nodes
             .iter()
-            .filter(|(path, _)| path.parent() == Some(dir))
-            .map(|(_, node)| FsEntry {
+            .filter(|(path, _)| path.parent() == Some(dir.as_path()))
+            .collect();
+        children.sort_by(|left, right| left.1.name.cmp(&right.1.name));
+        let mut entries = Vec::new();
+        for (_, node) in children {
+            budget.claim()?;
+            entries.push(FsEntry {
                 name: node.name.clone(),
                 kind: node.kind,
                 size: node.bytes.len() as u64,
                 mtime_ns: node.mtime_ns,
                 attributes: node.attributes,
-            })
-            .collect();
-        entries.sort_by(|a, b| a.name.cmp(&b.name));
+            });
+        }
         Ok(entries)
     }
 
-    fn stat(&self, path: &Path) -> io::Result<FsStat> {
+    fn stat(&self, approved_root: &Path, path: &Path) -> io::Result<FsStat> {
         self.inner.stats.fetch_add(1, Ordering::SeqCst);
         self.unavailable(path)?;
-        self.nodes()
+        let canonical = self.canonical(approved_root, path)?;
+        let nodes = self.nodes();
+        nodes
             .get(path)
+            .or_else(|| nodes.get(&canonical))
             .map(Node::stat)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "missing"))
     }
 
-    fn open(&self, path: &Path) -> io::Result<Box<dyn Read + Send>> {
+    fn open(&self, approved_root: &Path, path: &Path) -> io::Result<Box<dyn Read + Send>> {
         self.unavailable(path)?;
         if let Some(delay) = self.slow_opens().get(path).copied() {
             std::thread::sleep(delay);
         }
+        let canonical = self.canonical(approved_root, path)?;
+        if self
+            .nodes()
+            .get(path)
+            .is_some_and(|node| node.kind == FsKind::Link)
+        {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a file"));
+        }
+        let canonical = self.canonical(approved_root, &canonical)?;
         if self.vanishing().remove(path) {
-            self.nodes().remove(path);
+            self.nodes().remove(&canonical);
             return Err(io::Error::new(io::ErrorKind::NotFound, "missing"));
         }
         *self.opens_map().entry(path.to_path_buf()).or_default() += 1;
@@ -366,7 +479,7 @@ impl ShareFs for FakeShare {
             .unwrap_or_else(|e| e.into_inner())
             .push(path.to_path_buf());
         let mut nodes = self.nodes();
-        let Some(node) = nodes.get_mut(path) else {
+        let Some(node) = nodes.get_mut(&canonical) else {
             return Err(io::Error::new(io::ErrorKind::NotFound, "missing"));
         };
         if node.kind != FsKind::File {
@@ -384,12 +497,8 @@ impl ShareFs for FakeShare {
         )
     }
 
-    fn canonical(&self, path: &Path) -> io::Result<PathBuf> {
+    fn canonical(&self, approved_root: &Path, path: &Path) -> io::Result<PathBuf> {
         self.unavailable(path)?;
-        let nodes = self.nodes();
-        let Some(node) = nodes.get(path) else {
-            return Err(io::Error::new(io::ErrorKind::NotFound, "missing"));
-        };
-        Ok(node.target.clone().unwrap_or_else(|| path.to_path_buf()))
+        self.contained(approved_root, path)
     }
 }
