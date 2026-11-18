@@ -1,0 +1,433 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ShareCraft — GridCraft Co-authoring (Plan G3): Implementation Plan</title>
+<style>
+:root{color-scheme:light dark;--ink:light-dark(#172f38,#e4ecef);--muted:light-dark(#536b72,#a9b9bf);--line:light-dark(#d7e2e3,#36454b);--paper:light-dark(#fff,#1d272b);--wash:light-dark(#f2f6f5,#141b1e);--accent:light-dark(#3156c9,#9db4ff);font:15px/1.6 Segoe UI,system-ui,sans-serif;color:var(--ink);background:var(--wash)}
+*{box-sizing:border-box}body{margin:0;padding:28px 18px 80px}main{max-width:940px;margin:auto}
+h1{font-size:1.9rem;letter-spacing:-.03em;line-height:1.2;margin:0 0 14px}h2{font-size:1.3rem;margin:38px 0 12px;padding-top:18px;border-top:1px solid var(--line)}h3{font-size:1.08rem;margin:30px 0 8px}h4{font-size:.95rem;margin:16px 0 6px}
+p{margin:0 0 12px}ul,ol{margin:0 0 12px;padding-left:22px}li{margin-bottom:6px}a{color:var(--accent)}
+code{font-family:Consolas,Menlo,monospace;font-size:.88em;background:light-dark(#e9efee,#263238);padding:1px 5px;border-radius:3px;overflow-wrap:anywhere}
+pre{background:var(--paper);border:1px solid var(--line);border-radius:7px;padding:12px 14px;overflow-x:auto;font:13px/1.5 Consolas,Menlo,monospace;margin:0 0 12px}pre code{background:none;padding:0;font-size:inherit}
+.note{border-left:4px solid var(--accent);background:var(--paper);padding:12px 16px;margin:0 0 14px}.note p:last-child{margin:0}
+.task{background:var(--paper);border:1px solid var(--line);border-radius:9px;padding:6px 20px 14px;margin:18px 0}
+ol.steps{list-style:none;padding-left:0}ol.steps>li{padding-left:28px;position:relative;margin-bottom:10px}ol.steps>li::before{content:"☐";position:absolute;left:2px;color:var(--muted)}
+table{border-collapse:collapse;width:100%;font-size:.9rem;background:var(--paper);margin-bottom:14px}th,td{border:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top}th{background:light-dark(#e8efed,#263238)}
+.small{font-size:.88rem;color:var(--muted)}
+tbody tr:nth-child(even) td{background:light-dark(#f4f8f7,#212b30)}
+ol.steps>li:nth-child(even),ul.band>li:nth-child(even),ol.band>li:nth-child(even){background:light-dark(#f4f8f7,#212b30);border-radius:4px}
+</style>
+</head>
+<body><main>
+<h1>GridCraft live co-authoring, plan G3: identities, explicit commands, the apply loop and per-person undo: implementation plan</h1>
+<p class="small">ShareCraft &middot; Stage 2, GridCraft editor track &middot; Written 18 November 2026 &middot; Base <code>sharecraft</code> at <code>097d1514</code> &middot; Branch <code>coauthor-g3</code></p>
+<div class="note"><p><strong>For agentic workers:</strong> REQUIRED SUB-SKILL: use <code>superpowers:subagent-driven-development</code> or <code>superpowers:executing-plans</code>. Steps are checkboxes. Read the binding spec and the G1 proof report before starting. One task id per commit; do not put AI or agent attribution in a commit or pull request.</p></div>
+
+<p><strong>Goal:</strong> make the first GridCraft commands safe to put into ShareCraft's one ordered live log. A command names sheets, rows and columns by session identity rather than by whatever position they occupy now; every shared command carries all of its targets; the G2 client can copy, restore, apply and re-run a GridCraft document; and Undo sends a guarded reverse of this person's last action without removing another person's later work.</p>
+<p><strong>Architecture:</strong></p>
+<ul>
+<li><code>gridcraft-engine::coauthor</code> is the fork-owned adapter. It owns a normal <code>Session</code>, a session-only identity table, and the personal undo history, and implements G2's <code>collab_live::client::LiveEditor</code>. The existing engine stays the sole executor of workbook changes.</li>
+<li>A canonical <code>gridcraft/1</code> JSON payload is produced before <code>LiveClient::local</code>. It contains one allow-listed command, identity targets, formula references by identity, and the origin year used for a date typed without a year. The receiving adapter resolves identities to current positions and calls <code>Session::execute</code> with the existing explicit command form.</li>
+<li><code>GridSnapshot</code> copies only agreed document state: workbook, calculation state (including RAND), revision, and identities. It deliberately excludes a person's active sheet, selection and personal history. Applying a received command captures and restores that view by sheet identity.</li>
+<li><code>GridCoauthor</code> composes <code>LiveClient&lt;GridLiveEditor&gt;</code> with personal-history bookkeeping. G3 drives it only through an in-process simulated server. G5 will connect the same object to sockets and the screen.</li>
+<li>Undo records field-level before/after guards while the original command is first shown. Undo and Redo serialize those guards as ordinary <code>gridcraft/1</code> entries. A guard restores only a field that is still equal to the value this person's action left there.</li>
+</ul>
+<p><strong>Tech stack:</strong> Rust 2024 and the existing GridCraft workspace; G2's Rust <code>collab-live</code> crate through a sibling path dependency; existing <code>serde</code>, <code>serde_json</code>, <code>thiserror</code>, <code>sha2</code>, formula AST and engine/model/calc crates. No new third-party dependency. All dependencies remain within the repository's MIT/Apache/BSD/ISC licence allowlist.</p>
+<p><strong>Spec:</strong></p>
+<ul>
+<li><code>H:\Source\repos\ThineCraft\ShareCraft\co-authoring-approach.html</code> v1.2, binding: C7 to C14; sections 06 (identities), 07 (conflicts), 08 (undo), 10 (library/fork split) and 12 (risks).</li>
+<li><code>H:\Source\repos\ThineCraft\ShareCraft\gridcraft-coauthoring-proofs.html</code>: sections 03 to 10. The owner accepted its “go with conditions” recommendation, including waiting for the server for large structural changes and comparing entered content only across platforms.</li>
+<li><code>docs/coauthor-determinism.md</code> and <code>crates/engine/tests/fixtures/coauthor/selection_readers.md</code>: the G1 audit and exact selection-reading commands left to G3.</li>
+<li>G2 implementation read for this plan: <code>ShareCraft/crates/collab-live/src/client.rs</code> (<code>LiveEditor</code>, <code>GridSnapshot</code>'s required hooks, <code>EntryView</code>, <code>Stamp</code>, <code>Outcome</code>, <code>Effect</code>, <code>Mode</code>, <code>LiveClient</code>) and <code>ids.rs</code> (<code>LiveId</code>, <code>OrderedIds</code>, <code>Lookup</code>, <code>IdMaker</code>; participant 0 is the base).</li>
+</ul>
+
+<h2>The road (for context)</h2>
+<table>
+<thead><tr><th>Plan</th><th>What it builds</th><th>Where</th></tr></thead>
+<tbody>
+<tr><td>G1 (done)</td><td>Determinism, replay, save/reopen and rollback timing proofs; “go with conditions”.</td><td>GridCraft tests and ShareCraft report</td></tr>
+<tr><td>G2 (done)</td><td>The shared <code>collab-live</code> client, ordered identities and opaque-entry room.</td><td>ShareCraft</td></tr>
+<tr><td><strong>G3 (this)</strong></td><td>GridCraft identities; first target-explicit shared commands; G2 <code>LiveEditor</code> hooks and rollback/re-run; per-person Undo/Redo.</td><td>GridCraft</td></tr>
+<tr><td>G4</td><td>Checkpoint tickets and verification, full-recalc load, row-height fidelity, fingerprints on the room, returning clients, large content and the unsaved-log limit.</td><td>ShareCraft and GridCraft</td></tr>
+<tr><td>G5</td><td>Browser/desktop host bridge, presence, frame-page notices, real-browser runs and A07/A17 acceptance.</td><td>Both</td></tr>
+</tbody>
+</table>
+
+<h2>Proposals for the owner</h2>
+<p>The binding spec fixes the behaviour. The following names, limits and boundary choices are not fixed there; this plan proposes them explicitly.</p>
+<ol class="band">
+<li><strong>Use G2 directly.</strong> Add <code>collab-live = { path = "../../../ShareCraft/crates/collab-live" }</code> to <code>crates/engine/Cargo.toml</code>, rather than copying its trait. This tests the real apply loop and <code>OrderedIds</code> that G5 will use. The implementation PR records the tested ShareCraft commit; both sibling checkouts are required to build this branch.</li>
+<li><strong>Format name and module names.</strong> The first payload format is <code>gridcraft/1</code>. Fork code lives in <code>crates/engine/src/coauthor/</code>; its public façade is <code>GridCoauthor</code>, and its <code>LiveEditor</code> implementation is <code>GridLiveEditor</code>.</li>
+<li><strong>Identity shape.</strong> <code>WorkbookIds.sheets</code> is an <code>OrderedIds</code>; each live sheet identity owns <code>OrderedIds::base(MAX_ROWS)</code> and <code>OrderedIds::base(MAX_COLS)</code>. Thus every initial sheet, row and column is participant 0 plus its zero-based base position; inserted items use <code>LiveClient::new_ids</code>. A cell is <code>CellId { sheet, row, col }</code>.</li>
+<li><strong>Filter names.</strong> Keep the UI toggle <code>data.filter</code> local-only. Add idempotent <code>data.filterSet {sheet, range}</code> and <code>data.filterRemove {sheet, range}</code>. Extend existing <code>data.filterBy</code>, <code>data.clearFilter</code> (criteria only) and <code>data.reapply</code> with explicit <code>sheet</code> and <code>range</code>.</li>
+<li><strong>Large-workbook rule.</strong> <code>LARGE_WORKBOOK_CELLS</code> is 100,000 stored cells across the workbook. Row, column or sheet structure commands at or above it use <code>Mode::WaitForServer</code>; all other G3 commands use <code>ShowAtOnce</code>. G3 does not ship a cheaper structural re-run. It may be added later only with the same straight-through equality test and a heavier-formula timing win.</li>
+<li><strong>View fallback after deletion.</strong> A remote command preserves the local active sheet by <code>LiveId</code>. If that sheet was deleted, use the next surviving sheet at the deleted position, else the preceding sheet, and use that sheet's remembered selection (or A1). No remote command chooses an unrelated sheet merely because it became active while executing.</li>
+<li><strong>Clock and dates.</strong> An agreed entry uses <code>Stamp.at_ms</code> through <code>gridcraft_core::date::serial_from_unix_ms</code> for NOW/TODAY and <code>Stamp.seed</code> for RAND. A <code>cell.set</code> payload also carries <code>origin_year: i32</code>; year-less date parsing uses it. A locally shown volatile formula sets <code>Outcome.read_stamp = true</code>, so G2 re-applies it after the server stamp arrives.</li>
+<li><strong>Agreement means entered content.</strong> <code>GridLiveEditor::agreement_digest()</code> returns only <code>fingerprint(...).entered</code>. The computed digest stays a diagnostic in native-only tests and is never used for cross-platform room agreement until both builds share a maths library.</li>
+<li><strong>Personal history budget.</strong> Keep at most 100 actions or 128 MiB per person, using the same visible limits as current local history but with content-based accounting. Evicting an old personal action affects only that person's available Undo; it cannot affect convergence and no peer assumes the same depth.</li>
+<li><strong>Large undo payloads.</strong> G3 has no G4 side-channel for large content. If a guarded reverse exceeds G2's <code>MAX_PAYLOAD_BYTES</code>, Undo is refused with “This change is too large to undo while sharing”; the original change remains. Ordinary row/column edits and the regression fixtures must fit.</li>
+<li><strong>G3 stops below the UI.</strong> <code>GridCoauthor::submit</code>, <code>undo</code>, <code>redo</code>, <code>receive</code>, <code>tick</code> and <code>base_ready</code> are the stable host surface. G5 replaces direct <code>edit.undo</code>/<code>edit.redo</code> dispatch and the UI's direct history trimming; G3 tests the surface in-process and does not add sockets or browser code.</li>
+</ol>
+
+<h2>Not in this plan</h2>
+<ul class="band">
+<li>No WebSocket, browser host bridge, frame-page notice UI, presence drawing, read-only UI or real-browser test. Those are G5.</li>
+<li>No checkpoint upload/load, second-writer hash, row-height checkpoint fix, returning-client major versions, large-content side channel, unsaved-log limit or server fingerprint exchange. Those are G4.</li>
+<li>No personal filter views. C10 makes the G3 filter shared.</li>
+<li>No live keystrokes inside a cell. A cell draft stays private until Enter (Q2).</li>
+<li>No shared macros, scripts, Solver, data import, AutoFit column width, password changes, random-number tool, pictures, objects, sort, cut/move, insert/delete cells with shift, or large paste. They remain refused until separately made deterministic and target-explicit.</li>
+<li>No shared object-number allocation and no identity written into XLSX. Session identities die with retained room data (C7).</li>
+<li>No common desktop/browser maths library. Until it exists, agreement is entered content only and desktop joining remains subject to C16.</li>
+</ul>
+
+<h2>Global constraints</h2>
+<ul class="band">
+<li>Branch <code>coauthor-g3</code> is based on <code>sharecraft</code> at <code>097d1514</code>. Main changes only through a pull request.</li>
+<li>No panic, <code>unwrap</code>, <code>expect</code>, <code>panic!</code>, <code>unreachable!</code>, <code>todo!</code>, <code>unimplemented!</code> or <code>unsafe</code> in non-test code. Input sizes, identity counts, indexes and allocations are hostile and bounded.</li>
+<li>Every user-visible edit remains an engine command. The co-author adapter translates identities and invokes <code>Session::execute</code>; it does not edit a <code>Workbook</code> behind the engine except when restoring a previously captured snapshot.</li>
+<li>Only the allow-listed G3 commands enter the live log. Missing targets, unknown payload keys, unknown identities, invalid formula-reference counts and payloads over G2's limit are refused without changing document or identity state.</li>
+<li>A command that cannot resolve a deleted target returns <code>Effect::NoEffect { reason }</code>. It never guesses a nearby position. A later same-cell entry wins because entries execute in log order.</li>
+<li>View state and personal history are not shared, not fingerprinted and not serialized into a shared entry. A checkpoint later writes the stored workbook view, per C11.</li>
+<li>Use checked/saturating arithmetic and the existing <code>MAX_ROWS</code>/<code>MAX_COLS</code>. Identity operations must be atomic: an error leaves <code>OrderedIds</code> and the workbook unchanged.</li>
+<li>No new third-party dependency. Check any dependency change against the licence allowlist. No vendor artwork, strings, screenshots, fonts, templates or sample files.</li>
+<li>Do not change CI. Keep WASM building. Finish with <code>cargo xtask ci</code>; report exactly what ran.</li>
+<li>Update <code>docs/coauthor-determinism.md</code>, the selection-reader fixture and affected roadmap/gap documents when implementation lands. Do not hand-edit generated parity files; run their generator if catalog metadata changes.</li>
+</ul>
+
+<h2>Review focus</h2>
+<table>
+<thead><tr><th>Failure class</th><th>Expected behaviour</th><th>Pinned by</th></tr></thead>
+<tbody>
+<tr><td>A target row, column or sheet was deleted before an entry arrives.</td><td>No effect, a stable reason, and no nearby cell changed.</td><td><code>deleted_target_resolves_to_no_effect</code>, <code>late_edit_to_deleted_target_reports_no_effect</code></td></tr>
+<tr><td>A formula mixes current-sheet, named-sheet, absolute, range, whole-row, whole-column and 3-D references.</td><td>Every positional reference resolves by identity; a deleted endpoint becomes <code>#REF!</code>; anchors and non-reference syntax survive.</td><td><code>formula_references_round_trip_through_identities</code>, <code>formula_deleted_reference_becomes_ref</code></td></tr>
+<tr><td>Rollback restores workbook but not RAND state or identity tables.</td><td>Re-run equals straight-through on entered content and computed values in the same native build.</td><td><code>rollback_rerun_matches_straight_through</code>, <code>snapshot_restores_rand_state</code></td></tr>
+<tr><td>An Undo overlaps another person's later content or style edit.</td><td>Only matching fields revert; later fields and unrelated edits remain; the result says what was left.</td><td><code>content_undo_restores_only_unchanged_fields</code>, <code>format_undo_restores_only_matching_style_leaves</code></td></tr>
+<tr><td>A remote structural command changes the local active sheet or selection as a side effect.</td><td>The same live sheet and remembered selection remain, except for the stated deleted-sheet fallback.</td><td><code>remote_insert_and_delete_keep_the_local_view</code>, <code>deleted_active_sheet_uses_nearest_survivor</code></td></tr>
+</tbody>
+</table>
+
+<h2>G3 shared command surface</h2>
+<p>The wire does not send arbitrary <code>{id, params}</code>. <code>SharedCommand</code> has typed variants. The adapter resolves the identity form into the engine form below. “Required” means required in a live payload even if the ordinary single-user command still has a selection-based default.</p>
+<table>
+<thead><tr><th>Commands</th><th>Required explicit engine form after identity resolution</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td><code>cell.set</code></td><td><code>{sheet, cell, input, originYear}</code></td><td>Formula references travel separately as identity references; year-less dates use <code>originYear</code>.</td></tr>
+<tr><td><code>edit.clearContents</code></td><td><code>{sheet, range}</code></td><td>One or more identity ranges; never the selection.</td></tr>
+<tr><td><code>home.numberFormat</code>, <code>fontName</code>, <code>fontSize</code>, <code>fontColor</code>, <code>fillColor</code>, <code>borders</code>, <code>alignTop</code>, <code>alignMiddle</code>, <code>alignBottom</code></td><td><code>{sheet, range, ...value}</code></td><td>Existing explicit forms from G1.</td></tr>
+<tr><td><code>home.bold</code>, <code>italic</code>, <code>wrapText</code></td><td><code>{sheet, range, on}</code></td><td>No toggle from the receiver's active cell.</td></tr>
+<tr><td><code>home.alignLeft</code>, <code>alignCenter</code>, <code>alignRight</code></td><td><code>{sheet, range, on}</code></td><td><code>on</code> is always sent; false means General.</td></tr>
+<tr><td><code>home.underline</code>, <code>doubleUnderline</code></td><td><code>{sheet, range, on, style}</code></td><td><code>style</code> is one of the existing underline values; no active-style read.</td></tr>
+<tr><td><code>home.increaseFontSize</code>, <code>decreaseFontSize</code></td><td><code>{sheet, range, size}</code></td><td>The sender computes and sends the resulting half-point size; receiver does not step from its active cell.</td></tr>
+<tr><td><code>home.formatCells</code></td><td><code>{sheet, range, style}</code></td><td>Patch validation is against the actual target styles, atomically, never the active cell.</td></tr>
+<tr><td><code>data.filterSet</code>, <code>data.filterRemove</code></td><td><code>{sheet, range}</code></td><td>Idempotent set/remove; <code>data.filter</code> toggle is refused.</td></tr>
+<tr><td><code>data.filterBy</code></td><td><code>{sheet, range, column, values|custom|top|aboveAverage|clear}</code></td><td>Column is encoded as a column identity; the named filter range must already exist.</td></tr>
+<tr><td><code>data.clearFilter</code>, <code>data.reapply</code></td><td><code>{sheet, range}</code></td><td>Clear criteria or reapply on exactly that filter.</td></tr>
+<tr><td><code>home.insertRows</code>, <code>deleteRows</code>, <code>insertColumns</code>, <code>deleteColumns</code></td><td><code>{sheet, rows|cols}</code></td><td>Insert says “before identity X” (or end sentinel) plus newly allocated ids; delete names the exact ids.</td></tr>
+<tr><td><code>home.insertSheet</code></td><td><code>{name, before}</code></td><td><code>before</code> is a sheet identity or end; the new sheet identity is allocated before send.</td></tr>
+<tr><td><code>sheet.rename</code>, <code>home.deleteSheet</code></td><td><code>{sheet, ...}</code></td><td>Sheet is resolved from identity, never the active sheet.</td></tr>
+</tbody>
+</table>
+
+<h2>File map</h2>
+<table>
+<thead><tr><th>File</th><th>Responsibility</th></tr></thead>
+<tbody>
+<tr><td><code>Cargo.toml</code>, <code>crates/engine/Cargo.toml</code>, <code>Cargo.lock</code></td><td>Workspace alias and engine dependency on the sibling G2 <code>collab-live</code> crate.</td></tr>
+<tr><td><code>crates/engine/src/coauthor/mod.rs</code></td><td>Public façade, constants, errors, <code>PreparedChange</code>, <code>GridCoauthor</code> and command allow-list.</td></tr>
+<tr><td><code>crates/engine/src/coauthor/ids.rs</code></td><td><code>WorkbookIds</code>, <code>SheetIds</code>, <code>CellId</code>, identity ranges, lookups and structural updates.</td></tr>
+<tr><td><code>crates/engine/src/coauthor/command.rs</code></td><td><code>SharedEntry</code>/<code>SharedCommand</code> serde schema; encode explicit engine params to identities; resolve identities and formula references back to engine params.</td></tr>
+<tr><td><code>crates/engine/src/coauthor/editor.rs</code></td><td><code>GridLiveEditor</code>, <code>GridSnapshot</code>, view capture/restore, stamp context, <code>LiveEditor</code> hooks, mode policy and agreement digest.</td></tr>
+<tr><td><code>crates/engine/src/coauthor/undo.rs</code></td><td>Guarded field deltas, <code>UndoAction</code>, <code>PersonalHistory</code>, inverse construction, guarded apply and redo.</td></tr>
+<tr><td><code>crates/engine/src/lib.rs</code></td><td>Exports <code>coauthor</code>; narrow helpers for snapshot restore only if the module cannot use existing <code>doc</code>/<code>doc_mut</code>.</td></tr>
+<tr><td><code>crates/core/src/parse.rs</code></td><td>Adds explicit-year input parsing while preserving the existing single-user clock default.</td></tr>
+<tr><td><code>crates/engine/src/cmd/format.rs</code>, <code>crates/engine/src/cmd/data.rs</code>, <code>crates/engine/src/cmd/data/filter.rs</code></td><td>Target-explicit underline, font steps, Format Cells and filter set/remove/apply forms.</td></tr>
+<tr><td><code>crates/engine/tests/support/live.rs</code></td><td>Two-client in-process harness and deterministic simulated server; no socket.</td></tr>
+<tr><td><code>crates/engine/tests/it/coauthor_live.rs</code>, <code>coauthor_undo.rs</code>, <code>coauthor_commands.rs</code>, <code>tests/it/main.rs</code></td><td>Focused G3 integration tests and module registration.</td></tr>
+<tr><td><code>crates/engine/tests/support/sequences.rs</code>, <code>tests/fixtures/coauthor/selection_readers.md</code>, <code>tests/wasm_replay.rs</code></td><td>Expanded shared list, explicit forms and entered-only cross-platform comparison.</td></tr>
+<tr><td><code>docs/coauthor-determinism.md</code>, <code>docs/gaps.md</code>, <code>docs/roadmap.md</code>, <code>ROADMAP.md</code></td><td>Record G3 guarantees, remaining limits and the progress entry.</td></tr>
+</tbody>
+</table>
+
+<div class="task">
+<h3>Task 1: connect the G2 library and define <code>gridcraft/1</code></h3>
+<p><strong>Files:</strong> modify <code>Cargo.toml</code>, <code>crates/engine/Cargo.toml</code>, <code>Cargo.lock</code>, <code>crates/engine/src/lib.rs</code>; create <code>crates/engine/src/coauthor/mod.rs</code> and <code>command.rs</code>; test in <code>crates/engine/tests/it/coauthor_commands.rs</code> and register it in <code>tests/it/main.rs</code>.</p>
+<p><strong>Interfaces:</strong></p>
+<pre><code>pub const GRIDCRAFT_LIVE_FORMAT: &amp;str = "gridcraft/1";
+pub const LARGE_WORKBOOK_CELLS: usize = 100_000;
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SharedEntry { pub version: u32, pub action: u64, pub command: SharedCommand }
+
+pub struct PreparedChange { pub payload: String, pub mode: collab_live::client::Mode, pub action: u64 }
+
+pub fn decode_entry(payload: &amp;str) -&gt; Result&lt;SharedEntry, CoauthorError&gt;;
+pub fn is_shared_command(id: &amp;str) -&gt; bool;</code></pre>
+<ol class="steps">
+<li><strong>Write failing tests</strong> <code>shared_entry_round_trips_with_format_one</code>, <code>shared_entry_rejects_unknown_keys_and_versions</code>, <code>unlisted_commands_are_refused_in_live_mode</code> and <code>shared_commands_require_explicit_targets</code>. Assert canonical JSON round-trip, <code>version == 1</code>, a stable error with no mutation for extra fields/unknown variants, refusal of <code>data.filter</code>/<code>edit.undo</code>/macros, and missing sheet/range/on/size errors for the relevant allow-listed commands.</li>
+<li><strong>Run:</strong> <code>cargo test -p gridcraft-engine --test it coauthor_commands -- --nocapture</code>. Expected: fail because <code>coauthor</code> and the schema do not exist.</li>
+<li><strong>Add the path dependency</strong> exactly as proposed, export <code>pub mod coauthor;</code>, and define <code>CoauthorError</code> with typed variants for malformed payload, unsupported version/command, missing target, unknown identity, deleted target, engine error, oversized payload and history refusal. No generic panic path.</li>
+<li><strong>Define the serde schema</strong> as a closed tagged enum. Use <code>#[serde(deny_unknown_fields)]</code> on every wire struct; cap decoded payloads at G2's <code>MAX_PAYLOAD_BYTES</code> before allocating nested lists; keep UI-only defaults out of the wire.</li>
+<li><strong>Run the focused test</strong>, then <code>cargo check -p gridcraft-engine --all-targets</code>. Expected: pass.</li>
+<li><strong>Commit:</strong> <code>G3.1: define the GridCraft live command format</code>.</li>
+</ol>
+</div>
+
+<div class="task">
+<h3>Task 2: sheets, rows, columns and formula references by identity</h3>
+<p><strong>Files:</strong> create <code>crates/engine/src/coauthor/ids.rs</code>; extend <code>command.rs</code>; test in <code>coauthor_commands.rs</code>.</p>
+<p><strong>Interfaces:</strong></p>
+<pre><code>#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CellId { pub sheet: LiveId, pub row: LiveId, pub col: LiveId }
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SheetIds { pub id: LiveId, pub rows: OrderedIds, pub cols: OrderedIds }
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkbookIds { pub sheets: OrderedIds, pub by_id: BTreeMap&lt;LiveId, SheetIds&gt; }
+
+impl WorkbookIds {
+    pub fn from_workbook(wb: &amp;Workbook) -&gt; Result&lt;Self, CoauthorError&gt;;
+    pub fn cell_id(&amp;self, sheet: usize, cell: CellRef) -&gt; Result&lt;CellId, CoauthorError&gt;;
+    pub fn resolve_cell(&amp;self, id: CellId) -&gt; Result&lt;(usize, CellRef), TargetGone&gt;;
+    pub fn apply_structural(&amp;mut self, change: &amp;IdentityStructural) -&gt; Result&lt;(), CoauthorError&gt;;
+}
+
+pub fn encode_command(ids: &amp;WorkbookIds, session: &amp;Session, action: u64,
+    id: &amp;str, params: &amp;Json, origin_year: i32,
+    allocate: &amp;mut dyn FnMut(u32) -&gt; Result&lt;LiveId, IdError&gt;) -&gt; Result&lt;SharedEntry, CoauthorError&gt;;
+pub fn resolve_command(ids: &amp;WorkbookIds, session: &amp;Session,
+    entry: &amp;SharedEntry) -&gt; Result&lt;ResolvedCommand, TargetGone&gt;;</code></pre>
+<ol class="steps">
+<li><strong>Write failing tests</strong> <code>base_workbook_identity_tables_are_single_runs</code>, <code>concurrent_row_inserts_keep_both_identity_runs</code>, <code>deleted_target_resolves_to_no_effect</code>, <code>formula_references_round_trip_through_identities</code> and <code>formula_deleted_reference_becomes_ref</code>. Assert participant-0 base ids and one run per untouched axis; two inserts before one base id survive in log order; a deleted cell identity never resolves elsewhere; and formula anchors, sheet qualifiers, ranges, whole rows/columns and 3-D endpoints map back correctly.</li>
+<li><strong>Run the focused test.</strong> Expected: fail on missing identity types.</li>
+<li><strong>Build <code>WorkbookIds</code> from G2 <code>OrderedIds</code>.</strong> Use <code>MAX_ROWS</code>/<code>MAX_COLS</code>; keep deleted sheet records in <code>by_id</code> with a live/deleted state so late commands get a reason. Allocate every inserted sheet/row/column id through the closure backed by <code>LiveClient::new_ids</code>; never invent participant numbers in GridCraft.</li>
+<li><strong>Encode all targets.</strong> Represent a range by sheet id and row/column endpoint ids plus its cell/rows/columns kind. Inserts carry the identity before which they land (or an explicit end marker) and the newly allocated consecutive ids. Deletes carry the exact ids to remove. Validate workbook and identity changes before mutating either.</li>
+<li><strong>Encode formula references.</strong> Parse the formula with existing <code>gridcraft_formula::parse</code>; walk references in deterministic AST order; store an <code>IdentityReference</code> beside the canonical formula. On resolve, parse again and replace references in the same order with current positions. Preserve anchor flags. A deleted row/column/sheet produces an <code>Expr::Error(CellError::Ref)</code> at that reference; an unknown identity refuses the entry as malformed. Do not rewrite defined names or structured references.</li>
+<li><strong>Run:</strong> focused tests and <code>cargo test -p gridcraft-engine --test it coauthor_replay::two_engines_agree_on_random_sequences</code>. Expected: pass.</li>
+<li><strong>Commit:</strong> <code>G3.2: add live sheet row and column identities</code>.</li>
+</ol>
+</div>
+
+<div class="task">
+<h3>Task 3: make the remaining first commands target-explicit</h3>
+<p><strong>Files:</strong> modify <code>crates/engine/src/cmd/format.rs</code>, <code>cmd/data.rs</code>, <code>cmd/data/filter.rs</code>, <code>tests/support/sequences.rs</code>, <code>tests/fixtures/coauthor/selection_readers.md</code>; extend <code>coauthor_commands.rs</code>.</p>
+<p><strong>Interfaces:</strong> existing <code>Session::execute(&amp;mut self, id: &amp;str, params: Json) -&gt; Result&lt;Json&gt;</code> remains the executor. Add private helpers <code>set_filter</code>, <code>remove_filter</code> and <code>validate_style_patch_for_targets</code>; do not add another edit path.</p>
+<ol class="steps">
+<li><strong>Write failing tests</strong> <code>filter_commands_ignore_the_receivers_view</code>, <code>filter_set_and_remove_are_idempotent</code>, <code>underline_with_on_ignores_active_cell</code>, <code>font_step_uses_the_sent_size</code> and <code>format_cells_validation_uses_each_target_not_active_cell</code>. Move the second session to a different sheet/selection and give its active cell a contrary style. Assert identical results and entered fingerprints.</li>
+<li><strong>Run the focused test.</strong> Expected: the G1-listed selection readers diverge or lack their new commands.</li>
+<li><strong>Add filter commands.</strong> Register <code>data.filterSet</code> and <code>data.filterRemove</code> with required <code>sheet</code>/<code>range</code>; make them idempotent. Add required live forms to <code>filterBy</code>, <code>clearFilter</code> and <code>reapply</code>. Keep the ordinary selection defaults for single-user callers, but the co-author encoder refuses to omit them. A mismatched range is an error, not a replacement of another filter.</li>
+<li><strong>Remove active-style reads from explicit formatting.</strong> In <code>underline</code>, read <code>active_style</code> only when <code>on</code> is absent. In <code>step_font</code>, use a supplied validated <code>size</code>; only the local UI form computes from the active cell. For <code>formatCells</code>, collect the distinct actual target styles, validate the patch against each before <code>edit</code>, then apply atomically; no per-cell silent skip.</li>
+<li><strong>Expand <code>SHARED_COMMANDS</code> and its generator</strong> with explicit underline, font-step, Format Cells and filter cases. Update <code>selection_readers.md</code> to distinguish the fixed explicit forms from the still-local toggle.</li>
+<li><strong>Run:</strong> <code>cargo test -p gridcraft-engine --test it coauthor_commands</code>, <code>cargo test -p gridcraft-engine --test it coauthor_replay::two_engines_agree_on_random_sequences</code>, and the format/filter unit tests. Expected: pass.</li>
+<li><strong>Commit:</strong> <code>G3.3: make the first shared commands target explicit</code>.</li>
+</ol>
+</div>
+
+<div class="task">
+<h3>Task 4: carry clock, RAND state and year-less dates</h3>
+<p><strong>Files:</strong> modify <code>crates/core/src/parse.rs</code>, <code>crates/engine/src/cmd/edit/cell.rs</code>; create <code>crates/engine/src/coauthor/editor.rs</code>; extend <code>coauthor_commands.rs</code>.</p>
+<p><strong>Interfaces:</strong></p>
+<pre><code>pub fn parse_input_in_year(s: &amp;str, sys: DateSystem, year: i64) -&gt; Parsed;
+// Existing parse_input keeps using current_year() for non-live calls.
+
+pub struct GridSnapshot { document: SharedDocumentSnapshot, ids: WorkbookIds }
+pub struct SharedDocumentSnapshot { wb: Arc&lt;Workbook&gt;, calc: Calc, revision: u64 }
+
+impl GridLiveEditor {
+    fn apply_stamp(&amp;mut self, stamp: Stamp);
+    pub fn agreement_digest(&amp;self) -&gt; [u8; 32];
+}</code></pre>
+<ol class="steps">
+<li><strong>Write failing tests</strong> <code>entry_stamp_controls_now_and_rand</code>, <code>yearless_date_uses_the_sent_year</code>, <code>snapshot_restores_rand_state</code> and <code>agreement_digest_is_entered_only</code>. Assert two sessions with different system clocks/RNG histories store the same entry result under one stamp; <code>12/31</code> uses the payload year; restoring then reapplying reproduces RAND bits; and a computed-only 1-ULP difference does not change agreement.</li>
+<li><strong>Run the focused tests.</strong> Expected: fail because the entry context and explicit-year parser do not exist.</li>
+<li><strong>Split input parsing at the clock seam.</strong> Implement <code>parse_input_in_year</code> and make existing <code>parse_input</code> call it with <code>current_year()</code>. Extend only <code>cell.set</code>'s internal params with <code>originYear</code>; validate a representable year and pass it to the explicit parser. Ordinary calls remain unchanged.</li>
+<li><strong>Apply a server stamp before an agreed command.</strong> Set <code>DocState.calc.fixed_now</code> to <code>serial_from_unix_ms(at_ms as f64)</code> and call existing <code>Calc::set_rand_seed(u64::from(seed))</code>. Because <code>Calc: Clone</code>, <code>GridSnapshot</code> carries the advanced RNG state across rollback. For an unstamped local volatile formula, report <code>Outcome.read_stamp = true</code>; for nonvolatile work report false.</li>
+<li><strong>Make agreement entered-only.</strong> Implement <code>agreement_digest</code> by returning <code>fingerprint(&amp;session, DocId(active_index)).entered</code>. Keep <code>computed</code> in native diagnostic assertions, never in room agreement or the WASM expected result.</li>
+<li><strong>Run:</strong> focused tests, <code>volatile_functions_agree_with_fixed_now_and_seed</code>, and <code>cargo test -p gridcraft-core parse</code>. Expected: pass.</li>
+<li><strong>Commit:</strong> <code>G3.4: carry deterministic entry time and random state</code>.</li>
+</ol>
+</div>
+
+<div class="task">
+<h3>Task 5: implement the GridCraft <code>LiveEditor</code> hooks and keep the person's view</h3>
+<p><strong>Files:</strong> complete <code>coauthor/editor.rs</code>; modify <code>coauthor/mod.rs</code>; create <code>tests/support/live.rs</code> and <code>tests/it/coauthor_live.rs</code>; register in <code>tests/it/main.rs</code>.</p>
+<p><strong>Interfaces:</strong></p>
+<pre><code>pub struct GridLiveEditor {
+    session: Session,
+    ids: WorkbookIds,
+    applying: Option&lt;Seq&gt;,
+}
+
+impl GridLiveEditor {
+    pub fn new(session: Session) -&gt; Result&lt;Self, CoauthorError&gt;;
+    pub fn session(&amp;self) -&gt; &amp;Session;
+    pub fn session_mut(&amp;mut self) -&gt; &amp;mut Session;
+    pub fn ids(&amp;self) -&gt; &amp;WorkbookIds;
+    pub fn applying(&amp;self) -&gt; Option&lt;Seq&gt;;
+    pub fn prepare(&amp;mut self, action: u64, id: &amp;str, params: &amp;Json,
+        origin_year: i32, ids: &amp;mut dyn FnMut(u32) -&gt; Result&lt;LiveId, IdError&gt;)
+        -&gt; Result&lt;PreparedChange, CoauthorError&gt;;
+}
+
+impl LiveEditor for GridLiveEditor {
+    type Snapshot = GridSnapshot;
+    fn snapshot(&amp;self) -&gt; GridSnapshot;
+    fn restore(&amp;mut self, snapshot: &amp;GridSnapshot);
+    fn apply(&amp;mut self, entry: &amp;EntryView&lt;'_&gt;) -&gt; Result&lt;Outcome, Crash&gt;;
+    fn note_applying(&amp;mut self, seq: Option&lt;Seq&gt;);
+}</code></pre>
+<ol class="steps">
+<li><strong>Write failing tests</strong> <code>snapshot_restores_shared_state_not_personal_view</code>, <code>remote_insert_and_delete_keep_the_local_view</code>, <code>deleted_active_sheet_uses_nearest_survivor</code>, <code>internal_engine_error_is_a_live_crash</code> and <code>note_applying_tracks_the_seq</code>. Assert workbook/calc/ids restore; active sheet and selection do not roll back; remote add/delete does not select its target; fallback follows the proposal; <code>EngineError::Internal</code> maps to <code>Crash</code>; and the applying sequence is cleared after success.</li>
+<li><strong>Run:</strong> <code>cargo test -p gridcraft-engine --test it coauthor_live -- --nocapture</code>. Expected: fail on missing hooks.</li>
+<li><strong>Implement snapshots.</strong> Copy <code>Arc&lt;Workbook&gt;</code>, cloned <code>Calc</code>, revision and identity tables. Restore those fields through <code>Session::doc_mut</code>, rebuild nothing else, clear queued UI requests, and leave path/saved/trust/selection/personal history intact.</li>
+<li><strong>Implement view preservation by identity.</strong> Capture the active sheet <code>LiveId</code>, current <code>Selection</code> and <code>sheet_selections</code> before every received or re-run apply. Resolve the sheet id afterward and restore the selection. If it was deleted, use the proposed neighbour rule. Do not copy workbook-stored view values into a peer's view.</li>
+<li><strong>Implement apply atomically.</strong> Decode and resolve before mutation; take a pre-apply shared snapshot; execute the resolved command; update identities from the typed structural variant only after engine success. On normal engine error restore and return <code>Effect::NoEffect</code> with a bounded public reason. On <code>EngineError::Internal</code> restore and return <code>Err(Crash)</code>. No raw internal error or input is logged.</li>
+<li><strong>Implement <code>note_applying</code></strong> as the G3 in-memory crash note. Document that G5 supplies persistence. The test harness must simulate reload by constructing <code>LiveConfig { crashed_at: editor.applying() }</code>.</li>
+<li><strong>Run:</strong> focused tests and all existing engine tests. Expected: pass.</li>
+<li><strong>Commit:</strong> <code>G3.5: implement the GridCraft live editor hooks</code>.</li>
+</ol>
+</div>
+
+<div class="task">
+<h3>Task 6: integrate rollback/re-run and the large-workbook wait rule</h3>
+<p><strong>Files:</strong> extend <code>coauthor/mod.rs</code>, <code>editor.rs</code>, <code>tests/support/live.rs</code>, <code>coauthor_live.rs</code>, <code>tests/support/sequences.rs</code> and <code>tests/it/coauthor_timing.rs</code>.</p>
+<p><strong>Interfaces:</strong></p>
+<pre><code>pub struct GridCoauthor {
+    client: LiveClient&lt;GridLiveEditor&gt;,
+    next_action: u64,
+    history: PersonalHistory,
+    pending_history: BTreeMap&lt;u64, PendingHistory&gt;,
+}
+
+impl GridCoauthor {
+    pub fn new(config: LiveConfig, editor: GridLiveEditor) -&gt; Self;
+    pub fn editor(&amp;self) -&gt; &amp;GridLiveEditor;
+    pub fn submit(&amp;mut self, id: &amp;str, params: Json, origin_year: i32,
+        now_ms: u64) -&gt; Result&lt;Step, GridLiveError&gt;;
+    pub fn receive(&amp;mut self, frame: &amp;str, now_ms: u64) -&gt; Result&lt;Step, GridLiveError&gt;;
+    pub fn base_ready(&amp;mut self, now_ms: u64) -&gt; Result&lt;Step, GridLiveError&gt;;
+    pub fn tick(&amp;mut self, now_ms: u64) -&gt; Vec&lt;String&gt;;
+}
+
+pub fn mode_for(command: &amp;SharedCommand, stored_cells: usize) -&gt; Mode;</code></pre>
+<ol class="steps">
+<li><strong>Write failing tests</strong> <code>small_and_non_structural_commands_show_at_once</code>, <code>large_structural_commands_wait_for_server</code>, <code>rollback_rerun_matches_straight_through</code> and <code>rollback_rerun_keeps_pending_identity_allocations</code>. The equality test must include ordinary edits, every G3 structural command, filters, volatile formulas, two concurrent inserts at one place and a pending formula whose referenced row moves. Compare outcomes, identities, entered and native computed fingerprints after every delivered log entry.</li>
+<li><strong>Run the focused tests.</strong> Expected: fail before the wrapper and mode policy exist.</li>
+<li><strong>Implement <code>GridCoauthor</code> as a thin composition.</strong> <code>submit</code> allocates an action number, encodes against current identities through <code>LiveClient::new_ids</code>, chooses mode, then calls the existing <code>LiveClient::local</code>. <code>receive</code> delegates to <code>LiveClient::receive</code> and processes its events. Do not reproduce G2's queue, snapshot or re-run logic.</li>
+<li><strong>Implement the threshold exactly.</strong> Count stored cells with each sheet's existing sparse store length; at <code>&gt;= 100_000</code>, row/column/sheet insert/delete/rename waits for the server. A rename may be cheap, but classify all sheet structure together for a simple first rule. Non-structural formatting/content/filter commands show at once.</li>
+<li><strong>Build the deterministic simulated server</strong> in test support. It assigns participants and sequential <code>Seq</code>s, stamps entries with supplied times/seeds, can delay one client's own acknowledgement, and broadcasts the same frames in chosen orders. It must use G2 protocol messages rather than call <code>GridLiveEditor::apply</code> directly.</li>
+<li><strong>Extend the timing proof</strong> with a heavier-formula workbook and an ignored test <code>heavier_formula_rerun_report</code>. Report p50/p95 for content-only and one structural change at 100,000 cells. It is evidence for the wait rule, not a flaky pass/fail wall-clock gate. Do not add a batch-recalc shortcut in this task.</li>
+<li><strong>Run:</strong> focused tests; <code>cargo test --release -p gridcraft-engine --test it rollback_rerun_matches_straight_through</code>; the ignored timing report once with <code>--ignored --nocapture</code>. Expected: equality pass; timing printed and recorded for Task 10.</li>
+<li><strong>Commit:</strong> <code>G3.6: integrate live rollback and rerun</code>.</li>
+</ol>
+</div>
+
+<div class="task">
+<h3>Task 7: guarded content and format Undo</h3>
+<p><strong>Files:</strong> create <code>crates/engine/src/coauthor/undo.rs</code>; extend <code>command.rs</code>, <code>editor.rs</code>, <code>mod.rs</code>; create <code>tests/it/coauthor_undo.rs</code> and register it.</p>
+<p><strong>Interfaces:</strong></p>
+<pre><code>#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct GuardedValue&lt;T&gt; { pub target: T, pub expected: Json, pub restore: Json }
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub enum GuardedPatch {
+    Cells(Vec&lt;GuardedCellContent&gt;),
+    Styles(Vec&lt;GuardedStyleLeaf&gt;),
+    Composite(Vec&lt;GuardedPatch&gt;),
+    Structural(GuardedStructural),
+}
+
+pub struct UndoAction { pub action: u64, pub label: String, pub undo: GuardedPatch, pub redo: GuardedPatch, pub retained_bytes: usize }
+pub struct UndoReport { pub restored: usize, pub left: usize, pub reason: Option&lt;String&gt; }
+
+impl PersonalHistory {
+    pub fn record(&amp;mut self, action: UndoAction);
+    pub fn prepare_undo(&amp;mut self) -&gt; Result&lt;GuardedPatch, HistoryError&gt;;
+    pub fn prepare_redo(&amp;mut self) -&gt; Result&lt;GuardedPatch, HistoryError&gt;;
+    pub fn accepted(&amp;mut self, action: u64);
+    pub fn refused(&amp;mut self, action: u64);
+}</code></pre>
+<ol class="steps">
+<li><strong>Write failing tests</strong> <code>content_undo_restores_only_unchanged_fields</code>, <code>format_undo_restores_only_matching_style_leaves</code>, <code>undo_is_personal_and_is_a_new_entry</code>, <code>refused_undo_stays_on_stack</code> and <code>personal_history_obeys_count_and_byte_budgets</code>. Assert value Undo does not remove another person's later format; format Undo restores its own font size while retaining a later fill; peer histories contain only their own actions; undo advances the log; refusal leaves the action available; eviction is local.</li>
+<li><strong>Run:</strong> <code>cargo test -p gridcraft-engine --test it coauthor_undo -- --nocapture</code>. Expected: fail on missing history and guarded patches.</li>
+<li><strong>Build inverse data from before/after snapshots.</strong> Content commands compare cell content fields, not computed values or style. Format commands derive leaf paths from the command (<code>font.bold</code>, <code>font.size</code>, etc.) or the supplied Format Cells patch, and record only changed leaves. Include row/column style leaves for whole-line targets. Store identity targets, never positions.</li>
+<li><strong>Apply a guarded patch as one engine edit.</strong> For each field, compare its canonical current JSON with <code>expected</code>; restore only matches and count the rest. Validate the whole payload and all target identities first. Return <code>UndoReport</code> in the entry effect data kept by <code>GridCoauthor</code>; the room still sees G2 <code>Effect::Applied</code> or <code>NoEffect</code>.</li>
+<li><strong>Make history side effects idempotent across re-run.</strong> Key pending history by <code>SharedEntry.action</code>. Record once when <code>submit</code> succeeds; replace its computed inverse when the same pending action is re-run; finalize/remove through G2 <code>Applied</code>/<code>Refused</code> events. Never put <code>PersonalHistory</code> in <code>GridSnapshot</code>.</li>
+<li><strong>Add <code>GridCoauthor::undo(now_ms)</code> and <code>redo(now_ms)</code></strong>, returning <code>Result&lt;Step, GridLiveError&gt;</code>. Each serializes a guarded patch and calls <code>LiveClient::local</code> like any other change. Reject over-limit payloads before moving stacks.</li>
+<li><strong>Run:</strong> focused tests and <code>cargo test -p gridcraft-engine --test it coauthor_live</code>. Expected: pass.</li>
+<li><strong>Commit:</strong> <code>G3.7: add guarded personal undo for cells and formats</code>.</li>
+</ol>
+</div>
+
+<div class="task">
+<h3>Task 8: structural Undo, guarded all-or-nothing actions and Redo</h3>
+<p><strong>Files:</strong> extend <code>coauthor/undo.rs</code>, <code>ids.rs</code>, <code>command.rs</code> and <code>tests/it/coauthor_undo.rs</code>.</p>
+<p><strong>Interfaces:</strong> use <code>GuardedStructural</code> variants <code>InsertRows</code>, <code>DeleteRows</code>, <code>InsertColumns</code>, <code>DeleteColumns</code>, <code>AddSheet</code>, <code>RenameSheet</code> and <code>WholeAction</code>. Each contains the affected identities, before/after guards and the content needed for its reverse.</p>
+<ol class="steps">
+<li><strong>Write failing tests</strong> <code>row_delete_undo_restores_the_deleted_identities_and_cells</code>, <code>inserted_row_changed_by_another_person_is_not_removed</code>, <code>column_delete_undo_restores_formulas_and_formats</code>, <code>sheet_rename_undo_keeps_later_cell_edits</code>, <code>sheet_add_undo_refuses_after_another_person_edits_it</code>, <code>sort_large_paste_and_sheet_delete_require_untouched_guard</code> and <code>redo_reuses_the_same_guards_in_reverse</code>.</li>
+<li><strong>Run the focused tests.</strong> Expected: fail for structural variants.</li>
+<li><strong>Implement row/column reverse records.</strong> A delete records the deleted identity run and sparse cells/line info needed to reinsert it. Its Undo inserts the same identities and content; never allocates new ids. An insert's Undo deletes those identities only if their content and line properties still match the post-insert guard; otherwise refuse that structural part so another person's work is not removed.</li>
+<li><strong>Implement sheet add/rename.</strong> Add-sheet Undo deletes only an unchanged added sheet. Rename Undo checks only the same sheet identity still has the name this action assigned and that the old name is free; later cell edits remain. The corresponding Redo flips expected/restore guards.</li>
+<li><strong>Implement guarded all-or-nothing records.</strong> Although sort and large paste are not G3 shared commands, define the reusable <code>WholeAction</code> guard now and use it for <code>home.deleteSheet</code>: compare the entered fingerprint of every touched identity before applying its reverse. If any differ, refuse with the action label and untouched requirement. Do not store computed values as guards.</li>
+<li><strong>Test limits.</strong> Construct a deleted block whose reverse is just below and just above <code>MAX_PAYLOAD_BYTES</code>. Below must undo; above must leave the history and workbook unchanged with the proposed message.</li>
+<li><strong>Run:</strong> focused tests, coauthor live tests and the command-sequence fuzz test with its normal seed count. Expected: pass.</li>
+<li><strong>Commit:</strong> <code>G3.8: add guarded structural undo and redo</code>.</li>
+</ol>
+</div>
+
+<div class="task">
+<h3>Task 9: two-client convergence and cross-platform entered agreement</h3>
+<p><strong>Files:</strong> extend <code>tests/support/live.rs</code>, <code>tests/it/coauthor_live.rs</code>, <code>tests/wasm_replay.rs</code>, <code>tests/support/sequences.rs</code> and coauthor fixtures as needed.</p>
+<p><strong>Interfaces:</strong> no new production interface. This task proves the production façade through G2's actual client and protocol.</p>
+<ol class="steps">
+<li><strong>Write failing end-to-end tests</strong> <code>two_clients_converge_through_simulated_server</code>, <code>late_edit_to_deleted_target_reports_no_effect</code>, <code>same_cell_later_log_entry_wins</code>, <code>concurrent_inserts_before_one_row_keep_both_blocks</code>, <code>undo_never_removes_the_other_participants_work</code> and <code>cross_platform_agreement_uses_entered_digest</code>.</li>
+<li><strong>Drive only public G3/G2 surfaces.</strong> Join two <code>GridCoauthor</code>s, delay acknowledgements to force rollback, move their views apart, submit interleaved content/format/filter/structure/undo entries, deliver every server frame, and assert both reach <code>Phase::Live</code>, the same <code>agreed_seq</code>, ids and entered fingerprint. Same-platform computed fingerprints must also match.</li>
+<li><strong>Assert conflict notices.</strong> Inspect G2 <code>Event::Applied { effect: NoEffect { reason } }</code> for deleted targets and guarded Undo leftovers. Reasons identify the action and target kind without exposing formulas or cell content.</li>
+<li><strong>Change the WASM fixture contract.</strong> Native fixtures persist the entered digest as the agreement value. The WASM replay asserts it exactly; computed differences remain in the existing diagnostic maths-grid allow-list and cannot fail room agreement. Add a test that deliberately changes only a computed bit and proves the agreement helper stays equal while the diagnostic differs.</li>
+<li><strong>Run:</strong> all G3 tests, <code>cargo test -p gridcraft-engine --test it coauthor_replay::two_engines_agree_on_random_sequences</code>, and <code>cargo xtask wasm</code>. If the installed WASM runner is available, run the existing browser-engine fixture suite under Node and report that environment accurately.</li>
+<li><strong>Review the diff before commit.</strong> Confirm every shared variant has an explicit target test, every identity lookup handles <code>Lookup::At</code>/<code>Deleted</code>/<code>Unknown</code>, no production panic primitive was introduced, and no command outside the table can enter the log.</li>
+<li><strong>Commit:</strong> <code>G3.9: prove GridCraft live convergence</code>.</li>
+</ol>
+</div>
+
+<div class="task">
+<h3>Task 10: documents, generated checks and the final gate</h3>
+<p><strong>Files:</strong> modify <code>docs/coauthor-determinism.md</code>, <code>docs/gaps.md</code>, <code>docs/roadmap.md</code>, <code>ROADMAP.md</code>, and any affected command catalog docs through their generator.</p>
+<ol class="steps">
+<li><strong>Update the determinism audit.</strong> Move NOW/TODAY, RAND state, year-less dates, selection readers and per-person history depth from “Left for G3” to “Fixed in G3”, naming the exact tests. Keep maths-library differences, AutoFit width, pictures, iterative/manual calculation and non-shared commands open.</li>
+<li><strong>Update the roadmap and gaps</strong> in plain English: first shared command set and in-process adapter complete; no user-facing co-authoring until G4/G5; structural changes on workbooks with at least 100,000 stored cells wait for the server; record the heavier-formula timing without claiming an unrun platform.</li>
+<li><strong>Regenerate only what changed.</strong> If new filter commands alter the catalog, run <code>cargo xtask parity</code> rather than hand-editing <code>docs/parity-checklist.md</code>.</li>
+<li><strong>Run focused gates:</strong> all new named tests from Tasks 1 to 9, existing coauthor replay/save/timing tests, engine unit/integration tests, core tests and the WASM gate. Expected: pass, except any pre-existing ignored G1 row-height checkpoint test remains G4 work and is reported as such.</li>
+<li><strong>Run full gate:</strong> <code>cargo xtask ci</code>. Expected: fmt, clippy with warnings denied, tests, assets, layers and WASM all pass. If environment limits prevent a sub-gate, report it and rely on CI rather than claiming it ran.</li>
+<li><strong>Review the complete branch diff.</strong> Confirm it is based on <code>097d1514</code>, changes no CI workflow, contains no copied vendor material, records no secrets or personal details, and contains no AI/agent attribution. Search recent PRs/commits again for a better equivalent before opening a PR.</li>
+<li><strong>Commit:</strong> <code>G3.10: document the first live GridCraft commands</code>.</li>
+</ol>
+</div>
+
+<h2>Spec coverage</h2>
+<table>
+<thead><tr><th>Binding requirement or G1 condition</th><th>Where this plan covers it</th></tr></thead>
+<tbody>
+<tr><td>C7 / section 06: sheet, row and column identities; cell is row + column; not in XLSX.</td><td>Proposal 3; Task 2; <code>WorkbookIds</code> is session state only.</td></tr>
+<tr><td>C8/C9 / section 07: never silently move a target; later log entry wins; deleted/sorted target does nothing with notice.</td><td>Global constraints; Tasks 2, 5 and 9. Sort remains refused.</td></tr>
+<tr><td>C10: filter shared in Stage 2.</td><td>G3 command table; Task 3. Personal filter views remain out.</td></tr>
+<tr><td>C11: one person's active sheet and selection do not move another's.</td><td>Proposal 6; Task 5 view capture/restore tests.</td></tr>
+<tr><td>C12 / section 08: personal Undo, guarded by what the action left, new log entry, personal stack, Redo.</td><td>Tasks 7 and 8; history excluded from snapshots/fingerprints.</td></tr>
+<tr><td>C13: show ordinary GridCraft edits at once; heavy work waits.</td><td>Proposal 5; Task 6 threshold tests.</td></tr>
+<tr><td>Section 10: fork supplies snapshot, restore, apply, targets, outcome, reverse and fingerprint.</td><td>Tasks 2, 4, 5, 7 and 8 using G2's actual <code>LiveEditor</code>.</td></tr>
+<tr><td>Filters, underline, font-size steps and Format Cells target-explicit.</td><td>Command table; Task 3 exact tests.</td></tr>
+<tr><td>Structural changes on large workbooks start with wait-for-server; cheaper re-run only if proved equal.</td><td>Proposal 5; Task 6. No cheaper path ships.</td></tr>
+<tr><td>Carry clock, RAND state and dates typed without a year.</td><td>Proposal 7; Task 4.</td></tr>
+<tr><td>Rollback and re-apply equals straight-through.</td><td>Task 6 <code>rollback_rerun_matches_straight_through</code>, including identities and volatile formulas.</td></tr>
+<tr><td>Agreement across platforms compares entered content only.</td><td>Proposal 8; Tasks 4 and 9.</td></tr>
+<tr><td>Scope is fork-only build/test with an in-process harness through G2 against a simulated server.</td><td>Architecture; Tasks 5, 6 and 9. No socket or browser bridge.</td></tr>
+<tr><td>No G4 checkpoints and no G5 bridge.</td><td>Not in this plan; file map contains neither server nor UI bridge code.</td></tr>
+</tbody>
+</table>
+
+<p class="small">Evidence read while writing this plan: GridCraft <code>ROADMAP.md</code>, <code>docs/gaps.md</code>, <code>docs/coauthor-determinism.md</code>, the selection-reader fixture, <code>fingerprint.rs</code>, <code>Session</code>/<code>Session::execute</code>, command parsing and commit code, filter/format/sheet commands, formula AST and adjustment code, G1 replay/timing support; ShareCraft approach v1.2, G1 proofs, G1/G2 plans, and G2 <code>collab-live</code> client/identity source. Existing API names in this document follow those files; APIs displayed under “Interfaces” in tasks are explicitly new APIs to create.</p>
+
+</main></body>
+</html>
