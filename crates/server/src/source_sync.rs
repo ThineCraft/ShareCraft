@@ -101,6 +101,10 @@ pub struct Hidden {
     pub too_big: usize,
     pub unnameable: usize,
     pub renamed: usize,
+    pub system: usize,
+    pub offline: usize,
+    pub too_long: usize,
+    pub unreadable: usize,
 }
 
 impl Hidden {
@@ -112,6 +116,26 @@ impl Hidden {
             .saturating_add(self.policy)
             .saturating_add(self.too_big)
             .saturating_add(self.unnameable)
+            .saturating_add(self.system)
+            .saturating_add(self.offline)
+            .saturating_add(self.too_long)
+            .saturating_add(self.unreadable)
+    }
+
+    /// Counts grouped for the source details shown by the API and pages.
+    #[must_use]
+    pub fn detail(&self) -> serde_json::Value {
+        serde_json::json!({
+            "links": self.symlinks,
+            "submodules": self.submodules,
+            "types": self.policy,
+            "size": self.too_big,
+            "names": self.unnameable,
+            "system": self.system,
+            "offline": self.offline,
+            "long": self.too_long,
+            "unreadable": self.unreadable,
+        })
     }
 }
 
