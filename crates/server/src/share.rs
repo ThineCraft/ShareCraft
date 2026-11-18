@@ -9,11 +9,16 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use collab_core::ids::NodeId;
-use records::{SharePath, external_tag, hidden_by_default, reserved_name, windows_safe_name};
+use records::{
+    SharePath, SourceConfig, SourceStatus, approved_root, external_tag, hidden_by_default,
+    reserved_name, windows_safe_name,
+};
 use tokio::task::JoinSet;
 
-use crate::source::{EntryKind, TreeEntry};
-use crate::source_sync::Hidden;
+use crate::AppState;
+use crate::blobs::Held;
+use crate::source::{ContentMode, EntryKind, Listing, Look, SourceCaps, StorageSource, TreeEntry};
+use crate::source_sync::{Hidden, SyncError};
 
 const HIDDEN_ATTRIBUTE: u32 = 0x2;
 const SYSTEM_ATTRIBUTE: u32 = 0x4;
@@ -297,6 +302,144 @@ pub enum ListError {
     TooManyFiles(usize),
     TooSlow,
     TooDeep,
+}
+
+/// A connected file share as a storage source.
+pub(crate) struct ShareSource;
+
+impl StorageSource for ShareSource {
+    type Seen = ();
+
+    fn content(&self) -> ContentMode {
+        ContentMode::External
+    }
+
+    async fn look(
+        &self,
+        state: &AppState,
+        config: &SourceConfig,
+        _status: &SourceStatus,
+        _dirty: bool,
+    ) -> Result<Look<Self::Seen>, SyncError> {
+        let settings = state.db().share_settings().await.map_err(database_failed)?;
+        let location = config.location.as_deref().ok_or_else(not_approved)?;
+        let root = SharePath::parse(location).map_err(|_| not_approved())?;
+        let approved = approved_root(&root, &settings.roots).ok_or_else(not_approved)?;
+        let limits = ListLimits {
+            max_files: settings.max_files,
+            max_time: Duration::from_secs(settings.list_seconds),
+            at_once: 4,
+            max_depth: 100,
+        };
+        let mut listed = list_share(state.shares().fs(), approved, &root, &limits)
+            .await
+            .map_err(|error| listing_failed(error, &settings))?;
+
+        if !listed.unreadable.is_empty() {
+            let known = state
+                .db()
+                .source_items(config.library)
+                .await
+                .map_err(database_failed)?;
+            for item in known {
+                let below_unreadable = listed.unreadable.iter().any(|folder| {
+                    item.repository_path
+                        .strip_prefix(folder)
+                        .is_some_and(|tail| tail.starts_with('/'))
+                });
+                if !below_unreadable
+                    || listed
+                        .entries
+                        .iter()
+                        .any(|entry| entry.path == item.repository_path)
+                {
+                    continue;
+                }
+                listed.entries.push(TreeEntry {
+                    path: item.repository_path,
+                    kind: if item.blob_sha.is_some() {
+                        EntryKind::File
+                    } else {
+                        EntryKind::Dir
+                    },
+                    sha: item.blob_sha.unwrap_or_default(),
+                    size: u64::try_from(item.size).unwrap_or(0),
+                });
+            }
+            listed
+                .entries
+                .sort_by(|left, right| left.path.cmp(&right.path));
+        }
+
+        Ok(Look::Listing(Listing {
+            entries: listed.entries,
+            bookmark: String::new(),
+            etag: None,
+            credit: None,
+            hidden: listed.hidden,
+            took: listed.took,
+            seen: (),
+        }))
+    }
+
+    async fn list(
+        &self,
+        _state: &AppState,
+        _listing: &mut Listing<Self::Seen>,
+    ) -> Result<(), SyncError> {
+        Ok(())
+    }
+
+    async fn caps(&self, state: &AppState) -> Result<SourceCaps, SyncError> {
+        let settings = state.db().share_settings().await.map_err(database_failed)?;
+        Ok(SourceCaps {
+            max_files: settings.max_files,
+            max_bytes: None,
+        })
+    }
+
+    async fn fetch(
+        &self,
+        _state: &AppState,
+        _config: &SourceConfig,
+        _listing: &Listing<Self::Seen>,
+        _caps: SourceCaps,
+        _needed: &HashMap<String, u64>,
+    ) -> Result<HashMap<String, Held>, SyncError> {
+        Ok(HashMap::new())
+    }
+}
+
+fn not_approved() -> SyncError {
+    SyncError::NotConnected(
+        "This folder is no longer approved for ShareCraft. An administrator can approve it again."
+            .to_owned(),
+    )
+}
+
+fn database_failed(error: impl std::fmt::Display) -> SyncError {
+    eprintln!("sharecraft-server: database failure: {error}");
+    SyncError::Failed("The database could not be read, so nothing was changed.".to_owned())
+}
+
+fn listing_failed(error: ListError, settings: &records::ShareSettings) -> SyncError {
+    let message = match error {
+        ListError::Denied => {
+            "The server's account may not read this folder, so nothing was changed.".to_owned()
+        }
+        ListError::TooManyFiles(_) => format!(
+            "The folder holds more than {} files, the most this server shows for one library, so nothing was changed.",
+            settings.max_files
+        ),
+        ListError::TooSlow => format!(
+            "Listing the folder took longer than {} seconds, so nothing was changed.",
+            settings.list_seconds
+        ),
+        ListError::Unreachable | ListError::NotAFolder | ListError::TooDeep => {
+            "The share could not be reached, so nothing was changed.".to_owned()
+        }
+    };
+    SyncError::Failed(message)
 }
 
 /// Maps an operating-system listing failure to a stable category.

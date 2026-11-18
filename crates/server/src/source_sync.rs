@@ -34,7 +34,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use collab_core::ids::{DocId, NodeId};
 use futures_util::{StreamExt, TryStreamExt};
 use records::{
-    DEFAULT_SOURCE_MAX_BYTES, DEFAULT_SOURCE_MAX_FILES, Editor, NewEvent, NodeKind,
+    DEFAULT_SOURCE_MAX_BYTES, DEFAULT_SOURCE_MAX_FILES, Editor, ExternalEntry, NewEvent, NodeKind,
     SOURCE_MAX_BYTES, SOURCE_MAX_FILES, SourceConfig, SourceItem, SourceKind, SourceLock,
     SourceState, SourceStatus, SourceSyncTransition, UploadTarget, User, check_name, check_size,
     is_format_char, validate_document_name, validate_node_name,
@@ -54,6 +54,7 @@ use crate::blobs::Held;
 use crate::file_room::SaveReply;
 use crate::github::{GithubError, Head, RepoRef, TarLimits, for_each_in_tarball, git_blob_id};
 use crate::secrets::{Sealed, Secret};
+use crate::share::ShareSource;
 use crate::source::{ContentMode, EntryKind, Listing, Look, SourceCaps, StorageSource, TreeEntry};
 use crate::tree::{self, TreeOp, unique_node_name};
 
@@ -69,6 +70,8 @@ pub const STALE_SYNC: time::Duration = time::Duration::minutes(15);
 const MAX_AUTHOR_CHARS: usize = 100;
 /// Attempts at storing a new version when the file session's revision moved meanwhile.
 const VERSION_ATTEMPTS: usize = 3;
+/// How many complete polls an external item may be absent before it is recycled.
+pub const MISSING_GRACE_POLLS: u32 = 1;
 
 /// One item of the repository as the library shows it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -933,11 +936,12 @@ async fn sync_one(state: &AppState, library: NodeId, now: OffsetDateTime) -> boo
                 generation,
             } = *started;
             let outcome = match config.kind {
-                SourceKind::Github => run(&GithubSource, state, &config, &status).await,
-                SourceKind::Share => Err(SyncError::NotConnected(
-                    "File-share libraries are not available in this build.".to_owned(),
-                )
-                .into()),
+                SourceKind::Github => {
+                    run(&GithubSource, state, &config, &status, now, generation).await
+                }
+                SourceKind::Share => {
+                    run(&ShareSource, state, &config, &status, now, generation).await
+                }
             };
             let finished = finish(state, &config, status, now, outcome, generation).await;
             drop(source_lock);
@@ -1056,11 +1060,8 @@ pub async fn sync_once(
         return Ok(None);
     }
     let outcome = match config.kind {
-        SourceKind::Github => run(&GithubSource, state, &config, &status).await,
-        SourceKind::Share => Err(SyncError::NotConnected(
-            "File-share libraries are not available in this build.".to_owned(),
-        )
-        .into()),
+        SourceKind::Github => run(&GithubSource, state, &config, &status, now, generation).await,
+        SourceKind::Share => run(&ShareSource, state, &config, &status, now, generation).await,
     };
     finish(state, &config, status, now, outcome, generation).await
 }
@@ -1068,12 +1069,17 @@ pub async fn sync_once(
 /// What a sync that did not fail found.
 enum Outcome {
     /// Nothing to do; the ETag to keep.
-    Unchanged { etag: Option<String> },
+    Unchanged {
+        etag: Option<String>,
+        listing_detail: Option<serde_json::Value>,
+    },
     /// The library now mirrors `report.commit`.
     Synced {
         report: SyncReport,
         etag: Option<String>,
         files: usize,
+        content: ContentMode,
+        took: std::time::Duration,
     },
 }
 
@@ -1096,12 +1102,17 @@ async fn finish(
     };
     // Recorded only with the status: a sync whose connection changed meanwhile records neither.
     let event: Option<NewEvent>;
+    let listing_detail: Option<serde_json::Value>;
     let answer = match outcome {
-        Ok(Outcome::Unchanged { etag }) => {
+        Ok(Outcome::Unchanged {
+            etag,
+            listing_detail: detail,
+        }) => {
             status.state = SourceState::Ok;
             status.etag = etag;
             status.last_error = None;
             status.retry_at = None;
+            listing_detail = detail;
             event = None;
             Ok(None)
         }
@@ -1109,10 +1120,12 @@ async fn finish(
             report,
             etag,
             files,
+            content,
+            took,
         }) => {
             status.state = SourceState::Ok;
             status.etag = etag;
-            status.last_commit = Some(report.commit.clone());
+            status.last_commit = (!report.commit.is_empty()).then(|| report.commit.clone());
             status.last_synced_at = Some(now);
             status.last_error = None;
             status.retry_at = None;
@@ -1121,13 +1134,21 @@ async fn finish(
             // Files not shown at all. Files shown under a suffixed name (`renamed`) are shown,
             // so they are not counted here; the `source.synced` event carries their number.
             status.hidden = i64::try_from(report.hidden.total()).unwrap_or(i64::MAX);
-            event = Some(NewEvent {
-                kind: "source.synced",
-                actor: None,
-                subject: None,
-                document: None,
-                node: Some(library),
-                detail: json!({
+            listing_detail =
+                matches!(content, ContentMode::External).then(|| report.hidden.detail());
+            let detail = if matches!(content, ContentMode::External) {
+                json!({
+                    "added": report.added,
+                    "changed": report.changed,
+                    "removed": report.removed,
+                    "moved": report.moved,
+                    "hidden": report.hidden.total(),
+                    "renamed": report.hidden.renamed,
+                    "files": files,
+                    "seconds": took.as_secs_f64(),
+                })
+            } else {
+                json!({
                     "commit": short(&report.commit),
                     "added": report.added,
                     "changed": report.changed,
@@ -1136,11 +1157,20 @@ async fn finish(
                     "hidden": report.hidden.total(),
                     "renamed": report.hidden.renamed,
                     "bytes": report.bytes,
-                }),
+                })
+            };
+            event = Some(NewEvent {
+                kind: "source.synced",
+                actor: None,
+                subject: None,
+                document: None,
+                node: Some(library),
+                detail,
             });
             Ok(Some(report))
         }
         Err(Failure { error: e, applying }) => {
+            listing_detail = None;
             if applying {
                 // Half applied: never answered as unchanged, even at the last commit.
                 status.etag = Some(DIRTY_ETAG.to_owned());
@@ -1170,6 +1200,14 @@ async fn finish(
     let db = state.db();
     let recorded = match db.set_source_status_if(library, &status, generation).await {
         Ok(true) => {
+            if let Some(detail) = listing_detail
+                && let Err(e) = db.record_listing(library, generation, None, &detail).await
+            {
+                eprintln!(
+                    "sharecraft-server: cannot record the listing of library {}: {e}",
+                    library.0
+                );
+            }
             if let Some(event) = event {
                 state.events().emit(event);
             }
@@ -1373,13 +1411,18 @@ async fn run<S: StorageSource>(
     state: &AppState,
     config: &SourceConfig,
     status: &SourceStatus,
+    now: OffsetDateTime,
+    generation: i64,
 ) -> Result<Outcome, Failure> {
     let db = state.db();
     let library = config.library;
     let dirty = status.etag.as_deref() == Some(DIRTY_ETAG);
     let mut listing = match source.look(state, config, status, dirty).await? {
         Look::Unchanged { etag } => {
-            return Ok(Outcome::Unchanged { etag });
+            return Ok(Outcome::Unchanged {
+                etag,
+                listing_detail: None,
+            });
         }
         Look::Listing(listing) => listing,
     };
@@ -1389,6 +1432,7 @@ async fn run<S: StorageSource>(
     {
         return Ok(Outcome::Unchanged {
             etag: listing.etag.or_else(|| status.etag.clone()),
+            listing_detail: None,
         });
     }
     let user = connector(state, config, &listing.bookmark, listing.credit.as_deref()).await?;
@@ -1403,7 +1447,11 @@ async fn run<S: StorageSource>(
         );
         failed("The library's file policies could not be read, so nothing was changed.")
     })?;
-    let largest = state.config().max_file_bytes;
+    let mut largest = state.config().max_file_bytes;
+    if matches!(source.content(), ContentMode::External) {
+        let settings = db.share_settings().await.map_err(db_failed)?;
+        largest = largest.min(settings.cache_max_bytes / 2);
+    }
     let mut refused = std::mem::take(&mut listing.hidden);
     let folder = config.folder.trim_matches('/');
     let tree: Vec<TreeEntry> = std::mem::take(&mut listing.entries)
@@ -1438,6 +1486,10 @@ async fn run<S: StorageSource>(
     hidden.too_big = hidden.too_big.saturating_add(refused.too_big);
     hidden.unnameable = hidden.unnameable.saturating_add(refused.unnameable);
     hidden.renamed = hidden.renamed.saturating_add(refused.renamed);
+    hidden.system = hidden.system.saturating_add(refused.system);
+    hidden.offline = hidden.offline.saturating_add(refused.offline);
+    hidden.too_long = hidden.too_long.saturating_add(refused.too_long);
+    hidden.unreadable = hidden.unreadable.saturating_add(refused.unreadable);
 
     let files = shown.iter().filter(|e| !e.dir).count();
     let bytes =
@@ -1503,7 +1555,40 @@ async fn run<S: StorageSource>(
             lost.push(item.node);
         }
     }
-    let plan = plan_with_repairs(&shown, &known, &repairs);
+    let mut plan = plan_with_repairs(&shown, &known, &repairs);
+    if matches!(source.content(), ContentMode::External) {
+        let zero_moves: Vec<(SourceItem, Entry)> = plan
+            .moves
+            .iter()
+            .filter(|(_, entry)| entry.size == 0)
+            .cloned()
+            .collect();
+        plan.moves.retain(|(_, entry)| entry.size != 0);
+        for (item, entry) in zero_moves {
+            plan.remove.push(item);
+            plan.add.push(entry);
+        }
+        let missing: Vec<NodeId> = plan.remove.iter().map(|item| item.node).collect();
+        db.clear_missing_except(library, &missing)
+            .await
+            .map_err(db_failed)?;
+    }
+
+    if matches!(source.content(), ContentMode::External)
+        && lost.is_empty()
+        && plan.add.is_empty()
+        && plan.change.is_empty()
+        && plan.remove.is_empty()
+        && plan.moves.is_empty()
+        && status.files == i64::try_from(files).unwrap_or(i64::MAX)
+        && status.bytes == i64::try_from(bytes).unwrap_or(i64::MAX)
+        && status.hidden == i64::try_from(hidden.total()).unwrap_or(i64::MAX)
+    {
+        return Ok(Outcome::Unchanged {
+            etag: None,
+            listing_detail: Some(hidden.detail()),
+        });
+    }
 
     let mut needed: HashMap<String, u64> = HashMap::new();
     for entry in plan
@@ -1519,9 +1604,11 @@ async fn run<S: StorageSource>(
     // Marked half applied before anything changes, so a sync cut short by the process ending
     // never answers unchanged later, even when the branch is back at the last commit. A sync
     // that finishes replaces the marker with the branch's entity tag.
-    db.mark_source_etag(library, DIRTY_ETAG)
-        .await
-        .map_err(db_failed)?;
+    if matches!(source.content(), ContentMode::Mirrored) {
+        db.mark_source_etag(library, DIRTY_ETAG)
+            .await
+            .map_err(db_failed)?;
+    }
     let counts = apply(
         state,
         library,
@@ -1531,6 +1618,9 @@ async fn run<S: StorageSource>(
         plan,
         &fetched,
         source.content(),
+        now,
+        config.poll_seconds,
+        generation,
     )
     .await
     .map_err(|error| Failure {
@@ -1550,6 +1640,8 @@ async fn run<S: StorageSource>(
         },
         etag: listing.etag,
         files,
+        content: source.content(),
+        took: listing.took,
     })
 }
 
@@ -1905,7 +1997,6 @@ struct Applying<'a> {
     state: &'a AppState,
     library: NodeId,
     user: &'a User,
-    #[allow(dead_code)]
     mode: ContentMode,
     /// The node of each folder path, as known or made.
     folders: HashMap<String, NodeId>,
@@ -1927,9 +2018,12 @@ async fn apply(
     user: &User,
     known: &[SourceItem],
     lost: &[NodeId],
-    plan: Plan,
+    mut plan: Plan,
     fetched: &HashMap<String, Held>,
     mode: ContentMode,
+    now: OffsetDateTime,
+    poll_seconds: u32,
+    generation: i64,
 ) -> Result<Counts, SyncError> {
     if !lost.is_empty() {
         state
@@ -1937,6 +2031,17 @@ async fn apply(
             .remove_source_items(library, lost)
             .await
             .map_err(db_failed)?;
+    }
+    if matches!(mode, ContentMode::External) && !plan.remove.is_empty() {
+        let nodes: Vec<NodeId> = plan.remove.iter().map(|item| item.node).collect();
+        let seconds = i64::from(poll_seconds.saturating_mul(MISSING_GRACE_POLLS));
+        let expired = state
+            .db()
+            .note_missing(library, &nodes, now, time::Duration::seconds(seconds))
+            .await
+            .map_err(db_failed)?;
+        let expired: HashSet<NodeId> = expired.into_iter().collect();
+        plan.remove.retain(|item| expired.contains(&item.node));
     }
     let mut work = Applying {
         state,
@@ -1952,6 +2057,7 @@ async fn apply(
         fetched,
     };
     let mut counts = Counts::default();
+    let mut file_operations = 0_usize;
     let (gone_folders, gone_files): (Vec<SourceItem>, Vec<SourceItem>) = plan
         .remove
         .into_iter()
@@ -1965,6 +2071,8 @@ async fn apply(
     for item in gone_files {
         work.to_bin(&item).await?;
         counts.removed += 1;
+        file_operations = file_operations.saturating_add(1);
+        check_generation(state, library, generation, file_operations).await?;
     }
     for entry in plan.add.iter().filter(|e| e.dir) {
         work.add_folder(entry, &mut gone_folders).await?;
@@ -1975,6 +2083,8 @@ async fn apply(
             waiting.push(later);
         }
         counts.moved += 1;
+        file_operations = file_operations.saturating_add(1);
+        check_generation(state, library, generation, file_operations).await?;
     }
     let mut gone_folders: Vec<SourceItem> = gone_folders.into_values().collect();
     gone_folders.sort_by(|a, b| b.path.cmp(&a.path));
@@ -1987,12 +2097,39 @@ async fn apply(
     for (item, entry) in &plan.change {
         work.new_version(item.node, entry).await?;
         counts.changed += 1;
+        file_operations = file_operations.saturating_add(1);
+        check_generation(state, library, generation, file_operations).await?;
     }
     for entry in plan.add.iter().filter(|e| !e.dir) {
         work.add_file(entry).await?;
         counts.added += 1;
+        file_operations = file_operations.saturating_add(1);
+        check_generation(state, library, generation, file_operations).await?;
     }
     Ok(counts)
+}
+
+async fn check_generation(
+    state: &AppState,
+    library: NodeId,
+    generation: i64,
+    file_operations: usize,
+) -> Result<(), SyncError> {
+    if !file_operations.is_multiple_of(100) {
+        return Ok(());
+    }
+    let current = state
+        .db()
+        .source_generation(library)
+        .await
+        .map_err(db_failed)?;
+    if current == Some(generation) {
+        Ok(())
+    } else {
+        Err(failed(
+            "The source changed while its files were being listed, so the sync stopped.",
+        ))
+    }
 }
 
 /// `name` with a suffix no other name has, before the extension its editor needs: the
@@ -2026,6 +2163,27 @@ impl Applying<'_> {
     /// Records `node` as holding `entry`, replacing any item it held before.
     async fn record(&self, node: NodeId, entry: &Entry) -> Result<(), SyncError> {
         let db = self.state.db();
+        if matches!(self.mode, ContentMode::External) && !entry.dir {
+            let prefix = format!("x{}-", entry.size);
+            let mtime_ns = entry
+                .sha
+                .strip_prefix(&prefix)
+                .and_then(|text| text.parse::<i64>().ok())
+                .ok_or_else(|| failed("A file on the share had an invalid change tag."))?;
+            return db
+                .record_external_item(
+                    self.library,
+                    &ExternalEntry {
+                        node,
+                        path: entry.path.clone(),
+                        repository_path: entry.repository_path.clone(),
+                        size: entry.size,
+                        mtime_ns,
+                    },
+                )
+                .await
+                .map_err(db_failed);
+        }
         let item = SourceItem {
             node,
             path: entry.path.clone(),
@@ -2229,6 +2387,9 @@ impl Applying<'_> {
     /// Stores the content of `entry` as a new version of the file `node`, through its file
     /// session as an uploaded version is, and records it.
     async fn new_version(&self, node: NodeId, entry: &Entry) -> Result<(), SyncError> {
+        if matches!(self.mode, ContentMode::External) {
+            return self.record(node, entry).await;
+        }
         let db = self.state.db();
         let doc = DocId(node.0);
         let document = db
@@ -2283,10 +2444,37 @@ impl Applying<'_> {
             .map_err(db_failed)?;
         match existing {
             Some(node) if node.kind == NodeKind::Document && !self.tracked.contains(&node.id) => {
+                if matches!(self.mode, ContentMode::External) {
+                    return self.record(node.id, entry).await;
+                }
                 return self.new_version(node.id, entry).await;
             }
             Some(_) => return Err(taken(&entry.path)),
             None => {}
+        }
+        if matches!(self.mode, ContentMode::External) {
+            let id = DocId(Uuid::new_v4());
+            tree::create_document(
+                self.state,
+                self.user,
+                parent,
+                id,
+                name,
+                Editor::for_file_name(name),
+                Some(entry.size),
+            )
+            .await
+            .map_err(|e| {
+                eprintln!(
+                    "sharecraft-server: sync could not add {}: {e:?}",
+                    entry.path
+                );
+                failed(&format!(
+                    "{} could not be added, so the sync stopped.",
+                    entry.path
+                ))
+            })?;
+            return self.record(NodeId(id.0), entry).await;
         }
         let held = self.held(&entry.sha, &entry.path).await?;
         let created = create_uploaded(
