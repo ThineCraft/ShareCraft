@@ -129,6 +129,72 @@ fn within_is_by_whole_segments_and_ignores_case_for_windows_forms() {
 }
 
 #[test]
+fn drive_containment_uses_single_code_point_windows_case_mapping() {
+    let dotted_capital = SharePath::parse("C:\\\u{0130}").unwrap();
+    let expanded_lower = SharePath::parse("C:\\i\u{0307}").unwrap();
+    assert!(!dotted_capital.is_within(&expanded_lower));
+    assert!(!expanded_lower.is_within(&dotted_capital));
+
+    for candidate in ["C:\\\u{03C2}\\file", "C:\\\u{03C3}\\file"] {
+        assert!(
+            SharePath::parse(candidate)
+                .unwrap()
+                .is_within(&SharePath::parse("C:\\\u{03A3}").unwrap())
+        );
+    }
+    for root in ["C:\\\u{03C2}", "C:\\\u{03C3}"] {
+        assert!(
+            SharePath::parse("C:\\\u{03A3}\\file")
+                .unwrap()
+                .is_within(&SharePath::parse(root).unwrap())
+        );
+    }
+}
+
+#[test]
+fn unc_containment_uses_single_code_point_windows_case_mapping() {
+    let dotted_capital = SharePath::parse("\\\\server\\share\\\u{0130}").unwrap();
+    let expanded_lower = SharePath::parse("\\\\server\\share\\i\u{0307}").unwrap();
+    assert!(!dotted_capital.is_within(&expanded_lower));
+    assert!(!expanded_lower.is_within(&dotted_capital));
+
+    for candidate in [
+        "\\\\server\\share\\\u{03C2}\\file",
+        "\\\\server\\share\\\u{03C3}\\file",
+    ] {
+        assert!(
+            SharePath::parse(candidate)
+                .unwrap()
+                .is_within(&SharePath::parse("\\\\server\\share\\\u{03A3}").unwrap())
+        );
+    }
+    for root in ["\\\\server\\share\\\u{03C2}", "\\\\server\\share\\\u{03C3}"] {
+        assert!(
+            SharePath::parse("\\\\server\\share\\\u{03A3}\\file")
+                .unwrap()
+                .is_within(&SharePath::parse(root).unwrap())
+        );
+    }
+}
+
+#[test]
+fn windows_case_mapping_still_matches_only_whole_segments() {
+    let drive_root = SharePath::parse("C:\\\u{03A3}").unwrap();
+    assert!(
+        !SharePath::parse("C:\\\u{03C3}uffix")
+            .unwrap()
+            .is_within(&drive_root)
+    );
+
+    let unc_root = SharePath::parse("\\\\server\\share\\\u{03A3}").unwrap();
+    assert!(
+        !SharePath::parse("\\\\server\\share\\\u{03C2}uffix")
+            .unwrap()
+            .is_within(&unc_root)
+    );
+}
+
+#[test]
 fn posix_within_is_case_sensitive() {
     let root = SharePath::parse("/mnt/Share").unwrap();
     assert!(SharePath::parse("/mnt/Share/a").unwrap().is_within(&root));
@@ -252,6 +318,38 @@ async fn share_roots_setting_refuses_bad_roots_and_non_administrators() {
             test.db.set_setting(admin.id, SHARE_ROOTS, bad).await,
             Err(AccessError::InvalidSetting)
         );
+    }
+}
+
+#[tokio::test]
+async fn share_cache_and_listing_settings_enforce_exact_bounds_and_types() {
+    let test = TestDb::create().await;
+    let admin = user(&test, "Admin", true).await;
+
+    for bad in [json!(268_435_455), json!("268435456"), json!(-1)] {
+        assert_eq!(
+            test.db
+                .set_setting(admin.id, SHARE_CACHE_MAX_BYTES, bad)
+                .await,
+            Err(AccessError::InvalidSetting)
+        );
+    }
+    test.db
+        .set_setting(admin.id, SHARE_CACHE_MAX_BYTES, json!(268_435_456))
+        .await
+        .unwrap();
+
+    for bad in [json!(29), json!(3_601), json!("30")] {
+        assert_eq!(
+            test.db.set_setting(admin.id, SHARE_LIST_SECONDS, bad).await,
+            Err(AccessError::InvalidSetting)
+        );
+    }
+    for valid in [30, 3_600] {
+        test.db
+            .set_setting(admin.id, SHARE_LIST_SECONDS, json!(valid))
+            .await
+            .unwrap();
     }
 }
 

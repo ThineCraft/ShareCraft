@@ -406,7 +406,25 @@ fn is_device_name(name: &str) -> bool {
 }
 
 fn equal_windows(left: &str, right: &str) -> bool {
-    left.to_lowercase() == right.to_lowercase()
+    // NTFS compares names through its single-code-point $UpCase table. Fold each character
+    // independently (so sigma and final sigma both become capital sigma), and leave a character
+    // literal when Unicode defines only a multi-character uppercase mapping. Callers apply this
+    // to individual path segments, never to a whole path string.
+    left.chars()
+        .map(simple_uppercase)
+        .eq(right.chars().map(simple_uppercase))
+}
+
+fn simple_uppercase(character: char) -> char {
+    let mut uppercase = character.to_uppercase();
+    let Some(first) = uppercase.next() else {
+        return character;
+    };
+    if uppercase.next().is_none() {
+        first
+    } else {
+        character
+    }
 }
 
 fn prefix(path: &[String], root: &[String], equal: impl Fn(&str, &str) -> bool) -> bool {
