@@ -243,6 +243,9 @@ pub enum AccessError {
     /// The library is connected to a source already.
     #[error("that library is already connected to a source")]
     SourceExists,
+    /// Another library uses the same or an overlapping file-share location.
+    #[error("that file-share location is already in use")]
+    ShareLocationInUse,
     #[error("a document with that id already exists")]
     Exists,
     #[error("something with that name is already in that place")]

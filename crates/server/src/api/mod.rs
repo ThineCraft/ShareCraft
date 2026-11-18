@@ -377,6 +377,8 @@ pub(crate) enum ApiError {
     LibraryNotEmpty,
     /// 409: the library is connected to a source already.
     SourceExists,
+    /// 409: another library uses the same or an overlapping file-share location.
+    ShareLocationInUse,
     /// 409: the library is kept in step with a source (a GitHub repository), so nothing in it
     /// is created, changed, moved, copied in, deleted or restored here; administrators too.
     /// The answer's `message` says so in words.
@@ -538,6 +540,7 @@ impl ApiError {
             ApiError::FoldersOff => (StatusCode::CONFLICT, "folders_off"),
             ApiError::LibraryNotEmpty => (StatusCode::CONFLICT, "library_not_empty"),
             ApiError::SourceExists => (StatusCode::CONFLICT, "source_exists"),
+            ApiError::ShareLocationInUse => (StatusCode::CONFLICT, "share_location_in_use"),
             ApiError::SourceReadOnly => (StatusCode::CONFLICT, "source_read_only"),
             ApiError::RepositoryNotFound => {
                 (StatusCode::UNPROCESSABLE_ENTITY, "repository_not_found")
@@ -632,6 +635,7 @@ impl From<AccessError> for ApiError {
             AccessError::FoldersOff => ApiError::FoldersOff,
             AccessError::LibraryNotEmpty => ApiError::LibraryNotEmpty,
             AccessError::SourceExists => ApiError::SourceExists,
+            AccessError::ShareLocationInUse => ApiError::ShareLocationInUse,
             AccessError::BlockedFileType(file_type) => ApiError::BlockedFileType(file_type),
             AccessError::FileTooLarge(limit) => ApiError::FileTooLarge(limit),
             AccessError::Held(scan) => ApiError::Held(scan),

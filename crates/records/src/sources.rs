@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::libraries::ensure_library_row;
 use crate::quotas::recompute_site_usage;
-use crate::{AccessError, Db, DbError};
+use crate::{AccessError, Db, DbError, SharePath};
 
 /// PostgreSQL's code for a row a check constraint refuses.
 const CHECK_VIOLATION: &str = "23514";
@@ -513,7 +513,34 @@ impl Db {
         if !poll_ok(s.poll_seconds) {
             return Err(AccessError::InvalidSetting);
         }
+        let share_location = match s.kind {
+            SourceKind::Github => None,
+            SourceKind::Share => Some(
+                SharePath::parse(s.location.as_deref().ok_or(AccessError::InvalidSetting)?)
+                    .map_err(|_| AccessError::InvalidSetting)?,
+            ),
+        };
         let mut tx = self.pool().begin().await?;
+        if let Some(share_location) = &share_location {
+            sqlx::query("select pg_advisory_xact_lock(hashtextextended('share-connection', 0))")
+                .execute(&mut *tx)
+                .await?;
+            let locations: Vec<Option<String>> = sqlx::query_scalar(
+                "select location from library_sources \
+                 where kind = 'share' and library_id <> $1",
+            )
+            .bind(s.library.0)
+            .fetch_all(&mut *tx)
+            .await?;
+            for location in locations {
+                let location =
+                    SharePath::parse(location.as_deref().ok_or(AccessError::InvalidSetting)?)
+                        .map_err(|_| AccessError::InvalidSetting)?;
+                if share_location.is_within(&location) || location.is_within(share_location) {
+                    return Err(AccessError::ShareLocationInUse);
+                }
+            }
+        }
         let node: Option<(String, Option<OffsetDateTime>, Uuid)> =
             sqlx::query_as("select kind, deleted_at, site_id from nodes where id = $1 for update")
                 .bind(s.library.0)

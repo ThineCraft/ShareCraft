@@ -84,6 +84,24 @@ async fn connect_share(f: &Fixture) {
         .unwrap();
 }
 
+async fn library(f: &Fixture, name: &str) -> NodeId {
+    put(
+        &f.test,
+        new_id(),
+        NodeKind::Library,
+        Some(f.site),
+        f.site,
+        name,
+    )
+    .await
+}
+
+fn at_location(f: &Fixture, library: NodeId, location: &str) -> NewSource {
+    let mut source = share_source(f, library);
+    source.location = Some(location.into());
+    source
+}
+
 async fn external_document(f: &Fixture, name: &str) -> NodeId {
     document_in(&f.test, f.user, f.library, f.site, name)
         .await
@@ -130,6 +148,170 @@ async fn a_share_without_a_location_and_a_github_source_with_one_are_refused() {
         f.test.db.connect_source(&github).await,
         Err(AccessError::InvalidSetting)
     );
+}
+
+#[tokio::test]
+async fn two_libraries_cannot_connect_to_the_same_share_location() {
+    let f = fixture().await;
+    let second = library(&f, "Second").await;
+    f.test
+        .db
+        .connect_source(&share_source(&f, f.library))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        f.test.db.connect_source(&share_source(&f, second)).await,
+        Err(AccessError::ShareLocationInUse)
+    );
+}
+
+#[tokio::test]
+async fn reconnecting_the_same_share_library_is_still_source_exists() {
+    let f = fixture().await;
+    let source = share_source(&f, f.library);
+    f.test.db.connect_source(&source).await.unwrap();
+
+    assert_eq!(
+        f.test.db.connect_source(&source).await,
+        Err(AccessError::SourceExists)
+    );
+}
+
+#[tokio::test]
+async fn windows_case_and_separator_variants_are_the_same_share_location() {
+    let f = fixture().await;
+    let second = library(&f, "Second").await;
+    f.test
+        .db
+        .connect_source(&at_location(&f, f.library, r"C:\Approved\Files"))
+        .await
+        .unwrap();
+    assert_eq!(
+        f.test
+            .db
+            .connect_source(&at_location(&f, second, "c:/approved/files"))
+            .await,
+        Err(AccessError::ShareLocationInUse)
+    );
+
+    f.test.db.disconnect_source(f.library).await.unwrap();
+    f.test
+        .db
+        .connect_source(&at_location(&f, f.library, r"\\SRV\Share\a"))
+        .await
+        .unwrap();
+    assert_eq!(
+        f.test
+            .db
+            .connect_source(&at_location(&f, second, r"\\srv\share\A"))
+            .await,
+        Err(AccessError::ShareLocationInUse)
+    );
+}
+
+#[tokio::test]
+async fn a_child_share_location_cannot_overlap_its_parent() {
+    let f = fixture().await;
+    let second = library(&f, "Second").await;
+    f.test
+        .db
+        .connect_source(&at_location(&f, f.library, r"C:\Approved\Files"))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        f.test
+            .db
+            .connect_source(&at_location(&f, second, r"C:\Approved\Files\Child"))
+            .await,
+        Err(AccessError::ShareLocationInUse)
+    );
+}
+
+#[tokio::test]
+async fn a_parent_share_location_cannot_overlap_its_child() {
+    let f = fixture().await;
+    let second = library(&f, "Second").await;
+    f.test
+        .db
+        .connect_source(&at_location(&f, f.library, r"C:\Approved\Files\Child"))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        f.test
+            .db
+            .connect_source(&at_location(&f, second, r"C:\Approved\Files"))
+            .await,
+        Err(AccessError::ShareLocationInUse)
+    );
+}
+
+#[tokio::test]
+async fn sibling_locations_and_different_unc_shares_are_allowed() {
+    let f = fixture().await;
+    let sibling = library(&f, "Sibling").await;
+    let first_unc = library(&f, "First UNC").await;
+    let second_unc = library(&f, "Second UNC").await;
+
+    f.test
+        .db
+        .connect_source(&at_location(&f, f.library, r"C:\Approved\First"))
+        .await
+        .unwrap();
+    f.test
+        .db
+        .connect_source(&at_location(&f, sibling, r"C:\Approved\Second"))
+        .await
+        .unwrap();
+    f.test
+        .db
+        .connect_source(&at_location(&f, first_unc, r"\\srv\one\folder"))
+        .await
+        .unwrap();
+    f.test
+        .db
+        .connect_source(&at_location(&f, second_unc, r"\\srv\two\folder"))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn disconnecting_a_share_frees_its_location() {
+    let f = fixture().await;
+    let second = library(&f, "Second").await;
+    f.test
+        .db
+        .connect_source(&share_source(&f, f.library))
+        .await
+        .unwrap();
+    f.test.db.disconnect_source(f.library).await.unwrap();
+
+    f.test
+        .db
+        .connect_source(&share_source(&f, second))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn concurrent_connections_to_the_same_location_have_one_winner() {
+    let f = fixture().await;
+    let second = library(&f, "Second").await;
+    let first_source = share_source(&f, f.library);
+    let second_source = share_source(&f, second);
+
+    let (first, second) = tokio::join!(
+        f.test.db.connect_source(&first_source),
+        f.test.db.connect_source(&second_source)
+    );
+
+    assert!(matches!(
+        (&first, &second),
+        (Ok(()), Err(AccessError::ShareLocationInUse))
+            | (Err(AccessError::ShareLocationInUse), Ok(()))
+    ));
 }
 
 #[tokio::test]
