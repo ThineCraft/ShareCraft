@@ -32,6 +32,7 @@ mod room;
 mod scan;
 pub mod secrets;
 pub mod sites;
+pub mod source;
 pub mod source_sync;
 pub mod templates;
 pub mod tree;

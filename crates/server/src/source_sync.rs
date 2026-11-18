@@ -35,9 +35,9 @@ use collab_core::ids::{DocId, NodeId};
 use futures_util::{StreamExt, TryStreamExt};
 use records::{
     DEFAULT_SOURCE_MAX_BYTES, DEFAULT_SOURCE_MAX_FILES, Editor, NewEvent, NodeKind,
-    SOURCE_MAX_BYTES, SOURCE_MAX_FILES, SourceConfig, SourceItem, SourceLock, SourceState,
-    SourceStatus, SourceSyncTransition, UploadTarget, User, check_name, check_size, is_format_char,
-    validate_document_name, validate_node_name,
+    SOURCE_MAX_BYTES, SOURCE_MAX_FILES, SourceConfig, SourceItem, SourceKind, SourceLock,
+    SourceState, SourceStatus, SourceSyncTransition, UploadTarget, User, check_name, check_size,
+    is_format_char, validate_document_name, validate_node_name,
 };
 use revisions::RevisionId;
 use serde_json::json;
@@ -52,10 +52,9 @@ use crate::api::nodes::{after_rename, delete_one, move_one};
 use crate::api::uploads::{store_version, uploads_path};
 use crate::blobs::Held;
 use crate::file_room::SaveReply;
-use crate::github::{
-    EntryKind, GithubError, Head, RepoRef, TarLimits, TreeEntry, for_each_in_tarball, git_blob_id,
-};
+use crate::github::{GithubError, Head, RepoRef, TarLimits, for_each_in_tarball, git_blob_id};
 use crate::secrets::{Sealed, Secret};
+use crate::source::{ContentMode, EntryKind, Listing, Look, StorageSource, TreeEntry};
 use crate::tree::{self, TreeOp, unique_node_name};
 
 /// More files than this to read are read from one tarball rather than one by one.
@@ -909,7 +908,13 @@ async fn sync_one(state: &AppState, library: NodeId, now: OffsetDateTime) -> boo
                 status,
                 generation,
             } = *started;
-            let outcome = run(state, &config, &status).await;
+            let outcome = match config.kind {
+                SourceKind::Github => run(&GithubSource, state, &config, &status).await,
+                SourceKind::Share => Err(SyncError::NotConnected(
+                    "File-share libraries are not available in this build.".to_owned(),
+                )
+                .into()),
+            };
             let finished = finish(state, &config, status, now, outcome, generation).await;
             drop(source_lock);
             finished
@@ -1026,7 +1031,13 @@ pub async fn sync_once(
     {
         return Ok(None);
     }
-    let outcome = run(state, &config, &status).await;
+    let outcome = match config.kind {
+        SourceKind::Github => run(&GithubSource, state, &config, &status).await,
+        SourceKind::Share => Err(SyncError::NotConnected(
+            "File-share libraries are not available in this build.".to_owned(),
+        )
+        .into()),
+    };
     finish(state, &config, status, now, outcome, generation).await
 }
 
@@ -1187,52 +1198,161 @@ impl From<SyncError> for Failure {
     }
 }
 
-/// The sync itself: reads, checks, then applies.
-async fn run(
+/// The GitHub details needed after a repository has been listed.
+pub(crate) struct GithubSeen {
+    repo: RepoRef,
+    token: Option<Secret>,
+    commit: String,
+    whole: Whole,
+}
+
+/// GitHub as a connected-library storage source.
+pub(crate) struct GithubSource;
+
+impl StorageSource for GithubSource {
+    type Seen = GithubSeen;
+
+    fn content(&self) -> ContentMode {
+        ContentMode::Mirrored
+    }
+
+    async fn look(
+        &self,
+        state: &AppState,
+        config: &SourceConfig,
+        status: &SourceStatus,
+        dirty: bool,
+    ) -> Result<Look<Self::Seen>, SyncError> {
+        let started = std::time::Instant::now();
+        let repo = RepoRef::parse(&format!("{}/{}", config.owner, config.repo)).map_err(|_| {
+            SyncError::NotConnected(
+                "The repository's name is not one GitHub uses; connect the library again."
+                    .to_owned(),
+            )
+        })?;
+        let token = token_of(state, config).await?;
+        let github = state.github();
+        let sent_etag = if dirty { None } else { status.etag.as_deref() };
+        let head = github
+            .head(&repo, &config.branch, token.as_ref(), sent_etag)
+            .await
+            .map_err(github_error)?;
+        let (commit, tree_sha, etag, author) = match head {
+            Head::NotModified => {
+                return Ok(Look::Unchanged {
+                    etag: status.etag.clone(),
+                });
+            }
+            Head::Moved {
+                commit,
+                tree,
+                etag,
+                author,
+            } => (commit, tree, etag, author),
+        };
+        let entries = github
+            .tree(&repo, &tree_sha, token.as_ref())
+            .await
+            .map_err(github_error)?;
+        let whole = Whole::of(&entries).ok_or_else(too_big_to_add)?;
+        Ok(Look::Listing(Listing {
+            entries,
+            bookmark: commit.clone(),
+            etag,
+            credit: author,
+            hidden: Hidden::default(),
+            took: started.elapsed(),
+            seen: GithubSeen {
+                repo,
+                token,
+                commit,
+                whole,
+            },
+        }))
+    }
+
+    async fn caps(&self, state: &AppState) -> Result<(usize, Option<u64>), SyncError> {
+        let db = state.db();
+        let read = |value: Option<serde_json::Value>, default: i64| {
+            value
+                .and_then(|v| v.as_i64())
+                .filter(|n| *n >= 1)
+                .unwrap_or(default)
+        };
+        let files = read(
+            db.setting(SOURCE_MAX_FILES).await.map_err(db_failed)?,
+            DEFAULT_SOURCE_MAX_FILES,
+        );
+        let bytes = read(
+            db.setting(SOURCE_MAX_BYTES).await.map_err(db_failed)?,
+            DEFAULT_SOURCE_MAX_BYTES,
+        );
+        Ok((
+            usize::try_from(files).unwrap_or(usize::MAX),
+            Some(u64::try_from(bytes).unwrap_or(u64::MAX)),
+        ))
+    }
+
+    async fn fetch(
+        &self,
+        state: &AppState,
+        config: &SourceConfig,
+        listing: &Listing<Self::Seen>,
+        needed: &HashMap<String, u64>,
+    ) -> Result<HashMap<String, Held>, SyncError> {
+        let (_, max_bytes) = self.caps(state).await?;
+        let max_bytes = max_bytes.unwrap_or(u64::MAX);
+        let reading = Reading {
+            repo: &listing.seen.repo,
+            token: listing.seen.token.as_ref(),
+            commit: &listing.seen.commit,
+            folder: config.folder.trim_matches('/'),
+            whole: listing.seen.whole,
+            max_bytes,
+        };
+        if needed.is_empty() {
+            return Ok(HashMap::new());
+        }
+        if needed.len() > TARBALL_FROM && reading.whole.bytes <= reading.max_bytes {
+            match by_tarball(state, &reading, needed).await {
+                Ok(fetched) => return Ok(fetched),
+                Err(TarFailure::Failed(e)) => return Err(e),
+                Err(TarFailure::TooLarge) => {
+                    println!(
+                        "sharecraft-server: a tarball was over its limits; reading files singly"
+                    );
+                }
+            }
+        }
+        by_blobs(state, &reading, needed).await
+    }
+}
+
+/// The source-independent sync itself: reads, checks, then applies.
+async fn run<S: StorageSource>(
+    source: &S,
     state: &AppState,
     config: &SourceConfig,
     status: &SourceStatus,
 ) -> Result<Outcome, Failure> {
     let db = state.db();
     let library = config.library;
-    let repo = RepoRef::parse(&format!("{}/{}", config.owner, config.repo)).map_err(|_| {
-        SyncError::NotConnected(
-            "The repository's name is not one GitHub uses; connect the library again.".to_owned(),
-        )
-    })?;
-    let token = token_of(state, config).await?;
-    let token = token.as_ref();
-    let github = state.github();
     let dirty = status.etag.as_deref() == Some(DIRTY_ETAG);
-    let sent_etag = if dirty { None } else { status.etag.as_deref() };
-    let head = github
-        .head(&repo, &config.branch, token, sent_etag)
-        .await
-        .map_err(github_error)?;
-    let (commit, tree_sha, etag, author) = match head {
-        Head::NotModified => {
-            return Ok(Outcome::Unchanged {
-                etag: status.etag.clone(),
-            });
+    let mut listing = match source.look(state, config, status, dirty).await? {
+        Look::Unchanged { etag } => {
+            return Ok(Outcome::Unchanged { etag });
         }
-        Head::Moved {
-            commit,
-            tree,
-            etag,
-            author,
-        } => (commit, tree, etag, author),
+        Look::Listing(listing) => listing,
     };
-    if !dirty && status.last_commit.as_deref() == Some(commit.as_str()) {
+    if !dirty
+        && !listing.bookmark.is_empty()
+        && status.last_commit.as_deref() == Some(listing.bookmark.as_str())
+    {
         return Ok(Outcome::Unchanged {
-            etag: etag.or_else(|| status.etag.clone()),
+            etag: listing.etag.or_else(|| status.etag.clone()),
         });
     }
-    let user = connector(state, config, &commit, author.as_deref()).await?;
-    let tree = github
-        .tree(&repo, &tree_sha, token)
-        .await
-        .map_err(github_error)?;
-    let whole = Whole::of(&tree).ok_or_else(too_big_to_add)?;
+    let user = connector(state, config, &listing.bookmark, listing.credit.as_deref()).await?;
 
     // The library's file policies and the largest file the server takes, judged before names
     // are given, so a hidden file never pushes a shown sibling to a suffix.
@@ -1244,9 +1364,9 @@ async fn run(
         failed("The library's file policies could not be read, so nothing was changed.")
     })?;
     let largest = state.config().max_file_bytes;
-    let mut refused = Hidden::default();
+    let mut refused = std::mem::take(&mut listing.hidden);
     let folder = config.folder.trim_matches('/');
-    let tree: Vec<TreeEntry> = tree
+    let tree: Vec<TreeEntry> = std::mem::take(&mut listing.entries)
         .into_iter()
         .filter(|entry| {
             if entry.kind != EntryKind::File || below(&entry.path, folder).is_none() {
@@ -1272,13 +1392,17 @@ async fn run(
         .collect();
     let recorded = db.source_items(library).await.map_err(db_failed)?;
     let (shown, mut hidden) = shown_names_with_allocations(tree, folder, &recorded);
-    hidden.policy = refused.policy;
-    hidden.too_big = refused.too_big;
+    hidden.symlinks = hidden.symlinks.saturating_add(refused.symlinks);
+    hidden.submodules = hidden.submodules.saturating_add(refused.submodules);
+    hidden.policy = hidden.policy.saturating_add(refused.policy);
+    hidden.too_big = hidden.too_big.saturating_add(refused.too_big);
+    hidden.unnameable = hidden.unnameable.saturating_add(refused.unnameable);
+    hidden.renamed = hidden.renamed.saturating_add(refused.renamed);
 
     let files = shown.iter().filter(|e| !e.dir).count();
     let bytes =
         total_size(shown.iter().filter(|e| !e.dir).map(|e| e.size)).ok_or_else(too_big_to_add)?;
-    let (max_files, max_bytes) = caps(state).await?;
+    let (max_files, max_bytes) = source.caps(state).await?;
     if files > max_files {
         return Err(failed(&format!(
             "The repository has {files} files to show, more than the {max_files} this server \
@@ -1286,7 +1410,8 @@ async fn run(
         ))
         .into());
     }
-    if bytes > max_bytes {
+    if max_bytes.is_some_and(|max_bytes| bytes > max_bytes) {
+        let max_bytes = max_bytes.unwrap_or(u64::MAX);
         return Err(failed(&format!(
             "The repository's files hold {bytes} bytes, more than the {max_bytes} this server \
              mirrors for one library, so nothing was changed."
@@ -1347,19 +1472,7 @@ async fn run(
     {
         needed.insert(entry.sha.clone(), entry.size);
     }
-    let fetched = fetch(
-        state,
-        &Reading {
-            repo: &repo,
-            token,
-            commit: &commit,
-            folder: config.folder.trim_matches('/'),
-            whole,
-            max_bytes,
-        },
-        &needed,
-    )
-    .await?;
+    let fetched = source.fetch(state, config, &listing, &needed).await?;
 
     // Marked half applied before anything changes, so a sync cut short by the process ending
     // never answers unchanged later, even when the branch is back at the last commit. A sync
@@ -1367,16 +1480,25 @@ async fn run(
     db.mark_source_etag(library, DIRTY_ETAG)
         .await
         .map_err(db_failed)?;
-    let counts = apply(state, library, &user, &known, &lost, plan, &fetched)
-        .await
-        .map_err(|error| Failure {
-            error,
-            applying: true,
-        })?;
+    let counts = apply(
+        state,
+        library,
+        &user,
+        &known,
+        &lost,
+        plan,
+        &fetched,
+        source.content(),
+    )
+    .await
+    .map_err(|error| Failure {
+        error,
+        applying: true,
+    })?;
     drop(fetched);
     Ok(Outcome::Synced {
         report: SyncReport {
-            commit,
+            commit: listing.bookmark,
             added: counts.added,
             changed: counts.changed,
             removed: counts.removed,
@@ -1384,7 +1506,7 @@ async fn run(
             hidden,
             bytes,
         },
-        etag,
+        etag: listing.etag,
         files,
     })
 }
@@ -1528,25 +1650,8 @@ async fn connector(
 
 /// The caps on what one library mirrors: files and bytes.
 pub(crate) async fn caps(state: &AppState) -> Result<(usize, u64), SyncError> {
-    let db = state.db();
-    let read = |value: Option<serde_json::Value>, default: i64| {
-        value
-            .and_then(|v| v.as_i64())
-            .filter(|n| *n >= 1)
-            .unwrap_or(default)
-    };
-    let files = read(
-        db.setting(SOURCE_MAX_FILES).await.map_err(db_failed)?,
-        DEFAULT_SOURCE_MAX_FILES,
-    );
-    let bytes = read(
-        db.setting(SOURCE_MAX_BYTES).await.map_err(db_failed)?,
-        DEFAULT_SOURCE_MAX_BYTES,
-    );
-    Ok((
-        usize::try_from(files).unwrap_or(usize::MAX),
-        u64::try_from(bytes).unwrap_or(u64::MAX),
-    ))
+    let (files, bytes) = GithubSource.caps(state).await?;
+    Ok((files, bytes.unwrap_or(u64::MAX)))
 }
 
 /// The whole tree's size: its entries, and its files' bytes and the largest.
@@ -1584,29 +1689,6 @@ enum TarFailure {
     /// It is larger than the limits allow: the files are read one by one instead.
     TooLarge,
     Failed(SyncError),
-}
-
-/// Reads every blob of `needed` (blob id to size), checks each against its id and stores it,
-/// held: from one tarball when more than [`TARBALL_FROM`] are needed and the whole tree is
-/// within the byte cap, otherwise (or when the tarball is larger than allowed) one by one.
-async fn fetch(
-    state: &AppState,
-    reading: &Reading<'_>,
-    needed: &HashMap<String, u64>,
-) -> Result<HashMap<String, Held>, SyncError> {
-    if needed.is_empty() {
-        return Ok(HashMap::new());
-    }
-    if needed.len() > TARBALL_FROM && reading.whole.bytes <= reading.max_bytes {
-        match by_tarball(state, reading, needed).await {
-            Ok(fetched) => return Ok(fetched),
-            Err(TarFailure::Failed(e)) => return Err(e),
-            Err(TarFailure::TooLarge) => {
-                println!("sharecraft-server: a tarball was over its limits; reading files singly");
-            }
-        }
-    }
-    by_blobs(state, reading, needed).await
 }
 
 /// The message for bytes that do not match their id.
@@ -1773,6 +1855,8 @@ struct Applying<'a> {
     state: &'a AppState,
     library: NodeId,
     user: &'a User,
+    #[allow(dead_code)]
+    mode: ContentMode,
     /// The node of each folder path, as known or made.
     folders: HashMap<String, NodeId>,
     /// Every node recorded as an item when the sync started.
@@ -1786,6 +1870,7 @@ struct Applying<'a> {
 /// of the folders that go; under a temporary name where the final one is still taken), the
 /// folders gone binned, deepest first, the moved files given their final names, and last the
 /// files changed and added. Each item is recorded as it is done.
+#[allow(clippy::too_many_arguments)]
 async fn apply(
     state: &AppState,
     library: NodeId,
@@ -1794,6 +1879,7 @@ async fn apply(
     lost: &[NodeId],
     plan: Plan,
     fetched: &HashMap<String, Held>,
+    mode: ContentMode,
 ) -> Result<Counts, SyncError> {
     if !lost.is_empty() {
         state
@@ -1806,6 +1892,7 @@ async fn apply(
         state,
         library,
         user,
+        mode,
         folders: known
             .iter()
             .filter(|item| item.blob_sha.is_none())

@@ -23,6 +23,8 @@ use tokio::io::AsyncWriteExt;
 
 use crate::secrets::Secret;
 
+pub use crate::source::{EntryKind, TreeEntry};
+
 /// The `User-Agent` GitHub requires: fixed, naming the product and nobody in particular.
 const USER_AGENT_VALUE: &str = "ThineCraft-ShareCraft";
 /// The REST API version these requests are written for.
@@ -107,29 +109,6 @@ pub enum Head {
         etag: Option<String>,
         author: Option<String>,
     },
-}
-
-/// What a tree entry is.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EntryKind {
-    File,
-    Dir,
-    /// A symbolic link (mode 120000): its blob is the link target, not content.
-    Symlink,
-    /// A submodule: its id is a commit in another repository.
-    Submodule,
-}
-
-/// One entry of a recursive tree listing.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TreeEntry {
-    /// Its path from the repository root, `/`-separated.
-    pub path: String,
-    pub kind: EntryKind,
-    /// The Git id of its blob, tree or (for a submodule) commit.
-    pub sha: String,
-    /// Its size in bytes for a file or symbolic link; 0 otherwise.
-    pub size: u64,
 }
 
 /// Why a request to GitHub failed. Never holds a token or a response body.
