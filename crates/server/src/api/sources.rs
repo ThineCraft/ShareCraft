@@ -885,16 +885,7 @@ pub(crate) async fn sync_now(
 
 /// Lower-case hexadecimal of `bytes`.
 fn hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        for nibble in [b >> 4, b & 0x0f] {
-            if let Some(&digit) = DIGITS.get(usize::from(nibble)) {
-                out.push(char::from(digit));
-            }
-        }
-    }
-    out
+    crate::s3_sign::hex(bytes)
 }
 
 /// `POST /api/libraries/{id}/source/webhook`: a new webhook secret for the connection, for
