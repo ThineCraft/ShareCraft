@@ -414,6 +414,19 @@ pub struct SourceLock {
     _tx: sqlx::Transaction<'static, sqlx::Postgres>,
 }
 
+/// The organisation-wide turn that serialises approved-root changes with file-share
+/// connection commits. Dropping it rolls its otherwise empty transaction back and releases
+/// the PostgreSQL advisory lock.
+pub struct ShareConnectionLock {
+    tx: sqlx::Transaction<'static, sqlx::Postgres>,
+}
+
+impl std::fmt::Debug for ShareConnectionLock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ShareConnectionLock")
+    }
+}
+
 impl std::fmt::Debug for SourceLock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("SourceLock")
@@ -530,6 +543,30 @@ fn external_mtime(tag: &str) -> Result<i64, sqlx::Error> {
 }
 
 impl Db {
+    /// Takes the organisation-wide file-share connection/settings turn.
+    pub async fn lock_share_connections(&self) -> Result<ShareConnectionLock, DbError> {
+        let mut tx = self.pool().begin().await?;
+        sqlx::query("select pg_advisory_xact_lock(hashtextextended('share-connection', 0))")
+            .execute(&mut *tx)
+            .await?;
+        Ok(ShareConnectionLock { tx })
+    }
+
+    /// The lexical locations of the other connected shares while this turn is held.
+    pub async fn share_locations_locked(
+        &self,
+        lock: &mut ShareConnectionLock,
+        except: NodeId,
+    ) -> Result<Vec<String>, DbError> {
+        Ok(sqlx::query_scalar(
+            "select location from library_sources \
+             where kind = 'share' and library_id <> $1 and location is not null",
+        )
+        .bind(except.0)
+        .fetch_all(&mut *lock.tx)
+        .await?)
+    }
+
     /// Stores a sealed secret and returns its id. A secret with no ciphertext is refused: only
     /// sealed bytes belong here.
     pub async fn put_secret(&self, s: &SealedRow) -> Result<SecretId, DbError> {
@@ -583,6 +620,24 @@ impl Db {
     /// `LibraryNotEmpty` if anything not in the bin is in it; `SourceExists` if it is connected
     /// already.
     pub async fn connect_source(&self, s: &NewSource) -> Result<(), AccessError> {
+        self.connect_source_inner(s, true).await
+    }
+
+    /// Connects while the caller holds [`ShareConnectionLock`]. The caller has already checked
+    /// canonical exclusivity; the lexical check remains as defence in depth.
+    pub async fn connect_source_locked(
+        &self,
+        _lock: &mut ShareConnectionLock,
+        s: &NewSource,
+    ) -> Result<(), AccessError> {
+        self.connect_source_inner(s, false).await
+    }
+
+    async fn connect_source_inner(
+        &self,
+        s: &NewSource,
+        take_share_lock: bool,
+    ) -> Result<(), AccessError> {
         if !poll_ok(s.poll_seconds) {
             return Err(AccessError::InvalidSetting);
         }
@@ -595,9 +650,13 @@ impl Db {
         };
         let mut tx = self.pool().begin().await?;
         if let Some(share_location) = &share_location {
-            sqlx::query("select pg_advisory_xact_lock(hashtextextended('share-connection', 0))")
+            if take_share_lock {
+                sqlx::query(
+                    "select pg_advisory_xact_lock(hashtextextended('share-connection', 0))",
+                )
                 .execute(&mut *tx)
                 .await?;
+            }
             let locations: Vec<Option<String>> = sqlx::query_scalar(
                 "select location from library_sources \
                  where kind = 'share' and library_id <> $1",

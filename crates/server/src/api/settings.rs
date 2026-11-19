@@ -162,15 +162,26 @@ pub(crate) async fn change_shares(
             return Err(ApiError::InvalidRequest);
         }
     }
-    for (key, value) in changes
+    let changes: Vec<(&str, Value)> = changes
         .into_iter()
         .filter_map(|(key, value)| value.map(|v| (key, v)))
-    {
-        state
-            .db()
-            .set_setting(signed.session.user.id, key, value)
-            .await?;
-    }
+        .collect();
+    let mut roots_turn = if changes.iter().any(|(key, _)| *key == SHARE_ROOTS) {
+        Some(
+            state
+                .db()
+                .lock_share_connections()
+                .await
+                .map_err(|e| ApiError::unavailable(&e))?,
+        )
+    } else {
+        None
+    };
+    state
+        .db()
+        .set_settings(signed.session.user.id, changes)
+        .await?;
+    drop(roots_turn.take());
     Ok(Json(shares_out(&state).await?))
 }
 

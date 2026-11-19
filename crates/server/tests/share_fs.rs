@@ -14,7 +14,9 @@ use std::time::{Duration, Instant};
 
 use common::fake_share::FakeShare;
 use records::{SharePath, external_tag};
-use server::share::{FsBudget, FsKind, ListError, ListLimits, OsFs, ShareFs, list_share};
+use server::share::{
+    FsBudget, FsKind, ListError, ListLimits, OsFs, ShareFs, canonical_share_path, list_share,
+};
 use server::source::{EntryKind, TreeEntry};
 
 fn root() -> SharePath {
@@ -437,6 +439,14 @@ fn os_fs_lists_stats_and_opens_real_files() {
     assert_eq!(stat.kind, FsKind::File);
     assert_eq!(stat.size, 10);
     assert_eq!(bytes, b"real bytes");
+}
+
+#[test]
+fn os_fs_canonical_result_is_a_share_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let canonical = OsFs.canonical(dir.path(), dir.path()).unwrap();
+
+    assert!(canonical_share_path(&canonical).is_ok());
 }
 
 #[test]

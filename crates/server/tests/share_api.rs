@@ -153,6 +153,102 @@ async fn connecting_outside_every_root_is_refused_and_makes_nothing() {
 }
 
 #[tokio::test]
+async fn canonical_share_locations_are_exclusive_in_both_orders() {
+    for alias_first in [false, true] {
+        let env = Env::new().await;
+        env.fake.mkdir("real/folder");
+        env.fake.link("alias", "real");
+        let (first, second) = if alias_first {
+            (r"C:\approved\alias\folder", r"C:\approved\real\folder")
+        } else {
+            (r"C:\approved\real\folder", r"C:\approved\alias\folder")
+        };
+        let (status, answer) = env.connect(json!({"name":"First", "path":first})).await;
+        assert_eq!(status, StatusCode::CREATED, "{answer}");
+        let (status, answer) = env.connect(json!({"name":"Second", "path":second})).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{answer}");
+        assert_eq!(answer["error"], "share_location_in_use");
+        assert!(!answer.to_string().contains("real"));
+    }
+}
+
+#[tokio::test]
+async fn canonical_nested_alias_conflicts_but_a_sibling_is_allowed() {
+    let env = Env::new().await;
+    env.fake.mkdir("real/folder/nested");
+    env.fake.mkdir("real/sibling");
+    env.fake.link("alias", "real");
+    let (status, answer) = env
+        .connect(json!({"name":"Parent", "path":r"C:\approved\real\folder"}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{answer}");
+    let (status, answer) = env
+        .connect(json!({"name":"Nested", "path":r"C:\approved\alias\folder\nested"}))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{answer}");
+    assert_eq!(answer["error"], "share_location_in_use");
+    let (status, answer) = env
+        .connect(json!({"name":"Sibling", "path":r"C:\approved\alias\sibling"}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{answer}");
+}
+
+#[tokio::test]
+async fn an_unreachable_existing_location_falls_back_to_lexical_exclusivity() {
+    let env = Env::new().await;
+    env.fake.mkdir("gone/folder");
+    let (status, answer) = env
+        .connect(json!({"name":"Existing", "path":r"C:\approved\gone\folder"}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{answer}");
+    env.fake.remove("gone");
+    let (status, answer) = env.connect(json!({"name":"Parent", "path":ROOT})).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{answer}");
+    assert_eq!(answer["error"], "share_location_in_use");
+}
+
+#[tokio::test]
+async fn roots_removed_after_probe_are_rechecked_before_connect_commit() {
+    let env = Env::new().await;
+    env.fake.pause_list_after_read();
+    let client = env.server.http(Some(&env.admin));
+    let url = env
+        .server
+        .url(&format!("/api/sites/{}/libraries/share", env.site.0));
+    let connecting = tokio::spawn({
+        async move {
+            let response = client
+                .post(url)
+                .json(&json!({"name":"Racing", "path":ROOT}))
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            let answer: Value = response.json().await.unwrap();
+            (status, answer)
+        }
+    });
+    let deadline = tokio::time::Instant::now() + common::TIMEOUT;
+    while env.fake.lists() == 0 {
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::task::yield_now().await;
+    }
+    let (status, answer) = env
+        .call(
+            &env.admin,
+            Method::PUT,
+            "/api/settings/shares",
+            Some(json!({"roots":[]})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    env.fake.resume_list_after_read();
+    let (status, answer) = connecting.await.unwrap();
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{answer}");
+    assert_eq!(answer["error"], "share_not_approved");
+}
+
+#[tokio::test]
 async fn each_bad_path_is_refused_with_its_reason() {
     let env = Env::new().await;
     for (path, reason) in [
@@ -244,6 +340,48 @@ async fn show_gives_the_path_to_owners_and_not_to_viewers() {
     assert_eq!(status, StatusCode::OK, "{viewed}");
     assert_eq!(viewed["path"], Value::Null);
     syncing.await.unwrap();
+}
+
+#[tokio::test]
+async fn show_gives_the_path_to_administrators_and_the_connector_after_access_is_reduced() {
+    let env = Env::new().await;
+    let connector = env.server.user("Original connector").await;
+    env.server
+        .records_db()
+        .set_node_access(
+            env.admin.id,
+            env.site,
+            Principal::User(connector.id),
+            Some("owner"),
+        )
+        .await
+        .unwrap();
+    let (status, answer) = env
+        .call(
+            &connector,
+            Method::POST,
+            &format!("/api/sites/{}/libraries/share", env.site.0),
+            Some(json!({"name":"Connector path", "path":ROOT})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{answer}");
+    let library = NodeId(answer["id"].as_str().unwrap().parse().unwrap());
+    env.server
+        .records_db()
+        .set_node_access(
+            env.admin.id,
+            library,
+            Principal::User(connector.id),
+            Some("viewer"),
+        )
+        .await
+        .unwrap();
+    let route = format!("/api/libraries/{}/source", library.0);
+    for user in [&connector, &env.admin] {
+        let (status, answer) = env.call(user, Method::GET, &route, None).await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        assert_eq!(answer["path"], ROOT);
+    }
 }
 
 #[tokio::test]
@@ -459,6 +597,137 @@ async fn disconnect_empties_the_library_and_makes_it_editable() {
             .is_empty()
     );
     assert!(env.fake.opened_paths().is_empty());
+}
+
+#[tokio::test]
+async fn disconnect_ignores_child_permissions_after_library_authorisation() {
+    let env = Env::new().await;
+    env.fake.put("Private.txt", b"private");
+    let owner = env.server.user("Share owner").await;
+    env.server
+        .records_db()
+        .set_node_access(
+            env.admin.id,
+            env.site,
+            Principal::User(owner.id),
+            Some("owner"),
+        )
+        .await
+        .unwrap();
+    let (status, answer) = env
+        .call(
+            &owner,
+            Method::POST,
+            &format!("/api/sites/{}/libraries/share", env.site.0),
+            Some(json!({"name":"Private child", "path":ROOT})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{answer}");
+    let library = NodeId(answer["id"].as_str().unwrap().parse().unwrap());
+    server::source_sync::sync_once(&env.state, library, time::OffsetDateTime::UNIX_EPOCH)
+        .await
+        .unwrap();
+    let child = env
+        .server
+        .records_db()
+        .live_children(library)
+        .await
+        .unwrap()[0]
+        .id;
+    env.server
+        .records_db()
+        .set_node_access(env.admin.id, child, Principal::User(owner.id), None)
+        .await
+        .unwrap();
+
+    let (status, answer) = env
+        .call(
+            &owner,
+            Method::DELETE,
+            &format!("/api/libraries/{}/source", library.0),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{answer}");
+    assert!(
+        env.server
+            .records_db()
+            .source_of(library)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn a_failed_disconnect_batch_leaves_the_source_retryable() {
+    let env = Env::new().await;
+    env.fake.put("First.txt", b"first");
+    env.fake.put("Second.txt", b"second");
+    let library = env.connected("Retry disconnect").await;
+    server::source_sync::sync_once(&env.state, library, time::OffsetDateTime::UNIX_EPOCH)
+        .await
+        .unwrap();
+    let db = env.server.records_db();
+    let children = db.live_children(library).await.unwrap();
+    let child_ids: Vec<uuid::Uuid> = children.iter().map(|child| child.id.0).collect();
+    assert_eq!(child_ids.len(), 2);
+    let pool = db.test_pool();
+    sqlx::query(
+        "create function fail_share_disconnect() returns trigger language plpgsql as $$ \
+         begin if old.name = 'Second.txt' and new.deleted_at is not null then \
+         raise exception 'injected disconnect failure'; end if; return new; end $$",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "create trigger fail_share_disconnect before update on nodes \
+         for each row execute function fail_share_disconnect()",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let route = format!("/api/libraries/{}/source", library.0);
+    let (status, _) = env.call(&env.admin, Method::DELETE, &route, None).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        env.server
+            .records_db()
+            .source_of(library)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(db.live_children(library).await.unwrap().len(), 2);
+    sqlx::query("drop trigger fail_share_disconnect on nodes")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("drop function fail_share_disconnect()")
+        .execute(pool)
+        .await
+        .unwrap();
+
+    let (status, answer) = env.call(&env.admin, Method::DELETE, &route, None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{answer}");
+    assert!(
+        env.server
+            .records_db()
+            .source_of(library)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let deleted_events: i64 = sqlx::query_scalar(
+        "select count(*) from events where kind = 'node.deleted' and node_id = any($1)",
+    )
+    .bind(&child_ids)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(deleted_events, 2);
 }
 
 #[tokio::test]

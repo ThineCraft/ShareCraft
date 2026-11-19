@@ -168,8 +168,8 @@ impl ShareFs for OsFs {
 fn canonical_within(approved_root: &Path, path: &Path) -> io::Result<PathBuf> {
     let canonical_root = fs::canonicalize(approved_root)?;
     let canonical_path = fs::canonicalize(path)?;
-    let root = share_path_from_canonical(&canonical_root)?;
-    let candidate = share_path_from_canonical(&canonical_path)?;
+    let root = canonical_share_path(&canonical_root)?;
+    let candidate = canonical_share_path(&canonical_path)?;
     if candidate.is_within(&root) {
         Ok(canonical_path)
     } else {
@@ -177,7 +177,10 @@ fn canonical_within(approved_root: &Path, path: &Path) -> io::Result<PathBuf> {
     }
 }
 
-fn share_path_from_canonical(path: &Path) -> io::Result<SharePath> {
+/// Converts an operating-system canonical path to the typed representation used for share
+/// containment. Windows canonicalisation adds a device prefix, which is safe to remove only
+/// after the operating system has resolved the path.
+pub fn canonical_share_path(path: &Path) -> io::Result<SharePath> {
     let text = path.to_str().ok_or_else(path_refused)?;
     let normal = if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
         format!(r"\\{rest}")

@@ -39,7 +39,7 @@ use crate::blobs::{Held, commit as commit_reservation, release};
 use crate::brand::BrandError;
 use crate::checkpoint::Checkpointer;
 use crate::projection::record_first;
-use crate::room::credited_name;
+use crate::room::{AccessChange, credited_name};
 
 /// The format version of the tree records this server writes.
 const TREE_SCHEMA: u32 = 1;
@@ -333,6 +333,8 @@ struct Plan {
     as_if_live: bool,
     /// The files the change deletes.
     deleted: Vec<DocId>,
+    /// A database failure must take the whole Git change back before repairing rows.
+    take_back_on_failure: bool,
     /// A restored item that had to be renamed, and its name before.
     renamed: Option<(NodeId, String)>,
     /// The files a copy makes, each with its editor.
@@ -401,6 +403,7 @@ impl Default for Plan {
             needs_below: 0,
             as_if_live: false,
             deleted: Vec::new(),
+            take_back_on_failure: false,
             renamed: None,
             copies: Vec::new(),
             documents: Vec::new(),
@@ -536,6 +539,89 @@ pub async fn apply(state: &AppState, actor: &User, op: TreeOp) -> Result<Applied
         deleted,
         renamed,
     })
+}
+
+/// Moves every live direct child of a connected share library to the recycle bin in one tree
+/// commit and one database transaction. The caller has authorised the library operation; child
+/// scopes are therefore not re-authorised. A retry is idempotent because only live children are
+/// selected, and the source row is deliberately not touched here.
+pub(crate) async fn delete_source_children(
+    state: &AppState,
+    actor: &User,
+    library: NodeId,
+) -> Result<usize, AccessError> {
+    let _turn = state.tree_lock().lock().await;
+    ensure_in_step(state).await?;
+    let children = state.db().live_children(library).await?;
+    if children.is_empty() {
+        return Ok(0);
+    }
+    let tree = read_tree(state.checkpointer()).await.map_err(git_failure)?;
+    let stamp = Stamp {
+        at: now_text(),
+        by: author_of(actor),
+    };
+    let mut undo = Vec::new();
+    let mut records = Vec::new();
+    let mut documents = Vec::new();
+    let mut events = Vec::new();
+    for child in &children {
+        let first_record = records.len();
+        let before = tree
+            .iter()
+            .find(|record| record.id == child.id.0)
+            .ok_or(AccessError::NotFound)?;
+        let subtree = std::iter::once(before)
+            .chain(below(&tree, child.id.0))
+            .filter(|record| record.deleted.is_none());
+        for before in subtree {
+            undo.push(before.clone());
+            let mut gone = before.clone();
+            gone.deleted = Some(stamp.clone());
+            gone.deleted_with = Some(child.id.0);
+            gone.bin_stage = (before.id == child.id.0).then_some(1);
+            if gone.kind == kind_word(NodeKind::Document) {
+                let doc = DocId(gone.id);
+                documents.push(doc);
+                if gone.id != child.id.0 {
+                    events.push(NewEvent {
+                        kind: "node.deleted",
+                        actor: Some(actor.id),
+                        subject: None,
+                        document: Some(doc),
+                        node: Some(NodeId(gone.id)),
+                        detail: json!({ "name": gone.name, "with": child.id.0 }),
+                    });
+                }
+            }
+            records.push(gone);
+        }
+        events.push(NewEvent {
+            kind: "node.deleted",
+            actor: Some(actor.id),
+            subject: None,
+            document: document_of(child.kind, child.id),
+            node: Some(child.id),
+            detail: json!({ "name": child.name, "items": records.len() - first_record }),
+        });
+    }
+    let deleted = documents.clone();
+    let plan = Plan {
+        id: library,
+        message: "Disconnect file-share library".to_owned(),
+        records,
+        undo,
+        events,
+        deleted,
+        take_back_on_failure: true,
+        ..Plan::default()
+    };
+    let done = commit(state, Some(actor), plan).await?;
+    erase_released(state, done).await;
+    for doc in documents {
+        state.rooms().send_to(doc, AccessChange::Deleted);
+    }
+    Ok(children.len())
 }
 
 /// Purges the file `doc` for `actor`, an administrator deleting quarantined content (the route
@@ -1615,7 +1701,7 @@ async fn commit(
             // An external creation batch is one logical operation even when it contains only
             // folders. Never repair part of a refused batch node by node: remove the whole Git
             // batch, leaving the next listing to retry it atomically.
-            let taken_back = if plan.external_library.is_some() {
+            let taken_back = if plan.take_back_on_failure || plan.external_library.is_some() {
                 take_back_all(state, author.clone(), &plan.message, undo).await
             } else {
                 (plan.document.is_none() && plan.copies.is_empty() && plan.documents.is_empty())

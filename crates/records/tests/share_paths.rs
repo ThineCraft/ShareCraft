@@ -417,3 +417,30 @@ async fn share_settings_have_defaults_and_read_back() {
         [r"C:\approved", r"C:\also-approved"]
     );
 }
+
+#[tokio::test]
+async fn setting_batch_validates_every_key_before_changing_any() {
+    let test = TestDb::create().await;
+    let admin = user(&test, "BatchAdmin", true).await;
+    test.db
+        .set_setting(admin.id, SHARE_LIST_SECONDS, json!(120))
+        .await
+        .unwrap();
+
+    assert!(
+        test.db
+            .set_settings(
+                admin.id,
+                vec![
+                    (SHARE_LIST_SECONDS, json!(180)),
+                    ("not_a_setting", json!(true)),
+                ],
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        test.db.setting(SHARE_LIST_SECONDS).await.unwrap(),
+        Some(json!(120))
+    );
+}

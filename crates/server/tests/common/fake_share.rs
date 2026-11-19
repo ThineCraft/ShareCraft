@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use records::SharePath;
@@ -24,6 +24,7 @@ struct Inner {
     slow_read: Mutex<HashMap<PathBuf, Duration>>,
     slow_stat: Mutex<HashMap<PathBuf, Duration>>,
     slow_list: Mutex<Duration>,
+    pause_list_after_read: (Mutex<bool>, Condvar),
     vanish_on_open: Mutex<HashSet<PathBuf>>,
     change_during_read: Mutex<HashMap<PathBuf, VecDeque<Vec<u8>>>>,
     change_after_stat: Mutex<HashMap<PathBuf, VecDeque<Vec<u8>>>>,
@@ -70,6 +71,7 @@ impl FakeShare {
                 slow_read: Mutex::new(HashMap::new()),
                 slow_stat: Mutex::new(HashMap::new()),
                 slow_list: Mutex::new(Duration::ZERO),
+                pause_list_after_read: (Mutex::new(false), Condvar::new()),
                 vanish_on_open: Mutex::new(HashSet::new()),
                 change_during_read: Mutex::new(HashMap::new()),
                 change_after_stat: Mutex::new(HashMap::new()),
@@ -219,6 +221,25 @@ impl FakeShare {
 
     pub fn slow_list(&self, duration: Duration) {
         *self.slow_listing() = duration;
+    }
+
+    pub fn pause_list_after_read(&self) {
+        *self
+            .inner
+            .pause_list_after_read
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = true;
+    }
+
+    pub fn resume_list_after_read(&self) {
+        *self
+            .inner
+            .pause_list_after_read
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = false;
+        self.inner.pause_list_after_read.1.notify_all();
     }
 
     pub fn vanish_on_open(&self, path: &str) {
@@ -511,6 +532,12 @@ impl ShareFs for FakeShare {
                 mtime_ns: node.mtime_ns,
                 attributes: node.attributes,
             });
+        }
+        drop(nodes);
+        let (paused, wake) = &self.inner.pause_list_after_read;
+        let mut paused = paused.lock().unwrap_or_else(|error| error.into_inner());
+        while *paused {
+            paused = wake.wait(paused).unwrap_or_else(|error| error.into_inner());
         }
         Ok(entries)
     }
