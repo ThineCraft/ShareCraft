@@ -273,6 +273,13 @@ impl OrderedIds {
     }
 
     /// Live and deleted runs held now.
+    ///
+    /// Deleted runs are never merged or removed while the table lives, so this only grows in a
+    /// session, and an axis near [`Self::MAX_RUNS`] refuses every structural change. The way
+    /// out: deleted runs below the agreed checkpoint position may be compacted once every
+    /// participant has passed that position, because no change still to come can name them.
+    /// G5 Task 8 (the fork's identity tables) owns that compaction; until then a room recovers
+    /// when a new session starts from fresh identities.
     fn total_runs(&self) -> usize {
         self.live.len().saturating_add(self.deleted.len())
     }
@@ -1346,7 +1353,7 @@ mod tests {
         ) {
             let mut ids = OrderedIds::base(base);
             let mut list: Vec<LiveId> = (0..base).map(|c| LiveId(0, c)).collect();
-            let mut gone: Vec<LiveId> = Vec::new();
+            let mut gone: HashMap<LiveId, (u32, Option<LiveId>)> = HashMap::new();
             let mut makers: HashMap<u32, IdMaker> = HashMap::new();
             for op in ops {
                 let len = list.len() as u32;
@@ -1367,7 +1374,17 @@ mod tests {
                     Op::Delete { at, count } => {
                         if at + count <= len {
                             ids.delete(at, count).unwrap();
-                            gone.extend(list.drain(at as usize..(at + count) as usize));
+                            let after = at.checked_sub(1).map(|p| list[p as usize]);
+                            let block: Vec<_> =
+                                list.drain(at as usize..(at + count) as usize).collect();
+                            for (_, anchor) in gone.values_mut() {
+                                if anchor.is_some_and(|id| block.contains(&id)) {
+                                    *anchor = after;
+                                }
+                            }
+                            for (i, id) in block.into_iter().enumerate() {
+                                gone.insert(id, (at + i as u32, after));
+                            }
                         }
                     }
                     Op::Move { from, count, to } => {
@@ -1391,9 +1408,11 @@ mod tests {
                     for (pos, id) in list.iter().enumerate() {
                         prop_assert_eq!(table.find(*id), Lookup::At(pos as u32));
                     }
-                    for id in &gone {
-                        let deleted = matches!(table.find(*id), Lookup::Deleted { .. });
-                        prop_assert!(deleted);
+                    for (id, (was_at, after)) in &gone {
+                        prop_assert_eq!(
+                            table.find(*id),
+                            Lookup::Deleted { was_at: *was_at, after: *after }
+                        );
                     }
                     for participant in 0..5 {
                         let unseen = if participant == 0 {

@@ -18,6 +18,9 @@ pub const LIVE_PROTOCOL: u32 = 1;
 pub const MAX_PAYLOAD_BYTES: usize = 262_144;
 /// The longest format name, in characters.
 pub const MAX_FORMAT_LEN: usize = 64;
+/// The longest frame, in bytes, the server reads from a client; its socket refuses a longer
+/// one and closes the connection. A client checks each encoded frame against it before sending.
+pub const MAX_CLIENT_FRAME_BYTES: usize = 1024 * 1024;
 /// The most bytes a presence note may hold.
 pub const MAX_PRESENCE_BYTES: usize = 1024;
 /// How often a client sends a heartbeat, in milliseconds.

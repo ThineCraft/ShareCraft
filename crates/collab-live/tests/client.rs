@@ -2603,6 +2603,46 @@ fn people_event_debug_hides_names() {
     let shown = format!("{:?}", step.events);
     assert!(!shown.contains("sentinel-payload-7"), "{shown}");
     assert!(shown.contains("Presence"), "{shown}");
+
+    // Frames to send are opaque in a step's Debug: an entry and a presence note.
+    let id = client.new_ids(1).unwrap();
+    let mut step = client
+        .local(
+            &mut doc,
+            insert(id, "sentinel-payload-7"),
+            Mode::ShowAtOnce,
+            7,
+        )
+        .unwrap();
+    assert_eq!(step.send.len(), 1);
+    step.send.push(
+        client
+            .presence("sentinel-payload-7".into())
+            .unwrap()
+            .unwrap(),
+    );
+    let shown = format!("{step:?} {step:#?}");
+    assert!(!shown.contains("sentinel-payload-7"), "{shown}");
+    assert!(shown.contains("bytes"), "{shown}");
+
+    // A change that did nothing keeps the editor's reason out of Debug.
+    let applied = Event::Applied {
+        seq: Seq(3),
+        own: false,
+        effect: Effect::NoEffect {
+            reason: "Sentinel Name 7 typed sentinel-payload-7".into(),
+        },
+    };
+    let shown = format!(
+        "{applied:?} {:?}",
+        Step {
+            send: Vec::new(),
+            events: vec![applied.clone()],
+        }
+    );
+    assert!(!shown.contains("sentinel-payload-7"), "{shown}");
+    assert!(!shown.contains("Sentinel Name 7"), "{shown}");
+    assert!(shown.contains("NoEffect"), "{shown}");
 }
 
 #[test]
@@ -2656,4 +2696,51 @@ fn malformed_error_does_not_echo_frame_content() {
         matches!(error, ClientError::Malformed { line, .. } if line >= 2),
         "{error:?}"
     );
+}
+
+/// The server's socket takes client frames up to `MAX_CLIENT_FRAME_BYTES`. A change within the
+/// payload limit whose frame would be longer, because JSON escapes its characters, is refused
+/// before it is shown or queued, so it is never resent in a loop.
+#[test]
+fn change_whose_frame_the_server_would_drop_is_refused() {
+    use protocol::live::{MAX_CLIENT_FRAME_BYTES, MAX_PAYLOAD_BYTES};
+    assert_eq!(MAX_CLIENT_FRAME_BYTES, 1024 * 1024);
+    let mut doc = StandIn::new("a");
+    let mut client = live(&mut doc, 1);
+    // 256 KiB of a control character: each is written as six bytes, `\u0001`.
+    let escaped = "\u{1}".repeat(MAX_PAYLOAD_BYTES);
+    assert_eq!(
+        client
+            .local(&mut doc, escaped, Mode::ShowAtOnce, 10)
+            .unwrap_err(),
+        LocalError::TooLarge
+    );
+    assert_eq!(client.pending(), 0);
+    assert_eq!(client.unsent(), 0);
+    assert!(doc.lines().is_empty());
+    assert!(entries(&client.tick(70_000)).is_empty());
+    // A quote is written as two bytes, so the same length still fits.
+    let quotes = "\"".repeat(MAX_PAYLOAD_BYTES);
+    let step = client
+        .local(&mut doc, quotes, Mode::WaitForServer, 20)
+        .unwrap();
+    assert_eq!(step.send.len(), 1);
+    assert!(step.send[0].len() <= MAX_CLIENT_FRAME_BYTES);
+    assert_eq!(client.pending(), 1);
+}
+
+#[test]
+fn oversized_presence_from_the_server_is_dropped() {
+    let mut doc = StandIn::new("a");
+    let mut client = live(&mut doc, 1);
+    let limit = protocol::live::MAX_PRESENCE_BYTES;
+    let frame = json!({ "type": "presence", "participant": 2, "payload": "x".repeat(limit + 1) })
+        .to_string();
+    let step = client.receive(&mut doc, &frame, 5).unwrap();
+    assert!(step.events.is_empty(), "{:?}", step.events);
+    assert_eq!(client.phase(), Phase::Live);
+    let frame =
+        json!({ "type": "presence", "participant": 2, "payload": "x".repeat(limit) }).to_string();
+    let step = client.receive(&mut doc, &frame, 6).unwrap();
+    assert_eq!(step.events.len(), 1);
 }

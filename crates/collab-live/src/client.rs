@@ -16,8 +16,8 @@ use collab_core::ids::{ClientId, Seq};
 use protocol::RemovedReason;
 use protocol::live::{
     EntryBody, HEARTBEAT_MS, LIVE_PROTOCOL, LiveBuild, LiveClientMsg, LiveEntry, LivePerson,
-    LiveResume, LiveServerMsg, LiveSessionId, LocalNo, MAX_PAYLOAD_BYTES, MAX_PRESENCE_BYTES,
-    MajorReason, ParticipantNo, Place, RefusedReason, TicketPurpose,
+    LiveResume, LiveServerMsg, LiveSessionId, LocalNo, MAX_CLIENT_FRAME_BYTES, MAX_PAYLOAD_BYTES,
+    MAX_PRESENCE_BYTES, MajorReason, ParticipantNo, Place, RefusedReason, TicketPurpose,
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -100,14 +100,30 @@ pub struct Outcome {
     pub read_stamp: bool,
 }
 
-/// Whether a change took effect.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Whether a change took effect. The `Debug` form shows a reason's length only, as an editor
+/// may put document text in it.
+#[derive(Clone, PartialEq, Eq)]
 pub enum Effect {
     Applied,
     /// The change did nothing, on every device alike; `reason` says why.
     NoEffect {
         reason: String,
     },
+}
+
+impl std::fmt::Debug for Effect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Effect::Applied => f.write_str("Applied"),
+            Effect::NoEffect { reason } => f
+                .debug_struct("NoEffect")
+                .field(
+                    "reason",
+                    &format_args!("<{} chars>", reason.chars().count()),
+                )
+                .finish(),
+        }
+    }
 }
 
 /// The editor stopped in this entry.
@@ -164,11 +180,28 @@ pub enum AgreedSnapshot<'a, E: LiveEditor> {
     Saved(&'a E::Snapshot),
 }
 
-/// What a call produced: the frames to send, in order, and what happened.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// What a call produced: the frames to send, in order, and what happened. The `Debug` form
+/// shows each frame's length only, as frames carry payloads and presence notes.
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct Step {
     pub send: Vec<String>,
     pub events: Vec<Event>,
+}
+
+impl std::fmt::Debug for Step {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Step")
+            .field(
+                "send",
+                &self
+                    .send
+                    .iter()
+                    .map(|frame| Length(frame.len()))
+                    .collect::<Vec<_>>(),
+            )
+            .field("events", &self.events)
+            .finish()
+    }
 }
 
 /// Something the host may want to show or act on. The `Debug` form hides presence notes and
@@ -597,6 +630,13 @@ impl<E: LiveEditor> LiveClient<E> {
         }
     }
 
+    /// Finishes the client: every later call is refused and the presence note is forgotten.
+    fn close(&mut self) {
+        self.phase = Phase::Closed;
+        self.presence = None;
+        self.presence_sent = false;
+    }
+
     /// Advertises checkpoint capability and the editor's build kind on every join.
     #[must_use]
     pub fn with_live_capabilities(mut self, can_checkpoint: bool, build: LiveBuild) -> Self {
@@ -767,7 +807,7 @@ impl<E: LiveEditor> LiveClient<E> {
                 if self.stalled_at.take().is_some() {
                     editor.note_applying(None);
                 }
-                self.phase = Phase::Closed;
+                self.close();
                 step.events.push(Event::CannotOpen { seq });
             }
             LiveServerMsg::People { people } => step.events.push(Event::People(people)),
@@ -837,10 +877,18 @@ impl<E: LiveEditor> LiveClient<E> {
             LiveServerMsg::Presence {
                 participant,
                 payload,
-            } => step.events.push(Event::Presence {
-                participant,
-                payload,
-            }),
+            } => {
+                // The server relays notes within the limit only; anything longer is dropped.
+                if payload
+                    .as_ref()
+                    .is_none_or(|note| note.len() <= MAX_PRESENCE_BYTES)
+                {
+                    step.events.push(Event::Presence {
+                        participant,
+                        payload,
+                    });
+                }
+            }
             LiveServerMsg::Returning { participant } => {
                 step.events.push(Event::Returning { participant });
             }
@@ -856,11 +904,11 @@ impl<E: LiveEditor> LiveClient<E> {
                 major,
             }),
             LiveServerMsg::BuildRefused { .. } => {
-                self.phase = Phase::Closed;
+                self.close();
                 step.events.push(Event::BuildRefused);
             }
             LiveServerMsg::Incompatible { protocol, format } => {
-                self.phase = Phase::Closed;
+                self.close();
                 step.events.push(Event::Incompatible { protocol, format });
             }
             LiveServerMsg::Expired => {
@@ -868,7 +916,7 @@ impl<E: LiveEditor> LiveClient<E> {
                 step.events.push(Event::Expired);
             }
             LiveServerMsg::Removed { reason } => {
-                self.phase = Phase::Closed;
+                self.close();
                 step.events.push(Event::Removed { reason });
             }
         }
@@ -926,6 +974,17 @@ impl<E: LiveEditor> LiveClient<E> {
             return Err(LocalError::ReadOnly);
         }
         if payload.len() > MAX_PAYLOAD_BYTES {
+            return Err(LocalError::TooLarge);
+        }
+        // The frame this change goes out in, which is the same on every resend: JSON escaping
+        // can make it several times the payload, and the server drops a frame over its limit.
+        let encoded = frame(&LiveClientMsg::Entry {
+            local: LocalNo(self.next_local),
+            seen: self.agreed_seq,
+            format: self.config.format.clone(),
+            payload: payload.clone(),
+        });
+        if encoded.len() > MAX_CLIENT_FRAME_BYTES {
             return Err(LocalError::TooLarge);
         }
         if self.agreed.is_none() {
@@ -1027,7 +1086,7 @@ impl<E: LiveEditor> LiveClient<E> {
         if self.phase == Phase::Closed {
             return None;
         }
-        self.phase = Phase::Closed;
+        self.close();
         Some(frame(&LiveClientMsg::Leave))
     }
 

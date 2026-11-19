@@ -30,8 +30,9 @@ use crate::room::{
     AccessChange, Command, ConnId, JoinReply, OUTBOUND_CAPACITY, Outbound, RoomLink,
 };
 
-/// Largest frame or message accepted from a client.
-const MAX_MESSAGE: usize = 1024 * 1024;
+/// Largest frame or message accepted from a client; live clients check their frames against the
+/// same constant before sending.
+const MAX_MESSAGE: usize = protocol::live::MAX_CLIENT_FRAME_BYTES;
 /// How long a new connection has to send `Join`.
 const JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a closing connection waits for the client to answer its close.
