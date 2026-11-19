@@ -188,8 +188,19 @@ impl Sim {
                 format,
                 resume,
                 seen,
+                can_checkpoint,
+                returning_through,
                 ..
-            } => self.join(conn, client, protocol, &format, resume, seen),
+            } => self.join(
+                conn,
+                client,
+                protocol,
+                &format,
+                resume,
+                seen,
+                can_checkpoint,
+                returning_through,
+            ),
             LiveClientMsg::Entry {
                 local,
                 seen,
@@ -249,6 +260,7 @@ impl Sim {
         ParticipantNo(self.places.len() as u32)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn join(
         &mut self,
         conn: ConnId,
@@ -257,6 +269,8 @@ impl Sim {
         format: &str,
         resume: Option<protocol::live::LiveResume>,
         seen: Option<Seq>,
+        can_checkpoint: bool,
+        returning_through: Option<LocalNo>,
     ) {
         assert_eq!(protocol, LIVE_PROTOCOL);
         assert_eq!(format, self.format);
@@ -297,6 +311,15 @@ impl Sim {
             _ => Seq(0),
         };
         self.send_catchup(conn, from);
+        if can_checkpoint
+            && matches!(place, Place::Returning { .. })
+            && let Some(through) = returning_through
+            && let Some(state) = self.conns.get_mut(&conn)
+        {
+            state
+                .outbox
+                .push_back(frame(&LiveServerMsg::ReturnReady { through }));
+        }
     }
 
     /// Sends `catchup` and every entry after `from`, cancelled changes emptied.

@@ -9,13 +9,16 @@
 
 use collab_core::ids::{ClientId, Seq};
 use collab_live::client::{
-    ClientError, Crash, EntryView, Event, LiveClient, LiveConfig, LiveEditor, LocalError, Mode,
-    Outcome, Phase,
+    AgreedSnapshot, ClientError, Crash, Effect, EntryView, Event, LiveClient, LiveConfig,
+    LiveEditor, LocalError, Mode, Outcome, Phase, Step,
 };
 use collab_live::ids::LiveId;
 use collab_live::stand_in::{StandIn, StandInOp};
-use protocol::live::{LocalNo, ParticipantNo, RefusedReason};
+use protocol::live::{
+    LiveBuild, LocalNo, MajorReason, ParticipantNo, RefusedReason, TicketPurpose,
+};
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 const FORMAT: &str = "stand-in/1";
 
@@ -113,9 +116,24 @@ fn config() -> LiveConfig {
     }
 }
 
+fn checkpoint_client<E: LiveEditor>() -> LiveClient<E> {
+    LiveClient::new(config()).with_live_capabilities(true, LiveBuild::Browser)
+}
+
 /// A new client at `participant`, driven into `Live` on an empty document.
 fn live<E: LiveEditor>(editor: &mut E, participant: u32) -> LiveClient<E> {
-    let mut live = LiveClient::new(config());
+    start_live(editor, participant, LiveClient::new(config()))
+}
+
+fn checkpoint_live<E: LiveEditor>(editor: &mut E, participant: u32) -> LiveClient<E> {
+    start_live(editor, participant, checkpoint_client())
+}
+
+fn start_live<E: LiveEditor>(
+    editor: &mut E,
+    participant: u32,
+    mut live: LiveClient<E>,
+) -> LiveClient<E> {
     let join = live.connected(0);
     assert_eq!(join.len(), 1);
     live.receive(editor, &joined(participant), 0).unwrap();
@@ -125,6 +143,18 @@ fn live<E: LiveEditor>(editor: &mut E, participant: u32) -> LiveClient<E> {
     }
     assert_eq!(live.phase(), Phase::Live);
     live
+}
+
+fn checkpoint_ticket(ticket: Uuid, purpose: TicketPurpose, at: u64) -> String {
+    json!({
+        "type": "checkpoint_ticket",
+        "ticket": ticket,
+        "purpose": purpose,
+        "at": at,
+        "base": "base-revision",
+        "major": "returning_client_before",
+    })
+    .to_string()
 }
 
 fn sent(step_send: &[String]) -> Vec<Value> {
@@ -174,6 +204,156 @@ fn own_change_is_shown_and_sent() {
     assert_eq!(frames[0]["format"], FORMAT);
     assert_eq!(frames[0]["payload"], insert(id, "a"));
     assert_eq!(client.pending(), 1);
+}
+
+#[test]
+fn checkpoint_never_covers_a_waiting_change() {
+    let mut doc = StandIn::new("a");
+    let mut client = checkpoint_client();
+    let join: Value = serde_json::from_str(&client.connected(0)[0]).unwrap();
+    assert_eq!(join["can_checkpoint"], true);
+    assert_eq!(join["build"], "browser");
+    client.receive(&mut doc, &joined(1), 0).unwrap();
+    client.receive(&mut doc, &empty_catchup(), 0).unwrap();
+    client.base_ready(&mut doc, 0).unwrap();
+
+    let id = client.new_ids(1).unwrap();
+    client
+        .local(&mut doc, insert(id, "waiting"), Mode::ShowAtOnce, 10)
+        .unwrap();
+    assert_eq!(doc.lines(), vec!["waiting"]);
+
+    let ticket = Uuid::from_u128(3);
+    let step = client
+        .receive(
+            &mut doc,
+            &checkpoint_ticket(ticket, TicketPurpose::Write, 0),
+            20,
+        )
+        .unwrap();
+    assert_eq!(
+        step.events,
+        vec![Event::CheckpointRequested {
+            ticket,
+            at: Seq(0),
+            base: Some("base-revision".to_owned()),
+            major: Some(MajorReason::ReturningClientBefore),
+        }]
+    );
+
+    match client.agreed_snapshot(&doc, Seq(0)).unwrap() {
+        AgreedSnapshot::Saved(snapshot) => assert!(snapshot.lines().is_empty()),
+        AgreedSnapshot::Editor(_) => panic!("waiting work must require the saved agreed state"),
+    }
+    assert_eq!(doc.lines(), vec!["waiting"]);
+    assert_eq!(
+        client.checkpoint_ready(ticket, Seq(0)).unwrap(),
+        r#"{"type":"checkpoint_ready","ticket":"00000000-0000-0000-0000-000000000003","at":0}"#
+    );
+}
+
+#[test]
+fn checkpoint_requires_the_exact_agreed_position() {
+    let mut doc = StandIn::new("a");
+    let mut client = checkpoint_client();
+    client.connected(0);
+    client.receive(&mut doc, &joined(1), 0).unwrap();
+    client.receive(&mut doc, &empty_catchup(), 0).unwrap();
+
+    assert!(client.agreed_snapshot(&doc, Seq(0)).is_err());
+    client.base_ready(&mut doc, 0).unwrap();
+    assert!(client.agreed_snapshot(&doc, Seq(1)).is_err());
+    assert!(client.checkpoint_ready(Uuid::from_u128(4), Seq(1)).is_err());
+}
+
+#[test]
+fn checkpoint_includes_confirmed_folded_work_but_not_waiting_work() {
+    let mut doc = StandIn::new("a");
+    let mut client = checkpoint_live(&mut doc, 1);
+    let confirmed = client.new_ids(1).unwrap();
+    let waiting = client.new_ids(1).unwrap();
+    let confirmed_payload = insert(confirmed, "confirmed");
+    client
+        .local(&mut doc, confirmed_payload.clone(), Mode::ShowAtOnce, 10)
+        .unwrap();
+    client
+        .local(&mut doc, insert(waiting, "waiting"), Mode::ShowAtOnce, 11)
+        .unwrap();
+    client
+        .receive(
+            &mut doc,
+            &entry(1, 1, client.client(), 1, 0, &confirmed_payload),
+            20,
+        )
+        .unwrap();
+
+    assert_eq!(doc.lines(), vec!["confirmed", "waiting"]);
+    match client.agreed_snapshot(&doc, Seq(1)).unwrap() {
+        AgreedSnapshot::Saved(snapshot) => assert_eq!(snapshot.lines(), vec!["confirmed"]),
+        AgreedSnapshot::Editor(_) => panic!("waiting work must not be in the agreed state"),
+    }
+}
+
+#[test]
+fn checkpoint_controls_are_host_events() {
+    let mut doc = StandIn::new("a");
+    let mut client = checkpoint_client();
+    client.connected(0);
+    client.receive(&mut doc, &joined(1), 0).unwrap();
+    client.receive(&mut doc, &empty_catchup(), 0).unwrap();
+    client.base_ready(&mut doc, 0).unwrap();
+
+    let verify = Uuid::from_u128(5);
+    let step = client
+        .receive(
+            &mut doc,
+            &checkpoint_ticket(verify, TicketPurpose::Verify, 0),
+            10,
+        )
+        .unwrap();
+    assert_eq!(
+        step.events,
+        vec![Event::VerifyRequested {
+            ticket: verify,
+            at: Seq(0),
+            base: Some("base-revision".to_owned()),
+        }]
+    );
+
+    let paused = json!({ "type": "changes_paused", "entries": 5000, "bytes": 67108864 });
+    assert_eq!(
+        client
+            .receive(&mut doc, &paused.to_string(), 20)
+            .unwrap()
+            .events,
+        vec![Event::ChangesPaused {
+            entries: 5_000,
+            bytes: 67_108_864,
+        }]
+    );
+    assert_eq!(
+        client
+            .receive(&mut doc, r#"{"type":"changes_resumed"}"#, 30)
+            .unwrap()
+            .events,
+        vec![Event::ChangesResumed]
+    );
+}
+
+#[test]
+fn fingerprint_requires_an_agreed_position() {
+    let mut doc = StandIn::new("a");
+    let client = live(&mut doc, 1);
+    let entered = [0xab; 32];
+
+    assert!(client.fingerprint(Seq(1), entered).is_err());
+    assert_eq!(
+        client.fingerprint(Seq(0), entered).unwrap(),
+        format!(
+            "{{\"type\":\"fingerprint\",\"at\":0,\"entered\":\"{}\"}}",
+            "ab".repeat(32)
+        )
+    );
 }
 
 #[test]
@@ -1037,6 +1217,225 @@ fn returning_client_keeps_waiting_changes() {
     assert_eq!(resent[1]["local"], 2);
     assert_eq!(resent[1]["seen"], 1);
     assert_eq!(client.new_ids(1).unwrap(), LiveId(5, 0));
+}
+
+#[test]
+fn returning_client_holds_resends_until_return_ready() {
+    let mut doc = StandIn::new("a");
+    let mut client = checkpoint_live(&mut doc, 2);
+    let saved = client.new_ids(1).unwrap();
+    client
+        .local(&mut doc, insert(saved, "saved"), Mode::ShowAtOnce, 10)
+        .unwrap();
+
+    client.disconnected(20);
+    let join: Value = serde_json::from_str(&client.connected(30)[0]).unwrap();
+    assert_eq!(join["returning_through"], 1);
+    client
+        .receive(
+            &mut doc,
+            &joined_as(5, json!({ "is": "returning", "previous": 2 }), true),
+            30,
+        )
+        .unwrap();
+    let step = client.receive(&mut doc, &catchup(0, 0, 0), 30).unwrap();
+    assert!(entries(&step.send).is_empty());
+
+    let ordinary = client.new_ids(1).unwrap();
+    let step = client
+        .local(&mut doc, insert(ordinary, "ordinary"), Mode::ShowAtOnce, 40)
+        .unwrap();
+    assert!(entries(&step.send).is_empty());
+    assert!(entries(&client.tick(50)).is_empty());
+
+    let step = client
+        .receive(&mut doc, r#"{"type":"return_ready","through":1}"#, 60)
+        .unwrap();
+    assert_eq!(
+        step.events,
+        vec![Event::ReturnReady {
+            through: LocalNo(1)
+        }]
+    );
+    let resent = entries(&step.send);
+    assert_eq!(resent.len(), 2);
+    assert_eq!(resent[0]["local"], 1);
+    assert_eq!(resent[1]["local"], 2);
+}
+
+#[test]
+fn returning_client_keeps_the_barrier_across_a_reconnect() {
+    let mut doc = StandIn::new("a");
+    let mut client = checkpoint_live(&mut doc, 2);
+    let id = client.new_ids(1).unwrap();
+    client
+        .local(&mut doc, insert(id, "saved"), Mode::ShowAtOnce, 10)
+        .unwrap();
+    client.disconnected(20);
+    client.connected(30);
+    client
+        .receive(
+            &mut doc,
+            &joined_as(5, json!({ "is": "returning", "previous": 2 }), true),
+            30,
+        )
+        .unwrap();
+    client.receive(&mut doc, &catchup(0, 0, 0), 30).unwrap();
+
+    client.disconnected(40);
+    let join: Value = serde_json::from_str(&client.connected(50)[0]).unwrap();
+    assert_eq!(join["returning_through"], 1);
+    client.receive(&mut doc, &joined_kept(5), 50).unwrap();
+    let step = client.receive(&mut doc, &catchup(0, 0, 0), 50).unwrap();
+    assert!(entries(&step.send).is_empty());
+
+    let step = client
+        .receive(&mut doc, r#"{"type":"return_ready","through":1}"#, 60)
+        .unwrap();
+    assert_eq!(entries(&step.send).len(), 1);
+}
+
+#[test]
+fn access_loss_discards_the_return_barrier() {
+    let mut doc = StandIn::new("a");
+    let mut client = checkpoint_live(&mut doc, 2);
+    let saved = client.new_ids(1).unwrap();
+    client
+        .local(&mut doc, insert(saved, "saved"), Mode::ShowAtOnce, 10)
+        .unwrap();
+    client.disconnected(20);
+    client.connected(30);
+    client
+        .receive(
+            &mut doc,
+            &joined_as(5, json!({ "is": "returning", "previous": 2 }), true),
+            30,
+        )
+        .unwrap();
+    client.receive(&mut doc, &catchup(0, 0, 0), 30).unwrap();
+
+    client
+        .receive(&mut doc, r#"{"type":"access","can_edit":false}"#, 40)
+        .unwrap();
+    client
+        .receive(&mut doc, r#"{"type":"access","can_edit":true}"#, 50)
+        .unwrap();
+    let fresh = client.new_ids(1).unwrap();
+    let step = client
+        .local(&mut doc, insert(fresh, "fresh"), Mode::ShowAtOnce, 60)
+        .unwrap();
+    assert_eq!(entries(&step.send).len(), 1);
+    assert_eq!(client.pending(), 1);
+
+    assert_eq!(
+        client
+            .receive(&mut doc, r#"{"type":"return_ready","through":1}"#, 70)
+            .unwrap(),
+        Step::default()
+    );
+}
+
+#[derive(Clone)]
+struct ParticipantSensitive(Vec<u32>);
+
+impl LiveEditor for ParticipantSensitive {
+    type Snapshot = Vec<u32>;
+
+    fn snapshot(&self) -> Self::Snapshot {
+        self.0.clone()
+    }
+
+    fn restore(&mut self, snapshot: &Self::Snapshot) {
+        self.0.clone_from(snapshot);
+    }
+
+    fn apply(&mut self, entry: &EntryView<'_>) -> Result<Outcome, Crash> {
+        self.0.push(entry.participant.0);
+        Ok(Outcome {
+            effect: Effect::Applied,
+            read_stamp: false,
+        })
+    }
+}
+
+#[test]
+fn archive_return_preserves_the_old_participant_shown_copy() {
+    let mut doc = ParticipantSensitive(Vec::new());
+    let mut client = checkpoint_live(&mut doc, 2);
+    client
+        .local(&mut doc, "saved".to_owned(), Mode::ShowAtOnce, 10)
+        .unwrap();
+    assert_eq!(doc.0, vec![2]);
+    client.disconnected(20);
+    client.connected(30);
+    client
+        .receive(
+            &mut doc,
+            &joined_as(5, json!({ "is": "returning", "previous": 2 }), true),
+            30,
+        )
+        .unwrap();
+
+    client
+        .receive(&mut doc, r#"{"type":"archive_return","current":null}"#, 40)
+        .unwrap();
+    assert_eq!(doc.0, vec![2]);
+}
+
+#[test]
+fn archive_return_is_emitted_before_base_load() {
+    let mut doc = StandIn::new("a");
+    let mut client = checkpoint_live(&mut doc, 2);
+    let id = client.new_ids(1).unwrap();
+    client
+        .local(&mut doc, insert(id, "old shown copy"), Mode::ShowAtOnce, 10)
+        .unwrap();
+    client.disconnected(20);
+    client.connected(30);
+    client
+        .receive(
+            &mut doc,
+            &joined_as(5, json!({ "is": "returning", "previous": 2 }), true),
+            30,
+        )
+        .unwrap();
+
+    let archive = client
+        .receive(
+            &mut doc,
+            r#"{"type":"archive_return","current":"current-revision"}"#,
+            40,
+        )
+        .unwrap();
+    assert_eq!(
+        archive.events,
+        vec![Event::ArchiveReturn {
+            current: Some("current-revision".to_owned()),
+        }]
+    );
+    assert_eq!(doc.lines(), vec!["old shown copy"]);
+
+    let catchup = client.receive(&mut doc, &catchup(0, 0, 0), 50).unwrap();
+    assert_eq!(
+        catchup.events,
+        vec![Event::LoadBase {
+            revision: None,
+            at: Seq(0),
+        }]
+    );
+}
+
+#[test]
+fn archive_return_outside_a_return_handshake_is_rejected_without_mutation() {
+    let mut doc = StandIn::new("a");
+    let mut client = checkpoint_live(&mut doc, 2);
+    let error = client
+        .receive(&mut doc, r#"{"type":"archive_return","current":null}"#, 10)
+        .unwrap_err();
+    assert!(matches!(error, ClientError::Desync(_)));
+    assert_eq!(client.phase(), Phase::Live);
+    assert!(client.can_edit());
+    assert!(doc.lines().is_empty());
 }
 
 #[test]
