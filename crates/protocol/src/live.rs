@@ -94,6 +94,9 @@ pub enum TicketPurpose {
 pub enum UnavailableReason {
     /// The document's kept log is beyond what the server's limits allow sending a joiner.
     LogOverLimit,
+    /// Two editors' checkpoints disagreed: the live session stopped with both kept as major
+    /// versions and the last verified file current. Join again to load it.
+    CheckpointDispute,
     /// A reason this build does not know, sent by a newer server.
     #[serde(other)]
     Unknown,
@@ -111,6 +114,8 @@ pub enum MajorReason {
     OutsideReplacement,
     /// Preserve an expired returning client's own copy below the current file.
     ReturningClientArchive,
+    /// Keep one side of a checkpoint dispute; neither side becomes the base.
+    DisputedCopy,
 }
 
 /// Browser (or desktop editor) to server. Unknown fields are refused. The `Debug` form leaves
@@ -489,6 +494,10 @@ pub enum RefusedReason {
     /// accepted from a sole editor), or a major version is being stored at the head (see
     /// [`LiveServerMsg::ChangesPaused`]). The change is not in the log.
     LogPaused,
+    /// Not refused for good: changes wait while a major version is stored at the head. The
+    /// local number is not used up; the client sends the change, and those after it, again once
+    /// [`LiveServerMsg::ChangesResumed`] arrives.
+    Held,
     /// A reason this build does not know, sent by a newer server. Never sent; a client reads it
     /// as a refusal all the same.
     #[serde(other)]

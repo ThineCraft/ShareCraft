@@ -1454,7 +1454,7 @@ impl Db {
 
     /// Makes `checkpoint`, a revision that replaced the live file from outside and was stored
     /// again on top of the log's last state, the verified catch-up base at its position (S4):
-    /// the live checkpoints it supersedes are removed (major versions stay) and the verified
+    /// the ordinary checkpoints it supersedes are removed (disputed and major rows stay) and the verified
     /// position advances to it. Its session data is normally empty: the base is a plain file.
     /// Kept entries stay for their retention period.
     pub async fn adopt_live_base(
@@ -1474,8 +1474,8 @@ impl Db {
         }
         sqlx::query(
             "delete from live_checkpoints \
-             where document_id = $1 and (revision = $2 or through >= $3 \
-                   or (verified_at is null and major_reason is null))",
+             where document_id = $1 and disputed_at is null and major_reason is null \
+               and (revision = $2 or through >= $3 or verified_at is null)",
         )
         .bind(doc.0)
         .bind(checkpoint.revision)

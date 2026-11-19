@@ -1854,11 +1854,19 @@ async fn checkpoint_records_a_missing_revision_row_with_its_metadata() {
     let loaded = s.test.db.load_live(s.doc).await.unwrap();
     assert_eq!(loaded.unverified_checkpoints.len(), 1);
     assert_eq!(loaded.unverified_checkpoints[0].revision, written);
-    // The projection appending the same revision afterwards is not a conflict.
+    // The projection appending the same revision afterwards records nothing twice, and sees
+    // that the row is already the recorded head after its parent, so no rebuild is needed.
+    assert!(
+        !s.test
+            .db
+            .append_revision(Some(&base), &revision_record(&s, &written))
+            .await
+            .unwrap()
+    );
     assert!(
         s.test
             .db
-            .append_revision(Some(&base), &revision_record(&s, &written))
+            .is_recorded_head(s.doc, &written, Some(&base))
             .await
             .unwrap()
     );
@@ -2435,5 +2443,71 @@ async fn cancel_records_count_their_encoded_size() {
     assert_eq!(
         s.test.db.live_unsaved_counts(s.doc).await.unwrap(),
         (2, records::LIVE_CANCEL_BYTES)
+    );
+}
+
+/// Adopting an outside base keeps disputed rows (forensics) and major-version rows (history),
+/// even at or after its position.
+#[tokio::test]
+async fn adopting_a_base_keeps_disputed_and_major_rows() {
+    let s = setup().await;
+    let session = session(&s, 0).await;
+    let revisions = checkpoint_each_change(&s, session, 2, b"ids").await;
+    s.test
+        .db
+        .dispute_live_checkpoint(s.doc, &revisions[0], at(30))
+        .await
+        .unwrap();
+    let major = revision(&s, 'm', Some(&revisions[1])).await;
+    s.test
+        .db
+        .record_live_checkpoint(
+            s.doc,
+            &NewLiveCheckpoint {
+                revision: &major,
+                through: Seq(2),
+                sha256: [4; 32],
+                session,
+                session_data: b"",
+                major_reason: Some("returning_client_before"),
+                major_person: Some(s.bob),
+                writer: None,
+                created_at: at(31),
+            },
+        )
+        .await
+        .unwrap();
+    let outside = revision(&s, 'o', Some(&major)).await;
+    s.test
+        .db
+        .adopt_live_base(
+            s.doc,
+            &NewLiveCheckpoint {
+                revision: &outside,
+                through: Seq(2),
+                sha256: [5; 32],
+                session,
+                session_data: b"",
+                major_reason: Some("outside_current"),
+                major_person: None,
+                writer: None,
+                created_at: at(32),
+            },
+            at(33),
+        )
+        .await
+        .unwrap();
+    let mut kept: Vec<String> =
+        sqlx::query_scalar("select revision from live_checkpoints where document_id = $1")
+            .bind(s.doc.0)
+            .fetch_all(s.test.db.test_pool())
+            .await
+            .unwrap();
+    kept.sort();
+    let mut expected = vec![revisions[0].clone(), major, outside];
+    expected.sort();
+    assert_eq!(
+        kept, expected,
+        "only the ordinary unverified checkpoint goes"
     );
 }

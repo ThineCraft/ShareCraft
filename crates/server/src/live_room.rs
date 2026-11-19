@@ -26,7 +26,7 @@ use uuid::Uuid;
 use crate::events::EventSink;
 use crate::live_cancel::{CancelBook, Verdict};
 use crate::live_store::{
-    ForensicWritten, LiveStore, LiveWrite, LiveWriteError, MajorKind, MajorWrite, MajorWritten,
+    LiveStore, LiveWrite, LiveWriteError, MajorKind, MajorWrite, MajorWritten,
 };
 use crate::members::{self, AccessRules, Admission, Frames, Member, Members};
 use crate::room::{
@@ -77,8 +77,14 @@ pub(crate) const VERIFY_HOLD_MAX: Duration = Duration::from_secs(120);
 pub(crate) const RECONCILE_TRIES: u32 = 8;
 /// How long a room that refused an over-limit join stays to answer reconnects.
 const OVER_LIMIT_LINGER: Duration = Duration::from_secs(60);
-/// One forensic upload per person in this long.
-pub(crate) const FORENSIC_EVERY: Duration = Duration::from_secs(600);
+/// One major-version mark for a person's returns in this long.
+pub(crate) const RETURN_MARK_EVERY: Duration = Duration::from_secs(600);
+/// The most returning clients waiting for their major versions at once.
+pub(crate) const MAX_RETURNS: usize = 16;
+/// The most expired returning clients waiting to archive their copies at once.
+pub(crate) const MAX_ARCHIVES: usize = 16;
+/// How long a failed dispute stop waits before it is tried again.
+const DISPUTE_RETRY: Duration = Duration::from_secs(5);
 
 pub(crate) const RATE_PER_SECOND: u32 = 30;
 pub(crate) const RATE_BURST: u32 = 120;
@@ -278,8 +284,6 @@ struct Ticket {
     base: Option<String>,
     /// For a verify ticket, the stored revision it verifies.
     verifies: Option<String>,
-    /// For a forensic write ticket, the stored revision its holder disagreed with.
-    forensic_of: Option<String>,
     /// For a write ticket that makes a major version, which one.
     major: Option<MajorTicket>,
     expires: Instant,
@@ -297,6 +301,9 @@ enum MajorTicket {
     After(UserId),
     /// An expired returning person's own copy, kept below the current file.
     Archive(UserId),
+    /// A verifier's own bytes in a dispute, kept beside the disputed checkpoint; neither
+    /// becomes the base.
+    DisputedCopy(UserId),
 }
 
 impl MajorTicket {
@@ -306,6 +313,7 @@ impl MajorTicket {
             MajorTicket::Before(_) => MajorReason::ReturningClientBefore,
             MajorTicket::After(_) => MajorReason::ReturningClientAfter,
             MajorTicket::Archive(_) => MajorReason::ReturningClientArchive,
+            MajorTicket::DisputedCopy(_) => MajorReason::DisputedCopy,
         }
     }
 
@@ -322,6 +330,7 @@ fn major_reason_name(reason: MajorReason) -> &'static str {
         MajorReason::ReturningClientAfter => "returning_client_after",
         MajorReason::OutsideReplacement => "outside_replacement",
         MajorReason::ReturningClientArchive => "returning_client_archive",
+        MajorReason::DisputedCopy => "disputed_copy",
     }
 }
 
@@ -381,7 +390,6 @@ struct CheckpointWriter {
 /// What a checkpoint write produced.
 enum WriteResult {
     Checkpoint(Result<String, LiveWriteError>),
-    Forensic(Result<ForensicWritten, LiveWriteError>),
     Major(Result<MajorWritten, LiveWriteError>),
 }
 
@@ -398,13 +406,40 @@ pub(crate) struct WriteDone {
     reply: oneshot::Sender<LiveCheckpointReply>,
 }
 
-/// A verifier that disagreed, to be asked for its own bytes once no write is outstanding.
-struct ForensicDue {
+/// Two editors disagree on the checkpoint `revision` at `at`: the verifier is asked for its own
+/// bytes, then both are kept as major versions, the last verified base becomes current and the
+/// live session stops.
+struct OpenDispute {
     revision: String,
     at: Seq,
-    participant: ParticipantNo,
-    client: ClientId,
-    user: UserId,
+    verifier: (ParticipantNo, ClientId, UserId),
+    /// The verifier was given its write ticket.
+    asked: bool,
+    /// When a failed stop may be tried again.
+    retry_at: Option<Instant>,
+}
+
+/// The file was replaced from outside: the room's last state is written on top of `head` and
+/// `outside` is stored again on top of that (S4).
+#[derive(Clone, Debug)]
+struct Recovery {
+    head: String,
+    outside: String,
+}
+
+/// A major-version write the room runs off its task.
+struct OwnedMajor {
+    kind: MajorKind,
+    reason: &'static str,
+    person: UserId,
+    current: String,
+    restore: Option<String>,
+    disputed: Option<String>,
+    blob: Option<BlobRef>,
+    authors: Vec<Author>,
+    at: Seq,
+    session: Uuid,
+    created_at: OffsetDateTime,
 }
 
 /// Entered digests reported at one agreement position.
@@ -506,15 +541,24 @@ pub(crate) struct LiveRoom<S: LiveStore> {
     ticket_misses: HashMap<ParticipantNo, u32>,
     /// The outside revision that replaced the file under the room (S4): until the room's last
     /// state is kept below it, changes wait and only that write is asked for.
-    recovery: Option<String>,
+    recovery: Option<Recovery>,
+    /// A checkpoint dispute being settled; no ordinary ticket is issued meanwhile.
+    dispute: Option<OpenDispute>,
+    /// A dispute was settled: everyone is told and the live session ends.
+    stop_due: bool,
+    /// When each person's return was last marked with major versions.
+    return_marks: HashMap<UserId, Instant>,
+    /// Clients whose change was held back: the first held local number. Later numbers are
+    /// dropped silently until it comes again, so held changes keep their order.
+    held_from: HashMap<ClientId, u64>,
+    /// An over-limit room loaded its whole log for a capable editor's checkpoint.
+    over_limit_loaded: bool,
     /// Returning clients' barriers, the first in progress.
     returns: VecDeque<ReturnBarrier>,
     /// Expired returning clients still to be asked for their own copy (C22, after 30 days).
     archives: Vec<(ParticipantNo, ClientId, UserId)>,
     /// Whether everyone was told that changes wait for a major version.
     hold_announced: bool,
-    /// Writers whose checkpoint a verifier disputed: asked to write last, never to verify.
-    disputed_writers: BTreeSet<ParticipantNo>,
     /// The base accepted from a sole editor and not yet verified by a second one: its
     /// revision, position, hash and writer's client.
     sole_base: Option<(String, Seq, [u8; 32], Option<ClientId>)>,
@@ -538,15 +582,10 @@ pub(crate) struct LiveRoom<S: LiveStore> {
     lapsed: BTreeSet<ParticipantNo>,
     /// Since when a due write ticket has been held back by outstanding verify tickets.
     verify_hold: Option<Instant>,
-    /// When each person was last given a forensic ticket.
-    forensic_last: HashMap<UserId, Instant>,
-    /// Checkpoints a forensic upload was already asked for.
-    forensic_asked: BTreeSet<String>,
     /// Verifiers whose hash disagreed with an unverified checkpoint, or who let a verify ticket
     /// for it lapse; never asked to verify it again, so a silent verifier cannot hold back
     /// checkpoint work.
     not_asked: HashMap<String, BTreeSet<ParticipantNo>>,
-    forensic_due: Option<ForensicDue>,
     agreement: BTreeMap<Seq, AgreementBucket>,
     /// Changes stored in the open session, for its end event.
     session_changes: u64,
@@ -584,9 +623,8 @@ impl<S: LiveStore> LiveRoom<S> {
         events: EventSink,
         timing: LiveTiming,
     ) -> Result<Self, RoomFailed> {
-        let limits = timing.limits;
         let (entries, bytes) = store.live_unsaved_counts(doc).await?;
-        if entries > limits.hard_entries.saturating_mul(2) || bytes > limits.hard_bytes {
+        if beyond_limits(timing.limits, entries, bytes) {
             // Beyond what may be sent to a joiner: refuse joins without loading the log.
             let mut room = Self::from_loaded(
                 doc,
@@ -635,8 +673,25 @@ impl<S: LiveStore> LiveRoom<S> {
         {
             // The document's current revision is newer than the room's newest checkpoint.
             match store.describe_live_revision(doc, &now).await {
-                Ok(Some(info)) if restores(&info, &live, sha256) => {
-                    // The same bytes stored again (a forensic restore or a major mark).
+                Ok(Some(info)) if crate::live_store::written_by_room(&info) => {
+                    if info.fields.get("major_reason").and_then(Value::as_str)
+                        == Some("outside_replacement")
+                    {
+                        // An outside recovery stopped after keeping the room's state: the
+                        // outside file it names is stored again on top first.
+                        let outside = info
+                            .fields
+                            .get("replaced_by")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned);
+                        recovery = outside.map(|outside| Recovery {
+                            head: now.clone(),
+                            outside,
+                        });
+                    }
+                    // The room's own revision (a mark, a restore, or a checkpoint whose record
+                    // was not stored): it is the base the next checkpoint goes on.
+                    let _ = sha256;
                     restored = Some(now);
                 }
                 Ok(Some(info)) if loaded.head <= through => {
@@ -663,7 +718,12 @@ impl<S: LiveStore> LiveRoom<S> {
                 }
                 // Replaced from outside under unsaved changes: they are written once more and
                 // kept below it first (S4).
-                Ok(Some(_)) => recovery = Some(now),
+                Ok(Some(_)) => {
+                    recovery = Some(Recovery {
+                        head: now.clone(),
+                        outside: now,
+                    });
+                }
                 // Unknown: the next checkpoint write finds out.
                 Ok(None) | Err(_) => {}
             }
@@ -811,11 +871,7 @@ impl<S: LiveStore> LiveRoom<S> {
             || loaded.unsaved_bytes >= limits.hard_bytes;
         let at_warning = loaded.unsaved_entries >= limits.warn_entries
             || loaded.unsaved_bytes >= limits.warn_bytes;
-        // Cancel records may take the log a little past the entry limit (at most one per
-        // change); anything beyond that, or past the byte limit, was stored under a higher
-        // limit.
-        let over_limit = loaded.unsaved_entries > limits.hard_entries.saturating_mul(2)
-            || loaded.unsaved_bytes > limits.hard_bytes;
+        let over_limit = beyond_limits(limits, loaded.unsaved_entries, loaded.unsaved_bytes);
         let (written_tx, written_rx) = mpsc::unbounded_channel();
         Ok(Self {
             doc,
@@ -836,10 +892,14 @@ impl<S: LiveStore> LiveRoom<S> {
             last_writer: None,
             ticket_misses: HashMap::new(),
             recovery: None,
+            dispute: None,
+            stop_due: false,
+            return_marks: HashMap::new(),
+            held_from: HashMap::new(),
+            over_limit_loaded: false,
             returns: VecDeque::new(),
             archives: Vec::new(),
             hold_announced: false,
-            disputed_writers: BTreeSet::new(),
             sole_base: loaded
                 .verified_checkpoint
                 .as_ref()
@@ -863,10 +923,7 @@ impl<S: LiveStore> LiveRoom<S> {
             checkpoint_writers,
             lapsed: BTreeSet::new(),
             verify_hold: None,
-            forensic_last: HashMap::new(),
-            forensic_asked: BTreeSet::new(),
             not_asked: HashMap::new(),
-            forensic_due: None,
             agreement: BTreeMap::new(),
             session_changes,
             names: HashMap::new(),
@@ -932,6 +989,10 @@ impl<S: LiveStore> LiveRoom<S> {
             self.advance_returns().await;
             self.issue_due_tickets();
         }
+        let handled = match handled {
+            Ok(()) => self.stop_session().await,
+            failed => failed,
+        };
         self.sync_hold();
         handled
     }
@@ -1122,7 +1183,7 @@ impl<S: LiveStore> LiveRoom<S> {
                 if missed {
                     let misses = self.ticket_misses.entry(held.participant).or_insert(0);
                     *misses = misses.saturating_add(1);
-                    if held.purpose == TicketPurpose::Verify || held.forensic_of.is_some() {
+                    if held.purpose == TicketPurpose::Verify {
                         self.lapsed.insert(held.participant);
                     }
                     if let Some(revision) = held.verifies.clone() {
@@ -1169,7 +1230,7 @@ impl<S: LiveStore> LiveRoom<S> {
                 .is_some_and(|barrier| barrier.stage != ReturnStage::Batch)
             || self.pending_reconcile.is_some()
             || self.writing
-            || self.forensic_due.is_some()
+            || self.dispute.is_some()
             || self.head <= self.saved_through
             || self
                 .tickets
@@ -1217,7 +1278,6 @@ impl<S: LiveStore> LiveRoom<S> {
             .map(|(participant, place)| {
                 (
                     (
-                        self.disputed_writers.contains(participant),
                         self.ticket_misses.get(participant).copied().unwrap_or(0),
                         Some(*participant) == self.last_writer,
                         writer_build.is_some_and(|build| build == place.build),
@@ -1241,7 +1301,10 @@ impl<S: LiveStore> LiveRoom<S> {
         if self.recovery.is_some() {
             return;
         }
-        self.issue_forensic_ticket();
+        self.issue_dispute_ticket();
+        if self.dispute.is_some() {
+            return;
+        }
         self.issue_verify_ticket();
         let now = Instant::now();
         if !self.verify_outstanding() {
@@ -1270,52 +1333,163 @@ impl<S: LiveStore> LiveRoom<S> {
                 base,
                 None,
                 None,
-                None,
             );
         }
     }
 
-    /// Asks a verifier that disagreed for its own bytes, once no write is outstanding; drops
-    /// the request when that verifier can no longer checkpoint.
-    fn issue_forensic_ticket(&mut self) {
-        if self.writing
-            || self.recovery.is_some()
-            || self.pending_reconcile.is_some()
-            || self
-                .tickets
-                .iter()
-                .any(|held| held.purpose == TicketPurpose::Write)
-        {
+    /// In a dispute, asks the verifier once for its own bytes; once that ticket is used up or
+    /// cannot be given, settles the dispute with what there is.
+    fn issue_dispute_ticket(&mut self) {
+        if self.writing || self.recovery.is_some() {
             return;
         }
-        let Some(due) = self.forensic_due.take() else {
+        let Some(dispute) = &self.dispute else {
             return;
         };
-        if self.head <= self.saved_through
-            || !self.place_can_checkpoint(due.participant, due.client)
-            || self
-                .tickets
-                .iter()
-                .any(|held| held.participant == due.participant)
+        if self.tickets.iter().any(|held| {
+            held.major
+                .is_some_and(|major| matches!(major, MajorTicket::DisputedCopy(_)))
+        }) || dispute.retry_at.is_some_and(|at| at > Instant::now())
         {
             return;
         }
-        let base = self.checkpoint_base.clone();
-        self.forensic_last.insert(due.user, Instant::now());
-        self.forensic_asked.insert(due.revision.clone());
-        if self.warned {
-            self.urgent_asked = true;
+        let (participant, client, user) = dispute.verifier;
+        let at = dispute.at;
+        if !dispute.asked && self.head == at && self.place_can_checkpoint(participant, client) {
+            if let Some(dispute) = &mut self.dispute {
+                dispute.asked = true;
+            }
+            let base = self.checkpoint_base.clone();
+            self.issue_ticket(
+                TicketPurpose::Write,
+                (participant, client, user),
+                at,
+                base,
+                None,
+                Some(MajorTicket::DisputedCopy(user)),
+            );
+            return;
         }
-        let at = self.head;
-        self.issue_ticket(
-            TicketPurpose::Write,
-            (due.participant, due.client, due.user),
-            at,
-            base,
-            None,
-            None,
-            None,
+        // The verifier's bytes are not coming: keep the writer's copy and settle.
+        if let Some(dispute) = &mut self.dispute {
+            dispute.asked = true;
+        }
+        self.settle_dispute(None, user, Vec::new());
+    }
+
+    /// Keeps both sides of the dispute as major versions (the verifier's `blob` when it sent
+    /// one), stores the last verified base again as current, and then ends the session.
+    fn settle_dispute(&mut self, blob: Option<BlobRef>, user: UserId, authors: Vec<Author>) {
+        let Some(dispute) = &self.dispute else {
+            return;
+        };
+        let Some(current) = self.checkpoint_base.clone() else {
+            // Nothing in Git to keep: end the session as is.
+            self.dispute = None;
+            self.stop_due = true;
+            return;
+        };
+        let (participant, client, _) = dispute.verifier;
+        let owned = OwnedMajor {
+            kind: MajorKind::Dispute,
+            reason: "dispute_base",
+            person: user,
+            current,
+            restore: self.base_revision.clone(),
+            disputed: Some(dispute.revision.clone()),
+            blob,
+            authors,
+            at: dispute.at,
+            session: self
+                .session
+                .as_ref()
+                .map_or_else(Uuid::nil, |session| session.id.0),
+            created_at: OffsetDateTime::now_utc(),
+        };
+        let ticket = self.synthetic_ticket(
+            (participant, client, user),
+            dispute.at,
+            MajorTicket::DisputedCopy(user),
         );
+        let (reply, _) = oneshot::channel();
+        self.spawn_major(ticket, owned, reply);
+    }
+
+    /// A ticket standing for a write the room starts itself.
+    fn synthetic_ticket(
+        &self,
+        (participant, client, user): (ParticipantNo, ClientId, UserId),
+        at: Seq,
+        major: MajorTicket,
+    ) -> Ticket {
+        Ticket {
+            id: Uuid::nil(),
+            purpose: TicketPurpose::Write,
+            participant,
+            client,
+            user,
+            at,
+            base: self.checkpoint_base.clone(),
+            verifies: None,
+            major: Some(major),
+            expires: Instant::now(),
+            claimed: true,
+        }
+    }
+
+    /// Runs the major-version write `owned` off the room task; its result comes back as
+    /// [`LiveCommand::CheckpointWritten`] for `ticket`.
+    fn spawn_major(
+        &mut self,
+        ticket: Ticket,
+        owned: OwnedMajor,
+        reply: oneshot::Sender<LiveCheckpointReply>,
+    ) {
+        self.writing = true;
+        self.writing_hold = ticket.major.is_some_and(MajorTicket::holds_changes);
+        let store = self.store.clone();
+        let doc = self.doc;
+        let written = self.written_tx.clone();
+        let user = ticket.user;
+        let at = owned.at;
+        let session = owned.session;
+        let created_at = owned.created_at;
+        tokio::spawn(async move {
+            let job = tokio::spawn(async move {
+                let write = MajorWrite {
+                    kind: owned.kind,
+                    reason: owned.reason,
+                    person: owned.person,
+                    current: &owned.current,
+                    restore: owned.restore.as_deref(),
+                    disputed: owned.disputed.as_deref(),
+                    blob: owned.blob,
+                    authors: &owned.authors,
+                    at: owned.at,
+                    session: owned.session,
+                    created_at: owned.created_at,
+                };
+                store.write_live_major(doc, &write).await
+            });
+            let result = match job.await {
+                Ok(result) => result,
+                Err(error) => Err(LiveWriteError::Failed(format!(
+                    "major write task failed: {error}"
+                ))),
+            };
+            let done = WriteDone {
+                result: WriteResult::Major(result),
+                ticket,
+                user,
+                at,
+                sha256: [0; 32],
+                session,
+                session_data: Vec::new(),
+                created_at,
+                reply,
+            };
+            let _ = written.send(LiveCommand::CheckpointWritten(Box::new(done)));
+        });
     }
 
     /// Asks one eligible editor, never the writer or a verifier that disagreed, to re-derive
@@ -1340,7 +1514,6 @@ impl<S: LiveStore> LiveRoom<S> {
             at,
             Some(revision.clone()),
             Some(revision),
-            None,
             None,
         );
     }
@@ -1379,7 +1552,6 @@ impl<S: LiveStore> LiveRoom<S> {
         .find(|(participant, client, _)| {
             writer_client.is_none_or(|writer| writer != *client)
                 && !self.lapsed.contains(participant)
-                && !self.disputed_writers.contains(participant)
                 && not_asked.is_none_or(|set| !set.contains(participant))
         })
     }
@@ -1404,7 +1576,11 @@ impl<S: LiveStore> LiveRoom<S> {
         else {
             return Ok(());
         };
-        if self.verifier_for(&target.revision).is_some() {
+        let writer_client = self
+            .checkpoint_writers
+            .get(&target.revision)
+            .map(|writer| writer.client);
+        if self.dispute.is_some() || self.other_capable_present(writer_client) {
             return Ok(());
         }
         self.store
@@ -1437,15 +1613,27 @@ impl<S: LiveStore> LiveRoom<S> {
         Ok(())
     }
 
+    /// Whether a capable editor other than the writer's client holds a place: connected or
+    /// within its reconnect grace, holding a ticket or lapsed alike. Only with none is a sole
+    /// editor's checkpoint accepted.
+    fn other_capable_present(&self, writer: Option<ClientId>) -> bool {
+        self.session.as_ref().is_some_and(|session| {
+            session.places.values().any(|place| {
+                place.held
+                    && place.can_edit
+                    && place.can_checkpoint
+                    && writer.is_none_or(|writer| writer != place.client)
+            })
+        })
+    }
+
     /// Sets aside the checkpoint `revision` a verifier disputed: it stays in the history but is
     /// never a base, and its position is free for another writer, the verifier first.
     async fn dispute(&mut self, revision: &str) -> Result<(), RoomFailed> {
         self.store
             .dispute_live_checkpoint(self.doc, revision, OffsetDateTime::now_utc())
             .await?;
-        if let Some(writer) = self.checkpoint_writers.remove(revision) {
-            self.disputed_writers.insert(writer.participant);
-        }
+        self.checkpoint_writers.remove(revision);
         self.unverified_checkpoints
             .retain(|checkpoint| checkpoint.revision != revision);
         self.not_asked.remove(revision);
@@ -1472,7 +1660,6 @@ impl<S: LiveStore> LiveRoom<S> {
         at: Seq,
         base: Option<String>,
         verifies: Option<String>,
-        forensic_of: Option<String>,
         major: Option<MajorTicket>,
     ) {
         let id = Uuid::new_v4();
@@ -1492,7 +1679,6 @@ impl<S: LiveStore> LiveRoom<S> {
             at,
             base,
             verifies,
-            forensic_of,
             major,
             expires: Instant::now() + self.timing.ticket_lifetime,
             claimed: false,
@@ -1566,28 +1752,94 @@ impl<S: LiveStore> LiveRoom<S> {
             let _ = reply.send(LiveCheckpointReply::Failed);
             return;
         }
-        let authors = if held.forensic_of.is_some() {
-            vec![Author {
-                id: user.0.to_string(),
-                name: credited_name(self.names.get(&user).map_or("", String::as_str)),
-            }]
-        } else {
-            self.checkpoint_authors(at, user)
-        };
+        let uploader = vec![Author {
+            id: user.0.to_string(),
+            name: credited_name(self.names.get(&user).map_or("", String::as_str)),
+        }];
         let now = OffsetDateTime::now_utc();
         // PostgreSQL keeps microseconds; a reconcile compares this exact time.
         let created_at = now
             .replace_nanosecond(now.nanosecond() / 1_000 * 1_000)
             .unwrap_or(now);
+        let owned = |kind, reason, person, current: Option<String>, restore, disputed, authors| {
+            current.map(|current| OwnedMajor {
+                kind,
+                reason,
+                person,
+                current,
+                restore,
+                disputed,
+                blob: Some(blob),
+                authors,
+                at,
+                session: session.0,
+                created_at,
+            })
+        };
+        let major_write = match held.major {
+            Some(MajorTicket::Outside) => Some(owned(
+                MajorKind::Outside,
+                "outside_current",
+                user,
+                self.recovery.as_ref().map(|recovery| recovery.head.clone()),
+                self.recovery
+                    .as_ref()
+                    .map(|recovery| recovery.outside.clone()),
+                None,
+                self.checkpoint_authors(at, user),
+            )),
+            Some(MajorTicket::Archive(person)) => Some(owned(
+                MajorKind::Archive,
+                "returning_client_current",
+                person,
+                held.base.clone(),
+                None,
+                None,
+                uploader,
+            )),
+            Some(MajorTicket::DisputedCopy(_)) => {
+                // The verifier's own bytes settle the dispute.
+                let Some(dispute) = &self.dispute else {
+                    let _ = reply.send(LiveCheckpointReply::Refused);
+                    return;
+                };
+                let disputed = Some(dispute.revision.clone());
+                let at = dispute.at;
+                Some(
+                    owned(
+                        MajorKind::Dispute,
+                        "dispute_base",
+                        user,
+                        self.checkpoint_base.clone(),
+                        self.base_revision.clone(),
+                        disputed,
+                        uploader,
+                    )
+                    .map(|mut owned| {
+                        owned.at = at;
+                        owned
+                    }),
+                )
+            }
+            _ => None,
+        };
+        if let Some(major_write) = major_write {
+            match major_write {
+                Some(owned) => self.spawn_major(held, owned, reply),
+                None => {
+                    let _ = reply.send(LiveCheckpointReply::Failed);
+                }
+            }
+            return;
+        }
+        let authors = self.checkpoint_authors(at, user);
         self.writing = true;
         self.writing_hold = held.major.is_some_and(MajorTicket::holds_changes);
         let store = self.store.clone();
         let doc = self.doc;
         let written = self.written_tx.clone();
         let write_base = held.base.clone();
-        let forensic_of = held.forensic_of.clone();
         let major = held.major;
-        let outside = self.recovery.clone();
         let writer = Some(LiveCheckpointWriter {
             participant: held.participant.0,
             client: held.client,
@@ -1615,48 +1867,8 @@ impl<S: LiveStore> LiveRoom<S> {
                     writer,
                     major: major_point,
                 };
-                let major_target = match major {
-                    Some(MajorTicket::Outside) => Some((
-                        MajorKind::Outside,
-                        outside.as_deref(),
-                        "outside_current",
-                        user,
-                    )),
-                    Some(MajorTicket::Archive(person)) => Some((
-                        MajorKind::Archive,
-                        write_base.as_deref(),
-                        "returning_client_current",
-                        person,
-                    )),
-                    _ => None,
-                };
-                let major_write = major_target.map(|(kind, current, reason, person)| {
-                    current.map(|current| MajorWrite {
-                        kind,
-                        reason,
-                        person,
-                        current,
-                        blob: Some(blob),
-                        authors: &authors,
-                        at,
-                        session: session.0,
-                        created_at,
-                    })
-                });
-                let result = match (forensic_of.as_deref(), major_write) {
-                    (Some(agreed), _) => {
-                        WriteResult::Forensic(store.write_live_forensic(doc, &write, agreed).await)
-                    }
-                    (None, Some(Some(major))) => {
-                        WriteResult::Major(store.write_live_major(doc, &major).await)
-                    }
-                    (None, Some(None)) => WriteResult::Major(Err(LiveWriteError::Failed(
-                        "no current revision to keep the bytes below".to_owned(),
-                    ))),
-                    (None, None) => {
-                        WriteResult::Checkpoint(store.write_live_checkpoint(doc, &write).await)
-                    }
-                };
+                let result =
+                    WriteResult::Checkpoint(store.write_live_checkpoint(doc, &write).await);
                 (result, session_data)
             });
             let (result, session_data) = match job.await {
@@ -1701,25 +1913,6 @@ impl<S: LiveStore> LiveRoom<S> {
             reply,
         } = done;
         let answer = match result {
-            WriteResult::Forensic(Ok(written)) => {
-                let of = held.forensic_of.clone().unwrap_or_default();
-                self.checkpoint_base = Some(written.current.clone());
-                self.events.emit(NewEvent {
-                    kind: "live.checkpoint_forensic",
-                    actor: Some(user),
-                    subject: None,
-                    document: Some(self.doc),
-                    node: Some(self.doc.into()),
-                    detail: serde_json::json!({
-                        "revision": written.forensic,
-                        "of": of,
-                        "through": at.0,
-                    }),
-                });
-                LiveCheckpointReply::Saved {
-                    revision: written.forensic,
-                }
-            }
             WriteResult::Checkpoint(Ok(revision)) => {
                 self.checkpoint_stored(
                     revision.clone(),
@@ -1732,27 +1925,24 @@ impl<S: LiveStore> LiveRoom<S> {
                 );
                 LiveCheckpointReply::Saved { revision }
             }
-            WriteResult::Major(Ok(written)) => {
-                let kept = written.kept.clone().unwrap_or_default();
-                let (kept_reason, current_reason, person) = match held.major {
-                    Some(MajorTicket::Archive(person)) => (
-                        "returning_client_archive",
-                        "returning_client_current",
-                        person,
-                    ),
-                    _ => ("outside_replacement", "outside_current", user),
-                };
-                self.major_version(&kept, kept_reason, person, at);
-                self.major_version(&written.current, current_reason, person, at);
-                if held.major == Some(MajorTicket::Outside) {
-                    self.rebase_on(written.current, at);
-                } else {
-                    self.checkpoint_base = Some(written.current);
+            WriteResult::Major(Ok(written)) => self.major_written(&held, user, at, written),
+            WriteResult::Major(Err(LiveWriteError::Partial { head, error })) => {
+                eprintln!(
+                    "sharecraft-server: a major version of document {} stopped part way: {error}",
+                    self.doc.0
+                );
+                match (held.major, &mut self.recovery) {
+                    // The outside file is still to be stored again, on top of what was kept.
+                    (Some(MajorTicket::Outside), Some(recovery)) => recovery.head = head,
+                    _ => self.checkpoint_base = Some(head),
                 }
-                LiveCheckpointReply::Saved { revision: kept }
+                if matches!(held.major, Some(MajorTicket::DisputedCopy(_))) {
+                    self.dispute = None;
+                    self.stop_due = true;
+                }
+                LiveCheckpointReply::Failed
             }
             WriteResult::Checkpoint(Err(LiveWriteError::Stale { current }))
-            | WriteResult::Forensic(Err(LiveWriteError::Stale { current }))
             | WriteResult::Major(Err(LiveWriteError::Stale { current })) => {
                 if let Some(outside) = current.clone() {
                     self.enter_recovery(outside);
@@ -1772,27 +1962,44 @@ impl<S: LiveStore> LiveRoom<S> {
                 LiveCheckpointReply::Stale { current }
             }
             WriteResult::Checkpoint(Err(LiveWriteError::Failed(error)))
-            | WriteResult::Forensic(Err(LiveWriteError::Failed(error)))
             | WriteResult::Major(Err(LiveWriteError::Failed(error))) => {
                 eprintln!(
                     "sharecraft-server: live checkpoint of document {} failed: {error}",
                     self.doc.0
                 );
+                match held.major {
+                    Some(MajorTicket::Before(_) | MajorTicket::After(_)) if held.id.is_nil() => {
+                        self.mark_retry_at = Some(Instant::now() + RECONCILE_RETRY);
+                    }
+                    Some(MajorTicket::DisputedCopy(_)) => {
+                        if let Some(dispute) = &mut self.dispute {
+                            dispute.asked = true;
+                            dispute.retry_at = Some(Instant::now() + DISPUTE_RETRY);
+                        }
+                    }
+                    _ => {}
+                }
                 LiveCheckpointReply::Failed
             }
-            WriteResult::Forensic(Err(LiveWriteError::Unrecorded {
-                revision, error, ..
-            }))
-            | WriteResult::Major(Err(LiveWriteError::Unrecorded {
+            WriteResult::Major(Err(LiveWriteError::Unrecorded {
                 revision, error, ..
             })) => {
-                // A forensic revision records no checkpoint, so this is not expected; Git holds
-                // it and the next start reconciles the index.
+                // A major write records no checkpoint, so this is not expected; Git holds it
+                // and the next start reconciles the index.
                 eprintln!(
-                    "sharecraft-server: forensic revision {revision} of document {} is not \
+                    "sharecraft-server: major revision {revision} of document {} is not \
                      recorded: {error}",
                     self.doc.0
                 );
+                LiveCheckpointReply::Failed
+            }
+            WriteResult::Checkpoint(Err(LiveWriteError::Partial { head, error })) => {
+                // Not produced by a checkpoint write; treated as its own revision on top.
+                eprintln!(
+                    "sharecraft-server: live checkpoint of document {} stopped part way: {error}",
+                    self.doc.0
+                );
+                self.checkpoint_base = Some(head);
                 LiveCheckpointReply::Failed
             }
             WriteResult::Checkpoint(Err(LiveWriteError::Unrecorded {
@@ -1830,6 +2037,75 @@ impl<S: LiveStore> LiveRoom<S> {
             }
         };
         let _ = reply.send(answer);
+    }
+
+    /// Applies a finished major-version write.
+    fn major_written(
+        &mut self,
+        held: &Ticket,
+        user: UserId,
+        at: Seq,
+        written: MajorWritten,
+    ) -> LiveCheckpointReply {
+        let kept = written.kept.clone();
+        match held.major {
+            Some(MajorTicket::Outside) => {
+                if let Some(kept) = &kept {
+                    self.major_version(kept, "outside_replacement", user, at);
+                }
+                self.major_version(&written.current, "outside_current", user, at);
+                self.rebase_on(written.current.clone(), at);
+            }
+            Some(MajorTicket::Archive(person)) => {
+                if let Some(kept) = &kept {
+                    self.major_version(kept, "returning_client_archive", person, at);
+                }
+                self.major_version(&written.current, "returning_client_current", person, at);
+                self.checkpoint_base = Some(written.current.clone());
+            }
+            Some(MajorTicket::DisputedCopy(person)) => {
+                let mut copies = Vec::new();
+                for copy in kept.iter().chain(written.copy.iter()) {
+                    self.major_version(copy, "disputed_copy", person, at);
+                    copies.push(copy.clone());
+                }
+                self.checkpoint_base = Some(written.current.clone());
+                let revision = self
+                    .dispute
+                    .take()
+                    .map(|dispute| dispute.revision)
+                    .unwrap_or_default();
+                self.events.emit(NewEvent {
+                    kind: "live.checkpoint_dispute_stopped",
+                    actor: Some(person),
+                    subject: None,
+                    document: Some(self.doc),
+                    node: Some(self.doc.into()),
+                    detail: serde_json::json!({
+                        "revision": revision,
+                        "through": at.0,
+                        "copies": copies,
+                        "current": written.current,
+                    }),
+                });
+                self.stop_due = true;
+            }
+            Some(MajorTicket::Before(person) | MajorTicket::After(person)) => {
+                let reason = if matches!(held.major, Some(MajorTicket::Before(_))) {
+                    MajorReason::ReturningClientBefore
+                } else {
+                    MajorReason::ReturningClientAfter
+                };
+                self.mark_retry_at = None;
+                self.major_version(&written.current, major_reason_name(reason), person, at);
+                self.checkpoint_base = Some(written.current.clone());
+                self.return_point_stored();
+            }
+            None => {}
+        }
+        LiveCheckpointReply::Saved {
+            revision: kept.unwrap_or(written.current),
+        }
     }
 
     /// The effects of a stored, unverified checkpoint: the next checkpoint builds on it, its
@@ -2006,6 +2282,7 @@ impl<S: LiveStore> LiveRoom<S> {
                             "sole_editor": true,
                         }),
                     });
+                    self.open_dispute(revision, at, (held.participant, held.client, held.user));
                 }
             }
             // Otherwise covered by a later verified checkpoint meanwhile: nothing to verify.
@@ -2034,23 +2311,58 @@ impl<S: LiveStore> LiveRoom<S> {
                 detail: serde_json::json!({ "revision": revision, "through": at.0 }),
             });
             self.dispute(&revision).await?;
-            // The verifier writes the freed position first, at most once per checkpoint and
-            // once per person in FORENSIC_EVERY; otherwise any other capable editor does.
-            let recent = self
-                .forensic_last
-                .get(&held.user)
-                .is_some_and(|last| last.elapsed() < FORENSIC_EVERY);
-            if !recent && !self.forensic_asked.contains(&revision) {
-                self.forensic_due = Some(ForensicDue {
-                    revision,
-                    at,
-                    participant: held.participant,
-                    client: held.client,
-                    user: held.user,
-                });
-            }
+            self.open_dispute(revision, at, (held.participant, held.client, held.user));
         }
         Ok(LiveCheckpointReply::Accepted)
+    }
+
+    /// Two editors disagree on `revision` at `at`: changes wait, nothing new is asked for, and
+    /// the verifier is asked for its own bytes before the dispute is settled.
+    fn open_dispute(
+        &mut self,
+        revision: String,
+        at: Seq,
+        verifier: (ParticipantNo, ClientId, UserId),
+    ) {
+        self.cancel_tickets(|held| held.purpose == TicketPurpose::Write, false);
+        self.dispute = Some(OpenDispute {
+            revision,
+            at,
+            verifier,
+            asked: false,
+            retry_at: None,
+        });
+    }
+
+    /// Ends the live session after a dispute: everyone is told and their places end, so each
+    /// client joins again and loads the current file.
+    async fn stop_session(&mut self) -> Result<(), RoomFailed> {
+        if !self.stop_due || self.writing {
+            return Ok(());
+        }
+        self.stop_due = false;
+        let places = self
+            .session
+            .as_ref()
+            .map(|session| {
+                session
+                    .places
+                    .iter()
+                    .filter(|(_, place)| place.held)
+                    .map(|(participant, place)| (*participant, place.client))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let frame = encode(&LiveServerMsg::Unavailable {
+            reason: UnavailableReason::CheckpointDispute,
+        });
+        for (participant, client) in places {
+            let _ = self
+                .members
+                .send(Some(client), &Outbound::One(frame.clone()));
+            self.end_place(participant, GoneReason::Left).await?;
+        }
+        Ok(())
     }
 
     /// The room's base is now the verified checkpoint `revision` at `at`: earlier unverified
@@ -2083,13 +2395,6 @@ impl<S: LiveStore> LiveRoom<S> {
         self.checkpoint_writers
             .retain(|revision, _| kept.contains(revision));
         self.not_asked.retain(|revision, _| kept.contains(revision));
-        self.forensic_asked
-            .retain(|revision| kept.contains(revision));
-        self.forensic_last
-            .retain(|_, last| last.elapsed() < FORENSIC_EVERY);
-        if self.forensic_due.as_ref().is_some_and(|due| due.at <= at) {
-            self.forensic_due = None;
-        }
         self.cancel_tickets(
             |held| held.purpose == TicketPurpose::Verify && held.at <= at,
             false,
@@ -2343,7 +2648,21 @@ impl<S: LiveStore> LiveRoom<S> {
                     "tries": pending.tries.saturating_add(1),
                 }),
             });
-            self.checkpoint_base = Some(pending.revision);
+            // Only a revision Git knows becomes the base; otherwise the current one does.
+            let known = matches!(
+                self.store
+                    .describe_live_revision(self.doc, &pending.revision)
+                    .await,
+                Ok(Some(_))
+            );
+            self.checkpoint_base = if known {
+                Some(pending.revision)
+            } else {
+                match self.store.current_revision(self.doc).await {
+                    Ok(current) => current,
+                    Err(_) => self.checkpoint_base.clone(),
+                }
+            };
             self.first_unsaved.get_or_insert_with(Instant::now);
         } else {
             let delay = pending.delay;
@@ -2446,6 +2765,7 @@ impl<S: LiveStore> LiveRoom<S> {
         self.accept_sole_editor().await?;
         self.advance_returns().await;
         self.issue_due_tickets();
+        self.stop_session().await?;
         self.sync_hold();
         Ok(())
     }
@@ -2496,7 +2816,26 @@ impl<S: LiveStore> LiveRoom<S> {
             let _ = request.accepted.send(JoinReply::Refused);
             return Ok(());
         }
-        if self.over_limit {
+        let capable_editor = request.role.can_edit() && request.can_checkpoint;
+        if self.over_limit && capable_editor && !self.over_limit_loaded {
+            // A capable editor can write the checkpoint that brings the log back under: load the
+            // whole log once, for it.
+            let loaded = self.store.load_live(self.doc).await?;
+            let current = self.store.current_revision(self.doc).await?;
+            let mut room = Self::from_loaded(
+                self.doc,
+                self.store.clone(),
+                self.events.clone(),
+                self.timing,
+                loaded,
+                current,
+            )?;
+            room.over_limit = true;
+            room.over_limit_loaded = true;
+            room.over_limit_refused = self.over_limit_refused;
+            *self = room;
+        }
+        if self.over_limit && !(capable_editor && self.over_limit_loaded) {
             // A recoverable fault: raising the limit lets people in again.
             send_direct(
                 &request.tx,
@@ -2684,6 +3023,7 @@ impl<S: LiveStore> LiveRoom<S> {
             .find(|member| member.client == request.client)
             .is_some_and(|member| member.role.can_edit());
         let mut archive_frame = None;
+        let mut ready_frame = None;
         if let (Place::Returning { .. }, Some(through), true) =
             (place, request.returning_through, can_edit_now)
         {
@@ -2691,18 +3031,35 @@ impl<S: LiveStore> LiveRoom<S> {
                 archive_frame = Some(encode(&LiveServerMsg::ArchiveReturn {
                     current: self.checkpoint_base.clone(),
                 }));
-                if request.can_checkpoint {
+                if request.can_checkpoint && self.archives.len() < MAX_ARCHIVES {
                     self.archives
                         .push((participant, request.client, request.user));
                 }
             } else {
-                self.returns.push_back(ReturnBarrier {
-                    participant,
-                    client: request.client,
-                    user: request.user,
-                    through,
-                    stage: ReturnStage::Before,
-                });
+                let now = Instant::now();
+                self.return_marks
+                    .retain(|_, at| now.saturating_duration_since(*at) < RETURN_MARK_EVERY);
+                // The batch was stored before the drop, the person's returns were marked
+                // recently, or too many wait: no versions are made and the batch goes at once.
+                let stored = self
+                    .clients
+                    .get(&request.client)
+                    .is_some_and(|(_, next)| *next > through.0);
+                if stored
+                    || self.return_marks.contains_key(&request.user)
+                    || self.returns.len() >= MAX_RETURNS
+                {
+                    ready_frame = Some(encode(&LiveServerMsg::ReturnReady { through }));
+                } else {
+                    self.return_marks.insert(request.user, now);
+                    self.returns.push_back(ReturnBarrier {
+                        participant,
+                        client: request.client,
+                        user: request.user,
+                        through,
+                        stage: ReturnStage::Before,
+                    });
+                }
             }
         }
         let from = request
@@ -2738,7 +3095,8 @@ impl<S: LiveStore> LiveRoom<S> {
                     })
                 }),
         );
-        if self.paused {
+        frames.extend(ready_frame);
+        if self.paused || self.holding() {
             frames.push(encode(&LiveServerMsg::ChangesPaused {
                 entries: self.unsaved_entries,
                 bytes: self.unsaved_bytes,
@@ -2788,9 +3146,14 @@ impl<S: LiveStore> LiveRoom<S> {
             None => return Ok(()),
         };
         match self.store.live_local(self.doc, client, local.0).await? {
-            LiveLocal::Stored { .. } => return Ok(()),
+            LiveLocal::Stored { .. } => {
+                // A batch whose last local was stored before the drop ends here too.
+                self.note_return_local(client, local);
+                return Ok(());
+            }
             LiveLocal::Refused { reason } => {
                 self.refuse(client, local, reason_from_store(&reason));
+                self.note_return_local(client, local);
                 return Ok(());
             }
             LiveLocal::Unseen => {}
@@ -2798,8 +3161,26 @@ impl<S: LiveStore> LiveRoom<S> {
         let next_local = self.clients.get(&client).map_or(1, |(_, next)| *next);
         if local.0 < next_local {
             self.refuse(client, local, RefusedReason::OutOfOrder);
+            self.note_return_local(client, local);
             return Ok(());
         }
+        if self
+            .held_from
+            .get(&client)
+            .is_some_and(|first| local.0 > *first)
+        {
+            // Sent before the client heard that its earlier change was held: it sends this
+            // again, in order, once changes resume.
+            return Ok(());
+        }
+        if self.holding() || self.return_waits(client) {
+            // Changes wait for a major version at the head. Not refused for good: the number
+            // is not used up and the client sends the change again after the hold.
+            self.held_from.insert(client, local.0);
+            self.refuse(client, local, RefusedReason::Held);
+            return Ok(());
+        }
+        self.held_from.remove(&client);
 
         let reason = if !can_edit {
             Some(RefusedReason::ReadOnly)
@@ -2825,9 +3206,6 @@ impl<S: LiveStore> LiveRoom<S> {
             Some(RefusedReason::RateLimited)
         } else if self.paused || self.would_cross(payload.len()) {
             Some(RefusedReason::LogPaused)
-        } else if self.holding() || self.return_waits(client) {
-            // Changes wait for a major version at the head; nothing is paused for good.
-            Some(RefusedReason::LogPaused)
         } else {
             None
         };
@@ -2842,7 +3220,7 @@ impl<S: LiveStore> LiveRoom<S> {
             }
             self.advance_local(client, user, local);
             self.refuse(client, local, reason);
-            if reason == RefusedReason::LogPaused && !self.holding() && !self.return_waits(client) {
+            if reason == RefusedReason::LogPaused {
                 self.pause();
             }
             self.note_return_local(client, local);
@@ -2933,6 +3311,7 @@ impl<S: LiveStore> LiveRoom<S> {
     /// Whether new changes wait for a major version to be stored at the head.
     fn holding(&self) -> bool {
         self.recovery.is_some()
+            || self.dispute.is_some()
             || self.writing_hold
             || self
                 .tickets
@@ -3050,46 +3429,32 @@ impl<S: LiveStore> LiveRoom<S> {
             .session
             .as_ref()
             .map_or_else(Uuid::nil, |session| session.id.0);
-        let result = self
-            .store
-            .write_live_major(
-                self.doc,
-                &MajorWrite {
-                    kind: MajorKind::Mark,
-                    reason: major_reason_name(reason),
-                    person: barrier.user,
-                    current: &current,
-                    blob: None,
-                    authors: &[],
-                    at: self.head,
-                    session,
-                    created_at: OffsetDateTime::now_utc(),
-                },
-            )
-            .await;
-        match result {
-            Ok(written) => {
-                self.mark_retry_at = None;
-                self.major_version(
-                    &written.current,
-                    major_reason_name(reason),
-                    barrier.user,
-                    self.head,
-                );
-                self.checkpoint_base = Some(written.current);
-                self.return_point_stored();
-            }
-            Err(LiveWriteError::Stale {
-                current: Some(outside),
-            }) => self.enter_recovery(outside),
-            Err(error) => {
-                eprintln!(
-                    "sharecraft-server: a major version of document {} could not be stored:                      {error:?}",
-                    self.doc.0
-                );
-                self.mark_retry_at = Some(Instant::now() + RECONCILE_RETRY);
-            }
-        }
+        let major = if barrier.stage == ReturnStage::Before {
+            MajorTicket::Before(barrier.user)
+        } else {
+            MajorTicket::After(barrier.user)
+        };
+        let owned = OwnedMajor {
+            kind: MajorKind::Mark,
+            reason: major_reason_name(reason),
+            person: barrier.user,
+            current,
+            restore: None,
+            disputed: None,
+            blob: None,
+            authors: Vec::new(),
+            at: self.head,
+            session,
+            created_at: OffsetDateTime::now_utc(),
+        };
+        let ticket = self.synthetic_ticket(
+            (barrier.participant, barrier.client, barrier.user),
+            self.head,
+            major,
+        );
+        let (reply, _) = oneshot::channel();
+        // The mark runs off the room task; changes wait for it (`writing_hold`).
+        self.spawn_major(ticket, owned, reply);
     }
 
     /// Asks for a major-version write that is due: the room's last state after an outside
@@ -3115,7 +3480,6 @@ impl<S: LiveStore> LiveRoom<S> {
                     at,
                     base,
                     None,
-                    None,
                     Some(MajorTicket::Outside),
                 );
             }
@@ -3128,7 +3492,6 @@ impl<S: LiveStore> LiveRoom<S> {
                     (participant, client, user),
                     at,
                     base,
-                    None,
                     None,
                     Some(MajorTicket::Archive(user)),
                 );
@@ -3148,23 +3511,18 @@ impl<S: LiveStore> LiveRoom<S> {
             return;
         }
         if let Some(holder) = self.ticket_candidates(None, None).first().copied() {
-            self.issue_ticket(
-                TicketPurpose::Write,
-                holder,
-                at,
-                base,
-                None,
-                None,
-                Some(major),
-            );
+            self.issue_ticket(TicketPurpose::Write, holder, at, base, None, Some(major));
         }
     }
 
     /// The file was replaced from outside by `outside` (S4): changes wait, and the room's last
     /// state is asked for once more, to be kept below it.
     fn enter_recovery(&mut self, outside: String) {
-        self.recovery = Some(outside);
-        self.forensic_due = None;
+        self.recovery = Some(Recovery {
+            head: outside.clone(),
+            outside,
+        });
+        self.dispute = None;
         self.cancel_tickets(|_| true, false);
     }
 
@@ -3180,8 +3538,7 @@ impl<S: LiveStore> LiveRoom<S> {
         self.unverified_checkpoints.clear();
         self.checkpoint_writers.clear();
         self.not_asked.clear();
-        self.forensic_asked.clear();
-        self.forensic_due = None;
+        self.dispute = None;
         self.pending_reconcile = None;
         self.cancel_tickets(|_| true, false);
         self.entries.retain(|entry| entry.seq > at);
@@ -3286,6 +3643,11 @@ impl<S: LiveStore> LiveRoom<S> {
             .fold(0_u64, u64::saturating_add);
         self.warned = self.at_warning();
         self.urgent_asked = false;
+        if self.over_limit
+            && !beyond_limits(self.timing.limits, self.unsaved_entries, self.unsaved_bytes)
+        {
+            self.over_limit = false;
+        }
         if self.paused && !self.at_hard_limit() {
             self.paused = false;
             if !self.hold_announced {
@@ -4059,15 +4421,21 @@ fn major_point(major: Option<MajorTicket>) -> Option<(&'static str, UserId)> {
         MajorTicket::After(person) => {
             Some((major_reason_name(MajorReason::ReturningClientAfter), person))
         }
-        MajorTicket::Outside | MajorTicket::Archive(_) => None,
+        MajorTicket::Outside | MajorTicket::Archive(_) | MajorTicket::DisputedCopy(_) => None,
     }
 }
 
-/// Whether `info` holds the bytes of the live checkpoint `live` (hash `sha256`) stored again:
-/// a forensic restore or a major mark, which is not an outside change.
-fn restores(info: &RevisionInfo, live: &str, sha256: [u8; 32]) -> bool {
-    info.fields.get("restores").and_then(Value::as_str) == Some(live)
-        && info.blob.is_some_and(|blob| blob.sha256 == sha256)
+/// Whether a kept log of `entries` and `bytes` is beyond what was stored under `limits`. Paused
+/// traffic is allowed for: cancel records (at most one per change) may take the log past the
+/// hard limits by one record per change allowed.
+fn beyond_limits(limits: crate::config::LiveLimits, entries: u64, bytes: u64) -> bool {
+    entries > limits.hard_entries.saturating_mul(2)
+        || bytes
+            > limits.hard_bytes.saturating_add(
+                limits
+                    .hard_entries
+                    .saturating_mul(records::LIVE_CANCEL_BYTES),
+            )
 }
 
 fn millis(at: OffsetDateTime) -> Result<i64, DbError> {
@@ -4106,6 +4474,7 @@ fn reason_name(reason: RefusedReason) -> &'static str {
         RefusedReason::BaseAhead => "base_ahead",
         RefusedReason::OutOfOrder => "out_of_order",
         RefusedReason::LogPaused => "log_paused",
+        RefusedReason::Held => "held",
         RefusedReason::Unknown => "unknown",
     }
 }
@@ -6228,7 +6597,7 @@ mod tests {
                 format: FORMAT.to_owned(),
                 resume: None,
                 seen: None,
-                can_checkpoint: true,
+                can_checkpoint: false,
                 build: LiveBuild::Browser,
                 returning_through: None,
                 tx,
@@ -6840,77 +7209,6 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn second_hash_mismatch_keeps_both_files_and_log() {
-        let doc = DocId(id(100));
-        let (events, mut emitted) = EventSink::channel();
-        let (mut room, store, mut ann, mut bob, revision, verify) =
-            written_and_ticketed(events, 9).await;
-        let _ = emitted_kinds(&mut emitted, "");
-
-        assert_eq!(
-            hash(&mut room, UserId(id(12)), verify, Seq(1), 8).await,
-            LiveCheckpointReply::Accepted
-        );
-        let loaded = crate::live_store::LiveStore::load_live(&store, doc)
-            .await
-            .unwrap();
-        assert_eq!(
-            loaded.verified_through,
-            Seq(0),
-            "a mismatch verifies nothing"
-        );
-        assert!(
-            loaded.unverified_checkpoints.is_empty(),
-            "the disputed checkpoint is set aside, never a base"
-        );
-        assert_eq!(loaded.entries.len(), 1, "the log is kept");
-        assert_eq!(
-            emitted_kinds(&mut emitted, "live.checkpoint"),
-            [(
-                "live.checkpoint_mismatch",
-                json!({ "revision": revision, "through": 1 })
-            )]
-        );
-
-        // The verifier writes the freed position as an ordinary checkpoint.
-        let (write, purpose, at, base, major) = ticket_major(drain(&mut bob.rx)).unwrap();
-        assert_eq!(
-            (purpose, at, base.as_deref(), major),
-            (TicketPurpose::Write, Seq(1), Some(revision.as_str()), None)
-        );
-        assert!(checkpoint_ticket(drain(&mut ann.rx)).is_none());
-        let LiveCheckpointReply::Saved { revision: kept } =
-            upload_on(&mut room, UserId(id(12)), write, Seq(1), Some(&revision), 8).await
-        else {
-            panic!("the verifier's bytes are stored");
-        };
-        assert_eq!(
-            store.revisions(doc),
-            [(revision.clone(), [9; 32]), (kept.clone(), [8; 32])],
-            "both files stay in the history"
-        );
-        let loaded = crate::live_store::LiveStore::load_live(&store, doc)
-            .await
-            .unwrap();
-        assert_eq!(loaded.unverified_checkpoints.len(), 1);
-        assert_eq!(loaded.unverified_checkpoints[0].revision, kept);
-
-        // The room continues from the log.
-        entry(&mut room, &ann, 2, 1, FORMAT, "two".into())
-            .await
-            .unwrap();
-        tokio::time::advance(Duration::from_secs(15)).await;
-        room.expire_due().await.unwrap();
-        let mut asked = drain(&mut ann.rx);
-        asked.extend(drain(&mut bob.rx));
-        let write = tickets_in(asked)
-            .into_iter()
-            .find(|(_, purpose, _, _, _)| *purpose == TicketPurpose::Write);
-        let (_, _, at, base, _) = write.unwrap();
-        assert_eq!((at, base), (Seq(2), Some(kept)));
-    }
-
-    #[tokio::test(start_paused = true)]
     async fn restart_after_a_major_mark_keeps_checkpointing() {
         let doc = DocId(id(100));
         let store = MemStore::new();
@@ -6933,7 +7231,7 @@ mod tests {
             participant: ann.participant,
         };
         expire_one(&mut room, &bob, 1).await;
-        let _ = join_return(
+        let returned = join_return(
             &mut room,
             3,
             1,
@@ -6943,9 +7241,15 @@ mod tests {
             Some(LocalNo(2)),
         )
         .await;
+        room.finish_writes().await.unwrap();
         let marked = crate::live_store::LiveStore::current_revision(&store, doc)
             .await
             .unwrap()
+            .unwrap();
+        // Unsaved work after the mark: were the mark taken for an outside file, the restart
+        // would keep this work below it instead of carrying on.
+        entry(&mut room, &returned, 2, 1, FORMAT, "late".into())
+            .await
             .unwrap();
         drop(room);
 
@@ -6953,19 +7257,25 @@ mod tests {
             .await
             .unwrap();
         let mut ann = join_capable(&mut room, 5, 1, "editor", LiveBuild::Browser).await;
-        entry(&mut room, &ann, 3, 1, FORMAT, "two".into())
+        assert!(
+            room.recovery.is_none(),
+            "the room's own mark is no outside change"
+        );
+        entry(&mut room, &ann, 3, 2, FORMAT, "two".into())
             .await
             .unwrap();
         tokio::time::advance(Duration::from_secs(15)).await;
         room.expire_due().await.unwrap();
-        let (ticket, purpose, at, base, _) = ticket_major(drain(&mut ann.rx)).unwrap();
+        let mut asked = ann.after_join.clone();
+        asked.extend(drain(&mut ann.rx));
+        let (ticket, purpose, at, base, major) = ticket_major(asked).unwrap();
         assert_eq!(
-            (purpose, at, base.as_deref()),
-            (TicketPurpose::Write, Seq(2), Some(marked.as_str())),
+            (purpose, at, base.as_deref(), major),
+            (TicketPurpose::Write, Seq(3), Some(marked.as_str()), None),
             "the same bytes stored again are the base, not an outside change"
         );
         assert!(matches!(
-            upload_on(&mut room, UserId(id(11)), ticket, Seq(2), Some(&marked), 7).await,
+            upload_on(&mut room, UserId(id(11)), ticket, Seq(3), Some(&marked), 7).await,
             LiveCheckpointReply::Saved { .. }
         ));
     }
@@ -7921,7 +8231,7 @@ mod tests {
         entry(&mut room, &bob, 1, 1, FORMAT, "two".into())
             .await
             .unwrap();
-        assert_eq!(refusal(&drain(&mut bob.rx)), Some(RefusedReason::LogPaused));
+        assert_eq!(refusal(&drain(&mut bob.rx)), Some(RefusedReason::Held));
         assert_eq!(store.entry_count(), 1);
 
         let holder = if ticket_holder_is(&room, recovery, 1) {
@@ -8203,7 +8513,7 @@ mod tests {
         entry(&mut room, &bob, 2, 2, FORMAT, "bob two".into())
             .await
             .unwrap();
-        assert_eq!(refusal(&drain(&mut bob.rx)), Some(RefusedReason::LogPaused));
+        assert_eq!(refusal(&drain(&mut bob.rx)), Some(RefusedReason::Held));
         let before = upload_ticket(&mut room, &ann, ticket, Seq(2), None, 2).await;
         let fields = store.revision_fields(doc, &before);
         assert_eq!(field(&fields, "major"), Some(&json!(true)));
@@ -8381,8 +8691,13 @@ mod tests {
             Some(LocalNo(2)),
         )
         .await;
+        let mut ann = ann;
+        // The mark runs off the room task; changes wait for it.
+        assert!(room.writing());
+        room.finish_writes().await.unwrap();
         let mut frames = ann.initial.clone();
         frames.extend(ann.after_join.clone());
+        frames.extend(drain(&mut ann.rx));
         assert_eq!(return_ready(&frames), Some(LocalNo(2)));
         assert!(
             frames.iter().all(|message| !matches!(
@@ -8513,63 +8828,6 @@ mod tests {
 
     fn resumed(messages: &[LiveServerMsg]) -> bool {
         messages.contains(&LiveServerMsg::ChangesResumed)
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn disputed_checkpoint_at_the_hard_limit_resumes_changes() {
-        let doc = DocId(id(100));
-        let (events, mut emitted) = EventSink::channel();
-        let (mut room, store, mut ann, mut bob, ticket) = paused_room(events).await;
-        // Ann's checkpoint at the limit; Bob's hash disagrees.
-        let LiveCheckpointReply::Saved { revision } =
-            upload(&mut room, UserId(id(11)), ticket, Seq(3), 9).await
-        else {
-            panic!("stored");
-        };
-        let (verify, purpose, at) = checkpoint_ticket(drain(&mut bob.rx)).unwrap();
-        assert_eq!((purpose, at), (TicketPurpose::Verify, Seq(3)));
-        assert_eq!(
-            hash(&mut room, UserId(id(12)), verify, Seq(3), 8).await,
-            LiveCheckpointReply::Accepted
-        );
-        let loaded = crate::live_store::LiveStore::load_live(&store, doc)
-            .await
-            .unwrap();
-        assert!(
-            loaded.unverified_checkpoints.is_empty(),
-            "the disputed checkpoint is set aside"
-        );
-        assert!(
-            store
-                .revisions(doc)
-                .iter()
-                .any(|(kept, _)| *kept == revision)
-        );
-
-        // Its position is free: another writer is asked for it.
-        let (write, purpose, at, _, _) = ticket_major(drain(&mut bob.rx)).unwrap();
-        assert_eq!((purpose, at), (TicketPurpose::Write, Seq(3)));
-        assert!(checkpoint_ticket(drain(&mut ann.rx)).is_none());
-        let base = crate::live_store::LiveStore::current_revision(&store, doc)
-            .await
-            .unwrap();
-        assert!(matches!(
-            upload_on(&mut room, UserId(id(12)), write, Seq(3), base.as_deref(), 8).await,
-            LiveCheckpointReply::Saved { .. }
-        ));
-        // Ann, whose checkpoint was disputed, is not asked to verify Bob's: with no other
-        // capable editor, it is accepted as a sole-editor checkpoint and changes resume.
-        assert!(checkpoint_ticket(drain(&mut ann.rx)).is_none());
-        assert!(!room.paused);
-        assert!(resumed(&drain(&mut bob.rx)));
-        assert!(
-            emitted_kinds(&mut emitted, "live.checkpoint_sole_editor").len() == 1,
-            "recorded"
-        );
-        entry(&mut room, &ann, 4, 3, FORMAT, "four".into())
-            .await
-            .unwrap();
-        assert_eq!(entries(drain(&mut ann.rx)).len(), 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -8735,7 +8993,7 @@ mod tests {
                 format: FORMAT.to_owned(),
                 resume: None,
                 seen: None,
-                can_checkpoint: true,
+                can_checkpoint: false,
                 build: LiveBuild::Browser,
                 returning_through: None,
                 tx,
@@ -8796,7 +9054,8 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(store.describe_calls(), super::RECONCILE_TRIES as usize);
+        // One more description checks the revision before it becomes the base.
+        assert_eq!(store.describe_calls(), super::RECONCILE_TRIES as usize + 1);
         assert_eq!(
             write,
             Some((
@@ -8873,5 +9132,564 @@ mod tests {
         });
         room.recount();
         assert_eq!(room.unsaved_bytes, records::LIVE_CANCEL_BYTES);
+    }
+
+    // ---- Task 11 review fixes ----------------------------------------------------------------
+
+    /// Ann and Bob edit; Ann's checkpoint at 1 is verified by Bob; then Ann's change 2 is
+    /// checkpointed by Bob (written `sha`) and Ann holds the verify ticket.
+    async fn verified_then_written(
+        events: EventSink,
+        sha: u8,
+    ) -> (
+        LiveRoom<MemStore>,
+        MemStore,
+        Joined,
+        Joined,
+        String,
+        String,
+        Uuid,
+    ) {
+        let (mut room, store, mut ann, mut bob, first, verify) =
+            written_and_ticketed(events, 9).await;
+        assert_eq!(
+            hash(&mut room, UserId(id(12)), verify, Seq(1), 9).await,
+            LiveCheckpointReply::Accepted
+        );
+        assert_eq!(room.verified_through, Seq(1));
+        entry(&mut room, &ann, 2, 1, FORMAT, "two".into())
+            .await
+            .unwrap();
+        tokio::time::advance(Duration::from_secs(15)).await;
+        room.expire_due().await.unwrap();
+        let mut asked = drain(&mut ann.rx);
+        asked.extend(drain(&mut bob.rx));
+        let (write, _, at, base, _) = tickets_in(asked)
+            .into_iter()
+            .find(|(_, purpose, _, _, _)| *purpose == TicketPurpose::Write)
+            .unwrap();
+        assert!(ticket_holder_is(&room, write, bob.participant.0));
+        let LiveCheckpointReply::Saved { revision: second } =
+            upload_on(&mut room, UserId(id(12)), write, at, base.as_deref(), sha).await
+        else {
+            panic!("stored");
+        };
+        let (verify, purpose, at) = checkpoint_ticket(drain(&mut ann.rx)).unwrap();
+        assert_eq!((purpose, at), (TicketPurpose::Verify, Seq(2)));
+        let _ = drain(&mut bob.rx);
+        (room, store, ann, bob, first, second, verify)
+    }
+
+    fn unavailable(messages: &[LiveServerMsg]) -> bool {
+        messages.contains(&LiveServerMsg::Unavailable {
+            reason: protocol::live::UnavailableReason::CheckpointDispute,
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn second_hash_mismatch_keeps_both_files_and_log() {
+        let doc = DocId(id(100));
+        let (events, mut emitted) = EventSink::channel();
+        let (mut room, store, mut ann, mut bob, first, second, verify) =
+            verified_then_written(events, 5).await;
+        let _ = emitted_kinds(&mut emitted, "");
+
+        // Ann's own bytes disagree with Bob's checkpoint.
+        assert_eq!(
+            hash(&mut room, UserId(id(11)), verify, Seq(2), 6).await,
+            LiveCheckpointReply::Accepted
+        );
+        let (copy_ticket, purpose, at, base, major) = ticket_major(drain(&mut ann.rx)).unwrap();
+        assert_eq!(
+            (purpose, at, base.as_deref(), major),
+            (
+                TicketPurpose::Write,
+                Seq(2),
+                Some(second.as_str()),
+                Some(MajorReason::DisputedCopy)
+            )
+        );
+        // Changes wait while the dispute is settled.
+        entry(&mut room, &bob, 1, 2, FORMAT, "bob".into())
+            .await
+            .unwrap();
+        assert_eq!(refusal(&drain(&mut bob.rx)), Some(RefusedReason::Held));
+
+        let LiveCheckpointReply::Saved { revision: kept } = upload_on(
+            &mut room,
+            UserId(id(11)),
+            copy_ticket,
+            Seq(2),
+            Some(&second),
+            6,
+        )
+        .await
+        else {
+            panic!("the verifier's copy is kept");
+        };
+        room.settle().await.unwrap();
+        let revisions = store.revisions(doc);
+        let tail = revisions[revisions.len() - 3..].to_vec();
+        assert_eq!(tail[0], (kept.clone(), [6; 32]), "the verifier's copy");
+        assert_eq!(tail[1].1, [5; 32], "the writer's copy, again");
+        assert_eq!(tail[2].1, [9; 32], "the last verified base is current");
+        for (revision, _) in &tail[..2] {
+            assert_eq!(
+                store.revision_fields(doc, revision).get("major_reason"),
+                Some(&json!("disputed_copy"))
+            );
+        }
+        let loaded = crate::live_store::LiveStore::load_live(&store, doc)
+            .await
+            .unwrap();
+        assert_eq!(
+            loaded.verified_through,
+            Seq(1),
+            "neither side becomes the base"
+        );
+        assert_eq!(loaded.verified_checkpoint.unwrap().revision, first);
+        assert!(loaded.unverified_checkpoints.is_empty());
+        assert_eq!(loaded.entries.len(), 1, "the log is kept");
+        let stopped = emitted_kinds(&mut emitted, "live.checkpoint_dispute_stopped");
+        assert_eq!(stopped.len(), 1, "{stopped:?}");
+        // The live session ends: everyone is told and joins again.
+        assert!(unavailable(&drain(&mut ann.rx)));
+        assert!(unavailable(&drain(&mut bob.rx)));
+        assert!(!room.has_session());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hostile_verifier_cannot_promote_its_own_bytes() {
+        let doc = DocId(id(100));
+        let (events, mut emitted) = EventSink::channel();
+        let (mut room, store, mut ann, mut bob, ticket) = paused_room(events).await;
+        let _ = emitted_kinds(&mut emitted, "");
+        // Ann, honest, writes the urgent checkpoint at the limit.
+        assert!(matches!(
+            upload(&mut room, UserId(id(11)), ticket, Seq(3), 9).await,
+            LiveCheckpointReply::Saved { .. }
+        ));
+        let (verify, _, _) = checkpoint_ticket(drain(&mut bob.rx)).unwrap();
+        // Bob, hostile, disagrees and uploads bytes of his own.
+        assert_eq!(
+            hash(&mut room, UserId(id(12)), verify, Seq(3), 8).await,
+            LiveCheckpointReply::Accepted
+        );
+        let (copy_ticket, _, at, base, major) = ticket_major(drain(&mut bob.rx)).unwrap();
+        assert_eq!(major, Some(MajorReason::DisputedCopy));
+        let _ = upload_on(
+            &mut room,
+            UserId(id(12)),
+            copy_ticket,
+            at,
+            base.as_deref(),
+            8,
+        )
+        .await;
+        room.settle().await.unwrap();
+        assert!(
+            emitted_kinds(&mut emitted, "live.checkpoint_sole_editor").is_empty(),
+            "the disputer's bytes are never accepted"
+        );
+        let loaded = crate::live_store::LiveStore::load_live(&store, doc)
+            .await
+            .unwrap();
+        assert_eq!(loaded.verified_through, Seq(0));
+        assert!(loaded.unverified_checkpoints.is_empty());
+        let current = crate::live_store::LiveStore::current_revision(&store, doc)
+            .await
+            .unwrap()
+            .unwrap();
+        let current_sha = store
+            .revisions(doc)
+            .into_iter()
+            .find(|(revision, _)| *revision == current)
+            .unwrap()
+            .1;
+        assert_ne!(current_sha, [8; 32], "Bob's bytes are not the current file");
+        assert!(unavailable(&drain(&mut ann.rx)));
+        assert!(!room.has_session());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sole_editor_needs_nobody_else_present() {
+        let (events, mut emitted) = EventSink::channel();
+        let (mut room, _store, ann, mut bob, ticket) = paused_room(events).await;
+        assert!(matches!(
+            upload(&mut room, UserId(id(11)), ticket, Seq(3), 9).await,
+            LiveCheckpointReply::Saved { .. }
+        ));
+        assert!(checkpoint_ticket(drain(&mut bob.rx)).is_some());
+        // Bob stays connected but never answers: his verify ticket lapses.
+        for _ in 0..10 {
+            tokio::time::advance(Duration::from_secs(30)).await;
+            heartbeat(&mut room, &ann, 3).await;
+            heartbeat(&mut room, &bob, 3).await;
+            room.expire_due().await.unwrap();
+        }
+        assert!(room.paused, "a present peer is never bypassed");
+        assert!(emitted_kinds(&mut emitted, "live.checkpoint_sole_editor").is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn return_with_its_batch_already_stored_is_ready_at_once() {
+        let mut room = LiveRoom::load(
+            DocId(id(100)),
+            MemStore::new(),
+            EventSink::discard(),
+            no_ordinary_checkpoints(),
+        )
+        .await
+        .unwrap();
+        let ann = join_capable(&mut room, 1, 1, "editor", LiveBuild::Browser).await;
+        let bob = join_capable(&mut room, 2, 2, "editor", LiveBuild::Desktop).await;
+        for local in 1..=2 {
+            entry(&mut room, &ann, local, local - 1, FORMAT, "x".into())
+                .await
+                .unwrap();
+        }
+        let resume = LiveResume {
+            session: ann.session,
+            participant: ann.participant,
+        };
+        expire_one(&mut room, &bob, 2).await;
+        // Both locals were stored before the drop; the client did not hear so.
+        let ann = join_return(
+            &mut room,
+            3,
+            1,
+            UserId(id(11)),
+            Some(resume),
+            Some(Seq(0)),
+            Some(LocalNo(2)),
+        )
+        .await;
+        assert_eq!(return_ready(&ann.initial), Some(LocalNo(2)));
+        assert!(room.returns.is_empty(), "nothing waits behind it");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn returns_are_marked_at_most_once_per_person_in_ten_minutes() {
+        let store = MemStore::new();
+        let (mut room, ann, mut bob) = returned(EventSink::discard(), store.clone()).await;
+        let mut asked = ann.after_join.clone();
+        asked.extend(drain(&mut bob.rx));
+        let (ticket, _, at, _, _) = ticket_major(asked).unwrap();
+        let _ = upload_ticket(&mut room, &ann, ticket, at, None, 2).await;
+        let resume = LiveResume {
+            session: ann.session,
+            participant: ann.participant,
+        };
+        // Ann drops and returns again at once with more waiting work.
+        let seen = room.head.0;
+        expire_one(&mut room, &bob, seen).await;
+        room.finish_writes().await.unwrap();
+        let _ = drain(&mut bob.rx);
+        let again = join_return(
+            &mut room,
+            9,
+            1,
+            UserId(id(11)),
+            Some(resume),
+            Some(Seq(2)),
+            Some(LocalNo(5)),
+        )
+        .await;
+        assert_eq!(return_ready(&again.initial), Some(LocalNo(5)));
+        assert!(room.returns.is_empty());
+        assert!(
+            ticket_major(drain(&mut bob.rx)).is_none(),
+            "no new major version"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn joiners_during_a_hold_are_told_changes_wait() {
+        let (mut room, _ann, _bob) = returned(EventSink::discard(), MemStore::new()).await;
+        assert!(room.holding());
+        let cat = join_capable(&mut room, 7, 3, "editor", LiveBuild::Desktop).await;
+        assert!(paused(&cat.initial).is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn held_changes_are_not_used_up_and_go_again_after_the_hold() {
+        let doc = DocId(id(100));
+        let store = MemStore::new();
+        let (mut room, ann, mut bob) = returned(EventSink::discard(), store.clone()).await;
+        let mut asked = ann.after_join.clone();
+        asked.extend(drain(&mut bob.rx));
+        let (ticket, _, at, _, _) = ticket_major(asked).unwrap();
+        let before = store.refused_locals();
+        entry(&mut room, &bob, 2, 2, FORMAT, "held".into())
+            .await
+            .unwrap();
+        assert_eq!(refusal(&drain(&mut bob.rx)), Some(RefusedReason::Held));
+        // Sent before Bob heard: dropped quietly, to keep the order.
+        entry(&mut room, &bob, 3, 2, FORMAT, "after".into())
+            .await
+            .unwrap();
+        assert!(refusal(&drain(&mut bob.rx)).is_none());
+        assert_eq!(store.refused_locals(), before, "no number is used up");
+        let _ = upload_ticket(&mut room, &ann, ticket, at, None, 2).await;
+        assert!(resumed(&drain(&mut bob.rx)));
+        // Bob sends both again, in order; they are stored.
+        for (local, text) in [(2, "held"), (3, "after")] {
+            entry(&mut room, &bob, local, 2, FORMAT, text.into())
+                .await
+                .unwrap();
+        }
+        assert_eq!(entries(drain(&mut bob.rx)).len(), 2);
+        let _ = doc;
+    }
+
+    /// A stale write put the room into recovery; returns the room, the people, the outside
+    /// revision and the recovery ticket with its holder.
+    async fn recovering(
+        store: MemStore,
+    ) -> (
+        LiveRoom<MemStore>,
+        Joined,
+        Joined,
+        String,
+        (Uuid, String),
+        UserId,
+    ) {
+        let doc = DocId(id(100));
+        let mut room = LiveRoom::load(doc, store.clone(), EventSink::discard(), timing())
+            .await
+            .unwrap();
+        let mut ann = join_capable(&mut room, 1, 1, "editor", LiveBuild::Browser).await;
+        let mut bob = join_capable(&mut room, 2, 2, "editor", LiveBuild::Desktop).await;
+        entry(&mut room, &ann, 1, 0, FORMAT, "one".into())
+            .await
+            .unwrap();
+        tokio::time::advance(Duration::from_secs(15)).await;
+        room.expire_due().await.unwrap();
+        let mut asked = drain(&mut ann.rx);
+        asked.extend(drain(&mut bob.rx));
+        let (ticket, _, _, _, _) = ticket_major(asked).unwrap();
+        let first = upload_ticket(&mut room, &ann, ticket, Seq(1), None, 3).await;
+        let _ = drain(&mut ann.rx);
+        let (verify, _, _) = checkpoint_ticket(drain(&mut bob.rx)).unwrap();
+        assert_eq!(
+            hash(&mut room, UserId(id(12)), verify, Seq(1), 3).await,
+            LiveCheckpointReply::Accepted
+        );
+        entry(&mut room, &ann, 2, 1, FORMAT, "two".into())
+            .await
+            .unwrap();
+        tokio::time::advance(Duration::from_secs(15)).await;
+        room.expire_due().await.unwrap();
+        let mut asked = drain(&mut ann.rx);
+        asked.extend(drain(&mut bob.rx));
+        let (ticket, _, at, _, _) = tickets_in(asked)
+            .into_iter()
+            .find(|(_, purpose, _, _, _)| *purpose == TicketPurpose::Write)
+            .unwrap();
+        let outside = store.write_outside(doc, [5; 32]);
+        let holder = if ticket_holder_is(&room, ticket, 1) {
+            UserId(id(11))
+        } else {
+            UserId(id(12))
+        };
+        assert!(matches!(
+            upload_on(&mut room, holder, ticket, at, Some(&first), 9).await,
+            LiveCheckpointReply::Stale { .. }
+        ));
+        let mut asked = drain(&mut ann.rx);
+        asked.extend(drain(&mut bob.rx));
+        let (recovery, _, _, _, _) = ticket_major(asked).unwrap();
+        let holder = if ticket_holder_is(&room, recovery, 1) {
+            UserId(id(11))
+        } else {
+            UserId(id(12))
+        };
+        (room, ann, bob, outside, (recovery, first), holder)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn restart_after_a_half_done_outside_write_keeps_the_outside_file() {
+        let doc = DocId(id(100));
+        let store = MemStore::new();
+        let (mut room, _ann, _bob, outside, (recovery, first), holder) =
+            recovering(store.clone()).await;
+        store.fail_major_restore();
+        assert_eq!(
+            upload_on(&mut room, holder, recovery, Seq(2), Some(&first), 6).await,
+            LiveCheckpointReply::Failed
+        );
+        let kept = crate::live_store::LiveStore::current_revision(&store, doc)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(room);
+
+        let mut room = LiveRoom::load(doc, store.clone(), EventSink::discard(), timing())
+            .await
+            .unwrap();
+        let recovery = room.recovery.clone().expect("still recovering");
+        assert_eq!((recovery.head, recovery.outside), (kept, outside.clone()));
+        let ann = join_capable(&mut room, 5, 1, "editor", LiveBuild::Browser).await;
+        let (ticket, _, at, base, major) = ticket_major(ann.after_join.clone()).unwrap();
+        assert_eq!(major, Some(MajorReason::OutsideReplacement));
+        assert!(matches!(
+            upload_on(&mut room, UserId(id(11)), ticket, at, base.as_deref(), 7).await,
+            LiveCheckpointReply::Saved { .. }
+        ));
+        let (current, sha) = store.revisions(doc).last().unwrap().clone();
+        assert_eq!(
+            sha, [5; 32],
+            "the outside file is current again, not the room's state"
+        );
+        assert_eq!(
+            store.revision_fields(doc, &current).get("restores"),
+            Some(&json!(outside))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn restart_after_a_mark_on_an_outside_base_is_not_an_outside_change() {
+        let doc = DocId(id(100));
+        let store = MemStore::new();
+        let (mut room, ann, _bob, _outside, (recovery, first), holder) =
+            recovering(store.clone()).await;
+        assert!(matches!(
+            upload_on(&mut room, holder, recovery, Seq(2), Some(&first), 6).await,
+            LiveCheckpointReply::Saved { .. }
+        ));
+        let adopted = crate::live_store::LiveStore::current_revision(&store, doc)
+            .await
+            .unwrap()
+            .unwrap();
+        // A major mark of the adopted base (as a return onto a stored head makes).
+        let marked = crate::live_store::LiveStore::write_live_major(
+            &store,
+            doc,
+            &crate::live_store::MajorWrite {
+                kind: crate::live_store::MajorKind::Mark,
+                reason: "returning_client_before",
+                person: UserId(id(11)),
+                current: &adopted,
+                restore: None,
+                disputed: None,
+                blob: None,
+                authors: &[],
+                at: Seq(2),
+                session: room.session.as_ref().unwrap().id.0,
+                created_at: time::OffsetDateTime::UNIX_EPOCH,
+            },
+        )
+        .await
+        .unwrap()
+        .current;
+        // Unsaved work after it.
+        room.checkpoint_base = Some(marked.clone());
+        entry(&mut room, &ann, 3, 2, FORMAT, "three".into())
+            .await
+            .unwrap();
+        drop(room);
+
+        let room = LiveRoom::load(doc, store.clone(), EventSink::discard(), timing())
+            .await
+            .unwrap();
+        assert!(
+            room.recovery.is_none(),
+            "the room's own mark is not an outside file"
+        );
+        assert_eq!(room.checkpoint_base.as_deref(), Some(marked.as_str()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn restart_after_an_unrecorded_checkpoint_keeps_the_log() {
+        let doc = DocId(id(100));
+        let store = MemStore::new();
+        let mut room = LiveRoom::load(doc, store.clone(), EventSink::discard(), timing())
+            .await
+            .unwrap();
+        let mut ann = join_capable(&mut room, 1, 1, "editor", LiveBuild::Browser).await;
+        entry(&mut room, &ann, 1, 0, FORMAT, "one".into())
+            .await
+            .unwrap();
+        tokio::time::advance(Duration::from_secs(15)).await;
+        room.expire_due().await.unwrap();
+        let ticket = checkpoint_ticket(drain(&mut ann.rx)).unwrap().0;
+        assert!(matches!(
+            upload(&mut room, UserId(id(11)), ticket, Seq(1), 9).await,
+            LiveCheckpointReply::Saved { .. }
+        ));
+        entry(&mut room, &ann, 2, 1, FORMAT, "two".into())
+            .await
+            .unwrap();
+        // Git committed a checkpoint at 2 whose record never reached the database.
+        let unrecorded = store.commit_unrecorded(doc, Seq(2), [4; 32]);
+        entry(&mut room, &ann, 3, 2, FORMAT, "three".into())
+            .await
+            .unwrap();
+        drop(room);
+
+        let room = LiveRoom::load(doc, store.clone(), EventSink::discard(), timing())
+            .await
+            .unwrap();
+        assert!(
+            room.recovery.is_none(),
+            "the room's own commit is not an outside file"
+        );
+        assert_eq!(room.checkpoint_base.as_deref(), Some(unrecorded.as_str()));
+        assert_eq!(room.entries.len(), 3, "no entry leaves the log");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn over_limit_room_lets_a_capable_editor_bring_it_back_under() {
+        let doc = DocId(id(100));
+        let store = MemStore::new();
+        {
+            let mut room = LiveRoom::load(doc, store.clone(), EventSink::discard(), timing())
+                .await
+                .unwrap();
+            let ann = join_capable(&mut room, 1, 1, "editor", LiveBuild::Browser).await;
+            for local in 1..=5 {
+                entry(&mut room, &ann, local, local - 1, FORMAT, "x".into())
+                    .await
+                    .unwrap();
+            }
+        }
+        let mut room = LiveRoom::load(
+            doc,
+            store.clone(),
+            EventSink::discard(),
+            limited(1, 2, u64::MAX / 2, u64::MAX / 2),
+        )
+        .await
+        .unwrap();
+        assert!(room.over_limit);
+        let ann = join_capable(&mut room, 5, 1, "editor", LiveBuild::Browser).await;
+        assert_eq!(
+            entries(ann.initial.clone()).len(),
+            5,
+            "the log, for a checkpoint"
+        );
+        let (ticket, purpose, at, base, _) = ticket_major(ann.after_join.clone()).unwrap();
+        assert_eq!((purpose, at), (TicketPurpose::Write, Seq(5)));
+        assert!(matches!(
+            upload_on(&mut room, UserId(id(11)), ticket, at, base.as_deref(), 9).await,
+            LiveCheckpointReply::Saved { .. }
+        ));
+        assert!(!room.over_limit, "back under: people may join again");
+        let bob = join_as(&mut room, 6, 2, 12, "editor", FORMAT, None, None).await;
+        assert_eq!(bob.participant, ParticipantNo(3));
+    }
+
+    #[test]
+    fn paused_cancel_records_fit_under_the_load_limit() {
+        let limits = crate::config::LiveLimits {
+            warn_entries: 1,
+            hard_entries: 2,
+            warn_bytes: 5,
+            hard_bytes: 10,
+        };
+        let allowance = 10 + 2 * records::LIVE_CANCEL_BYTES;
+        assert!(!super::beyond_limits(limits, 4, allowance));
+        assert!(super::beyond_limits(limits, 4, allowance + 1));
+        assert!(super::beyond_limits(limits, 5, 0));
     }
 }

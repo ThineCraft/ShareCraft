@@ -540,6 +540,20 @@ impl<E: LiveEditor> LiveClient<E> {
                     )));
                 }
             },
+            LiveServerMsg::Refused {
+                local,
+                reason: RefusedReason::Held,
+            } => {
+                // Not refused for good: this change and every later one wait, still shown, and
+                // go again once changes resume.
+                for pending in self
+                    .pending
+                    .iter_mut()
+                    .filter(|pending| pending.local >= local)
+                {
+                    pending.sent = false;
+                }
+            }
             LiveServerMsg::Refused { local, reason } => {
                 let first = self.pending.front().map(|pending| pending.local);
                 // A refusal of a change the client already took off its queue (for example one
@@ -599,7 +613,10 @@ impl<E: LiveEditor> LiveClient<E> {
             LiveServerMsg::ChangesPaused { entries, bytes } => {
                 step.events.push(Event::ChangesPaused { entries, bytes });
             }
-            LiveServerMsg::ChangesResumed => step.events.push(Event::ChangesResumed),
+            LiveServerMsg::ChangesResumed => {
+                step.events.push(Event::ChangesResumed);
+                self.send_unsent(now_ms, &mut step.send);
+            }
             LiveServerMsg::ReturnReady { through } => {
                 if self.discarded_return_through == Some(through) {
                     self.discarded_return_through = None;

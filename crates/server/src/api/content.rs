@@ -828,6 +828,8 @@ pub(crate) async fn live_checkpoint(
     if !access.can_edit() {
         return Err(access.refusal().into());
     }
+    // A library connected to a source is read-only: no checkpoint is stored into it.
+    super::nodes::require_not_connected(state.db(), doc.into()).await?;
     let query = query_of(query)?;
     let base = match query.base {
         Some(text) => Some(RevisionId::from_str(&text).map_err(|_| ApiError::BadRequest)?),
@@ -934,6 +936,8 @@ pub(crate) async fn live_checkpoint_hash(
     if !access.can_edit() {
         return Err(access.refusal().into());
     }
+    // A hash can lead to major versions being stored: refused in a connected library.
+    super::nodes::require_not_connected(state.db(), doc.into()).await?;
     let sha256 = parse_sha256(&body.sha256).ok_or(ApiError::BadRequest)?;
     let link = state.rooms().live_link(doc).ok_or(ApiError::Forbidden)?;
     let (reply, answer) = oneshot::channel();

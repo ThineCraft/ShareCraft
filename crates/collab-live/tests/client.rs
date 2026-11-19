@@ -2474,3 +2474,34 @@ fn unavailable_join_is_recoverable() {
     assert_eq!(client.pending(), 1);
     assert_eq!(client.connected(50).len(), 1, "it can join again");
 }
+
+/// A change refused because changes wait for a major version stays waiting, shown, and is sent
+/// again, in order, once changes resume.
+#[test]
+fn held_refusal_keeps_the_change_and_resends_it_after_the_hold() {
+    let mut doc = StandIn::new("a");
+    let mut client = live(&mut doc, 1);
+    let first = client.new_ids(1).unwrap();
+    let second = client.new_ids(1).unwrap();
+    client
+        .local(&mut doc, insert(first, "one"), Mode::ShowAtOnce, 10)
+        .unwrap();
+    client
+        .local(&mut doc, insert(second, "two"), Mode::ShowAtOnce, 10)
+        .unwrap();
+    for local in [1, 2] {
+        let held = json!({ "type": "refused", "local": local, "reason": "held" }).to_string();
+        let step = client.receive(&mut doc, &held, 20).unwrap();
+        assert!(step.send.is_empty());
+    }
+    assert_eq!(client.pending(), 2, "nothing is dropped");
+    assert_eq!(doc.lines(), vec!["one", "two"]);
+    let resumed = json!({ "type": "changes_resumed" }).to_string();
+    let step = client.receive(&mut doc, &resumed, 30).unwrap();
+    let resent = sent(&step.send);
+    assert_eq!(resent.len(), 2);
+    assert_eq!(
+        (resent[0]["local"].clone(), resent[1]["local"].clone()),
+        (json!(1), json!(2))
+    );
+}

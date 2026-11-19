@@ -29,9 +29,10 @@ create table live_checkpoints (
   check (disputed_at is null or verified_at is null),
   primary key (document_id, revision)
 );
--- One standing checkpoint per position; disputed ones step aside.
+-- One standing ordinary checkpoint per position; disputed ones step aside, and major-version
+-- rows (history people restore from) may share a position with one.
 create unique index live_checkpoints_position on live_checkpoints (document_id, through)
-  where disputed_at is null;
+  where disputed_at is null and major_reason is null;
 create index live_checkpoints_unverified on live_checkpoints (document_id, through)
   where verified_at is null and disputed_at is null;
 

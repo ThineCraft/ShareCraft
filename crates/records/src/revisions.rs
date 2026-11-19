@@ -170,8 +170,7 @@ pub(crate) async fn recorded_parent(
 impl Db {
     /// Records `r` as the revision after `parent`, the document's previous one (`None` for its
     /// first). Returns `false`, changing nothing, if `parent` is not the latest revision
-    /// recorded for the document; returns `true`, changing nothing, when `r` is recorded
-    /// already as the latest revision after `parent`. Creates the document's record, with no creator and no
+    /// recorded for the document. Creates the document's record, with no creator and no
     /// grants, if it has none; then sets its revision, time, name and fields from `r`.
     pub async fn append_revision(
         &self,
@@ -181,15 +180,6 @@ impl Db {
         let mut tx = self.pool().begin().await?;
         lock_document(&mut tx, r.doc, &r.name).await?;
         let (head, position) = recorded_head(&mut tx, r.doc).await?;
-        if head.as_deref() == Some(r.revision.as_str())
-            && recorded_parent(&mut tx, r.doc, &r.revision)
-                .await?
-                .as_deref()
-                == parent
-        {
-            // Recorded already, by a live checkpoint that could not wait for this projection.
-            return Ok(true);
-        }
         if head.as_deref() != parent {
             // Dropping the transaction rolls back the record it may have created.
             return Ok(false);
@@ -201,6 +191,20 @@ impl Db {
         set_current(&mut tx, r).await?;
         tx.commit().await?;
         Ok(true)
+    }
+
+    /// Whether `revision` is `doc`'s latest recorded revision, recorded after `parent`: a live
+    /// checkpoint records its own row without waiting for the revision projection.
+    pub async fn is_recorded_head(
+        &self,
+        doc: DocId,
+        revision: &str,
+        parent: Option<&str>,
+    ) -> Result<bool, DbError> {
+        let mut conn = self.pool().acquire().await?;
+        let (head, _) = recorded_head(&mut conn, doc).await?;
+        Ok(head.as_deref() == Some(revision)
+            && recorded_parent(&mut conn, doc, revision).await?.as_deref() == parent)
     }
 
     /// Replaces `doc`'s recorded revisions with `history`, oldest first, in one transaction.
