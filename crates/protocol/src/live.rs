@@ -593,8 +593,9 @@ impl std::fmt::Debug for Redacted {
     }
 }
 
-/// Someone holding a place in the session.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Someone holding a place in the session. The `Debug` form hides the account and shows the
+/// name's length only.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LivePerson {
     /// Their place.
     pub participant: ParticipantNo,
@@ -609,6 +610,23 @@ pub struct LivePerson {
     /// Whether their client is connected now; a place outlives a dropped connection until it
     /// expires.
     pub connected: bool,
+}
+
+impl std::fmt::Debug for LivePerson {
+    /// Shows the place and rights; the account as `<hidden>` and the name as its length.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LivePerson")
+            .field("participant", &self.participant)
+            .field("client", &self.client)
+            .field("user", &format_args!("<hidden>"))
+            .field(
+                "name",
+                &format_args!("<{} chars>", self.name.chars().count()),
+            )
+            .field("can_edit", &self.can_edit)
+            .field("connected", &self.connected)
+            .finish()
+    }
 }
 
 /// Why a change was refused.
@@ -1194,6 +1212,158 @@ mod tests {
         );
         assert!(!shown.contains(secret), "{shown}");
         assert!(shown.contains("Presence"), "{shown}");
+    }
+
+    const SENTINEL_NAME: &str = "Sentinel Name 7";
+    const SENTINEL_PAYLOAD: &str = "sentinel-payload-7";
+
+    fn sentinel_person() -> LivePerson {
+        LivePerson {
+            participant: ParticipantNo(3),
+            client: ClientId(Uuid::from_u128(5)),
+            user: UserId(Uuid::from_u128(0x5e47_1ae1)),
+            name: SENTINEL_NAME.into(),
+            can_edit: true,
+            connected: false,
+        }
+    }
+
+    #[test]
+    fn live_person_debug_hides_the_name_and_account() {
+        let person = sentinel_person();
+        let shown = format!("{person:?}");
+        assert!(!shown.contains(SENTINEL_NAME), "{shown}");
+        assert!(!shown.contains("5e471ae1"), "{shown}");
+        assert!(shown.contains("<hidden>"), "{shown}");
+        assert!(shown.contains("<15 chars>"), "{shown}");
+        assert!(shown.contains("participant"), "{shown}");
+        assert!(shown.contains("can_edit"), "{shown}");
+        assert!(shown.contains("connected"), "{shown}");
+        // Equality and the wire form are unchanged.
+        assert_eq!(person.clone(), person);
+        let json = serde_json::to_string(&person).unwrap();
+        assert!(json.contains(SENTINEL_NAME));
+        assert_eq!(serde_json::from_str::<LivePerson>(&json).unwrap(), person);
+    }
+
+    #[test]
+    fn debug_output_never_contains_names_or_payloads() {
+        let client = vec![
+            LiveClientMsg::LiveJoin {
+                client: ClientId(Uuid::nil()),
+                protocol: LIVE_PROTOCOL,
+                format: "gridcraft/1".into(),
+                resume: None,
+                seen: None,
+                can_checkpoint: true,
+                build: LiveBuild::Browser,
+                returning_through: None,
+            },
+            LiveClientMsg::Entry {
+                local: LocalNo(1),
+                seen: Seq(0),
+                format: "gridcraft/1".into(),
+                payload: SENTINEL_PAYLOAD.into(),
+            },
+            LiveClientMsg::Heartbeat { seen: Seq(3) },
+            LiveClientMsg::Report { seq: Seq(4) },
+            LiveClientMsg::Fingerprint {
+                at: Seq(4),
+                entered: SENTINEL_PAYLOAD.into(),
+            },
+            LiveClientMsg::CheckpointReady {
+                ticket: Uuid::from_u128(4),
+                at: Seq(4),
+            },
+            LiveClientMsg::CheckpointFailed {
+                ticket: Uuid::from_u128(4),
+            },
+            LiveClientMsg::Presence {
+                payload: SENTINEL_PAYLOAD.into(),
+            },
+            LiveClientMsg::Resync,
+            LiveClientMsg::Leave,
+        ];
+        let server = vec![
+            LiveServerMsg::LiveJoined {
+                session: LiveSessionId(Uuid::from_u128(3)),
+                participant: ParticipantNo(1),
+                place: Place::New,
+                can_edit: true,
+                heartbeat_ms: HEARTBEAT_MS,
+                people: vec![sentinel_person()],
+            },
+            LiveServerMsg::Catchup {
+                base: Seq(0),
+                revision: None,
+                from: Seq(0),
+                head: Seq(2),
+            },
+            LiveServerMsg::Entry {
+                entry: change(SENTINEL_PAYLOAD),
+            },
+            LiveServerMsg::Refused {
+                local: LocalNo(3),
+                reason: RefusedReason::TooLarge,
+            },
+            LiveServerMsg::CannotOpen { seq: Seq(4) },
+            LiveServerMsg::People {
+                people: vec![sentinel_person(), sentinel_person()],
+            },
+            LiveServerMsg::Access { can_edit: false },
+            LiveServerMsg::CheckpointTicket {
+                ticket: Uuid::from_u128(4),
+                purpose: TicketPurpose::Write,
+                at: Seq(4),
+                base: None,
+                major: None,
+            },
+            LiveServerMsg::ChangesPaused {
+                entries: 1,
+                bytes: 2,
+            },
+            LiveServerMsg::ChangesResumed,
+            LiveServerMsg::ReturnReady {
+                through: LocalNo(8),
+            },
+            LiveServerMsg::ArchiveReturn { current: None },
+            LiveServerMsg::Presence {
+                participant: ParticipantNo(2),
+                payload: Some(SENTINEL_PAYLOAD.into()),
+            },
+            LiveServerMsg::Returning {
+                participant: ParticipantNo(3),
+            },
+            LiveServerMsg::Saved {
+                revision: "abc".into(),
+                through: Seq(9),
+                verified: true,
+                major: false,
+            },
+            LiveServerMsg::BuildRefused {
+                build: LiveBuild::Desktop,
+            },
+            LiveServerMsg::Incompatible {
+                protocol: LIVE_PROTOCOL,
+                format: "gridcraft/1".into(),
+            },
+            LiveServerMsg::Expired,
+            LiveServerMsg::Removed {
+                reason: RemovedReason::Deleted,
+            },
+        ];
+        // Every variant is listed (the counts match `live_message_tags_are_pinned`).
+        assert_eq!(client.len(), 10);
+        assert_eq!(server.len(), 19);
+        let shown: Vec<String> = client
+            .iter()
+            .map(|msg| format!("{msg:?} {msg:#?}"))
+            .chain(server.iter().map(|msg| format!("{msg:?} {msg:#?}")))
+            .collect();
+        for text in shown {
+            assert!(!text.contains(SENTINEL_NAME), "{text}");
+            assert!(!text.contains(SENTINEL_PAYLOAD), "{text}");
+        }
     }
 
     #[test]

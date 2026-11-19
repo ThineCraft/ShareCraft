@@ -54,8 +54,8 @@ pub struct Stamp {
     pub seed: u32,
 }
 
-/// One change as the editor sees it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// One change as the editor sees it. The `Debug` form shows the payload's length only.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct EntryView<'a> {
     /// Its position in the log; `None` while it is still waiting for the server.
     pub seq: Option<Seq>,
@@ -67,6 +67,27 @@ pub struct EntryView<'a> {
     pub stamp: Option<Stamp>,
     /// The change's content, exactly as sent.
     pub payload: &'a str,
+}
+
+impl std::fmt::Debug for EntryView<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EntryView")
+            .field("seq", &self.seq)
+            .field("participant", &self.participant)
+            .field("own", &self.own)
+            .field("stamp", &self.stamp)
+            .field("payload", &Length(self.payload.len()))
+            .finish()
+    }
+}
+
+/// Shows a payload's length in place of its content.
+struct Length(usize);
+
+impl std::fmt::Debug for Length {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<{} bytes>", self.0)
+    }
 }
 
 /// What applying a change did.
@@ -99,6 +120,10 @@ pub const MAX_ENTRIES_PER_WINDOW: usize = 20;
 
 /// The window [`MAX_ENTRIES_PER_WINDOW`] counts over, in milliseconds.
 pub const PACE_WINDOW_MS: u64 = 1_000;
+
+/// The longest server frame the client reads, in bytes. The largest the server sends is an
+/// entry whose payload of [`MAX_PAYLOAD_BYTES`] has every character escaped, below this.
+pub const MAX_FRAME_BYTES: usize = 8 * MAX_PAYLOAD_BYTES;
 
 /// The shortest heartbeat interval the client takes from the server; the longest is
 /// [`HEARTBEAT_MS`].
@@ -146,8 +171,9 @@ pub struct Step {
     pub events: Vec<Event>,
 }
 
-/// Something the host may want to show or act on.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Something the host may want to show or act on. The `Debug` form hides presence notes and
+/// shows people through [`LivePerson`]'s, which hides names and accounts.
+#[derive(Clone, PartialEq, Eq)]
 pub enum Event {
     /// Reset the editor to the stored revision at `at` (none: the empty document), then call
     /// [`LiveClient::base_ready`].
@@ -222,6 +248,109 @@ pub enum Event {
     Removed { reason: RemovedReason },
 }
 
+impl std::fmt::Debug for Event {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Event::LoadBase { revision, at } => f
+                .debug_struct("LoadBase")
+                .field("revision", revision)
+                .field("at", at)
+                .finish(),
+            Event::Applied { seq, own, effect } => f
+                .debug_struct("Applied")
+                .field("seq", seq)
+                .field("own", own)
+                .field("effect", effect)
+                .finish(),
+            Event::Refused { local, reason } => f
+                .debug_struct("Refused")
+                .field("local", local)
+                .field("reason", reason)
+                .finish(),
+            Event::DroppedPending { count } => f
+                .debug_struct("DroppedPending")
+                .field("count", count)
+                .finish(),
+            Event::Crashed { seq } => f.debug_struct("Crashed").field("seq", seq).finish(),
+            Event::CannotOpen { seq } => f.debug_struct("CannotOpen").field("seq", seq).finish(),
+            Event::Returned { previous, now } => f
+                .debug_struct("Returned")
+                .field("previous", previous)
+                .field("now", now)
+                .finish(),
+            Event::People(people) => f.debug_tuple("People").field(people).finish(),
+            Event::AccessChanged { can_edit } => f
+                .debug_struct("AccessChanged")
+                .field("can_edit", can_edit)
+                .finish(),
+            Event::CheckpointRequested {
+                ticket,
+                at,
+                base,
+                major,
+            } => f
+                .debug_struct("CheckpointRequested")
+                .field("ticket", ticket)
+                .field("at", at)
+                .field("base", base)
+                .field("major", major)
+                .finish(),
+            Event::VerifyRequested { ticket, at, base } => f
+                .debug_struct("VerifyRequested")
+                .field("ticket", ticket)
+                .field("at", at)
+                .field("base", base)
+                .finish(),
+            Event::ChangesPaused { entries, bytes } => f
+                .debug_struct("ChangesPaused")
+                .field("entries", entries)
+                .field("bytes", bytes)
+                .finish(),
+            Event::ChangesResumed => f.write_str("ChangesResumed"),
+            Event::ReturnReady { through } => f
+                .debug_struct("ReturnReady")
+                .field("through", through)
+                .finish(),
+            Event::ArchiveReturn { current } => f
+                .debug_struct("ArchiveReturn")
+                .field("current", current)
+                .finish(),
+            Event::Presence {
+                participant,
+                payload,
+            } => f
+                .debug_struct("Presence")
+                .field("participant", participant)
+                .field("payload", &payload.as_ref().map(|note| Length(note.len())))
+                .finish(),
+            Event::Returning { participant } => f
+                .debug_struct("Returning")
+                .field("participant", participant)
+                .finish(),
+            Event::Saved {
+                revision,
+                through,
+                verified,
+                major,
+            } => f
+                .debug_struct("Saved")
+                .field("revision", revision)
+                .field("through", through)
+                .field("verified", verified)
+                .field("major", major)
+                .finish(),
+            Event::BuildRefused => f.write_str("BuildRefused"),
+            Event::Expired => f.write_str("Expired"),
+            Event::Incompatible { protocol, format } => f
+                .debug_struct("Incompatible")
+                .field("protocol", protocol)
+                .field("format", format)
+                .finish(),
+            Event::Removed { reason } => f.debug_struct("Removed").field("reason", reason).finish(),
+        }
+    }
+}
+
 /// Where the client is in its session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
@@ -249,9 +378,14 @@ pub enum Phase {
 /// A frame the client cannot follow. The host drops the connection and reconnects.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum ClientError {
-    /// The frame is not a live server message.
-    #[error("malformed frame: {0}")]
-    Malformed(String),
+    /// The frame is not a live server message. Only the kind and position of the fault are
+    /// kept, never the frame's text.
+    #[error("malformed frame: {kind:?} at line {line}, column {column}")]
+    Malformed {
+        kind: MalformedKind,
+        line: usize,
+        column: usize,
+    },
     /// An entry is not the next position in the log.
     #[error("entry {got:?} arrived where {expected:?} was expected")]
     OutOfOrder { expected: Seq, got: Seq },
@@ -261,6 +395,51 @@ pub enum ClientError {
     /// The requested position is not the exact, available agreed state.
     #[error("agreed state at {at:?} is unavailable (agreed {agreed:?}, phase {phase:?})")]
     AgreedUnavailable { at: Seq, agreed: Seq, phase: Phase },
+}
+
+/// What was wrong with a malformed frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MalformedKind {
+    /// Not JSON, or cut short.
+    Syntax,
+    /// A `type` (or other tag) this build does not know.
+    UnknownType,
+    /// A field the message needs is missing.
+    MissingField,
+    /// A field holds the wrong kind of value.
+    WrongType,
+    /// The frame is over [`MAX_FRAME_BYTES`], or a number is out of range.
+    TooLarge,
+}
+
+impl ClientError {
+    /// The fault in `error`, without the text serde would quote from the frame.
+    fn malformed(error: &serde_json::Error) -> ClientError {
+        use serde_json::error::Category;
+        let kind = match error.classify() {
+            Category::Io | Category::Eof => MalformedKind::Syntax,
+            category @ (Category::Syntax | Category::Data) => {
+                // The message is only inspected here, never kept or shown.
+                let message = error.to_string();
+                if message.starts_with("unknown variant") {
+                    MalformedKind::UnknownType
+                } else if message.starts_with("missing field") {
+                    MalformedKind::MissingField
+                } else if message.contains("out of range") {
+                    MalformedKind::TooLarge
+                } else if category == Category::Syntax {
+                    MalformedKind::Syntax
+                } else {
+                    MalformedKind::WrongType
+                }
+            }
+        };
+        ClientError::Malformed {
+            kind,
+            line: error.line(),
+            column: error.column(),
+        }
+    }
 }
 
 /// Why a local change was not taken. Nothing changed.
@@ -484,8 +663,15 @@ impl<E: LiveEditor> LiveClient<E> {
             // Nothing more is read once closed, and nothing here asks the host to reconnect.
             return Ok(step);
         }
-        let msg: LiveServerMsg = serde_json::from_str(frame)
-            .map_err(|error| ClientError::Malformed(error.to_string()))?;
+        if frame.len() > MAX_FRAME_BYTES {
+            return Err(ClientError::Malformed {
+                kind: MalformedKind::TooLarge,
+                line: 0,
+                column: 0,
+            });
+        }
+        let msg: LiveServerMsg =
+            serde_json::from_str(frame).map_err(|error| ClientError::malformed(&error))?;
         match msg {
             LiveServerMsg::LiveJoined {
                 session,

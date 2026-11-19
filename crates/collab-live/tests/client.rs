@@ -823,7 +823,7 @@ fn malformed_frame_is_an_error() {
     let mut client = live(&mut doc, 1);
     assert!(matches!(
         client.receive(&mut doc, "not json", 5).unwrap_err(),
-        ClientError::Malformed(_)
+        ClientError::Malformed { .. }
     ));
 }
 
@@ -2571,4 +2571,89 @@ fn presence_is_never_sent_while_not_live() {
     // Once closed, nothing is sent or kept.
     client.leave();
     assert_eq!(client.presence("closed".into()).unwrap(), None);
+}
+
+#[test]
+fn people_event_debug_hides_names() {
+    let mut doc = StandIn::new("a");
+    let mut client = live(&mut doc, 1);
+    let frame = json!({
+        "type": "people",
+        "people": [{
+            "participant": 2,
+            "client": other(2),
+            "user": "00000000-0000-0000-0000-00005e471ae1",
+            "name": "Sentinel Name 7",
+            "can_edit": true,
+            "connected": true,
+        }],
+    })
+    .to_string();
+    let step = client.receive(&mut doc, &frame, 5).unwrap();
+    assert_eq!(step.events.len(), 1);
+    let shown = format!("{:?} {:#?}", step.events, step);
+    assert!(!shown.contains("Sentinel Name 7"), "{shown}");
+    assert!(!shown.contains("5e471ae1"), "{shown}");
+    assert!(shown.contains("People"), "{shown}");
+
+    // A presence note is opaque too.
+    let frame = json!({ "type": "presence", "participant": 2, "payload": "sentinel-payload-7" })
+        .to_string();
+    let step = client.receive(&mut doc, &frame, 6).unwrap();
+    let shown = format!("{:?}", step.events);
+    assert!(!shown.contains("sentinel-payload-7"), "{shown}");
+    assert!(shown.contains("Presence"), "{shown}");
+}
+
+#[test]
+fn malformed_error_does_not_echo_frame_content() {
+    use collab_live::client::MalformedKind;
+    let mut doc = StandIn::new("a");
+    let mut client = live(&mut doc, 1);
+    let cases = [
+        (
+            "{\"type\":\"refused\",\"local\":1,\"reason\":{\"sentinel-payload-7\":1}}".to_owned(),
+            MalformedKind::WrongType,
+        ),
+        (
+            "{\"type\":\"sentinel-payload-7\"}".to_owned(),
+            MalformedKind::UnknownType,
+        ),
+        (
+            "{\"type\":\"access\"}".to_owned(),
+            MalformedKind::MissingField,
+        ),
+        (
+            "{\"type\":\"presence\",\"participant\":\"sentinel-payload-7\",\"payload\":null}"
+                .to_owned(),
+            MalformedKind::WrongType,
+        ),
+        (
+            "sentinel-payload-7 not json".to_owned(),
+            MalformedKind::Syntax,
+        ),
+        (
+            format!(
+                "{{\"type\":\"presence\",\"participant\":2,\"payload\":\"{}sentinel-payload-7\"}}",
+                "x".repeat(collab_live::client::MAX_FRAME_BYTES)
+            ),
+            MalformedKind::TooLarge,
+        ),
+    ];
+    for (frame, kind) in cases {
+        let error = client.receive(&mut doc, &frame, 5).unwrap_err();
+        let shown = format!("{error:?} {error}");
+        assert!(!shown.contains("sentinel-payload-7"), "{shown}");
+        match error {
+            ClientError::Malformed { kind: got, .. } => assert_eq!(got, kind, "{frame:.80}"),
+            other => panic!("expected malformed, got {other:?}"),
+        }
+    }
+    let error = client
+        .receive(&mut doc, "{\n  \"type\": 7\n}", 5)
+        .unwrap_err();
+    assert!(
+        matches!(error, ClientError::Malformed { line, .. } if line >= 2),
+        "{error:?}"
+    );
 }
