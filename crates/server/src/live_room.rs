@@ -43,6 +43,8 @@ pub(crate) struct LiveTiming {
     pub checkpoint_wait: Duration,
     /// How long a checkpoint ticket can be used.
     pub ticket_lifetime: Duration,
+    /// Unsaved-log and catch-up limits.
+    pub limits: crate::config::LiveLimits,
 }
 
 /// The adopted checkpoint cadence (plan G4): 15 seconds without a new change, or 120 seconds
@@ -455,8 +457,18 @@ pub(crate) struct LiveRoom<S: LiveStore> {
     /// Changes stored in the open session, for its end event.
     session_changes: u64,
     names: HashMap<UserId, String>,
-    _unsaved_entries: u64,
-    _unsaved_bytes: u64,
+    /// Entries kept after the verified base (the catch-up a joiner is sent), cancel records
+    /// included.
+    unsaved_entries: u64,
+    /// Payload bytes kept after the verified base.
+    unsaved_bytes: u64,
+    /// New changes are refused until a verified checkpoint brings the log under its limits.
+    paused: bool,
+    /// The log is past a warning threshold: a checkpoint is asked for at once.
+    warned: bool,
+    /// The durable log is beyond what the limits allow (a limit was lowered): new joins are
+    /// refused rather than sent an unbounded catch-up.
+    over_limit: bool,
     _retained_session_data: Vec<records::LiveSessionDataRow>,
     format: Option<String>,
     entries: Vec<LiveEntry>,
@@ -613,6 +625,16 @@ impl<S: LiveStore> LiveRoom<S> {
                 .count()
         });
         let session_changes = u64::try_from(session_changes).unwrap_or(u64::MAX);
+        let limits = timing.limits;
+        let at_hard = loaded.unsaved_entries >= limits.hard_entries
+            || loaded.unsaved_bytes >= limits.hard_bytes;
+        let at_warning = loaded.unsaved_entries >= limits.warn_entries
+            || loaded.unsaved_bytes >= limits.warn_bytes;
+        // Cancel records may take the log a little past the entry limit (at most one per
+        // change); anything beyond that, or past the byte limit, was stored under a higher
+        // limit.
+        let over_limit = loaded.unsaved_entries > limits.hard_entries.saturating_mul(2)
+            || loaded.unsaved_bytes > limits.hard_bytes;
         let (written_tx, written_rx) = mpsc::unbounded_channel();
         Ok(Self {
             doc,
@@ -647,8 +669,11 @@ impl<S: LiveStore> LiveRoom<S> {
             agreement: BTreeMap::new(),
             session_changes,
             names: HashMap::new(),
-            _unsaved_entries: loaded.unsaved_entries,
-            _unsaved_bytes: loaded.unsaved_bytes,
+            unsaved_entries: loaded.unsaved_entries,
+            unsaved_bytes: loaded.unsaved_bytes,
+            paused: at_hard,
+            warned: at_warning,
+            over_limit,
             _retained_session_data: loaded.retained_session_data,
             format: loaded.format,
             entries,
@@ -939,6 +964,10 @@ impl<S: LiveStore> LiveRoom<S> {
                 .any(|held| held.purpose == TicketPurpose::Write)
         {
             return None;
+        }
+        if self.warned {
+            // Past a warning threshold: ask at once.
+            return Some(Instant::now());
         }
         let quiet = self.last_change.map(|at| at + self.timing.checkpoint_quiet);
         let wait = self
@@ -1466,6 +1495,17 @@ impl<S: LiveStore> LiveRoom<S> {
                 build,
             },
         );
+        // The store keeps only the newest unverified checkpoints; so does the room.
+        self.unverified_checkpoints
+            .sort_by_key(|checkpoint| checkpoint.through);
+        let excess = self
+            .unverified_checkpoints
+            .len()
+            .saturating_sub(records::MAX_UNVERIFIED_CHECKPOINTS);
+        for dropped in self.unverified_checkpoints.drain(..excess) {
+            self.checkpoint_writers.remove(&dropped.revision);
+            self.not_asked.remove(&dropped.revision);
+        }
     }
 
     /// Compares a verify ticket's independently written hash with the stored checkpoint. A
@@ -1575,6 +1615,7 @@ impl<S: LiveStore> LiveRoom<S> {
         self.witnesses.retain(|seq, _| *seq > at);
         self.viewer_reports.retain(|seq, _| *seq > at);
         self.agreement.retain(|seq, _| *seq > at);
+        self.recount();
         self.events.emit(NewEvent {
             kind: "live.checkpoint_verified",
             actor: Some(user),
@@ -1950,6 +1991,23 @@ impl<S: LiveStore> LiveRoom<S> {
             let _ = request.accepted.send(JoinReply::Refused);
             return Ok(());
         }
+        if self.over_limit {
+            // A recoverable fault: raising the limit, or a checkpoint verified through another
+            // path, lets people in again.
+            self.events.emit(NewEvent {
+                kind: "live.log_over_limit",
+                actor: Some(request.user),
+                subject: None,
+                document: Some(self.doc),
+                node: Some(self.doc.into()),
+                detail: serde_json::json!({
+                    "entries": self.unsaved_entries,
+                    "bytes": self.unsaved_bytes,
+                }),
+            });
+            let _ = request.accepted.send(JoinReply::Refused);
+            return Ok(());
+        }
         if self
             .clients
             .get(&request.client)
@@ -2122,6 +2180,12 @@ impl<S: LiveStore> LiveRoom<S> {
                     })
                 }),
         );
+        if self.paused {
+            frames.push(encode(&LiveServerMsg::ChangesPaused {
+                entries: self.unsaved_entries,
+                bytes: self.unsaved_bytes,
+            }));
+        }
         let _ = self
             .members
             .send(Some(request.client), &Outbound::Many(frames));
@@ -2193,6 +2257,8 @@ impl<S: LiveStore> LiveRoom<S> {
             Some(RefusedReason::BaseAhead)
         } else if self.head.0 >= i64::MAX as u64 {
             Some(RefusedReason::OutOfOrder)
+        } else if self.paused || self.would_cross(payload.len()) {
+            Some(RefusedReason::LogPaused)
         } else if !self
             .rates
             .entry(client)
@@ -2210,6 +2276,9 @@ impl<S: LiveStore> LiveRoom<S> {
                 .await?;
             self.advance_local(client, user, local);
             self.refuse(client, local, reason);
+            if reason == RefusedReason::LogPaused {
+                self.pause();
+            }
             return Ok(());
         }
 
@@ -2222,6 +2291,7 @@ impl<S: LiveStore> LiveRoom<S> {
         let seed = random_seed()?;
         let witnesses = self.witnesses();
         let session = self.session.as_ref().ok_or_else(no_session)?.id;
+        let payload_len = payload.len();
         self.store
             .append_live_change(
                 self.doc,
@@ -2261,11 +2331,115 @@ impl<S: LiveStore> LiveRoom<S> {
         self.advance_local(client, user, local);
         self.note_unsaved_change();
         self.session_changes = self.session_changes.saturating_add(1);
+        self.unsaved_entries = self.unsaved_entries.saturating_add(1);
+        self.unsaved_bytes = self
+            .unsaved_bytes
+            .saturating_add(u64::try_from(payload_len).unwrap_or(u64::MAX));
         let _ = self.members.send(
             None,
             &Outbound::One(encode(&LiveServerMsg::Entry { entry })),
         );
+        self.check_limits();
         Ok(())
+    }
+
+    /// Whether storing one more change of `len` payload bytes would take the log past a hard
+    /// limit.
+    fn would_cross(&self, len: usize) -> bool {
+        let limits = self.timing.limits;
+        self.unsaved_entries.saturating_add(1) > limits.hard_entries
+            || self
+                .unsaved_bytes
+                .saturating_add(u64::try_from(len).unwrap_or(u64::MAX))
+                > limits.hard_bytes
+    }
+
+    fn at_hard_limit(&self) -> bool {
+        let limits = self.timing.limits;
+        self.unsaved_entries >= limits.hard_entries || self.unsaved_bytes >= limits.hard_bytes
+    }
+
+    fn at_warning(&self) -> bool {
+        let limits = self.timing.limits;
+        self.unsaved_entries >= limits.warn_entries || self.unsaved_bytes >= limits.warn_bytes
+    }
+
+    /// After the log grew: warns (asking for a checkpoint at once) and, at a hard limit,
+    /// pauses new changes so clients hear of it before sending more.
+    fn check_limits(&mut self) {
+        if !self.warned && self.at_warning() {
+            self.warned = true;
+            self.events.emit(NewEvent {
+                kind: "live.log_warning",
+                actor: None,
+                subject: None,
+                document: Some(self.doc),
+                node: Some(self.doc.into()),
+                detail: serde_json::json!({
+                    "entries": self.unsaved_entries,
+                    "bytes": self.unsaved_bytes,
+                }),
+            });
+        }
+        if self.at_hard_limit() {
+            self.pause();
+        }
+    }
+
+    /// Pauses new changes and tells everyone, once.
+    fn pause(&mut self) {
+        if self.paused {
+            return;
+        }
+        self.paused = true;
+        let frame = encode(&LiveServerMsg::ChangesPaused {
+            entries: self.unsaved_entries,
+            bytes: self.unsaved_bytes,
+        });
+        let _ = self.members.send(None, &Outbound::One(frame));
+        self.events.emit(NewEvent {
+            kind: "live.changes_paused",
+            actor: None,
+            subject: None,
+            document: Some(self.doc),
+            node: Some(self.doc.into()),
+            detail: serde_json::json!({
+                "entries": self.unsaved_entries,
+                "bytes": self.unsaved_bytes,
+            }),
+        });
+    }
+
+    /// Counts the kept log again after its verified base moved, and resumes changes once it
+    /// is under both hard limits.
+    fn recount(&mut self) {
+        self.unsaved_entries = u64::try_from(self.entries.len()).unwrap_or(u64::MAX);
+        self.unsaved_bytes = self
+            .entries
+            .iter()
+            .map(|entry| match &entry.body {
+                EntryBody::Change { payload, .. } => u64::try_from(payload.len()).unwrap_or(0),
+                EntryBody::Cancel { .. } => 0,
+            })
+            .fold(0_u64, u64::saturating_add);
+        self.warned = self.at_warning();
+        if self.paused && !self.at_hard_limit() {
+            self.paused = false;
+            let _ = self
+                .members
+                .send(None, &Outbound::One(encode(&LiveServerMsg::ChangesResumed)));
+            self.events.emit(NewEvent {
+                kind: "live.changes_resumed",
+                actor: None,
+                subject: None,
+                document: Some(self.doc),
+                node: Some(self.doc.into()),
+                detail: serde_json::json!({
+                    "entries": self.unsaved_entries,
+                    "bytes": self.unsaved_bytes,
+                }),
+            });
+        }
     }
 
     fn note_unsaved_change(&mut self) {
@@ -2632,8 +2806,11 @@ impl<S: LiveStore> LiveRoom<S> {
         else {
             return Err(RoomFailed(DbError::new("live cancel target changed kind")));
         };
+        let freed = u64::try_from(payload.len()).unwrap_or(0);
         payload.clear();
         *cancelled = true;
+        self.unsaved_entries = self.unsaved_entries.saturating_add(1);
+        self.unsaved_bytes = self.unsaved_bytes.saturating_sub(freed);
         let cancel = LiveEntry {
             seq,
             at_ms: millis(at)?,
@@ -2649,6 +2826,7 @@ impl<S: LiveStore> LiveRoom<S> {
             None,
             &Outbound::One(encode(&LiveServerMsg::Entry { entry: cancel })),
         );
+        self.check_limits();
         self.events.emit(NewEvent {
             kind: "live.entry_cancelled",
             actor: None,
@@ -3032,6 +3210,7 @@ fn reason_name(reason: RefusedReason) -> &'static str {
         RefusedReason::RateLimited => "rate_limited",
         RefusedReason::BaseAhead => "base_ahead",
         RefusedReason::OutOfOrder => "out_of_order",
+        RefusedReason::LogPaused => "log_paused",
         RefusedReason::Unknown => "unknown",
     }
 }
@@ -3044,6 +3223,7 @@ fn reason_from_store(reason: &str) -> RefusedReason {
         "rate_limited" => RefusedReason::RateLimited,
         "base_ahead" => RefusedReason::BaseAhead,
         "out_of_order" => RefusedReason::OutOfOrder,
+        "log_paused" => RefusedReason::LogPaused,
         _ => RefusedReason::Unknown,
     }
 }
@@ -3113,6 +3293,7 @@ mod tests {
             checkpoint_quiet: super::CHECKPOINT_QUIET,
             checkpoint_wait: super::CHECKPOINT_WAIT,
             ticket_lifetime: super::TICKET_LIFETIME,
+            limits: crate::config::LiveLimits::default(),
         }
     }
 
@@ -4823,6 +5004,477 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(loaded.verified_through, Seq(0));
+    }
+
+    // ---- Task 10: unsaved-log and catch-up limits ----
+
+    fn limited(
+        warn_entries: u64,
+        hard_entries: u64,
+        warn_bytes: u64,
+        hard_bytes: u64,
+    ) -> LiveTiming {
+        LiveTiming {
+            limits: crate::config::LiveLimits {
+                warn_entries,
+                warn_bytes,
+                hard_entries,
+                hard_bytes,
+            },
+            ..timing()
+        }
+    }
+
+    async fn limited_room(timing: LiveTiming) -> (LiveRoom<MemStore>, MemStore) {
+        let store = MemStore::new();
+        let room = LiveRoom::load(DocId(id(100)), store.clone(), EventSink::discard(), timing)
+            .await
+            .unwrap();
+        (room, store)
+    }
+
+    fn refusal(messages: &[LiveServerMsg]) -> Option<RefusedReason> {
+        messages.iter().find_map(|message| match message {
+            LiveServerMsg::Refused { reason, .. } => Some(*reason),
+            _ => None,
+        })
+    }
+
+    fn paused(messages: &[LiveServerMsg]) -> Option<(u64, u64)> {
+        messages.iter().find_map(|message| match message {
+            LiveServerMsg::ChangesPaused { entries, bytes } => Some((*entries, *bytes)),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn default_limits_are_the_adopted_values() {
+        let limits = crate::config::LiveLimits::default();
+        assert_eq!(limits.warn_entries, 4_000);
+        assert_eq!(limits.warn_bytes, 48 * 1024 * 1024);
+        assert_eq!(limits.hard_entries, 5_000);
+        assert_eq!(limits.hard_bytes, 64 * 1024 * 1024);
+        assert_eq!(super::MAX_SESSION_DATA_BYTES, 8 * 1024 * 1024);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn warning_threshold_issues_urgent_ticket() {
+        let (events, mut emitted) = EventSink::channel();
+        let mut room = LiveRoom::load(
+            DocId(id(100)),
+            MemStore::new(),
+            events,
+            limited(3, 10, u64::MAX / 2, u64::MAX / 2),
+        )
+        .await
+        .unwrap();
+        let mut ann = join_capable(&mut room, 1, 1, "editor", LiveBuild::Browser).await;
+        for local in 1..=2 {
+            entry(&mut room, &ann, local, local - 1, FORMAT, "x".into())
+                .await
+                .unwrap();
+        }
+        assert!(
+            checkpoint_ticket(drain(&mut ann.rx)).is_none(),
+            "not due yet"
+        );
+        entry(&mut room, &ann, 3, 2, FORMAT, "x".into())
+            .await
+            .unwrap();
+        // No quiet period: the warning asks at once.
+        let (_, purpose, at) = checkpoint_ticket(drain(&mut ann.rx)).unwrap();
+        assert_eq!((purpose, at), (TicketPurpose::Write, Seq(3)));
+        assert_eq!(
+            emitted_kinds(&mut emitted, "live.log"),
+            [("live.log_warning", json!({ "entries": 3, "bytes": 3 }))]
+        );
+        // Changes still go in below the hard limit.
+        entry(&mut room, &ann, 4, 3, FORMAT, "x".into())
+            .await
+            .unwrap();
+        assert_eq!(room.head, Seq(4));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn entry_limit_pauses_before_storing_the_next_change() {
+        let (events, mut emitted) = EventSink::channel();
+        let store = MemStore::new();
+        let mut room = LiveRoom::load(
+            DocId(id(100)),
+            store.clone(),
+            events,
+            limited(100, 3, u64::MAX / 2, u64::MAX / 2),
+        )
+        .await
+        .unwrap();
+        let mut ann = join_as(&mut room, 1, 1, 11, "editor", FORMAT, None, None).await;
+        let mut bob = join_as(&mut room, 2, 2, 12, "editor", FORMAT, None, None).await;
+        for local in 1..=3 {
+            entry(&mut room, &ann, local, local - 1, FORMAT, "x".into())
+                .await
+                .unwrap();
+        }
+        assert_eq!(store.entry_count(), 3);
+        // The third change reached the limit: everyone is told before sending more.
+        assert_eq!(paused(&drain(&mut bob.rx)), Some((3, 3)));
+        let _ = drain(&mut ann.rx);
+        entry(&mut room, &ann, 4, 3, FORMAT, "x".into())
+            .await
+            .unwrap();
+        assert_eq!(store.entry_count(), 3, "the next change is not stored");
+        assert_eq!(room.head, Seq(3));
+        let answer = drain(&mut ann.rx);
+        assert_eq!(refusal(&answer), Some(RefusedReason::LogPaused));
+        assert!(entries(answer).is_empty(), "nothing is broadcast");
+        assert!(entries(drain(&mut bob.rx)).is_empty());
+        assert_eq!(
+            crate::live_store::LiveStore::live_local(&store, DocId(id(100)), ann.client, 4)
+                .await
+                .unwrap(),
+            records::LiveLocal::Refused {
+                reason: "log_paused".to_owned()
+            },
+            "its number is used up"
+        );
+        assert_eq!(
+            emitted_kinds(&mut emitted, "live.changes"),
+            [("live.changes_paused", json!({ "entries": 3, "bytes": 3 }))]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn byte_limit_pauses_before_storing_the_next_change() {
+        let (mut room, store) = limited_room(limited(100, 100, 100, 10)).await;
+        let mut ann = join_as(&mut room, 1, 1, 11, "editor", FORMAT, None, None).await;
+        for (local, payload) in [(1, "aaaa"), (2, "bbbb")] {
+            entry(&mut room, &ann, local, local - 1, FORMAT, payload.into())
+                .await
+                .unwrap();
+        }
+        let _ = drain(&mut ann.rx);
+        entry(&mut room, &ann, 3, 2, FORMAT, "ccc".into())
+            .await
+            .unwrap();
+        let answer = drain(&mut ann.rx);
+        assert_eq!(refusal(&answer), Some(RefusedReason::LogPaused));
+        assert_eq!(paused(&answer), Some((2, 8)));
+        assert_eq!(store.entry_count(), 2);
+        // Paused: even a change that would fit waits for a checkpoint.
+        entry(&mut room, &ann, 4, 2, FORMAT, "d".into())
+            .await
+            .unwrap();
+        assert_eq!(refusal(&drain(&mut ann.rx)), Some(RefusedReason::LogPaused));
+        assert_eq!(store.entry_count(), 2);
+    }
+
+    /// A room paused at three entries, with Ann holding a write ticket and Bob a capable
+    /// editor.
+    async fn paused_room(
+        events: EventSink,
+    ) -> (LiveRoom<MemStore>, MemStore, Joined, Joined, Uuid) {
+        let store = MemStore::new();
+        let mut room = LiveRoom::load(
+            DocId(id(100)),
+            store.clone(),
+            events,
+            limited(3, 3, u64::MAX / 2, u64::MAX / 2),
+        )
+        .await
+        .unwrap();
+        let mut ann = join_capable(&mut room, 1, 1, "editor", LiveBuild::Browser).await;
+        let mut bob = join_capable(&mut room, 2, 2, "editor", LiveBuild::Desktop).await;
+        let mut ticket = None;
+        for local in 1..=3 {
+            entry(&mut room, &ann, local, local - 1, FORMAT, "x".into())
+                .await
+                .unwrap();
+            if let Some((id, _, _)) = checkpoint_ticket(drain(&mut ann.rx)) {
+                ticket = Some(id);
+            }
+        }
+        let _ = drain(&mut bob.rx);
+        assert!(room.paused);
+        (room, store, ann, bob, ticket.expect("an urgent ticket"))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn paused_room_still_accepts_control_messages() {
+        let (mut room, _store, mut ann, mut bob, _ticket) = paused_room(EventSink::discard()).await;
+        room.handle(LiveCommand::Heartbeat {
+            conn: bob.conn,
+            client: bob.client,
+            seen: Seq(3),
+        })
+        .await
+        .unwrap();
+        room.handle(LiveCommand::Resync {
+            conn: bob.conn,
+            client: bob.client,
+        })
+        .await
+        .unwrap();
+        let resent = drain(&mut bob.rx);
+        assert_eq!(resyncs(&resent), 1);
+        assert_eq!(entries(resent).len(), 3);
+        fingerprint(&mut room, &bob, 64, &"a".repeat(64)).await;
+        room.handle(LiveCommand::Leave {
+            conn: ann.conn,
+            client: ann.client,
+        })
+        .await
+        .unwrap();
+        room.settle().await.unwrap();
+        assert!(
+            room.people()
+                .iter()
+                .all(|person| person.participant != ann.participant)
+        );
+        let _ = drain(&mut ann.rx);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn verified_checkpoint_resumes_changes() {
+        let (events, mut emitted) = EventSink::channel();
+        let (mut room, store, mut ann, mut bob, ticket) = paused_room(events).await;
+        let LiveCheckpointReply::Saved { .. } =
+            upload(&mut room, UserId(id(11)), ticket, Seq(3), 9).await
+        else {
+            panic!("a paused room still stores checkpoints");
+        };
+        assert!(
+            room.paused,
+            "a stored but unverified checkpoint does not resume"
+        );
+        let (verify, purpose, at) = checkpoint_ticket(drain(&mut bob.rx)).unwrap();
+        assert_eq!((purpose, at), (TicketPurpose::Verify, Seq(3)));
+        let _ = emitted_kinds(&mut emitted, "");
+        assert_eq!(
+            hash(&mut room, UserId(id(12)), verify, Seq(3), 9).await,
+            LiveCheckpointReply::Accepted
+        );
+        assert!(!room.paused);
+        assert!(
+            drain(&mut ann.rx)
+                .iter()
+                .any(|message| matches!(message, LiveServerMsg::ChangesResumed))
+        );
+        assert_eq!(
+            emitted_kinds(&mut emitted, "live.changes"),
+            [("live.changes_resumed", json!({ "entries": 0, "bytes": 0 }))]
+        );
+        entry(&mut room, &ann, 4, 3, FORMAT, "x".into())
+            .await
+            .unwrap();
+        assert_eq!(room.head, Seq(4));
+        assert_eq!(store.entry_count(), 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn restart_cancels_ticket_and_keeps_pause() {
+        let doc = DocId(id(100));
+        let (room, store, ann, _bob, ticket) = paused_room(EventSink::discard()).await;
+        let resume = LiveResume {
+            session: ann.session,
+            participant: ann.participant,
+        };
+        drop(room);
+        let mut room = LiveRoom::load(
+            doc,
+            store.clone(),
+            EventSink::discard(),
+            limited(3, 3, u64::MAX / 2, u64::MAX / 2),
+        )
+        .await
+        .unwrap();
+        assert!(room.paused, "limits are recomputed from durable entries");
+        let mut ann = join_full(
+            &mut room,
+            7,
+            1,
+            UserId(id(11)),
+            "editor",
+            FORMAT,
+            Some(resume),
+            Some(Seq(3)),
+            true,
+            LiveBuild::Browser,
+        )
+        .await;
+        assert_eq!(paused(&ann.initial), Some((3, 3)));
+        assert_eq!(
+            upload(&mut room, UserId(id(11)), ticket, Seq(3), 9).await,
+            LiveCheckpointReply::Refused,
+            "no ticket survives a restart"
+        );
+        let _ = drain(&mut ann.rx);
+        entry(&mut room, &ann, 4, 3, FORMAT, "x".into())
+            .await
+            .unwrap();
+        assert_eq!(refusal(&drain(&mut ann.rx)), Some(RefusedReason::LogPaused));
+        assert_eq!(store.entry_count(), 3, "no entry is lost or counted twice");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn catchup_never_exceeds_the_unsaved_limits() {
+        let doc = DocId(id(100));
+        let (mut room, store) = limited_room(limited(100, 4, u64::MAX / 2, u64::MAX / 2)).await;
+        let ann = join_as(&mut room, 1, 1, 11, "editor", FORMAT, None, None).await;
+        for local in 1..=6 {
+            {
+                let seen = room_head(&room);
+                entry(&mut room, &ann, local, seen, FORMAT, "x".into())
+            }
+            .await
+            .unwrap();
+        }
+        assert_eq!(store.entry_count(), 4);
+        let late = join_as(&mut room, 2, 2, 12, "editor", FORMAT, None, None).await;
+        assert_eq!(entries(late.initial.clone()).len(), 4);
+        assert_eq!(paused(&late.initial), Some((4, 4)));
+
+        // A lower limit on durable state: new joins are refused rather than sent an unbounded
+        // catch-up, and the fault is recorded.
+        let (events, mut emitted) = EventSink::channel();
+        let mut lowered = LiveRoom::load(
+            doc,
+            store,
+            events,
+            limited(1, 1, u64::MAX / 2, u64::MAX / 2),
+        )
+        .await
+        .unwrap();
+        let (tx, mut rx) = mpsc::channel(16);
+        let (accepted, answer) = oneshot::channel();
+        lowered
+            .handle(LiveCommand::Join {
+                conn: 9,
+                client: ClientId(id(9)),
+                user: UserId(id(19)),
+                session: SessionId(id(1019)),
+                name: "Late".into(),
+                role: builtin_access("editor"),
+                protocol: 1,
+                format: FORMAT.to_owned(),
+                resume: None,
+                seen: None,
+                can_checkpoint: true,
+                build: LiveBuild::Browser,
+                tx,
+                accepted,
+            })
+            .await
+            .unwrap();
+        assert_eq!(answer.await.unwrap(), JoinReply::Refused);
+        assert!(entries(drain(&mut rx)).is_empty());
+        assert_eq!(
+            emitted_kinds(&mut emitted, "live.log"),
+            [("live.log_over_limit", json!({ "entries": 4, "bytes": 4 }))]
+        );
+    }
+
+    fn room_head(room: &LiveRoom<MemStore>) -> u64 {
+        room.head.0
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn five_thousand_small_entries_pause_at_the_adopted_limit() {
+        let (mut room, store) = room().await;
+        let ann = join_as(&mut room, 1, 1, 11, "editor", FORMAT, None, None).await;
+        let mut rx = ann.rx;
+        let ann = Joined {
+            rx: mpsc::channel(1).1,
+            initial: Vec::new(),
+            after_join: Vec::new(),
+            ..ann
+        };
+        for local in 1..=5_001 {
+            // Within the rate limit.
+            tokio::time::advance(Duration::from_millis(40)).await;
+            {
+                let seen = room_head(&room);
+                entry(&mut room, &ann, local, seen, FORMAT, "x".into())
+            }
+            .await
+            .unwrap();
+            let _ = drain(&mut rx);
+        }
+        assert_eq!(store.entry_count(), 5_000);
+        assert!(room.paused);
+        assert_eq!(room.entries.len(), 5_000);
+        assert!(
+            room.entries.capacity() < 2 * 5_000,
+            "no oversized allocation"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn session_data_limit_is_enforced_before_upload() {
+        let (mut room, store) = room().await;
+        let mut ann = join_capable(&mut room, 1, 1, "editor", LiveBuild::Browser).await;
+        entry(&mut room, &ann, 1, 0, FORMAT, "one".into())
+            .await
+            .unwrap();
+        tokio::time::advance(Duration::from_secs(15)).await;
+        room.expire_due().await.unwrap();
+        let (ticket, _, at) = checkpoint_ticket(drain(&mut ann.rx)).unwrap();
+        let (reply, answer) = oneshot::channel();
+        room.handle(LiveCommand::CheckpointUpload {
+            user: UserId(id(11)),
+            ticket,
+            at,
+            base: None,
+            blob: BlobRef {
+                sha256: [9; 32],
+                size: 3,
+            },
+            session_data: vec![0; super::MAX_SESSION_DATA_BYTES + 1],
+            reply,
+        })
+        .await
+        .unwrap();
+        room.finish_writes().await.unwrap();
+        assert_eq!(answer.await.unwrap(), LiveCheckpointReply::Refused);
+        assert!(store.revisions(DocId(id(100))).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_editor_cannot_grow_checkpoint_storage_without_bound() {
+        let doc = DocId(id(100));
+        let (mut room, store) = room().await;
+        let mut ann = join_capable(&mut room, 1, 1, "editor", LiveBuild::Browser).await;
+        let mut written = 0;
+        for local in 1..=20 {
+            {
+                let seen = room_head(&room);
+                entry(&mut room, &ann, local, seen, FORMAT, "x".into())
+            }
+            .await
+            .unwrap();
+            tokio::time::advance(Duration::from_secs(15)).await;
+            room.expire_due().await.unwrap();
+            if let Some((ticket, TicketPurpose::Write, at, base)) = ticket_full(drain(&mut ann.rx))
+            {
+                let reply =
+                    upload_on(&mut room, UserId(id(11)), ticket, at, base.as_deref(), 9).await;
+                assert!(matches!(reply, LiveCheckpointReply::Saved { .. }));
+                written += 1;
+            }
+        }
+        assert_eq!(written, 20, "a lone editor keeps checkpointing");
+        let loaded = crate::live_store::LiveStore::load_live(&store, doc)
+            .await
+            .unwrap();
+        let holding = loaded
+            .unverified_checkpoints
+            .iter()
+            .filter(|checkpoint| !checkpoint.session_data.is_empty())
+            .count();
+        assert_eq!(holding, records::MAX_UNVERIFIED_CHECKPOINTS);
+        assert_eq!(
+            store.session_data_bytes(doc),
+            records::MAX_UNVERIFIED_CHECKPOINTS * b"identities".len()
+        );
+        assert!(room.unverified_checkpoints.len() <= records::MAX_UNVERIFIED_CHECKPOINTS);
     }
 
     #[tokio::test(start_paused = true)]

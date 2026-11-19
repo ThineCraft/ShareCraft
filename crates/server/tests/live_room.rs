@@ -1004,3 +1004,73 @@ async fn second_participant_hash_verifies_the_checkpoint() {
         "the base carries its session data"
     );
 }
+
+#[tokio::test]
+async fn checkpoint_identity_data_counts_against_the_site_quota() {
+    let server = spawn_server_config(|config| {
+        live_config(config);
+        config.live_checkpoint_quiet = Duration::from_millis(50);
+    })
+    .await;
+    let (doc, ann, _bob) = shared_live(&server).await;
+    let root = server.admin("Root").await;
+    let site = server.db.db.node(doc.into()).await.unwrap().unwrap().site;
+    let used = server.db.db.site_usage(site).await.unwrap().used;
+    let response = server
+        .http(Some(&root))
+        .put(server.url(&format!("/api/sites/{}/quota", site.0)))
+        .json(&serde_json::json!({ "bytes": used + 1_500 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let mut socket =
+        join_capable_socket(&server, doc, &ann, protocol::live::LiveBuild::Browser).await;
+    let identities = vec![b'i'; 1_000];
+    for local in 1..=2_u64 {
+        send_live(
+            &mut socket,
+            &LiveClientMsg::Entry {
+                local: LocalNo(local),
+                seen: Seq(local - 1),
+                format: FORMAT.to_owned(),
+                payload: "x".to_owned(),
+            },
+        )
+        .await;
+        let (ticket, at, base) = next_live(&mut socket, |message| match message {
+            LiveServerMsg::CheckpointTicket {
+                ticket, at, base, ..
+            } => Some((ticket, at, base)),
+            _ => None,
+        })
+        .await;
+        let mut query = vec![("ticket", ticket.to_string()), ("at", at.0.to_string())];
+        if let Some(base) = &base {
+            query.push(("base", base.clone()));
+        }
+        let response = server
+            .http(Some(&ann))
+            .put(server.url(&format!("/api/docs/{}/live-checkpoint", doc.0)))
+            .query(&query)
+            .header("x-sharecraft-session-data-length", identities.len())
+            .body([identities.as_slice(), format!("book {local}").as_bytes()].concat())
+            .send()
+            .await
+            .unwrap();
+        if local == 1 {
+            assert_eq!(response.status(), StatusCode::OK);
+            let usage = server.db.db.site_usage(site).await.unwrap();
+            assert!(
+                usage.used >= used + 1_000,
+                "stored identity data is used space"
+            );
+        } else {
+            assert_eq!(
+                response.status(),
+                StatusCode::INSUFFICIENT_STORAGE,
+                "the second checkpoint's identity data does not fit"
+            );
+        }
+    }
+}

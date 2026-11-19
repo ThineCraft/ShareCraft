@@ -178,7 +178,22 @@ pub(super) async fn reserve_held(
     site: NodeId,
     held: Held,
 ) -> Result<(Held, Reservation), ApiError> {
-    match state.db().reserve_bytes(site, held.blob().size).await {
+    reserve_held_with(state, site, held, 0).await
+}
+
+/// [`reserve_held`], with `extra` bytes stored alongside the content (a live checkpoint's
+/// identity data) reserved with it.
+async fn reserve_held_with(
+    state: &AppState,
+    site: NodeId,
+    held: Held,
+    extra: u64,
+) -> Result<(Held, Reservation), ApiError> {
+    match state
+        .db()
+        .reserve_bytes(site, held.blob().size.saturating_add(extra))
+        .await
+    {
         Ok(reservation) => Ok((held, reservation)),
         Err(e) => {
             discard(state, held).await;
@@ -857,7 +872,8 @@ pub(crate) async fn live_checkpoint(
     room_for_body(&state, site, &headers).await?;
     let (session_data, rest) = read_prefix(request.into_body(), session_length).await?;
     let held = body_blob(&state, Request::new(rest)).await?;
-    let (held, reservation) = reserve_held(&state, site, held).await?;
+    // The identity data is stored with the checkpoint and counts against the quota as well.
+    let (held, reservation) = reserve_held_with(&state, site, held, session_bytes).await?;
 
     let reply = {
         let state = state.clone();

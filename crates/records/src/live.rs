@@ -63,6 +63,10 @@ pub struct LiveSwept {
     pub clients: u64,
 }
 
+/// The most unverified checkpoints a document keeps: storing another removes the oldest, so
+/// one editor cannot grow checkpoint storage without bound while nobody verifies.
+pub const MAX_UNVERIFIED_CHECKPOINTS: usize = 4;
+
 /// One durable checkpoint of a live log.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LiveCheckpointRow {
@@ -609,6 +613,30 @@ async fn insert_live_checkpoint(
     .bind(writer_client)
     .execute(&mut *tx)
     .await?;
+    if inserted.rows_affected() == 1 {
+        // Keep at most MAX_UNVERIFIED_CHECKPOINTS unverified checkpoints after the verified
+        // base: the oldest go, with their identity data.
+        let verified_through: i64 =
+            sqlx::query_scalar("select verified_through from live_logs where document_id = $1")
+                .bind(doc.0)
+                .fetch_one(&mut *tx)
+                .await?;
+        let cap = i64::try_from(MAX_UNVERIFIED_CHECKPOINTS).unwrap_or(i64::MAX);
+        sqlx::query(
+            "delete from live_checkpoints \
+             where document_id = $1 and verified_at is null \
+               and revision in ( \
+                 select revision from live_checkpoints \
+                 where document_id = $1 and verified_at is null \
+                   and (through > $2 or ($2 = 0 and through = 0)) \
+                 order by through desc offset $3)",
+        )
+        .bind(doc.0)
+        .bind(verified_through)
+        .bind(cap)
+        .execute(&mut *tx)
+        .await?;
+    }
     if inserted.rows_affected() == 0 {
         let same: bool = sqlx::query_scalar(
             "select exists( \
@@ -1258,6 +1286,16 @@ impl Db {
         .fetch_optional(&mut *tx)
         .await?;
         if checkpoint.is_none() {
+            // A superseded checkpoint is removed once a later one is verified; verifying it
+            // late changes nothing.
+            let verified_through: i64 =
+                sqlx::query_scalar("select verified_through from live_logs where document_id = $1")
+                    .bind(doc.0)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            if through <= verified_through {
+                return Ok(());
+            }
             return Err(DbError::new(format!(
                 "no checkpoint {:?} at position {through} for {}",
                 revision, doc.0
@@ -1274,6 +1312,33 @@ impl Db {
         .execute(&mut *tx)
         .await?;
         advance_live_verified(&mut tx, doc, through, at).await?;
+        // Earlier unverified checkpoints are superseded: they give up their identity data,
+        // except the newest of another session, which a returning client of that session may
+        // still need; those left with none are removed.
+        sqlx::query(
+            "update live_checkpoints c set session_data = '' \
+             where c.document_id = $1 and c.verified_at is null and c.through < $2 \
+               and octet_length(c.session_data) > 0 \
+               and (c.session_id = (select session_id from live_checkpoints \
+                                    where document_id = $1 and revision = $3) \
+                    or exists (select 1 from live_checkpoints n \
+                               where n.document_id = c.document_id \
+                                 and n.session_id = c.session_id and n.through > c.through))",
+        )
+        .bind(doc.0)
+        .bind(through)
+        .bind(revision)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "delete from live_checkpoints \
+             where document_id = $1 and verified_at is null and through < $2 \
+               and octet_length(session_data) = 0",
+        )
+        .bind(doc.0)
+        .bind(through)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(())
     }

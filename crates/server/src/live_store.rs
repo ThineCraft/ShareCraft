@@ -963,6 +963,23 @@ mod memory {
             }
         }
 
+        /// The identity bytes held by `doc`'s checkpoints.
+        pub(crate) fn session_data_bytes(&self, doc: DocId) -> usize {
+            self.inner
+                .lock()
+                .ok()
+                .and_then(|state| {
+                    state.docs.get(&doc).map(|memory| {
+                        memory
+                            .checkpoints
+                            .iter()
+                            .map(|checkpoint| checkpoint.row.session_data.len())
+                            .sum()
+                    })
+                })
+                .unwrap_or_default()
+        }
+
         pub(crate) fn entry_count(&self) -> usize {
             self.inner
                 .lock()
@@ -1209,6 +1226,26 @@ mod memory {
                     row,
                     created_at: checkpoint.created_at,
                 });
+                let verified_through = memory.verified_through;
+                let counted = |row: &LiveCheckpointRow| {
+                    !row.verified
+                        && (row.through > verified_through
+                            || (verified_through == Seq(0) && row.through == Seq(0)))
+                };
+                let mut newest = memory
+                    .checkpoints
+                    .iter()
+                    .filter(|checkpoint| counted(&checkpoint.row))
+                    .map(|checkpoint| checkpoint.row.through)
+                    .collect::<Vec<_>>();
+                newest.sort_unstable_by(|a, b| b.cmp(a));
+                let dropped = newest
+                    .into_iter()
+                    .skip(records::MAX_UNVERIFIED_CHECKPOINTS)
+                    .collect::<HashSet<_>>();
+                memory.checkpoints.retain(|checkpoint| {
+                    !(counted(&checkpoint.row) && dropped.contains(&checkpoint.row.through))
+                });
             }
             Self::finish_write(state)
         }
@@ -1281,6 +1318,29 @@ mod memory {
                 })
                 .ok_or_else(|| DbError::new("no checkpoint at the exact revision and position"))?;
             checkpoint.row.verified = true;
+            let verified_session = checkpoint.row.session;
+            let rows = memory
+                .checkpoints
+                .iter()
+                .map(|checkpoint| (checkpoint.row.session, checkpoint.row.through))
+                .collect::<Vec<_>>();
+            for checkpoint in &mut memory.checkpoints {
+                let row = &mut checkpoint.row;
+                let superseded_in_session = rows
+                    .iter()
+                    .any(|(session, at)| *session == row.session && *at > row.through);
+                if !row.verified
+                    && row.through < through
+                    && (row.session == verified_session || superseded_in_session)
+                {
+                    row.session_data.clear();
+                }
+            }
+            memory.checkpoints.retain(|checkpoint| {
+                checkpoint.row.verified
+                    || checkpoint.row.through >= through
+                    || !checkpoint.row.session_data.is_empty()
+            });
             if through > memory.verified_through {
                 memory.verified_through = through;
                 memory.unsaved_entries = memory

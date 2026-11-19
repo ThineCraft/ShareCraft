@@ -56,6 +56,8 @@ pub struct Config {
     pub live_checkpoint_wait: Duration,
     /// How long a live checkpoint ticket can be used.
     pub live_ticket_lifetime: Duration,
+    /// How much unsaved live work a document may hold before it warns and pauses.
+    pub live_limits: LiveLimits,
     /// The PostgreSQL database holding accounts, sessions and access grants.
     pub database_url: DatabaseUrl,
     /// Where the built editors are installed, one folder per editor, served at `/editors`.
@@ -272,6 +274,7 @@ impl Config {
             live_checkpoint_quiet: crate::live_room::CHECKPOINT_QUIET,
             live_checkpoint_wait: crate::live_room::CHECKPOINT_WAIT,
             live_ticket_lifetime: crate::live_room::TICKET_LIFETIME,
+            live_limits: LiveLimits::default(),
             database_url,
             editors_dir: PathBuf::from(editors_dir.unwrap_or(DEFAULT_EDITORS)),
             max_file_bytes,
@@ -355,6 +358,31 @@ fn read_var(name: &'static str) -> Result<Option<String>, ConfigError> {
         Ok(v) => Ok(Some(v)),
         Err(std::env::VarError::NotPresent) => Ok(None),
         Err(std::env::VarError::NotUnicode(_)) => Err(ConfigError::NotUnicode(name)),
+    }
+}
+
+/// How much unsaved work a live log may hold since its verified base, counted in entries
+/// (cancel records included) and payload bytes. At a warning threshold the room asks for a
+/// checkpoint at once; at a hard limit it pauses new changes until a checkpoint is verified.
+/// The same limits bound the catch-up a joining client is sent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LiveLimits {
+    pub warn_entries: u64,
+    pub warn_bytes: u64,
+    pub hard_entries: u64,
+    pub hard_bytes: u64,
+}
+
+impl Default for LiveLimits {
+    /// The adopted values (plan G4, proposal 2): warn at 4,000 entries or 48 MiB, pause at
+    /// 5,000 entries or 64 MiB.
+    fn default() -> Self {
+        Self {
+            warn_entries: 4_000,
+            warn_bytes: 48 * 1024 * 1024,
+            hard_entries: 5_000,
+            hard_bytes: 64 * 1024 * 1024,
+        }
     }
 }
 

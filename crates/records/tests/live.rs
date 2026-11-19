@@ -1978,3 +1978,126 @@ async fn migration_0020_backfills_tombstones_in_one_pass() {
         assert_eq!(tombstone.final_seq, Seq(final_seq), "session {session}");
     }
 }
+
+/// Records `count` changes and an unverified checkpoint after each, with `data` as session
+/// data; answers the revisions, oldest first.
+async fn checkpoint_each_change(s: &Setup, session: Uuid, count: u64, data: &[u8]) -> Vec<String> {
+    let one = client();
+    let mut revisions = Vec::new();
+    let mut parent: Option<String> = None;
+    for seq in 1..=count {
+        s.test
+            .db
+            .append_live_change(s.doc, &change(seq, session, one, s.ann, seq, b"x", &[]))
+            .await
+            .unwrap();
+        let id = char::from(b'a' + u8::try_from(seq).unwrap());
+        let revision = revision(s, id, parent.as_deref()).await;
+        s.test
+            .db
+            .record_live_checkpoint(
+                s.doc,
+                &NewLiveCheckpoint {
+                    revision: &revision,
+                    through: Seq(seq),
+                    sha256: [u8::try_from(seq).unwrap(); 32],
+                    session,
+                    session_data: data,
+                    major_reason: None,
+                    major_person: None,
+                    writer: None,
+                    created_at: at(i64::try_from(seq).unwrap() + 100),
+                },
+            )
+            .await
+            .unwrap();
+        parent = Some(revision.clone());
+        revisions.push(revision);
+    }
+    revisions
+}
+
+#[tokio::test]
+async fn unverified_checkpoints_are_capped_per_document() {
+    let s = setup().await;
+    let session = session(&s, 0).await;
+    let count = u64::try_from(records::MAX_UNVERIFIED_CHECKPOINTS).unwrap() + 3;
+    let revisions = checkpoint_each_change(&s, session, count, b"identity table").await;
+
+    let loaded = s.test.db.load_live(s.doc).await.unwrap();
+    let kept = loaded
+        .unverified_checkpoints
+        .iter()
+        .map(|checkpoint| checkpoint.revision.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        kept,
+        revisions[revisions.len() - records::MAX_UNVERIFIED_CHECKPOINTS..],
+        "only the newest unverified checkpoints are kept"
+    );
+    let rows: i64 =
+        sqlx::query_scalar("select count(*) from live_checkpoints where document_id = $1")
+            .bind(s.doc.0)
+            .fetch_one(s.test.db.test_pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        rows,
+        i64::try_from(records::MAX_UNVERIFIED_CHECKPOINTS).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn verification_drops_superseded_session_data() {
+    let s = setup().await;
+    let session = session(&s, 0).await;
+    let revisions = checkpoint_each_change(&s, session, 3, b"identity table").await;
+
+    s.test
+        .db
+        .verify_live_checkpoint(s.doc, &revisions[1], Seq(2), at(50))
+        .await
+        .unwrap();
+
+    let data: Vec<(String, i32)> = sqlx::query_as(
+        "select revision, octet_length(session_data) from live_checkpoints \
+         where document_id = $1 order by through",
+    )
+    .bind(s.doc.0)
+    .fetch_all(s.test.db.test_pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        data,
+        [(revisions[1].clone(), 14), (revisions[2].clone(), 14),],
+        "the superseded unverified checkpoint is gone; the verified base and the newer one keep \
+         their identity data"
+    );
+}
+
+#[tokio::test]
+async fn checkpoint_session_data_counts_against_the_site_quota() {
+    let test = TestDb::create().await;
+    let ann = user(&test, "Ann", false).await.id;
+    let tree = tree(&test, ann).await;
+    let s = Setup {
+        bob: ann,
+        ann,
+        doc: tree.doc,
+        test,
+    };
+    let session = session(&s, 0).await;
+    checkpoint_each_change(&s, session, 2, &[7; 1_000]).await;
+    let with_data = s.test.db.site_usage(tree.site).await.unwrap();
+    sqlx::query("update live_checkpoints set session_data = '' where document_id = $1")
+        .bind(s.doc.0)
+        .execute(s.test.db.test_pool())
+        .await
+        .unwrap();
+    let without = s.test.db.site_usage(tree.site).await.unwrap();
+    assert_eq!(
+        with_data.used - without.used,
+        2_000,
+        "identity data is stored bytes"
+    );
+}

@@ -977,6 +977,7 @@ mod tests {
             live_checkpoint_quiet: Duration::from_secs(15),
             live_checkpoint_wait: Duration::from_secs(120),
             live_ticket_lifetime: Duration::from_secs(120),
+            live_limits: Default::default(),
             database_url: DatabaseUrl::new(test.url()),
             editors_dir: dir.join("editors"),
             max_file_bytes: 64 << 20,

@@ -383,6 +383,7 @@ impl AppState {
                 checkpoint_quiet: self.shared.config.live_checkpoint_quiet,
                 checkpoint_wait: self.shared.config.live_checkpoint_wait,
                 ticket_lifetime: self.shared.config.live_ticket_lifetime,
+                limits: self.shared.config.live_limits,
             },
         )
     }

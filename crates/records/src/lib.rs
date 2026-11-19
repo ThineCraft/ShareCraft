@@ -59,7 +59,7 @@ pub use links::{AnyoneGrant, Link, LinkError, LinkKind, LinkToken};
 pub use live::{
     GoneReason, LIVE_KEEP_DAYS, LiveCheckpointRow, LiveCheckpointWriter, LiveEntryRow, LiveLoaded,
     LiveLocal, LiveParticipantRow, LiveReturnTombstoneRow, LiveSessionDataRow, LiveSessionRow,
-    LiveSwept, NewLiveCancel, NewLiveChange, NewLiveCheckpoint,
+    LiveSwept, MAX_UNVERIFIED_CHECKPOINTS, NewLiveCancel, NewLiveChange, NewLiveCheckpoint,
 };
 pub use navigation::{NavViewer, ResolvedItem, ResolvedTarget, SitesMirror};
 pub use policies::{

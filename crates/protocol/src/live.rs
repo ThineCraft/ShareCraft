@@ -464,6 +464,9 @@ pub enum RefusedReason {
     BaseAhead,
     /// The change's `local` number is not the next one expected from this client.
     OutOfOrder,
+    /// The unsaved log is at its limit; changes are paused until a checkpoint is verified
+    /// (see [`LiveServerMsg::ChangesPaused`]). The change is not in the log.
+    LogPaused,
     /// A reason this build does not know, sent by a newer server. Never sent; a client reads it
     /// as a refusal all the same.
     #[serde(other)]
