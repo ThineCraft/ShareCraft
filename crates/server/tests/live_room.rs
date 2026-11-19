@@ -1046,12 +1046,19 @@ async fn checkpoint_identity_data_counts_against_the_site_quota() {
         if let Some(base) = &base {
             query.push(("base", base.clone()));
         }
+        let body = [identities.as_slice(), format!("book {local}").as_bytes()].concat();
+        // The second body has no declared length, so only the reservation can refuse it.
+        let body = if local == 1 {
+            reqwest::Body::from(body)
+        } else {
+            reqwest::Body::wrap_stream(futures_util::stream::iter([Ok::<_, std::io::Error>(body)]))
+        };
         let response = server
             .http(Some(&ann))
             .put(server.url(&format!("/api/docs/{}/live-checkpoint", doc.0)))
             .query(&query)
             .header("x-sharecraft-session-data-length", identities.len())
-            .body([identities.as_slice(), format!("book {local}").as_bytes()].concat())
+            .body(body)
             .send()
             .await
             .unwrap();
@@ -1066,8 +1073,57 @@ async fn checkpoint_identity_data_counts_against_the_site_quota() {
             assert_eq!(
                 response.status(),
                 StatusCode::INSUFFICIENT_STORAGE,
-                "the second checkpoint's identity data does not fit"
+                "the second checkpoint's identity data does not fit the reservation"
             );
         }
     }
+}
+
+/// The identity-data limit is checked from the header, before any of the body is read.
+#[tokio::test]
+async fn session_data_limit_is_enforced_before_upload() {
+    let server = spawn_server_config(|config| {
+        live_config(config);
+        config.live_checkpoint_quiet = Duration::from_millis(50);
+    })
+    .await;
+    let (doc, ann, _bob) = shared_live(&server).await;
+    let mut socket =
+        join_capable_socket(&server, doc, &ann, protocol::live::LiveBuild::Browser).await;
+    send_live(
+        &mut socket,
+        &LiveClientMsg::Entry {
+            local: LocalNo(1),
+            seen: Seq(0),
+            format: FORMAT.to_owned(),
+            payload: "x".to_owned(),
+        },
+    )
+    .await;
+    let (ticket, at, base) = next_live(&mut socket, |message| match message {
+        LiveServerMsg::CheckpointTicket {
+            ticket, at, base, ..
+        } => Some((ticket, at, base)),
+        _ => None,
+    })
+    .await;
+    let mut query = vec![("ticket", ticket.to_string()), ("at", at.0.to_string())];
+    if let Some(base) = &base {
+        query.push(("base", base.clone()));
+    }
+    let never_finishes = futures_util::stream::pending::<Result<Vec<u8>, std::io::Error>>();
+    let response = tokio::time::timeout(
+        Duration::from_secs(5),
+        server
+            .http(Some(&ann))
+            .put(server.url(&format!("/api/docs/{}/live-checkpoint", doc.0)))
+            .query(&query)
+            .header("x-sharecraft-session-data-length", 8 * 1024 * 1024 + 1)
+            .body(reqwest::Body::wrap_stream(never_finishes))
+            .send(),
+    )
+    .await
+    .expect("refused from the header, without reading the body")
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }

@@ -17,7 +17,7 @@ use protocol::RemovedReason;
 use protocol::live::{
     EntryBody, HEARTBEAT_MS, LIVE_PROTOCOL, LiveBuild, LiveClientMsg, LiveEntry, LivePerson,
     LiveResume, LiveServerMsg, LiveSessionId, LocalNo, MAX_PAYLOAD_BYTES, MajorReason,
-    ParticipantNo, Place, RefusedReason, TicketPurpose,
+    ParticipantNo, Place, RefusedReason, TicketPurpose, UnavailableReason,
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -200,6 +200,9 @@ pub enum Event {
     ArchiveReturn { current: Option<String> },
     /// The place ended after missed heartbeats; the client can join again.
     Expired,
+    /// The server cannot take the join for now; the client keeps its work and can join again
+    /// later.
+    Unavailable { reason: UnavailableReason },
     /// The client's protocol or format does not match the session's.
     Incompatible { protocol: u32, format: String },
     /// The server ended the connection; do not reconnect.
@@ -634,6 +637,10 @@ impl<E: LiveEditor> LiveClient<E> {
             LiveServerMsg::Incompatible { protocol, format } => {
                 self.phase = Phase::Closed;
                 step.events.push(Event::Incompatible { protocol, format });
+            }
+            LiveServerMsg::Unavailable { reason } => {
+                self.disconnected(now_ms);
+                step.events.push(Event::Unavailable { reason });
             }
             LiveServerMsg::Expired => {
                 self.disconnected(now_ms);

@@ -226,6 +226,37 @@ pub(crate) fn checkpoint_fields(
 pub(crate) trait LiveStore: Clone + Send + Sync + 'static {
     fn load_live(&self, doc: DocId) -> impl Future<Output = Result<LiveLoaded, DbError>> + Send;
 
+    /// The kept entries after the verified base and their bytes, without loading them.
+    fn live_unsaved_counts(
+        &self,
+        doc: DocId,
+    ) -> impl Future<Output = Result<(u64, u64), DbError>> + Send;
+
+    /// Sets aside the unverified checkpoint `revision` its verifier disagreed with.
+    fn dispute_live_checkpoint(
+        &self,
+        doc: DocId,
+        revision: &str,
+        at: OffsetDateTime,
+    ) -> impl Future<Output = Result<(), DbError>> + Send;
+
+    /// Accepts the checkpoint `revision` at `through` as the base with no second editor to
+    /// verify it.
+    fn accept_live_sole_editor(
+        &self,
+        doc: DocId,
+        revision: &str,
+        through: Seq,
+        at: OffsetDateTime,
+    ) -> impl Future<Output = Result<(), DbError>> + Send;
+
+    /// A second editor's hash matched the sole-editor base `revision`.
+    fn confirm_live_sole_editor(
+        &self,
+        doc: DocId,
+        revision: &str,
+    ) -> impl Future<Output = Result<(), DbError>> + Send;
+
     /// The document's current revision as recorded, for a log with no live checkpoint yet.
     fn current_revision(
         &self,
@@ -401,6 +432,33 @@ fn validate_checkpoint_description(
 impl LiveStore for Db {
     async fn load_live(&self, doc: DocId) -> Result<LiveLoaded, DbError> {
         Db::load_live(self, doc).await
+    }
+
+    async fn live_unsaved_counts(&self, doc: DocId) -> Result<(u64, u64), DbError> {
+        Db::live_unsaved_counts(self, doc).await
+    }
+
+    async fn dispute_live_checkpoint(
+        &self,
+        doc: DocId,
+        revision: &str,
+        at: OffsetDateTime,
+    ) -> Result<(), DbError> {
+        Db::dispute_live_checkpoint(self, doc, revision, at).await
+    }
+
+    async fn accept_live_sole_editor(
+        &self,
+        doc: DocId,
+        revision: &str,
+        through: Seq,
+        at: OffsetDateTime,
+    ) -> Result<(), DbError> {
+        Db::accept_live_sole_editor(self, doc, revision, through, at).await
+    }
+
+    async fn confirm_live_sole_editor(&self, doc: DocId, revision: &str) -> Result<(), DbError> {
+        Db::confirm_live_sole_editor(self, doc, revision).await
     }
 
     async fn current_revision(&self, doc: DocId) -> Result<Option<String>, DbError> {
@@ -611,6 +669,35 @@ impl LiveDb {
 impl LiveStore for LiveDb {
     async fn load_live(&self, doc: DocId) -> Result<LiveLoaded, DbError> {
         self.db.load_live(doc).await
+    }
+
+    async fn live_unsaved_counts(&self, doc: DocId) -> Result<(u64, u64), DbError> {
+        self.db.live_unsaved_counts(doc).await
+    }
+
+    async fn dispute_live_checkpoint(
+        &self,
+        doc: DocId,
+        revision: &str,
+        at: OffsetDateTime,
+    ) -> Result<(), DbError> {
+        self.db.dispute_live_checkpoint(doc, revision, at).await
+    }
+
+    async fn accept_live_sole_editor(
+        &self,
+        doc: DocId,
+        revision: &str,
+        through: Seq,
+        at: OffsetDateTime,
+    ) -> Result<(), DbError> {
+        self.db
+            .accept_live_sole_editor(doc, revision, through, at)
+            .await
+    }
+
+    async fn confirm_live_sole_editor(&self, doc: DocId, revision: &str) -> Result<(), DbError> {
+        self.db.confirm_live_sole_editor(doc, revision).await
     }
 
     async fn current_revision(&self, doc: DocId) -> Result<Option<String>, DbError> {
@@ -1148,6 +1235,8 @@ mod memory {
     struct MemoryCheckpoint {
         row: LiveCheckpointRow,
         created_at: OffsetDateTime,
+        /// Set aside after a verifier disagreed.
+        disputed: bool,
     }
 
     struct MemoryDoc {
@@ -1288,6 +1377,21 @@ mod memory {
             }
         }
 
+        /// How many local numbers were finally refused, over every document.
+        pub(crate) fn refused_locals(&self) -> usize {
+            self.inner
+                .lock()
+                .map(|state| {
+                    state
+                        .docs
+                        .values()
+                        .flat_map(|memory| memory.locals.values())
+                        .filter(|local| matches!(local, LiveLocal::Refused { .. }))
+                        .count()
+                })
+                .unwrap_or_default()
+        }
+
         /// The authors credited by the last checkpoint written.
         pub(crate) fn last_authors(&self) -> Vec<Author> {
             self.inner
@@ -1378,6 +1482,21 @@ mod memory {
         }
     }
 
+    /// The unsaved-log bytes of the entries after `through`: payloads, and each cancel record
+    /// at its encoded size.
+    fn unsaved_bytes_after(entries: &[LiveEntryRow], through: Seq) -> u64 {
+        entries
+            .iter()
+            .map(|entry| match entry {
+                LiveEntryRow::Change { seq, payload, .. } if *seq > through => {
+                    u64::try_from(payload.len()).unwrap_or(u64::MAX)
+                }
+                LiveEntryRow::Cancel { seq, .. } if *seq > through => records::LIVE_CANCEL_BYTES,
+                _ => 0,
+            })
+            .fold(0, u64::saturating_add)
+    }
+
     /// The in-memory form of `Db::adopt_live_base`.
     fn adopt_in(memory: &mut MemoryDoc, checkpoint: &NewLiveCheckpoint<'_>) -> Result<(), DbError> {
         if checkpoint.through > memory.head {
@@ -1389,6 +1508,7 @@ mod memory {
                 || (!kept.row.verified && kept.row.major_reason.is_none()))
         });
         memory.checkpoints.push(MemoryCheckpoint {
+            disputed: false,
             row: LiveCheckpointRow {
                 revision: checkpoint.revision.to_owned(),
                 through: checkpoint.through,
@@ -1399,6 +1519,7 @@ mod memory {
                 major_reason: checkpoint.major_reason.map(str::to_owned),
                 major_person: checkpoint.major_person,
                 writer: checkpoint.writer,
+                sole_editor: false,
             },
             created_at: checkpoint.created_at,
         });
@@ -1417,18 +1538,7 @@ mod memory {
                 .count()
                 .try_into()
                 .unwrap_or(u64::MAX);
-            memory.unsaved_bytes = memory
-                .entries
-                .iter()
-                .filter_map(|entry| match entry {
-                    LiveEntryRow::Change { seq, payload, .. } if *seq > through => {
-                        Some(payload.len())
-                    }
-                    _ => None,
-                })
-                .sum::<usize>()
-                .try_into()
-                .unwrap_or(u64::MAX);
+            memory.unsaved_bytes = unsaved_bytes_after(&memory.entries, through);
         }
         Ok(())
     }
@@ -1559,6 +1669,7 @@ mod memory {
                 .iter()
                 .filter(|checkpoint| {
                     !checkpoint.row.verified
+                        && !checkpoint.disputed
                         && (checkpoint.row.through > memory.verified_through
                             || (memory.verified_through == Seq(0)
                                 && checkpoint.row.through == Seq(0)))
@@ -1644,9 +1755,11 @@ mod memory {
                 major_reason: checkpoint.major_reason.map(str::to_owned),
                 major_person: checkpoint.major_person,
                 writer: checkpoint.writer,
+                sole_editor: false,
             };
             if let Some(existing) = memory.checkpoints.iter().find(|existing| {
-                existing.row.revision == row.revision || existing.row.through == row.through
+                existing.row.revision == row.revision
+                    || (existing.row.through == row.through && !existing.disputed)
             }) {
                 let mut stored = existing.row.clone();
                 stored.verified = false;
@@ -1655,6 +1768,7 @@ mod memory {
                 }
             } else {
                 memory.checkpoints.push(MemoryCheckpoint {
+                    disputed: false,
                     row,
                     created_at: checkpoint.created_at,
                 });
@@ -1668,7 +1782,7 @@ mod memory {
                 let mut newest = memory
                     .checkpoints
                     .iter()
-                    .filter(|checkpoint| counted(&checkpoint.row))
+                    .filter(|checkpoint| !checkpoint.disputed && counted(&checkpoint.row))
                     .map(|checkpoint| checkpoint.row.through)
                     .collect::<Vec<_>>();
                 newest.sort_unstable_by(|a, b| b.cmp(a));
@@ -1677,7 +1791,8 @@ mod memory {
                     .skip(records::MAX_UNVERIFIED_CHECKPOINTS)
                     .collect::<HashSet<_>>();
                 memory.checkpoints.retain(|checkpoint| {
-                    !(counted(&checkpoint.row) && dropped.contains(&checkpoint.row.through))
+                    checkpoint.disputed
+                        || !(counted(&checkpoint.row) && dropped.contains(&checkpoint.row.through))
                 });
             }
             Self::finish_write(state)
@@ -1805,6 +1920,66 @@ mod memory {
             self.record_live_checkpoint(doc, checkpoint).await
         }
 
+        async fn live_unsaved_counts(&self, doc: DocId) -> Result<(u64, u64), DbError> {
+            let state = self.state()?;
+            Ok(state.docs.get(&doc).map_or((0, 0), |memory| {
+                (memory.unsaved_entries, memory.unsaved_bytes)
+            }))
+        }
+
+        async fn dispute_live_checkpoint(
+            &self,
+            doc: DocId,
+            revision: &str,
+            _at: OffsetDateTime,
+        ) -> Result<(), DbError> {
+            let mut state = self.write()?;
+            let memory = state.docs.entry(doc).or_default();
+            for checkpoint in &mut memory.checkpoints {
+                if checkpoint.row.revision == revision && !checkpoint.row.verified {
+                    checkpoint.disputed = true;
+                    checkpoint.row.session_data.clear();
+                }
+            }
+            Self::finish_write(state)
+        }
+
+        async fn accept_live_sole_editor(
+            &self,
+            doc: DocId,
+            revision: &str,
+            through: Seq,
+            at: OffsetDateTime,
+        ) -> Result<(), DbError> {
+            self.verify_live_checkpoint(doc, revision, through, at)
+                .await?;
+            let mut state = self.state()?;
+            if let Some(memory) = state.docs.get_mut(&doc) {
+                for checkpoint in &mut memory.checkpoints {
+                    if checkpoint.row.revision == revision {
+                        checkpoint.row.sole_editor = true;
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        async fn confirm_live_sole_editor(
+            &self,
+            doc: DocId,
+            revision: &str,
+        ) -> Result<(), DbError> {
+            let mut state = self.write()?;
+            if let Some(memory) = state.docs.get_mut(&doc) {
+                for checkpoint in &mut memory.checkpoints {
+                    if checkpoint.row.revision == revision {
+                        checkpoint.row.sole_editor = false;
+                    }
+                }
+            }
+            Self::finish_write(state)
+        }
+
         async fn verify_live_checkpoint(
             &self,
             doc: DocId,
@@ -1821,10 +1996,13 @@ mod memory {
                 .checkpoints
                 .iter_mut()
                 .find(|checkpoint| {
-                    checkpoint.row.revision == revision && checkpoint.row.through == through
+                    !checkpoint.disputed
+                        && checkpoint.row.revision == revision
+                        && checkpoint.row.through == through
                 })
                 .ok_or_else(|| DbError::new("no checkpoint at the exact revision and position"))?;
             checkpoint.row.verified = true;
+            checkpoint.row.sole_editor = false;
             let verified_session = checkpoint.row.session;
             let rows = memory
                 .checkpoints
@@ -1861,18 +2039,7 @@ mod memory {
                     .count()
                     .try_into()
                     .unwrap_or(u64::MAX);
-                memory.unsaved_bytes = memory
-                    .entries
-                    .iter()
-                    .filter_map(|entry| match entry {
-                        LiveEntryRow::Change { seq, payload, .. } if *seq > through => {
-                            Some(payload.len())
-                        }
-                        _ => None,
-                    })
-                    .sum::<usize>()
-                    .try_into()
-                    .unwrap_or(u64::MAX);
+                memory.unsaved_bytes = unsaved_bytes_after(&memory.entries, through);
             }
             Self::finish_write(state)
         }
@@ -2075,6 +2242,9 @@ mod memory {
                 reports: cancel.reports,
             });
             memory.unsaved_entries = memory.unsaved_entries.saturating_add(1);
+            memory.unsaved_bytes = memory
+                .unsaved_bytes
+                .saturating_add(records::LIVE_CANCEL_BYTES);
             memory.head = cancel.seq;
             Ok(())
         }
@@ -2713,7 +2883,7 @@ mod tests {
 
         let loaded = store.load_live(doc).await.unwrap();
         assert_eq!(loaded.unsaved_entries, 2);
-        assert_eq!(loaded.unsaved_bytes, 3);
+        assert_eq!(loaded.unsaved_bytes, 3 + records::LIVE_CANCEL_BYTES);
     }
 
     #[tokio::test]

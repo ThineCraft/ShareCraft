@@ -2452,3 +2452,25 @@ fn replaced_base_at_the_same_position_is_loaded() {
             .any(|event| matches!(event, Event::LoadBase { .. }))
     );
 }
+
+/// A join refused for now (the log is over its limit) is recoverable: the client goes offline
+/// and keeps its work for a later join, and is not closed.
+#[test]
+fn unavailable_join_is_recoverable() {
+    let mut doc = StandIn::new("a");
+    let mut client = live(&mut doc, 1);
+    let id = client.new_ids(1).unwrap();
+    client
+        .local(&mut doc, insert(id, "kept"), Mode::ShowAtOnce, 10)
+        .unwrap();
+    client.disconnected(20);
+    client.connected(30);
+    let frame = json!({ "type": "unavailable", "reason": "log_over_limit" }).to_string();
+    let step = client.receive(&mut doc, &frame, 40).unwrap();
+    assert!(step.events.contains(&Event::Unavailable {
+        reason: protocol::live::UnavailableReason::LogOverLimit
+    }));
+    assert_eq!(client.phase(), Phase::Offline);
+    assert_eq!(client.pending(), 1);
+    assert_eq!(client.connected(50).len(), 1, "it can join again");
+}

@@ -20,12 +20,20 @@ create table live_checkpoints (
   writer_participant integer check (writer_participant >= 1),
   writer_client uuid,
   created_at timestamptz not null,
+  -- A verifier's hash disagreed: kept for forensics, never a base, and its position is free
+  -- for another writer's checkpoint.
+  disputed_at timestamptz,
+  -- Accepted as the base with no second capable editor to verify it; cleared when one does.
+  sole_editor_at timestamptz,
   check ((writer_participant is null) = (writer_client is null)),
-  primary key (document_id, revision),
-  unique (document_id, through)
+  check (disputed_at is null or verified_at is null),
+  primary key (document_id, revision)
 );
+-- One standing checkpoint per position; disputed ones step aside.
+create unique index live_checkpoints_position on live_checkpoints (document_id, through)
+  where disputed_at is null;
 create index live_checkpoints_unverified on live_checkpoints (document_id, through)
-  where verified_at is null;
+  where verified_at is null and disputed_at is null;
 
 -- The small, permanent part of an ended place. It is enough to recognise an expired client
 -- after session entries and identity data have completed their retention period.

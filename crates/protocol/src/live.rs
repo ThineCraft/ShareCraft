@@ -88,6 +88,17 @@ pub enum TicketPurpose {
     Verify,
 }
 
+/// Why the server cannot take a join for now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnavailableReason {
+    /// The document's kept log is beyond what the server's limits allow sending a joiner.
+    LogOverLimit,
+    /// A reason this build does not know, sent by a newer server.
+    #[serde(other)]
+    Unknown,
+}
+
 /// Why a checkpoint is marked as a major version.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -347,6 +358,12 @@ pub enum LiveServerMsg {
     },
     /// The last frame: the place ended after missed heartbeats. Join again.
     Expired,
+    /// The last frame: the join is refused for now; nothing is lost and a later join may
+    /// succeed. A server fault, not a removal.
+    Unavailable {
+        /// Why.
+        reason: UnavailableReason,
+    },
     /// The last frame before the server closes the connection; do not reconnect.
     Removed {
         /// Why.
@@ -468,8 +485,9 @@ pub enum RefusedReason {
     BaseAhead,
     /// The change's `local` number is not the next one expected from this client.
     OutOfOrder,
-    /// The unsaved log is at its limit; changes are paused until a checkpoint is verified
-    /// (see [`LiveServerMsg::ChangesPaused`]). The change is not in the log.
+    /// Changes are paused: the unsaved log is at its limit until a checkpoint is verified (or
+    /// accepted from a sole editor), or a major version is being stored at the head (see
+    /// [`LiveServerMsg::ChangesPaused`]). The change is not in the log.
     LogPaused,
     /// A reason this build does not know, sent by a newer server. Never sent; a client reads it
     /// as a refusal all the same.
@@ -553,6 +571,7 @@ mod tests {
                 LiveServerMsg::ArchiveReturn { .. } => "archive_return",
                 LiveServerMsg::Incompatible { .. } => "incompatible",
                 LiveServerMsg::Expired => "expired",
+                LiveServerMsg::Unavailable { .. } => "unavailable",
                 LiveServerMsg::Removed { .. } => "removed",
             }
         }
@@ -649,6 +668,9 @@ mod tests {
                 format: "gridcraft/1".into(),
             },
             LiveServerMsg::Expired,
+            LiveServerMsg::Unavailable {
+                reason: UnavailableReason::LogOverLimit,
+            },
             LiveServerMsg::Removed {
                 reason: RemovedReason::Deleted,
             },
@@ -661,7 +683,7 @@ mod tests {
         // The strings are written out in the matches above; this checks they are the strings
         // on the wire, and that no sample was dropped from the lists.
         assert_eq!(client.len(), 9);
-        assert_eq!(server.len(), 15);
+        assert_eq!(server.len(), 16);
     }
 
     #[test]
