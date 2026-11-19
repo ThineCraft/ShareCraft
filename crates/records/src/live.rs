@@ -627,7 +627,7 @@ async fn insert_live_checkpoint(
              where document_id = $1 and verified_at is null \
                and revision in ( \
                  select revision from live_checkpoints \
-                 where document_id = $1 and verified_at is null \
+                 where document_id = $1 and verified_at is null and major_reason is null \
                    and (through > $2 or ($2 = 0 and through = 0)) \
                  order by through desc offset $3)",
         )
@@ -1339,6 +1339,65 @@ impl Db {
         .bind(through)
         .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Makes `checkpoint`, a revision that replaced the live file from outside and was stored
+    /// again on top of the log's last state, the verified catch-up base at its position (S4):
+    /// the live checkpoints it supersedes are removed (major versions stay) and the verified
+    /// position advances to it. Its session data is normally empty: the base is a plain file.
+    /// Kept entries stay for their retention period.
+    pub async fn adopt_live_base(
+        &self,
+        doc: DocId,
+        checkpoint: &NewLiveCheckpoint<'_>,
+        at: OffsetDateTime,
+    ) -> Result<(), DbError> {
+        let through = signed(checkpoint.through.0)?;
+        let mut tx = self.pool().begin().await?;
+        let head = lock_log(&mut tx, doc).await?;
+        if through > head {
+            return Err(DbError::new(format!(
+                "base position {through} exceeds the head {head} of {}",
+                doc.0
+            )));
+        }
+        sqlx::query(
+            "delete from live_checkpoints \
+             where document_id = $1 and (revision = $2 or through >= $3 \
+                   or (verified_at is null and major_reason is null))",
+        )
+        .bind(doc.0)
+        .bind(checkpoint.revision)
+        .bind(through)
+        .execute(&mut *tx)
+        .await?;
+        let writer_participant = checkpoint
+            .writer
+            .map(|writer| number(writer.participant))
+            .transpose()?;
+        sqlx::query(
+            "insert into live_checkpoints \
+                 (document_id, revision, through, sha256, verified_at, session_id, session_data, \
+                  major_reason, major_person, created_at, writer_participant, writer_client) \
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+        )
+        .bind(doc.0)
+        .bind(checkpoint.revision)
+        .bind(through)
+        .bind(checkpoint.sha256.as_slice())
+        .bind(at)
+        .bind(checkpoint.session)
+        .bind(checkpoint.session_data)
+        .bind(checkpoint.major_reason)
+        .bind(checkpoint.major_person.map(|person| person.0))
+        .bind(checkpoint.created_at)
+        .bind(writer_participant)
+        .bind(checkpoint.writer.map(|writer| writer.client.0))
+        .execute(&mut *tx)
+        .await?;
+        advance_live_verified(&mut tx, doc, through, at).await?;
         tx.commit().await?;
         Ok(())
     }

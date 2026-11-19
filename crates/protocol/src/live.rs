@@ -96,6 +96,10 @@ pub enum MajorReason {
     ReturningClientBefore,
     /// Preserve the result after applying a returning client's late changes.
     ReturningClientAfter,
+    /// Preserve the room's last state below a file that replaced it from outside (S4).
+    OutsideReplacement,
+    /// Preserve an expired returning client's own copy below the current file.
+    ReturningClientArchive,
 }
 
 /// Browser (or desktop editor) to server. Unknown fields are refused. The `Debug` form leaves

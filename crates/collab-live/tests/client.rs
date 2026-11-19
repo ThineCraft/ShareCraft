@@ -2404,3 +2404,51 @@ fn own_crash_while_catching_up_from_the_base_is_a_crash_in_place() {
     assert_eq!(doc.doc.lines(), vec!["one", "mine"]);
     assert_eq!(client.pending(), 1);
 }
+
+fn catchup_on(base: u64, revision: &str, from: u64, head: u64) -> String {
+    json!({ "type": "catchup", "base": base, "revision": revision, "from": from, "head": head })
+        .to_string()
+}
+
+/// A base named at exactly the client's position but with another revision replaced the
+/// file from outside (S4): the client loads it rather than keep its own state. The same
+/// revision again carries on as before.
+#[test]
+fn replaced_base_at_the_same_position_is_loaded() {
+    let mut doc = StandIn::new("a");
+    let mut client = live(&mut doc, 1);
+    client
+        .receive(
+            &mut doc,
+            &entry(1, 2, other(2), 1, 0, &insert(LiveId(2, 0), "x")),
+            10,
+        )
+        .unwrap();
+    assert_eq!(client.agreed_seq(), Seq(1));
+
+    let step = client
+        .receive(&mut doc, &catchup_on(1, "outside", 1, 1), 20)
+        .unwrap();
+    assert_eq!(client.phase(), Phase::LoadingBase);
+    assert!(step.events.contains(&Event::LoadBase {
+        revision: Some("outside".to_owned()),
+        at: Seq(1),
+    }));
+    client.base_ready(&mut doc, 30).unwrap();
+    assert_eq!(client.phase(), Phase::Live);
+
+    // Reconnecting onto the same base keeps the state.
+    client.disconnected(40);
+    client.connected(50);
+    client.receive(&mut doc, &joined_kept(1), 60).unwrap();
+    let step = client
+        .receive(&mut doc, &catchup_on(1, "outside", 1, 1), 60)
+        .unwrap();
+    assert_eq!(client.phase(), Phase::Live);
+    assert!(
+        !step
+            .events
+            .iter()
+            .any(|event| matches!(event, Event::LoadBase { .. }))
+    );
+}

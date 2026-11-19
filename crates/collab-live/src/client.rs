@@ -352,6 +352,8 @@ pub struct LiveClient<E: LiveEditor> {
     held: Vec<LiveEntry>,
     /// The base position named by the catch-up while loading the base.
     base_at: Seq,
+    /// The stored revision the editor's state was loaded from.
+    base_revision: Option<String>,
     /// The entry the editor stopped in, until a verdict on it arrives: the stall survives
     /// reconnects, and a client started with a crash note begins with it.
     stalled_at: Option<Seq>,
@@ -391,6 +393,7 @@ impl<E: LiveEditor> LiveClient<E> {
             next_local: 1,
             held: Vec::new(),
             base_at: Seq(0),
+            base_revision: None,
             stalled_at,
             skipped: BTreeSet::new(),
         }
@@ -494,12 +497,16 @@ impl<E: LiveEditor> LiveClient<E> {
                     ));
                 }
                 self.head = head;
-                if self.has_state && from == self.agreed_seq {
+                // Another revision named at exactly the client's position replaced the file
+                // from outside (S4): what the client holds is no longer the agreed state.
+                let replaced = from == base && revision != self.base_revision;
+                if self.has_state && from == self.agreed_seq && !replaced {
                     self.phase = Phase::CatchingUp;
                 } else {
                     self.phase = Phase::LoadingBase;
                     self.held.clear();
                     self.base_at = base;
+                    self.base_revision.clone_from(&revision);
                     step.events.push(Event::LoadBase { revision, at: base });
                 }
                 self.check_live(now_ms, &mut step);

@@ -73,6 +73,19 @@ pub(crate) enum RoomKind {
     Live,
 }
 
+/// Which room opens a document of `editor`. Only a co-authoring editor (GridCraft) may use the
+/// live room; one-seat editors keep their file session and its whole-file return rule (C22)
+/// even when listed.
+pub(crate) fn room_kind(live_editors: &[Editor], editor: Editor) -> RoomKind {
+    if editor == Editor::GridCraft && live_editors.contains(&editor) {
+        RoomKind::Live
+    } else if editor.is_file() {
+        RoomKind::File
+    } else {
+        RoomKind::Text
+    }
+}
+
 /// `GET /ws/docs/{doc_id}`: upgrades to a WebSocket connected to that document: its text room,
 /// or its file session when the document is a file. The caller is the signed-in person (`401`
 /// without a session) and needs a role on the document; a document that does not exist and one
@@ -139,13 +152,7 @@ async fn visitor(
         expires_at: session.expires_at,
         name: session.user.name,
         role,
-        kind: if state.config().live_editors.contains(&document.editor) {
-            RoomKind::Live
-        } else if document.editor.is_file() {
-            RoomKind::File
-        } else {
-            RoomKind::Text
-        },
+        kind: room_kind(&state.config().live_editors, document.editor),
         doc_name: document.name,
     })
 }
@@ -333,7 +340,7 @@ async fn live_session(s: &mut Session<'_>, first: &str) -> bool {
         seen,
         can_checkpoint,
         build,
-        ..
+        returning_through,
     }) = serde_json::from_str::<LiveClientMsg>(first)
     else {
         return false;
@@ -352,6 +359,7 @@ async fn live_session(s: &mut Session<'_>, first: &str) -> bool {
             seen,
             can_checkpoint,
             build,
+            returning_through,
         },
     )
     .await
@@ -519,6 +527,7 @@ struct LiveJoinFields {
     seen: Option<collab_core::ids::Seq>,
     can_checkpoint: bool,
     build: protocol::live::LiveBuild,
+    returning_through: Option<protocol::live::LocalNo>,
 }
 
 async fn join_live_room(
@@ -536,6 +545,7 @@ async fn join_live_room(
         seen,
         can_checkpoint,
         build,
+        returning_through,
     } = join;
     join_with(
         || state.open_live_room(doc),
@@ -553,6 +563,7 @@ async fn join_live_room(
             seen,
             can_checkpoint,
             build,
+            returning_through,
             tx,
             accepted,
         },
@@ -781,6 +792,19 @@ async fn write(sink: &mut Sink, out: Outbound, limit: Duration) -> Result<(), Wr
 )]
 mod tests {
     use super::*;
+
+    /// One-seat editors keep their whole-file seat and its version-on-top return (C22): even
+    /// listed as live editors they never reach the live room or its return path.
+    #[test]
+    fn one_seat_return_remains_the_file_session_rule() {
+        let all = Editor::ALL.to_vec();
+        for editor in [Editor::WordCraft, Editor::PdfCraft, Editor::SolidCraft] {
+            assert_eq!(room_kind(&all, editor), RoomKind::File, "{editor:?}");
+        }
+        assert_eq!(room_kind(&all, Editor::GridCraft), RoomKind::Live);
+        assert_eq!(room_kind(&[], Editor::GridCraft), RoomKind::File);
+        assert_eq!(room_kind(&all, Editor::Text), RoomKind::Text);
+    }
 
     #[test]
     fn session_end_becomes_a_timer_deadline() {

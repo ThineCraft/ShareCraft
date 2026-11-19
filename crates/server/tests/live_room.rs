@@ -235,10 +235,7 @@ async fn expiry_with_entry_in_flight_commits_once() {
     a.reconnect(&server).await;
     a.pump_until(|c| c.client().phase() == Phase::Live).await;
     assert_eq!(a.client().pending(), 1);
-    a.receive_server_message(&LiveServerMsg::ReturnReady {
-        through: LocalNo(1),
-    })
-    .await;
+    // The server stores the current file as a major version, then lets the batch go.
     a.pump_until(|c| c.client().phase() == Phase::Live && c.client().pending() == 0)
         .await;
     assert!(matches!(a.last_place(), Some(Place::Returning { .. })));
