@@ -57,8 +57,9 @@ pub use libraries::{
 };
 pub use links::{AnyoneGrant, Link, LinkError, LinkKind, LinkToken};
 pub use live::{
-    GoneReason, LIVE_KEEP_DAYS, LiveEntryRow, LiveLoaded, LiveLocal, LiveParticipantRow,
-    LiveSessionRow, LiveSwept, NewLiveCancel, NewLiveChange,
+    GoneReason, LIVE_KEEP_DAYS, LiveCheckpointRow, LiveEntryRow, LiveLoaded, LiveLocal,
+    LiveParticipantRow, LiveReturnTombstoneRow, LiveSessionDataRow, LiveSessionRow, LiveSwept,
+    NewLiveCancel, NewLiveChange, NewLiveCheckpoint,
 };
 pub use navigation::{NavViewer, ResolvedItem, ResolvedTarget, SitesMirror};
 pub use policies::{

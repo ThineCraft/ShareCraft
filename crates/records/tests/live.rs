@@ -11,7 +11,11 @@ mod common;
 use collab_core::ids::{ClientId, DocId, Seq, UserId};
 use common::{Gate, tree, user, wait_blocked};
 use records::test_support::TestDb;
-use records::{GoneReason, LiveEntryRow, LiveLocal, NewLiveCancel, NewLiveChange};
+use records::{
+    GoneReason, LiveCheckpointRow, LiveEntryRow, LiveLocal, LiveReturnTombstoneRow,
+    LiveSessionDataRow, NewLiveCancel, NewLiveChange, NewLiveCheckpoint, RevisionRecord,
+};
+use serde_json::json;
 use sqlx::Connection;
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
@@ -101,6 +105,29 @@ async fn live_log_gate(s: &Setup) -> Gate {
         .await
         .unwrap();
     Gate { conn, pid }
+}
+
+async fn revision(s: &Setup, id: char, parent: Option<&str>) -> String {
+    let revision = id.to_string().repeat(40);
+    assert!(
+        s.test
+            .db
+            .append_revision(
+                parent,
+                &RevisionRecord {
+                    doc: s.doc,
+                    revision: revision.clone(),
+                    committed_at: at(i64::from(id as u8)),
+                    authors: vec![(s.ann.0.to_string(), "Ann".to_string())],
+                    name: "live.grid".to_string(),
+                    fields: json!({}),
+                    size: 10,
+                },
+            )
+            .await
+            .unwrap()
+    );
+    revision
 }
 
 #[tokio::test]
@@ -1126,4 +1153,515 @@ async fn migration_0018_upgrades_an_existing_database() {
         .await
         .unwrap();
     assert_eq!(test.db.load_live(doc).await.unwrap().head, Seq(1));
+}
+
+#[tokio::test]
+async fn live_checkpoint_records_revision_position_hash_and_session_data() {
+    let s = setup().await;
+    let session = session(&s, 0).await;
+    let one = client();
+    s.test
+        .db
+        .append_live_change(s.doc, &change(1, session, one, s.ann, 1, b"entry", &[]))
+        .await
+        .unwrap();
+    let revision = revision(&s, 'a', None).await;
+    let sha256 = [7; 32];
+    let session_data = br#"{"sheet":"identity"}"#;
+
+    s.test
+        .db
+        .record_live_checkpoint(
+            s.doc,
+            &NewLiveCheckpoint {
+                revision: &revision,
+                through: Seq(1),
+                sha256,
+                session,
+                session_data,
+                major_reason: Some("returning_client_before"),
+                major_person: Some(s.ann),
+                created_at: at(2),
+            },
+        )
+        .await
+        .unwrap();
+
+    let loaded = s.test.db.load_live(s.doc).await.unwrap();
+    assert_eq!(loaded.verified_checkpoint, None);
+    assert_eq!(
+        loaded.unverified_checkpoints,
+        [LiveCheckpointRow {
+            revision,
+            through: Seq(1),
+            sha256,
+            verified: false,
+            session,
+            session_data: session_data.to_vec(),
+            major_reason: Some("returning_client_before".to_string()),
+            major_person: Some(s.ann),
+        }]
+    );
+    assert_eq!(loaded.unsaved_entries, 1);
+    assert_eq!(loaded.unsaved_bytes, 5);
+}
+
+#[tokio::test]
+async fn verification_advances_only_the_matching_checkpoint() {
+    let s = setup().await;
+    let session = session(&s, 0).await;
+    let one = client();
+    for seq in 1..=2 {
+        s.test
+            .db
+            .append_live_change(s.doc, &change(seq, session, one, s.ann, seq, b"x", &[]))
+            .await
+            .unwrap();
+    }
+    let first = revision(&s, 'a', None).await;
+    let second = revision(&s, 'b', Some(&first)).await;
+    for (revision, through, byte) in [(&first, 1, 1), (&second, 2, 2)] {
+        s.test
+            .db
+            .record_live_checkpoint(
+                s.doc,
+                &NewLiveCheckpoint {
+                    revision,
+                    through: Seq(through),
+                    sha256: [byte; 32],
+                    session,
+                    session_data: &[byte],
+                    major_reason: None,
+                    major_person: None,
+                    created_at: at(through as i64 + 2),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    assert!(
+        s.test
+            .db
+            .verify_live_checkpoint(s.doc, &first, Seq(2), at(5))
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        s.test.db.load_live(s.doc).await.unwrap().verified_through,
+        Seq(0)
+    );
+
+    s.test
+        .db
+        .verify_live_checkpoint(s.doc, &first, Seq(1), at(6))
+        .await
+        .unwrap();
+    let loaded = s.test.db.load_live(s.doc).await.unwrap();
+    assert_eq!(loaded.verified_through, Seq(1));
+    assert_eq!(loaded.verified_checkpoint.unwrap().revision, first);
+    assert_eq!(
+        loaded
+            .unverified_checkpoints
+            .iter()
+            .map(|checkpoint| checkpoint.revision.as_str())
+            .collect::<Vec<_>>(),
+        [&second]
+    );
+}
+
+#[tokio::test]
+async fn checkpoint_position_cannot_exceed_head() {
+    let s = setup().await;
+    let session = session(&s, 0).await;
+    let revision = revision(&s, 'a', None).await;
+
+    assert!(
+        s.test
+            .db
+            .record_live_checkpoint(
+                s.doc,
+                &NewLiveCheckpoint {
+                    revision: &revision,
+                    through: Seq(1),
+                    sha256: [3; 32],
+                    session,
+                    session_data: b"session",
+                    major_reason: None,
+                    major_person: None,
+                    created_at: at(1),
+                },
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        s.test
+            .db
+            .load_live(s.doc)
+            .await
+            .unwrap()
+            .unverified_checkpoints
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn older_checkpoint_cannot_replace_the_base() {
+    let s = setup().await;
+    let session = session(&s, 0).await;
+    let one = client();
+    for seq in 1..=2 {
+        s.test
+            .db
+            .append_live_change(s.doc, &change(seq, session, one, s.ann, seq, b"x", &[]))
+            .await
+            .unwrap();
+    }
+    let first = revision(&s, 'a', None).await;
+    let second = revision(&s, 'b', Some(&first)).await;
+    for (revision, through) in [(&first, 1), (&second, 2)] {
+        s.test
+            .db
+            .record_live_checkpoint(
+                s.doc,
+                &NewLiveCheckpoint {
+                    revision,
+                    through: Seq(through),
+                    sha256: [through as u8; 32],
+                    session,
+                    session_data: &[through as u8],
+                    major_reason: None,
+                    major_person: None,
+                    created_at: at(through as i64 + 2),
+                },
+            )
+            .await
+            .unwrap();
+    }
+    s.test
+        .db
+        .verify_live_checkpoint(s.doc, &second, Seq(2), at(5))
+        .await
+        .unwrap();
+    s.test
+        .db
+        .verify_live_checkpoint(s.doc, &first, Seq(1), at(20))
+        .await
+        .unwrap();
+
+    let loaded = s.test.db.load_live(s.doc).await.unwrap();
+    assert_eq!(loaded.verified_through, Seq(2));
+    assert_eq!(loaded.verified_checkpoint.unwrap().revision, second);
+    assert_eq!(
+        sqlx::query_scalar::<_, OffsetDateTime>(
+            "select verified_at from live_logs where document_id = $1"
+        )
+        .bind(s.doc.0)
+        .fetch_one(s.test.db.test_pool())
+        .await
+        .unwrap(),
+        at(5),
+        "a stale verification must not restart retention"
+    );
+}
+
+#[tokio::test]
+async fn session_data_survives_until_covered_entries_expire() {
+    let s = setup().await;
+    let session = session(&s, 0).await;
+    let one = client();
+    s.test
+        .db
+        .append_live_change(s.doc, &change(1, session, one, s.ann, 1, b"x", &[]))
+        .await
+        .unwrap();
+    let revision = revision(&s, 'a', None).await;
+    s.test
+        .db
+        .record_live_checkpoint(
+            s.doc,
+            &NewLiveCheckpoint {
+                revision: &revision,
+                through: Seq(1),
+                sha256: [4; 32],
+                session,
+                session_data: b"identity table",
+                major_reason: None,
+                major_person: None,
+                created_at: at(2),
+            },
+        )
+        .await
+        .unwrap();
+    s.test
+        .db
+        .verify_live_checkpoint(s.doc, &revision, Seq(1), at(3))
+        .await
+        .unwrap();
+    s.test.db.end_live_session(session, at(4)).await.unwrap();
+
+    s.test
+        .db
+        .sweep_live(at(3) + Duration::days(29))
+        .await
+        .unwrap();
+    assert_eq!(
+        s.test
+            .db
+            .load_live(s.doc)
+            .await
+            .unwrap()
+            .verified_checkpoint
+            .unwrap()
+            .session_data,
+        b"identity table"
+    );
+
+    s.test
+        .db
+        .sweep_live(at(3) + Duration::days(30) + Duration::seconds(1))
+        .await
+        .unwrap();
+    let loaded = s.test.db.load_live(s.doc).await.unwrap();
+    assert!(loaded.entries.is_empty());
+    assert!(loaded.verified_checkpoint.unwrap().session_data.is_empty());
+}
+
+#[tokio::test]
+async fn return_tombstone_survives_detail_retention() {
+    let s = setup().await;
+    let session = session(&s, 0).await;
+    let one = client();
+    let participant = s
+        .test
+        .db
+        .add_live_participant(s.doc, session, one, s.ann, at(0))
+        .await
+        .unwrap();
+    s.test
+        .db
+        .append_live_change(s.doc, &change(1, session, one, s.ann, 1, b"x", &[]))
+        .await
+        .unwrap();
+    s.test
+        .db
+        .mark_live_verified(s.doc, Seq(1), at(1))
+        .await
+        .unwrap();
+    s.test.db.end_live_session(session, at(2)).await.unwrap();
+
+    s.test
+        .db
+        .sweep_live(at(1) + Duration::days(31))
+        .await
+        .unwrap();
+    let loaded = s.test.db.load_live(s.doc).await.unwrap();
+    assert!(loaded.participants.is_empty());
+    assert_eq!(
+        loaded.return_tombstones,
+        [LiveReturnTombstoneRow {
+            session,
+            participant,
+            client: one,
+            user: s.ann,
+            ended_at: at(2),
+            final_seq: Seq(1),
+        }]
+    );
+}
+
+#[tokio::test]
+async fn revision_index_rebuild_keeps_live_checkpoint_metadata() {
+    let s = setup().await;
+    let session = session(&s, 0).await;
+    let one = client();
+    for seq in 1..=2 {
+        s.test
+            .db
+            .append_live_change(s.doc, &change(seq, session, one, s.ann, seq, b"x", &[]))
+            .await
+            .unwrap();
+    }
+    let first = revision(&s, 'a', None).await;
+    let second = revision(&s, 'b', Some(&first)).await;
+    for (revision, through, data) in [(&first, 1, b"first".as_slice()), (&second, 2, b"second")] {
+        s.test
+            .db
+            .record_live_checkpoint(
+                s.doc,
+                &NewLiveCheckpoint {
+                    revision,
+                    through: Seq(through),
+                    sha256: [through as u8; 32],
+                    session,
+                    session_data: data,
+                    major_reason: None,
+                    major_person: None,
+                    created_at: at(through as i64 + 2),
+                },
+            )
+            .await
+            .unwrap();
+    }
+    s.test
+        .db
+        .verify_live_checkpoint(s.doc, &first, Seq(1), at(5))
+        .await
+        .unwrap();
+    let history = vec![
+        RevisionRecord {
+            doc: s.doc,
+            revision: first.clone(),
+            committed_at: at(i64::from(b'a')),
+            authors: vec![(s.ann.0.to_string(), "Ann".to_string())],
+            name: "live.grid".to_string(),
+            fields: json!({}),
+            size: 10,
+        },
+        RevisionRecord {
+            doc: s.doc,
+            revision: second.clone(),
+            committed_at: at(i64::from(b'b')),
+            authors: vec![(s.ann.0.to_string(), "Ann".to_string())],
+            name: "live.grid".to_string(),
+            fields: json!({}),
+            size: 10,
+        },
+    ];
+
+    s.test.db.replace_revisions(s.doc, &history).await.unwrap();
+
+    let loaded = s.test.db.load_live(s.doc).await.unwrap();
+    assert_eq!(loaded.verified_checkpoint.unwrap().revision, first);
+    assert_eq!(loaded.unverified_checkpoints[0].revision, second);
+    assert_eq!(loaded.unverified_checkpoints[0].session_data, b"second");
+}
+
+#[tokio::test]
+async fn load_keeps_retained_identity_data_for_older_sessions() {
+    let s = setup().await;
+    let first_session = session(&s, 0).await;
+    let one = client();
+    s.test
+        .db
+        .append_live_change(s.doc, &change(1, first_session, one, s.ann, 1, b"one", &[]))
+        .await
+        .unwrap();
+    let first_revision = revision(&s, 'a', None).await;
+    s.test
+        .db
+        .record_live_checkpoint(
+            s.doc,
+            &NewLiveCheckpoint {
+                revision: &first_revision,
+                through: Seq(1),
+                sha256: [1; 32],
+                session: first_session,
+                session_data: b"first identities",
+                major_reason: None,
+                major_person: None,
+                created_at: at(2),
+            },
+        )
+        .await
+        .unwrap();
+    s.test
+        .db
+        .verify_live_checkpoint(s.doc, &first_revision, Seq(1), at(3))
+        .await
+        .unwrap();
+    s.test
+        .db
+        .end_live_session(first_session, at(4))
+        .await
+        .unwrap();
+
+    let second_session = session(&s, 5).await;
+    s.test
+        .db
+        .append_live_change(
+            s.doc,
+            &change(2, second_session, client(), s.bob, 1, b"two", &[]),
+        )
+        .await
+        .unwrap();
+    let second_revision = revision(&s, 'b', Some(&first_revision)).await;
+    s.test
+        .db
+        .record_live_checkpoint(
+            s.doc,
+            &NewLiveCheckpoint {
+                revision: &second_revision,
+                through: Seq(2),
+                sha256: [2; 32],
+                session: second_session,
+                session_data: b"second identities",
+                major_reason: None,
+                major_person: None,
+                created_at: at(6),
+            },
+        )
+        .await
+        .unwrap();
+    s.test
+        .db
+        .verify_live_checkpoint(s.doc, &second_revision, Seq(2), at(7))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        s.test
+            .db
+            .load_live(s.doc)
+            .await
+            .unwrap()
+            .retained_session_data,
+        [
+            LiveSessionDataRow {
+                session: first_session,
+                through: Seq(1),
+                session_data: b"first identities".to_vec(),
+            },
+            LiveSessionDataRow {
+                session: second_session,
+                through: Seq(2),
+                session_data: b"second identities".to_vec(),
+            },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn zero_position_checkpoint_survives_sweep_and_loads_for_verification() {
+    let s = setup().await;
+    let session = session(&s, 0).await;
+    let revision = revision(&s, 'a', None).await;
+    s.test
+        .db
+        .record_live_checkpoint(
+            s.doc,
+            &NewLiveCheckpoint {
+                revision: &revision,
+                through: Seq(0),
+                sha256: [9; 32],
+                session,
+                session_data: b"empty workbook identities",
+                major_reason: None,
+                major_person: None,
+                created_at: at(1),
+            },
+        )
+        .await
+        .unwrap();
+
+    s.test.db.sweep_live(at(2)).await.unwrap();
+
+    let loaded = s.test.db.load_live(s.doc).await.unwrap();
+    assert_eq!(loaded.unverified_checkpoints.len(), 1);
+    assert_eq!(loaded.unverified_checkpoints[0].revision, revision);
+    assert_eq!(
+        loaded.unverified_checkpoints[0].session_data,
+        b"empty workbook identities"
+    );
 }

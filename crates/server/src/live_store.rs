@@ -240,7 +240,11 @@ mod memory {
                 last_participant: memory.last_participant,
                 format: memory.format.clone(),
                 verified_through: memory.verified_through,
+                verified_checkpoint: None,
+                unverified_checkpoints: Vec::new(),
                 entries: memory.entries.clone(),
+                unsaved_entries: u64::try_from(memory.entries.len()).unwrap_or(u64::MAX),
+                unsaved_bytes: 0,
                 open_session: memory.open_session.clone(),
                 participants: memory.participants.clone(),
                 clients: memory
@@ -248,6 +252,8 @@ mod memory {
                     .iter()
                     .map(|(client, (user, next))| (*client, *user, *next))
                     .collect(),
+                retained_session_data: Vec::new(),
+                return_tombstones: Vec::new(),
             })
         }
 

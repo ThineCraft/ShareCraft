@@ -28,6 +28,14 @@ pub(crate) async fn delete_live_logs(
         .bind(&ids)
         .execute(&mut *conn)
         .await?;
+    sqlx::query("delete from live_checkpoints where document_id = any($1)")
+        .bind(&ids)
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query("delete from live_return_tombstones where document_id = any($1)")
+        .bind(&ids)
+        .execute(&mut *conn)
+        .await?;
     sqlx::query("delete from live_sessions where document_id = any($1)")
         .bind(&ids)
         .execute(&mut *conn)
@@ -52,6 +60,53 @@ pub struct LiveSwept {
     pub entries: u64,
     pub sessions: u64,
     pub clients: u64,
+}
+
+/// One durable checkpoint of a live log.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiveCheckpointRow {
+    pub revision: String,
+    pub through: Seq,
+    pub sha256: [u8; 32],
+    pub verified: bool,
+    pub session: Uuid,
+    /// Opaque editor identity data associated with the checkpoint bytes.
+    pub session_data: Vec<u8>,
+    pub major_reason: Option<String>,
+    pub major_person: Option<UserId>,
+}
+
+/// A checkpoint to associate with an existing revision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NewLiveCheckpoint<'a> {
+    pub revision: &'a str,
+    pub through: Seq,
+    pub sha256: [u8; 32],
+    pub session: Uuid,
+    pub session_data: &'a [u8],
+    pub major_reason: Option<&'a str>,
+    pub major_person: Option<UserId>,
+    pub created_at: OffsetDateTime,
+}
+
+/// The minimal durable identity of one place in an ended session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiveReturnTombstoneRow {
+    pub session: Uuid,
+    pub participant: u32,
+    pub client: ClientId,
+    pub user: UserId,
+    pub ended_at: OffsetDateTime,
+    pub final_seq: Seq,
+}
+
+/// The newest retained identity table for one live session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiveSessionDataRow {
+    pub session: Uuid,
+    pub through: Seq,
+    /// Opaque editor identity data.
+    pub session_data: Vec<u8>,
 }
 
 /// Why a place in a live session ended.
@@ -99,8 +154,16 @@ pub struct LiveLoaded {
     pub format: Option<String>,
     /// Entries at or below this position are covered by a verified revision.
     pub verified_through: Seq,
+    /// The newest verified checkpoint, which is the catch-up base.
+    pub verified_checkpoint: Option<LiveCheckpointRow>,
+    /// Unverified checkpoints later than the catch-up base, oldest first.
+    pub unverified_checkpoints: Vec<LiveCheckpointRow>,
     /// Every kept entry after `verified_through`, oldest first.
     pub entries: Vec<LiveEntryRow>,
+    /// Kept entries after the verified base.
+    pub unsaved_entries: u64,
+    /// Payload bytes kept after the verified base.
+    pub unsaved_bytes: u64,
     /// The open session, if any.
     pub open_session: Option<LiveSessionRow>,
     /// Every participant ever given a place in this document, including ended sessions.
@@ -108,6 +171,10 @@ pub struct LiveLoaded {
     /// Every client of the document: its id, its person and its next local number (one past
     /// the highest number stored or finally refused).
     pub clients: Vec<(ClientId, UserId, u64)>,
+    /// Retained identity data for current and ended sessions, oldest first.
+    pub retained_session_data: Vec<LiveSessionDataRow>,
+    /// Ended places retained after their detailed session rows expire.
+    pub return_tombstones: Vec<LiveReturnTombstoneRow>,
 }
 
 /// A live session.
@@ -399,6 +466,62 @@ fn entry_of(row: &PgRow) -> Result<LiveEntryRow, DbError> {
     }
 }
 
+async fn advance_live_verified(
+    conn: &mut PgConnection,
+    doc: DocId,
+    through: i64,
+    at: OffsetDateTime,
+) -> Result<(), DbError> {
+    sqlx::query(
+        "update live_logs set verified_through = $2, verified_at = $3 \
+         where document_id = $1 and verified_through < $2",
+    )
+    .bind(doc.0)
+    .bind(through)
+    .bind(at)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+fn checkpoint_of(row: &PgRow) -> Result<LiveCheckpointRow, DbError> {
+    let bytes: Vec<u8> = row.try_get("sha256")?;
+    let sha256 = bytes.try_into().map_err(|bytes: Vec<u8>| {
+        DbError::new(format!("checkpoint hash has {} bytes", bytes.len()))
+    })?;
+    Ok(LiveCheckpointRow {
+        revision: row.try_get("revision")?,
+        through: Seq(unsigned(row.try_get("through")?)?),
+        sha256,
+        verified: row
+            .try_get::<Option<OffsetDateTime>, _>("verified_at")?
+            .is_some(),
+        session: row.try_get("session_id")?,
+        session_data: row.try_get("session_data")?,
+        major_reason: row.try_get("major_reason")?,
+        major_person: row.try_get::<Option<Uuid>, _>("major_person")?.map(UserId),
+    })
+}
+
+fn return_tombstone_of(row: &PgRow) -> Result<LiveReturnTombstoneRow, DbError> {
+    Ok(LiveReturnTombstoneRow {
+        session: row.try_get("session_id")?,
+        participant: unnumber(row.try_get("participant")?)?,
+        client: ClientId(row.try_get("client_id")?),
+        user: UserId(row.try_get("user_id")?),
+        ended_at: row.try_get("ended_at")?,
+        final_seq: Seq(unsigned(row.try_get("final_seq")?)?),
+    })
+}
+
+fn session_data_of(row: &PgRow) -> Result<LiveSessionDataRow, DbError> {
+    Ok(LiveSessionDataRow {
+        session: row.try_get("session_id")?,
+        through: Seq(unsigned(row.try_get("through")?)?),
+        session_data: row.try_get("session_data")?,
+    })
+}
+
 impl Db {
     /// `doc`'s live log: its head, its kept entries after the verified position, its open
     /// session with every place in it, and its clients.
@@ -417,6 +540,33 @@ impl Db {
         .fetch_one(&mut *tx)
         .await?;
         let verified_through: i64 = log.try_get("verified_through")?;
+        let verified_checkpoint = sqlx::query(
+            "select revision, through, sha256, verified_at, session_id, session_data, \
+                    major_reason, major_person \
+             from live_checkpoints where document_id = $1 and verified_at is not null \
+             order by through desc limit 1",
+        )
+        .bind(doc.0)
+        .fetch_optional(&mut *tx)
+        .await?
+        .as_ref()
+        .map(checkpoint_of)
+        .transpose()?;
+        let unverified_checkpoints = sqlx::query(
+            "select revision, through, sha256, verified_at, session_id, session_data, \
+                    major_reason, major_person \
+             from live_checkpoints \
+             where document_id = $1 and verified_at is null \
+               and (through > $2 or ($2 = 0 and through = 0)) \
+             order by through",
+        )
+        .bind(doc.0)
+        .bind(verified_through)
+        .fetch_all(&mut *tx)
+        .await?
+        .iter()
+        .map(checkpoint_of)
+        .collect::<Result<Vec<_>, _>>()?;
         let entries = sqlx::query(
             "select seq, session_id, kind, client_id, local, participant, user_id, seen, at, \
                     seed, format, payload, witnesses, cancels, reports, cancelled_by \
@@ -429,6 +579,15 @@ impl Db {
         .iter()
         .map(entry_of)
         .collect::<Result<Vec<_>, _>>()?;
+        let unsaved = sqlx::query(
+            "select count(*)::bigint as entries, \
+                    coalesce(sum(octet_length(payload)), 0)::bigint as bytes \
+             from live_entries where document_id = $1 and seq > $2",
+        )
+        .bind(doc.0)
+        .bind(verified_through)
+        .fetch_one(&mut *tx)
+        .await?;
 
         let session = sqlx::query(
             "select id, format, first_seq, started_at from live_sessions \
@@ -507,6 +666,31 @@ impl Db {
             ))
         })
         .collect::<Result<Vec<_>, DbError>>()?;
+        let retained_session_data = sqlx::query(
+            "select session_id, through, session_data from ( \
+                 select distinct on (session_id) session_id, through, session_data \
+                 from live_checkpoints \
+                 where document_id = $1 and octet_length(session_data) > 0 \
+                 order by session_id, through desc \
+             ) retained order by through",
+        )
+        .bind(doc.0)
+        .fetch_all(&mut *tx)
+        .await?
+        .iter()
+        .map(session_data_of)
+        .collect::<Result<Vec<_>, _>>()?;
+        let return_tombstones = sqlx::query(
+            "select session_id, participant, client_id, user_id, ended_at, final_seq \
+             from live_return_tombstones where document_id = $1 \
+             order by ended_at, session_id, participant",
+        )
+        .bind(doc.0)
+        .fetch_all(&mut *tx)
+        .await?
+        .iter()
+        .map(return_tombstone_of)
+        .collect::<Result<Vec<_>, _>>()?;
         tx.commit().await?;
 
         Ok(LiveLoaded {
@@ -514,10 +698,16 @@ impl Db {
             last_participant: unnumber(log.try_get("last_participant")?)?,
             format: log.try_get("format")?,
             verified_through: Seq(unsigned(verified_through)?),
+            verified_checkpoint,
+            unverified_checkpoints,
             entries,
+            unsaved_entries: unsigned(unsaved.try_get("entries")?)?,
+            unsaved_bytes: unsigned(unsaved.try_get("bytes")?)?,
             open_session,
             participants,
             clients,
+            retained_session_data,
+            return_tombstones,
         })
     }
 
@@ -847,6 +1037,144 @@ impl Db {
         local_disposition(&mut conn, doc, client, signed(local)?).await
     }
 
+    /// Associates an existing revision with one exact position and its opaque session data.
+    /// Repeating the same record is idempotent; a conflicting revision or position fails.
+    pub async fn record_live_checkpoint(
+        &self,
+        doc: DocId,
+        checkpoint: &NewLiveCheckpoint<'_>,
+    ) -> Result<(), DbError> {
+        let through = signed(checkpoint.through.0)?;
+        let mut tx = self.pool().begin().await?;
+        let head = lock_log(&mut tx, doc).await?;
+        if through > head {
+            return Err(DbError::new(format!(
+                "checkpoint position {through} exceeds the head {head} of {}",
+                doc.0
+            )));
+        }
+        let session_exists: bool = sqlx::query_scalar(
+            "select exists(select 1 from live_sessions where id = $1 and document_id = $2)",
+        )
+        .bind(checkpoint.session)
+        .bind(doc.0)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !session_exists {
+            return Err(DbError::new(format!(
+                "{} is not a live session of {}",
+                checkpoint.session, doc.0
+            )));
+        }
+        let revision_exists: bool = sqlx::query_scalar(
+            "select exists(select 1 from revisions where revision = $1 and document_id = $2)",
+        )
+        .bind(checkpoint.revision)
+        .bind(doc.0)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !revision_exists {
+            return Err(DbError::new(format!(
+                "revision {:?} does not belong to {}",
+                checkpoint.revision, doc.0
+            )));
+        }
+        let inserted = sqlx::query(
+            "insert into live_checkpoints \
+                 (document_id, revision, through, sha256, session_id, session_data, \
+                  major_reason, major_person, created_at) \
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+             on conflict do nothing",
+        )
+        .bind(doc.0)
+        .bind(checkpoint.revision)
+        .bind(through)
+        .bind(checkpoint.sha256.as_slice())
+        .bind(checkpoint.session)
+        .bind(checkpoint.session_data)
+        .bind(checkpoint.major_reason)
+        .bind(checkpoint.major_person.map(|person| person.0))
+        .bind(checkpoint.created_at)
+        .execute(&mut *tx)
+        .await?;
+        if inserted.rows_affected() == 0 {
+            let same: bool = sqlx::query_scalar(
+                "select exists( \
+                    select 1 from live_checkpoints \
+                    where document_id = $1 and revision = $2 and through = $3 \
+                      and sha256 = $4 and session_id = $5 and session_data = $6 \
+                      and major_reason is not distinct from $7 \
+                      and major_person is not distinct from $8 and created_at = $9)",
+            )
+            .bind(doc.0)
+            .bind(checkpoint.revision)
+            .bind(through)
+            .bind(checkpoint.sha256.as_slice())
+            .bind(checkpoint.session)
+            .bind(checkpoint.session_data)
+            .bind(checkpoint.major_reason)
+            .bind(checkpoint.major_person.map(|person| person.0))
+            .bind(checkpoint.created_at)
+            .fetch_one(&mut *tx)
+            .await?;
+            if !same {
+                return Err(DbError::new(format!(
+                    "checkpoint {:?} or position {through} conflicts with a stored checkpoint",
+                    checkpoint.revision
+                )));
+            }
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Marks exactly the named checkpoint verified and atomically advances the catch-up base.
+    pub async fn verify_live_checkpoint(
+        &self,
+        doc: DocId,
+        revision: &str,
+        through: Seq,
+        at: OffsetDateTime,
+    ) -> Result<(), DbError> {
+        let through = signed(through.0)?;
+        let mut tx = self.pool().begin().await?;
+        let head = lock_log(&mut tx, doc).await?;
+        if through > head {
+            return Err(DbError::new(format!(
+                "checkpoint position {through} exceeds the head {head} of {}",
+                doc.0
+            )));
+        }
+        let checkpoint: Option<Vec<u8>> = sqlx::query_scalar(
+            "select sha256 from live_checkpoints \
+             where document_id = $1 and revision = $2 and through = $3 for update",
+        )
+        .bind(doc.0)
+        .bind(revision)
+        .bind(through)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if checkpoint.is_none() {
+            return Err(DbError::new(format!(
+                "no checkpoint {:?} at position {through} for {}",
+                revision, doc.0
+            )));
+        }
+        sqlx::query(
+            "update live_checkpoints set verified_at = coalesce(verified_at, $4) \
+             where document_id = $1 and revision = $2 and through = $3",
+        )
+        .bind(doc.0)
+        .bind(revision)
+        .bind(through)
+        .bind(at)
+        .execute(&mut *tx)
+        .await?;
+        advance_live_verified(&mut tx, doc, through, at).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Marks entries through `through` as covered by a verified revision. A stale mark does
     /// not move the verified position backwards or restart its retention period.
     pub async fn mark_live_verified(
@@ -856,16 +1184,8 @@ impl Db {
         at: OffsetDateTime,
     ) -> Result<(), DbError> {
         let mut tx = self.pool().begin().await?;
-        ensure_log(&mut tx, doc).await?;
-        sqlx::query(
-            "update live_logs set verified_through = $2, verified_at = $3 \
-             where document_id = $1 and verified_through < $2",
-        )
-        .bind(doc.0)
-        .bind(signed(through.0)?)
-        .bind(at)
-        .execute(&mut *tx)
-        .await?;
+        lock_log(&mut tx, doc).await?;
+        advance_live_verified(&mut tx, doc, signed(through.0)?, at).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -887,6 +1207,17 @@ impl Db {
         .execute(&mut *tx)
         .await?
         .rows_affected();
+        sqlx::query(
+            "update live_checkpoints c set session_data = '' \
+             where octet_length(c.session_data) > 0 \
+               and c.created_at < $1 \
+               and not exists (select 1 from live_entries e where e.session_id = c.session_id) \
+               and not exists (select 1 from live_sessions s \
+                               where s.id = c.session_id and s.ended_at is null)",
+        )
+        .bind(cutoff)
+        .execute(&mut *tx)
+        .await?;
         sqlx::query("delete from live_refusals where at < $1")
             .bind(cutoff)
             .execute(&mut *tx)
@@ -938,12 +1269,25 @@ impl Db {
     /// no such session.
     pub async fn end_live_session(&self, session: Uuid, at: OffsetDateTime) -> Result<(), DbError> {
         let mut tx = self.pool().begin().await?;
-        session_doc(&mut tx, session).await?;
+        let doc = session_doc(&mut tx, session).await?;
+        let head = lock_log(&mut tx, doc).await?;
         sqlx::query("update live_sessions set ended_at = $2 where id = $1 and ended_at is null")
             .bind(session)
             .bind(at)
             .execute(&mut *tx)
             .await?;
+        sqlx::query(
+            "insert into live_return_tombstones \
+                 (session_id, participant, document_id, client_id, user_id, ended_at, final_seq) \
+             select s.id, p.number, s.document_id, p.client_id, p.user_id, s.ended_at, $2 \
+             from live_sessions s join live_participants p on p.session_id = s.id \
+             where s.id = $1 and s.ended_at is not null \
+             on conflict do nothing",
+        )
+        .bind(session)
+        .bind(head)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(())
     }
