@@ -1,6 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { connectLive, liveRetry, parseLiveEditorMessage, peekServerFrame, warnOnLeave } from './live-host.js';
+import {
+  MAX_SEND_BYTES,
+  connectLive,
+  liveNotice,
+  liveRetry,
+  onlyEditor,
+  parseLiveEditorMessage,
+  peekServerFrame,
+  pickBanner,
+  warnOnLeave,
+} from './live-host.js';
 
 const ORIGIN = 'https://share.test';
 const DOC = 'doc-1';
@@ -449,7 +459,7 @@ test('checkpoint_upload_uses_the_ticket_and_base', async () => {
   assert.equal(call.url, `/api/docs/doc-1/live-checkpoint?ticket=${TICKET}&at=7&base=r1`);
   assert.equal(call.init.method, 'PUT');
   assert.equal(call.init.headers['x-sharecraft-session-data-length'], '1');
-  assert.deepEqual([...call.init.body], [3, 1, 2]);
+  assert.deepEqual([...new Uint8Array(await call.init.body.arrayBuffer())], [3, 1, 2]);
   assert.equal(socket().sent.length, 0, 'a stored checkpoint needs no frame');
 
   // No base: none named. A failed upload gives the ticket back, so another writer is asked.
@@ -667,4 +677,212 @@ test('leaving_warns_while_live_changes_wait', () => {
   assert.equal(warnOnLeave({ phase: 'live', waiting: 0, canEdit: true }), false);
   assert.equal(warnOnLeave({ phase: 'offline', waiting: 3, canEdit: true }), true);
   assert.equal(warnOnLeave({ phase: 'live', waiting: 1, canEdit: true }), true);
+});
+
+// ---- notices (Task 13) ----
+
+const CTX = { nameOf: (participant) => (participant === 4 ? 'Ann Tester' : null), onlyEditor: false, canManage: false };
+
+test('live_notice_wording_for_each_kind', () => {
+  const rows = [
+    // The editor's LiveNotice kinds.
+    ['editor', { kind: 'not_applied', seq: 3, kept_text: null, reason: 'row_deleted' }, "Your change wasn't applied because someone deleted that row.", 'status'],
+    ['editor', { kind: 'not_applied', seq: 3, kept_text: null, reason: 'column_deleted' }, "Your change wasn't applied because someone deleted that column.", 'status'],
+    ['editor', { kind: 'not_applied', seq: 3, kept_text: null, reason: 'sheet_deleted' }, "Your change wasn't applied because someone deleted that sheet.", 'status'],
+    ['editor', { kind: 'not_applied', seq: 3, kept_text: null, reason: 'target_unavailable' }, "Your change wasn't applied because the cells it was for can't be changed now.", 'status'],
+    ['editor', { kind: 'not_applied', seq: 3, kept_text: null, reason: 'changed_since_undo' }, "Undo wasn't applied because someone changed those cells since.", 'status'],
+    ['editor', { kind: 'not_applied', seq: 3, kept_text: null, reason: 'invalid' }, "Your change wasn't applied because it isn't valid here.", 'status'],
+    ['editor', { kind: 'not_applied', seq: 3, kept_text: null, reason: 'failed' }, "Your change couldn't be applied.", 'status'],
+    ['editor', { kind: 'not_applied', seq: 3, kept_text: null, reason: 'something_new' }, "Your change couldn't be applied.", 'status'],
+    ['editor', { kind: 'change_refused', reason: 'read_only' }, "You can only view this document, so your change wasn't kept.", 'status'],
+    ['editor', { kind: 'change_refused', reason: 'too_large' }, "That change is too large to share, so it wasn't kept. Try a smaller one.", 'status'],
+    ['editor', { kind: 'change_refused', reason: 'rate_limited' }, "Changes came too fast, so one wasn't kept. Try it again.", 'status'],
+    ['editor', { kind: 'change_refused', reason: 'out_of_order' }, "Your change couldn't be shared, so it wasn't kept.", 'status'],
+    ['editor', { kind: 'undo_left', cells: 1 }, 'Undo left 1 cell as it was, because someone changed it since.', 'status'],
+    ['editor', { kind: 'undo_left', cells: 3 }, 'Undo left 3 cells as they were, because someone changed them since.', 'status'],
+    ['editor', { kind: 'undo_refused', reason: 'anything' }, "Undo isn't possible here, because someone else's changes depend on it.", 'status'],
+    ['editor', { kind: 'unshared', command: 'sort' }, 'Not available while editing together.', 'status'],
+    ['editor', { kind: 'paused', entries: 10, bytes: 99 }, 'Changes are paused until the latest version is saved. A lot of changes are waiting to go into the stored file.', 'status'],
+    ['editor', { kind: 'returned', not_applied: 0 }, 'Welcome back. The changes you made while away have been added.', 'status'],
+    ['editor', { kind: 'returned', not_applied: 2 }, "Welcome back. 2 of the changes you made while away couldn't be applied.", 'status'],
+    ['editor', { kind: 'returned', not_applied: 1 }, "Welcome back. 1 of the changes you made while away couldn't be applied.", 'status'],
+    ['editor', { kind: 'archived_return' }, "You were away too long for your changes to be added. The copy you had is kept in the file's history.", 'status'],
+    ['editor', { kind: 'others_returning', participant: 4 }, "Changes Ann Tester made while away are arriving. The version before them is kept.", 'status'],
+    ['editor', { kind: 'others_returning', participant: 9 }, "Changes someone made while away are arriving. The version before them is kept.", 'status'],
+    ['editor', { kind: 'read_only', read_only: true }, 'You can now only view this document.', 'status'],
+    ['editor', { kind: 'read_only', read_only: false }, 'You can edit this document again.', 'status'],
+    ['editor', { kind: 'cannot_open' }, "This document can't be opened together, because one of its changes can't be applied. You can download the last stored version.", 'alert'],
+    ['editor', { kind: 'incompatible' }, 'This editor is out of date. Reload to keep working together.', 'alert'],
+    ['editor', { kind: 'build_refused' }, "Editing together isn't available in the desktop app yet.", 'alert'],
+    // The server messages the page peeks at.
+    ['server', { type: 'changes_paused', entries: 10, bytes: 99 }, 'Changes are paused until the latest version is saved. A lot of changes are waiting to go into the stored file.', 'status'],
+    ['server', { type: 'returning', participant: 4 }, "Changes Ann Tester made while away are arriving. The version before them is kept.", 'status'],
+    ['server', { type: 'cannot_open', seq: 5 }, "This document can't be opened together, because one of its changes can't be applied. You can download the last stored version.", 'alert'],
+    ['server', { type: 'incompatible', protocol: 1, format: 'gridcraft/1' }, 'This editor is out of date. Reload to keep working together.', 'alert'],
+    ['server', { type: 'build_refused', build: {} }, "Editing together isn't available in the desktop app yet.", 'alert'],
+    // Resets: joining again, never an error.
+    ['reset', 'unavailable', 'This document is busy right now. Joining again shortly; your changes are kept.', 'status'],
+    ['reset', 'expired', 'You were away for a while. Joining again; your changes are kept.', 'status'],
+    ['reset', 'base', "The latest version couldn't be loaded. Trying again shortly.", 'status'],
+    ['reset', 'base_fetch', "The latest version couldn't be loaded. Trying again shortly.", 'status'],
+    ['reset', 'overloaded', 'Too many changes arrived at once. Reconnecting; your changes are kept.', 'status'],
+    ['reset', 'editor', 'Reconnecting; your changes are kept.', 'status'],
+    ['reset', 'malformed', 'Reconnecting; your changes are kept.', 'status'],
+    ['reset', 'out_of_order', 'Reconnecting; your changes are kept.', 'status'],
+    ['reset', 'desync', 'Reconnecting; your changes are kept.', 'status'],
+    ['reset', 'agreed_unavailable', 'Reconnecting; your changes are kept.', 'status'],
+    // Stops.
+    ['stop', 'repeated', "This document can't be opened together right now.", 'alert'],
+    ['stop', 'incompatible', 'This editor is out of date. Reload to keep working together.', 'alert'],
+    ['stop', 'build_refused', "Editing together isn't available in the desktop app yet.", 'alert'],
+    ['stop', 'cannot_open', "This document can't be opened together, because one of its changes can't be applied. You can download the last stored version.", 'alert'],
+    ['stop', 'not_answering', "The editor isn't answering.", 'alert'],
+  ];
+  for (const [source, value, text, role] of rows) {
+    const notice = liveNotice(source, value, CTX);
+    assert.equal(notice?.text, text, `${source} ${JSON.stringify(value)}`);
+    assert.equal(notice.role, role, `${source} ${JSON.stringify(value)}`);
+    assert.ok(notice.actions.length <= 2);
+  }
+  // The stops offer their way on; "Reload editor" is its own button.
+  assert.deepEqual(liveNotice('stop', 'not_answering', CTX).actions, ['reloadEditor']);
+  assert.deepEqual(liveNotice('stop', 'repeated', CTX).actions, ['reload']);
+  assert.deepEqual(liveNotice('stop', 'incompatible', CTX).actions, ['reload']);
+  assert.deepEqual(liveNotice('stop', 'cannot_open', CTX).actions, ['download']);
+  // Resumed clears the pause; people, access, removed, expired and saved say nothing here.
+  assert.deepEqual(liveNotice('editor', { kind: 'resumed' }, CTX), { topic: 'paused', clear: true });
+  assert.deepEqual(liveNotice('server', { type: 'changes_resumed' }, CTX), { topic: 'paused', clear: true });
+  for (const type of ['people', 'access', 'removed', 'expired']) assert.equal(liveNotice('server', { type }, CTX), null);
+  assert.equal(liveNotice('server', { type: 'saved', revision: 'r', through: 3, verified: true, major: false }, CTX), null);
+  assert.equal(liveNotice('editor', { kind: 'removed' }, CTX), null);
+  assert.equal(liveNotice('editor', { kind: 'nonsense' }, CTX), null);
+  assert.equal(liveNotice('editor', null, CTX), null);
+});
+
+test('not_applied_notice_offers_to_copy_the_kept_text', () => {
+  const notice = liveNotice('editor', { kind: 'not_applied', seq: 3, kept_text: '<b>=SUM(A1)</b>', reason: 'row_deleted' }, CTX);
+  assert.equal(notice.text, "Your change wasn't applied because someone deleted that row. Your text is kept.");
+  assert.deepEqual(notice.actions, ['copy']);
+  assert.equal(notice.copy, '<b>=SUM(A1)</b>', 'kept as text, to copy; never shown as markup');
+  assert.ok(!notice.text.includes('SUM'), 'the typed text is not in the sentence');
+  const none = liveNotice('editor', { kind: 'not_applied', seq: 3, kept_text: '', reason: 'row_deleted' }, CTX);
+  assert.deepEqual(none.actions, []);
+});
+
+test('paused_notice_asks_to_keep_the_tab_open_only_when_needed', () => {
+  const paused = { kind: 'paused', entries: 10, bytes: 99 };
+  assert.doesNotMatch(liveNotice('editor', paused, CTX).text, /Keep this tab open/);
+  const alone = liveNotice('editor', paused, { ...CTX, onlyEditor: true });
+  assert.match(alone.text, /Keep this tab open so they can be saved\.$/);
+  assert.match(liveNotice('server', { type: 'changes_paused' }, { ...CTX, onlyEditor: true }).text, /Keep this tab open/);
+  // Only an editor that may save counts; viewers and dropped places do not.
+  const people = [
+    { participant: 1, can_edit: true, connected: true },
+    { participant: 2, can_edit: false, connected: true },
+    { participant: 3, can_edit: true, connected: false },
+  ];
+  assert.equal(onlyEditor(people, true), true);
+  assert.equal(onlyEditor(people, false), false);
+  assert.equal(onlyEditor([...people, { participant: 4, can_edit: true, connected: true }], true), false);
+  assert.equal(onlyEditor(null, true), true);
+});
+
+test('returning_notice_says_the_earlier_version_is_kept', () => {
+  const notice = liveNotice('server', { type: 'returning', participant: 4 }, CTX);
+  assert.match(notice.text, /^Changes Ann Tester made while away are arriving\./);
+  assert.match(notice.text, /The version before them is kept\.$/);
+  assert.equal(notice.topic, 'return');
+});
+
+test('owner_sees_the_checkpoint_mismatch_notice', () => {
+  const saved = { type: 'saved', revision: 'r', through: 3, verified: false, major: false, mismatch: true };
+  assert.equal(liveNotice('server', saved, CTX), null, 'editors and viewers see nothing');
+  const owner = liveNotice('server', saved, { ...CTX, canManage: true });
+  assert.equal(owner.text, 'Two editors saved different files for the same changes. Both are in the history.');
+  assert.deepEqual(owner.actions, ['activity']);
+  assert.equal(liveNotice('server', { ...saved, mismatch: false }, { ...CTX, canManage: true }), null);
+});
+
+test('one_banner_at_a_time_with_at_most_two_actions', () => {
+  const change = liveNotice('editor', { kind: 'not_applied', seq: 1, kept_text: 'x', reason: 'row_deleted' }, CTX);
+  const paused = liveNotice('editor', { kind: 'paused', entries: 1, bytes: 1 }, CTX);
+  const stop = liveNotice('stop', 'repeated', CTX);
+  // The newest wins.
+  assert.equal(pickBanner(change, paused), paused);
+  assert.equal(pickBanner(null, change), change);
+  // A stop is not replaced by information, only by another stop.
+  assert.equal(pickBanner(stop, change), stop);
+  const other = liveNotice('stop', 'incompatible', CTX);
+  assert.equal(pickBanner(stop, other), other);
+  // A clear takes away only its own topic.
+  const resumed = liveNotice('editor', { kind: 'resumed' }, CTX);
+  assert.equal(pickBanner(paused, resumed), null);
+  assert.equal(pickBanner(change, resumed), change);
+  assert.equal(pickBanner(paused, null), paused);
+  // At most two actions, whatever is asked.
+  assert.equal(pickBanner(null, { topic: 'x', text: 't', role: 'status', actions: ['a', 'b', 'c'] }).actions.length, 2);
+});
+
+test('notices_from_the_editor_are_bounded', () => {
+  const parse = (notice) => parseLiveEditorMessage('gridcraft', { type: 'gridcraft:live-notice', notice });
+  // Only the fields of the kind are kept, each checked.
+  const kept = parse({ kind: 'not_applied', seq: 3, kept_text: 'hi', reason: 'row_deleted', extra: 'x'.repeat(10) });
+  assert.deepEqual(kept.notice, { kind: 'not_applied', seq: 3, kept_text: 'hi', reason: 'row_deleted' });
+  // Text over the limit is dropped, not shown cut.
+  const long = parse({ kind: 'not_applied', seq: 3, kept_text: 'x'.repeat(40_000), reason: 'row_deleted' });
+  assert.equal(long.notice.kept_text, null);
+  assert.equal(parse({ kind: 'undo_left', cells: -1 }), null);
+  assert.equal(parse({ kind: 'others_returning', participant: 'x' }), null);
+  assert.deepEqual(parse({ kind: 'read_only', read_only: true }).notice, { kind: 'read_only', read_only: true });
+  assert.equal(parse({ kind: 'read_only' }), null);
+  assert.equal(parse({ kind: 'unknown_kind' }), null);
+});
+
+test('the_send_limit_counts_bytes', () => {
+  const parse = (frame) => parseLiveEditorMessage('gridcraft', { type: 'gridcraft:live-send', frame });
+  assert.ok(parse('a'.repeat(MAX_SEND_BYTES)));
+  assert.equal(parse('a'.repeat(MAX_SEND_BYTES + 1)), null);
+  // Three bytes each in UTF-8: fewer than the limit in characters, over it in bytes.
+  assert.equal(parse('€'.repeat(Math.floor(MAX_SEND_BYTES / 3) + 1)), null);
+  assert.ok(parse('€'.repeat(Math.floor(MAX_SEND_BYTES / 3))));
+  // A pair of surrogates is four bytes; a lone one is three, as TextEncoder writes it.
+  assert.ok(parse('😀'.repeat(MAX_SEND_BYTES / 4)));
+  assert.equal(parse('😀'.repeat(MAX_SEND_BYTES / 4) + 'a'), null);
+});
+
+test('checkpoint_sizes_are_bounded_before_copying', () => {
+  const checkpoint = (bytes, sessionData) =>
+    parseLiveEditorMessage('gridcraft', { type: 'gridcraft:live-checkpoint', ticket: TICKET, at: 1, base: null, bytes, sessionData, sha256: SHA });
+  // The size is read from what the editor posted, before anything is copied (a stand-in view
+  // claims a size over the limit; a copy of it would be one byte and pass).
+  const claiming = (size) => {
+    const view = new Uint8Array(1);
+    Object.defineProperty(view, 'byteLength', { get: () => size });
+    return view;
+  };
+  assert.equal(checkpoint(claiming(512 * 1024 * 1024 + 1), new Uint8Array(0)), null);
+  assert.equal(checkpoint(new Uint8Array(1), claiming(8 * 1024 * 1024 + 1)), null);
+  assert.ok(checkpoint(claiming(512 * 1024 * 1024), claiming(8 * 1024 * 1024)));
+  assert.ok(checkpoint(new Uint8Array(2), new Uint8Array(1)));
+});
+
+test('the_page_hears_resets_saves_and_its_own_changes', async () => {
+  const resets = [];
+  const saving = [];
+  let changed = 0;
+  const { page, socket } = live({
+    routes: { '/api/docs/doc-1/live-checkpoint?': new Response(null, { status: 200 }) },
+    handlers: { reset: (kind) => resets.push(kind), saving: (on) => saving.push(on), changed: () => (changed += 1) },
+  });
+  page.fromEditor({ type: 'gridcraft:live-send', frame: '{"type":"entry","local":1,"payload":"x"}' });
+  page.fromEditor({ type: 'gridcraft:live-send', frame: '{"type":"presence","payload":"{\\"type\\":\\"entry\\"}"}' });
+  page.fromEditor({ type: 'gridcraft:live-send', frame: '{"type":"heartbeat","seen":1}' });
+  assert.equal(changed, 1, 'only an entry counts as a change; presence and heartbeats do not');
+  assert.equal(socket().sent.length, 3);
+  page.fromEditor({ type: 'gridcraft:live-checkpoint', ticket: TICKET, at: 1, base: null, bytes: new Uint8Array(1), sessionData: new Uint8Array(0), sha256: SHA });
+  assert.deepEqual(saving, [true]);
+  await settle();
+  assert.deepEqual(saving, [true, false]);
+  page.fromEditor({ type: 'gridcraft:live-reset', kind: 'unavailable' });
+  assert.deepEqual(resets, ['unavailable']);
 });

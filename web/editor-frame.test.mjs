@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { avatarColour } from './account.js';
-import { backLabel, isFocusShortcut, presenceModel, statusLabel } from './editor-frame.js';
+import { backLabel, downloadNote, isFocusShortcut, liveLook, liveStatus, presenceModel, statusLabel } from './editor-frame.js';
 
 const ME = '11111111-1111-1111-1111-111111111111';
 
@@ -114,4 +114,72 @@ test('both editor pages have the slim bar, a status region, the strip and no sit
     assert.doesNotMatch(html, /style=|<style/);
     assert.doesNotMatch(html, /id="people"|id="docline"/);
   }
+});
+
+// ---- live documents (G5) ----
+
+test('presence_hides_places_without_a_connection', () => {
+  const model = presenceModel(
+    [
+      { participant: 1, user: 'u-bob', name: 'Bob Smith', can_edit: true, connected: true },
+      { participant: 2, user: 'u-cat', name: 'Cat Jones', can_edit: true, connected: false },
+      { participant: 3, user: 'u-dan', name: 'Dan Brown', can_edit: true },
+    ],
+    ME,
+  );
+  assert.deepEqual(model.shown.map((person) => person.name), ['Bob Smith', 'Dan Brown']);
+  assert.equal(model.label, 'Also here: Bob Smith and Dan Brown');
+  // A person with one dropped place and one connected tab is shown once.
+  const both = presenceModel(
+    [
+      { participant: 1, user: 'u-bob', name: 'Bob Smith', connected: false },
+      { participant: 4, user: 'u-bob', name: 'Bob Smith', connected: true },
+    ],
+    ME,
+  );
+  assert.equal(both.total, 1);
+});
+
+test('presence_shows_viewers_as_read_only', () => {
+  const model = presenceModel([{ participant: 1, user: 'u-cat', name: 'Cat Jones', can_edit: false, connected: true }], ME);
+  assert.equal(model.shown[0].readOnly, true);
+  assert.equal(model.label, 'Also here: Cat Jones (read only)');
+});
+
+test('live_people_carry_colour_and_initials_for_the_editor', () => {
+  const look = liveLook({ participant: 1, user: 'u-bob', name: 'Bob Smith' });
+  assert.equal(look.initials, 'BS');
+  assert.equal(look.colour, avatarColour('u-bob').light.bg);
+  assert.match(look.colour, /^#[0-9a-f]{6}$/);
+  // The bar's avatar colour for that account; the name stands in for a missing account.
+  assert.equal(liveLook({ name: 'Cat Jones' }).colour, avatarColour('Cat Jones').light.bg);
+  assert.equal(liveLook({}).initials, '?');
+});
+
+test('status_words_for_live_states', () => {
+  const word = (state) => statusLabel(liveStatus(state)).word;
+  const live = { phase: 'live', waiting: 0, canEdit: true };
+  assert.equal(word(live), 'Saved');
+  assert.equal(word({ ...live, waiting: 2 }), 'Saving…');
+  assert.equal(word({ ...live, saving: true }), 'Saving…');
+  assert.equal(word({ ...live, unsaved: true }), 'Unsaved changes kept');
+  assert.equal(word({ ...live, paused: true, waiting: 1 }), 'Unsaved changes kept');
+  assert.match(statusLabel(liveStatus({ ...live, paused: true })).detail, /paused/);
+  assert.equal(word({ ...live, phase: 'offline', waiting: 1 }), 'Offline — changes kept');
+  assert.equal(word({ ...live, phase: 'offline', unsaved: true }), 'Offline — changes kept');
+  assert.equal(word({ ...live, phase: 'joining' }), 'Connecting…');
+  assert.equal(word({ ...live, phase: 'catching_up' }), 'Connecting…');
+  assert.equal(word({ ...live, canEdit: false }), 'Read only');
+  assert.equal(word({ ...live, canEdit: false, phase: 'offline' }), 'Read only');
+  assert.equal(word(null), 'Connecting…');
+});
+
+test('download_says_when_the_stored_file_is_behind', () => {
+  const note = "The stored file doesn't include the latest changes yet";
+  assert.equal(downloadNote({ live: { behind: true } }), note);
+  assert.equal(downloadNote({ live: { behind: false } }), '');
+  assert.equal(downloadNote({ live: { behind: false } }, { unsaved: true }), note);
+  assert.equal(downloadNote({ live: { behind: true } }, { savedSince: true }), '');
+  assert.equal(downloadNote({}), '');
+  assert.equal(downloadNote(null), '');
 });

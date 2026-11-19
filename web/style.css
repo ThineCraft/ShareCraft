@@ -154,6 +154,10 @@ body.full{padding:0;height:100vh;height:100dvh;overflow:hidden}
 .banner.idle{padding:0;border:0}
 .banner .actions{display:flex;flex-wrap:wrap;gap:var(--space-2)}
 .banner .button,.banner button{min-height:var(--control-sm);padding:var(--space-1) var(--space-3);background:var(--paper)}
+/* live documents (G5): information is quiet, a stop is an alert; both keep 4.5:1 in light and dark */
+.banner.info{background:var(--paper);color:var(--text);border-left:4px solid var(--accent-ink)}
+.banner[role=alert]{background:var(--stop-bg);color:var(--stop-ink);border-left:4px solid var(--stop-ink)}
+.banner.idle{border-left:0}
 .frame.full .share{max-height:50vh;overflow:auto;border-top:0;border-bottom:1px solid var(--line)}
 .frame.full .editor-area{flex:1 1 auto;min-height:0;display:flex;background:var(--bg)}
 .editor-area iframe{flex:1;display:block;width:100%;height:100%;border:0;background:var(--sheet)}
