@@ -8,7 +8,7 @@
 //! single run, and remembers where deleted ids were.
 
 use protocol::live::ParticipantNo;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
 /// A lasting identity: (participant, counter). Participant 0 is the base rows.
@@ -30,6 +30,9 @@ pub enum IdError {
     /// The client holds no place yet, so it has no participant number to make ids under.
     #[error("no place in the session yet")]
     NoPlace,
+    /// Stored identity data violates an invariant required by [`OrderedIds`].
+    #[error("invalid ordered ids: {0}")]
+    Invalid(&'static str),
 }
 
 /// Makes new ids for one participant, counting on from 0.
@@ -113,10 +116,31 @@ struct DeletedRun {
 }
 
 /// The live ids in order, kept as runs, and the deleted ids with where they were.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct OrderedIds {
     live: Vec<Run>,
     deleted: Vec<DeletedRun>,
+}
+
+#[derive(Deserialize)]
+struct RawOrderedIds {
+    live: Vec<Run>,
+    deleted: Vec<DeletedRun>,
+}
+
+impl<'de> Deserialize<'de> for OrderedIds {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawOrderedIds::deserialize(deserializer)?;
+        let ids = OrderedIds {
+            live: raw.live,
+            deleted: raw.deleted,
+        };
+        ids.validate().map_err(serde::de::Error::custom)?;
+        Ok(ids)
+    }
 }
 
 impl OrderedIds {
@@ -153,6 +177,75 @@ impl OrderedIds {
     /// How many runs the live ids are kept in.
     pub fn runs(&self) -> usize {
         self.live.len()
+    }
+
+    /// Checks that every stored identity is well formed, unique and internally consistent.
+    pub fn validate(&self) -> Result<(), IdError> {
+        let mut intervals = Vec::with_capacity(self.live.len() + self.deleted.len());
+        let mut live_intervals = Vec::with_capacity(self.live.len());
+        let mut live_len = 0u64;
+
+        for run in &self.live {
+            Self::validate_run(run)?;
+            live_len += u64::from(run.len);
+            if live_len > u64::from(u32::MAX) {
+                return Err(IdError::Invalid("live length exceeds u32::MAX"));
+            }
+            let interval = (run.participant, run.start, run.end());
+            intervals.push(interval);
+            live_intervals.push(interval);
+        }
+        for gone in &self.deleted {
+            Self::validate_run(&gone.run)?;
+            if u64::from(gone.was_at) + u64::from(gone.run.len) > u64::from(u32::MAX) {
+                return Err(IdError::Invalid(
+                    "deleted historical position exceeds u32::MAX",
+                ));
+            }
+            intervals.push((gone.run.participant, gone.run.start, gone.run.end()));
+        }
+
+        intervals.sort_unstable();
+        let mut previous: Option<(u32, u64)> = None;
+        for (participant, start, end) in intervals {
+            if let Some((previous_participant, previous_end)) = previous
+                && participant == previous_participant
+                && u64::from(start) < previous_end
+            {
+                return Err(IdError::Taken(LiveId(participant, start)));
+            }
+            previous = Some((participant, end));
+        }
+
+        live_intervals.sort_unstable();
+        for gone in &self.deleted {
+            if let Some(after) = gone.after
+                && !Self::sorted_intervals_hold(&live_intervals, after)
+            {
+                return Err(IdError::Invalid("deleted after id is not live"));
+            }
+        }
+        Ok(())
+    }
+
+    fn sorted_intervals_hold(intervals: &[(u32, u32, u64)], id: LiveId) -> bool {
+        let index = intervals.partition_point(|&(participant, start, _)| {
+            participant < id.0 || (participant == id.0 && start <= id.1)
+        });
+        index
+            .checked_sub(1)
+            .and_then(|index| intervals.get(index))
+            .is_some_and(|&(participant, _, end)| participant == id.0 && u64::from(id.1) < end)
+    }
+
+    fn validate_run(run: &Run) -> Result<(), IdError> {
+        if run.len == 0 {
+            return Err(IdError::Invalid("run length is zero"));
+        }
+        if run.end() > u64::from(u32::MAX) + 1 {
+            return Err(IdError::Invalid("run counter exceeds u32::MAX"));
+        }
+        Ok(())
     }
 
     /// The id at `pos`, if there is one.
@@ -195,6 +288,7 @@ impl OrderedIds {
             return Err(IdError::OutOfRange { at, count, len });
         }
         if count == 0 {
+            debug_assert!(self.validate().is_ok());
             return Ok(());
         }
         let start = u64::from(first.1);
@@ -213,6 +307,7 @@ impl OrderedIds {
         };
         self.live.insert(index, run);
         self.merge();
+        debug_assert!(self.validate().is_ok());
         Ok(())
     }
 
@@ -223,15 +318,25 @@ impl OrderedIds {
             return Err(IdError::OutOfRange { at, count, len });
         }
         if count == 0 {
+            debug_assert!(self.validate().is_ok());
             return Ok(());
         }
         let after = at.checked_sub(1).and_then(|above| self.id_at(above));
         let block = self.take_out(at, count);
+        for gone in &mut self.deleted {
+            if gone
+                .after
+                .is_some_and(|id| block.iter().any(|run| run.holds(id)))
+            {
+                gone.after = after;
+            }
+        }
         let mut was_at = at;
         for run in block {
             self.deleted.push(DeletedRun { run, was_at, after });
             was_at += run.len;
         }
+        debug_assert!(self.validate().is_ok());
         Ok(())
     }
 
@@ -255,12 +360,14 @@ impl OrderedIds {
             });
         }
         if count == 0 {
+            debug_assert!(self.validate().is_ok());
             return Ok(());
         }
         let block = self.take_out(from, count);
         let index = self.split_at(to);
         self.live.splice(index..index, block);
         self.merge();
+        debug_assert!(self.validate().is_ok());
         Ok(())
     }
 
@@ -395,6 +502,21 @@ mod tests {
     }
 
     #[test]
+    fn deleting_an_anchor_reanchors_deleted_ids() {
+        let mut ids = OrderedIds::base(6);
+        ids.delete(3, 1).unwrap();
+        ids.delete(2, 1).unwrap();
+
+        assert_eq!(
+            ids.find(LiveId(0, 3)),
+            Lookup::Deleted {
+                was_at: 3,
+                after: Some(LiveId(0, 1))
+            }
+        );
+    }
+
+    #[test]
     fn reusing_an_id_is_refused() {
         let mut ids = OrderedIds::base(10);
         ids.delete(3, 2).unwrap();
@@ -500,6 +622,144 @@ mod tests {
         assert_eq!(back.take(1), Ok(LiveId(3, 7)));
     }
 
+    fn assert_ordered_ids_json_is_invalid(json: serde_json::Value) {
+        let result = serde_json::from_value::<OrderedIds>(json);
+        assert!(
+            result.is_err(),
+            "invalid OrderedIds deserialized: {result:?}"
+        );
+    }
+
+    #[test]
+    fn ordered_ids_reject_invalid_serialized_runs() {
+        for invalid in [
+            serde_json::json!({
+                "live": [{ "participant": 1, "start": 0, "len": 0 }],
+                "deleted": []
+            }),
+            serde_json::json!({
+                "live": [],
+                "deleted": [{
+                    "run": { "participant": 1, "start": 0, "len": 0 },
+                    "was_at": 0,
+                    "after": null
+                }]
+            }),
+            serde_json::json!({
+                "live": [{ "participant": 1, "start": u32::MAX, "len": 2 }],
+                "deleted": []
+            }),
+            serde_json::json!({
+                "live": [
+                    { "participant": 1, "start": 0, "len": u32::MAX },
+                    { "participant": 2, "start": 0, "len": 1 }
+                ],
+                "deleted": []
+            }),
+            serde_json::json!({
+                "live": [
+                    { "participant": 1, "start": 0, "len": 2 },
+                    { "participant": 1, "start": 1, "len": 2 }
+                ],
+                "deleted": []
+            }),
+            serde_json::json!({
+                "live": [{ "participant": 1, "start": 0, "len": 1 }],
+                "deleted": [{
+                    "run": { "participant": 2, "start": 0, "len": 1 },
+                    "was_at": 0,
+                    "after": [9, 9]
+                }]
+            }),
+            serde_json::json!({
+                "live": [],
+                "deleted": [{
+                    "run": { "participant": 1, "start": 0, "len": 2 },
+                    "was_at": u32::MAX,
+                    "after": null
+                }]
+            }),
+        ] {
+            assert_ordered_ids_json_is_invalid(invalid);
+        }
+    }
+
+    #[test]
+    fn ordered_ids_reject_live_deleted_overlap() {
+        assert_ordered_ids_json_is_invalid(serde_json::json!({
+            "live": [{ "participant": 1, "start": 0, "len": 3 }],
+            "deleted": [{
+                "run": { "participant": 1, "start": 2, "len": 2 },
+                "was_at": 2,
+                "after": [1, 0]
+            }]
+        }));
+    }
+
+    #[test]
+    fn ordered_ids_reject_duplicate_deleted_ids() {
+        assert_ordered_ids_json_is_invalid(serde_json::json!({
+            "live": [],
+            "deleted": [
+                {
+                    "run": { "participant": 1, "start": 0, "len": 2 },
+                    "was_at": 0,
+                    "after": null
+                },
+                {
+                    "run": { "participant": 1, "start": 1, "len": 2 },
+                    "was_at": 1,
+                    "after": null
+                }
+            ]
+        }));
+    }
+
+    #[test]
+    fn ordered_ids_valid_round_trip_still_works() {
+        let mut ids = OrderedIds::base(8);
+        ids.insert(3, LiveId(2, 10), 2).unwrap();
+        ids.delete(4, 2).unwrap();
+        ids.move_block(0, 2, 4).unwrap();
+
+        let json = serde_json::to_string(&ids).unwrap();
+        let deserialized: OrderedIds = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized, ids);
+    }
+
+    #[test]
+    fn ordered_ids_validate_many_fragmented_anchors_without_quadratic_work() {
+        const RUNS: u32 = 50_000;
+        let after = Some(LiveId(1, (RUNS - 1) * 2));
+        let ids = OrderedIds {
+            live: (0..RUNS)
+                .map(|start| Run {
+                    participant: 1,
+                    start: start * 2,
+                    len: 1,
+                })
+                .collect(),
+            deleted: (0..RUNS)
+                .map(|start| DeletedRun {
+                    run: Run {
+                        participant: 2,
+                        start: start * 2,
+                        len: 1,
+                    },
+                    was_at: start,
+                    after,
+                })
+                .collect(),
+        };
+        let json = serde_json::to_vec(&ids).unwrap();
+        assert!(json.len() < 8 * 1024 * 1024);
+
+        let deserialized: OrderedIds = serde_json::from_slice(&json).unwrap();
+
+        assert_eq!(deserialized, ids);
+    }
+
     #[derive(Clone, Debug)]
     enum Op {
         Insert {
@@ -577,6 +837,11 @@ mod tests {
                             let after = at.checked_sub(1).map(|p| list[p as usize]);
                             let gone: Vec<_> =
                                 list.drain(at as usize..(at + count) as usize).collect();
+                            for (_, deleted_after) in deleted.values_mut() {
+                                if deleted_after.is_some_and(|id| gone.contains(&id)) {
+                                    *deleted_after = after;
+                                }
+                            }
                             for (i, id) in gone.into_iter().enumerate() {
                                 deleted.insert(id, (at + i as u32, after));
                             }
