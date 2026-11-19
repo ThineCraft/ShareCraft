@@ -18,6 +18,8 @@ pub const LIVE_PROTOCOL: u32 = 1;
 pub const MAX_PAYLOAD_BYTES: usize = 262_144;
 /// The longest format name, in characters.
 pub const MAX_FORMAT_LEN: usize = 64;
+/// The most bytes a presence note may hold.
+pub const MAX_PRESENCE_BYTES: usize = 1024;
 /// How often a client sends a heartbeat, in milliseconds.
 pub const HEARTBEAT_MS: u64 = 60_000;
 /// How many heartbeat periods may pass without any message before a place ends.
@@ -162,6 +164,12 @@ pub enum LiveClientMsg {
         /// The ticket that failed.
         ticket: Uuid,
     },
+    /// Where the person is in the document, for the others to show. Opaque to the server,
+    /// at most [`MAX_PRESENCE_BYTES`], latest-wins and never stored.
+    Presence {
+        /// The note, opaque to the server.
+        payload: String,
+    },
     /// Send the log again from the base.
     Resync,
     /// The person is leaving; their place ends now.
@@ -222,6 +230,10 @@ impl std::fmt::Debug for LiveClientMsg {
                 .debug_struct("CheckpointFailed")
                 .field("ticket", ticket)
                 .finish(),
+            LiveClientMsg::Presence { payload } => f
+                .debug_struct("Presence")
+                .field("payload", &Redacted(payload.len()))
+                .finish(),
             LiveClientMsg::Resync => f.write_str("Resync"),
             LiveClientMsg::Leave => f.write_str("Leave"),
         }
@@ -243,9 +255,9 @@ pub enum Place {
     },
 }
 
-/// Server to browser (or desktop editor). The `Debug` form leaves payloads out, through
-/// [`EntryBody`]'s.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Server to browser (or desktop editor). The `Debug` form leaves payloads and presence notes
+/// out.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LiveServerMsg {
     /// Join accepted.
@@ -334,6 +346,35 @@ pub enum LiveServerMsg {
         /// The current stored revision under which the old shown copy is archived.
         current: Option<String>,
     },
+    /// Someone's presence note, relayed as sent; `None` when it is cleared (their connection
+    /// closed or their place ended).
+    Presence {
+        /// Whose note it is.
+        participant: ParticipantNo,
+        /// The note, opaque to the server; `None` when cleared.
+        payload: Option<String>,
+    },
+    /// Someone whose place had ended is back, with saved work of their own to send.
+    Returning {
+        /// Their new place.
+        participant: ParticipantNo,
+    },
+    /// A checkpoint of the session was stored, or a stored one was verified.
+    Saved {
+        /// The stored revision.
+        revision: String,
+        /// The last log position it covers.
+        through: Seq,
+        /// Whether a second editor has written the same bytes.
+        verified: bool,
+        /// Whether it is kept as a major version.
+        major: bool,
+    },
+    /// The last frame: this kind of editor build may not take part in this session.
+    BuildRefused {
+        /// The build that was refused.
+        build: LiveBuild,
+    },
     /// The last frame: the client's protocol or format does not match the session's.
     Incompatible {
         /// The server's protocol.
@@ -348,6 +389,128 @@ pub enum LiveServerMsg {
         /// Why.
         reason: RemovedReason,
     },
+}
+
+impl std::fmt::Debug for LiveServerMsg {
+    /// Leaves payloads and presence notes out; people show as their own `Debug` form.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LiveServerMsg::LiveJoined {
+                session,
+                participant,
+                place,
+                can_edit,
+                heartbeat_ms,
+                people,
+            } => f
+                .debug_struct("LiveJoined")
+                .field("session", session)
+                .field("participant", participant)
+                .field("place", place)
+                .field("can_edit", can_edit)
+                .field("heartbeat_ms", heartbeat_ms)
+                .field("people", people)
+                .finish(),
+            LiveServerMsg::Catchup {
+                base,
+                revision,
+                from,
+                head,
+            } => f
+                .debug_struct("Catchup")
+                .field("base", base)
+                .field("revision", revision)
+                .field("from", from)
+                .field("head", head)
+                .finish(),
+            LiveServerMsg::Entry { entry } => {
+                f.debug_struct("Entry").field("entry", entry).finish()
+            }
+            LiveServerMsg::Refused { local, reason } => f
+                .debug_struct("Refused")
+                .field("local", local)
+                .field("reason", reason)
+                .finish(),
+            LiveServerMsg::CannotOpen { seq } => {
+                f.debug_struct("CannotOpen").field("seq", seq).finish()
+            }
+            LiveServerMsg::People { people } => {
+                f.debug_struct("People").field("people", people).finish()
+            }
+            LiveServerMsg::Access { can_edit } => f
+                .debug_struct("Access")
+                .field("can_edit", can_edit)
+                .finish(),
+            LiveServerMsg::CheckpointTicket {
+                ticket,
+                purpose,
+                at,
+                base,
+                major,
+            } => f
+                .debug_struct("CheckpointTicket")
+                .field("ticket", ticket)
+                .field("purpose", purpose)
+                .field("at", at)
+                .field("base", base)
+                .field("major", major)
+                .finish(),
+            LiveServerMsg::ChangesPaused { entries, bytes } => f
+                .debug_struct("ChangesPaused")
+                .field("entries", entries)
+                .field("bytes", bytes)
+                .finish(),
+            LiveServerMsg::ChangesResumed => f.write_str("ChangesResumed"),
+            LiveServerMsg::ReturnReady { through } => f
+                .debug_struct("ReturnReady")
+                .field("through", through)
+                .finish(),
+            LiveServerMsg::ArchiveReturn { current } => f
+                .debug_struct("ArchiveReturn")
+                .field("current", current)
+                .finish(),
+            LiveServerMsg::Presence {
+                participant,
+                payload,
+            } => f
+                .debug_struct("Presence")
+                .field("participant", participant)
+                .field(
+                    "payload",
+                    &payload.as_ref().map(|note| Redacted(note.len())),
+                )
+                .finish(),
+            LiveServerMsg::Returning { participant } => f
+                .debug_struct("Returning")
+                .field("participant", participant)
+                .finish(),
+            LiveServerMsg::Saved {
+                revision,
+                through,
+                verified,
+                major,
+            } => f
+                .debug_struct("Saved")
+                .field("revision", revision)
+                .field("through", through)
+                .field("verified", verified)
+                .field("major", major)
+                .finish(),
+            LiveServerMsg::BuildRefused { build } => f
+                .debug_struct("BuildRefused")
+                .field("build", build)
+                .finish(),
+            LiveServerMsg::Incompatible { protocol, format } => f
+                .debug_struct("Incompatible")
+                .field("protocol", protocol)
+                .field("format", format)
+                .finish(),
+            LiveServerMsg::Expired => f.write_str("Expired"),
+            LiveServerMsg::Removed { reason } => {
+                f.debug_struct("Removed").field("reason", reason).finish()
+            }
+        }
+    }
 }
 
 /// One position in the log, stamped by the server.
@@ -526,6 +689,7 @@ mod tests {
                 LiveClientMsg::Fingerprint { .. } => "fingerprint",
                 LiveClientMsg::CheckpointReady { .. } => "checkpoint_ready",
                 LiveClientMsg::CheckpointFailed { .. } => "checkpoint_failed",
+                LiveClientMsg::Presence { .. } => "presence",
                 LiveClientMsg::Resync => "resync",
                 LiveClientMsg::Leave => "leave",
             }
@@ -544,6 +708,10 @@ mod tests {
                 LiveServerMsg::ChangesResumed => "changes_resumed",
                 LiveServerMsg::ReturnReady { .. } => "return_ready",
                 LiveServerMsg::ArchiveReturn { .. } => "archive_return",
+                LiveServerMsg::Presence { .. } => "presence",
+                LiveServerMsg::Returning { .. } => "returning",
+                LiveServerMsg::Saved { .. } => "saved",
+                LiveServerMsg::BuildRefused { .. } => "build_refused",
                 LiveServerMsg::Incompatible { .. } => "incompatible",
                 LiveServerMsg::Expired => "expired",
                 LiveServerMsg::Removed { .. } => "removed",
@@ -581,6 +749,9 @@ mod tests {
             },
             LiveClientMsg::CheckpointFailed {
                 ticket: Uuid::from_u128(4),
+            },
+            LiveClientMsg::Presence {
+                payload: "{\"cell\":\"A1\"}".into(),
             },
             LiveClientMsg::Resync,
             LiveClientMsg::Leave,
@@ -637,6 +808,22 @@ mod tests {
             LiveServerMsg::ArchiveReturn {
                 current: Some("abc123".into()),
             },
+            LiveServerMsg::Presence {
+                participant: ParticipantNo(2),
+                payload: Some("{}".into()),
+            },
+            LiveServerMsg::Returning {
+                participant: ParticipantNo(3),
+            },
+            LiveServerMsg::Saved {
+                revision: "abc123".into(),
+                through: Seq(9),
+                verified: true,
+                major: false,
+            },
+            LiveServerMsg::BuildRefused {
+                build: LiveBuild::Desktop,
+            },
             LiveServerMsg::Incompatible {
                 protocol: LIVE_PROTOCOL,
                 format: "gridcraft/1".into(),
@@ -653,8 +840,8 @@ mod tests {
         }
         // The strings are written out in the matches above; this checks they are the strings
         // on the wire, and that no sample was dropped from the lists.
-        assert_eq!(client.len(), 9);
-        assert_eq!(server.len(), 15);
+        assert_eq!(client.len(), 10);
+        assert_eq!(server.len(), 19);
     }
 
     #[test]
@@ -903,6 +1090,110 @@ mod tests {
         assert!(!valid_format("grid craft"));
         assert!(!valid_format("grid\u{0}"));
         assert!(!valid_format("gridcraft/é"));
+    }
+
+    #[test]
+    fn presence_wire_forms_are_pinned() {
+        assert_eq!(MAX_PRESENCE_BYTES, 1024);
+        let note = LiveClientMsg::Presence {
+            payload: "B2".into(),
+        };
+        let json = serde_json::to_string(&note).unwrap();
+        assert_eq!(json, "{\"type\":\"presence\",\"payload\":\"B2\"}");
+        assert_eq!(serde_json::from_str::<LiveClientMsg>(&json).unwrap(), note);
+        assert!(
+            serde_json::from_str::<LiveClientMsg>(
+                "{\"type\":\"presence\",\"payload\":\"x\",\"participant\":2}"
+            )
+            .is_err()
+        );
+
+        let relayed = LiveServerMsg::Presence {
+            participant: ParticipantNo(2),
+            payload: Some("x".into()),
+        };
+        let json = serde_json::to_string(&relayed).unwrap();
+        assert_eq!(
+            json,
+            "{\"type\":\"presence\",\"participant\":2,\"payload\":\"x\"}"
+        );
+        assert_eq!(
+            serde_json::from_str::<LiveServerMsg>(&json).unwrap(),
+            relayed
+        );
+
+        let cleared = LiveServerMsg::Presence {
+            participant: ParticipantNo(2),
+            payload: None,
+        };
+        let json = serde_json::to_string(&cleared).unwrap();
+        assert_eq!(
+            json,
+            "{\"type\":\"presence\",\"participant\":2,\"payload\":null}"
+        );
+        assert_eq!(
+            serde_json::from_str::<LiveServerMsg>(&json).unwrap(),
+            cleared
+        );
+    }
+
+    #[test]
+    fn returning_saved_and_build_refused_wire_forms_are_pinned() {
+        let returning = LiveServerMsg::Returning {
+            participant: ParticipantNo(3),
+        };
+        let json = serde_json::to_string(&returning).unwrap();
+        assert_eq!(json, "{\"type\":\"returning\",\"participant\":3}");
+        assert_eq!(
+            serde_json::from_str::<LiveServerMsg>(&json).unwrap(),
+            returning
+        );
+
+        let saved = LiveServerMsg::Saved {
+            revision: "0123456789abcdef".into(),
+            through: Seq(12),
+            verified: false,
+            major: true,
+        };
+        let json = serde_json::to_string(&saved).unwrap();
+        assert_eq!(
+            json,
+            "{\"type\":\"saved\",\"revision\":\"0123456789abcdef\",\"through\":12,\
+             \"verified\":false,\"major\":true}"
+        );
+        assert_eq!(serde_json::from_str::<LiveServerMsg>(&json).unwrap(), saved);
+
+        let refused = LiveServerMsg::BuildRefused {
+            build: LiveBuild::Desktop,
+        };
+        let json = serde_json::to_string(&refused).unwrap();
+        assert_eq!(json, "{\"type\":\"build_refused\",\"build\":\"desktop\"}");
+        assert_eq!(
+            serde_json::from_str::<LiveServerMsg>(&json).unwrap(),
+            refused
+        );
+    }
+
+    #[test]
+    fn presence_payload_is_redacted_in_debug() {
+        let secret = "presence-secret-note-777";
+        let shown = format!(
+            "{:?}",
+            LiveClientMsg::Presence {
+                payload: secret.into()
+            }
+        );
+        assert!(!shown.contains(secret), "{shown}");
+        assert!(shown.contains("Presence"), "{shown}");
+        let shown = format!(
+            "{:?}",
+            LiveServerMsg::Presence {
+                participant: ParticipantNo(4),
+                payload: Some(secret.into()),
+            }
+        );
+        assert!(!shown.contains(secret), "{shown}");
+        assert!(shown.contains("Presence"), "{shown}");
     }
 
     #[test]

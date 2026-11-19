@@ -400,6 +400,8 @@ async fn live_session(s: &mut Session<'_>, first: &str) -> bool {
                 }
                 // The upload itself says the bytes are ready.
                 Ok(LiveClientMsg::CheckpointReady { .. }) => None,
+                // Presence notes are dropped until the room relays them (G5 Task 4).
+                Ok(LiveClientMsg::Presence { .. }) => None,
                 Ok(LiveClientMsg::Resync) => Some(LiveCommand::Resync { conn, client }),
                 Ok(LiveClientMsg::Leave) => Some(LiveCommand::Leave { conn, client }),
                 Ok(LiveClientMsg::LiveJoin { .. }) | Err(_) => None,

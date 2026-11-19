@@ -2404,3 +2404,171 @@ fn own_crash_while_catching_up_from_the_base_is_a_crash_in_place() {
     assert_eq!(doc.doc.lines(), vec!["one", "mine"]);
     assert_eq!(client.pending(), 1);
 }
+
+/// The presence frames among `frames`.
+fn presences(frames: &[String]) -> Vec<Value> {
+    sent(frames)
+        .into_iter()
+        .filter(|frame| frame["type"] == "presence")
+        .collect()
+}
+
+#[test]
+fn presence_over_the_limit_is_refused_locally() {
+    let mut doc = StandIn::new("a");
+    let mut client = live(&mut doc, 1);
+    let limit = protocol::live::MAX_PRESENCE_BYTES;
+    assert_eq!(
+        client.presence("x".repeat(limit + 1)).unwrap_err(),
+        LocalError::TooLarge
+    );
+    let frame = client.presence("x".repeat(limit)).unwrap().unwrap();
+    let frame: Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(frame["type"], "presence");
+    assert_eq!(frame["payload"].as_str().unwrap().len(), limit);
+    // A refused note is not kept either: nothing waits to be sent.
+    let mut offline: LiveClient<StandIn> = LiveClient::new(config());
+    assert_eq!(
+        offline.presence("y".repeat(limit + 1)).unwrap_err(),
+        LocalError::TooLarge
+    );
+    let mut frames = offline.connected(0);
+    let mut other_doc = StandIn::new("b");
+    offline.receive(&mut other_doc, &joined(2), 0).unwrap();
+    let step = offline
+        .receive(&mut other_doc, &empty_catchup(), 0)
+        .unwrap();
+    frames.extend(step.send);
+    if offline.phase() == Phase::LoadingBase {
+        frames.extend(offline.base_ready(&mut other_doc, 0).unwrap().send);
+    }
+    assert_eq!(offline.phase(), Phase::Live);
+    assert!(presences(&frames).is_empty());
+}
+
+#[test]
+fn presence_is_sent_after_reconnect_latest_only() {
+    let mut doc = StandIn::new("a");
+    let mut client = live(&mut doc, 1);
+    assert!(client.presence("first".into()).unwrap().is_some());
+    client.disconnected(10);
+    assert_eq!(client.presence("second".into()).unwrap(), None);
+    assert_eq!(client.presence("third".into()).unwrap(), None);
+    let mut frames = client.connected(20);
+    assert!(presences(&frames).is_empty(), "not sent before the join");
+    let step = client.receive(&mut doc, &joined_kept(1), 20).unwrap();
+    frames.extend(step.send);
+    assert!(
+        presences(&frames).is_empty(),
+        "not sent before the catch-up"
+    );
+    let step = client.receive(&mut doc, &catchup(0, 0, 0), 20).unwrap();
+    assert_eq!(client.phase(), Phase::Live);
+    frames.extend(step.send);
+    let notes = presences(&frames);
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert_eq!(notes[0]["payload"], "third");
+    // Sent once: later ticks do not repeat it.
+    assert!(presences(&client.tick(30)).is_empty());
+    // A note is not a change: nothing waits for the server.
+    assert_eq!(client.pending(), 0);
+    assert_eq!(client.unsent(), 0);
+}
+
+#[test]
+fn presence_from_others_becomes_an_event() {
+    let mut doc = StandIn::new("a");
+    let mut client = live(&mut doc, 1);
+    let shown_before = doc.lines();
+    let frame = json!({ "type": "presence", "participant": 2, "payload": "B2" }).to_string();
+    let step = client.receive(&mut doc, &frame, 5).unwrap();
+    assert_eq!(
+        step.events,
+        vec![Event::Presence {
+            participant: ParticipantNo(2),
+            payload: Some("B2".into()),
+        }]
+    );
+    assert!(step.send.is_empty());
+    let frame = json!({ "type": "presence", "participant": 2, "payload": null }).to_string();
+    let step = client.receive(&mut doc, &frame, 6).unwrap();
+    assert_eq!(
+        step.events,
+        vec![Event::Presence {
+            participant: ParticipantNo(2),
+            payload: None,
+        }]
+    );
+    assert_eq!(doc.lines(), shown_before);
+    assert_eq!(client.agreed_seq(), Seq(0));
+
+    let frame = json!({ "type": "returning", "participant": 3 }).to_string();
+    let step = client.receive(&mut doc, &frame, 7).unwrap();
+    assert_eq!(
+        step.events,
+        vec![Event::Returning {
+            participant: ParticipantNo(3)
+        }]
+    );
+    let frame = json!({
+        "type": "saved", "revision": "abc", "through": 4, "verified": true, "major": false
+    })
+    .to_string();
+    let step = client.receive(&mut doc, &frame, 8).unwrap();
+    assert_eq!(
+        step.events,
+        vec![Event::Saved {
+            revision: "abc".into(),
+            through: Seq(4),
+            verified: true,
+            major: false,
+        }]
+    );
+    assert_eq!(client.phase(), Phase::Live);
+    let frame = json!({ "type": "build_refused", "build": "desktop" }).to_string();
+    let step = client.receive(&mut doc, &frame, 9).unwrap();
+    assert_eq!(step.events, vec![Event::BuildRefused]);
+    assert_eq!(client.phase(), Phase::Closed);
+}
+
+#[test]
+fn presence_is_never_sent_while_not_live() {
+    let mut doc = StandIn::new("a");
+    let mut client: LiveClient<StandIn> = LiveClient::new(config());
+    assert_eq!(client.presence("offline".into()).unwrap(), None);
+    let join = client.connected(0);
+    assert!(presences(&join).is_empty());
+    assert_eq!(client.presence("joining".into()).unwrap(), None);
+    let step = client.receive(&mut doc, &joined(1), 0).unwrap();
+    assert!(presences(&step.send).is_empty());
+    let step = client.receive(&mut doc, &catchup(0, 0, 2), 0).unwrap();
+    assert!(presences(&step.send).is_empty());
+    let step = client.base_ready(&mut doc, 0).unwrap();
+    assert!(presences(&step.send).is_empty());
+    assert_eq!(client.phase(), Phase::CatchingUp);
+    assert_eq!(client.presence("catching up".into()).unwrap(), None);
+    assert!(presences(&client.tick(70_000)).is_empty());
+    let sender = other(9);
+    let step = client
+        .receive(
+            &mut doc,
+            &entry(1, 2, sender, 1, 0, &insert(LiveId(2, 0), "x")),
+            1,
+        )
+        .unwrap();
+    assert!(presences(&step.send).is_empty());
+    let step = client
+        .receive(
+            &mut doc,
+            &entry(2, 2, sender, 2, 1, &set(LiveId(2, 0), "y")),
+            2,
+        )
+        .unwrap();
+    assert_eq!(client.phase(), Phase::Live);
+    let notes = presences(&step.send);
+    assert_eq!(notes.len(), 1);
+    assert_eq!(notes[0]["payload"], "catching up");
+    // Once closed, nothing is sent or kept.
+    client.leave();
+    assert_eq!(client.presence("closed".into()).unwrap(), None);
+}

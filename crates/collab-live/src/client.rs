@@ -16,8 +16,8 @@ use collab_core::ids::{ClientId, Seq};
 use protocol::RemovedReason;
 use protocol::live::{
     EntryBody, HEARTBEAT_MS, LIVE_PROTOCOL, LiveBuild, LiveClientMsg, LiveEntry, LivePerson,
-    LiveResume, LiveServerMsg, LiveSessionId, LocalNo, MAX_PAYLOAD_BYTES, MajorReason,
-    ParticipantNo, Place, RefusedReason, TicketPurpose,
+    LiveResume, LiveServerMsg, LiveSessionId, LocalNo, MAX_PAYLOAD_BYTES, MAX_PRESENCE_BYTES,
+    MajorReason, ParticipantNo, Place, RefusedReason, TicketPurpose,
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -198,6 +198,22 @@ pub enum Event {
     ReturnReady { through: LocalNo },
     /// Archive the old shown copy before the current base is loaded.
     ArchiveReturn { current: Option<String> },
+    /// Someone's presence note changed; `None` when it was cleared. Opaque to the library.
+    Presence {
+        participant: ParticipantNo,
+        payload: Option<String>,
+    },
+    /// Someone whose place had ended is back, with saved work of their own to send.
+    Returning { participant: ParticipantNo },
+    /// A checkpoint was stored (`verified` false) or a stored one verified.
+    Saved {
+        revision: String,
+        through: Seq,
+        verified: bool,
+        major: bool,
+    },
+    /// This kind of editor build may not take part in the session; the client is closed.
+    BuildRefused,
     /// The place ended after missed heartbeats; the client can join again.
     Expired,
     /// The client's protocol or format does not match the session's.
@@ -359,6 +375,10 @@ pub struct LiveClient<E: LiveEditor> {
     /// cancelled, and the one a cancel record unstalled. A cancel record for anything else
     /// at or before the agreed position means the editor applied a cancelled change.
     skipped: BTreeSet<Seq>,
+    /// The newest presence note, kept to be sent again on the next join.
+    presence: Option<String>,
+    /// Whether [`LiveClient::presence`]'s note went out on the current connection.
+    presence_sent: bool,
 }
 
 impl<E: LiveEditor> LiveClient<E> {
@@ -393,6 +413,8 @@ impl<E: LiveEditor> LiveClient<E> {
             base_at: Seq(0),
             stalled_at,
             skipped: BTreeSet::new(),
+            presence: None,
+            presence_sent: false,
         }
     }
 
@@ -411,6 +433,7 @@ impl<E: LiveEditor> LiveClient<E> {
         }
         self.phase = Phase::Joining;
         self.joined = false;
+        self.presence_sent = false;
         self.held.clear();
         // The join is a sign of life: the next heartbeat is due a full interval after it.
         self.last_heartbeat_ms = now_ms;
@@ -441,6 +464,7 @@ impl<E: LiveEditor> LiveClient<E> {
         }
         self.phase = Phase::Offline;
         self.joined = false;
+        self.presence_sent = false;
         // Entries held for this connection come again in the next catch-up.
         self.held.clear();
         for pending in &mut self.pending {
@@ -624,6 +648,31 @@ impl<E: LiveEditor> LiveClient<E> {
                 self.discarded_return_through = None;
                 self.has_state = false;
             }
+            LiveServerMsg::Presence {
+                participant,
+                payload,
+            } => step.events.push(Event::Presence {
+                participant,
+                payload,
+            }),
+            LiveServerMsg::Returning { participant } => {
+                step.events.push(Event::Returning { participant });
+            }
+            LiveServerMsg::Saved {
+                revision,
+                through,
+                verified,
+                major,
+            } => step.events.push(Event::Saved {
+                revision,
+                through,
+                verified,
+                major,
+            }),
+            LiveServerMsg::BuildRefused { .. } => {
+                self.phase = Phase::Closed;
+                step.events.push(Event::BuildRefused);
+            }
             LiveServerMsg::Incompatible { protocol, format } => {
                 self.phase = Phase::Closed;
                 step.events.push(Event::Incompatible { protocol, format });
@@ -732,6 +781,33 @@ impl<E: LiveEditor> LiveClient<E> {
         let mut step = Step::default();
         self.send_unsent(now_ms, &mut step.send);
         Ok(step)
+    }
+
+    /// Where the person is now, as an opaque note for the others to show.
+    ///
+    /// Returns the frame to send now, or `None` while not live: the newest note is kept and
+    /// sent once the client is live again, so only the latest one ever goes out. A note is not
+    /// a change: it has no local number, is never queued for resending, and changes neither the
+    /// agreed nor the shown state. A note over [`MAX_PRESENCE_BYTES`] is refused before any
+    /// frame is made, and nothing is kept once the client is closed.
+    pub fn presence(&mut self, payload: String) -> Result<Option<String>, LocalError> {
+        if payload.len() > MAX_PRESENCE_BYTES {
+            return Err(LocalError::TooLarge);
+        }
+        if self.phase == Phase::Closed {
+            return Ok(None);
+        }
+        if self.phase == Phase::Live {
+            self.presence_sent = true;
+            let frame = frame(&LiveClientMsg::Presence {
+                payload: payload.clone(),
+            });
+            self.presence = Some(payload);
+            return Ok(Some(frame));
+        }
+        self.presence = Some(payload);
+        self.presence_sent = false;
+        Ok(None)
     }
 
     /// Time passed: returns the heartbeat when it is due, and any changes not yet sent.
@@ -911,6 +987,14 @@ impl<E: LiveEditor> LiveClient<E> {
     fn check_live(&mut self, now_ms: u64, step: &mut Step) {
         if self.phase == Phase::CatchingUp && self.agreed_seq >= self.head {
             self.phase = Phase::Live;
+            if !self.presence_sent
+                && let Some(payload) = &self.presence
+            {
+                self.presence_sent = true;
+                step.send.push(frame(&LiveClientMsg::Presence {
+                    payload: payload.clone(),
+                }));
+            }
             self.send_unsent(now_ms, &mut step.send);
         }
     }
