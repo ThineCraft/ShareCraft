@@ -5,7 +5,8 @@
 //! ids of an untouched document are the base rows, `LiveId(0, 0)` upwards; each participant
 //! makes new ids from its own counter with an [`IdMaker`]. [`OrderedIds`] keeps the order of
 //! the live ids in runs of consecutive counters, so an untouched sheet of a million rows is a
-//! single run, and remembers where deleted ids were.
+//! single run, and remembers where deleted ids were. Lookups go through a private index and take
+//! logarithmic time in the number of runs; an axis holds at most [`OrderedIds::MAX_RUNS`] runs.
 
 use protocol::live::ParticipantNo;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -33,6 +34,11 @@ pub enum IdError {
     /// Stored identity data violates an invariant required by [`OrderedIds`].
     #[error("invalid ordered ids: {0}")]
     Invalid(&'static str),
+    /// The change could leave the axis with more than [`OrderedIds::MAX_RUNS`] live and
+    /// deleted runs (`runs` is that worst case), or touches more than
+    /// [`OrderedIds::MAX_BLOCKS_PER_CHANGE`] separate blocks.
+    #[error("the change could leave {runs} runs or touches {blocks} blocks, over the limit")]
+    TooFragmented { runs: usize, blocks: usize },
 }
 
 /// Makes new ids for one participant, counting on from 0.
@@ -115,14 +121,101 @@ struct DeletedRun {
     after: Option<LiveId>,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many runs lookups have visited on this thread, for the tests.
+    static PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts one run visited by a lookup (tests only).
+#[inline]
+fn probe() {
+    #[cfg(test)]
+    PROBES.with(|probes| probes.set(probes.get() + 1));
+}
+
+/// The first index in `items` where `before` is false, assuming `before` holds for a prefix;
+/// a binary search that counts each item it looks at as a probe.
+fn partition_point<T>(items: &[T], before: impl Fn(&T) -> bool) -> usize {
+    let (mut low, mut high) = (0, items.len());
+    while low < high {
+        let middle = low + (high - low) / 2;
+        probe();
+        match items.get(middle) {
+            Some(item) if before(item) => low = middle + 1,
+            _ => high = middle,
+        }
+    }
+    low
+}
+
 type IdentityInterval = (u32, u32, u64);
 type DeletedInterval = (u32, u32, u64, usize);
+
+/// Where a run is kept.
+#[derive(Clone, Copy, Debug)]
+enum Slot {
+    Live(usize),
+    Deleted(usize),
+}
+
+/// The lookup index of an [`OrderedIds`]: derived from the runs, never stored, and rebuilt after
+/// loading and after every change.
+#[derive(Clone, Default)]
+struct RunIndex {
+    /// The position of each live run's first id.
+    starts: Vec<u32>,
+    /// Every run's first identity, live and deleted, in identity order.
+    by_id: Vec<(u32, u32, Slot)>,
+    /// How many ids are live.
+    len: u32,
+}
+
+impl RunIndex {
+    fn build(live: &[Run], deleted: &[DeletedRun]) -> RunIndex {
+        let mut starts = Vec::with_capacity(live.len());
+        let mut len = 0u32;
+        for run in live {
+            starts.push(len);
+            // Validated tables and accepted changes never pass u32::MAX live ids.
+            len = len.saturating_add(run.len);
+        }
+        let mut by_id: Vec<_> =
+            live.iter()
+                .enumerate()
+                .map(|(index, run)| (run.participant, run.start, Slot::Live(index)))
+                .chain(deleted.iter().enumerate().map(|(index, gone)| {
+                    (gone.run.participant, gone.run.start, Slot::Deleted(index))
+                }))
+                .collect();
+        by_id.sort_unstable_by_key(|&(participant, start, _)| (participant, start));
+        RunIndex { starts, by_id, len }
+    }
+}
+
+/// The index is derived from the runs, so two tables with the same runs are equal whatever
+/// their indexes hold.
+impl PartialEq for RunIndex {
+    fn eq(&self, _other: &RunIndex) -> bool {
+        true
+    }
+}
+
+impl Eq for RunIndex {}
+
+impl std::fmt::Debug for RunIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<index of {} runs>", self.by_id.len())
+    }
+}
 
 /// The live ids in order, kept as runs, and the deleted ids with where they were.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct OrderedIds {
     live: Vec<Run>,
     deleted: Vec<DeletedRun>,
+    #[serde(skip)]
+    index: RunIndex,
 }
 
 #[derive(Deserialize)]
@@ -140,15 +233,75 @@ impl<'de> Deserialize<'de> for OrderedIds {
         let mut ids = OrderedIds {
             live: raw.live,
             deleted: raw.deleted,
+            index: RunIndex::default(),
         };
         ids.normalize_deleted_anchors()
             .map_err(serde::de::Error::custom)?;
         ids.validate().map_err(serde::de::Error::custom)?;
+        ids.reindex();
         Ok(ids)
     }
 }
 
 impl OrderedIds {
+    /// Live and deleted runs one axis may hold.
+    pub const MAX_RUNS: usize = 65_536;
+    /// Separate blocks one structural change may touch.
+    pub const MAX_BLOCKS_PER_CHANGE: usize = 1_024;
+
+    /// How much one change can add to the live and deleted runs at most: an insert splits one
+    /// run and adds one; a delete splits at both ends of the block and moves its runs to the
+    /// deleted list; a move splits at both ends and at the place it lands.
+    const INSERT_GROWTH: usize = 2;
+    const DELETE_GROWTH: usize = 2;
+    const MOVE_GROWTH: usize = 3;
+
+    /// A table of these runs, with its index built.
+    fn from_parts(live: Vec<Run>, deleted: Vec<DeletedRun>) -> OrderedIds {
+        let mut ids = OrderedIds {
+            live,
+            deleted,
+            index: RunIndex::default(),
+        };
+        ids.reindex();
+        ids
+    }
+
+    /// Builds the index again from the runs.
+    fn reindex(&mut self) {
+        self.index = RunIndex::build(&self.live, &self.deleted);
+    }
+
+    /// Live and deleted runs held now.
+    fn total_runs(&self) -> usize {
+        self.live.len().saturating_add(self.deleted.len())
+    }
+
+    /// Refuses a change that could grow the table by `growth` runs past [`Self::MAX_RUNS`] or
+    /// that touches more than [`Self::MAX_BLOCKS_PER_CHANGE`] blocks.
+    fn check_growth(&self, growth: usize, blocks: usize) -> Result<(), IdError> {
+        let runs = self.total_runs().saturating_add(growth);
+        if runs > Self::MAX_RUNS || blocks > Self::MAX_BLOCKS_PER_CHANGE {
+            return Err(IdError::TooFragmented { runs, blocks });
+        }
+        Ok(())
+    }
+
+    /// Whether deleting or moving these blocks (`(at, count)` each) would pass either limit;
+    /// checked before any change.
+    ///
+    /// Each block is counted at its worst (a move), so a change this accepts can be made block
+    /// by block without [`IdError::TooFragmented`]. The answer depends only on the table, so
+    /// every device decides alike.
+    pub fn check_fragmentation(&self, blocks: &[(u32, u32)]) -> Result<(), IdError> {
+        self.check_growth(
+            blocks.len().saturating_mul(Self::MAX_GROWTH_PER_BLOCK),
+            blocks.len(),
+        )
+    }
+
+    const MAX_GROWTH_PER_BLOCK: usize = Self::MOVE_GROWTH;
+
     /// The base rows `LiveId(0, 0)..LiveId(0, len - 1)`, as one run.
     pub fn base(len: u32) -> OrderedIds {
         let live = if len == 0 {
@@ -160,18 +313,12 @@ impl OrderedIds {
                 len,
             }]
         };
-        OrderedIds {
-            live,
-            deleted: Vec::new(),
-        }
+        OrderedIds::from_parts(live, Vec::new())
     }
 
     /// How many ids are live.
     pub fn len(&self) -> u32 {
-        // Inserts refuse to grow past u32::MAX, so the sum always fits.
-        self.live
-            .iter()
-            .fold(0u32, |sum, run| sum.saturating_add(run.len))
+        self.index.len
     }
 
     /// Whether no id is live.
@@ -342,37 +489,44 @@ impl OrderedIds {
         Ok(())
     }
 
-    /// The id at `pos`, if there is one.
+    /// The id at `pos`, if there is one. Takes time logarithmic in the number of runs.
     pub fn id_at(&self, pos: u32) -> Option<LiveId> {
-        let mut first = 0u32;
-        for run in &self.live {
-            let offset = pos.checked_sub(first)?;
-            if offset < run.len {
-                return Some(LiveId(run.participant, run.start + offset));
-            }
-            first += run.len;
+        if pos >= self.index.len {
+            return None;
         }
-        None
+        // The last run starting at or before `pos`.
+        let index = partition_point(&self.index.starts, |&start| start <= pos).checked_sub(1)?;
+        let run = self.live.get(index)?;
+        let offset = pos.checked_sub(*self.index.starts.get(index)?)?;
+        (offset < run.len).then(|| LiveId(run.participant, run.start.saturating_add(offset)))
     }
 
-    /// Where `id` is now.
+    /// Where `id` is now. Takes time logarithmic in the number of runs.
     pub fn find(&self, id: LiveId) -> Lookup {
-        let mut first = 0u32;
-        for run in &self.live {
-            if run.holds(id) {
-                return Lookup::At(first + (id.1 - run.start));
-            }
-            first += run.len;
-        }
-        for gone in &self.deleted {
-            if gone.run.holds(id) {
-                return Lookup::Deleted {
+        // The last run, live or deleted, whose first identity is at or before `id`.
+        let found = partition_point(&self.index.by_id, |&(participant, start, _)| {
+            (participant, start) <= (id.0, id.1)
+        })
+        .checked_sub(1)
+        .and_then(|index| self.index.by_id.get(index));
+        let Some(&(_, _, slot)) = found else {
+            return Lookup::Unknown;
+        };
+        match slot {
+            Slot::Live(index) => match (self.live.get(index), self.index.starts.get(index)) {
+                (Some(run), Some(&first)) if run.holds(id) => {
+                    Lookup::At(first.saturating_add(id.1 - run.start))
+                }
+                _ => Lookup::Unknown,
+            },
+            Slot::Deleted(index) => match self.deleted.get(index) {
+                Some(gone) if gone.run.holds(id) => Lookup::Deleted {
                     was_at: gone.was_at.saturating_add(id.1 - gone.run.start),
                     after: gone.after,
-                };
-            }
+                },
+                _ => Lookup::Unknown,
+            },
         }
-        Lookup::Unknown
     }
 
     /// Inserts the `count` ids starting at `first` so the first of them is at position `at`.
@@ -393,6 +547,7 @@ impl OrderedIds {
         if let Some(taken) = self.first_taken(first.0, start, end) {
             return Err(IdError::Taken(taken));
         }
+        self.check_growth(Self::INSERT_GROWTH, 1)?;
         let index = self.split_at(at);
         let run = Run {
             participant: first.0,
@@ -401,6 +556,7 @@ impl OrderedIds {
         };
         self.live.insert(index, run);
         self.merge();
+        self.reindex();
         debug_assert!(self.validate().is_ok());
         Ok(())
     }
@@ -415,6 +571,7 @@ impl OrderedIds {
             debug_assert!(self.validate().is_ok());
             return Ok(());
         }
+        self.check_growth(Self::DELETE_GROWTH, 1)?;
         let after = at.checked_sub(1).and_then(|above| self.id_at(above));
         let block = self.take_out(at, count);
         let mut removed_intervals: Vec<_> = block
@@ -435,6 +592,7 @@ impl OrderedIds {
             self.deleted.push(DeletedRun { run, was_at, after });
             was_at += run.len;
         }
+        self.reindex();
         debug_assert!(self.validate().is_ok());
         Ok(())
     }
@@ -462,10 +620,12 @@ impl OrderedIds {
             debug_assert!(self.validate().is_ok());
             return Ok(());
         }
+        self.check_growth(Self::MOVE_GROWTH, 1)?;
         let block = self.take_out(from, count);
         let index = self.split_at(to);
         self.live.splice(index..index, block);
         self.merge();
+        self.reindex();
         debug_assert!(self.validate().is_ok());
         Ok(())
     }
@@ -754,15 +914,15 @@ mod tests {
     #[test]
     fn deleting_fragmented_runs_reanchors_without_quadratic_work() {
         const RUNS: u32 = 20_000;
-        let mut ids = OrderedIds {
-            live: (0..RUNS)
+        let mut ids = OrderedIds::from_parts(
+            (0..RUNS)
                 .map(|start| Run {
                     participant: 1,
                     start: start * 2,
                     len: 1,
                 })
                 .collect(),
-            deleted: (0..RUNS)
+            (0..RUNS)
                 .map(|start| DeletedRun {
                     run: Run {
                         participant: 2,
@@ -773,7 +933,7 @@ mod tests {
                     after: Some(LiveId(1, start * 2)),
                 })
                 .collect(),
-        };
+        );
 
         let started = Instant::now();
         ids.delete(0, RUNS).unwrap();
@@ -911,15 +1071,15 @@ mod tests {
     fn ordered_ids_validate_many_fragmented_anchors_without_quadratic_work() {
         const RUNS: u32 = 50_000;
         let after = Some(LiveId(1, (RUNS - 1) * 2));
-        let ids = OrderedIds {
-            live: (0..RUNS)
+        let ids = OrderedIds::from_parts(
+            (0..RUNS)
                 .map(|start| Run {
                     participant: 1,
                     start: start * 2,
                     len: 1,
                 })
                 .collect(),
-            deleted: (0..RUNS)
+            (0..RUNS)
                 .map(|start| DeletedRun {
                     run: Run {
                         participant: 2,
@@ -930,7 +1090,7 @@ mod tests {
                     after,
                 })
                 .collect(),
-        };
+        );
         let json = serde_json::to_vec(&ids).unwrap();
         assert!(json.len() < 8 * 1024 * 1024);
 
@@ -1064,5 +1224,272 @@ mod tests {
                 prop_assert!(ids.runs() <= expected_runs);
             }
         }
+    }
+
+    /// Runs visited by `lookup`.
+    fn probes_of(lookup: impl FnOnce()) -> usize {
+        PROBES.with(|probes| probes.set(0));
+        lookup();
+        PROBES.with(std::cell::Cell::get)
+    }
+
+    /// An axis of `runs` single-id live runs that cannot merge (every other counter of
+    /// participant 1), loaded the way stored data is.
+    fn fragmented(runs: u32) -> OrderedIds {
+        let live: Vec<_> = (0..runs)
+            .map(|at| serde_json::json!({ "participant": 1, "start": at * 2, "len": 1 }))
+            .collect();
+        serde_json::from_value(serde_json::json!({ "live": live, "deleted": [] })).unwrap()
+    }
+
+    #[test]
+    fn lookups_on_a_fragmented_axis_touch_few_runs() {
+        const RUNS: u32 = 60_000;
+        let mut ids = fragmented(RUNS);
+        // Some deleted runs too, so `find` has both kinds to search.
+        ids.delete(10, 5).unwrap();
+        assert_eq!(ids.runs(), RUNS as usize - 5);
+        let mut worst = 0;
+        for pos in (0..RUNS - 5).step_by(997).chain([0, RUNS - 6]) {
+            let id = ids.id_at(pos).unwrap();
+            worst = worst.max(probes_of(|| assert_eq!(ids.id_at(pos), Some(id))));
+            worst = worst.max(probes_of(|| assert_eq!(ids.find(id), Lookup::At(pos))));
+        }
+        worst = worst.max(probes_of(|| assert_eq!(ids.id_at(RUNS), None)));
+        worst = worst.max(probes_of(|| {
+            assert!(matches!(ids.find(LiveId(1, 24)), Lookup::Deleted { .. }));
+        }));
+        worst = worst.max(probes_of(|| {
+            assert_eq!(ids.find(LiveId(1, 1)), Lookup::Unknown);
+        }));
+        worst = worst.max(probes_of(|| {
+            assert_eq!(ids.find(LiveId(9, 0)), Lookup::Unknown);
+        }));
+        println!("most runs visited by one lookup on {RUNS} runs: {worst}");
+        assert!(worst <= 40, "a lookup visited {worst} runs");
+    }
+
+    #[test]
+    fn index_is_rebuilt_after_deserialisation() {
+        let mut ids = OrderedIds::base(40);
+        ids.insert(5, LiveId(2, 0), 3).unwrap();
+        ids.delete(10, 4).unwrap();
+        ids.move_block(0, 3, 20).unwrap();
+        ids.insert(30, LiveId(3, 0), 2).unwrap();
+        let json = serde_json::to_value(&ids).unwrap();
+        // The stored form is unchanged: only the runs, no index.
+        let keys: Vec<_> = json.as_object().unwrap().keys().cloned().collect();
+        assert_eq!(keys, vec!["deleted".to_owned(), "live".to_owned()]);
+        let back: OrderedIds = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(back, ids);
+        assert_eq!(serde_json::to_value(&back).unwrap(), json);
+        assert_eq!(back.len(), ids.len());
+        for pos in 0..=ids.len() {
+            assert_eq!(back.id_at(pos), ids.id_at(pos));
+            if let Some(id) = ids.id_at(pos) {
+                assert_eq!(back.find(id), Lookup::At(pos));
+            }
+        }
+        for participant in 0..4 {
+            for counter in 0..45 {
+                let id = LiveId(participant, counter);
+                assert_eq!(back.find(id), ids.find(id), "{id:?}");
+            }
+        }
+        // A loaded table goes on changing like the original.
+        let mut a = ids.clone();
+        let mut b = back;
+        a.move_block(2, 7, 11).unwrap();
+        b.move_block(2, 7, 11).unwrap();
+        assert_eq!(a, b);
+        for pos in 0..a.len() {
+            let id = a.id_at(pos).unwrap();
+            assert_eq!(b.id_at(pos), Some(id));
+            assert_eq!(b.find(id), Lookup::At(pos));
+        }
+    }
+
+    #[test]
+    #[ignore = "timing record for G5 Task 14; run with --release -- --ignored --nocapture"]
+    fn fragmented_axis_lookup_timing() {
+        const RUNS: u32 = 60_000;
+        const LOOKUPS: u32 = 200_000;
+        let ids = fragmented(RUNS);
+        let started = Instant::now();
+        let mut found = 0u64;
+        for n in 0..LOOKUPS {
+            let pos = n.wrapping_mul(7_919) % RUNS;
+            if let Some(id) = ids.id_at(pos)
+                && ids.find(id) == Lookup::At(pos)
+            {
+                found += 1;
+            }
+        }
+        let elapsed = started.elapsed();
+        assert_eq!(found, u64::from(LOOKUPS));
+        let per_second = f64::from(LOOKUPS * 2) / elapsed.as_secs_f64();
+        println!(
+            "fragmented_axis_lookup_timing: {RUNS} runs, {} lookups in {elapsed:?}, \
+             {per_second:.0} lookups per second",
+            LOOKUPS * 2
+        );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+        /// Many small blocks from several participants, so the table fragments; every lookup
+        /// (and every lookup on a copy loaded from JSON) agrees with a plain list.
+        #[test]
+        fn indexed_lookups_match_a_plain_list(
+            base in 0..=30u32,
+            ops in proptest::collection::vec(op(), 0..=120),
+        ) {
+            let mut ids = OrderedIds::base(base);
+            let mut list: Vec<LiveId> = (0..base).map(|c| LiveId(0, c)).collect();
+            let mut gone: Vec<LiveId> = Vec::new();
+            let mut makers: HashMap<u32, IdMaker> = HashMap::new();
+            for op in ops {
+                let len = list.len() as u32;
+                match op {
+                    Op::Insert { at, participant, count } => {
+                        let count = count.min(2);
+                        let first = makers
+                            .entry(participant)
+                            .or_insert_with(|| IdMaker::new(ParticipantNo(participant)))
+                            .take(count)
+                            .unwrap();
+                        if ids.insert(at, first, count).is_ok() {
+                            for i in 0..count {
+                                list.insert((at + i) as usize, LiveId(first.0, first.1 + i));
+                            }
+                        }
+                    }
+                    Op::Delete { at, count } => {
+                        if at + count <= len {
+                            ids.delete(at, count).unwrap();
+                            gone.extend(list.drain(at as usize..(at + count) as usize));
+                        }
+                    }
+                    Op::Move { from, count, to } => {
+                        if from + count <= len && to <= len - count {
+                            ids.move_block(from, count, to).unwrap();
+                            let block: Vec<_> =
+                                list.drain(from as usize..(from + count) as usize).collect();
+                            for (i, id) in block.into_iter().enumerate() {
+                                list.insert(to as usize + i, id);
+                            }
+                        }
+                    }
+                }
+                let loaded: OrderedIds =
+                    serde_json::from_str(&serde_json::to_string(&ids).unwrap()).unwrap();
+                for table in [&ids, &loaded] {
+                    prop_assert_eq!(table.len(), list.len() as u32);
+                    for pos in 0..=list.len() as u32 + 1 {
+                        prop_assert_eq!(table.id_at(pos), list.get(pos as usize).copied());
+                    }
+                    for (pos, id) in list.iter().enumerate() {
+                        prop_assert_eq!(table.find(*id), Lookup::At(pos as u32));
+                    }
+                    for id in &gone {
+                        let deleted = matches!(table.find(*id), Lookup::Deleted { .. });
+                        prop_assert!(deleted);
+                    }
+                    for participant in 0..5 {
+                        let unseen = if participant == 0 {
+                            base
+                        } else {
+                            makers.get(&participant).map_or(0, |maker| {
+                                u32::try_from(maker.next).unwrap()
+                            })
+                        };
+                        prop_assert_eq!(
+                            table.find(LiveId(participant, unseen)),
+                            Lookup::Unknown
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn axis_over_max_runs_is_refused_before_change() {
+        let max = OrderedIds::MAX_RUNS as u32;
+        assert_eq!(OrderedIds::MAX_RUNS, 65_536);
+        // One short of the limit: any insert, delete or move could pass it.
+        let mut full = fragmented(max - 1);
+        let before = full.clone();
+        let json = serde_json::to_string(&full).unwrap();
+        assert!(matches!(
+            full.insert(7, LiveId(5, 0), 1),
+            Err(IdError::TooFragmented { runs, blocks: 1 }) if runs > OrderedIds::MAX_RUNS
+        ));
+        assert!(matches!(
+            full.delete(7, 3),
+            Err(IdError::TooFragmented { runs, blocks: 1 }) if runs > OrderedIds::MAX_RUNS
+        ));
+        assert!(matches!(
+            full.move_block(7, 3, 100),
+            Err(IdError::TooFragmented { runs, blocks: 1 }) if runs > OrderedIds::MAX_RUNS
+        ));
+        assert_eq!(full, before);
+        assert_eq!(serde_json::to_string(&full).unwrap(), json);
+        for pos in [0, 7, 8, max - 2] {
+            assert_eq!(full.find(full.id_at(pos).unwrap()), Lookup::At(pos));
+        }
+        // Range errors still come first, and an empty change is no change.
+        assert!(matches!(
+            full.insert(max, LiveId(5, 0), 1),
+            Err(IdError::OutOfRange { .. })
+        ));
+        assert_eq!(full.delete(3, 0), Ok(()));
+
+        // With room for the worst case the same changes are made.
+        let mut roomy = fragmented(max - 3);
+        roomy.insert(7, LiveId(5, 0), 1).unwrap();
+        assert_eq!(roomy.find(LiveId(5, 0)), Lookup::At(7));
+        let mut roomy = fragmented(max - 3);
+        roomy.move_block(7, 3, 100).unwrap();
+        let mut roomy = fragmented(max - 2);
+        roomy.delete(7, 3).unwrap();
+        assert!(matches!(roomy.find(LiveId(1, 16)), Lookup::Deleted { .. }));
+        // Deleted runs count too: the table now holds max - 2 runs in all.
+        assert_eq!(roomy.insert(0, LiveId(6, 0), 1), Ok(()));
+        assert!(matches!(
+            roomy.insert(0, LiveId(6, 1), 1),
+            Err(IdError::TooFragmented { .. })
+        ));
+    }
+
+    #[test]
+    fn too_many_blocks_in_one_change_is_refused_before_change() {
+        assert_eq!(OrderedIds::MAX_BLOCKS_PER_CHANGE, 1_024);
+        let ids = OrderedIds::base(10_000);
+        let blocks: Vec<(u32, u32)> = (0..1_025u32).map(|at| (at * 3, 1)).collect();
+        assert_eq!(ids.check_fragmentation(&blocks[..1_024]), Ok(()));
+        assert!(matches!(
+            ids.check_fragmentation(&blocks),
+            Err(IdError::TooFragmented { blocks: 1_025, .. })
+        ));
+        assert_eq!(ids.check_fragmentation(&[]), Ok(()));
+
+        // Near the run limit, a change is refused when its blocks could pass it, and a change
+        // that passes the check can be made block by block without any refusal.
+        let max = OrderedIds::MAX_RUNS as u32;
+        let near = fragmented(max - 30);
+        assert!(matches!(
+            near.check_fragmentation(&[(0, 1); 11]),
+            Err(IdError::TooFragmented { blocks: 11, .. })
+        ));
+        assert_eq!(near.check_fragmentation(&[(0, 1); 10]), Ok(()));
+        let mut near = near;
+        for n in 0..10u32 {
+            near.move_block(n * 4, 1, n * 4 + 2).unwrap();
+        }
+        // Checking changes nothing.
+        let ids_before = ids.clone();
+        let _ = ids.check_fragmentation(&blocks);
+        assert_eq!(ids, ids_before);
     }
 }
