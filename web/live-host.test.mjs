@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { connectLive, liveRetry, parseLiveEditorMessage, peekServerFrame } from './live-host.js';
+import { connectLive, liveRetry, parseLiveEditorMessage, peekServerFrame, warnOnLeave } from './live-host.js';
 
 const ORIGIN = 'https://share.test';
 const DOC = 'doc-1';
@@ -517,9 +517,9 @@ test('watchdog_offers_reload_after_fifteen_silent_seconds', () => {
   assert.equal(seen.reloads, 0);
   clock.advance(1);
   assert.equal(seen.reloads, 1, 'reloaded automatically');
-  // An answer stops the watchdog for that tick.
+  // An answer stops the watchdog for that tick (one short of live keeps the reload count).
   clock.advance(45_000);
-  page.fromEditor({ type: 'gridcraft:live-state', phase: 'live', waiting: 0, canEdit: true });
+  page.fromEditor({ type: 'gridcraft:live-state', phase: 'catching_up', waiting: 0, canEdit: true });
   clock.advance(30_000);
   assert.equal(seen.reloads, 1);
   // Two more silent ticks reload; after three, the page offers "Reload editor" instead.
@@ -532,4 +532,139 @@ test('watchdog_offers_reload_after_fifteen_silent_seconds', () => {
   assert.equal(page.kinds().at(-1), 'gridcraft:live-tick');
   clock.advance(120_000);
   assert.equal(seen.offers, 1);
+});
+
+// ---- G5 Task 12 review fixes ----
+
+test('live_retry_keeps_backing_off_while_the_room_is_unavailable', () => {
+  let state;
+  const waits = [];
+  for (let n = 0; n < 12; n += 1) {
+    state = liveRetry(state, { type: 'reset', kind: 'unavailable' }, () => 0);
+    waits.push(state.wait);
+  }
+  assert.equal(state.stopped, false, 'an unavailable room is not a client fault');
+  assert.equal(waits.at(-1), 60000);
+  assert.equal(state.repeats, 0);
+  // It does not break a run of identical client errors either.
+  let run;
+  for (const kind of ['desync', 'desync', 'unavailable', 'desync', 'desync', 'desync']) {
+    run = liveRetry(run, { type: 'reset', kind }, () => 0);
+  }
+  assert.equal(run.stopped, true);
+});
+
+/**
+ * A page whose editor is reloaded the way file.js does it: the session is closed and a new
+ * connection made for the new editor, sharing `memory`.
+ */
+function reloadingPage() {
+  const page = standInPage();
+  const clock = standInClock();
+  const sockets = standInSockets();
+  const memory = {};
+  const seen = { reloads: 0, offers: 0, stopped: [], connections: 0 };
+  let connection = null;
+  const env = {
+    WebSocket: sockets.Socket,
+    fetch: standInFetch({}).fetch,
+    setTimeout: clock.setTimeout,
+    clearTimeout: clock.clearTimeout,
+    setInterval: clock.setInterval,
+    clearInterval: clock.clearInterval,
+    random: () => 0,
+  };
+  const start = () => {
+    seen.connections += 1;
+    connection = connectLive(page.frame, { prefix: 'gridcraft', live: 'gridcraft/1' }, DOC, {
+      canEdit: true,
+      memory,
+      stopped: (why) => seen.stopped.push(why),
+      reloadEditor: () => {
+        seen.reloads += 1;
+        connection.close();
+        start();
+      },
+      offerReload: () => (seen.offers += 1),
+      env,
+    });
+    sockets.made.at(-1).open();
+  };
+  start();
+  return { page, clock, sockets, seen, socket: () => sockets.made.at(-1) };
+}
+
+test('automatic_reloads_are_counted_across_editor_reloads', () => {
+  const { page, clock, seen } = reloadingPage();
+  // Each new editor is silent: three reloads, then "Reload editor" is offered.
+  for (let n = 0; n < 5; n += 1) clock.advance(75_000);
+  assert.equal(seen.reloads, 3);
+  assert.equal(seen.connections, 4);
+  assert.ok(seen.offers >= 1, 'the page offers "Reload editor" after three reloads');
+  // Reaching live starts the count again.
+  page.fromEditor({ type: 'gridcraft:live-state', phase: 'live', waiting: 0, canEdit: true });
+  clock.advance(75_000);
+  assert.equal(seen.reloads, 4);
+});
+
+test('the_repeated_error_stop_holds_across_editor_reloads', () => {
+  const { page, clock, sockets, seen } = reloadingPage();
+  for (let n = 0; n < 3; n += 1) {
+    page.fromEditor({ type: 'gridcraft:live-reset', kind: 'desync' });
+    clock.advance(10_000);
+    sockets.made.at(-1).open();
+  }
+  // The editor stops answering and is reloaded: the run of errors carries on.
+  clock.advance(75_000);
+  assert.equal(seen.reloads, 1);
+  for (let n = 0; n < 2; n += 1) {
+    page.fromEditor({ type: 'gridcraft:live-reset', kind: 'desync' });
+    clock.advance(10_000);
+    sockets.made.at(-1).open();
+  }
+  assert.deepEqual(seen.stopped, ['repeated']);
+});
+
+test('a_close_and_a_reset_together_open_one_socket', () => {
+  const { page, socket, sockets, clock } = live();
+  // Climb to the one-minute cap.
+  for (let n = 0; n < 7; n += 1) {
+    page.fromEditor({ type: 'gridcraft:live-reset', kind: `k${n}` });
+    clock.advance(60_000);
+    socket().open();
+  }
+  const before = sockets.made.length;
+  const closes = page.kinds().filter((kind) => kind === 'gridcraft:live-closed').length;
+  // The server closes after its last frame, then the editor asks for a reset.
+  socket().close();
+  page.fromEditor({ type: 'gridcraft:live-reset', kind: 'expired' });
+  clock.advance(120_000);
+  assert.equal(sockets.made.length, before + 1, 'one new socket');
+  assert.equal(page.kinds().filter((kind) => kind === 'gridcraft:live-closed').length, closes + 1);
+});
+
+test('a_late_base_fetch_does_not_reset_a_newer_connection', async () => {
+  let fail;
+  const pending = new Promise((resolve) => (fail = resolve));
+  const { page, socket, sockets, clock } = live({
+    routes: { '/api/docs/doc-1/content?revision=r1': () => pending },
+  });
+  page.fromEditor({ type: 'gridcraft:live-load', revision: 'r1', at: 5 });
+  await settle();
+  // The connection drops and comes back while the fetch is out.
+  socket().close();
+  clock.advance(1000);
+  assert.equal(sockets.made.length, 2);
+  socket().open();
+  fail(new Response(null, { status: 503 }));
+  await settle();
+  assert.equal(socket().readyState, 1, 'the newer connection is kept');
+  assert.equal(page.posted.some((message) => message.type === 'gridcraft:live-base'), false);
+});
+
+test('leaving_warns_while_live_changes_wait', () => {
+  assert.equal(warnOnLeave(undefined), false);
+  assert.equal(warnOnLeave({ phase: 'live', waiting: 0, canEdit: true }), false);
+  assert.equal(warnOnLeave({ phase: 'offline', waiting: 3, canEdit: true }), true);
+  assert.equal(warnOnLeave({ phase: 'live', waiting: 1, canEdit: true }), true);
 });

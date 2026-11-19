@@ -41,7 +41,7 @@ import { forgetOpened, rememberOpened } from './start.js';
 import { activityPanel } from './activity.js';
 import { setupEditorFrame } from './editor-frame.js';
 import { avatarColour, initials } from './account.js';
-import { connectLive } from './live-host.js';
+import { connectLive, warnOnLeave } from './live-host.js';
 import { createViewer } from './file-viewer.js';
 import { viewerList } from './viewer.js';
 
@@ -112,6 +112,8 @@ let notReadyTimer = 0;
 let chrome = null;          // the frame's header and panels, set up once the viewer and queue exist
 let liveMode = false;       // the server opens this document in a live room (G5)
 let liveSession = null;     // the live connection, once the editor is ready
+let liveMemory = {};        // back-off and reload count, kept across editor reloads
+let liveState = null;       // the editor's last live state
 let viewGen = 0;            // counts the files shown in the viewer; older answers are dropped
 const previewUrl = () => `/api/docs/${seg(docId)}/preview`;
 
@@ -156,8 +158,8 @@ chrome = setupEditorFrame(frameBox, {
 
 addEventListener('beforeunload', (event) => {
   if (removed) return;
-  // Unsaved changes in the editor, or a copy the server has not stored.
-  if (editorDirty || queue.kept || mine) {
+  // Unsaved changes in the editor, a copy the server has not stored, or live changes waiting.
+  if (editorDirty || queue.kept || mine || (liveMode && warnOnLeave(liveState))) {
     event.preventDefault();
     event.returnValue = '';
   }
@@ -825,6 +827,8 @@ function onReady() {
 function startLive() {
   liveSession = connectLive(frame, BRIDGES[doc.editor], docId, {
     canEdit: can(doc.access, 'edit'),
+    memory: liveMemory,
+    state: (state) => (liveState = state),
     look: (person) => ({ initials: initials(person.name), colour: avatarColour(person.user).light.bg }),
     removed: (reason) => stopRemoved(reason),
     stopped: () => setNotice({ text: LIVE_STOPPED, actions: ['reload'] }),

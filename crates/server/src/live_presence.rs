@@ -16,6 +16,10 @@ pub(crate) const PRESENCE_PER_SECOND: u32 = 10;
 pub(crate) const PRESENCE_BURST: u32 = 20;
 
 /// The latest note of each place, and each place's allowance.
+///
+/// The allowance is kept per place, which one client holds at a time, and is forgotten as soon
+/// as the place is not connected: a client that reconnects starts with a full burst again. That
+/// is no more than reconnecting already costs (an upgrade, a recheck and a catch-up).
 #[derive(Default)]
 pub(crate) struct PresenceBook {
     notes: BTreeMap<ParticipantNo, String>,

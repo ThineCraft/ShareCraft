@@ -44,6 +44,8 @@ const PEEKED = new Set([
   'returning',
   'saved',
 ]);
+/** The reset the editor asks for when the room cannot take it now; not a client fault. */
+const UNAVAILABLE = 'unavailable';
 /** Server messages after which the page stops for good. */
 const FINAL = new Set(['incompatible', 'build_refused', 'cannot_open']);
 
@@ -53,7 +55,8 @@ const FINAL = new Set(['incompatible', 'build_refused', 'cannot_open']);
  * editor could not follow; `kind` names the error), `{type: 'live'}` (the session is live
  * again, which starts everything afresh). The wait starts at one second and doubles up to a
  * minute, less up to 20% at random so several tabs do not retry together. Five identical
- * errors in a row stop it for good; a close between them is not an error.
+ * errors in a row stop it for good; a close between them is not an error, and neither is an
+ * `unavailable` room (it keeps waiting, up to a minute, until the room can take it again).
  */
 export function liveRetry(state, event, random = Math.random) {
   const fresh = { wait: 0, attempt: 0, stopped: false, lastError: null, repeats: 0 };
@@ -64,7 +67,7 @@ export function liveRetry(state, event, random = Math.random) {
   const base = Math.min(FIRST_WAIT * 2 ** (attempt - 1), MAX_WAIT);
   const spread = Math.min(Math.max(Number(random()) || 0, 0), 1);
   const wait = Math.round(base * (1 - SPREAD * spread));
-  if (event?.type !== 'reset') return { ...now, wait, attempt };
+  if (event?.type !== 'reset' || event.kind === UNAVAILABLE) return { ...now, wait, attempt };
   const kind = String(event.kind ?? '');
   const repeats = kind === now.lastError ? now.repeats + 1 : 1;
   return { wait, attempt, stopped: repeats >= MAX_REPEATS, lastError: kind, repeats };
@@ -146,6 +149,11 @@ export function peekServerFrame(text) {
   }
 }
 
+/** Whether leaving the page now loses changes: the editor's last state had some waiting. */
+export function warnOnLeave(state) {
+  return Number.isSafeInteger(state?.waiting) && state.waiting > 0;
+}
+
 const integerHeader = (response, name, max) => {
   const text = response.headers.get(name);
   if (text === null || !/^-?\d{1,16}$/.test(text)) return null;
@@ -163,6 +171,9 @@ const integerHeader = (response, name, max) => {
  * - `stopped(why)`: the page stopped reconnecting (`repeated`, or the final server message);
  * - `peek(message)`, `access(canEdit)`, `notice(notice)`, `state(state)`: for the bar;
  * - `reloadEditor()`, `offerReload()`: the editor did not answer a tick in time;
+ * - `memory`: an object the page keeps across editor reloads, which holds the back-off state
+ *   and the count of automatic reloads, so neither starts again with a new editor; both reset
+ *   when the session is live;
  * - `env`: stand-ins for WebSocket, fetch, timers and random, for tests.
  */
 export function connectLive(frame, bridge, docId, handlers = {}) {
@@ -181,12 +192,13 @@ export function connectLive(frame, bridge, docId, handlers = {}) {
   const origin = win.location.origin;
   const prefix = bridge.prefix;
   const id = encodeURIComponent(docId);
+  const memory = handlers.memory ?? {};
+  memory.reloads ??= 0;
   let socket = null;
+  let generation = 0; // counts sockets, so a late answer for an older one is dropped
   let finished = false;
-  let retry;
   let retryTimer = 0;
   let watchdog = 0;
-  let reloads = 0;
 
   const post = (message, transfer) => {
     try {
@@ -214,6 +226,7 @@ export function connectLive(frame, bridge, docId, handlers = {}) {
     const scheme = win.location.protocol === 'https:' ? 'wss' : 'ws';
     const ws = new env.WebSocket(`${scheme}://${win.location.host}/ws/docs/${id}`);
     socket = ws;
+    generation += 1;
     ws.onopen = () => {
       if (ws === socket && !finished) live('open');
     };
@@ -247,20 +260,25 @@ export function connectLive(frame, bridge, docId, handlers = {}) {
   };
 
   const again = (event) => {
-    retry = liveRetry(retry, event, env.random);
-    if (retry.stopped) {
+    memory.retry = liveRetry(memory.retry, event, env.random);
+    // A close and a reset can come together; only the latest wait opens a socket.
+    env.clearTimeout(retryTimer);
+    if (memory.retry.stopped) {
       finish();
       handlers.stopped?.('repeated');
       return;
     }
-    retryTimer = env.setTimeout(open, retry.wait);
+    retryTimer = env.setTimeout(open, memory.retry.wait);
   };
 
   // The editor (or the page) cannot follow the room: close, tell the editor, and join later.
   const reset = (kind) => {
     if (finished) return;
-    drop();
-    live('closed');
+    // The socket may be gone already (the server closed it after its last frame).
+    if (socket) {
+      drop();
+      live('closed');
+    }
     again({ type: 'reset', kind });
   };
 
@@ -333,6 +351,7 @@ export function connectLive(frame, bridge, docId, handlers = {}) {
   // The base the editor asked for: the revision's file (none: the empty document) and, for a
   // checkpoint, its session data and stamp.
   const load = async ({ revision, at }) => {
+    const asked = generation;
     if (revision === null) {
       live('base', { revision: null, at, bytes: new Uint8Array(0) });
       return;
@@ -352,7 +371,8 @@ export function connectLive(frame, bridge, docId, handlers = {}) {
         fields = { revision, at, bytes, sessionData, stamp: { atMs, seed } };
       }
     }
-    if (finished) return;
+    // An answer for an older socket is dropped: its editor asks again after the catch-up.
+    if (finished || asked !== generation) return;
     if (!fields) {
       reset('base_fetch');
       return;
@@ -414,7 +434,10 @@ export function connectLive(frame, bridge, docId, handlers = {}) {
       case 'state':
         env.clearTimeout(watchdog);
         watchdog = 0;
-        if (message.phase === 'live') retry = liveRetry(retry, { type: 'live' });
+        if (message.phase === 'live') {
+          memory.retry = liveRetry(memory.retry, { type: 'live' });
+          memory.reloads = 0;
+        }
         handlers.state?.(message);
         break;
       default:
@@ -431,8 +454,8 @@ export function connectLive(frame, bridge, docId, handlers = {}) {
     watchdog = env.setTimeout(() => {
       watchdog = 0;
       if (finished || doc.visibilityState !== 'visible') return;
-      if (reloads < AUTO_RELOADS) {
-        reloads += 1;
+      if (memory.reloads < AUTO_RELOADS) {
+        memory.reloads += 1;
         handlers.reloadEditor?.();
       } else {
         handlers.offerReload?.();
