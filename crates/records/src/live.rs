@@ -75,6 +75,15 @@ pub struct LiveCheckpointRow {
     pub session_data: Vec<u8>,
     pub major_reason: Option<String>,
     pub major_person: Option<UserId>,
+    /// Who uploaded the bytes, when a participant did.
+    pub writer: Option<LiveCheckpointWriter>,
+}
+
+/// The place and client that uploaded a checkpoint's bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct LiveCheckpointWriter {
+    pub participant: u32,
+    pub client: ClientId,
 }
 
 /// A checkpoint to associate with an existing revision.
@@ -87,6 +96,8 @@ pub struct NewLiveCheckpoint<'a> {
     pub session_data: &'a [u8],
     pub major_reason: Option<&'a str>,
     pub major_person: Option<UserId>,
+    /// Who uploaded the bytes, when a participant did.
+    pub writer: Option<LiveCheckpointWriter>,
     pub created_at: OffsetDateTime,
 }
 
@@ -499,6 +510,16 @@ fn checkpoint_of(row: &PgRow) -> Result<LiveCheckpointRow, DbError> {
         session_data: row.try_get("session_data")?,
         major_reason: row.try_get("major_reason")?,
         major_person: row.try_get::<Option<Uuid>, _>("major_person")?.map(UserId),
+        writer: match (
+            row.try_get::<Option<i32>, _>("writer_participant")?,
+            row.try_get::<Option<Uuid>, _>("writer_client")?,
+        ) {
+            (Some(participant), Some(client)) => Some(LiveCheckpointWriter {
+                participant: unnumber(participant)?,
+                client: ClientId(client),
+            }),
+            _ => None,
+        },
     })
 }
 
@@ -563,11 +584,16 @@ async fn insert_live_checkpoint(
             checkpoint.revision, doc.0
         )));
     }
+    let writer_participant = checkpoint
+        .writer
+        .map(|writer| number(writer.participant))
+        .transpose()?;
+    let writer_client = checkpoint.writer.map(|writer| writer.client.0);
     let inserted = sqlx::query(
         "insert into live_checkpoints \
                  (document_id, revision, through, sha256, session_id, session_data, \
-                  major_reason, major_person, created_at) \
-             values ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+                  major_reason, major_person, created_at, writer_participant, writer_client) \
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
              on conflict do nothing",
     )
     .bind(doc.0)
@@ -579,6 +605,8 @@ async fn insert_live_checkpoint(
     .bind(checkpoint.major_reason)
     .bind(checkpoint.major_person.map(|person| person.0))
     .bind(checkpoint.created_at)
+    .bind(writer_participant)
+    .bind(writer_client)
     .execute(&mut *tx)
     .await?;
     if inserted.rows_affected() == 0 {
@@ -588,7 +616,9 @@ async fn insert_live_checkpoint(
                     where document_id = $1 and revision = $2 and through = $3 \
                       and sha256 = $4 and session_id = $5 and session_data = $6 \
                       and major_reason is not distinct from $7 \
-                      and major_person is not distinct from $8 and created_at = $9)",
+                      and major_person is not distinct from $8 and created_at = $9 \
+                      and writer_participant is not distinct from $10 \
+                      and writer_client is not distinct from $11)",
         )
         .bind(doc.0)
         .bind(checkpoint.revision)
@@ -599,6 +629,8 @@ async fn insert_live_checkpoint(
         .bind(checkpoint.major_reason)
         .bind(checkpoint.major_person.map(|person| person.0))
         .bind(checkpoint.created_at)
+        .bind(writer_participant)
+        .bind(writer_client)
         .fetch_one(&mut *tx)
         .await?;
         if !same {
@@ -631,7 +663,7 @@ impl Db {
         let verified_through: i64 = log.try_get("verified_through")?;
         let verified_checkpoint = sqlx::query(
             "select revision, through, sha256, verified_at, session_id, session_data, \
-                    major_reason, major_person \
+                    major_reason, major_person, writer_participant, writer_client \
              from live_checkpoints where document_id = $1 and verified_at is not null \
              order by through desc limit 1",
         )
@@ -643,7 +675,7 @@ impl Db {
         .transpose()?;
         let unverified_checkpoints = sqlx::query(
             "select revision, through, sha256, verified_at, session_id, session_data, \
-                    major_reason, major_person \
+                    major_reason, major_person, writer_participant, writer_client \
              from live_checkpoints \
              where document_id = $1 and verified_at is null \
                and (through > $2 or ($2 = 0 and through = 0)) \

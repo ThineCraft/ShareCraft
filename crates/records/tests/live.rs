@@ -12,8 +12,9 @@ use collab_core::ids::{ClientId, DocId, Seq, UserId};
 use common::{Gate, tree, user, wait_blocked};
 use records::test_support::TestDb;
 use records::{
-    GoneReason, LiveCheckpointRow, LiveEntryRow, LiveLocal, LiveReturnTombstoneRow,
-    LiveSessionDataRow, NewLiveCancel, NewLiveChange, NewLiveCheckpoint, RevisionRecord,
+    GoneReason, LiveCheckpointRow, LiveCheckpointWriter, LiveEntryRow, LiveLocal,
+    LiveReturnTombstoneRow, LiveSessionDataRow, NewLiveCancel, NewLiveChange, NewLiveCheckpoint,
+    RevisionRecord,
 };
 use serde_json::json;
 use sqlx::Connection;
@@ -1168,6 +1169,10 @@ async fn live_checkpoint_records_revision_position_hash_and_session_data() {
     let revision = revision(&s, 'a', None).await;
     let sha256 = [7; 32];
     let session_data = br#"{"sheet":"identity"}"#;
+    let writer = LiveCheckpointWriter {
+        participant: 1,
+        client: one,
+    };
 
     s.test
         .db
@@ -1181,11 +1186,33 @@ async fn live_checkpoint_records_revision_position_hash_and_session_data() {
                 session_data,
                 major_reason: Some("returning_client_before"),
                 major_person: Some(s.ann),
+                writer: Some(writer),
                 created_at: at(2),
             },
         )
         .await
         .unwrap();
+    // The same position recorded again with another writer is a conflict, not a repeat.
+    assert!(
+        s.test
+            .db
+            .record_live_checkpoint(
+                s.doc,
+                &NewLiveCheckpoint {
+                    revision: &revision,
+                    through: Seq(1),
+                    sha256,
+                    session,
+                    session_data,
+                    major_reason: Some("returning_client_before"),
+                    major_person: Some(s.ann),
+                    writer: None,
+                    created_at: at(2),
+                },
+            )
+            .await
+            .is_err()
+    );
 
     let loaded = s.test.db.load_live(s.doc).await.unwrap();
     assert_eq!(loaded.verified_checkpoint, None);
@@ -1200,6 +1227,7 @@ async fn live_checkpoint_records_revision_position_hash_and_session_data() {
             session_data: session_data.to_vec(),
             major_reason: Some("returning_client_before".to_string()),
             major_person: Some(s.ann),
+            writer: Some(writer),
         }]
     );
     assert_eq!(loaded.unsaved_entries, 1);
@@ -1233,6 +1261,7 @@ async fn verification_advances_only_the_matching_checkpoint() {
                     session_data: &[byte],
                     major_reason: None,
                     major_person: None,
+                    writer: None,
                     created_at: at(through as i64 + 2),
                 },
             )
@@ -1289,6 +1318,7 @@ async fn checkpoint_position_cannot_exceed_head() {
                     session_data: b"session",
                     major_reason: None,
                     major_person: None,
+                    writer: None,
                     created_at: at(1),
                 },
             )
@@ -1333,6 +1363,7 @@ async fn older_checkpoint_cannot_replace_the_base() {
                     session_data: &[through as u8],
                     major_reason: None,
                     major_person: None,
+                    writer: None,
                     created_at: at(through as i64 + 2),
                 },
             )
@@ -1389,6 +1420,7 @@ async fn session_data_survives_until_covered_entries_expire() {
                 session_data: b"identity table",
                 major_reason: None,
                 major_person: None,
+                writer: None,
                 created_at: at(2),
             },
         )
@@ -1502,6 +1534,7 @@ async fn revision_index_rebuild_keeps_live_checkpoint_metadata() {
                     session_data: data,
                     major_reason: None,
                     major_person: None,
+                    writer: None,
                     created_at: at(through as i64 + 2),
                 },
             )
@@ -1565,6 +1598,7 @@ async fn load_keeps_retained_identity_data_for_older_sessions() {
                 session_data: b"first identities",
                 major_reason: None,
                 major_person: None,
+                writer: None,
                 created_at: at(2),
             },
         )
@@ -1603,6 +1637,7 @@ async fn load_keeps_retained_identity_data_for_older_sessions() {
                 session_data: b"second identities",
                 major_reason: None,
                 major_person: None,
+                writer: None,
                 created_at: at(6),
             },
         )
@@ -1653,6 +1688,7 @@ async fn zero_position_checkpoint_survives_sweep_and_loads_for_verification() {
                 session_data: b"empty workbook identities",
                 major_reason: None,
                 major_person: None,
+                writer: None,
                 created_at: at(1),
             },
         )
@@ -1687,6 +1723,7 @@ async fn unverified_zero_checkpoint_keeps_session_data_after_its_session_ends() 
                 session_data: b"empty workbook identities",
                 major_reason: None,
                 major_person: None,
+                writer: None,
                 created_at: at(1),
             },
         )
@@ -1772,6 +1809,7 @@ fn written_checkpoint<'a>(written: &'a str, session: Uuid) -> NewLiveCheckpoint<
         session_data: b"identities",
         major_reason: None,
         major_person: None,
+        writer: None,
         created_at: at(6),
     }
 }

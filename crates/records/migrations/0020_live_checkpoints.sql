@@ -15,7 +15,12 @@ create table live_checkpoints (
   session_data bytea not null,
   major_reason text,
   major_person uuid references users(id),
+  -- Who uploaded the bytes: their place and client in the live session, so a restarted room
+  -- never asks the writer to verify its own checkpoint. Both or neither.
+  writer_participant integer check (writer_participant >= 1),
+  writer_client uuid,
   created_at timestamptz not null,
+  check ((writer_participant is null) = (writer_client is null)),
   primary key (document_id, revision),
   unique (document_id, through)
 );

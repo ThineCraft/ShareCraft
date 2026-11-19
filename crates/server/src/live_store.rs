@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use collab_core::ids::{ClientId, DocId, Seq, UserId};
 use records::{
-    Db, DbError, GoneReason, LiveLoaded, LiveLocal, LiveReturnTombstoneRow, NewLiveCancel,
-    NewLiveChange, NewLiveCheckpoint, Origin,
+    Db, DbError, GoneReason, LiveCheckpointWriter, LiveLoaded, LiveLocal, LiveReturnTombstoneRow,
+    NewLiveCancel, NewLiveChange, NewLiveCheckpoint, Origin,
 };
 use revisions::{Author, BlobRef, Checkpoint, Outcome, RevisionId, RevisionInfo};
 use serde_json::{Map, Value};
@@ -29,6 +29,8 @@ pub(crate) struct LiveWrite<'a> {
     pub session: Uuid,
     pub session_data: &'a [u8],
     pub created_at: OffsetDateTime,
+    /// The place and client that uploaded it.
+    pub writer: Option<LiveCheckpointWriter>,
 }
 
 /// Why a participant-written checkpoint was not stored.
@@ -101,6 +103,14 @@ pub(crate) trait LiveStore: Clone + Send + Sync + 'static {
         write: &LiveWrite<'_>,
         agreed: &str,
     ) -> impl Future<Output = Result<ForensicWritten, LiveWriteError>> + Send;
+
+    /// Git's description of `revision` of `doc`, for a checkpoint whose write could not
+    /// describe it; `None` when Git does not know it.
+    fn describe_live_revision(
+        &self,
+        doc: DocId,
+        revision: &str,
+    ) -> impl Future<Output = Result<Option<RevisionInfo>, String>> + Send;
 
     #[allow(dead_code)] // Records an existing revision; participant writes use the write above.
     fn record_live_checkpoint(
@@ -255,6 +265,14 @@ impl LiveStore for Db {
         Err(LiveWriteError::Failed(
             "the database alone cannot commit checkpoint bytes".to_owned(),
         ))
+    }
+
+    async fn describe_live_revision(
+        &self,
+        _doc: DocId,
+        _revision: &str,
+    ) -> Result<Option<RevisionInfo>, String> {
+        Err("the database alone cannot read the library".to_owned())
     }
 
     async fn record_live_checkpoint(
@@ -497,6 +515,7 @@ impl LiveStore for LiveDb {
             session_data: write.session_data,
             major_reason: None,
             major_person: None,
+            writer: write.writer,
             created_at: write.created_at,
         };
         let unrecorded =
@@ -631,6 +650,20 @@ impl LiveStore for LiveDb {
             forensic: forensic.to_string(),
             current,
         })
+    }
+
+    async fn describe_live_revision(
+        &self,
+        doc: DocId,
+        revision: &str,
+    ) -> Result<Option<RevisionInfo>, String> {
+        let revision = RevisionId::from_str(revision).map_err(|error| error.to_string())?;
+        self.blocking(move |store| {
+            store
+                .describe(doc, &revision)
+                .map_err(|error| error.to_string())
+        })
+        .await
     }
 
     async fn record_live_checkpoint(
@@ -780,6 +813,11 @@ mod memory {
         docs: HashMap<DocId, MemoryDoc>,
         fail_next: bool,
         fail_after_next: bool,
+        /// Describes still to fail.
+        fail_describes: u32,
+        describe_calls: usize,
+        /// The next checkpoint write panics.
+        panic_next_write: bool,
         last_authors: Vec<Author>,
         /// While set, each checkpoint write waits for one permit before it commits.
         write_gate: Option<Arc<tokio::sync::Semaphore>>,
@@ -810,6 +848,8 @@ mod memory {
         revisions_written: u64,
         /// Every revision written, oldest first, with the SHA-256 of its content.
         revisions: Vec<(String, [u8; 32])>,
+        /// The fields of each checkpoint revision written.
+        revision_fields: HashMap<String, Map<String, Value>>,
     }
 
     impl Default for MemoryDoc {
@@ -832,6 +872,7 @@ mod memory {
                 current_revision: None,
                 revisions_written: 0,
                 revisions: Vec::new(),
+                revision_fields: HashMap::new(),
             }
         }
     }
@@ -850,6 +891,28 @@ mod memory {
         pub(crate) fn fail_after_next(&self) {
             if let Ok(mut state) = self.inner.lock() {
                 state.fail_after_next = true;
+            }
+        }
+
+        /// Makes the next `count` descriptions of a revision fail, as an unreachable Git would.
+        pub(crate) fn fail_describes(&self, count: u32) {
+            if let Ok(mut state) = self.inner.lock() {
+                state.fail_describes = count;
+            }
+        }
+
+        /// How many times a revision was described.
+        pub(crate) fn describe_calls(&self) -> usize {
+            self.inner
+                .lock()
+                .map(|state| state.describe_calls)
+                .unwrap_or_default()
+        }
+
+        /// Makes the next checkpoint write panic.
+        pub(crate) fn panic_next_write(&self) {
+            if let Ok(mut state) = self.inner.lock() {
+                state.panic_next_write = true;
             }
         }
 
@@ -948,6 +1011,12 @@ mod memory {
             write: &LiveWrite<'_>,
         ) -> Result<String, LiveWriteError> {
             self.wait_for_gate().await;
+            let panic_now = self
+                .inner
+                .lock()
+                .map(|mut state| std::mem::take(&mut state.panic_next_write))
+                .unwrap_or_default();
+            assert!(!panic_now, "injected checkpoint write panic");
             let revision = {
                 let mut state = self
                     .write()
@@ -963,6 +1032,9 @@ mod memory {
                 let revision = format!("{:040x}", memory.revisions_written);
                 memory.current_revision = Some(revision.clone());
                 memory.revisions.push((revision.clone(), write.blob.sha256));
+                memory
+                    .revision_fields
+                    .insert(revision.clone(), live_fields(&Map::new(), write.at));
                 revision
             };
             self.record_live_checkpoint(
@@ -975,6 +1047,7 @@ mod memory {
                     session_data: write.session_data,
                     major_reason: None,
                     major_person: None,
+                    writer: write.writer,
                     created_at: write.created_at,
                 },
             )
@@ -1121,6 +1194,7 @@ mod memory {
                 session_data: checkpoint.session_data.to_vec(),
                 major_reason: checkpoint.major_reason.map(str::to_owned),
                 major_person: checkpoint.major_person,
+                writer: checkpoint.writer,
             };
             if let Some(existing) = memory.checkpoints.iter().find(|existing| {
                 existing.row.revision == row.revision || existing.row.through == row.through
@@ -1137,6 +1211,42 @@ mod memory {
                 });
             }
             Self::finish_write(state)
+        }
+
+        async fn describe_live_revision(
+            &self,
+            doc: DocId,
+            revision: &str,
+        ) -> Result<Option<RevisionInfo>, String> {
+            let mut state = self.inner.lock().map_err(|_| "lock poisoned".to_owned())?;
+            state.describe_calls = state.describe_calls.saturating_add(1);
+            if state.fail_describes > 0 {
+                state.fail_describes -= 1;
+                return Err("injected describe failure".to_owned());
+            }
+            let Some(memory) = state.docs.get(&doc) else {
+                return Ok(None);
+            };
+            let Some((_, sha256)) = memory.revisions.iter().find(|(id, _)| id == revision) else {
+                return Ok(None);
+            };
+            Ok(Some(RevisionInfo {
+                revision: RevisionId::from_str(revision).map_err(|error| error.to_string())?,
+                doc,
+                committed_at: 0,
+                authors: Vec::new(),
+                file_name: "book.gridcraft".to_owned(),
+                fields: memory
+                    .revision_fields
+                    .get(revision)
+                    .cloned()
+                    .unwrap_or_default(),
+                blob: Some(BlobRef {
+                    sha256: *sha256,
+                    size: 3,
+                }),
+                size: 3,
+            }))
         }
 
         async fn reconcile_live_checkpoint(
@@ -1508,6 +1618,7 @@ mod tests {
             session_data,
             major_reason: None,
             major_person: None,
+            writer: None,
             created_at: OffsetDateTime::UNIX_EPOCH,
         }
     }
@@ -1731,6 +1842,225 @@ mod tests {
                 .collect::<Vec<_>>(),
             [revision]
         );
+    }
+
+    /// A library that commits a set number of writes, then fails every later one.
+    struct FailsAfter {
+        inner: revisions::RevisionStore,
+        writes_left: std::sync::atomic::AtomicUsize,
+    }
+
+    impl crate::checkpoint::Checkpointer for FailsAfter {
+        fn write(
+            &self,
+            c: &revisions::Checkpoint<'_>,
+        ) -> Result<revisions::Outcome, revisions::CheckpointError> {
+            use std::sync::atomic::Ordering;
+            if self
+                .writes_left
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    left.checked_sub(1)
+                })
+                .is_err()
+            {
+                return Err(revisions::CheckpointError::Git(revisions::GitError::new(
+                    "injected restore failure",
+                )));
+            }
+            crate::checkpoint::Checkpointer::write(&self.inner, c)
+        }
+
+        fn load(
+            &self,
+            doc: DocId,
+        ) -> Result<Option<revisions::Stored>, revisions::CheckpointError> {
+            crate::checkpoint::Checkpointer::load(&self.inner, doc)
+        }
+
+        fn load_at(
+            &self,
+            doc: DocId,
+            revision: &revisions::RevisionId,
+        ) -> Result<Option<revisions::Stored>, revisions::CheckpointError> {
+            crate::checkpoint::Checkpointer::load_at(&self.inner, doc, revision)
+        }
+
+        fn describe(
+            &self,
+            doc: DocId,
+            revision: &revisions::RevisionId,
+        ) -> Result<Option<RevisionInfo>, revisions::CheckpointError> {
+            crate::checkpoint::Checkpointer::describe(&self.inner, doc, revision)
+        }
+
+        fn history(&self, doc: DocId) -> Result<Vec<RevisionInfo>, revisions::CheckpointError> {
+            crate::checkpoint::Checkpointer::history(&self.inner, doc)
+        }
+
+        fn documents(&self) -> Result<Vec<DocId>, revisions::GitError> {
+            crate::checkpoint::Checkpointer::documents(&self.inner)
+        }
+    }
+
+    #[tokio::test]
+    async fn database_forensic_write_keeps_both_commits_and_restores_the_agreed_file() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use records::test_support::TestDb;
+        use records::{Editor, NewUser};
+        use revisions::{Author, RevisionStore};
+
+        use super::{LiveDb, LiveWrite};
+        use crate::checkpoint::Checkpointer;
+
+        let test = TestDb::create().await;
+        let db = test.db.clone();
+        let ann = db
+            .create_user(
+                None,
+                NewUser {
+                    email: "ann@test.invalid",
+                    name: "Ann",
+                    password: "a long enough password",
+                    is_admin: false,
+                },
+            )
+            .await
+            .unwrap()
+            .id;
+        let doc = DocId(Uuid::new_v4());
+        db.create_document(ann, doc, "book.xlsx", Editor::GridCraft)
+            .await
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let library = Arc::new(FailsAfter {
+            inner: RevisionStore::open(&crate::library_path(dir.path())).unwrap(),
+            // The agreed checkpoint, then a forensic revision and its restore.
+            writes_left: AtomicUsize::new(3),
+        });
+        let blobs = crate::blobs::test_blobs(dir.path());
+        let live = LiveDb {
+            db: db.clone(),
+            store: library.clone(),
+            blobs: blobs.clone(),
+        };
+        let session = Uuid::new_v4();
+        db.start_live_session(doc, session, "gridcraft/1", OffsetDateTime::UNIX_EPOCH)
+            .await
+            .unwrap();
+        let authors = [Author {
+            id: ann.0.to_string(),
+            name: "Ann".to_owned(),
+        }];
+        let blob = |bytes: &'static [u8]| blobs.store().write_from(bytes, u64::MAX).unwrap();
+        let agreed_blob = blob(b"agreed workbook");
+        let agreed = live
+            .write_live_checkpoint(
+                doc,
+                &LiveWrite {
+                    base: None,
+                    blob: agreed_blob,
+                    authors: &authors,
+                    at: Seq(0),
+                    session,
+                    session_data: b"identities",
+                    created_at: OffsetDateTime::UNIX_EPOCH,
+                    writer: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let forensic_blob = blob(b"disagreeing workbook");
+        let written = live
+            .write_live_forensic(
+                doc,
+                &LiveWrite {
+                    base: Some(&agreed),
+                    blob: forensic_blob,
+                    authors: &authors,
+                    at: Seq(0),
+                    session,
+                    session_data: b"",
+                    created_at: OffsetDateTime::UNIX_EPOCH,
+                    writer: None,
+                },
+                &agreed,
+            )
+            .await
+            .unwrap();
+        assert_ne!(written.forensic, written.current);
+        let describe = |revision: &str| {
+            library
+                .describe(doc, &revision.parse().unwrap())
+                .unwrap()
+                .unwrap()
+        };
+        let forensic = describe(&written.forensic);
+        assert_eq!(forensic.blob.unwrap().sha256, forensic_blob.sha256);
+        assert_eq!(forensic.fields.get("forensic_of"), Some(&json!(agreed)));
+        let restored = describe(&written.current);
+        assert_eq!(restored.blob.unwrap().sha256, agreed_blob.sha256);
+        assert_eq!(restored.fields.get("restores"), Some(&json!(agreed)));
+        assert_eq!(
+            library.load(doc).unwrap().unwrap().revision.to_string(),
+            written.current,
+            "the agreed bytes are the current file again"
+        );
+        let index = db.revisions(doc).await.unwrap();
+        assert_eq!(
+            index
+                .iter()
+                .map(|row| (row.revision.clone(), row.parent.clone()))
+                .collect::<Vec<_>>(),
+            [
+                (agreed.clone(), None),
+                (written.forensic.clone(), Some(agreed.clone())),
+                (written.current.clone(), Some(written.forensic.clone())),
+            ]
+        );
+        let loaded = LiveStore::load_live(&db, doc).await.unwrap();
+        assert_eq!(
+            loaded
+                .unverified_checkpoints
+                .iter()
+                .map(|checkpoint| checkpoint.revision.clone())
+                .collect::<Vec<_>>(),
+            std::slice::from_ref(&agreed),
+            "forensic bytes never become a checkpoint"
+        );
+
+        // A second forensic upload whose restore cannot be written: the forensic revision
+        // stays current and recorded.
+        library.writes_left.store(1, Ordering::SeqCst);
+        let base = written.current.clone();
+        let again = live
+            .write_live_forensic(
+                doc,
+                &LiveWrite {
+                    base: Some(&base),
+                    blob: blob(b"another disagreeing workbook"),
+                    authors: &authors,
+                    at: Seq(0),
+                    session,
+                    session_data: b"",
+                    created_at: OffsetDateTime::UNIX_EPOCH,
+                    writer: None,
+                },
+                &agreed,
+            )
+            .await
+            .unwrap();
+        assert_eq!(again.current, again.forensic);
+        assert_eq!(
+            library.load(doc).unwrap().unwrap().revision.to_string(),
+            again.forensic
+        );
+        let index = db.revisions(doc).await.unwrap();
+        assert_eq!(index.len(), 4);
+        assert_eq!(index[3].revision, again.forensic);
+        assert_eq!(index[3].parent.as_deref(), Some(base.as_str()));
     }
 
     #[tokio::test]
