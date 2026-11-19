@@ -299,7 +299,7 @@ async fn blocking<T: Send + 'static>(
 }
 
 /// The database's form of a revision Git describes.
-fn to_record(info: RevisionInfo) -> Result<RevisionRecord, String> {
+pub(crate) fn to_record(info: RevisionInfo) -> Result<RevisionRecord, String> {
     let committed_at = OffsetDateTime::from_unix_timestamp(info.committed_at)
         .map_err(|e| format!("revision {} has an impossible time: {e}", info.revision))?;
     Ok(RevisionRecord {

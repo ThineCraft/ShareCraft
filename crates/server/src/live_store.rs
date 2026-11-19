@@ -22,9 +22,13 @@ pub(crate) trait LiveStore: Send + Sync + 'static {
         checkpoint: &NewLiveCheckpoint<'_>,
     ) -> impl Future<Output = Result<(), DbError>> + Send;
 
+    /// Records the checkpoint metadata of a revision Git committed (`described`, written on top
+    /// of `parent`) after an unknown database outcome. The revision index row is recorded
+    /// first when it is missing, in the same transaction, so reconciliation can always finish.
     fn reconcile_live_checkpoint(
         &self,
         doc: DocId,
+        parent: Option<&str>,
         checkpoint: &NewLiveCheckpoint<'_>,
         described: &RevisionInfo,
         expected_fields: &Map<String, Value>,
@@ -148,12 +152,19 @@ impl LiveStore for Db {
     async fn reconcile_live_checkpoint(
         &self,
         doc: DocId,
+        parent: Option<&str>,
         checkpoint: &NewLiveCheckpoint<'_>,
         described: &RevisionInfo,
         expected_fields: &Map<String, Value>,
     ) -> Result<(), DbError> {
         validate_checkpoint_description(doc, checkpoint, described, expected_fields)?;
-        Db::record_live_checkpoint(self, doc, checkpoint).await
+        let record = crate::projection::to_record(described.clone()).map_err(DbError::new)?;
+        Db::record_live_checkpoint_revision(self, parent, &record, checkpoint).await?;
+        if let Some(blob) = described.blob {
+            // The content-store reference the projection would have recorded with the row.
+            self.record_blob_ref(doc, blob, checkpoint.revision).await?;
+        }
+        Ok(())
     }
 
     async fn verify_live_checkpoint(
@@ -172,11 +183,7 @@ impl LiveStore for Db {
         session: Uuid,
         participant: u32,
     ) -> Result<Option<LiveReturnTombstoneRow>, DbError> {
-        Ok(Db::load_live(self, doc)
-            .await?
-            .return_tombstones
-            .into_iter()
-            .find(|row| row.session == session && row.participant == participant))
+        Db::live_return_tombstone(self, doc, session, participant).await
     }
 
     async fn start_live_session(
@@ -440,7 +447,6 @@ mod memory {
                     .map(|(client, (user, next))| (*client, *user, *next))
                     .collect(),
                 retained_session_data,
-                return_tombstones: memory.return_tombstones.clone(),
             })
         }
 
@@ -489,6 +495,7 @@ mod memory {
         async fn reconcile_live_checkpoint(
             &self,
             doc: DocId,
+            _parent: Option<&str>,
             checkpoint: &NewLiveCheckpoint<'_>,
             described: &RevisionInfo,
             expected_fields: &Map<String, Value>,
@@ -821,7 +828,12 @@ mod memory {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+#[allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::unwrap_used
+)]
 mod tests {
     use collab_core::ids::{ClientId, DocId, Seq, UserId};
     use records::{NewLiveCancel, NewLiveChange, NewLiveCheckpoint};
@@ -950,7 +962,7 @@ mod tests {
         );
 
         store
-            .reconcile_live_checkpoint(doc, &checkpoint, &described, &fields)
+            .reconcile_live_checkpoint(doc, None, &checkpoint, &described, &fields)
             .await
             .expect("reconcile repeats the exact durable operation");
         let restarted = store.load_live(doc).await.unwrap();
@@ -990,6 +1002,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn database_reconcile_records_a_missing_revision_row_before_the_checkpoint() {
+        use crate::checkpoint::Checkpointer;
+        use records::test_support::TestDb;
+        use records::{Editor, NewUser};
+        use revisions::{Author, Checkpoint, Outcome, RevisionStore};
+
+        let test = TestDb::create().await;
+        let db = test.db.clone();
+        let ann = db
+            .create_user(
+                None,
+                NewUser {
+                    email: "ann@test.invalid",
+                    name: "Ann",
+                    password: "a long enough password",
+                    is_admin: false,
+                },
+            )
+            .await
+            .unwrap()
+            .id;
+        let doc = DocId(Uuid::new_v4());
+        db.create_document(ann, doc, "book.xlsx", Editor::GridCraft)
+            .await
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let library = RevisionStore::open(&crate::library_path(dir.path())).unwrap();
+        let blob = crate::blobs::test_blobs(dir.path())
+            .store()
+            .write_from(&b"workbook bytes at zero"[..], u64::MAX)
+            .unwrap();
+        let fields = checkpoint_fields(Seq(0));
+        let authors = [Author {
+            id: ann.0.to_string(),
+            name: "Ann".to_owned(),
+        }];
+        let Outcome::Written(written) = library
+            .write(&Checkpoint {
+                doc,
+                file_name: "book.xlsx",
+                blob,
+                base: None,
+                authors: &authors,
+                fields: &fields,
+            })
+            .unwrap()
+        else {
+            panic!("the checkpoint must write a revision");
+        };
+        // Git has the revision; the database outcome was lost, so the index has no row.
+        assert!(db.revisions(doc).await.unwrap().is_empty());
+        let session = Uuid::new_v4();
+        db.start_live_session(doc, session, "gridcraft/1", OffsetDateTime::UNIX_EPOCH)
+            .await
+            .unwrap();
+        let revision = written.to_string();
+        let checkpoint = NewLiveCheckpoint {
+            sha256: blob.sha256,
+            ..checkpoint(&revision, session, b"identities")
+        };
+        let described = library.describe(doc, &written).unwrap().unwrap();
+        assert!(db.record_live_checkpoint(doc, &checkpoint).await.is_err());
+
+        LiveStore::reconcile_live_checkpoint(&db, doc, None, &checkpoint, &described, &fields)
+            .await
+            .expect("reconcile records the revision row and the checkpoint together");
+        LiveStore::reconcile_live_checkpoint(&db, doc, None, &checkpoint, &described, &fields)
+            .await
+            .expect("reconcile is repeatable");
+
+        let loaded = LiveStore::load_live(&db, doc).await.unwrap();
+        assert_eq!(loaded.unverified_checkpoints.len(), 1);
+        assert_eq!(loaded.unverified_checkpoints[0].revision, revision);
+        assert_eq!(
+            db.revisions(doc)
+                .await
+                .unwrap()
+                .iter()
+                .map(|row| row.revision.clone())
+                .collect::<Vec<_>>(),
+            [revision]
+        );
+    }
+
+    #[tokio::test]
     async fn end_session_makes_return_tombstone_lookup_available() {
         let (store, doc, session) = started_store().await;
         let client = ClientId(id(300));
@@ -1011,10 +1108,6 @@ mod tests {
         assert_eq!(tombstone.user, user);
         assert_eq!(tombstone.ended_at, ended_at);
         assert_eq!(tombstone.final_seq, Seq(0));
-        assert_eq!(
-            store.load_live(doc).await.unwrap().return_tombstones,
-            [tombstone]
-        );
     }
 
     #[tokio::test]

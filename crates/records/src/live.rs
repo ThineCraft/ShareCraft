@@ -10,7 +10,8 @@ use sqlx::{PgConnection, Row};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::{Db, DbError};
+use crate::revisions::{insert as insert_revision, lock_document, recorded_head, set_current};
+use crate::{Db, DbError, RevisionRecord};
 
 pub(crate) async fn delete_live_logs(
     conn: &mut PgConnection,
@@ -173,8 +174,6 @@ pub struct LiveLoaded {
     pub clients: Vec<(ClientId, UserId, u64)>,
     /// Retained identity data for current and ended sessions, oldest first.
     pub retained_session_data: Vec<LiveSessionDataRow>,
-    /// Ended places retained after their detailed session rows expire.
-    pub return_tombstones: Vec<LiveReturnTombstoneRow>,
 }
 
 /// A live session.
@@ -522,6 +521,96 @@ fn session_data_of(row: &PgRow) -> Result<LiveSessionDataRow, DbError> {
     })
 }
 
+/// Associates an existing revision with one exact position and its opaque session data, under
+/// the live-log lock. Repeating the same record is idempotent; a conflicting revision or
+/// position fails.
+async fn insert_live_checkpoint(
+    tx: &mut PgConnection,
+    doc: DocId,
+    checkpoint: &NewLiveCheckpoint<'_>,
+) -> Result<(), DbError> {
+    let through = signed(checkpoint.through.0)?;
+    let head = lock_log(&mut *tx, doc).await?;
+    if through > head {
+        return Err(DbError::new(format!(
+            "checkpoint position {through} exceeds the head {head} of {}",
+            doc.0
+        )));
+    }
+    let session_exists: bool = sqlx::query_scalar(
+        "select exists(select 1 from live_sessions where id = $1 and document_id = $2)",
+    )
+    .bind(checkpoint.session)
+    .bind(doc.0)
+    .fetch_one(&mut *tx)
+    .await?;
+    if !session_exists {
+        return Err(DbError::new(format!(
+            "{} is not a live session of {}",
+            checkpoint.session, doc.0
+        )));
+    }
+    let revision_exists: bool = sqlx::query_scalar(
+        "select exists(select 1 from revisions where revision = $1 and document_id = $2)",
+    )
+    .bind(checkpoint.revision)
+    .bind(doc.0)
+    .fetch_one(&mut *tx)
+    .await?;
+    if !revision_exists {
+        return Err(DbError::new(format!(
+            "revision {:?} does not belong to {}",
+            checkpoint.revision, doc.0
+        )));
+    }
+    let inserted = sqlx::query(
+        "insert into live_checkpoints \
+                 (document_id, revision, through, sha256, session_id, session_data, \
+                  major_reason, major_person, created_at) \
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+             on conflict do nothing",
+    )
+    .bind(doc.0)
+    .bind(checkpoint.revision)
+    .bind(through)
+    .bind(checkpoint.sha256.as_slice())
+    .bind(checkpoint.session)
+    .bind(checkpoint.session_data)
+    .bind(checkpoint.major_reason)
+    .bind(checkpoint.major_person.map(|person| person.0))
+    .bind(checkpoint.created_at)
+    .execute(&mut *tx)
+    .await?;
+    if inserted.rows_affected() == 0 {
+        let same: bool = sqlx::query_scalar(
+            "select exists( \
+                    select 1 from live_checkpoints \
+                    where document_id = $1 and revision = $2 and through = $3 \
+                      and sha256 = $4 and session_id = $5 and session_data = $6 \
+                      and major_reason is not distinct from $7 \
+                      and major_person is not distinct from $8 and created_at = $9)",
+        )
+        .bind(doc.0)
+        .bind(checkpoint.revision)
+        .bind(through)
+        .bind(checkpoint.sha256.as_slice())
+        .bind(checkpoint.session)
+        .bind(checkpoint.session_data)
+        .bind(checkpoint.major_reason)
+        .bind(checkpoint.major_person.map(|person| person.0))
+        .bind(checkpoint.created_at)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !same {
+            return Err(DbError::new(format!(
+                "checkpoint {:?} or position {through} conflicts with a stored checkpoint",
+                checkpoint.revision
+            )));
+        }
+    }
+    Ok(())
+}
+
 impl Db {
     /// `doc`'s live log: its head, its kept entries after the verified position, its open
     /// session with every place in it, and its clients.
@@ -680,17 +769,6 @@ impl Db {
         .iter()
         .map(session_data_of)
         .collect::<Result<Vec<_>, _>>()?;
-        let return_tombstones = sqlx::query(
-            "select session_id, participant, client_id, user_id, ended_at, final_seq \
-             from live_return_tombstones where document_id = $1 \
-             order by ended_at, session_id, participant",
-        )
-        .bind(doc.0)
-        .fetch_all(&mut *tx)
-        .await?
-        .iter()
-        .map(return_tombstone_of)
-        .collect::<Result<Vec<_>, _>>()?;
         tx.commit().await?;
 
         Ok(LiveLoaded {
@@ -707,7 +785,6 @@ impl Db {
             participants,
             clients,
             retained_session_data,
-            return_tombstones,
         })
     }
 
@@ -1044,88 +1121,82 @@ impl Db {
         doc: DocId,
         checkpoint: &NewLiveCheckpoint<'_>,
     ) -> Result<(), DbError> {
-        let through = signed(checkpoint.through.0)?;
         let mut tx = self.pool().begin().await?;
-        let head = lock_log(&mut tx, doc).await?;
-        if through > head {
-            return Err(DbError::new(format!(
-                "checkpoint position {through} exceeds the head {head} of {}",
-                doc.0
-            )));
-        }
-        let session_exists: bool = sqlx::query_scalar(
-            "select exists(select 1 from live_sessions where id = $1 and document_id = $2)",
-        )
-        .bind(checkpoint.session)
-        .bind(doc.0)
-        .fetch_one(&mut *tx)
-        .await?;
-        if !session_exists {
-            return Err(DbError::new(format!(
-                "{} is not a live session of {}",
-                checkpoint.session, doc.0
-            )));
-        }
-        let revision_exists: bool = sqlx::query_scalar(
-            "select exists(select 1 from revisions where revision = $1 and document_id = $2)",
-        )
-        .bind(checkpoint.revision)
-        .bind(doc.0)
-        .fetch_one(&mut *tx)
-        .await?;
-        if !revision_exists {
-            return Err(DbError::new(format!(
-                "revision {:?} does not belong to {}",
-                checkpoint.revision, doc.0
-            )));
-        }
-        let inserted = sqlx::query(
-            "insert into live_checkpoints \
-                 (document_id, revision, through, sha256, session_id, session_data, \
-                  major_reason, major_person, created_at) \
-             values ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
-             on conflict do nothing",
-        )
-        .bind(doc.0)
-        .bind(checkpoint.revision)
-        .bind(through)
-        .bind(checkpoint.sha256.as_slice())
-        .bind(checkpoint.session)
-        .bind(checkpoint.session_data)
-        .bind(checkpoint.major_reason)
-        .bind(checkpoint.major_person.map(|person| person.0))
-        .bind(checkpoint.created_at)
-        .execute(&mut *tx)
-        .await?;
-        if inserted.rows_affected() == 0 {
-            let same: bool = sqlx::query_scalar(
-                "select exists( \
-                    select 1 from live_checkpoints \
-                    where document_id = $1 and revision = $2 and through = $3 \
-                      and sha256 = $4 and session_id = $5 and session_data = $6 \
-                      and major_reason is not distinct from $7 \
-                      and major_person is not distinct from $8 and created_at = $9)",
-            )
-            .bind(doc.0)
-            .bind(checkpoint.revision)
-            .bind(through)
-            .bind(checkpoint.sha256.as_slice())
-            .bind(checkpoint.session)
-            .bind(checkpoint.session_data)
-            .bind(checkpoint.major_reason)
-            .bind(checkpoint.major_person.map(|person| person.0))
-            .bind(checkpoint.created_at)
-            .fetch_one(&mut *tx)
-            .await?;
-            if !same {
-                return Err(DbError::new(format!(
-                    "checkpoint {:?} or position {through} conflicts with a stored checkpoint",
-                    checkpoint.revision
-                )));
-            }
-        }
+        insert_live_checkpoint(&mut tx, doc, checkpoint).await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Records `revision`, as Git describes it, in the revision index after `parent` when it is
+    /// not recorded yet, then associates it with `checkpoint`, in one transaction: a revision
+    /// that Git committed is never left without its checkpoint record because the
+    /// asynchronous revision projection has not caught up (or lost its row). Fails, storing
+    /// nothing, when the revision is missing and `parent` is not the recorded head; a rebuild
+    /// of the index from Git must run first.
+    pub async fn record_live_checkpoint_revision(
+        &self,
+        parent: Option<&str>,
+        revision: &RevisionRecord,
+        checkpoint: &NewLiveCheckpoint<'_>,
+    ) -> Result<(), DbError> {
+        let doc = revision.doc;
+        if revision.revision != checkpoint.revision {
+            return Err(DbError::new(format!(
+                "checkpoint names {:?} but the revision is {:?}",
+                checkpoint.revision, revision.revision
+            )));
+        }
+        let mut tx = self.pool().begin().await?;
+        // The document lock first, then the live-log lock.
+        lock_document(&mut tx, doc, &revision.name).await?;
+        let recorded: bool = sqlx::query_scalar(
+            "select exists(select 1 from revisions where revision = $1 and document_id = $2)",
+        )
+        .bind(&revision.revision)
+        .bind(doc.0)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !recorded {
+            let (head, position) = recorded_head(&mut tx, doc).await?;
+            if head.as_deref() != parent {
+                return Err(DbError::new(format!(
+                    "revision {:?} of {} is not recorded and its parent is not the recorded head",
+                    revision.revision, doc.0
+                )));
+            }
+            let position = position
+                .checked_add(1)
+                .ok_or_else(|| DbError::new("too many revisions"))?;
+            insert_revision(&mut tx, revision, position, parent).await?;
+            set_current(&mut tx, revision).await?;
+        }
+        insert_live_checkpoint(&mut tx, doc, checkpoint).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// The tombstone of place `participant` of the ended session `session` of `doc`, by its
+    /// key: one indexed row, however many sessions the document has had.
+    pub async fn live_return_tombstone(
+        &self,
+        doc: DocId,
+        session: Uuid,
+        participant: u32,
+    ) -> Result<Option<LiveReturnTombstoneRow>, DbError> {
+        let mut conn = self.pool().acquire().await?;
+        sqlx::query(
+            "select session_id, participant, client_id, user_id, ended_at, final_seq \
+             from live_return_tombstones \
+             where session_id = $1 and participant = $2 and document_id = $3",
+        )
+        .bind(session)
+        .bind(number(participant)?)
+        .bind(doc.0)
+        .fetch_optional(&mut *conn)
+        .await?
+        .as_ref()
+        .map(return_tombstone_of)
+        .transpose()
     }
 
     /// Marks exactly the named checkpoint verified and atomically advances the catch-up base.
@@ -1207,9 +1278,12 @@ impl Db {
         .execute(&mut *tx)
         .await?
         .rows_affected();
+        // Only a verified checkpoint gives up its identity data: an unverified one (at
+        // position 0 included) may still be verified and become the catch-up base.
         sqlx::query(
             "update live_checkpoints c set session_data = '' \
              where octet_length(c.session_data) > 0 \
+               and c.verified_at is not null \
                and c.created_at < $1 \
                and not exists (select 1 from live_entries e where e.session_id = c.session_id) \
                and not exists (select 1 from live_sessions s \

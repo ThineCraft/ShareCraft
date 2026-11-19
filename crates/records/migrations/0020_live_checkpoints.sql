@@ -38,11 +38,16 @@ create index live_return_tombstones_by_document_client
   on live_return_tombstones (document_id, client_id);
 
 -- Preserve already-ended sessions when this migration is applied to an active installation.
+-- Each session's last position is aggregated in one pass over the entries (live_entries has
+-- no session index), never once per ended place.
+with last_entries as (
+  select session_id, max(seq) as last_seq from live_entries group by session_id
+)
 insert into live_return_tombstones
     (session_id, participant, document_id, client_id, user_id, ended_at, final_seq)
 select s.id, p.number, s.document_id, p.client_id, p.user_id, s.ended_at,
-       coalesce((select max(e.seq) from live_entries e where e.session_id = s.id),
-                s.first_seq - 1)
+       coalesce(l.last_seq, s.first_seq - 1)
 from live_sessions s
 join live_participants p on p.session_id = s.id
+left join last_entries l on l.session_id = s.id
 where s.ended_at is not null;

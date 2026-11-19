@@ -1459,15 +1459,19 @@ async fn return_tombstone_survives_detail_retention() {
     let loaded = s.test.db.load_live(s.doc).await.unwrap();
     assert!(loaded.participants.is_empty());
     assert_eq!(
-        loaded.return_tombstones,
-        [LiveReturnTombstoneRow {
+        s.test
+            .db
+            .live_return_tombstone(s.doc, session, participant)
+            .await
+            .unwrap(),
+        Some(LiveReturnTombstoneRow {
             session,
             participant,
             client: one,
             user: s.ann,
             ended_at: at(2),
             final_seq: Seq(1),
-        }]
+        })
     );
 }
 
@@ -1664,4 +1668,275 @@ async fn zero_position_checkpoint_survives_sweep_and_loads_for_verification() {
         loaded.unverified_checkpoints[0].session_data,
         b"empty workbook identities"
     );
+}
+
+#[tokio::test]
+async fn unverified_zero_checkpoint_keeps_session_data_after_its_session_ends() {
+    let s = setup().await;
+    let session = session(&s, 0).await;
+    let revision = revision(&s, 'a', None).await;
+    s.test
+        .db
+        .record_live_checkpoint(
+            s.doc,
+            &NewLiveCheckpoint {
+                revision: &revision,
+                through: Seq(0),
+                sha256: [9; 32],
+                session,
+                session_data: b"empty workbook identities",
+                major_reason: None,
+                major_person: None,
+                created_at: at(1),
+            },
+        )
+        .await
+        .unwrap();
+    s.test.db.end_live_session(session, at(2)).await.unwrap();
+
+    s.test
+        .db
+        .sweep_live(at(2) + Duration::days(31))
+        .await
+        .unwrap();
+
+    let loaded = s.test.db.load_live(s.doc).await.unwrap();
+    assert_eq!(loaded.unverified_checkpoints.len(), 1);
+    assert_eq!(
+        loaded.unverified_checkpoints[0].session_data, b"empty workbook identities",
+        "an unverified checkpoint can still be verified, so it keeps its identity data"
+    );
+}
+
+#[tokio::test]
+async fn return_tombstone_lookup_is_by_place_within_its_document() {
+    let s = setup().await;
+    let other = tree(&s.test, s.ann).await.doc;
+    let session = session(&s, 0).await;
+    let one = client();
+    let participant = s
+        .test
+        .db
+        .add_live_participant(s.doc, session, one, s.ann, at(0))
+        .await
+        .unwrap();
+    s.test.db.end_live_session(session, at(1)).await.unwrap();
+
+    let found = s
+        .test
+        .db
+        .live_return_tombstone(s.doc, session, participant)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(found.client, one);
+    assert_eq!(found.final_seq, Seq(0));
+    assert_eq!(
+        s.test
+            .db
+            .live_return_tombstone(other, session, participant)
+            .await
+            .unwrap(),
+        None,
+        "a place of another document is not this document's tombstone"
+    );
+    assert_eq!(
+        s.test
+            .db
+            .live_return_tombstone(s.doc, session, participant + 1)
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+/// The Git description of `revision` as the revision index stores it.
+fn revision_record(s: &Setup, revision: &str) -> RevisionRecord {
+    RevisionRecord {
+        doc: s.doc,
+        revision: revision.to_owned(),
+        committed_at: at(5),
+        authors: vec![(s.ann.0.to_string(), "Ann".to_string())],
+        name: "live.grid".to_string(),
+        fields: json!({ "verified": false, "live_through": 0 }),
+        size: 10,
+    }
+}
+
+fn written_checkpoint<'a>(written: &'a str, session: Uuid) -> NewLiveCheckpoint<'a> {
+    NewLiveCheckpoint {
+        revision: written,
+        through: Seq(0),
+        sha256: [4; 32],
+        session,
+        session_data: b"identities",
+        major_reason: None,
+        major_person: None,
+        created_at: at(6),
+    }
+}
+
+#[tokio::test]
+async fn checkpoint_records_a_missing_revision_row_with_its_metadata() {
+    let s = setup().await;
+    let session = session(&s, 0).await;
+    let base = revision(&s, 'a', None).await;
+    let written = "b".repeat(40);
+    let checkpoint = written_checkpoint(&written, session);
+    assert!(
+        s.test
+            .db
+            .record_live_checkpoint(s.doc, &checkpoint)
+            .await
+            .is_err(),
+        "the plain record still needs the revision row"
+    );
+
+    s.test
+        .db
+        .record_live_checkpoint_revision(Some(&base), &revision_record(&s, &written), &checkpoint)
+        .await
+        .unwrap();
+    // Repeating it (another reconcile) changes nothing.
+    s.test
+        .db
+        .record_live_checkpoint_revision(Some(&base), &revision_record(&s, &written), &checkpoint)
+        .await
+        .unwrap();
+
+    let rows = s.test.db.revisions(s.doc).await.unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.revision.as_str())
+            .collect::<Vec<_>>(),
+        [base.as_str(), written.as_str()]
+    );
+    assert_eq!(rows[1].parent.as_deref(), Some(base.as_str()));
+    let loaded = s.test.db.load_live(s.doc).await.unwrap();
+    assert_eq!(loaded.unverified_checkpoints.len(), 1);
+    assert_eq!(loaded.unverified_checkpoints[0].revision, written);
+    // The projection appending the same revision afterwards is not a conflict.
+    assert!(
+        s.test
+            .db
+            .append_revision(Some(&base), &revision_record(&s, &written))
+            .await
+            .unwrap()
+    );
+    assert_eq!(s.test.db.revisions(s.doc).await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn checkpoint_revision_after_another_head_stores_nothing() {
+    let s = setup().await;
+    let session = session(&s, 0).await;
+    let base = revision(&s, 'a', None).await;
+    let _outside = revision(&s, 'c', Some(&base)).await;
+    let written = "b".repeat(40);
+    let checkpoint = written_checkpoint(&written, session);
+
+    assert!(
+        s.test
+            .db
+            .record_live_checkpoint_revision(
+                Some(&base),
+                &revision_record(&s, &written),
+                &checkpoint
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(s.test.db.revisions(s.doc).await.unwrap().len(), 2);
+    assert!(
+        s.test
+            .db
+            .load_live(s.doc)
+            .await
+            .unwrap()
+            .unverified_checkpoints
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn migration_0020_backfills_tombstones_in_one_pass() {
+    // 0019 is the migration before 0020 on this branch.
+    let test = TestDb::create_at(Some(19)).await;
+    let ann = user(&test, "Ann", false).await.id;
+    let doc = tree(&test, ann).await.doc;
+    let mut expected = Vec::new();
+    let mut seq = 0;
+    for n in 0..24_u64 {
+        let session = Uuid::new_v4();
+        test.db
+            .start_live_session(doc, session, FORMAT, at(0))
+            .await
+            .unwrap();
+        let mut places = Vec::new();
+        for _ in 0..2 {
+            let one = client();
+            let number = test
+                .db
+                .add_live_participant(doc, session, one, ann, at(0))
+                .await
+                .unwrap();
+            places.push((number, one));
+        }
+        // Every third session stores nothing, so its final position is the head it began at.
+        let stored = if n % 3 == 0 { 0 } else { 3 };
+        for local in 1..=stored {
+            seq += 1;
+            test.db
+                .append_live_change(
+                    doc,
+                    &change(seq, session, places[0].1, ann, local, b"x", &[]),
+                )
+                .await
+                .unwrap();
+        }
+        let mut conn = sqlx::PgConnection::connect(&test.url()).await.unwrap();
+        sqlx::query("update live_sessions set ended_at = $2 where id = $1")
+            .bind(session)
+            .bind(at(1))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        for (number, one) in places {
+            expected.push((session, number, one, seq));
+        }
+    }
+
+    // Run 0020 inside one transaction first, to count how often it reads the entries.
+    let mut conn = sqlx::PgConnection::connect(&test.url()).await.unwrap();
+    let mut tx = conn.begin().await.unwrap();
+    sqlx::raw_sql(include_str!("../migrations/0020_live_checkpoints.sql"))
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let reads: i64 = sqlx::query_scalar(
+        "select (coalesce(seq_scan, 0) + coalesce(idx_scan, 0))::bigint \
+         from pg_stat_xact_user_tables \
+         where relname = 'live_entries' and schemaname = current_schema()",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    tx.rollback().await.unwrap();
+    assert!(
+        reads <= 2,
+        "the backfill read the entries {reads} times for {} ended places",
+        expected.len()
+    );
+
+    test.db.migrate().await.unwrap();
+    for (session, participant, one, final_seq) in expected {
+        let tombstone = test
+            .db
+            .live_return_tombstone(doc, session, participant)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(tombstone.client, one);
+        assert_eq!(tombstone.final_seq, Seq(final_seq), "session {session}");
+    }
 }

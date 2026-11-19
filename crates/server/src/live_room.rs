@@ -245,7 +245,6 @@ pub(crate) struct LiveRoom<S: LiveStore> {
     _unsaved_entries: u64,
     _unsaved_bytes: u64,
     _retained_session_data: Vec<records::LiveSessionDataRow>,
-    _return_tombstones: Vec<records::LiveReturnTombstoneRow>,
     format: Option<String>,
     entries: Vec<LiveEntry>,
     witnesses: HashMap<Seq, Vec<u32>>,
@@ -364,7 +363,6 @@ impl<S: LiveStore> LiveRoom<S> {
             _unsaved_entries: loaded.unsaved_entries,
             _unsaved_bytes: loaded.unsaved_bytes,
             _retained_session_data: loaded.retained_session_data,
-            _return_tombstones: loaded.return_tombstones,
             format: loaded.format,
             entries,
             witnesses,
@@ -382,13 +380,14 @@ impl<S: LiveStore> LiveRoom<S> {
     #[allow(dead_code)] // Task 8 calls this after an indeterminate checkpoint database write.
     async fn reconcile_live_checkpoint(
         &self,
+        parent: Option<&str>,
         checkpoint: &NewLiveCheckpoint<'_>,
         described: &RevisionInfo,
         expected_fields: &Map<String, Value>,
     ) -> Result<(), RoomFailed> {
         if let Err(error) = self
             .store
-            .reconcile_live_checkpoint(self.doc, checkpoint, described, expected_fields)
+            .reconcile_live_checkpoint(self.doc, parent, checkpoint, described, expected_fields)
             .await
         {
             self.events.emit(NewEvent {
@@ -1650,7 +1649,8 @@ mod tests {
 
     use collab_core::ids::{ClientId, DocId, Seq, SessionId, UserId};
     use protocol::live::{
-        EntryBody, LiveResume, LiveServerMsg, LocalNo, ParticipantNo, Place, RefusedReason,
+        EntryBody, LiveBuild, LiveResume, LiveServerMsg, LocalNo, ParticipantNo, Place,
+        RefusedReason, TicketPurpose,
     };
     use records::NewLiveCheckpoint;
     use revisions::{BlobRef, RevisionInfo};
@@ -1661,7 +1661,7 @@ mod tests {
     use super::{LiveCommand, LiveRoom, LiveTiming, start_sweeper_task};
     use crate::events::EventSink;
     use crate::live_store::MemStore;
-    use crate::members::builtin_access;
+    use crate::members::{AccessRules, builtin_access};
     use crate::room::{JoinReply, Outbound};
 
     const FORMAT: &str = "gridcraft/1";
@@ -1769,8 +1769,9 @@ mod tests {
         all
     }
 
-    async fn join_as(
-        room: &mut LiveRoom<MemStore>,
+    #[allow(clippy::too_many_arguments)]
+    async fn join_as<S: crate::live_store::LiveStore>(
+        room: &mut LiveRoom<S>,
         conn: u64,
         client_n: u128,
         user_n: u128,
@@ -1779,21 +1780,74 @@ mod tests {
         resume: Option<LiveResume>,
         seen: Option<Seq>,
     ) -> Joined {
+        join_user(
+            room,
+            conn,
+            client_n,
+            UserId(id(user_n)),
+            role,
+            format,
+            resume,
+            seen,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn join_user<S: crate::live_store::LiveStore>(
+        room: &mut LiveRoom<S>,
+        conn: u64,
+        client_n: u128,
+        user: UserId,
+        role: &str,
+        format: &str,
+        resume: Option<LiveResume>,
+        seen: Option<Seq>,
+    ) -> Joined {
+        join_capable_user(
+            room,
+            conn,
+            client_n,
+            user,
+            role,
+            format,
+            resume,
+            seen,
+            false,
+            LiveBuild::Browser,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn join_capable_user<S: crate::live_store::LiveStore>(
+        room: &mut LiveRoom<S>,
+        conn: u64,
+        client_n: u128,
+        user: UserId,
+        role: &str,
+        format: &str,
+        resume: Option<LiveResume>,
+        seen: Option<Seq>,
+        can_checkpoint: bool,
+        build: LiveBuild,
+    ) -> Joined {
         let client = ClientId(id(client_n));
-        let user = UserId(id(user_n));
         let (tx, rx) = mpsc::channel(512);
         let (accepted, answer) = oneshot::channel();
         room.handle(LiveCommand::Join {
             conn,
             client,
             user,
-            session: SessionId(id(user_n + 1000)),
-            name: format!("User {user_n}"),
+            session: SessionId(id(user.0.as_u128().wrapping_add(1000))),
+            name: format!("User {}", user.0),
             role: builtin_access(role),
             protocol: 1,
             format: format.to_owned(),
             resume,
             seen,
+            can_checkpoint,
+            build,
             tx,
             accepted,
         })
@@ -1832,8 +1886,20 @@ mod tests {
         joined
     }
 
-    async fn entry(
-        room: &mut LiveRoom<MemStore>,
+    fn ticket(messages: Vec<LiveServerMsg>) -> Option<(Uuid, TicketPurpose, Seq)> {
+        messages.into_iter().find_map(|message| match message {
+            LiveServerMsg::CheckpointTicket {
+                ticket,
+                purpose,
+                at,
+                ..
+            } => Some((ticket, purpose, at)),
+            _ => None,
+        })
+    }
+
+    async fn entry<S: crate::live_store::LiveStore>(
+        room: &mut LiveRoom<S>,
         joined: &Joined,
         local: u64,
         seen: u64,
@@ -2728,6 +2794,101 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn database_restart_loads_the_verified_base_and_sends_its_suffix() {
+        let test = records::test_support::TestDb::create().await;
+        let db = test.db.clone();
+        let mut users = Vec::new();
+        for name in ["Ann", "Bob"] {
+            users.push(
+                db.create_user(
+                    None,
+                    records::NewUser {
+                        email: &format!("{name}@test.invalid"),
+                        name,
+                        password: "a long enough password",
+                        is_admin: false,
+                    },
+                )
+                .await
+                .unwrap()
+                .id,
+            );
+        }
+        let doc = DocId(Uuid::new_v4());
+        db.create_document(users[0], doc, "book.xlsx", records::Editor::GridCraft)
+            .await
+            .unwrap();
+        let mut first = LiveRoom::load(doc, db.clone(), EventSink::discard(), timing())
+            .await
+            .unwrap();
+        let mut ann = join_user(&mut first, 1, 1, users[0], "editor", FORMAT, None, None).await;
+        for local in 1..=3 {
+            entry(
+                &mut first,
+                &ann,
+                local,
+                local - 1,
+                FORMAT,
+                format!("change {local}"),
+            )
+            .await
+            .unwrap();
+        }
+        let _ = drain(&mut ann.rx);
+        let revision = "a".repeat(40);
+        let now = time::OffsetDateTime::now_utc()
+            .replace_nanosecond(0)
+            .unwrap();
+        db.record_live_checkpoint_revision(
+            None,
+            &records::RevisionRecord {
+                doc,
+                revision: revision.clone(),
+                committed_at: now,
+                authors: vec![(users[0].0.to_string(), "Ann".to_owned())],
+                name: "book.xlsx".to_owned(),
+                fields: json!({ "verified": false, "live_through": 2 }),
+                size: 10,
+            },
+            &NewLiveCheckpoint {
+                created_at: now,
+                ..checkpoint(&revision, Seq(2), ann.session, b"identities at two")
+            },
+        )
+        .await
+        .unwrap();
+        db.verify_live_checkpoint(doc, &revision, Seq(2), now)
+            .await
+            .unwrap();
+        drop(first);
+
+        let mut restarted = LiveRoom::load(doc, db.clone(), EventSink::discard(), timing())
+            .await
+            .unwrap();
+        let bob = join_user(&mut restarted, 2, 2, users[1], "editor", FORMAT, None, None).await;
+        match bob.initial.as_slice() {
+            [
+                LiveServerMsg::LiveJoined { .. },
+                LiveServerMsg::Catchup {
+                    base: Seq(2),
+                    revision: Some(base_revision),
+                    from: Seq(2),
+                    head: Seq(3),
+                },
+                LiveServerMsg::Entry { entry },
+            ] => {
+                assert_eq!(base_revision, &revision);
+                assert_eq!(entry.seq, Seq(3));
+                assert!(matches!(
+                    &entry.body,
+                    EntryBody::Change { payload, .. } if payload == "change 3"
+                ));
+            }
+            other => panic!("unexpected catch-up from the database: {other:?}"),
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn unverified_checkpoint_does_not_advance_catchup_base() {
         let doc = DocId(id(100));
@@ -2832,7 +2993,7 @@ mod tests {
         };
 
         assert!(
-            room.reconcile_live_checkpoint(&checkpoint, &described, &fields)
+            room.reconcile_live_checkpoint(None, &checkpoint, &described, &fields)
                 .await
                 .is_err()
         );
