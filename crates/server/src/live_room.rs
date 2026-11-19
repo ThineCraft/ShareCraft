@@ -13,8 +13,10 @@ use protocol::live::{
 };
 use records::{
     Access, DbError, GoneReason, LiveEntryRow, LiveLoaded, LiveLocal, NewEvent, NewLiveCancel,
-    NewLiveChange,
+    NewLiveChange, NewLiveCheckpoint,
 };
+use revisions::RevisionInfo;
+use serde_json::{Map, Value};
 use time::OffsetDateTime;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
@@ -237,6 +239,13 @@ pub(crate) struct LiveRoom<S: LiveStore> {
     members: Members<LiveFrames>,
     head: Seq,
     verified_through: Seq,
+    base_revision: Option<String>,
+    _base_session_data: Vec<u8>,
+    _unverified_checkpoints: Vec<records::LiveCheckpointRow>,
+    _unsaved_entries: u64,
+    _unsaved_bytes: u64,
+    _retained_session_data: Vec<records::LiveSessionDataRow>,
+    _return_tombstones: Vec<records::LiveReturnTombstoneRow>,
     format: Option<String>,
     entries: Vec<LiveEntry>,
     witnesses: HashMap<Seq, Vec<u32>>,
@@ -268,9 +277,23 @@ impl<S: LiveStore> LiveRoom<S> {
         timing: LiveTiming,
         loaded: LiveLoaded,
     ) -> Result<Self, RoomFailed> {
+        let base_revision = loaded
+            .verified_checkpoint
+            .as_ref()
+            .map(|checkpoint| checkpoint.revision.clone());
+        let base_session_data = loaded
+            .verified_checkpoint
+            .as_ref()
+            .map_or_else(Vec::new, |checkpoint| checkpoint.session_data.clone());
         let mut entries = Vec::with_capacity(loaded.entries.len());
         let mut witnesses = HashMap::new();
         for row in loaded.entries {
+            let seq = match &row {
+                LiveEntryRow::Change { seq, .. } | LiveEntryRow::Cancel { seq, .. } => *seq,
+            };
+            if seq <= loaded.verified_through {
+                continue;
+            }
             if let LiveEntryRow::Change {
                 seq,
                 witnesses: row_witnesses,
@@ -335,6 +358,13 @@ impl<S: LiveStore> LiveRoom<S> {
             members,
             head: loaded.head,
             verified_through: loaded.verified_through,
+            base_revision,
+            _base_session_data: base_session_data,
+            _unverified_checkpoints: loaded.unverified_checkpoints,
+            _unsaved_entries: loaded.unsaved_entries,
+            _unsaved_bytes: loaded.unsaved_bytes,
+            _retained_session_data: loaded.retained_session_data,
+            _return_tombstones: loaded.return_tombstones,
             format: loaded.format,
             entries,
             witnesses,
@@ -347,6 +377,34 @@ impl<S: LiveStore> LiveRoom<S> {
             rates: HashMap::new(),
             pending_ends: Vec::new(),
         })
+    }
+
+    #[allow(dead_code)] // Task 8 calls this after an indeterminate checkpoint database write.
+    async fn reconcile_live_checkpoint(
+        &self,
+        checkpoint: &NewLiveCheckpoint<'_>,
+        described: &RevisionInfo,
+        expected_fields: &Map<String, Value>,
+    ) -> Result<(), RoomFailed> {
+        if let Err(error) = self
+            .store
+            .reconcile_live_checkpoint(self.doc, checkpoint, described, expected_fields)
+            .await
+        {
+            self.events.emit(NewEvent {
+                kind: "live.checkpoint_reconcile_fault",
+                actor: None,
+                subject: None,
+                document: Some(self.doc),
+                node: Some(self.doc.into()),
+                detail: serde_json::json!({
+                    "revision": checkpoint.revision,
+                    "through": checkpoint.through.0,
+                }),
+            });
+            return Err(error.into());
+        }
+        Ok(())
     }
 
     pub(crate) async fn handle(&mut self, cmd: LiveCommand) -> Result<(), RoomFailed> {
@@ -659,7 +717,7 @@ impl<S: LiveStore> LiveRoom<S> {
             }),
             encode(&LiveServerMsg::Catchup {
                 base: self.verified_through,
-                revision: None,
+                revision: self.base_revision.clone(),
                 from,
                 head: self.head,
             }),
@@ -1075,7 +1133,7 @@ impl<S: LiveStore> LiveRoom<S> {
         }
         let mut frames = vec![encode(&LiveServerMsg::Catchup {
             base: self.verified_through,
-            revision: None,
+            revision: self.base_revision.clone(),
             from: self.verified_through,
             head: self.head,
         })];
@@ -1594,6 +1652,9 @@ mod tests {
     use protocol::live::{
         EntryBody, LiveResume, LiveServerMsg, LocalNo, ParticipantNo, Place, RefusedReason,
     };
+    use records::NewLiveCheckpoint;
+    use revisions::{BlobRef, RevisionInfo};
+    use serde_json::{Map, Value, json};
     use tokio::sync::{mpsc, oneshot};
     use uuid::Uuid;
 
@@ -1623,6 +1684,24 @@ mod tests {
         LiveTiming {
             heartbeat: Duration::from_secs(60),
             misses: 3,
+        }
+    }
+
+    fn checkpoint<'a>(
+        revision: &'a str,
+        through: Seq,
+        session: protocol::live::LiveSessionId,
+        session_data: &'a [u8],
+    ) -> NewLiveCheckpoint<'a> {
+        NewLiveCheckpoint {
+            revision,
+            through,
+            sha256: [7; 32],
+            session: session.0,
+            session_data,
+            major_reason: None,
+            major_person: None,
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
         }
     }
 
@@ -2595,6 +2674,181 @@ mod tests {
             );
             assert_eq!(entries(joined.initial).len(), count);
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn join_catchup_uses_the_last_verified_revision_and_position() {
+        let doc = DocId(id(100));
+        let store = MemStore::new();
+        let mut first = LiveRoom::load(doc, store.clone(), EventSink::discard(), timing())
+            .await
+            .unwrap();
+        let mut ann = join_as(&mut first, 1, 1, 11, "editor", FORMAT, None, None).await;
+        entry(&mut first, &ann, 1, 0, FORMAT, "before".into())
+            .await
+            .unwrap();
+        entry(&mut first, &ann, 2, 1, FORMAT, "after".into())
+            .await
+            .unwrap();
+        let _ = drain(&mut ann.rx);
+
+        crate::live_store::LiveStore::record_live_checkpoint(
+            &store,
+            doc,
+            &checkpoint("verified-revision", Seq(1), ann.session, b"identities"),
+        )
+        .await
+        .unwrap();
+        crate::live_store::LiveStore::verify_live_checkpoint(
+            &store,
+            doc,
+            "verified-revision",
+            Seq(1),
+            time::OffsetDateTime::UNIX_EPOCH,
+        )
+        .await
+        .unwrap();
+        let mut restarted = LiveRoom::load(doc, store, EventSink::discard(), timing())
+            .await
+            .unwrap();
+
+        let joined = join_as(&mut restarted, 2, 2, 12, "editor", FORMAT, None, None).await;
+        assert!(matches!(
+            joined.initial.as_slice(),
+            [
+                LiveServerMsg::LiveJoined { .. },
+                LiveServerMsg::Catchup {
+                    base: Seq(1),
+                    revision: Some(revision),
+                    from: Seq(1),
+                    head: Seq(2),
+                },
+                LiveServerMsg::Entry { entry },
+            ] if revision == "verified-revision" && entry.seq == Seq(2)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unverified_checkpoint_does_not_advance_catchup_base() {
+        let doc = DocId(id(100));
+        let store = MemStore::new();
+        let mut first = LiveRoom::load(doc, store.clone(), EventSink::discard(), timing())
+            .await
+            .unwrap();
+        let mut ann = join_as(&mut first, 1, 1, 11, "editor", FORMAT, None, None).await;
+        entry(&mut first, &ann, 1, 0, FORMAT, "verified".into())
+            .await
+            .unwrap();
+        entry(&mut first, &ann, 2, 1, FORMAT, "unverified".into())
+            .await
+            .unwrap();
+        let _ = drain(&mut ann.rx);
+
+        crate::live_store::LiveStore::record_live_checkpoint(
+            &store,
+            doc,
+            &checkpoint(
+                "verified-revision",
+                Seq(1),
+                ann.session,
+                b"verified identities",
+            ),
+        )
+        .await
+        .unwrap();
+        crate::live_store::LiveStore::verify_live_checkpoint(
+            &store,
+            doc,
+            "verified-revision",
+            Seq(1),
+            time::OffsetDateTime::UNIX_EPOCH,
+        )
+        .await
+        .unwrap();
+        crate::live_store::LiveStore::record_live_checkpoint(
+            &store,
+            doc,
+            &checkpoint(
+                "unverified-revision",
+                Seq(2),
+                ann.session,
+                b"unverified identities",
+            ),
+        )
+        .await
+        .unwrap();
+        let mut restarted = LiveRoom::load(doc, store, EventSink::discard(), timing())
+            .await
+            .unwrap();
+
+        let joined = join_as(&mut restarted, 2, 2, 12, "editor", FORMAT, None, None).await;
+        assert!(matches!(
+            joined.initial.as_slice(),
+            [
+                LiveServerMsg::LiveJoined { .. },
+                LiveServerMsg::Catchup {
+                    base: Seq(1),
+                    revision: Some(revision),
+                    from: Seq(1),
+                    head: Seq(2),
+                },
+                LiveServerMsg::Entry { entry },
+            ] if revision == "verified-revision" && entry.seq == Seq(2)
+        ));
+    }
+
+    #[tokio::test]
+    async fn checkpoint_reconcile_mismatch_faults_without_storing_metadata() {
+        let doc = DocId(id(100));
+        let store = MemStore::new();
+        let (events, mut emitted) = EventSink::channel();
+        let room = LiveRoom::load(doc, store.clone(), events, timing())
+            .await
+            .unwrap();
+        let checkpoint = checkpoint(
+            "1111111111111111111111111111111111111111",
+            Seq(0),
+            protocol::live::LiveSessionId(id(200)),
+            b"identities",
+        );
+        let fields: Map<String, Value> = serde_json::from_value(json!({
+            "title": "kept base field",
+            "verified": false,
+            "live_through": 0,
+        }))
+        .unwrap();
+        let described = RevisionInfo {
+            revision: checkpoint.revision.parse().unwrap(),
+            doc: DocId(id(999)),
+            committed_at: 0,
+            authors: Vec::new(),
+            file_name: "book.gridcraft".into(),
+            fields: fields.clone(),
+            blob: Some(BlobRef {
+                sha256: checkpoint.sha256,
+                size: 10,
+            }),
+            size: 10,
+        };
+
+        assert!(
+            room.reconcile_live_checkpoint(&checkpoint, &described, &fields)
+                .await
+                .is_err()
+        );
+        let event = emitted.try_recv().unwrap();
+        assert_eq!(event.kind, "live.checkpoint_reconcile_fault");
+        assert_eq!(
+            event.detail,
+            json!({ "revision": checkpoint.revision, "through": 0 })
+        );
+        assert!(
+            crate::live_store::LiveStore::load_live(&store, doc)
+                .await
+                .unwrap()
+                .unverified_checkpoints
+                .is_empty()
+        );
     }
 
     #[tokio::test(start_paused = true)]
