@@ -207,7 +207,7 @@ pub(crate) async fn record_first(
 
 /// Appends `revision` after `parent`; if the recorded head is not `parent`, replaces the
 /// document's list from Git instead.
-async fn record(
+pub(crate) async fn record(
     store: &Arc<dyn Checkpointer>,
     db: &Db,
     doc: DocId,

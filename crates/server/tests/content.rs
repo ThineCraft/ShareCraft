@@ -165,6 +165,52 @@ async fn checkpoint_upload_is_checked_before_body() {
     }
 }
 
+#[tokio::test]
+async fn checkpoint_hash_is_checked_before_the_room_compares_it() {
+    let server = spawn_server_config(|config| {
+        config.live_editors = vec![records::Editor::GridCraft];
+    })
+    .await;
+    let doc = new_doc();
+    let ann = server.user("Ann").await;
+    let vic = server.user("Vic").await;
+    server.create_file_document(doc, &ann).await;
+    let _client = common::live::LiveTestClient::connect(&server, doc, &ann, "ann").await;
+    let digest = "ab".repeat(32);
+    let hash = |who, body: Value| {
+        server
+            .http(Some(who))
+            .post(server.url(&format!("/api/docs/{}/live-checkpoint/hash", doc.0)))
+            .json(&body)
+            .send()
+    };
+
+    for (who, sha256, expected) in [
+        (&ann, digest.clone(), StatusCode::FORBIDDEN),
+        (&vic, digest.clone(), StatusCode::NOT_FOUND),
+        (&ann, digest.to_uppercase(), StatusCode::BAD_REQUEST),
+        (&ann, "ab".repeat(33), StatusCode::BAD_REQUEST),
+    ] {
+        let response = hash(
+            who,
+            serde_json::json!({ "ticket": Uuid::new_v4(), "at": 0, "sha256": sha256 }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), expected);
+    }
+    let response = hash(
+        &ann,
+        serde_json::json!({ "ticket": Uuid::new_v4(), "at": 0, "sha256": digest, "computed": "x" }),
+    )
+    .await
+    .unwrap();
+    assert!(
+        response.status().is_client_error(),
+        "only the file hash crosses the wire"
+    );
+}
+
 /// The id of `user`'s own folder, where their uploads go.
 async fn home(site: &Site, user: &TestUser) -> String {
     site.home_of(user).await.0.to_string()

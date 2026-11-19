@@ -47,6 +47,16 @@ pub(crate) enum LiveWriteError {
     },
 }
 
+/// What a verifier's disagreeing (forensic) upload left in the history.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ForensicWritten {
+    /// The revision holding the verifier's bytes.
+    pub forensic: String,
+    /// The document's current revision afterwards: normally a new revision restoring the
+    /// agreed bytes, or the forensic revision itself when that restore could not be written.
+    pub current: String,
+}
+
 /// The fields a live checkpoint revision stores: the base revision's fields, without an
 /// earlier checkpoint's live facts, plus its own.
 pub(crate) fn live_fields(base: &Map<String, Value>, at: Seq) -> Map<String, Value> {
@@ -65,7 +75,7 @@ pub(crate) fn live_fields(base: &Map<String, Value>, at: Seq) -> Map<String, Val
     fields
 }
 
-pub(crate) trait LiveStore: Send + Sync + 'static {
+pub(crate) trait LiveStore: Clone + Send + Sync + 'static {
     fn load_live(&self, doc: DocId) -> impl Future<Output = Result<LiveLoaded, DbError>> + Send;
 
     /// The document's current revision as recorded, for a log with no live checkpoint yet.
@@ -81,6 +91,16 @@ pub(crate) trait LiveStore: Send + Sync + 'static {
         doc: DocId,
         write: &LiveWrite<'_>,
     ) -> impl Future<Output = Result<String, LiveWriteError>> + Send;
+
+    /// Keeps a verifier's disagreeing bytes for `write.at` as a history revision on top of
+    /// `write.base`, then restores the agreed checkpoint `agreed` as the current revision. No
+    /// live checkpoint is recorded: the forensic bytes never become a catch-up base.
+    fn write_live_forensic(
+        &self,
+        doc: DocId,
+        write: &LiveWrite<'_>,
+        agreed: &str,
+    ) -> impl Future<Output = Result<ForensicWritten, LiveWriteError>> + Send;
 
     #[allow(dead_code)] // Records an existing revision; participant writes use the write above.
     fn record_live_checkpoint(
@@ -101,7 +121,8 @@ pub(crate) trait LiveStore: Send + Sync + 'static {
         expected_fields: &Map<String, Value>,
     ) -> impl Future<Output = Result<(), DbError>> + Send;
 
-    #[allow(dead_code)] // Task 9 consumes the checkpoint verification boundary.
+    /// Marks the checkpoint `revision` at exactly `through` verified and advances the log's
+    /// verified position, in one transaction.
     fn verify_live_checkpoint(
         &self,
         doc: DocId,
@@ -220,6 +241,17 @@ impl LiveStore for Db {
         _doc: DocId,
         _write: &LiveWrite<'_>,
     ) -> Result<String, LiveWriteError> {
+        Err(LiveWriteError::Failed(
+            "the database alone cannot commit checkpoint bytes".to_owned(),
+        ))
+    }
+
+    async fn write_live_forensic(
+        &self,
+        _doc: DocId,
+        _write: &LiveWrite<'_>,
+        _agreed: &str,
+    ) -> Result<ForensicWritten, LiveWriteError> {
         Err(LiveWriteError::Failed(
             "the database alone cannot commit checkpoint bytes".to_owned(),
         ))
@@ -349,6 +381,20 @@ pub(crate) struct LiveDb {
 }
 
 impl LiveDb {
+    /// Records `revision`, written on top of `parent`, in the revision index; a failure is
+    /// logged, since Git holds it and the next start reconciles the index.
+    async fn record_index(&self, doc: DocId, parent: Option<&RevisionId>, revision: &RevisionId) {
+        if let Err(error) =
+            crate::projection::record(&self.store, &self.db, doc, parent, revision).await
+        {
+            eprintln!(
+                "sharecraft-server: revision {revision} of document {} is saved but could not \
+                 be recorded in the database: {error}",
+                doc.0
+            );
+        }
+    }
+
     /// Runs `read` on the library without blocking the async workers.
     async fn blocking<T: Send + 'static>(
         &self,
@@ -471,6 +517,120 @@ impl LiveStore for LiveDb {
             Ok(None) => Err(unrecorded(None, "Git does not describe it".to_owned())),
             Err(error) => Err(unrecorded(None, error)),
         }
+    }
+
+    async fn write_live_forensic(
+        &self,
+        doc: DocId,
+        write: &LiveWrite<'_>,
+        agreed: &str,
+    ) -> Result<ForensicWritten, LiveWriteError> {
+        let failed = |error: String| LiveWriteError::Failed(error);
+        let name = self
+            .db
+            .document(doc)
+            .await
+            .map_err(|error| failed(error.to_string()))?
+            .ok_or_else(|| failed(format!("document {} has no record", doc.0)))?
+            .name;
+        let base = write
+            .base
+            .map(RevisionId::from_str)
+            .transpose()
+            .map_err(|error| failed(error.to_string()))?;
+        let agreed_id = RevisionId::from_str(agreed).map_err(|error| failed(error.to_string()))?;
+        let wanted = agreed_id.clone();
+        let agreed_info = self
+            .blocking(move |store| {
+                store
+                    .describe(doc, &wanted)
+                    .map_err(|error| error.to_string())
+            })
+            .await
+            .map_err(failed)?
+            .ok_or_else(|| failed(format!("{agreed} is not a revision of the document")))?;
+        let agreed_blob = agreed_info
+            .blob
+            .ok_or_else(|| failed(format!("{agreed} has no content-store bytes")))?;
+        let mut fields = live_fields(&agreed_info.fields, write.at);
+        fields.insert("forensic_of".to_owned(), Value::from(agreed));
+        let blob = write.blob;
+        let authors = write.authors.to_vec();
+        let commit_base = base.clone();
+        let outcome = write_claimed(
+            &self.blobs,
+            Some(&self.db),
+            Arc::clone(&self.store),
+            doc,
+            blob,
+            Origin::EditorSave,
+            {
+                let name = name.clone();
+                move |store| {
+                    store.write(&Checkpoint {
+                        doc,
+                        file_name: &name,
+                        blob,
+                        base: commit_base.as_ref(),
+                        authors: &authors,
+                        fields: &fields,
+                    })
+                }
+            },
+        )
+        .await;
+        let forensic = match outcome {
+            Ok(Outcome::Written(revision) | Outcome::Unchanged(revision)) => revision,
+            Err(WriteError::Stale { current }) => {
+                return Err(LiveWriteError::Stale {
+                    current: current.map(|current| current.to_string()),
+                });
+            }
+            Err(WriteError::Failed(error)) => return Err(failed(error)),
+        };
+        self.record_index(doc, base.as_ref(), &forensic).await;
+        // The agreed checkpoint becomes current again, so the forensic bytes stay history.
+        let mut restored_fields = agreed_info.fields.clone();
+        restored_fields.insert("restores".to_owned(), Value::from(agreed));
+        let restored_authors = agreed_info.authors.clone();
+        let restore_base = forensic.clone();
+        let restored = write_claimed(
+            &self.blobs,
+            Some(&self.db),
+            Arc::clone(&self.store),
+            doc,
+            agreed_blob,
+            Origin::EditorSave,
+            move |store| {
+                store.write(&Checkpoint {
+                    doc,
+                    file_name: &name,
+                    blob: agreed_blob,
+                    base: Some(&restore_base),
+                    authors: &restored_authors,
+                    fields: &restored_fields,
+                })
+            },
+        )
+        .await;
+        let current = match restored {
+            Ok(Outcome::Written(revision) | Outcome::Unchanged(revision)) => {
+                self.record_index(doc, Some(&forensic), &revision).await;
+                revision.to_string()
+            }
+            Err(error) => {
+                eprintln!(
+                    "sharecraft-server: the agreed checkpoint {agreed} of document {} could not \
+                     be restored after forensic revision {forensic}: {error:?}",
+                    doc.0
+                );
+                forensic.to_string()
+            }
+        };
+        Ok(ForensicWritten {
+            forensic: forensic.to_string(),
+            current,
+        })
     }
 
     async fn record_live_checkpoint(
@@ -621,6 +781,8 @@ mod memory {
         fail_next: bool,
         fail_after_next: bool,
         last_authors: Vec<Author>,
+        /// While set, each checkpoint write waits for one permit before it commits.
+        write_gate: Option<Arc<tokio::sync::Semaphore>>,
     }
 
     #[derive(Clone)]
@@ -646,6 +808,8 @@ mod memory {
         return_tombstones: Vec<LiveReturnTombstoneRow>,
         current_revision: Option<String>,
         revisions_written: u64,
+        /// Every revision written, oldest first, with the SHA-256 of its content.
+        revisions: Vec<(String, [u8; 32])>,
     }
 
     impl Default for MemoryDoc {
@@ -667,6 +831,7 @@ mod memory {
                 return_tombstones: Vec::new(),
                 current_revision: None,
                 revisions_written: 0,
+                revisions: Vec::new(),
             }
         }
     }
@@ -701,6 +866,38 @@ mod memory {
                 .lock()
                 .map(|state| state.last_authors.clone())
                 .unwrap_or_default()
+        }
+
+        /// Makes every later checkpoint write wait for a permit of the returned gate, as a
+        /// slow Git write would.
+        pub(crate) fn hold_checkpoint_writes(&self) -> Arc<tokio::sync::Semaphore> {
+            let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            if let Ok(mut state) = self.inner.lock() {
+                state.write_gate = Some(Arc::clone(&gate));
+            }
+            gate
+        }
+
+        /// Every revision written for `doc`, oldest first, with its content's SHA-256.
+        pub(crate) fn revisions(&self, doc: DocId) -> Vec<(String, [u8; 32])> {
+            self.inner
+                .lock()
+                .ok()
+                .and_then(|state| state.docs.get(&doc).map(|memory| memory.revisions.clone()))
+                .unwrap_or_default()
+        }
+
+        async fn wait_for_gate(&self) {
+            let gate = self
+                .inner
+                .lock()
+                .ok()
+                .and_then(|state| state.write_gate.clone());
+            if let Some(gate) = gate
+                && let Ok(permit) = gate.acquire().await
+            {
+                permit.forget();
+            }
         }
 
         pub(crate) fn entry_count(&self) -> usize {
@@ -750,6 +947,7 @@ mod memory {
             doc: DocId,
             write: &LiveWrite<'_>,
         ) -> Result<String, LiveWriteError> {
+            self.wait_for_gate().await;
             let revision = {
                 let mut state = self
                     .write()
@@ -764,6 +962,7 @@ mod memory {
                 memory.revisions_written = memory.revisions_written.saturating_add(1);
                 let revision = format!("{:040x}", memory.revisions_written);
                 memory.current_revision = Some(revision.clone());
+                memory.revisions.push((revision.clone(), write.blob.sha256));
                 revision
             };
             self.record_live_checkpoint(
@@ -787,6 +986,41 @@ mod memory {
                 error: error.to_string(),
             })?;
             Ok(revision)
+        }
+
+        async fn write_live_forensic(
+            &self,
+            doc: DocId,
+            write: &LiveWrite<'_>,
+            agreed: &str,
+        ) -> Result<ForensicWritten, LiveWriteError> {
+            self.wait_for_gate().await;
+            let mut state = self
+                .write()
+                .map_err(|error| LiveWriteError::Failed(error.to_string()))?;
+            let memory = state.docs.entry(doc).or_default();
+            if write.base.map(str::to_owned) != memory.current_revision {
+                return Err(LiveWriteError::Stale {
+                    current: memory.current_revision.clone(),
+                });
+            }
+            let agreed_sha = memory
+                .revisions
+                .iter()
+                .find(|(revision, _)| revision == agreed)
+                .map(|(_, sha)| *sha)
+                .ok_or_else(|| LiveWriteError::Failed(format!("{agreed} is not a revision")))?;
+            let mut written = Vec::new();
+            for sha in [write.blob.sha256, agreed_sha] {
+                memory.revisions_written = memory.revisions_written.saturating_add(1);
+                let revision = format!("{:040x}", memory.revisions_written);
+                memory.revisions.push((revision.clone(), sha));
+                written.push(revision);
+            }
+            let current = written.pop().unwrap_or_default();
+            let forensic = written.pop().unwrap_or_default();
+            memory.current_revision = Some(current.clone());
+            Ok(ForensicWritten { forensic, current })
         }
 
         async fn load_live(&self, doc: DocId) -> Result<LiveLoaded, DbError> {

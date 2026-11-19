@@ -898,7 +898,9 @@ pub(crate) async fn live_checkpoint(
 /// `POST /api/docs/{id}/live-checkpoint/hash` with `{ticket, at, sha256}`: the SHA-256 of the
 /// bytes a verifying participant wrote independently for its verify ticket. Refused like an
 /// upload (`403`, `404`) unless the ticket is the caller's, unused and unexpired for exactly
-/// this position; `202` once the room has it.
+/// this position; `202` once the room has compared it with the stored checkpoint (a match
+/// verifies it, a mismatch keeps it unverified and asks the caller for its own bytes); `503`
+/// when the verification could not be stored.
 pub(crate) async fn live_checkpoint_hash(
     State(state): State<AppState>,
     signed: Signed,

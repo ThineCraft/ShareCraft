@@ -898,3 +898,109 @@ async fn participant_checkpoint_upload_becomes_the_current_revision() {
         "a ticket is one-use"
     );
 }
+
+async fn join_capable_socket(
+    server: &TestServer,
+    doc: DocId,
+    user: &TestUser,
+    build: protocol::live::LiveBuild,
+) -> common::Socket {
+    let mut socket = common::open_socket(server.addr, doc, user).await;
+    send_live(
+        &mut socket,
+        &LiveClientMsg::LiveJoin {
+            client: collab_core::ids::ClientId(uuid::Uuid::new_v4()),
+            protocol: protocol::live::LIVE_PROTOCOL,
+            format: FORMAT.to_owned(),
+            resume: None,
+            seen: None,
+            can_checkpoint: true,
+            build,
+            returning_through: None,
+        },
+    )
+    .await;
+    next_live(&mut socket, |message| {
+        matches!(message, LiveServerMsg::LiveJoined { .. }).then_some(())
+    })
+    .await;
+    socket
+}
+
+#[tokio::test]
+async fn second_participant_hash_verifies_the_checkpoint() {
+    use sha2::Digest;
+    let server = spawn_server_config(|config| {
+        live_config(config);
+        config.live_checkpoint_quiet = Duration::from_millis(50);
+    })
+    .await;
+    let (doc, ann, bob) = shared_live(&server).await;
+    let mut ann_socket =
+        join_capable_socket(&server, doc, &ann, protocol::live::LiveBuild::Browser).await;
+    let mut bob_socket =
+        join_capable_socket(&server, doc, &bob, protocol::live::LiveBuild::Desktop).await;
+    send_live(
+        &mut ann_socket,
+        &LiveClientMsg::Entry {
+            local: LocalNo(1),
+            seen: Seq(0),
+            format: FORMAT.to_owned(),
+            payload: "one".to_owned(),
+        },
+    )
+    .await;
+    let (ticket, at) = next_live(&mut ann_socket, |message| match message {
+        LiveServerMsg::CheckpointTicket { ticket, at, .. } => Some((ticket, at)),
+        _ => None,
+    })
+    .await;
+    let file = b"checkpoint workbook bytes".to_vec();
+    let response = server
+        .http(Some(&ann))
+        .put(server.url(&format!("/api/docs/{}/live-checkpoint", doc.0)))
+        .query(&[("ticket", ticket.to_string()), ("at", at.0.to_string())])
+        .header("x-sharecraft-session-data-length", 3)
+        .body([b"ids".as_slice(), &file].concat())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let revision = response.json::<serde_json::Value>().await.unwrap()["revision"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let (verify, purpose, verify_at) = next_live(&mut bob_socket, |message| match message {
+        LiveServerMsg::CheckpointTicket {
+            ticket,
+            purpose,
+            at,
+            ..
+        } => Some((ticket, purpose, at)),
+        _ => None,
+    })
+    .await;
+    assert_eq!(purpose, protocol::live::TicketPurpose::Verify);
+    assert_eq!(verify_at, at);
+    let digest = sha2::Sha256::digest(&file)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let hashed = server
+        .http(Some(&bob))
+        .post(server.url(&format!("/api/docs/{}/live-checkpoint/hash", doc.0)))
+        .json(&serde_json::json!({ "ticket": verify, "at": at.0, "sha256": digest }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(hashed.status(), StatusCode::ACCEPTED);
+    let loaded = server.db.db.load_live(doc).await.unwrap();
+    assert_eq!(loaded.verified_through, at);
+    let verified = loaded.verified_checkpoint.unwrap();
+    assert_eq!(verified.revision, revision);
+    assert_eq!(
+        verified.session_data, b"ids",
+        "the base carries its session data"
+    );
+}
