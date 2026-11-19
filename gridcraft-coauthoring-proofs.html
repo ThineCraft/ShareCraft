@@ -23,11 +23,11 @@ tbody tr:nth-child(even)>td,tbody tr:nth-child(even)>th{background:light-dark(#f
 <p class="eyebrow">ThineCraft / ShareCraft report</p>
 <h1>GridCraft co-authoring: the proofs</h1>
 <p class="lede">Before anything is built for live co-authoring in GridCraft, plan G1 tested the four things the adopted design rests on (C16, “proofs first”). This report gives each result, its evidence, and a recommendation: go, with conditions.</p>
-<div class="meta"><span>Version 0.1 · For the owner’s decision</span><span>16 November 2026</span><span>Reports against <a href="co-authoring-approach.html" style="color:inherit">co-authoring-approach.html</a> (C1, C5, C7, C9, C12, C16, section 12) and <a href="sequencing.html" style="color:inherit">sequencing.html</a> (Stage 2 editor track)</span></div>
+<div class="meta"><span>Version 0.2 · G3 results added</span><span>19 November 2026</span><span>Reports against <a href="co-authoring-approach.html" style="color:inherit">co-authoring-approach.html</a> v1.3 (C1, C5, C7, C9, C12, C16, section 12) and <a href="sequencing.html" style="color:inherit">sequencing.html</a> (Stage 2 editor track)</span></div>
 </header>
 <div class="layout">
 <nav aria-label="Report contents"><p>In this report</p>
-<a href="#verdict">01 · Recommendation</a><a href="#results">02 · The four proofs</a><a href="#engines">03 · Two engines</a><a href="#platforms">04 · Desktop and browser</a><a href="#save">05 · Save and reopen</a><a href="#timing">06 · Rollback and re-run</a><a href="#selection">07 · Commands that read the selection</a><a href="#audit">08 · Determinism audit</a><a href="#fixes">09 · Engine fixes made</a><a href="#conditions">10 · Conditions for G3 to G5</a><a href="#notproved">11 · Not proved</a><a href="#decisions">12 · Decisions asked</a><a href="#evidence">13 · Evidence and commits</a>
+<a href="#verdict">01 · Recommendation</a><a href="#results">02 · The four proofs</a><a href="#engines">03 · Two engines</a><a href="#platforms">04 · Desktop and browser</a><a href="#save">05 · Save and reopen</a><a href="#timing">06 · Rollback and re-run</a><a href="#selection">07 · Commands that read the selection</a><a href="#audit">08 · Determinism audit</a><a href="#fixes">09 · Engine fixes made</a><a href="#conditions">10 · Conditions for G3 to G5</a><a href="#notproved">11 · Not proved</a><a href="#decisions">12 · Decisions asked</a><a href="#evidence">13 · Evidence and commits</a><a href="#changes02">Changes in v0.2</a>
 </nav>
 <main id="main">
 <div class="toolbar"><span class="small">Standalone HTML · Print-ready · No external assets</span><button type="button" onclick="window.print()">Print / Save PDF</button></div>
@@ -107,38 +107,47 @@ tbody tr:nth-child(even)>td,tbody tr:nth-child(even)>th{background:light-dark(#f
 <tr><td>One command alone: content or format</td><td>0.3 to 1 ms</td><td>Under 1 ms</td><td>—</td></tr>
 <tr><td>One command alone: row or column insert or delete</td><td>43 to 60 ms (p50)</td><td>33 to 39 ms</td><td>About the whole desktop budget</td></tr>
 </tbody></table></div>
-<p><strong>What it means.</strong> Re-running ordinary edits is cheap. A structural change is expensive because it rewrites references and recalculates the whole workbook. G3 should either make structural re-runs cheaper (for example one recalculation per batch instead of per command, proven to give the same result) or, as the design already allows, apply structural changes on large workbooks only once the server has agreed them (“wait for the server”).</p>
+<p><strong>What it means.</strong> Re-running ordinary edits is cheap. A structural change is expensive because it rewrites references and recalculates the whole workbook. G3 chose the design’s “wait for the server” mode for structural changes on large workbooks and proved rollback/re-run equal to straight-through application.</p>
 <p class="small">Qualifiers: the workbook’s formulas are cheap, so real workbooks may be slower. The browser figure is one run under Node, not pinned and not in a real browser. The browser build being faster than the desktop is unexplained; the copy alone takes 1.0 to 1.3 ms on the desktop against 0.3 ms, which points at the Windows memory allocator, not yet tested. A first figure of 97 ms included an extra full recalculation the design never does; it is kept in the evidence and not used here.</p>
+<h3>G3 heavier-formula follow-up</h3>
+<p>G3 chose the wait-for-server path for structural commands, including structural Undo and Redo, on workbooks with at least 100,000 stored cells. Its equality test proves rollback and re-run reach the same result as straight-through application, including Undo/Redo.</p>
+<div class="table-wrap"><table>
+<thead><tr><th scope="col">G3 workload</th><th scope="col">Native Windows p95</th><th scope="col">Meaning</th></tr></thead>
+<tbody>
+<tr><td>Ten content changes in a 100,000-cell workbook, with 20,000 formulas depending on one 80-cell block</td><td>About 355 ms</td><td>Clone and apply under deliberately heavy fan-out in the Task 6 run.</td></tr>
+<tr><td>One structural change in the same 100,000-cell workbook</td><td>About 142 ms</td><td>Supports waiting for the server rather than optimistic structural re-run.</td></tr>
+</tbody></table></div>
+<p class="small">These are measurements of that heavy 20,000-formula workload, not a claim that one ordinary content edit takes about 355 ms. Only native Windows was measured for this G3 follow-up.</p>
 </section>
 
 <section id="selection"><h2>07 / Commands that read the selection</h2>
-<p>A shared command must act only on what it is told, never on the sender’s or receiver’s selection. Reading the command code found these, which are now input for G3:</p>
+<p>A shared command must act only on what it is told, never on the sender’s or receiver’s selection. G1 found the cases below; G3 resolved them for the first shared command set:</p>
 <div class="table-wrap"><table>
 <thead><tr><th scope="col">Command</th><th scope="col">What it reads</th><th scope="col">Consequence</th></tr></thead>
 <tbody>
-<tr><td>Filter on and off (<code>data.filter</code>)</td><td>A toggle that looks for a table at the active cell</td><td>Two people toggling at once cancel out. Left out of the proofs; G3 needs explicit set-filter and clear-filter commands.</td></tr>
-<tr><td><code>data.filterBy</code>, <code>data.clearFilter</code>, <code>data.reapply</code></td><td>No sheet parameter: always the active sheet</td><td>Left out of the proofs; G3 adds explicit targets.</td></tr>
-<tr><td>Underline and double underline</td><td>The active cell’s underline, even when told on or off</td><td>G3 fix.</td></tr>
-<tr><td>Increase and decrease font size</td><td>Steps from the active cell’s size</td><td>G3: send the resulting size.</td></tr>
-<tr><td>Format Cells</td><td>Checks the change against the active cell’s style</td><td>Could be accepted on one client and refused on another; G3 fix.</td></tr>
+<tr><td>Filter on and off (<code>data.filter</code>)</td><td>A toggle that looks for a table at the active cell</td><td>G3 keeps the toggle local and added explicit, idempotent set/remove commands.</td></tr>
+<tr><td><code>data.filterBy</code>, <code>data.clearFilter</code>, <code>data.reapply</code></td><td>No sheet parameter: always the active sheet</td><td>G3 added explicit sheet and filter-range targets.</td></tr>
+<tr><td>Underline and double underline</td><td>The active cell’s underline, even when told on or off</td><td>G3 sends the explicit resulting state and style.</td></tr>
+<tr><td>Increase and decrease font size</td><td>Steps from the active cell’s size</td><td>G3 sends the resulting size.</td></tr>
+<tr><td>Format Cells</td><td>Checks the change against the active cell’s style</td><td>G3 validates the patch against each explicit target.</td></tr>
 <tr><td>Bold, italic, wrap text, align left, centre and right</td><td>Toggle from the active cell when “on” is not given</td><td>Shared only in the explicit form, as proved in G1.</td></tr>
-<tr><td>Insert and delete sheet</td><td>Make the new sheet active; reset the selection</td><td>The workbook agrees, but a remote change must not move a co-author’s view: G3’s apply loop keeps the view.</td></tr>
+<tr><td>Insert and delete sheet</td><td>Make the new sheet active; reset the selection</td><td>G3’s apply loop preserves each co-author’s view.</td></tr>
 </tbody></table></div>
 </section>
 
 <section id="audit"><h2>08 / Determinism audit</h2>
-<p>Every hash map, clock, random source, use of a memory address and floating-point path in the engine, model, calculation, formula, functions and xlsx code was classed as safe, fixed in G1, or left for G3, with the reason. The full audit is <code>docs/coauthor-determinism.md</code> in the GridCraft fork.</p>
+<p>Every hash map, clock, random source, use of a memory address and floating-point path in the engine, model, calculation, formula, functions and xlsx code was classed as safe, fixed in G1, or left for G3, with the reason. G3 fixed the clock, random state, year-less-date and shared-history items for its first command set; the maths-library and non-shared command findings remain open. The full current audit is <code>docs/coauthor-determinism.md</code> in the GridCraft fork.</p>
 <div class="table-wrap"><table>
-<thead><tr><th scope="col">Left for G3 or later</th><th scope="col">Why it matters</th><th scope="col">Fix proposed</th></tr></thead>
+<thead><tr><th scope="col">G1 finding</th><th scope="col">Why it matters</th><th scope="col">Status after G3</th></tr></thead>
 <tbody>
-<tr><td>NOW and TODAY</td><td>Each client has its own clock</td><td>The command carries the originator’s time, or the agreed time</td></tr>
-<tr><td>RAND, RANDBETWEEN, RANDARRAY</td><td>The random state lives in the calculator, not the workbook, so a rollback or reload draws other numbers</td><td>Keep the random state with the agreed workbook, or treat volatile results as the server’s</td></tr>
-<tr><td>Dates typed without a year</td><td>Read the system clock, so two clients either side of New Year differ</td><td>The originator sends the full date</td></tr>
-<tr><td>Maths library differences</td><td>Section 04</td><td>One maths library in both builds, or the server’s computed values are the agreed ones</td></tr>
+<tr><td>NOW and TODAY</td><td>Each client has its own clock</td><td><strong>Fixed for G3:</strong> the server stamp sets the agreed calculation clock.</td></tr>
+<tr><td>RAND, RANDBETWEEN, RANDARRAY</td><td>The random state lives in the calculator, not the workbook, so a rollback or reload draws other numbers</td><td><strong>Fixed for G3:</strong> snapshots carry the RNG cursor and the server stamp seeds the agreed stream.</td></tr>
+<tr><td>Dates typed without a year</td><td>Read the system clock, so two clients either side of New Year differ</td><td><strong>Fixed for G3:</strong> <code>cell.set</code> carries the origin year; formula and filter coercion use the stamped clock.</td></tr>
+<tr><td>Maths library differences</td><td>Section 04</td><td><strong>Open:</strong> agreement uses entered content only until both builds use one maths library.</td></tr>
 <tr><td>Conditional formats, validation lists, Advanced Filter and pivot calculated fields</td><td>Use the system clock and a fixed random seed</td><td>Pass the session’s clock and seed</td></tr>
 <tr><td>Iterative calculation, manual calculation, more than 8 spill rounds</td><td>Results depend on calculation history</td><td>A full recalculation after each agreed step, or per-workbook settings</td></tr>
 <tr><td>AutoFit column width, password salts, the random-number tool, macro time limits, cell pictures</td><td>Depend on the machine, and are not shared commands</td><td>The originator sends the result</td></tr>
-<tr><td>Undo history depth</td><td>Differs between platforms</td><td>Per-person undo must not assume the same depth</td></tr>
+<tr><td>Undo history depth</td><td>Differs between platforms</td><td><strong>Fixed for G3:</strong> personal history is outside snapshots and agreement and uses content-based count and byte limits.</td></tr>
 </tbody></table></div>
 </section>
 
@@ -157,16 +166,16 @@ tbody tr:nth-child(even)>td,tbody tr:nth-child(even)>th{background:light-dark(#f
 
 <section id="conditions"><h2>10 / Conditions for G3 to G5</h2>
 <div class="table-wrap"><table>
-<thead><tr><th scope="col">Condition</th><th scope="col">Plan</th></tr></thead>
+<thead><tr><th scope="col">Condition</th><th scope="col">Plan</th><th scope="col">Status and evidence</th></tr></thead>
 <tbody>
-<tr><td>Make filters, underline, font-size steps and Format Cells target-explicit; keep a co-author’s view when applying others’ commands.</td><td>G3</td></tr>
-<tr><td>Structural changes on large workbooks: a cheaper re-run proven equal to straight application, or “wait for the server”. Re-measure with heavier formulas.</td><td>G3</td></tr>
-<tr><td>Clock, random state and year-less dates carried in the command or the agreed state.</td><td>G3</td></tr>
-<tr><td>A test that rolling back and re-applying gives the same workbook as applying straight through.</td><td>G3</td></tr>
-<tr><td>Checkpoints load with a full recalculation; fix the row-height loss (8 of 10,000).</td><td>G4</td></tr>
-<tr><td>Agreement checks across platforms use entered content only, until both builds share one maths library.</td><td>G4</td></tr>
-<tr><td>Re-run the browser checks and timings in real browsers (Chrome, Edge, Firefox).</td><td>G5</td></tr>
-<tr><td>Desktop GridCraft joins shared sessions only once both builds use one maths library (C16).</td><td>After G5</td></tr>
+<tr><td>Make filters, underline, font-size steps and Format Cells target-explicit; keep a co-author’s view when applying others’ commands.</td><td>G3</td><td><strong>Met.</strong> <code>shared_commands_require_explicit_targets</code>, <code>filter_commands_ignore_the_receivers_view</code>, <code>filter_set_and_remove_are_idempotent</code>, <code>underline_with_on_ignores_active_cell</code>, <code>font_step_uses_the_sent_size</code>, <code>format_cells_validation_uses_each_target_not_active_cell</code>, and <code>remote_insert_and_delete_keep_the_local_view</code>.</td></tr>
+<tr><td>Structural changes on large workbooks: a cheaper re-run proven equal to straight application, or “wait for the server”. Re-measure with heavier formulas.</td><td>G3</td><td><strong>Met.</strong> <code>large_structural_commands_wait_for_server</code> applies the rule at 100,000 stored cells; <code>structural_undo_and_redo_wait_for_the_server_on_large_workbooks</code> covers their reverses. The heavier 20,000-formula workload measured ten content changes at p95 about 355 ms and one structural change at about 142 ms.</td></tr>
+<tr><td>Clock, random state and year-less dates carried in the command or the agreed state.</td><td>G3</td><td><strong>Met.</strong> <code>entry_stamp_controls_now_and_rand</code>, <code>snapshot_restores_rand_state</code>, <code>yearless_date_uses_the_sent_year</code>, <code>filter_criteria_read_year_less_dates_in_the_stamped_year</code>, and <code>guarded_undo_and_redo_calculate_under_the_entry_stamp</code>.</td></tr>
+<tr><td>A test that rolling back and re-applying gives the same workbook as applying straight through.</td><td>G3</td><td><strong>Met.</strong> <code>rollback_rerun_matches_straight_through</code> covers ordinary, structural and volatile entries, including Undo and Redo.</td></tr>
+<tr><td>Agreement checks across platforms use entered content only.</td><td>G3</td><td><strong>Met.</strong> <code>agreement_digest_is_entered_only</code>, <code>cross_platform_agreement_uses_entered_digest</code>, and <code>rows_hidden_by_a_filter_are_not_entered_content</code>. Computed values remain diagnostic only.</td></tr>
+<tr><td>Checkpoints load with a full recalculation; fix the row-height loss (8 of 10,000); save deletion ownership with checkpoint identities.</td><td>G4</td><td><strong>Open.</strong> G3 has no checkpoint path. I8 is carried to G4.</td></tr>
+<tr><td>Use one maths library in desktop and browser builds so last-digit computed results agree.</td><td>G4 / after G5</td><td><strong>Open.</strong> Until then, room agreement remains entered content only and desktop joining remains subject to C16.</td></tr>
+<tr><td>Re-run the browser checks and timings in real browsers (Chrome, Edge, Firefox), connect the host and bound fragmented identity-table work.</td><td>G5</td><td><strong>Open.</strong> I7 and the user-facing browser/desktop path belong to G5.</td></tr>
 </tbody></table></div>
 </section>
 
@@ -174,11 +183,17 @@ tbody tr:nth-child(even)>td,tbody tr:nth-child(even)>th{background:light-dark(#f
 <ul>
 <li>Real browsers: every browser-build result ran under Node.</li>
 <li>Linux and macOS desktops.</li>
-<li>Filters, in any proof.</li>
-<li>Rolling back and re-applying against applying straight through, and clients that loaded a checkpoint.</li>
-<li>Workbooks with expensive formulas. Larger workbooks were timed only for reference: 1,000,000 cells take about 1 s for 10 mixed changes on the desktop.</li>
+<li>Clients that loaded a checkpoint; G3 proves rollback/re-run against straight-through application only from its in-process shared state.</li>
+<li>Expensive-formula workbooks outside the G3 follow-up’s deliberately heavy 20,000-formula, one-80-cell-block workload.</li>
 <li>A 1-ULP difference at a rounding boundary changing a comparison or a displayed value.</li>
 <li>Why the browser build is faster than the desktop.</li>
+</ul>
+<h3>Open items after G3</h3>
+<ul>
+<li><strong>I7 · G5:</strong> identity tables grow and become expensive under fragmentation; index and share them, and cap distinct structural blocks.</li>
+<li><strong>I8 · G4:</strong> deletion ownership is not saved with checkpoint identities, so a checkpoint-loaded client cannot safely prove a structural Undo.</li>
+<li><strong>Maths library:</strong> the last-digit desktop/browser differences in section 04 remain open.</li>
+<li><strong>Pre-existing GridCraft gates:</strong> clippy at <code>apps/gridcraft-cli/src/check.rs:281</code>, <code>complex_numbers</code>, <code>caret_after_typing_arabic_is_drawn_at_its_left_end</code>, and the stale keytips table all fail at the fork’s G3 base as well as at its tip.</li>
 </ul>
 </section>
 
@@ -208,7 +223,11 @@ tbody tr:nth-child(even)>td,tbody tr:nth-child(even)>th{background:light-dark(#f
 <p class="small">Tests at the end of G1: engine 902 unit and 127 integration tests passing; xlsx 368; calculation 118; browser build 6. New test-only dependency: <code>wasm-bindgen-test</code> 0.3.79 (MIT or Apache-2.0), run with <code>wasm-bindgen-test-runner</code> 0.2.129 installed in its own folder on J:.</p>
 </section>
 
-<footer><p>ShareCraft · GridCraft co-authoring proofs (plan G1) · Version 0.1 · 16 November 2026</p></footer>
+<section id="changes02"><h2>Changes in version 0.2</h2>
+<p>Version 0.2 adds the reviewed G3 results from the GridCraft fork (19 November 2026). It marks the G3-owned conditions met with their tests, adds the heavier-formula workload and timings, and carries the checkpoint, fragmented-identity, maths-library and pre-existing gate findings forward. It does not change the G1 measurements or the original go-with-conditions recommendation.</p>
+</section>
+
+<footer><p>ShareCraft · GridCraft co-authoring proofs (plans G1 and G3) · Version 0.2 · 19 November 2026</p></footer>
 </main>
 </div>
 </body>
