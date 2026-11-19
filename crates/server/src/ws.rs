@@ -338,6 +338,9 @@ async fn live_session(s: &mut Session<'_>, first: &str) -> bool {
     else {
         return false;
     };
+    if crate::live_room::build_refused(&format, build) {
+        return write_removed(s, &LiveServerMsg::BuildRefused { build }).await;
+    }
     let conn = s.state.next_conn();
     let Some((room, out_rx)) = join_live_room(
         s.state,
@@ -400,8 +403,12 @@ async fn live_session(s: &mut Session<'_>, first: &str) -> bool {
                 }
                 // The upload itself says the bytes are ready.
                 Ok(LiveClientMsg::CheckpointReady { .. }) => None,
-                // Presence notes are dropped until the room relays them (G5 Task 4).
-                Ok(LiveClientMsg::Presence { .. }) => None,
+                // The room checks its size and rate; a dropped note keeps the connection.
+                Ok(LiveClientMsg::Presence { payload }) => Some(LiveCommand::Presence {
+                    conn,
+                    client,
+                    payload,
+                }),
                 Ok(LiveClientMsg::Resync) => Some(LiveCommand::Resync { conn, client }),
                 Ok(LiveClientMsg::Leave) => Some(LiveCommand::Leave { conn, client }),
                 Ok(LiveClientMsg::LiveJoin { .. }) | Err(_) => None,

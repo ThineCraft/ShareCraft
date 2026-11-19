@@ -20,7 +20,9 @@ use common::{
     spawn_server_config, wait_events,
 };
 use protocol::RemovedReason;
-use protocol::live::{EntryBody, LiveClientMsg, LiveServerMsg, LocalNo, Place, RefusedReason};
+use protocol::live::{
+    EntryBody, LiveClientMsg, LiveServerMsg, LocalNo, ParticipantNo, Place, RefusedReason,
+};
 use records::{Editor, LiveEntryRow};
 use reqwest::StatusCode;
 use tempfile::tempdir;
@@ -939,7 +941,7 @@ async fn second_participant_hash_verifies_the_checkpoint() {
     let mut ann_socket =
         join_capable_socket(&server, doc, &ann, protocol::live::LiveBuild::Browser).await;
     let mut bob_socket =
-        join_capable_socket(&server, doc, &bob, protocol::live::LiveBuild::Desktop).await;
+        join_capable_socket(&server, doc, &bob, protocol::live::LiveBuild::Browser).await;
     send_live(
         &mut ann_socket,
         &LiveClientMsg::Entry {
@@ -1003,4 +1005,441 @@ async fn second_participant_hash_verifies_the_checkpoint() {
         verified.session_data, b"ids",
         "the base carries its session data"
     );
+}
+
+// G5 Task 4: presence and room notices.
+
+/// Whether `c` was sent `who`'s presence note `note` (`None`: cleared).
+fn has_note(c: &LiveTestClient, who: ParticipantNo, note: Option<&str>) -> bool {
+    c.messages.iter().any(|message| {
+        matches!(
+            message,
+            LiveServerMsg::Presence { participant, payload }
+                if *participant == who && payload.as_deref() == note
+        )
+    })
+}
+
+/// The presence notes `c` was sent from `who`.
+fn notes_from(c: &LiveTestClient, who: ParticipantNo) -> Vec<Option<String>> {
+    c.messages
+        .iter()
+        .filter_map(|message| match message {
+            LiveServerMsg::Presence {
+                participant,
+                payload,
+            } if *participant == who => Some(payload.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn me(c: &LiveTestClient) -> ParticipantNo {
+    c.client().participant().unwrap()
+}
+
+fn raw_presence(payload: &str) -> String {
+    serde_json::to_string(&LiveClientMsg::Presence {
+        payload: payload.to_owned(),
+    })
+    .unwrap()
+}
+
+#[tokio::test]
+async fn presence_reaches_others_but_not_the_sender() {
+    let server = live_server().await;
+    let (doc, ann, bob) = shared_live(&server).await;
+    let cat = server.user("Cat").await;
+    share(&server, &ann, doc, &cat, "editor").await;
+    let mut a = LiveTestClient::connect(&server, doc, &ann, "a").await;
+    let mut b = LiveTestClient::connect(&server, doc, &bob, "b").await;
+    let mut c = LiveTestClient::connect(&server, doc, &cat, "c").await;
+    a.presence("A1").await;
+    let from_a = me(&a);
+    b.pump_until(|c| has_note(c, from_a, Some("A1"))).await;
+    c.pump_until(|c| has_note(c, from_a, Some("A1"))).await;
+    // The server handles a connection's frames in order: once b's later note reaches a, a's
+    // own note would have reached it first if it were sent back.
+    b.presence("B7").await;
+    let from_b = me(&b);
+    a.pump_until(|c| has_note(c, from_b, Some("B7"))).await;
+    assert!(notes_from(&a, from_a).is_empty(), "{:?}", a.messages);
+    assert!(notes_from(&b, from_b).is_empty());
+}
+
+#[tokio::test]
+async fn joiner_receives_current_presence_after_catchup() {
+    let server = live_server().await;
+    let (doc, ann, bob) = shared_live(&server).await;
+    let mut a = LiveTestClient::connect(&server, doc, &ann, "a").await;
+    let mut b = LiveTestClient::connect(&server, doc, &bob, "b").await;
+    a.presence("old").await;
+    a.presence("C3").await;
+    let from_a = me(&a);
+    b.pump_until(|c| has_note(c, from_a, Some("C3"))).await;
+    let mut late = LiveTestClient::connect(&server, doc, &bob, "late").await;
+    late.pump_until(|c| has_note(c, from_a, Some("C3"))).await;
+    let catchup = late
+        .messages
+        .iter()
+        .position(|message| matches!(message, LiveServerMsg::Catchup { .. }))
+        .unwrap();
+    let note = late
+        .messages
+        .iter()
+        .position(|message| matches!(message, LiveServerMsg::Presence { .. }))
+        .unwrap();
+    assert!(note > catchup, "{:?}", late.messages);
+    // Only the latest note is kept.
+    assert_eq!(notes_from(&late, from_a), vec![Some("C3".to_owned())]);
+}
+
+#[tokio::test]
+async fn presence_is_dropped_when_connection_closes() {
+    let server = live_server().await;
+    let (doc, ann, bob) = shared_live(&server).await;
+    let mut a = LiveTestClient::connect(&server, doc, &ann, "a").await;
+
+    // The connection closes.
+    let mut b = LiveTestClient::connect(&server, doc, &bob, "closed").await;
+    b.presence("here").await;
+    let who = me(&b);
+    a.pump_until(|c| has_note(c, who, Some("here"))).await;
+    b.disconnect();
+    a.pump_until(|c| has_note(c, who, None)).await;
+
+    // The person leaves.
+    let mut b = LiveTestClient::connect(&server, doc, &bob, "left").await;
+    b.presence("here").await;
+    let who = me(&b);
+    a.pump_until(|c| has_note(c, who, Some("here"))).await;
+    b.close().await;
+    a.pump_until(|c| has_note(c, who, None)).await;
+
+    // The place expires while the connection stays open but silent.
+    let mut b = LiveTestClient::connect(&server, doc, &bob, "silent").await;
+    b.presence("here").await;
+    let who = me(&b);
+    a.pump_until(|c| has_note(c, who, Some("here"))).await;
+    for _ in 0..30 {
+        a.tick_now().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    a.pump_until(|c| has_note(c, who, None)).await;
+
+    // Access is removed.
+    let mut b = LiveTestClient::connect(&server, doc, &bob, "revoked").await;
+    b.presence("here").await;
+    let who = me(&b);
+    a.pump_until(|c| has_note(c, who, Some("here"))).await;
+    revoke(&server, &ann, doc, &bob).await;
+    a.pump_until(|c| has_note(c, who, None)).await;
+}
+
+#[tokio::test]
+async fn viewer_presence_is_relayed() {
+    let server = live_server().await;
+    let doc = new_doc();
+    let ann = server.user("Ann").await;
+    let vic = server.user("Vic").await;
+    server.create_file_document(doc, &ann).await;
+    share(&server, &ann, doc, &vic, "viewer").await;
+    let mut a = LiveTestClient::connect(&server, doc, &ann, "a").await;
+    let mut v = LiveTestClient::connect(&server, doc, &vic, "v").await;
+    v.presence("D4").await;
+    let from_v = me(&v);
+    a.pump_until(|c| has_note(c, from_v, Some("D4"))).await;
+}
+
+#[tokio::test]
+async fn oversized_or_too_fast_presence_is_dropped() {
+    let server = live_server().await;
+    let (doc, ann, bob) = shared_live(&server).await;
+    let mut a = LiveTestClient::connect(&server, doc, &ann, "a").await;
+    let mut b = LiveTestClient::connect(&server, doc, &bob, "b").await;
+    let from_b = me(&b);
+    let big = "x".repeat(protocol::live::MAX_PRESENCE_BYTES + 1);
+    b.send_raw(&raw_presence(&big)).await;
+    b.send_raw(&raw_presence("small")).await;
+    a.pump_until(|c| has_note(c, from_b, Some("small"))).await;
+    assert_eq!(notes_from(&a, from_b), vec![Some("small".to_owned())]);
+
+    // A burst of 40 notes: at most the burst of 20 (and what refills meanwhile) gets through.
+    for n in 0..40 {
+        b.send_raw(&raw_presence(&format!("n{n}"))).await;
+    }
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    b.send_raw(&raw_presence("after")).await;
+    a.pump_until(|c| has_note(c, from_b, Some("after"))).await;
+    let burst = notes_from(&a, from_b)
+        .into_iter()
+        .filter(|note| note.as_deref().is_some_and(|note| note.starts_with('n')))
+        .count();
+    assert!(
+        (1..=22).contains(&burst),
+        "{burst} notes of the burst got through"
+    );
+    // The connection and the place carry on.
+    a.insert("still here").await;
+    b.pump_until(|c| c.lines() == ["still here"]).await;
+}
+
+#[tokio::test]
+async fn presence_counts_as_a_sign_of_life() {
+    let server = live_server().await;
+    let (doc, ann, bob) = shared_live(&server).await;
+    let mut a = LiveTestClient::connect(&server, doc, &ann, "a").await;
+    let mut b = LiveTestClient::connect(&server, doc, &bob, "b").await;
+    let from_b = me(&b);
+    // b sends nothing but presence notes, twice a second, for longer than three heartbeats.
+    for n in 0..10 {
+        b.send_raw(&raw_presence(&format!("p{n}"))).await;
+        a.tick_now().await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    a.pump_until(|c| has_note(c, from_b, Some("p9"))).await;
+    assert!(!has_note(&a, from_b, None), "b's place ended");
+    let loaded = server.records_db().load_live(doc).await.unwrap();
+    let place = loaded
+        .participants
+        .iter()
+        .find(|place| place.number == from_b.0)
+        .unwrap();
+    assert_eq!(place.gone, None, "{loaded:?}");
+}
+
+#[tokio::test]
+async fn presence_is_not_stored_or_logged() {
+    let server = live_server().await;
+    let (doc, ann, bob) = shared_live(&server).await;
+    let mut a = LiveTestClient::connect(&server, doc, &ann, "a").await;
+    let mut b = LiveTestClient::connect(&server, doc, &bob, "b").await;
+    let sentinel = "presence-sentinel-9";
+    a.presence(sentinel).await;
+    let from_a = me(&a);
+    b.pump_until(|c| has_note(c, from_a, Some(sentinel))).await;
+    a.disconnect();
+    b.pump_until(|c| has_note(c, from_a, None)).await;
+    let loaded = server.records_db().load_live(doc).await.unwrap();
+    assert!(loaded.entries.is_empty(), "{loaded:?}");
+    assert_eq!(loaded.head, Seq(0));
+    let events = wait_events(&server.db.db, doc, |events| {
+        events.iter().any(|event| event.kind == "editing.left")
+    })
+    .await;
+    for event in &events {
+        assert!(!event.kind.contains("presence"), "{}", event.kind);
+        assert!(!event.detail.to_string().contains(sentinel), "{event:?}");
+    }
+}
+
+#[tokio::test]
+async fn people_list_marks_dropped_connections() {
+    let server = live_server().await;
+    let (doc, ann, bob) = shared_live(&server).await;
+    let mut a = LiveTestClient::connect(&server, doc, &ann, "a").await;
+    let mut b = LiveTestClient::connect(&server, doc, &bob, "b").await;
+    let from_b = me(&b);
+    let shown = |c: &LiveTestClient, connected: bool| {
+        c.messages.iter().any(|message| {
+            matches!(message, LiveServerMsg::People { people } if people.iter().any(|person| {
+                person.participant == from_b && person.connected == connected
+            }))
+        })
+    };
+    a.pump_until(|c| shown(c, true)).await;
+    b.disconnect();
+    a.pump_until(|c| shown(c, false)).await;
+    b.reconnect(&server).await;
+    a.messages.clear();
+    a.pump_until(|c| shown(c, true)).await;
+}
+
+#[tokio::test]
+async fn returning_notice_reaches_the_others() {
+    let server = live_server().await;
+    let (doc, ann, bob) = shared_live(&server).await;
+    let mut a = LiveTestClient::connect(&server, doc, &ann, "a").await;
+    let mut b = LiveTestClient::connect(&server, doc, &bob, "b").await;
+    let before = me(&b);
+    b.disconnect();
+    // b's connection is shown as dropped; every People list after that one is newer.
+    a.pump_until(|c| {
+        c.messages.iter().any(|message| {
+            matches!(message, LiveServerMsg::People { people }
+                if people.iter().any(|person| person.participant == before && !person.connected))
+        })
+    })
+    .await;
+    a.messages.clear();
+    // b's place expires while a stays.
+    a.pump_until(|c| {
+        c.messages.iter().any(|message| {
+            matches!(message, LiveServerMsg::People { people }
+                if people.iter().all(|person| person.participant != before))
+        })
+    })
+    .await;
+    b.reconnect(&server).await;
+    b.pump_until(|c| c.client().phase() == Phase::Live).await;
+    assert!(
+        matches!(b.last_place(), Some(Place::Returning { .. })),
+        "{:?}",
+        b.messages
+    );
+    let now = me(&b);
+    a.pump_until(|c| {
+        c.messages.iter().any(|message| {
+            matches!(message, LiveServerMsg::Returning { participant } if *participant == now)
+        })
+    })
+    .await;
+    assert!(
+        !b.messages
+            .iter()
+            .any(|message| matches!(message, LiveServerMsg::Returning { .. }))
+    );
+}
+
+#[tokio::test]
+async fn saved_notice_follows_a_stored_checkpoint() {
+    use sha2::Digest;
+    let server = spawn_server_config(|config| {
+        live_config(config);
+        config.live_checkpoint_quiet = Duration::from_millis(50);
+    })
+    .await;
+    let (doc, ann, bob) = shared_live(&server).await;
+    let mut ann_socket =
+        join_capable_socket(&server, doc, &ann, protocol::live::LiveBuild::Browser).await;
+    let mut bob_socket =
+        join_capable_socket(&server, doc, &bob, protocol::live::LiveBuild::Browser).await;
+    send_live(
+        &mut ann_socket,
+        &LiveClientMsg::Entry {
+            local: LocalNo(1),
+            seen: Seq(0),
+            format: FORMAT.to_owned(),
+            payload: "one".to_owned(),
+        },
+    )
+    .await;
+    let (ticket, at) = next_live(&mut ann_socket, |message| match message {
+        LiveServerMsg::CheckpointTicket { ticket, at, .. } => Some((ticket, at)),
+        _ => None,
+    })
+    .await;
+    let file = b"checkpoint workbook bytes".to_vec();
+    let response = server
+        .http(Some(&ann))
+        .put(server.url(&format!("/api/docs/{}/live-checkpoint", doc.0)))
+        .query(&[("ticket", ticket.to_string()), ("at", at.0.to_string())])
+        .header("x-sharecraft-session-data-length", 3)
+        .body([b"ids".as_slice(), &file].concat())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let revision = response.json::<serde_json::Value>().await.unwrap()["revision"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let stored = LiveServerMsg::Saved {
+        revision: revision.clone(),
+        through: at,
+        verified: false,
+        major: false,
+    };
+    for socket in [&mut ann_socket, &mut bob_socket] {
+        let saved = next_live(socket, |message| {
+            matches!(message, LiveServerMsg::Saved { .. }).then_some(message)
+        })
+        .await;
+        assert_eq!(saved, stored);
+    }
+
+    let verify = next_live(&mut bob_socket, |message| match message {
+        LiveServerMsg::CheckpointTicket { ticket, .. } => Some(ticket),
+        _ => None,
+    })
+    .await;
+    let digest = sha2::Sha256::digest(&file)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let hashed = server
+        .http(Some(&bob))
+        .post(server.url(&format!("/api/docs/{}/live-checkpoint/hash", doc.0)))
+        .json(&serde_json::json!({ "ticket": verify, "at": at.0, "sha256": digest }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(hashed.status(), StatusCode::ACCEPTED);
+    let verified = LiveServerMsg::Saved {
+        revision,
+        through: at,
+        verified: true,
+        major: false,
+    };
+    for socket in [&mut ann_socket, &mut bob_socket] {
+        let saved = next_live(socket, |message| {
+            matches!(message, LiveServerMsg::Saved { verified: true, .. }).then_some(message)
+        })
+        .await;
+        assert_eq!(saved, verified);
+    }
+}
+
+#[tokio::test]
+async fn desktop_build_is_refused_for_gridcraft_rooms() {
+    let server = live_server().await;
+    let (doc, ann, bob) = shared_live(&server).await;
+    assert!(FORMAT.starts_with("gridcraft/"));
+    let mut socket = common::open_socket(server.addr, doc, &bob).await;
+    send_live(
+        &mut socket,
+        &LiveClientMsg::LiveJoin {
+            client: collab_core::ids::ClientId(uuid::Uuid::new_v4()),
+            protocol: protocol::live::LIVE_PROTOCOL,
+            format: FORMAT.to_owned(),
+            resume: None,
+            seen: None,
+            can_checkpoint: true,
+            build: protocol::live::LiveBuild::Desktop,
+            returning_through: None,
+        },
+    )
+    .await;
+    let first = next_live(&mut socket, Some).await;
+    assert_eq!(
+        first,
+        LiveServerMsg::BuildRefused {
+            build: protocol::live::LiveBuild::Desktop
+        }
+    );
+    {
+        use futures_util::StreamExt;
+        let closed = tokio::time::timeout(common::TIMEOUT, async {
+            loop {
+                match socket.next().await {
+                    Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
+                        panic!("frame after the refusal: {text}")
+                    }
+                    Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_)) | Err(_)) | None => {
+                        break;
+                    }
+                    Some(Ok(_)) => {}
+                }
+            }
+        })
+        .await;
+        assert!(closed.is_ok(), "the refused connection stayed open");
+    }
+    // No place was given.
+    let loaded = server.records_db().load_live(doc).await.unwrap();
+    assert!(loaded.participants.is_empty(), "{loaded:?}");
+    // A browser build joins as usual.
+    let mut a = LiveTestClient::connect(&server, doc, &ann, "a").await;
+    a.insert("browser").await;
+    a.pump_until(|c| c.client().pending() == 0).await;
 }

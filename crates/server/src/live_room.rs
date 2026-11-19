@@ -33,6 +33,10 @@ use crate::room::{
 };
 use records::LiveCheckpointWriter;
 
+mod notices;
+
+pub(crate) use notices::build_refused;
+
 #[derive(Clone, Copy)]
 pub(crate) struct LiveTiming {
     pub heartbeat: Duration,
@@ -240,6 +244,12 @@ pub(crate) enum LiveCommand {
     },
     /// A checkpoint write, run off the room task, has finished.
     CheckpointWritten(Box<WriteDone>),
+    /// A presence note, relayed in memory only (see `notices`).
+    Presence {
+        conn: ConnId,
+        client: ClientId,
+        payload: String,
+    },
 }
 
 /// The live room's answer to a checkpoint upload or hash.
@@ -469,6 +479,8 @@ pub(crate) struct LiveRoom<S: LiveStore> {
     clients: HashMap<ClientId, (UserId, u64)>,
     rates: HashMap<ClientId, RateBucket>,
     pending_ends: Vec<(LiveSessionId, ParticipantNo, GoneReason)>,
+    /// The latest presence note of each place; memory only.
+    presence: crate::live_presence::PresenceBook,
 }
 
 impl<S: LiveStore> LiveRoom<S> {
@@ -661,6 +673,7 @@ impl<S: LiveStore> LiveRoom<S> {
             clients,
             rates: HashMap::new(),
             pending_ends: Vec::new(),
+            presence: crate::live_presence::PresenceBook::default(),
         })
     }
 
@@ -837,6 +850,15 @@ impl<S: LiveStore> LiveRoom<S> {
             },
             LiveCommand::CheckpointWritten(done) => {
                 self.checkpoint_written(*done);
+                Ok(())
+            }
+            LiveCommand::Presence {
+                conn,
+                client,
+                payload,
+            } => {
+                self.note_life(conn, client);
+                self.relay_presence(conn, client, payload);
                 Ok(())
             }
         }
@@ -1459,13 +1481,14 @@ impl<S: LiveStore> LiveRoom<S> {
             .and_then(|session| session.places.get(&participant))
             .map(|place| place.build);
         self.checkpoint_writers.insert(
-            revision,
+            revision.clone(),
             CheckpointWriter {
                 participant,
                 client,
                 build,
             },
         );
+        self.notify_saved(revision, at, false, false);
     }
 
     /// Compares a verify ticket's independently written hash with the stored checkpoint. A
@@ -1546,6 +1569,10 @@ impl<S: LiveStore> LiveRoom<S> {
     /// The room's base is now the verified checkpoint `revision` at `at`: earlier unverified
     /// checkpoints, entries and agreement positions are no longer needed in memory.
     fn checkpoint_verified(&mut self, revision: String, at: Seq, user: UserId) {
+        let major = self
+            .unverified_checkpoints
+            .iter()
+            .any(|checkpoint| checkpoint.revision == revision && checkpoint.major_reason.is_some());
         self.verified_through = at;
         self.base_revision = Some(revision.clone());
         // The verified base's identity data is in the store; this room does not read it.
@@ -1583,6 +1610,7 @@ impl<S: LiveStore> LiveRoom<S> {
             node: Some(self.doc.into()),
             detail: serde_json::json!({ "revision": revision, "through": at.0 }),
         });
+        self.notify_saved(revision, at, true, major);
     }
 
     /// Records an editing participant's entered digest at an agreement position. The position
@@ -2125,6 +2153,7 @@ impl<S: LiveStore> LiveRoom<S> {
         let _ = self
             .members
             .send(Some(request.client), &Outbound::Many(frames));
+        self.after_join(request.client, participant, place);
         self.broadcast_people();
         let stated = self
             .session
@@ -2750,6 +2779,7 @@ impl<S: LiveStore> LiveRoom<S> {
             people: self.people(),
         });
         let _ = self.members.send(None, &Outbound::One(frame));
+        self.drop_absent_presence();
     }
 
     fn prepare_access(&mut self, change: &AccessChange) {
@@ -3088,7 +3118,8 @@ mod tests {
     use crate::members::{AccessRules, builtin_access};
     use crate::room::{JoinReply, Outbound};
 
-    const FORMAT: &str = "gridcraft/1";
+    // Not a `gridcraft/` format: desktop builds, which several tests use, are refused there.
+    const FORMAT: &str = "stand-in/1";
 
     struct Joined {
         conn: u64,
@@ -4769,6 +4800,7 @@ mod tests {
         );
 
         // The room's base moved: a resync starts from the verified checkpoint.
+        let _ = drain(&mut bob.rx);
         room.handle(LiveCommand::Resync {
             conn: bob.conn,
             client: bob.client,
