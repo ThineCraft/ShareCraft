@@ -26,8 +26,8 @@ use axum::http::header::{
 };
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use collab_core::ids::{DocId, NodeId};
-use futures_util::Stream;
+use collab_core::ids::{DocId, NodeId, Seq};
+use futures_util::{Stream, StreamExt};
 use records::{AccessError, Editor, NameConflict, Origin, QuotaError, Reservation, User};
 use revisions::{
     Author, BlobRef, Checkpoint, CheckpointError, Content, Outcome, RevisionId, Stored,
@@ -35,15 +35,17 @@ use revisions::{
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tokio::io::AsyncReadExt;
+use tokio::sync::oneshot;
 use uuid::Uuid;
 
 use super::uploads::{
     Named, add_renamed, clean_upload_name, conflict_choice, settle_name, store_version,
 };
-use super::{ApiError, parse_id, to_completion};
+use super::{ApiError, JsonBody, parse_id, to_completion};
 use crate::blobs::{BodyError, Held, release, write_claimed};
 use crate::checkpoint::Checkpointer;
 use crate::file_room::SaveReply;
+use crate::live_room::{LiveCheckpointReply, LiveCommand, MAX_SESSION_DATA_BYTES};
 use crate::previews::{self, PreviewKind, PreviewType, ThumbError};
 use crate::projection::record_first;
 use crate::room::credited_name;
@@ -71,6 +73,27 @@ pub(crate) struct DownloadQuery {
 pub(crate) struct SaveQuery {
     base: Option<String>,
 }
+
+/// Query of `PUT /api/docs/{id}/live-checkpoint`.
+#[derive(Deserialize)]
+pub(crate) struct LiveCheckpointQuery {
+    ticket: Uuid,
+    at: u64,
+    base: Option<String>,
+}
+
+/// Body of `POST /api/docs/{id}/live-checkpoint/hash`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LiveHashBody {
+    ticket: Uuid,
+    at: u64,
+    /// 64 lowercase hexadecimal digits.
+    sha256: String,
+}
+
+/// The request header giving how many leading body bytes are the editor's session data.
+const SESSION_DATA_HEADER: &str = "x-sharecraft-session-data-length";
 
 /// Query of `POST /api/docs/upload`.
 #[derive(Deserialize)]
@@ -760,6 +783,211 @@ pub(crate) async fn save(
         .await?
     };
     Ok(save_answer(reply))
+}
+
+/// `PUT /api/docs/{id}/live-checkpoint?ticket=&at=[&base=]`: a live participant's checkpoint
+/// for the write ticket the live room gave it. The caller must be able to edit the document,
+/// and the ticket must be theirs, unused and unexpired, for exactly this position and base;
+/// otherwise `403` (`404` without access) before any of the body is read. The body is the
+/// editor's opaque session data (`x-sharecraft-session-data-length` bytes, at most 8 MiB,
+/// none without the header) followed by the file bytes, which stream into the content store
+/// as a save's do, reserved against the site's quota. Answers `{revision}` once Git and the
+/// database hold the checkpoint (current, not yet verified); `409 {current}` when the
+/// document has a revision it was not based on; `503` when it could not be stored.
+pub(crate) async fn live_checkpoint(
+    State(state): State<AppState>,
+    signed: Signed,
+    Path(id): Path<String>,
+    query: Result<Query<LiveCheckpointQuery>, QueryRejection>,
+    headers: HeaderMap,
+    request: Request,
+) -> Result<Response, ApiError> {
+    let doc = DocId(parse_id(&id)?);
+    let user = signed.session.user.id;
+    let access = state
+        .db()
+        .doc_access(user, doc)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?
+        .ok_or(ApiError::NotFound)?;
+    if !access.can_edit() {
+        return Err(access.refusal().into());
+    }
+    let query = query_of(query)?;
+    let base = match query.base {
+        Some(text) => Some(RevisionId::from_str(&text).map_err(|_| ApiError::BadRequest)?),
+        None => None,
+    };
+    let at = Seq(query.at);
+    let link = state.rooms().live_link(doc).ok_or(ApiError::Forbidden)?;
+    let (reply, answer) = oneshot::channel();
+    let claim = LiveCommand::CheckpointClaim {
+        user,
+        ticket: query.ticket,
+        at,
+        base: base.clone(),
+        reply,
+    };
+    if link.commands.send(claim).await.is_err() || !answer.await.unwrap_or(false) {
+        return Err(ApiError::Forbidden);
+    }
+    let session_length = match headers.get(SESSION_DATA_HEADER) {
+        None => 0,
+        Some(value) => value
+            .to_str()
+            .ok()
+            .and_then(|text| text.trim().parse::<usize>().ok())
+            .ok_or(ApiError::BadRequest)?,
+    };
+    if session_length > MAX_SESSION_DATA_BYTES {
+        return Err(ApiError::TooLarge);
+    }
+    let declared = headers
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok());
+    let session_bytes = u64::try_from(session_length).map_err(|_| ApiError::TooLarge)?;
+    if declared.is_some_and(|length| {
+        length < session_bytes
+            || length.saturating_sub(session_bytes) > state.config().max_file_bytes
+    }) {
+        return Err(ApiError::TooLarge);
+    }
+    let site = site_of(&state, doc.into()).await?;
+    room_for_body(&state, site, &headers).await?;
+    let (session_data, rest) = read_prefix(request.into_body(), session_length).await?;
+    let held = body_blob(&state, Request::new(rest)).await?;
+    let (held, reservation) = reserve_held(&state, site, held).await?;
+
+    let reply = {
+        let state = state.clone();
+        to_completion(async move {
+            let reservation = match follow_node(&state, reservation, doc.into()).await {
+                Ok(reservation) => reservation,
+                Err(e) => {
+                    discard(&state, held).await;
+                    return Err(e);
+                }
+            };
+            let (reply, answer) = oneshot::channel();
+            let upload = LiveCommand::CheckpointUpload {
+                user,
+                ticket: query.ticket,
+                at,
+                base,
+                blob: held.blob(),
+                session_data,
+                reply,
+            };
+            let reply = if link.commands.send(upload).await.is_ok() {
+                answer.await.unwrap_or(LiveCheckpointReply::Failed)
+            } else {
+                LiveCheckpointReply::Failed
+            };
+            if !matches!(reply, LiveCheckpointReply::Saved { .. }) {
+                discard(&state, held).await;
+            }
+            release(state.db(), reservation).await;
+            Ok(reply)
+        })
+        .await?
+    };
+    Ok(live_answer(reply))
+}
+
+/// `POST /api/docs/{id}/live-checkpoint/hash` with `{ticket, at, sha256}`: the SHA-256 of the
+/// bytes a verifying participant wrote independently for its verify ticket. Refused like an
+/// upload (`403`, `404`) unless the ticket is the caller's, unused and unexpired for exactly
+/// this position; `202` once the room has it.
+pub(crate) async fn live_checkpoint_hash(
+    State(state): State<AppState>,
+    signed: Signed,
+    Path(id): Path<String>,
+    JsonBody(body): JsonBody<LiveHashBody>,
+) -> Result<Response, ApiError> {
+    let doc = DocId(parse_id(&id)?);
+    let user = signed.session.user.id;
+    let access = state
+        .db()
+        .doc_access(user, doc)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?
+        .ok_or(ApiError::NotFound)?;
+    if !access.can_edit() {
+        return Err(access.refusal().into());
+    }
+    let sha256 = parse_sha256(&body.sha256).ok_or(ApiError::BadRequest)?;
+    let link = state.rooms().live_link(doc).ok_or(ApiError::Forbidden)?;
+    let (reply, answer) = oneshot::channel();
+    let hash = LiveCommand::CheckpointHash {
+        user,
+        ticket: body.ticket,
+        at: Seq(body.at),
+        sha256,
+        reply,
+    };
+    if link.commands.send(hash).await.is_err() {
+        return Err(ApiError::Forbidden);
+    }
+    Ok(live_answer(
+        answer.await.unwrap_or(LiveCheckpointReply::Refused),
+    ))
+}
+
+/// 64 lowercase hexadecimal digits as 32 bytes.
+fn parse_sha256(text: &str) -> Option<[u8; 32]> {
+    let digits = text.as_bytes();
+    if digits.len() != 64 {
+        return None;
+    }
+    let value = |digit: u8| match digit {
+        b'0'..=b'9' => Some(digit - b'0'),
+        b'a'..=b'f' => Some(digit - b'a' + 10),
+        _ => None,
+    };
+    let mut bytes = [0; 32];
+    for (byte, [high, low]) in bytes.iter_mut().zip(digits.as_chunks::<2>().0) {
+        *byte = (value(*high)? << 4) | value(*low)?;
+    }
+    Some(bytes)
+}
+
+/// Splits the first `length` bytes off `body`, reading no further; `400` when it ends first.
+async fn read_prefix(body: Body, length: usize) -> Result<(Vec<u8>, Body), ApiError> {
+    let mut stream = body.into_data_stream();
+    let mut prefix = Vec::with_capacity(length.min(DOWNLOAD_CHUNK));
+    let mut rest = None;
+    while prefix.len() < length {
+        let mut chunk = match stream.next().await {
+            Some(Ok(chunk)) => chunk,
+            Some(Err(_)) | None => return Err(ApiError::BadRequest),
+        };
+        let wanted = length.saturating_sub(prefix.len());
+        if chunk.len() > wanted {
+            let head = chunk.split_to(wanted);
+            prefix.extend_from_slice(&head);
+            rest = Some(chunk);
+        } else {
+            prefix.extend_from_slice(&chunk);
+        }
+    }
+    let first = futures_util::stream::iter(rest.map(Ok::<Bytes, axum::Error>));
+    Ok((prefix, Body::from_stream(first.chain(stream))))
+}
+
+/// The HTTP answer to the live room's checkpoint reply.
+fn live_answer(reply: LiveCheckpointReply) -> Response {
+    match reply {
+        LiveCheckpointReply::Saved { revision } => {
+            Json(json!({ "revision": revision })).into_response()
+        }
+        LiveCheckpointReply::Accepted => StatusCode::ACCEPTED.into_response(),
+        LiveCheckpointReply::Refused => ApiError::Forbidden.into_response(),
+        LiveCheckpointReply::Stale { current } => {
+            (StatusCode::CONFLICT, Json(json!({ "current": current }))).into_response()
+        }
+        LiveCheckpointReply::Failed => ApiError::Unavailable.into_response(),
+    }
 }
 
 /// The answer to a save (or an uploaded new version) the file session answered with `reply`.

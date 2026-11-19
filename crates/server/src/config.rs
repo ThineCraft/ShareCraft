@@ -50,6 +50,12 @@ pub struct Config {
     pub live_editors: Vec<Editor>,
     /// How often a live client sends a heartbeat. Its place expires after three periods.
     pub live_heartbeat: Duration,
+    /// A live checkpoint is asked for once the log has been quiet this long after a change.
+    pub live_checkpoint_quiet: Duration,
+    /// ... or once the first unsaved live change is this old, whichever comes first.
+    pub live_checkpoint_wait: Duration,
+    /// How long a live checkpoint ticket can be used.
+    pub live_ticket_lifetime: Duration,
     /// The PostgreSQL database holding accounts, sessions and access grants.
     pub database_url: DatabaseUrl,
     /// Where the built editors are installed, one folder per editor, served at `/editors`.
@@ -263,6 +269,9 @@ impl Config {
             write_timeout: Duration::from_secs(10),
             live_editors: Vec::new(),
             live_heartbeat: Duration::from_secs(60),
+            live_checkpoint_quiet: crate::live_room::CHECKPOINT_QUIET,
+            live_checkpoint_wait: crate::live_room::CHECKPOINT_WAIT,
+            live_ticket_lifetime: crate::live_room::TICKET_LIFETIME,
             database_url,
             editors_dir: PathBuf::from(editors_dir.unwrap_or(DEFAULT_EDITORS)),
             max_file_bytes,
@@ -372,6 +381,9 @@ mod tests {
         assert_eq!(c.write_timeout, Duration::from_secs(10));
         assert!(c.live_editors.is_empty());
         assert_eq!(c.live_heartbeat, Duration::from_secs(60));
+        assert_eq!(c.live_checkpoint_quiet, Duration::from_secs(15));
+        assert_eq!(c.live_checkpoint_wait, Duration::from_secs(120));
+        assert_eq!(c.live_ticket_lifetime, Duration::from_secs(120));
         assert_eq!(c.editors_dir, PathBuf::from("./editors"));
         assert_eq!(c.max_file_bytes, 10 * 1024 * 1024 * 1024);
         assert_eq!(c.github_api, "https://api.github.com");

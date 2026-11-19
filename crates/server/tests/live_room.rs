@@ -766,3 +766,135 @@ async fn events_are_recorded() {
         }
     }
 }
+
+/// Reads live frames from `socket` until `found` picks one.
+async fn next_live<T>(
+    socket: &mut common::Socket,
+    found: impl Fn(LiveServerMsg) -> Option<T>,
+) -> T {
+    use futures_util::StreamExt;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match socket.next().await {
+                Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
+                    if let Some(value) = found(serde_json::from_str(&text).unwrap()) {
+                        return value;
+                    }
+                }
+                Some(Ok(_)) => {}
+                other => panic!("socket ended: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("live frame timed out")
+}
+
+async fn send_live(socket: &mut common::Socket, message: &LiveClientMsg) {
+    use futures_util::SinkExt;
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::text(
+            serde_json::to_string(message).unwrap(),
+        ))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn participant_checkpoint_upload_becomes_the_current_revision() {
+    let server = spawn_server_config(|config| {
+        live_config(config);
+        config.live_checkpoint_quiet = Duration::from_millis(50);
+    })
+    .await;
+    let (doc, ann, _bob) = shared_live(&server).await;
+    let mut socket = common::open_socket(server.addr, doc, &ann).await;
+    send_live(
+        &mut socket,
+        &LiveClientMsg::LiveJoin {
+            client: collab_core::ids::ClientId(uuid::Uuid::new_v4()),
+            protocol: protocol::live::LIVE_PROTOCOL,
+            format: FORMAT.to_owned(),
+            resume: None,
+            seen: None,
+            can_checkpoint: true,
+            build: protocol::live::LiveBuild::Browser,
+            returning_through: None,
+        },
+    )
+    .await;
+    next_live(&mut socket, |message| {
+        matches!(message, LiveServerMsg::LiveJoined { .. }).then_some(())
+    })
+    .await;
+    send_live(
+        &mut socket,
+        &LiveClientMsg::Entry {
+            local: LocalNo(1),
+            seen: Seq(0),
+            format: FORMAT.to_owned(),
+            payload: "one".to_owned(),
+        },
+    )
+    .await;
+    let (ticket, at, base) = next_live(&mut socket, |message| match message {
+        LiveServerMsg::CheckpointTicket {
+            ticket, at, base, ..
+        } => Some((ticket, at, base)),
+        _ => None,
+    })
+    .await;
+    assert_eq!(at, Seq(1));
+    let session_data = b"stand-in identities".to_vec();
+    let file = b"checkpoint workbook bytes".to_vec();
+    let mut body = session_data.clone();
+    body.extend_from_slice(&file);
+    let mut query = vec![("ticket", ticket.to_string()), ("at", at.0.to_string())];
+    if let Some(base) = &base {
+        query.push(("base", base.clone()));
+    }
+
+    let response = server
+        .http(Some(&ann))
+        .put(server.url(&format!("/api/docs/{}/live-checkpoint", doc.0)))
+        .query(&query)
+        .header("x-sharecraft-session-data-length", session_data.len())
+        .body(body.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let revision = response.json::<serde_json::Value>().await.unwrap()["revision"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let downloaded = server
+        .http(Some(&ann))
+        .get(server.url(&format!("/api/docs/{}/content", doc.0)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(downloaded.status(), StatusCode::OK);
+    assert_eq!(downloaded.bytes().await.unwrap().as_ref(), file.as_slice());
+    let loaded = server.db.db.load_live(doc).await.unwrap();
+    assert_eq!(loaded.verified_through, Seq(0));
+    assert_eq!(loaded.unverified_checkpoints.len(), 1);
+    assert_eq!(loaded.unverified_checkpoints[0].revision, revision);
+    assert_eq!(loaded.unverified_checkpoints[0].session_data, session_data);
+
+    let reused = server
+        .http(Some(&ann))
+        .put(server.url(&format!("/api/docs/{}/live-checkpoint", doc.0)))
+        .query(&query)
+        .header("x-sharecraft-session-data-length", session_data.len())
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        reused.status(),
+        StatusCode::FORBIDDEN,
+        "a ticket is one-use"
+    );
+}

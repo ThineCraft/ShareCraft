@@ -1,21 +1,88 @@
 //! Persistence boundary for the live room.
 
 use std::future::Future;
+use std::str::FromStr;
+use std::sync::Arc;
 
 use collab_core::ids::{ClientId, DocId, Seq, UserId};
 use records::{
     Db, DbError, GoneReason, LiveLoaded, LiveLocal, LiveReturnTombstoneRow, NewLiveCancel,
-    NewLiveChange, NewLiveCheckpoint,
+    NewLiveChange, NewLiveCheckpoint, Origin,
 };
-use revisions::RevisionInfo;
+use revisions::{Author, BlobRef, Checkpoint, Outcome, RevisionId, RevisionInfo};
 use serde_json::{Map, Value};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use crate::blobs::{Blobs, write_claimed};
+use crate::checkpoint::{Checkpointer, WriteError};
+
+/// A participant-written checkpoint to commit and record at one live position.
+pub(crate) struct LiveWrite<'a> {
+    /// The revision it was written on top of.
+    pub base: Option<&'a str>,
+    /// The file bytes, already in the content store.
+    pub blob: BlobRef,
+    /// Everyone credited, the first as the commit author.
+    pub authors: &'a [Author],
+    pub at: Seq,
+    pub session: Uuid,
+    pub session_data: &'a [u8],
+    pub created_at: OffsetDateTime,
+}
+
+/// Why a participant-written checkpoint was not stored.
+#[derive(Debug)]
+pub(crate) enum LiveWriteError {
+    /// The document has a revision the checkpoint was not based on.
+    Stale { current: Option<String> },
+    /// Nothing was committed.
+    Failed(String),
+    /// Git committed `revision`, but its checkpoint record is not known to be stored.
+    Unrecorded {
+        revision: String,
+        fields: Map<String, Value>,
+        described: Option<Box<RevisionInfo>>,
+        error: String,
+    },
+}
+
+/// The fields a live checkpoint revision stores: the base revision's fields, without an
+/// earlier checkpoint's live facts, plus its own.
+pub(crate) fn live_fields(base: &Map<String, Value>, at: Seq) -> Map<String, Value> {
+    let mut fields = base.clone();
+    for key in [
+        "verified",
+        "live_through",
+        "major",
+        "major_reason",
+        "major_person",
+    ] {
+        fields.remove(key);
+    }
+    fields.insert("verified".to_owned(), Value::Bool(false));
+    fields.insert("live_through".to_owned(), Value::from(at.0));
+    fields
+}
+
 pub(crate) trait LiveStore: Send + Sync + 'static {
     fn load_live(&self, doc: DocId) -> impl Future<Output = Result<LiveLoaded, DbError>> + Send;
 
-    #[allow(dead_code)] // Task 8 consumes the checkpoint write boundary.
+    /// The document's current revision as recorded, for a log with no live checkpoint yet.
+    fn current_revision(
+        &self,
+        doc: DocId,
+    ) -> impl Future<Output = Result<Option<String>, DbError>> + Send;
+
+    /// Commits `write` on top of its base and records it, unverified, at its position: the
+    /// revision index row and the checkpoint metadata together.
+    fn write_live_checkpoint(
+        &self,
+        doc: DocId,
+        write: &LiveWrite<'_>,
+    ) -> impl Future<Output = Result<String, LiveWriteError>> + Send;
+
+    #[allow(dead_code)] // Records an existing revision; participant writes use the write above.
     fn record_live_checkpoint(
         &self,
         doc: DocId,
@@ -141,6 +208,23 @@ impl LiveStore for Db {
         Db::load_live(self, doc).await
     }
 
+    async fn current_revision(&self, doc: DocId) -> Result<Option<String>, DbError> {
+        Ok(self
+            .document(doc)
+            .await?
+            .and_then(|document| document.revision))
+    }
+
+    async fn write_live_checkpoint(
+        &self,
+        _doc: DocId,
+        _write: &LiveWrite<'_>,
+    ) -> Result<String, LiveWriteError> {
+        Err(LiveWriteError::Failed(
+            "the database alone cannot commit checkpoint bytes".to_owned(),
+        ))
+    }
+
     async fn record_live_checkpoint(
         &self,
         doc: DocId,
@@ -255,6 +339,263 @@ impl LiveStore for Db {
     }
 }
 
+/// The production live store: the database, plus the library and content store that a
+/// participant-written checkpoint is committed to.
+#[derive(Clone)]
+pub(crate) struct LiveDb {
+    pub db: Db,
+    pub store: Arc<dyn Checkpointer>,
+    pub blobs: Arc<Blobs>,
+}
+
+impl LiveDb {
+    /// Runs `read` on the library without blocking the async workers.
+    async fn blocking<T: Send + 'static>(
+        &self,
+        read: impl FnOnce(&dyn Checkpointer) -> Result<T, String> + Send + 'static,
+    ) -> Result<T, String> {
+        let store = Arc::clone(&self.store);
+        tokio::task::spawn_blocking(move || read(&*store))
+            .await
+            .map_err(|error| format!("reading the library failed: {error}"))?
+    }
+}
+
+impl LiveStore for LiveDb {
+    async fn load_live(&self, doc: DocId) -> Result<LiveLoaded, DbError> {
+        self.db.load_live(doc).await
+    }
+
+    async fn current_revision(&self, doc: DocId) -> Result<Option<String>, DbError> {
+        LiveStore::current_revision(&self.db, doc).await
+    }
+
+    async fn write_live_checkpoint(
+        &self,
+        doc: DocId,
+        write: &LiveWrite<'_>,
+    ) -> Result<String, LiveWriteError> {
+        let failed = |error: String| LiveWriteError::Failed(error);
+        let name = self
+            .db
+            .document(doc)
+            .await
+            .map_err(|error| failed(error.to_string()))?
+            .ok_or_else(|| failed(format!("document {} has no record", doc.0)))?
+            .name;
+        let base = write
+            .base
+            .map(RevisionId::from_str)
+            .transpose()
+            .map_err(|error| failed(error.to_string()))?;
+        let base_fields = match base.clone() {
+            Some(base) => self
+                .blocking(move |store| {
+                    store
+                        .describe(doc, &base)
+                        .map_err(|error| error.to_string())
+                })
+                .await
+                .map_err(failed)?
+                .map(|info| info.fields)
+                .unwrap_or_default(),
+            None => Map::new(),
+        };
+        let fields = live_fields(&base_fields, write.at);
+        let blob = write.blob;
+        let authors = write.authors.to_vec();
+        let commit_fields = fields.clone();
+        let commit_base = base.clone();
+        let outcome = write_claimed(
+            &self.blobs,
+            Some(&self.db),
+            Arc::clone(&self.store),
+            doc,
+            blob,
+            Origin::EditorSave,
+            move |store| {
+                store.write(&Checkpoint {
+                    doc,
+                    file_name: &name,
+                    blob,
+                    base: commit_base.as_ref(),
+                    authors: &authors,
+                    fields: &commit_fields,
+                })
+            },
+        )
+        .await;
+        let revision = match outcome {
+            Ok(Outcome::Written(revision) | Outcome::Unchanged(revision)) => revision,
+            Err(WriteError::Stale { current }) => {
+                return Err(LiveWriteError::Stale {
+                    current: current.map(|current| current.to_string()),
+                });
+            }
+            Err(WriteError::Failed(error)) => return Err(failed(error)),
+        };
+        let wanted = revision.clone();
+        let described = self
+            .blocking(move |store| {
+                store
+                    .describe(doc, &wanted)
+                    .map_err(|error| error.to_string())
+            })
+            .await;
+        let text = revision.to_string();
+        let checkpoint = NewLiveCheckpoint {
+            revision: &text,
+            through: write.at,
+            sha256: blob.sha256,
+            session: write.session,
+            session_data: write.session_data,
+            major_reason: None,
+            major_person: None,
+            created_at: write.created_at,
+        };
+        let unrecorded =
+            |described: Option<RevisionInfo>, error: String| LiveWriteError::Unrecorded {
+                revision: text.clone(),
+                fields: fields.clone(),
+                described: described.map(Box::new),
+                error,
+            };
+        match described {
+            Ok(Some(info)) => match self
+                .reconcile_live_checkpoint(doc, write.base, &checkpoint, &info, &fields)
+                .await
+            {
+                Ok(()) => Ok(text.clone()),
+                Err(error) => Err(unrecorded(Some(info), error.to_string())),
+            },
+            Ok(None) => Err(unrecorded(None, "Git does not describe it".to_owned())),
+            Err(error) => Err(unrecorded(None, error)),
+        }
+    }
+
+    async fn record_live_checkpoint(
+        &self,
+        doc: DocId,
+        checkpoint: &NewLiveCheckpoint<'_>,
+    ) -> Result<(), DbError> {
+        self.db.record_live_checkpoint(doc, checkpoint).await
+    }
+
+    async fn reconcile_live_checkpoint(
+        &self,
+        doc: DocId,
+        parent: Option<&str>,
+        checkpoint: &NewLiveCheckpoint<'_>,
+        described: &RevisionInfo,
+        expected_fields: &Map<String, Value>,
+    ) -> Result<(), DbError> {
+        LiveStore::reconcile_live_checkpoint(
+            &self.db,
+            doc,
+            parent,
+            checkpoint,
+            described,
+            expected_fields,
+        )
+        .await
+    }
+
+    async fn verify_live_checkpoint(
+        &self,
+        doc: DocId,
+        revision: &str,
+        through: Seq,
+        at: OffsetDateTime,
+    ) -> Result<(), DbError> {
+        self.db
+            .verify_live_checkpoint(doc, revision, through, at)
+            .await
+    }
+
+    async fn live_return_tombstone(
+        &self,
+        doc: DocId,
+        session: Uuid,
+        participant: u32,
+    ) -> Result<Option<LiveReturnTombstoneRow>, DbError> {
+        self.db
+            .live_return_tombstone(doc, session, participant)
+            .await
+    }
+
+    async fn start_live_session(
+        &self,
+        doc: DocId,
+        session: Uuid,
+        format: &str,
+        at: OffsetDateTime,
+    ) -> Result<(), DbError> {
+        self.db.start_live_session(doc, session, format, at).await
+    }
+
+    async fn add_live_participant(
+        &self,
+        doc: DocId,
+        session: Uuid,
+        client: ClientId,
+        user: UserId,
+        at: OffsetDateTime,
+    ) -> Result<u32, DbError> {
+        self.db
+            .add_live_participant(doc, session, client, user, at)
+            .await
+    }
+
+    async fn end_live_place(
+        &self,
+        session: Uuid,
+        number: u32,
+        reason: GoneReason,
+        at: OffsetDateTime,
+    ) -> Result<(), DbError> {
+        self.db.end_live_place(session, number, reason, at).await
+    }
+
+    async fn append_live_change(
+        &self,
+        doc: DocId,
+        change: &NewLiveChange<'_>,
+    ) -> Result<(), DbError> {
+        self.db.append_live_change(doc, change).await
+    }
+
+    async fn cancel_live_entry(&self, doc: DocId, cancel: &NewLiveCancel) -> Result<(), DbError> {
+        self.db.cancel_live_entry(doc, cancel).await
+    }
+
+    async fn consume_live_local(
+        &self,
+        doc: DocId,
+        client: ClientId,
+        user: UserId,
+        local: u64,
+        reason: &str,
+        at: OffsetDateTime,
+    ) -> Result<(), DbError> {
+        self.db
+            .consume_live_local(doc, client, user, local, reason, at)
+            .await
+    }
+
+    async fn live_local(
+        &self,
+        doc: DocId,
+        client: ClientId,
+        local: u64,
+    ) -> Result<LiveLocal, DbError> {
+        self.db.live_local(doc, client, local).await
+    }
+
+    async fn end_live_session(&self, session: Uuid, at: OffsetDateTime) -> Result<(), DbError> {
+        self.db.end_live_session(session, at).await
+    }
+}
+
 #[cfg(test)]
 pub(crate) use memory::MemStore;
 
@@ -279,6 +620,7 @@ mod memory {
         docs: HashMap<DocId, MemoryDoc>,
         fail_next: bool,
         fail_after_next: bool,
+        last_authors: Vec<Author>,
     }
 
     #[derive(Clone)]
@@ -302,6 +644,8 @@ mod memory {
         clients: HashMap<ClientId, (UserId, u64)>,
         locals: HashMap<(ClientId, u64), LiveLocal>,
         return_tombstones: Vec<LiveReturnTombstoneRow>,
+        current_revision: Option<String>,
+        revisions_written: u64,
     }
 
     impl Default for MemoryDoc {
@@ -321,6 +665,8 @@ mod memory {
                 clients: HashMap::new(),
                 locals: HashMap::new(),
                 return_tombstones: Vec::new(),
+                current_revision: None,
+                revisions_written: 0,
             }
         }
     }
@@ -340,6 +686,21 @@ mod memory {
             if let Ok(mut state) = self.inner.lock() {
                 state.fail_after_next = true;
             }
+        }
+
+        /// Makes `revision` the document's current revision, as an outside save would.
+        pub(crate) fn set_current_revision(&self, doc: DocId, revision: String) {
+            if let Ok(mut state) = self.inner.lock() {
+                state.docs.entry(doc).or_default().current_revision = Some(revision);
+            }
+        }
+
+        /// The authors credited by the last checkpoint written.
+        pub(crate) fn last_authors(&self) -> Vec<Author> {
+            self.inner
+                .lock()
+                .map(|state| state.last_authors.clone())
+                .unwrap_or_default()
         }
 
         pub(crate) fn entry_count(&self) -> usize {
@@ -376,6 +737,58 @@ mod memory {
     }
 
     impl LiveStore for MemStore {
+        async fn current_revision(&self, doc: DocId) -> Result<Option<String>, DbError> {
+            Ok(self
+                .state()?
+                .docs
+                .get(&doc)
+                .and_then(|memory| memory.current_revision.clone()))
+        }
+
+        async fn write_live_checkpoint(
+            &self,
+            doc: DocId,
+            write: &LiveWrite<'_>,
+        ) -> Result<String, LiveWriteError> {
+            let revision = {
+                let mut state = self
+                    .write()
+                    .map_err(|error| LiveWriteError::Failed(error.to_string()))?;
+                state.last_authors = write.authors.to_vec();
+                let memory = state.docs.entry(doc).or_default();
+                if write.base.map(str::to_owned) != memory.current_revision {
+                    return Err(LiveWriteError::Stale {
+                        current: memory.current_revision.clone(),
+                    });
+                }
+                memory.revisions_written = memory.revisions_written.saturating_add(1);
+                let revision = format!("{:040x}", memory.revisions_written);
+                memory.current_revision = Some(revision.clone());
+                revision
+            };
+            self.record_live_checkpoint(
+                doc,
+                &NewLiveCheckpoint {
+                    revision: &revision,
+                    through: write.at,
+                    sha256: write.blob.sha256,
+                    session: write.session,
+                    session_data: write.session_data,
+                    major_reason: None,
+                    major_person: None,
+                    created_at: write.created_at,
+                },
+            )
+            .await
+            .map_err(|error| LiveWriteError::Unrecorded {
+                revision: revision.clone(),
+                fields: live_fields(&Map::new(), write.at),
+                described: None,
+                error: error.to_string(),
+            })?;
+            Ok(revision)
+        }
+
         async fn load_live(&self, doc: DocId) -> Result<LiveLoaded, DbError> {
             let mut state = self.state()?;
             let memory = state.docs.entry(doc).or_default();

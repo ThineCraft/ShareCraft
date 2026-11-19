@@ -13,6 +13,7 @@ mod common;
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use collab_core::ids::DocId;
 use common::{
@@ -129,6 +130,39 @@ async fn shared_file(server: &TestServer) -> (DocId, TestUser, TestUser, TestUse
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
     }
     (doc, ann, bob, vic)
+}
+
+#[tokio::test]
+async fn checkpoint_upload_is_checked_before_body() {
+    let server = spawn_server_config(|config| {
+        config.live_editors = vec![records::Editor::GridCraft];
+    })
+    .await;
+    let doc = new_doc();
+    let ann = server.user("Ann").await;
+    let vic = server.user("Vic").await;
+    server.create_file_document(doc, &ann).await;
+    let _client = common::live::LiveTestClient::connect(&server, doc, &ann, "ann").await;
+
+    for (who, expected) in [(&ann, StatusCode::FORBIDDEN), (&vic, StatusCode::NOT_FOUND)] {
+        let never_finishes = futures_util::stream::pending::<Result<Vec<u8>, std::io::Error>>();
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            server
+                .http(Some(who))
+                .put(server.url(&format!("/api/docs/{}/live-checkpoint", doc.0)))
+                .query(&[
+                    ("ticket", Uuid::new_v4().to_string()),
+                    ("at", "0".to_owned()),
+                ])
+                .body(reqwest::Body::wrap_stream(never_finishes))
+                .send(),
+        )
+        .await
+        .expect("an unusable ticket must be refused without reading the body")
+        .unwrap();
+        assert_eq!(response.status(), expected);
+    }
 }
 
 /// The id of `user`'s own folder, where their uploads go.

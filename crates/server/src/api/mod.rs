@@ -240,6 +240,11 @@ pub(crate) fn router() -> Router<AppState> {
             "/docs/{id}/content",
             get(content::download).put(content::save),
         )
+        .route("/docs/{id}/live-checkpoint", put(content::live_checkpoint))
+        .route(
+            "/docs/{id}/live-checkpoint/hash",
+            post(content::live_checkpoint_hash),
+        )
         .route("/docs/{id}/preview", get(content::preview))
         .route("/docs/{id}/thumbnail", get(content::thumbnail))
         .route("/docs/{id}/access", get(nodes::access).put(nodes::share))
@@ -969,6 +974,9 @@ mod tests {
             write_timeout: Duration::from_secs(10),
             live_editors: Vec::new(),
             live_heartbeat: Duration::from_secs(60),
+            live_checkpoint_quiet: Duration::from_secs(15),
+            live_checkpoint_wait: Duration::from_secs(120),
+            live_ticket_lifetime: Duration::from_secs(120),
             database_url: DatabaseUrl::new(test.url()),
             editors_dir: dir.join("editors"),
             max_file_bytes: 64 << 20,

@@ -331,6 +331,8 @@ async fn live_session(s: &mut Session<'_>, first: &str) -> bool {
         format,
         resume,
         seen,
+        can_checkpoint,
+        build,
         ..
     }) = serde_json::from_str::<LiveClientMsg>(first)
     else {
@@ -338,7 +340,19 @@ async fn live_session(s: &mut Session<'_>, first: &str) -> bool {
     };
     let conn = s.state.next_conn();
     let Some((room, out_rx)) = join_live_room(
-        s.state, s.doc, conn, client, s.visitor, protocol, format, resume, seen,
+        s.state,
+        s.doc,
+        conn,
+        client,
+        s.visitor,
+        LiveJoinFields {
+            protocol,
+            format,
+            resume,
+            seen,
+            can_checkpoint,
+            build,
+        },
     )
     .await
     else {
@@ -377,9 +391,15 @@ async fn live_session(s: &mut Session<'_>, first: &str) -> bool {
                         entered,
                     })
                 }
-                Ok(
-                    LiveClientMsg::CheckpointReady { .. } | LiveClientMsg::CheckpointFailed { .. },
-                ) => None,
+                Ok(LiveClientMsg::CheckpointFailed { ticket }) => {
+                    Some(LiveCommand::CheckpointFailed {
+                        conn,
+                        client,
+                        ticket,
+                    })
+                }
+                // The upload itself says the bytes are ready.
+                Ok(LiveClientMsg::CheckpointReady { .. }) => None,
                 Ok(LiveClientMsg::Resync) => Some(LiveCommand::Resync { conn, client }),
                 Ok(LiveClientMsg::Leave) => Some(LiveCommand::Leave { conn, client }),
                 Ok(LiveClientMsg::LiveJoin { .. }) | Err(_) => None,
@@ -491,18 +511,32 @@ async fn join_file_room(
     .await
 }
 
-#[allow(clippy::too_many_arguments)]
+/// What a `live_join` frame asks for, besides its client.
+struct LiveJoinFields {
+    protocol: u32,
+    format: String,
+    resume: Option<protocol::live::LiveResume>,
+    seen: Option<collab_core::ids::Seq>,
+    can_checkpoint: bool,
+    build: protocol::live::LiveBuild,
+}
+
 async fn join_live_room(
     state: &AppState,
     doc: DocId,
     conn: ConnId,
     client: ClientId,
     visitor: &Visitor,
-    protocol: u32,
-    format: String,
-    resume: Option<protocol::live::LiveResume>,
-    seen: Option<collab_core::ids::Seq>,
+    join: LiveJoinFields,
 ) -> Option<(LiveLink, mpsc::Receiver<Outbound>)> {
+    let LiveJoinFields {
+        protocol,
+        format,
+        resume,
+        seen,
+        can_checkpoint,
+        build,
+    } = join;
     join_with(
         || state.open_live_room(doc),
         |room| &room.commands,
@@ -517,6 +551,8 @@ async fn join_live_room(
             format: format.clone(),
             resume,
             seen,
+            can_checkpoint,
+            build,
             tx,
             accepted,
         },
