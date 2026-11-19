@@ -11,7 +11,7 @@ use collab_core::ids::{ClientId, DocId, SessionId, UserId};
 use collab_text::TextOp;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
-use protocol::live::{LiveClientMsg, LiveServerMsg};
+use protocol::live::{LiveClientMsg, LiveServerMsg, valid_fingerprint};
 use protocol::{ClientMsg, FileClientMsg, FileServerMsg, RemovedReason, Resume, ServerMsg};
 use records::{Access, Editor};
 use time::OffsetDateTime;
@@ -366,10 +366,19 @@ async fn live_session(s: &mut Session<'_>, first: &str) -> bool {
                 Ok(LiveClientMsg::Report { seq }) => {
                     Some(LiveCommand::Report { conn, client, seq })
                 }
+                Ok(LiveClientMsg::Fingerprint { at, entered }) => {
+                    if !valid_fingerprint(&entered) {
+                        return None;
+                    }
+                    Some(LiveCommand::Fingerprint {
+                        conn,
+                        client,
+                        at,
+                        entered,
+                    })
+                }
                 Ok(
-                    LiveClientMsg::Fingerprint { .. }
-                    | LiveClientMsg::CheckpointReady { .. }
-                    | LiveClientMsg::CheckpointFailed { .. },
+                    LiveClientMsg::CheckpointReady { .. } | LiveClientMsg::CheckpointFailed { .. },
                 ) => None,
                 Ok(LiveClientMsg::Resync) => Some(LiveCommand::Resync { conn, client }),
                 Ok(LiveClientMsg::Leave) => Some(LiveCommand::Leave { conn, client }),

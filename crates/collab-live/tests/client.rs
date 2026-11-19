@@ -253,6 +253,57 @@ fn checkpoint_never_covers_a_waiting_change() {
 }
 
 #[test]
+fn non_checkpoint_client_fingerprints_saved_agreed_state_not_shown_state() {
+    let mut doc = StandIn::new("a");
+    let mut client = live(&mut doc, 1);
+    let waiting = client.new_ids(1).unwrap();
+    client
+        .local(&mut doc, insert(waiting, "waiting"), Mode::ShowAtOnce, 10)
+        .unwrap();
+
+    assert_eq!(doc.lines(), vec!["waiting"]);
+    match client.agreed_snapshot(&doc, Seq(0)).unwrap() {
+        AgreedSnapshot::Saved(snapshot) => assert!(snapshot.lines().is_empty()),
+        AgreedSnapshot::Editor(_) => panic!("optimistic work must use the saved agreed state"),
+    }
+    assert_eq!(
+        client.fingerprint(Seq(0), [0; 32]).unwrap(),
+        format!(
+            "{{\"type\":\"fingerprint\",\"at\":0,\"entered\":\"{}\"}}",
+            "00".repeat(32)
+        )
+    );
+}
+
+#[test]
+fn non_checkpoint_client_materializes_each_partially_confirmed_agreed_state() {
+    let mut doc = StandIn::new("a");
+    let mut client = live(&mut doc, 1);
+    let confirmed = client.new_ids(1).unwrap();
+    let waiting = client.new_ids(1).unwrap();
+    let confirmed_payload = insert(confirmed, "confirmed");
+    client
+        .local(&mut doc, confirmed_payload.clone(), Mode::ShowAtOnce, 10)
+        .unwrap();
+    client
+        .local(&mut doc, insert(waiting, "waiting"), Mode::ShowAtOnce, 11)
+        .unwrap();
+    client
+        .receive(
+            &mut doc,
+            &entry(1, 1, client.client(), 1, 0, &confirmed_payload),
+            20,
+        )
+        .unwrap();
+
+    assert_eq!(doc.lines(), vec!["confirmed", "waiting"]);
+    match client.agreed_snapshot(&doc, Seq(1)).unwrap() {
+        AgreedSnapshot::Saved(snapshot) => assert_eq!(snapshot.lines(), vec!["confirmed"]),
+        AgreedSnapshot::Editor(_) => panic!("waiting work must not be in the agreed state"),
+    }
+}
+
+#[test]
 fn checkpoint_requires_the_exact_agreed_position() {
     let mut doc = StandIn::new("a");
     let mut client = checkpoint_client();
@@ -530,7 +581,7 @@ fn stamped_change_is_reapplied_with_server_stamp() {
 }
 
 #[test]
-fn sixty_four_folds_then_goes_back() {
+fn each_confirmation_materializes_the_exact_agreed_state() {
     let mut doc = Counting {
         doc: StandIn::new("a"),
         restores: 0,
@@ -555,7 +606,7 @@ fn sixty_four_folds_then_goes_back() {
             )
             .unwrap();
     }
-    assert_eq!(doc.restores, 1);
+    assert_eq!(doc.restores, 64);
     assert_eq!(client.pending(), 1);
     assert_eq!(client.agreed_seq(), Seq(64));
     assert_eq!(doc.doc.lines().len(), 65);
@@ -884,7 +935,7 @@ fn own_confirmation_with_other_content_is_desync() {
 }
 
 #[test]
-fn others_entry_lands_after_folded_own_entries() {
+fn others_entry_lands_after_materialized_own_entries() {
     let mut doc = Counting {
         doc: StandIn::new("a"),
         restores: 0,
@@ -898,7 +949,7 @@ fn others_entry_lands_after_folded_own_entries() {
     client
         .local(&mut doc, insert(b, "b"), Mode::ShowAtOnce, 10)
         .unwrap();
-    // "a" is confirmed and folded; "b" still waits.
+    // "a" is confirmed into the exact agreed copy; "b" still waits.
     client
         .receive(
             &mut doc,
@@ -906,7 +957,7 @@ fn others_entry_lands_after_folded_own_entries() {
             20,
         )
         .unwrap();
-    assert_eq!(doc.restores, 0);
+    assert_eq!(doc.restores, 1);
     client
         .receive(
             &mut doc,
@@ -915,7 +966,7 @@ fn others_entry_lands_after_folded_own_entries() {
         )
         .unwrap();
     assert_eq!(doc.doc.lines(), vec!["a", "x", "b"]);
-    assert_eq!(doc.restores, 1);
+    assert_eq!(doc.restores, 2);
     assert_eq!(client.agreed_seq(), Seq(2));
     assert_eq!(client.pending(), 1);
 }
@@ -1193,6 +1244,13 @@ fn returning_client_keeps_waiting_changes() {
     }));
     assert_eq!(client.participant(), Some(ParticipantNo(5)));
     assert_eq!(client.resume().unwrap().participant, ParticipantNo(5));
+    let catchup = client
+        .receive(&mut doc, &catchup(0, 1, 1), 200_000)
+        .unwrap();
+    assert!(entries(&catchup.send).is_empty());
+    let ready = client
+        .receive(&mut doc, r#"{"type":"return_ready","through":2}"#, 200_000)
+        .unwrap();
     // The waiting changes are shown again under the new number.
     let rerun: Vec<_> = doc.applied[mark..]
         .iter()
@@ -1206,11 +1264,8 @@ fn returning_client_keeps_waiting_changes() {
     );
     assert_eq!(doc.doc.lines(), vec!["x", "one", "two"]);
 
-    let step = client
-        .receive(&mut doc, &catchup(0, 1, 1), 200_000)
-        .unwrap();
     assert_eq!(client.phase(), Phase::Live);
-    let resent = entries(&step.send);
+    let resent = entries(&ready.send);
     assert_eq!(resent.len(), 2);
     assert_eq!(resent[0]["local"], 1);
     assert_eq!(resent[0]["seen"], 0);
@@ -1220,9 +1275,9 @@ fn returning_client_keeps_waiting_changes() {
 }
 
 #[test]
-fn returning_client_holds_resends_until_return_ready() {
+fn non_checkpoint_returning_client_holds_resends_until_return_ready() {
     let mut doc = StandIn::new("a");
-    let mut client = checkpoint_live(&mut doc, 2);
+    let mut client = live(&mut doc, 2);
     let saved = client.new_ids(1).unwrap();
     client
         .local(&mut doc, insert(saved, "saved"), Mode::ShowAtOnce, 10)
@@ -1264,9 +1319,9 @@ fn returning_client_holds_resends_until_return_ready() {
 }
 
 #[test]
-fn returning_client_keeps_the_barrier_across_a_reconnect() {
+fn non_checkpoint_returning_client_keeps_the_barrier_across_a_reconnect() {
     let mut doc = StandIn::new("a");
-    let mut client = checkpoint_live(&mut doc, 2);
+    let mut client = live(&mut doc, 2);
     let id = client.new_ids(1).unwrap();
     client
         .local(&mut doc, insert(id, "saved"), Mode::ShowAtOnce, 10)
@@ -1383,9 +1438,9 @@ fn archive_return_preserves_the_old_participant_shown_copy() {
 }
 
 #[test]
-fn archive_return_is_emitted_before_base_load() {
+fn non_checkpoint_archive_return_is_emitted_before_base_load() {
     let mut doc = StandIn::new("a");
-    let mut client = checkpoint_live(&mut doc, 2);
+    let mut client = live(&mut doc, 2);
     let id = client.new_ids(1).unwrap();
     client
         .local(&mut doc, insert(id, "old shown copy"), Mode::ShowAtOnce, 10)
@@ -1744,6 +1799,9 @@ fn rerun_under_new_number_is_not_folded_as_stored() {
         .unwrap();
     client
         .receive(&mut doc, &catchup(0, 0, 1), 200_000)
+        .unwrap();
+    client
+        .receive(&mut doc, r#"{"type":"return_ready","through":1}"#, 200_000)
         .unwrap();
     let mark = doc.applied.len();
     client

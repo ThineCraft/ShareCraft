@@ -33,6 +33,14 @@ pub fn valid_format(format: &str) -> bool {
         })
 }
 
+/// Whether `fingerprint` is exactly one lowercase hexadecimal SHA-256 digest.
+pub fn valid_fingerprint(fingerprint: &str) -> bool {
+    fingerprint.len() == 64
+        && fingerprint
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
 /// Identifies one live session of a document: from the first person joining until the last
 /// one has left or expired.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -737,6 +745,15 @@ mod tests {
             ))
             .is_err()
         );
+    }
+
+    #[test]
+    fn fingerprint_is_exactly_64_lowercase_hex_characters() {
+        assert!(valid_fingerprint(&"0123456789abcdef".repeat(4)));
+        assert!(!valid_fingerprint(&"a".repeat(63)));
+        assert!(!valid_fingerprint(&"a".repeat(65)));
+        assert!(!valid_fingerprint(&format!("{}A", "a".repeat(63))));
+        assert!(!valid_fingerprint(&format!("{}g", "a".repeat(63))));
     }
 
     #[test]

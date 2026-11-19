@@ -172,6 +172,11 @@ impl LiveTestClient {
         self.send_frames(frames).await;
     }
 
+    pub async fn receive_server_message(&mut self, message: &LiveServerMsg) {
+        self.take_server_frame(&serde_json::to_string(message).unwrap())
+            .await;
+    }
+
     pub async fn wait_closed(&mut self) {
         tokio::time::timeout(TIMEOUT, async {
             loop {

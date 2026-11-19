@@ -93,10 +93,6 @@ pub enum Effect {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Crash;
 
-/// How many confirmed own changes the client keeps on top of its agreed copy before it goes
-/// back and takes a new copy.
-pub const MAX_FOLDED: usize = 64;
-
 /// The most entry frames the client sends in any [`PACE_WINDOW_MS`]. The server allows more
 /// (30 a second, bursts up to 120), so a paced client is never refused for its rate.
 pub const MAX_ENTRIES_PER_WINDOW: usize = 20;
@@ -801,13 +797,6 @@ impl<E: LiveEditor> LiveClient<E> {
         editor: &'a E,
         at: Seq,
     ) -> Result<AgreedSnapshot<'a, E>, ClientError> {
-        if !self.can_checkpoint {
-            return Err(ClientError::AgreedUnavailable {
-                at,
-                agreed: self.agreed_seq,
-                phase: self.phase,
-            });
-        }
         self.require_agreed(at)?;
         Ok(match &self.agreed {
             Some(snapshot) => AgreedSnapshot::Saved(snapshot),
@@ -978,7 +967,7 @@ impl<E: LiveEditor> LiveClient<E> {
         self.heartbeat_ms = heartbeat_ms.clamp(MIN_HEARTBEAT_MS, HEARTBEAT_MS);
         self.joined = true;
         if let Place::Returning { previous } = place {
-            self.hold_return = self.can_checkpoint && self.returning_through.is_some();
+            self.hold_return = self.returning_through.is_some();
             step.events.push(Event::Returned {
                 previous,
                 now: participant,
@@ -1140,7 +1129,7 @@ impl<E: LiveEditor> LiveClient<E> {
                 self.agreed_seq = seq;
                 if self.pending.is_empty() {
                     self.settle();
-                } else if self.can_checkpoint || self.folded.len() >= MAX_FOLDED {
+                } else {
                     self.go_back(editor, None);
                 }
                 step.events.push(Event::Applied {

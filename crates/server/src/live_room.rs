@@ -148,6 +148,12 @@ pub(crate) enum LiveCommand {
         client: ClientId,
         seq: Seq,
     },
+    Fingerprint {
+        conn: ConnId,
+        client: ClientId,
+        at: Seq,
+        entered: String,
+    },
     Resync {
         conn: ConnId,
         client: ClientId,
@@ -389,6 +395,16 @@ impl<S: LiveStore> LiveRoom<S> {
                 self.apply_verdicts(verdicts).await
             }
             LiveCommand::Report { conn, client, seq } => self.report(conn, client, seq).await,
+            LiveCommand::Fingerprint {
+                conn,
+                client,
+                at,
+                entered,
+            } => {
+                let _ = (at, entered);
+                self.note_life(conn, client);
+                Ok(())
+            }
             LiveCommand::Resync { conn, client } => {
                 self.note_life(conn, client);
                 self.resync(conn, client);

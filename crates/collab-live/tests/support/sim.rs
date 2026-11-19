@@ -52,6 +52,8 @@ pub struct Sim {
     stored: HashSet<(ClientId, u64)>,
     refused: HashMap<(ClientId, u64), RefusedReason>,
     viewers: HashSet<ClientId>,
+    /// A durable return barrier whose readiness may need repeating after a dropped connection.
+    return_ready: HashMap<ClientId, LocalNo>,
     conns: HashMap<ConnId, Conn>,
     next_conn: u64,
     clock: i64,
@@ -85,6 +87,7 @@ impl Sim {
             stored: HashSet::new(),
             refused: HashMap::new(),
             viewers: HashSet::new(),
+            return_ready: HashMap::new(),
             conns: HashMap::new(),
             next_conn: 1,
             clock: 1_763_000_000_000,
@@ -128,7 +131,17 @@ impl Sim {
 
     /// The next frame waiting for `conn`, if any.
     pub fn next_out(&mut self, conn: ConnId) -> Option<String> {
-        self.conns.get_mut(&conn)?.outbox.pop_front()
+        let state = self.conns.get_mut(&conn)?;
+        let frame = state.outbox.pop_front()?;
+        let client = state.joined.map(|(client, _)| client);
+        if matches!(
+            serde_json::from_str(&frame),
+            Ok(LiveServerMsg::ReturnReady { .. })
+        ) && let Some(client) = client
+        {
+            self.return_ready.remove(&client);
+        }
+        Some(frame)
     }
 
     /// How many frames wait for `conn`.
@@ -269,7 +282,7 @@ impl Sim {
         format: &str,
         resume: Option<protocol::live::LiveResume>,
         seen: Option<Seq>,
-        can_checkpoint: bool,
+        _can_checkpoint: bool,
         returning_through: Option<LocalNo>,
     ) {
         assert_eq!(protocol, LIVE_PROTOCOL);
@@ -311,9 +324,17 @@ impl Sim {
             _ => Seq(0),
         };
         self.send_catchup(conn, from);
-        if can_checkpoint
-            && matches!(place, Place::Returning { .. })
+        if matches!(place, Place::Returning { .. })
             && let Some(through) = returning_through
+        {
+            self.return_ready.insert(client, through);
+        }
+        let ready = returning_through.filter(|through| {
+            self.return_ready
+                .get(&client)
+                .is_some_and(|held| held == through)
+        });
+        if let Some(through) = ready
             && let Some(state) = self.conns.get_mut(&conn)
         {
             state
@@ -346,6 +367,7 @@ impl Sim {
             // From a place that has ended: ignored, not stored.
             return;
         };
+        self.return_ready.remove(&client);
         assert_eq!(format, self.format);
         let expected = *self.next_local.get(&client).unwrap_or(&1);
         if local.0 < expected {

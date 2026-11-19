@@ -233,6 +233,12 @@ async fn expiry_with_entry_in_flight_commits_once() {
     assert_eq!(a.client().pending(), 1);
     let sent_before_reconnect = a.outbound_messages.len();
     a.reconnect(&server).await;
+    a.pump_until(|c| c.client().phase() == Phase::Live).await;
+    assert_eq!(a.client().pending(), 1);
+    a.receive_server_message(&LiveServerMsg::ReturnReady {
+        through: LocalNo(1),
+    })
+    .await;
     a.pump_until(|c| c.client().phase() == Phase::Live && c.client().pending() == 0)
         .await;
     assert!(matches!(a.last_place(), Some(Place::Returning { .. })));
@@ -442,6 +448,53 @@ async fn garbage_frame_closes_only_that_connection() {
     b.insert("still live").await;
     b.pump_until(|c| c.client().pending() == 0).await;
     assert_eq!(b.lines(), vec!["still live"]);
+}
+
+#[tokio::test]
+async fn malformed_fingerprints_are_refused_without_ending_the_room() {
+    let server = live_server().await;
+    let (doc, ann, bob) = shared_live(&server).await;
+    let mut b = LiveTestClient::connect(&server, doc, &bob, "b").await;
+
+    for entered in [
+        "a".repeat(63),
+        "a".repeat(65),
+        format!("{}A", "a".repeat(63)),
+        format!("{}g", "a".repeat(63)),
+    ] {
+        let mut sender = LiveTestClient::connect(&server, doc, &ann, "sender").await;
+        sender
+            .send_raw(
+                &serde_json::to_string(&LiveClientMsg::Fingerprint {
+                    at: Seq(0),
+                    entered,
+                })
+                .unwrap(),
+            )
+            .await;
+        sender.wait_closed().await;
+    }
+
+    let mut valid = LiveTestClient::connect(&server, doc, &ann, "valid").await;
+    valid
+        .send_raw(
+            &serde_json::to_string(&LiveClientMsg::Fingerprint {
+                at: Seq(0),
+                entered: "0123456789abcdef".repeat(4),
+            })
+            .unwrap(),
+        )
+        .await;
+    b.insert("still live").await;
+    b.pump_until(|client| client.client().pending() == 0).await;
+    valid
+        .pump_until(|client| client.lines() == ["still live"])
+        .await;
+    assert_eq!(b.lines(), ["still live"]);
+    assert_eq!(
+        server.records_db().load_live(doc).await.unwrap().head,
+        Seq(1)
+    );
 }
 
 #[tokio::test]
