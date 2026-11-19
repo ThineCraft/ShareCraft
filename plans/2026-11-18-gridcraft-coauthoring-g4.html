@@ -1,0 +1,412 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ShareCraft — GridCraft Co-authoring (Plan G4): Implementation Plan</title>
+<style>
+:root{color-scheme:light dark;--ink:light-dark(#172f38,#e4ecef);--muted:light-dark(#536b72,#a9b9bf);--line:light-dark(#d7e2e3,#36454b);--paper:light-dark(#fff,#1d272b);--wash:light-dark(#f2f6f5,#141b1e);--accent:light-dark(#3156c9,#9db4ff);font:15px/1.6 Segoe UI,system-ui,sans-serif;color:var(--ink);background:var(--wash)}
+*{box-sizing:border-box}body{margin:0;padding:28px 18px 80px}main{max-width:940px;margin:auto}
+h1{font-size:1.9rem;letter-spacing:-.03em;line-height:1.2;margin:0 0 14px}h2{font-size:1.3rem;margin:38px 0 12px;padding-top:18px;border-top:1px solid var(--line)}h3{font-size:1.08rem;margin:30px 0 8px}h4{font-size:.95rem;margin:16px 0 6px}
+p{margin:0 0 12px}ul,ol{margin:0 0 12px;padding-left:22px}li{margin-bottom:6px}a{color:var(--accent)}
+code{font-family:Consolas,Menlo,monospace;font-size:.88em;background:light-dark(#e9efee,#263238);padding:1px 5px;border-radius:3px;overflow-wrap:anywhere}
+pre{background:var(--paper);border:1px solid var(--line);border-radius:7px;padding:12px 14px;overflow-x:auto;font:13px/1.5 Consolas,Menlo,monospace;margin:0 0 12px}pre code{background:none;padding:0;font-size:inherit}
+.note{border-left:4px solid var(--accent);background:var(--paper);padding:12px 16px;margin:0 0 14px}.note p:last-child{margin:0}
+.task{background:var(--paper);border:1px solid var(--line);border-radius:9px;padding:6px 20px 14px;margin:18px 0}
+ol.steps{list-style:none;padding-left:0}ol.steps>li{padding-left:28px;position:relative;margin-bottom:10px}ol.steps>li::before{content:"☐";position:absolute;left:2px;color:var(--muted)}
+table{border-collapse:collapse;width:100%;font-size:.9rem;background:var(--paper);margin-bottom:14px}th,td{border:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top}th{background:light-dark(#e8efed,#263238)}
+.small{font-size:.88rem;color:var(--muted)}
+tbody tr:nth-child(even) td{background:light-dark(#f4f8f7,#212b30)}
+ol.steps>li:nth-child(even),ul.band>li:nth-child(even),ol.band>li:nth-child(even){background:light-dark(#f4f8f7,#212b30);border-radius:4px}
+</style>
+</head>
+<body><main>
+<h1>GridCraft live co-authoring, plan G4: checkpoint tickets, verification, returning clients and bounded logs: implementation plan</h1>
+<p class="small">ShareCraft · Stage 2, editor track · Written 18 November 2026</p>
+<div class="note"><p><strong>For agentic workers:</strong> REQUIRED SUB-SKILL: use superpowers:subagent-driven-development or superpowers:executing-plans. Steps are checkboxes.</p></div>
+
+<p><strong>Goal:</strong> turn GridCraft's ordered live log into durable, bounded and independently checked file revisions: a participant writes a checkpoint at an exact agreed position, another participant verifies the bytes, later joiners load a fully recalculated checkpoint without row-height drift, expired clients create the adopted major-version history, and the room pauses before its unsaved log or catch-up can grow without limit.</p>
+<p><strong>Architecture:</strong></p>
+<ul>
+<li><strong>ShareCraft remains the coordinator, not a spreadsheet engine.</strong> The live room chooses a capable editing participant, issues a one-use ticket for one log position and base revision, accepts the resulting file through the existing content-store/checkpointer path, and asks a different participant for a SHA-256 of bytes independently written at the same position. The room never parses an XLSX file, a GridCraft command or GridCraft's session data.</li>
+<li><strong><code>collab-live</code> exposes the agreed state without folding in waiting work.</strong> A ticket can be honoured only at <code>LiveClient::agreed_seq()</code>. If optimistic changes are shown, the library returns its saved agreed snapshot; otherwise the editor itself is the agreed state. This is the mechanical guarantee that a checkpoint base never covers a waiting change.</li>
+<li><strong>GridCraft owns checkpoint fidelity.</strong> Its adapter writes deterministic XLSX bytes and serialised <code>WorkbookIds</code> from an agreed <code>GridSnapshot</code>, loads a checkpoint through a checkpoint-specific open path, performs a full recalculation, and uses only <code>Fingerprint.entered</code> for room agreement. Ordinary File › Open keeps its existing imported-row fitting behaviour.</li>
+<li><strong>PostgreSQL records the durable live facts.</strong> Migration <code>0020_live_checkpoints.sql</code>, after this branch's <code>0019_github_sources.sql</code>, stores each checkpoint's revision, log position, byte hash, verification state, session-data bytes and major-version reason/person. The one-use ticket stays in the room: restart cancels it and issues another.</li>
+</ul>
+<p><strong>Tech stack:</strong> both existing Rust workspaces; ShareCraft's <code>protocol</code>, <code>collab-live</code>, <code>records</code>, <code>server</code>, <code>revisions</code>, PostgreSQL/<code>sqlx</code>, content store and Axum API; GridCraft's <code>engine</code>, <code>xlsx</code>, <code>serde_json</code>, <code>sha2</code> and existing co-author test fixtures. No new third-party dependency.</p>
+<p><strong>Spec:</strong></p>
+<ul>
+<li><a href="../co-authoring-approach.html">co-authoring-approach.html</a> v1.2 (binding), especially section 04's returning-client sequence, section 05's participant checkpoints and second hash, section 12's save/reopen and version risks, and adopted decisions C1–C23;</li>
+<li><a href="../gridcraft-coauthoring-proofs.html#conditions">gridcraft-coauthoring-proofs.html section 10</a>: checkpoint loads fully recalculate and preserve row heights; cross-platform agreement compares entered content only;</li>
+<li><a href="2026-11-16-gridcraft-coauthoring-g2.html">plan G2</a> and its built <code>collab-live</code>/<code>live_room</code>/<code>live_store</code>/<code>records::live</code> foundation; <a href="2026-11-18-gridcraft-coauthoring-g3.html">plan G3</a> and the fork's <code>GridCoauthor</code>, <code>GridLiveEditor</code>, <code>WorkbookIds</code> and entered fingerprint;</li>
+<li><a href="../scope.html#sc15">SC-15</a>, <a href="../scope.html#sc24">SC-24</a>, and <a href="../sequencing.html#spine">spine rules S1–S7</a>.</li>
+</ul>
+
+<h2>The road (for context)</h2>
+<table>
+<thead><tr><th>Plan</th><th>What it builds</th><th>Where</th></tr></thead>
+<tbody>
+<tr><td>G1 (done)</td><td>The four proofs and the conditional go-ahead.</td><td>GridCraft tests, ShareCraft documents</td></tr>
+<tr><td>G2 (built on this branch)</td><td>The shared collaboration library, opaque-entry room and durable ordered log.</td><td>ShareCraft</td></tr>
+<tr><td>G3 (built in the fork branch)</td><td>GridCraft identities, explicit first commands, deterministic apply loop and per-person Undo.</td><td>GridCraft</td></tr>
+<tr><td>G4 (this)</td><td>Checkpoint tickets and second-hash verification; full-recalc, row-faithful loads; entered-only agreement reports; returning-client major versions; bounded unsaved logs and catch-up.</td><td>ShareCraft and GridCraft</td></tr>
+<tr><td>G5</td><td>The browser/desktop host bridge, presence, user notices, real-browser runs and enabling GridCraft.</td><td>Both</td></tr>
+</tbody>
+</table>
+
+<h2>Proposals for the owner</h2>
+<p>The binding paper settles the behaviour. These are the concrete values and implementation choices it deliberately left to the Stage 2 plan.</p>
+<ol class="band">
+<li><strong>Checkpoint cadence:</strong> ask after 15 seconds without a new change or 120 seconds after the first unsaved change, whichever comes first. Ask immediately when the last editing participant is leaving, when the room reaches its warning threshold, before a returning-client batch, and after that batch. This is slower than text's 2/30 seconds because each checkpoint is a whole workbook.</li>
+<li><strong>Bounded unsaved work:</strong> warn and issue an urgent ticket at 4,000 changes or 48 MiB of payload since the verified base; pause new changes at 5,000 changes or 64 MiB, whichever comes first. Cancel records count as entries but contribute only their encoded size. The limits apply to retained in-memory catch-up as well as new work, so a room that loads over the hard limit starts paused.</li>
+<li><strong>Bounded session data:</strong> GridCraft identity JSON is at most 8 MiB. It is opaque to ShareCraft but validated by GridCraft before use. An oversize or invalid table cannot become a catch-up base; the checkpoint stays unverified and the room keeps its earlier verified base.</li>
+<li><strong>Verification status is durable database state.</strong> The Git revision's immutable JSON fields record <code>verified: false</code> when stored without a matching second hash, plus its live position. A later match marks that same revision verified in <code>live_checkpoints</code> and advances <code>live_logs.verified_through</code>; it does not rewrite Git history merely to change a flag. History/API answers overlay the durable verification state.</li>
+<li><strong>Tickets are short-lived room capabilities.</strong> A UUID ticket is one-use, belongs to one participant, position, base revision and purpose (<code>write</code> or <code>verify</code>), and expires after 2 minutes or immediately on access loss, heartbeat expiry, departure, room restart or a stale base. The next eligible participant is then asked.</li>
+<li><strong>A different writer verifies.</strong> The second hash must come from a different participant and, when both kinds are present, prefer the other build kind (browser versus desktop). G4 proves the protocol without allowing desktop co-authoring; C16's desktop admission remains blocked until the common maths library after G5.</li>
+<li><strong>Agreement reports every 64 ordered changes.</strong> An editing client reports the 32-byte entered digest at the exact agreed position. A mismatch makes the odd client resync from the last verified checkpoint and records <code>live.agreement_mismatch</code>; computed values and view state never cross the wire.</li>
+<li><strong>Retain a minimal return tombstone.</strong> Session identity data and entries still expire by the adopted 30-day rule, but the session id, participant/client ownership, end time and final position remain as small tombstone rows. That is the only way to recognise the same in-memory client after 30 days and apply C22's “archive its copy under the current file” path without retaining the old identities forever.</li>
+<li><strong>Large-content side-channel remains deferred.</strong> G3 refuses large paste and over-limit Undo, and the G1 road row for G4 names checkpoints, verification, returning clients/major versions and the log limit. G4 therefore bounds ordinary payloads but does not add C20's per-document large-content upload. It must be planned before any large-paste command is admitted.</li>
+</ol>
+
+<h2>Not in this plan</h2>
+<ul class="band">
+<li>No browser or desktop transport bridge, frame-page status UI, “bring this tab forward” prompt, read-only editor shell, presence drawing or real-browser run. G5 consumes the host APIs and message/event variants prepared here.</li>
+<li>No enabling <code>Config.live_editors</code> for GridCraft. The unsaved limits are required before that switch, but G5 owns the switch and end-to-end browser acceptance.</li>
+<li>No common native/WASM maths library and no desktop admission. Computed values remain native diagnostics only.</li>
+<li>No large-content side-channel, large shared paste, shared macros/scripts/import/Solver, objects or new shared command families. C20 remains required before one of those commands needs content beyond <code>MAX_PAYLOAD_BYTES</code>.</li>
+<li>No SC-08 version numbering or publishing UI. G4 stores the adopted interim <code>major</code>, reason and person metadata.</li>
+<li>No change to text rooms, file-seat rooms, their checkpoint schedule or their save protocol.</li>
+</ul>
+
+<h2>Global constraints</h2>
+<ul class="band">
+<li>The server never reads an entry payload, GridCraft identity JSON or XLSX content. It may count bytes, compute SHA-256 over uploaded bytes and compare fixed-size hashes (C1, C4, S6).</li>
+<li>A checkpoint is one existing Git/content-store revision with all contributors since the preceding checkpoint; the uploader alone is not credited (S3). Every write names the current revision it was based on and stale writes take the adopted S4 recovery path.</li>
+<li>A ticket names one <code>Seq</code>. GridCraft writes exactly the agreed snapshot at that sequence. A shown but unconfirmed change is never included, and a ticket ahead of or behind <code>agreed_seq</code> is refused.</li>
+<li>Entries are retained until a verified revision covers them and then for 30 days. <code>Db::mark_live_verified</code> is called only after a matching independent hash, never merely after the primary upload.</li>
+<li>Checkpoint session data and file bytes are one logical result: the room does not advance its base unless both are durably associated with the same position/revision. A malformed identity table cannot be loaded by GridCraft.</li>
+<li>Cross-platform agreement is <code>Fingerprint.entered</code> only. It includes entered content, explicit formatting, row heights/column widths, merges, filters and names; it excludes computed values, active sheet, selection, scroll, zoom and personal history.</li>
+<li>Checkpoint load performs a full recalculation under the log's deterministic stamp state. It does not apply File › Open's imported-row auto-fit a second time. Ordinary user-open behaviour remains unchanged.</li>
+<li>At either hard log limit the room refuses/pause-notices new entries before writing them; heartbeats, leave, report, resync, hash, ticket and access messages still work so the room can recover.</li>
+<li>A role loss or heartbeat expiry cancels that participant's ticket before another is issued (S5). A viewer never receives a write or verify ticket.</li>
+<li>The returning-client sequence is two barriers: store/mark the current state major before accepting the saved late batch, then store the result major immediately after the last local number that existed at return. Ordinary entries made later are not mistaken for the return batch.</li>
+<li>ShareCraft migration <code>0020_live_checkpoints.sql</code> uses LF endings and is never edited after application. GridCraft production code follows its <code>AGENTS.md</code>: no panic primitives, no <code>unsafe</code>, checked hostile input, no CI changes, no agent attribution.</li>
+<li>No new third-party dependency in either repository. ShareCraft finishes with <code>cargo xtask check</code>; GridCraft finishes with <code>cargo xtask ci</code>. Report only gates that actually ran.</li>
+</ul>
+
+<h2>Review focus</h2>
+<table>
+<thead><tr><th>Failure class</th><th>Expected behaviour</th><th>Pinned by</th></tr></thead>
+<tbody>
+<tr><td>A participant has optimistic waiting work when a ticket arrives.</td><td>The file and identity data come from the agreed snapshot at the ticket's exact position; the waiting work remains shown but is absent from the checkpoint.</td><td><code>checkpoint_never_covers_a_waiting_change</code>, <code>grid_checkpoint_uses_the_agreed_snapshot</code></td></tr>
+<tr><td>Stored <code>OrderedIds</code> contains a zero-length, overflowing, overlapping, duplicated or inconsistent run.</td><td>Deserialisation fails before lookup or allocation; no partial table reaches the editor.</td><td><code>ordered_ids_reject_invalid_serialized_runs</code>, <code>workbook_ids_reject_inconsistent_session_data</code></td></tr>
+<tr><td>The primary writer disappears, loses edit rights or uploads after the base moved.</td><td>The ticket is cancelled, its bytes cannot commit under that ticket, a new eligible writer is selected, and stale recovery preserves both live and outside states as major history.</td><td><code>ticket_is_cancelled_on_expiry_and_role_loss</code>, <code>stale_live_checkpoint_preserves_both_versions</code></td></tr>
+<tr><td>A lone or disagreeing writer produces an unverified revision.</td><td>It is current and downloadable, its entries/session data remain, later re-derivation either verifies it or records both files and a mismatch without advancing the verified base.</td><td><code>lone_checkpoint_stays_unverified_until_second_hash</code>, <code>second_hash_mismatch_keeps_both_files_and_log</code></td></tr>
+<tr><td>The server restarts while paused, while a ticket is outstanding or after Git wrote but before PostgreSQL settled.</td><td>No ticket survives; limits are recomputed from durable entries; reconcile recovers the revision record; no entry is lost or counted twice.</td><td><code>restart_cancels_ticket_and_keeps_pause</code>, <code>checkpoint_commit_reconciles_after_unknown_db_outcome</code></td></tr>
+</tbody>
+</table>
+
+<h2>File map</h2>
+<table>
+<thead><tr><th>Repository / file</th><th>Responsibility in G4</th></tr></thead>
+<tbody>
+<tr><td>ShareCraft · <code>crates/collab-live/src/ids.rs</code></td><td>Validated <code>OrderedIds</code> deserialisation and public validation used by stored session data.</td></tr>
+<tr><td>ShareCraft · <code>crates/protocol/src/live.rs</code></td><td>Checkpoint capability/build kind on join; ticket, pause/resume, entered fingerprint and return-barrier wire messages.</td></tr>
+<tr><td>ShareCraft · <code>crates/collab-live/src/client.rs</code>, <code>tests/client.rs</code>, <code>tests/convergence.rs</code></td><td>Exact agreed-snapshot access, ticket/fingerprint/return events, held resends and the no-waiting-change invariant.</td></tr>
+<tr><td>GridCraft fork · <code>crates/engine/src/coauthor/ids.rs</code>, <code>editor.rs</code>, <code>mod.rs</code></td><td>Validate/encode session identities; write an agreed <code>GridSnapshot</code>; load checkpoint bytes plus identities; expose G5's checkpoint host surface.</td></tr>
+<tr><td>GridCraft fork · <code>crates/engine/src/io.rs</code>, <code>cmd.rs</code>, <code>fingerprint.rs</code></td><td>Checkpoint-specific XLSX parsing, full recalculation and row-height fidelity; entered-only wire digest remains explicit.</td></tr>
+<tr><td>GridCraft fork · <code>crates/engine/tests/it/coauthor_save_reload.rs</code>, <code>coauthor_live.rs</code>, <code>coauthor_replay.rs</code>, <code>tests/wasm_replay.rs</code></td><td>Lossless checkpoint, waiting-change, native/WASM entered agreement and later-join proofs.</td></tr>
+<tr><td>ShareCraft · <code>crates/records/migrations/0020_live_checkpoints.sql</code></td><td>Live checkpoint/revision/session-data records, verification fields and return tombstones; latest migration on this branch is currently 0019.</td></tr>
+<tr><td>ShareCraft · <code>crates/records/src/live.rs</code>, <code>tests/live.rs</code></td><td>Atomic checkpoint metadata, contributors, verification, session data, bounded byte counts, return age and retention.</td></tr>
+<tr><td>ShareCraft · <code>crates/server/src/live_store.rs</code>, <code>live_room.rs</code>, <code>tests/live_room.rs</code></td><td>Store abstraction/memory stand-in, ticket selection/lifecycle, verification, fingerprints, pause, return barriers and events.</td></tr>
+<tr><td>ShareCraft · <code>crates/server/src/api/content.rs</code>, <code>api/mod.rs</code>, <code>tests/content.rs</code></td><td>Authenticated live-checkpoint bytes/hash endpoint, streaming limits and hand-off to the live room while reusing content-store claims and checkpoint writing.</td></tr>
+<tr><td>ShareCraft · <code>crates/server/src/config.rs</code>, <code>lib.rs</code>, <code>checkpoint.rs</code></td><td>Fixed live timing/limits and reuse of <code>Checkpointer</code>/<code>Checkpoint</code> with live metadata and multi-author credit.</td></tr>
+<tr><td>ShareCraft · <code>BUILDING.html</code>, <code>co-authoring-approach.html</code>, <code>sequencing.html</code></td><td>Operational limits, migration, events, completed G4 status and remaining G5/C20 limits.</td></tr>
+<tr><td>GridCraft fork · <code>docs/coauthor-determinism.md</code>, <code>docs/gaps.md</code>, <code>docs/roadmap.md</code>, <code>ROADMAP.md</code></td><td>Checkpoint guarantees, test evidence and remaining bridge/maths/large-content limits.</td></tr>
+</tbody>
+</table>
+
+<div class="task">
+<h3>Task 1 [ShareCraft]: validate every deserialised <code>OrderedIds</code></h3>
+<p><strong>Files:</strong> modify <code>crates/collab-live/src/ids.rs</code>.</p>
+<p><strong>Interfaces:</strong></p>
+<pre><code>impl OrderedIds {
+    pub fn validate(&amp;self) -&gt; Result&lt;(), IdError&gt;;
+}
+
+// Replace the derived implementation; serialised JSON stays compatible.
+impl&lt;'de&gt; Deserialize&lt;'de&gt; for OrderedIds;</code></pre>
+<ol class="steps">
+<li><strong>Write failing tests</strong> <code>ordered_ids_reject_invalid_serialized_runs</code>, <code>ordered_ids_reject_live_deleted_overlap</code>, <code>ordered_ids_reject_duplicate_deleted_ids</code> and <code>ordered_ids_valid_round_trip_still_works</code>. Construct JSON with zero-length runs, counter overflow, total live length over <code>u32::MAX</code>, overlapping live runs, live/deleted overlap, deleted/deleted overlap and a deleted <code>after</code> identity that is neither live nor <code>null</code>. Assert a serde error, never a panic.</li>
+<li><strong>Run:</strong> <code>cargo test -p collab-live ids -- --nocapture</code>. Expected: invalid forms currently deserialize.</li>
+<li><strong>Add validation without changing the wire form.</strong> Deserialize through private raw structs, reject every malformed invariant, require all runs to have positive length and fit <code>u32</code> counters, require live length to fit <code>u32</code>, reject an identity present more than once across either collection, and require each deleted <code>after</code> to name a currently live identity. Keep non-adjacent live runs legal because moves can create them.</li>
+<li><strong>Make mutation preserve the same invariants.</strong> Add debug-only validation at successful exits of <code>insert</code>, <code>delete</code> and <code>move_block</code>; do not turn hostile input into a production panic.</li>
+<li><strong>Run:</strong> focused tests and the existing <code>ordered_ids_match_a_plain_list</code> property test. Expected: pass with unchanged valid JSON.</li>
+<li><strong>Commit:</strong> <code>G4.1: validate stored live identities</code>.</li>
+</ol>
+</div>
+
+<div class="task">
+<h3>Task 2 [ShareCraft]: add checkpoint, agreement and return control messages</h3>
+<p><strong>Files:</strong> modify <code>crates/protocol/src/live.rs</code>; extend its unit tests.</p>
+<p><strong>Interfaces:</strong></p>
+<pre><code>pub enum LiveBuild { Browser, Desktop }
+pub enum TicketPurpose { Write, Verify }
+
+LiveClientMsg::LiveJoin { /* existing fields */, can_checkpoint: bool,
+    build: LiveBuild, returning_through: Option&lt;LocalNo&gt; }
+LiveClientMsg::Fingerprint { at: Seq, entered: String }
+LiveClientMsg::CheckpointReady { ticket: Uuid, at: Seq }
+LiveClientMsg::CheckpointFailed { ticket: Uuid }
+
+LiveServerMsg::CheckpointTicket { ticket: Uuid, purpose: TicketPurpose,
+    at: Seq, base: Option&lt;String&gt;, major: Option&lt;MajorReason&gt; }
+LiveServerMsg::ChangesPaused { entries: u64, bytes: u64 }
+LiveServerMsg::ChangesResumed
+LiveServerMsg::ReturnReady { through: LocalNo }
+LiveServerMsg::ArchiveReturn { current: Option&lt;String&gt; }</code></pre>
+<ol class="steps">
+<li><strong>Write failing protocol tests</strong> <code>checkpoint_wire_forms_are_pinned</code>, <code>fingerprint_wire_form_is_entered_only</code>, <code>return_barrier_wire_forms_are_pinned</code> and extend <code>live_message_tags_are_pinned</code>. Pin UUID, <code>Seq</code>, revision string, purpose, build and major reason JSON. There must be no computed-hash field.</li>
+<li><strong>Run:</strong> <code>cargo test -p protocol live -- --nocapture</code>. Expected: fail on missing variants.</li>
+<li><strong>Add closed serde enums.</strong> Keep <code>deny_unknown_fields</code> on client messages, lowercase/snake-case tags and the existing redacted <code>Debug</code>. Validate the entered digest as exactly 64 lowercase hex characters at the room boundary, not by adding arbitrary JSON.</li>
+<li><strong>Keep capability separate from permission.</strong> <code>can_checkpoint</code> means the host can make bytes now; it never grants edit rights. A viewer or a participant whose tab is hidden may report false.</li>
+<li><strong>Run:</strong> protocol tests and <code>cargo test -p collab-live --no-run</code>. Expected: exhaustive matches identify every G2 client/server location that Task 3 must update.</li>
+<li><strong>Commit:</strong> <code>G4.2: define live checkpoint control messages</code>.</li>
+</ol>
+</div>
+
+<div class="task">
+<h3>Task 3 [ShareCraft]: expose an exact agreed snapshot and hold return resends</h3>
+<p><strong>Files:</strong> modify <code>crates/collab-live/src/client.rs</code>, <code>crates/collab-live/tests/client.rs</code>, <code>tests/convergence.rs</code> and <code>tests/support/sim.rs</code>.</p>
+<p><strong>Interfaces:</strong></p>
+<pre><code>pub struct LiveConfig { /* existing */, pub can_checkpoint: bool, pub build: LiveBuild }
+
+impl&lt;E: LiveEditor&gt; LiveClient&lt;E&gt; {
+    pub fn agreed_snapshot&lt;'a&gt;(&amp;'a self, editor: &amp;'a E, at: Seq)
+        -&gt; Result&lt;AgreedSnapshot&lt;'a, E&gt;, ClientError&gt;;
+    pub fn checkpoint_ready(&amp;self, ticket: Uuid, at: Seq) -&gt; Result&lt;String, ClientError&gt;;
+    pub fn fingerprint(&amp;self, at: Seq, entered: [u8; 32]) -&gt; Result&lt;String, ClientError&gt;;
+}
+
+pub enum AgreedSnapshot&lt;'a, E: LiveEditor&gt; {
+    Editor(&amp;'a E),
+    Saved(&amp;'a E::Snapshot),
+}</code></pre>
+<ol class="steps">
+<li><strong>Write failing tests</strong> <code>checkpoint_never_covers_a_waiting_change</code>, <code>checkpoint_requires_the_exact_agreed_position</code>, <code>returning_client_holds_resends_until_return_ready</code>, <code>archive_return_is_emitted_before_base_load</code> and <code>fingerprint_requires_an_agreed_position</code>. In the first, show a local change, ticket the preceding agreed position, and assert the returned snapshot lacks the local change while the editor still shows it.</li>
+<li><strong>Run:</strong> <code>cargo test -p collab-live --test client checkpoint -- --nocapture</code>. Expected: fail because the library exposes only the shown editor.</li>
+<li><strong>Return a borrowed agreed state.</strong> At exactly <code>agreed_seq</code>, return <code>Saved</code> when <code>self.agreed</code> exists and <code>Editor</code> only when <code>agreed</code> is absent (which <code>settle</code> guarantees means no shown waiting/folded state). Reject any other position, loading/resync/stalled phase or missing base.</li>
+<li><strong>Advertise the return batch.</strong> On <code>connected</code>, set <code>returning_through</code> to the highest local that already exists in <code>pending</code>. For <code>Place::Returning</code>, do not call <code>send_unsent</code> until <code>ReturnReady</code>; ordinary new work is also held behind the barrier. On <code>ArchiveReturn</code>, emit an event before accepting the new base so G5 can archive the old shown copy.</li>
+<li><strong>Add host events</strong> for ticket received, paused/resumed, verify requested, return ready and archive-return. Events carry positions/tickets/revisions only, never file or entry content.</li>
+<li><strong>Run:</strong> all <code>collab-live</code> tests, especially reconnect/resend, expiry and convergence. Expected: G2 behaviour remains unchanged when the new fields use their default test values.</li>
+<li><strong>Commit:</strong> <code>G4.3: expose checkpoint-safe agreed state</code>.</li>
+</ol>
+</div>
+
+<div class="task">
+<h3>Task 4 [GridCraft fork]: validate session identities and write agreed checkpoints</h3>
+<p><strong>Files:</strong> modify <code>crates/engine/src/coauthor/ids.rs</code>, <code>editor.rs</code>, <code>mod.rs</code>; extend <code>crates/engine/tests/it/coauthor_live.rs</code> and <code>coauthor_save_reload.rs</code>.</p>
+<p><strong>Interfaces:</strong></p>
+<pre><code>pub struct GridCheckpoint {
+    pub bytes: Vec&lt;u8&gt;,
+    pub session_data: Vec&lt;u8&gt;,
+    pub sha256: [u8; 32],
+    pub entered: [u8; 32],
+}
+
+impl WorkbookIds {
+    pub fn from_session_data(bytes: &amp;[u8], wb: &amp;Workbook) -&gt; Result&lt;Self, CoauthorError&gt;;
+    pub fn session_data(&amp;self) -&gt; Result&lt;Vec&lt;u8&gt;, CoauthorError&gt;;
+}
+
+impl GridCoauthor {
+    pub fn checkpoint(&amp;self, at: Seq) -&gt; Result&lt;GridCheckpoint, GridLiveError&gt;;
+}</code></pre>
+<ol class="steps">
+<li><strong>Write failing tests</strong> <code>workbook_ids_reject_inconsistent_session_data</code>, <code>grid_checkpoint_uses_the_agreed_snapshot</code>, <code>grid_checkpoint_restores_stored_view_before_writing</code> and <code>grid_checkpoint_bytes_are_deterministic</code>. Reject a sheet map missing a live sheet, a map with extra live ids, mismatched <code>SheetIds.id</code>, axes not exactly <code>MAX_ROWS</code>/<code>MAX_COLS</code>, unknown keys and identity JSON over 8 MiB. Assert a waiting cell edit is absent from file bytes and identities but remains visible in the live editor.</li>
+<li><strong>Run in the fork:</strong> <code>cargo test -p gridcraft-engine --test it coauthor_live checkpoint -- --nocapture</code>. Expected: fail on missing checkpoint surface.</li>
+<li><strong>Validate the whole <code>WorkbookIds</code> graph.</strong> Rely on Task 1 for each <code>OrderedIds</code>, then require the live sheet order to correspond one-for-one with the workbook and <code>by_id</code>; deleted sheet records may remain but cannot masquerade as live. Use serde's closed structs and checked lengths.</li>
+<li><strong>Write from <code>LiveClient::agreed_snapshot</code>.</strong> Add read-only helpers on <code>GridLiveEditor</code>/<code>GridSnapshot</code> that select the workbook, calc state and ids without restoring the shown editor. Clone the workbook only to put the last stored file-view fields back as C11 requires, then call the existing XLSX byte writer. Compute SHA-256 over the exact bytes and <code>fingerprint(...).entered</code> over that state.</li>
+<li><strong>Do not change ordinary Save.</strong> The checkpoint helper is an adapter method; <code>file.saveBytes</code>, local Undo history and the current view remain untouched.</li>
+<li><strong>Run:</strong> the focused tests, <code>save_is_deterministic</code> and <code>save_reload_save_is_stable</code>. Expected: pass.</li>
+<li><strong>Commit in the fork:</strong> <code>G4.4: write GridCraft agreed checkpoints</code>.</li>
+</ol>
+</div>
+
+<div class="task">
+<h3>Task 5 [GridCraft fork]: full-recalc checkpoint load and row-height fidelity</h3>
+<p><strong>Files:</strong> modify <code>crates/engine/src/io.rs</code>, <code>cmd.rs</code>, <code>coauthor/editor.rs</code>, <code>coauthor/mod.rs</code>, <code>tests/it/coauthor_save_reload.rs</code>.</p>
+<p><strong>Interfaces:</strong></p>
+<pre><code>pub fn open_checkpoint_bytes(name: &amp;str, bytes: &amp;[u8])
+    -&gt; Result&lt;(Workbook, Vec&lt;String&gt;)&gt;;
+
+impl GridCoauthor {
+    pub fn load_checkpoint(&amp;mut self, bytes: &amp;[u8], session_data: &amp;[u8],
+        stamp: Stamp) -&gt; Result&lt;(), GridLiveError&gt;;
+}</code></pre>
+<ol class="steps">
+<li><strong>Turn the G1 loss into failing positive tests.</strong> Replace ignored <code>known_loss_reopen_refits_rows_from_values</code> with <code>checkpoint_reload_preserves_wrapped_formula_row_height</code> and <code>checkpoint_reload_preserves_seed_3996_row_heights</code>. Add <code>checkpoint_load_recalculates_every_formula</code> and <code>ordinary_file_open_still_fits_imported_rows</code>.</li>
+<li><strong>Run:</strong> <code>cargo test -p gridcraft-engine --test it coauthor_save_reload -- --nocapture</code>. Expected: the two former known-loss cases fail before the fix.</li>
+<li><strong>Separate parsing from imported-file fitting.</strong> Factor the existing <code>open_bytes_with</code> path so <code>open_checkpoint_bytes</code> parses XLSX but does not call <code>fit_imported_rows</code>. Keep <code>open_bytes</code>, password handling, CSV and File › Open behaviour exactly as today.</li>
+<li><strong>Keep live automatic heights current.</strong> In the existing command commit pipeline, capture the rows of formula cells whose displayed value changed during recalculation and add them to <code>fit_rows</code>; auto-fit those rows after recalculation with the same deduplication as directly changed rows. Preserve explicit/custom heights, hidden rows and merged-cell exclusions already guarded by the row-fit tests.</li>
+<li><strong>Load with full calculation.</strong> Build the checkpoint document with <code>DocState::new</code>, not <code>from_saved</code>, after applying the supplied deterministic clock/RAND stamp. Replace identities only after <code>WorkbookIds::from_session_data</code> validates against the loaded workbook; failure leaves the old editor untouched.</li>
+<li><strong>Run:</strong> all <code>coauthor_save_reload</code> tests, engine row-fit tests around <code>open_grows_default_height_rows_to_their_font</code>, and <code>save_reload_lossless</code> with at least the normal 200 generated seeds. Expected: no ignored G4 row-height test remains.</li>
+<li><strong>Commit in the fork:</strong> <code>G4.5: load checkpoints with full recalculation</code>.</li>
+</ol>
+</div>
+
+<div class="task">
+<h3>Task 6 [ShareCraft]: persist checkpoint positions, hashes and session data</h3>
+<p><strong>Files:</strong> create <code>crates/records/migrations/0020_live_checkpoints.sql</code>; modify <code>crates/records/src/live.rs</code>, <code>crates/records/src/lib.rs</code>, <code>crates/records/tests/live.rs</code>.</p>
+<p><strong>Interfaces:</strong></p>
+<pre><code>pub struct LiveCheckpointRow { pub revision: String, pub through: Seq,
+    pub sha256: [u8; 32], pub verified: bool, pub session: Uuid,
+    pub session_data: Vec&lt;u8&gt;, pub major_reason: Option&lt;String&gt;,
+    pub major_person: Option&lt;UserId&gt; }
+
+pub struct NewLiveCheckpoint&lt;'a&gt; { /* same durable fields plus created_at */ }
+
+impl Db {
+    pub async fn record_live_checkpoint(&amp;self, doc: DocId,
+        checkpoint: &amp;NewLiveCheckpoint&lt;'_&gt;) -&gt; Result&lt;(), DbError&gt;;
+    pub async fn verify_live_checkpoint(&amp;self, doc: DocId, revision: &amp;str,
+        through: Seq, at: OffsetDateTime) -&gt; Result&lt;(), DbError&gt;;
+}</code></pre>
+<ol class="steps">
+<li><strong>Write failing database tests</strong> <code>live_checkpoint_records_revision_position_hash_and_session_data</code>, <code>verification_advances_only_the_matching_checkpoint</code>, <code>checkpoint_position_cannot_exceed_head</code>, <code>older_checkpoint_cannot_replace_the_base</code>, <code>session_data_survives_until_covered_entries_expire</code> and <code>return_tombstone_survives_detail_retention</code>.</li>
+<li><strong>Run:</strong> <code>cargo xtask test -p records --test live -- --nocapture</code>. Expected: fail before migration/API.</li>
+<li><strong>Add migration 0020 with LF lines.</strong> Add a live-checkpoint table keyed by document/revision and unique document/position, fixed 32-byte hash, verified timestamp, opaque session-data bytes, session id, major reason/person and created time. Add minimal ended-session return fields without retaining purged entries/session-data. Use foreign keys already present; do not edit 0018 or 0019.</li>
+<li><strong>Make verification atomic.</strong> Under the live-log row lock, require the named checkpoint, hash/position match and <code>through &lt;= head</code>; mark it verified and call the existing verified-through update in the same transaction. A stale lower verification cannot move the base or reset retention.</li>
+<li><strong>Extend <code>LiveLoaded</code>.</strong> Return the newest verified checkpoint as catch-up base, any later unverified checkpoints needing a hash, retained session data, unsaved entry/byte totals and return tombstones. Keep entries ordered strictly after <code>verified_through</code>.</li>
+<li><strong>Run:</strong> focused records tests, migration checksum/line-ending tests and existing retention/purge tests. Expected: pass.</li>
+<li><strong>Commit:</strong> <code>G4.6: store live checkpoint metadata</code>.</li>
+</ol>
+</div>
+
+<div class="task">
+<h3>Task 7 [ShareCraft]: extend the live store and reconstruct the real catch-up base</h3>
+<p><strong>Files:</strong> modify <code>crates/server/src/live_store.rs</code>, <code>live_room.rs</code>; extend their inline unit tests.</p>
+<p><strong>Interfaces:</strong> add <code>record_live_checkpoint</code>, <code>verify_live_checkpoint</code> and return-tombstone lookup to <code>LiveStore</code> and its <code>Db</code>/<code>MemStore</code> implementations. Add the verified checkpoint/session data and byte totals to <code>MemoryDoc</code>.</p>
+<ol class="steps">
+<li><strong>Write failing room/store tests</strong> <code>join_catchup_uses_the_last_verified_revision_and_position</code>, <code>unverified_checkpoint_does_not_advance_catchup_base</code>, <code>restart_loads_session_data_with_the_base</code> and <code>checkpoint_commit_reconciles_after_unknown_db_outcome</code>.</li>
+<li><strong>Run:</strong> <code>cargo xtask test -p server live_room:: -- --nocapture</code>. Expected: G2 catch-up still names base 0/no revision.</li>
+<li><strong>Implement the store boundary first.</strong> Keep production and memory semantics identical: record an unverified or verified checkpoint, verify only an exact match, load newest base and preserve a checkpoint needing later verification. Add failure injection before/after durable operations to exercise retry and unknown outcome.</li>
+<li><strong>Initialise <code>LiveRoom</code> from the loaded base.</strong> Set its base position/revision/session data and unsaved counters from <code>LiveLoaded</code>, then hold only entries after the verified base. A room with a current unverified revision still sends joiners the last verified revision plus retained entries, as C6 requires.</li>
+<li><strong>Reconcile without guessing.</strong> If Git already contains the revision but the database outcome is unknown, use the existing revision index/checkpointer description to insert the missing checkpoint metadata only when document, base fields, through-position and byte hash agree; otherwise leave it unverified and emit a fault.</li>
+<li><strong>Run:</strong> focused tests and existing live restart, retention and purge tests. Expected: pass.</li>
+<li><strong>Commit:</strong> <code>G4.7: load live rooms from verified checkpoints</code>.</li>
+</ol>
+</div>
+
+<div class="task">
+<h3>Task 8 [ShareCraft]: issue tickets and store participant-written checkpoints</h3>
+<p><strong>Files:</strong> modify <code>crates/server/src/live_room.rs</code>, <code>api/content.rs</code>, <code>api/mod.rs</code>, <code>config.rs</code>, <code>lib.rs</code>, <code>checkpoint.rs</code>, <code>crates/server/tests/content.rs</code>, <code>tests/live_room.rs</code>.</p>
+<p><strong>Interfaces:</strong></p>
+<pre><code>LiveCommand::CheckpointUpload { user: UserId, ticket: Uuid, at: Seq,
+    base: Option&lt;RevisionId&gt;, blob: BlobRef, session_data: Vec&lt;u8&gt;,
+    reply: oneshot::Sender&lt;LiveCheckpointReply&gt; }
+LiveCommand::CheckpointHash { user: UserId, ticket: Uuid, at: Seq,
+    sha256: [u8; 32], reply: oneshot::Sender&lt;LiveCheckpointReply&gt; }
+
+PUT /api/docs/{id}/live-checkpoint?ticket=&amp;at=&amp;base=
+POST /api/docs/{id}/live-checkpoint/hash</code></pre>
+<ol class="steps">
+<li><strong>Write failing tests</strong> <code>due_checkpoint_tickets_one_capable_editor</code>, <code>checkpoint_upload_is_checked_before_body</code>, <code>checkpoint_credits_every_contributor_through_position</code>, <code>ticket_is_cancelled_on_expiry_and_role_loss</code>, <code>ticket_is_one_use_and_expires</code> and <code>checkpoint_position_cannot_cover_a_later_entry</code>. Assert viewer/wrong participant/wrong position/base/used/expired tickets are refused before reading the request body.</li>
+<li><strong>Run:</strong> <code>cargo xtask test -p server live_checkpoint -- --nocapture</code>. Expected: endpoint/room command missing.</li>
+<li><strong>Add the proposed cadence and selector.</strong> Track first/last unsaved times, one active ticket and eligible connected editors. Prefer a participant other than the last writer and prefer visible/capable clients; use deterministic participant order in tests. Cancellation immediately makes the next eligible participant selectable.</li>
+<li><strong>Stream bytes through existing machinery.</strong> Reuse <code>room_for_body</code>, <code>body_blob</code>, quota reservation, content-store hold/claim and <code>Checkpointer::checkpoint</code>. Build fields containing <code>verified</code>, <code>live_through</code>, optional <code>major</code>, reason and person. Authors are distinct contributing users whose last change is at or before the ticket position, in first-contribution order.</li>
+<li><strong>Store bytes and session data as one logical result.</strong> Only after the checkpointer returns a revision record <code>NewLiveCheckpoint</code>. On a DB failure, keep the content/revision for reconcile and fail the ticket; never broadcast a new base early. On stale base, enter Task 11's S4 recovery instead of retrying against the outside file silently.</li>
+<li><strong>Reply and broadcast state.</strong> The primary upload becomes current even when unverified, clears saved unsaved counters through its position, and triggers a verify ticket; it does not call <code>mark_live_verified</code>. Issue <code>revision.saved</code> and <code>live.checkpoint_unverified</code> events without entry content.</li>
+<li><strong>Run:</strong> focused API/room tests and existing file save/content-store/quota tests. Expected: pass.</li>
+<li><strong>Commit:</strong> <code>G4.8: store participant live checkpoints</code>.</li>
+</ol>
+</div>
+
+<div class="task">
+<h3>Task 9 [ShareCraft]: verify with a second hash and compare entered agreement</h3>
+<p><strong>Files:</strong> modify <code>crates/server/src/live_room.rs</code>, <code>live_store.rs</code>, <code>api/content.rs</code>; extend <code>crates/server/tests/live_room.rs</code>, <code>content.rs</code>.</p>
+<ol class="steps">
+<li><strong>Write failing tests</strong> <code>matching_second_hash_verifies_checkpoint</code>, <code>same_participant_cannot_verify_its_upload</code>, <code>lone_checkpoint_stays_unverified_until_second_hash</code>, <code>later_joiner_rederives_unverified_checkpoint</code>, <code>second_hash_mismatch_keeps_both_files_and_log</code>, <code>agreement_uses_entered_digest_only</code> and <code>agreement_mismatch_resyncs_only_the_odd_client</code>.</li>
+<li><strong>Run:</strong> the named server tests. Expected: fail because the primary upload has no verifier/fingerprint book.</li>
+<li><strong>Verify exact bytes at an exact position.</strong> A verify ticket names the stored revision and position. Accept only another editing participant's hash. A match atomically verifies the checkpoint, calls <code>Db::mark_live_verified</code> through Task 6, advances the room base, and permits retention; emit <code>live.checkpoint_verified</code>.</li>
+<li><strong>Handle no verifier and mismatch.</strong> Keep the revision current/unverified and the log/session data retained. On mismatch, record <code>live.checkpoint_mismatch</code>, send the verifier a new write-purpose forensic ticket for the same position, and store those bytes as a history revision without making them the agreed base. Both files then remain inspectable; the room continues from the log.</li>
+<li><strong>Ask later editors before ordinary checkpoint work.</strong> On an editing join, if an unverified checkpoint exists, catch up from the last verified base to its position and issue a verify ticket there before issuing a newer write ticket. Do not ask a viewer.</li>
+<li><strong>Add agreement buckets keyed by <code>Seq</code>.</strong> Every 64 changes ask capable editors for the entered digest. Compare only reports from editors that reached that exact position; choose the majority digest when at least three report, otherwise resync both on a two-way disagreement. Bound and discard old buckets at the verified base.</li>
+<li><strong>Run:</strong> focused tests plus cancellation/resync/restart tests. Expected: pass.</li>
+<li><strong>Commit:</strong> <code>G4.9: verify live checkpoints and agreement</code>.</li>
+</ol>
+</div>
+
+<div class="task">
+<h3>Task 10 [ShareCraft]: enforce unsaved-log and catch-up limits</h3>
+<p><strong>Files:</strong> modify <code>crates/server/src/live_room.rs</code>, <code>live_store.rs</code>, <code>config.rs</code>, <code>crates/records/src/live.rs</code>; extend room, records and server integration tests.</p>
+<p><strong>Interfaces:</strong> constants/config fields for the proposal: warning <code>4_000</code> entries / <code>48 * 1024 * 1024</code> bytes; hard <code>5_000</code> entries / <code>64 * 1024 * 1024</code> bytes; session data <code>8 * 1024 * 1024</code> bytes.</p>
+<ol class="steps">
+<li><strong>Write failing tests</strong> <code>warning_threshold_issues_urgent_ticket</code>, <code>entry_limit_pauses_before_storing_the_next_change</code>, <code>byte_limit_pauses_before_storing_the_next_change</code>, <code>paused_room_still_accepts_control_messages</code>, <code>verified_checkpoint_resumes_changes</code>, <code>restart_cancels_ticket_and_keeps_pause</code>, <code>catchup_never_exceeds_the_unsaved_limits</code> and <code>session_data_limit_is_enforced_before_upload</code>.</li>
+<li><strong>Run:</strong> focused room/records tests. Expected: G2 stores until database or memory exhaustion.</li>
+<li><strong>Count authoritative stored data.</strong> Have <code>append_live_change</code>/<code>cancel_live_entry</code> return or update exact retained entry/payload byte totals under the log lock; initialise from <code>LiveLoaded</code>. Do not rely on JSON frame length or a client-declared value.</li>
+<li><strong>Check before append.</strong> If the next entry would cross either hard limit, consume/refuse its local number with a new stable <code>log_paused</code> reason, do not write/broadcast it, send <code>ChangesPaused</code>, and keep heartbeats/report/resync/leave/fingerprint/checkpoint traffic live. At warning, ask urgently but continue until hard.</li>
+<li><strong>Bound joins as well as writes.</strong> A room loaded at/over hard limit is paused and sends at most the retained bounded set from the verified base. If durable state violates the configured cap (for example after lowering a setting), refuse new live joins with a recoverable server fault rather than allocating an unbounded catch-up.</li>
+<li><strong>Resume only after a durable checkpoint result.</strong> A stored checkpoint may lower unsaved counters, but new changes resume only when the room has a usable base and the remaining catch-up is below both hard limits; verification later advances retention independently.</li>
+<li><strong>Emit events</strong> <code>live.log_warning</code>, <code>live.changes_paused</code> and <code>live.changes_resumed</code> with counts/bytes only and no content.</li>
+<li><strong>Run:</strong> focused tests, the server live-room integration suite and a test using 5,000 small entries without an oversized allocation. Expected: pass.</li>
+<li><strong>Commit:</strong> <code>G4.10: bound unsaved live logs and catchup</code>.</li>
+</ol>
+</div>
+
+<div class="task">
+<h3>Task 11 [ShareCraft + GridCraft fork]: returning-client barriers and major versions</h3>
+<p><strong>Files:</strong> ShareCraft modifies <code>crates/collab-live/src/client.rs</code>, <code>crates/server/src/live_room.rs</code>, <code>live_store.rs</code>, <code>crates/records/src/live.rs</code>, room/client/records tests; GridCraft modifies <code>crates/engine/src/coauthor/mod.rs</code>, <code>editor.rs</code> and <code>tests/it/coauthor_live.rs</code>.</p>
+<ol class="steps">
+<li><strong>Write failing cross-layer tests</strong> <code>expired_return_stores_current_then_late_result_as_major</code>, <code>return_batch_ends_at_the_local_named_on_join</code>, <code>returning_changes_keep_other_peoples_work</code>, <code>returning_deleted_target_is_no_effect_and_kept_for_the_author</code>, <code>return_after_thirty_days_archives_old_copy_below_current</code> and <code>one_seat_return_remains_the_file_session_rule</code>.</li>
+<li><strong>Run:</strong> ShareCraft client/room tests and GridCraft <code>coauthor_live</code>. Expected: G2 currently reports <code>Returned</code> then sends waiting entries immediately, with no version barrier.</li>
+<li><strong>Barrier before the return batch.</strong> When a known ended place rejoins within 30 days with <code>returning_through</code>, pause ordinary new entries, checkpoint the current head with <code>major: true</code>, reason <code>returning_client_before</code> and the returning person, then send <code>ReturnReady</code>. If the head is already the stored current revision, write metadata that marks that point major without fabricating different content.</li>
+<li><strong>Track exactly the old waiting batch.</strong> Accept its locals through the join's <code>returning_through</code> by normal order/identity/conflict rules. Do not classify later work as offline. After that local is durably appended, issue an immediate checkpoint at the resulting head with <code>major: true</code>, reason <code>returning_client_after</code>, and normal contributor credit including the returning person.</li>
+<li><strong>Keep failed GridCraft targets copyable.</strong> GridCraft's host event for <code>Effect::NoEffect</code> retains the original pending payload/text for G5's notice. The major checkpoint omits no-effect entries' document effect but the log keeps the audit entry.</li>
+<li><strong>Handle returns older than 30 days.</strong> Use the minimal tombstone to send <code>ArchiveReturn</code> before loading current. GridCraft writes its old shown copy as deterministic bytes. ShareCraft commits that copy as a major revision on top of current, then commits the unchanged current blob again as the current major revision; no old identity is applied to the new session.</li>
+<li><strong>Keep one-seat editors unchanged.</strong> Do not route WordCraft/PdfCraft/SolidCraft through the live return path. Their existing whole-file version-on-top semantics remain for their later stages.</li>
+<li><strong>Run:</strong> all named tests, expiry/reconnect/repeat tests, GridCraft two-client convergence and revision-history tests. Expected: pass and no return batch can start before the “before” major point exists.</li>
+<li><strong>Commit separately by repository:</strong> ShareCraft <code>G4.11: store returning clients as major versions</code>; GridCraft <code>G4.11: expose returning checkpoint copies</code>.</li>
+</ol>
+</div>
+
+<div class="task">
+<h3>Task 12 [ShareCraft + GridCraft fork]: stale-base recovery, end-to-end proof, documents and final gates</h3>
+<p><strong>Files:</strong> ShareCraft extends <code>crates/server/tests/live_room.rs</code>, <code>content.rs</code>, <code>BUILDING.html</code>, <code>co-authoring-approach.html</code>, <code>sequencing.html</code>; GridCraft extends <code>crates/engine/tests/it/coauthor_save_reload.rs</code>, <code>coauthor_live.rs</code>, <code>coauthor_replay.rs</code>, <code>tests/wasm_replay.rs</code>, and updates <code>docs/coauthor-determinism.md</code>, <code>docs/gaps.md</code>, <code>docs/roadmap.md</code>, <code>ROADMAP.md</code>.</p>
+<ol class="steps">
+<li><strong>Write the final failing scenarios</strong> <code>stale_live_checkpoint_preserves_both_versions</code>, <code>checkpoint_then_catchup_equals_straight_through</code>, <code>verified_checkpoint_survives_room_and_server_restart</code>, <code>native_and_wasm_checkpoint_agree_on_entered_content</code> and <code>checkpoint_hash_matches_between_two_grid_editors</code>. The straight-through test uses two GridCraft clients, a pending change during the ticket, saved session identities, a late join and further structural/content changes.</li>
+<li><strong>Implement S4 recovery.</strong> On a stale primary ticket, stop the room. Use the uploaded live-state bytes to make a major revision on top of the outside current revision, then re-store the outside revision's blob/fields unchanged as the current major revision. Record reason, people, old/new bases and positions; never merge the two files or discard the log.</li>
+<li><strong>Prove second-writer bytes.</strong> Two fresh GridCraft editors load the verified base/session data, replay the same retained entries, write at the ticket position and produce identical SHA-256. Repeat from one checkpoint plus suffix versus straight-through. The entered fingerprints must match after every later entry; native computed equality is diagnostic only.</li>
+<li><strong>Update ShareCraft documentation.</strong> In <code>BUILDING.html</code> document migration 0020, 15/120-second cadence, all entry/byte/session-data limits, ticket cancellation, verification, return major versions, events and the fact that the room remains off until G5. Update the adopted paper only with factual G4 build notes; do not alter C1–C23. Update sequencing progress without claiming browser acceptance.</li>
+<li><strong>Update GridCraft documentation.</strong> Record full-recalc checkpoint loading, fixed row-height loss, deterministic checkpoint bytes/session identities and entered-only agreement. Keep common maths, real browsers, G5 bridge, large content and unshared commands open. Remove only the resolved G4 known-loss note.</li>
+<li><strong>Run focused ShareCraft gates:</strong> all named G4 tests; <code>cargo xtask test -p collab-live</code>; <code>cargo xtask test -p records --test live</code>; <code>cargo xtask test -p server live_room -- --nocapture</code>; content/revision/retention/purge tests. Expected: pass.</li>
+<li><strong>Run focused GridCraft gates:</strong> all coauthor integration tests; normal and extended <code>save_reload_lossless</code>; native/WASM entered replay; row-height/open tests. Then run <code>cargo xtask ci</code>. Expected: fmt, clippy with warnings denied, tests, assets, layers and WASM pass; no production panic or unsafe and no agent attribution.</li>
+<li><strong>Run ShareCraft's full gate:</strong> <code>cargo xtask check</code>. Review both complete diffs, migrations and generated files. Confirm no CI workflow changed, G4 did not enable GridCraft, and the only cross-repository dependency remains the sibling <code>collab-live</code> relationship established by G3.</li>
+<li><strong>Commit separately by repository:</strong> ShareCraft <code>G4.12: document verified live checkpoints</code>; GridCraft <code>G4.12: prove checkpoint fidelity</code>.</li>
+</ol>
+</div>
+
+<h2>Spec coverage</h2>
+<table>
+<thead><tr><th>Binding requirement</th><th>Plan coverage</th></tr></thead>
+<tbody>
+<tr><td>C1/C4/S6: server orders and stores; no editor process or spreadsheet semantics on the server.</td><td>Architecture; Global constraints; Tasks 8–12 use opaque bytes, hashes and session data only.</td></tr>
+<tr><td>C6/section 05: one-use ticket; participant writes; second editor hashes; lone/mismatch stays unverified and is re-derived later.</td><td>Proposals 4–6; Tasks 2, 3, 6–9 and 12.</td></tr>
+<tr><td>Checkpoint base can never cover a waiting change (G2 final review).</td><td>Review focus 1; Task 3 <code>agreed_snapshot</code>; Task 4 GridCraft byte proof; Task 12 end-to-end suffix test.</td></tr>
+<tr><td>Validate deserialised <code>OrderedIds</code> invariants (G2 final review).</td><td>Task 1 and Task 4 whole-<code>WorkbookIds</code> validation.</td></tr>
+<tr><td>People joining later load last verified revision + session data + retained entries.</td><td>Tasks 5–7, 9 and 12.</td></tr>
+<tr><td>Proof condition: checkpoint loads fully recalculate and the 8/10,000 row-height loss is fixed.</td><td>Task 5 turns the ignored loss into passing positive tests; Task 12 extended proof.</td></tr>
+<tr><td>Proof condition: platform agreement compares entered content only.</td><td>Proposal 7; Global constraints; Tasks 2, 4, 9 and 12. No computed digest exists on the wire.</td></tr>
+<tr><td>C11: checkpoint file view does not depend on which person writes it.</td><td>Task 4 restores stored view fields only in the checkpoint clone and tests deterministic bytes.</td></tr>
+<tr><td>C14: format-version changes wait for retained entries.</td><td>Existing G2 format pin remains; Tasks 6–7 retain format/session data until the verified base and retention allow purge.</td></tr>
+<tr><td>C18/S4: leftover changes persist; outside replacement preserves live state as major then outside current again.</td><td>Tasks 6–8 retain unsaved state; Task 12 implements/tests stale-base recovery.</td></tr>
+<tr><td>C19: limit entries and bytes; pause changes with notice until checkpoint stored; bound catch-up before enabling.</td><td>Proposal 2; Global constraints; Task 10; G5 enable remains explicitly out of scope.</td></tr>
+<tr><td>C21: expiry cancels ticket and frees the participant.</td><td>Proposal 5; Global constraints; Tasks 8 and 10 restart/expiry tests.</td></tr>
+<tr><td>C22/C23: return after expiry creates “before” and “after” major history; after 30 days archive old copy below unchanged current; interim JSON metadata.</td><td>Proposal 8; Tasks 6, 11 and 12.</td></tr>
+<tr><td>S3/S7: one Git revision credits every contributor; publish checkpoint/audit events.</td><td>Tasks 8–12, including contributor-boundary and event assertions.</td></tr>
+<tr><td>C20 large content.</td><td>Proposal 9 and Not in this plan: explicitly deferred because G3 admits no command that needs it; must precede large shared paste/Undo.</td></tr>
+<tr><td>Fork rules: no panic/unsafe, hostile input bounded, WASM kept, docs/gates, no attribution.</td><td>Global constraints; Tasks 4, 5, 11 and 12.</td></tr>
+</tbody>
+</table>
+
+</main></body></html>
