@@ -194,7 +194,8 @@ const STOPS = Object.freeze({
 });
 const RESETS = Object.freeze({
   unavailable: 'This document is busy right now. Joining again shortly; your changes are kept.',
-  expired: 'You were away for a while. Joining again; your changes are kept.',
+  // What became of the changes made while away comes later (returned, archived_return).
+  expired: 'You were away for a while. Joining again.',
   base: "The latest version couldn't be loaded. Trying again shortly.",
   base_fetch: "The latest version couldn't be loaded. Trying again shortly.",
   overloaded: 'Too many changes arrived at once. Reconnecting; your changes are kept.',
@@ -204,8 +205,11 @@ const MISMATCH = 'Two editors saved different files for the same changes. Both a
 
 const info = (topic, text, actions = []) => ({ topic, text, role: 'status', actions });
 const stopNotice = (why) => {
-  const { text, actions } = Object.hasOwn(STOPS, why) ? STOPS[why] : STOPS.repeated;
-  return { topic: 'stop', text, role: 'alert', actions: [...actions] };
+  const known = Object.hasOwn(STOPS, why) ? why : 'repeated';
+  const { text, actions } = STOPS[known];
+  // The not-answering offer has its own topic: it goes when the editor answers again. Every
+  // other stop is final.
+  return { topic: known === 'not_answering' ? 'not_answering' : 'stop', text, role: 'alert', actions: [...actions] };
 };
 const returningNotice = (participant, context) => {
   const name = (position(participant) && context.nameOf?.(participant)) || 'someone';
@@ -269,7 +273,7 @@ export function liveNotice(source, value, context = {}) {
     case 'undo_refused':
       return info('change', "Undo isn't possible here, because someone else's changes depend on it.");
     case 'unshared':
-      return info('change', 'Not available while editing together.');
+      return info('change', "That command isn't available while editing together.");
     case 'paused':
       return pausedNotice(context);
     case 'resumed':
@@ -307,6 +311,38 @@ export function pickBanner(current, next) {
   if (next.clear) return current?.topic === next.topic ? null : (current ?? null);
   if (current?.role === 'alert' && next.role !== 'alert') return current;
   return next.actions.length > 2 ? { ...next, actions: next.actions.slice(0, 2) } : next;
+}
+
+const WAITING_LOST = " Changes made here since then weren't sent: download your copy before you reload.";
+
+/**
+ * The one banner the frame shows: `pageNotice` the page's own (an editor that did not start, an
+ * error), `live` the live session's (pickBanner), `waiting` the changes the editor still holds
+ * that the server has not taken. A live stop is never covered by a page notice; otherwise the
+ * page's notice comes first. A stop whose way on is Reload, with changes waiting, says they were
+ * not sent and offers the person's copy before the reload.
+ */
+export function shownBanner(pageNotice, live, waiting) {
+  const stopped = live?.role === 'alert';
+  const shown = stopped ? live : (pageNotice ?? live ?? null);
+  if (!stopped || shown !== live || !(waiting > 0) || !live.actions.includes('reload')) return shown;
+  return { ...live, text: live.text + WAITING_LOST, actions: ['mycopy', 'reload'] };
+}
+
+/**
+ * Whether this tab has changes the stored file may not hold, from what the page can see without
+ * reading an entry: `{type: 'sent'}` (this tab sent a change) and `{type: 'saved', through}` (a
+ * version was stored up to `through`). The page never learns the position of its own changes,
+ * so it counts conservatively: a change is covered by the first stored version whose position
+ * is beyond that of the one stored after the change was sent. A change sent before a version
+ * arrived may lie beyond it, so it waits for the next one; a repeat for a position already seen
+ * (a verification) moves nothing on. Answers `{ unsaved, sentSince, through }`.
+ */
+export function trackUnsaved(track, event) {
+  const now = track ?? { unsaved: false, sentSince: false, through: -1 };
+  if (event?.type === 'sent') return { ...now, unsaved: true, sentSince: true };
+  if (event?.type !== 'saved' || !position(event.through) || event.through <= now.through) return now;
+  return { unsaved: now.sentSince, sentSince: false, through: event.through };
 }
 
 /**
@@ -404,6 +440,7 @@ const integerHeader = (response, name, max) => {
  * - `stopped(why)`: the page stopped reconnecting (`repeated`, or the final server message);
  * - `peek(message)`, `access(canEdit)`, `notice(notice)`, `state(state)`: for the bar;
  * - `reset(kind)`: the editor could not follow and joins again after a wait;
+ * - `opened()`: a new socket is open (the room repeats any pause to a joiner);
  * - `changed()`: this tab sent one of its changes; `saving(on)`: a checkpoint upload started or
  *   the last one ended;
  * - `reloadEditor()`, `offerReload()`: the editor did not answer a tick in time;
@@ -465,7 +502,9 @@ export function connectLive(frame, bridge, docId, handlers = {}) {
     socket = ws;
     generation += 1;
     ws.onopen = () => {
-      if (ws === socket && !finished) live('open');
+      if (ws !== socket || finished) return;
+      live('open');
+      handlers.opened?.();
     };
     ws.onmessage = (event) => {
       if (ws !== socket || finished || typeof event.data !== 'string') return;

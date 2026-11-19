@@ -40,7 +40,7 @@ import {
 import { forgetOpened, rememberOpened } from './start.js';
 import { activityPanel } from './activity.js';
 import { downloadNote, liveLook, liveStatus, setupEditorFrame } from './editor-frame.js';
-import { connectLive, liveNotice, onlyEditor, pickBanner, warnOnLeave } from './live-host.js';
+import { connectLive, liveNotice, onlyEditor, pickBanner, shownBanner, trackUnsaved, warnOnLeave } from './live-host.js';
 import { createViewer } from './file-viewer.js';
 import { viewerList } from './viewer.js';
 
@@ -62,6 +62,7 @@ const statusPill = frameBox.querySelector('.status');
 const statusText = $('status');
 const saveButton = $('save');
 const downloadLink = $('download');
+const downloadNoteLine = $('download-note');
 const accessLink = $('access-link');
 const banner = $('banner');
 const bannerText = $('banner-text');
@@ -115,7 +116,9 @@ let liveCanEdit = false;    // this person may edit, as the room last said
 let livePeople = [];        // the room's last People list
 let livePaused = false;     // the room paused changes until the latest version is saved
 let liveSaving = false;     // a checkpoint upload is under way
-let liveUnsaved = false;    // this tab made changes since the last stored version
+let liveTrack = trackUnsaved(undefined, null); // this tab's changes against stored versions
+let liveStopped = false;    // the page stopped the live session for good (no reconnect)
+let bannerTimer = 0;        // the banner's text, written after its role changed
 let liveSavedSince = false; // a version was stored after the document answer was read
 let liveBanner = null;      // the live session's one banner (live-host.js pickBanner)
 let viewGen = 0;            // counts the files shown in the viewer; older answers are dropped
@@ -483,7 +486,7 @@ function showDownload() {
   if (knownRevision && !removed) downloadLink.href = contentUrl(knownRevision);
   else downloadLink.removeAttribute('href');
   // A live document's stored file can be behind what everyone sees (G5 Task 5's mark).
-  const note = liveMode && !removed ? downloadNote(doc, { savedSince: liveSavedSince, unsaved: liveUnsaved }) : '';
+  const note = liveMode && !removed ? downloadNote(doc, { savedSince: liveSavedSince, unsaved: liveTrack.unsaved }) : '';
   if (note) {
     downloadLink.title = `${note}.`;
     downloadLink.setAttribute('aria-label', `Download. ${note}.`);
@@ -491,6 +494,10 @@ function showDownload() {
     downloadLink.removeAttribute('title');
     downloadLink.removeAttribute('aria-label');
   }
+  // Said on screen too, under the bar (Download is in the menu on a narrow screen).
+  const visible = note && !downloadLink.hidden ? `${note}.` : '';
+  if (downloadNoteLine.textContent !== visible) downloadNoteLine.textContent = visible;
+  downloadNoteLine.hidden = !visible;
 }
 
 function showProblem(text, linkNearest = false) {
@@ -504,6 +511,7 @@ function showProblem(text, linkNearest = false) {
 // in memory, and the page does not reconnect.
 function stopRemoved(reason) {
   removed = true;
+  clearTimeout(bannerTimer);
   liveSession?.close();
   liveSession = null;
   liveBanner = null;
@@ -846,15 +854,23 @@ function startLive() {
     memory: liveMemory,
     state: (state) => {
       liveState = state;
+      // The editor answered: an offer to reload it is over.
+      liveBanner = pickBanner(liveBanner, { topic: 'not_answering', clear: true });
       // Joined again: what was said about reconnecting is over.
       if (state.phase === 'live') showLive({ topic: 'connection', clear: true });
       else render();
+    },
+    opened: () => {
+      // A new connection: a pause from before it is the room's to repeat (it does to a joiner).
+      livePaused = false;
+      showLive({ topic: 'paused', clear: true });
     },
     look: liveLook,
     removed: (reason) => stopRemoved(reason),
     stopped: (why) => {
       liveSession?.close();
       liveSession = null;
+      liveStopped = true;
       showLive(liveNotice('stop', why, liveContext()));
     },
     reloadEditor: reloadLiveEditor,
@@ -865,7 +881,7 @@ function startLive() {
       render();
     },
     changed: () => {
-      liveUnsaved = true;
+      liveTrack = trackUnsaved(liveTrack, { type: 'sent' });
       showDownload();
       render();
     },
@@ -888,6 +904,8 @@ function onLivePeek(message) {
     case 'people':
       livePeople = Array.isArray(message.people) ? message.people : [];
       showPeople(livePeople);
+      // Whether this tab is the only one that could save may have changed during a pause.
+      if (livePaused && liveBanner?.topic === 'paused') liveBanner = liveNotice('server', { type: 'changes_paused' }, liveContext());
       break;
     case 'changes_paused':
       livePaused = true;
@@ -899,7 +917,8 @@ function onLivePeek(message) {
       if (typeof message.revision === 'string' && message.revision.length <= 128) {
         knownRevision = message.revision;
         liveSavedSince = true;
-        liveUnsaved = false;
+        // Only changes this stored version can hold stop counting as unsaved (trackUnsaved).
+        liveTrack = trackUnsaved(liveTrack, { type: 'saved', through: message.through });
         showDownload();
       }
       break;
@@ -928,12 +947,14 @@ function showLive(next) {
 // The editor stopped answering: a fresh editor joins as a new client.
 function reloadLiveEditor() {
   if (removed) return;
-  if (liveBanner?.topic === 'stop') liveBanner = null;
+  liveBanner = pickBanner(liveBanner, { topic: 'not_answering', clear: true });
   liveSession?.close();
   liveSession = null;
   bridge?.close();
   editorReady = false;
   startEditor();
+  // The banner and its button are gone: focus goes to the new editor, not to the page's end.
+  frame?.focus();
 }
 
 function onDirty({ dirty }) {
@@ -1119,7 +1140,8 @@ function render() {
     // A live document has no seat and no Save: the status follows the room (Proposal 14).
     const label = chrome.setStatus(liveStatus(liveStatusState()));
     frameBox.dataset.state = label.tone;
-    setBanner(notice ?? liveBanner);
+    // A live stop is never covered by the page's own notice (shownBanner).
+    setBanner(shownBanner(notice, liveBanner, liveState?.waiting ?? 0));
     return;
   }
   if (lostEdit && somethingToLose() && !status.failed) updateStatus({ type: 'not_stored' });
@@ -1148,7 +1170,8 @@ function liveStatusState() {
     canEdit: liveCanEdit && liveState?.canEdit !== false,
     paused: livePaused,
     saving: liveSaving,
-    unsaved: liveUnsaved,
+    unsaved: liveTrack.unsaved,
+    stopped: liveStopped,
   };
 }
 
@@ -1169,12 +1192,24 @@ function setBanner(next) {
   const key = next ? `${next.role ?? ''}\n${next.text}\n${actions.join(',')}\n${next.copy ?? ''}` : '';
   if (key === bannerKey) return;
   bannerKey = key;
-  banner.setAttribute('role', alert ? 'alert' : 'status');
-  banner.setAttribute('aria-live', alert ? 'assertive' : 'polite');
+  clearTimeout(bannerTimer);
+  const role = alert ? 'alert' : 'status';
+  const write = () => {
+    bannerText.textContent = next?.text ?? '';
+    bannerActions.replaceChildren(...actions.map((kind) => actionControl(kind, next)));
+    banner.classList.toggle('idle', !next);
+  };
   banner.classList.toggle('info', next?.role === 'status');
-  bannerText.textContent = next?.text ?? '';
-  bannerActions.replaceChildren(...actions.map((kind) => actionControl(kind, next)));
-  banner.classList.toggle('idle', !next);
+  if (banner.getAttribute('role') === role) {
+    write();
+    return;
+  }
+  // A region that becomes live and changes at once is not announced by every screen reader:
+  // the role changes first, with the region empty, and the text follows.
+  banner.setAttribute('role', role);
+  banner.setAttribute('aria-live', alert ? 'assertive' : 'polite');
+  bannerText.textContent = '';
+  bannerTimer = setTimeout(write, 100);
 }
 
 function actionControl(kind, shown) {
@@ -1186,7 +1221,7 @@ function actionControl(kind, shown) {
     mycopy: ['Download my copy', downloadMyCopy],
     reload: ['Reload', () => location.reload()],
     reloadEditor: ['Reload editor', reloadLiveEditor],
-    copy: ['Copy text', (event) => copyKeptText(shown?.copy, event.currentTarget)],
+    copy: ['Copy text', (event) => copyKeptText(shown, event.currentTarget)],
     activity: ['Open Activity', (event) => {
       if (!removed && doc) activityPanel().open({ id: docId, name: doc.name, me, opener: event.currentTarget });
     }],
@@ -1197,12 +1232,19 @@ function actionControl(kind, shown) {
 }
 
 // The text a change that was not applied kept, to the clipboard; the button says how it went.
-async function copyKeptText(text, button) {
-  if (typeof text !== 'string') return;
+// The banner says how it went, so a screen reader hears it (a changed button label is silent).
+async function copyKeptText(shown, button) {
+  if (typeof shown?.copy !== 'string') return;
+  let result;
   try {
-    await navigator.clipboard.writeText(text);
+    await navigator.clipboard.writeText(shown.copy);
+    result = 'Your text was copied.';
     button.textContent = 'Copied';
   } catch {
+    result = "Your text couldn't be copied.";
     button.textContent = "Couldn't copy";
   }
+  if (removed || liveBanner !== shown) return;
+  liveBanner = { ...shown, text: `${shown.text} ${result}` };
+  render();
 }

@@ -9,6 +9,8 @@ import {
   parseLiveEditorMessage,
   peekServerFrame,
   pickBanner,
+  shownBanner,
+  trackUnsaved,
   warnOnLeave,
 } from './live-host.js';
 
@@ -701,7 +703,7 @@ test('live_notice_wording_for_each_kind', () => {
     ['editor', { kind: 'undo_left', cells: 1 }, 'Undo left 1 cell as it was, because someone changed it since.', 'status'],
     ['editor', { kind: 'undo_left', cells: 3 }, 'Undo left 3 cells as they were, because someone changed them since.', 'status'],
     ['editor', { kind: 'undo_refused', reason: 'anything' }, "Undo isn't possible here, because someone else's changes depend on it.", 'status'],
-    ['editor', { kind: 'unshared', command: 'sort' }, 'Not available while editing together.', 'status'],
+    ['editor', { kind: 'unshared', command: 'sort' }, "That command isn't available while editing together.", 'status'],
     ['editor', { kind: 'paused', entries: 10, bytes: 99 }, 'Changes are paused until the latest version is saved. A lot of changes are waiting to go into the stored file.', 'status'],
     ['editor', { kind: 'returned', not_applied: 0 }, 'Welcome back. The changes you made while away have been added.', 'status'],
     ['editor', { kind: 'returned', not_applied: 2 }, "Welcome back. 2 of the changes you made while away couldn't be applied.", 'status'],
@@ -722,7 +724,7 @@ test('live_notice_wording_for_each_kind', () => {
     ['server', { type: 'build_refused', build: {} }, "Editing together isn't available in the desktop app yet.", 'alert'],
     // Resets: joining again, never an error.
     ['reset', 'unavailable', 'This document is busy right now. Joining again shortly; your changes are kept.', 'status'],
-    ['reset', 'expired', 'You were away for a while. Joining again; your changes are kept.', 'status'],
+    ['reset', 'expired', 'You were away for a while. Joining again.', 'status'],
     ['reset', 'base', "The latest version couldn't be loaded. Trying again shortly.", 'status'],
     ['reset', 'base_fetch', "The latest version couldn't be loaded. Trying again shortly.", 'status'],
     ['reset', 'overloaded', 'Too many changes arrived at once. Reconnecting; your changes are kept.', 'status'],
@@ -821,6 +823,71 @@ test('one_banner_at_a_time_with_at_most_two_actions', () => {
   assert.equal(pickBanner(paused, null), paused);
   // At most two actions, whatever is asked.
   assert.equal(pickBanner(null, { topic: 'x', text: 't', role: 'status', actions: ['a', 'b', 'c'] }).actions.length, 2);
+});
+
+test('the_not_answering_alert_clears_when_the_editor_answers', () => {
+  const offer = liveNotice('stop', 'not_answering', CTX);
+  assert.equal(offer.topic, 'not_answering');
+  assert.equal(pickBanner(offer, { topic: 'not_answering', clear: true }), null);
+  // Other stops are final: a recovered editor does not clear them.
+  const repeated = liveNotice('stop', 'repeated', CTX);
+  assert.equal(pickBanner(repeated, { topic: 'not_answering', clear: true }), repeated);
+});
+
+test('a_stop_with_waiting_changes_offers_a_copy_before_reloading', () => {
+  const stop = liveNotice('stop', 'repeated', CTX);
+  assert.equal(shownBanner(null, stop, 0), stop);
+  const warned = shownBanner(null, stop, 3);
+  assert.equal(warned.text, "This document can't be opened together right now. Changes made here since then weren't sent: download your copy before you reload.");
+  assert.deepEqual(warned.actions, ['mycopy', 'reload']);
+  assert.equal(warned.role, 'alert');
+  // A stop without Reload, or information, is left as it is.
+  const desktop = liveNotice('stop', 'build_refused', CTX);
+  assert.equal(shownBanner(null, desktop, 3), desktop);
+  const info = liveNotice('reset', 'editor', CTX);
+  assert.equal(shownBanner(null, info, 3), info);
+});
+
+test('a_page_notice_never_covers_a_live_stop', () => {
+  const page = { text: 'The editor did not start within 60 seconds.', actions: ['download'] };
+  const stop = liveNotice('stop', 'incompatible', CTX);
+  assert.equal(shownBanner(page, stop, 0), stop);
+  const info = liveNotice('reset', 'editor', CTX);
+  assert.equal(shownBanner(page, info, 0), page, 'a page notice still outranks live information');
+  assert.equal(shownBanner(null, null, 0), null);
+});
+
+test('saved_clears_unsaved_only_for_changes_it_can_cover', () => {
+  let track = trackUnsaved(undefined, { type: 'sent' });
+  assert.equal(track.unsaved, true);
+  // A change sent before this checkpoint arrived may be after its position: it stays unsaved.
+  track = trackUnsaved(track, { type: 'saved', through: 10 });
+  assert.equal(track.unsaved, true);
+  // The next later checkpoint covers it.
+  track = trackUnsaved(track, { type: 'saved', through: 12 });
+  assert.equal(track.unsaved, false);
+  // A saved for a position already seen (a verification) moves nothing on.
+  track = trackUnsaved(track, { type: 'sent' });
+  track = trackUnsaved(track, { type: 'saved', through: 12 });
+  track = trackUnsaved(track, { type: 'saved', through: 12 });
+  assert.equal(track.unsaved, true);
+  track = trackUnsaved(track, { type: 'saved', through: 13 });
+  assert.equal(track.unsaved, true, 'the first new position after sending may not hold it');
+  track = trackUnsaved(track, { type: 'saved', through: 14 });
+  assert.equal(track.unsaved, false);
+  // Nothing sent: a checkpoint changes nothing.
+  assert.equal(trackUnsaved(undefined, { type: 'saved', through: 1 }).unsaved, false);
+  assert.equal(trackUnsaved(track, { type: 'saved', through: 'x' }), track);
+});
+
+test('the_page_is_told_when_a_socket_opens', () => {
+  let opened = 0;
+  const { clock, socket } = live({ handlers: { opened: () => (opened += 1) } });
+  assert.equal(opened, 1);
+  socket().close();
+  clock.advance(60_000);
+  socket().open();
+  assert.equal(opened, 2, 'each new connection, so a pause from before it can be cleared');
 });
 
 test('notices_from_the_editor_are_bounded', () => {

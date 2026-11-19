@@ -68,6 +68,20 @@ test('statusLabel gives a quiet word per state', () => {
   assert.equal(statusLabel('failed').word, 'Not saved');
   assert.equal(statusLabel('connecting').word, 'Connecting…');
   assert.equal(statusLabel('notice').word, 'Unsaved changes');
+  assert.equal(statusLabel('unsaved').word, 'Unsaved changes kept');
+});
+
+test('the_stale_download_note_is_visible_text_that_wraps', () => {
+  const html = readFileSync(new URL('./file.html', import.meta.url), 'utf8');
+  assert.match(html, /<p id="download-note" class="download-note" role="note" hidden><\/p>/);
+  const css = readFileSync(new URL('./style.css', import.meta.url), 'utf8');
+  const rule = /\.download-note\{([^}]*)\}/.exec(css)?.[1] ?? '';
+  assert.match(rule, /overflow-wrap:anywhere/, 'a long note wraps at 375 px');
+  assert.doesNotMatch(rule, /nowrap|display:none/);
+  // Not hidden on narrow screens, where Download moves into the menu.
+  assert.doesNotMatch(css, /\.download-note\{[^}]*\}[^{]*@media[^{]*\{[^}]*\.download-note\{display:none/);
+  // "Unsaved changes kept" has its own dot, not the green "Saved" one.
+  assert.match(css, /\.editor-frame\[data-state=unsaved\] :is\(\.status,\.focus-exit\) i\{background:var\(--warn-ink\)\}/);
 });
 
 test('statusLabel keeps the longer sentence as the detail, and a given word wins', () => {
@@ -166,12 +180,33 @@ test('status_words_for_live_states', () => {
   assert.equal(word({ ...live, paused: true, waiting: 1 }), 'Unsaved changes kept');
   assert.match(statusLabel(liveStatus({ ...live, paused: true })).detail, /paused/);
   assert.equal(word({ ...live, phase: 'offline', waiting: 1 }), 'Offline — changes kept');
-  assert.equal(word({ ...live, phase: 'offline', unsaved: true }), 'Offline — changes kept');
+  assert.equal(word({ ...live, phase: 'offline', unsaved: true }), 'Connecting…', 'taken by the server: nothing is kept only here');
   assert.equal(word({ ...live, phase: 'joining' }), 'Connecting…');
   assert.equal(word({ ...live, phase: 'catching_up' }), 'Connecting…');
   assert.equal(word({ ...live, canEdit: false }), 'Read only');
   assert.equal(word({ ...live, canEdit: false, phase: 'offline' }), 'Read only');
   assert.equal(word(null), 'Connecting…');
+});
+
+test('status_after_a_stop_says_what_is_true', () => {
+  const stopped = { phase: 'offline', waiting: 0, canEdit: true, stopped: true };
+  // Changes this tab still holds are not sent again: the page does not reconnect.
+  const lost = liveStatus({ ...stopped, waiting: 2 });
+  assert.equal(statusLabel(lost).word, 'Not saved');
+  assert.equal(lost.text, "Changes made here since the connection stopped couldn't be sent.");
+  assert.doesNotMatch(lost.text, /connection is back/);
+  // Changes the server took are kept there, not in this tab.
+  const server = liveStatus({ ...stopped, unsaved: true });
+  assert.equal(statusLabel(server).word, 'Unsaved changes kept');
+  assert.doesNotMatch(server.text, /in this tab/);
+  assert.equal(statusLabel(liveStatus(stopped)).word, 'Saved');
+  assert.equal(statusLabel(liveStatus({ ...stopped, canEdit: false })).word, 'Read only');
+  // An ordinary drop: "kept in this tab" only for changes still waiting here.
+  const waiting = liveStatus({ phase: 'offline', waiting: 1, canEdit: true });
+  assert.match(waiting.text, /kept in this tab/);
+  const accepted = liveStatus({ phase: 'offline', waiting: 0, unsaved: true, canEdit: true });
+  assert.equal(statusLabel(accepted).word, 'Connecting…');
+  assert.doesNotMatch(accepted.text ?? '', /in this tab/);
 });
 
 test('download_says_when_the_stored_file_is_behind', () => {

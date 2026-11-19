@@ -62,14 +62,21 @@ const AWAY = new Set(['offline', 'closed', 'stalled', 'idle']);
  * The bar's status for a live document (Proposal 14): `state` is the editor's last live state
  * (`phase`, `waiting`, `canEdit`) with what the page knows besides: `paused` (the room paused
  * changes), `saving` (a checkpoint upload is under way) and `unsaved` (this tab made changes
- * since the last stored version). Answers a state for statusLabel.
+ * since the last stored version, which the server has taken) and `stopped` (the page stopped
+ * for good and does not connect again). `waiting` counts changes the server has not taken yet:
+ * only those are "kept in this tab". Answers a state for statusLabel.
  */
 export function liveStatus(state) {
-  const { phase = '', waiting = 0, canEdit = true, paused = false, saving = false, unsaved = false } = state ?? {};
+  const { phase = '', waiting = 0, canEdit = true, paused = false, saving = false, unsaved = false, stopped = false } = state ?? {};
   if (canEdit === false) return { tone: 'view' };
-  const pending = waiting > 0 || unsaved;
+  if (stopped) {
+    // Nothing is sent again: changes still waiting here are lost when the page goes.
+    if (waiting > 0) return { tone: 'failed', text: "Changes made here since the connection stopped couldn't be sent." };
+    if (unsaved) return { tone: 'unsaved', text: 'Your changes are kept on the server.' };
+    return { tone: 'saved' };
+  }
   if (!CONNECTED.has(phase)) {
-    if (AWAY.has(phase) && pending) {
+    if (AWAY.has(phase) && waiting > 0) {
       return { tone: 'offline', text: 'Your changes are kept in this tab and are sent when the connection is back.' };
     }
     return { tone: 'connecting' };
