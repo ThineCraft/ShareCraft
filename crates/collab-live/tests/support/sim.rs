@@ -188,6 +188,7 @@ impl Sim {
                 format,
                 resume,
                 seen,
+                ..
             } => self.join(conn, client, protocol, &format, resume, seen),
             LiveClientMsg::Entry {
                 local,
@@ -201,6 +202,11 @@ impl Sim {
                 }
             }
             LiveClientMsg::Report { seq } => self.report(conn, seq),
+            LiveClientMsg::Fingerprint { .. }
+            | LiveClientMsg::CheckpointReady { .. }
+            | LiveClientMsg::CheckpointFailed { .. } => {
+                panic!("checkpoint controls are not implemented by the G2 simulator")
+            }
             LiveClientMsg::Resync => {
                 if self.place_of(conn).is_some() {
                     self.resyncs += 1;

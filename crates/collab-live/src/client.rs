@@ -15,8 +15,9 @@ use std::collections::{BTreeSet, VecDeque};
 use collab_core::ids::{ClientId, Seq};
 use protocol::RemovedReason;
 use protocol::live::{
-    EntryBody, HEARTBEAT_MS, LIVE_PROTOCOL, LiveClientMsg, LiveEntry, LivePerson, LiveResume,
-    LiveServerMsg, LiveSessionId, LocalNo, MAX_PAYLOAD_BYTES, ParticipantNo, Place, RefusedReason,
+    EntryBody, HEARTBEAT_MS, LIVE_PROTOCOL, LiveBuild, LiveClientMsg, LiveEntry, LivePerson,
+    LiveResume, LiveServerMsg, LiveSessionId, LocalNo, MAX_PAYLOAD_BYTES, ParticipantNo, Place,
+    RefusedReason,
 };
 use thiserror::Error;
 
@@ -370,6 +371,9 @@ impl<E: LiveEditor> LiveClient<E> {
             format: self.config.format.clone(),
             resume: self.resume(),
             seen: self.has_state.then_some(self.agreed_seq),
+            can_checkpoint: false,
+            build: LiveBuild::Browser,
+            returning_through: None,
         };
         vec![frame(&join)]
     }
@@ -508,6 +512,15 @@ impl<E: LiveEditor> LiveClient<E> {
                     self.drop_pending(editor, &mut step);
                 }
                 step.events.push(Event::AccessChanged { can_edit });
+            }
+            LiveServerMsg::CheckpointTicket { .. }
+            | LiveServerMsg::ChangesPaused { .. }
+            | LiveServerMsg::ChangesResumed
+            | LiveServerMsg::ReturnReady { .. }
+            | LiveServerMsg::ArchiveReturn { .. } => {
+                return Err(ClientError::Desync(
+                    "checkpoint control message before checkpoint support is enabled".to_owned(),
+                ));
             }
             LiveServerMsg::Incompatible { protocol, format } => {
                 self.phase = Phase::Closed;

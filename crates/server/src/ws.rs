@@ -331,6 +331,7 @@ async fn live_session(s: &mut Session<'_>, first: &str) -> bool {
         format,
         resume,
         seen,
+        ..
     }) = serde_json::from_str::<LiveClientMsg>(first)
     else {
         return false;
@@ -365,6 +366,11 @@ async fn live_session(s: &mut Session<'_>, first: &str) -> bool {
                 Ok(LiveClientMsg::Report { seq }) => {
                     Some(LiveCommand::Report { conn, client, seq })
                 }
+                Ok(
+                    LiveClientMsg::Fingerprint { .. }
+                    | LiveClientMsg::CheckpointReady { .. }
+                    | LiveClientMsg::CheckpointFailed { .. },
+                ) => None,
                 Ok(LiveClientMsg::Resync) => Some(LiveCommand::Resync { conn, client }),
                 Ok(LiveClientMsg::Leave) => Some(LiveCommand::Leave { conn, client }),
                 Ok(LiveClientMsg::LiveJoin { .. }) | Err(_) => None,
