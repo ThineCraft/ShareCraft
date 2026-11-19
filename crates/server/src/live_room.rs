@@ -2382,7 +2382,11 @@ impl<S: LiveStore> LiveRoom<S> {
     }
 
     fn disconnect(&mut self, conn: ConnId, client: ClientId) {
-        if self.members.leave(conn, client).is_none() {
+        // `None` is a replaced connection's late leave, or a member already dropped because its
+        // queue was full; only the second still needs the others told.
+        if self.members.leave(conn, client).is_none()
+            && self.members.iter().any(|member| member.client == client)
+        {
             return;
         }
         // Not connected, so it cannot be asked: the next eligible editor is.
@@ -2775,11 +2779,17 @@ impl<S: LiveStore> LiveRoom<S> {
     }
 
     fn broadcast_people(&mut self) {
-        let frame = encode(&LiveServerMsg::People {
-            people: self.people(),
-        });
-        let _ = self.members.send(None, &Outbound::One(frame));
-        self.drop_absent_presence();
+        // A member dropped while this goes out (its queue was full) is shown as gone at once:
+        // the list goes again until nobody more is dropped, and each round drops one at least.
+        loop {
+            let frame = encode(&LiveServerMsg::People {
+                people: self.people(),
+            });
+            let dropped = self.members.send(None, &Outbound::One(frame)).any();
+            if !(self.drop_absent_presence() || dropped) {
+                break;
+            }
+        }
     }
 
     fn prepare_access(&mut self, change: &AccessChange) {
@@ -3118,8 +3128,7 @@ mod tests {
     use crate::members::{AccessRules, builtin_access};
     use crate::room::{JoinReply, Outbound};
 
-    // Not a `gridcraft/` format: desktop builds, which several tests use, are refused there.
-    const FORMAT: &str = "stand-in/1";
+    const FORMAT: &str = "gridcraft/1";
 
     struct Joined {
         conn: u64,
@@ -6014,6 +6023,58 @@ mod tests {
                     .any(|person| person.participant == ann.participant)
             );
         }
+    }
+
+    /// A member dropped because its send queue is full (`Members::send`) leaves the People list
+    /// and loses its presence note at once, before its socket task reports the disconnect.
+    #[tokio::test(start_paused = true)]
+    async fn full_queue_drop_clears_presence_and_people() {
+        let (mut room, _) = room().await;
+        let mut ann = join_as(&mut room, 1, 1, 11, "editor", FORMAT, None, None).await;
+        let bob = join_as(&mut room, 2, 2, 12, "editor", FORMAT, None, None).await;
+        let mut cat = join_as(&mut room, 3, 3, 13, "editor", FORMAT, None, None).await;
+        let note = |joined: &Joined, payload: &str| LiveCommand::Presence {
+            conn: joined.conn,
+            client: joined.client,
+            payload: payload.to_owned(),
+        };
+        room.handle(note(&bob, "B2")).await.unwrap();
+        // Bob never reads: Ann's notes fill his queue until he is dropped. Cat reads all along.
+        let mut seen = drain(&mut cat.rx);
+        for round in 0..40 {
+            for n in 0..20 {
+                room.handle(note(&ann, &format!("A{round}-{n}")))
+                    .await
+                    .unwrap();
+            }
+            tokio::time::advance(Duration::from_secs(2)).await;
+            let _ = drain(&mut ann.rx);
+            seen.extend(drain(&mut cat.rx));
+        }
+        assert!(
+            !room
+                .members
+                .iter()
+                .any(|member| member.client == bob.client),
+            "bob's full queue dropped him"
+        );
+        seen.extend(drain(&mut cat.rx));
+        assert!(
+            seen.iter().any(|message| matches!(
+                message,
+                LiveServerMsg::Presence { participant, payload: None } if *participant == bob.participant
+            )),
+            "bob's note is cleared at once"
+        );
+        assert!(
+            seen.iter().any(|message| matches!(
+                message,
+                LiveServerMsg::People { people } if people.iter().any(|person| {
+                    person.participant == bob.participant && !person.connected
+                })
+            )),
+            "bob shows as not connected at once"
+        );
     }
 
     #[tokio::test(start_paused = true)]

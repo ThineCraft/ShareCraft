@@ -53,8 +53,13 @@ impl<S: LiveStore> LiveRoom<S> {
             .iter()
             .map(encode)
             .collect::<Vec<_>>();
-        if !notes.is_empty() {
-            let _ = self.members.send(Some(client), &Outbound::Many(notes));
+        if !notes.is_empty()
+            && self
+                .members
+                .send(Some(client), &Outbound::Many(notes))
+                .any()
+        {
+            self.broadcast_people();
         }
         if matches!(place, Place::Returning { .. }) {
             self.send_to_others(client, &LiveServerMsg::Returning { participant });
@@ -63,8 +68,9 @@ impl<S: LiveStore> LiveRoom<S> {
 
     /// Clears the note of every place that is no longer held or no longer connected, telling
     /// everyone. Called whenever the people list is sent, which every connect, disconnect,
-    /// leave, expiry and removal does.
-    pub(super) fn drop_absent_presence(&mut self) {
+    /// leave, expiry and removal does. Returns whether a member was dropped meanwhile (its
+    /// queue was full), so the caller sends the people list again.
+    pub(super) fn drop_absent_presence(&mut self) -> bool {
         let present = self
             .session
             .as_ref()
@@ -79,12 +85,17 @@ impl<S: LiveStore> LiveRoom<S> {
             })
             .map(|(participant, _)| *participant)
             .collect::<BTreeSet<_>>();
+        let mut dropped = false;
         for cleared in self
             .presence
             .keep_only(|participant| present.contains(&participant))
         {
-            let _ = self.members.send(None, &Outbound::One(encode(&cleared)));
+            dropped |= self
+                .members
+                .send(None, &Outbound::One(encode(&cleared)))
+                .any();
         }
+        dropped
     }
 
     /// Tells everyone a checkpoint was stored (`verified` false) or verified.
@@ -101,10 +112,13 @@ impl<S: LiveStore> LiveRoom<S> {
             verified,
             major,
         });
-        let _ = self.members.send(None, &Outbound::One(frame));
+        if self.members.send(None, &Outbound::One(frame)).any() {
+            self.broadcast_people();
+        }
     }
 
-    /// Sends `message` to every connected member but `except`.
+    /// Sends `message` to every connected member but `except`. A member dropped because its
+    /// queue was full is shown as gone at once.
     fn send_to_others(&mut self, except: ClientId, message: &LiveServerMsg) {
         let frame = Outbound::One(encode(message));
         let others = self
@@ -113,8 +127,12 @@ impl<S: LiveStore> LiveRoom<S> {
             .map(|member| member.client)
             .filter(|client| *client != except)
             .collect::<Vec<_>>();
+        let mut dropped = false;
         for client in others {
-            let _ = self.members.send(Some(client), &frame);
+            dropped |= self.members.send(Some(client), &frame).any();
+        }
+        if dropped {
+            self.broadcast_people();
         }
     }
 }

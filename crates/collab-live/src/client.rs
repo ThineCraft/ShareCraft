@@ -141,6 +141,9 @@ pub const PACE_WINDOW_MS: u64 = 1_000;
 /// entry whose payload of [`MAX_PAYLOAD_BYTES`] has every character escaped, below this.
 pub const MAX_FRAME_BYTES: usize = 8 * MAX_PAYLOAD_BYTES;
 
+/// The longest revision id a `Saved` notice may name.
+const MAX_REVISION_BYTES: usize = 128;
+
 /// The shortest heartbeat interval the client takes from the server; the longest is
 /// [`HEARTBEAT_MS`].
 pub const MIN_HEARTBEAT_MS: u64 = 1_000;
@@ -897,12 +900,17 @@ impl<E: LiveEditor> LiveClient<E> {
                 through,
                 verified,
                 major,
-            } => step.events.push(Event::Saved {
-                revision,
-                through,
-                verified,
-                major,
-            }),
+            } => {
+                // A stored revision is named by its id; anything longer is dropped.
+                if revision.len() <= MAX_REVISION_BYTES {
+                    step.events.push(Event::Saved {
+                        revision,
+                        through,
+                        verified,
+                        major,
+                    });
+                }
+            }
             LiveServerMsg::BuildRefused { .. } => {
                 self.close();
                 step.events.push(Event::BuildRefused);

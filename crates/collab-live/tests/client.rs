@@ -2744,3 +2744,23 @@ fn oversized_presence_from_the_server_is_dropped() {
     let step = client.receive(&mut doc, &frame, 6).unwrap();
     assert_eq!(step.events.len(), 1);
 }
+
+/// The server names a stored revision by its id; anything longer than an id is dropped.
+#[test]
+fn saved_notice_with_an_oversized_revision_is_dropped() {
+    let mut doc = StandIn::new("a");
+    let mut client = live(&mut doc, 1);
+    let saved = |revision: String| {
+        json!({ "type": "saved", "revision": revision, "through": 1, "verified": true, "major": false })
+            .to_string()
+    };
+    let step = client
+        .receive(&mut doc, &saved("r".repeat(129)), 5)
+        .unwrap();
+    assert!(step.events.is_empty(), "{:?}", step.events);
+    assert_eq!(client.phase(), Phase::Live);
+    let step = client
+        .receive(&mut doc, &saved("r".repeat(128)), 6)
+        .unwrap();
+    assert_eq!(step.events.len(), 1);
+}

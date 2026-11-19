@@ -262,7 +262,10 @@ async fn text_session(s: &mut Session<'_>, first: &str) -> bool {
                 // A second `Join` on one socket, or anything unparseable.
                 Ok(ClientMsg::Join { .. }) | Err(_) => None,
             };
-            let ended = relay(s, &room.commands, &room.access, out_rx, read).await;
+            let ended = relay(s, &room.commands, &room.access, out_rx, |text: &str| {
+                Read::from(read(text))
+            })
+            .await;
             ended == Ended::WriteTimedOut
         }
         Recheck::Removed(reason) => {
@@ -301,7 +304,7 @@ async fn file_session(s: &mut Session<'_>, first: &str) -> bool {
             .await
         {
             Ok(()) => {
-                let ended = relay(s, &room.commands, &room.access, out_rx, |_| None).await;
+                let ended = relay(s, &room.commands, &room.access, out_rx, |_| Read::End).await;
                 ended == Ended::WriteTimedOut
             }
             // The session ended meanwhile; the page joins again.
@@ -339,6 +342,9 @@ async fn live_session(s: &mut Session<'_>, first: &str) -> bool {
     else {
         return false;
     };
+    // The rule reads the format this client claims. That is enough: a room whose format is set
+    // answers any other claim `Incompatible`, and a room without one takes the first claim as
+    // its format, which any client may already do. Keep the room's own format check.
     if crate::live_room::build_refused(&format, build) {
         return write_removed(s, &LiveServerMsg::BuildRefused { build }).await;
     }
@@ -364,55 +370,63 @@ async fn live_session(s: &mut Session<'_>, first: &str) -> bool {
     };
     let stalled = match recheck_after_join(s.state, s.doc, &room.access, s.visitor).await {
         Recheck::Keep => {
-            let read = |text: &str| match serde_json::from_str::<LiveClientMsg>(text) {
-                Ok(LiveClientMsg::Entry {
-                    local,
-                    seen,
-                    format,
-                    payload,
-                }) => Some(LiveCommand::Entry {
-                    conn,
-                    client,
-                    local,
-                    seen,
-                    format,
-                    payload,
-                }),
-                Ok(LiveClientMsg::Heartbeat { seen }) => {
-                    Some(LiveCommand::Heartbeat { conn, client, seen })
-                }
-                Ok(LiveClientMsg::Report { seq }) => {
-                    Some(LiveCommand::Report { conn, client, seq })
-                }
-                Ok(LiveClientMsg::Fingerprint { at, entered }) => {
-                    if !valid_fingerprint(&entered) {
-                        return None;
+            let read = |text: &str| -> Read<LiveCommand> {
+                Read::from(match serde_json::from_str::<LiveClientMsg>(text) {
+                    Ok(LiveClientMsg::Entry {
+                        local,
+                        seen,
+                        format,
+                        payload,
+                    }) => Some(LiveCommand::Entry {
+                        conn,
+                        client,
+                        local,
+                        seen,
+                        format,
+                        payload,
+                    }),
+                    Ok(LiveClientMsg::Heartbeat { seen }) => {
+                        Some(LiveCommand::Heartbeat { conn, client, seen })
                     }
-                    Some(LiveCommand::Fingerprint {
-                        conn,
-                        client,
-                        at,
-                        entered,
-                    })
-                }
-                Ok(LiveClientMsg::CheckpointFailed { ticket }) => {
-                    Some(LiveCommand::CheckpointFailed {
-                        conn,
-                        client,
-                        ticket,
-                    })
-                }
-                // The upload itself says the bytes are ready.
-                Ok(LiveClientMsg::CheckpointReady { .. }) => None,
-                // The room checks its size and rate; a dropped note keeps the connection.
-                Ok(LiveClientMsg::Presence { payload }) => Some(LiveCommand::Presence {
-                    conn,
-                    client,
-                    payload,
-                }),
-                Ok(LiveClientMsg::Resync) => Some(LiveCommand::Resync { conn, client }),
-                Ok(LiveClientMsg::Leave) => Some(LiveCommand::Leave { conn, client }),
-                Ok(LiveClientMsg::LiveJoin { .. }) | Err(_) => None,
+                    Ok(LiveClientMsg::Report { seq }) => {
+                        Some(LiveCommand::Report { conn, client, seq })
+                    }
+                    Ok(LiveClientMsg::Fingerprint { at, entered }) => {
+                        if !valid_fingerprint(&entered) {
+                            return Read::End;
+                        }
+                        Some(LiveCommand::Fingerprint {
+                            conn,
+                            client,
+                            at,
+                            entered,
+                        })
+                    }
+                    Ok(LiveClientMsg::CheckpointFailed { ticket }) => {
+                        Some(LiveCommand::CheckpointFailed {
+                            conn,
+                            client,
+                            ticket,
+                        })
+                    }
+                    // The upload itself says the bytes are ready.
+                    Ok(LiveClientMsg::CheckpointReady { .. }) => None,
+                    // An oversized note is dropped here, keeping the connection; the room checks
+                    // the rate.
+                    Ok(LiveClientMsg::Presence { payload }) => {
+                        if payload.len() > protocol::live::MAX_PRESENCE_BYTES {
+                            return Read::Skip;
+                        }
+                        Some(LiveCommand::Presence {
+                            conn,
+                            client,
+                            payload,
+                        })
+                    }
+                    Ok(LiveClientMsg::Resync) => Some(LiveCommand::Resync { conn, client }),
+                    Ok(LiveClientMsg::Leave) => Some(LiveCommand::Leave { conn, client }),
+                    Ok(LiveClientMsg::LiveJoin { .. }) | Err(_) => None,
+                })
             };
             relay(s, &room.commands, &room.access, out_rx, read).await == Ended::WriteTimedOut
         }
@@ -692,12 +706,28 @@ fn deadline(expires_at: OffsetDateTime, now: OffsetDateTime) -> Option<Instant> 
 /// ends the connection. When the session expires, asks the room (through `access`) to end the
 /// session's connections; the room then queues `Removed { signed_out }` and lets go, which ends
 /// this loop once the frame is written. Each write has the session's limit to finish.
+/// What one text frame from the client does.
+enum Read<C> {
+    /// It goes to the room.
+    Send(C),
+    /// It is dropped; the connection stays.
+    Skip,
+    /// It ends the connection.
+    End,
+}
+
+impl<C> From<Option<C>> for Read<C> {
+    fn from(command: Option<C>) -> Self {
+        command.map_or(Read::End, Read::Send)
+    }
+}
+
 async fn relay<C>(
     s: &mut Session<'_>,
     commands: &mpsc::Sender<C>,
     access: &mpsc::UnboundedSender<AccessChange>,
     mut out_rx: mpsc::Receiver<Outbound>,
-    read: impl Fn(&str) -> Option<C>,
+    read: impl Fn(&str) -> Read<C>,
 ) -> Ended {
     let mut ends = Ending {
         session: s.visitor.session,
@@ -724,8 +754,9 @@ async fn relay<C>(
             frame = s.stream.next() => {
                 let cmd = match frame {
                     Some(Ok(Message::Text(text))) => match read(text.as_str()) {
-                        Some(cmd) => cmd,
-                        None => return Ended::Normally,
+                        Read::Send(cmd) => cmd,
+                        Read::Skip => continue,
+                        Read::End => return Ended::Normally,
                     },
                     Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
                     // Binary frames, close, oversized frames and transport errors.

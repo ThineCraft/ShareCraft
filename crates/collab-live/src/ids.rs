@@ -278,8 +278,9 @@ impl OrderedIds {
     /// session, and an axis near [`Self::MAX_RUNS`] refuses every structural change. The way
     /// out: deleted runs below the agreed checkpoint position may be compacted once every
     /// participant has passed that position, because no change still to come can name them.
-    /// G5 Task 8 (the fork's identity tables) owns that compaction; until then a room recovers
-    /// when a new session starts from fresh identities.
+    /// G5 Task 8 (the fork's identity tables) owns that compaction. Until then an axis starts
+    /// afresh only when a session starts from a plain file revision, with fresh identities; a
+    /// session that starts from a checkpoint loads the same tables, deleted runs included.
     fn total_runs(&self) -> usize {
         self.live.len().saturating_add(self.deleted.len())
     }
