@@ -40,6 +40,8 @@ import {
 import { forgetOpened, rememberOpened } from './start.js';
 import { activityPanel } from './activity.js';
 import { setupEditorFrame } from './editor-frame.js';
+import { avatarColour, initials } from './account.js';
+import { connectLive } from './live-host.js';
 import { createViewer } from './file-viewer.js';
 import { viewerList } from './viewer.js';
 
@@ -54,6 +56,8 @@ const NOT_READY_FOR = 5000; // how long "not ready yet" stays at most, in millis
 const MOVED_ON =
   'A newer version was saved while the connection was lost, so changes you make here are not saved. Download your copy, then reload.';
 const NEWER = 'A newer version was saved. Reload to see it.';
+const LIVE_STOPPED = "This document can't be opened together right now.";
+const LIVE_NOT_ANSWERING = 'The editor is not answering. Reload it to carry on.';
 
 const $ = (id) => document.getElementById(id);
 const frameBox = $('frame');
@@ -106,6 +110,8 @@ let bannerKey = '';
 let roleCheck = 0;          // the latest role request; older answers are dropped
 let notReadyTimer = 0;
 let chrome = null;          // the frame's header and panels, set up once the viewer and queue exist
+let liveMode = false;       // the server opens this document in a live room (G5)
+let liveSession = null;     // the live connection, once the editor is ready
 let viewGen = 0;            // counts the files shown in the viewer; older answers are dropped
 const previewUrl = () => `/api/docs/${seg(docId)}/preview`;
 
@@ -416,6 +422,12 @@ async function openEditor() {
     return;
   }
   render();
+  if (doc.session === 'live' && BRIDGES[doc.editor].live) {
+    // A live document: no file session. The page opens the socket once the editor is ready.
+    liveMode = true;
+    startEditor();
+    return;
+  }
   openSocket();
 }
 
@@ -477,6 +489,8 @@ function showProblem(text, linkNearest = false) {
 // in memory, and the page does not reconnect.
 function stopRemoved(reason) {
   removed = true;
+  liveSession?.close();
+  liveSession = null;
   clearTimeout(retryTimer);
   clearTimeout(readyTimer);
   queue.drop();
@@ -794,11 +808,39 @@ function onReady() {
   editorReady = true;
   clearTimeout(readyTimer);
   clearNotReady();
+  if (liveMode) {
+    startLive();
+    return;
+  }
   // A document that was never saved has no bytes: the editor starts empty on its own.
   bridge.start(doc.name, initialBytes);
   initialBytes = null;
   updateStatus({ type: 'opened', canSave: editing() });
   render();
+}
+
+// ---- live session (G5) ----
+
+// The editor is ready: the page carries its live session from now on (live-host.js).
+function startLive() {
+  liveSession = connectLive(frame, BRIDGES[doc.editor], docId, {
+    canEdit: can(doc.access, 'edit'),
+    look: (person) => ({ initials: initials(person.name), colour: avatarColour(person.user).light.bg }),
+    removed: (reason) => stopRemoved(reason),
+    stopped: () => setNotice({ text: LIVE_STOPPED, actions: ['reload'] }),
+    reloadEditor: reloadLiveEditor,
+    offerReload: () => setNotice({ text: LIVE_NOT_ANSWERING, actions: ['reload'] }),
+  });
+}
+
+// The editor stopped answering: a fresh editor joins as a new client.
+function reloadLiveEditor() {
+  if (removed) return;
+  liveSession?.close();
+  liveSession = null;
+  bridge?.close();
+  editorReady = false;
+  startEditor();
 }
 
 function onDirty({ dirty }) {
