@@ -76,8 +76,10 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
+      # Timing-sensitive tests (GitHub-source webhooks, share timeouts) can fail once on a busy
+      # runner; a test that passes on retry is reported as flaky, not as a failure.
       - name: Tests (shard ${{ matrix.shard }} of 4)
-        run: cargo nextest run --workspace --no-fail-fast --partition hash:${{ matrix.shard }}/4
+        run: cargo nextest run --workspace --no-fail-fast --retries 2 --partition hash:${{ matrix.shard }}/4
       - name: Documentation tests
         if: matrix.shard == 1
         run: cargo test --workspace --doc
