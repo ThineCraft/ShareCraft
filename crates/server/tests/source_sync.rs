@@ -20,7 +20,8 @@ use collab_core::ids::{DocId, NodeId};
 use common::fake_github::{AUTHOR_NAME, FakeGithub};
 use common::{FileClient, TIMEOUT, TestServer, TestUser, spawn_server_config, start_fake_github};
 use records::{
-    LinkKind, NewSource, NodeKind, Principal, SealedRow, SourceKind, SourceState, SourceStatus,
+    LinkKind, NewSource, NodeKind, Principal, SealedRow, SourceKind, SourceMode, SourceState,
+    SourceStatus,
 };
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
@@ -81,6 +82,8 @@ impl Env {
             repo: REPO.to_owned(),
             branch: "main".to_owned(),
             folder: folder.to_owned(),
+            location: None,
+            mode: SourceMode::ReadOnly,
             token,
             poll_seconds: 300,
             connected_by: admin.id,
@@ -306,6 +309,46 @@ async fn second_sync_with_no_change_makes_one_conditional_request_and_no_blob_re
     let status = env.status().await;
     assert_eq!(status.state, SourceState::Ok);
     assert_eq!(status.files, 2);
+}
+
+#[tokio::test]
+async fn recorded_commit_without_an_etag_skips_the_tree_request() {
+    let env = Env::new().await;
+    env.fake
+        .commit("main", &files(&[("a.md", "A"), ("b/c.md", "C")]));
+    env.synced().await;
+
+    let db = env.server.records_db();
+    let mut status = env.status().await;
+    status.etag = None;
+    db.set_source_status(env.library, &status).await.unwrap();
+    let trees = env.fake.count("trees");
+
+    assert_eq!(env.sync().await, Ok(None));
+    assert_eq!(env.fake.count("commits_not_modified"), 0);
+    assert_eq!(env.fake.count("trees"), trees);
+}
+
+#[tokio::test]
+async fn disabled_connector_is_reported_before_a_truncated_tree() {
+    let env = Env::new().await;
+    env.fake
+        .commit("main", &files(&[("one.md", "1"), ("two.md", "2")]));
+    let other_admin = env.server.admin("Grace Admin").await;
+    env.server
+        .records_db()
+        .set_disabled(other_admin.id, env.admin.id, true)
+        .await
+        .unwrap();
+    env.fake.force_truncate_trees();
+    let trees = env.fake.count("trees");
+
+    let failed = env.sync().await;
+    assert!(
+        matches!(&failed, Err(SyncError::NotConnected(message)) if message.contains("person who connected")),
+        "{failed:?}"
+    );
+    assert_eq!(env.fake.count("trees"), trees);
 }
 
 #[tokio::test]

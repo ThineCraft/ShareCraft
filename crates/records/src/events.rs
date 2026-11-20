@@ -2,7 +2,7 @@
 
 use collab_core::ids::{DocId, NodeId, UserId};
 use sqlx::postgres::PgRow;
-use sqlx::{PgConnection, Row};
+use sqlx::{PgConnection, Postgres, QueryBuilder, Row};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -42,6 +42,29 @@ pub struct NewEvent {
 /// Writes `event` on `conn`, normally a transaction, so the event commits with the change.
 pub(crate) async fn record(conn: &mut PgConnection, event: NewEvent) -> Result<(), sqlx::Error> {
     insert(conn, &event).await.map(drop)
+}
+
+/// Writes ordinary events in one statement. Callers that need generated ids use
+/// [`record_with_id`] instead.
+pub(crate) async fn record_many(
+    conn: &mut PgConnection,
+    events: &[NewEvent],
+) -> Result<(), sqlx::Error> {
+    if events.is_empty() {
+        return Ok(());
+    }
+    let mut query = QueryBuilder::<Postgres>::new(
+        "insert into events (kind, actor, subject, document_id, node_id, detail) ",
+    );
+    query.push_values(events, |mut row, event| {
+        row.push_bind(event.kind)
+            .push_bind(event.actor.map(|u| u.0))
+            .push_bind(event.subject.map(|u| u.0))
+            .push_bind(event.document.map(|d| d.0))
+            .push_bind(event.node.map(|n| n.0))
+            .push_bind(&event.detail);
+    });
+    query.build().execute(conn).await.map(drop)
 }
 
 /// As [`record`], answering the event's id.

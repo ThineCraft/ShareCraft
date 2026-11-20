@@ -440,11 +440,13 @@ impl Db {
                    on c.parent_id = b.id \
                  where c.deleted_at is null and b.depth < 10000 \
              ) \
-             select n.id, n.name, d.editor, b.library_id, lib.name, d.revised_at \
+             select n.id, n.name, d.editor, b.library_id, lib.name, \
+                    coalesce(d.revised_at, si.modified_at) as revised_at \
              from below b join nodes n on n.id = b.id \
              join documents d on d.id = n.id \
+             left join source_items si on si.node_id = n.id \
              join nodes lib on lib.id = b.library_id \
-             where n.kind = 'document' and d.revision is not null \
+             where n.kind = 'document' and coalesce(d.revision, si.revision) is not null \
              order by lower(n.name), n.id",
         )
         .bind(site.0)

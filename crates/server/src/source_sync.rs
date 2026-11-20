@@ -27,6 +27,7 @@
 //! No token, response body or other secret reaches an event, a log line, `last_error` or an
 //! error: every message here is a plain sentence of ours.
 
+use std::collections::hash_map::Entry as HashEntry;
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -34,10 +35,10 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use collab_core::ids::{DocId, NodeId};
 use futures_util::{StreamExt, TryStreamExt};
 use records::{
-    DEFAULT_SOURCE_MAX_BYTES, DEFAULT_SOURCE_MAX_FILES, Editor, NewEvent, NodeKind,
-    SOURCE_MAX_BYTES, SOURCE_MAX_FILES, SourceConfig, SourceItem, SourceLock, SourceState,
-    SourceStatus, SourceSyncTransition, UploadTarget, User, check_name, check_size, is_format_char,
-    validate_document_name, validate_node_name,
+    DEFAULT_SOURCE_MAX_BYTES, DEFAULT_SOURCE_MAX_FILES, Editor, ExternalEntry, NewEvent, Node,
+    NodeKind, SOURCE_MAX_BYTES, SOURCE_MAX_FILES, SourceConfig, SourceItem, SourceKind, SourceLock,
+    SourceState, SourceStatus, SourceSyncTransition, UploadTarget, User, check_name, check_size,
+    is_format_char, validate_document_name, validate_node_name,
 };
 use revisions::RevisionId;
 use serde_json::json;
@@ -52,10 +53,10 @@ use crate::api::nodes::{after_rename, delete_one, move_one};
 use crate::api::uploads::{store_version, uploads_path};
 use crate::blobs::Held;
 use crate::file_room::SaveReply;
-use crate::github::{
-    EntryKind, GithubError, Head, RepoRef, TarLimits, TreeEntry, for_each_in_tarball, git_blob_id,
-};
+use crate::github::{GithubError, Head, RepoRef, TarLimits, for_each_in_tarball, git_blob_id};
 use crate::secrets::{Sealed, Secret};
+use crate::share::ShareSource;
+use crate::source::{ContentMode, EntryKind, Listing, Look, SourceCaps, StorageSource, TreeEntry};
 use crate::tree::{self, TreeOp, unique_node_name};
 
 /// More files than this to read are read from one tarball rather than one by one.
@@ -70,6 +71,8 @@ pub const STALE_SYNC: time::Duration = time::Duration::minutes(15);
 const MAX_AUTHOR_CHARS: usize = 100;
 /// Attempts at storing a new version when the file session's revision moved meanwhile.
 const VERSION_ATTEMPTS: usize = 3;
+/// How many complete polls an external item may be absent before it is recycled.
+pub const MISSING_GRACE_POLLS: u32 = 1;
 
 /// One item of the repository as the library shows it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -102,6 +105,10 @@ pub struct Hidden {
     pub too_big: usize,
     pub unnameable: usize,
     pub renamed: usize,
+    pub system: usize,
+    pub offline: usize,
+    pub too_long: usize,
+    pub unreadable: usize,
 }
 
 impl Hidden {
@@ -113,6 +120,26 @@ impl Hidden {
             .saturating_add(self.policy)
             .saturating_add(self.too_big)
             .saturating_add(self.unnameable)
+            .saturating_add(self.system)
+            .saturating_add(self.offline)
+            .saturating_add(self.too_long)
+            .saturating_add(self.unreadable)
+    }
+
+    /// Counts grouped for the source details shown by the API and pages.
+    #[must_use]
+    pub fn detail(&self) -> serde_json::Value {
+        serde_json::json!({
+            "links": self.symlinks,
+            "submodules": self.submodules,
+            "types": self.policy,
+            "size": self.too_big,
+            "names": self.unnameable,
+            "system": self.system,
+            "offline": self.offline,
+            "long": self.too_long,
+            "unreadable": self.unreadable,
+        })
     }
 }
 
@@ -909,7 +936,14 @@ async fn sync_one(state: &AppState, library: NodeId, now: OffsetDateTime) -> boo
                 status,
                 generation,
             } = *started;
-            let outcome = run(state, &config, &status).await;
+            let outcome = match config.kind {
+                SourceKind::Github => {
+                    run(&GithubSource, state, &config, &status, now, generation).await
+                }
+                SourceKind::Share => {
+                    run(&ShareSource, state, &config, &status, now, generation).await
+                }
+            };
             let finished = finish(state, &config, status, now, outcome, generation).await;
             drop(source_lock);
             finished
@@ -1026,19 +1060,27 @@ pub async fn sync_once(
     {
         return Ok(None);
     }
-    let outcome = run(state, &config, &status).await;
+    let outcome = match config.kind {
+        SourceKind::Github => run(&GithubSource, state, &config, &status, now, generation).await,
+        SourceKind::Share => run(&ShareSource, state, &config, &status, now, generation).await,
+    };
     finish(state, &config, status, now, outcome, generation).await
 }
 
 /// What a sync that did not fail found.
 enum Outcome {
     /// Nothing to do; the ETag to keep.
-    Unchanged { etag: Option<String> },
+    Unchanged {
+        etag: Option<String>,
+        listing_detail: Option<serde_json::Value>,
+    },
     /// The library now mirrors `report.commit`.
     Synced {
         report: SyncReport,
         etag: Option<String>,
         files: usize,
+        content: ContentMode,
+        took: std::time::Duration,
     },
 }
 
@@ -1061,12 +1103,17 @@ async fn finish(
     };
     // Recorded only with the status: a sync whose connection changed meanwhile records neither.
     let event: Option<NewEvent>;
+    let listing_detail: Option<serde_json::Value>;
     let answer = match outcome {
-        Ok(Outcome::Unchanged { etag }) => {
+        Ok(Outcome::Unchanged {
+            etag,
+            listing_detail: detail,
+        }) => {
             status.state = SourceState::Ok;
             status.etag = etag;
             status.last_error = None;
             status.retry_at = None;
+            listing_detail = detail;
             event = None;
             Ok(None)
         }
@@ -1074,10 +1121,12 @@ async fn finish(
             report,
             etag,
             files,
+            content,
+            took,
         }) => {
             status.state = SourceState::Ok;
             status.etag = etag;
-            status.last_commit = Some(report.commit.clone());
+            status.last_commit = (!report.commit.is_empty()).then(|| report.commit.clone());
             status.last_synced_at = Some(now);
             status.last_error = None;
             status.retry_at = None;
@@ -1086,13 +1135,21 @@ async fn finish(
             // Files not shown at all. Files shown under a suffixed name (`renamed`) are shown,
             // so they are not counted here; the `source.synced` event carries their number.
             status.hidden = i64::try_from(report.hidden.total()).unwrap_or(i64::MAX);
-            event = Some(NewEvent {
-                kind: "source.synced",
-                actor: None,
-                subject: None,
-                document: None,
-                node: Some(library),
-                detail: json!({
+            listing_detail =
+                matches!(content, ContentMode::External).then(|| report.hidden.detail());
+            let detail = if matches!(content, ContentMode::External) {
+                json!({
+                    "added": report.added,
+                    "changed": report.changed,
+                    "removed": report.removed,
+                    "moved": report.moved,
+                    "hidden": report.hidden.total(),
+                    "renamed": report.hidden.renamed,
+                    "files": files,
+                    "seconds": took.as_secs_f64(),
+                })
+            } else {
+                json!({
                     "commit": short(&report.commit),
                     "added": report.added,
                     "changed": report.changed,
@@ -1101,11 +1158,20 @@ async fn finish(
                     "hidden": report.hidden.total(),
                     "renamed": report.hidden.renamed,
                     "bytes": report.bytes,
-                }),
+                })
+            };
+            event = Some(NewEvent {
+                kind: "source.synced",
+                actor: None,
+                subject: None,
+                document: None,
+                node: Some(library),
+                detail,
             });
             Ok(Some(report))
         }
         Err(Failure { error: e, applying }) => {
+            listing_detail = None;
             if applying {
                 // Half applied: never answered as unchanged, even at the last commit.
                 status.etag = Some(DIRTY_ETAG.to_owned());
@@ -1135,6 +1201,14 @@ async fn finish(
     let db = state.db();
     let recorded = match db.set_source_status_if(library, &status, generation).await {
         Ok(true) => {
+            if let Some(detail) = listing_detail
+                && let Err(e) = db.record_listing(library, generation, None, &detail).await
+            {
+                eprintln!(
+                    "sharecraft-server: cannot record the listing of library {}: {e}",
+                    library.0
+                );
+            }
             if let Some(event) = event {
                 state.events().emit(event);
             }
@@ -1187,52 +1261,190 @@ impl From<SyncError> for Failure {
     }
 }
 
-/// The sync itself: reads, checks, then applies.
-async fn run(
+/// The GitHub details needed after a repository has been listed.
+pub(crate) struct GithubSeen {
+    repo: RepoRef,
+    token: Option<Secret>,
+    commit: String,
+    tree: String,
+    whole: Option<Whole>,
+}
+
+/// GitHub as a connected-library storage source.
+pub(crate) struct GithubSource;
+
+impl StorageSource for GithubSource {
+    type Seen = GithubSeen;
+
+    fn content(&self) -> ContentMode {
+        ContentMode::Mirrored
+    }
+
+    async fn look(
+        &self,
+        state: &AppState,
+        config: &SourceConfig,
+        status: &SourceStatus,
+        dirty: bool,
+    ) -> Result<Look<Self::Seen>, SyncError> {
+        let started = std::time::Instant::now();
+        let repo = RepoRef::parse(&format!("{}/{}", config.owner, config.repo)).map_err(|_| {
+            SyncError::NotConnected(
+                "The repository's name is not one GitHub uses; connect the library again."
+                    .to_owned(),
+            )
+        })?;
+        let token = token_of(state, config).await?;
+        let github = state.github();
+        let sent_etag = if dirty { None } else { status.etag.as_deref() };
+        let head = github
+            .head(&repo, &config.branch, token.as_ref(), sent_etag)
+            .await
+            .map_err(github_error)?;
+        let (commit, tree_sha, etag, author) = match head {
+            Head::NotModified => {
+                return Ok(Look::Unchanged {
+                    etag: status.etag.clone(),
+                });
+            }
+            Head::Moved {
+                commit,
+                tree,
+                etag,
+                author,
+            } => (commit, tree, etag, author),
+        };
+        Ok(Look::Listing(Box::new(Listing {
+            entries: Vec::new(),
+            protected: HashSet::new(),
+            bookmark: commit.clone(),
+            etag,
+            credit: author,
+            hidden: Hidden::default(),
+            took: started.elapsed(),
+            seen: GithubSeen {
+                repo,
+                token,
+                commit,
+                tree: tree_sha,
+                whole: None,
+            },
+        })))
+    }
+
+    async fn list(
+        &self,
+        state: &AppState,
+        listing: &mut Listing<Self::Seen>,
+    ) -> Result<(), SyncError> {
+        let entries = state
+            .github()
+            .tree(
+                &listing.seen.repo,
+                &listing.seen.tree,
+                listing.seen.token.as_ref(),
+            )
+            .await
+            .map_err(github_error)?;
+        listing.seen.whole = Some(Whole::of(&entries).ok_or_else(too_big_to_add)?);
+        listing.entries = entries;
+        Ok(())
+    }
+
+    async fn caps(&self, state: &AppState) -> Result<SourceCaps, SyncError> {
+        let db = state.db();
+        let read = |value: Option<serde_json::Value>, default: i64| {
+            value
+                .and_then(|v| v.as_i64())
+                .filter(|n| *n >= 1)
+                .unwrap_or(default)
+        };
+        let files = read(
+            db.setting(SOURCE_MAX_FILES).await.map_err(db_failed)?,
+            DEFAULT_SOURCE_MAX_FILES,
+        );
+        let bytes = read(
+            db.setting(SOURCE_MAX_BYTES).await.map_err(db_failed)?,
+            DEFAULT_SOURCE_MAX_BYTES,
+        );
+        Ok(SourceCaps {
+            max_files: usize::try_from(files).unwrap_or(usize::MAX),
+            max_bytes: Some(u64::try_from(bytes).unwrap_or(u64::MAX)),
+        })
+    }
+
+    async fn fetch(
+        &self,
+        state: &AppState,
+        config: &SourceConfig,
+        listing: &Listing<Self::Seen>,
+        caps: SourceCaps,
+        needed: &HashMap<String, u64>,
+    ) -> Result<HashMap<String, Held>, SyncError> {
+        let whole = listing.seen.whole.ok_or_else(too_big_to_add)?;
+        let reading = Reading {
+            repo: &listing.seen.repo,
+            token: listing.seen.token.as_ref(),
+            commit: &listing.seen.commit,
+            folder: config.folder.trim_matches('/'),
+            whole,
+        };
+        if needed.is_empty() {
+            return Ok(HashMap::new());
+        }
+        if caps.tarball_worth_trying(needed.len(), whole) {
+            match by_tarball(state, &reading, needed).await {
+                Ok(fetched) => return Ok(fetched),
+                Err(TarFailure::Failed(e)) => return Err(e),
+                Err(TarFailure::TooLarge) => {
+                    println!(
+                        "sharecraft-server: a tarball was over its limits; reading files singly"
+                    );
+                }
+            }
+        }
+        by_blobs(state, &reading, needed).await
+    }
+}
+
+/// The source-independent sync itself: reads, checks, then applies.
+async fn run<S: StorageSource>(
+    source: &S,
     state: &AppState,
     config: &SourceConfig,
     status: &SourceStatus,
+    now: OffsetDateTime,
+    generation: i64,
 ) -> Result<Outcome, Failure> {
     let db = state.db();
     let library = config.library;
-    let repo = RepoRef::parse(&format!("{}/{}", config.owner, config.repo)).map_err(|_| {
-        SyncError::NotConnected(
-            "The repository's name is not one GitHub uses; connect the library again.".to_owned(),
-        )
-    })?;
-    let token = token_of(state, config).await?;
-    let token = token.as_ref();
-    let github = state.github();
     let dirty = status.etag.as_deref() == Some(DIRTY_ETAG);
-    let sent_etag = if dirty { None } else { status.etag.as_deref() };
-    let head = github
-        .head(&repo, &config.branch, token, sent_etag)
-        .await
-        .map_err(github_error)?;
-    let (commit, tree_sha, etag, author) = match head {
-        Head::NotModified => {
+    let mut listing = match source.look(state, config, status, dirty).await? {
+        Look::Unchanged { etag } => {
             return Ok(Outcome::Unchanged {
-                etag: status.etag.clone(),
+                etag,
+                listing_detail: None,
             });
         }
-        Head::Moved {
-            commit,
-            tree,
-            etag,
-            author,
-        } => (commit, tree, etag, author),
+        Look::Listing(listing) => *listing,
     };
-    if !dirty && status.last_commit.as_deref() == Some(commit.as_str()) {
+    if !dirty
+        && !listing.bookmark.is_empty()
+        && status.last_commit.as_deref() == Some(listing.bookmark.as_str())
+    {
         return Ok(Outcome::Unchanged {
-            etag: etag.or_else(|| status.etag.clone()),
+            etag: listing.etag.or_else(|| status.etag.clone()),
+            listing_detail: None,
         });
     }
-    let user = connector(state, config, &commit, author.as_deref()).await?;
-    let tree = github
-        .tree(&repo, &tree_sha, token)
-        .await
-        .map_err(github_error)?;
-    let whole = Whole::of(&tree).ok_or_else(too_big_to_add)?;
+    let user = connector(state, config, &listing.bookmark, listing.credit.as_deref()).await?;
+    source.list(state, &mut listing).await?;
+    let recorded = db.source_items(library).await.map_err(db_failed)?;
+    let protected_paths: HashSet<String> = recorded
+        .iter()
+        .filter(|item| listing.protected.contains(&item.node))
+        .map(|item| item.repository_path.clone())
+        .collect();
 
     // The library's file policies and the largest file the server takes, judged before names
     // are given, so a hidden file never pushes a shown sibling to a suffix.
@@ -1243,12 +1455,19 @@ async fn run(
         );
         failed("The library's file policies could not be read, so nothing was changed.")
     })?;
-    let largest = state.config().max_file_bytes;
-    let mut refused = Hidden::default();
+    let mut largest = state.config().max_file_bytes;
+    if matches!(source.content(), ContentMode::External) {
+        let settings = db.share_settings().await.map_err(db_failed)?;
+        largest = largest.min(settings.cache_max_bytes / 2);
+    }
+    let mut refused = std::mem::take(&mut listing.hidden);
     let folder = config.folder.trim_matches('/');
-    let tree: Vec<TreeEntry> = tree
+    let tree: Vec<TreeEntry> = std::mem::take(&mut listing.entries)
         .into_iter()
         .filter(|entry| {
+            if protected_paths.contains(entry.path.as_str()) {
+                return false;
+            }
             if entry.kind != EntryKind::File || below(&entry.path, folder).is_none() {
                 return true;
             }
@@ -1270,28 +1489,51 @@ async fn run(
             true
         })
         .collect();
-    let recorded = db.source_items(library).await.map_err(db_failed)?;
-    let (shown, mut hidden) = shown_names_with_allocations(tree, folder, &recorded);
-    hidden.policy = refused.policy;
-    hidden.too_big = refused.too_big;
+    let (mut shown, mut hidden) = shown_names_with_allocations(tree, folder, &recorded);
+    shown.extend(
+        recorded
+            .iter()
+            .filter(|item| listing.protected.contains(&item.node))
+            .map(|item| Entry {
+                path: item.path.clone(),
+                repository_path: item.repository_path.clone(),
+                sha: item.blob_sha.clone().unwrap_or_default(),
+                size: u64::try_from(item.size).unwrap_or(0),
+                dir: item.blob_sha.is_none(),
+            }),
+    );
+    shown.sort_by(|left, right| left.path.cmp(&right.path));
+    hidden.symlinks = hidden.symlinks.saturating_add(refused.symlinks);
+    hidden.submodules = hidden.submodules.saturating_add(refused.submodules);
+    hidden.policy = hidden.policy.saturating_add(refused.policy);
+    hidden.too_big = hidden.too_big.saturating_add(refused.too_big);
+    hidden.unnameable = hidden.unnameable.saturating_add(refused.unnameable);
+    hidden.renamed = hidden.renamed.saturating_add(refused.renamed);
+    hidden.system = hidden.system.saturating_add(refused.system);
+    hidden.offline = hidden.offline.saturating_add(refused.offline);
+    hidden.too_long = hidden.too_long.saturating_add(refused.too_long);
+    hidden.unreadable = hidden.unreadable.saturating_add(refused.unreadable);
 
     let files = shown.iter().filter(|e| !e.dir).count();
     let bytes =
         total_size(shown.iter().filter(|e| !e.dir).map(|e| e.size)).ok_or_else(too_big_to_add)?;
-    let (max_files, max_bytes) = caps(state).await?;
-    if files > max_files {
-        return Err(failed(&format!(
-            "The repository has {files} files to show, more than the {max_files} this server \
-             mirrors for one library, so nothing was changed."
-        ))
-        .into());
-    }
-    if bytes > max_bytes {
-        return Err(failed(&format!(
-            "The repository's files hold {bytes} bytes, more than the {max_bytes} this server \
-             mirrors for one library, so nothing was changed."
-        ))
-        .into());
+    let caps = source.caps(state).await?;
+    if caps.exceeded_by(files, bytes) {
+        if files > caps.max_files {
+            return Err(failed(&format!(
+                "The repository has {files} files to show, more than the {} this server \
+                 mirrors for one library, so nothing was changed.",
+                caps.max_files
+            ))
+            .into());
+        }
+        if let Some(max_bytes) = caps.max_bytes {
+            return Err(failed(&format!(
+                "The repository's files hold {bytes} bytes, more than the {max_bytes} this server \
+                 mirrors for one library, so nothing was changed."
+            ))
+            .into());
+        }
     }
 
     // A tracked node is usable only when it is live at the displayed parent and name recorded
@@ -1311,6 +1553,13 @@ async fn run(
     let mut repairs = HashSet::new();
     let mut valid_folders: HashMap<String, NodeId> = HashMap::new();
     for item in ordered {
+        if listing.protected.contains(&item.node) {
+            if item.blob_sha.is_none() {
+                valid_folders.insert(item.path.clone(), item.node);
+            }
+            known.push(item);
+            continue;
+        }
         let expected_parent = if parent_path(&item.path).is_empty() {
             Some(library)
         } else {
@@ -1336,7 +1585,50 @@ async fn run(
             lost.push(item.node);
         }
     }
-    let plan = plan_with_repairs(&shown, &known, &repairs);
+    let plannable_shown: Vec<Entry> = shown
+        .iter()
+        .filter(|entry| !protected_paths.contains(&entry.repository_path))
+        .cloned()
+        .collect();
+    let plannable_known: Vec<SourceItem> = known
+        .iter()
+        .filter(|item| !listing.protected.contains(&item.node))
+        .cloned()
+        .collect();
+    let mut plan = plan_with_repairs(&plannable_shown, &plannable_known, &repairs);
+    if matches!(source.content(), ContentMode::External) {
+        let zero_moves: Vec<(SourceItem, Entry)> = plan
+            .moves
+            .iter()
+            .filter(|(_, entry)| entry.size == 0)
+            .cloned()
+            .collect();
+        plan.moves.retain(|(_, entry)| entry.size != 0);
+        for (item, entry) in zero_moves {
+            plan.remove.push(item);
+            plan.add.push(entry);
+        }
+        let missing: Vec<NodeId> = plan.remove.iter().map(|item| item.node).collect();
+        db.clear_missing_except(library, &missing)
+            .await
+            .map_err(db_failed)?;
+    }
+
+    if matches!(source.content(), ContentMode::External)
+        && lost.is_empty()
+        && plan.add.is_empty()
+        && plan.change.is_empty()
+        && plan.remove.is_empty()
+        && plan.moves.is_empty()
+        && status.files == i64::try_from(files).unwrap_or(i64::MAX)
+        && status.bytes == i64::try_from(bytes).unwrap_or(i64::MAX)
+        && status.hidden == i64::try_from(hidden.total()).unwrap_or(i64::MAX)
+    {
+        return Ok(Outcome::Unchanged {
+            etag: None,
+            listing_detail: Some(hidden.detail()),
+        });
+    }
 
     let mut needed: HashMap<String, u64> = HashMap::new();
     for entry in plan
@@ -1347,36 +1639,38 @@ async fn run(
     {
         needed.insert(entry.sha.clone(), entry.size);
     }
-    let fetched = fetch(
-        state,
-        &Reading {
-            repo: &repo,
-            token,
-            commit: &commit,
-            folder: config.folder.trim_matches('/'),
-            whole,
-            max_bytes,
-        },
-        &needed,
-    )
-    .await?;
+    let fetched = source.fetch(state, config, &listing, caps, &needed).await?;
 
     // Marked half applied before anything changes, so a sync cut short by the process ending
     // never answers unchanged later, even when the branch is back at the last commit. A sync
     // that finishes replaces the marker with the branch's entity tag.
-    db.mark_source_etag(library, DIRTY_ETAG)
-        .await
-        .map_err(db_failed)?;
-    let counts = apply(state, library, &user, &known, &lost, plan, &fetched)
-        .await
-        .map_err(|error| Failure {
-            error,
-            applying: true,
-        })?;
+    if matches!(source.content(), ContentMode::Mirrored) {
+        db.mark_source_etag(library, DIRTY_ETAG)
+            .await
+            .map_err(db_failed)?;
+    }
+    let counts = apply(
+        state,
+        library,
+        &user,
+        &known,
+        &lost,
+        plan,
+        &fetched,
+        source.content(),
+        now,
+        config.poll_seconds,
+        generation,
+    )
+    .await
+    .map_err(|error| Failure {
+        error,
+        applying: true,
+    })?;
     drop(fetched);
     Ok(Outcome::Synced {
         report: SyncReport {
-            commit,
+            commit: listing.bookmark,
             added: counts.added,
             changed: counts.changed,
             removed: counts.removed,
@@ -1384,8 +1678,10 @@ async fn run(
             hidden,
             bytes,
         },
-        etag,
+        etag: listing.etag,
         files,
+        content: source.content(),
+        took: listing.took,
     })
 }
 
@@ -1528,25 +1824,8 @@ async fn connector(
 
 /// The caps on what one library mirrors: files and bytes.
 pub(crate) async fn caps(state: &AppState) -> Result<(usize, u64), SyncError> {
-    let db = state.db();
-    let read = |value: Option<serde_json::Value>, default: i64| {
-        value
-            .and_then(|v| v.as_i64())
-            .filter(|n| *n >= 1)
-            .unwrap_or(default)
-    };
-    let files = read(
-        db.setting(SOURCE_MAX_FILES).await.map_err(db_failed)?,
-        DEFAULT_SOURCE_MAX_FILES,
-    );
-    let bytes = read(
-        db.setting(SOURCE_MAX_BYTES).await.map_err(db_failed)?,
-        DEFAULT_SOURCE_MAX_BYTES,
-    );
-    Ok((
-        usize::try_from(files).unwrap_or(usize::MAX),
-        u64::try_from(bytes).unwrap_or(u64::MAX),
-    ))
+    let caps = GithubSource.caps(state).await?;
+    Ok((caps.max_files, caps.max_bytes.unwrap_or(u64::MAX)))
 }
 
 /// The whole tree's size: its entries, and its files' bytes and the largest.
@@ -1555,6 +1834,15 @@ struct Whole {
     entries: usize,
     bytes: u64,
     largest: u64,
+}
+
+impl SourceCaps {
+    fn tarball_worth_trying(self, needed: usize, whole: Whole) -> bool {
+        needed > TARBALL_FROM
+            && self
+                .max_bytes
+                .is_some_and(|max_bytes| whole.bytes <= max_bytes)
+    }
 }
 
 impl Whole {
@@ -1576,7 +1864,6 @@ struct Reading<'a> {
     /// The mirrored folder, without outer slashes.
     folder: &'a str,
     whole: Whole,
-    max_bytes: u64,
 }
 
 /// Why reading the tarball did not work.
@@ -1584,29 +1871,6 @@ enum TarFailure {
     /// It is larger than the limits allow: the files are read one by one instead.
     TooLarge,
     Failed(SyncError),
-}
-
-/// Reads every blob of `needed` (blob id to size), checks each against its id and stores it,
-/// held: from one tarball when more than [`TARBALL_FROM`] are needed and the whole tree is
-/// within the byte cap, otherwise (or when the tarball is larger than allowed) one by one.
-async fn fetch(
-    state: &AppState,
-    reading: &Reading<'_>,
-    needed: &HashMap<String, u64>,
-) -> Result<HashMap<String, Held>, SyncError> {
-    if needed.is_empty() {
-        return Ok(HashMap::new());
-    }
-    if needed.len() > TARBALL_FROM && reading.whole.bytes <= reading.max_bytes {
-        match by_tarball(state, reading, needed).await {
-            Ok(fetched) => return Ok(fetched),
-            Err(TarFailure::Failed(e)) => return Err(e),
-            Err(TarFailure::TooLarge) => {
-                println!("sharecraft-server: a tarball was over its limits; reading files singly");
-            }
-        }
-    }
-    by_blobs(state, reading, needed).await
 }
 
 /// The message for bytes that do not match their id.
@@ -1773,6 +2037,7 @@ struct Applying<'a> {
     state: &'a AppState,
     library: NodeId,
     user: &'a User,
+    mode: ContentMode,
     /// The node of each folder path, as known or made.
     folders: HashMap<String, NodeId>,
     /// Every node recorded as an item when the sync started.
@@ -1786,14 +2051,19 @@ struct Applying<'a> {
 /// of the folders that go; under a temporary name where the final one is still taken), the
 /// folders gone binned, deepest first, the moved files given their final names, and last the
 /// files changed and added. Each item is recorded as it is done.
+#[allow(clippy::too_many_arguments)]
 async fn apply(
     state: &AppState,
     library: NodeId,
     user: &User,
     known: &[SourceItem],
     lost: &[NodeId],
-    plan: Plan,
+    mut plan: Plan,
     fetched: &HashMap<String, Held>,
+    mode: ContentMode,
+    now: OffsetDateTime,
+    poll_seconds: u32,
+    generation: i64,
 ) -> Result<Counts, SyncError> {
     if !lost.is_empty() {
         state
@@ -1802,10 +2072,22 @@ async fn apply(
             .await
             .map_err(db_failed)?;
     }
+    if matches!(mode, ContentMode::External) && !plan.remove.is_empty() {
+        let nodes: Vec<NodeId> = plan.remove.iter().map(|item| item.node).collect();
+        let seconds = i64::from(poll_seconds.saturating_mul(MISSING_GRACE_POLLS));
+        let expired = state
+            .db()
+            .note_missing(library, &nodes, now, time::Duration::seconds(seconds))
+            .await
+            .map_err(db_failed)?;
+        let expired: HashSet<NodeId> = expired.into_iter().collect();
+        plan.remove.retain(|item| expired.contains(&item.node));
+    }
     let mut work = Applying {
         state,
         library,
         user,
+        mode,
         folders: known
             .iter()
             .filter(|item| item.blob_sha.is_none())
@@ -1815,6 +2097,7 @@ async fn apply(
         fetched,
     };
     let mut counts = Counts::default();
+    let mut applied_operations = 0_usize;
     let (gone_folders, gone_files): (Vec<SourceItem>, Vec<SourceItem>) = plan
         .remove
         .into_iter()
@@ -1828,9 +2111,54 @@ async fn apply(
     for item in gone_files {
         work.to_bin(&item).await?;
         counts.removed += 1;
+        applied_operations = applied_operations.saturating_add(1);
+        check_generation(state, library, generation, applied_operations).await?;
     }
-    for entry in plan.add.iter().filter(|e| e.dir) {
-        work.add_folder(entry, &mut gone_folders).await?;
+    if matches!(mode, ContentMode::External) {
+        // A file replacing a folder needs that folder's name freed before the combined batch is
+        // created. Other gone folders stay until after moves, preserving the existing ordering.
+        let file_add_paths: HashSet<&str> = plan
+            .add
+            .iter()
+            .filter(|entry| !entry.dir)
+            .map(|entry| entry.path.as_str())
+            .collect();
+        let replaced_folders: Vec<NodeId> = gone_folders
+            .iter()
+            .filter(|(_, item)| file_add_paths.contains(item.path.as_str()))
+            .map(|(node, _)| *node)
+            .collect();
+        for node in replaced_folders {
+            let Some(item) = gone_folders.remove(&node) else {
+                continue;
+            };
+            work.to_bin(&item).await?;
+            work.folders.remove(&item.path);
+            applied_operations = applied_operations.saturating_add(1);
+            check_generation(state, library, generation, applied_operations).await?;
+        }
+        let adds: Vec<&Entry> = plan
+            .add
+            .iter()
+            .filter(|entry| entry.dir)
+            .chain(plan.add.iter().filter(|entry| !entry.dir))
+            .collect();
+        let added = work
+            .add_external_batches(
+                &adds,
+                &mut gone_folders,
+                state.config().normalized_source_create_batch_size(),
+                generation,
+            )
+            .await?;
+        counts.added = counts.added.saturating_add(added);
+        applied_operations = applied_operations.saturating_add(adds.len());
+    } else {
+        for entry in plan.add.iter().filter(|e| e.dir) {
+            work.add_folder(entry, &mut gone_folders).await?;
+            applied_operations = applied_operations.saturating_add(1);
+            check_generation(state, library, generation, applied_operations).await?;
+        }
     }
     let mut waiting = Vec::new();
     for (item, entry) in &plan.moves {
@@ -1838,24 +2166,59 @@ async fn apply(
             waiting.push(later);
         }
         counts.moved += 1;
+        applied_operations = applied_operations.saturating_add(1);
+        check_generation(state, library, generation, applied_operations).await?;
     }
     let mut gone_folders: Vec<SourceItem> = gone_folders.into_values().collect();
     gone_folders.sort_by(|a, b| b.path.cmp(&a.path));
     for item in gone_folders {
         work.to_bin(&item).await?;
+        applied_operations = applied_operations.saturating_add(1);
+        check_generation(state, library, generation, applied_operations).await?;
     }
     for (node, entry) in waiting {
         work.final_name(node, entry).await?;
+        applied_operations = applied_operations.saturating_add(1);
+        check_generation(state, library, generation, applied_operations).await?;
     }
     for (item, entry) in &plan.change {
         work.new_version(item.node, entry).await?;
         counts.changed += 1;
+        applied_operations = applied_operations.saturating_add(1);
+        check_generation(state, library, generation, applied_operations).await?;
     }
-    for entry in plan.add.iter().filter(|e| !e.dir) {
-        work.add_file(entry).await?;
-        counts.added += 1;
+    if !matches!(mode, ContentMode::External) {
+        for entry in plan.add.iter().filter(|e| !e.dir) {
+            work.add_file(entry).await?;
+            counts.added += 1;
+            applied_operations = applied_operations.saturating_add(1);
+            check_generation(state, library, generation, applied_operations).await?;
+        }
     }
     Ok(counts)
+}
+
+async fn check_generation(
+    state: &AppState,
+    library: NodeId,
+    generation: i64,
+    applied_operations: usize,
+) -> Result<(), SyncError> {
+    if !applied_operations.is_multiple_of(100) {
+        return Ok(());
+    }
+    let current = state
+        .db()
+        .source_generation(library)
+        .await
+        .map_err(db_failed)?;
+    if current == Some(generation) {
+        Ok(())
+    } else {
+        Err(failed(
+            "The source changed while its files were being listed, so the sync stopped.",
+        ))
+    }
 }
 
 /// `name` with a suffix no other name has, before the extension its editor needs: the
@@ -1873,7 +2236,178 @@ fn temporary_name(name: &str) -> String {
     tree::fit(stem, extension, &suffix)
 }
 
+fn external_mtime(entry: &Entry) -> Result<i64, SyncError> {
+    let prefix = format!("x{}-", entry.size);
+    entry
+        .sha
+        .strip_prefix(&prefix)
+        .and_then(|text| text.parse::<i64>().ok())
+        .ok_or_else(|| failed("A file on the share had an invalid change tag."))
+}
+
 impl Applying<'_> {
+    /// Creates new share nodes in count-bounded commits. Existing untracked nodes keep the
+    /// adopt-by-path replacement used before batching.
+    async fn add_external_batches(
+        &mut self,
+        entries: &[&Entry],
+        gone: &mut HashMap<NodeId, SourceItem>,
+        batch_size: usize,
+        generation: i64,
+    ) -> Result<usize, SyncError> {
+        let mut batch = Vec::with_capacity(batch_size);
+        let mut added_files = 0_usize;
+        let mut adopted_since_check = 0_usize;
+        let mut children: HashMap<NodeId, HashMap<String, Option<Node>>> = HashMap::new();
+        let mut git_ids = tree::external_tree_ids(self.state).await.map_err(|e| {
+            eprintln!("sharecraft-server: sync could not read the content tree: {e:?}");
+            failed("The content tree could not be read, so the sync stopped.")
+        })?;
+        for entry in entries {
+            let parent = self.folder(parent_path(&entry.path))?;
+            let name = last_name(&entry.path);
+            if let HashEntry::Vacant(slot) = children.entry(parent) {
+                let known = self
+                    .state
+                    .db()
+                    .live_children(parent)
+                    .await
+                    .map_err(db_failed)?
+                    .into_iter()
+                    .map(|node| (node.name.to_lowercase(), Some(node)))
+                    .collect();
+                slot.insert(known);
+            }
+            let existing = children
+                .get(&parent)
+                .and_then(|known| known.get(&name.to_lowercase()))
+                .cloned()
+                .flatten();
+            if entry.dir {
+                match existing {
+                    Some(node)
+                        if node.kind == NodeKind::Folder && !self.tracked.contains(&node.id) =>
+                    {
+                        self.record(node.id, entry).await?;
+                        self.folders.insert(entry.path.clone(), node.id);
+                        adopted_since_check = adopted_since_check.saturating_add(1);
+                        if adopted_since_check == batch_size {
+                            self.ensure_external_generation(generation).await?;
+                            adopted_since_check = 0;
+                        }
+                        continue;
+                    }
+                    Some(node)
+                        if node.kind == NodeKind::Folder && gone.remove(&node.id).is_some() =>
+                    {
+                        if node.name != name {
+                            self.change(
+                                TreeOp::Rename {
+                                    id: node.id,
+                                    name: name.to_owned(),
+                                },
+                                &entry.path,
+                            )
+                            .await?;
+                        }
+                        self.record(node.id, entry).await?;
+                        self.folders.insert(entry.path.clone(), node.id);
+                        adopted_since_check = adopted_since_check.saturating_add(1);
+                        if adopted_since_check == batch_size {
+                            self.ensure_external_generation(generation).await?;
+                            adopted_since_check = 0;
+                        }
+                        continue;
+                    }
+                    Some(_) => return Err(taken(&entry.path)),
+                    None => {}
+                }
+            } else {
+                match existing {
+                    Some(node)
+                        if node.kind == NodeKind::Document && !self.tracked.contains(&node.id) =>
+                    {
+                        self.record(node.id, entry).await?;
+                        added_files = added_files.saturating_add(1);
+                        adopted_since_check = adopted_since_check.saturating_add(1);
+                        if adopted_since_check == batch_size {
+                            self.ensure_external_generation(generation).await?;
+                            adopted_since_check = 0;
+                        }
+                        continue;
+                    }
+                    Some(_) => return Err(taken(&entry.path)),
+                    None => {}
+                }
+            }
+            let id = NodeId(Uuid::new_v4());
+            if let Some(known) = children.get_mut(&parent) {
+                known.insert(name.to_lowercase(), None);
+            }
+            if entry.dir {
+                self.folders.insert(entry.path.clone(), id);
+            } else {
+                added_files = added_files.saturating_add(1);
+            }
+            let mtime_ns = if entry.dir { 0 } else { external_mtime(entry)? };
+            batch.push(tree::ExternalNodeCreate {
+                id,
+                parent,
+                name: name.to_owned(),
+                path: entry.path.clone(),
+                repository_path: entry.repository_path.clone(),
+                size: entry.size,
+                mtime_ns,
+                editor: (!entry.dir).then(|| Editor::for_file_name(name)),
+            });
+            if batch.len() == batch_size {
+                self.commit_external_batch(&batch, generation, &git_ids)
+                    .await?;
+                git_ids.extend(batch.iter().map(|create| create.id.0));
+                batch.clear();
+            }
+        }
+        if !batch.is_empty() {
+            self.commit_external_batch(&batch, generation, &git_ids)
+                .await?;
+        }
+        if adopted_since_check > 0 {
+            self.ensure_external_generation(generation).await?;
+        }
+        Ok(added_files)
+    }
+
+    async fn commit_external_batch(
+        &self,
+        batch: &[tree::ExternalNodeCreate],
+        generation: i64,
+        git_ids: &HashSet<Uuid>,
+    ) -> Result<(), SyncError> {
+        tree::create_external_nodes(self.state, self.user, self.library, batch, git_ids)
+            .await
+            .map_err(|e| {
+                eprintln!("sharecraft-server: sync could not add a file-share batch: {e:?}");
+                failed("A batch of file-share items could not be added, so the sync stopped.")
+            })?;
+        self.ensure_external_generation(generation).await
+    }
+
+    async fn ensure_external_generation(&self, generation: i64) -> Result<(), SyncError> {
+        let current = self
+            .state
+            .db()
+            .source_generation(self.library)
+            .await
+            .map_err(db_failed)?;
+        if current == Some(generation) {
+            Ok(())
+        } else {
+            Err(failed(
+                "The source changed while its files were being listed, so the sync stopped.",
+            ))
+        }
+    }
+
     /// The node of the folder at `path` (the library at the top).
     fn folder(&self, path: &str) -> Result<NodeId, SyncError> {
         if path.is_empty() {
@@ -1889,6 +2423,22 @@ impl Applying<'_> {
     /// Records `node` as holding `entry`, replacing any item it held before.
     async fn record(&self, node: NodeId, entry: &Entry) -> Result<(), SyncError> {
         let db = self.state.db();
+        if matches!(self.mode, ContentMode::External) && !entry.dir {
+            let mtime_ns = external_mtime(entry)?;
+            return db
+                .record_external_item(
+                    self.library,
+                    &ExternalEntry {
+                        node,
+                        path: entry.path.clone(),
+                        repository_path: entry.repository_path.clone(),
+                        size: entry.size,
+                        mtime_ns,
+                    },
+                )
+                .await
+                .map_err(db_failed);
+        }
         let item = SourceItem {
             node,
             path: entry.path.clone(),
@@ -2092,6 +2642,9 @@ impl Applying<'_> {
     /// Stores the content of `entry` as a new version of the file `node`, through its file
     /// session as an uploaded version is, and records it.
     async fn new_version(&self, node: NodeId, entry: &Entry) -> Result<(), SyncError> {
+        if matches!(self.mode, ContentMode::External) {
+            return self.record(node, entry).await;
+        }
         let db = self.state.db();
         let doc = DocId(node.0);
         let document = db
@@ -2146,10 +2699,37 @@ impl Applying<'_> {
             .map_err(db_failed)?;
         match existing {
             Some(node) if node.kind == NodeKind::Document && !self.tracked.contains(&node.id) => {
+                if matches!(self.mode, ContentMode::External) {
+                    return self.record(node.id, entry).await;
+                }
                 return self.new_version(node.id, entry).await;
             }
             Some(_) => return Err(taken(&entry.path)),
             None => {}
+        }
+        if matches!(self.mode, ContentMode::External) {
+            let id = DocId(Uuid::new_v4());
+            tree::create_document(
+                self.state,
+                self.user,
+                parent,
+                id,
+                name,
+                Editor::for_file_name(name),
+                Some(entry.size),
+            )
+            .await
+            .map_err(|e| {
+                eprintln!(
+                    "sharecraft-server: sync could not add {}: {e:?}",
+                    entry.path
+                );
+                failed(&format!(
+                    "{} could not be added, so the sync stopped.",
+                    entry.path
+                ))
+            })?;
+            return self.record(NodeId(id.0), entry).await;
         }
         let held = self.held(&entry.sha, &entry.path).await?;
         let created = create_uploaded(
@@ -2256,6 +2836,28 @@ mod tests {
         };
         assert!(Whole::of(&[huge("a"), huge("b")]).is_none());
         assert!(Whole::of(&[huge("a")]).is_some());
+    }
+
+    #[test]
+    fn one_cap_snapshot_drives_enforcement_and_tarball_selection() {
+        let whole = Whole {
+            entries: 25,
+            bytes: 80,
+            largest: 4,
+        };
+        let snapshot = SourceCaps {
+            max_files: 30,
+            max_bytes: Some(100),
+        };
+        assert!(!snapshot.exceeded_by(25, 80));
+        assert!(snapshot.tarball_worth_trying(25, whole));
+
+        let changed_later = SourceCaps {
+            max_files: 30,
+            max_bytes: Some(50),
+        };
+        assert!(changed_later.exceeded_by(25, 80));
+        assert!(!changed_later.tarball_worth_trying(25, whole));
     }
 
     #[test]

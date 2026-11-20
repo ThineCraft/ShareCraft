@@ -28,12 +28,14 @@
 mod common;
 
 use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 
 use collab_core::ids::{DocId, NodeId};
 use common::fake_github::FakeGithub;
+use common::fake_share::FakeShare;
 use common::{FileClient, TestServer, TestUser, spawn_server_config, start_fake_github};
 use protocol::{FileServerMsg, SeatState};
-use records::{NewSource, NodeKind, Principal, SourceKind};
+use records::{NewSource, NodeKind, Principal, SHARE_ROOTS, SourceKind, SourceMode};
 use reqwest::header::CONTENT_RANGE;
 use reqwest::{Method, StatusCode};
 use revisions::BlobRef;
@@ -45,9 +47,10 @@ use uuid::Uuid;
 
 const OWNER: &str = "octo-org";
 const REPO: &str = "docs";
+const SHARE_ROOT: &str = r"C:\source-readonly";
 /// The refusal's message, word for word.
 const MESSAGE: &str =
-    "This library is kept in step with a GitHub repository, so it cannot be changed here.";
+    "This library is kept in step with an outside source, so it cannot be changed here.";
 const SEAT: &str = "x-sharecraft-seat";
 
 /// What a route does to a library's files.
@@ -108,6 +111,10 @@ const ROUTES: &[(&str, Decision)] = &[
     ),
     (
         "POST /api/sites/{id}/libraries/github",
+        Allowed("makes a new library and connects it; no existing library's files change"),
+    ),
+    (
+        "POST /api/sites/{id}/libraries/share",
         Allowed("makes a new library and connects it; no existing library's files change"),
     ),
     ("GET /api/libraries/{id}", Read),
@@ -310,6 +317,8 @@ const ROUTES: &[(&str, Decision)] = &[
         "PUT /api/settings/scanner",
         Allowed("organisation settings"),
     ),
+    ("GET /api/settings/shares", Read),
+    ("PUT /api/settings/shares", Allowed("organisation settings")),
     ("GET /api/nodes/{id}/inheritance/preview", Read),
     ("GET /api/explorer/{root}", Read),
     ("GET /api/explorer/{root}/counts", Read),
@@ -610,7 +619,7 @@ fn a_route_list_guard() {
         unclassified.is_empty() && gone.is_empty(),
         "routes not classified in ROUTES: {unclassified:?}; recorded but not registered: {gone:?}"
     );
-    assert_eq!(routes.len(), 153, "the number of registered routes changed");
+    assert_eq!(routes.len(), 156, "the number of registered routes changed");
     let mut mounts_sorted = mounts.clone();
     mounts_sorted.sort();
     let mut expected: Vec<String> = MOUNTS.iter().map(|m| (*m).to_owned()).collect();
@@ -776,6 +785,7 @@ fn sha_hex(bytes: &[u8]) -> String {
 struct Env {
     server: TestServer,
     fake: FakeGithub,
+    share: FakeShare,
     state: AppState,
     admin: TestUser,
     olive: TestUser,
@@ -820,7 +830,12 @@ impl Env {
         let bob = server.user("Bob Nobody").await;
         let elsewhere = common::Site::library(&server).await;
         let state = server.app_state().await;
+        let share = FakeShare::new(SHARE_ROOT);
+        state.shares().set_fs(Arc::new(share.clone()));
         let db = server.records_db();
+        db.set_setting(admin.id, SHARE_ROOTS, json!([SHARE_ROOT]))
+            .await
+            .unwrap();
         let site = db.node(elsewhere).await.unwrap().unwrap().site;
         db.set_node_access(admin.id, site, Principal::User(olive.id), Some("owner"))
             .await
@@ -828,6 +843,7 @@ impl Env {
         let mut env = Env {
             server,
             fake,
+            share,
             state,
             admin,
             olive,
@@ -1001,6 +1017,15 @@ impl Env {
     /// `connected`, the library is connected to the fake's branch and its items come from the
     /// sync; otherwise the administrator makes them.
     async fn fixture(&self, connected: bool, users: &[&TestUser]) -> Fixture {
+        self.fixture_for(connected.then_some(SourceKind::Github), users)
+            .await
+    }
+
+    async fn share_fixture(&self, users: &[&TestUser]) -> Fixture {
+        self.fixture_for(Some(SourceKind::Share), users).await
+    }
+
+    async fn fixture_for(&self, source: Option<SourceKind>, users: &[&TestUser]) -> Fixture {
         let suffix = Uuid::new_v4().simple().to_string();
         let library = self
             .new_library(&format!("Library {suffix}"), "document")
@@ -1024,8 +1049,8 @@ impl Env {
             sessions.insert(user.email.clone(), (finish, chunk));
         }
         let (docs, other, doomed);
-        if connected {
-            self.connect(&library).await;
+        if let Some(source) = source {
+            self.connect(&library, source).await;
             let mut tree: Vec<(String, Vec<u8>)> = Vec::new();
             for name in DOCS_FILES.iter().chain(BINNED) {
                 tree.push((format!("docs/{name}"), bytes_of(name)));
@@ -1038,7 +1063,16 @@ impl Env {
             }
             let files: Vec<(&str, Vec<u8>)> =
                 tree.iter().map(|(p, b)| (p.as_str(), b.clone())).collect();
-            self.fake.commit("main", &files);
+            match source {
+                SourceKind::Github => {
+                    self.fake.commit("main", &files);
+                }
+                SourceKind::Share => {
+                    for (path, bytes) in &files {
+                        self.share.put(path, bytes);
+                    }
+                }
+            }
             self.sync(&library).await;
             let top = self.children(&library).await;
             docs = top["docs"].clone();
@@ -1052,8 +1086,31 @@ impl Env {
                 .into_iter()
                 .filter(|(path, _)| !BINNED.iter().any(|b| path.ends_with(b)))
                 .collect();
-            self.fake.commit("main", &kept);
-            self.sync(&library).await;
+            match source {
+                SourceKind::Github => {
+                    self.fake.commit("main", &kept);
+                    self.sync(&library).await;
+                }
+                SourceKind::Share => {
+                    for name in BINNED {
+                        self.share.remove(&format!("docs/{name}"));
+                    }
+                    let library_id = NodeId(library.parse().unwrap());
+                    let missing_at = OffsetDateTime::now_utc();
+                    sync_once(&self.state, library_id, missing_at)
+                        .await
+                        .unwrap()
+                        .expect("the share changed");
+                    sync_once(
+                        &self.state,
+                        library_id,
+                        missing_at + time::Duration::seconds(301),
+                    )
+                    .await
+                    .unwrap()
+                    .expect("the missing share files were recycled");
+                }
+            }
             let live = self.children(&docs).await;
             for name in BINNED {
                 assert!(!live.contains_key(*name), "{name} is still live");
@@ -1099,16 +1156,30 @@ impl Env {
 
     /// Connects the empty `library` to the fake's `octo-org/docs` branch `main` (the records
     /// API: the HTTP route comes with Task 6).
-    async fn connect(&self, library: &str) {
+    async fn connect(&self, library: &str, kind: SourceKind) {
         self.server
             .records_db()
             .connect_source(&NewSource {
                 library: NodeId(library.parse().unwrap()),
-                kind: SourceKind::Github,
-                owner: OWNER.to_owned(),
-                repo: REPO.to_owned(),
-                branch: "main".to_owned(),
+                kind,
+                owner: if kind == SourceKind::Github {
+                    OWNER.to_owned()
+                } else {
+                    String::new()
+                },
+                repo: if kind == SourceKind::Github {
+                    REPO.to_owned()
+                } else {
+                    String::new()
+                },
+                branch: if kind == SourceKind::Github {
+                    "main".to_owned()
+                } else {
+                    String::new()
+                },
                 folder: String::new(),
+                location: (kind == SourceKind::Share).then(|| SHARE_ROOT.to_owned()),
+                mode: SourceMode::ReadOnly,
                 token: None,
                 poll_seconds: 300,
                 connected_by: self.admin.id,
@@ -1450,6 +1521,24 @@ async fn every_content_route_refuses_in_a_connected_library() {
     let top = env.children(&fx.library).await;
     assert!(top.contains_key("added.txt"), "{top:?}");
     assert!(!top.contains_key("other"), "{top:?}");
+}
+
+/// The same complete guarded-route table uses the same refusal for a file-share library. The
+/// fixture selection is the only difference, so a route added to the table is exercised for
+/// both connected-source kinds without a second copy of the table.
+#[tokio::test]
+async fn every_write_route_is_refused_in_a_share_library() {
+    let env = Env::new().await;
+    let fx = env.share_fixture(&[&env.olive, &env.admin]).await;
+    for (user, who) in [
+        (&env.olive, "share owner"),
+        (&env.admin, "share administrator"),
+    ] {
+        for row in ROWS {
+            let answered = env.perform(&fx, user, row.act).await;
+            assert_refused(row.act, who, &answered);
+        }
+    }
 }
 
 /// The same rows in ordinary libraries, as an owner and as an administrator (each with a

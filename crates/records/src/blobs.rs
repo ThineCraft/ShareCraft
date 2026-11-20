@@ -10,11 +10,11 @@
 //! rebuilt from it ([`Db::rebuild_blob_refs`]), which the next start does when a flag says so.
 
 use collab_core::ids::DocId;
-use revisions::{BlobRef, hex, parse_hex};
+use revisions::{hex, parse_hex};
 use sqlx::PgConnection;
 use time::OffsetDateTime;
 
-use crate::{Db, DbError, Origin};
+use crate::{BlobRef, Db, DbError, Origin};
 
 /// The flag set once by the upgrade to the content store.
 pub const BLOB_REFS_UPGRADE: &str = "blob_refs_upgrade";
@@ -105,6 +105,83 @@ async fn insert_completed(
 }
 
 impl Db {
+    /// Pins `blob` in the external-content cache, creating its safety row as an upload claim
+    /// does and recording `now` as its most recent use, in one transaction.
+    pub async fn pin_cached(&self, blob: &BlobRef, now: OffsetDateTime) -> Result<(), DbError> {
+        let mut tx = self.pool().begin().await?;
+        upsert_claimed(&mut tx, blob, Origin::Upload).await?;
+        sqlx::query("select sha256 from blobs where sha256 = $1 for share")
+            .bind(blob.hex())
+            .fetch_one(&mut *tx)
+            .await?;
+        sqlx::query(
+            "insert into source_cache (sha256, size, last_used_at) values ($1, $2, $3) \
+             on conflict (sha256) do update set size = excluded.size, \
+                 last_used_at = greatest(source_cache.last_used_at, excluded.last_used_at)",
+        )
+        .bind(blob.hex())
+        .bind(size_of(blob))
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Records `now` as the most recent use of cached content. Answers whether it was pinned.
+    pub async fn touch_cached(
+        &self,
+        sha256: &[u8; 32],
+        now: OffsetDateTime,
+    ) -> Result<bool, DbError> {
+        let done = sqlx::query(
+            "update source_cache set last_used_at = greatest(source_cache.last_used_at, $2) \
+             where sha256 = $1",
+        )
+        .bind(hex(sha256))
+        .bind(now)
+        .execute(self.pool())
+        .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    /// The total bytes pinned in the external-content cache.
+    pub async fn cached_bytes(&self) -> Result<u64, DbError> {
+        let bytes: i64 =
+            sqlx::query_scalar("select coalesce(sum(size), 0)::bigint from source_cache")
+                .fetch_one(self.pool())
+                .await?;
+        Ok(u64::try_from(bytes).unwrap_or(0))
+    }
+
+    /// At most `limit` pinned contents, least recently used first.
+    pub async fn coldest_cached(&self, limit: i64) -> Result<Vec<BlobRef>, DbError> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "select sha256, size from source_cache order by last_used_at, sha256 limit $1",
+        )
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(sha256, size)| {
+                Some(BlobRef {
+                    sha256: parse_hex(&sha256)?,
+                    size: u64::try_from(size).ok()?,
+                })
+            })
+            .collect())
+    }
+
+    /// Removes the cache pin for `sha256`; whether there was one.
+    pub async fn unpin_cached(&self, sha256: &[u8; 32]) -> Result<bool, DbError> {
+        let done = sqlx::query("delete from source_cache where sha256 = $1")
+            .bind(hex(sha256))
+            .execute(self.pool())
+            .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
     /// Claims `blob` for a version of `doc` about to be committed: creates its `blobs` row if
     /// absent, locks it `FOR SHARE` (so no erasure can run meanwhile) and writes a pending
     /// `blob_refs` row, in one transaction. Once this returns, nothing erases `blob` until the
@@ -236,9 +313,10 @@ impl Db {
     }
 
     /// Deletes the row of the content `sha256` if no `blob_refs` row names it, pending ones
-    /// included, and no brand image pins it (`brand_refs`, see [`crate::BrandChange`]), with
-    /// the row locked `FOR UPDATE` while counting. Answers whether nothing names it now (also
-    /// when it had no row), in which case the caller erases the file.
+    /// included, no brand image pins it (`brand_refs`, see [`crate::BrandChange`]), and it is
+    /// not pinned in the external-content cache, with the row locked `FOR UPDATE` while
+    /// counting. Answers whether nothing names it now (also when it had no row), in which case
+    /// the caller erases the file.
     pub async fn release_blob_if_unreferenced(&self, sha256: &[u8; 32]) -> Result<bool, DbError> {
         let hash = hex(sha256);
         let mut tx = self.pool().begin().await?;
@@ -252,7 +330,8 @@ impl Db {
         }
         let named: i64 = sqlx::query_scalar(
             "select (select count(*) from blob_refs where sha256 = $1) \
-                    + (select count(*) from brand_refs where sha256 = $1)",
+                    + (select count(*) from brand_refs where sha256 = $1) \
+                    + (select count(*) from source_cache where sha256 = $1)",
         )
         .bind(&hash)
         .fetch_one(&mut *tx)
@@ -301,7 +380,7 @@ impl Db {
     }
 
     /// The contents with a row created before `before` that no `blob_refs` row names and no
-    /// brand image pins.
+    /// brand image or the external-content cache pins.
     pub async fn unreferenced_blobs(
         &self,
         before: OffsetDateTime,
@@ -311,6 +390,7 @@ impl Db {
              where b.created_at < $1 \
                and not exists (select 1 from blob_refs r where r.sha256 = b.sha256) \
                and not exists (select 1 from brand_refs p where p.sha256 = b.sha256) \
+               and not exists (select 1 from source_cache c where c.sha256 = b.sha256) \
              order by b.sha256",
         )
         .bind(before)

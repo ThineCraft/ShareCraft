@@ -6,7 +6,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use collab_core::ids::{DocId, NodeId};
-use records::{Access, AccessError, Editor};
+use records::{Access, AccessError, Editor, Unavailable};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use time::OffsetDateTime;
@@ -129,6 +129,27 @@ pub(crate) struct DocDetail {
     /// The threat's name, when quarantined.
     #[serde(skip_serializing_if = "Option::is_none")]
     threat: Option<String>,
+    /// File-share metadata for an external document.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    external: Option<ExternalDetail>,
+}
+
+#[derive(Serialize)]
+struct ExternalDetail {
+    bytes: u64,
+    modified_at: Option<String>,
+    read: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unavailable: Option<&'static str>,
+}
+
+pub(crate) fn unavailable_name(unavailable: Unavailable) -> &'static str {
+    match unavailable {
+        Unavailable::Denied => "denied",
+        Unavailable::Gone => "gone",
+        Unavailable::TooLarge => "too_large",
+        Unavailable::Locked => "locked",
+    }
 }
 
 /// `GET /api/docs/{id}`: the document, if the caller has access to it. For a file no editor
@@ -157,14 +178,31 @@ pub(crate) async fn open(
         .await
         .map_err(|e| ApiError::unavailable(&e))?;
     let (scan, threat) = scan_fields(mark);
+    let external = db
+        .external_item(NodeId(doc.0))
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?;
+    let revision = external.as_ref().map_or_else(
+        || document.revision.clone(),
+        |item| Some(item.revision.clone()),
+    );
+    let external = external.map(|item| ExternalDetail {
+        bytes: item.size,
+        modified_at: OffsetDateTime::from_unix_timestamp_nanos(i128::from(item.mtime_ns))
+            .ok()
+            .and_then(|at| at.format(&Rfc3339).ok()),
+        read: item.sha256.is_some(),
+        unavailable: item.unavailable.map(unavailable_name),
+    });
     Ok(Json(DocDetail {
         id: document.id.0.to_string(),
         name: document.name,
         editor: document.editor,
         access,
-        revision: document.revision,
+        revision,
         scan,
         threat,
+        external,
     }))
 }
 

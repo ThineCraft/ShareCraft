@@ -935,9 +935,10 @@ impl Db {
         let query = format!(
             "with recursive {ANYONE_LINK}, held(node_id) as (select $3::uuid), {DEAD}, \
              {ANYONE_REACH} \
-             select {NODE_COLUMNS}, d.editor, d.revised_at, \
+             select {NODE_COLUMNS}, d.editor, coalesce(d.revised_at, si.modified_at) as revised_at, \
                     (case when n.kind = 'document' then 1 else 0 end)::int2 as kind_rank \
              from nodes n left join documents d on d.id = n.id and n.kind = 'document' \
+             left join source_items si on si.node_id = n.id \
              where n.parent_id = $3 and n.deleted_at is null {from_cursor} \
                and not {} \
                and exists (select 1 from reachable where id = $3) \

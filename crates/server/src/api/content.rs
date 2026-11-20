@@ -44,6 +44,7 @@ use super::uploads::{
 use super::{ApiError, JsonBody, parse_id, to_completion};
 use crate::blobs::{BodyError, Held, release, write_claimed};
 use crate::checkpoint::Checkpointer;
+use crate::external::{ExternalError, Ready};
 use crate::file_room::SaveReply;
 use crate::live_room::{LiveCheckpointReply, LiveCommand, MAX_SESSION_DATA_BYTES};
 use crate::previews::{self, PreviewKind, PreviewType, ThumbError};
@@ -123,6 +124,65 @@ pub(crate) async fn blocking<T: Send + 'static>(
     match tokio::task::spawn_blocking(move || read(&*store)).await {
         Ok(result) => result.map_err(|e| ApiError::unavailable(&e)),
         Err(e) => Err(ApiError::unavailable(&e)),
+    }
+}
+
+/// A document's current bytes, wherever they are kept. An external answer owns its cache hold
+/// until this value, or the response stream made from it, is dropped.
+pub(crate) enum Current {
+    Stored(Stored),
+    External(Ready),
+    None,
+}
+
+/// The current stored revision, or a share-backed document materialised on first use.
+pub(crate) async fn current_content(state: &AppState, doc: DocId) -> Result<Current, ApiError> {
+    if let Some(stored) = blocking(state, move |store| store.load(doc)).await? {
+        return Ok(Current::Stored(stored));
+    }
+    match crate::external::materialise(state, NodeId(doc.0)).await {
+        Ok(Some(ready)) => Ok(Current::External(ready)),
+        Ok(None) => Ok(Current::None),
+        Err(error) => Err(external_error(error)),
+    }
+}
+
+fn external_error(error: ExternalError) -> ApiError {
+    match error {
+        ExternalError::Gone => ApiError::SourceUnavailable("gone"),
+        ExternalError::Denied => ApiError::SourceUnavailable("denied"),
+        ExternalError::Offline => ApiError::SourceUnavailable("offline"),
+        ExternalError::Changing => ApiError::SourceUnavailable("changing"),
+        ExternalError::TooLarge => ApiError::SourceUnavailable("too_large"),
+        ExternalError::NotApproved => ApiError::SourceUnavailable("not_approved"),
+        ExternalError::Busy => ApiError::Busy,
+        ExternalError::Held(scan) => ApiError::Held(scan),
+        ExternalError::Failed => ApiError::Unavailable,
+    }
+}
+
+struct CurrentParts {
+    revision: RevisionId,
+    content: Content,
+    held: Option<Held>,
+}
+
+impl Current {
+    fn into_parts(self) -> Result<Option<CurrentParts>, ApiError> {
+        match self {
+            Current::Stored(stored) => Ok(Some(CurrentParts {
+                revision: stored.revision,
+                content: stored.content,
+                held: None,
+            })),
+            Current::External(ready) => Ok(Some(CurrentParts {
+                revision: RevisionId::from_str(&ready.revision)
+                    .map_err(|_| ApiError::Unavailable)?,
+                content: Content::Blob(ready.blob),
+                held: Some(ready.held),
+            })),
+            Current::None => Ok(None),
+        }
     }
 }
 
@@ -295,21 +355,22 @@ pub(crate) async fn download(
         .ok_or(ApiError::NotFound)?;
     let query = query_of(query)?;
 
-    let stored = match query.revision {
+    let current = match query.revision {
         Some(text) => {
             // Text that is not a revision id names nothing.
             let revision = RevisionId::from_str(&text).map_err(|_| ApiError::NotFound)?;
-            blocking(&state, move |store| store.load_at(doc, &revision))
-                .await?
-                .ok_or(ApiError::NotFound)?
+            match blocking(&state, move |store| store.load_at(doc, &revision)).await? {
+                Some(stored) => Current::Stored(stored),
+                None => match current_content(&state, doc).await? {
+                    Current::External(ready) if ready.revision == text => Current::External(ready),
+                    _ => return Err(ApiError::NotFound),
+                },
+            }
         }
-        None => match blocking(&state, move |store| store.load(doc)).await? {
-            Some(stored) => stored,
-            None => return Ok(StatusCode::NO_CONTENT.into_response()),
-        },
+        None => current_content(&state, doc).await?,
     };
 
-    file_answer(&state, &document.name, stored, headers.get(RANGE)).await
+    file_answer(&state, &document.name, current, headers.get(RANGE)).await
 }
 
 /// Which bytes of a file a download sends.
@@ -420,10 +481,10 @@ impl Delivery {
 pub(crate) async fn file_answer(
     state: &AppState,
     name: &str,
-    stored: Stored,
+    current: Current,
     range: Option<&HeaderValue>,
 ) -> Result<Response, ApiError> {
-    stored_answer(state, name, stored, range, DOWNLOAD).await
+    current_answer(state, name, current, range, DOWNLOAD).await
 }
 
 /// The headers every answer handing out a file's bytes carries: its type and disposition
@@ -455,24 +516,27 @@ fn byte_headers(
 /// A file's bytes as `delivery` hands them out, with the headers of [`file_answer`]; a range is
 /// served only when `delivery` allows ranges (the whole file otherwise, without
 /// `Accept-Ranges`).
-async fn stored_answer(
+async fn current_answer(
     state: &AppState,
     name: &str,
-    stored: Stored,
+    current: Current,
     range: Option<&HeaderValue>,
     delivery: Delivery,
 ) -> Result<Response, ApiError> {
-    require_available(state, &stored.content).await?;
-    let mut headers = byte_headers(name, &stored.revision, delivery)?;
+    let Some(parts) = current.into_parts()? else {
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    };
+    require_available(state, &parts.content).await?;
+    let mut headers = byte_headers(name, &parts.revision, delivery)?;
     let range = if delivery.ranges {
         headers.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
         range
     } else {
         None
     };
-    let size = stored.content.size();
-    let file = match &stored.content {
-        Content::Blob(blob) => Some(open_content(state, &stored.revision, *blob).await?),
+    let size = parts.content.size();
+    let file = match &parts.content {
+        Content::Blob(blob) => Some(open_content(state, &parts.revision, *blob).await?),
         Content::Inline(_) => None,
     };
     let (status, start, length) = match span_of(range, size) {
@@ -490,8 +554,8 @@ async fn stored_answer(
         }
     };
     headers.insert(CONTENT_LENGTH, header_value(&length.to_string())?);
-    let body = match (stored.content, file) {
-        (_, Some(file)) => Body::from_stream(file_stream(file, start, length)?),
+    let body = match (parts.content, file) {
+        (_, Some(file)) => Body::from_stream(file_stream(file, start, length, parts.held)?),
         (Content::Inline(bytes), None) => {
             let from = usize::try_from(start).map_err(|e| ApiError::unavailable(&e))?;
             let to = usize::try_from(start + length).map_err(|e| ApiError::unavailable(&e))?;
@@ -546,38 +610,51 @@ pub(crate) async fn preview_answer(
 ) -> Result<Response, ApiError> {
     let kind = previews::preview_type(&document.name).ok_or(ApiError::NoPreview)?;
     let doc = document.id;
-    let Some(stored) = blocking(state, move |store| store.load(doc)).await? else {
+    let current = current_content(state, doc).await?;
+    if matches!(current, Current::None) {
         return Ok(StatusCode::NO_CONTENT.into_response());
-    };
+    }
     if kind.kind != PreviewKind::Text {
-        return stored_answer(
+        return current_answer(
             state,
             &document.name,
-            stored,
+            current,
             range,
             Delivery::preview(kind),
         )
         .await;
     }
-    require_available(state, &stored.content).await?;
-    let cut = stored.content.size() > previews::TEXT_PREVIEW_BYTES;
-    let start = read_start(state, &stored, previews::TEXT_PREVIEW_BYTES).await?;
+    let parts = current.into_parts()?.ok_or(ApiError::NoPreview)?;
+    require_available(state, &parts.content).await?;
+    let cut = parts.content.size() > previews::TEXT_PREVIEW_BYTES;
+    let start = read_start(
+        state,
+        &parts.revision,
+        &parts.content,
+        previews::TEXT_PREVIEW_BYTES,
+    )
+    .await?;
     let text = previews::text_preview(start, cut).ok_or(ApiError::NoPreview)?;
-    let mut headers = byte_headers(&document.name, &stored.revision, Delivery::preview(kind))?;
+    let mut headers = byte_headers(&document.name, &parts.revision, Delivery::preview(kind))?;
     headers.insert(CONTENT_LENGTH, header_value(&text.len().to_string())?);
     Ok((StatusCode::OK, headers, text).into_response())
 }
 
 /// At most the first `limit` bytes of `stored`'s content.
-async fn read_start(state: &AppState, stored: &Stored, limit: u64) -> Result<Vec<u8>, ApiError> {
-    let blob = match &stored.content {
+async fn read_start(
+    state: &AppState,
+    revision: &RevisionId,
+    content: &Content,
+    limit: u64,
+) -> Result<Vec<u8>, ApiError> {
+    let blob = match content {
         Content::Inline(bytes) => {
             let end = usize::try_from(limit).map_or(bytes.len(), |limit| limit.min(bytes.len()));
             return Ok(bytes.get(..end).unwrap_or_default().to_vec());
         }
         Content::Blob(blob) => *blob,
     };
-    let file = open_content(state, &stored.revision, blob).await?;
+    let file = open_content(state, revision, blob).await?;
     tokio::task::spawn_blocking(move || {
         let mut start = Vec::new();
         std::io::Read::read_to_end(&mut std::io::Read::take(file, limit), &mut start)?;
@@ -606,12 +683,13 @@ pub(crate) async fn thumbnail(
     if !previews::has_thumbnail(&document.name) {
         return Err(ApiError::NoThumbnail);
     }
-    let stored = blocking(&state, move |store| store.load(doc))
+    let parts = current_content(&state, doc)
         .await?
+        .into_parts()?
         .ok_or(ApiError::NoThumbnail)?;
-    require_available(&state, &stored.content).await?;
+    require_available(&state, &parts.content).await?;
     // Content kept inline in Git predates the content store and is never an image.
-    let Content::Blob(blob) = stored.content else {
+    let Content::Blob(blob) = parts.content else {
         return Err(ApiError::NoThumbnail);
     };
     let made = state
@@ -692,23 +770,24 @@ fn file_stream(
     mut file: std::fs::File,
     start: u64,
     length: u64,
+    held: Option<Held>,
 ) -> Result<impl Stream<Item = std::io::Result<Bytes>>, ApiError> {
     file.seek(SeekFrom::Start(start))
         .map_err(|e| ApiError::unavailable(&e))?;
     let reader = tokio::fs::File::from_std(file).take(length);
     Ok(futures_util::stream::unfold(
-        Some(reader),
-        |reader| async move {
+        (Some(reader), held),
+        |(reader, held)| async move {
             let mut reader = reader?;
             let mut buf = vec![0u8; DOWNLOAD_CHUNK];
             match reader.read(&mut buf).await {
                 Ok(0) => None,
                 Ok(n) => {
                     buf.truncate(n);
-                    Some((Ok(Bytes::from(buf)), Some(reader)))
+                    Some((Ok(Bytes::from(buf)), (Some(reader), held)))
                 }
                 // The response ends after the error.
-                Err(e) => Some((Err(e), None)),
+                Err(e) => Some((Err(e), (None, held))),
             }
         },
     ))

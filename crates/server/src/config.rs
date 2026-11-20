@@ -22,6 +22,23 @@ pub const DEFAULT_EDITORS: &str = "./editors";
 pub const DEFAULT_MAX_FILE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 /// GitHub's API address, used when `SHARECRAFT_GITHUB_API` is not set.
 pub const DEFAULT_GITHUB_API: &str = "https://api.github.com";
+/// Tree nodes a file-share sync creates in one Git commit and PostgreSQL transaction.
+pub const DEFAULT_SOURCE_CREATE_BATCH_SIZE: usize = 200;
+/// Largest safe file-share creation batch. This keeps allocations bounded and leaves the
+/// records layer comfortably below PostgreSQL's 65,535 bind-parameter limit.
+pub const MAX_SOURCE_CREATE_BATCH_SIZE: usize = 1_000;
+
+/// Coerces a configured file-share creation batch to the supported inclusive range 1..=1,000.
+#[must_use]
+pub const fn normalize_source_create_batch_size(value: usize) -> usize {
+    if value == 0 {
+        1
+    } else if value > MAX_SOURCE_CREATE_BATCH_SIZE {
+        MAX_SOURCE_CREATE_BATCH_SIZE
+    } else {
+        value
+    }
+}
 
 /// How the server runs.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -71,6 +88,9 @@ pub struct Config {
     /// unless `SHARECRAFT_GITHUB_API` names another (a plain `http://` address only then, for
     /// a test server). People using ShareCraft never choose it.
     pub github_api: String,
+    /// Maximum tree nodes a file-share sync creates in one batch. GitHub and HTTP tree writes
+    /// do not use this setting.
+    pub source_create_batch_size: usize,
 }
 
 /// A database URL. It usually holds a password, so `Debug` never shows it.
@@ -165,6 +185,12 @@ pub struct DeploymentValues<'a> {
 }
 
 impl Config {
+    /// The configured file-share creation batch, normalized to the documented safe range.
+    #[must_use]
+    pub(crate) const fn normalized_source_create_batch_size(&self) -> usize {
+        normalize_source_create_batch_size(self.source_create_batch_size)
+    }
+
     /// Reads `SHARECRAFT_ADDR`, `SHARECRAFT_DATA`, `SHARECRAFT_WEB`, `SHARECRAFT_EDITORS_DIR` and
     /// `SHARECRAFT_MAX_FILE_BYTES` and `SHARECRAFT_GITHUB_API`, using the defaults for any that
     /// are unset, and `DATABASE_URL`, which is required.
@@ -280,6 +306,7 @@ impl Config {
             max_file_bytes,
             upload_idle: Duration::from_secs(60),
             github_api: DEFAULT_GITHUB_API.to_owned(),
+            source_create_batch_size: DEFAULT_SOURCE_CREATE_BATCH_SIZE,
         })
     }
 }
@@ -415,6 +442,15 @@ mod tests {
         assert_eq!(c.editors_dir, PathBuf::from("./editors"));
         assert_eq!(c.max_file_bytes, 10 * 1024 * 1024 * 1024);
         assert_eq!(c.github_api, "https://api.github.com");
+        assert_eq!(c.source_create_batch_size, DEFAULT_SOURCE_CREATE_BATCH_SIZE);
+    }
+
+    #[test]
+    fn source_create_batch_size_is_normalized_to_the_safe_range() {
+        assert_eq!(normalize_source_create_batch_size(0), 1);
+        assert_eq!(normalize_source_create_batch_size(1), 1);
+        assert_eq!(normalize_source_create_batch_size(1_000_000), 1_000);
+        assert_eq!(normalize_source_create_batch_size(usize::MAX), 1_000);
     }
 
     #[test]
