@@ -128,7 +128,8 @@ impl Sim {
 
     /// The next frame waiting for `conn`, if any.
     pub fn next_out(&mut self, conn: ConnId) -> Option<String> {
-        self.conns.get_mut(&conn)?.outbox.pop_front()
+        let state = self.conns.get_mut(&conn)?;
+        state.outbox.pop_front()
     }
 
     /// How many frames wait for `conn`.
@@ -188,7 +189,19 @@ impl Sim {
                 format,
                 resume,
                 seen,
-            } => self.join(conn, client, protocol, &format, resume, seen),
+                can_checkpoint,
+                returning_through,
+                ..
+            } => self.join(
+                conn,
+                client,
+                protocol,
+                &format,
+                resume,
+                seen,
+                can_checkpoint,
+                returning_through,
+            ),
             LiveClientMsg::Entry {
                 local,
                 seen,
@@ -201,6 +214,11 @@ impl Sim {
                 }
             }
             LiveClientMsg::Report { seq } => self.report(conn, seq),
+            LiveClientMsg::Fingerprint { .. }
+            | LiveClientMsg::CheckpointReady { .. }
+            | LiveClientMsg::CheckpointFailed { .. } => {
+                panic!("checkpoint controls are not implemented by the G2 simulator")
+            }
             LiveClientMsg::Resync => {
                 if self.place_of(conn).is_some() {
                     self.resyncs += 1;
@@ -243,6 +261,7 @@ impl Sim {
         ParticipantNo(self.places.len() as u32)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn join(
         &mut self,
         conn: ConnId,
@@ -251,6 +270,8 @@ impl Sim {
         format: &str,
         resume: Option<protocol::live::LiveResume>,
         seen: Option<Seq>,
+        _can_checkpoint: bool,
+        returning_through: Option<LocalNo>,
     ) {
         assert_eq!(protocol, LIVE_PROTOCOL);
         assert_eq!(format, self.format);
@@ -291,6 +312,18 @@ impl Sim {
             _ => Seq(0),
         };
         self.send_catchup(conn, from);
+        // The room's rule: every join that names a batch is told it may send it, once the
+        // version before it is stored (here at once, for there are no versions). A returning
+        // join opens the barrier; a later join of the same client, kept or not, is told again,
+        // since the first `return_ready` may have been lost with the connection. A client
+        // holding no such batch ignores it.
+        if let Some(through) = returning_through
+            && let Some(state) = self.conns.get_mut(&conn)
+        {
+            state
+                .outbox
+                .push_back(frame(&LiveServerMsg::ReturnReady { through }));
+        }
     }
 
     /// Sends `catchup` and every entry after `from`, cancelled changes emptied.

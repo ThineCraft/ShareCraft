@@ -207,7 +207,7 @@ pub(crate) async fn record_first(
 
 /// Appends `revision` after `parent`; if the recorded head is not `parent`, replaces the
 /// document's list from Git instead.
-async fn record(
+pub(crate) async fn record(
     store: &Arc<dyn Checkpointer>,
     db: &Db,
     doc: DocId,
@@ -229,7 +229,13 @@ async fn record(
     if let Some(blob) = blob {
         record_ref(db, doc, blob, revision).await;
     }
-    if !appended {
+    // A live checkpoint records its own row; the list needs no rebuild for it.
+    let recorded = !appended
+        && db
+            .is_recorded_head(doc, &revision.to_string(), parent.as_deref())
+            .await
+            .map_err(|e| e.to_string())?;
+    if !appended && !recorded {
         replace_from_git(store, db, doc).await?;
     }
     Ok(())
@@ -299,7 +305,7 @@ async fn blocking<T: Send + 'static>(
 }
 
 /// The database's form of a revision Git describes.
-fn to_record(info: RevisionInfo) -> Result<RevisionRecord, String> {
+pub(crate) fn to_record(info: RevisionInfo) -> Result<RevisionRecord, String> {
     let committed_at = OffsetDateTime::from_unix_timestamp(info.committed_at)
         .map_err(|e| format!("revision {} has an impossible time: {e}", info.revision))?;
     Ok(RevisionRecord {

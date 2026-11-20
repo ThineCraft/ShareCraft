@@ -371,11 +371,19 @@ impl AppState {
     fn open_live_room(&self, doc: DocId) -> LiveLink {
         self.shared.rooms.open_live(
             doc,
-            self.shared.db.clone(),
+            live_store::LiveDb {
+                db: self.shared.db.clone(),
+                store: Arc::clone(&self.shared.checkpointer),
+                blobs: Arc::clone(&self.shared.blobs),
+            },
             self.shared.events.clone(),
             LiveTiming {
                 heartbeat: self.shared.config.live_heartbeat,
                 misses: protocol::live::EXPIRY_MISSES,
+                checkpoint_quiet: self.shared.config.live_checkpoint_quiet,
+                checkpoint_wait: self.shared.config.live_checkpoint_wait,
+                ticket_lifetime: self.shared.config.live_ticket_lifetime,
+                limits: self.shared.config.live_limits,
             },
         )
     }

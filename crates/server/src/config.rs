@@ -50,6 +50,14 @@ pub struct Config {
     pub live_editors: Vec<Editor>,
     /// How often a live client sends a heartbeat. Its place expires after three periods.
     pub live_heartbeat: Duration,
+    /// A live checkpoint is asked for once the log has been quiet this long after a change.
+    pub live_checkpoint_quiet: Duration,
+    /// ... or once the first unsaved live change is this old, whichever comes first.
+    pub live_checkpoint_wait: Duration,
+    /// How long a live checkpoint ticket can be used.
+    pub live_ticket_lifetime: Duration,
+    /// How much unsaved live work a document may hold before it warns and pauses.
+    pub live_limits: LiveLimits,
     /// The PostgreSQL database holding accounts, sessions and access grants.
     pub database_url: DatabaseUrl,
     /// Where the built editors are installed, one folder per editor, served at `/editors`.
@@ -263,6 +271,10 @@ impl Config {
             write_timeout: Duration::from_secs(10),
             live_editors: Vec::new(),
             live_heartbeat: Duration::from_secs(60),
+            live_checkpoint_quiet: crate::live_room::CHECKPOINT_QUIET,
+            live_checkpoint_wait: crate::live_room::CHECKPOINT_WAIT,
+            live_ticket_lifetime: crate::live_room::TICKET_LIFETIME,
+            live_limits: LiveLimits::default(),
             database_url,
             editors_dir: PathBuf::from(editors_dir.unwrap_or(DEFAULT_EDITORS)),
             max_file_bytes,
@@ -349,6 +361,31 @@ fn read_var(name: &'static str) -> Result<Option<String>, ConfigError> {
     }
 }
 
+/// How much unsaved work a live log may hold since its verified base, counted in entries
+/// (cancel records included) and payload bytes. At a warning threshold the room asks for a
+/// checkpoint at once; at a hard limit it pauses new changes until a checkpoint is verified.
+/// The same limits bound the catch-up a joining client is sent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LiveLimits {
+    pub warn_entries: u64,
+    pub warn_bytes: u64,
+    pub hard_entries: u64,
+    pub hard_bytes: u64,
+}
+
+impl Default for LiveLimits {
+    /// The adopted values (plan G4, proposal 2): warn at 4,000 entries or 48 MiB, pause at
+    /// 5,000 entries or 64 MiB.
+    fn default() -> Self {
+        Self {
+            warn_entries: 4_000,
+            warn_bytes: 48 * 1024 * 1024,
+            hard_entries: 5_000,
+            hard_bytes: 64 * 1024 * 1024,
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -372,6 +409,9 @@ mod tests {
         assert_eq!(c.write_timeout, Duration::from_secs(10));
         assert!(c.live_editors.is_empty());
         assert_eq!(c.live_heartbeat, Duration::from_secs(60));
+        assert_eq!(c.live_checkpoint_quiet, Duration::from_secs(15));
+        assert_eq!(c.live_checkpoint_wait, Duration::from_secs(120));
+        assert_eq!(c.live_ticket_lifetime, Duration::from_secs(120));
         assert_eq!(c.editors_dir, PathBuf::from("./editors"));
         assert_eq!(c.max_file_bytes, 10 * 1024 * 1024 * 1024);
         assert_eq!(c.github_api, "https://api.github.com");

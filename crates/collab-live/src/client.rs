@@ -15,10 +15,12 @@ use std::collections::{BTreeSet, VecDeque};
 use collab_core::ids::{ClientId, Seq};
 use protocol::RemovedReason;
 use protocol::live::{
-    EntryBody, HEARTBEAT_MS, LIVE_PROTOCOL, LiveClientMsg, LiveEntry, LivePerson, LiveResume,
-    LiveServerMsg, LiveSessionId, LocalNo, MAX_PAYLOAD_BYTES, ParticipantNo, Place, RefusedReason,
+    EntryBody, HEARTBEAT_MS, LIVE_PROTOCOL, LiveBuild, LiveClientMsg, LiveEntry, LivePerson,
+    LiveResume, LiveServerMsg, LiveSessionId, LocalNo, MAX_PAYLOAD_BYTES, MajorReason,
+    ParticipantNo, Place, RefusedReason, TicketPurpose, UnavailableReason,
 };
 use thiserror::Error;
+use uuid::Uuid;
 
 use crate::ids::{IdError, IdMaker, LiveId};
 
@@ -91,10 +93,6 @@ pub enum Effect {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Crash;
 
-/// How many confirmed own changes the client keeps on top of its agreed copy before it goes
-/// back and takes a new copy.
-pub const MAX_FOLDED: usize = 64;
-
 /// The most entry frames the client sends in any [`PACE_WINDOW_MS`]. The server allows more
 /// (30 a second, bursts up to 120), so a paced client is never refused for its rate.
 pub const MAX_ENTRIES_PER_WINDOW: usize = 20;
@@ -131,6 +129,14 @@ pub struct LiveConfig {
     /// client loads the base, applies the entries before it, and stalls at it without applying
     /// it, reporting it on every join until the server's verdict.
     pub crashed_at: Option<Seq>,
+}
+
+/// A borrowed view of the exact agreed state at a requested log position.
+pub enum AgreedSnapshot<'a, E: LiveEditor> {
+    /// The shown editor is exactly the agreed state.
+    Editor(&'a E),
+    /// Waiting or folded work is shown, so use the saved agreed state.
+    Saved(&'a E::Snapshot),
 }
 
 /// What a call produced: the frames to send, in order, and what happened.
@@ -171,8 +177,33 @@ pub enum Event {
     People(Vec<LivePerson>),
     /// The person's right to edit changed.
     AccessChanged { can_edit: bool },
+    /// Write a checkpoint from the exact agreed state at `at`.
+    CheckpointRequested {
+        ticket: Uuid,
+        at: Seq,
+        base: Option<String>,
+        major: Option<MajorReason>,
+    },
+    /// Independently write and hash the exact agreed state at `at`.
+    VerifyRequested {
+        ticket: Uuid,
+        at: Seq,
+        base: Option<String>,
+    },
+    /// New changes wait (the unsaved log reached a hard limit, or a major version is being
+    /// stored at the head): waiting changes stay shown and are held until `ChangesResumed`.
+    ChangesPaused { entries: u64, bytes: u64 },
+    /// New changes may be sent again; held changes go now.
+    ChangesResumed,
+    /// The durable pre-return checkpoint exists and the saved batch may be sent.
+    ReturnReady { through: LocalNo },
+    /// Archive the old shown copy before the current base is loaded.
+    ArchiveReturn { current: Option<String> },
     /// The place ended after missed heartbeats; the client can join again.
     Expired,
+    /// The server cannot take the join for now; the client keeps its work and can join again
+    /// later.
+    Unavailable { reason: UnavailableReason },
     /// The client's protocol or format does not match the session's.
     Incompatible { protocol: u32, format: String },
     /// The server ended the connection; do not reconnect.
@@ -215,6 +246,9 @@ pub enum ClientError {
     /// The server and the client disagree about this client's own changes.
     #[error("out of step with the server: {0}")]
     Desync(String),
+    /// The requested position is not the exact, available agreed state.
+    #[error("agreed state at {at:?} is unavailable (agreed {agreed:?}, phase {phase:?})")]
+    AgreedUnavailable { at: Seq, agreed: Seq, phase: Phase },
 }
 
 /// Why a local change was not taken. Nothing changed.
@@ -280,6 +314,10 @@ struct Pending {
 /// The library's side of one editor in a live session.
 pub struct LiveClient<E: LiveEditor> {
     config: LiveConfig,
+    /// Whether this editor can write and independently verify checkpoints.
+    can_checkpoint: bool,
+    /// The kind of editor build, used to prefer a different verifier.
+    build: LiveBuild,
     /// This client's identifier, made fresh by [`LiveClient::new`].
     client: ClientId,
     phase: Phase,
@@ -307,11 +345,25 @@ pub struct LiveClient<E: LiveEditor> {
     folded: Vec<Ordered>,
     /// Own changes not yet confirmed, in order.
     pending: VecDeque<Pending>,
+    /// The last local number advertised on this connection as pre-existing saved work.
+    returning_through: Option<LocalNo>,
+    /// Whether a returning place is waiting for the server's durable pre-return checkpoint.
+    hold_return: bool,
+    /// A change was held by the server: nothing is sent until changes resume, or until the
+    /// return barrier that held it opens.
+    changes_held: bool,
+    /// The server said changes wait (`changes_paused`): queued changes stay, shown, until
+    /// `changes_resumed`, so none is sent only to be refused.
+    changes_paused: bool,
+    /// A discarded return batch whose already-sent readiness may still arrive.
+    discarded_return_through: Option<LocalNo>,
     next_local: u64,
     /// Entries received while the client cannot apply them yet.
     held: Vec<LiveEntry>,
     /// The base position named by the catch-up while loading the base.
     base_at: Seq,
+    /// The stored revision the editor's state was loaded from.
+    base_revision: Option<String>,
     /// The entry the editor stopped in, until a verdict on it arrives: the stall survives
     /// reconnects, and a client started with a crash note begins with it.
     stalled_at: Option<Seq>,
@@ -327,6 +379,8 @@ impl<E: LiveEditor> LiveClient<E> {
         let stalled_at = config.crashed_at;
         LiveClient {
             config,
+            can_checkpoint: false,
+            build: LiveBuild::Browser,
             client: ClientId(uuid::Uuid::new_v4()),
             phase: Phase::Offline,
             session: None,
@@ -343,12 +397,26 @@ impl<E: LiveEditor> LiveClient<E> {
             head: Seq(0),
             folded: Vec::new(),
             pending: VecDeque::new(),
+            returning_through: None,
+            hold_return: false,
+            changes_held: false,
+            changes_paused: false,
+            discarded_return_through: None,
             next_local: 1,
             held: Vec::new(),
             base_at: Seq(0),
+            base_revision: None,
             stalled_at,
             skipped: BTreeSet::new(),
         }
+    }
+
+    /// Advertises checkpoint capability and the editor's build kind on every join.
+    #[must_use]
+    pub fn with_live_capabilities(mut self, can_checkpoint: bool, build: LiveBuild) -> Self {
+        self.can_checkpoint = can_checkpoint;
+        self.build = build;
+        self
     }
 
     /// The connection is open: returns the `live_join` frame.
@@ -364,12 +432,18 @@ impl<E: LiveEditor> LiveClient<E> {
         for pending in &mut self.pending {
             pending.sent = false;
         }
+        if !self.hold_return {
+            self.returning_through = self.pending.back().map(|pending| pending.local);
+        }
         let join = LiveClientMsg::LiveJoin {
             client: self.client,
             protocol: LIVE_PROTOCOL,
             format: self.config.format.clone(),
             resume: self.resume(),
             seen: self.has_state.then_some(self.agreed_seq),
+            can_checkpoint: self.can_checkpoint,
+            build: self.build,
+            returning_through: self.returning_through,
         };
         vec![frame(&join)]
     }
@@ -435,12 +509,16 @@ impl<E: LiveEditor> LiveClient<E> {
                     ));
                 }
                 self.head = head;
-                if self.has_state && from == self.agreed_seq {
+                // Another revision named at exactly the client's position replaced the file
+                // from outside (S4): what the client holds is no longer the agreed state.
+                let replaced = from == base && revision != self.base_revision;
+                if self.has_state && from == self.agreed_seq && !replaced {
                     self.phase = Phase::CatchingUp;
                 } else {
                     self.phase = Phase::LoadingBase;
                     self.held.clear();
                     self.base_at = base;
+                    self.base_revision.clone_from(&revision);
                     step.events.push(Event::LoadBase { revision, at: base });
                 }
                 self.check_live(now_ms, &mut step);
@@ -471,6 +549,21 @@ impl<E: LiveEditor> LiveClient<E> {
                     )));
                 }
             },
+            LiveServerMsg::Refused {
+                local,
+                reason: RefusedReason::Held,
+            } => {
+                // Not refused for good: this change and every later one wait, still shown, and
+                // go again once changes resume, never before.
+                self.changes_held = true;
+                for pending in self
+                    .pending
+                    .iter_mut()
+                    .filter(|pending| pending.local >= local)
+                {
+                    pending.sent = false;
+                }
+            }
             LiveServerMsg::Refused { local, reason } => {
                 let first = self.pending.front().map(|pending| pending.local);
                 // A refusal of a change the client already took off its queue (for example one
@@ -509,9 +602,80 @@ impl<E: LiveEditor> LiveClient<E> {
                 }
                 step.events.push(Event::AccessChanged { can_edit });
             }
+            LiveServerMsg::CheckpointTicket {
+                ticket,
+                purpose,
+                at,
+                base,
+                major,
+            } => match purpose {
+                TicketPurpose::Write => step.events.push(Event::CheckpointRequested {
+                    ticket,
+                    at,
+                    base,
+                    major,
+                }),
+                TicketPurpose::Verify => {
+                    step.events
+                        .push(Event::VerifyRequested { ticket, at, base })
+                }
+            },
+            LiveServerMsg::ChangesPaused { entries, bytes } => {
+                // Queued changes wait instead of going out to be refused.
+                self.changes_paused = true;
+                step.events.push(Event::ChangesPaused { entries, bytes });
+            }
+            LiveServerMsg::ChangesResumed => {
+                step.events.push(Event::ChangesResumed);
+                self.changes_held = false;
+                self.changes_paused = false;
+                self.send_unsent(now_ms, &mut step.send);
+            }
+            LiveServerMsg::ReturnReady { through } => {
+                if self.discarded_return_through == Some(through) {
+                    // The batch was dropped with the edit right; a change held behind its
+                    // barrier meanwhile is released now, or nothing ever would release it.
+                    self.discarded_return_through = None;
+                    if self.changes_held {
+                        self.changes_held = false;
+                        self.send_unsent(now_ms, &mut step.send);
+                    }
+                } else if self.hold_return && self.returning_through == Some(through) {
+                    self.hold_return = false;
+                    self.returning_through = None;
+                    if self
+                        .pending
+                        .iter()
+                        .any(|pending| pending.shown && pending.shown_as != self.own_participant())
+                    {
+                        self.go_back(editor, None);
+                    }
+                    step.events.push(Event::ReturnReady { through });
+                    self.send_unsent(now_ms, &mut step.send);
+                }
+                // Otherwise a repeat: the server sends it again on every join that names a
+                // batch, and this client holds none any more.
+            }
+            LiveServerMsg::ArchiveReturn { current } => {
+                if self.phase != Phase::Joining || !self.joined || !self.hold_return {
+                    return Err(ClientError::Desync(
+                        "archive return outside a held return batch".to_owned(),
+                    ));
+                }
+                step.events.push(Event::ArchiveReturn { current });
+                self.pending.clear();
+                self.returning_through = None;
+                self.hold_return = false;
+                self.discarded_return_through = None;
+                self.has_state = false;
+            }
             LiveServerMsg::Incompatible { protocol, format } => {
                 self.phase = Phase::Closed;
                 step.events.push(Event::Incompatible { protocol, format });
+            }
+            LiveServerMsg::Unavailable { reason } => {
+                self.disconnected(now_ms);
+                step.events.push(Event::Unavailable { reason });
             }
             LiveServerMsg::Expired => {
                 self.disconnected(now_ms);
@@ -676,6 +840,43 @@ impl<E: LiveEditor> LiveClient<E> {
         self.agreed_seq
     }
 
+    /// Borrows the exact agreed state at `at`, without including shown waiting work.
+    pub fn agreed_snapshot<'a>(
+        &'a self,
+        editor: &'a E,
+        at: Seq,
+    ) -> Result<AgreedSnapshot<'a, E>, ClientError> {
+        self.require_agreed(at)?;
+        Ok(match &self.agreed {
+            Some(snapshot) => AgreedSnapshot::Saved(snapshot),
+            None => AgreedSnapshot::Editor(editor),
+        })
+    }
+
+    /// Makes the checkpoint-ready frame for a ticket at the exact agreed position. The server
+    /// ignores this frame (it acts on the upload itself); it only checks the client can write
+    /// the checkpoint at `at`.
+    pub fn checkpoint_ready(&self, ticket: Uuid, at: Seq) -> Result<String, ClientError> {
+        if !self.can_checkpoint {
+            return Err(ClientError::AgreedUnavailable {
+                at,
+                agreed: self.agreed_seq,
+                phase: self.phase,
+            });
+        }
+        self.require_agreed(at)?;
+        Ok(frame(&LiveClientMsg::CheckpointReady { ticket, at }))
+    }
+
+    /// Makes an entered-content fingerprint frame for the exact agreed position.
+    pub fn fingerprint(&self, at: Seq, entered: [u8; 32]) -> Result<String, ClientError> {
+        self.require_agreed(at)?;
+        Ok(frame(&LiveClientMsg::Fingerprint {
+            at,
+            entered: hex(&entered),
+        }))
+    }
+
     /// How many own changes wait for the server.
     pub fn pending(&self) -> usize {
         self.pending.len()
@@ -716,10 +917,27 @@ impl<E: LiveEditor> LiveClient<E> {
         self.participant.unwrap_or(ParticipantNo(0))
     }
 
+    fn require_agreed(&self, at: Seq) -> Result<(), ClientError> {
+        if self.phase == Phase::Live && self.has_state && at == self.agreed_seq {
+            Ok(())
+        } else {
+            Err(ClientError::AgreedUnavailable {
+                at,
+                agreed: self.agreed_seq,
+                phase: self.phase,
+            })
+        }
+    }
+
     /// Sends the waiting changes not yet sent on this connection, in order, as far as the pace
     /// allows. What is sent is always a prefix of the queue.
     fn send_unsent(&mut self, now_ms: u64, send: &mut Vec<String>) {
-        if self.phase != Phase::Live || !self.can_edit {
+        if self.phase != Phase::Live
+            || !self.can_edit
+            || self.hold_return
+            || self.changes_held
+            || self.changes_paused
+        {
             return;
         }
         self.clock_check(now_ms);
@@ -804,16 +1022,25 @@ impl<E: LiveEditor> LiveClient<E> {
         // A server's interval outside 1 s to 60 s would flood it or let the place expire.
         self.heartbeat_ms = heartbeat_ms.clamp(MIN_HEARTBEAT_MS, HEARTBEAT_MS);
         self.joined = true;
+        // A new join starts over: a hold of the connection before applies no longer.
+        self.changes_held = false;
+        self.changes_paused = false;
         if let Place::Returning { previous } = place {
+            self.hold_return = self.returning_through.is_some();
             step.events.push(Event::Returned {
                 previous,
                 now: participant,
             });
+        } else if place == Place::New {
+            self.hold_return = false;
         }
         if !can_edit {
             // The person lost the right to edit while away (S5).
             self.drop_pending(editor, step);
-        } else if renumbered && self.pending.iter().any(|pending| pending.shown) {
+        } else if renumbered
+            && !self.hold_return
+            && self.pending.iter().any(|pending| pending.shown)
+        {
             // Waiting changes are shown again as coming from the new number. They keep their
             // local numbers and `seen`, and go to the server as normal entries.
             self.go_back(editor, None);
@@ -825,6 +1052,10 @@ impl<E: LiveEditor> LiveClient<E> {
     fn drop_pending(&mut self, editor: &mut E, step: &mut Step) {
         let count = self.pending.len();
         let any_shown = self.pending.iter().any(|pending| pending.shown);
+        if self.hold_return {
+            self.discarded_return_through = self.returning_through.take();
+            self.hold_return = false;
+        }
         self.pending.clear();
         if any_shown {
             self.go_back(editor, None);
@@ -950,12 +1181,14 @@ impl<E: LiveEditor> LiveClient<E> {
         };
         if confirms && let Some(confirmed) = self.pending.pop_front() {
             if confirmed.shown && !confirmed.read_stamp && confirmed.shown_as == participant {
-                // Already shown as the server ordered it: keep it on top of the copy.
+                // Already shown as the server ordered it. Keep the fast path when it was the
+                // last waiting change; otherwise materialise the new exact agreed snapshot
+                // before re-running the remaining waiting work.
                 self.folded.push(ordered);
                 self.agreed_seq = seq;
                 if self.pending.is_empty() {
                     self.settle();
-                } else if self.folded.len() >= MAX_FOLDED {
+                } else {
                     self.go_back(editor, None);
                 }
                 step.events.push(Event::Applied {
@@ -1161,7 +1394,7 @@ impl<E: LiveEditor> LiveClient<E> {
     /// A waiting change whose re-run stops the editor is left out of what is shown until it
     /// is confirmed: the editor goes back to `copy` and re-runs the ones before it.
     fn rerun_pending(&mut self, editor: &mut E, copy: &E::Snapshot) {
-        let participant = self.own_participant();
+        let current_participant = self.own_participant();
         for at in 0..self.pending.len() {
             let Some(pending) = self.pending.get(at) else {
                 break;
@@ -1169,6 +1402,11 @@ impl<E: LiveEditor> LiveClient<E> {
             if pending.mode != Mode::ShowAtOnce {
                 continue;
             }
+            let participant = if self.hold_return {
+                pending.shown_as
+            } else {
+                current_participant
+            };
             let view = EntryView {
                 seq: None,
                 participant,
@@ -1180,6 +1418,11 @@ impl<E: LiveEditor> LiveClient<E> {
             if result.is_err() {
                 editor.restore(copy);
                 for earlier in self.pending.iter().take(at).filter(|earlier| earlier.shown) {
+                    let participant = if self.hold_return {
+                        earlier.shown_as
+                    } else {
+                        current_participant
+                    };
                     let _ = editor.apply(&EntryView {
                         seq: None,
                         participant,
@@ -1207,6 +1450,15 @@ impl<E: LiveEditor> LiveClient<E> {
             }
         }
     }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
+    for &byte in bytes {
+        encoded.push(char::from_digit(u32::from(byte >> 4), 16).unwrap_or('0'));
+        encoded.push(char::from_digit(u32::from(byte & 0x0f), 16).unwrap_or('0'));
+    }
+    encoded
 }
 
 /// The text of a client frame. Serialising a client message cannot fail: every field is a

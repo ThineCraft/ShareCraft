@@ -753,7 +753,7 @@ impl Rooms {
     pub(crate) fn open_live(
         self: &Arc<Self>,
         doc: DocId,
-        db: Db,
+        db: crate::live_store::LiveDb,
         events: EventSink,
         timing: LiveTiming,
     ) -> LiveLink {
@@ -781,6 +781,14 @@ impl Rooms {
             },
         );
         link
+    }
+
+    /// The live room of `doc` if one is open; never opens one.
+    pub(crate) fn live_link(&self, doc: DocId) -> Option<LiveLink> {
+        match self.link(doc) {
+            Some(Link::Live(link)) if !link.commands.is_closed() => Some(link),
+            _ => None,
+        }
     }
 
     /// Sends the access change `change` to `doc`'s room. Nothing happens if the room is not
