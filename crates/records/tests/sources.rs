@@ -945,7 +945,8 @@ async fn populated_schema_migrates_from_live_log_to_github_sources() {
         Some(sealed(b"migration cipher"))
     );
 
-    test.db.migrate_to(20).await.unwrap();
+    // The file-share columns arrive in 0022 (after G4's 0020 and 0021).
+    test.db.migrate_to(22).await.unwrap();
 
     let migrated =
         sqlx::query("select location, mode, generation from library_sources where library_id = $1")
