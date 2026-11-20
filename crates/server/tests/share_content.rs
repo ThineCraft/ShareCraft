@@ -404,13 +404,15 @@ async fn hung_opens_time_out_mark_the_library_offline_and_keep_reads_bounded() {
         ("later.txt", b"later", 1),
     ])
     .await;
+    // Long enough that all four reads reach their open before the first one times out (each
+    // makes several database calls first), and still well short of the hung open.
     env.state
         .shares()
-        .set_operation_timeout(Duration::from_millis(150));
+        .set_operation_timeout(Duration::from_millis(1_000));
     let mut tasks = Vec::new();
     for n in 0..4 {
         let path = format!("hung-{n}.txt");
-        env.fake.slow_open(&path, Duration::from_millis(500));
+        env.fake.slow_open(&path, Duration::from_millis(3_000));
         let node = env.item(&path).await.node;
         let state = env.state.clone();
         tasks.push(tokio::spawn(async move { materialise(&state, node).await }));
@@ -421,7 +423,7 @@ async fn hung_opens_time_out_mark_the_library_offline_and_keep_reads_bounded() {
     for task in tasks {
         assert!(matches!(task.await.unwrap(), Err(ExternalError::Offline)));
     }
-    assert!(started.elapsed() < Duration::from_millis(300));
+    assert!(started.elapsed() < Duration::from_millis(2_000));
     let opens = env.fake.open_started();
     let later = env.item("later.txt").await.node;
     let second_started = Instant::now();
