@@ -902,12 +902,19 @@ async fn no_event_holds_a_full_path() {
         .await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{answer}");
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    let details: Vec<String> = sqlx::query_scalar("select detail::text from events")
-        .fetch_all(env.server.records_db().test_pool())
-        .await
-        .unwrap();
+    // The administrator's change of the approved roots records the roots it set; that event is
+    // the setting's own audit, not a library's, so it is left out here.
+    let details: Vec<String> = sqlx::query_scalar(
+        "select detail::text from events where coalesce(detail->>'key', '') <> 'share_roots'",
+    )
+    .fetch_all(env.server.records_db().test_pool())
+    .await
+    .unwrap();
+    // The path is looked for as JSON writes it, so a Windows path's backslashes match too.
+    let written = serde_json::to_string(ROOT).unwrap();
+    let written = written.trim_matches('"');
     assert!(
-        details.iter().all(|detail| !detail.contains(ROOT)),
+        details.iter().all(|detail| !detail.contains(written)),
         "{details:?}"
     );
 }
