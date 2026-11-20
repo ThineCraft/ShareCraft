@@ -241,7 +241,13 @@ pub struct Shares {
     operation_timeout: RwLock<Duration>,
     cache_max_bytes_for_tests: Mutex<Option<u64>>,
     listing_progress: Mutex<HashMap<NodeId, Arc<AtomicUsize>>>,
+    lookups: Arc<tokio::sync::Semaphore>,
 }
+
+/// How many canonical-path lookups a connect may have in flight across the whole server. A
+/// lookup holds its permit for its whole blocking call, also after its caller stopped waiting,
+/// so a hung share server can never tie up more than this many blocking threads.
+pub const SHARE_LOOKUPS: usize = 8;
 
 impl Default for Shares {
     fn default() -> Self {
@@ -262,7 +268,14 @@ impl Shares {
             operation_timeout: RwLock::new(crate::external::OPERATION_WAIT),
             cache_max_bytes_for_tests: Mutex::new(None),
             listing_progress: Mutex::new(HashMap::new()),
+            lookups: Arc::new(tokio::sync::Semaphore::new(SHARE_LOOKUPS)),
         }
+    }
+
+    /// The server-wide bound on canonical-path lookups in flight; see [`SHARE_LOOKUPS`].
+    #[must_use]
+    pub fn lookups(&self) -> Arc<tokio::sync::Semaphore> {
+        Arc::clone(&self.lookups)
     }
 
     /// The current file-system implementation.

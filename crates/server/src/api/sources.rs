@@ -8,7 +8,6 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::Json;
@@ -33,7 +32,7 @@ use crate::auth::Signed;
 use crate::github::{EntryKind, GithubError, Head, RepoRef};
 use crate::libraries;
 use crate::secrets::Secret;
-use crate::share::{FsBudget, ShareFs, canonical_share_path};
+use crate::share::{FsBudget, canonical_share_path};
 use crate::source_sync::{abandon_uploads_into, caps, token_context, token_of, webhook_context};
 use crate::tree::{self, TreeOp};
 
@@ -504,27 +503,46 @@ fn share_probe_error(error: &io::Error) -> ApiError {
 /// it gives up with a retryable `503`.
 const SHARE_RESOLVE_ROUNDS: usize = 3;
 
-/// The canonical location of `path` within `root`, through the contained [`ShareFs`] seam,
-/// waiting no later than `deadline`. A timeout or any failure is the probe's refusal; the
-/// canonical path itself never appears in an answer or a log.
+/// Why a canonical lookup gave no location.
+enum Lookup {
+    /// No lookup permit came free before the deadline: the server already has
+    /// [`crate::share::SHARE_LOOKUPS`] lookups in flight, most likely blocked on a hung server.
+    Busy,
+    /// The lookup failed or did not finish by the deadline.
+    Failed(ApiError),
+}
+
+/// The canonical location of `path` within `root`, through the contained [`crate::share::ShareFs`] seam,
+/// waiting no later than `deadline`. The blocking call holds one of the server's lookup permits
+/// until it returns, even after this caller stops waiting for it. A failure never carries the
+/// canonical path into an answer or a log.
 async fn resolve_canonical(
-    fs: &Arc<dyn ShareFs>,
+    state: &AppState,
     root: &SharePath,
     path: &SharePath,
     deadline: tokio::time::Instant,
-) -> Result<SharePath, ApiError> {
-    let fs = Arc::clone(fs);
+) -> Result<SharePath, Lookup> {
+    let permit = tokio::time::timeout_at(deadline, state.shares().lookups().acquire_owned())
+        .await
+        .map_err(|_| Lookup::Busy)?
+        .map_err(|_| Lookup::Busy)?;
+    let fs = state.shares().fs();
     let root = root.to_path_buf();
     let candidate = path.to_path_buf();
     let resolved = tokio::time::timeout_at(
         deadline,
-        tokio::task::spawn_blocking(move || fs.canonical(&root, &candidate)),
+        tokio::task::spawn_blocking(move || {
+            let resolved = fs.canonical(&root, &candidate);
+            drop(permit);
+            resolved
+        }),
     )
     .await
-    .map_err(|_| ApiError::ShareUnreachable("offline"))?
-    .map_err(|_| ApiError::ShareUnreachable("offline"))?
-    .map_err(|error| share_probe_error(&error))?;
-    canonical_share_path(&resolved).map_err(|_| ApiError::ShareUnreachable("offline"))
+    .map_err(|_| Lookup::Failed(ApiError::ShareUnreachable("offline")))?
+    .map_err(|_| Lookup::Failed(ApiError::ShareUnreachable("offline")))?
+    .map_err(|error| Lookup::Failed(share_probe_error(&error)))?;
+    canonical_share_path(&resolved)
+        .map_err(|_| Lookup::Failed(ApiError::ShareUnreachable("offline")))
 }
 
 /// Makes a new read-only library backed by an administrator-approved file-share folder.
@@ -564,7 +582,7 @@ pub(crate) async fn connect_share(
         .share_settings()
         .await
         .map_err(|e| ApiError::unavailable(&e))?;
-    let approved = approved_root(&path, &settings.roots)
+    let mut approved = approved_root(&path, &settings.roots)
         .cloned()
         .ok_or(ApiError::ShareNotApproved)?;
     if overlaps_data_folder(&state, &path).await {
@@ -580,34 +598,48 @@ pub(crate) async fn connect_share(
     }
 
     // Probe only the connected folder itself; recursive walking belongs to the first listing.
-    let fs = state.shares().fs();
-    let probe_fs = Arc::clone(&fs);
+    // Like a canonical lookup, the probe holds one of the server's lookup permits for its whole
+    // blocking call and is waited for no longer than `list_seconds`.
+    let probe_fs = state.shares().fs();
     let approved_path = approved.to_path_buf();
     let share_path = path.to_path_buf();
     let max_files = settings.max_files;
     let max_time = Duration::from_secs(settings.list_seconds);
-    tokio::task::spawn_blocking(move || {
-        probe_fs.list(
-            &approved_path,
-            &share_path,
-            &FsBudget::new(max_files, Instant::now() + max_time),
-        )
-    })
+    let probe_deadline = tokio::time::Instant::now() + max_time;
+    let permit = tokio::time::timeout_at(probe_deadline, state.shares().lookups().acquire_owned())
+        .await
+        .map_err(|_| ApiError::Unavailable)?
+        .map_err(|_| ApiError::Unavailable)?;
+    tokio::time::timeout_at(
+        probe_deadline,
+        tokio::task::spawn_blocking(move || {
+            let listed = probe_fs.list(
+                &approved_path,
+                &share_path,
+                &FsBudget::new(max_files, Instant::now() + max_time),
+            );
+            drop(permit);
+            listed
+        }),
+    )
     .await
+    .map_err(|_| ApiError::ShareUnreachable("offline"))?
     .map_err(|_| ApiError::ShareUnreachable("offline"))?
     .map_err(|error| share_probe_error(&error))?;
 
     // Every file-system call happens outside the organisation-wide connection turn, so the
     // turn never waits on share I/O. The new folder's canonical location and that of every
     // share already connected are resolved at once, under one `list_seconds` deadline; an
-    // existing location that cannot be resolved in time falls back to its typed path. Under
+    // existing location that cannot be resolved in time falls back to its typed path, but when
+    // no lookup permit comes free in time the answer is a retryable `503` instead. Under
     // the turn only the database is touched: the roots and the connected locations are read
     // again and compared with what was resolved. A location connected meanwhile was never
     // resolved, so the turn is given up, just the new locations are resolved (with a fresh
     // deadline), and the comparison is repeated; after a few rounds of that the answer is a
-    // retryable `503`.
+    // retryable `503`. So is a root change that moves the folder under a different approved root
+    // meanwhile: its own location is then resolved again within the new root.
     let mut resolved: HashMap<String, Option<SharePath>> = HashMap::new();
-    let mut canonical_path: Option<SharePath> = None;
+    let mut own_canonical: Option<SharePath> = None;
     let mut held = None;
     for _ in 0..SHARE_RESOLVE_ROUNDS {
         let deadline = tokio::time::Instant::now() + max_time;
@@ -621,33 +653,45 @@ pub(crate) async fn connect_share(
             .collect();
         let resolving_existing =
             futures_util::future::join_all(unresolved.into_iter().map(|location| {
-                let fs = Arc::clone(&fs);
+                let state = &state;
                 let roots = settings.roots.clone();
                 async move {
                     let canonical = match SharePath::parse(&location) {
                         Ok(lexical) => match approved_root(&lexical, &roots) {
                             Some(root) => {
-                                resolve_canonical(&fs, root, &lexical, deadline).await.ok()
+                                match resolve_canonical(state, root, &lexical, deadline).await {
+                                    Ok(canonical) => Ok(Some(canonical)),
+                                    // Too many lookups are already stuck: answer a
+                                    // retryable 503 rather than skip this location's
+                                    // canonical comparison.
+                                    Err(Lookup::Busy) => Err(ApiError::Unavailable),
+                                    Err(Lookup::Failed(_)) => Ok(None),
+                                }
                             }
-                            None => None,
+                            None => Ok(None),
                         },
-                        Err(_) => None,
+                        Err(_) => Ok(None),
                     };
                     (location, canonical)
                 }
             }));
-        let newly = if canonical_path.is_none() {
+        let newly = if own_canonical.is_none() {
             let (own, newly) = tokio::join!(
-                resolve_canonical(&fs, &approved, &path, deadline),
+                resolve_canonical(&state, &approved, &path, deadline),
                 resolving_existing
             );
-            canonical_path = Some(own?);
+            own_canonical = Some(own.map_err(|lookup| match lookup {
+                Lookup::Busy => ApiError::Unavailable,
+                Lookup::Failed(error) => error,
+            })?);
             newly
         } else {
             resolving_existing.await
         };
-        resolved.extend(newly);
-        let Some(canonical_path) = canonical_path.as_ref() else {
+        for (location, canonical) in newly {
+            resolved.insert(location, canonical?);
+        }
+        let Some(canonical_path) = own_canonical.clone() else {
             return Err(ApiError::ShareUnreachable("offline"));
         };
 
@@ -665,8 +709,15 @@ pub(crate) async fn connect_share(
             .share_settings()
             .await
             .map_err(|e| ApiError::unavailable(&e))?;
-        if approved_root(&path, &current_settings.roots).is_none() {
+        let Some(current_root) = approved_root(&path, &current_settings.roots).cloned() else {
             return Err(ApiError::ShareNotApproved);
+        };
+        if current_root != approved {
+            // The folder's own canonical location was judged within a root that has since
+            // been replaced: give the turn up and resolve it again within the current root.
+            approved = current_root;
+            own_canonical = None;
+            continue;
         }
         let existing = state
             .db()
@@ -679,7 +730,7 @@ pub(crate) async fn connect_share(
             let lexical_conflict = path.is_within(&lexical) || lexical.is_within(&path);
             let conflict = match resolved.get(&location) {
                 Some(Some(existing)) => {
-                    canonical_path.is_within(existing) || existing.is_within(canonical_path)
+                    canonical_path.is_within(existing) || existing.is_within(&canonical_path)
                 }
                 Some(None) => lexical_conflict,
                 None => {
@@ -1155,11 +1206,10 @@ pub(crate) async fn disconnect(
         } else {
             0
         };
-        let secrets = state
-            .db()
-            .disconnect_source(library)
-            .await
-            .map_err(|e| ApiError::unavailable(&e))?;
+        // The library-level authorisation is judged again in the disconnect's own transaction,
+        // also when there were no children to remove: the route's check above was made before
+        // the wait for the source turn.
+        let secrets = state.db().disconnect_source_as(actor.id, library).await?;
         for id in secrets {
             forget_secret(&state, id).await;
         }

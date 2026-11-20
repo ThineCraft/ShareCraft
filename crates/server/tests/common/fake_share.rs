@@ -27,6 +27,7 @@ struct Inner {
     pause_list_after_read: (Mutex<bool>, Condvar),
     hang_canonical: (Mutex<HashSet<PathBuf>>, Condvar),
     canonical_hanging: AtomicUsize,
+    canonical_hanging_peak: AtomicUsize,
     vanish_on_open: Mutex<HashSet<PathBuf>>,
     change_during_read: Mutex<HashMap<PathBuf, VecDeque<Vec<u8>>>>,
     change_after_stat: Mutex<HashMap<PathBuf, VecDeque<Vec<u8>>>>,
@@ -76,6 +77,7 @@ impl FakeShare {
                 pause_list_after_read: (Mutex::new(false), Condvar::new()),
                 hang_canonical: (Mutex::new(HashSet::new()), Condvar::new()),
                 canonical_hanging: AtomicUsize::new(0),
+                canonical_hanging_peak: AtomicUsize::new(0),
                 vanish_on_open: Mutex::new(HashSet::new()),
                 change_during_read: Mutex::new(HashMap::new()),
                 change_after_stat: Mutex::new(HashMap::new()),
@@ -271,6 +273,11 @@ impl FakeShare {
     /// How many canonical resolutions are blocked by [`FakeShare::hang_canonical`] now.
     pub fn canonical_hanging(&self) -> usize {
         self.inner.canonical_hanging.load(Ordering::SeqCst)
+    }
+
+    /// The most canonical resolutions ever blocked by [`FakeShare::hang_canonical`] at once.
+    pub fn canonical_hanging_peak(&self) -> usize {
+        self.inner.canonical_hanging_peak.load(Ordering::SeqCst)
     }
 
     pub fn vanish_on_open(&self, path: &str) {
@@ -699,7 +706,10 @@ impl ShareFs for FakeShare {
             let (hanging, wake) = &self.inner.hang_canonical;
             let mut hanging = hanging.lock().unwrap_or_else(|error| error.into_inner());
             if hanging.contains(path) {
-                self.inner.canonical_hanging.fetch_add(1, Ordering::SeqCst);
+                let now = self.inner.canonical_hanging.fetch_add(1, Ordering::SeqCst) + 1;
+                self.inner
+                    .canonical_hanging_peak
+                    .fetch_max(now, Ordering::SeqCst);
                 while hanging.contains(path) {
                     hanging = wake
                         .wait(hanging)
