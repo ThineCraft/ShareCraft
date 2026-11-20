@@ -12,7 +12,7 @@ use collab_core::ids::{ClientId, DocId, Seq, UserId};
 use common::{Gate, tree, user, wait_blocked};
 use records::test_support::TestDb;
 use records::{
-    GoneReason, LiveCheckpointRow, LiveCheckpointWriter, LiveEntryRow, LiveLocal,
+    GoneReason, LiveCheckpointRow, LiveCheckpointWriter, LiveDisputeMark, LiveEntryRow, LiveLocal,
     LiveReturnTombstoneRow, LiveSessionDataRow, NewLiveCancel, NewLiveChange, NewLiveCheckpoint,
     RevisionRecord,
 };
@@ -2509,5 +2509,76 @@ async fn adopting_a_base_keeps_disputed_and_major_rows() {
     assert_eq!(
         kept, expected,
         "only the ordinary unverified checkpoint goes"
+    );
+}
+
+/// A disputed sole-editor base is set aside: the last peer-verified checkpoint is the catch-up
+/// base again, with the log after it.
+#[tokio::test]
+async fn disputed_sole_editor_base_falls_back_to_the_last_peer_verified_base() {
+    let s = setup().await;
+    let session = session(&s, 0).await;
+    let revisions = checkpoint_each_change(&s, session, 3, b"ids").await;
+    s.test
+        .db
+        .verify_live_checkpoint(s.doc, &revisions[0], Seq(1), at(20))
+        .await
+        .unwrap();
+    s.test
+        .db
+        .accept_live_sole_editor(s.doc, &revisions[2], Seq(3), at(30))
+        .await
+        .unwrap();
+    let fallback = s
+        .test
+        .db
+        .dispute_live_sole_base(s.doc, &revisions[2], at(40))
+        .await
+        .unwrap();
+    assert_eq!(fallback, Some((revisions[0].clone(), Seq(1))));
+    let loaded = s.test.db.load_live(s.doc).await.unwrap();
+    assert_eq!(loaded.verified_through, Seq(1));
+    assert_eq!(loaded.verified_checkpoint.unwrap().revision, revisions[0]);
+    assert!(
+        loaded
+            .unverified_checkpoints
+            .iter()
+            .all(|checkpoint| checkpoint.revision != revisions[2]),
+        "a disputed base is never loaded"
+    );
+    assert_eq!(loaded.entries.len(), 2, "the log after the fallback base");
+}
+
+/// The people in a dispute are remembered per document: when they last stopped a session and
+/// until when they are excluded from checkpoint work.
+#[tokio::test]
+async fn dispute_marks_are_kept_per_document_and_person() {
+    let s = setup().await;
+    assert!(
+        s.test
+            .db
+            .live_dispute_marks(s.doc)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let mark = LiveDisputeMark {
+        user: s.ann,
+        stopped_at: Some(at(10)),
+        excluded_until: None,
+    };
+    s.test.db.set_live_dispute_mark(s.doc, &mark).await.unwrap();
+    let excluded = LiveDisputeMark {
+        excluded_until: Some(at(100)),
+        ..mark.clone()
+    };
+    s.test
+        .db
+        .set_live_dispute_mark(s.doc, &excluded)
+        .await
+        .unwrap();
+    assert_eq!(
+        s.test.db.live_dispute_marks(s.doc).await.unwrap(),
+        vec![excluded]
     );
 }

@@ -71,6 +71,16 @@ pub const MAX_UNVERIFIED_CHECKPOINTS: usize = 4;
 /// of its fixed fields on the wire.
 pub const LIVE_CANCEL_BYTES: u64 = 64;
 
+/// A person's part in a document's checkpoint disputes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiveDisputeMark {
+    pub user: UserId,
+    /// When a dispute they took part in last stopped the live session.
+    pub stopped_at: Option<OffsetDateTime>,
+    /// Until when they write and verify none of the document's checkpoints.
+    pub excluded_until: Option<OffsetDateTime>,
+}
+
 /// One durable checkpoint of a live log.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LiveCheckpointRow {
@@ -1350,6 +1360,107 @@ impl Db {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
+        Ok(())
+    }
+
+    /// Sets aside the sole-editor base `revision`, which a second editor disputed: it is no
+    /// longer verified, keeps no identity data, is never a base, and the catch-up base goes
+    /// back to the newest checkpoint a peer verified (with the log after it). Answers that
+    /// checkpoint's revision and position, if there is one.
+    pub async fn dispute_live_sole_base(
+        &self,
+        doc: DocId,
+        revision: &str,
+        at: OffsetDateTime,
+    ) -> Result<Option<(String, Seq)>, DbError> {
+        let mut tx = self.pool().begin().await?;
+        lock_log(&mut tx, doc).await?;
+        sqlx::query(
+            "update live_checkpoints \
+             set disputed_at = coalesce(disputed_at, $3), verified_at = null, \
+                 sole_editor_at = null, session_data = '' \
+             where document_id = $1 and revision = $2",
+        )
+        .bind(doc.0)
+        .bind(revision)
+        .bind(at)
+        .execute(&mut *tx)
+        .await?;
+        let fallback = sqlx::query(
+            "select revision, through, verified_at from live_checkpoints \
+             where document_id = $1 and verified_at is not null and disputed_at is null \
+               and sole_editor_at is null \
+             order by through desc, verified_at desc limit 1",
+        )
+        .bind(doc.0)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let (back_to, verified_at, answer) = match fallback {
+            Some(row) => {
+                let through: i64 = row.try_get("through")?;
+                let verified_at: OffsetDateTime = row.try_get("verified_at")?;
+                let revision: String = row.try_get("revision")?;
+                (
+                    through,
+                    Some(verified_at),
+                    Some((revision, Seq(unsigned(through)?))),
+                )
+            }
+            None => (0, None, None),
+        };
+        sqlx::query(
+            "update live_logs set verified_through = $2, verified_at = $3 \
+             where document_id = $1",
+        )
+        .bind(doc.0)
+        .bind(back_to)
+        .bind(verified_at)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(answer)
+    }
+
+    /// The dispute marks of `doc`'s people (see [`LiveDisputeMark`]).
+    pub async fn live_dispute_marks(&self, doc: DocId) -> Result<Vec<LiveDisputeMark>, DbError> {
+        let mut conn = self.pool().acquire().await?;
+        sqlx::query(
+            "select user_id, stopped_at, excluded_until from live_dispute_marks \
+             where document_id = $1 order by user_id",
+        )
+        .bind(doc.0)
+        .fetch_all(&mut *conn)
+        .await?
+        .iter()
+        .map(|row| {
+            Ok(LiveDisputeMark {
+                user: UserId(row.try_get("user_id")?),
+                stopped_at: row.try_get("stopped_at")?,
+                excluded_until: row.try_get("excluded_until")?,
+            })
+        })
+        .collect()
+    }
+
+    /// Stores `mark` for its person on `doc`, replacing the one before.
+    pub async fn set_live_dispute_mark(
+        &self,
+        doc: DocId,
+        mark: &LiveDisputeMark,
+    ) -> Result<(), DbError> {
+        let mut conn = self.pool().acquire().await?;
+        sqlx::query(
+            "insert into live_dispute_marks (document_id, user_id, stopped_at, excluded_until) \
+             values ($1, $2, $3, $4) \
+             on conflict (document_id, user_id) do update \
+             set stopped_at = excluded.stopped_at, excluded_until = excluded.excluded_until",
+        )
+        .bind(doc.0)
+        .bind(mark.user.0)
+        .bind(mark.stopped_at)
+        .bind(mark.excluded_until)
+        .execute(&mut *conn)
+        .await?;
         Ok(())
     }
 

@@ -348,6 +348,8 @@ pub struct LiveClient<E: LiveEditor> {
     returning_through: Option<LocalNo>,
     /// Whether a returning place is waiting for the server's durable pre-return checkpoint.
     hold_return: bool,
+    /// A change was held by the server: nothing is sent until changes resume.
+    changes_held: bool,
     /// A discarded return batch whose already-sent readiness may still arrive.
     discarded_return_through: Option<LocalNo>,
     next_local: u64,
@@ -392,6 +394,7 @@ impl<E: LiveEditor> LiveClient<E> {
             pending: VecDeque::new(),
             returning_through: None,
             hold_return: false,
+            changes_held: false,
             discarded_return_through: None,
             next_local: 1,
             held: Vec::new(),
@@ -545,7 +548,8 @@ impl<E: LiveEditor> LiveClient<E> {
                 reason: RefusedReason::Held,
             } => {
                 // Not refused for good: this change and every later one wait, still shown, and
-                // go again once changes resume.
+                // go again once changes resume, never before.
+                self.changes_held = true;
                 for pending in self
                     .pending
                     .iter_mut()
@@ -615,6 +619,7 @@ impl<E: LiveEditor> LiveClient<E> {
             }
             LiveServerMsg::ChangesResumed => {
                 step.events.push(Event::ChangesResumed);
+                self.changes_held = false;
                 self.send_unsent(now_ms, &mut step.send);
             }
             LiveServerMsg::ReturnReady { through } => {
@@ -912,7 +917,7 @@ impl<E: LiveEditor> LiveClient<E> {
     /// Sends the waiting changes not yet sent on this connection, in order, as far as the pace
     /// allows. What is sent is always a prefix of the queue.
     fn send_unsent(&mut self, now_ms: u64, send: &mut Vec<String>) {
-        if self.phase != Phase::Live || !self.can_edit || self.hold_return {
+        if self.phase != Phase::Live || !self.can_edit || self.hold_return || self.changes_held {
             return;
         }
         self.clock_check(now_ms);
@@ -997,6 +1002,8 @@ impl<E: LiveEditor> LiveClient<E> {
         // A server's interval outside 1 s to 60 s would flood it or let the place expire.
         self.heartbeat_ms = heartbeat_ms.clamp(MIN_HEARTBEAT_MS, HEARTBEAT_MS);
         self.joined = true;
+        // A new join starts over: a hold of the connection before applies no longer.
+        self.changes_held = false;
         if let Place::Returning { previous } = place {
             self.hold_return = self.returning_through.is_some();
             step.events.push(Event::Returned {

@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use collab_core::ids::{ClientId, DocId, Seq, UserId};
 use records::{
-    Db, DbError, GoneReason, LiveCheckpointWriter, LiveLoaded, LiveLocal, LiveReturnTombstoneRow,
-    NewLiveCancel, NewLiveChange, NewLiveCheckpoint, Origin,
+    Db, DbError, GoneReason, LiveCheckpointWriter, LiveDisputeMark, LiveLoaded, LiveLocal,
+    LiveReturnTombstoneRow, NewLiveCancel, NewLiveChange, NewLiveCheckpoint, Origin,
 };
 use revisions::{Author, BlobRef, Checkpoint, Outcome, RevisionId, RevisionInfo};
 use serde_json::{Map, Value};
@@ -276,6 +276,28 @@ pub(crate) trait LiveStore: Clone + Send + Sync + 'static {
         at: OffsetDateTime,
     ) -> impl Future<Output = Result<(), DbError>> + Send;
 
+    /// Sets aside the sole-editor base `revision` a second editor disputed; the catch-up base
+    /// goes back to the newest peer-verified checkpoint, which is answered.
+    fn dispute_live_sole_base(
+        &self,
+        doc: DocId,
+        revision: &str,
+        at: OffsetDateTime,
+    ) -> impl Future<Output = Result<Option<(String, Seq)>, DbError>> + Send;
+
+    /// The dispute marks of the document's people.
+    fn live_dispute_marks(
+        &self,
+        doc: DocId,
+    ) -> impl Future<Output = Result<Vec<LiveDisputeMark>, DbError>> + Send;
+
+    /// Stores one person's dispute mark.
+    fn set_live_dispute_mark(
+        &self,
+        doc: DocId,
+        mark: &LiveDisputeMark,
+    ) -> impl Future<Output = Result<(), DbError>> + Send;
+
     /// Accepts the checkpoint `revision` at `through` as the base with no second editor to
     /// verify it.
     fn accept_live_sole_editor(
@@ -471,6 +493,27 @@ impl LiveStore for Db {
         at: OffsetDateTime,
     ) -> Result<(), DbError> {
         Db::dispute_live_checkpoint(self, doc, revision, at).await
+    }
+
+    async fn dispute_live_sole_base(
+        &self,
+        doc: DocId,
+        revision: &str,
+        at: OffsetDateTime,
+    ) -> Result<Option<(String, Seq)>, DbError> {
+        Db::dispute_live_sole_base(self, doc, revision, at).await
+    }
+
+    async fn live_dispute_marks(&self, doc: DocId) -> Result<Vec<LiveDisputeMark>, DbError> {
+        Db::live_dispute_marks(self, doc).await
+    }
+
+    async fn set_live_dispute_mark(
+        &self,
+        doc: DocId,
+        mark: &LiveDisputeMark,
+    ) -> Result<(), DbError> {
+        Db::set_live_dispute_mark(self, doc, mark).await
     }
 
     async fn accept_live_sole_editor(
@@ -697,6 +740,27 @@ impl LiveStore for LiveDb {
         at: OffsetDateTime,
     ) -> Result<(), DbError> {
         self.db.dispute_live_checkpoint(doc, revision, at).await
+    }
+
+    async fn dispute_live_sole_base(
+        &self,
+        doc: DocId,
+        revision: &str,
+        at: OffsetDateTime,
+    ) -> Result<Option<(String, Seq)>, DbError> {
+        self.db.dispute_live_sole_base(doc, revision, at).await
+    }
+
+    async fn live_dispute_marks(&self, doc: DocId) -> Result<Vec<LiveDisputeMark>, DbError> {
+        self.db.live_dispute_marks(doc).await
+    }
+
+    async fn set_live_dispute_mark(
+        &self,
+        doc: DocId,
+        mark: &LiveDisputeMark,
+    ) -> Result<(), DbError> {
+        self.db.set_live_dispute_mark(doc, mark).await
     }
 
     async fn accept_live_sole_editor(
@@ -1186,6 +1250,7 @@ mod memory {
         revisions: Vec<(String, [u8; 32])>,
         /// The fields of each checkpoint revision written.
         revision_fields: HashMap<String, Map<String, Value>>,
+        dispute_marks: Vec<LiveDisputeMark>,
     }
 
     impl Default for MemoryDoc {
@@ -1209,6 +1274,7 @@ mod memory {
                 revisions_written: 0,
                 revisions: Vec::new(),
                 revision_fields: HashMap::new(),
+                dispute_marks: Vec::new(),
             }
         }
     }
@@ -1798,7 +1864,8 @@ mod memory {
                 }
                 None => None,
             };
-            if fail_restore && let Some(head) = kept.clone().or_else(|| copy.clone()) {
+            // The head left is the last revision written, as in Git.
+            if fail_restore && let Some(head) = copy.clone().or_else(|| kept.clone()) {
                 return Err(LiveWriteError::Partial {
                     head,
                     error: "injected restore failure".to_owned(),
@@ -1906,6 +1973,69 @@ mod memory {
                     checkpoint.row.session_data.clear();
                 }
             }
+            Self::finish_write(state)
+        }
+
+        async fn dispute_live_sole_base(
+            &self,
+            doc: DocId,
+            revision: &str,
+            _at: OffsetDateTime,
+        ) -> Result<Option<(String, Seq)>, DbError> {
+            let mut state = self.write()?;
+            let memory = state.docs.entry(doc).or_default();
+            for checkpoint in &mut memory.checkpoints {
+                if checkpoint.row.revision == revision {
+                    checkpoint.disputed = true;
+                    checkpoint.row.verified = false;
+                    checkpoint.row.sole_editor = false;
+                    checkpoint.row.session_data.clear();
+                }
+            }
+            let fallback = memory
+                .checkpoints
+                .iter()
+                .filter(|checkpoint| {
+                    checkpoint.row.verified && !checkpoint.disputed && !checkpoint.row.sole_editor
+                })
+                .max_by_key(|checkpoint| checkpoint.row.through)
+                .map(|checkpoint| (checkpoint.row.revision.clone(), checkpoint.row.through));
+            let back_to = fallback.as_ref().map_or(Seq(0), |(_, through)| *through);
+            memory.verified_through = back_to;
+            memory.unsaved_entries = memory
+                .entries
+                .iter()
+                .filter(|entry| match entry {
+                    LiveEntryRow::Change { seq, .. } | LiveEntryRow::Cancel { seq, .. } => {
+                        *seq > back_to
+                    }
+                })
+                .count()
+                .try_into()
+                .unwrap_or(u64::MAX);
+            memory.unsaved_bytes = unsaved_bytes_after(&memory.entries, back_to);
+            Self::finish_write(state)?;
+            Ok(fallback)
+        }
+
+        async fn live_dispute_marks(&self, doc: DocId) -> Result<Vec<LiveDisputeMark>, DbError> {
+            let state = self.state()?;
+            Ok(state
+                .docs
+                .get(&doc)
+                .map(|memory| memory.dispute_marks.clone())
+                .unwrap_or_default())
+        }
+
+        async fn set_live_dispute_mark(
+            &self,
+            doc: DocId,
+            mark: &LiveDisputeMark,
+        ) -> Result<(), DbError> {
+            let mut state = self.write()?;
+            let memory = state.docs.entry(doc).or_default();
+            memory.dispute_marks.retain(|kept| kept.user != mark.user);
+            memory.dispute_marks.push(mark.clone());
             Self::finish_write(state)
         }
 

@@ -2505,3 +2505,48 @@ fn held_refusal_keeps_the_change_and_resends_it_after_the_hold() {
         (json!(1), json!(2))
     );
 }
+
+/// Held changes wait for `changes_resumed`: neither a tick nor a new change sends them (or
+/// anything after them) during the hold.
+#[test]
+fn held_change_is_not_resent_by_tick_before_resume() {
+    let mut doc = StandIn::new("a");
+    let mut client = live(&mut doc, 1);
+    let first = client.new_ids(1).unwrap();
+    client
+        .local(&mut doc, insert(first, "one"), Mode::ShowAtOnce, 10)
+        .unwrap();
+    let held = json!({ "type": "refused", "local": 1, "reason": "held" }).to_string();
+    let step = client.receive(&mut doc, &held, 20).unwrap();
+    assert!(step.send.is_empty());
+    for now in [2_000, 4_000, 6_000] {
+        let frames = sent(&client.tick(now));
+        assert!(
+            frames.iter().all(|frame| frame["type"] != "entry"),
+            "nothing is resent during the hold: {frames:?}"
+        );
+    }
+    let second = client.new_ids(1).unwrap();
+    let step = client
+        .local(&mut doc, insert(second, "two"), Mode::ShowAtOnce, 7_000)
+        .unwrap();
+    assert!(
+        sent(&step.send)
+            .iter()
+            .all(|frame| frame["type"] != "entry"),
+        "a new change waits behind the held one"
+    );
+    assert!(
+        sent(&client.tick(8_000))
+            .iter()
+            .all(|frame| frame["type"] != "entry")
+    );
+    let resumed = json!({ "type": "changes_resumed" }).to_string();
+    let step = client.receive(&mut doc, &resumed, 9_000).unwrap();
+    let resent = sent(&step.send);
+    assert_eq!(resent.len(), 2);
+    assert_eq!(
+        (resent[0]["local"].clone(), resent[1]["local"].clone()),
+        (json!(1), json!(2))
+    );
+}
