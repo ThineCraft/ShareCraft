@@ -2550,3 +2550,87 @@ fn held_change_is_not_resent_by_tick_before_resume() {
         (json!(1), json!(2))
     );
 }
+
+/// During a pause (the log at its limit, or a major version at the head) queued changes wait,
+/// shown, instead of going out to be refused; they go once changes resume.
+#[test]
+fn changes_paused_holds_queued_changes_until_resumed() {
+    let mut doc = StandIn::new("a");
+    let mut client = live(&mut doc, 1);
+    let paused = json!({ "type": "changes_paused", "entries": 5000, "bytes": 10 }).to_string();
+    client.receive(&mut doc, &paused, 10).unwrap();
+    let first = client.new_ids(1).unwrap();
+    let step = client
+        .local(&mut doc, insert(first, "one"), Mode::ShowAtOnce, 20)
+        .unwrap();
+    assert!(
+        sent(&step.send).is_empty(),
+        "nothing goes out to be refused"
+    );
+    assert!(
+        sent(&client.tick(5_000))
+            .iter()
+            .all(|frame| frame["type"] != "entry")
+    );
+    assert_eq!(client.pending(), 1, "the change waits, shown");
+    let step = client
+        .receive(&mut doc, r#"{"type":"changes_resumed"}"#, 6_000)
+        .unwrap();
+    let resent = sent(&step.send);
+    assert_eq!(resent.len(), 1);
+    assert_eq!(resent[0]["local"], 1);
+}
+
+/// I5: a returning client that lost its batch with its edit right, then had a new change held,
+/// is released by the `return_ready` of the discarded batch: nothing else would release it.
+#[test]
+fn return_ready_of_a_discarded_batch_releases_a_held_change() {
+    let mut doc = StandIn::new("a");
+    let mut client = checkpoint_live(&mut doc, 2);
+    let saved = client.new_ids(1).unwrap();
+    client
+        .local(&mut doc, insert(saved, "saved"), Mode::ShowAtOnce, 10)
+        .unwrap();
+    client.disconnected(20);
+    client.connected(30);
+    client
+        .receive(
+            &mut doc,
+            &joined_as(5, json!({ "is": "returning", "previous": 2 }), true),
+            30,
+        )
+        .unwrap();
+    client.receive(&mut doc, &catchup(0, 0, 0), 30).unwrap();
+    client
+        .receive(&mut doc, r#"{"type":"access","can_edit":false}"#, 40)
+        .unwrap();
+    client
+        .receive(&mut doc, r#"{"type":"access","can_edit":true}"#, 50)
+        .unwrap();
+    let fresh = client.new_ids(1).unwrap();
+    let step = client
+        .local(&mut doc, insert(fresh, "fresh"), Mode::ShowAtOnce, 60)
+        .unwrap();
+    assert_eq!(entries(&step.send).len(), 1);
+    let held = json!({ "type": "refused", "local": 2, "reason": "held" }).to_string();
+    client.receive(&mut doc, &held, 70).unwrap();
+    let step = client
+        .receive(&mut doc, r#"{"type":"return_ready","through":1}"#, 80)
+        .unwrap();
+    let resent = entries(&step.send);
+    assert_eq!(resent.len(), 1, "the held change goes again");
+    assert_eq!(resent[0]["local"], 2);
+}
+
+/// C1: the server sends `return_ready` again on every join that names a batch; a client
+/// holding no such batch (it was released already) ignores the repeat.
+#[test]
+fn a_repeated_return_ready_is_ignored() {
+    let mut doc = StandIn::new("a");
+    let mut client = live(&mut doc, 1);
+    let step = client
+        .receive(&mut doc, r#"{"type":"return_ready","through":4}"#, 10)
+        .unwrap();
+    assert_eq!(step, Step::default());
+    assert_eq!(client.phase(), Phase::Live);
+}

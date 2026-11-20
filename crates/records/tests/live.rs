@@ -2582,3 +2582,55 @@ async fn dispute_marks_are_kept_per_document_and_person() {
         vec![excluded]
     );
 }
+
+/// t11-fix minor 6: two verified checkpoints at the same position (a major version marked there
+/// and a base adopted at it later) load deterministically: the one verified last.
+#[tokio::test]
+async fn load_breaks_a_tie_between_verified_checkpoints_by_the_newest_verification() {
+    let s = setup().await;
+    let session = session(&s, 0).await;
+    s.test
+        .db
+        .append_live_change(s.doc, &change(1, session, client(), s.ann, 1, b"x", &[]))
+        .await
+        .unwrap();
+    let older = revision(&s, 'b', None).await;
+    let newer = revision(&s, 'a', Some(&older)).await;
+    let checkpoint = |revision, byte| NewLiveCheckpoint {
+        revision,
+        through: Seq(1),
+        sha256: [byte; 32],
+        session,
+        session_data: &[],
+        major_reason: None,
+        major_person: None,
+        writer: None,
+        created_at: at(2),
+    };
+    s.test
+        .db
+        .record_live_checkpoint(
+            s.doc,
+            &NewLiveCheckpoint {
+                major_reason: Some("returning_client_before"),
+                major_person: Some(s.ann),
+                ..checkpoint(&older, 1)
+            },
+        )
+        .await
+        .unwrap();
+    s.test
+        .db
+        .verify_live_checkpoint(s.doc, &older, Seq(1), at(5))
+        .await
+        .unwrap();
+    s.test
+        .db
+        .adopt_live_base(s.doc, &checkpoint(&newer, 2), at(6))
+        .await
+        .unwrap();
+    for _ in 0..3 {
+        let loaded = s.test.db.load_live(s.doc).await.unwrap();
+        assert_eq!(loaded.verified_checkpoint.unwrap().revision, newer);
+    }
+}

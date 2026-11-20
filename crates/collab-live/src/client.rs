@@ -190,9 +190,10 @@ pub enum Event {
         at: Seq,
         base: Option<String>,
     },
-    /// New changes are paused because the unsaved log reached a hard limit.
+    /// New changes wait (the unsaved log reached a hard limit, or a major version is being
+    /// stored at the head): waiting changes stay shown and are held until `ChangesResumed`.
     ChangesPaused { entries: u64, bytes: u64 },
-    /// New changes may be sent again.
+    /// New changes may be sent again; held changes go now.
     ChangesResumed,
     /// The durable pre-return checkpoint exists and the saved batch may be sent.
     ReturnReady { through: LocalNo },
@@ -348,8 +349,12 @@ pub struct LiveClient<E: LiveEditor> {
     returning_through: Option<LocalNo>,
     /// Whether a returning place is waiting for the server's durable pre-return checkpoint.
     hold_return: bool,
-    /// A change was held by the server: nothing is sent until changes resume.
+    /// A change was held by the server: nothing is sent until changes resume, or until the
+    /// return barrier that held it opens.
     changes_held: bool,
+    /// The server said changes wait (`changes_paused`): queued changes stay, shown, until
+    /// `changes_resumed`, so none is sent only to be refused.
+    changes_paused: bool,
     /// A discarded return batch whose already-sent readiness may still arrive.
     discarded_return_through: Option<LocalNo>,
     next_local: u64,
@@ -395,6 +400,7 @@ impl<E: LiveEditor> LiveClient<E> {
             returning_through: None,
             hold_return: false,
             changes_held: false,
+            changes_paused: false,
             discarded_return_through: None,
             next_local: 1,
             held: Vec::new(),
@@ -615,16 +621,25 @@ impl<E: LiveEditor> LiveClient<E> {
                 }
             },
             LiveServerMsg::ChangesPaused { entries, bytes } => {
+                // Queued changes wait instead of going out to be refused.
+                self.changes_paused = true;
                 step.events.push(Event::ChangesPaused { entries, bytes });
             }
             LiveServerMsg::ChangesResumed => {
                 step.events.push(Event::ChangesResumed);
                 self.changes_held = false;
+                self.changes_paused = false;
                 self.send_unsent(now_ms, &mut step.send);
             }
             LiveServerMsg::ReturnReady { through } => {
                 if self.discarded_return_through == Some(through) {
+                    // The batch was dropped with the edit right; a change held behind its
+                    // barrier meanwhile is released now, or nothing ever would release it.
                     self.discarded_return_through = None;
+                    if self.changes_held {
+                        self.changes_held = false;
+                        self.send_unsent(now_ms, &mut step.send);
+                    }
                 } else if self.hold_return && self.returning_through == Some(through) {
                     self.hold_return = false;
                     self.returning_through = None;
@@ -637,11 +652,9 @@ impl<E: LiveEditor> LiveClient<E> {
                     }
                     step.events.push(Event::ReturnReady { through });
                     self.send_unsent(now_ms, &mut step.send);
-                } else {
-                    return Err(ClientError::Desync(format!(
-                        "return ready through {through:?} without that return batch"
-                    )));
                 }
+                // Otherwise a repeat: the server sends it again on every join that names a
+                // batch, and this client holds none any more.
             }
             LiveServerMsg::ArchiveReturn { current } => {
                 if self.phase != Phase::Joining || !self.joined || !self.hold_return {
@@ -840,7 +853,9 @@ impl<E: LiveEditor> LiveClient<E> {
         })
     }
 
-    /// Makes the checkpoint-ready frame for a ticket at the exact agreed position.
+    /// Makes the checkpoint-ready frame for a ticket at the exact agreed position. The server
+    /// ignores this frame (it acts on the upload itself); it only checks the client can write
+    /// the checkpoint at `at`.
     pub fn checkpoint_ready(&self, ticket: Uuid, at: Seq) -> Result<String, ClientError> {
         if !self.can_checkpoint {
             return Err(ClientError::AgreedUnavailable {
@@ -917,7 +932,12 @@ impl<E: LiveEditor> LiveClient<E> {
     /// Sends the waiting changes not yet sent on this connection, in order, as far as the pace
     /// allows. What is sent is always a prefix of the queue.
     fn send_unsent(&mut self, now_ms: u64, send: &mut Vec<String>) {
-        if self.phase != Phase::Live || !self.can_edit || self.hold_return || self.changes_held {
+        if self.phase != Phase::Live
+            || !self.can_edit
+            || self.hold_return
+            || self.changes_held
+            || self.changes_paused
+        {
             return;
         }
         self.clock_check(now_ms);
@@ -1004,6 +1024,7 @@ impl<E: LiveEditor> LiveClient<E> {
         self.joined = true;
         // A new join starts over: a hold of the connection before applies no longer.
         self.changes_held = false;
+        self.changes_paused = false;
         if let Place::Returning { previous } = place {
             self.hold_return = self.returning_through.is_some();
             step.events.push(Event::Returned {

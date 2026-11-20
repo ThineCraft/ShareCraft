@@ -22,6 +22,9 @@ pub const MAX_FORMAT_LEN: usize = 64;
 pub const HEARTBEAT_MS: u64 = 60_000;
 /// How many heartbeat periods may pass without any message before a place ends.
 pub const EXPIRY_MISSES: u32 = 3;
+/// Editors report an entered-content fingerprint at every log position that is a multiple of
+/// this. The server compares the reports at each such position.
+pub const AGREEMENT_EVERY: u64 = 64;
 
 /// Whether `format` is a valid format name: 1 to [`MAX_FORMAT_LEN`] characters, each one of
 /// `a-z`, `0-9`, `.`, `_`, `/` or `-`.
@@ -68,11 +71,13 @@ pub struct LiveResume {
     pub participant: ParticipantNo,
 }
 
-/// The kind of editor build connected to a live session.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// The kind of editor build connected to a live session. A verify ticket goes only to a place
+/// on the writer's build, since checkpoint bytes carry computed values.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LiveBuild {
-    /// An editor running in a browser.
+    /// An editor running in a browser; what an older client that names no build is taken as.
+    #[default]
     Browser,
     /// A native desktop editor.
     Desktop,
@@ -135,11 +140,16 @@ pub enum LiveClientMsg {
         resume: Option<LiveResume>,
         /// The last log position the client applied, when reconnecting.
         seen: Option<Seq>,
-        /// Whether this host can write checkpoint bytes now.
+        /// Whether this host can write checkpoint bytes now. An older client that leaves it out
+        /// cannot.
+        #[serde(default)]
         can_checkpoint: bool,
-        /// The kind of editor build running on this host.
+        /// The kind of editor build running on this host; [`LiveBuild::Browser`] when left out.
+        #[serde(default)]
         build: LiveBuild,
-        /// The last local number in a returning client's saved batch, if any.
+        /// The last local number in a returning client's saved batch, if any. Left out, the
+        /// client is not returning.
+        #[serde(default)]
         returning_through: Option<LocalNo>,
     },
     /// Propose a change.
@@ -170,7 +180,8 @@ pub enum LiveClientMsg {
         /// A lowercase hexadecimal SHA-256 digest of entered content.
         entered: String,
     },
-    /// Checkpoint bytes for a ticket are ready to upload.
+    /// Checkpoint bytes for a ticket are ready to upload. Accepted for compatibility and ignored:
+    /// the server acts on the upload itself (`PUT /api/docs/{id}/live-checkpoint`).
     CheckpointReady {
         /// The one-use checkpoint ticket.
         ticket: Uuid,
@@ -335,16 +346,21 @@ pub enum LiveServerMsg {
         /// Why this checkpoint is a major version, when it is one.
         major: Option<MajorReason>,
     },
-    /// New changes are paused because the unsaved log reached a hard limit.
+    /// New changes wait: the unsaved log reached a hard limit, or a major version is being
+    /// stored at the head. The client holds its queued changes until
+    /// [`LiveServerMsg::ChangesResumed`]. A join is told this before its catch-up.
     ChangesPaused {
         /// Retained entries in the unsaved log.
         entries: u64,
         /// Retained payload bytes in the unsaved log.
         bytes: u64,
     },
-    /// New changes may be sent again.
+    /// New changes may be sent again. Also sent to every join when nothing holds changes, so a
+    /// client that missed the resume releases its held changes.
     ChangesResumed,
-    /// The checkpoint before a returning client's saved batch is durable.
+    /// The checkpoint before a returning client's saved batch is durable. Sent again on every
+    /// later join of that client that names the batch, so a copy lost with the connection is
+    /// not the last; a client that holds no such batch ignores it.
     ReturnReady {
         /// The last local number in the saved batch that may now be sent.
         through: LocalNo,
@@ -490,11 +506,11 @@ pub enum RefusedReason {
     BaseAhead,
     /// The change's `local` number is not the next one expected from this client.
     OutOfOrder,
-    /// Changes are paused: the unsaved log is at its limit until a checkpoint is verified (or
-    /// accepted from a sole editor), or a major version is being stored at the head (see
-    /// [`LiveServerMsg::ChangesPaused`]). The change is not in the log.
+    /// Changes were paused at the log's limit. Sent by servers before G4's final fixes, and
+    /// still read from changes they stored; a current server answers [`RefusedReason::Held`].
     LogPaused,
-    /// Not refused for good: changes wait while a major version is stored at the head. The
+    /// Not refused for good: changes wait while a major version is stored at the head or while
+    /// the unsaved log is at its limit. The
     /// local number is not used up; the client sends the change, and those after it, again once
     /// [`LiveServerMsg::ChangesResumed`] arrives.
     Held,
@@ -964,5 +980,71 @@ mod tests {
             }
         );
         assert!(!shown.contains(secret), "{shown}");
+    }
+
+    /// An older client (G2/G3) names none of the checkpoint or return fields: it joins as a
+    /// browser that cannot checkpoint and is not returning.
+    #[test]
+    fn an_older_join_without_the_new_fields_is_read_with_defaults() {
+        let old = "{\"type\":\"live_join\",\"client\":\"00000000-0000-0000-0000-000000000001\",\
+                   \"protocol\":1,\"format\":\"gridcraft/1\",\"resume\":null,\"seen\":null}";
+        let join: LiveClientMsg = serde_json::from_str(old).unwrap();
+        assert_eq!(
+            join,
+            LiveClientMsg::LiveJoin {
+                client: ClientId(Uuid::from_u128(1)),
+                protocol: LIVE_PROTOCOL,
+                format: "gridcraft/1".into(),
+                resume: None,
+                seen: None,
+                can_checkpoint: false,
+                build: LiveBuild::Browser,
+                returning_through: None,
+            }
+        );
+    }
+
+    #[test]
+    fn refusal_ticket_and_reason_names_are_pinned() {
+        for (reason, name) in [
+            (RefusedReason::ReadOnly, "read_only"),
+            (RefusedReason::WrongFormat, "wrong_format"),
+            (RefusedReason::TooLarge, "too_large"),
+            (RefusedReason::RateLimited, "rate_limited"),
+            (RefusedReason::BaseAhead, "base_ahead"),
+            (RefusedReason::OutOfOrder, "out_of_order"),
+            (RefusedReason::LogPaused, "log_paused"),
+            (RefusedReason::Held, "held"),
+        ] {
+            assert_eq!(serde_json::to_value(reason).unwrap(), name);
+        }
+        for (purpose, name) in [
+            (TicketPurpose::Write, "write"),
+            (TicketPurpose::Verify, "verify"),
+        ] {
+            assert_eq!(serde_json::to_value(purpose).unwrap(), name);
+        }
+        for (reason, name) in [
+            (UnavailableReason::LogOverLimit, "log_over_limit"),
+            (UnavailableReason::CheckpointDispute, "checkpoint_dispute"),
+        ] {
+            assert_eq!(serde_json::to_value(reason).unwrap(), name);
+        }
+        for (reason, name) in [
+            (
+                MajorReason::ReturningClientBefore,
+                "returning_client_before",
+            ),
+            (MajorReason::ReturningClientAfter, "returning_client_after"),
+            (MajorReason::OutsideReplacement, "outside_replacement"),
+            (
+                MajorReason::ReturningClientArchive,
+                "returning_client_archive",
+            ),
+            (MajorReason::DisputedCopy, "disputed_copy"),
+        ] {
+            assert_eq!(serde_json::to_value(reason).unwrap(), name);
+        }
+        assert_eq!(AGREEMENT_EVERY, 64);
     }
 }

@@ -737,7 +737,7 @@ impl Db {
                     major_reason, major_person, writer_participant, writer_client, \
                     sole_editor_at \
              from live_checkpoints where document_id = $1 and verified_at is not null \
-             order by through desc limit 1",
+             order by through desc, verified_at desc, created_at desc, revision desc limit 1",
         )
         .bind(doc.0)
         .fetch_optional(&mut *tx)

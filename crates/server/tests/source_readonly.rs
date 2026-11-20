@@ -1251,7 +1251,12 @@ impl Env {
             Act::LiveHash => (
                 Method::POST,
                 format!("/api/docs/{}/live-checkpoint/hash", fx.item("sheet.xlsx")),
-                json!({ "ticket": Uuid::new_v4(), "at": 0, "sha256": "ab".repeat(32) }),
+                json!({
+                    "ticket": Uuid::new_v4(),
+                    "at": 0,
+                    "sha256": "ab".repeat(32),
+                    "session_sha256": "cd".repeat(32),
+                }),
             ),
             Act::RenameFolder => (
                 Method::PATCH,

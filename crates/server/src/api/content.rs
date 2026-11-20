@@ -88,8 +88,12 @@ pub(crate) struct LiveCheckpointQuery {
 pub(crate) struct LiveHashBody {
     ticket: Uuid,
     at: u64,
-    /// 64 lowercase hexadecimal digits.
+    /// The SHA-256 of the checkpoint file bytes the verifier wrote: 64 lowercase hexadecimal
+    /// digits.
     sha256: String,
+    /// The SHA-256 of the session (identity) data the verifier would upload with those bytes,
+    /// in the same form. Required: a hash without it verifies nothing.
+    session_sha256: String,
 }
 
 /// The request header giving how many leading body bytes are the editor's session data.
@@ -836,18 +840,8 @@ pub(crate) async fn live_checkpoint(
         None => None,
     };
     let at = Seq(query.at);
-    let link = state.rooms().live_link(doc).ok_or(ApiError::Forbidden)?;
-    let (reply, answer) = oneshot::channel();
-    let claim = LiveCommand::CheckpointClaim {
-        user,
-        ticket: query.ticket,
-        at,
-        base: base.clone(),
-        reply,
-    };
-    if link.commands.send(claim).await.is_err() || !answer.await.unwrap_or(false) {
-        return Err(ApiError::Forbidden);
-    }
+    // The lengths are read before the ticket is claimed, so a request refused for them does not
+    // use the ticket up.
     let session_length = match headers.get(SESSION_DATA_HEADER) {
         None => 0,
         Some(value) => value
@@ -869,6 +863,22 @@ pub(crate) async fn live_checkpoint(
             || length.saturating_sub(session_bytes) > state.config().max_file_bytes
     }) {
         return Err(ApiError::TooLarge);
+    }
+    // The most bytes this upload can bring, which sets the claimed ticket's deadline.
+    let length =
+        declared.unwrap_or_else(|| state.config().max_file_bytes.saturating_add(session_bytes));
+    let link = state.rooms().live_link(doc).ok_or(ApiError::Forbidden)?;
+    let (reply, answer) = oneshot::channel();
+    let claim = LiveCommand::CheckpointClaim {
+        user,
+        ticket: query.ticket,
+        at,
+        base: base.clone(),
+        length,
+        reply,
+    };
+    if link.commands.send(claim).await.is_err() || !answer.await.unwrap_or(false) {
+        return Err(ApiError::Forbidden);
     }
     let site = site_of(&state, doc.into()).await?;
     room_for_body(&state, site, &headers).await?;
@@ -913,8 +923,9 @@ pub(crate) async fn live_checkpoint(
     Ok(live_answer(reply))
 }
 
-/// `POST /api/docs/{id}/live-checkpoint/hash` with `{ticket, at, sha256}`: the SHA-256 of the
-/// bytes a verifying participant wrote independently for its verify ticket. Refused like an
+/// `POST /api/docs/{id}/live-checkpoint/hash` with `{ticket, at, sha256, session_sha256}`: the
+/// SHA-256 of the bytes a verifying participant wrote independently for its verify ticket, and
+/// of the session data it would upload with them; both must match. Refused like an
 /// upload (`403`, `404`) unless the ticket is the caller's, unused and unexpired for exactly
 /// this position; `202` once the room has compared it with the stored checkpoint (a match
 /// verifies it, a mismatch keeps it unverified and asks the caller for its own bytes); `503`
@@ -939,6 +950,7 @@ pub(crate) async fn live_checkpoint_hash(
     // A hash can lead to major versions being stored: refused in a connected library.
     super::nodes::require_not_connected(state.db(), doc.into()).await?;
     let sha256 = parse_sha256(&body.sha256).ok_or(ApiError::BadRequest)?;
+    let session_sha256 = parse_sha256(&body.session_sha256).ok_or(ApiError::BadRequest)?;
     let link = state.rooms().live_link(doc).ok_or(ApiError::Forbidden)?;
     let (reply, answer) = oneshot::channel();
     let hash = LiveCommand::CheckpointHash {
@@ -946,6 +958,7 @@ pub(crate) async fn live_checkpoint_hash(
         ticket: body.ticket,
         at: Seq(body.at),
         sha256,
+        session_sha256,
         reply,
     };
     if link.commands.send(hash).await.is_err() {

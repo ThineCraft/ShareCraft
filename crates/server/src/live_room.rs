@@ -55,10 +55,13 @@ pub(crate) const CHECKPOINT_QUIET: Duration = Duration::from_secs(15);
 pub(crate) const CHECKPOINT_WAIT: Duration = Duration::from_secs(120);
 /// A checkpoint ticket is one-use and expires after two minutes.
 pub(crate) const TICKET_LIFETIME: Duration = Duration::from_secs(120);
+/// A claimed write ticket's upload is given at least this rate: its deadline is the ticket's
+/// lifetime plus the upload's most bytes at this rate (64 KiB/s).
+pub(crate) const UPLOAD_FLOOR_BYTES_PER_SECOND: u64 = 64 * 1024;
 /// The largest editor identity table stored with a checkpoint.
 pub(crate) const MAX_SESSION_DATA_BYTES: usize = 8 * 1024 * 1024;
 /// Editors report their entered digest at every position that is a multiple of this.
-pub(crate) const AGREEMENT_EVERY: u64 = 64;
+pub(crate) const AGREEMENT_EVERY: u64 = protocol::live::AGREEMENT_EVERY;
 /// Agreement positions compared at once; the oldest goes first.
 const MAX_AGREEMENT_BUCKETS: usize = 128;
 /// Reports kept for one agreement position.
@@ -237,11 +240,14 @@ pub(crate) enum LiveCommand {
         ticket: Uuid,
     },
     /// Uses the write ticket `ticket` before its upload body is read; answers whether it may.
+    /// `length` is the most bytes the upload can bring (its declared length, else the largest
+    /// allowed): the claimed ticket's deadline gives it time at [`UPLOAD_FLOOR_BYTES_PER_SECOND`].
     CheckpointClaim {
         user: UserId,
         ticket: Uuid,
         at: Seq,
         base: Option<RevisionId>,
+        length: u64,
         reply: oneshot::Sender<bool>,
     },
     /// Stores the uploaded checkpoint `blob` (in the content store) with its session data.
@@ -254,12 +260,14 @@ pub(crate) enum LiveCommand {
         session_data: Vec<u8>,
         reply: oneshot::Sender<LiveCheckpointReply>,
     },
-    /// A verify ticket's independently written hash.
+    /// A verify ticket's independently written hashes: of the file bytes, and of the editor's
+    /// session (identity) data that would go with them.
     CheckpointHash {
         user: UserId,
         ticket: Uuid,
         at: Seq,
         sha256: [u8; 32],
+        session_sha256: [u8; 32],
         reply: oneshot::Sender<LiveCheckpointReply>,
     },
     /// A checkpoint write, run off the room task, has finished.
@@ -584,6 +592,12 @@ pub(crate) struct LiveRoom<S: LiveStore> {
     /// The base accepted from a sole editor and not yet verified by a second one: its
     /// revision, position, hash and writer's client.
     sole_base: Option<(String, Seq, [u8; 32], Option<ClientId>)>,
+    /// The build of the sole base's writer, when this room saw it; only a place on the same
+    /// build verifies it.
+    sole_base_build: Option<LiveBuild>,
+    /// The SHA-256 of each unverified checkpoint's session (identity) data, and of a sole
+    /// editor's base: a verifier's hash of its own session data must match it too.
+    session_hashes: HashMap<String, [u8; 32]>,
     /// Past a warning threshold, the one urgent checkpoint was asked for.
     urgent_asked: bool,
     /// When an over-limit join was last refused; the event is recorded once per room.
@@ -893,10 +907,25 @@ impl<S: LiveStore> LiveRoom<S> {
                 })
             })
             .collect::<HashMap<_, _>>();
+        let mut session_hashes = HashMap::new();
+        if let Some(checkpoint) = loaded
+            .verified_checkpoint
+            .as_ref()
+            .filter(|checkpoint| checkpoint.sole_editor)
+        {
+            session_hashes.insert(
+                checkpoint.revision.clone(),
+                session_sha256(&checkpoint.session_data),
+            );
+        }
         let unverified_checkpoints = loaded
             .unverified_checkpoints
             .into_iter()
             .map(|mut checkpoint| {
+                session_hashes.insert(
+                    checkpoint.revision.clone(),
+                    session_sha256(&checkpoint.session_data),
+                );
                 checkpoint.session_data = Vec::new();
                 checkpoint
             })
@@ -960,6 +989,8 @@ impl<S: LiveStore> LiveRoom<S> {
                         checkpoint.writer.map(|writer| writer.client),
                     )
                 }),
+            sole_base_build: None,
+            session_hashes,
             urgent_asked: false,
             over_limit_refused: None,
             pending_reconcile: None,
@@ -1139,13 +1170,25 @@ impl<S: LiveStore> LiveRoom<S> {
                 ticket,
                 at,
                 base,
+                length,
                 reply,
             } => {
+                // From now on the deadline is the upload's: the lifetime again, plus its most
+                // bytes at the floor rate.
+                let upload_time = self
+                    .timing
+                    .ticket_lifetime
+                    .saturating_add(Duration::from_secs(
+                        length.div_ceil(UPLOAD_FLOOR_BYTES_PER_SECOND),
+                    ));
                 let claimed = self
                     .usable_ticket(user, ticket, at, base.as_ref(), TicketPurpose::Write)
                     .and_then(|index| self.tickets.get_mut(index))
                     .filter(|held| !held.claimed)
-                    .map(|held| held.claimed = true)
+                    .map(|held| {
+                        held.claimed = true;
+                        held.expires = Instant::now() + upload_time;
+                    })
                     .is_some();
                 let _ = reply.send(claimed);
                 Ok(())
@@ -1167,8 +1210,12 @@ impl<S: LiveStore> LiveRoom<S> {
                 ticket,
                 at,
                 sha256,
+                session_sha256,
                 reply,
-            } => match self.checkpoint_hash(user, ticket, at, sha256).await {
+            } => match self
+                .checkpoint_hash(user, ticket, at, sha256, session_sha256)
+                .await
+            {
                 Ok(answer) => {
                     let _ = reply.send(answer);
                     Ok(())
@@ -1204,26 +1251,65 @@ impl<S: LiveStore> LiveRoom<S> {
                 && held.at == at
                 && (purpose == TicketPurpose::Verify || held.base == base)
                 && held.expires > now
-                && self.place_can_checkpoint(held.participant, held.client)
+                && match purpose {
+                    TicketPurpose::Write => {
+                        self.place_can_checkpoint(held.participant, held.client)
+                    }
+                    TicketPurpose::Verify => self.place_can_verify(held.participant, held.client),
+                }
         })
     }
 
-    /// Whether `participant` holds its place for `client`, may edit and is connected.
-    fn place_can_checkpoint(&self, participant: ParticipantNo, client: ClientId) -> bool {
+    /// Whether `participant` holds its place for `client`, may edit, can checkpoint and is
+    /// connected, exclusions aside.
+    fn place_capable(&self, participant: ParticipantNo, client: ClientId) -> bool {
         self.session
             .as_ref()
             .and_then(|session| session.places.get(&participant))
             .is_some_and(|place| {
-                place.held
-                    && place.can_edit
-                    && place.can_checkpoint
-                    && place.client == client
-                    && !self.excluded(place.user)
+                place.held && place.can_edit && place.can_checkpoint && place.client == client
             })
             && self
                 .members
                 .iter()
                 .any(|member| member.client == client && member.role.can_edit())
+    }
+
+    /// The person and build of `participant`'s place.
+    fn place_of(&self, participant: ParticipantNo) -> Option<(UserId, LiveBuild)> {
+        self.session
+            .as_ref()
+            .and_then(|session| session.places.get(&participant))
+            .map(|place| (place.user, place.build))
+    }
+
+    /// Whether `participant` may write a checkpoint: capable, and not excluded after a repeat
+    /// dispute unless no capable editor who is not excluded is present (a room is never left
+    /// without a writer).
+    fn place_can_checkpoint(&self, participant: ParticipantNo, client: ClientId) -> bool {
+        self.place_capable(participant, client)
+            && self.place_of(participant).is_some_and(|(user, _)| {
+                !self.excluded(user) || !self.unexcluded_writer_present(user)
+            })
+    }
+
+    /// Whether `participant` may verify a checkpoint: capable and not excluded.
+    fn place_can_verify(&self, participant: ParticipantNo, client: ClientId) -> bool {
+        self.place_capable(participant, client)
+            && self
+                .place_of(participant)
+                .is_some_and(|(user, _)| !self.excluded(user))
+    }
+
+    /// Whether a capable editor other than `except`, and not excluded, is present.
+    fn unexcluded_writer_present(&self, except: UserId) -> bool {
+        self.session.as_ref().is_some_and(|session| {
+            session.places.iter().any(|(participant, place)| {
+                place.user != except
+                    && !self.excluded(place.user)
+                    && self.place_capable(*participant, place.client)
+            })
+        })
     }
 
     /// Removes the tickets `which` picks; `missed` counts them against their holders, so the
@@ -1307,7 +1393,7 @@ impl<S: LiveStore> LiveRoom<S> {
 
     /// Eligible ticket holders, best first: connected editors whose host can checkpoint and
     /// who hold no ticket, fewest missed tickets first, then (for a write) not the last
-    /// writer, (for a verify) the other build kind than `writer_build`, then by number.
+    /// writer, (for a verify) the same build kind as `writer_build`, then by number.
     fn ticket_candidates(
         &self,
         exclude: Option<ParticipantNo>,
@@ -1332,7 +1418,7 @@ impl<S: LiveStore> LiveRoom<S> {
                     (
                         self.ticket_misses.get(participant).copied().unwrap_or(0),
                         Some(*participant) == self.last_writer,
-                        writer_build.is_some_and(|build| build == place.build),
+                        writer_build.is_some_and(|build| build != place.build),
                         *participant,
                     ),
                     (*participant, place.client, place.user),
@@ -1587,27 +1673,38 @@ impl<S: LiveStore> LiveRoom<S> {
             })
     }
 
-    /// The editor to verify `revision`: never its writer, a writer whose checkpoint was
-    /// disputed, a verifier that lapsed or one that disagreed with it.
+    /// The editor to verify `revision`: never its writer's person (any of their tabs), a person
+    /// excluded after a repeat dispute, a verifier that lapsed or one that disagreed with it;
+    /// and only a place on the writer's build, since the bytes carry computed values. With
+    /// none, the checkpoint stays unverified and the sole-editor rule applies.
     fn verifier_for(&self, revision: &str) -> Option<(ParticipantNo, ClientId, UserId)> {
         let writer = self.checkpoint_writers.get(revision).copied();
-        let writer_client = writer.map(|writer| writer.client).or_else(|| {
-            self.sole_base
-                .as_ref()
-                .filter(|(base, _, _, _)| base == revision)
-                .and_then(|(_, _, _, client)| *client)
-        });
+        let sole = self
+            .sole_base
+            .as_ref()
+            .filter(|(base, _, _, _)| base == revision);
+        let writer_client = writer
+            .map(|writer| writer.client)
+            .or_else(|| sole.and_then(|(_, _, _, client)| *client));
+        let writer_user = writer_client.and_then(|client| self.user_of(client));
+        let writer_build = match writer {
+            Some(writer) => writer.build,
+            None => sole.and(self.sole_base_build),
+        };
         let not_asked = self.not_asked.get(revision);
-        self.ticket_candidates(
-            writer.map(|writer| writer.participant),
-            writer.and_then(|writer| writer.build),
-        )
-        .into_iter()
-        .find(|(participant, client, _)| {
-            writer_client.is_none_or(|writer| writer != *client)
-                && !self.lapsed.contains(participant)
-                && not_asked.is_none_or(|set| !set.contains(participant))
-        })
+        self.ticket_candidates(writer.map(|writer| writer.participant), writer_build)
+            .into_iter()
+            .find(|(participant, client, user)| {
+                writer_client.is_none_or(|writer| writer != *client)
+                    && writer_user.is_none_or(|writer| writer != *user)
+                    && self.place_can_verify(*participant, *client)
+                    && writer_build.is_none_or(|build| {
+                        self.place_of(*participant)
+                            .is_some_and(|(_, place)| place == build)
+                    })
+                    && !self.lapsed.contains(participant)
+                    && not_asked.is_none_or(|set| !set.contains(participant))
+            })
     }
 
     /// At a hard limit with no second capable editor to verify the newest checkpoint, it is
@@ -1630,11 +1727,13 @@ impl<S: LiveStore> LiveRoom<S> {
         else {
             return Ok(());
         };
-        let writer_client = self
-            .checkpoint_writers
-            .get(&target.revision)
-            .map(|writer| writer.client);
-        if self.dispute.is_some() || self.other_capable_present(writer_client) {
+        let target_writer = self.checkpoint_writers.get(&target.revision).copied();
+        if self.dispute.is_some()
+            || self.other_capable_present(
+                target_writer.map(|writer| writer.client),
+                target_writer.and_then(|writer| writer.build),
+            )
+        {
             return Ok(());
         }
         self.store
@@ -1663,22 +1762,29 @@ impl<S: LiveStore> LiveRoom<S> {
             target.sha256,
             writer.map(|writer| writer.client),
         ));
+        self.sole_base_build = writer.and_then(|writer| writer.build);
         self.settle_base(target.revision, target.through);
         Ok(())
     }
 
-    /// Whether a capable editor other than the writer's client holds a place: connected or
-    /// within its reconnect grace, holding a ticket or lapsed alike. Only with none is a sole
-    /// editor's checkpoint accepted.
-    fn other_capable_present(&self, writer: Option<ClientId>) -> bool {
+    /// Whether a capable editor who could verify the writer's checkpoint holds a place: another
+    /// person (not the writer's other tab), not excluded, on the writer's build when it is
+    /// known, connected or within its reconnect grace, holding a ticket or lapsed alike. Only
+    /// with none is a sole editor's checkpoint accepted.
+    fn other_capable_present(&self, writer: Option<ClientId>, build: Option<LiveBuild>) -> bool {
+        let writer_user = writer.and_then(|client| self.user_of(client));
         self.session.as_ref().is_some_and(|session| {
             session.places.values().any(|place| {
                 // A place loaded after a restart counts until its editor joins again and says
                 // what it can do.
                 place.held
-                    && (place.sign_in.is_none() || (place.can_edit && place.can_checkpoint))
+                    && (place.sign_in.is_none()
+                        || (place.can_edit
+                            && place.can_checkpoint
+                            && build.is_none_or(|build| build == place.build)))
                     && !self.excluded(place.user)
                     && writer.is_none_or(|writer| writer != place.client)
+                    && writer_user.is_none_or(|writer| writer != place.user)
             })
         })
     }
@@ -1690,6 +1796,7 @@ impl<S: LiveStore> LiveRoom<S> {
             .dispute_live_checkpoint(self.doc, revision, OffsetDateTime::now_utc())
             .await?;
         self.checkpoint_writers.remove(revision);
+        self.session_hashes.remove(revision);
         self.unverified_checkpoints
             .retain(|checkpoint| checkpoint.revision != revision);
         self.not_asked.remove(revision);
@@ -1974,7 +2081,7 @@ impl<S: LiveStore> LiveRoom<S> {
                 self.checkpoint_stored(
                     revision.clone(),
                     at,
-                    sha256,
+                    (sha256, session_sha256(&session_data)),
                     session,
                     user,
                     (held.participant, held.client),
@@ -2184,7 +2291,7 @@ impl<S: LiveStore> LiveRoom<S> {
         &mut self,
         revision: String,
         at: Seq,
-        sha256: [u8; 32],
+        (sha256, session_sha): ([u8; 32], [u8; 32]),
         session: Uuid,
         user: UserId,
         (participant, client): (ParticipantNo, ClientId),
@@ -2192,6 +2299,7 @@ impl<S: LiveStore> LiveRoom<S> {
     ) {
         self.saved_through = self.saved_through.max(at);
         self.checkpoint_base = Some(revision.clone());
+        self.session_hashes.insert(revision.clone(), session_sha);
         self.last_writer = Some(participant);
         self.ticket_misses.remove(&participant);
         self.unverified_checkpoints
@@ -2275,6 +2383,7 @@ impl<S: LiveStore> LiveRoom<S> {
         });
         for revision in dropped {
             self.checkpoint_writers.remove(&revision);
+            self.session_hashes.remove(&revision);
             self.not_asked.remove(&revision);
             self.cancel_tickets(
                 |held| held.verifies.as_deref() == Some(revision.as_str()),
@@ -2296,6 +2405,7 @@ impl<S: LiveStore> LiveRoom<S> {
         ticket: Uuid,
         at: Seq,
         sha256: [u8; 32],
+        session_sha256: [u8; 32],
     ) -> Result<LiveCheckpointReply, RoomFailed> {
         let Some(index) = self.usable_ticket(user, ticket, at, None, TicketPurpose::Verify) else {
             return Ok(LiveCheckpointReply::Refused);
@@ -2308,11 +2418,15 @@ impl<S: LiveStore> LiveRoom<S> {
             .checkpoint_writers
             .get(&revision)
             .is_some_and(|writer| {
-                writer.participant == held.participant || writer.client == held.client
+                writer.participant == held.participant
+                    || writer.client == held.client
+                    || self.user_of(writer.client) == Some(held.user)
             })
         {
             return Ok(LiveCheckpointReply::Refused);
         }
+        // The identity data must match as well as the file: either mismatch is a dispute.
+        let session_matches = self.session_hashes.get(&revision) == Some(&session_sha256);
         let Some(stored) = self
             .unverified_checkpoints
             .iter()
@@ -2325,7 +2439,7 @@ impl<S: LiveStore> LiveRoom<S> {
             {
                 // A second editor re-derived a sole editor's base.
                 self.sole_base = None;
-                if base_sha == sha256 {
+                if base_sha == sha256 && session_matches {
                     self.store
                         .confirm_live_sole_editor(self.doc, &revision)
                         .await?;
@@ -2377,7 +2491,7 @@ impl<S: LiveStore> LiveRoom<S> {
         if at <= self.verified_through {
             return Ok(LiveCheckpointReply::Accepted);
         }
-        if stored == sha256 {
+        if stored == sha256 && session_matches {
             self.store
                 .verify_live_checkpoint(self.doc, &revision, at, OffsetDateTime::now_utc())
                 .await?;
@@ -2581,6 +2695,9 @@ impl<S: LiveStore> LiveRoom<S> {
             .collect::<BTreeSet<_>>();
         self.checkpoint_writers
             .retain(|revision, _| kept.contains(revision));
+        let sole = self.sole_base.as_ref().map(|(revision, _, _, _)| revision);
+        self.session_hashes
+            .retain(|revision, _| kept.contains(revision) || Some(revision) == sole);
         self.not_asked.retain(|revision, _| kept.contains(revision));
         self.cancel_tickets(
             |held| held.purpose == TicketPurpose::Verify && held.at <= at,
@@ -2803,7 +2920,7 @@ impl<S: LiveStore> LiveRoom<S> {
             self.checkpoint_stored(
                 pending.revision.clone(),
                 pending.at,
-                pending.sha256,
+                (pending.sha256, session_sha256(&pending.session_data)),
                 pending.session,
                 pending.user,
                 (pending.participant, pending.client),
@@ -3262,6 +3379,13 @@ impl<S: LiveStore> LiveRoom<S> {
                     });
                 }
             }
+        } else if let (Some(through), true) = (request.returning_through, can_edit_now)
+            && !self.return_waits(request.client)
+        {
+            // A later join of a client whose barrier has opened (or ended): the `return_ready`
+            // sent when it opened may have been lost with the connection, so it is sent again.
+            // A client holding no such batch ignores it.
+            ready_frame = Some(encode(&LiveServerMsg::ReturnReady { through }));
         }
         let from = request
             .seen
@@ -3280,6 +3404,16 @@ impl<S: LiveStore> LiveRoom<S> {
             people: self.people(),
         })];
         frames.extend(archive_frame);
+        // Before the catch-up, so the client never sends into a hold; when nothing holds, a
+        // client that missed the resume is released.
+        frames.push(encode(&if self.paused || self.holding() {
+            LiveServerMsg::ChangesPaused {
+                entries: self.unsaved_entries,
+                bytes: self.unsaved_bytes,
+            }
+        } else {
+            LiveServerMsg::ChangesResumed
+        }));
         frames.push(encode(&LiveServerMsg::Catchup {
             base: self.verified_through,
             revision: self.base_revision.clone(),
@@ -3297,12 +3431,6 @@ impl<S: LiveStore> LiveRoom<S> {
                 }),
         );
         frames.extend(ready_frame);
-        if self.paused || self.holding() {
-            frames.push(encode(&LiveServerMsg::ChangesPaused {
-                entries: self.unsaved_entries,
-                bytes: self.unsaved_bytes,
-            }));
-        }
         let _ = self
             .members
             .send(Some(request.client), &Outbound::Many(frames));
@@ -3370,7 +3498,7 @@ impl<S: LiveStore> LiveRoom<S> {
             .get(&client)
             .is_some_and(|first| local.0 > *first)
         {
-            if self.holding() || self.return_waits(client) {
+            if self.holding() || self.paused || self.return_waits(client) {
                 // Sent before the client heard that its earlier change was held: it sends
                 // this again, in order, once changes resume.
                 return Ok(());
@@ -3417,6 +3545,15 @@ impl<S: LiveStore> LiveRoom<S> {
         } else {
             None
         };
+        if reason == Some(RefusedReason::LogPaused) {
+            // The log is at its limit: the change waits like any held change, its number not
+            // used up, and the client sends it again once changes resume. Nothing a person saw
+            // is rolled back.
+            self.pause();
+            self.held_from.insert(client, local.0);
+            self.refuse(client, local, RefusedReason::Held);
+            return Ok(());
+        }
         if let Some(reason) = reason {
             // A rate refusal is not written down, so a flood costs the database nothing; the
             // number is still used up in this room.
@@ -3428,9 +3565,6 @@ impl<S: LiveStore> LiveRoom<S> {
             }
             self.advance_local(client, user, local);
             self.refuse(client, local, reason);
-            if reason == RefusedReason::LogPaused {
-                self.pause();
-            }
             self.note_return_local(client, local);
             return Ok(());
         }
@@ -3517,10 +3651,13 @@ impl<S: LiveStore> LiveRoom<S> {
                     .is_some_and(|since| since + RETURN_BATCH_LIMIT <= now)
             {
                 barrier.stage = ReturnStage::After;
-                stuck.push(barrier.client);
+                stuck.push((barrier.client, barrier.through));
             }
         }
-        for client in stuck {
+        for (client, through) in stuck {
+            // Its `return_ready` may never have arrived: told again before the resync.
+            let frame = encode(&LiveServerMsg::ReturnReady { through });
+            let _ = self.members.send(Some(client), &Outbound::One(frame));
             self.send_resync(client);
         }
     }
@@ -3767,6 +3904,7 @@ impl<S: LiveStore> LiveRoom<S> {
         self._base_session_data = Vec::new();
         self.unverified_checkpoints.clear();
         self.checkpoint_writers.clear();
+        self.session_hashes.clear();
         self.not_asked.clear();
         self.dispute = None;
         self.pending_reconcile = None;
@@ -4659,6 +4797,12 @@ fn major_point(major: Option<MajorTicket>) -> Option<(&'static str, UserId)> {
 /// Whether a kept log of `entries` and `bytes` is beyond what was stored under `limits`. Paused
 /// traffic is allowed for: cancel records (at most one per change) may take the log past the
 /// hard limits by one record per change allowed.
+/// The SHA-256 of a checkpoint's session (identity) data, as a verifier reports it.
+fn session_sha256(session_data: &[u8]) -> [u8; 32] {
+    use sha2::Digest;
+    sha2::Sha256::digest(session_data).into()
+}
+
 fn beyond_limits(limits: crate::config::LiveLimits, entries: u64, bytes: u64) -> bool {
     entries > limits.hard_entries.saturating_mul(2)
         || bytes
@@ -4773,6 +4917,8 @@ mod tests {
         participant: ParticipantNo,
         place: Place,
         initial: Vec<LiveServerMsg>,
+        /// The join's own frames exactly as sent, `changes_resumed` included.
+        raw: Vec<LiveServerMsg>,
         /// Frames sent right after the join's own, such as a checkpoint ticket.
         after_join: Vec<LiveServerMsg>,
     }
@@ -4969,6 +5115,7 @@ mod tests {
             participant: ParticipantNo(0),
             place: Place::New,
             initial: Vec::new(),
+            raw: Vec::new(),
             after_join: Vec::new(),
         };
         let first = recv_messages(&mut joined.rx).await;
@@ -4980,18 +5127,29 @@ mod tests {
                     place,
                     ..
                 },
-                LiveServerMsg::Catchup { .. },
                 ..,
-            ] => {
+            ] if first
+                .iter()
+                .any(|frame| matches!(frame, LiveServerMsg::Catchup { .. })) =>
+            {
                 joined.session = *session;
                 joined.participant = *participant;
                 joined.place = *place;
             }
             other => panic!("unexpected join frames: {other:?}"),
         }
-        joined.initial = first;
+        joined.raw.clone_from(&first);
+        joined.initial = without_resumed(first);
         joined.after_join = drain(&mut joined.rx);
         joined
+    }
+
+    /// Join frames without the `changes_resumed` every join carries when nothing holds.
+    fn without_resumed(frames: Vec<LiveServerMsg>) -> Vec<LiveServerMsg> {
+        frames
+            .into_iter()
+            .filter(|frame| *frame != LiveServerMsg::ChangesResumed)
+            .collect()
     }
 
     async fn entry<S: crate::live_store::LiveStore>(
@@ -5939,6 +6097,7 @@ mod tests {
             ticket,
             at,
             base: None,
+            length: 3,
             reply,
         })
         .await
@@ -5988,7 +6147,7 @@ mod tests {
         let (mut room, _) = room().await;
         let mut viewer = join_capable(&mut room, 1, 1, "viewer", LiveBuild::Browser).await;
         let mut incapable = join_as(&mut room, 2, 2, 22, "editor", FORMAT, None, None).await;
-        let mut capable = join_capable(&mut room, 3, 3, "editor", LiveBuild::Desktop).await;
+        let mut capable = join_capable(&mut room, 3, 3, "editor", LiveBuild::Browser).await;
         entry(&mut room, &incapable, 1, 0, FORMAT, "one".into())
             .await
             .unwrap();
@@ -6043,7 +6202,7 @@ mod tests {
     async fn ticket_is_cancelled_on_expiry_and_role_loss() {
         let (mut room, _) = room().await;
         let mut ann = join_capable(&mut room, 1, 1, "editor", LiveBuild::Browser).await;
-        let mut bob = join_capable(&mut room, 2, 2, "editor", LiveBuild::Desktop).await;
+        let mut bob = join_capable(&mut room, 2, 2, "editor", LiveBuild::Browser).await;
         entry(&mut room, &ann, 1, 0, FORMAT, "one".into())
             .await
             .unwrap();
@@ -6207,7 +6366,7 @@ mod tests {
             .await
             .unwrap();
         let mut ann = join_capable(&mut room, 1, 1, "editor", LiveBuild::Browser).await;
-        let mut bob = join_capable(&mut room, 2, 2, "editor", LiveBuild::Desktop).await;
+        let mut bob = join_capable(&mut room, 2, 2, "editor", LiveBuild::Browser).await;
         entry(&mut room, &ann, 1, 0, FORMAT, "one".into())
             .await
             .unwrap();
@@ -6312,6 +6471,12 @@ mod tests {
         })
     }
 
+    /// The SHA-256 of the session data every test upload carries.
+    fn identities_sha() -> [u8; 32] {
+        use sha2::Digest;
+        sha2::Sha256::digest(b"identities").into()
+    }
+
     async fn hash<S: crate::live_store::LiveStore>(
         room: &mut LiveRoom<S>,
         user: UserId,
@@ -6319,12 +6484,24 @@ mod tests {
         at: Seq,
         sha: u8,
     ) -> LiveCheckpointReply {
+        hash_full(room, user, ticket, at, sha, identities_sha()).await
+    }
+
+    async fn hash_full<S: crate::live_store::LiveStore>(
+        room: &mut LiveRoom<S>,
+        user: UserId,
+        ticket: Uuid,
+        at: Seq,
+        sha: u8,
+        session_sha256: [u8; 32],
+    ) -> LiveCheckpointReply {
         let (reply, answer) = oneshot::channel();
         room.handle(LiveCommand::CheckpointHash {
             user,
             ticket,
             at,
             sha256: [sha; 32],
+            session_sha256,
             reply,
         })
         .await
@@ -6376,7 +6553,7 @@ mod tests {
             .await
             .unwrap();
         let mut ann = join_capable(&mut room, 1, 1, "editor", LiveBuild::Browser).await;
-        let mut bob = join_capable(&mut room, 2, 2, "editor", LiveBuild::Desktop).await;
+        let mut bob = join_capable(&mut room, 2, 2, "editor", LiveBuild::Browser).await;
         entry(&mut room, &ann, 1, 0, FORMAT, "one".into())
             .await
             .unwrap();
@@ -6595,17 +6772,15 @@ mod tests {
         assert_eq!(store.entry_count(), 3, "the next change is not stored");
         assert_eq!(room.head, Seq(3));
         let answer = drain(&mut ann.rx);
-        assert_eq!(refusal(&answer), Some(RefusedReason::LogPaused));
+        assert_eq!(refusal(&answer), Some(RefusedReason::Held));
         assert!(entries(answer).is_empty(), "nothing is broadcast");
         assert!(entries(drain(&mut bob.rx)).is_empty());
         assert_eq!(
             crate::live_store::LiveStore::live_local(&store, DocId(id(100)), ann.client, 4)
                 .await
                 .unwrap(),
-            records::LiveLocal::Refused {
-                reason: "log_paused".to_owned()
-            },
-            "its number is used up"
+            records::LiveLocal::Unseen,
+            "held, its number is not used up"
         );
         assert_eq!(
             emitted_kinds(&mut emitted, "live.changes"),
@@ -6627,14 +6802,19 @@ mod tests {
             .await
             .unwrap();
         let answer = drain(&mut ann.rx);
-        assert_eq!(refusal(&answer), Some(RefusedReason::LogPaused));
+        assert_eq!(refusal(&answer), Some(RefusedReason::Held));
         assert_eq!(paused(&answer), Some((2, 8)));
         assert_eq!(store.entry_count(), 2);
-        // Paused: even a change that would fit waits for a checkpoint.
+        // Paused: even a change that would fit waits for a checkpoint. Sent again first, the
+        // held change is held again; a later one waits quietly behind it.
+        entry(&mut room, &ann, 3, 2, FORMAT, "ccc".into())
+            .await
+            .unwrap();
+        assert_eq!(refusal(&drain(&mut ann.rx)), Some(RefusedReason::Held));
         entry(&mut room, &ann, 4, 2, FORMAT, "d".into())
             .await
             .unwrap();
-        assert_eq!(refusal(&drain(&mut ann.rx)), Some(RefusedReason::LogPaused));
+        assert!(refusal(&drain(&mut ann.rx)).is_none());
         assert_eq!(store.entry_count(), 2);
     }
 
@@ -6653,7 +6833,7 @@ mod tests {
         .await
         .unwrap();
         let mut ann = join_capable(&mut room, 1, 1, "editor", LiveBuild::Browser).await;
-        let mut bob = join_capable(&mut room, 2, 2, "editor", LiveBuild::Desktop).await;
+        let mut bob = join_capable(&mut room, 2, 2, "editor", LiveBuild::Browser).await;
         let mut ticket = None;
         for local in 1..=3 {
             entry(&mut room, &ann, local, local - 1, FORMAT, "x".into())
@@ -6781,7 +6961,7 @@ mod tests {
         entry(&mut room, &ann, 4, 3, FORMAT, "x".into())
             .await
             .unwrap();
-        assert_eq!(refusal(&drain(&mut ann.rx)), Some(RefusedReason::LogPaused));
+        assert_eq!(refusal(&drain(&mut ann.rx)), Some(RefusedReason::Held));
         assert_eq!(store.entry_count(), 3, "no entry is lost or counted twice");
     }
 
@@ -7019,7 +7199,7 @@ mod tests {
         );
 
         // Another editor is asked instead.
-        let bob = join_capable(&mut room, 6, 2, "editor", LiveBuild::Desktop).await;
+        let bob = join_capable(&mut room, 6, 2, "editor", LiveBuild::Browser).await;
         let (verify, purpose, at, base) = ticket_full(bob.after_join.clone()).unwrap();
         assert_eq!(
             (purpose, at, base),
@@ -7040,7 +7220,7 @@ mod tests {
             .await
             .unwrap();
         let mut ann = join_capable(&mut room, 1, 1, "editor", LiveBuild::Browser).await;
-        let mut bob = join_capable(&mut room, 2, 2, "editor", LiveBuild::Desktop).await;
+        let mut bob = join_capable(&mut room, 2, 2, "editor", LiveBuild::Browser).await;
         entry(&mut room, &ann, 1, 0, FORMAT, "one".into())
             .await
             .unwrap();
@@ -7128,8 +7308,8 @@ mod tests {
     async fn silent_verifiers_are_not_asked_again_on_later_checkpoints() {
         let (mut room, store) = room().await;
         let mut ann = join_capable(&mut room, 1, 1, "editor", LiveBuild::Browser).await;
-        let mut bob = join_capable(&mut room, 2, 2, "editor", LiveBuild::Desktop).await;
-        let mut cat = join_capable(&mut room, 3, 3, "editor", LiveBuild::Desktop).await;
+        let mut bob = join_capable(&mut room, 2, 2, "editor", LiveBuild::Browser).await;
+        let mut cat = join_capable(&mut room, 3, 3, "editor", LiveBuild::Browser).await;
         let users = [UserId(id(11)), UserId(id(12)), UserId(id(13))];
         let mut verifies = [0; 3];
         let mut writes = Vec::new();
@@ -7217,7 +7397,7 @@ mod tests {
             .await
             .unwrap();
         let mut ann = join_capable(&mut room, 1, 1, "editor", LiveBuild::Browser).await;
-        let mut bob = join_capable(&mut room, 2, 2, "editor", LiveBuild::Desktop).await;
+        let mut bob = join_capable(&mut room, 2, 2, "editor", LiveBuild::Browser).await;
         let mut cat = join_capable(&mut room, 3, 3, "editor", LiveBuild::Browser).await;
         let mallory = UserId(id(99));
         let mut tabs = Vec::new();
@@ -7285,7 +7465,7 @@ mod tests {
         .await
         .unwrap();
         let mut ann = join_capable(&mut room, 1, 1, "editor", LiveBuild::Browser).await;
-        let mut bob = join_capable(&mut room, 2, 2, "editor", LiveBuild::Desktop).await;
+        let mut bob = join_capable(&mut room, 2, 2, "editor", LiveBuild::Browser).await;
         let mut cat = join_capable(&mut room, 3, 3, "editor", LiveBuild::Browser).await;
         for local in 1..=64 {
             entry(&mut room, &ann, local, local - 1, FORMAT, "x".into())
@@ -7350,7 +7530,7 @@ mod tests {
             "the lone checkpoint is current while unverified"
         );
 
-        let cat = join_capable(&mut room, 3, 3, "editor", LiveBuild::Desktop).await;
+        let cat = join_capable(&mut room, 3, 3, "editor", LiveBuild::Browser).await;
         let (verify, purpose, at) = checkpoint_ticket(cat.after_join.clone()).unwrap();
         assert_eq!((purpose, at), (TicketPurpose::Verify, Seq(1)));
         assert_eq!(
@@ -7398,7 +7578,7 @@ mod tests {
             checkpoint_ticket(viewer.after_join.clone()).is_none(),
             "a viewer is never asked"
         );
-        let mut cat = join_capable(&mut room, 3, 3, "editor", LiveBuild::Desktop).await;
+        let mut cat = join_capable(&mut room, 3, 3, "editor", LiveBuild::Browser).await;
         assert!(matches!(
             &cat.initial[1],
             LiveServerMsg::Catchup {
@@ -7447,7 +7627,7 @@ mod tests {
             .await
             .unwrap();
         let mut ann = join_capable(&mut room, 1, 1, "editor", LiveBuild::Browser).await;
-        let mut bob = join_capable(&mut room, 2, 2, "editor", LiveBuild::Desktop).await;
+        let mut bob = join_capable(&mut room, 2, 2, "editor", LiveBuild::Browser).await;
         entry(&mut room, &ann, 1, 0, FORMAT, "one".into())
             .await
             .unwrap();
@@ -7518,7 +7698,7 @@ mod tests {
             .await
             .unwrap();
         let mut ann = join_capable(&mut room, 1, 1, "editor", LiveBuild::Browser).await;
-        let mut bob = join_capable(&mut room, 2, 2, "editor", LiveBuild::Desktop).await;
+        let mut bob = join_capable(&mut room, 2, 2, "editor", LiveBuild::Browser).await;
         let mut viewer = join_capable(&mut room, 3, 3, "viewer", LiveBuild::Browser).await;
         for local in 1..=64 {
             entry(&mut room, &ann, local, local - 1, FORMAT, "x".into())
@@ -7554,7 +7734,7 @@ mod tests {
             .await
             .unwrap();
         let mut ann = join_capable(&mut room, 1, 1, "editor", LiveBuild::Browser).await;
-        let mut bob = join_capable(&mut room, 2, 2, "editor", LiveBuild::Desktop).await;
+        let mut bob = join_capable(&mut room, 2, 2, "editor", LiveBuild::Browser).await;
         let mut cat = join_capable(&mut room, 3, 3, "editor", LiveBuild::Browser).await;
         for local in 1..=64 {
             entry(&mut room, &ann, local, local - 1, FORMAT, "x".into())
@@ -8327,6 +8507,7 @@ mod tests {
             participant: ParticipantNo(0),
             place: Place::New,
             initial: Vec::new(),
+            raw: Vec::new(),
             after_join: Vec::new(),
         };
         let first = recv_messages(&mut joined.rx).await;
@@ -8343,7 +8524,8 @@ mod tests {
         } else {
             panic!("unexpected join frames: {first:?}");
         }
-        joined.initial = first;
+        joined.raw.clone_from(&first);
+        joined.initial = without_resumed(first);
         joined.after_join = drain(&mut joined.rx);
         joined
     }
@@ -8427,7 +8609,7 @@ mod tests {
             .await
             .unwrap();
         let mut ann = join_capable(&mut room, 1, 1, "editor", LiveBuild::Browser).await;
-        let mut bob = join_capable(&mut room, 2, 2, "editor", LiveBuild::Desktop).await;
+        let mut bob = join_capable(&mut room, 2, 2, "editor", LiveBuild::Browser).await;
         entry(&mut room, &ann, 1, 0, FORMAT, "one".into())
             .await
             .unwrap();
@@ -8658,7 +8840,7 @@ mod tests {
         .await
         .unwrap();
         let ann = join_capable(&mut room, 1, 1, "editor", LiveBuild::Browser).await;
-        let mut bob = join_capable(&mut room, 2, 2, "editor", LiveBuild::Desktop).await;
+        let mut bob = join_capable(&mut room, 2, 2, "editor", LiveBuild::Browser).await;
         entry(&mut room, &ann, 1, 0, FORMAT, "ann one".into())
             .await
             .unwrap();
@@ -8897,7 +9079,7 @@ mod tests {
             .await
             .unwrap();
         let mut ann = join_capable(&mut room, 1, 1, "editor", LiveBuild::Browser).await;
-        let mut bob = join_capable(&mut room, 2, 2, "editor", LiveBuild::Desktop).await;
+        let mut bob = join_capable(&mut room, 2, 2, "editor", LiveBuild::Browser).await;
         entry(&mut room, &ann, 1, 0, FORMAT, "one".into())
             .await
             .unwrap();
@@ -9150,7 +9332,7 @@ mod tests {
         assert_eq!(entries(drain(&mut ann.rx)).len(), 1);
 
         // A second editor who joins later verifies it.
-        let bob = join_capable(&mut room, 2, 2, "editor", LiveBuild::Desktop).await;
+        let bob = join_capable(&mut room, 2, 2, "editor", LiveBuild::Browser).await;
         let (verify, purpose, at) = checkpoint_ticket(bob.after_join.clone()).unwrap();
         assert_eq!((purpose, at), (TicketPurpose::Verify, Seq(3)));
         assert_eq!(
@@ -9311,7 +9493,7 @@ mod tests {
             room.checkpoint_stored(
                 format!("{n:040x}"),
                 Seq(n),
-                [9; 32],
+                ([9; 32], [0; 32]),
                 Uuid::nil(),
                 UserId(id(11)),
                 (ParticipantNo(1), ClientId(id(1))),
@@ -9336,13 +9518,14 @@ mod tests {
         let _ = drain(&mut ann.rx);
         let before = store.refused_locals();
         let mut reasons = Vec::new();
-        for local in 4..=(4 + u64::from(super::RATE_BURST) + 20) {
-            entry(&mut room, &ann, local, 3, FORMAT, "x".into())
+        // A client that keeps sending its held change is still paced.
+        for _ in 0..(u64::from(super::RATE_BURST) + 20) {
+            entry(&mut room, &ann, 4, 3, FORMAT, "x".into())
                 .await
                 .unwrap();
             reasons.extend(refusal(&drain(&mut ann.rx)));
         }
-        assert_eq!(reasons.last(), Some(&RefusedReason::RateLimited));
+        assert!(reasons.contains(&RefusedReason::RateLimited), "{reasons:?}");
         assert!(
             store.refused_locals() - before <= super::RATE_BURST as usize + 1,
             "paused refusals write no more rows than the rate allows"
@@ -9573,7 +9756,7 @@ mod tests {
         .await
         .unwrap();
         let ann = join_capable(&mut room, 1, 1, "editor", LiveBuild::Browser).await;
-        let bob = join_capable(&mut room, 2, 2, "editor", LiveBuild::Desktop).await;
+        let bob = join_capable(&mut room, 2, 2, "editor", LiveBuild::Browser).await;
         for local in 1..=2 {
             entry(&mut room, &ann, local, local - 1, FORMAT, "x".into())
                 .await
@@ -9638,7 +9821,7 @@ mod tests {
     async fn joiners_during_a_hold_are_told_changes_wait() {
         let (mut room, _ann, _bob) = returned(EventSink::discard(), MemStore::new()).await;
         assert!(room.holding());
-        let cat = join_capable(&mut room, 7, 3, "editor", LiveBuild::Desktop).await;
+        let cat = join_capable(&mut room, 7, 3, "editor", LiveBuild::Browser).await;
         assert!(paused(&cat.initial).is_some());
     }
 
@@ -9690,7 +9873,7 @@ mod tests {
             .await
             .unwrap();
         let mut ann = join_capable(&mut room, 1, 1, "editor", LiveBuild::Browser).await;
-        let mut bob = join_capable(&mut room, 2, 2, "editor", LiveBuild::Desktop).await;
+        let mut bob = join_capable(&mut room, 2, 2, "editor", LiveBuild::Browser).await;
         entry(&mut room, &ann, 1, 0, FORMAT, "one".into())
             .await
             .unwrap();
@@ -9996,7 +10179,7 @@ mod tests {
         .await
         .unwrap();
         let mut ann = join_capable(&mut room, 1, 1, "editor", LiveBuild::Browser).await;
-        let mut bob = join_capable(&mut room, 2, 2, "editor", LiveBuild::Desktop).await;
+        let mut bob = join_capable(&mut room, 2, 2, "editor", LiveBuild::Browser).await;
         entry(&mut room, &ann, 1, 0, FORMAT, "one".into())
             .await
             .unwrap();
@@ -10027,7 +10210,7 @@ mod tests {
         let _ = emitted_kinds(&mut emitted, "");
 
         // Cat joins and disagrees.
-        let mut cat = join_capable(&mut room, 7, 3, "editor", LiveBuild::Desktop).await;
+        let mut cat = join_capable(&mut room, 7, 3, "editor", LiveBuild::Browser).await;
         let (verify, purpose, verify_at) = checkpoint_ticket(cat.after_join.clone()).unwrap();
         assert_eq!((purpose, verify_at), (TicketPurpose::Verify, at));
         assert_eq!(
@@ -10107,7 +10290,7 @@ mod tests {
             .await
             .unwrap();
         let mut ann = join_capable(&mut room, 3, 1, "editor", LiveBuild::Browser).await;
-        let mut bob = join_capable(&mut room, 4, 2, "editor", LiveBuild::Desktop).await;
+        let mut bob = join_capable(&mut room, 4, 2, "editor", LiveBuild::Browser).await;
         let head = room.head.0;
         entry(&mut room, &ann, 3, head, FORMAT, "three".into())
             .await
@@ -10161,9 +10344,12 @@ mod tests {
         room.expire_due().await.unwrap();
         let mut asked = drain(&mut ann.rx);
         asked.extend(drain(&mut bob.rx));
+        let asked = tickets_in(asked);
         assert!(
-            tickets_in(asked).is_empty(),
-            "excluded people get no tickets"
+            asked
+                .iter()
+                .all(|(_, purpose, _, _, _)| *purpose == TicketPurpose::Write),
+            "excluded people never verify, and write only because nobody else can: {asked:?}"
         );
         // The exclusion outlives the room.
         drop(room);
@@ -10207,10 +10393,13 @@ mod tests {
                 .all(|barrier| barrier.stage != super::ReturnStage::Batch),
             "the batch is closed"
         );
-        assert!(
-            !catchups(&drain(&mut ann.rx)).is_empty(),
-            "its client is resynced"
+        let frames = drain(&mut ann.rx);
+        assert_eq!(
+            return_ready(&frames),
+            Some(LocalNo(3)),
+            "told again it may send, in case the first was lost"
         );
+        assert!(!catchups(&frames).is_empty(), "its client is resynced");
     }
 
     /// I5: a client that gave up its held change and sends a later one after the hold is
@@ -10252,7 +10441,7 @@ mod tests {
                 .await
                 .unwrap();
             let _ann = join_capable(&mut room, 1, 1, "editor", LiveBuild::Browser).await;
-            let _bob = join_capable(&mut room, 2, 2, "editor", LiveBuild::Desktop).await;
+            let _bob = join_capable(&mut room, 2, 2, "editor", LiveBuild::Browser).await;
         }
         let (events, mut emitted) = EventSink::channel();
         let mut room = LiveRoom::load(
@@ -10360,5 +10549,369 @@ mod tests {
         );
         assert!(unavailable(&drain(&mut ann.rx)));
         assert!(!room.has_session());
+    }
+
+    // ---- G4 final review fixes ----
+
+    /// C1: Ann's connection drops while the version before her batch is written, so the
+    /// `return_ready` sent when it is stored reaches nobody. Her kept rejoin is told again.
+    #[tokio::test(start_paused = true)]
+    async fn a_return_ready_lost_with_the_connection_is_sent_on_the_kept_rejoin() {
+        let store = MemStore::new();
+        let (mut room, ann, mut bob) = returned(EventSink::discard(), store.clone()).await;
+        let mut asked = ann.after_join.clone();
+        asked.extend(drain(&mut bob.rx));
+        let (ticket, _, at, _, _) = ticket_major(asked).unwrap();
+        let holder = if ticket_holder_is(&room, ticket, ann.participant.0) {
+            UserId(id(11))
+        } else {
+            UserId(id(12))
+        };
+        let (reply, answer) = oneshot::channel();
+        room.handle(LiveCommand::CheckpointUpload {
+            user: holder,
+            ticket,
+            at,
+            base: None,
+            blob: BlobRef {
+                sha256: [2; 32],
+                size: 3,
+            },
+            session_data: b"identities".to_vec(),
+            reply,
+        })
+        .await
+        .unwrap();
+        room.handle(LiveCommand::Disconnected {
+            conn: ann.conn,
+            client: ann.client,
+        })
+        .await
+        .unwrap();
+        room.finish_writes().await.unwrap();
+        assert!(matches!(
+            answer.await.unwrap(),
+            LiveCheckpointReply::Saved { .. }
+        ));
+        let resume = LiveResume {
+            session: ann.session,
+            participant: ann.participant,
+        };
+        let again = join_return(
+            &mut room,
+            9,
+            1,
+            UserId(id(11)),
+            Some(resume),
+            Some(Seq(2)),
+            Some(LocalNo(3)),
+        )
+        .await;
+        assert_eq!(again.place, Place::Kept);
+        let mut frames = again.initial.clone();
+        frames.extend(again.after_join.clone());
+        assert_eq!(return_ready(&frames), Some(LocalNo(3)));
+    }
+
+    /// I1: a person excluded after a repeat dispute never verifies, and writes only while no
+    /// capable editor who is not excluded is present, so a room is never left without a
+    /// writer.
+    #[tokio::test(start_paused = true)]
+    async fn an_excluded_editor_writes_only_when_nobody_else_can() {
+        let doc = DocId(id(100));
+        let store = MemStore::new();
+        crate::live_store::LiveStore::set_live_dispute_mark(
+            &store,
+            doc,
+            &records::LiveDisputeMark {
+                user: UserId(id(11)),
+                stopped_at: None,
+                excluded_until: Some(time::OffsetDateTime::now_utc() + time::Duration::hours(24)),
+            },
+        )
+        .await
+        .unwrap();
+        let mut room = LiveRoom::load(doc, store.clone(), EventSink::discard(), timing())
+            .await
+            .unwrap();
+        let mut ann = join_capable(&mut room, 1, 1, "editor", LiveBuild::Browser).await;
+        entry(&mut room, &ann, 1, 0, FORMAT, "one".into())
+            .await
+            .unwrap();
+        tokio::time::advance(Duration::from_secs(15)).await;
+        room.expire_due().await.unwrap();
+        let (write, purpose, at) =
+            checkpoint_ticket(drain(&mut ann.rx)).expect("a lone excluded editor still writes");
+        assert_eq!((purpose, at), (TicketPurpose::Write, Seq(1)));
+        assert!(matches!(
+            upload(&mut room, UserId(id(11)), write, Seq(1), 9).await,
+            LiveCheckpointReply::Saved { .. }
+        ));
+
+        // Bob joins: he verifies Ann's checkpoint, and from now on he writes, not Ann.
+        let mut bob = join_capable(&mut room, 2, 2, "editor", LiveBuild::Browser).await;
+        let mut asked = bob.after_join.clone();
+        asked.extend(drain(&mut bob.rx));
+        let (verify, purpose, _) = checkpoint_ticket(asked).unwrap();
+        assert_eq!(purpose, TicketPurpose::Verify);
+        assert_eq!(
+            hash(&mut room, UserId(id(12)), verify, Seq(1), 9).await,
+            LiveCheckpointReply::Accepted
+        );
+        entry(&mut room, &ann, 2, 1, FORMAT, "two".into())
+            .await
+            .unwrap();
+        tokio::time::advance(Duration::from_secs(15)).await;
+        room.expire_due().await.unwrap();
+        assert!(
+            checkpoint_ticket(drain(&mut ann.rx)).is_none(),
+            "not Ann while Bob can write"
+        );
+        let (write, purpose, at, base) = ticket_full(drain(&mut bob.rx)).unwrap();
+        assert_eq!((purpose, at), (TicketPurpose::Write, Seq(2)));
+        assert!(matches!(
+            upload_on(&mut room, UserId(id(12)), write, Seq(2), base.as_deref(), 8).await,
+            LiveCheckpointReply::Saved { .. }
+        ));
+        for _ in 0..4 {
+            tokio::time::advance(Duration::from_secs(30)).await;
+            heartbeat(&mut room, &ann, 2).await;
+            heartbeat(&mut room, &bob, 2).await;
+            room.expire_due().await.unwrap();
+        }
+        assert!(
+            checkpoint_ticket(drain(&mut ann.rx)).is_none(),
+            "an excluded person never verifies"
+        );
+    }
+
+    /// I2: the writer's other tab is the same person: it never verifies the checkpoint, and it
+    /// does not stop a lone person's checkpoint being accepted at the limit.
+    #[tokio::test(start_paused = true)]
+    async fn a_second_tab_of_the_writer_never_verifies() {
+        let mut room = LiveRoom::load(
+            DocId(id(100)),
+            MemStore::new(),
+            EventSink::discard(),
+            limited(3, 3, u64::MAX / 2, u64::MAX / 2),
+        )
+        .await
+        .unwrap();
+        let mut first = join_capable(&mut room, 1, 1, "editor", LiveBuild::Browser).await;
+        let mut second = join_full(
+            &mut room,
+            2,
+            3,
+            UserId(id(11)),
+            "editor",
+            FORMAT,
+            None,
+            None,
+            true,
+            LiveBuild::Browser,
+        )
+        .await;
+        let mut asked = Vec::new();
+        for local in 1..=3 {
+            entry(&mut room, &first, local, local - 1, FORMAT, "x".into())
+                .await
+                .unwrap();
+            asked.extend(drain(&mut first.rx));
+            asked.extend(drain(&mut second.rx));
+        }
+        assert!(room.paused);
+        let (write, _, at, _, _) = tickets_in(asked)
+            .into_iter()
+            .find(|(_, purpose, _, _, _)| *purpose == TicketPurpose::Write)
+            .unwrap();
+        assert!(matches!(
+            upload(&mut room, UserId(id(11)), write, at, 9).await,
+            LiveCheckpointReply::Saved { .. }
+        ));
+        let mut asked = drain(&mut first.rx);
+        asked.extend(drain(&mut second.rx));
+        assert!(
+            tickets_in(asked)
+                .iter()
+                .all(|(_, purpose, _, _, _)| *purpose != TicketPurpose::Verify),
+            "the writer's own tab is never asked to verify"
+        );
+        assert!(!room.paused, "a lone person's checkpoint is accepted");
+    }
+
+    /// I3: a verifier checks the writer's identity data as well as the file: a forged
+    /// identity table with correct file bytes is a dispute, never verified.
+    #[tokio::test(start_paused = true)]
+    async fn a_verify_must_match_the_session_data_too() {
+        let doc = DocId(id(100));
+        let (events, mut emitted) = EventSink::channel();
+        let (mut room, store, _ann, _bob, _revision, verify) =
+            written_and_ticketed(events, 9).await;
+        let _ = emitted_kinds(&mut emitted, "");
+        assert_eq!(
+            hash_full(&mut room, UserId(id(12)), verify, Seq(1), 9, [0xab; 32]).await,
+            LiveCheckpointReply::Accepted
+        );
+        let loaded = crate::live_store::LiveStore::load_live(&store, doc)
+            .await
+            .unwrap();
+        assert_eq!(
+            loaded.verified_through,
+            Seq(0),
+            "a forged identity table is never verified"
+        );
+        assert!(
+            emitted_kinds(&mut emitted, "live.checkpoint_mismatch").len() == 1,
+            "a mismatch on either hash is a dispute"
+        );
+    }
+
+    /// I4: a claimed write ticket's upload is given time for its bytes at 64 KiB/s plus the
+    /// lifetime, so a large workbook on a slow link can still be checkpointed.
+    #[tokio::test(start_paused = true)]
+    async fn a_claimed_upload_gets_time_for_its_bytes() {
+        let (mut room, _) = room().await;
+        let mut ann = join_capable(&mut room, 1, 1, "editor", LiveBuild::Browser).await;
+        entry(&mut room, &ann, 1, 0, FORMAT, "one".into())
+            .await
+            .unwrap();
+        tokio::time::advance(Duration::from_secs(15)).await;
+        room.expire_due().await.unwrap();
+        let ticket = checkpoint_ticket(drain(&mut ann.rx)).unwrap().0;
+        let (reply, answer) = oneshot::channel();
+        room.handle(LiveCommand::CheckpointClaim {
+            user: UserId(id(11)),
+            ticket,
+            at: Seq(1),
+            base: None,
+            // Ten minutes at the floor rate.
+            length: super::UPLOAD_FLOOR_BYTES_PER_SECOND * 600,
+            reply,
+        })
+        .await
+        .unwrap();
+        assert!(answer.await.unwrap());
+        for _ in 0..7 {
+            tokio::time::advance(Duration::from_secs(60)).await;
+            heartbeat(&mut room, &ann, 1).await;
+            room.expire_due().await.unwrap();
+        }
+        assert!(matches!(
+            upload(&mut room, UserId(id(11)), ticket, Seq(1), 9).await,
+            LiveCheckpointReply::Saved { .. }
+        ));
+    }
+
+    /// Same-build ruling: checkpoint bytes carry computed values, so only a place on the
+    /// writer's build verifies them.
+    #[tokio::test(start_paused = true)]
+    async fn verify_tickets_go_only_to_the_writers_build() {
+        let (mut room, _) = room().await;
+        let mut ann = join_capable(&mut room, 1, 1, "editor", LiveBuild::Browser).await;
+        let mut bob = join_capable(&mut room, 2, 2, "editor", LiveBuild::Desktop).await;
+        entry(&mut room, &ann, 1, 0, FORMAT, "one".into())
+            .await
+            .unwrap();
+        tokio::time::advance(Duration::from_secs(15)).await;
+        room.expire_due().await.unwrap();
+        let mut asked = drain(&mut ann.rx);
+        asked.extend(drain(&mut bob.rx));
+        let (write, _, at, _, _) = tickets_in(asked)
+            .into_iter()
+            .find(|(_, purpose, _, _, _)| *purpose == TicketPurpose::Write)
+            .unwrap();
+        let writer = if ticket_holder_is(&room, write, ann.participant.0) {
+            UserId(id(11))
+        } else {
+            UserId(id(12))
+        };
+        assert!(matches!(
+            upload(&mut room, writer, write, at, 9).await,
+            LiveCheckpointReply::Saved { .. }
+        ));
+        let mut asked = drain(&mut ann.rx);
+        asked.extend(drain(&mut bob.rx));
+        assert!(
+            tickets_in(asked).is_empty(),
+            "the other build is not asked to verify"
+        );
+        let cat_build = if writer == UserId(id(11)) {
+            LiveBuild::Browser
+        } else {
+            LiveBuild::Desktop
+        };
+        let cat = join_capable(&mut room, 3, 3, "editor", cat_build).await;
+        let (_, purpose, at) = checkpoint_ticket(cat.after_join.clone()).unwrap();
+        assert_eq!((purpose, at), (TicketPurpose::Verify, Seq(1)));
+    }
+
+    /// I5: every join is told whether changes wait, before its catch-up, so a client never
+    /// sends into a hold and a client that missed `changes_resumed` is released.
+    #[tokio::test(start_paused = true)]
+    async fn joins_are_told_whether_changes_wait_before_their_catch_up() {
+        let (mut room, _) = room().await;
+        let ann = join_capable(&mut room, 1, 1, "editor", LiveBuild::Browser).await;
+        let position = |frames: &[LiveServerMsg], wanted: fn(&LiveServerMsg) -> bool| {
+            frames.iter().position(wanted)
+        };
+        let resumed_at = position(&ann.raw, |frame| {
+            matches!(frame, LiveServerMsg::ChangesResumed)
+        });
+        let catchup_at = position(&ann.raw, |frame| {
+            matches!(frame, LiveServerMsg::Catchup { .. })
+        });
+        assert!(
+            resumed_at.is_some_and(|at| catchup_at.is_some_and(|catchup| at < catchup)),
+            "{:?}",
+            ann.raw
+        );
+
+        let (mut room, _ann, _bob) = returned(EventSink::discard(), MemStore::new()).await;
+        assert!(room.holding());
+        let cat = join_capable(&mut room, 7, 3, "editor", LiveBuild::Browser).await;
+        let paused_at = position(&cat.initial, |frame| {
+            matches!(frame, LiveServerMsg::ChangesPaused { .. })
+        });
+        let catchup_at = position(&cat.initial, |frame| {
+            matches!(frame, LiveServerMsg::Catchup { .. })
+        });
+        assert!(
+            paused_at.is_some_and(|at| catchup_at.is_some_and(|catchup| at < catchup)),
+            "{:?}",
+            cat.initial
+        );
+    }
+
+    /// Pause ruling: a change that reaches a paused room is held, not refused for good: its
+    /// number is not used up and the client sends it again once changes resume.
+    #[tokio::test(start_paused = true)]
+    async fn a_paused_room_holds_changes_without_using_them_up() {
+        let (mut room, store) = limited_room(limited(100, 3, u64::MAX / 2, u64::MAX / 2)).await;
+        let mut ann = join_as(&mut room, 1, 1, 11, "editor", FORMAT, None, None).await;
+        for local in 1..=3 {
+            entry(&mut room, &ann, local, local - 1, FORMAT, "x".into())
+                .await
+                .unwrap();
+        }
+        let _ = drain(&mut ann.rx);
+        entry(&mut room, &ann, 4, 3, FORMAT, "x".into())
+            .await
+            .unwrap();
+        assert_eq!(refusal(&drain(&mut ann.rx)), Some(RefusedReason::Held));
+        assert_eq!(
+            crate::live_store::LiveStore::live_local(&store, DocId(id(100)), ann.client, 4)
+                .await
+                .unwrap(),
+            records::LiveLocal::Unseen,
+            "its number is not used up"
+        );
+        entry(&mut room, &ann, 5, 3, FORMAT, "y".into())
+            .await
+            .unwrap();
+        assert!(
+            refusal(&drain(&mut ann.rx)).is_none(),
+            "a later change sent before the client heard waits quietly"
+        );
+        assert_eq!(store.entry_count(), 3);
     }
 }

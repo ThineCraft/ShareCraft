@@ -936,7 +936,7 @@ async fn second_participant_hash_verifies_the_checkpoint() {
     let mut ann_socket =
         join_capable_socket(&server, doc, &ann, protocol::live::LiveBuild::Browser).await;
     let mut bob_socket =
-        join_capable_socket(&server, doc, &bob, protocol::live::LiveBuild::Desktop).await;
+        join_capable_socket(&server, doc, &bob, protocol::live::LiveBuild::Browser).await;
     send_live(
         &mut ann_socket,
         &LiveClientMsg::Entry {
@@ -987,7 +987,12 @@ async fn second_participant_hash_verifies_the_checkpoint() {
     let hashed = server
         .http(Some(&bob))
         .post(server.url(&format!("/api/docs/{}/live-checkpoint/hash", doc.0)))
-        .json(&serde_json::json!({ "ticket": verify, "at": at.0, "sha256": digest }))
+        .json(&serde_json::json!({
+            "ticket": verify,
+            "at": at.0,
+            "sha256": digest,
+            "session_sha256": sha_hex(b"ids"),
+        }))
         .send()
         .await
         .unwrap();
@@ -1209,8 +1214,15 @@ async fn saved_revision(response: reqwest::Response) -> String {
         .to_owned()
 }
 
-/// Verifies the checkpoint `asked` names with the SHA-256 of `file`.
-async fn verify_checkpoint(site: &Site, user: &TestUser, doc: DocId, asked: &Asked, file: &[u8]) {
+/// Verifies the checkpoint `asked` names with the SHA-256 of `file` and of `session_data`.
+async fn verify_checkpoint(
+    site: &Site,
+    user: &TestUser,
+    doc: DocId,
+    asked: &Asked,
+    session_data: &[u8],
+    file: &[u8],
+) {
     let response = site
         .http(Some(user))
         .post(site.url(&format!("/api/docs/{}/live-checkpoint/hash", doc.0)))
@@ -1218,6 +1230,7 @@ async fn verify_checkpoint(site: &Site, user: &TestUser, doc: DocId, asked: &Ask
             "ticket": asked.ticket,
             "at": asked.at.0,
             "sha256": sha_hex(file),
+            "session_sha256": sha_hex(session_data),
         }))
         .send()
         .await
@@ -1313,7 +1326,7 @@ async fn stale_live_checkpoint_preserves_both_versions() {
     .await;
     let (doc, ann, bob) = shared_live(&server).await;
     let mut ann_socket = join_capable_socket(&server, doc, &ann, LiveBuild::Browser).await;
-    let mut bob_socket = join_capable_socket(&server, doc, &bob, LiveBuild::Desktop).await;
+    let mut bob_socket = join_capable_socket(&server, doc, &bob, LiveBuild::Browser).await;
     let holder = |asked: &Asked| if asked.first { &ann } else { &bob };
 
     // A verified checkpoint at 1.
@@ -1330,7 +1343,15 @@ async fn stale_live_checkpoint_preserves_both_versions() {
         verify.first, write.first,
         "the writer never verifies its own"
     );
-    verify_checkpoint(&server, holder(&verify), doc, &verify, &first_file).await;
+    verify_checkpoint(
+        &server,
+        holder(&verify),
+        doc,
+        &verify,
+        b"ids-1",
+        &first_file,
+    )
+    .await;
     assert_eq!(
         server.db.db.load_live(doc).await.unwrap().verified_through,
         Seq(1)
@@ -1357,7 +1378,7 @@ async fn stale_live_checkpoint_preserves_both_versions() {
 
     // The editors come back to a room that finds the outside file newer than its base.
     let mut ann_socket = rejoin_capable(&server, doc, &ann, LiveBuild::Browser).await;
-    let mut bob_socket = rejoin_capable(&server, doc, &bob, LiveBuild::Desktop).await;
+    let mut bob_socket = rejoin_capable(&server, doc, &bob, LiveBuild::Browser).await;
 
     // The room asks for its last state once more, as a major version, and changes wait.
     let recovery = ticket_to_either(&mut ann_socket, &mut bob_socket, TicketPurpose::Write).await;
@@ -1541,7 +1562,7 @@ async fn verified_checkpoint_survives_room_and_server_restart() {
     let bob = first.user("Bob").await;
     share(&first, &ann, doc, &bob, "editor").await;
     let mut ann_socket = join_capable_socket(&first, doc, &ann, LiveBuild::Browser).await;
-    let mut bob_socket = join_capable_socket(&first, doc, &bob, LiveBuild::Desktop).await;
+    let mut bob_socket = join_capable_socket(&first, doc, &bob, LiveBuild::Browser).await;
     let holder = |asked: &Asked| if asked.first { &ann } else { &bob };
     send_change(&mut ann_socket, 1, 0, "one").await;
     send_change(&mut ann_socket, 2, 1, "two").await;
@@ -1557,7 +1578,7 @@ async fn verified_checkpoint_survives_room_and_server_restart() {
     )
     .await;
     let verify = ticket_to_either(&mut ann_socket, &mut bob_socket, TicketPurpose::Verify).await;
-    verify_checkpoint(&first, holder(&verify), doc, &verify, &file).await;
+    verify_checkpoint(&first, holder(&verify), doc, &verify, b"ids at two", &file).await;
     send_change(&mut ann_socket, 3, 2, "three").await;
     next_live(&mut ann_socket, |message| match message {
         LiveServerMsg::Entry { entry } if entry.seq == Seq(3) => Some(()),
