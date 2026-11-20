@@ -31,6 +31,7 @@ mod members;
 pub mod previews;
 mod projection;
 mod room;
+pub mod s3_sign;
 mod scan;
 pub mod secrets;
 pub mod share;
