@@ -13,14 +13,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use collab_core::ids::NodeId;
-use common::fake_share::FakeShare;
+use common::fake_share::{FakeShare, native};
 use common::{TestServer, TestUser, spawn_server_config_without_workers};
 use records::{Principal, SHARE_LIST_SECONDS, SHARE_ROOTS, SourceKind, SourceState};
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 use server::AppState;
 
+#[cfg(windows)]
 const ROOT: &str = r"C:\approved";
+#[cfg(not(windows))]
+const ROOT: &str = "/approved";
 
 struct Env {
     server: TestServer,
@@ -141,7 +144,7 @@ async fn connecting_outside_every_root_is_refused_and_makes_nothing() {
         .await
         .unwrap();
     let (status, answer) = env
-        .connect(json!({"name": "Outside", "path": r"C:\elsewhere"}))
+        .connect(json!({"name": "Outside", "path": &native(r"C:\elsewhere")}))
         .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{answer}");
     assert_eq!(answer["error"], "share_not_approved");
@@ -160,9 +163,15 @@ async fn canonical_share_locations_are_exclusive_in_both_orders() {
         env.fake.mkdir("real/folder");
         env.fake.link("alias", "real");
         let (first, second) = if alias_first {
-            (r"C:\approved\alias\folder", r"C:\approved\real\folder")
+            (
+                native(r"C:\approved\alias\folder"),
+                native(r"C:\approved\real\folder"),
+            )
         } else {
-            (r"C:\approved\real\folder", r"C:\approved\alias\folder")
+            (
+                native(r"C:\approved\real\folder"),
+                native(r"C:\approved\alias\folder"),
+            )
         };
         let (status, answer) = env.connect(json!({"name":"First", "path":first})).await;
         assert_eq!(status, StatusCode::CREATED, "{answer}");
@@ -180,16 +189,16 @@ async fn canonical_nested_alias_conflicts_but_a_sibling_is_allowed() {
     env.fake.mkdir("real/sibling");
     env.fake.link("alias", "real");
     let (status, answer) = env
-        .connect(json!({"name":"Parent", "path":r"C:\approved\real\folder"}))
+        .connect(json!({"name":"Parent", "path":&native(r"C:\approved\real\folder")}))
         .await;
     assert_eq!(status, StatusCode::CREATED, "{answer}");
     let (status, answer) = env
-        .connect(json!({"name":"Nested", "path":r"C:\approved\alias\folder\nested"}))
+        .connect(json!({"name":"Nested", "path":&native(r"C:\approved\alias\folder\nested")}))
         .await;
     assert_eq!(status, StatusCode::CONFLICT, "{answer}");
     assert_eq!(answer["error"], "share_location_in_use");
     let (status, answer) = env
-        .connect(json!({"name":"Sibling", "path":r"C:\approved\alias\sibling"}))
+        .connect(json!({"name":"Sibling", "path":&native(r"C:\approved\alias\sibling")}))
         .await;
     assert_eq!(status, StatusCode::CREATED, "{answer}");
 }
@@ -199,7 +208,7 @@ async fn an_unreachable_existing_location_falls_back_to_lexical_exclusivity() {
     let env = Env::new().await;
     env.fake.mkdir("gone/folder");
     let (status, answer) = env
-        .connect(json!({"name":"Existing", "path":r"C:\approved\gone\folder"}))
+        .connect(json!({"name":"Existing", "path":&native(r"C:\approved\gone\folder")}))
         .await;
     assert_eq!(status, StatusCode::CREATED, "{answer}");
     env.fake.remove("gone");
@@ -252,14 +261,24 @@ async fn roots_removed_after_probe_are_rechecked_before_connect_commit() {
 #[tokio::test]
 async fn each_bad_path_is_refused_with_its_reason() {
     let env = Env::new().await;
-    for (path, reason) in [
-        ("relative", "relative"),
-        (r"C:\approved\..\outside", "traversal"),
-        (r"\\?\C:\approved", "device"),
-        (r"C:\approved\CON", "characters"),
-        (r"C:\approved\file.txt:secret", "stream"),
-        (r"\\server\C$", "whole_drive"),
-    ] {
+    let mut cases = vec![
+        ("relative".to_owned(), "relative"),
+        (native(r"C:\approved\..\outside"), "traversal"),
+        (native(r"C:\approved\CON"), "characters"),
+        (native(r"C:\approved\file.txt:secret"), "stream"),
+        // A device prefix is refused as such on every system.
+        (r"\\?\C:\approved".to_owned(), "device"),
+    ];
+    if cfg!(windows) {
+        cases.push((r"\\server\C$".to_owned(), "whole_drive"));
+    } else {
+        // The Linux counterpart of a whole drive is the whole file system, and a server
+        // there cannot open a UNC or drive path, which it says instead of "not found".
+        cases.push(("/".to_owned(), "whole_drive"));
+        cases.push((r"\\server\share\folder".to_owned(), "other_system"));
+        cases.push((r"C:\approved".to_owned(), "other_system"));
+    }
+    for (path, reason) in cases {
         let (status, answer) = env
             .connect(json!({"name": format!("Bad {reason}"), "path": path}))
             .await;
@@ -429,9 +448,9 @@ async fn an_unreachable_denied_or_missing_folder_is_refused_plainly() {
     for fault in ["missing", "denied", "offline"] {
         let env = Env::new().await;
         let path = if fault == "missing" {
-            r"C:\approved\missing"
+            native(r"C:\approved\missing")
         } else {
-            ROOT
+            ROOT.to_owned()
         };
         match fault {
             "denied" => env.fake.deny(ROOT),
@@ -969,7 +988,7 @@ async fn a_hanging_existing_share_never_holds_the_connection_turn() {
     env.fake.mkdir("second");
     env.fake.mkdir("third");
     let (status, answer) = env
-        .connect(json!({"name":"Held", "path":r"C:\approved\held"}))
+        .connect(json!({"name":"Held", "path":&native(r"C:\approved\held")}))
         .await;
     assert_eq!(status, StatusCode::CREATED, "{answer}");
     env.fake.hang_canonical("held");
@@ -989,7 +1008,7 @@ async fn a_hanging_existing_share_never_holds_the_connection_turn() {
         &env.admin,
         Method::POST,
         &route,
-        Some(json!({"name":"Second", "path":r"C:\approved\second"})),
+        Some(json!({"name":"Second", "path":&native(r"C:\approved\second")})),
     );
     wait_until("the second connect resolves the hanging share", || async {
         env.fake.canonical_hanging() >= 1
@@ -1000,7 +1019,7 @@ async fn a_hanging_existing_share_never_holds_the_connection_turn() {
         &env.admin,
         Method::POST,
         &route,
-        Some(json!({"name":"Third", "path":r"C:\approved\third"})),
+        Some(json!({"name":"Third", "path":&native(r"C:\approved\third")})),
     );
     wait_until("the third connect resolves the hanging share", || async {
         env.fake.canonical_hanging() >= 2
@@ -1185,7 +1204,7 @@ async fn disconnect_of_an_empty_library_rechecks_library_access() {
             &owner,
             Method::POST,
             &format!("/api/sites/{}/libraries/share", env.site.0),
-            Some(json!({"name":"Empty revoked", "path":r"C:\approved\empty"})),
+            Some(json!({"name":"Empty revoked", "path":&native(r"C:\approved\empty")})),
         )
         .await;
     assert_eq!(status, StatusCode::CREATED, "{answer}");
@@ -1227,7 +1246,7 @@ async fn lookups_against_a_hanging_share_are_bounded_across_connects() {
     let env = Env::new().await;
     env.fake.mkdir("held");
     let (status, answer) = env
-        .connect(json!({"name":"Held", "path":r"C:\approved\held"}))
+        .connect(json!({"name":"Held", "path":&native(r"C:\approved\held")}))
         .await;
     assert_eq!(status, StatusCode::CREATED, "{answer}");
     for n in 0..CONNECTS {
@@ -1252,7 +1271,7 @@ async fn lookups_against_a_hanging_share_are_bounded_across_connects() {
                 &route,
                 Some(json!({
                     "name": format!("Sibling {n}"),
-                    "path": format!(r"C:\approved\sibling{n}"),
+                    "path": native(&format!(r"C:\approved\sibling{n}")),
                 })),
             )
         })

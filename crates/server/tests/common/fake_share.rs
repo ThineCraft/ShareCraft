@@ -341,8 +341,10 @@ impl FakeShare {
         let candidate = Path::new(path);
         if candidate.is_absolute() || candidate.starts_with(&self.inner.root) {
             candidate.to_path_buf()
-        } else {
+        } else if cfg!(windows) {
             self.inner.root.join(path.replace('/', "\\"))
+        } else {
+            self.inner.root.join(path.replace('\\', "/"))
         }
     }
 
@@ -497,6 +499,23 @@ impl Drop for ActiveList<'_> {
 
 fn path_refused() -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, "path refused")
+}
+
+/// A test path written in Windows form, given in this system's own form: unchanged on
+/// Windows, and elsewhere without its drive letter and with `/` separators, so
+/// `C:\approved\held` is `/approved/held` on Linux. Tests about UNC or drive paths
+/// themselves name them directly instead.
+#[allow(dead_code)]
+pub fn native(windows: &str) -> String {
+    if cfg!(windows) {
+        return windows.to_owned();
+    }
+    let mut chars = windows.chars();
+    let rest = match (chars.next(), chars.next()) {
+        (Some(letter), Some(':')) if letter.is_ascii_alphabetic() => chars.as_str(),
+        _ => windows,
+    };
+    rest.replace('\\', "/")
 }
 
 impl Node {

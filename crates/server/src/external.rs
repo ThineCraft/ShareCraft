@@ -743,12 +743,21 @@ fn classify(error: &io::Error) -> FsError {
         | ErrorKind::ConnectionReset
         | ErrorKind::NotConnected
         | ErrorKind::HostUnreachable
-        | ErrorKind::NetworkUnreachable => FsError::Offline,
+        | ErrorKind::NetworkUnreachable
+        | ErrorKind::NetworkDown
+        | ErrorKind::StaleNetworkFileHandle => FsError::Offline,
+        _ if host_down(error) => FsError::Offline,
         _ => {
             eprintln!("sharecraft-server: file share read failed: {error}");
             FsError::Failed
         }
     }
+}
+
+/// Whether the error is Linux's `EHOSTDOWN`, which a CIFS mount answers when the server
+/// behind it has gone; the standard library gives it no kind of its own.
+fn host_down(error: &io::Error) -> bool {
+    cfg!(target_os = "linux") && error.raw_os_error() == Some(112)
 }
 
 fn reader_error(error: &BlobError) -> Option<FsError> {

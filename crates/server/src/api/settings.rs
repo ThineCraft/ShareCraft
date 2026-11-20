@@ -8,7 +8,7 @@ use records::{
     ANYONE_LINK_MAX_DAYS, ANYONE_LINKS, DEFAULT_LANGUAGE, DEFAULT_TIME_ZONE, PathRefusal,
     RegionalDefaults, SCANNER_MAX_BYTES, SCANNER_TIMEOUT_SECONDS, SCANNER_TOO_LARGE,
     SCANNER_UNAVAILABLE, SCANNER_URL, SHARE_CACHE_MAX_BYTES, SHARE_LIST_SECONDS, SHARE_ROOTS,
-    SOURCE_MAX_FILES, ScannerSettings, SharePath, SharingSettings, valid_root,
+    SOURCE_MAX_FILES, ScannerSettings, SharePath, SharingSettings, usable_here, valid_root,
     valid_scanner_setting, validate_language, validate_time_zone,
 };
 use serde::{Deserialize, Serialize};
@@ -20,6 +20,7 @@ use super::{ApiError, JsonBody};
 use crate::AppState;
 use crate::auth::Signed;
 use crate::icap::Client;
+use crate::share::canonical_share_path;
 
 /// The longest the test of new scanner settings waits for the scanner.
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -35,6 +36,7 @@ pub(super) fn path_reason(reason: PathRefusal) -> &'static str {
         PathRefusal::Stream => "stream",
         PathRefusal::TooLong => "too_long",
         PathRefusal::WholeDrive => "whole_drive",
+        PathRefusal::OtherSystem => "other_system",
         PathRefusal::EmptySegment
         | PathRefusal::BadCharacter
         | PathRefusal::DeviceName
@@ -57,8 +59,9 @@ pub(super) async fn overlaps_data_folder(state: &AppState, path: &SharePath) -> 
     tokio::task::spawn_blocking(move || {
         let share = fs.canonical(&share, &share).ok()?;
         let data = fs.canonical(&data, &data).ok()?;
-        let share = SharePath::parse(share.to_str()?).ok()?;
-        let data = SharePath::parse(data.to_str()?).ok()?;
+        // Windows canonical paths carry a `\\?\` prefix, which only this conversion removes.
+        let share = canonical_share_path(&share).ok()?;
+        let data = canonical_share_path(&data).ok()?;
         Some(share.is_within(&data) || data.is_within(&share))
     })
     .await
@@ -128,6 +131,7 @@ pub(crate) async fn change_shares(
                 let path = SharePath::parse(value)
                     .map_err(|reason| ApiError::InvalidSharePath(path_reason(reason)))?;
                 valid_root(&path)
+                    .and_then(|()| usable_here(&path))
                     .map_err(|reason| ApiError::InvalidSharePath(path_reason(reason)))?;
                 if overlaps_data_folder(&state, &path).await {
                     return Err(ApiError::ShareNotApproved);

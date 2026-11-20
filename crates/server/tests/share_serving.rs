@@ -33,7 +33,10 @@ use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
+#[cfg(windows)]
 const ROOT: &str = r"C:\approved";
+#[cfg(not(windows))]
+const ROOT: &str = "/approved";
 
 struct Env {
     server: TestServer,

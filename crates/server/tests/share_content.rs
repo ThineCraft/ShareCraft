@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use collab_core::ids::{DocId, NodeId};
-use common::fake_share::FakeShare;
+use common::fake_share::{FakeShare, native};
 use common::{
     TIMEOUT, TestServer, TestUser, spawn_server_config, spawn_server_config_without_workers,
     start_fake_github,
@@ -35,7 +35,10 @@ use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+#[cfg(windows)]
 const ROOT: &str = r"C:\approved";
+#[cfg(not(windows))]
+const ROOT: &str = "/approved";
 
 struct Env {
     server: TestServer,
@@ -564,8 +567,9 @@ async fn mid_stream_connection_reset_marks_the_library_offline_and_is_remembered
 async fn a_link_swapped_in_after_the_listing_is_refused() {
     let env = Env::new(&[("inside.txt", b"inside", 1)]).await;
     let node = env.item("inside.txt").await.node;
-    env.fake.put(r"C:\outside\secret.txt", b"secret");
-    env.fake.link("inside.txt", r"C:\outside\secret.txt");
+    env.fake.put(&native(r"C:\outside\secret.txt"), b"secret");
+    env.fake
+        .link("inside.txt", &native(r"C:\outside\secret.txt"));
 
     assert!(matches!(
         materialise(&env.state, node).await,

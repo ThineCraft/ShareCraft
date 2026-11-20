@@ -18,7 +18,8 @@ use axum::response::{IntoResponse, Response};
 use collab_core::ids::NodeId;
 use records::{
     LibraryKind, NewEvent, NewSource, Perms, SealedRow, SecretId, SharePath, SourceChange,
-    SourceConfig, SourceKind, SourceMode, SourceStatus, User, approved_root, valid_root,
+    SourceConfig, SourceKind, SourceMode, SourceStatus, User, approved_root, usable_here,
+    valid_root,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -576,7 +577,9 @@ pub(crate) async fn connect_share(
         .to_owned();
     let path = SharePath::parse(&body.path)
         .map_err(|reason| ApiError::InvalidSharePath(path_reason(reason)))?;
-    valid_root(&path).map_err(|reason| ApiError::InvalidSharePath(path_reason(reason)))?;
+    valid_root(&path)
+        .and_then(|()| usable_here(&path))
+        .map_err(|reason| ApiError::InvalidSharePath(path_reason(reason)))?;
     let settings = state
         .db()
         .share_settings()

@@ -30,7 +30,10 @@ use server::source_sync::{SyncError, SyncReport, sync_once};
 use sqlx::Connection;
 use time::OffsetDateTime;
 
+#[cfg(windows)]
 const ROOT: &str = r"C:\approved";
+#[cfg(not(windows))]
+const ROOT: &str = "/approved";
 
 struct Env {
     server: TestServer,
