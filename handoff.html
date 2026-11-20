@@ -23,16 +23,16 @@
 <body>
 <main>
 <h1>ShareCraft handoff</h1>
-<p class="note">Written 20 November 2026 for whoever (person or coding agent) picks the work up next. It describes the state at the time of writing; check <code>git log</code> and each plan's ledger for anything newer.</p>
+<p class="note">Written 20 November 2026 and updated after the release to <code>main</code> (5411a7b), for whoever (person or coding agent) picks the work up next. It describes the state at the time of writing; check <code>git log</code> and each plan's ledger for anything newer.</p>
 
 <h2>Where everything is</h2>
 <div class="wrap"><table>
 <thead><tr><th>Folder</th><th>Branch</th><th>Used for</th></tr></thead>
 <tbody>
 <tr><td><code>H:\Source\repos\ThineCraft\ShareCraft</code></td><td>gridcraft-coauthoring-g4</td><td>Main checkout. G4 is finished here; holds the G3, G4 and G5 ledgers.</td></tr>
-<tr><td><code>…\ShareCraft-release</code></td><td>release-integration</td><td>G4 + G5 + File Share + S3 merged on main, plus the parallel CI. Becomes <code>main</code>.</td></tr>
+<tr><td><code>…\ShareCraft-release</code></td><td>release-integration</td><td>The release that became <code>main</code> (5411a7b, pushed 20 November 2026). Start new work from <code>main</code>.</td></tr>
 <tr><td><code>…\ShareCraft-g5</code></td><td>gridcraft-coauthoring-g5</td><td>G5 ShareCraft tasks (pushed at 37779d5; later commits are local).</td></tr>
-<tr><td><code>…\ShareCraft-fileshare</code></td><td>fileshare-surfacing</td><td>File Share surfacing (UNC and drive paths).</td></tr>
+<tr><td><code>…\ShareCraft-fileshare</code></td><td>fileshare-surfacing</td><td>File Share surfacing (Windows UNC and drive paths, and Linux paths including mounted SMB shares). Pushed.</td></tr>
 <tr><td><code>…\ShareCraft-s3</code></td><td>s3-surfacing</td><td>S3 surfacing, built on File Share.</td></tr>
 <tr><td><code>…\ShareCraft-ci</code></td><td>ci-parallel</td><td>The parallel GitHub check (pushed; merged into the release).</td></tr>
 <tr><td><code>…\ShareCraft-github</code>, <code>…-production</code>, <code>…-s3-design</code></td><td>various</td><td>Older work; GitHub surfacing is already in main.</td></tr>
@@ -44,11 +44,11 @@
 <div class="wrap"><table>
 <thead><tr><th>Track</th><th>Plan</th><th>State</th><th>Next</th></tr></thead>
 <tbody>
-<tr><td>Release</td><td>—</td><td><code>release-integration</code> pushed; GitHub check running. Unfinished features are off by default (see below).</td><td>When the check passes: fast-forward <code>main</code> and push it (the owner approved this). Then build a fresh install zip from main (the production-mode session offered to).</td></tr>
+<tr><td>Release</td><td>—</td><td>Done. <code>main</code> = <code>origin/main</code> = 5411a7b (G4, G5 switched off, File Share Tasks 1–9 off until a folder is approved, S3 signing, the parallel check, this handoff). GitHub run 44676640425 passed on Linux. Unfinished features are off by default (see below). A Windows zip from 5411a7b is being built into <code>J:\sharecraft-package</code>.</td><td>New work branches start from <code>main</code>. Older work branches (g4, g5, fileshare, s3) are all contained in <code>main</code>; keep using them only for their remaining tasks and merge <code>main</code> into them first.</td></tr>
 <tr><td>G3 – GridCraft co-authoring core</td><td><code>plans/2026-11-18-gridcraft-coauthoring-g3.html</code></td><td>Done and reviewed. Fork PR <code>ThineCraft/GridCraft#2</code> (coauthor-g3 → sharecraft) is open.</td><td>Owner to merge the fork PR.</td></tr>
 <tr><td>G4 – verified live checkpoints</td><td><code>plans/2026-11-18-gridcraft-coauthoring-g4.html</code></td><td>Done: all 12 tasks, per-task reviews, final whole-branch review and its fix wave (ShareCraft 9652112; fork 1fe2fd16 and b77cc005 on coauthor-g5). In the release.</td><td>Nothing; parked minors are listed in <code>final-review.md</code> and <code>final-fix-report.md</code>.</td></tr>
 <tr><td>G5 – live editing on screen</td><td><code>plans/2026-11-19-gridcraft-coauthoring-g5.html</code></td><td>Done: ShareCraft Tasks 1–4, 12, 13; fork Tasks 9–11. In the release but switched off.</td><td>Task 7 (fork pins ShareCraft by git revision; pin the new <code>main</code>), then Task 8 (fork identity tables and axis compaction), Tasks 5 and 6 (join base, the switch), 14, 15, then the G5 final review.</td></tr>
-<tr><td>File Share surfacing</td><td><code>plans/2026-11-17-file-share-surfacing.html</code></td><td>Tasks 1–9 done (to d8cfcf9). Off until an administrator approves a folder.</td><td>Task 10 of 27. Its migration is now <code>0022</code> (renumbered in the release); later File Share migrations take the next free number, not the plan's 0021.</td></tr>
+<tr><td>File Share surfacing</td><td><code>plans/2026-11-17-file-share-surfacing.html</code></td><td>Tasks 1–9 done, plus the Linux fixes found by the first Linux run (to 750c144). Off until an administrator approves a folder.</td><td>Task 10 of 27, which also takes the Linux duplicate-share fix (compare the folder's device and inode at connect, because SMB mounts ignore letter case). Its migration is now <code>0022</code> (renumbered in the release); later File Share migrations take the next free number, not the plan's 0021. Plan steps written for Windows only (for example the Recycle Bin for deletes) need a Linux equivalent.</td></tr>
 <tr><td>S3 surfacing</td><td><code>plans/2026-11-18-s3-surfacing.html</code> (in the S3 worktree)</td><td>Task 2 (SigV4 signing) done. Library only.</td><td>Task 3. Builds on File Share.</td></tr>
 <tr><td>Build speed</td><td>—</td><td>Parallel GitHub check done.</td><td>Combine the 69 server/records integration test files into one test program per crate; use <code>rust-lld</code>; set dev debug info to line tables only.</td></tr>
 </tbody></table></div>
@@ -65,6 +65,9 @@
 <tr><td>Desktop GridCraft builds are refused in shared rooms for now.</td><td>Only the browser build is proven identical between peers.</td></tr>
 <tr><td>GitHub Actions runs the full test suite; local machines run only the tests for what changed.</td><td>The PC was saturated by parallel builds.</td></tr>
 <tr><td>Codex is not used unless the owner asks again.</td><td>Owner's instruction, 19 November 2026.</td></tr>
+<tr><td>File Share is not Windows-only: it must work on Linux servers (Linux paths, mounted SMB/CIFS shares) as well as Windows UNC and drive paths. Gaps are closed, never hidden behind <code>cfg(windows)</code>. Off Windows, a UNC or drive path is refused as <code>other_system</code>; <code>/</code> is refused like <code>C:\</code>.</td><td>Owner's decision, 20 November 2026, after the first Linux test run failed 69 share tests.</td></tr>
+<tr><td>The settings audit event for approved share folders keeps the full folder paths.</td><td>It records an administrator's own settings change; an exception to "events carry counts and library-relative paths only". Owner, 20 November 2026.</td></tr>
+<tr><td>The owner is moving day-to-day coding to GitHub Copilot with Claude models; this page and <code>.github/copilot-instructions.md</code> carry the context.</td><td>Owner, 20 November 2026.</td></tr>
 </tbody></table></div>
 
 <h2>Unfinished features and how they stay off</h2>

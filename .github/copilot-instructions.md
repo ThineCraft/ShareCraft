@@ -20,6 +20,9 @@ product decisions.
 - Commits in this repository end with a `Co-Authored-By:` line for the agent that wrote them.
   (The GridCraft fork is the opposite: no attribution there; see its `AGENTS.md`.)
 - Do not use OpenAI Codex for this work unless the owner asks again.
+- ShareCraft runs on Windows and Linux servers. Never hide a failing test or feature behind
+  `cfg(windows)`; close the Linux gap (File Share: Linux paths and mounted SMB/CIFS shares as well
+  as Windows UNC and drive paths).
 
 ## How work is done here
 
