@@ -47,7 +47,10 @@ use uuid::Uuid;
 
 const OWNER: &str = "octo-org";
 const REPO: &str = "docs";
+#[cfg(windows)]
 const SHARE_ROOT: &str = r"C:\source-readonly";
+#[cfg(not(windows))]
+const SHARE_ROOT: &str = "/source-readonly";
 /// The refusal's message, word for word.
 const MESSAGE: &str =
     "This library is kept in step with an outside source, so it cannot be changed here.";

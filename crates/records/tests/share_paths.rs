@@ -12,7 +12,7 @@ use records::test_support::TestDb;
 use records::{
     AccessError, DEFAULT_SOURCE_MAX_FILES, PathRefusal, SHARE_CACHE_MAX_BYTES, SHARE_LIST_SECONDS,
     SHARE_ROOTS, SOURCE_MAX_FILES, SharePath, approved_root, hidden_by_default, reserved_name,
-    valid_root, windows_safe_name,
+    usable_here, usable_on, valid_root, windows_safe_name,
 };
 use serde_json::json;
 
@@ -236,6 +236,29 @@ fn a_whole_drive_or_bare_admin_share_is_not_a_valid_root() {
     );
     assert!(valid_root(&SharePath::parse(r"\\server\share").unwrap()).is_ok());
     assert!(valid_root(&SharePath::parse(r"\\server\C$\folder").unwrap()).is_ok());
+}
+
+#[test]
+fn the_whole_posix_file_system_is_not_a_valid_root_but_a_mount_point_is() {
+    assert_eq!(
+        valid_root(&SharePath::parse("/").unwrap()),
+        Err(PathRefusal::WholeDrive)
+    );
+    assert!(valid_root(&SharePath::parse("/mnt/share").unwrap()).is_ok());
+}
+
+#[test]
+fn unc_and_drive_paths_are_usable_only_on_windows() {
+    let unc = SharePath::parse(r"\\server\share\folder").unwrap();
+    let drive = SharePath::parse(r"C:\approved").unwrap();
+    let posix = SharePath::parse("/mnt/share").unwrap();
+    for path in [&unc, &drive, &posix] {
+        assert_eq!(usable_on(path, true), Ok(()));
+    }
+    assert_eq!(usable_on(&unc, false), Err(PathRefusal::OtherSystem));
+    assert_eq!(usable_on(&drive, false), Err(PathRefusal::OtherSystem));
+    assert_eq!(usable_on(&posix, false), Ok(()));
+    assert_eq!(usable_here(&unc).is_ok(), cfg!(windows));
 }
 
 #[test]

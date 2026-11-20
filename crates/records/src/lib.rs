@@ -83,7 +83,8 @@ pub use scopes::{Crumb, Cursor, Listed, NodeAccess};
 pub use settings::{ANYONE_LINK_MAX_DAYS, ANYONE_LINKS, SharingSettings};
 pub use share_paths::{
     PathRefusal, SHARE_CACHE_MAX_BYTES, SHARE_LIST_SECONDS, SHARE_ROOTS, SharePath, ShareSettings,
-    approved_root, hidden_by_default, reserved_name, valid_root, windows_safe_name,
+    approved_root, hidden_by_default, reserved_name, usable_here, usable_on, valid_root,
+    windows_safe_name,
 };
 pub use sites::{
     AdminSite, DEFAULT_LANGUAGE, DEFAULT_TIME_ZONE, GLOBAL_NAVIGATION, NavScope, RegionalDefaults,
