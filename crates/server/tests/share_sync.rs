@@ -1278,13 +1278,25 @@ async fn events_carry_counts_and_no_path() {
     env.fake.put("folder/a.txt", b"a");
     env.fake.put("b.txt", b"b");
     env.synced_at(OffsetDateTime::UNIX_EPOCH).await;
-    let events = env
-        .server
-        .records_db()
-        .events_of_kind("source.synced")
-        .await
-        .unwrap();
-    let detail = &events.first().expect("source.synced event").detail;
+    // Events are written by a background task, so the sync can answer before its event is in.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let event = loop {
+        let events = env
+            .server
+            .records_db()
+            .events_of_kind("source.synced")
+            .await
+            .unwrap();
+        if let Some(event) = events.into_iter().next() {
+            break event;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "source.synced event"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+    let detail = &event.detail;
     assert_eq!(detail["added"], 2);
     assert_eq!(detail["files"], 2);
     assert!(detail.get("seconds").is_some());
