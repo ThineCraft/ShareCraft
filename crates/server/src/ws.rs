@@ -140,7 +140,13 @@ async fn visitor(
         expires_at: session.expires_at,
         name: session.user.name,
         role,
-        kind: if state.config().live_editors.contains(&document.editor) {
+        kind: if state.config().live_editors.contains(&document.editor)
+            && state
+                .editors()
+                .get(document.editor.id())
+                .and_then(|manifest| manifest.live_format())
+                .is_some()
+        {
             RoomKind::Live
         } else if document.editor.is_file() {
             RoomKind::File

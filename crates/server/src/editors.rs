@@ -37,6 +37,7 @@ pub struct Source {
 
 /// What `cargo xtask editors build` wrote about an installed editor.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Manifest {
     /// The editor's id: the folder name, and an [`Editor`] id other than `text`.
     pub id: String,
@@ -52,9 +53,27 @@ pub struct Manifest {
     pub script_hashes: Vec<String>,
     /// `sha256-…` of each inline style in `index.html`.
     pub style_hashes: Vec<String>,
+    /// Optional live protocol capability.
+    pub live: Option<LiveManifest>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiveManifest {
+    pub protocol: u32,
+    pub format: String,
 }
 
 impl Manifest {
+    /// Whether this installed build advertises the server's live protocol and format.
+    #[must_use]
+    pub fn live_format(&self) -> Option<&str> {
+        self.live
+            .as_ref()
+            .filter(|live| live.protocol == protocol::live::LIVE_PROTOCOL)
+            .filter(|live| live.format == "gridcraft/1")
+            .map(|live| live.format.as_str())
+    }
     /// The Content-Security-Policy of this editor's files: its own files, WebAssembly, and the
     /// inline scripts and styles its manifest names by hash; no `<base>` and no form submissions.
     /// `object-src` is left to `default-src 'self'`: the editors print through a `blob:` PDF in
@@ -348,5 +367,17 @@ mod tests {
         let manifest = manifest.unwrap();
         assert_eq!(manifest.id, "gridcraft");
         assert_eq!(manifest.script_hashes.len(), 1);
+        assert_eq!(manifest.live_format(), Some("gridcraft/1"));
+    }
+
+    #[test]
+    fn mismatched_live_protocol_or_format_keeps_the_file_session() {
+        let mut manifest = serde_json::from_str::<Manifest>(include_str!("../../../xtask/tests/fixtures/editor.json")).unwrap();
+        assert_eq!(manifest.live_format(), Some("gridcraft/1"));
+        manifest.live.as_mut().unwrap().protocol = 2;
+        assert_eq!(manifest.live_format(), None);
+        manifest.live.as_mut().unwrap().protocol = protocol::live::LIVE_PROTOCOL;
+        manifest.live.as_mut().unwrap().format = "gridcraft/2".to_owned();
+        assert_eq!(manifest.live_format(), None);
     }
 }

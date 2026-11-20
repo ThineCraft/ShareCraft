@@ -763,7 +763,9 @@ async fn text_documents_still_default() {
 async fn document_answer_names_the_live_behind_mark() {
     let server = spawn_server().await;
     let ann = server.user("ann").await;
-    let doc = create_doc(&server, &ann, "Book.xlsx").await;
+    let (status, body) = post_doc(&server, &ann, json!({ "name": "Book.xlsx", "editor": "gridcraft" })).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let doc = body["id"].as_str().unwrap().to_owned();
     let (status, body) = call(
         &server,
         Some(&ann),
@@ -776,4 +778,5 @@ async fn document_answer_names_the_live_behind_mark() {
     assert_eq!(body["live"]["behind"], false);
     assert_eq!(body["live"]["head"], 0);
     assert_eq!(body["live"]["stored_through"], 0);
+    assert_eq!(body["session"], "file");
 }

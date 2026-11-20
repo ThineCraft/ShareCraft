@@ -9,6 +9,7 @@ branch   = "sharecraft"
 commit   = "017d0b9d5d167096bcba7d7216569476f80b9046"
 app      = "apps/gridcraft-web"
 checkout = "../GridCraft"
+live_format = "gridcraft/1"
 
 [wordcraft]
 upstream = "https://github.com/storytold/wordcraft"

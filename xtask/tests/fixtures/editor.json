@@ -5,6 +5,10 @@
     "repository": "https://github.com/ThineCraft/GridCraft"
   },
   "id": "gridcraft",
+  "live": {
+    "format": "gridcraft/1",
+    "protocol": 1
+  },
   "script_hashes": [
     "sha256-O5JTT//82Kx49BrvVhdpg+8xboXFwBQ1Tq7v8lYWyX4="
   ],

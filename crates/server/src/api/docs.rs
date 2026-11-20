@@ -122,6 +122,8 @@ pub(crate) struct DocDetail {
     /// The caller's access: `{perms, roles}`.
     access: Access,
     revision: Option<String>,
+    /// The session kind the document answer routes to.
+    session: &'static str,
     /// Whether a live log has entries beyond the newest stored revision.
     live: records::LiveBehind,
     /// `held` while the malware scanner holds the current version, `quarantined` when it is
@@ -168,12 +170,26 @@ pub(crate) async fn open(
             stored_through: collab_core::ids::Seq(0),
         });
     let (scan, threat) = scan_fields(mark);
+    let session = if state.config().live_editors.contains(&document.editor)
+        && state
+            .editors()
+            .get(document.editor.id())
+            .and_then(|manifest| manifest.live_format())
+            .is_some()
+    {
+        "live"
+    } else if document.editor.is_file() {
+        "file"
+    } else {
+        "text"
+    };
     Ok(Json(DocDetail {
         id: document.id.0.to_string(),
         name: document.name,
         editor: document.editor,
         access,
         revision: document.revision,
+        session,
         live,
         scan,
         threat,

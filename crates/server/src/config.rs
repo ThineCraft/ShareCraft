@@ -149,6 +149,9 @@ pub enum ConfigError {
          or fragment"
     )]
     BadGithubApi,
+    /// A live-editor setting names an editor that cannot co-author.
+    #[error("SHARECRAFT_LIVE_EDITORS names {0:?}; only gridcraft can co-author")]
+    BadLiveEditors(String),
 }
 
 /// The raw production-mode settings, as read from the environment.
@@ -160,6 +163,25 @@ pub struct DeploymentValues<'a> {
     pub trusted_proxies: Option<&'a str>,
     /// `SHARECRAFT_HSTS_SECONDS`.
     pub hsts_seconds: Option<&'a str>,
+}
+
+fn live_editors_from(value: Option<&str>) -> Result<Vec<Editor>, ConfigError> {
+    let mut editors = Vec::new();
+    let Some(value) = value else {
+        return Ok(editors);
+    };
+    for item in value.split(',') {
+        match item.trim() {
+            "" => {}
+            "gridcraft" => {
+                if !editors.contains(&Editor::GridCraft) {
+                    editors.push(Editor::GridCraft);
+                }
+            }
+            other => return Err(ConfigError::BadLiveEditors(other.to_owned())),
+        }
+    }
+    Ok(editors)
 }
 
 impl Config {
@@ -182,6 +204,7 @@ impl Config {
         let trusted_proxies = read_var("SHARECRAFT_TRUSTED_PROXIES")?;
         let hsts_seconds = read_var("SHARECRAFT_HSTS_SECONDS")?;
         let github_api = github_api_from(read_var("SHARECRAFT_GITHUB_API")?.as_deref())?;
+        let live_editors = live_editors_from(read_var("SHARECRAFT_LIVE_EDITORS")?.as_deref())?;
         let mut config = Self::from_values_in(
             DeploymentValues {
                 public_url: public_url.as_deref(),
@@ -196,6 +219,7 @@ impl Config {
             max_file_bytes.as_deref(),
         )?;
         config.github_api = github_api;
+        config.live_editors = live_editors;
         Ok(config)
     }
 
@@ -367,6 +391,22 @@ fn read_var(name: &'static str) -> Result<Option<String>, ConfigError> {
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_editors_default_stays_empty() {
+        assert_eq!(live_editors_from(None).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn live_editors_reads_gridcraft_and_refuses_unknown_editors() {
+        assert_eq!(
+            live_editors_from(Some(" gridcraft ")).unwrap(),
+            vec![Editor::GridCraft]
+        );
+        for value in ["wordcraft", "pdfcraft", "solidcraft", "unknown"] {
+            assert!(live_editors_from(Some(value)).is_err(), "{value}");
+        }
+    }
 
     #[test]
     fn defaults_are_local() {
