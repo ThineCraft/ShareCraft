@@ -23,11 +23,11 @@ tbody tr:nth-child(even)>td,tbody tr:nth-child(even)>th{background:light-dark(#f
 <p class="eyebrow">ThineCraft / ShareCraft decision paper</p>
 <h1>Co-authoring in the real editors</h1>
 <p class="lede">Who reconciles two people's changes, who writes the saved file, and what the rules are for a spreadsheet. Adopted by the owner on 11 November 2026, ahead of the Stage 2 plan.</p>
-<div class="meta"><span>Version 1.5 · Adopted by the owner, 11 November 2026; G4 build notes added 19 November 2026</span><span>19 November 2026</span><span>Changes in 1.5: the G4 checkpoint rules after the final review (<a href="#changes15" style="color:inherit">list</a>)</span><span>Companion to <a href="sequencing.html" style="color:inherit">sequencing.html</a>, <a href="editor-readiness.html" style="color:inherit">editor-readiness.html</a> and <a href="scope.html" style="color:inherit">scope.html</a> (D16, D22, SC-15)</span></div>
+<div class="meta"><span>Version 1.6 · Adopted by the owner, 11 November 2026; G4 and G5 build notes added 19 November 2026</span><span>19 November 2026</span><span>Changes in 1.6: G4 and the first G5 parts merged, still off (<a href="#changes16" style="color:inherit">list</a>)</span><span>Companion to <a href="sequencing.html" style="color:inherit">sequencing.html</a>, <a href="editor-readiness.html" style="color:inherit">editor-readiness.html</a> and <a href="scope.html" style="color:inherit">scope.html</a> (D16, D22, SC-15)</span></div>
 </header>
 <div class="layout">
 <nav aria-label="Document contents"><p>In this document</p>
-<a href="#summary">01 · Summary</a><a href="#today">02 · What exists today</a><a href="#options">03 · Who reconciles</a><a href="#shape">04 · How it works</a><a href="#checkpoint">05 · Who writes the checkpoint</a><a href="#identities">06 · GridCraft: identities</a><a href="#conflicts">07 · GridCraft: conflict rules</a><a href="#undo">08 · GridCraft: undo</a><a href="#others">09 · The other editors</a><a href="#library">10 · Shared library and forks</a><a href="#spine">11 · Changes to the spine</a><a href="#risks">12 · Risks and open questions</a><a href="#outofscope">13 · Out of scope</a><a href="#decisions">14 · Decisions asked</a><a href="#method">15 · How this was established</a><a href="#changes03">Changes in v0.3</a><a href="#changes10">Changes in v1.0</a><a href="#changes11">Changes in v1.1</a><a href="#changes12">Changes in v1.2</a><a href="#changes13">Changes in v1.3</a><a href="#changes14">Changes in v1.4</a><a href="#changes15">Changes in v1.5</a>
+<a href="#summary">01 · Summary</a><a href="#today">02 · What exists today</a><a href="#options">03 · Who reconciles</a><a href="#shape">04 · How it works</a><a href="#checkpoint">05 · Who writes the checkpoint</a><a href="#identities">06 · GridCraft: identities</a><a href="#conflicts">07 · GridCraft: conflict rules</a><a href="#undo">08 · GridCraft: undo</a><a href="#others">09 · The other editors</a><a href="#library">10 · Shared library and forks</a><a href="#spine">11 · Changes to the spine</a><a href="#risks">12 · Risks and open questions</a><a href="#outofscope">13 · Out of scope</a><a href="#decisions">14 · Decisions asked</a><a href="#method">15 · How this was established</a><a href="#changes03">Changes in v0.3</a><a href="#changes10">Changes in v1.0</a><a href="#changes11">Changes in v1.1</a><a href="#changes12">Changes in v1.2</a><a href="#changes13">Changes in v1.3</a><a href="#changes14">Changes in v1.4</a><a href="#changes15">Changes in v1.5</a><a href="#changes16">Changes in v1.6</a>
 </nav>
 <main id="main">
 <div class="toolbar"><span class="small">Standalone HTML · Print-ready · No external assets</span><button type="button" onclick="window.print()">Print / Save PDF</button></div>
@@ -511,8 +511,19 @@ tbody tr:nth-child(even)>td,tbody tr:nth-child(even)>th{background:light-dark(#f
 <tr><td>Older editors joining</td><td>Refused silently.</td><td>Join as a browser that cannot write checkpoints and is not returning.</td></tr>
 </tbody></table></div>
 <p><strong>What GridCraft must send.</strong> The verifier&rsquo;s answer now carries the SHA-256 of the identity data its own checkpoint would upload, beside the SHA-256 of the file. The fork change is recorded in the G4 final-fix report.</p>
+<h3 id="changes16">Changes in version 1.6, after G4 and G5 were merged</h3>
+<p>G4 and the first G5 parts were merged into the release integration branch on 19 November 2026 (<a href="BUILDING.html#live-host">BUILDING.html sections 35 and 38</a>). Decisions C1 to C23 are unchanged. <strong>Live co-authoring is still off:</strong> <code>Config.live_editors</code> is empty and the document answer has no <code>session</code> field yet (G5 Task 6), so every GridCraft document opens as a file session.</p>
+<div class="table-wrap"><table class="banded"><caption>How the G5 parts fit G4&rsquo;s rules</caption>
+<thead><tr><th>Part</th><th>Rule after the merge</th></tr></thead>
+<tbody>
+<tr><td>Presence (C11)</td><td>Latest note only, relayed and never stored, at most 1,024 bytes.</td></tr>
+<tr><td>A returning person (C9)</td><td>The others are told at G4&rsquo;s return barrier, when the version before the returning work is stored, not at the join.</td></tr>
+<tr><td>Saved notices (C6)</td><td>Say whether a checkpoint is stored or verified and whether it is a major version. A dispute that keeps both copies is reported as a mismatch, which owners see.</td></tr>
+<tr><td>Desktop builds (C5, C16)</td><td>Refused in GridCraft rooms until the maths library difference is gone. G4&rsquo;s same-build checking rule stays.</td></tr>
+<tr><td>Verify answers</td><td>The page posts both hashes, of the file and of the identity data, as G4 requires.</td></tr>
+</tbody></table></div>
 </section>
 
-<footer>ShareCraft · ThineCraft · Co-authoring Approach v1.5 · 19 November 2026<br>Adopted by the owner on 11 November 2026, as recommended. Read with Scope of Works v0.22 (D22) and Sequencing Plan v0.20.</footer>
+<footer>ShareCraft · ThineCraft · Co-authoring Approach v1.6 · 19 November 2026<br>Adopted by the owner on 11 November 2026, as recommended. Read with Scope of Works v0.23 (D22) and Sequencing Plan v0.21.</footer>
 </main></div>
 </body></html>
