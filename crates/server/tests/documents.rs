@@ -758,3 +758,22 @@ async fn text_documents_still_default() {
     assert_eq!(status, StatusCode::CREATED);
     assert_eq!(body["editor"], "text");
 }
+
+#[tokio::test]
+async fn document_answer_names_the_live_behind_mark() {
+    let server = spawn_server().await;
+    let ann = server.user("ann").await;
+    let doc = create_doc(&server, &ann, "Book.xlsx").await;
+    let (status, body) = call(
+        &server,
+        Some(&ann),
+        Method::GET,
+        &format!("/api/docs/{doc}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["live"]["behind"], false);
+    assert_eq!(body["live"]["head"], 0);
+    assert_eq!(body["live"]["stored_through"], 0);
+}

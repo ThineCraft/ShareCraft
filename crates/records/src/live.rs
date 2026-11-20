@@ -187,6 +187,14 @@ pub struct LiveLoaded {
     pub retained_session_data: Vec<LiveSessionDataRow>,
 }
 
+/// Where a document's live log stands relative to its stored file revisions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct LiveBehind {
+    pub behind: bool,
+    pub head: Seq,
+    pub stored_through: Seq,
+}
+
 /// A live session.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LiveSessionRow {
@@ -644,6 +652,32 @@ async fn insert_live_checkpoint(
 }
 
 impl Db {
+    /// Reports whether a live log has entries beyond the newest stored live checkpoint.
+    pub async fn live_behind(&self, doc: DocId) -> Result<Option<LiveBehind>, DbError> {
+        let live = self.load_live(doc).await?;
+        if live.format.is_none() {
+            return Ok(None);
+        }
+        let stored_through = live
+            .verified_checkpoint
+            .as_ref()
+            .map_or(live.verified_through, |checkpoint| {
+                live.verified_through.max(checkpoint.through)
+            })
+            .max(
+                live.unverified_checkpoints
+                    .iter()
+                    .map(|checkpoint| checkpoint.through)
+                    .max()
+                    .unwrap_or(Seq(0)),
+            );
+        Ok(Some(LiveBehind {
+            behind: live.head > stored_through,
+            head: live.head,
+            stored_through,
+        }))
+    }
+
     /// `doc`'s live log: its head, its kept entries after the verified position, its open
     /// session with every place in it, and its clients.
     pub async fn load_live(&self, doc: DocId) -> Result<LiveLoaded, DbError> {

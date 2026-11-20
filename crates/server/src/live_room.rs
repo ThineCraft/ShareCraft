@@ -1901,6 +1901,19 @@ impl<S: LiveStore> LiveRoom<S> {
                 node: Some(self.doc.into()),
                 detail: serde_json::json!({ "head": self.head.0, "entries": entries }),
             });
+            if self.head > self.saved_through {
+                self.events.emit(NewEvent {
+                    kind: "live.file_behind",
+                    actor: None,
+                    subject: None,
+                    document: Some(self.doc),
+                    node: Some(self.doc.into()),
+                    detail: serde_json::json!({
+                        "head": self.head.0,
+                        "stored_through": self.saved_through.0
+                    }),
+                });
+            }
             self.session = None;
         }
         Ok(())
@@ -6203,6 +6216,34 @@ mod tests {
 
         let bob = join_as(&mut room, 2, 2, 12, "editor", FORMAT, None, None).await;
         assert_eq!(bob.participant, ParticipantNo(2));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn session_end_with_unsaved_entries_marks_the_file_behind() {
+        let store = MemStore::new();
+        let (events, mut event_rx) = EventSink::channel();
+        let mut room = LiveRoom::load(DocId(id(100)), store, events, timing())
+            .await
+            .unwrap();
+        let ann = join_as(&mut room, 1, 1, 11, "editor", FORMAT, None, None).await;
+        entry(&mut room, &ann, 1, 0, FORMAT, "unsaved".into())
+            .await
+            .unwrap();
+        room.handle(LiveCommand::Leave {
+            conn: ann.conn,
+            client: ann.client,
+        })
+        .await
+        .unwrap();
+        room.settle().await.unwrap();
+
+        let behind = std::iter::from_fn(|| event_rx.try_recv().ok())
+            .find(|event| event.kind == "live.file_behind")
+            .expect("live.file_behind event");
+        assert_eq!(
+            behind.detail,
+            serde_json::json!({ "head": 1, "stored_through": 0 })
+        );
     }
 
     #[tokio::test(start_paused = true)]

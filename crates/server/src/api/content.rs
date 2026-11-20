@@ -57,6 +57,8 @@ use crate::{AppState, auth::Signed};
 const SEAT_HEADER: &str = "x-sharecraft-seat";
 /// The response header naming the revision a download holds.
 const REVISION_HEADER: &str = "x-sharecraft-revision";
+/// The response header saying the stored file is behind live entries.
+const LIVE_BEHIND_HEADER: &str = "x-sharecraft-live-behind";
 /// How many times a kept-both upload picks its name again when it is taken meanwhile.
 const NAME_ATTEMPTS: usize = 5;
 /// How much of a file a download reads and sends at a time.
@@ -66,6 +68,12 @@ const DOWNLOAD_CHUNK: usize = 64 * 1024;
 #[derive(Deserialize)]
 pub(crate) struct DownloadQuery {
     revision: Option<String>,
+}
+
+/// Query of `GET /api/docs/{id}/live-base`.
+#[derive(Deserialize)]
+pub(crate) struct LiveBaseQuery {
+    at: u64,
 }
 
 /// Query of `PUT /api/docs/{id}/content`.
@@ -286,11 +294,88 @@ pub(crate) async fn download(
         }
         None => match blocking(&state, move |store| store.load(doc)).await? {
             Some(stored) => stored,
-            None => return Ok(StatusCode::NO_CONTENT.into_response()),
+            None => {
+                let mut answer = StatusCode::NO_CONTENT.into_response();
+                if db
+                    .live_behind(doc)
+                    .await
+                    .map_err(|e| ApiError::unavailable(&e))?
+                    .is_some_and(|live| live.behind)
+                {
+                    answer.headers_mut().insert(
+                        HeaderName::from_static(LIVE_BEHIND_HEADER),
+                        HeaderValue::from_static("1"),
+                    );
+                }
+                return Ok(answer);
+            }
         },
     };
 
-    file_answer(&state, &document.name, stored, headers.get(RANGE)).await
+    let mut answer = file_answer(&state, &document.name, stored, headers.get(RANGE)).await?;
+    if db
+        .live_behind(doc)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?
+        .is_some_and(|live| live.behind)
+    {
+        answer.headers_mut().insert(
+            HeaderName::from_static(LIVE_BEHIND_HEADER),
+            HeaderValue::from_static("1"),
+        );
+    }
+    Ok(answer)
+}
+
+/// `GET /api/docs/{id}/live-base?at={seq}`: opaque identity data for the room's current base.
+/// The base is plain-file data only when no verified checkpoint exists.
+pub(crate) async fn live_base(
+    State(state): State<AppState>,
+    signed: Signed,
+    Path(id): Path<String>,
+    query: Result<Query<LiveBaseQuery>, QueryRejection>,
+) -> Result<Response, ApiError> {
+    let doc = DocId(parse_id(&id)?);
+    let db = state.db();
+    db.doc_access(signed.session.user.id, doc)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?
+        .ok_or(ApiError::NotFound)?;
+    let query = query_of(query)?;
+    let at = Seq(query.at);
+    let loaded = db
+        .load_live(doc)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?;
+    if loaded.format.is_none()
+        && loaded.open_session.is_none()
+        && loaded.verified_checkpoint.is_none()
+        && loaded.unverified_checkpoints.is_empty()
+        && loaded.head == Seq(0)
+    {
+        return Ok(ApiError::NotFound.into_response());
+    }
+    if at != loaded.verified_through {
+        return Ok(StatusCode::CONFLICT.into_response());
+    }
+    let mut headers = HeaderMap::new();
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    match loaded.verified_checkpoint {
+        Some(checkpoint) if !checkpoint.session_data.is_empty() => {
+            headers.insert(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/octet-stream"),
+            );
+            let mut response = Body::from(checkpoint.session_data).into_response();
+            *response.headers_mut() = headers;
+            Ok(response)
+        }
+        _ => {
+            let mut response = StatusCode::NO_CONTENT.into_response();
+            *response.headers_mut() = headers;
+            Ok(response)
+        }
+    }
 }
 
 /// Which bytes of a file a download sends.

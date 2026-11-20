@@ -15,11 +15,12 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use collab_core::ids::DocId;
+use collab_core::ids::{ClientId, DocId, Seq};
 use common::{
     FileClient, Site, TestServer, TestUser, new_doc, spawn_server, spawn_server_config,
     spawn_server_with, wait_events,
 };
+use records::NewLiveChange;
 use reqwest::StatusCode;
 use reqwest::header::{
     CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_SECURITY_POLICY, CONTENT_TYPE, ORIGIN,
@@ -31,6 +32,7 @@ use revisions::{
 };
 use serde_json::Value;
 use server::Checkpointer;
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 const SEAT: &str = "x-sharecraft-seat";
@@ -919,5 +921,85 @@ async fn file_session_events_are_recorded() {
     assert_eq!(
         saved.detail["authors"],
         serde_json::json!([ann.id.0.to_string()])
+    );
+}
+
+#[tokio::test]
+async fn live_base_plain_file_revision_is_not_cached() {
+    let server = spawn_server().await;
+    let ann = server.user("Ann").await;
+    let doc = new_doc();
+    server.create_file_document(doc, &ann).await;
+    server
+        .db
+        .db
+        .start_live_session(
+            doc,
+            Uuid::new_v4(),
+            "gridcraft/1",
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap();
+
+    let response = server
+        .http(Some(&ann))
+        .get(server.url(&format!("/api/docs/{}/live-base", doc.0)))
+        .query(&[("at", "0")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(response.headers().get(CACHE_CONTROL).unwrap(), "no-store");
+}
+
+#[tokio::test]
+async fn download_says_when_the_file_is_behind() {
+    let server = spawn_server().await;
+    let ann = server.user("Ann").await;
+    let doc = new_doc();
+    server.create_file_document(doc, &ann).await;
+    let session = Uuid::new_v4();
+    server
+        .db
+        .db
+        .start_live_session(doc, session, "gridcraft/1", OffsetDateTime::now_utc())
+        .await
+        .unwrap();
+    server
+        .db
+        .db
+        .append_live_change(
+            doc,
+            &NewLiveChange {
+                seq: Seq(1),
+                session,
+                client: ClientId(Uuid::new_v4()),
+                local: 1,
+                participant: 1,
+                user: ann.id,
+                seen: Seq(0),
+                at: OffsetDateTime::now_utc(),
+                seed: 1,
+                format: "gridcraft/1",
+                payload: b"change",
+                witnesses: &[],
+            },
+        )
+        .await
+        .unwrap();
+
+    let loaded = server.db.db.load_live(doc).await.unwrap();
+    assert_eq!(loaded.head, Seq(1));
+    let live = server.db.db.live_behind(doc).await.unwrap();
+    assert_eq!(live.map(|live| live.behind), Some(true));
+
+    let response = download(&server, Some(&ann), doc, None).await;
+    assert_eq!(
+        response
+            .headers()
+            .get("x-sharecraft-live-behind")
+            .map(|value| value.as_bytes()),
+        Some("1".as_bytes())
     );
 }

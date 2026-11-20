@@ -236,6 +236,7 @@ pub(crate) fn router() -> Router<AppState> {
         )
         .route("/uploads/{id}/finish", post(uploads::finish))
         .route("/docs/{id}", get(docs::open))
+        .route("/docs/{id}/live-base", get(content::live_base))
         .route(
             "/docs/{id}/content",
             get(content::download).put(content::save),

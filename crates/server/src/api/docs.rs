@@ -122,6 +122,8 @@ pub(crate) struct DocDetail {
     /// The caller's access: `{perms, roles}`.
     access: Access,
     revision: Option<String>,
+    /// Whether a live log has entries beyond the newest stored revision.
+    live: records::LiveBehind,
     /// `held` while the malware scanner holds the current version, `quarantined` when it is
     /// infected; absent when it is available.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -156,6 +158,15 @@ pub(crate) async fn open(
         .scan_mark(doc)
         .await
         .map_err(|e| ApiError::unavailable(&e))?;
+    let live = db
+        .live_behind(doc)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?
+        .unwrap_or(records::LiveBehind {
+            behind: false,
+            head: collab_core::ids::Seq(0),
+            stored_through: collab_core::ids::Seq(0),
+        });
     let (scan, threat) = scan_fields(mark);
     Ok(Json(DocDetail {
         id: document.id.0.to_string(),
@@ -163,6 +174,7 @@ pub(crate) async fn open(
         editor: document.editor,
         access,
         revision: document.revision,
+        live,
         scan,
         threat,
     }))
