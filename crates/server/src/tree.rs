@@ -544,7 +544,8 @@ pub async fn apply(state: &AppState, actor: &User, op: TreeOp) -> Result<Applied
 /// Moves every live direct child of a connected share library to the recycle bin in one tree
 /// commit and one database transaction. The caller has authorised the library operation; child
 /// scopes are therefore not re-authorised. A retry is idempotent because only live children are
-/// selected, and the source row is deliberately not touched here.
+/// selected, and the source row is deliberately not touched here. The library's
+/// `manage_access` is judged again in the transaction.
 pub(crate) async fn delete_source_children(
     state: &AppState,
     actor: &User,
@@ -613,6 +614,10 @@ pub(crate) async fn delete_source_children(
         undo,
         events,
         deleted,
+        // The library-level authorisation is judged again inside the transaction, so a
+        // revocation while the disconnect waited for the source turn still stops it. The
+        // children are deliberately not re-judged.
+        needs: vec![(library, Perms::MANAGE_ACCESS)],
         take_back_on_failure: true,
         ..Plan::default()
     };

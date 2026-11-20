@@ -444,3 +444,59 @@ async fn setting_batch_validates_every_key_before_changing_any() {
         Some(json!(120))
     );
 }
+
+#[tokio::test]
+async fn a_failed_write_in_a_setting_batch_leaves_every_key_unchanged() {
+    let test = TestDb::create().await;
+    let admin = user(&test, "AtomicAdmin", true).await;
+    test.db
+        .set_setting(admin.id, SHARE_LIST_SECONDS, json!(120))
+        .await
+        .unwrap();
+    let pool = test.db.test_pool();
+    // Both values pass validation; the second write is refused by the database itself.
+    assert_eq!(SHARE_CACHE_MAX_BYTES, "share_cache_max_bytes");
+    sqlx::query(
+        "create function fail_setting_write() returns trigger language plpgsql as $$ \
+         begin if new.key = 'share_cache_max_bytes' then \
+         raise exception 'injected settings failure'; end if; return new; end $$",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "create trigger fail_setting_write before insert or update on settings \
+         for each row execute function fail_setting_write()",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let events_before: i64 =
+        sqlx::query_scalar("select count(*) from events where kind = 'setting.changed'")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert!(
+        test.db
+            .set_settings(
+                admin.id,
+                vec![
+                    (SHARE_LIST_SECONDS, json!(180)),
+                    (SHARE_CACHE_MAX_BYTES, json!(512_u64 * 1024 * 1024)),
+                ],
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        test.db.setting(SHARE_LIST_SECONDS).await.unwrap(),
+        Some(json!(120))
+    );
+    let events_after: i64 =
+        sqlx::query_scalar("select count(*) from events where kind = 'setting.changed'")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(events_after, events_before);
+}

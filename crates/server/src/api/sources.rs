@@ -6,6 +6,7 @@
 //! reach the database, and no answer, event, log line or error carries one: the only exception
 //! is the webhook secret in the one answer that generates it.
 
+use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -25,14 +26,14 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use super::nodes::{node_id, require_manager, rfc3339};
-use super::settings::{overlaps_data_folder, path_reason};
+use super::settings::{SHARE_TURN_WAIT, overlaps_data_folder, path_reason};
 use super::{ApiError, JsonBody, to_completion};
 use crate::AppState;
 use crate::auth::Signed;
 use crate::github::{EntryKind, GithubError, Head, RepoRef};
 use crate::libraries;
 use crate::secrets::Secret;
-use crate::share::{FsBudget, canonical_share_path};
+use crate::share::{FsBudget, ShareFs, canonical_share_path};
 use crate::source_sync::{abandon_uploads_into, caps, token_context, token_of, webhook_context};
 use crate::tree::{self, TreeOp};
 
@@ -499,6 +500,33 @@ fn share_probe_error(error: &io::Error) -> ApiError {
     }
 }
 
+/// How many times a share connect resolves locations connected while it was resolving before
+/// it gives up with a retryable `503`.
+const SHARE_RESOLVE_ROUNDS: usize = 3;
+
+/// The canonical location of `path` within `root`, through the contained [`ShareFs`] seam,
+/// waiting no later than `deadline`. A timeout or any failure is the probe's refusal; the
+/// canonical path itself never appears in an answer or a log.
+async fn resolve_canonical(
+    fs: &Arc<dyn ShareFs>,
+    root: &SharePath,
+    path: &SharePath,
+    deadline: tokio::time::Instant,
+) -> Result<SharePath, ApiError> {
+    let fs = Arc::clone(fs);
+    let root = root.to_path_buf();
+    let candidate = path.to_path_buf();
+    let resolved = tokio::time::timeout_at(
+        deadline,
+        tokio::task::spawn_blocking(move || fs.canonical(&root, &candidate)),
+    )
+    .await
+    .map_err(|_| ApiError::ShareUnreachable("offline"))?
+    .map_err(|_| ApiError::ShareUnreachable("offline"))?
+    .map_err(|error| share_probe_error(&error))?;
+    canonical_share_path(&resolved).map_err(|_| ApiError::ShareUnreachable("offline"))
+}
+
 /// Makes a new read-only library backed by an administrator-approved file-share folder.
 pub(crate) async fn connect_share(
     State(state): State<AppState>,
@@ -569,60 +597,106 @@ pub(crate) async fn connect_share(
     .map_err(|_| ApiError::ShareUnreachable("offline"))?
     .map_err(|error| share_probe_error(&error))?;
 
-    // The probe deliberately happens before this turn: a root change does not wait on file
-    // system I/O. Once the turn is ours, read the roots again and hold it through the source
-    // insert, making a concurrent root removal linearise wholly before or after this commit.
-    let mut connection_turn = state
-        .db()
-        .lock_share_connections()
-        .await
-        .map_err(|e| ApiError::unavailable(&e))?;
-    let current_settings = state
-        .db()
-        .share_settings()
-        .await
-        .map_err(|e| ApiError::unavailable(&e))?;
-    let current_root = approved_root(&path, &current_settings.roots)
-        .cloned()
-        .ok_or(ApiError::ShareNotApproved)?;
-    let canonical_path = {
-        let fs = Arc::clone(&fs);
-        let root = current_root.to_path_buf();
-        let candidate = path.to_path_buf();
-        tokio::task::spawn_blocking(move || fs.canonical(&root, &candidate))
+    // Every file-system call happens outside the organisation-wide connection turn, so the
+    // turn never waits on share I/O. The new folder's canonical location and that of every
+    // share already connected are resolved at once, under one `list_seconds` deadline; an
+    // existing location that cannot be resolved in time falls back to its typed path. Under
+    // the turn only the database is touched: the roots and the connected locations are read
+    // again and compared with what was resolved. A location connected meanwhile was never
+    // resolved, so the turn is given up, just the new locations are resolved (with a fresh
+    // deadline), and the comparison is repeated; after a few rounds of that the answer is a
+    // retryable `503`.
+    let mut resolved: HashMap<String, Option<SharePath>> = HashMap::new();
+    let mut canonical_path: Option<SharePath> = None;
+    let mut held = None;
+    for _ in 0..SHARE_RESOLVE_ROUNDS {
+        let deadline = tokio::time::Instant::now() + max_time;
+        let unresolved: Vec<String> = state
+            .db()
+            .share_locations()
             .await
-            .map_err(|_| ApiError::ShareUnreachable("offline"))?
-            .map_err(|error| share_probe_error(&error))?
-    };
-    let canonical_path =
-        canonical_share_path(&canonical_path).map_err(|_| ApiError::ShareUnreachable("offline"))?;
-    let existing = state
-        .db()
-        .share_locations_locked(&mut connection_turn, NodeId(Uuid::nil()))
-        .await
-        .map_err(|e| ApiError::unavailable(&e))?;
-    for location in existing {
-        let lexical = SharePath::parse(&location).map_err(|_| ApiError::Unavailable)?;
-        let canonical = if let Some(root) = approved_root(&lexical, &current_settings.roots) {
-            let fs = Arc::clone(&fs);
-            let root = root.to_path_buf();
-            let candidate = lexical.to_path_buf();
-            tokio::task::spawn_blocking(move || fs.canonical(&root, &candidate))
-                .await
-                .ok()
-                .and_then(Result::ok)
-                .and_then(|value| canonical_share_path(&value).ok())
+            .map_err(|e| ApiError::unavailable(&e))?
+            .into_iter()
+            .filter(|location| !resolved.contains_key(location))
+            .collect();
+        let resolving_existing =
+            futures_util::future::join_all(unresolved.into_iter().map(|location| {
+                let fs = Arc::clone(&fs);
+                let roots = settings.roots.clone();
+                async move {
+                    let canonical = match SharePath::parse(&location) {
+                        Ok(lexical) => match approved_root(&lexical, &roots) {
+                            Some(root) => {
+                                resolve_canonical(&fs, root, &lexical, deadline).await.ok()
+                            }
+                            None => None,
+                        },
+                        Err(_) => None,
+                    };
+                    (location, canonical)
+                }
+            }));
+        let newly = if canonical_path.is_none() {
+            let (own, newly) = tokio::join!(
+                resolve_canonical(&fs, &approved, &path, deadline),
+                resolving_existing
+            );
+            canonical_path = Some(own?);
+            newly
         } else {
-            None
+            resolving_existing.await
         };
-        let conflict = canonical.as_ref().map_or_else(
-            || path.is_within(&lexical) || lexical.is_within(&path),
-            |existing| canonical_path.is_within(existing) || existing.is_within(&canonical_path),
-        );
-        if conflict {
-            return Err(ApiError::ShareLocationInUse);
+        resolved.extend(newly);
+        let Some(canonical_path) = canonical_path.as_ref() else {
+            return Err(ApiError::ShareUnreachable("offline"));
+        };
+
+        // The wait for the turn is bounded; a timeout is a retryable `503`. The turn is then
+        // held through the source insert, so a concurrent root change or connect linearises
+        // wholly before or after this commit.
+        let mut turn = state
+            .db()
+            .lock_share_connections(SHARE_TURN_WAIT)
+            .await
+            .map_err(|e| ApiError::unavailable(&e))?
+            .ok_or(ApiError::Unavailable)?;
+        let current_settings = state
+            .db()
+            .share_settings()
+            .await
+            .map_err(|e| ApiError::unavailable(&e))?;
+        if approved_root(&path, &current_settings.roots).is_none() {
+            return Err(ApiError::ShareNotApproved);
+        }
+        let existing = state
+            .db()
+            .share_locations_locked(&mut turn, NodeId(Uuid::nil()))
+            .await
+            .map_err(|e| ApiError::unavailable(&e))?;
+        let mut complete = true;
+        for location in existing {
+            let lexical = SharePath::parse(&location).map_err(|_| ApiError::Unavailable)?;
+            let lexical_conflict = path.is_within(&lexical) || lexical.is_within(&path);
+            let conflict = match resolved.get(&location) {
+                Some(Some(existing)) => {
+                    canonical_path.is_within(existing) || existing.is_within(canonical_path)
+                }
+                Some(None) => lexical_conflict,
+                None => {
+                    complete = false;
+                    lexical_conflict
+                }
+            };
+            if conflict {
+                return Err(ApiError::ShareLocationInUse);
+            }
+        }
+        if complete {
+            held = Some(turn);
+            break;
         }
     }
+    let mut connection_turn = held.ok_or(ApiError::Unavailable)?;
 
     let library = NodeId(Uuid::new_v4());
     let location = path.display();

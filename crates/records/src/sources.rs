@@ -543,13 +543,48 @@ fn external_mtime(tag: &str) -> Result<i64, sqlx::Error> {
 }
 
 impl Db {
-    /// Takes the organisation-wide file-share connection/settings turn.
-    pub async fn lock_share_connections(&self) -> Result<ShareConnectionLock, DbError> {
+    /// Takes the organisation-wide file-share connection/settings turn, waiting at most `wait`
+    /// for it. `None` when another holder kept it for longer: the caller answers with a
+    /// retryable refusal instead of holding a pool connection indefinitely. The wait is enforced
+    /// by PostgreSQL's `lock_timeout`, local to this turn's transaction.
+    pub async fn lock_share_connections(
+        &self,
+        wait: std::time::Duration,
+    ) -> Result<Option<ShareConnectionLock>, DbError> {
         let mut tx = self.pool().begin().await?;
-        sqlx::query("select pg_advisory_xact_lock(hashtextextended('share-connection', 0))")
+        let millis = wait.as_millis().clamp(1, u128::from(u32::MAX));
+        sqlx::query("select set_config('lock_timeout', $1, true)")
+            .bind(format!("{millis}ms"))
             .execute(&mut *tx)
             .await?;
-        Ok(ShareConnectionLock { tx })
+        match sqlx::query("select pg_advisory_xact_lock(hashtextextended('share-connection', 0))")
+            .execute(&mut *tx)
+            .await
+        {
+            Ok(_) => {}
+            Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("55P03") => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
+        }
+        // The timeout bounded only the wait for this turn; later statements on it are not
+        // subject to it.
+        sqlx::query("select set_config('lock_timeout', '0', true)")
+            .execute(&mut *tx)
+            .await?;
+        Ok(Some(ShareConnectionLock { tx }))
+    }
+
+    /// The lexical locations of every connected share, read without the connection turn. A
+    /// caller resolves them outside the turn and compares again under it with
+    /// [`Db::share_locations_locked`].
+    pub async fn share_locations(&self) -> Result<Vec<String>, DbError> {
+        Ok(sqlx::query_scalar(
+            "select location from library_sources \
+             where kind = 'share' and location is not null",
+        )
+        .fetch_all(self.pool())
+        .await?)
     }
 
     /// The lexical locations of the other connected shares while this turn is held.

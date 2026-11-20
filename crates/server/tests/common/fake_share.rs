@@ -25,6 +25,8 @@ struct Inner {
     slow_stat: Mutex<HashMap<PathBuf, Duration>>,
     slow_list: Mutex<Duration>,
     pause_list_after_read: (Mutex<bool>, Condvar),
+    hang_canonical: (Mutex<HashSet<PathBuf>>, Condvar),
+    canonical_hanging: AtomicUsize,
     vanish_on_open: Mutex<HashSet<PathBuf>>,
     change_during_read: Mutex<HashMap<PathBuf, VecDeque<Vec<u8>>>>,
     change_after_stat: Mutex<HashMap<PathBuf, VecDeque<Vec<u8>>>>,
@@ -72,6 +74,8 @@ impl FakeShare {
                 slow_stat: Mutex::new(HashMap::new()),
                 slow_list: Mutex::new(Duration::ZERO),
                 pause_list_after_read: (Mutex::new(false), Condvar::new()),
+                hang_canonical: (Mutex::new(HashSet::new()), Condvar::new()),
+                canonical_hanging: AtomicUsize::new(0),
                 vanish_on_open: Mutex::new(HashSet::new()),
                 change_during_read: Mutex::new(HashMap::new()),
                 change_after_stat: Mutex::new(HashMap::new()),
@@ -240,6 +244,33 @@ impl FakeShare {
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = false;
         self.inner.pause_list_after_read.1.notify_all();
+    }
+
+    /// Makes every canonical resolution of `path` block until [`FakeShare::release_canonical`],
+    /// like a `CreateFile` on an unreachable server.
+    pub fn hang_canonical(&self, path: &str) {
+        let path = self.path(path);
+        self.inner
+            .hang_canonical
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(path);
+    }
+
+    pub fn release_canonical(&self) {
+        self.inner
+            .hang_canonical
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
+        self.inner.hang_canonical.1.notify_all();
+    }
+
+    /// How many canonical resolutions are blocked by [`FakeShare::hang_canonical`] now.
+    pub fn canonical_hanging(&self) -> usize {
+        self.inner.canonical_hanging.load(Ordering::SeqCst)
     }
 
     pub fn vanish_on_open(&self, path: &str) {
@@ -664,6 +695,19 @@ impl ShareFs for FakeShare {
     }
 
     fn canonical(&self, approved_root: &Path, path: &Path) -> io::Result<PathBuf> {
+        {
+            let (hanging, wake) = &self.inner.hang_canonical;
+            let mut hanging = hanging.lock().unwrap_or_else(|error| error.into_inner());
+            if hanging.contains(path) {
+                self.inner.canonical_hanging.fetch_add(1, Ordering::SeqCst);
+                while hanging.contains(path) {
+                    hanging = wake
+                        .wait(hanging)
+                        .unwrap_or_else(|error| error.into_inner());
+                }
+                self.inner.canonical_hanging.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
         self.unavailable(path)?;
         self.contained(approved_root, path)
     }

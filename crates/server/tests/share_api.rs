@@ -10,11 +10,12 @@
 mod common;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use collab_core::ids::NodeId;
 use common::fake_share::FakeShare;
 use common::{TestServer, TestUser, spawn_server_config_without_workers};
-use records::{Principal, SHARE_ROOTS, SourceKind, SourceState};
+use records::{Principal, SHARE_LIST_SECONDS, SHARE_ROOTS, SourceKind, SourceState};
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 use server::AppState;
@@ -890,4 +891,276 @@ async fn no_event_holds_a_full_path() {
         details.iter().all(|detail| !detail.contains(ROOT)),
         "{details:?}"
     );
+}
+
+/// A client for requests that may legitimately take as long as the listing deadline.
+fn patient_client(env: &Env, user: &TestUser) -> reqwest::Client {
+    use reqwest::header::{COOKIE, HeaderMap, HeaderValue, ORIGIN};
+    let mut headers = HeaderMap::new();
+    headers.insert(ORIGIN, HeaderValue::from_str(&env.server.origin()).unwrap());
+    headers.insert(COOKIE, HeaderValue::from_str(&user.cookie).unwrap());
+    reqwest::Client::builder()
+        .default_headers(headers)
+        .timeout(Duration::from_secs(120))
+        .build()
+        .unwrap()
+}
+
+/// Sends `method` to `route` with `body` on a [`patient_client`], in the background.
+fn spawn_call(
+    env: &Env,
+    user: &TestUser,
+    method: Method,
+    route: &str,
+    body: Option<Value>,
+) -> tokio::task::JoinHandle<(StatusCode, Value)> {
+    let client = patient_client(env, user);
+    let url = env.server.url(route);
+    tokio::spawn(async move {
+        let mut request = client.request(method, url);
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        let response = request.send().await.unwrap();
+        let status = response.status();
+        let text = response.text().await.unwrap();
+        (
+            status,
+            serde_json::from_str(&text).unwrap_or(Value::String(text)),
+        )
+    })
+}
+
+/// Waits, within [`common::TIMEOUT`], until `ready` holds.
+async fn wait_until<F: std::future::Future<Output = bool>>(what: &str, ready: impl Fn() -> F) {
+    let deadline = tokio::time::Instant::now() + common::TIMEOUT;
+    while !ready().await {
+        assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Whether a session of this test's database waits for the advisory lock `key`: `gate` if
+/// given, the organisation-wide share-connection turn if not.
+async fn advisory_waiter(pool: &sqlx::PgPool, gate: Option<i64>) -> bool {
+    sqlx::query_scalar::<_, bool>(
+        "with k as (select coalesce($1::bigint, \
+             hashtextextended('share-connection', 0)) as key) \
+         select exists (select 1 from pg_locks, k where locktype = 'advisory' and not granted \
+         and database = (select oid from pg_database where datname = current_database()) \
+         and classid::bigint = ((k.key >> 32) & 4294967295) \
+         and objid::bigint = (k.key & 4294967295))",
+    )
+    .bind(gate)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn a_hanging_existing_share_never_holds_the_connection_turn() {
+    let env = Env::new().await;
+    env.server
+        .records_db()
+        .set_setting(env.admin.id, SHARE_LIST_SECONDS, json!(30))
+        .await
+        .unwrap();
+    env.fake.mkdir("held");
+    env.fake.mkdir("second");
+    env.fake.mkdir("third");
+    let (status, answer) = env
+        .connect(json!({"name":"Held", "path":r"C:\approved\held"}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{answer}");
+    env.fake.hang_canonical("held");
+    // Released however the test ends, so no blocked resolution outlives it.
+    struct Release(FakeShare);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.0.release_canonical();
+        }
+    }
+    let _release = Release(env.fake.clone());
+
+    let started = tokio::time::Instant::now();
+    let route = format!("/api/sites/{}/libraries/share", env.site.0);
+    let second = spawn_call(
+        &env,
+        &env.admin,
+        Method::POST,
+        &route,
+        Some(json!({"name":"Second", "path":r"C:\approved\second"})),
+    );
+    wait_until("the second connect resolves the hanging share", || async {
+        env.fake.canonical_hanging() >= 1
+    })
+    .await;
+    let third = spawn_call(
+        &env,
+        &env.admin,
+        Method::POST,
+        &route,
+        Some(json!({"name":"Third", "path":r"C:\approved\third"})),
+    );
+    wait_until("the third connect resolves the hanging share", || async {
+        env.fake.canonical_hanging() >= 2
+    })
+    .await;
+
+    // A roots change is answered at once (within the ordinary client timeout) while both
+    // connects wait on the hanging share.
+    let (status, answer) = env
+        .call(
+            &env.admin,
+            Method::PUT,
+            "/api/settings/shares",
+            Some(json!({"roots":[ROOT]})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert!(!second.is_finished() && !third.is_finished());
+
+    // Neither connect is held beyond the listing deadline: the hanging share falls back to its
+    // typed path, which neither sibling overlaps.
+    let limit = started + Duration::from_secs(30 + 15);
+    for connecting in [second, third] {
+        let (status, answer) = tokio::time::timeout_at(limit, connecting)
+            .await
+            .expect("a connect was held beyond the deadline")
+            .unwrap();
+        assert_eq!(status, StatusCode::CREATED, "{answer}");
+    }
+}
+
+#[tokio::test]
+async fn a_roots_change_waits_for_a_connect_holding_the_turn() {
+    let env = Env::new().await;
+    let pool = env.server.records_db().test_pool().clone();
+    sqlx::query(
+        "create function hold_share_insert() returns trigger language plpgsql as $$ \
+         begin perform pg_advisory_xact_lock(4242); return new; end $$",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "create trigger hold_share_insert before insert on library_sources \
+         for each row execute function hold_share_insert()",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let mut gate = pool.acquire().await.unwrap();
+    sqlx::query("select pg_advisory_lock(4242)")
+        .execute(&mut *gate)
+        .await
+        .unwrap();
+
+    let route = format!("/api/sites/{}/libraries/share", env.site.0);
+    let connecting = spawn_call(
+        &env,
+        &env.admin,
+        Method::POST,
+        &route,
+        Some(json!({"name":"Held turn", "path":ROOT})),
+    );
+    wait_until("the connect holds the turn at its insert", || {
+        advisory_waiter(&pool, Some(4242))
+    })
+    .await;
+    let putting = spawn_call(
+        &env,
+        &env.admin,
+        Method::PUT,
+        "/api/settings/shares",
+        Some(json!({"roots":[]})),
+    );
+    wait_until("the roots change waits for the turn", || {
+        advisory_waiter(&pool, None)
+    })
+    .await;
+    assert!(!putting.is_finished());
+
+    sqlx::query("select pg_advisory_unlock(4242)")
+        .execute(&mut *gate)
+        .await
+        .unwrap();
+    let (status, answer) = connecting.await.unwrap();
+    assert_eq!(status, StatusCode::CREATED, "{answer}");
+    let (status, answer) = putting.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert!(
+        env.server
+            .records_db()
+            .share_settings()
+            .await
+            .unwrap()
+            .roots
+            .is_empty()
+    );
+    drop(gate);
+    sqlx::query("drop trigger hold_share_insert on library_sources")
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn disconnect_rechecks_library_access_after_waiting_for_the_source_turn() {
+    let env = Env::new().await;
+    env.fake.put("Kept.txt", b"kept");
+    let owner = env.server.user("Revoked owner").await;
+    env.server
+        .records_db()
+        .set_node_access(
+            env.admin.id,
+            env.site,
+            Principal::User(owner.id),
+            Some("owner"),
+        )
+        .await
+        .unwrap();
+    let (status, answer) = env
+        .call(
+            &owner,
+            Method::POST,
+            &format!("/api/sites/{}/libraries/share", env.site.0),
+            Some(json!({"name":"Revoked", "path":ROOT})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{answer}");
+    let library = NodeId(answer["id"].as_str().unwrap().parse().unwrap());
+    server::source_sync::sync_once(&env.state, library, time::OffsetDateTime::UNIX_EPOCH)
+        .await
+        .unwrap();
+    let db = env.server.records_db();
+    assert_eq!(db.live_children(library).await.unwrap().len(), 1);
+
+    let held = db.try_lock_source(library).await.unwrap().unwrap();
+    let before = db.source_generation(library).await.unwrap().unwrap();
+    let disconnecting = spawn_call(
+        &env,
+        &owner,
+        Method::DELETE,
+        &format!("/api/libraries/{}/source", library.0),
+        None,
+    );
+    wait_until("the disconnect waits for the source turn", || async {
+        db.source_generation(library).await.unwrap().unwrap() > before
+    })
+    .await;
+    db.set_node_access(
+        env.admin.id,
+        library,
+        Principal::User(owner.id),
+        Some("viewer"),
+    )
+    .await
+    .unwrap();
+    drop(held);
+
+    let (status, answer) = disconnecting.await.unwrap();
+    assert_ne!(status, StatusCode::NO_CONTENT, "{answer}");
+    assert!(db.source_of(library).await.unwrap().is_some());
+    assert_eq!(db.live_children(library).await.unwrap().len(), 1);
 }

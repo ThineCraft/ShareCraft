@@ -170,9 +170,10 @@ pub(crate) async fn change_shares(
         Some(
             state
                 .db()
-                .lock_share_connections()
+                .lock_share_connections(SHARE_TURN_WAIT)
                 .await
-                .map_err(|e| ApiError::unavailable(&e))?,
+                .map_err(|e| ApiError::unavailable(&e))?
+                .ok_or(ApiError::Unavailable)?,
         )
     } else {
         None
@@ -184,6 +185,10 @@ pub(crate) async fn change_shares(
     drop(roots_turn.take());
     Ok(Json(shares_out(&state).await?))
 }
+
+/// The longest a request waits for the organisation-wide share-connection turn before it is
+/// refused with a retryable `503 unavailable`. Holders never do file-system I/O under the turn.
+pub(crate) const SHARE_TURN_WAIT: Duration = Duration::from_secs(10);
 
 /// `GET /api/settings/sharing`.
 #[derive(Serialize)]
