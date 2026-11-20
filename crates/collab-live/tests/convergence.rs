@@ -821,3 +821,56 @@ mod found {
         .unwrap();
     }
 }
+
+/// The run and block limits depend only on the agreed table, so every device decides the same
+/// way: one loaded from the stored form, one that made the same changes, one that reloaded.
+#[test]
+fn fragmentation_limit_is_decided_alike_everywhere() {
+    use collab_live::ids::{IdError, LiveId, OrderedIds};
+    let runs = OrderedIds::MAX_RUNS as u32 - 4;
+    let live: Vec<_> = (0..runs)
+        .map(|at| serde_json::json!({ "participant": 1, "start": at * 2, "len": 1 }))
+        .collect();
+    let stored = serde_json::json!({ "live": live, "deleted": [] });
+    let mut a: OrderedIds = serde_json::from_value(stored.clone()).unwrap();
+    let mut b: OrderedIds = serde_json::from_value(stored).unwrap();
+    // Both make one change that fits.
+    a.move_block(10, 4, 50).unwrap();
+    b.move_block(10, 4, 50).unwrap();
+    // A third device loads the result from the stored form.
+    let mut c: OrderedIds = serde_json::from_str(&serde_json::to_string(&a).unwrap()).unwrap();
+    let plan = [(0u32, 1u32), (5, 1)];
+    let mut outcomes = Vec::new();
+    for ids in [&mut a, &mut b, &mut c] {
+        let check = ids.check_fragmentation(&plan);
+        let before = serde_json::to_string(&*ids).unwrap();
+        let first = ids.move_block(0, 1, 9);
+        let mut made = 0u32;
+        let refusal = loop {
+            match ids.insert(0, LiveId(7, made), 1) {
+                Ok(()) => made += 1,
+                Err(error) => break error,
+            }
+        };
+        let after = serde_json::to_string(&*ids).unwrap();
+        outcomes.push((check, first, made, refusal, before != after, after));
+    }
+    assert!(
+        outcomes.windows(2).all(|pair| pair[0] == pair[1]),
+        "{:?}",
+        {
+            outcomes
+                .iter()
+                .map(|(check, first, made, refusal, ..)| (*check, *first, *made, *refusal))
+                .collect::<Vec<_>>()
+        }
+    );
+    // The check said no (two blocks could pass the limit), the single move fitted, and the
+    // inserts after it stopped at the same place everywhere.
+    let (check, first, made, refusal, changed, _) = &outcomes[0];
+    assert!(matches!(check, Err(IdError::TooFragmented { .. })));
+    assert_eq!(*first, Ok(()));
+    assert_eq!(*made, 3);
+    assert!(matches!(refusal, IdError::TooFragmented { .. }));
+    assert!(*changed);
+}

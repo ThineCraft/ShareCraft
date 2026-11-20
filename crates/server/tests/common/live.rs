@@ -105,6 +105,17 @@ impl LiveTestClient {
         Ok(())
     }
 
+    /// Sets this person's presence note through the library; it goes out now only while live.
+    pub async fn presence(&mut self, note: &str) {
+        if let Some(frame) = self
+            .client
+            .presence(note.to_owned())
+            .expect("note within the limit")
+        {
+            self.send_frames(vec![frame]).await;
+        }
+    }
+
     pub async fn send_raw(&mut self, frame: &str) {
         let socket = self.socket.as_mut().expect("client is connected");
         socket.send(Message::text(frame)).await.unwrap();

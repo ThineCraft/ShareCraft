@@ -35,6 +35,10 @@ use crate::room::{
 };
 use records::LiveCheckpointWriter;
 
+mod notices;
+
+pub(crate) use notices::build_refused;
+
 #[derive(Clone, Copy)]
 pub(crate) struct LiveTiming {
     pub heartbeat: Duration,
@@ -272,6 +276,12 @@ pub(crate) enum LiveCommand {
     },
     /// A checkpoint write, run off the room task, has finished.
     CheckpointWritten(Box<WriteDone>),
+    /// A presence note, relayed in memory only (see `notices`).
+    Presence {
+        conn: ConnId,
+        client: ClientId,
+        payload: String,
+    },
 }
 
 /// The live room's answer to a checkpoint upload or hash.
@@ -650,6 +660,8 @@ pub(crate) struct LiveRoom<S: LiveStore> {
     clients: HashMap<ClientId, (UserId, u64)>,
     rates: HashMap<ClientId, RateBucket>,
     pending_ends: Vec<(LiveSessionId, ParticipantNo, GoneReason)>,
+    /// The latest presence note of each place; memory only.
+    presence: crate::live_presence::PresenceBook,
 }
 
 impl<S: LiveStore> LiveRoom<S> {
@@ -1023,6 +1035,7 @@ impl<S: LiveStore> LiveRoom<S> {
             clients,
             rates: HashMap::new(),
             pending_ends: Vec::new(),
+            presence: crate::live_presence::PresenceBook::default(),
         })
     }
 
@@ -1227,6 +1240,15 @@ impl<S: LiveStore> LiveRoom<S> {
             },
             LiveCommand::CheckpointWritten(done) => {
                 self.checkpoint_written(*done);
+                Ok(())
+            }
+            LiveCommand::Presence {
+                conn,
+                client,
+                payload,
+            } => {
+                self.note_life(conn, client);
+                self.relay_presence(conn, client, payload);
                 Ok(())
             }
         }
@@ -2245,6 +2267,15 @@ impl<S: LiveStore> LiveRoom<S> {
                     copies.push(copy.clone());
                 }
                 self.checkpoint_base = Some(written.current.clone());
+                // Owners are told both copies are in the history (G5 Task 13). The current file
+                // is the last verified one, so the saved position does not move on.
+                self.notify_saved(
+                    written.current.clone(),
+                    self.verified_through,
+                    true,
+                    true,
+                    true,
+                );
                 let revision = self
                     .dispute
                     .take()
@@ -2275,6 +2306,7 @@ impl<S: LiveStore> LiveRoom<S> {
                 self.major_version(&written.current, major_reason_name(reason), person, at);
                 self.checkpoint_base = Some(written.current.clone());
                 self.return_point_stored();
+                self.notify_saved(written.current.clone(), at, false, true, false);
             }
             None => {}
         }
@@ -2354,7 +2386,7 @@ impl<S: LiveStore> LiveRoom<S> {
             .map(|place| place.build);
         let revision_name = revision.clone();
         self.checkpoint_writers.insert(
-            revision,
+            revision.clone(),
             CheckpointWriter {
                 participant,
                 client,
@@ -2390,10 +2422,12 @@ impl<S: LiveStore> LiveRoom<S> {
                 false,
             );
         }
+        let is_major = major_point(major).is_some();
         if let Some((reason, person)) = major_point(major) {
             self.major_version(&revision_name, reason, person, at);
             self.return_point_stored();
         }
+        self.notify_saved(revision_name, at, false, is_major, false);
     }
 
     /// Compares a verify ticket's independently written hash with the stored checkpoint. A
@@ -2669,6 +2703,11 @@ impl<S: LiveStore> LiveRoom<S> {
     /// The room's base is now the verified checkpoint `revision` at `at`: earlier unverified
     /// checkpoints, entries and agreement positions are no longer needed in memory.
     fn checkpoint_verified(&mut self, revision: String, at: Seq, user: UserId) {
+        // Whether it is a major version, read before the base settles and drops it.
+        let major = self
+            .unverified_checkpoints
+            .iter()
+            .any(|checkpoint| checkpoint.revision == revision && checkpoint.major_reason.is_some());
         self.settle_base(revision.clone(), at);
         self.events.emit(NewEvent {
             kind: "live.checkpoint_verified",
@@ -2678,6 +2717,7 @@ impl<S: LiveStore> LiveRoom<S> {
             node: Some(self.doc.into()),
             detail: serde_json::json!({ "revision": revision, "through": at.0 }),
         });
+        self.notify_saved(revision, at, true, major, false);
     }
 
     /// The room's base is now the checkpoint `revision` at `at`.
@@ -3434,6 +3474,7 @@ impl<S: LiveStore> LiveRoom<S> {
         let _ = self
             .members
             .send(Some(request.client), &Outbound::Many(frames));
+        self.after_join(request.client, participant);
         self.broadcast_people();
         let stated = self
             .session
@@ -3737,7 +3778,9 @@ impl<S: LiveStore> LiveRoom<S> {
                     through: barrier.through,
                 });
                 let client = barrier.client;
+                let participant = barrier.participant;
                 let _ = self.members.send(Some(client), &Outbound::One(frame));
+                self.announce_returning(client, participant);
             }
             ReturnStage::After => {
                 self.returns.pop_front();
@@ -4122,7 +4165,11 @@ impl<S: LiveStore> LiveRoom<S> {
     }
 
     fn disconnect(&mut self, conn: ConnId, client: ClientId) {
-        if self.members.leave(conn, client).is_none() {
+        // `None` is a replaced connection's late leave, or a member already dropped because its
+        // queue was full; only the second still needs the others told.
+        if self.members.leave(conn, client).is_none()
+            && self.members.iter().any(|member| member.client == client)
+        {
             return;
         }
         // Not connected, so it cannot be asked: the next eligible editor is.
@@ -4522,10 +4569,17 @@ impl<S: LiveStore> LiveRoom<S> {
     }
 
     fn broadcast_people(&mut self) {
-        let frame = encode(&LiveServerMsg::People {
-            people: self.people(),
-        });
-        let _ = self.members.send(None, &Outbound::One(frame));
+        // A member dropped while this goes out (its queue was full) is shown as gone at once:
+        // the list goes again until nobody more is dropped, and each round drops one at least.
+        loop {
+            let frame = encode(&LiveServerMsg::People {
+                people: self.people(),
+            });
+            let dropped = self.members.send(None, &Outbound::One(frame)).any();
+            if !(self.drop_absent_presence() || dropped) {
+                break;
+            }
+        }
     }
 
     fn prepare_access(&mut self, change: &AccessChange) {
@@ -6598,6 +6652,7 @@ mod tests {
         );
 
         // The room's base moved: a resync starts from the verified checkpoint.
+        let _ = drain(&mut bob.rx);
         room.handle(LiveCommand::Resync {
             conn: bob.conn,
             client: bob.client,
@@ -8128,6 +8183,58 @@ mod tests {
                     .any(|person| person.participant == ann.participant)
             );
         }
+    }
+
+    /// A member dropped because its send queue is full (`Members::send`) leaves the People list
+    /// and loses its presence note at once, before its socket task reports the disconnect.
+    #[tokio::test(start_paused = true)]
+    async fn full_queue_drop_clears_presence_and_people() {
+        let (mut room, _) = room().await;
+        let mut ann = join_as(&mut room, 1, 1, 11, "editor", FORMAT, None, None).await;
+        let bob = join_as(&mut room, 2, 2, 12, "editor", FORMAT, None, None).await;
+        let mut cat = join_as(&mut room, 3, 3, 13, "editor", FORMAT, None, None).await;
+        let note = |joined: &Joined, payload: &str| LiveCommand::Presence {
+            conn: joined.conn,
+            client: joined.client,
+            payload: payload.to_owned(),
+        };
+        room.handle(note(&bob, "B2")).await.unwrap();
+        // Bob never reads: Ann's notes fill his queue until he is dropped. Cat reads all along.
+        let mut seen = drain(&mut cat.rx);
+        for round in 0..40 {
+            for n in 0..20 {
+                room.handle(note(&ann, &format!("A{round}-{n}")))
+                    .await
+                    .unwrap();
+            }
+            tokio::time::advance(Duration::from_secs(2)).await;
+            let _ = drain(&mut ann.rx);
+            seen.extend(drain(&mut cat.rx));
+        }
+        assert!(
+            !room
+                .members
+                .iter()
+                .any(|member| member.client == bob.client),
+            "bob's full queue dropped him"
+        );
+        seen.extend(drain(&mut cat.rx));
+        assert!(
+            seen.iter().any(|message| matches!(
+                message,
+                LiveServerMsg::Presence { participant, payload: None } if *participant == bob.participant
+            )),
+            "bob's note is cleared at once"
+        );
+        assert!(
+            seen.iter().any(|message| matches!(
+                message,
+                LiveServerMsg::People { people } if people.iter().any(|person| {
+                    person.participant == bob.participant && !person.connected
+                })
+            )),
+            "bob shows as not connected at once"
+        );
     }
 
     #[tokio::test(start_paused = true)]

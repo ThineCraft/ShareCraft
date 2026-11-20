@@ -22,6 +22,7 @@ pub mod icap;
 pub mod libraries;
 mod links;
 mod live_cancel;
+mod live_presence;
 mod live_room;
 mod live_store;
 mod looks;

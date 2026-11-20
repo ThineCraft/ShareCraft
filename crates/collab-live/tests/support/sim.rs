@@ -214,6 +214,8 @@ impl Sim {
                 }
             }
             LiveClientMsg::Report { seq } => self.report(conn, seq),
+            // Presence notes change nothing in the log; the simulator does not relay them.
+            LiveClientMsg::Presence { .. } => {}
             LiveClientMsg::Fingerprint { .. }
             | LiveClientMsg::CheckpointReady { .. }
             | LiveClientMsg::CheckpointFailed { .. } => {
