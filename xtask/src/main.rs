@@ -3,6 +3,8 @@
 //! - `web` builds the browser client for WebAssembly and writes the page's package to `web/pkg`;
 //! - `check` loads `.env`, then runs the licence check, formatting, lints, tests, the
 //!   WebAssembly builds, the page script tests (with Node) and the check of installed editors;
+//! - `licences`, `wasm` and `pages` run those parts of `check` on their own, so CI can run them
+//!   side by side;
 //! - `test` loads `.env`, then runs `cargo test` with the arguments given;
 //! - `scale` loads `.env`, then runs the ignored scale tests (a library of 100,000 files) in a
 //!   debug build, one at a time, printing the times they measure;
@@ -43,6 +45,10 @@ fn main() -> ExitCode {
     let result = match task.as_deref() {
         Some("web") => web(),
         Some("check") => check(),
+        // The parts of `check`, one at a time, for CI jobs that run them side by side.
+        Some("licences") => workspace_root().and_then(|root| check_licences(&root)),
+        Some("wasm") => check_wasm(),
+        Some("pages") => workspace_root().and_then(|root| check_page_scripts(&root)),
         Some("test") => test(std::env::args_os().skip(2)),
         Some("scale") => scale(),
         Some("editors") => editors::dispatch(&std::env::args().skip(2).collect::<Vec<_>>()),
@@ -50,7 +56,7 @@ fn main() -> ExitCode {
         Some("package") => package::run_package(&std::env::args().skip(2).collect::<Vec<_>>()),
         Some("tls-proxy") => tls_proxy::run(&std::env::args().skip(2).collect::<Vec<_>>()),
         _ => Err(
-            "usage: cargo xtask <web|check|test|scale|editors|fake-icap|package|tls-proxy>"
+            "usage: cargo xtask <web|check|licences|wasm|pages|test|scale|editors|fake-icap|package|tls-proxy>"
                 .to_owned(),
         ),
     };
@@ -159,14 +165,21 @@ fn check() -> Result<()> {
         "warnings",
     ]))?;
     run(cargo(&root).args(["test", "--workspace"]))?;
-    // One build per crate, so features enabled by another crate cannot hide a problem.
-    for krate in WASM_CRATES {
-        run(cargo(&root).args(["build", "-p", krate, "--target", WASM_TARGET]))?;
-    }
+    check_wasm()?;
     check_page_scripts(&root)?;
     // Only editors that are installed are checked; a machine with none passes.
     editors::verify_installed(&root)?;
     println!("xtask: all checks passed");
+    Ok(())
+}
+
+/// Builds every crate that must keep compiling for the browser. One build per crate, so
+/// features enabled by another crate cannot hide a problem.
+fn check_wasm() -> Result<()> {
+    let root = workspace_root()?;
+    for krate in WASM_CRATES {
+        run(cargo(&root).args(["build", "-p", krate, "--target", WASM_TARGET]))?;
+    }
     Ok(())
 }
 

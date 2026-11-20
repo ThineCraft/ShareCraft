@@ -1,6 +1,9 @@
-# Runs the project's full check (`cargo xtask check`) on GitHub's Linux runners for every push
-# and pull request, so long builds and the test suite do not have to run on a developer's machine.
-# The check needs a PostgreSQL database for the tests; it is a throwaway service container here.
+# Runs the project's full check on GitHub's Linux runners for every push and pull request, so
+# long builds and the test suite do not have to run on a developer's machine.
+#
+# The parts of `cargo xtask check` run as separate jobs side by side: lints, the tests (split
+# into shards with cargo-nextest), the WebAssembly builds and the page scripts. The final
+# `check` job passes only when every other job passed, so it can stand for the whole check.
 name: check
 
 on:
@@ -15,46 +18,107 @@ concurrency:
   group: check-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: short
+
 jobs:
-  check:
+  lint:
+    name: licences, format and lints
     runs-on: ubuntu-latest
-    timeout-minutes: 90
-    services:
-      postgres:
-        image: postgres:18
-        env:
-          POSTGRES_USER: sharecraft
-          POSTGRES_PASSWORD: ci-only-throwaway
-          POSTGRES_DB: sharecraft_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U sharecraft -d sharecraft_test"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 20
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: lint
+      - name: Licences
+        run: cargo xtask licences
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Lints
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: tests ${{ matrix.shard }}/4
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     env:
       # A throwaway database inside this job only; nothing secret.
       TEST_DATABASE_URL: postgres://sharecraft:ci-only-throwaway@localhost:5432/sharecraft_test
-      CARGO_TERM_COLOR: always
-      CARGO_INCREMENTAL: 0
-      RUST_BACKTRACE: short
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+      # Started by hand rather than as a service container, so it can allow more connections:
+      # the tests run in parallel processes and each opens its own pool.
+      - name: PostgreSQL
+        run: |
+          docker run -d --name pg -p 5432:5432 \
+            -e POSTGRES_USER=sharecraft -e POSTGRES_PASSWORD=ci-only-throwaway \
+            -e POSTGRES_DB=sharecraft_test \
+            postgres:18 -c max_connections=500
+          for i in $(seq 1 60); do
+            docker exec pg pg_isready -U sharecraft -d sharecraft_test && exit 0
+            sleep 1
+          done
+          echo "PostgreSQL did not start" && exit 1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - name: Tests (shard ${{ matrix.shard }} of 4)
+        run: cargo nextest run --workspace --no-fail-fast --partition hash:${{ matrix.shard }}/4
+      - name: Documentation tests
+        if: matrix.shard == 1
+        run: cargo test --workspace --doc
 
-      - name: Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+  wasm:
+    name: WebAssembly builds
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
-          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: wasm
+      - name: Build for the browser
+        run: cargo xtask wasm
 
-      - name: Cache the build
-        uses: Swatinem/rust-cache@v2
-
-      - name: Node for the page-script tests
-        uses: actions/setup-node@v4
+  pages:
+    name: page scripts
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
+      - name: Page script tests
+        run: node --test web/*.test.mjs
 
-      - name: Full check
-        run: cargo xtask check
+  check:
+    name: check
+    if: always()
+    needs: [lint, test, wasm, pages]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every part passed
+        run: |
+          echo '${{ toJSON(needs) }}'
+          test "${{ needs.lint.result }}" = success
+          test "${{ needs.test.result }}" = success
+          test "${{ needs.wasm.result }}" = success
+          test "${{ needs.pages.result }}" = success
