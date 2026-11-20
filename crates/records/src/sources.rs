@@ -1709,30 +1709,59 @@ impl Db {
     /// had no connection.
     pub async fn disconnect_source(&self, library: NodeId) -> Result<Vec<SecretId>, DbError> {
         let mut tx = self.pool().begin().await?;
-        let row: Option<(Option<Uuid>, Option<Uuid>, Uuid)> = sqlx::query_as(
-            "select s.token_secret, s.webhook_secret, n.site_id from library_sources s \
-             join nodes n on n.id = s.library_id where s.library_id = $1 for update of s",
-        )
-        .bind(library.0)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let Some((token, webhook, site)) = row else {
-            return Ok(Vec::new());
-        };
-        sqlx::query("delete from source_items where library_id = $1")
-            .bind(library.0)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("delete from library_sources where library_id = $1")
-            .bind(library.0)
-            .execute(&mut *tx)
-            .await?;
-        recompute_site_usage(&mut tx, NodeId(site)).await?;
+        let secrets = disconnect_in(&mut tx, library).await?;
         tx.commit().await?;
-        Ok([token, webhook]
-            .into_iter()
-            .flatten()
-            .map(SecretId)
-            .collect())
+        Ok(secrets)
     }
+
+    /// [`Db::disconnect_source`] for `actor`, whose `manage_access` on `library` is judged again
+    /// in the same transaction as the disconnect: a revocation after the route's own check
+    /// still stops it. `NotFound` when `actor` cannot see the library; the access's refusal
+    /// when they see it without `manage_access`.
+    pub async fn disconnect_source_as(
+        &self,
+        actor: UserId,
+        library: NodeId,
+    ) -> Result<Vec<SecretId>, AccessError> {
+        let mut tx = self.pool().begin().await?;
+        match crate::scopes::access_in(&mut tx, actor, library).await? {
+            None => return Err(AccessError::NotFound),
+            Some(held) if !held.can_manage_access() => return Err(held.refusal()),
+            Some(_) => {}
+        }
+        let secrets = disconnect_in(&mut tx, library).await?;
+        tx.commit().await?;
+        Ok(secrets)
+    }
+}
+
+/// Removes the connection of `library` and its item rows on `conn`, returning its secrets.
+async fn disconnect_in(
+    conn: &mut PgConnection,
+    library: NodeId,
+) -> Result<Vec<SecretId>, sqlx::Error> {
+    let row: Option<(Option<Uuid>, Option<Uuid>, Uuid)> = sqlx::query_as(
+        "select s.token_secret, s.webhook_secret, n.site_id from library_sources s \
+         join nodes n on n.id = s.library_id where s.library_id = $1 for update of s",
+    )
+    .bind(library.0)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some((token, webhook, site)) = row else {
+        return Ok(Vec::new());
+    };
+    sqlx::query("delete from source_items where library_id = $1")
+        .bind(library.0)
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query("delete from library_sources where library_id = $1")
+        .bind(library.0)
+        .execute(&mut *conn)
+        .await?;
+    recompute_site_usage(conn, NodeId(site)).await?;
+    Ok([token, webhook]
+        .into_iter()
+        .flatten()
+        .map(SecretId)
+        .collect())
 }

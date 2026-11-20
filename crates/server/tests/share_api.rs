@@ -1160,7 +1160,124 @@ async fn disconnect_rechecks_library_access_after_waiting_for_the_source_turn() 
     drop(held);
 
     let (status, answer) = disconnecting.await.unwrap();
-    assert_ne!(status, StatusCode::NO_CONTENT, "{answer}");
+    assert_eq!(status, StatusCode::FORBIDDEN, "{answer}");
     assert!(db.source_of(library).await.unwrap().is_some());
     assert_eq!(db.live_children(library).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn disconnect_of_an_empty_library_rechecks_library_access() {
+    let env = Env::new().await;
+    env.fake.mkdir("empty");
+    let owner = env.server.user("Revoked empty owner").await;
+    env.server
+        .records_db()
+        .set_node_access(
+            env.admin.id,
+            env.site,
+            Principal::User(owner.id),
+            Some("owner"),
+        )
+        .await
+        .unwrap();
+    let (status, answer) = env
+        .call(
+            &owner,
+            Method::POST,
+            &format!("/api/sites/{}/libraries/share", env.site.0),
+            Some(json!({"name":"Empty revoked", "path":r"C:\approved\empty"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{answer}");
+    let library = NodeId(answer["id"].as_str().unwrap().parse().unwrap());
+    let db = env.server.records_db();
+    assert!(db.live_children(library).await.unwrap().is_empty());
+
+    let held = db.try_lock_source(library).await.unwrap().unwrap();
+    let before = db.source_generation(library).await.unwrap().unwrap();
+    let disconnecting = spawn_call(
+        &env,
+        &owner,
+        Method::DELETE,
+        &format!("/api/libraries/{}/source", library.0),
+        None,
+    );
+    wait_until("the disconnect waits for the source turn", || async {
+        db.source_generation(library).await.unwrap().unwrap() > before
+    })
+    .await;
+    db.set_node_access(
+        env.admin.id,
+        library,
+        Principal::User(owner.id),
+        Some("viewer"),
+    )
+    .await
+    .unwrap();
+    drop(held);
+
+    let (status, answer) = disconnecting.await.unwrap();
+    assert_eq!(status, StatusCode::FORBIDDEN, "{answer}");
+    assert!(db.source_of(library).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn lookups_against_a_hanging_share_are_bounded_across_connects() {
+    const CONNECTS: usize = server::share::SHARE_LOOKUPS + 4;
+    let env = Env::new().await;
+    env.fake.mkdir("held");
+    let (status, answer) = env
+        .connect(json!({"name":"Held", "path":r"C:\approved\held"}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{answer}");
+    for n in 0..CONNECTS {
+        env.fake.mkdir(&format!("sibling{n}"));
+    }
+    env.fake.hang_canonical("held");
+    struct Release(FakeShare);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.0.release_canonical();
+        }
+    }
+    let release = Release(env.fake.clone());
+
+    let route = format!("/api/sites/{}/libraries/share", env.site.0);
+    let connecting: Vec<_> = (0..CONNECTS)
+        .map(|n| {
+            spawn_call(
+                &env,
+                &env.admin,
+                Method::POST,
+                &route,
+                Some(json!({
+                    "name": format!("Sibling {n}"),
+                    "path": format!(r"C:\approved\sibling{n}"),
+                })),
+            )
+        })
+        .collect();
+    wait_until("the lookup bound is reached", || async {
+        env.fake.canonical_hanging() >= server::share::SHARE_LOOKUPS
+    })
+    .await;
+    // Every connect has had ample time to start its own lookup of the hanging share.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        env.fake.canonical_hanging_peak(),
+        server::share::SHARE_LOOKUPS
+    );
+
+    drop(release);
+    for connecting in connecting {
+        let (status, answer) = connecting.await.unwrap();
+        assert!(
+            status == StatusCode::CREATED || status == StatusCode::SERVICE_UNAVAILABLE,
+            "{status} {answer}"
+        );
+    }
+    assert_eq!(
+        env.fake.canonical_hanging_peak(),
+        server::share::SHARE_LOOKUPS
+    );
 }
