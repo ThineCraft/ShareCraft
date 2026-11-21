@@ -114,6 +114,13 @@ footer { display: flex; justify-content: space-between; gap: 1rem; padding: 2rem
 .state-card ul { margin: 0; padding: 0; list-style: none; }
 .state-card li { padding: .8rem .9rem; border-radius: .5rem; color: #d8d4ca; line-height: 1.5; }
 .state-card li:nth-child(odd) { background: #ffffff08; }
+.shot img { cursor: zoom-in; }
+.shot img:focus-visible { outline: 3px solid var(--accent); outline-offset: 4px; }
+.viewer { width: 100vw; max-width: none; height: 100vh; height: 100dvh; max-height: none; margin: 0; padding: clamp(.5rem, 2vw, 1.5rem); border: 0; background: transparent; cursor: zoom-out; }
+.viewer::backdrop { background: #05080bfa; }
+.viewer[open] { display: flex; align-items: center; justify-content: center; }
+.viewer img { display: block; max-width: 100%; max-height: 100%; width: auto; height: auto; object-fit: contain; border-radius: .6rem; box-shadow: 0 2rem 6rem #000a; }
+.viewer-close { position: fixed; top: .75rem; right: .75rem; z-index: 1; width: 2.75rem; height: 2.75rem; border: 1px solid #ffffff33; border-radius: 50%; background: #0a1016e0; color: #f5f1e7; font: inherit; font-size: 1.6rem; line-height: 1; cursor: pointer; }
 @media (max-width: 62rem) {
   .hero-shots, .tour-row, .tour-row-flip, .tour-row-phone, .state-grid { grid-template-columns: 1fr; }
   .tour-row-flip > .tour-copy { order: 0; }
