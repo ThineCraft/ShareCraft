@@ -1517,6 +1517,15 @@ export function brandImageHref(url) {
   return typeof url === 'string' && BRAND_IMAGE.test(url) ? url : null;
 }
 
+/**
+ * The address a banner picture is drawn from: a brand image's banner-sized picture (at most 2400
+ * pixels wide and half as high, made by the server), or `url` as it is for anything else (a
+ * draft's document in Change the look).
+ */
+export function bannerSrc(url) {
+  return brandImageHref(url) ? `${url}?size=banner` : url;
+}
+
 /** ShareCraft's own tab icon, the account bar's mark. */
 export const SHARECRAFT_ICON = '/favicon.svg';
 
@@ -1682,7 +1691,7 @@ export function headerView(site, look, { draft = false } = {}) {
     ? brandImage(logoUrl, { class: 'site-logo', alt }, () => name.setAttribute('class', 'site-name'))
     : null;
   const band = imageUrl
-    ? [brandImage(imageUrl, { class: 'band-image', alt: '' }), h('span', { class: 'band-shade', 'aria-hidden': 'true' })]
+    ? [brandImage(bannerSrc(imageUrl), { class: 'band-image', alt: '' }), h('span', { class: 'band-shade', 'aria-hidden': 'true' })]
     : [];
   return h(
     'header',

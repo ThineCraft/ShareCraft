@@ -78,7 +78,8 @@ export function showHero(header, here) {
   img.alt = '';
   img.decoding = 'async';
   img.hidden = true;
-  img.src = step.url;
+  // The server's banner-sized picture, as the site's own banner is drawn (see bannerSrc).
+  img.src = `${step.url}?size=banner`;
   band.after(img);
   const reduced = globalThis.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches;
   const start = () => {

@@ -168,6 +168,23 @@ async fn library_hero_image_chosen_kept_and_released() {
     assert_eq!(record.kind, "image");
     assert_eq!(pin_owners(&db, &sha(&wide)).await, vec![shown.clone()]);
     assert_eq!(image_status(&first, &root, &url).await, StatusCode::OK);
+    // Its banner-sized picture: a JPEG, no larger than it needs to be (this one is 4:1 and
+    // narrower than 2400, so as wide and high as it is); any other size is refused.
+    let response = first
+        .http(Some(&root))
+        .get(first.url(&format!("{url}?size=banner")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-type"], "image/jpeg");
+    let bytes = response.bytes().await.unwrap();
+    let banner = image::load_from_memory(&bytes).unwrap();
+    assert_eq!((banner.width(), banner.height()), (1200, 300));
+    assert_eq!(
+        image_status(&first, &root, &format!("{url}?size=huge")).await,
+        StatusCode::BAD_REQUEST
+    );
     // Kept as it is; the same answer.
     let (status, again) = hero(&first, &root, &shown, json!({ "keep": sha(&wide) })).await;
     assert_eq!(status, StatusCode::OK, "{again}");

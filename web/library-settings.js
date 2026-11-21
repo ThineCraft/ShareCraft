@@ -4,6 +4,7 @@
 
 import {
   api,
+  bannerSrc,
   brandImageHref,
   can,
   confirmDialog,
@@ -101,7 +102,7 @@ function show(settings) {
 /** The banner picture as a tile: the picture, its name, Change (or Choose) and Remove. */
 function showHero(image) {
   const picture = h('span', { class: 'slot-picture', 'aria-hidden': 'true' });
-  const url = brandImageHref(image?.url);
+  const url = brandImageHref(image?.url) ? bannerSrc(image.url) : null;
   if (url) {
     const img = h('img', { src: url, alt: '' });
     img.addEventListener('error', () => (img.hidden = true));

@@ -8,7 +8,8 @@
 //! A thumbnail is made on the server the first time it is asked for, from PNG, JPEG, GIF (its
 //! first frame) and WebP, turned upright as its EXIF orientation says, in two sizes (see
 //! [`ThumbSize`]), and kept at `<data>/thumbs/<xx>/<sha256>.256.png`, or `<sha256>.720.jpg`
-//! (`.720.png` for a picture with transparency) (see [`thumbnail`]).
+//! (`.720.png` for a picture with transparency), or `<sha256>.banner.jpg` (`.banner.png`) for
+//! a banner (see [`thumbnail`]).
 //! Decoding is limited before anything is allocated: the size the header gives, the memory
 //! the decoded pixels need, the size of the file, for a GIF the number of its frames and for
 //! a JPEG the number of its scans (each counted by walking the file without decoding it), so
@@ -34,8 +35,10 @@ use tokio::sync::Semaphore;
 pub const THUMBNAIL_SIDE: u32 = 256;
 /// The longer side of a large thumbnail (the Album view of an image library), at most.
 pub const LARGE_THUMBNAIL_SIDE: u32 = 720;
-/// The JPEG quality of a large thumbnail.
+/// The JPEG quality of a large thumbnail and of a banner.
 const LARGE_THUMBNAIL_QUALITY: u8 = 82;
+/// The width of a banner, at most: twice the width a site header is commonly drawn at.
+pub const BANNER_WIDTH: u32 = 2400;
 
 /// Which thumbnail is asked for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,6 +47,10 @@ pub enum ThumbSize {
     Small,
     /// At most [`LARGE_THUMBNAIL_SIDE`]: a JPEG, or a PNG for a picture with transparency.
     Large,
+    /// A site header's banner picture: at most [`BANNER_WIDTH`] wide and at most half as high
+    /// as it is wide (the middle kept, as the header's `object-fit: cover` shows it: the header
+    /// is always wider than 2:1); a JPEG, or a PNG for a picture with transparency.
+    Banner,
 }
 
 impl ThumbSize {
@@ -53,6 +60,7 @@ impl ThumbSize {
         match self {
             ThumbSize::Small => THUMBNAIL_SIDE,
             ThumbSize::Large => LARGE_THUMBNAIL_SIDE,
+            ThumbSize::Banner => BANNER_WIDTH,
         }
     }
 }
@@ -234,6 +242,10 @@ pub fn thumb_paths(store: &BlobStore, sha256: &[u8; 32], size: ThumbSize) -> Vec
             thumb_dir_of(store, sha256, "720.jpg"),
             thumb_dir_of(store, sha256, "720.png"),
         ],
+        ThumbSize::Banner => vec![
+            thumb_dir_of(store, sha256, "banner.jpg"),
+            thumb_dir_of(store, sha256, "banner.png"),
+        ],
     }
 }
 
@@ -407,31 +419,72 @@ fn make_thumbnail(
     // A GIF's decoder decodes its first frame only.
     let image = DynamicImage::from_decoder(decoder)?;
     drop(bytes);
-    let side = which.side();
-    let mut small = if width > side || height > side {
-        image.thumbnail(side, side)
+    let small = if which == ThumbSize::Banner {
+        banner(image, orientation)
     } else {
-        image
+        let side = which.side();
+        let mut small = if width > side || height > side {
+            image.thumbnail(side, side)
+        } else {
+            image
+        };
+        small.apply_orientation(orientation);
+        small
     };
-    small.apply_orientation(orientation);
     let mut out = Vec::new();
-    let path = if which == ThumbSize::Large && !small.color().has_alpha() {
+    let path = if which != ThumbSize::Small && !small.color().has_alpha() {
         let rgb = DynamicImage::ImageRgb8(small.to_rgb8());
         rgb.write_with_encoder(JpegEncoder::new_with_quality(
             &mut out,
             LARGE_THUMBNAIL_QUALITY,
         ))?;
-        thumb_dir_of(store, sha256, "720.jpg")
+        match which {
+            ThumbSize::Banner => thumb_dir_of(store, sha256, "banner.jpg"),
+            _ => thumb_dir_of(store, sha256, "720.jpg"),
+        }
     } else {
         let rgba = DynamicImage::ImageRgba8(small.to_rgba8());
         rgba.write_to(&mut Cursor::new(&mut out), ImageFormat::Png)?;
         match which {
             ThumbSize::Small => thumb_path(store, sha256),
             ThumbSize::Large => thumb_dir_of(store, sha256, "720.png"),
+            ThumbSize::Banner => thumb_dir_of(store, sha256, "banner.png"),
         }
     };
     keep(store, sha256, &path, &out)?;
     Ok(path)
+}
+
+/// `image` (as decoded, to be turned by `orientation`) as a banner: upright, at most
+/// [`BANNER_WIDTH`] wide (never enlarged), and cut to at most half as high as it is wide,
+/// keeping the middle.
+fn banner(image: DynamicImage, orientation: Orientation) -> DynamicImage {
+    // Turned a quarter, its height now is its width once upright.
+    let turned = matches!(
+        orientation,
+        Orientation::Rotate90
+            | Orientation::Rotate270
+            | Orientation::Rotate90FlipH
+            | Orientation::Rotate270FlipH
+    );
+    let (most_wide, most_high) = if turned {
+        (MAX_IMAGE_SIDE, BANNER_WIDTH)
+    } else {
+        (BANNER_WIDTH, MAX_IMAGE_SIDE)
+    };
+    let mut small = if image.width() > most_wide || image.height() > most_high {
+        image.thumbnail(most_wide, most_high)
+    } else {
+        image
+    };
+    small.apply_orientation(orientation);
+    let (width, height) = (small.width(), small.height());
+    let highest = (width / 2).max(1);
+    if height > highest {
+        small.crop_imm(0, height.saturating_sub(highest) / 2, width, highest)
+    } else {
+        small
+    }
 }
 
 /// Writes `bytes` to a temporary file beside the content store and renames it to `path`. A
@@ -494,7 +547,7 @@ pub fn remember_failure(store: &BlobStore, sha256: &[u8; 32]) -> std::io::Result
     Ok(())
 }
 
-/// Erases the thumbnails of the content `sha256` of `store` (both sizes, and one kept under the
+/// Erases the thumbnails of the content `sha256` of `store` (every size and the banner, and one kept under the
 /// older name `<sha256>.png`), its mark of having none and its photo facts (see
 /// [`crate::photos`]); whether there was any.
 ///
@@ -504,6 +557,7 @@ pub fn erase_thumbnail(store: &BlobStore, sha256: &[u8; 32]) -> std::io::Result<
     let mut erased = false;
     let mut paths = thumb_paths(store, sha256, ThumbSize::Small);
     paths.extend(thumb_paths(store, sha256, ThumbSize::Large));
+    paths.extend(thumb_paths(store, sha256, ThumbSize::Banner));
     paths.push(thumb_dir_of(store, sha256, "png"));
     paths.push(no_thumb_path(store, sha256));
     paths.push(crate::photos::facts_path(store, sha256));
@@ -738,6 +792,25 @@ async fn is_file(path: &Path) -> bool {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn banners_are_upright_at_most_2400_wide_and_half_as_high() {
+        let size = |image: DynamicImage| (image.width(), image.height());
+        // A tall photo: shrunk to the width, the middle kept.
+        let tall = DynamicImage::new_rgb8(3000, 4000);
+        assert_eq!(size(banner(tall, Orientation::NoTransforms)), (2400, 1200));
+        // Stored on its side, upright 3000 by 4000: the same.
+        let turned = DynamicImage::new_rgb8(4000, 3000);
+        assert_eq!(size(banner(turned, Orientation::Rotate90)), (2400, 1200));
+        // Wide already: only shrunk.
+        let wide = DynamicImage::new_rgb8(6000, 1000);
+        assert_eq!(size(banner(wide, Orientation::NoTransforms)), (2400, 400));
+        // Small: never enlarged, still cut to 2:1.
+        let small = DynamicImage::new_rgb8(300, 300);
+        assert_eq!(size(banner(small, Orientation::NoTransforms)), (300, 150));
+        let strip = DynamicImage::new_rgb8(300, 100);
+        assert_eq!(size(banner(strip, Orientation::NoTransforms)), (300, 100));
+    }
 
     #[test]
     fn extensions_are_the_last_suffix_only() {
