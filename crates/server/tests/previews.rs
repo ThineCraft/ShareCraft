@@ -34,7 +34,9 @@ use reqwest::header::{
 };
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
-use server::previews::{PreviewKind, ThumbError, no_thumb_path, preview_type, thumb_path};
+use server::previews::{
+    PreviewKind, ThumbError, ThumbSize, no_thumb_path, preview_type, thumb_path, thumb_paths,
+};
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 
@@ -745,7 +747,7 @@ async fn thumbnails_made_once_and_cached() {
     let first = response.bytes().await.unwrap();
     assert_eq!(dimensions(&first), (256, 171));
 
-    // Kept at <data>/thumbs/<xx>/<sha256>.png.
+    // Kept at <data>/thumbs/<xx>/<sha256>.256.png.
     let hex: String = sha(&wide).iter().map(|b| format!("{b:02x}")).collect();
     assert_eq!(
         path,
@@ -754,7 +756,7 @@ async fn thumbnails_made_once_and_cached() {
             .path()
             .join("thumbs")
             .join(&hex[..2])
-            .join(format!("{hex}.png"))
+            .join(format!("{hex}.256.png"))
     );
     assert_eq!(std::fs::read(&path).unwrap(), first);
 
@@ -878,7 +880,7 @@ async fn hostile_images_refused_quickly() {
             "{name}"
         );
         assert!(started.elapsed() < Duration::from_secs(1), "{name}");
-        let error = server::previews::thumbnail(&store, &sha(bytes)).unwrap_err();
+        let error = server::previews::thumbnail(&store, &sha(bytes), ThumbSize::Small).unwrap_err();
         assert!(matches!(error, ThumbError::Remembered), "{name}: {error:?}");
     }
     // Each for the reason expected, decided before the pixels are decoded.
@@ -892,7 +894,7 @@ async fn hostile_images_refused_quickly() {
         "TooLarge",
     ]) {
         std::fs::remove_file(no_thumb_path(&store, &sha(bytes))).unwrap();
-        let error = server::previews::thumbnail(&store, &sha(bytes)).unwrap_err();
+        let error = server::previews::thumbnail(&store, &sha(bytes), ThumbSize::Small).unwrap_err();
         assert!(
             format!("{error:?}").starts_with(expected),
             "{name}: {error:?}"
@@ -1040,6 +1042,301 @@ async fn thumbnail_erased_with_its_blob() {
     assert!(!store.contains(&sha(&bad)));
     assert!(!bad_thumb.exists());
     assert!(!bad_mark.exists());
+}
+
+/// TIFF data (EXIF), little-endian: an Orientation in the first directory and, in the EXIF
+/// directory, a DateTimeOriginal.
+pub fn exif_tiff(orientation: u16, date: &str) -> Vec<u8> {
+    let mut t = b"II\x2a\x00\x08\x00\x00\x00".to_vec();
+    t.extend_from_slice(&2u16.to_le_bytes());
+    t.extend_from_slice(&0x0112u16.to_le_bytes());
+    t.extend_from_slice(&3u16.to_le_bytes());
+    t.extend_from_slice(&1u32.to_le_bytes());
+    t.extend_from_slice(&orientation.to_le_bytes());
+    t.extend_from_slice(&[0, 0]);
+    t.extend_from_slice(&0x8769u16.to_le_bytes());
+    t.extend_from_slice(&4u16.to_le_bytes());
+    t.extend_from_slice(&1u32.to_le_bytes());
+    let exif_ifd: u32 = 8 + 2 + 24 + 4;
+    t.extend_from_slice(&exif_ifd.to_le_bytes());
+    t.extend_from_slice(&0u32.to_le_bytes());
+    let date_at = exif_ifd + 2 + 12 + 4;
+    t.extend_from_slice(&1u16.to_le_bytes());
+    t.extend_from_slice(&0x9003u16.to_le_bytes());
+    t.extend_from_slice(&2u16.to_le_bytes());
+    t.extend_from_slice(&20u32.to_le_bytes());
+    t.extend_from_slice(&date_at.to_le_bytes());
+    t.extend_from_slice(&0u32.to_le_bytes());
+    t.extend_from_slice(date.as_bytes());
+    t.push(0);
+    t
+}
+
+/// The fixture JPEG with an EXIF segment saying `orientation` and taken at `date`.
+fn turned_jpeg(orientation: u16, date: &str) -> Vec<u8> {
+    let plain = jpeg();
+    let tiff = exif_tiff(orientation, date);
+    let mut out = plain[..2].to_vec();
+    out.extend_from_slice(&[0xFF, 0xE1]);
+    out.extend_from_slice(&u16::try_from(tiff.len() + 8).unwrap().to_be_bytes());
+    out.extend_from_slice(b"Exif\0\0");
+    out.extend_from_slice(&tiff);
+    out.extend_from_slice(&plain[2..]);
+    out
+}
+
+async fn large_thumbnail(site: &Site, user: &TestUser, doc: &str) -> reqwest::Response {
+    get(
+        site,
+        Some(user),
+        &format!("/api/docs/{doc}/thumbnail?size=large"),
+        None,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn large_thumbnails_and_upright_pictures() {
+    let server = spawn_server().await;
+    let admin = server.admin("Large").await;
+    let home = server.home_of(&admin).await.0.to_string();
+    let store = server.blobs();
+
+    // A large thumbnail is a JPEG at most 720 pixels on its longer side, kept apart from the
+    // small one.
+    let wide = picture(1600, 900, ImageFormat::Png);
+    let doc = upload(&server, &admin, &home, "Wide.png", &wide).await;
+    let response = large_thumbnail(&server, &admin, &doc).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header(&response, CONTENT_TYPE), "image/jpeg");
+    assert_eq!(header(&response, CACHE_CONTROL), "private, max-age=300");
+    assert_eq!(header(&response, X_CONTENT_TYPE_OPTIONS), "nosniff");
+    assert_eq!(header(&response, CONTENT_SECURITY_POLICY), "sandbox");
+    let body = response.bytes().await.unwrap();
+    assert_eq!(&body[..2], &[0xFF, 0xD8]);
+    assert_eq!(dimensions(&body), (720, 405));
+    let large = thumb_paths(&store, &sha(&wide), ThumbSize::Large);
+    assert!(large[0].is_file());
+    assert!(!thumb_path(&store, &sha(&wide)).exists());
+    let small = thumbnail(&server, &admin, &doc)
+        .await
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(dimensions(&small), (256, 144));
+
+    // A picture with transparency stays a PNG; one smaller than 720 is never enlarged.
+    let mut clear = Vec::new();
+    DynamicImage::ImageRgba8(RgbaImage::from_pixel(300, 200, Rgba([0, 0, 0, 0])))
+        .write_to(&mut Cursor::new(&mut clear), ImageFormat::Png)
+        .unwrap();
+    let doc = upload(&server, &admin, &home, "Clear.png", &clear).await;
+    let response = large_thumbnail(&server, &admin, &doc).await;
+    assert_eq!(header(&response, CONTENT_TYPE), "image/png");
+    assert_eq!(dimensions(&response.bytes().await.unwrap()), (300, 200));
+    assert!(thumb_paths(&store, &sha(&clear), ThumbSize::Large)[1].is_file());
+
+    // Any other size is refused.
+    let (status, _) = refused(
+        get(
+            &server,
+            Some(&admin),
+            &format!("/api/docs/{doc}/thumbnail?size=huge"),
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    // A photo the camera held sideways (EXIF orientation 6) is turned upright in both sizes.
+    let (width, height) = dimensions(&jpeg());
+    assert!(width > height);
+    let turned = turned_jpeg(6, "2024:07:14 18:05:09");
+    let doc = upload(&server, &admin, &home, "Turned.jpg", &turned).await;
+    let small = thumbnail(&server, &admin, &doc)
+        .await
+        .bytes()
+        .await
+        .unwrap();
+    let (w, h) = dimensions(&small);
+    assert!(h > w, "{w} × {h}");
+    let large = large_thumbnail(&server, &admin, &doc)
+        .await
+        .bytes()
+        .await
+        .unwrap();
+    let (w, h) = dimensions(&large);
+    assert!(h > w && h <= 720, "{w} × {h}");
+    // Its facts are read from the headers and kept beside the thumbnails.
+    let facts = server::photos::photo_facts(&store, &sha(&turned)).unwrap();
+    assert_eq!((facts.width, facts.height), (Some(height), Some(width)));
+    assert_eq!(facts.taken_at.as_deref(), Some("2024-07-14T18:05:09"));
+    let facts_path = server::photos::facts_path(&store, &sha(&turned));
+    assert!(facts_path.is_file());
+    // Upside down is turned too, keeping its shape.
+    let flipped = turned_jpeg(3, "2024:07:14 18:05:09");
+    let doc_flipped = upload(&server, &admin, &home, "Flipped.jpg", &flipped).await;
+    let small = thumbnail(&server, &admin, &doc_flipped)
+        .await
+        .bytes()
+        .await
+        .unwrap();
+    let (w, h) = dimensions(&small);
+    assert!(w > h, "{w} × {h}");
+
+    // Purged, the content goes with both sizes, its facts, and a thumbnail kept under the
+    // older name.
+    let old_name = server::previews::thumb_dir_of(&store, &sha(&turned), "png");
+    std::fs::write(&old_name, &small).unwrap();
+    let kept: Vec<PathBuf> = thumb_paths(&store, &sha(&turned), ThumbSize::Small)
+        .into_iter()
+        .chain(thumb_paths(&store, &sha(&turned), ThumbSize::Large))
+        .filter(|path| path.is_file())
+        .collect();
+    assert_eq!(kept.len(), 2);
+    let (status, body) = call(
+        &server,
+        &admin,
+        Method::DELETE,
+        &format!("/api/nodes/{doc}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    for _ in 0..2 {
+        let (status, body) = call(
+            &server,
+            &admin,
+            Method::DELETE,
+            &format!("/api/bin/{doc}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    }
+    assert!(!store.contains(&sha(&turned)));
+    for path in kept.iter().chain([&facts_path, &old_name]) {
+        assert!(!path.exists(), "{}", path.display());
+    }
+}
+
+#[tokio::test]
+async fn photos_listing_gives_shapes_and_dates() {
+    let server = spawn_server().await;
+    let admin = server.admin("Photos").await;
+    let (status, body) = call(
+        &server,
+        &admin,
+        Method::POST,
+        "/api/sites",
+        Some(json!({ "name": "Album" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let site = body["id"].as_str().unwrap().to_owned();
+    let (status, body) = call(
+        &server,
+        &admin,
+        Method::POST,
+        &format!("/api/sites/{site}/libraries"),
+        Some(json!({ "name": "Photos", "kind": "image" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let images = body["id"].as_str().unwrap().to_owned();
+    let (width, height) = dimensions(&jpeg());
+    upload(
+        &server,
+        &admin,
+        &images,
+        "A wide.png",
+        &picture(300, 200, ImageFormat::Png),
+    )
+    .await;
+    upload(
+        &server,
+        &admin,
+        &images,
+        "B turned.jpg",
+        &turned_jpeg(6, "2023:12:24 09:30:00"),
+    )
+    .await;
+    upload(
+        &server,
+        &admin,
+        &images,
+        "C broken.png",
+        b"\x89PNG\r\n\x1a\nnot really",
+    )
+    .await;
+    upload(&server, &admin, &images, "D drawing.svg", b"<svg/>").await;
+
+    let (status, page) = call(
+        &server,
+        &admin,
+        Method::GET,
+        &format!("/api/nodes/{images}/children?view=photos"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let photos: Vec<(String, Value)> = page["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| {
+            (
+                item["name"].as_str().unwrap().to_owned(),
+                item["photo"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        photos,
+        vec![
+            (
+                "A wide.png".to_owned(),
+                json!({ "width": 300, "height": 200 })
+            ),
+            (
+                "B turned.jpg".to_owned(),
+                json!({ "width": height, "height": width, "taken_at": "2023-12-24T09:30:00" })
+            ),
+            ("C broken.png".to_owned(), Value::Null),
+            ("D drawing.svg".to_owned(), Value::Null),
+        ],
+        "{page}"
+    );
+    // Asked again, the kept facts answer the same.
+    let (_, again) = call(
+        &server,
+        &admin,
+        Method::GET,
+        &format!("/api/nodes/{images}/children?view=photos"),
+        None,
+    )
+    .await;
+    assert_eq!(again["items"], page["items"]);
+    // The grid and the list carry no facts; the Album view is for image libraries only.
+    let (_, grid) = call(
+        &server,
+        &admin,
+        Method::GET,
+        &format!("/api/nodes/{images}/children?view=grid"),
+        None,
+    )
+    .await;
+    assert!(grid["items"][0].get("photo").is_none(), "{grid}");
+    let (status, _) = call(
+        &server,
+        &admin,
+        Method::GET,
+        &format!("/api/nodes/{site}/children?view=photos"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 }
 
 fn local() -> SocketAddr {

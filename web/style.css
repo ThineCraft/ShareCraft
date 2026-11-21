@@ -1965,3 +1965,87 @@ ol.sk-item li+li::before{color:var(--line)}
 
 /* The build's version at the foot of signed-in pages (account.js showVersion). */
 .build-version{margin:var(--space-6) auto 0;padding:0 var(--space-4);max-width:1200px;text-align:center;color:var(--muted);font-size:var(--text-xs)}
+
+/* The Album view of an image library (photo-view.js): pictures edge to edge in justified rows,
+   placed through --x, --y, --w and --h; select boxes only on hover, focus or while selecting. */
+.photos{--ph-shade:rgb(0 0 0/.38);margin-top:var(--space-1)}
+.photo-tools{display:flex;flex-wrap:wrap;align-items:center;gap:var(--space-2);margin:0 0 var(--space-3)}
+.photo-tools button[aria-pressed=true]{background:var(--soft);font-weight:600}
+.photo-keys{margin:0 0 0 auto}
+.photo-folders{list-style:none;display:flex;flex-wrap:wrap;gap:var(--space-2);margin:0 0 var(--space-3);padding:0}
+.photo-folder{display:inline-flex;align-items:center;min-height:var(--control);padding:var(--space-1) var(--space-3);border:1px solid var(--line);border-radius:var(--radius-pill);background:var(--paper);color:var(--text);font-size:var(--text-sm);text-decoration:none}
+.photo-folder:hover{border-color:var(--accent-ink)}
+.photo-day{margin:0 0 var(--space-4)}
+.photo-day-name{position:sticky;top:0;z-index:1;margin:0;padding:var(--space-2) 0;background:var(--bg);font-size:var(--text-md);font-weight:600}
+.photo-grid{position:relative;list-style:none;margin:0;padding:0;height:var(--grid-h,0px)}
+.photo{position:absolute;left:var(--x,0px);top:var(--y,0px);width:var(--w,0px);height:var(--h,0px)}
+.photo-open{display:block;width:100%;height:100%;min-height:0;padding:0;border:0;border-radius:0;background:var(--band);overflow:hidden;cursor:zoom-in}
+.photo-open:hover{background:var(--band)}
+.photo-open:focus-visible{outline:3px solid var(--accent-ink);outline-offset:-3px}
+.photo-img{display:grid;place-items:center;width:100%;height:100%}
+.photo-img img{display:block;width:100%;height:100%;object-fit:cover;transition:transform var(--dur) var(--ease)}
+.photo-img .placeholder{color:var(--muted);font-size:var(--text-sm);font-weight:400;padding:var(--space-2);text-align:center}
+.photo-open::after{content:'';position:absolute;inset:0 0 auto;height:56px;background:linear-gradient(var(--ph-shade),transparent);opacity:0;pointer-events:none;transition:opacity var(--dur-fast) var(--ease)}
+.photo-check{position:absolute;top:var(--space-2);left:var(--space-2);width:22px;height:22px;margin:0;opacity:0;accent-color:var(--accent);cursor:pointer;transition:opacity var(--dur-fast) var(--ease)}
+.photo:is(:hover,:focus-within) .photo-check,.photo:is(:hover,:focus-within) .photo-open::after,.photos.selecting .photo-check{opacity:1}
+.photos.selecting .photo-open{cursor:pointer}
+.photo.selected .photo-open{background:var(--soft)}
+.photo.selected .photo-img img{transform:scale(.9)}
+.photo.selected::after{content:'';position:absolute;inset:0;box-shadow:inset 0 0 0 3px var(--accent-ink);pointer-events:none}
+@media (hover:none){.photo:hover .photo-check{opacity:0}.photos.selecting .photo-check{opacity:1}}
+@media (max-width:760px){
+ .photo-keys{display:none}
+ .photo-tools button{min-height:var(--control-touch)}
+ .photo-check{width:26px;height:26px}
+}
+
+/* The Album view's full-screen viewer and slideshow (photo-viewer.js): a dark stage in both
+   modes, the picture fitted to it, controls on glass that fade while a slideshow plays. */
+.photo-viewer{--ph-stage:#0b0c0e;--ph-ink:#f2f4f5;--ph-muted:#b9c1c6;--ph-glass:rgb(28 31 35/.78);--ph-glass-hover:rgb(56 61 68/.9);--ph-line:rgb(255 255 255/.2);--ph-shade:rgb(0 0 0/.55);
+ color-scheme:dark;position:fixed;inset:0;width:100vw;max-width:none;height:100dvh;max-height:none;margin:0;padding:0;border:0;border-radius:0;background:var(--ph-stage);color:var(--ph-ink);overflow:hidden;box-shadow:none}
+.photo-viewer::backdrop{background:rgb(0 0 0/.9)}
+html:has(dialog.photo-viewer[open]){overflow:hidden}
+.ph-stage{position:absolute;inset:0;display:grid;place-items:center;padding:64px 72px 80px;touch-action:pinch-zoom;user-select:none;-webkit-user-select:none}
+.photo-viewer.playing.idle .ph-stage{padding:0}
+.ph-stage:focus{outline:none}
+.ph-image{display:block;width:100%;height:100%;object-fit:contain}
+.ph-full{animation:ph-in var(--dur) var(--ease)}
+@keyframes ph-in{from{opacity:.65}to{opacity:1}}
+.ph-top{position:absolute;inset:0 0 auto;display:flex;align-items:flex-start;gap:var(--space-3);padding:var(--space-3) var(--space-4) var(--space-6);background:linear-gradient(var(--ph-shade),transparent);pointer-events:none}
+.ph-top>*{pointer-events:auto}
+.ph-title{flex:1 1 auto;min-width:0}
+.ph-name{margin:0;font-size:var(--text-md);font-weight:600;color:var(--ph-ink);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ph-when,.ph-where{margin:2px 0 0;font-size:var(--text-sm);color:var(--ph-muted)}
+.ph-bar{position:absolute;left:50%;bottom:var(--space-4);transform:translateX(-50%);display:flex;align-items:center;gap:var(--space-2);padding:var(--space-2);border:1px solid var(--ph-line);border-radius:var(--radius-pill);background:var(--ph-glass);box-shadow:var(--shadow-2)}
+.photo-viewer :is(button,.button){border-color:var(--ph-line);background:var(--ph-glass);color:var(--ph-ink);border-radius:var(--radius-pill)}
+.photo-viewer :is(button,.button):is(:hover,.plain:hover){background:var(--ph-glass-hover);border-color:var(--ph-line);color:var(--ph-ink)}
+.photo-viewer button:disabled{opacity:.35;background:var(--ph-glass);color:var(--ph-ink)}
+.photo-viewer :focus-visible{outline:2px solid var(--ph-ink);outline-offset:2px}
+.photo-viewer select{border-color:var(--ph-line);background:var(--ph-glass);color:var(--ph-ink);border-radius:var(--radius-pill)}
+.ph-play[aria-pressed=true]{background:var(--ph-ink);color:var(--ph-stage);border-color:var(--ph-ink)}
+.photo-viewer .ph-play[aria-pressed=true]:hover{background:var(--ph-muted);color:var(--ph-stage)}
+.ph-loop-label{display:inline-flex;align-items:center;gap:var(--space-1);padding:0 var(--space-2);color:var(--ph-ink);font-size:var(--text-sm)}
+.ph-loop-label input{accent-color:var(--ph-ink)}
+.ph-icon{width:var(--control);padding:0;font-size:var(--text-lg)}
+.ph-step{position:absolute;top:50%;width:48px;height:48px;min-height:48px;padding:0;transform:translateY(-50%);font-size:var(--text-2xl);line-height:1}
+.ph-previous{left:var(--space-3)}
+.ph-next{right:var(--space-3)}
+.ph-top,.ph-bar,.ph-step{transition:opacity var(--dur) var(--ease)}
+.photo-viewer.idle{cursor:none}
+.photo-viewer.idle :is(.ph-top,.ph-bar,.ph-step){opacity:0;pointer-events:none}
+@media (max-width:760px){
+ .ph-stage{padding:56px 0 calc(72px + env(safe-area-inset-bottom))}
+ .ph-bar{left:0;right:0;bottom:0;transform:none;justify-content:space-between;flex-wrap:wrap;border-width:1px 0 0;border-radius:0;padding:var(--space-2) var(--space-3) calc(var(--space-2) + env(safe-area-inset-bottom))}
+ .photo-viewer :is(button,.button,select){min-height:var(--control-touch)}
+ .ph-bar{gap:var(--space-1)}
+ .ph-bar :is(button,.button){padding-inline:var(--space-3)}
+ .ph-loop-label{padding:0 var(--space-1)}
+ .ph-icon{width:var(--control-touch)}
+ .ph-step{width:40px;height:40px;min-height:40px;font-size:var(--text-xl);opacity:.85}
+ .ph-previous{left:var(--space-1)}
+ .ph-next{right:var(--space-1)}
+}
+@media (forced-colors:active){
+ .photo-viewer{background:Canvas;color:CanvasText}
+ .photo.selected::after{box-shadow:none;outline:3px solid Highlight;outline-offset:-3px}
+}

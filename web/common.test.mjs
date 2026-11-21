@@ -1340,7 +1340,7 @@ test('type_list_field_normalises', () => {
 });
 
 test('grid_switch_only_for_image_libraries', () => {
-  assert.deepEqual(libs.libraryViews('image'), ['list', 'grid']);
+  assert.deepEqual(libs.libraryViews('image'), ['list', 'grid', 'photos']);
   for (const kind of ['document', 'template', 'asset', undefined]) assert.deepEqual(libs.libraryViews(kind), ['list'], kind);
   assert.equal(libs.libraryKindLabel('image'), 'Image library');
   assert.equal(libs.libraryKindLabel('document'), 'Document library');

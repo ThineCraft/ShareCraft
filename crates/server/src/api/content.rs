@@ -736,9 +736,18 @@ async fn read_start(
     .map_err(|e| ApiError::unavailable(&e))
 }
 
-/// `GET /api/docs/{id}/thumbnail`: a PNG of the document's current version at most 256 pixels
-/// on its longer side, made on the server the first time it is asked for and kept beside the
-/// content store (see [`previews::thumbnail`]). For PNG, JPEG, GIF (its first frame) and WebP
+/// Query of `GET /api/docs/{id}/thumbnail`.
+#[derive(Deserialize)]
+pub(crate) struct ThumbnailQuery {
+    /// `large` for the Album view's thumbnail; the small one when absent.
+    size: Option<String>,
+}
+
+/// `GET /api/docs/{id}/thumbnail?size=`: a PNG of the document's current version at most 256
+/// pixels on its longer side, or with `size=large` a JPEG (a PNG for a picture with
+/// transparency) at most 720, turned upright as its EXIF orientation says, made on the server
+/// the first time it is asked for and kept beside the content store (see
+/// [`previews::thumbnail`]). `422` for any other size. For PNG, JPEG, GIF (its first frame) and WebP
 /// files; `415 no_thumbnail` for any other type, for a document with no version, and for an
 /// image that cannot be decoded within the limits. `423 held {scan}` while the malware scanner
 /// holds the content; `404` if the caller has no role on the document; `503 busy` when no turn
@@ -748,8 +757,14 @@ pub(crate) async fn thumbnail(
     State(state): State<AppState>,
     signed: Signed,
     Path(id): Path<String>,
+    query: Result<Query<ThumbnailQuery>, QueryRejection>,
 ) -> Result<Response, ApiError> {
     let doc = DocId(parse_id(&id)?);
+    let size = match query_of(query)?.size.as_deref() {
+        None => previews::ThumbSize::Small,
+        Some("large") => previews::ThumbSize::Large,
+        Some(_) => return Err(ApiError::InvalidRequest),
+    };
     let document = viewed_document(&state, &signed, doc).await?;
     if !previews::has_thumbnail(&document.name) {
         return Err(ApiError::NoThumbnail);
@@ -765,7 +780,7 @@ pub(crate) async fn thumbnail(
     };
     let made = state
         .thumbnailer()
-        .make(Arc::clone(state.blobs()), blob.sha256)
+        .make(Arc::clone(state.blobs()), blob.sha256, size)
         .await;
     let path = match made {
         Ok(path) => path,
@@ -792,8 +807,13 @@ pub(crate) async fn thumbnail(
         // Erased meanwhile with its content.
         Err(_) => return Err(ApiError::NoThumbnail),
     };
+    let kind = if path.extension().is_some_and(|e| e == "jpg") {
+        "image/jpeg"
+    } else {
+        "image/png"
+    };
     let mut headers = HeaderMap::new();
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static("image/png"));
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static(kind));
     headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
     headers.insert(CONTENT_SECURITY_POLICY, HeaderValue::from_static("sandbox"));
     headers.insert(

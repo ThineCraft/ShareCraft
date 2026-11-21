@@ -40,6 +40,7 @@
   <div id="view-switch" class="view-switch" role="group" aria-label="View" hidden>
    <button type="button" id="view-list" class="plain" aria-pressed="true">List</button>
    <button type="button" id="view-grid" class="plain" aria-pressed="false">Grid</button>
+   <button type="button" id="view-photos" class="plain" aria-pressed="false">Album</button>
   </div>
   <div class="menu-wrap">
    <button type="button" id="more-button" class="plain menu-button" aria-label="More for this library">More <span class="caret" aria-hidden="true">▾</span></button>
@@ -124,6 +125,16 @@
   <tbody id="file-rows"></tbody>
  </table>
  <ul id="items" class="list" aria-labelledby="items-heading" hidden></ul>
+ <div id="photos" class="photos" hidden>
+  <div class="photo-tools" role="toolbar" aria-label="Album">
+   <button type="button" id="photo-group" class="plain" aria-pressed="true">By date</button>
+   <button type="button" id="photo-slideshow" class="plain">Slideshow</button>
+   <p id="photo-keys" class="meta photo-keys">Arrow keys move, Enter opens, Space selects.</p>
+  </div>
+  <ul id="photo-folders" class="photo-folders" aria-label="Folders" hidden></ul>
+  <div class="photo-groups" aria-describedby="photo-keys"></div>
+  <p id="photo-others" class="meta" hidden></p>
+ </div>
  <p id="empty" hidden>There is nothing here yet.</p>
  <p><button type="button" id="more" class="plain" hidden>Show more</button></p>
  </div>

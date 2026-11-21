@@ -2341,7 +2341,7 @@ export const libraryKindLabel = (kind) => LIBRARY_KINDS.find((k) => k.value === 
 export const libraryKindChoices = (isAdmin) => LIBRARY_KINDS.filter((k) => isAdmin || k.value !== 'asset');
 
 /** The views a library of `kind` offers: image libraries have a grid of thumbnails too. */
-export const libraryViews = (kind) => (kind === 'image' ? ['list', 'grid'] : ['list']);
+export const libraryViews = (kind) => (kind === 'image' ? ['list', 'grid', 'photos'] : ['list']);
 
 /** The marks a listed item carries: held, quarantined (with its threat) and blocked. */
 export function itemMarks(item) {

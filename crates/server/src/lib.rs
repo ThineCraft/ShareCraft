@@ -28,6 +28,7 @@ mod live_room;
 mod live_store;
 mod looks;
 mod members;
+pub mod photos;
 pub mod previews;
 mod projection;
 mod room;
