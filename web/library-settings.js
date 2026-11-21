@@ -56,6 +56,8 @@ await siteChrome(here.path[0].id, {
 if (!can(here.access, 'manage_site')) fail('Only the owners of this site can change the settings of its libraries.');
 if (!first.ok) fail(first.status === 404 ? MISSING : messageFor(first.error));
 let library = first.data;
+/** The brand centre's images, fetched once when the banner picture picker first opens. */
+let brandImages = null;
 show(library);
 $('settings').hidden = false;
 
@@ -95,8 +97,6 @@ function show(settings) {
   showHero(settings.hero_image ?? null);
 }
 
-/** The brand centre's images, fetched once when the picker first opens. */
-let brandImages = null;
 
 /** The banner picture as a tile: the picture, its name, Change (or Choose) and Remove. */
 function showHero(image) {
