@@ -379,6 +379,37 @@ async fn slot_image(
     }
 }
 
+/// The hero image of a library of `site`, chosen by `actor` as a header image is: `slot` is
+/// `{doc}` (the current version of a document in an asset library or in one of `site`'s
+/// libraries, which `actor` can view), `{brand_image}` (an image of the brand centre), or
+/// `{keep}` (the hash of `current`, the library's hero image now, kept as it is).
+///
+/// # Errors
+/// As a header image of a look (see `slot_image`): `422 invalid_look` for a slot that gives no
+/// way or more than one, an unknown brand image or a `keep` of anything but `current`; `413
+/// image_too_large`; `423 held`; `404`, `400 wrong_place` or `422 not_an_image` for the
+/// document.
+pub(crate) async fn hero_image(
+    state: &AppState,
+    actor: &User,
+    site: NodeId,
+    slot: ImageSlot,
+    current: Option<&ImageRef>,
+) -> Result<ImageRef, BrandError> {
+    let org = state.db().org_brand().await?;
+    let ctx = SlotContext {
+        state,
+        actor,
+        site,
+        current: current.into_iter().collect(),
+        history: Vec::new(),
+        org: &org,
+    };
+    slot_image(&ctx, Some(slot), ImageKind::Background)
+        .await?
+        .ok_or_else(|| BrandError::InvalidLook("no image was chosen".into()))
+}
+
 /// Every image of `look`, each with the name of its slot.
 fn slots(look: &Look) -> Vec<(&'static str, &ImageRef)> {
     [

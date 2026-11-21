@@ -123,7 +123,11 @@ const showEntry = (id, shown) => {
 if (libraryStep) $('settings-link').href = `/library-settings.html?id=${seg(libraryStep.id)}`;
 let canAdd = false;
 showPlace();
-await siteChrome(here.path[0].id, { currentId: here.path.find((step) => step.kind === 'library')?.id, footer: true });
+await siteChrome(here.path[0].id, {
+  currentId: libraryStep?.id,
+  footer: true,
+  hero: libraryStep ? { library: libraryStep.id, url: library?.hero_image?.url ?? null } : null,
+});
 
 $('bin-link').href = `/bin.html?site=${seg(here.path[0].id)}`;
 const siteId = here.path[0].id;

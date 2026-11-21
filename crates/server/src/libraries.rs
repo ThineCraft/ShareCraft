@@ -44,6 +44,9 @@ pub struct LibraryEdit {
     pub blocked_types: Option<Vec<String>>,
     /// The largest file it takes, in bytes; `Some(None)` for no limit of its own.
     pub max_file_bytes: Option<Option<u64>>,
+    /// The hero image, already chosen (see [`crate::looks::hero_image`]); `Some(None)` for
+    /// none.
+    pub hero_image: Option<Option<revisions::brand::ImageRef>>,
 }
 
 /// What a reconcile of the library records did.
@@ -254,6 +257,19 @@ pub async fn change(
         note("max_file_bytes", json!(after.max_file_bytes), json!(bytes));
         after.max_file_bytes = bytes;
     }
+    if let Some(hero) = edit.hero_image {
+        let name = |image: &Option<revisions::brand::ImageRef>| {
+            image
+                .as_ref()
+                .map(|i| json!({ "name": i.name, "sha256": i.sha256 }))
+        };
+        note(
+            "hero_image",
+            json!(name(&after.hero_image)),
+            json!(name(&hero)),
+        );
+        after.hero_image = hero;
+    }
     // Only administrators set the asset kind, or change a library away from it; the other
     // settings of an asset library are its managers' to change.
     let kind_changed = after.kind != before.kind;
@@ -309,10 +325,24 @@ pub async fn change(
         })
         .await;
     match applied {
-        Ok(()) => Ok(db
-            .library_settings(library)
-            .await?
-            .unwrap_or_else(|| LibrarySettings::defaults(library))),
+        Ok(()) => {
+            // A hero image replaced or taken away no longer pins its content here; it is erased
+            // if nothing else names it.
+            if let Some(old) = &before.hero_image
+                && after.hero_image.as_ref().map(|i| &i.sha256) != Some(&old.sha256)
+                && let Some(hash) = revisions::parse_hex(&old.sha256)
+                && let Err(e) = state.blobs().erase_if_unreferenced(db, &hash).await
+            {
+                eprintln!(
+                    "sharecraft-server: could not erase the old hero image of library {}: {e}",
+                    library.0
+                );
+            }
+            Ok(db
+                .library_settings(library)
+                .await?
+                .unwrap_or_else(|| LibrarySettings::defaults(library)))
+        }
         Err(AccessError::Db(error)) => {
             eprintln!(
                 "sharecraft-server: change to library {} is in Git but not in the database: \

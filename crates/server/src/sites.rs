@@ -772,11 +772,16 @@ pub async fn reconcile(store: Arc<dyn Checkpointer>, db: &Db) -> Result<SitesRep
         .map_err(|e| CheckpointError::Git(GitError::new(e)))??
     };
     let defaults = db.regional_defaults().await?;
-    let sites: HashSet<NodeId> = db
-        .node_rows()
-        .await?
-        .into_iter()
+    let node_rows = db.node_rows().await?;
+    let sites: HashSet<NodeId> = node_rows
+        .iter()
         .filter(|row| row.kind == NodeKind::Site && row.purged_at.is_none())
+        .map(|row| row.id)
+        .collect();
+    // A library's hero image is pinned under the library's id (see crate::libraries).
+    let libraries: HashSet<NodeId> = node_rows
+        .iter()
+        .filter(|row| row.kind == NodeKind::Library && row.purged_at.is_none())
         .map(|row| row.id)
         .collect();
     let current: HashMap<NodeId, SiteSettings> = db
@@ -794,10 +799,12 @@ pub async fn reconcile(store: Arc<dyn Checkpointer>, db: &Db) -> Result<SitesRep
     for (owner, sha, media_type) in db.all_brand_pins().await? {
         pins.entry(owner).or_default().push((sha, media_type));
     }
-    // Pins of a site no longer in the tree (purged, or never mirrored) are dropped; the
-    // sweeper erases what nothing names any more.
+    // Pins of a site or library no longer in the tree (purged, or never mirrored) are
+    // dropped; the sweeper erases what nothing names any more. A library's own pins are put
+    // right by the libraries' reconcile, after the sites.
     for owner in pins.keys() {
-        let gone = Uuid::parse_str(owner).is_ok_and(|id| !sites.contains(&NodeId(id)));
+        let gone = Uuid::parse_str(owner)
+            .is_ok_and(|id| !sites.contains(&NodeId(id)) && !libraries.contains(&NodeId(id)));
         if gone {
             db.drop_brand_pins(owner).await?;
             report.updated = report.updated.saturating_add(1);

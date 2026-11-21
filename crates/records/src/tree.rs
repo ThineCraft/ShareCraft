@@ -526,8 +526,24 @@ async fn after_purge(
     .bind(&ids)
     .fetch_all(&mut *conn)
     .await?;
+    // A purged library's hero image is no longer pinned by it.
+    let owners: Vec<String> = ids.iter().map(Uuid::to_string).collect();
+    let unpinned: Vec<(String, i64)> = sqlx::query_as(
+        "with gone as (delete from brand_refs where owner = any($1) returning sha256) \
+         select b.sha256, b.size from gone join blobs b on b.sha256 = gone.sha256",
+    )
+    .bind(&owners)
+    .fetch_all(&mut *conn)
+    .await?;
     let mut purged = PurgedVersions::default();
     let mut seen = std::collections::HashSet::new();
+    for (sha256, size) in &unpinned {
+        if seen.insert(sha256.clone())
+            && let (Some(sha256), Ok(size)) = (parse_hex(sha256), u64::try_from(*size))
+        {
+            purged.contents.push(BlobRef { sha256, size });
+        }
+    }
     for (sha256, size) in gone {
         purged.versions += 1;
         purged.bytes = purged.bytes.saturating_add(size);

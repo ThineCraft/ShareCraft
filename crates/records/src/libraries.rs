@@ -6,6 +6,7 @@
 use std::collections::HashSet;
 
 use collab_core::ids::{DocId, NodeId, UserId};
+use revisions::brand::ImageRef;
 use revisions::{LIBRARY_SCHEMA, LibraryFields, LibraryRecord, MAX_DESCRIPTION_CHARS};
 use sqlx::postgres::PgRow;
 use sqlx::{PgConnection, Row};
@@ -32,7 +33,7 @@ const CHECK_VIOLATION: &str = "23514";
 
 /// The columns of a `libraries` row as [`settings_from_row`] reads them.
 const LIBRARY_COLUMNS: &str =
-    "id, kind, description, folders, allowed_types, blocked_types, max_file_bytes";
+    "id, kind, description, folders, allowed_types, blocked_types, max_file_bytes, hero_image";
 
 /// A file in one of a site's template libraries: a "New from template" choice for whoever may
 /// view it and its content is available (the caller judges both).
@@ -103,6 +104,9 @@ pub struct LibrarySettings {
     pub blocked_types: Vec<String>,
     /// The largest file it takes, in bytes; `None` for no limit of its own.
     pub max_file_bytes: Option<u64>,
+    /// The image shown in place of the site header's banner image on its pages, if any. It
+    /// pins its content (`brand_refs` rows owned by the library's id).
+    pub hero_image: Option<ImageRef>,
 }
 
 impl LibrarySettings {
@@ -118,6 +122,7 @@ impl LibrarySettings {
             allowed_types: None,
             blocked_types: Vec::new(),
             max_file_bytes: None,
+            hero_image: None,
         }
     }
 
@@ -132,13 +137,14 @@ impl LibrarySettings {
             allowed_types: record.allowed_types.clone(),
             blocked_types: record.blocked_types.clone(),
             max_file_bytes: record.max_file_bytes,
+            hero_image: record.hero_image.clone(),
         })
     }
 
     /// The library record that holds these settings.
     #[must_use]
     pub fn to_record(&self) -> LibraryRecord {
-        LibraryRecord::new(
+        let mut record = LibraryRecord::new(
             self.id.0,
             LibraryFields {
                 kind: self.kind.as_str().to_owned(),
@@ -148,7 +154,9 @@ impl LibrarySettings {
                 blocked_types: self.blocked_types.clone(),
                 max_file_bytes: self.max_file_bytes,
             },
-        )
+        );
+        record.hero_image = self.hero_image.clone();
+        record
     }
 
     /// The file types the library accepts in effect: its own list, and for an image library
@@ -275,6 +283,11 @@ pub struct LibraryChange<'a> {
 fn settings_from_row(row: &PgRow) -> Result<LibrarySettings, sqlx::Error> {
     let kind: String = row.try_get("kind")?;
     let bytes: Option<i64> = row.try_get("max_file_bytes")?;
+    let hero: Option<serde_json::Value> = row.try_get("hero_image")?;
+    let hero_image = hero
+        .map(serde_json::from_value::<ImageRef>)
+        .transpose()
+        .map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
     Ok(LibrarySettings {
         id: NodeId(row.try_get("id")?),
         kind: LibraryKind::parse(&kind)
@@ -284,6 +297,7 @@ fn settings_from_row(row: &PgRow) -> Result<LibrarySettings, sqlx::Error> {
         allowed_types: row.try_get("allowed_types")?,
         blocked_types: row.try_get("blocked_types")?,
         max_file_bytes: bytes.map(|b| u64::try_from(b).unwrap_or(0)),
+        hero_image,
     })
 }
 
@@ -312,12 +326,12 @@ pub(crate) async fn upsert_library(
         .transpose()?;
     let result = sqlx::query(
         "insert into libraries (id, kind, description, folders, allowed_types, blocked_types, \
-             max_file_bytes) \
-         values ($1, $2, $3, $4, $5, $6, $7) \
+             max_file_bytes, hero_image) \
+         values ($1, $2, $3, $4, $5, $6, $7, $8) \
          on conflict (id) do update set kind = excluded.kind, \
              description = excluded.description, folders = excluded.folders, \
              allowed_types = excluded.allowed_types, blocked_types = excluded.blocked_types, \
-             max_file_bytes = excluded.max_file_bytes",
+             max_file_bytes = excluded.max_file_bytes, hero_image = excluded.hero_image",
     )
     .bind(settings.id.0)
     .bind(settings.kind.as_str())
@@ -326,6 +340,14 @@ pub(crate) async fn upsert_library(
     .bind(&settings.allowed_types)
     .bind(&settings.blocked_types)
     .bind(bytes)
+    .bind(
+        settings
+            .hero_image
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|_| AccessError::InvalidLibrarySettings("refused"))?,
+    )
     .execute(conn)
     .await;
     match result {
@@ -496,6 +518,24 @@ impl Db {
                 other => other,
             })?;
         upsert_library(&mut tx, change.settings).await?;
+        // The hero image pins its content, as a site's look pins its images; a repair from Git
+        // (no actor) brings back a content row that is missing.
+        let pins: Vec<crate::brand::Pin<'_>> = change
+            .settings
+            .hero_image
+            .iter()
+            .map(crate::brand::Pin::from)
+            .collect();
+        let pinned = crate::brand::pin_contents(
+            &mut tx,
+            &library.0.to_string(),
+            &pins,
+            change.actor.is_none(),
+        )
+        .await?;
+        if !pinned {
+            return Err(AccessError::InvalidLibrarySettings("image_gone"));
+        }
         for event in change.events {
             record(&mut tx, event).await?;
         }

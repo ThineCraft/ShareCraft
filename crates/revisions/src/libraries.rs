@@ -101,6 +101,12 @@ pub struct LibraryRecord {
     pub blocked_types: Vec<String>,
     /// The largest file it takes, in bytes; `None` for no limit of its own.
     pub max_file_bytes: Option<u64>,
+    /// The library's hero image: shown in place of the site header's banner image on the
+    /// library's pages (only where the site's look has one). A copy of the image as chosen,
+    /// pinned in the content store as a look's images are. Not among the fields a site
+    /// template carries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hero_image: Option<crate::brand::ImageRef>,
 }
 
 impl LibraryRecord {
@@ -116,6 +122,7 @@ impl LibraryRecord {
             allowed_types: fields.allowed_types,
             blocked_types: fields.blocked_types,
             max_file_bytes: fields.max_file_bytes,
+            hero_image: None,
         }
     }
 
@@ -125,7 +132,7 @@ impl LibraryRecord {
         LibraryRecord::new(id, LibraryFields::default())
     }
 
-    /// The kind and settings, without the identity.
+    /// The kind and settings, without the identity (and without the hero image).
     #[must_use]
     pub fn fields(&self) -> LibraryFields {
         LibraryFields {
@@ -248,6 +255,7 @@ mod tests {
             allowed_types: Some(vec![".png".into(), ".jpg".into()]),
             blocked_types: vec![".tar.gz".into()],
             max_file_bytes: Some(10_485_760),
+            hero_image: None,
         };
         let text = String::from_utf8(file_bytes(&record).unwrap()).unwrap();
         let expected = r#"{

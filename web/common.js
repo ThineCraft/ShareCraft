@@ -8,6 +8,7 @@ import { existingSidebar, sidebar } from './workspace.js';
 import { prefetchCache, prefetchKey, setupPrefetch } from './prefetch.js';
 import { connection } from './connection.js';
 import { rememberChrome } from './skeleton.js';
+import { showHero } from './hero.js';
 
 // Pointing at a link to another page asks for its first answers early (prefetch.js).
 setupPrefetch();
@@ -1840,11 +1841,14 @@ function sideBySide(page, chrome, vertical) {
  * across the top.
  * The focused editor frame passes `navigation: false`: no navigation row under its bar (the way
  * back and the command palette reach the site instead).
+ * A page in a library passes `hero: {library, url}` (`url` the library's banner picture or
+ * null): where the header shows a banner picture, the library's slides in over it, and on the
+ * next page of the site outside the library it slides back out (see hero.js).
  * `currentId` is marked as the current page. Answers `{ site, navigation, look }`, each null
  * when it could not be read; without the site the organisation defaults are used, and without
  * the look the page keeps its own.
  */
-export async function siteChrome(siteId, { currentId, place, footer = false, frame = false, navigation: withNavigation = true } = {}) {
+export async function siteChrome(siteId, { currentId, place, footer = false, frame = false, navigation: withNavigation = true, hero = null } = {}) {
   const [site, navigation, look] = await Promise.all([
     api('GET', `/sites/${seg(siteId)}`),
     api('GET', `/sites/${seg(siteId)}/navigation`),
@@ -1879,9 +1883,10 @@ export async function siteChrome(siteId, { currentId, place, footer = false, fra
     frameMark(document.querySelector('.bar .mono'), shown.look);
     if (withNavigation) placeChrome(view, place);
   } else {
+    const header = shown.site ? headerView(shown.site, shown.look) : null;
     placeSite(
       {
-        header: shown.site ? headerView(shown.site, shown.look) : null,
+        header,
         chrome: view,
         footer: footer ? footerView(shown.look) : null,
         vertical,
@@ -1890,6 +1895,8 @@ export async function siteChrome(siteId, { currentId, place, footer = false, fra
     );
     // The heights the header and navigation took, so that the next visit reserves them (skeleton.js).
     rememberChrome();
+    // A library's banner picture slides in over the site's, and back out on leaving (hero.js).
+    showHero(header, { site: siteId, library: hero?.library ?? null, url: hero?.url ?? null });
   }
   return shown;
 }
