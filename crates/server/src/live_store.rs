@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use collab_core::ids::{ClientId, DocId, Seq, UserId};
 use records::{
-    Db, DbError, GoneReason, LiveCheckpointWriter, LiveLoaded, LiveLocal, LiveReturnTombstoneRow,
-    NewLiveCancel, NewLiveChange, NewLiveCheckpoint, Origin,
+    Db, DbError, GoneReason, LiveCheckpointWriter, LiveDisputeMark, LiveLoaded, LiveLocal,
+    LiveReturnTombstoneRow, NewLiveCancel, NewLiveChange, NewLiveCheckpoint, Origin,
 };
 use revisions::{Author, BlobRef, Checkpoint, Outcome, RevisionId, RevisionInfo};
 use serde_json::{Map, Value};
@@ -31,6 +31,177 @@ pub(crate) struct LiveWrite<'a> {
     pub created_at: OffsetDateTime,
     /// The place and client that uploaded it.
     pub writer: Option<LiveCheckpointWriter>,
+    /// The major-version reason and person, when the checkpoint is a major version (C23).
+    pub major: Option<(&'a str, UserId)>,
+}
+
+/// What a major-version write keeps in the history (C22, C23, S4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MajorKind {
+    /// The room's last state, uploaded, kept below the outside revision that replaced the
+    /// file; that revision is then stored again as current and becomes the live base.
+    Outside,
+    /// An expired returning client's own copy, uploaded, kept below the current revision,
+    /// which is then stored again as current.
+    Archive,
+    /// No upload: the current revision is stored again, unchanged, marked major.
+    Mark,
+    /// Two editors' checkpoints disagreed: the verifier's bytes (when uploaded) and the
+    /// writer's checkpoint are kept as disputed copies, then the last verified base (when
+    /// there is one) is stored again as current.
+    Dispute,
+}
+
+/// A major-version write on top of the document's current revision.
+pub(crate) struct MajorWrite<'a> {
+    pub kind: MajorKind,
+    /// The reason recorded on the revision stored again as current.
+    pub reason: &'a str,
+    pub person: UserId,
+    /// The document's current revision: everything is written on top of it.
+    pub current: &'a str,
+    /// The revision whose bytes are stored again as current at the end; `current` when
+    /// `None` (except for a dispute with no verified base, which ends on the writer's copy).
+    pub restore: Option<&'a str>,
+    /// For a dispute, the writer's disputed checkpoint, kept again as a major version.
+    pub disputed: Option<&'a str>,
+    /// The uploaded bytes, for [`MajorKind::Outside`], [`MajorKind::Archive`] and (the
+    /// verifier's) [`MajorKind::Dispute`].
+    pub blob: Option<BlobRef>,
+    /// Credited on the uploaded bytes.
+    pub authors: &'a [Author],
+    pub at: Seq,
+    pub session: Uuid,
+    pub created_at: OffsetDateTime,
+}
+
+/// What a major-version write left in the history.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MajorWritten {
+    /// The revision holding the uploaded bytes, when there were any.
+    pub kept: Option<String>,
+    /// For a dispute, the writer's checkpoint kept again.
+    pub copy: Option<String>,
+    /// The current revision afterwards.
+    pub current: String,
+}
+
+/// The reason recorded on uploaded bytes a major write keeps.
+fn kept_reason(kind: MajorKind) -> &'static str {
+    match kind {
+        MajorKind::Outside => "outside_replacement",
+        MajorKind::Archive | MajorKind::Mark => "returning_client_archive",
+        MajorKind::Dispute => "disputed_copy",
+    }
+}
+
+/// The field naming the content hash of a revision the live room wrote itself. A file saved
+/// from elsewhere with copied fields carries another hash than its own content's, so it is
+/// never taken for the room's own.
+pub(crate) const OWN_MARKER: &str = "live_blob";
+
+fn hex(sha256: &[u8; 32]) -> String {
+    sha256.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// `fields` marked as written by the live room for content `sha256`.
+fn marked(mut fields: Map<String, Value>, sha256: &[u8; 32]) -> Map<String, Value> {
+    fields.insert(OWN_MARKER.to_owned(), Value::from(hex(sha256)));
+    fields
+}
+
+/// Whether the live room wrote `info` itself: its marker names its own content.
+pub(crate) fn written_by_room(info: &RevisionInfo) -> bool {
+    info.blob.is_some_and(|blob| {
+        info.fields.get(OWN_MARKER).and_then(Value::as_str) == Some(hex(&blob.sha256).as_str())
+    })
+}
+
+/// Live and major facts, which a revision stored again or kept must not inherit.
+const LIVE_KEYS: [&str; 9] = [
+    "verified",
+    "live_through",
+    "major",
+    "major_reason",
+    "major_person",
+    "restores",
+    "forensic_of",
+    "replaced_by",
+    OWN_MARKER,
+];
+
+/// `base` without live facts, marked as a major version for `reason` and `person`.
+pub(crate) fn major_fields(
+    base: &Map<String, Value>,
+    reason: &str,
+    person: UserId,
+) -> Map<String, Value> {
+    let mut fields = base.clone();
+    for key in LIVE_KEYS {
+        fields.remove(key);
+    }
+    fields.insert("major".to_owned(), Value::Bool(true));
+    fields.insert("major_reason".to_owned(), Value::from(reason));
+    fields.insert("major_person".to_owned(), Value::from(person.0.to_string()));
+    fields
+}
+
+/// The fields of `revision` stored again, unchanged, as a major version that names the
+/// revision whose bytes it holds (the one `revision` itself restores, if any).
+fn restored_fields(
+    revision: &str,
+    info: &RevisionInfo,
+    reason: &str,
+    person: UserId,
+) -> Map<String, Value> {
+    let origin = info
+        .fields
+        .get("restores")
+        .and_then(Value::as_str)
+        .unwrap_or(revision)
+        .to_owned();
+    let mut fields = major_fields(&info.fields, reason, person);
+    fields.insert("restores".to_owned(), Value::from(origin));
+    match info.blob {
+        Some(blob) => marked(fields, &blob.sha256),
+        None => fields,
+    }
+}
+
+/// The fields of the uploaded bytes a major write keeps.
+fn kept_fields(
+    kind: MajorKind,
+    target: &str,
+    target_fields: &Map<String, Value>,
+    write: &MajorWrite<'_>,
+    blob: &BlobRef,
+) -> Map<String, Value> {
+    let mut fields = major_fields(target_fields, kept_reason(kind), write.person);
+    if kind == MajorKind::Outside {
+        fields.insert("live_through".to_owned(), Value::from(write.at.0));
+        fields.insert("verified".to_owned(), Value::Bool(false));
+        fields.insert("replaced_by".to_owned(), Value::from(target));
+    }
+    marked(fields, &blob.sha256)
+}
+
+/// The verified base an outside replacement leaves: the outside file stored again.
+fn adopted_base<'a>(
+    revision: &'a str,
+    sha256: [u8; 32],
+    write: &MajorWrite<'_>,
+) -> NewLiveCheckpoint<'a> {
+    NewLiveCheckpoint {
+        revision,
+        through: write.at,
+        sha256,
+        session: write.session,
+        session_data: &[],
+        major_reason: Some("outside_current"),
+        major_person: Some(write.person),
+        writer: None,
+        created_at: write.created_at,
+    }
 }
 
 /// Why a participant-written checkpoint was not stored.
@@ -47,16 +218,9 @@ pub(crate) enum LiveWriteError {
         described: Option<Box<RevisionInfo>>,
         error: String,
     },
-}
-
-/// What a verifier's disagreeing (forensic) upload left in the history.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ForensicWritten {
-    /// The revision holding the verifier's bytes.
-    pub forensic: String,
-    /// The document's current revision afterwards: normally a new revision restoring the
-    /// agreed bytes, or the forensic revision itself when that restore could not be written.
-    pub current: String,
+    /// A major write stopped part way: Git holds the room's own revision `head` on top of what
+    /// was current, and the revision meant to end current was not stored again.
+    Partial { head: String, error: String },
 }
 
 /// The fields a live checkpoint revision stores: the base revision's fields, without an
@@ -69,6 +233,10 @@ pub(crate) fn live_fields(base: &Map<String, Value>, at: Seq) -> Map<String, Val
         "major",
         "major_reason",
         "major_person",
+        "restores",
+        "forensic_of",
+        "replaced_by",
+        OWN_MARKER,
     ] {
         fields.remove(key);
     }
@@ -77,8 +245,75 @@ pub(crate) fn live_fields(base: &Map<String, Value>, at: Seq) -> Map<String, Val
     fields
 }
 
+/// The fields of the checkpoint `write`: [`live_fields`], marked major when it is one.
+pub(crate) fn checkpoint_fields(
+    base: &Map<String, Value>,
+    write: &LiveWrite<'_>,
+) -> Map<String, Value> {
+    let mut fields = live_fields(base, write.at);
+    if let Some((reason, person)) = write.major {
+        fields.insert("major".to_owned(), Value::Bool(true));
+        fields.insert("major_reason".to_owned(), Value::from(reason));
+        fields.insert("major_person".to_owned(), Value::from(person.0.to_string()));
+    }
+    marked(fields, &write.blob.sha256)
+}
+
 pub(crate) trait LiveStore: Clone + Send + Sync + 'static {
     fn load_live(&self, doc: DocId) -> impl Future<Output = Result<LiveLoaded, DbError>> + Send;
+
+    /// The kept entries after the verified base and their bytes, without loading them.
+    fn live_unsaved_counts(
+        &self,
+        doc: DocId,
+    ) -> impl Future<Output = Result<(u64, u64), DbError>> + Send;
+
+    /// Sets aside the unverified checkpoint `revision` its verifier disagreed with.
+    fn dispute_live_checkpoint(
+        &self,
+        doc: DocId,
+        revision: &str,
+        at: OffsetDateTime,
+    ) -> impl Future<Output = Result<(), DbError>> + Send;
+
+    /// Sets aside the sole-editor base `revision` a second editor disputed; the catch-up base
+    /// goes back to the newest peer-verified checkpoint, which is answered.
+    fn dispute_live_sole_base(
+        &self,
+        doc: DocId,
+        revision: &str,
+        at: OffsetDateTime,
+    ) -> impl Future<Output = Result<Option<(String, Seq)>, DbError>> + Send;
+
+    /// The dispute marks of the document's people.
+    fn live_dispute_marks(
+        &self,
+        doc: DocId,
+    ) -> impl Future<Output = Result<Vec<LiveDisputeMark>, DbError>> + Send;
+
+    /// Stores one person's dispute mark.
+    fn set_live_dispute_mark(
+        &self,
+        doc: DocId,
+        mark: &LiveDisputeMark,
+    ) -> impl Future<Output = Result<(), DbError>> + Send;
+
+    /// Accepts the checkpoint `revision` at `through` as the base with no second editor to
+    /// verify it.
+    fn accept_live_sole_editor(
+        &self,
+        doc: DocId,
+        revision: &str,
+        through: Seq,
+        at: OffsetDateTime,
+    ) -> impl Future<Output = Result<(), DbError>> + Send;
+
+    /// A second editor's hash matched the sole-editor base `revision`.
+    fn confirm_live_sole_editor(
+        &self,
+        doc: DocId,
+        revision: &str,
+    ) -> impl Future<Output = Result<(), DbError>> + Send;
 
     /// The document's current revision as recorded, for a log with no live checkpoint yet.
     fn current_revision(
@@ -94,15 +329,23 @@ pub(crate) trait LiveStore: Clone + Send + Sync + 'static {
         write: &LiveWrite<'_>,
     ) -> impl Future<Output = Result<String, LiveWriteError>> + Send;
 
-    /// Keeps a verifier's disagreeing bytes for `write.at` as a history revision on top of
-    /// `write.base`, then restores the agreed checkpoint `agreed` as the current revision. No
-    /// live checkpoint is recorded: the forensic bytes never become a catch-up base.
-    fn write_live_forensic(
+    /// Writes a major version on top of `write.current` (see [`MajorKind`]). After an outside
+    /// replacement it also records the outside file, stored again, as the verified live base
+    /// at `write.at`.
+    fn write_live_major(
         &self,
         doc: DocId,
-        write: &LiveWrite<'_>,
-        agreed: &str,
-    ) -> impl Future<Output = Result<ForensicWritten, LiveWriteError>> + Send;
+        write: &MajorWrite<'_>,
+    ) -> impl Future<Output = Result<MajorWritten, LiveWriteError>> + Send;
+
+    /// Records `checkpoint`, a revision that replaced the live file from outside, as the
+    /// verified catch-up base at its position.
+    fn adopt_live_base(
+        &self,
+        doc: DocId,
+        checkpoint: &NewLiveCheckpoint<'_>,
+        at: OffsetDateTime,
+    ) -> impl Future<Output = Result<(), DbError>> + Send;
 
     /// Git's description of `revision` of `doc`, for a checkpoint whose write could not
     /// describe it; `None` when Git does not know it.
@@ -239,6 +482,54 @@ impl LiveStore for Db {
         Db::load_live(self, doc).await
     }
 
+    async fn live_unsaved_counts(&self, doc: DocId) -> Result<(u64, u64), DbError> {
+        Db::live_unsaved_counts(self, doc).await
+    }
+
+    async fn dispute_live_checkpoint(
+        &self,
+        doc: DocId,
+        revision: &str,
+        at: OffsetDateTime,
+    ) -> Result<(), DbError> {
+        Db::dispute_live_checkpoint(self, doc, revision, at).await
+    }
+
+    async fn dispute_live_sole_base(
+        &self,
+        doc: DocId,
+        revision: &str,
+        at: OffsetDateTime,
+    ) -> Result<Option<(String, Seq)>, DbError> {
+        Db::dispute_live_sole_base(self, doc, revision, at).await
+    }
+
+    async fn live_dispute_marks(&self, doc: DocId) -> Result<Vec<LiveDisputeMark>, DbError> {
+        Db::live_dispute_marks(self, doc).await
+    }
+
+    async fn set_live_dispute_mark(
+        &self,
+        doc: DocId,
+        mark: &LiveDisputeMark,
+    ) -> Result<(), DbError> {
+        Db::set_live_dispute_mark(self, doc, mark).await
+    }
+
+    async fn accept_live_sole_editor(
+        &self,
+        doc: DocId,
+        revision: &str,
+        through: Seq,
+        at: OffsetDateTime,
+    ) -> Result<(), DbError> {
+        Db::accept_live_sole_editor(self, doc, revision, through, at).await
+    }
+
+    async fn confirm_live_sole_editor(&self, doc: DocId, revision: &str) -> Result<(), DbError> {
+        Db::confirm_live_sole_editor(self, doc, revision).await
+    }
+
     async fn current_revision(&self, doc: DocId) -> Result<Option<String>, DbError> {
         Ok(self
             .document(doc)
@@ -256,15 +547,23 @@ impl LiveStore for Db {
         ))
     }
 
-    async fn write_live_forensic(
+    async fn write_live_major(
         &self,
         _doc: DocId,
-        _write: &LiveWrite<'_>,
-        _agreed: &str,
-    ) -> Result<ForensicWritten, LiveWriteError> {
+        _write: &MajorWrite<'_>,
+    ) -> Result<MajorWritten, LiveWriteError> {
         Err(LiveWriteError::Failed(
-            "the database alone cannot commit checkpoint bytes".to_owned(),
+            "the database alone cannot commit a major version".to_owned(),
         ))
+    }
+
+    async fn adopt_live_base(
+        &self,
+        doc: DocId,
+        checkpoint: &NewLiveCheckpoint<'_>,
+        at: OffsetDateTime,
+    ) -> Result<(), DbError> {
+        Db::adopt_live_base(self, doc, checkpoint, at).await
     }
 
     async fn describe_live_revision(
@@ -430,6 +729,56 @@ impl LiveStore for LiveDb {
         self.db.load_live(doc).await
     }
 
+    async fn live_unsaved_counts(&self, doc: DocId) -> Result<(u64, u64), DbError> {
+        self.db.live_unsaved_counts(doc).await
+    }
+
+    async fn dispute_live_checkpoint(
+        &self,
+        doc: DocId,
+        revision: &str,
+        at: OffsetDateTime,
+    ) -> Result<(), DbError> {
+        self.db.dispute_live_checkpoint(doc, revision, at).await
+    }
+
+    async fn dispute_live_sole_base(
+        &self,
+        doc: DocId,
+        revision: &str,
+        at: OffsetDateTime,
+    ) -> Result<Option<(String, Seq)>, DbError> {
+        self.db.dispute_live_sole_base(doc, revision, at).await
+    }
+
+    async fn live_dispute_marks(&self, doc: DocId) -> Result<Vec<LiveDisputeMark>, DbError> {
+        self.db.live_dispute_marks(doc).await
+    }
+
+    async fn set_live_dispute_mark(
+        &self,
+        doc: DocId,
+        mark: &LiveDisputeMark,
+    ) -> Result<(), DbError> {
+        self.db.set_live_dispute_mark(doc, mark).await
+    }
+
+    async fn accept_live_sole_editor(
+        &self,
+        doc: DocId,
+        revision: &str,
+        through: Seq,
+        at: OffsetDateTime,
+    ) -> Result<(), DbError> {
+        self.db
+            .accept_live_sole_editor(doc, revision, through, at)
+            .await
+    }
+
+    async fn confirm_live_sole_editor(&self, doc: DocId, revision: &str) -> Result<(), DbError> {
+        self.db.confirm_live_sole_editor(doc, revision).await
+    }
+
     async fn current_revision(&self, doc: DocId) -> Result<Option<String>, DbError> {
         LiveStore::current_revision(&self.db, doc).await
     }
@@ -465,7 +814,7 @@ impl LiveStore for LiveDb {
                 .unwrap_or_default(),
             None => Map::new(),
         };
-        let fields = live_fields(&base_fields, write.at);
+        let fields = checkpoint_fields(&base_fields, write);
         let blob = write.blob;
         let authors = write.authors.to_vec();
         let commit_fields = fields.clone();
@@ -513,8 +862,8 @@ impl LiveStore for LiveDb {
             sha256: blob.sha256,
             session: write.session,
             session_data: write.session_data,
-            major_reason: None,
-            major_person: None,
+            major_reason: write.major.map(|(reason, _)| reason),
+            major_person: write.major.map(|(_, person)| person),
             writer: write.writer,
             created_at: write.created_at,
         };
@@ -538,12 +887,11 @@ impl LiveStore for LiveDb {
         }
     }
 
-    async fn write_live_forensic(
+    async fn write_live_major(
         &self,
         doc: DocId,
-        write: &LiveWrite<'_>,
-        agreed: &str,
-    ) -> Result<ForensicWritten, LiveWriteError> {
+        write: &MajorWrite<'_>,
+    ) -> Result<MajorWritten, LiveWriteError> {
         let failed = |error: String| LiveWriteError::Failed(error);
         let name = self
             .db
@@ -552,104 +900,152 @@ impl LiveStore for LiveDb {
             .map_err(|error| failed(error.to_string()))?
             .ok_or_else(|| failed(format!("document {} has no record", doc.0)))?
             .name;
-        let base = write
-            .base
-            .map(RevisionId::from_str)
-            .transpose()
-            .map_err(|error| failed(error.to_string()))?;
-        let agreed_id = RevisionId::from_str(agreed).map_err(|error| failed(error.to_string()))?;
-        let wanted = agreed_id.clone();
-        let agreed_info = self
-            .blocking(move |store| {
-                store
-                    .describe(doc, &wanted)
-                    .map_err(|error| error.to_string())
-            })
-            .await
-            .map_err(failed)?
-            .ok_or_else(|| failed(format!("{agreed} is not a revision of the document")))?;
-        let agreed_blob = agreed_info
-            .blob
-            .ok_or_else(|| failed(format!("{agreed} has no content-store bytes")))?;
-        let mut fields = live_fields(&agreed_info.fields, write.at);
-        fields.insert("forensic_of".to_owned(), Value::from(agreed));
-        let blob = write.blob;
-        let authors = write.authors.to_vec();
-        let commit_base = base.clone();
-        let outcome = write_claimed(
-            &self.blobs,
-            Some(&self.db),
-            Arc::clone(&self.store),
-            doc,
-            blob,
-            Origin::EditorSave,
-            {
-                let name = name.clone();
-                move |store| {
-                    store.write(&Checkpoint {
-                        doc,
-                        file_name: &name,
-                        blob,
-                        base: commit_base.as_ref(),
-                        authors: &authors,
-                        fields: &fields,
-                    })
-                }
-            },
-        )
-        .await;
-        let forensic = match outcome {
-            Ok(Outcome::Written(revision) | Outcome::Unchanged(revision)) => revision,
-            Err(WriteError::Stale { current }) => {
-                return Err(LiveWriteError::Stale {
-                    current: current.map(|current| current.to_string()),
-                });
-            }
-            Err(WriteError::Failed(error)) => return Err(failed(error)),
+        let described = |revision: String| async move {
+            let id = RevisionId::from_str(&revision).map_err(|error| failed(error.to_string()))?;
+            let info = self
+                .blocking(move |store| store.describe(doc, &id).map_err(|error| error.to_string()))
+                .await
+                .map_err(failed)?
+                .ok_or_else(|| failed(format!("{revision} is not a revision of the document")))?;
+            let blob = info
+                .blob
+                .ok_or_else(|| failed(format!("{revision} has no content-store bytes")))?;
+            Ok::<_, LiveWriteError>((info, blob))
         };
-        self.record_index(doc, base.as_ref(), &forensic).await;
-        // The agreed checkpoint becomes current again, so the forensic bytes stay history.
-        let mut restored_fields = agreed_info.fields.clone();
-        restored_fields.insert("restores".to_owned(), Value::from(agreed));
-        let restored_authors = agreed_info.authors.clone();
-        let restore_base = forensic.clone();
-        let restored = write_claimed(
-            &self.blobs,
-            Some(&self.db),
-            Arc::clone(&self.store),
-            doc,
-            agreed_blob,
-            Origin::EditorSave,
-            move |store| {
-                store.write(&Checkpoint {
+        // Commits `blob` on top of `base`; a base that is no longer current is stale.
+        let commit = |blob: BlobRef,
+                      base: RevisionId,
+                      authors: Vec<Author>,
+                      fields: Map<String, Value>| {
+            let name = name.clone();
+            async move {
+                let outcome = write_claimed(
+                    &self.blobs,
+                    Some(&self.db),
+                    Arc::clone(&self.store),
                     doc,
-                    file_name: &name,
-                    blob: agreed_blob,
-                    base: Some(&restore_base),
-                    authors: &restored_authors,
-                    fields: &restored_fields,
-                })
-            },
-        )
-        .await;
-        let current = match restored {
-            Ok(Outcome::Written(revision) | Outcome::Unchanged(revision)) => {
-                self.record_index(doc, Some(&forensic), &revision).await;
-                revision.to_string()
-            }
-            Err(error) => {
-                eprintln!(
-                    "sharecraft-server: the agreed checkpoint {agreed} of document {} could not \
-                     be restored after forensic revision {forensic}: {error:?}",
-                    doc.0
-                );
-                forensic.to_string()
+                    blob,
+                    Origin::EditorSave,
+                    move |store| {
+                        store.write(&Checkpoint {
+                            doc,
+                            file_name: &name,
+                            blob,
+                            base: Some(&base),
+                            authors: &authors,
+                            fields: &fields,
+                        })
+                    },
+                )
+                .await;
+                match outcome {
+                    Ok(Outcome::Written(revision) | Outcome::Unchanged(revision)) => Ok(revision),
+                    Err(WriteError::Stale { current }) => Err(LiveWriteError::Stale {
+                        current: current.map(|current| current.to_string()),
+                    }),
+                    Err(WriteError::Failed(error)) => Err(LiveWriteError::Failed(error)),
+                }
             }
         };
-        Ok(ForensicWritten {
-            forensic: forensic.to_string(),
+        let current_id =
+            RevisionId::from_str(write.current).map_err(|error| failed(error.to_string()))?;
+        let target = write.restore.unwrap_or(write.current);
+        let (target_info, target_blob) = described(target.to_owned()).await?;
+        let mut parent = current_id;
+        let mut wrote = false;
+        // After the first commit, a failure leaves the room's own revision on top.
+        let partial = |head: &RevisionId, error: LiveWriteError| LiveWriteError::Partial {
+            head: head.to_string(),
+            error: format!("{error:?}"),
+        };
+        let kept = match (write.kind, write.blob) {
+            (MajorKind::Outside | MajorKind::Archive | MajorKind::Dispute, Some(blob)) => {
+                let fields = kept_fields(write.kind, target, &target_info.fields, write, &blob);
+                let kept = commit(blob, parent.clone(), write.authors.to_vec(), fields).await?;
+                self.record_index(doc, Some(&parent), &kept).await;
+                parent = kept.clone();
+                wrote = true;
+                Some(kept)
+            }
+            (MajorKind::Mark | MajorKind::Dispute, None) => None,
+            _ => {
+                return Err(failed(
+                    "a major write's bytes do not match its kind".to_owned(),
+                ));
+            }
+        };
+        let mut copy = None;
+        if let Some(disputed) = write.disputed {
+            let (info, blob) = match described(disputed.to_owned()).await {
+                Ok(found) => found,
+                Err(error) if wrote => return Err(partial(&parent, error)),
+                Err(error) => return Err(error),
+            };
+            let fields = restored_fields(
+                disputed,
+                &info,
+                kept_reason(MajorKind::Dispute),
+                write.person,
+            );
+            let written = match commit(blob, parent.clone(), info.authors.clone(), fields).await {
+                Ok(written) => written,
+                Err(error) if wrote => return Err(partial(&parent, error)),
+                Err(error) => return Err(error),
+            };
+            self.record_index(doc, Some(&parent), &written).await;
+            parent = written.clone();
+            wrote = true;
+            copy = Some(written);
+        }
+        let ends_on_copy = write.kind == MajorKind::Dispute && write.restore.is_none();
+        let current = if ends_on_copy {
+            parent.to_string()
+        } else {
+            let fields = restored_fields(target, &target_info, write.reason, write.person);
+            match commit(
+                target_blob,
+                parent.clone(),
+                target_info.authors.clone(),
+                fields,
+            )
+            .await
+            {
+                Ok(revision) => {
+                    self.record_index(doc, Some(&parent), &revision).await;
+                    revision.to_string()
+                }
+                Err(error) if wrote => return Err(partial(&parent, error)),
+                // Nothing was written: the current file moved on, or the write failed.
+                Err(error) => return Err(error),
+            }
+        };
+        if write.kind == MajorKind::Outside {
+            self.db
+                .adopt_live_base(
+                    doc,
+                    &adopted_base(&current, target_blob.sha256, write),
+                    write.created_at,
+                )
+                .await
+                .map_err(|error| LiveWriteError::Partial {
+                    head: current.clone(),
+                    error: error.to_string(),
+                })?;
+        }
+        Ok(MajorWritten {
+            kept: kept.map(|kept| kept.to_string()),
+            copy: copy.map(|copy| copy.to_string()),
             current,
         })
+    }
+
+    async fn adopt_live_base(
+        &self,
+        doc: DocId,
+        checkpoint: &NewLiveCheckpoint<'_>,
+        at: OffsetDateTime,
+    ) -> Result<(), DbError> {
+        self.db.adopt_live_base(doc, checkpoint, at).await
     }
 
     async fn describe_live_revision(
@@ -818,6 +1214,8 @@ mod memory {
         describe_calls: usize,
         /// The next checkpoint write panics.
         panic_next_write: bool,
+        /// The next major write stops after keeping its bytes, before the final restore.
+        fail_major_restore: bool,
         last_authors: Vec<Author>,
         /// While set, each checkpoint write waits for one permit before it commits.
         write_gate: Option<Arc<tokio::sync::Semaphore>>,
@@ -827,6 +1225,8 @@ mod memory {
     struct MemoryCheckpoint {
         row: LiveCheckpointRow,
         created_at: OffsetDateTime,
+        /// Set aside after a verifier disagreed.
+        disputed: bool,
     }
 
     struct MemoryDoc {
@@ -850,6 +1250,7 @@ mod memory {
         revisions: Vec<(String, [u8; 32])>,
         /// The fields of each checkpoint revision written.
         revision_fields: HashMap<String, Map<String, Value>>,
+        dispute_marks: Vec<LiveDisputeMark>,
     }
 
     impl Default for MemoryDoc {
@@ -873,6 +1274,7 @@ mod memory {
                 revisions_written: 0,
                 revisions: Vec::new(),
                 revision_fields: HashMap::new(),
+                dispute_marks: Vec::new(),
             }
         }
     }
@@ -909,6 +1311,37 @@ mod memory {
                 .unwrap_or_default()
         }
 
+        /// Commits a checkpoint revision at `through` as the room writes one, without its
+        /// record: Git holds it and the database does not.
+        pub(crate) fn commit_unrecorded(
+            &self,
+            doc: DocId,
+            through: Seq,
+            sha256: [u8; 32],
+        ) -> String {
+            let mut state = self
+                .inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let memory = state.docs.entry(doc).or_default();
+            memory.revisions_written = memory.revisions_written.saturating_add(1);
+            let revision = format!("{:040x}", memory.revisions_written);
+            memory.revisions.push((revision.clone(), sha256));
+            memory.revision_fields.insert(
+                revision.clone(),
+                marked(live_fields(&Map::new(), through), &sha256),
+            );
+            memory.current_revision = Some(revision.clone());
+            revision
+        }
+
+        /// Makes the next major write stop part way, as a failed restore commit would.
+        pub(crate) fn fail_major_restore(&self) {
+            if let Ok(mut state) = self.inner.lock() {
+                state.fail_major_restore = true;
+            }
+        }
+
         /// Makes the next checkpoint write panic.
         pub(crate) fn panic_next_write(&self) {
             if let Ok(mut state) = self.inner.lock() {
@@ -916,11 +1349,70 @@ mod memory {
             }
         }
 
-        /// Makes `revision` the document's current revision, as an outside save would.
-        pub(crate) fn set_current_revision(&self, doc: DocId, revision: String) {
-            if let Ok(mut state) = self.inner.lock() {
-                state.docs.entry(doc).or_default().current_revision = Some(revision);
+        /// Writes a revision of `sha256` as the current file, as an outside save would.
+        pub(crate) fn write_outside(&self, doc: DocId, sha256: [u8; 32]) -> String {
+            let mut state = self
+                .inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let memory = state.docs.entry(doc).or_default();
+            memory.revisions_written = memory.revisions_written.saturating_add(1);
+            let revision = format!("{:040x}", memory.revisions_written);
+            memory.revisions.push((revision.clone(), sha256));
+            memory.current_revision = Some(revision.clone());
+            revision
+        }
+
+        /// The fields `revision` of `doc` was written with.
+        pub(crate) fn revision_fields(&self, doc: DocId, revision: &str) -> Map<String, Value> {
+            self.inner
+                .lock()
+                .ok()
+                .and_then(|state| {
+                    state
+                        .docs
+                        .get(&doc)
+                        .and_then(|memory| memory.revision_fields.get(revision).cloned())
+                })
+                .unwrap_or_default()
+        }
+
+        /// Forgets the places of ended sessions, as the 30-day sweep does; their tombstones
+        /// stay.
+        pub(crate) fn forget_ended_places(&self, doc: DocId) {
+            if let Ok(mut state) = self.inner.lock()
+                && let Some(memory) = state.docs.get_mut(&doc)
+            {
+                let open = memory
+                    .open_session
+                    .as_ref()
+                    .map(|session| {
+                        session
+                            .participants
+                            .iter()
+                            .map(|place| place.number)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                memory
+                    .participants
+                    .retain(|place| open.contains(&place.number));
             }
+        }
+
+        /// How many local numbers were finally refused, over every document.
+        pub(crate) fn refused_locals(&self) -> usize {
+            self.inner
+                .lock()
+                .map(|state| {
+                    state
+                        .docs
+                        .values()
+                        .flat_map(|memory| memory.locals.values())
+                        .filter(|local| matches!(local, LiveLocal::Refused { .. }))
+                        .count()
+                })
+                .unwrap_or_default()
         }
 
         /// The authors credited by the last checkpoint written.
@@ -963,6 +1455,23 @@ mod memory {
             }
         }
 
+        /// The identity bytes held by `doc`'s checkpoints.
+        pub(crate) fn session_data_bytes(&self, doc: DocId) -> usize {
+            self.inner
+                .lock()
+                .ok()
+                .and_then(|state| {
+                    state.docs.get(&doc).map(|memory| {
+                        memory
+                            .checkpoints
+                            .iter()
+                            .map(|checkpoint| checkpoint.row.session_data.len())
+                            .sum()
+                    })
+                })
+                .unwrap_or_default()
+        }
+
         pub(crate) fn entry_count(&self) -> usize {
             self.inner
                 .lock()
@@ -994,6 +1503,69 @@ mod memory {
             }
             Ok(())
         }
+    }
+
+    /// The unsaved-log bytes of the entries after `through`: payloads, and each cancel record
+    /// at its encoded size.
+    fn unsaved_bytes_after(entries: &[LiveEntryRow], through: Seq) -> u64 {
+        entries
+            .iter()
+            .map(|entry| match entry {
+                LiveEntryRow::Change { seq, payload, .. } if *seq > through => {
+                    u64::try_from(payload.len()).unwrap_or(u64::MAX)
+                }
+                LiveEntryRow::Cancel { seq, .. } if *seq > through => records::LIVE_CANCEL_BYTES,
+                _ => 0,
+            })
+            .fold(0, u64::saturating_add)
+    }
+
+    /// The in-memory form of `Db::adopt_live_base`.
+    fn adopt_in(memory: &mut MemoryDoc, checkpoint: &NewLiveCheckpoint<'_>) -> Result<(), DbError> {
+        if checkpoint.through > memory.head {
+            return Err(DbError::new("base position exceeds the live head"));
+        }
+        memory.checkpoints.retain(|kept| {
+            kept.disputed
+                || kept.row.major_reason.is_some()
+                || !(kept.row.revision == checkpoint.revision
+                    || kept.row.through >= checkpoint.through
+                    || !kept.row.verified)
+        });
+        memory.checkpoints.push(MemoryCheckpoint {
+            disputed: false,
+            row: LiveCheckpointRow {
+                revision: checkpoint.revision.to_owned(),
+                through: checkpoint.through,
+                sha256: checkpoint.sha256,
+                verified: true,
+                session: checkpoint.session,
+                session_data: checkpoint.session_data.to_vec(),
+                major_reason: checkpoint.major_reason.map(str::to_owned),
+                major_person: checkpoint.major_person,
+                writer: checkpoint.writer,
+                sole_editor: false,
+            },
+            created_at: checkpoint.created_at,
+        });
+        if checkpoint.through > memory.verified_through {
+            memory.verified_through = checkpoint.through;
+            let through = checkpoint.through;
+            let after = |entry: &LiveEntryRow| match entry {
+                LiveEntryRow::Change { seq, .. } | LiveEntryRow::Cancel { seq, .. } => {
+                    *seq > through
+                }
+            };
+            memory.unsaved_entries = memory
+                .entries
+                .iter()
+                .filter(|entry| after(entry))
+                .count()
+                .try_into()
+                .unwrap_or(u64::MAX);
+            memory.unsaved_bytes = unsaved_bytes_after(&memory.entries, through);
+        }
+        Ok(())
     }
 
     impl LiveStore for MemStore {
@@ -1034,7 +1606,7 @@ mod memory {
                 memory.revisions.push((revision.clone(), write.blob.sha256));
                 memory
                     .revision_fields
-                    .insert(revision.clone(), live_fields(&Map::new(), write.at));
+                    .insert(revision.clone(), checkpoint_fields(&Map::new(), write));
                 revision
             };
             self.record_live_checkpoint(
@@ -1045,8 +1617,8 @@ mod memory {
                     sha256: write.blob.sha256,
                     session: write.session,
                     session_data: write.session_data,
-                    major_reason: None,
-                    major_person: None,
+                    major_reason: write.major.map(|(reason, _)| reason),
+                    major_person: write.major.map(|(_, person)| person),
                     writer: write.writer,
                     created_at: write.created_at,
                 },
@@ -1054,46 +1626,11 @@ mod memory {
             .await
             .map_err(|error| LiveWriteError::Unrecorded {
                 revision: revision.clone(),
-                fields: live_fields(&Map::new(), write.at),
+                fields: checkpoint_fields(&Map::new(), write),
                 described: None,
                 error: error.to_string(),
             })?;
             Ok(revision)
-        }
-
-        async fn write_live_forensic(
-            &self,
-            doc: DocId,
-            write: &LiveWrite<'_>,
-            agreed: &str,
-        ) -> Result<ForensicWritten, LiveWriteError> {
-            self.wait_for_gate().await;
-            let mut state = self
-                .write()
-                .map_err(|error| LiveWriteError::Failed(error.to_string()))?;
-            let memory = state.docs.entry(doc).or_default();
-            if write.base.map(str::to_owned) != memory.current_revision {
-                return Err(LiveWriteError::Stale {
-                    current: memory.current_revision.clone(),
-                });
-            }
-            let agreed_sha = memory
-                .revisions
-                .iter()
-                .find(|(revision, _)| revision == agreed)
-                .map(|(_, sha)| *sha)
-                .ok_or_else(|| LiveWriteError::Failed(format!("{agreed} is not a revision")))?;
-            let mut written = Vec::new();
-            for sha in [write.blob.sha256, agreed_sha] {
-                memory.revisions_written = memory.revisions_written.saturating_add(1);
-                let revision = format!("{:040x}", memory.revisions_written);
-                memory.revisions.push((revision.clone(), sha));
-                written.push(revision);
-            }
-            let current = written.pop().unwrap_or_default();
-            let forensic = written.pop().unwrap_or_default();
-            memory.current_revision = Some(current.clone());
-            Ok(ForensicWritten { forensic, current })
         }
 
         async fn load_live(&self, doc: DocId) -> Result<LiveLoaded, DbError> {
@@ -1110,6 +1647,7 @@ mod memory {
                 .iter()
                 .filter(|checkpoint| {
                     !checkpoint.row.verified
+                        && !checkpoint.disputed
                         && (checkpoint.row.through > memory.verified_through
                             || (memory.verified_through == Seq(0)
                                 && checkpoint.row.through == Seq(0)))
@@ -1195,9 +1733,14 @@ mod memory {
                 major_reason: checkpoint.major_reason.map(str::to_owned),
                 major_person: checkpoint.major_person,
                 writer: checkpoint.writer,
+                sole_editor: false,
             };
             if let Some(existing) = memory.checkpoints.iter().find(|existing| {
-                existing.row.revision == row.revision || existing.row.through == row.through
+                existing.row.revision == row.revision
+                    || (existing.row.through == row.through
+                        && !existing.disputed
+                        && existing.row.major_reason.is_none()
+                        && row.major_reason.is_none())
             }) {
                 let mut stored = existing.row.clone();
                 stored.verified = false;
@@ -1206,10 +1749,158 @@ mod memory {
                 }
             } else {
                 memory.checkpoints.push(MemoryCheckpoint {
+                    disputed: false,
                     row,
                     created_at: checkpoint.created_at,
                 });
+                let verified_through = memory.verified_through;
+                let counted = |row: &LiveCheckpointRow| {
+                    !row.verified
+                        && row.major_reason.is_none()
+                        && (row.through > verified_through
+                            || (verified_through == Seq(0) && row.through == Seq(0)))
+                };
+                let mut newest = memory
+                    .checkpoints
+                    .iter()
+                    .filter(|checkpoint| !checkpoint.disputed && counted(&checkpoint.row))
+                    .map(|checkpoint| checkpoint.row.through)
+                    .collect::<Vec<_>>();
+                newest.sort_unstable_by(|a, b| b.cmp(a));
+                let dropped = newest
+                    .into_iter()
+                    .skip(records::MAX_UNVERIFIED_CHECKPOINTS)
+                    .collect::<HashSet<_>>();
+                memory.checkpoints.retain(|checkpoint| {
+                    checkpoint.disputed
+                        || !(counted(&checkpoint.row) && dropped.contains(&checkpoint.row.through))
+                });
             }
+            Self::finish_write(state)
+        }
+
+        async fn write_live_major(
+            &self,
+            doc: DocId,
+            write: &MajorWrite<'_>,
+        ) -> Result<MajorWritten, LiveWriteError> {
+            self.wait_for_gate().await;
+            let fail_restore = self
+                .inner
+                .lock()
+                .map(|mut state| std::mem::take(&mut state.fail_major_restore))
+                .unwrap_or_default();
+            let mut state = self
+                .write()
+                .map_err(|error| LiveWriteError::Failed(error.to_string()))?;
+            let memory = state.docs.entry(doc).or_default();
+            if memory.current_revision.as_deref() != Some(write.current) {
+                return Err(LiveWriteError::Stale {
+                    current: memory.current_revision.clone(),
+                });
+            }
+            let info = |memory: &MemoryDoc, revision: &str| {
+                let sha = memory
+                    .revisions
+                    .iter()
+                    .find(|(id, _)| id == revision)
+                    .map(|(_, sha)| *sha)
+                    .ok_or_else(|| {
+                        LiveWriteError::Failed(format!("{revision} is not a revision"))
+                    })?;
+                Ok::<_, LiveWriteError>(RevisionInfo {
+                    revision: RevisionId::from_str(revision)
+                        .map_err(|error| LiveWriteError::Failed(error.to_string()))?,
+                    doc,
+                    committed_at: 0,
+                    authors: Vec::new(),
+                    file_name: "book.gridcraft".to_owned(),
+                    fields: memory
+                        .revision_fields
+                        .get(revision)
+                        .cloned()
+                        .unwrap_or_default(),
+                    blob: Some(BlobRef {
+                        sha256: sha,
+                        size: 3,
+                    }),
+                    size: 3,
+                })
+            };
+            let push = |memory: &mut MemoryDoc, sha: [u8; 32], fields: Map<String, Value>| {
+                memory.revisions_written = memory.revisions_written.saturating_add(1);
+                let revision = format!("{:040x}", memory.revisions_written);
+                memory.revisions.push((revision.clone(), sha));
+                memory.revision_fields.insert(revision.clone(), fields);
+                memory.current_revision = Some(revision.clone());
+                revision
+            };
+            let target = write.restore.unwrap_or(write.current);
+            let target_info = info(memory, target)?;
+            let target_sha = target_info.blob.map_or([0; 32], |blob| blob.sha256);
+            let kept = match (write.kind, write.blob) {
+                (MajorKind::Outside | MajorKind::Archive | MajorKind::Dispute, Some(blob)) => {
+                    let fields = kept_fields(write.kind, target, &target_info.fields, write, &blob);
+                    Some(push(memory, blob.sha256, fields))
+                }
+                (MajorKind::Mark | MajorKind::Dispute, None) => None,
+                _ => {
+                    return Err(LiveWriteError::Failed(
+                        "a major write's bytes do not match its kind".to_owned(),
+                    ));
+                }
+            };
+            let copy = match write.disputed {
+                Some(disputed) => {
+                    let disputed_info = info(memory, disputed)?;
+                    let sha = disputed_info.blob.map_or([0; 32], |blob| blob.sha256);
+                    let fields = restored_fields(
+                        disputed,
+                        &disputed_info,
+                        kept_reason(MajorKind::Dispute),
+                        write.person,
+                    );
+                    Some(push(memory, sha, fields))
+                }
+                None => None,
+            };
+            // The head left is the last revision written, as in Git.
+            if fail_restore && let Some(head) = copy.clone().or_else(|| kept.clone()) {
+                return Err(LiveWriteError::Partial {
+                    head,
+                    error: "injected restore failure".to_owned(),
+                });
+            }
+            let current = if write.kind == MajorKind::Dispute && write.restore.is_none() {
+                copy.clone().unwrap_or_else(|| write.current.to_owned())
+            } else {
+                push(
+                    memory,
+                    target_sha,
+                    restored_fields(target, &target_info, write.reason, write.person),
+                )
+            };
+            if write.kind == MajorKind::Outside {
+                adopt_in(memory, &adopted_base(&current, target_sha, write))
+                    .map_err(|error| LiveWriteError::Failed(error.to_string()))?;
+            }
+            state.last_authors = write.authors.to_vec();
+            Ok(MajorWritten {
+                kept,
+                copy,
+                current,
+            })
+        }
+
+        async fn adopt_live_base(
+            &self,
+            doc: DocId,
+            checkpoint: &NewLiveCheckpoint<'_>,
+            _at: OffsetDateTime,
+        ) -> Result<(), DbError> {
+            let mut state = self.write()?;
+            let memory = state.docs.entry(doc).or_default();
+            adopt_in(memory, checkpoint)?;
             Self::finish_write(state)
         }
 
@@ -1261,6 +1952,129 @@ mod memory {
             self.record_live_checkpoint(doc, checkpoint).await
         }
 
+        async fn live_unsaved_counts(&self, doc: DocId) -> Result<(u64, u64), DbError> {
+            let state = self.state()?;
+            Ok(state.docs.get(&doc).map_or((0, 0), |memory| {
+                (memory.unsaved_entries, memory.unsaved_bytes)
+            }))
+        }
+
+        async fn dispute_live_checkpoint(
+            &self,
+            doc: DocId,
+            revision: &str,
+            _at: OffsetDateTime,
+        ) -> Result<(), DbError> {
+            let mut state = self.write()?;
+            let memory = state.docs.entry(doc).or_default();
+            for checkpoint in &mut memory.checkpoints {
+                if checkpoint.row.revision == revision && !checkpoint.row.verified {
+                    checkpoint.disputed = true;
+                    checkpoint.row.session_data.clear();
+                }
+            }
+            Self::finish_write(state)
+        }
+
+        async fn dispute_live_sole_base(
+            &self,
+            doc: DocId,
+            revision: &str,
+            _at: OffsetDateTime,
+        ) -> Result<Option<(String, Seq)>, DbError> {
+            let mut state = self.write()?;
+            let memory = state.docs.entry(doc).or_default();
+            for checkpoint in &mut memory.checkpoints {
+                if checkpoint.row.revision == revision {
+                    checkpoint.disputed = true;
+                    checkpoint.row.verified = false;
+                    checkpoint.row.sole_editor = false;
+                    checkpoint.row.session_data.clear();
+                }
+            }
+            let fallback = memory
+                .checkpoints
+                .iter()
+                .filter(|checkpoint| {
+                    checkpoint.row.verified && !checkpoint.disputed && !checkpoint.row.sole_editor
+                })
+                .max_by_key(|checkpoint| checkpoint.row.through)
+                .map(|checkpoint| (checkpoint.row.revision.clone(), checkpoint.row.through));
+            let back_to = fallback.as_ref().map_or(Seq(0), |(_, through)| *through);
+            memory.verified_through = back_to;
+            memory.unsaved_entries = memory
+                .entries
+                .iter()
+                .filter(|entry| match entry {
+                    LiveEntryRow::Change { seq, .. } | LiveEntryRow::Cancel { seq, .. } => {
+                        *seq > back_to
+                    }
+                })
+                .count()
+                .try_into()
+                .unwrap_or(u64::MAX);
+            memory.unsaved_bytes = unsaved_bytes_after(&memory.entries, back_to);
+            Self::finish_write(state)?;
+            Ok(fallback)
+        }
+
+        async fn live_dispute_marks(&self, doc: DocId) -> Result<Vec<LiveDisputeMark>, DbError> {
+            let state = self.state()?;
+            Ok(state
+                .docs
+                .get(&doc)
+                .map(|memory| memory.dispute_marks.clone())
+                .unwrap_or_default())
+        }
+
+        async fn set_live_dispute_mark(
+            &self,
+            doc: DocId,
+            mark: &LiveDisputeMark,
+        ) -> Result<(), DbError> {
+            let mut state = self.write()?;
+            let memory = state.docs.entry(doc).or_default();
+            memory.dispute_marks.retain(|kept| kept.user != mark.user);
+            memory.dispute_marks.push(mark.clone());
+            Self::finish_write(state)
+        }
+
+        async fn accept_live_sole_editor(
+            &self,
+            doc: DocId,
+            revision: &str,
+            through: Seq,
+            at: OffsetDateTime,
+        ) -> Result<(), DbError> {
+            self.verify_live_checkpoint(doc, revision, through, at)
+                .await?;
+            let mut state = self.state()?;
+            if let Some(memory) = state.docs.get_mut(&doc) {
+                for checkpoint in &mut memory.checkpoints {
+                    if checkpoint.row.revision == revision {
+                        checkpoint.row.sole_editor = true;
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        async fn confirm_live_sole_editor(
+            &self,
+            doc: DocId,
+            revision: &str,
+        ) -> Result<(), DbError> {
+            let mut state = self.write()?;
+            if let Some(memory) = state.docs.get_mut(&doc) {
+                for checkpoint in &mut memory.checkpoints {
+                    if checkpoint.row.revision == revision {
+                        checkpoint.row.sole_editor = false;
+                    }
+                }
+            }
+            Self::finish_write(state)
+        }
+
         async fn verify_live_checkpoint(
             &self,
             doc: DocId,
@@ -1277,10 +2091,36 @@ mod memory {
                 .checkpoints
                 .iter_mut()
                 .find(|checkpoint| {
-                    checkpoint.row.revision == revision && checkpoint.row.through == through
+                    !checkpoint.disputed
+                        && checkpoint.row.revision == revision
+                        && checkpoint.row.through == through
                 })
                 .ok_or_else(|| DbError::new("no checkpoint at the exact revision and position"))?;
             checkpoint.row.verified = true;
+            checkpoint.row.sole_editor = false;
+            let verified_session = checkpoint.row.session;
+            let rows = memory
+                .checkpoints
+                .iter()
+                .map(|checkpoint| (checkpoint.row.session, checkpoint.row.through))
+                .collect::<Vec<_>>();
+            for checkpoint in &mut memory.checkpoints {
+                let row = &mut checkpoint.row;
+                let superseded_in_session = rows
+                    .iter()
+                    .any(|(session, at)| *session == row.session && *at > row.through);
+                if !row.verified
+                    && row.through < through
+                    && (row.session == verified_session || superseded_in_session)
+                {
+                    row.session_data.clear();
+                }
+            }
+            memory.checkpoints.retain(|checkpoint| {
+                checkpoint.row.verified
+                    || checkpoint.row.through >= through
+                    || !checkpoint.row.session_data.is_empty()
+            });
             if through > memory.verified_through {
                 memory.verified_through = through;
                 memory.unsaved_entries = memory
@@ -1294,18 +2134,7 @@ mod memory {
                     .count()
                     .try_into()
                     .unwrap_or(u64::MAX);
-                memory.unsaved_bytes = memory
-                    .entries
-                    .iter()
-                    .filter_map(|entry| match entry {
-                        LiveEntryRow::Change { seq, payload, .. } if *seq > through => {
-                            Some(payload.len())
-                        }
-                        _ => None,
-                    })
-                    .sum::<usize>()
-                    .try_into()
-                    .unwrap_or(u64::MAX);
+                memory.unsaved_bytes = unsaved_bytes_after(&memory.entries, through);
             }
             Self::finish_write(state)
         }
@@ -1508,6 +2337,9 @@ mod memory {
                 reports: cancel.reports,
             });
             memory.unsaved_entries = memory.unsaved_entries.saturating_add(1);
+            memory.unsaved_bytes = memory
+                .unsaved_bytes
+                .saturating_add(records::LIVE_CANCEL_BYTES);
             memory.head = cancel.seq;
             Ok(())
         }
@@ -1903,167 +2735,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn database_forensic_write_keeps_both_commits_and_restores_the_agreed_file() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        use records::test_support::TestDb;
-        use records::{Editor, NewUser};
-        use revisions::{Author, RevisionStore};
-
-        use super::{LiveDb, LiveWrite};
-        use crate::checkpoint::Checkpointer;
-
-        let test = TestDb::create().await;
-        let db = test.db.clone();
-        let ann = db
-            .create_user(
-                None,
-                NewUser {
-                    email: "ann@test.invalid",
-                    name: "Ann",
-                    password: "a long enough password",
-                    is_admin: false,
-                },
-            )
-            .await
-            .unwrap()
-            .id;
-        let doc = DocId(Uuid::new_v4());
-        db.create_document(ann, doc, "book.xlsx", Editor::GridCraft)
-            .await
-            .unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let library = Arc::new(FailsAfter {
-            inner: RevisionStore::open(&crate::library_path(dir.path())).unwrap(),
-            // The agreed checkpoint, then a forensic revision and its restore.
-            writes_left: AtomicUsize::new(3),
-        });
-        let blobs = crate::blobs::test_blobs(dir.path());
-        let live = LiveDb {
-            db: db.clone(),
-            store: library.clone(),
-            blobs: blobs.clone(),
-        };
-        let session = Uuid::new_v4();
-        db.start_live_session(doc, session, "gridcraft/1", OffsetDateTime::UNIX_EPOCH)
-            .await
-            .unwrap();
-        let authors = [Author {
-            id: ann.0.to_string(),
-            name: "Ann".to_owned(),
-        }];
-        let blob = |bytes: &'static [u8]| blobs.store().write_from(bytes, u64::MAX).unwrap();
-        let agreed_blob = blob(b"agreed workbook");
-        let agreed = live
-            .write_live_checkpoint(
-                doc,
-                &LiveWrite {
-                    base: None,
-                    blob: agreed_blob,
-                    authors: &authors,
-                    at: Seq(0),
-                    session,
-                    session_data: b"identities",
-                    created_at: OffsetDateTime::UNIX_EPOCH,
-                    writer: None,
-                },
-            )
-            .await
-            .unwrap();
-
-        let forensic_blob = blob(b"disagreeing workbook");
-        let written = live
-            .write_live_forensic(
-                doc,
-                &LiveWrite {
-                    base: Some(&agreed),
-                    blob: forensic_blob,
-                    authors: &authors,
-                    at: Seq(0),
-                    session,
-                    session_data: b"",
-                    created_at: OffsetDateTime::UNIX_EPOCH,
-                    writer: None,
-                },
-                &agreed,
-            )
-            .await
-            .unwrap();
-        assert_ne!(written.forensic, written.current);
-        let describe = |revision: &str| {
-            library
-                .describe(doc, &revision.parse().unwrap())
-                .unwrap()
-                .unwrap()
-        };
-        let forensic = describe(&written.forensic);
-        assert_eq!(forensic.blob.unwrap().sha256, forensic_blob.sha256);
-        assert_eq!(forensic.fields.get("forensic_of"), Some(&json!(agreed)));
-        let restored = describe(&written.current);
-        assert_eq!(restored.blob.unwrap().sha256, agreed_blob.sha256);
-        assert_eq!(restored.fields.get("restores"), Some(&json!(agreed)));
-        assert_eq!(
-            library.load(doc).unwrap().unwrap().revision.to_string(),
-            written.current,
-            "the agreed bytes are the current file again"
-        );
-        let index = db.revisions(doc).await.unwrap();
-        assert_eq!(
-            index
-                .iter()
-                .map(|row| (row.revision.clone(), row.parent.clone()))
-                .collect::<Vec<_>>(),
-            [
-                (agreed.clone(), None),
-                (written.forensic.clone(), Some(agreed.clone())),
-                (written.current.clone(), Some(written.forensic.clone())),
-            ]
-        );
-        let loaded = LiveStore::load_live(&db, doc).await.unwrap();
-        assert_eq!(
-            loaded
-                .unverified_checkpoints
-                .iter()
-                .map(|checkpoint| checkpoint.revision.clone())
-                .collect::<Vec<_>>(),
-            std::slice::from_ref(&agreed),
-            "forensic bytes never become a checkpoint"
-        );
-
-        // A second forensic upload whose restore cannot be written: the forensic revision
-        // stays current and recorded.
-        library.writes_left.store(1, Ordering::SeqCst);
-        let base = written.current.clone();
-        let again = live
-            .write_live_forensic(
-                doc,
-                &LiveWrite {
-                    base: Some(&base),
-                    blob: blob(b"another disagreeing workbook"),
-                    authors: &authors,
-                    at: Seq(0),
-                    session,
-                    session_data: b"",
-                    created_at: OffsetDateTime::UNIX_EPOCH,
-                    writer: None,
-                },
-                &agreed,
-            )
-            .await
-            .unwrap();
-        assert_eq!(again.current, again.forensic);
-        assert_eq!(
-            library.load(doc).unwrap().unwrap().revision.to_string(),
-            again.forensic
-        );
-        let index = db.revisions(doc).await.unwrap();
-        assert_eq!(index.len(), 4);
-        assert_eq!(index[3].revision, again.forensic);
-        assert_eq!(index[3].parent.as_deref(), Some(base.as_str()));
-    }
-
-    #[tokio::test]
     async fn end_session_makes_return_tombstone_lookup_available() {
         let (store, doc, session) = started_store().await;
         let client = ClientId(id(300));
@@ -2143,6 +2814,178 @@ mod tests {
 
         let loaded = store.load_live(doc).await.unwrap();
         assert_eq!(loaded.unsaved_entries, 2);
-        assert_eq!(loaded.unsaved_bytes, 3);
+        assert_eq!(loaded.unsaved_bytes, 3 + records::LIVE_CANCEL_BYTES);
+    }
+
+    #[tokio::test]
+    async fn database_outside_recovery_keeps_live_state_below_the_outside_file() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+
+        use records::test_support::TestDb;
+        use records::{Editor, NewUser};
+        use revisions::{Author, RevisionStore};
+
+        use super::{LiveDb, LiveWrite, MajorKind, MajorWrite};
+        use crate::checkpoint::Checkpointer;
+
+        let test = TestDb::create().await;
+        let db = test.db.clone();
+        let ann = db
+            .create_user(
+                None,
+                NewUser {
+                    email: "ann@test.invalid",
+                    name: "Ann",
+                    password: "a long enough password",
+                    is_admin: false,
+                },
+            )
+            .await
+            .unwrap()
+            .id;
+        let doc = DocId(Uuid::new_v4());
+        db.create_document(ann, doc, "book.xlsx", Editor::GridCraft)
+            .await
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let library = Arc::new(FailsAfter {
+            inner: RevisionStore::open(&crate::library_path(dir.path())).unwrap(),
+            writes_left: AtomicUsize::new(100),
+        });
+        let blobs = crate::blobs::test_blobs(dir.path());
+        let live = LiveDb {
+            db: db.clone(),
+            store: library.clone(),
+            blobs: blobs.clone(),
+        };
+        let session = Uuid::new_v4();
+        db.start_live_session(doc, session, "gridcraft/1", OffsetDateTime::UNIX_EPOCH)
+            .await
+            .unwrap();
+        let authors = [Author {
+            id: ann.0.to_string(),
+            name: "Ann".to_owned(),
+        }];
+        let blob = |bytes: &'static [u8]| blobs.store().write_from(bytes, u64::MAX).unwrap();
+        let live_blob = blob(b"live workbook");
+        let checkpoint = live
+            .write_live_checkpoint(
+                doc,
+                &LiveWrite {
+                    base: None,
+                    blob: live_blob,
+                    authors: &authors,
+                    at: Seq(0),
+                    session,
+                    session_data: b"identities",
+                    created_at: OffsetDateTime::UNIX_EPOCH,
+                    writer: None,
+                    major: None,
+                },
+            )
+            .await
+            .unwrap();
+        // Someone saves another file over it.
+        let outside_blob = blob(b"outside workbook");
+        let outside = live
+            .write_live_checkpoint(
+                doc,
+                &LiveWrite {
+                    base: Some(&checkpoint),
+                    blob: outside_blob,
+                    authors: &authors,
+                    at: Seq(0),
+                    session,
+                    session_data: b"",
+                    created_at: OffsetDateTime::UNIX_EPOCH,
+                    writer: None,
+                    major: None,
+                },
+            )
+            .await;
+        // A second checkpoint at the same position is refused as metadata, but Git has it:
+        // whatever the record says, the current file is the outside one.
+        let outside = match outside {
+            Ok(revision) => revision,
+            Err(super::LiveWriteError::Unrecorded { revision, .. }) => revision,
+            Err(other) => panic!("{other:?}"),
+        };
+
+        let last_state = blob(b"room's last state");
+        let written = live
+            .write_live_major(
+                doc,
+                &MajorWrite {
+                    kind: MajorKind::Outside,
+                    reason: "outside_current",
+                    person: ann,
+                    current: &outside,
+                    restore: None,
+                    disputed: None,
+                    blob: Some(last_state),
+                    authors: &authors,
+                    at: Seq(0),
+                    session,
+                    created_at: OffsetDateTime::UNIX_EPOCH,
+                },
+            )
+            .await
+            .unwrap();
+        let describe = |revision: &str| {
+            library
+                .describe(doc, &revision.parse().unwrap())
+                .unwrap()
+                .unwrap()
+        };
+        let kept = describe(written.kept.as_deref().unwrap());
+        assert_eq!(kept.blob.unwrap().sha256, last_state.sha256);
+        assert_eq!(kept.fields.get("major"), Some(&json!(true)));
+        assert_eq!(
+            kept.fields.get("major_reason"),
+            Some(&json!("outside_replacement"))
+        );
+        let current = describe(&written.current);
+        assert_eq!(current.blob.unwrap().sha256, outside_blob.sha256);
+        assert_eq!(current.fields.get("restores"), Some(&json!(outside)));
+        assert_eq!(
+            current.fields.get("major_reason"),
+            Some(&json!("outside_current"))
+        );
+        assert_eq!(
+            library.load(doc).unwrap().unwrap().revision.to_string(),
+            written.current,
+            "the outside file is current again"
+        );
+        let loaded = LiveStore::load_live(&db, doc).await.unwrap();
+        let base = loaded.verified_checkpoint.unwrap();
+        assert_eq!(base.revision, written.current);
+        assert!(loaded.unverified_checkpoints.is_empty());
+
+        // Stale against a moved head: nothing is written.
+        let before = library.history(doc).unwrap().len();
+        let stale = live
+            .write_live_major(
+                doc,
+                &MajorWrite {
+                    kind: MajorKind::Mark,
+                    reason: "returning_client_before",
+                    person: ann,
+                    current: &outside,
+                    restore: None,
+                    disputed: None,
+                    blob: None,
+                    authors: &[],
+                    at: Seq(0),
+                    session,
+                    created_at: OffsetDateTime::UNIX_EPOCH,
+                },
+            )
+            .await;
+        assert!(
+            matches!(stale, Err(super::LiveWriteError::Stale { .. })),
+            "{stale:?}"
+        );
+        assert_eq!(library.history(doc).unwrap().len(), before);
     }
 }

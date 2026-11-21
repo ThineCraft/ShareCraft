@@ -16,6 +16,7 @@ pub mod config;
 pub mod deployment;
 pub mod editors;
 mod events;
+pub mod external;
 mod file_room;
 pub mod github;
 pub mod icap;
@@ -30,9 +31,12 @@ mod members;
 pub mod previews;
 mod projection;
 mod room;
+pub mod s3_sign;
 mod scan;
 pub mod secrets;
+pub mod share;
 pub mod sites;
+pub mod source;
 pub mod source_sync;
 pub mod templates;
 pub mod tree;
@@ -138,6 +142,8 @@ struct Shared {
     secrets: Arc<secrets::SecretBox>,
     /// The client for the configured GitHub API address.
     github: Arc<github::GithubClient>,
+    /// File-share reads and their operating-system seam.
+    shares: Arc<share::Shares>,
     /// The sync worker's wakes, turns and back-off.
     sources: source_sync::Sources,
 }
@@ -186,6 +192,7 @@ impl AppState {
                 tree_undos: std::sync::Mutex::new(Vec::new()),
                 secrets: Arc::new(secrets),
                 github: Arc::new(github),
+                shares: Arc::new(share::Shares::default()),
                 sources: source_sync::Sources::default(),
             }),
         })
@@ -208,6 +215,12 @@ impl AppState {
     #[must_use]
     pub fn github(&self) -> &github::GithubClient {
         &self.shared.github
+    }
+
+    /// File-share reads and their operating-system seam.
+    #[must_use]
+    pub fn shares(&self) -> &share::Shares {
+        &self.shared.shares
     }
 
     /// The settings the server runs with.
@@ -384,6 +397,7 @@ impl AppState {
                 checkpoint_quiet: self.shared.config.live_checkpoint_quiet,
                 checkpoint_wait: self.shared.config.live_checkpoint_wait,
                 ticket_lifetime: self.shared.config.live_ticket_lifetime,
+                limits: self.shared.config.live_limits,
             },
         )
     }

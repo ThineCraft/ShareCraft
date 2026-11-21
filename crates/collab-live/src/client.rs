@@ -18,6 +18,7 @@ use protocol::live::{
     EntryBody, HEARTBEAT_MS, LIVE_PROTOCOL, LiveBuild, LiveClientMsg, LiveEntry, LivePerson,
     LiveResume, LiveServerMsg, LiveSessionId, LocalNo, MAX_CLIENT_FRAME_BYTES, MAX_PAYLOAD_BYTES,
     MAX_PRESENCE_BYTES, MajorReason, ParticipantNo, Place, RefusedReason, TicketPurpose,
+    UnavailableReason,
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -252,9 +253,10 @@ pub enum Event {
         at: Seq,
         base: Option<String>,
     },
-    /// New changes are paused because the unsaved log reached a hard limit.
+    /// New changes wait (the unsaved log reached a hard limit, or a major version is being
+    /// stored at the head): waiting changes stay shown and are held until `ChangesResumed`.
     ChangesPaused { entries: u64, bytes: u64 },
-    /// New changes may be sent again.
+    /// New changes may be sent again; held changes go now.
     ChangesResumed,
     /// The durable pre-return checkpoint exists and the saved batch may be sent.
     ReturnReady { through: LocalNo },
@@ -278,6 +280,9 @@ pub enum Event {
     BuildRefused,
     /// The place ended after missed heartbeats; the client can join again.
     Expired,
+    /// The server cannot take the join for now; the client keeps its work and can join again
+    /// later.
+    Unavailable { reason: UnavailableReason },
     /// The client's protocol or format does not match the session's.
     Incompatible { protocol: u32, format: String },
     /// The server ended the connection; do not reconnect.
@@ -377,6 +382,10 @@ impl std::fmt::Debug for Event {
                 .finish(),
             Event::BuildRefused => f.write_str("BuildRefused"),
             Event::Expired => f.write_str("Expired"),
+            Event::Unavailable { reason } => f
+                .debug_struct("Unavailable")
+                .field("reason", reason)
+                .finish(),
             Event::Incompatible { protocol, format } => f
                 .debug_struct("Incompatible")
                 .field("protocol", protocol)
@@ -576,6 +585,12 @@ pub struct LiveClient<E: LiveEditor> {
     returning_through: Option<LocalNo>,
     /// Whether a returning place is waiting for the server's durable pre-return checkpoint.
     hold_return: bool,
+    /// A change was held by the server: nothing is sent until changes resume, or until the
+    /// return barrier that held it opens.
+    changes_held: bool,
+    /// The server said changes wait (`changes_paused`): queued changes stay, shown, until
+    /// `changes_resumed`, so none is sent only to be refused.
+    changes_paused: bool,
     /// A discarded return batch whose already-sent readiness may still arrive.
     discarded_return_through: Option<LocalNo>,
     next_local: u64,
@@ -583,6 +598,8 @@ pub struct LiveClient<E: LiveEditor> {
     held: Vec<LiveEntry>,
     /// The base position named by the catch-up while loading the base.
     base_at: Seq,
+    /// The stored revision the editor's state was loaded from.
+    base_revision: Option<String>,
     /// The entry the editor stopped in, until a verdict on it arrives: the stall survives
     /// reconnects, and a client started with a crash note begins with it.
     stalled_at: Option<Seq>,
@@ -622,10 +639,13 @@ impl<E: LiveEditor> LiveClient<E> {
             pending: VecDeque::new(),
             returning_through: None,
             hold_return: false,
+            changes_held: false,
+            changes_paused: false,
             discarded_return_through: None,
             next_local: 1,
             held: Vec::new(),
             base_at: Seq(0),
+            base_revision: None,
             stalled_at,
             skipped: BTreeSet::new(),
             presence: None,
@@ -747,12 +767,16 @@ impl<E: LiveEditor> LiveClient<E> {
                     ));
                 }
                 self.head = head;
-                if self.has_state && from == self.agreed_seq {
+                // Another revision named at exactly the client's position replaced the file
+                // from outside (S4): what the client holds is no longer the agreed state.
+                let replaced = from == base && revision != self.base_revision;
+                if self.has_state && from == self.agreed_seq && !replaced {
                     self.phase = Phase::CatchingUp;
                 } else {
                     self.phase = Phase::LoadingBase;
                     self.held.clear();
                     self.base_at = base;
+                    self.base_revision.clone_from(&revision);
                     step.events.push(Event::LoadBase { revision, at: base });
                 }
                 self.check_live(now_ms, &mut step);
@@ -783,6 +807,21 @@ impl<E: LiveEditor> LiveClient<E> {
                     )));
                 }
             },
+            LiveServerMsg::Refused {
+                local,
+                reason: RefusedReason::Held,
+            } => {
+                // Not refused for good: this change and every later one wait, still shown, and
+                // go again once changes resume, never before.
+                self.changes_held = true;
+                for pending in self
+                    .pending
+                    .iter_mut()
+                    .filter(|pending| pending.local >= local)
+                {
+                    pending.sent = false;
+                }
+            }
             LiveServerMsg::Refused { local, reason } => {
                 let first = self.pending.front().map(|pending| pending.local);
                 // A refusal of a change the client already took off its queue (for example one
@@ -840,12 +879,25 @@ impl<E: LiveEditor> LiveClient<E> {
                 }
             },
             LiveServerMsg::ChangesPaused { entries, bytes } => {
+                // Queued changes wait instead of going out to be refused.
+                self.changes_paused = true;
                 step.events.push(Event::ChangesPaused { entries, bytes });
             }
-            LiveServerMsg::ChangesResumed => step.events.push(Event::ChangesResumed),
+            LiveServerMsg::ChangesResumed => {
+                step.events.push(Event::ChangesResumed);
+                self.changes_held = false;
+                self.changes_paused = false;
+                self.send_unsent(now_ms, &mut step.send);
+            }
             LiveServerMsg::ReturnReady { through } => {
                 if self.discarded_return_through == Some(through) {
+                    // The batch was dropped with the edit right; a change held behind its
+                    // barrier meanwhile is released now, or nothing ever would release it.
                     self.discarded_return_through = None;
+                    if self.changes_held {
+                        self.changes_held = false;
+                        self.send_unsent(now_ms, &mut step.send);
+                    }
                 } else if self.hold_return && self.returning_through == Some(through) {
                     self.hold_return = false;
                     self.returning_through = None;
@@ -858,11 +910,9 @@ impl<E: LiveEditor> LiveClient<E> {
                     }
                     step.events.push(Event::ReturnReady { through });
                     self.send_unsent(now_ms, &mut step.send);
-                } else {
-                    return Err(ClientError::Desync(format!(
-                        "return ready through {through:?} without that return batch"
-                    )));
                 }
+                // Otherwise a repeat: the server sends it again on every join that names a
+                // batch, and this client holds none any more.
             }
             LiveServerMsg::ArchiveReturn { current } => {
                 if self.phase != Phase::Joining || !self.joined || !self.hold_return {
@@ -900,6 +950,8 @@ impl<E: LiveEditor> LiveClient<E> {
                 through,
                 verified,
                 major,
+                // Read by the page's owners' notice from the frame itself.
+                mismatch: _,
             } => {
                 // A stored revision is named by its id; anything longer is dropped.
                 if revision.len() <= MAX_REVISION_BYTES {
@@ -918,6 +970,10 @@ impl<E: LiveEditor> LiveClient<E> {
             LiveServerMsg::Incompatible { protocol, format } => {
                 self.close();
                 step.events.push(Event::Incompatible { protocol, format });
+            }
+            LiveServerMsg::Unavailable { reason } => {
+                self.disconnected(now_ms);
+                step.events.push(Event::Unavailable { reason });
             }
             LiveServerMsg::Expired => {
                 self.disconnected(now_ms);
@@ -1133,7 +1189,9 @@ impl<E: LiveEditor> LiveClient<E> {
         })
     }
 
-    /// Makes the checkpoint-ready frame for a ticket at the exact agreed position.
+    /// Makes the checkpoint-ready frame for a ticket at the exact agreed position. The server
+    /// ignores this frame (it acts on the upload itself); it only checks the client can write
+    /// the checkpoint at `at`.
     pub fn checkpoint_ready(&self, ticket: Uuid, at: Seq) -> Result<String, ClientError> {
         if !self.can_checkpoint {
             return Err(ClientError::AgreedUnavailable {
@@ -1210,7 +1268,12 @@ impl<E: LiveEditor> LiveClient<E> {
     /// Sends the waiting changes not yet sent on this connection, in order, as far as the pace
     /// allows. What is sent is always a prefix of the queue.
     fn send_unsent(&mut self, now_ms: u64, send: &mut Vec<String>) {
-        if self.phase != Phase::Live || !self.can_edit || self.hold_return {
+        if self.phase != Phase::Live
+            || !self.can_edit
+            || self.hold_return
+            || self.changes_held
+            || self.changes_paused
+        {
             return;
         }
         self.clock_check(now_ms);
@@ -1303,6 +1366,9 @@ impl<E: LiveEditor> LiveClient<E> {
         // A server's interval outside 1 s to 60 s would flood it or let the place expire.
         self.heartbeat_ms = heartbeat_ms.clamp(MIN_HEARTBEAT_MS, HEARTBEAT_MS);
         self.joined = true;
+        // A new join starts over: a hold of the connection before applies no longer.
+        self.changes_held = false;
+        self.changes_paused = false;
         if let Place::Returning { previous } = place {
             self.hold_return = self.returning_through.is_some();
             step.events.push(Event::Returned {

@@ -5,7 +5,7 @@
 use std::collections::BTreeSet;
 
 use collab_core::ids::{ClientId, Seq};
-use protocol::live::{LiveBuild, LiveServerMsg, ParticipantNo, Place};
+use protocol::live::{LiveBuild, LiveServerMsg, ParticipantNo};
 use tokio::time::Instant;
 
 use super::{LiveRoom, encode};
@@ -39,14 +39,10 @@ impl<S: LiveStore> LiveRoom<S> {
         }
     }
 
-    /// After a join's catch-up: the joiner gets everyone else's current note, and a returning
-    /// client is announced to the others.
-    pub(super) fn after_join(
-        &mut self,
-        client: ClientId,
-        participant: ParticipantNo,
-        place: Place,
-    ) {
+    /// After a join's catch-up: the joiner gets everyone else's current note. A returning
+    /// client is announced to the others later, at its return barrier
+    /// ([`Self::announce_returning`]).
+    pub(super) fn after_join(&mut self, client: ClientId, participant: ParticipantNo) {
         let notes = self
             .presence
             .current(participant)
@@ -61,9 +57,12 @@ impl<S: LiveStore> LiveRoom<S> {
         {
             self.broadcast_people();
         }
-        if matches!(place, Place::Returning { .. }) {
-            self.send_to_others(client, &LiveServerMsg::Returning { participant });
-        }
+    }
+
+    /// Tells everyone but the returning client that it is back with saved work of its own:
+    /// sent once, when the version before its batch is stored and it is told `ReturnReady`.
+    pub(super) fn announce_returning(&mut self, client: ClientId, participant: ParticipantNo) {
+        self.send_to_others(client, &LiveServerMsg::Returning { participant });
     }
 
     /// Clears the note of every place that is no longer held or no longer connected, telling
@@ -98,19 +97,23 @@ impl<S: LiveStore> LiveRoom<S> {
         dropped
     }
 
-    /// Tells everyone a checkpoint was stored (`verified` false) or verified.
+    /// Tells everyone a checkpoint was stored (`verified` false) or verified; `major` when it
+    /// is kept as a major version, `mismatch` when two editors' checkpoints disagreed and both
+    /// were kept.
     pub(super) fn notify_saved(
         &mut self,
         revision: String,
         through: Seq,
         verified: bool,
         major: bool,
+        mismatch: bool,
     ) {
         let frame = encode(&LiveServerMsg::Saved {
             revision,
             through,
             verified,
             major,
+            mismatch,
         });
         if self.members.send(None, &Outbound::One(frame)).any() {
             self.broadcast_people();

@@ -142,7 +142,9 @@ async fn creator_owns_and_lists_the_new_document() {
             "name": "Plans",
             "editor": "text",
             "access": common::role_access("owner"),
-            "revision": null
+            "revision": null,
+            "session": "text",
+            "live": { "behind": false, "head": 0, "stored_through": 0 }
         })
     );
 

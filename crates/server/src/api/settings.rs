@@ -5,10 +5,11 @@
 use axum::Json;
 use axum::extract::State;
 use records::{
-    ANYONE_LINK_MAX_DAYS, ANYONE_LINKS, DEFAULT_LANGUAGE, DEFAULT_TIME_ZONE, RegionalDefaults,
-    SCANNER_MAX_BYTES, SCANNER_TIMEOUT_SECONDS, SCANNER_TOO_LARGE, SCANNER_UNAVAILABLE,
-    SCANNER_URL, ScannerSettings, SharingSettings, valid_scanner_setting, validate_language,
-    validate_time_zone,
+    ANYONE_LINK_MAX_DAYS, ANYONE_LINKS, DEFAULT_LANGUAGE, DEFAULT_TIME_ZONE, PathRefusal,
+    RegionalDefaults, SCANNER_MAX_BYTES, SCANNER_TIMEOUT_SECONDS, SCANNER_TOO_LARGE,
+    SCANNER_UNAVAILABLE, SCANNER_URL, SHARE_CACHE_MAX_BYTES, SHARE_LIST_SECONDS, SHARE_ROOTS,
+    SOURCE_MAX_FILES, ScannerSettings, SharePath, SharingSettings, usable_here, valid_root,
+    valid_scanner_setting, validate_language, validate_time_zone,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -19,12 +20,179 @@ use super::{ApiError, JsonBody};
 use crate::AppState;
 use crate::auth::Signed;
 use crate::icap::Client;
+use crate::share::canonical_share_path;
 
 /// The longest the test of new scanner settings waits for the scanner.
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The longest `anyone_link_max_days` may be, as the records layer allows.
 const MAX_DAYS_LIMIT: i64 = 365;
+
+pub(super) fn path_reason(reason: PathRefusal) -> &'static str {
+    match reason {
+        PathRefusal::NotAbsolute | PathRefusal::Empty => "relative",
+        PathRefusal::Traversal => "traversal",
+        PathRefusal::DevicePrefix => "device",
+        PathRefusal::Stream => "stream",
+        PathRefusal::TooLong => "too_long",
+        PathRefusal::WholeDrive => "whole_drive",
+        PathRefusal::OtherSystem => "other_system",
+        PathRefusal::EmptySegment
+        | PathRefusal::BadCharacter
+        | PathRefusal::DeviceName
+        | PathRefusal::TrailingDotOrSpace => "characters",
+    }
+}
+
+/// Whether `path` and the server's private data folder overlap, lexically or after resolving
+/// links. Canonicalization uses the file-system seam and never exposes its error text.
+pub(super) async fn overlaps_data_folder(state: &AppState, path: &SharePath) -> bool {
+    let data_text = state.config().data_dir.to_string_lossy();
+    if let Ok(data) = SharePath::parse(&data_text)
+        && (path.is_within(&data) || data.is_within(path))
+    {
+        return true;
+    }
+    let fs = state.shares().fs();
+    let share = path.to_path_buf();
+    let data = state.config().data_dir.clone();
+    tokio::task::spawn_blocking(move || {
+        let share = fs.canonical(&share, &share).ok()?;
+        let data = fs.canonical(&data, &data).ok()?;
+        // Windows canonical paths carry a `\\?\` prefix, which only this conversion removes.
+        let share = canonical_share_path(&share).ok()?;
+        let data = canonical_share_path(&data).ok()?;
+        Some(share.is_within(&data) || data.is_within(&share))
+    })
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(false)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ShareSettingsChange {
+    roots: Option<Vec<String>>,
+    cache_max_bytes: Option<Value>,
+    list_seconds: Option<Value>,
+    max_files: Option<Value>,
+}
+
+async fn shares_out(state: &AppState) -> Result<Value, ApiError> {
+    let settings = state
+        .db()
+        .share_settings()
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?;
+    let cache = state
+        .db()
+        .cached_bytes()
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?;
+    let runs_as = std::env::var("USERNAME")
+        .or_else(|_| std::env::var("USER"))
+        .ok();
+    Ok(json!({
+        "roots": settings.roots.iter().map(SharePath::display).collect::<Vec<_>>(),
+        "cache_max_bytes": settings.cache_max_bytes,
+        "list_seconds": settings.list_seconds,
+        "max_files": settings.max_files,
+        "cache": { "bytes": cache },
+        "runs_as": runs_as,
+    }))
+}
+
+/// `GET /api/settings/shares`: approved share roots and listing/cache limits, for administrators.
+pub(crate) async fn shares(
+    State(state): State<AppState>,
+    signed: Signed,
+) -> Result<Json<Value>, ApiError> {
+    if !signed.session.user.is_admin {
+        return Err(ApiError::Forbidden);
+    }
+    Ok(Json(shares_out(&state).await?))
+}
+
+/// `PUT /api/settings/shares`: changes the supplied file-share settings, for administrators.
+pub(crate) async fn change_shares(
+    State(state): State<AppState>,
+    signed: Signed,
+    JsonBody(change): JsonBody<ShareSettingsChange>,
+) -> Result<Json<Value>, ApiError> {
+    if !signed.session.user.is_admin {
+        return Err(ApiError::Forbidden);
+    }
+    let roots = match change.roots {
+        None => None,
+        Some(values) => {
+            let mut parsed = Vec::with_capacity(values.len());
+            for value in &values {
+                let path = SharePath::parse(value)
+                    .map_err(|reason| ApiError::InvalidSharePath(path_reason(reason)))?;
+                valid_root(&path)
+                    .and_then(|()| usable_here(&path))
+                    .map_err(|reason| ApiError::InvalidSharePath(path_reason(reason)))?;
+                if overlaps_data_folder(&state, &path).await {
+                    return Err(ApiError::ShareNotApproved);
+                }
+                parsed.push(path.display());
+            }
+            Some(json!(parsed))
+        }
+    };
+    let changes = [
+        (SHARE_ROOTS, roots),
+        (SHARE_CACHE_MAX_BYTES, change.cache_max_bytes),
+        (SHARE_LIST_SECONDS, change.list_seconds),
+        (SOURCE_MAX_FILES, change.max_files),
+    ];
+    if changes.iter().all(|(_, value)| value.is_none()) {
+        return Err(ApiError::InvalidRequest);
+    }
+    // Validate every value before writing the first one, so a bad later field changes nothing.
+    for (key, value) in changes
+        .iter()
+        .filter_map(|(key, value)| value.as_ref().map(|v| (*key, v)))
+    {
+        let valid = match key {
+            SHARE_ROOTS => true,
+            SHARE_CACHE_MAX_BYTES => value.as_u64().is_some_and(|n| n >= 256 * 1024 * 1024),
+            SHARE_LIST_SECONDS => value.as_u64().is_some_and(|n| (30..=3_600).contains(&n)),
+            SOURCE_MAX_FILES => value.as_i64().is_some_and(|n| n >= 1),
+            _ => false,
+        };
+        if !valid {
+            return Err(ApiError::InvalidRequest);
+        }
+    }
+    let changes: Vec<(&str, Value)> = changes
+        .into_iter()
+        .filter_map(|(key, value)| value.map(|v| (key, v)))
+        .collect();
+    let mut roots_turn = if changes.iter().any(|(key, _)| *key == SHARE_ROOTS) {
+        Some(
+            state
+                .db()
+                .lock_share_connections(SHARE_TURN_WAIT)
+                .await
+                .map_err(|e| ApiError::unavailable(&e))?
+                .ok_or(ApiError::Unavailable)?,
+        )
+    } else {
+        None
+    };
+    state
+        .db()
+        .set_settings(signed.session.user.id, changes)
+        .await?;
+    drop(roots_turn.take());
+    Ok(Json(shares_out(&state).await?))
+}
+
+/// The longest a request waits for the organisation-wide share-connection turn before it is
+/// refused with a retryable `503 unavailable`. Holders never do file-system I/O under the turn.
+pub(crate) const SHARE_TURN_WAIT: Duration = Duration::from_secs(10);
 
 /// `GET /api/settings/sharing`.
 #[derive(Serialize)]

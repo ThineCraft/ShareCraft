@@ -2405,6 +2405,236 @@ fn own_crash_while_catching_up_from_the_base_is_a_crash_in_place() {
     assert_eq!(client.pending(), 1);
 }
 
+fn catchup_on(base: u64, revision: &str, from: u64, head: u64) -> String {
+    json!({ "type": "catchup", "base": base, "revision": revision, "from": from, "head": head })
+        .to_string()
+}
+
+/// A base named at exactly the client's position but with another revision replaced the
+/// file from outside (S4): the client loads it rather than keep its own state. The same
+/// revision again carries on as before.
+#[test]
+fn replaced_base_at_the_same_position_is_loaded() {
+    let mut doc = StandIn::new("a");
+    let mut client = live(&mut doc, 1);
+    client
+        .receive(
+            &mut doc,
+            &entry(1, 2, other(2), 1, 0, &insert(LiveId(2, 0), "x")),
+            10,
+        )
+        .unwrap();
+    assert_eq!(client.agreed_seq(), Seq(1));
+
+    let step = client
+        .receive(&mut doc, &catchup_on(1, "outside", 1, 1), 20)
+        .unwrap();
+    assert_eq!(client.phase(), Phase::LoadingBase);
+    assert!(step.events.contains(&Event::LoadBase {
+        revision: Some("outside".to_owned()),
+        at: Seq(1),
+    }));
+    client.base_ready(&mut doc, 30).unwrap();
+    assert_eq!(client.phase(), Phase::Live);
+
+    // Reconnecting onto the same base keeps the state.
+    client.disconnected(40);
+    client.connected(50);
+    client.receive(&mut doc, &joined_kept(1), 60).unwrap();
+    let step = client
+        .receive(&mut doc, &catchup_on(1, "outside", 1, 1), 60)
+        .unwrap();
+    assert_eq!(client.phase(), Phase::Live);
+    assert!(
+        !step
+            .events
+            .iter()
+            .any(|event| matches!(event, Event::LoadBase { .. }))
+    );
+}
+
+/// A join refused for now (the log is over its limit) is recoverable: the client goes offline
+/// and keeps its work for a later join, and is not closed.
+#[test]
+fn unavailable_join_is_recoverable() {
+    let mut doc = StandIn::new("a");
+    let mut client = live(&mut doc, 1);
+    let id = client.new_ids(1).unwrap();
+    client
+        .local(&mut doc, insert(id, "kept"), Mode::ShowAtOnce, 10)
+        .unwrap();
+    client.disconnected(20);
+    client.connected(30);
+    let frame = json!({ "type": "unavailable", "reason": "log_over_limit" }).to_string();
+    let step = client.receive(&mut doc, &frame, 40).unwrap();
+    assert!(step.events.contains(&Event::Unavailable {
+        reason: protocol::live::UnavailableReason::LogOverLimit
+    }));
+    assert_eq!(client.phase(), Phase::Offline);
+    assert_eq!(client.pending(), 1);
+    assert_eq!(client.connected(50).len(), 1, "it can join again");
+}
+
+/// A change refused because changes wait for a major version stays waiting, shown, and is sent
+/// again, in order, once changes resume.
+#[test]
+fn held_refusal_keeps_the_change_and_resends_it_after_the_hold() {
+    let mut doc = StandIn::new("a");
+    let mut client = live(&mut doc, 1);
+    let first = client.new_ids(1).unwrap();
+    let second = client.new_ids(1).unwrap();
+    client
+        .local(&mut doc, insert(first, "one"), Mode::ShowAtOnce, 10)
+        .unwrap();
+    client
+        .local(&mut doc, insert(second, "two"), Mode::ShowAtOnce, 10)
+        .unwrap();
+    for local in [1, 2] {
+        let held = json!({ "type": "refused", "local": local, "reason": "held" }).to_string();
+        let step = client.receive(&mut doc, &held, 20).unwrap();
+        assert!(step.send.is_empty());
+    }
+    assert_eq!(client.pending(), 2, "nothing is dropped");
+    assert_eq!(doc.lines(), vec!["one", "two"]);
+    let resumed = json!({ "type": "changes_resumed" }).to_string();
+    let step = client.receive(&mut doc, &resumed, 30).unwrap();
+    let resent = sent(&step.send);
+    assert_eq!(resent.len(), 2);
+    assert_eq!(
+        (resent[0]["local"].clone(), resent[1]["local"].clone()),
+        (json!(1), json!(2))
+    );
+}
+
+/// Held changes wait for `changes_resumed`: neither a tick nor a new change sends them (or
+/// anything after them) during the hold.
+#[test]
+fn held_change_is_not_resent_by_tick_before_resume() {
+    let mut doc = StandIn::new("a");
+    let mut client = live(&mut doc, 1);
+    let first = client.new_ids(1).unwrap();
+    client
+        .local(&mut doc, insert(first, "one"), Mode::ShowAtOnce, 10)
+        .unwrap();
+    let held = json!({ "type": "refused", "local": 1, "reason": "held" }).to_string();
+    let step = client.receive(&mut doc, &held, 20).unwrap();
+    assert!(step.send.is_empty());
+    for now in [2_000, 4_000, 6_000] {
+        let frames = sent(&client.tick(now));
+        assert!(
+            frames.iter().all(|frame| frame["type"] != "entry"),
+            "nothing is resent during the hold: {frames:?}"
+        );
+    }
+    let second = client.new_ids(1).unwrap();
+    let step = client
+        .local(&mut doc, insert(second, "two"), Mode::ShowAtOnce, 7_000)
+        .unwrap();
+    assert!(
+        sent(&step.send)
+            .iter()
+            .all(|frame| frame["type"] != "entry"),
+        "a new change waits behind the held one"
+    );
+    assert!(
+        sent(&client.tick(8_000))
+            .iter()
+            .all(|frame| frame["type"] != "entry")
+    );
+    let resumed = json!({ "type": "changes_resumed" }).to_string();
+    let step = client.receive(&mut doc, &resumed, 9_000).unwrap();
+    let resent = sent(&step.send);
+    assert_eq!(resent.len(), 2);
+    assert_eq!(
+        (resent[0]["local"].clone(), resent[1]["local"].clone()),
+        (json!(1), json!(2))
+    );
+}
+
+/// During a pause (the log at its limit, or a major version at the head) queued changes wait,
+/// shown, instead of going out to be refused; they go once changes resume.
+#[test]
+fn changes_paused_holds_queued_changes_until_resumed() {
+    let mut doc = StandIn::new("a");
+    let mut client = live(&mut doc, 1);
+    let paused = json!({ "type": "changes_paused", "entries": 5000, "bytes": 10 }).to_string();
+    client.receive(&mut doc, &paused, 10).unwrap();
+    let first = client.new_ids(1).unwrap();
+    let step = client
+        .local(&mut doc, insert(first, "one"), Mode::ShowAtOnce, 20)
+        .unwrap();
+    assert!(
+        sent(&step.send).is_empty(),
+        "nothing goes out to be refused"
+    );
+    assert!(
+        sent(&client.tick(5_000))
+            .iter()
+            .all(|frame| frame["type"] != "entry")
+    );
+    assert_eq!(client.pending(), 1, "the change waits, shown");
+    let step = client
+        .receive(&mut doc, r#"{"type":"changes_resumed"}"#, 6_000)
+        .unwrap();
+    let resent = sent(&step.send);
+    assert_eq!(resent.len(), 1);
+    assert_eq!(resent[0]["local"], 1);
+}
+
+/// I5: a returning client that lost its batch with its edit right, then had a new change held,
+/// is released by the `return_ready` of the discarded batch: nothing else would release it.
+#[test]
+fn return_ready_of_a_discarded_batch_releases_a_held_change() {
+    let mut doc = StandIn::new("a");
+    let mut client = checkpoint_live(&mut doc, 2);
+    let saved = client.new_ids(1).unwrap();
+    client
+        .local(&mut doc, insert(saved, "saved"), Mode::ShowAtOnce, 10)
+        .unwrap();
+    client.disconnected(20);
+    client.connected(30);
+    client
+        .receive(
+            &mut doc,
+            &joined_as(5, json!({ "is": "returning", "previous": 2 }), true),
+            30,
+        )
+        .unwrap();
+    client.receive(&mut doc, &catchup(0, 0, 0), 30).unwrap();
+    client
+        .receive(&mut doc, r#"{"type":"access","can_edit":false}"#, 40)
+        .unwrap();
+    client
+        .receive(&mut doc, r#"{"type":"access","can_edit":true}"#, 50)
+        .unwrap();
+    let fresh = client.new_ids(1).unwrap();
+    let step = client
+        .local(&mut doc, insert(fresh, "fresh"), Mode::ShowAtOnce, 60)
+        .unwrap();
+    assert_eq!(entries(&step.send).len(), 1);
+    let held = json!({ "type": "refused", "local": 2, "reason": "held" }).to_string();
+    client.receive(&mut doc, &held, 70).unwrap();
+    let step = client
+        .receive(&mut doc, r#"{"type":"return_ready","through":1}"#, 80)
+        .unwrap();
+    let resent = entries(&step.send);
+    assert_eq!(resent.len(), 1, "the held change goes again");
+    assert_eq!(resent[0]["local"], 2);
+}
+
+/// C1: the server sends `return_ready` again on every join that names a batch; a client
+/// holding no such batch (it was released already) ignores the repeat.
+#[test]
+fn a_repeated_return_ready_is_ignored() {
+    let mut doc = StandIn::new("a");
+    let mut client = live(&mut doc, 1);
+    let step = client
+        .receive(&mut doc, r#"{"type":"return_ready","through":4}"#, 10)
+        .unwrap();
+    assert_eq!(step, Step::default());
+    assert_eq!(client.phase(), Phase::Live);
+}
+
 /// The presence frames among `frames`.
 fn presences(frames: &[String]) -> Vec<Value> {
     sent(frames)

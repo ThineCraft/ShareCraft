@@ -7,6 +7,7 @@
 //! rows concerned and judges the person's access again. Git is the authority: each record is
 //! built from the node's current record in Git, never from PostgreSQL.
 
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
@@ -15,11 +16,11 @@ use std::sync::atomic::Ordering;
 use collab_core::ids::{DocId, NodeId, UserId};
 use protocol::RemovedReason;
 use records::{
-    Access, AccessError, BinStage, ClaimId, Db, DbError, Document, Editor, LibraryKind,
-    LibrarySettings, NewEvent, Node, NodeChange, NodeKind, NodeRow, NodesApplied, OrgPolicy, Perms,
-    QuotaError, Reservation, SiteKind, SiteSettings, User, is_format_char, validate_description,
-    validate_document_name, validate_language, validate_node_name, validate_template_body,
-    validate_time_zone,
+    Access, AccessError, BinStage, ClaimId, Db, DbError, Document, Editor, ExternalEntry,
+    LibraryKind, LibrarySettings, NewEvent, Node, NodeChange, NodeKind, NodeRow, NodesApplied,
+    OrgPolicy, Perms, QuotaError, Reservation, SiteKind, SiteSettings, SourceItem, User,
+    is_format_char, validate_description, validate_document_name, validate_language,
+    validate_node_name, validate_template_body, validate_time_zone,
 };
 use records::{Origin, check_name, check_size};
 use revisions::brand::{FontPackage, Look, OrgBrand, TemplateLook};
@@ -38,7 +39,7 @@ use crate::blobs::{Held, commit as commit_reservation, release};
 use crate::brand::BrandError;
 use crate::checkpoint::Checkpointer;
 use crate::projection::record_first;
-use crate::room::credited_name;
+use crate::room::{AccessChange, credited_name};
 
 /// The format version of the tree records this server writes.
 const TREE_SCHEMA: u32 = 1;
@@ -332,10 +333,18 @@ struct Plan {
     as_if_live: bool,
     /// The files the change deletes.
     deleted: Vec<DocId>,
+    /// A database failure must take the whole Git change back before repairing rows.
+    take_back_on_failure: bool,
     /// A restored item that had to be renamed, and its name before.
     renamed: Option<(NodeId, String)>,
     /// The files a copy makes, each with its editor.
     copies: Vec<(NodeId, Editor)>,
+    /// Other new documents made by a bulk external-source creation.
+    documents: Vec<(NodeId, Editor)>,
+    /// The source rows committed atomically with a bulk external-source creation.
+    external_library: Option<NodeId>,
+    source_items: Vec<SourceItem>,
+    external_items: Vec<ExternalEntry>,
     /// The versions a copy stores once its tree commit is in, already claimed.
     contents: Option<CopiedContents>,
 }
@@ -394,8 +403,13 @@ impl Default for Plan {
             needs_below: 0,
             as_if_live: false,
             deleted: Vec::new(),
+            take_back_on_failure: false,
             renamed: None,
             copies: Vec::new(),
+            documents: Vec::new(),
+            external_library: None,
+            source_items: Vec::new(),
+            external_items: Vec::new(),
             contents: None,
         }
     }
@@ -525,6 +539,94 @@ pub async fn apply(state: &AppState, actor: &User, op: TreeOp) -> Result<Applied
         deleted,
         renamed,
     })
+}
+
+/// Moves every live direct child of a connected share library to the recycle bin in one tree
+/// commit and one database transaction. The caller has authorised the library operation; child
+/// scopes are therefore not re-authorised. A retry is idempotent because only live children are
+/// selected, and the source row is deliberately not touched here. The library's
+/// `manage_access` is judged again in the transaction.
+pub(crate) async fn delete_source_children(
+    state: &AppState,
+    actor: &User,
+    library: NodeId,
+) -> Result<usize, AccessError> {
+    let _turn = state.tree_lock().lock().await;
+    ensure_in_step(state).await?;
+    let children = state.db().live_children(library).await?;
+    if children.is_empty() {
+        return Ok(0);
+    }
+    let tree = read_tree(state.checkpointer()).await.map_err(git_failure)?;
+    let stamp = Stamp {
+        at: now_text(),
+        by: author_of(actor),
+    };
+    let mut undo = Vec::new();
+    let mut records = Vec::new();
+    let mut documents = Vec::new();
+    let mut events = Vec::new();
+    for child in &children {
+        let first_record = records.len();
+        let before = tree
+            .iter()
+            .find(|record| record.id == child.id.0)
+            .ok_or(AccessError::NotFound)?;
+        let subtree = std::iter::once(before)
+            .chain(below(&tree, child.id.0))
+            .filter(|record| record.deleted.is_none());
+        for before in subtree {
+            undo.push(before.clone());
+            let mut gone = before.clone();
+            gone.deleted = Some(stamp.clone());
+            gone.deleted_with = Some(child.id.0);
+            gone.bin_stage = (before.id == child.id.0).then_some(1);
+            if gone.kind == kind_word(NodeKind::Document) {
+                let doc = DocId(gone.id);
+                documents.push(doc);
+                if gone.id != child.id.0 {
+                    events.push(NewEvent {
+                        kind: "node.deleted",
+                        actor: Some(actor.id),
+                        subject: None,
+                        document: Some(doc),
+                        node: Some(NodeId(gone.id)),
+                        detail: json!({ "name": gone.name, "with": child.id.0 }),
+                    });
+                }
+            }
+            records.push(gone);
+        }
+        events.push(NewEvent {
+            kind: "node.deleted",
+            actor: Some(actor.id),
+            subject: None,
+            document: document_of(child.kind, child.id),
+            node: Some(child.id),
+            detail: json!({ "name": child.name, "items": records.len() - first_record }),
+        });
+    }
+    let deleted = documents.clone();
+    let plan = Plan {
+        id: library,
+        message: "Disconnect file-share library".to_owned(),
+        records,
+        undo,
+        events,
+        deleted,
+        // The library-level authorisation is judged again inside the transaction, so a
+        // revocation while the disconnect waited for the source turn still stops it. The
+        // children are deliberately not re-judged.
+        needs: vec![(library, Perms::MANAGE_ACCESS)],
+        take_back_on_failure: true,
+        ..Plan::default()
+    };
+    let done = commit(state, Some(actor), plan).await?;
+    erase_released(state, done).await;
+    for doc in documents {
+        state.rooms().send_to(doc, AccessChange::Deleted);
+    }
+    Ok(children.len())
 }
 
 /// Purges the file `doc` for `actor`, an administrator deleting quarantined content (the route
@@ -949,6 +1051,184 @@ pub async fn create_document(
     db.document(id)
         .await?
         .ok_or_else(|| DbError::new("the new document was not recorded").into())
+}
+
+/// One folder or external document created by a source listing. `editor` is `None` for a
+/// folder. Entries in a batch are parent before child.
+#[derive(Clone, Debug)]
+pub(crate) struct ExternalNodeCreate {
+    pub id: NodeId,
+    pub parent: NodeId,
+    pub name: String,
+    pub path: String,
+    pub repository_path: String,
+    pub size: u64,
+    pub mtime_ns: i64,
+    pub editor: Option<Editor>,
+}
+
+/// The node ids Git holds at the start of a share apply, after any pending tree repair. A
+/// caller carries this set across its count-bounded batches and adds each committed id.
+pub(crate) async fn external_tree_ids(state: &AppState) -> Result<HashSet<Uuid>, AccessError> {
+    let _turn = state.tree_lock().lock().await;
+    ensure_in_step(state).await?;
+    Ok(read_tree(state.checkpointer())
+        .await
+        .map_err(git_failure)?
+        .into_iter()
+        .map(|record| record.id)
+        .collect())
+}
+
+/// Creates a parent-before-child batch of folders and external documents in one Git commit,
+/// then mirrors all node, document, source-item and event rows in one PostgreSQL transaction.
+/// The files have no versions and every node inherits permissions from its parent.
+pub(crate) async fn create_external_nodes(
+    state: &AppState,
+    actor: &User,
+    library: NodeId,
+    creates: &[ExternalNodeCreate],
+    existing_git: &HashSet<Uuid>,
+) -> Result<(), AccessError> {
+    if creates.is_empty() {
+        return Ok(());
+    }
+    let _turn = state.tree_lock().lock().await;
+    ensure_in_step(state).await?;
+    let db = state.db();
+    let (_, library_access) = visible(db, actor, library).await?;
+    require(&library_access, Perms::ADD)?;
+
+    let author = author_of(actor);
+    let ids: Vec<NodeId> = creates.iter().map(|create| create.id).collect();
+    let distinct: HashSet<NodeId> = ids.iter().copied().collect();
+    if distinct.len() != ids.len() || db.any_node_id_used(&ids).await? {
+        return Err(AccessError::Exists);
+    }
+    if ids.iter().any(|id| existing_git.contains(&id.0)) {
+        return Err(AccessError::Exists);
+    }
+    let mut records = Vec::with_capacity(creates.len());
+    let mut undo = Vec::with_capacity(creates.len());
+    let mut documents = Vec::new();
+    let mut events = Vec::with_capacity(creates.len());
+    let mut folders = Vec::new();
+    let mut external = Vec::new();
+    let mut made: HashMap<NodeId, TreeRecord> = HashMap::new();
+    let mut names: HashMap<NodeId, HashSet<String>> = HashMap::new();
+    let mut needs: Vec<(usize, NodeId)> = Vec::new();
+
+    for create in creates {
+        let (parent_kind, site, parent_is_new) = match made.get(&create.parent) {
+            Some(parent) => (
+                parse_kind(&parent.kind).ok_or(AccessError::WrongPlace)?,
+                parent.site,
+                true,
+            ),
+            None => {
+                let (parent, access) = visible(db, actor, create.parent).await?;
+                require(&access, Perms::ADD)?;
+                needs.push((create.path.matches('/').count(), create.parent));
+                (parent.kind, parent.site.0, false)
+            }
+        };
+        if !matches!(parent_kind, NodeKind::Library | NodeKind::Folder) {
+            return Err(AccessError::WrongPlace);
+        }
+        let (kind, name) = match create.editor {
+            Some(editor) => {
+                let name = validate_document_name(&create.name, editor)?.to_owned();
+                check_policies(db, library, &name, Some(create.size)).await?;
+                (NodeKind::Document, name)
+            }
+            None => {
+                if folders_off(db, library).await? {
+                    return Err(AccessError::FoldersOff);
+                }
+                (
+                    NodeKind::Folder,
+                    validate_node_name(&create.name)?.to_owned(),
+                )
+            }
+        };
+        if let Entry::Vacant(slot) = names.entry(create.parent) {
+            let existing = if parent_is_new {
+                HashSet::new()
+            } else {
+                db.live_child_names(create.parent)
+                    .await?
+                    .into_iter()
+                    .collect()
+            };
+            slot.insert(existing);
+        }
+        let taken = names
+            .get_mut(&create.parent)
+            .ok_or_else(|| DbError::new("the batch parent has no name set"))?;
+        if !taken.insert(name.to_lowercase()) {
+            return Err(AccessError::NameTaken);
+        }
+        let record = new_record(
+            create.id,
+            kind,
+            Some(create.parent),
+            site,
+            &name,
+            author.clone(),
+        );
+        undo.push(deleted(&record, author.clone()));
+        if let Some(editor) = create.editor {
+            documents.push((create.id, editor));
+            events.push(NewEvent {
+                kind: "document.created",
+                actor: Some(actor.id),
+                subject: None,
+                document: Some(DocId(create.id.0)),
+                node: Some(create.id),
+                detail: json!({
+                    "name": name,
+                    "editor": editor.id(),
+                    "uploaded": true,
+                    "bytes": create.size,
+                }),
+            });
+            external.push(ExternalEntry {
+                node: create.id,
+                path: create.path.clone(),
+                repository_path: create.repository_path.clone(),
+                size: create.size,
+                mtime_ns: create.mtime_ns,
+            });
+        } else {
+            events.push(created_event(actor.id, &record));
+            folders.push(SourceItem {
+                node: create.id,
+                path: create.path.clone(),
+                repository_path: create.repository_path.clone(),
+                blob_sha: None,
+                size: i64::try_from(create.size).unwrap_or(i64::MAX),
+            });
+        }
+        made.insert(create.id, record.clone());
+        records.push(record);
+    }
+    needs.sort_unstable_by_key(|(depth, id)| (*depth, id.0));
+    needs.dedup_by_key(|(_, id)| *id);
+    let needs: Vec<(NodeId, Perms)> = needs.into_iter().map(|(_, id)| (id, Perms::ADD)).collect();
+    let plan = Plan {
+        id: creates.first().map_or(library, |create| create.id),
+        message: format!("Create {} file-share items", creates.len()),
+        records,
+        undo,
+        needs,
+        documents,
+        events,
+        external_library: Some(library),
+        source_items: folders,
+        external_items: external,
+        ..Plan::default()
+    };
+    commit(state, Some(actor), plan).await.map(drop)
 }
 
 /// Checks that `actor` may create a file named `name`, opened in `editor`, of `size` bytes
@@ -1384,6 +1664,11 @@ async fn commit(
             site_groups: if plan.site_groups { actor_id } else { None },
             document: plan.document,
             copies: &plan.copies,
+            documents: &plan.documents,
+            external_library: plan.external_library,
+            source_items: &plan.source_items,
+            external_items: &plan.external_items,
+            bulk_create: plan.external_library.is_some(),
             needs_below: plan.needs_below,
             as_if_live: plan.as_if_live,
             sites: &plan.site_rows,
@@ -1418,8 +1703,15 @@ async fn commit(
                 return Err(AccessError::Db(error));
             }
             // Git does not hold a new file's editor: new files are taken back.
-            let taken_back = (plan.document.is_none() && plan.copies.is_empty())
-                || take_back_all(state, author.clone(), &plan.message, undo).await;
+            // An external creation batch is one logical operation even when it contains only
+            // folders. Never repair part of a refused batch node by node: remove the whole Git
+            // batch, leaving the next listing to retry it atomically.
+            let taken_back = if plan.take_back_on_failure || plan.external_library.is_some() {
+                take_back_all(state, author.clone(), &plan.message, undo).await
+            } else {
+                (plan.document.is_none() && plan.copies.is_empty() && plan.documents.is_empty())
+                    || take_back_all(state, author.clone(), &plan.message, undo).await
+            };
             let ids: Vec<Uuid> = plan
                 .records
                 .iter()

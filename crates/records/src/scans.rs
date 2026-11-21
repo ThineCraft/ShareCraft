@@ -580,6 +580,11 @@ impl Db {
             "select d.id, b.scan, b.scan_detail, b.scan_hold from documents d \
              join blob_refs r on r.doc_id = d.id and r.revision = d.revision and not r.pending \
              join blobs b on b.sha256 = r.sha256 \
+             where d.id = any($1) and b.scan not in ('clean', 'released', 'unscanned') \
+             union \
+             select d.id, b.scan, b.scan_detail, b.scan_hold from documents d \
+             join source_items i on i.node_id = d.id \
+             join blobs b on b.sha256 = i.content_sha256 \
              where d.id = any($1) and b.scan not in ('clean', 'released', 'unscanned')",
         )
         .bind(&ids)
@@ -682,13 +687,19 @@ impl Db {
     ) -> Result<Vec<DueScan>, DbError> {
         let rows: Vec<(String, i64, Option<String>)> = sqlx::query_as(
             "select b.sha256, b.size, \
-                    (select d.name from blob_refs r join documents d on d.id = r.doc_id \
-                     where r.sha256 = b.sha256 order by r.id desc limit 1) \
+                    coalesce( \
+                        (select d.name from blob_refs r join documents d on d.id = r.doc_id \
+                         where r.sha256 = b.sha256 order by r.id desc limit 1), \
+                        (select n.name from source_items i join nodes n on n.id = i.node_id \
+                         where i.content_sha256 = b.sha256 \
+                         order by i.read_at desc nulls last, i.modified_at desc, i.node_id \
+                         limit 1)) \
              from blobs b \
              where b.scan in ('pending', 'failed') \
                and coalesce(b.next_scan_at, '-infinity') <= $1 \
                and (exists (select 1 from blob_refs r where r.sha256 = b.sha256) \
-                    or exists (select 1 from brand_refs p where p.sha256 = b.sha256)) \
+                    or exists (select 1 from brand_refs p where p.sha256 = b.sha256) \
+                    or exists (select 1 from source_cache c where c.sha256 = b.sha256)) \
              order by b.scan_hold desc, b.next_scan_at nulls first, b.sha256 limit $2",
         )
         .bind(now)
@@ -718,7 +729,8 @@ impl Db {
                  scan_hold = false \
              where b.scan = 'unscanned' \
                and (exists (select 1 from blob_refs r where r.sha256 = b.sha256) \
-                    or exists (select 1 from brand_refs p where p.sha256 = b.sha256))",
+                    or exists (select 1 from brand_refs p where p.sha256 = b.sha256) \
+                    or exists (select 1 from source_cache c where c.sha256 = b.sha256))",
         )
         .execute(self.pool())
         .await?;
@@ -788,10 +800,15 @@ impl Db {
     /// The live or binned documents whose current version names the content `sha256`.
     pub async fn documents_naming(&self, sha256: &[u8; 32]) -> Result<Vec<HeldDocument>, DbError> {
         let rows: Vec<(uuid::Uuid, String, bool)> = sqlx::query_as(
-            "select n.id, n.name, n.deleted_at is not null from documents d \
-             join blob_refs r on r.doc_id = d.id and r.revision = d.revision and not r.pending \
-             join nodes n on n.id = d.id \
-             where r.sha256 = $1 order by n.name, n.id",
+            "select id, name, deleted from ( \
+                 select n.id, n.name, n.deleted_at is not null as deleted from documents d \
+                 join blob_refs r on r.doc_id = d.id and r.revision = d.revision and not r.pending \
+                 join nodes n on n.id = d.id where r.sha256 = $1 \
+                 union \
+                 select n.id, n.name, n.deleted_at is not null as deleted from documents d \
+                 join source_items i on i.node_id = d.id \
+                 join nodes n on n.id = d.id where i.content_sha256 = $1 \
+             ) named order by name, id",
         )
         .bind(hex(sha256))
         .fetch_all(self.pool())

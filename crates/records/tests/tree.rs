@@ -7,7 +7,7 @@
 
 use collab_core::ids::NodeId;
 use records::test_support::TestDb;
-use records::{AccessError, NodeKind, NodeRow, validate_node_name};
+use records::{AccessError, NodeChange, NodeKind, NodeRow, validate_node_name};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -93,6 +93,34 @@ async fn site_rows_start_as_scopes() {
     let (site, library) = site_and_library(&test).await;
     assert!(test.db.node(site).await.unwrap().unwrap().unique_scope);
     assert!(!test.db.node(library).await.unwrap().unwrap().unique_scope);
+}
+
+#[tokio::test]
+async fn bulk_create_chunks_node_inserts_past_the_postgres_bind_limit() {
+    let test = TestDb::create().await;
+    let (site, library) = site_and_library(&test).await;
+    let rows: Vec<_> = (0..5_100)
+        .map(|number| {
+            row(
+                id(),
+                NodeKind::Folder,
+                Some(library),
+                site,
+                &format!("Folder {number:04}"),
+            )
+        })
+        .collect();
+
+    test.db
+        .apply_nodes(NodeChange {
+            rows: &rows,
+            bulk_create: true,
+            ..NodeChange::default()
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(test.db.live_children(library).await.unwrap().len(), 5_100);
 }
 
 #[tokio::test]

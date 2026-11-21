@@ -32,7 +32,7 @@ use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
 use crate::AppState;
-use crate::api::content::{blocking, file_answer, preview_answer};
+use crate::api::content::{blocking, current_content, file_answer, preview_answer};
 use crate::api::nodes::{ChildrenPage, ChildrenQuery, node_id, rfc3339};
 use crate::api::{ApiError, recheck_below, recheck_person, to_completion};
 use crate::auth::{MaybeSigned, Signed};
@@ -273,10 +273,13 @@ async fn content(
     let node = reached_id(&node)?;
     let document = reached_document(&state, &token, node).await?;
     let doc = document.id;
-    match blocking(&state, move |store| store.load(doc)).await? {
-        Some(stored) => file_answer(&state, &document.name, stored, headers.get(RANGE)).await,
-        None => Ok(StatusCode::NO_CONTENT.into_response()),
-    }
+    file_answer(
+        &state,
+        &document.name,
+        current_content(&state, doc).await?,
+        headers.get(RANGE),
+    )
+    .await
 }
 
 /// `GET /api/l/{token}/preview/{node}`: a file's preview as of its last saved revision, by the

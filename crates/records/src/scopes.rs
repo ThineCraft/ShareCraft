@@ -282,12 +282,13 @@ pub(crate) fn children_query(after: bool) -> String {
     };
     format!(
         "with recursive {REACH} \
-         select {NODE_COLUMNS}, d.editor, d.revised_at, \
+         select {NODE_COLUMNS}, d.editor, coalesce(d.revised_at, si.modified_at) as revised_at, \
                 (case when n.kind = 'document' then 1 else 0 end)::int2 as kind_rank, \
                 g.perms, g.role_ids, g.role_names \
          from nodes n \
          {MINE_ON_N} \
          left join documents d on d.id = n.id and n.kind = 'document' \
+         left join source_items si on si.node_id = n.id \
          where n.parent_id = $2 and n.deleted_at is null {from_cursor} \
            and ($3 \
                 or (case when n.unique_scope then g.perms is not null else $4 end) \

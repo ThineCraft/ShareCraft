@@ -5,15 +5,17 @@
 //!
 //! A secret is stored as ciphertext only. The key that seals it lives outside the database.
 
-use collab_core::ids::{NodeId, UserId};
-use sqlx::Row;
+use collab_core::ids::{DocId, NodeId, UserId};
+use serde_json::json;
 use sqlx::postgres::PgRow;
+use sqlx::{PgConnection, Postgres, QueryBuilder, Row};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use crate::events::{NewEvent, record};
 use crate::libraries::ensure_library_row;
 use crate::quotas::recompute_site_usage;
-use crate::{AccessError, Db, DbError};
+use crate::{AccessError, Db, DbError, Editor, SharePath};
 
 /// PostgreSQL's code for a row a check constraint refuses.
 const CHECK_VIOLATION: &str = "23514";
@@ -62,6 +64,7 @@ impl std::fmt::Debug for SealedRow {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SourceKind {
     Github,
+    Share,
 }
 
 impl SourceKind {
@@ -70,6 +73,7 @@ impl SourceKind {
     pub fn as_str(self) -> &'static str {
         match self {
             SourceKind::Github => "github",
+            SourceKind::Share => "share",
         }
     }
 
@@ -78,6 +82,35 @@ impl SourceKind {
     pub fn parse(word: &str) -> Option<SourceKind> {
         match word {
             "github" => Some(SourceKind::Github),
+            "share" => Some(SourceKind::Share),
+            _ => None,
+        }
+    }
+}
+
+/// Whether a file-share source may be changed through ShareCraft.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceMode {
+    ReadWrite,
+    ReadOnly,
+}
+
+impl SourceMode {
+    /// The word for the mode, as stored.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SourceMode::ReadWrite => "read_write",
+            SourceMode::ReadOnly => "read_only",
+        }
+    }
+
+    /// The mode named `word`.
+    #[must_use]
+    pub fn parse(word: &str) -> Option<SourceMode> {
+        match word {
+            "read_write" => Some(SourceMode::ReadWrite),
+            "read_only" => Some(SourceMode::ReadOnly),
             _ => None,
         }
     }
@@ -139,6 +172,9 @@ pub struct NewSource {
     pub branch: String,
     /// A folder of the repository; empty for the whole repository.
     pub folder: String,
+    /// The approved root of a file-share source; absent for GitHub.
+    pub location: Option<String>,
+    pub mode: SourceMode,
     /// The sealed access token, for a private repository.
     pub token: Option<SecretId>,
     /// Seconds between polls, from 60 to 86 400.
@@ -156,6 +192,8 @@ pub struct SourceConfig {
     pub repo: String,
     pub branch: String,
     pub folder: String,
+    pub location: Option<String>,
+    pub mode: SourceMode,
     pub token: Option<SecretId>,
     pub webhook_secret: Option<SecretId>,
     pub poll_seconds: u32,
@@ -183,6 +221,10 @@ pub struct SourceStatus {
     pub bytes: i64,
     /// Entries not mirrored.
     pub hidden: i64,
+    /// Source-specific detail behind `hidden`; empty for sources without detail.
+    pub hidden_detail: serde_json::Value,
+    /// The next scheduled source check, when the source has its own schedule.
+    pub next_check_at: Option<OffsetDateTime>,
 }
 
 /// A new status for [`Db::set_source_status`]: every field is written as given.
@@ -235,9 +277,154 @@ pub struct SourceItemLocation {
     pub deleted: bool,
 }
 
+/// A file-share listing entry to attach to an existing tree node.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExternalEntry {
+    pub node: NodeId,
+    pub path: String,
+    pub repository_path: String,
+    pub size: u64,
+    pub mtime_ns: i64,
+}
+
+/// Why the bytes of an external item cannot currently be read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unavailable {
+    Denied,
+    Gone,
+    TooLarge,
+    Locked,
+}
+
+/// Writes every source row belonging to a tree batch through the tree projection's existing
+/// transaction. Folders use `items`; external documents use `external` so their revision and
+/// modified time are established atomically with their node and document rows.
+pub(crate) async fn record_source_items_with(
+    conn: &mut PgConnection,
+    library: NodeId,
+    items: &[SourceItem],
+    external: &[ExternalEntry],
+) -> Result<(), DbError> {
+    if !items.is_empty() {
+        let mut query = QueryBuilder::<Postgres>::new(
+            "insert into source_items \
+             (library_id, path, repository_path, node_id, blob_sha, size) ",
+        );
+        query.push_values(items, |mut values, item| {
+            values
+                .push_bind(library.0)
+                .push_bind(&item.path)
+                .push_bind(&item.repository_path)
+                .push_bind(item.node.0)
+                .push_bind(&item.blob_sha)
+                .push_bind(item.size);
+        });
+        query.build().execute(&mut *conn).await?;
+    }
+    if !external.is_empty() {
+        let values: Vec<_> = external
+            .iter()
+            .map(|entry| {
+                let size = i64::try_from(entry.size).map_err(DbError::new)?;
+                let modified =
+                    OffsetDateTime::from_unix_timestamp_nanos(i128::from(entry.mtime_ns))
+                        .map_err(DbError::new)?;
+                Ok((
+                    entry,
+                    external_tag(entry.size, entry.mtime_ns),
+                    size,
+                    new_external_revision(),
+                    modified,
+                ))
+            })
+            .collect::<Result<Vec<_>, DbError>>()?;
+        let mut query = QueryBuilder::<Postgres>::new(
+            "insert into source_items \
+             (library_id, path, repository_path, node_id, blob_sha, size, revision, modified_at) ",
+        );
+        query.push_values(
+            &values,
+            |mut row, (entry, tag, size, revision, modified)| {
+                row.push_bind(library.0)
+                    .push_bind(&entry.path)
+                    .push_bind(&entry.repository_path)
+                    .push_bind(entry.node.0)
+                    .push_bind(tag)
+                    .push_bind(*size)
+                    .push_bind(revision)
+                    .push_bind(*modified);
+            },
+        );
+        query.build().execute(&mut *conn).await?;
+    }
+    Ok(())
+}
+
+impl Unavailable {
+    fn as_str(self) -> &'static str {
+        match self {
+            Unavailable::Denied => "denied",
+            Unavailable::Gone => "gone",
+            Unavailable::TooLarge => "too_large",
+            Unavailable::Locked => "locked",
+        }
+    }
+
+    fn parse(word: &str) -> Option<Unavailable> {
+        match word {
+            "denied" => Some(Unavailable::Denied),
+            "gone" => Some(Unavailable::Gone),
+            "too_large" => Some(Unavailable::TooLarge),
+            "locked" => Some(Unavailable::Locked),
+            _ => None,
+        }
+    }
+}
+
+/// A live document backed by a file-share source.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExternalItem {
+    pub library: NodeId,
+    pub node: NodeId,
+    pub location: String,
+    pub repository_path: String,
+    pub size: u64,
+    pub mtime_ns: i64,
+    pub tag: String,
+    pub revision: String,
+    pub sha256: Option<[u8; 32]>,
+    pub unavailable: Option<Unavailable>,
+}
+
+/// The compact change-detection tag stored in `source_items.blob_sha`.
+#[must_use]
+pub fn external_tag(size: u64, mtime_ns: i64) -> String {
+    format!("x{size}-{mtime_ns}")
+}
+
+/// A random, lower-case 40-hex revision id for pages and file sessions.
+#[must_use]
+pub fn new_external_revision() -> String {
+    let random = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    random.chars().take(40).collect()
+}
+
 /// The turn to sync one library (see [`Db::try_lock_source`]); dropping it gives the turn up.
 pub struct SourceLock {
     _tx: sqlx::Transaction<'static, sqlx::Postgres>,
+}
+
+/// The organisation-wide turn that serialises approved-root changes with file-share
+/// connection commits. Dropping it rolls its otherwise empty transaction back and releases
+/// the PostgreSQL advisory lock.
+pub struct ShareConnectionLock {
+    tx: sqlx::Transaction<'static, sqlx::Postgres>,
+}
+
+impl std::fmt::Debug for ShareConnectionLock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ShareConnectionLock")
+    }
 }
 
 impl std::fmt::Debug for SourceLock {
@@ -246,9 +433,10 @@ impl std::fmt::Debug for SourceLock {
     }
 }
 
-const SOURCE_COLUMNS: &str = "library_id, kind, owner, repo, branch, folder, token_secret, \
-    webhook_secret, poll_seconds, connected_by, state, last_commit, etag, last_checked_at, \
-    last_synced_at, last_error, retry_at, files, bytes, hidden";
+const SOURCE_COLUMNS: &str = "library_id, kind, owner, repo, branch, folder, location, mode, \
+    token_secret, webhook_secret, poll_seconds, connected_by, state, last_commit, etag, \
+    last_checked_at, last_synced_at, last_error, retry_at, files, bytes, hidden, hidden_detail, \
+    next_check_at";
 
 /// `from … where …` for the connections whose library is live in a live site that is not
 /// archived and whose retry time (`$1` is now) has passed or is unset; the caller adds more
@@ -267,6 +455,7 @@ fn decode(what: &str, value: &str) -> sqlx::Error {
 fn source_from_row(row: &PgRow) -> Result<(SourceConfig, SourceStatus), sqlx::Error> {
     let kind: String = row.try_get("kind")?;
     let state: String = row.try_get("state")?;
+    let mode: String = row.try_get("mode")?;
     let poll: i32 = row.try_get("poll_seconds")?;
     let token: Option<Uuid> = row.try_get("token_secret")?;
     let webhook: Option<Uuid> = row.try_get("webhook_secret")?;
@@ -277,6 +466,8 @@ fn source_from_row(row: &PgRow) -> Result<(SourceConfig, SourceStatus), sqlx::Er
         repo: row.try_get("repo")?,
         branch: row.try_get("branch")?,
         folder: row.try_get("folder")?,
+        location: row.try_get("location")?,
+        mode: SourceMode::parse(&mode).ok_or_else(|| decode("source mode", &mode))?,
         token: token.map(SecretId),
         webhook_secret: webhook.map(SecretId),
         poll_seconds: u32::try_from(poll).map_err(|e| sqlx::Error::Decode(e.into()))?,
@@ -293,6 +484,8 @@ fn source_from_row(row: &PgRow) -> Result<(SourceConfig, SourceStatus), sqlx::Er
         files: row.try_get("files")?,
         bytes: row.try_get("bytes")?,
         hidden: row.try_get("hidden")?,
+        hidden_detail: row.try_get("hidden_detail")?,
+        next_check_at: row.try_get("next_check_at")?,
     };
     Ok((config, status))
 }
@@ -311,7 +504,104 @@ fn refused(e: sqlx::Error) -> AccessError {
     }
 }
 
+fn encode_sha256(bytes: &[u8; 32]) -> String {
+    bytes
+        .iter()
+        .fold(String::with_capacity(64), |mut hex, byte| {
+            use std::fmt::Write as _;
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        })
+}
+
+fn decode_sha256(hex: &str) -> Result<[u8; 32], sqlx::Error> {
+    if hex.len() != 64 {
+        return Err(decode("SHA-256", hex));
+    }
+    let bytes = hex
+        .as_bytes()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| {
+            let digits =
+                std::str::from_utf8(pair).map_err(|error| sqlx::Error::Decode(error.into()))?;
+            u8::from_str_radix(digits, 16).map_err(|error| sqlx::Error::Decode(error.into()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    bytes.try_into().map_err(|_| decode("SHA-256", hex))
+}
+
+fn external_mtime(tag: &str) -> Result<i64, sqlx::Error> {
+    let (_, mtime) = tag
+        .strip_prefix('x')
+        .and_then(|rest| rest.split_once('-'))
+        .ok_or_else(|| decode("external tag", tag))?;
+    mtime
+        .parse()
+        .map_err(|error| sqlx::Error::Decode(Box::new(error)))
+}
+
 impl Db {
+    /// Takes the organisation-wide file-share connection/settings turn, waiting at most `wait`
+    /// for it. `None` when another holder kept it for longer: the caller answers with a
+    /// retryable refusal instead of holding a pool connection indefinitely. The wait is enforced
+    /// by PostgreSQL's `lock_timeout`, local to this turn's transaction.
+    pub async fn lock_share_connections(
+        &self,
+        wait: std::time::Duration,
+    ) -> Result<Option<ShareConnectionLock>, DbError> {
+        let mut tx = self.pool().begin().await?;
+        let millis = wait.as_millis().clamp(1, u128::from(u32::MAX));
+        sqlx::query("select set_config('lock_timeout', $1, true)")
+            .bind(format!("{millis}ms"))
+            .execute(&mut *tx)
+            .await?;
+        match sqlx::query("select pg_advisory_xact_lock(hashtextextended('share-connection', 0))")
+            .execute(&mut *tx)
+            .await
+        {
+            Ok(_) => {}
+            Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("55P03") => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
+        }
+        // The timeout bounded only the wait for this turn; later statements on it are not
+        // subject to it.
+        sqlx::query("select set_config('lock_timeout', '0', true)")
+            .execute(&mut *tx)
+            .await?;
+        Ok(Some(ShareConnectionLock { tx }))
+    }
+
+    /// The lexical locations of every connected share, read without the connection turn. A
+    /// caller resolves them outside the turn and compares again under it with
+    /// [`Db::share_locations_locked`].
+    pub async fn share_locations(&self) -> Result<Vec<String>, DbError> {
+        Ok(sqlx::query_scalar(
+            "select location from library_sources \
+             where kind = 'share' and location is not null",
+        )
+        .fetch_all(self.pool())
+        .await?)
+    }
+
+    /// The lexical locations of the other connected shares while this turn is held.
+    pub async fn share_locations_locked(
+        &self,
+        lock: &mut ShareConnectionLock,
+        except: NodeId,
+    ) -> Result<Vec<String>, DbError> {
+        Ok(sqlx::query_scalar(
+            "select location from library_sources \
+             where kind = 'share' and library_id <> $1 and location is not null",
+        )
+        .bind(except.0)
+        .fetch_all(&mut *lock.tx)
+        .await?)
+    }
+
     /// Stores a sealed secret and returns its id. A secret with no ciphertext is refused: only
     /// sealed bytes belong here.
     pub async fn put_secret(&self, s: &SealedRow) -> Result<SecretId, DbError> {
@@ -365,10 +655,59 @@ impl Db {
     /// `LibraryNotEmpty` if anything not in the bin is in it; `SourceExists` if it is connected
     /// already.
     pub async fn connect_source(&self, s: &NewSource) -> Result<(), AccessError> {
+        self.connect_source_inner(s, true).await
+    }
+
+    /// Connects while the caller holds [`ShareConnectionLock`]. The caller has already checked
+    /// canonical exclusivity; the lexical check remains as defence in depth.
+    pub async fn connect_source_locked(
+        &self,
+        _lock: &mut ShareConnectionLock,
+        s: &NewSource,
+    ) -> Result<(), AccessError> {
+        self.connect_source_inner(s, false).await
+    }
+
+    async fn connect_source_inner(
+        &self,
+        s: &NewSource,
+        take_share_lock: bool,
+    ) -> Result<(), AccessError> {
         if !poll_ok(s.poll_seconds) {
             return Err(AccessError::InvalidSetting);
         }
+        let share_location = match s.kind {
+            SourceKind::Github => None,
+            SourceKind::Share => Some(
+                SharePath::parse(s.location.as_deref().ok_or(AccessError::InvalidSetting)?)
+                    .map_err(|_| AccessError::InvalidSetting)?,
+            ),
+        };
         let mut tx = self.pool().begin().await?;
+        if let Some(share_location) = &share_location {
+            if take_share_lock {
+                sqlx::query(
+                    "select pg_advisory_xact_lock(hashtextextended('share-connection', 0))",
+                )
+                .execute(&mut *tx)
+                .await?;
+            }
+            let locations: Vec<Option<String>> = sqlx::query_scalar(
+                "select location from library_sources \
+                 where kind = 'share' and library_id <> $1",
+            )
+            .bind(s.library.0)
+            .fetch_all(&mut *tx)
+            .await?;
+            for location in locations {
+                let location =
+                    SharePath::parse(location.as_deref().ok_or(AccessError::InvalidSetting)?)
+                        .map_err(|_| AccessError::InvalidSetting)?;
+                if share_location.is_within(&location) || location.is_within(share_location) {
+                    return Err(AccessError::ShareLocationInUse);
+                }
+            }
+        }
         let node: Option<(String, Option<OffsetDateTime>, Uuid)> =
             sqlx::query_as("select kind, deleted_at, site_id from nodes where id = $1 for update")
                 .bind(s.library.0)
@@ -397,17 +736,28 @@ impl Db {
         if occupied {
             return Err(AccessError::LibraryNotEmpty);
         }
+        let (owner, repo, branch, folder) = match s.kind {
+            SourceKind::Github => (
+                s.owner.as_str(),
+                s.repo.as_str(),
+                s.branch.as_str(),
+                s.folder.as_str(),
+            ),
+            SourceKind::Share => ("", "", "", ""),
+        };
         sqlx::query(
             "insert into library_sources (library_id, kind, owner, repo, branch, folder, \
-                 token_secret, poll_seconds, connected_by) \
-             values ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                 location, mode, token_secret, poll_seconds, connected_by) \
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
         )
         .bind(s.library.0)
         .bind(s.kind.as_str())
-        .bind(&s.owner)
-        .bind(&s.repo)
-        .bind(&s.branch)
-        .bind(&s.folder)
+        .bind(owner)
+        .bind(repo)
+        .bind(branch)
+        .bind(folder)
+        .bind(&s.location)
+        .bind(s.mode.as_str())
         .bind(s.token.map(|t| t.0))
         .bind(i32::try_from(s.poll_seconds).map_err(|_| AccessError::InvalidSetting)?)
         .bind(s.connected_by.0)
@@ -488,8 +838,9 @@ impl Db {
         let done = sqlx::query(
             "update library_sources set state = $2, last_commit = $3, etag = $4, \
                  last_checked_at = $5, last_synced_at = $6, last_error = $7, retry_at = $8, \
-                 files = $9, bytes = $10, hidden = $11 \
-             where library_id = $1 and ($12::bigint is null or generation = $12)",
+                 files = $9, bytes = $10, hidden = $11, hidden_detail = $12, \
+                 next_check_at = $13 \
+             where library_id = $1 and ($14::bigint is null or generation = $14)",
         )
         .bind(library.0)
         .bind(u.state.as_str())
@@ -502,6 +853,8 @@ impl Db {
         .bind(u.files)
         .bind(u.bytes)
         .bind(u.hidden)
+        .bind(&u.hidden_detail)
+        .bind(u.next_check_at)
         .bind(generation)
         .execute(self.pool())
         .await?;
@@ -595,7 +948,8 @@ impl Db {
     pub async fn requeue_source(&self, library: NodeId, etag: Option<&str>) -> Result<(), DbError> {
         sqlx::query(
             "update library_sources set state = 'connecting', last_checked_at = null, \
-                 retry_at = null, last_error = null, etag = coalesce($2, etag) \
+                 next_check_at = null, retry_at = null, last_error = null, \
+                 etag = coalesce($2, etag) \
              where library_id = $1",
         )
         .bind(library.0)
@@ -620,6 +974,8 @@ impl Db {
                               then state else 'connecting' end, \
                  last_checked_at = case when state = 'rate_limited' and retry_at > $3 \
                                         then last_checked_at else null end, \
+                 next_check_at = case when state = 'rate_limited' and retry_at > $3 \
+                                      then next_check_at else null end, \
                  retry_at = case when state = 'rate_limited' and retry_at > $3 \
                                  then retry_at else null end, \
                  last_error = case when state = 'rate_limited' and retry_at > $3 \
@@ -711,6 +1067,7 @@ impl Db {
                  webhook_secret = case when $7 then $8 else webhook_secret end, \
                  last_commit = case when $9 then null else last_commit end, \
                  etag = case when $9 then null else etag end, \
+                 last_checked_at = null, next_check_at = null, \
                  generation = generation + 1 \
              where library_id = $1",
         )
@@ -728,6 +1085,277 @@ impl Db {
         .map_err(refused)?;
         tx.commit().await?;
         Ok(gone)
+    }
+
+    /// Atomically records the file-share metadata for `e`. A new content tag receives a new
+    /// external revision and forgets content learned for the old tag. If reconcile restored the
+    /// node from Git after a crashed creation batch, its missing document row is restored as an
+    /// ordinary external file in this transaction too.
+    pub async fn record_external_item(
+        &self,
+        library: NodeId,
+        e: &ExternalEntry,
+    ) -> Result<(), DbError> {
+        let size = i64::try_from(e.size).map_err(DbError::new)?;
+        let modified = OffsetDateTime::from_unix_timestamp_nanos(i128::from(e.mtime_ns))
+            .map_err(DbError::new)?;
+        let tag = external_tag(e.size, e.mtime_ns);
+        let revision = new_external_revision();
+        let mut tx = self.pool().begin().await?;
+        sqlx::query(
+            "delete from source_items where library_id = $1 and node_id = $2 \
+             and repository_path <> $3",
+        )
+        .bind(library.0)
+        .bind(e.node.0)
+        .bind(&e.repository_path)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "insert into source_items \
+                 (library_id, path, repository_path, node_id, blob_sha, size, revision, \
+                  modified_at) \
+             values ($1, $2, $3, $4, $5, $6, $7, $8) \
+             on conflict (library_id, repository_path) do update set \
+                 path = excluded.path, node_id = excluded.node_id, size = excluded.size, \
+                 modified_at = excluded.modified_at, \
+                 revision = case when source_items.blob_sha is not distinct from excluded.blob_sha \
+                                 then source_items.revision else excluded.revision end, \
+                 content_sha256 = case when source_items.blob_sha is not distinct from excluded.blob_sha \
+                                       then source_items.content_sha256 else null end, \
+                 read_at = case when source_items.blob_sha is not distinct from excluded.blob_sha \
+                                then source_items.read_at else null end, \
+                 unavailable = case when source_items.blob_sha is not distinct from excluded.blob_sha \
+                                    then source_items.unavailable else null end, \
+                 blob_sha = excluded.blob_sha, missing_since = null",
+        )
+        .bind(library.0)
+        .bind(&e.path)
+        .bind(&e.repository_path)
+        .bind(e.node.0)
+        .bind(tag)
+        .bind(size)
+        .bind(revision)
+        .bind(modified)
+        .execute(&mut *tx)
+        .await?;
+        let restored: Option<(String, Option<Uuid>)> = sqlx::query_as(
+            "select name, created_by from nodes where id = $1 and kind = 'document' \
+             and not exists (select 1 from documents where id = $1)",
+        )
+        .bind(e.node.0)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some((name, created_by)) = restored {
+            let editor = Editor::for_file_name(&name);
+            let inserted = sqlx::query(
+                "insert into documents (id, name, editor, created_by) values ($1, $2, $3, $4) \
+                 on conflict (id) do nothing",
+            )
+            .bind(e.node.0)
+            .bind(&name)
+            .bind(editor.id())
+            .bind(created_by)
+            .execute(&mut *tx)
+            .await?;
+            if inserted.rows_affected() == 1 {
+                record(
+                    &mut tx,
+                    NewEvent {
+                        kind: "document.created",
+                        actor: created_by.map(UserId),
+                        subject: None,
+                        document: Some(DocId(e.node.0)),
+                        node: Some(e.node),
+                        detail: json!({
+                            "name": name,
+                            "editor": editor.id(),
+                            "uploaded": true,
+                            "bytes": e.size,
+                        }),
+                    },
+                )
+                .await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// The external metadata for a live share-backed document.
+    pub async fn external_item(&self, node: NodeId) -> Result<Option<ExternalItem>, DbError> {
+        let row = sqlx::query(
+            "select i.library_id, i.node_id, s.location, i.repository_path, i.size, \
+                    i.blob_sha, i.revision, i.content_sha256, i.unavailable \
+             from source_items i \
+             join library_sources s on s.library_id = i.library_id and s.kind = 'share' \
+             join nodes n on n.id = i.node_id \
+             where i.node_id = $1 and n.kind = 'document' and n.deleted_at is null",
+        )
+        .bind(node.0)
+        .fetch_optional(self.pool())
+        .await?;
+        row.map(|row| {
+            let size: i64 = row.try_get("size")?;
+            let tag: String = row.try_get("blob_sha")?;
+            let sha: Option<String> = row.try_get("content_sha256")?;
+            let unavailable: Option<String> = row.try_get("unavailable")?;
+            Ok::<_, sqlx::Error>(ExternalItem {
+                library: NodeId(row.try_get("library_id")?),
+                node: NodeId(row.try_get("node_id")?),
+                location: row.try_get("location")?,
+                repository_path: row.try_get("repository_path")?,
+                size: u64::try_from(size).map_err(|error| sqlx::Error::Decode(error.into()))?,
+                mtime_ns: external_mtime(&tag)?,
+                tag,
+                revision: row.try_get("revision")?,
+                sha256: sha.as_deref().map(decode_sha256).transpose()?,
+                unavailable: unavailable
+                    .as_deref()
+                    .map(|word| {
+                        Unavailable::parse(word)
+                            .ok_or_else(|| decode("external unavailability", word))
+                    })
+                    .transpose()?,
+            })
+        })
+        .transpose()
+        .map_err(DbError::from)
+    }
+
+    /// Records materialised content only if `tag` is still the item's current tag, returning its
+    /// revision. Content that changed without a new tag atomically receives a new revision.
+    pub async fn set_external_content(
+        &self,
+        node: NodeId,
+        tag: &str,
+        sha256: &[u8; 32],
+        at: OffsetDateTime,
+    ) -> Result<Option<String>, DbError> {
+        let revision = sqlx::query_scalar(
+            "update source_items set \
+                 revision = case when content_sha256 is not null and content_sha256 <> $3 \
+                                 then $5 else revision end, \
+                 content_sha256 = $3, read_at = $4, unavailable = null \
+             where node_id = $1 and blob_sha = $2 returning revision",
+        )
+        .bind(node.0)
+        .bind(tag)
+        .bind(encode_sha256(sha256))
+        .bind(at)
+        .bind(new_external_revision())
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(revision)
+    }
+
+    /// Moves an external item's stat and revision only if `old_tag` is still current.
+    pub async fn set_external_stat(
+        &self,
+        node: NodeId,
+        old_tag: &str,
+        size: u64,
+        mtime_ns: i64,
+    ) -> Result<bool, DbError> {
+        let stored_size = i64::try_from(size).map_err(DbError::new)?;
+        let modified = OffsetDateTime::from_unix_timestamp_nanos(i128::from(mtime_ns))
+            .map_err(DbError::new)?;
+        let done = sqlx::query(
+            "update source_items set blob_sha = $3, size = $4, modified_at = $5, revision = $6, \
+                 content_sha256 = null, read_at = null, unavailable = null, missing_since = null \
+             where node_id = $1 and blob_sha = $2",
+        )
+        .bind(node.0)
+        .bind(old_tag)
+        .bind(external_tag(size, mtime_ns))
+        .bind(stored_size)
+        .bind(modified)
+        .bind(new_external_revision())
+        .execute(self.pool())
+        .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    /// Changes an external item's availability only if `tag` is still current.
+    pub async fn set_external_unavailable(
+        &self,
+        node: NodeId,
+        tag: &str,
+        reason: Option<Unavailable>,
+    ) -> Result<bool, DbError> {
+        let done = sqlx::query(
+            "update source_items set unavailable = $3 where node_id = $1 and blob_sha = $2",
+        )
+        .bind(node.0)
+        .bind(tag)
+        .bind(reason.map(Unavailable::as_str))
+        .execute(self.pool())
+        .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    /// Notes the listed nodes missing and answers those whose grace period has elapsed.
+    pub async fn note_missing(
+        &self,
+        library: NodeId,
+        nodes: &[NodeId],
+        now: OffsetDateTime,
+        grace: time::Duration,
+    ) -> Result<Vec<NodeId>, DbError> {
+        let ids: Vec<Uuid> = nodes.iter().map(|node| node.0).collect();
+        let cutoff = now - grace;
+        let missing: Vec<Uuid> = sqlx::query_scalar(
+            "with noted as ( \
+                 update source_items set missing_since = coalesce(missing_since, $3) \
+                 where library_id = $1 and node_id = any($2) returning node_id, missing_since \
+             ) select node_id from noted where missing_since <= $4 order by node_id",
+        )
+        .bind(library.0)
+        .bind(&ids)
+        .bind(now)
+        .bind(cutoff)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(missing.into_iter().map(NodeId).collect())
+    }
+
+    /// Clears the missing marker from every tracked item except `still_missing`.
+    pub async fn clear_missing_except(
+        &self,
+        library: NodeId,
+        still_missing: &[NodeId],
+    ) -> Result<(), DbError> {
+        let ids: Vec<Uuid> = still_missing.iter().map(|node| node.0).collect();
+        sqlx::query(
+            "update source_items set missing_since = null \
+             where library_id = $1 and not (node_id = any($2))",
+        )
+        .bind(library.0)
+        .bind(&ids)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
+    /// Records share-listing scheduling and hidden detail at one generation.
+    pub async fn record_listing(
+        &self,
+        library: NodeId,
+        generation: i64,
+        next_check_at: Option<OffsetDateTime>,
+        hidden_detail: &serde_json::Value,
+    ) -> Result<bool, DbError> {
+        let done = sqlx::query(
+            "update library_sources set next_check_at = $3, hidden_detail = $4 \
+             where library_id = $1 and generation = $2",
+        )
+        .bind(library.0)
+        .bind(generation)
+        .bind(next_check_at)
+        .bind(hidden_detail)
+        .execute(self.pool())
+        .await?;
+        Ok(done.rows_affected() > 0)
     }
 
     /// The items of `library`, by path.
@@ -808,6 +1436,18 @@ impl Db {
                  values ($1, $2, $3, $4, $5, $6) \
                  on conflict (library_id, repository_path) do update set \
                      path = excluded.path, node_id = excluded.node_id, \
+                     revision = case when source_items.blob_sha is not distinct from excluded.blob_sha \
+                                     then source_items.revision else null end, \
+                     modified_at = case when source_items.blob_sha is not distinct from excluded.blob_sha \
+                                        then source_items.modified_at else null end, \
+                     content_sha256 = case when source_items.blob_sha is not distinct from excluded.blob_sha \
+                                           then source_items.content_sha256 else null end, \
+                     read_at = case when source_items.blob_sha is not distinct from excluded.blob_sha \
+                                    then source_items.read_at else null end, \
+                     unavailable = case when source_items.blob_sha is not distinct from excluded.blob_sha \
+                                        then source_items.unavailable else null end, \
+                     missing_since = case when source_items.blob_sha is not distinct from excluded.blob_sha \
+                                         then source_items.missing_since else null end, \
                      blob_sha = excluded.blob_sha, size = excluded.size",
             )
             .bind(library.0)
@@ -846,6 +1486,18 @@ impl Db {
              values ($1, $2, $3, $4, $5, $6) \
              on conflict (library_id, repository_path) do update set \
                  path = excluded.path, node_id = excluded.node_id, \
+                 revision = case when source_items.blob_sha is not distinct from excluded.blob_sha \
+                                 then source_items.revision else null end, \
+                 modified_at = case when source_items.blob_sha is not distinct from excluded.blob_sha \
+                                    then source_items.modified_at else null end, \
+                 content_sha256 = case when source_items.blob_sha is not distinct from excluded.blob_sha \
+                                       then source_items.content_sha256 else null end, \
+                 read_at = case when source_items.blob_sha is not distinct from excluded.blob_sha \
+                                then source_items.read_at else null end, \
+                 unavailable = case when source_items.blob_sha is not distinct from excluded.blob_sha \
+                                    then source_items.unavailable else null end, \
+                 missing_since = case when source_items.blob_sha is not distinct from excluded.blob_sha \
+                                     then source_items.missing_since else null end, \
                  blob_sha = excluded.blob_sha, size = excluded.size",
         )
         .bind(library.0)
@@ -888,8 +1540,10 @@ impl Db {
         let ids: Vec<Uuid> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "select s.library_id {SYNCABLE} \
                and s.state in ('connecting', 'ok', 'rate_limited', 'failed') \
-               and (s.last_checked_at is null \
-                    or s.last_checked_at + make_interval(secs => s.poll_seconds) <= $1) \
+               and (coalesce(s.next_check_at, \
+                             s.last_checked_at + make_interval(secs => s.poll_seconds)) is null \
+                    or coalesce(s.next_check_at, \
+                                s.last_checked_at + make_interval(secs => s.poll_seconds)) <= $1) \
              order by s.last_checked_at asc nulls first, s.library_id \
              limit $2"
         )))
@@ -1055,30 +1709,59 @@ impl Db {
     /// had no connection.
     pub async fn disconnect_source(&self, library: NodeId) -> Result<Vec<SecretId>, DbError> {
         let mut tx = self.pool().begin().await?;
-        let row: Option<(Option<Uuid>, Option<Uuid>, Uuid)> = sqlx::query_as(
-            "select s.token_secret, s.webhook_secret, n.site_id from library_sources s \
-             join nodes n on n.id = s.library_id where s.library_id = $1 for update of s",
-        )
-        .bind(library.0)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let Some((token, webhook, site)) = row else {
-            return Ok(Vec::new());
-        };
-        sqlx::query("delete from source_items where library_id = $1")
-            .bind(library.0)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("delete from library_sources where library_id = $1")
-            .bind(library.0)
-            .execute(&mut *tx)
-            .await?;
-        recompute_site_usage(&mut tx, NodeId(site)).await?;
+        let secrets = disconnect_in(&mut tx, library).await?;
         tx.commit().await?;
-        Ok([token, webhook]
-            .into_iter()
-            .flatten()
-            .map(SecretId)
-            .collect())
+        Ok(secrets)
     }
+
+    /// [`Db::disconnect_source`] for `actor`, whose `manage_access` on `library` is judged again
+    /// in the same transaction as the disconnect: a revocation after the route's own check
+    /// still stops it. `NotFound` when `actor` cannot see the library; the access's refusal
+    /// when they see it without `manage_access`.
+    pub async fn disconnect_source_as(
+        &self,
+        actor: UserId,
+        library: NodeId,
+    ) -> Result<Vec<SecretId>, AccessError> {
+        let mut tx = self.pool().begin().await?;
+        match crate::scopes::access_in(&mut tx, actor, library).await? {
+            None => return Err(AccessError::NotFound),
+            Some(held) if !held.can_manage_access() => return Err(held.refusal()),
+            Some(_) => {}
+        }
+        let secrets = disconnect_in(&mut tx, library).await?;
+        tx.commit().await?;
+        Ok(secrets)
+    }
+}
+
+/// Removes the connection of `library` and its item rows on `conn`, returning its secrets.
+async fn disconnect_in(
+    conn: &mut PgConnection,
+    library: NodeId,
+) -> Result<Vec<SecretId>, sqlx::Error> {
+    let row: Option<(Option<Uuid>, Option<Uuid>, Uuid)> = sqlx::query_as(
+        "select s.token_secret, s.webhook_secret, n.site_id from library_sources s \
+         join nodes n on n.id = s.library_id where s.library_id = $1 for update of s",
+    )
+    .bind(library.0)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some((token, webhook, site)) = row else {
+        return Ok(Vec::new());
+    };
+    sqlx::query("delete from source_items where library_id = $1")
+        .bind(library.0)
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query("delete from library_sources where library_id = $1")
+        .bind(library.0)
+        .execute(&mut *conn)
+        .await?;
+    recompute_site_usage(conn, NodeId(site)).await?;
+    Ok([token, webhook]
+        .into_iter()
+        .flatten()
+        .map(SecretId)
+        .collect())
 }

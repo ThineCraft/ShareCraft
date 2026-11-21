@@ -384,10 +384,15 @@ export function parseLiveEditorMessage(prefix, data) {
       if (!bytes || !sessionData) return null;
       return { kind: 'checkpoint', ticket: data.ticket, at: data.at, base: data.base, bytes, sessionData, sha256: data.sha256 };
     }
-    case 'hash':
-      return shortText(data.ticket, MAX_TICKET_CHARS) && position(data.at) && typeof data.sha256 === 'string' && SHA256.test(data.sha256)
-        ? { kind: 'hash', ticket: data.ticket, at: data.at, sha256: data.sha256 }
-        : null;
+    case 'hash': {
+      if (!shortText(data.ticket, MAX_TICKET_CHARS) || !position(data.at)) return null;
+      if (typeof data.sha256 !== 'string' || !SHA256.test(data.sha256)) return null;
+      // The server needs the identity data's hash too (G4). An editor that does not send it
+      // yet is passed through as it is, and the server refuses the hash.
+      if (data.sessionSha256 === undefined) return { kind: 'hash', ticket: data.ticket, at: data.at, sha256: data.sha256 };
+      if (typeof data.sessionSha256 !== 'string' || !SHA256.test(data.sessionSha256)) return null;
+      return { kind: 'hash', ticket: data.ticket, at: data.at, sha256: data.sha256, sessionSha256: data.sessionSha256 };
+    }
     case 'notice': {
       const notice = cleanNotice(data.notice);
       return notice ? { kind: 'notice', notice } : null;
@@ -676,11 +681,12 @@ export function connectLive(frame, bridge, docId, handlers = {}) {
     if (response?.ok !== true) send(JSON.stringify({ type: 'checkpoint_failed', ticket }));
   };
 
-  const hash = async ({ ticket, at, sha256 }) => {
+  const hash = async ({ ticket, at, sha256, sessionSha256 }) => {
+    const body = sessionSha256 === undefined ? { ticket, at, sha256 } : { ticket, at, sha256, session_sha256: sessionSha256 };
     const response = await fetchFrom('/live-checkpoint/hash', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ ticket, at, sha256 }),
+      body: JSON.stringify(body),
     });
     if (response?.ok !== true) send(JSON.stringify({ type: 'checkpoint_failed', ticket }));
   };

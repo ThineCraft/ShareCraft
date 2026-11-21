@@ -16,7 +16,7 @@ use collab_core::ids::{DocId, GroupId, NodeId, UserId};
 use protocol::RemovedReason;
 use records::{
     Access, AccessError, AssignmentView, Crumb, Cursor, Db, Editor, LibraryKind, LinkKind, Listed,
-    Node, NodeKind, Perms, Principal, PrincipalView, RoleRef, User,
+    Node, NodeKind, Perms, Principal, PrincipalView, RoleRef, SourceKind, User,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -314,6 +314,12 @@ pub(crate) struct ChildOut {
     /// Absent otherwise. Whether one can be made still depends on its bytes.
     #[serde(skip_serializing_if = "Option::is_none")]
     thumbnail: Option<bool>,
+    /// `true` when this file's bytes live on a file share.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    external: Option<bool>,
+    /// Why an external file cannot currently be read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unavailable: Option<&'static str>,
 }
 
 impl From<Listed> for ChildOut {
@@ -330,6 +336,8 @@ impl From<Listed> for ChildOut {
             scan: None,
             threat: None,
             thumbnail: None,
+            external: None,
+            unavailable: None,
         }
     }
 }
@@ -373,6 +381,16 @@ impl ChildrenPage {
                 .ok()
                 .and_then(|id| marks.remove(&DocId(id)));
             (item.scan, item.threat) = super::docs::scan_fields(mark);
+            if item.kind == NodeKind::Document
+                && let Ok(id) = Uuid::parse_str(&item.id)
+                && let Some(external) = db
+                    .external_item(NodeId(id))
+                    .await
+                    .map_err(|e| ApiError::unavailable(&e))?
+            {
+                item.external = Some(true);
+                item.unavailable = external.unavailable.map(super::docs::unavailable_name);
+            }
         }
         let Some((library, org)) = tree::policies_at(db, parent).await? else {
             return Ok(self);
@@ -644,6 +662,7 @@ pub(crate) async fn copy_one(
     parent: NodeId,
     name: Option<String>,
 ) -> Result<Copied, ApiError> {
+    require_share_copyable_for(state.db(), actor.id, id).await?;
     let applied = tree::apply(state, actor, TreeOp::Copy { id, parent, name })
         .await
         .map_err(|e| match e {
@@ -652,6 +671,37 @@ pub(crate) async fn copy_one(
             e => e.into(),
         })?;
     Ok(Copied::from(applied))
+}
+
+/// Refuses Phase 1 copies out of file-share libraries, while preserving GitHub's existing copy
+/// behavior. Access is checked before the source kind is disclosed.
+async fn require_share_copyable_for(db: &Db, user: UserId, node: NodeId) -> Result<(), ApiError> {
+    let Some(library) = db
+        .source_library_of(node)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?
+    else {
+        return Ok(());
+    };
+    let Some((source, _)) = db
+        .source_of(library)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?
+    else {
+        return Ok(());
+    };
+    if source.kind != SourceKind::Share {
+        return Ok(());
+    }
+    if db
+        .effective_access(user, node)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?
+        .is_none()
+    {
+        return Err(ApiError::NotFound);
+    }
+    Err(ApiError::SourceCopyUnavailable)
 }
 
 impl From<tree::Applied> for Copied {

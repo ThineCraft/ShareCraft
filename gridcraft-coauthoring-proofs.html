@@ -23,11 +23,11 @@ tbody tr:nth-child(even)>td,tbody tr:nth-child(even)>th{background:light-dark(#f
 <p class="eyebrow">ThineCraft / ShareCraft report</p>
 <h1>GridCraft co-authoring: the proofs</h1>
 <p class="lede">Before anything is built for live co-authoring in GridCraft, plan G1 tested the four things the adopted design rests on (C16, “proofs first”). This report gives each result, its evidence, and a recommendation: go, with conditions.</p>
-<div class="meta"><span>Version 0.2 · G3 results added</span><span>19 November 2026</span><span>Reports against <a href="co-authoring-approach.html" style="color:inherit">co-authoring-approach.html</a> v1.3 (C1, C5, C7, C9, C12, C16, section 12) and <a href="sequencing.html" style="color:inherit">sequencing.html</a> (Stage 2 editor track)</span></div>
+<div class="meta"><span>Version 0.3 · G4 results added</span><span>19 November 2026</span><span>Reports against <a href="co-authoring-approach.html" style="color:inherit">co-authoring-approach.html</a> v1.3 (C1, C5, C7, C9, C12, C16, section 12) and <a href="sequencing.html" style="color:inherit">sequencing.html</a> (Stage 2 editor track)</span></div>
 </header>
 <div class="layout">
 <nav aria-label="Report contents"><p>In this report</p>
-<a href="#verdict">01 · Recommendation</a><a href="#results">02 · The four proofs</a><a href="#engines">03 · Two engines</a><a href="#platforms">04 · Desktop and browser</a><a href="#save">05 · Save and reopen</a><a href="#timing">06 · Rollback and re-run</a><a href="#selection">07 · Commands that read the selection</a><a href="#audit">08 · Determinism audit</a><a href="#fixes">09 · Engine fixes made</a><a href="#conditions">10 · Conditions for G3 to G5</a><a href="#notproved">11 · Not proved</a><a href="#decisions">12 · Decisions asked</a><a href="#evidence">13 · Evidence and commits</a><a href="#changes02">Changes in v0.2</a>
+<a href="#verdict">01 · Recommendation</a><a href="#results">02 · The four proofs</a><a href="#engines">03 · Two engines</a><a href="#platforms">04 · Desktop and browser</a><a href="#save">05 · Save and reopen</a><a href="#timing">06 · Rollback and re-run</a><a href="#selection">07 · Commands that read the selection</a><a href="#audit">08 · Determinism audit</a><a href="#fixes">09 · Engine fixes made</a><a href="#conditions">10 · Conditions for G3 to G5</a><a href="#notproved">11 · Not proved</a><a href="#decisions">12 · Decisions asked</a><a href="#evidence">13 · Evidence and commits</a><a href="#changes02">Changes in v0.2</a><a href="#changes03">Changes in v0.3</a>
 </nav>
 <main id="main">
 <div class="toolbar"><span class="small">Standalone HTML · Print-ready · No external assets</span><button type="button" onclick="window.print()">Print / Save PDF</button></div>
@@ -173,7 +173,8 @@ tbody tr:nth-child(even)>td,tbody tr:nth-child(even)>th{background:light-dark(#f
 <tr><td>Clock, random state and year-less dates carried in the command or the agreed state.</td><td>G3</td><td><strong>Met.</strong> <code>entry_stamp_controls_now_and_rand</code>, <code>snapshot_restores_rand_state</code>, <code>yearless_date_uses_the_sent_year</code>, <code>filter_criteria_read_year_less_dates_in_the_stamped_year</code>, and <code>guarded_undo_and_redo_calculate_under_the_entry_stamp</code>.</td></tr>
 <tr><td>A test that rolling back and re-applying gives the same workbook as applying straight through.</td><td>G3</td><td><strong>Met.</strong> <code>rollback_rerun_matches_straight_through</code> covers ordinary, structural and volatile entries, including Undo and Redo.</td></tr>
 <tr><td>Agreement checks across platforms use entered content only.</td><td>G3</td><td><strong>Met.</strong> <code>agreement_digest_is_entered_only</code>, <code>cross_platform_agreement_uses_entered_digest</code>, and <code>rows_hidden_by_a_filter_are_not_entered_content</code>. Computed values remain diagnostic only.</td></tr>
-<tr><td>Checkpoints load with a full recalculation; fix the row-height loss (8 of 10,000); save deletion ownership with checkpoint identities.</td><td>G4</td><td><strong>Open.</strong> G3 has no checkpoint path. I8 is carried to G4.</td></tr>
+<tr><td>Checkpoints load with a full recalculation; fix the row-height loss (8 of 10,000); save deletion ownership with checkpoint identities.</td><td>G4</td><td><strong>Met in the fork.</strong> <code>checkpoint_load_recalculates_every_formula</code>, <code>checkpoint_load_stamps_the_first_iterative_calculation</code> and <code>checkpoint_reload_preserves_wrapped_formula_row_height</code> (the G1 loss, no longer ignored); <code>checkpoint_session_data_restores_deletion_ownership</code> and <code>grid_checkpoint_bytes_are_deterministic</code> (I8). Ordinary edits outside live sessions keep their old row behaviour: <code>ordinary_edit_does_not_fit_unrelated_formulas_or_change_saved_rows</code>. Fork commits <code>c0531b13</code>, <code>70dd423c</code>, <code>83561f76</code> on <code>coauthor-g4</code>.</td></tr>
+<tr><td>Prove second-writer bytes: two fresh editors load the same base, replay the same entries and write identical SHA-256; one checkpoint plus the changes after it equals straight-through; native and browser builds agree on entered content after a checkpoint.</td><td>G4</td><td><strong>Open.</strong> Plan G4 Task 12 names these fork tests; they are not written. The ShareCraft server compares hashes only, so it does not depend on them, but they are what make a peer check meaningful.</td></tr>
 <tr><td>Use one maths library in desktop and browser builds so last-digit computed results agree.</td><td>G4 / after G5</td><td><strong>Open.</strong> Until then, room agreement remains entered content only and desktop joining remains subject to C16.</td></tr>
 <tr><td>Re-run the browser checks and timings in real browsers (Chrome, Edge, Firefox), connect the host and bound fragmented identity-table work.</td><td>G5</td><td><strong>Open.</strong> I7 and the user-facing browser/desktop path belong to G5.</td></tr>
 </tbody></table></div>
@@ -183,7 +184,7 @@ tbody tr:nth-child(even)>td,tbody tr:nth-child(even)>th{background:light-dark(#f
 <ul>
 <li>Real browsers: every browser-build result ran under Node.</li>
 <li>Linux and macOS desktops.</li>
-<li>Clients that loaded a checkpoint; G3 proves rollback/re-run against straight-through application only from its in-process shared state.</li>
+<li>Clients that loaded a checkpoint, beyond the G4 fork tests in section 10: equal hashes from two fresh editors, and checkpoint-plus-suffix against straight-through, are not proved yet.</li>
 <li>Expensive-formula workbooks outside the G3 follow-up’s deliberately heavy 20,000-formula, one-80-cell-block workload.</li>
 <li>A 1-ULP difference at a rounding boundary changing a comparison or a displayed value.</li>
 <li>Why the browser build is faster than the desktop.</li>
@@ -191,7 +192,7 @@ tbody tr:nth-child(even)>td,tbody tr:nth-child(even)>th{background:light-dark(#f
 <h3>Open items after G3</h3>
 <ul>
 <li><strong>I7 · G5:</strong> identity tables grow and become expensive under fragmentation; index and share them, and cap distinct structural blocks.</li>
-<li><strong>I8 · G4:</strong> deletion ownership is not saved with checkpoint identities, so a checkpoint-loaded client cannot safely prove a structural Undo.</li>
+<li><strong>I8 · G4:</strong> closed in G4. Deletion ownership is saved with checkpoint identities (section 10).</li>
 <li><strong>Maths library:</strong> the last-digit desktop/browser differences in section 04 remain open.</li>
 <li><strong>Pre-existing GridCraft gates:</strong> clippy at <code>apps/gridcraft-cli/src/check.rs:281</code>, <code>complex_numbers</code>, <code>caret_after_typing_arabic_is_drawn_at_its_left_end</code>, and the stale keytips table all fail at the fork’s G3 base as well as at its tip.</li>
 </ul>
@@ -227,7 +228,11 @@ tbody tr:nth-child(even)>td,tbody tr:nth-child(even)>th{background:light-dark(#f
 <p>Version 0.2 adds the reviewed G3 results from the GridCraft fork (19 November 2026). It marks the G3-owned conditions met with their tests, adds the heavier-formula workload and timings, and carries the checkpoint, fragmented-identity, maths-library and pre-existing gate findings forward. It does not change the G1 measurements or the original go-with-conditions recommendation.</p>
 </section>
 
-<footer><p>ShareCraft · GridCraft co-authoring proofs (plans G1 and G3) · Version 0.2 · 19 November 2026</p></footer>
+<section id="changes03"><h2>Changes in version 0.3</h2>
+<p>Version 0.3 adds the G4 checkpoint results from the GridCraft fork (19 November 2026). Checkpoints now load with a full recalculation, the G1 row-height loss is fixed and its test runs, and deletion ownership travels with the checkpoint identities. The fork gate run for G4 Task 12 (<code>cargo test -p gridcraft-engine --test it coauthor_</code> on <code>coauthor-g5</code> at <code>70dac9e9</code>, which contains G4) passed 173 tests with 3 ignored release-only tests. Still open: the second-writer and checkpoint-plus-suffix proofs, entered-content agreement after a checkpoint between the native and browser builds, one maths library, real browsers and the G5 host bridge. The G1 measurements and the recommendation are unchanged.</p>
+</section>
+
+<footer><p>ShareCraft · GridCraft co-authoring proofs (plans G1, G3 and G4) · Version 0.3 · 19 November 2026</p></footer>
 </main>
 </div>
 </body>

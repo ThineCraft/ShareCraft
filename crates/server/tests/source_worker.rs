@@ -1409,6 +1409,8 @@ async fn webhook_works_through_the_trusted_proxy_in_production_mode() {
         repo: REPO.to_owned(),
         branch: "main".to_owned(),
         folder: String::new(),
+        location: None,
+        mode: records::SourceMode::ReadOnly,
         token: None,
         poll_seconds: 300,
         connected_by: ada.id,

@@ -335,11 +335,13 @@ fn config(data_dir: &Path, db: &TestDb) -> Config {
         live_checkpoint_quiet: Duration::from_secs(15),
         live_checkpoint_wait: Duration::from_secs(120),
         live_ticket_lifetime: Duration::from_secs(120),
+        live_limits: Default::default(),
         database_url: server::config::DatabaseUrl::new(db.url()),
         editors_dir: data_dir.join("editors"),
         max_file_bytes: 64 << 20,
         upload_idle: Duration::from_secs(60),
         github_api: server::config::DEFAULT_GITHUB_API.to_owned(),
+        source_create_batch_size: server::config::DEFAULT_SOURCE_CREATE_BATCH_SIZE,
     }
 }
 

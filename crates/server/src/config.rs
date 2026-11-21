@@ -22,6 +22,23 @@ pub const DEFAULT_EDITORS: &str = "./editors";
 pub const DEFAULT_MAX_FILE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 /// GitHub's API address, used when `SHARECRAFT_GITHUB_API` is not set.
 pub const DEFAULT_GITHUB_API: &str = "https://api.github.com";
+/// Tree nodes a file-share sync creates in one Git commit and PostgreSQL transaction.
+pub const DEFAULT_SOURCE_CREATE_BATCH_SIZE: usize = 200;
+/// Largest safe file-share creation batch. This keeps allocations bounded and leaves the
+/// records layer comfortably below PostgreSQL's 65,535 bind-parameter limit.
+pub const MAX_SOURCE_CREATE_BATCH_SIZE: usize = 1_000;
+
+/// Coerces a configured file-share creation batch to the supported inclusive range 1..=1,000.
+#[must_use]
+pub const fn normalize_source_create_batch_size(value: usize) -> usize {
+    if value == 0 {
+        1
+    } else if value > MAX_SOURCE_CREATE_BATCH_SIZE {
+        MAX_SOURCE_CREATE_BATCH_SIZE
+    } else {
+        value
+    }
+}
 
 /// How the server runs.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -56,6 +73,8 @@ pub struct Config {
     pub live_checkpoint_wait: Duration,
     /// How long a live checkpoint ticket can be used.
     pub live_ticket_lifetime: Duration,
+    /// How much unsaved live work a document may hold before it warns and pauses.
+    pub live_limits: LiveLimits,
     /// The PostgreSQL database holding accounts, sessions and access grants.
     pub database_url: DatabaseUrl,
     /// Where the built editors are installed, one folder per editor, served at `/editors`.
@@ -69,6 +88,9 @@ pub struct Config {
     /// unless `SHARECRAFT_GITHUB_API` names another (a plain `http://` address only then, for
     /// a test server). People using ShareCraft never choose it.
     pub github_api: String,
+    /// Maximum tree nodes a file-share sync creates in one batch. GitHub and HTTP tree writes
+    /// do not use this setting.
+    pub source_create_batch_size: usize,
 }
 
 /// A database URL. It usually holds a password, so `Debug` never shows it.
@@ -185,6 +207,12 @@ fn live_editors_from(value: Option<&str>) -> Result<Vec<Editor>, ConfigError> {
 }
 
 impl Config {
+    /// The configured file-share creation batch, normalized to the documented safe range.
+    #[must_use]
+    pub(crate) const fn normalized_source_create_batch_size(&self) -> usize {
+        normalize_source_create_batch_size(self.source_create_batch_size)
+    }
+
     /// Reads `SHARECRAFT_ADDR`, `SHARECRAFT_DATA`, `SHARECRAFT_WEB`, `SHARECRAFT_EDITORS_DIR` and
     /// `SHARECRAFT_MAX_FILE_BYTES` and `SHARECRAFT_GITHUB_API`, using the defaults for any that
     /// are unset, and `DATABASE_URL`, which is required.
@@ -296,11 +324,13 @@ impl Config {
             live_checkpoint_quiet: crate::live_room::CHECKPOINT_QUIET,
             live_checkpoint_wait: crate::live_room::CHECKPOINT_WAIT,
             live_ticket_lifetime: crate::live_room::TICKET_LIFETIME,
+            live_limits: LiveLimits::default(),
             database_url,
             editors_dir: PathBuf::from(editors_dir.unwrap_or(DEFAULT_EDITORS)),
             max_file_bytes,
             upload_idle: Duration::from_secs(60),
             github_api: DEFAULT_GITHUB_API.to_owned(),
+            source_create_batch_size: DEFAULT_SOURCE_CREATE_BATCH_SIZE,
         })
     }
 }
@@ -382,6 +412,31 @@ fn read_var(name: &'static str) -> Result<Option<String>, ConfigError> {
     }
 }
 
+/// How much unsaved work a live log may hold since its verified base, counted in entries
+/// (cancel records included) and payload bytes. At a warning threshold the room asks for a
+/// checkpoint at once; at a hard limit it pauses new changes until a checkpoint is verified.
+/// The same limits bound the catch-up a joining client is sent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LiveLimits {
+    pub warn_entries: u64,
+    pub warn_bytes: u64,
+    pub hard_entries: u64,
+    pub hard_bytes: u64,
+}
+
+impl Default for LiveLimits {
+    /// The adopted values (plan G4, proposal 2): warn at 4,000 entries or 48 MiB, pause at
+    /// 5,000 entries or 64 MiB.
+    fn default() -> Self {
+        Self {
+            warn_entries: 4_000,
+            warn_bytes: 48 * 1024 * 1024,
+            hard_entries: 5_000,
+            hard_bytes: 64 * 1024 * 1024,
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -427,6 +482,15 @@ mod tests {
         assert_eq!(c.editors_dir, PathBuf::from("./editors"));
         assert_eq!(c.max_file_bytes, 10 * 1024 * 1024 * 1024);
         assert_eq!(c.github_api, "https://api.github.com");
+        assert_eq!(c.source_create_batch_size, DEFAULT_SOURCE_CREATE_BATCH_SIZE);
+    }
+
+    #[test]
+    fn source_create_batch_size_is_normalized_to_the_safe_range() {
+        assert_eq!(normalize_source_create_batch_size(0), 1);
+        assert_eq!(normalize_source_create_batch_size(1), 1);
+        assert_eq!(normalize_source_create_batch_size(1_000_000), 1_000);
+        assert_eq!(normalize_source_create_batch_size(usize::MAX), 1_000);
     }
 
     #[test]

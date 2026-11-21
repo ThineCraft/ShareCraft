@@ -229,7 +229,13 @@ pub(crate) async fn record(
     if let Some(blob) = blob {
         record_ref(db, doc, blob, revision).await;
     }
-    if !appended {
+    // A live checkpoint records its own row; the list needs no rebuild for it.
+    let recorded = !appended
+        && db
+            .is_recorded_head(doc, &revision.to_string(), parent.as_deref())
+            .await
+            .map_err(|e| e.to_string())?;
+    if !appended && !recorded {
         replace_from_git(store, db, doc).await?;
     }
     Ok(())

@@ -287,6 +287,8 @@ test('malformed_live_messages_are_ignored', () => {
     { ...checkpoint, base: 5 },
     { type: 'gridcraft:live-hash', ticket: TICKET, at: 4 },
     { type: 'gridcraft:live-hash', ticket: TICKET, at: -4, sha256: SHA },
+    { type: 'gridcraft:live-hash', ticket: TICKET, at: 4, sha256: SHA, sessionSha256: 'ab' },
+    { type: 'gridcraft:live-hash', ticket: TICKET, at: 4, sha256: SHA, sessionSha256: 7 },
     { type: 'gridcraft:live-notice' },
     { type: 'gridcraft:live-notice', notice: { read_only: true } },
     { type: 'gridcraft:live-notice', notice: ['kind'] },
@@ -491,6 +493,19 @@ test('hash_is_posted_for_a_verify_ticket', async () => {
   assert.equal(call.init.method, 'POST');
   assert.equal(call.init.headers['content-type'], 'application/json');
   assert.deepEqual(JSON.parse(call.init.body), { ticket: TICKET, at: 7, sha256: SHA });
+  assert.equal(socket().sent.length, 0);
+});
+
+test('hash_carries_the_identity_data_hash_when_the_editor_gives_it', async () => {
+  const { page, fetched, socket } = live({
+    routes: { '/api/docs/doc-1/live-checkpoint/hash': new Response(null, { status: 202 }) },
+  });
+  const session = 'cd'.repeat(32);
+  page.fromEditor({ type: 'gridcraft:live-hash', ticket: TICKET, at: 7, sha256: SHA, sessionSha256: session });
+  await settle();
+  const call = fetched.calls.at(-1);
+  assert.equal(call.url, '/api/docs/doc-1/live-checkpoint/hash');
+  assert.deepEqual(JSON.parse(call.init.body), { ticket: TICKET, at: 7, sha256: SHA, session_sha256: session });
   assert.equal(socket().sent.length, 0);
 });
 

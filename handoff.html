@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ShareCraft handoff</title>
+<style>
+  :root { --bg:#fff; --fg:#1d1d1f; --muted:#5b5b66; --line:#d9d9e0; --band:#f3f4f8; --head:#e6e8f0; --accent:#2457c5; color-scheme: light; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#16171b; --fg:#e8e8ec; --muted:#a3a3ad; --line:#33343c; --band:#1f2026; --head:#2a2c34; --accent:#8fb0ff; color-scheme: dark; } }
+  body { margin:0; padding:2rem 1rem; background:var(--bg); color:var(--fg); font:15px/1.55 system-ui, sans-serif; }
+  main { max-width: 64rem; margin: 0 auto; }
+  h1 { font-size:1.7rem; margin:0 0 .3rem; } h2 { font-size:1.2rem; margin:2.2rem 0 .6rem; border-bottom:1px solid var(--line); padding-bottom:.3rem; }
+  p.note { color:var(--muted); margin-top:0; }
+  .wrap { overflow-x:auto; }
+  table { border-collapse:collapse; width:100%; margin:.4rem 0 1rem; }
+  th, td { text-align:left; vertical-align:top; padding:.45rem .6rem; border-bottom:1px solid var(--line); }
+  th { background:var(--head); }
+  tbody tr:nth-child(even) td { background:var(--band); }
+  code { font-family: ui-monospace, Consolas, monospace; font-size:.92em; }
+  ul.banded { list-style:none; padding:0; } ul.banded li { padding:.35rem .6rem; } ul.banded li:nth-child(even) { background:var(--band); }
+</style>
+</head>
+<body>
+<main>
+<h1>ShareCraft handoff</h1>
+<p class="note">Written 20 November 2026 and updated after the release to <code>main</code> (5411a7b), for whoever (person or coding agent) picks the work up next. It describes the state at the time of writing; check <code>git log</code> and each plan's ledger for anything newer.</p>
+
+<h2>Where everything is</h2>
+<div class="wrap"><table>
+<thead><tr><th>Folder</th><th>Branch</th><th>Used for</th></tr></thead>
+<tbody>
+<tr><td><code>H:\Source\repos\ThineCraft\ShareCraft</code></td><td>gridcraft-coauthoring-g4</td><td>Main checkout. G4 is finished here; holds the G3, G4 and G5 ledgers.</td></tr>
+<tr><td><code>…\ShareCraft-release</code></td><td>release-integration</td><td>The release that became <code>main</code> (5411a7b, pushed 20 November 2026). Start new work from <code>main</code>.</td></tr>
+<tr><td><code>…\ShareCraft-g5</code></td><td>gridcraft-coauthoring-g5</td><td>G5 ShareCraft tasks (pushed at 37779d5; later commits are local).</td></tr>
+<tr><td><code>…\ShareCraft-fileshare</code></td><td>fileshare-surfacing</td><td>File Share surfacing (Windows UNC and drive paths, and Linux paths including mounted SMB shares). Pushed.</td></tr>
+<tr><td><code>…\ShareCraft-s3</code></td><td>s3-surfacing</td><td>S3 surfacing, built on File Share.</td></tr>
+<tr><td><code>…\ShareCraft-ci</code></td><td>ci-parallel</td><td>The parallel GitHub check (pushed; merged into the release).</td></tr>
+<tr><td><code>…\ShareCraft-github</code>, <code>…-production</code>, <code>…-s3-design</code></td><td>various</td><td>Older work; GitHub surfacing is already in main.</td></tr>
+<tr><td><code>H:\Source\repos\ThineCraft\GridCraft</code></td><td>coauthor-g5</td><td>The GridCraft fork (spreadsheet editor). See its <code>AGENTS.md</code>.</td></tr>
+</tbody></table></div>
+<p>Each plan's ledger is <code>.superpowers/sdd/&lt;plan file&gt;/progress.md</code> in the folder that runs it. Git ignores <code>.superpowers</code>, so it exists only on this PC. Reviews, briefs and reports sit beside each ledger. GridCraft's equivalents are in its git-ignored <code>plan/</code> folder.</p>
+
+<h2>State of each track</h2>
+<div class="wrap"><table>
+<thead><tr><th>Track</th><th>Plan</th><th>State</th><th>Next</th></tr></thead>
+<tbody>
+<tr><td>Release</td><td>—</td><td>Done. <code>main</code> = <code>origin/main</code> = 5411a7b (G4, G5 switched off, File Share Tasks 1–9 off until a folder is approved, S3 signing, the parallel check, this handoff). GitHub run 44676640425 passed on Linux. Unfinished features are off by default (see below). A Windows zip from 5411a7b is being built into <code>J:\sharecraft-package</code>.</td><td>New work branches start from <code>main</code>. Older work branches (g4, g5, fileshare, s3) are all contained in <code>main</code>; keep using them only for their remaining tasks and merge <code>main</code> into them first.</td></tr>
+<tr><td>G3 – GridCraft co-authoring core</td><td><code>plans/2026-11-18-gridcraft-coauthoring-g3.html</code></td><td>Done and reviewed. Fork PR <code>ThineCraft/GridCraft#2</code> (coauthor-g3 → sharecraft) is open.</td><td>Owner to merge the fork PR.</td></tr>
+<tr><td>G4 – verified live checkpoints</td><td><code>plans/2026-11-18-gridcraft-coauthoring-g4.html</code></td><td>Done: all 12 tasks, per-task reviews, final whole-branch review and its fix wave (ShareCraft 9652112; fork 1fe2fd16 and b77cc005 on coauthor-g5). In the release.</td><td>Nothing; parked minors are listed in <code>final-review.md</code> and <code>final-fix-report.md</code>.</td></tr>
+<tr><td>G5 – live editing on screen</td><td><code>plans/2026-11-19-gridcraft-coauthoring-g5.html</code></td><td>Done: ShareCraft Tasks 1–4, 12, 13; fork Tasks 9–11. In the release but switched off.</td><td>Task 7 (fork pins ShareCraft by git revision; pin the new <code>main</code>), then Task 8 (fork identity tables and axis compaction), Tasks 5 and 6 (join base, the switch), 14, 15, then the G5 final review.</td></tr>
+<tr><td>File Share surfacing</td><td><code>plans/2026-11-17-file-share-surfacing.html</code></td><td>Tasks 1–9 done, plus the Linux fixes found by the first Linux run (to 750c144). Off until an administrator approves a folder.</td><td>Task 10 of 27, which also takes the Linux duplicate-share fix (compare the folder's device and inode at connect, because SMB mounts ignore letter case). Its migration is now <code>0022</code> (renumbered in the release); later File Share migrations take the next free number, not the plan's 0021. Plan steps written for Windows only (for example the Recycle Bin for deletes) need a Linux equivalent.</td></tr>
+<tr><td>S3 surfacing</td><td><code>plans/2026-11-18-s3-surfacing.html</code> (in the S3 worktree)</td><td>Task 2 (SigV4 signing) done. Library only.</td><td>Task 3. Builds on File Share.</td></tr>
+<tr><td>Build speed</td><td>—</td><td>Parallel GitHub check done.</td><td>Combine the 69 server/records integration test files into one test program per crate; use <code>rust-lld</code>; set dev debug info to line tables only.</td></tr>
+</tbody></table></div>
+
+<h2>Decisions made in conversation (not yet everywhere in the plans)</h2>
+<div class="wrap"><table>
+<thead><tr><th>Decision</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td>A lone editor pauses at 5,000 unsaved changes and resumes after its own "sole-editor" checkpoint.</td><td>A pause the user can never leave is worse than a checkpoint no second person checked.</td></tr>
+<tr><td>A checkpoint dispute never makes either side's copy the trusted one: both copies are kept as versions, the last agreed base is restored, and the live session ends.</td><td>A hostile peer must never be able to promote its own bytes.</td></tr>
+<tr><td>One dispute stop per person per document per hour; a repeat excludes both people involved from <em>verifying</em> for 24 hours (from writing only while someone else can write).</td><td>Bounds disputes as a way to disrupt a room, without leaving a room unable to save.</td></tr>
+<tr><td>Checkpoints are verified only by a different person on the same build; the verifier also hashes the identity data.</td><td>Desktop and browser maths differ in the last digit; tabs of one person are not independent.</td></tr>
+<tr><td>During a pause, changes are held, never refused and rolled back.</td><td>Nothing a person saw is lost.</td></tr>
+<tr><td>Desktop GridCraft builds are refused in shared rooms for now.</td><td>Only the browser build is proven identical between peers.</td></tr>
+<tr><td>GitHub Actions runs the full test suite; local machines run only the tests for what changed.</td><td>The PC was saturated by parallel builds.</td></tr>
+<tr><td>Codex is not used unless the owner asks again.</td><td>Owner's instruction, 19 November 2026.</td></tr>
+<tr><td>File Share is not Windows-only: it must work on Linux servers (Linux paths, mounted SMB/CIFS shares) as well as Windows UNC and drive paths. Gaps are closed, never hidden behind <code>cfg(windows)</code>. Off Windows, a UNC or drive path is refused as <code>other_system</code>; <code>/</code> is refused like <code>C:\</code>.</td><td>Owner's decision, 20 November 2026, after the first Linux test run failed 69 share tests.</td></tr>
+<tr><td>The settings audit event for approved share folders keeps the full folder paths.</td><td>It records an administrator's own settings change; an exception to "events carry counts and library-relative paths only". Owner, 20 November 2026.</td></tr>
+<tr><td>The owner is moving day-to-day coding to GitHub Copilot with Claude models; this page and <code>.github/copilot-instructions.md</code> carry the context.</td><td>Owner, 20 November 2026.</td></tr>
+</tbody></table></div>
+
+<h2>Unfinished features and how they stay off</h2>
+<ul class="banded">
+<li><strong>G5 live editing:</strong> the page enters live mode only when the document answer carries <code>session: "live"</code>, which G5 Task 6 adds; <code>Config.live_editors</code> is empty. GridCraft documents open as ordinary file sessions.</li>
+<li><strong>File Share:</strong> the approved roots setting defaults to empty, so every connect is refused; no page uses the File Share routes yet.</li>
+<li><strong>S3:</strong> only the signing library exists; nothing reaches it.</li>
+</ul>
+
+<h2>Open items to remember</h2>
+<ul class="banded">
+<li>Uploading a new version while a live session is open returns a bare 503; G5 should answer "being edited".</li>
+<li>"Download my copy" after a stopped live session needs GridCraft to hand over its bytes on request; it currently hands over nothing in live sessions.</li>
+<li>A column or row can be frozen for a session by heavy insert/delete churn until G5 Task 8 adds compaction of deleted identity runs.</li>
+<li>The client library's <code>Event::Saved</code> does not carry <code>mismatch</code>; the page reads it from the raw frame.</li>
+<li>Development databases that applied an earlier copy of migration 0020 (G4's or File Share's) must be reset.</li>
+<li>Nothing in the live-editing work has been tried in a real browser yet.</li>
+<li>File Share test share: <code>\\NEWHORIZONS\TestShare</code> (read access checked; writing not yet allowed by the owner).</li>
+</ul>
+</main>
+</body>
+</html>

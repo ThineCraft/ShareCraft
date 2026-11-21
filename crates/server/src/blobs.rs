@@ -43,7 +43,7 @@ pub fn blobs_path(data_dir: &Path) -> PathBuf {
 pub(crate) struct Blobs {
     store: BlobStore,
     /// Held shared by a claim, alone by an erasure; see the module documentation.
-    erasing: RwLock<()>,
+    erasing: Arc<RwLock<()>>,
     /// How many [`Held`] there are of each content.
     holds: Mutex<HashMap<[u8; 32], usize>>,
     /// When the sweeper last walked the store's files, as of the time it was given.
@@ -58,9 +58,15 @@ const WALK_EVERY: time::Duration = time::Duration::hours(1);
 /// Content just stored, or found stored, by a write that has not settled what becomes of it:
 /// while this lives, nothing erases it (see the module documentation). Dropping it ends the
 /// hold.
-pub(crate) struct Held {
+pub struct Held {
     blobs: Arc<Blobs>,
     blob: BlobRef,
+}
+
+pub(crate) enum CacheEviction {
+    Held,
+    Removed,
+    Missing,
 }
 
 impl Held {
@@ -108,7 +114,7 @@ impl Blobs {
     pub(crate) fn new(store: BlobStore) -> Self {
         Self {
             store,
-            erasing: RwLock::new(()),
+            erasing: Arc::new(RwLock::new(())),
             holds: Mutex::new(HashMap::new()),
             walked: Mutex::new(None),
             claimed: Notify::new(),
@@ -132,7 +138,7 @@ impl Blobs {
     }
 
     /// Whether some write holds the content `sha256`.
-    fn is_held(&self, sha256: &[u8; 32]) -> bool {
+    pub(crate) fn is_held(&self, sha256: &[u8; 32]) -> bool {
         self.holds
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -208,6 +214,27 @@ impl Blobs {
         self.place_held(blob, move |store| store.place(&tmp, blob))
             .await
             .map_err(|e| e.to_string())
+    }
+
+    /// Streams a blocking reader into the content store, hashing at most `limit` bytes, and
+    /// holds the stored content. The reader and store are used only on a blocking worker.
+    pub(crate) async fn write_reader(
+        self: &Arc<Self>,
+        reader: Box<dyn Read + Send>,
+        limit: u64,
+    ) -> Result<Held, BlobError> {
+        let turn = Arc::clone(&self.erasing).read_owned().await;
+        let blobs = Arc::clone(self);
+        let task = tokio::task::spawn_blocking(move || {
+            let written = blobs.store.write_tmp(reader, limit)?;
+            let (tmp, blob) = written;
+            let held = blobs.hold(blob);
+            let result = blobs.store.place(&tmp, blob).map(|()| held);
+            drop(turn);
+            result
+        });
+        task.await
+            .map_err(|error| BlobError::Io(std::io::Error::other(error)))?
     }
 
     /// Streams `body` into the store, hashing it on the way, keeping no more than a few chunks
@@ -353,6 +380,10 @@ impl Blobs {
         if self.is_held(sha256) {
             return Ok(false);
         }
+        self.erase_unreferenced_locked(db, sha256).await
+    }
+
+    async fn erase_unreferenced_locked(&self, db: &Db, sha256: &[u8; 32]) -> Result<bool, String> {
         // A flag set since the caller looked means a version may name it without a row.
         if db.blob_refs_flagged().await.map_err(|e| e.to_string())? {
             return Ok(false);
@@ -373,6 +404,31 @@ impl Blobs {
             );
         }
         Ok(erased)
+    }
+
+    /// Removes one cache pin and its unreferenced file without allowing a new hold between
+    /// the hold check and erasure. Held content is touched and left pinned.
+    pub(crate) async fn evict_cached(
+        &self,
+        db: &Db,
+        blob: BlobRef,
+    ) -> Result<CacheEviction, String> {
+        let _turn = self.erasing.write().await;
+        if self.is_held(&blob.sha256) {
+            db.pin_cached(&blob, time::OffsetDateTime::now_utc())
+                .await
+                .map_err(|error| error.to_string())?;
+            return Ok(CacheEviction::Held);
+        }
+        if !db
+            .unpin_cached(&blob.sha256)
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            return Ok(CacheEviction::Missing);
+        }
+        let _ = self.erase_unreferenced_locked(db, &blob.sha256).await?;
+        Ok(CacheEviction::Removed)
     }
 }
 

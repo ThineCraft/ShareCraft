@@ -137,7 +137,7 @@ async fn shared_file(server: &TestServer) -> (DocId, TestUser, TestUser, TestUse
 #[tokio::test]
 async fn checkpoint_upload_is_checked_before_body() {
     let server = spawn_server_config(|config| {
-        config.live_editors = vec![records::Editor::GridCraft];
+        common::enable_live_gridcraft(config);
     })
     .await;
     let doc = new_doc();
@@ -170,7 +170,7 @@ async fn checkpoint_upload_is_checked_before_body() {
 #[tokio::test]
 async fn checkpoint_hash_is_checked_before_the_room_compares_it() {
     let server = spawn_server_config(|config| {
-        config.live_editors = vec![records::Editor::GridCraft];
+        common::enable_live_gridcraft(config);
     })
     .await;
     let doc = new_doc();
@@ -179,6 +179,7 @@ async fn checkpoint_hash_is_checked_before_the_room_compares_it() {
     server.create_file_document(doc, &ann).await;
     let _client = common::live::LiveTestClient::connect(&server, doc, &ann, "ann").await;
     let digest = "ab".repeat(32);
+    let session = "cd".repeat(32);
     let hash = |who, body: Value| {
         server
             .http(Some(who))
@@ -187,30 +188,57 @@ async fn checkpoint_hash_is_checked_before_the_room_compares_it() {
             .send()
     };
 
-    for (who, sha256, expected) in [
-        (&ann, digest.clone(), StatusCode::FORBIDDEN),
-        (&vic, digest.clone(), StatusCode::NOT_FOUND),
-        (&ann, digest.to_uppercase(), StatusCode::BAD_REQUEST),
-        (&ann, "ab".repeat(33), StatusCode::BAD_REQUEST),
+    for (who, sha256, session_sha256, expected) in [
+        (&ann, digest.clone(), session.clone(), StatusCode::FORBIDDEN),
+        (&vic, digest.clone(), session.clone(), StatusCode::NOT_FOUND),
+        (
+            &ann,
+            digest.to_uppercase(),
+            session.clone(),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            &ann,
+            "ab".repeat(33),
+            session.clone(),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            &ann,
+            digest.clone(),
+            "cd".repeat(31),
+            StatusCode::BAD_REQUEST,
+        ),
     ] {
         let response = hash(
             who,
-            serde_json::json!({ "ticket": Uuid::new_v4(), "at": 0, "sha256": sha256 }),
+            serde_json::json!({
+                "ticket": Uuid::new_v4(),
+                "at": 0,
+                "sha256": sha256,
+                "session_sha256": session_sha256,
+            }),
         )
         .await
         .unwrap();
         assert_eq!(response.status(), expected);
     }
-    let response = hash(
-        &ann,
-        serde_json::json!({ "ticket": Uuid::new_v4(), "at": 0, "sha256": digest, "computed": "x" }),
-    )
-    .await
-    .unwrap();
-    assert!(
-        response.status().is_client_error(),
-        "only the file hash crosses the wire"
-    );
+    for body in [
+        serde_json::json!({
+            "ticket": Uuid::new_v4(),
+            "at": 0,
+            "sha256": digest,
+            "session_sha256": session,
+            "computed": "x",
+        }),
+        serde_json::json!({ "ticket": Uuid::new_v4(), "at": 0, "sha256": digest }),
+    ] {
+        let response = hash(&ann, body).await.unwrap();
+        assert!(
+            response.status().is_client_error(),
+            "only the two hashes cross the wire, and both are required"
+        );
+    }
 }
 
 /// The id of `user`'s own folder, where their uploads go.

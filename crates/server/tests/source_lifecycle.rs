@@ -22,7 +22,7 @@ use collab_core::ids::NodeId;
 use common::fake_github::FakeGithub;
 use common::{TestServer, TestUser, spawn_server_config, start_fake_github};
 use fake_icap::{Behaviour, FakeIcap, eicar};
-use records::{NewSource, SealedRow, SecretId, SourceChange, SourceKind, SourceState};
+use records::{NewSource, SealedRow, SecretId, SourceChange, SourceKind, SourceMode, SourceState};
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 use server::AppState;
@@ -145,6 +145,8 @@ impl Env {
             repo: REPO.to_owned(),
             branch: "main".to_owned(),
             folder: String::new(),
+            location: None,
+            mode: SourceMode::ReadOnly,
             token: Some(env.token),
             poll_seconds: 300,
             connected_by: env.admin.id,

@@ -12,7 +12,7 @@ use collab_core::ids::{ClientId, DocId, Seq, UserId};
 use common::{Gate, tree, user, wait_blocked};
 use records::test_support::TestDb;
 use records::{
-    GoneReason, LiveCheckpointRow, LiveCheckpointWriter, LiveEntryRow, LiveLocal,
+    GoneReason, LiveCheckpointRow, LiveCheckpointWriter, LiveDisputeMark, LiveEntryRow, LiveLocal,
     LiveReturnTombstoneRow, LiveSessionDataRow, NewLiveCancel, NewLiveChange, NewLiveCheckpoint,
     RevisionRecord,
 };
@@ -1228,6 +1228,7 @@ async fn live_checkpoint_records_revision_position_hash_and_session_data() {
             major_reason: Some("returning_client_before".to_string()),
             major_person: Some(s.ann),
             writer: Some(writer),
+            sole_editor: false,
         }]
     );
     assert_eq!(loaded.unsaved_entries, 1);
@@ -1853,11 +1854,19 @@ async fn checkpoint_records_a_missing_revision_row_with_its_metadata() {
     let loaded = s.test.db.load_live(s.doc).await.unwrap();
     assert_eq!(loaded.unverified_checkpoints.len(), 1);
     assert_eq!(loaded.unverified_checkpoints[0].revision, written);
-    // The projection appending the same revision afterwards is not a conflict.
+    // The projection appending the same revision afterwards records nothing twice, and sees
+    // that the row is already the recorded head after its parent, so no rebuild is needed.
+    assert!(
+        !s.test
+            .db
+            .append_revision(Some(&base), &revision_record(&s, &written))
+            .await
+            .unwrap()
+    );
     assert!(
         s.test
             .db
-            .append_revision(Some(&base), &revision_record(&s, &written))
+            .is_recorded_head(s.doc, &written, Some(&base))
             .await
             .unwrap()
     );
@@ -1976,5 +1985,652 @@ async fn migration_0020_backfills_tombstones_in_one_pass() {
             .unwrap();
         assert_eq!(tombstone.client, one);
         assert_eq!(tombstone.final_seq, Seq(final_seq), "session {session}");
+    }
+}
+
+/// Records `count` changes and an unverified checkpoint after each, with `data` as session
+/// data; answers the revisions, oldest first.
+async fn checkpoint_each_change(s: &Setup, session: Uuid, count: u64, data: &[u8]) -> Vec<String> {
+    let one = client();
+    let mut revisions = Vec::new();
+    let mut parent: Option<String> = None;
+    for seq in 1..=count {
+        s.test
+            .db
+            .append_live_change(s.doc, &change(seq, session, one, s.ann, seq, b"x", &[]))
+            .await
+            .unwrap();
+        let id = char::from(b'a' + u8::try_from(seq).unwrap());
+        let revision = revision(s, id, parent.as_deref()).await;
+        s.test
+            .db
+            .record_live_checkpoint(
+                s.doc,
+                &NewLiveCheckpoint {
+                    revision: &revision,
+                    through: Seq(seq),
+                    sha256: [u8::try_from(seq).unwrap(); 32],
+                    session,
+                    session_data: data,
+                    major_reason: None,
+                    major_person: None,
+                    writer: None,
+                    created_at: at(i64::try_from(seq).unwrap() + 100),
+                },
+            )
+            .await
+            .unwrap();
+        parent = Some(revision.clone());
+        revisions.push(revision);
+    }
+    revisions
+}
+
+#[tokio::test]
+async fn unverified_checkpoints_are_capped_per_document() {
+    let s = setup().await;
+    let session = session(&s, 0).await;
+    let count = u64::try_from(records::MAX_UNVERIFIED_CHECKPOINTS).unwrap() + 3;
+    let revisions = checkpoint_each_change(&s, session, count, b"identity table").await;
+
+    let loaded = s.test.db.load_live(s.doc).await.unwrap();
+    let kept = loaded
+        .unverified_checkpoints
+        .iter()
+        .map(|checkpoint| checkpoint.revision.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        kept,
+        revisions[revisions.len() - records::MAX_UNVERIFIED_CHECKPOINTS..],
+        "only the newest unverified checkpoints are kept"
+    );
+    let rows: i64 =
+        sqlx::query_scalar("select count(*) from live_checkpoints where document_id = $1")
+            .bind(s.doc.0)
+            .fetch_one(s.test.db.test_pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        rows,
+        i64::try_from(records::MAX_UNVERIFIED_CHECKPOINTS).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn verification_drops_superseded_session_data() {
+    let s = setup().await;
+    let session = session(&s, 0).await;
+    let revisions = checkpoint_each_change(&s, session, 3, b"identity table").await;
+
+    s.test
+        .db
+        .verify_live_checkpoint(s.doc, &revisions[1], Seq(2), at(50))
+        .await
+        .unwrap();
+
+    let data: Vec<(String, i32)> = sqlx::query_as(
+        "select revision, octet_length(session_data) from live_checkpoints \
+         where document_id = $1 order by through",
+    )
+    .bind(s.doc.0)
+    .fetch_all(s.test.db.test_pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        data,
+        [(revisions[1].clone(), 14), (revisions[2].clone(), 14),],
+        "the superseded unverified checkpoint is gone; the verified base and the newer one keep \
+         their identity data"
+    );
+}
+
+#[tokio::test]
+async fn checkpoint_session_data_counts_against_the_site_quota() {
+    let test = TestDb::create().await;
+    let ann = user(&test, "Ann", false).await.id;
+    let tree = tree(&test, ann).await;
+    let s = Setup {
+        bob: ann,
+        ann,
+        doc: tree.doc,
+        test,
+    };
+    let session = session(&s, 0).await;
+    checkpoint_each_change(&s, session, 2, &[7; 1_000]).await;
+    let with_data = s.test.db.site_usage(tree.site).await.unwrap();
+    sqlx::query("update live_checkpoints set session_data = '' where document_id = $1")
+        .bind(s.doc.0)
+        .execute(s.test.db.test_pool())
+        .await
+        .unwrap();
+    let without = s.test.db.site_usage(tree.site).await.unwrap();
+    assert_eq!(
+        with_data.used - without.used,
+        2_000,
+        "identity data is stored bytes"
+    );
+}
+
+/// An outside revision stored again on top of a live log becomes its verified catch-up base:
+/// the live checkpoints it replaces go, and the entries it covers count as saved.
+#[tokio::test]
+async fn adopted_outside_base_becomes_the_verified_catchup_base() {
+    let s = setup().await;
+    let session = session(&s, 0).await;
+    let one = client();
+    for seq in 1..=3 {
+        s.test
+            .db
+            .append_live_change(s.doc, &change(seq, session, one, s.ann, seq, b"x", &[]))
+            .await
+            .unwrap();
+    }
+    let live = revision(&s, 'a', None).await;
+    s.test
+        .db
+        .record_live_checkpoint(
+            s.doc,
+            &NewLiveCheckpoint {
+                revision: &live,
+                through: Seq(2),
+                sha256: [1; 32],
+                session,
+                session_data: b"ids",
+                major_reason: None,
+                major_person: None,
+                writer: None,
+                created_at: at(4),
+            },
+        )
+        .await
+        .unwrap();
+    let outside = revision(&s, 'b', Some(&live)).await;
+
+    s.test
+        .db
+        .adopt_live_base(
+            s.doc,
+            &NewLiveCheckpoint {
+                revision: &outside,
+                through: Seq(3),
+                sha256: [2; 32],
+                session,
+                session_data: b"",
+                major_reason: Some("outside_replacement"),
+                major_person: Some(s.bob),
+                writer: None,
+                created_at: at(5),
+            },
+            at(6),
+        )
+        .await
+        .unwrap();
+    let loaded = s.test.db.load_live(s.doc).await.unwrap();
+    assert_eq!(loaded.verified_through, Seq(3));
+    let base = loaded.verified_checkpoint.unwrap();
+    assert_eq!(
+        (base.revision.as_str(), base.through),
+        (outside.as_str(), Seq(3))
+    );
+    assert!(
+        base.session_data.is_empty(),
+        "a plain file base has no identities"
+    );
+    assert!(loaded.unverified_checkpoints.is_empty());
+    assert!(loaded.entries.is_empty());
+    assert_eq!(loaded.unsaved_entries, 0);
+    assert_eq!(loaded.head, Seq(3), "the log keeps its positions");
+
+    // Beyond the head is refused.
+    assert!(
+        s.test
+            .db
+            .adopt_live_base(
+                s.doc,
+                &NewLiveCheckpoint {
+                    revision: &outside,
+                    through: Seq(4),
+                    sha256: [2; 32],
+                    session,
+                    session_data: b"",
+                    major_reason: None,
+                    major_person: None,
+                    writer: None,
+                    created_at: at(7),
+                },
+                at(7),
+            )
+            .await
+            .is_err()
+    );
+}
+
+/// Major-version checkpoints are history people restore from: the cap on unverified
+/// checkpoints never drops one.
+#[tokio::test]
+async fn unverified_cap_keeps_major_checkpoints() {
+    let s = setup().await;
+    let session = session(&s, 0).await;
+    let one = client();
+    for seq in 1..=6 {
+        s.test
+            .db
+            .append_live_change(s.doc, &change(seq, session, one, s.ann, seq, b"x", &[]))
+            .await
+            .unwrap();
+    }
+    let mut parent: Option<String> = None;
+    for (n, letter) in ['a', 'b', 'c', 'd', 'e', 'f'].into_iter().enumerate() {
+        let written = revision(&s, letter, parent.as_deref()).await;
+        let through = u64::try_from(n).unwrap() + 1;
+        s.test
+            .db
+            .record_live_checkpoint(
+                s.doc,
+                &NewLiveCheckpoint {
+                    revision: &written,
+                    through: Seq(through),
+                    sha256: [1; 32],
+                    session,
+                    session_data: b"ids",
+                    major_reason: (n == 0).then_some("returning_client_before"),
+                    major_person: (n == 0).then_some(s.bob),
+                    writer: None,
+                    created_at: at(i64::try_from(through).unwrap() + 10),
+                },
+            )
+            .await
+            .unwrap();
+        parent = Some(written);
+    }
+    let loaded = s.test.db.load_live(s.doc).await.unwrap();
+    let kept = loaded
+        .unverified_checkpoints
+        .iter()
+        .map(|checkpoint| checkpoint.through.0)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        kept,
+        [1, 3, 4, 5, 6],
+        "the major checkpoint stays; ordinary ones are capped"
+    );
+}
+
+/// Verifying keeps the newest identity data of another session, which that session's
+/// returning clients still need, while the same session's superseded data goes.
+#[tokio::test]
+async fn verification_keeps_another_sessions_newest_session_data() {
+    let s = setup().await;
+    let old = session(&s, 0).await;
+    let revisions = checkpoint_each_change(&s, old, 1, b"old identities").await;
+    s.test.db.end_live_session(old, at(10)).await.unwrap();
+    let new = session(&s, 11).await;
+    let one = client();
+    let mut parent = revisions[0].clone();
+    let mut newer = Vec::new();
+    for (seq, id) in [(2_u64, 'x'), (3, 'y')] {
+        s.test
+            .db
+            .append_live_change(s.doc, &change(seq, new, one, s.ann, seq, b"x", &[]))
+            .await
+            .unwrap();
+        let written = revision(&s, id, Some(&parent)).await;
+        s.test
+            .db
+            .record_live_checkpoint(
+                s.doc,
+                &NewLiveCheckpoint {
+                    revision: &written,
+                    through: Seq(seq),
+                    sha256: [9; 32],
+                    session: new,
+                    session_data: b"new identities",
+                    major_reason: None,
+                    major_person: None,
+                    writer: None,
+                    created_at: at(i64::try_from(seq).unwrap() + 20),
+                },
+            )
+            .await
+            .unwrap();
+        parent = written.clone();
+        newer.push(written);
+    }
+    s.test
+        .db
+        .verify_live_checkpoint(s.doc, &newer[1], Seq(3), at(50))
+        .await
+        .unwrap();
+    let data: Vec<(String, i32)> = sqlx::query_as(
+        "select revision, octet_length(session_data) from live_checkpoints \
+         where document_id = $1 order by through",
+    )
+    .bind(s.doc.0)
+    .fetch_all(s.test.db.test_pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        data,
+        [(revisions[0].clone(), 14), (newer[1].clone(), 14)],
+        "the old session's newest identities stay; the new session's superseded ones go"
+    );
+}
+
+/// A checkpoint its verifier disputes is set aside: kept for forensics, never a base, and its
+/// position is free for another writer's checkpoint.
+#[tokio::test]
+async fn disputed_checkpoint_frees_its_position() {
+    let s = setup().await;
+    let session = session(&s, 0).await;
+    let revisions = checkpoint_each_change(&s, session, 2, b"ids").await;
+    s.test
+        .db
+        .dispute_live_checkpoint(s.doc, &revisions[1], at(30))
+        .await
+        .unwrap();
+    let loaded = s.test.db.load_live(s.doc).await.unwrap();
+    assert_eq!(
+        loaded
+            .unverified_checkpoints
+            .iter()
+            .map(|checkpoint| checkpoint.revision.clone())
+            .collect::<Vec<_>>(),
+        [revisions[0].clone()]
+    );
+    let other = revision(&s, 'z', Some(&revisions[1])).await;
+    s.test
+        .db
+        .record_live_checkpoint(
+            s.doc,
+            &NewLiveCheckpoint {
+                revision: &other,
+                through: Seq(2),
+                sha256: [3; 32],
+                session,
+                session_data: b"ids",
+                major_reason: None,
+                major_person: None,
+                writer: None,
+                created_at: at(31),
+            },
+        )
+        .await
+        .unwrap();
+    let kept: i64 =
+        sqlx::query_scalar("select count(*) from live_checkpoints where document_id = $1")
+            .bind(s.doc.0)
+            .fetch_one(s.test.db.test_pool())
+            .await
+            .unwrap();
+    assert_eq!(kept, 3, "the disputed row stays for forensics");
+    let loaded = s.test.db.load_live(s.doc).await.unwrap();
+    assert_eq!(
+        loaded.unverified_checkpoints.last().unwrap().revision,
+        other
+    );
+    // A disputed checkpoint is never verified.
+    assert!(
+        s.test
+            .db
+            .verify_live_checkpoint(s.doc, &revisions[1], Seq(2), at(40))
+            .await
+            .is_err()
+    );
+}
+
+/// With no second capable editor, a writer's checkpoint is accepted as the base, marked
+/// sole-editor until a second editor verifies it.
+#[tokio::test]
+async fn sole_editor_checkpoint_is_the_base_until_confirmed() {
+    let s = setup().await;
+    let session = session(&s, 0).await;
+    let revisions = checkpoint_each_change(&s, session, 2, b"ids").await;
+    s.test
+        .db
+        .accept_live_sole_editor(s.doc, &revisions[1], Seq(2), at(30))
+        .await
+        .unwrap();
+    let loaded = s.test.db.load_live(s.doc).await.unwrap();
+    assert_eq!(loaded.verified_through, Seq(2));
+    let base = loaded.verified_checkpoint.unwrap();
+    assert_eq!(base.revision, revisions[1]);
+    assert!(base.sole_editor);
+    s.test
+        .db
+        .confirm_live_sole_editor(s.doc, &revisions[1])
+        .await
+        .unwrap();
+    let base = s
+        .test
+        .db
+        .load_live(s.doc)
+        .await
+        .unwrap()
+        .verified_checkpoint
+        .unwrap();
+    assert!(!base.sole_editor);
+}
+
+/// Cancel records count their encoded size against the unsaved log.
+#[tokio::test]
+async fn cancel_records_count_their_encoded_size() {
+    let s = setup().await;
+    let session = session(&s, 0).await;
+    let one = client();
+    s.test
+        .db
+        .append_live_change(s.doc, &change(1, session, one, s.ann, 1, b"abc", &[]))
+        .await
+        .unwrap();
+    s.test
+        .db
+        .cancel_live_entry(
+            s.doc,
+            &NewLiveCancel {
+                seq: Seq(2),
+                session,
+                cancels: Seq(1),
+                reports: 1,
+                at: at(3),
+                seed: 1,
+            },
+        )
+        .await
+        .unwrap();
+    let loaded = s.test.db.load_live(s.doc).await.unwrap();
+    assert_eq!(loaded.unsaved_entries, 2);
+    assert_eq!(loaded.unsaved_bytes, records::LIVE_CANCEL_BYTES);
+    assert_eq!(
+        s.test.db.live_unsaved_counts(s.doc).await.unwrap(),
+        (2, records::LIVE_CANCEL_BYTES)
+    );
+}
+
+/// Adopting an outside base keeps disputed rows (forensics) and major-version rows (history),
+/// even at or after its position.
+#[tokio::test]
+async fn adopting_a_base_keeps_disputed_and_major_rows() {
+    let s = setup().await;
+    let session = session(&s, 0).await;
+    let revisions = checkpoint_each_change(&s, session, 2, b"ids").await;
+    s.test
+        .db
+        .dispute_live_checkpoint(s.doc, &revisions[0], at(30))
+        .await
+        .unwrap();
+    let major = revision(&s, 'm', Some(&revisions[1])).await;
+    s.test
+        .db
+        .record_live_checkpoint(
+            s.doc,
+            &NewLiveCheckpoint {
+                revision: &major,
+                through: Seq(2),
+                sha256: [4; 32],
+                session,
+                session_data: b"",
+                major_reason: Some("returning_client_before"),
+                major_person: Some(s.bob),
+                writer: None,
+                created_at: at(31),
+            },
+        )
+        .await
+        .unwrap();
+    let outside = revision(&s, 'o', Some(&major)).await;
+    s.test
+        .db
+        .adopt_live_base(
+            s.doc,
+            &NewLiveCheckpoint {
+                revision: &outside,
+                through: Seq(2),
+                sha256: [5; 32],
+                session,
+                session_data: b"",
+                major_reason: Some("outside_current"),
+                major_person: None,
+                writer: None,
+                created_at: at(32),
+            },
+            at(33),
+        )
+        .await
+        .unwrap();
+    let mut kept: Vec<String> =
+        sqlx::query_scalar("select revision from live_checkpoints where document_id = $1")
+            .bind(s.doc.0)
+            .fetch_all(s.test.db.test_pool())
+            .await
+            .unwrap();
+    kept.sort();
+    let mut expected = vec![revisions[0].clone(), major, outside];
+    expected.sort();
+    assert_eq!(
+        kept, expected,
+        "only the ordinary unverified checkpoint goes"
+    );
+}
+
+/// A disputed sole-editor base is set aside: the last peer-verified checkpoint is the catch-up
+/// base again, with the log after it.
+#[tokio::test]
+async fn disputed_sole_editor_base_falls_back_to_the_last_peer_verified_base() {
+    let s = setup().await;
+    let session = session(&s, 0).await;
+    let revisions = checkpoint_each_change(&s, session, 3, b"ids").await;
+    s.test
+        .db
+        .verify_live_checkpoint(s.doc, &revisions[0], Seq(1), at(20))
+        .await
+        .unwrap();
+    s.test
+        .db
+        .accept_live_sole_editor(s.doc, &revisions[2], Seq(3), at(30))
+        .await
+        .unwrap();
+    let fallback = s
+        .test
+        .db
+        .dispute_live_sole_base(s.doc, &revisions[2], at(40))
+        .await
+        .unwrap();
+    assert_eq!(fallback, Some((revisions[0].clone(), Seq(1))));
+    let loaded = s.test.db.load_live(s.doc).await.unwrap();
+    assert_eq!(loaded.verified_through, Seq(1));
+    assert_eq!(loaded.verified_checkpoint.unwrap().revision, revisions[0]);
+    assert!(
+        loaded
+            .unverified_checkpoints
+            .iter()
+            .all(|checkpoint| checkpoint.revision != revisions[2]),
+        "a disputed base is never loaded"
+    );
+    assert_eq!(loaded.entries.len(), 2, "the log after the fallback base");
+}
+
+/// The people in a dispute are remembered per document: when they last stopped a session and
+/// until when they are excluded from checkpoint work.
+#[tokio::test]
+async fn dispute_marks_are_kept_per_document_and_person() {
+    let s = setup().await;
+    assert!(
+        s.test
+            .db
+            .live_dispute_marks(s.doc)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let mark = LiveDisputeMark {
+        user: s.ann,
+        stopped_at: Some(at(10)),
+        excluded_until: None,
+    };
+    s.test.db.set_live_dispute_mark(s.doc, &mark).await.unwrap();
+    let excluded = LiveDisputeMark {
+        excluded_until: Some(at(100)),
+        ..mark.clone()
+    };
+    s.test
+        .db
+        .set_live_dispute_mark(s.doc, &excluded)
+        .await
+        .unwrap();
+    assert_eq!(
+        s.test.db.live_dispute_marks(s.doc).await.unwrap(),
+        vec![excluded]
+    );
+}
+
+/// t11-fix minor 6: two verified checkpoints at the same position (a major version marked there
+/// and a base adopted at it later) load deterministically: the one verified last.
+#[tokio::test]
+async fn load_breaks_a_tie_between_verified_checkpoints_by_the_newest_verification() {
+    let s = setup().await;
+    let session = session(&s, 0).await;
+    s.test
+        .db
+        .append_live_change(s.doc, &change(1, session, client(), s.ann, 1, b"x", &[]))
+        .await
+        .unwrap();
+    let older = revision(&s, 'b', None).await;
+    let newer = revision(&s, 'a', Some(&older)).await;
+    let checkpoint = |revision, byte| NewLiveCheckpoint {
+        revision,
+        through: Seq(1),
+        sha256: [byte; 32],
+        session,
+        session_data: &[],
+        major_reason: None,
+        major_person: None,
+        writer: None,
+        created_at: at(2),
+    };
+    s.test
+        .db
+        .record_live_checkpoint(
+            s.doc,
+            &NewLiveCheckpoint {
+                major_reason: Some("returning_client_before"),
+                major_person: Some(s.ann),
+                ..checkpoint(&older, 1)
+            },
+        )
+        .await
+        .unwrap();
+    s.test
+        .db
+        .verify_live_checkpoint(s.doc, &older, Seq(1), at(5))
+        .await
+        .unwrap();
+    s.test
+        .db
+        .adopt_live_base(s.doc, &checkpoint(&newer, 2), at(6))
+        .await
+        .unwrap();
+    for _ in 0..3 {
+        let loaded = s.test.db.load_live(s.doc).await.unwrap();
+        assert_eq!(loaded.verified_checkpoint.unwrap().revision, newer);
     }
 }
