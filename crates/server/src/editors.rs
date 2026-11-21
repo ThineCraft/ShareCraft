@@ -372,7 +372,10 @@ mod tests {
 
     #[test]
     fn mismatched_live_protocol_or_format_keeps_the_file_session() {
-        let mut manifest = serde_json::from_str::<Manifest>(include_str!("../../../xtask/tests/fixtures/editor.json")).unwrap();
+        let mut manifest = serde_json::from_str::<Manifest>(include_str!(
+            "../../../xtask/tests/fixtures/editor.json"
+        ))
+        .unwrap();
         assert_eq!(manifest.live_format(), Some("gridcraft/1"));
         manifest.live.as_mut().unwrap().protocol = 2;
         assert_eq!(manifest.live_format(), None);
