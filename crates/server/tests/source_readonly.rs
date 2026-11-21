@@ -338,6 +338,7 @@ const ROUTES: &[(&str, Decision)] = &[
     ("POST /api/uploads/{id}/finish", Guarded),
     ("GET /api/docs/{id}", Read),
     ("GET /api/docs/{id}/content", Read),
+    ("GET /api/docs/{id}/live-base", Read),
     ("PUT /api/docs/{id}/content", Guarded),
     ("PUT /api/docs/{id}/live-checkpoint", Guarded),
     ("POST /api/docs/{id}/live-checkpoint/hash", Guarded),
@@ -622,7 +623,7 @@ fn a_route_list_guard() {
         unclassified.is_empty() && gone.is_empty(),
         "routes not classified in ROUTES: {unclassified:?}; recorded but not registered: {gone:?}"
     );
-    assert_eq!(routes.len(), 156, "the number of registered routes changed");
+    assert_eq!(routes.len(), 157, "the number of registered routes changed");
     let mut mounts_sorted = mounts.clone();
     mounts_sorted.sort();
     let mut expected: Vec<String> = MOUNTS.iter().map(|m| (*m).to_owned()).collect();
