@@ -31,6 +31,7 @@ pub mod previews;
 mod projection;
 mod room;
 pub mod s3_sign;
+pub mod s3_xml;
 mod scan;
 pub mod secrets;
 pub mod share;
