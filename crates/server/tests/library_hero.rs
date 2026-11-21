@@ -298,3 +298,102 @@ async fn library_hero_image_chosen_kept_and_released() {
     let blobs = revisions::BlobStore::open(&server::blobs_path(data_dir.path())).unwrap();
     assert!(blobs.contains(&Sha256::digest(&wide).into()));
 }
+
+/// With images from the site's own libraries turned off for site owners, a site owner may give
+/// a library only a brand-centre picture as its banner (as on Change the look); an
+/// administrator may still give it any.
+#[tokio::test]
+async fn library_banner_follows_the_brand_image_limit() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let db = TestDb::create().await;
+    let server = StoppableServer::start(data_dir.path(), &db, |_| {});
+    let root = server.admin("Root").await;
+    let (status, body) = call(
+        &server,
+        &root,
+        Method::POST,
+        "/api/sites",
+        Some(json!({ "name": "Quay" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let site = body["id"].as_str().unwrap().to_owned();
+    let pictures = new_library(&server, &root, &site, "Pictures").await;
+    let (status, body) = call(
+        &server,
+        &root,
+        Method::POST,
+        &format!("/api/sites/{site}/libraries"),
+        Some(json!({ "name": "Brand", "kind": "asset" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let assets = body["id"].as_str().unwrap().to_owned();
+    let own = upload(&server, &root, &pictures, "Quay.png", &png(900, 300, 30)).await;
+    let branded = png(1000, 400, 120);
+    let brand_doc = upload(&server, &root, &assets, "Brand banner.png", &branded).await;
+    let (status, body) = call(
+        &server,
+        &root,
+        Method::POST,
+        "/api/brand/images",
+        Some(json!({ "doc": brand_doc, "kind": "background" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let brand_image = body["id"].as_str().unwrap().to_owned();
+    let olive = server.user("Olive").await;
+    let (status, body) = call(
+        &server,
+        &root,
+        Method::PUT,
+        &format!("/api/nodes/{site}/access"),
+        Some(json!({ "email": olive.email, "role": "owner" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    // The limit off: a site owner may choose a picture from the site's libraries.
+    let (status, body) = hero(&server, &olive, &pictures, json!({ "doc": own })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // The limit on: refused, and the banner stays as it was.
+    let (status, body) = call(
+        &server,
+        &root,
+        Method::PUT,
+        "/api/brand/policy",
+        Some(json!({ "site_images": false })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let other = upload(&server, &root, &pictures, "Other.png", &png(800, 300, 60)).await;
+    let (status, body) = hero(&server, &olive, &pictures, json!({ "doc": other })).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], "not_allowed", "{body}");
+    let (_, body) = call(
+        &server,
+        &olive,
+        Method::GET,
+        &format!("/api/libraries/{pictures}"),
+        None,
+    )
+    .await;
+    assert_eq!(body["hero_image"]["name"], "Quay.png");
+    // A brand-centre image is allowed.
+    let (status, body) = hero(
+        &server,
+        &olive,
+        &pictures,
+        json!({ "brand_image": brand_image }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["hero_image"]["sha256"], sha(&branded));
+    // Taking it away is never refused.
+    let (status, _) = hero(&server, &olive, &pictures, Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    // An administrator is not limited.
+    let (status, body) = hero(&server, &root, &pictures, json!({ "doc": other })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}

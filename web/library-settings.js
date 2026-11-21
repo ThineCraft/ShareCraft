@@ -28,6 +28,7 @@ import {
   typeListText,
 } from './common.js';
 import { pickImage } from './image-picker.js';
+import { studioLimits } from './look-studio.js';
 import { webhookInstructions } from './source-panel.js';
 
 const $ = (id) => document.getElementById(id);
@@ -57,8 +58,8 @@ await siteChrome(here.path[0].id, {
 if (!can(here.access, 'manage_site')) fail('Only the owners of this site can change the settings of its libraries.');
 if (!first.ok) fail(first.status === 404 ? MISSING : messageFor(first.error));
 let library = first.data;
-/** The brand centre's images, fetched once when the banner picture picker first opens. */
-let brandImages = null;
+/** The brand centre (its images and limits), fetched once when the banner picture picker first opens. */
+let brand = null;
 show(library);
 $('settings').hidden = false;
 
@@ -112,11 +113,19 @@ function showHero(image) {
   }
   const choose = h('button', { type: 'button', class: 'secondary small' }, image ? 'Change the banner picture' : 'Choose a banner picture');
   choose.addEventListener('click', async () => {
-    if (brandImages === null) {
-      const brand = await api('GET', '/brand');
-      brandImages = brand.ok ? (brand.data.images ?? []) : [];
+    if (brand === null) {
+      const answer = await api('GET', '/brand');
+      brand = answer.ok ? answer.data : { images: [] };
     }
-    const picked = await pickImage({ siteId: library.site, brandImages, title: 'Choose the banner picture' });
+    // The organisation's limit on images from the site's own libraries holds for site owners
+    // here as on Change the look: brand-centre images only (the server judges it again).
+    const limits = studioLimits(brand.policy, !brand.can_manage);
+    const picked = await pickImage({
+      siteId: library.site,
+      brandImages: brand.images ?? [],
+      title: 'Choose the banner picture',
+      brandOnly: limits.siteImages.disabled ? limits.siteImages.reason : null,
+    });
     if (!picked) return;
     await saveHero(picked.brand_image ? { brand_image: picked.brand_image } : { doc: picked.doc });
   });
