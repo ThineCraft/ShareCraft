@@ -23,15 +23,15 @@
 <body>
 <main>
 <h1>ShareCraft handoff</h1>
-<p class="note">Written 20 November 2026 and updated after the release to <code>main</code> (5411a7b), for whoever (person or coding agent) picks the work up next. It describes the state at the time of writing; check <code>git log</code> and each plan's ledger for anything newer.</p>
+<p class="note">Written 20 November 2026 and updated after the release to <code>main</code> (5411a7b) and again after G5 Tasks 5 and 6 reached <code>main</code> (8fba716), for whoever (person or coding agent) picks the work up next. It describes the state at the time of writing; check <code>git log</code> and each plan's ledger for anything newer.</p>
 
 <h2>Where everything is</h2>
 <div class="wrap"><table>
 <thead><tr><th>Folder</th><th>Branch</th><th>Used for</th></tr></thead>
 <tbody>
 <tr><td><code>H:\Source\repos\ThineCraft\ShareCraft</code></td><td>gridcraft-coauthoring-g4</td><td>Main checkout. G4 is finished here; holds the G3, G4 and G5 ledgers.</td></tr>
-<tr><td><code>…\ShareCraft-release</code></td><td>release-integration</td><td>The release that became <code>main</code> (5411a7b, pushed 20 November 2026). Start new work from <code>main</code>.</td></tr>
-<tr><td><code>…\ShareCraft-g5</code></td><td>gridcraft-coauthoring-g5</td><td>G5 ShareCraft tasks (pushed at 37779d5; later commits are local).</td></tr>
+<tr><td><code>…\ShareCraft-release</code></td><td>main</td><td>The release (first <code>main</code> 5411a7b, pushed 20 November 2026); now has <code>main</code> checked out. Start new work from <code>main</code>.</td></tr>
+<tr><td><code>…\ShareCraft-g5</code></td><td>gridcraft-coauthoring-g5</td><td>G5 ShareCraft tasks. Pushed; at 8fba716, the same commit as <code>main</code>.</td></tr>
 <tr><td><code>…\ShareCraft-fileshare</code></td><td>fileshare-surfacing</td><td>File Share surfacing (Windows UNC and drive paths, and Linux paths including mounted SMB shares). Pushed.</td></tr>
 <tr><td><code>…\ShareCraft-s3</code></td><td>s3-surfacing</td><td>S3 surfacing, built on File Share.</td></tr>
 <tr><td><code>…\ShareCraft-ci</code></td><td>ci-parallel</td><td>The parallel GitHub check (pushed; merged into the release).</td></tr>
@@ -47,7 +47,7 @@
 <tr><td>Release</td><td>—</td><td>Done. <code>main</code> = <code>origin/main</code> = 5411a7b (G4, G5 switched off, File Share Tasks 1–9 off until a folder is approved, S3 signing, the parallel check, this handoff). GitHub run 44676640425 passed on Linux. Unfinished features are off by default (see below). A Windows zip from 5411a7b is being built into <code>J:\sharecraft-package</code>.</td><td>New work branches start from <code>main</code>. Older work branches (g4, g5, fileshare, s3) are all contained in <code>main</code>; keep using them only for their remaining tasks and merge <code>main</code> into them first.</td></tr>
 <tr><td>G3 – GridCraft co-authoring core</td><td><code>plans/2026-11-18-gridcraft-coauthoring-g3.html</code></td><td>Done and reviewed. Fork PR <code>ThineCraft/GridCraft#2</code> (coauthor-g3 → sharecraft) is open.</td><td>Owner to merge the fork PR.</td></tr>
 <tr><td>G4 – verified live checkpoints</td><td><code>plans/2026-11-18-gridcraft-coauthoring-g4.html</code></td><td>Done: all 12 tasks, per-task reviews, final whole-branch review and its fix wave (ShareCraft 9652112; fork 1fe2fd16 and b77cc005 on coauthor-g5). In the release.</td><td>Nothing; parked minors are listed in <code>final-review.md</code> and <code>final-fix-report.md</code>.</td></tr>
-<tr><td>G5 – live editing on screen</td><td><code>plans/2026-11-19-gridcraft-coauthoring-g5.html</code></td><td>Done: ShareCraft Tasks 1–4, 12, 13; fork Tasks 9–11. In the release but switched off.</td><td>Task 7 (fork pins ShareCraft by git revision; pin the new <code>main</code>), then Task 8 (fork identity tables and axis compaction), Tasks 5 and 6 (join base, the switch), 14, 15, then the G5 final review.</td></tr>
+<tr><td>G5 – live editing on screen</td><td><code>plans/2026-11-19-gridcraft-coauthoring-g5.html</code></td><td>Done: ShareCraft Tasks 1–6, 12, 13; fork Tasks 9–11. Tasks 5 and 6 were built by GitHub Copilot (4260b87, 56dd815), merged with <code>main</code> and fixed by Claude, and are in <code>main</code> at 8fba716 (GitHub run 44856589920 passed); they have had no per-task review yet. Switched off unless <code>SHARECRAFT_LIVE_EDITORS=gridcraft</code> is set <em>and</em> the installed GridCraft build declares the live format.</td><td>Task 7 (fork pins ShareCraft by git revision; pin <code>main</code> 8fba716 or later), then Task 8 (fork identity tables and axis compaction), 14, 15, then the G5 final review, which also reviews Tasks 5 and 6. Tasks 7 and 8 are <strong>not</strong> done, whatever any older ledger note says.</td></tr>
 <tr><td>File Share surfacing</td><td><code>plans/2026-11-17-file-share-surfacing.html</code></td><td>Tasks 1–9 done, plus the Linux fixes found by the first Linux run (to 750c144). Off until an administrator approves a folder.</td><td>Task 10 of 27, which also takes the Linux duplicate-share fix (compare the folder's device and inode at connect, because SMB mounts ignore letter case). Its migration is now <code>0022</code> (renumbered in the release); later File Share migrations take the next free number, not the plan's 0021. Plan steps written for Windows only (for example the Recycle Bin for deletes) need a Linux equivalent.</td></tr>
 <tr><td>S3 surfacing</td><td><code>plans/2026-11-18-s3-surfacing.html</code> (in the S3 worktree)</td><td>Task 2 (SigV4 signing) done. Library only.</td><td>Task 3. Builds on File Share.</td></tr>
 <tr><td>Build speed</td><td>—</td><td>Parallel GitHub check done.</td><td>Combine the 69 server/records integration test files into one test program per crate; use <code>rust-lld</code>; set dev debug info to line tables only.</td></tr>
@@ -72,7 +72,7 @@
 
 <h2>Unfinished features and how they stay off</h2>
 <ul class="banded">
-<li><strong>G5 live editing:</strong> the page enters live mode only when the document answer carries <code>session: "live"</code>, which G5 Task 6 adds; <code>Config.live_editors</code> is empty. GridCraft documents open as ordinary file sessions.</li>
+<li><strong>G5 live editing:</strong> the page enters live mode only when the document answer carries <code>session: "live"</code>. That needs <code>SHARECRAFT_LIVE_EDITORS=gridcraft</code> (unset by default) and an installed GridCraft build whose <code>editor.json</code> declares the live protocol and the <code>gridcraft/1</code> format; one helper, <code>ws::room_kind_for</code>, decides this for both the document answer and the WebSocket. Without both, GridCraft documents open as ordinary file sessions. Do not switch it on in production before G5 Task 8 (compaction) and the final review.</li>
 <li><strong>File Share:</strong> the approved roots setting defaults to empty, so every connect is refused; no page uses the File Share routes yet.</li>
 <li><strong>S3:</strong> only the signing library exists; nothing reaches it.</li>
 </ul>
