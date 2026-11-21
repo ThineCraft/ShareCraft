@@ -4,12 +4,12 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>ShareCraft · ThineCraft</title>
-  <meta name="description" content="Planned open infrastructure for intranets, portals, documents, lists, publishing, governance, and collaboration.">
+  <meta name="description" content="Open-source team sites, document libraries and sharing, written in Rust. Spreadsheets, documents, PDFs and 3D designs open in the browser. Early development build.">
   <link rel="canonical" href="https://share.thinecraft.io/">
   <meta property="og:type" content="website">
   <meta property="og:site_name" content="ShareCraft">
   <meta property="og:title" content="ShareCraft: A SharePoint alternative shaped around ownership">
-  <meta property="og:description" content="Planned open infrastructure for intranets, portals, documents, lists, publishing, governance, and collaboration.">
+  <meta property="og:description" content="Open-source team sites, document libraries and sharing, written in Rust. Spreadsheets, documents, PDFs and 3D designs open in the browser. Early development build.">
   <meta property="og:url" content="https://share.thinecraft.io/">
   <meta property="og:image" content="https://share.thinecraft.io/social-card.png">
   <meta property="og:image:type" content="image/png">
@@ -18,7 +18,7 @@
   <meta property="og:image:alt" content="ShareCraft: A SharePoint alternative shaped around ownership. Sites, knowledge, and collaboration.">
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="ShareCraft: A SharePoint alternative shaped around ownership">
-  <meta name="twitter:description" content="Planned open infrastructure for intranets, portals, documents, lists, publishing, governance, and collaboration.">
+  <meta name="twitter:description" content="Open-source team sites, document libraries and sharing, written in Rust. Spreadsheets, documents, PDFs and 3D designs open in the browser. Early development build.">
   <meta name="twitter:image" content="https://share.thinecraft.io/social-card.png">
   <meta name="twitter:image:alt" content="ShareCraft: A SharePoint alternative shaped around ownership. Sites, knowledge, and collaboration.">
   <link rel="stylesheet" href="/styles.css">
@@ -33,71 +33,169 @@
     <nav id="project-navigation" class="project-nav" aria-label="ThineCraft projects" data-open="false"><a href="https://thinecraft.io">ThineCraft</a><a href="https://share.thinecraft.io" aria-current="page">ShareCraft</a><a href="https://drive.thinecraft.io">DriveCraft</a><a href="https://team.thinecraft.io">TeamCraft</a><a href="https://gantt.thinecraft.io">GanttCraft</a><a href="https://flow.thinecraft.io">FlowCraft</a><a href="https://show.thinecraft.io">ShowCraft</a><a href="https://form.thinecraft.io">FormCraft</a><a href="https://cloud.thinecraft.io">CloudCraft</a></nav>
   </header>
   <main id="main">
-    <section class="hero">
+    <section class="hero hero-shots">
       <div class="hero-copy">
-        <p class="eyebrow">Sites, knowledge, and collaboration</p>
+        <p class="eyebrow">Sites, libraries, and collaboration</p>
         <h1>A SharePoint alternative shaped around ownership.</h1>
-        <p class="lede">Planned open infrastructure for intranets, portals, documents, lists, publishing, governance, and collaboration.</p>
+        <p class="lede">Open-source team sites, document libraries, and sharing, written in Rust. Your files are kept as Git revisions on servers you control, and spreadsheets, documents, PDFs and 3D designs open right in the browser.</p>
         <aside class="status" aria-label="Project status">
-          <strong>Placeholder project</strong>
-          <span>No working implementation is provided or implied.</span>
+          <strong>Early development build</strong>
+          <span>Running and tested, but not a release yet. The screenshots below are from the real app.</span>
         </aside>
       </div>
-      <div class="signal" aria-hidden="true">
-    <div class="signal-orbit signal-orbit-one"></div>
-    <div class="signal-orbit signal-orbit-two"></div>
-    <div class="signal-core"><span>S</span></div>
-    <span class="signal-label signal-label-1">SITE</span><span class="signal-label signal-label-2">LIBRARY</span><span class="signal-label signal-label-3">CONTEXT</span>
-  </div>
+      <figure class="shot shot-hero">
+        <img src="/screenshots/site.webp" width="2400" height="1500" alt="A ShareCraft team site called Harbor &amp; Pine, with its libraries, recently changed files, and site owners.">
+      </figure>
     </section>
-    <section class="thesis-section section-shell" aria-labelledby="thesis-title">
-      <p class="section-kicker">The proposition</p>
-      <h2 id="thesis-title">Built to remain understandable—and yours.</h2>
-      <p>ShareCraft is intended to become the shared-content foundation of the ecosystem: a place for organizational knowledge to be published, governed, searched, and reused without being trapped.</p>
-    </section>
-    <section class="capabilities section-shell" aria-labelledby="capabilities-title">
+
+    <section class="tour section-shell" aria-labelledby="tour-title">
       <div class="section-heading">
-        <p class="section-kicker">Proposed scope</p>
-        <h2 id="capabilities-title">What ShareCraft is intended to make possible.</h2>
+        <div>
+          <p class="section-kicker">See it working</p>
+          <h2 id="tour-title">What ShareCraft does today.</h2>
+        </div>
+        <p class="section-note">Every picture is the working app, showing a made-up architecture firm.</p>
       </div>
-      <div class="feature-grid"><article class="feature-card">
-    <span class="feature-index">01</span>
-    <p class="feature-label">Planned capability</p>
-    <h3>Sites and structured knowledge</h3>
-    <p>Team sites, communication sites, intranets, pages, news, lists, navigation, and reusable content are part of the intended SharePoint-alternative scope.</p>
-  </article><article class="feature-card">
-    <span class="feature-index">02</span>
-    <p class="feature-label">Planned capability</p>
-    <h3>Document libraries and governance</h3>
-    <p>Document libraries are intended to combine metadata, versions, search, permissions, sharing controls, auditability, retention, and governance.</p>
-  </article><article class="feature-card">
-    <span class="feature-index">03</span>
-    <p class="feature-label">Planned capability</p>
-    <h3>Co-authoring across the craft</h3>
-    <p>Presence and co-authoring are intended for WordCraft, GridCraft, PdfCraft, SolidCraft, DeckCraft, and other compatible ThineCraft applications.</p>
-  </article><article class="feature-card">
-    <span class="feature-index">04</span>
-    <p class="feature-label">Planned capability</p>
-    <h3>Workflows and a controlled public edge</h3>
-    <p>Workflow integration is intended to connect content processes across the ecosystem, while controlled public submissions can receive records without exposing the private workspace.</p>
-  </article></div>
+
+      <article class="tour-row">
+        <div class="tour-copy">
+          <span class="feature-index">01</span>
+          <h3>Sites and document libraries</h3>
+          <p>Each team gets a site with its own libraries and folders. Upload, rename, move, copy and delete files; deleted items go to a recycle bin, and quotas keep storage in check. A library of 100,000 files has been measured.</p>
+        </div>
+        <figure class="shot">
+          <img src="/screenshots/folder.webp" width="2400" height="1500" loading="lazy" alt="A folder in the Projects library, with the folder tree on the left and a list of spreadsheets, documents and PDFs.">
+        </figure>
+      </article>
+
+      <article class="tour-row tour-row-flip">
+        <div class="tour-copy">
+          <span class="feature-index">02</span>
+          <h3>Open files in the browser</h3>
+          <p>Spreadsheets open in GridCraft, word documents in WordCraft, PDFs in PdfCraft, and 3D designs in SolidCraft, all inside ShareCraft. Every save becomes a revision. For now, one person edits a file at a time while others read; editing a spreadsheet together is being built.</p>
+        </div>
+        <div class="shot-stack" role="group" aria-label="Files open in their editors">
+          <figure class="shot">
+            <img src="/screenshots/sheet.webp" width="2400" height="1500" loading="lazy" alt="A budget spreadsheet open in GridCraft inside ShareCraft.">
+            <figcaption>GridCraft</figcaption>
+          </figure>
+          <figure class="shot">
+            <img src="/screenshots/word.webp" width="2400" height="1500" loading="lazy" alt="A design brief open in WordCraft inside ShareCraft.">
+            <figcaption>WordCraft</figcaption>
+          </figure>
+          <figure class="shot">
+            <img src="/screenshots/pdf.webp" width="2400" height="1500" loading="lazy" alt="A site survey PDF open in PdfCraft inside ShareCraft.">
+            <figcaption>PdfCraft</figcaption>
+          </figure>
+        </div>
+      </article>
+
+      <article class="tour-row">
+        <div class="tour-copy">
+          <span class="feature-index">03</span>
+          <h3>Photo libraries</h3>
+          <p>An image library shows pictures as a grid instead of a list, for project photos, renders and sketches.</p>
+        </div>
+        <figure class="shot">
+          <img src="/screenshots/photos.webp" width="2400" height="1500" loading="lazy" alt="The Photos library showing image files as a grid of thumbnails.">
+        </figure>
+      </article>
+
+      <article class="tour-row tour-row-flip">
+        <div class="tour-copy">
+          <span class="feature-index">04</span>
+          <h3>Sharing you can understand</h3>
+          <p>See who has access to any site, folder or file, and where that access comes from. Give access to people or groups, make sharing links, answer access requests, and break or restore inheritance. The explorer shows the whole permission tree at once.</p>
+        </div>
+        <div class="shot-stack shot-stack-two" role="group" aria-label="Sharing and permissions">
+          <figure class="shot">
+            <img src="/screenshots/access.webp" width="2400" height="1500" loading="lazy" alt="The sharing page for a folder, listing who has access and which access is inherited from the site.">
+            <figcaption>Who has access</figcaption>
+          </figure>
+          <figure class="shot">
+            <img src="/screenshots/explorer.webp" width="2400" height="1500" loading="lazy" alt="The inheritance explorer, showing a tree of sites, libraries and folders and where permissions change.">
+            <figcaption>Inheritance explorer</figcaption>
+          </figure>
+        </div>
+      </article>
+
+      <article class="tour-row">
+        <div class="tour-copy">
+          <span class="feature-index">05</span>
+          <h3>People and groups</h3>
+          <p>Administrators add accounts, disable them, and organise people into groups. Someone whose access is removed is put out of any open document at once.</p>
+        </div>
+        <figure class="shot">
+          <img src="/screenshots/people.webp" width="2400" height="1500" loading="lazy" alt="The admin centre's People page listing accounts with their names, email addresses and status.">
+        </figure>
+      </article>
+
+      <article class="tour-row tour-row-flip">
+        <div class="tour-copy">
+          <span class="feature-index">06</span>
+          <h3>Your look, light or dark</h3>
+          <p>Each site can choose a theme and colours, with a live preview before saving. Every page follows the reader's light or dark setting.</p>
+        </div>
+        <div class="shot-stack shot-stack-two" role="group" aria-label="Themes and dark mode">
+          <figure class="shot">
+            <img src="/screenshots/look.webp" width="2400" height="1500" loading="lazy" alt="The Change the look page with theme choices and a live preview of the site.">
+            <figcaption>Change the look</figcaption>
+          </figure>
+          <figure class="shot">
+            <img src="/screenshots/site-dark.webp" width="2400" height="1500" loading="lazy" alt="The Harbor &amp; Pine team site in dark mode.">
+            <figcaption>Dark mode</figcaption>
+          </figure>
+        </div>
+      </article>
+
+      <article class="tour-row tour-row-phone">
+        <div class="tour-copy">
+          <span class="feature-index">07</span>
+          <h3>Works on a phone</h3>
+          <p>The same pages fit a small screen, with a bottom bar for moving between sites, files and people.</p>
+        </div>
+        <figure class="shot shot-phone">
+          <img src="/screenshots/folder-phone.webp" width="1170" height="2532" loading="lazy" alt="A library folder on a phone screen, with a list of files and a navigation bar at the bottom.">
+        </figure>
+      </article>
     </section>
-    <section class="sequence-section section-shell" aria-labelledby="sequence-title">
-      <div>
-        <p class="section-kicker">The shape of the work</p>
-        <h2 id="sequence-title">A simple path through a complex system.</h2>
+
+    <section class="state-section section-shell" aria-labelledby="state-title">
+      <div class="section-heading">
+        <div>
+          <p class="section-kicker">Honest status</p>
+          <h2 id="state-title">Built, and still to come.</h2>
+        </div>
       </div>
-      <ol><li>
-    <span>01</span>
-    <strong>Publish a governed space</strong>
-  </li><li>
-    <span>02</span>
-    <strong>Collaborate in context</strong>
-  </li><li>
-    <span>03</span>
-    <strong>Keep knowledge portable</strong>
-  </li></ol>
+      <div class="state-grid">
+        <div class="state-card">
+          <h3>Working now</h3>
+          <ul>
+            <li>Accounts, groups and roles: viewer, editor, owner</li>
+            <li>Team sites, navigation and document and image libraries</li>
+            <li>Uploads, recycle bin, copy and storage quotas</li>
+            <li>Sharing links, access requests and permission inheritance</li>
+            <li>GridCraft, WordCraft, PdfCraft and SolidCraft in the browser</li>
+            <li>Plain-text documents edited together, live</li>
+            <li>Every save kept as a Git revision; records in PostgreSQL</li>
+            <li>Site themes and branding, light and dark</li>
+            <li>Production mode behind your own HTTPS reverse proxy</li>
+          </ul>
+        </div>
+        <div class="state-card state-card-next">
+          <h3>Not built yet</h3>
+          <ul>
+            <li>Editing a spreadsheet together, live (in progress)</li>
+            <li>Libraries on Windows file shares and S3 storage (partly built)</li>
+            <li>Lists, pages and news</li>
+            <li>Search</li>
+            <li>Workflows</li>
+            <li>Guests and notifications</li>
+          </ul>
+        </div>
+      </div>
     </section>
+
     <section class="ecosystem section-shell" aria-labelledby="ecosystem-title">
       <div class="section-heading">
         <p class="section-kicker">One connected craft</p>
@@ -147,14 +245,15 @@
     </section>
     <section class="source-cta section-shell">
       <p class="section-kicker">Open from the beginning</p>
-      <h2>The source and the conversation belong in public.</h2>
-      <p>This site documents an intended direction. Follow the repository as the project definition, architecture, and implementation take shape.</p>
-      <p><a href="/ui-concepts.html">Explore the UI concepts <span aria-hidden="true">↗</span></a></p>
+      <h2>The source and the conversation are public.</h2>
+      <p>ShareCraft is dual-licensed under MIT and Apache 2.0. The repository has the code, the build instructions, and the plans for what comes next.</p>
+      <p><a href="/ui-concepts.html">Explore the early UI concepts <span aria-hidden="true">↗</span></a></p>
       <p><a href="/client-library.html">Try the client library: A–Z roller &amp; inline metadata <span aria-hidden="true">↗</span></a></p>
       <p><a href="/editor-frame.html">See the editor frame &amp; co-authoring states <span aria-hidden="true">↗</span></a></p>
+      <p><a href="https://github.com/ThineCraft/ShareCraft/blob/main/BUILDING.html">How to build and run it <span aria-hidden="true">↗</span></a></p>
       <a href="https://github.com/ThineCraft/ShareCraft">View on GitHub <span aria-hidden="true">↗</span></a>
     </section>
   </main>
-  <footer><span>ShareCraft</span><span>Part of the planned ThineCraft ecosystem.</span></footer>
+  <footer><span>ShareCraft</span><span>Part of the ThineCraft ecosystem.</span></footer>
 </body>
 </html>
