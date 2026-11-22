@@ -60,6 +60,10 @@ const SEAT_HEADER: &str = "x-sharecraft-seat";
 const REVISION_HEADER: &str = "x-sharecraft-revision";
 /// The response header saying the stored file is behind live entries.
 const LIVE_BEHIND_HEADER: &str = "x-sharecraft-live-behind";
+/// The live-base response headers carrying the stamp of the entry at the base's position: its
+/// time in Unix milliseconds and its seed.
+const LIVE_AT_MS_HEADER: &str = "x-sharecraft-live-at-ms";
+const LIVE_SEED_HEADER: &str = "x-sharecraft-live-seed";
 /// How many times a kept-both upload picks its name again when it is taken meanwhile.
 const NAME_ATTEMPTS: usize = 5;
 /// How much of a file a download reads and sends at a time.
@@ -432,6 +436,26 @@ pub(crate) async fn live_base(
                 CONTENT_TYPE,
                 HeaderValue::from_static("application/octet-stream"),
             );
+            // The checkpoint loads under the stamp of the entry at its position, as the editors
+            // that applied that entry calculated under it; the page needs both headers.
+            // A purged entry leaves the headers out: the page then cannot load this base.
+            let stamp = db
+                .live_entry_stamp(doc, at)
+                .await
+                .map_err(|e| ApiError::unavailable(&e))?
+                .map(|(stamped, seed)| (stamped.unix_timestamp_nanos() / 1_000_000, seed));
+            if let Some((at_ms, seed)) = stamp
+                && let Ok(at_ms) = i64::try_from(at_ms)
+            {
+                headers.insert(
+                    HeaderName::from_static(LIVE_AT_MS_HEADER),
+                    HeaderValue::from(at_ms),
+                );
+                headers.insert(
+                    HeaderName::from_static(LIVE_SEED_HEADER),
+                    HeaderValue::from(seed),
+                );
+            }
             let mut response = Body::from(checkpoint.session_data).into_response();
             *response.headers_mut() = headers;
             Ok(response)

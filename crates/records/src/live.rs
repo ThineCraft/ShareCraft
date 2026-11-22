@@ -919,6 +919,24 @@ impl Db {
         })
     }
 
+    /// The server's stamp on the entry at `seq` of `doc`'s log, a change or a cancel record:
+    /// when it was put in order and its seed. `None` when no such entry is kept. A checkpoint at
+    /// `seq` loads under it, so a joiner calculates as the editors that applied the entry did.
+    pub async fn live_entry_stamp(
+        &self,
+        doc: DocId,
+        seq: Seq,
+    ) -> Result<Option<(OffsetDateTime, u32)>, DbError> {
+        let row =
+            sqlx::query("select at, seed from live_entries where document_id = $1 and seq = $2")
+                .bind(doc.0)
+                .bind(signed(seq.0)?)
+                .fetch_optional(self.pool())
+                .await?;
+        row.map(|row| Ok((row.try_get("at")?, seed_of(row.try_get("seed")?)?)))
+            .transpose()
+    }
+
     /// Starts the session `session` of `doc` in `format`. Fails when `doc` has an open
     /// session already.
     pub async fn start_live_session(

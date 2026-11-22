@@ -20,7 +20,7 @@ use common::{
     FileClient, Site, TestServer, TestUser, new_doc, spawn_server, spawn_server_config,
     spawn_server_with, wait_events,
 };
-use records::NewLiveChange;
+use records::{NewLiveChange, NewLiveCheckpoint};
 use reqwest::StatusCode;
 use reqwest::header::{
     CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_SECURITY_POLICY, CONTENT_TYPE, ORIGIN,
@@ -979,6 +979,112 @@ async fn live_base_plain_file_revision_is_not_cached() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     assert_eq!(response.headers().get(CACHE_CONTROL).unwrap(), "no-store");
+}
+
+/// A joiner whose base is a verified checkpoint gets its identity data and the stamp of the
+/// entry at the base position, which the page needs to load the checkpoint (G5 Task 15: without
+/// the stamp headers no one could join a document once it had a verified checkpoint).
+#[tokio::test]
+async fn live_base_checkpoint_carries_the_stamp_of_its_position() {
+    let server = spawn_server().await;
+    let ann = server.user("Ann").await;
+    let doc = new_doc();
+    server.create_file_document(doc, &ann).await;
+    // The checkpoint names a stored revision of the document; its bytes do not matter here.
+    let mut seat = FileClient::connect_as(&server, doc, &ann).await;
+    let token = seat.token().unwrap();
+    let response = save(&server, &ann, doc, None, Some(&token), b"one".to_vec()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let json: Value = response.json().await.unwrap();
+    let revision = json["revision"].as_str().unwrap().to_owned();
+    let revision = revision.as_str();
+    seat.close().await;
+    let session = Uuid::new_v4();
+    server
+        .db
+        .db
+        .start_live_session(doc, session, "gridcraft/1", OffsetDateTime::now_utc())
+        .await
+        .unwrap();
+    let client = ClientId(Uuid::new_v4());
+    let first = OffsetDateTime::from_unix_timestamp(1_795_219_200).unwrap();
+    let second = OffsetDateTime::from_unix_timestamp(1_795_219_260).unwrap()
+        + time::Duration::milliseconds(167);
+    for (seq, at, seed) in [(1, first, 7), (2, second, 4_000_000_000)] {
+        server
+            .db
+            .db
+            .append_live_change(
+                doc,
+                &NewLiveChange {
+                    seq: Seq(seq),
+                    session,
+                    client,
+                    local: seq,
+                    participant: 1,
+                    user: ann.id,
+                    seen: Seq(seq - 1),
+                    at,
+                    seed,
+                    format: "gridcraft/1",
+                    payload: b"change",
+                    witnesses: &[1],
+                },
+            )
+            .await
+            .unwrap();
+    }
+    server
+        .db
+        .db
+        .record_live_checkpoint(
+            doc,
+            &NewLiveCheckpoint {
+                revision,
+                through: Seq(2),
+                sha256: [3; 32],
+                session,
+                session_data: b"identities",
+                major_reason: None,
+                major_person: None,
+                writer: None,
+                created_at: OffsetDateTime::now_utc(),
+            },
+        )
+        .await
+        .unwrap();
+    server
+        .db
+        .db
+        .verify_live_checkpoint(doc, revision, Seq(2), OffsetDateTime::now_utc())
+        .await
+        .unwrap();
+
+    let response = server
+        .http(Some(&ann))
+        .get(server.url(&format!("/api/docs/{}/live-base", doc.0)))
+        .query(&[("at", "2")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers().get(CACHE_CONTROL).unwrap(), "no-store");
+    let at_ms = (second.unix_timestamp_nanos() / 1_000_000).to_string();
+    assert_eq!(
+        response
+            .headers()
+            .get("x-sharecraft-live-at-ms")
+            .map(|value| value.as_bytes()),
+        Some(at_ms.as_bytes())
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-sharecraft-live-seed")
+            .map(|value| value.as_bytes()),
+        Some("4000000000".as_bytes())
+    );
+    assert_eq!(response.bytes().await.unwrap().as_ref(), b"identities");
 }
 
 #[tokio::test]
