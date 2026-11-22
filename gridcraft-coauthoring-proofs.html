@@ -23,11 +23,11 @@ tbody tr:nth-child(even)>td,tbody tr:nth-child(even)>th{background:light-dark(#f
 <p class="eyebrow">ThineCraft / ShareCraft report</p>
 <h1>GridCraft co-authoring: the proofs</h1>
 <p class="lede">Before anything is built for live co-authoring in GridCraft, plan G1 tested the four things the adopted design rests on (C16, “proofs first”). This report gives each result, its evidence, and a recommendation: go, with conditions.</p>
-<div class="meta"><span>Version 0.3 · G4 results added</span><span>19 November 2026</span><span>Reports against <a href="co-authoring-approach.html" style="color:inherit">co-authoring-approach.html</a> v1.3 (C1, C5, C7, C9, C12, C16, section 12) and <a href="sequencing.html" style="color:inherit">sequencing.html</a> (Stage 2 editor track)</span></div>
+<div class="meta"><span>Version 0.4 · G5 real-browser results added</span><span>22 November 2026</span><span>Reports against <a href="co-authoring-approach.html" style="color:inherit">co-authoring-approach.html</a> v1.3 (C1, C5, C7, C9, C12, C16, section 12) and <a href="sequencing.html" style="color:inherit">sequencing.html</a> (Stage 2 editor track)</span></div>
 </header>
 <div class="layout">
 <nav aria-label="Report contents"><p>In this report</p>
-<a href="#verdict">01 · Recommendation</a><a href="#results">02 · The four proofs</a><a href="#engines">03 · Two engines</a><a href="#platforms">04 · Desktop and browser</a><a href="#save">05 · Save and reopen</a><a href="#timing">06 · Rollback and re-run</a><a href="#selection">07 · Commands that read the selection</a><a href="#audit">08 · Determinism audit</a><a href="#fixes">09 · Engine fixes made</a><a href="#conditions">10 · Conditions for G3 to G5</a><a href="#notproved">11 · Not proved</a><a href="#decisions">12 · Decisions asked</a><a href="#evidence">13 · Evidence and commits</a><a href="#changes02">Changes in v0.2</a><a href="#changes03">Changes in v0.3</a>
+<a href="#verdict">01 · Recommendation</a><a href="#results">02 · The four proofs</a><a href="#engines">03 · Two engines</a><a href="#platforms">04 · Desktop and browser</a><a href="#save">05 · Save and reopen</a><a href="#timing">06 · Rollback and re-run</a><a href="#selection">07 · Commands that read the selection</a><a href="#audit">08 · Determinism audit</a><a href="#fixes">09 · Engine fixes made</a><a href="#conditions">10 · Conditions for G3 to G5</a><a href="#notproved">11 · Not proved</a><a href="#decisions">12 · Decisions asked</a><a href="#evidence">13 · Evidence and commits</a><a href="#browsers">14 · Real browsers (G5)</a><a href="#changes02">Changes in v0.2</a><a href="#changes03">Changes in v0.3</a><a href="#changes04">Changes in v0.4</a>
 </nav>
 <main id="main">
 <div class="toolbar"><span class="small">Standalone HTML · Print-ready · No external assets</span><button type="button" onclick="window.print()">Print / Save PDF</button></div>
@@ -176,13 +176,13 @@ tbody tr:nth-child(even)>td,tbody tr:nth-child(even)>th{background:light-dark(#f
 <tr><td>Checkpoints load with a full recalculation; fix the row-height loss (8 of 10,000); save deletion ownership with checkpoint identities.</td><td>G4</td><td><strong>Met in the fork.</strong> <code>checkpoint_load_recalculates_every_formula</code>, <code>checkpoint_load_stamps_the_first_iterative_calculation</code> and <code>checkpoint_reload_preserves_wrapped_formula_row_height</code> (the G1 loss, no longer ignored); <code>checkpoint_session_data_restores_deletion_ownership</code> and <code>grid_checkpoint_bytes_are_deterministic</code> (I8). Ordinary edits outside live sessions keep their old row behaviour: <code>ordinary_edit_does_not_fit_unrelated_formulas_or_change_saved_rows</code>. Fork commits <code>c0531b13</code>, <code>70dd423c</code>, <code>83561f76</code> on <code>coauthor-g4</code>.</td></tr>
 <tr><td>Prove second-writer bytes: two fresh editors load the same base, replay the same entries and write identical SHA-256; one checkpoint plus the changes after it equals straight-through; native and browser builds agree on entered content after a checkpoint.</td><td>G4</td><td><strong>Open.</strong> Plan G4 Task 12 names these fork tests; they are not written. The ShareCraft server compares hashes only, so it does not depend on them, but they are what make a peer check meaningful.</td></tr>
 <tr><td>Use one maths library in desktop and browser builds so last-digit computed results agree.</td><td>G4 / after G5</td><td><strong>Open.</strong> Until then, room agreement remains entered content only and desktop joining remains subject to C16.</td></tr>
-<tr><td>Re-run the browser checks and timings in real browsers (Chrome, Edge, Firefox), connect the host and bound fragmented identity-table work.</td><td>G5</td><td><strong>Open.</strong> I7 and the user-facing browser/desktop path belong to G5.</td></tr>
+<tr><td>Re-run the browser checks and timings in real browsers (Chrome, Edge, Firefox), connect the host and bound fragmented identity-table work.</td><td>G5</td><td><strong>Partly met (G5, 21 November 2026).</strong> Fragmented identity-table work is bounded (I7, G5.8: shared identity tables and a fragmentation limit). Real browsers: the built-in browser (Chromium 156) ran every test and passed; Chrome and Edge matched native on every correctness test but their timings were not received; Firefox ran only up to the cross-platform agreement test. Details and what was not run are in <a href="#browsers">section 14</a>. The browser host path is built; the acceptance run is recorded in <code>sequencing.html</code>.</td></tr>
 </tbody></table></div>
 </section>
 
 <section id="notproved"><h2>11 / Not proved</h2>
 <ul>
-<li>Real browsers: every browser-build result ran under Node.</li>
+<li>Real browsers: the G1 and G3 browser-build results ran under Node. G5 added a real-browser run (section 14), which is complete only for the built-in browser; Chrome and Edge timings and most of the Firefox run are still missing.</li>
 <li>Linux and macOS desktops.</li>
 <li>Clients that loaded a checkpoint, beyond the G4 fork tests in section 10: equal hashes from two fresh editors, and checkpoint-plus-suffix against straight-through, are not proved yet.</li>
 <li>Expensive-formula workbooks outside the G3 follow-up’s deliberately heavy 20,000-formula, one-80-cell-block workload.</li>
@@ -224,6 +224,46 @@ tbody tr:nth-child(even)>td,tbody tr:nth-child(even)>th{background:light-dark(#f
 <p class="small">Tests at the end of G1: engine 902 unit and 127 integration tests passing; xlsx 368; calculation 118; browser build 6. New test-only dependency: <code>wasm-bindgen-test</code> 0.3.79 (MIT or Apache-2.0), run with <code>wasm-bindgen-test-runner</code> 0.2.129 installed in its own folder on J:.</p>
 </section>
 
+<section id="browsers"><h2>14 / Real browsers (G5)</h2>
+<p>G5 Task 14 re-ran the browser build’s tests in real browsers. The fork’s tests for <code>wasm32-unknown-unknown</code> (<code>wasm_matches_native_fixtures</code>, the maths grid, the ignored rollback timing tests and Task 8’s fragmented-axis timing) were built in release mode with the ignored tests included, and served to each browser by the already-installed test runner in its interactive mode (runner 0.2.129). Nothing new was downloaded. The browser-side counterpart of the fragmented-axis timing is fork commit <code>f0074681</code>. The G1 measurements above are unchanged; the figures here are additional.</p>
+<p>Claude in Chrome could not reach this PC’s local ports, so Claude ran the built-in browser and the owner ran Chrome, Edge and Firefox by hand, at a runner address on this PC.</p>
+<div class="table-wrap"><table>
+<thead><tr><th scope="col">Browser</th><th scope="col">Run by</th><th scope="col">Correctness tests</th><th scope="col">Timings</th></tr></thead>
+<tbody>
+<tr><td>Built-in browser (Chromium 156), pane visible</td><td>Claude</td><td>All tests ran without error. 1,584 formula cells in 5 text formats compared; 6 differ, all 6 on the allowed list. Checkpoint head hash <code>8c464a91…</code>, identical to native.</td><td>Complete. Headline: 10 pending changes on 100,000 cells, clone and apply p95 59.665 ms (limit 150 ms). Fragmented axis: p95 0.200 ms per entry, 0 identity runs walked.</td></tr>
+<tr><td>Chrome</td><td>Owner</td><td>All non-timing tests ran without error. 6 of 6 differences allowed. Checkpoint hash identical to native.</td><td>Not received. The timing test had started and its results were still pending.</td></tr>
+<tr><td>Edge</td><td>Owner</td><td>Same as Chrome: all non-timing tests, 6 of 6 allowed, checkpoint identical to native.</td><td>Not received (same state as Chrome).</td></tr>
+<tr><td>Firefox</td><td>Owner</td><td>Ran without error up to the start of <code>cross_platform_agreement_uses_entered_digest</code>: maths grid, displayed text (6 of 6 allowed), fixtures, ULP, step differences, checkpoint (identical to native) and maths inputs.</td><td>Not run. The last line seen was the start of the cross-platform agreement test; the timing tests were not reached.</td></tr>
+</tbody></table></div>
+<h3>Built-in browser timings (milliseconds, p95, 30 runs after one warm-up)</h3>
+<div class="table-wrap"><table>
+<thead><tr><th scope="col">Workload (stored cells, pending changes)</th><th scope="col">Apply</th><th scope="col">Recalculation</th></tr></thead>
+<tbody>
+<tr><td>Mixed, 10,000 cells, 10 pending (1 structural)</td><td>6.465</td><td>8.105</td></tr>
+<tr><td>Mixed, 100,000 cells, 1 pending</td><td>4.185</td><td>55.905</td></tr>
+<tr><td>Mixed, 100,000 cells, 10 pending (1 structural): the proposal’s workload</td><td>59.665</td><td>93.105</td></tr>
+<tr><td>Content only, 100,000 cells, 10 pending</td><td>5.635</td><td>31.485</td></tr>
+<tr><td>One structural change among 10, 100,000 cells</td><td>48.900</td><td>69.185</td></tr>
+<tr><td>Mixed, 1,000,000 cells, 10 pending (1 structural)</td><td>559.935</td><td>928.955</td></tr>
+</tbody></table></div>
+<p class="small">The 59.665 ms figure is the one the 150 ms limit applies to (clone plus apply); it is met with room to spare. On 100,000 cells, single commands take under 1.1 ms at p95 except row and column inserts and deletes, which take 36 to 54 ms, the same character as the G1 finding in section 06. Only a selection of the rows is shown here.</p>
+<h3>Fragmented identity table (I7)</h3>
+<div class="table-wrap"><table>
+<thead><tr><th scope="col">Axis</th><th scope="col">1,000 <code>cell.set</code> entries</th><th scope="col">Per entry</th><th scope="col">Identity runs copied or walked</th></tr></thead>
+<tbody>
+<tr><td>1 run, 0 owned deletions</td><td>185.4 ms</td><td>p50 0.110, p95 0.205, max 8.635 ms</td><td>0</td></tr>
+<tr><td>60,001 runs, 30,000 owned deletions</td><td>181.8 ms</td><td>p50 0.105, p95 0.200, max 8.590 ms</td><td>0</td></tr>
+</tbody></table></div>
+<p>The heavily fragmented axis costs the same per entry as the unfragmented one, so the I7 cost is bounded in a real browser as well as natively.</p>
+<h3>What was not run</h3>
+<ul>
+<li>The timing tests in Chrome and Edge (started, results not received) and in Firefox (not reached). The 150 ms limit is therefore shown met in one engine family only (Chromium 156 in the built-in browser).</li>
+<li>Firefox’s cross-platform agreement test and everything after it, including the rollback and fragmented-axis timings.</li>
+<li>Safari, and Linux and macOS desktops.</li>
+<li>Repeated separate runs: each browser was run once.</li>
+</ul>
+</section>
+
 <section id="changes02"><h2>Changes in version 0.2</h2>
 <p>Version 0.2 adds the reviewed G3 results from the GridCraft fork (19 November 2026). It marks the G3-owned conditions met with their tests, adds the heavier-formula workload and timings, and carries the checkpoint, fragmented-identity, maths-library and pre-existing gate findings forward. It does not change the G1 measurements or the original go-with-conditions recommendation.</p>
 </section>
@@ -232,7 +272,11 @@ tbody tr:nth-child(even)>td,tbody tr:nth-child(even)>th{background:light-dark(#f
 <p>Version 0.3 adds the G4 checkpoint results from the GridCraft fork (19 November 2026). Checkpoints now load with a full recalculation, the G1 row-height loss is fixed and its test runs, and deletion ownership travels with the checkpoint identities. The fork gate run for G4 Task 12 (<code>cargo test -p gridcraft-engine --test it coauthor_</code> on <code>coauthor-g5</code> at <code>70dac9e9</code>, which contains G4) passed 173 tests with 3 ignored release-only tests. Still open: the second-writer and checkpoint-plus-suffix proofs, entered-content agreement after a checkpoint between the native and browser builds, one maths library, real browsers and the G5 host bridge. The G1 measurements and the recommendation are unchanged.</p>
 </section>
 
-<footer><p>ShareCraft · GridCraft co-authoring proofs (plans G1, G3 and G4) · Version 0.3 · 19 November 2026</p></footer>
+<section id="changes04"><h2>Changes in version 0.4</h2>
+<p>Version 0.4 adds the G5 real-browser results (21 November 2026): section 14, and the real-browser and fragmented-table lines in sections 10 and 11. The built-in browser passed every test, with the headline rollback timing at 59.665 ms against the 150 ms limit. Chrome, Edge and Firefox ran the correctness tests the owner could reach and matched native, but the timings from Chrome and Edge were not received and Firefox stopped before its timing tests. The G1 measurements, the G4 results and the recommendation are unchanged.</p>
+</section>
+
+<footer><p>ShareCraft · GridCraft co-authoring proofs (plans G1, G3, G4 and G5) · Version 0.4 · 22 November 2026</p></footer>
 </main>
 </div>
 </body>
