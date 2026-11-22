@@ -8,6 +8,10 @@ use sqlx::PgConnection;
 
 use crate::events::{NewEvent, record};
 use crate::policies::{BLOCKED_FILE_TYPES, valid_blocked_types};
+use crate::s3_endpoints::{
+    S3_BYTES_DOWN, S3_ENDPOINTS, S3_LIST_REQUESTS, S3_READ_REQUESTS, valid_bytes_setting,
+    valid_endpoints_setting, valid_request_setting,
+};
 use crate::scans::{SCANNER_SETTINGS, SCANNER_URL, valid_scanner_setting};
 use crate::share_paths::{
     SHARE_CACHE_MAX_BYTES, SHARE_LIST_SECONDS, SHARE_ROOTS, valid_cache_setting,
@@ -49,6 +53,9 @@ fn validate(key: &str, value: &Value) -> Result<(), AccessError> {
         SHARE_ROOTS => valid_roots_setting(value),
         SHARE_CACHE_MAX_BYTES => valid_cache_setting(value),
         SHARE_LIST_SECONDS => valid_list_setting(value),
+        S3_ENDPOINTS => valid_endpoints_setting(value),
+        S3_LIST_REQUESTS | S3_READ_REQUESTS => valid_request_setting(value),
+        S3_BYTES_DOWN => valid_bytes_setting(value),
         ANYONE_LINK_MAX_DAYS => value
             .as_i64()
             .is_some_and(|days| (1..=MAX_DAYS_LIMIT).contains(&days)),
@@ -154,6 +161,14 @@ impl Db {
         .bind(actor.0)
         .execute(&mut *tx)
         .await?;
+        let event_values = if key == S3_ENDPOINTS {
+            (
+                before.as_ref().map(|_| json!("[redacted]")),
+                json!("[redacted]"),
+            )
+        } else {
+            (before.clone(), value.clone())
+        };
         record(
             &mut tx,
             NewEvent {
@@ -162,7 +177,7 @@ impl Db {
                 subject: None,
                 document: None,
                 node: None,
-                detail: json!({ "key": key, "from": before, "to": value }),
+                detail: json!({ "key": key, "from": event_values.0, "to": event_values.1 }),
             },
         )
         .await?;

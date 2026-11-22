@@ -22,6 +22,7 @@ mod quotas;
 mod requests;
 mod revisions;
 mod roles;
+mod s3_endpoints;
 mod scans;
 mod scopes;
 mod settings;
@@ -73,6 +74,11 @@ pub use requests::{
 };
 pub use revisions::{RevisionRecord, RevisionRow};
 pub use roles::{Access, Perms, Principal, RoleDef, RoleRef};
+pub use s3_endpoints::{
+    EndpointRefusal, IpRange, S3_BYTES_DOWN, S3_ENDPOINTS, S3_LIST_REQUESTS, S3_READ_REQUESTS,
+    S3Endpoint, S3Settings, address_allowed, aws_endpoint, clean_prefix, find_endpoint,
+    prefixes_overlap, s3_location, valid_bucket,
+};
 pub use scans::{
     DueScan, HeldDocument, ICAP_PORT, MAX_SCAN_DETAIL, Origin, QuarantineEntry, RELEASE_REASON,
     SCANNER_MAX_BYTES, SCANNER_SETTINGS, SCANNER_TIMEOUT_SECONDS, SCANNER_TOO_LARGE,
