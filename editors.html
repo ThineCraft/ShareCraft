@@ -35,7 +35,7 @@ table.band tbody tr:nth-child(even) td{background:light-dark(#f2f6f5,#1f3436)}
 <section id="status"><h2>00 / Where things stand</h2>
 <div class="note"><p><strong>All four editors open from ShareCraft and save back as Git revisions.</strong> On 10 November 2026, GridCraft, WordCraft, PdfCraft and SolidCraft were each built from their fork, opened from ShareCraft in a browser, edited, saved, and reopened from the saved Git revision. Each check covered the main path only; section 08 lists what was not checked, and sections 03 to 07 what does not work yet. Stage 1 was merged into <code>main</code> on 10 November 2026 (commit <code>28479e7</code>).</p>
 <p><strong>Since then, on 11 November 2026, each editor was changed to keep the document ShareCraft opened.</strong> When an editor is hosted by ShareCraft, its own New, Open and Close are refused, so a person cannot swap the document inside the frame and have a later Save store the other one. The new GridCraft, WordCraft and PdfCraft commits were pushed to the <code>sharecraft</code> branch of each fork on 11 November 2026. Sections 02 to 07 give the detail, and section 08 what was not checked.</p>
-<p>The browser checks were done by the project owner's assistant using the browser built into its tools, one browser engine only. Section 08 lists what was not checked. One person edits a file at a time; editing a file together is Stage 2 work.</p></div>
+<p>The browser checks were done by the project owner's assistant using the browser built into its tools, one browser engine only. Section 08 lists what was not checked. One person edits a file at a time, with one exception: GridCraft in the browser can be edited together by several people when the server is switched to allow it (section 03, "Live co-authoring"). That is on in development only and off elsewhere until the owner decides.</p></div>
 </section>
 
 <section id="how"><h2>01 / How an editor opens from ShareCraft</h2>
@@ -55,7 +55,7 @@ table.band tbody tr:nth-child(even) td{background:light-dark(#f2f6f5,#1f3436)}
 <div class="table-wrap"><table><caption>Where each editor comes from</caption>
 <thead><tr><th>Editor</th><th>Upstream and base commit</th><th>Fork, branch and fork commit</th><th>Version</th></tr></thead>
 <tbody>
-<tr><td>GridCraft (spreadsheets)</td><td><a href="https://github.com/storytold/gridcraft">storytold/gridcraft</a><br><span class="hash">e9addf52fe68847e6c1310fcfa5d42b7aa8b9650</span></td><td><a href="https://github.com/ThineCraft/GridCraft">ThineCraft/GridCraft</a>, branch <code>sharecraft</code><br><span class="hash">017d0b9d5d167096bcba7d7216569476f80b9046</span></td><td>0.16.0</td></tr>
+<tr><td>GridCraft (spreadsheets)</td><td><a href="https://github.com/storytold/gridcraft">storytold/gridcraft</a><br><span class="hash">e9addf52fe68847e6c1310fcfa5d42b7aa8b9650</span></td><td><a href="https://github.com/ThineCraft/GridCraft">ThineCraft/GridCraft</a>, branch <code>sharecraft</code><br><span class="hash">8a7c0bbcd33c7ca163be36e6c71e8a07e692647f</span><br><span class="small">(was <span class="hash">017d0b9d</span> until G5, 22 November 2026)</span></td><td>0.16.0</td></tr>
 <tr><td>WordCraft (word documents)</td><td><a href="https://github.com/storytold/wordcraft">storytold/wordcraft</a><br><span class="hash">2922fe566b575794f896077467cf92825ccba7c9</span></td><td><a href="https://github.com/ThineCraft/WordCraft">ThineCraft/WordCraft</a>, branch <code>sharecraft</code><br><span class="hash">35551cebbaa854a9cfd9bf7da66a49505ec39ad2</span></td><td>0.15.1</td></tr>
 <tr><td>PdfCraft (PDFs)</td><td><a href="https://github.com/storytold/pdfcraft">storytold/pdfcraft</a><br><span class="hash">a71b5124bc388e6b86ec0ee5ec16d31fa1955117</span></td><td><a href="https://github.com/ThineCraft/PdfCraft">ThineCraft/PdfCraft</a>, branch <code>sharecraft</code><br><span class="hash">343edd8045970651a37bafaf78ac7a747cfdda2a</span></td><td>0.18.1</td></tr>
 <tr><td>SolidCraft (3D designs)</td><td><a href="https://github.com/tangency-labs/solidcraft">tangency-labs/solidcraft</a><br><span class="hash">f232e4a40c9d1d3088c758e393b7db43048eac22</span></td><td><a href="https://github.com/ThineCraft/SolidCraft">ThineCraft/SolidCraft</a>, branch <code>sharecraft</code><br><span class="hash">dd8724aeaa10d50de232d7be44864683fdfc508f</span></td><td>0.40.0-rc.3</td></tr>
@@ -88,7 +88,7 @@ table.band tbody tr:nth-child(even) td{background:light-dark(#f2f6f5,#1f3436)}
 <section id="gridcraft"><h2>03 / GridCraft</h2>
 <div class="cards">
 <article class="module"><span class="tag">Opens and saves from ShareCraft</span><h3>Where it comes from and what was changed</h3>
-<p>Upstream <a href="https://github.com/storytold/gridcraft">storytold/gridcraft</a> by the ArtCraft team, base <span class="hash">e9addf52fe68847e6c1310fcfa5d42b7aa8b9650</span>. Fork <a href="https://github.com/ThineCraft/GridCraft">ThineCraft/GridCraft</a>, branch <code>sharecraft</code>, ending at <span class="hash">017d0b9d5d167096bcba7d7216569476f80b9046</span>. The hosted lock (below) was added on 11 November 2026.</p>
+<p>Upstream <a href="https://github.com/storytold/gridcraft">storytold/gridcraft</a> by the ArtCraft team, base <span class="hash">e9addf52fe68847e6c1310fcfa5d42b7aa8b9650</span>. Fork <a href="https://github.com/ThineCraft/GridCraft">ThineCraft/GridCraft</a>, branch <code>sharecraft</code>, ending at <span class="hash">8a7c0bbcd33c7ca163be36e6c71e8a07e692647f</span>. It was <span class="hash">017d0b9d5d167096bcba7d7216569476f80b9046</span> until plan G5, which added live co-authoring on top (below). The hosted lock was added on 11 November 2026.</p>
 <p>Why there are changes at all: the fork must not present itself as ArtCraft's product or suggest ArtCraft endorses it, but it must still credit where it came from. So the changes remove the upstream brand from what a person sees, and say plainly what the fork is based on.</p>
 <ul>
 <li>The About dialog said "Part of ArtCraft." It now says "Based on GridCraft by the ArtCraft team." Its links to the ArtCraft website and chat server were removed, with the translations used only by those links.</li>
@@ -130,6 +130,31 @@ table.band tbody tr:nth-child(even) td{background:light-dark(#f2f6f5,#1f3436)}
 <li>The start dialog had no Open&hellip;. Its Blank workbook and template buttons were refused with "not available here", and one workbook remained.</li>
 <li>Data &#9656; Get Data was refused with the same note, and no file picker appeared. Opening the open dialog through the editor's page interface returned no dialog, and file.open and file.new through its command interface were refused.</li>
 </ul>
+<h4>Live co-authoring (plan G5, 22 November 2026)</h4>
+<p>Several people can edit one GridCraft spreadsheet at the same time in the browser, with their selections drawn for each other and each person&rsquo;s own Undo. It is built into the fork and connected through ShareCraft&rsquo;s frame page. It is <strong>off by default</strong>: ShareCraft routes a GridCraft document to a live session only when the server is started with <code>SHARECRAFT_LIVE_EDITORS=gridcraft</code> and the installed build&rsquo;s <code>editor.json</code> declares <code>"live": {"format": "gridcraft/1", "protocol": 1}</code>. It was switched on in development for the acceptance run; production stays off until the owner decides. How the run went is in <a href="BUILDING.html#live-room">BUILDING.html section 32</a> and <a href="co-authoring-approach.html#changes17">co-authoring-approach.html v1.7</a>.</p>
+<div class="table-wrap"><table class="band"><caption>GridCraft capability matrix: live co-authoring</caption>
+<thead><tr><th>Capability</th><th>GridCraft in the browser (ShareCraft frame)</th><th>Desktop GridCraft</th></tr></thead>
+<tbody>
+<tr><td>Live co-authoring</td><td>Yes, when switched on (development only for now)</td><td>No. It is in the design (C5, C16) but not in G5; it waits for one shared Rust maths library, because the desktop and browser maths can differ in the last digit.</td></tr>
+<tr><td>Others&rsquo; selection and presence</td><td>Yes (selection drawn after the G5 presence fix)</td><td>No</td></tr>
+<tr><td>Personal Undo and Redo</td><td>Yes: your own change only, where the document is still as you left it</td><td>No</td></tr>
+<tr><td>Editing while offline</td><td>Refused with &ldquo;You&rsquo;re offline. Changes can be made again when the connection is back.&rdquo;; text already being typed is kept; changes already sent are kept and resent</td><td>Not applicable</td></tr>
+<tr><td>Commands not shared yet (filter toggle, writing a range from a script, sort, cut and paste, fill, objects, charts, pivots, macros)</td><td>Refused in a live document with &ldquo;Not available while editing together&rdquo;</td><td>Not applicable</td></tr>
+<tr><td>Save</td><td>Automatic checkpoints checked by a second editor; no Save button and no seat</td><td>Unchanged: one person, Save stores a revision</td></tr>
+<tr><td>Show Changes, large content, desktop sessions</td><td>Not built</td><td>Not built</td></tr>
+</tbody></table></div>
+<p>WordCraft, PdfCraft and SolidCraft keep the one editing seat (C17). Their co-authoring is in the design, not in G5.</p>
+<h4>Fork mapping and base</h4>
+<div class="table-wrap"><table class="band"><caption>Where the live co-authoring work sits in the GridCraft fork</caption>
+<thead><tr><th>Item</th><th>Value</th></tr></thead>
+<tbody>
+<tr><td>Upstream and base</td><td>storytold/gridcraft at <span class="hash">e9addf52fe68847e6c1310fcfa5d42b7aa8b9650</span>, unchanged by G5</td></tr>
+<tr><td>Fork branch ShareCraft builds from</td><td><code>sharecraft</code>, at <span class="hash">8a7c0bbc</span> (fast-forwarded from the earlier G5 work on <code>coauthor-g5</code> with the owner&rsquo;s yes; the work passed through <code>g5-task8b</code>, <code>g5-presence</code> and <code>g5-offline</code>)</td></tr>
+<tr><td>What it adds to the base</td><td>The shared <code>collab-live</code>, <code>collab-core</code> and <code>protocol</code> crates from ShareCraft, pinned by git revision; the identity-based command format <code>gridcraft/1</code>; the in-process live adapter; shared identity tables with a fragmentation limit; and the web editor&rsquo;s live host messages, presence drawing and offline refusal</td></tr>
+<tr><td>Declared in the build</td><td><code>live_format = "gridcraft/1"</code> in <code>editors.toml</code>, written into <code>editor.json</code> as <code>live</code> by <code>cargo xtask editors build</code></td></tr>
+<tr><td>Reproducible</td><td>Two builds from empty target folders on 22 November 2026 gave 16 installed files with identical hashes. <code>NOTICE</code>, <code>ATTRIBUTION.md</code>, <code>LICENSE-APACHE</code> and <code>LICENSE-MIT</code> are in <code>licenses/</code>.</td></tr>
+<tr><td>Pushing</td><td>Pushing the fork&rsquo;s branches and merging wait for the owner&rsquo;s yes</td></tr>
+</tbody></table></div>
 <h4>What does not work, or works differently</h4>
 <ul>
 <li>The frame's Save button does nothing while the browser tab is hidden (section 07).</li>
@@ -334,6 +359,18 @@ table.band tbody tr:nth-child(even) td{background:light-dark(#f2f6f5,#1f3436)}
 <li>Update this page (commits, version, size, what works) and commit <code>editors.toml</code> and this page together in ShareCraft.</li>
 </ol>
 <p class="small">Step 2 and the use of tags are a suggestion of this page, not something the build tool needs.</p>
+<h3>Re-pinning ShareCraft to a newer GridCraft build</h3>
+<p>GridCraft depends on ShareCraft&rsquo;s live crates by git revision, and ShareCraft builds the GridCraft editor from a recorded fork commit, so the two are moved together:</p>
+<ol>
+<li>In the fork, finish and commit the change on a branch, with the fork&rsquo;s own checks passing. For a change to the co-authoring code also run the browser tests (<code>wasm_replay</code>) natively and for <code>wasm32</code>.</li>
+<li>With the owner&rsquo;s yes, move the fork&rsquo;s <code>sharecraft</code> branch to that commit (a fast-forward when the history is linear). <code>cargo xtask editors build gridcraft</code> refuses unless the fork&rsquo;s folder is on <code>sharecraft</code>, clean, and cut from the recorded base.</li>
+<li>If the change is in ShareCraft&rsquo;s own live crates, commit that in ShareCraft first and set the fork&rsquo;s dependency to that full commit hash; the ShareCraft commit must be pushed before anyone else can build the fork.</li>
+<li>In ShareCraft, record the new full fork commit as <code>commit</code> in the <code>[gridcraft]</code> table of <code>editors.toml</code>. Keep <code>live_format</code>; change it only when the command format changes, and then older rooms must be allowed to finish first.</li>
+<li>Build, and check the build is reproducible: <code>cargo xtask editors build gridcraft</code> twice, each from an empty <code>SHARECRAFT_EDITOR_TARGET_DIR</code>, and compare the installed files&rsquo; hashes. Then <code>cargo xtask editors verify</code>, and check <code>editor.json</code> still has the <code>live</code> field and <code>licenses/</code> still holds the four notice files.</li>
+<li><strong>Restart the server.</strong> It reads the installed editors once, at start. Open live sessions end at the restart.</li>
+<li>Repeat the checks that matter: a GridCraft document&rsquo;s answer says <code>"session": "live"</code>, two people can edit it, and a closed file reopens.</li>
+<li>Commit <code>editors.toml</code> and this page together in ShareCraft.</li>
+</ol>
 </section>
 
 <section id="risks"><h2>11 / Risks</h2>
