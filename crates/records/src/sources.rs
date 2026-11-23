@@ -15,6 +15,7 @@ use uuid::Uuid;
 use crate::events::{NewEvent, record};
 use crate::libraries::ensure_library_row;
 use crate::quotas::recompute_site_usage;
+use crate::s3_endpoints::{clean_prefix, prefixes_overlap, s3_location, valid_bucket};
 use crate::{AccessError, Db, DbError, Editor, SharePath};
 
 /// PostgreSQL's code for a row a check constraint refuses.
@@ -65,6 +66,7 @@ impl std::fmt::Debug for SealedRow {
 pub enum SourceKind {
     Github,
     Share,
+    S3,
 }
 
 impl SourceKind {
@@ -74,6 +76,7 @@ impl SourceKind {
         match self {
             SourceKind::Github => "github",
             SourceKind::Share => "share",
+            SourceKind::S3 => "s3",
         }
     }
 
@@ -83,6 +86,7 @@ impl SourceKind {
         match word {
             "github" => Some(SourceKind::Github),
             "share" => Some(SourceKind::Share),
+            "s3" => Some(SourceKind::S3),
             _ => None,
         }
     }
@@ -285,6 +289,8 @@ pub struct ExternalEntry {
     pub repository_path: String,
     pub size: u64,
     pub mtime_ns: i64,
+    /// The entry's own change tag; `None` stores [`external_tag`] of `size` and `mtime_ns`.
+    pub tag: Option<String>,
 }
 
 /// Why the bytes of an external item cannot currently be read.
@@ -294,6 +300,167 @@ pub enum Unavailable {
     Gone,
     TooLarge,
     Locked,
+    /// The object is archived (offline) in the store and must be restored first.
+    Archived,
+}
+
+/// Whether versioning is on in an S3 bucket, as probed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Versioning {
+    Enabled,
+    Suspended,
+    None,
+    Unknown,
+}
+
+impl Versioning {
+    /// The word for the state, as stored.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Versioning::Enabled => "enabled",
+            Versioning::Suspended => "suspended",
+            Versioning::None => "none",
+            Versioning::Unknown => "unknown",
+        }
+    }
+
+    /// The state named `word`.
+    #[must_use]
+    pub fn parse(word: &str) -> Option<Versioning> {
+        match word {
+            "enabled" => Some(Versioning::Enabled),
+            "suspended" => Some(Versioning::Suspended),
+            "none" => Some(Versioning::None),
+            "unknown" => Some(Versioning::Unknown),
+            _ => None,
+        }
+    }
+}
+
+/// A yes, a no, or not known yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tri {
+    Yes,
+    No,
+    Unknown,
+}
+
+impl Tri {
+    /// The word for the answer, as stored.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Tri::Yes => "yes",
+            Tri::No => "no",
+            Tri::Unknown => "unknown",
+        }
+    }
+
+    /// The answer named `word`.
+    #[must_use]
+    pub fn parse(word: &str) -> Option<Tri> {
+        match word {
+            "yes" => Some(Tri::Yes),
+            "no" => Some(Tri::No),
+            "unknown" => Some(Tri::Unknown),
+            _ => None,
+        }
+    }
+}
+
+/// Where the bucket of an S3-backed library is, and what was learned about it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct S3Place {
+    /// The name of an approved endpoint.
+    pub endpoint: String,
+    pub bucket: String,
+    /// Empty, or ends in `/`.
+    pub prefix: String,
+    pub access_key_id: String,
+    pub versioning: Versioning,
+    /// Whether the store honours conditional requests.
+    pub conditional: Tri,
+}
+
+/// Requests and bytes counted against an S3 library in one month.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Usage {
+    pub list: u64,
+    pub read: u64,
+    pub write: u64,
+    pub bytes_down: u64,
+    pub bytes_up: u64,
+    pub cache_hits: u64,
+}
+
+/// What an S3 library may use in a month.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Budget {
+    pub list_requests: u64,
+    pub read_requests: u64,
+    pub bytes_down: Option<u64>,
+}
+
+/// What a change tag says.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TagParts {
+    pub mtime_ns: i64,
+    /// The first 16 hex digits of the SHA-256 of the object's ETag; absent in a file-share tag.
+    pub etag: Option<String>,
+    pub archived: bool,
+}
+
+/// The change tag of an S3 object: `x{size}-{ns}~{16 hex}` and `!a` when it is archived. The
+/// 16 hex digits are the start of the SHA-256 of the ETag exactly as received.
+#[must_use]
+pub fn object_tag(size: u64, modified_s: i64, etag: &str, archived: bool) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+    let digest = Sha256::digest(etag.as_bytes());
+    let mut tag = format!("x{size}-{}~", modified_s.saturating_mul(1_000_000_000));
+    for byte in digest.iter().take(8) {
+        let _ = write!(tag, "{byte:02x}");
+    }
+    if archived {
+        tag.push_str("!a");
+    }
+    tag
+}
+
+/// Reads a change tag of either form (`x5-1700…` and `x5-1700…~ab12…!a`) for an item of `size`
+/// bytes. `None` when it is neither.
+#[must_use]
+pub fn external_tag_parts(tag: &str, size: u64) -> Option<TagParts> {
+    let rest = tag
+        .strip_prefix('x')?
+        .strip_prefix(size.to_string().as_str())?
+        .strip_prefix('-')?;
+    let (rest, archived) = match rest.strip_suffix("!a") {
+        Some(rest) => (rest, true),
+        None => (rest, false),
+    };
+    let (time, etag) = match rest.split_once('~') {
+        Some((time, digest)) => {
+            let hex = digest.len() == 16
+                && digest
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+            if !hex {
+                return None;
+            }
+            (time, Some(digest.to_owned()))
+        }
+        None => (rest, None),
+    };
+    if archived && etag.is_none() {
+        return None;
+    }
+    Some(TagParts {
+        mtime_ns: time.parse().ok()?,
+        etag,
+        archived,
+    })
 }
 
 /// Writes every source row belonging to a tree batch through the tree projection's existing
@@ -329,22 +496,26 @@ pub(crate) async fn record_source_items_with(
                 let modified =
                     OffsetDateTime::from_unix_timestamp_nanos(i128::from(entry.mtime_ns))
                         .map_err(DbError::new)?;
+                let tag = entry_tag(entry);
+                let unavailable = tag_unavailable(&tag, entry.size);
                 Ok((
                     entry,
-                    external_tag(entry.size, entry.mtime_ns),
+                    tag,
                     size,
                     new_external_revision(),
                     modified,
+                    unavailable,
                 ))
             })
             .collect::<Result<Vec<_>, DbError>>()?;
         let mut query = QueryBuilder::<Postgres>::new(
             "insert into source_items \
-             (library_id, path, repository_path, node_id, blob_sha, size, revision, modified_at) ",
+             (library_id, path, repository_path, node_id, blob_sha, size, revision, modified_at, \
+              unavailable) ",
         );
         query.push_values(
             &values,
-            |mut row, (entry, tag, size, revision, modified)| {
+            |mut row, (entry, tag, size, revision, modified, unavailable)| {
                 row.push_bind(library.0)
                     .push_bind(&entry.path)
                     .push_bind(&entry.repository_path)
@@ -352,7 +523,8 @@ pub(crate) async fn record_source_items_with(
                     .push_bind(tag)
                     .push_bind(*size)
                     .push_bind(revision)
-                    .push_bind(*modified);
+                    .push_bind(*modified)
+                    .push_bind(*unavailable);
             },
         );
         query.build().execute(&mut *conn).await?;
@@ -367,6 +539,7 @@ impl Unavailable {
             Unavailable::Gone => "gone",
             Unavailable::TooLarge => "too_large",
             Unavailable::Locked => "locked",
+            Unavailable::Archived => "archived",
         }
     }
 
@@ -376,16 +549,20 @@ impl Unavailable {
             "gone" => Some(Unavailable::Gone),
             "too_large" => Some(Unavailable::TooLarge),
             "locked" => Some(Unavailable::Locked),
+            "archived" => Some(Unavailable::Archived),
             _ => None,
         }
     }
 }
 
-/// A live document backed by a file-share source.
+/// A live document backed by a file-share or S3 source.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExternalItem {
     pub library: NodeId,
     pub node: NodeId,
+    /// The kind of source that holds it: a file share or S3.
+    pub kind: SourceKind,
+    /// The stored location text of the source.
     pub location: String,
     pub repository_path: String,
     pub size: u64,
@@ -394,6 +571,8 @@ pub struct ExternalItem {
     pub revision: String,
     pub sha256: Option<[u8; 32]>,
     pub unavailable: Option<Unavailable>,
+    /// The object version the item was last read at, where the store keeps versions.
+    pub version: Option<String>,
 }
 
 /// The compact change-detection tag stored in `source_items.blob_sha`.
@@ -532,14 +711,34 @@ fn decode_sha256(hex: &str) -> Result<[u8; 32], sqlx::Error> {
     bytes.try_into().map_err(|_| decode("SHA-256", hex))
 }
 
-fn external_mtime(tag: &str) -> Result<i64, sqlx::Error> {
-    let (_, mtime) = tag
-        .strip_prefix('x')
-        .and_then(|rest| rest.split_once('-'))
-        .ok_or_else(|| decode("external tag", tag))?;
-    mtime
-        .parse()
-        .map_err(|error| sqlx::Error::Decode(Box::new(error)))
+fn usage_from_row(row: &PgRow) -> Result<Usage, sqlx::Error> {
+    let count = |column: &str| -> Result<u64, sqlx::Error> {
+        let value: i64 = row.try_get(column)?;
+        u64::try_from(value).map_err(|error| sqlx::Error::Decode(error.into()))
+    };
+    Ok(Usage {
+        list: count("list_requests")?,
+        read: count("read_requests")?,
+        write: count("write_requests")?,
+        bytes_down: count("bytes_down")?,
+        bytes_up: count("bytes_up")?,
+        cache_hits: count("cache_hits")?,
+    })
+}
+
+/// The tag stored for `entry`: its own, else the one built from its size and time.
+fn entry_tag(entry: &ExternalEntry) -> String {
+    entry
+        .tag
+        .clone()
+        .unwrap_or_else(|| external_tag(entry.size, entry.mtime_ns))
+}
+
+/// `Some("archived")` for the tag of an archived object.
+fn tag_unavailable(tag: &str, size: u64) -> Option<&'static str> {
+    external_tag_parts(tag, size)
+        .is_some_and(|parts| parts.archived)
+        .then_some("archived")
 }
 
 impl Db {
@@ -655,7 +854,24 @@ impl Db {
     /// `LibraryNotEmpty` if anything not in the bin is in it; `SourceExists` if it is connected
     /// already.
     pub async fn connect_source(&self, s: &NewSource) -> Result<(), AccessError> {
-        self.connect_source_inner(s, true).await
+        self.connect_source_inner(s, true, None).await
+    }
+
+    /// Connects a library to a bucket as [`Db::connect_source`] connects the other kinds, in
+    /// one transaction that also records `place`. `s.kind` must be `S3`, its location must be
+    /// [`s3_location`] of `place`, and its token the sealed secret key; the bucket must be a
+    /// valid name and the prefix clean (`InvalidSetting` otherwise). `Exists` when another
+    /// library holds the same endpoint and bucket under an overlapping prefix; the overlap is
+    /// judged under an organisation-wide lock, so two connections made at once cannot both win.
+    pub async fn connect_s3_source(
+        &self,
+        s: &NewSource,
+        place: &S3Place,
+    ) -> Result<(), AccessError> {
+        if s.kind != SourceKind::S3 {
+            return Err(AccessError::InvalidSetting);
+        }
+        self.connect_source_inner(s, true, Some(place)).await
     }
 
     /// Connects while the caller holds [`ShareConnectionLock`]. The caller has already checked
@@ -665,25 +881,63 @@ impl Db {
         _lock: &mut ShareConnectionLock,
         s: &NewSource,
     ) -> Result<(), AccessError> {
-        self.connect_source_inner(s, false).await
+        self.connect_source_inner(s, false, None).await
     }
 
     async fn connect_source_inner(
         &self,
         s: &NewSource,
         take_share_lock: bool,
+        s3: Option<&S3Place>,
     ) -> Result<(), AccessError> {
         if !poll_ok(s.poll_seconds) {
             return Err(AccessError::InvalidSetting);
         }
         let share_location = match s.kind {
-            SourceKind::Github => None,
+            SourceKind::Github | SourceKind::S3 => None,
             SourceKind::Share => Some(
                 SharePath::parse(s.location.as_deref().ok_or(AccessError::InvalidSetting)?)
                     .map_err(|_| AccessError::InvalidSetting)?,
             ),
         };
+        // An S3 connection is made only through `connect_s3_source`, with a place that
+        // agrees with its location; no other kind has one.
+        match (s.kind, s3) {
+            (SourceKind::S3, Some(place)) => {
+                let location = s3_location(&place.endpoint, &place.bucket, &place.prefix);
+                if place.endpoint.is_empty()
+                    || !valid_bucket(&place.bucket)
+                    || clean_prefix(&place.prefix).as_deref() != Some(place.prefix.as_str())
+                    || s.location.as_deref() != Some(location.as_str())
+                    || s.token.is_none()
+                {
+                    return Err(AccessError::InvalidSetting);
+                }
+            }
+            (SourceKind::S3, None) | (_, Some(_)) => return Err(AccessError::InvalidSetting),
+            _ => {}
+        }
         let mut tx = self.pool().begin().await?;
+        if let Some(place) = s3 {
+            sqlx::query("select pg_advisory_xact_lock(hashtextextended('s3-connection', 0))")
+                .execute(&mut *tx)
+                .await?;
+            let prefixes: Vec<String> = sqlx::query_scalar(
+                "select prefix from source_s3 \
+                 where endpoint = $1 and bucket = $2 and library_id <> $3",
+            )
+            .bind(&place.endpoint)
+            .bind(&place.bucket)
+            .bind(s.library.0)
+            .fetch_all(&mut *tx)
+            .await?;
+            if prefixes
+                .iter()
+                .any(|other| prefixes_overlap(&place.prefix, other))
+            {
+                return Err(AccessError::Exists);
+            }
+        }
         if let Some(share_location) = &share_location {
             if take_share_lock {
                 sqlx::query(
@@ -743,7 +997,7 @@ impl Db {
                 s.branch.as_str(),
                 s.folder.as_str(),
             ),
-            SourceKind::Share => ("", "", "", ""),
+            SourceKind::Share | SourceKind::S3 => ("", "", "", ""),
         };
         sqlx::query(
             "insert into library_sources (library_id, kind, owner, repo, branch, folder, \
@@ -764,8 +1018,230 @@ impl Db {
         .execute(&mut *tx)
         .await
         .map_err(refused)?;
+        if let Some(place) = s3 {
+            sqlx::query(
+                "insert into source_s3 \
+                     (library_id, endpoint, bucket, prefix, access_key_id, versioning, \
+                      conditional) \
+                 values ($1, $2, $3, $4, $5, $6, $7)",
+            )
+            .bind(s.library.0)
+            .bind(&place.endpoint)
+            .bind(&place.bucket)
+            .bind(&place.prefix)
+            .bind(&place.access_key_id)
+            .bind(place.versioning.as_str())
+            .bind(place.conditional.as_str())
+            .execute(&mut *tx)
+            .await
+            .map_err(refused)?;
+        }
         recompute_site_usage(&mut tx, site).await?;
         tx.commit().await?;
+        Ok(())
+    }
+
+    /// Where the bucket of the S3 library `library` is; `None` if it is not connected to one.
+    pub async fn s3_place(&self, library: NodeId) -> Result<Option<S3Place>, DbError> {
+        let row = sqlx::query(
+            "select endpoint, bucket, prefix, access_key_id, versioning, conditional \
+             from source_s3 where library_id = $1",
+        )
+        .bind(library.0)
+        .fetch_optional(self.pool())
+        .await?;
+        row.map(|row| {
+            let versioning: String = row.try_get("versioning")?;
+            let conditional: String = row.try_get("conditional")?;
+            Ok::<_, sqlx::Error>(S3Place {
+                endpoint: row.try_get("endpoint")?,
+                bucket: row.try_get("bucket")?,
+                prefix: row.try_get("prefix")?,
+                access_key_id: row.try_get("access_key_id")?,
+                versioning: Versioning::parse(&versioning)
+                    .ok_or_else(|| decode("versioning", &versioning))?,
+                conditional: Tri::parse(&conditional)
+                    .ok_or_else(|| decode("conditional support", &conditional))?,
+            })
+        })
+        .transpose()
+        .map_err(DbError::from)
+    }
+
+    /// Records what a probe learned about the bucket of `library`. Nothing happens if it is
+    /// not an S3 library.
+    pub async fn set_s3_probe(
+        &self,
+        library: NodeId,
+        versioning: Versioning,
+        conditional: Tri,
+    ) -> Result<(), DbError> {
+        sqlx::query("update source_s3 set versioning = $2, conditional = $3 where library_id = $1")
+            .bind(library.0)
+            .bind(versioning.as_str())
+            .bind(conditional.as_str())
+            .execute(self.pool())
+            .await?;
+        Ok(())
+    }
+
+    /// Replaces the access key of the S3 library `library`: the key id and the sealed secret
+    /// together, in one transaction. Moves the generation on and clears `last_error` and the
+    /// retry time, so a library that could not connect is tried again at once. Answers the
+    /// secret it displaced, for the caller to delete. `NotFound` if `library` is not connected
+    /// to a bucket; `InvalidSetting` for a key id the record refuses.
+    pub async fn set_s3_key(
+        &self,
+        library: NodeId,
+        access_key_id: &str,
+        secret: SecretId,
+    ) -> Result<Option<SecretId>, AccessError> {
+        let mut tx = self.pool().begin().await?;
+        let current: Option<(Option<Uuid>,)> = sqlx::query_as(
+            "select s.token_secret from library_sources s \
+             join source_s3 b on b.library_id = s.library_id \
+             where s.library_id = $1 and s.kind = 's3' for update of s",
+        )
+        .bind(library.0)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((old,)) = current else {
+            return Err(AccessError::NotFound);
+        };
+        sqlx::query("update source_s3 set access_key_id = $2 where library_id = $1")
+            .bind(library.0)
+            .bind(access_key_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(refused)?;
+        sqlx::query(
+            "update library_sources set token_secret = $2, generation = generation + 1, \
+                 last_error = null, retry_at = null, last_checked_at = null, \
+                 next_check_at = null, \
+                 state = case when state = 'not_connected' then 'connecting' else state end \
+             where library_id = $1",
+        )
+        .bind(library.0)
+        .bind(secret.0)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(old.filter(|old| *old != secret.0).map(SecretId))
+    }
+
+    /// Adds `delta` to the counts of `library` for the month of `month` and answers the
+    /// month's totals after the addition. One statement: two additions made at once both
+    /// count. The first request of a month makes its row.
+    pub async fn add_source_usage(
+        &self,
+        library: NodeId,
+        month: time::Date,
+        delta: &Usage,
+    ) -> Result<Usage, DbError> {
+        let month = month.replace_day(1).map_err(DbError::new)?;
+        let count = |n: u64| i64::try_from(n).map_err(DbError::new);
+        let row = sqlx::query(
+            "insert into source_usage \
+                 (library_id, month, list_requests, read_requests, write_requests, \
+                  bytes_down, bytes_up, cache_hits) \
+             values ($1, $2, $3, $4, $5, $6, $7, $8) \
+             on conflict (library_id, month) do update set \
+                 list_requests = source_usage.list_requests + excluded.list_requests, \
+                 read_requests = source_usage.read_requests + excluded.read_requests, \
+                 write_requests = source_usage.write_requests + excluded.write_requests, \
+                 bytes_down = source_usage.bytes_down + excluded.bytes_down, \
+                 bytes_up = source_usage.bytes_up + excluded.bytes_up, \
+                 cache_hits = source_usage.cache_hits + excluded.cache_hits \
+             returning list_requests, read_requests, write_requests, bytes_down, bytes_up, \
+                       cache_hits",
+        )
+        .bind(library.0)
+        .bind(month)
+        .bind(count(delta.list)?)
+        .bind(count(delta.read)?)
+        .bind(count(delta.write)?)
+        .bind(count(delta.bytes_down)?)
+        .bind(count(delta.bytes_up)?)
+        .bind(count(delta.cache_hits)?)
+        .fetch_one(self.pool())
+        .await?;
+        Ok(usage_from_row(&row)?)
+    }
+
+    /// The counts of `library` for the month of `month`; all zero when nothing was counted.
+    pub async fn usage(&self, library: NodeId, month: time::Date) -> Result<Usage, DbError> {
+        let month = month.replace_day(1).map_err(DbError::new)?;
+        let row = sqlx::query(
+            "select list_requests, read_requests, write_requests, bytes_down, bytes_up, \
+                    cache_hits \
+             from source_usage where library_id = $1 and month = $2",
+        )
+        .bind(library.0)
+        .bind(month)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row
+            .as_ref()
+            .map(usage_from_row)
+            .transpose()?
+            .unwrap_or_default())
+    }
+
+    /// Marks the budget warning of the month as given; true the first time only.
+    pub async fn mark_usage_warned(
+        &self,
+        library: NodeId,
+        month: time::Date,
+    ) -> Result<bool, DbError> {
+        let month = month.replace_day(1).map_err(DbError::new)?;
+        let done = sqlx::query(
+            "insert into source_usage (library_id, month, warned) values ($1, $2, true) \
+             on conflict (library_id, month) do update set warned = true \
+             where not source_usage.warned",
+        )
+        .bind(library.0)
+        .bind(month)
+        .execute(self.pool())
+        .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    /// What `library` may use in a month: its own budget where it has one, else the
+    /// organisation's defaults (see [`Db::s3_settings`]).
+    pub async fn budget(&self, library: NodeId) -> Result<Budget, DbError> {
+        let own: Option<(Option<i64>, Option<i64>, Option<i64>)> = sqlx::query_as(
+            "select budget_list, budget_read, budget_bytes from source_s3 where library_id = $1",
+        )
+        .bind(library.0)
+        .fetch_optional(self.pool())
+        .await?;
+        let settings = self.s3_settings().await?;
+        let (list, read, bytes) = own.unwrap_or_default();
+        let own = |value: Option<i64>| value.and_then(|n| u64::try_from(n).ok());
+        Ok(Budget {
+            list_requests: own(list).unwrap_or(settings.list_requests),
+            read_requests: own(read).unwrap_or(settings.read_requests),
+            bytes_down: own(bytes).or(settings.bytes_down),
+        })
+    }
+
+    /// Sets the budget of the S3 library `library`. `NotFound` if it is not connected to a
+    /// bucket; `InvalidSetting` for a figure the record cannot hold.
+    pub async fn set_budget(&self, library: NodeId, b: &Budget) -> Result<(), AccessError> {
+        let count = |n: u64| i64::try_from(n).map_err(|_| AccessError::InvalidSetting);
+        let done = sqlx::query(
+            "update source_s3 set budget_list = $2, budget_read = $3, budget_bytes = $4 \
+             where library_id = $1",
+        )
+        .bind(library.0)
+        .bind(count(b.list_requests)?)
+        .bind(count(b.read_requests)?)
+        .bind(b.bytes_down.map(count).transpose()?)
+        .execute(self.pool())
+        .await?;
+        if done.rows_affected() == 0 {
+            return Err(AccessError::NotFound);
+        }
         Ok(())
     }
 
@@ -1099,7 +1575,8 @@ impl Db {
         let size = i64::try_from(e.size).map_err(DbError::new)?;
         let modified = OffsetDateTime::from_unix_timestamp_nanos(i128::from(e.mtime_ns))
             .map_err(DbError::new)?;
-        let tag = external_tag(e.size, e.mtime_ns);
+        let tag = entry_tag(e);
+        let archived = tag_unavailable(&tag, e.size);
         let revision = new_external_revision();
         let mut tx = self.pool().begin().await?;
         sqlx::query(
@@ -1114,8 +1591,8 @@ impl Db {
         sqlx::query(
             "insert into source_items \
                  (library_id, path, repository_path, node_id, blob_sha, size, revision, \
-                  modified_at) \
-             values ($1, $2, $3, $4, $5, $6, $7, $8) \
+                  modified_at, unavailable) \
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
              on conflict (library_id, repository_path) do update set \
                  path = excluded.path, node_id = excluded.node_id, size = excluded.size, \
                  modified_at = excluded.modified_at, \
@@ -1125,8 +1602,11 @@ impl Db {
                                        then source_items.content_sha256 else null end, \
                  read_at = case when source_items.blob_sha is not distinct from excluded.blob_sha \
                                 then source_items.read_at else null end, \
-                 unavailable = case when source_items.blob_sha is not distinct from excluded.blob_sha \
-                                    then source_items.unavailable else null end, \
+                 unavailable = coalesce(excluded.unavailable, \
+                     case when source_items.blob_sha is not distinct from excluded.blob_sha \
+                          then source_items.unavailable else null end), \
+                 version_id = case when source_items.blob_sha is not distinct from excluded.blob_sha \
+                                   then source_items.version_id else null end, \
                  blob_sha = excluded.blob_sha, missing_since = null",
         )
         .bind(library.0)
@@ -1137,6 +1617,7 @@ impl Db {
         .bind(size)
         .bind(revision)
         .bind(modified)
+        .bind(archived)
         .execute(&mut *tx)
         .await?;
         let restored: Option<(String, Option<Uuid>)> = sqlx::query_as(
@@ -1185,10 +1666,11 @@ impl Db {
     /// The external metadata for a live share-backed document.
     pub async fn external_item(&self, node: NodeId) -> Result<Option<ExternalItem>, DbError> {
         let row = sqlx::query(
-            "select i.library_id, i.node_id, s.location, i.repository_path, i.size, \
-                    i.blob_sha, i.revision, i.content_sha256, i.unavailable \
+            "select i.library_id, i.node_id, s.kind, s.location, i.repository_path, i.size, \
+                    i.blob_sha, i.revision, i.content_sha256, i.unavailable, i.version_id \
              from source_items i \
-             join library_sources s on s.library_id = i.library_id and s.kind = 'share' \
+             join library_sources s on s.library_id = i.library_id \
+                  and s.kind in ('share', 's3') \
              join nodes n on n.id = i.node_id \
              where i.node_id = $1 and n.kind = 'document' and n.deleted_at is null",
         )
@@ -1197,17 +1679,23 @@ impl Db {
         .await?;
         row.map(|row| {
             let size: i64 = row.try_get("size")?;
+            let size = u64::try_from(size).map_err(|error| sqlx::Error::Decode(error.into()))?;
             let tag: String = row.try_get("blob_sha")?;
+            let kind: String = row.try_get("kind")?;
             let sha: Option<String> = row.try_get("content_sha256")?;
             let unavailable: Option<String> = row.try_get("unavailable")?;
+            let parts =
+                external_tag_parts(&tag, size).ok_or_else(|| decode("external tag", &tag))?;
             Ok::<_, sqlx::Error>(ExternalItem {
                 library: NodeId(row.try_get("library_id")?),
                 node: NodeId(row.try_get("node_id")?),
+                kind: SourceKind::parse(&kind).ok_or_else(|| decode("source kind", &kind))?,
                 location: row.try_get("location")?,
                 repository_path: row.try_get("repository_path")?,
-                size: u64::try_from(size).map_err(|error| sqlx::Error::Decode(error.into()))?,
-                mtime_ns: external_mtime(&tag)?,
+                size,
+                mtime_ns: parts.mtime_ns,
                 tag,
+                version: row.try_get("version_id")?,
                 revision: row.try_get("revision")?,
                 sha256: sha.as_deref().map(decode_sha256).transpose()?,
                 unavailable: unavailable
@@ -1257,20 +1745,57 @@ impl Db {
         size: u64,
         mtime_ns: i64,
     ) -> Result<bool, DbError> {
+        self.set_external_seen(node, old_tag, &external_tag(size, mtime_ns), size)
+            .await
+    }
+
+    /// Moves an external item to what was seen last (`new_tag`, of an object of `size` bytes)
+    /// only if `old_tag` is still current, in one statement: a new revision, the content
+    /// learned for the old tag and its version forgotten, and the item unavailable as
+    /// archived exactly when `new_tag` says so. Whether it moved.
+    pub async fn set_external_seen(
+        &self,
+        node: NodeId,
+        old_tag: &str,
+        new_tag: &str,
+        size: u64,
+    ) -> Result<bool, DbError> {
+        let parts = external_tag_parts(new_tag, size)
+            .ok_or_else(|| DbError::new("an external item was seen with an invalid change tag"))?;
         let stored_size = i64::try_from(size).map_err(DbError::new)?;
-        let modified = OffsetDateTime::from_unix_timestamp_nanos(i128::from(mtime_ns))
+        let modified = OffsetDateTime::from_unix_timestamp_nanos(i128::from(parts.mtime_ns))
             .map_err(DbError::new)?;
         let done = sqlx::query(
             "update source_items set blob_sha = $3, size = $4, modified_at = $5, revision = $6, \
-                 content_sha256 = null, read_at = null, unavailable = null, missing_since = null \
+                 content_sha256 = null, read_at = null, unavailable = $7, missing_since = null, \
+                 version_id = null \
              where node_id = $1 and blob_sha = $2",
         )
         .bind(node.0)
         .bind(old_tag)
-        .bind(external_tag(size, mtime_ns))
+        .bind(new_tag)
         .bind(stored_size)
         .bind(modified)
         .bind(new_external_revision())
+        .bind(parts.archived.then_some("archived"))
+        .execute(self.pool())
+        .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    /// Records the object version an item was read at, only if `tag` is still current.
+    pub async fn set_external_version(
+        &self,
+        node: NodeId,
+        tag: &str,
+        version: Option<&str>,
+    ) -> Result<bool, DbError> {
+        let done = sqlx::query(
+            "update source_items set version_id = $3 where node_id = $1 and blob_sha = $2",
+        )
+        .bind(node.0)
+        .bind(tag)
+        .bind(version)
         .execute(self.pool())
         .await?;
         Ok(done.rows_affected() > 0)

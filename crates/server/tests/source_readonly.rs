@@ -1076,6 +1076,7 @@ impl Env {
                         self.share.put(path, bytes);
                     }
                 }
+                SourceKind::S3 => panic!("this suite has no S3 fake"),
             }
             self.sync(&library).await;
             let top = self.children(&library).await;
@@ -1114,6 +1115,7 @@ impl Env {
                     .unwrap()
                     .expect("the missing share files were recycled");
                 }
+                SourceKind::S3 => panic!("this suite has no S3 fake"),
             }
             let live = self.children(&docs).await;
             for name in BINNED {

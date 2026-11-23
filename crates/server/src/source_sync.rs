@@ -38,7 +38,7 @@ use records::{
     DEFAULT_SOURCE_MAX_BYTES, DEFAULT_SOURCE_MAX_FILES, Editor, ExternalEntry, NewEvent, Node,
     NodeKind, SOURCE_MAX_BYTES, SOURCE_MAX_FILES, SourceConfig, SourceItem, SourceKind, SourceLock,
     SourceState, SourceStatus, SourceSyncTransition, UploadTarget, User, check_name, check_size,
-    is_format_char, validate_document_name, validate_node_name,
+    external_tag_parts, is_format_char, validate_document_name, validate_node_name,
 };
 use revisions::RevisionId;
 use serde_json::json;
@@ -943,6 +943,10 @@ async fn sync_one(state: &AppState, library: NodeId, now: OffsetDateTime) -> boo
                 SourceKind::Share => {
                     run(&ShareSource, state, &config, &status, now, generation).await
                 }
+                // The S3 listing arrives with its source; until then nothing reads a bucket.
+                SourceKind::S3 => {
+                    Err(failed("S3 libraries are not synced by this version.").into())
+                }
             };
             let finished = finish(state, &config, status, now, outcome, generation).await;
             drop(source_lock);
@@ -1063,6 +1067,7 @@ pub async fn sync_once(
     let outcome = match config.kind {
         SourceKind::Github => run(&GithubSource, state, &config, &status, now, generation).await,
         SourceKind::Share => run(&ShareSource, state, &config, &status, now, generation).await,
+        SourceKind::S3 => Err(failed("S3 libraries are not synced by this version.").into()),
     };
     finish(state, &config, status, now, outcome, generation).await
 }
@@ -2237,11 +2242,8 @@ fn temporary_name(name: &str) -> String {
 }
 
 fn external_mtime(entry: &Entry) -> Result<i64, SyncError> {
-    let prefix = format!("x{}-", entry.size);
-    entry
-        .sha
-        .strip_prefix(&prefix)
-        .and_then(|text| text.parse::<i64>().ok())
+    external_tag_parts(&entry.sha, entry.size)
+        .map(|parts| parts.mtime_ns)
         .ok_or_else(|| failed("A file on the share had an invalid change tag."))
 }
 
@@ -2358,6 +2360,7 @@ impl Applying<'_> {
                 repository_path: entry.repository_path.clone(),
                 size: entry.size,
                 mtime_ns,
+                tag: (!entry.dir).then(|| entry.sha.clone()),
                 editor: (!entry.dir).then(|| Editor::for_file_name(name)),
             });
             if batch.len() == batch_size {
@@ -2434,6 +2437,7 @@ impl Applying<'_> {
                         repository_path: entry.repository_path.clone(),
                         size: entry.size,
                         mtime_ns,
+                        tag: Some(entry.sha.clone()),
                     },
                 )
                 .await

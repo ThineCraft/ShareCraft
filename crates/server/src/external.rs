@@ -479,7 +479,8 @@ fn remembered_refusal(item: &ExternalItem) -> Result<(), ExternalError> {
         Some(Unavailable::Gone) => Err(ExternalError::Gone),
         Some(Unavailable::Denied) => Err(ExternalError::Denied),
         Some(Unavailable::TooLarge) => Err(ExternalError::TooLarge),
-        Some(Unavailable::Locked) | None => Ok(()),
+        // An archived object is read only through S3, whose arm refuses it before asking.
+        Some(Unavailable::Locked | Unavailable::Archived) | None => Ok(()),
     }
 }
 

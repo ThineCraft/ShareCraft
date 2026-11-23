@@ -100,11 +100,12 @@ pub use sites::{
     validate_language, validate_time_zone,
 };
 pub use sources::{
-    DEFAULT_SOURCE_MAX_BYTES, DEFAULT_SOURCE_MAX_FILES, ExternalEntry, ExternalItem,
-    MAX_POLL_SECONDS, MAX_SOURCE_ERROR_CHARS, MIN_POLL_SECONDS, NewSource, SOURCE_MAX_BYTES,
-    SOURCE_MAX_FILES, SealedRow, SecretId, SourceChange, SourceConfig, SourceItem,
-    SourceItemLocation, SourceKind, SourceLock, SourceMode, SourceState, SourceStatus,
-    SourceSyncTransition, StatusUpdate, Unavailable, external_tag, new_external_revision,
+    Budget, DEFAULT_SOURCE_MAX_BYTES, DEFAULT_SOURCE_MAX_FILES, ExternalEntry, ExternalItem,
+    MAX_POLL_SECONDS, MAX_SOURCE_ERROR_CHARS, MIN_POLL_SECONDS, NewSource, S3Place,
+    SOURCE_MAX_BYTES, SOURCE_MAX_FILES, SealedRow, SecretId, SourceChange, SourceConfig,
+    SourceItem, SourceItemLocation, SourceKind, SourceLock, SourceMode, SourceState, SourceStatus,
+    SourceSyncTransition, StatusUpdate, TagParts, Tri, Unavailable, Usage, Versioning,
+    external_tag, external_tag_parts, new_external_revision, object_tag,
 };
 pub use templates::{
     MAX_PACKAGE_BYTES, MAX_TEMPLATE_DEPTH, MAX_TEMPLATE_FOLDERS, MAX_TEMPLATE_LIBRARIES,

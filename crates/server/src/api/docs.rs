@@ -169,6 +169,7 @@ pub(crate) fn unavailable_name(unavailable: Unavailable) -> &'static str {
         Unavailable::Gone => "gone",
         Unavailable::TooLarge => "too_large",
         Unavailable::Locked => "locked",
+        Unavailable::Archived => "archived",
     }
 }
 

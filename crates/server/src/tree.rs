@@ -1064,6 +1064,8 @@ pub(crate) struct ExternalNodeCreate {
     pub repository_path: String,
     pub size: u64,
     pub mtime_ns: i64,
+    /// The entry's own change tag; None builds it from size and mtime_ns.
+    pub tag: Option<String>,
     pub editor: Option<Editor>,
 }
 
@@ -1198,6 +1200,7 @@ pub(crate) async fn create_external_nodes(
                 repository_path: create.repository_path.clone(),
                 size: create.size,
                 mtime_ns: create.mtime_ns,
+                tag: create.tag.clone(),
             });
         } else {
             events.push(created_event(actor.id, &record));

@@ -100,6 +100,7 @@ async fn external_document(
         repository_path: name.into(),
         size: blob.size,
         mtime_ns,
+        tag: None,
     };
     fixture
         .test

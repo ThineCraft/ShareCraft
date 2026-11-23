@@ -115,6 +115,7 @@ fn entry(node: NodeId, path: &str, size: u64, mtime_ns: i64) -> ExternalEntry {
         repository_path: path.into(),
         size,
         mtime_ns,
+        tag: None,
     }
 }
 
