@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>S3 demo scope</title>
+<style>
+:root{--fg:#1c1c1c;--bg:#fff;--th:#e4e8ee;--band:#f2f4f7}
+@media (prefers-color-scheme:dark){:root{--fg:#e8e8e8;--bg:#16181c;--th:#2a2f37;--band:#1f2329}}
+body{font:15px/1.5 system-ui,sans-serif;max-width:960px;margin:2rem auto;padding:0 16px;color:var(--fg);background:var(--bg)}
+table{border-collapse:collapse;width:100%;margin:.5rem 0 1.5rem}th,td{text-align:left;padding:.4rem .6rem;vertical-align:top}
+th{background:var(--th)}tbody tr:nth-child(even){background:var(--band)}code{font-size:.92em}
+</style></head><body>
+<h1>S3 surfacing: one-week demo scope (proposal, 23 Nov 2026)</h1>
+<p>Target date about 30 Nov 2026. Branch <code>s3-surfacing</code>, worktree <code>ShareCraft-s3</code>. Plan: <code>plans/2026-11-18-s3-surfacing.html</code>. Nothing built yet under this proposal.</p>
+
+<h2>What the demo shows</h2>
+<p>An administrator approves the Cloudflare R2 endpoint. A site manager makes a new library "From S3 storage" with a bucket, an optional prefix and an access key (typed by the owner into the page, stored only encrypted). The bucket's files appear as folders and files; people open, preview and download them (bytes fetched on first open, scanned, cached). A file added to the bucket in the R2 dashboard appears after the next poll or after "Update now". Read-only.</p>
+
+<h2>Where things stand</h2>
+<table><thead><tr><th>Item</th><th>State</th></tr></thead><tbody>
+<tr><td>Tasks 2 to 4 (signing, XML, endpoints)</td><td>Done; Task 2 on main, 3 and 4 on the branch only</td></tr>
+<tr><td>Branch base</td><td>Made from file-share f4b2e6f; main is 83 commits ahead (file-share fix rounds 1 to 3, Linux fixes, G5). Needs a local merge of main into the branch</td></tr>
+<tr><td>Task 5</td><td>Codex stopped: adding <code>tag</code> to <code>ExternalEntry</code> breaks one literal in <code>records/tests/share_sources.rs</code>, outside its file list. Ruling needed: allow adding <code>tag: None</code> there (no behaviour change)</td></tr>
+<tr><td>File-share Task 10 (worker)</td><td>Not started. S3 Task 12 says stop without it. Not needed for the demo: the existing worker already polls every connected library on its fixed interval, any kind</td></tr>
+<tr><td>File-share Task 11 (pages)</td><td>Not started. S3 Task 14 says stop without it: the S3 pages build on its shared pieces (<code>sourceName</code>, <code>unavailableText</code>, <code>hiddenLines</code>)</td></tr>
+</tbody></table>
+
+<h2>Proposed scope</h2>
+<table><thead><tr><th>Task</th><th>Decision</th><th>Why</th></tr></thead><tbody>
+<tr><td>Merge main into s3-surfacing (local, not pushed)</td><td>Do first</td><td>Picks up the file-share fixes the S3 work builds on</td></tr>
+<tr><td>5 Source records, migration 0022</td><td>Build in full</td><td>Migration written once in final form, including usage columns, so nothing later edits it</td></tr>
+<tr><td>6 Client and fake S3 server</td><td>Build in full</td><td>The core; all tests run against the fake on 127.0.0.1</td></tr>
+<tr><td>7 Listing and S3 source</td><td>Build in full</td><td>Includes the cut-short-listing-deletes-nothing and odd-key rules</td></tr>
+<tr><td>8 materialise refactor</td><td>Build in full</td><td>Needed by 9; file-share suites must keep their counts</td></tr>
+<tr><td>9 Reading on first use</td><td>Build in full</td><td>Open and download</td></tr>
+<tr><td>10 Serving over HTTP</td><td>Build in full</td><td>Small</td></tr>
+<tr><td>11 Connect, manage, settings</td><td>Build in full</td><td>Includes the standing secret-leak test</td></tr>
+<tr><td>12 Worker: budget, usage meter, pauses</td><td><b>Defer</b>; requests still counted in memory by Task 6</td><td>Waits on file-share Task 10. Fixed-interval polling is enough for the demo. Risk: no monthly cap enforced yet (see costs)</td></tr>
+<tr><td>13 Version history</td><td><b>Defer</b></td><td>Not part of "browse and open"</td></tr>
+<tr><td>14 Pages</td><td><b>Cut down</b>: new-library choice, library banner with Update now, approved-endpoints form, unavailable-file text; built with the shared pieces from file-share Task 11 written source-neutral, S3 forms only</td><td>The demo needs a UI. The file-share forms of the pages stay for file-share Task 11</td></tr>
+<tr><td>15 Review and one fix wave</td><td>Keep, scoped to the security checklist</td><td>Secret leaks, SSRF, no writes, partial listings</td></tr>
+<tr><td>16 R2 check</td><td>Keep (controller, with the owner)</td><td>The real-service proof</td></tr>
+<tr><td>Phase 2 (writes, 18 to 31)</td><td>Not this week</td><td></td></tr>
+</tbody></table>
+
+<h2>How it is proved</h2>
+<table><thead><tr><th>Proof</th><th>Detail</th></tr></thead><tbody>
+<tr><td>Fake S3 server tests</td><td>New test binaries s3_sources, s3_client, s3_sync, s3_content, s3_serving, s3_api, plus the file-share suites side by side to show no change. Targeted local runs; full run on GitHub check.yml after you approve a push</td></tr>
+<tr><td>Real R2 bucket</td><td>You create the bucket and an API token (read-only, that bucket) and type the key into the page yourself; I never create resources or see the key. Upload a few files including a nested folder; then add one while watching it appear</td></tr>
+<tr><td>Demo script</td><td>A short HTML page of steps on the local preview server</td></tr>
+</tbody></table>
+
+<h2>Costs</h2>
+<p>R2 free tier per month: 10 GB stored, 1 million list/write operations (class A), 10 million read operations (class B), no charge for data out. A demo bucket of a few MB polled every 5 minutes uses about 9,000 list operations a month: no charge. Over the free tier: $4.50 per million class A, $0.36 per million class B, $0.015 per GB-month. Because Task 12 (the cap) is deferred, leave the demo library disconnected after the demo or keep the bucket small.</p>
+
+<h2>Order and dates (approximate)</h2>
+<table><thead><tr><th>Days</th><th>Work</th></tr></thead><tbody>
+<tr><td>23 to 24 Nov</td><td>Merge main; Tasks 5, 6</td></tr>
+<tr><td>25 to 26 Nov</td><td>Tasks 7, 8, 9, 10</td></tr>
+<tr><td>27 Nov</td><td>Task 11; pages</td></tr>
+<tr><td>28 Nov</td><td>Review wave and fixes; push for check.yml</td></tr>
+<tr><td>29 Nov</td><td>R2 check with you; demo script</td></tr>
+<tr><td>30 Nov</td><td>Spare</td></tr>
+</tbody></table>
+</body></html>
