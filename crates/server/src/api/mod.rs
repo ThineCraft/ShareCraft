@@ -52,7 +52,7 @@ const MAX_BODY: usize = 16 * 1024;
 const SOURCE_READ_ONLY: &str =
     "This library is kept in step with an outside source, so it cannot be changed here.";
 
-const SOURCE_COPY_UNAVAILABLE: &str = "Files in this library are read from a file share when \
+const SOURCE_COPY_UNAVAILABLE: &str = "Files in this library are read from outside storage when \
 opened and cannot be copied here yet. Download the file instead.";
 
 /// The `/api` routes, to be nested under `/api`. Unknown paths answer `404 {"error":"not_found"}`
@@ -943,6 +943,12 @@ fn source_unavailable_message(reason: &str) -> &'static str {
         "changing" => "The file changed while it was being read. Try again.",
         "too_large" => "The file is too large to cache from the file share.",
         "not_approved" => "The file share location is no longer approved.",
+        "archived" => {
+            "This file is in archive storage and must be restored there before it can be opened."
+        }
+        "budget" => {
+            "This library has used its request budget for the month. Files opened before still open; a library owner can raise the budget."
+        }
         _ => "The file is unavailable from the file share.",
     }
 }

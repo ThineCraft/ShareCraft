@@ -161,6 +161,9 @@ struct ExternalDetail {
     read: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     unavailable: Option<&'static str>,
+    /// `true` for an S3 object in an archive storage class that has not been restored.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    storage_class_archived: Option<bool>,
 }
 
 pub(crate) fn unavailable_name(unavailable: Unavailable) -> &'static str {
@@ -227,6 +230,9 @@ pub(crate) async fn open(
             .and_then(|at| at.format(&Rfc3339).ok()),
         read: item.sha256.is_some(),
         unavailable: item.unavailable.map(unavailable_name),
+        storage_class_archived: records::external_tag_parts(&item.tag, item.size)
+            .is_some_and(|parts| parts.archived)
+            .then_some(true),
     });
     Ok(Json(DocDetail {
         id: document.id.0.to_string(),
