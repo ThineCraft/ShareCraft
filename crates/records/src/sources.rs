@@ -414,6 +414,19 @@ pub struct SourceLock {
     _tx: sqlx::Transaction<'static, sqlx::Postgres>,
 }
 
+/// The organisation-wide turn that serialises approved-root changes with file-share
+/// connection commits. Dropping it rolls its otherwise empty transaction back and releases
+/// the PostgreSQL advisory lock.
+pub struct ShareConnectionLock {
+    tx: sqlx::Transaction<'static, sqlx::Postgres>,
+}
+
+impl std::fmt::Debug for ShareConnectionLock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ShareConnectionLock")
+    }
+}
+
 impl std::fmt::Debug for SourceLock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("SourceLock")
@@ -530,6 +543,65 @@ fn external_mtime(tag: &str) -> Result<i64, sqlx::Error> {
 }
 
 impl Db {
+    /// Takes the organisation-wide file-share connection/settings turn, waiting at most `wait`
+    /// for it. `None` when another holder kept it for longer: the caller answers with a
+    /// retryable refusal instead of holding a pool connection indefinitely. The wait is enforced
+    /// by PostgreSQL's `lock_timeout`, local to this turn's transaction.
+    pub async fn lock_share_connections(
+        &self,
+        wait: std::time::Duration,
+    ) -> Result<Option<ShareConnectionLock>, DbError> {
+        let mut tx = self.pool().begin().await?;
+        let millis = wait.as_millis().clamp(1, u128::from(u32::MAX));
+        sqlx::query("select set_config('lock_timeout', $1, true)")
+            .bind(format!("{millis}ms"))
+            .execute(&mut *tx)
+            .await?;
+        match sqlx::query("select pg_advisory_xact_lock(hashtextextended('share-connection', 0))")
+            .execute(&mut *tx)
+            .await
+        {
+            Ok(_) => {}
+            Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("55P03") => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
+        }
+        // The timeout bounded only the wait for this turn; later statements on it are not
+        // subject to it.
+        sqlx::query("select set_config('lock_timeout', '0', true)")
+            .execute(&mut *tx)
+            .await?;
+        Ok(Some(ShareConnectionLock { tx }))
+    }
+
+    /// The lexical locations of every connected share, read without the connection turn. A
+    /// caller resolves them outside the turn and compares again under it with
+    /// [`Db::share_locations_locked`].
+    pub async fn share_locations(&self) -> Result<Vec<String>, DbError> {
+        Ok(sqlx::query_scalar(
+            "select location from library_sources \
+             where kind = 'share' and location is not null",
+        )
+        .fetch_all(self.pool())
+        .await?)
+    }
+
+    /// The lexical locations of the other connected shares while this turn is held.
+    pub async fn share_locations_locked(
+        &self,
+        lock: &mut ShareConnectionLock,
+        except: NodeId,
+    ) -> Result<Vec<String>, DbError> {
+        Ok(sqlx::query_scalar(
+            "select location from library_sources \
+             where kind = 'share' and library_id <> $1 and location is not null",
+        )
+        .bind(except.0)
+        .fetch_all(&mut *lock.tx)
+        .await?)
+    }
+
     /// Stores a sealed secret and returns its id. A secret with no ciphertext is refused: only
     /// sealed bytes belong here.
     pub async fn put_secret(&self, s: &SealedRow) -> Result<SecretId, DbError> {
@@ -583,6 +655,24 @@ impl Db {
     /// `LibraryNotEmpty` if anything not in the bin is in it; `SourceExists` if it is connected
     /// already.
     pub async fn connect_source(&self, s: &NewSource) -> Result<(), AccessError> {
+        self.connect_source_inner(s, true).await
+    }
+
+    /// Connects while the caller holds [`ShareConnectionLock`]. The caller has already checked
+    /// canonical exclusivity; the lexical check remains as defence in depth.
+    pub async fn connect_source_locked(
+        &self,
+        _lock: &mut ShareConnectionLock,
+        s: &NewSource,
+    ) -> Result<(), AccessError> {
+        self.connect_source_inner(s, false).await
+    }
+
+    async fn connect_source_inner(
+        &self,
+        s: &NewSource,
+        take_share_lock: bool,
+    ) -> Result<(), AccessError> {
         if !poll_ok(s.poll_seconds) {
             return Err(AccessError::InvalidSetting);
         }
@@ -595,9 +685,13 @@ impl Db {
         };
         let mut tx = self.pool().begin().await?;
         if let Some(share_location) = &share_location {
-            sqlx::query("select pg_advisory_xact_lock(hashtextextended('share-connection', 0))")
+            if take_share_lock {
+                sqlx::query(
+                    "select pg_advisory_xact_lock(hashtextextended('share-connection', 0))",
+                )
                 .execute(&mut *tx)
                 .await?;
+            }
             let locations: Vec<Option<String>> = sqlx::query_scalar(
                 "select location from library_sources \
                  where kind = 'share' and library_id <> $1",
@@ -1615,30 +1709,59 @@ impl Db {
     /// had no connection.
     pub async fn disconnect_source(&self, library: NodeId) -> Result<Vec<SecretId>, DbError> {
         let mut tx = self.pool().begin().await?;
-        let row: Option<(Option<Uuid>, Option<Uuid>, Uuid)> = sqlx::query_as(
-            "select s.token_secret, s.webhook_secret, n.site_id from library_sources s \
-             join nodes n on n.id = s.library_id where s.library_id = $1 for update of s",
-        )
-        .bind(library.0)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let Some((token, webhook, site)) = row else {
-            return Ok(Vec::new());
-        };
-        sqlx::query("delete from source_items where library_id = $1")
-            .bind(library.0)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("delete from library_sources where library_id = $1")
-            .bind(library.0)
-            .execute(&mut *tx)
-            .await?;
-        recompute_site_usage(&mut tx, NodeId(site)).await?;
+        let secrets = disconnect_in(&mut tx, library).await?;
         tx.commit().await?;
-        Ok([token, webhook]
-            .into_iter()
-            .flatten()
-            .map(SecretId)
-            .collect())
+        Ok(secrets)
     }
+
+    /// [`Db::disconnect_source`] for `actor`, whose `manage_access` on `library` is judged again
+    /// in the same transaction as the disconnect: a revocation after the route's own check
+    /// still stops it. `NotFound` when `actor` cannot see the library; the access's refusal
+    /// when they see it without `manage_access`.
+    pub async fn disconnect_source_as(
+        &self,
+        actor: UserId,
+        library: NodeId,
+    ) -> Result<Vec<SecretId>, AccessError> {
+        let mut tx = self.pool().begin().await?;
+        match crate::scopes::access_in(&mut tx, actor, library).await? {
+            None => return Err(AccessError::NotFound),
+            Some(held) if !held.can_manage_access() => return Err(held.refusal()),
+            Some(_) => {}
+        }
+        let secrets = disconnect_in(&mut tx, library).await?;
+        tx.commit().await?;
+        Ok(secrets)
+    }
+}
+
+/// Removes the connection of `library` and its item rows on `conn`, returning its secrets.
+async fn disconnect_in(
+    conn: &mut PgConnection,
+    library: NodeId,
+) -> Result<Vec<SecretId>, sqlx::Error> {
+    let row: Option<(Option<Uuid>, Option<Uuid>, Uuid)> = sqlx::query_as(
+        "select s.token_secret, s.webhook_secret, n.site_id from library_sources s \
+         join nodes n on n.id = s.library_id where s.library_id = $1 for update of s",
+    )
+    .bind(library.0)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some((token, webhook, site)) = row else {
+        return Ok(Vec::new());
+    };
+    sqlx::query("delete from source_items where library_id = $1")
+        .bind(library.0)
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query("delete from library_sources where library_id = $1")
+        .bind(library.0)
+        .execute(&mut *conn)
+        .await?;
+    recompute_site_usage(conn, NodeId(site)).await?;
+    Ok([token, webhook]
+        .into_iter()
+        .flatten()
+        .map(SecretId)
+        .collect())
 }

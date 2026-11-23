@@ -74,6 +74,7 @@ struct EditorSpec {
     app: String,
     /// The fork's checkout, relative to the workspace root.
     checkout: String,
+    live_format: Option<String>,
 }
 
 /// The editors in the text of `editors.toml`, by id. Every table needs every key, as a string.
@@ -102,6 +103,10 @@ fn parse_editors(text: &str) -> Result<Vec<EditorSpec>> {
             commit: field("commit")?,
             app: field("app")?,
             checkout: field("checkout")?,
+            live_format: entry
+                .get("live_format")
+                .and_then(toml::Value::as_str)
+                .map(str::to_owned),
         });
     }
     Ok(editors)
@@ -345,10 +350,17 @@ struct ManifestData {
     built: String,
     script_hashes: Vec<String>,
     style_hashes: Vec<String>,
+    live_format: Option<String>,
 }
 
 /// The text of `editor.json`: indented, with a line break at the end.
 fn manifest_json(data: &ManifestData) -> Result<String> {
+    let live = data.live_format.as_ref().map(|format| {
+        serde_json::json!({
+            "protocol": 1,
+            "format": format,
+        })
+    });
     let value = serde_json::json!({
         "id": data.id,
         "version": data.version,
@@ -357,6 +369,7 @@ fn manifest_json(data: &ManifestData) -> Result<String> {
         "built": data.built,
         "script_hashes": data.script_hashes,
         "style_hashes": data.style_hashes,
+        "live": live,
     });
     let mut text =
         serde_json::to_string_pretty(&value).map_err(|e| format!("cannot write manifest: {e}"))?;
@@ -952,6 +965,7 @@ fn finish_build(
         built: today(),
         script_hashes: hashes.scripts,
         style_hashes: hashes.styles,
+        live_format: spec.live_format.clone(),
     };
     let json = manifest_json(&data)?;
     std::fs::write(dist.join(MANIFEST), json)
@@ -1390,6 +1404,7 @@ branch   = "sharecraft"
 commit   = ""
 app      = "apps/gridcraft-web"
 checkout = "../GridCraft"
+live_format = "gridcraft/1"
 "#;
 
     #[test]
@@ -1406,6 +1421,7 @@ checkout = "../GridCraft"
                 commit: String::new(),
                 app: "apps/gridcraft-web".to_owned(),
                 checkout: "../GridCraft".to_owned(),
+                live_format: Some("gridcraft/1".to_owned()),
             }]
         );
         let missing = parse_editors("[a]\nupstream = \"x\"\n");
@@ -1438,11 +1454,21 @@ checkout = "../GridCraft"
             built: "2026-11-10".to_owned(),
             script_hashes: vec!["sha256-O5JTT//82Kx49BrvVhdpg+8xboXFwBQ1Tq7v8lYWyX4=".to_owned()],
             style_hashes: vec!["sha256-IAdwN3biDCQ3brrgp1m8kBEsPQYyqfREKOEfeoREopc=".to_owned()],
+            live_format: Some("gridcraft/1".to_owned()),
         }
     }
 
     /// The server reads this same file in its own tests (`editors.rs`), so what is written here
     /// is accepted there.
+    #[test]
+    fn manifest_records_the_live_format() {
+        let json =
+            serde_json::from_str::<serde_json::Value>(&manifest_json(&fixed_manifest()).unwrap())
+                .unwrap();
+        assert_eq!(json["live"]["protocol"], 1);
+        assert_eq!(json["live"]["format"], "gridcraft/1");
+    }
+
     #[test]
     fn manifest_round_trips_through_the_server_type() {
         let fixture = include_str!("../tests/fixtures/editor.json");

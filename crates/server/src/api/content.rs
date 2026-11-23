@@ -26,8 +26,8 @@ use axum::http::header::{
 };
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use collab_core::ids::{DocId, NodeId};
-use futures_util::Stream;
+use collab_core::ids::{DocId, NodeId, Seq};
+use futures_util::{Stream, StreamExt};
 use records::{AccessError, Editor, NameConflict, Origin, QuotaError, Reservation, User};
 use revisions::{
     Author, BlobRef, Checkpoint, CheckpointError, Content, Outcome, RevisionId, Stored,
@@ -35,16 +35,18 @@ use revisions::{
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tokio::io::AsyncReadExt;
+use tokio::sync::oneshot;
 use uuid::Uuid;
 
 use super::uploads::{
     Named, add_renamed, clean_upload_name, conflict_choice, settle_name, store_version,
 };
-use super::{ApiError, parse_id, to_completion};
+use super::{ApiError, JsonBody, parse_id, to_completion};
 use crate::blobs::{BodyError, Held, release, write_claimed};
 use crate::checkpoint::Checkpointer;
 use crate::external::{ExternalError, Ready};
 use crate::file_room::SaveReply;
+use crate::live_room::{LiveCheckpointReply, LiveCommand, MAX_SESSION_DATA_BYTES};
 use crate::previews::{self, PreviewKind, PreviewType, ThumbError};
 use crate::projection::record_first;
 use crate::room::credited_name;
@@ -56,6 +58,12 @@ use crate::{AppState, auth::Signed};
 const SEAT_HEADER: &str = "x-sharecraft-seat";
 /// The response header naming the revision a download holds.
 const REVISION_HEADER: &str = "x-sharecraft-revision";
+/// The response header saying the stored file is behind live entries.
+const LIVE_BEHIND_HEADER: &str = "x-sharecraft-live-behind";
+/// The live-base response headers carrying the stamp of the entry at the base's position: its
+/// time in Unix milliseconds and its seed.
+const LIVE_AT_MS_HEADER: &str = "x-sharecraft-live-at-ms";
+const LIVE_SEED_HEADER: &str = "x-sharecraft-live-seed";
 /// How many times a kept-both upload picks its name again when it is taken meanwhile.
 const NAME_ATTEMPTS: usize = 5;
 /// How much of a file a download reads and sends at a time.
@@ -67,11 +75,42 @@ pub(crate) struct DownloadQuery {
     revision: Option<String>,
 }
 
+/// Query of `GET /api/docs/{id}/live-base`.
+#[derive(Deserialize)]
+pub(crate) struct LiveBaseQuery {
+    at: u64,
+}
+
 /// Query of `PUT /api/docs/{id}/content`.
 #[derive(Deserialize)]
 pub(crate) struct SaveQuery {
     base: Option<String>,
 }
+
+/// Query of `PUT /api/docs/{id}/live-checkpoint`.
+#[derive(Deserialize)]
+pub(crate) struct LiveCheckpointQuery {
+    ticket: Uuid,
+    at: u64,
+    base: Option<String>,
+}
+
+/// Body of `POST /api/docs/{id}/live-checkpoint/hash`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LiveHashBody {
+    ticket: Uuid,
+    at: u64,
+    /// The SHA-256 of the checkpoint file bytes the verifier wrote: 64 lowercase hexadecimal
+    /// digits.
+    sha256: String,
+    /// The SHA-256 of the session (identity) data the verifier would upload with those bytes,
+    /// in the same form. Required: a hash without it verifies nothing.
+    session_sha256: String,
+}
+
+/// The request header giving how many leading body bytes are the editor's session data.
+const SESSION_DATA_HEADER: &str = "x-sharecraft-session-data-length";
 
 /// Query of `POST /api/docs/upload`.
 #[derive(Deserialize)]
@@ -215,7 +254,22 @@ pub(super) async fn reserve_held(
     site: NodeId,
     held: Held,
 ) -> Result<(Held, Reservation), ApiError> {
-    match state.db().reserve_bytes(site, held.blob().size).await {
+    reserve_held_with(state, site, held, 0).await
+}
+
+/// [`reserve_held`], with `extra` bytes stored alongside the content (a live checkpoint's
+/// identity data) reserved with it.
+async fn reserve_held_with(
+    state: &AppState,
+    site: NodeId,
+    held: Held,
+    extra: u64,
+) -> Result<(Held, Reservation), ApiError> {
+    match state
+        .db()
+        .reserve_bytes(site, held.blob().size.saturating_add(extra))
+        .await
+    {
         Ok(reservation) => Ok((held, reservation)),
         Err(e) => {
             discard(state, held).await;
@@ -328,7 +382,89 @@ pub(crate) async fn download(
         None => current_content(&state, doc).await?,
     };
 
-    file_answer(&state, &document.name, current, headers.get(RANGE)).await
+    let mut answer = file_answer(&state, &document.name, current, headers.get(RANGE)).await?;
+    // Best effort: a failure here leaves the header out rather than failing the download.
+    if crate::api::docs::live_behind_mark(db, doc)
+        .await
+        .is_some_and(|live| live.behind)
+    {
+        answer.headers_mut().insert(
+            HeaderName::from_static(LIVE_BEHIND_HEADER),
+            HeaderValue::from_static("1"),
+        );
+    }
+    Ok(answer)
+}
+
+/// `GET /api/docs/{id}/live-base?at={seq}`: opaque identity data for the room's current base.
+/// The base is plain-file data only when no verified checkpoint exists.
+pub(crate) async fn live_base(
+    State(state): State<AppState>,
+    signed: Signed,
+    Path(id): Path<String>,
+    query: Result<Query<LiveBaseQuery>, QueryRejection>,
+) -> Result<Response, ApiError> {
+    let doc = DocId(parse_id(&id)?);
+    let db = state.db();
+    db.doc_access(signed.session.user.id, doc)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?
+        .ok_or(ApiError::NotFound)?;
+    let query = query_of(query)?;
+    let at = Seq(query.at);
+    let loaded = db
+        .load_live(doc)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?;
+    if loaded.format.is_none()
+        && loaded.open_session.is_none()
+        && loaded.verified_checkpoint.is_none()
+        && loaded.unverified_checkpoints.is_empty()
+        && loaded.head == Seq(0)
+    {
+        return Ok(ApiError::NotFound.into_response());
+    }
+    if at != loaded.verified_through {
+        return Ok(StatusCode::CONFLICT.into_response());
+    }
+    let mut headers = HeaderMap::new();
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    match loaded.verified_checkpoint {
+        Some(checkpoint) if !checkpoint.session_data.is_empty() => {
+            headers.insert(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/octet-stream"),
+            );
+            // The checkpoint loads under the stamp of the entry at its position, as the editors
+            // that applied that entry calculated under it; the page needs both headers.
+            // A purged entry leaves the headers out: the page then cannot load this base.
+            let stamp = db
+                .live_entry_stamp(doc, at)
+                .await
+                .map_err(|e| ApiError::unavailable(&e))?
+                .map(|(stamped, seed)| (stamped.unix_timestamp_nanos() / 1_000_000, seed));
+            if let Some((at_ms, seed)) = stamp
+                && let Ok(at_ms) = i64::try_from(at_ms)
+            {
+                headers.insert(
+                    HeaderName::from_static(LIVE_AT_MS_HEADER),
+                    HeaderValue::from(at_ms),
+                );
+                headers.insert(
+                    HeaderName::from_static(LIVE_SEED_HEADER),
+                    HeaderValue::from(seed),
+                );
+            }
+            let mut response = Body::from(checkpoint.session_data).into_response();
+            *response.headers_mut() = headers;
+            Ok(response)
+        }
+        _ => {
+            let mut response = StatusCode::NO_CONTENT.into_response();
+            *response.headers_mut() = headers;
+            Ok(response)
+        }
+    }
 }
 
 /// Which bytes of a file a download sends.
@@ -623,9 +759,18 @@ async fn read_start(
     .map_err(|e| ApiError::unavailable(&e))
 }
 
-/// `GET /api/docs/{id}/thumbnail`: a PNG of the document's current version at most 256 pixels
-/// on its longer side, made on the server the first time it is asked for and kept beside the
-/// content store (see [`previews::thumbnail`]). For PNG, JPEG, GIF (its first frame) and WebP
+/// Query of `GET /api/docs/{id}/thumbnail`.
+#[derive(Deserialize)]
+pub(crate) struct ThumbnailQuery {
+    /// `large` for the Album view's thumbnail; the small one when absent.
+    size: Option<String>,
+}
+
+/// `GET /api/docs/{id}/thumbnail?size=`: a PNG of the document's current version at most 256
+/// pixels on its longer side, or with `size=large` a JPEG (a PNG for a picture with
+/// transparency) at most 720, turned upright as its EXIF orientation says, made on the server
+/// the first time it is asked for and kept beside the content store (see
+/// [`previews::thumbnail`]). `422` for any other size. For PNG, JPEG, GIF (its first frame) and WebP
 /// files; `415 no_thumbnail` for any other type, for a document with no version, and for an
 /// image that cannot be decoded within the limits. `423 held {scan}` while the malware scanner
 /// holds the content; `404` if the caller has no role on the document; `503 busy` when no turn
@@ -635,8 +780,14 @@ pub(crate) async fn thumbnail(
     State(state): State<AppState>,
     signed: Signed,
     Path(id): Path<String>,
+    query: Result<Query<ThumbnailQuery>, QueryRejection>,
 ) -> Result<Response, ApiError> {
     let doc = DocId(parse_id(&id)?);
+    let size = match query_of(query)?.size.as_deref() {
+        None => previews::ThumbSize::Small,
+        Some("large") => previews::ThumbSize::Large,
+        Some(_) => return Err(ApiError::InvalidRequest),
+    };
     let document = viewed_document(&state, &signed, doc).await?;
     if !previews::has_thumbnail(&document.name) {
         return Err(ApiError::NoThumbnail);
@@ -652,7 +803,7 @@ pub(crate) async fn thumbnail(
     };
     let made = state
         .thumbnailer()
-        .make(Arc::clone(state.blobs()), blob.sha256)
+        .make(Arc::clone(state.blobs()), blob.sha256, size)
         .await;
     let path = match made {
         Ok(path) => path,
@@ -679,8 +830,13 @@ pub(crate) async fn thumbnail(
         // Erased meanwhile with its content.
         Err(_) => return Err(ApiError::NoThumbnail),
     };
+    let kind = if path.extension().is_some_and(|e| e == "jpg") {
+        "image/jpeg"
+    } else {
+        "image/png"
+    };
     let mut headers = HeaderMap::new();
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static("image/png"));
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static(kind));
     headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
     headers.insert(CONTENT_SECURITY_POLICY, HeaderValue::from_static("sandbox"));
     headers.insert(
@@ -839,6 +995,227 @@ pub(crate) async fn save(
         .await?
     };
     Ok(save_answer(reply))
+}
+
+/// `PUT /api/docs/{id}/live-checkpoint?ticket=&at=[&base=]`: a live participant's checkpoint
+/// for the write ticket the live room gave it. The caller must be able to edit the document,
+/// and the ticket must be theirs, unused and unexpired, for exactly this position and base;
+/// otherwise `403` (`404` without access) before any of the body is read. The body is the
+/// editor's opaque session data (`x-sharecraft-session-data-length` bytes, at most 8 MiB,
+/// none without the header) followed by the file bytes, which stream into the content store
+/// as a save's do, reserved against the site's quota. Answers `{revision}` once Git and the
+/// database hold the checkpoint (current, not yet verified); `409 {current}` when the
+/// document has a revision it was not based on; `503` when it could not be stored.
+pub(crate) async fn live_checkpoint(
+    State(state): State<AppState>,
+    signed: Signed,
+    Path(id): Path<String>,
+    query: Result<Query<LiveCheckpointQuery>, QueryRejection>,
+    headers: HeaderMap,
+    request: Request,
+) -> Result<Response, ApiError> {
+    let doc = DocId(parse_id(&id)?);
+    let user = signed.session.user.id;
+    let access = state
+        .db()
+        .doc_access(user, doc)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?
+        .ok_or(ApiError::NotFound)?;
+    if !access.can_edit() {
+        return Err(access.refusal().into());
+    }
+    // A library connected to a source is read-only: no checkpoint is stored into it.
+    super::nodes::require_not_connected(state.db(), doc.into()).await?;
+    let query = query_of(query)?;
+    let base = match query.base {
+        Some(text) => Some(RevisionId::from_str(&text).map_err(|_| ApiError::BadRequest)?),
+        None => None,
+    };
+    let at = Seq(query.at);
+    // The lengths are read before the ticket is claimed, so a request refused for them does not
+    // use the ticket up.
+    let session_length = match headers.get(SESSION_DATA_HEADER) {
+        None => 0,
+        Some(value) => value
+            .to_str()
+            .ok()
+            .and_then(|text| text.trim().parse::<usize>().ok())
+            .ok_or(ApiError::BadRequest)?,
+    };
+    if session_length > MAX_SESSION_DATA_BYTES {
+        return Err(ApiError::TooLarge);
+    }
+    let declared = headers
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok());
+    let session_bytes = u64::try_from(session_length).map_err(|_| ApiError::TooLarge)?;
+    if declared.is_some_and(|length| {
+        length < session_bytes
+            || length.saturating_sub(session_bytes) > state.config().max_file_bytes
+    }) {
+        return Err(ApiError::TooLarge);
+    }
+    // The most bytes this upload can bring, which sets the claimed ticket's deadline.
+    let length =
+        declared.unwrap_or_else(|| state.config().max_file_bytes.saturating_add(session_bytes));
+    let link = state.rooms().live_link(doc).ok_or(ApiError::Forbidden)?;
+    let (reply, answer) = oneshot::channel();
+    let claim = LiveCommand::CheckpointClaim {
+        user,
+        ticket: query.ticket,
+        at,
+        base: base.clone(),
+        length,
+        reply,
+    };
+    if link.commands.send(claim).await.is_err() || !answer.await.unwrap_or(false) {
+        return Err(ApiError::Forbidden);
+    }
+    let site = site_of(&state, doc.into()).await?;
+    room_for_body(&state, site, &headers).await?;
+    let (session_data, rest) = read_prefix(request.into_body(), session_length).await?;
+    let held = body_blob(&state, Request::new(rest)).await?;
+    // The identity data is stored with the checkpoint and counts against the quota as well.
+    let (held, reservation) = reserve_held_with(&state, site, held, session_bytes).await?;
+
+    let reply = {
+        let state = state.clone();
+        to_completion(async move {
+            let reservation = match follow_node(&state, reservation, doc.into()).await {
+                Ok(reservation) => reservation,
+                Err(e) => {
+                    discard(&state, held).await;
+                    return Err(e);
+                }
+            };
+            let (reply, answer) = oneshot::channel();
+            let upload = LiveCommand::CheckpointUpload {
+                user,
+                ticket: query.ticket,
+                at,
+                base,
+                blob: held.blob(),
+                session_data,
+                reply,
+            };
+            let reply = if link.commands.send(upload).await.is_ok() {
+                answer.await.unwrap_or(LiveCheckpointReply::Failed)
+            } else {
+                LiveCheckpointReply::Failed
+            };
+            if !matches!(reply, LiveCheckpointReply::Saved { .. }) {
+                discard(&state, held).await;
+            }
+            release(state.db(), reservation).await;
+            Ok(reply)
+        })
+        .await?
+    };
+    Ok(live_answer(reply))
+}
+
+/// `POST /api/docs/{id}/live-checkpoint/hash` with `{ticket, at, sha256, session_sha256}`: the
+/// SHA-256 of the bytes a verifying participant wrote independently for its verify ticket, and
+/// of the session data it would upload with them; both must match. Refused like an
+/// upload (`403`, `404`) unless the ticket is the caller's, unused and unexpired for exactly
+/// this position; `202` once the room has compared it with the stored checkpoint (a match
+/// verifies it, a mismatch keeps it unverified and asks the caller for its own bytes); `503`
+/// when the verification could not be stored.
+pub(crate) async fn live_checkpoint_hash(
+    State(state): State<AppState>,
+    signed: Signed,
+    Path(id): Path<String>,
+    JsonBody(body): JsonBody<LiveHashBody>,
+) -> Result<Response, ApiError> {
+    let doc = DocId(parse_id(&id)?);
+    let user = signed.session.user.id;
+    let access = state
+        .db()
+        .doc_access(user, doc)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?
+        .ok_or(ApiError::NotFound)?;
+    if !access.can_edit() {
+        return Err(access.refusal().into());
+    }
+    // A hash can lead to major versions being stored: refused in a connected library.
+    super::nodes::require_not_connected(state.db(), doc.into()).await?;
+    let sha256 = parse_sha256(&body.sha256).ok_or(ApiError::BadRequest)?;
+    let session_sha256 = parse_sha256(&body.session_sha256).ok_or(ApiError::BadRequest)?;
+    let link = state.rooms().live_link(doc).ok_or(ApiError::Forbidden)?;
+    let (reply, answer) = oneshot::channel();
+    let hash = LiveCommand::CheckpointHash {
+        user,
+        ticket: body.ticket,
+        at: Seq(body.at),
+        sha256,
+        session_sha256,
+        reply,
+    };
+    if link.commands.send(hash).await.is_err() {
+        return Err(ApiError::Forbidden);
+    }
+    Ok(live_answer(
+        answer.await.unwrap_or(LiveCheckpointReply::Refused),
+    ))
+}
+
+/// 64 lowercase hexadecimal digits as 32 bytes.
+fn parse_sha256(text: &str) -> Option<[u8; 32]> {
+    let digits = text.as_bytes();
+    if digits.len() != 64 {
+        return None;
+    }
+    let value = |digit: u8| match digit {
+        b'0'..=b'9' => Some(digit - b'0'),
+        b'a'..=b'f' => Some(digit - b'a' + 10),
+        _ => None,
+    };
+    let mut bytes = [0; 32];
+    for (byte, [high, low]) in bytes.iter_mut().zip(digits.as_chunks::<2>().0) {
+        *byte = (value(*high)? << 4) | value(*low)?;
+    }
+    Some(bytes)
+}
+
+/// Splits the first `length` bytes off `body`, reading no further; `400` when it ends first.
+async fn read_prefix(body: Body, length: usize) -> Result<(Vec<u8>, Body), ApiError> {
+    let mut stream = body.into_data_stream();
+    let mut prefix = Vec::with_capacity(length.min(DOWNLOAD_CHUNK));
+    let mut rest = None;
+    while prefix.len() < length {
+        let mut chunk = match stream.next().await {
+            Some(Ok(chunk)) => chunk,
+            Some(Err(_)) | None => return Err(ApiError::BadRequest),
+        };
+        let wanted = length.saturating_sub(prefix.len());
+        if chunk.len() > wanted {
+            let head = chunk.split_to(wanted);
+            prefix.extend_from_slice(&head);
+            rest = Some(chunk);
+        } else {
+            prefix.extend_from_slice(&chunk);
+        }
+    }
+    let first = futures_util::stream::iter(rest.map(Ok::<Bytes, axum::Error>));
+    Ok((prefix, Body::from_stream(first.chain(stream))))
+}
+
+/// The HTTP answer to the live room's checkpoint reply.
+fn live_answer(reply: LiveCheckpointReply) -> Response {
+    match reply {
+        LiveCheckpointReply::Saved { revision } => {
+            Json(json!({ "revision": revision })).into_response()
+        }
+        LiveCheckpointReply::Accepted => StatusCode::ACCEPTED.into_response(),
+        LiveCheckpointReply::Refused => ApiError::Forbidden.into_response(),
+        LiveCheckpointReply::Stale { current } => {
+            (StatusCode::CONFLICT, Json(json!({ "current": current }))).into_response()
+        }
+        LiveCheckpointReply::Failed => ApiError::Unavailable.into_response(),
+    }
 }
 
 /// The answer to a save (or an uploaded new version) the file session answered with `reply`.

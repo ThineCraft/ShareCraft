@@ -259,7 +259,7 @@ pub(crate) async fn show(
 pub(crate) struct ChildrenQuery {
     after: Option<String>,
     limit: Option<u32>,
-    /// `grid` for the thumbnail grid of an image library.
+    /// `grid` for the thumbnail grid of an image library, `photos` for its Album view.
     view: Option<String>,
 }
 
@@ -314,6 +314,10 @@ pub(crate) struct ChildOut {
     /// Absent otherwise. Whether one can be made still depends on its bytes.
     #[serde(skip_serializing_if = "Option::is_none")]
     thumbnail: Option<bool>,
+    /// In the Album view, a picture's shape as shown and when it was taken (see
+    /// [`crate::photos`]). Absent when its headers tell nothing, and for files on a share.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    photo: Option<crate::photos::PhotoFacts>,
     /// `true` when this file's bytes live on a file share.
     #[serde(skip_serializing_if = "Option::is_none")]
     external: Option<bool>,
@@ -336,6 +340,7 @@ impl From<Listed> for ChildOut {
             scan: None,
             threat: None,
             thumbnail: None,
+            photo: None,
             external: None,
             unavailable: None,
         }
@@ -422,12 +427,60 @@ impl ChildrenPage {
     }
 }
 
+impl ChildrenPage {
+    /// The page, each picture in it whose thumbnail can be asked for (see
+    /// [`ChildrenPage::with_thumbnails`]) given its `photo` facts, read once from its current
+    /// version's headers and kept (see [`crate::photos::photo_facts`]). Files on a share are
+    /// left out: reading them would fetch them. One that cannot be read is left without.
+    async fn with_photos(mut self, state: &AppState) -> Result<Self, ApiError> {
+        let wanted: Vec<(usize, DocId)> = self
+            .items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| item.thumbnail == Some(true) && item.external.is_none())
+            .filter_map(|(at, item)| Uuid::parse_str(&item.id).ok().map(|id| (at, DocId(id))))
+            .collect();
+        if wanted.is_empty() {
+            return Ok(self);
+        }
+        let blobs = std::sync::Arc::clone(state.blobs());
+        let found = super::content::blocking(state, move |store| {
+            let mut found = Vec::new();
+            for (at, doc) in wanted {
+                let Ok(Some(stored)) = store.load(doc) else {
+                    continue;
+                };
+                let revisions::Content::Blob(blob) = stored.content else {
+                    continue;
+                };
+                match crate::photos::photo_facts(blobs.store(), &blob.sha256) {
+                    Ok(facts) if facts.width.is_some() => found.push((at, facts)),
+                    Ok(_) => {}
+                    Err(e) => eprintln!(
+                        "sharecraft-server: cannot read the photo facts of content {}: {e}",
+                        blob.hex()
+                    ),
+                }
+            }
+            Ok(found)
+        })
+        .await?;
+        for (at, facts) in found {
+            if let Some(item) = self.items.get_mut(at) {
+                item.photo = Some(facts);
+            }
+        }
+        Ok(self)
+    }
+}
+
 /// `GET /api/nodes/{id}/children?after=&limit=&view=`: one page of the children the caller
 /// can see, folders before files, then by name. `limit` is 1 to 500 (100 if absent); `after`
 /// is the `next` of the previous page. `view=grid`, for an image library or a folder in one
 /// only (`422` elsewhere, and for any other view), pages the same way with 1 to 200 (200 if
-/// absent). A file the file policies there now refuse is marked `"policy": "blocked"`, and one
-/// whose thumbnail can be asked for `"thumbnail": true`.
+/// absent). `view=photos` is the grid's listing with each picture's `photo`: `{width, height,
+/// taken_at?}` (see [`ChildrenPage::with_photos`]). A file the file policies there now refuse
+/// is marked `"policy": "blocked"`, and one whose thumbnail can be asked for `"thumbnail": true`.
 pub(crate) async fn children(
     State(state): State<AppState>,
     signed: Signed,
@@ -437,9 +490,10 @@ pub(crate) async fn children(
     let id = node_id(&id)?;
     let Query(query) = query.map_err(|_| ApiError::BadRequest)?;
     let db = state.db();
-    let grid = match query.view.as_deref() {
-        None => false,
-        Some("grid") => true,
+    let (grid, photos) = match query.view.as_deref() {
+        None => (false, false),
+        Some("grid") => (true, false),
+        Some("photos") => (true, true),
         Some(_) => return Err(ApiError::InvalidRequest),
     };
     let (after, limit) = if grid {
@@ -456,12 +510,14 @@ pub(crate) async fn children(
     if grid && !in_image_library(db, id).await? {
         return Err(ApiError::InvalidRequest);
     }
-    Ok(Json(
-        ChildrenPage::of(listed, next.as_ref())
-            .marked(db, id)
-            .await?
-            .with_thumbnails(),
-    ))
+    let page = ChildrenPage::of(listed, next.as_ref())
+        .marked(db, id)
+        .await?
+        .with_thumbnails();
+    if photos {
+        return Ok(Json(page.with_photos(&state).await?));
+    }
+    Ok(Json(page))
 }
 
 /// Whether `node` is an image library or lies in one.

@@ -15,10 +15,13 @@ use std::collections::{BTreeSet, VecDeque};
 use collab_core::ids::{ClientId, Seq};
 use protocol::RemovedReason;
 use protocol::live::{
-    EntryBody, HEARTBEAT_MS, LIVE_PROTOCOL, LiveClientMsg, LiveEntry, LivePerson, LiveResume,
-    LiveServerMsg, LiveSessionId, LocalNo, MAX_PAYLOAD_BYTES, ParticipantNo, Place, RefusedReason,
+    EntryBody, HEARTBEAT_MS, LIVE_PROTOCOL, LiveBuild, LiveClientMsg, LiveEntry, LivePerson,
+    LiveResume, LiveServerMsg, LiveSessionId, LocalNo, MAX_CLIENT_FRAME_BYTES, MAX_PAYLOAD_BYTES,
+    MAX_PRESENCE_BYTES, MajorReason, ParticipantNo, Place, RefusedReason, TicketPurpose,
+    UnavailableReason,
 };
 use thiserror::Error;
+use uuid::Uuid;
 
 use crate::ids::{IdError, IdMaker, LiveId};
 
@@ -52,8 +55,8 @@ pub struct Stamp {
     pub seed: u32,
 }
 
-/// One change as the editor sees it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// One change as the editor sees it. The `Debug` form shows the payload's length only.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct EntryView<'a> {
     /// Its position in the log; `None` while it is still waiting for the server.
     pub seq: Option<Seq>,
@@ -67,6 +70,27 @@ pub struct EntryView<'a> {
     pub payload: &'a str,
 }
 
+impl std::fmt::Debug for EntryView<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EntryView")
+            .field("seq", &self.seq)
+            .field("participant", &self.participant)
+            .field("own", &self.own)
+            .field("stamp", &self.stamp)
+            .field("payload", &Length(self.payload.len()))
+            .finish()
+    }
+}
+
+/// Shows a payload's length in place of its content.
+struct Length(usize);
+
+impl std::fmt::Debug for Length {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<{} bytes>", self.0)
+    }
+}
+
 /// What applying a change did.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Outcome {
@@ -77,8 +101,9 @@ pub struct Outcome {
     pub read_stamp: bool,
 }
 
-/// Whether a change took effect.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Whether a change took effect. The `Debug` form shows a reason's length only, as an editor
+/// may put document text in it.
+#[derive(Clone, PartialEq, Eq)]
 pub enum Effect {
     Applied,
     /// The change did nothing, on every device alike; `reason` says why.
@@ -87,13 +112,24 @@ pub enum Effect {
     },
 }
 
+impl std::fmt::Debug for Effect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Effect::Applied => f.write_str("Applied"),
+            Effect::NoEffect { reason } => f
+                .debug_struct("NoEffect")
+                .field(
+                    "reason",
+                    &format_args!("<{} chars>", reason.chars().count()),
+                )
+                .finish(),
+        }
+    }
+}
+
 /// The editor stopped in this entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Crash;
-
-/// How many confirmed own changes the client keeps on top of its agreed copy before it goes
-/// back and takes a new copy.
-pub const MAX_FOLDED: usize = 64;
 
 /// The most entry frames the client sends in any [`PACE_WINDOW_MS`]. The server allows more
 /// (30 a second, bursts up to 120), so a paced client is never refused for its rate.
@@ -101,6 +137,13 @@ pub const MAX_ENTRIES_PER_WINDOW: usize = 20;
 
 /// The window [`MAX_ENTRIES_PER_WINDOW`] counts over, in milliseconds.
 pub const PACE_WINDOW_MS: u64 = 1_000;
+
+/// The longest server frame the client reads, in bytes. The largest the server sends is an
+/// entry whose payload of [`MAX_PAYLOAD_BYTES`] has every character escaped, below this.
+pub const MAX_FRAME_BYTES: usize = 8 * MAX_PAYLOAD_BYTES;
+
+/// The longest revision id a `Saved` notice may name.
+const MAX_REVISION_BYTES: usize = 128;
 
 /// The shortest heartbeat interval the client takes from the server; the longest is
 /// [`HEARTBEAT_MS`].
@@ -133,15 +176,41 @@ pub struct LiveConfig {
     pub crashed_at: Option<Seq>,
 }
 
-/// What a call produced: the frames to send, in order, and what happened.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// A borrowed view of the exact agreed state at a requested log position.
+pub enum AgreedSnapshot<'a, E: LiveEditor> {
+    /// The shown editor is exactly the agreed state.
+    Editor(&'a E),
+    /// Waiting or folded work is shown, so use the saved agreed state.
+    Saved(&'a E::Snapshot),
+}
+
+/// What a call produced: the frames to send, in order, and what happened. The `Debug` form
+/// shows each frame's length only, as frames carry payloads and presence notes.
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct Step {
     pub send: Vec<String>,
     pub events: Vec<Event>,
 }
 
-/// Something the host may want to show or act on.
-#[derive(Clone, Debug, PartialEq, Eq)]
+impl std::fmt::Debug for Step {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Step")
+            .field(
+                "send",
+                &self
+                    .send
+                    .iter()
+                    .map(|frame| Length(frame.len()))
+                    .collect::<Vec<_>>(),
+            )
+            .field("events", &self.events)
+            .finish()
+    }
+}
+
+/// Something the host may want to show or act on. The `Debug` form hides presence notes and
+/// shows people through [`LivePerson`]'s, which hides names and accounts.
+#[derive(Clone, PartialEq, Eq)]
 pub enum Event {
     /// Reset the editor to the stored revision at `at` (none: the empty document), then call
     /// [`LiveClient::base_ready`].
@@ -171,12 +240,160 @@ pub enum Event {
     People(Vec<LivePerson>),
     /// The person's right to edit changed.
     AccessChanged { can_edit: bool },
+    /// Write a checkpoint from the exact agreed state at `at`.
+    CheckpointRequested {
+        ticket: Uuid,
+        at: Seq,
+        base: Option<String>,
+        major: Option<MajorReason>,
+    },
+    /// Independently write and hash the exact agreed state at `at`.
+    VerifyRequested {
+        ticket: Uuid,
+        at: Seq,
+        base: Option<String>,
+    },
+    /// New changes wait (the unsaved log reached a hard limit, or a major version is being
+    /// stored at the head): waiting changes stay shown and are held until `ChangesResumed`.
+    ChangesPaused { entries: u64, bytes: u64 },
+    /// New changes may be sent again; held changes go now.
+    ChangesResumed,
+    /// The durable pre-return checkpoint exists and the saved batch may be sent.
+    ReturnReady { through: LocalNo },
+    /// Archive the old shown copy before the current base is loaded.
+    ArchiveReturn { current: Option<String> },
+    /// Someone's presence note changed; `None` when it was cleared. Opaque to the library.
+    Presence {
+        participant: ParticipantNo,
+        payload: Option<String>,
+    },
+    /// Someone whose place had ended is back, with saved work of their own to send.
+    Returning { participant: ParticipantNo },
+    /// A checkpoint was stored (`verified` false) or a stored one verified.
+    Saved {
+        revision: String,
+        through: Seq,
+        verified: bool,
+        major: bool,
+    },
+    /// This kind of editor build may not take part in the session; the client is closed.
+    BuildRefused,
     /// The place ended after missed heartbeats; the client can join again.
     Expired,
+    /// The server cannot take the join for now; the client keeps its work and can join again
+    /// later.
+    Unavailable { reason: UnavailableReason },
     /// The client's protocol or format does not match the session's.
     Incompatible { protocol: u32, format: String },
     /// The server ended the connection; do not reconnect.
     Removed { reason: RemovedReason },
+}
+
+impl std::fmt::Debug for Event {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Event::LoadBase { revision, at } => f
+                .debug_struct("LoadBase")
+                .field("revision", revision)
+                .field("at", at)
+                .finish(),
+            Event::Applied { seq, own, effect } => f
+                .debug_struct("Applied")
+                .field("seq", seq)
+                .field("own", own)
+                .field("effect", effect)
+                .finish(),
+            Event::Refused { local, reason } => f
+                .debug_struct("Refused")
+                .field("local", local)
+                .field("reason", reason)
+                .finish(),
+            Event::DroppedPending { count } => f
+                .debug_struct("DroppedPending")
+                .field("count", count)
+                .finish(),
+            Event::Crashed { seq } => f.debug_struct("Crashed").field("seq", seq).finish(),
+            Event::CannotOpen { seq } => f.debug_struct("CannotOpen").field("seq", seq).finish(),
+            Event::Returned { previous, now } => f
+                .debug_struct("Returned")
+                .field("previous", previous)
+                .field("now", now)
+                .finish(),
+            Event::People(people) => f.debug_tuple("People").field(people).finish(),
+            Event::AccessChanged { can_edit } => f
+                .debug_struct("AccessChanged")
+                .field("can_edit", can_edit)
+                .finish(),
+            Event::CheckpointRequested {
+                ticket,
+                at,
+                base,
+                major,
+            } => f
+                .debug_struct("CheckpointRequested")
+                .field("ticket", ticket)
+                .field("at", at)
+                .field("base", base)
+                .field("major", major)
+                .finish(),
+            Event::VerifyRequested { ticket, at, base } => f
+                .debug_struct("VerifyRequested")
+                .field("ticket", ticket)
+                .field("at", at)
+                .field("base", base)
+                .finish(),
+            Event::ChangesPaused { entries, bytes } => f
+                .debug_struct("ChangesPaused")
+                .field("entries", entries)
+                .field("bytes", bytes)
+                .finish(),
+            Event::ChangesResumed => f.write_str("ChangesResumed"),
+            Event::ReturnReady { through } => f
+                .debug_struct("ReturnReady")
+                .field("through", through)
+                .finish(),
+            Event::ArchiveReturn { current } => f
+                .debug_struct("ArchiveReturn")
+                .field("current", current)
+                .finish(),
+            Event::Presence {
+                participant,
+                payload,
+            } => f
+                .debug_struct("Presence")
+                .field("participant", participant)
+                .field("payload", &payload.as_ref().map(|note| Length(note.len())))
+                .finish(),
+            Event::Returning { participant } => f
+                .debug_struct("Returning")
+                .field("participant", participant)
+                .finish(),
+            Event::Saved {
+                revision,
+                through,
+                verified,
+                major,
+            } => f
+                .debug_struct("Saved")
+                .field("revision", revision)
+                .field("through", through)
+                .field("verified", verified)
+                .field("major", major)
+                .finish(),
+            Event::BuildRefused => f.write_str("BuildRefused"),
+            Event::Expired => f.write_str("Expired"),
+            Event::Unavailable { reason } => f
+                .debug_struct("Unavailable")
+                .field("reason", reason)
+                .finish(),
+            Event::Incompatible { protocol, format } => f
+                .debug_struct("Incompatible")
+                .field("protocol", protocol)
+                .field("format", format)
+                .finish(),
+            Event::Removed { reason } => f.debug_struct("Removed").field("reason", reason).finish(),
+        }
+    }
 }
 
 /// Where the client is in its session.
@@ -206,15 +423,68 @@ pub enum Phase {
 /// A frame the client cannot follow. The host drops the connection and reconnects.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum ClientError {
-    /// The frame is not a live server message.
-    #[error("malformed frame: {0}")]
-    Malformed(String),
+    /// The frame is not a live server message. Only the kind and position of the fault are
+    /// kept, never the frame's text.
+    #[error("malformed frame: {kind:?} at line {line}, column {column}")]
+    Malformed {
+        kind: MalformedKind,
+        line: usize,
+        column: usize,
+    },
     /// An entry is not the next position in the log.
     #[error("entry {got:?} arrived where {expected:?} was expected")]
     OutOfOrder { expected: Seq, got: Seq },
     /// The server and the client disagree about this client's own changes.
     #[error("out of step with the server: {0}")]
     Desync(String),
+    /// The requested position is not the exact, available agreed state.
+    #[error("agreed state at {at:?} is unavailable (agreed {agreed:?}, phase {phase:?})")]
+    AgreedUnavailable { at: Seq, agreed: Seq, phase: Phase },
+}
+
+/// What was wrong with a malformed frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MalformedKind {
+    /// Not JSON, or cut short.
+    Syntax,
+    /// A `type` (or other tag) this build does not know.
+    UnknownType,
+    /// A field the message needs is missing.
+    MissingField,
+    /// A field holds the wrong kind of value.
+    WrongType,
+    /// The frame is over [`MAX_FRAME_BYTES`], or a number is out of range.
+    TooLarge,
+}
+
+impl ClientError {
+    /// The fault in `error`, without the text serde would quote from the frame.
+    fn malformed(error: &serde_json::Error) -> ClientError {
+        use serde_json::error::Category;
+        let kind = match error.classify() {
+            Category::Io | Category::Eof => MalformedKind::Syntax,
+            category @ (Category::Syntax | Category::Data) => {
+                // The message is only inspected here, never kept or shown.
+                let message = error.to_string();
+                if message.starts_with("unknown variant") {
+                    MalformedKind::UnknownType
+                } else if message.starts_with("missing field") {
+                    MalformedKind::MissingField
+                } else if message.contains("out of range") {
+                    MalformedKind::TooLarge
+                } else if category == Category::Syntax {
+                    MalformedKind::Syntax
+                } else {
+                    MalformedKind::WrongType
+                }
+            }
+        };
+        ClientError::Malformed {
+            kind,
+            line: error.line(),
+            column: error.column(),
+        }
+    }
 }
 
 /// Why a local change was not taken. Nothing changed.
@@ -280,6 +550,10 @@ struct Pending {
 /// The library's side of one editor in a live session.
 pub struct LiveClient<E: LiveEditor> {
     config: LiveConfig,
+    /// Whether this editor can write and independently verify checkpoints.
+    can_checkpoint: bool,
+    /// The kind of editor build, used to prefer a different verifier.
+    build: LiveBuild,
     /// This client's identifier, made fresh by [`LiveClient::new`].
     client: ClientId,
     phase: Phase,
@@ -307,11 +581,25 @@ pub struct LiveClient<E: LiveEditor> {
     folded: Vec<Ordered>,
     /// Own changes not yet confirmed, in order.
     pending: VecDeque<Pending>,
+    /// The last local number advertised on this connection as pre-existing saved work.
+    returning_through: Option<LocalNo>,
+    /// Whether a returning place is waiting for the server's durable pre-return checkpoint.
+    hold_return: bool,
+    /// A change was held by the server: nothing is sent until changes resume, or until the
+    /// return barrier that held it opens.
+    changes_held: bool,
+    /// The server said changes wait (`changes_paused`): queued changes stay, shown, until
+    /// `changes_resumed`, so none is sent only to be refused.
+    changes_paused: bool,
+    /// A discarded return batch whose already-sent readiness may still arrive.
+    discarded_return_through: Option<LocalNo>,
     next_local: u64,
     /// Entries received while the client cannot apply them yet.
     held: Vec<LiveEntry>,
     /// The base position named by the catch-up while loading the base.
     base_at: Seq,
+    /// The stored revision the editor's state was loaded from.
+    base_revision: Option<String>,
     /// The entry the editor stopped in, until a verdict on it arrives: the stall survives
     /// reconnects, and a client started with a crash note begins with it.
     stalled_at: Option<Seq>,
@@ -319,6 +607,10 @@ pub struct LiveClient<E: LiveEditor> {
     /// cancelled, and the one a cancel record unstalled. A cancel record for anything else
     /// at or before the agreed position means the editor applied a cancelled change.
     skipped: BTreeSet<Seq>,
+    /// The newest presence note, kept to be sent again on the next join.
+    presence: Option<String>,
+    /// Whether [`LiveClient::presence`]'s note went out on the current connection.
+    presence_sent: bool,
 }
 
 impl<E: LiveEditor> LiveClient<E> {
@@ -327,6 +619,8 @@ impl<E: LiveEditor> LiveClient<E> {
         let stalled_at = config.crashed_at;
         LiveClient {
             config,
+            can_checkpoint: false,
+            build: LiveBuild::Browser,
             client: ClientId(uuid::Uuid::new_v4()),
             phase: Phase::Offline,
             session: None,
@@ -343,12 +637,35 @@ impl<E: LiveEditor> LiveClient<E> {
             head: Seq(0),
             folded: Vec::new(),
             pending: VecDeque::new(),
+            returning_through: None,
+            hold_return: false,
+            changes_held: false,
+            changes_paused: false,
+            discarded_return_through: None,
             next_local: 1,
             held: Vec::new(),
             base_at: Seq(0),
+            base_revision: None,
             stalled_at,
             skipped: BTreeSet::new(),
+            presence: None,
+            presence_sent: false,
         }
+    }
+
+    /// Finishes the client: every later call is refused and the presence note is forgotten.
+    fn close(&mut self) {
+        self.phase = Phase::Closed;
+        self.presence = None;
+        self.presence_sent = false;
+    }
+
+    /// Advertises checkpoint capability and the editor's build kind on every join.
+    #[must_use]
+    pub fn with_live_capabilities(mut self, can_checkpoint: bool, build: LiveBuild) -> Self {
+        self.can_checkpoint = can_checkpoint;
+        self.build = build;
+        self
     }
 
     /// The connection is open: returns the `live_join` frame.
@@ -358,11 +675,15 @@ impl<E: LiveEditor> LiveClient<E> {
         }
         self.phase = Phase::Joining;
         self.joined = false;
+        self.presence_sent = false;
         self.held.clear();
         // The join is a sign of life: the next heartbeat is due a full interval after it.
         self.last_heartbeat_ms = now_ms;
         for pending in &mut self.pending {
             pending.sent = false;
+        }
+        if !self.hold_return {
+            self.returning_through = self.pending.back().map(|pending| pending.local);
         }
         let join = LiveClientMsg::LiveJoin {
             client: self.client,
@@ -370,6 +691,9 @@ impl<E: LiveEditor> LiveClient<E> {
             format: self.config.format.clone(),
             resume: self.resume(),
             seen: self.has_state.then_some(self.agreed_seq),
+            can_checkpoint: self.can_checkpoint,
+            build: self.build,
+            returning_through: self.returning_through,
         };
         vec![frame(&join)]
     }
@@ -382,6 +706,7 @@ impl<E: LiveEditor> LiveClient<E> {
         }
         self.phase = Phase::Offline;
         self.joined = false;
+        self.presence_sent = false;
         // Entries held for this connection come again in the next catch-up.
         self.held.clear();
         for pending in &mut self.pending {
@@ -401,8 +726,15 @@ impl<E: LiveEditor> LiveClient<E> {
             // Nothing more is read once closed, and nothing here asks the host to reconnect.
             return Ok(step);
         }
-        let msg: LiveServerMsg = serde_json::from_str(frame)
-            .map_err(|error| ClientError::Malformed(error.to_string()))?;
+        if frame.len() > MAX_FRAME_BYTES {
+            return Err(ClientError::Malformed {
+                kind: MalformedKind::TooLarge,
+                line: 0,
+                column: 0,
+            });
+        }
+        let msg: LiveServerMsg =
+            serde_json::from_str(frame).map_err(|error| ClientError::malformed(&error))?;
         match msg {
             LiveServerMsg::LiveJoined {
                 session,
@@ -435,12 +767,16 @@ impl<E: LiveEditor> LiveClient<E> {
                     ));
                 }
                 self.head = head;
-                if self.has_state && from == self.agreed_seq {
+                // Another revision named at exactly the client's position replaced the file
+                // from outside (S4): what the client holds is no longer the agreed state.
+                let replaced = from == base && revision != self.base_revision;
+                if self.has_state && from == self.agreed_seq && !replaced {
                     self.phase = Phase::CatchingUp;
                 } else {
                     self.phase = Phase::LoadingBase;
                     self.held.clear();
                     self.base_at = base;
+                    self.base_revision.clone_from(&revision);
                     step.events.push(Event::LoadBase { revision, at: base });
                 }
                 self.check_live(now_ms, &mut step);
@@ -471,6 +807,21 @@ impl<E: LiveEditor> LiveClient<E> {
                     )));
                 }
             },
+            LiveServerMsg::Refused {
+                local,
+                reason: RefusedReason::Held,
+            } => {
+                // Not refused for good: this change and every later one wait, still shown, and
+                // go again once changes resume, never before.
+                self.changes_held = true;
+                for pending in self
+                    .pending
+                    .iter_mut()
+                    .filter(|pending| pending.local >= local)
+                {
+                    pending.sent = false;
+                }
+            }
             LiveServerMsg::Refused { local, reason } => {
                 let first = self.pending.front().map(|pending| pending.local);
                 // A refusal of a change the client already took off its queue (for example one
@@ -498,7 +849,7 @@ impl<E: LiveEditor> LiveClient<E> {
                 if self.stalled_at.take().is_some() {
                     editor.note_applying(None);
                 }
-                self.phase = Phase::Closed;
+                self.close();
                 step.events.push(Event::CannotOpen { seq });
             }
             LiveServerMsg::People { people } => step.events.push(Event::People(people)),
@@ -509,16 +860,127 @@ impl<E: LiveEditor> LiveClient<E> {
                 }
                 step.events.push(Event::AccessChanged { can_edit });
             }
+            LiveServerMsg::CheckpointTicket {
+                ticket,
+                purpose,
+                at,
+                base,
+                major,
+            } => match purpose {
+                TicketPurpose::Write => step.events.push(Event::CheckpointRequested {
+                    ticket,
+                    at,
+                    base,
+                    major,
+                }),
+                TicketPurpose::Verify => {
+                    step.events
+                        .push(Event::VerifyRequested { ticket, at, base })
+                }
+            },
+            LiveServerMsg::ChangesPaused { entries, bytes } => {
+                // Queued changes wait instead of going out to be refused.
+                self.changes_paused = true;
+                step.events.push(Event::ChangesPaused { entries, bytes });
+            }
+            LiveServerMsg::ChangesResumed => {
+                step.events.push(Event::ChangesResumed);
+                self.changes_held = false;
+                self.changes_paused = false;
+                self.send_unsent(now_ms, &mut step.send);
+            }
+            LiveServerMsg::ReturnReady { through } => {
+                if self.discarded_return_through == Some(through) {
+                    // The batch was dropped with the edit right; a change held behind its
+                    // barrier meanwhile is released now, or nothing ever would release it.
+                    self.discarded_return_through = None;
+                    if self.changes_held {
+                        self.changes_held = false;
+                        self.send_unsent(now_ms, &mut step.send);
+                    }
+                } else if self.hold_return && self.returning_through == Some(through) {
+                    self.hold_return = false;
+                    self.returning_through = None;
+                    if self
+                        .pending
+                        .iter()
+                        .any(|pending| pending.shown && pending.shown_as != self.own_participant())
+                    {
+                        self.go_back(editor, None);
+                    }
+                    step.events.push(Event::ReturnReady { through });
+                    self.send_unsent(now_ms, &mut step.send);
+                }
+                // Otherwise a repeat: the server sends it again on every join that names a
+                // batch, and this client holds none any more.
+            }
+            LiveServerMsg::ArchiveReturn { current } => {
+                if self.phase != Phase::Joining || !self.joined || !self.hold_return {
+                    return Err(ClientError::Desync(
+                        "archive return outside a held return batch".to_owned(),
+                    ));
+                }
+                step.events.push(Event::ArchiveReturn { current });
+                self.pending.clear();
+                self.returning_through = None;
+                self.hold_return = false;
+                self.discarded_return_through = None;
+                self.has_state = false;
+            }
+            LiveServerMsg::Presence {
+                participant,
+                payload,
+            } => {
+                // The server relays notes within the limit only; anything longer is dropped.
+                if payload
+                    .as_ref()
+                    .is_none_or(|note| note.len() <= MAX_PRESENCE_BYTES)
+                {
+                    step.events.push(Event::Presence {
+                        participant,
+                        payload,
+                    });
+                }
+            }
+            LiveServerMsg::Returning { participant } => {
+                step.events.push(Event::Returning { participant });
+            }
+            LiveServerMsg::Saved {
+                revision,
+                through,
+                verified,
+                major,
+                // Read by the page's owners' notice from the frame itself.
+                mismatch: _,
+            } => {
+                // A stored revision is named by its id; anything longer is dropped.
+                if revision.len() <= MAX_REVISION_BYTES {
+                    step.events.push(Event::Saved {
+                        revision,
+                        through,
+                        verified,
+                        major,
+                    });
+                }
+            }
+            LiveServerMsg::BuildRefused { .. } => {
+                self.close();
+                step.events.push(Event::BuildRefused);
+            }
             LiveServerMsg::Incompatible { protocol, format } => {
-                self.phase = Phase::Closed;
+                self.close();
                 step.events.push(Event::Incompatible { protocol, format });
+            }
+            LiveServerMsg::Unavailable { reason } => {
+                self.disconnected(now_ms);
+                step.events.push(Event::Unavailable { reason });
             }
             LiveServerMsg::Expired => {
                 self.disconnected(now_ms);
                 step.events.push(Event::Expired);
             }
             LiveServerMsg::Removed { reason } => {
-                self.phase = Phase::Closed;
+                self.close();
                 step.events.push(Event::Removed { reason });
             }
         }
@@ -578,6 +1040,17 @@ impl<E: LiveEditor> LiveClient<E> {
         if payload.len() > MAX_PAYLOAD_BYTES {
             return Err(LocalError::TooLarge);
         }
+        // The frame this change goes out in, which is the same on every resend: JSON escaping
+        // can make it several times the payload, and the server drops a frame over its limit.
+        let encoded = frame(&LiveClientMsg::Entry {
+            local: LocalNo(self.next_local),
+            seen: self.agreed_seq,
+            format: self.config.format.clone(),
+            payload: payload.clone(),
+        });
+        if encoded.len() > MAX_CLIENT_FRAME_BYTES {
+            return Err(LocalError::TooLarge);
+        }
         if self.agreed.is_none() {
             self.agreed = Some(editor.snapshot());
         }
@@ -619,6 +1092,33 @@ impl<E: LiveEditor> LiveClient<E> {
         Ok(step)
     }
 
+    /// Where the person is now, as an opaque note for the others to show.
+    ///
+    /// Returns the frame to send now, or `None` while not live: the newest note is kept and
+    /// sent once the client is live again, so only the latest one ever goes out. A note is not
+    /// a change: it has no local number, is never queued for resending, and changes neither the
+    /// agreed nor the shown state. A note over [`MAX_PRESENCE_BYTES`] is refused before any
+    /// frame is made, and nothing is kept once the client is closed.
+    pub fn presence(&mut self, payload: String) -> Result<Option<String>, LocalError> {
+        if payload.len() > MAX_PRESENCE_BYTES {
+            return Err(LocalError::TooLarge);
+        }
+        if self.phase == Phase::Closed {
+            return Ok(None);
+        }
+        if self.phase == Phase::Live {
+            self.presence_sent = true;
+            let frame = frame(&LiveClientMsg::Presence {
+                payload: payload.clone(),
+            });
+            self.presence = Some(payload);
+            return Ok(Some(frame));
+        }
+        self.presence = Some(payload);
+        self.presence_sent = false;
+        Ok(None)
+    }
+
     /// Time passed: returns the heartbeat when it is due, and any changes not yet sent.
     ///
     /// The heartbeat goes every `heartbeat_ms` whatever else was sent. Changes go at most
@@ -650,7 +1150,7 @@ impl<E: LiveEditor> LiveClient<E> {
         if self.phase == Phase::Closed {
             return None;
         }
-        self.phase = Phase::Closed;
+        self.close();
         Some(frame(&LiveClientMsg::Leave))
     }
 
@@ -674,6 +1174,43 @@ impl<E: LiveEditor> LiveClient<E> {
     /// The last log position in the agreed state.
     pub fn agreed_seq(&self) -> Seq {
         self.agreed_seq
+    }
+
+    /// Borrows the exact agreed state at `at`, without including shown waiting work.
+    pub fn agreed_snapshot<'a>(
+        &'a self,
+        editor: &'a E,
+        at: Seq,
+    ) -> Result<AgreedSnapshot<'a, E>, ClientError> {
+        self.require_agreed(at)?;
+        Ok(match &self.agreed {
+            Some(snapshot) => AgreedSnapshot::Saved(snapshot),
+            None => AgreedSnapshot::Editor(editor),
+        })
+    }
+
+    /// Makes the checkpoint-ready frame for a ticket at the exact agreed position. The server
+    /// ignores this frame (it acts on the upload itself); it only checks the client can write
+    /// the checkpoint at `at`.
+    pub fn checkpoint_ready(&self, ticket: Uuid, at: Seq) -> Result<String, ClientError> {
+        if !self.can_checkpoint {
+            return Err(ClientError::AgreedUnavailable {
+                at,
+                agreed: self.agreed_seq,
+                phase: self.phase,
+            });
+        }
+        self.require_agreed(at)?;
+        Ok(frame(&LiveClientMsg::CheckpointReady { ticket, at }))
+    }
+
+    /// Makes an entered-content fingerprint frame for the exact agreed position.
+    pub fn fingerprint(&self, at: Seq, entered: [u8; 32]) -> Result<String, ClientError> {
+        self.require_agreed(at)?;
+        Ok(frame(&LiveClientMsg::Fingerprint {
+            at,
+            entered: hex(&entered),
+        }))
     }
 
     /// How many own changes wait for the server.
@@ -716,10 +1253,27 @@ impl<E: LiveEditor> LiveClient<E> {
         self.participant.unwrap_or(ParticipantNo(0))
     }
 
+    fn require_agreed(&self, at: Seq) -> Result<(), ClientError> {
+        if self.phase == Phase::Live && self.has_state && at == self.agreed_seq {
+            Ok(())
+        } else {
+            Err(ClientError::AgreedUnavailable {
+                at,
+                agreed: self.agreed_seq,
+                phase: self.phase,
+            })
+        }
+    }
+
     /// Sends the waiting changes not yet sent on this connection, in order, as far as the pace
     /// allows. What is sent is always a prefix of the queue.
     fn send_unsent(&mut self, now_ms: u64, send: &mut Vec<String>) {
-        if self.phase != Phase::Live || !self.can_edit {
+        if self.phase != Phase::Live
+            || !self.can_edit
+            || self.hold_return
+            || self.changes_held
+            || self.changes_paused
+        {
             return;
         }
         self.clock_check(now_ms);
@@ -749,6 +1303,14 @@ impl<E: LiveEditor> LiveClient<E> {
     fn check_live(&mut self, now_ms: u64, step: &mut Step) {
         if self.phase == Phase::CatchingUp && self.agreed_seq >= self.head {
             self.phase = Phase::Live;
+            if !self.presence_sent
+                && let Some(payload) = &self.presence
+            {
+                self.presence_sent = true;
+                step.send.push(frame(&LiveClientMsg::Presence {
+                    payload: payload.clone(),
+                }));
+            }
             self.send_unsent(now_ms, &mut step.send);
         }
     }
@@ -804,16 +1366,25 @@ impl<E: LiveEditor> LiveClient<E> {
         // A server's interval outside 1 s to 60 s would flood it or let the place expire.
         self.heartbeat_ms = heartbeat_ms.clamp(MIN_HEARTBEAT_MS, HEARTBEAT_MS);
         self.joined = true;
+        // A new join starts over: a hold of the connection before applies no longer.
+        self.changes_held = false;
+        self.changes_paused = false;
         if let Place::Returning { previous } = place {
+            self.hold_return = self.returning_through.is_some();
             step.events.push(Event::Returned {
                 previous,
                 now: participant,
             });
+        } else if place == Place::New {
+            self.hold_return = false;
         }
         if !can_edit {
             // The person lost the right to edit while away (S5).
             self.drop_pending(editor, step);
-        } else if renumbered && self.pending.iter().any(|pending| pending.shown) {
+        } else if renumbered
+            && !self.hold_return
+            && self.pending.iter().any(|pending| pending.shown)
+        {
             // Waiting changes are shown again as coming from the new number. They keep their
             // local numbers and `seen`, and go to the server as normal entries.
             self.go_back(editor, None);
@@ -825,6 +1396,10 @@ impl<E: LiveEditor> LiveClient<E> {
     fn drop_pending(&mut self, editor: &mut E, step: &mut Step) {
         let count = self.pending.len();
         let any_shown = self.pending.iter().any(|pending| pending.shown);
+        if self.hold_return {
+            self.discarded_return_through = self.returning_through.take();
+            self.hold_return = false;
+        }
         self.pending.clear();
         if any_shown {
             self.go_back(editor, None);
@@ -950,12 +1525,14 @@ impl<E: LiveEditor> LiveClient<E> {
         };
         if confirms && let Some(confirmed) = self.pending.pop_front() {
             if confirmed.shown && !confirmed.read_stamp && confirmed.shown_as == participant {
-                // Already shown as the server ordered it: keep it on top of the copy.
+                // Already shown as the server ordered it. Keep the fast path when it was the
+                // last waiting change; otherwise materialise the new exact agreed snapshot
+                // before re-running the remaining waiting work.
                 self.folded.push(ordered);
                 self.agreed_seq = seq;
                 if self.pending.is_empty() {
                     self.settle();
-                } else if self.folded.len() >= MAX_FOLDED {
+                } else {
                     self.go_back(editor, None);
                 }
                 step.events.push(Event::Applied {
@@ -1161,7 +1738,7 @@ impl<E: LiveEditor> LiveClient<E> {
     /// A waiting change whose re-run stops the editor is left out of what is shown until it
     /// is confirmed: the editor goes back to `copy` and re-runs the ones before it.
     fn rerun_pending(&mut self, editor: &mut E, copy: &E::Snapshot) {
-        let participant = self.own_participant();
+        let current_participant = self.own_participant();
         for at in 0..self.pending.len() {
             let Some(pending) = self.pending.get(at) else {
                 break;
@@ -1169,6 +1746,11 @@ impl<E: LiveEditor> LiveClient<E> {
             if pending.mode != Mode::ShowAtOnce {
                 continue;
             }
+            let participant = if self.hold_return {
+                pending.shown_as
+            } else {
+                current_participant
+            };
             let view = EntryView {
                 seq: None,
                 participant,
@@ -1180,6 +1762,11 @@ impl<E: LiveEditor> LiveClient<E> {
             if result.is_err() {
                 editor.restore(copy);
                 for earlier in self.pending.iter().take(at).filter(|earlier| earlier.shown) {
+                    let participant = if self.hold_return {
+                        earlier.shown_as
+                    } else {
+                        current_participant
+                    };
                     let _ = editor.apply(&EntryView {
                         seq: None,
                         participant,
@@ -1207,6 +1794,15 @@ impl<E: LiveEditor> LiveClient<E> {
             }
         }
     }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
+    for &byte in bytes {
+        encoded.push(char::from_digit(u32::from(byte >> 4), 16).unwrap_or('0'));
+        encoded.push(char::from_digit(u32::from(byte & 0x0f), 16).unwrap_or('0'));
+    }
+    encoded
 }
 
 /// The text of a client frame. Serialising a client message cannot fail: every field is a

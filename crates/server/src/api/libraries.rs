@@ -29,9 +29,10 @@ where
 }
 
 /// A library with its settings, as its routes answer it: `{id, name, site, kind, description,
-/// folders, allowed_types, blocked_types, max_file_bytes, effective_allowed_types}`, where
-/// `effective_allowed_types` is what it accepts in effect (for an image library with no list
-/// of its own, the image types; `null` for every type).
+/// folders, allowed_types, blocked_types, max_file_bytes, effective_allowed_types,
+/// hero_image}`, where `effective_allowed_types` is what it accepts in effect (for an image
+/// library with no list of its own, the image types; `null` for every type) and `hero_image`
+/// is `{url, name, sha256, width?, height?}` or `null`.
 fn library_out(node: &Node, settings: &LibrarySettings) -> Value {
     json!({
         "id": node.id.0.to_string(),
@@ -44,6 +45,13 @@ fn library_out(node: &Node, settings: &LibrarySettings) -> Value {
         "blocked_types": settings.blocked_types,
         "max_file_bytes": settings.max_file_bytes,
         "effective_allowed_types": settings.effective_allowed(),
+        "hero_image": settings.hero_image.as_ref().map(|image| json!({
+            "url": super::brand::image_url(&image.sha256),
+            "name": image.name,
+            "sha256": image.sha256,
+            "width": image.width,
+            "height": image.height,
+        })),
     })
 }
 
@@ -73,22 +81,47 @@ pub(crate) struct LibraryChangeBody {
     /// `null` for no limit of the library's own.
     #[serde(default, deserialize_with = "nullable")]
     max_file_bytes: Option<Option<u64>>,
+    /// `{doc}`, `{brand_image}` or `{keep}` as a look's image is chosen; `null` for none.
+    #[serde(default, deserialize_with = "nullable")]
+    hero_image: Option<Option<crate::looks::ImageSlot>>,
 }
 
 /// `PATCH /api/libraries/{id} {description?, kind?, folders?, allowed_types?, blocked_types?,
-/// max_file_bytes?}`: changes the library's kind and settings, with `manage_site` on it (the
-/// kind `asset`, or a change away from it, needs an administrator too): one commit, recorded
-/// as `library.changed`. Answers the library as it then is. `422 invalid_library_settings`
-/// with the `reason` for settings that break a rule; `403 archived` on an archived site.
+/// max_file_bytes?, hero_image?}`: changes the library's kind and settings, with `manage_site`
+/// on it (the kind `asset`, or a change away from it, needs an administrator too): one commit,
+/// recorded as `library.changed`. Answers the library as it then is. `422
+/// invalid_library_settings` with the `reason` for settings that break a rule; `403 archived`
+/// on an archived site. The hero image is chosen as a site look's header image is (see
+/// [`crate::looks::hero_image`]), with that route's refusals; `null` takes it away.
 pub(crate) async fn change(
     State(state): State<AppState>,
     signed: Signed,
     Path(id): Path<String>,
     JsonBody(body): JsonBody<LibraryChangeBody>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<Value>, ChangeRefusal> {
     let library = node_id(&id)?;
     let actor = signed.session.user;
+    let hero_image = match body.hero_image {
+        None => None,
+        Some(None) => Some(None),
+        Some(Some(slot)) => {
+            // Judged by who may change the library first, so a refusal tells nothing more.
+            let (node, settings) = libraries::show(&state, &actor, library)
+                .await
+                .map_err(ApiError::from)?;
+            let chosen = crate::looks::hero_image(
+                &state,
+                &actor,
+                node.site,
+                slot,
+                settings.hero_image.as_ref(),
+            )
+            .await?;
+            Some(Some(chosen))
+        }
+    };
     let edit = LibraryEdit {
+        hero_image,
         description: body.description,
         kind: body.kind,
         folders: body.folders,
@@ -105,8 +138,38 @@ pub(crate) async fn change(
         })
         .await?;
     }
-    let (node, settings) = libraries::show(&state, &actor, library).await?;
+    let (node, settings) = libraries::show(&state, &actor, library)
+        .await
+        .map_err(ApiError::from)?;
     Ok(Json(library_out(&node, &settings)))
+}
+
+/// Why a library's settings were not changed: as every route answers, or as a look's image is
+/// refused.
+pub(crate) enum ChangeRefusal {
+    Api(ApiError),
+    Brand(crate::brand::BrandError),
+}
+
+impl From<ApiError> for ChangeRefusal {
+    fn from(e: ApiError) -> Self {
+        ChangeRefusal::Api(e)
+    }
+}
+
+impl From<crate::brand::BrandError> for ChangeRefusal {
+    fn from(e: crate::brand::BrandError) -> Self {
+        ChangeRefusal::Brand(e)
+    }
+}
+
+impl IntoResponse for ChangeRefusal {
+    fn into_response(self) -> Response {
+        match self {
+            ChangeRefusal::Api(e) => e.into_response(),
+            ChangeRefusal::Brand(e) => e.into_response(),
+        }
+    }
 }
 
 /// The body of `POST /api/sites/{id}/libraries`.

@@ -67,6 +67,14 @@ pub struct Config {
     pub live_editors: Vec<Editor>,
     /// How often a live client sends a heartbeat. Its place expires after three periods.
     pub live_heartbeat: Duration,
+    /// A live checkpoint is asked for once the log has been quiet this long after a change.
+    pub live_checkpoint_quiet: Duration,
+    /// ... or once the first unsaved live change is this old, whichever comes first.
+    pub live_checkpoint_wait: Duration,
+    /// How long a live checkpoint ticket can be used.
+    pub live_ticket_lifetime: Duration,
+    /// How much unsaved live work a document may hold before it warns and pauses.
+    pub live_limits: LiveLimits,
     /// The PostgreSQL database holding accounts, sessions and access grants.
     pub database_url: DatabaseUrl,
     /// Where the built editors are installed, one folder per editor, served at `/editors`.
@@ -163,6 +171,9 @@ pub enum ConfigError {
          or fragment"
     )]
     BadGithubApi,
+    /// A live-editor setting names an editor that cannot co-author.
+    #[error("SHARECRAFT_LIVE_EDITORS names {0:?}; only gridcraft can co-author")]
+    BadLiveEditors(String),
 }
 
 /// The raw production-mode settings, as read from the environment.
@@ -174,6 +185,25 @@ pub struct DeploymentValues<'a> {
     pub trusted_proxies: Option<&'a str>,
     /// `SHARECRAFT_HSTS_SECONDS`.
     pub hsts_seconds: Option<&'a str>,
+}
+
+fn live_editors_from(value: Option<&str>) -> Result<Vec<Editor>, ConfigError> {
+    let mut editors = Vec::new();
+    let Some(value) = value else {
+        return Ok(editors);
+    };
+    for item in value.split(',') {
+        match item.trim() {
+            "" => {}
+            "gridcraft" => {
+                if !editors.contains(&Editor::GridCraft) {
+                    editors.push(Editor::GridCraft);
+                }
+            }
+            other => return Err(ConfigError::BadLiveEditors(other.to_owned())),
+        }
+    }
+    Ok(editors)
 }
 
 impl Config {
@@ -202,6 +232,7 @@ impl Config {
         let trusted_proxies = read_var("SHARECRAFT_TRUSTED_PROXIES")?;
         let hsts_seconds = read_var("SHARECRAFT_HSTS_SECONDS")?;
         let github_api = github_api_from(read_var("SHARECRAFT_GITHUB_API")?.as_deref())?;
+        let live_editors = live_editors_from(read_var("SHARECRAFT_LIVE_EDITORS")?.as_deref())?;
         let mut config = Self::from_values_in(
             DeploymentValues {
                 public_url: public_url.as_deref(),
@@ -216,6 +247,7 @@ impl Config {
             max_file_bytes.as_deref(),
         )?;
         config.github_api = github_api;
+        config.live_editors = live_editors;
         Ok(config)
     }
 
@@ -289,6 +321,10 @@ impl Config {
             write_timeout: Duration::from_secs(10),
             live_editors: Vec::new(),
             live_heartbeat: Duration::from_secs(60),
+            live_checkpoint_quiet: crate::live_room::CHECKPOINT_QUIET,
+            live_checkpoint_wait: crate::live_room::CHECKPOINT_WAIT,
+            live_ticket_lifetime: crate::live_room::TICKET_LIFETIME,
+            live_limits: LiveLimits::default(),
             database_url,
             editors_dir: PathBuf::from(editors_dir.unwrap_or(DEFAULT_EDITORS)),
             max_file_bytes,
@@ -376,6 +412,31 @@ fn read_var(name: &'static str) -> Result<Option<String>, ConfigError> {
     }
 }
 
+/// How much unsaved work a live log may hold since its verified base, counted in entries
+/// (cancel records included) and payload bytes. At a warning threshold the room asks for a
+/// checkpoint at once; at a hard limit it pauses new changes until a checkpoint is verified.
+/// The same limits bound the catch-up a joining client is sent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LiveLimits {
+    pub warn_entries: u64,
+    pub warn_bytes: u64,
+    pub hard_entries: u64,
+    pub hard_bytes: u64,
+}
+
+impl Default for LiveLimits {
+    /// The adopted values (plan G4, proposal 2): warn at 4,000 entries or 48 MiB, pause at
+    /// 5,000 entries or 64 MiB.
+    fn default() -> Self {
+        Self {
+            warn_entries: 4_000,
+            warn_bytes: 48 * 1024 * 1024,
+            hard_entries: 5_000,
+            hard_bytes: 64 * 1024 * 1024,
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -385,6 +446,22 @@ fn read_var(name: &'static str) -> Result<Option<String>, ConfigError> {
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_editors_default_stays_empty() {
+        assert_eq!(live_editors_from(None).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn live_editors_reads_gridcraft_and_refuses_unknown_editors() {
+        assert_eq!(
+            live_editors_from(Some(" gridcraft ")).unwrap(),
+            vec![Editor::GridCraft]
+        );
+        for value in ["wordcraft", "pdfcraft", "solidcraft", "unknown"] {
+            assert!(live_editors_from(Some(value)).is_err(), "{value}");
+        }
+    }
 
     #[test]
     fn defaults_are_local() {
@@ -399,6 +476,9 @@ mod tests {
         assert_eq!(c.write_timeout, Duration::from_secs(10));
         assert!(c.live_editors.is_empty());
         assert_eq!(c.live_heartbeat, Duration::from_secs(60));
+        assert_eq!(c.live_checkpoint_quiet, Duration::from_secs(15));
+        assert_eq!(c.live_checkpoint_wait, Duration::from_secs(120));
+        assert_eq!(c.live_ticket_lifetime, Duration::from_secs(120));
         assert_eq!(c.editors_dir, PathBuf::from("./editors"));
         assert_eq!(c.max_file_bytes, 10 * 1024 * 1024 * 1024);
         assert_eq!(c.github_api, "https://api.github.com");

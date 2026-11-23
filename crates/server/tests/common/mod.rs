@@ -543,6 +543,10 @@ pub fn config_at(data_dir: &Path, db: &TestDb) -> Config {
         write_timeout: Duration::from_secs(10),
         live_editors: Vec::new(),
         live_heartbeat: Duration::from_secs(60),
+        live_checkpoint_quiet: Duration::from_secs(15),
+        live_checkpoint_wait: Duration::from_secs(120),
+        live_ticket_lifetime: Duration::from_secs(120),
+        live_limits: Default::default(),
         database_url: server::config::DatabaseUrl::new(db.url()),
         editors_dir: data_dir.join("editors"),
         max_file_bytes: 64 << 20,
@@ -574,6 +578,23 @@ pub fn install_stub_editor(config: &Config, id: &str) -> PathBuf {
     )
     .unwrap();
     folder
+}
+
+/// Switches live editing on for GridCraft: lists it in `live_editors` and installs a stub build
+/// whose manifest declares the live protocol and format, as a real live-capable build does.
+/// Call it from the `edit` closure of [`spawn_server_config`].
+#[allow(dead_code)]
+pub fn enable_live_gridcraft(config: &mut Config) {
+    config.live_editors = vec![records::Editor::GridCraft];
+    let folder = install_stub_editor(config, "gridcraft");
+    let path = folder.join("editor.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    manifest["live"] = serde_json::json!({
+        "protocol": protocol::live::LIVE_PROTOCOL,
+        "format": "gridcraft/1",
+    });
+    std::fs::write(&path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
 }
 
 /// A grace period no test waits out: an empty room stays open for the whole test.

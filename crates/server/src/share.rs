@@ -168,8 +168,8 @@ impl ShareFs for OsFs {
 fn canonical_within(approved_root: &Path, path: &Path) -> io::Result<PathBuf> {
     let canonical_root = fs::canonicalize(approved_root)?;
     let canonical_path = fs::canonicalize(path)?;
-    let root = share_path_from_canonical(&canonical_root)?;
-    let candidate = share_path_from_canonical(&canonical_path)?;
+    let root = canonical_share_path(&canonical_root)?;
+    let candidate = canonical_share_path(&canonical_path)?;
     if candidate.is_within(&root) {
         Ok(canonical_path)
     } else {
@@ -177,7 +177,10 @@ fn canonical_within(approved_root: &Path, path: &Path) -> io::Result<PathBuf> {
     }
 }
 
-fn share_path_from_canonical(path: &Path) -> io::Result<SharePath> {
+/// Converts an operating-system canonical path to the typed representation used for share
+/// containment. Windows canonicalisation adds a device prefix, which is safe to remove only
+/// after the operating system has resolved the path.
+pub fn canonical_share_path(path: &Path) -> io::Result<SharePath> {
     let text = path.to_str().ok_or_else(path_refused)?;
     let normal = if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
         format!(r"\\{rest}")
@@ -238,7 +241,13 @@ pub struct Shares {
     operation_timeout: RwLock<Duration>,
     cache_max_bytes_for_tests: Mutex<Option<u64>>,
     listing_progress: Mutex<HashMap<NodeId, Arc<AtomicUsize>>>,
+    lookups: Arc<tokio::sync::Semaphore>,
 }
+
+/// How many canonical-path lookups a connect may have in flight across the whole server. A
+/// lookup holds its permit for its whole blocking call, also after its caller stopped waiting,
+/// so a hung share server can never tie up more than this many blocking threads.
+pub const SHARE_LOOKUPS: usize = 8;
 
 impl Default for Shares {
     fn default() -> Self {
@@ -259,7 +268,14 @@ impl Shares {
             operation_timeout: RwLock::new(crate::external::OPERATION_WAIT),
             cache_max_bytes_for_tests: Mutex::new(None),
             listing_progress: Mutex::new(HashMap::new()),
+            lookups: Arc::new(tokio::sync::Semaphore::new(SHARE_LOOKUPS)),
         }
+    }
+
+    /// The server-wide bound on canonical-path lookups in flight; see [`SHARE_LOOKUPS`].
+    #[must_use]
+    pub fn lookups(&self) -> Arc<tokio::sync::Semaphore> {
+        Arc::clone(&self.lookups)
     }
 
     /// The current file-system implementation.

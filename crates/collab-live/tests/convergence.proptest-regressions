@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 6b1b16f22e31c193532f50b6d726837918e1b6931ef28fb9f9bd4363ccaaec68 # shrinks to actions = [Change { device: 2, kind: 0, pick: 0, wait: false }, Disconnect { device: 2 }, Change { device: 0, kind: 0, pick: 0, wait: false }, Reconnect { device: 2 }, Change { device: 0, kind: 0, pick: 0, wait: false }, ToServer { device: 0, count: 1 }, Expire { device: 2 }, ToServer { device: 2, count: 1 }, ToClient { device: 2, count: 1 }, Disconnect { device: 2 }], delay_verdicts = false
+cc a998a8ddc54b51af324ab7ac3f4c54b2b80400a39651d2c752a7b5de673145e8 # shrinks to actions = [Change { device: 0, kind: 0, pick: 0, wait: false }, Expire { device: 1 }, Change { device: 1, kind: 0, pick: 0, wait: false }, ToClient { device: 1, count: 1 }, Reconnect { device: 1 }, ToServer { device: 1, count: 1 }, ToClient { device: 1, count: 3 }, Disconnect { device: 1 }, Change { device: 0, kind: 0, pick: 0, wait: false }, Change { device: 0, kind: 0, pick: 0, wait: false }, Change { device: 0, kind: 0, pick: 0, wait: false }], delay_verdicts = false

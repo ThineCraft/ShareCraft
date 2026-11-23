@@ -15,7 +15,15 @@ export const EDITORS = Object.freeze({
  * How the page talks to each editor, by editor id.
  */
 export const BRIDGES = Object.freeze({
-  gridcraft: Object.freeze({ kind: 'craft-web-host', prefix: 'gridcraft', query: 'host=parent', author: true }),
+  // `live`: the change format of the editor's live session (G5), for documents the server opens
+  // in a live room.
+  gridcraft: Object.freeze({
+    kind: 'craft-web-host',
+    prefix: 'gridcraft',
+    query: 'host=parent',
+    author: true,
+    live: 'gridcraft/1',
+  }),
   wordcraft: Object.freeze({
     kind: 'craft-web-host',
     prefix: 'wordcraft',

@@ -4,7 +4,8 @@
 // Save and a "⋯" menu with the rest (Details, Activity, …); and a Focus mode that hides the bar and leaves only a small
 // "Exit focus" pill, remembered per viewer.
 //
-// `presenceModel`, `statusLabel`, `backLabel` and `isFocusShortcut` are pure and tested;
+// `presenceModel`, `liveLook`, `liveStatus`, `downloadNote`, `statusLabel`, `backLabel` and
+// `isFocusShortcut` are pure and tested;
 // `setupEditorFrame` needs the page. The site's look colours the bar only (siteChrome does that).
 
 import { initials, avatarColour } from './account.js';
@@ -27,7 +28,8 @@ export function presenceModel(people, me, limit = 4) {
   const seen = new Set();
   const others = [];
   for (const person of Array.isArray(people) ? people : []) {
-    if (!person || person.me === true) continue;
+    // A live place whose connection dropped is kept for a while, but not shown (Proposal 7).
+    if (!person || person.me === true || person.connected === false) continue;
     const user = typeof person.user === 'string' ? person.user : typeof person.id === 'string' ? person.id : '';
     if (me && user === me) continue;
     const name = String(person.name ?? '').trim() || 'Someone';
@@ -40,6 +42,65 @@ export function presenceModel(people, me, limit = 4) {
   const shown = others.length > cap ? others.slice(0, cap) : others;
   const names = others.map((person) => (person.readOnly ? `${person.name} (read only)` : person.name));
   return { shown, more: others.length - shown.length, total: others.length, label: names.length ? `Also here: ${listText(names)}` : '' };
+}
+
+/**
+ * How a person in a live session looks in the editor's canvas: the initials and the light-theme
+ * colour of the avatar the bar gives the same account (`#rrggbb`), so a selection and its face
+ * match. The name stands in for a missing account.
+ */
+export function liveLook(person) {
+  const name = String(person?.name ?? '');
+  const user = typeof person?.user === 'string' ? person.user : '';
+  return { initials: initials(name), colour: avatarColour(user || name).light.bg };
+}
+
+const CONNECTED = new Set(['live']);
+const AWAY = new Set(['offline', 'closed', 'stalled', 'idle']);
+
+/**
+ * The bar's status for a live document (Proposal 14): `state` is the editor's last live state
+ * (`phase`, `waiting`, `canEdit`) with what the page knows besides: `paused` (the room paused
+ * changes), `saving` (a checkpoint upload is under way) and `unsaved` (this tab made changes
+ * since the last stored version, which the server has taken) and `stopped` (the page stopped
+ * for good and does not connect again). `waiting` counts changes the server has not taken yet:
+ * only those are "kept in this tab". Answers a state for statusLabel.
+ */
+export function liveStatus(state) {
+  const { phase = '', waiting = 0, canEdit = true, paused = false, saving = false, unsaved = false, stopped = false } = state ?? {};
+  if (canEdit === false) return { tone: 'view' };
+  if (stopped) {
+    // Nothing is sent again: changes still waiting here are lost when the page goes.
+    if (waiting > 0) return { tone: 'failed', text: "Changes made here since the connection stopped couldn't be sent." };
+    if (unsaved) return { tone: 'unsaved', text: 'Your changes are kept on the server.' };
+    return { tone: 'saved' };
+  }
+  if (!CONNECTED.has(phase)) {
+    if (AWAY.has(phase) && waiting > 0) {
+      return { tone: 'offline', text: 'Your changes are kept in this tab and are sent when the connection is back.' };
+    }
+    return { tone: 'connecting' };
+  }
+  if (paused) {
+    return { tone: 'unsaved', text: 'Changes are paused until the latest version is saved.' };
+  }
+  if (saving || waiting > 0) return { tone: 'saving' };
+  if (unsaved) {
+    return { tone: 'unsaved', text: 'Your changes are kept on the server and go into the stored file shortly.' };
+  }
+  return { tone: 'saved' };
+}
+
+const BEHIND = "The stored file doesn't include the latest changes yet";
+
+/**
+ * What the Download link says about a live document's stored file: `doc` is the document
+ * answer (`live.behind`); `since` what this page saw after it: `savedSince` (a newer version
+ * was stored) and `unsaved` (changes not yet in a stored version). '' when the file is current.
+ */
+export function downloadNote(doc, { savedSince = false, unsaved = false } = {}) {
+  const behind = doc?.live?.behind === true && !savedSince;
+  return behind || unsaved ? BEHIND : '';
 }
 
 function listText(names) {
@@ -55,6 +116,7 @@ const WORDS = Object.freeze({
   view: 'Read only',
   failed: 'Not saved',
   notice: 'Unsaved changes',
+  unsaved: 'Unsaved changes kept',
 });
 
 /**

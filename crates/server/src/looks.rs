@@ -379,6 +379,49 @@ async fn slot_image(
     }
 }
 
+/// The hero image of a library of `site`, chosen by `actor` as a header image is: `slot` is
+/// `{doc}` (the current version of a document in an asset library or in one of `site`'s
+/// libraries, which `actor` can view), `{brand_image}` (an image of the brand centre), or
+/// `{keep}` (the hash of `current`, the library's hero image now, kept as it is).
+///
+/// # Errors
+/// As a header image of a look (see `slot_image`): `422 invalid_look` for a slot that gives no
+/// way or more than one, an unknown brand image or a `keep` of anything but `current`; `413
+/// image_too_large`; `423 held`; `404`, `400 wrong_place` or `422 not_an_image` for the
+/// document. `409 not_allowed {problems}` when the brand policy turns off images from the
+/// site's own libraries and `actor` is a site owner (neither an administrator nor a brand
+/// manager): only an image the brand centre holds (matched by content) may be chosen or kept.
+pub(crate) async fn hero_image(
+    state: &AppState,
+    actor: &User,
+    site: NodeId,
+    slot: ImageSlot,
+    current: Option<&ImageRef>,
+) -> Result<ImageRef, BrandError> {
+    let org = state.db().org_brand().await?;
+    let ctx = SlotContext {
+        state,
+        actor,
+        site,
+        current: current.into_iter().collect(),
+        history: Vec::new(),
+        org: &org,
+    };
+    let image = slot_image(&ctx, Some(slot), ImageKind::Background)
+        .await?
+        .ok_or_else(|| BrandError::InvalidLook("no image was chosen".into()))?;
+    if !org.policy.site_images
+        && !org.images.iter().any(|b| b.image.sha256 == image.sha256)
+        && actor_kind(state.db(), actor).await? == Actor::Owner
+    {
+        return Err(BrandError::NotAllowed(vec![
+            "banner picture: images from the site's own libraries are turned off for site owners"
+                .to_owned(),
+        ]));
+    }
+    Ok(image)
+}
+
 /// Every image of `look`, each with the name of its slot.
 fn slots(look: &Look) -> Vec<(&'static str, &ImageRef)> {
     [

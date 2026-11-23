@@ -170,11 +170,36 @@ pub(crate) async fn locked_usage(
             .bind(site.0)
             .fetch_one(&mut *conn)
             .await?;
+    let identities = live_identity_bytes(&mut *conn, site).await?;
     Ok(SiteUsage {
-        used: bytes_of(used),
+        used: bytes_of(used).saturating_add(identities),
         reserved: bytes_of(reserved),
         quota: quota.map(bytes_of),
     })
+}
+
+/// The live-checkpoint identity data held for the documents of `site`. It is stored bytes
+/// like a version's, so it counts as used: read where usage is judged rather than kept in
+/// `used`, so dropping it, moving or purging its document needs no bookkeeping.
+pub(crate) async fn live_identity_bytes(
+    conn: &mut PgConnection,
+    site: NodeId,
+) -> Result<u64, sqlx::Error> {
+    let installed: bool = sqlx::query_scalar("select to_regclass('live_checkpoints') is not null")
+        .fetch_one(&mut *conn)
+        .await?;
+    if !installed {
+        return Ok(0);
+    }
+    let bytes: i64 = sqlx::query_scalar(
+        "select coalesce(sum(octet_length(c.session_data)), 0)::bigint \
+         from live_checkpoints c join nodes n on n.id = c.document_id \
+         where n.site_id = $1 and octet_length(c.session_data) > 0",
+    )
+    .bind(site.0)
+    .fetch_one(conn)
+    .await?;
+    Ok(bytes_of(bytes))
 }
 
 /// Adds `delta` (which may be negative) to the reserved bytes of `site`, never below zero.
@@ -387,18 +412,20 @@ pub(crate) async fn apply_usage_changes(
 impl Db {
     /// The storage of `site`: nothing used, reserved or limited if it has no row yet.
     pub async fn site_usage(&self, site: NodeId) -> Result<SiteUsage, DbError> {
+        let mut conn = self.pool().acquire().await?;
         let row: Option<(i64, i64, Option<i64>)> =
             sqlx::query_as("select used, reserved, quota from site_usage where site_id = $1")
                 .bind(site.0)
-                .fetch_optional(self.pool())
+                .fetch_optional(&mut *conn)
                 .await?;
-        Ok(
-            row.map_or_else(SiteUsage::default, |(used, reserved, quota)| SiteUsage {
-                used: bytes_of(used),
-                reserved: bytes_of(reserved),
-                quota: quota.map(bytes_of),
-            }),
-        )
+        let identities = live_identity_bytes(&mut conn, site).await?;
+        let mut usage = row.map_or_else(SiteUsage::default, |(used, reserved, quota)| SiteUsage {
+            used: bytes_of(used),
+            reserved: bytes_of(reserved),
+            quota: quota.map(bytes_of),
+        });
+        usage.used = usage.used.saturating_add(identities);
+        Ok(usage)
     }
 
     /// Sets the quota of `site` to `quota` bytes (`None`: no limit), for `actor`, who must be an

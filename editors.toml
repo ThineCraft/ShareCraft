@@ -6,9 +6,10 @@ upstream = "https://github.com/storytold/gridcraft"
 base     = "e9addf52fe68847e6c1310fcfa5d42b7aa8b9650"
 fork     = "https://github.com/ThineCraft/GridCraft"
 branch   = "sharecraft"
-commit   = "017d0b9d5d167096bcba7d7216569476f80b9046"
+commit   = "0b90f2317388c4ffd28a5a6f1c90dc08c82d38d0"
 app      = "apps/gridcraft-web"
 checkout = "../GridCraft"
+live_format = "gridcraft/1"
 
 [wordcraft]
 upstream = "https://github.com/storytold/wordcraft"

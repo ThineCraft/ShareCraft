@@ -8,6 +8,7 @@ import { existingSidebar, sidebar } from './workspace.js';
 import { prefetchCache, prefetchKey, setupPrefetch } from './prefetch.js';
 import { connection } from './connection.js';
 import { rememberChrome } from './skeleton.js';
+import { showHero } from './hero.js';
 
 // Pointing at a link to another page asks for its first answers early (prefetch.js).
 setupPrefetch();
@@ -1516,6 +1517,15 @@ export function brandImageHref(url) {
   return typeof url === 'string' && BRAND_IMAGE.test(url) ? url : null;
 }
 
+/**
+ * The address a banner picture is drawn from: a brand image's banner-sized picture (at most 2400
+ * pixels wide and half as high, made by the server), or `url` as it is for anything else (a
+ * draft's document in Change the look).
+ */
+export function bannerSrc(url) {
+  return brandImageHref(url) ? `${url}?size=banner` : url;
+}
+
 /** ShareCraft's own tab icon, the account bar's mark. */
 export const SHARECRAFT_ICON = '/favicon.svg';
 
@@ -1681,7 +1691,7 @@ export function headerView(site, look, { draft = false } = {}) {
     ? brandImage(logoUrl, { class: 'site-logo', alt }, () => name.setAttribute('class', 'site-name'))
     : null;
   const band = imageUrl
-    ? [brandImage(imageUrl, { class: 'band-image', alt: '' }), h('span', { class: 'band-shade', 'aria-hidden': 'true' })]
+    ? [brandImage(bannerSrc(imageUrl), { class: 'band-image', alt: '' }), h('span', { class: 'band-shade', 'aria-hidden': 'true' })]
     : [];
   return h(
     'header',
@@ -1840,11 +1850,14 @@ function sideBySide(page, chrome, vertical) {
  * across the top.
  * The focused editor frame passes `navigation: false`: no navigation row under its bar (the way
  * back and the command palette reach the site instead).
+ * A page in a library passes `hero: {library, url}` (`url` the library's banner picture or
+ * null): where the header shows a banner picture, the library's slides in over it, and on the
+ * next page of the site outside the library it slides back out (see hero.js).
  * `currentId` is marked as the current page. Answers `{ site, navigation, look }`, each null
  * when it could not be read; without the site the organisation defaults are used, and without
  * the look the page keeps its own.
  */
-export async function siteChrome(siteId, { currentId, place, footer = false, frame = false, navigation: withNavigation = true } = {}) {
+export async function siteChrome(siteId, { currentId, place, footer = false, frame = false, navigation: withNavigation = true, hero = null } = {}) {
   const [site, navigation, look] = await Promise.all([
     api('GET', `/sites/${seg(siteId)}`),
     api('GET', `/sites/${seg(siteId)}/navigation`),
@@ -1879,9 +1892,10 @@ export async function siteChrome(siteId, { currentId, place, footer = false, fra
     frameMark(document.querySelector('.bar .mono'), shown.look);
     if (withNavigation) placeChrome(view, place);
   } else {
+    const header = shown.site ? headerView(shown.site, shown.look) : null;
     placeSite(
       {
-        header: shown.site ? headerView(shown.site, shown.look) : null,
+        header,
         chrome: view,
         footer: footer ? footerView(shown.look) : null,
         vertical,
@@ -1890,6 +1904,8 @@ export async function siteChrome(siteId, { currentId, place, footer = false, fra
     );
     // The heights the header and navigation took, so that the next visit reserves them (skeleton.js).
     rememberChrome();
+    // A library's banner picture slides in over the site's, and back out on leaving (hero.js).
+    showHero(header, { site: siteId, library: hero?.library ?? null, url: hero?.url ?? null });
   }
   return shown;
 }
@@ -2341,7 +2357,7 @@ export const libraryKindLabel = (kind) => LIBRARY_KINDS.find((k) => k.value === 
 export const libraryKindChoices = (isAdmin) => LIBRARY_KINDS.filter((k) => isAdmin || k.value !== 'asset');
 
 /** The views a library of `kind` offers: image libraries have a grid of thumbnails too. */
-export const libraryViews = (kind) => (kind === 'image' ? ['list', 'grid'] : ['list']);
+export const libraryViews = (kind) => (kind === 'image' ? ['list', 'grid', 'photos'] : ['list']);
 
 /** The marks a listed item carries: held, quarantined (with its threat) and blocked. */
 export function itemMarks(item) {

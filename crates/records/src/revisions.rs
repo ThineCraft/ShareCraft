@@ -62,7 +62,11 @@ fn stored_authors(authors: &[(String, String)]) -> Json<Vec<StoredAuthor>> {
 /// Creates `doc`'s record if it has none, with no creator and no grants, then locks it, so
 /// writers of one document's revisions take turns. The record is named after the document's
 /// node if it has one, otherwise `name`.
-async fn lock_document(conn: &mut PgConnection, doc: DocId, name: &str) -> Result<(), sqlx::Error> {
+pub(crate) async fn lock_document(
+    conn: &mut PgConnection,
+    doc: DocId,
+    name: &str,
+) -> Result<(), sqlx::Error> {
     sqlx::query(
         "insert into documents (id, name) \
          values ($1, coalesce((select name from nodes where id = $1 and kind = 'document'), $2)) \
@@ -79,7 +83,7 @@ async fn lock_document(conn: &mut PgConnection, doc: DocId, name: &str) -> Resul
     Ok(())
 }
 
-async fn insert(
+pub(crate) async fn insert(
     conn: &mut PgConnection,
     r: &RevisionRecord,
     position: i32,
@@ -105,7 +109,10 @@ async fn insert(
 /// Makes the document's record describe `newest`, its latest revision. Its name is the name of
 /// the document's node if it has one (the tree is where a document is renamed, and a rename
 /// writes no revision), otherwise the name in `newest`.
-async fn set_current(conn: &mut PgConnection, newest: &RevisionRecord) -> Result<(), sqlx::Error> {
+pub(crate) async fn set_current(
+    conn: &mut PgConnection,
+    newest: &RevisionRecord,
+) -> Result<(), sqlx::Error> {
     sqlx::query(
         "update documents set revision = $2, revised_at = $3, \
              name = coalesce((select name from nodes where id = $1 and kind = 'document'), $4), \
@@ -122,6 +129,44 @@ async fn set_current(conn: &mut PgConnection, newest: &RevisionRecord) -> Result
     Ok(())
 }
 
+/// The newest recorded revision of `doc` and its position (0 when none).
+pub(crate) async fn recorded_head(
+    conn: &mut PgConnection,
+    doc: DocId,
+) -> Result<(Option<String>, i32), sqlx::Error> {
+    let head = sqlx::query(
+        "select revision, position from revisions where document_id = $1 \
+         order by position desc limit 1",
+    )
+    .bind(doc.0)
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(match head {
+        Some(row) => (
+            Some(row.try_get::<String, _>("revision")?),
+            row.try_get::<i32, _>("position")?,
+        ),
+        None => (None, 0),
+    })
+}
+
+/// The recorded parent of `revision` of `doc`; `None` both for a first revision and for one
+/// not recorded.
+pub(crate) async fn recorded_parent(
+    conn: &mut PgConnection,
+    doc: DocId,
+    revision: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    Ok(sqlx::query_scalar::<_, Option<String>>(
+        "select parent from revisions where document_id = $1 and revision = $2",
+    )
+    .bind(doc.0)
+    .bind(revision)
+    .fetch_optional(&mut *conn)
+    .await?
+    .flatten())
+}
+
 impl Db {
     /// Records `r` as the revision after `parent`, the document's previous one (`None` for its
     /// first). Returns `false`, changing nothing, if `parent` is not the latest revision
@@ -134,20 +179,7 @@ impl Db {
     ) -> Result<bool, DbError> {
         let mut tx = self.pool().begin().await?;
         lock_document(&mut tx, r.doc, &r.name).await?;
-        let head = sqlx::query(
-            "select revision, position from revisions where document_id = $1 \
-             order by position desc limit 1",
-        )
-        .bind(r.doc.0)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let (head, position) = match head {
-            Some(row) => (
-                Some(row.try_get::<String, _>("revision")?),
-                row.try_get::<i32, _>("position")?,
-            ),
-            None => (None, 0),
-        };
+        let (head, position) = recorded_head(&mut tx, r.doc).await?;
         if head.as_deref() != parent {
             // Dropping the transaction rolls back the record it may have created.
             return Ok(false);
@@ -159,6 +191,20 @@ impl Db {
         set_current(&mut tx, r).await?;
         tx.commit().await?;
         Ok(true)
+    }
+
+    /// Whether `revision` is `doc`'s latest recorded revision, recorded after `parent`: a live
+    /// checkpoint records its own row without waiting for the revision projection.
+    pub async fn is_recorded_head(
+        &self,
+        doc: DocId,
+        revision: &str,
+        parent: Option<&str>,
+    ) -> Result<bool, DbError> {
+        let mut conn = self.pool().acquire().await?;
+        let (head, _) = recorded_head(&mut conn, doc).await?;
+        Ok(head.as_deref() == Some(revision)
+            && recorded_parent(&mut conn, doc, revision).await?.as_deref() == parent)
     }
 
     /// Replaces `doc`'s recorded revisions with `history`, oldest first, in one transaction.

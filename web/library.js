@@ -59,6 +59,8 @@ import { fileIcon, fileKind, nextSort, parseSort, relativeTime, sortDescription,
 import { addShortcut, isMacPlatform } from './shortcuts.js';
 import { extendSelection, moveIndex, selectionText, toggleSelection } from './selection.js';
 import { settleAll, softly } from './skeleton.js';
+import { createPhotoView } from './photo-view.js';
+import { createPhotoViewer } from './photo-viewer.js';
 import { shouldReload, sourceAccess, sourceControlsEnabled, sourceStateText, sourceSummary } from './source-panel.js';
 
 const BULK_MAX = 500;
@@ -121,7 +123,11 @@ const showEntry = (id, shown) => {
 if (libraryStep) $('settings-link').href = `/library-settings.html?id=${seg(libraryStep.id)}`;
 let canAdd = false;
 showPlace();
-await siteChrome(here.path[0].id, { currentId: here.path.find((step) => step.kind === 'library')?.id, footer: true });
+await siteChrome(here.path[0].id, {
+  currentId: libraryStep?.id,
+  footer: true,
+  hero: libraryStep ? { library: libraryStep.id, url: library?.hero_image?.url ?? null } : null,
+});
 
 $('bin-link').href = `/bin.html?site=${seg(here.path[0].id)}`;
 const siteId = here.path[0].id;
@@ -140,7 +146,10 @@ let trail = [];
 let moveRequest = 0; // the latest listing asked for; older answers are dropped
 let renaming = null;
 const views = libraryViews(library?.kind);
-let view = 'list'; // 'grid' only in an image library
+let view = 'list'; // 'grid' or 'photos' only in an image library
+let photoView = null; // the Album view, made when first shown (see showPhotos)
+let photoViewer = null; // its full-screen viewer and slideshow
+let moreWatcher = null; // loads the next page as the end of the Album view comes near
 let watcher = null; // loads a tile's thumbnail when it scrolls into view
 let templates = [];
 let creating = null; // what the create dialog makes: 'folder', 'doc:<editor>' or 'template'
@@ -349,8 +358,8 @@ function clearList() {
 
 /** The query of a page of the listing after `after` (null for the first). */
 function listQuery(after) {
-  const grid = view === 'grid';
-  return `limit=${grid ? GRID_PAGE : PAGE}${grid ? '&view=grid' : ''}${after ? `&after=${encodeURIComponent(after)}` : ''}`;
+  const grid = view === 'grid' || view === 'photos';
+  return `limit=${grid ? GRID_PAGE : PAGE}${grid ? `&view=${view}` : ''}${after ? `&after=${encodeURIComponent(after)}` : ''}`;
 }
 
 async function loadPage() {
@@ -374,6 +383,7 @@ function render() {
   watcher?.disconnect();
   watcher = null;
   const grid = view === 'grid';
+  const photos = view === 'photos';
   const lostFocus =
     document.activeElement === document.body ||
     $('items').contains(document.activeElement) ||
@@ -381,9 +391,11 @@ function render() {
   // The grid of an image library is a list of tiles; the list is a table that sorts.
   $('items').classList.toggle('grid', grid);
   $('items').hidden = !grid;
-  $('file-table').hidden = grid || items.length === 0;
+  $('file-table').hidden = grid || photos || items.length === 0;
+  $('photos').hidden = !photos || items.length === 0;
+  if (photos) showPhotos();
   $('items').replaceChildren(...(grid ? items.map(tile) : []));
-  $('file-rows').replaceChildren(...(grid ? [] : sortEntries(items, sort.key, sort.direction).map(row)));
+  $('file-rows').replaceChildren(...(grid || photos ? [] : sortEntries(items, sort.key, sort.direction).map(row)));
   showSort();
   showSelection();
   showCut();
@@ -460,11 +472,12 @@ function setupViews() {
   $('view-switch').hidden = views.length < 2;
   if (views.length < 2) return;
   try {
-    if (localStorage.getItem('sharecraft-library-view') === 'grid') view = 'grid';
+    const kept = localStorage.getItem('sharecraft-library-view');
+    if (views.includes(kept)) view = kept;
   } catch {
     // no storage: the list is shown
   }
-  for (const [id, which] of [['view-list', 'list'], ['view-grid', 'grid']]) {
+  for (const [id, which] of [['view-list', 'list'], ['view-grid', 'grid'], ['view-photos', 'photos']]) {
     $(id).addEventListener('click', async () => {
       if (view === which) return;
       view = which;
@@ -483,6 +496,87 @@ function setupViews() {
 function showViewButtons() {
   $('view-list').setAttribute('aria-pressed', String(view === 'list'));
   $('view-grid').setAttribute('aria-pressed', String(view === 'grid'));
+  $('view-photos').setAttribute('aria-pressed', String(view === 'photos'));
+}
+
+// ---- the Album view of an image library, its viewer and slideshow (photo-view.js) ----
+
+/** Draws the Album view of what is loaded: folders as links, the pictures, and a note of the rest. */
+function showPhotos() {
+  if (!photoView) setupPhotos();
+  const folders = items.filter((item) => item.kind === 'folder' || item.kind === 'library');
+  $('photo-folders').hidden = folders.length === 0;
+  $('photo-folders').replaceChildren(
+    ...folders.map((item) => h('li', {}, h('a', { href: pageFor(item.kind, item.id), class: 'photo-folder' }, item.name))),
+  );
+  photoView.show(items);
+  const shown = photoView.photos().length;
+  const others = items.filter((item) => item.kind === 'document').length - shown;
+  $('photo-others').hidden = others === 0;
+  $('photo-others').textContent =
+    others === 1
+      ? 'One other file has no picture to show here; the List shows it.'
+      : `${others} other files have no picture to show here; the List shows them.`;
+  $('photo-slideshow').disabled = shown === 0;
+}
+
+/** Makes the Album view and its viewer, the first time they are shown. */
+function setupPhotos() {
+  photoViewer = createPhotoViewer({
+    onClose: (item) => {
+      if (item && view === 'photos') photoView.focusPhoto(item.id);
+    },
+  });
+  photoView = createPhotoView({
+    root: $('photos'),
+    isSelected: (id) => selected.has(id),
+    toggle: (id) => {
+      anchor = null;
+      setSelection(toggleSelection(selected, id));
+    },
+    open: (list, index) => photoViewer.open(list, index),
+  });
+  let grouped = true;
+  try {
+    grouped = localStorage.getItem('sharecraft-photos-grouped') !== 'false';
+  } catch {
+    // not remembered: by date
+  }
+  $('photo-group').setAttribute('aria-pressed', String(grouped));
+  photoView.setGrouped(grouped);
+  $('photo-group').addEventListener('click', () => {
+    const on = $('photo-group').getAttribute('aria-pressed') !== 'true';
+    $('photo-group').setAttribute('aria-pressed', String(on));
+    try {
+      localStorage.setItem('sharecraft-photos-grouped', String(on));
+    } catch {
+      // not remembered
+    }
+    photoView.setGrouped(on);
+  });
+  $('photo-slideshow').addEventListener('click', () => {
+    const list = photoView.photos();
+    // From the picture last focused, else the first.
+    const from = Math.max(0, list.findIndex((item) => item.id === photoView.current()));
+    photoViewer.open(list, from, { play: true });
+  });
+  // More of a large library loads as its end comes near.
+  if ('IntersectionObserver' in globalThis) {
+    moreWatcher = new IntersectionObserver(
+      (entries) => {
+        if (view !== 'photos' || !next || $('more').disabled || !entries.some((entry) => entry.isIntersecting)) return;
+        $('more').disabled = true;
+        loadPage().finally(() => {
+          $('more').disabled = false;
+          // Asked again: the end may still be in view after this page.
+          moreWatcher.unobserve($('more'));
+          moreWatcher.observe($('more'));
+        });
+      },
+      { rootMargin: '600px' },
+    );
+    moreWatcher.observe($('more'));
+  }
 }
 
 /** A tile of the grid: the thumbnail (loaded when it comes into view), the name and its marks. */
@@ -1501,7 +1595,7 @@ function rowOf(event) {
 /** Whether keys for the files are meant here: focus in the table or grid, or on nothing in particular. */
 function inFiles(event) {
   const target = event.target;
-  return target === document.body || Boolean(target?.closest?.('#file-table, #items, #bulk-bar, .details-pane, .details-sheet'));
+  return target === document.body || Boolean(target?.closest?.('#file-table, #items, #photos, #bulk-bar, .details-pane, .details-sheet'));
 }
 
 /** The item of the focused row, else the current row's. */
@@ -1523,7 +1617,10 @@ function setSelection(next) {
   selected.clear();
   for (const id of next) selected.add(id);
   if (view === 'grid') render();
-  else {
+  else if (view === 'photos') {
+    photoView?.refreshSelection();
+    showSelection();
+  } else {
     for (const tr of fileRows()) {
       const box = tr.querySelector('td.c-select input');
       if (box) box.checked = selected.has(tr.dataset.id);

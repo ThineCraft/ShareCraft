@@ -8,7 +8,8 @@ use std::sync::Arc;
 
 use axum::Json;
 use axum::body::Body;
-use axum::extract::{Path, State};
+use axum::extract::rejection::QueryRejection;
+use axum::extract::{Path, Query, State};
 use axum::http::header::{
     CACHE_CONTROL, CONTENT_LENGTH, CONTENT_SECURITY_POLICY, CONTENT_TYPE, X_CONTENT_TYPE_OPTIONS,
 };
@@ -473,12 +474,31 @@ pub(crate) async fn set_managers(
 /// content). `404` for a signed-out visitor and for content that neither the brand centre nor
 /// a site's look names; `423 held {scan}` once the content is not available (a rescan found it
 /// infected, say).
+///
+/// With `?size=banner` a PNG, JPEG or WebP is answered as a site header's banner picture
+/// instead: at most 2400 pixels wide and at most half as high, its middle kept, upright, made
+/// the first time it is asked for and kept beside the content (see
+/// [`crate::previews::ThumbSize::Banner`]). Any other image, or one no banner can be made of
+/// (or none in time), is answered as it is. Any other `size` is `400 bad_request`.
 pub(crate) async fn image(
     State(state): State<AppState>,
     MaybeSigned(signed): MaybeSigned,
     Path(sha256): Path<String>,
+    query: Result<Query<ImageQuery>, QueryRejection>,
 ) -> Result<Response, ApiError> {
-    serve(&state, signed.is_some(), &sha256, Served::Image).await
+    let banner = match super::content::query_of(query)?.size.as_deref() {
+        None => false,
+        Some("banner") => true,
+        Some(_) => return Err(ApiError::BadRequest),
+    };
+    serve(&state, signed.is_some(), &sha256, Served::Image { banner }).await
+}
+
+/// Query of `GET /api/brand/images/{sha256}`.
+#[derive(Deserialize)]
+pub(crate) struct ImageQuery {
+    /// `banner` for the banner-sized picture.
+    size: Option<String>,
 }
 
 /// `GET /api/brand/fonts/{sha256}`: a font file's bytes, for anyone signed in, as the type
@@ -497,7 +517,10 @@ pub(crate) async fn font(
 /// What a brand file route serves.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Served {
-    Image,
+    /// An image; with `banner`, its banner-sized picture where one can be made.
+    Image {
+        banner: bool,
+    },
     Font,
 }
 
@@ -518,7 +541,7 @@ async fn serve(
     };
     let db = state.db();
     let found = match what {
-        Served::Image => db.brand_image_type(&hash).await,
+        Served::Image { .. } => db.brand_image_type(&hash).await,
         Served::Font => db.brand_font_type(&hash).await,
     };
     let media_type = found
@@ -531,8 +554,83 @@ async fn serve(
     {
         return Err(ApiError::Held(scan));
     }
+    let made = match what {
+        Served::Image { banner: true } => banner(state, &hash, &media_type).await,
+        _ => None,
+    };
+    let (media_type, bytes) = match made {
+        Some(made) => made,
+        None => (media_type, original(state, hash, sha256).await?),
+    };
+    let header = |text: &str| HeaderValue::from_str(text).map_err(|e| ApiError::unavailable(&e));
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, header(&media_type)?);
+    headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    let policy = match what {
+        Served::Image { .. } => IMAGE_POLICY,
+        Served::Font => FONT_POLICY,
+    };
+    headers.insert(CONTENT_SECURITY_POLICY, HeaderValue::from_static(policy));
+    if matches!(what, Served::Font) {
+        headers.insert(
+            HeaderName::from_static("cross-origin-resource-policy"),
+            HeaderValue::from_static("same-origin"),
+        );
+    }
+    headers.insert(
+        CACHE_CONTROL,
+        HeaderValue::from_static("private, max-age=31536000, immutable"),
+    );
+    headers.insert(CONTENT_LENGTH, header(&bytes.len().to_string())?);
+    Ok((StatusCode::OK, headers, Body::from(bytes)).into_response())
+}
+
+/// The banner-sized picture of the brand image `hash` of type `media_type`, made if needed, as
+/// `(type, bytes)`; `None` to answer the image as it is: not a PNG, JPEG or WebP, none can be
+/// made of it, or no turn came free in time.
+async fn banner(state: &AppState, hash: &[u8; 32], media_type: &str) -> Option<(String, Vec<u8>)> {
+    if !matches!(media_type, "image/png" | "image/jpeg" | "image/webp") {
+        return None;
+    }
+    let made = state
+        .thumbnailer()
+        .make(
+            Arc::clone(state.blobs()),
+            *hash,
+            crate::previews::ThumbSize::Banner,
+        )
+        .await;
+    let path = match made {
+        Ok(path) => path,
+        Err(e) => {
+            if matches!(
+                e,
+                crate::previews::ThumbError::Io(_)
+                    | crate::previews::ThumbError::Store(_)
+                    | crate::previews::ThumbError::Task(_)
+            ) {
+                eprintln!(
+                    "sharecraft-server: cannot make the banner of brand content {}: {e}",
+                    revisions::hex(hash)
+                );
+            }
+            return None;
+        }
+    };
+    let kind = if path.extension().is_some_and(|e| e == "jpg") {
+        "image/jpeg"
+    } else {
+        "image/png"
+    };
+    // Erased meanwhile with its content: the original answers (or is missing too).
+    let bytes = tokio::fs::read(&path).await.ok()?;
+    Some((kind.to_owned(), bytes))
+}
+
+/// The bytes of the brand content `hash` (named `sha256`) as kept.
+async fn original(state: &AppState, hash: [u8; 32], sha256: &str) -> Result<Vec<u8>, ApiError> {
     let blobs = Arc::clone(state.blobs());
-    let bytes = tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
         let Some(mut file) = blobs.store().open_blob(&hash)? else {
             return Ok::<_, revisions::BlobError>(None);
         };
@@ -546,28 +644,7 @@ async fn serve(
     .ok_or_else(|| {
         eprintln!("sharecraft-server: brand content {sha256} is missing from the content store");
         ApiError::Unavailable
-    })?;
-    let header = |text: &str| HeaderValue::from_str(text).map_err(|e| ApiError::unavailable(&e));
-    let mut headers = HeaderMap::new();
-    headers.insert(CONTENT_TYPE, header(&media_type)?);
-    headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
-    let policy = match what {
-        Served::Image => IMAGE_POLICY,
-        Served::Font => FONT_POLICY,
-    };
-    headers.insert(CONTENT_SECURITY_POLICY, HeaderValue::from_static(policy));
-    if what == Served::Font {
-        headers.insert(
-            HeaderName::from_static("cross-origin-resource-policy"),
-            HeaderValue::from_static("same-origin"),
-        );
-    }
-    headers.insert(
-        CACHE_CONTROL,
-        HeaderValue::from_static("private, max-age=31536000, immutable"),
-    );
-    headers.insert(CONTENT_LENGTH, header(&bytes.len().to_string())?);
-    Ok((StatusCode::OK, headers, Body::from(bytes)).into_response())
+    })
 }
 
 /// The body of `POST /api/brand/fonts`.

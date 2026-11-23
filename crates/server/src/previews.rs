@@ -6,7 +6,10 @@
 //! ever shown as text; SVG only as an image, behind the sandbox every answer carries.
 //!
 //! A thumbnail is made on the server the first time it is asked for, from PNG, JPEG, GIF (its
-//! first frame) and WebP, and kept at `<data>/thumbs/<xx>/<sha256>.png` (see [`thumbnail`]).
+//! first frame) and WebP, turned upright as its EXIF orientation says, in two sizes (see
+//! [`ThumbSize`]), and kept at `<data>/thumbs/<xx>/<sha256>.256.png`, or `<sha256>.720.jpg`
+//! (`.720.png` for a picture with transparency), or `<sha256>.banner.jpg` (`.banner.png`) for
+//! a banner (see [`thumbnail`]).
 //! Decoding is limited before anything is allocated: the size the header gives, the memory
 //! the decoded pixels need, the size of the file, for a GIF the number of its frames and for
 //! a JPEG the number of its scans (each counted by walking the file without decoding it), so
@@ -15,19 +18,52 @@
 //! and a decode has [`THUMBNAIL_TIME`] (see `Thumbnailer`). A thumbnail is
 //! written to a temporary file and renamed into place, so a failure leaves nothing behind. Content
 //! that fails, or takes too long, is marked and never decoded again. Erasing a content erases
-//! its thumbnail and its mark (see [`erase_thumbnail`]).
+//! its thumbnails, its mark and its photo facts (see [`erase_thumbnail`]).
 
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
+use image::codecs::jpeg::JpegEncoder;
+use image::metadata::Orientation;
 use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader, Limits};
 use revisions::{BlobStore, hex};
 use tokio::sync::Semaphore;
 
 /// The longer side of a thumbnail, at most.
 pub const THUMBNAIL_SIDE: u32 = 256;
+/// The longer side of a large thumbnail (the Album view of an image library), at most.
+pub const LARGE_THUMBNAIL_SIDE: u32 = 720;
+/// The JPEG quality of a large thumbnail and of a banner.
+const LARGE_THUMBNAIL_QUALITY: u8 = 82;
+/// The width of a banner, at most: twice the width a site header is commonly drawn at.
+pub const BANNER_WIDTH: u32 = 2400;
+
+/// Which thumbnail is asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThumbSize {
+    /// At most [`THUMBNAIL_SIDE`] pixels on its longer side, always a PNG.
+    Small,
+    /// At most [`LARGE_THUMBNAIL_SIDE`]: a JPEG, or a PNG for a picture with transparency.
+    Large,
+    /// A site header's banner picture: at most [`BANNER_WIDTH`] wide and at most half as high
+    /// as it is wide (the middle kept, as the header's `object-fit: cover` shows it: the header
+    /// is always wider than 2:1); a JPEG, or a PNG for a picture with transparency.
+    Banner,
+}
+
+impl ThumbSize {
+    /// Its longer side, at most.
+    #[must_use]
+    pub fn side(self) -> u32 {
+        match self {
+            ThumbSize::Small => THUMBNAIL_SIDE,
+            ThumbSize::Large => LARGE_THUMBNAIL_SIDE,
+            ThumbSize::Banner => BANNER_WIDTH,
+        }
+    }
+}
 /// The widest and tallest image a thumbnail is made from.
 pub const MAX_IMAGE_SIDE: u32 = 12_000;
 /// The most memory one thumbnail may use: the file read plus its decoded pixels.
@@ -178,20 +214,53 @@ pub fn thumbs_dir(store: &BlobStore) -> PathBuf {
     }
 }
 
-/// Where the thumbnail of the content `sha256` of `store` is kept, whether or not it is there:
-/// `<data>/thumbs/<xx>/<sha256>.png`.
+/// `<data>/thumbs/<xx>/<sha256>.<suffix>`: where something kept about the content `sha256` of
+/// `store` lies.
 #[must_use]
-pub fn thumb_path(store: &BlobStore, sha256: &[u8; 32]) -> PathBuf {
+pub fn thumb_dir_of(store: &BlobStore, sha256: &[u8; 32], suffix: &str) -> PathBuf {
     let name = hex(sha256);
     let prefix = name.get(..2).unwrap_or_default().to_owned();
-    thumbs_dir(store).join(prefix).join(format!("{name}.png"))
+    thumbs_dir(store)
+        .join(prefix)
+        .join(format!("{name}.{suffix}"))
+}
+
+/// Where the small thumbnail of the content `sha256` of `store` is kept, whether or not it is
+/// there: `<data>/thumbs/<xx>/<sha256>.256.png`.
+#[must_use]
+pub fn thumb_path(store: &BlobStore, sha256: &[u8; 32]) -> PathBuf {
+    thumb_dir_of(store, sha256, "256.png")
+}
+
+/// Where a thumbnail of `size` may be kept, in the order looked for: the small one's single
+/// place, or the large one's JPEG and PNG.
+#[must_use]
+pub fn thumb_paths(store: &BlobStore, sha256: &[u8; 32], size: ThumbSize) -> Vec<PathBuf> {
+    match size {
+        ThumbSize::Small => vec![thumb_path(store, sha256)],
+        ThumbSize::Large => vec![
+            thumb_dir_of(store, sha256, "720.jpg"),
+            thumb_dir_of(store, sha256, "720.png"),
+        ],
+        ThumbSize::Banner => vec![
+            thumb_dir_of(store, sha256, "banner.jpg"),
+            thumb_dir_of(store, sha256, "banner.png"),
+        ],
+    }
+}
+
+/// The kept thumbnail of `size`, if there is one.
+fn kept_thumbnail(store: &BlobStore, sha256: &[u8; 32], size: ThumbSize) -> Option<PathBuf> {
+    thumb_paths(store, sha256, size)
+        .into_iter()
+        .find(|path| path.is_file())
 }
 
 /// Where the mark that no thumbnail can be made of the content `sha256` of `store` is kept,
 /// whether or not it is there: `<data>/thumbs/<xx>/<sha256>.none`, an empty file.
 #[must_use]
 pub fn no_thumb_path(store: &BlobStore, sha256: &[u8; 32]) -> PathBuf {
-    thumb_path(store, sha256).with_extension("none")
+    thumb_dir_of(store, sha256, "none")
 }
 
 /// Why no thumbnail was made.
@@ -258,8 +327,9 @@ impl ThumbError {
     }
 }
 
-/// The thumbnail of the content `sha256` of `store`, made and kept if it is not kept yet: a
-/// PNG at most [`THUMBNAIL_SIDE`] pixels on its longer side, never enlarged. Blocks; the server
+/// The thumbnail of `size` of the content `sha256` of `store`, made and kept if it is not kept
+/// yet: at most [`ThumbSize::side`] pixels on its longer side, never enlarged, and turned
+/// upright as its EXIF orientation says. Blocks; the server
 /// calls it through a `Thumbnailer`. A failure that belongs to the content (see
 /// [`ThumbError::is_lasting`]) is remembered with a mark beside the thumbnails (see
 /// [`no_thumb_path`]), and from then on the content is not decoded again.
@@ -269,16 +339,19 @@ impl ThumbError {
 /// name, over the limits (see the module documentation), cut short or broken, the store or
 /// the file system failing, or [`ThumbError::Remembered`] once one of those was recorded.
 /// No partial thumbnail is ever left behind.
-pub fn thumbnail(store: &BlobStore, sha256: &[u8; 32]) -> Result<PathBuf, ThumbError> {
-    let path = thumb_path(store, sha256);
-    if path.is_file() {
+pub fn thumbnail(
+    store: &BlobStore,
+    sha256: &[u8; 32],
+    size: ThumbSize,
+) -> Result<PathBuf, ThumbError> {
+    if let Some(path) = kept_thumbnail(store, sha256, size) {
         return Ok(path);
     }
     if no_thumb_path(store, sha256).is_file() {
         return Err(ThumbError::Remembered);
     }
-    match make_thumbnail(store, sha256, &path) {
-        Ok(()) => Ok(path),
+    match make_thumbnail(store, sha256, size) {
+        Ok(path) => Ok(path),
         Err(e) => {
             if e.is_lasting()
                 && let Err(failed) = remember_failure(store, sha256)
@@ -293,8 +366,13 @@ pub fn thumbnail(store: &BlobStore, sha256: &[u8; 32]) -> Result<PathBuf, ThumbE
     }
 }
 
-/// Decodes the content `sha256` of `store` within the limits and keeps its thumbnail at `path`.
-fn make_thumbnail(store: &BlobStore, sha256: &[u8; 32], path: &Path) -> Result<(), ThumbError> {
+/// Decodes the content `sha256` of `store` within the limits and keeps its thumbnail of
+/// `size`; where it is kept.
+fn make_thumbnail(
+    store: &BlobStore,
+    sha256: &[u8; 32],
+    which: ThumbSize,
+) -> Result<PathBuf, ThumbError> {
     let file = store.open_blob(sha256)?.ok_or(ThumbError::Missing)?;
     let size = file.metadata()?.len();
     if size > MAX_IMAGE_FILE_BYTES {
@@ -321,7 +399,7 @@ fn make_thumbnail(store: &BlobStore, sha256: &[u8; 32], path: &Path) -> Result<(
     let mut reader = ImageReader::with_format(Cursor::new(bytes.as_slice()), format);
     reader.limits(limits);
     // The decoder reads the header only; the limits are checked against it here.
-    let decoder = reader.into_decoder().map_err(|e| match e {
+    let mut decoder = reader.into_decoder().map_err(|e| match e {
         image::ImageError::Limits(_) => ThumbError::TooLarge,
         e => ThumbError::Decode(e),
     })?;
@@ -332,45 +410,118 @@ fn make_thumbnail(store: &BlobStore, sha256: &[u8; 32], path: &Path) -> Result<(
     if decoder.total_bytes() > budget {
         return Err(ThumbError::TooLarge);
     }
+    // From the headers; a GIF has none, and an orientation that cannot be read is left as is.
+    let orientation = if format == ImageFormat::Gif {
+        Orientation::NoTransforms
+    } else {
+        decoder.orientation().unwrap_or(Orientation::NoTransforms)
+    };
     // A GIF's decoder decodes its first frame only.
     let image = DynamicImage::from_decoder(decoder)?;
     drop(bytes);
-    let small = if width > THUMBNAIL_SIDE || height > THUMBNAIL_SIDE {
-        image.thumbnail(THUMBNAIL_SIDE, THUMBNAIL_SIDE)
+    let small = if which == ThumbSize::Banner {
+        banner(image, orientation)
+    } else {
+        let side = which.side();
+        let mut small = if width > side || height > side {
+            image.thumbnail(side, side)
+        } else {
+            image
+        };
+        small.apply_orientation(orientation);
+        small
+    };
+    let mut out = Vec::new();
+    let path = if which != ThumbSize::Small && !small.color().has_alpha() {
+        let rgb = DynamicImage::ImageRgb8(small.to_rgb8());
+        rgb.write_with_encoder(JpegEncoder::new_with_quality(
+            &mut out,
+            LARGE_THUMBNAIL_QUALITY,
+        ))?;
+        match which {
+            ThumbSize::Banner => thumb_dir_of(store, sha256, "banner.jpg"),
+            _ => thumb_dir_of(store, sha256, "720.jpg"),
+        }
+    } else {
+        let rgba = DynamicImage::ImageRgba8(small.to_rgba8());
+        rgba.write_to(&mut Cursor::new(&mut out), ImageFormat::Png)?;
+        match which {
+            ThumbSize::Small => thumb_path(store, sha256),
+            ThumbSize::Large => thumb_dir_of(store, sha256, "720.png"),
+            ThumbSize::Banner => thumb_dir_of(store, sha256, "banner.png"),
+        }
+    };
+    keep(store, sha256, &path, &out)?;
+    Ok(path)
+}
+
+/// `image` (as decoded, to be turned by `orientation`) as a banner: upright, at most
+/// [`BANNER_WIDTH`] wide (never enlarged), and cut to at most half as high as it is wide,
+/// keeping the middle.
+fn banner(image: DynamicImage, orientation: Orientation) -> DynamicImage {
+    // Turned a quarter, its height now is its width once upright.
+    let turned = matches!(
+        orientation,
+        Orientation::Rotate90
+            | Orientation::Rotate270
+            | Orientation::Rotate90FlipH
+            | Orientation::Rotate270FlipH
+    );
+    let (most_wide, most_high) = if turned {
+        (MAX_IMAGE_SIDE, BANNER_WIDTH)
+    } else {
+        (BANNER_WIDTH, MAX_IMAGE_SIDE)
+    };
+    let mut small = if image.width() > most_wide || image.height() > most_high {
+        image.thumbnail(most_wide, most_high)
     } else {
         image
     };
-    let small = DynamicImage::ImageRgba8(small.to_rgba8());
-    let mut png = Vec::new();
-    small.write_to(&mut Cursor::new(&mut png), ImageFormat::Png)?;
-    keep(store, sha256, path, &png)
+    small.apply_orientation(orientation);
+    let (width, height) = (small.width(), small.height());
+    let highest = (width / 2).max(1);
+    if height > highest {
+        small.crop_imm(0, height.saturating_sub(highest) / 2, width, highest)
+    } else {
+        small
+    }
 }
 
-/// Writes `png` to a temporary file beside the content store and renames it to `path`. If the
-/// content was erased meanwhile, the thumbnail is erased too (an erasure deletes the content
-/// first, then its thumbnail; whichever looks last finds the other's work).
-fn keep(store: &BlobStore, sha256: &[u8; 32], path: &Path, png: &[u8]) -> Result<(), ThumbError> {
+/// Writes `bytes` to a temporary file beside the content store and renames it to `path`. A
+/// failure leaves nothing behind; another writer having put a file at `path` first is none.
+///
+/// # Errors
+/// The I/O error.
+pub(crate) fn write_kept(store: &BlobStore, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
     let tmp = store
         .tmp_dir()
-        .join(format!("thumb-{}.png", uuid::Uuid::new_v4().simple()));
+        .join(format!("thumb-{}.tmp", uuid::Uuid::new_v4().simple()));
     let written = (|| {
         let mut file = std::fs::File::create(&tmp)?;
-        file.write_all(png)?;
+        file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
         std::fs::rename(&tmp, path)
     })();
     if let Err(e) = written {
         let _ = std::fs::remove_file(&tmp);
-        // Another request may have put the same thumbnail in place first.
+        // Another request may have put the same file in place first.
         if path.is_file() {
             return Ok(());
         }
-        return Err(e.into());
+        return Err(e);
     }
+    Ok(())
+}
+
+/// Writes `png` to a temporary file beside the content store and renames it to `path`. If the
+/// content was erased meanwhile, the thumbnail is erased too (an erasure deletes the content
+/// first, then its thumbnail; whichever looks last finds the other's work).
+fn keep(store: &BlobStore, sha256: &[u8; 32], path: &Path, bytes: &[u8]) -> Result<(), ThumbError> {
+    write_kept(store, path, bytes)?;
     if !store.contains(sha256) {
         let _ = erase_thumbnail(store, sha256);
         return Err(ThumbError::Missing);
@@ -396,14 +547,21 @@ pub fn remember_failure(store: &BlobStore, sha256: &[u8; 32]) -> std::io::Result
     Ok(())
 }
 
-/// Erases the thumbnail of the content `sha256` of `store`, and its mark of having none; whether
-/// there was either.
+/// Erases the thumbnails of the content `sha256` of `store` (every size and the banner, and one kept under the
+/// older name `<sha256>.png`), its mark of having none and its photo facts (see
+/// [`crate::photos`]); whether there was any.
 ///
 /// # Errors
 /// The I/O error for anything but a missing file.
 pub fn erase_thumbnail(store: &BlobStore, sha256: &[u8; 32]) -> std::io::Result<bool> {
     let mut erased = false;
-    for path in [thumb_path(store, sha256), no_thumb_path(store, sha256)] {
+    let mut paths = thumb_paths(store, sha256, ThumbSize::Small);
+    paths.extend(thumb_paths(store, sha256, ThumbSize::Large));
+    paths.extend(thumb_paths(store, sha256, ThumbSize::Banner));
+    paths.push(thumb_dir_of(store, sha256, "png"));
+    paths.push(no_thumb_path(store, sha256));
+    paths.push(crate::photos::facts_path(store, sha256));
+    for path in paths {
         match std::fs::remove_file(path) {
             Ok(()) => erased = true,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -556,10 +714,11 @@ impl Thumbnailer {
         &self,
         blobs: Arc<crate::blobs::Blobs>,
         sha256: [u8; 32],
+        size: ThumbSize,
     ) -> Result<PathBuf, ThumbError> {
-        let path = thumb_path(blobs.store(), &sha256);
+        let paths = thumb_paths(blobs.store(), &sha256, size);
         let mark = no_thumb_path(blobs.store(), &sha256);
-        if is_file(&path).await {
+        if let Some(path) = kept(&paths).await {
             return Ok(path);
         }
         if is_file(&mark).await {
@@ -572,7 +731,7 @@ impl Thumbnailer {
             Err(_) => return Err(ThumbError::Busy),
         };
         // Made, or found unmakeable, by another request while this one waited.
-        if is_file(&path).await {
+        if let Some(path) = kept(&paths).await {
             return Ok(path);
         }
         if is_file(&mark).await {
@@ -581,7 +740,7 @@ impl Thumbnailer {
         let maker = Arc::clone(&blobs);
         let job = tokio::task::spawn_blocking(move || {
             let _turn = turn;
-            thumbnail(maker.store(), &sha256)
+            thumbnail(maker.store(), &sha256, size)
         });
         match tokio::time::timeout(THUMBNAIL_TIME, job).await {
             Ok(made) => made.map_err(|e| ThumbError::Task(e.to_string()))?,
@@ -612,6 +771,16 @@ impl Thumbnailer {
     }
 }
 
+/// The first of `paths` that is a file, without blocking the async workers.
+async fn kept(paths: &[PathBuf]) -> Option<PathBuf> {
+    for path in paths {
+        if is_file(path).await {
+            return Some(path.clone());
+        }
+    }
+    None
+}
+
 /// Whether `path` is a file, without blocking the async workers.
 async fn is_file(path: &Path) -> bool {
     tokio::fs::metadata(path)
@@ -623,6 +792,25 @@ async fn is_file(path: &Path) -> bool {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn banners_are_upright_at_most_2400_wide_and_half_as_high() {
+        let size = |image: DynamicImage| (image.width(), image.height());
+        // A tall photo: shrunk to the width, the middle kept.
+        let tall = DynamicImage::new_rgb8(3000, 4000);
+        assert_eq!(size(banner(tall, Orientation::NoTransforms)), (2400, 1200));
+        // Stored on its side, upright 3000 by 4000: the same.
+        let turned = DynamicImage::new_rgb8(4000, 3000);
+        assert_eq!(size(banner(turned, Orientation::Rotate90)), (2400, 1200));
+        // Wide already: only shrunk.
+        let wide = DynamicImage::new_rgb8(6000, 1000);
+        assert_eq!(size(banner(wide, Orientation::NoTransforms)), (2400, 400));
+        // Small: never enlarged, still cut to 2:1.
+        let small = DynamicImage::new_rgb8(300, 300);
+        assert_eq!(size(banner(small, Orientation::NoTransforms)), (300, 150));
+        let strip = DynamicImage::new_rgb8(300, 100);
+        assert_eq!(size(banner(strip, Orientation::NoTransforms)), (300, 100));
+    }
 
     #[test]
     fn extensions_are_the_last_suffix_only() {

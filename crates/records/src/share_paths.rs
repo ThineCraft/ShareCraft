@@ -24,6 +24,9 @@ pub enum PathRefusal {
     TrailingDotOrSpace,
     TooLong,
     WholeDrive,
+    /// A UNC or drive path given to a server that is not running on Windows, which cannot
+    /// open it. There, a Windows share is used through its mount point, such as `/mnt/share`.
+    OtherSystem,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -202,13 +205,30 @@ pub fn approved_root<'a>(path: &SharePath, roots: &'a [SharePath]) -> Option<&'a
     roots.iter().find(|root| path.is_within(root))
 }
 
-/// Refuses approvals which would grant an entire drive or a bare administrative share.
+/// Refuses approvals which would grant an entire drive, a bare administrative share, or the
+/// whole file system (`/`).
 pub fn valid_root(root: &SharePath) -> Result<(), PathRefusal> {
     match &root.0 {
-        PathKind::Drive { folders, .. } if folders.is_empty() => Err(PathRefusal::WholeDrive),
+        PathKind::Drive { folders, .. } | PathKind::Posix { folders } if folders.is_empty() => {
+            Err(PathRefusal::WholeDrive)
+        }
         PathKind::Unc { share, folders, .. } if share.ends_with('$') && folders.is_empty() => {
             Err(PathRefusal::WholeDrive)
         }
+        _ => Ok(()),
+    }
+}
+
+/// Refuses a path this server's operating system cannot open: off Windows, a UNC or drive
+/// path. Parsing stays the same everywhere; this is judged where a path is approved or used.
+pub fn usable_here(path: &SharePath) -> Result<(), PathRefusal> {
+    usable_on(path, cfg!(windows))
+}
+
+/// [`usable_here`] for a server that is (`windows`) or is not running on Windows.
+pub fn usable_on(path: &SharePath, windows: bool) -> Result<(), PathRefusal> {
+    match &path.0 {
+        PathKind::Unc { .. } | PathKind::Drive { .. } if !windows => Err(PathRefusal::OtherSystem),
         _ => Ok(()),
     }
 }

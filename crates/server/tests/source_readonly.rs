@@ -47,7 +47,10 @@ use uuid::Uuid;
 
 const OWNER: &str = "octo-org";
 const REPO: &str = "docs";
+#[cfg(windows)]
 const SHARE_ROOT: &str = r"C:\source-readonly";
+#[cfg(not(windows))]
+const SHARE_ROOT: &str = "/source-readonly";
 /// The refusal's message, word for word.
 const MESSAGE: &str =
     "This library is kept in step with an outside source, so it cannot be changed here.";
@@ -335,7 +338,10 @@ const ROUTES: &[(&str, Decision)] = &[
     ("POST /api/uploads/{id}/finish", Guarded),
     ("GET /api/docs/{id}", Read),
     ("GET /api/docs/{id}/content", Read),
+    ("GET /api/docs/{id}/live-base", Read),
     ("PUT /api/docs/{id}/content", Guarded),
+    ("PUT /api/docs/{id}/live-checkpoint", Guarded),
+    ("POST /api/docs/{id}/live-checkpoint/hash", Guarded),
     ("GET /api/docs/{id}/preview", Read),
     ("GET /api/docs/{id}/thumbnail", Read),
     ("GET /api/docs/{id}/access", Read),
@@ -617,7 +623,7 @@ fn a_route_list_guard() {
         unclassified.is_empty() && gone.is_empty(),
         "routes not classified in ROUTES: {unclassified:?}; recorded but not registered: {gone:?}"
     );
-    assert_eq!(routes.len(), 154, "the number of registered routes changed");
+    assert_eq!(routes.len(), 157, "the number of registered routes changed");
     let mut mounts_sorted = mounts.clone();
     mounts_sorted.sort();
     let mut expected: Vec<String> = MOUNTS.iter().map(|m| (*m).to_owned()).collect();
@@ -674,6 +680,8 @@ enum Act {
     BulkRestore,
     FromTemplate,
     Save,
+    LiveCheckpoint,
+    LiveHash,
     RenameFolder,
     RenameLibrary,
     DeleteFolder,
@@ -722,6 +730,18 @@ const ROWS: &[Row] = &[
         201,
     ),
     row(Act::Save, "PUT /api/docs/{id}/content", 200),
+    // In an ordinary library these reach the live room's ticket check: the file has no live
+    // room here, so no ticket can be held (403). A connected library refuses them first.
+    row(
+        Act::LiveCheckpoint,
+        "PUT /api/docs/{id}/live-checkpoint",
+        403,
+    ),
+    row(
+        Act::LiveHash,
+        "POST /api/docs/{id}/live-checkpoint/hash",
+        403,
+    ),
     row(Act::RenameFolder, "PATCH /api/nodes/{id}", 200),
     row(Act::RenameLibrary, "PATCH /api/nodes/{id}", 200),
     row(Act::DeleteFolder, "DELETE /api/nodes/{id}", 204),
@@ -1294,6 +1314,25 @@ impl Env {
                 json!({ "template": self.template, "parent": fx.docs }),
             ),
             Act::Save => return self.save(fx, user).await,
+            Act::LiveCheckpoint => (
+                Method::PUT,
+                format!(
+                    "/api/docs/{}/live-checkpoint?ticket={}&at=0",
+                    fx.item("sheet.xlsx"),
+                    Uuid::new_v4()
+                ),
+                Value::Null,
+            ),
+            Act::LiveHash => (
+                Method::POST,
+                format!("/api/docs/{}/live-checkpoint/hash", fx.item("sheet.xlsx")),
+                json!({
+                    "ticket": Uuid::new_v4(),
+                    "at": 0,
+                    "sha256": "ab".repeat(32),
+                    "session_sha256": "cd".repeat(32),
+                }),
+            ),
             Act::RenameFolder => (
                 Method::PATCH,
                 format!("/api/nodes/{}", fx.docs),

@@ -4,6 +4,8 @@
 
 import {
   api,
+  bannerSrc,
+  brandImageHref,
   can,
   confirmDialog,
   formatSize,
@@ -25,6 +27,8 @@ import {
   siteChrome,
   typeListText,
 } from './common.js';
+import { pickImage } from './image-picker.js';
+import { studioLimits } from './look-studio.js';
 import { webhookInstructions } from './source-panel.js';
 
 const $ = (id) => document.getElementById(id);
@@ -46,12 +50,16 @@ if (self.kind !== 'library') {
   location.replace(pageFor(self.kind, self.id));
   await new Promise(() => {});
 }
-await siteChrome(here.path[0].id, { currentId: libraryId });
-if (!can(here.access, 'manage_site')) fail('Only the owners of this site can change the settings of its libraries.');
-
 const first = await api('GET', `/libraries/${seg(libraryId)}`);
+await siteChrome(here.path[0].id, {
+  currentId: libraryId,
+  hero: { library: libraryId, url: first.ok ? (first.data.hero_image?.url ?? null) : null },
+});
+if (!can(here.access, 'manage_site')) fail('Only the owners of this site can change the settings of its libraries.');
 if (!first.ok) fail(first.status === 404 ? MISSING : messageFor(first.error));
 let library = first.data;
+/** The brand centre (its images and limits), fetched once when the banner picture picker first opens. */
+let brand = null;
 show(library);
 $('settings').hidden = false;
 
@@ -88,6 +96,61 @@ function show(settings) {
   $('blocked').value = typeListText(settings.blocked_types);
   $('max-mb').value = megabytesText(settings.max_file_bytes);
   showEffective(settings);
+  showHero(settings.hero_image ?? null);
+}
+
+
+/** The banner picture as a tile: the picture, its name, Change (or Choose) and Remove. */
+function showHero(image) {
+  const picture = h('span', { class: 'slot-picture', 'aria-hidden': 'true' });
+  const url = brandImageHref(image?.url) ? bannerSrc(image.url) : null;
+  if (url) {
+    const img = h('img', { src: url, alt: '' });
+    img.addEventListener('error', () => (img.hidden = true));
+    picture.append(img);
+  } else {
+    picture.append(h('span', { class: 'slot-empty' }, 'No picture'));
+  }
+  const choose = h('button', { type: 'button', class: 'secondary small' }, image ? 'Change the banner picture' : 'Choose a banner picture');
+  choose.addEventListener('click', async () => {
+    if (brand === null) {
+      const answer = await api('GET', '/brand');
+      brand = answer.ok ? answer.data : { images: [] };
+    }
+    // The organisation's limit on images from the site's own libraries holds for site owners
+    // here as on Change the look: brand-centre images only (the server judges it again).
+    const limits = studioLimits(brand.policy, !brand.can_manage);
+    const picked = await pickImage({
+      siteId: library.site,
+      brandImages: brand.images ?? [],
+      title: 'Choose the banner picture',
+      brandOnly: limits.siteImages.disabled ? limits.siteImages.reason : null,
+    });
+    if (!picked) return;
+    await saveHero(picked.brand_image ? { brand_image: picked.brand_image } : { doc: picked.doc });
+  });
+  const remove = image ? h('button', { type: 'button', class: 'ghost small', 'aria-label': 'Remove the banner picture' }, 'Remove') : null;
+  remove?.addEventListener('click', () => saveHero(null));
+  $('hero-slot').replaceChildren(
+    h(
+      'div',
+      { class: 'slot card' },
+      picture,
+      h('span', { class: 'slot-name' }, image?.name ?? 'None'),
+      h('span', { class: 'slot-actions' }, choose, remove),
+    ),
+  );
+}
+
+/** Sends the banner picture alone (`{doc}`, `{brand_image}` or null) and shows the answer. */
+async function saveHero(slot) {
+  showMessage(error, '');
+  showMessage($('saved'), '');
+  const result = await api('PATCH', `/libraries/${seg(libraryId)}`, { hero_image: slot });
+  if (!result.ok) return showMessage(error, messageFor(result.error));
+  library = { ...library, hero_image: result.data.hero_image ?? null };
+  showHero(library.hero_image);
+  showMessage($('saved'), slot ? 'Banner picture saved.' : 'Banner picture removed.');
 }
 
 /** What the library takes in effect, one line each (the kind's own list included). */

@@ -33,7 +33,10 @@ use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
+#[cfg(windows)]
 const ROOT: &str = r"C:\approved";
+#[cfg(not(windows))]
+const ROOT: &str = "/approved";
 
 struct Env {
     server: TestServer,
@@ -653,6 +656,9 @@ async fn a_download_in_progress_survives_eviction() {
     let response = env.download(&env.viewer, "large.bin").await;
     assert_eq!(response.status(), StatusCode::OK);
     env.state.shares().set_cache_max_bytes_for_tests(0);
-    assert_eq!(evict(&env.state).await, 0);
+    // Windows cannot erase a file another handle has open, so the cached copy stays until
+    // the download ends. Linux removes its name at once and the open download reads on.
+    let expected = if cfg!(windows) { 0 } else { 1 };
+    assert_eq!(evict(&env.state).await, expected);
     assert_eq!(response.bytes().await.unwrap(), bytes);
 }

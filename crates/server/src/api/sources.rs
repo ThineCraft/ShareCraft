@@ -6,6 +6,7 @@
 //! reach the database, and no answer, event, log line or error carries one: the only exception
 //! is the webhook secret in the one answer that generates it.
 
+use std::collections::HashMap;
 use std::io;
 use std::time::{Duration, Instant};
 
@@ -17,21 +18,22 @@ use axum::response::{IntoResponse, Response};
 use collab_core::ids::NodeId;
 use records::{
     LibraryKind, NewEvent, NewSource, Perms, SealedRow, SecretId, SharePath, SourceChange,
-    SourceConfig, SourceKind, SourceMode, SourceStatus, User, approved_root, valid_root,
+    SourceConfig, SourceKind, SourceMode, SourceStatus, User, approved_root, usable_here,
+    valid_root,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use super::nodes::{delete_one, node_id, require_manager, rfc3339};
-use super::settings::{overlaps_data_folder, path_reason};
+use super::nodes::{node_id, require_manager, rfc3339};
+use super::settings::{SHARE_TURN_WAIT, overlaps_data_folder, path_reason};
 use super::{ApiError, JsonBody, to_completion};
 use crate::AppState;
 use crate::auth::Signed;
 use crate::github::{EntryKind, GithubError, Head, RepoRef};
 use crate::libraries;
 use crate::secrets::Secret;
-use crate::share::FsBudget;
+use crate::share::{FsBudget, canonical_share_path};
 use crate::source_sync::{abandon_uploads_into, caps, token_context, token_of, webhook_context};
 use crate::tree::{self, TreeOp};
 
@@ -498,6 +500,52 @@ fn share_probe_error(error: &io::Error) -> ApiError {
     }
 }
 
+/// How many times a share connect resolves locations connected while it was resolving before
+/// it gives up with a retryable `503`.
+const SHARE_RESOLVE_ROUNDS: usize = 3;
+
+/// Why a canonical lookup gave no location.
+enum Lookup {
+    /// No lookup permit came free before the deadline: the server already has
+    /// [`crate::share::SHARE_LOOKUPS`] lookups in flight, most likely blocked on a hung server.
+    Busy,
+    /// The lookup failed or did not finish by the deadline.
+    Failed(ApiError),
+}
+
+/// The canonical location of `path` within `root`, through the contained [`crate::share::ShareFs`] seam,
+/// waiting no later than `deadline`. The blocking call holds one of the server's lookup permits
+/// until it returns, even after this caller stops waiting for it. A failure never carries the
+/// canonical path into an answer or a log.
+async fn resolve_canonical(
+    state: &AppState,
+    root: &SharePath,
+    path: &SharePath,
+    deadline: tokio::time::Instant,
+) -> Result<SharePath, Lookup> {
+    let permit = tokio::time::timeout_at(deadline, state.shares().lookups().acquire_owned())
+        .await
+        .map_err(|_| Lookup::Busy)?
+        .map_err(|_| Lookup::Busy)?;
+    let fs = state.shares().fs();
+    let root = root.to_path_buf();
+    let candidate = path.to_path_buf();
+    let resolved = tokio::time::timeout_at(
+        deadline,
+        tokio::task::spawn_blocking(move || {
+            let resolved = fs.canonical(&root, &candidate);
+            drop(permit);
+            resolved
+        }),
+    )
+    .await
+    .map_err(|_| Lookup::Failed(ApiError::ShareUnreachable("offline")))?
+    .map_err(|_| Lookup::Failed(ApiError::ShareUnreachable("offline")))?
+    .map_err(|error| Lookup::Failed(share_probe_error(&error)))?;
+    canonical_share_path(&resolved)
+        .map_err(|_| Lookup::Failed(ApiError::ShareUnreachable("offline")))
+}
+
 /// Makes a new read-only library backed by an administrator-approved file-share folder.
 pub(crate) async fn connect_share(
     State(state): State<AppState>,
@@ -529,13 +577,15 @@ pub(crate) async fn connect_share(
         .to_owned();
     let path = SharePath::parse(&body.path)
         .map_err(|reason| ApiError::InvalidSharePath(path_reason(reason)))?;
-    valid_root(&path).map_err(|reason| ApiError::InvalidSharePath(path_reason(reason)))?;
+    valid_root(&path)
+        .and_then(|()| usable_here(&path))
+        .map_err(|reason| ApiError::InvalidSharePath(path_reason(reason)))?;
     let settings = state
         .db()
         .share_settings()
         .await
         .map_err(|e| ApiError::unavailable(&e))?;
-    let approved = approved_root(&path, &settings.roots)
+    let mut approved = approved_root(&path, &settings.roots)
         .cloned()
         .ok_or(ApiError::ShareNotApproved)?;
     if overlaps_data_folder(&state, &path).await {
@@ -551,21 +601,156 @@ pub(crate) async fn connect_share(
     }
 
     // Probe only the connected folder itself; recursive walking belongs to the first listing.
-    let fs = state.shares().fs();
+    // Like a canonical lookup, the probe holds one of the server's lookup permits for its whole
+    // blocking call and is waited for no longer than `list_seconds`.
+    let probe_fs = state.shares().fs();
     let approved_path = approved.to_path_buf();
     let share_path = path.to_path_buf();
     let max_files = settings.max_files;
     let max_time = Duration::from_secs(settings.list_seconds);
-    tokio::task::spawn_blocking(move || {
-        fs.list(
-            &approved_path,
-            &share_path,
-            &FsBudget::new(max_files, Instant::now() + max_time),
-        )
-    })
+    let probe_deadline = tokio::time::Instant::now() + max_time;
+    let permit = tokio::time::timeout_at(probe_deadline, state.shares().lookups().acquire_owned())
+        .await
+        .map_err(|_| ApiError::Unavailable)?
+        .map_err(|_| ApiError::Unavailable)?;
+    tokio::time::timeout_at(
+        probe_deadline,
+        tokio::task::spawn_blocking(move || {
+            let listed = probe_fs.list(
+                &approved_path,
+                &share_path,
+                &FsBudget::new(max_files, Instant::now() + max_time),
+            );
+            drop(permit);
+            listed
+        }),
+    )
     .await
     .map_err(|_| ApiError::ShareUnreachable("offline"))?
+    .map_err(|_| ApiError::ShareUnreachable("offline"))?
     .map_err(|error| share_probe_error(&error))?;
+
+    // Every file-system call happens outside the organisation-wide connection turn, so the
+    // turn never waits on share I/O. The new folder's canonical location and that of every
+    // share already connected are resolved at once, under one `list_seconds` deadline; an
+    // existing location that cannot be resolved in time falls back to its typed path, but when
+    // no lookup permit comes free in time the answer is a retryable `503` instead. Under
+    // the turn only the database is touched: the roots and the connected locations are read
+    // again and compared with what was resolved. A location connected meanwhile was never
+    // resolved, so the turn is given up, just the new locations are resolved (with a fresh
+    // deadline), and the comparison is repeated; after a few rounds of that the answer is a
+    // retryable `503`. So is a root change that moves the folder under a different approved root
+    // meanwhile: its own location is then resolved again within the new root.
+    let mut resolved: HashMap<String, Option<SharePath>> = HashMap::new();
+    let mut own_canonical: Option<SharePath> = None;
+    let mut held = None;
+    for _ in 0..SHARE_RESOLVE_ROUNDS {
+        let deadline = tokio::time::Instant::now() + max_time;
+        let unresolved: Vec<String> = state
+            .db()
+            .share_locations()
+            .await
+            .map_err(|e| ApiError::unavailable(&e))?
+            .into_iter()
+            .filter(|location| !resolved.contains_key(location))
+            .collect();
+        let resolving_existing =
+            futures_util::future::join_all(unresolved.into_iter().map(|location| {
+                let state = &state;
+                let roots = settings.roots.clone();
+                async move {
+                    let canonical = match SharePath::parse(&location) {
+                        Ok(lexical) => match approved_root(&lexical, &roots) {
+                            Some(root) => {
+                                match resolve_canonical(state, root, &lexical, deadline).await {
+                                    Ok(canonical) => Ok(Some(canonical)),
+                                    // Too many lookups are already stuck: answer a
+                                    // retryable 503 rather than skip this location's
+                                    // canonical comparison.
+                                    Err(Lookup::Busy) => Err(ApiError::Unavailable),
+                                    Err(Lookup::Failed(_)) => Ok(None),
+                                }
+                            }
+                            None => Ok(None),
+                        },
+                        Err(_) => Ok(None),
+                    };
+                    (location, canonical)
+                }
+            }));
+        let newly = if own_canonical.is_none() {
+            let (own, newly) = tokio::join!(
+                resolve_canonical(&state, &approved, &path, deadline),
+                resolving_existing
+            );
+            own_canonical = Some(own.map_err(|lookup| match lookup {
+                Lookup::Busy => ApiError::Unavailable,
+                Lookup::Failed(error) => error,
+            })?);
+            newly
+        } else {
+            resolving_existing.await
+        };
+        for (location, canonical) in newly {
+            resolved.insert(location, canonical?);
+        }
+        let Some(canonical_path) = own_canonical.clone() else {
+            return Err(ApiError::ShareUnreachable("offline"));
+        };
+
+        // The wait for the turn is bounded; a timeout is a retryable `503`. The turn is then
+        // held through the source insert, so a concurrent root change or connect linearises
+        // wholly before or after this commit.
+        let mut turn = state
+            .db()
+            .lock_share_connections(SHARE_TURN_WAIT)
+            .await
+            .map_err(|e| ApiError::unavailable(&e))?
+            .ok_or(ApiError::Unavailable)?;
+        let current_settings = state
+            .db()
+            .share_settings()
+            .await
+            .map_err(|e| ApiError::unavailable(&e))?;
+        let Some(current_root) = approved_root(&path, &current_settings.roots).cloned() else {
+            return Err(ApiError::ShareNotApproved);
+        };
+        if current_root != approved {
+            // The folder's own canonical location was judged within a root that has since
+            // been replaced: give the turn up and resolve it again within the current root.
+            approved = current_root;
+            own_canonical = None;
+            continue;
+        }
+        let existing = state
+            .db()
+            .share_locations_locked(&mut turn, NodeId(Uuid::nil()))
+            .await
+            .map_err(|e| ApiError::unavailable(&e))?;
+        let mut complete = true;
+        for location in existing {
+            let lexical = SharePath::parse(&location).map_err(|_| ApiError::Unavailable)?;
+            let lexical_conflict = path.is_within(&lexical) || lexical.is_within(&path);
+            let conflict = match resolved.get(&location) {
+                Some(Some(existing)) => {
+                    canonical_path.is_within(existing) || existing.is_within(&canonical_path)
+                }
+                Some(None) => lexical_conflict,
+                None => {
+                    complete = false;
+                    lexical_conflict
+                }
+            };
+            if conflict {
+                return Err(ApiError::ShareLocationInUse);
+            }
+        }
+        if complete {
+            held = Some(turn);
+            break;
+        }
+    }
+    let mut connection_turn = held.ok_or(ApiError::Unavailable)?;
 
     let library = NodeId(Uuid::new_v4());
     let location = path.display();
@@ -577,19 +762,22 @@ pub(crate) async fn connect_share(
             tree::create_library(&state, &actor, site, library, &name, kind).await?;
             if let Err(error) = state
                 .db()
-                .connect_source(&NewSource {
-                    library,
-                    kind: SourceKind::Share,
-                    owner: String::new(),
-                    repo: String::new(),
-                    branch: String::new(),
-                    folder: String::new(),
-                    location: Some(location),
-                    mode: SourceMode::ReadOnly,
-                    token: None,
-                    poll_seconds: DEFAULT_POLL_SECONDS,
-                    connected_by: actor.id,
-                })
+                .connect_source_locked(
+                    &mut connection_turn,
+                    &NewSource {
+                        library,
+                        kind: SourceKind::Share,
+                        owner: String::new(),
+                        repo: String::new(),
+                        branch: String::new(),
+                        folder: String::new(),
+                        location: Some(location),
+                        mode: SourceMode::ReadOnly,
+                        token: None,
+                        poll_seconds: DEFAULT_POLL_SECONDS,
+                        connected_by: actor.id,
+                    },
+                )
                 .await
             {
                 purge_new_library(&state, &actor, library).await;
@@ -669,12 +857,15 @@ pub(crate) async fn show(
     // Whoever may see the library as `GET /api/libraries/{id}` shows it (not in the bin).
     libraries::show(&state, &signed.session.user, library).await?;
     let origin = origin(&state, &headers)?;
-    let reveal_path = state
-        .db()
-        .effective_access(signed.session.user.id, library)
-        .await
-        .map_err(|e| ApiError::unavailable(&e))?
-        .is_some_and(|access| access.can_manage_access());
+    let (config, _) = source_of(&state, library).await?;
+    let reveal_path = signed.session.user.is_admin
+        || config.connected_by == signed.session.user.id
+        || state
+            .db()
+            .effective_access(signed.session.user.id, library)
+            .await
+            .map_err(|e| ApiError::unavailable(&e))?
+            .is_some_and(|access| access.can_manage_access());
     Ok(Json(
         answer_of(&state, &origin, library, reveal_path).await?,
     ))
@@ -1005,24 +1196,14 @@ pub(crate) async fn disconnect(
             tokio::time::sleep(Duration::from_millis(25)).await;
         };
         let removed = if config.kind == SourceKind::Share {
-            let children = state
-                .db()
-                .live_children(library)
-                .await
-                .map_err(|e| ApiError::unavailable(&e))?;
-            let count = children.len();
-            for child in children {
-                delete_one(&state, &actor, child.id).await?;
-            }
-            count
+            tree::delete_source_children(&state, &actor, library).await?
         } else {
             0
         };
-        let secrets = state
-            .db()
-            .disconnect_source(library)
-            .await
-            .map_err(|e| ApiError::unavailable(&e))?;
+        // The library-level authorisation is judged again in the disconnect's own transaction,
+        // also when there were no children to remove: the route's check above was made before
+        // the wait for the source turn.
+        let secrets = state.db().disconnect_source_as(actor.id, library).await?;
         for id in secrets {
             forget_secret(&state, id).await;
         }

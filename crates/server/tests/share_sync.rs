@@ -30,7 +30,10 @@ use server::source_sync::{SyncError, SyncReport, sync_once};
 use sqlx::Connection;
 use time::OffsetDateTime;
 
+#[cfg(windows)]
 const ROOT: &str = r"C:\approved";
+#[cfg(not(windows))]
+const ROOT: &str = "/approved";
 
 struct Env {
     server: TestServer,
@@ -93,6 +96,28 @@ impl Env {
             .await
             .unwrap()
             .expect("the listing changed")
+    }
+
+    /// The first `source.synced` event. Events are written by a background task, so a sync
+    /// can answer before its event is in; this waits for it, up to ten seconds.
+    async fn first_synced_event(&self) -> records::Event {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let events = self
+                .server
+                .records_db()
+                .events_of_kind("source.synced")
+                .await
+                .unwrap();
+            if let Some(event) = events.into_iter().next() {
+                return event;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "source.synced event"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
     }
 
     async fn status(&self) -> SourceStatus {
@@ -640,6 +665,7 @@ async fn a_second_listing_with_no_change_records_no_event_and_makes_no_git_commi
     env.fake.put("same.txt", b"same");
     env.synced_at(OffsetDateTime::UNIX_EPOCH).await;
     let before_head = tree_head(&env.server);
+    env.first_synced_event().await;
     let before_events = env
         .server
         .records_db()
@@ -654,6 +680,8 @@ async fn a_second_listing_with_no_change_records_no_event_and_makes_no_git_commi
         Ok(None)
     );
     assert_eq!(tree_head(&env.server), before_head);
+    // Events are written by a background task: give a wrongly emitted one time to land.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     assert_eq!(
         env.server
             .records_db()
@@ -1275,13 +1303,8 @@ async fn events_carry_counts_and_no_path() {
     env.fake.put("folder/a.txt", b"a");
     env.fake.put("b.txt", b"b");
     env.synced_at(OffsetDateTime::UNIX_EPOCH).await;
-    let events = env
-        .server
-        .records_db()
-        .events_of_kind("source.synced")
-        .await
-        .unwrap();
-    let detail = &events.first().expect("source.synced event").detail;
+    let event = env.first_synced_event().await;
+    let detail = &event.detail;
     assert_eq!(detail["added"], 2);
     assert_eq!(detail["files"], 2);
     assert!(detail.get("seconds").is_some());

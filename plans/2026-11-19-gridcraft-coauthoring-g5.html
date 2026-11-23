@@ -1,0 +1,569 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ShareCraft — GridCraft Co-authoring (Plan G5): Implementation Plan</title>
+<style>
+:root{color-scheme:light dark;--ink:light-dark(#172f38,#e4ecef);--muted:light-dark(#536b72,#a9b9bf);--line:light-dark(#d7e2e3,#36454b);--paper:light-dark(#fff,#1d272b);--wash:light-dark(#f2f6f5,#141b1e);--accent:light-dark(#3156c9,#9db4ff);font:15px/1.6 Segoe UI,system-ui,sans-serif;color:var(--ink);background:var(--wash)}
+*{box-sizing:border-box}body{margin:0;padding:28px 18px 80px}main{max-width:940px;margin:auto}
+h1{font-size:1.9rem;letter-spacing:-.03em;line-height:1.2;margin:0 0 14px}h2{font-size:1.3rem;margin:38px 0 12px;padding-top:18px;border-top:1px solid var(--line)}h3{font-size:1.08rem;margin:30px 0 8px}h4{font-size:.95rem;margin:16px 0 6px}
+p{margin:0 0 12px}ul,ol{margin:0 0 12px;padding-left:22px}li{margin-bottom:6px}a{color:var(--accent)}
+code{font-family:Consolas,Menlo,monospace;font-size:.88em;background:light-dark(#e9efee,#263238);padding:1px 5px;border-radius:3px;overflow-wrap:anywhere}
+pre{background:var(--paper);border:1px solid var(--line);border-radius:7px;padding:12px 14px;overflow-x:auto;font:13px/1.5 Consolas,Menlo,monospace;margin:0 0 12px}pre code{background:none;padding:0;font-size:inherit}
+.note{border-left:4px solid var(--accent);background:var(--paper);padding:12px 16px;margin:0 0 14px}.note p:last-child{margin:0}
+.task{background:var(--paper);border:1px solid var(--line);border-radius:9px;padding:6px 20px 14px;margin:18px 0}
+ol.steps{list-style:none;padding-left:0}ol.steps>li{padding-left:28px;position:relative;margin-bottom:10px}ol.steps>li::before{content:"☐";position:absolute;left:2px;color:var(--muted)}
+table{border-collapse:collapse;width:100%;font-size:.9rem;background:var(--paper);margin-bottom:14px}th,td{border:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top}th{background:light-dark(#e8efed,#263238)}
+.table-wrap{overflow-x:auto}
+.small{font-size:.88rem;color:var(--muted)}
+tbody tr:nth-child(even) td{background:light-dark(#f4f8f7,#212b30)}
+ol.steps>li:nth-child(even),ul.band>li:nth-child(even),ol.band>li:nth-child(even){background:light-dark(#f4f8f7,#212b30);border-radius:4px}
+ul.band>li,ol.band>li{padding:4px 8px}
+</style>
+</head>
+<body><main>
+<h1>GridCraft live co-authoring, plan G5: the host bridge, presence, notices, switching it on and the two-browser acceptance run: implementation plan</h1>
+<p class="small">ShareCraft · Stage 2, editor track · Written 19 November 2026 · The last plan of the G1&ndash;G5 road</p>
+<div class="note"><p><strong>For agentic workers:</strong> REQUIRED SUB-SKILL: use superpowers:subagent-driven-development or superpowers:executing-plans. Steps are checkboxes.</p></div>
+
+<p><strong>Goal:</strong> make GridCraft live co-authoring something two people can actually use. A GridCraft file clicked in a library opens in the browser, both people edit it at the same time, each sees the other's changes and where the other is working, notices about changes that could not be applied appear in ShareCraft's own frame, the file is saved and checked automatically, and the whole thing is proved with two real browsers against acceptance tests A07 and A17.</p>
+
+<p><strong>In plain words.</strong> G2 built the server's "chat session" for a document and the shared library that every editor uses to take part in it. G3 taught the GridCraft engine to send and apply changes in that session. G4 taught the session to save checked revisions. All of that works only inside automated tests. G5 connects the pieces to the screen: the ShareCraft page around the editor carries the messages between the server and the editor, the editor draws the other people's selections, ShareCraft shows who is here and what happened, and a setting switches GridCraft documents from "one editor at a time" to "together". It also clears the items that the earlier reviews said must be fixed before anyone uses it.</p>
+
+<p><strong>Architecture:</strong></p>
+<ul>
+<li><strong>The ShareCraft page owns the connection; the editor owns the session logic.</strong> The frame page (<code>file.html</code>, <code>file.js</code>) opens the one WebSocket to <code>/ws/docs/{id}</code>, as it does today for the file session, and passes every live frame unchanged to the GridCraft editor in its <code>&lt;iframe&gt;</code> and back, over same-origin <code>postMessage</code>. Inside the editor, <code>GridCoauthor</code> (G3/G4) is the live client. The page only looks at a short, named list of server messages (who is here, access, removal, pause, saved) so it can draw the bar and the notices. The server is unchanged in kind: it still orders opaque entries and never reads a GridCraft command, presence or session data.</li>
+<li><strong>Live work runs from messages, not from drawing.</strong> The page sends the editor a tick every minute and hands over each frame as it arrives. The editor answers from its message handler, so a tab in the background keeps its heartbeat, applies other people's changes and can still write a checkpoint, even though the browser has stopped drawing it.</li>
+<li><strong>Presence is a small opaque note beside the log.</strong> Each editor sends "where I am" (sheet, active cell, selection, and whether it is typing in a cell) named by lasting identity. The room passes it to the others, keeps only the latest one per person in memory, never stores or logs it, and drops it when the person's connection drops. ShareCraft shows only people who are connected.</li>
+<li><strong>Notices live in the frame page, which is ordinary HTML.</strong> The editor reports what happened ("your change to B5 was not applied: the row was deleted; your text is kept") as a structured notice; ShareCraft shows it as one banner under the bar, readable by a screen reader (approach &sect;12). The editor draws only other people's selections, in colours ShareCraft assigns, always with initials, never by colour alone.</li>
+<li><strong>GridCraft's bridge is Rust.</strong> The fork adds its live messages in <code>apps/gridcraft-web</code> with <code>web-sys</code>, beside the existing <code>craft-web-host</code> bridge, so no handwritten JavaScript enters the fork. The screen (<code>ui-egui</code>) sends shared commands through <code>GridCoauthor</code> and keeps view commands personal.</li>
+<li><strong>The switch is explicit and checked.</strong> A new setting, <code>SHARECRAFT_LIVE_EDITORS</code>, fills <code>Config.live_editors</code>, which stays empty by default. The server also refuses to route a document to the live room unless the installed GridCraft build says it speaks the live protocol, so an old editor build can never be put into a live session by mistake.</li>
+</ul>
+
+<p><strong>Tech stack:</strong> both existing Rust workspaces; ShareCraft's <code>protocol</code>, <code>collab-live</code>, <code>server</code>, <code>records</code>, <code>xtask</code> and the plain JavaScript modules in <code>web/</code> with <code>node --test</code>; GridCraft's <code>engine</code>, <code>ui-egui</code> and <code>apps/gridcraft-web</code> (eframe, <code>web-sys</code>, <code>craft-web-host</code>). No new third-party dependency in either repository. The fork's dependency on ShareCraft's crates changes from a sibling folder path to a pinned git revision of the same public repository (Task 7).</p>
+
+<p><strong>Spec:</strong></p>
+<ul class="band">
+<li><a href="../co-authoring-approach.html">co-authoring-approach.html</a> v1.3 (binding): decisions C1&ndash;C23; &sect;04 (the session, the heartbeat, rule failures, returning clients and what everyone sees), &sect;05 (participant checkpoints, joiners, "nobody connected", stored file behind), &sect;07 and C11 (per-person view), &sect;08 (personal undo), &sect;10 (presence envelope in the library, drawing in the fork, read-only), &sect;11 (opaque presence, desktop clients, events), &sect;12 (accessibility of notices, hostile participants, desktop maths) and the open items, above all I7.</li>
+<li><a href="../gridcraft-coauthoring-proofs.html">gridcraft-coauthoring-proofs.html</a> v0.2 &sect;10, the G5 row: re-run the browser checks and timings in real browsers (Chrome, Edge, Firefox), connect the host, and bound fragmented identity-table work.</li>
+<li><a href="../scope.html">scope.html</a>: A07 (browser opening and co-authoring) and A17 (editor fork delivery), D12, D16, D20&ndash;D22, SC-15; <a href="../sequencing.html">sequencing.html</a>: Stage 2's editor track, whose exit includes A07 and the rest of A17 for GridCraft, and spine rules S1&ndash;S7.</li>
+<li>The G2, G3 and G4 plans in this folder, and their review ledgers: the G2 final review's "before G5" items (host reconnect back-off after client errors, presenting places with no connection, names in <code>Debug</code>); the G3 ledger's ruling that the fork's sibling-path dependency must become a git or published dependency in G5, its carry I7, and its minor "<code>Session::coauthoring</code> is never cleared".</li>
+<li><a href="../docs/editor-frame.html">docs/editor-frame.html</a> (the frame concept): ShareCraft owns the bar, banners and side panel; the editor owns the canvas and draws other people's cursors in colours ShareCraft assigns; one banner, at most two actions; never colour alone.</li>
+</ul>
+
+<h2>The road (for context)</h2>
+<table>
+<thead><tr><th>Plan</th><th>What it builds</th><th>Where</th></tr></thead>
+<tbody>
+<tr><td>G1 (done)</td><td>The four proofs and the conditional go-ahead.</td><td>GridCraft tests, ShareCraft documents</td></tr>
+<tr><td>G2 (built)</td><td>The shared collaboration library, the opaque-entry room and the durable ordered log.</td><td>ShareCraft</td></tr>
+<tr><td>G3 (built in the fork)</td><td>GridCraft identities, explicit shared commands, the apply loop and personal Undo.</td><td>GridCraft</td></tr>
+<tr><td>G4 (being built)</td><td>Checkpoint tickets and second-hash verification, full-recalc checkpoint loads, returning clients and major versions, bounded unsaved logs.</td><td>ShareCraft and GridCraft</td></tr>
+<tr><td>G5 (this)</td><td>The host bridge, presence, notices in the frame, switching GridCraft on, and the A07/A17 acceptance run with two real browsers.</td><td>Both</td></tr>
+</tbody>
+</table>
+
+<div class="note"><p><strong>Before starting.</strong> G5 builds on G4's finished work: the checkpoint upload and hash routes, verification, the returning-client barriers and the log limits (G4 Tasks 8&ndash;12 were still in progress when this plan was written). Start only when G4's final review is done. ShareCraft work goes on a branch <code>gridcraft-coauthoring-g5</code> made from G4's tip; fork work goes on <code>coauthor-g5</code> made from <code>coauthor-g4</code>'s tip. Where this plan names a G4 route or message, use the form G4 actually built.</p></div>
+
+<h2>Proposals for the owner</h2>
+<p>The binding paper settles the behaviour. These are the choices it leaves open, made here so the work can go ahead. Each can be changed before or after the build.</p>
+<ol class="band">
+<li><strong>The page carries the connection.</strong> The ShareCraft frame page opens the one WebSocket and passes frames to and from the editor; the editor does not open its own. This keeps one connection per open tab, keeps sign-in and the editors' security policy as they are, and lets ShareCraft see who is here without asking the editor. The alternative, the editor opening its own socket, would need a second connection for the page's bar.</li>
+<li><strong>GridCraft's live messages are its own, for now.</strong> They are a small set of <code>gridcraft:live-*</code> messages in <code>apps/gridcraft-web</code>, written in Rust with <code>web-sys</code>, beside the shared <code>craft-web-host</code> contract rather than inside it. Adding them to <code>craft-web-host</code> would mean a change and a release in another organisation's repository (<code>storytold/craft-libs</code>), which can follow once the messages have settled.</li>
+<li><strong>A hidden tab stays a full participant.</strong> Ticks and frames are handled when they arrive, not when the editor draws, so a tab in the background keeps its place, applies changes and may write checkpoints. The "bring this tab forward" request (C19) is shown only when changes are paused and this tab is the only editor that could save.</li>
+<li><strong>Reconnecting after an error waits longer each time.</strong> After a closed socket or an error the library cannot follow, the page waits 1 second, then doubles the wait up to 60 seconds, with up to 20% random spread so several tabs do not retry together. After five identical errors in a row it stops and shows "This document can't be opened together right now" with a Reload button. Reaching the live state resets the count.</li>
+<li><strong>What presence carries.</strong> The sheet, the active cell, one selected range and whether the person is typing in a cell, all named by identity; at most 1,024 bytes; at most 10 updates a second from one tab (the room drops the rest); the latest kept in memory per person and sent to people who join; never stored, logged or put in events. Showing "typing in this cell" is the middle way the paper kept open in Q2; nobody sees the typed text before Enter.</li>
+<li><strong>Viewers are shown, marked read only.</strong> Viewers send presence too. The bar lists them with "(read only)" and the canvas draws their selection with a dashed outline.</li>
+<li><strong>People without a connection are hidden.</strong> A person whose connection has dropped keeps their place for up to three minutes (C21), but neither the bar nor the canvas shows them during that time. They reappear when they reconnect.</li>
+<li><strong>Colours and names.</strong> ShareCraft gives each person the colour it already uses for their avatar, and passes name, initials and colour to the editor. The editor draws an outline with an initials tag, and the name on hover.</li>
+<li><strong>Bounds on identity tables (I7).</strong> The library indexes its identity runs so a lookup takes a few steps rather than a scan. One structural change may touch at most 1,024 separate blocks of rows or columns, and one axis may hold at most 65,536 runs (live and deleted together). A change over either limit does nothing on every machine and its author is told, in the same way as other rule failures (C8). The automated test counts steps; a separate timing run is recorded.</li>
+<li><strong>The fork pins ShareCraft by git revision.</strong> <code>collab-core</code>, <code>collab-live</code> and <code>protocol</code> come from <code>https://github.com/ThineCraft/ShareCraft</code> at a full commit hash, as the fork already does for <code>craft-libs</code>. Nothing is published to crates.io. This needs that ShareCraft commit to be pushed, which waits for your yes. For work across both checkouts, a command-line <code>--config patch</code> points the build at the local folder without committing it.</li>
+<li><strong>Session data for a joining editor comes over HTTP.</strong> A new read-only route hands the editor the identity tables for its starting revision. They can be up to 8 MiB, which does not fit in a 1 MiB socket message.</li>
+<li><strong>Desktop GridCraft is refused for now.</strong> The paper keeps desktop editors out of shared sessions until both builds use one maths library (&sect;12, C5, C16). The room therefore refuses a desktop build joining a GridCraft session with a clear message. Desktop sign-in and a desktop bridge are not built in G5.</li>
+<li><strong>How it is switched on.</strong> <code>SHARECRAFT_LIVE_EDITORS=gridcraft</code> turns it on; the built-in default stays empty. Only GridCraft is accepted, since the other editors keep the one editing seat (C17). A document goes to the live room only when the installed GridCraft build declares the live protocol in its manifest. The development <code>.env</code> turns it on for the acceptance run; turning it on anywhere else is your decision after A07 and A17 pass.</li>
+<li><strong>Save and Download in a live document.</strong> There is no Save button and the editor's own Save does not upload a file, because checkpoints are automatic and a whole-file upload would race them. The status reads Saved, Saving&hellip; or Unsaved changes kept. Download gives the last stored revision and says when it is behind the live document.</li>
+<li><strong>When the editor stops.</strong> The editor notes the entry it is applying in the tab's session storage, so a reloaded editor reports it (C3). If the editor does not answer a tick within 15 seconds while the tab is shown, the page offers "Reload editor"; it reloads automatically at most three times.</li>
+<li><strong>Faults shown to the owner.</strong> When a checkpoint could not be verified because two editors wrote different files (C6), people who own the document see a notice in the frame, and the Activity feed records it. Editors and viewers see nothing.</li>
+<li><strong>Others are told about a return.</strong> The room sends everyone else a short "this person's changes made while away are arriving" message when a returning client's batch starts, so the frame can say that the version before is kept (&sect;04).</li>
+<li><strong>Commands GridCraft does not share yet.</strong> In a live document they are refused with "Not available while editing together", rather than greyed one by one; the menu stays as it is.</li>
+<li><strong>Which browsers.</strong> No Playwright or similar tool exists in either repository, and none is added. The acceptance run uses the assistant's built-in browser (Chromium) for one person at <code>http://localhost:8787</code> and Claude in Chrome (Google Chrome) for the other at <code>http://127.0.0.1:8787</code>, which keeps their sign-ins apart and keeps both tabs drawn. The proofs' Edge and Firefox runs need you to open a page and read out its result; no browser driver is downloaded without your yes.</li>
+<li><strong>Branches.</strong> The acceptance run installs the GridCraft build from <code>coauthor-g5</code>, recorded in <code>editors.toml</code> with that branch name. Merging the fork's co-authoring branches into its <code>sharecraft</code> branch, and pushing either repository, wait for your go-ahead.</li>
+</ol>
+
+<h2>Not in this plan</h2>
+<ul class="band">
+<li>Desktop GridCraft in shared sessions, desktop sign-in to ShareCraft and the common maths library (C5, C16; after G5).</li>
+<li>Large content beside the log and large shared paste (C20), and any new shared command families: sort, cut and paste, fill, objects, charts, pivots, macros and scripts stay refused in a live document.</li>
+<li>Seeing typing live inside a cell (Q2: after Enter in Stage 2), personal filter views (C10) and following another person's view.</li>
+<li>"Who is in it now" on the library page (the concept's library presence), SC-08 version numbering and a version-history screen.</li>
+<li>Moving the plain-text editor onto the live room (C15) and any change to WordCraft, PdfCraft or SolidCraft, which keep the one editing seat (C17).</li>
+<li>Adding the live messages to <code>craft-web-host</code> or offering the work to upstream GridCraft.</li>
+<li>Any CI workflow change in either repository, and pushing or merging without the owner's yes.</li>
+</ul>
+
+<h2>Global constraints</h2>
+<ul class="band">
+<li><strong>The server stays a relay (C1, C4, S6).</strong> It never reads an entry payload, a presence note, GridCraft session data or XLSX content. It may count bytes and compare fixed-size hashes. Presence is not written to PostgreSQL, not put in events and not logged.</li>
+<li><strong>Nothing new reaches a log or a <code>Debug</code> form.</strong> Names, account ids, payloads, presence notes and typed text are kept out of <code>Debug</code> output, <code>eprintln!</code>, <code>log::</code> calls and the browser console. Events carry positions, counts and kinds only.</li>
+<li><strong>Applying a received change reads nothing personal</strong> (approach &sect;03). Filling in a target from the sender's selection happens on the sender's side, before the entry is made. View state (active sheet, scroll, active cell, zoom, frozen panes, gridlines) stays per person (C11).</li>
+<li><strong>The screen changes the shared workbook only through <code>GridCoauthor</code>.</strong> In a live document every direct write the paper lists (the filter menu, view state written before commands, the screen's own trimming of the undo list) goes through the entry point or is switched off.</li>
+<li><strong>Hostile input is bounded on both sides of <code>postMessage</code>.</strong> The page checks the message's origin and source; the editor checks its parent's origin, every size (frame 1 MiB, base file 512 MiB as today, session data 8 MiB, people list 256) and every field before use.</li>
+<li><strong>The room stays off by default.</strong> <code>Config.live_editors</code> stays empty unless <code>SHARECRAFT_LIVE_EDITORS</code> names <code>gridcraft</code> and the installed editor declares the live protocol.</li>
+<li><strong>GridCraft fork rules (AGENTS.md):</strong> no panic primitives and no <code>unsafe</code> in non-test code; input treated as hostile and allocations bounded; Rust only, no handwritten JavaScript or TypeScript (the web build stays an eframe app using <code>web-sys</code>); the existing web build and the <code>craft-web-host</code> contract keep working; no CI changes; no agent attribution in commits or pull requests; one task id per commit; <code>cargo xtask ci</code> before each commit, reporting the four failures known to exist at the G3 base separately from anything new.</li>
+<li><strong>ShareCraft rules (BUILDING.html):</strong> page scripts keep their pure parts in exported functions tested with <code>node --test</code>; no inline script is added to a page (the hashed security policy, section 20, stays as it is); every new table and long list in a document is banded in light and dark; <code>cargo xtask check</code> before each commit; builds use <code>CARGO_TARGET_DIR=J:\cargo-target\sharecraft-g5</code>, and <code>CARGO_BUILD_JOBS=1</code> if the paging file runs out.</li>
+<li><strong>Report only what ran.</strong> Each step that runs a browser check records what was seen; anything not run is listed as not checked.</li>
+</ul>
+
+<h2>Review focus</h2>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Failure class</th><th>Expected behaviour</th><th>Pinned by</th></tr></thead>
+<tbody>
+<tr><td>A tab in the background stops drawing, so heartbeats stop and the place expires, or other people's changes pile up unapplied.</td><td>Ticks and frames are handled in the message handler; the place survives; the hidden tab is up to date when shown.</td><td><code>ticks_without_drawing_send_heartbeats</code>, <code>frames_apply_without_drawing</code>; acceptance step "hidden tab for five minutes".</td></tr>
+<tr><td>The screen writes the shared workbook outside the entry point (filter menu, view state, undo trimming).</td><td>No direct write in live mode; fingerprints still agree after each such action.</td><td><code>filter_menu_goes_through_the_entry_point_when_live</code>, <code>control_and_object_drags_do_not_trim_shared_history</code>, <code>live_view_state_is_not_written_into_the_workbook</code>.</td></tr>
+<tr><td>A viewer's edit is shown and then taken back, or a viewer changes the document.</td><td>The editor refuses before showing; navigation and selection still work.</td><td><code>read_only_live_mode_refuses_edits_and_keeps_navigation</code>, <code>viewer_cannot_submit_but_can_move_its_own_view</code>.</td></tr>
+<tr><td>Ghost cursors or stale names after someone's connection drops.</td><td>Presence cleared at once on disconnect; disconnected places hidden in the bar and canvas.</td><td><code>presence_is_dropped_when_connection_closes</code>, <code>presence_hides_places_without_a_connection</code>, <code>disconnected_places_are_not_drawn</code>.</td></tr>
+<tr><td>A repeated error makes the page reconnect in a tight loop.</td><td>Waits grow to 60 seconds; five identical errors stop with a notice.</td><td><code>live_retry_doubles_to_sixty_seconds_with_spread</code>, <code>live_retry_stops_after_five_identical_client_errors</code>.</td></tr>
+<tr><td>A first live session starts from an empty workbook instead of the stored file.</td><td>The catch-up base is the document's current revision with fresh identities.</td><td><code>first_live_session_starts_from_the_current_file_revision</code>, <code>starting_from_file_bytes_gives_every_client_the_same_identities</code>.</td></tr>
+<tr><td>One person fragments an axis and every later change slows down for everyone.</td><td>Indexed lookups; per-sheet tables shared between snapshots; over-limit changes do nothing everywhere.</td><td><code>lookups_on_a_fragmented_axis_touch_few_runs</code>, <code>snapshot_shares_unchanged_sheet_tables</code>, <code>structural_entry_over_the_block_cap_has_no_effect_everywhere</code>.</td></tr>
+<tr><td>An old editor build, or a desktop build, is put into a live session.</td><td>The server keeps the file session for an editor that does not declare the live protocol, and refuses a desktop build with a clear message.</td><td><code>live_room_needs_an_installed_live_editor</code>, <code>desktop_build_is_refused_for_gridcraft_rooms</code>.</td></tr>
+<tr><td>Names or typed text appear in logs.</td><td>Debug forms show lengths only.</td><td><code>debug_output_never_contains_names_or_payloads</code>, <code>malformed_error_does_not_echo_frame_content</code>.</td></tr>
+<tr><td>Leaving a live session leaves the workbook marked as shared, so the macro debugger stays blocked.</td><td><code>GridCoauthor::finish</code> hands back a session that is no longer co-authoring.</td><td><code>leaving_the_room_clears_coauthoring</code>, <code>macro_debugger_can_start_after_leaving</code>.</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>File map</h2>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Repository / file</th><th>Responsibility in G5</th></tr></thead>
+<tbody>
+<tr><td>ShareCraft · <code>crates/protocol/src/live.rs</code></td><td>Presence, returning, saved and build-refused messages; names out of <code>Debug</code>.</td></tr>
+<tr><td>ShareCraft · <code>crates/collab-live/src/client.rs</code>, <code>tests/client.rs</code></td><td>Presence sending and events; no frame content in errors.</td></tr>
+<tr><td>ShareCraft · <code>crates/collab-live/src/ids.rs</code>, <code>tests/convergence.rs</code></td><td>Indexed identity runs and the per-axis run limit (I7, library part).</td></tr>
+<tr><td>ShareCraft · <code>crates/server/src/live_room.rs</code>, <code>live_store.rs</code>, <code>ws.rs</code>, <code>tests/live_room.rs</code></td><td>Presence relay, return and saved notices, desktop refusal, first-session base, stored-file-behind mark.</td></tr>
+<tr><td>ShareCraft · <code>crates/server/src/api/content.rs</code>, <code>api/docs.rs</code>, <code>api/mod.rs</code>, <code>tests/content.rs</code>, <code>tests/documents.rs</code></td><td>The live-base route; the document answer names the session kind and whether the stored file is behind; the download notes it.</td></tr>
+<tr><td>ShareCraft · <code>crates/server/src/config.rs</code>, <code>editors.rs</code>, <code>tests/editors.rs</code></td><td><code>SHARECRAFT_LIVE_EDITORS</code>; the installed editor's live declaration.</td></tr>
+<tr><td>ShareCraft · <code>crates/records/src/live.rs</code>, <code>crates/records/tests/live.rs</code></td><td>Reading whether a document has live entries after its stored revision.</td></tr>
+<tr><td>ShareCraft · <code>xtask/src/editors.rs</code>, <code>editors.toml</code></td><td>Write the live format and protocol into the installed editor's manifest; record the G5 fork commit.</td></tr>
+<tr><td>ShareCraft · <code>web/live-host.js</code> (new), <code>web/live-host.test.mjs</code> (new)</td><td>The page side of the bridge: socket, relay, back-off, base loading, checkpoint upload, watchdog, notice wording.</td></tr>
+<tr><td>ShareCraft · <code>web/file.js</code>, <code>web/editor-host.js</code>, <code>web/editor-frame.js</code>, <code>web/editor-frame.test.mjs</code>, <code>web/style.css</code></td><td>Choose the live path; the bar's people and status; one banner for notices.</td></tr>
+<tr><td>GridCraft fork · <code>Cargo.toml</code>, <code>crates/engine/Cargo.toml</code>, <code>Cargo.lock</code>, <code>xtask/src</code></td><td>Pinned git dependency on ShareCraft's three crates, and a check that no dependency path leaves the repository.</td></tr>
+<tr><td>GridCraft fork · <code>crates/engine/src/coauthor/ids.rs</code>, <code>command.rs</code>, <code>editor.rs</code>, <code>mod.rs</code>, new <code>host.rs</code> and <code>presence.rs</code></td><td>Shared per-sheet tables and the block limit; routing, explicit targets, presence, notices, read-only, start and finish.</td></tr>
+<tr><td>GridCraft fork · <code>crates/engine/tests/it/coauthor_live.rs</code>, <code>coauthor_timing.rs</code>, new <code>coauthor_host.rs</code></td><td>Host-surface, fragmentation and presence tests.</td></tr>
+<tr><td>GridCraft fork · <code>apps/gridcraft-web/src/live.rs</code> (new), <code>host.rs</code>, <code>web.rs</code>, <code>main.rs</code></td><td>The <code>gridcraft:live-*</code> messages, ticks, crash note, checkpoint and hash hand-over.</td></tr>
+<tr><td>GridCraft fork · <code>crates/ui-egui/src/live.rs</code> (new), <code>app/commands.rs</code>, <code>app/mod.rs</code>, <code>app/view.rs</code>, <code>app/editing.rs</code>, <code>grid/menus.rs</code>, <code>grid/interact.rs</code>, <code>form_controls.rs</code>, grid drawing</td><td>Live mode on the screen: command routing, personal Undo, no direct writes, read-only, others' selections.</td></tr>
+<tr><td>ShareCraft · <code>BUILDING.html</code>, <code>co-authoring-approach.html</code>, <code>gridcraft-coauthoring-proofs.html</code>, <code>sequencing.html</code>, <code>editors.html</code></td><td>Operation, G5 build notes (no change to C1&ndash;C23), the real-browser results, progress and the capability matrix.</td></tr>
+<tr><td>GridCraft fork · <code>docs/gaps.md</code> &sect;16, <code>docs/roadmap.md</code>, <code>ROADMAP.md</code>, <code>docs/coauthor-determinism.md</code></td><td>What is now user-facing, what remains, how to build against a local ShareCraft.</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>Tasks</h2>
+<p class="small">Order: ShareCraft Tasks 1&ndash;3 first, because the fork pins the commit that contains them (Task 7). Tasks 4&ndash;6 and 12&ndash;13 are ShareCraft; 7&ndash;11 are the fork; 14 and 15 span both.</p>
+
+<div class="task">
+<h3>Task 1 [ShareCraft]: presence, return, saved and build-refused messages</h3>
+<p><strong>Files:</strong> modify <code>crates/protocol/src/live.rs</code>, <code>crates/collab-live/src/client.rs</code>; extend their unit tests and <code>crates/collab-live/tests/client.rs</code>.</p>
+<p><strong>Interfaces:</strong></p>
+<pre><code>pub const MAX_PRESENCE_BYTES: usize = 1024;
+
+LiveClientMsg::Presence { payload: String }
+LiveServerMsg::Presence { participant: ParticipantNo, payload: Option&lt;String&gt; } // None: cleared
+LiveServerMsg::Returning { participant: ParticipantNo }
+LiveServerMsg::Saved { revision: String, through: Seq, verified: bool, major: bool }
+LiveServerMsg::BuildRefused { build: LiveBuild }
+
+impl&lt;E: LiveEditor&gt; LiveClient&lt;E&gt; {
+    /// The frame to send now, or None while not live (the latest note is kept and sent on
+    /// the next join).
+    pub fn presence(&amp;mut self, payload: String) -&gt; Result&lt;Option&lt;String&gt;, LocalError&gt;;
+}
+Event::Presence { participant: ParticipantNo, payload: Option&lt;String&gt; }
+Event::Returning { participant: ParticipantNo }
+Event::Saved { revision: String, through: Seq, verified: bool, major: bool }
+Event::BuildRefused</code></pre>
+<ol class="steps">
+<li><strong>Check G4 first.</strong> If G4 Task 8 already broadcasts a stored checkpoint to the room, reuse its message for <code>Saved</code> and drop that variant here; record the choice in the commit message.</li>
+<li><strong>Write failing tests</strong> <code>presence_wire_forms_are_pinned</code>, <code>returning_saved_and_build_refused_wire_forms_are_pinned</code>, <code>presence_payload_is_redacted_in_debug</code> and extend <code>live_message_tags_are_pinned</code> in <code>protocol</code>; <code>presence_over_the_limit_is_refused_locally</code>, <code>presence_is_sent_after_reconnect_latest_only</code>, <code>presence_from_others_becomes_an_event</code> and <code>presence_is_never_sent_while_not_live</code> in <code>collab-live</code>.</li>
+<li><strong>Run:</strong> <code>cargo test -p protocol live -- --nocapture</code> and <code>cargo test -p collab-live --features stand-in --test client presence -- --nocapture</code>. Expected: fail on missing variants.</li>
+<li><strong>Add the messages.</strong> Keep <code>deny_unknown_fields</code> and snake-case tags. The presence payload is an opaque string, like an entry's, shown in <code>Debug</code> only as its length. A payload over <code>MAX_PRESENCE_BYTES</code> is refused with <code>LocalError::TooLarge</code> before any frame is made.</li>
+<li><strong>Make presence latest-wins in the library.</strong> While offline or catching up, keep only the newest note and send it once the client is live again. A presence note is not an entry: it has no local number, no resend queue and no effect on agreed or shown state.</li>
+<li><strong>Run:</strong> all <code>protocol</code> and <code>collab-live</code> tests, the wasm32 build of <code>collab-live</code>, and <code>cargo test -p server --no-run</code>. Expected: pass; exhaustive matches show every server location Task 4 must handle.</li>
+<li><strong>Commit:</strong> <code>G5.1: presence and room notices on the live wire</code>.</li>
+</ol>
+</div>
+
+<div class="task">
+<h3>Task 2 [ShareCraft]: keep names and content out of <code>Debug</code> and logs</h3>
+<p><strong>Files:</strong> modify <code>crates/protocol/src/live.rs</code>, <code>crates/collab-live/src/client.rs</code>; audit <code>crates/server/src/live_room.rs</code>, <code>live_store.rs</code>, <code>live_cancel.rs</code>, <code>ws.rs</code> and the <code>web/*.js</code> files that handle live messages.</p>
+<p><strong>Interfaces:</strong></p>
+<pre><code>// Hand-written: participant, client, can_edit and connected are shown;
+// user and name are shown as "&lt;hidden&gt;" and "&lt;N chars&gt;".
+impl std::fmt::Debug for LivePerson;
+
+// Carries only the kind and position of the fault, never the frame's text.
+ClientError::Malformed { kind: MalformedKind, line: usize, column: usize }</code></pre>
+<ol class="steps">
+<li><strong>Write failing tests</strong> <code>live_person_debug_hides_the_name_and_account</code> and <code>debug_output_never_contains_names_or_payloads</code> in <code>protocol</code>: build every client and server message with the sentinel name <code>Sentinel Name 7</code> and the sentinel payload <code>sentinel-payload-7</code>, format each with <code>{:?}</code> and assert neither appears. Add <code>people_event_debug_hides_names</code> and <code>malformed_error_does_not_echo_frame_content</code> in <code>collab-live</code>; the second feeds a frame whose bad field holds a sentinel string, as serde's messages would otherwise quote it.</li>
+<li><strong>Run:</strong> the two crates' focused tests. Expected: the derived <code>Debug</code> prints the name, and <code>Malformed</code> echoes the value.</li>
+<li><strong>Replace the derived forms.</strong> Keep <code>PartialEq</code> and serde unchanged so wire tests and <code>assert_eq!</code> still work. Map serde errors to a small closed <code>MalformedKind</code> (syntax, unknown type, missing field, wrong type, too large) with line and column only.</li>
+<li><strong>Audit every output path.</strong> In the server's live files, check each <code>eprintln!</code> and error <code>Display</code> reachable from a live message: none may print a <code>LivePerson</code>, a message, an event or a payload. In the web scripts, the live path must not <code>console.log</code> a frame or a person. Record the audit result, file by file, in the commit message. The fork's share of this audit is in Tasks 9 and 10.</li>
+<li><strong>Run:</strong> <code>cargo test -p protocol</code>, <code>cargo test -p collab-live --features stand-in</code>, <code>cargo xtask test -p server live_room</code>. Expected: pass.</li>
+<li><strong>Commit:</strong> <code>G5.2: keep names and payloads out of debug output</code>.</li>
+</ol>
+</div>
+
+<div class="task">
+<h3>Task 3 [ShareCraft]: index identity runs and bound them per axis (I7, library part)</h3>
+<p><strong>Files:</strong> modify <code>crates/collab-live/src/ids.rs</code>; extend its unit tests and <code>crates/collab-live/tests/convergence.rs</code>.</p>
+<p><strong>Interfaces:</strong></p>
+<pre><code>impl OrderedIds {
+    /// Live and deleted runs one axis may hold.
+    pub const MAX_RUNS: usize = 65_536;
+    /// Separate blocks one structural change may touch.
+    pub const MAX_BLOCKS_PER_CHANGE: usize = 1_024;
+
+    pub fn id_at(&amp;self, pos: u32) -&gt; Option&lt;LiveId&gt;;   // now O(log runs)
+    pub fn find(&amp;self, id: LiveId) -&gt; Lookup;          // now O(log runs)
+    /// Whether deleting or moving these blocks would pass either limit; checked before any change.
+    pub fn check_fragmentation(&amp;self, blocks: &amp;[(u32, u32)]) -&gt; Result&lt;(), IdError&gt;;
+}
+IdError::TooFragmented { runs: usize, blocks: usize }</code></pre>
+<ol class="steps">
+<li><strong>Write failing tests</strong> <code>indexed_lookups_match_a_plain_list</code> (a property test beside <code>ordered_ids_match_a_plain_list</code>, comparing every <code>id_at</code> and <code>find</code> with the plain list after random inserts, deletes and moves), <code>lookups_on_a_fragmented_axis_touch_few_runs</code> (an axis with 60,000 runs; a test-only probe counter shows at most 40 runs visited per lookup), <code>index_is_rebuilt_after_deserialisation</code>, <code>axis_over_max_runs_is_refused_before_change</code> and <code>too_many_blocks_in_one_change_is_refused_before_change</code>.</li>
+<li><strong>Run:</strong> <code>cargo test -p collab-live ids -- --nocapture</code>. Expected: the probe count is in the tens of thousands; the limit tests fail to compile.</li>
+<li><strong>Add the index.</strong> Keep the serialised form unchanged: the index is private, skipped by serde and rebuilt after validation on load and after each successful mutation. Use cumulative run starts for positions and an ordered map from each run's first identity to its run, for live and deleted runs alike. Mutation stays as costly as today (it already moves runs); lookups become logarithmic.</li>
+<li><strong>Add the limits.</strong> <code>insert</code>, <code>delete</code> and <code>move_block</code> return <code>IdError::TooFragmented</code> without changing anything when the result would pass <code>MAX_RUNS</code>. <code>check_fragmentation</code> lets an editor test a whole change first. The decision depends only on the agreed table, so every machine decides the same.</li>
+<li><strong>Add an ignored release timing test</strong> <code>fragmented_axis_lookup_timing</code> that prints lookups per second on a 60,000-run axis, for the record in Task 14.</li>
+<li><strong>Run:</strong> all <code>collab-live</code> tests including convergence, the wasm32 build, and the fork's <code>coauthor_</code> tests against this checkout. Expected: pass; valid stored JSON loads unchanged.</li>
+<li><strong>Commit:</strong> <code>G5.3: index and bound live identity runs</code>. Then ask the owner to push the ShareCraft branch so Task 7 can pin it.</li>
+</ol>
+</div>
+
+<div class="task">
+<h3>Task 4 [ShareCraft]: relay presence and room notices; refuse desktop builds</h3>
+<p><strong>Files:</strong> modify <code>crates/server/src/live_room.rs</code>, <code>ws.rs</code>; extend <code>crates/server/tests/live_room.rs</code>.</p>
+<ol class="steps">
+<li><strong>Write failing tests</strong> <code>presence_reaches_others_but_not_the_sender</code>, <code>joiner_receives_current_presence_after_catchup</code>, <code>presence_is_dropped_when_connection_closes</code> (also on leave, expiry and access removal), <code>viewer_presence_is_relayed</code>, <code>oversized_or_too_fast_presence_is_dropped</code>, <code>presence_counts_as_a_sign_of_life</code>, <code>presence_is_not_stored_or_logged</code> (no live table row, no event), <code>people_list_marks_dropped_connections</code>, <code>returning_notice_reaches_the_others</code>, <code>saved_notice_follows_a_stored_checkpoint</code> and <code>desktop_build_is_refused_for_gridcraft_rooms</code>.</li>
+<li><strong>Run:</strong> <code>cargo xtask test -p server --test live_room presence -- --nocapture</code>. Expected: fail; presence is not handled.</li>
+<li><strong>Relay presence in memory only.</strong> Keep the latest note per held place. Send it to every other connected member, never back to the sender. After a join's catch-up, send the joiner every current note. On connection close, leave, expiry, removal or loss of access, delete the note and send <code>Presence { payload: None }</code>. Drop silently a note over <code>MAX_PRESENCE_BYTES</code> or beyond 10 a second (burst 20) from one client. Any presence message refreshes the client's last-heard time (C21). Presence does not count towards the unsaved-log limits.</li>
+<li><strong>Send the People list on every connect and disconnect,</strong> so <code>connected</code> is always current for the frame (Task 13).</li>
+<li><strong>Send the two notices.</strong> When G4's return barrier opens for a returning client, send <code>Returning</code> to everyone else. After a checkpoint is stored and after it is verified, send <code>Saved</code> to everyone (skip if Task 1 found G4's own broadcast).</li>
+<li><strong>Refuse desktop builds</strong> for rooms whose format starts with <code>gridcraft/</code>: answer <code>BuildRefused { build: Desktop }</code> and close, before a place is given. The rule is a constant with a comment naming C5, C16 and approach &sect;12, so it is removed only with the maths library.</li>
+<li><strong>Run:</strong> the focused tests, all <code>live_room</code> unit and integration tests, and the revocation tests. Expected: pass.</li>
+<li><strong>Commit:</strong> <code>G5.4: relay presence and live room notices</code>.</li>
+</ol>
+</div>
+
+<div class="task">
+<h3>Task 5 [ShareCraft]: give a joining editor its base, and say when the stored file is behind</h3>
+<p><strong>Files:</strong> modify <code>crates/server/src/api/content.rs</code>, <code>api/docs.rs</code>, <code>api/mod.rs</code>, <code>live_room.rs</code>, <code>live_store.rs</code>, <code>crates/records/src/live.rs</code>; extend <code>crates/server/tests/content.rs</code>, <code>documents.rs</code>, <code>live_room.rs</code> and <code>crates/records/tests/live.rs</code>.</p>
+<p><strong>Interfaces:</strong></p>
+<pre><code>GET /api/docs/{id}/live-base?at={seq}
+  200 application/octet-stream  the session data stored with the base at `at`
+  204                           the base is a plain file revision (fresh identities)
+  409                           `at` is not the room's current base
+  404                           no read access, or no live log
+  Cache-Control: no-store
+
+// in the document answer
+"live": { "behind": bool, "head": u64, "stored_through": u64 }
+
+impl Db {
+    pub async fn live_behind(&amp;self, doc: DocId) -&gt; Result&lt;Option&lt;LiveBehind&gt;, DbError&gt;;
+}</code></pre>
+<ol class="steps">
+<li><strong>Write failing tests</strong> <code>first_live_session_starts_from_the_current_file_revision</code> (a GridCraft document saved through the file session, then joined live, gets <code>Catchup { base: 0, revision: Some(current) }</code>), <code>later_joiner_gets_the_session_data_of_its_base</code>, <code>live_base_requires_read_access</code>, <code>live_base_refuses_a_stale_position</code>, <code>live_base_is_not_cached</code>, <code>session_end_with_unsaved_entries_marks_the_file_behind</code>, <code>stored_checkpoint_clears_the_behind_mark</code> and <code>download_says_when_the_file_is_behind</code>.</li>
+<li><strong>Run:</strong> the focused server and records tests. Expected: fail; G4's room keeps the base session data unused (<code>_base_session_data</code>), and no route or flag exists.</li>
+<li><strong>Use the current file revision as the first base.</strong> When no verified live checkpoint exists, the room's base is the document's current revision at position 0 with no session data. If G4 already does this, keep the test as a guard.</li>
+<li><strong>Add the route.</strong> Check read access before anything else (viewers may read; they need the base to show the document). Answer only for the room's current base position, from the room's memory when a room is open and from the stored checkpoint row otherwise. Never parse the bytes.</li>
+<li><strong>Add the behind mark.</strong> A document is behind when its live log holds entries after the last stored revision's position. The document answer carries the mark; a download of the current revision adds the header <code>X-ShareCraft-Live-Behind: 1</code>; a session that ends behind records the event <code>live.file_behind</code> with positions only (the paper's "stored file is behind" event, &sect;11).</li>
+<li><strong>Run:</strong> focused tests, the content-route header tests and the records live suite. Expected: pass.</li>
+<li><strong>Commit:</strong> <code>G5.5: live base for joining editors and the behind mark</code>.</li>
+</ol>
+</div>
+
+<div class="task">
+<h3>Task 6 [ShareCraft]: the switch</h3>
+<p><strong>Files:</strong> modify <code>crates/server/src/config.rs</code>, <code>editors.rs</code>, <code>ws.rs</code>, <code>api/docs.rs</code>, <code>xtask/src/editors.rs</code>, <code>editors.toml</code>; extend <code>crates/server/tests/editors.rs</code>, <code>live_room.rs</code>, <code>documents.rs</code>.</p>
+<p><strong>Interfaces:</strong></p>
+<pre><code>SHARECRAFT_LIVE_EDITORS=gridcraft      // comma-separated; empty or unset: none
+
+// editors.toml, [gridcraft]
+live_format = "gridcraft/1"
+
+// installed editor.json, written by `cargo xtask editors build`
+"live": { "protocol": 1, "format": "gridcraft/1" }
+
+// document answer
+"session": "live" | "file" | "text"</code></pre>
+<ol class="steps">
+<li><strong>Write failing tests</strong> <code>live_editors_default_stays_empty</code>, <code>live_editors_reads_gridcraft</code>, <code>live_editors_refuses_editors_that_cannot_coauthor</code> (WordCraft, PdfCraft, SolidCraft and unknown names stop the server at start with a plain message), <code>live_room_needs_an_installed_live_editor</code>, <code>mismatched_live_protocol_keeps_the_file_session</code>, <code>document_answer_names_the_session_kind</code> and, in <code>xtask</code>, <code>manifest_records_the_live_format</code>.</li>
+<li><strong>Run:</strong> the focused tests. Expected: fail; the setting cannot be read and the manifest has no live field.</li>
+<li><strong>Read the setting.</strong> Follow the other <code>SHARECRAFT_*</code> settings in <code>config.rs</code>, with the error wording style already used there.</li>
+<li><strong>Check the installed editor.</strong> At start, a listed editor counts as live only if its manifest's <code>live.protocol</code> equals <code>LIVE_PROTOCOL</code>. Otherwise print one line saying so and keep the file session for its documents. Routing in <code>ws.rs</code> and the document answer use the same decision, so the page always picks the path the server will take.</li>
+<li><strong>Write the manifest field</strong> from <code>editors.toml</code>'s <code>live_format</code>; <code>cargo xtask check</code>'s installed-editor check also compares it.</li>
+<li><strong>Keep the switch safe.</strong> Changing the setting takes effect at restart, which ends every room; the existing registry rule that one document has one room kind stays. BUILDING.html (Task 15) says to switch only with the server stopped.</li>
+<li><strong>Run:</strong> the focused tests, the file-session and text-room suites. Expected: pass, with GridCraft documents still in the file session while the setting is empty.</li>
+<li><strong>Commit:</strong> <code>G5.6: switch for live editors, checked against the installed build</code>.</li>
+</ol>
+</div>
+
+<div class="task">
+<h3>Task 7 [GridCraft fork]: depend on ShareCraft by pinned git revision</h3>
+<p><strong>Files:</strong> modify <code>Cargo.toml</code>, <code>crates/engine/Cargo.toml</code>, <code>Cargo.lock</code>, <code>docs/coauthor-determinism.md</code>; add a test in the fork's <code>xtask</code>.</p>
+<ol class="steps">
+<li><strong>Precondition:</strong> ShareCraft Tasks 1&ndash;3 are committed and the owner has allowed the ShareCraft branch to be pushed. Note the full commit hash.</li>
+<li><strong>Write the failing test</strong> <code>workspace_has_no_path_dependency_outside_the_repository</code> in the fork's <code>xtask</code>: read <code>cargo metadata</code> and fail on any path dependency whose folder is outside the workspace root, naming it.</li>
+<li><strong>Run:</strong> <code>cargo test -p xtask workspace_has_no_path_dependency</code>. Expected: fails, naming <code>../ShareCraft/crates/collab-live</code>, <code>collab-core</code> and <code>protocol</code>.</li>
+<li><strong>Switch the source.</strong> Declare the three crates once in <code>[workspace.dependencies]</code> with <code>git = "https://github.com/ThineCraft/ShareCraft"</code> and the full <code>rev</code>, with the comment style the <code>craft-libs</code> lines use; make <code>crates/engine</code> use <code>workspace = true</code>. Update the lock file with <code>cargo update -p collab-live -p collab-core -p protocol</code> only. Licences stay MIT OR Apache-2.0.</li>
+<li><strong>Prove it builds alone.</strong> Clone the fork branch into an empty temporary folder with no ShareCraft beside it and run <code>cargo build -p gridcraft-engine --locked</code> and <code>cargo xtask wasm</code>. Expected: pass. This is also what ShareCraft's <code>cargo xtask editors build</code> needs, since it builds from a temporary worktree.</li>
+<li><strong>Document the local override.</strong> In <code>docs/coauthor-determinism.md</code>, show the <code>--config 'patch."https://github.com/ThineCraft/ShareCraft".collab-live.path="…"'</code> form (and the other two crates) for work on both repositories at once, with the rule that a committed lock file never points at a local path. Do not edit any <code>.cargo/config.toml</code>.</li>
+<li><strong>Run:</strong> <code>cargo xtask ci</code>. Expected: the four known base failures only.</li>
+<li><strong>Commit in the fork:</strong> <code>G5.7: depend on ShareCraft's live crates by git revision</code>.</li>
+</ol>
+</div>
+
+<div class="task">
+<h3>Task 8 [GridCraft fork]: shared per-sheet identity tables and the fragmentation limit (I7, fork part)</h3>
+<p><strong>Files:</strong> modify <code>crates/engine/src/coauthor/ids.rs</code>, <code>editor.rs</code>, <code>command.rs</code>; extend <code>crates/engine/tests/it/coauthor_live.rs</code> and <code>coauthor_timing.rs</code>.</p>
+<p><strong>Interfaces:</strong></p>
+<pre><code>pub struct WorkbookIds { /* per sheet: */ sheets: BTreeMap&lt;SheetId, Arc&lt;SheetIds&gt;&gt;, .. }
+// Changed through Arc::make_mut; serialised through the inner value, so session data is unchanged.
+
+TargetGone::TooFragmented   // the change does nothing everywhere; its author is told</code></pre>
+<ol class="steps">
+<li><strong>Write failing tests</strong> <code>snapshot_shares_unchanged_sheet_tables</code> (a snapshot after a change on one sheet points at the same tables for the others), <code>session_data_bytes_are_unchanged_by_sharing</code>, <code>fragmented_axis_entries_touch_few_runs</code> (1,000 <code>cell.set</code> entries on a 60,000-run axis stay under a fixed probe count), <code>structural_entry_over_the_block_cap_has_no_effect_everywhere</code> (two clients, a delete naming 2,000 alternate rows; both report no effect and the same entered fingerprint), <code>axis_at_the_run_cap_refuses_further_fragmentation</code>, <code>sender_refuses_an_over_cap_delete_before_sending</code> and <code>two_clients_agree_after_fragmentation_refusals</code>.</li>
+<li><strong>Run:</strong> <code>cargo test -p gridcraft-engine --test it coauthor_live fragment -- --nocapture</code>. Expected: fail.</li>
+<li><strong>Share tables between snapshots.</strong> Each sheet's row and column tables sit behind an <code>Arc</code>; a snapshot clones pointers; a change copies only the sheet it touches. Keep the session-data JSON byte-for-byte the same, proven by the test above.</li>
+<li><strong>Check fragmentation before applying.</strong> Before a structural shared command or a guarded structural Undo is applied, call <code>check_fragmentation</code> for its blocks; on refusal return <code>TargetGone::TooFragmented</code>, so <code>Effect::NoEffect</code> follows on every machine. The sender runs the same check before making the entry and gives the person the reason without sending.</li>
+<li><strong>Add the ignored release timing test</strong> <code>fragmented_axis_timing</code> (native, and wasm through <code>wasm_replay</code>'s runner in Task 14).</li>
+<li><strong>Run:</strong> all <code>coauthor_</code> tests, <code>save_reload_lossless</code>, the two-engine replay and the native/wasm replay. Expected: pass.</li>
+<li><strong>Commit in the fork:</strong> <code>G5.8: shared identity tables and a fragmentation limit</code>.</li>
+</ol>
+</div>
+
+<div class="task">
+<h3>Task 9 [GridCraft fork]: the engine's host surface</h3>
+<p><strong>Files:</strong> create <code>crates/engine/src/coauthor/host.rs</code> and <code>presence.rs</code>; modify <code>coauthor/mod.rs</code>, <code>editor.rs</code>, <code>command.rs</code>; create <code>crates/engine/tests/it/coauthor_host.rs</code> and register it in the <code>it</code> test crate.</p>
+<p><strong>Interfaces:</strong></p>
+<pre><code>pub enum Route { Shared, Local, Refused(&amp;'static str) }
+pub fn route(id: &amp;str) -&gt; Route;
+/// Fill sheet, range, rows or cols from the sender's own selection and active sheet.
+pub fn explicit_params(session: &amp;Session, id: &amp;str, params: Json) -&gt; Result&lt;Json, CoauthorError&gt;;
+
+pub enum LiveBase&lt;'a&gt; {
+    File { bytes: &amp;'a [u8] },
+    Checkpoint { bytes: &amp;'a [u8], session_data: &amp;'a [u8], stamp: Stamp },
+}
+pub struct Presence { pub sheet: SheetId, pub active: CellId, pub range: Option&lt;IdRange&gt;, pub editing: bool }
+pub struct ShownPresence { pub sheet: usize, pub active: (u32, u32), pub range: Option&lt;Rect&gt;, pub editing: bool }
+pub enum LiveNotice {
+    NotApplied { seq: Seq, kept_text: Option&lt;String&gt;, reason: NotAppliedReason },
+    ChangeRefused { reason: RefusedReason },
+    UndoLeft { cells: usize }, UndoRefused { reason: String },
+    Unshared { command: String },
+    Paused { entries: u64, bytes: u64 }, Resumed,
+    Returned { not_applied: usize }, ArchivedReturn,
+    OthersReturning { participant: ParticipantNo },
+    ReadOnly(bool), CannotOpen, Incompatible, BuildRefused, Removed,
+}
+
+impl GridCoauthor {
+    pub fn start(session: Session, base: LiveBase&lt;'_&gt;, config: LiveConfig) -&gt; Result&lt;Self, GridLiveError&gt;;
+    pub fn finish(self) -&gt; Session;                       // coauthoring = false
+    pub fn presence(&amp;mut self, now_ms: u64) -&gt; Option&lt;String&gt;;  // a frame when it changed
+    pub fn shown_presence(&amp;self, payload: &amp;str) -&gt; Option&lt;ShownPresence&gt;;
+    pub fn take_notices(&amp;mut self) -&gt; Vec&lt;LiveNotice&gt;;
+    pub fn can_edit(&amp;self) -&gt; bool;
+}</code></pre>
+<ol class="steps">
+<li><strong>Write failing tests</strong> <code>leaving_the_room_clears_coauthoring</code>, <code>macro_debugger_can_start_after_leaving</code>, <code>every_shared_command_routes_shared_and_view_commands_route_local</code>, <code>unshared_document_command_is_refused_with_a_reason</code>, <code>ui_defaults_become_explicit_targets</code>, <code>viewer_cannot_submit_but_can_move_its_own_view</code>, <code>starting_from_file_bytes_gives_every_client_the_same_identities</code>, <code>presence_round_trips_by_identity</code>, <code>presence_follows_a_remote_row_insert</code>, <code>presence_on_a_deleted_row_is_dropped</code>, <code>malformed_presence_is_ignored</code>, <code>no_effect_notice_keeps_the_typed_text</code> and <code>notice_debug_hides_the_kept_text</code>.</li>
+<li><strong>Run:</strong> <code>cargo test -p gridcraft-engine --test it coauthor_host -- --nocapture</code>. Expected: fail on the missing surface.</li>
+<li><strong>Routing.</strong> <code>Shared</code> is exactly <code>is_shared_command</code>. <code>Local</code> is the per-person list (selection, active cell, <code>sheet.activate</code>, next and previous sheet, scroll, zoom, frozen panes, gridlines, copy, find without replace). Everything else that can change the document is <code>Refused("Not available while editing together")</code>. Keep the list beside <code>is_shared_command</code>, with a test that every registered command falls into exactly one class.</li>
+<li><strong>Explicit targets</strong> read the sender's selection and active sheet once, on the sender's side, then hand a target-explicit command to <code>submit</code>. Received entries never pass through this function.</li>
+<li><strong>Start and finish.</strong> <code>start</code> builds the editor from a plain file (fresh identities, participant 0 runs) or a checkpoint (G4's <code>load_checkpoint</code>). <code>finish</code> ends the client and returns the session with <code>coauthoring</code> set to <code>false</code> (the G3 carry), dropping identities and personal history.</li>
+<li><strong>Presence.</strong> Encode the person's view by identity, at most once per change and no more than 10 a second; decode others' notes against the current agreed tables; drop a note whose row, column or sheet is gone; reject malformed or oversized notes without error. Presence never reads or changes the workbook.</li>
+<li><strong>Notices.</strong> Turn G3/G4 events into <code>LiveNotice</code> values. A not-applied cell edit keeps the text the person typed (G4 Task 11). Notices' <code>Debug</code> shows lengths, not text. In live mode, a viewer's <code>submit</code> returns <code>LocalError::ReadOnly</code> before anything is shown.</li>
+<li><strong>Run:</strong> all <code>coauthor_</code> tests and <code>tests::every_command_survives_empty_params</code>. Expected: pass.</li>
+<li><strong>Commit in the fork:</strong> <code>G5.9: GridCraft live host surface</code>.</li>
+</ol>
+</div>
+
+<div class="task">
+<h3>Task 10 [GridCraft fork]: the web bridge for live messages</h3>
+<p><strong>Files:</strong> create <code>apps/gridcraft-web/src/live.rs</code>; modify <code>host.rs</code>, <code>web.rs</code>, <code>main.rs</code>; tests inline in <code>live.rs</code> (native).</p>
+<p><strong>Messages</strong> (all <code>postMessage</code> between same-origin windows; the editor checks the parent's origin and that the message came from its parent):</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Direction</th><th>Type</th><th>Carries</th></tr></thead>
+<tbody>
+<tr><td>page &rarr; editor</td><td><code>gridcraft:live-start</code></td><td>document id, format expected, whether this tab may edit</td></tr>
+<tr><td>page &rarr; editor</td><td><code>gridcraft:live-open</code> / <code>live-closed</code></td><td>the socket opened or closed</td></tr>
+<tr><td>page &rarr; editor</td><td><code>gridcraft:live-frame</code></td><td>one server frame, as text, at most 1 MiB</td></tr>
+<tr><td>page &rarr; editor</td><td><code>gridcraft:live-tick</code></td><td>nothing; sent every minute and on visibility change</td></tr>
+<tr><td>page &rarr; editor</td><td><code>gridcraft:live-base</code></td><td>revision, position, file bytes, session data or none</td></tr>
+<tr><td>page &rarr; editor</td><td><code>gridcraft:live-people</code></td><td>participant, name, initials, colour, connected; at most 256</td></tr>
+<tr><td>page &rarr; editor</td><td><code>gridcraft:live-stop</code></td><td>leave now (page closing or access removed)</td></tr>
+<tr><td>editor &rarr; page</td><td><code>gridcraft:live-send</code></td><td>one frame to send</td></tr>
+<tr><td>editor &rarr; page</td><td><code>gridcraft:live-reset</code></td><td>an error kind; close and reconnect after back-off</td></tr>
+<tr><td>editor &rarr; page</td><td><code>gridcraft:live-load</code></td><td>revision and position of the base to fetch</td></tr>
+<tr><td>editor &rarr; page</td><td><code>gridcraft:live-checkpoint</code></td><td>ticket, position, base, file bytes, session data, SHA-256</td></tr>
+<tr><td>editor &rarr; page</td><td><code>gridcraft:live-hash</code></td><td>ticket, position, SHA-256</td></tr>
+<tr><td>editor &rarr; page</td><td><code>gridcraft:live-notice</code></td><td>one <code>LiveNotice</code>, as JSON</td></tr>
+<tr><td>editor &rarr; page</td><td><code>gridcraft:live-state</code></td><td>phase, waiting changes, may edit; answers every tick</td></tr>
+</tbody>
+</table>
+</div>
+<ol class="steps">
+<li><strong>Write failing tests</strong> <code>live_messages_parse_and_bound_their_fields</code>, <code>frames_over_a_mebibyte_are_refused</code>, <code>unknown_live_messages_are_ignored</code>, <code>people_lists_over_256_are_refused</code>, <code>checkpoint_message_names_ticket_position_and_hash</code>, <code>client_error_asks_the_page_to_reconnect</code>, <code>ticks_without_drawing_send_heartbeats</code>, <code>frames_apply_without_drawing</code>, <code>crash_note_round_trips</code> and <code>every_tick_is_answered_with_state</code>. Parse into a native <code>LivePageMsg</code> from <code>serde_json::Value</code> so the tests run without a browser; the <code>web-sys</code> layer only converts.</li>
+<li><strong>Run:</strong> <code>cargo test -p gridcraft-web live</code>. Expected: fail.</li>
+<li><strong>Hold the live seat beside the app.</strong> The seat (<code>GridCoauthor</code> plus outbox) is shared between the message handler and the egui app as <code>Rc&lt;RefCell&lt;…&gt;&gt;</code>. The handler borrows with <code>try_borrow_mut</code>; if the app holds it, the message is queued and handled at the start of the next frame or the next message. Frames, ticks and checkpoint tickets are handled in the handler, so nothing waits for drawing; the handler requests a repaint afterwards.</li>
+<li><strong>Checkpoints and hashes.</strong> On a write ticket, call G4's <code>GridCoauthor::checkpoint</code> and post the bytes, session data and SHA-256; on a verify ticket, post only the hash. A failure posts nothing and sends <code>CheckpointFailed</code>.</li>
+<li><strong>Crash note.</strong> Before applying a received entry, write its position under <code>gridcraft-live-applying:&lt;document id&gt;</code> in the frame's session storage; clear it after. At start, a note found there becomes <code>LiveConfig.crashed_at</code>. Storage failures are logged without content and do not stop the session.</li>
+<li><strong>Errors.</strong> A <code>ClientError</code> posts <code>live-reset</code> with its kind only; the page does the waiting. Log lines name kinds and positions, never names or text (the fork's share of Task 2).</li>
+<li><strong>Keep the existing contract.</strong> <code>gridcraft:ready</code>, <code>open</code>, <code>save</code>, <code>dirty</code> and <code>failed</code> behave as today. In live mode the editor does not post <code>save</code> for its own Save (Task 11) and reports <code>dirty</code> as false.</li>
+<li><strong>Run:</strong> the focused tests, <code>cargo xtask wasm</code> and the web app's existing tests. Expected: pass; no JavaScript file is added.</li>
+<li><strong>Commit in the fork:</strong> <code>G5.10: live messages between the page and GridCraft</code>.</li>
+</ol>
+</div>
+
+<div class="task">
+<h3>Task 11 [GridCraft fork]: live mode on the screen</h3>
+<p><strong>Files:</strong> create <code>crates/ui-egui/src/live.rs</code>; modify <code>app/mod.rs</code>, <code>app/commands.rs</code>, <code>app/view.rs</code>, <code>app/editing.rs</code>, <code>grid/menus.rs</code>, <code>grid/interact.rs</code>, <code>form_controls.rs</code> and the grid drawing module; tests in <code>crates/ui-egui</code>, using the offscreen snapshot path for drawing.</p>
+<ol class="steps">
+<li><strong>Write failing tests</strong> <code>live_mode_sends_shared_commands_through_the_coauthor</code>, <code>live_mode_runs_view_commands_locally</code>, <code>live_mode_refuses_unshared_commands_with_a_notice</code>, <code>live_undo_and_redo_use_personal_history</code>, <code>filter_menu_goes_through_the_entry_point_when_live</code>, <code>control_and_object_drags_do_not_trim_shared_history</code>, <code>live_view_state_is_not_written_into_the_workbook</code>, <code>live_save_does_not_upload_a_file</code>, <code>read_only_live_mode_refuses_edits_and_keeps_navigation</code>, <code>cell_draft_is_sent_only_on_enter</code>, <code>others_selections_are_drawn_with_initials</code> and <code>disconnected_places_are_not_drawn</code>.</li>
+<li><strong>Run:</strong> <code>cargo test -p gridcraft-ui-egui live</code>. Expected: fail.</li>
+<li><strong>Lend the session for each live call.</strong> <code>SheetApp</code> keeps its <code>session</code> field, so its hundreds of readers stay unchanged. Around each <code>GridCoauthor</code> call, swap the app's session with the coauthor's (a move of the struct, not a copy), call, and swap back. Between calls the app reads the shown workbook as now.</li>
+<li><strong>Route commands.</strong> In <code>run_command</code>, when live: <code>Shared</code> goes through <code>explicit_params</code> then <code>submit</code>; <code>Local</code> runs as today; <code>Refused</code> posts a notice; <code>edit.undo</code> and <code>edit.redo</code> call the personal history. A cell draft stays private until Enter (Q2), then becomes one <code>cell.set</code>.</li>
+<li><strong>Close the direct writes.</strong> In live mode: the filter menu runs <code>data.filterBy</code> through the router; <code>store_view_state</code> does not write the person's view into the shared workbook (the stored view is restored only in checkpoints, C11); the form-control and object-drag undo trimming are skipped, since those commands are not shared. The macro debugger stays refused (G3).</li>
+<li><strong>Save.</strong> File &rsaquo; Save and Ctrl+S do not post a file in live mode; they leave a status notice, because checkpoints are automatic. Export as PDF still works.</li>
+<li><strong>Read-only.</strong> When the coauthor says the person may not edit, editing commands are refused before anything is shown, the cell editor does not open, and navigation, selection and copy keep working.</li>
+<li><strong>Draw other people.</strong> For each connected person with presence on the shown sheet, draw a 2-pixel outline round their selection and active cell in their assigned colour, a tag with their initials at the active cell's top-left, their name on hover, a small pencil mark when they are typing, and a dashed outline for viewers. Colours come from the page; text colour is chosen for contrast. Nothing is drawn for a person without a connection.</li>
+<li><strong>Run:</strong> the focused tests, the existing UI tests and the snapshot example. Look at the snapshot PNG. Expected: pass; outside live mode nothing changes.</li>
+<li><strong>Commit in the fork:</strong> <code>G5.11: live mode on the GridCraft screen</code>.</li>
+</ol>
+</div>
+
+<div class="task">
+<h3>Task 12 [ShareCraft]: the frame page carries the live session</h3>
+<p><strong>Files:</strong> create <code>web/live-host.js</code> and <code>web/live-host.test.mjs</code>; modify <code>web/file.js</code> and <code>web/editor-host.js</code>.</p>
+<p><strong>Interfaces:</strong></p>
+<pre><code>export function liveRetry(state, event, random = Math.random)   // pure: { wait, attempt, stopped, lastError }
+export function parseLiveEditorMessage(prefix, data)            // pure: a known message or null
+export function peekServerFrame(text)                           // pure: { type, … } for the named few, else null
+export function connectLive(frame, bridge, docId, handlers)     // needs the page</code></pre>
+<ol class="steps">
+<li><strong>Write failing tests</strong> <code>live_retry_doubles_to_sixty_seconds_with_spread</code>, <code>live_retry_stops_after_five_identical_client_errors</code>, <code>live_retry_resets_once_live</code>, <code>editor_live_messages_with_another_prefix_are_ignored</code>, <code>malformed_live_messages_are_ignored</code>, <code>frames_pass_through_unchanged</code>, <code>page_peeks_only_at_named_server_messages</code>, <code>base_load_fetches_revision_and_session_data</code>, <code>checkpoint_upload_uses_the_ticket_and_base</code>, <code>hash_is_posted_for_a_verify_ticket</code>, <code>leave_is_sent_when_the_page_closes</code> and <code>watchdog_offers_reload_after_fifteen_silent_seconds</code>, using stand-in editors and sockets as <code>editor-host.test.mjs</code> does.</li>
+<li><strong>Run:</strong> <code>node --test web/live-host.test.mjs</code>. Expected: fail; the module does not exist.</li>
+<li><strong>Choose the path.</strong> <code>file.js</code> reads <code>session</code> from the document answer (Task 6). For <code>"live"</code> it does not send the file-session <code>join</code>; it waits for the editor's <code>ready</code>, sends <code>live-start</code>, opens the socket, and from then on relays. Other documents keep today's path untouched.</li>
+<li><strong>Relay without understanding.</strong> Every text frame from the socket goes to the editor as <code>live-frame</code>; every <code>live-send</code> goes to the socket. The page parses a frame only to peek at <code>people</code>, <code>access</code>, <code>removed</code>, <code>expired</code>, <code>incompatible</code>, <code>build_refused</code>, <code>cannot_open</code>, <code>changes_paused</code>, <code>changes_resumed</code>, <code>returning</code> and <code>saved</code>; it never peeks at entries or presence.</li>
+<li><strong>Back-off.</strong> On socket close or <code>live-reset</code>, use <code>liveRetry</code> (Proposal 4). <code>removed</code> stops for good through the existing <code>stopRemoved</code>.</li>
+<li><strong>Ticks and visibility.</strong> Post <code>live-tick</code> every 60 seconds and on <code>visibilitychange</code>. If no <code>live-state</code> answers within 15 seconds while the tab is shown, offer "Reload editor"; reload the frame automatically at most three times.</li>
+<li><strong>Base and checkpoints.</strong> On <code>live-load</code>, fetch the revision through the existing content route (or none) and the session data from <code>/live-base</code>, then post <code>live-base</code>. On <code>live-checkpoint</code>, upload through G4's live-checkpoint route with the ticket, position and base; on <code>live-hash</code>, post the hash. Upload failures are reported to the editor as a failed ticket; the room picks another writer.</li>
+<li><strong>Leaving.</strong> On <code>pagehide</code> that is not kept in the back/forward cache, send <code>{"type":"leave"}</code> on the socket and <code>live-stop</code> to the editor.</li>
+<li><strong>Run:</strong> <code>node --test web/*.test.mjs</code> and <code>cargo xtask check</code>. Expected: pass.</li>
+<li><strong>Commit:</strong> <code>G5.12: the frame page carries GridCraft's live session</code>.</li>
+</ol>
+</div>
+
+<div class="task">
+<h3>Task 13 [ShareCraft]: people, notices and status in the frame</h3>
+<p><strong>Files:</strong> modify <code>web/editor-frame.js</code>, <code>web/editor-frame.test.mjs</code>, <code>web/live-host.js</code>, <code>web/live-host.test.mjs</code>, <code>web/file.js</code>, <code>web/style.css</code>.</p>
+<ol class="steps">
+<li><strong>Write failing tests</strong> <code>presence_hides_places_without_a_connection</code>, <code>presence_shows_viewers_as_read_only</code>, <code>live_people_carry_colour_and_initials_for_the_editor</code>, <code>live_notice_wording_for_each_kind</code> (one row per <code>LiveNotice</code> and peeked server message), <code>not_applied_notice_offers_to_copy_the_kept_text</code>, <code>paused_notice_asks_to_keep_the_tab_open_only_when_needed</code>, <code>returning_notice_says_the_earlier_version_is_kept</code>, <code>owner_sees_the_checkpoint_mismatch_notice</code>, <code>status_words_for_live_states</code>, <code>download_says_when_the_stored_file_is_behind</code> and <code>one_banner_at_a_time_with_at_most_two_actions</code>.</li>
+<li><strong>Run:</strong> <code>node --test web/editor-frame.test.mjs web/live-host.test.mjs</code>. Expected: fail.</li>
+<li><strong>People.</strong> <code>presenceModel</code> leaves out anyone whose <code>connected</code> is <code>false</code> (Proposal 7), keeps "(read only)" for viewers, and the page posts <code>live-people</code> to the editor with the colour <code>avatarColour</code> already gives each account.</li>
+<li><strong>Notices.</strong> One banner under the bar, as the concept says: the newest important notice wins, at most two actions, <code>role="status"</code> for information and <code>role="alert"</code> for stops. Plain wording, for example: "Your change to B5 wasn't applied because someone deleted that row. Your text is kept." with Copy text; "Changes are paused until the latest version is saved." (with "Keep this tab open" only when this tab is the only editor); "Ann's changes made while she was away are arriving. The version before them is kept."; "This editor is out of date. Reload to keep working together."; "Editing together isn't available in the desktop app yet."</li>
+<li><strong>Status.</strong> The bar's status follows <code>saved</code>, ticket and pause messages: Saved, Saving&hellip;, Unsaved changes kept, Offline &mdash; changes kept, Read only. There is no Save button for a live document (Proposal 14). Download notes "The stored file doesn't include the latest changes yet" when the document answer or header says it is behind.</li>
+<li><strong>Owners' fault notice.</strong> When a <code>saved</code> message reports a mismatch and this person may manage the document, show "Two editors saved different files for the same changes. Both are in the history." with a link to Activity.</li>
+<li><strong>Check the look</strong> in light and dark and at 375 pixels with the stand-in page the frame tests use; banners keep contrast of at least 4.5:1.</li>
+<li><strong>Run:</strong> all web tests and <code>cargo xtask check</code>. Expected: pass.</li>
+<li><strong>Commit:</strong> <code>G5.13: people, notices and status for live documents</code>.</li>
+</ol>
+</div>
+
+<div class="task">
+<h3>Task 14 [ShareCraft + GridCraft fork]: re-run the browser proofs in real browsers</h3>
+<p><strong>Files:</strong> GridCraft updates <code>docs/coauthor-determinism.md</code>; ShareCraft updates <code>gridcraft-coauthoring-proofs.html</code> (version 0.3).</p>
+<ol class="steps">
+<li><strong>Build the browser tests</strong> in the fork for <code>wasm32-unknown-unknown</code>: <code>wasm_matches_native_fixtures</code>, the maths grid, the ignored rollback timing tests and Task 8's <code>fragmented_axis_timing</code>.</li>
+<li><strong>Serve them for a real browser</strong> with the already-installed <code>wasm-bindgen-test-runner</code> in its interactive mode (<code>NO_HEADLESS=1</code>), which serves the tests on a local address instead of running them under Node. Nothing is downloaded.</li>
+<li><strong>Run them in Chromium and Chrome.</strong> Open the address in the built-in browser and in Claude in Chrome; record each test's result and each timing.</li>
+<li><strong>Ask the owner for Edge and Firefox.</strong> Give the address and what to read out. If the owner prefers a browser driver instead, ask first, naming the file, source and size.</li>
+<li><strong>Record the results</strong> in the proofs report's &sect;10 G5 row and a new section, browser by browser, with what was not run. Do not change the G1 measurements.</li>
+<li><strong>Commit separately by repository:</strong> GridCraft <code>G5.14: real-browser proof results</code>; ShareCraft <code>G5.14: proofs report v0.3, real browsers</code>.</li>
+</ol>
+</div>
+
+<div class="task">
+<h3>Task 15 [ShareCraft + GridCraft fork]: install, switch on, the A07/A17 acceptance run, documents and final gates</h3>
+<p><strong>Files:</strong> ShareCraft <code>editors.toml</code>, <code>BUILDING.html</code> (sections 13&ndash;15, 21 and 32), <code>co-authoring-approach.html</code> (version 1.4, G5 build notes only), <code>sequencing.html</code>, <code>editors.html</code>; GridCraft <code>docs/gaps.md</code> &sect;16, <code>docs/roadmap.md</code>, <code>ROADMAP.md</code>.</p>
+<ol class="steps">
+<li><strong>Gates first.</strong> Fork: <code>cargo xtask ci</code> (report the four known base failures separately). ShareCraft: <code>cargo xtask check</code> (report the known intermittent <code>library_kinds</code> test separately if it appears).</li>
+<li><strong>Build and install the editor.</strong> Record the <code>coauthor-g5</code> commit and <code>live_format</code> in <code>editors.toml</code>; run <code>cargo xtask editors build gridcraft</code> twice from clean and compare the installed files' hashes (A17's reproducible build); install; check the manifest has the live field and <code>NOTICE</code> and <code>ATTRIBUTION.md</code> are present (A17's retained notices).</li>
+<li><strong>Switch on in development only.</strong> Stop the server, set <code>SHARECRAFT_LIVE_EDITORS=gridcraft</code> in the development <code>.env</code> (without printing it), start the server built in this session, and confirm a GridCraft document's answer says <code>"session": "live"</code>.</li>
+<li><strong>Two people, two browsers.</strong> Ann in the built-in browser at <code>http://localhost:8787</code>; Bob in Claude in Chrome at <code>http://127.0.0.1:8787</code>. Use the development test accounts; ask before reading their stored passwords, or create fresh accounts with the server's <code>add-user</code> command.</li>
+<li><strong>Run the A07 checks</strong> and record each as passed, failed or not run:
+<ul class="band">
+<li>Both open the same GridCraft file from a library; both see each other in the bar and each other's selection in the grid.</li>
+<li>Simultaneous substantive edits: values, formulas referring across rows, formatting, a filter, row and column inserts and deletes, a sheet rename; both end with the same cells (read through the page's <code>window.gridcraft</code> interface).</li>
+<li>Conflicts: both type in one cell (the later stands, the other sees it change); Bob edits a row Ann deletes (Bob's change does nothing, the notice offers his text); both insert rows at the same place (both sets kept).</li>
+<li>Personal Undo: Ann undoes her own change while Bob's later change stays.</li>
+<li>Save status: Saving&hellip; then Saved; a revision appears with both people credited.</li>
+<li>Read only: Bob made a viewer; his edits are refused before they show; he still sees Ann's changes and selection.</li>
+<li>Interruption and reconnect: stop the server for twenty seconds with changes waiting in both tabs; both show Offline &mdash; changes kept, reconnect with growing waits, and nothing is lost or doubled.</li>
+<li>Hidden tab: Bob's tab in the background for five minutes while Ann edits; Bob keeps his place and is up to date when shown.</li>
+<li>Revocation: Ann removes Bob's access; Bob's editor is taken off his screen at once and his presence disappears for Ann.</li>
+<li>Reopen: both close the file; reopen it; the content matches what was last seen and the download is not marked behind.</li>
+</ul></li>
+<li><strong>Inspect the stored result (A17).</strong> In the data folder's Git repository and through the revisions API, read the newest revisions' JSON metadata: every contributor credited, <code>verified</code> true after the second hash, <code>live_through</code> set, no <code>major</code> unless a return happened. Record the commit ids.</li>
+<li><strong>Record what only automated tests cover:</strong> returning after expiry and the 30-day archive, log-limit pause, crash cancellation, checkpoint mismatch and stale-base recovery.</li>
+<li><strong>Update ShareCraft documents.</strong> BUILDING.html: the switch, the manifest check, the frame's live path, the live-base route, the behind mark, presence (not stored or logged), back-off, notices, events, and how to turn it off again. Approach v1.4: factual G5 build notes and the proposals as built, with no change to C1&ndash;C23. Sequencing: the progress note, saying exactly which A07 and A17 checks ran in which browser. editors.html: GridCraft's capability matrix (live co-authoring in the browser; not on the desktop), the fork mapping and base, and update instructions including re-pinning ShareCraft.</li>
+<li><strong>Update GridCraft documents.</strong> gaps.md &sect;16: user-facing co-authoring in ShareCraft's browser frame; I7 resolved with its limits; still missing: desktop sessions and the maths library, large content, unshared commands, Show Changes. Roadmap and ROADMAP.md progress lines with their dates.</li>
+<li><strong>Leave the built-in default empty</strong> and say in the report that production stays off until the owner decides.</li>
+<li><strong>Commit separately by repository:</strong> ShareCraft <code>G5.15: GridCraft live co-authoring switched on in development, A07/A17 run</code>; GridCraft <code>G5.15: co-authoring connected to ShareCraft</code>. Do not push or merge without the owner's yes.</li>
+</ol>
+</div>
+
+<h2>Spec coverage</h2>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Binding requirement</th><th>Plan coverage</th></tr></thead>
+<tbody>
+<tr><td>C1/C4/S6: the server orders opaque entries; no editor process on the server.</td><td>Architecture; Global constraints; Tasks 4&ndash;6 add only opaque relay, routing and HTTP hand-over.</td></tr>
+<tr><td>&sect;04 and C21: a heartbeat every minute; a short drop costs nothing; three minutes to expiry.</td><td>Proposal 3; Tasks 10 and 12 (ticks without drawing, back-off); acceptance hidden-tab and reconnect checks.</td></tr>
+<tr><td>&sect;04 and C8: a change that cannot apply does nothing; its author is told and keeps the text.</td><td>Tasks 9, 11 and 13; acceptance conflict checks.</td></tr>
+<tr><td>&sect;04 and C22: others are told about a return; the returning person sees what did not apply.</td><td>Proposal 17; Tasks 1, 4, 9 and 13; G4 builds the versions.</td></tr>
+<tr><td>C3: a reloaded editor reports the entry it stopped in.</td><td>Proposal 15; Tasks 10 and 12.</td></tr>
+<tr><td>&sect;05 and C6: participant checkpoints and second hashes; faults shown to the owner.</td><td>Tasks 10 and 12 connect G4's tickets; Proposal 16 and Task 13.</td></tr>
+<tr><td>&sect;05: joiners build from the last verified revision, its session data and the entries since; a new room starts from the file.</td><td>Proposal 11; Task 5; Task 9's <code>start</code>.</td></tr>
+<tr><td>&sect;05 and C4: with nobody connected, downloads and the feed say the stored file is behind.</td><td>Task 5 (mark, header, event); Task 13 (wording).</td></tr>
+<tr><td>&sect;07 and C11: view state per person; nothing personal read when applying.</td><td>Global constraints; Tasks 9 and 11.</td></tr>
+<tr><td>&sect;08 and C12: personal Undo; the screen's own undo edits moved off the shared list.</td><td>Task 11.</td></tr>
+<tr><td>&sect;10: presence envelope in the library, drawing in the fork; viewers cannot change the document.</td><td>Proposals 5&ndash;8; Tasks 1, 4, 9, 11 and 13.</td></tr>
+<tr><td>&sect;11: presence opaque; events for the stored file being behind; desktop clients on the same terms.</td><td>Tasks 1, 4 and 5; Proposal 12 and Task 4 keep desktop out as &sect;12 requires.</td></tr>
+<tr><td>&sect;12: notices in the frame page for accessibility.</td><td>Architecture; Task 13 (roles, contrast, one banner).</td></tr>
+<tr><td>&sect;12 and C5/C16: desktop stays out until one maths library.</td><td>Proposal 12; Task 4; Not in this plan.</td></tr>
+<tr><td>C13 and Q2: changes shown at once; cell typing reaches others after Enter.</td><td>Task 11 (<code>cell_draft_is_sent_only_on_enter</code>); Proposal 5's typing mark.</td></tr>
+<tr><td>C14: the session is pinned to a protocol and format; another version is told to reload.</td><td>Task 6 (manifest check); Task 13 (reload notice).</td></tr>
+<tr><td>C17: other editors keep the one editing seat.</td><td>Task 6 refuses them in the setting.</td></tr>
+<tr><td>C19: pause with a notice; people may be asked to bring a tab forward.</td><td>Proposal 3; Task 13.</td></tr>
+<tr><td>Open item I7 and proofs &sect;10: index, share and bound identity tables, with a timing test on a fragmented axis.</td><td>Proposal 9; Tasks 3 and 8; Task 14 records timings.</td></tr>
+<tr><td>Proofs &sect;10: re-run the browser checks and timings in Chrome, Edge and Firefox; connect the host.</td><td>Proposal 19; Task 14; Tasks 10&ndash;12.</td></tr>
+<tr><td>G2 review, before G5: back-off after client errors; places with no connection; names in <code>Debug</code>.</td><td>Proposals 4 and 7; Tasks 2, 4, 12 and 13.</td></tr>
+<tr><td>G3 ruling: the fork's sibling-path dependency becomes a git or published dependency.</td><td>Proposal 10; Task 7.</td></tr>
+<tr><td>G3 review minor: <code>Session::coauthoring</code> is cleared when a session leaves a room.</td><td>Task 9 (<code>finish</code>, two tests).</td></tr>
+<tr><td>Switching the room on for GridCraft through <code>Config.live_editors</code>.</td><td>Proposal 13; Tasks 6 and 15.</td></tr>
+<tr><td>A07 for GridCraft: two authorised people, simultaneous edits, presence, save status, read-only, reconnect, conflicts, revocation, reopening without loss.</td><td>Task 15's checklist, with what only automated tests cover listed.</td></tr>
+<tr><td>A17 for GridCraft: mapping and base, notices, reproducible build, deployed collaboration parts, launch adapter, A07 in two browser sessions, revision and JSON metadata, maintenance instructions, capability matrix.</td><td>Tasks 6, 7 and 15.</td></tr>
+<tr><td>S5: lost access ends the session at once and cancels tickets.</td><td>Existing room rules; Task 4 clears presence; acceptance revocation check.</td></tr>
+<tr><td>S7: events, positions and counts only.</td><td>Task 5 (<code>live.file_behind</code>); Global constraints; Task 4 keeps presence out of events.</td></tr>
+<tr><td>Fork rules: no panic or <code>unsafe</code>, hostile input bounded, Rust only, web build kept, no CI change, no attribution.</td><td>Global constraints; Tasks 7&ndash;11.</td></tr>
+</tbody>
+</table>
+</div>
+
+</main></body></html>

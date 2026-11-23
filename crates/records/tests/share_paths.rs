@@ -12,7 +12,7 @@ use records::test_support::TestDb;
 use records::{
     AccessError, DEFAULT_SOURCE_MAX_FILES, PathRefusal, SHARE_CACHE_MAX_BYTES, SHARE_LIST_SECONDS,
     SHARE_ROOTS, SOURCE_MAX_FILES, SharePath, approved_root, hidden_by_default, reserved_name,
-    valid_root, windows_safe_name,
+    usable_here, usable_on, valid_root, windows_safe_name,
 };
 use serde_json::json;
 
@@ -239,6 +239,29 @@ fn a_whole_drive_or_bare_admin_share_is_not_a_valid_root() {
 }
 
 #[test]
+fn the_whole_posix_file_system_is_not_a_valid_root_but_a_mount_point_is() {
+    assert_eq!(
+        valid_root(&SharePath::parse("/").unwrap()),
+        Err(PathRefusal::WholeDrive)
+    );
+    assert!(valid_root(&SharePath::parse("/mnt/share").unwrap()).is_ok());
+}
+
+#[test]
+fn unc_and_drive_paths_are_usable_only_on_windows() {
+    let unc = SharePath::parse(r"\\server\share\folder").unwrap();
+    let drive = SharePath::parse(r"C:\approved").unwrap();
+    let posix = SharePath::parse("/mnt/share").unwrap();
+    for path in [&unc, &drive, &posix] {
+        assert_eq!(usable_on(path, true), Ok(()));
+    }
+    assert_eq!(usable_on(&unc, false), Err(PathRefusal::OtherSystem));
+    assert_eq!(usable_on(&drive, false), Err(PathRefusal::OtherSystem));
+    assert_eq!(usable_on(&posix, false), Ok(()));
+    assert_eq!(usable_here(&unc).is_ok(), cfg!(windows));
+}
+
+#[test]
 fn nothing_is_approved_when_there_are_no_roots() {
     assert_eq!(
         approved_root(&SharePath::parse(r"C:\folder").unwrap(), &[]),
@@ -416,4 +439,87 @@ async fn share_settings_have_defaults_and_read_back() {
             .collect::<Vec<_>>(),
         [r"C:\approved", r"C:\also-approved"]
     );
+}
+
+#[tokio::test]
+async fn setting_batch_validates_every_key_before_changing_any() {
+    let test = TestDb::create().await;
+    let admin = user(&test, "BatchAdmin", true).await;
+    test.db
+        .set_setting(admin.id, SHARE_LIST_SECONDS, json!(120))
+        .await
+        .unwrap();
+
+    assert!(
+        test.db
+            .set_settings(
+                admin.id,
+                vec![
+                    (SHARE_LIST_SECONDS, json!(180)),
+                    ("not_a_setting", json!(true)),
+                ],
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        test.db.setting(SHARE_LIST_SECONDS).await.unwrap(),
+        Some(json!(120))
+    );
+}
+
+#[tokio::test]
+async fn a_failed_write_in_a_setting_batch_leaves_every_key_unchanged() {
+    let test = TestDb::create().await;
+    let admin = user(&test, "AtomicAdmin", true).await;
+    test.db
+        .set_setting(admin.id, SHARE_LIST_SECONDS, json!(120))
+        .await
+        .unwrap();
+    let pool = test.db.test_pool();
+    // Both values pass validation; the second write is refused by the database itself.
+    assert_eq!(SHARE_CACHE_MAX_BYTES, "share_cache_max_bytes");
+    sqlx::query(
+        "create function fail_setting_write() returns trigger language plpgsql as $$ \
+         begin if new.key = 'share_cache_max_bytes' then \
+         raise exception 'injected settings failure'; end if; return new; end $$",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "create trigger fail_setting_write before insert or update on settings \
+         for each row execute function fail_setting_write()",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let events_before: i64 =
+        sqlx::query_scalar("select count(*) from events where kind = 'setting.changed'")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert!(
+        test.db
+            .set_settings(
+                admin.id,
+                vec![
+                    (SHARE_LIST_SECONDS, json!(180)),
+                    (SHARE_CACHE_MAX_BYTES, json!(512_u64 * 1024 * 1024)),
+                ],
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        test.db.setting(SHARE_LIST_SECONDS).await.unwrap(),
+        Some(json!(120))
+    );
+    let events_after: i64 =
+        sqlx::query_scalar("select count(*) from events where kind = 'setting.changed'")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(events_after, events_before);
 }

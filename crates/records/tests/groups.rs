@@ -1307,16 +1307,17 @@ async fn upgrade_keeps_everyones_access() {
     // Plan 1's access, worked out by this plan's code with no group membership at all: an
     // empty stand-in for the table the upgrade makes, for the recycle bin's column that the
     // access decision reads (nothing was purged before the bin), and for the sites' own rows
-    // it reads for the archive (nothing was archived before sites had settings).
+    // it reads for the archive (nothing was archived before sites had settings), and for the
+    // source items a listing joins for a file-share item's time (no library had a source).
     sqlx::raw_sql(
-        "create table group_members (group_id uuid, user_id uuid);          alter table nodes add column purged_at timestamptz;          create table sites (id uuid primary key, archived_at timestamptz);",
+        "create table group_members (group_id uuid, user_id uuid);          alter table nodes add column purged_at timestamptz;          create table sites (id uuid primary key, archived_at timestamptz);          create table source_items (node_id uuid, modified_at timestamptz);",
     )
     .execute(test.db.test_pool())
     .await
     .unwrap();
     let before = everything(&test.db, &people, &nodes).await;
     sqlx::raw_sql(
-        "drop table group_members; alter table nodes drop column purged_at; drop table sites;",
+        "drop table group_members; alter table nodes drop column purged_at; drop table sites;          drop table source_items;",
     )
     .execute(test.db.test_pool())
     .await
