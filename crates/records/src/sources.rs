@@ -922,6 +922,28 @@ impl Db {
             sqlx::query("select pg_advisory_xact_lock(hashtextextended('s3-connection', 0))")
                 .execute(&mut *tx)
                 .await?;
+            // The endpoint's approval is read again under the lock, and its setting row is
+            // held `FOR SHARE` until the commit: a settings change that removes the endpoint
+            // either commits first (and is seen here) or waits for this connection to commit.
+            if !place.endpoint.starts_with("aws:") {
+                let approved: Option<serde_json::Value> =
+                    sqlx::query_scalar("select value from settings where key = $1 for share")
+                        .bind(crate::s3_endpoints::S3_ENDPOINTS)
+                        .fetch_optional(&mut *tx)
+                        .await?;
+                let named = approved
+                    .as_ref()
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|entries| {
+                        entries.iter().any(|entry| {
+                            entry.get("name").and_then(serde_json::Value::as_str)
+                                == Some(place.endpoint.as_str())
+                        })
+                    });
+                if !named {
+                    return Err(AccessError::S3EndpointNotApproved);
+                }
+            }
             let prefixes: Vec<String> = sqlx::query_scalar(
                 "select prefix from source_s3 \
                  where endpoint = $1 and bucket = $2 and library_id <> $3",
@@ -1039,6 +1061,15 @@ impl Db {
         recompute_site_usage(&mut tx, site).await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    /// How many libraries are connected through each S3 endpoint, by the endpoint's name.
+    pub async fn s3_endpoints_in_use(&self) -> Result<Vec<(String, i64)>, DbError> {
+        Ok(sqlx::query_as(
+            "select endpoint, count(*) from source_s3 group by endpoint order by endpoint",
+        )
+        .fetch_all(self.pool())
+        .await?)
     }
 
     /// Where the bucket of the S3 library `library` is; `None` if it is not connected to one.

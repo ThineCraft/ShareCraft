@@ -246,6 +246,9 @@ pub enum AccessError {
     /// Another library uses the same or an overlapping file-share location.
     #[error("that file-share location is already in use")]
     ShareLocationInUse,
+    /// The S3 endpoint named is not (or no longer) approved by an administrator.
+    #[error("that S3 endpoint is not approved")]
+    S3EndpointNotApproved,
     #[error("a document with that id already exists")]
     Exists,
     #[error("something with that name is already in that place")]

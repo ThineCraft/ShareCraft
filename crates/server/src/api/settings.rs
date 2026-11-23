@@ -1,12 +1,14 @@
 //! The organisation's settings: sharing (whether anyone links may be made and used, and how
 //! long one may last), the regional defaults of sites (language and time zone), the file
-//! types blocked everywhere, and the malware scanner.
+//! types blocked everywhere, the malware scanner, the approved file shares and the approved
+//! S3 endpoints with their default budgets.
 
 use axum::Json;
 use axum::extract::State;
 use records::{
-    ANYONE_LINK_MAX_DAYS, ANYONE_LINKS, DEFAULT_LANGUAGE, DEFAULT_TIME_ZONE, PathRefusal,
-    RegionalDefaults, SCANNER_MAX_BYTES, SCANNER_TIMEOUT_SECONDS, SCANNER_TOO_LARGE,
+    ANYONE_LINK_MAX_DAYS, ANYONE_LINKS, DEFAULT_LANGUAGE, DEFAULT_TIME_ZONE, EndpointRefusal,
+    IpRange, PathRefusal, RegionalDefaults, S3_BYTES_DOWN, S3_ENDPOINTS, S3_LIST_REQUESTS,
+    S3_READ_REQUESTS, S3Endpoint, SCANNER_MAX_BYTES, SCANNER_TIMEOUT_SECONDS, SCANNER_TOO_LARGE,
     SCANNER_UNAVAILABLE, SCANNER_URL, SHARE_CACHE_MAX_BYTES, SHARE_LIST_SECONDS, SHARE_ROOTS,
     SOURCE_MAX_FILES, ScannerSettings, SharePath, SharingSettings, usable_here, valid_root,
     valid_scanner_setting, validate_language, validate_time_zone,
@@ -188,6 +190,235 @@ pub(crate) async fn change_shares(
         .await?;
     drop(roots_turn.take());
     Ok(Json(shares_out(&state).await?))
+}
+
+/// The most approved S3 endpoints, as the records layer allows.
+const MAX_S3_ENDPOINTS: usize = 20;
+
+/// The word an answer gives for an endpoint refusal.
+fn refusal_word(refusal: EndpointRefusal) -> &'static str {
+    match refusal {
+        EndpointRefusal::Empty => "empty",
+        EndpointRefusal::NotHttps => "not_https",
+        EndpointRefusal::HasPath => "has_path",
+        EndpointRefusal::HasQuery => "has_query",
+        EndpointRefusal::HasCredentials => "has_credentials",
+        EndpointRefusal::BadHost => "bad_host",
+        EndpointRefusal::AddressLiteral => "address_literal",
+        EndpointRefusal::BadPort => "bad_port",
+        EndpointRefusal::BadRegion => "bad_region",
+        EndpointRefusal::BadName => "bad_name",
+        EndpointRefusal::NameTaken => "name_taken",
+        EndpointRefusal::TooMany => "too_many",
+        EndpointRefusal::BadRange => "bad_range",
+        EndpointRefusal::Reserved => "reserved",
+    }
+}
+
+/// Deserialises a field that may be `null`, telling `null` (`Some(Value::Null)`) from absent
+/// (`None`, with `#[serde(default)]`).
+fn present<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<Value>, D::Error> {
+    Value::deserialize(deserializer).map(Some)
+}
+
+/// The body of `PUT /api/settings/s3`: the settings to change, at least one.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct S3SettingsChange {
+    /// `[{name, url, region, path_style, allow}]`: the whole list, replacing the old one.
+    endpoints: Option<Value>,
+    /// At least 1,000.
+    list_requests: Option<Value>,
+    /// At least 1,000.
+    read_requests: Option<Value>,
+    /// At least 1 GiB, or `null` for no limit.
+    #[serde(default, deserialize_with = "present")]
+    bytes_down: Option<Value>,
+}
+
+/// One approved endpoint as it is stored, checked as the records layer checks it (HTTPS only,
+/// no path, query or credentials, no address literal outside the entry's own ranges). A
+/// default `:443` is taken off the address, so the stored address is the one signed and sent.
+fn stored_endpoint(index: usize, value: &Value) -> Result<(String, Value), ApiError> {
+    let bad = |reason| ApiError::InvalidS3Endpoint(Some(index), reason);
+    let object = value.as_object().ok_or(bad("bad_name"))?;
+    if object.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "name" | "url" | "region" | "path_style" | "allow"
+        )
+    }) {
+        return Err(bad("unknown_field"));
+    }
+    let text = |field: &str, refusal: &'static str| {
+        object
+            .get(field)
+            .and_then(Value::as_str)
+            .ok_or(bad(refusal))
+    };
+    let name = text("name", "bad_name")?;
+    let url = text("url", "empty")?;
+    let region = text("region", "bad_region")?;
+    let path_style = match object.get("path_style") {
+        None => false,
+        Some(value) => value.as_bool().ok_or(bad("bad_path_style"))?,
+    };
+    let allow = match object.get("allow") {
+        None => Vec::new(),
+        Some(value) => value
+            .as_array()
+            .ok_or(bad("bad_range"))?
+            .iter()
+            .map(|range| range.as_str().map(str::to_owned).ok_or(bad("bad_range")))
+            .collect::<Result<Vec<_>, _>>()?,
+    };
+    let endpoint = S3Endpoint::parse(name, url, region, path_style, &allow, false)
+        .map_err(|refusal| bad(refusal_word(refusal)))?;
+    let url = if endpoint.https() && endpoint.port() == Some(443) {
+        endpoint
+            .url
+            .strip_suffix(":443")
+            .unwrap_or(&endpoint.url)
+            .to_owned()
+    } else {
+        endpoint.url.clone()
+    };
+    Ok((
+        endpoint.name.clone(),
+        json!({
+            "name": endpoint.name,
+            "url": url,
+            "region": endpoint.region,
+            "path_style": endpoint.path_style,
+            "allow": endpoint.allow.iter().map(IpRange::display).collect::<Vec<_>>(),
+        }),
+    ))
+}
+
+/// The S3 settings as answered: the approved endpoints, the default monthly budgets and how
+/// many libraries use each endpoint (by name).
+async fn s3_out(state: &AppState) -> Result<Value, ApiError> {
+    let settings = state
+        .db()
+        .s3_settings()
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?;
+    let in_use = state
+        .db()
+        .s3_endpoints_in_use()
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?;
+    Ok(json!({
+        "endpoints": settings
+            .endpoints
+            .iter()
+            .map(|endpoint| json!({
+                "name": endpoint.name,
+                "url": endpoint.url,
+                "region": endpoint.region,
+                "path_style": endpoint.path_style,
+                "allow": endpoint.allow.iter().map(IpRange::display).collect::<Vec<_>>(),
+            }))
+            .collect::<Vec<_>>(),
+        "list_requests": settings.list_requests,
+        "read_requests": settings.read_requests,
+        "bytes_down": settings.bytes_down,
+        "in_use": in_use
+            .into_iter()
+            .map(|(name, libraries)| (name, json!(libraries)))
+            .collect::<serde_json::Map<String, Value>>(),
+    }))
+}
+
+/// `GET /api/settings/s3`: the approved S3 endpoints, the default monthly budgets and
+/// `in_use` (`{name: libraries}`), for administrators (`403` otherwise).
+pub(crate) async fn s3(
+    State(state): State<AppState>,
+    signed: Signed,
+) -> Result<Json<Value>, ApiError> {
+    if !signed.session.user.is_admin {
+        return Err(ApiError::Forbidden);
+    }
+    Ok(Json(s3_out(&state).await?))
+}
+
+/// `PUT /api/settings/s3 {endpoints?, list_requests?, read_requests?, bytes_down?}`: changes
+/// the settings given, for administrators (`403` otherwise). Everything is checked before
+/// anything is written, then all of it is written in one transaction or none of it; each
+/// changed key is recorded as `setting.changed`, the endpoints without their addresses. `422
+/// invalid_s3_endpoint {entry, reason}` names the first bad endpoint; `422 invalid_request`
+/// for a budget it does not take, or nothing given. Removing an endpoint disconnects no
+/// library: theirs stop reading and listing at once. Answers the settings as they then are.
+pub(crate) async fn change_s3(
+    State(state): State<AppState>,
+    signed: Signed,
+    JsonBody(change): JsonBody<S3SettingsChange>,
+) -> Result<Json<Value>, ApiError> {
+    if !signed.session.user.is_admin {
+        return Err(ApiError::Forbidden);
+    }
+    let endpoints = match change.endpoints {
+        None => None,
+        Some(value) => {
+            let entries = value
+                .as_array()
+                .ok_or(ApiError::InvalidS3Endpoint(None, "bad_name"))?;
+            if entries.len() > MAX_S3_ENDPOINTS {
+                return Err(ApiError::InvalidS3Endpoint(None, "too_many"));
+            }
+            let mut names: Vec<String> = Vec::with_capacity(entries.len());
+            let mut stored = Vec::with_capacity(entries.len());
+            for (index, entry) in entries.iter().enumerate() {
+                let (name, value) = stored_endpoint(index, entry)?;
+                if names.contains(&name) {
+                    return Err(ApiError::InvalidS3Endpoint(Some(index), "name_taken"));
+                }
+                names.push(name);
+                stored.push(value);
+            }
+            Some(Value::Array(stored))
+        }
+    };
+    let changes = [
+        (S3_ENDPOINTS, endpoints),
+        (S3_LIST_REQUESTS, change.list_requests),
+        (S3_READ_REQUESTS, change.read_requests),
+        (S3_BYTES_DOWN, change.bytes_down),
+    ];
+    if changes.iter().all(|(_, value)| value.is_none()) {
+        return Err(ApiError::InvalidRequest);
+    }
+    // Every budget is checked here as the records layer checks it, before anything is written.
+    for (key, value) in changes
+        .iter()
+        .filter_map(|(key, value)| value.as_ref().map(|v| (*key, v)))
+    {
+        let valid = match key {
+            S3_ENDPOINTS => true,
+            S3_LIST_REQUESTS | S3_READ_REQUESTS => value
+                .as_u64()
+                .is_some_and(|n| n >= 1_000 && i64::try_from(n).is_ok()),
+            S3_BYTES_DOWN => {
+                value.is_null()
+                    || value
+                        .as_u64()
+                        .is_some_and(|n| n >= 1024 * 1024 * 1024 && i64::try_from(n).is_ok())
+            }
+            _ => false,
+        };
+        if !valid {
+            return Err(ApiError::InvalidRequest);
+        }
+    }
+    let changes: Vec<(&str, Value)> = changes
+        .into_iter()
+        .filter_map(|(key, value)| value.map(|v| (key, v)))
+        .collect();
+    state
+        .db()
+        .set_settings(signed.session.user.id, changes)
+        .await?;
+    Ok(Json(s3_out(&state).await?))
 }
 
 /// The longest a request waits for the organisation-wide share-connection turn before it is

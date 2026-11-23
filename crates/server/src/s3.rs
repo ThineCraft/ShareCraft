@@ -660,6 +660,23 @@ impl S3 {
         })
     }
 
+    /// The approved endpoint named `name` (a built-in `aws:<region>` or one of the stored
+    /// approvals), read afresh; `None` when there is none of that name.
+    ///
+    /// # Errors
+    /// When the settings cannot be read.
+    pub(crate) async fn approved_endpoint(
+        &self,
+        state: &AppState,
+        name: &str,
+    ) -> Result<Option<S3Endpoint>, records::DbError> {
+        let settings = state.db().s3_settings().await?;
+        Ok(match find_endpoint(name, &settings) {
+            Some(endpoint) => Some(endpoint),
+            None => self.loopback_endpoint(state, name).await,
+        })
+    }
+
     /// The target of the S3 library `library`: its place, its approved endpoint and its
     /// unsealed key. `AddressRefused` if the endpoint is no longer approved; `BadKeys` if the
     /// stored key cannot be opened.
@@ -673,14 +690,11 @@ impl S3 {
             .await
             .map_err(|_| S3Error::Other)?
             .ok_or(S3Error::Other)?;
-        let settings = state.db().s3_settings().await.map_err(|_| S3Error::Other)?;
-        let endpoint = match find_endpoint(&place.endpoint, &settings) {
-            Some(endpoint) => endpoint,
-            None => self
-                .loopback_endpoint(state, &place.endpoint)
-                .await
-                .ok_or(S3Error::AddressRefused)?,
-        };
+        let endpoint = self
+            .approved_endpoint(state, &place.endpoint)
+            .await
+            .map_err(|_| S3Error::Other)?
+            .ok_or(S3Error::AddressRefused)?;
         let (config, _) = state
             .db()
             .source_of(library)

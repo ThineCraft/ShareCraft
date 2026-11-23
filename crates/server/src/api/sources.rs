@@ -1,6 +1,7 @@
-//! Connecting a library to a branch of a GitHub repository and managing the connection:
-//! connect (a new library, made only once GitHub answers that the repository and branch are
-//! there and within the caps), show, change, "Sync now", the webhook secret and disconnect.
+//! Connecting a library to a branch of a GitHub repository, a file-share folder or an S3
+//! bucket, and managing the connection: connect (a new library, made only once the source
+//! answers that it is there and usable), show, change, "Sync now", the webhook secret and
+//! disconnect.
 //!
 //! Secrets (the token, the webhook secret) are sealed (see [`crate::secrets`]) before they
 //! reach the database, and no answer, event, log line or error carries one: the only exception
@@ -17,11 +18,12 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use collab_core::ids::NodeId;
 use records::{
-    LibraryKind, NewEvent, NewSource, Perms, SealedRow, SecretId, SharePath, SourceChange,
-    SourceConfig, SourceKind, SourceMode, SourceStatus, User, approved_root, usable_here,
+    AccessError, Budget, LibraryKind, NewEvent, NewSource, Perms, S3Endpoint, S3Place, SealedRow,
+    SecretId, SharePath, SourceChange, SourceConfig, SourceKind, SourceMode, SourceStatus, Tri,
+    Usage, User, Versioning, approved_root, clean_prefix, s3_location, usable_here, valid_bucket,
     valid_root,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -32,6 +34,8 @@ use crate::AppState;
 use crate::auth::Signed;
 use crate::github::{EntryKind, GithubError, Head, RepoRef};
 use crate::libraries;
+use crate::s3::S3Error;
+use crate::s3_sign::Credentials;
 use crate::secrets::Secret;
 use crate::share::{FsBudget, canonical_share_path};
 use crate::source_sync::{abandon_uploads_into, caps, token_context, token_of, webhook_context};
@@ -47,6 +51,12 @@ const MAX_FOLDER_BYTES: usize = 500;
 const MAX_TOKEN_BYTES: usize = 1000;
 /// The bytes of a webhook secret.
 const WEBHOOK_SECRET_BYTES: usize = 32;
+/// The longest S3 access key id taken, in bytes.
+const MAX_KEY_ID_BYTES: usize = 128;
+/// The longest S3 secret access key taken, in bytes.
+const MAX_SECRET_KEY_BYTES: usize = 1000;
+/// The longest the probe of a bucket may take, both of its requests together.
+const S3_PROBE_LIMIT: Duration = Duration::from_secs(20);
 
 /// Asks the sync worker to sync `library` at once, after an owner acted on its connection: its
 /// failures in a row are forgotten (no back-off left from before). The outcome is recorded in
@@ -304,6 +314,9 @@ async fn answer_of(
     reveal_path: bool,
 ) -> Result<Value, ApiError> {
     let (config, status) = source_of(state, library).await?;
+    if config.kind == SourceKind::S3 {
+        return s3_answer(state, &config, &status, reveal_path).await;
+    }
     let mut answer = source_out(origin, &config, &status, reveal_path);
     if config.kind == SourceKind::Share
         && status.state == records::SourceState::Syncing
@@ -882,6 +895,18 @@ pub(crate) struct ChangeBody {
     token: Option<String>,
     /// `true` takes the token away.
     clear_token: Option<bool>,
+    /// S3: a new access key id, given with `secret_access_key`.
+    access_key_id: Option<String>,
+    /// S3: the new key's secret, given with `access_key_id`.
+    secret_access_key: Option<SecretText>,
+    /// S3: `{list_requests, read_requests, bytes_down}`.
+    budget: Option<Value>,
+    /// Never changed: named only to be refused with `422`.
+    bucket: Option<Value>,
+    /// Never changed: named only to be refused with `422`.
+    prefix: Option<Value>,
+    /// Never changed: named only to be refused with `422`.
+    endpoint: Option<Value>,
 }
 
 /// `PATCH /api/libraries/{id}/source {branch?, folder?, poll_seconds?, token?,
@@ -904,6 +929,16 @@ pub(crate) async fn change(
     let actor = signed.session.user;
     require_manager(state.db(), actor.id, library).await?;
     let (config, _) = source_of(&state, library).await?;
+    if body.bucket.is_some() || body.prefix.is_some() || body.endpoint.is_some() {
+        return Err(ApiError::InvalidRequest);
+    }
+    if config.kind == SourceKind::S3 {
+        let origin = origin(&state, &headers)?;
+        return change_s3(state, actor, library, &origin, body, &config).await;
+    }
+    if body.access_key_id.is_some() || body.secret_access_key.is_some() || body.budget.is_some() {
+        return Err(ApiError::InvalidRequest);
+    }
     if config.kind == SourceKind::Share
         && (body.branch.is_some()
             || body.folder.is_some()
@@ -1093,7 +1128,7 @@ pub(crate) async fn webhook(
     let actor = signed.session.user;
     require_manager(state.db(), actor.id, library).await?;
     let (config, _) = source_of(&state, library).await?;
-    if config.kind == SourceKind::Share {
+    if config.kind != SourceKind::Github {
         return Err(ApiError::InvalidRequest);
     }
     let origin = origin(&state, &headers)?;
@@ -1172,8 +1207,11 @@ pub(crate) async fn disconnect(
     let actor = signed.session.user;
     require_manager(state.db(), actor.id, library).await?;
     let (config, _) = source_of(&state, library).await?;
+    // A file share and a bucket are listed in long passes that a disconnect stops: their
+    // generation moves on and the disconnect waits for the pass to give up its turn.
+    let external = config.kind != SourceKind::Github;
     to_completion(async move {
-        if config.kind == SourceKind::Share {
+        if external {
             state
                 .db()
                 .bump_source_generation(library)
@@ -1190,12 +1228,12 @@ pub(crate) async fn disconnect(
             {
                 break turn;
             }
-            if config.kind != SourceKind::Share || tokio::time::Instant::now() >= deadline {
+            if !external || tokio::time::Instant::now() >= deadline {
                 return Err(ApiError::SourceBusy);
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         };
-        let removed = if config.kind == SourceKind::Share {
+        let removed = if external {
             tree::delete_source_children(&state, &actor, library).await?
         } else {
             0
@@ -1208,8 +1246,8 @@ pub(crate) async fn disconnect(
             forget_secret(&state, id).await;
         }
         drop(turn);
-        let detail = if config.kind == SourceKind::Share {
-            json!({ "kind": "share", "removed": removed })
+        let detail = if external {
+            json!({ "kind": config.kind.as_str(), "removed": removed })
         } else {
             json!({ "repository": format!("{}/{}", config.owner, config.repo) })
         };
@@ -1217,6 +1255,558 @@ pub(crate) async fn disconnect(
         Ok(StatusCode::NO_CONTENT.into_response())
     })
     .await
+}
+
+/// A secret key as a request carries it, wrapped in [`Secret`] as it is read: the body holds
+/// no plain string a `Debug` or an error could print. No `Debug` of its own.
+pub(crate) struct SecretText(Secret);
+
+impl<'de> Deserialize<'de> for SecretText {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer).map(|text| SecretText(Secret::new(text)))
+    }
+}
+
+/// `id` if it can be an access key id: 1 to 128 bytes, no control character.
+fn checked_key_id(id: &str) -> Result<(), ApiError> {
+    if id.is_empty() || id.len() > MAX_KEY_ID_BYTES || id.chars().any(char::is_control) {
+        return Err(ApiError::InvalidRequest);
+    }
+    Ok(())
+}
+
+/// `secret` if it can be a secret access key: 1 to 1,000 bytes, no control character.
+fn checked_secret_key(secret: &Secret) -> Result<(), ApiError> {
+    let text = secret.expose();
+    if text.is_empty() || text.len() > MAX_SECRET_KEY_BYTES || text.chars().any(char::is_control) {
+        return Err(ApiError::InvalidRequest);
+    }
+    Ok(())
+}
+
+/// The approved endpoint named `name`, read afresh; `422 s3_endpoint_not_approved` for a name
+/// no administrator approved (an address typed in its place is no name).
+async fn approved_endpoint(state: &AppState, name: &str) -> Result<S3Endpoint, ApiError> {
+    state
+        .s3()
+        .approved_endpoint(state, name)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?
+        .ok_or(ApiError::S3EndpointNotApproved)
+}
+
+/// The answer for an S3 failure while probing: a reason word, never the store's text.
+fn s3_refused(error: S3Error) -> ApiError {
+    let reason = match error {
+        S3Error::BadKeys => "keys",
+        S3Error::NoBucket | S3Error::NotFound => "bucket",
+        S3Error::Denied => "denied",
+        S3Error::WrongRegion => "region",
+        S3Error::ClockSkew => "clock",
+        S3Error::AddressRefused => "address",
+        S3Error::Throttled
+        | S3Error::Precondition
+        | S3Error::Archived
+        | S3Error::Unsupported
+        | S3Error::Unreachable
+        | S3Error::TimedOut
+        | S3Error::Malformed
+        | S3Error::Other => {
+            // `S3Error` holds no text from the store, no key and no address.
+            eprintln!("sharecraft-server: an S3 bucket could not be probed: {error}");
+            "offline"
+        }
+    };
+    ApiError::S3Unreachable(reason)
+}
+
+/// Asks the bucket whether the key may list `prefix` (one listing of at most one key), then
+/// its versioning state (whose failure is no refusal: it is recorded as unknown). Two
+/// requests, no write, counted against no library, within 20 seconds in all.
+async fn probe_bucket(
+    state: &AppState,
+    endpoint: &S3Endpoint,
+    bucket: &str,
+    prefix: &str,
+    access_key_id: &str,
+    secret: &Secret,
+) -> Result<Versioning, ApiError> {
+    let s3 = state.s3();
+    let target = s3.target_from(
+        endpoint,
+        bucket,
+        Credentials {
+            access_key_id: access_key_id.to_owned(),
+            secret: secret.clone(),
+            session_token: None,
+        },
+    );
+    let probing = async {
+        s3.list_page(&target, prefix, None, 1)
+            .await
+            .map_err(s3_refused)?;
+        Ok::<_, ApiError>(
+            s3.bucket_versioning(&target)
+                .await
+                .unwrap_or(Versioning::Unknown),
+        )
+    };
+    tokio::time::timeout(S3_PROBE_LIMIT, probing)
+        .await
+        .map_err(|_| ApiError::S3Unreachable("offline"))?
+}
+
+/// The last four characters of an access key id, as the pages show it.
+fn id_ends(id: &str) -> String {
+    let start = id.char_indices().rev().nth(3).map_or(0, |(index, _)| index);
+    id.get(start..).unwrap_or_default().to_owned()
+}
+
+/// An S3 connection as the routes answer it. Its place, key, usage, budget and pause go only
+/// to those who may manage the library (`reveal`); everyone else gets nulls for them. Never
+/// the secret and never the endpoint's address: the endpoint by its name only.
+async fn s3_answer(
+    state: &AppState,
+    config: &SourceConfig,
+    status: &SourceStatus,
+    reveal: bool,
+) -> Result<Value, ApiError> {
+    let library = config.library;
+    let listing_now = (status.state == records::SourceState::Syncing)
+        .then(|| state.s3().listing_progress(library))
+        .flatten()
+        .map(|files| json!({ "files_so_far": files }));
+    let mut answer = json!({
+        "kind": "s3",
+        "mode": config.mode.as_str(),
+        "state": status.state.as_str(),
+        "last_checked_at": rfc3339(status.last_checked_at),
+        "last_synced_at": rfc3339(status.last_synced_at),
+        "last_error": status.last_error,
+        "files": status.files,
+        "bytes": status.bytes,
+        "hidden": status.hidden,
+        "hidden_by": status.hidden_detail,
+        "poll_seconds": config.poll_seconds,
+        "next_check_at": rfc3339(status.next_check_at),
+        "listing_now": listing_now,
+        "endpoint": null,
+        "bucket": null,
+        "prefix": null,
+        "key": null,
+        "versioning": null,
+        "usage": null,
+        "budget": null,
+        "paused": null,
+    });
+    if !reveal {
+        return Ok(answer);
+    }
+    let db = state.db();
+    let Some(place) = db
+        .s3_place(library)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?
+    else {
+        return Ok(answer);
+    };
+    let today = time::OffsetDateTime::now_utc().date();
+    let stored = db
+        .usage(library, today)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?;
+    // What is counted and not yet stored (the worker stores it) counts too.
+    let unflushed = state.s3().unflushed_usage(library);
+    let usage = Usage {
+        list: stored.list.saturating_add(unflushed.list),
+        read: stored.read.saturating_add(unflushed.read),
+        write: stored.write.saturating_add(unflushed.write),
+        bytes_down: stored.bytes_down.saturating_add(unflushed.bytes_down),
+        bytes_up: stored.bytes_up.saturating_add(unflushed.bytes_up),
+        cache_hits: stored.cache_hits.saturating_add(unflushed.cache_hits),
+    };
+    let budget = db
+        .budget(library)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?;
+    let paused = if usage.list >= budget.list_requests {
+        Some("list")
+    } else if usage.read >= budget.read_requests
+        || budget
+            .bytes_down
+            .is_some_and(|most| usage.bytes_down >= most)
+    {
+        Some("read")
+    } else {
+        None
+    };
+    if let Some(object) = answer.as_object_mut() {
+        for (field, value) in [
+            ("endpoint", json!(place.endpoint)),
+            ("bucket", json!(place.bucket)),
+            ("prefix", json!(place.prefix)),
+            (
+                "key",
+                json!({ "id_ends": id_ends(&place.access_key_id), "secret": "set" }),
+            ),
+            ("versioning", json!(place.versioning.as_str())),
+            (
+                "usage",
+                json!({
+                    "month": format!("{:04}-{:02}", today.year(), u8::from(today.month())),
+                    "list": usage.list,
+                    "read": usage.read,
+                    "write": usage.write,
+                    "bytes_down": usage.bytes_down,
+                    "bytes_up": usage.bytes_up,
+                    "cache_hits": usage.cache_hits,
+                }),
+            ),
+            (
+                "budget",
+                json!({
+                    "list_requests": budget.list_requests,
+                    "read_requests": budget.read_requests,
+                    "bytes_down": budget.bytes_down,
+                }),
+            ),
+            ("paused", json!(paused)),
+        ] {
+            object.insert(field.to_owned(), value);
+        }
+    }
+    Ok(answer)
+}
+
+/// The body of `POST /api/sites/{id}/libraries/s3`. No `Debug`: it holds the secret key.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ConnectS3Body {
+    name: String,
+    /// The name of an approved endpoint, or `aws:<region>`.
+    endpoint: String,
+    bucket: String,
+    /// The whole bucket when not given.
+    prefix: Option<String>,
+    access_key_id: String,
+    secret_access_key: SecretText,
+    /// `document` when not given, or `image`.
+    kind: Option<String>,
+    /// Phase 1 takes only `read_only`.
+    mode: Option<String>,
+}
+
+/// `POST /api/sites/{id}/libraries/s3 {name, endpoint, bucket, prefix?, access_key_id,
+/// secret_access_key, kind?, mode?}`: makes a new read-only library in the site backed by the
+/// bucket (below the prefix), for someone who may make a library there. Checked in this order,
+/// nothing asked of the store before the last: access (`403`); `kind` `document` or `image`
+/// and `mode` `read_only` (`422 invalid_request`); the endpoint is approved (`422
+/// s3_endpoint_not_approved`); the bucket and prefix (`422 invalid_s3_place` with `reason`
+/// `bucket` or `prefix`); the key's lengths (`422 invalid_request`); the probe (`422
+/// s3_unreachable` with its `reason`). Only then is the library made, the secret sealed and the
+/// connection recorded (`409 s3_place_in_use` when another library holds an overlapping prefix
+/// of the bucket, judged together with the endpoint's approval under one lock); a failure
+/// removes the new library and forgets the secret. `201 {id, source}`.
+pub(crate) async fn connect_s3(
+    State(state): State<AppState>,
+    signed: Signed,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    JsonBody(body): JsonBody<ConnectS3Body>,
+) -> Result<Response, ApiError> {
+    let ConnectS3Body {
+        name,
+        endpoint,
+        bucket,
+        prefix,
+        access_key_id,
+        secret_access_key: SecretText(secret),
+        kind,
+        mode,
+    } = body;
+    let site = node_id(&id)?;
+    let actor = signed.session.user;
+
+    // Who may make a library here, judged before anything else.
+    let (place, access) = tree::visible(state.db(), &actor, site).await?;
+    if place.kind != records::NodeKind::Site {
+        return Err(ApiError::WrongPlace);
+    }
+    tree::require(&access, Perms::MANAGE_SITE)?;
+    let kind = match kind.as_deref() {
+        None | Some("document") => LibraryKind::Document,
+        Some("image") => LibraryKind::Image,
+        Some(_) => return Err(ApiError::InvalidRequest),
+    };
+    if mode.as_deref().is_some_and(|mode| mode != "read_only") {
+        return Err(ApiError::InvalidRequest);
+    }
+    let name = records::validate_node_name(&name)
+        .map_err(ApiError::from)?
+        .to_owned();
+    let endpoint = approved_endpoint(&state, &endpoint).await?;
+    if !valid_bucket(&bucket) {
+        return Err(ApiError::InvalidS3Place("bucket"));
+    }
+    let prefix = clean_prefix(prefix.as_deref().unwrap_or_default())
+        .ok_or(ApiError::InvalidS3Place("prefix"))?;
+    checked_key_id(&access_key_id)?;
+    checked_secret_key(&secret)?;
+    // A taken name costs no request to the store; `create_library` checks it again.
+    if !state
+        .db()
+        .name_free(site, &name, None)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?
+    {
+        return Err(ApiError::NameTaken);
+    }
+
+    let versioning =
+        probe_bucket(&state, &endpoint, &bucket, &prefix, &access_key_id, &secret).await?;
+    let library = NodeId(Uuid::new_v4());
+    let origin = origin(&state, &headers)?;
+    {
+        let state = state.clone();
+        let actor = actor.clone();
+        to_completion(async move {
+            tree::create_library(&state, &actor, site, library, &name, kind).await?;
+            let sealed =
+                store_secret(&state, secret.expose().as_bytes(), &token_context(library)).await;
+            drop(secret);
+            let token = match sealed {
+                Ok(token) => token,
+                Err(e) => {
+                    purge_new_library(&state, &actor, library).await;
+                    return Err(e);
+                }
+            };
+            let place = S3Place {
+                endpoint: endpoint.name,
+                bucket,
+                prefix,
+                access_key_id,
+                versioning,
+                conditional: Tri::Unknown,
+            };
+            let connected = state
+                .db()
+                .connect_s3_source(
+                    &NewSource {
+                        library,
+                        kind: SourceKind::S3,
+                        owner: String::new(),
+                        repo: String::new(),
+                        branch: String::new(),
+                        folder: String::new(),
+                        location: Some(s3_location(&place.endpoint, &place.bucket, &place.prefix)),
+                        mode: SourceMode::ReadOnly,
+                        token: Some(token),
+                        poll_seconds: DEFAULT_POLL_SECONDS,
+                        connected_by: actor.id,
+                    },
+                    &place,
+                )
+                .await;
+            if let Err(e) = connected {
+                purge_new_library(&state, &actor, library).await;
+                forget_secret(&state, token).await;
+                return Err(match e {
+                    AccessError::Exists => ApiError::S3PlaceInUse,
+                    e => e.into(),
+                });
+            }
+            abandon_uploads_into(&state, library).await;
+            emit(
+                &state,
+                "source.connected",
+                &actor,
+                library,
+                json!({ "kind": "s3" }),
+            );
+            wake(&state, library);
+            Ok(())
+        })
+        .await?;
+    }
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "id": library.0.to_string(),
+            "source": answer_of(&state, &origin, library, true).await?,
+        })),
+    )
+        .into_response())
+}
+
+/// A budget as `PATCH` takes it: `{list_requests, read_requests, bytes_down}`, the first two
+/// whole numbers of at least 1, `bytes_down` one too or `null` (the server's default). Anything
+/// else is `422 invalid_request`.
+fn budget_of(value: &Value) -> Result<Budget, ApiError> {
+    let object = value.as_object().ok_or(ApiError::InvalidRequest)?;
+    if object.len() != 3 {
+        return Err(ApiError::InvalidRequest);
+    }
+    let count = |field: &str| {
+        object
+            .get(field)
+            .and_then(Value::as_u64)
+            .filter(|n| *n >= 1 && i64::try_from(*n).is_ok())
+            .ok_or(ApiError::InvalidRequest)
+    };
+    let bytes_down = match object.get("bytes_down") {
+        Some(Value::Null) => None,
+        Some(_) => Some(count("bytes_down")?),
+        None => return Err(ApiError::InvalidRequest),
+    };
+    Ok(Budget {
+        list_requests: count("list_requests")?,
+        read_requests: count("read_requests")?,
+        bytes_down,
+    })
+}
+
+/// `PATCH /api/libraries/{id}/source` for an S3 library: `{poll_seconds?, access_key_id? with
+/// secret_access_key?, budget?}`. A GitHub field is `422 invalid_request`, and so is a key id
+/// without its secret or the other way round. A new key is probed first, as connecting is (the
+/// same `422` answers change nothing); then it replaces the old one, whose sealed row is
+/// deleted, and a library that could not connect is tried again. Answers the connection.
+async fn change_s3(
+    state: AppState,
+    actor: User,
+    library: NodeId,
+    origin: &str,
+    body: ChangeBody,
+    config: &SourceConfig,
+) -> Result<Json<Value>, ApiError> {
+    let ChangeBody {
+        branch,
+        folder,
+        poll_seconds,
+        token,
+        clear_token,
+        access_key_id,
+        secret_access_key,
+        budget,
+        ..
+    } = body;
+    if branch.is_some() || folder.is_some() || token.is_some() || clear_token.is_some() {
+        return Err(ApiError::InvalidRequest);
+    }
+    if poll_seconds
+        .is_some_and(|s| !(records::MIN_POLL_SECONDS..=records::MAX_POLL_SECONDS).contains(&s))
+    {
+        return Err(ApiError::InvalidRequest);
+    }
+    let budget = budget.as_ref().map(budget_of).transpose()?;
+    let key = match (access_key_id, secret_access_key) {
+        (None, None) => None,
+        (Some(id), Some(SecretText(secret))) => {
+            checked_key_id(&id)?;
+            checked_secret_key(&secret)?;
+            Some((id, secret))
+        }
+        _ => return Err(ApiError::InvalidRequest),
+    };
+    let poll_seconds = poll_seconds.filter(|s| *s != config.poll_seconds);
+    let budget = match budget {
+        Some(budget) => {
+            let current = state
+                .db()
+                .budget(library)
+                .await
+                .map_err(|e| ApiError::unavailable(&e))?;
+            (budget != current).then_some(budget)
+        }
+        None => None,
+    };
+    if poll_seconds.is_none() && budget.is_none() && key.is_none() {
+        return Ok(Json(answer_of(&state, origin, library, true).await?));
+    }
+    let probed = match &key {
+        Some((id, secret)) => {
+            let place = state
+                .db()
+                .s3_place(library)
+                .await
+                .map_err(|e| ApiError::unavailable(&e))?
+                .ok_or(ApiError::NotFound)?;
+            let endpoint = approved_endpoint(&state, &place.endpoint).await?;
+            let versioning =
+                probe_bucket(&state, &endpoint, &place.bucket, &place.prefix, id, secret).await?;
+            Some((versioning, place.conditional))
+        }
+        None => None,
+    };
+    let mut fields: Vec<&str> = Vec::new();
+    if poll_seconds.is_some() {
+        fields.push("poll_seconds");
+    }
+    if key.is_some() {
+        fields.push("key");
+    }
+    if budget.is_some() {
+        fields.push("budget");
+    }
+    {
+        let state = state.clone();
+        to_completion(async move {
+            if let Some((id, secret)) = key {
+                let stored =
+                    store_secret(&state, secret.expose().as_bytes(), &token_context(library)).await;
+                drop(secret);
+                let stored = stored?;
+                match state.db().set_s3_key(library, &id, stored).await {
+                    Ok(displaced) => {
+                        if let Some(old) = displaced {
+                            forget_secret(&state, old).await;
+                        }
+                    }
+                    Err(e) => {
+                        forget_secret(&state, stored).await;
+                        return Err(e.into());
+                    }
+                }
+                if let Some((versioning, conditional)) = probed {
+                    state
+                        .db()
+                        .set_s3_probe(library, versioning, conditional)
+                        .await
+                        .map_err(|e| ApiError::unavailable(&e))?;
+                }
+            }
+            if let Some(poll_seconds) = poll_seconds {
+                let change = SourceChange {
+                    poll_seconds: Some(poll_seconds),
+                    ..SourceChange::default()
+                };
+                state.db().change_source(library, &change).await?;
+                state
+                    .db()
+                    .requeue_source_preserving_rate_limit(
+                        library,
+                        None,
+                        time::OffsetDateTime::now_utc(),
+                    )
+                    .await
+                    .map_err(|e| ApiError::unavailable(&e))?;
+            }
+            if let Some(budget) = budget {
+                state.db().set_budget(library, &budget).await?;
+            }
+            emit(
+                &state,
+                "source.changed",
+                &actor,
+                library,
+                json!({ "fields": fields }),
+            );
+            wake(&state, library);
+            Ok(())
+        })
+        .await?;
+    }
+    Ok(Json(answer_of(&state, origin, library, true).await?))
 }
 
 #[cfg(test)]
@@ -1247,6 +1837,12 @@ mod tests {
             assert!(!valid_folder(bad), "{bad:?}");
         }
         assert!(!valid_folder(&"a".repeat(501)));
+    }
+
+    #[test]
+    fn the_last_four_characters_of_a_key_id() {
+        assert_eq!(super::id_ends("AKIAEXAMPLE1234"), "1234");
+        assert_eq!(super::id_ends("ab"), "ab");
     }
 
     #[test]

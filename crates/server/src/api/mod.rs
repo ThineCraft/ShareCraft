@@ -79,6 +79,7 @@ pub(crate) fn router() -> Router<AppState> {
         .route("/sites/{id}/libraries", post(libraries::create))
         .route("/sites/{id}/libraries/github", post(sources::connect))
         .route("/sites/{id}/libraries/share", post(sources::connect_share))
+        .route("/sites/{id}/libraries/s3", post(sources::connect_s3))
         .route(
             "/libraries/{id}/source",
             get(sources::show)
@@ -91,6 +92,7 @@ pub(crate) fn router() -> Router<AppState> {
             "/settings/shares",
             get(settings::shares).put(settings::change_shares),
         )
+        .route("/settings/s3", get(settings::s3).put(settings::change_s3))
         .route(
             "/libraries/{id}",
             get(libraries::show).patch(libraries::change),
@@ -377,6 +379,19 @@ pub(crate) enum ApiError {
     ShareNotApproved,
     /// 422: the approved folder cannot be listed.
     ShareUnreachable(&'static str),
+    /// 422: the S3 endpoint named is not one an administrator approved (or a built-in
+    /// `aws:<region>`).
+    S3EndpointNotApproved,
+    /// 422: the bucket or the prefix breaks its rules; the reason is `bucket` or `prefix`.
+    InvalidS3Place(&'static str),
+    /// 422: the probe of the bucket failed; the reason is `keys`, `bucket`, `denied`, `region`,
+    /// `clock`, `address` or `offline`, and the message a plain sentence of ours.
+    S3Unreachable(&'static str),
+    /// 422: an entry of the approved S3 endpoints breaks a rule: which entry (its place in the
+    /// list, none when the list itself is refused) and why.
+    InvalidS3Endpoint(Option<usize>, &'static str),
+    /// 409: another library uses the same bucket under an overlapping prefix.
+    S3PlaceInUse,
     /// 422: not an acceptable document or person name.
     InvalidName,
     /// 422: not an acceptable email address.
@@ -563,6 +578,15 @@ impl ApiError {
             ApiError::ShareUnreachable(_) => {
                 (StatusCode::UNPROCESSABLE_ENTITY, "share_unreachable")
             }
+            ApiError::S3EndpointNotApproved => {
+                (StatusCode::UNPROCESSABLE_ENTITY, "s3_endpoint_not_approved")
+            }
+            ApiError::InvalidS3Place(_) => (StatusCode::UNPROCESSABLE_ENTITY, "invalid_s3_place"),
+            ApiError::S3Unreachable(_) => (StatusCode::UNPROCESSABLE_ENTITY, "s3_unreachable"),
+            ApiError::InvalidS3Endpoint(..) => {
+                (StatusCode::UNPROCESSABLE_ENTITY, "invalid_s3_endpoint")
+            }
+            ApiError::S3PlaceInUse => (StatusCode::CONFLICT, "s3_place_in_use"),
             ApiError::InvalidName => (StatusCode::UNPROCESSABLE_ENTITY, "invalid_name"),
             ApiError::InvalidEmail => (StatusCode::UNPROCESSABLE_ENTITY, "invalid_email"),
             ApiError::InvalidLanguage => (StatusCode::UNPROCESSABLE_ENTITY, "invalid_language"),
@@ -676,6 +700,7 @@ impl From<AccessError> for ApiError {
             AccessError::LibraryNotEmpty => ApiError::LibraryNotEmpty,
             AccessError::SourceExists => ApiError::SourceExists,
             AccessError::ShareLocationInUse => ApiError::ShareLocationInUse,
+            AccessError::S3EndpointNotApproved => ApiError::S3EndpointNotApproved,
             AccessError::BlockedFileType(file_type) => ApiError::BlockedFileType(file_type),
             AccessError::FileTooLarge(limit) => ApiError::FileTooLarge(limit),
             AccessError::Held(scan) => ApiError::Held(scan),
@@ -874,6 +899,25 @@ impl IntoResponse for ApiError {
                 "reason": reason,
                 "message": share_unreachable_message(reason),
             }),
+            ApiError::InvalidS3Place(reason) => json!({
+                "error": code,
+                "reason": reason,
+                "message": if reason == "prefix" {
+                    "The prefix must be empty or folder names separated by \"/\", with no empty, \".\" or \"..\" name."
+                } else {
+                    "The bucket name is not one S3 allows: 3 to 63 lower-case letters, digits, dots and hyphens."
+                },
+            }),
+            ApiError::S3Unreachable(reason) => json!({
+                "error": code,
+                "reason": reason,
+                "message": s3_unreachable_message(reason),
+            }),
+            ApiError::InvalidS3Endpoint(entry, reason) => json!({
+                "error": code,
+                "entry": entry,
+                "reason": reason,
+            }),
             ApiError::InvalidTemplate(reason) | ApiError::InvalidLibrarySettings(reason) => {
                 json!({ "error": code, "reason": reason })
             }
@@ -915,6 +959,19 @@ impl IntoResponse for ApiError {
             _ => json!({ "error": code }),
         };
         (status, Json(body)).into_response()
+    }
+}
+
+/// The plain sentence for a failed probe of a bucket. Never the store's own text.
+fn s3_unreachable_message(reason: &str) -> &'static str {
+    match reason {
+        "keys" => "The S3 storage did not accept the access key and secret.",
+        "bucket" => "The S3 storage has no bucket of that name.",
+        "denied" => "The access key is not allowed to list this bucket or prefix.",
+        "region" => "The bucket is in another region than the endpoint's.",
+        "clock" => "This server's clock differs too much from the S3 storage's.",
+        "address" => "The endpoint's address is not one this server may reach.",
+        _ => "The S3 storage could not be reached. Try again later.",
     }
 }
 

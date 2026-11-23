@@ -28,9 +28,29 @@ struct Fixture {
     library: NodeId,
 }
 
+/// Approves the endpoint `r2` as an administrator would: a bucket is connected only on an
+/// approved endpoint.
+async fn approve_r2(test: &TestDb, admin: UserId) {
+    test.db
+        .set_setting(
+            admin,
+            records::S3_ENDPOINTS,
+            json!([{
+                "name": "r2",
+                "url": "https://r2.example.com",
+                "region": "auto",
+                "path_style": true,
+                "allow": [],
+            }]),
+        )
+        .await
+        .unwrap();
+}
+
 async fn fixture() -> Fixture {
     let test = TestDb::create().await;
     let ann = user(&test, "Ann", true).await;
+    approve_r2(&test, ann.id).await;
     let site = site(&test, "Site", Some(ann.id)).await;
     let library = put(
         &test,
@@ -301,6 +321,30 @@ async fn overlapping_prefixes_in_one_bucket_are_refused_both_ways_and_other_buck
     // A refused connection leaves no secret referrer behind it, and a freed prefix is free.
     f.test.db.disconnect_source(deep).await.unwrap();
     connect(&f, wide, "nested-bucket", "a/").await.unwrap();
+}
+
+#[tokio::test]
+async fn a_connection_is_refused_once_its_endpoint_is_no_longer_approved() {
+    let f = fixture().await;
+    f.test
+        .db
+        .set_setting(f.user, records::S3_ENDPOINTS, json!([]))
+        .await
+        .unwrap();
+    assert_eq!(
+        connect(&f, f.library, "withdrawn-bucket", "").await,
+        Err(AccessError::S3EndpointNotApproved)
+    );
+    assert!(f.test.db.source_of(f.library).await.unwrap().is_none());
+    // The built-in AWS endpoints need no approval.
+    let mut place = place("aws-bucket", "");
+    place.endpoint = "aws:eu-west-2".into();
+    let token = secret(&f, b"sealed key").await;
+    f.test
+        .db
+        .connect_s3_source(&s3_source(&f, f.library, &place, token), &place)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -1222,6 +1266,7 @@ async fn migrating_a_database_with_github_and_share_rows_keeps_them() {
         conditional: Tri::No,
     };
     let token = test.db.put_secret(&sealed(b"sealed key")).await.unwrap();
+    approve_r2(&test, ann.id).await;
     test.db
         .connect_s3_source(
             &NewSource {
