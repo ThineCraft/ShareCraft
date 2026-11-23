@@ -601,6 +601,73 @@ async fn a_file_and_a_folder_of_one_name_both_show() {
 }
 
 #[tokio::test]
+async fn an_empty_marker_folder_shows_and_goes_to_the_bin_after_the_grace() {
+    let env = Env::new().await;
+    env.fake.put(BUCKET, "empty/", b"");
+    env.fake.put(BUCKET, "kept.txt", b"kept");
+
+    env.synced_at(at(0)).await;
+    assert_eq!(env.paths().await, ["empty", "kept.txt"]);
+    let folder = env.item("empty").await;
+    assert!(folder.blob_sha.is_none());
+    assert_eq!(folder.repository_path, "empty/");
+    assert!(
+        env.server
+            .records_db()
+            .node(folder.node)
+            .await
+            .unwrap()
+            .is_some_and(|node| !node.deleted)
+    );
+    assert_eq!(env.sync_at(at(30)).await, Ok(None));
+
+    env.fake.remove(BUCKET, "empty/");
+    env.sync_at(at(60)).await.unwrap();
+    assert!(!env.in_bin(folder.node).await, "the one-poll grace applies");
+    env.sync_at(at(121)).await.unwrap();
+    assert!(env.in_bin(folder.node).await);
+    assert_eq!(env.paths().await, ["kept.txt"]);
+}
+
+#[tokio::test]
+async fn a_file_added_then_removed_beside_a_folder_of_its_name_never_fails_a_pass() {
+    let env = Env::new().await;
+    env.fake.put(BUCKET, "a/b.txt", b"inside");
+    env.synced_at(at(0)).await;
+    let folder = env.item("a").await.node;
+
+    env.fake.put(BUCKET, "a", b"file");
+    env.synced_at(at(60)).await;
+    assert_eq!(env.paths().await, ["a", "a (1)", "a/b.txt"]);
+    assert_eq!(env.item("a").await.node, folder);
+    let file = env.item("a (1)").await.node;
+
+    env.fake.remove(BUCKET, "a");
+    env.sync_at(at(120)).await.unwrap();
+    assert!(!env.in_bin(file).await);
+    env.sync_at(at(200)).await.unwrap();
+    assert!(env.in_bin(file).await);
+    assert_eq!(env.paths().await, ["a", "a/b.txt"]);
+    assert_eq!(env.item("a").await.node, folder);
+    assert!(!env.in_bin(folder).await);
+    assert_eq!(env.status().await.state, SourceState::Ok);
+}
+
+#[tokio::test]
+async fn a_folder_appearing_beside_a_shown_file_leaves_the_file_its_name() {
+    let env = Env::new().await;
+    env.fake.put(BUCKET, "a", b"file");
+    env.synced_at(at(0)).await;
+    let file = env.item("a").await.node;
+
+    env.fake.put(BUCKET, "a/b.txt", b"inside");
+    env.synced_at(at(60)).await;
+    assert_eq!(env.paths().await, ["a", "a (2)", "a (2)/b.txt"]);
+    assert_eq!(env.item("a").await.node, file);
+    assert_eq!(env.sync_at(at(120)).await, Ok(None));
+}
+
+#[tokio::test]
 async fn blocked_types_and_over_size_objects_are_hidden_and_counted() {
     let env = Env::build("", |config| config.max_file_bytes = 4).await;
     let (status, body) = call(
