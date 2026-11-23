@@ -923,7 +923,19 @@ async fn join_capable_socket(
         matches!(message, LiveServerMsg::LiveJoined { .. }).then_some(())
     })
     .await;
+    report_caught_up(&mut socket).await;
     socket
+}
+
+/// Reads the join's catch-up and reports its head, as an editor does once its base has
+/// loaded: until then the room offers it no checkpoint ticket.
+async fn report_caught_up(socket: &mut common::Socket) {
+    let head = next_live(socket, |message| match message {
+        LiveServerMsg::Catchup { head, .. } => Some(head),
+        _ => None,
+    })
+    .await;
+    send_live(socket, &LiveClientMsg::Heartbeat { seen: head }).await;
 }
 
 #[tokio::test]
@@ -1535,6 +1547,7 @@ async fn rejoin_capable(
         .await
         .unwrap_or(false);
         if joined {
+            report_caught_up(&mut socket).await;
             return socket;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1633,6 +1646,8 @@ async fn verified_checkpoint_survives_room_and_server_restart() {
     })
     .await;
     assert_eq!(caught_up, Seq(3), "only the suffix after the base is sent");
+    // Once its base has loaded and it has caught up, the newcomer says so and is asked.
+    send_live(&mut socket, &LiveClientMsg::Heartbeat { seen: Seq(3) }).await;
     let ticket = next_live(&mut socket, |message| match message {
         LiveServerMsg::CheckpointTicket {
             purpose: TicketPurpose::Write,
