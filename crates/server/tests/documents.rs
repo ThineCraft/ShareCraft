@@ -787,3 +787,36 @@ async fn document_answer_names_the_live_behind_mark() {
     assert_eq!(body["live"]["stored_through"], 0);
     assert_eq!(body["session"], "file");
 }
+
+/// The behind mark is read-only: opening a document that never went live writes no live log.
+#[tokio::test]
+async fn text_document_answer_is_unchanged_and_writes_no_live_log() {
+    let server = spawn_server().await;
+    let ann = server.user("ann").await;
+    let (status, body) = post_doc(&server, &ann, json!({ "name": "Notes" })).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["editor"], "text");
+    let doc = body["id"].as_str().unwrap().to_owned();
+    for _ in 0..3 {
+        let (status, body) = call(
+            &server,
+            Some(&ann),
+            Method::GET,
+            &format!("/api/docs/{doc}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["session"], "text");
+        assert_eq!(
+            body["live"],
+            json!({ "behind": false, "head": 0, "stored_through": 0 })
+        );
+    }
+    let rows: i64 = sqlx::query_scalar("select count(*) from live_logs where document_id = $1")
+        .bind(uuid::Uuid::parse_str(&doc).unwrap())
+        .fetch_one(server.db.db.test_pool())
+        .await
+        .unwrap();
+    assert_eq!(rows, 0);
+}

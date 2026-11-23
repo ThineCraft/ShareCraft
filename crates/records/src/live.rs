@@ -723,28 +723,37 @@ async fn insert_live_checkpoint(
 }
 
 impl Db {
-    /// Reports whether a live log has entries beyond the newest stored live checkpoint.
+    /// Reports whether a live log has entries beyond the newest stored live checkpoint: `None`
+    /// when `doc` has never been live. Read-only and narrow (no log row is created, and no
+    /// payload or identity data is read), as every document answer and download asks it.
     pub async fn live_behind(&self, doc: DocId) -> Result<Option<LiveBehind>, DbError> {
-        let live = self.load_live(doc).await?;
-        if live.format.is_none() {
+        let row = sqlx::query(
+            "select l.head, l.format, l.verified_through, \
+                    (select max(c.through) from live_checkpoints c \
+                     where c.document_id = l.document_id \
+                       and (c.verified_at is not null or c.disputed_at is null)) as stored \
+             from live_logs l where l.document_id = $1",
+        )
+        .bind(doc.0)
+        .fetch_optional(self.pool())
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let format: Option<String> = row.try_get("format")?;
+        if format.is_none() {
             return Ok(None);
         }
-        let stored_through = live
-            .verified_checkpoint
-            .as_ref()
-            .map_or(live.verified_through, |checkpoint| {
-                live.verified_through.max(checkpoint.through)
-            })
-            .max(
-                live.unverified_checkpoints
-                    .iter()
-                    .map(|checkpoint| checkpoint.through)
-                    .max()
-                    .unwrap_or(Seq(0)),
-            );
+        let head = Seq(unsigned(row.try_get("head")?)?);
+        let verified_through = Seq(unsigned(row.try_get("verified_through")?)?);
+        let stored: Option<i64> = row.try_get("stored")?;
+        let stored_through = match stored {
+            Some(through) => verified_through.max(Seq(unsigned(through)?)),
+            None => verified_through,
+        };
         Ok(Some(LiveBehind {
-            behind: live.head > stored_through,
-            head: live.head,
+            behind: head > stored_through,
+            head,
             stored_through,
         }))
     }

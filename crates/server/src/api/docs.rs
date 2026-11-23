@@ -27,6 +27,22 @@ fn rfc3339(time: Option<OffsetDateTime>) -> Option<String> {
     time.and_then(|time| time.format(&Rfc3339).ok())
 }
 
+/// Where `doc`'s live log stands against its stored revisions, or `None` when it has never
+/// been live. Best effort: the mark only decorates a document answer or a download, so a
+/// database failure is reported on the console and the answer goes out without it.
+pub(crate) async fn live_behind_mark(db: &records::Db, doc: DocId) -> Option<records::LiveBehind> {
+    match db.live_behind(doc).await {
+        Ok(live) => live,
+        Err(e) => {
+            eprintln!(
+                "sharecraft-server: the live mark of document {} was left out: {e}",
+                doc.0
+            );
+            None
+        }
+    }
+}
+
 /// The body of `POST /api/docs`.
 #[derive(Deserialize)]
 pub(crate) struct NewDoc {
@@ -181,10 +197,9 @@ pub(crate) async fn open(
         .scan_mark(doc)
         .await
         .map_err(|e| ApiError::unavailable(&e))?;
-    let live = db
-        .live_behind(doc)
+    // Best effort: a failure here leaves the mark out rather than failing the answer.
+    let live = live_behind_mark(db, doc)
         .await
-        .map_err(|e| ApiError::unavailable(&e))?
         .unwrap_or(records::LiveBehind {
             behind: false,
             head: collab_core::ids::Seq(0),

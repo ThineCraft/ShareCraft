@@ -383,10 +383,9 @@ pub(crate) async fn download(
     };
 
     let mut answer = file_answer(&state, &document.name, current, headers.get(RANGE)).await?;
-    if db
-        .live_behind(doc)
+    // Best effort: a failure here leaves the header out rather than failing the download.
+    if crate::api::docs::live_behind_mark(db, doc)
         .await
-        .map_err(|e| ApiError::unavailable(&e))?
         .is_some_and(|live| live.behind)
     {
         answer.headers_mut().insert(

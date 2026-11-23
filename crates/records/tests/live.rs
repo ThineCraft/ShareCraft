@@ -2634,3 +2634,99 @@ async fn load_breaks_a_tie_between_verified_checkpoints_by_the_newest_verificati
         assert_eq!(loaded.verified_checkpoint.unwrap().revision, newer);
     }
 }
+
+#[tokio::test]
+async fn behind_mark_writes_nothing_for_a_document_never_live() {
+    let s = setup().await;
+    assert_eq!(s.test.db.live_behind(s.doc).await.unwrap(), None);
+    let rows: i64 = sqlx::query_scalar("select count(*) from live_logs where document_id = $1")
+        .bind(s.doc.0)
+        .fetch_one(s.test.db.test_pool())
+        .await
+        .unwrap();
+    assert_eq!(rows, 0);
+}
+
+#[tokio::test]
+async fn behind_mark_follows_the_stored_checkpoints() {
+    let s = setup().await;
+    let session = session(&s, 0).await;
+    let one = client();
+    let mark = |behind, head, stored| {
+        Some(records::LiveBehind {
+            behind,
+            head: Seq(head),
+            stored_through: Seq(stored),
+        })
+    };
+    // A session with no entries has no format yet.
+    assert_eq!(s.test.db.live_behind(s.doc).await.unwrap(), None);
+    for seq in 1..=3 {
+        s.test
+            .db
+            .append_live_change(s.doc, &change(seq, session, one, s.ann, seq, b"x", &[]))
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        s.test.db.live_behind(s.doc).await.unwrap(),
+        mark(true, 3, 0)
+    );
+
+    let first = revision(&s, 'a', None).await;
+    let second = revision(&s, 'b', Some(&first)).await;
+    let third = revision(&s, 'c', Some(&second)).await;
+    for (revision, through) in [(&first, 1u8), (&second, 2), (&third, 3)] {
+        s.test
+            .db
+            .record_live_checkpoint(
+                s.doc,
+                &NewLiveCheckpoint {
+                    revision,
+                    through: Seq(u64::from(through)),
+                    sha256: [through; 32],
+                    session,
+                    session_data: &[1],
+                    major_reason: None,
+                    major_person: None,
+                    writer: None,
+                    created_at: at(i64::from(through) + 3),
+                },
+            )
+            .await
+            .unwrap();
+    }
+    // An unverified checkpoint counts as stored.
+    assert_eq!(
+        s.test.db.live_behind(s.doc).await.unwrap(),
+        mark(false, 3, 3)
+    );
+    // A disputed one does not.
+    s.test
+        .db
+        .dispute_live_checkpoint(s.doc, &third, at(10))
+        .await
+        .unwrap();
+    assert_eq!(
+        s.test.db.live_behind(s.doc).await.unwrap(),
+        mark(true, 3, 2)
+    );
+    s.test
+        .db
+        .verify_live_checkpoint(s.doc, &first, Seq(1), at(11))
+        .await
+        .unwrap();
+    assert_eq!(
+        s.test.db.live_behind(s.doc).await.unwrap(),
+        mark(true, 3, 2)
+    );
+    s.test
+        .db
+        .verify_live_checkpoint(s.doc, &second, Seq(2), at(12))
+        .await
+        .unwrap();
+    assert_eq!(
+        s.test.db.live_behind(s.doc).await.unwrap(),
+        mark(true, 3, 2)
+    );
+}
