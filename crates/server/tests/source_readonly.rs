@@ -1618,22 +1618,6 @@ async fn every_content_route_refuses_in_a_connected_library() {
 /// The same complete guarded-route table uses the same refusal for a file-share library. The
 /// fixture selection is the only difference, so a route added to the table is exercised for
 /// both connected-source kinds without a second copy of the table.
-/// The same table against an S3 library: every write route refuses for its owner and for an
-/// administrator (the S3 twin of the file-share test below). The table is shared, not copied.
-#[tokio::test]
-async fn every_write_route_is_refused_in_an_s3_library() {
-    let env = Env::new().await;
-    let fx = env
-        .fixture_for(Some(SourceKind::S3), &[&env.olive, &env.admin])
-        .await;
-    for (user, who) in [(&env.olive, "s3 owner"), (&env.admin, "s3 administrator")] {
-        for row in ROWS {
-            let answered = env.perform(&fx, user, row.act).await;
-            assert_refused(row.act, who, &answered);
-        }
-    }
-}
-
 #[tokio::test]
 async fn every_write_route_is_refused_in_a_share_library() {
     let env = Env::new().await;
@@ -1642,6 +1626,22 @@ async fn every_write_route_is_refused_in_a_share_library() {
         (&env.olive, "share owner"),
         (&env.admin, "share administrator"),
     ] {
+        for row in ROWS {
+            let answered = env.perform(&fx, user, row.act).await;
+            assert_refused(row.act, who, &answered);
+        }
+    }
+}
+
+/// The same table against an S3 library: every write route refuses for its owner and for an
+/// administrator (the S3 twin of the file-share test above). The table is shared, not copied.
+#[tokio::test]
+async fn every_write_route_is_refused_in_an_s3_library() {
+    let env = Env::new().await;
+    let fx = env
+        .fixture_for(Some(SourceKind::S3), &[&env.olive, &env.admin])
+        .await;
+    for (user, who) in [(&env.olive, "s3 owner"), (&env.admin, "s3 administrator")] {
         for row in ROWS {
             let answered = env.perform(&fx, user, row.act).await;
             assert_refused(row.act, who, &answered);

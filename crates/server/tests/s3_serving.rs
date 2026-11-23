@@ -525,20 +525,34 @@ async fn gone_denied_offline_and_not_approved_are_409_with_their_reasons() {
     .await;
     env.fake.remove(BUCKET, "gone.txt");
     env.fake.deny(BUCKET, "denied.txt");
-    assert_source_unavailable(&env, "gone.txt", StatusCode::CONFLICT, "gone").await;
+    let gone = assert_source_unavailable(&env, "gone.txt", StatusCode::CONFLICT, "gone").await;
+    assert_eq!(
+        gone["message"],
+        "This file is no longer in the library's S3 storage."
+    );
     assert_source_unavailable(&env, "denied.txt", StatusCode::CONFLICT, "denied").await;
 
     set_endpoints(&env.server, endpoint_at(&dead_origin().await)).await;
-    assert_source_unavailable(
+    let offline = assert_source_unavailable(
         &env,
         "offline.txt",
         StatusCode::SERVICE_UNAVAILABLE,
         "offline",
     )
     .await;
+    assert_eq!(
+        offline["message"],
+        "The library's S3 storage cannot be reached. Files opened before still open; others will open when it is back."
+    );
 
     set_endpoints(&env.server, json!([])).await;
-    assert_source_unavailable(&env, "withdrawn.txt", StatusCode::CONFLICT, "not_approved").await;
+    let withdrawn =
+        assert_source_unavailable(&env, "withdrawn.txt", StatusCode::CONFLICT, "not_approved")
+            .await;
+    assert_eq!(
+        withdrawn["message"],
+        "The S3 endpoint this library uses is no longer approved by an administrator."
+    );
 }
 
 #[tokio::test]

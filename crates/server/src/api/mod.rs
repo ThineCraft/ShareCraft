@@ -36,7 +36,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use collab_core::ids::{DocId, NodeId, SessionId, UserId};
-use records::{AccessError, AccountError, FileType, LinkError, RequestError, ScanState};
+use records::{
+    AccessError, AccountError, FileType, LinkError, RequestError, ScanState, SourceKind,
+};
 use serde::de::DeserializeOwned;
 use serde_json::json;
 use uuid::Uuid;
@@ -403,10 +405,11 @@ pub(crate) enum ApiError {
     /// is created, changed, moved, copied in, deleted or restored here; administrators too.
     /// The answer's `message` says so in words.
     SourceReadOnly,
-    /// 409: the file share cannot currently supply this file. The reason is a stable public
-    /// classification and never operating-system text or a path.
-    SourceUnavailable(&'static str),
-    /// 409: Phase 1 cannot copy a file or folder out of a file-share library.
+    /// 409: the file share or S3 storage cannot currently supply this file. The reason is a
+    /// stable public classification and never operating-system text, a path, a bucket or a key;
+    /// the kind of source picks the message's wording.
+    SourceUnavailable(&'static str, SourceKind),
+    /// 409: Phase 1 cannot copy a file or folder out of a file-share or S3 library.
     SourceCopyUnavailable,
     /// 422: GitHub has no such repository, or the token given (or none) cannot see it; the
     /// answer's `message` says so in words.
@@ -574,10 +577,10 @@ impl ApiError {
             ApiError::SourceExists => (StatusCode::CONFLICT, "source_exists"),
             ApiError::ShareLocationInUse => (StatusCode::CONFLICT, "share_location_in_use"),
             ApiError::SourceReadOnly => (StatusCode::CONFLICT, "source_read_only"),
-            ApiError::SourceUnavailable("offline") => {
+            ApiError::SourceUnavailable("offline", _) => {
                 (StatusCode::SERVICE_UNAVAILABLE, "source_unavailable")
             }
-            ApiError::SourceUnavailable(_) => (StatusCode::CONFLICT, "source_unavailable"),
+            ApiError::SourceUnavailable(..) => (StatusCode::CONFLICT, "source_unavailable"),
             ApiError::SourceCopyUnavailable => (StatusCode::CONFLICT, "source_copy_unavailable"),
             ApiError::RepositoryNotFound => {
                 (StatusCode::UNPROCESSABLE_ENTITY, "repository_not_found")
@@ -881,10 +884,10 @@ impl IntoResponse for ApiError {
             ApiError::Held(scan) => json!({ "error": code, "scan": scan }),
             ApiError::TooMany(limit) => json!({ "error": code, "limit": limit }),
             ApiError::SourceReadOnly => json!({ "error": code, "message": SOURCE_READ_ONLY }),
-            ApiError::SourceUnavailable(reason) => json!({
+            ApiError::SourceUnavailable(reason, kind) => json!({
                 "error": code,
                 "reason": reason,
-                "message": source_unavailable_message(reason),
+                "message": source_unavailable_message(reason, kind),
             }),
             ApiError::SourceCopyUnavailable => {
                 json!({ "error": code, "message": SOURCE_COPY_UNAVAILABLE })
@@ -935,7 +938,34 @@ fn share_unreachable_message(reason: &str) -> &'static str {
     }
 }
 
-fn source_unavailable_message(reason: &str) -> &'static str {
+/// The plain sentence for an unavailable external file: the file-share wording, or for an S3
+/// library the S3 wording. `archived` and `budget` are the same for both.
+fn source_unavailable_message(reason: &str, kind: SourceKind) -> &'static str {
+    if kind == SourceKind::S3 {
+        return match reason {
+            "gone" => "This file is no longer in the library's S3 storage.",
+            "denied" => "The library's S3 access key is not allowed to read this file.",
+            "offline" => {
+                "The library's S3 storage cannot be reached. Files opened before still open; others will open when it is back."
+            }
+            "changing" => {
+                "This file changed in S3 storage while it was being read. Try again in a moment."
+            }
+            "too_large" => {
+                "This file is too large to open from S3 storage with the current cache size."
+            }
+            "not_approved" => {
+                "The S3 endpoint this library uses is no longer approved by an administrator."
+            }
+            "archived" => {
+                "This file is in archive storage and must be restored there before it can be opened."
+            }
+            "budget" => {
+                "This library has used its request budget for the month. Files opened before still open; a library owner can raise the budget."
+            }
+            _ => "This file cannot be read from S3 storage right now.",
+        };
+    }
     match reason {
         "gone" => "The file is no longer available on the file share.",
         "denied" => "The server is not allowed to read this file from the file share.",

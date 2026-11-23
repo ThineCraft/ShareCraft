@@ -28,7 +28,9 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use collab_core::ids::{DocId, NodeId, Seq};
 use futures_util::{Stream, StreamExt};
-use records::{AccessError, Editor, NameConflict, Origin, QuotaError, Reservation, User};
+use records::{
+    AccessError, Editor, NameConflict, Origin, QuotaError, Reservation, SourceKind, User,
+};
 use revisions::{
     Author, BlobRef, Checkpoint, CheckpointError, Content, Outcome, RevisionId, Stored,
 };
@@ -155,23 +157,29 @@ pub(crate) async fn current_content(state: &AppState, doc: DocId) -> Result<Curr
     match crate::external::materialise(state, NodeId(doc.0)).await {
         Ok(Some(ready)) => Ok(Current::External(ready)),
         Ok(None) => Ok(Current::None),
-        Err(error) => Err(external_error(error)),
+        Err(error) => {
+            let kind = match state.db().external_item(NodeId(doc.0)).await {
+                Ok(Some(item)) => item.kind,
+                _ => SourceKind::Share,
+            };
+            Err(external_error(error, kind))
+        }
     }
 }
 
-fn external_error(error: ExternalError) -> ApiError {
+fn external_error(error: ExternalError, kind: SourceKind) -> ApiError {
     match error {
-        ExternalError::Gone => ApiError::SourceUnavailable("gone"),
-        ExternalError::Denied => ApiError::SourceUnavailable("denied"),
-        ExternalError::Offline => ApiError::SourceUnavailable("offline"),
-        ExternalError::Changing => ApiError::SourceUnavailable("changing"),
-        ExternalError::TooLarge => ApiError::SourceUnavailable("too_large"),
-        ExternalError::NotApproved => ApiError::SourceUnavailable("not_approved"),
+        ExternalError::Gone => ApiError::SourceUnavailable("gone", kind),
+        ExternalError::Denied => ApiError::SourceUnavailable("denied", kind),
+        ExternalError::Offline => ApiError::SourceUnavailable("offline", kind),
+        ExternalError::Changing => ApiError::SourceUnavailable("changing", kind),
+        ExternalError::TooLarge => ApiError::SourceUnavailable("too_large", kind),
+        ExternalError::NotApproved => ApiError::SourceUnavailable("not_approved", kind),
         ExternalError::Busy => ApiError::Busy,
         ExternalError::Held(scan) => ApiError::Held(scan),
         ExternalError::Failed => ApiError::Unavailable,
-        ExternalError::Archived => ApiError::SourceUnavailable("archived"),
-        ExternalError::OverBudget => ApiError::SourceUnavailable("budget"),
+        ExternalError::Archived => ApiError::SourceUnavailable("archived", kind),
+        ExternalError::OverBudget => ApiError::SourceUnavailable("budget", kind),
     }
 }
 
