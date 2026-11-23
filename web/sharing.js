@@ -41,6 +41,47 @@ let globalEditor = null;
 let regional = null;
 let scanner = null; // the scanner settings as the server last answered them
 
+// ---- S3 storage state and wording (declared before the first call that can reach it) ----
+
+let s3Answer = null; // the S3 settings as the server last answered them: endpoints and in_use
+
+/** The sentence for each reason the server gives for an endpoint, in plain words. */
+const S3_REASON = {
+  empty: 'Fill in this field.',
+  not_https: 'Use an https address.',
+  has_path: 'Give the address without a path.',
+  has_query: 'Give the address without a query.',
+  has_credentials: 'Leave user names and passwords out of the address.',
+  bad_host: 'The address needs a host name.',
+  address_literal: 'Use a host name, not an IP address.',
+  bad_port: 'The port is not one S3 storage uses.',
+  bad_region: 'The region is not valid.',
+  bad_name: 'The name is not valid.',
+  name_taken: 'Another storage already has this name.',
+  too_many: 'There are too many storage entries.',
+  bad_range: 'A private range is not valid. Write it like 10.0.0.0/8.',
+  reserved: 'That range cannot be allowed.',
+  unknown_field: 'That is not a field ShareCraft knows.',
+  bad_path_style: 'Choose path style or virtual-hosted style.',
+};
+/** The field each entry reason is shown beside. */
+const S3_FIELD = {
+  bad_name: 'name',
+  name_taken: 'name',
+  not_https: 'url',
+  has_path: 'url',
+  has_query: 'url',
+  has_credentials: 'url',
+  bad_host: 'url',
+  address_literal: 'url',
+  bad_port: 'url',
+  bad_region: 'region',
+  bad_path_style: 'style',
+  bad_range: 'allow',
+  reserved: 'allow',
+};
+const S3_FIELDS = ['name', 'url', 'region', 'style', 'allow'];
+
 
 if (!me.is_admin) {
   status.textContent = 'Only administrators can change the organisation settings.';
@@ -56,6 +97,7 @@ if (!me.is_admin) {
   await showRegional();
   await showFiles();
   await showScanner();
+  await showS3Storage();
   await showGlobal();
 }
 
@@ -239,6 +281,112 @@ $('scanner-test').addEventListener('click', async () => {
   if (!scanner) return;
   if (!scanner.scanner_url) return noteIn('scanner-msg', 'There is no scanner to test. Enter its address and save first.');
   await sendScanner({ scanner_url: scanner.scanner_url });
+});
+
+// ---- S3 storage ----
+
+
+
+function clearS3Errors() {
+  for (const field of S3_FIELDS) showMessage($(`s3-err-${field}`), '');
+}
+
+function showS3Rows(answer) {
+  const rows = answer.endpoints.map((endpoint, index) =>
+    h(
+      'tr',
+      {},
+      h('th', { scope: 'row' }, endpoint.name),
+      h('td', {}, endpoint.url),
+      h('td', {}, endpoint.region),
+      h('td', {}, endpoint.path_style ? 'Path style' : 'Virtual-hosted style'),
+      h('td', {}, endpoint.allow.length > 0 ? endpoint.allow.join(', ') : 'None'),
+      h('td', {}, String(answer.in_use?.[endpoint.name] ?? 0)),
+      h(
+        'td',
+        {},
+        h('button', { type: 'button', class: 'plain', 'data-index': String(index), 'aria-label': `Remove ${endpoint.name}` }, 'Remove'),
+      ),
+    ),
+  );
+  $('s3-rows').replaceChildren(...rows);
+  $('s3-none').hidden = answer.endpoints.length > 0;
+}
+
+async function showS3Storage() {
+  const result = await api('GET', '/settings/s3');
+  if (!result.ok) return showMessage(error, messageFor(result.error));
+  s3Answer = result.data;
+  showS3Rows(s3Answer);
+  $('s3').hidden = false;
+}
+
+/** A refused endpoint: its reason beside the field it concerns, or in the form's message. */
+function s3Refused(result, newIndex) {
+  if (result.error !== 'invalid_s3_endpoint') return noteIn('s3-msg', messageFor(result.error));
+  const { entry, reason } = result.data ?? {};
+  const text = S3_REASON[reason] ?? 'The storage was not saved. Check the entry and try again.';
+  const field = entry === newIndex ? S3_FIELD[reason] : undefined;
+  if (field) return showMessage($(`s3-err-${field}`), text);
+  const where = typeof entry === 'number' && entry !== newIndex ? `Storage ${entry + 1}: ` : '';
+  return noteIn('s3-msg', `${where}${text}`);
+}
+
+/** Saves the whole list of endpoints the server keeps; `newIndex` names the entry being added. */
+async function sendS3(endpoints, newIndex, done) {
+  const result = await api('PUT', '/settings/s3', { endpoints });
+  if (!result.ok) return s3Refused(result, newIndex);
+  s3Answer = result.data;
+  showS3Rows(s3Answer);
+  noteIn('s3-msg', done, true);
+}
+
+$('s3-add').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  if (!s3Answer) return;
+  clearS3Errors();
+  noteIn('s3-msg', '');
+  const entry = {
+    name: $('s3-name').value.trim(),
+    url: $('s3-url').value.trim(),
+    region: $('s3-region').value.trim(),
+    path_style: $('s3-style').value === 'path',
+    allow: $('s3-allow')
+      .value.split(',')
+      .map((range) => range.trim())
+      .filter((range) => range !== ''),
+  };
+  const endpoints = [...s3Answer.endpoints, entry];
+  await sendS3(endpoints, s3Answer.endpoints.length, 'Added. Libraries can connect to it now.');
+  if (s3Answer.endpoints.length === endpoints.length) {
+    $('s3-name').value = '';
+    $('s3-url').value = '';
+    $('s3-region').value = '';
+    $('s3-style').value = 'path';
+    $('s3-allow').value = '';
+  }
+});
+
+$('s3-rows').addEventListener('click', async (event) => {
+  const button = event.target.closest('button[data-index]');
+  if (!button || !s3Answer) return;
+  const index = Number(button.dataset.index);
+  const endpoint = s3Answer.endpoints[index];
+  if (!endpoint) return;
+  const users = s3Answer.in_use?.[endpoint.name] ?? 0;
+  const sure = await confirmDialog(
+    users > 0
+      ? `Remove ${endpoint.name}? ${users} ${users === 1 ? 'library reads' : 'libraries read'} from it, and their reads stop at once.`
+      : `Remove ${endpoint.name}?`,
+    'Remove storage',
+  );
+  if (!sure) return button.focus();
+  noteIn('s3-msg', '');
+  await sendS3(
+    s3Answer.endpoints.filter((_, position) => position !== index),
+    -1,
+    `Removed ${endpoint.name}.`,
+  );
 });
 
 $('scan-existing').addEventListener('click', async () => {

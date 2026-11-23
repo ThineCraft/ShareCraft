@@ -104,6 +104,63 @@
   <p id="scan-existing-msg" role="status" class="msg ok"></p>
   <p><a href="/quarantine.html">Open the quarantine</a></p>
  </section>
+ <section id="s3" aria-labelledby="s3-heading" hidden>
+  <h2 id="s3-heading">S3 storage</h2>
+  <p class="note">ShareCraft connects only to these addresses and to Amazon S3. Addresses inside private networks are refused unless you list the range here.</p>
+  <p class="meta">ShareCraft's own permissions decide who sees a file; the bucket's policies are not read. Whoever connects a library chooses who sees everything the access key can read under that folder.</p>
+  <div class="scroll">
+   <table class="banded" id="s3-table">
+    <caption class="visually-hidden">Approved S3 storage</caption>
+    <thead>
+     <tr>
+      <th scope="col">Name</th>
+      <th scope="col">Address</th>
+      <th scope="col">Region</th>
+      <th scope="col">Addressing</th>
+      <th scope="col">Private ranges allowed</th>
+      <th scope="col">Libraries using it</th>
+      <th scope="col"><span class="visually-hidden">Actions</span></th>
+     </tr>
+    </thead>
+    <tbody id="s3-rows"></tbody>
+   </table>
+  </div>
+  <p id="s3-none" class="meta" hidden>No S3 storage is approved yet. Libraries cannot connect to S3 until one is added.</p>
+  <form id="s3-add" class="stack" aria-labelledby="s3-add-heading">
+   <h3 id="s3-add-heading">Add storage</h3>
+   <div class="field">
+    <label for="s3-name">Name</label>
+    <input type="text" id="s3-name" autocomplete="off" aria-describedby="s3-err-name">
+    <small id="s3-err-name" role="alert" class="msg"></small>
+   </div>
+   <div class="field">
+    <label for="s3-url">Address</label>
+    <input type="text" id="s3-url" autocomplete="off" spellcheck="false" placeholder="https://storage.example.org" aria-describedby="s3-err-url">
+    <small id="s3-err-url" role="alert" class="msg"></small>
+   </div>
+   <div class="field">
+    <label for="s3-region">Region</label>
+    <input type="text" id="s3-region" autocomplete="off" aria-describedby="s3-err-region">
+    <small id="s3-err-region" role="alert" class="msg"></small>
+   </div>
+   <div class="field">
+    <label for="s3-style">Addressing</label>
+    <select id="s3-style" aria-describedby="s3-err-style">
+     <option value="path">Path style</option>
+     <option value="virtual">Virtual-hosted style</option>
+    </select>
+    <small id="s3-err-style" role="alert" class="msg"></small>
+   </div>
+   <div class="field">
+    <label for="s3-allow">Private ranges allowed</label>
+    <input type="text" id="s3-allow" autocomplete="off" spellcheck="false" aria-describedby="s3-allow-note s3-err-allow">
+    <small id="s3-allow-note" class="meta">Separated by commas, like 10.0.0.0/8. Leave empty to allow none.</small>
+    <small id="s3-err-allow" role="alert" class="msg"></small>
+   </div>
+   <div><button type="submit">Add storage</button></div>
+   <p id="s3-msg" role="alert" class="msg"></p>
+  </form>
+ </section>
  <section id="global" aria-labelledby="global-heading" hidden>
   <h2 id="global-heading">Global navigation</h2>
   <p class="meta">The bar at the top of every page. A link to a place is shown only to people who can open it.</p>

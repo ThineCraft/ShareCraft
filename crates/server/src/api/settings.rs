@@ -342,6 +342,26 @@ pub(crate) async fn s3(
     Ok(Json(s3_out(&state).await?))
 }
 
+/// `GET /api/s3/endpoints`: the names of the approved S3 endpoints as `[{name}]`, and nothing
+/// else (no address, region, addressing style or ranges), for anyone signed in (`401` otherwise).
+pub(crate) async fn s3_names(
+    State(state): State<AppState>,
+    _signed: Signed,
+) -> Result<Json<Value>, ApiError> {
+    let settings = state
+        .db()
+        .s3_settings()
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?;
+    Ok(Json(Value::Array(
+        settings
+            .endpoints
+            .iter()
+            .map(|endpoint| json!({ "name": endpoint.name }))
+            .collect(),
+    )))
+}
+
 /// `PUT /api/settings/s3 {endpoints?, list_requests?, read_requests?, bytes_down?}`: changes
 /// the settings given, for administrators (`403` otherwise). Everything is checked before
 /// anything is written, then all of it is written in one transaction or none of it; each

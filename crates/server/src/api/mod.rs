@@ -93,6 +93,7 @@ pub(crate) fn router() -> Router<AppState> {
             get(settings::shares).put(settings::change_shares),
         )
         .route("/settings/s3", get(settings::s3).put(settings::change_s3))
+        .route("/s3/endpoints", get(settings::s3_names))
         .route(
             "/libraries/{id}",
             get(libraries::show).patch(libraries::change),

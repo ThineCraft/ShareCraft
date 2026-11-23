@@ -1276,3 +1276,42 @@ async fn no_event_holds_the_endpoint_bucket_prefix_or_key_id() {
         }
     }
 }
+
+#[tokio::test]
+async fn signed_in_users_are_given_only_the_names_of_the_approved_endpoints() {
+    let env = Env::new().await;
+    let someone = env.server.user("Plain user").await;
+    let named = "names-endpoint-7a3";
+    set_endpoints(
+        &env.server,
+        json!([endpoint_entry(named, "https://s3.example.test:443", &["10.0.0.0/8"])]),
+    )
+    .await;
+    let (status, answer) = env
+        .call(&someone, Method::GET, "/api/s3/endpoints", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer, json!([{ "name": named }]));
+    let entries = answer.as_array().unwrap();
+    for entry in entries {
+        let keys: Vec<&str> = entry
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, vec!["name"], "{answer}");
+    }
+    let text = answer.to_string();
+    for hidden in ["url", "region", "path_style", "allow", "127.0.0.1", "http"] {
+        assert!(!text.contains(hidden), "{hidden} in {answer}");
+    }
+    let signed_out = env
+        .server
+        .http(None)
+        .request(Method::GET, env.server.url("/api/s3/endpoints"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(signed_out.status(), StatusCode::UNAUTHORIZED);
+}

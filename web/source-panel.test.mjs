@@ -9,6 +9,10 @@ import {
   shouldReload,
   validRepository,
   webhookInstructions,
+  sourceName,
+  unavailableText,
+  validBucket,
+  validPrefix,
 } from './source-panel.js';
 
 test('shouldReload follows a changed commit or a completed update', () => {
@@ -26,6 +30,8 @@ test('sourceAccess distinguishes a missing source from connected and uncertain r
   assert.equal(sourceAccess({ ok: false, status: 0, error: 'network' }), 'unknown');
   assert.equal(sourceAccess({ ok: true, status: 200, data: connected }), 'connected');
   assert.equal(sourceAccess({ ok: true, status: 200, data: null }), 'unknown');
+  assert.equal(sourceAccess({ ok: true, status: 200, data: { kind: 's3', state: 'ok', bucket: null } }), 'connected');
+  assert.equal(sourceAccess({ ok: true, status: 200, data: { kind: 's3' } }), 'unknown');
 });
 
 test('source controls stay disabled while source access is unknown', () => {
@@ -127,4 +133,103 @@ test('webhookInstructions names the JSON payload, secret and push event without 
   assert.equal(lines.join('\n').split(address).length - 1, 1);
   assert.equal(lines.join('\n').split(secret).length - 1, 1);
   assert.equal(lines.join('\n').includes('must-not-leak'), false);
+});
+
+const S3_NOW = Date.parse('2026-11-17T14:24:00Z');
+const s3 = {
+  kind: 's3',
+  mode: 'read_only',
+  last_checked_at: '2026-11-17T14:20:00Z',
+  last_synced_at: '2026-11-17T14:20:00Z',
+  paused: null,
+  listing_now: null,
+  bucket: 'docs',
+  prefix: 'team/',
+};
+
+test('sourceSummary describes an S3 library that is shown and checked', () => {
+  assert.deepEqual(sourceSummary({ ...s3, state: 'ok' }, S3_NOW), {
+    headline: 'Shows the files in S3 storage.',
+    detail: 'Checked 4 minutes ago. Files open from the bucket when you ask for them; this library cannot be changed here.',
+    tone: 'ok',
+  });
+});
+
+test('sourceSummary shows listing progress for an S3 library being listed', () => {
+  assert.deepEqual(sourceSummary({ ...s3, state: 'syncing', listing_now: { files_so_far: 12400 } }, S3_NOW), {
+    headline: 'Listing the bucket… 12,400 files so far',
+    detail: 'Files shown are from the last update. This library cannot be changed here.',
+    tone: 'working',
+  });
+  assert.equal(sourceSummary({ ...s3, state: 'syncing', listing_now: null }, S3_NOW).headline, 'Listing the bucket…');
+});
+
+test('sourceSummary gives the S3 connecting, unreachable, refused and budget states their words', () => {
+  assert.deepEqual(sourceSummary({ ...s3, state: 'connecting', last_checked_at: null }, S3_NOW), {
+    headline: 'Connecting…',
+    detail: 'Files will appear after the first listing. This library cannot be changed here.',
+    tone: 'working',
+  });
+  assert.deepEqual(sourceSummary({ ...s3, state: 'failed' }, S3_NOW), {
+    headline: 'The storage could not be reached. Files already opened still open.',
+    detail: 'Files shown are from the last update. This library cannot be changed here.',
+    tone: 'attention',
+  });
+  assert.deepEqual(sourceSummary({ ...s3, state: 'not_connected' }, S3_NOW), {
+    headline: 'The storage refused the access key.',
+    detail: 'Files shown are from the last update. This library cannot be changed here.',
+    tone: 'attention',
+  });
+  assert.deepEqual(sourceSummary({ ...s3, state: 'ok', paused: 'list' }, S3_NOW), {
+    headline: 'This library has used its request budget for the month. Files opened before still open.',
+    detail: 'Files shown are from the last update. This library cannot be changed here.',
+    tone: 'attention',
+  });
+});
+
+test('sourceName shows the bucket and folder for owners and never invents a bucket', () => {
+  assert.equal(sourceName({ kind: 's3', bucket: 'docs', prefix: 'team/' }), 'docs/team');
+  assert.equal(sourceName({ kind: 's3', bucket: 'docs', prefix: '' }), 'docs');
+  assert.equal(sourceName({ kind: 's3', bucket: null, prefix: null }), 'S3 storage');
+  assert.equal(sourceName({ kind: 's3' }), 'S3 storage');
+  assert.equal(sourceName({ repository: 'owner/repo', branch: 'main' }), 'github.com/owner/repo');
+});
+
+test('unavailableText gives a word for each unavailable reason', () => {
+  assert.equal(unavailableText('archived'), 'In archive storage');
+  assert.equal(unavailableText('gone'), 'Not in the bucket');
+  assert.equal(unavailableText('denied'), 'Access refused');
+  assert.equal(unavailableText('budget'), 'Over the request budget');
+  assert.equal(unavailableText('anything'), 'Unavailable');
+  assert.equal(unavailableText(undefined), 'Unavailable');
+});
+
+test('validBucket accepts S3 bucket names and gives a reason for each refusal', () => {
+  for (const name of ['abc', 'my-bucket.2026', 'a1b', 'x'.repeat(63)]) {
+    assert.deepEqual(validBucket(name), { ok: true, reason: '' }, name);
+  }
+  const refused = [
+    'ab',
+    'x'.repeat(64),
+    'My-Bucket',
+    'bucket_name',
+    '-bucket',
+    'bucket-',
+    'my..bucket',
+    '192.168.0.1',
+  ];
+  for (const name of refused) {
+    const answer = validBucket(name);
+    assert.equal(answer.ok, false, name);
+    assert.notEqual(answer.reason, '', name);
+  }
+});
+
+test('validPrefix accepts an empty or plain folder and refuses unsafe ones', () => {
+  for (const prefix of ['', 'team', 'team/', 'a/b/c/']) assert.deepEqual(validPrefix(prefix), { ok: true, reason: '' }, prefix);
+  for (const prefix of ['/team', 'a/../b', 'a/./b', 'x'.repeat(513), 'bad\u0001name']) {
+    const answer = validPrefix(prefix);
+    assert.equal(answer.ok, false, JSON.stringify(prefix));
+    assert.notEqual(answer.reason, '');
+  }
 });

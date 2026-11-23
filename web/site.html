@@ -85,6 +85,7 @@
    <legend>Start with</legend>
    <label class="check"><input type="radio" name="library-source" value="empty" checked> Empty library</label>
    <label class="check"><input type="radio" name="library-source" value="github"> From a GitHub repository</label>
+   <label class="check"><input type="radio" name="library-source" value="s3"> From S3 storage</label>
   </fieldset>
   <div id="github-library-fields" hidden>
    <div class="field">
@@ -107,6 +108,33 @@
     <input type="password" id="github-token" autocomplete="new-password" aria-describedby="github-token-note">
     <small id="github-token-note" class="meta">A public repository needs no token. For a private repository, a read-only fine-grained token with Contents: read is enough.</small>
    </div>
+  </div>
+  <div id="s3-library-fields" hidden>
+   <div class="field">
+    <label for="s3-endpoint">Storage</label>
+    <select id="s3-endpoint" aria-describedby="s3-none"></select>
+    <small id="s3-none" class="msg" hidden></small>
+   </div>
+   <div class="field">
+    <label for="s3-bucket">Bucket</label>
+    <input type="text" id="s3-bucket" autocomplete="off" aria-describedby="s3-bucket-note">
+    <small id="s3-bucket-note" class="meta">3 to 63 lower-case letters, digits, dots and hyphens.</small>
+   </div>
+   <div class="field">
+    <label for="s3-prefix">Folder in the bucket</label>
+    <input type="text" id="s3-prefix" autocomplete="off" aria-describedby="s3-prefix-note">
+    <small id="s3-prefix-note" class="meta">Leave empty to use the whole bucket.</small>
+   </div>
+   <div class="field">
+    <label for="s3-key-id">Access key ID</label>
+    <input type="text" id="s3-key-id" autocomplete="off">
+   </div>
+   <div class="field">
+    <label for="s3-secret">Secret access key</label>
+    <input type="password" id="s3-secret" autocomplete="off" aria-describedby="s3-secret-note">
+    <small id="s3-secret-note" class="meta">Never shown again after you create the library.</small>
+   </div>
+   <p class="meta" id="s3-hint">Files stay in the bucket: ShareCraft reads one when someone opens it. Your storage provider may charge for the requests and downloads ShareCraft makes. In this release the library is read-only. Give ShareCraft a key that may only read this bucket.</p>
   </div>
   <p id="new-library-error" role="alert" class="msg" tabindex="-1"></p>
   <div class="row end">

@@ -7,6 +7,9 @@ const LAST_UPDATE = `Files shown are from the last update. ${READ_ONLY}`;
 export function sourceAccess(result) {
   if (!result?.ok) return result?.status === 404 ? 'none' : 'unknown';
   const source = result.data;
+  if (source !== null && typeof source === 'object' && source.kind === 's3') {
+    return typeof source.state === 'string' ? 'connected' : 'unknown';
+  }
   return source !== null && typeof source === 'object' && typeof source.repository === 'string' &&
       typeof source.branch === 'string' && typeof source.state === 'string'
     ? 'connected'
@@ -65,9 +68,58 @@ function rateLimitTime(error) {
   return match?.[1] ?? '';
 }
 
+/** The S3 headline, supporting sentence and tone for an S3 library; the budget pause wins over the state. */
+function s3Summary(source, now) {
+  const state = source.state;
+  if (source.paused) {
+    return {
+      headline: 'This library has used its request budget for the month. Files opened before still open.',
+      detail: LAST_UPDATE,
+      tone: 'attention',
+    };
+  }
+  if (state === 'ok') {
+    const age = relativeTime(source.last_checked_at, now);
+    return {
+      headline: 'Shows the files in S3 storage.',
+      detail: `${age ? `Checked ${age}. ` : ''}Files open from the bucket when you ask for them; this library cannot be changed here.`,
+      tone: 'ok',
+    };
+  }
+  if (state === 'connecting') {
+    return {
+      headline: sourceStateText(state),
+      detail: `Files will appear after the first listing. ${READ_ONLY}`,
+      tone: 'working',
+    };
+  }
+  if (state === 'syncing') {
+    const files = Number(source.listing_now?.files_so_far);
+    return {
+      headline: Number.isFinite(files) && files >= 0
+        ? `Listing the bucket… ${files.toLocaleString('en-GB')} files so far`
+        : 'Listing the bucket…',
+      detail: LAST_UPDATE,
+      tone: 'working',
+    };
+  }
+  if (state === 'not_connected') {
+    return { headline: 'The storage refused the access key.', detail: LAST_UPDATE, tone: 'attention' };
+  }
+  if (state === 'failed' || state === 'rate_limited') {
+    return {
+      headline: 'The storage could not be reached. Files already opened still open.',
+      detail: LAST_UPDATE,
+      tone: 'attention',
+    };
+  }
+  return { headline: sourceStateText(state), detail: LAST_UPDATE, tone: 'attention' };
+}
+
 /** The headline, supporting sentence and non-colour tone for a connected-library banner. */
 export function sourceSummary(source, now = Date.now()) {
   const state = source?.state;
+  if (source?.kind === 's3') return s3Summary(source, now);
   if (state === 'ok') {
     const age = relativeTime(source.last_synced_at, now);
     return {
@@ -107,6 +159,54 @@ export function sourceSummary(source, now = Date.now()) {
 export function validRepository(text) {
   if (typeof text !== 'string' || text !== text.trim()) return false;
   return /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\/[A-Za-z0-9._-]+$/.test(text);
+}
+
+/** The name of a connected source for its owners: `github.com/owner/repo`, or `bucket/folder` for S3. */
+export function sourceName(source) {
+  if (source?.kind === 's3') {
+    if (typeof source.bucket !== 'string' || source.bucket === '') return 'S3 storage';
+    const folder = typeof source.prefix === 'string' ? source.prefix.replace(/\/+$/, '') : '';
+    return folder === '' ? source.bucket : `${source.bucket}/${folder}`;
+  }
+  return typeof source?.repository === 'string' ? `github.com/${source.repository}` : '';
+}
+
+const UNAVAILABLE_TEXT = {
+  archived: 'In archive storage',
+  gone: 'Not in the bucket',
+  denied: 'Access refused',
+  budget: 'Over the request budget',
+};
+
+/** The text mark for a file the listing reports as unavailable; never colour alone. */
+export function unavailableText(reason) {
+  return Object.hasOwn(UNAVAILABLE_TEXT, reason) ? UNAVAILABLE_TEXT[reason] : 'Unavailable';
+}
+
+/** A first check of an S3 bucket name; the server decides. */
+export function validBucket(text) {
+  const refuse = (reason) => ({ ok: false, reason });
+  if (typeof text !== 'string' || text.length < 3 || text.length > 63) {
+    return refuse('Use 3 to 63 characters.');
+  }
+  if (!/^[a-z0-9.-]+$/.test(text)) return refuse('Use only lower-case letters, digits, dots and hyphens.');
+  if (!/^[a-z0-9].*[a-z0-9]$/.test(text)) return refuse('Start and end with a letter or digit.');
+  if (text.includes('..')) return refuse('Do not use two dots in a row.');
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(text)) return refuse('Write the bucket name, not an IP address.');
+  return { ok: true, reason: '' };
+}
+
+/** A first check of the folder in a bucket; empty means the whole bucket. */
+export function validPrefix(text) {
+  if (typeof text !== 'string') return { ok: false, reason: 'Write the folder as text.' };
+  if (text === '') return { ok: true, reason: '' };
+  if (text.length > 512) return { ok: false, reason: 'Use at most 512 characters.' };
+  if (text.startsWith('/')) return { ok: false, reason: 'Do not start the folder with a slash.' };
+  if (/[\u0000-\u001f\u007f]/.test(text)) return { ok: false, reason: 'Do not use control characters.' };
+  if (text.split('/').some((segment) => segment === '.' || segment === '..')) {
+    return { ok: false, reason: 'Do not use . or .. as a folder name.' };
+  }
+  return { ok: true, reason: '' };
 }
 
 /** The four values to copy into GitHub's Add webhook form. */
