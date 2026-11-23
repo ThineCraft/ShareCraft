@@ -999,6 +999,7 @@ async fn live_base_checkpoint_carries_the_stamp_of_its_position() {
     let revision = json["revision"].as_str().unwrap().to_owned();
     let revision = revision.as_str();
     seat.close().await;
+    wait_revision_row(&server, doc, revision).await;
     let session = Uuid::new_v4();
     server
         .db
@@ -1136,4 +1137,158 @@ async fn download_says_when_the_file_is_behind() {
             .map(|value| value.as_bytes()),
         Some("1".as_bytes())
     );
+}
+
+/// Waits until `revision` of `doc` is recorded in the database, which follows the save's answer.
+async fn wait_revision_row(server: &TestServer, doc: DocId, revision: &str) {
+    for _ in 0..500 {
+        let rows = server.db.db.revisions(doc).await.unwrap();
+        if rows.iter().any(|row| row.revision == revision) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("revision {revision} was never recorded");
+}
+
+/// A live log of two changes on Ann's file document, with a checkpoint at 2 carrying
+/// `session_data`, verified.
+async fn verified_live_base(server: &TestServer, ann: &TestUser, doc: DocId, session_data: &[u8]) {
+    let mut seat = FileClient::connect_as(server, doc, ann).await;
+    let token = seat.token().unwrap();
+    let response = save(server, ann, doc, None, Some(&token), b"one".to_vec()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let json: Value = response.json().await.unwrap();
+    let revision = json["revision"].as_str().unwrap().to_owned();
+    seat.close().await;
+    wait_revision_row(server, doc, &revision).await;
+    let session = Uuid::new_v4();
+    let db = &server.db.db;
+    db.start_live_session(doc, session, "gridcraft/1", OffsetDateTime::now_utc())
+        .await
+        .unwrap();
+    let client = ClientId(Uuid::new_v4());
+    for seq in 1..=2 {
+        db.append_live_change(
+            doc,
+            &NewLiveChange {
+                seq: Seq(seq),
+                session,
+                client,
+                local: seq,
+                participant: 1,
+                user: ann.id,
+                seen: Seq(seq - 1),
+                at: OffsetDateTime::now_utc(),
+                seed: 7,
+                format: "gridcraft/1",
+                payload: b"change",
+                witnesses: &[1],
+            },
+        )
+        .await
+        .unwrap();
+    }
+    db.record_live_checkpoint(
+        doc,
+        &NewLiveCheckpoint {
+            revision: &revision,
+            through: Seq(2),
+            sha256: [3; 32],
+            session,
+            session_data,
+            major_reason: None,
+            major_person: None,
+            writer: None,
+            created_at: OffsetDateTime::now_utc(),
+        },
+    )
+    .await
+    .unwrap();
+    db.verify_live_checkpoint(doc, &revision, Seq(2), OffsetDateTime::now_utc())
+        .await
+        .unwrap();
+}
+
+/// `GET /api/docs/{id}/live-base?at={at}` as `user`.
+async fn live_base(
+    server: &TestServer,
+    user: &TestUser,
+    doc: DocId,
+    at: &str,
+) -> reqwest::Response {
+    server
+        .http(Some(user))
+        .get(server.url(&format!("/api/docs/{}/live-base", doc.0)))
+        .query(&[("at", at)])
+        .send()
+        .await
+        .unwrap()
+}
+
+/// A position other than the room's verified base is a conflict: the page asks again.
+#[tokio::test]
+async fn live_base_at_another_position_is_a_conflict() {
+    let server = spawn_server().await;
+    let ann = server.user("Ann").await;
+    let doc = new_doc();
+    server.create_file_document(doc, &ann).await;
+    verified_live_base(&server, &ann, doc, b"identities").await;
+    for at in ["0", "1", "3"] {
+        assert_eq!(
+            live_base(&server, &ann, doc, at).await.status(),
+            StatusCode::CONFLICT,
+            "at {at}"
+        );
+    }
+    assert_eq!(
+        live_base(&server, &ann, doc, "2").await.status(),
+        StatusCode::OK
+    );
+}
+
+/// A document that was never live has no live base.
+#[tokio::test]
+async fn live_base_of_a_document_never_live_is_not_found() {
+    let server = spawn_server().await;
+    let ann = server.user("Ann").await;
+    let doc = new_doc();
+    server.create_file_document(doc, &ann).await;
+    assert_eq!(
+        live_base(&server, &ann, doc, "0").await.status(),
+        StatusCode::NOT_FOUND
+    );
+}
+
+/// Someone without access to the document learns nothing of its live base.
+#[tokio::test]
+async fn live_base_without_access_is_not_found() {
+    let server = spawn_server().await;
+    let ann = server.user("Ann").await;
+    let eve = server.user("Eve").await;
+    let doc = new_doc();
+    server.create_file_document(doc, &ann).await;
+    verified_live_base(&server, &ann, doc, b"identities").await;
+    for at in ["2", "0"] {
+        let response = live_base(&server, &eve, doc, at).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "at {at}");
+        let body = response.bytes().await.unwrap();
+        assert!(!body.windows(10).any(|bytes| bytes == b"identities"));
+    }
+}
+
+/// A verified base with no identity data (a file stored again from outside) is loaded as a
+/// plain file: no content, and nothing cached.
+#[tokio::test]
+async fn live_base_without_identity_data_is_no_content() {
+    let server = spawn_server().await;
+    let ann = server.user("Ann").await;
+    let doc = new_doc();
+    server.create_file_document(doc, &ann).await;
+    verified_live_base(&server, &ann, doc, b"").await;
+    let response = live_base(&server, &ann, doc, "2").await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(response.headers().get(CACHE_CONTROL).unwrap(), "no-store");
+    assert!(response.headers().get("x-sharecraft-live-at-ms").is_none());
+    assert!(response.bytes().await.unwrap().is_empty());
 }
