@@ -657,6 +657,12 @@ pub(crate) struct LiveRoom<S: LiveStore> {
     resolved_reports: BTreeSet<(Seq, u32)>,
     session: Option<Session>,
     known_places: HashMap<ParticipantNo, ClientId>,
+    /// Connections whose editor is still loading the base, with the head its catch-up ends
+    /// at. Such an editor cannot honour a checkpoint ticket yet, so it is offered none until
+    /// it reports that position, or sends a change or presence note (which a client sends
+    /// only once it is live). A client that keeps its state is sent the log from where it is,
+    /// ahead of any later ticket on the same connection, so it is never listed.
+    catching_up: HashMap<(ConnId, ClientId), Seq>,
     clients: HashMap<ClientId, (UserId, u64)>,
     rates: HashMap<ClientId, RateBucket>,
     pending_ends: Vec<(LiveSessionId, ParticipantNo, GoneReason)>,
@@ -1032,6 +1038,7 @@ impl<S: LiveStore> LiveRoom<S> {
             resolved_reports: BTreeSet::new(),
             session,
             known_places,
+            catching_up: HashMap::new(),
             clients,
             rates: HashMap::new(),
             pending_ends: Vec::new(),
@@ -1171,9 +1178,12 @@ impl<S: LiveStore> LiveRoom<S> {
             } => {
                 self.note_life(conn, client);
                 if let Some(participant) = self.current_participant(conn, client) {
+                    // An editor still loading the base could not honour any ticket: that is not
+                    // a miss, and it is asked again once it has caught up.
+                    let caught_up = !self.catching_up.contains_key(&(conn, client));
                     self.cancel_tickets(
                         |held| held.id == ticket && held.participant == participant,
-                        true,
+                        caught_up,
                     );
                 }
                 Ok(())
@@ -1248,6 +1258,7 @@ impl<S: LiveStore> LiveRoom<S> {
                 payload,
             } => {
                 self.note_life(conn, client);
+                self.note_live(conn, client);
                 self.relay_presence(conn, client, payload);
                 Ok(())
             }
@@ -1429,6 +1440,10 @@ impl<S: LiveStore> LiveRoom<S> {
             .iter()
             .filter(|(participant, place)| {
                 Some(**participant) != exclude
+                    && !self
+                        .catching_up
+                        .keys()
+                        .any(|(_, catching)| *catching == place.client)
                     && self.place_can_checkpoint(**participant, place.client)
                     && !self
                         .tickets
@@ -3444,6 +3459,13 @@ impl<S: LiveStore> LiveRoom<S> {
             .seen
             .filter(|seen| *seen >= self.verified_through && *seen <= self.head)
             .unwrap_or(self.verified_through);
+        // A client sent the log from somewhere other than where it is loads the base first.
+        self.catching_up
+            .retain(|(_, catching), _| *catching != request.client);
+        if request.seen != Some(from) {
+            self.catching_up
+                .insert((request.conn, request.client), self.head);
+        }
         let mut frames = vec![encode(&LiveServerMsg::LiveJoined {
             session: self.session.as_ref().ok_or_else(no_session)?.id,
             participant,
@@ -3515,6 +3537,8 @@ impl<S: LiveStore> LiveRoom<S> {
             self.refuse(client, local, RefusedReason::OutOfOrder);
             return Ok(());
         }
+        // A client proposes changes only once it is live.
+        self.note_live(conn, client);
         let verdicts = self.note_seen(conn, client, seen);
         self.apply_verdicts(verdicts).await?;
         let Some(participant) = self.current_participant(conn, client) else {
@@ -4126,6 +4150,13 @@ impl<S: LiveStore> LiveRoom<S> {
         };
         place.seen = place.seen.max(seen.min(self.head));
         let position = place.seen;
+        if self
+            .catching_up
+            .get(&(conn, client))
+            .is_some_and(|until| seen >= *until)
+        {
+            self.catching_up.remove(&(conn, client));
+        }
         self.seen_verdicts(participant, position)
     }
 
@@ -4157,6 +4188,12 @@ impl<S: LiveStore> LiveRoom<S> {
         verdicts
     }
 
+    /// The connection sent what a client sends only once it is live (a change or a presence
+    /// note), so it has caught up.
+    fn note_live(&mut self, conn: ConnId, client: ClientId) {
+        self.catching_up.remove(&(conn, client));
+    }
+
     fn note_life(&mut self, conn: ConnId, client: ClientId) {
         let Some(participant) = self.current_participant(conn, client) else {
             return;
@@ -4178,6 +4215,7 @@ impl<S: LiveStore> LiveRoom<S> {
     }
 
     fn disconnect(&mut self, conn: ConnId, client: ClientId) {
+        self.catching_up.remove(&(conn, client));
         // `None` is a replaced connection's late leave, or a member already dropped because its
         // queue was full; only the second still needs the others told.
         if self.members.leave(conn, client).is_none()
@@ -4367,6 +4405,18 @@ impl<S: LiveStore> LiveRoom<S> {
 
     /// Sends `client` the log again from the verified base.
     fn send_resync(&mut self, client: ClientId) {
+        // The client loads the log again from the base: it is catching up until it reports
+        // the head.
+        let head = self.head;
+        let conns = self
+            .members
+            .iter()
+            .filter(|member| member.client == client)
+            .map(|member| member.conn)
+            .collect::<Vec<_>>();
+        for conn in conns {
+            self.catching_up.insert((conn, client), head);
+        }
         let mut frames = vec![encode(&LiveServerMsg::Catchup {
             base: self.verified_through,
             revision: self.base_revision.clone(),
@@ -5138,8 +5188,55 @@ mod tests {
         .await
     }
 
+    /// Joins, and then, for a client without state (as one whose base loads at once), reports
+    /// the catch-up's head, so the place has caught up; `after_join` has what the room sent
+    /// after either.
     #[allow(clippy::too_many_arguments)]
     async fn join_full<S: crate::live_store::LiveStore>(
+        room: &mut LiveRoom<S>,
+        conn: u64,
+        client_n: u128,
+        user: UserId,
+        role: &str,
+        format: &str,
+        resume: Option<LiveResume>,
+        seen: Option<Seq>,
+        can_checkpoint: bool,
+        build: LiveBuild,
+    ) -> Joined {
+        let mut joined = join_loading(
+            room,
+            conn,
+            client_n,
+            user,
+            role,
+            format,
+            resume,
+            seen,
+            can_checkpoint,
+            build,
+        )
+        .await;
+        let head = joined.initial.iter().find_map(|frame| match frame {
+            LiveServerMsg::Catchup { head, .. } => Some(*head),
+            _ => None,
+        });
+        if let Some(head) = head.filter(|_| seen.is_none()) {
+            room.handle(LiveCommand::Heartbeat {
+                conn,
+                client: joined.client,
+                seen: head,
+            })
+            .await
+            .unwrap();
+            joined.after_join.extend(drain(&mut joined.rx));
+        }
+        joined
+    }
+
+    /// Joins; the place is still loading the base until it reports the catch-up's head.
+    #[allow(clippy::too_many_arguments)]
+    async fn join_loading<S: crate::live_store::LiveStore>(
         room: &mut LiveRoom<S>,
         conn: u64,
         client_n: u128,
@@ -11061,5 +11158,145 @@ mod tests {
             "a later change sent before the client heard waits quietly"
         );
         assert_eq!(store.entry_count(), 3);
+    }
+
+    /// A joiner still loading the base is not offered a checkpoint ticket it cannot honour
+    /// yet, a refusal from it then is not held against it, and once it has caught up it
+    /// verifies the checkpoint the room is waiting on (final review I-3).
+    #[tokio::test(start_paused = true)]
+    async fn joiner_is_ticketed_only_once_caught_up() {
+        let doc = DocId(id(100));
+        let store = MemStore::new();
+        let (ann_resume, revision) = {
+            let mut room = LiveRoom::load(doc, store.clone(), EventSink::discard(), timing())
+                .await
+                .unwrap();
+            let mut ann = join_capable(&mut room, 1, 1, "editor", LiveBuild::Browser).await;
+            for local in 1..=2 {
+                entry(&mut room, &ann, local, local - 1, FORMAT, "x".into())
+                    .await
+                    .unwrap();
+            }
+            tokio::time::advance(Duration::from_secs(15)).await;
+            room.expire_due().await.unwrap();
+            let ticket = checkpoint_ticket(drain(&mut ann.rx)).unwrap().0;
+            let LiveCheckpointReply::Saved { revision } =
+                upload(&mut room, UserId(id(11)), ticket, Seq(2), 9).await
+            else {
+                panic!("the upload must be stored");
+            };
+            let resume = LiveResume {
+                session: ann.session,
+                participant: ann.participant,
+            };
+            (resume, revision)
+        };
+
+        // A restart with the checkpoint unverified: Ann, its writer, comes back first.
+        let mut room = LiveRoom::load(doc, store.clone(), EventSink::discard(), timing())
+            .await
+            .unwrap();
+        let _ann = join_full(
+            &mut room,
+            5,
+            1,
+            UserId(id(11)),
+            "editor",
+            FORMAT,
+            Some(ann_resume),
+            Some(Seq(2)),
+            true,
+            LiveBuild::Browser,
+        )
+        .await;
+        // Bob joins while the verify ticket is due; his editor is still loading the base, so
+        // a ticket now would fail, as his editor does with one it cannot honour.
+        let mut bob = join_loading(
+            &mut room,
+            6,
+            2,
+            UserId(id(12)),
+            "editor",
+            FORMAT,
+            None,
+            None,
+            true,
+            LiveBuild::Browser,
+        )
+        .await;
+        let mut offered = bob.after_join.clone();
+        offered.extend(drain(&mut bob.rx));
+        let early = checkpoint_ticket(offered);
+        if let Some((ticket, _, _)) = early {
+            room.handle(LiveCommand::CheckpointFailed {
+                conn: bob.conn,
+                client: bob.client,
+                ticket,
+            })
+            .await
+            .unwrap();
+        }
+        assert!(
+            !room.lapsed.contains(&bob.participant),
+            "a joiner that had not caught up is not a lapsed verifier"
+        );
+        assert_eq!(room.ticket_misses.get(&bob.participant), None);
+
+        // Bob's editor has caught up and says so.
+        heartbeat(&mut room, &bob, 2).await;
+        let (verify, purpose, at, base) = ticket_full(drain(&mut bob.rx)).unwrap();
+        assert_eq!(
+            (purpose, at, base),
+            (TicketPurpose::Verify, Seq(2), Some(revision.clone()))
+        );
+        assert_eq!(
+            hash(&mut room, UserId(id(12)), verify, Seq(2), 9).await,
+            LiveCheckpointReply::Accepted
+        );
+        let loaded = crate::live_store::LiveStore::load_live(&store, doc)
+            .await
+            .unwrap();
+        assert_eq!(loaded.verified_through, Seq(2));
+        assert_eq!(loaded.verified_checkpoint.unwrap().revision, revision);
+        assert!(early.is_none(), "no ticket before Bob had caught up");
+    }
+
+    /// A verifier sent the log again is catching up: a ticket it fails meanwhile is not held
+    /// against it, and it is asked again once it has caught up.
+    #[tokio::test(start_paused = true)]
+    async fn resynced_verifier_failing_while_catching_up_is_not_lapsed() {
+        let (mut room, store, _ann, mut bob, revision, verify) =
+            written_and_ticketed(EventSink::discard(), 9).await;
+        room.handle(LiveCommand::Resync {
+            conn: bob.conn,
+            client: bob.client,
+        })
+        .await
+        .unwrap();
+        room.handle(LiveCommand::CheckpointFailed {
+            conn: bob.conn,
+            client: bob.client,
+            ticket: verify,
+        })
+        .await
+        .unwrap();
+        assert!(!room.lapsed.contains(&bob.participant));
+        assert_eq!(room.ticket_misses.get(&bob.participant), None);
+        let _ = drain(&mut bob.rx);
+
+        heartbeat(&mut room, &bob, 1).await;
+        let (again, purpose, at, base) = ticket_full(drain(&mut bob.rx)).unwrap();
+        assert_eq!(
+            (purpose, at, base),
+            (TicketPurpose::Verify, Seq(1), Some(revision))
+        );
+        assert_eq!(
+            hash(&mut room, UserId(id(12)), again, Seq(1), 9).await,
+            LiveCheckpointReply::Accepted
+        );
+        let loaded = crate::live_store::LiveStore::load_live(&store, DocId(id(100)))
+            .await
+            .unwrap();
+        assert_eq!(loaded.verified_through, Seq(1));
     }
 }
