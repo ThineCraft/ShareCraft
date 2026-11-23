@@ -183,6 +183,12 @@ export function unavailableText(reason) {
   return Object.hasOwn(UNAVAILABLE_TEXT, reason) ? UNAVAILABLE_TEXT[reason] : 'Unavailable';
 }
 
+/** The text mark for a listed item the server reports as unavailable (`unavailable`), or ''. */
+export function unavailableMarkFor(item) {
+  if (item?.unavailable === undefined || item?.unavailable === null || item.unavailable === '') return '';
+  return unavailableText(item.unavailable);
+}
+
 /** A first check of an S3 bucket name; the server decides. */
 export function validBucket(text) {
   const refuse = (reason) => ({ ok: false, reason });

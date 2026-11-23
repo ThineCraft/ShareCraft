@@ -327,7 +327,10 @@ function s3Refused(result, newIndex) {
   const { entry, reason } = result.data ?? {};
   const text = S3_REASON[reason] ?? 'The storage was not saved. Check the entry and try again.';
   const field = entry === newIndex ? S3_FIELD[reason] : undefined;
-  if (field) return showMessage($(`s3-err-${field}`), text);
+  if (field) {
+    showMessage($(`s3-err-${field}`), text);
+    return $(`s3-${field}`).focus();
+  }
   const where = typeof entry === 'number' && entry !== newIndex ? `Storage ${entry + 1}: ` : '';
   return noteIn('s3-msg', `${where}${text}`);
 }

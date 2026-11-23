@@ -11,6 +11,7 @@ import {
   webhookInstructions,
   sourceName,
   unavailableText,
+  unavailableMarkFor,
   validBucket,
   validPrefix,
 } from './source-panel.js';
@@ -202,6 +203,14 @@ test('unavailableText gives a word for each unavailable reason', () => {
   assert.equal(unavailableText('budget'), 'Over the request budget');
   assert.equal(unavailableText('anything'), 'Unavailable');
   assert.equal(unavailableText(undefined), 'Unavailable');
+});
+
+test('unavailableMarkFor gives the text mark only for an item the listing marks unavailable', () => {
+  assert.equal(unavailableMarkFor({ name: 'a.txt' }), '');
+  assert.equal(unavailableMarkFor({ name: 'a.txt', unavailable: null }), '');
+  assert.equal(unavailableMarkFor({ name: 'a.txt', unavailable: 'archived' }), 'In archive storage');
+  assert.equal(unavailableMarkFor({ name: 'a.txt', unavailable: 'too_large' }), 'Unavailable');
+  assert.equal(unavailableMarkFor(null), '');
 });
 
 test('validBucket accepts S3 bucket names and gives a reason for each refusal', () => {
