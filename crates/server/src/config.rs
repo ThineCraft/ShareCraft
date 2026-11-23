@@ -91,6 +91,9 @@ pub struct Config {
     /// Maximum tree nodes a file-share sync creates in one batch. GitHub and HTTP tree writes
     /// do not use this setting.
     pub source_create_batch_size: usize,
+    /// Lets an S3 endpoint be plain `http://127.0.0.1:<port>`. False unless a test sets it;
+    /// no environment variable reads it.
+    pub s3_plain_loopback: bool,
 }
 
 /// A database URL. It usually holds a password, so `Debug` never shows it.
@@ -331,6 +334,7 @@ impl Config {
             upload_idle: Duration::from_secs(60),
             github_api: DEFAULT_GITHUB_API.to_owned(),
             source_create_batch_size: DEFAULT_SOURCE_CREATE_BATCH_SIZE,
+            s3_plain_loopback: false,
         })
     }
 }
