@@ -8,7 +8,8 @@ use std::time::Duration;
 
 use collab_core::ids::{DocId, NodeId};
 use records::{
-    ExternalItem, NewEvent, ScanState, SharePath, Unavailable, approved_root, external_tag,
+    ExternalItem, NewEvent, ScanState, SharePath, SourceKind, Unavailable, approved_root,
+    external_tag,
 };
 use revisions::{BlobError, BlobRef};
 use serde_json::json;
@@ -138,13 +139,40 @@ struct ApprovedItem {
     cache_max: u64,
 }
 
-/// Materialises one live share-backed document. Ordinary and GitHub documents answer `None`.
+/// Materialises one live external document. Ordinary and GitHub documents answer `None`.
 pub async fn materialise(state: &AppState, node: NodeId) -> Result<Option<Ready>, ExternalError> {
-    if approved_item(state, node).await?.is_none() {
+    let Some(item) = state
+        .db()
+        .external_item(node)
+        .await
+        .map_err(database_failed)?
+    else {
         return Ok(None);
+    };
+    match item.kind {
+        SourceKind::Share => {
+            if approved_item(state, node).await?.is_none() {
+                return Ok(None);
+            }
+            let flight = Arc::new(state.shares().flight(node).await);
+            materialise_share(state, node, flight).await
+        }
+        SourceKind::S3 => {
+            let _flight = Arc::new(state.shares().flight(node).await);
+            // Task 9 adds the S3 arm.
+            Err(ExternalError::Failed)
+        }
+        SourceKind::Github => Ok(None),
     }
+}
 
-    let flight = Arc::new(state.shares().flight(node).await);
+/// The file-share arm of `materialise`: approved root and paths, `stat`, the lease-guarded read
+/// and the second `stat`, then the shared tail.
+async fn materialise_share(
+    state: &AppState,
+    node: NodeId,
+    flight: Arc<Flight>,
+) -> Result<Option<Ready>, ExternalError> {
     let approved = approved_item(state, node)
         .await?
         .ok_or(ExternalError::Gone)?;
@@ -188,7 +216,7 @@ pub async fn materialise(state: &AppState, node: NodeId) -> Result<Option<Ready>
     let item = approved.item;
     let cache_max = approved.cache_max;
     remembered_refusal(&item)?;
-    if let Some(ready) = cached(state, &item).await? {
+    if let Some(ready) = serve_cached(state, &item).await? {
         return Ok(Some(ready));
     }
 
@@ -383,20 +411,7 @@ pub async fn materialise(state: &AppState, node: NodeId) -> Result<Option<Ready>
             continue;
         }
 
-        let blob = held.blob();
-        let now = OffsetDateTime::now_utc();
-        state
-            .db()
-            .pin_cached(&blob, now)
-            .await
-            .map_err(database_failed)?;
-        state.blobs().claimed().notify_one();
-        if let Some(revision) = state
-            .db()
-            .set_external_content(node, &item.tag, &blob.sha256, now)
-            .await
-            .map_err(database_failed)?
-        {
+        if let Some(revision) = pin_and_record(state, &item, &held).await? {
             item.revision = revision;
             break (held, old_hash);
         }
@@ -418,17 +433,50 @@ pub async fn materialise(state: &AppState, node: NodeId) -> Result<Option<Ready>
     };
     drop(lease);
 
+    finish_read(state, &item, held, old_hash).await.map(Some)
+}
+
+/// Pins the stored bytes and records them on the item with the compare-and-set on its tag.
+/// `None` means the compare-and-set was lost: the caller discards the bytes and decides what next.
+async fn pin_and_record(
+    state: &AppState,
+    item: &ExternalItem,
+    held: &Held,
+) -> Result<Option<String>, ExternalError> {
+    let blob = held.blob();
+    let now = OffsetDateTime::now_utc();
+    state
+        .db()
+        .pin_cached(&blob, now)
+        .await
+        .map_err(database_failed)?;
+    state.blobs().claimed().notify_one();
+    state
+        .db()
+        .set_external_content(item.node, &item.tag, &blob.sha256, now)
+        .await
+        .map_err(database_failed)
+}
+
+/// Everything after the bytes are stored and recorded: the changed-content event, the scan gate
+/// and eviction. `item` carries the revision the record returned.
+async fn finish_read(
+    state: &AppState,
+    item: &ExternalItem,
+    held: Held,
+    old_hash: Option<[u8; 32]>,
+) -> Result<Ready, ExternalError> {
     let blob = held.blob();
     if old_hash.is_some_and(|old| old != blob.sha256) {
         eprintln!(
             "sharecraft-server: share content changed without a new stat for node {}",
-            node.0
+            item.node.0
         );
         state.events().emit(NewEvent {
             kind: "source.content_changed",
             actor: None,
             subject: None,
-            document: Some(DocId(node.0)),
+            document: Some(DocId(item.node.0)),
             node: Some(item.library),
             detail: json!({ "path": item.repository_path }),
         });
@@ -439,11 +487,11 @@ pub async fn materialise(state: &AppState, node: NodeId) -> Result<Option<Ready>
         return Err(error);
     }
     let _ = evict(state).await;
-    Ok(Some(Ready {
+    Ok(Ready {
         blob,
         held,
-        revision: item.revision,
-    }))
+        revision: item.revision.clone(),
+    })
 }
 
 async fn approved_item(
@@ -484,7 +532,10 @@ fn remembered_refusal(item: &ExternalItem) -> Result<(), ExternalError> {
     }
 }
 
-async fn cached(state: &AppState, item: &ExternalItem) -> Result<Option<Ready>, ExternalError> {
+async fn serve_cached(
+    state: &AppState,
+    item: &ExternalItem,
+) -> Result<Option<Ready>, ExternalError> {
     let Some(sha256) = item.sha256 else {
         return Ok(None);
     };
