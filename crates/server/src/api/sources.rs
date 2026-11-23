@@ -1322,7 +1322,9 @@ fn s3_refused(error: S3Error) -> ApiError {
 
 /// Asks the bucket whether the key may list `prefix` (one listing of at most one key), then
 /// its versioning state (whose failure is no refusal: it is recorded as unknown). Two
-/// requests, no write, counted against no library, within 20 seconds in all.
+/// requests, no write, within 20 seconds in all. The connect probe (`library` is `None`: the
+/// library does not exist yet) is counted against no library; a key replacement is counted
+/// against its library.
 async fn probe_bucket(
     state: &AppState,
     endpoint: &S3Endpoint,
@@ -1330,9 +1332,10 @@ async fn probe_bucket(
     prefix: &str,
     access_key_id: &str,
     secret: &Secret,
+    library: Option<NodeId>,
 ) -> Result<Versioning, ApiError> {
     let s3 = state.s3();
-    let target = s3.target_from(
+    let mut target = s3.target_from(
         endpoint,
         bucket,
         Credentials {
@@ -1341,6 +1344,9 @@ async fn probe_bucket(
             session_token: None,
         },
     );
+    if let Some(library) = library {
+        target = target.with_library(library);
+    }
     let probing = async {
         s3.list_page(&target, prefix, None, 1)
             .await
@@ -1562,8 +1568,16 @@ pub(crate) async fn connect_s3(
         return Err(ApiError::NameTaken);
     }
 
-    let versioning =
-        probe_bucket(&state, &endpoint, &bucket, &prefix, &access_key_id, &secret).await?;
+    let versioning = probe_bucket(
+        &state,
+        &endpoint,
+        &bucket,
+        &prefix,
+        &access_key_id,
+        &secret,
+        None,
+    )
+    .await?;
     let library = NodeId(Uuid::new_v4());
     let origin = origin(&state, &headers)?;
     {
@@ -1732,8 +1746,16 @@ async fn change_s3(
                 .map_err(|e| ApiError::unavailable(&e))?
                 .ok_or(ApiError::NotFound)?;
             let endpoint = approved_endpoint(&state, &place.endpoint).await?;
-            let versioning =
-                probe_bucket(&state, &endpoint, &place.bucket, &place.prefix, id, secret).await?;
+            let versioning = probe_bucket(
+                &state,
+                &endpoint,
+                &place.bucket,
+                &place.prefix,
+                id,
+                secret,
+                Some(library),
+            )
+            .await?;
             Some((versioning, place.conditional))
         }
         None => None,

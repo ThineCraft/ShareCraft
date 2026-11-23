@@ -1156,6 +1156,14 @@ impl Db {
         .bind(secret.0)
         .execute(&mut *tx)
         .await?;
+        // A denied mark came from the old key; the new key gets to try again.
+        sqlx::query(
+            "update source_items set unavailable = null \
+             where library_id = $1 and unavailable = 'denied'",
+        )
+        .bind(library.0)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(old.filter(|old| *old != secret.0).map(SecretId))
     }

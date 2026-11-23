@@ -1724,6 +1724,7 @@ async fn run<S: StorageSource>(
         plan,
         &fetched,
         source.content(),
+        config.kind,
         now,
         config.poll_seconds,
         generation,
@@ -2104,6 +2105,7 @@ struct Applying<'a> {
     library: NodeId,
     user: &'a User,
     mode: ContentMode,
+    kind: SourceKind,
     /// The node of each folder path, as known or made.
     folders: HashMap<String, NodeId>,
     /// Every node recorded as an item when the sync started.
@@ -2127,6 +2129,7 @@ async fn apply(
     mut plan: Plan,
     fetched: &HashMap<String, Held>,
     mode: ContentMode,
+    kind: SourceKind,
     now: OffsetDateTime,
     poll_seconds: u32,
     generation: i64,
@@ -2154,6 +2157,7 @@ async fn apply(
         library,
         user,
         mode,
+        kind,
         folders: known
             .iter()
             .filter(|item| item.blob_sha.is_none())
@@ -2302,10 +2306,16 @@ fn temporary_name(name: &str) -> String {
     tree::fit(stem, extension, &suffix)
 }
 
-fn external_mtime(entry: &Entry) -> Result<i64, SyncError> {
+fn external_mtime(entry: &Entry, kind: SourceKind) -> Result<i64, SyncError> {
     external_tag_parts(&entry.sha, entry.size)
         .map(|parts| parts.mtime_ns)
-        .ok_or_else(|| failed("A file in the library's storage had an invalid change tag."))
+        .ok_or_else(|| {
+            if kind == SourceKind::S3 {
+                failed("An object in the bucket had an invalid change tag.")
+            } else {
+                failed("A file on the share had an invalid change tag.")
+            }
+        })
 }
 
 impl Applying<'_> {
@@ -2412,7 +2422,11 @@ impl Applying<'_> {
             } else {
                 added_files = added_files.saturating_add(1);
             }
-            let mtime_ns = if entry.dir { 0 } else { external_mtime(entry)? };
+            let mtime_ns = if entry.dir {
+                0
+            } else {
+                external_mtime(entry, self.kind)?
+            };
             batch.push(tree::ExternalNodeCreate {
                 id,
                 parent,
@@ -2450,8 +2464,13 @@ impl Applying<'_> {
         tree::create_external_nodes(self.state, self.user, self.library, batch, git_ids)
             .await
             .map_err(|e| {
-                eprintln!("sharecraft-server: sync could not add a batch of external items: {e:?}");
-                failed("A batch of items could not be added, so the sync stopped.")
+                if self.kind == SourceKind::S3 {
+                    eprintln!("sharecraft-server: sync could not add a batch of S3 items: {e:?}");
+                    failed("A batch of S3 items could not be added, so the sync stopped.")
+                } else {
+                    eprintln!("sharecraft-server: sync could not add a file-share batch: {e:?}");
+                    failed("A batch of file-share items could not be added, so the sync stopped.")
+                }
             })?;
         self.ensure_external_generation(generation).await
     }
@@ -2488,7 +2507,7 @@ impl Applying<'_> {
     async fn record(&self, node: NodeId, entry: &Entry) -> Result<(), SyncError> {
         let db = self.state.db();
         if matches!(self.mode, ContentMode::External) && !entry.dir {
-            let mtime_ns = external_mtime(entry)?;
+            let mtime_ns = external_mtime(entry, self.kind)?;
             return db
                 .record_external_item(
                     self.library,

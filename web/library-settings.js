@@ -363,6 +363,9 @@ function closeKeyForm() {
   $('s3-key-open').setAttribute('aria-expanded', 'false');
 }
 
+// A page left or restored from the back-forward cache never keeps a typed key.
+addEventListener('pagehide', closeKeyForm);
+
 $('s3-key-open').addEventListener('click', () => {
   if (!$('s3-key-form').hidden) return closeKeyForm();
   $('s3-key-form').hidden = false;

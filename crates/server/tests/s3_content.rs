@@ -297,6 +297,20 @@ async fn first_read_stores_hashes_pins_and_records_the_hash() {
 }
 
 #[tokio::test]
+async fn a_key_with_a_space_and_a_plus_lists_with_its_exact_name_and_opens() {
+    let env = Env::new(&[("dir/a b+c.txt", b"plus")]).await;
+    assert_eq!(
+        env.item("dir/a b+c.txt").await.repository_path,
+        "dir/a b+c.txt"
+    );
+
+    let ready = env.ready("dir/a b+c.txt").await;
+
+    assert_eq!(env.bytes(&ready), b"plus");
+    assert_eq!(env.fake.count("get"), 1);
+}
+
+#[tokio::test]
 async fn a_second_read_heads_and_does_not_get() {
     let env = Env::new(&[("report.txt", b"quarterly")]).await;
     drop(env.ready("report.txt").await);

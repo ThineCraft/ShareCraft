@@ -785,7 +785,7 @@ fn list(
          <Name>{}</Name><Prefix>{}</Prefix><KeyCount>{}</KeyCount><MaxKeys>{max_keys}</MaxKeys>\
          <EncodingType>url</EncodingType><IsTruncated>{truncated}</IsTruncated>",
         s3_xml::escape(bucket),
-        s3_sign::uri_encode(&prefix, true),
+        url_listing_encode(&prefix),
         page.len(),
     );
     if let Some(token) = &given {
@@ -798,7 +798,7 @@ fn list(
         out.push_str(&format!(
             "<Contents><Key>{}</Key><LastModified>{}</LastModified><ETag>{}</ETag>\
              <Size>{}</Size><StorageClass>{}</StorageClass></Contents>",
-            s3_sign::uri_encode(key, true),
+            url_listing_encode(key),
             iso_date(object.modified_s),
             s3_xml::escape(&object.etag),
             object.bytes.len(),
@@ -816,6 +816,12 @@ fn list(
     }
     out.push_str("</ListBucketResult>");
     xml(out)
+}
+
+/// Encodes a listed name like AWS S3's `encoding-type=url`: a space becomes `+` and a literal
+/// `+` becomes `%2B`.
+fn url_listing_encode(text: &str) -> String {
+    s3_sign::uri_encode(text, true).replace("%20", "+")
 }
 
 fn object_answer(

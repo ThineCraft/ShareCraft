@@ -1284,7 +1284,11 @@ async fn signed_in_users_are_given_only_the_names_of_the_approved_endpoints() {
     let named = "names-endpoint-7a3";
     set_endpoints(
         &env.server,
-        json!([endpoint_entry(named, "https://s3.example.test:443", &["10.0.0.0/8"])]),
+        json!([endpoint_entry(
+            named,
+            "https://s3.example.test:443",
+            &["10.0.0.0/8"]
+        )]),
     )
     .await;
     let (status, answer) = env

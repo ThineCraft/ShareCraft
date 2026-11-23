@@ -736,10 +736,17 @@ async fn finish_read(
 ) -> Result<Ready, ExternalError> {
     let blob = held.blob();
     if old_hash.is_some_and(|old| old != blob.sha256) {
-        eprintln!(
-            "sharecraft-server: share content changed without a new stat for node {}",
-            item.node.0
-        );
+        if item.kind == SourceKind::S3 {
+            eprintln!(
+                "sharecraft-server: content changed without a new listing tag for node {}",
+                item.node.0
+            );
+        } else {
+            eprintln!(
+                "sharecraft-server: share content changed without a new stat for node {}",
+                item.node.0
+            );
+        }
         state.events().emit(NewEvent {
             kind: "source.content_changed",
             actor: None,

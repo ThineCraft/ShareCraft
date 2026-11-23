@@ -463,6 +463,10 @@ fn public_v6(ip: Ipv6Addr) -> bool {
         || in_v6(value, "ff00::", 8)
         || in_v6(value, "2001:db8::", 32)
         || in_v6(value, "2001:2::", 48)
+        // Teredo, 6to4 and local-use NAT64 tunnel to addresses this check cannot see.
+        || in_v6(value, "2001::", 32)
+        || in_v6(value, "2002::", 16)
+        || in_v6(value, "64:ff9b:1::", 48)
     {
         return false;
     }

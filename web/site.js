@@ -338,6 +338,7 @@ function clearS3Secret() {
 
 $('new-library-cancel').addEventListener('click', () => $('new-library-dialog').close());
 $('new-library-dialog').addEventListener('close', clearS3Secret);
+addEventListener('pagehide', clearS3Secret);
 $('new-library').addEventListener('submit', async (event) => {
   event.preventDefault();
   const say = (text, field = null) => {

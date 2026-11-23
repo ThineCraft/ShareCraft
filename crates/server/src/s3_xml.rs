@@ -332,7 +332,7 @@ pub fn list_page(text: &str) -> Result<ListPage, XmlError> {
     {
         let raw_key = required(contents, "Key")?;
         let key = if encoded {
-            percent_decode(raw_key)?
+            decode_listed_key(raw_key)?
         } else {
             raw_key.to_owned()
         };
@@ -398,7 +398,7 @@ pub fn versions_page(
         let marker = item.name == "DeleteMarker";
         let raw_key = required(item, "Key")?;
         let key = if encoded {
-            percent_decode(raw_key)?
+            decode_listed_key(raw_key)?
         } else {
             raw_key.to_owned()
         };
@@ -438,7 +438,13 @@ pub fn versions_page(
     Ok((entries, next))
 }
 
-/// Decodes S3's `encoding-type=url` key representation as UTF-8.
+/// Decodes a key from an `encoding-type=url` listing. S3 writes a space as `+` and a literal `+`
+/// as `%2B` there, so `+` is read as a space before percent-decoding.
+pub fn decode_listed_key(text: &str) -> Result<String, XmlError> {
+    percent_decode(&text.replace('+', " "))
+}
+
+/// Decodes S3's percent-encoding as UTF-8 (a `+` stays a `+`).
 pub fn percent_decode(text: &str) -> Result<String, XmlError> {
     let mut bytes = Vec::with_capacity(text.len());
     let mut characters = text.chars();
@@ -583,6 +589,14 @@ mod tests {
 
         let xml = "<ListBucketResult><EncodingType>url</EncodingType><IsTruncated>false</IsTruncated><Contents><Key>a%20b</Key><LastModified>2009-10-12T17:50:30.000Z</LastModified><ETag>x</ETag><Size>1</Size></Contents></ListBucketResult>";
         assert_eq!(list_page(xml).unwrap().objects[0].key, "a b");
+    }
+
+    #[test]
+    fn a_plus_in_a_listed_key_is_a_space_and_an_encoded_plus_is_a_plus() {
+        assert_eq!(decode_listed_key("a+b%2Bc").unwrap(), "a b+c");
+        assert_eq!(percent_decode("a+b%2Bc").unwrap(), "a+b+c");
+        let xml = "<ListBucketResult><EncodingType>url</EncodingType><IsTruncated>false</IsTruncated><Contents><Key>dir/a+b%2Bc.txt</Key><LastModified>2009-10-12T17:50:30.000Z</LastModified><ETag>x</ETag><Size>1</Size></Contents></ListBucketResult>";
+        assert_eq!(list_page(xml).unwrap().objects[0].key, "dir/a b+c.txt");
     }
 
     #[test]

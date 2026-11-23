@@ -1038,6 +1038,76 @@ async fn replacing_the_key_answers_the_old_secret_and_moves_the_generation() {
 }
 
 #[tokio::test]
+async fn replacing_the_key_clears_denied_marks_and_keeps_archived_ones() {
+    let f = fixture().await;
+    connect(&f, f.library, "denied-bucket", "").await.unwrap();
+    let denied = external_document(&f, f.library, "Denied.txt").await;
+    let archived = external_document(&f, f.library, "Archived.txt").await;
+    let ns = 1_700_000_000_i64 * 1_000_000_000;
+    let archived_tag = object_tag(9, 1_700_000_000, "\"e1\"", true);
+    f.test
+        .db
+        .record_external_item(f.library, &entry(denied, "Denied.txt", 9, ns, None))
+        .await
+        .unwrap();
+    f.test
+        .db
+        .record_external_item(
+            f.library,
+            &entry(archived, "Archived.txt", 9, ns, Some(archived_tag)),
+        )
+        .await
+        .unwrap();
+    let tag = f.test.db.external_item(denied).await.unwrap().unwrap().tag;
+    assert!(
+        f.test
+            .db
+            .set_external_unavailable(denied, &tag, Some(Unavailable::Denied))
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        f.test
+            .db
+            .external_item(denied)
+            .await
+            .unwrap()
+            .unwrap()
+            .unavailable,
+        Some(Unavailable::Denied)
+    );
+
+    let new = secret(&f, b"replacement sealed key").await;
+    f.test
+        .db
+        .set_s3_key(f.library, "AKIANEWKEY", new)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        f.test
+            .db
+            .external_item(denied)
+            .await
+            .unwrap()
+            .unwrap()
+            .unavailable,
+        None,
+        "the new key may try again"
+    );
+    assert_eq!(
+        f.test
+            .db
+            .external_item(archived)
+            .await
+            .unwrap()
+            .unwrap()
+            .unavailable,
+        Some(Unavailable::Archived)
+    );
+}
+
+#[tokio::test]
 async fn disconnect_removes_s3_and_usage_rows_and_answers_the_secret() {
     let f = fixture().await;
     let place = place("gone-bucket", "p/");
