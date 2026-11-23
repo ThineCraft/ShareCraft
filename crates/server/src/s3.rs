@@ -18,7 +18,7 @@ use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
 use collab_core::ids::NodeId;
@@ -31,7 +31,10 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Method, StatusCode, redirect};
 use time::OffsetDateTime;
 
+use revisions::BlobError;
+
 use crate::AppState;
+use crate::blobs::{Blobs, ChannelReader, Held};
 use crate::s3_sign::{self, Credentials, EMPTY_SHA256, ToSign};
 use crate::s3_xml::{self, ListPage};
 use crate::source_sync::SyncError;
@@ -169,6 +172,12 @@ struct Meter {
 }
 
 impl Meter {
+    fn hit(&self, library: NodeId) {
+        let mut usage = lock(&self.usage);
+        let entry = usage.entry(library).or_default();
+        entry.cache_hits = entry.cache_hits.saturating_add(1);
+    }
+
     fn add(&self, library: NodeId, class: Class, requests: u64, bytes_down: u64) {
         let mut usage = lock(&self.usage);
         let entry = usage.entry(library).or_default();
@@ -189,8 +198,16 @@ struct Waits {
     retry: Duration,
 }
 
-/// The S3 client of a running server: clients per endpoint and the usage meter.
+/// How many objects may be read from S3 at once across the server. Its own permits: a hung file
+/// share must not starve S3, nor the reverse.
+pub const S3_READS: usize = 4;
+
+/// The S3 client of a running server: clients per endpoint, the usage meter, the read permits
+/// and the offline memory of each library.
 pub struct S3 {
+    read: Arc<tokio::sync::Semaphore>,
+    read_wait: Mutex<Duration>,
+    offline_until: Mutex<HashMap<NodeId, Instant>>,
     plain_loopback: bool,
     clients: Mutex<HashMap<String, reqwest::Client>>,
     waits: Mutex<Waits>,
@@ -517,6 +534,9 @@ impl S3 {
     #[must_use]
     pub fn new(plain_loopback: bool) -> S3 {
         S3 {
+            read: Arc::new(tokio::sync::Semaphore::new(S3_READS)),
+            read_wait: Mutex::new(crate::external::READ_WAIT),
+            offline_until: Mutex::new(HashMap::new()),
             plain_loopback,
             clients: Mutex::new(HashMap::new()),
             waits: Mutex::new(Waits {
@@ -529,6 +549,47 @@ impl S3 {
             listing_progress: Mutex::new(HashMap::new()),
             list_time_for_tests: Mutex::new(None),
         }
+    }
+
+    /// An S3 read permit, waited for at most the read wait; `None` when none came in time.
+    /// Dropping the permit (also by cancelling the read holding it) gives it back.
+    pub(crate) async fn read_turn(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let wait = *lock(&self.read_wait);
+        tokio::time::timeout(wait, Arc::clone(&self.read).acquire_owned())
+            .await
+            .ok()
+            .and_then(Result::ok)
+    }
+
+    /// Sets how long a read waits for a permit before answering busy, without changing its
+    /// 20-second production default.
+    pub fn set_read_wait(&self, wait: Duration) {
+        *lock(&self.read_wait) = wait;
+    }
+
+    /// The read permits free now, for tests.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn read_permits_for_tests(&self) -> usize {
+        self.read.available_permits()
+    }
+
+    /// Whether `library`'s store was found unreachable recently enough that no request is sent.
+    pub(crate) fn offline(&self, library: NodeId) -> bool {
+        let now = Instant::now();
+        let mut offline = lock(&self.offline_until);
+        offline.retain(|_, until| *until > now);
+        offline.get(&library).is_some_and(|until| *until > now)
+    }
+
+    /// Remembers `library`'s store as unreachable for `for_time`.
+    pub(crate) fn mark_offline(&self, library: NodeId, for_time: Duration) {
+        lock(&self.offline_until).insert(library, Instant::now() + for_time);
+    }
+
+    /// Counts one read answered from the cache against `library`.
+    pub(crate) fn count_cache_hit(&self, library: NodeId) {
+        self.meter.hit(library);
     }
 
     /// Files seen so far by a listing of `library`'s bucket currently in progress.
@@ -1020,6 +1081,92 @@ impl S3 {
         }
         put("authorization", &signed.authorization)?;
         Ok(headers)
+    }
+}
+
+/// How many body chunks may wait between the answer and the content store.
+const BODY_QUEUE: usize = 2;
+
+/// Why an object's body was not stored.
+#[derive(Debug)]
+pub(crate) enum StoreFailure {
+    /// The body was shorter or longer than its length: the object is changing, or the answer
+    /// was cut.
+    Torn,
+    /// The body stopped coming (the idle limit passed) or the connection failed.
+    Stream(S3Error),
+    /// The content store refused it.
+    Store(BlobError),
+}
+
+/// Reads from the body channel, and fails rather than ending before `remaining` bytes: a body
+/// cut short is never placed in the store, also when the read is cancelled part way.
+struct ExactReader {
+    inner: ChannelReader,
+    remaining: u64,
+}
+
+impl std::io::Read for ExactReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = std::io::Read::read(&mut self.inner, buf)?;
+        if n == 0 && self.remaining > 0 && !buf.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "the S3 body ended early",
+            ));
+        }
+        self.remaining = self
+            .remaining
+            .saturating_sub(u64::try_from(n).unwrap_or(u64::MAX));
+        Ok(n)
+    }
+}
+
+/// Streams `body` into the content store through a bounded channel, at most `size` bytes and
+/// exactly `size` bytes, and holds what it stored. The store reads on a blocking worker; the
+/// body is read here. When the store stops early its end of the channel closes and the next
+/// send fails, so neither side waits on the other for ever.
+pub(crate) async fn store_body(
+    blobs: &Arc<Blobs>,
+    mut body: Body,
+    size: u64,
+) -> Result<Held, StoreFailure> {
+    let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<Bytes>>(BODY_QUEUE);
+    let reader = ExactReader {
+        inner: ChannelReader::new(rx),
+        remaining: size,
+    };
+    let write = blobs.write_reader(Box::new(reader), size);
+    let pump = async move {
+        loop {
+            match body.chunk().await {
+                Ok(Some(bytes)) => {
+                    if tx.send(Ok(bytes)).await.is_err() {
+                        return Ok(());
+                    }
+                }
+                Ok(None) => return Ok(()),
+                Err(error) => {
+                    let _ = tx
+                        .send(Err(std::io::Error::other("the S3 body failed")))
+                        .await;
+                    return Err(error);
+                }
+            }
+        }
+    };
+    let (written, pumped) = tokio::join!(write, pump);
+    match (pumped, written) {
+        (Ok(()), Ok(held)) => Ok(held),
+        (Err(S3Error::Malformed), _) => Err(StoreFailure::Torn),
+        (Err(error), _) => Err(StoreFailure::Stream(error)),
+        (Ok(()), Err(BlobError::TooLarge { .. })) => Err(StoreFailure::Torn),
+        (Ok(()), Err(BlobError::Io(error)))
+            if error.kind() == std::io::ErrorKind::UnexpectedEof =>
+        {
+            Err(StoreFailure::Torn)
+        }
+        (Ok(()), Err(error)) => Err(StoreFailure::Store(error)),
     }
 }
 

@@ -170,6 +170,8 @@ fn external_error(error: ExternalError) -> ApiError {
         ExternalError::Busy => ApiError::Busy,
         ExternalError::Held(scan) => ApiError::Held(scan),
         ExternalError::Failed => ApiError::Unavailable,
+        ExternalError::Archived => ApiError::SourceUnavailable("archived"),
+        ExternalError::OverBudget => ApiError::SourceUnavailable("over_budget"),
     }
 }
 

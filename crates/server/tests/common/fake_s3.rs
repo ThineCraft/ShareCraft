@@ -71,7 +71,7 @@ struct Model {
     slow: HashMap<String, Duration>,
     hung: HashSet<String>,
     truncated: HashMap<String, usize>,
-    change_before_get: HashMap<String, Vec<u8>>,
+    change_before_get: HashMap<String, Vec<Vec<u8>>>,
     page_size: usize,
     unsorted: bool,
     repeat_token: bool,
@@ -288,11 +288,14 @@ impl FakeS3 {
         self.model().truncated.insert(key.to_owned(), at);
     }
 
-    /// After the next `HEAD` of `key` the object is replaced by `bytes`.
+    /// After the next `HEAD` of `key` the object is replaced by `bytes`. Called again before
+    /// that `HEAD`, the replacements queue: each later `HEAD` makes the next one.
     pub fn change_before_get(&self, key: &str, bytes: &[u8]) {
         self.model()
             .change_before_get
-            .insert(key.to_owned(), bytes.to_vec());
+            .entry(key.to_owned())
+            .or_default()
+            .push(bytes.to_vec());
     }
 
     /// Listing pages hold at most `n` keys.
@@ -647,7 +650,9 @@ async fn handle(State(model): State<Arc<Mutex<Model>>>, request: Request) -> Res
         let stray = m.stray_key.clone();
         let no_versioning = m.no_versioning_api;
         let replacement = if kind == "head" {
-            m.change_before_get.remove(&key)
+            m.change_before_get
+                .get_mut(&key)
+                .and_then(|queue| (!queue.is_empty()).then(|| queue.remove(0)))
         } else {
             None
         };

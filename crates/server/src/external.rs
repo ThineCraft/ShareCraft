@@ -9,7 +9,7 @@ use std::time::Duration;
 use collab_core::ids::{DocId, NodeId};
 use records::{
     ExternalItem, NewEvent, ScanState, SharePath, SourceKind, Unavailable, approved_root,
-    external_tag,
+    external_tag, object_tag,
 };
 use revisions::{BlobError, BlobRef};
 use serde_json::json;
@@ -17,6 +17,7 @@ use time::OffsetDateTime;
 
 use crate::AppState;
 use crate::blobs::{CacheEviction, Held};
+use crate::s3::{S3Error, S3Target, StoreFailure};
 use crate::share::{Flight, FsKind, FsStat, ShareFs};
 
 pub const SHARE_READS: usize = 4;
@@ -37,6 +38,10 @@ pub enum ExternalError {
     NotApproved,
     Held(ScanState),
     Failed,
+    /// The S3 object is in an archive storage class and not restored; it is never requested.
+    Archived,
+    /// The library's monthly read budget is used up and the content is not in the cache.
+    OverBudget,
 }
 
 pub struct Ready {
@@ -158,9 +163,8 @@ pub async fn materialise(state: &AppState, node: NodeId) -> Result<Option<Ready>
             materialise_share(state, node, flight).await
         }
         SourceKind::S3 => {
-            let _flight = Arc::new(state.shares().flight(node).await);
-            // Task 9 adds the S3 arm.
-            Err(ExternalError::Failed)
+            let flight = Arc::new(state.shares().flight(node).await);
+            materialise_s3(state, node, flight).await.map(Some)
         }
         SourceKind::Github => Ok(None),
     }
@@ -436,6 +440,270 @@ async fn materialise_share(
     finish_read(state, &item, held, old_hash).await.map(Some)
 }
 
+/// The S3 arm of `materialise`: `HEAD`, then one whole-object `GET` with `If-Match` on the ETag
+/// just seen, streamed into the content store, then the shared tail. An archived object is
+/// never asked for; a body that is not exactly the object is never kept.
+async fn materialise_s3(
+    state: &AppState,
+    node: NodeId,
+    flight: Arc<Flight>,
+) -> Result<Ready, ExternalError> {
+    let _flight = flight;
+    let s3 = state.s3();
+    let mut item = current_item(state, node).await?;
+    // The settings are read again: an endpoint no longer approved refuses even cached content.
+    let mut target = s3_target(state, item.library).await?;
+    s3_remembered_refusal(&item)?;
+    let mut changed_retried = false;
+    let mut cas_retried = false;
+    loop {
+        if let Some(reason) = s3_paused(state, item.library).await? {
+            return s3_from_cache(state, &item, reason).await;
+        }
+
+        let key = format!("{}{}", target.prefix(), item.repository_path);
+        let head = match tokio::time::timeout(STAT_WAIT, s3.head(&target, &key)).await {
+            Ok(Ok(head)) => head,
+            Ok(Err(error)) => return s3_refusal(state, &item, error).await,
+            Err(_) => return s3_refusal(state, &item, S3Error::TimedOut).await,
+        };
+        let archived = archived_class(head.class.as_deref()) && !head.restored;
+        let tag = object_tag(head.size, head.modified_s, &head.etag, archived);
+        if tag != item.tag {
+            let _moved = state
+                .db()
+                .set_external_seen(node, &item.tag, &tag, head.size)
+                .await
+                .map_err(database_failed)?;
+            state.sources().wake(item.library);
+            item = current_item(state, node).await?;
+        }
+        if archived {
+            return Err(ExternalError::Archived);
+        }
+        if item.tag != tag {
+            // Someone else moved the tag meanwhile: look again once.
+            if changed_retried {
+                return Err(ExternalError::Changing);
+            }
+            changed_retried = true;
+            continue;
+        }
+        s3_remembered_refusal(&item)?;
+        if let Some(version) = head.version.as_deref()
+            && item.version.as_deref() != Some(version)
+        {
+            let _ = state
+                .db()
+                .set_external_version(node, &tag, Some(version))
+                .await
+                .map_err(database_failed)?;
+        }
+        if let Some(ready) = serve_cached(state, &item).await? {
+            s3.count_cache_hit(item.library);
+            return Ok(ready);
+        }
+
+        let cache_max = cache_max_bytes(state).await?;
+        if head.size > state.config().max_file_bytes || head.size > cache_max / 2 {
+            state
+                .db()
+                .set_external_unavailable(node, &item.tag, Some(Unavailable::TooLarge))
+                .await
+                .map_err(database_failed)?;
+            return Err(ExternalError::TooLarge);
+        }
+
+        let permit = s3.read_turn().await.ok_or(ExternalError::Busy)?;
+        // The wait may have been long: the approval, the item and the budget are read again.
+        target = s3_target(state, item.library).await?;
+        item = current_item(state, node).await?;
+        s3_remembered_refusal(&item)?;
+        if item.unavailable == Some(Unavailable::Archived) {
+            return Err(ExternalError::Archived);
+        }
+        if item.tag != tag {
+            drop(permit);
+            if changed_retried {
+                return Err(ExternalError::Changing);
+            }
+            changed_retried = true;
+            continue;
+        }
+        if let Some(reason) = s3_paused(state, item.library).await? {
+            drop(permit);
+            return s3_from_cache(state, &item, reason).await;
+        }
+        let old_hash = item.sha256;
+        let key = format!("{}{}", target.prefix(), item.repository_path);
+        let (answer, body) = match s3.get(&target, &key, &head.etag, None).await {
+            Ok(got) => got,
+            Err(S3Error::Precondition) => {
+                // Replaced since the `HEAD`: look again once.
+                drop(permit);
+                if changed_retried {
+                    return Err(ExternalError::Changing);
+                }
+                changed_retried = true;
+                continue;
+            }
+            Err(error) => return s3_refusal(state, &item, error).await,
+        };
+        if answer.size != head.size || body.length() != Some(head.size) {
+            return Err(ExternalError::Changing);
+        }
+        let held = match crate::s3::store_body(state.blobs(), body, head.size).await {
+            Ok(held) => held,
+            Err(StoreFailure::Torn) => return Err(ExternalError::Changing),
+            Err(StoreFailure::Stream(error)) => {
+                eprintln!("sharecraft-server: an S3 read stopped part way: {error}");
+                s3.mark_offline(item.library, OFFLINE_FOR);
+                return Err(ExternalError::Offline);
+            }
+            Err(StoreFailure::Store(error)) => return Err(blob_failed(error)),
+        };
+        if held.blob().size != head.size {
+            discard(state, held).await;
+            return Err(ExternalError::Changing);
+        }
+        if let Some(revision) = pin_and_record(state, &item, &held).await? {
+            item.revision = revision;
+            drop(permit);
+            return finish_read(state, &item, held, old_hash).await;
+        }
+        // The listing moved the tag while the bytes were coming: they are not this item's.
+        discard(state, held).await;
+        drop(permit);
+        state.sources().wake(item.library);
+        if cas_retried {
+            return Err(ExternalError::Changing);
+        }
+        cas_retried = true;
+        item = current_item(state, node).await?;
+        s3_remembered_refusal(&item)?;
+    }
+}
+
+/// Whether an object in `class` must be restored before it can be read.
+fn archived_class(class: Option<&str>) -> bool {
+    matches!(class, Some("GLACIER" | "DEEP_ARCHIVE"))
+}
+
+async fn current_item(state: &AppState, node: NodeId) -> Result<ExternalItem, ExternalError> {
+    state
+        .db()
+        .external_item(node)
+        .await
+        .map_err(database_failed)?
+        .ok_or(ExternalError::Gone)
+}
+
+async fn s3_target(state: &AppState, library: NodeId) -> Result<S3Target, ExternalError> {
+    match state.s3().target(state, library).await {
+        Ok(target) => Ok(target),
+        Err(S3Error::AddressRefused) => Err(ExternalError::NotApproved),
+        Err(S3Error::BadKeys) => {
+            eprintln!("sharecraft-server: the stored S3 key of a library cannot be opened");
+            Err(ExternalError::Failed)
+        }
+        Err(error) => {
+            eprintln!("sharecraft-server: cannot read an S3 library's place: {error}");
+            Err(ExternalError::Failed)
+        }
+    }
+}
+
+/// The remembered refusals of an S3 item, except archived: the `HEAD` checks that again, since
+/// a restored object must become readable.
+fn s3_remembered_refusal(item: &ExternalItem) -> Result<(), ExternalError> {
+    match item.unavailable {
+        Some(Unavailable::Archived) => Ok(()),
+        _ => remembered_refusal(item),
+    }
+}
+
+/// Why no request may be sent for `library` now: its store was found offline recently, or the
+/// month's read budget is used up (stored usage plus what is counted and not yet stored).
+async fn s3_paused(
+    state: &AppState,
+    library: NodeId,
+) -> Result<Option<ExternalError>, ExternalError> {
+    if state.s3().offline(library) {
+        return Ok(Some(ExternalError::Offline));
+    }
+    let budget = state.db().budget(library).await.map_err(database_failed)?;
+    let used = state
+        .db()
+        .usage(library, OffsetDateTime::now_utc().date())
+        .await
+        .map_err(database_failed)?;
+    let unflushed = state.s3().unflushed_usage(library);
+    let reads = used.read.saturating_add(unflushed.read);
+    let bytes = used.bytes_down.saturating_add(unflushed.bytes_down);
+    let over = reads >= budget.read_requests || budget.bytes_down.is_some_and(|max| bytes >= max);
+    Ok(over.then_some(ExternalError::OverBudget))
+}
+
+/// The answer when no request may be sent: the cached content, else `reason`.
+async fn s3_from_cache(
+    state: &AppState,
+    item: &ExternalItem,
+    reason: ExternalError,
+) -> Result<Ready, ExternalError> {
+    if item.unavailable == Some(Unavailable::Archived) {
+        return Err(ExternalError::Archived);
+    }
+    match serve_cached(state, item).await? {
+        Some(ready) => {
+            state.s3().count_cache_hit(item.library);
+            Ok(ready)
+        }
+        None => Err(reason),
+    }
+}
+
+/// What an S3 failure means for the read of `item`.
+async fn s3_refusal(
+    state: &AppState,
+    item: &ExternalItem,
+    error: S3Error,
+) -> Result<Ready, ExternalError> {
+    match error {
+        S3Error::Unreachable | S3Error::TimedOut | S3Error::Throttled => {
+            state.s3().mark_offline(item.library, OFFLINE_FOR);
+            s3_from_cache(state, item, ExternalError::Offline).await
+        }
+        S3Error::NotFound => {
+            mark_gone_and_wake(state, item).await?;
+            Err(ExternalError::Gone)
+        }
+        S3Error::Denied => {
+            state
+                .db()
+                .set_external_unavailable(item.node, &item.tag, Some(Unavailable::Denied))
+                .await
+                .map_err(database_failed)?;
+            Err(ExternalError::Denied)
+        }
+        // The listing finds these too and marks the library not connected.
+        S3Error::BadKeys | S3Error::NoBucket | S3Error::WrongRegion | S3Error::ClockSkew => {
+            state.sources().wake(item.library);
+            Err(ExternalError::Offline)
+        }
+        S3Error::AddressRefused => Err(ExternalError::NotApproved),
+        S3Error::Archived => Err(ExternalError::Archived),
+        S3Error::Precondition | S3Error::Unsupported | S3Error::Malformed | S3Error::Other => {
+            eprintln!("sharecraft-server: an S3 read failed: {error}");
+            Err(ExternalError::Failed)
+        }
+    }
+}
+
+async fn cache_max_bytes(state: &AppState) -> Result<u64, ExternalError> {
+    let settings = state.db().share_settings().await.map_err(database_failed)?;
+    Ok(state.shares().cache_max_bytes(settings.cache_max_bytes))
+}
+
 /// Pins the stored bytes and records them on the item with the compare-and-set on its tag.
 /// `None` means the compare-and-set was lost: the caller discards the bytes and decides what next.
 async fn pin_and_record(
@@ -527,8 +795,9 @@ fn remembered_refusal(item: &ExternalItem) -> Result<(), ExternalError> {
         Some(Unavailable::Gone) => Err(ExternalError::Gone),
         Some(Unavailable::Denied) => Err(ExternalError::Denied),
         Some(Unavailable::TooLarge) => Err(ExternalError::TooLarge),
-        // An archived object is read only through S3, whose arm refuses it before asking.
-        Some(Unavailable::Locked | Unavailable::Archived) | None => Ok(()),
+        // Only an S3 item can be archived; the S3 arm checks it again with a `HEAD`.
+        Some(Unavailable::Archived) => Err(ExternalError::Archived),
+        Some(Unavailable::Locked) | None => Ok(()),
     }
 }
 
