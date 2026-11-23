@@ -80,6 +80,8 @@ struct Model {
     skew: bool,
     redirect: Option<String>,
     no_versioning_api: bool,
+    fail_continued: Option<(u16, String)>,
+    slow_list: Option<Duration>,
     counts: HashMap<String, usize>,
     requests: Vec<Logged>,
     last_headers: HeaderMap,
@@ -105,6 +107,8 @@ impl Default for Model {
             skew: false,
             redirect: None,
             no_versioning_api: false,
+            fail_continued: None,
+            slow_list: None,
             counts: HashMap::new(),
             requests: Vec::new(),
             last_headers: HeaderMap::new(),
@@ -197,6 +201,23 @@ impl FakeS3 {
     /// Stores `bytes` at `key` with the ETag, class and restore state of `opts`.
     pub fn put_with(&self, bucket: &str, key: &str, bytes: &[u8], opts: Opts) {
         self.put_full(bucket, key, bytes, now_s(), opts);
+    }
+
+    /// Stores ytes at key with the ETag, class and restore state of opts, modified at
+    /// modified_s.
+    pub fn put_with_at(&self, bucket: &str, key: &str, bytes: &[u8], modified_s: i64, opts: Opts) {
+        self.put_full(bucket, key, bytes, modified_s, opts);
+    }
+
+    /// Answers every listing request that carries a continuation token (every page after the
+    /// first) with status and an error body carrying code.
+    pub fn fail_continued_lists(&self, status: u16, code: &str) {
+        self.model().fail_continued = Some((status, code.to_owned()));
+    }
+
+    /// Waits wait before answering each listing page.
+    pub fn slow_list(&self, wait: Duration) {
+        self.model().slow_list = Some(wait);
     }
 
     fn put_full(&self, bucket: &str, key: &str, bytes: &[u8], modified_s: i64, opts: Opts) {
@@ -591,6 +612,15 @@ async fn handle(State(model): State<Arc<Mutex<Model>>>, request: Request) -> Res
         }
         if let Some((status, code)) = m.fail_next.take() {
             return error(status, &code);
+        }
+        if kind == "list"
+            && has("continuation-token")
+            && let Some((status, code)) = m.fail_continued.clone()
+        {
+            return error(status, &code);
+        }
+        if kind == "list" {
+            wait = m.slow_list;
         }
         if m.skew {
             return error(403, "RequestTimeTooSkewed");

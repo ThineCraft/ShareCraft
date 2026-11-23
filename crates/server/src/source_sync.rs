@@ -54,6 +54,7 @@ use crate::api::uploads::{store_version, uploads_path};
 use crate::blobs::Held;
 use crate::file_room::SaveReply;
 use crate::github::{GithubError, Head, RepoRef, TarLimits, for_each_in_tarball, git_blob_id};
+use crate::s3_source::S3Source;
 use crate::secrets::{Sealed, Secret};
 use crate::share::ShareSource;
 use crate::source::{ContentMode, EntryKind, Listing, Look, SourceCaps, StorageSource, TreeEntry};
@@ -109,6 +110,8 @@ pub struct Hidden {
     pub offline: usize,
     pub too_long: usize,
     pub unreadable: usize,
+    /// Archived objects: shown (so not in [`Hidden::total`]) but not readable until restored.
+    pub archived: usize,
 }
 
 impl Hidden {
@@ -139,6 +142,7 @@ impl Hidden {
             "offline": self.offline,
             "long": self.too_long,
             "unreadable": self.unreadable,
+            "archived": self.archived,
         })
     }
 }
@@ -386,10 +390,29 @@ fn shown_names_with_allocations(
             .or_default()
             .push(path.clone());
     }
+    // Folders that hold a shown file, by their parent and lower-cased name. A file beside a
+    // folder of its name (only a bucket can hold both) is numbered and the folder keeps the
+    // name; the folder's repository path then ends in `/`, so the two stay distinct records.
+    let file_paths: HashSet<String> = files.iter().map(|(path, _, _)| path.clone()).collect();
+    let mut folder_names: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut seen_folders: HashSet<&str> = HashSet::new();
+    for (path, _, _) in &files {
+        let mut folder = parent_path(path);
+        while !folder.is_empty() && seen_folders.insert(folder) {
+            folder_names
+                .entry(parent_path(folder).to_owned())
+                .or_default()
+                .insert(last_name(folder).to_lowercase());
+            folder = parent_path(folder);
+        }
+    }
     let mut collision_numbers = HashMap::new();
     let mut plain_file_names: HashMap<String, HashSet<String>> = HashMap::new();
-    for ((parent, _), paths) in groups {
-        if paths.len() > 1 {
+    for ((parent, lower), paths) in groups {
+        let beside_folder = folder_names
+            .get(&parent)
+            .is_some_and(|names| names.contains(&lower));
+        if paths.len() > 1 || beside_folder {
             for (index, path) in paths.into_iter().enumerate() {
                 collision_numbers.insert(path, index + 1);
             }
@@ -464,7 +487,11 @@ fn shown_names_with_allocations(
             folders.insert(original.clone(), at.clone());
             shown.push(Entry {
                 path: at.clone(),
-                repository_path: original.clone(),
+                repository_path: if file_paths.contains(&original) {
+                    format!("{original}/")
+                } else {
+                    original.clone()
+                },
                 sha: String::new(),
                 size: 0,
                 dir: true,
@@ -943,10 +970,7 @@ async fn sync_one(state: &AppState, library: NodeId, now: OffsetDateTime) -> boo
                 SourceKind::Share => {
                     run(&ShareSource, state, &config, &status, now, generation).await
                 }
-                // The S3 listing arrives with its source; until then nothing reads a bucket.
-                SourceKind::S3 => {
-                    Err(failed("S3 libraries are not synced by this version.").into())
-                }
+                SourceKind::S3 => run(&S3Source, state, &config, &status, now, generation).await,
             };
             let finished = finish(state, &config, status, now, outcome, generation).await;
             drop(source_lock);
@@ -1067,7 +1091,7 @@ pub async fn sync_once(
     let outcome = match config.kind {
         SourceKind::Github => run(&GithubSource, state, &config, &status, now, generation).await,
         SourceKind::Share => run(&ShareSource, state, &config, &status, now, generation).await,
-        SourceKind::S3 => Err(failed("S3 libraries are not synced by this version.").into()),
+        SourceKind::S3 => run(&S3Source, state, &config, &status, now, generation).await,
     };
     finish(state, &config, status, now, outcome, generation).await
 }
@@ -1518,6 +1542,7 @@ async fn run<S: StorageSource>(
     hidden.offline = hidden.offline.saturating_add(refused.offline);
     hidden.too_long = hidden.too_long.saturating_add(refused.too_long);
     hidden.unreadable = hidden.unreadable.saturating_add(refused.unreadable);
+    hidden.archived = hidden.archived.saturating_add(refused.archived);
 
     let files = shown.iter().filter(|e| !e.dir).count();
     let bytes =
@@ -2244,7 +2269,7 @@ fn temporary_name(name: &str) -> String {
 fn external_mtime(entry: &Entry) -> Result<i64, SyncError> {
     external_tag_parts(&entry.sha, entry.size)
         .map(|parts| parts.mtime_ns)
-        .ok_or_else(|| failed("A file on the share had an invalid change tag."))
+        .ok_or_else(|| failed("A file in the library's storage had an invalid change tag."))
 }
 
 impl Applying<'_> {
@@ -2389,8 +2414,8 @@ impl Applying<'_> {
         tree::create_external_nodes(self.state, self.user, self.library, batch, git_ids)
             .await
             .map_err(|e| {
-                eprintln!("sharecraft-server: sync could not add a file-share batch: {e:?}");
-                failed("A batch of file-share items could not be added, so the sync stopped.")
+                eprintln!("sharecraft-server: sync could not add a batch of external items: {e:?}");
+                failed("A batch of items could not be added, so the sync stopped.")
             })?;
         self.ensure_external_generation(generation).await
     }
@@ -3038,6 +3063,40 @@ mod tests {
                 "docs/readme (2).md"
             ]
         );
+        assert_eq!(hidden.renamed, 2);
+    }
+
+    #[test]
+    fn a_file_beside_a_folder_of_its_name_is_numbered_and_the_folder_keeps_the_name() {
+        let (shown, hidden) = shown_names(
+            vec![
+                tree("a", EntryKind::File, "s1"),
+                tree("a/b.md", EntryKind::File, "s2"),
+                tree("Notes.md", EntryKind::File, "s3"),
+                tree("notes.md/c.md", EntryKind::File, "s4"),
+            ],
+            "",
+        );
+        assert_eq!(
+            paths(&shown),
+            [
+                "Notes (1).md",
+                "a",
+                "a (1)",
+                "a/b.md",
+                "notes.md",
+                "notes.md/c.md"
+            ]
+        );
+        let folder = shown.iter().find(|e| e.path == "a").unwrap();
+        assert!(folder.dir);
+        assert_eq!(folder.repository_path, "a/");
+        let file = shown.iter().find(|e| e.path == "a (1)").unwrap();
+        assert!(!file.dir);
+        assert_eq!(file.repository_path, "a");
+        let other = shown.iter().find(|e| e.path == "notes.md").unwrap();
+        assert!(other.dir);
+        assert_eq!(other.repository_path, "notes.md");
         assert_eq!(hidden.renamed, 2);
     }
 

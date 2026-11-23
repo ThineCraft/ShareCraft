@@ -34,6 +34,7 @@ mod projection;
 mod room;
 pub mod s3;
 pub mod s3_sign;
+pub mod s3_source;
 pub mod s3_xml;
 mod scan;
 pub mod secrets;

@@ -16,13 +16,15 @@ use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use axum::body::Bytes;
 use collab_core::ids::NodeId;
 use records::{
-    IpRange, S3Endpoint, Usage, Versioning, address_allowed, find_endpoint, valid_bucket,
+    IpRange, S3_ENDPOINTS, S3Endpoint, Usage, Versioning, address_allowed, find_endpoint,
+    valid_bucket,
 };
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
@@ -194,6 +196,33 @@ pub struct S3 {
     waits: Mutex<Waits>,
     overrides: Arc<Mutex<HashMap<String, SocketAddr>>>,
     meter: Arc<Meter>,
+    listing_progress: Mutex<HashMap<NodeId, Arc<AtomicUsize>>>,
+    list_time_for_tests: Mutex<Option<Duration>>,
+}
+
+/// The files seen so far by a bucket listing in progress; forgotten when dropped.
+pub(crate) struct ListingProgress<'a> {
+    owner: &'a S3,
+    library: NodeId,
+    count: Arc<AtomicUsize>,
+}
+
+impl ListingProgress<'_> {
+    pub(crate) fn set(&self, files: usize) {
+        self.count.store(files, Ordering::SeqCst);
+    }
+}
+
+impl Drop for ListingProgress<'_> {
+    fn drop(&mut self) {
+        let mut progress = lock(&self.owner.listing_progress);
+        if progress
+            .get(&self.library)
+            .is_some_and(|current| Arc::ptr_eq(current, &self.count))
+        {
+            progress.remove(&self.library);
+        }
+    }
 }
 
 impl fmt::Debug for S3 {
@@ -497,7 +526,77 @@ impl S3 {
             }),
             overrides: Arc::new(Mutex::new(HashMap::new())),
             meter: Arc::new(Meter::default()),
+            listing_progress: Mutex::new(HashMap::new()),
+            list_time_for_tests: Mutex::new(None),
         }
+    }
+
+    /// Files seen so far by a listing of `library`'s bucket currently in progress.
+    #[must_use]
+    pub fn listing_progress(&self, library: NodeId) -> Option<usize> {
+        lock(&self.listing_progress)
+            .get(&library)
+            .map(|count| count.load(Ordering::SeqCst))
+    }
+
+    pub(crate) fn begin_listing(&self, library: NodeId) -> ListingProgress<'_> {
+        let count = Arc::new(AtomicUsize::new(0));
+        lock(&self.listing_progress).insert(library, Arc::clone(&count));
+        ListingProgress {
+            owner: self,
+            library,
+            count,
+        }
+    }
+
+    /// The longest a listing pass may take: `configured`, unless a test set another.
+    pub(crate) fn list_time(&self, configured: Duration) -> Duration {
+        lock(&self.list_time_for_tests).unwrap_or(configured)
+    }
+
+    /// Sets (or with `None` clears) the listing time limit, for tests; the stored setting is
+    /// unchanged.
+    pub fn set_list_time_for_tests(&self, limit: Option<Duration>) {
+        *lock(&self.list_time_for_tests) = limit;
+    }
+
+    /// What has been counted against `library` and not yet taken by [`S3::take_usage`].
+    #[must_use]
+    pub fn unflushed_usage(&self, library: NodeId) -> Usage {
+        lock(&self.meter.usage)
+            .get(&library)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// The endpoint `name` of the stored approvals, read with the plain-HTTP loopback form
+    /// allowed. Only a client built with that test switch looks.
+    async fn loopback_endpoint(&self, state: &AppState, name: &str) -> Option<S3Endpoint> {
+        if !self.plain_loopback {
+            return None;
+        }
+        let value = state.db().setting(S3_ENDPOINTS).await.ok()??;
+        value.as_array()?.iter().find_map(|entry| {
+            let object = entry.as_object()?;
+            if object.get("name")?.as_str()? != name {
+                return None;
+            }
+            let allow = object
+                .get("allow")?
+                .as_array()?
+                .iter()
+                .map(|range| range.as_str().map(str::to_owned))
+                .collect::<Option<Vec<_>>>()?;
+            S3Endpoint::parse(
+                name,
+                object.get("url")?.as_str()?,
+                object.get("region")?.as_str()?,
+                object.get("path_style")?.as_bool()?,
+                &allow,
+                true,
+            )
+            .ok()
+        })
     }
 
     /// The target of the S3 library `library`: its place, its approved endpoint and its
@@ -514,7 +613,13 @@ impl S3 {
             .map_err(|_| S3Error::Other)?
             .ok_or(S3Error::Other)?;
         let settings = state.db().s3_settings().await.map_err(|_| S3Error::Other)?;
-        let endpoint = find_endpoint(&place.endpoint, &settings).ok_or(S3Error::AddressRefused)?;
+        let endpoint = match find_endpoint(&place.endpoint, &settings) {
+            Some(endpoint) => endpoint,
+            None => self
+                .loopback_endpoint(state, &place.endpoint)
+                .await
+                .ok_or(S3Error::AddressRefused)?,
+        };
         let (config, _) = state
             .db()
             .source_of(library)
