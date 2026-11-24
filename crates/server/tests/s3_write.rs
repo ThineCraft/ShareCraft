@@ -457,24 +457,46 @@ async fn write_numbered_takes_the_next_free_name() {
 #[tokio::test]
 async fn make_folder_writes_a_zero_byte_marker_and_accepts_an_existing_one() {
     let (fake, s3, t) = setup().await;
-    make_folder(&s3, &t, "photos/2024").await.unwrap();
+    make_folder(&s3, &t, "photos/2024", Tri::Yes).await.unwrap();
     assert_eq!(fake.writes(), [w("PUT", "lib/photos/2024/", "absent")]);
     assert_eq!(fake.last_write_body_len(), Some(0));
     assert_eq!(fake.object(BUCKET, "lib/photos/2024/").unwrap().bytes, b"");
 
     // Again: a marker already there is success, and nothing is deleted.
-    make_folder(&s3, &t, "photos/2024").await.unwrap();
+    make_folder(&s3, &t, "photos/2024", Tri::Yes).await.unwrap();
     assert!(fake.writes().iter().all(|(method, _, _)| method == "PUT"));
     assert!(fake.object(BUCKET, "lib/photos/2024/").is_some());
 
     assert_eq!(
-        make_folder(&s3, &t, "../x").await.unwrap_err(),
+        make_folder(&s3, &t, "../x", Tri::Yes).await.unwrap_err(),
         WriteError::Failed
     );
     assert_eq!(
-        make_folder(&s3, &t, "a/").await.unwrap_err(),
+        make_folder(&s3, &t, "a/", Tri::Yes).await.unwrap_err(),
         WriteError::Failed
     );
+}
+
+#[tokio::test]
+async fn make_folder_on_a_store_that_ignores_conditions_heads_first_and_never_overwrites() {
+    for conditional in [Tri::No, Tri::Unknown] {
+        let (fake, s3, t) = setup().await;
+        fake.ignore_conditions();
+        // A marker already there (here with bytes, which a blind PUT would empty) is success
+        // with no PUT.
+        fake.put(BUCKET, "lib/kept/", b"marker bytes");
+        make_folder(&s3, &t, "kept", conditional).await.unwrap();
+        assert!(fake.writes().is_empty(), "{conditional:?}");
+        assert_eq!(
+            fake.object(BUCKET, "lib/kept/").unwrap().bytes,
+            b"marker bytes"
+        );
+
+        // A marker not there is written, without a condition the store would ignore.
+        make_folder(&s3, &t, "fresh", conditional).await.unwrap();
+        assert_eq!(fake.writes(), [w("PUT", "lib/fresh/", "none")]);
+        assert_eq!(fake.object(BUCKET, "lib/fresh/").unwrap().bytes, b"");
+    }
 }
 
 #[tokio::test]
@@ -672,7 +694,7 @@ async fn a_bad_path_is_refused_before_any_request() {
                 .await
                 .is_err()
         );
-        assert!(make_folder(&s3, &t, path).await.is_err());
+        assert!(make_folder(&s3, &t, path, Tri::Yes).await.is_err());
     }
     // A key over 1,024 bytes.
     let deep = vec!["d".repeat(200); 6].join("/");
@@ -697,7 +719,7 @@ async fn no_key_outside_the_prefix_is_ever_written() {
     let _ = write_object(&s3, &t, "../other/secret.txt", &body, &base(None), Tri::No).await;
     let _ = write_beside(&s3, &t, "../other/secret.txt", &body, "Ada", at(), Tri::Yes).await;
     let _ = write_numbered(&s3, &t, "../other/secret.txt", &body, Tri::Yes).await;
-    let _ = make_folder(&s3, &t, "../other").await;
+    let _ = make_folder(&s3, &t, "../other", Tri::No).await;
     done(
         write_object(&s3, &t, "in.txt", &body, &base(Some(tag)), Tri::Yes)
             .await
@@ -710,7 +732,7 @@ async fn no_key_outside_the_prefix_is_ever_written() {
     write_numbered(&s3, &t, "in.txt", &body, Tri::Yes)
         .await
         .unwrap();
-    make_folder(&s3, &t, "sub").await.unwrap();
+    make_folder(&s3, &t, "sub", Tri::Yes).await.unwrap();
 
     for (_, key, _) in fake.writes() {
         assert!(key.starts_with("lib/"), "{key}");

@@ -40,7 +40,7 @@ use crate::s3_write;
 use crate::secrets::Secret;
 use crate::share::{FsBudget, canonical_share_path};
 use crate::source_sync::{abandon_uploads_into, caps, token_context, token_of, webhook_context};
-use crate::source_write::Probe;
+use crate::source_write::{self, Probe};
 use crate::tree::{self, TreeOp};
 
 /// Seconds between polls of a new connection.
@@ -1305,9 +1305,20 @@ pub(crate) async fn disconnect(
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         };
-        // Judged again once the turn is held, before anything is removed (the disconnect's own
-        // transaction judges it a last time).
-        writes_settled(&state, library).await?;
+        // Judged again once the turn is held, before anything is removed, and closed to new
+        // changes in the same step: the library is made read-only in one transaction that
+        // locks its connection row and counts its pending changes (a stage holds that row
+        // `FOR SHARE`, so it is either counted here, and the disconnect is refused with nothing
+        // moved, or it waits and then finds the library read-only and is refused). No change
+        // can be accepted once the children are being moved. A disconnect that fails after
+        // this leaves the library read-only, which an owner may choose anyway.
+        let closed = state
+            .db()
+            .set_source_mode(library, SourceMode::ReadOnly)
+            .await?;
+        if closed {
+            recheck_below(&state, library).await;
+        }
         let removed = if external {
             tree::delete_source_children(&state, &actor, library).await?
         } else {
@@ -2147,9 +2158,15 @@ async fn change_mode(
     }
     let changed = db.set_source_mode(library, mode).await?;
     if mode == SourceMode::ReadWrite {
-        db.set_write_state(library, WriteState::Ok, None)
+        let unblocked = db
+            .set_write_state(library, WriteState::Ok, None)
             .await
             .map_err(unavailable)?;
+        // A blocked library restored, as the worker's passing probe does it: the changes
+        // waiting are due at once, and the seats narrowed by the block widen again.
+        if unblocked {
+            source_write::restored(state, library, true, time::OffsetDateTime::now_utc()).await;
+        }
     }
     if changed {
         emit(

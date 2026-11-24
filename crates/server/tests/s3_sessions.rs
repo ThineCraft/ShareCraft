@@ -274,6 +274,37 @@ impl Env {
         self.fake.object(BUCKET, &key(path))
     }
 
+    /// A disconnect of `library` by the owner, sent at once and answered later.
+    fn disconnect(&self, library: NodeId) -> tokio::task::JoinHandle<(StatusCode, Value)> {
+        let request = self.server.http(Some(&self.owner)).delete(
+            self.server
+                .url(&format!("/api/libraries/{}/source", library.0)),
+        );
+        tokio::spawn(async move { answer(request.send().await.unwrap()).await })
+    }
+
+    /// The library's connection row: its mode and generation.
+    async fn connection(&self, library: NodeId) -> (String, i64) {
+        sqlx::query_as("select mode, generation from library_sources where library_id = $1")
+            .bind(library.0)
+            .fetch_one(self.db().test_pool())
+            .await
+            .unwrap()
+    }
+
+    /// Waits (at most [`common::TIMEOUT`]) until `library`'s connection row satisfies `done`.
+    async fn connection_until(&self, library: NodeId, done: impl Fn(&(String, i64)) -> bool) {
+        let deadline = tokio::time::Instant::now() + common::TIMEOUT;
+        loop {
+            let found = self.connection(library).await;
+            if done(&found) {
+                return;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "{found:?}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     /// The writes the fake received for `path`: `(method, condition)`.
     fn writes_of(&self, path: &str) -> Vec<(String, String)> {
         let key = key(path);
@@ -564,6 +595,133 @@ async fn a_library_blocked_mid_session_narrows_the_seat_and_keeps_the_last_save(
     );
     assert!(env.pending(file).await.is_none());
     editor.close().await;
+}
+
+#[tokio::test]
+async fn a_refused_write_narrows_the_seat_and_a_passing_reprobe_widens_it_without_an_access_change()
+{
+    let env = Env::new().await;
+    let (library, file) = env.sheet().await;
+    let mut editor = env.editor(&env.owner, file).await;
+    assert!(editor.can_edit);
+    let base = env.revision(file).await.unwrap();
+    env.saved(&editor, file, &base, b"kept through the block")
+        .await;
+
+    // The store refuses the write: the library is blocked, and the block alone narrows the seat.
+    env.fake.read_only();
+    let now = OffsetDateTime::now_utc() + time::Duration::seconds(31);
+    env.write(now).await;
+    assert_eq!(
+        env.db().write_state(library).await.unwrap().unwrap().0,
+        WriteState::Blocked
+    );
+    editor
+        .pump_until(|c| !c.can_edit && c.token().is_none())
+        .await;
+    assert!(env.pending(file).await.is_some(), "the save is kept");
+
+    // The key may write again: the next probe passes, restores the library and widens the seat.
+    env.fake.allow_writes();
+    let later = now + time::Duration::seconds(301);
+    env.write(later).await;
+    assert_eq!(
+        env.db().write_state(library).await.unwrap().unwrap().0,
+        WriteState::Ok
+    );
+    editor.pump_until(|c| c.can_edit).await;
+
+    env.write(later).await;
+    assert_eq!(
+        env.object("docs/sheet.xlsx").unwrap().bytes,
+        b"kept through the block"
+    );
+    assert!(env.pending(file).await.is_none());
+    editor.close().await;
+}
+
+#[tokio::test]
+async fn a_save_staged_while_a_disconnect_waits_makes_it_refuse_with_nothing_moved() {
+    let env = Env::new().await;
+    let (library, file) = env.sheet().await;
+    let mut editor = env.editor(&env.owner, file).await;
+    let base = env.revision(file).await.unwrap();
+    let (_, generation) = env.connection(library).await;
+
+    // A listing holds the library's turn: the disconnect has judged the writes settled and waits.
+    let turn = env.db().try_lock_source(library).await.unwrap().unwrap();
+    let disconnect = env.disconnect(library);
+    env.connection_until(library, |(_, now)| *now > generation)
+        .await;
+    env.saved(&editor, file, &base, b"saved during the disconnect")
+        .await;
+    drop(turn);
+
+    let (status, body) = disconnect.await.unwrap();
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], "source_writes_pending", "{body}");
+    // Nothing was moved: the library is still connected, read and write, with its files.
+    assert!(env.db().source_of(library).await.unwrap().is_some());
+    assert_eq!(env.connection(library).await.0, "read_write");
+    let docs = env.child(library, "docs").await;
+    assert_eq!(env.child(docs, "sheet.xlsx").await, file);
+    assert!(env.pending(file).await.is_some());
+
+    // And the save still reaches the bucket.
+    env.write(OffsetDateTime::now_utc() + time::Duration::seconds(31))
+        .await;
+    assert_eq!(
+        env.object("docs/sheet.xlsx").unwrap().bytes,
+        b"saved during the disconnect"
+    );
+    editor.close().await;
+}
+
+#[tokio::test]
+async fn a_save_after_a_disconnect_has_closed_the_library_is_refused_and_the_disconnect_completes()
+{
+    let env = Env::new().await;
+    let (library, file) = env.sheet().await;
+    let docs = env.child(library, "docs").await;
+    let editor = env.editor(&env.owner, file).await;
+    let token = editor.token().expect("the editor holds the seat");
+    let base = env.revision(file).await.unwrap();
+
+    // A lock on one child holds the move to the bin back, after the disconnect has decided.
+    let mut hold = env.db().test_pool().begin().await.unwrap();
+    sqlx::query("select id from nodes where id = $1 for update")
+        .bind(docs.0)
+        .execute(&mut *hold)
+        .await
+        .unwrap();
+    let disconnect = env.disconnect(library);
+    env.connection_until(library, |(mode, _)| mode == "read_only")
+        .await;
+
+    let request = env
+        .server
+        .http(Some(&env.owner))
+        .put(env.server.url(&format!("/api/docs/{}/content", file.0)))
+        .header(SEAT, token)
+        .query(&[("base", base)])
+        .body(b"too late".to_vec());
+    let mut save = tokio::spawn(async move { answer(request.send().await.unwrap()).await });
+    // The save is answered while the children are held, or waits for them: refused either way.
+    let early = tokio::time::timeout(Duration::from_secs(5), &mut save).await;
+    hold.rollback().await.unwrap();
+    let (status, body) = match early {
+        Ok(done) => done.unwrap(),
+        Err(_) => save.await.unwrap(),
+    };
+    assert_ne!(status, StatusCode::OK, "{body}");
+    assert!(env.pending(file).await.is_none(), "nothing was staged");
+
+    let (status, body) = disconnect.await.unwrap();
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert!(env.db().source_of(library).await.unwrap().is_none());
+    assert!(env.children(library).await.is_empty());
+    assert!(env.writes_of("docs/sheet.xlsx").is_empty());
+    drop(editor);
 }
 
 #[tokio::test]

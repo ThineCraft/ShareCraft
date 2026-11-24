@@ -532,9 +532,9 @@ async fn switching_modes_changes_what_the_guard_answers_at_once() {
         "source_action_unavailable",
         ACTION_UNAVAILABLE,
     );
+    // A new folder goes through in a read-and-write library (since Task 6).
     let through = env.make_folder(&env.owner, docs).await;
-    assert_eq!(through.0, StatusCode::CONFLICT, "{}", through.1);
-    assert_eq!(through.1["error"], "source_action_unavailable");
+    assert_eq!(through.0, StatusCode::CREATED, "{}", through.1);
 
     let (status, answer) = env
         .patch(&env.owner, library, json!({ "mode": "read_only" }))
@@ -622,7 +622,46 @@ async fn patch_to_read_write_on_a_blocked_library_restores_it_when_the_probe_pas
         WriteState::Ok
     );
     let through = env.make_folder(&env.owner, library).await;
-    assert_eq!(through.1["error"], "source_action_unavailable");
+    assert_eq!(through.0, StatusCode::CREATED, "{}", through.1);
+}
+
+#[tokio::test]
+async fn patch_to_read_write_on_a_blocked_library_makes_its_waiting_changes_due_at_once() {
+    let env = Env::new().await;
+    env.fake.put(BUCKET, &format!("{PREFIX}a.txt"), b"a");
+    let library = env.library("Waiting", "read_write").await;
+    let file = env.child(library, "a.txt").await;
+    env.stage(library, file, "a.txt").await;
+    let db = env.server.records_db();
+    let now = OffsetDateTime::now_utc();
+    // The write was refused: it waits out its back-off, and the library is blocked.
+    assert!(
+        db.fail_write(
+            file,
+            &BlobRef::of(b"staged change").sha256,
+            "refused",
+            now + time::Duration::minutes(10),
+        )
+        .await
+        .unwrap()
+    );
+    db.set_write_state(library, WriteState::Blocked, Some("refused"))
+        .await
+        .unwrap();
+    assert!(db.due_writes(now, 10).await.unwrap().is_empty());
+
+    let (status, answer) = env
+        .patch(&env.admin, library, json!({ "mode": "read_write" }))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    // Due at once, as after the worker's passing probe, and announced.
+    let due = db.due_writes(OffsetDateTime::now_utc(), 10).await.unwrap();
+    assert_eq!(
+        due.iter().map(|row| row.node).collect::<Vec<_>>(),
+        [file],
+        "the change waits out its back-off"
+    );
+    assert_eq!(env.events_of("source.write_restored").await.len(), 1);
 }
 
 #[tokio::test]

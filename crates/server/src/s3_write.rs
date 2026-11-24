@@ -286,18 +286,36 @@ fn empty_body() -> PutBody {
     }
 }
 
-/// Makes the folder at `path`: a zero-byte object at `<key>/`, `If-None-Match`. A marker that is
-/// already there is success. Nothing is deleted.
+/// Makes the folder at `path`: a zero-byte object at `<key>/`. A marker that is already there is
+/// success. Nothing is deleted or overwritten.
+///
+/// With `conditional` of `Tri::Yes` the `PUT` is `If-None-Match`. With `Tri::No` or
+/// `Tri::Unknown` (treated alike) the marker key is asked for first (`HEAD`): one that is there
+/// is success with no `PUT`, else the `PUT` is unconditional: the same small stated race as
+/// [`write_object`].
 ///
 /// # Errors
 /// [`WriteError`]; `Failed` for a path that is not a good folder name.
-pub async fn make_folder(s3: &S3, t: &S3Target, path: &str) -> Result<(), WriteError> {
+pub async fn make_folder(
+    s3: &S3,
+    t: &S3Target,
+    path: &str,
+    conditional: Tri,
+) -> Result<(), WriteError> {
     let key = object_key(t, path).ok_or(WriteError::Failed)?;
     let key = format!("{key}/");
     if key.len() > MAX_KEY_BYTES {
         return Err(WriteError::Failed);
     }
-    match put_checked(s3, t, &key, &empty_body(), Cond::IfAbsent).await {
+    let conditions = conditional == Tri::Yes;
+    if !conditions {
+        match s3.head(t, &key).await {
+            Ok(_) => return Ok(()),
+            Err(S3Error::NotFound) => {}
+            Err(error) => return Err(write_error(error)),
+        }
+    }
+    match put_checked(s3, t, &key, &empty_body(), cond_if_absent(conditions)).await {
         Ok(_) | Err(S3Error::Precondition) => Ok(()),
         Err(error) => Err(write_error(error)),
     }

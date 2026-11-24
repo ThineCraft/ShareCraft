@@ -1165,18 +1165,8 @@ async fn failed_write(
     now: OffsetDateTime,
 ) {
     fail(state, row, now, sentence(error)).await;
-    if error != WriteError::Denied {
-        return;
-    }
-    state.writes().note_blocked(row.library, Some(now));
-    match state
-        .db()
-        .set_write_state(row.library, WriteState::Blocked, Some(BLOCKED_REASON))
-        .await
-    {
-        Ok(true) => emit(state, "source.write_blocked", row.library, None, json!({})),
-        Ok(false) => {}
-        Err(e) => eprintln!("sharecraft-server: cannot block a library's writes: {e}"),
+    if error == WriteError::Denied {
+        block(state, row.library, Some(now)).await;
     }
 }
 
@@ -1267,20 +1257,39 @@ async fn reprobe(state: &AppState, now: OffsetDateTime) {
             eprintln!("sharecraft-server: cannot record a write probe: {e}");
         }
         match db.set_write_state(library, WriteState::Ok, None).await {
-            Ok(true) => emit(state, "source.write_restored", library, None, json!({})),
-            Ok(false) => {}
-            Err(e) => {
-                eprintln!("sharecraft-server: cannot unblock a library's writes: {e}");
-                continue;
+            Ok(changed) => restored(state, library, changed, now).await,
+            Err(e) => eprintln!("sharecraft-server: cannot unblock a library's writes: {e}"),
+        }
+    }
+}
+
+/// The writes of `library` are no longer blocked (a probe passed, by the worker or by an
+/// administrator's switch to read and write): its pending changes are due at once and the writer
+/// is woken. When the state really `changed`, it is announced and the open files below are
+/// re-checked, so editing seats narrowed by the block widen again.
+pub(crate) async fn restored(
+    state: &AppState,
+    library: NodeId,
+    changed: bool,
+    now: OffsetDateTime,
+) {
+    if changed {
+        emit(state, "source.write_restored", library, None, json!({}));
+    }
+    match state.db().pending_writes_of(library).await {
+        Ok(rows) => {
+            for row in rows {
+                if let Err(e) = state.db().retry_write(row.node, now).await {
+                    eprintln!("sharecraft-server: cannot make a change due again: {e}");
+                }
             }
         }
-        for row in rows {
-            if let Err(e) = db.retry_write(row.node, now).await {
-                eprintln!("sharecraft-server: cannot make a change due again: {e}");
-            }
-        }
-        state.writes().blocked().remove(&library);
-        state.writes().wake();
+        Err(e) => eprintln!("sharecraft-server: cannot read a library's changes: {e}"),
+    }
+    state.writes().blocked().remove(&library);
+    state.writes().wake();
+    if changed {
+        crate::api::recheck_below(state, library).await;
     }
 }
 
@@ -1433,7 +1442,12 @@ pub(crate) async fn create_folder(
         }
         Err(_) => return Err(ApiError::Unavailable),
     };
-    match make_folder(state.s3(), &target, &path).await {
+    let conditional = db
+        .s3_place(library)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?
+        .map_or(Tri::Unknown, |place| place.conditional);
+    match make_folder(state.s3(), &target, &path, conditional).await {
         Ok(()) => {}
         Err(WriteError::Denied) => {
             block(state, library, Some(OffsetDateTime::now_utc())).await;
@@ -1490,7 +1504,9 @@ pub(crate) async fn create_folder(
     Ok(node)
 }
 
-/// Blocks the writes of `library` after the store refused one, as the worker does.
+/// Blocks the writes of `library` after the store refused one (a write by the worker, or a new
+/// folder). A real change is announced and the open files below are re-checked, so editing
+/// seats narrow to read-only at once.
 async fn block(state: &AppState, library: NodeId, probed: Option<OffsetDateTime>) {
     state.writes().note_blocked(library, probed);
     match state
@@ -1498,7 +1514,10 @@ async fn block(state: &AppState, library: NodeId, probed: Option<OffsetDateTime>
         .set_write_state(library, WriteState::Blocked, Some(BLOCKED_REASON))
         .await
     {
-        Ok(true) => emit(state, "source.write_blocked", library, None, json!({})),
+        Ok(true) => {
+            emit(state, "source.write_blocked", library, None, json!({}));
+            crate::api::recheck_below(state, library).await;
+        }
         Ok(false) => {}
         Err(e) => eprintln!("sharecraft-server: cannot block a library's writes: {e}"),
     }
