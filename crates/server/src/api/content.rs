@@ -52,8 +52,10 @@ use crate::live_room::{LiveCheckpointReply, LiveCommand, MAX_SESSION_DATA_BYTES}
 use crate::previews::{self, PreviewKind, PreviewType, ThumbError};
 use crate::projection::record_first;
 use crate::room::credited_name;
+use crate::s3_source::nameable_segment;
+use crate::s3_write::object_key;
 use crate::scan::require_available;
-use crate::source_write::{Place, writable_place};
+use crate::source_write::{Place, create_staged, staged_path, writable_place, write_limit};
 use crate::tree;
 use crate::{AppState, auth::Signed};
 
@@ -236,7 +238,7 @@ pub(super) async fn body_blob(state: &AppState, request: Request) -> Result<Held
 /// it. Nothing is erased while a flag says the content rows may be incomplete, as a version
 /// could then name the content without a row; the sweeper deals with it after the rebuild.
 /// Failures are logged.
-pub(super) async fn discard(state: &AppState, held: Held) {
+pub(crate) async fn discard(state: &AppState, held: Held) {
     let blob = held.blob();
     // This request's own hold ends first; anyone else's keeps the content.
     drop(held);
@@ -1277,7 +1279,8 @@ fn saved(revision: &RevisionId, changed: bool) -> Response {
 /// is then refused, or fails, is erased unless something else names it. If they cannot be
 /// stored after the document was made, the document stays, empty, and the answer is `503`
 /// naming it. `409 source_read_only` in a library connected to a source, before the body is
-/// read.
+/// read, except a read-and-write S3 library, where the file is staged for its bucket (see
+/// [`upload_external`]).
 pub(crate) async fn upload(
     State(state): State<AppState>,
     signed: Signed,
@@ -1291,10 +1294,17 @@ pub(crate) async fn upload(
     let (name, editor, cleaned_from) = clean_upload_name(&asked)?;
     let user = signed.session.user;
     // A replace is a new version of a file in `parent`, so the one check covers both. Into a
-    // read-and-write library the file goes to its store (Task 5).
-    match writable_place(state.db(), user.id, parent).await? {
-        Place::Ordinary => {}
-        Place::External(_) => return Err(ApiError::SourceWriteNotBuilt),
+    // read-and-write library the file goes to its store.
+    if let Place::External(_) = writable_place(state.db(), user.id, parent).await? {
+        return upload_external(
+            state,
+            user,
+            parent,
+            (name, editor, cleaned_from),
+            choice,
+            request,
+        )
+        .await;
     }
     let declared = request
         .headers()
@@ -1373,6 +1383,115 @@ pub(crate) async fn upload(
     .await
 }
 
+/// [`upload`] into a read-and-write library of an outside store: the content is staged and the
+/// write worker writes it there. The name must make a key the store takes (`422 invalid_name`),
+/// and the file must fit one write (`413`, before the body is read when it declares its
+/// length). No site quota is used: the bytes live in the store. A new file answers as an
+/// upload does with `"saving": true`; a replacement goes through the file's session, which
+/// stages it, and is written at once.
+async fn upload_external(
+    state: AppState,
+    user: User,
+    parent: NodeId,
+    (name, editor, cleaned_from): (String, Editor, Option<String>),
+    choice: Option<NameConflict>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    let db = state.db();
+    records::validate_node_name(&name)?;
+    let Some((library, path)) = staged_path(db, parent, &name).await? else {
+        return Err(ApiError::SourceActionUnavailable);
+    };
+    let nameable = path
+        .rsplit('/')
+        .next()
+        .is_some_and(|last| nameable_segment(last) && !records::reserved_name(last));
+    let keyed = match state.s3().target(&state, library).await {
+        Ok(target) => object_key(&target, &path).is_some(),
+        // Not approved, or unreadable: the worker reports it; the name is judged on its own.
+        Err(_) => true,
+    };
+    if !nameable || !keyed {
+        return Err(ApiError::InvalidName);
+    }
+    let limit = write_limit(&state)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?;
+    let declared = request
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    if declared.is_some_and(|length| length > limit) {
+        return Err(ApiError::TooLarge);
+    }
+    let named = settle_name(&state, &user, parent, &name, editor, choice, declared).await?;
+    if let Some(answer) = named.answer() {
+        return Ok(answer);
+    }
+    let held = body_blob(&state, request).await?;
+    if held.blob().size == 0 {
+        discard(&state, held).await;
+        return Err(ApiError::BadRequest);
+    }
+    if held.blob().size > limit {
+        discard(&state, held).await;
+        return Err(ApiError::TooLarge);
+    }
+    let keep_both = choice == Some(NameConflict::KeepBoth);
+    to_completion(async move {
+        match named {
+            Named::New {
+                name: final_name,
+                editor,
+                renamed,
+            } => {
+                let created =
+                    create_staged(&state, &user, parent, &final_name, editor, held, keep_both)
+                        .await?;
+                match created {
+                    Created::Done { mut body, .. } => {
+                        let from = cleaned_from.as_deref().or(renamed.as_deref());
+                        add_renamed(&mut body, from, &final_name);
+                        Ok((StatusCode::CREATED, Json(body)).into_response())
+                    }
+                    Created::Failed(response) => Ok(response),
+                }
+            }
+            Named::Replace { doc, name, base } => {
+                match tree::check_policies(state.db(), doc.into(), &name, Some(held.blob().size))
+                    .await
+                {
+                    Ok(()) => {
+                        let reply = store_version(&state, &user, doc, &name, base, held).await;
+                        if matches!(reply, SaveReply::Saved(_)) {
+                            // A replacement is written at once, not after the coalescing wait.
+                            if let Err(e) = state
+                                .db()
+                                .flush_write(doc.into(), time::OffsetDateTime::now_utc())
+                                .await
+                            {
+                                eprintln!("sharecraft-server: database failure: {e}");
+                            }
+                            state.writes().wake();
+                        }
+                        Ok(save_answer(reply))
+                    }
+                    Err(e) => {
+                        discard(&state, held).await;
+                        Err(e.into())
+                    }
+                }
+            }
+            Named::Taken { .. } | Named::Skip | Named::Refused(_) => {
+                discard(&state, held).await;
+                Err(ApiError::Unavailable)
+            }
+        }
+    })
+    .await
+}
+
 /// What [`create_uploaded`] made.
 pub(crate) enum Created {
     /// The document `doc`, with its first revision; `body` describes it.
@@ -1387,7 +1506,7 @@ pub(crate) enum Created {
 /// is refused or fails is erased unless something else names it. If it cannot be stored after
 /// the document was made, the document stays, empty, and the answer is `503` naming it. With
 /// `keep_both`, a name taken meanwhile is chosen again (the first free `name (2)`, `name (3)`
-/// …) rather than refused, so the upload is not lost.
+/// â€¦) rather than refused, so the upload is not lost.
 pub(crate) async fn create_uploaded(
     state: &AppState,
     user: &User,

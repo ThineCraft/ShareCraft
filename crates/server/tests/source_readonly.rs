@@ -716,11 +716,14 @@ enum S3rw {
     /// Slice 1 lets it through; the task named does the write. Until then it answers the
     /// interim `source_action_unavailable`.
     Through(&'static str),
+    /// Slice 1 lets it through and the change is staged for the bucket: it answers as in an
+    /// ordinary library.
+    Succeeds,
     /// Refused with this code (for a bulk request, its one item).
     Refused(&'static str),
 }
 
-use S3rw::{Refused, Through};
+use S3rw::{Refused, Succeeds, Through};
 
 /// A row: the request, the route it goes to, its status in an ordinary library, and its
 /// decision in a read-and-write S3 library.
@@ -754,13 +757,8 @@ const ROWS: &[Row] = &[
     ),
     // A blank file has no bytes to store.
     row(Act::CreateDoc, "POST /api/docs", 201, UNAVAILABLE),
-    row(Act::Upload, "POST /api/docs/upload", 201, Through("Task 5")),
-    row(
-        Act::UploadReplacing,
-        "POST /api/docs/upload",
-        200,
-        Through("Task 5"),
-    ),
+    row(Act::Upload, "POST /api/docs/upload", 201, Succeeds),
+    row(Act::UploadReplacing, "POST /api/docs/upload", 200, Succeeds),
     row(
         Act::StartNewFile,
         "POST /api/uploads",
@@ -1384,8 +1382,10 @@ impl Env {
                 json!({ "parent": fx.docs, "name": "Notes" }),
             ),
             Act::Upload | Act::UploadReplacing => {
+                // One new file per person: the S3 table runs every row for two on one fixture.
+                let uploaded = format!("uploaded-{}.txt", user.id.0);
                 let (name, mut query) = if act == Act::Upload {
-                    ("uploaded.txt", vec![])
+                    (uploaded.as_str(), vec![])
                 } else {
                     ("replace-me.txt", vec![("on_conflict", "replace")])
                 };
@@ -1755,6 +1755,10 @@ async fn every_guarded_route_follows_its_s3_read_write_decision() {
         for row in ROWS {
             let (status, body) = env.perform(&fx, user, row.act).await;
             let code = match row.s3rw.unwrap() {
+                Succeeds => {
+                    assert_eq!(status.as_u16(), row.ok, "{:?} as {who}: {body}", row.act);
+                    continue;
+                }
                 Through(_) | Refused("source_action_unavailable") => "source_action_unavailable",
                 Refused(code) => code,
             };
@@ -1779,8 +1783,14 @@ async fn every_guarded_route_follows_its_s3_read_write_decision() {
             assert_eq!(body["message"], message, "{:?} as {who}: {body}", row.act);
         }
     }
-    // Nothing reached the bucket.
-    assert!(env.s3.writes().is_empty(), "{:?}", env.s3.writes());
+    // Nothing but the staged uploads reached the bucket, and nothing outside `docs`.
+    for (method, key, _) in env.s3.writes() {
+        assert_eq!(method, "PUT", "{key}");
+        assert!(
+            key.starts_with("docs/uploaded-") || key == "docs/replace-me.txt",
+            "{key}"
+        );
+    }
 }
 
 /// The same rows in ordinary libraries, as an owner and as an administrator (each with a

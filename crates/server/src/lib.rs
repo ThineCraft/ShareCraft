@@ -154,6 +154,8 @@ struct Shared {
     s3: Arc<s3::S3>,
     /// The sync worker's wakes, turns and back-off.
     sources: source_sync::Sources,
+    /// The write worker's wake and the blocked libraries it probes again.
+    writes: source_write::SourceWrites,
 }
 
 impl AppState {
@@ -204,6 +206,7 @@ impl AppState {
                 shares: Arc::new(share::Shares::default()),
                 s3: Arc::new(s3),
                 sources: source_sync::Sources::default(),
+                writes: source_write::SourceWrites::default(),
             }),
         })
     }
@@ -213,6 +216,13 @@ impl AppState {
     #[must_use]
     pub fn sources(&self) -> &source_sync::Sources {
         &self.shared.sources
+    }
+
+    /// The write worker of read-and-write libraries: [`source_write::SourceWrites::wake`] asks it
+    /// to look for due writes at once.
+    #[must_use]
+    pub fn writes(&self) -> &source_write::SourceWrites {
+        &self.shared.writes
     }
 
     /// Seals and opens the secrets of connected libraries.
@@ -382,15 +392,27 @@ impl AppState {
     }
 
     /// The command channel of `doc`'s file session, opening it if needed; `name` is the
-    /// document's name, which a newly opened session stores revisions under.
-    fn open_file_room(&self, doc: DocId, name: String) -> FileLink {
+    /// document's name, which a newly opened session stores revisions under. A session opened
+    /// for a `bucket_file` (see [`source_write::is_bucket_file`]) saves through the
+    /// [`source_write::ExternalCheckpointer`], with no content claims and no site usage; any
+    /// other through Git.
+    fn open_file_room(&self, doc: DocId, name: String, bucket_file: bool) -> FileLink {
+        let git = Arc::clone(&self.shared.checkpointer);
+        let (store, db): (Arc<dyn Checkpointer>, _) = if bucket_file {
+            (
+                Arc::new(source_write::ExternalCheckpointer::new(self.clone(), git)),
+                None,
+            )
+        } else {
+            (git, Some(self.shared.db.clone()))
+        };
         self.shared.rooms.open_file(
             doc,
             name,
             Storage {
-                store: Arc::clone(&self.shared.checkpointer),
+                store,
                 blobs: Arc::clone(&self.shared.blobs),
-                db: Some(self.shared.db.clone()),
+                db,
                 events: self.shared.events.clone(),
             },
             self.shared.config.room_grace,
@@ -796,6 +818,8 @@ pub async fn serve_state(state: AppState, listener: TcpListener) -> std::io::Res
     let _scanner = scan::start_worker(state.clone());
     // `prepare` has put syncs cut short by an earlier process back to `connecting` already.
     let _syncer = source_sync::start_worker(state.clone());
+    // Pending writes left by an earlier process are written from the first step.
+    let _writer = source_write::start_writer(state.clone());
     axum::serve(
         listener,
         router(state).into_make_service_with_connect_info::<SocketAddr>(),

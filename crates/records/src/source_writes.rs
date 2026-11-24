@@ -547,6 +547,24 @@ impl Db {
         Ok(true)
     }
 
+    /// Moves the pending write of `node` holding the content `sha256` to `path` (a new file
+    /// written under another name because its own was taken meanwhile). Whether it moved.
+    pub async fn repath_write(
+        &self,
+        node: NodeId,
+        sha256: &[u8; 32],
+        path: &str,
+    ) -> Result<bool, DbError> {
+        let done =
+            sqlx::query("update source_writes set path = $3 where node_id = $1 and sha256 = $2")
+                .bind(node.0)
+                .bind(hex(sha256))
+                .bind(path)
+                .execute(self.pool())
+                .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
     /// The tracking row of `node` in its connected library, if it has one.
     pub async fn source_item_of(&self, node: NodeId) -> Result<Option<SourceItem>, DbError> {
         let row = sqlx::query(

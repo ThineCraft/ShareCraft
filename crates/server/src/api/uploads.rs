@@ -75,7 +75,7 @@ use super::{ApiError, JsonBody, parse_id, to_completion};
 use crate::auth::Signed;
 use crate::blobs::{ChannelReader, Held, release};
 use crate::file_room::{FileLink, SaveReply, check_upload, upload_version};
-use crate::source_write::{Place, writable_place};
+use crate::source_write::{Place, is_bucket_file, writable_place};
 use crate::{AppState, tree};
 
 /// A session that has received nothing for this long is swept.
@@ -366,10 +366,11 @@ pub(crate) async fn store_version(
     held: Held,
 ) -> SaveReply {
     let blob = held.blob();
+    let bucket_file = is_bucket_file(state.db(), doc).await;
     // A session that ended before taking the upload wrote nothing for it; it is opened again.
     let mut reply = SaveReply::Failed;
     for _ in 0..SESSION_ATTEMPTS {
-        let link = session_of(state, doc, name);
+        let link = session_of(state, doc, name, bucket_file);
         if let Ok(answer) =
             upload_version(&link, user.id, user.name.clone(), base.clone(), blob).await
         {
@@ -534,9 +535,10 @@ async fn check_new_version(state: &AppState, user: &User, doc: DocId) -> Result<
     Ok(document.name)
 }
 
-/// The file session of `doc` (named `name`), opened if needed.
-fn session_of(state: &AppState, doc: DocId, name: &str) -> FileLink {
-    state.open_file_room(doc, name.to_owned())
+/// The file session of `doc` (named `name`), opened if needed: for a `bucket_file` (see
+/// [`is_bucket_file`]), one that saves to the bucket.
+fn session_of(state: &AppState, doc: DocId, name: &str, bucket_file: bool) -> FileLink {
+    state.open_file_room(doc, name.to_owned(), bucket_file)
 }
 
 /// Asks `doc`'s file session whether it would take a new version made from `base` now (see
@@ -547,9 +549,11 @@ async fn ask_check(
     name: &str,
     base: Option<RevisionId>,
 ) -> Result<Option<SaveReply>, ApiError> {
+    let bucket_file = is_bucket_file(state.db(), doc).await;
     for _ in 0..SESSION_ATTEMPTS {
         // A session that ended meanwhile is opened again.
-        if let Ok(answer) = check_upload(&session_of(state, doc, name), base.clone()).await {
+        let link = session_of(state, doc, name, bucket_file);
+        if let Ok(answer) = check_upload(&link, base.clone()).await {
             return Ok(answer);
         }
     }

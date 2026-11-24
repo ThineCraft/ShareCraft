@@ -357,6 +357,13 @@ impl FakeS3 {
         self.model().deny_writes_after = Some(n);
     }
 
+    /// Writes are accepted again: [`FakeS3::read_only`] and [`FakeS3::deny_writes_after`] end.
+    pub fn allow_writes(&self) {
+        let mut model = self.model();
+        model.read_only = false;
+        model.deny_writes_after = None;
+    }
+
     /// The next write is stored (or removed), and then answered `503 SlowDown`.
     pub fn lose_answer_after_write(&self) {
         self.model().lose_answer = true;

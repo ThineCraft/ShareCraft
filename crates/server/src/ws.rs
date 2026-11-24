@@ -65,6 +65,8 @@ pub(crate) struct Visitor {
     pub(crate) doc_name: String,
     /// Which mutually exclusive kind of room opens this document.
     pub(crate) kind: RoomKind,
+    /// Whether the document is a file of an S3 library: its file session saves to the bucket.
+    pub(crate) bucket_file: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -159,6 +161,7 @@ async fn visitor(
     if let Some(scan) = crate::scan::held_state(state, doc).await? {
         return Err(ApiError::Held(scan));
     }
+    let bucket_file = crate::source_write::is_bucket_file(db, doc).await;
     Ok(Visitor {
         user: session.user.id,
         session: session.id,
@@ -167,6 +170,7 @@ async fn visitor(
         role,
         kind: room_kind_for(state, document.editor),
         doc_name: document.name,
+        bucket_file,
     })
 }
 
@@ -539,7 +543,7 @@ async fn join_file_room(
     visitor: &Visitor,
 ) -> Option<(FileLink, mpsc::Receiver<Outbound>)> {
     join_with(
-        || state.open_file_room(doc, visitor.doc_name.clone()),
+        || state.open_file_room(doc, visitor.doc_name.clone(), visitor.bucket_file),
         |room| &room.commands,
         |tx, accepted| FileCommand::Join {
             conn,

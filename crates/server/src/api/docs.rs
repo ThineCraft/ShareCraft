@@ -219,21 +219,38 @@ pub(crate) async fn open(
         .external_item(NodeId(doc.0))
         .await
         .map_err(|e| ApiError::unavailable(&e))?;
-    let revision = external.as_ref().map_or_else(
-        || document.revision.clone(),
-        |item| Some(item.revision.clone()),
-    );
-    let external = external.map(|item| ExternalDetail {
-        bytes: item.size,
-        modified_at: OffsetDateTime::from_unix_timestamp_nanos(i128::from(item.mtime_ns))
-            .ok()
-            .and_then(|at| at.format(&Rfc3339).ok()),
-        read: item.sha256.is_some(),
-        unavailable: item.unavailable.map(unavailable_name),
-        storage_class_archived: records::external_tag_parts(&item.tag, item.size)
-            .is_some_and(|parts| parts.archived)
-            .then_some(true),
-    });
+    // A change waiting to be written is the file's current revision, also of a new file the
+    // store does not have yet.
+    let pending = db
+        .pending_write(NodeId(doc.0))
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?;
+    let revision = match (&pending, &external) {
+        (Some(pending), _) => Some(pending.revision.clone()),
+        (None, Some(item)) => Some(item.revision.clone()),
+        (None, None) => document.revision.clone(),
+    };
+    let staged_bytes = pending.as_ref().map(|pending| pending.blob.size);
+    let external = match (external, staged_bytes) {
+        (None, Some(bytes)) => Some(ExternalDetail {
+            bytes,
+            modified_at: None,
+            read: true,
+            unavailable: None,
+            storage_class_archived: None,
+        }),
+        (external, _) => external.map(|item| ExternalDetail {
+            bytes: staged_bytes.unwrap_or(item.size),
+            modified_at: OffsetDateTime::from_unix_timestamp_nanos(i128::from(item.mtime_ns))
+                .ok()
+                .and_then(|at| at.format(&Rfc3339).ok()),
+            read: item.sha256.is_some(),
+            unavailable: item.unavailable.map(unavailable_name),
+            storage_class_archived: records::external_tag_parts(&item.tag, item.size)
+                .is_some_and(|parts| parts.archived)
+                .then_some(true),
+        }),
+    };
     Ok(Json(DocDetail {
         id: document.id.0.to_string(),
         name: document.name,
