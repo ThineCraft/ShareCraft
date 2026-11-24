@@ -946,6 +946,34 @@ async fn only_the_author_and_owners_may_retry_or_discard() {
 }
 
 #[tokio::test]
+async fn an_author_who_may_not_delete_cannot_discard_a_new_file_and_nothing_is_lost() {
+    let env = Env::new().await;
+    let library = env.library("NoDelete").await;
+    let eve = env.person("Eve Editor", "editor").await;
+    let node = env.new_file(&eve, library, "eves.txt", b"eve").await;
+    // She can still see the file, but may no longer delete it.
+    env.db()
+        .set_node_access(
+            env.admin.id,
+            env.site,
+            Principal::User(eve.id),
+            Some("viewer"),
+        )
+        .await
+        .unwrap();
+    let before = env.pending(node).await.unwrap();
+    let (status, body) = env
+        .call(&eve, Method::DELETE, &discard_path(library, node), None)
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let after = env.pending(node).await.expect("the change is kept");
+    assert_eq!(after.revision, before.revision);
+    assert!(!env.db().node(node).await.unwrap().unwrap().deleted);
+    env.write(OffsetDateTime::now_utc()).await;
+    assert_eq!(env.object("eves.txt").unwrap().bytes, b"eve");
+}
+
+#[tokio::test]
 async fn the_listing_and_the_file_answer_show_saving_and_failed() {
     let env = Env::new().await;
     let library = env.library("Marks").await;

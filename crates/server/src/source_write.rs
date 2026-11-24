@@ -1566,6 +1566,16 @@ pub(crate) async fn discard_write(
         .await
         .map_err(unavailable)?
         .is_some();
+    if !tracked {
+        // A new file goes with its change: the person must be allowed to delete it, which is
+        // judged before anything is withdrawn, so a refusal leaves the change untouched.
+        let access = db
+            .effective_access(actor.id, node)
+            .await
+            .map_err(unavailable)?
+            .ok_or(ApiError::NotFound)?;
+        tree::require(&access, Perms::DELETE)?;
+    }
     if !db
         .drop_write(node, &row.blob.sha256)
         .await
@@ -1573,11 +1583,12 @@ pub(crate) async fn discard_write(
     {
         return Err(ApiError::NotFound);
     }
-    drop(lock);
     if !tracked {
-        // A new file the bucket never got: it goes, with nothing of it left to write.
+        // A new file the bucket never got: it goes, with nothing of it left to write. The
+        // lock is held until it has gone, so no newer change is staged for it meanwhile.
         crate::api::nodes::delete_one(state, actor, node).await?;
     }
+    drop(lock);
     state.events().emit(NewEvent {
         kind: "source.write_discarded",
         actor: Some(actor.id),
