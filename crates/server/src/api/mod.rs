@@ -54,6 +54,23 @@ const MAX_BODY: usize = 16 * 1024;
 const SOURCE_READ_ONLY: &str =
     "This library is kept in step with an outside source, so it cannot be changed here.";
 
+/// The `message` of `409 source_writes_pending`.
+const SOURCE_WRITES_PENDING: &str =
+    "Some changes are still being saved to the storage. Wait for them, or discard them, first.";
+
+/// The `message` of `409 source_action_unavailable`.
+const SOURCE_ACTION_UNAVAILABLE: &str = "This cannot be done yet in a library stored in S3. Uploading files, saving and making folders work; renaming, moving, copying and deleting come later.";
+
+/// The `message` of `409 source_write_blocked`.
+const SOURCE_WRITE_BLOCKED: &str = "This library is read-only until its storage accepts changes again. Its files can still be opened.";
+
+/// The `message` of `422 s3_not_writable`.
+const S3_NOT_WRITABLE: &str = "This access key may read the bucket but not write to it. Connect the library read-only, or use a key that may write.";
+
+/// The `message` of `403 read_write_admin_only`.
+const READ_WRITE_ADMIN_ONLY: &str =
+    "Only an administrator may let people change the files in a bucket.";
+
 const SOURCE_COPY_UNAVAILABLE: &str = "Files in this library are read from outside storage when \
 opened and cannot be copied here yet. Download the file instead.";
 
@@ -419,7 +436,20 @@ pub(crate) enum ApiError {
     ShareLocationInUse,
     /// 409: changes to the library's store are accepted but not yet written, so it is not
     /// disconnected or made read-only yet.
-    WritesPending,
+    SourceWritesPending,
+    /// 409: a read-and-write S3 library does not take this action yet (rename, move, copy in,
+    /// delete, restore, a blank file, a file from a template).
+    SourceActionUnavailable,
+    /// 409: a route slice 1 lets through in a read-and-write S3 library, whose write is not
+    /// built yet. Answered as `source_action_unavailable`; removed once every such route
+    /// writes.
+    SourceWriteNotBuilt,
+    /// 409: the read-and-write library is read-only until its storage accepts changes again.
+    SourceWriteBlocked,
+    /// 422: the write probe found that the access key may read the bucket but not write to it.
+    S3NotWritable,
+    /// 403: only an administrator may make a library read and write.
+    ReadWriteAdminOnly,
     /// 409: the library is kept in step with a source (a GitHub repository), so nothing in it
     /// is created, changed, moved, copied in, deleted or restored here; administrators too.
     /// The answer's `message` says so in words.
@@ -604,7 +634,13 @@ impl ApiError {
             ApiError::LibraryNotEmpty => (StatusCode::CONFLICT, "library_not_empty"),
             ApiError::SourceExists => (StatusCode::CONFLICT, "source_exists"),
             ApiError::ShareLocationInUse => (StatusCode::CONFLICT, "share_location_in_use"),
-            ApiError::WritesPending => (StatusCode::CONFLICT, "writes_pending"),
+            ApiError::SourceWritesPending => (StatusCode::CONFLICT, "source_writes_pending"),
+            ApiError::SourceActionUnavailable | ApiError::SourceWriteNotBuilt => {
+                (StatusCode::CONFLICT, "source_action_unavailable")
+            }
+            ApiError::SourceWriteBlocked => (StatusCode::CONFLICT, "source_write_blocked"),
+            ApiError::S3NotWritable => (StatusCode::UNPROCESSABLE_ENTITY, "s3_not_writable"),
+            ApiError::ReadWriteAdminOnly => (StatusCode::FORBIDDEN, "read_write_admin_only"),
             ApiError::SourceReadOnly => (StatusCode::CONFLICT, "source_read_only"),
             ApiError::SourceUnavailable("offline", _) => {
                 (StatusCode::SERVICE_UNAVAILABLE, "source_unavailable")
@@ -705,7 +741,7 @@ impl From<AccessError> for ApiError {
             AccessError::LibraryNotEmpty => ApiError::LibraryNotEmpty,
             AccessError::SourceExists => ApiError::SourceExists,
             AccessError::ShareLocationInUse => ApiError::ShareLocationInUse,
-            AccessError::WritesPending => ApiError::WritesPending,
+            AccessError::WritesPending => ApiError::SourceWritesPending,
             AccessError::LibraryReadOnly => ApiError::SourceReadOnly,
             AccessError::S3EndpointNotApproved => ApiError::S3EndpointNotApproved,
             AccessError::BlockedFileType(file_type) => ApiError::BlockedFileType(file_type),
@@ -935,6 +971,19 @@ impl IntoResponse for ApiError {
             ApiError::Held(scan) => json!({ "error": code, "scan": scan }),
             ApiError::TooMany(limit) => json!({ "error": code, "limit": limit }),
             ApiError::SourceReadOnly => json!({ "error": code, "message": SOURCE_READ_ONLY }),
+            ApiError::SourceWritesPending => {
+                json!({ "error": code, "message": SOURCE_WRITES_PENDING })
+            }
+            ApiError::SourceActionUnavailable | ApiError::SourceWriteNotBuilt => {
+                json!({ "error": code, "message": SOURCE_ACTION_UNAVAILABLE })
+            }
+            ApiError::SourceWriteBlocked => {
+                json!({ "error": code, "message": SOURCE_WRITE_BLOCKED })
+            }
+            ApiError::S3NotWritable => json!({ "error": code, "message": S3_NOT_WRITABLE }),
+            ApiError::ReadWriteAdminOnly => {
+                json!({ "error": code, "message": READ_WRITE_ADMIN_ONLY })
+            }
             ApiError::SourceUnavailable(reason, kind) => json!({
                 "error": code,
                 "reason": reason,

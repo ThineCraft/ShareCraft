@@ -1,10 +1,98 @@
-//! The types every write to an external library shares, and the names a written copy gets.
+//! The types every write to an external library shares, the guard that says where a change
+//! goes, and the names a written copy gets.
 //!
-//! Only the shared types and names are here for now. The store-specific code is in
-//! `s3_write.rs`, the only module that changes a bucket.
+//! The store-specific code is in `s3_write.rs`, the only module that changes a bucket.
 
-use records::Tri;
+use collab_core::ids::{NodeId, UserId};
+use records::{Db, SourceKind, SourceMode, Tri, WriteState};
 use time::{OffsetDateTime, UtcOffset};
+
+use crate::api::ApiError;
+
+/// The store an external library's changes are written to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Store {
+    S3(S3WriteTarget),
+}
+
+/// A read-and-write S3 library, as a write to it needs it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct S3WriteTarget {
+    pub library: NodeId,
+    /// Whether the store honours conditional writes, as the write probe last found.
+    pub conditional: Tri,
+}
+
+/// Where a change to a node goes. Not `crate::room::Place`, the room registry's entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Place {
+    /// Outside any connected library: the ordinary tree and content store.
+    Ordinary,
+    /// In a read-and-write library of an outside store: the change is staged and written there.
+    External(Store),
+}
+
+/// Where a change to `node` by `user` goes, read afresh (never cached).
+///
+/// Outside a connected library: [`Place::Ordinary`], whoever asks (the handler judges access).
+/// In one, someone who cannot see `node` is told nothing: `404`, as the other routes answer (a
+/// recycle-bin entry, which nobody has access to as such, is judged by its library). Someone
+/// who can: `409 source_read_only` for a GitHub, file-share or read-only S3 library; `409
+/// source_write_blocked` for a read-and-write S3 library whose writes are blocked; otherwise
+/// [`Place::External`] with what the probe learnt about conditional writes. Whether the
+/// endpoint is still approved is not read here: a write to one no longer approved fails in the
+/// worker and stays queued.
+///
+/// The guard belongs in the HTTP handlers, never in `tree::apply` or the upload functions,
+/// which the sync engine calls directly.
+pub(crate) async fn writable_place(db: &Db, user: UserId, node: NodeId) -> Result<Place, ApiError> {
+    let unavailable = |e: records::DbError| ApiError::unavailable(&e);
+    let Some(library) = db.source_library_of(node).await.map_err(unavailable)? else {
+        return Ok(Place::Ordinary);
+    };
+    let visible = if db
+        .effective_access(user, node)
+        .await
+        .map_err(unavailable)?
+        .is_some()
+    {
+        true
+    } else {
+        let in_bin = db
+            .node(node)
+            .await
+            .map_err(unavailable)?
+            .is_some_and(|found| found.deleted);
+        in_bin
+            && db
+                .effective_access(user, library)
+                .await
+                .map_err(unavailable)?
+                .is_some()
+    };
+    if !visible {
+        return Err(ApiError::NotFound);
+    }
+    let Some((config, _)) = db.source_of(library).await.map_err(unavailable)? else {
+        // Disconnected a moment ago: judged as it now is.
+        return Ok(Place::Ordinary);
+    };
+    if config.kind != SourceKind::S3 || config.mode != SourceMode::ReadWrite {
+        return Err(ApiError::SourceReadOnly);
+    }
+    if let Some((WriteState::Blocked, _)) = db.write_state(library).await.map_err(unavailable)? {
+        return Err(ApiError::SourceWriteBlocked);
+    }
+    let conditional = db
+        .s3_place(library)
+        .await
+        .map_err(unavailable)?
+        .map_or(Tri::Unknown, |place| place.conditional);
+    Ok(Place::External(Store::S3(S3WriteTarget {
+        library,
+        conditional,
+    })))
+}
 
 /// The longest name a conflict copy gets, in characters.
 const NAME_MAX_CHARS: usize = 120;

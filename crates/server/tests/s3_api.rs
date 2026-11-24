@@ -526,14 +526,23 @@ async fn template_and_asset_kinds_are_refused() {
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{kind}: {answer}");
         assert_eq!(answer["error"], "invalid_request");
     }
+    // Read and write is for administrators only, refused before the store is asked.
+    let owner = env.with_role("Site owner", "owner", env.site).await;
     let mut body = Env::body("Read and write");
     body["mode"] = json!("read_write");
-    let (status, answer) = env.connect(body).await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{answer}");
+    body["prefix"] = json!("writable/");
+    let (status, answer) = env.connect_as(&owner, body.clone()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{answer}");
+    assert_eq!(answer["error"], "read_write_admin_only");
     assert!(env.fake.requests().is_empty());
+    // An administrator, with a store that takes writes.
+    let (status, answer) = env.connect(body).await;
+    assert_eq!(status, StatusCode::CREATED, "{answer}");
+    assert_eq!(answer["source"]["mode"], "read_write");
     let mut body = Env::body("Pictures");
     body["kind"] = json!("image");
     body["mode"] = json!("read_only");
+    body["prefix"] = json!("pictures/");
     let (status, answer) = env.connect(body).await;
     assert_eq!(status, StatusCode::CREATED, "{answer}");
 }

@@ -53,6 +53,7 @@ use crate::previews::{self, PreviewKind, PreviewType, ThumbError};
 use crate::projection::record_first;
 use crate::room::credited_name;
 use crate::scan::require_available;
+use crate::source_write::{Place, writable_place};
 use crate::tree;
 use crate::{AppState, auth::Signed};
 
@@ -949,8 +950,12 @@ pub(crate) async fn save(
         return Err(access.refusal().into());
     }
     // A file of a connected library opens with a read-only seat, so nobody holds a token for
-    // it; refused in words all the same, before the body is read.
-    super::nodes::require_not_connected(db, doc.into()).await?;
+    // it; refused in words all the same, before the body is read. A read-and-write library's
+    // file is saved to its store (Task 7).
+    match writable_place(db, user, doc.into()).await? {
+        Place::Ordinary => {}
+        Place::External(_) => return Err(ApiError::SourceWriteNotBuilt),
+    }
     let document = db
         .document(doc)
         .await
@@ -1285,8 +1290,12 @@ pub(crate) async fn upload(
     let choice = conflict_choice(query.on_conflict.as_deref())?;
     let (name, editor, cleaned_from) = clean_upload_name(&asked)?;
     let user = signed.session.user;
-    // A replace is a new version of a file in `parent`, so the one check covers both.
-    super::nodes::require_not_connected_for(state.db(), user.id, parent).await?;
+    // A replace is a new version of a file in `parent`, so the one check covers both. Into a
+    // read-and-write library the file goes to its store (Task 5).
+    match writable_place(state.db(), user.id, parent).await? {
+        Place::Ordinary => {}
+        Place::External(_) => return Err(ApiError::SourceWriteNotBuilt),
+    }
     let declared = request
         .headers()
         .get(CONTENT_LENGTH)

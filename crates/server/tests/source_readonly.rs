@@ -664,6 +664,13 @@ fn a_route_list_guard() {
             "{} is not a guarded route",
             row.route
         );
+        // Every row says what a read-and-write S3 library does with it.
+        assert!(
+            row.s3rw.is_some(),
+            "{:?} ({}) has no S3 read-and-write decision",
+            row.act,
+            row.route
+        );
     }
 }
 
@@ -703,64 +710,131 @@ enum Act {
     DeleteLibrary,
 }
 
-/// A row: the request, the route it goes to, and its status in an ordinary library.
+/// What a read-and-write S3 library does with a row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum S3rw {
+    /// Slice 1 lets it through; the task named does the write. Until then it answers the
+    /// interim `source_action_unavailable`.
+    Through(&'static str),
+    /// Refused with this code (for a bulk request, its one item).
+    Refused(&'static str),
+}
+
+use S3rw::{Refused, Through};
+
+/// A row: the request, the route it goes to, its status in an ordinary library, and its
+/// decision in a read-and-write S3 library.
 struct Row {
     act: Act,
     route: &'static str,
     ok: u16,
+    s3rw: Option<S3rw>,
 }
 
-const fn row(act: Act, route: &'static str, ok: u16) -> Row {
-    Row { act, route, ok }
+const fn row(act: Act, route: &'static str, ok: u16, s3rw: S3rw) -> Row {
+    Row {
+        act,
+        route,
+        ok,
+        s3rw: Some(s3rw),
+    }
 }
+
+const UNAVAILABLE: S3rw = Refused("source_action_unavailable");
+const READ_ONLY: S3rw = Refused("source_read_only");
 
 /// The table: one row per way a guarded route can change a library. Destructive rows (the
 /// folder and the library themselves) come last.
 const ROWS: &[Row] = &[
-    row(Act::CreateFolder, "POST /api/nodes/{id}/children", 201),
-    row(Act::CreateDoc, "POST /api/docs", 201),
-    row(Act::Upload, "POST /api/docs/upload", 201),
-    row(Act::UploadReplacing, "POST /api/docs/upload", 200),
-    row(Act::StartNewFile, "POST /api/uploads", 201),
-    row(Act::StartNewVersion, "POST /api/uploads", 201),
-    row(Act::Chunk, "PUT /api/uploads/{id}", 200),
-    row(Act::Finish, "POST /api/uploads/{id}/finish", 201),
-    row(Act::Rename, "PATCH /api/nodes/{id}", 200),
-    row(Act::MoveWithin, "PATCH /api/nodes/{id}", 200),
-    row(Act::MoveIn, "PATCH /api/nodes/{id}", 200),
-    row(Act::MoveOut, "PATCH /api/nodes/{id}", 200),
-    row(Act::CopyIn, "POST /api/nodes/{id}/copy", 201),
-    row(Act::CopyWithin, "POST /api/nodes/{id}/copy", 201),
-    row(Act::Delete, "DELETE /api/nodes/{id}", 204),
-    row(Act::Restore, "POST /api/bin/{id}/restore", 200),
-    row(Act::BulkMove, "POST /api/bulk", 200),
-    row(Act::BulkMoveIn, "POST /api/bulk", 200),
-    row(Act::BulkMoveOut, "POST /api/bulk", 200),
-    row(Act::BulkCopyIn, "POST /api/bulk", 200),
-    row(Act::BulkDelete, "POST /api/bulk", 200),
-    row(Act::BulkRestore, "POST /api/bulk", 200),
+    row(
+        Act::CreateFolder,
+        "POST /api/nodes/{id}/children",
+        201,
+        Through("Task 6"),
+    ),
+    // A blank file has no bytes to store.
+    row(Act::CreateDoc, "POST /api/docs", 201, UNAVAILABLE),
+    row(Act::Upload, "POST /api/docs/upload", 201, Through("Task 5")),
+    row(
+        Act::UploadReplacing,
+        "POST /api/docs/upload",
+        200,
+        Through("Task 5"),
+    ),
+    row(
+        Act::StartNewFile,
+        "POST /api/uploads",
+        201,
+        Through("Task 6"),
+    ),
+    row(
+        Act::StartNewVersion,
+        "POST /api/uploads",
+        201,
+        Through("Task 6"),
+    ),
+    row(Act::Chunk, "PUT /api/uploads/{id}", 200, Through("Task 6")),
+    row(
+        Act::Finish,
+        "POST /api/uploads/{id}/finish",
+        201,
+        Through("Task 6"),
+    ),
+    row(Act::Rename, "PATCH /api/nodes/{id}", 200, UNAVAILABLE),
+    row(Act::MoveWithin, "PATCH /api/nodes/{id}", 200, UNAVAILABLE),
+    row(Act::MoveIn, "PATCH /api/nodes/{id}", 200, UNAVAILABLE),
+    row(Act::MoveOut, "PATCH /api/nodes/{id}", 200, UNAVAILABLE),
+    row(Act::CopyIn, "POST /api/nodes/{id}/copy", 201, UNAVAILABLE),
+    row(
+        Act::CopyWithin,
+        "POST /api/nodes/{id}/copy",
+        201,
+        UNAVAILABLE,
+    ),
+    row(Act::Delete, "DELETE /api/nodes/{id}", 204, UNAVAILABLE),
+    row(Act::Restore, "POST /api/bin/{id}/restore", 200, UNAVAILABLE),
+    row(Act::BulkMove, "POST /api/bulk", 200, UNAVAILABLE),
+    row(Act::BulkMoveIn, "POST /api/bulk", 200, UNAVAILABLE),
+    row(Act::BulkMoveOut, "POST /api/bulk", 200, UNAVAILABLE),
+    row(Act::BulkCopyIn, "POST /api/bulk", 200, UNAVAILABLE),
+    row(Act::BulkDelete, "POST /api/bulk", 200, UNAVAILABLE),
+    row(Act::BulkRestore, "POST /api/bulk", 200, UNAVAILABLE),
     row(
         Act::FromTemplate,
         "POST /api/libraries/{id}/from-template",
         201,
+        UNAVAILABLE,
     ),
-    row(Act::Save, "PUT /api/docs/{id}/content", 200),
+    row(
+        Act::Save,
+        "PUT /api/docs/{id}/content",
+        200,
+        Through("Task 7"),
+    ),
     // In an ordinary library these reach the live room's ticket check: the file has no live
-    // room here, so no ticket can be held (403). A connected library refuses them first.
+    // room here, so no ticket can be held (403). A connected library refuses them first; a
+    // bucket file never opens in a live room.
     row(
         Act::LiveCheckpoint,
         "PUT /api/docs/{id}/live-checkpoint",
         403,
+        READ_ONLY,
     ),
     row(
         Act::LiveHash,
         "POST /api/docs/{id}/live-checkpoint/hash",
         403,
+        READ_ONLY,
     ),
-    row(Act::RenameFolder, "PATCH /api/nodes/{id}", 200),
-    row(Act::RenameLibrary, "PATCH /api/nodes/{id}", 200),
-    row(Act::DeleteFolder, "DELETE /api/nodes/{id}", 204),
-    row(Act::DeleteLibrary, "DELETE /api/nodes/{id}", 204),
+    row(Act::RenameFolder, "PATCH /api/nodes/{id}", 200, UNAVAILABLE),
+    row(Act::RenameLibrary, "PATCH /api/nodes/{id}", 200, READ_ONLY),
+    row(
+        Act::DeleteFolder,
+        "DELETE /api/nodes/{id}",
+        204,
+        UNAVAILABLE,
+    ),
+    row(Act::DeleteLibrary, "DELETE /api/nodes/{id}", 204, READ_ONLY),
 ];
 
 /// The files of the fixture's `docs` folder, each for its own row.
@@ -1654,6 +1728,59 @@ async fn every_write_route_is_refused_in_an_s3_library() {
             assert_refused(row.act, who, &answered);
         }
     }
+}
+
+/// The `message` of `409 source_action_unavailable`, word for word.
+const UNAVAILABLE_MESSAGE: &str = "This cannot be done yet in a library stored in S3. Uploading files, saving and making folders work; renaming, moving, copying and deleting come later.";
+
+/// The table against a read-and-write S3 library, for its owner and for an administrator: a
+/// `Refused` row answers its code now (with its message), and a `Through` row answers the
+/// interim `source_action_unavailable` until the task named in it switches the row to "the
+/// write succeeds".
+#[tokio::test]
+async fn every_guarded_route_follows_its_s3_read_write_decision() {
+    let env = Env::new().await;
+    let fx = env
+        .fixture_for(Some(SourceKind::S3), &[&env.olive, &env.admin])
+        .await;
+    env.server
+        .records_db()
+        .set_source_mode(NodeId(fx.library.parse().unwrap()), SourceMode::ReadWrite)
+        .await
+        .unwrap();
+    for (user, who) in [
+        (&env.olive, "s3 read-write owner"),
+        (&env.admin, "s3 read-write administrator"),
+    ] {
+        for row in ROWS {
+            let (status, body) = env.perform(&fx, user, row.act).await;
+            let code = match row.s3rw.unwrap() {
+                Through(_) | Refused("source_action_unavailable") => "source_action_unavailable",
+                Refused(code) => code,
+            };
+            if is_bulk(row.act) {
+                assert_eq!(status, StatusCode::OK, "{:?} as {who}: {body}", row.act);
+                assert_eq!(body[0]["ok"], false, "{:?} as {who}: {body}", row.act);
+                assert_eq!(body[0]["error"], code, "{:?} as {who}: {body}", row.act);
+                continue;
+            }
+            assert_eq!(
+                status,
+                StatusCode::CONFLICT,
+                "{:?} as {who}: {body}",
+                row.act
+            );
+            assert_eq!(body["error"], code, "{:?} as {who}: {body}", row.act);
+            let message = if code == "source_read_only" {
+                MESSAGE
+            } else {
+                UNAVAILABLE_MESSAGE
+            };
+            assert_eq!(body["message"], message, "{:?} as {who}: {body}", row.act);
+        }
+    }
+    // Nothing reached the bucket.
+    assert!(env.s3.writes().is_empty(), "{:?}", env.s3.writes());
 }
 
 /// The same rows in ordinary libraries, as an owner and as an administrator (each with a

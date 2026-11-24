@@ -27,6 +27,7 @@ use super::{ApiError, JsonBody, parse_id, recheck_below, to_completion};
 use crate::AppState;
 use crate::auth::Signed;
 use crate::room::AccessChange;
+use crate::source_write::{Place, Store, writable_place};
 use crate::tree::{self, TreeOp};
 
 /// Children listed when the request names no limit.
@@ -50,11 +51,10 @@ pub(crate) fn node_id(text: &str) -> Result<NodeId, ApiError> {
     parse_id(text).map(NodeId)
 }
 
-/// `409 source_read_only` if `node` is, or lies in, a library connected to a source: such a
-/// library is kept in step with its repository, so nothing in it is created, changed, moved,
-/// copied in, deleted or restored through the API, by anyone, administrators included (they
-/// disconnect the source instead). One query, never cached: a library connected or
-/// disconnected a moment ago is judged as it now is.
+/// `409 source_read_only` if `node` is, or lies in, a library connected to a source, whatever
+/// its mode: used by the live room's checkpoint routes, since a file of a connected library
+/// never opens in a live room. One query, never cached: a library connected or disconnected a
+/// moment ago is judged as it now is.
 ///
 /// The guard belongs in the HTTP handlers (and the editor's seat, see [`read_only_seat`]),
 /// never in [`tree::apply`], [`move_one`], [`delete_one`] or the upload functions, which the
@@ -70,46 +70,46 @@ pub(crate) async fn require_not_connected(db: &Db, node: NodeId) -> Result<(), A
     }
 }
 
-/// [`require_not_connected`] for a handler that has not yet checked `user`'s access, so that a
-/// refusal tells nothing to someone who cannot see the node: `404` for them, as the other
-/// routes answer. A recycle-bin entry, which nobody has access to as such, is judged by its
-/// connected library instead.
+/// The refusing form of [`writable_place`], for a route that changes nothing in a connected
+/// library: `Ok` outside one; inside, what [`writable_place`] tells someone who cannot see
+/// the node (`404`) and a library that is not read and write (`409 source_read_only`), and
+/// `409 source_action_unavailable` for a read-and-write library, blocked or not (the action is
+/// unavailable whatever its state).
 pub(crate) async fn require_not_connected_for(
     db: &Db,
     user: UserId,
     node: NodeId,
 ) -> Result<(), ApiError> {
-    let library = db
-        .source_library_of(node)
-        .await
-        .map_err(|e| ApiError::unavailable(&e))?;
-    let Some(library) = library else {
-        return Ok(());
-    };
-    let unavailable = |e: records::DbError| ApiError::unavailable(&e);
-    if db
-        .effective_access(user, node)
-        .await
-        .map_err(unavailable)?
-        .is_some()
-    {
-        return Err(ApiError::SourceReadOnly);
+    match writable_place(db, user, node).await {
+        Ok(Place::Ordinary) => Ok(()),
+        Ok(Place::External(_)) | Err(ApiError::SourceWriteBlocked) => {
+            Err(ApiError::SourceActionUnavailable)
+        }
+        Err(e) => Err(e),
     }
-    let in_bin = db
-        .node(node)
-        .await
-        .map_err(unavailable)?
-        .is_some_and(|found| found.deleted);
-    if in_bin
-        && db
-            .effective_access(user, library)
+}
+
+/// [`require_not_connected_for`] for a route that acts on `node` itself (renames, moves or
+/// deletes it): a connected library node itself keeps `409 source_read_only` in every mode.
+async fn require_item_not_connected_for(
+    db: &Db,
+    user: UserId,
+    node: NodeId,
+) -> Result<(), ApiError> {
+    let library = match writable_place(db, user, node).await {
+        Ok(Place::Ordinary) => return Ok(()),
+        Ok(Place::External(Store::S3(target))) => Some(target.library),
+        Err(ApiError::SourceWriteBlocked) => db
+            .source_library_of(node)
             .await
-            .map_err(unavailable)?
-            .is_some()
-    {
-        return Err(ApiError::SourceReadOnly);
+            .map_err(|e| ApiError::unavailable(&e))?,
+        Err(e) => return Err(e),
+    };
+    if library == Some(node) {
+        Err(ApiError::SourceReadOnly)
+    } else {
+        Err(ApiError::SourceActionUnavailable)
     }
-    Err(ApiError::NotFound)
 }
 
 /// `access` to a file of a connected library, as its editor's seat gets it: without `add`,
@@ -143,7 +143,7 @@ pub(crate) async fn delete_checked(
     actor: &User,
     id: NodeId,
 ) -> Result<(), ApiError> {
-    require_not_connected_for(state.db(), actor.id, id).await?;
+    require_item_not_connected_for(state.db(), actor.id, id).await?;
     delete_one(state, actor, id).await
 }
 
@@ -580,7 +580,14 @@ pub(crate) async fn create(
     let kind: NodeKind =
         serde_json::from_value(Value::String(new.kind)).map_err(|_| ApiError::InvalidRequest)?;
     let actor = signed.session.user;
-    require_not_connected_for(state.db(), actor.id, parent).await?;
+    match writable_place(state.db(), actor.id, parent).await? {
+        Place::Ordinary => {}
+        // A folder goes to the store as a marker (Task 6); nothing else is made there.
+        Place::External(_) if kind == NodeKind::Folder => {
+            return Err(ApiError::SourceWriteNotBuilt);
+        }
+        Place::External(_) => return Err(ApiError::SourceActionUnavailable),
+    }
     let node = to_completion(async move {
         let op = TreeOp::Create {
             parent: Some(parent),
@@ -620,7 +627,7 @@ pub(crate) async fn change(
     }
     let actor = signed.session.user;
     // Both the item and where it would go: nothing is renamed if the move would be refused.
-    require_not_connected_for(state.db(), actor.id, id).await?;
+    require_item_not_connected_for(state.db(), actor.id, id).await?;
     if let Some(parent) = parent {
         require_not_connected_for(state.db(), actor.id, parent).await?;
     }

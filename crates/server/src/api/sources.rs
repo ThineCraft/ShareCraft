@@ -20,8 +20,8 @@ use collab_core::ids::NodeId;
 use records::{
     AccessError, Budget, LibraryKind, NewEvent, NewSource, Perms, S3Endpoint, S3Place, SealedRow,
     SecretId, SharePath, SourceChange, SourceConfig, SourceKind, SourceMode, SourceStatus, Tri,
-    Usage, User, Versioning, approved_root, clean_prefix, s3_location, usable_here, valid_bucket,
-    valid_root,
+    Usage, User, Versioning, WriteState, approved_root, clean_prefix, s3_location, usable_here,
+    valid_bucket, valid_root,
 };
 use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
@@ -29,16 +29,18 @@ use uuid::Uuid;
 
 use super::nodes::{node_id, require_manager, rfc3339};
 use super::settings::{SHARE_TURN_WAIT, overlaps_data_folder, path_reason};
-use super::{ApiError, JsonBody, to_completion};
+use super::{ApiError, JsonBody, recheck_below, to_completion};
 use crate::AppState;
 use crate::auth::Signed;
 use crate::github::{EntryKind, GithubError, Head, RepoRef};
 use crate::libraries;
-use crate::s3::S3Error;
+use crate::s3::{S3Error, S3Target};
 use crate::s3_sign::Credentials;
+use crate::s3_write;
 use crate::secrets::Secret;
 use crate::share::{FsBudget, canonical_share_path};
 use crate::source_sync::{abandon_uploads_into, caps, token_context, token_of, webhook_context};
+use crate::source_write::Probe;
 use crate::tree::{self, TreeOp};
 
 /// Seconds between polls of a new connection.
@@ -312,10 +314,11 @@ async fn answer_of(
     origin: &str,
     library: NodeId,
     reveal_path: bool,
+    admin: bool,
 ) -> Result<Value, ApiError> {
     let (config, status) = source_of(state, library).await?;
     if config.kind == SourceKind::S3 {
-        return s3_answer(state, &config, &status, reveal_path).await;
+        return s3_answer(state, &config, &status, reveal_path, admin).await;
     }
     let mut answer = source_out(origin, &config, &status, reveal_path);
     if config.kind == SourceKind::Share
@@ -476,7 +479,7 @@ pub(crate) async fn connect(
         })
         .await?;
     }
-    let source = answer_of(&state, &origin, library, true).await?;
+    let source = answer_of(&state, &origin, library, true, actor.is_admin).await?;
     let warnings: Vec<&str> = if probed.archived {
         vec!["archived"]
     } else {
@@ -813,7 +816,7 @@ pub(crate) async fn connect_share(
         StatusCode::CREATED,
         Json(json!({
             "id": library.0.to_string(),
-            "source": answer_of(&state, &origin, library, true).await?,
+            "source": answer_of(&state, &origin, library, true, actor.is_admin).await?,
         })),
     )
         .into_response())
@@ -880,7 +883,14 @@ pub(crate) async fn show(
             .map_err(|e| ApiError::unavailable(&e))?
             .is_some_and(|access| access.can_manage_access());
     Ok(Json(
-        answer_of(&state, &origin, library, reveal_path).await?,
+        answer_of(
+            &state,
+            &origin,
+            library,
+            reveal_path,
+            signed.session.user.is_admin,
+        )
+        .await?,
     ))
 }
 
@@ -907,6 +917,8 @@ pub(crate) struct ChangeBody {
     prefix: Option<Value>,
     /// Never changed: named only to be refused with `422`.
     endpoint: Option<Value>,
+    /// S3: `read_only` or `read_write`.
+    mode: Option<String>,
 }
 
 /// `PATCH /api/libraries/{id}/source {branch?, folder?, poll_seconds?, token?,
@@ -927,6 +939,7 @@ pub(crate) async fn change(
 ) -> Result<Json<Value>, ApiError> {
     let library = node_id(&id)?;
     let actor = signed.session.user;
+    let admin = actor.is_admin;
     require_manager(state.db(), actor.id, library).await?;
     let (config, _) = source_of(&state, library).await?;
     if body.bucket.is_some() || body.prefix.is_some() || body.endpoint.is_some() {
@@ -936,7 +949,11 @@ pub(crate) async fn change(
         let origin = origin(&state, &headers)?;
         return change_s3(state, actor, library, &origin, body, &config).await;
     }
-    if body.access_key_id.is_some() || body.secret_access_key.is_some() || body.budget.is_some() {
+    if body.access_key_id.is_some()
+        || body.secret_access_key.is_some()
+        || body.budget.is_some()
+        || body.mode.is_some()
+    {
         return Err(ApiError::InvalidRequest);
     }
     if config.kind == SourceKind::Share
@@ -969,7 +986,9 @@ pub(crate) async fn change(
     let clear = clear && config.token.is_some();
     let new_token = token.is_some() || clear;
     if branch.is_none() && folder.is_none() && poll_seconds.is_none() && !new_token {
-        return Ok(Json(answer_of(&state, &origin, library, true).await?));
+        return Ok(Json(
+            answer_of(&state, &origin, library, true, admin).await?,
+        ));
     }
     let reprobe = branch.is_some() || folder.is_some() || new_token;
     if reprobe {
@@ -1070,7 +1089,9 @@ pub(crate) async fn change(
         })
         .await?;
     }
-    Ok(Json(answer_of(&state, &origin, library, true).await?))
+    Ok(Json(
+        answer_of(&state, &origin, library, true, admin).await?,
+    ))
 }
 
 /// `POST /api/libraries/{id}/source/sync`: "Sync now", for owners of the library. `202`; the
@@ -1193,10 +1214,24 @@ pub(crate) async fn webhook(
     })))
 }
 
+/// `409 source_writes_pending` while `library` has changes still to be written to its store.
+async fn writes_settled(state: &AppState, library: NodeId) -> Result<(), ApiError> {
+    let (saving, failed) = state
+        .db()
+        .pending_counts(library)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?;
+    if saving > 0 || failed > 0 {
+        return Err(ApiError::SourceWritesPending);
+    }
+    Ok(())
+}
+
 /// `DELETE /api/libraries/{id}/source`: disconnects the library, for owners of it: its files
 /// stay as they are and it becomes an ordinary library again; the connection's sealed secrets
 /// are deleted. `204`; `404` for a library that is not connected; `409 source_busy` while a
-/// sync of it runs. The library's sync turn is held until everything is removed, so no sync
+/// sync of it runs; `409 source_writes_pending` while changes to its store are still to be
+/// written, before anything is removed. The library's sync turn is held until everything is removed, so no sync
 /// changes the library after the answer. Recorded as `source.disconnected`.
 pub(crate) async fn disconnect(
     State(state): State<AppState>,
@@ -1207,6 +1242,8 @@ pub(crate) async fn disconnect(
     let actor = signed.session.user;
     require_manager(state.db(), actor.id, library).await?;
     let (config, _) = source_of(&state, library).await?;
+    // Changes accepted for the store and not yet written are not dropped by a disconnect.
+    writes_settled(&state, library).await?;
     // A file share and a bucket are listed in long passes that a disconnect stops: their
     // generation moves on and the disconnect waits for the pass to give up its turn.
     let external = config.kind != SourceKind::Github;
@@ -1233,6 +1270,9 @@ pub(crate) async fn disconnect(
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         };
+        // Judged again once the turn is held, before anything is removed (the disconnect's own
+        // transaction judges it a last time).
+        writes_settled(&state, library).await?;
         let removed = if external {
             tree::delete_source_children(&state, &actor, library).await?
         } else {
@@ -1322,9 +1362,11 @@ fn s3_refused(error: S3Error) -> ApiError {
 
 /// Asks the bucket whether the key may list `prefix` (one listing of at most one key), then
 /// its versioning state (whose failure is no refusal: it is recorded as unknown). Two
-/// requests, no write, within 20 seconds in all. The connect probe (`library` is `None`: the
+/// requests, no write, answered before `deadline` (20 seconds from the start of the probe, the
+/// write probe included when there is one). The connect probe (`library` is `None`: the
 /// library does not exist yet) is counted against no library; a key replacement is counted
 /// against its library.
+#[allow(clippy::too_many_arguments)]
 async fn probe_bucket(
     state: &AppState,
     endpoint: &S3Endpoint,
@@ -1333,6 +1375,7 @@ async fn probe_bucket(
     access_key_id: &str,
     secret: &Secret,
     library: Option<NodeId>,
+    deadline: tokio::time::Instant,
 ) -> Result<Versioning, ApiError> {
     let s3 = state.s3();
     let mut target = s3.target_from(
@@ -1357,9 +1400,88 @@ async fn probe_bucket(
                 .unwrap_or(Versioning::Unknown),
         )
     };
-    tokio::time::timeout(S3_PROBE_LIMIT, probing)
+    tokio::time::timeout_at(deadline, probing)
         .await
         .map_err(|_| ApiError::S3Unreachable("offline"))?
+}
+
+/// The write probe (see [`s3_write::probe_writes`]) on `target`, answered before `deadline`.
+/// It runs as a task of its own, so the limit never stops it between its first write and its
+/// removal: one answered too late is `offline` here and still cleans up after itself (an
+/// object it then could not remove is logged).
+async fn probe_writes_by(
+    state: &AppState,
+    target: S3Target,
+    deadline: tokio::time::Instant,
+    library: Option<NodeId>,
+) -> (Probe, Option<String>) {
+    let mut task = {
+        let state = state.clone();
+        tokio::spawn(async move { s3_write::probe_writes(state.s3(), &target).await })
+    };
+    match tokio::time::timeout_at(deadline, &mut task).await {
+        Ok(Ok(found)) => found,
+        Ok(Err(_)) => (Probe::Unreachable("offline"), None),
+        Err(_) => {
+            tokio::spawn(async move {
+                if let Ok((probe, Some(_))) = task.await
+                    && !matches!(probe, Probe::Unreachable(_))
+                {
+                    log_probe_left(library);
+                }
+            });
+            (Probe::Unreachable("offline"), None)
+        }
+    }
+}
+
+fn log_probe_left(library: Option<NodeId>) {
+    match library {
+        Some(library) => eprintln!(
+            "sharecraft-server: a write probe object could not be removed (library {})",
+            library.0
+        ),
+        None => eprintln!(
+            "sharecraft-server: a write probe object could not be removed (no library was made)"
+        ),
+    }
+}
+
+/// Logs and announces (`source.probe_left {name}`, the name relative to the library's place:
+/// never the bucket or the prefix) a probe object that could not be removed. Nothing when the
+/// probe could not write at all: then no object was made.
+fn report_probe_left(
+    state: &AppState,
+    actor: &User,
+    library: Option<NodeId>,
+    probe: Probe,
+    left: Option<String>,
+) {
+    let Some(name) = left else {
+        return;
+    };
+    if matches!(probe, Probe::Unreachable(_)) {
+        return;
+    }
+    log_probe_left(library);
+    state.events().emit(NewEvent {
+        kind: "source.probe_left",
+        actor: Some(actor.id),
+        subject: None,
+        document: None,
+        node: library,
+        detail: json!({ "name": name }),
+    });
+}
+
+/// What the write probe allows: read and write with the condition support found, or the
+/// refusal (`422 s3_not_writable` for a key that may only read, `422 s3_unreachable`).
+fn writes_allowed(probe: Probe) -> Result<Tri, ApiError> {
+    match probe {
+        Probe::ReadWrite { conditional } => Ok(conditional),
+        Probe::ReadOnly => Err(ApiError::S3NotWritable),
+        Probe::Unreachable(reason) => Err(ApiError::S3Unreachable(reason)),
+    }
 }
 
 /// The last four characters of an access key id, as the pages show it.
@@ -1376,8 +1498,19 @@ async fn s3_answer(
     config: &SourceConfig,
     status: &SourceStatus,
     reveal: bool,
+    admin: bool,
 ) -> Result<Value, ApiError> {
     let library = config.library;
+    let db = state.db();
+    let (write_state, write_error) = db
+        .write_state(library)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?
+        .unwrap_or((WriteState::Ok, None));
+    let (saving, failed) = db
+        .pending_counts(library)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?;
     let listing_now = (status.state == records::SourceState::Syncing)
         .then(|| state.s3().listing_progress(library))
         .flatten()
@@ -1396,6 +1529,11 @@ async fn s3_answer(
         "poll_seconds": config.poll_seconds,
         "next_check_at": rfc3339(status.next_check_at),
         "listing_now": listing_now,
+        "write_state": write_state.as_str(),
+        "write_error": write_error,
+        "writes": { "saving": saving, "failed": failed },
+        "may_choose_read_write": admin,
+        "conditional": null,
         "endpoint": null,
         "bucket": null,
         "prefix": null,
@@ -1408,7 +1546,6 @@ async fn s3_answer(
     if !reveal {
         return Ok(answer);
     }
-    let db = state.db();
     let Some(place) = db
         .s3_place(library)
         .await
@@ -1456,6 +1593,7 @@ async fn s3_answer(
                 json!({ "id_ends": id_ends(&place.access_key_id), "secret": "set" }),
             ),
             ("versioning", json!(place.versioning.as_str())),
+            ("conditional", json!(place.conditional.as_str())),
             (
                 "usage",
                 json!({
@@ -1498,18 +1636,22 @@ pub(crate) struct ConnectS3Body {
     secret_access_key: SecretText,
     /// `document` when not given, or `image`.
     kind: Option<String>,
-    /// Phase 1 takes only `read_only`.
+    /// `read_only` when not given, or `read_write` (administrators only).
     mode: Option<String>,
 }
 
 /// `POST /api/sites/{id}/libraries/s3 {name, endpoint, bucket, prefix?, access_key_id,
-/// secret_access_key, kind?, mode?}`: makes a new read-only library in the site backed by the
-/// bucket (below the prefix), for someone who may make a library there. Checked in this order,
-/// nothing asked of the store before the last: access (`403`); `kind` `document` or `image`
-/// and `mode` `read_only` (`422 invalid_request`); the endpoint is approved (`422
-/// s3_endpoint_not_approved`); the bucket and prefix (`422 invalid_s3_place` with `reason`
-/// `bucket` or `prefix`); the key's lengths (`422 invalid_request`); the probe (`422
-/// s3_unreachable` with its `reason`). Only then is the library made, the secret sealed and the
+/// secret_access_key, kind?, mode?}`: makes a new library in the site backed by the bucket
+/// (below the prefix), for someone who may make a library there; read-only unless `mode` is
+/// `read_write`. Checked in this order, nothing asked of the store before the last: access
+/// (`403`); `kind` `document` or `image` and `mode` `read_only` or `read_write` (`422
+/// invalid_request`); `read_write` from someone who is not an administrator (`403
+/// read_write_admin_only`); the endpoint is approved (`422 s3_endpoint_not_approved`); the
+/// bucket and prefix (`422 invalid_s3_place` with `reason` `bucket` or `prefix`); the key's
+/// lengths (`422 invalid_request`); the probe (`422 s3_unreachable` with its `reason`), and for
+/// `read_write` the write probe in the same 20 seconds (`422 s3_not_writable` for a key that
+/// may only read; it leaves nothing in the bucket). Only then is the library made, the secret
+/// sealed and the
 /// connection recorded (`409 s3_place_in_use` when another library holds an overlapping prefix
 /// of the bucket, judged together with the endpoint's approval under one lock); a failure
 /// removes the new library and forgets the secret. `201 {id, source}`.
@@ -1544,8 +1686,13 @@ pub(crate) async fn connect_s3(
         Some("image") => LibraryKind::Image,
         Some(_) => return Err(ApiError::InvalidRequest),
     };
-    if mode.as_deref().is_some_and(|mode| mode != "read_only") {
-        return Err(ApiError::InvalidRequest);
+    let mode = match mode.as_deref() {
+        None | Some("read_only") => SourceMode::ReadOnly,
+        Some("read_write") => SourceMode::ReadWrite,
+        Some(_) => return Err(ApiError::InvalidRequest),
+    };
+    if mode == SourceMode::ReadWrite && !actor.is_admin {
+        return Err(ApiError::ReadWriteAdminOnly);
     }
     let name = records::validate_node_name(&name)
         .map_err(ApiError::from)?
@@ -1568,6 +1715,7 @@ pub(crate) async fn connect_s3(
         return Err(ApiError::NameTaken);
     }
 
+    let deadline = tokio::time::Instant::now() + S3_PROBE_LIMIT;
     let versioning = probe_bucket(
         &state,
         &endpoint,
@@ -1576,78 +1724,113 @@ pub(crate) async fn connect_s3(
         &access_key_id,
         &secret,
         None,
+        deadline,
     )
     .await?;
+    let (conditional, probed) = if mode == SourceMode::ReadWrite {
+        let target = state
+            .s3()
+            .target_from(
+                &endpoint,
+                &bucket,
+                Credentials {
+                    access_key_id: access_key_id.clone(),
+                    secret: secret.clone(),
+                    session_token: None,
+                },
+            )
+            .with_prefix(&prefix);
+        let (probe, left) = probe_writes_by(&state, target, deadline, None).await;
+        match writes_allowed(probe) {
+            Ok(conditional) => (conditional, Some((probe, left))),
+            Err(e) => {
+                report_probe_left(&state, &actor, None, probe, left);
+                return Err(e);
+            }
+        }
+    } else {
+        (Tri::Unknown, None)
+    };
     let library = NodeId(Uuid::new_v4());
     let origin = origin(&state, &headers)?;
     {
-        let state = state.clone();
-        let actor = actor.clone();
-        to_completion(async move {
-            tree::create_library(&state, &actor, site, library, &name, kind).await?;
-            let sealed =
-                store_secret(&state, secret.expose().as_bytes(), &token_context(library)).await;
-            drop(secret);
-            let token = match sealed {
-                Ok(token) => token,
-                Err(e) => {
+        let made = {
+            let state = state.clone();
+            let actor = actor.clone();
+            to_completion(async move {
+                tree::create_library(&state, &actor, site, library, &name, kind).await?;
+                let sealed =
+                    store_secret(&state, secret.expose().as_bytes(), &token_context(library)).await;
+                drop(secret);
+                let token = match sealed {
+                    Ok(token) => token,
+                    Err(e) => {
+                        purge_new_library(&state, &actor, library).await;
+                        return Err(e);
+                    }
+                };
+                let place = S3Place {
+                    endpoint: endpoint.name,
+                    bucket,
+                    prefix,
+                    access_key_id,
+                    versioning,
+                    conditional,
+                };
+                let connected = state
+                    .db()
+                    .connect_s3_source(
+                        &NewSource {
+                            library,
+                            kind: SourceKind::S3,
+                            owner: String::new(),
+                            repo: String::new(),
+                            branch: String::new(),
+                            folder: String::new(),
+                            location: Some(s3_location(
+                                &place.endpoint,
+                                &place.bucket,
+                                &place.prefix,
+                            )),
+                            mode,
+                            token: Some(token),
+                            poll_seconds: DEFAULT_POLL_SECONDS,
+                            connected_by: actor.id,
+                        },
+                        &place,
+                    )
+                    .await;
+                if let Err(e) = connected {
                     purge_new_library(&state, &actor, library).await;
-                    return Err(e);
+                    forget_secret(&state, token).await;
+                    return Err(match e {
+                        AccessError::Exists => ApiError::S3PlaceInUse,
+                        e => e.into(),
+                    });
                 }
-            };
-            let place = S3Place {
-                endpoint: endpoint.name,
-                bucket,
-                prefix,
-                access_key_id,
-                versioning,
-                conditional: Tri::Unknown,
-            };
-            let connected = state
-                .db()
-                .connect_s3_source(
-                    &NewSource {
-                        library,
-                        kind: SourceKind::S3,
-                        owner: String::new(),
-                        repo: String::new(),
-                        branch: String::new(),
-                        folder: String::new(),
-                        location: Some(s3_location(&place.endpoint, &place.bucket, &place.prefix)),
-                        mode: SourceMode::ReadOnly,
-                        token: Some(token),
-                        poll_seconds: DEFAULT_POLL_SECONDS,
-                        connected_by: actor.id,
-                    },
-                    &place,
-                )
-                .await;
-            if let Err(e) = connected {
-                purge_new_library(&state, &actor, library).await;
-                forget_secret(&state, token).await;
-                return Err(match e {
-                    AccessError::Exists => ApiError::S3PlaceInUse,
-                    e => e.into(),
-                });
-            }
-            abandon_uploads_into(&state, library).await;
-            emit(
-                &state,
-                "source.connected",
-                &actor,
-                library,
-                json!({ "kind": "s3" }),
-            );
-            wake(&state, library);
-            Ok(())
-        })
-        .await?;
+                abandon_uploads_into(&state, library).await;
+                emit(
+                    &state,
+                    "source.connected",
+                    &actor,
+                    library,
+                    json!({ "kind": "s3" }),
+                );
+                wake(&state, library);
+                Ok(())
+            })
+            .await
+        };
+        if let Some((probe, left)) = probed {
+            report_probe_left(&state, &actor, made.is_ok().then_some(library), probe, left);
+        }
+        made?;
     }
     Ok((
         StatusCode::CREATED,
         Json(json!({
             "id": library.0.to_string(),
-            "source": answer_of(&state, &origin, library, true).await?,
+            "source": answer_of(&state, &origin, library, true, actor.is_admin).await?,
         })),
     )
         .into_response())
@@ -1681,10 +1864,19 @@ fn budget_of(value: &Value) -> Result<Budget, ApiError> {
 }
 
 /// `PATCH /api/libraries/{id}/source` for an S3 library: `{poll_seconds?, access_key_id? with
-/// secret_access_key?, budget?}`. A GitHub field is `422 invalid_request`, and so is a key id
-/// without its secret or the other way round. A new key is probed first, as connecting is (the
-/// same `422` answers change nothing); then it replaces the old one, whose sealed row is
-/// deleted, and a library that could not connect is tried again. Answers the connection.
+/// secret_access_key?, budget?, mode?}`. A GitHub field is `422 invalid_request`, and so is a
+/// key id without its secret or the other way round, a `mode` other than `read_only` or
+/// `read_write`, and a `mode` given with a new key. A new key is probed first, as connecting is
+/// (the same `422` answers change nothing); then it replaces the old one, whose sealed row is
+/// deleted, and a library that could not connect is tried again.
+///
+/// `mode` `read_write` is for administrators only (`403 read_write_admin_only`, before the
+/// store is asked): the write probe runs first with the library's key, counted against it
+/// (`422 s3_not_writable`, `422 s3_unreachable`, nothing changed); a pass records what it found
+/// about conditional writes, makes the library read and write and its writes no longer
+/// blocked (which is how a blocked library is restored). `read_only` is for owners; `409
+/// source_writes_pending` while changes are still to be written. A mode change is recorded as
+/// `source.mode_changed {mode}` and the open files below are rechecked. Answers the connection.
 async fn change_s3(
     state: AppState,
     actor: User,
@@ -1702,8 +1894,19 @@ async fn change_s3(
         access_key_id,
         secret_access_key,
         budget,
+        mode,
         ..
     } = body;
+    let admin = actor.is_admin;
+    let mode = match mode.as_deref() {
+        None => None,
+        Some("read_only") => Some(SourceMode::ReadOnly),
+        Some("read_write") => Some(SourceMode::ReadWrite),
+        Some(_) => return Err(ApiError::InvalidRequest),
+    };
+    if mode == Some(SourceMode::ReadWrite) && !admin {
+        return Err(ApiError::ReadWriteAdminOnly);
+    }
     if branch.is_some() || folder.is_some() || token.is_some() || clear_token.is_some() {
         return Err(ApiError::InvalidRequest);
     }
@@ -1722,6 +1925,26 @@ async fn change_s3(
         }
         _ => return Err(ApiError::InvalidRequest),
     };
+    if mode.is_some() && key.is_some() {
+        return Err(ApiError::InvalidRequest);
+    }
+    // A mode asked for that the library has changes nothing; read and write asked for again
+    // while its writes are blocked probes and restores it.
+    let mode = match mode {
+        Some(SourceMode::ReadWrite) if config.mode == SourceMode::ReadWrite => {
+            let blocked = matches!(
+                state
+                    .db()
+                    .write_state(library)
+                    .await
+                    .map_err(|e| ApiError::unavailable(&e))?,
+                Some((WriteState::Blocked, _))
+            );
+            blocked.then_some(SourceMode::ReadWrite)
+        }
+        Some(mode) => (mode != config.mode).then_some(mode),
+        None => None,
+    };
     let poll_seconds = poll_seconds.filter(|s| *s != config.poll_seconds);
     let budget = match budget {
         Some(budget) => {
@@ -1734,9 +1957,24 @@ async fn change_s3(
         }
         None => None,
     };
-    if poll_seconds.is_none() && budget.is_none() && key.is_none() {
-        return Ok(Json(answer_of(&state, origin, library, true).await?));
+    if poll_seconds.is_none() && budget.is_none() && key.is_none() && mode.is_none() {
+        return Ok(Json(answer_of(&state, origin, library, true, admin).await?));
     }
+    // Read and write only once the store has shown it takes writes, with the library's own key
+    // (counted against it), before anything changes.
+    let writable = if mode == Some(SourceMode::ReadWrite) {
+        let target = state
+            .s3()
+            .target(&state, library)
+            .await
+            .map_err(s3_refused)?;
+        let deadline = tokio::time::Instant::now() + S3_PROBE_LIMIT;
+        let (probe, left) = probe_writes_by(&state, target, deadline, Some(library)).await;
+        report_probe_left(&state, &actor, Some(library), probe, left);
+        Some(writes_allowed(probe)?)
+    } else {
+        None
+    };
     let probed = match &key {
         Some((id, secret)) => {
             let place = state
@@ -1754,6 +1992,7 @@ async fn change_s3(
                 id,
                 secret,
                 Some(library),
+                tokio::time::Instant::now() + S3_PROBE_LIMIT,
             )
             .await?;
             Some((versioning, place.conditional))
@@ -1773,6 +2012,10 @@ async fn change_s3(
     {
         let state = state.clone();
         to_completion(async move {
+            // First, so that a refusal (changes still to be written) changes nothing else.
+            if let Some(mode) = mode {
+                change_mode(&state, &actor, library, mode, writable).await?;
+            }
             if let Some((id, secret)) = key {
                 let stored =
                     store_secret(&state, secret.expose().as_bytes(), &token_context(library)).await;
@@ -1816,19 +2059,64 @@ async fn change_s3(
             if let Some(budget) = budget {
                 state.db().set_budget(library, &budget).await?;
             }
-            emit(
-                &state,
-                "source.changed",
-                &actor,
-                library,
-                json!({ "fields": fields }),
-            );
-            wake(&state, library);
+            if !fields.is_empty() {
+                emit(
+                    &state,
+                    "source.changed",
+                    &actor,
+                    library,
+                    json!({ "fields": fields }),
+                );
+                wake(&state, library);
+            }
             Ok(())
         })
         .await?;
     }
-    Ok(Json(answer_of(&state, origin, library, true).await?))
+    Ok(Json(answer_of(&state, origin, library, true, admin).await?))
+}
+
+/// Makes `library` `mode`. For read and write, `conditional` is what the write probe found,
+/// recorded first; the writes are then no longer blocked. A library with changes still to be
+/// written is not made read-only (`409 source_writes_pending`, judged in the same transaction
+/// as the change). A real change is recorded and the open files below are rechecked.
+async fn change_mode(
+    state: &AppState,
+    actor: &User,
+    library: NodeId,
+    mode: SourceMode,
+    conditional: Option<Tri>,
+) -> Result<(), ApiError> {
+    let db = state.db();
+    let unavailable = |e: records::DbError| ApiError::unavailable(&e);
+    if let Some(conditional) = conditional {
+        let versioning = db
+            .s3_place(library)
+            .await
+            .map_err(unavailable)?
+            .ok_or(ApiError::NotFound)?
+            .versioning;
+        db.set_s3_probe(library, versioning, conditional)
+            .await
+            .map_err(unavailable)?;
+    }
+    let changed = db.set_source_mode(library, mode).await?;
+    if mode == SourceMode::ReadWrite {
+        db.set_write_state(library, WriteState::Ok, None)
+            .await
+            .map_err(unavailable)?;
+    }
+    if changed {
+        emit(
+            state,
+            "source.mode_changed",
+            actor,
+            library,
+            json!({ "mode": mode.as_str() }),
+        );
+        recheck_below(state, library).await;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

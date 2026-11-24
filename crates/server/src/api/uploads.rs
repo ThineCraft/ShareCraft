@@ -56,7 +56,7 @@ use axum::extract::{Path as UrlPath, Query, Request, State};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_RANGE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use collab_core::ids::{DocId, NodeId};
+use collab_core::ids::{DocId, NodeId, UserId};
 use futures_util::StreamExt;
 use records::{
     AccessError, Editor, NameConflict, NewEvent, NewUpload, NodeKind, Perms, QuotaError,
@@ -71,11 +71,11 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use super::content::{Created, create_uploaded, discard, query_of, save_answer};
-use super::nodes::require_not_connected_for;
 use super::{ApiError, JsonBody, parse_id, to_completion};
 use crate::auth::Signed;
 use crate::blobs::{ChannelReader, Held, release};
 use crate::file_room::{FileLink, SaveReply, check_upload, upload_version};
+use crate::source_write::{Place, writable_place};
 use crate::{AppState, tree};
 
 /// A session that has received nothing for this long is swept.
@@ -406,7 +406,7 @@ pub(crate) async fn start(
     let (target, name, base, site) = match (body.parent, body.doc) {
         (Some(parent), None) => {
             let parent = NodeId(parse_id(&parent)?);
-            require_not_connected_for(db, user.id, parent).await?;
+            refuse_unbuilt(db, user.id, parent).await?;
             let asked = body.name.ok_or(ApiError::BadRequest)?;
             if body.base.is_some() {
                 return Err(ApiError::BadRequest);
@@ -431,7 +431,7 @@ pub(crate) async fn start(
         }
         (None, Some(doc)) => {
             let doc = DocId(parse_id(&doc)?);
-            require_not_connected_for(db, user.id, doc.into()).await?;
+            refuse_unbuilt(db, user.id, doc.into()).await?;
             let base = match &body.base {
                 Some(text) => Some(RevisionId::from_str(text).map_err(|_| ApiError::BadRequest)?),
                 None => None,
@@ -589,6 +589,15 @@ async fn refuse_archived(state: &AppState, session: &UploadSession) -> Result<()
     Ok(())
 }
 
+/// [`writable_place`] for an upload into `node`: `Ok` for an ordinary place; a read-and-write
+/// library's upload goes to its store (Task 6), not yet built.
+async fn refuse_unbuilt(db: &records::Db, user: UserId, node: NodeId) -> Result<(), ApiError> {
+    match writable_place(db, user, node).await? {
+        Place::Ordinary => Ok(()),
+        Place::External(_) => Err(ApiError::SourceWriteNotBuilt),
+    }
+}
+
 /// `409 source_read_only` if the session's file goes into a library connected to a source
 /// (connected after the session started, while the library was empty). Sending to it and
 /// finishing it are refused; abandoning it is not.
@@ -597,7 +606,7 @@ async fn refuse_connected(state: &AppState, session: &UploadSession) -> Result<(
         UploadTarget::NewFile { parent } => parent,
         UploadTarget::NewVersion { doc } => doc.into(),
     };
-    require_not_connected_for(state.db(), session.owner, place).await
+    refuse_unbuilt(state.db(), session.owner, place).await
 }
 
 /// Abandons the upload session `id`, whoever it belongs to, once any request on it is done:
