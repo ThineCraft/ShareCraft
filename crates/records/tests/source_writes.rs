@@ -1091,3 +1091,81 @@ async fn migrating_a_phase_1_database_keeps_its_rows() {
         .unwrap();
     assert_eq!(test.db.pending_counts(library).await.unwrap(), (1, 0));
 }
+
+#[tokio::test]
+async fn staging_is_refused_for_a_read_only_library_and_after_a_switch_to_read_only() {
+    let f = fixture().await;
+    let db = &f.test.db;
+    let node = new_file(&f, "A.txt").await;
+    let blob = BlobRef::of(b"content");
+    db.pin_cached(&blob, t0()).await.unwrap();
+    let new = NewPendingWrite {
+        node,
+        library: f.library,
+        path: "A.txt",
+        blob,
+        base_tag: None,
+        by: f.user,
+        flush: false,
+        now: t0(),
+    };
+
+    assert!(
+        db.set_source_mode(f.library, SourceMode::ReadOnly)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        db.stage_write(&new).await,
+        Err(AccessError::LibraryReadOnly)
+    );
+    assert_eq!(db.pending_write(node).await.unwrap(), None);
+
+    // Read and write again: accepted. No connection at all: refused.
+    assert!(
+        db.set_source_mode(f.library, SourceMode::ReadWrite)
+            .await
+            .unwrap()
+    );
+    db.stage_write(&new).await.unwrap();
+    let elsewhere = NewPendingWrite {
+        library: new_id(),
+        node: new_file(&f, "B.txt").await,
+        ..new
+    };
+    assert_eq!(
+        db.stage_write(&elsewhere).await,
+        Err(AccessError::LibraryReadOnly)
+    );
+}
+
+#[tokio::test]
+async fn a_superseded_finish_forgets_the_old_content_so_a_dropped_newer_stage_serves_the_bucket() {
+    let f = fixture().await;
+    let db = &f.test.db;
+    let (node, old_tag) = tracked_file(&f, "T.txt").await;
+    let old = BlobRef::of(b"read earlier");
+    db.pin_cached(&old, t0()).await.unwrap();
+    db.set_external_content(node, &old_tag, &old.sha256, t0())
+        .await
+        .unwrap();
+    assert_eq!(
+        db.external_item(node).await.unwrap().unwrap().sha256,
+        Some(old.sha256)
+    );
+
+    let (a, _) = stage(&f, node, "T.txt", b"stage A", Some(&old_tag), false, t0()).await;
+    let (b, _) = stage(&f, node, "T.txt", b"stage B!", Some(&old_tag), false, t0()).await;
+    let written = tag_of(a.size, 1_800_000_000);
+    let modified = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+    assert!(
+        !db.finish_write(node, &a.sha256, &written, a.size, modified)
+            .await
+            .unwrap()
+    );
+    assert!(db.drop_write(node, &b.sha256).await.unwrap());
+
+    let item = db.external_item(node).await.unwrap().unwrap();
+    assert_eq!(item.tag, written);
+    assert_eq!(item.sha256, None, "the next read fetches from the bucket");
+}

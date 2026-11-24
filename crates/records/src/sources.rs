@@ -673,7 +673,6 @@ fn poll_ok(seconds: u32) -> bool {
     (MIN_POLL_SECONDS..=MAX_POLL_SECONDS).contains(&seconds)
 }
 
-/// Maps a refused check to `InvalidSetting`.
 /// A [`SourceItem`] from a row of `node_id, path, repository_path, blob_sha, size`.
 pub(crate) fn item_from_row(row: &PgRow) -> Result<SourceItem, sqlx::Error> {
     Ok(SourceItem {
@@ -685,6 +684,7 @@ pub(crate) fn item_from_row(row: &PgRow) -> Result<SourceItem, sqlx::Error> {
     })
 }
 
+/// Maps a refused check to `InvalidSetting`.
 fn refused(e: sqlx::Error) -> AccessError {
     match e {
         sqlx::Error::Database(d) if d.code().as_deref() == Some(CHECK_VIOLATION) => {

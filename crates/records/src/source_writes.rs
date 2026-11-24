@@ -262,10 +262,21 @@ impl Db {
     /// first base tag and first staging time; the content, size, author, staging time and
     /// revision are replaced, a request to flush is kept once made, and the attempt starts over.
     /// A tracked node's `source_items.revision` moves with it, so the editor's view and the
-    /// page agree that the file changed.
-    pub async fn stage_write(&self, w: &NewPendingWrite<'_>) -> Result<String, DbError> {
+    /// page agree that the file changed. The library's connection row is locked `FOR SHARE` and
+    /// its mode judged in the same transaction as the insert, so a switch to read-only cannot
+    /// slip between: a library that is read-only (or has no connection) refuses with
+    /// `LibraryReadOnly`, and a switch that wins the lock first is seen here.
+    pub async fn stage_write(&self, w: &NewPendingWrite<'_>) -> Result<String, AccessError> {
         let revision = new_external_revision();
         let mut tx = self.pool().begin().await?;
+        let mode: Option<String> =
+            sqlx::query_scalar("select mode from library_sources where library_id = $1 for share")
+                .bind(w.library.0)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if mode.as_deref() != Some(SourceMode::ReadWrite.as_str()) {
+            return Err(AccessError::LibraryReadOnly);
+        }
         sqlx::query("select sha256 from blobs where sha256 = $1 for share")
             .bind(w.blob.hex())
             .fetch_one(&mut *tx)
@@ -430,6 +441,14 @@ impl Db {
             .await?;
         }
         if !current {
+            // The item's content is the old one no longer: forget it, so a read fetches the
+            // bucket's, also if the newer stage is withdrawn.
+            sqlx::query(
+                "update source_items set content_sha256 = null, read_at = null where node_id = $1",
+            )
+            .bind(node.0)
+            .execute(&mut *tx)
+            .await?;
             sqlx::query("update source_writes set base_tag = $2 where node_id = $1")
                 .bind(node.0)
                 .bind(tag)

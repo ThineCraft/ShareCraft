@@ -249,6 +249,9 @@ pub enum AccessError {
     /// The S3 endpoint named is not (or no longer) approved by an administrator.
     #[error("that S3 endpoint is not approved")]
     S3EndpointNotApproved,
+    /// The library is read-only: nothing is staged for its store.
+    #[error("this library is read-only")]
+    LibraryReadOnly,
     /// Changes accepted for a connected library's store are not yet written there.
     #[error("changes to this library are still being saved")]
     WritesPending,

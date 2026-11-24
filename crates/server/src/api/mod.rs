@@ -706,6 +706,7 @@ impl From<AccessError> for ApiError {
             AccessError::SourceExists => ApiError::SourceExists,
             AccessError::ShareLocationInUse => ApiError::ShareLocationInUse,
             AccessError::WritesPending => ApiError::WritesPending,
+            AccessError::LibraryReadOnly => ApiError::SourceReadOnly,
             AccessError::S3EndpointNotApproved => ApiError::S3EndpointNotApproved,
             AccessError::BlockedFileType(file_type) => ApiError::BlockedFileType(file_type),
             AccessError::FileTooLarge(limit) => ApiError::FileTooLarge(limit),
