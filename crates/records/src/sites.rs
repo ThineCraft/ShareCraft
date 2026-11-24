@@ -852,6 +852,13 @@ pub(crate) async fn purge_site_rows(
     // Its connected libraries: their item records, their connections, then the sealed secrets
     // those connections named (nothing else names a secret).
     sqlx::query(
+        "delete from source_writes where library_id in \
+             (select id from nodes where site_id = $1 and kind = 'library')",
+    )
+    .bind(site.0)
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query(
         "delete from source_items where library_id in \
              (select id from nodes where site_id = $1 and kind = 'library')",
     )

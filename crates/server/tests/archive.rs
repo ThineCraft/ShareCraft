@@ -612,6 +612,7 @@ async fn archived_site_refuses_every_write() {
                 sha256: sha_abc(),
                 base: None,
                 on_conflict: None,
+                external: false,
             })
             .await
             .unwrap();

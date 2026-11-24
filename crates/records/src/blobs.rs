@@ -157,7 +157,9 @@ impl Db {
     /// At most `limit` pinned contents, least recently used first.
     pub async fn coldest_cached(&self, limit: i64) -> Result<Vec<BlobRef>, DbError> {
         let rows: Vec<(String, i64)> = sqlx::query_as(
-            "select sha256, size from source_cache order by last_used_at, sha256 limit $1",
+            "select c.sha256, c.size from source_cache c \
+             where not exists (select 1 from source_writes w where w.sha256 = c.sha256) \
+             order by c.last_used_at, c.sha256 limit $1",
         )
         .bind(limit)
         .fetch_all(self.pool())
@@ -175,10 +177,13 @@ impl Db {
 
     /// Removes the cache pin for `sha256`; whether there was one.
     pub async fn unpin_cached(&self, sha256: &[u8; 32]) -> Result<bool, DbError> {
-        let done = sqlx::query("delete from source_cache where sha256 = $1")
-            .bind(hex(sha256))
-            .execute(self.pool())
-            .await?;
+        let done = sqlx::query(
+            "delete from source_cache where sha256 = $1 \
+             and not exists (select 1 from source_writes w where w.sha256 = $1)",
+        )
+        .bind(hex(sha256))
+        .execute(self.pool())
+        .await?;
         Ok(done.rows_affected() > 0)
     }
 
@@ -331,7 +336,8 @@ impl Db {
         let named: i64 = sqlx::query_scalar(
             "select (select count(*) from blob_refs where sha256 = $1) \
                     + (select count(*) from brand_refs where sha256 = $1) \
-                    + (select count(*) from source_cache where sha256 = $1)",
+                    + (select count(*) from source_cache where sha256 = $1) \
+                    + (select count(*) from source_writes where sha256 = $1)",
         )
         .bind(&hash)
         .fetch_one(&mut *tx)
@@ -391,6 +397,7 @@ impl Db {
                and not exists (select 1 from blob_refs r where r.sha256 = b.sha256) \
                and not exists (select 1 from brand_refs p where p.sha256 = b.sha256) \
                and not exists (select 1 from source_cache c where c.sha256 = b.sha256) \
+               and not exists (select 1 from source_writes w where w.sha256 = b.sha256) \
              order by b.sha256",
         )
         .bind(before)

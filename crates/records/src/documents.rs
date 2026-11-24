@@ -249,6 +249,9 @@ pub enum AccessError {
     /// The S3 endpoint named is not (or no longer) approved by an administrator.
     #[error("that S3 endpoint is not approved")]
     S3EndpointNotApproved,
+    /// Changes accepted for a connected library's store are not yet written there.
+    #[error("changes to this library are still being saved")]
+    WritesPending,
     #[error("a document with that id already exists")]
     Exists,
     #[error("something with that name is already in that place")]

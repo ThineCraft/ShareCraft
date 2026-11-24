@@ -417,6 +417,9 @@ pub(crate) enum ApiError {
     SourceExists,
     /// 409: another library uses the same or an overlapping file-share location.
     ShareLocationInUse,
+    /// 409: changes to the library's store are accepted but not yet written, so it is not
+    /// disconnected or made read-only yet.
+    WritesPending,
     /// 409: the library is kept in step with a source (a GitHub repository), so nothing in it
     /// is created, changed, moved, copied in, deleted or restored here; administrators too.
     /// The answer's `message` says so in words.
@@ -601,6 +604,7 @@ impl ApiError {
             ApiError::LibraryNotEmpty => (StatusCode::CONFLICT, "library_not_empty"),
             ApiError::SourceExists => (StatusCode::CONFLICT, "source_exists"),
             ApiError::ShareLocationInUse => (StatusCode::CONFLICT, "share_location_in_use"),
+            ApiError::WritesPending => (StatusCode::CONFLICT, "writes_pending"),
             ApiError::SourceReadOnly => (StatusCode::CONFLICT, "source_read_only"),
             ApiError::SourceUnavailable("offline", _) => {
                 (StatusCode::SERVICE_UNAVAILABLE, "source_unavailable")
@@ -701,6 +705,7 @@ impl From<AccessError> for ApiError {
             AccessError::LibraryNotEmpty => ApiError::LibraryNotEmpty,
             AccessError::SourceExists => ApiError::SourceExists,
             AccessError::ShareLocationInUse => ApiError::ShareLocationInUse,
+            AccessError::WritesPending => ApiError::WritesPending,
             AccessError::S3EndpointNotApproved => ApiError::S3EndpointNotApproved,
             AccessError::BlockedFileType(file_type) => ApiError::BlockedFileType(file_type),
             AccessError::FileTooLarge(limit) => ApiError::FileTooLarge(limit),

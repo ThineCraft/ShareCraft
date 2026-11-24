@@ -465,6 +465,7 @@ pub(crate) async fn start(
             sha256,
             base: base_text.as_deref(),
             on_conflict: on_conflict.filter(|_| matches!(target, UploadTarget::NewFile { .. })),
+            external: false,
         })
         .await
         .map_err(|e| match e {

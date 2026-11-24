@@ -674,6 +674,17 @@ fn poll_ok(seconds: u32) -> bool {
 }
 
 /// Maps a refused check to `InvalidSetting`.
+/// A [`SourceItem`] from a row of `node_id, path, repository_path, blob_sha, size`.
+pub(crate) fn item_from_row(row: &PgRow) -> Result<SourceItem, sqlx::Error> {
+    Ok(SourceItem {
+        node: NodeId(row.try_get("node_id")?),
+        path: row.try_get("path")?,
+        repository_path: row.try_get("repository_path")?,
+        blob_sha: row.try_get("blob_sha")?,
+        size: row.try_get("size")?,
+    })
+}
+
 fn refused(e: sqlx::Error) -> AccessError {
     match e {
         sqlx::Error::Database(d) if d.code().as_deref() == Some(CHECK_VIOLATION) => {
@@ -1932,15 +1943,7 @@ impl Db {
         .fetch_all(self.pool())
         .await?;
         rows.iter()
-            .map(|row| {
-                Ok(SourceItem {
-                    node: NodeId(row.try_get("node_id")?),
-                    path: row.try_get("path")?,
-                    repository_path: row.try_get("repository_path")?,
-                    blob_sha: row.try_get("blob_sha")?,
-                    size: row.try_get("size")?,
-                })
-            })
+            .map(item_from_row)
             .collect::<Result<_, sqlx::Error>>()
             .map_err(DbError::from)
     }
@@ -2271,7 +2274,7 @@ impl Db {
     /// Ends the connection of `library`: removes its items and its connection, keeping every
     /// node, and returns the ids of the secrets it used, which the caller deletes. Empty if it
     /// had no connection.
-    pub async fn disconnect_source(&self, library: NodeId) -> Result<Vec<SecretId>, DbError> {
+    pub async fn disconnect_source(&self, library: NodeId) -> Result<Vec<SecretId>, AccessError> {
         let mut tx = self.pool().begin().await?;
         let secrets = disconnect_in(&mut tx, library).await?;
         tx.commit().await?;
@@ -2300,10 +2303,12 @@ impl Db {
 }
 
 /// Removes the connection of `library` and its item rows on `conn`, returning its secrets.
+/// `WritesPending` while changes accepted for the store are not yet written: they would be
+/// lost with it.
 async fn disconnect_in(
     conn: &mut PgConnection,
     library: NodeId,
-) -> Result<Vec<SecretId>, sqlx::Error> {
+) -> Result<Vec<SecretId>, AccessError> {
     let row: Option<(Option<Uuid>, Option<Uuid>, Uuid)> = sqlx::query_as(
         "select s.token_secret, s.webhook_secret, n.site_id from library_sources s \
          join nodes n on n.id = s.library_id where s.library_id = $1 for update of s",
@@ -2314,6 +2319,14 @@ async fn disconnect_in(
     let Some((token, webhook, site)) = row else {
         return Ok(Vec::new());
     };
+    let pending: i64 =
+        sqlx::query_scalar("select count(*) from source_writes where library_id = $1")
+            .bind(library.0)
+            .fetch_one(&mut *conn)
+            .await?;
+    if pending > 0 {
+        return Err(AccessError::WritesPending);
+    }
     sqlx::query("delete from source_items where library_id = $1")
         .bind(library.0)
         .execute(&mut *conn)
