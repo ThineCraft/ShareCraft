@@ -33,7 +33,7 @@ import { relativeTime } from './files.js';
 import { libraryCardModel, libraryIcon, ownerChip, recentAcrossLibraries, recentIcon } from './site-home.js';
 import { checklistModel, readWelcome, showChecklist, unsetParts, unsetText, writeWelcome } from './new-site.js';
 import { settle, settleAll } from './skeleton.js';
-import { validRepository } from './source-panel.js';
+import { validBucket, validPrefix, validRepository } from './source-panel.js';
 
 const $ = (id) => document.getElementById(id);
 const error = $('error');
@@ -274,11 +274,71 @@ function showGithubLibraryFields() {
   $('github-repository').required = chosen;
 }
 
+// The approved S3 storage names, as the server gives them: null until they are read.
+let s3Storage = null;
+let s3StorageFailed = false;
+
+function s3LibraryChosen() {
+  return document.querySelector('input[name="library-source"]:checked')?.value === 's3';
+}
+
+/** The submit button is off while S3 storage is chosen but none can be used. */
+function updateSubmitState() {
+  const blocked = s3LibraryChosen() && (s3StorageFailed || s3Storage === null || s3Storage.length === 0);
+  $('new-library-submit').disabled = blocked;
+}
+
+async function showS3LibraryFields() {
+  const chosen = s3LibraryChosen();
+  $('s3-library-fields').hidden = !chosen;
+  $('s3-endpoint').required = chosen;
+  $('s3-bucket').required = chosen;
+  $('s3-key-id').required = chosen;
+  $('s3-secret').required = chosen;
+  if (chosen && s3Storage === null) {
+    const result = await api('GET', '/s3/endpoints');
+    s3StorageFailed = !result.ok || !Array.isArray(result.data);
+    s3Storage = s3StorageFailed ? null : result.data.map((entry) => entry.name);
+    $('s3-endpoint').replaceChildren(...(s3Storage ?? []).map((name) => h('option', { value: name }, name)));
+  }
+  const none = chosen && !s3StorageFailed && (s3Storage ?? []).length === 0;
+  const failed = chosen && s3StorageFailed;
+  showMessage(
+    $('s3-none'),
+    none
+      ? 'An administrator must approve S3 storage under Sharing settings first.'
+      : failed ? 'The approved storage could not be loaded. Choose S3 storage again to retry.' : '',
+  );
+  $('s3-none').hidden = !(none || failed);
+  $('s3-endpoint').hidden = none || failed;
+  updateSubmitState();
+}
+
+/** The sentence for a refused S3 library, in place. */
+function s3ErrorText(result) {
+  if (result.error === 's3_endpoint_not_approved') {
+    return 'That storage is not approved. Ask an administrator to approve it under Sharing settings.';
+  }
+  if (result.error === 's3_place_in_use') return 'Another library already reads that folder of this bucket.';
+  if (typeof result.data?.message === 'string') return result.data.message;
+  return messageFor(result.error);
+}
+
 for (const choice of document.querySelectorAll('input[name="library-source"]')) {
-  choice.addEventListener('change', showGithubLibraryFields);
+  choice.addEventListener('change', () => {
+    showGithubLibraryFields();
+    showS3LibraryFields();
+  });
+}
+
+/** Clears the secret field whenever the dialog closes, however it closes. */
+function clearS3Secret() {
+  $('s3-secret').value = '';
 }
 
 $('new-library-cancel').addEventListener('click', () => $('new-library-dialog').close());
+$('new-library-dialog').addEventListener('close', clearS3Secret);
+addEventListener('pagehide', clearS3Secret);
 $('new-library').addEventListener('submit', async (event) => {
   event.preventDefault();
   const say = (text, field = null) => {
@@ -290,6 +350,7 @@ $('new-library').addEventListener('submit', async (event) => {
   if (!name) {
     return say('Give the library a name.', $('library-name'));
   }
+  if (s3LibraryChosen()) return createS3Library(name, say);
   const fromGithub = githubLibraryChosen();
   const repository = $('github-repository').value.trim();
   if (fromGithub && !validRepository(repository)) {
@@ -323,6 +384,49 @@ $('new-library').addEventListener('submit', async (event) => {
   }
 });
 
+/**
+ * Makes a library read from an S3 bucket. The secret access key is read once, cleared from its
+ * field before the request, and never kept in a variable, storage or an error message.
+ */
+async function createS3Library(name, say) {
+  const bucketField = $('s3-bucket');
+  const prefixField = $('s3-prefix');
+  const keyField = $('s3-key-id');
+  const secretField = $('s3-secret');
+  const endpoint = $('s3-endpoint').value;
+  const bucket = bucketField.value.trim();
+  const prefix = prefixField.value.trim();
+  const keyId = keyField.value.trim();
+  const bucketCheck = validBucket(bucket);
+  if (!bucketCheck.ok) return say(bucketCheck.reason, bucketField);
+  const prefixCheck = validPrefix(prefix);
+  if (!prefixCheck.ok) return say(prefixCheck.reason, prefixField);
+  if (!endpoint) return say('Choose the storage.', $('s3-endpoint'));
+  if (keyId === '') return say('Give the access key ID.', keyField);
+  if (secretField.value === '') return say('Give the secret access key.', secretField);
+  say('');
+  $('new-library-submit').disabled = true;
+  const body = {
+    name,
+    endpoint,
+    bucket,
+    access_key_id: keyId,
+    secret_access_key: secretField.value,
+    kind: $('library-kind').value,
+  };
+  if (prefix) body.prefix = prefix;
+  secretField.value = '';
+  const result = await api('POST', `/sites/${seg(siteId)}/libraries/s3`, body);
+  delete body.secret_access_key;
+  updateSubmitState();
+  if (result.ok) {
+    location.assign(pageFor('library', result.data.id));
+    return;
+  }
+  const field = result.data?.reason === 'prefix' ? prefixField : result.data?.reason === 'bucket' ? bucketField : null;
+  say(`${s3ErrorText(result)} Retype the secret access key before trying again.`, field);
+}
+
 function newLibraryCard() {
   const button = h(
     'button',
@@ -335,7 +439,10 @@ function newLibraryCard() {
     $('library-kind').value = 'document';
     document.querySelector('input[name="library-source"][value="empty"]').checked = true;
     for (const id of ['github-repository', 'github-branch', 'github-folder', 'github-token']) $(id).value = '';
+    for (const id of ['s3-bucket', 's3-prefix', 's3-key-id']) $(id).value = '';
+    clearS3Secret();
     showGithubLibraryFields();
+    showS3LibraryFields();
     showMessage($('new-library-error'), '');
     openDialog($('new-library-dialog'), $('library-name'), button);
   });

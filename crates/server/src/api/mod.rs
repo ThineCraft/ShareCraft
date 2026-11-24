@@ -36,7 +36,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use collab_core::ids::{DocId, NodeId, SessionId, UserId};
-use records::{AccessError, AccountError, FileType, LinkError, RequestError, ScanState};
+use records::{
+    AccessError, AccountError, FileType, LinkError, RequestError, ScanState, SourceKind,
+};
 use serde::de::DeserializeOwned;
 use serde_json::json;
 use uuid::Uuid;
@@ -52,7 +54,7 @@ const MAX_BODY: usize = 16 * 1024;
 const SOURCE_READ_ONLY: &str =
     "This library is kept in step with an outside source, so it cannot be changed here.";
 
-const SOURCE_COPY_UNAVAILABLE: &str = "Files in this library are read from a file share when \
+const SOURCE_COPY_UNAVAILABLE: &str = "Files in this library are read from outside storage when \
 opened and cannot be copied here yet. Download the file instead.";
 
 /// The `/api` routes, to be nested under `/api`. Unknown paths answer `404 {"error":"not_found"}`
@@ -77,6 +79,7 @@ pub(crate) fn router() -> Router<AppState> {
         .route("/sites/{id}/libraries", post(libraries::create))
         .route("/sites/{id}/libraries/github", post(sources::connect))
         .route("/sites/{id}/libraries/share", post(sources::connect_share))
+        .route("/sites/{id}/libraries/s3", post(sources::connect_s3))
         .route(
             "/libraries/{id}/source",
             get(sources::show)
@@ -89,6 +92,8 @@ pub(crate) fn router() -> Router<AppState> {
             "/settings/shares",
             get(settings::shares).put(settings::change_shares),
         )
+        .route("/settings/s3", get(settings::s3).put(settings::change_s3))
+        .route("/s3/endpoints", get(settings::s3_names))
         .route(
             "/libraries/{id}",
             get(libraries::show).patch(libraries::change),
@@ -375,6 +380,19 @@ pub(crate) enum ApiError {
     ShareNotApproved,
     /// 422: the approved folder cannot be listed.
     ShareUnreachable(&'static str),
+    /// 422: the S3 endpoint named is not one an administrator approved (or a built-in
+    /// `aws:<region>`).
+    S3EndpointNotApproved,
+    /// 422: the bucket or the prefix breaks its rules; the reason is `bucket` or `prefix`.
+    InvalidS3Place(&'static str),
+    /// 422: the probe of the bucket failed; the reason is `keys`, `bucket`, `denied`, `region`,
+    /// `clock`, `address` or `offline`, and the message a plain sentence of ours.
+    S3Unreachable(&'static str),
+    /// 422: an entry of the approved S3 endpoints breaks a rule: which entry (its place in the
+    /// list, none when the list itself is refused) and why.
+    InvalidS3Endpoint(Option<usize>, &'static str),
+    /// 409: another library uses the same bucket under an overlapping prefix.
+    S3PlaceInUse,
     /// 422: not an acceptable document or person name.
     InvalidName,
     /// 422: not an acceptable email address.
@@ -403,10 +421,11 @@ pub(crate) enum ApiError {
     /// is created, changed, moved, copied in, deleted or restored here; administrators too.
     /// The answer's `message` says so in words.
     SourceReadOnly,
-    /// 409: the file share cannot currently supply this file. The reason is a stable public
-    /// classification and never operating-system text or a path.
-    SourceUnavailable(&'static str),
-    /// 409: Phase 1 cannot copy a file or folder out of a file-share library.
+    /// 409: the file share or S3 storage cannot currently supply this file. The reason is a
+    /// stable public classification and never operating-system text, a path, a bucket or a key;
+    /// the kind of source picks the message's wording.
+    SourceUnavailable(&'static str, SourceKind),
+    /// 409: Phase 1 cannot copy a file or folder out of a file-share or S3 library.
     SourceCopyUnavailable,
     /// 422: GitHub has no such repository, or the token given (or none) cannot see it; the
     /// answer's `message` says so in words.
@@ -560,6 +579,15 @@ impl ApiError {
             ApiError::ShareUnreachable(_) => {
                 (StatusCode::UNPROCESSABLE_ENTITY, "share_unreachable")
             }
+            ApiError::S3EndpointNotApproved => {
+                (StatusCode::UNPROCESSABLE_ENTITY, "s3_endpoint_not_approved")
+            }
+            ApiError::InvalidS3Place(_) => (StatusCode::UNPROCESSABLE_ENTITY, "invalid_s3_place"),
+            ApiError::S3Unreachable(_) => (StatusCode::UNPROCESSABLE_ENTITY, "s3_unreachable"),
+            ApiError::InvalidS3Endpoint(..) => {
+                (StatusCode::UNPROCESSABLE_ENTITY, "invalid_s3_endpoint")
+            }
+            ApiError::S3PlaceInUse => (StatusCode::CONFLICT, "s3_place_in_use"),
             ApiError::InvalidName => (StatusCode::UNPROCESSABLE_ENTITY, "invalid_name"),
             ApiError::InvalidEmail => (StatusCode::UNPROCESSABLE_ENTITY, "invalid_email"),
             ApiError::InvalidLanguage => (StatusCode::UNPROCESSABLE_ENTITY, "invalid_language"),
@@ -574,10 +602,10 @@ impl ApiError {
             ApiError::SourceExists => (StatusCode::CONFLICT, "source_exists"),
             ApiError::ShareLocationInUse => (StatusCode::CONFLICT, "share_location_in_use"),
             ApiError::SourceReadOnly => (StatusCode::CONFLICT, "source_read_only"),
-            ApiError::SourceUnavailable("offline") => {
+            ApiError::SourceUnavailable("offline", _) => {
                 (StatusCode::SERVICE_UNAVAILABLE, "source_unavailable")
             }
-            ApiError::SourceUnavailable(_) => (StatusCode::CONFLICT, "source_unavailable"),
+            ApiError::SourceUnavailable(..) => (StatusCode::CONFLICT, "source_unavailable"),
             ApiError::SourceCopyUnavailable => (StatusCode::CONFLICT, "source_copy_unavailable"),
             ApiError::RepositoryNotFound => {
                 (StatusCode::UNPROCESSABLE_ENTITY, "repository_not_found")
@@ -673,6 +701,7 @@ impl From<AccessError> for ApiError {
             AccessError::LibraryNotEmpty => ApiError::LibraryNotEmpty,
             AccessError::SourceExists => ApiError::SourceExists,
             AccessError::ShareLocationInUse => ApiError::ShareLocationInUse,
+            AccessError::S3EndpointNotApproved => ApiError::S3EndpointNotApproved,
             AccessError::BlockedFileType(file_type) => ApiError::BlockedFileType(file_type),
             AccessError::FileTooLarge(limit) => ApiError::FileTooLarge(limit),
             AccessError::Held(scan) => ApiError::Held(scan),
@@ -871,6 +900,25 @@ impl IntoResponse for ApiError {
                 "reason": reason,
                 "message": share_unreachable_message(reason),
             }),
+            ApiError::InvalidS3Place(reason) => json!({
+                "error": code,
+                "reason": reason,
+                "message": if reason == "prefix" {
+                    "The prefix must be empty or folder names separated by \"/\", with no empty, \".\" or \"..\" name."
+                } else {
+                    "The bucket name is not one S3 allows: 3 to 63 lower-case letters, digits, dots and hyphens."
+                },
+            }),
+            ApiError::S3Unreachable(reason) => json!({
+                "error": code,
+                "reason": reason,
+                "message": s3_unreachable_message(reason),
+            }),
+            ApiError::InvalidS3Endpoint(entry, reason) => json!({
+                "error": code,
+                "entry": entry,
+                "reason": reason,
+            }),
             ApiError::InvalidTemplate(reason) | ApiError::InvalidLibrarySettings(reason) => {
                 json!({ "error": code, "reason": reason })
             }
@@ -881,10 +929,10 @@ impl IntoResponse for ApiError {
             ApiError::Held(scan) => json!({ "error": code, "scan": scan }),
             ApiError::TooMany(limit) => json!({ "error": code, "limit": limit }),
             ApiError::SourceReadOnly => json!({ "error": code, "message": SOURCE_READ_ONLY }),
-            ApiError::SourceUnavailable(reason) => json!({
+            ApiError::SourceUnavailable(reason, kind) => json!({
                 "error": code,
                 "reason": reason,
-                "message": source_unavailable_message(reason),
+                "message": source_unavailable_message(reason, kind),
             }),
             ApiError::SourceCopyUnavailable => {
                 json!({ "error": code, "message": SOURCE_COPY_UNAVAILABLE })
@@ -915,6 +963,19 @@ impl IntoResponse for ApiError {
     }
 }
 
+/// The plain sentence for a failed probe of a bucket. Never the store's own text.
+fn s3_unreachable_message(reason: &str) -> &'static str {
+    match reason {
+        "keys" => "The S3 storage did not accept the access key and secret.",
+        "bucket" => "The S3 storage has no bucket of that name.",
+        "denied" => "The access key is not allowed to list this bucket or prefix.",
+        "region" => "The bucket is in another region than the endpoint's.",
+        "clock" => "This server's clock differs too much from the S3 storage's.",
+        "address" => "The endpoint's address is not one this server may reach.",
+        _ => "The S3 storage could not be reached. Try again later.",
+    }
+}
+
 fn share_path_message(reason: &str) -> &'static str {
     match reason {
         "relative" => "Enter an absolute server or network path.",
@@ -935,7 +996,34 @@ fn share_unreachable_message(reason: &str) -> &'static str {
     }
 }
 
-fn source_unavailable_message(reason: &str) -> &'static str {
+/// The plain sentence for an unavailable external file: the file-share wording, or for an S3
+/// library the S3 wording. `archived` and `budget` are the same for both.
+fn source_unavailable_message(reason: &str, kind: SourceKind) -> &'static str {
+    if kind == SourceKind::S3 {
+        return match reason {
+            "gone" => "This file is no longer in the library's S3 storage.",
+            "denied" => "The library's S3 access key is not allowed to read this file.",
+            "offline" => {
+                "The library's S3 storage cannot be reached. Files opened before still open; others will open when it is back."
+            }
+            "changing" => {
+                "This file changed in S3 storage while it was being read. Try again in a moment."
+            }
+            "too_large" => {
+                "This file is too large to open from S3 storage with the current cache size."
+            }
+            "not_approved" => {
+                "The S3 endpoint this library uses is no longer approved by an administrator."
+            }
+            "archived" => {
+                "This file is in archive storage and must be restored there before it can be opened."
+            }
+            "budget" => {
+                "This library has used its request budget for the month. Files opened before still open; a library owner can raise the budget."
+            }
+            _ => "This file cannot be read from S3 storage right now.",
+        };
+    }
     match reason {
         "gone" => "The file is no longer available on the file share.",
         "denied" => "The server is not allowed to read this file from the file share.",
@@ -943,6 +1031,12 @@ fn source_unavailable_message(reason: &str) -> &'static str {
         "changing" => "The file changed while it was being read. Try again.",
         "too_large" => "The file is too large to cache from the file share.",
         "not_approved" => "The file share location is no longer approved.",
+        "archived" => {
+            "This file is in archive storage and must be restored there before it can be opened."
+        }
+        "budget" => {
+            "This library has used its request budget for the month. Files opened before still open; a library owner can raise the budget."
+        }
         _ => "The file is unavailable from the file share.",
     }
 }
@@ -1070,6 +1164,7 @@ mod tests {
             upload_idle: Duration::from_secs(60),
             github_api: crate::config::DEFAULT_GITHUB_API.to_owned(),
             source_create_batch_size: crate::config::DEFAULT_SOURCE_CREATE_BATCH_SIZE,
+            s3_plain_loopback: false,
         };
         let store = RevisionStore::open(&crate::library_path(dir)).unwrap();
         let blobs = revisions::BlobStore::open(&crate::blobs_path(dir)).unwrap();

@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>S3 demo script</title>
+<style>
+:root{--fg:#1c1c1c;--bg:#fff;--th:#e4e8ee;--band:#f2f4f7;--note:#fff6d6}
+@media (prefers-color-scheme:dark){:root{--fg:#e8e8e8;--bg:#16181c;--th:#2a2f37;--band:#1f2329;--note:#3a3320}}
+body{font:15px/1.5 system-ui,sans-serif;max-width:960px;margin:2rem auto;padding:0 16px;color:var(--fg);background:var(--bg)}
+table{border-collapse:collapse;width:100%;margin:.5rem 0 1.5rem}th,td{text-align:left;padding:.4rem .6rem;vertical-align:top}
+th{background:var(--th)}tbody tr:nth-child(even){background:var(--band)}code{font-size:.92em}
+.note{background:var(--note);padding:.6rem .8rem;border-radius:4px}
+</style></head><body>
+<h1>S3 surfacing: demo script (Phase 1, read-only, Cloudflare R2)</h1>
+<p>Branch <code>s3-surfacing</code>, worktree <code>H:\Source\repos\ThineCraft\ShareCraft-s3</code>. About 15 minutes. You do every step that touches Cloudflare or types a key; Claude never sees the key.</p>
+
+<p class="note">Cost: R2's free tier covers this (1 million list and 10 million read operations a month, 10 GB stored, no download charge). The library polls the bucket on its check interval, so disconnect the demo library afterwards; the monthly request cap is not enforced yet (deferred Task 12).</p>
+
+<h2>Before the demo (once)</h2>
+<table><thead><tr><th>#</th><th>Step</th><th>Where</th></tr></thead><tbody>
+<tr><td>1</td><td>Create a bucket, for example <code>sharecraft-demo</code>.</td><td>Cloudflare dashboard → R2 → Create bucket</td></tr>
+<tr><td>2</td><td>Upload a few files: <code>Welcome.pdf</code>, <code>Reports/Q3 plan.docx</code>, <code>Reports/a b+c.txt</code> (a space and a plus, to check key decoding), <code>Photos/harbour.jpg</code>. Create an empty folder <code>Empty/</code>.</td><td>The bucket's Objects tab</td></tr>
+<tr><td>3</td><td>Create an API token with <b>Object Read only</b>, limited to that bucket. Keep the Access Key ID and Secret Access Key for step 7; do not paste them into chat.</td><td>R2 → Manage R2 API tokens</td></tr>
+<tr><td>4</td><td>Note the S3 endpoint: <code>https://&lt;account id&gt;.r2.cloudflarestorage.com</code> (shown on the token page). Do not add <code>:443</code>.</td><td>Same page</td></tr>
+</tbody></table>
+
+<h2>The demo</h2>
+<table><thead><tr><th>#</th><th>Step</th><th>What should happen</th></tr></thead><tbody>
+<tr><td>5</td><td>Open the demo server Claude started (address in the hand-over) and sign in as the administrator.</td><td>Home page</td></tr>
+<tr><td>6</td><td>Sharing settings → S3 storage → add an endpoint: name <code>r2</code>, address from step 4, region <code>auto</code>, addressing style path. Save.</td><td>The endpoint is listed; the notes about approved addresses show below it</td></tr>
+<tr><td>7</td><td>On a site: New library → From S3 storage. Storage <code>r2</code>, bucket <code>sharecraft-demo</code>, folder empty, then the access key ID and secret from step 3. Create.</td><td>The library opens with the banner "Listing the bucket…", then "Shows the files in S3 storage. Checked … ago."</td></tr>
+<tr><td>8</td><td>Browse: <code>Reports</code>, <code>Photos</code>, <code>Empty</code>.</td><td>Folders and files match the bucket; <code>Empty</code> shows as an empty folder; <code>a b+c.txt</code> keeps its exact name</td></tr>
+<tr><td>9</td><td>Open <code>Welcome.pdf</code>, preview <code>harbour.jpg</code>, download <code>a b+c.txt</code>.</td><td>Each opens; the first open takes a moment (fetched, scanned, cached), the second is instant</td></tr>
+<tr><td>10</td><td>In the R2 dashboard upload <code>New.txt</code>. Back in ShareCraft, Library settings → Source → Update now (or wait for the check interval).</td><td><code>New.txt</code> appears and opens</td></tr>
+<tr><td>11</td><td>Delete <code>New.txt</code> in R2, then Update now twice.</td><td>It goes to the library's bin after one missed check (grace period)</td></tr>
+<tr><td>12</td><td>Try to rename or upload in the library.</td><td>Refused: the library is read-only</td></tr>
+<tr><td>13</td><td>Library settings → Source: show "Access key ending …, secret set" and Replace key.</td><td>The secret is never shown</td></tr>
+<tr><td>14</td><td>Sign in as the second (non-administrator) account in the other address (<code>localhost</code> vs <code>127.0.0.1</code>), with view access to the library.</td><td>Sees the files and "S3 storage", never the bucket, endpoint or key</td></tr>
+</tbody></table>
+
+<h2>After the demo</h2>
+<table><thead><tr><th>#</th><th>Step</th></tr></thead><tbody>
+<tr><td>15</td><td>Library settings → Source → Disconnect ("Nothing in the bucket is changed"). The polling stops.</td></tr>
+<tr><td>16</td><td>Optionally delete the API token and the bucket in the R2 dashboard.</td></tr>
+</tbody></table>
+
+<h2>What is not in this demo</h2>
+<table><thead><tr><th>Item</th><th>State</th></tr></thead><tbody>
+<tr><td>Monthly request budget enforced by the worker, usage meter saved to the database, pauses</td><td>Deferred (Task 12); counts are kept in memory only</td></tr>
+<tr><td>Budget panel in library settings, default budgets in Sharing settings</td><td>Deferred with Task 12</td></tr>
+<tr><td>Version history from the bucket</td><td>Deferred (Task 13)</td></tr>
+<tr><td>Writing to the bucket (Phase 2)</td><td>Not started</td></tr>
+<tr><td>Amazon S3 and MinIO</td><td>Built to work; checked only against the fake S3 server in tests</td></tr>
+</tbody></table>
+</body></html>

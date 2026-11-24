@@ -61,7 +61,15 @@ import { extendSelection, moveIndex, selectionText, toggleSelection } from './se
 import { settleAll, softly } from './skeleton.js';
 import { createPhotoView } from './photo-view.js';
 import { createPhotoViewer } from './photo-viewer.js';
-import { shouldReload, sourceAccess, sourceControlsEnabled, sourceStateText, sourceSummary } from './source-panel.js';
+import {
+  shouldReload,
+  sourceAccess,
+  sourceControlsEnabled,
+  sourceName,
+  sourceStateText,
+  sourceSummary,
+  unavailableMarkFor,
+} from './source-panel.js';
 
 const BULK_MAX = 500;
 const GRID_PAGE = 200; // the grid's page, the most the server answers at once
@@ -261,6 +269,8 @@ function renderSource() {
   const banner = $('source-banner');
   clearTimeout(sourceTimer);
   sourceTimer = null;
+  $('source-name').hidden = true;
+  $('source-fix').hidden = true;
   banner.hidden = sourceAccessState === 'none';
   if (sourceAccessState === 'none') {
     showAccepts();
@@ -282,6 +292,12 @@ function renderSource() {
   $('source-state').textContent = sourceStateText(source.state);
   $('source-headline').textContent = summary.headline;
   $('source-detail').textContent = summary.detail;
+  // An S3 answer carries the bucket for owners only; its name is shown only when it is there.
+  const s3Bucket = source.kind === 's3' && typeof source.bucket === 'string' && source.bucket !== '';
+  $('source-name').textContent = s3Bucket ? sourceName(source) : '';
+  $('source-name').hidden = !s3Bucket;
+  $('source-fix').hidden = !(s3Bucket && source.state === 'not_connected');
+  if (libraryStep) $('source-fix').href = `/library-settings.html?id=${seg(libraryStep.id)}`;
   $('source-sync').textContent = 'Update now';
   $('source-sync').hidden = !can(here.access, 'manage_site');
   $('source-sync').disabled = ['connecting', 'syncing'].includes(source.state);
@@ -580,6 +596,23 @@ function setupPhotos() {
 }
 
 /** A tile of the grid: the thumbnail (loaded when it comes into view), the name and its marks. */
+/**
+ * The small text marks under an item's name: the shared marks, then the listing's unavailable
+ * reason in words (never colour alone). The unavailable mark has an id the name links describe.
+ */
+function markNodes(item) {
+  const unavailable = unavailableMarkFor(item);
+  return [
+    ...itemMarks(item).map((mark) => h('small', { class: 'mark warn' }, mark)),
+    ...(unavailable ? [h('small', { class: 'mark warn', id: `unavail-${item.id}` }, unavailable)] : []),
+  ];
+}
+
+/** The description of a name link: the unavailable mark's text, when there is one. */
+function describedBy(item) {
+  return unavailableMarkFor(item) === '' ? {} : { 'aria-describedby': `unavail-${item.id}` };
+}
+
 function tile(item) {
   const picture = h('div', { class: 'thumb', 'aria-hidden': 'true' });
   if (item.thumbnail) {
@@ -600,8 +633,8 @@ function tile(item) {
   return h(
     'li',
     {},
-    h('a', { href: pageFor(item.kind, item.id, item.editor), class: 'tile-link' }, picture, h('span', { class: 'tile-name' }, item.name)),
-    h('span', { class: 'tile-foot' }, box, ...itemMarks(item).map((mark) => h('small', { class: 'mark warn' }, mark))),
+    h('a', { href: pageFor(item.kind, item.id, item.editor), class: 'tile-link', ...describedBy(item) }, picture, h('span', { class: 'tile-name' }, item.name)),
+    h('span', { class: 'tile-foot' }, box, ...markNodes(item)),
   );
 }
 
@@ -717,8 +750,8 @@ function row(item) {
           'div',
           { class: 'name-text' },
           // One line with an ellipsis on screen; the whole name stays in the text and the tooltip.
-          h('a', { href: pageFor(item.kind, item.id, item.editor), class: 'name-link', title: item.name }, item.name),
-          ...itemMarks(item).map((mark) => h('small', { class: 'mark warn' }, mark)),
+          h('a', { href: pageFor(item.kind, item.id, item.editor), class: 'name-link', title: item.name, ...describedBy(item) }, item.name),
+          ...markNodes(item),
           // The narrow layout's second line; screen readers get the same from the cells.
           h(
             'span',

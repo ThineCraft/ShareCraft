@@ -729,8 +729,8 @@ pub(crate) async fn copy_one(
     Ok(Copied::from(applied))
 }
 
-/// Refuses Phase 1 copies out of file-share libraries, while preserving GitHub's existing copy
-/// behavior. Access is checked before the source kind is disclosed.
+/// Refuses Phase 1 copies out of file-share and S3 libraries, while preserving GitHub's existing
+/// copy behavior. Access is checked before the source kind is disclosed.
 async fn require_share_copyable_for(db: &Db, user: UserId, node: NodeId) -> Result<(), ApiError> {
     let Some(library) = db
         .source_library_of(node)
@@ -746,7 +746,7 @@ async fn require_share_copyable_for(db: &Db, user: UserId, node: NodeId) -> Resu
     else {
         return Ok(());
     };
-    if source.kind != SourceKind::Share {
+    if !matches!(source.kind, SourceKind::Share | SourceKind::S3) {
         return Ok(());
     }
     if db

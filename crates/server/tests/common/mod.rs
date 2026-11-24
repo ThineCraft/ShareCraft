@@ -38,6 +38,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use uuid::Uuid;
 
 pub mod fake_github;
+pub mod fake_s3;
 pub mod fake_share;
 pub mod live;
 
@@ -553,6 +554,7 @@ pub fn config_at(data_dir: &Path, db: &TestDb) -> Config {
         upload_idle: Duration::from_secs(60),
         github_api: server::config::DEFAULT_GITHUB_API.to_owned(),
         source_create_batch_size: server::config::DEFAULT_SOURCE_CREATE_BATCH_SIZE,
+        s3_plain_loopback: true,
     }
 }
 

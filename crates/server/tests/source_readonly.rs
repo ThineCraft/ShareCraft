@@ -32,21 +32,29 @@ use std::sync::Arc;
 
 use collab_core::ids::{DocId, NodeId};
 use common::fake_github::FakeGithub;
+use common::fake_s3::FakeS3;
 use common::fake_share::FakeShare;
 use common::{FileClient, TestServer, TestUser, spawn_server_config, start_fake_github};
 use protocol::{FileServerMsg, SeatState};
-use records::{NewSource, NodeKind, Principal, SHARE_ROOTS, SourceKind, SourceMode};
+use records::{
+    NewSource, NodeKind, Principal, S3_ENDPOINTS, S3Place, SHARE_ROOTS, SealedRow, SourceKind,
+    SourceMode, Tri, Versioning, s3_location,
+};
 use reqwest::header::CONTENT_RANGE;
 use reqwest::{Method, StatusCode};
 use revisions::BlobRef;
 use serde_json::{Value, json};
 use server::AppState;
-use server::source_sync::sync_once;
+use server::source_sync::{sync_once, token_context};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
 const OWNER: &str = "octo-org";
 const REPO: &str = "docs";
+const S3_BUCKET: &str = "readonly-bucket-5b1";
+const S3_ENDPOINT: &str = "readonly-endpoint-2e8";
+const S3_KEY_ID: &str = "AKIDREADONLYEXAMPLE";
+const S3_SECRET: &str = "planted-readonly-secret-6a3";
 #[cfg(windows)]
 const SHARE_ROOT: &str = r"C:\source-readonly";
 #[cfg(not(windows))]
@@ -118,6 +126,10 @@ const ROUTES: &[(&str, Decision)] = &[
     ),
     (
         "POST /api/sites/{id}/libraries/share",
+        Allowed("makes a new library and connects it; no existing library's files change"),
+    ),
+    (
+        "POST /api/sites/{id}/libraries/s3",
         Allowed("makes a new library and connects it; no existing library's files change"),
     ),
     ("GET /api/libraries/{id}", Read),
@@ -322,6 +334,9 @@ const ROUTES: &[(&str, Decision)] = &[
     ),
     ("GET /api/settings/shares", Read),
     ("PUT /api/settings/shares", Allowed("organisation settings")),
+    ("GET /api/settings/s3", Read),
+    ("GET /api/s3/endpoints", Read),
+    ("PUT /api/settings/s3", Allowed("organisation settings")),
     ("GET /api/nodes/{id}/inheritance/preview", Read),
     ("GET /api/explorer/{root}", Read),
     ("GET /api/explorer/{root}/counts", Read),
@@ -623,7 +638,7 @@ fn a_route_list_guard() {
         unclassified.is_empty() && gone.is_empty(),
         "routes not classified in ROUTES: {unclassified:?}; recorded but not registered: {gone:?}"
     );
-    assert_eq!(routes.len(), 157, "the number of registered routes changed");
+    assert_eq!(routes.len(), 161, "the number of registered routes changed");
     let mut mounts_sorted = mounts.clone();
     mounts_sorted.sort();
     let mut expected: Vec<String> = MOUNTS.iter().map(|m| (*m).to_owned()).collect();
@@ -790,6 +805,7 @@ struct Env {
     server: TestServer,
     fake: FakeGithub,
     share: FakeShare,
+    s3: FakeS3,
     state: AppState,
     admin: TestUser,
     olive: TestUser,
@@ -836,6 +852,9 @@ impl Env {
         let state = server.app_state().await;
         let share = FakeShare::new(SHARE_ROOT);
         state.shares().set_fs(Arc::new(share.clone()));
+        let s3 = FakeS3::start().await;
+        s3.bucket(S3_BUCKET);
+        s3.require_keys(S3_KEY_ID, S3_SECRET);
         let db = server.records_db();
         db.set_setting(admin.id, SHARE_ROOTS, json!([SHARE_ROOT]))
             .await
@@ -848,6 +867,7 @@ impl Env {
             server,
             fake,
             share,
+            s3,
             state,
             admin,
             olive,
@@ -1076,6 +1096,11 @@ impl Env {
                         self.share.put(path, bytes);
                     }
                 }
+                SourceKind::S3 => {
+                    for (path, bytes) in &files {
+                        self.s3.put(S3_BUCKET, path, bytes);
+                    }
+                }
             }
             self.sync(&library).await;
             let top = self.children(&library).await;
@@ -1095,9 +1120,14 @@ impl Env {
                     self.fake.commit("main", &kept);
                     self.sync(&library).await;
                 }
-                SourceKind::Share => {
+                SourceKind::Share | SourceKind::S3 => {
                     for name in BINNED {
-                        self.share.remove(&format!("docs/{name}"));
+                        let path = format!("docs/{name}");
+                        if source == SourceKind::S3 {
+                            self.s3.remove(S3_BUCKET, &path);
+                        } else {
+                            self.share.remove(&path);
+                        }
                     }
                     let library_id = NodeId(library.parse().unwrap());
                     let missing_at = OffsetDateTime::now_utc();
@@ -1161,6 +1191,10 @@ impl Env {
     /// Connects the empty `library` to the fake's `octo-org/docs` branch `main` (the records
     /// API: the HTTP route comes with Task 6).
     async fn connect(&self, library: &str, kind: SourceKind) {
+        if kind == SourceKind::S3 {
+            self.connect_s3(library).await;
+            return;
+        }
         self.server
             .records_db()
             .connect_source(&NewSource {
@@ -1190,6 +1224,67 @@ impl Env {
             })
             .await
             .unwrap();
+    }
+
+    /// Connects the empty `library` to the S3 fake's bucket, with its endpoint approved and the
+    /// key sealed as the S3 suites seal it.
+    async fn connect_s3(&self, library: &str) {
+        let library = NodeId(library.parse().unwrap());
+        let db = self.server.records_db();
+        sqlx::query(
+            "insert into settings (key, value, changed_at) values ($1, $2, now()) \
+             on conflict (key) do update set value = excluded.value",
+        )
+        .bind(S3_ENDPOINTS)
+        .bind(json!([{
+            "name": S3_ENDPOINT,
+            "url": self.s3.origin(),
+            "region": "us-east-1",
+            "path_style": true,
+            "allow": ["127.0.0.0/8"],
+        }]))
+        .execute(db.test_pool())
+        .await
+        .unwrap();
+        let sealed = self
+            .state
+            .secrets()
+            .seal(S3_SECRET.as_bytes(), &token_context(library))
+            .unwrap();
+        let token = db
+            .put_secret(&SealedRow {
+                key_id: sealed.key_id,
+                nonce: sealed.nonce,
+                ciphertext: sealed.ciphertext,
+            })
+            .await
+            .unwrap();
+        let place = S3Place {
+            endpoint: S3_ENDPOINT.to_owned(),
+            bucket: S3_BUCKET.to_owned(),
+            prefix: String::new(),
+            access_key_id: S3_KEY_ID.to_owned(),
+            versioning: Versioning::Unknown,
+            conditional: Tri::Unknown,
+        };
+        db.connect_s3_source(
+            &NewSource {
+                library,
+                kind: SourceKind::S3,
+                owner: String::new(),
+                repo: String::new(),
+                branch: String::new(),
+                folder: String::new(),
+                location: Some(s3_location(S3_ENDPOINT, S3_BUCKET, "")),
+                mode: SourceMode::ReadOnly,
+                token: Some(token),
+                poll_seconds: 300,
+                connected_by: self.admin.id,
+            },
+            &place,
+        )
+        .await
+        .unwrap();
     }
 
     /// The current revision of the document `doc`.
@@ -1538,6 +1633,22 @@ async fn every_write_route_is_refused_in_a_share_library() {
         (&env.olive, "share owner"),
         (&env.admin, "share administrator"),
     ] {
+        for row in ROWS {
+            let answered = env.perform(&fx, user, row.act).await;
+            assert_refused(row.act, who, &answered);
+        }
+    }
+}
+
+/// The same table against an S3 library: every write route refuses for its owner and for an
+/// administrator (the S3 twin of the file-share test above). The table is shared, not copied.
+#[tokio::test]
+async fn every_write_route_is_refused_in_an_s3_library() {
+    let env = Env::new().await;
+    let fx = env
+        .fixture_for(Some(SourceKind::S3), &[&env.olive, &env.admin])
+        .await;
+    for (user, who) in [(&env.olive, "s3 owner"), (&env.admin, "s3 administrator")] {
         for row in ROWS {
             let answered = env.perform(&fx, user, row.act).await;
             assert_refused(row.act, who, &answered);

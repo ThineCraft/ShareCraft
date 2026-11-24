@@ -32,7 +32,10 @@ pub mod photos;
 pub mod previews;
 mod projection;
 mod room;
+pub mod s3;
 pub mod s3_sign;
+pub mod s3_source;
+pub mod s3_xml;
 mod scan;
 pub mod secrets;
 pub mod share;
@@ -145,6 +148,8 @@ struct Shared {
     github: Arc<github::GithubClient>,
     /// File-share reads and their operating-system seam.
     shares: Arc<share::Shares>,
+    /// The S3 client: clients per endpoint and the usage meter.
+    s3: Arc<s3::S3>,
     /// The sync worker's wakes, turns and back-off.
     sources: source_sync::Sources,
 }
@@ -169,6 +174,7 @@ impl AppState {
             .map_err(|e| std::io::Error::other(format!("cannot open the secret key: {e}")))?;
         let github = github::GithubClient::new(&config.github_api)
             .map_err(|e| std::io::Error::other(format!("cannot set up the GitHub client: {e}")))?;
+        let s3 = s3::S3::new(config.s3_plain_loopback);
         Ok(Self {
             shared: Arc::new(Shared {
                 config,
@@ -194,6 +200,7 @@ impl AppState {
                 secrets: Arc::new(secrets),
                 github: Arc::new(github),
                 shares: Arc::new(share::Shares::default()),
+                s3: Arc::new(s3),
                 sources: source_sync::Sources::default(),
             }),
         })
@@ -222,6 +229,12 @@ impl AppState {
     #[must_use]
     pub fn shares(&self) -> &share::Shares {
         &self.shared.shares
+    }
+
+    /// The S3 client: clients per endpoint and the usage meter.
+    #[must_use]
+    pub fn s3(&self) -> &s3::S3 {
+        &self.shared.s3
     }
 
     /// The settings the server runs with.

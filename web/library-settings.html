@@ -62,8 +62,47 @@
 
  <section id="source-section" aria-labelledby="source-heading" hidden>
   <h2 id="source-heading">Source</h2>
-  <p class="meta">This library is kept in step with a GitHub repository. Its files cannot be changed in ShareCraft.</p>
-  <p><strong>Repository</strong><br><span id="source-repository"></span></p>
+  <p class="meta" id="source-intro">This library is kept in step with a GitHub repository. Its files cannot be changed in ShareCraft.</p>
+  <section id="s3-source" aria-label="S3 storage" hidden>
+   <p><strong>Storage</strong><br><span id="s3-storage"></span></p>
+   <p><strong>Bucket</strong><br><span id="s3-bucket"></span></p>
+   <p><strong>Folder in the bucket</strong><br><span id="s3-folder"></span></p>
+   <p><strong>Access key</strong><br><span id="s3-key"></span></p>
+   <p><strong>Earlier versions</strong><br><span id="s3-versioning"></span></p>
+   <form id="s3-settings" class="stack">
+    <div class="field">
+     <label for="s3-poll">Check every (seconds)</label>
+     <input type="number" id="s3-poll" min="60" max="86400" step="1" required aria-describedby="s3-poll-note">
+     <small id="s3-poll-note" class="meta">From 60 seconds to 86,400 seconds.</small>
+    </div>
+    <div class="row">
+     <button type="submit">Save check interval</button>
+     <button type="button" id="s3-update" class="plain">Update now</button>
+     <button type="button" id="s3-key-open" class="plain" aria-expanded="false" aria-controls="s3-key-form">Replace key</button>
+    </div>
+    <p id="s3-saved" role="status" class="msg ok"></p>
+    <p id="s3-error" role="alert" class="msg"></p>
+   </form>
+   <form id="s3-key-form" class="stack" hidden>
+    <h3>Replace key</h3>
+    <p class="meta">Both fields are required. ShareCraft checks the new key before it replaces the old one.</p>
+    <div class="field">
+     <label for="s3-new-key-id">New access key ID</label>
+     <input type="text" id="s3-new-key-id" autocomplete="off" required>
+    </div>
+    <div class="field">
+     <label for="s3-new-secret">New secret access key</label>
+     <input type="password" id="s3-new-secret" autocomplete="off" required aria-describedby="s3-new-secret-note">
+     <small id="s3-new-secret-note" class="meta">Never shown again after it is saved.</small>
+    </div>
+    <div class="row">
+     <button type="submit">Replace key</button>
+     <button type="button" id="s3-key-cancel" class="plain">Cancel</button>
+    </div>
+    <p id="s3-key-error" role="alert" class="msg"></p>
+   </form>
+  </section>
+  <p id="github-repo-line"><strong>Repository</strong><br><span id="source-repository"></span></p>
   <form id="source-settings" class="stack">
    <div class="field">
     <label for="source-branch">Branch</label>
@@ -93,7 +132,7 @@
    <p id="source-error" role="alert" class="msg"></p>
   </form>
 
-  <section class="source-box" aria-labelledby="webhook-heading">
+  <section class="source-box" id="webhook-box" aria-labelledby="webhook-heading">
    <h3 id="webhook-heading">GitHub webhook</h3>
    <p>A webhook updates this library after a push. Its secret is shown only once, when it is created.</p>
    <p id="webhook-state" class="meta"></p>
@@ -108,7 +147,7 @@
 
   <section class="source-box danger-zone" aria-labelledby="disconnect-heading">
    <h3 id="disconnect-heading">Disconnect</h3>
-   <p>Disconnecting stops updates from GitHub. The files stay in this library.</p>
+   <p id="disconnect-text">Disconnecting stops updates from GitHub. The files stay in this library.</p>
    <button type="button" id="source-disconnect" class="danger">Disconnect repository</button>
    <p id="disconnect-error" role="alert" class="msg"></p>
   </section>

@@ -29,10 +29,18 @@ import {
 } from './common.js';
 import { pickImage } from './image-picker.js';
 import { studioLimits } from './look-studio.js';
-import { webhookInstructions } from './source-panel.js';
+import { sourceName, webhookInstructions } from './source-panel.js';
 
 const $ = (id) => document.getElementById(id);
 const error = $('error');
+// The GitHub wording, kept so that showing an S3 library and then a GitHub one restores it exactly.
+const githubIntro = $('source-intro').textContent;
+const githubDisconnect = $('disconnect-text').textContent;
+const githubDisconnectButton = $('source-disconnect').textContent;
+const VERSIONING = {
+  enabled: 'This bucket keeps earlier versions',
+  none: 'This bucket keeps no earlier versions',
+};
 const MISSING = 'This library does not exist, or you do not have access to it.';
 const sourceError = (code) =>
   code === 'invalid_request'
@@ -207,6 +215,19 @@ $('settings').addEventListener('submit', async (event) => {
 function showSource() {
   $('source-section').hidden = source === null;
   if (source === null) return;
+  const s3 = source.kind === 's3';
+  $('source-intro').textContent = s3
+    ? 'This library shows the files in an S3 bucket. Its files cannot be changed in ShareCraft.'
+    : githubIntro;
+  $('disconnect-text').textContent = s3
+    ? 'Disconnecting stops updates from S3 storage. The files stay in this library. Nothing in the bucket is changed.'
+    : githubDisconnect;
+  $('source-disconnect').textContent = s3 ? 'Disconnect' : githubDisconnectButton;
+  $('github-repo-line').hidden = s3;
+  $('source-settings').hidden = s3;
+  $('webhook-box').hidden = s3;
+  $('s3-source').hidden = !s3;
+  if (s3) return showS3Source();
   $('source-repository').textContent = `github.com/${source.repository}`;
   $('source-branch').value = source.branch;
   $('source-folder').value = source.folder ?? '';
@@ -285,6 +306,108 @@ $('source-token-remove').addEventListener('click', async () => {
   showMessage($('source-saved'), 'Token removed. An update has started.');
 });
 
+/** The S3 storage facts, as the server answered them (the key's last four characters only). */
+function showS3Source() {
+  $('s3-storage').textContent = source.endpoint ?? '';
+  $('s3-bucket').textContent = source.bucket ?? '';
+  $('s3-folder').textContent = source.prefix ? source.prefix : '(whole bucket)';
+  $('s3-key').textContent = `Access key ending …${source.key?.id_ends ?? ''} · secret set`;
+  $('s3-versioning').textContent = VERSIONING[source.versioning] ?? 'Not known';
+  $('s3-poll').value = String(source.poll_seconds);
+}
+
+/** A refused S3 change in plain words; the server's own sentence where it gives one. */
+function s3Error(result) {
+  if (result.error === 'invalid_request') return 'Check the access key ID and secret access key, then try again.';
+  if (result.error === 's3_endpoint_not_approved') {
+    return 'This storage is no longer approved by an administrator. Ask an administrator to approve it under Sharing settings.';
+  }
+  if (typeof result.data?.message === 'string') return result.data.message;
+  return messageFor(result.error);
+}
+
+$('s3-settings').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  if (source === null || source.kind !== 's3') return;
+  showMessage($('s3-error'), '');
+  showMessage($('s3-saved'), '');
+  const pollSeconds = Number($('s3-poll').value);
+  if (!Number.isInteger(pollSeconds) || pollSeconds < 60 || pollSeconds > 86_400) {
+    showMessage($('s3-error'), 'Check every must be a whole number from 60 to 86,400 seconds.');
+    $('s3-poll').focus();
+    return;
+  }
+  if (pollSeconds === source.poll_seconds) return showMessage($('s3-saved'), 'Nothing has changed.');
+  const result = await api('PATCH', `/libraries/${seg(libraryId)}/source`, { poll_seconds: pollSeconds });
+  if (!result.ok) return showMessage($('s3-error'), s3Error(result));
+  source = result.data;
+  showSource();
+  showMessage($('s3-saved'), 'Check interval saved.');
+});
+
+$('s3-update').addEventListener('click', async () => {
+  if (source === null || source.kind !== 's3') return;
+  showMessage($('s3-error'), '');
+  showMessage($('s3-saved'), '');
+  const result = await api('POST', `/libraries/${seg(libraryId)}/source/sync`);
+  if (!result.ok) return showMessage($('s3-error'), messageFor(result.error));
+  showMessage($('s3-saved'), 'An update has started.');
+});
+
+function clearKeyForm() {
+  $('s3-new-key-id').value = '';
+  $('s3-new-secret').value = '';
+}
+
+function closeKeyForm() {
+  clearKeyForm();
+  $('s3-key-form').hidden = true;
+  $('s3-key-open').setAttribute('aria-expanded', 'false');
+}
+
+// A page left or restored from the back-forward cache never keeps a typed key.
+addEventListener('pagehide', closeKeyForm);
+
+$('s3-key-open').addEventListener('click', () => {
+  if (!$('s3-key-form').hidden) return closeKeyForm();
+  $('s3-key-form').hidden = false;
+  $('s3-key-open').setAttribute('aria-expanded', 'true');
+  $('s3-new-key-id').focus();
+});
+
+$('s3-key-cancel').addEventListener('click', () => {
+  closeKeyForm();
+  $('s3-key-open').focus();
+});
+
+// The new secret is read once, cleared from its field before the request, and never kept.
+$('s3-key-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  if (source === null || source.kind !== 's3') return;
+  showMessage($('s3-key-error'), '');
+  const keyField = $('s3-new-key-id');
+  const secretField = $('s3-new-secret');
+  if (keyField.value.trim() === '') {
+    showMessage($('s3-key-error'), 'Give the new access key ID.');
+    return keyField.focus();
+  }
+  if (secretField.value === '') {
+    showMessage($('s3-key-error'), 'Give the new secret access key.');
+    return secretField.focus();
+  }
+  const body = { access_key_id: keyField.value.trim(), secret_access_key: secretField.value };
+  clearKeyForm();
+  const result = await api('PATCH', `/libraries/${seg(libraryId)}/source`, body);
+  delete body.secret_access_key;
+  if (!result.ok) {
+    return showMessage($('s3-key-error'), `${s3Error(result)} Retype both fields before trying again.`);
+  }
+  source = result.data;
+  closeKeyForm();
+  showSource();
+  showMessage($('s3-saved'), 'Key replaced. An update has started.');
+});
+
 function hideWebhookSecret() {
   $('webhook-steps').replaceChildren();
   $('webhook-once').textContent = '';
@@ -313,15 +436,22 @@ $('webhook-create').addEventListener('click', async () => {
 $('source-disconnect').addEventListener('click', async () => {
   if (source === null) return;
   showMessage($('disconnect-error'), '');
+  const s3 = source.kind === 's3';
   const sure = await confirmDialog(
-    `Disconnect github.com/${source.repository}? Updates from GitHub stop, but the files stay in this library.`,
-    'Disconnect repository',
+    s3
+      ? `Disconnect ${sourceName(source)}? Updates from S3 storage stop, but the files stay in this library. Nothing in the bucket is changed.`
+      : `Disconnect github.com/${source.repository}? Updates from GitHub stop, but the files stay in this library.`,
+    s3 ? 'Disconnect storage' : 'Disconnect repository',
   );
   if (!sure) return $('source-disconnect').focus();
   const result = await api('DELETE', `/libraries/${seg(libraryId)}/source`);
   if (!result.ok) return showMessage($('disconnect-error'), messageFor(result.error));
   source = null;
   hideWebhookSecret();
+  clearKeyForm();
   showSource();
-  showMessage($('saved'), 'Disconnected from GitHub. The files stay in this library.');
+  showMessage(
+    $('saved'),
+    s3 ? 'Disconnected from S3 storage. The files stay in this library.' : 'Disconnected from GitHub. The files stay in this library.',
+  );
 });
