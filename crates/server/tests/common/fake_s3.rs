@@ -87,6 +87,7 @@ struct Model {
     hung: HashSet<String>,
     truncated: HashMap<String, usize>,
     change_before_get: HashMap<String, Vec<Vec<u8>>>,
+    appear_after_miss: HashMap<String, Vec<u8>>,
     page_size: usize,
     unsorted: bool,
     repeat_token: bool,
@@ -119,6 +120,7 @@ impl Default for Model {
             hung: HashSet::new(),
             truncated: HashMap::new(),
             change_before_get: HashMap::new(),
+            appear_after_miss: HashMap::new(),
             page_size: 1000,
             unsorted: false,
             repeat_token: false,
@@ -327,6 +329,14 @@ impl FakeS3 {
     /// replaced by `bytes`.
     pub fn change_after_head(&self, key: &str, bytes: &[u8]) {
         self.change_before_get(key, bytes);
+    }
+
+    /// The next `HEAD` of `key` is answered as it is (not found, when nothing is there) and the
+    /// key then appears with `bytes`: a new file someone else made between a check and a write.
+    pub fn appear_after_miss(&self, key: &str, bytes: &[u8]) {
+        self.model()
+            .appear_after_miss
+            .insert(key.to_owned(), bytes.to_vec());
     }
 
     /// The store accepts and ignores `If-Match` and `If-None-Match` on a write.
@@ -750,6 +760,11 @@ async fn handle(State(model): State<Arc<Mutex<Model>>>, request: Request) -> Res
         } else {
             None
         };
+        let appears = if kind == "head" {
+            m.appear_after_miss.remove(&key)
+        } else {
+            None
+        };
         if kind == "get" {
             wait = m.slow.get(&key).copied();
         }
@@ -798,6 +813,9 @@ async fn handle(State(model): State<Arc<Mutex<Model>>>, request: Request) -> Res
             ),
             _ => {
                 let Some(object) = b.objects.get(&key).cloned() else {
+                    if let Some(bytes) = appears {
+                        store(b, &key, bytes, now_s(), Opts::default());
+                    }
                     return error(404, "NoSuchKey");
                 };
                 if let Some(bytes) = replacement {
