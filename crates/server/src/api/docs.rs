@@ -223,7 +223,9 @@ pub(crate) async fn open(
             stored_through: collab_core::ids::Seq(0),
         });
     let (scan, threat) = scan_fields(mark);
-    let session = match crate::ws::room_kind_for(&state, document.editor) {
+    // A bucket file's session is never live; if that cannot be told, nothing is answered.
+    let bucket_file = crate::source_write::is_bucket_file(&state, doc).await?;
+    let session = match crate::ws::room_kind_for(&state, document.editor, bucket_file) {
         crate::ws::RoomKind::Live => "live",
         crate::ws::RoomKind::File => "file",
         crate::ws::RoomKind::Text => "text",

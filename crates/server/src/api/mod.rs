@@ -448,10 +448,6 @@ pub(crate) enum ApiError {
     /// 409: a read-and-write S3 library does not take this action yet (rename, move, copy in,
     /// delete, restore, a blank file, a file from a template).
     SourceActionUnavailable,
-    /// 409: a route slice 1 lets through in a read-and-write S3 library, whose write is not
-    /// built yet. Answered as `source_action_unavailable`; removed once every such route
-    /// writes.
-    SourceWriteNotBuilt,
     /// 409: the read-and-write library is read-only until its storage accepts changes again.
     SourceWriteBlocked,
     /// 422: the write probe found that the access key may read the bucket but not write to it.
@@ -646,7 +642,7 @@ impl ApiError {
             ApiError::SourceExists => (StatusCode::CONFLICT, "source_exists"),
             ApiError::ShareLocationInUse => (StatusCode::CONFLICT, "share_location_in_use"),
             ApiError::SourceWritesPending => (StatusCode::CONFLICT, "source_writes_pending"),
-            ApiError::SourceActionUnavailable | ApiError::SourceWriteNotBuilt => {
+            ApiError::SourceActionUnavailable => {
                 (StatusCode::CONFLICT, "source_action_unavailable")
             }
             ApiError::SourceWriteBlocked => (StatusCode::CONFLICT, "source_write_blocked"),
@@ -898,15 +894,10 @@ async fn recheck(state: &AppState, mut docs: Vec<DocId>, only: Option<UserId>) {
     docs.dedup();
     for doc in docs {
         let _in_order = rooms.order_access(doc).await;
-        // A file of a connected library stays read-only whatever role is read (one query per
-        // document; a failure to tell counts as connected).
-        let connected = match db.source_library_of(doc.into()).await {
-            Ok(library) => library.is_some(),
-            Err(e) => {
-                eprintln!("sharecraft-server: database failure: {e}");
-                true
-            }
-        };
+        // The seat's rule (read once per document; a failure to tell gives a read-only seat): a
+        // file of a connected library stays read-only whatever role is read, unless the
+        // library is a read-and-write S3 library whose writes are not blocked.
+        let read_only = !nodes::seat_may_edit(db, doc).await;
         for user in rooms.connected_users(doc).await {
             if only.is_some_and(|only| only != user) {
                 continue;
@@ -918,7 +909,7 @@ async fn recheck(state: &AppState, mut docs: Vec<DocId>, only: Option<UserId>) {
                     None
                 }
             };
-            let access = if connected {
+            let access = if read_only {
                 access.map(nodes::read_only_seat)
             } else {
                 access
@@ -993,7 +984,7 @@ impl IntoResponse for ApiError {
             ApiError::SourceWritesPending => {
                 json!({ "error": code, "message": SOURCE_WRITES_PENDING })
             }
-            ApiError::SourceActionUnavailable | ApiError::SourceWriteNotBuilt => {
+            ApiError::SourceActionUnavailable => {
                 json!({ "error": code, "message": SOURCE_ACTION_UNAVAILABLE })
             }
             ApiError::SourceWriteBlocked => {

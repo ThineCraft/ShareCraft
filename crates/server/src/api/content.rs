@@ -931,7 +931,8 @@ fn file_stream(
 /// Its bytes are reserved against the site's quota before they are handed on (`507
 /// quota_exceeded` when the site has no room); the reservation is given back once the session
 /// answers, the version written having been counted with its commit. A save refused after its
-/// body was stored has that content erased, unless something else names it.
+/// body was stored has that content erased, unless something else names it. A file of a
+/// read-and-write S3 library reserves nothing: its session stages the save for the bucket.
 pub(crate) async fn save(
     State(state): State<AppState>,
     signed: Signed,
@@ -953,11 +954,12 @@ pub(crate) async fn save(
     }
     // A file of a connected library opens with a read-only seat, so nobody holds a token for
     // it; refused in words all the same, before the body is read. A read-and-write library's
-    // file is saved to its store (Task 7).
-    match writable_place(db, user, doc.into()).await? {
-        Place::Ordinary => {}
-        Place::External(_) => return Err(ApiError::SourceWriteNotBuilt),
-    }
+    // file is saved through its session, which stages it for the store: its bytes live there,
+    // so no site quota is reserved or used.
+    let external = match writable_place(db, user, doc.into()).await? {
+        Place::Ordinary => false,
+        Place::External(_) => true,
+    };
     let document = db
         .document(doc)
         .await
@@ -984,29 +986,40 @@ pub(crate) async fn save(
     {
         return Ok(save_answer(refused));
     }
-    let site = site_of(&state, doc.into()).await?;
-    room_for_body(&state, site, &headers).await?;
-    let held = body_blob(&state, request).await?;
-    let (held, reservation) = reserve_held(&state, site, held).await?;
+    let (held, reservation) = if external {
+        (body_blob(&state, request).await?, None)
+    } else {
+        let site = site_of(&state, doc.into()).await?;
+        room_for_body(&state, site, &headers).await?;
+        let held = body_blob(&state, request).await?;
+        let (held, reservation) = reserve_held(&state, site, held).await?;
+        (held, Some(reservation))
+    };
 
     let reply = {
         let state = state.clone();
         to_completion(async move {
             // Moved to another site while the body arrived: judged there.
-            let reservation = match follow_node(&state, reservation, doc.into()).await {
-                Ok(reservation) => reservation,
-                Err(e) => {
-                    discard(&state, held).await;
-                    return Err(e);
-                }
+            let reservation = match reservation {
+                Some(reservation) => match follow_node(&state, reservation, doc.into()).await {
+                    Ok(reservation) => Some(reservation),
+                    Err(e) => {
+                        discard(&state, held).await;
+                        return Err(e);
+                    }
+                },
+                None => None,
             };
             let blob = held.blob();
             let reply = state.rooms().save_file(doc, user, &token, base, blob).await;
-            // Saved or unchanged, a version names the content.
+            // Saved or unchanged, a version (or, for a bucket file, its pending write and the
+            // cache pin) names the content.
             if !matches!(reply, SaveReply::Saved(_) | SaveReply::Unchanged(_)) {
                 discard(&state, held).await;
             }
-            release(state.db(), reservation).await;
+            if let Some(reservation) = reservation {
+                release(state.db(), reservation).await;
+            }
             Ok(reply)
         })
         .await?

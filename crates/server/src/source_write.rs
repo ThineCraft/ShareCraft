@@ -711,6 +711,30 @@ impl Checkpointer for ExternalCheckpointer {
     fn documents(&self) -> Result<Vec<DocId>, GitError> {
         self.git.documents()
     }
+
+    /// The session's last save is not held back by the coalescing wait: its pending write is
+    /// flushed and the writer woken. Spawned, so the ending session does not wait. If the flush
+    /// cannot be recorded, the write still happens once the wait is over.
+    fn session_ended(&self, doc: DocId) {
+        let Some(runtime) = &self.runtime else {
+            return;
+        };
+        let state = self.state.clone();
+        runtime.spawn(async move {
+            match state
+                .db()
+                .flush_write(NodeId(doc.0), OffsetDateTime::now_utc())
+                .await
+            {
+                Ok(true) => state.writes().wake(),
+                Ok(false) => {}
+                Err(e) => eprintln!(
+                    "sharecraft-server: the last save of an ended session was not flushed; it is \
+                     written after the usual wait: {e}"
+                ),
+            }
+        });
+    }
 }
 
 /// The write worker's wake, the blocked libraries it probes again and when it last did, and

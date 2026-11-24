@@ -725,9 +725,6 @@ enum Act {
 /// What a read-and-write S3 library does with a row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum S3rw {
-    /// Slice 1 lets it through; the task named does the write. Until then it answers the
-    /// interim `source_action_unavailable`.
-    Through(&'static str),
     /// Slice 1 lets it through and the change is staged for the bucket: it answers as in an
     /// ordinary library.
     Succeeds,
@@ -735,7 +732,7 @@ enum S3rw {
     Refused(&'static str),
 }
 
-use S3rw::{Refused, Succeeds, Through};
+use S3rw::{Refused, Succeeds};
 
 /// A row: the request, the route it goes to, its status in an ordinary library, and its
 /// decision in a read-and-write S3 library.
@@ -800,12 +797,7 @@ const ROWS: &[Row] = &[
         201,
         UNAVAILABLE,
     ),
-    row(
-        Act::Save,
-        "PUT /api/docs/{id}/content",
-        200,
-        Through("Task 7"),
-    ),
+    row(Act::Save, "PUT /api/docs/{id}/content", 200, Succeeds),
     // In an ordinary library these reach the live room's ticket check: the file has no live
     // room here, so no ticket can be held (403). A connected library refuses them first; a
     // bucket file never opens in a live room.
@@ -1731,9 +1723,8 @@ async fn every_write_route_is_refused_in_an_s3_library() {
 const UNAVAILABLE_MESSAGE: &str = "This cannot be done yet in a library stored in S3. Uploading files, saving and making folders work; renaming, moving, copying and deleting come later.";
 
 /// The table against a read-and-write S3 library, for its owner and for an administrator: a
-/// `Refused` row answers its code now (with its message), and a `Through` row answers the
-/// interim `source_action_unavailable` until the task named in it switches the row to "the
-/// write succeeds".
+/// `Refused` row answers its code (with its message), and a `Succeeds` row answers as in an
+/// ordinary library.
 #[tokio::test]
 async fn every_guarded_route_follows_its_s3_read_write_decision() {
     let env = Env::new().await;
@@ -1756,7 +1747,6 @@ async fn every_guarded_route_follows_its_s3_read_write_decision() {
                     assert_eq!(status.as_u16(), row.ok, "{:?} as {who}: {body}", row.act);
                     continue;
                 }
-                Through(_) | Refused("source_action_unavailable") => "source_action_unavailable",
                 Refused(code) => code,
             };
             if is_bulk(row.act) {
@@ -1780,15 +1770,16 @@ async fn every_guarded_route_follows_its_s3_read_write_decision() {
             assert_eq!(body["message"], message, "{:?} as {who}: {body}", row.act);
         }
     }
-    // Nothing but the uploads and new folders reached the bucket (the finished sessions' files
-    // go to the library's top).
+    // Nothing but the uploads, new folders and saves reached the bucket (the finished sessions'
+    // files go to the library's top).
     for (method, key, _) in env.s3.writes() {
         assert_eq!(method, "PUT", "{key}");
         assert!(
             key.starts_with("docs/uploaded-")
                 || key.starts_with("finish-")
                 || key.starts_with("docs/New folder ")
-                || key == "docs/replace-me.txt",
+                || key == "docs/replace-me.txt"
+                || key == "docs/sheet.xlsx",
             "{key}"
         );
     }
@@ -2134,10 +2125,17 @@ async fn reading_listing_previewing_and_sharing_still_work() {
 /// An editor opened on a file of a connected library joins with a viewer's seat: `can_edit`
 /// false and no token, even for its owner and an administrator, and a save with any token is
 /// refused. An access change while it is open (which reads access afresh) keeps it read-only.
+/// So for a GitHub, a file-share and a read-only S3 library.
 #[tokio::test]
 async fn an_editor_opens_a_connected_file_read_only() {
     let env = Env::new().await;
-    let fx = env.fixture(true, &[]).await;
+    for kind in [SourceKind::Github, SourceKind::Share, SourceKind::S3] {
+        let fx = env.fixture_for(Some(kind), &[]).await;
+        editor_opens_read_only(&env, &fx).await;
+    }
+}
+
+async fn editor_opens_read_only(env: &Env, fx: &Fixture) {
     let sheet = DocId(fx.item("sheet.xlsx").parse().unwrap());
     let mut editors = Vec::new();
     for user in [&env.olive, &env.admin] {

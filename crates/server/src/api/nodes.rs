@@ -16,7 +16,8 @@ use collab_core::ids::{DocId, GroupId, NodeId, UserId};
 use protocol::RemovedReason;
 use records::{
     Access, AccessError, AssignmentView, Crumb, Cursor, Db, Editor, LibraryKind, LinkKind, Listed,
-    Node, NodeKind, PendingState, Perms, Principal, PrincipalView, RoleRef, SourceKind, User,
+    Node, NodeKind, PendingState, Perms, Principal, PrincipalView, RoleRef, SourceKind, SourceMode,
+    User, WriteState,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -122,18 +123,46 @@ pub(crate) fn read_only_seat(access: Access) -> Access {
     Access { perms, ..access }
 }
 
-/// `access`, read for `doc`'s editor seat, made read-only (see [`read_only_seat`]) when `doc`
-/// lies in a connected library. If that cannot be told, it is made read-only too: the safe
-/// side.
-pub(crate) async fn seat_access(db: &Db, doc: DocId, access: Option<Access>) -> Option<Access> {
-    let access = access?;
-    match db.source_library_of(doc.into()).await {
-        Ok(None) => Some(access),
-        Ok(Some(_)) => Some(read_only_seat(access)),
+/// Whether the editor of `doc` may get the editing seat: `doc` lies outside every connected
+/// library, or in a read-and-write S3 library whose writes are not blocked. Any other
+/// connected library (GitHub, file share, read-only S3, blocked) gives a read-only seat
+/// ([`read_only_seat`]). If it cannot be told, the seat is read-only: the safe side. Read
+/// afresh, so a mode switch or a block narrows or widens open seats at the next re-check.
+pub(crate) async fn seat_may_edit(db: &Db, doc: DocId) -> bool {
+    match writable_library(db, doc).await {
+        Ok(may) => may,
         Err(e) => {
             eprintln!("sharecraft-server: database failure: {e}");
-            Some(read_only_seat(access))
+            false
         }
+    }
+}
+
+async fn writable_library(db: &Db, doc: DocId) -> Result<bool, records::DbError> {
+    let Some(library) = db.source_library_of(doc.into()).await? else {
+        return Ok(true);
+    };
+    let read_write = matches!(
+        db.source_of(library).await?,
+        Some((config, _)) if config.kind == SourceKind::S3 && config.mode == SourceMode::ReadWrite
+    );
+    if !read_write {
+        return Ok(false);
+    }
+    Ok(!matches!(
+        db.write_state(library).await?,
+        Some((WriteState::Blocked, _))
+    ))
+}
+
+/// `access`, read for `doc`'s editor seat: as read when the seat may edit (see
+/// [`seat_may_edit`]), otherwise made read-only (see [`read_only_seat`]).
+pub(crate) async fn seat_access(db: &Db, doc: DocId, access: Option<Access>) -> Option<Access> {
+    let access = access?;
+    if seat_may_edit(db, doc).await {
+        Some(access)
+    } else {
+        Some(read_only_seat(access))
     }
 }
 
