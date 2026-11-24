@@ -2214,7 +2214,7 @@ cargo xtask test -j 3 -p records --test sources</code></pre>
 <p class="small">The paragraph above is the record of 19 November 2026. Reading from S3 libraries (Phase 1, read-only) was built after it and is on <code>main</code>; this file does not describe it, and the S3 plan does. The rest of this section records editable S3 storage, slice 1.</p>
 
 <h3>Editable S3 storage, slice 1</h3>
-<p>Built on 24 November 2026 on the branch <code>s3-writes</code>, cut from <code>main</code> at <code>78bfd6a</code>. It is not merged. The branch was pushed and the full GitHub check was green at <code>cc2b88b</code>; one more commit, <code>8788b3f</code>, came from the live check below. The plan is <code>plans/2026-11-24-s3-writes-slice1.html</code> and the scope is <code>plans/2026-11-24-s3-editable-scope.html</code>. Slice 1 is upload, replace, save from an editor and new folder. The shared write path is in <code>crates/server/src/source_write.rs</code> and <code>crates/records/src/source_writes.rs</code>. Everything that changes a bucket is in <code>crates/server/src/s3_write.rs</code> and nowhere else. No file-share write code was written.</p>
+<p>Built on 24 November 2026 on the branch <code>s3-writes</code>, cut from <code>main</code> at <code>78bfd6a</code>. It is not merged. The branch was pushed and the full GitHub check was green at <code>cc2b88b</code> (run 45456975116). One more commit, <code>8788b3f</code>, came from the live check below; it was pushed on 24 November 2026 and its check run (45479777333) was running when this was written. Nothing is merged. The plan is <code>plans/2026-11-24-s3-writes-slice1.html</code> and the scope is <code>plans/2026-11-24-s3-editable-scope.html</code>. Slice 1 is upload, replace, save from an editor and new folder. The shared write path is in <code>crates/server/src/source_write.rs</code> and <code>crates/records/src/source_writes.rs</code>. Everything that changes a bucket is in <code>crates/server/src/s3_write.rs</code> and nowhere else. No file-share write code was written.</p>
 
 <h3>The two modes and who chooses them</h3>
 <div class="table-wrap"><table class="banded"><caption>Modes of an S3 library</caption>
@@ -2252,13 +2252,13 @@ cargo xtask test -j 3 -p records --test sources</code></pre>
 <h3>Limits</h3>
 <ul class="band">
 <li><strong>512 MiB.</strong> One PUT per file, at most 512 MiB. A larger file is refused before any byte is stored, with <code>413 source_file_too_large</code> and a plain message. The limit is the smaller of that, the configured maximum file size and half the cache size. Multipart is slice 2.</li>
-<li><strong>Editor-save coalescing.</strong> An editor save is staged at once and answered with the staged revision, but the bucket gets at most one write per file every 30 seconds, always the latest content. Ending the editor session asks for a flush. Ten quick saves make one write.</li>
+<li><strong>Editor-save coalescing.</strong> An editor save is staged at once and answered with the staged revision, but the bucket gets at most one write per file every 30 seconds, always the latest content. Ending the editor session asks for a flush. Several quick saves make one write (three in the live check).</li>
 <li><strong>Quota.</strong> Uploads and saves into an S3 library use no site quota, because the bytes live in the bucket. Writes are counted by the existing meter. Nothing caps them, and the counts are still not saved to <code>source_usage</code>.</li>
 <li><strong>Secrets and events.</strong> Events carry counts, node ids and library-relative paths only, never the endpoint, bucket, prefix or key. Messages are our own sentences of at most 300 characters.</li>
 </ul>
 
 <h3>Migration 0025</h3>
-<p><code>crates/records/migrations/0025_source_writes.sql</code> adds the pending-writes table (<code>source_writes</code>), the library write state and external upload sessions that reserve no quota. <code>main</code> uses up to 0024. The S3 plan&rsquo;s 0023 and the file-share plan&rsquo;s 0021 were not written. It keeps Phase 1 S3 rows and file-share rows. It is not edited once committed; a later change needs a new numbered file. No installation outside development has applied it.</p>
+<p><code>crates/records/migrations/0025_source_writes.sql</code> adds the pending-writes table (<code>source_writes</code>), the library write state and external upload sessions that reserve no quota. <code>main</code> uses up to 0024. It keeps Phase 1 S3 rows and file-share rows. It is not edited once committed; a later change needs a new numbered file.</p>
 
 <h3>Commands</h3>
 <p>From the worktree root in PowerShell. Local runs are targeted; the full suite runs on GitHub (<code>check.yml</code>). Run one test binary at a time, with at most three build jobs, and every <code>s3_*</code>, <code>share_*</code> and <code>source_*</code> server binary with <code>--test-threads=1</code>. Tests need <code>TEST_DATABASE_URL</code> (PostgreSQL 18) and connect only to 127.0.0.1.</p>
@@ -2275,7 +2275,7 @@ cargo fmt --all
 node --test web/</code></pre>
 
 <h3>What the live check on 24 November 2026 checked</h3>
-<p>The server at <code>cc2b88b</code> ran on a scratch schema against the owner&rsquo;s Cloudflare R2 bucket <code>sharecraft-demo</code>. The check wrote only objects named <code>s3w-check-*</code> at the top level. The controller never created a bucket or token and never saw a secret key.</p>
+<p>The server at <code>cc2b88b</code> ran on a scratch schema against the owner&rsquo;s Cloudflare R2 bucket <code>sharecraft-demo</code>. The check wrote only objects named <code>s3w-check-*</code> at the top level. The owner created the bucket and both tokens (read and write, and read only) and typed every key into the page. The controller created no cloud resource and saw no secret key.</p>
 <div class="table-wrap"><table class="banded"><caption>Checked live</caption>
 <thead><tr><th>Check</th><th>Result</th></tr></thead>
 <tbody>
@@ -2294,14 +2294,14 @@ node --test web/</code></pre>
 <div class="table-wrap"><table class="banded"><caption>Not checked live</caption>
 <thead><tr><th>Not checked</th><th>Note</th></tr></thead>
 <tbody>
-<tr><td>A read-only token on this server</td><td>The owner tested it before connecting read and write, and reported the result. It was not run through ShareCraft.</td></tr>
+<tr><td>A read-only token on this server</td><td>The owner tested it beforehand and reported it. ShareCraft&rsquo;s behaviour with such a token on this build was not checked by the live check.</td></tr>
 <tr><td>An editor save from WordCraft</td><td>GridCraft was used.</td></tr>
-<tr><td>The 512 MiB limit</td><td>Tested only with a lowered limit in automated tests.</td></tr>
+<tr><td>The 512 MiB limit</td><td>Covered by automated tests, not checked live.</td></tr>
 <tr><td>More than one conflict case</td><td>One conflict, one person, was seen. Multi-user naming beyond that was not.</td></tr>
 <tr><td>A store that ignores conditions</td><td>R2 honoured them; that path is covered only by the fake store.</td></tr>
 <tr><td>Recognising a write whose answer was lost, on R2</td><td>The ledger records no live check of R2 returning the metadata header. Without it, a lost answer makes a duplicate conflict copy, never lost data.</td></tr>
 </tbody></table></div>
-<p><strong>Cost.</strong> The live check cost $0.00. It stayed inside R2&rsquo;s free monthly allowance, as read on Cloudflare&rsquo;s pricing page on 24 November 2026, using a few hundred requests and about 3 MB. Prices and allowances change; read the page again before relying on this. The servers were stopped, the scratch schema dropped, and the data folder and launch entry removed. The owner is to revoke the Object Read token; the <code>s3w-check-*</code> objects can be deleted from the bucket.</p>
+<p><strong>Cost.</strong> The live check cost $0.00. It stayed inside R2&rsquo;s free monthly allowance, as read from R2&rsquo;s pricing on 24 November 2026, using a few hundred requests and about 3 MB. Prices and allowances change; read the page again before relying on this. The servers were stopped, the scratch schema dropped, and the data folder and launch entry removed. The owner is to revoke the Object Read token; the <code>s3w-check-*</code> objects can be deleted from the bucket.</p>
 
 <h3>Rulings made while building</h3>
 <ul class="band">
