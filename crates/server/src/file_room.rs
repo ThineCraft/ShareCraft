@@ -1049,6 +1049,7 @@ async fn run(
             break;
         }
     }
+    store.session_ended(doc);
     place.close();
     access_rx.close();
     rx.close();

@@ -33,7 +33,7 @@ import { relativeTime } from './files.js';
 import { libraryCardModel, libraryIcon, ownerChip, recentAcrossLibraries, recentIcon } from './site-home.js';
 import { checklistModel, readWelcome, showChecklist, unsetParts, unsetText, writeWelcome } from './new-site.js';
 import { settle, settleAll } from './skeleton.js';
-import { validBucket, validPrefix, validRepository } from './source-panel.js';
+import { sourceWriteErrorText, validBucket, validPrefix, validRepository } from './source-panel.js';
 
 const $ = (id) => document.getElementById(id);
 const error = $('error');
@@ -314,8 +314,17 @@ async function showS3LibraryFields() {
   updateSubmitState();
 }
 
+/** Only an administrator is offered the choice of read and write; others connect read-only. */
+function showS3ModeChoice() {
+  $('s3-mode-set').hidden = !(me.is_admin === true && s3LibraryChosen());
+}
+
+const s3Mode = () => (me.is_admin === true ? document.querySelector('input[name="s3-mode"]:checked')?.value : null) ?? 'read_only';
+
 /** The sentence for a refused S3 library, in place. */
 function s3ErrorText(result) {
+  const write = sourceWriteErrorText(result.error, result.data);
+  if (write) return write;
   if (result.error === 's3_endpoint_not_approved') {
     return 'That storage is not approved. Ask an administrator to approve it under Sharing settings.';
   }
@@ -328,6 +337,7 @@ for (const choice of document.querySelectorAll('input[name="library-source"]')) 
   choice.addEventListener('change', () => {
     showGithubLibraryFields();
     showS3LibraryFields();
+    showS3ModeChoice();
   });
 }
 
@@ -414,6 +424,7 @@ async function createS3Library(name, say) {
     secret_access_key: secretField.value,
     kind: $('library-kind').value,
   };
+  if (s3Mode() === 'read_write') body.mode = 'read_write';
   if (prefix) body.prefix = prefix;
   secretField.value = '';
   const result = await api('POST', `/sites/${seg(siteId)}/libraries/s3`, body);
@@ -424,8 +435,17 @@ async function createS3Library(name, say) {
     return;
   }
   const field = result.data?.reason === 'prefix' ? prefixField : result.data?.reason === 'bucket' ? bucketField : null;
+  // A key that cannot write: the person may connect the library read-only instead.
+  $('s3-readonly-row').hidden = result.error !== 's3_not_writable';
   say(`${s3ErrorText(result)} Retype the secret access key before trying again.`, field);
 }
+
+$('s3-readonly-instead').addEventListener('click', () => {
+  document.querySelector('input[name="s3-mode"][value="read_only"]').checked = true;
+  $('s3-readonly-row').hidden = true;
+  showMessage($('new-library-error'), 'Read only is chosen. Retype the secret access key, then create the library.');
+  $('s3-secret').focus();
+});
 
 function newLibraryCard() {
   const button = h(
@@ -443,6 +463,9 @@ function newLibraryCard() {
     clearS3Secret();
     showGithubLibraryFields();
     showS3LibraryFields();
+    document.querySelector('input[name="s3-mode"][value="read_only"]').checked = true;
+    $('s3-readonly-row').hidden = true;
+    showS3ModeChoice();
     showMessage($('new-library-error'), '');
     openDialog($('new-library-dialog'), $('library-name'), button);
   });

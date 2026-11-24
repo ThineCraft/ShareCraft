@@ -54,6 +54,23 @@ const MAX_BODY: usize = 16 * 1024;
 const SOURCE_READ_ONLY: &str =
     "This library is kept in step with an outside source, so it cannot be changed here.";
 
+/// The `message` of `409 source_writes_pending`.
+const SOURCE_WRITES_PENDING: &str =
+    "Some changes are still being saved to the storage. Wait for them, or discard them, first.";
+
+/// The `message` of `409 source_action_unavailable`.
+const SOURCE_ACTION_UNAVAILABLE: &str = "This cannot be done yet in a library stored in S3. Uploading files, saving and making folders work; renaming, moving, copying and deleting come later.";
+
+/// The `message` of `409 source_write_blocked`.
+const SOURCE_WRITE_BLOCKED: &str = "This library is read-only until its storage accepts changes again. Its files can still be opened.";
+
+/// The `message` of `422 s3_not_writable`.
+const S3_NOT_WRITABLE: &str = "This access key may read the bucket but not write to it. Connect the library read-only, or use a key that may write.";
+
+/// The `message` of `403 read_write_admin_only`.
+const READ_WRITE_ADMIN_ONLY: &str =
+    "Only an administrator may let people change the files in a bucket.";
+
 const SOURCE_COPY_UNAVAILABLE: &str = "Files in this library are read from outside storage when \
 opened and cannot be copied here yet. Download the file instead.";
 
@@ -87,6 +104,14 @@ pub(crate) fn router() -> Router<AppState> {
                 .delete(sources::disconnect),
         )
         .route("/libraries/{id}/source/sync", post(sources::sync_now))
+        .route(
+            "/libraries/{id}/source/writes/{node}/retry",
+            post(sources::retry_write),
+        )
+        .route(
+            "/libraries/{id}/source/writes/{node}",
+            delete(sources::discard_write),
+        )
         .route("/libraries/{id}/source/webhook", post(sources::webhook))
         .route(
             "/settings/shares",
@@ -417,6 +442,18 @@ pub(crate) enum ApiError {
     SourceExists,
     /// 409: another library uses the same or an overlapping file-share location.
     ShareLocationInUse,
+    /// 409: changes to the library's store are accepted but not yet written, so it is not
+    /// disconnected or made read-only yet.
+    SourceWritesPending,
+    /// 409: a read-and-write S3 library does not take this action yet (rename, move, copy in,
+    /// delete, restore, a blank file, a file from a template).
+    SourceActionUnavailable,
+    /// 409: the read-and-write library is read-only until its storage accepts changes again.
+    SourceWriteBlocked,
+    /// 422: the write probe found that the access key may read the bucket but not write to it.
+    S3NotWritable,
+    /// 403: only an administrator may make a library read and write.
+    ReadWriteAdminOnly,
     /// 409: the library is kept in step with a source (a GitHub repository), so nothing in it
     /// is created, changed, moved, copied in, deleted or restored here; administrators too.
     /// The answer's `message` says so in words.
@@ -449,6 +486,9 @@ pub(crate) enum ApiError {
     /// 413: the file is larger than its library takes; the answer's `limit` is the library's
     /// limit in bytes.
     FileTooLarge(u64),
+    /// 413: the file is larger than one write to S3 storage takes; the answer's `limit` is that
+    /// limit in bytes and its `message` says so in words.
+    SourceFileTooLarge(u64),
     /// 423: the content is held by the malware scanner (waiting for it, failed, too large or
     /// infected), so its bytes are not handed out; the answer's `scan` says which.
     Held(ScanState),
@@ -601,6 +641,13 @@ impl ApiError {
             ApiError::LibraryNotEmpty => (StatusCode::CONFLICT, "library_not_empty"),
             ApiError::SourceExists => (StatusCode::CONFLICT, "source_exists"),
             ApiError::ShareLocationInUse => (StatusCode::CONFLICT, "share_location_in_use"),
+            ApiError::SourceWritesPending => (StatusCode::CONFLICT, "source_writes_pending"),
+            ApiError::SourceActionUnavailable => {
+                (StatusCode::CONFLICT, "source_action_unavailable")
+            }
+            ApiError::SourceWriteBlocked => (StatusCode::CONFLICT, "source_write_blocked"),
+            ApiError::S3NotWritable => (StatusCode::UNPROCESSABLE_ENTITY, "s3_not_writable"),
+            ApiError::ReadWriteAdminOnly => (StatusCode::FORBIDDEN, "read_write_admin_only"),
             ApiError::SourceReadOnly => (StatusCode::CONFLICT, "source_read_only"),
             ApiError::SourceUnavailable("offline", _) => {
                 (StatusCode::SERVICE_UNAVAILABLE, "source_unavailable")
@@ -619,6 +666,9 @@ impl ApiError {
             ApiError::WrongExtension => (StatusCode::UNPROCESSABLE_ENTITY, "wrong_extension"),
             ApiError::BlockedFileType(_) => (StatusCode::UNPROCESSABLE_ENTITY, "blocked_file_type"),
             ApiError::FileTooLarge(_) => (StatusCode::PAYLOAD_TOO_LARGE, "file_too_large"),
+            ApiError::SourceFileTooLarge(_) => {
+                (StatusCode::PAYLOAD_TOO_LARGE, "source_file_too_large")
+            }
             ApiError::Held(_) => (StatusCode::LOCKED, "held"),
             ApiError::Busy => (StatusCode::SERVICE_UNAVAILABLE, "busy"),
             ApiError::NoPreview => (StatusCode::UNSUPPORTED_MEDIA_TYPE, "no_preview"),
@@ -701,6 +751,8 @@ impl From<AccessError> for ApiError {
             AccessError::LibraryNotEmpty => ApiError::LibraryNotEmpty,
             AccessError::SourceExists => ApiError::SourceExists,
             AccessError::ShareLocationInUse => ApiError::ShareLocationInUse,
+            AccessError::WritesPending => ApiError::SourceWritesPending,
+            AccessError::LibraryReadOnly => ApiError::SourceReadOnly,
             AccessError::S3EndpointNotApproved => ApiError::S3EndpointNotApproved,
             AccessError::BlockedFileType(file_type) => ApiError::BlockedFileType(file_type),
             AccessError::FileTooLarge(limit) => ApiError::FileTooLarge(limit),
@@ -842,15 +894,10 @@ async fn recheck(state: &AppState, mut docs: Vec<DocId>, only: Option<UserId>) {
     docs.dedup();
     for doc in docs {
         let _in_order = rooms.order_access(doc).await;
-        // A file of a connected library stays read-only whatever role is read (one query per
-        // document; a failure to tell counts as connected).
-        let connected = match db.source_library_of(doc.into()).await {
-            Ok(library) => library.is_some(),
-            Err(e) => {
-                eprintln!("sharecraft-server: database failure: {e}");
-                true
-            }
-        };
+        // The seat's rule (read once per document; a failure to tell gives a read-only seat): a
+        // file of a connected library stays read-only whatever role is read, unless the
+        // library is a read-and-write S3 library whose writes are not blocked.
+        let read_only = !nodes::seat_may_edit(db, doc).await;
         for user in rooms.connected_users(doc).await {
             if only.is_some_and(|only| only != user) {
                 continue;
@@ -862,7 +909,7 @@ async fn recheck(state: &AppState, mut docs: Vec<DocId>, only: Option<UserId>) {
                     None
                 }
             };
-            let access = if connected {
+            let access = if read_only {
                 access.map(nodes::read_only_seat)
             } else {
                 access
@@ -926,9 +973,27 @@ impl IntoResponse for ApiError {
                 json!({ "error": code, "extension": file_type })
             }
             ApiError::FileTooLarge(limit) => json!({ "error": code, "limit": limit }),
+            ApiError::SourceFileTooLarge(limit) => json!({
+                "error": code,
+                "limit": limit,
+                "message": source_file_too_large_message(limit),
+            }),
             ApiError::Held(scan) => json!({ "error": code, "scan": scan }),
             ApiError::TooMany(limit) => json!({ "error": code, "limit": limit }),
             ApiError::SourceReadOnly => json!({ "error": code, "message": SOURCE_READ_ONLY }),
+            ApiError::SourceWritesPending => {
+                json!({ "error": code, "message": SOURCE_WRITES_PENDING })
+            }
+            ApiError::SourceActionUnavailable => {
+                json!({ "error": code, "message": SOURCE_ACTION_UNAVAILABLE })
+            }
+            ApiError::SourceWriteBlocked => {
+                json!({ "error": code, "message": SOURCE_WRITE_BLOCKED })
+            }
+            ApiError::S3NotWritable => json!({ "error": code, "message": S3_NOT_WRITABLE }),
+            ApiError::ReadWriteAdminOnly => {
+                json!({ "error": code, "message": READ_WRITE_ADMIN_ONLY })
+            }
             ApiError::SourceUnavailable(reason, kind) => json!({
                 "error": code,
                 "reason": reason,
@@ -961,6 +1026,24 @@ impl IntoResponse for ApiError {
         };
         (status, Json(body)).into_response()
     }
+}
+
+/// The plain sentence for a file over the limit of one write to S3 storage: `limit` is said
+/// in the largest unit that holds it exactly (`512 MiB`, `2 KiB`, or bytes).
+fn source_file_too_large_message(limit: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    const GIB: u64 = 1024 * MIB;
+    let words = if limit >= GIB && limit.is_multiple_of(GIB) {
+        format!("{} GiB", limit / GIB)
+    } else if limit >= MIB && limit.is_multiple_of(MIB) {
+        format!("{} MiB", limit / MIB)
+    } else if limit >= KIB && limit.is_multiple_of(KIB) {
+        format!("{} KiB", limit / KIB)
+    } else {
+        format!("{limit} bytes")
+    };
+    format!("Files over {words} cannot be saved to S3 storage yet.")
 }
 
 /// The plain sentence for a failed probe of a bucket. Never the store's own text.
@@ -1074,6 +1157,23 @@ where
 mod tests {
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[test]
+    fn the_size_limit_is_said_in_words() {
+        use super::source_file_too_large_message as words;
+        assert_eq!(
+            words(512 * 1024 * 1024),
+            "Files over 512 MiB cannot be saved to S3 storage yet."
+        );
+        assert_eq!(
+            words(2048),
+            "Files over 2 KiB cannot be saved to S3 storage yet."
+        );
+        assert_eq!(
+            words(10),
+            "Files over 10 bytes cannot be saved to S3 storage yet."
+        );
+    }
 
     use crate::members::builtin_access;
     use collab_core::ids::{ClientId, DocId};

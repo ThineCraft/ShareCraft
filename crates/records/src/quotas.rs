@@ -572,17 +572,27 @@ impl Db {
         }
         let mut tx = self.pool().begin().await?;
         lock_usage(&mut tx, &[before, site]).await?;
-        let size: Option<i64> = sqlx::query_scalar(
-            "select size from upload_sessions where id = $1 and site_id = $2 for update",
+        let found: Option<(i64, bool)> = sqlx::query_as(
+            "select size, external from upload_sessions where id = $1 and site_id = $2 for update",
         )
         .bind(id)
         .bind(before.0)
         .fetch_optional(&mut *tx)
         .await?;
-        let Some(size) = size else {
+        let Some((size, external)) = found else {
             // Ended, or moved by another request meanwhile: that one has settled it.
             return Ok(self.upload_session(id).await?.is_some());
         };
+        if external {
+            // Nothing was reserved for it, so there is nothing to move or to find room for.
+            sqlx::query("update upload_sessions set site_id = $2 where id = $1")
+                .bind(id)
+                .bind(site.0)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            return Ok(true);
+        }
         let there = locked_usage(&mut tx, site).await?;
         if !there.has_room(bytes_of(size)) {
             return Err(QuotaError::Exceeded);
@@ -603,7 +613,8 @@ impl Db {
     pub async fn reset_reservations(&self) -> Result<(), DbError> {
         sqlx::query(
             "update site_usage u set reserved = coalesce( \
-                 (select sum(s.size) from upload_sessions s where s.site_id = u.site_id), 0)",
+                 (select sum(s.size) from upload_sessions s \
+                  where s.site_id = u.site_id and not s.external), 0)",
         )
         .execute(self.pool())
         .await?;

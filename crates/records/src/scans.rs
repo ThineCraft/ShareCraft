@@ -690,6 +690,9 @@ impl Db {
                     coalesce( \
                         (select d.name from blob_refs r join documents d on d.id = r.doc_id \
                          where r.sha256 = b.sha256 order by r.id desc limit 1), \
+                        (select n.name from source_writes w join nodes n on n.id = w.node_id \
+                         where w.sha256 = b.sha256 order by w.staged_at desc, w.node_id \
+                         limit 1), \
                         (select n.name from source_items i join nodes n on n.id = i.node_id \
                          where i.content_sha256 = b.sha256 \
                          order by i.read_at desc nulls last, i.modified_at desc, i.node_id \
@@ -699,7 +702,8 @@ impl Db {
                and coalesce(b.next_scan_at, '-infinity') <= $1 \
                and (exists (select 1 from blob_refs r where r.sha256 = b.sha256) \
                     or exists (select 1 from brand_refs p where p.sha256 = b.sha256) \
-                    or exists (select 1 from source_cache c where c.sha256 = b.sha256)) \
+                    or exists (select 1 from source_cache c where c.sha256 = b.sha256) \
+                    or exists (select 1 from source_writes w where w.sha256 = b.sha256)) \
              order by b.scan_hold desc, b.next_scan_at nulls first, b.sha256 limit $2",
         )
         .bind(now)
@@ -730,7 +734,8 @@ impl Db {
              where b.scan = 'unscanned' \
                and (exists (select 1 from blob_refs r where r.sha256 = b.sha256) \
                     or exists (select 1 from brand_refs p where p.sha256 = b.sha256) \
-                    or exists (select 1 from source_cache c where c.sha256 = b.sha256))",
+                    or exists (select 1 from source_cache c where c.sha256 = b.sha256) \
+                    or exists (select 1 from source_writes w where w.sha256 = b.sha256))",
         )
         .execute(self.pool())
         .await?;

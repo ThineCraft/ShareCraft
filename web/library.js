@@ -64,7 +64,13 @@ import { createPhotoViewer } from './photo-viewer.js';
 import {
   shouldReload,
   sourceAccess,
+  sourceActions,
   sourceControlsEnabled,
+  sourceWriteErrorText,
+  savingMark,
+  mayResolve,
+  discardQuestion,
+  writeCountsText,
   sourceName,
   sourceStateText,
   sourceSummary,
@@ -110,6 +116,10 @@ if (libraryStep) {
   sourceAccessState = 'none';
 }
 const sourceControls = () => sourceControlsEnabled(sourceAccessState);
+// What the library's source leaves open: adding files and folders in a writable bucket, all of
+// it with no source, nothing otherwise. Rename, move, copy and delete stay hidden for a bucket.
+const sourceMay = () => sourceActions(sourceAccessState, source);
+const errorText = (result) => sourceWriteErrorText(result.error, result.data) || messageFor(result.error);
 if (library?.description) {
   $('library-description').textContent = library.description;
   $('library-description').hidden = false;
@@ -173,6 +183,8 @@ let anchor = null; // where Shift+Up or Shift+Down started extending the selecti
 let anchorBase = new Set(); // what was selected when it started
 let inline = null; // the rename in place under way: { id, input }
 let sourceTimer = null; // polls only while the source is connecting or syncing
+let newMenuReady = false; // the New menu's listeners are added once
+let savingTimer = null; // polls the list while a file is being saved to the bucket
 const MAC = isMacPlatform();
 const KEY_MOD = MAC ? { text: 'Command', aria: 'Meta' } : { text: 'Ctrl', aria: 'Control' };
 const UNDO_KEYS = `${KEY_MOD.text}+Z`;
@@ -230,7 +242,7 @@ setupNewMenu();
 addPaletteActions(() => {
   if (!canAdd) return [];
   const actions = [{ key: 'upload-files', label: 'Upload files', detail: `To ${self.name}`, keywords: 'add files', run: () => $('pick-files').click() }];
-  if (library?.folders !== false) actions.push({ key: 'new-folder', label: 'New folder', detail: `In ${self.name}`, keywords: 'create add make folder', run: () => askCreate('folder') });
+  if (library?.folders !== false && sourceMay().folder) actions.push({ key: 'new-folder', label: 'New folder', detail: `In ${self.name}`, keywords: 'create add make folder', run: () => askCreate('folder') });
   return actions;
 });
 $('select-all').addEventListener('change', () => {
@@ -289,20 +301,26 @@ function renderSource() {
   }
   const summary = sourceSummary(source);
   banner.dataset.tone = summary.tone;
-  $('source-state').textContent = sourceStateText(source.state);
+  const blocked = source.kind === 's3' && source.mode === 'read_write' && source.write_state === 'blocked';
+  $('source-state').textContent = blocked ? 'Read only' : sourceStateText(source.state);
   $('source-headline').textContent = summary.headline;
-  $('source-detail').textContent = summary.detail;
+  // "Saving 3 files…" and "2 files could not be saved." follow the banner's own sentence.
+  const counts = source.kind === 's3' && source.mode === 'read_write' ? writeCountsText(source.writes) : '';
+  $('source-detail').textContent = counts ? `${summary.detail} ${counts}` : summary.detail;
   // An S3 answer carries the bucket for owners only; its name is shown only when it is there.
   const s3Bucket = source.kind === 's3' && typeof source.bucket === 'string' && source.bucket !== '';
   $('source-name').textContent = s3Bucket ? sourceName(source) : '';
   $('source-name').hidden = !s3Bucket;
-  $('source-fix').hidden = !(s3Bucket && source.state === 'not_connected');
+  $('source-fix').hidden = !(s3Bucket && (source.state === 'not_connected' || blocked));
+  $('source-fix').textContent = blocked ? 'Try again under Source in the library settings' : 'Check the access key under Source';
   if (libraryStep) $('source-fix').href = `/library-settings.html?id=${seg(libraryStep.id)}`;
   $('source-sync').textContent = 'Update now';
   $('source-sync').hidden = !can(here.access, 'manage_site');
   $('source-sync').disabled = ['connecting', 'syncing'].includes(source.state);
   showAccepts();
-  sourceTimer = ['connecting', 'syncing'].includes(source.state) ? setTimeout(refreshSource, 10_000) : null;
+  // The banner is read again while the source updates and while changes are being saved.
+  const busy = ['connecting', 'syncing'].includes(source.state) || Number(source.writes?.saving) > 0;
+  sourceTimer = busy ? setTimeout(refreshSource, 10_000) : null;
 }
 
 async function refreshSource() {
@@ -315,15 +333,23 @@ async function refreshSource() {
   source = sourceAccessState === 'connected' ? result.data : null;
   if (sourceAccessState === 'unknown') showMessage(error, messageFor(result.error));
   else showMessage(error, '');
+  const couldAdd = canAdd;
   showPlace();
   renderSource();
-  if (sourceAccessState === 'connected' && shouldReload(previous, source)) {
+  // A switch of mode or a block changes what may be added: the New menu follows it.
+  if (couldAdd !== canAdd) setupNewMenu();
+  if (sourceAccessState === 'connected' && (shouldReload(previous, source) || writesSettled(previous, source))) {
     await reload({ preserve: true });
-  } else if (controlsWereEnabled !== sourceControls()) render();
+  } else if (controlsWereEnabled !== sourceControls() || couldAdd !== canAdd) render();
   if (sourceAccessState === 'none') {
     await setupTemplates();
     setupNewMenu();
   }
+}
+
+/** Whether the changes that were being saved are all written (or gone) since the last answer. */
+function writesSettled(previous, next) {
+  return Number(previous?.writes?.saving) > 0 && !(Number(next?.writes?.saving) > 0);
 }
 
 async function updateSourceNow() {
@@ -385,7 +411,7 @@ async function loadPage() {
 /** Adds the page of the listing `result` answered, or says why there is none. */
 function takePage(result) {
   if (!result.ok) {
-    note(messageFor(result.error), true);
+    note(errorText(result), true);
     return;
   }
   items = items.concat(result.data.items);
@@ -424,6 +450,21 @@ function render() {
     );
     again?.focus();
   }
+  watchSaving();
+}
+
+/** While a listed file is still being saved to the bucket the list is read again every few seconds. */
+function watchSaving() {
+  clearTimeout(savingTimer);
+  savingTimer = null;
+  if (!items.some((item) => item.saving === 'saving')) return;
+  savingTimer = setTimeout(async () => {
+    savingTimer = null;
+    // Not while a menu, dialog or rename is open: the rows would be drawn again under it.
+    if (inline || document.querySelector('dialog[open]')) return watchSaving();
+    await reload({ preserve: true });
+    refreshSource();
+  }, 4000);
 }
 
 // ---- sorting the list ----
@@ -604,8 +645,85 @@ function markNodes(item) {
   const unavailable = unavailableMarkFor(item);
   return [
     ...itemMarks(item).map((mark) => h('small', { class: 'mark warn' }, mark)),
+    ...writeNodes(item),
     ...(unavailable ? [h('small', { class: 'mark warn', id: `unavail-${item.id}` }, unavailable)] : []),
   ];
+}
+
+/**
+ * Under a file's name while its change is not yet in the bucket: "Saving…", or "Not saved: why"
+ * with Retry and Discard (in words, never colour alone). The buttons are for the change's author
+ * and the library's owners only: the listing says so in may_resolve.
+ */
+function writeNodes(item) {
+  const text = savingMark(item);
+  if (text === '') return [];
+  if (item.saving === 'saving') return [h('small', { class: 'mark', id: `saving-${item.id}` }, text)];
+  const buttons = mayResolve(item)
+    ? [
+        writeButton(item, 'Retry', () => retryWrite(item)),
+        writeButton(item, 'Discard', () => discardWrite(item)),
+      ]
+    : [];
+  return [
+    h('small', { class: 'mark warn', id: `saving-${item.id}` }, text),
+    ...(buttons.length ? [h('span', { class: 'row-actions' }, ...buttons)] : []),
+  ];
+}
+
+function writeButton(item, label, run) {
+  const button = h(
+    'button',
+    { type: 'button', class: 'plain small', 'aria-label': `${label} ${item.name}`, 'data-write': label.toLowerCase(), 'data-for-write': item.id },
+    label,
+  );
+  button.addEventListener('click', () => run());
+  return button;
+}
+
+/** Retry: the server writes the change again at once; the row shows "Saving…" until it is done. */
+async function retryWrite(item) {
+  const result = await api('POST', `/libraries/${seg(libraryStep.id)}/source/writes/${seg(item.id)}/retry`);
+  if (!result.ok) {
+    showToast(errorText(result), { kind: 'error' });
+    return;
+  }
+  actionsFor = item.id;
+  await reload({ preserve: true });
+  focusRow(item.id);
+}
+
+/** Discard: asks first; a new file is deleted, a changed one shows what the bucket has. */
+async function discardWrite(item) {
+  const isNew = item.external !== true;
+  if (!(await confirmDialog(discardQuestion(isNew), 'Discard'))) {
+    focusWriteButton(item.id, 'discard');
+    return;
+  }
+  const result = await api('DELETE', `/libraries/${seg(libraryStep.id)}/source/writes/${seg(item.id)}`);
+  if (!result.ok) {
+    showToast(errorText(result), { kind: 'error' });
+    focusWriteButton(item.id, 'discard');
+    return;
+  }
+  actionsFor = isNew ? null : item.id;
+  await reload({ preserve: true });
+  refreshSource();
+  focusRow(item.id);
+}
+
+/** Puts focus back on the row's own button, or on the list's title when the row is gone. */
+function focusRow(id) {
+  const rows = [...document.querySelectorAll('#items [data-for], #file-rows [data-for]')];
+  const again = rows.find((button) => button.dataset.for === id);
+  if (again) return again.focus();
+  const title = $('title');
+  title.tabIndex = -1;
+  title.focus();
+}
+
+function focusWriteButton(id, which) {
+  document.querySelector(`button[data-for-write="${CSS.escape(id)}"][data-write="${which}"]`)?.focus();
 }
 
 /** The description of a name link: the unavailable mark's text, when there is one. */
@@ -675,7 +793,7 @@ function thumbnailOptions(picture) {
 // ---- New from template ----
 
 async function setupTemplates() {
-  if (!canAdd || !libraryStep) return;
+  if (!canAdd || !libraryStep || sourceAccessState !== 'none') return;
   const result = await api('GET', `/libraries/${seg(libraryStep.id)}/templates`);
   templates = result.ok ? result.data : [];
   $('create-template').replaceChildren(
@@ -855,7 +973,13 @@ function note(text, isError) {
 function setupNewMenu() {
   $('new-wrap').hidden = !canAdd;
   $('drop-hint').hidden = !canAdd;
-  const entries = newMenu({ folders: library?.folders, editors: docEditors, templates: templates.length });
+  // A bucket takes uploads and folders; a new blank file or a template copy is not offered there.
+  const bucket = sourceAccessState !== 'none';
+  const entries = newMenu({
+    folders: library?.folders !== false && sourceMay().folder,
+    editors: bucket ? [] : docEditors,
+    templates: bucket ? 0 : templates.length,
+  });
   $('new-menu').replaceChildren(
     ...entries.map(({ key, label }) => {
       const entry = h('button', { type: 'button', role: 'menuitem', 'data-key': key }, label);
@@ -863,7 +987,9 @@ function setupNewMenu() {
       return h('li', { role: 'none' }, entry);
     }),
   );
-  setupMenu($('new-button'), $('new-menu'));
+  // The menu's own listeners are added once; later calls only change its entries.
+  if (!newMenuReady) setupMenu($('new-button'), $('new-menu'));
+  newMenuReady = true;
 }
 
 /** What a New menu entry does: a file picker for uploads, otherwise the naming dialog. */
@@ -910,7 +1036,7 @@ $('create-form').addEventListener('submit', async (event) => {
   if (key === 'folder') {
     if (!name) return say('Give the folder a name.');
     const result = await api('POST', `/nodes/${seg(nodeId)}/children`, { kind: 'folder', name });
-    if (!result.ok) return say(messageFor(result.error));
+    if (!result.ok) return say(errorText(result));
     createDialog.close();
     await reload();
     showToast(`Created the folder ${result.data.name}`);
@@ -1064,7 +1190,7 @@ function showPlace() {
   showEntry('explorer-link', can(here.access, 'manage_access'));
   $('explorer-link').href = `/explorer.html?root=${seg(nodeId)}`;
   $('access-link').href = `/access.html?id=${seg(nodeId)}`;
-  canAdd = can(here.access, 'add') && sourceControls();
+  canAdd = can(here.access, 'add') && sourceMay().add;
   showAccepts();
   $('drop-target').textContent = self.name;
   $('new-wrap').hidden = !canAdd;

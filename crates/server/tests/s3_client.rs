@@ -17,8 +17,9 @@ use std::time::Duration;
 use collab_core::ids::NodeId;
 use common::fake_s3::{FakeS3, Opts};
 use records::{S3Endpoint, Versioning};
-use server::s3::{Body, Class, S3, S3Error, S3Target};
+use server::s3::{Body, Class, Cond, PutBody, S3, S3Error, S3Target, SINGLE_PUT_MAX};
 use server::s3_sign::Credentials;
+use server::s3_sign::sha256_hex;
 use server::secrets::Secret;
 use uuid::Uuid;
 
@@ -673,7 +674,7 @@ async fn versioning_is_read_and_an_unsupporting_store_is_unsupported() {
 }
 
 #[tokio::test]
-async fn the_client_sends_no_write() {
+async fn reads_send_no_write() {
     let fake = fake().await;
     fake.require_keys(KEY_ID, SECRET);
     fake.put(BUCKET, "a/k.txt", b"content");
@@ -701,4 +702,371 @@ async fn the_client_sends_no_write() {
             "{request:?}"
         );
     }
+}
+
+/// A file holding `bytes` and the body that sends it.
+fn file_body(bytes: &[u8]) -> (tempfile::NamedTempFile, PutBody) {
+    use sha2::Digest;
+    use std::io::Write;
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    file.write_all(bytes).unwrap();
+    file.flush().unwrap();
+    let body = PutBody {
+        path: Some(file.path().to_path_buf()),
+        size: bytes.len() as u64,
+        sha256: sha2::Sha256::digest(bytes).into(),
+    };
+    (file, body)
+}
+
+fn empty_hash() -> [u8; 32] {
+    use sha2::Digest;
+    sha2::Sha256::digest(b"").into()
+}
+
+#[tokio::test]
+async fn put_round_trips_and_the_store_checks_the_hash() {
+    let fake = fake().await;
+    fake.require_keys(KEY_ID, SECRET);
+    let s3 = client();
+    let t = target(&s3, &fake);
+    // Several 64 KiB pieces.
+    let bytes: Vec<u8> = (0..300_000_u32).map(|n| (n % 251) as u8).collect();
+    let (_file, body) = file_body(&bytes);
+
+    let head = s3
+        .put(&t, "dir/new.bin", &body, Cond::IfAbsent)
+        .await
+        .unwrap();
+    assert_eq!(head.size, 300_000);
+    let stored = fake.object(BUCKET, "dir/new.bin").unwrap();
+    assert_eq!(stored.bytes, bytes);
+    assert_eq!(head.etag, stored.etag);
+    assert_eq!(head.modified_s, stored.modified_s);
+    let (_, got) = s3.get(&t, "dir/new.bin", &head.etag, None).await.unwrap();
+    assert_eq!(read_all(got).await.unwrap(), bytes);
+
+    // A hash that is not the bytes' hash: the store refuses and keeps nothing.
+    let (_other, mut wrong) = file_body(b"some other bytes");
+    wrong.sha256 = [7; 32];
+    assert_eq!(
+        s3.put(&t, "dir/bad.bin", &wrong, Cond::None)
+            .await
+            .unwrap_err(),
+        S3Error::Other
+    );
+    assert!(fake.object(BUCKET, "dir/bad.bin").is_none());
+}
+
+#[tokio::test]
+async fn put_if_absent_refuses_an_existing_key() {
+    let fake = fake().await;
+    fake.put(BUCKET, "k.txt", b"outside");
+    let s3 = client();
+    let t = target(&s3, &fake);
+    let (_f, body) = file_body(b"ours");
+
+    assert_eq!(
+        s3.put(&t, "k.txt", &body, Cond::IfAbsent)
+            .await
+            .unwrap_err(),
+        S3Error::Precondition
+    );
+    assert_eq!(fake.object(BUCKET, "k.txt").unwrap().bytes, b"outside");
+    s3.put(&t, "fresh.txt", &body, Cond::IfAbsent)
+        .await
+        .unwrap();
+    assert_eq!(fake.object(BUCKET, "fresh.txt").unwrap().bytes, b"ours");
+    assert_eq!(
+        fake.writes(),
+        [
+            ("PUT".to_owned(), "k.txt".to_owned(), "absent".to_owned()),
+            (
+                "PUT".to_owned(),
+                "fresh.txt".to_owned(),
+                "absent".to_owned()
+            ),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn put_if_match_refuses_a_changed_object() {
+    let fake = fake().await;
+    fake.put(BUCKET, "k.txt", b"v1");
+    let s3 = client();
+    let t = target(&s3, &fake);
+    let seen = s3.head(&t, "k.txt").await.unwrap();
+    let (_f, body) = file_body(b"ours");
+
+    fake.put(BUCKET, "k.txt", b"changed outside");
+    assert_eq!(
+        s3.put(&t, "k.txt", &body, Cond::IfMatch(&seen.etag))
+            .await
+            .unwrap_err(),
+        S3Error::Precondition
+    );
+    assert_eq!(
+        fake.object(BUCKET, "k.txt").unwrap().bytes,
+        b"changed outside"
+    );
+    // An object that is gone does not match either.
+    assert_eq!(
+        s3.put(&t, "gone.txt", &body, Cond::IfMatch(&seen.etag))
+            .await
+            .unwrap_err(),
+        S3Error::Precondition
+    );
+    // The current tag matches.
+    let now = s3.head(&t, "k.txt").await.unwrap();
+    s3.put(&t, "k.txt", &body, Cond::IfMatch(&now.etag))
+        .await
+        .unwrap();
+    assert_eq!(fake.object(BUCKET, "k.txt").unwrap().bytes, b"ours");
+    assert_eq!(fake.writes().last().unwrap().2, "match");
+}
+
+#[tokio::test]
+async fn a_conflict_answer_is_never_taken_for_success() {
+    let fake = fake().await;
+    let s3 = client();
+    let t = target(&s3, &fake);
+    let (_f, body) = file_body(b"ours");
+
+    fake.fail_next(412, "PreconditionFailed");
+    assert_eq!(
+        s3.put(&t, "a.txt", &body, Cond::None).await.unwrap_err(),
+        S3Error::Precondition
+    );
+    fake.fail_next(409, "ConditionalRequestConflict");
+    assert_eq!(
+        s3.put(&t, "a.txt", &body, Cond::IfAbsent)
+            .await
+            .unwrap_err(),
+        S3Error::Precondition
+    );
+    // Each was sent once; nothing was stored.
+    assert_eq!(fake.count("write"), 2);
+    assert!(fake.object(BUCKET, "a.txt").is_none());
+    // Another 409 is not a conflict.
+    fake.fail_next(409, "OperationAborted");
+    assert_eq!(
+        s3.put(&t, "a.txt", &body, Cond::None).await.unwrap_err(),
+        S3Error::Other
+    );
+}
+
+#[tokio::test]
+async fn put_records_the_content_hash_and_head_reads_it() {
+    let fake = fake().await;
+    fake.put(BUCKET, "plain.txt", b"no hash here");
+    let s3 = client();
+    let t = target(&s3, &fake);
+    let (_f, body) = file_body(b"hashed bytes");
+    let expected = sha256_hex(b"hashed bytes");
+
+    let head = s3.put(&t, "h.txt", &body, Cond::None).await.unwrap();
+    assert_eq!(head.sha256.as_deref(), Some(expected.as_str()));
+    assert_eq!(
+        fake.object(BUCKET, "h.txt").unwrap().sha256.as_deref(),
+        Some(expected.as_str())
+    );
+    assert_eq!(
+        s3.head(&t, "h.txt").await.unwrap().sha256.as_deref(),
+        Some(expected.as_str())
+    );
+    assert_eq!(s3.head(&t, "plain.txt").await.unwrap().sha256, None);
+}
+
+#[tokio::test]
+async fn a_write_is_sent_once_even_when_throttled() {
+    let fake = fake().await;
+    let s3 = client();
+    let t = target(&s3, &fake);
+    let (_f, body) = file_body(b"ours");
+
+    fake.throttle_next(1);
+    assert_eq!(
+        s3.put(&t, "k.txt", &body, Cond::None).await.unwrap_err(),
+        S3Error::Throttled
+    );
+    assert_eq!(fake.count("write"), 1);
+    fake.fail_next(500, "InternalError");
+    assert_eq!(
+        s3.put(&t, "k.txt", &body, Cond::None).await.unwrap_err(),
+        S3Error::Throttled
+    );
+    assert_eq!(fake.count("write"), 2);
+    fake.throttle_next(1);
+    assert_eq!(
+        s3.delete(&t, "k.txt").await.unwrap_err(),
+        S3Error::Throttled
+    );
+    assert_eq!(fake.count("write"), 3);
+    s3.put(&t, "k.txt", &body, Cond::None).await.unwrap();
+    assert_eq!(fake.count("write"), 4);
+}
+
+#[tokio::test]
+async fn content_over_the_single_put_limit_is_refused_before_any_request() {
+    let fake = fake().await;
+    let s3 = client();
+    let t = target(&s3, &fake);
+    assert_eq!(s3.single_put_max(), SINGLE_PUT_MAX);
+    assert_eq!(SINGLE_PUT_MAX, 512 * 1024 * 1024);
+    s3.set_single_put_max_for_tests(10);
+    assert_eq!(s3.single_put_max(), 10);
+
+    let (_f, big) = file_body(b"eleven byte");
+    assert_eq!(
+        s3.put(&t, "big.bin", &big, Cond::None).await.unwrap_err(),
+        S3Error::Unsupported
+    );
+    assert!(fake.requests().is_empty());
+    let (_g, ten) = file_body(b"ten bytes!");
+    s3.put(&t, "ok.bin", &ten, Cond::None).await.unwrap();
+    // Only the PUT and its HEAD went out.
+    assert_eq!(fake.requests().len(), 2);
+
+    // A file whose length is not the declared size is refused too, and a key with a dot
+    // segment is never asked for.
+    let (_h, mut lying) = file_body(b"abc");
+    lying.size = 5;
+    assert_eq!(
+        s3.put(&t, "lie.bin", &lying, Cond::None).await.unwrap_err(),
+        S3Error::Other
+    );
+    assert_eq!(
+        s3.put(&t, "a/../b", &ten, Cond::None).await.unwrap_err(),
+        S3Error::Other
+    );
+    assert_eq!(fake.count("write"), 1);
+}
+
+#[tokio::test]
+async fn a_zero_byte_put_sends_no_body() {
+    let fake = fake().await;
+    fake.require_keys(KEY_ID, SECRET);
+    let s3 = client();
+    let t = target(&s3, &fake);
+    let body = PutBody {
+        path: None,
+        size: 0,
+        sha256: empty_hash(),
+    };
+    let head = s3.put(&t, "dir/", &body, Cond::IfAbsent).await.unwrap();
+    assert_eq!(head.size, 0);
+    assert_eq!(fake.object(BUCKET, "dir/").unwrap().bytes, b"");
+    assert_eq!(fake.last_write_body_len(), Some(0));
+    // No path but a size is a mistake.
+    let odd = PutBody {
+        path: None,
+        size: 3,
+        sha256: empty_hash(),
+    };
+    assert_eq!(
+        s3.put(&t, "odd", &odd, Cond::None).await.unwrap_err(),
+        S3Error::Other
+    );
+}
+
+#[tokio::test]
+async fn delete_removes_an_object_and_a_missing_one_is_fine() {
+    let fake = fake().await;
+    fake.require_keys(KEY_ID, SECRET);
+    fake.put(BUCKET, "gone.txt", b"x");
+    let s3 = client();
+    let t = target(&s3, &fake);
+
+    s3.delete(&t, "gone.txt").await.unwrap();
+    assert!(fake.object(BUCKET, "gone.txt").is_none());
+    s3.delete(&t, "never-was.txt").await.unwrap();
+    assert_eq!(fake.count("write"), 2);
+    assert_eq!(fake.writes()[0].0, "DELETE");
+    // A missing bucket is still an error.
+    let nowhere = s3.target_from(&endpoint(&fake, true), "nowhere", creds(KEY_ID, SECRET));
+    assert_eq!(
+        s3.delete(&nowhere, "k").await.unwrap_err(),
+        S3Error::NoBucket
+    );
+}
+
+#[tokio::test]
+async fn every_write_is_signed_and_counted_with_its_bytes_up() {
+    let fake = fake().await;
+    fake.require_keys(KEY_ID, SECRET);
+    let s3 = client();
+    let library = NodeId(Uuid::new_v4());
+    let t = target(&s3, &fake).with_library(library);
+    let (_a, five) = file_body(b"12345");
+    let (_b, seven) = file_body(b"1234567");
+
+    s3.put(&t, "a", &five, Cond::IfAbsent).await.unwrap();
+    s3.put(&t, "b", &seven, Cond::None).await.unwrap();
+    s3.delete(&t, "a").await.unwrap();
+
+    let usage = s3.take_usage();
+    assert_eq!(usage.len(), 1);
+    let (counted, usage) = usage[0];
+    assert_eq!(counted, library);
+    assert_eq!(usage.write, 3);
+    assert_eq!(usage.bytes_up, 12);
+    // The HEAD after each PUT is a read.
+    assert_eq!(usage.read, 2);
+
+    let sent = fake.requests();
+    let first = &sent[0];
+    assert_eq!(first.method, "PUT");
+    for name in [
+        "authorization",
+        "x-amz-date",
+        "x-amz-content-sha256",
+        "x-amz-meta-sharecraft-sha256",
+        "content-length",
+        "if-none-match",
+        "host",
+    ] {
+        assert!(
+            first.headers.iter().any(|h| h == name),
+            "{name} missing from {first:?}"
+        );
+    }
+    assert!(!sent[2].headers.iter().any(|h| h == "if-none-match"));
+    assert_eq!(sent.iter().filter(|r| r.method == "DELETE").count(), 1);
+}
+
+#[tokio::test]
+async fn a_read_only_key_is_denied_on_each_write() {
+    let fake = fake().await;
+    fake.put(BUCKET, "k.txt", b"v");
+    fake.read_only();
+    let s3 = client();
+    let t = target(&s3, &fake);
+    let (_f, body) = file_body(b"ours");
+
+    assert_eq!(
+        s3.put(&t, "k.txt", &body, Cond::None).await.unwrap_err(),
+        S3Error::Denied
+    );
+    assert_eq!(s3.delete(&t, "k.txt").await.unwrap_err(), S3Error::Denied);
+    assert_eq!(fake.object(BUCKET, "k.txt").unwrap().bytes, b"v");
+    // Reads are untouched.
+    s3.head(&t, "k.txt").await.unwrap();
+}
+
+#[tokio::test]
+async fn a_store_that_ignores_conditions_accepts_both() {
+    let fake = fake().await;
+    fake.put(BUCKET, "k.txt", b"outside");
+    fake.ignore_conditions();
+    let s3 = client();
+    let t = target(&s3, &fake);
+    let (_f, body) = file_body(b"ours");
+
+    s3.put(&t, "k.txt", &body, Cond::IfAbsent).await.unwrap();
+    s3.put(&t, "k.txt", &body, Cond::IfMatch("\"not-the-tag\""))
+        .await
+        .unwrap();
+    assert_eq!(fake.object(BUCKET, "k.txt").unwrap().bytes, b"ours");
+    assert_eq!(fake.count("write"), 2);
 }

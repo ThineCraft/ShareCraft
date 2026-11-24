@@ -804,6 +804,7 @@ body.dragging .drop-overlay{display:flex}
 .sort-arrow{font-size:var(--text-xs);min-width:10px}
 .name-cell{display:flex;align-items:center;gap:var(--space-3);min-width:0}
 .name-text{display:flex;flex:1 1 auto;flex-wrap:wrap;align-items:center;gap:2px var(--space-2);min-width:0}
+.row-actions{display:inline-flex;flex-wrap:wrap;gap:var(--space-1)}
 .files a.name-link{flex:0 1 auto;min-width:0;max-width:100%;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;font-weight:600;color:var(--text);text-decoration:none}
 .files a.name-link:hover,.files a.name-link:focus-visible{color:var(--accent-ink);text-decoration:underline}
 .files .sub{display:none}

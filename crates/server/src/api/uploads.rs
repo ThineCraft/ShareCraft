@@ -56,7 +56,7 @@ use axum::extract::{Path as UrlPath, Query, Request, State};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_RANGE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use collab_core::ids::{DocId, NodeId};
+use collab_core::ids::{DocId, NodeId, UserId};
 use futures_util::StreamExt;
 use records::{
     AccessError, Editor, NameConflict, NewEvent, NewUpload, NodeKind, Perms, QuotaError,
@@ -71,11 +71,13 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use super::content::{Created, create_uploaded, discard, query_of, save_answer};
-use super::nodes::require_not_connected_for;
 use super::{ApiError, JsonBody, parse_id, to_completion};
 use crate::auth::Signed;
 use crate::blobs::{ChannelReader, Held, release};
 use crate::file_room::{FileLink, SaveReply, check_upload, upload_version};
+use crate::source_write::{
+    Place, create_staged, external_path, is_bucket_file, writable_place, write_limit,
+};
 use crate::{AppState, tree};
 
 /// A session that has received nothing for this long is swept.
@@ -366,10 +368,16 @@ pub(crate) async fn store_version(
     held: Held,
 ) -> SaveReply {
     let blob = held.blob();
+    // When the records cannot say which store the file lives in, no session is opened: a
+    // bucket file must never be saved to Git.
+    let Ok(bucket_file) = is_bucket_file(state, doc).await else {
+        discard(state, held).await;
+        return SaveReply::Failed;
+    };
     // A session that ended before taking the upload wrote nothing for it; it is opened again.
     let mut reply = SaveReply::Failed;
     for _ in 0..SESSION_ATTEMPTS {
-        let link = session_of(state, doc, name);
+        let link = session_of(state, doc, name, bucket_file);
         if let Ok(answer) =
             upload_version(&link, user.id, user.name.clone(), base.clone(), blob).await
         {
@@ -397,22 +405,36 @@ pub(crate) async fn start(
         return Err(ApiError::InvalidRequest);
     }
     if body.size > state.config().max_file_bytes {
+        // Into a bucket the limit is said in words; an ordinary place answers as before.
+        if let Some(Ok(Place::External(_))) = place_asked(&state, user.id, &body).await {
+            let limit = write_limit(&state)
+                .await
+                .map_err(|e| ApiError::unavailable(&e))?;
+            return Err(ApiError::SourceFileTooLarge(limit));
+        }
         return Err(ApiError::TooLarge);
     }
     let sha256 = parse_hex(&body.sha256.to_ascii_lowercase()).ok_or(ApiError::InvalidRequest)?;
     let on_conflict = conflict_choice(body.on_conflict.as_deref())?;
     let mut renamed = None;
     let db = state.db();
-    let (target, name, base, site) = match (body.parent, body.doc) {
+    let (target, name, base, site, external) = match (body.parent, body.doc) {
         (Some(parent), None) => {
             let parent = NodeId(parse_id(&parent)?);
-            require_not_connected_for(db, user.id, parent).await?;
+            let place = writable_place(db, user.id, parent).await?;
             let asked = body.name.ok_or(ApiError::BadRequest)?;
             if body.base.is_some() {
                 return Err(ApiError::BadRequest);
             }
             let (name, editor, from) = clean_upload_name(&asked)?;
             renamed = from;
+            // Into a bucket the name must make a key the bucket takes and the listing shows,
+            // and the file must fit one write.
+            let external = matches!(place, Place::External(_));
+            if external {
+                external_path(&state, parent, &name).await?;
+                refuse_over_limit(&state, body.size).await?;
+            }
             let size = Some(body.size);
             match tree::check_create_document(&state, &user, parent, &name, editor, size).await {
                 // A name taken now is settled when the upload finishes.
@@ -427,16 +449,20 @@ pub(crate) async fn start(
                 .map_err(|e| ApiError::unavailable(&e))?
                 .ok_or(ApiError::NotFound)?
                 .site;
-            (UploadTarget::NewFile { parent }, name, None, site)
+            (UploadTarget::NewFile { parent }, name, None, site, external)
         }
         (None, Some(doc)) => {
             let doc = DocId(parse_id(&doc)?);
-            require_not_connected_for(db, user.id, doc.into()).await?;
+            let place = writable_place(db, user.id, doc.into()).await?;
+            let external = matches!(place, Place::External(_));
             let base = match &body.base {
                 Some(text) => Some(RevisionId::from_str(text).map_err(|_| ApiError::BadRequest)?),
                 None => None,
             };
             let name = check_new_version(&state, &user, doc).await?;
+            if external {
+                refuse_over_limit(&state, body.size).await?;
+            }
             tree::check_policies(db, doc.into(), &name, Some(body.size)).await?;
             if let Some(refused) = ask_check(&state, doc, &name, base.clone()).await? {
                 return Ok(save_answer(refused));
@@ -447,7 +473,7 @@ pub(crate) async fn start(
                 .map_err(|e| ApiError::unavailable(&e))?
                 .ok_or(ApiError::NotFound)?
                 .site;
-            (UploadTarget::NewVersion { doc }, name, base, site)
+            (UploadTarget::NewVersion { doc }, name, base, site, external)
         }
         _ => return Err(ApiError::BadRequest),
     };
@@ -465,6 +491,8 @@ pub(crate) async fn start(
             sha256,
             base: base_text.as_deref(),
             on_conflict: on_conflict.filter(|_| matches!(target, UploadTarget::NewFile { .. })),
+            // The bytes will live in the bucket: no quota is checked or reserved for them.
+            external,
         })
         .await
         .map_err(|e| match e {
@@ -533,9 +561,10 @@ async fn check_new_version(state: &AppState, user: &User, doc: DocId) -> Result<
     Ok(document.name)
 }
 
-/// The file session of `doc` (named `name`), opened if needed.
-fn session_of(state: &AppState, doc: DocId, name: &str) -> FileLink {
-    state.open_file_room(doc, name.to_owned())
+/// The file session of `doc` (named `name`), opened if needed: for a `bucket_file` (see
+/// [`is_bucket_file`]), one that saves to the bucket.
+fn session_of(state: &AppState, doc: DocId, name: &str, bucket_file: bool) -> FileLink {
+    state.open_file_room(doc, name.to_owned(), bucket_file)
 }
 
 /// Asks `doc`'s file session whether it would take a new version made from `base` now (see
@@ -546,9 +575,11 @@ async fn ask_check(
     name: &str,
     base: Option<RevisionId>,
 ) -> Result<Option<SaveReply>, ApiError> {
+    let bucket_file = is_bucket_file(state, doc).await?;
     for _ in 0..SESSION_ATTEMPTS {
         // A session that ended meanwhile is opened again.
-        if let Ok(answer) = check_upload(&session_of(state, doc, name), base.clone()).await {
+        let link = session_of(state, doc, name, bucket_file);
+        if let Ok(answer) = check_upload(&link, base.clone()).await {
             return Ok(answer);
         }
     }
@@ -588,15 +619,57 @@ async fn refuse_archived(state: &AppState, session: &UploadSession) -> Result<()
     Ok(())
 }
 
-/// `409 source_read_only` if the session's file goes into a library connected to a source
-/// (connected after the session started, while the library was empty). Sending to it and
-/// finishing it are refused; abandoning it is not.
-async fn refuse_connected(state: &AppState, session: &UploadSession) -> Result<(), ApiError> {
+/// The place a request that has not been checked yet asks for, if it names one: `None` when
+/// it names no node or one that is no id.
+async fn place_asked(
+    state: &AppState,
+    user: UserId,
+    body: &StartBody,
+) -> Option<Result<Place, ApiError>> {
+    let asked = body.parent.as_deref().or(body.doc.as_deref())?;
+    let node = NodeId(parse_id(asked).ok()?);
+    Some(writable_place(state.db(), user, node).await)
+}
+
+/// `413 source_file_too_large` when a file of `size` bytes does not fit one write to a bucket:
+/// the limit is said in words.
+async fn refuse_over_limit(state: &AppState, size: u64) -> Result<(), ApiError> {
+    let limit = write_limit(state)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?;
+    if size > limit {
+        return Err(ApiError::SourceFileTooLarge(limit));
+    }
+    Ok(())
+}
+
+/// The [`Place`] the session's file goes into now; `409 source_read_only` if it goes into a
+/// library connected to a source that takes no changes (connected after the session started,
+/// while the library was empty, or switched to read-only since). Sending to it and finishing it
+/// are refused; abandoning it is not. A session started for a bucket (no quota reserved) whose
+/// library is no longer one is refused too: its bytes were never counted against the site.
+async fn refuse_connected(state: &AppState, session: &UploadSession) -> Result<Place, ApiError> {
     let place = match session.target {
         UploadTarget::NewFile { parent } => parent,
         UploadTarget::NewVersion { doc } => doc.into(),
     };
-    require_not_connected_for(state.db(), session.owner, place).await
+    let found = writable_place(state.db(), session.owner, place).await?;
+    if session.external && found == Place::Ordinary {
+        return Err(ApiError::SourceActionUnavailable);
+    }
+    Ok(found)
+}
+
+/// Gives back what a finished session still held reserved: nothing for a session started for a
+/// bucket, which reserved no quota.
+async fn release_unless_external(
+    state: &AppState,
+    session: &UploadSession,
+    reservation: Reservation,
+) {
+    if !session.external {
+        release(state.db(), reservation).await;
+    }
 }
 
 /// Abandons the upload session `id`, whoever it belongs to, once any request on it is done:
@@ -940,7 +1013,8 @@ pub(crate) async fn finish(
     let user = signed.session.user;
     let session = owned(&state, id, &user).await?;
     refuse_archived(&state, &session).await?;
-    refuse_connected(&state, &session).await?;
+    let place = refuse_connected(&state, &session).await?;
+    let external = matches!(place, Place::External(_));
     to_completion(async move {
         let turn = state.uploads().turn(id);
         let mut progress = turn.lock().await;
@@ -990,10 +1064,10 @@ pub(crate) async fn finish(
         match session.target {
             UploadTarget::NewFile { parent } => {
                 let choice = choice.or(session.on_conflict);
-                finish_new_file(&state, &user, &session, parent, blob, choice).await
+                finish_new_file(&state, &user, &session, parent, blob, choice, external).await
             }
             UploadTarget::NewVersion { doc } => {
-                finish_new_version(&state, &user, &session, doc, blob).await
+                finish_new_version(&state, &user, &session, doc, blob, external).await
             }
         }
     })
@@ -1073,6 +1147,7 @@ async fn finish_new_file(
     parent: NodeId,
     blob: BlobRef,
     choice: Option<NameConflict>,
+    external: bool,
 ) -> Result<Response, ApiError> {
     let editor = Editor::for_file_name(&session.name);
     let size = Some(session.size);
@@ -1090,17 +1165,26 @@ async fn finish_new_file(
             renamed,
         } => (name, editor, renamed),
         Named::Replace { doc, name, base } => {
-            return save_upload(state, user, session, doc, &name, base, blob).await;
+            return save_upload(state, user, session, (doc, &name, base), blob, external).await;
         }
         Named::Taken { .. } | Named::Skip | Named::Refused(_) => {
             return Err(ApiError::Unavailable);
         }
     };
+    if external {
+        // The name is judged again: it may be one the bucket or the listing would refuse.
+        external_path(state, parent, &name).await?;
+    }
     let (held, reservation) = adopt(state, session, blob).await?;
     let keep_both = choice == Some(NameConflict::KeepBoth);
-    let created = create_uploaded(state, user, parent, &name, editor, held, keep_both).await;
+    let created = if external {
+        // Staged for the bucket, written at once: no quota is used.
+        create_staged(state, user, parent, &name, editor, held, keep_both).await
+    } else {
+        create_uploaded(state, user, parent, &name, editor, held, keep_both).await
+    };
     // A version written was counted with its commit.
-    release(state.db(), reservation).await;
+    release_unless_external(state, session, reservation).await;
     Ok(match created? {
         Created::Done { doc, mut body } => {
             completed(state, user, doc, session, false);
@@ -1119,6 +1203,7 @@ async fn finish_new_version(
     session: &UploadSession,
     doc: DocId,
     blob: BlobRef,
+    external: bool,
 ) -> Result<Response, ApiError> {
     let name = check_new_version(state, user, doc).await?;
     tree::check_policies(state.db(), doc.into(), &name, Some(session.size)).await?;
@@ -1133,25 +1218,36 @@ async fn finish_new_version(
         }
         return Ok(save_answer(refused));
     }
-    save_upload(state, user, session, doc, &name, base, blob).await
+    save_upload(state, user, session, (doc, &name, base), blob, external).await
 }
 
 /// Saves the session's content `blob` as a new version of `doc` (named `name`) made from
-/// `base`, through the document's file session, once its bytes are claimed against the quota.
+/// `base` (together `version`), through the document's file session, once its bytes are
+/// claimed against the quota. For a file of a bucket (`external`) the session stages the change
+/// and no quota is used; it is written at once, not after the coalescing wait.
 async fn save_upload(
     state: &AppState,
     user: &User,
     session: &UploadSession,
-    doc: DocId,
-    name: &str,
-    base: Option<RevisionId>,
+    (doc, name, base): (DocId, &str, Option<RevisionId>),
     blob: BlobRef,
+    external: bool,
 ) -> Result<Response, ApiError> {
     let (held, reservation) = adopt(state, session, blob).await?;
     let reply = store_version(state, user, doc, name, base, held).await;
     // A version written was counted with its commit.
-    release(state.db(), reservation).await;
+    release_unless_external(state, session, reservation).await;
     if matches!(reply, SaveReply::Saved(_)) {
+        if external {
+            if let Err(e) = state
+                .db()
+                .flush_write(doc.into(), OffsetDateTime::now_utc())
+                .await
+            {
+                eprintln!("sharecraft-server: database failure: {e}");
+            }
+            state.writes().wake();
+        }
         completed(state, user, doc, session, true);
     }
     Ok(save_answer(reply))

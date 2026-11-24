@@ -1,4 +1,6 @@
-// Pure wording and validation for libraries connected to a GitHub repository.
+// Pure wording and validation for libraries connected to a GitHub repository or an S3 bucket.
+
+import { formatSize } from './common.js';
 
 const READ_ONLY = 'This library cannot be changed here.';
 const LAST_UPDATE = `Files shown are from the last update. ${READ_ONLY}`;
@@ -19,6 +21,24 @@ export function sourceAccess(result) {
 /** Source-managed libraries and uncertain source lookups are both read-only. */
 export function sourceControlsEnabled(access) {
   return access === 'none';
+}
+
+const NO_ACTIONS = { add: false, folder: false, rename: false, move: false, remove: false, copy: false };
+
+/** Whether a connected S3 library accepts changes now: read and write, and not blocked. */
+export function s3Writable(source) {
+  return source?.kind === 's3' && source.mode === 'read_write' && source.write_state !== 'blocked';
+}
+
+/**
+ * What a person may do here, as far as the library's source goes: everything in a library with
+ * no source; adding files and folders in a writable, unblocked S3 library; nothing otherwise.
+ * (The server decides who may add; this only leaves out what it would refuse.)
+ */
+export function sourceActions(access, source) {
+  if (access === 'none') return { add: true, folder: true, rename: true, move: true, remove: true, copy: true };
+  if (access === 'connected' && s3Writable(source)) return { ...NO_ACTIONS, add: true, folder: true };
+  return { ...NO_ACTIONS };
 }
 
 /** Whether a refreshed source status means the visible folder may have changed. */
@@ -71,15 +91,34 @@ function rateLimitTime(error) {
 /** The S3 headline, supporting sentence and tone for an S3 library; the budget pause wins over the state. */
 function s3Summary(source, now) {
   const state = source.state;
+  const writable = source.mode === 'read_write';
+  const blocked = writable && source.write_state === 'blocked';
+  // A library that takes changes does not say it cannot be changed.
+  const lastUpdate = writable ? 'Files shown are from the last update.' : LAST_UPDATE;
+  const readOnlyEnd = writable ? '' : ` ${READ_ONLY}`;
   if (source.paused) {
     return {
       headline: 'This library has used its request budget for the month. Files opened before still open.',
-      detail: LAST_UPDATE,
+      detail: lastUpdate,
+      tone: 'attention',
+    };
+  }
+  if (blocked) {
+    return {
+      headline: 'Read-only until fixed: the storage refused a change.',
+      detail: sentence(source.write_error) || 'Nothing more is known. Try again from the library settings.',
       tone: 'attention',
     };
   }
   if (state === 'ok') {
     const age = relativeTime(source.last_checked_at, now);
+    if (writable) {
+      return {
+        headline: 'Stored in S3 storage.',
+        detail: `${age ? `Checked ${age}. ` : ''}Changes you make here are saved to the bucket.`,
+        tone: 'ok',
+      };
+    }
     return {
       headline: 'Shows the files in S3 storage.',
       detail: `${age ? `Checked ${age}. ` : ''}Files open from the bucket when you ask for them; this library cannot be changed here.`,
@@ -89,7 +128,7 @@ function s3Summary(source, now) {
   if (state === 'connecting') {
     return {
       headline: sourceStateText(state),
-      detail: `Files will appear after the first listing. ${READ_ONLY}`,
+      detail: `Files will appear after the first listing.${readOnlyEnd}`,
       tone: 'working',
     };
   }
@@ -99,21 +138,21 @@ function s3Summary(source, now) {
       headline: Number.isFinite(files) && files >= 0
         ? `Listing the bucket… ${files.toLocaleString('en-GB')} files so far`
         : 'Listing the bucket…',
-      detail: LAST_UPDATE,
+      detail: lastUpdate,
       tone: 'working',
     };
   }
   if (state === 'not_connected') {
-    return { headline: 'The storage refused the access key.', detail: LAST_UPDATE, tone: 'attention' };
+    return { headline: 'The storage refused the access key.', detail: lastUpdate, tone: 'attention' };
   }
   if (state === 'failed' || state === 'rate_limited') {
     return {
       headline: 'The storage could not be reached. Files already opened still open.',
-      detail: LAST_UPDATE,
+      detail: lastUpdate,
       tone: 'attention',
     };
   }
-  return { headline: sourceStateText(state), detail: LAST_UPDATE, tone: 'attention' };
+  return { headline: sourceStateText(state), detail: lastUpdate, tone: 'attention' };
 }
 
 /** The headline, supporting sentence and non-colour tone for a connected-library banner. */
@@ -223,4 +262,104 @@ export function webhookInstructions(webhook, secret) {
     `Secret: ${secret ?? ''}`,
     'Events: Just the push event',
   ];
+}
+
+// ---- writing to a bucket ----
+
+const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+
+/** "Saving 3 files…" and "2 files could not be saved." from the source's pending counts, or ''. */
+export function writeCountsText(writes) {
+  const saving = Number(writes?.saving) > 0 ? Number(writes.saving) : 0;
+  const failed = Number(writes?.failed) > 0 ? Number(writes.failed) : 0;
+  return [
+    saving > 0 ? `Saving ${plural(saving, 'file')}…` : '',
+    failed > 0 ? `${plural(failed, 'file')} could not be saved.` : '',
+  ]
+    .filter(Boolean)
+    .join(' ');
+}
+
+/** The reason shown on a failed row when the listing has none of its own. */
+const FAILED_REASON = 'it could not be written to the bucket.';
+
+/** The text mark under a name for a change not yet written: "Saving…", "Not saved: <reason>", or ''. */
+export function savingMark(item, reason = '') {
+  if (item?.saving === 'saving') return 'Saving…';
+  if (item?.saving === 'failed') {
+    const why = typeof reason === 'string' && reason.trim() !== '' ? reason.trim() : FAILED_REASON;
+    return `Not saved: ${why}`;
+  }
+  return '';
+}
+
+/** What Discard asks first; a file that was never in the bucket is deleted by it. */
+export function discardQuestion(isNew) {
+  return isNew
+    ? 'Discard this file? It was never saved to the bucket.'
+    : 'Discard this change? The file goes back to what is in the bucket.';
+}
+
+/** The sentence for a change this kind of library does not take yet. */
+export function sourceActionUnavailableText() {
+  return 'This change is not available in a library stored in S3 yet. You can add files and folders.';
+}
+
+/** The sentence for a file over the single-upload limit; `limit` in bytes, when the server said. */
+export function sourceFileTooLargeText(limit) {
+  const size = typeof limit === 'number' && Number.isFinite(limit) && limit > 0 ? ` the ${formatSize(limit)}` : '';
+  return `This file is larger than${size} a library stored in S3 takes. Nothing was stored.`;
+}
+
+/** The sentence for a change refused because the library is read-only until fixed. */
+export function sourceWriteBlockedText() {
+  return 'This library is read-only until the storage accepts changes again. An owner can try again from the library settings.';
+}
+
+/** The sentence for a non-administrator asking for read and write. */
+export function readWriteAdminOnlyText() {
+  return 'Only an administrator can make a library read and write.';
+}
+
+const WRITE_TEXTS = {
+  s3_not_writable:
+    'That access key can read the bucket but is not allowed to write to it. Use a key that may write, or connect read-only.',
+  source_writes_pending:
+    'Some changes are still being saved to the bucket. Wait until they are saved or discarded, then try again.',
+};
+
+/** The sentence for an error code of writing to a bucket, or '' for any other code. */
+export function sourceWriteErrorText(code, data) {
+  if (code === 'source_action_unavailable') return sourceActionUnavailableText();
+  if (code === 'source_file_too_large') return sourceFileTooLargeText(Number(data?.limit));
+  if (code === 'source_write_blocked') return sourceWriteBlockedText();
+  if (code === 'read_write_admin_only') return readWriteAdminOnlyText();
+  return Object.hasOwn(WRITE_TEXTS, code) ? WRITE_TEXTS[code] : '';
+}
+
+/**
+ * The one mode change the settings page offers, or null: administrators make a library read and
+ * write (a blocked one is tried again the same way); owners switch a writable library back.
+ */
+export function modeSwitchText(source, isAdmin) {
+  if (source?.kind !== 's3') return null;
+  if (source.mode === 'read_write') {
+    if (source.write_state === 'blocked' && isAdmin) return { to: 'read_write', label: 'Try again' };
+    return { to: 'read_only', label: 'Switch to read-only' };
+  }
+  return isAdmin ? { to: 'read_write', label: 'Switch to read and write' } : null;
+}
+
+/** What the storage does with a save that would overwrite an outside change; '' when not known. */
+export function overwriteNote(conditional) {
+  if (conditional === 'yes') return "This storage refuses a save that would overwrite someone else's change.";
+  if (conditional === 'no' || conditional === 'unknown') {
+    return 'This storage cannot refuse a conflicting save. A change made in the bucket in the same instant as a save here can be overwritten.';
+  }
+  return '';
+}
+
+/** Whether the server offered this row or file's pending change to the person to Retry or Discard. */
+export function mayResolve(entry) {
+  return entry?.may_resolve === true;
 }

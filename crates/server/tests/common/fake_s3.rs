@@ -4,7 +4,11 @@
 //! ranges and `If-Match`, `?versioning`, and S3-shaped error XML, and has switches that force
 //! S3's failures. Every request is logged (never the `Authorization` value).
 //!
-//! Phase 1 half: it answers every write with `501 NotImplemented` and counts it as `write`.
+//! Writes: `PUT` stores bytes (checking `x-amz-content-sha256` against them, honouring
+//! `If-Match` and `If-None-Match: *` with `412 PreconditionFailed`, keeping the
+//! `x-amz-meta-sharecraft-sha256` header) and `DELETE` removes. Both count as `write` and are
+//! logged by `writes()` with a condition word and never a header value. Any other write method
+//! is answered `501 NotImplemented`.
 //!
 //! It stops accepting connections when dropped.
 
@@ -53,6 +57,17 @@ struct Object {
     class: Option<String>,
     restored: Option<bool>,
     version: Option<String>,
+    sha256: Option<String>,
+}
+
+/// An object as the fake holds it, for tests to inspect.
+#[derive(Clone, Debug)]
+pub struct Stored {
+    pub bytes: Vec<u8>,
+    pub etag: String,
+    pub modified_s: i64,
+    /// The `x-amz-meta-sharecraft-sha256` the object was written with.
+    pub sha256: Option<String>,
 }
 
 #[derive(Default)]
@@ -72,6 +87,7 @@ struct Model {
     hung: HashSet<String>,
     truncated: HashMap<String, usize>,
     change_before_get: HashMap<String, Vec<Vec<u8>>>,
+    appear_after_miss: HashMap<String, Vec<u8>>,
     page_size: usize,
     unsorted: bool,
     repeat_token: bool,
@@ -85,6 +101,12 @@ struct Model {
     counts: HashMap<String, usize>,
     requests: Vec<Logged>,
     last_headers: HeaderMap,
+    ignore_conditions: bool,
+    read_only: bool,
+    deny_writes_after: Option<usize>,
+    lose_answer: bool,
+    writes: Vec<(String, String, String)>,
+    last_write_body_len: Option<usize>,
 }
 
 impl Default for Model {
@@ -99,6 +121,7 @@ impl Default for Model {
             hung: HashSet::new(),
             truncated: HashMap::new(),
             change_before_get: HashMap::new(),
+            appear_after_miss: HashMap::new(),
             page_size: 1000,
             unsorted: false,
             repeat_token: false,
@@ -112,6 +135,12 @@ impl Default for Model {
             counts: HashMap::new(),
             requests: Vec::new(),
             last_headers: HeaderMap::new(),
+            ignore_conditions: false,
+            read_only: false,
+            deny_writes_after: None,
+            lose_answer: false,
+            writes: Vec::new(),
+            last_write_body_len: None,
         }
     }
 }
@@ -298,6 +327,71 @@ impl FakeS3 {
             .push(bytes.to_vec());
     }
 
+    /// Same as [`FakeS3::change_before_get`]: after the next `HEAD` of `key` the object is
+    /// replaced by `bytes`.
+    pub fn change_after_head(&self, key: &str, bytes: &[u8]) {
+        self.change_before_get(key, bytes);
+    }
+
+    /// The next `HEAD` of `key` is answered as it is (not found, when nothing is there) and the
+    /// key then appears with `bytes`: a new file someone else made between a check and a write.
+    pub fn appear_after_miss(&self, key: &str, bytes: &[u8]) {
+        self.model()
+            .appear_after_miss
+            .insert(key.to_owned(), bytes.to_vec());
+    }
+
+    /// The store accepts and ignores `If-Match` and `If-None-Match` on a write.
+    pub fn ignore_conditions(&self) {
+        self.model().ignore_conditions = true;
+    }
+
+    /// Every `PUT` and `DELETE` is answered `403 AccessDenied`.
+    pub fn read_only(&self) {
+        self.model().read_only = true;
+    }
+
+    /// The first `n` writes (`PUT` or `DELETE`) are accepted; every later one is answered
+    /// `403 AccessDenied`.
+    pub fn deny_writes_after(&self, n: usize) {
+        self.model().deny_writes_after = Some(n);
+    }
+
+    /// Writes are accepted again: [`FakeS3::read_only`] and [`FakeS3::deny_writes_after`] end.
+    pub fn allow_writes(&self) {
+        let mut model = self.model();
+        model.read_only = false;
+        model.deny_writes_after = None;
+    }
+
+    /// The next write is stored (or removed), and then answered `503 SlowDown`.
+    pub fn lose_answer_after_write(&self) {
+        self.model().lose_answer = true;
+    }
+
+    /// Every `PUT` and `DELETE` received, in order: method, key and a condition word (`none`,
+    /// `absent` for `If-None-Match` or `match` for `If-Match`). Never a header value.
+    pub fn writes(&self) -> Vec<(String, String, String)> {
+        self.model().writes.clone()
+    }
+
+    /// The length of the body of the last `PUT` received.
+    pub fn last_write_body_len(&self) -> Option<usize> {
+        self.model().last_write_body_len
+    }
+
+    /// The object at `key` in `bucket`.
+    pub fn object(&self, bucket: &str, key: &str) -> Option<Stored> {
+        let model = self.model();
+        let object = model.buckets.get(bucket)?.objects.get(key)?;
+        Some(Stored {
+            bytes: object.bytes.clone(),
+            etag: object.etag.clone(),
+            modified_s: object.modified_s,
+            sha256: object.sha256.clone(),
+        })
+    }
+
     /// Listing pages hold at most `n` keys.
     pub fn page_size(&self, n: usize) {
         self.model().page_size = n.max(1);
@@ -373,6 +467,7 @@ fn store(b: &mut Bucket, key: &str, bytes: Vec<u8>, modified_s: i64, opts: Opts)
             class: opts.class,
             restored: opts.restored,
             version,
+            sha256: None,
         },
     );
 }
@@ -601,6 +696,20 @@ async fn handle(State(model): State<Arc<Mutex<Model>>>, request: Request) -> Res
             _ => "write",
         };
         *m.counts.entry(kind.to_owned()).or_default() += 1;
+        if kind == "write" && matches!(method, Method::PUT | Method::DELETE) {
+            let condition = if parts.headers.contains_key(header::IF_NONE_MATCH) {
+                "absent"
+            } else if parts.headers.contains_key(header::IF_MATCH) {
+                "match"
+            } else {
+                "none"
+            };
+            m.writes
+                .push((method.to_string(), key.clone(), condition.to_owned()));
+            if method == Method::PUT {
+                m.last_write_body_len = Some(body.len());
+            }
+        }
 
         if let Some(origin) = m.redirect.clone() {
             return Response::builder()
@@ -625,6 +734,16 @@ async fn handle(State(model): State<Arc<Mutex<Model>>>, request: Request) -> Res
         if kind == "list" {
             wait = m.slow_list;
         }
+        if kind == "write"
+            && method == Method::PUT
+            && let Some(claimed) = parts
+                .headers
+                .get("x-amz-content-sha256")
+                .and_then(|v| v.to_str().ok())
+            && claimed != s3_sign::sha256_hex(&body)
+        {
+            return error(400, "XAmzContentSHA256Mismatch");
+        }
         if m.skew {
             return error(403, "RequestTimeTooSkewed");
         }
@@ -634,7 +753,7 @@ async fn handle(State(model): State<Arc<Mutex<Model>>>, request: Request) -> Res
         {
             return error(403, code);
         }
-        if kind == "write" {
+        if kind == "write" && !matches!(method, Method::PUT | Method::DELETE) {
             return error(501, "NotImplemented");
         }
         let denied = m.denied.iter().any(|(b, p)| {
@@ -656,16 +775,32 @@ async fn handle(State(model): State<Arc<Mutex<Model>>>, request: Request) -> Res
         } else {
             None
         };
+        let appears = if kind == "head" {
+            m.appear_after_miss.remove(&key)
+        } else {
+            None
+        };
         if kind == "get" {
             wait = m.slow.get(&key).copied();
         }
         let hung = m.hung.contains(&key);
         let truncated = m.truncated.get(&key).copied();
+        let read_only = m.read_only || m.deny_writes_after.is_some_and(|n| m.writes.len() > n);
+        let write_flags = Flags {
+            ignore_conditions: m.ignore_conditions,
+            lose_answer: kind == "write" && std::mem::take(&mut m.lose_answer),
+        };
         let Some(b) = m.buckets.get_mut(&bucket) else {
             return error(404, "NoSuchBucket");
         };
         if denied {
             return error(403, "AccessDenied");
+        }
+        if kind == "write" {
+            if read_only {
+                return error(403, "AccessDenied");
+            }
+            return write(b, &key, &method, &parts.headers, body.to_vec(), write_flags);
         }
         match kind {
             "versioning" => {
@@ -693,6 +828,9 @@ async fn handle(State(model): State<Arc<Mutex<Model>>>, request: Request) -> Res
             ),
             _ => {
                 let Some(object) = b.objects.get(&key).cloned() else {
+                    if let Some(bytes) = appears {
+                        store(b, &key, bytes, now_s(), Opts::default());
+                    }
                     return error(404, "NoSuchKey");
                 };
                 if let Some(bytes) = replacement {
@@ -711,6 +849,56 @@ async fn handle(State(model): State<Arc<Mutex<Model>>>, request: Request) -> Res
         tokio::time::sleep(wait).await;
     }
     response
+}
+
+struct Flags {
+    ignore_conditions: bool,
+    lose_answer: bool,
+}
+
+/// A `PUT` or `DELETE` of `key`.
+fn write(
+    b: &mut Bucket,
+    key: &str,
+    method: &Method,
+    headers: &HeaderMap,
+    bytes: Vec<u8>,
+    flags: Flags,
+) -> Response {
+    let text = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    if *method == Method::DELETE {
+        b.objects.remove(key);
+        if flags.lose_answer {
+            return error(503, "SlowDown");
+        }
+        return Response::builder()
+            .status(StatusCode::NO_CONTENT)
+            .body(Body::empty())
+            .unwrap();
+    }
+    if !flags.ignore_conditions {
+        let existing = b.objects.get(key);
+        if text("if-none-match") == Some("*") && existing.is_some() {
+            return error(412, "PreconditionFailed");
+        }
+        if let Some(wanted) = text("if-match")
+            && existing.is_none_or(|object| object.etag != wanted)
+        {
+            return error(412, "PreconditionFailed");
+        }
+    }
+    let sha256 = text("x-amz-meta-sharecraft-sha256").map(str::to_owned);
+    store(b, key, bytes, now_s(), Opts::default());
+    let object = b.objects.get_mut(key).unwrap();
+    object.sha256 = sha256;
+    if flags.lose_answer {
+        return error(503, "SlowDown");
+    }
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::ETAG, object.etag.clone())
+        .body(Body::empty())
+        .unwrap()
 }
 
 fn xml(text: String) -> Response {
@@ -774,6 +962,7 @@ fn list(
                 class: None,
                 restored: None,
                 version: None,
+                sha256: None,
             },
         ));
     }
@@ -887,6 +1076,9 @@ fn object_answer(
     }
     if let Some(version) = &object.version {
         builder = builder.header("x-amz-version-id", version.clone());
+    }
+    if let Some(sha256) = &object.sha256 {
+        builder = builder.header("x-amz-meta-sharecraft-sha256", sha256.clone());
     }
     if head_only {
         return builder.body(Body::empty()).unwrap();

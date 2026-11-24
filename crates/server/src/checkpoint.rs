@@ -65,6 +65,10 @@ pub trait Checkpointer: Send + Sync + 'static {
     /// Whatever the store reports when it cannot be read.
     fn documents(&self) -> Result<Vec<DocId>, GitError>;
 
+    /// Told once by a file session of `doc` when it has ended. Must not block: work it starts
+    /// runs elsewhere. By default nothing is done.
+    fn session_ended(&self, _doc: DocId) {}
+
     /// Records one change to the content tree as one commit credited to its author.
     ///
     /// # Errors

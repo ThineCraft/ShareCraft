@@ -10,13 +10,17 @@
 //! headers it signed. Errors carry no text: an S3 error body is read (at most 64 KiB) only for
 //! its `Code` word, which is written to the server log; its `Message` is never kept.
 //!
-//! Phase 1: no method here sends `PUT`, `POST` or `DELETE`.
+//! Reads are signed with the empty payload hash and tried again when throttled. The two write
+//! calls, [`S3::put`] and [`S3::delete`], are sent once, never tried again here: the caller's
+//! back-off decides. A `PUT` streams its file in pieces of at most 64 KiB and signs the real
+//! SHA-256 of the bytes, so the store itself checks them. No method here sends `POST`.
 
 use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -30,6 +34,7 @@ use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Method, StatusCode, redirect};
 use time::OffsetDateTime;
+use tokio::io::AsyncReadExt;
 
 use revisions::BlobError;
 
@@ -45,6 +50,11 @@ pub const CONNECT_WAIT: Duration = Duration::from_secs(10);
 pub const IDLE_WAIT: Duration = Duration::from_secs(30);
 /// How many times a throttled or failed request is tried again.
 pub const RETRIES: u32 = 3;
+
+/// The largest object one `PUT` sends: 512 MiB. A larger file waits for multipart.
+pub const SINGLE_PUT_MAX: u64 = 512 * 1024 * 1024;
+/// The most of a file read and sent at a time.
+const PUT_PIECE: usize = 64 * 1024;
 
 /// The first wait before a retry; each later wait is twice the one before (0.5, 1, 2 s).
 const FIRST_RETRY_WAIT: Duration = Duration::from_millis(500);
@@ -111,6 +121,28 @@ pub struct ObjectHead {
     /// True only when a restore of an archived object has finished.
     pub restored: bool,
     pub version: Option<String>,
+    /// The `x-amz-meta-sharecraft-sha256` the object was written with: 64 lower-case hex digits.
+    pub sha256: Option<String>,
+}
+
+/// The condition a `PUT` carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cond<'a> {
+    /// No condition: replace whatever is there.
+    None,
+    /// `If-Match: <etag>`: only if the object still has this tag.
+    IfMatch(&'a str),
+    /// `If-None-Match: *`: only if there is no object.
+    IfAbsent,
+}
+
+/// What a `PUT` sends: a file (or nothing, for zero bytes), its size and its SHA-256.
+#[derive(Clone, Debug)]
+pub struct PutBody {
+    /// The file to stream, opened when the request is sent; `None` sends zero bytes.
+    pub path: Option<PathBuf>,
+    pub size: u64,
+    pub sha256: [u8; 32],
 }
 
 /// Where requests for one bucket go and how they are signed.
@@ -158,6 +190,14 @@ impl S3Target {
         self.library
     }
 
+    /// The same target with `prefix` (empty, or ending in `/`) as the library's prefix: for the
+    /// connect probe.
+    #[must_use]
+    pub fn with_prefix(mut self, prefix: &str) -> S3Target {
+        prefix.clone_into(&mut self.prefix);
+        self
+    }
+
     /// The same target, its requests counted against `library`.
     #[must_use]
     pub fn with_library(mut self, library: NodeId) -> S3Target {
@@ -189,6 +229,12 @@ impl Meter {
         *count = count.saturating_add(requests);
         entry.bytes_down = entry.bytes_down.saturating_add(bytes_down);
     }
+
+    fn up(&self, library: NodeId, bytes_up: u64) {
+        let mut usage = lock(&self.usage);
+        let entry = usage.entry(library).or_default();
+        entry.bytes_up = entry.bytes_up.saturating_add(bytes_up);
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -215,6 +261,7 @@ pub struct S3 {
     meter: Arc<Meter>,
     listing_progress: Mutex<HashMap<NodeId, Arc<AtomicUsize>>>,
     list_time_for_tests: Mutex<Option<Duration>>,
+    single_put_max: AtomicU64,
 }
 
 /// The files seen so far by a bucket listing in progress; forgotten when dropped.
@@ -327,6 +374,8 @@ fn mapped(status: u16, code: Option<&str>) -> S3Error {
         (501, _) | (_, Some("NotImplemented")) => S3Error::Unsupported,
         (400 | 403, Some("InvalidObjectState")) => S3Error::Archived,
         (403, Some("InvalidAccessKeyId" | "SignatureDoesNotMatch")) => S3Error::BadKeys,
+        // R2 answers a revoked or unknown token with a bare 401.
+        (401, _) => S3Error::BadKeys,
         (403, Some("RequestTimeTooSkewed")) => S3Error::ClockSkew,
         (403, _) => S3Error::Denied,
         (404, _) => S3Error::NotFound,
@@ -334,7 +383,7 @@ fn mapped(status: u16, code: Option<&str>) -> S3Error {
         | (400, Some("AuthorizationHeaderMalformed" | "PermanentRedirect" | "InvalidRegionName")) => {
             S3Error::WrongRegion
         }
-        (412, _) => S3Error::Precondition,
+        (412, _) | (409, Some("ConditionalRequestConflict")) => S3Error::Precondition,
         (429 | 500 | 502 | 503, _) => S3Error::Throttled,
         _ => S3Error::Other,
     }
@@ -376,6 +425,11 @@ fn object_head(headers: &HeaderMap, size: u64) -> Result<ObjectHead, S3Error> {
         class: header_text(headers, "x-amz-storage-class").map(str::to_owned),
         restored,
         version: header_text(headers, "x-amz-version-id").map(str::to_owned),
+        sha256: header_text(headers, "x-amz-meta-sharecraft-sha256")
+            .filter(|text| {
+                text.len() == 64 && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+            })
+            .map(str::to_owned),
     })
 }
 
@@ -549,6 +603,7 @@ impl S3 {
             meter: Arc::new(Meter::default()),
             listing_progress: Mutex::new(HashMap::new()),
             list_time_for_tests: Mutex::new(None),
+            single_put_max: AtomicU64::new(SINGLE_PUT_MAX),
         }
     }
 
@@ -773,6 +828,79 @@ impl S3 {
         object_head(headers, size)
     }
 
+    /// `PUT` of the bytes of `body` to `key`, under `cond`, sent once. The store is given the
+    /// real SHA-256 (signed), the length and `x-amz-meta-sharecraft-sha256`; the file is opened
+    /// when the request goes out and read in pieces of at most 64 KiB, never whole. On success
+    /// the object is asked for with one `HEAD` and that answer is returned, so the caller holds
+    /// the bucket's own ETag and time.
+    ///
+    /// Only `s3_write.rs` calls this.
+    ///
+    /// # Errors
+    /// `Unsupported` when `body.size` exceeds [`S3::single_put_max`]; `Other` for a key that
+    /// cannot be asked for or a file whose length is not `body.size`; `Precondition` for a
+    /// `412` or a `409 ConditionalRequestConflict`; otherwise see [`S3Error`]. A `429` or `5xx`
+    /// is `Throttled` and is not tried again.
+    pub async fn put(
+        &self,
+        t: &S3Target,
+        key: &str,
+        body: &PutBody,
+        cond: Cond<'_>,
+    ) -> Result<ObjectHead, S3Error> {
+        if body.size > self.single_put_max() {
+            return Err(S3Error::Unsupported);
+        }
+        if unaskable(key) || (body.path.is_none() && body.size != 0) {
+            return Err(S3Error::Other);
+        }
+        let sha256 = s3_sign::hex(&body.sha256);
+        let mut extra = vec![
+            ("content-length".to_owned(), body.size.to_string()),
+            ("x-amz-meta-sharecraft-sha256".to_owned(), sha256.clone()),
+        ];
+        match cond {
+            Cond::None => {}
+            Cond::IfAbsent => extra.push(("if-none-match".to_owned(), "*".to_owned())),
+            Cond::IfMatch(etag) => extra.push(("if-match".to_owned(), etag.to_owned())),
+        }
+        let payload = Payload {
+            sha256: &sha256,
+            size: body.size,
+            path: body.path.as_deref(),
+        };
+        self.send_once(t, Class::Write, Method::PUT, key, &extra, Some(payload))
+            .await?;
+        self.head(t, key).await
+    }
+
+    /// `DELETE` of `key`, sent once; `204` and `404` are both success.
+    ///
+    /// Only `s3_write.rs` calls this (the probe, in slice 1).
+    ///
+    /// # Errors
+    /// See [`S3Error`].
+    pub async fn delete(&self, t: &S3Target, key: &str) -> Result<(), S3Error> {
+        match self
+            .send_once(t, Class::Write, Method::DELETE, key, &[], None)
+            .await
+        {
+            Ok(_) | Err(S3Error::NotFound) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The largest file one `PUT` sends.
+    #[must_use]
+    pub fn single_put_max(&self) -> u64 {
+        self.single_put_max.load(Ordering::SeqCst)
+    }
+
+    /// Sets the largest file one `PUT` sends, for tests.
+    pub fn set_single_put_max_for_tests(&self, bytes: u64) {
+        self.single_put_max.store(bytes, Ordering::SeqCst);
+    }
+
     /// `GET` of `key` with `If-Match: if_match`, and of only bytes `first..=last` when `range`
     /// is given. The answer's ETag must equal `if_match`.
     ///
@@ -977,44 +1105,12 @@ impl S3 {
         query: &[(String, String)],
         extra: &[(String, String)],
     ) -> Result<reqwest::Response, S3Error> {
-        if !valid_bucket(&t.bucket) || key.is_some_and(unaskable) {
-            return Err(S3Error::Other);
-        }
-        let client = self.client(&t.endpoint)?;
-        let (base, path, host) = parts(t, key);
-        let query_text = query
-            .iter()
-            .map(|(name, value)| {
-                format!(
-                    "{}={}",
-                    s3_sign::uri_encode(name, false),
-                    s3_sign::uri_encode(value, false)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("&");
-        let full = if query_text.is_empty() {
-            format!("{base}{path}")
-        } else {
-            format!("{base}{path}?{query_text}")
-        };
-        let url = reqwest::Url::parse(&full).map_err(|_| S3Error::Other)?;
-        // The path sent must be the path signed.
-        if url.path() != path {
-            return Err(S3Error::Other);
-        }
-        // An address literal is never resolved, so it is checked here.
-        let host_name = url.host_str().ok_or(S3Error::Other)?;
-        let bare = host_name.trim_start_matches('[').trim_end_matches(']');
-        if let Ok(ip) = bare.parse::<IpAddr>()
-            && !address_allowed(ip, &t.endpoint.allow)
-        {
-            return Err(S3Error::AddressRefused);
-        }
+        let (client, url, path, host) = self.prepared(t, key, query)?;
 
         let mut attempt: u32 = 0;
         loop {
-            let headers = self.signed_headers(t, &method, &host, &path, query, extra)?;
+            let headers =
+                self.signed_headers(t, &method, &host, &path, query, extra, EMPTY_SHA256)?;
             let sent = client
                 .request(method.clone(), url.clone())
                 .headers(headers)
@@ -1054,7 +1150,93 @@ impl S3 {
         }
     }
 
+    /// The client, URL, signed path and `Host` of a request, after the checks every request
+    /// passes: a valid bucket, a key that can be asked for, a URL whose path is the signed path
+    /// and an address that is allowed.
+    fn prepared(
+        &self,
+        t: &S3Target,
+        key: Option<&str>,
+        query: &[(String, String)],
+    ) -> Result<(reqwest::Client, reqwest::Url, String, String), S3Error> {
+        if !valid_bucket(&t.bucket) || key.is_some_and(unaskable) {
+            return Err(S3Error::Other);
+        }
+        let client = self.client(&t.endpoint)?;
+        let (base, path, host) = parts(t, key);
+        let query_text = query
+            .iter()
+            .map(|(name, value)| {
+                format!(
+                    "{}={}",
+                    s3_sign::uri_encode(name, false),
+                    s3_sign::uri_encode(value, false)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("&");
+        let full = if query_text.is_empty() {
+            format!("{base}{path}")
+        } else {
+            format!("{base}{path}?{query_text}")
+        };
+        let url = reqwest::Url::parse(&full).map_err(|_| S3Error::Other)?;
+        // The path sent must be the path signed.
+        if url.path() != path {
+            return Err(S3Error::Other);
+        }
+        // An address literal is never resolved, so it is checked here.
+        let host_name = url.host_str().ok_or(S3Error::Other)?;
+        let bare = host_name.trim_start_matches('[').trim_end_matches(']');
+        if let Ok(ip) = bare.parse::<IpAddr>()
+            && !address_allowed(ip, &t.endpoint.allow)
+        {
+            return Err(S3Error::AddressRefused);
+        }
+        Ok((client, url, path, host))
+    }
+
+    /// Signs and sends one write request, once: no retry of any answer. A `PUT` carries its
+    /// payload hash in the signature and streams its file; the answer must be a success.
+    async fn send_once(
+        &self,
+        t: &S3Target,
+        class: Class,
+        method: Method,
+        key: &str,
+        extra: &[(String, String)],
+        payload: Option<Payload<'_>>,
+    ) -> Result<reqwest::Response, S3Error> {
+        let (client, url, path, host) = self.prepared(t, Some(key), &[])?;
+        let hash = payload.as_ref().map_or(EMPTY_SHA256, |p| p.sha256);
+        let headers = self.signed_headers(t, &method, &host, &path, &[], extra, hash)?;
+        let mut request = client.request(method.clone(), url).headers(headers);
+        let mut bytes_up = 0;
+        if let Some(payload) = payload {
+            bytes_up = payload.size;
+            if let Some(body) = payload.open().await? {
+                request = request.body(body);
+            }
+        }
+        let sent = request.send().await;
+        if let Err(e) = &sent
+            && refused_by_resolver(e)
+        {
+            return Err(S3Error::AddressRefused);
+        }
+        self.counted(t, class, 1, 0);
+        if let Some(library) = t.library {
+            self.meter.up(library, bytes_up);
+        }
+        let response = sent.map_err(|e| transport(&e))?;
+        if response.status().is_success() {
+            return Ok(response);
+        }
+        Err(self.failure(t, &method, response).await)
+    }
+
     /// The headers of one try: exactly the ones signed, plus the `Authorization` header.
+    #[allow(clippy::too_many_arguments)]
     fn signed_headers(
         &self,
         t: &S3Target,
@@ -1063,6 +1245,7 @@ impl S3 {
         path: &str,
         query: &[(String, String)],
         extra: &[(String, String)],
+        payload_sha256: &str,
     ) -> Result<HeaderMap, S3Error> {
         let signed = s3_sign::sign(
             &t.credentials,
@@ -1074,7 +1257,7 @@ impl S3 {
                 path,
                 query,
                 headers: extra,
-                payload_sha256: EMPTY_SHA256,
+                payload_sha256,
             },
         );
         let mut headers = HeaderMap::new();
@@ -1087,7 +1270,7 @@ impl S3 {
         };
         put("host", host)?;
         put("x-amz-date", &signed.amz_date)?;
-        put("x-amz-content-sha256", EMPTY_SHA256)?;
+        put("x-amz-content-sha256", payload_sha256)?;
         if let Some(token) = &t.credentials.session_token {
             put("x-amz-security-token", token.expose())?;
         }
@@ -1096,6 +1279,62 @@ impl S3 {
         }
         put("authorization", &signed.authorization)?;
         Ok(headers)
+    }
+}
+
+/// What a `PUT` sends: the hash it signs, the length it promises and the file it streams.
+struct Payload<'a> {
+    sha256: &'a str,
+    size: u64,
+    path: Option<&'a Path>,
+}
+
+impl Payload<'_> {
+    /// Opens the file now and makes the body that streams it in pieces of at most 64 KiB; a
+    /// file whose length is not `size` is refused (`Other`), and a file that ends early or
+    /// grows while it is sent fails the stream. `None` sends no body.
+    async fn open(&self) -> Result<Option<reqwest::Body>, S3Error> {
+        let Some(path) = self.path else {
+            return Ok(None);
+        };
+        let file = tokio::fs::File::open(path)
+            .await
+            .map_err(|_| S3Error::Other)?;
+        let length = file.metadata().await.map_err(|_| S3Error::Other)?.len();
+        if length != self.size {
+            return Err(S3Error::Other);
+        }
+        if self.size == 0 {
+            return Ok(None);
+        }
+        let stream =
+            futures_util::stream::unfold((file, self.size), |(mut file, left)| async move {
+                if left == 0 {
+                    return None;
+                }
+                let want = usize::try_from(left).map_or(PUT_PIECE, |left| left.min(PUT_PIECE));
+                let mut piece = vec![0_u8; want];
+                let mut filled = 0;
+                while filled < want {
+                    let Some(room) = piece.get_mut(filled..) else {
+                        break;
+                    };
+                    match file.read(room).await {
+                        Ok(0) => {
+                            let error = std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                "the file ended early",
+                            );
+                            return Some((Err(error), (file, 0)));
+                        }
+                        Ok(n) => filled += n,
+                        Err(error) => return Some((Err(error), (file, 0))),
+                    }
+                }
+                let left = left.saturating_sub(u64::try_from(want).unwrap_or(u64::MAX));
+                Some((Ok(Bytes::from(piece)), (file, left)))
+            });
+        Ok(Some(reqwest::Body::wrap_stream(stream)))
     }
 }
 
@@ -1201,6 +1440,7 @@ mod tests {
         assert_eq!(mapped(404, Some("NoSuchBucket")), S3Error::NoBucket);
         assert_eq!(mapped(403, Some("SignatureDoesNotMatch")), S3Error::BadKeys);
         assert_eq!(mapped(403, None), S3Error::Denied);
+        assert_eq!(mapped(401, None), S3Error::BadKeys);
         assert_eq!(mapped(400, Some("InvalidObjectState")), S3Error::Archived);
         assert_eq!(mapped(501, None), S3Error::Unsupported);
         assert_eq!(mapped(418, None), S3Error::Other);

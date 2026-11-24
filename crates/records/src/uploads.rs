@@ -86,6 +86,9 @@ pub struct UploadSession {
     pub base: Option<String>,
     /// For a new file, what to do if its name is taken, if chosen when it started.
     pub on_conflict: Option<NameConflict>,
+    /// Whether the file goes to a store outside the site (a bucket): such a session checks and
+    /// reserves no quota.
+    pub external: bool,
     pub created_at: OffsetDateTime,
     /// When the session started or last received a chunk.
     pub touched_at: OffsetDateTime,
@@ -103,6 +106,8 @@ pub struct NewUpload<'a> {
     pub sha256: [u8; 32],
     pub base: Option<&'a str>,
     pub on_conflict: Option<NameConflict>,
+    /// The file goes to a store outside the site: no quota is checked and nothing is reserved.
+    pub external: bool,
 }
 
 /// Why an upload session was not started.
@@ -133,7 +138,7 @@ fn bytes_of(value: i64) -> u64 {
 macro_rules! columns {
     () => {
         "id, owner, site_id, parent_id, doc_id, name, size, sha256, received, base_revision, \
-         on_conflict, created_at, touched_at"
+         on_conflict, external, created_at, touched_at"
     };
 }
 
@@ -173,6 +178,7 @@ fn session_from_row(row: &PgRow) -> Result<UploadSession, sqlx::Error> {
         received: bytes_of(row.try_get("received")?),
         base: row.try_get("base_revision")?,
         on_conflict,
+        external: row.try_get("external")?,
         created_at: row.try_get("created_at")?,
         touched_at: row.try_get("touched_at")?,
     })
@@ -200,15 +206,17 @@ impl Db {
         if open >= UPLOADS_PER_PERSON {
             return Err(UploadError::TooMany);
         }
-        let usage = locked_usage(&mut tx, new.site)
-            .await
-            .map_err(DbError::from)?;
-        if !fits(usage.used, usage.reserved, usage.quota, new.size) {
-            return Err(UploadError::QuotaExceeded);
+        if !new.external {
+            let usage = locked_usage(&mut tx, new.site)
+                .await
+                .map_err(DbError::from)?;
+            if !fits(usage.used, usage.reserved, usage.quota, new.size) {
+                return Err(UploadError::QuotaExceeded);
+            }
+            change_reserved(&mut tx, new.site, column(new.size))
+                .await
+                .map_err(DbError::from)?;
         }
-        change_reserved(&mut tx, new.site, column(new.size))
-            .await
-            .map_err(DbError::from)?;
         let (parent, doc) = match new.target {
             UploadTarget::NewFile { parent } => (Some(parent.0), None),
             UploadTarget::NewVersion { doc } => (None, Some(doc.0)),
@@ -216,8 +224,8 @@ impl Db {
         let row = sqlx::query(concat!(
             "insert into upload_sessions \
                  (id, owner, site_id, parent_id, doc_id, name, size, sha256, base_revision, \
-                  on_conflict) \
-             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) returning ",
+                  on_conflict, external) \
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) returning ",
             columns!()
         ))
         .bind(new.id)
@@ -230,6 +238,7 @@ impl Db {
         .bind(&new.sha256[..])
         .bind(new.base)
         .bind(new.on_conflict.map(NameConflict::as_str))
+        .bind(new.external)
         .fetch_one(&mut *tx)
         .await
         .map_err(DbError::from)?;
@@ -273,15 +282,17 @@ impl Db {
         };
         let mut tx = self.pool().begin().await?;
         locked_usage(&mut tx, site).await?;
-        let size: Option<i64> =
-            sqlx::query_scalar("delete from upload_sessions where id = $1 returning size")
+        let ended: Option<(i64, bool)> =
+            sqlx::query_as("delete from upload_sessions where id = $1 returning size, external")
                 .bind(id)
                 .fetch_optional(&mut *tx)
                 .await?;
-        let Some(size) = size else {
+        let Some((size, external)) = ended else {
             return Ok(false);
         };
-        change_reserved(&mut tx, site, -size).await?;
+        if !external {
+            change_reserved(&mut tx, site, -size).await?;
+        }
         tx.commit().await?;
         Ok(true)
     }
@@ -309,16 +320,26 @@ impl Db {
         };
         let mut tx = self.pool().begin().await?;
         let usage = locked_usage(&mut tx, site).await?;
-        let size: Option<i64> =
-            sqlx::query_scalar("select size from upload_sessions where id = $1 for update")
+        let found: Option<(i64, bool)> =
+            sqlx::query_as("select size, external from upload_sessions where id = $1 for update")
                 .bind(id)
                 .fetch_optional(&mut *tx)
                 .await?;
-        let Some(size) = size else {
+        let Some((size, external)) = found else {
             return Ok(None);
         };
+        if external {
+            // The bytes live outside the site: nothing was reserved and nothing is claimed.
+            sqlx::query("delete from upload_sessions where id = $1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            return Ok(Some(Reservation::new(site, 0)));
+        }
         let open: i64 = sqlx::query_scalar(
-            "select coalesce(sum(size), 0)::bigint from upload_sessions where site_id = $1",
+            "select coalesce(sum(size), 0)::bigint from upload_sessions \
+             where site_id = $1 and not external",
         )
         .bind(site.0)
         .fetch_one(&mut *tx)

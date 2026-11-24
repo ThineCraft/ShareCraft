@@ -144,8 +144,28 @@ struct ApprovedItem {
     cache_max: u64,
 }
 
-/// Materialises one live external document. Ordinary and GitHub documents answer `None`.
+/// Materialises one live external document. Ordinary and GitHub documents answer `None`. A
+/// document with a change waiting to be written is its staged content, held and through the
+/// scan gate, without asking the store (also a new file the store does not have yet).
 pub async fn materialise(state: &AppState, node: NodeId) -> Result<Option<Ready>, ExternalError> {
+    if let Some(pending) = state
+        .db()
+        .pending_write(node)
+        .await
+        .map_err(database_failed)?
+    {
+        let held = state
+            .blobs()
+            .hold_stored(pending.blob)
+            .await
+            .ok_or(ExternalError::Failed)?;
+        scan_gate(state, &pending.blob.sha256).await?;
+        return Ok(Some(Ready {
+            blob: pending.blob,
+            held,
+            revision: pending.revision,
+        }));
+    }
     let Some(item) = state
         .db()
         .external_item(node)

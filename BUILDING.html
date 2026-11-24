@@ -30,7 +30,7 @@ ul.band>li:nth-child(even),ol.band>li:nth-child(even){background:light-dark(#f4f
 </header>
 <div class="layout">
 <nav aria-label="Document contents"><p>In this document</p>
-<a href="#need">01 · What you need</a><a href="#build">02 · Build and check</a><a href="#admin">03 · The first administrator</a><a href="#run">04 · Run it and sign in</a><a href="#settings">05 · Settings</a><a href="#accounts">06 · Accounts and signing in</a><a href="#sharing">07 · Sharing and roles</a><a href="#removed">08 · What a removed person sees</a><a href="#data">09 · Where data is kept</a><a href="#index">10 · The revision index</a><a href="#events">11 · Events</a><a href="#stop">12 · Stopping the server, and notices</a><a href="#editors">13 · Building the editors</a><a href="#files">14 · Opening a file document</a><a href="#session">15 · File session, seat and saving</a><a href="#content">16 · Content routes</a><a href="#tree">17 · The content tree and routes</a><a href="#treegit">18 · The tree in Git and PostgreSQL</a><a href="#upgrade">19 · Upgrading</a><a href="#policy">20 · The editor pages' policy</a><a href="#limits">21 · Known limits</a><a href="#scale">22 · A library of 100,000 files</a><a href="#groups">23 · Groups, roles and the explorer</a><a href="#links">24 · Sharing links and requests</a><a href="#storage">25 · Files, bin and quotas</a><a href="#sites">26 · Sites and navigation</a><a href="#libraries">27 · Libraries</a><a href="#branding">28 · Branding</a><a href="#production">29 · Production mode</a><a href="#branding2">30 · Branding, part two</a><a href="#licences">31 · Licences</a><a href="#live-room">32 · Shared live room</a><a href="#github-sources">33 · GitHub-connected libraries</a><a href="#live-checkpoints">34 · Verified live checkpoints</a><a href="#live-host">35 · Presence, notices and the live page</a><a href="#file-shares">36 · File-share libraries</a><a href="#s3-signing">37 · S3 request signing</a><a href="#release-state">38 · Release state</a>
+<a href="#need">01 · What you need</a><a href="#build">02 · Build and check</a><a href="#admin">03 · The first administrator</a><a href="#run">04 · Run it and sign in</a><a href="#settings">05 · Settings</a><a href="#accounts">06 · Accounts and signing in</a><a href="#sharing">07 · Sharing and roles</a><a href="#removed">08 · What a removed person sees</a><a href="#data">09 · Where data is kept</a><a href="#index">10 · The revision index</a><a href="#events">11 · Events</a><a href="#stop">12 · Stopping the server, and notices</a><a href="#editors">13 · Building the editors</a><a href="#files">14 · Opening a file document</a><a href="#session">15 · File session, seat and saving</a><a href="#content">16 · Content routes</a><a href="#tree">17 · The content tree and routes</a><a href="#treegit">18 · The tree in Git and PostgreSQL</a><a href="#upgrade">19 · Upgrading</a><a href="#policy">20 · The editor pages' policy</a><a href="#limits">21 · Known limits</a><a href="#scale">22 · A library of 100,000 files</a><a href="#groups">23 · Groups, roles and the explorer</a><a href="#links">24 · Sharing links and requests</a><a href="#storage">25 · Files, bin and quotas</a><a href="#sites">26 · Sites and navigation</a><a href="#libraries">27 · Libraries</a><a href="#branding">28 · Branding</a><a href="#production">29 · Production mode</a><a href="#branding2">30 · Branding, part two</a><a href="#licences">31 · Licences</a><a href="#live-room">32 · Shared live room</a><a href="#github-sources">33 · GitHub-connected libraries</a><a href="#live-checkpoints">34 · Verified live checkpoints</a><a href="#live-host">35 · Presence, notices and the live page</a><a href="#file-shares">36 · File-share libraries</a><a href="#s3-signing">37 · S3: signing and editable storage</a><a href="#release-state">38 · Release state</a>
 </nav>
 <main id="main">
 <div class="toolbar"><span class="small">Standalone HTML · Print-ready · No external assets</span><button type="button" onclick="window.print()">Print / Save PDF</button></div>
@@ -2209,8 +2209,137 @@ cargo xtask test -j 3 -p records --test sources</code></pre>
 <p>The server uses the share as the account it runs under; no credentials are stored. The full plan and its open questions are in <code>plans/2026-11-17-file-share-surfacing.html</code>.</p>
 </section>
 
-<section id="s3-signing"><h2>37 / S3 request signing</h2>
+<section id="s3-signing"><h2>37 / S3: request signing and editable storage</h2>
 <p>Built on 18 November 2026 as S3 surfacing Task 2, on the branch <code>s3-surfacing</code>, and merged into the release integration branch on 19 November 2026. It is library code only: <code>crates/server/src/s3_sign.rs</code> signs requests with AWS Signature Version 4 and is tested against AWS&rsquo;s published example vectors. No route, setting or page uses it, so nothing in ShareCraft talks to S3 yet. The plan is <code>plans/2026-11-18-s3-surfacing.html</code>.</p>
+<p class="small">The paragraph above is the record of 19 November 2026. Reading from S3 libraries (Phase 1, read-only) was built after it and is on <code>main</code>; this file does not describe it, and the S3 plan does. The rest of this section records editable S3 storage, slice 1.</p>
+
+<h3>Editable S3 storage, slice 1</h3>
+<p>Built on 24 November 2026 on the branch <code>s3-writes</code>, cut from <code>main</code> at <code>78bfd6a</code>. It is not merged. The branch was pushed and the full GitHub check was green at <code>cc2b88b</code> (run 45456975116). One more commit, <code>8788b3f</code>, came from the live check below; it was pushed on 24 November 2026 and its check run (45479777333) was running when this was written. Nothing is merged. The plan is <code>plans/2026-11-24-s3-writes-slice1.html</code> and the scope is <code>plans/2026-11-24-s3-editable-scope.html</code>. Slice 1 is upload, replace, save from an editor and new folder. The shared write path is in <code>crates/server/src/source_write.rs</code> and <code>crates/records/src/source_writes.rs</code>. Everything that changes a bucket is in <code>crates/server/src/s3_write.rs</code> and nowhere else. No file-share write code was written.</p>
+
+<h3>The two modes and who chooses them</h3>
+<div class="table-wrap"><table class="banded"><caption>Modes of an S3 library</caption>
+<thead><tr><th>Mode</th><th>What people can do</th><th>Who can choose it</th></tr></thead>
+<tbody>
+<tr><td>Read only (the default)</td><td>Browse, open, download and preview. Every change is refused, as before.</td><td>Anyone who may connect a library. Owners can switch a library back to read-only, but not while changes are waiting to be written: that answers <code>409 source_writes_pending</code>.</td></tr>
+<tr><td>Read and write</td><td>Upload, replace, save from an editor and make a folder. Other changes are refused until slice 2.</td><td>Administrators only, when connecting and when switching later. Anyone else gets <code>403 read_write_admin_only</code> before the store is asked.</td></tr>
+</tbody></table></div>
+<p>The mode is sent as <code>mode</code> to <code>POST /api/sites/{id}/libraries/s3</code> and to <code>PATCH /api/libraries/{id}/source</code>. Any other value is <code>422 invalid_request</code>. A GitHub source cannot be read and write. A switch emits <code>source.mode_changed</code>. Switching to read and write on a blocked library is also how an administrator retries it.</p>
+
+<h3>What the guard does in an S3 library</h3>
+<div class="table-wrap"><table class="banded"><caption>Each route has a read-and-write S3 decision</caption>
+<thead><tr><th>Library</th><th>Answer</th></tr></thead>
+<tbody>
+<tr><td>Not connected</td><td>Ordinary. Nothing changes.</td></tr>
+<tr><td>GitHub, file share, or read-only S3</td><td><code>409 source_read_only</code>, exactly as before.</td></tr>
+<tr><td>Read-and-write S3, writes working</td><td>Upload, replace, editor save and new folder go through. Rename, move, delete, restore, copy in, a new blank file and a new file from a template answer <code>409 source_action_unavailable</code> with a plain message.</td></tr>
+<tr><td>Read-and-write S3, blocked</td><td>The library is read-only until its storage accepts changes again; its files can still be opened. The blocked answer is <code>source_write_blocked</code>.</td></tr>
+</tbody></table></div>
+<p>The library node itself keeps its current refusals. <code>crates/server/tests/source_readonly.rs</code> holds the route table: every guarded route has a decision, and a test runs each row in a read-and-write S3 library on the fake store. The route count there went from 161 to 163 for the Retry and Discard routes. Editor files in a read-only S3 library now open in a file session, not a live room: a live room loads from Git, which holds no bucket content. A bucket file never opens in a live room.</p>
+
+<h3>How a write flows</h3>
+<ol class="band">
+<li><strong>Stage.</strong> The upload or save is accepted at once and recorded as a pending row in <code>source_writes</code>, with the content pinned in the external-content cache. The file&rsquo;s current revision becomes the staged one, and the page shows &ldquo;Saving&hellip;&rdquo;. Staged content is served to readers while it waits. The listing leaves a pending file alone.</li>
+<li><strong>Scan.</strong> Nothing is written before the scan gate lets the content through. Infected content is dropped and never written.</li>
+<li><strong>Conditional PUT.</strong> A background worker takes due rows, holds the source lock, then sends a HEAD and one PUT. A replacement is <code>If-Match</code> on the ETag it saw; a new file is <code>If-None-Match: *</code>. Each PUT carries <code>x-amz-meta-sharecraft-sha256</code>, so a write whose answer was lost is recognised as ours and is not taken for a conflict. Writes are never retried inside the S3 client; the worker&rsquo;s back-off retries them, and every retry starts with a HEAD. On a store recorded as not honouring conditions, the write is a HEAD and then a plain PUT, and <code>source.unconditional_write</code> is emitted.</li>
+<li><strong>Conflict copy.</strong> If the object changed outside ShareCraft, the bucket keeps the outside version and the work is written beside it as <code>name (edited by Person YYYY-MM-DD HH.MM).ext</code>. The time is UTC and the person&rsquo;s name is cut to 40 characters. A taken name is numbered from 2 to 20. A new file whose key appeared meanwhile gets a numbered name instead. <code>source.conflict_copy</code> is emitted.</li>
+<li><strong>Echo suppression.</strong> After a write the server records the same tag the next listing computes from the object&rsquo;s size, modified time and ETag, so the next listing sees no change of its own.</li>
+</ol>
+<p>A refused write (the store says no) blocks the library, drops nothing, and emits <code>source.write_blocked</code>. While blocked, the worker re-probes at most once every five minutes; a passing probe restores the library and makes its rows due. Failed writes retry after 30 seconds, doubling to 10 minutes. Retry and Discard are offered to the row&rsquo;s author and to owners. Discard of a replacement shows the bucket&rsquo;s content again; discard of a new file sends it to the recycle bin, where it cannot be restored into this library in slice 1.</p>
+
+<h3>The write probe</h3>
+<p>The probe runs when a library is connected as read and write, when it is switched, and when a blocked library is re-checked. It uses one key, <code>.sharecraft-tmp-probe-&lt;id&gt;</code>, which the listing hides. It sends four requests: a zero-byte PUT that must be accepted; the same PUT again, where a refusal means the store honours <code>If-None-Match</code>; a PUT with an <code>If-Match</code> that cannot match, where a refusal confirms conditions; then a DELETE. A key that may only read is refused with <code>422 s3_not_writable</code>. The result is recorded in <code>source_s3.conditional</code> (yes or no). If the DELETE fails, the server logs it and emits <code>source.probe_left</code> with a library-relative name only.</p>
+
+<h3>Limits</h3>
+<ul class="band">
+<li><strong>512 MiB.</strong> One PUT per file, at most 512 MiB. A larger file is refused before any byte is stored, with <code>413 source_file_too_large</code> and a plain message. The limit is the smaller of that, the configured maximum file size and half the cache size. Multipart is slice 2.</li>
+<li><strong>Editor-save coalescing.</strong> An editor save is staged at once and answered with the staged revision, but the bucket gets at most one write per file every 30 seconds, always the latest content. Ending the editor session asks for a flush. Several quick saves make one write (three in the live check).</li>
+<li><strong>Quota.</strong> Uploads and saves into an S3 library use no site quota, because the bytes live in the bucket. Writes are counted by the existing meter. Nothing caps them, and the counts are still not saved to <code>source_usage</code>.</li>
+<li><strong>Secrets and events.</strong> Events carry counts, node ids and library-relative paths only, never the endpoint, bucket, prefix or key. Messages are our own sentences of at most 300 characters.</li>
+</ul>
+
+<h3>Migration 0025</h3>
+<p><code>crates/records/migrations/0025_source_writes.sql</code> adds the pending-writes table (<code>source_writes</code>), the library write state and external upload sessions that reserve no quota. <code>main</code> uses up to 0024. It keeps Phase 1 S3 rows and file-share rows. It is not edited once committed; a later change needs a new numbered file.</p>
+
+<h3>Commands</h3>
+<p>From the worktree root in PowerShell. Local runs are targeted; the full suite runs on GitHub (<code>check.yml</code>). Run one test binary at a time, with at most three build jobs, and every <code>s3_*</code>, <code>share_*</code> and <code>source_*</code> server binary with <code>--test-threads=1</code>. Tests need <code>TEST_DATABASE_URL</code> (PostgreSQL 18) and connect only to 127.0.0.1.</p>
+<pre><code>$env:CARGO_TARGET_DIR = 'J:\cargo-target\sharecraft-s3w'
+$env:CARGO_INCREMENTAL = '0'
+cargo test -j 3 -p records --test source_writes
+cargo test -j 3 -p server --test s3_write -- --test-threads=1
+cargo test -j 3 -p server --test s3_modes -- --test-threads=1
+cargo test -j 3 -p server --test s3_uploads -- --test-threads=1
+cargo test -j 3 -p server --test s3_write_routes -- --test-threads=1
+cargo test -j 3 -p server --test s3_sessions -- --test-threads=1
+cargo clippy -j 3 -p records -p server --all-targets
+cargo fmt --all
+node --test web/</code></pre>
+
+<h3>What the live check on 24 November 2026 checked</h3>
+<p>The server at <code>cc2b88b</code> ran on a scratch schema against the owner&rsquo;s Cloudflare R2 bucket <code>sharecraft-demo</code>. The check wrote only objects named <code>s3w-check-*</code> at the top level. The owner created the bucket and both tokens (read and write, and read only) and typed every key into the page. The controller created no cloud resource and saw no secret key.</p>
+<div class="table-wrap"><table class="banded"><caption>Checked live</caption>
+<thead><tr><th>Check</th><th>Result</th></tr></thead>
+<tbody>
+<tr><td>Write probe</td><td>Found conditional writes: yes; versioning: unknown. The bucket listing showed no probe object afterwards, and again after switching read-only to read and write.</td></tr>
+<tr><td>Uploads</td><td>A 45-byte and a 3,145,851-byte file went Saving, then saved. The recorded SHA-256 matched the local file for both, and the owner&rsquo;s download from the dashboard matched the originals.</td></tr>
+<tr><td>Replace by upload</td><td>Replace in the name-clash prompt recorded the new size and hash. The next listing did not re-read either file and saw no outside change.</td></tr>
+<tr><td>Editor saves (GridCraft)</td><td>Three saves in about 12 seconds made one pending row; the bucket kept the old bytes until the write. Closing the editor flushed one write of 4,110 bytes and the queue was empty.</td></tr>
+<tr><td>New folder</td><td>A zero-byte marker <code>s3w-check-folder/</code> was written, and an upload into the folder landed below it.</td></tr>
+<tr><td>Refused actions</td><td>Rename, move and delete through the API answered <code>409 source_action_unavailable</code> with a plain message. The row menu offered only Details and Access; the New menu offered Folder and uploads.</td></tr>
+<tr><td>Mode switch</td><td>Read-only and back worked, and site usage stayed at 0 throughout.</td></tr>
+<tr><td>Conflict</td><td>The owner replaced a spreadsheet in the dashboard while it was open in GridCraft. The save made <code>s3w-check-sheet (edited by Ann Tester 2026-11-24 19.46).xlsx</code> (4,126 bytes) and the bucket kept the outside version (4,056 bytes). That write went at the 30-second window, not on closing the editor, although an earlier close did flush in under 8 seconds. Closing the editor is therefore not always prompt, but the write stays within the 30-second promise.</td></tr>
+<tr><td>A revoked write key</td><td>R2 answered a bare 401 with no code. Before the fix, ShareCraft sent it to &ldquo;other&rdquo;, so the write &ldquo;tried again later&rdquo; for ever and the library was never blocked. The row showed &ldquo;Not saved&rdquo; with Retry (another attempt, with back-off) and Discard (confirmed; the row and the pending change were gone). Fixed in <code>8788b3f</code>: a 401 now means refused keys. Re-checked live: the write was refused &ldquo;with this access key&rdquo;, the library became blocked, settings showed &ldquo;Read-only until fixed&rdquo; and &ldquo;1 file could not be saved&rdquo; with Try again.</td></tr>
+<tr><td>Pages at 375 px, dark theme</td><td>The library page, library settings (Source section) and connect form had no sideways scroll; after the 401 fix the library and settings pages were checked again.</td></tr>
+</tbody></table></div>
+<p>The 401 fix also changes how Phase 1 reads, already on <code>main</code>, treat a bare 401: as refused keys.</p>
+<div class="table-wrap"><table class="banded"><caption>Not checked live</caption>
+<thead><tr><th>Not checked</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td>A read-only token on this server</td><td>The owner tested it beforehand and reported it. ShareCraft&rsquo;s behaviour with such a token on this build was not checked by the live check.</td></tr>
+<tr><td>An editor save from WordCraft</td><td>GridCraft was used.</td></tr>
+<tr><td>The 512 MiB limit</td><td>Covered by automated tests, not checked live.</td></tr>
+<tr><td>More than one conflict case</td><td>One conflict, one person, was seen. Multi-user naming beyond that was not.</td></tr>
+<tr><td>A store that ignores conditions</td><td>R2 honoured them; that path is covered only by the fake store.</td></tr>
+<tr><td>Recognising a write whose answer was lost, on R2</td><td>The ledger records no live check of R2 returning the metadata header. Without it, a lost answer makes a duplicate conflict copy, never lost data.</td></tr>
+</tbody></table></div>
+<p><strong>Cost.</strong> The live check cost $0.00. It stayed inside R2&rsquo;s free monthly allowance, as read from R2&rsquo;s pricing on 24 November 2026, using a few hundred requests and about 3 MB. Prices and allowances change; read the page again before relying on this. The servers were stopped, the scratch schema dropped, and the data folder and launch entry removed. The owner is to revoke the Object Read token; the <code>s3w-check-*</code> objects can be deleted from the bucket.</p>
+
+<h3>Rulings made while building</h3>
+<ul class="band">
+<li>Staged content, already scanned and accepted, stays servable after its endpoint loses approval. It is ShareCraft&rsquo;s copy, not a request to the store. An administrator who withdraws approval may expect staged edits to be hidden too; raise this with the owner.</li>
+<li>A disconnect that fails after switching the library read-only leaves it read-only. That is the safe state, and owners may choose it anyway.</li>
+<li>Two older <code>s3_modes</code> assertions that expected folder creation to be refused now expect 201, because folders became a pass-through route.</li>
+<li>The long local test sweep was replaced by the full GitHub run, by house rule.</li>
+</ul>
+
+<h3>Deferred and parked items</h3>
+<p>Every minor the review ledger left open, as recorded. None was fixed unless it says so. The detail for Task 5 and the final review is in <code>task-5-review.md</code> and <code>final-review.md</code> in the plan&rsquo;s working folder.</p>
+<div class="table-wrap"><table class="banded"><caption>Deferred and parked minors</caption>
+<thead><tr><th>Where</th><th>Item</th></tr></thead>
+<tbody>
+<tr><td>Records</td><td>A new-file <code>finish_write</code> can take over another node&rsquo;s <code>source_items</code> row through ON CONFLICT; there is no concurrency test.</td></tr>
+<tr><td>S3 client</td><td><code>put()</code> returns an error when the HEAD after a successful PUT fails, so the outcome is unknown. It is treated as offline, and the retry&rsquo;s HEAD and hash metadata recognise it.</td></tr>
+<tr><td>S3 client</td><td><code>signed_headers</code> carries a too-many-arguments lint allowance. In the fake store, <code>lose_answer</code> is consumed by refused writes.</td></tr>
+<tr><td>Safe writes</td><td><code>refused()</code> treats not-found as a refusal. A deep path may fail only for the longer copy name.</td></tr>
+<tr><td>Safe writes</td><td>The probe&rsquo;s leftover name was carried to the modes task to surface only when the probe was not unreachable; the ledger does not record the outcome.</td></tr>
+<tr><td>Modes</td><td><code>writable_place</code> can make up to five queries.</td></tr>
+<tr><td>Modes</td><td>A read-only connect over a taken place with bad keys answers <code>s3_place_in_use</code> rather than a key error.</td></tr>
+<tr><td>Modes</td><td>The disconnect race (children sent to the bin while a pending row survives) was found again by the final review and fixed in <code>cc2b88b</code>.</td></tr>
+<tr><td>Write worker</td><td>Database-error branches in <code>write_one</code> return without moving <code>next_try_at</code>. Scans that keep failing are re-checked every 5 seconds without back-off. Nine minors are in <code>task-5-review.md</code>.</td></tr>
+<tr><td>Routes</td><td>The saving mark in <code>nodes.rs</code> makes one query per row.</td></tr>
+<tr><td>Routes</td><td>Pre-bucket upload sessions claim quota at finish, so a 507 is possible.</td></tr>
+<tr><td>Routes</td><td>The name checks in <code>external_path</code> and <code>upload_external</code> are duplicated.</td></tr>
+<tr><td>Routes</td><td>A failure other than a refusal in <code>delete_one</code>, after the pending row was dropped, still loses the row.</td></tr>
+<tr><td>Editor saves</td><td>Opening a document runs <code>is_bucket_file</code>, one more query, which can answer 503. <code>session_ended</code> is silent when there is no runtime. A save in flight when a channel closes waits 30 seconds.</td></tr>
+<tr><td>Pages</td><td>The new-file Discard wording infers &ldquo;never written&rdquo; from <code>item.external</code> and <code>modified_at</code>. A failed mark in the list has no reason text. <code>with_resolvable</code> runs an extra query per saving row. A public-link listing shows saving without buttons, which is safe.</td></tr>
+<tr><td>Final review</td><td>Minors M1 to M8: two were fixed in <code>cc2b88b</code> (restoring a node makes pending rows due; a folder marker is checked with a HEAD first on stores without conditions); the rest are parked for slice 2.</td></tr>
+<tr><td>Final review</td><td>A disconnect that fails leaves the library read-only without emitting <code>source.mode_changed</code>, and only an administrator can switch it back. Safe, parked for slice 2.</td></tr>
+<tr><td>Live check (a)</td><td>A HEAD that answers 404 for a key that does not exist yet is logged as &ldquo;S3 answered 404 (no code)&rdquo;, like a fault.</td></tr>
+<tr><td>Live check (b)</td><td>In library settings, the &ldquo;Switch to read-only&rdquo; button has no gap above the &ldquo;Check every&rdquo; label.</td></tr>
+<tr><td>Live check (c)</td><td>The connect form shows the read-and-write charge sentence while Read only is selected.</td></tr>
+<tr><td>Live check (e)</td><td>The blocked text in settings says &ldquo;the storage refused a change&rdquo; twice.</td></tr>
+</tbody></table></div>
+<p>Minor (d) of the live check, the missing write counts on the Source line, was withdrawn: the line shows &ldquo;Saving 1 file&hellip;&rdquo; while a write is pending.</p>
+
 </section>
 
 <section id="release-state"><h2>38 / Release state</h2>
@@ -2220,11 +2349,11 @@ cargo xtask test -j 3 -p records --test sources</code></pre>
 <tbody>
 <tr><td>Live co-authoring (G4 and G5)</td><td>Built; on in development only when switched on; off in production</td><td><code>Config.live_editors</code> is empty unless <code>SHARECRAFT_LIVE_EDITORS=gridcraft</code> is set and the installed GridCraft build declares the live format. The built-in default stays empty and production stays off until the owner decides (section 32).</td></tr>
 <tr><td>File-share libraries</td><td>Phase 1 (read-only) built</td><td>No folder is approved by default, so nothing can be connected; no page shows it.</td></tr>
-<tr><td>S3 libraries</td><td>Signing library only</td><td>No route, setting or page reaches it.</td></tr>
+<tr><td>S3 libraries</td><td>Signing library and read-only libraries on <code>main</code>; editing (slice 1) on <code>s3-writes</code>, not merged</td><td>A new S3 library is read-only. Only an administrator can make one read and write (section 37).</td></tr>
 </tbody></table></div>
 </section>
 
-<footer>ShareCraft · ThineCraft · Building and running · Updated 22 November 2026<br>Change note: plan G5 is built and its acceptance run is done; its final review and the fixes from that review are the last step. Section 13 says how to check a GridCraft build for live editing; sections 14 and 15 describe the live path (status words, offline, reconnecting, the behind mark, the live-base route); section 21 lists the limits and the two follow-ups before production; section 32 says how to switch live editing on and off and records the acceptance run of 22 November 2026; <code>SHARECRAFT_LIVE_EDITORS</code> is in section 05. Off by default, and off in production until the owner decides.<br>Earlier change note: sections 35 to 38 record the release integration branch: G5 presence, room notices and the live page (not reachable until G5 Task 6), file-share libraries Phase 1 (off until an administrator approves a folder; migration renumbered 0022), the S3 signing library (no route) and how each is kept off. Not a release until the owner says so.<br>Earlier change note: section 34 records plan G4, verified live checkpoints, built on <code>gridcraft-coauthoring-g4</code> and not yet merged: the checkpoint cadence and limits, a lone editor resuming after its own sole-editor checkpoint, a checkpoint dispute stopping the live session with both copies kept, outside replacements kept as major versions, and migration 0020, edited in place (development databases must be reset). The final-review fixes add: <code>ReturnReady</code> sent again on rejoin, same-person and same-build checkers, identity data checked by hash, upload deadlines that scale with size, exclusion from checking only (writing too only while someone else can write), held instead of refused changes during a pause, and optional new join fields. <code>Config.live_editors</code> remains empty until G5. Not a release.<br>Earlier change note: GridCraft co-authoring plan G3 is built and reviewed in-process in the GridCraft fork, but is not merged into its <code>sharecraft</code> branch or connected to a browser host.<br>Describes the development build through plan 5 phase A1, GitHub surfacing, built on <code>github-surfacing</code> and not yet merged, together with the earlier editor, platform, branding and production-mode plans. Not a release.</footer>
+<footer>ShareCraft · ThineCraft · Building and running · Updated 24 November 2026<br>Change note, 24 November 2026: section 37 now records editable S3 storage, slice 1, on the branch <code>s3-writes</code> (not merged): the two modes and who chooses them, the guard, how a write flows, the write probe, the 512 MiB limit, editor-save coalescing, migration 0025, the commands, what the live check on 24 November 2026 did and did not check, and the deferred items. Section 38 gains the S3 row. Not a release.<br>Earlier change note: plan G5 is built and its acceptance run is done; its final review and the fixes from that review are the last step. Section 13 says how to check a GridCraft build for live editing; sections 14 and 15 describe the live path (status words, offline, reconnecting, the behind mark, the live-base route); section 21 lists the limits and the two follow-ups before production; section 32 says how to switch live editing on and off and records the acceptance run of 22 November 2026; <code>SHARECRAFT_LIVE_EDITORS</code> is in section 05. Off by default, and off in production until the owner decides.<br>Earlier change note: sections 35 to 38 record the release integration branch: G5 presence, room notices and the live page (not reachable until G5 Task 6), file-share libraries Phase 1 (off until an administrator approves a folder; migration renumbered 0022), the S3 signing library (no route) and how each is kept off. Not a release until the owner says so.<br>Earlier change note: section 34 records plan G4, verified live checkpoints, built on <code>gridcraft-coauthoring-g4</code> and not yet merged: the checkpoint cadence and limits, a lone editor resuming after its own sole-editor checkpoint, a checkpoint dispute stopping the live session with both copies kept, outside replacements kept as major versions, and migration 0020, edited in place (development databases must be reset). The final-review fixes add: <code>ReturnReady</code> sent again on rejoin, same-person and same-build checkers, identity data checked by hash, upload deadlines that scale with size, exclusion from checking only (writing too only while someone else can write), held instead of refused changes during a pause, and optional new join fields. <code>Config.live_editors</code> remains empty until G5. Not a release.<br>Earlier change note: GridCraft co-authoring plan G3 is built and reviewed in-process in the GridCraft fork, but is not merged into its <code>sharecraft</code> branch or connected to a browser host.<br>Describes the development build through plan 5 phase A1, GitHub surfacing, built on <code>github-surfacing</code> and not yet merged, together with the earlier editor, platform, branding and production-mode plans. Not a release.</footer>
 </main></div>
 </body>
 </html>

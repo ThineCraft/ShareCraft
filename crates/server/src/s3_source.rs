@@ -23,7 +23,7 @@ use crate::source_sync::{Hidden, SyncError};
 /// The most keys asked for in one listing page.
 pub const PAGE: u16 = 1000;
 /// The longest relative path shown, in characters.
-const MAX_RELATIVE_CHARS: usize = 400;
+pub(crate) const MAX_RELATIVE_CHARS: usize = 400;
 /// The longest name shown, in bytes.
 const MAX_SEGMENT_BYTES: usize = 255;
 
@@ -161,7 +161,7 @@ pub async fn list_bucket(
 }
 
 /// Whether one `/`-separated segment of a key can be a name in a library.
-fn nameable_segment(segment: &str) -> bool {
+pub(crate) fn nameable_segment(segment: &str) -> bool {
     !segment.is_empty()
         && segment != "."
         && segment != ".."

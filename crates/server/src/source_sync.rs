@@ -1504,6 +1504,25 @@ async fn run<S: StorageSource>(
     let user = connector(state, config, &listing.bookmark, listing.credit.as_deref()).await?;
     source.list(state, &mut listing).await?;
     let recorded = db.source_items(library).await.map_err(db_failed)?;
+    // Files with a change waiting to be written are left alone: a tracked one keeps its
+    // recorded entry and nothing is planned for it; a new one's path is not taken from the
+    // listing (its write may have landed before its finish was recorded).
+    let pending = db.pending_writes_of(library).await.map_err(db_failed)?;
+    if !pending.is_empty() {
+        let tracked: HashSet<NodeId> = recorded.iter().map(|item| item.node).collect();
+        let mut new_paths = HashSet::new();
+        for row in pending {
+            if tracked.contains(&row.node) {
+                listing.protected.insert(row.node);
+            } else {
+                new_paths.insert(row.path);
+            }
+        }
+        let folder = config.folder.trim_matches('/');
+        listing.entries.retain(|entry| {
+            below(&entry.path, folder).is_none_or(|path| !new_paths.contains(path))
+        });
+    }
     let protected_paths: HashSet<String> = recorded
         .iter()
         .filter(|item| listing.protected.contains(&item.node))

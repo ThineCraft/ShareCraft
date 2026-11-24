@@ -5,6 +5,7 @@
 // shows the queue's progress and answers its questions. Nothing runs at import.
 
 import { formatSize, goToSignIn, messageFor, policyRefusalText, quotaRefusalText, seg } from './common.js';
+import { sourceWriteErrorText } from './source-panel.js';
 
 /** The size of one chunk: 8 MiB. */
 export const CHUNK = 8 * 1024 * 1024;
@@ -599,6 +600,12 @@ export class UploadQueue {
         return new Stop(`“${file.name}” cannot be uploaded here: its name or kind is not supported.`);
       case 'name_taken':
         return new Stop(`A file named “${file.name}” is already here.`);
+      // A bucket that takes writes refuses a file that is too large, or a library that is blocked.
+      case 'source_file_too_large':
+      case 'source_write_blocked':
+      case 'source_action_unavailable':
+      case 'source_writes_pending':
+        return new Stop(sourceWriteErrorText(result.error, result.data));
       case 'blocked_file_type':
       case 'file_too_large':
         return new Stop(policyRefusalText(result.error, result.data, file.name));

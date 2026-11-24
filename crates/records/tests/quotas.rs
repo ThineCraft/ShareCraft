@@ -63,6 +63,7 @@ fn upload<'a>(owner: UserId, site: NodeId, parent: NodeId, size: u64) -> NewUplo
         sha256: [7; 32],
         base: None,
         on_conflict: None,
+        external: false,
     }
 }
 

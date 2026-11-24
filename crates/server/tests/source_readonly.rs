@@ -147,6 +147,18 @@ const ROUTES: &[(&str, Decision)] = &[
         Allowed("wakes the sync, which is what changes a connected library's files"),
     ),
     (
+        "POST /api/libraries/{id}/source/writes/{node}/retry",
+        Allowed(
+            "retries or discards a change already accepted; the bucket is changed only by the              write worker",
+        ),
+    ),
+    (
+        "DELETE /api/libraries/{id}/source/writes/{node}",
+        Allowed(
+            "retries or discards a change already accepted; the bucket is changed only by the              write worker",
+        ),
+    ),
+    (
         "POST /api/libraries/{id}/source/webhook",
         Allowed("a webhook secret for the connection, not files"),
     ),
@@ -638,7 +650,7 @@ fn a_route_list_guard() {
         unclassified.is_empty() && gone.is_empty(),
         "routes not classified in ROUTES: {unclassified:?}; recorded but not registered: {gone:?}"
     );
-    assert_eq!(routes.len(), 161, "the number of registered routes changed");
+    assert_eq!(routes.len(), 163, "the number of registered routes changed");
     let mut mounts_sorted = mounts.clone();
     mounts_sorted.sort();
     let mut expected: Vec<String> = MOUNTS.iter().map(|m| (*m).to_owned()).collect();
@@ -662,6 +674,13 @@ fn a_route_list_guard() {
         assert!(
             ROUTES.contains(&(row.route, Guarded)),
             "{} is not a guarded route",
+            row.route
+        );
+        // Every row says what a read-and-write S3 library does with it.
+        assert!(
+            row.s3rw.is_some(),
+            "{:?} ({}) has no S3 read-and-write decision",
+            row.act,
             row.route
         );
     }
@@ -703,64 +722,106 @@ enum Act {
     DeleteLibrary,
 }
 
-/// A row: the request, the route it goes to, and its status in an ordinary library.
+/// What a read-and-write S3 library does with a row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum S3rw {
+    /// Slice 1 lets it through and the change is staged for the bucket: it answers as in an
+    /// ordinary library.
+    Succeeds,
+    /// Refused with this code (for a bulk request, its one item).
+    Refused(&'static str),
+}
+
+use S3rw::{Refused, Succeeds};
+
+/// A row: the request, the route it goes to, its status in an ordinary library, and its
+/// decision in a read-and-write S3 library.
 struct Row {
     act: Act,
     route: &'static str,
     ok: u16,
+    s3rw: Option<S3rw>,
 }
 
-const fn row(act: Act, route: &'static str, ok: u16) -> Row {
-    Row { act, route, ok }
+const fn row(act: Act, route: &'static str, ok: u16, s3rw: S3rw) -> Row {
+    Row {
+        act,
+        route,
+        ok,
+        s3rw: Some(s3rw),
+    }
 }
+
+const UNAVAILABLE: S3rw = Refused("source_action_unavailable");
+const READ_ONLY: S3rw = Refused("source_read_only");
 
 /// The table: one row per way a guarded route can change a library. Destructive rows (the
 /// folder and the library themselves) come last.
 const ROWS: &[Row] = &[
-    row(Act::CreateFolder, "POST /api/nodes/{id}/children", 201),
-    row(Act::CreateDoc, "POST /api/docs", 201),
-    row(Act::Upload, "POST /api/docs/upload", 201),
-    row(Act::UploadReplacing, "POST /api/docs/upload", 200),
-    row(Act::StartNewFile, "POST /api/uploads", 201),
-    row(Act::StartNewVersion, "POST /api/uploads", 201),
-    row(Act::Chunk, "PUT /api/uploads/{id}", 200),
-    row(Act::Finish, "POST /api/uploads/{id}/finish", 201),
-    row(Act::Rename, "PATCH /api/nodes/{id}", 200),
-    row(Act::MoveWithin, "PATCH /api/nodes/{id}", 200),
-    row(Act::MoveIn, "PATCH /api/nodes/{id}", 200),
-    row(Act::MoveOut, "PATCH /api/nodes/{id}", 200),
-    row(Act::CopyIn, "POST /api/nodes/{id}/copy", 201),
-    row(Act::CopyWithin, "POST /api/nodes/{id}/copy", 201),
-    row(Act::Delete, "DELETE /api/nodes/{id}", 204),
-    row(Act::Restore, "POST /api/bin/{id}/restore", 200),
-    row(Act::BulkMove, "POST /api/bulk", 200),
-    row(Act::BulkMoveIn, "POST /api/bulk", 200),
-    row(Act::BulkMoveOut, "POST /api/bulk", 200),
-    row(Act::BulkCopyIn, "POST /api/bulk", 200),
-    row(Act::BulkDelete, "POST /api/bulk", 200),
-    row(Act::BulkRestore, "POST /api/bulk", 200),
+    row(
+        Act::CreateFolder,
+        "POST /api/nodes/{id}/children",
+        201,
+        Succeeds,
+    ),
+    // A blank file has no bytes to store.
+    row(Act::CreateDoc, "POST /api/docs", 201, UNAVAILABLE),
+    row(Act::Upload, "POST /api/docs/upload", 201, Succeeds),
+    row(Act::UploadReplacing, "POST /api/docs/upload", 200, Succeeds),
+    row(Act::StartNewFile, "POST /api/uploads", 201, Succeeds),
+    row(Act::StartNewVersion, "POST /api/uploads", 201, Succeeds),
+    row(Act::Chunk, "PUT /api/uploads/{id}", 200, Succeeds),
+    row(Act::Finish, "POST /api/uploads/{id}/finish", 201, Succeeds),
+    row(Act::Rename, "PATCH /api/nodes/{id}", 200, UNAVAILABLE),
+    row(Act::MoveWithin, "PATCH /api/nodes/{id}", 200, UNAVAILABLE),
+    row(Act::MoveIn, "PATCH /api/nodes/{id}", 200, UNAVAILABLE),
+    row(Act::MoveOut, "PATCH /api/nodes/{id}", 200, UNAVAILABLE),
+    row(Act::CopyIn, "POST /api/nodes/{id}/copy", 201, UNAVAILABLE),
+    row(
+        Act::CopyWithin,
+        "POST /api/nodes/{id}/copy",
+        201,
+        UNAVAILABLE,
+    ),
+    row(Act::Delete, "DELETE /api/nodes/{id}", 204, UNAVAILABLE),
+    row(Act::Restore, "POST /api/bin/{id}/restore", 200, UNAVAILABLE),
+    row(Act::BulkMove, "POST /api/bulk", 200, UNAVAILABLE),
+    row(Act::BulkMoveIn, "POST /api/bulk", 200, UNAVAILABLE),
+    row(Act::BulkMoveOut, "POST /api/bulk", 200, UNAVAILABLE),
+    row(Act::BulkCopyIn, "POST /api/bulk", 200, UNAVAILABLE),
+    row(Act::BulkDelete, "POST /api/bulk", 200, UNAVAILABLE),
+    row(Act::BulkRestore, "POST /api/bulk", 200, UNAVAILABLE),
     row(
         Act::FromTemplate,
         "POST /api/libraries/{id}/from-template",
         201,
+        UNAVAILABLE,
     ),
-    row(Act::Save, "PUT /api/docs/{id}/content", 200),
+    row(Act::Save, "PUT /api/docs/{id}/content", 200, Succeeds),
     // In an ordinary library these reach the live room's ticket check: the file has no live
-    // room here, so no ticket can be held (403). A connected library refuses them first.
+    // room here, so no ticket can be held (403). A connected library refuses them first; a
+    // bucket file never opens in a live room.
     row(
         Act::LiveCheckpoint,
         "PUT /api/docs/{id}/live-checkpoint",
         403,
+        READ_ONLY,
     ),
     row(
         Act::LiveHash,
         "POST /api/docs/{id}/live-checkpoint/hash",
         403,
+        READ_ONLY,
     ),
-    row(Act::RenameFolder, "PATCH /api/nodes/{id}", 200),
-    row(Act::RenameLibrary, "PATCH /api/nodes/{id}", 200),
-    row(Act::DeleteFolder, "DELETE /api/nodes/{id}", 204),
-    row(Act::DeleteLibrary, "DELETE /api/nodes/{id}", 204),
+    row(Act::RenameFolder, "PATCH /api/nodes/{id}", 200, UNAVAILABLE),
+    row(Act::RenameLibrary, "PATCH /api/nodes/{id}", 200, READ_ONLY),
+    row(
+        Act::DeleteFolder,
+        "DELETE /api/nodes/{id}",
+        204,
+        UNAVAILABLE,
+    ),
+    row(Act::DeleteLibrary, "DELETE /api/nodes/{id}", 204, READ_ONLY),
 ];
 
 /// The files of the fixture's `docs` folder, each for its own row.
@@ -1302,7 +1363,7 @@ impl Env {
             Act::CreateFolder => (
                 Method::POST,
                 format!("/api/nodes/{}/children", fx.docs),
-                json!({ "kind": "folder", "name": "New folder" }),
+                json!({ "kind": "folder", "name": format!("New folder {}", user.id.0) }),
             ),
             Act::CreateDoc => (
                 Method::POST,
@@ -1310,8 +1371,10 @@ impl Env {
                 json!({ "parent": fx.docs, "name": "Notes" }),
             ),
             Act::Upload | Act::UploadReplacing => {
+                // One new file per person: the S3 table runs every row for two on one fixture.
+                let uploaded = format!("uploaded-{}.txt", user.id.0);
                 let (name, mut query) = if act == Act::Upload {
-                    ("uploaded.txt", vec![])
+                    (uploaded.as_str(), vec![])
                 } else {
                     ("replace-me.txt", vec![("on_conflict", "replace")])
                 };
@@ -1333,7 +1396,7 @@ impl Env {
                 "/api/uploads".to_owned(),
                 json!({
                     "parent": fx.docs,
-                    "name": "started.txt",
+                    "name": format!("started-{}.txt", user.id.0),
                     "size": 2,
                     "sha256": sha_hex(b"ab"),
                 }),
@@ -1653,6 +1716,72 @@ async fn every_write_route_is_refused_in_an_s3_library() {
             let answered = env.perform(&fx, user, row.act).await;
             assert_refused(row.act, who, &answered);
         }
+    }
+}
+
+/// The `message` of `409 source_action_unavailable`, word for word.
+const UNAVAILABLE_MESSAGE: &str = "This cannot be done yet in a library stored in S3. Uploading files, saving and making folders work; renaming, moving, copying and deleting come later.";
+
+/// The table against a read-and-write S3 library, for its owner and for an administrator: a
+/// `Refused` row answers its code (with its message), and a `Succeeds` row answers as in an
+/// ordinary library.
+#[tokio::test]
+async fn every_guarded_route_follows_its_s3_read_write_decision() {
+    let env = Env::new().await;
+    let fx = env
+        .fixture_for(Some(SourceKind::S3), &[&env.olive, &env.admin])
+        .await;
+    env.server
+        .records_db()
+        .set_source_mode(NodeId(fx.library.parse().unwrap()), SourceMode::ReadWrite)
+        .await
+        .unwrap();
+    for (user, who) in [
+        (&env.olive, "s3 read-write owner"),
+        (&env.admin, "s3 read-write administrator"),
+    ] {
+        for row in ROWS {
+            let (status, body) = env.perform(&fx, user, row.act).await;
+            let code = match row.s3rw.unwrap() {
+                Succeeds => {
+                    assert_eq!(status.as_u16(), row.ok, "{:?} as {who}: {body}", row.act);
+                    continue;
+                }
+                Refused(code) => code,
+            };
+            if is_bulk(row.act) {
+                assert_eq!(status, StatusCode::OK, "{:?} as {who}: {body}", row.act);
+                assert_eq!(body[0]["ok"], false, "{:?} as {who}: {body}", row.act);
+                assert_eq!(body[0]["error"], code, "{:?} as {who}: {body}", row.act);
+                continue;
+            }
+            assert_eq!(
+                status,
+                StatusCode::CONFLICT,
+                "{:?} as {who}: {body}",
+                row.act
+            );
+            assert_eq!(body["error"], code, "{:?} as {who}: {body}", row.act);
+            let message = if code == "source_read_only" {
+                MESSAGE
+            } else {
+                UNAVAILABLE_MESSAGE
+            };
+            assert_eq!(body["message"], message, "{:?} as {who}: {body}", row.act);
+        }
+    }
+    // Nothing but the uploads, new folders and saves reached the bucket (the finished sessions'
+    // files go to the library's top).
+    for (method, key, _) in env.s3.writes() {
+        assert_eq!(method, "PUT", "{key}");
+        assert!(
+            key.starts_with("docs/uploaded-")
+                || key.starts_with("finish-")
+                || key.starts_with("docs/New folder ")
+                || key == "docs/replace-me.txt"
+                || key == "docs/sheet.xlsx",
+            "{key}"
+        );
     }
 }
 
@@ -1996,10 +2125,17 @@ async fn reading_listing_previewing_and_sharing_still_work() {
 /// An editor opened on a file of a connected library joins with a viewer's seat: `can_edit`
 /// false and no token, even for its owner and an administrator, and a save with any token is
 /// refused. An access change while it is open (which reads access afresh) keeps it read-only.
+/// So for a GitHub, a file-share and a read-only S3 library.
 #[tokio::test]
 async fn an_editor_opens_a_connected_file_read_only() {
     let env = Env::new().await;
-    let fx = env.fixture(true, &[]).await;
+    for kind in [SourceKind::Github, SourceKind::Share, SourceKind::S3] {
+        let fx = env.fixture_for(Some(kind), &[]).await;
+        editor_opens_read_only(&env, &fx).await;
+    }
+}
+
+async fn editor_opens_read_only(env: &Env, fx: &Fixture) {
     let sheet = DocId(fx.item("sheet.xlsx").parse().unwrap());
     let mut editors = Vec::new();
     for user in [&env.olive, &env.admin] {

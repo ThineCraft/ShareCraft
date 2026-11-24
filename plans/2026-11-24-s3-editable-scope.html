@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Editable S3 storage: scope</title>
+<style>
+:root{--bg:#fff;--fg:#1d1d1f;--muted:#5f6368;--line:#d9dce1;--band:#f3f5f8;--head:#e8ecf2;--accent:#0b57d0}
+@media (prefers-color-scheme:dark){:root{--bg:#16181c;--fg:#e8eaed;--muted:#a0a6ad;--line:#33373d;--band:#1f2228;--head:#262a31;--accent:#8ab4f8}}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:860px;margin:0 auto;padding:24px 16px 48px}
+h1{font-size:1.6rem;margin:0 0 4px}h2{font-size:1.2rem;margin:32px 0 8px}
+p.sub{color:var(--muted);margin:0 0 16px}
+.scroll{position:relative;overflow-x:auto;margin:0 0 16px}
+table{border-collapse:collapse;width:100%;min-width:520px}
+th,td{text-align:left;vertical-align:top;padding:8px 10px;border-bottom:1px solid var(--line)}
+th{background:var(--head)}
+tbody tr:nth-child(even){background:var(--band)}
+ul,ol{padding-left:1.3em}
+code{font-size:.92em}
+</style>
+</head>
+<body>
+<main>
+<h1>Editable S3 storage</h1>
+<p class="sub">Proposal for the owner, 24 November 2026. Phase 1 (read-only) is on main at 78bfd6a. Nothing below is built yet.</p>
+
+<h2>What editable S3 involves</h2>
+<p>People add, replace, edit, rename and delete files in a library, and ShareCraft makes the same change in the bucket. Four pieces of work make that safe:</p>
+<ul>
+<li><b>Never overwrite someone else's change.</b> Every save names the version it started from. ShareCraft asks the bucket to accept the write only if the object is still that version. Cloudflare's documentation (checked today) says R2 does this check atomically, on a single upload and on finishing a large upload. If the object has changed, ShareCraft keeps both: your edit is saved beside the original as a named copy.</li>
+<li><b>Never lose an accepted save.</b> A save is kept in ShareCraft first, shown as "saving", checked by the virus scanner, and then written to the bucket by the background worker. A restart, going offline or a refused key keeps it queued. Editor saves are grouped, so the bucket gets at most one write per file every 30 seconds.</li>
+<li><b>Moves and deletes are not atomic in S3.</b> A rename is a copy and then a delete, once for every object. R2 has no object versioning, so a deleted file goes to a hidden <code>.sharecraft-bin/</code> holding folder in the bucket for 93 days. That keeps the recycle bin and Restore working.</li>
+<li><b>Modes and permissions.</b> Each library is read-only or read and write. Before a library is switched to read and write, ShareCraft runs a short write probe, which leaves nothing in the bucket. A key that may only read is refused for read and write, in plain words. A refused write blocks the library ("read-only until fixed") and drops nothing.</li>
+</ul>
+
+<h2>What it depends on</h2>
+<p>The S3 plan's Phase 2 (its Tasks 18–31) was written to reuse the file-share plan's write path, which is that plan's Tasks 15–21: the pending-write records, the staging and write worker, the mode-aware guard, editor saves, and delete with the holding folder. <b>None of that exists.</b> The file-share work stopped at its Task 9. Its Phase 1 Tasks 10–14 and all of Phase 2 are unbuilt, and its Phase 2 is gated on a check against a real share.</p>
+<div class="scroll"><table>
+<thead><tr><th>Route</th><th>What happens</th><th>Rough time</th></tr></thead>
+<tbody>
+<tr><td>As planned: file share first</td><td>Finish file-share Phase 1 (Tasks 10–14) and its write path (Tasks 15–21), and only then S3 Phase 2.</td><td>4–5 weeks before S3 can save anything</td></tr>
+<tr><td><b>Proposed: S3 first</b></td><td>Build the shared write path once, store-neutral, with S3 as its first store. Later, the file share adds its own arm (its safe-write code and the Windows specifics) instead of building the shared part. The file-share Phase 2 cards get rewritten when that work starts.</td><td>About 1½ weeks for slice 1</td></tr>
+</tbody>
+</table></div>
+<p>S3 first is the safer order as well as the quicker one: R2 refuses a conflicting write by itself, whereas a file share has a race window that the file-share plan only narrows. The cost is that the shared code will have been tested against one store. When the file share joins it, some of it may need reshaping.</p>
+
+<h2>Proposed first slice: edit files in the bucket</h2>
+<div class="scroll"><table>
+<thead><tr><th>In slice 1</th><th>Detail</th></tr></thead>
+<tbody>
+<tr><td>Read-and-write mode</td><td>Chosen when connecting, or switched later in the library's Source section. The write probe runs first. Only administrators may choose read and write for now (the plan's own recommendation, because a writable key with a wrong prefix can damage a bucket other systems rely on).</td></tr>
+<tr><td>Upload and replace</td><td>Staged, scanned, then sent with a conditional upload. A conflict gives a named copy, "name (edited by Ann Tester 2026-11-24 14.05).ext". No site quota is used, since the bytes live in the bucket.</td></tr>
+<tr><td>Editor saves</td><td>WordCraft, GridCraft and the other editors get the editing seat in a writable S3 library. Saves are answered at once and written to the bucket at most once every 30 seconds, plus a final write when the session ends.</td></tr>
+<tr><td>New folder</td><td>A zero-byte folder marker, created only if the name is free.</td></tr>
+<tr><td>Saving state and Retry</td><td>The library and file pages show "saving" and any failed write, with Retry and Discard buttons.</td></tr>
+<tr><td>Size limit</td><td>One upload per file, up to 512 MiB. Larger files are refused with a plain message until multipart uploads arrive (slice 2).</td></tr>
+<tr><td>Proof</td><td>Fake-S3 tests for every rule above, a whole-branch review, then a live check on your R2 bucket. You make a test bucket and an Object Read &amp; Write token, and you type the key. In that check we upload, edit and save a document, force a conflict from the Cloudflare dashboard, and check that no leftover probe or upload remains.</td></tr>
+</tbody>
+</table></div>
+
+<h2>Slice 2 (about 1 more week), and later</h2>
+<div class="scroll"><table>
+<thead><tr><th>Item</th><th>When</th></tr></thead>
+<tbody>
+<tr><td>Rename and move (copy, then delete; folders capped at 1,000 objects)</td><td>Slice 2</td></tr>
+<tr><td>Delete into the holding folder, Restore, Purge, and the 93-day sweep</td><td>Slice 2</td></tr>
+<tr><td>Multipart uploads for files over 512 MiB, and the sweep that cancels abandoned ones</td><td>Slice 2</td></tr>
+<tr><td>Copy within a bucket (server side) and between libraries</td><td>Slice 2</td></tr>
+<tr><td>Delete markers and "Restore this version" (buckets with versioning, which means AWS S3 and not R2)</td><td>Later, with Task 13's version history</td></tr>
+<tr><td>Budget enforcement and saving the usage counts (Task 12, still deferred from Phase 1)</td><td>Later. Writes are counted, but nothing caps them yet.</td></tr>
+<tr><td>Stores that ignore conditional writes (some MinIO setups): allowed, with the risk stated</td><td>Slice 1 records what the probe finds. The warning text comes in slice 2.</td></tr>
+</tbody>
+</table></div>
+
+<h2>Risks I can see now</h2>
+<ul>
+<li>Editor saves need the file session (<code>file_room.rs</code>, changed recently for G5) to save to a staged write instead of Git. If that takes more than a small change, the task stops and reports rather than reshaping the editors. Live co-authoring rooms are not touched.</li>
+<li>Once a library is in read-and-write mode, deletes made in the bucket by others still show up as deletions in ShareCraft, exactly as now. Slice 1 adds no recycle-bin record for them.</li>
+<li>The migration is number 0025 (main uses up to 0024).</li>
+<li>The live R2 check uses a few hundred write requests, which is inside R2's free monthly allowance. I will re-read Cloudflare's price page and state the cost before asking for your yes.</li>
+</ul>
+
+<h2>How it is built</h2>
+<p>A new work branch, <code>s3-writes</code>, cut from main 78bfd6a. It follows the same process as Phase 1: an implementer and a reviewer for each task, local targeted tests, and a full <code>check.yml</code> run after you approve a push. Nothing is merged or pushed without your go-ahead.</p>
+</main>
+</body>
+</html>

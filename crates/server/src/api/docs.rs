@@ -152,6 +152,21 @@ pub(crate) struct DocDetail {
     /// File-share metadata for an external document.
     #[serde(skip_serializing_if = "Option::is_none")]
     external: Option<ExternalDetail>,
+    /// A change to this file accepted and not yet written to its bucket.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    writes: Option<WriteMark>,
+}
+
+/// Where a change accepted for a bucket stands.
+#[derive(Serialize)]
+struct WriteMark {
+    /// `saving`, or `failed` when writing it failed and a retry is waited for.
+    state: &'static str,
+    /// Why it failed: shown only to the change's author and the library's owners.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    /// Whether the caller may Retry or Discard it: its author, or an owner of the library.
+    may_resolve: bool,
 }
 
 #[derive(Serialize)]
@@ -210,7 +225,9 @@ pub(crate) async fn open(
             stored_through: collab_core::ids::Seq(0),
         });
     let (scan, threat) = scan_fields(mark);
-    let session = match crate::ws::room_kind_for(&state, document.editor) {
+    // A bucket file's session is never live; if that cannot be told, nothing is answered.
+    let bucket_file = crate::source_write::is_bucket_file(&state, doc).await?;
+    let session = match crate::ws::room_kind_for(&state, document.editor, bucket_file) {
         crate::ws::RoomKind::Live => "live",
         crate::ws::RoomKind::File => "file",
         crate::ws::RoomKind::Text => "text",
@@ -219,21 +236,56 @@ pub(crate) async fn open(
         .external_item(NodeId(doc.0))
         .await
         .map_err(|e| ApiError::unavailable(&e))?;
-    let revision = external.as_ref().map_or_else(
-        || document.revision.clone(),
-        |item| Some(item.revision.clone()),
-    );
-    let external = external.map(|item| ExternalDetail {
-        bytes: item.size,
-        modified_at: OffsetDateTime::from_unix_timestamp_nanos(i128::from(item.mtime_ns))
-            .ok()
-            .and_then(|at| at.format(&Rfc3339).ok()),
-        read: item.sha256.is_some(),
-        unavailable: item.unavailable.map(unavailable_name),
-        storage_class_archived: records::external_tag_parts(&item.tag, item.size)
-            .is_some_and(|parts| parts.archived)
-            .then_some(true),
-    });
+    // A change waiting to be written is the file's current revision, also of a new file the
+    // store does not have yet.
+    let pending = db
+        .pending_write(NodeId(doc.0))
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?;
+    let revision = match (&pending, &external) {
+        (Some(pending), _) => Some(pending.revision.clone()),
+        (None, Some(item)) => Some(item.revision.clone()),
+        (None, None) => document.revision.clone(),
+    };
+    let writes = match &pending {
+        None => None,
+        Some(pending) => {
+            let failed = pending.state == records::PendingState::Failed;
+            let may_resolve = pending.by == signed.session.user.id
+                || db
+                    .effective_access(signed.session.user.id, pending.library)
+                    .await
+                    .map_err(|e| ApiError::unavailable(&e))?
+                    .is_some_and(|held| held.can_manage_access());
+            let may_see_error = failed && may_resolve;
+            Some(WriteMark {
+                state: if failed { "failed" } else { "saving" },
+                error: pending.error.clone().filter(|_| may_see_error),
+                may_resolve,
+            })
+        }
+    };
+    let staged_bytes = pending.as_ref().map(|pending| pending.blob.size);
+    let external = match (external, staged_bytes) {
+        (None, Some(bytes)) => Some(ExternalDetail {
+            bytes,
+            modified_at: None,
+            read: true,
+            unavailable: None,
+            storage_class_archived: None,
+        }),
+        (external, _) => external.map(|item| ExternalDetail {
+            bytes: staged_bytes.unwrap_or(item.size),
+            modified_at: OffsetDateTime::from_unix_timestamp_nanos(i128::from(item.mtime_ns))
+                .ok()
+                .and_then(|at| at.format(&Rfc3339).ok()),
+            read: item.sha256.is_some(),
+            unavailable: item.unavailable.map(unavailable_name),
+            storage_class_archived: records::external_tag_parts(&item.tag, item.size)
+                .is_some_and(|parts| parts.archived)
+                .then_some(true),
+        }),
+    };
     Ok(Json(DocDetail {
         id: document.id.0.to_string(),
         name: document.name,
@@ -245,6 +297,7 @@ pub(crate) async fn open(
         scan,
         threat,
         external,
+        writes,
     }))
 }
 
