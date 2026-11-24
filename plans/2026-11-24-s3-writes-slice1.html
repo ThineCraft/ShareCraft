@@ -1,0 +1,629 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>S3 writes slice 1</title>
+<style>
+:root{--bg:#fff;--fg:#1d1d1f;--muted:#5f6368;--line:#d9dce1;--band:#f3f5f8;--head:#e8ecf2;--accent:#0b57d0;--card:#fafbfc;--code:#eef1f5}
+@media (prefers-color-scheme:dark){:root{--bg:#16181c;--fg:#e8eaed;--muted:#a0a6ad;--line:#33373d;--band:#1f2228;--head:#262a31;--accent:#8ab4f8;--card:#1b1e23;--code:#23272e}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:900px;margin:0 auto;padding:24px 16px 48px}
+h1{font-size:1.6rem;margin:0 0 4px}h2{font-size:1.25rem;margin:36px 0 8px;padding-top:12px;border-top:1px solid var(--line)}
+h3{font-size:1.08rem;margin:0 0 8px}h4{font-size:.98rem;margin:14px 0 6px}
+p{margin:0 0 12px}p.sub{color:var(--muted);margin:0 0 16px}
+a{color:var(--accent)}
+.scroll{position:relative;overflow-x:auto;margin:0 0 16px}
+table{border-collapse:collapse;width:100%;min-width:520px}
+th,td{text-align:left;vertical-align:top;padding:8px 10px;border-bottom:1px solid var(--line)}
+th{background:var(--head)}
+tbody tr:nth-child(even){background:var(--band)}
+ul,ol{padding-left:1.3em;margin:0 0 12px}li{margin-bottom:5px}
+ul.band>li:nth-child(even),ol.band>li:nth-child(even){background:var(--band);border-radius:4px}
+code{font-family:Consolas,Menlo,monospace;font-size:.88em;background:var(--code);padding:1px 4px;border-radius:3px;overflow-wrap:anywhere}
+pre{background:var(--code);border:1px solid var(--line);border-radius:6px;padding:10px 12px;overflow-x:auto;font:13px/1.5 Consolas,Menlo,monospace;margin:0 0 12px}
+pre code{background:none;padding:0;font-size:inherit;overflow-wrap:normal}
+.task{background:var(--card);border:1px solid var(--line);border-radius:9px;padding:14px 16px 6px;margin:20px 0}
+.note{border-left:4px solid var(--accent);background:var(--card);padding:10px 14px;margin:0 0 14px}
+.note p:last-child{margin:0}
+.small{font-size:.9rem;color:var(--muted)}
+</style>
+</head>
+<body>
+<main>
+<h1>Editable S3 storage, slice 1: task cards</h1>
+<p class="sub">Implementation plan, 24 November 2026. Branch <code>s3-writes</code> in <code>H:\Source\repos\ThineCraft\ShareCraft-s3w</code>, cut from main 78bfd6a. The scope is <a href="2026-11-24-s3-editable-scope.html">2026-11-24-s3-editable-scope.html</a>; its "In slice 1" table is binding. Nothing below is built yet.</p>
+
+<div class="note">
+<p><b>What changes from the S3 plan's Phase 2.</b> That plan (<a href="2026-11-18-s3-surfacing.html">2026-11-18-s3-surfacing.html</a>, Tasks 18 to 31) assumed the file-share write path existed: <code>share_ops</code>, <code>stage</code>, <code>write_due</code>, <code>writable_place</code>, <code>Place</code>, <code>source_writes</code>, <code>WriteError</code>. None of it is in the code: the file-share work stopped at its Task 9. This plan builds that shared path once, store-neutral, with S3 as its first store. Shared parts go in <code>crates/server/src/source_write.rs</code> and <code>crates/records/src/source_writes.rs</code>; everything that talks to a bucket goes in <code>crates/server/src/s3_write.rs</code>. No file-share write code is written. Where the old cards and the real code disagree, the cards below follow the code and say so.</p>
+</div>
+
+<h2>Contents</h2>
+<div class="scroll"><table>
+<thead><tr><th>Task</th><th>What it builds</th><th>Needs</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>Records for writing: migration 0025, pending writes, write state, mode, upload sessions without quota</td><td>nothing</td></tr>
+<tr><td>2</td><td>The S3 client's write calls (conditional PUT, DELETE) and the fake's write half</td><td>nothing</td></tr>
+<tr><td>3</td><td>Safe writes to a bucket (<code>s3_write.rs</code>), the write probe, the shared write types</td><td>2</td></tr>
+<tr><td>4</td><td>Modes, the mode-aware guard, the probe in connect and change, the route table</td><td>1, 3</td></tr>
+<tr><td>5</td><td>Staging, the external checkpointer, the write worker, conflict copies; simple upload and replace</td><td>4</td></tr>
+<tr><td>6</td><td>Chunked uploads, new folder, the 512 MiB limit, Retry and Discard routes, saving marks</td><td>5</td></tr>
+<tr><td>7</td><td>Editor saves: the editing seat, 30-second coalescing, flush when the session ends</td><td>5</td></tr>
+<tr><td>8</td><td>Pages: connect and settings choices, banner, saving state, Retry and Discard</td><td>6, 7</td></tr>
+<tr><td>9</td><td>Whole-slice review and one fix wave</td><td>1 to 8</td></tr>
+<tr><td>10 (controller)</td><td>Live check on the owner's R2 bucket</td><td>9</td></tr>
+<tr><td>11</td><td>The records: BUILDING.html, scope.html, sequencing.html</td><td>10</td></tr>
+</tbody>
+</table></div>
+
+<h2>Rulings already made</h2>
+<ul class="band">
+<li><b>S3 first, store-neutral.</b> The shared write path is built once with S3 as its only store. <code>Store</code> has one arm, <code>Store::S3</code>; the file share adds <code>Store::Share</code> later. Shared names are neutral: <code>source_writes</code>, <code>source_write</code>, <code>stage</code>, <code>write_due</code>.</li>
+<li><b>Only administrators choose read and write</b>, when connecting and when switching later. Owners may switch a library back to read-only. A new S3 library is still read-only unless an administrator asks for read and write (this differs from the S3 plan, which made read and write the default).</li>
+<li><b>Migration 0025</b> (<code>0025_source_writes.sql</code>). Main uses up to 0024. The S3 plan's <code>0023_s3_writes.sql</code> and the file-share plan's <code>0021_file_share_writes.sql</code> are not written.</li>
+<li><b>One PUT per file, at most 512 MiB.</b> Larger files are refused before any byte is stored, in plain words. Multipart is slice 2.</li>
+<li><b>Out of slice 1, and refused</b> in a read-and-write S3 library with the code <code>source_action_unavailable</code>: rename, move, delete, restore, copy in, new blank file, new from template. The library node itself keeps its current refusals.</li>
+<li><b>Writes are counted by the existing meter</b> (<code>S3::count</code>, class <code>Write</code>), nothing caps them, and the counts are still not saved to <code>source_usage</code>: Phase 1 never calls <code>S3::take_usage</code> (budget work stays deferred).</li>
+<li><b>No site quota is used</b> by uploads or saves into an S3 library: the bytes live in the bucket. Staged content lives in the external-content cache (<code>source_cache</code>) until written.</li>
+<li><b>The write probe runs before read and write is allowed</b> and leaves nothing. A key that may only read is refused with 422 in plain words. What the probe learns about conditional writes is recorded in <code>source_s3.conditional</code>.</li>
+<li><b>A refused write blocks the library</b> ("read-only until fixed"), drops nothing, and a passing probe restores it.</li>
+<li><b>Editor saves go through the file session</b> by giving external files a different <code>Checkpointer</code>; <code>live_room.rs</code> does not change, and a bucket file never opens in a live room.</li>
+<li><b>Writes are never retried inside the S3 client.</b> The worker's back-off retries them, and every retry starts with a HEAD. Each PUT carries <code>x-amz-meta-sharecraft-sha256</code> so that a write whose answer was lost is recognised as ours rather than as a conflict.</li>
+</ul>
+
+<h2>Global constraints</h2>
+<ul class="band">
+<li>Rust 2024. Workspace lints deny <code>unwrap_used</code>, <code>expect_used</code>, <code>panic</code> and <code>indexing_slicing</code>; <code>unsafe_code</code> is forbidden. Test files carry <code>#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]</code> as the existing ones do.</li>
+<li>No new crates. <code>git diff 78bfd6a -- Cargo.lock</code> must show no added package, and no <code>Cargo.toml</code> gains a dependency. Revert unrelated <code>Cargo.lock</code> churn before reporting. A task that seems to need a crate stops and reports. Streaming a request body uses <code>reqwest::Body::wrap_stream</code> (the <code>stream</code> feature is already on) with a <code>futures-util</code> stream; <code>tokio-util</code> is not a dependency and is not added.</li>
+<li>Operating-system TLS only: every S3 request goes through the existing <code>reqwest</code> client built with native-tls, certificate checks on, https only except <code>Config::s3_plain_loopback</code> in tests.</li>
+<li>Windows features need no per-machine administrator work.</li>
+<li>Migrations: never edit an applied migration; LF line endings. This plan adds only <code>crates/records/migrations/0025_source_writes.sql</code>. Once Task 1 is committed it is not edited; a later need is a new numbered file.</li>
+<li>The secret key exists in plain text only in the request that supplies it and in memory while signing. It never appears in Git, an event, a log line, an error, a Debug output, a URL or an API answer.</li>
+<li>Events carry counts, node ids and library-relative paths only: never the endpoint address, bucket, prefix, key or key id. <code>write_error</code>, <code>last_error</code> and every API message is a plain sentence of ours, at most 300 characters. Text from an S3 error body reaches the server log only as its Code word.</li>
+<li>Every change to a bucket goes through <code>crates/server/src/s3_write.rs</code> and nowhere else. A read-only library is never written to. Nothing outside the library's prefix is ever written.</li>
+<li>Never overwrite an outside change knowingly, never drop an accepted save silently, never write content before the scan gate lets it through.</li>
+<li>Real services cost the owner money. No implementer run and no test touches a real endpoint; only controller Task 10 does, after the owner's explicit yes to a stated cost. The controller never creates a bucket or token and never types or reads a secret key.</li>
+<li>Pages are plain HTML and JavaScript in <code>web/</code>, no build step, light and dark, usable from 375 px wide, keyboard and screen-reader usable, nothing told by colour alone; tables and long lists carry alternating row shading. Documents are HTML, never Markdown.</li>
+<li>Commits end with <code>Co-Authored-By: Claude Opus 5.5 &lt;noreply@anthropic.com&gt;</code>. The controller commits; implementer runs never run a Git command that changes state. Nothing is merged into main or pushed without the owner.</li>
+</ul>
+
+<h2>How this plan is executed</h2>
+<p><b>Roles.</b> For each task the controller starts one implementer run with write access in the worktree, pasting the task card together with Global constraints, this section, Rulings already made and Shared types. When it reports, the controller commits exactly the files it names (never <code>git add -A</code>), writes one ledger line, and starts a read-only review run with the card and its Review focus. Findings go to a new fix run (never a resumed one); at most five fix rounds per task.</p>
+<p><b>The report file.</b> Every run writes <code>.superpowers/sdd/2026-11-24-s3-writes-slice1.html/task-N-report.md</code> (fix rounds <code>task-N-fix-k-report.md</code>, reviews <code>task-N-review.md</code>). First line: <code>Status: done</code> or <code>Status: stopped</code>. Then: files created and changed; each command run with pass and fail counts copied from its output; anything outside the card's file list and why; any place the code departs from the card and why; anything not run. A run never says a suite passed unless it ran it. The ledger is <code>.superpowers/sdd/2026-11-24-s3-writes-slice1.html/progress.md</code>, excluded through <code>.git/info/exclude</code>.</p>
+<p><b>Seams every card allows</b> (listed under "Outside the file list", no stop): test-support files (<code>crates/server/tests/common/*.rs</code>, <code>crates/records/src/test_support.rs</code>), including new faults and counters on <code>fake_s3.rs</code>; test-only setters named <code>set_*_for_tests</code> that change no production default; new <code>ApiError</code>, <code>AccessError</code> or <code>SyncError</code> variants mapped wherever the existing ones are; read-only plumbing in <code>crates/records/src/sources.rs</code> to expose a field the card names; a new field on a struct that test files construct, with the test files updated. Anything else outside the file list, a signature here that does not fit the code, or a need for a crate: stop and report.</p>
+<p><b>Visibility.</b> Integration tests in <code>crates/server/tests/</code> can only call <code>pub</code> items. The S3 plan made the client's write calls <code>pub(crate)</code> and then tested them from <code>tests/s3_client.rs</code>, which cannot compile. Here they are <code>pub</code> with a doc line "only <code>s3_write.rs</code> calls this"; the review checks that with a search.</p>
+<p><b>Commands</b> (PowerShell, from the worktree root):</p>
+<pre><code>$env:CARGO_TARGET_DIR = 'J:\cargo-target\sharecraft-s3w'
+$env:CARGO_INCREMENTAL = '0'
+# Load .env into the process without printing it. Never echo, cat or log .env or any database URL.
+Get-Content .env | ForEach-Object { if ($_ -match '^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$') { Set-Item -Path ("env:" + $Matches[1]) -Value $Matches[2].Trim('"') } }
+cargo test -j 3 -p records --test source_writes
+cargo test -j 3 -p server --test s3_write -- --test-threads=1
+cargo clippy -j 3 -p records -p server --all-targets
+cargo fmt --all
+node --test web/</code></pre>
+<ul class="band">
+<li>Builds use at most three jobs. Run <code>cargo test -p &lt;crate&gt; --test &lt;name&gt;</code> directly, one test binary at a time; never <code>cargo xtask test</code>. Every <code>s3_*</code>, <code>share_*</code> and <code>source_*</code> server binary runs with <code>-- --test-threads=1</code>.</li>
+<li>Tests need <code>TEST_DATABASE_URL</code> (PostgreSQL 18); each test gets its own schema through <code>TestDb::create</code>.</li>
+<li>Local runs are targeted. The full suite runs on GitHub <code>check.yml</code> after the owner approves a push.</li>
+<li>Known load-sensitive tests (rerun alone and report both results): <code>scan::scanner_failures_hold_and_retry</code>, <code>library_kinds::new_from_template_copies_latest_version_only</code>, the webhook permit-duration test in <code>source_worker</code>, the disconnect and case-collision tests in <code>source_api</code>.</li>
+<li>No wall-clock sleeps for correctness: drive time through a <code>now</code> argument (<code>write_due(state, now)</code>), wait on conditions with the existing 5-second helpers, shorten waits through test setters. No test connects to anything but 127.0.0.1.</li>
+</ul>
+
+<h2>Shared types</h2>
+<p>Names used by more than one task. A task that produces one writes it exactly so; a task that consumes one does not rename it. "exists" marks what is on main today.</p>
+<pre><code>// records::sources (exists)
+SourceKind::{Github, Share, S3}; SourceMode::{ReadWrite, ReadOnly}   // library_sources.mode already allows read_write for share and s3
+S3Place { endpoint, bucket, prefix, access_key_id, versioning: Versioning, conditional: Tri }
+Tri::{Yes, No, Unknown}; Db::set_s3_probe(library, Versioning, Tri)
+ExternalEntry { node, path, repository_path, size, mtime_ns, tag: Option&lt;String&gt; }
+ExternalItem { library, node, kind, location, repository_path, size, mtime_ns, tag, revision, sha256, unavailable, version }
+object_tag(size, modified_s, etag, archived) -&gt; String; new_external_revision() -&gt; String
+Db::{source_library_of, source_of, external_item, record_external_item, set_external_seen,
+     upsert_source_items, try_lock_source, bump_source_generation, pin_cached, unpin_cached}
+
+// records::source_writes (Task 1, new module, re-exported from records::lib)
+pub enum WriteState { Ok, Blocked }                       // 'ok' | 'blocked'
+pub enum PendingState { Scanning, Ready, Failed }         // 'scanning' | 'ready' | 'failed'
+pub const COALESCE: time::Duration = time::Duration::seconds(30);
+pub struct NewPendingWrite&lt;'a&gt; { pub node: NodeId, pub library: NodeId, pub path: &amp;'a str,
+    pub blob: BlobRef, pub base_tag: Option&lt;&amp;'a str&gt;, pub by: UserId, pub flush: bool, pub now: OffsetDateTime }
+pub struct PendingWrite { pub node: NodeId, pub library: NodeId, pub path: String, pub blob: BlobRef,
+    pub revision: String, pub base_tag: Option&lt;String&gt;, pub by: UserId, pub state: PendingState,
+    pub error: Option&lt;String&gt;, pub attempts: u32, pub next_try_at: Option&lt;OffsetDateTime&gt;,
+    pub flush: bool, pub first_staged_at: OffsetDateTime, pub staged_at: OffsetDateTime }
+AccessError::WritesPending                                // new variant
+NewUpload.external: bool; UploadSession.external: bool    // records::uploads
+
+// server::s3 (Task 2)
+pub enum Cond&lt;'a&gt; { None, IfMatch(&amp;'a str), IfAbsent }
+pub struct PutBody { pub path: Option&lt;PathBuf&gt; /* None: zero bytes */, pub size: u64, pub sha256: [u8; 32] }
+pub const SINGLE_PUT_MAX: u64 = 512 * 1024 * 1024;
+ObjectHead.sha256: Option&lt;String&gt;                       // from x-amz-meta-sharecraft-sha256
+
+// server::source_write (Tasks 3 to 7, new)
+pub enum WriteError { Denied, Offline, NameTaken, Gone, NoSpace, TooLarge, Failed }
+pub struct Base { pub tag: Option&lt;String&gt; /* None: must not exist */, pub sha256: Option&lt;[u8; 32]&gt; }
+pub struct Seen { pub tag: String, pub size: u64, pub modified: OffsetDateTime }
+pub enum Written { Done(Seen), Conflict }
+pub enum Probe { ReadWrite { conditional: Tri }, ReadOnly, Unreachable(&amp;'static str) }
+pub fn sibling_name(name: &amp;str, person: &amp;str, at: OffsetDateTime) -&gt; String
+pub(crate) enum Store { S3(S3WriteTarget) }               // Store::Share comes with the file-share work
+pub(crate) struct S3WriteTarget { pub library: NodeId, pub conditional: Tri }
+pub(crate) enum Place { Ordinary, External(Store) }       // not crate::room::Place, which is the room registry entry
+pub(crate) async fn writable_place(db: &amp;Db, user: UserId, node: NodeId) -&gt; Result&lt;Place, ApiError&gt;
+pub(crate) async fn stage(state: &amp;AppState, s: &amp;StageRequest&lt;'_&gt;) -&gt; Result&lt;String, StageError&gt;
+pub(crate) enum StageError { Blocked, TooLarge, Failed }
+pub(crate) struct ExternalCheckpointer;                   // impl revisions Checkpointer for bucket files
+pub async fn write_due(state: &amp;AppState, now: OffsetDateTime) -&gt; usize
+
+// server::s3_write (Task 3, new)
+pub async fn write_object(..) -&gt; Result&lt;Written, WriteError&gt;; write_beside; make_folder; probe_writes; object_key</code></pre>
+
+<h2>Review focus</h2>
+<p>Conditions the happy path never meets. Each has a named test in the task that owns the code; Task 9 checks them again across the branch.</p>
+<ul class="band">
+<li><b>A write that destroys something.</b> An outside change overwritten on a store that honours conditions; a 412 or 409 taken for success; a write retried inside the client after an answer was lost; a key built without the prefix or with <code>..</code>; a probe that leaves its object (Tasks 2, 3).</li>
+<li><b>An accepted save that can be lost.</b> A save answered <code>Saved</code> with no pending row; staged content evicted, swept or released while a row names it; a restart, a session end, a mode switch or a blocked library dropping a row; a superseded stage lost by <code>finish_write</code> (Tasks 1, 5, 7).</li>
+<li><b>Content written before the scan.</b> Every PUT of user content passes <code>Db::availability</code> first; infected content is never written (Task 5).</li>
+<li><b>The guard per mode, route by route.</b> Every guarded route has an S3 read-and-write decision; refused routes stay refused; a person who cannot see the node gets 404; a blocked library refuses writes and still reads (Task 4).</li>
+<li><b>Races.</b> The write worker and a listing touching the same library without the source lock; a listing that removes, renames or re-tags a node with a pending row; a mode switch racing a write; two saves from one base (Tasks 4, 5, 7).</li>
+<li><b>Echo.</b> The tag recorded after a write not matching what the next listing computes (a phantom change, or a missed one) (Task 5).</li>
+<li><b>Quota and counting.</b> An upload or save into an S3 library touching site usage or reservations; a write request not counted (Tasks 2, 5, 6, 7).</li>
+<li><b>Nothing else changes.</b> GitHub libraries, file-share libraries, read-only S3 libraries, ordinary uploads and file sessions, and live co-authoring rooms behave exactly as before; <code>live_room.rs</code> is untouched.</li>
+</ul>
+
+<h2>File structure</h2>
+<div class="scroll"><table>
+<thead><tr><th>File</th><th>Responsibility</th></tr></thead>
+<tbody>
+<tr><td><code>crates/records/migrations/0025_source_writes.sql</code> (new)</td><td>Write state on <code>library_sources</code>; the <code>source_writes</code> table; <code>upload_sessions.external</code>.</td></tr>
+<tr><td><code>crates/records/src/source_writes.rs</code> (new)</td><td>Pending writes, write state, mode change. Store-neutral.</td></tr>
+<tr><td><code>crates/records/src/{sources.rs, uploads.rs, blobs.rs, scans.rs, tree.rs, sites.rs, lib.rs}</code></td><td>Disconnect refusal, <code>source_item_of</code>, quota-free upload sessions, staged content counted as referenced, purge cleanup, exports.</td></tr>
+<tr><td><code>crates/server/src/s3.rs</code></td><td>Conditional PUT, DELETE, the content-hash metadata, bytes-up counting.</td></tr>
+<tr><td><code>crates/server/src/s3_write.rs</code> (new)</td><td>The only code that changes a bucket: safe write, write beside, folder marker, probe, key building.</td></tr>
+<tr><td><code>crates/server/src/source_write.rs</code> (new)</td><td>Shared write types, the guard's <code>Place</code>, staging, the external checkpointer, the write worker, Retry and Discard. Store-neutral apart from the <code>Store::S3</code> arms.</td></tr>
+<tr><td><code>crates/server/src/{lib.rs, external.rs, source_sync.rs, s3_source.rs, ws.rs, checkpoint.rs, file_room.rs}</code></td><td>Worker start and file-session storage choice; staged content served; listing protection; nameable rule shared; room kind and seat; the session-ended hook (one call in <code>file_room.rs</code>).</td></tr>
+<tr><td><code>crates/server/src/api/{nodes.rs, content.rs, uploads.rs, docs.rs, sources.rs, libraries.rs, bulk.rs, mod.rs}</code></td><td>The guard at every call site, the new routes, the new errors, connect and change with a mode.</td></tr>
+<tr><td><code>crates/server/tests/common/fake_s3.rs</code></td><td>The write half of the fake: conditions, metadata, DELETE, faults, write log.</td></tr>
+<tr><td><code>crates/records/tests/source_writes.rs</code>, <code>crates/server/tests/{s3_write.rs, s3_modes.rs, s3_uploads.rs, s3_write_routes.rs, s3_sessions.rs}</code> (new); <code>tests/{s3_client.rs, s3_api.rs, source_readonly.rs}</code> (modify)</td><td>Tests, one new file per task.</td></tr>
+<tr><td><code>web/{source-panel.js, source-panel.test.mjs, library.js, library.html, library-settings.js, library-settings.html, site.js, site.html, file.js}</code></td><td>Mode choice, banner, saving marks, Retry and Discard.</td></tr>
+</tbody>
+</table></div>
+
+<h2>What the code looks like today (verified 24 November)</h2>
+<div class="scroll"><table>
+<thead><tr><th>Thing</th><th>Where and what</th></tr></thead>
+<tbody>
+<tr><td>The read-only guard</td><td><code>api/nodes.rs</code>: <code>require_not_connected(db, node)</code> and <code>require_not_connected_for(db, user, node)</code>, answering <code>ApiError::SourceReadOnly</code> (409 <code>source_read_only</code>) for any library with a <code>library_sources</code> row. Called from <code>api/nodes.rs</code> (delete_checked, restore_checked, create, change twice, copy), <code>api/content.rs</code> (save, live_checkpoint, live_checkpoint_hash, upload), <code>api/uploads.rs</code> (start twice, refuse_connected), <code>api/docs.rs</code> (create), <code>api/libraries.rs</code> (from-template), <code>api/bulk.rs</code> (two places).</td></tr>
+<tr><td>The seat</td><td><code>api/nodes.rs</code>: <code>seat_access</code> and <code>read_only_seat</code>, used by <code>ws.rs</code> (<code>visitor</code> and the access re-check) and by <code>recheck</code> in <code>api/mod.rs</code> (its own <code>connected</code> test).</td></tr>
+<tr><td>The source lock</td><td><code>Db::try_lock_source(library) -&gt; Option&lt;SourceLock&gt;</code>, a transaction-scoped advisory lock; the sync worker holds it for a whole pass (<code>start_worker_sync</code> in <code>source_sync.rs</code>); <code>disconnect</code> waits up to 10 s for it.</td></tr>
+<tr><td>Mode</td><td><code>library_sources.mode</code> exists (0022) and 0024 already allows <code>read_write</code> for kind <code>s3</code>. <code>SourceMode::ReadWrite</code> exists in records but nothing reads it. <code>connect_s3</code> refuses any mode but <code>read_only</code> with 422.</td></tr>
+<tr><td>Materialise</td><td><code>external::materialise(state, node)</code> dispatches on <code>ExternalItem.kind</code>; <code>materialise_s3</code> does HEAD, tag compare-and-set, cache, GET with <code>If-Match</code>, <code>store_body</code>, <code>pin_and_record</code>, <code>finish_read</code> with <code>scan_gate</code> (waits up to 20 s for a pending scan).</td></tr>
+<tr><td>The scan gate</td><td><code>Db::availability(sha256)</code> (<code>None</code> = available). <code>Db::pin_cached</code> claims the blob as an upload (<code>Origin::Upload</code>), so pinned content is held while its scan is pending.</td></tr>
+<tr><td>The file session's save path</td><td><code>file_room.rs</code>: a <code>WriteJob</code> runs <code>write_claimed(blobs, db, store, ..)</code> on <code>Storage.store: Arc&lt;dyn Checkpointer&gt;</code>; the session's revision comes from <code>store.load(doc)</code> at start. <code>AppState::open_file_room(doc, name)</code> in <code>lib.rs</code> always passes the Git checkpointer. <code>write_claimed</code> with <code>db: None</code> makes no claim and counts no usage.</td></tr>
+<tr><td>The meter</td><td><code>S3::count(library, class, requests, bytes_down)</code>; the private <code>Meter::add</code> never adds <code>bytes_up</code>; <code>S3::take_usage</code> is never called, <code>unflushed_usage</code> feeds the Source answer.</td></tr>
+<tr><td>The client</td><td><code>S3::send</code> signs with an empty payload hash, sends no body, and retries 429 and 5xx up to <code>RETRIES</code> times. <code>mapped()</code> maps 412 to <code>Precondition</code> and 409 to <code>Other</code>.</td></tr>
+<tr><td>The fake</td><td><code>fake_s3.rs</code> answers every non-GET, non-HEAD with 501 <code>NotImplemented</code>, counts it as <code>"write"</code>, caps bodies at 16 MiB. <code>change_before_get(key, bytes)</code> replaces an object right after answering a HEAD.</td></tr>
+<tr><td>Listing protection</td><td><code>source::Listing.protected</code> (set by the share source for unreadable folders) is carried by <code>source_sync::run</code>: protected nodes keep their recorded entry and are not planned. S3 sets it empty.</td></tr>
+<tr><td>Names</td><td><code>records::reserved_name</code> hides <code>.sharecraft-bin</code> and <code>.sharecraft-tmp-*</code>; <code>s3_source::nameable_segment</code> (private) is the rule the listing uses to show a key segment.</td></tr>
+<tr><td>Uploads</td><td>The pages upload only through chunked sessions (<code>web/upload.js</code>, 8 MiB chunks); <code>Db::start_upload</code> reserves the declared size against the site's quota.</td></tr>
+<tr><td>AppState</td><td><code>lib.rs</code>: <code>db()</code>, <code>s3()</code>, <code>sources()</code>, <code>blobs()</code>, <code>rooms()</code>, <code>events()</code>, <code>config()</code>; workers started in <code>serve_state</code>.</td></tr>
+</tbody>
+</table></div>
+
+<!-- ===================================================== -->
+<h2>Task cards</h2>
+
+<div class="task">
+<h3>Task 1: records for writing</h3>
+<p><b>Files.</b> Create <code>crates/records/migrations/0025_source_writes.sql</code>, <code>crates/records/src/source_writes.rs</code>, <code>crates/records/tests/source_writes.rs</code>. Modify <code>crates/records/src/{sources.rs, uploads.rs, blobs.rs, scans.rs, tree.rs, sites.rs, lib.rs}</code>.</p>
+<h4>Migration 0025 (LF endings)</h4>
+<pre><code>alter table library_sources
+  add column write_state text not null default 'ok' check (write_state in ('ok', 'blocked')),
+  add column write_error text check (write_error is null or char_length(write_error) &lt;= 300);
+
+create table source_writes (
+  node_id uuid primary key references nodes(id),
+  -- No cascade: a disconnect is refused while writes are pending.
+  library_id uuid not null references library_sources(library_id),
+  -- The path below the library's place, as source_items.repository_path writes it.
+  path text not null check (char_length(path) between 1 and 1024),
+  sha256 text not null references blobs(sha256),
+  size bigint not null check (size &gt;= 0),
+  revision text not null check (revision ~ '^[0-9a-f]{40}$'),
+  -- The tag the change was based on; null: the file is new and must not exist.
+  base_tag text,
+  by_user uuid not null references users(id),
+  state text not null check (state in ('scanning', 'ready', 'failed')),
+  error text check (error is null or char_length(error) &lt;= 300),
+  attempts integer not null default 0 check (attempts &gt;= 0),
+  next_try_at timestamptz,
+  flush boolean not null default false,
+  first_staged_at timestamptz not null,
+  staged_at timestamptz not null
+);
+create index source_writes_library on source_writes (library_id);
+create index source_writes_sha256 on source_writes (sha256);
+
+alter table upload_sessions add column external boolean not null default false;</code></pre>
+<p class="small">The file-share plan's <code>delete_mode</code> column and <code>source_bin</code> table belong to delete (slice 2) and are not added. The <code>path</code> column is new: the file-share plan kept a new file's path nowhere, but the listing needs it to leave an unwritten new file alone.</p>
+<h4>Interfaces</h4>
+<p>Produces the <code>records::source_writes</code> types in Shared types, and:</p>
+<pre><code>impl Db {
+  pub async fn set_source_mode(&amp;self, library: NodeId, mode: SourceMode) -&gt; Result&lt;bool, AccessError&gt;;
+  pub async fn write_state(&amp;self, library: NodeId) -&gt; Result&lt;Option&lt;(WriteState, Option&lt;String&gt;)&gt;, DbError&gt;;
+  pub async fn set_write_state(&amp;self, library: NodeId, state: WriteState, error: Option&lt;&amp;str&gt;) -&gt; Result&lt;bool, DbError&gt;;
+  pub async fn stage_write(&amp;self, w: &amp;NewPendingWrite&lt;'_&gt;) -&gt; Result&lt;String, DbError&gt;;   // the new revision
+  pub async fn pending_write(&amp;self, node: NodeId) -&gt; Result&lt;Option&lt;PendingWrite&gt;, DbError&gt;;
+  pub async fn pending_writes_of(&amp;self, library: NodeId) -&gt; Result&lt;Vec&lt;PendingWrite&gt;, DbError&gt;;
+  pub async fn pending_counts(&amp;self, library: NodeId) -&gt; Result&lt;(u64, u64), DbError&gt;;     // (saving, failed)
+  pub async fn due_writes(&amp;self, now: OffsetDateTime, limit: i64) -&gt; Result&lt;Vec&lt;PendingWrite&gt;, DbError&gt;;
+  pub async fn finish_write(&amp;self, node: NodeId, sha256: &amp;[u8; 32], tag: &amp;str, size: u64,
+                            modified: OffsetDateTime) -&gt; Result&lt;bool, DbError&gt;;
+  pub async fn fail_write(&amp;self, node: NodeId, sha256: &amp;[u8; 32], error: &amp;str,
+                          next_try_at: OffsetDateTime) -&gt; Result&lt;bool, DbError&gt;;
+  pub async fn retry_write(&amp;self, node: NodeId, now: OffsetDateTime) -&gt; Result&lt;bool, DbError&gt;;
+  pub async fn flush_write(&amp;self, node: NodeId, now: OffsetDateTime) -&gt; Result&lt;bool, DbError&gt;;
+  pub async fn drop_write(&amp;self, node: NodeId, sha256: &amp;[u8; 32]) -&gt; Result&lt;bool, DbError&gt;;
+  pub async fn source_item_of(&amp;self, node: NodeId) -&gt; Result&lt;Option&lt;SourceItem&gt;, DbError&gt;;
+}</code></pre>
+<h4>Rules</h4>
+<ul class="band">
+<li><code>set_source_mode</code> refuses <code>read_write</code> for a GitHub source (<code>InvalidSetting</code>) and refuses <code>read_only</code> while the library has pending rows (<code>AccessError::WritesPending</code>, judged in the same transaction with the source row locked <code>FOR UPDATE</code>). A real change advances the generation and answers <code>true</code>.</li>
+<li><code>set_write_state</code> cuts the error to 300 characters and answers whether the state changed.</li>
+<li><code>stage_write</code> is one transaction: lock the <code>blobs</code> row <code>FOR SHARE</code> (the caller pinned it with <code>pin_cached</code>); upsert the row, keeping the first <code>base_tag</code> and <code>first_staged_at</code> when one exists and replacing content, size, <code>by_user</code>, <code>staged_at</code> and <code>flush</code> (true wins); state <code>scanning</code>, <code>error</code> null, <code>attempts</code> 0, <code>next_try_at</code> null; mint a revision (<code>new_external_revision</code>) and, when the node has a <code>source_items</code> row, write it to <code>source_items.revision</code> too.</li>
+<li>A pending row is a reference to its content everywhere a cache pin is: <code>release_blob_if_unreferenced</code>, <code>unreferenced_blobs</code>, <code>due_scans</code> and <code>queue_unscanned</code> count <code>source_writes</code>; <code>coldest_cached</code> skips content a pending row names; <code>unpin_cached</code> answers <code>false</code> and removes nothing for such content.</li>
+<li><code>due_writes</code> answers rows whose <code>next_try_at</code> is null or passed, that are <code>flush</code> or were first staged <code>COALESCE</code> or more before <code>now</code>, oldest first, and leaves scanning rows alone otherwise. The scan decision is the caller's (<code>Db::availability</code>), not SQL.</li>
+<li><code>finish_write</code> is compare-and-set on the staged hash, one transaction. For a tracked node it writes the item's tag (<code>blob_sha</code>), size and <code>modified_at</code>; when the row still holds <code>sha256</code> it also sets <code>content_sha256</code>, <code>read_at</code>, clears <code>unavailable</code>, <code>missing_since</code> and <code>version_id</code>, keeps the row's revision as <code>source_items.revision</code>, and deletes the row (<code>true</code>). For a new file it inserts the <code>source_items</code> row (<code>path = repository_path =</code> the row's path) with the row's revision. If a newer stage arrived meanwhile it answers <code>false</code>, leaves the row, and sets its <code>base_tag</code> to <code>tag</code>.</li>
+<li><code>fail_write</code> sets state <code>failed</code>, the error, <code>attempts + 1</code> and <code>next_try_at</code>; <code>retry_write</code> makes a row due at once (state back to <code>scanning</code>, error kept until written); <code>flush_write</code> sets <code>flush</code>. Each is refused (<code>false</code>) for other content where it takes a hash.</li>
+<li><code>drop_write</code> removes the row if it still holds <code>sha256</code>; for a tracked node it also mints a fresh <code>source_items.revision</code> (the staged revision is withdrawn; the item's content is the bucket's again).</li>
+<li>Disconnect (<code>disconnect_source</code>, <code>disconnect_source_as</code>) answers <code>WritesPending</code> while rows exist. Purging a node (<code>tree.rs</code>, next to <code>delete from source_items where node_id = any($1)</code>) and purging a site (<code>sites.rs</code>, next to its <code>delete from source_items</code>) delete the nodes' pending rows in the same transaction.</li>
+<li><code>start_upload</code> with <code>external: true</code> checks no quota and reserves nothing; <code>end_upload</code> and <code>claim_upload</code> release or answer nothing for such a session (a zero-byte reservation, or <code>None</code> where the code allows it: say which in the report).</li>
+</ul>
+<p><b>Write failing tests in <code>crates/records/tests/source_writes.rs</code>:</b> <code>staging_mints_a_revision_and_records_the_base_and_the_path</code>; <code>a_second_stage_keeps_the_first_base_and_time_and_replaces_the_content</code>; <code>staging_a_tracked_file_moves_its_revision_and_a_new_file_keeps_it_in_the_row</code>; <code>staged_content_is_referenced_and_cannot_be_released_evicted_or_unpinned</code>; <code>due_writes_wait_for_the_throttle_and_the_retry_time_and_flush_skips_the_throttle</code>; <code>finish_write_sets_the_tag_keeps_the_revision_and_removes_the_row</code>; <code>finish_write_for_superseded_content_keeps_the_row_and_moves_its_base</code>; <code>finishing_a_new_file_creates_its_tracking_row</code>; <code>fail_retry_flush_and_drop_are_refused_for_other_content</code>; <code>dropping_a_tracked_write_withdraws_its_revision</code>; <code>mode_round_trips_and_github_cannot_be_read_write</code>; <code>read_only_is_refused_while_writes_are_pending</code>; <code>write_state_round_trips_and_is_cut_to_300_characters</code>; <code>disconnect_is_refused_while_writes_are_pending</code>; <code>purging_a_node_or_a_site_removes_its_pending_rows</code>; <code>an_external_upload_session_reserves_no_quota</code>; <code>migrating_a_phase_1_database_keeps_its_rows</code>.</p>
+<p><b>Run</b> <code>cargo test -j 3 -p records --test source_writes</code>. Expected: fails to compile.</p>
+<p><b>Implement.</b></p>
+<p><b>Run neighbours</b>: <code>--test s3_sources</code>, <code>--test share_sources</code>, <code>--test share_cache</code>, <code>--test sources</code>, <code>--test blobs</code>, <code>--test quotas</code>, <code>--test bin</code>, and <code>cargo build -j 3 -p server --tests</code>. Expected: pass.</p>
+<p><b>Done means</b>: listed tests pass; existing records suites keep their counts; the server builds.</p>
+<p><b>Review focus</b>: a compare-and-set done in two statements; a window where an accepted save has neither a pending row nor a written tag; staged content that something can erase; the migration on a database holding Phase 1 S3 rows and file-share rows; <code>external</code> upload sessions touching <code>reserved</code>.</p>
+</div>
+
+<div class="task">
+<h3>Task 2: the client's write calls and the fake's write half</h3>
+<p><b>Files.</b> Modify <code>crates/server/src/s3.rs</code>, <code>crates/server/tests/common/fake_s3.rs</code>, <code>crates/server/tests/s3_client.rs</code>.</p>
+<h4>Interfaces</h4>
+<pre><code>pub enum Cond&lt;'a&gt; { None, IfMatch(&amp;'a str), IfAbsent }
+pub struct PutBody { pub path: Option&lt;PathBuf&gt;, pub size: u64, pub sha256: [u8; 32] }
+pub const SINGLE_PUT_MAX: u64 = 512 * 1024 * 1024;
+impl S3 {
+  /// Only s3_write.rs calls this.
+  pub async fn put(&amp;self, t: &amp;S3Target, key: &amp;str, body: &amp;PutBody, cond: Cond&lt;'_&gt;) -&gt; Result&lt;ObjectHead, S3Error&gt;;
+  /// Only s3_write.rs calls this (the probe, in slice 1).
+  pub async fn delete(&amp;self, t: &amp;S3Target, key: &amp;str) -&gt; Result&lt;(), S3Error&gt;;
+  pub fn single_put_max(&amp;self) -&gt; u64;
+  pub fn set_single_put_max_for_tests(&amp;self, bytes: u64);
+}
+impl S3Target { pub fn with_prefix(self, prefix: &amp;str) -&gt; S3Target; }   // for the connect probe
+ObjectHead { .., pub sha256: Option&lt;String&gt; }                           // new field</code></pre>
+<h4>Rules</h4>
+<ul class="band">
+<li><code>put</code> refuses before any request when <code>body.size</code> exceeds <code>single_put_max()</code> (<code>S3Error::Unsupported</code>) or the key fails the existing <code>unaskable</code> check. It sends <code>x-amz-content-sha256</code> as the real hex SHA-256 (signed, so the store verifies the bytes), <code>content-length</code>, <code>x-amz-meta-sharecraft-sha256</code> (the same hex), and <code>if-none-match: *</code> for <code>IfAbsent</code> or <code>if-match: &lt;etag&gt;</code> for <code>IfMatch</code>. The body is streamed from <code>body.path</code>, opened at the moment of sending, in pieces of at most 64 KiB; a file whose length differs from <code>size</code> is refused (<code>Other</code>). <code>path: None</code> sends no body (zero bytes).</li>
+<li>Add a private sibling of <code>send</code> (for example <code>send_once</code>) that takes the body and its hash and signs <code>ToSign.payload_sha256</code> with that hash; <code>signed_headers</code> gets the payload hash as a parameter instead of the constant <code>EMPTY_SHA256</code>, reads keep sending the constant. Reads keep <code>send</code> and its retries unchanged.</li>
+<li><b>Writes are sent once.</b> A 429 or 5xx is answered as <code>Throttled</code> with no retry; a transport failure as today. <code>mapped()</code> gains <code>(409, Some("ConditionalRequestConflict")) =&gt; Precondition</code>. A 412 is <code>Precondition</code>. Nothing a store answers for a conditional write is taken for success unless the status is 2xx.</li>
+<li>After a successful PUT the client asks <code>head</code> once and answers it, so the caller records the bucket's real ETag and time. <code>object_head</code> reads <code>x-amz-meta-sharecraft-sha256</code> into <code>ObjectHead.sha256</code> when it is 64 lower-case hex characters.</li>
+<li>Every PUT and DELETE is counted as one <code>Class::Write</code> request against <code>t.library()</code>, and a PUT adds <code>size</code> to <code>bytes_up</code> (extend the private <code>Meter</code> with a bytes-up count; leave the public <code>S3::count</code> signature as it is). The HEAD after a PUT counts as a read, as every HEAD does.</li>
+<li><code>delete</code> sends <code>DELETE</code> on the key; 204 and 404 are both success. It exists for the probe only in slice 1.</li>
+<li>The fake gains: PUT that stores bytes, ETag (MD5-like as <code>etag_of</code> makes now), modified time and the <code>x-amz-meta-sharecraft-sha256</code> header, and checks <code>x-amz-content-sha256</code> against the body (400 <code>XAmzContentSHA256Mismatch</code>); <code>If-None-Match: *</code> on an existing key and <code>If-Match</code> with a different or absent object answer 412 <code>PreconditionFailed</code>; DELETE; faults <code>ignore_conditions()</code> (accepts and ignores both headers), <code>read_only()</code> (403 <code>AccessDenied</code> on every PUT and DELETE), <code>lose_answer_after_write()</code> (stores the object, then answers 503); <code>change_after_head(key, bytes)</code> (the existing <code>change_before_get</code> already replaces an object right after a HEAD; add this name for it, or reuse it and say so); <code>writes()</code>, an ordered log of <code>(method, key, condition)</code> with no header values; <code>object(bucket, key)</code> to read bytes and metadata. Keep the <code>"write"</code> count for PUT and DELETE.</li>
+</ul>
+<p><b>Write failing tests in <code>tests/s3_client.rs</code>:</b> <code>put_round_trips_and_the_store_checks_the_hash</code>; <code>put_if_absent_refuses_an_existing_key</code>; <code>put_if_match_refuses_a_changed_object</code>; <code>a_conflict_answer_is_never_taken_for_success</code> (412, and 409 <code>ConditionalRequestConflict</code>); <code>put_records_the_content_hash_and_head_reads_it</code>; <code>a_write_is_sent_once_even_when_throttled</code>; <code>content_over_the_single_put_limit_is_refused_before_any_request</code>; <code>a_zero_byte_put_sends_no_body</code>; <code>delete_removes_an_object_and_a_missing_one_is_fine</code>; <code>every_write_is_signed_and_counted_with_its_bytes_up</code>; <code>a_read_only_key_is_denied_on_each_write</code>; <code>a_store_that_ignores_conditions_accepts_both</code>. Rename <code>the_client_sends_no_write</code> to <code>reads_send_no_write</code> and keep its body.</p>
+<p><b>Run</b> <code>cargo test -j 3 -p server --test s3_client -- --test-threads=1</code>. Expected: fails to compile.</p>
+<p><b>Implement.</b></p>
+<p><b>Run neighbours</b>: <code>--test s3_content</code>, <code>--test s3_sync</code>, <code>--test s3_api</code>, <code>--test s3_serving</code> (each alone), clippy. Expected: pass; the Phase 1 "no write" tests still pass.</p>
+<p><b>Done means</b>: listed tests pass; a search shows <code>.put(</code> and <code>.delete(</code> on <code>S3</code> called only from tests (and from <code>s3_write.rs</code> once Task 3 exists).</p>
+<p><b>Review focus</b>: a header sent that is not signed, or signed and not sent; the payload hash not matching the bytes streamed; a whole file read into memory; a retry of a conditional PUT; a 412 or 409 mapped to anything but <code>Precondition</code>; the secret or an Authorization value in the fake's log.</p>
+</div>
+
+<div class="task">
+<h3>Task 3: safe writes to a bucket, the probe, the shared write types</h3>
+<p><b>Files.</b> Create <code>crates/server/src/source_write.rs</code> (the shared types only, in this task), <code>crates/server/src/s3_write.rs</code>, <code>crates/server/tests/s3_write.rs</code>. Modify <code>crates/server/src/lib.rs</code> (modules), <code>crates/server/src/s3_source.rs</code> (make <code>nameable_segment</code> <code>pub(crate)</code>).</p>
+<h4>Interfaces</h4>
+<pre><code>// source_write.rs
+pub enum WriteError { Denied, Offline, NameTaken, Gone, NoSpace, TooLarge, Failed }
+pub struct Base { pub tag: Option&lt;String&gt;, pub sha256: Option&lt;[u8; 32]&gt; }
+pub struct Seen { pub tag: String, pub size: u64, pub modified: OffsetDateTime }
+pub enum Written { Done(Seen), Conflict }
+pub enum Probe { ReadWrite { conditional: Tri }, ReadOnly, Unreachable(&amp;'static str) }
+pub fn sibling_name(name: &amp;str, person: &amp;str, at: OffsetDateTime) -&gt; String;
+pub fn numbered_name(name: &amp;str, n: u32) -&gt; String;          // "name (2).ext"
+
+// s3_write.rs: every function takes the S3 client and a target that carries the library's prefix
+pub fn object_key(t: &amp;S3Target, path: &amp;str) -&gt; Option&lt;String&gt;;
+pub async fn write_object(s3: &amp;S3, t: &amp;S3Target, path: &amp;str, body: &amp;PutBody, base: &amp;Base,
+                          conditional: Tri) -&gt; Result&lt;Written, WriteError&gt;;
+pub async fn write_beside(s3: &amp;S3, t: &amp;S3Target, path: &amp;str, body: &amp;PutBody, person: &amp;str,
+                          at: OffsetDateTime) -&gt; Result&lt;(String, Seen), WriteError&gt;;
+pub async fn write_numbered(s3: &amp;S3, t: &amp;S3Target, path: &amp;str, body: &amp;PutBody)
+                          -&gt; Result&lt;(String, Seen), WriteError&gt;;
+pub async fn make_folder(s3: &amp;S3, t: &amp;S3Target, path: &amp;str) -&gt; Result&lt;(), WriteError&gt;;
+pub async fn probe_writes(s3: &amp;S3, t: &amp;S3Target) -&gt; Probe;</code></pre>
+<h4>Rules</h4>
+<ul class="band">
+<li><code>object_key</code> is <code>prefix + path</code>, and <code>None</code> for an empty path, a leading <code>/</code>, an empty, <code>.</code> or <code>..</code> segment, a control character, a segment <code>nameable_segment</code> refuses or <code>reserved_name</code> matches, or a key over 1,024 bytes. Every write function builds its keys only through it; nothing is sent for a <code>None</code>.</li>
+<li><code>seen_of(head)</code> is <code>Seen { tag: object_tag(head.size, head.modified_s, &amp;head.etag, false), size, modified }</code>, the same tag the listing computes, so the next listing sees no change.</li>
+<li><code>write_object</code> with <code>conditional == Tri::Yes</code>: HEAD the key. Not found and <code>base.tag</code> is <code>None</code>: PUT <code>IfAbsent</code>. Found and its tag equals <code>base.tag</code>: PUT <code>IfMatch(head.etag)</code>. Found and <code>head.sha256</code> equals the body's hash: <code>Done</code> without a PUT (an earlier attempt landed and its answer was lost). Anything else: <code>Conflict</code>. A PUT answered <code>Precondition</code>: HEAD again; our hash there is <code>Done</code>, otherwise <code>Conflict</code>. Nothing was overwritten in either case.</li>
+<li>With <code>Tri::No</code> or <code>Tri::Unknown</code>: the same HEAD check, then PUT with <code>Cond::None</code>. This is the stated residual race (one round trip); the caller emits the event. The probe always records <code>Yes</code> or <code>No</code> before a library is writable, so <code>Unknown</code> is treated as <code>No</code>.</li>
+<li>S3 has no content hash for an object written by someone else, so the file-share rule "same bytes are not a conflict" applies only through our own metadata.</li>
+<li>Errors: <code>Denied</code> and <code>BadKeys</code> are <code>Denied</code>; <code>NoBucket</code> is <code>Gone</code>; <code>Throttled</code>, <code>Unreachable</code>, <code>TimedOut</code>, <code>AddressRefused</code>, <code>ClockSkew</code>, <code>WrongRegion</code> are <code>Offline</code>; <code>Unsupported</code> from the size check is <code>TooLarge</code>; the rest <code>Failed</code>. S3 never answers <code>NameTaken</code> from <code>write_object</code> and never <code>NoSpace</code> in slice 1.</li>
+<li><code>sibling_name</code>: <code>"&lt;stem&gt; (edited by &lt;person&gt; &lt;YYYY-MM-DD HH.MM&gt;)&lt;.ext&gt;"</code>, the time in UTC (the <code>time</code> crate has no zone database; see Not checked), the person's name cleaned to characters <code>nameable_segment</code> accepts and cut to 40 characters, the stem shortened so the whole name fits 120 characters, never splitting a character. <code>write_beside</code> PUTs it <code>IfAbsent</code>; a taken name tries <code>numbered_name(sibling, 2..=20)</code>, then <code>Failed</code>. <code>write_numbered</code> does the same with <code>numbered_name(name, 2..=20)</code> (for a new file whose key appeared meanwhile).</li>
+<li><code>make_folder</code> PUTs a zero-byte object <code>"&lt;key&gt;/"</code> with <code>IfAbsent</code>; <code>Precondition</code> (a marker already there) is success. It never deletes.</li>
+<li><code>probe_writes</code> uses one key <code>&lt;prefix&gt;.sharecraft-tmp-probe-&lt;uuid&gt;</code> (the listing already hides it): (1) PUT zero bytes <code>IfAbsent</code>: <code>Denied</code> answers <code>ReadOnly</code>, another failure <code>Unreachable(reason)</code> with the reason words <code>connect_s3</code> uses (<code>keys</code>, <code>bucket</code>, <code>region</code>, <code>clock</code>, <code>address</code>, <code>offline</code>). (2) PUT <code>IfAbsent</code> again: refused means conditions work; accepted means <code>No</code>. (3) PUT <code>IfMatch("\"0\"")</code>: refused confirms <code>Yes</code>; accepted means <code>No</code>. (4) DELETE the key. Four requests, nothing that was there is touched. If (4) fails, the answer is still the probe's finding and the caller logs and records it (Task 4).</li>
+</ul>
+<p><b>Write failing tests in <code>tests/s3_write.rs</code></b> (the fake's write log): <code>replace_is_one_conditional_put_after_a_head</code>; <code>a_new_file_is_put_if_absent</code>; <code>a_target_changed_since_the_base_is_a_conflict_and_is_untouched</code>; <code>a_target_changed_between_head_and_put_is_a_conflict_not_an_overwrite</code>; <code>a_new_key_that_appeared_meanwhile_is_a_conflict</code>; <code>a_write_whose_answer_was_lost_is_recognised_by_its_hash</code>; <code>on_a_store_that_ignores_conditions_the_write_is_head_then_put</code>; <code>write_beside_names_the_copy_and_numbers_it_if_taken</code>; <code>sibling_name_is_nameable_and_fits</code>; <code>write_numbered_takes_the_next_free_name</code>; <code>make_folder_writes_a_zero_byte_marker_and_accepts_an_existing_one</code>; <code>the_probe_finds_read_write_with_conditions</code>; <code>the_probe_finds_a_store_that_ignores_conditions</code>; <code>the_probe_finds_a_read_only_key</code>; <code>the_probe_leaves_nothing</code> (all three fakes); <code>errors_map_to_plain_write_errors</code>; <code>a_bad_path_is_refused_before_any_request</code>; <code>no_key_outside_the_prefix_is_ever_written</code>.</p>
+<p><b>Run</b> <code>cargo test -j 3 -p server --test s3_write -- --test-threads=1</code>. Expected: fails to compile.</p>
+<p><b>Implement.</b></p>
+<p><b>Run neighbours</b>: <code>--test s3_client</code>, <code>--test s3_sync</code> (each alone), clippy. Expected: pass.</p>
+<p><b>Done means</b>: listed tests pass; a search shows <code>S3::put</code> and <code>S3::delete</code> called only in <code>s3_write.rs</code> and tests.</p>
+<p><b>Review focus</b>: <code>Precondition</code> treated as success or retried as an overwrite; a <code>Done</code> answered without the object being ours; a key built without <code>object_key</code>; the probe key left behind or a probe key that the listing would show; a conflict copy whose name the listing would hide or number differently.</p>
+</div>
+
+<div class="task">
+<h3>Task 4: modes, the mode-aware guard, the probe in connect and change</h3>
+<p><b>Files.</b> Modify <code>crates/server/src/source_write.rs</code> (<code>Place</code>, <code>Store</code>, <code>S3WriteTarget</code>, <code>writable_place</code>), <code>api/nodes.rs</code> (the two guards, <code>seat_access</code> unchanged in effect), <code>api/mod.rs</code> (new errors), <code>api/sources.rs</code> (connect, change, show, disconnect), <code>crates/server/tests/source_readonly.rs</code>, <code>crates/server/tests/s3_api.rs</code> (its read-and-write refusal test). Create <code>crates/server/tests/s3_modes.rs</code>.</p>
+<h4>Interfaces</h4>
+<pre><code>pub(crate) enum Store { S3(S3WriteTarget) }
+pub(crate) struct S3WriteTarget { pub library: NodeId, pub conditional: Tri }
+pub(crate) enum Place { Ordinary, External(Store) }
+pub(crate) async fn writable_place(db: &amp;Db, user: UserId, node: NodeId) -&gt; Result&lt;Place, ApiError&gt;;
+// api/mod.rs
+ApiError::SourceActionUnavailable   // 409 source_action_unavailable
+ApiError::SourceWriteBlocked        // 409 source_write_blocked
+ApiError::SourceWritesPending       // 409 source_writes_pending
+ApiError::S3NotWritable             // 422 s3_not_writable
+ApiError::ReadWriteAdminOnly        // 403 read_write_admin_only
+ApiError::SourceWriteNotBuilt       // 409 source_action_unavailable; temporary, removed by Task 7</code></pre>
+<h4>Rules</h4>
+<ul class="band">
+<li><code>writable_place</code> keeps <code>require_not_connected_for</code>'s rules about what someone who cannot see the node is told (404, the recycle-bin case judged by the library). It answers <code>Ordinary</code> outside a connected library; <code>SourceReadOnly</code> for GitHub, file-share and read-only S3 libraries (exactly as today); <code>SourceWriteBlocked</code> for a read-and-write S3 library whose <code>write_state</code> is <code>blocked</code>; otherwise <code>External(Store::S3(..))</code> with the conditional support from <code>s3_place</code>. Endpoint approval is not re-read here: a write to an endpoint no longer approved fails in the worker (<code>S3::target</code> answers <code>AddressRefused</code>) and stays queued.</li>
+<li>The existing guards keep their names and become the refusing form: <code>require_not_connected_for</code> calls <code>writable_place</code> and maps <code>External(_)</code> to <code>SourceActionUnavailable</code> and a blocked library to <code>SourceActionUnavailable</code> too (the action is unavailable whatever the state). <code>require_not_connected</code> does the same for its callers. So every call site that is not changed later stays refused: delete, restore, rename, move, copy in, bulk, blank file, from-template, live checkpoints. The library node itself (delete, rename) keeps <code>SourceReadOnly</code>.</li>
+<li>The routes slice 1 lets through call <code>writable_place</code> directly: <code>POST /api/docs/upload</code> (<code>content::upload</code>), <code>POST /api/uploads</code>, <code>PUT /api/uploads/{id}</code>, <code>POST /api/uploads/{id}/finish</code> (<code>uploads::start</code>, <code>refuse_connected</code>), <code>POST /api/nodes/{id}/children</code> for a folder (<code>nodes::create</code>), <code>PUT /api/docs/{id}/content</code> (<code>content::save</code>). In this task each answers <code>External(_)</code> with <code>SourceWriteNotBuilt</code>; Tasks 5, 6 and 7 replace those arms. Keep the guard in handlers, never in <code>tree::apply</code> or the upload functions (the sync engine calls those).</li>
+<li>The seat stays read-only for every connected library in this task. Task 7 opens it.</li>
+<li><b>Connect.</b> <code>POST /api/sites/{id}/libraries/s3</code> takes <code>mode</code> <code>read_only</code> (default) or <code>read_write</code>; anything else is 422 <code>invalid_request</code>. <code>read_write</code> from someone who is not an administrator (<code>User.is_admin</code>) is 403 <code>read_write_admin_only</code> before the store is asked. For <code>read_write</code>, after the existing <code>probe_bucket</code>, run <code>s3_write::probe_writes</code> on <code>target_from(..).with_prefix(&amp;prefix)</code> within the same 20-second limit: <code>ReadOnly</code> is 422 <code>s3_not_writable</code>, <code>Unreachable(reason)</code> the existing <code>s3_unreachable</code>; nothing is created. A pass records <code>S3Place.conditional</code> from the probe and connects with <code>SourceMode::ReadWrite</code>.</li>
+<li><b>Change.</b> <code>PATCH /api/libraries/{id}/source</code> gains <code>mode?</code> for S3. <code>read_write</code>: administrators only (403 <code>read_write_admin_only</code>); probe with <code>S3::target(state, library)</code> (counted against the library); <code>ReadOnly</code> 422 <code>s3_not_writable</code>; a pass calls <code>set_s3_probe</code>, <code>set_source_mode</code> and <code>set_write_state(Ok, None)</code> (this is also how an administrator retries a blocked library). <code>read_only</code>: owners as today; <code>WritesPending</code> is 409 <code>source_writes_pending</code>. A change emits <code>source.mode_changed {mode}</code> and calls <code>recheck_below(&amp;state, library)</code>.</li>
+<li><b>Probe leftovers.</b> If the probe's DELETE failed, log <code>sharecraft-server: a write probe object could not be removed</code> with the library id only, and emit <code>source.probe_left {name}</code> with the library-relative name (no prefix, no bucket).</li>
+<li><b>Show.</b> <code>GET /api/libraries/{id}/source</code> for S3 adds <code>write_state</code>, <code>write_error</code>, <code>writes: {saving, failed}</code> (from <code>pending_counts</code>), <code>may_choose_read_write</code> (the caller is an administrator) for everyone who may see it, and <code>conditional</code> (<code>yes</code>, <code>no</code>, <code>unknown</code>) only with the other revealed fields.</li>
+<li><b>Disconnect</b> answers 409 <code>source_writes_pending</code> while writes are pending, before anything is removed.</li>
+<li>Messages, word for word: <code>s3_not_writable</code> "This access key may read the bucket but not write to it. Connect the library read-only, or use a key that may write." <code>source_write_blocked</code> "This library is read-only until its storage accepts changes again. Its files can still be opened." <code>source_action_unavailable</code> "This cannot be done yet in a library stored in S3. Uploading files, saving and making folders work; renaming, moving, copying and deleting come later." <code>source_writes_pending</code> "Some changes are still being saved to the storage. Wait for them, or discard them, first." <code>read_write_admin_only</code> "Only an administrator may let people change the files in a bucket."</li>
+<li><b>The route table.</b> In <code>source_readonly.rs</code> every <code>Row</code> gains an S3 read-and-write decision, <code>S3rw::Through(&amp;'static str)</code> or <code>S3rw::Refused(&amp;'static str)</code>, as in the table below; <code>a_route_list_guard</code> fails when a guarded route has a row without one. A new test runs every row in a read-and-write S3 library on the fake: <code>Refused</code> rows answer their code now; <code>Through</code> rows answer <code>source_action_unavailable</code> (the interim code) until the task named in the table switches them to "succeeds, and the fake saw the write".</li>
+</ul>
+<div class="scroll"><table>
+<thead><tr><th>Row (<code>Act</code>)</th><th>Route</th><th>S3 read and write</th></tr></thead>
+<tbody>
+<tr><td>CreateFolder</td><td>POST /api/nodes/{id}/children</td><td>Through, Task 6 (zero-byte marker)</td></tr>
+<tr><td>CreateDoc</td><td>POST /api/docs</td><td>Refused <code>source_action_unavailable</code> (a blank file has no bytes to store)</td></tr>
+<tr><td>Upload, UploadReplacing</td><td>POST /api/docs/upload</td><td>Through, Task 5</td></tr>
+<tr><td>StartNewFile, StartNewVersion, Chunk, Finish</td><td>POST /api/uploads, PUT /api/uploads/{id}, POST /api/uploads/{id}/finish</td><td>Through, Task 6</td></tr>
+<tr><td>Rename, MoveWithin, MoveIn, MoveOut, RenameFolder</td><td>PATCH /api/nodes/{id}</td><td>Refused <code>source_action_unavailable</code></td></tr>
+<tr><td>RenameLibrary</td><td>PATCH /api/nodes/{id}</td><td>Refused <code>source_read_only</code> (as today)</td></tr>
+<tr><td>CopyIn, CopyWithin</td><td>POST /api/nodes/{id}/copy</td><td>Refused <code>source_action_unavailable</code></td></tr>
+<tr><td>Delete, DeleteFolder</td><td>DELETE /api/nodes/{id}</td><td>Refused <code>source_action_unavailable</code></td></tr>
+<tr><td>DeleteLibrary</td><td>DELETE /api/nodes/{id}</td><td>Refused <code>source_read_only</code> (as today)</td></tr>
+<tr><td>Restore</td><td>POST /api/bin/{id}/restore</td><td>Refused <code>source_action_unavailable</code></td></tr>
+<tr><td>BulkMove, BulkMoveIn, BulkMoveOut, BulkCopyIn, BulkDelete, BulkRestore</td><td>POST /api/bulk</td><td>Refused <code>source_action_unavailable</code> (per item, as the bulk answer reports refusals today)</td></tr>
+<tr><td>FromTemplate</td><td>POST /api/libraries/{id}/from-template</td><td>Refused <code>source_action_unavailable</code></td></tr>
+<tr><td>Save</td><td>PUT /api/docs/{id}/content</td><td>Through, Task 7</td></tr>
+<tr><td>LiveCheckpoint, LiveHash</td><td>PUT /api/docs/{id}/live-checkpoint, POST …/hash</td><td>Refused <code>source_read_only</code> (bucket files never open in a live room)</td></tr>
+</tbody>
+</table></div>
+<p><b>Write failing tests in <code>tests/s3_modes.rs</code>:</b> <code>an_administrator_may_connect_read_write_and_the_probe_records_condition_support</code>; <code>a_non_administrator_is_refused_read_write_before_the_store_is_asked</code>; <code>a_read_only_key_is_refused_for_read_write_in_plain_words_and_nothing_is_made</code>; <code>the_connect_probe_leaves_nothing_in_the_bucket</code>; <code>connecting_without_a_mode_is_read_only</code>; <code>patch_to_read_write_probes_first_and_is_for_administrators_only</code>; <code>patch_to_read_only_is_refused_while_writes_are_pending</code> (stage a row with <code>Db::stage_write</code>); <code>switching_modes_changes_what_the_guard_answers_at_once</code>; <code>a_blocked_library_answers_source_write_blocked_and_still_reads</code>; <code>patch_to_read_write_on_a_blocked_library_restores_it_when_the_probe_passes</code>; <code>disconnect_is_refused_while_writes_are_pending</code>; <code>a_person_who_cannot_see_the_node_still_gets_404</code>; <code>the_source_answer_shows_write_state_and_counts_and_hides_conditional_from_viewers</code>; <code>a_probe_left_behind_is_logged_and_announced_without_the_bucket</code>. In <code>source_readonly.rs</code>: <code>every_guarded_route_follows_its_s3_read_write_decision</code>. In <code>s3_api.rs</code> change <code>template_and_asset_kinds_are_refused</code> so that <code>read_write</code> from a non-administrator is 403 and from an administrator with a writable fake is 201.</p>
+<p><b>Run</b> <code>cargo test -j 3 -p server --test s3_modes -- --test-threads=1</code>. Expected: fails.</p>
+<p><b>Implement.</b></p>
+<p><b>Run neighbours</b> (each alone): <code>--test source_readonly</code>, <code>--test s3_api</code>, <code>--test source_api</code>, <code>--test share_api</code>, <code>--test nodes</code>, <code>--test copy_bulk</code>. Expected: pass; GitHub and file-share rows answer exactly as before.</p>
+<p><b>Done means</b>: listed tests pass; no behaviour change for GitHub, file-share or read-only S3 libraries.</p>
+<p><b>Review focus</b>: a caller of the old guards that now lets something through; a handler that treats <code>External</code> as <code>Ordinary</code>; a mode switch racing a write (the generation, and <code>WritesPending</code> judged in the same transaction); the admin check after the store was asked; a probe that can leave its key.</p>
+</div>
+
+<div class="task">
+<h3>Task 5: staging, the external checkpointer, the write worker</h3>
+<p><b>Files.</b> Modify <code>crates/server/src/source_write.rs</code> (staging, <code>ExternalCheckpointer</code>, <code>write_due</code>, the worker, <code>SourceWrites</code> on <code>AppState</code>), <code>lib.rs</code> (<code>AppState::writes()</code>; <code>open_file_room</code> chooses storage; <code>serve_state</code> starts the writer), <code>ws.rs</code> (<code>Visitor</code> carries whether the document is a bucket file), <code>api/uploads.rs</code> (<code>session_of</code> passes the same choice), <code>external.rs</code> (staged content first), <code>source_sync.rs</code> (listing leaves pending nodes alone), <code>api/content.rs</code> (<code>upload</code>: the <code>External</code> arm), <code>api/docs.rs</code> (<code>open</code>: revision of a pending write). Create <code>crates/server/tests/s3_uploads.rs</code>.</p>
+<h4>Interfaces</h4>
+<pre><code>pub(crate) struct StageRequest&lt;'a&gt; { pub library: NodeId, pub node: NodeId, pub path: &amp;'a str,
+    pub blob: BlobRef, pub base_tag: Option&lt;&amp;'a str&gt;, pub by: UserId, pub flush: bool }
+pub(crate) async fn stage(state: &amp;AppState, s: &amp;StageRequest&lt;'_&gt;) -&gt; Result&lt;String, StageError&gt;;
+pub(crate) async fn create_staged(state: &amp;AppState, user: &amp;User, parent: NodeId, name: &amp;str,
+    editor: Editor, held: Held, keep_both: bool) -&gt; Result&lt;Created, ApiError&gt;;   // content::Created
+pub(crate) async fn is_bucket_file(db: &amp;Db, doc: DocId) -&gt; bool;   // in an S3 library, any mode
+pub(crate) struct ExternalCheckpointer { /* inner Git checkpointer, Db, Arc&lt;Blobs&gt;, wake, runtime Handle */ }
+impl Checkpointer for ExternalCheckpointer { .. }
+pub struct SourceWrites;   // AppState::writes(): the writer's wake, re-probe times, test setters
+pub async fn write_due(state: &amp;AppState, now: OffsetDateTime) -&gt; usize;
+pub const WRITES_AT_ONCE: usize = 4;
+pub const REPROBE_EVERY: Duration = Duration::from_secs(300);</code></pre>
+<h4>Rules</h4>
+<ul class="band">
+<li><b>stage</b>: refuse <code>Blocked</code> when the library's <code>write_state</code> is blocked; <code>TooLarge</code> above the limit (the smaller of <code>S3::single_put_max</code>, <code>Config::max_file_bytes</code> and half the cache size from <code>share_settings</code>); <code>pin_cached</code> the content; <code>stage_write</code>; <code>blobs().claimed().notify_one()</code> so the scan worker looks; wake the writer; answer the revision. From this moment the file's current revision is the staged one.</li>
+<li><b>Staged content is served.</b> At the top of <code>external::materialise</code>, before <code>external_item</code>: if <code>pending_write(node)</code> exists, hold the staged blob (<code>Blobs::hold_stored</code>), pass it through the existing <code>scan_gate</code>, and answer <code>Ready { blob, held, revision: pending.revision }</code> without asking the store. This also serves a new file that has no <code>source_items</code> row yet. <code>docs::open</code> answers the pending revision and size for such a node.</li>
+<li><b>The listing leaves pending nodes alone.</b> In <code>source_sync::run</code>, after <code>source.list</code>: read <code>pending_writes_of(library)</code>; add every tracked node with a pending row to <code>listing.protected</code> (the existing mechanism: its recorded entry is carried, nothing is planned for it); drop listing entries whose path equals the path of an untracked pending row (a new file whose PUT may already have landed). Store-neutral: file shares have no rows yet.</li>
+<li><b>The external checkpointer.</b> <code>open_file_room(doc, name, bucket_file)</code>: when <code>bucket_file</code>, the session's <code>Storage</code> has <code>store: Arc::new(ExternalCheckpointer{..})</code> and <code>db: None</code>, so <code>write_claimed</code> makes no blob claim, records no Git revision and counts no site usage. <code>bucket_file</code> is <code>is_bucket_file(db, doc)</code>, computed in <code>ws::visitor</code> (stored on <code>Visitor</code>) and in <code>uploads::session_of</code>'s callers before the session is opened; a document's library kind cannot change while a session is open except by disconnect, which is refused while writes are pending.
+<ul>
+<li><code>load(doc)</code>: the pending revision, else the item's revision, else <code>None</code>; <code>Stored.content</code> is the staged or cached blob when known, else <code>Content::Inline(Vec::new())</code> (the session reads only the revision and the fields); <code>meta</code> with empty fields and no contributors.</li>
+<li><code>write(c)</code>: on the blocking thread, <code>Handle::block_on</code> the async work. If <code>c.base</code> is not the current revision: <code>CheckpointError::Stale { current }</code> (the session's existing conflict path). If the content equals the current content: <code>Unchanged(current)</code>. If the library is not read and write or is blocked: an error the session reports as a failed save. Otherwise <code>stage</code> with <code>by</code> from <code>c.authors[0].id</code>, <code>base_tag</code> the item's tag (none for a new file), <code>flush: false</code>, and answer <code>Written(revision)</code>.</li>
+<li><code>load_at</code>, <code>describe</code>, <code>history</code> and the rest delegate to the Git checkpointer (a bucket file has no Git history).</li>
+</ul></li>
+<li><b>Upload.</b> <code>content::upload</code>'s <code>External</code> arm: the name must pass <code>validate_node_name</code>, <code>nameable_segment</code>, not <code>reserved_name</code>, and give an <code>object_key</code> (else 422 <code>invalid_name</code>); a declared length over the limit is 413 <code>source_file_too_large</code> (Task 6 adds the message; here the variant may answer the existing <code>too_large</code>); no <code>room_for_body</code>, no <code>reserve_held</code>. A new file goes through <code>create_staged</code> (<code>tree::create_document</code>, then <code>stage</code> with <code>base_tag: None</code>, <code>flush: true</code>, path = the parent's <code>source_item_of</code> path joined with the name, or the name at the library root) and answers as <code>create_uploaded</code> does with <code>"saving": true</code> added. A replacement goes through the existing <code>store_version</code> (the session now stages it), then <code>flush_write</code> and a wake.</li>
+<li><b>The worker.</b> <code>start_writer(state)</code> loops on the wake or every 5 seconds and calls <code>write_due(state, now)</code>. <code>write_due</code> takes up to <code>WRITES_AT_ONCE</code> due rows, one per node, and for each:
+<ol>
+<li>Scan gate: <code>Db::availability(sha256)</code>. Pending, failed or too large: leave it. Infected: <code>drop_write</code>, leave the content to the existing quarantine marks.</li>
+<li><code>try_lock_source(library)</code>; busy: leave it for the next step (a listing holds the lock for its whole pass).</li>
+<li>Read the row again under the lock; if gone or its content changed, start over with the new row next time.</li>
+<li>Target: <code>S3::target(state, library)</code>; <code>AddressRefused</code> fails the write with "The storage is no longer approved by an administrator.".</li>
+<li><code>s3_write::write_object(s3, &amp;target, &amp;row.path, &amp;PutBody{ path: Some(blobs.store().path_of(sha)), size, sha256 }, &amp;Base{ tag: row.base_tag, sha256: None }, conditional)</code> while holding the content with <code>hold_stored</code>.</li>
+<li><code>Done(seen)</code>: <code>finish_write(node, sha, &amp;seen.tag, seen.size, seen.modified)</code>. A <code>false</code> answer means a newer save is waiting; it is written next time from the new base. On a store recorded as <code>Tri::No</code>, emit <code>source.unconditional_write {count: 1}</code>.</li>
+<li><code>Conflict</code> on a tracked file: <code>write_beside</code> with the author's name and <code>now</code>; create the copy's node beside the original with <code>tree::create_document</code>, credited to the author, and its tracking row with <code>record_external_item</code> (tag from the copy's <code>Seen</code>) and the content recorded; <code>drop_write</code>; move the original to the bucket's state with <code>set_external_seen</code> from a fresh HEAD and wake a listing; emit <code>source.conflict_copy {node, copy}</code>. The open session learns on its next save (its base is no longer current, so the existing <code>Conflict</code> answer and notice follow).</li>
+<li><code>Conflict</code> on a new file: <code>write_numbered</code>; rename the node to the name written with <code>tree::apply(TreeOp::Rename)</code>; finish as Done with that path (record the row through <code>finish_write</code> after updating the pending path; add a small <code>Db::repath_write</code> if needed and say so).</li>
+<li><code>Offline</code>, <code>Gone</code>, <code>Failed</code>, <code>TooLarge</code>: <code>fail_write</code> with a plain sentence and <code>next_try_at</code> 30 seconds doubling to 10 minutes by <code>attempts</code>.</li>
+<li><code>Denied</code>: the same, and <code>set_write_state(Blocked, "The storage refused a change with this access key.")</code> with <code>source.write_blocked</code> when it changed.</li>
+</ol>
+Then, for each blocked library with pending rows, at most once per <code>REPROBE_EVERY</code> (times kept in <code>SourceWrites</code>): <code>probe_writes</code>; <code>ReadWrite</code> sets <code>Ok</code>, emits <code>source.write_restored</code>, records <code>conditional</code>, and makes the library's rows due (<code>retry_write</code>). The S3 plan re-probed after each listing; this keeps the probe out of <code>source_sync.rs</code> and costs at most four requests per library per five minutes while blocked.</li>
+<li>Restart: pending rows and their pinned content survive; the worker picks them up. Nothing in this task touches a quota.</li>
+</ul>
+<p><b>Write failing tests in <code>tests/s3_uploads.rs</code></b> (HTTP, a read-and-write library made by an administrator on the fake; drive the worker with <code>write_due(state, now)</code>): <code>an_upload_appears_as_saving_then_is_in_the_bucket_with_the_same_bytes</code>; <code>nothing_is_written_before_the_scan_passes</code> (use the scanner fixture <code>tests/scan.rs</code> uses; the fake's write log stays empty until the scan is clean); <code>infected_content_is_never_written</code>; <code>replacing_a_file_from_a_stale_revision_is_a_conflict_and_nothing_is_staged</code>; <code>replacing_a_file_writes_one_conditional_put_and_the_next_read_does_not_get</code>; <code>an_object_changed_in_the_bucket_meanwhile_is_kept_and_a_named_copy_holds_the_upload</code>; <code>a_change_between_head_and_put_is_kept_and_becomes_a_named_copy</code>; <code>a_new_file_whose_key_appeared_gets_a_numbered_name</code>; <code>a_lost_answer_does_not_make_a_conflict_copy</code>; <code>an_offline_store_keeps_the_write_and_writes_it_when_back</code>; <code>a_denied_write_blocks_the_library_and_a_passing_reprobe_writes_it</code>; <code>a_restart_between_stage_and_write_loses_nothing</code> (<code>StoppableServer</code>); <code>staged_content_is_served_while_saving_and_is_not_evicted</code>; <code>a_listing_during_saving_keeps_the_new_file_and_its_revision</code>; <code>a_listing_after_a_write_plans_no_change</code>; <code>uploads_do_not_touch_site_usage_or_reserve_quota</code> (a site at its quota still accepts the upload); <code>on_a_store_that_ignores_conditions_the_event_is_sent</code>; <code>every_write_is_counted_by_the_meter</code>; <code>no_key_outside_the_prefix_is_written</code>; <code>a_read_only_s3_library_still_refuses_the_upload</code>. Switch the <code>Upload</code> and <code>UploadReplacing</code> rows of the route table to "succeeds".</p>
+<p><b>Run</b> <code>cargo test -j 3 -p server --test s3_uploads -- --test-threads=1</code>. Expected: fails.</p>
+<p><b>Implement.</b></p>
+<p><b>Run neighbours</b> (each alone): <code>--test uploads</code>, <code>--test content</code>, <code>--test file_session</code>, <code>--test two_sessions</code>, <code>--test s3_content</code>, <code>--test s3_sync</code>, <code>--test share_sync</code>, <code>--test share_content</code>, <code>--test source_readonly</code>, <code>--test quotas</code>, <code>--test scan</code>. Expected: pass.</p>
+<p><b>Done means</b>: listed tests pass; ordinary uploads and file sessions unchanged; file-share suites keep their counts.</p>
+<p><b>Review focus</b>: any PUT before availability allows the content; an accepted upload with no pending row; the worker and a listing touching one library without the source lock; a conflict path that loses either side's bytes; a retry loop without back-off; <code>Handle::block_on</code> called on an async worker thread (it must only run inside the blocking task); ordinary file sessions opened with the external checkpointer.</p>
+</div>
+
+<div class="task">
+<h3>Task 6: chunked uploads, new folder, the size limit, Retry and Discard</h3>
+<p><b>Files.</b> Modify <code>crates/server/src/api/uploads.rs</code> (start, adopt, follow_site, finish), <code>api/nodes.rs</code> (<code>create</code> for a folder; <code>marked</code> adds the saving mark), <code>api/docs.rs</code> (<code>open</code> adds the write state), <code>api/sources.rs</code> and <code>api/mod.rs</code> (two routes, one error), <code>source_write.rs</code> (<code>create_folder</code>, <code>retry</code>, <code>discard</code>), <code>crates/server/tests/source_readonly.rs</code> (the two new routes classified; route count 161 becomes 163; the upload and folder rows switched to "succeeds"). Create <code>crates/server/tests/s3_write_routes.rs</code>.</p>
+<h4>Interfaces</h4>
+<pre><code>pub(crate) async fn create_folder(state: &amp;AppState, actor: &amp;User, library: NodeId, parent: NodeId,
+                                  name: &amp;str) -&gt; Result&lt;Node, ApiError&gt;;
+POST   /api/libraries/{id}/source/writes/{node}/retry   // 202; the write's author or the library's owners
+DELETE /api/libraries/{id}/source/writes/{node}         // 204; the same people
+ApiError::SourceFileTooLarge(u64)                        // 413 source_file_too_large {limit}
+DocDetail.writes: Option&lt;{ state: "saving" | "failed", error: Option&lt;String&gt; }&gt;
+NodeItem.saving: Option&lt;"saving" | "failed"&gt;</code></pre>
+<h4>Rules</h4>
+<ul class="band">
+<li><b>Chunked uploads.</b> <code>uploads::start</code> with <code>writable_place</code> answering <code>External</code>: the same name rules as Task 5; a declared size over the limit is 413 <code>source_file_too_large</code> with the message "Files over 512 MiB cannot be saved to S3 storage yet." (or the smaller limit, in words); <code>NewUpload.external: true</code>, so no quota is checked or reserved; <code>adopt</code> and <code>follow_site</code> skip quota for such sessions. <code>finish</code>: a new file goes through <code>create_staged</code>; a new version through <code>store_version</code> then <code>flush_write</code>. A session in a library that became read-only or blocked meanwhile is refused at <code>finish</code> by <code>refuse_connected</code> as today.</li>
+<li><b>New folder.</b> <code>nodes::create</code> with kind folder in an <code>External</code> place calls <code>create_folder</code>: take the source lock (wait up to 10 seconds, else 409 <code>source_busy</code>); check the person may add there exactly as <code>tree::apply</code> does; validate the name (<code>validate_node_name</code>, <code>nameable_segment</code>, not <code>reserved_name</code>, an <code>object_key</code> exists); refuse a name taken ignoring case (<code>Db::name_free</code>) before the bucket is asked; <code>s3_write::make_folder</code>; then <code>tree::apply(TreeOp::Create{ kind: Folder, .. })</code> and <code>upsert_source_items</code> with a folder row (<code>blob_sha: None</code>). If the tree step fails after the marker was written, log it and leave the marker: the next listing shows an empty folder. Nothing is deleted from the bucket. A library may be in read and write mode with folders switched off: <code>FoldersOff</code> answers as today.</li>
+<li><b>Retry</b> calls <code>retry_write</code> and wakes the writer; 404 for a node with no row or a person who cannot see it; 403 for someone who is neither the row's <code>by_user</code> nor an owner of the library.</li>
+<li><b>Discard</b> takes the source lock (as above), then: a tracked file: <code>drop_write</code>; the file shows the bucket's content again with a new revision; a new file never written: <code>drop_write</code>, then the node is deleted with the unguarded <code>delete_one</code> as the person (it goes to the recycle bin and, in slice 1, cannot be restored into this library). Emits <code>source.write_discarded {node}</code>.</li>
+<li><b>Marks.</b> The children answer (<code>NodePage::marked</code>) gives <code>saving: "saving" | "failed"</code> for documents with a pending row; <code>GET /api/docs/{id}</code> gives <code>writes: {state, error}</code>, the error only to the row's author and owners.</li>
+<li>Classify the two new routes in <code>ROUTES</code> as <code>Allowed("retries or discards a change already accepted; the bucket is changed only by the write worker")</code>.</li>
+</ul>
+<p><b>Write failing tests in <code>tests/s3_write_routes.rs</code>:</b> <code>a_chunked_upload_is_staged_once_when_finished_and_reaches_the_bucket</code>; <code>a_chunked_upload_reserves_no_quota_in_a_full_site</code>; <code>a_file_over_the_limit_is_refused_in_plain_words_before_any_byte</code> (lower the limit with <code>set_single_put_max_for_tests</code>); <code>a_new_version_by_chunked_upload_is_written_through_the_session</code>; <code>creating_a_folder_writes_a_marker_and_tracks_it</code>; <code>a_folder_name_the_listing_would_hide_is_refused_and_nothing_is_written</code>; <code>a_folder_name_taken_ignoring_case_is_refused_before_the_bucket_is_asked</code>; <code>a_folder_marker_already_in_the_bucket_is_accepted</code>; <code>a_listing_after_a_new_folder_plans_no_change</code>; <code>an_upload_into_a_new_folder_lands_below_its_marker</code>; <code>retry_makes_a_failed_write_due_now</code>; <code>discard_returns_a_replaced_file_to_the_bucket_content</code>; <code>discard_of_a_new_file_removes_it</code>; <code>only_the_author_and_owners_may_retry_or_discard</code>; <code>the_listing_and_the_file_answer_show_saving_and_failed</code>; <code>a_viewer_cannot_upload_or_make_a_folder_and_the_bucket_is_untouched</code>.</p>
+<p><b>Run</b> <code>cargo test -j 3 -p server --test s3_write_routes -- --test-threads=1</code>. Expected: fails.</p>
+<p><b>Implement.</b></p>
+<p><b>Run neighbours</b> (each alone): <code>--test s3_uploads</code>, <code>--test uploads</code>, <code>--test source_readonly</code>, <code>--test nodes</code>, <code>--test quotas</code>, <code>--test s3_sync</code>. Expected: pass.</p>
+<p><b>Done means</b>: listed tests pass; every <code>Through</code> row except <code>Save</code> now succeeds in the route table.</p>
+<p><b>Review focus</b>: a quota path missed for an external session (start, adopt, follow_site, finish, sweep); a folder tracked under a path the listing computes differently; a permission check after the bucket was touched; discard racing the worker.</p>
+</div>
+
+<div class="task">
+<h3>Task 7: editor saves</h3>
+<p><b>Files.</b> Modify <code>crates/server/src/checkpoint.rs</code> (one default method), <code>file_room.rs</code> (one call), <code>source_write.rs</code> (the checkpointer's session-ended hook), <code>api/nodes.rs</code> (<code>seat_access</code>), <code>api/mod.rs</code> (<code>recheck</code>'s connected test; remove <code>SourceWriteNotBuilt</code>), <code>ws.rs</code> (room kind for bucket files), <code>api/docs.rs</code> (the session kind it answers), <code>api/content.rs</code> (<code>save</code>: the <code>External</code> arm), <code>crates/server/tests/source_readonly.rs</code> (<code>Save</code> row succeeds; <code>an_editor_opens_a_connected_file_read_only</code> keeps its GitHub, share and read-only S3 cases). Create <code>crates/server/tests/s3_sessions.rs</code>.</p>
+<div class="note"><p><b>Stop rule.</b> The change to <code>file_room.rs</code> is one call after the session's loop ends (<code>store.session_ended(doc)</code>) and its import. If anything more in <code>file_room.rs</code> or any change to <code>room.rs</code> or <code>live_room.rs</code> seems needed, stop and report with what and why. <code>live_room.rs</code> must not change.</p></div>
+<h4>Interfaces</h4>
+<pre><code>// checkpoint.rs, on trait Checkpointer
+fn session_ended(&amp;self, _doc: DocId) {}                        // default: nothing
+// ws.rs
+pub(crate) fn room_kind_for(state: &amp;AppState, editor: Editor, bucket_file: bool) -&gt; RoomKind;   // bucket file: never Live</code></pre>
+<h4>Rules</h4>
+<ul class="band">
+<li><b>The seat.</b> <code>seat_access</code> gives the editing seat (the access as read) in a read-and-write S3 library whose <code>write_state</code> is <code>ok</code>, and <code>read_only_seat</code> in every other connected library, as today. <code>recheck</code> in <code>api/mod.rs</code> uses the same rule instead of its own <code>connected</code> test, so a mode switch or a block narrows or widens open seats at the next re-check.</li>
+<li><b>Room kind.</b> A bucket file opens in the file session even where <code>room_kind</code> would choose a live room; <code>docs::open</code> and the WebSocket use the same function so they never disagree.</li>
+<li><b>Saves.</b> <code>content::save</code> in an <code>External</code> place skips <code>room_for_body</code> and <code>reserve_held</code>; the rest is unchanged (<code>check_save</code>, <code>save_file</code>, <code>discard</code> unless saved). The session's <code>ExternalCheckpointer</code> stages each save with <code>flush: false</code>, so the bucket gets at most one write per file per 30 seconds (<code>COALESCE</code>, through <code>due_writes</code>), always the latest content, based on the tag the editing run began from. Each save is still answered at once with the staged revision, and the session's base rule runs on those revisions, so two people can never both save from one base.</li>
+<li><b>Flush.</b> <code>ExternalCheckpointer::session_ended(doc)</code> spawns <code>flush_write(doc, now)</code> and wakes the writer; <code>file_room::run</code> calls it once after its loop ends.</li>
+<li><b>Outside change.</b> The first write after an outside change finds the conflict (Task 5): the work becomes the named copy, the original shows the bucket's content, and the next save from the session is a <code>Conflict</code> with the existing notice.</li>
+<li><b>Blocked mid-session.</b> The seat narrows on the next re-check; the last staged save stays queued and is written once the library is restored.</li>
+<li>Remove <code>ApiError::SourceWriteNotBuilt</code>; a search finds no use of it.</li>
+</ul>
+<p><b>Write failing tests in <code>tests/s3_sessions.rs</code></b> (the stub editor fixture and <code>FileClient</code> from <code>tests/common</code>): <code>an_editor_file_in_a_writable_library_gets_the_editing_seat_and_read_only_otherwise</code>; <code>a_save_is_answered_at_once_and_reaches_the_bucket_after_the_throttle</code>; <code>ten_quick_saves_make_one_put_with_the_last_bytes</code>; <code>leaving_the_session_flushes_the_last_save</code> (a short room grace); <code>a_save_from_a_stale_revision_is_a_conflict_as_for_any_file</code>; <code>an_outside_change_during_the_session_is_kept_and_the_edits_become_a_named_copy</code>; <code>two_sessions_one_after_the_other_chain_their_revisions</code>; <code>a_library_blocked_mid_session_narrows_the_seat_and_keeps_the_last_save</code>; <code>saves_use_no_site_quota</code>; <code>a_bucket_file_never_opens_in_a_live_room</code> (with <code>live_editors</code> configured); <code>an_upload_while_someone_holds_the_seat_is_being_edited_as_for_any_file</code>.</p>
+<p><b>Run</b> <code>cargo test -j 3 -p server --test s3_sessions -- --test-threads=1</code>. Expected: fails.</p>
+<p><b>Implement.</b></p>
+<p><b>Run neighbours</b> (each alone): <code>--test file_session</code>, <code>--test two_sessions</code>, <code>--test editors</code>, <code>--test browser_client</code>, <code>--test live_room</code>, <code>--test source_readonly</code>, <code>--test s3_uploads</code>. Expected: pass.</p>
+<p><b>Done means</b>: listed tests pass; the two-session proof and the live-room suite are green; <code>git diff 78bfd6a -- crates/server/src/live_room.rs crates/server/src/live_room crates/server/src/room.rs</code> is empty.</p>
+<p><b>Review focus</b>: a save acknowledged that a crash, an eviction or a session end can lose; the throttle starving the final write; revision ids diverging between the session and the item; ordinary files getting the external checkpointer; any change to live rooms.</p>
+</div>
+
+<div class="task">
+<h3>Task 8: pages</h3>
+<p><b>Files.</b> Modify <code>web/source-panel.js</code>, <code>web/source-panel.test.mjs</code>, <code>web/library.js</code>, <code>web/library.html</code>, <code>web/library-settings.js</code>, <code>web/library-settings.html</code>, <code>web/site.js</code>, <code>web/site.html</code>, <code>web/file.js</code>.</p>
+<h4>What people see</h4>
+<ul class="band">
+<li><b>Connect dialog</b> (<code>site.js</code>, <code>site.html</code>): for administrators only (<code>/api/me</code> <code>is_admin</code>), a choice "Read only" (default) or "Read and write", with the hint "What people add and change here is saved in the bucket, and your provider may charge for each change." <code>s3_not_writable</code> shows its message with a button "Connect read-only instead". Non-administrators see no choice.</li>
+<li><b>Banner</b> (<code>source-panel.js</code> <code>s3Summary</code>): a writable library that is up to date reads "Stored in S3 storage. Checked 4 minutes ago. Changes you make here are saved to the bucket." A blocked one reads "Read-only until fixed: the storage refused a change." with the <code>write_error</code> as detail. Pending counts: "Saving 3 files…" and "2 files could not be saved."</li>
+<li><b>Actions</b>: a new pure <code>sourceActions(access, source)</code> answers <code>{ add, folder, rename, move, remove, copy }</code>. For a read-and-write S3 library that is not blocked: <code>add</code> and <code>folder</code> true, the others false. For every other connected library: all false, as <code>sourceControlsEnabled</code> answers now. <code>library.js</code> uses it for <code>canAdd</code>, the New folder button, the upload tray and the row menu; rename, move, copy, delete and cut stay hidden.</li>
+<li><b>Saving marks</b>: under a file's name, "Saving…" or "Not saved: &lt;reason&gt;" (text, never colour alone), with Retry and Discard buttons on a failed row for the author and owners; Discard asks first ("Discard this change? The file goes back to what is in the bucket." or, for a new file, "Discard this file? It was never saved to the bucket."). The list polls while anything is saving, as it polls while syncing.</li>
+<li><b>File page</b> (<code>file.js</code>): the same saving state and buttons from <code>GET /api/docs/{id}</code> <code>writes</code>.</li>
+<li><b>Source section</b> (<code>library-settings.js</code>, <code>.html</code>): the mode with "Switch to read and write" (administrators) or "Switch to read-only" (owners; <code>source_writes_pending</code> shown in words); a blocked library shows "Try again", which is the same <code>PATCH mode=read_write</code>. One of: "This storage refuses a save that would overwrite someone else's change." or "This storage cannot refuse a conflicting save. A change made in the bucket in the same instant as a save here can be overwritten." The S3 intro text no longer says files cannot be changed when the library is writable.</li>
+<li>Error texts for <code>source_action_unavailable</code>, <code>source_file_too_large</code>, <code>source_write_blocked</code>, <code>read_write_admin_only</code>, each a pure function with a test.</li>
+</ul>
+<p><b>Write failing tests in <code>web/source-panel.test.mjs</code></b> for each new text, for <code>sourceActions</code> on read-only, writable, blocked, GitHub, share and unknown sources, and for the saving mark of saving, failed and absent rows.</p>
+<p><b>Run</b> <code>node --test web/</code>. Expected: the new tests fail.</p>
+<p><b>Implement</b>, reusing existing controls and styles; light and dark; 375 px; labels tied to fields; focus returns to the row after Retry or Discard.</p>
+<p><b>Run</b> <code>node --test web/</code> and <code>cargo test -j 3 -p server --test browser_client</code>. Expected: pass.</p>
+<p><b>Done means</b>: JavaScript tests pass with the count reported. The walk-through at 375 px is Task 10.</p>
+<p><b>Review focus</b>: an action shown that the server refuses; controls shown in a read-only or blocked library; the overwrite sentence missing when <code>conditional</code> is <code>no</code> or <code>unknown</code>; the read-and-write choice shown to a non-administrator.</p>
+</div>
+
+<div class="task">
+<h3>Task 9: whole-slice review and one fix wave</h3>
+<p>A read-only review run over <code>78bfd6a..HEAD</code> with this checklist, each answered with file and line or "not found":</p>
+<ol class="band">
+<li>Nothing changes a bucket outside <code>s3_write.rs</code> (search <code>.put(</code>, <code>.delete(</code>, <code>Method::PUT</code>, <code>Method::DELETE</code>).</li>
+<li>Every conditional path treats 412 and 409 as a conflict; no write is retried inside the client; a lost answer is recognised by the hash metadata.</li>
+<li>No content is written before <code>Db::availability</code> allows it; infected content never is.</li>
+<li>No accepted save can be lost by a restart, an eviction, a session end, a mode switch, a block or a disconnect.</li>
+<li>No key outside the library's prefix is ever written; every key comes from <code>object_key</code>.</li>
+<li>Every guarded route has an S3 read-and-write decision and follows it; refused routes answer <code>source_action_unavailable</code>; GitHub, file-share and read-only S3 behaviour is unchanged.</li>
+<li>Uploads and saves into an S3 library touch no quota and no site usage; every write request is counted by the meter.</li>
+<li>No secret, endpoint address, bucket, prefix or key id reaches an event, a log line, an error or an answer that Phase 1 kept them from.</li>
+<li>The probe leaves nothing; only administrators can make a library writable.</li>
+<li><code>live_room.rs</code> and <code>room.rs</code> unchanged; <code>file_room.rs</code> changed by one call.</li>
+<li>Migration 0025 applies to a database with Phase 1 S3 and file-share rows; <code>Cargo.lock</code> has no new package.</li>
+</ol>
+<p><b>Run</b>, one binary at a time with <code>--test-threads=1</code>: every <code>s3_*</code>, <code>share_*</code> and <code>source_*</code> server binary, <code>uploads</code>, <code>content</code>, <code>file_session</code>, <code>two_sessions</code>, <code>quotas</code>, <code>scan</code>, <code>nodes</code>, <code>copy_bulk</code>, <code>live_room</code>, <code>editors</code>, <code>browser_client</code>; the records binaries <code>source_writes</code>, <code>s3_sources</code>, <code>share_sources</code>, <code>share_cache</code>, <code>sources</code>, <code>blobs</code>, <code>quotas</code>, <code>bin</code>; <code>node --test web/</code>; <code>cargo clippy -j 3 --workspace --all-targets</code>; <code>cargo fmt --all -- --check</code>. Report each count and rerun the load-sensitive tests alone.</p>
+<p>Fix wave in a new run; scoped re-review; rulings and parked items go in the ledger. Then the controller asks the owner before pushing <code>s3-writes</code> for a full <code>check.yml</code> run.</p>
+</div>
+
+<div class="task">
+<h3>Task 10 (controller): live check on the owner's R2 bucket</h3>
+<p>The controller does this task, only after the owner's explicit yes to a stated cost, on a throwaway server and test schema. It creates no cloud resource, types no secret, changes no system setting, installs nothing.</p>
+<ol class="band">
+<li><b>Cost first.</b> Re-read Cloudflare's R2 pricing page and state the cost. As recalled (not checked): storage, Class A (writes, lists) and Class B (reads) requests have a monthly free allowance far above this check's few hundred requests and few megabytes, and R2 charges no egress; expected cost nothing. Write the <code>Cost:</code> line in the ledger.</li>
+<li><b>Ask the owner</b> for a test bucket holding nothing that matters, an R2 API token with Object Read &amp; Write on that bucket only, and a second token with Object Read only. The owner types the secrets into the page.</li>
+<li>Connect read-only with the read token, then try read and write with it: expect the plain <code>s3_not_writable</code> message and nothing made.</li>
+<li>Connect read and write as an administrator with the write token: record what the probe found (<code>conditional</code> expected <code>yes</code> on R2) and see in the dashboard that no <code>.sharecraft-tmp-probe-*</code> object remains.</li>
+<li>Upload a small file and a file of a few megabytes; see "saving" then saved; download each from the dashboard and compare SHA-256 with the originals.</li>
+<li>Replace a file by upload; the dashboard shows the new bytes; the next listing changes nothing (no new revision).</li>
+<li>Open a .docx in WordCraft (or .xlsx in GridCraft), save several times within 30 seconds, close; the dashboard shows one change and the final bytes.</li>
+<li>Conflict: open a file in its editor, replace the object from the dashboard, save in ShareCraft; the dashboard keeps the outside version and a "(edited by …)" copy holds the edit.</li>
+<li>Make a folder; its marker appears; upload into it.</li>
+<li>Refused actions: rename, move and delete answer the plain "not available yet" message.</li>
+<li>Switch to read-only and back; the site's usage is unchanged; the Source section's write count is plausible.</li>
+<li>Pages at 375 px and in dark mode: the connect choice, the writable banner, a saving and a failed file with Retry and Discard (a failed write can be made by revoking the write token in the dashboard, which also shows "read-only until fixed"), the Source section.</li>
+<li>Write what was checked, what was not and what it cost into the ledger. Remove the servers and schemas; tell the owner which tokens to revoke and that the bucket can be emptied.</li>
+</ol>
+</div>
+
+<div class="task">
+<h3>Task 11: the records</h3>
+<p><b>Files.</b> Modify <code>BUILDING.html</code>, <code>scope.html</code>, <code>sequencing.html</code>. Written from this plan and the ledger; HTML with row shading in both themes; the controller commits <code>docs: record editable S3 storage, slice 1</code>.</p>
+<ul class="band">
+<li><code>BUILDING.html</code>: the S3 section gains the two modes and who chooses them; the guard's S3 decisions; how a write flows (stage, scan, conditional PUT, conflict copy); the probe and what it records; the 512 MiB limit; editor-save coalescing; echo suppression; migration 0025; the commands; what Task 10 checked and did not, and its cost; every deferred minor from the ledger.</li>
+<li><code>scope.html</code>: the S3 entry becomes "slice 1 built: upload, replace, save, new folder"; decisions from the next free number (S3-first shared write path; administrators only for read and write; conditional writes with HEAD-then-PUT where a store ignores them).</li>
+<li><code>sequencing.html</code>: slice 2 named next (rename and move, delete with the holding folder, multipart, copy), then the file share joining the shared write path with its own arm.</li>
+</ul>
+<p><b>Review focus</b>: statements the ledger does not support; anything described as checked that Task 10 did not check; a price stated as fact.</p>
+</div>
+
+<h2>Not checked, and risks</h2>
+<p>No product code was built or run for this plan. Names and signatures were read from the tree at dcf2c04 (main 78bfd6a plus the scope document).</p>
+<ul class="band">
+<li><b>The external checkpointer is the riskiest seam.</b> It relies on <code>file_room.rs</code> using only <code>Stored.revision</code> and <code>Stored.meta.fields</code> from <code>load</code>, on <code>write_claimed</code> with <code>db: None</code> doing nothing but run the closure, and on <code>tokio::runtime::Handle::block_on</code> being safe inside <code>spawn_blocking</code>. I read <code>run</code>, <code>load</code>, <code>finish_write</code> and <code>next_write</code>, not every line of <code>file_room.rs</code> (2,050 lines). The <code>Recorder</code> is skipped when <code>db</code> is <code>None</code>; whether anything else in a session needs <code>db</code> was not checked. Task 7's stop rule covers it.</li>
+<li><b>Choosing the storage when a session opens.</b> <code>ws::join_file_room</code> opens the session inside a closure (<code>join_with(|| state.open_file_room(..))</code>); the plan computes <code>bucket_file</code> beforehand on <code>Visitor</code>. I did not check every other caller of <code>open_file_room</code> or <code>Rooms::open_file</code> beyond <code>ws.rs</code> and <code>uploads::session_of</code>.</li>
+<li><b>Echo suppression</b> depends on the HEAD after a PUT giving the same ETag and the same whole-second modified time that the next listing's <code>LastModified</code> gives. True for the fake and for AWS single PUTs; for R2 it is believed, not checked. Task 10 checks it ("the next listing changes nothing").</li>
+<li><b>Custom metadata on R2.</b> The lost-answer rule assumes R2 stores and returns <code>x-amz-meta-sharecraft-sha256</code> on HEAD. R2 documents custom metadata; the exact header behaviour was not checked. Without it, a lost answer produces a duplicate conflict copy, never lost data.</li>
+<li><b>The scan gate for editor saves.</b> <code>pin_cached</code> claims content as an upload, so a staged editor save is held while its scan is pending (ordinary editor saves are never held). Reopening a just-saved bucket file may wait up to 20 seconds for the scanner. Accepted as the cost of "scanned before it reaches the bucket"; not measured.</li>
+<li><b>The listing's handling of untracked nodes.</b> I relied on <code>plan_with_repairs</code> planning only tracked items and on <code>listing.protected</code> carrying a protected node's recorded entry. A new file's node with no tracking row whose key the listing also sees is handled by dropping that entry; I did not trace what <code>shown_names_with_allocations</code> does if an untracked node and a listed object share a name in other ways (for example a case variant). Task 5's listing tests are where this shows.</li>
+<li><b>Quota paths for chunked uploads.</b> <code>start_upload</code>, <code>end_upload</code>, <code>claim_upload</code>, <code>adopt</code>, <code>follow_site</code> and the sweeper all touch reservations; I read their names and the start, not their bodies. Task 6 must find every one.</li>
+<li><b>Bulk refusals.</b> I did not read how <code>api/bulk.rs</code> reports a per-item refusal; the plan assumes the existing shape carries the new code.</li>
+<li><b>Conflict-copy time zone.</b> Names use UTC because the workspace has no zone database. The scope's example shows a local-looking time; if the owner wants local time, that needs the site's regional setting and a zone crate, which the no-new-crates rule forbids.</li>
+<li><b>Admin-only read and write</b> uses <code>User.is_admin</code>. Whether a disabled administrator's session can reach these routes was not checked (the session layer should already refuse it).</li>
+<li><b>The cache bounds staging.</b> Staged content counts in <code>cached_bytes</code>; a cache full of staged writes makes eviction log "every entry is held" and new reads wait. The per-file limit (half the cache) keeps one file from filling it, not many.</li>
+<li><b>Prices are recalled, not checked.</b> Task 10 re-reads the page before asking.</li>
+<li><b>Deletes made in the bucket by others</b> still show as deletions in ShareCraft after the grace polls, with no recycle-bin entry, exactly as in Phase 1.</li>
+<li><b>The meter is memory-only.</b> Write counts are lost on a restart until budget work saves them.</li>
+<li><b>Visibility.</b> Making the client's write calls and <code>s3_write</code> functions <code>pub</code> (for integration tests) relies on review searches, not the compiler, to keep them inside <code>s3_write.rs</code>.</li>
+<li><b>Route count.</b> <code>a_route_list_guard</code> asserts 161 routes today; Task 6 makes it 163. Any other branch adding routes meanwhile will conflict on that line.</li>
+</ul>
+
+</main>
+</body>
+</html>
