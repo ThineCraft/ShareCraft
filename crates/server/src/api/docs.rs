@@ -152,6 +152,19 @@ pub(crate) struct DocDetail {
     /// File-share metadata for an external document.
     #[serde(skip_serializing_if = "Option::is_none")]
     external: Option<ExternalDetail>,
+    /// A change to this file accepted and not yet written to its bucket.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    writes: Option<WriteMark>,
+}
+
+/// Where a change accepted for a bucket stands.
+#[derive(Serialize)]
+struct WriteMark {
+    /// `saving`, or `failed` when writing it failed and a retry is waited for.
+    state: &'static str,
+    /// Why it failed: shown only to the change's author and the library's owners.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -230,6 +243,23 @@ pub(crate) async fn open(
         (None, Some(item)) => Some(item.revision.clone()),
         (None, None) => document.revision.clone(),
     };
+    let writes = match &pending {
+        None => None,
+        Some(pending) => {
+            let failed = pending.state == records::PendingState::Failed;
+            let may_see_error = failed
+                && (pending.by == signed.session.user.id
+                    || db
+                        .effective_access(signed.session.user.id, pending.library)
+                        .await
+                        .map_err(|e| ApiError::unavailable(&e))?
+                        .is_some_and(|held| held.can_manage_access()));
+            Some(WriteMark {
+                state: if failed { "failed" } else { "saving" },
+                error: pending.error.clone().filter(|_| may_see_error),
+            })
+        }
+    };
     let staged_bytes = pending.as_ref().map(|pending| pending.blob.size);
     let external = match (external, staged_bytes) {
         (None, Some(bytes)) => Some(ExternalDetail {
@@ -262,6 +292,7 @@ pub(crate) async fn open(
         scan,
         threat,
         external,
+        writes,
     }))
 }
 

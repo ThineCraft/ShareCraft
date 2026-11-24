@@ -147,6 +147,18 @@ const ROUTES: &[(&str, Decision)] = &[
         Allowed("wakes the sync, which is what changes a connected library's files"),
     ),
     (
+        "POST /api/libraries/{id}/source/writes/{node}/retry",
+        Allowed(
+            "retries or discards a change already accepted; the bucket is changed only by the              write worker",
+        ),
+    ),
+    (
+        "DELETE /api/libraries/{id}/source/writes/{node}",
+        Allowed(
+            "retries or discards a change already accepted; the bucket is changed only by the              write worker",
+        ),
+    ),
+    (
         "POST /api/libraries/{id}/source/webhook",
         Allowed("a webhook secret for the connection, not files"),
     ),
@@ -638,7 +650,7 @@ fn a_route_list_guard() {
         unclassified.is_empty() && gone.is_empty(),
         "routes not classified in ROUTES: {unclassified:?}; recorded but not registered: {gone:?}"
     );
-    assert_eq!(routes.len(), 161, "the number of registered routes changed");
+    assert_eq!(routes.len(), 163, "the number of registered routes changed");
     let mut mounts_sorted = mounts.clone();
     mounts_sorted.sort();
     let mut expected: Vec<String> = MOUNTS.iter().map(|m| (*m).to_owned()).collect();
@@ -753,31 +765,16 @@ const ROWS: &[Row] = &[
         Act::CreateFolder,
         "POST /api/nodes/{id}/children",
         201,
-        Through("Task 6"),
+        Succeeds,
     ),
     // A blank file has no bytes to store.
     row(Act::CreateDoc, "POST /api/docs", 201, UNAVAILABLE),
     row(Act::Upload, "POST /api/docs/upload", 201, Succeeds),
     row(Act::UploadReplacing, "POST /api/docs/upload", 200, Succeeds),
-    row(
-        Act::StartNewFile,
-        "POST /api/uploads",
-        201,
-        Through("Task 6"),
-    ),
-    row(
-        Act::StartNewVersion,
-        "POST /api/uploads",
-        201,
-        Through("Task 6"),
-    ),
-    row(Act::Chunk, "PUT /api/uploads/{id}", 200, Through("Task 6")),
-    row(
-        Act::Finish,
-        "POST /api/uploads/{id}/finish",
-        201,
-        Through("Task 6"),
-    ),
+    row(Act::StartNewFile, "POST /api/uploads", 201, Succeeds),
+    row(Act::StartNewVersion, "POST /api/uploads", 201, Succeeds),
+    row(Act::Chunk, "PUT /api/uploads/{id}", 200, Succeeds),
+    row(Act::Finish, "POST /api/uploads/{id}/finish", 201, Succeeds),
     row(Act::Rename, "PATCH /api/nodes/{id}", 200, UNAVAILABLE),
     row(Act::MoveWithin, "PATCH /api/nodes/{id}", 200, UNAVAILABLE),
     row(Act::MoveIn, "PATCH /api/nodes/{id}", 200, UNAVAILABLE),
@@ -1374,7 +1371,7 @@ impl Env {
             Act::CreateFolder => (
                 Method::POST,
                 format!("/api/nodes/{}/children", fx.docs),
-                json!({ "kind": "folder", "name": "New folder" }),
+                json!({ "kind": "folder", "name": format!("New folder {}", user.id.0) }),
             ),
             Act::CreateDoc => (
                 Method::POST,
@@ -1407,7 +1404,7 @@ impl Env {
                 "/api/uploads".to_owned(),
                 json!({
                     "parent": fx.docs,
-                    "name": "started.txt",
+                    "name": format!("started-{}.txt", user.id.0),
                     "size": 2,
                     "sha256": sha_hex(b"ab"),
                 }),
@@ -1783,11 +1780,15 @@ async fn every_guarded_route_follows_its_s3_read_write_decision() {
             assert_eq!(body["message"], message, "{:?} as {who}: {body}", row.act);
         }
     }
-    // Nothing but the staged uploads reached the bucket, and nothing outside `docs`.
+    // Nothing but the uploads and new folders reached the bucket (the finished sessions' files
+    // go to the library's top).
     for (method, key, _) in env.s3.writes() {
         assert_eq!(method, "PUT", "{key}");
         assert!(
-            key.starts_with("docs/uploaded-") || key == "docs/replace-me.txt",
+            key.starts_with("docs/uploaded-")
+                || key.starts_with("finish-")
+                || key.starts_with("docs/New folder ")
+                || key == "docs/replace-me.txt",
             "{key}"
         );
     }

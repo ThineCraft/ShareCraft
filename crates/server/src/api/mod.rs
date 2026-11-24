@@ -104,6 +104,14 @@ pub(crate) fn router() -> Router<AppState> {
                 .delete(sources::disconnect),
         )
         .route("/libraries/{id}/source/sync", post(sources::sync_now))
+        .route(
+            "/libraries/{id}/source/writes/{node}/retry",
+            post(sources::retry_write),
+        )
+        .route(
+            "/libraries/{id}/source/writes/{node}",
+            delete(sources::discard_write),
+        )
         .route("/libraries/{id}/source/webhook", post(sources::webhook))
         .route(
             "/settings/shares",
@@ -482,6 +490,9 @@ pub(crate) enum ApiError {
     /// 413: the file is larger than its library takes; the answer's `limit` is the library's
     /// limit in bytes.
     FileTooLarge(u64),
+    /// 413: the file is larger than one write to S3 storage takes; the answer's `limit` is that
+    /// limit in bytes and its `message` says so in words.
+    SourceFileTooLarge(u64),
     /// 423: the content is held by the malware scanner (waiting for it, failed, too large or
     /// infected), so its bytes are not handed out; the answer's `scan` says which.
     Held(ScanState),
@@ -659,6 +670,9 @@ impl ApiError {
             ApiError::WrongExtension => (StatusCode::UNPROCESSABLE_ENTITY, "wrong_extension"),
             ApiError::BlockedFileType(_) => (StatusCode::UNPROCESSABLE_ENTITY, "blocked_file_type"),
             ApiError::FileTooLarge(_) => (StatusCode::PAYLOAD_TOO_LARGE, "file_too_large"),
+            ApiError::SourceFileTooLarge(_) => {
+                (StatusCode::PAYLOAD_TOO_LARGE, "source_file_too_large")
+            }
             ApiError::Held(_) => (StatusCode::LOCKED, "held"),
             ApiError::Busy => (StatusCode::SERVICE_UNAVAILABLE, "busy"),
             ApiError::NoPreview => (StatusCode::UNSUPPORTED_MEDIA_TYPE, "no_preview"),
@@ -968,6 +982,11 @@ impl IntoResponse for ApiError {
                 json!({ "error": code, "extension": file_type })
             }
             ApiError::FileTooLarge(limit) => json!({ "error": code, "limit": limit }),
+            ApiError::SourceFileTooLarge(limit) => json!({
+                "error": code,
+                "limit": limit,
+                "message": source_file_too_large_message(limit),
+            }),
             ApiError::Held(scan) => json!({ "error": code, "scan": scan }),
             ApiError::TooMany(limit) => json!({ "error": code, "limit": limit }),
             ApiError::SourceReadOnly => json!({ "error": code, "message": SOURCE_READ_ONLY }),
@@ -1016,6 +1035,24 @@ impl IntoResponse for ApiError {
         };
         (status, Json(body)).into_response()
     }
+}
+
+/// The plain sentence for a file over the limit of one write to S3 storage: `limit` is said
+/// in the largest unit that holds it exactly (`512 MiB`, `2 KiB`, or bytes).
+fn source_file_too_large_message(limit: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    const GIB: u64 = 1024 * MIB;
+    let words = if limit >= GIB && limit.is_multiple_of(GIB) {
+        format!("{} GiB", limit / GIB)
+    } else if limit >= MIB && limit.is_multiple_of(MIB) {
+        format!("{} MiB", limit / MIB)
+    } else if limit >= KIB && limit.is_multiple_of(KIB) {
+        format!("{} KiB", limit / KIB)
+    } else {
+        format!("{limit} bytes")
+    };
+    format!("Files over {words} cannot be saved to S3 storage yet.")
 }
 
 /// The plain sentence for a failed probe of a bucket. Never the store's own text.
@@ -1129,6 +1166,23 @@ where
 mod tests {
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[test]
+    fn the_size_limit_is_said_in_words() {
+        use super::source_file_too_large_message as words;
+        assert_eq!(
+            words(512 * 1024 * 1024),
+            "Files over 512 MiB cannot be saved to S3 storage yet."
+        );
+        assert_eq!(
+            words(2048),
+            "Files over 2 KiB cannot be saved to S3 storage yet."
+        );
+        assert_eq!(
+            words(10),
+            "Files over 10 bytes cannot be saved to S3 storage yet."
+        );
+    }
 
     use crate::members::builtin_access;
     use collab_core::ids::{ClientId, DocId};

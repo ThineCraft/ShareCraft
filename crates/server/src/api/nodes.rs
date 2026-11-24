@@ -16,7 +16,7 @@ use collab_core::ids::{DocId, GroupId, NodeId, UserId};
 use protocol::RemovedReason;
 use records::{
     Access, AccessError, AssignmentView, Crumb, Cursor, Db, Editor, LibraryKind, LinkKind, Listed,
-    Node, NodeKind, Perms, Principal, PrincipalView, RoleRef, SourceKind, User,
+    Node, NodeKind, PendingState, Perms, Principal, PrincipalView, RoleRef, SourceKind, User,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -27,7 +27,7 @@ use super::{ApiError, JsonBody, parse_id, recheck_below, to_completion};
 use crate::AppState;
 use crate::auth::Signed;
 use crate::room::AccessChange;
-use crate::source_write::{Place, Store, writable_place};
+use crate::source_write::{Place, Store, create_folder, writable_place};
 use crate::tree::{self, TreeOp};
 
 /// Children listed when the request names no limit.
@@ -324,6 +324,10 @@ pub(crate) struct ChildOut {
     /// Why an external file cannot currently be read.
     #[serde(skip_serializing_if = "Option::is_none")]
     unavailable: Option<&'static str>,
+    /// `saving` for a file of a read-and-write S3 library whose change is accepted and not yet
+    /// written to the bucket, `failed` when writing it failed and is waiting for a retry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    saving: Option<&'static str>,
 }
 
 impl From<Listed> for ChildOut {
@@ -343,6 +347,7 @@ impl From<Listed> for ChildOut {
             photo: None,
             external: None,
             unavailable: None,
+            saving: None,
         }
     }
 }
@@ -388,13 +393,28 @@ impl ChildrenPage {
             (item.scan, item.threat) = super::docs::scan_fields(mark);
             if item.kind == NodeKind::Document
                 && let Ok(id) = Uuid::parse_str(&item.id)
-                && let Some(external) = db
+            {
+                if let Some(external) = db
                     .external_item(NodeId(id))
                     .await
                     .map_err(|e| ApiError::unavailable(&e))?
-            {
-                item.external = Some(true);
-                item.unavailable = external.unavailable.map(super::docs::unavailable_name);
+                {
+                    item.external = Some(true);
+                    item.unavailable = external.unavailable.map(super::docs::unavailable_name);
+                }
+                // A change accepted and not yet written to the bucket (also of a new file,
+                // which has no external item yet).
+                if let Some(pending) = db
+                    .pending_write(NodeId(id))
+                    .await
+                    .map_err(|e| ApiError::unavailable(&e))?
+                {
+                    item.saving = Some(if pending.state == PendingState::Failed {
+                        "failed"
+                    } else {
+                        "saving"
+                    });
+                }
             }
         }
         let Some((library, org)) = tree::policies_at(db, parent).await? else {
@@ -582,9 +602,13 @@ pub(crate) async fn create(
     let actor = signed.session.user;
     match writable_place(state.db(), actor.id, parent).await? {
         Place::Ordinary => {}
-        // A folder goes to the store as a marker (Task 6); nothing else is made there.
-        Place::External(_) if kind == NodeKind::Folder => {
-            return Err(ApiError::SourceWriteNotBuilt);
+        // A folder goes to the store as a marker; nothing else is made there.
+        Place::External(Store::S3(target)) if kind == NodeKind::Folder => {
+            let node = to_completion(async move {
+                create_folder(&state, &actor, target.library, parent, &new.name).await
+            })
+            .await?;
+            return Ok((StatusCode::CREATED, Json(NodeOut::from(node))).into_response());
         }
         Place::External(_) => return Err(ApiError::SourceActionUnavailable),
     }

@@ -1094,6 +1094,41 @@ pub(crate) async fn change(
     ))
 }
 
+/// `POST /api/libraries/{id}/source/writes/{node}/retry`: Retry of a change to the library's
+/// store that was accepted and not yet written (waiting, or failed): it becomes due now. For the
+/// change's author and the library's owners. `202`; `404` for a node with no pending change or
+/// a person who cannot see it; `403` for anyone else.
+pub(crate) async fn retry_write(
+    State(state): State<AppState>,
+    signed: Signed,
+    Path((id, node)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    let library = node_id(&id)?;
+    let node = node_id(&node)?;
+    crate::source_write::retry(&state, &signed.session.user, library, node).await?;
+    Ok(StatusCode::ACCEPTED.into_response())
+}
+
+/// `DELETE /api/libraries/{id}/source/writes/{node}`: Discard of a change to the library's
+/// store that was accepted and not yet written, for the change's author and the library's
+/// owners. A file the store has shows the store's content again; a new file is deleted. `204`;
+/// `404` and `403` as for Retry; `409 source_busy` while a listing holds the library for more
+/// than ten seconds. Recorded as `source.write_discarded`.
+pub(crate) async fn discard_write(
+    State(state): State<AppState>,
+    signed: Signed,
+    Path((id, node)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    let library = node_id(&id)?;
+    let node = node_id(&node)?;
+    let actor = signed.session.user;
+    to_completion(async move {
+        crate::source_write::discard_write(&state, &actor, library, node).await?;
+        Ok(StatusCode::NO_CONTENT.into_response())
+    })
+    .await
+}
+
 /// `POST /api/libraries/{id}/source/sync`: "Sync now", for owners of the library. `202`; the
 /// sync runs in the background and its outcome shows in the connection's status. It also ends
 /// a stop (`not_connected`) and a back-off after failures (`failed`); a rate limit is still

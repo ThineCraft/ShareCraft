@@ -21,8 +21,9 @@ use std::time::Duration;
 
 use collab_core::ids::{DocId, NodeId, UserId};
 use records::{
-    AccessError, Db, Editor, ExternalEntry, NewEvent, NewPendingWrite, PendingWrite, ScanState,
-    SourceKind, SourceMode, Tri, User, WriteState, object_tag,
+    AccessError, Db, Editor, ExternalEntry, NewEvent, NewPendingWrite, Node, NodeKind,
+    PendingWrite, Perms, ScanState, SourceItem, SourceKind, SourceLock, SourceMode, Tri, User,
+    WriteState, object_tag,
 };
 use revisions::{
     BlobRef, Checkpoint, CheckpointError, Content, GitError, Meta, Outcome, RevisionId,
@@ -41,7 +42,10 @@ use crate::api::content::{Created, discard};
 use crate::blobs::Held;
 use crate::checkpoint::Checkpointer;
 use crate::s3::{PutBody, S3Error, S3Target};
-use crate::s3_write::{object_key, probe_writes, write_beside, write_numbered, write_object};
+use crate::s3_source::nameable_segment;
+use crate::s3_write::{
+    make_folder, object_key, probe_writes, write_beside, write_numbered, write_object,
+};
 use crate::tree::{self, TreeOp};
 
 /// The store an external library's changes are written to.
@@ -1272,4 +1276,315 @@ fn emit(
         node: Some(library),
         detail,
     });
+}
+
+/// How long a request that must hold a library's source lock waits for a listing or a write.
+const LOCK_WAIT: Duration = Duration::from_secs(10);
+
+/// The library's source lock, waiting up to [`LOCK_WAIT`] for a listing or a write to give it up
+/// (`409 source_busy` after that). Held, no listing and no write of the library runs.
+async fn lock_source(db: &Db, library: NodeId) -> Result<SourceLock, ApiError> {
+    let deadline = tokio::time::Instant::now() + LOCK_WAIT;
+    loop {
+        if let Some(lock) = db
+            .try_lock_source(library)
+            .await
+            .map_err(|e| ApiError::unavailable(&e))?
+        {
+            return Ok(lock);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(ApiError::SourceBusy);
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// The library and the library-relative path (the key below the prefix) of a new item named
+/// `name` in `parent` of a read-and-write S3 library, once the name is one the listing will
+/// show and the bucket takes: the name is valid (`422 invalid_name`), it is one segment the
+/// listing shows and not one ShareCraft keeps for itself, and a key can be made of it.
+/// `409 source_action_unavailable` when `parent` is a folder the store does not know yet.
+pub(crate) async fn external_path(
+    state: &AppState,
+    parent: NodeId,
+    name: &str,
+) -> Result<(NodeId, String), ApiError> {
+    records::validate_node_name(name)?;
+    let Some((library, path)) = staged_path(state.db(), parent, name).await? else {
+        return Err(ApiError::SourceActionUnavailable);
+    };
+    let nameable = path
+        .rsplit('/')
+        .next()
+        .is_some_and(|last| nameable_segment(last) && !records::reserved_name(last));
+    let keyed = match state.s3().target(state, library).await {
+        Ok(target) => object_key(&target, &path).is_some(),
+        // Not approved, or unreadable: the worker reports it; the name is judged on its own.
+        Err(_) => true,
+    };
+    if !nameable || !keyed {
+        return Err(ApiError::InvalidName);
+    }
+    Ok((library, path))
+}
+
+/// Whether the library that `place` is in (or is) has its folders off.
+async fn folders_off(db: &Db, place: NodeId) -> Result<bool, ApiError> {
+    let unavailable = |e: records::DbError| ApiError::unavailable(&e);
+    let Some(library) = db.library_of(place).await.map_err(unavailable)? else {
+        return Ok(false);
+    };
+    Ok(db
+        .library_settings(library)
+        .await
+        .map_err(unavailable)?
+        .is_some_and(|settings| !settings.folders))
+}
+
+/// Everything about a new folder `name` in `parent` that is judged before the bucket is asked,
+/// as [`tree::apply`] judges a create: the person sees `parent` and may add there, it is a
+/// library or folder, folders are on, the name is valid, one the listing shows and free there
+/// ignoring case. Answers the library and the library-relative path of the folder.
+async fn folder_allowed(
+    state: &AppState,
+    actor: &User,
+    parent: NodeId,
+    name: &str,
+) -> Result<(NodeId, String), ApiError> {
+    let db = state.db();
+    let (parent_node, access) = tree::visible(db, actor, parent).await?;
+    if !matches!(parent_node.kind, NodeKind::Library | NodeKind::Folder) {
+        return Err(AccessError::WrongPlace.into());
+    }
+    tree::require(&access, Perms::ADD)?;
+    if folders_off(db, parent).await? {
+        return Err(AccessError::FoldersOff.into());
+    }
+    let name = records::validate_node_name(name)?;
+    let found = external_path(state, parent, name).await?;
+    if !db
+        .name_free(parent, name, None)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?
+    {
+        return Err(AccessError::NameTaken.into());
+    }
+    Ok(found)
+}
+
+/// Creates the folder `name` in `parent` of the read-and-write S3 library `library` for `actor`:
+/// a zero-byte marker object `<path>/` is written to the bucket (one already there is
+/// accepted; nothing is ever deleted or overwritten) and the folder is tracked as the listing
+/// will see it, so the next listing plans no change.
+///
+/// Everything that can be refused is judged before the bucket is asked: the person's right to
+/// add there (as [`tree::apply`] judges it), the folders setting, the name, and whether the name
+/// is free ignoring case. The library's source lock is held from before the marker is written
+/// until the folder is tracked, so no listing sees one without the other (`409 source_busy`
+/// after ten seconds). If the folder cannot be made in the tree after the marker was written,
+/// the marker is left: the next listing shows an empty folder.
+///
+/// # Errors
+/// `404`, `403` and `409 name_taken` as for any create; `422 invalid_name`; `409 folders_off`;
+/// `409 source_busy`; `409 source_write_blocked` when the store refuses the write (the library
+/// is blocked until a probe passes); `source_unavailable` when it cannot be reached.
+pub(crate) async fn create_folder(
+    state: &AppState,
+    actor: &User,
+    library: NodeId,
+    parent: NodeId,
+    name: &str,
+) -> Result<Node, ApiError> {
+    let db = state.db();
+    let name = records::validate_node_name(name)?.to_owned();
+    folder_allowed(state, actor, parent, &name).await?;
+    let lock = lock_source(db, library).await?;
+    // Judged again once the lock is held: a listing or a write may have run meanwhile.
+    let (_, path) = folder_allowed(state, actor, parent, &name).await?;
+    let target = match state.s3().target(state, library).await {
+        Ok(target) => target,
+        Err(S3Error::AddressRefused) => {
+            return Err(ApiError::SourceUnavailable("not_approved", SourceKind::S3));
+        }
+        Err(_) => return Err(ApiError::Unavailable),
+    };
+    match make_folder(state.s3(), &target, &path).await {
+        Ok(()) => {}
+        Err(WriteError::Denied) => {
+            block(state, library, Some(OffsetDateTime::now_utc())).await;
+            return Err(ApiError::SourceWriteBlocked);
+        }
+        Err(WriteError::Offline) => {
+            return Err(ApiError::SourceUnavailable("offline", SourceKind::S3));
+        }
+        Err(WriteError::Gone) => return Err(ApiError::SourceUnavailable("gone", SourceKind::S3)),
+        Err(_) => return Err(ApiError::Unavailable),
+    }
+    let created = tree::apply(
+        state,
+        actor,
+        TreeOp::Create {
+            parent: Some(parent),
+            kind: NodeKind::Folder,
+            name: name.clone(),
+            id: NodeId(Uuid::new_v4()),
+        },
+    )
+    .await;
+    let node = match created {
+        Ok(applied) => applied.node,
+        Err(e) => {
+            eprintln!(
+                "sharecraft-server: a folder marker was written but its folder could not be \
+                 made: {e}"
+            );
+            return Err(e.into());
+        }
+    };
+    // The listing's own name for it: below the parent's shown path.
+    let shown = if parent == library {
+        name.clone()
+    } else {
+        match db.source_item_of(parent).await {
+            Ok(Some(item)) => format!("{}/{name}", item.path),
+            _ => path.clone(),
+        }
+    };
+    let item = SourceItem {
+        node: node.id,
+        path: shown,
+        repository_path: format!("{path}/"),
+        blob_sha: None,
+        size: 0,
+    };
+    if let Err(e) = db.upsert_source_items(library, &[item]).await {
+        // The folder exists without its tracking: the next listing tracks it by its path.
+        eprintln!("sharecraft-server: a new folder could not be tracked: {e}");
+    }
+    drop(lock);
+    Ok(node)
+}
+
+/// Blocks the writes of `library` after the store refused one, as the worker does.
+async fn block(state: &AppState, library: NodeId, probed: Option<OffsetDateTime>) {
+    state.writes().note_blocked(library, probed);
+    match state
+        .db()
+        .set_write_state(library, WriteState::Blocked, Some(BLOCKED_REASON))
+        .await
+    {
+        Ok(true) => emit(state, "source.write_blocked", library, None, json!({})),
+        Ok(false) => {}
+        Err(e) => eprintln!("sharecraft-server: cannot block a library's writes: {e}"),
+    }
+}
+
+/// The pending write of `node` in `library` that `actor` may retry or discard: `404` when the
+/// person cannot see the node or it has no pending change in that library; `403` unless the
+/// person is the change's author or may manage access to the library (an owner).
+async fn own_write(
+    state: &AppState,
+    actor: &User,
+    library: NodeId,
+    node: NodeId,
+) -> Result<PendingWrite, ApiError> {
+    let db = state.db();
+    let unavailable = |e: records::DbError| ApiError::unavailable(&e);
+    db.effective_access(actor.id, node)
+        .await
+        .map_err(unavailable)?
+        .ok_or(ApiError::NotFound)?;
+    let row = db
+        .pending_write(node)
+        .await
+        .map_err(unavailable)?
+        .filter(|row| row.library == library)
+        .ok_or(ApiError::NotFound)?;
+    if row.by == actor.id {
+        return Ok(row);
+    }
+    let owner = db
+        .effective_access(actor.id, library)
+        .await
+        .map_err(unavailable)?
+        .is_some_and(|held| held.can_manage_access());
+    if !owner {
+        return Err(ApiError::Forbidden);
+    }
+    Ok(row)
+}
+
+/// Retry: makes the pending write of `node` due now and wakes the writer, for its author or an
+/// owner of `library`. `404` without a pending change (or for a person who cannot see it),
+/// `403` for anyone else.
+pub(crate) async fn retry(
+    state: &AppState,
+    actor: &User,
+    library: NodeId,
+    node: NodeId,
+) -> Result<(), ApiError> {
+    own_write(state, actor, library, node).await?;
+    let found = state
+        .db()
+        .retry_write(node, OffsetDateTime::now_utc())
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?;
+    if !found {
+        return Err(ApiError::NotFound);
+    }
+    state.writes().wake();
+    Ok(())
+}
+
+/// Discard: withdraws the pending write of `node`, for its author or an owner of `library`.
+/// A file the bucket has shows the bucket's content again, with a new revision; a new file
+/// never written is deleted (to the recycle bin, as the person, and in slice 1 it cannot be
+/// restored into this library). Nothing in the bucket is changed. The library's source lock is
+/// taken first (`409 source_busy` after ten seconds), so a write in progress finishes first: if
+/// it wrote the change meanwhile there is nothing left to discard (`404`). Records
+/// `source.write_discarded {node}`.
+pub(crate) async fn discard_write(
+    state: &AppState,
+    actor: &User,
+    library: NodeId,
+    node: NodeId,
+) -> Result<(), ApiError> {
+    own_write(state, actor, library, node).await?;
+    let db = state.db();
+    let unavailable = |e: records::DbError| ApiError::unavailable(&e);
+    let lock = lock_source(db, library).await?;
+    // Read again under the lock: the worker may have written it, or a newer change may have
+    // replaced the one the person saw.
+    let row = db
+        .pending_write(node)
+        .await
+        .map_err(unavailable)?
+        .ok_or(ApiError::NotFound)?;
+    let tracked = db
+        .source_item_of(node)
+        .await
+        .map_err(unavailable)?
+        .is_some();
+    if !db
+        .drop_write(node, &row.blob.sha256)
+        .await
+        .map_err(unavailable)?
+    {
+        return Err(ApiError::NotFound);
+    }
+    drop(lock);
+    if !tracked {
+        // A new file the bucket never got: it goes, with nothing of it left to write.
+        crate::api::nodes::delete_one(state, actor, node).await?;
+    }
+    state.events().emit(NewEvent {
+        kind: "source.write_discarded",
+        actor: Some(actor.id),
+        subject: None,
+        document: Some(DocId(node.0)),
+        node: Some(library),
+        detail: json!({ "node": node.0.to_string() }),
+    });
+    Ok(())
 }
