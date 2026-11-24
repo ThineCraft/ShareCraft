@@ -79,12 +79,12 @@ async fn approve(db: &records::Db, fake: &FakeS3) {
     .unwrap();
 }
 
-fn connect_body(name: &str, mode: &str) -> Value {
+fn connect_body(name: &str, mode: &str, prefix: &str) -> Value {
     json!({
         "name": name,
         "endpoint": ENDPOINT,
         "bucket": BUCKET,
-        "prefix": PREFIX,
+        "prefix": prefix,
         "access_key_id": KEY_ID,
         "secret_access_key": SECRET,
         "mode": mode,
@@ -166,12 +166,17 @@ impl Env {
 
     /// A library connected by the administrator in `mode`, its bucket listed once.
     async fn library(&self, name: &str, mode: &str) -> NodeId {
+        self.library_at(name, mode, PREFIX).await
+    }
+
+    /// A library connected by the administrator in `mode` on `prefix`, its bucket listed once.
+    async fn library_at(&self, name: &str, mode: &str, prefix: &str) -> NodeId {
         let (status, answer) = self
             .call(
                 &self.admin,
                 Method::POST,
                 &format!("/api/sites/{}/libraries/s3", self.site.0),
-                Some(connect_body(name, mode)),
+                Some(connect_body(name, mode, prefix)),
             )
             .await;
         assert_eq!(status, StatusCode::CREATED, "{answer}");
@@ -394,8 +399,13 @@ async fn nothing_is_written_before_the_scan_passes() {
     assert!(env.writes_of("clean.txt").is_empty());
     assert!(env.pending(node).await.is_some());
 
+    // Held back a few seconds, with no attempt counted.
+    let held = env.pending(node).await.unwrap();
+    assert_eq!(held.attempts, 0);
+    assert!(held.next_try_at.unwrap() > now);
+
     assert_eq!(env.scan(b"clean upload").await, ScanState::Clean);
-    env.write(now).await;
+    env.write(now + time::Duration::seconds(6)).await;
     assert_eq!(env.object("clean.txt").unwrap().bytes, b"clean upload");
     assert!(env.pending(node).await.is_none());
 }
@@ -695,7 +705,7 @@ async fn a_restart_between_stage_and_write_loses_nothing() {
     let response = first
         .http(Some(&admin))
         .post(first.url(&format!("/api/sites/{}/libraries/s3", site.0)))
-        .json(&connect_body("Restarted", "read_write"))
+        .json(&connect_body("Restarted", "read_write", PREFIX))
         .send()
         .await
         .unwrap();
@@ -981,4 +991,103 @@ async fn a_read_only_s3_library_still_refuses_the_upload() {
     env.write(OffsetDateTime::now_utc()).await;
     assert!(env.fake.writes().is_empty());
     assert!(env.children(library).await.is_empty());
+}
+
+#[tokio::test]
+async fn held_and_blocked_writes_do_not_keep_a_ready_write_waiting() {
+    let env = Env::new().await;
+    let blocked = env.library_at("Blocked", "read_write", "team-a/").await;
+    let busy = env.library_at("Busy", "read_write", "team-c/").await;
+    let ready = env.library_at("Ready", "read_write", "team-b/").await;
+    // Staged oldest first: the four held rows come before the ready one.
+    let a1 = env.new_file(blocked, "a1.txt", b"a one").await;
+    let a2 = env.new_file(blocked, "a2.txt", b"a two").await;
+    let c1 = env.new_file(busy, "c1.txt", b"c one").await;
+    let c2 = env.new_file(busy, "c2.txt", b"c two").await;
+    env.new_file(ready, "b.txt", b"b ready").await;
+    env.db()
+        .set_write_state(blocked, WriteState::Blocked, Some("Refused."))
+        .await
+        .unwrap();
+    // A listing holds the busy library for the whole pass.
+    let lock = env.db().try_lock_source(busy).await.unwrap().unwrap();
+
+    let now = OffsetDateTime::now_utc();
+    env.write(now).await;
+    assert_eq!(
+        env.fake.object(BUCKET, "team-b/b.txt").unwrap().bytes,
+        b"b ready"
+    );
+    assert!(env.fake.object(BUCKET, "team-a/a1.txt").is_none());
+    assert!(env.fake.object(BUCKET, "team-c/c1.txt").is_none());
+    // The busy library's rows are looked at again in five seconds, with no attempt counted.
+    for node in [c1, c2] {
+        let held = env.pending(node).await.unwrap();
+        assert_eq!(held.attempts, 0);
+        let wait = held.next_try_at.unwrap() - now;
+        assert!(
+            (wait - time::Duration::seconds(5)).abs() < time::Duration::milliseconds(1),
+            "{wait}"
+        );
+    }
+
+    drop(lock);
+    env.write(now + time::Duration::seconds(6)).await;
+    assert_eq!(
+        env.fake.object(BUCKET, "team-c/c1.txt").unwrap().bytes,
+        b"c one"
+    );
+    assert_eq!(
+        env.fake.object(BUCKET, "team-c/c2.txt").unwrap().bytes,
+        b"c two"
+    );
+    // The blocked library's rows wait for the probe that unblocks it, then are written.
+    assert_eq!(
+        env.db().write_state(blocked).await.unwrap().unwrap().0,
+        WriteState::Ok
+    );
+    env.write(now + time::Duration::seconds(6)).await;
+    for node in [a1, a2] {
+        assert!(env.pending(node).await.is_none());
+    }
+    assert_eq!(
+        env.fake.object(BUCKET, "team-a/a2.txt").unwrap().bytes,
+        b"a two"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_bucket_lookup_opens_no_session_and_commits_nothing_to_git() {
+    let env = Env::new().await;
+    let library = env.library("Lookup", "read_write").await;
+    // A file an editor opens, so its session could be joined.
+    let node = env.new_file(library, "a.pdf", b"first").await;
+    env.write(OffsetDateTime::now_utc()).await;
+    assert!(env.pending(node).await.is_none());
+    let doc = collab_core::ids::DocId(node.0);
+    let revisions = env.server.records_revisions(doc).await;
+
+    env.state.writes().set_bucket_lookup_fails_for_tests(true);
+    let (status, body) = env
+        .upload(&env.owner, library, "a.pdf", b"second", Some("replace"))
+        .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(env.pending(node).await.is_none(), "nothing staged");
+    assert_eq!(env.server.records_revisions(doc).await, revisions);
+    // The editor's join is refused too.
+    let request = common::ws_request(
+        env.server.addr,
+        &format!("/ws/docs/{}", node.0),
+        Some(&env.owner.cookie),
+    );
+    assert_eq!(common::handshake_status(request).await, 503);
+    assert_eq!(env.server.records_revisions(doc).await, revisions);
+
+    env.state.writes().set_bucket_lookup_fails_for_tests(false);
+    env.replace(library, "a.pdf", b"second").await;
+    let staged = env
+        .pending(node)
+        .await
+        .expect("staged once the lookup works");
+    assert!(staged.base_tag.is_some());
 }

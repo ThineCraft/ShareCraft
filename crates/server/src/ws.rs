@@ -161,7 +161,7 @@ async fn visitor(
     if let Some(scan) = crate::scan::held_state(state, doc).await? {
         return Err(ApiError::Held(scan));
     }
-    let bucket_file = crate::source_write::is_bucket_file(db, doc).await;
+    let bucket_file = crate::source_write::is_bucket_file(state, doc).await?;
     Ok(Visitor {
         user: session.user.id,
         session: session.id,

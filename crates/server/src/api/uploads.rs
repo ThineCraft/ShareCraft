@@ -366,7 +366,12 @@ pub(crate) async fn store_version(
     held: Held,
 ) -> SaveReply {
     let blob = held.blob();
-    let bucket_file = is_bucket_file(state.db(), doc).await;
+    // When the records cannot say which store the file lives in, no session is opened: a
+    // bucket file must never be saved to Git.
+    let Ok(bucket_file) = is_bucket_file(state, doc).await else {
+        discard(state, held).await;
+        return SaveReply::Failed;
+    };
     // A session that ended before taking the upload wrote nothing for it; it is opened again.
     let mut reply = SaveReply::Failed;
     for _ in 0..SESSION_ATTEMPTS {
@@ -549,7 +554,7 @@ async fn ask_check(
     name: &str,
     base: Option<RevisionId>,
 ) -> Result<Option<SaveReply>, ApiError> {
-    let bucket_file = is_bucket_file(state.db(), doc).await;
+    let bucket_file = is_bucket_file(state, doc).await?;
     for _ in 0..SESSION_ATTEMPTS {
         // A session that ended meanwhile is opened again.
         let link = session_of(state, doc, name, bucket_file);

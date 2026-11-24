@@ -356,18 +356,23 @@ impl Db {
     }
 
     /// At most `limit` pending writes whose retry time is null or passed and that are flushed or
-    /// were first staged [`COALESCE`] or more before `now`, oldest first. Whether the content
-    /// has been scanned is the caller's question ([`Db::availability`]), not this one's.
+    /// were first staged [`COALESCE`] or more before `now`, oldest first. Rows of a library whose
+    /// writes are blocked are left out: they wait for the probe that unblocks it, and never take
+    /// the places of other libraries' rows. Whether the content has been scanned is the
+    /// caller's question ([`Db::availability`]), not this one's.
     pub async fn due_writes(
         &self,
         now: OffsetDateTime,
         limit: i64,
     ) -> Result<Vec<PendingWrite>, DbError> {
         let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "select {COLUMNS} from source_writes \
-             where coalesce(next_try_at, '-infinity') <= $1 \
-               and (flush or first_staged_at <= $2) \
-             order by first_staged_at, node_id limit $3"
+            "select {COLUMNS} from source_writes w \
+             where coalesce(w.next_try_at, '-infinity') <= $1 \
+               and (w.flush or w.first_staged_at <= $2) \
+               and not exists (select 1 from library_sources s \
+                               where s.library_id = w.library_id \
+                                 and s.write_state = 'blocked') \
+             order by w.first_staged_at, w.node_id limit $3"
         )))
         .bind(now)
         .bind(now - COALESCE)
@@ -563,6 +568,39 @@ impl Db {
                 .execute(self.pool())
                 .await?;
         Ok(done.rows_affected() > 0)
+    }
+
+    /// Puts off the pending write of `node` holding the content `sha256` until `until`, without
+    /// counting an attempt or recording an error (its content is still being scanned, or a
+    /// listing holds its library). Whether the row still holds that content.
+    pub async fn defer_write(
+        &self,
+        node: NodeId,
+        sha256: &[u8; 32],
+        until: OffsetDateTime,
+    ) -> Result<bool, DbError> {
+        let done = sqlx::query(
+            "update source_writes set next_try_at = $3 where node_id = $1 and sha256 = $2",
+        )
+        .bind(node.0)
+        .bind(hex(sha256))
+        .bind(until)
+        .execute(self.pool())
+        .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    /// The libraries whose writes are blocked and that have pending writes.
+    pub async fn blocked_with_writes(&self) -> Result<Vec<NodeId>, DbError> {
+        let ids: Vec<Uuid> = sqlx::query_scalar(
+            "select s.library_id from library_sources s \
+             where s.write_state = 'blocked' \
+               and exists (select 1 from source_writes w where w.library_id = s.library_id) \
+             order by s.library_id",
+        )
+        .fetch_all(self.pool())
+        .await?;
+        Ok(ids.into_iter().map(NodeId).collect())
     }
 
     /// The tracking row of `node` in its connected library, if it has one.

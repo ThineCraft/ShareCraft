@@ -278,6 +278,10 @@ const NOT_APPROVED: &str = "The storage is no longer approved by an administrato
 const READ_ONLY_NOW: &str =
     "The library is read-only now, so this change was not written to its storage.";
 const CONTENT_MISSING: &str = "The content of this change is missing from this server.";
+const SCAN_TOO_LARGE: &str =
+    "The file is too large for the malware scanner, so it is not written to the storage.";
+/// How long a change waits for its scan or a listing before it is looked at again.
+const HELD_SECONDS: i64 = 5;
 
 /// What [`stage`] stages: the content `blob` (already in the content store, held by the caller)
 /// as the new state of `node`, at the library-relative `path` of the S3 library `library`.
@@ -490,15 +494,28 @@ pub(crate) async fn staged_path(
 }
 
 /// Whether `doc` is a file of an S3 library, in either mode: its file session uses the
-/// [`ExternalCheckpointer`]. A database failure answers `false`.
-pub(crate) async fn is_bucket_file(db: &Db, doc: DocId) -> bool {
-    let Ok(Some(library)) = db.source_library_of(NodeId(doc.0)).await else {
-        return false;
+/// [`ExternalCheckpointer`].
+///
+/// # Errors
+/// `503 unavailable` when the records cannot say. The caller opens no session then: a bucket
+/// file's session must never fall back to Git.
+pub(crate) async fn is_bucket_file(state: &AppState, doc: DocId) -> Result<bool, ApiError> {
+    if state.writes().bucket_lookup_fails() {
+        return Err(ApiError::Unavailable);
+    }
+    let db = state.db();
+    let unavailable = |e: records::DbError| ApiError::unavailable(&e);
+    let Some(library) = db
+        .source_library_of(NodeId(doc.0))
+        .await
+        .map_err(unavailable)?
+    else {
+        return Ok(false);
     };
-    matches!(
-        db.source_of(library).await,
-        Ok(Some((config, _))) if config.kind == SourceKind::S3
-    )
+    Ok(matches!(
+        db.source_of(library).await.map_err(unavailable)?,
+        Some((config, _)) if config.kind == SourceKind::S3
+    ))
 }
 
 /// The checkpointer of a bucket file's session: a save is staged for the bucket, never
@@ -700,9 +717,21 @@ pub struct SourceWrites {
     /// Blocked libraries with changes waiting, and when each was last probed (or blocked).
     blocked: Mutex<HashMap<NodeId, Option<OffsetDateTime>>>,
     paused: AtomicBool,
+    /// [`is_bucket_file`] answers a failure, as a database outage would. For tests.
+    bucket_lookup_fails: AtomicBool,
 }
 
 impl SourceWrites {
+    /// Makes [`is_bucket_file`] fail (or work again), as it does when the database cannot be
+    /// read. For tests.
+    pub fn set_bucket_lookup_fails_for_tests(&self, fails: bool) {
+        self.bucket_lookup_fails.store(fails, Ordering::SeqCst);
+    }
+
+    fn bucket_lookup_fails(&self) -> bool {
+        self.bucket_lookup_fails.load(Ordering::SeqCst)
+    }
+
     /// Asks the worker to look for due writes at once.
     pub fn wake(&self) {
         self.wake.notify_one();
@@ -801,16 +830,33 @@ async fn write_one(state: &AppState, due: PendingWrite, now: OffsetDateTime) -> 
             }
             return true;
         }
-        // Still being scanned, or held: left for a later step.
-        Ok(Some(_)) => return false,
+        // Over the scanner's limit: it is never let through, so it is never written.
+        Ok(Some(ScanState::TooLarge)) => {
+            fail(state, &due, now, SCAN_TOO_LARGE).await;
+            return true;
+        }
+        // Still being scanned, or the scan is retried: looked at again shortly, so it never
+        // keeps other files' writes waiting.
+        Ok(Some(_)) => {
+            defer(state, &due, now).await;
+            return false;
+        }
         Err(e) => {
             eprintln!("sharecraft-server: cannot read the scan of a change: {e}");
             return false;
         }
     }
-    // A listing holds the lock for its whole pass: the row waits for a later step.
-    let Ok(Some(lock)) = db.try_lock_source(due.library).await else {
-        return false;
+    // A listing holds the lock for its whole pass: the row is looked at again shortly.
+    let lock = match db.try_lock_source(due.library).await {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            defer(state, &due, now).await;
+            return false;
+        }
+        Err(e) => {
+            eprintln!("sharecraft-server: cannot take a library's source lock: {e}");
+            return false;
+        }
     };
     let row = match db.pending_write(due.node).await {
         Ok(Some(row)) if row.blob == due.blob => row,
@@ -1124,17 +1170,40 @@ async fn fail(state: &AppState, row: &PendingWrite, now: OffsetDateTime, why: &s
     }
 }
 
+/// The row is held (its scan has not finished, or a listing holds the library): it is looked at
+/// again after a few seconds, with no attempt counted.
+async fn defer(state: &AppState, row: &PendingWrite, now: OffsetDateTime) {
+    let until = now + time::Duration::seconds(HELD_SECONDS);
+    if let Err(e) = state
+        .db()
+        .defer_write(row.node, &row.blob.sha256, until)
+        .await
+    {
+        eprintln!("sharecraft-server: cannot hold a change back: {e}");
+    }
+}
+
 /// Probes again each blocked library with changes waiting whose time has come. A pass unblocks
-/// it, records what it found about conditional writes and makes its changes due.
+/// it, records what it found about conditional writes and makes its changes due. Blocked
+/// libraries not yet known here (after a restart, say) are probed at once.
 async fn reprobe(state: &AppState, now: OffsetDateTime) {
     let every = time::Duration::seconds(i64::try_from(REPROBE_EVERY.as_secs()).unwrap_or(300));
+    let db = state.db();
+    match db.blocked_with_writes().await {
+        Ok(found) => {
+            let mut blocked = state.writes().blocked();
+            for library in found {
+                blocked.entry(library).or_insert(None);
+            }
+        }
+        Err(e) => eprintln!("sharecraft-server: cannot list blocked libraries: {e}"),
+    }
     let libraries: Vec<(NodeId, Option<OffsetDateTime>)> = state
         .writes()
         .blocked()
         .iter()
         .map(|(library, at)| (*library, *at))
         .collect();
-    let db = state.db();
     for (library, probed) in libraries {
         if probed.is_some_and(|at| now - at < every) {
             continue;

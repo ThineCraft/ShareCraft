@@ -1506,7 +1506,7 @@ pub(crate) enum Created {
 /// is refused or fails is erased unless something else names it. If it cannot be stored after
 /// the document was made, the document stays, empty, and the answer is `503` naming it. With
 /// `keep_both`, a name taken meanwhile is chosen again (the first free `name (2)`, `name (3)`
-/// â€¦) rather than refused, so the upload is not lost.
+/// …) rather than refused, so the upload is not lost.
 pub(crate) async fn create_uploaded(
     state: &AppState,
     user: &User,
