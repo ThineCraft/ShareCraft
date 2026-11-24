@@ -358,3 +358,8 @@ export function overwriteNote(conditional) {
   }
   return '';
 }
+
+/** Whether the server offered this row or file's pending change to the person to Retry or Discard. */
+export function mayResolve(entry) {
+  return entry?.may_resolve === true;
+}

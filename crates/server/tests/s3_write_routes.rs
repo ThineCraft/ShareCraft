@@ -1014,6 +1014,20 @@ async fn the_listing_and_the_file_answer_show_saving_and_failed() {
         }
     }
 
+    // Retry and Discard are offered to the author and an owner, and to nobody else.
+    for (user, may) in [(&eve, true), (&env.owner, true), (&dan, false)] {
+        let detail = env.doc_as(user, node).await;
+        assert_eq!(detail["writes"]["may_resolve"], may, "file answer for {}: {detail}", user.email);
+        let items = env.listed(user, library).await;
+        let listed = items
+            .iter()
+            .find(|item| item["name"] == "eves.txt")
+            .expect("listed");
+        assert_eq!(listed["may_resolve"], may, "listing for {}: {listed}", user.email);
+        let plain = items.iter().find(|item| item["name"] == "plain.txt").expect("listed");
+        assert!(plain.get("may_resolve").is_none(), "{plain}");
+    }
+
     // Written: no mark any more.
     env.write(now + time::Duration::seconds(31)).await;
     let items = env.listed(&env.owner, library).await;

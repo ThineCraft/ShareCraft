@@ -165,6 +165,8 @@ struct WriteMark {
     /// Why it failed: shown only to the change's author and the library's owners.
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    /// Whether the caller may Retry or Discard it: its author, or an owner of the library.
+    may_resolve: bool,
 }
 
 #[derive(Serialize)]
@@ -249,16 +251,17 @@ pub(crate) async fn open(
         None => None,
         Some(pending) => {
             let failed = pending.state == records::PendingState::Failed;
-            let may_see_error = failed
-                && (pending.by == signed.session.user.id
-                    || db
-                        .effective_access(signed.session.user.id, pending.library)
-                        .await
-                        .map_err(|e| ApiError::unavailable(&e))?
-                        .is_some_and(|held| held.can_manage_access()));
+            let may_resolve = pending.by == signed.session.user.id
+                || db
+                    .effective_access(signed.session.user.id, pending.library)
+                    .await
+                    .map_err(|e| ApiError::unavailable(&e))?
+                    .is_some_and(|held| held.can_manage_access());
+            let may_see_error = failed && may_resolve;
             Some(WriteMark {
                 state: if failed { "failed" } else { "saving" },
                 error: pending.error.clone().filter(|_| may_see_error),
+                may_resolve,
             })
         }
     };

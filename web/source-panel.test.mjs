@@ -25,6 +25,7 @@ import {
   sourceWriteBlockedText,
   readWriteAdminOnlyText,
   sourceWriteErrorText,
+  mayResolve,
 } from './source-panel.js';
 
 test('shouldReload follows a changed commit or a completed update', () => {
@@ -392,4 +393,13 @@ test('overwriteNote shows for conditional no or unknown and for nothing else', (
   assert.equal(overwriteNote('unknown'), overwriteNote('no'));
   assert.equal(overwriteNote(undefined), '');
   assert.equal(overwriteNote(null), '');
+});
+
+test('mayResolve is true only when the server said the person may Retry or Discard', () => {
+  assert.equal(mayResolve({ saving: 'failed', may_resolve: true }), true);
+  assert.equal(mayResolve({ state: 'failed', may_resolve: true }), true);
+  assert.equal(mayResolve({ saving: 'failed', may_resolve: false }), false);
+  assert.equal(mayResolve({ saving: 'failed' }), false);
+  assert.equal(mayResolve({ saving: 'failed', may_resolve: 'true' }), false);
+  assert.equal(mayResolve(null), false);
 });

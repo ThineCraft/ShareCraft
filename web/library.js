@@ -68,6 +68,7 @@ import {
   sourceControlsEnabled,
   sourceWriteErrorText,
   savingMark,
+  mayResolve,
   discardQuestion,
   writeCountsText,
   sourceName,
@@ -651,14 +652,14 @@ function markNodes(item) {
 
 /**
  * Under a file's name while its change is not yet in the bucket: "Saving…", or "Not saved: why"
- * with Retry and Discard (in words, never colour alone). The buttons are for people who may add
- * here; the server answers 403 for anyone who is neither the change's author nor an owner.
+ * with Retry and Discard (in words, never colour alone). The buttons are for the change's author
+ * and the library's owners only: the listing says so in may_resolve.
  */
 function writeNodes(item) {
   const text = savingMark(item);
   if (text === '') return [];
   if (item.saving === 'saving') return [h('small', { class: 'mark', id: `saving-${item.id}` }, text)];
-  const buttons = canAdd
+  const buttons = mayResolve(item)
     ? [
         writeButton(item, 'Retry', () => retryWrite(item)),
         writeButton(item, 'Discard', () => discardWrite(item)),

@@ -44,7 +44,7 @@ import { downloadNote, liveLook, liveStatus, setupEditorFrame } from './editor-f
 import { connectLive, liveNotice, onlyEditor, pickBanner, shownBanner, trackUnsaved, warnOnLeave } from './live-host.js';
 import { createViewer } from './file-viewer.js';
 import { viewerList } from './viewer.js';
-import { discardQuestion, savingMark, sourceWriteErrorText } from './source-panel.js';
+import { discardQuestion, mayResolve, savingMark, sourceWriteErrorText } from './source-panel.js';
 
 const FIRST_DELAY = 500;
 const MAX_DELAY = 8000;
@@ -222,7 +222,7 @@ async function main() {
 /**
  * "Saving…" while the change waits for the bucket; "Not saved: why" with Retry and Discard when
  * writing it failed. Only the change's author and the library's owners are told why (the server
- * sends `writes.error` to them only), and only they are offered the buttons.
+ * sends `writes.error` to them only), and only they are offered the buttons (`writes.may_resolve`).
  */
 function showWrites(note = '') {
   clearTimeout(writeTimer);
@@ -239,7 +239,7 @@ function showWrites(note = '') {
   const text = savingMark({ saving: failed ? 'failed' : 'saving' }, writes.error);
   box.classList.remove('idle');
   $('write-text').textContent = note ? `${text} ${note}` : text;
-  const mayAct = failed && typeof writes.error === 'string';
+  const mayAct = failed && mayResolve(writes);
   $('write-actions').replaceChildren(
     ...(mayAct
       ? [

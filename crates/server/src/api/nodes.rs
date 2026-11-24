@@ -357,6 +357,10 @@ pub(crate) struct ChildOut {
     /// written to the bucket, `failed` when writing it failed and is waiting for a retry.
     #[serde(skip_serializing_if = "Option::is_none")]
     saving: Option<&'static str>,
+    /// With `saving`: whether the caller may Retry or Discard it (its author, or an owner of the
+    /// library): the buttons are shown only when the server would accept them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    may_resolve: Option<bool>,
 }
 
 impl From<Listed> for ChildOut {
@@ -377,6 +381,7 @@ impl From<Listed> for ChildOut {
             external: None,
             unavailable: None,
             saving: None,
+            may_resolve: None,
         }
     }
 }
@@ -396,6 +401,35 @@ impl ChildrenPage {
             items: listed.into_iter().map(ChildOut::from).collect(),
             next: next.map(encode_cursor),
         }
+    }
+
+    /// Each file marked `saving` also says whether `user` may Retry or Discard its change: the
+    /// change's author, or someone who may manage access to its library.
+    pub(crate) async fn with_resolvable(mut self, db: &Db, user: UserId) -> Result<Self, ApiError> {
+        for item in &mut self.items {
+            if item.saving.is_none() {
+                continue;
+            }
+            let Ok(id) = Uuid::parse_str(&item.id) else {
+                continue;
+            };
+            let Some(pending) = db
+                .pending_write(NodeId(id))
+                .await
+                .map_err(|e| ApiError::unavailable(&e))?
+            else {
+                continue;
+            };
+            item.may_resolve = Some(if pending.by == user {
+                true
+            } else {
+                db.effective_access(user, pending.library)
+                    .await
+                    .map_err(|e| ApiError::unavailable(&e))?
+                    .is_some_and(|held| held.can_manage_access())
+            });
+        }
+        Ok(self)
     }
 
     /// The page, each file in it that the file policies where it is (in `parent`) now refuse
@@ -561,6 +595,8 @@ pub(crate) async fn children(
     }
     let page = ChildrenPage::of(listed, next.as_ref())
         .marked(db, id)
+        .await?
+        .with_resolvable(db, signed.session.user.id)
         .await?
         .with_thumbnails();
     if photos {
