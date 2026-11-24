@@ -1715,6 +1715,16 @@ pub(crate) async fn connect_s3(
         return Err(ApiError::NameTaken);
     }
 
+    // A place another library holds is refused before the store is asked: the write probe
+    // must never write into another library's place (`connect_s3_source` judges it again).
+    if state
+        .db()
+        .s3_place_taken(&endpoint.name, &bucket, &prefix)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?
+    {
+        return Err(ApiError::S3PlaceInUse);
+    }
     let deadline = tokio::time::Instant::now() + S3_PROBE_LIMIT;
     let versioning = probe_bucket(
         &state,

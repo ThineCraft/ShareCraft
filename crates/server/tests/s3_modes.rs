@@ -740,3 +740,22 @@ async fn a_probe_left_behind_is_logged_and_announced_without_the_bucket() {
     let seen = env.seen.lock().unwrap().join("\n");
     assert!(!seen.contains(SECRET));
 }
+
+#[tokio::test]
+async fn read_write_over_another_librarys_place_is_refused_before_anything_is_written() {
+    let env = Env::new().await;
+    env.library("Existing", "read_only").await;
+    let libraries = env.libraries().await;
+    let mut body = Env::body("Overlapping", Some("read_write"));
+    body["prefix"] = json!(format!("{PREFIX}inner/"));
+    let (status, answer) = env.connect_as(&env.admin, body).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{answer}");
+    assert_eq!(answer["error"], "s3_place_in_use");
+    let (status, answer) = env
+        .connect_as(&env.admin, Env::body("Same place", Some("read_write")))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{answer}");
+    assert_eq!(answer["error"], "s3_place_in_use");
+    assert!(env.fake.writes().is_empty(), "{:?}", env.fake.writes());
+    assert_eq!(env.libraries().await, libraries);
+}

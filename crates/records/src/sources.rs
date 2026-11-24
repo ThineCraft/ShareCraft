@@ -1083,6 +1083,24 @@ impl Db {
         .await?)
     }
 
+    /// Whether another library holds `bucket` at `endpoint` under a prefix overlapping
+    /// `prefix`: the rule [`Db::connect_s3_source`] refuses with `Exists`, read without a lock
+    /// so a route can refuse before it asks the store anything (the connect judges it again).
+    pub async fn s3_place_taken(
+        &self,
+        endpoint: &str,
+        bucket: &str,
+        prefix: &str,
+    ) -> Result<bool, DbError> {
+        let prefixes: Vec<String> =
+            sqlx::query_scalar("select prefix from source_s3 where endpoint = $1 and bucket = $2")
+                .bind(endpoint)
+                .bind(bucket)
+                .fetch_all(self.pool())
+                .await?;
+        Ok(prefixes.iter().any(|other| prefixes_overlap(prefix, other)))
+    }
+
     /// Where the bucket of the S3 library `library` is; `None` if it is not connected to one.
     pub async fn s3_place(&self, library: NodeId) -> Result<Option<S3Place>, DbError> {
         let row = sqlx::query(
