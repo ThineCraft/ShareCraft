@@ -374,6 +374,8 @@ fn mapped(status: u16, code: Option<&str>) -> S3Error {
         (501, _) | (_, Some("NotImplemented")) => S3Error::Unsupported,
         (400 | 403, Some("InvalidObjectState")) => S3Error::Archived,
         (403, Some("InvalidAccessKeyId" | "SignatureDoesNotMatch")) => S3Error::BadKeys,
+        // R2 answers a revoked or unknown token with a bare 401.
+        (401, _) => S3Error::BadKeys,
         (403, Some("RequestTimeTooSkewed")) => S3Error::ClockSkew,
         (403, _) => S3Error::Denied,
         (404, _) => S3Error::NotFound,
@@ -1438,6 +1440,7 @@ mod tests {
         assert_eq!(mapped(404, Some("NoSuchBucket")), S3Error::NoBucket);
         assert_eq!(mapped(403, Some("SignatureDoesNotMatch")), S3Error::BadKeys);
         assert_eq!(mapped(403, None), S3Error::Denied);
+        assert_eq!(mapped(401, None), S3Error::BadKeys);
         assert_eq!(mapped(400, Some("InvalidObjectState")), S3Error::Archived);
         assert_eq!(mapped(501, None), S3Error::Unsupported);
         assert_eq!(mapped(418, None), S3Error::Other);
