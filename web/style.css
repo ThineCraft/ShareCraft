@@ -273,7 +273,7 @@ dialog input:is([type=text],[type=email]){width:100%}
 .filters{display:flex;flex-wrap:wrap;align-items:flex-end;gap:var(--space-2) var(--space-4);margin:var(--space-3) 0}
 .filters .field{margin:0}
 .mark.own{border-color:var(--accent-ink);color:var(--accent-ink)}
-.scroll{overflow-x:auto;margin:0 0 var(--space-3)}
+.scroll{position:relative;overflow-x:auto;margin:0 0 var(--space-3)}
 table.banded{border-collapse:collapse;width:100%;min-width:280px}
 table.banded th,table.banded td{text-align:left;vertical-align:top;padding:var(--space-2);border-bottom:1px solid var(--line);overflow-wrap:anywhere}
 table.banded th{font-size:var(--text-sm);color:var(--muted);font-weight:600}
