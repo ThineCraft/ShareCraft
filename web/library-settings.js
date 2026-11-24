@@ -36,9 +36,10 @@ const error = $('error');
 // The GitHub wording, kept so that showing an S3 library and then a GitHub one restores it exactly.
 const githubIntro = $('source-intro').textContent;
 const githubDisconnect = $('disconnect-text').textContent;
+const githubDisconnectButton = $('source-disconnect').textContent;
 const VERSIONING = {
-  enabled: 'This bucket keeps earlier versions.',
-  none: 'This bucket keeps no earlier versions.',
+  enabled: 'This bucket keeps earlier versions',
+  none: 'This bucket keeps no earlier versions',
 };
 const MISSING = 'This library does not exist, or you do not have access to it.';
 const sourceError = (code) =>
@@ -221,6 +222,7 @@ function showSource() {
   $('disconnect-text').textContent = s3
     ? 'Disconnecting stops updates from S3 storage. The files stay in this library. Nothing in the bucket is changed.'
     : githubDisconnect;
+  $('source-disconnect').textContent = s3 ? 'Disconnect' : githubDisconnectButton;
   $('github-repo-line').hidden = s3;
   $('source-settings').hidden = s3;
   $('webhook-box').hidden = s3;
@@ -310,7 +312,7 @@ function showS3Source() {
   $('s3-bucket').textContent = source.bucket ?? '';
   $('s3-folder').textContent = source.prefix ? source.prefix : '(whole bucket)';
   $('s3-key').textContent = `Access key ending …${source.key?.id_ends ?? ''} · secret set`;
-  $('s3-versioning').textContent = VERSIONING[source.versioning] ?? 'Not known.';
+  $('s3-versioning').textContent = VERSIONING[source.versioning] ?? 'Not known';
   $('s3-poll').value = String(source.poll_seconds);
 }
 

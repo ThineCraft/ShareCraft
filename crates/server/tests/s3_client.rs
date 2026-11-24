@@ -423,6 +423,7 @@ async fn each_error_is_mapped() {
         (307, "TemporaryRedirect", S3Error::WrongRegion),
         (400, "AuthorizationHeaderMalformed", S3Error::WrongRegion),
         (400, "PermanentRedirect", S3Error::WrongRegion),
+        (400, "InvalidRegionName", S3Error::WrongRegion),
         (412, "PreconditionFailed", S3Error::Precondition),
         (403, "InvalidObjectState", S3Error::Archived),
         (400, "InvalidObjectState", S3Error::Archived),

@@ -277,6 +277,9 @@ dialog input:is([type=text],[type=email]){width:100%}
 table.banded{border-collapse:collapse;width:100%;min-width:280px}
 table.banded th,table.banded td{text-align:left;vertical-align:top;padding:var(--space-2);border-bottom:1px solid var(--line);overflow-wrap:anywhere}
 table.banded th{font-size:var(--text-sm);color:var(--muted);font-weight:600}
+/* the approved S3 endpoints table keeps its columns and scrolls inside its .scroll box at phone width */
+#s3-table{min-width:40rem}
+#s3-table th{white-space:nowrap}
 table.banded tbody tr:nth-child(even){background:var(--band)}
 .crumbs-line{list-style:none;display:flex;flex-wrap:wrap;gap:2px 0;margin:0 0 var(--space-2);padding:0;font-size:var(--text-sm)}
 .crumbs-line li+li::before{content:"›" / "";margin:0 var(--space-2);color:var(--muted)}

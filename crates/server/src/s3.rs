@@ -330,7 +330,8 @@ fn mapped(status: u16, code: Option<&str>) -> S3Error {
         (403, Some("RequestTimeTooSkewed")) => S3Error::ClockSkew,
         (403, _) => S3Error::Denied,
         (404, _) => S3Error::NotFound,
-        (301 | 307, _) | (400, Some("AuthorizationHeaderMalformed" | "PermanentRedirect")) => {
+        (301 | 307, _)
+        | (400, Some("AuthorizationHeaderMalformed" | "PermanentRedirect" | "InvalidRegionName")) => {
             S3Error::WrongRegion
         }
         (412, _) => S3Error::Precondition,
