@@ -203,12 +203,23 @@ async fn put_first_free(
     folder: &str,
     names: &[String],
     body: &PutBody,
+    conditional: Tri,
 ) -> Result<(String, Seen), WriteError> {
     check_size(s3, body)?;
+    let conditions = conditional == Tri::Yes;
     for name in names {
         let path = format!("{folder}{name}");
         let key = object_key(t, &path).ok_or(WriteError::Failed)?;
-        match put_checked(s3, t, &key, body, Cond::IfAbsent).await {
+        if !conditions {
+            // No conditions to lean on: a name that is there is never written to.
+            match s3.head(t, &key).await {
+                Ok(head) if is_ours(&head, body) => return Ok((path, seen_of(&head))),
+                Ok(_) => continue,
+                Err(S3Error::NotFound) => {}
+                Err(error) => return Err(write_error(error)),
+            }
+        }
+        match put_checked(s3, t, &key, body, cond_if_absent(conditions)).await {
             Ok(head) => return Ok((path, seen_of(&head))),
             Err(S3Error::Precondition) => match s3.head(t, &key).await {
                 Ok(head) if is_ours(&head, body) => return Ok((path, seen_of(&head))),
@@ -240,11 +251,12 @@ pub async fn write_beside(
     body: &PutBody,
     person: &str,
     at: OffsetDateTime,
+    conditional: Tri,
 ) -> Result<(String, Seen), WriteError> {
     object_key(t, path).ok_or(WriteError::Failed)?;
     let (folder, name) = split_path(path);
     let first = sibling_name(name, person, at);
-    put_first_free(s3, t, folder, &candidates(&first), body).await
+    put_first_free(s3, t, folder, &candidates(&first), body, conditional).await
 }
 
 /// Writes a new file at `path`, or at `name (2).ext` and on if that key appeared meanwhile.
@@ -256,12 +268,13 @@ pub async fn write_numbered(
     t: &S3Target,
     path: &str,
     body: &PutBody,
+    conditional: Tri,
 ) -> Result<(String, Seen), WriteError> {
     object_key(t, path).ok_or(WriteError::Failed)?;
     let (folder, name) = split_path(path);
     let mut names = vec![];
     names.extend((2..=LAST_NUMBER).map(|n| numbered_name(name, n)));
-    put_first_free(s3, t, folder, &names, body).await
+    put_first_free(s3, t, folder, &names, body, conditional).await
 }
 
 /// The body of a zero-byte object.
@@ -291,15 +304,17 @@ pub async fn make_folder(s3: &S3, t: &S3Target, path: &str) -> Result<(), WriteE
 }
 
 /// Whether a refusal answers a condition: `Ok(true)` refused, `Ok(false)` accepted or not
-/// understood (a store that rejects the header does not honour it), else why it failed.
-fn refused(result: Result<ObjectHead, S3Error>) -> Result<bool, &'static str> {
+/// understood (a store that rejects the header does not honour it), `Err(None)` when the key may
+/// not write at all, else why it failed.
+fn refused(result: Result<ObjectHead, S3Error>) -> Result<bool, Option<&'static str>> {
     match result {
         Ok(_) => Ok(false),
         Err(S3Error::Precondition | S3Error::NotFound) => Ok(true),
         Err(S3Error::Unsupported | S3Error::Other | S3Error::Malformed | S3Error::Archived) => {
             Ok(false)
         }
-        Err(error) => Err(reason(error)),
+        Err(S3Error::Denied) => Err(None),
+        Err(error) => Err(Some(reason(error))),
     }
 }
 
@@ -308,32 +323,45 @@ fn refused(result: Result<ObjectHead, S3Error>) -> Result<bool, &'static str> {
 /// again (refused when conditions work), a `PUT` with an `If-Match` that cannot match (refused
 /// when conditions work) and a `DELETE`. Nothing that was there is touched.
 ///
-/// The key is `<prefix>.sharecraft-tmp-probe-<uuid>`, which listings hide. If the `DELETE` fails
-/// the answer is still what the probe found.
-pub async fn probe_writes(s3: &S3, t: &S3Target) -> Probe {
+/// The key is `<prefix>.sharecraft-tmp-probe-<uuid>`, which listings hide. The `DELETE` is sent
+/// after any `PUT` that did not answer `Denied`, even one that failed, since it may have landed.
+/// The second value is the probe object's name relative to the library prefix when its removal
+/// failed, else `None`; the answer is still what the probe found.
+pub async fn probe_writes(s3: &S3, t: &S3Target) -> (Probe, Option<String>) {
     // Not built by `object_key`, which refuses names ShareCraft keeps for itself.
-    let key = format!("{}.sharecraft-tmp-probe-{}", t.prefix(), Uuid::new_v4());
+    let name = format!(".sharecraft-tmp-probe-{}", Uuid::new_v4());
+    let key = format!("{}{name}", t.prefix());
     let body = empty_body();
-    match put_checked(s3, t, &key, &body, Cond::IfAbsent).await {
-        Ok(_) => {}
-        Err(S3Error::Denied) => return Probe::ReadOnly,
-        Err(error) => return Probe::Unreachable(reason(error)),
-    }
-    let second = refused(put_checked(s3, t, &key, &body, Cond::IfAbsent).await);
-    let third = match second {
-        Ok(_) => refused(put_checked(s3, t, &key, &body, Cond::IfMatch("\"0\"")).await),
-        Err(why) => Err(why),
+    let first = put_checked(s3, t, &key, &body, Cond::IfAbsent).await;
+    let finding = match first {
+        Err(S3Error::Denied) => return (Probe::ReadOnly, None),
+        Err(error) => Err(Some(reason(error))),
+        Ok(_) => {
+            let second = refused(put_checked(s3, t, &key, &body, Cond::IfAbsent).await);
+            match second {
+                Ok(second) => {
+                    let third =
+                        refused(put_checked(s3, t, &key, &body, Cond::IfMatch("\"0\"")).await);
+                    third.map(|third| second && third)
+                }
+                Err(why) => Err(why),
+            }
+        }
     };
     // The key is ours whatever the answers were.
-    // If this fails the finding stands, and listings hide the key.
-    let _ = s3.delete(t, &key).await;
-    match (second, third) {
-        (Ok(true), Ok(true)) => Probe::ReadWrite {
+    let left = match s3.delete(t, &key).await {
+        Ok(()) => None,
+        Err(_) => Some(name),
+    };
+    let probe = match finding {
+        Ok(true) => Probe::ReadWrite {
             conditional: Tri::Yes,
         },
-        (Ok(_), Ok(_)) => Probe::ReadWrite {
+        Ok(false) => Probe::ReadWrite {
             conditional: Tri::No,
         },
-        (Err(why), _) | (_, Err(why)) => Probe::Unreachable(why),
-    }
+        Err(None) => Probe::ReadOnly,
+        Err(Some(why)) => Probe::Unreachable(why),
+    };
+    (probe, left)
 }

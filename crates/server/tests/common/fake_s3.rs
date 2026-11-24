@@ -103,6 +103,7 @@ struct Model {
     last_headers: HeaderMap,
     ignore_conditions: bool,
     read_only: bool,
+    deny_writes_after: Option<usize>,
     lose_answer: bool,
     writes: Vec<(String, String, String)>,
     last_write_body_len: Option<usize>,
@@ -136,6 +137,7 @@ impl Default for Model {
             last_headers: HeaderMap::new(),
             ignore_conditions: false,
             read_only: false,
+            deny_writes_after: None,
             lose_answer: false,
             writes: Vec::new(),
             last_write_body_len: None,
@@ -347,6 +349,12 @@ impl FakeS3 {
     /// Every `PUT` and `DELETE` is answered `403 AccessDenied`.
     pub fn read_only(&self) {
         self.model().read_only = true;
+    }
+
+    /// The first `n` writes (`PUT` or `DELETE`) are accepted; every later one is answered
+    /// `403 AccessDenied`.
+    pub fn deny_writes_after(&self, n: usize) {
+        self.model().deny_writes_after = Some(n);
     }
 
     /// The next write is stored (or removed), and then answered `503 SlowDown`.
@@ -770,7 +778,7 @@ async fn handle(State(model): State<Arc<Mutex<Model>>>, request: Request) -> Res
         }
         let hung = m.hung.contains(&key);
         let truncated = m.truncated.get(&key).copied();
-        let read_only = m.read_only;
+        let read_only = m.read_only || m.deny_writes_after.is_some_and(|n| m.writes.len() > n);
         let write_flags = Flags {
             ignore_conditions: m.ignore_conditions,
             lose_answer: kind == "write" && std::mem::take(&mut m.lose_answer),

@@ -322,7 +322,7 @@ async fn write_beside_names_the_copy_and_numbers_it_if_taken() {
     let name = sibling_name("report.txt", "Ada", at());
     assert_eq!(name, "report (edited by Ada 2023-11-14 22.13).txt");
 
-    let (path, seen) = write_beside(&s3, &t, "docs/report.txt", &body, "Ada", at())
+    let (path, seen) = write_beside(&s3, &t, "docs/report.txt", &body, "Ada", at(), Tri::Yes)
         .await
         .unwrap();
     assert_eq!(path, format!("docs/{name}"));
@@ -337,7 +337,7 @@ async fn write_beside_names_the_copy_and_numbers_it_if_taken() {
 
     // Taken by someone else: the next number.
     let (_g, other) = file_body(b"second edit");
-    let (path2, _) = write_beside(&s3, &t, "docs/report.txt", &other, "Ada", at())
+    let (path2, _) = write_beside(&s3, &t, "docs/report.txt", &other, "Ada", at(), Tri::Yes)
         .await
         .unwrap();
     assert_eq!(path2, format!("docs/{}", numbered_name(&name, 2)),);
@@ -363,13 +363,13 @@ async fn write_beside_names_the_copy_and_numbers_it_if_taken() {
     }
     let (_h, third) = file_body(b"third");
     assert_eq!(
-        write_beside(&s3, &t, "docs/report.txt", &third, "Ada", at())
+        write_beside(&s3, &t, "docs/report.txt", &third, "Ada", at(), Tri::Yes)
             .await
             .unwrap_err(),
         WriteError::Failed
     );
     // A file at the top of the library works as well.
-    let (top, _) = write_beside(&s3, &t, "top.txt", &body, "Bo", at())
+    let (top, _) = write_beside(&s3, &t, "top.txt", &body, "Bo", at(), Tri::Yes)
         .await
         .unwrap();
     assert!(!top.contains('/'));
@@ -424,7 +424,9 @@ async fn write_numbered_takes_the_next_free_name() {
     fake.put(BUCKET, "lib/d/new (2).txt", b"theirs too");
     let (_f, body) = file_body(b"ours");
 
-    let (path, seen) = write_numbered(&s3, &t, "d/new.txt", &body).await.unwrap();
+    let (path, seen) = write_numbered(&s3, &t, "d/new.txt", &body, Tri::Yes)
+        .await
+        .unwrap();
     assert_eq!(path, "d/new (3).txt");
     assert_eq!(seen.size, 4);
     assert_eq!(
@@ -445,7 +447,7 @@ async fn write_numbered_takes_the_next_free_name() {
     }
     let (_g, other) = file_body(b"different");
     assert_eq!(
-        write_numbered(&s3, &t, "d/new.txt", &other)
+        write_numbered(&s3, &t, "d/new.txt", &other, Tri::Yes)
             .await
             .unwrap_err(),
         WriteError::Failed
@@ -478,7 +480,8 @@ async fn make_folder_writes_a_zero_byte_marker_and_accepts_an_existing_one() {
 #[tokio::test]
 async fn the_probe_finds_read_write_with_conditions() {
     let (fake, s3, t) = setup().await;
-    let probe = probe_writes(&s3, &t).await;
+    let (probe, left) = probe_writes(&s3, &t).await;
+    assert_eq!(left, None);
     assert!(
         matches!(
             probe,
@@ -503,7 +506,8 @@ async fn the_probe_finds_read_write_with_conditions() {
 async fn the_probe_finds_a_store_that_ignores_conditions() {
     let (fake, s3, t) = setup().await;
     fake.ignore_conditions();
-    let probe = probe_writes(&s3, &t).await;
+    let (probe, left) = probe_writes(&s3, &t).await;
+    assert_eq!(left, None);
     assert!(
         matches!(
             probe,
@@ -520,7 +524,8 @@ async fn the_probe_finds_a_store_that_ignores_conditions() {
 async fn the_probe_finds_a_read_only_key() {
     let (fake, s3, t) = setup().await;
     fake.read_only();
-    let probe = probe_writes(&s3, &t).await;
+    let (probe, left) = probe_writes(&s3, &t).await;
+    assert_eq!(left, None);
     assert!(matches!(probe, Probe::ReadOnly), "{probe:?}");
 }
 
@@ -531,7 +536,7 @@ async fn the_probe_reports_why_it_could_not_ask() {
     // No such bucket.
     let t = target_for(&s3, &fake, "nowhere", PREFIX);
     assert!(matches!(
-        probe_writes(&s3, &t).await,
+        probe_writes(&s3, &t).await.0,
         Probe::Unreachable("bucket")
     ));
     // Wrong keys.
@@ -539,7 +544,7 @@ async fn the_probe_reports_why_it_could_not_ask() {
     fake.require_keys("other", "keys");
     let t = target_for(&s3, &fake, BUCKET, PREFIX);
     assert!(matches!(
-        probe_writes(&s3, &t).await,
+        probe_writes(&s3, &t).await.0,
         Probe::Unreachable("keys")
     ));
 }
@@ -553,7 +558,8 @@ async fn the_probe_leaves_nothing() {
         if ignoring {
             fake.ignore_conditions();
         }
-        let probe = probe_writes(&s3, &t).await;
+        let (probe, left) = probe_writes(&s3, &t).await;
+        assert_eq!(left, None);
         assert!(matches!(probe, Probe::ReadWrite { .. }), "{probe:?}");
         let keys: Vec<String> = fake.writes().into_iter().map(|(_, key, _)| key).collect();
         for key in keys {
@@ -657,11 +663,15 @@ async fn a_bad_path_is_refused_before_any_request() {
             );
         }
         assert!(
-            write_beside(&s3, &t, path, &body, "Ada", at())
+            write_beside(&s3, &t, path, &body, "Ada", at(), Tri::Yes)
                 .await
                 .is_err()
         );
-        assert!(write_numbered(&s3, &t, path, &body).await.is_err());
+        assert!(
+            write_numbered(&s3, &t, path, &body, Tri::Yes)
+                .await
+                .is_err()
+        );
         assert!(make_folder(&s3, &t, path).await.is_err());
     }
     // A key over 1,024 bytes.
@@ -685,8 +695,8 @@ async fn no_key_outside_the_prefix_is_ever_written() {
     let (_f, body) = file_body(b"ours");
 
     let _ = write_object(&s3, &t, "../other/secret.txt", &body, &base(None), Tri::No).await;
-    let _ = write_beside(&s3, &t, "../other/secret.txt", &body, "Ada", at()).await;
-    let _ = write_numbered(&s3, &t, "../other/secret.txt", &body).await;
+    let _ = write_beside(&s3, &t, "../other/secret.txt", &body, "Ada", at(), Tri::Yes).await;
+    let _ = write_numbered(&s3, &t, "../other/secret.txt", &body, Tri::Yes).await;
     let _ = make_folder(&s3, &t, "../other").await;
     done(
         write_object(&s3, &t, "in.txt", &body, &base(Some(tag)), Tri::Yes)
@@ -694,10 +704,12 @@ async fn no_key_outside_the_prefix_is_ever_written() {
             .unwrap(),
     );
     let _ = probe_writes(&s3, &t).await;
-    write_beside(&s3, &t, "in.txt", &body, "Ada", at())
+    write_beside(&s3, &t, "in.txt", &body, "Ada", at(), Tri::Yes)
         .await
         .unwrap();
-    write_numbered(&s3, &t, "in.txt", &body).await.unwrap();
+    write_numbered(&s3, &t, "in.txt", &body, Tri::Yes)
+        .await
+        .unwrap();
     make_folder(&s3, &t, "sub").await.unwrap();
 
     for (_, key, _) in fake.writes() {
@@ -712,4 +724,78 @@ async fn no_key_outside_the_prefix_is_ever_written() {
         fake.object(BUCKET, "lib/in.txt").unwrap().sha256.as_deref(),
         Some(sha256_hex(b"ours").as_str())
     );
+}
+
+#[tokio::test]
+async fn a_probe_object_that_cannot_be_removed_is_named() {
+    let (fake, s3, t) = setup().await;
+    // Three writes pass, the DELETE is refused.
+    fake.deny_writes_after(3);
+    let (probe, left) = probe_writes(&s3, &t).await;
+    assert!(
+        matches!(
+            probe,
+            Probe::ReadWrite {
+                conditional: Tri::Yes
+            }
+        ),
+        "{probe:?}"
+    );
+    let name = left.expect("the name of what was left");
+    assert!(name.starts_with(".sharecraft-tmp-probe-"), "{name}");
+    assert!(!name.contains('/'));
+    assert!(reserved_name(&name));
+    assert!(fake.object(BUCKET, &format!("lib/{name}")).is_some());
+}
+
+#[tokio::test]
+async fn a_failure_after_the_probe_object_landed_still_sends_the_delete() {
+    let (fake, s3, t) = setup().await;
+    fake.lose_answer_after_write();
+    let (probe, left) = probe_writes(&s3, &t).await;
+    assert!(matches!(probe, Probe::Unreachable("offline")), "{probe:?}");
+    assert_eq!(left, None);
+    let writes = fake.writes();
+    assert_eq!(writes.len(), 2, "{writes:?}");
+    assert_eq!(writes[1].0, "DELETE");
+    assert_eq!(writes[0].1, writes[1].1);
+    assert!(fake.object(BUCKET, &writes[0].1).is_none());
+}
+
+#[tokio::test]
+async fn a_refusal_at_the_second_step_is_read_only() {
+    let (fake, s3, t) = setup().await;
+    fake.deny_writes_after(1);
+    let (probe, left) = probe_writes(&s3, &t).await;
+    assert!(matches!(probe, Probe::ReadOnly), "{probe:?}");
+    // The DELETE was refused as well, so the object is reported.
+    assert!(left.is_some());
+}
+
+#[tokio::test]
+async fn on_a_store_that_ignores_conditions_a_taken_copy_name_is_not_overwritten() {
+    let (fake, s3, t) = setup().await;
+    fake.ignore_conditions();
+    let (_f, body) = file_body(b"my edit");
+    let name = sibling_name("report.txt", "Ada", at());
+    fake.put(BUCKET, &format!("lib/{name}"), b"theirs");
+    for conditional in [Tri::No, Tri::Unknown] {
+        let (path, _) = write_beside(&s3, &t, "report.txt", &body, "Ada", at(), conditional)
+            .await
+            .unwrap();
+        assert_eq!(path, numbered_name(&name, 2));
+        fake.remove(BUCKET, &format!("lib/{path}"));
+    }
+    assert_eq!(
+        fake.object(BUCKET, &format!("lib/{name}")).unwrap().bytes,
+        b"theirs"
+    );
+    assert!(fake.writes().iter().all(|(_, _, cond)| cond == "none"));
+
+    fake.put(BUCKET, "lib/new.txt", b"theirs");
+    let (path, _) = write_numbered(&s3, &t, "new.txt", &body, Tri::No)
+        .await
+        .unwrap();
+    assert_eq!(path, "new (2).txt");
+    assert_eq!(fake.object(BUCKET, "lib/new.txt").unwrap().bytes, b"theirs");
 }
