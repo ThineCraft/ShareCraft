@@ -23,6 +23,7 @@ import {
   pollHeld,
   quarantineNotice,
   can,
+  confirmDialog,
   goToSignIn,
   h,
   messageFor,
@@ -43,6 +44,7 @@ import { downloadNote, liveLook, liveStatus, setupEditorFrame } from './editor-f
 import { connectLive, liveNotice, onlyEditor, pickBanner, shownBanner, trackUnsaved, warnOnLeave } from './live-host.js';
 import { createViewer } from './file-viewer.js';
 import { viewerList } from './viewer.js';
+import { discardQuestion, savingMark, sourceWriteErrorText } from './source-panel.js';
 
 const FIRST_DELAY = 500;
 const MAX_DELAY = 8000;
@@ -54,6 +56,7 @@ const NOT_READY = 'The editor is not ready yet.';
 const NOT_READY_FOR = 5000; // how long "not ready yet" stays at most, in milliseconds
 const MOVED_ON =
   'A newer version was saved while the connection was lost, so changes you make here are not saved. Download your copy, then reload.';
+const WRITE_POLL = 4000; // how often a file being saved to a bucket is read again
 const NEWER = 'A newer version was saved. Reload to see it.';
 
 const $ = (id) => document.getElementById(id);
@@ -107,6 +110,7 @@ let notice = null;          // a banner that stays until what it is about is ove
 let bannerKey = '';
 let roleCheck = 0;          // the latest role request; older answers are dropped
 let notReadyTimer = 0;
+let writeTimer = 0;          // reads the file again while its change is being saved to a bucket
 let chrome = null;          // the frame's header and panels, set up once the viewer and queue exist
 let liveMode = false;       // the server opens this document in a live room (G5)
 let liveSession = null;     // the live connection, once the editor is ready
@@ -208,8 +212,101 @@ async function main() {
   showDetail();
   setRole(doc.access);
   showDownload();
+  showWrites();
   if (doc.editor === 'other') loadSiblings();
   await openAsChosen();
+}
+
+// ---- a change accepted for a bucket and not yet written ----
+
+/**
+ * "Saving…" while the change waits for the bucket; "Not saved: why" with Retry and Discard when
+ * writing it failed. Only the change's author and the library's owners are told why (the server
+ * sends `writes.error` to them only), and only they are offered the buttons.
+ */
+function showWrites(note = '') {
+  clearTimeout(writeTimer);
+  const box = $('write-banner');
+  const writes = doc?.writes;
+  if (!writes) {
+    box.classList.add('idle');
+    $('write-text').textContent = note;
+    $('write-actions').replaceChildren();
+    if (note) box.classList.remove('idle');
+    return;
+  }
+  const failed = writes.state === 'failed';
+  const text = savingMark({ saving: failed ? 'failed' : 'saving' }, writes.error);
+  box.classList.remove('idle');
+  $('write-text').textContent = note ? `${text} ${note}` : text;
+  const mayAct = failed && typeof writes.error === 'string';
+  $('write-actions').replaceChildren(
+    ...(mayAct
+      ? [
+          h('button', { type: 'button', class: 'plain', 'data-write': 'retry' }, 'Retry'),
+          h('button', { type: 'button', class: 'plain', 'data-write': 'discard' }, 'Discard'),
+        ]
+      : []),
+  );
+  $('write-actions').querySelector('[data-write=retry]')?.addEventListener('click', retryWrite);
+  $('write-actions').querySelector('[data-write=discard]')?.addEventListener('click', discardWrite);
+  if (!failed) writeTimer = setTimeout(readWrites, WRITE_POLL);
+}
+
+/** Reads the file's save state again; says `done` once nothing is waiting. */
+async function readWrites(done = 'Saved to the bucket.') {
+  if (removed) return;
+  const result = await api('GET', `/docs/${seg(docId)}`);
+  if (!result.ok) return showWrites(result.status === 0 ? '' : messageFor(result.error));
+  const was = doc.writes;
+  doc = { ...doc, writes: result.data.writes, external: result.data.external ?? doc.external };
+  if (was && !doc.writes) {
+    showWrites(done);
+    writeTimer = setTimeout(() => showWrites(), 6000);
+    return;
+  }
+  showWrites();
+}
+
+function writeLibrary() {
+  return path.find((step) => step.kind === 'library')?.id;
+}
+
+async function retryWrite() {
+  const library = writeLibrary();
+  if (!library) return;
+  const result = await api('POST', `/libraries/${seg(library)}/source/writes/${seg(docId)}/retry`);
+  if (!result.ok) {
+    showWrites(sourceWriteErrorText(result.error, result.data) || messageFor(result.error));
+    $('write-actions').querySelector('[data-write=retry]')?.focus();
+    return;
+  }
+  await readWrites();
+  $('write-text').focus(); // the buttons are gone: focus stays in the banner
+}
+
+async function discardWrite() {
+  const library = writeLibrary();
+  if (!library) return;
+  const isNew = doc.external?.modified_at == null;
+  if (!(await confirmDialog(discardQuestion(isNew), 'Discard'))) {
+    $('write-actions').querySelector('[data-write=discard]')?.focus();
+    return;
+  }
+  const result = await api('DELETE', `/libraries/${seg(library)}/source/writes/${seg(docId)}`);
+  if (!result.ok) {
+    showWrites(sourceWriteErrorText(result.error, result.data) || messageFor(result.error));
+    $('write-actions').querySelector('[data-write=discard]')?.focus();
+    return;
+  }
+  // A file that was never in the bucket is gone: back to the folder it was in.
+  if (isNew) {
+    removed = true;
+    location.assign(folder ? pageFor(folder.kind, folder.id) : '/');
+    return;
+  }
+  await readWrites('Discarded. The file shows what is in the bucket.');
+  $('write-text').focus();
 }
 
 // ---- what the page shows: the editor, a preview, a download, or why it cannot open ----

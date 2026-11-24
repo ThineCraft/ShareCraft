@@ -69,6 +69,16 @@
    <p><strong>Folder in the bucket</strong><br><span id="s3-folder"></span></p>
    <p><strong>Access key</strong><br><span id="s3-key"></span></p>
    <p><strong>Earlier versions</strong><br><span id="s3-versioning"></span></p>
+   <section id="s3-mode-box" aria-labelledby="s3-mode-heading">
+    <p><strong id="s3-mode-heading">What people can do</strong><br><span id="s3-mode-text" tabindex="-1"></span></p>
+    <p id="s3-writes-text" class="meta" hidden></p>
+    <p id="s3-overwrite" class="meta" hidden></p>
+    <div class="row">
+     <button type="button" id="s3-mode-switch" class="plain" hidden></button>
+    </div>
+    <p id="s3-mode-status" role="status" class="msg ok"></p>
+    <p id="s3-mode-error" role="alert" class="msg"></p>
+   </section>
    <form id="s3-settings" class="stack">
     <div class="field">
      <label for="s3-poll">Check every (seconds)</label>

@@ -134,9 +134,18 @@
     <input type="password" id="s3-secret" autocomplete="off" aria-describedby="s3-secret-note">
     <small id="s3-secret-note" class="meta">Never shown again after you create the library.</small>
    </div>
-   <p class="meta" id="s3-hint">Files stay in the bucket: ShareCraft reads one when someone opens it. Your storage provider may charge for the requests and downloads ShareCraft makes. In this release the library is read-only. Give ShareCraft a key that may only read this bucket.</p>
+   <fieldset class="choice-set" id="s3-mode-set" aria-describedby="s3-mode-note" hidden>
+    <legend>What people can do</legend>
+    <label class="check"><input type="radio" name="s3-mode" value="read_only" checked> Read only</label>
+    <label class="check"><input type="radio" name="s3-mode" value="read_write"> Read and write</label>
+    <small id="s3-mode-note" class="meta">What people add and change here is saved in the bucket, and your provider may charge for each change.</small>
+   </fieldset>
+   <p class="meta" id="s3-hint">Files stay in the bucket: ShareCraft reads one when someone opens it. Your storage provider may charge for the requests and downloads ShareCraft makes. A read-only library needs a key that may only read this bucket.</p>
   </div>
   <p id="new-library-error" role="alert" class="msg" tabindex="-1"></p>
+  <div class="row" id="s3-readonly-row" hidden>
+   <button type="button" id="s3-readonly-instead" class="plain">Connect read-only instead</button>
+  </div>
   <div class="row end">
    <button type="button" id="new-library-cancel" class="plain">Cancel</button>
    <button type="submit" id="new-library-submit">Create library</button>

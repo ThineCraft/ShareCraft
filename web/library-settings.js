@@ -29,7 +29,14 @@ import {
 } from './common.js';
 import { pickImage } from './image-picker.js';
 import { studioLimits } from './look-studio.js';
-import { sourceName, webhookInstructions } from './source-panel.js';
+import {
+  modeSwitchText,
+  overwriteNote,
+  sourceName,
+  sourceWriteErrorText,
+  webhookInstructions,
+  writeCountsText,
+} from './source-panel.js';
 
 const $ = (id) => document.getElementById(id);
 const error = $('error');
@@ -216,8 +223,11 @@ function showSource() {
   $('source-section').hidden = source === null;
   if (source === null) return;
   const s3 = source.kind === 's3';
+  const writable = s3 && source.mode === 'read_write';
   $('source-intro').textContent = s3
-    ? 'This library shows the files in an S3 bucket. Its files cannot be changed in ShareCraft.'
+    ? writable
+      ? 'This library shows the files in an S3 bucket. You can add files and folders here, and they are saved to the bucket. Renaming, moving, copying and deleting are not available yet.'
+      : 'This library shows the files in an S3 bucket. Its files cannot be changed in ShareCraft.'
     : githubIntro;
   $('disconnect-text').textContent = s3
     ? 'Disconnecting stops updates from S3 storage. The files stay in this library. Nothing in the bucket is changed.'
@@ -314,7 +324,54 @@ function showS3Source() {
   $('s3-key').textContent = `Access key ending …${source.key?.id_ends ?? ''} · secret set`;
   $('s3-versioning').textContent = VERSIONING[source.versioning] ?? 'Not known';
   $('s3-poll').value = String(source.poll_seconds);
+  showS3Mode();
 }
+
+/** The mode in words, what is waiting to be saved, the overwrite sentence, and the one switch offered. */
+function showS3Mode() {
+  const writable = source.mode === 'read_write';
+  const blocked = writable && source.write_state === 'blocked';
+  $('s3-mode-text').textContent = blocked
+    ? `Read-only until fixed: the storage refused a change.${source.write_error ? ` ${source.write_error}` : ''}`
+    : writable
+      ? 'Read and write. What people add here is saved in the bucket, and your provider may charge for each change.'
+      : 'Read only. Files open from the bucket but cannot be changed in ShareCraft.';
+  const counts = writable ? writeCountsText(source.writes) : '';
+  $('s3-writes-text').textContent = counts;
+  $('s3-writes-text').hidden = counts === '';
+  const note = writable ? overwriteNote(source.conditional) : '';
+  $('s3-overwrite').textContent = note;
+  $('s3-overwrite').hidden = note === '';
+  const choice = modeSwitchText(source, me.is_admin === true && source.may_choose_read_write !== false);
+  $('s3-mode-switch').hidden = choice === null;
+  if (choice !== null) {
+    $('s3-mode-switch').textContent = choice.label;
+    $('s3-mode-switch').dataset.to = choice.to;
+  }
+}
+
+$('s3-mode-switch').addEventListener('click', async () => {
+  if (source === null || source.kind !== 's3') return;
+  const button = $('s3-mode-switch');
+  const to = button.dataset.to;
+  showMessage($('s3-mode-error'), '');
+  showMessage($('s3-mode-status'), '');
+  button.disabled = true;
+  button.setAttribute('aria-busy', 'true');
+  const result = await api('PATCH', `/libraries/${seg(libraryId)}/source`, { mode: to });
+  button.disabled = false;
+  button.removeAttribute('aria-busy');
+  if (!result.ok) {
+    showMessage($('s3-mode-error'), sourceWriteErrorText(result.error, result.data) || s3Error(result));
+    button.focus();
+    return;
+  }
+  source = result.data;
+  showSource();
+  showMessage($('s3-mode-status'), to === 'read_write' ? 'This library is now read and write.' : 'This library is now read only.');
+  // The button may be gone now (an owner who is not an administrator cannot switch back): focus stays on the page.
+  (button.hidden ? $('s3-mode-text') : button).focus();
+});
 
 /** A refused S3 change in plain words; the server's own sentence where it gives one. */
 function s3Error(result) {
