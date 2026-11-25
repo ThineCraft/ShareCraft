@@ -67,7 +67,8 @@ pub struct BinEntry {
     pub path: Vec<String>,
     /// The sum of the sizes of the stored versions of every file deleted with it, as the
     /// content store's rows know them (versions stored inside Git before the content store
-    /// are not counted).
+    /// are not counted), and of the objects an S3 library tracks for them (in its holding
+    /// folder while the entry lasts).
     pub size: i64,
     /// Who deleted it; `None` if that person is not known.
     pub deleted_by: Option<UserRef>,
@@ -237,6 +238,10 @@ impl Db {
                     (select coalesce(sum(b.size), 0)::bigint from nodes m \
                          join blob_refs r on r.doc_id = m.id and not r.pending \
                          join blobs b on b.sha256 = r.sha256 \
+                     where m.deleted_with = n.id and m.purged_at is null) \
+                    + (select coalesce(sum(i.size), 0)::bigint from nodes m \
+                         join source_items i on i.node_id = m.id \
+                         join library_sources s on s.library_id = i.library_id and s.kind = 's3' \
                      where m.deleted_with = n.id and m.purged_at is null) as size \
              from nodes n \
              left join users u on u.id = n.deleted_by \

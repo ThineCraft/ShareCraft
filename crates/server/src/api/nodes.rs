@@ -28,7 +28,10 @@ use super::{ApiError, JsonBody, parse_id, recheck_below, to_completion};
 use crate::AppState;
 use crate::auth::Signed;
 use crate::room::AccessChange;
-use crate::source_write::{Place, Store, create_folder, rename_or_move, writable_place};
+use crate::source_write::{
+    Place, Store, create_folder, delete_to_holding, rename_or_move, restore_from_holding,
+    writable_place,
+};
 use crate::tree::{self, TreeOp};
 
 /// Children listed when the request names no limit.
@@ -90,31 +93,8 @@ pub(crate) async fn require_not_connected_for(
     }
 }
 
-/// [`require_not_connected_for`] for a route that acts on `node` itself (deletes it): a
-/// connected library node itself keeps `409 source_read_only` in every mode. Renames and moves
-/// are judged by [`restructure_place`].
-async fn require_item_not_connected_for(
-    db: &Db,
-    user: UserId,
-    node: NodeId,
-) -> Result<(), ApiError> {
-    let library = match writable_place(db, user, node).await {
-        Ok(Place::Ordinary) => return Ok(()),
-        Ok(Place::External(Store::S3(target))) => Some(target.library),
-        Err(ApiError::SourceWriteBlocked) => db
-            .source_library_of(node)
-            .await
-            .map_err(|e| ApiError::unavailable(&e))?,
-        Err(e) => return Err(e),
-    };
-    if library == Some(node) {
-        Err(ApiError::SourceReadOnly)
-    } else {
-        Err(ApiError::SourceActionUnavailable)
-    }
-}
-
-/// Where a rename of `id`, or a move of it into `parent`, by `user` is made: `Ok(None)` in the
+/// Where a rename of `id`, or a move of it into `parent` (or, with no `parent`, a delete of
+/// it), by `user` is made: `Ok(None)` in the
 /// ordinary tree (a `parent` in a connected library is refused as [`require_not_connected_for`]
 /// refuses it), `Ok(Some(library))` in the bucket of the read-and-write S3 library `id` is in
 /// (see [`rename_or_move`]). Refused inside a connected library: what [`writable_place`] tells
@@ -215,24 +195,55 @@ pub(crate) async fn seat_access(db: &Db, doc: DocId, access: Option<Access>) -> 
     }
 }
 
-/// [`delete_one`] for a request: refused when the item is in a connected library.
+/// [`delete_one`] for a request. Inside a read-and-write S3 library the item's objects go to
+/// the library's holding folder first (see [`delete_to_holding`]); in any other connected
+/// library it is refused, as [`restructure_place`] refuses a rename (`source_read_only`,
+/// `source_write_blocked`, and a library node itself `source_read_only`).
 pub(crate) async fn delete_checked(
     state: &AppState,
     actor: &User,
     id: NodeId,
 ) -> Result<(), ApiError> {
-    require_item_not_connected_for(state.db(), actor.id, id).await?;
+    if restructure_place(state.db(), actor.id, id, None)
+        .await?
+        .is_some()
+    {
+        delete_to_holding(state, actor, id).await?;
+        return Ok(());
+    }
     delete_one(state, actor, id).await
 }
 
-/// A restore from the recycle bin for a request: refused when the entry would go back into a
-/// connected library (it is judged by where it was, which is where it returns).
+/// A restore from the recycle bin for a request. An entry whose objects a read-and-write S3
+/// library holds comes back through its bucket (see [`restore_from_holding`]); any other entry
+/// is refused when it would go back into a connected library (it is judged by where it was,
+/// which is where it returns), so an entry the listing put in the bin, whose objects are gone,
+/// stays there.
 pub(crate) async fn restore_checked(
     state: &AppState,
     actor: &User,
     id: NodeId,
 ) -> Result<tree::Applied, ApiError> {
-    require_not_connected_for(state.db(), actor.id, id).await?;
+    let db = state.db();
+    let held = db
+        .held(id)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?
+        .is_some();
+    if held {
+        let restored = restore_from_holding(state, actor, id).await?;
+        let node = db
+            .node(restored.node)
+            .await
+            .map_err(|e| ApiError::unavailable(&e))?
+            .ok_or(ApiError::NotFound)?;
+        return Ok(tree::Applied {
+            node,
+            deleted: Vec::new(),
+            renamed: restored.renamed.map(|from| (restored.node, from)),
+        });
+    }
+    require_not_connected_for(db, actor.id, id).await?;
     Ok(tree::apply(state, actor, TreeOp::Restore { id }).await?)
 }
 

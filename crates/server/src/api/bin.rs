@@ -12,7 +12,7 @@ use axum::Json;
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use records::{BinCursor, BinEntry, BinStage, Editor, NodeKind};
+use records::{BinCursor, BinEntry, BinStage, Editor, NodeKind, Perms, SourceKind};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
@@ -20,6 +20,7 @@ use super::nodes::{NodeOut, node_id, restore_checked, rfc3339};
 use super::{ApiError, to_completion};
 use crate::AppState;
 use crate::auth::Signed;
+use crate::source_write::release_held;
 use crate::tree::{self, TreeOp};
 
 /// Entries listed when the request names no limit.
@@ -53,7 +54,8 @@ struct EntryOut {
     editor: Option<Editor>,
     /// The names of the nodes it was in, from the site down.
     path: Vec<String>,
-    /// Bytes of the stored versions of the files deleted with it.
+    /// Bytes of the stored versions of the files deleted with it, and of the objects an S3
+    /// library holds for them.
     size: i64,
     /// `null` when the person is not known.
     deleted_by: Option<PersonOut>,
@@ -150,7 +152,8 @@ pub(crate) struct Restored {
 /// was (see [`tree::apply`]). `200 {node, renamed}`; `404` unless the caller sees the entry;
 /// `403` without the permission; `409 parent_in_bin` when a folder above it is in the bin and
 /// the caller may not restore it; `409 source_read_only` for an entry that would go back into a
-/// library connected to a source.
+/// library connected to a source, unless it is held by a read-and-write S3 library (see
+/// [`crate::source_write::restore_from_holding`]).
 ///
 /// Removing an entry (`DELETE /api/bin/{id}`) is not refused there: an entry is no longer the
 /// library's live content, and the sync never brings an entry back, so only a restore would
@@ -191,7 +194,9 @@ pub(crate) async fn restore(
 
 /// `DELETE /api/bin/{id}`: moves a first-stage entry to the second stage (needs what restoring
 /// it needs), or purges a second-stage entry, with everything deleted with it (site managers).
-/// `204`; `404` unless the caller sees the entry.
+/// `204`; `404` unless the caller sees the entry. An entry whose objects a bucket holds has them
+/// deleted first (left there when the library is read-only by then); while the bucket is
+/// offline or failing, `503 source_unavailable {reason: offline}` and nothing is purged.
 pub(crate) async fn remove(
     State(state): State<AppState>,
     signed: Signed,
@@ -208,7 +213,20 @@ pub(crate) async fn remove(
             .ok_or(ApiError::NotFound)?;
         let op = match entry.stage {
             BinStage::First => TreeOp::ToSecondStage { id },
-            BinStage::Second => TreeOp::Purge { id },
+            BinStage::Second => {
+                // What a bucket holds for the entry goes first, and only for someone the purge
+                // is for: anyone else gets the tree's answer, with nothing deleted.
+                let manages = state
+                    .db()
+                    .effective_access(actor.id, entry.site)
+                    .await
+                    .map_err(|e| ApiError::unavailable(&e))?
+                    .is_some_and(|access| access.perms.contains(Perms::MANAGE_SITE));
+                if manages && !release_held(&state, id, OffsetDateTime::now_utc()).await? {
+                    return Err(ApiError::SourceUnavailable("offline", SourceKind::S3));
+                }
+                TreeOp::Purge { id }
+            }
         };
         tree::apply(&state, &actor, op).await?;
         Ok(())

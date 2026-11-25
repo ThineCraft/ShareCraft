@@ -1510,7 +1510,15 @@ async fn run<S: StorageSource>(
     }
     let user = connector(state, config, &listing.bookmark, listing.credit.as_deref()).await?;
     source.list(state, &mut listing).await?;
-    let recorded = db.source_items(library).await.map_err(db_failed)?;
+    // The rows of items deleted into a bucket's holding folder stay with their bin entries
+    // until they are restored or purged; the listing never sees the holding folder.
+    let recorded: Vec<SourceItem> = db
+        .source_items(library)
+        .await
+        .map_err(db_failed)?
+        .into_iter()
+        .filter(|item| !crate::s3_write::is_held_path(&item.repository_path))
+        .collect();
     // Files with a change waiting to be written are left alone: a tracked one keeps its
     // recorded entry and nothing is planned for it; a new one's path is not taken from the
     // listing (its write may have landed before its finish was recorded).

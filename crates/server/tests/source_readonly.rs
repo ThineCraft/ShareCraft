@@ -785,13 +785,16 @@ const ROWS: &[Row] = &[
         201,
         UNAVAILABLE,
     ),
-    row(Act::Delete, "DELETE /api/nodes/{id}", 204, UNAVAILABLE),
+    // Deletes move the objects into the library's holding folder (slice 2). The binned files
+    // of the fixture were put in the bin by the listing, which holds nothing of them: they
+    // cannot come back into the library.
+    row(Act::Delete, "DELETE /api/nodes/{id}", 204, Succeeds),
     row(Act::Restore, "POST /api/bin/{id}/restore", 200, UNAVAILABLE),
     row(Act::BulkMove, "POST /api/bulk", 200, Succeeds),
     row(Act::BulkMoveIn, "POST /api/bulk", 200, UNAVAILABLE),
     row(Act::BulkMoveOut, "POST /api/bulk", 200, UNAVAILABLE),
     row(Act::BulkCopyIn, "POST /api/bulk", 200, UNAVAILABLE),
-    row(Act::BulkDelete, "POST /api/bulk", 200, UNAVAILABLE),
+    row(Act::BulkDelete, "POST /api/bulk", 200, Succeeds),
     row(Act::BulkRestore, "POST /api/bulk", 200, UNAVAILABLE),
     row(
         Act::FromTemplate,
@@ -824,12 +827,7 @@ const ROWS: &[Row] = &[
         Refused("source_item_saving"),
     ),
     row(Act::RenameLibrary, "PATCH /api/nodes/{id}", 200, READ_ONLY),
-    row(
-        Act::DeleteFolder,
-        "DELETE /api/nodes/{id}",
-        204,
-        UNAVAILABLE,
-    ),
+    row(Act::DeleteFolder, "DELETE /api/nodes/{id}", 204, Succeeds),
     row(Act::DeleteLibrary, "DELETE /api/nodes/{id}", 204, READ_ONLY),
 ];
 
@@ -1781,9 +1779,38 @@ async fn every_guarded_route_follows_its_s3_read_write_decision() {
             };
             assert_eq!(body["message"], message, "{:?} as {who}: {body}", row.act);
         }
+        // The deletes put their items in the bin, holding their objects: restored through the
+        // bucket, so the next person deletes them again.
+        for entry in [
+            fx.item("delete-me.txt"),
+            fx.item("bulk-delete.txt"),
+            fx.doomed.as_str(),
+        ] {
+            let (status, body) = env
+                .call(
+                    user,
+                    Method::POST,
+                    &format!("/api/bin/{entry}/restore"),
+                    None,
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "restore as {who}: {body}");
+            assert!(body["renamed"].is_null(), "restore as {who}: {body}");
+        }
     }
-    // Nothing but the uploads, new folders and saves, and the renames and moves inside the
-    // library, reached the bucket (the finished sessions' files go to the library's top).
+    // Nothing but the uploads, new folders and saves, the renames and moves inside the library,
+    // and the deletes into its holding folder and the restores out of it reached the bucket
+    // (the finished sessions' files go to the library's top).
+    let deleted = [
+        "docs/delete-me.txt",
+        "docs/bulk-delete.txt",
+        "doomed/inside.txt",
+    ];
+    // The restored folder got a marker, which the next person's delete held with it.
+    let held = |key: &str| {
+        key.starts_with(".sharecraft-bin/")
+            && (key.ends_with("/doomed/") || deleted.iter().any(|path| key.ends_with(path)))
+    };
     for (method, key, _) in env.s3.writes() {
         if method == "COPY" {
             assert!(
@@ -1792,7 +1819,10 @@ async fn every_guarded_route_follows_its_s3_read_write_decision() {
                     "other/move-me.txt",
                     "other/bulk-move.txt"
                 ]
-                .contains(&key.as_str()),
+                .contains(&key.as_str())
+                    || deleted.contains(&key.as_str())
+                    || key == "doomed/"
+                    || held(&key),
                 "{key}"
             );
             continue;
@@ -1804,7 +1834,10 @@ async fn every_guarded_route_follows_its_s3_read_write_decision() {
                     "docs/move-me.txt",
                     "docs/bulk-move.txt"
                 ]
-                .contains(&key.as_str()),
+                .contains(&key.as_str())
+                    || deleted.contains(&key.as_str())
+                    || key == "doomed/"
+                    || held(&key),
                 "{key}"
             );
             continue;
@@ -1815,7 +1848,9 @@ async fn every_guarded_route_follows_its_s3_read_write_decision() {
                 || key.starts_with("finish-")
                 || key.starts_with("docs/New folder ")
                 || key == "docs/replace-me.txt"
-                || key == "docs/sheet.xlsx",
+                || key == "docs/sheet.xlsx"
+                // The restored folder's marker: it had none.
+                || key == "doomed/",
             "{key}"
         );
     }

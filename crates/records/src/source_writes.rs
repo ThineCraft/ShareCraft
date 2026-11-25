@@ -689,6 +689,18 @@ impl Db {
         Ok(ids.into_iter().map(NodeId).collect())
     }
 
+    /// The S3 libraries connected read and write whose writes are not blocked, by id.
+    pub async fn writable_s3_libraries(&self) -> Result<Vec<NodeId>, DbError> {
+        let ids: Vec<Uuid> = sqlx::query_scalar(
+            "select library_id from library_sources \
+             where kind = 's3' and mode = 'read_write' and write_state <> 'blocked' \
+             order by library_id",
+        )
+        .fetch_all(self.pool())
+        .await?;
+        Ok(ids.into_iter().map(NodeId).collect())
+    }
+
     /// Forgets the hold of `entry`. Whether there was one.
     pub async fn forget_held(&self, entry: NodeId) -> Result<bool, DbError> {
         let done = sqlx::query("delete from source_held where entry_id = $1")

@@ -13,7 +13,7 @@
 //!
 //! The store-specific code is in `s3_write.rs`, the only module that changes a bucket.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use collab_core::ids::{DocId, NodeId, UserId};
 use records::{
-    AccessError, Db, Editor, ExternalEntry, NewEvent, NewPendingWrite, Node, NodeKind,
+    AccessError, BinStage, Db, Editor, ExternalEntry, NewEvent, NewPendingWrite, Node, NodeKind,
     PendingWrite, Perms, ScanState, SourceItem, SourceKind, SourceLock, SourceMode, Tri, User,
     WriteState, object_tag,
 };
@@ -44,8 +44,8 @@ use crate::checkpoint::Checkpointer;
 use crate::s3::{PutBody, S3Error, S3Target};
 use crate::s3_source::nameable_segment;
 use crate::s3_write::{
-    Moved, make_folder, move_item, object_key, probe_writes, write_beside, write_numbered,
-    write_object,
+    Moved, delete_held, hold, holding_root, make_folder, move_item, object_key, probe_writes,
+    sweep_holding, unhold, write_beside, write_numbered, write_object,
 };
 use crate::tree::{self, TreeOp};
 
@@ -752,6 +752,8 @@ pub struct SourceWrites {
     wake: Notify,
     /// Blocked libraries with changes waiting, and when each was last probed (or blocked).
     blocked: Mutex<HashMap<NodeId, Option<OffsetDateTime>>>,
+    /// When the holding sweep last ran for each library (see [`sweep_holds`]).
+    swept: Mutex<HashMap<NodeId, OffsetDateTime>>,
     paused: AtomicBool,
     /// [`is_bucket_file`] answers a failure, as a database outage would. For tests.
     bucket_lookup_fails: AtomicBool,
@@ -785,6 +787,20 @@ impl SourceWrites {
 
     fn blocked(&self) -> std::sync::MutexGuard<'_, HashMap<NodeId, Option<OffsetDateTime>>> {
         self.blocked.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Whether the holding sweep of `library` is due at `now` (it never ran, or ran a day or
+    /// more before); if so, it is noted as run at `now`.
+    fn sweep_due(&self, library: NodeId, now: OffsetDateTime) -> bool {
+        let mut swept = self.swept.lock().unwrap_or_else(PoisonError::into_inner);
+        if swept
+            .get(&library)
+            .is_some_and(|last| now - *last < SWEEP_EVERY)
+        {
+            return false;
+        }
+        swept.insert(library, now);
+        true
     }
 
     /// `library` is blocked with changes waiting, last probed (or blocked) at `probed`; with
@@ -1659,6 +1675,66 @@ async fn shown_in(
     Ok(format!("{}/{name}", item.path))
 }
 
+/// The tracking row of `node` in `library` and the rows of it and everything inside it, for a
+/// step that copies it in the bucket (a rename, move or delete): `409 source_item_saving` when
+/// it is a new file whose first write is still to come, or it or anything inside it has a
+/// change not yet written; `409 source_action_unavailable` when the bucket does not know it;
+/// `409 source_unavailable {reason: archived}` when anything of it is in archive storage, which
+/// no copy can move (refused as reading it is, not as a change a later try might get past).
+async fn tracked_subtree(
+    db: &Db,
+    library: NodeId,
+    node: NodeId,
+) -> Result<(SourceItem, Vec<SourceItem>), ApiError> {
+    let unavailable = |e: records::DbError| ApiError::unavailable(&e);
+    let Some(tracked) = db.source_item_of(node).await.map_err(unavailable)? else {
+        // Not in the bucket yet: a new file whose first write is still to come.
+        if db.pending_write(node).await.map_err(unavailable)?.is_some() {
+            return Err(ApiError::SourceItemSaving);
+        }
+        return Err(ApiError::SourceActionUnavailable);
+    };
+    let from = tracked.repository_path.as_str();
+    if db.writes_below(library, from).await.map_err(unavailable)? > 0 {
+        return Err(ApiError::SourceItemSaving);
+    }
+    let items = subtree_rows(db, library, from).await?;
+    if items
+        .iter()
+        .any(|i| i.blob_sha.as_deref().is_some_and(|tag| tag.ends_with("!a")))
+    {
+        return Err(ApiError::SourceUnavailable("archived", SourceKind::S3));
+    }
+    Ok((tracked, items))
+}
+
+/// The tracking rows of `library` at the repository path `from` and, for a folder (`from`
+/// ending with `/`), below it.
+async fn subtree_rows(db: &Db, library: NodeId, from: &str) -> Result<Vec<SourceItem>, ApiError> {
+    let folder = from.ends_with('/');
+    Ok(db
+        .source_items(library)
+        .await
+        .map_err(|e| ApiError::unavailable(&e))?
+        .into_iter()
+        .filter(|i| i.repository_path == from || (folder && i.repository_path.starts_with(from)))
+        .collect())
+}
+
+/// What the tree recorded for `items`, as a bucket step checks it: library-relative paths and
+/// tags (none for a folder).
+fn known_of(items: &[SourceItem]) -> Vec<(String, String)> {
+    items
+        .iter()
+        .map(|i| {
+            (
+                i.repository_path.clone(),
+                i.blob_sha.clone().unwrap_or_default(),
+            )
+        })
+        .collect()
+}
+
 /// Everything about renaming `node` to `name` and/or moving it into `parent` inside its
 /// read-and-write S3 library that is judged before the bucket is asked. `None` when nothing
 /// would change.
@@ -1719,17 +1795,8 @@ async fn restructure_allowed(
     if new_name == item.name && destination == current {
         return Ok(None);
     }
-    let Some(tracked) = db.source_item_of(node).await.map_err(unavailable)? else {
-        // Not in the bucket yet: a new file whose first write is still to come.
-        if db.pending_write(node).await.map_err(unavailable)?.is_some() {
-            return Err(ApiError::SourceItemSaving);
-        }
-        return Err(ApiError::SourceActionUnavailable);
-    };
+    let (tracked, items) = tracked_subtree(db, library, node).await?;
     let from = tracked.repository_path;
-    if db.writes_below(library, &from).await.map_err(unavailable)? > 0 {
-        return Err(ApiError::SourceItemSaving);
-    }
     if new_name != item.name && item.kind == NodeKind::Document {
         tree::check_policies(db, node, &new_name, None).await?;
     }
@@ -1743,21 +1810,6 @@ async fn restructure_allowed(
     }
     let folder = item.kind == NodeKind::Folder;
     let to = if folder { format!("{path}/") } else { path };
-    let items: Vec<SourceItem> = db
-        .source_items(library)
-        .await
-        .map_err(unavailable)?
-        .into_iter()
-        .filter(|i| i.repository_path == from || (folder && i.repository_path.starts_with(&from)))
-        .collect();
-    // An object in archive storage cannot be copied: refused as reading it is, not as a change
-    // that a later try might get past.
-    if items
-        .iter()
-        .any(|i| i.blob_sha.as_deref().is_some_and(|tag| tag.ends_with("!a")))
-    {
-        return Err(ApiError::SourceUnavailable("archived", SourceKind::S3));
-    }
     let shown_to = shown_in(db, library, destination, &new_name).await?;
     Ok(Some(Restructure {
         library,
@@ -1813,16 +1865,7 @@ pub(crate) async fn rename_or_move(
         return Ok(unchanged);
     };
     let target = bucket(state, plan.library).await?;
-    let known: Vec<(String, String)> = plan
-        .items
-        .iter()
-        .map(|i| {
-            (
-                i.repository_path.clone(),
-                i.blob_sha.clone().unwrap_or_default(),
-            )
-        })
-        .collect();
+    let known = known_of(&plan.items);
     let moved = match move_item(
         state.s3(),
         &target,
@@ -1996,6 +2039,542 @@ async fn record_moved(state: &AppState, plan: &Restructure, moved: &Moved) {
             }
         }
     }
+}
+
+/// Everything about deleting `node` inside its read-and-write S3 library that is judged before
+/// the bucket is asked, as [`tree::apply`] judges a delete and [`restructure_allowed`] a bucket
+/// step: where the node is (`404`, `409 source_read_only`, `409 source_write_blocked`, a library
+/// itself `409 source_read_only`), `delete` on it, then [`tracked_subtree`]. The plan's `to` and
+/// `shown_to` are left for the hold to fill in.
+async fn delete_allowed(
+    state: &AppState,
+    actor: &User,
+    node: NodeId,
+) -> Result<Restructure, ApiError> {
+    let db = state.db();
+    let library = match writable_place(db, actor.id, node).await? {
+        Place::External(Store::S3(target)) => target.library,
+        Place::Ordinary => return Err(ApiError::SourceActionUnavailable),
+    };
+    if library == node {
+        return Err(ApiError::SourceReadOnly);
+    }
+    let (item, access) = tree::visible(db, actor, node).await?;
+    if !matches!(item.kind, NodeKind::Folder | NodeKind::Document) {
+        return Err(AccessError::WrongPlace.into());
+    }
+    tree::require(&access, Perms::DELETE)?;
+    let (tracked, items) = tracked_subtree(db, library, node).await?;
+    Ok(Restructure {
+        library,
+        kind: item.kind,
+        old_name: item.name,
+        name: None,
+        parent: None,
+        from: tracked.repository_path,
+        to: String::new(),
+        shown_from: tracked.path,
+        shown_to: String::new(),
+        items,
+    })
+}
+
+/// Deletes `node` inside its read-and-write S3 library, for `actor`: its objects are moved into
+/// the holding folder (`.sharecraft-bin/<today, UTC>/<node>/<its path>`, every object copied on
+/// the tag ShareCraft recorded, then every original deleted), then the node goes to the recycle
+/// bin as an entry of its own (id `node`), and a hold row names the root. The tracking rows
+/// follow the objects into the holding folder, where no listing looks, so Restore knows where
+/// everything was and the bin shows the size.
+///
+/// Judged as [`delete_allowed`], again under the library's source lock (`409 source_busy` after
+/// ten seconds), which is held until the rows are recorded. If the tree refuses after the bucket
+/// step, the objects are moved back (best effort) and the tree's error is answered. Originals
+/// that could not be deleted are counted in `left_behind` and come back as new files at the
+/// listing, which is woken. Records `source.held {node, objects, left_behind}`.
+///
+/// # Errors
+/// As [`delete_allowed`]; `409 source_too_many_objects {count}`, `409 source_too_large_to_move`,
+/// `409 source_changed` (a listing is woken), `409 source_write_blocked` (the store refused: the
+/// library is blocked) and `source_unavailable` from the bucket.
+pub(crate) async fn delete_to_holding(
+    state: &AppState,
+    actor: &User,
+    node: NodeId,
+) -> Result<Restructured, ApiError> {
+    let db = state.db();
+    let first = delete_allowed(state, actor, node).await?;
+    let lock = lock_source(db, first.library).await?;
+    // Judged again once the lock is held: a listing or a write may have run meanwhile.
+    let mut plan = delete_allowed(state, actor, node).await?;
+    let target = bucket(state, plan.library).await?;
+    // One time for the root's date and the hold's: a delete at midnight is filed under the day
+    // its hold row names.
+    let now = OffsetDateTime::now_utc();
+    let root = holding_root(now.date(), node);
+    plan.to = format!("{root}{}", plan.from);
+    plan.shown_to = plan.to.trim_end_matches('/').to_owned();
+    let known = known_of(&plan.items);
+    let held = hold(
+        state.s3(),
+        &target,
+        &plan.from,
+        plan.folder(),
+        &root,
+        &known,
+    )
+    .await;
+    let moved = match held {
+        Ok(moved) => moved,
+        Err(error) => return Err(refusal(state, plan.library, error).await),
+    };
+    if let Err(e) = crate::api::nodes::delete_one(state, actor, node).await {
+        let back = unhold(
+            state.s3(),
+            &target,
+            &root,
+            &plan.from,
+            &plan.from,
+            plan.folder(),
+        )
+        .await;
+        match back {
+            Ok(back) if back.left_behind == 0 && moved.left_behind == 0 => {}
+            Ok(_) => state.sources().wake(plan.library),
+            Err(error) => {
+                eprintln!(
+                    "sharecraft-server: objects held for a refused delete could not be moved \
+                     back: {error:?}"
+                );
+                state.sources().wake(plan.library);
+            }
+        }
+        return Err(e);
+    }
+    record_moved(state, &plan, &moved).await;
+    if let Err(e) = db
+        .hold_record(node, plan.library, &root, moved.objects, now)
+        .await
+    {
+        // The entry stays in the bin without its objects named: the holding sweep deletes them
+        // once they are 94 days old.
+        eprintln!("sharecraft-server: the hold of a deleted item could not be recorded: {e}");
+    }
+    drop(lock);
+    if moved.left_behind > 0 {
+        state.sources().wake(plan.library);
+    }
+    state.events().emit(NewEvent {
+        kind: "source.held",
+        actor: Some(actor.id),
+        subject: None,
+        document: (plan.kind == NodeKind::Document).then_some(DocId(node.0)),
+        node: Some(plan.library),
+        detail: json!({
+            "node": node.0.to_string(),
+            "objects": moved.objects,
+            "left_behind": moved.left_behind,
+        }),
+    });
+    Ok(Restructured {
+        node,
+        left_behind: moved.left_behind,
+    })
+}
+
+/// What a restore from the holding folder did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Restored {
+    pub node: NodeId,
+    /// The name it had, when it came back under a numbered one.
+    pub renamed: Option<String>,
+}
+
+/// A restore from the holding folder, judged and ready to be made.
+struct Unhold {
+    /// The hold's root, and the path held under it (where the item was when it was deleted).
+    root: String,
+    held: String,
+    /// Whether the store honours conditional writes, for the folder marker.
+    conditional: Tri,
+    /// Where it goes back to: the folder it was deleted from.
+    parent: NodeId,
+    /// The move out of the holding folder; `to` and `shown_to` are filled in once a name is
+    /// free.
+    plan: Restructure,
+}
+
+/// Everything about restoring the bin entry `entry` from the holding folder that is judged
+/// before the bucket is asked: where it is (`404`, `409 source_read_only`, `409
+/// source_write_blocked`), the hold (`404` without one), the person's rights as the bin judges
+/// them (`delete` on it as if it were live in the first stage, `manage_site` in the second),
+/// and the folder it goes back to, which must be live (`409 parent_in_bin`).
+async fn restore_allowed(
+    state: &AppState,
+    actor: &User,
+    entry: NodeId,
+) -> Result<Unhold, ApiError> {
+    let db = state.db();
+    let unavailable = |e: records::DbError| ApiError::unavailable(&e);
+    let target = match writable_place(db, actor.id, entry).await? {
+        Place::External(Store::S3(target)) => target,
+        Place::Ordinary => return Err(ApiError::SourceActionUnavailable),
+    };
+    let held = db
+        .held(entry)
+        .await
+        .map_err(unavailable)?
+        .filter(|held| held.library == target.library)
+        .ok_or(ApiError::NotFound)?;
+    let bin = db
+        .bin_state(entry)
+        .await
+        .map_err(unavailable)?
+        .ok_or(ApiError::NotFound)?;
+    match bin.stage {
+        BinStage::First => {
+            let access = db
+                .access_as_if_live(actor.id, entry)
+                .await
+                .map_err(unavailable)?
+                .ok_or(ApiError::NotFound)?;
+            tree::require(&access, Perms::DELETE)?;
+        }
+        BinStage::Second => {
+            let manages = db
+                .effective_access(actor.id, bin.site)
+                .await
+                .map_err(unavailable)?
+                .is_some_and(|access| access.perms.contains(Perms::MANAGE_SITE));
+            if !manages {
+                return Err(ApiError::NotFound);
+            }
+        }
+    }
+    let node = db
+        .node(entry)
+        .await
+        .map_err(unavailable)?
+        .ok_or(ApiError::NotFound)?;
+    let parent = node.parent.ok_or(ApiError::SourceActionUnavailable)?;
+    let parent_live = db
+        .node(parent)
+        .await
+        .map_err(unavailable)?
+        .is_some_and(|found| !found.deleted);
+    if !parent_live {
+        return Err(ApiError::ParentInBin);
+    }
+    let row = db
+        .source_item_of(entry)
+        .await
+        .map_err(unavailable)?
+        .ok_or(ApiError::SourceActionUnavailable)?;
+    let held_path = row
+        .repository_path
+        .strip_prefix(held.root.as_str())
+        .filter(|rest| !rest.is_empty())
+        .ok_or(ApiError::SourceActionUnavailable)?
+        .to_owned();
+    let items = subtree_rows(db, target.library, &row.repository_path).await?;
+    Ok(Unhold {
+        root: held.root,
+        held: held_path,
+        conditional: target.conditional,
+        parent,
+        plan: Restructure {
+            library: target.library,
+            kind: node.kind,
+            old_name: node.name,
+            name: None,
+            parent: None,
+            from: row.repository_path,
+            to: String::new(),
+            shown_from: row.path,
+            shown_to: String::new(),
+            items,
+        },
+    })
+}
+
+/// The `n`th name tried for an item named `name` coming back: the name itself, then `name (2)`
+/// (a file's before its extension) up to `(20)`.
+fn restore_name(name: &str, folder: bool, n: u32) -> String {
+    match n {
+        0 | 1 => name.to_owned(),
+        n if folder => format!("{name} ({n})"),
+        n => numbered_name(name, n),
+    }
+}
+
+/// Restores the bin entry `entry` of a read-and-write S3 library from the holding folder, for
+/// `actor`: its objects go back where it was deleted from (copied, then the held ones deleted),
+/// then the entry comes back in the tree with everything deleted with it, then the tracking rows
+/// take the new paths and tags, so the next listing finds nothing new. The node keeps its id,
+/// permissions and links.
+///
+/// The name is the one it had if no live item there has it, ignoring case, else `name (2)` and
+/// on up to `(20)`; a name the bucket has but the tree does not yet (not listed) is passed over
+/// for the next. A folder whose marker was not held gets one. Runs under the library's source
+/// lock (`409 source_busy` after ten seconds), judged before and again under it. Records
+/// `source.unheld {node, objects, left_behind}`.
+///
+/// # Errors
+/// As [`restore_allowed`]; `409 name_taken` when all twenty names are taken; the bucket's
+/// refusals (as a move's) and the tree's.
+pub(crate) async fn restore_from_holding(
+    state: &AppState,
+    actor: &User,
+    entry: NodeId,
+) -> Result<Restored, ApiError> {
+    let db = state.db();
+    let unavailable = |e: records::DbError| ApiError::unavailable(&e);
+    let first = restore_allowed(state, actor, entry).await?;
+    let lock = lock_source(db, first.plan.library).await?;
+    let Unhold {
+        root,
+        held,
+        conditional,
+        parent,
+        mut plan,
+    } = restore_allowed(state, actor, entry).await?;
+    let target = bucket(state, plan.library).await?;
+    let folder = plan.folder();
+    let original = plan.old_name.clone();
+    let taken: HashSet<String> = db
+        .live_child_names(parent)
+        .await
+        .map_err(unavailable)?
+        .into_iter()
+        .collect();
+    let mut found = None;
+    for n in 1..=LAST_RESTORE_NUMBER {
+        let name = restore_name(&original, folder, n);
+        if taken.contains(&name.to_lowercase()) {
+            continue;
+        }
+        let (_, path) = external_path(state, parent, &name).await?;
+        let to = if folder { format!("{path}/") } else { path };
+        match unhold(state.s3(), &target, &root, &held, &to, folder).await {
+            Ok(moved) => {
+                found = Some((name, to, moved));
+                break;
+            }
+            // Taken in the bucket but not listed yet: the next number.
+            Err(WriteError::NameTaken) => {}
+            Err(error) => return Err(refusal(state, plan.library, error).await),
+        }
+    }
+    let Some((name, to, moved)) = found else {
+        return Err(AccessError::NameTaken.into());
+    };
+    let restored = match tree::apply(state, actor, TreeOp::Restore { id: entry }).await {
+        Ok(applied) => applied,
+        Err(e) => {
+            // The objects stay where they now are, and come in as new files at the listing:
+            // a duplicate at worst, never a loss.
+            eprintln!(
+                "sharecraft-server: a restore was refused after its objects left the holding \
+                 folder: {e}"
+            );
+            state.sources().wake(plan.library);
+            return Err(e.into());
+        }
+    };
+    if restored.node.name != name {
+        let renamed = TreeOp::Rename {
+            id: entry,
+            name: name.clone(),
+        };
+        if let Err(e) = tree::apply(state, actor, renamed).await {
+            eprintln!("sharecraft-server: a restored item could not take its new name: {e}");
+            state.sources().wake(plan.library);
+        }
+    }
+    plan.to.clone_from(&to);
+    match shown_in(db, plan.library, parent, &name).await {
+        Ok(shown) => {
+            plan.shown_to = shown;
+            record_moved(state, &plan, &moved).await;
+        }
+        Err(_) => state.sources().wake(plan.library),
+    }
+    // A folder whose marker was not held (a folder only its files made) gets one, so it stays
+    // when it is emptied.
+    if folder && !moved.seen.iter().any(|(path, _)| *path == to) {
+        let marker = to.trim_end_matches('/');
+        if let Err(error) = make_folder(state.s3(), &target, marker, conditional).await {
+            eprintln!(
+                "sharecraft-server: the marker of a restored folder could not be written: \
+                 {error:?}"
+            );
+        }
+    }
+    if let Err(e) = db.forget_held(entry).await {
+        eprintln!("sharecraft-server: the hold of a restored item could not be forgotten: {e}");
+    }
+    drop(lock);
+    if moved.left_behind > 0 {
+        state.sources().wake(plan.library);
+    }
+    state.events().emit(NewEvent {
+        kind: "source.unheld",
+        actor: Some(actor.id),
+        subject: None,
+        document: (plan.kind == NodeKind::Document).then_some(DocId(entry.0)),
+        node: Some(plan.library),
+        detail: json!({
+            "node": entry.0.to_string(),
+            "objects": moved.objects,
+            "left_behind": moved.left_behind,
+        }),
+    });
+    Ok(Restored {
+        node: entry,
+        renamed: (name != original).then_some(original),
+    })
+}
+
+/// How many names a restore tries: the plain one, then `(2)` to `(20)`.
+const LAST_RESTORE_NUMBER: u32 = 20;
+
+/// How long a purge whose held objects could not be deleted waits before trying again.
+const HELD_RETRY: time::Duration = time::Duration::hours(1);
+
+/// Lets go of what the bin entry `entry` holds in a bucket, before it is purged. Answers whether
+/// the purge may go ahead:
+///
+/// - no hold: `true`;
+/// - a read-and-write S3 library: the held objects are deleted, the hold forgotten,
+///   `source.held_purged {node, objects}`, `true`;
+/// - a library read-only or disconnected by now: nothing is written, the hold is forgotten,
+///   `source.held_left {node, objects}` (the objects stay), `true`;
+/// - the bucket offline or failing: the hold waits an hour (`retry_at`), `false`.
+///
+/// # Errors
+/// A database failure (`503`).
+pub(crate) async fn release_held(
+    state: &AppState,
+    entry: NodeId,
+    now: OffsetDateTime,
+) -> Result<bool, ApiError> {
+    let db = state.db();
+    let unavailable = |e: records::DbError| ApiError::unavailable(&e);
+    let Some(held) = db.held(entry).await.map_err(unavailable)? else {
+        return Ok(true);
+    };
+    let writable = db
+        .source_of(held.library)
+        .await
+        .map_err(unavailable)?
+        .is_some_and(|(config, _)| {
+            config.kind == SourceKind::S3 && config.mode == SourceMode::ReadWrite
+        });
+    if !writable {
+        db.forget_held(entry).await.map_err(unavailable)?;
+        emit(
+            state,
+            "source.held_left",
+            held.library,
+            None,
+            json!({ "node": entry.0.to_string(), "objects": held.objects }),
+        );
+        return Ok(true);
+    }
+    let deleted = match state.s3().target(state, held.library).await {
+        Ok(target) => delete_held(state.s3(), &target, &held.root)
+            .await
+            .map_err(|error| format!("{error:?}")),
+        Err(error) => Err(format!("{error:?}")),
+    };
+    match deleted {
+        Ok(objects) => {
+            db.forget_held(entry).await.map_err(unavailable)?;
+            emit(
+                state,
+                "source.held_purged",
+                held.library,
+                None,
+                json!({ "node": entry.0.to_string(), "objects": objects }),
+            );
+            Ok(true)
+        }
+        Err(error) => {
+            eprintln!(
+                "sharecraft-server: the held objects of bin entry {} could not be deleted \
+                 ({error}); trying again in an hour",
+                entry.0
+            );
+            db.defer_held(entry, now + HELD_RETRY)
+                .await
+                .map_err(unavailable)?;
+            Ok(false)
+        }
+    }
+}
+
+/// How old a day folder of the holding folder must be before the sweep looks inside it.
+const SWEEP_AFTER_DAYS: i64 = 94;
+/// How often the holding sweep runs for one library.
+const SWEEP_EVERY: time::Duration = time::Duration::days(1);
+
+/// The daily holding sweep: once a day for each read-and-write S3 library whose writes are not
+/// blocked (the last run kept in memory, so a restart runs it again), deletes the objects under
+/// its holding folder whose day folder is more than 94 days before `now` (UTC) and whose entry no
+/// hold names (see [`crate::s3_write::sweep_holding`]); records `source.holding_swept {count}`
+/// when it deleted any. Then aborts the multipart uploads a crash left open for a day. Answers
+/// how many objects it deleted. Failures are logged and left for the next day.
+pub async fn sweep_holds(state: &AppState, now: OffsetDateTime) -> usize {
+    let db = state.db();
+    let libraries = match db.writable_s3_libraries().await {
+        Ok(libraries) => libraries,
+        Err(e) => {
+            eprintln!("sharecraft-server: database failure: {e}");
+            Vec::new()
+        }
+    };
+    let older_than = now
+        .to_offset(UtcOffset::UTC)
+        .checked_sub(time::Duration::days(SWEEP_AFTER_DAYS))
+        .map(OffsetDateTime::date);
+    let mut swept = 0;
+    for library in libraries {
+        let Some(older_than) = older_than else {
+            break;
+        };
+        if !state.writes().sweep_due(library, now) {
+            continue;
+        }
+        let keep: HashSet<NodeId> = match db.held_entries_of(library).await {
+            Ok(entries) => entries.into_iter().collect(),
+            Err(e) => {
+                eprintln!("sharecraft-server: database failure: {e}");
+                continue;
+            }
+        };
+        let Ok(target) = state.s3().target(state, library).await else {
+            continue;
+        };
+        match sweep_holding(state.s3(), &target, older_than, &keep).await {
+            Ok(0) => {}
+            Ok(count) => {
+                swept += usize::try_from(count).unwrap_or(usize::MAX);
+                emit(
+                    state,
+                    "source.holding_swept",
+                    library,
+                    None,
+                    json!({ "count": count }),
+                );
+            }
+            Err(error) => eprintln!(
+                "sharecraft-server: the holding folder of library {} could not be swept: \
+                 {error:?}",
+                library.0
+            ),
+        }
+    }
+    crate::s3_write::abort_stale(state, now).await;
+    swept
 }
 
 /// Blocks the writes of `library` after the store refused one (a write by the worker, or a new

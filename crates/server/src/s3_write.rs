@@ -490,6 +490,20 @@ pub fn holding_root(date: Date, entry: NodeId) -> String {
     )
 }
 
+/// Whether the library-relative `path` is inside the holding folder (where a tracking row of an
+/// item deleted into it is kept while its bin entry lasts).
+#[must_use]
+pub fn is_held_path(path: &str) -> bool {
+    path.strip_prefix(HOLDING)
+        .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Aborts the multipart uploads a crash left open for more than a day before `now`. Answers how
+/// many it aborted. Nothing yet: multipart uploads come with a later step of this work.
+pub async fn abort_stale(_state: &crate::AppState, _now: OffsetDateTime) -> usize {
+    0
+}
+
 /// Every object whose key starts with `prefix`, all pages. Keys a store names outside the
 /// prefix are dropped, so nothing outside it is ever moved or deleted.
 async fn list_all(s3: &S3, t: &S3Target, prefix: &str) -> Result<Vec<ObjectEntry>, WriteError> {
