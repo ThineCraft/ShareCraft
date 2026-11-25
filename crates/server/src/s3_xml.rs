@@ -370,6 +370,45 @@ pub fn error_code(text: &str) -> Option<String> {
     child(&root, "Code").map(|code| code.text.clone())
 }
 
+/// The upload id of an `InitiateMultipartUploadResult`: `None` when the answer is anything
+/// else or names no id.
+pub fn upload_id(body: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(body).ok()?;
+    let root = root_named(text, "InitiateMultipartUploadResult").ok()?;
+    let id = child(&root, "UploadId")?.text.trim();
+    (!id.is_empty() && id.len() <= 1024).then(|| id.to_owned())
+}
+
+/// True only for a `CopyObjectResult` document: a `200` whose body is an `<Error>` is false.
+pub fn copy_result_ok(body: &[u8]) -> bool {
+    std::str::from_utf8(body)
+        .ok()
+        .is_some_and(|text| root_named(text, "CopyObjectResult").is_ok())
+}
+
+/// True only for a `CompleteMultipartUploadResult` document: a `200` whose body is an
+/// `<Error>` is false.
+pub fn complete_result_ok(body: &[u8]) -> bool {
+    std::str::from_utf8(body)
+        .ok()
+        .is_some_and(|text| root_named(text, "CompleteMultipartUploadResult").is_ok())
+}
+
+/// The body of a `CompleteMultipartUpload` request: each part's number and ETag, in the order
+/// given.
+#[must_use]
+pub fn complete_request(parts: &[(u16, String)]) -> String {
+    let mut out = String::from("<CompleteMultipartUpload>");
+    for (number, etag) in parts {
+        out.push_str(&format!(
+            "<Part><PartNumber>{number}</PartNumber><ETag>{}</ETag></Part>",
+            escape(etag)
+        ));
+    }
+    out.push_str("</CompleteMultipartUpload>");
+    out
+}
+
 /// Reads a bucket's versioning status. An absent status means versioning was never enabled.
 pub fn versioning(text: &str) -> Result<Option<String>, XmlError> {
     let root = root_named(text, "VersioningConfiguration")?;

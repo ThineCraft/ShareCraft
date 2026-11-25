@@ -10,10 +10,13 @@
 //! headers it signed. Errors carry no text: an S3 error body is read (at most 64 KiB) only for
 //! its `Code` word, which is written to the server log; its `Message` is never kept.
 //!
-//! Reads are signed with the empty payload hash and tried again when throttled. The two write
-//! calls, [`S3::put`] and [`S3::delete`], are sent once, never tried again here: the caller's
-//! back-off decides. A `PUT` streams its file in pieces of at most 64 KiB and signs the real
-//! SHA-256 of the bytes, so the store itself checks them. No method here sends `POST`.
+//! Reads are signed with the empty payload hash and tried again when throttled. The write
+//! calls ([`S3::put`], [`S3::delete`], [`S3::copy`] and the multipart calls) are sent once,
+//! never tried again here: the caller's back-off decides. A `PUT` streams its file (or, for a
+//! part, a range of it) in pieces of at most 64 KiB and signs the real SHA-256 of the bytes, so
+//! the store itself checks them. `POST` is sent only to start and to complete a multipart
+//! upload; a `200` answer whose body is an `<Error>` document is a failure for a copy and a
+//! completion.
 
 use std::collections::HashMap;
 use std::error::Error as StdError;
@@ -34,7 +37,7 @@ use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Method, StatusCode, redirect};
 use time::OffsetDateTime;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use revisions::BlobError;
 
@@ -53,6 +56,12 @@ pub const RETRIES: u32 = 3;
 
 /// The largest object one `PUT` sends: 512 MiB. A larger file waits for multipart.
 pub const SINGLE_PUT_MAX: u64 = 512 * 1024 * 1024;
+/// The largest object one `CopyObject` copies: 5 GiB.
+pub const COPY_MAX: u64 = 5 * 1024 * 1024 * 1024;
+/// The size of each part of a multipart upload: 64 MiB (settable for tests).
+pub const PART_BYTES: u64 = 64 * 1024 * 1024;
+/// The most parts one multipart upload holds.
+pub const MAX_PARTS: u64 = 10_000;
 /// The most of a file read and sent at a time.
 const PUT_PIECE: usize = 64 * 1024;
 
@@ -142,6 +151,15 @@ pub struct PutBody {
     /// The file to stream, opened when the request is sent; `None` sends zero bytes.
     pub path: Option<PathBuf>,
     pub size: u64,
+    pub sha256: [u8; 32],
+}
+
+/// What one part of a multipart upload sends: a range of a file and the SHA-256 of that range.
+#[derive(Clone, Debug)]
+pub struct PartBody {
+    pub path: PathBuf,
+    pub offset: u64,
+    pub len: u64,
     pub sha256: [u8; 32],
 }
 
@@ -262,6 +280,7 @@ pub struct S3 {
     listing_progress: Mutex<HashMap<NodeId, Arc<AtomicUsize>>>,
     list_time_for_tests: Mutex<Option<Duration>>,
     single_put_max: AtomicU64,
+    part_bytes: AtomicU64,
 }
 
 /// The files seen so far by a bucket listing in progress; forgotten when dropped.
@@ -371,6 +390,8 @@ fn transport(error: &reqwest::Error) -> S3Error {
 fn mapped(status: u16, code: Option<&str>) -> S3Error {
     match (status, code) {
         (_, Some("NoSuchBucket")) => S3Error::NoBucket,
+        (_, Some("NoSuchUpload")) => S3Error::NotFound,
+        (_, Some("EntityTooSmall" | "InvalidPart" | "InvalidPartOrder")) => S3Error::Other,
         (501, _) | (_, Some("NotImplemented")) => S3Error::Unsupported,
         (400 | 403, Some("InvalidObjectState")) => S3Error::Archived,
         (403, Some("InvalidAccessKeyId" | "SignatureDoesNotMatch")) => S3Error::BadKeys,
@@ -397,6 +418,27 @@ fn retried(status: StatusCode) -> bool {
 fn loggable(code: &str) -> Option<&str> {
     (!code.is_empty() && code.len() <= 64 && code.bytes().all(|b| b.is_ascii_alphanumeric()))
         .then_some(code)
+}
+
+/// The line the server log gets for a failed answer, or `None` for a `404` to a `HEAD` or a
+/// `DELETE`: a missing object is an ordinary answer to those, not a fault.
+#[must_use]
+pub fn failure_log_line(method: &str, status: u16, code: Option<&str>) -> Option<String> {
+    if status == 404 && matches!(method, "HEAD" | "DELETE") {
+        return None;
+    }
+    Some(format!(
+        "sharecraft-server: S3 answered {status} {}",
+        code.unwrap_or("(no code)")
+    ))
+}
+
+fn push_condition(extra: &mut Vec<(String, String)>, cond: Cond<'_>) {
+    match cond {
+        Cond::None => {}
+        Cond::IfAbsent => extra.push(("if-none-match".to_owned(), "*".to_owned())),
+        Cond::IfMatch(etag) => extra.push(("if-match".to_owned(), etag.to_owned())),
+    }
 }
 
 fn header_text<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -604,6 +646,7 @@ impl S3 {
             listing_progress: Mutex::new(HashMap::new()),
             list_time_for_tests: Mutex::new(None),
             single_put_max: AtomicU64::new(SINGLE_PUT_MAX),
+            part_bytes: AtomicU64::new(PART_BYTES),
         }
     }
 
@@ -868,9 +911,19 @@ impl S3 {
             sha256: &sha256,
             size: body.size,
             path: body.path.as_deref(),
+            offset: None,
+            inline: None,
         };
-        self.send_once(t, Class::Write, Method::PUT, key, &extra, Some(payload))
-            .await?;
+        self.send_once(
+            t,
+            Class::Write,
+            Method::PUT,
+            key,
+            &[],
+            &extra,
+            Some(payload),
+        )
+        .await?;
         self.head(t, key).await
     }
 
@@ -882,12 +935,215 @@ impl S3 {
     /// See [`S3Error`].
     pub async fn delete(&self, t: &S3Target, key: &str) -> Result<(), S3Error> {
         match self
-            .send_once(t, Class::Write, Method::DELETE, key, &[], None)
+            .send_once(t, Class::Write, Method::DELETE, key, &[], &[], None)
             .await
         {
             Ok(_) | Err(S3Error::NotFound) => Ok(()),
             Err(error) => Err(error),
         }
+    }
+
+    /// `CopyObject` of `from_key` to `to_key` inside the bucket, sent once. The source is
+    /// not asked for: the caller gives its size, and one over [`COPY_MAX`] is refused before
+    /// anything is sent. The copy carries `x-amz-copy-source-if-match: from_etag`, so a source
+    /// that changed is a `Precondition`, and `cond` for the destination. A `200` whose body is
+    /// an `<Error>` is a failure. On success the destination is asked for with one `HEAD` and
+    /// that answer is returned. A copy sends no bytes from here, so none are counted up.
+    ///
+    /// Only `s3_write.rs` calls this.
+    ///
+    /// # Errors
+    /// `Unsupported` when the source is over [`COPY_MAX`]; `Other` for a key that cannot be
+    /// asked for; `Precondition` for a `412`; otherwise see [`S3Error`].
+    pub async fn copy(
+        &self,
+        t: &S3Target,
+        from_key: &str,
+        from_etag: &str,
+        from_size: u64,
+        to_key: &str,
+        cond: Cond<'_>,
+    ) -> Result<ObjectHead, S3Error> {
+        if from_size > COPY_MAX {
+            return Err(S3Error::Unsupported);
+        }
+        if unaskable(from_key) || unaskable(to_key) {
+            return Err(S3Error::Other);
+        }
+        let mut extra = vec![
+            (
+                "x-amz-copy-source".to_owned(),
+                format!("/{}/{}", t.bucket, s3_sign::uri_encode(from_key, true)),
+            ),
+            (
+                "x-amz-copy-source-if-match".to_owned(),
+                from_etag.to_owned(),
+            ),
+        ];
+        push_condition(&mut extra, cond);
+        let response = self
+            .send_once(t, Class::Write, Method::PUT, to_key, &[], &extra, None)
+            .await?;
+        self.answer_in_200(t, response, s3_xml::copy_result_ok)
+            .await?;
+        self.head(t, to_key).await
+    }
+
+    /// Starts a multipart upload of `key`: `POST ?uploads`, with the whole file's SHA-256 as
+    /// `x-amz-meta-sharecraft-sha256`, so a lost completion answer is recognised afterwards.
+    /// Answers the upload id.
+    ///
+    /// # Errors
+    /// `Malformed` when the answer names no upload id; otherwise see [`S3Error`].
+    pub async fn start_multipart(
+        &self,
+        t: &S3Target,
+        key: &str,
+        sha256: &[u8; 32],
+    ) -> Result<String, S3Error> {
+        let extra = [(
+            "x-amz-meta-sharecraft-sha256".to_owned(),
+            s3_sign::hex(sha256),
+        )];
+        let response = self
+            .send_once(
+                t,
+                Class::Write,
+                Method::POST,
+                key,
+                &[("uploads", "")],
+                &extra,
+                None,
+            )
+            .await?;
+        let text = self.document(t, response).await?;
+        s3_xml::upload_id(text.as_bytes()).ok_or(S3Error::Malformed)
+    }
+
+    /// `PUT ?partNumber=&uploadId=` of the `body.len` bytes of `body.path` from `body.offset`,
+    /// streamed in pieces of at most 64 KiB and signed with `body.sha256`. Answers the part's
+    /// ETag. Numbers run from 1 to 10,000.
+    ///
+    /// # Errors
+    /// `Other` for a number out of range, a key that cannot be asked for, or a file that ends
+    /// before `offset + len`; otherwise see [`S3Error`].
+    pub async fn put_part(
+        &self,
+        t: &S3Target,
+        key: &str,
+        upload_id: &str,
+        number: u16,
+        body: &PartBody,
+    ) -> Result<String, S3Error> {
+        if number == 0 || u64::from(number) > MAX_PARTS {
+            return Err(S3Error::Other);
+        }
+        let sha256 = s3_sign::hex(&body.sha256);
+        let extra = [("content-length".to_owned(), body.len.to_string())];
+        let payload = Payload {
+            sha256: &sha256,
+            size: body.len,
+            path: Some(&body.path),
+            offset: Some(body.offset),
+            inline: None,
+        };
+        let number = number.to_string();
+        let response = self
+            .send_once(
+                t,
+                Class::Write,
+                Method::PUT,
+                key,
+                &[("partNumber", &number), ("uploadId", upload_id)],
+                &extra,
+                Some(payload),
+            )
+            .await?;
+        let etag = header_text(response.headers(), "etag").ok_or(S3Error::Malformed)?;
+        if etag.is_empty() || etag.len() > 1024 {
+            return Err(S3Error::Malformed);
+        }
+        Ok(etag.to_owned())
+    }
+
+    /// Completes a multipart upload: `POST ?uploadId=` with the parts' numbers and ETags, under
+    /// `cond`. A `200` whose body is an `<Error>` is a failure. On success the object is asked
+    /// for with one `HEAD` and that answer is returned.
+    ///
+    /// # Errors
+    /// `Precondition` for a `412`; `NotFound` for an unknown upload; otherwise see [`S3Error`].
+    pub async fn complete_multipart(
+        &self,
+        t: &S3Target,
+        key: &str,
+        upload_id: &str,
+        parts: &[(u16, String)],
+        cond: Cond<'_>,
+    ) -> Result<ObjectHead, S3Error> {
+        let document = s3_xml::complete_request(parts);
+        let hash = s3_sign::sha256_hex(document.as_bytes());
+        let mut extra = Vec::new();
+        push_condition(&mut extra, cond);
+        let payload = Payload {
+            sha256: &hash,
+            size: u64::try_from(document.len()).unwrap_or(u64::MAX),
+            path: None,
+            offset: None,
+            inline: Some(document.as_bytes()),
+        };
+        let response = self
+            .send_once(
+                t,
+                Class::Write,
+                Method::POST,
+                key,
+                &[("uploadId", upload_id)],
+                &extra,
+                Some(payload),
+            )
+            .await?;
+        self.answer_in_200(t, response, s3_xml::complete_result_ok)
+            .await?;
+        self.head(t, key).await
+    }
+
+    /// Abandons a multipart upload: `DELETE ?uploadId=`. An upload that is already gone
+    /// (`404 NoSuchUpload`) counts as done.
+    ///
+    /// # Errors
+    /// See [`S3Error`].
+    pub async fn abort_multipart(
+        &self,
+        t: &S3Target,
+        key: &str,
+        upload_id: &str,
+    ) -> Result<(), S3Error> {
+        match self
+            .send_once(
+                t,
+                Class::Write,
+                Method::DELETE,
+                key,
+                &[("uploadId", upload_id)],
+                &[],
+                None,
+            )
+            .await
+        {
+            Ok(_) | Err(S3Error::NotFound) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The size of each part of a multipart upload.
+    #[must_use]
+    pub fn part_bytes(&self) -> u64 {
+        self.part_bytes.load(Ordering::SeqCst)
+    }
+
+    /// Sets the size of each part, for tests.
+    pub fn set_part_bytes_for_tests(&self, bytes: u64) {
+        self.part_bytes.store(bytes.max(1), Ordering::SeqCst);
     }
 
     /// The largest file one `PUT` sends.
@@ -1087,11 +1343,38 @@ impl S3 {
                 .and_then(s3_xml::error_code)
         };
         let code = code.as_deref().and_then(loggable);
+        if let Some(line) = failure_log_line(method.as_str(), status, code) {
+            eprintln!("{line}");
+        }
+        mapped(status, code)
+    }
+
+    /// Reads the answer of a call that can fail inside a `200`: `ok` says whether the body is
+    /// the document wanted. An `<Error>` document is mapped by its code (and logged by it).
+    async fn answer_in_200(
+        &self,
+        t: &S3Target,
+        response: reqwest::Response,
+        ok: fn(&[u8]) -> bool,
+    ) -> Result<(), S3Error> {
+        let text = self.document(t, response).await?;
+        if ok(text.as_bytes()) {
+            return Ok(());
+        }
+        let Some(code) = s3_xml::error_code(&text) else {
+            return Err(S3Error::Malformed);
+        };
+        let code = loggable(&code);
         eprintln!(
-            "sharecraft-server: S3 answered {status} {}",
+            "sharecraft-server: S3 answered 200 with an error {}",
             code.unwrap_or("(no code)")
         );
-        mapped(status, code)
+        Err(match code {
+            Some("PreconditionFailed") => S3Error::Precondition,
+            Some("NoSuchKey" | "NoSuchUpload") => S3Error::NotFound,
+            Some("AccessDenied") => S3Error::Denied,
+            other => mapped(500, other),
+        })
     }
 
     /// Signs and sends one request, trying a throttled or failed one again up to [`RETRIES`]
@@ -1198,22 +1481,31 @@ impl S3 {
 
     /// Signs and sends one write request, once: no retry of any answer. A `PUT` carries its
     /// payload hash in the signature and streams its file; the answer must be a success.
+    #[allow(clippy::too_many_arguments)]
     async fn send_once(
         &self,
         t: &S3Target,
         class: Class,
         method: Method,
         key: &str,
+        query: &[(&str, &str)],
         extra: &[(String, String)],
         payload: Option<Payload<'_>>,
     ) -> Result<reqwest::Response, S3Error> {
-        let (client, url, path, host) = self.prepared(t, Some(key), &[])?;
+        let query: Vec<(String, String)> = query
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect();
+        let (client, url, path, host) = self.prepared(t, Some(key), &query)?;
         let hash = payload.as_ref().map_or(EMPTY_SHA256, |p| p.sha256);
-        let headers = self.signed_headers(t, &method, &host, &path, &[], extra, hash)?;
+        let headers = self.signed_headers(t, &method, &host, &path, &query, extra, hash)?;
         let mut request = client.request(method.clone(), url).headers(headers);
         let mut bytes_up = 0;
         if let Some(payload) = payload {
-            bytes_up = payload.size;
+            // Only file bytes count as sent; a small document body does not.
+            if payload.path.is_some() {
+                bytes_up = payload.size;
+            }
             if let Some(body) = payload.open().await? {
                 request = request.body(body);
             }
@@ -1287,6 +1579,11 @@ struct Payload<'a> {
     sha256: &'a str,
     size: u64,
     path: Option<&'a Path>,
+    /// Where in the file the bytes start: `None` sends the whole file, which must be exactly
+    /// `size` long; `Some` sends `size` bytes from there, and the file must reach that far.
+    offset: Option<u64>,
+    /// A small body held in memory (a document), sent instead of a file.
+    inline: Option<&'a [u8]>,
 }
 
 impl Payload<'_> {
@@ -1294,15 +1591,28 @@ impl Payload<'_> {
     /// file whose length is not `size` is refused (`Other`), and a file that ends early or
     /// grows while it is sent fails the stream. `None` sends no body.
     async fn open(&self) -> Result<Option<reqwest::Body>, S3Error> {
+        if let Some(bytes) = self.inline {
+            return Ok(Some(reqwest::Body::from(Bytes::copy_from_slice(bytes))));
+        }
         let Some(path) = self.path else {
             return Ok(None);
         };
-        let file = tokio::fs::File::open(path)
+        let mut file = tokio::fs::File::open(path)
             .await
             .map_err(|_| S3Error::Other)?;
         let length = file.metadata().await.map_err(|_| S3Error::Other)?.len();
-        if length != self.size {
-            return Err(S3Error::Other);
+        match self.offset {
+            None if length != self.size => return Err(S3Error::Other),
+            Some(offset) => {
+                // A part read past the end of the file is refused before anything is sent.
+                if offset.checked_add(self.size).is_none_or(|end| end > length) {
+                    return Err(S3Error::Other);
+                }
+                file.seek(std::io::SeekFrom::Start(offset))
+                    .await
+                    .map_err(|_| S3Error::Other)?;
+            }
+            None => {}
         }
         if self.size == 0 {
             return Ok(None);
