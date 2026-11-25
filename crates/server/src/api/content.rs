@@ -170,7 +170,7 @@ pub(crate) async fn current_content(state: &AppState, doc: DocId) -> Result<Curr
     }
 }
 
-fn external_error(error: ExternalError, kind: SourceKind) -> ApiError {
+pub(crate) fn external_error(error: ExternalError, kind: SourceKind) -> ApiError {
     match error {
         ExternalError::Gone => ApiError::SourceUnavailable("gone", kind),
         ExternalError::Denied => ApiError::SourceUnavailable("denied", kind),

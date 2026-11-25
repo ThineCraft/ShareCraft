@@ -469,6 +469,14 @@ pub(crate) enum ApiError {
     SourceChanged,
     /// 409: the read-and-write library is read-only until its storage accepts changes again.
     SourceWriteBlocked,
+    /// A copy into a read-and-write S3 library that stopped part way: `made` files and folders
+    /// were made (and their files staged, so they are written), the rest were not. Answered with
+    /// the status and code of what stopped it, and `made`.
+    SourceCopyIncomplete {
+        made: u64,
+        status: StatusCode,
+        code: &'static str,
+    },
     /// 422: the write probe found that the access key may read the bucket but not write to it.
     S3NotWritable,
     /// 403: only an administrator may make a library read and write.
@@ -603,7 +611,7 @@ impl ApiError {
         self.status_and_code().1
     }
 
-    fn status_and_code(self) -> (StatusCode, &'static str) {
+    pub(crate) fn status_and_code(self) -> (StatusCode, &'static str) {
         match self {
             ApiError::BadRequest => (StatusCode::BAD_REQUEST, "bad_request"),
             ApiError::NotSignedIn => (StatusCode::UNAUTHORIZED, "not_signed_in"),
@@ -668,6 +676,7 @@ impl ApiError {
             ApiError::SourceItemSaving => (StatusCode::CONFLICT, "source_item_saving"),
             ApiError::SourceTooLargeToMove => (StatusCode::CONFLICT, "source_too_large_to_move"),
             ApiError::SourceChanged => (StatusCode::CONFLICT, "source_changed"),
+            ApiError::SourceCopyIncomplete { status, code, .. } => (status, code),
             ApiError::SourceWriteBlocked => (StatusCode::CONFLICT, "source_write_blocked"),
             ApiError::S3NotWritable => (StatusCode::UNPROCESSABLE_ENTITY, "s3_not_writable"),
             ApiError::ReadWriteAdminOnly => (StatusCode::FORBIDDEN, "read_write_admin_only"),
@@ -1023,6 +1032,14 @@ impl IntoResponse for ApiError {
                 json!({ "error": code, "message": SOURCE_TOO_LARGE_TO_MOVE })
             }
             ApiError::SourceChanged => json!({ "error": code, "message": SOURCE_CHANGED }),
+            ApiError::SourceCopyIncomplete { made, .. } => json!({
+                "error": code,
+                "made": made,
+                "message": format!(
+                    "The copy stopped part way: {} items were copied and are being saved to the                      storage; the rest were not copied.",
+                    crate::source_write::thousands(made)
+                ),
+            }),
             ApiError::S3NotWritable => json!({ "error": code, "message": S3_NOT_WRITABLE }),
             ApiError::ReadWriteAdminOnly => {
                 json!({ "error": code, "message": READ_WRITE_ADMIN_ONLY })

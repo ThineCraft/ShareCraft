@@ -6,7 +6,9 @@
 //! its own result, in the order given: one failing does not stop the others. An item in, or
 //! going into, a library connected to a source is refused as the single-item route refuses it
 //! (`source_read_only`). A move or copy inside a read-and-write S3 library goes through the bucket, as
-//! the single-item route does, taking the library's source lock once for each item.
+//! the single-item route does, taking the library's source lock once for each item; a copy out of
+//! an S3 library or into a read-and-write one goes through ShareCraft, as the single-item route
+//! copies it.
 
 use axum::Json;
 use axum::extract::State;
@@ -151,7 +153,9 @@ pub(crate) async fn run(
                         _ => None,
                     },
                     limit: match e {
-                        ApiError::FileTooLarge(limit) => Some(limit),
+                        ApiError::FileTooLarge(limit) | ApiError::SourceFileTooLarge(limit) => {
+                            Some(limit)
+                        }
                         _ => None,
                     },
                     scan: match e {
@@ -202,8 +206,9 @@ async fn one(
                 .map(|_| Done::default())
         }
         (BulkOp::Copy, Some(parent)) => {
-            // Into a connected library: refused, but inside one read-and-write S3 library, which
-            // copies through the bucket (see `copy_checked`).
+            // As the single-item route copies it: inside one read-and-write S3 library through
+            // the bucket, out of an S3 library or into a read-and-write one through ShareCraft,
+            // and into any other connected library refused (see `copy_checked`).
             let copied = copy_checked(state, actor, id, parent, None).await?;
             Ok(Done {
                 new_id: Some(copied.id().to_owned()),

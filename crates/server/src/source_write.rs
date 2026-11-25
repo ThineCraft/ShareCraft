@@ -22,8 +22,8 @@ use std::time::Duration;
 use collab_core::ids::{DocId, NodeId, UserId};
 use records::{
     Access, AccessError, BinStage, Db, Editor, ExternalEntry, NewEvent, NewPendingWrite, Node,
-    NodeKind, PendingWrite, Perms, ScanState, SourceItem, SourceKind, SourceLock, SourceMode, Tri,
-    User, WriteState, object_tag,
+    NodeKind, PendingWrite, Perms, QuotaError, ScanState, SourceItem, SourceKind, SourceLock,
+    SourceMode, Tri, User, WriteState, object_tag,
 };
 use revisions::{
     BlobRef, Checkpoint, CheckpointError, Content, GitError, Meta, Outcome, RevisionId,
@@ -2321,6 +2321,542 @@ async fn record_copied(
         if let Err(e) = db.record_external_item(plan.library, entry).await {
             eprintln!("sharecraft-server: a copied file could not be tracked: {e}");
             state.sources().wake(plan.library);
+        }
+    }
+}
+
+/// Where the items of a copy between libraries are read from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AcrossFrom {
+    /// The ordinary content store (an ordinary or GitHub library).
+    Tree,
+    /// The bucket of the S3 library, in either mode, read through the external-content cache.
+    Bucket(NodeId),
+}
+
+/// Where the items of a copy between libraries are made.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AcrossInto {
+    /// Ordinary files and folders, counted against the quota of the site.
+    Tree { site: NodeId },
+    /// Folders and staged files of the read-and-write S3 library.
+    Bucket(NodeId),
+}
+
+/// One item a copy between libraries makes, in the order it is made: every folder before
+/// what is in it.
+struct AcrossItem {
+    /// The original.
+    source: NodeId,
+    /// The item of the plan the copy goes into; `None` for the top, which goes into the
+    /// parent asked for.
+    within: Option<usize>,
+    name: String,
+    /// `None` for a folder.
+    file: Option<AcrossFile>,
+}
+
+/// A file of a copy between libraries.
+struct AcrossFile {
+    editor: Editor,
+    /// Its size: the tracked size of a bucket file, the stored size of an ordinary one.
+    size: u64,
+    /// The content of an ordinary file; a bucket file's is read when it is copied.
+    content: Option<Content>,
+}
+
+/// A copy between libraries, judged and ready to be made.
+struct AcrossPlan {
+    from: AcrossFrom,
+    into: AcrossInto,
+    items: Vec<AcrossItem>,
+    /// The bytes of every file.
+    bytes: u64,
+}
+
+/// Where `node` of a connected library is read from for a copy out of it: `409
+/// source_copy_unavailable` for a file share, whose files are not copied yet.
+async fn across_from(db: &Db, node: NodeId) -> Result<AcrossFrom, ApiError> {
+    let unavailable = |e: records::DbError| ApiError::unavailable(&e);
+    let Some(library) = db.source_library_of(node).await.map_err(unavailable)? else {
+        return Ok(AcrossFrom::Tree);
+    };
+    match db.source_of(library).await.map_err(unavailable)? {
+        Some((config, _)) if config.kind == SourceKind::S3 => Ok(AcrossFrom::Bucket(library)),
+        Some((config, _)) if config.kind == SourceKind::Share => {
+            Err(ApiError::SourceCopyUnavailable)
+        }
+        _ => Ok(AcrossFrom::Tree),
+    }
+}
+
+/// The items below `node` (which is `top` in the plan) that a copy takes, as the ordinary copy
+/// takes them: every live item the person may view, a hidden folder taking everything in it
+/// with it, and a file only with its document row (and, in a bucket, its tracking row).
+async fn across_walk(
+    db: &Db,
+    actor: &User,
+    node: NodeId,
+    tracked: &HashMap<NodeId, u64>,
+    from: AcrossFrom,
+    items: &mut Vec<AcrossItem>,
+) -> Result<(), ApiError> {
+    let unavailable = |e: records::DbError| ApiError::unavailable(&e);
+    let mut level = vec![(node, 0usize)];
+    while let Some((folder, at)) = level.pop() {
+        let mut children = db.live_children(folder).await.map_err(unavailable)?;
+        children.sort_by(|a, b| a.name.cmp(&b.name));
+        for child in children {
+            let viewable = db
+                .effective_access(actor.id, child.id)
+                .await
+                .map_err(unavailable)?
+                .is_some_and(|a| a.perms.contains(Perms::VIEW));
+            if !viewable {
+                continue;
+            }
+            let file = match child.kind {
+                NodeKind::Folder => None,
+                NodeKind::Document => {
+                    let Some(document) =
+                        db.document(DocId(child.id.0)).await.map_err(unavailable)?
+                    else {
+                        continue;
+                    };
+                    let size = match from {
+                        AcrossFrom::Bucket(_) => match tracked.get(&child.id) {
+                            Some(size) => *size,
+                            None => continue,
+                        },
+                        AcrossFrom::Tree => 0,
+                    };
+                    Some(AcrossFile {
+                        editor: document.editor,
+                        size,
+                        content: None,
+                    })
+                }
+                _ => continue,
+            };
+            let folder_child = file.is_none();
+            items.push(AcrossItem {
+                source: child.id,
+                within: Some(at),
+                name: child.name,
+                file,
+            });
+            if folder_child {
+                level.push((child.id, items.len() - 1));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The library-relative paths every item of `plan` takes in the bucket, the top at `top`.
+fn across_paths(plan: &AcrossPlan, top: &str) -> Vec<String> {
+    let mut paths: Vec<String> = Vec::with_capacity(plan.items.len());
+    for item in &plan.items {
+        let path = match item.within.and_then(|at| paths.get(at)) {
+            Some(folder) => format!("{folder}/{}", item.name),
+            None => top.to_owned(),
+        };
+        paths.push(path);
+    }
+    paths
+}
+
+/// Everything about copying `node` into `parent` of another library (as `name` or as it is)
+/// that is judged before a byte is read or anything is made:
+///
+/// - where it comes from: `404` for someone who cannot see it, `view` on it, a file or folder,
+///   `409 source_copy_unavailable` out of a file share; out of a bucket `409
+///   source_item_saving` while it or anything inside has a change not yet written and `409
+///   source_unavailable {reason: archived}` for anything in archive storage;
+/// - where it goes: what [`writable_place`] says of `parent` (`409 source_read_only`, `409
+///   source_write_blocked`), a library or folder, `add` there, the folders setting for a
+///   folder, a name free there ignoring case (`409 name_taken`: never numbered), and into a
+///   bucket a name the listing shows and the bucket takes for every item (`422 invalid_name`);
+/// - the limits: at most [`crate::s3_write::MOVE_MAX_OBJECTS`] files and folders (`409
+///   source_too_many_objects {count}`), and every file within the destination's largest file
+///   (into a bucket [`write_limit`], `413 source_file_too_large {limit}`; elsewhere the
+///   server's, `413 too_large`) and its library's file policies.
+///
+/// What the person may not view is left out, as the ordinary copy leaves it out. A bucket
+/// file's size is its tracked size, so nothing is read from the bucket here.
+async fn across_allowed(
+    state: &AppState,
+    actor: &User,
+    node: NodeId,
+    parent: NodeId,
+    name: Option<&str>,
+) -> Result<AcrossPlan, ApiError> {
+    let db = state.db();
+    let unavailable = |e: records::DbError| ApiError::unavailable(&e);
+    let (item, access) = tree::visible(db, actor, node).await?;
+    tree::require(&access, Perms::VIEW)?;
+    if !matches!(item.kind, NodeKind::Folder | NodeKind::Document) {
+        return Err(AccessError::WrongPlace.into());
+    }
+    let from = across_from(db, node).await?;
+    let bucket = match writable_place(db, actor.id, parent).await? {
+        Place::External(Store::S3(target)) => Some(target.library),
+        Place::Ordinary => None,
+    };
+    if let (AcrossFrom::Bucket(a), Some(b)) = (from, bucket)
+        && a == b
+    {
+        // Inside one library: a copy in the bucket (see `copy_within`).
+        return Err(ApiError::SourceActionUnavailable);
+    }
+    let (place, place_access) = tree::visible(db, actor, parent).await?;
+    if !matches!(place.kind, NodeKind::Library | NodeKind::Folder) {
+        return Err(AccessError::WrongPlace.into());
+    }
+    tree::require(&place_access, Perms::ADD)?;
+    if db.is_at_or_below(parent, node).await.map_err(unavailable)? {
+        return Err(AccessError::IntoItself.into());
+    }
+    let into = bucket.map_or(AcrossInto::Tree { site: place.site }, AcrossInto::Bucket);
+    let asked = name.map_or(item.name.as_str(), str::trim);
+    let new_name = match checked_name(db, &item, asked).await {
+        Err(ApiError::WrongExtension) => return Err(ApiError::InvalidName),
+        checked => checked?,
+    };
+    let tracked: HashMap<NodeId, u64> = match from {
+        AcrossFrom::Bucket(library) => {
+            let (_, rows) = tracked_subtree(db, library, node).await?;
+            rows.into_iter()
+                .map(|row| (row.node, u64::try_from(row.size).unwrap_or(0)))
+                .collect()
+        }
+        AcrossFrom::Tree => HashMap::new(),
+    };
+    let top = match item.kind {
+        NodeKind::Document => {
+            let document = db
+                .document(DocId(node.0))
+                .await
+                .map_err(unavailable)?
+                .ok_or(ApiError::NotFound)?;
+            let size = match from {
+                AcrossFrom::Bucket(_) => *tracked
+                    .get(&node)
+                    .ok_or(ApiError::SourceActionUnavailable)?,
+                AcrossFrom::Tree => 0,
+            };
+            Some(AcrossFile {
+                editor: document.editor,
+                size,
+                content: None,
+            })
+        }
+        _ => None,
+    };
+    let folder = top.is_none();
+    let mut items = vec![AcrossItem {
+        source: node,
+        within: None,
+        name: new_name.clone(),
+        file: top,
+    }];
+    if folder {
+        across_walk(db, actor, node, &tracked, from, &mut items).await?;
+    }
+    let count = u64::try_from(items.len()).unwrap_or(u64::MAX);
+    if count > crate::s3_write::MOVE_MAX_OBJECTS {
+        return Err(ApiError::SourceTooManyObjects(count));
+    }
+    // The content of an ordinary file: its latest version, which the scanner must not hold. A
+    // file with no content yet is left out (it keeps its place, so the folders keep theirs).
+    if from == AcrossFrom::Tree {
+        for item in &mut items {
+            let top = item.within.is_none();
+            let Some(file) = item.file.as_mut() else {
+                continue;
+            };
+            let doc = DocId(item.source.0);
+            let Some(stored) =
+                crate::api::content::blocking(state, move |store| store.load(doc)).await?
+            else {
+                if top {
+                    return Err(ApiError::SourceActionUnavailable);
+                }
+                continue;
+            };
+            if let Content::Blob(blob) = &stored.content
+                && let Some(scan) = db.availability(&blob.sha256).await.map_err(unavailable)?
+            {
+                return Err(ApiError::Held(scan));
+            }
+            file.size = match &stored.content {
+                Content::Blob(blob) => blob.size,
+                Content::Inline(bytes) => u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            };
+            file.content = Some(stored.content);
+        }
+    }
+    if folder && folders_off(db, parent).await? {
+        return Err(AccessError::FoldersOff.into());
+    }
+    if !db
+        .name_free(parent, &new_name, None)
+        .await
+        .map_err(unavailable)?
+    {
+        return Err(AccessError::NameTaken.into());
+    }
+    let limit = match into {
+        AcrossInto::Bucket(_) => write_limit(state).await.map_err(unavailable)?,
+        AcrossInto::Tree { .. } => state.config().max_file_bytes,
+    };
+    let mut bytes = 0u64;
+    for item in &items {
+        let Some(file) = &item.file else { continue };
+        if from == AcrossFrom::Tree && file.content.is_none() {
+            continue;
+        }
+        if file.size > limit {
+            return Err(match into {
+                AcrossInto::Bucket(_) => ApiError::SourceFileTooLarge(limit),
+                AcrossInto::Tree { .. } => ApiError::TooLarge,
+            });
+        }
+        tree::check_policies(db, parent, &item.name, Some(file.size)).await?;
+        bytes = bytes.saturating_add(file.size);
+    }
+    let plan = AcrossPlan {
+        from,
+        into,
+        items,
+        bytes,
+    };
+    if let AcrossInto::Bucket(library) = into {
+        let (_, top) = external_path(state, parent, &new_name).await?;
+        let target = state.s3().target(state, library).await.ok();
+        for path in across_paths(&plan, &top).iter().skip(1) {
+            let nameable = path
+                .rsplit('/')
+                .next()
+                .is_some_and(|last| nameable_segment(last) && !records::reserved_name(last));
+            let keyed = target
+                .as_ref()
+                .is_none_or(|target| object_key(target, path).is_some());
+            if !nameable || !keyed {
+                return Err(ApiError::InvalidName);
+            }
+        }
+    }
+    Ok(plan)
+}
+
+/// The content of the file `item` of `plan`, held: an ordinary file's stored content, or a
+/// bucket file's bytes read through the external-content cache (passing its scan gate), held
+/// to the destination's limit `limit` again, since the bucket may hold more than was tracked.
+async fn across_content(
+    state: &AppState,
+    plan: &AcrossPlan,
+    item: &AcrossItem,
+    limit: u64,
+) -> Result<Held, ApiError> {
+    let held = match (
+        plan.from,
+        item.file.as_ref().and_then(|f| f.content.clone()),
+    ) {
+        (AcrossFrom::Bucket(_), _) => {
+            match crate::external::materialise(state, item.source).await {
+                Ok(Some(ready)) => ready.held,
+                Ok(None) => return Err(ApiError::Unavailable),
+                Err(e) => return Err(crate::api::content::external_error(e, SourceKind::S3)),
+            }
+        }
+        (AcrossFrom::Tree, Some(Content::Blob(blob))) => state
+            .blobs()
+            .hold_stored(blob)
+            .await
+            .ok_or(ApiError::Unavailable)?,
+        (AcrossFrom::Tree, Some(Content::Inline(bytes))) => state
+            .blobs()
+            .write_bytes(bytes)
+            .await
+            .map_err(|e| ApiError::unavailable(&e))?,
+        (AcrossFrom::Tree, None) => return Err(ApiError::Unavailable),
+    };
+    if held.blob().size > limit {
+        discard(state, held).await;
+        return Err(match plan.into {
+            AcrossInto::Bucket(_) => ApiError::SourceFileTooLarge(limit),
+            AcrossInto::Tree { .. } => ApiError::TooLarge,
+        });
+    }
+    Ok(held)
+}
+
+/// Makes the item `item` of `plan` in `parent`: a folder, or a file with its content (an
+/// ordinary file through the upload route's [`crate::api::content::create_uploaded`], a bucket
+/// file staged through [`create_staged`]). Answers the new node.
+async fn across_one(
+    state: &AppState,
+    actor: &User,
+    plan: &AcrossPlan,
+    item: &AcrossItem,
+    parent: NodeId,
+    limit: u64,
+) -> Result<NodeId, ApiError> {
+    let Some(file) = &item.file else {
+        return match plan.into {
+            AcrossInto::Bucket(library) => {
+                Ok(create_folder(state, actor, library, parent, &item.name)
+                    .await?
+                    .id)
+            }
+            AcrossInto::Tree { .. } => Ok(tree::apply(
+                state,
+                actor,
+                TreeOp::Create {
+                    parent: Some(parent),
+                    kind: NodeKind::Folder,
+                    name: item.name.clone(),
+                    id: NodeId(Uuid::new_v4()),
+                },
+            )
+            .await?
+            .node
+            .id),
+        };
+    };
+    let held = across_content(state, plan, item, limit).await?;
+    let created = match plan.into {
+        AcrossInto::Bucket(_) => {
+            create_staged(state, actor, parent, &item.name, file.editor, held, false).await?
+        }
+        AcrossInto::Tree { .. } => {
+            crate::api::content::create_uploaded(
+                state,
+                actor,
+                parent,
+                &item.name,
+                file.editor,
+                held,
+                false,
+            )
+            .await?
+        }
+    };
+    match created {
+        Created::Done { doc, .. } => Ok(NodeId(doc.0)),
+        Created::Failed(_) => Err(ApiError::Unavailable),
+    }
+}
+
+/// Copies `node` into `parent` of another library, for `actor`, named `name` or as it is:
+/// out of an S3 library into an ordinary place, from an ordinary place into a read-and-write
+/// S3 library, or from one S3 library into another. Answers the new node.
+///
+/// Everything that can be refused is judged first, before a byte is read (see
+/// [`across_allowed`]); a copy out is then reserved against the destination site's quota
+/// (`507 quota_exceeded`), still before a byte is read. Then each item is made, every folder
+/// before what is in it:
+///
+/// - out of a bucket, each file's bytes are read through the external-content cache
+///   ([`crate::external::materialise`], which passes them through the scan gate) and made an
+///   ordinary file through the upload route's [`crate::api::content::create_uploaded`], which
+///   counts them in the site's usage;
+/// - into a bucket, folders are made with [`create_folder`] (the marker written at once) and
+///   files with [`create_staged`], on the original's content (already scanned) or the bytes
+///   just read, so the write worker writes them after the scan gate; nothing else is written
+///   in the request.
+///
+/// If a step fails part way, a copy out deletes what it made (best effort) and answers the
+/// error; a copy into a bucket leaves what it made (its files are accepted saves) and answers
+/// `SourceCopyIncomplete` with the error's status and code and how many items it made.
+pub(crate) async fn copy_across(
+    state: &AppState,
+    actor: &User,
+    node: NodeId,
+    parent: NodeId,
+    name: Option<&str>,
+) -> Result<NodeId, ApiError> {
+    let db = state.db();
+    let plan = across_allowed(state, actor, node, parent, name).await?;
+    let limit = match plan.into {
+        AcrossInto::Bucket(_) => write_limit(state)
+            .await
+            .map_err(|e| ApiError::unavailable(&e))?,
+        AcrossInto::Tree { .. } => state.config().max_file_bytes,
+    };
+    let reservation = match plan.into {
+        AcrossInto::Tree { site } if plan.bytes > 0 => Some(
+            db.reserve_bytes(site, plan.bytes)
+                .await
+                .map_err(|e| match e {
+                    QuotaError::Exceeded => ApiError::QuotaExceeded,
+                    QuotaError::Db(e) => ApiError::unavailable(&e),
+                })?,
+        ),
+        _ => None,
+    };
+    // The node made of each item, in order; `None` for a file left out.
+    let mut made: Vec<Option<NodeId>> = Vec::with_capacity(plan.items.len());
+    let mut failed = None;
+    for item in &plan.items {
+        if plan.from == AcrossFrom::Tree
+            && item
+                .file
+                .as_ref()
+                .is_some_and(|file| file.content.is_none())
+        {
+            made.push(None);
+            continue;
+        }
+        let into = match item.within {
+            Some(at) => match made.get(at).copied().flatten() {
+                Some(folder) => folder,
+                None => {
+                    failed = Some(ApiError::Unavailable);
+                    break;
+                }
+            },
+            None => parent,
+        };
+        match across_one(state, actor, &plan, item, into, limit).await {
+            Ok(new) => made.push(Some(new)),
+            Err(e) => {
+                failed = Some(e);
+                break;
+            }
+        }
+    }
+    // The files made were counted with their versions.
+    if let Some(reservation) = reservation {
+        crate::blobs::release(db, reservation).await;
+    }
+    let top = made.first().copied().flatten();
+    let count = made.iter().flatten().count();
+    let Some(error) = failed else {
+        return top.ok_or(ApiError::Unavailable);
+    };
+    match plan.into {
+        AcrossInto::Tree { .. } => {
+            if let Some(top) = top
+                && let Err(e) = tree::apply(state, actor, TreeOp::Delete { id: top }).await
+            {
+                eprintln!("sharecraft-server: a copy that failed part way was not removed: {e}");
+            }
+            Err(error)
+        }
+        AcrossInto::Bucket(_) if count == 0 => Err(error),
+        AcrossInto::Bucket(_) => {
+            eprintln!(
+                "sharecraft-server: a copy into S3 storage stopped after {count} items: {}",
+                error.code()
+            );
+            let (status, code) = error.status_and_code();
+            Err(ApiError::SourceCopyIncomplete {
+                made: u64::try_from(count).unwrap_or(u64::MAX),
+                status,
+                code,
+            })
         }
     }
 }

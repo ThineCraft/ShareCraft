@@ -772,13 +772,14 @@ const ROWS: &[Row] = &[
     row(Act::StartNewVersion, "POST /api/uploads", 201, Succeeds),
     row(Act::Chunk, "PUT /api/uploads/{id}", 200, Succeeds),
     row(Act::Finish, "POST /api/uploads/{id}/finish", 201, Succeeds),
-    // Renames, moves and copies inside the library go through the bucket (slice 2); moves and
-    // copies into or between libraries stay unavailable (copies are Task 7).
+    // Renames, moves and copies inside the library go through the bucket (slice 2); copies into
+    // it go through ShareCraft, their files staged for the worker; moves into or between
+    // libraries stay unavailable.
     row(Act::Rename, "PATCH /api/nodes/{id}", 200, Succeeds),
     row(Act::MoveWithin, "PATCH /api/nodes/{id}", 200, Succeeds),
     row(Act::MoveIn, "PATCH /api/nodes/{id}", 200, UNAVAILABLE),
     row(Act::MoveOut, "PATCH /api/nodes/{id}", 200, UNAVAILABLE),
-    row(Act::CopyIn, "POST /api/nodes/{id}/copy", 201, UNAVAILABLE),
+    row(Act::CopyIn, "POST /api/nodes/{id}/copy", 201, Succeeds),
     row(Act::CopyWithin, "POST /api/nodes/{id}/copy", 201, Succeeds),
     // Deletes move the objects into the library's holding folder (slice 2). The binned files
     // of the fixture were put in the bin by the listing, which holds nothing of them: they
@@ -788,7 +789,7 @@ const ROWS: &[Row] = &[
     row(Act::BulkMove, "POST /api/bulk", 200, Succeeds),
     row(Act::BulkMoveIn, "POST /api/bulk", 200, UNAVAILABLE),
     row(Act::BulkMoveOut, "POST /api/bulk", 200, UNAVAILABLE),
-    row(Act::BulkCopyIn, "POST /api/bulk", 200, UNAVAILABLE),
+    row(Act::BulkCopyIn, "POST /api/bulk", 200, Succeeds),
     row(Act::BulkDelete, "POST /api/bulk", 200, Succeeds),
     row(Act::BulkRestore, "POST /api/bulk", 200, UNAVAILABLE),
     row(
@@ -1445,7 +1446,11 @@ impl Env {
             Act::CopyIn => (
                 Method::POST,
                 format!("/api/nodes/{}/copy", fx.item("copy-in.txt")),
-                json!({ "parent": fx.docs }),
+                // A name of its own: a copy into a bucket never takes a taken name.
+                json!({
+                    "parent": fx.docs,
+                    "name": format!("copy-in-{}.txt", Uuid::new_v4().simple()),
+                }),
             ),
             Act::CopyWithin => (
                 Method::POST,
@@ -1796,10 +1801,23 @@ async fn every_guarded_route_follows_its_s3_read_write_decision() {
             assert_eq!(status, StatusCode::OK, "restore as {who}: {body}");
             assert!(body["renamed"].is_null(), "restore as {who}: {body}");
         }
+        // The bulk copy names no name: its original takes a new one, so the next person's copy
+        // is not refused as taken.
+        let (status, body) = env
+            .call(
+                user,
+                Method::PATCH,
+                &format!("/api/nodes/{}", fx.item("bulk-copy-in.txt")),
+                Some(json!({
+                    "name": format!("bulk-copy-in-{}.txt", Uuid::new_v4().simple()),
+                })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "rename as {who}: {body}");
     }
-    // Nothing but the uploads, new folders and saves, the renames, moves and copies inside the library,
-    // and the deletes into its holding folder and the restores out of it reached the bucket
-    // (the finished sessions' files go to the library's top).
+    // Nothing but the uploads, new folders and saves, the copies into the library, the renames,
+    // moves and copies inside it, and the deletes into its holding folder and the restores out
+    // of it reached the bucket (the finished sessions' files go to the library's top).
     let deleted = [
         "docs/delete-me.txt",
         "docs/bulk-delete.txt",
@@ -1849,6 +1867,8 @@ async fn every_guarded_route_follows_its_s3_read_write_decision() {
                 || key.starts_with("docs/New folder ")
                 || key == "docs/replace-me.txt"
                 || key == "docs/sheet.xlsx"
+                || key.starts_with("docs/copy-in-")
+                || key.starts_with("docs/bulk-copy-in")
                 // The restored folder's marker: it had none.
                 || key == "doomed/",
             "{key}"
