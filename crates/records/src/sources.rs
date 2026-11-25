@@ -2337,14 +2337,21 @@ async fn disconnect_in(
     let Some((token, webhook, site)) = row else {
         return Ok(Vec::new());
     };
-    let pending: i64 =
-        sqlx::query_scalar("select count(*) from source_writes where library_id = $1")
-            .bind(library.0)
-            .fetch_one(&mut *conn)
-            .await?;
+    let pending: i64 = sqlx::query_scalar(
+        "select (select count(*) from source_writes where library_id = $1) \
+                  + (select count(*) from source_multipart where library_id = $1)",
+    )
+    .bind(library.0)
+    .fetch_one(&mut *conn)
+    .await?;
     if pending > 0 {
         return Err(AccessError::WritesPending);
     }
+    // What the library holds is forgotten with the connection; the objects stay in the bucket.
+    sqlx::query("delete from source_held where library_id = $1")
+        .bind(library.0)
+        .execute(&mut *conn)
+        .await?;
     sqlx::query("delete from source_items where library_id = $1")
         .bind(library.0)
         .execute(&mut *conn)

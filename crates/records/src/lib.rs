@@ -100,7 +100,9 @@ pub use sites::{
     SiteChange, SiteKind, SiteSettings, SiteState, TemplateRow, validate_description,
     validate_language, validate_time_zone,
 };
-pub use source_writes::{COALESCE, NewPendingWrite, PendingState, PendingWrite, WriteState};
+pub use source_writes::{
+    COALESCE, Held, NewPendingWrite, OpenMultipart, PendingState, PendingWrite, WriteState,
+};
 pub use sources::{
     Budget, DEFAULT_SOURCE_MAX_BYTES, DEFAULT_SOURCE_MAX_FILES, ExternalEntry, ExternalItem,
     MAX_POLL_SECONDS, MAX_SOURCE_ERROR_CHARS, MIN_POLL_SECONDS, NewSource, S3Place,

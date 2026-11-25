@@ -859,6 +859,20 @@ pub(crate) async fn purge_site_rows(
     .execute(&mut *conn)
     .await?;
     sqlx::query(
+        "delete from source_held where entry_id in (select id from nodes where site_id = $1) \
+            or library_id in (select id from nodes where site_id = $1 and kind = 'library')",
+    )
+    .bind(site.0)
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query(
+        "delete from source_multipart where node_id in (select id from nodes where site_id = $1) \
+            or library_id in (select id from nodes where site_id = $1 and kind = 'library')",
+    )
+    .bind(site.0)
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query(
         "delete from source_items where library_id in \
              (select id from nodes where site_id = $1 and kind = 'library')",
     )
