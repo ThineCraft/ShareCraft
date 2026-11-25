@@ -52,6 +52,21 @@
    <div id="hero-slot" class="slot-grid" role="group" aria-labelledby="hero-heading" aria-describedby="hero-note"></div>
    <small id="hero-note" class="meta">While someone is in this library, it slides in over the site's banner picture. A site whose header has no banner picture shows none. Choosing or removing it is saved at once.</small>
   </div>
+  <div id="hero-framer" class="field framer" hidden>
+   <span class="label" id="framer-heading">Banner position and size</span>
+   <div id="framer-stage" class="framer-stage" tabindex="0" role="group" aria-labelledby="framer-heading" aria-describedby="framer-help">
+    <img id="framer-picture" alt="" draggable="false">
+    <div id="framer-window" class="framer-window" aria-hidden="true"></div>
+   </div>
+   <div class="framer-controls">
+    <label for="framer-zoom">Size</label>
+    <input id="framer-zoom" type="range" min="100" max="400" step="5" value="100">
+    <output id="framer-zoom-text" for="framer-zoom">100%</output>
+    <button type="button" id="framer-reset" class="ghost small">Centre it again</button>
+   </div>
+   <small id="framer-help" class="meta">The bright box is the part of the picture the header shows. Drag it, or select the picture and use the arrow keys, to choose that part. Make the picture bigger to show less of it. Narrower screens show less at the sides. Changes are saved as you make them.</small>
+   <p id="framer-saved" role="status" class="msg ok"></p>
+  </div>
   <section aria-labelledby="effective-heading">
    <h2 id="effective-heading">What the library takes now</h2>
    <ul id="effective" class="list"></ul>

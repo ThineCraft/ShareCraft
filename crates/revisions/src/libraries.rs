@@ -107,6 +107,40 @@ pub struct LibraryRecord {
     /// template carries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hero_image: Option<crate::brand::ImageRef>,
+    /// Where the hero image sits in the header and how large; `None` for the middle at its
+    /// smallest. Chosen afresh with each new hero image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hero_frame: Option<HeroFrame>,
+}
+
+/// The lowest `zoom` of a [`HeroFrame`], in percent: the picture just covers the header.
+pub const HERO_ZOOM_MIN: u16 = 100;
+/// The highest `zoom` of a [`HeroFrame`], in percent.
+pub const HERO_ZOOM_MAX: u16 = 400;
+/// The highest `x` and `y` of a [`HeroFrame`].
+pub const HERO_POINT_MAX: u16 = 1000;
+
+/// How a hero image is framed in the header: the point of the picture kept in view (`x`
+/// across and `y` down, each in thousandths of the picture, 0 to 1000) and how far it is
+/// enlarged beyond just covering the header (`zoom`, 100 to 400 percent). The picture covers
+/// the header, placed so that the point sits as far across and down the header as it is
+/// across and down the picture, then is enlarged around it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HeroFrame {
+    pub x: u16,
+    pub y: u16,
+    pub zoom: u16,
+}
+
+impl HeroFrame {
+    /// Whether every value is in its range.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        self.x <= HERO_POINT_MAX
+            && self.y <= HERO_POINT_MAX
+            && (HERO_ZOOM_MIN..=HERO_ZOOM_MAX).contains(&self.zoom)
+    }
 }
 
 impl LibraryRecord {
@@ -123,6 +157,7 @@ impl LibraryRecord {
             blocked_types: fields.blocked_types,
             max_file_bytes: fields.max_file_bytes,
             hero_image: None,
+            hero_frame: None,
         }
     }
 
@@ -256,6 +291,7 @@ mod tests {
             blocked_types: vec![".tar.gz".into()],
             max_file_bytes: Some(10_485_760),
             hero_image: None,
+            hero_frame: None,
         };
         let text = String::from_utf8(file_bytes(&record).unwrap()).unwrap();
         let expected = r#"{

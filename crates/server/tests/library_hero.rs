@@ -149,6 +149,17 @@ async fn library_hero_image_chosen_kept_and_released() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["hero_image"], Value::Null);
+    // No frame without a picture.
+    let (status, body) = call(
+        &first,
+        &root,
+        Method::PATCH,
+        &format!("/api/libraries/{shown}"),
+        Some(json!({ "hero_frame": { "x": 500, "y": 500, "zoom": 100 } })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["reason"], "invalid_hero_frame");
 
     // Chosen from a document of the site: answered with the library, kept in Git, pinned under
     // the library's id and served at the brand image route.
@@ -168,11 +179,12 @@ async fn library_hero_image_chosen_kept_and_released() {
     assert_eq!(record.kind, "image");
     assert_eq!(pin_owners(&db, &sha(&wide)).await, vec![shown.clone()]);
     assert_eq!(image_status(&first, &root, &url).await, StatusCode::OK);
-    // Its banner-sized picture: a JPEG, no larger than it needs to be (this one is 4:1 and
-    // narrower than 2400, so as wide and high as it is); any other size is refused.
+    // Its banner-sized picture: a JPEG, the whole picture, no larger than it needs to be (this
+    // one is narrower than 2400, so as wide and high as it is); any other size is refused,
+    // `banner` (which once answered a picture cut to 2:1) too.
     let response = first
         .http(Some(&root))
-        .get(first.url(&format!("{url}?size=banner")))
+        .get(first.url(&format!("{url}?size=header")))
         .send()
         .await
         .unwrap();
@@ -181,14 +193,62 @@ async fn library_hero_image_chosen_kept_and_released() {
     let bytes = response.bytes().await.unwrap();
     let banner = image::load_from_memory(&bytes).unwrap();
     assert_eq!((banner.width(), banner.height()), (1200, 300));
-    assert_eq!(
-        image_status(&first, &root, &format!("{url}?size=huge")).await,
-        StatusCode::BAD_REQUEST
-    );
+    for size in ["huge", "banner"] {
+        assert_eq!(
+            image_status(&first, &root, &format!("{url}?size={size}")).await,
+            StatusCode::BAD_REQUEST
+        );
+    }
     // Kept as it is; the same answer.
     let (status, again) = hero(&first, &root, &shown, json!({ "keep": sha(&wide) })).await;
     assert_eq!(status, StatusCode::OK, "{again}");
     assert_eq!(again["hero_image"], body["hero_image"]);
+    assert_eq!(again["hero_frame"], Value::Null);
+
+    // Framed: moved and enlarged, answered and kept in Git; out of range refused.
+    let frame = json!({ "x": 200, "y": 850, "zoom": 150 });
+    let (status, body) = call(
+        &first,
+        &root,
+        Method::PATCH,
+        &format!("/api/libraries/{shown}"),
+        Some(json!({ "hero_frame": frame })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["hero_frame"], frame);
+    let record = store
+        .read_library_record(Uuid::parse_str(&shown).unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        record.hero_frame,
+        Some(revisions::HeroFrame {
+            x: 200,
+            y: 850,
+            zoom: 150
+        })
+    );
+    for wrong in [
+        json!({ "x": 1001, "y": 0, "zoom": 100 }),
+        json!({ "x": 0, "y": 0, "zoom": 99 }),
+        json!({ "x": 0, "y": 0, "zoom": 401 }),
+    ] {
+        let (status, body) = call(
+            &first,
+            &root,
+            Method::PATCH,
+            &format!("/api/libraries/{shown}"),
+            Some(json!({ "hero_frame": wrong })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["reason"], "invalid_hero_frame");
+    }
+    // Keeping the same picture keeps its frame.
+    let (status, body) = hero(&first, &root, &shown, json!({ "keep": sha(&wide) })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["hero_frame"], frame);
 
     // Who may not change the library may not choose it; nor a document that is not an image,
     // nor a slot that names two ways.
@@ -231,6 +291,8 @@ async fn library_hero_image_chosen_kept_and_released() {
     let (status, body) = hero(&first, &root, &shown, json!({ "doc": other })).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["hero_image"]["sha256"], sha(&tall));
+    // A new picture starts in the middle at its smallest.
+    assert_eq!(body["hero_frame"], Value::Null);
     assert!(pin_owners(&db, &sha(&wide)).await.is_empty());
     assert_eq!(
         image_status(&first, &root, &url).await,

@@ -7,7 +7,7 @@ use std::collections::HashSet;
 
 use collab_core::ids::{DocId, NodeId, UserId};
 use revisions::brand::ImageRef;
-use revisions::{LIBRARY_SCHEMA, LibraryFields, LibraryRecord, MAX_DESCRIPTION_CHARS};
+use revisions::{HeroFrame, LIBRARY_SCHEMA, LibraryFields, LibraryRecord, MAX_DESCRIPTION_CHARS};
 use sqlx::postgres::PgRow;
 use sqlx::{PgConnection, Row};
 use uuid::Uuid;
@@ -32,8 +32,8 @@ const MAX_EXTENSION_CHARS: usize = 20;
 const CHECK_VIOLATION: &str = "23514";
 
 /// The columns of a `libraries` row as [`settings_from_row`] reads them.
-const LIBRARY_COLUMNS: &str =
-    "id, kind, description, folders, allowed_types, blocked_types, max_file_bytes, hero_image";
+const LIBRARY_COLUMNS: &str = "id, kind, description, folders, allowed_types, blocked_types, \
+     max_file_bytes, hero_image, hero_frame";
 
 /// A file in one of a site's template libraries: a "New from template" choice for whoever may
 /// view it and its content is available (the caller judges both).
@@ -107,6 +107,9 @@ pub struct LibrarySettings {
     /// The image shown in place of the site header's banner image on its pages, if any. It
     /// pins its content (`brand_refs` rows owned by the library's id).
     pub hero_image: Option<ImageRef>,
+    /// Where the hero image sits in the header and how large; `None` for the middle at its
+    /// smallest.
+    pub hero_frame: Option<HeroFrame>,
 }
 
 impl LibrarySettings {
@@ -123,6 +126,7 @@ impl LibrarySettings {
             blocked_types: Vec::new(),
             max_file_bytes: None,
             hero_image: None,
+            hero_frame: None,
         }
     }
 
@@ -138,6 +142,7 @@ impl LibrarySettings {
             blocked_types: record.blocked_types.clone(),
             max_file_bytes: record.max_file_bytes,
             hero_image: record.hero_image.clone(),
+            hero_frame: record.hero_frame,
         })
     }
 
@@ -156,6 +161,7 @@ impl LibrarySettings {
             },
         );
         record.hero_image = self.hero_image.clone();
+        record.hero_frame = self.hero_frame;
         record
     }
 
@@ -251,6 +257,11 @@ pub fn validate_library_settings(record: &LibraryRecord, admin: bool) -> Result<
     {
         return refuse("invalid_max_file_bytes");
     }
+    if let Some(frame) = &record.hero_frame
+        && (record.hero_image.is_none() || !frame.is_valid())
+    {
+        return refuse("invalid_hero_frame");
+    }
     if kind == LibraryKind::Asset && !admin {
         return Err(AccessError::Forbidden);
     }
@@ -288,6 +299,11 @@ fn settings_from_row(row: &PgRow) -> Result<LibrarySettings, sqlx::Error> {
         .map(serde_json::from_value::<ImageRef>)
         .transpose()
         .map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
+    let frame: Option<serde_json::Value> = row.try_get("hero_frame")?;
+    let hero_frame = frame
+        .map(serde_json::from_value::<HeroFrame>)
+        .transpose()
+        .map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
     Ok(LibrarySettings {
         id: NodeId(row.try_get("id")?),
         kind: LibraryKind::parse(&kind)
@@ -298,6 +314,7 @@ fn settings_from_row(row: &PgRow) -> Result<LibrarySettings, sqlx::Error> {
         blocked_types: row.try_get("blocked_types")?,
         max_file_bytes: bytes.map(|b| u64::try_from(b).unwrap_or(0)),
         hero_image,
+        hero_frame,
     })
 }
 
@@ -326,12 +343,13 @@ pub(crate) async fn upsert_library(
         .transpose()?;
     let result = sqlx::query(
         "insert into libraries (id, kind, description, folders, allowed_types, blocked_types, \
-             max_file_bytes, hero_image) \
-         values ($1, $2, $3, $4, $5, $6, $7, $8) \
+             max_file_bytes, hero_image, hero_frame) \
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
          on conflict (id) do update set kind = excluded.kind, \
              description = excluded.description, folders = excluded.folders, \
              allowed_types = excluded.allowed_types, blocked_types = excluded.blocked_types, \
-             max_file_bytes = excluded.max_file_bytes, hero_image = excluded.hero_image",
+             max_file_bytes = excluded.max_file_bytes, hero_image = excluded.hero_image, \
+             hero_frame = excluded.hero_frame",
     )
     .bind(settings.id.0)
     .bind(settings.kind.as_str())
@@ -343,6 +361,14 @@ pub(crate) async fn upsert_library(
     .bind(
         settings
             .hero_image
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|_| AccessError::InvalidLibrarySettings("refused"))?,
+    )
+    .bind(
+        settings
+            .hero_frame
             .as_ref()
             .map(serde_json::to_value)
             .transpose()

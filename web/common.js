@@ -1523,7 +1523,7 @@ export function brandImageHref(url) {
  * draft's document in Change the look).
  */
 export function bannerSrc(url) {
-  return brandImageHref(url) ? `${url}?size=banner` : url;
+  return brandImageHref(url) ? `${url}?size=header` : url;
 }
 
 /** ShareCraft's own tab icon, the account bar's mark. */
@@ -1850,7 +1850,7 @@ function sideBySide(page, chrome, vertical) {
  * across the top.
  * The focused editor frame passes `navigation: false`: no navigation row under its bar (the way
  * back and the command palette reach the site instead).
- * A page in a library passes `hero: {library, url}` (`url` the library's banner picture or
+ * A page in a library passes `hero: {library, url, frame}` (`url` the library's banner picture or
  * null): where the header shows a banner picture, the library's slides in over it, and on the
  * next page of the site outside the library it slides back out (see hero.js).
  * `currentId` is marked as the current page. Answers `{ site, navigation, look }`, each null
@@ -1905,7 +1905,7 @@ export async function siteChrome(siteId, { currentId, place, footer = false, fra
     // The heights the header and navigation took, so that the next visit reserves them (skeleton.js).
     rememberChrome();
     // A library's banner picture slides in over the site's, and back out on leaving (hero.js).
-    showHero(header, { site: siteId, library: hero?.library ?? null, url: hero?.url ?? null });
+    showHero(header, { site: siteId, library: hero?.library ?? null, url: hero?.url ?? null, frame: hero?.frame ?? null });
   }
   return shown;
 }
@@ -2454,6 +2454,7 @@ const LIBRARY_REASONS = Object.assign(Object.create(null), {
   no_types: 'List at least one allowed type, or leave the field empty to allow every type.',
   not_an_image_type: 'An image library accepts only image types (.png .jpg .jpeg .gif .webp .svg .avif .bmp .tif .tiff .heic).',
   invalid_max_file_bytes: 'The largest file must be more than 0 MB.',
+  invalid_hero_frame: 'The banner position could not be kept. Choose the banner picture again, then move it.',
 });
 
 /** The sentence for an `invalid_library_settings` refusal's `reason`. */

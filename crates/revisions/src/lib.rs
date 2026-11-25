@@ -23,7 +23,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 pub use blobs::{BlobError, BlobRef, BlobStore, Content, hex, parse_hex};
-pub use libraries::{LIBRARY_KINDS, LIBRARY_SCHEMA, LibraryFields, LibraryRecord};
+pub use libraries::{
+    HERO_POINT_MAX, HERO_ZOOM_MAX, HERO_ZOOM_MIN, HeroFrame, LIBRARY_KINDS, LIBRARY_SCHEMA,
+    LibraryFields, LibraryRecord,
+};
 pub use meta::{Author, Meta};
 pub use sites::{
     HubRecord, MAX_DESCRIPTION_CHARS, MAX_TEMPLATE_NAME_CHARS, NavItem, NavTarget, OrgNavigation,

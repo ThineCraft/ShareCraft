@@ -1680,7 +1680,7 @@ test('header_view_for_each_layout', () => {
     const image = byClass(band, 'band-image')[0];
     assert.equal(image.tag, 'img');
     // Drawn from the server's banner-sized picture.
-    assert.equal(image.attributes.src, `${OTHER_IMAGE}?size=banner`);
+    assert.equal(image.attributes.src, `${OTHER_IMAGE}?size=header`);
     assert.equal(image.attributes.alt, '');
     assert.equal(byClass(band, 'band-shade').length, 1);
     // Only an extended header has an image or an alignment.

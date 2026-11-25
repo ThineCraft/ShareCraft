@@ -47,6 +47,9 @@ pub struct LibraryEdit {
     /// The hero image, already chosen (see [`crate::looks::hero_image`]); `Some(None)` for
     /// none.
     pub hero_image: Option<Option<revisions::brand::ImageRef>>,
+    /// How the hero image is framed; `Some(None)` for the middle at its smallest. A new hero
+    /// image given without it starts at the middle at its smallest.
+    pub hero_frame: Option<Option<revisions::HeroFrame>>,
 }
 
 /// What a reconcile of the library records did.
@@ -268,7 +271,15 @@ pub async fn change(
             json!(name(&after.hero_image)),
             json!(name(&hero)),
         );
+        if after.hero_image.as_ref().map(|i| &i.sha256) != hero.as_ref().map(|i| &i.sha256) {
+            note("hero_frame", json!(after.hero_frame), Value::Null);
+            after.hero_frame = None;
+        }
         after.hero_image = hero;
+    }
+    if let Some(frame) = edit.hero_frame {
+        note("hero_frame", json!(after.hero_frame), json!(frame));
+        after.hero_frame = frame;
     }
     // Only administrators set the asset kind, or change a library away from it; the other
     // settings of an asset library are its managers' to change.

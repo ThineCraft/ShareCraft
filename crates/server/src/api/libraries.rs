@@ -30,9 +30,10 @@ where
 
 /// A library with its settings, as its routes answer it: `{id, name, site, kind, description,
 /// folders, allowed_types, blocked_types, max_file_bytes, effective_allowed_types,
-/// hero_image}`, where `effective_allowed_types` is what it accepts in effect (for an image
+/// hero_image, hero_frame}`, where `effective_allowed_types` is what it accepts in effect (for an image
 /// library with no list of its own, the image types; `null` for every type) and `hero_image`
-/// is `{url, name, sha256, width?, height?}` or `null`.
+/// is `{url, name, sha256, width?, height?}` or `null`, and `hero_frame` `{x, y, zoom}` (see
+/// [`revisions::HeroFrame`]) or `null` for the middle at its smallest.
 fn library_out(node: &Node, settings: &LibrarySettings) -> Value {
     json!({
         "id": node.id.0.to_string(),
@@ -52,6 +53,7 @@ fn library_out(node: &Node, settings: &LibrarySettings) -> Value {
             "width": image.width,
             "height": image.height,
         })),
+        "hero_frame": settings.hero_frame,
     })
 }
 
@@ -84,15 +86,21 @@ pub(crate) struct LibraryChangeBody {
     /// `{doc}`, `{brand_image}` or `{keep}` as a look's image is chosen; `null` for none.
     #[serde(default, deserialize_with = "nullable")]
     hero_image: Option<Option<crate::looks::ImageSlot>>,
+    /// `{x, y, zoom}`; `null` for the middle at its smallest.
+    #[serde(default, deserialize_with = "nullable")]
+    hero_frame: Option<Option<revisions::HeroFrame>>,
 }
 
 /// `PATCH /api/libraries/{id} {description?, kind?, folders?, allowed_types?, blocked_types?,
-/// max_file_bytes?, hero_image?}`: changes the library's kind and settings, with `manage_site`
+/// max_file_bytes?, hero_image?, hero_frame?}`: changes the library's kind and settings, with `manage_site`
 /// on it (the kind `asset`, or a change away from it, needs an administrator too): one commit,
 /// recorded as `library.changed`. Answers the library as it then is. `422
 /// invalid_library_settings` with the `reason` for settings that break a rule; `403 archived`
 /// on an archived site. The hero image is chosen as a site look's header image is (see
-/// [`crate::looks::hero_image`]), with that route's refusals; `null` takes it away.
+/// [`crate::looks::hero_image`]), with that route's refusals; `null` takes it away. A new hero
+/// image starts framed at the middle at its smallest unless `hero_frame` is given with it; a
+/// frame with no hero image, or out of range, is `422 invalid_library_settings` with the
+/// `reason` `invalid_hero_frame`.
 pub(crate) async fn change(
     State(state): State<AppState>,
     signed: Signed,
@@ -122,6 +130,7 @@ pub(crate) async fn change(
     };
     let edit = LibraryEdit {
         hero_image,
+        hero_frame: body.hero_frame,
         description: body.description,
         kind: body.kind,
         folders: body.folders,

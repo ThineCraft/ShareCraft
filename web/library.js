@@ -144,7 +144,7 @@ showPlace();
 await siteChrome(here.path[0].id, {
   currentId: libraryStep?.id,
   footer: true,
-  hero: libraryStep ? { library: libraryStep.id, url: library?.hero_image?.url ?? null } : null,
+  hero: libraryStep ? { library: libraryStep.id, url: library?.hero_image?.url ?? null, frame: library?.hero_frame ?? null } : null,
 });
 
 $('bin-link').href = `/bin.html?site=${seg(here.path[0].id)}`;

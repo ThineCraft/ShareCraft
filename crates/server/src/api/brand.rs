@@ -475,11 +475,12 @@ pub(crate) async fn set_managers(
 /// a site's look names; `423 held {scan}` once the content is not available (a rescan found it
 /// infected, say).
 ///
-/// With `?size=banner` a PNG, JPEG or WebP is answered as a site header's banner picture
-/// instead: at most 2400 pixels wide and at most half as high, its middle kept, upright, made
+/// With `?size=header` a PNG, JPEG or WebP is answered as a site header's banner picture
+/// instead: the whole picture, upright, at most 2400 pixels wide and high, made
 /// the first time it is asked for and kept beside the content (see
 /// [`crate::previews::ThumbSize::Banner`]). Any other image, or one no banner can be made of
-/// (or none in time), is answered as it is. Any other `size` is `400 bad_request`.
+/// (or none in time), is answered as it is. Any other `size` is `400 bad_request` (`banner`
+/// too: it answered a picture cut to 2:1, which browsers keep as immutable).
 pub(crate) async fn image(
     State(state): State<AppState>,
     MaybeSigned(signed): MaybeSigned,
@@ -488,7 +489,7 @@ pub(crate) async fn image(
 ) -> Result<Response, ApiError> {
     let banner = match super::content::query_of(query)?.size.as_deref() {
         None => false,
-        Some("banner") => true,
+        Some("header") => true,
         Some(_) => return Err(ApiError::BadRequest),
     };
     serve(&state, signed.is_some(), &sha256, Served::Image { banner }).await
@@ -497,7 +498,7 @@ pub(crate) async fn image(
 /// Query of `GET /api/brand/images/{sha256}`.
 #[derive(Deserialize)]
 pub(crate) struct ImageQuery {
-    /// `banner` for the banner-sized picture.
+    /// `header` for the banner-sized picture.
     size: Option<String>,
 }
 

@@ -37,7 +37,8 @@ pub const THUMBNAIL_SIDE: u32 = 256;
 pub const LARGE_THUMBNAIL_SIDE: u32 = 720;
 /// The JPEG quality of a large thumbnail and of a banner.
 const LARGE_THUMBNAIL_QUALITY: u8 = 82;
-/// The width of a banner, at most: twice the width a site header is commonly drawn at.
+/// The width and the height of a banner, at most: twice the width a site header is commonly
+/// drawn at.
 pub const BANNER_WIDTH: u32 = 2400;
 
 /// Which thumbnail is asked for.
@@ -47,9 +48,10 @@ pub enum ThumbSize {
     Small,
     /// At most [`LARGE_THUMBNAIL_SIDE`]: a JPEG, or a PNG for a picture with transparency.
     Large,
-    /// A site header's banner picture: at most [`BANNER_WIDTH`] wide and at most half as high
-    /// as it is wide (the middle kept, as the header's `object-fit: cover` shows it: the header
-    /// is always wider than 2:1); a JPEG, or a PNG for a picture with transparency.
+    /// A site header's banner picture: the whole picture, upright, at most [`BANNER_WIDTH`]
+    /// wide and high (a library's banner picture may be moved to show any part of it); a JPEG,
+    /// or a PNG for a picture with transparency. Kept as `<sha>.header.jpg`: the older
+    /// `<sha>.banner.jpg` was cut to 2:1.
     Banner,
 }
 
@@ -243,8 +245,8 @@ pub fn thumb_paths(store: &BlobStore, sha256: &[u8; 32], size: ThumbSize) -> Vec
             thumb_dir_of(store, sha256, "720.png"),
         ],
         ThumbSize::Banner => vec![
-            thumb_dir_of(store, sha256, "banner.jpg"),
-            thumb_dir_of(store, sha256, "banner.png"),
+            thumb_dir_of(store, sha256, "header.jpg"),
+            thumb_dir_of(store, sha256, "header.png"),
         ],
     }
 }
@@ -439,7 +441,7 @@ fn make_thumbnail(
             LARGE_THUMBNAIL_QUALITY,
         ))?;
         match which {
-            ThumbSize::Banner => thumb_dir_of(store, sha256, "banner.jpg"),
+            ThumbSize::Banner => thumb_dir_of(store, sha256, "header.jpg"),
             _ => thumb_dir_of(store, sha256, "720.jpg"),
         }
     } else {
@@ -448,43 +450,23 @@ fn make_thumbnail(
         match which {
             ThumbSize::Small => thumb_path(store, sha256),
             ThumbSize::Large => thumb_dir_of(store, sha256, "720.png"),
-            ThumbSize::Banner => thumb_dir_of(store, sha256, "banner.png"),
+            ThumbSize::Banner => thumb_dir_of(store, sha256, "header.png"),
         }
     };
     keep(store, sha256, &path, &out)?;
     Ok(path)
 }
 
-/// `image` (as decoded, to be turned by `orientation`) as a banner: upright, at most
-/// [`BANNER_WIDTH`] wide (never enlarged), and cut to at most half as high as it is wide,
-/// keeping the middle.
+/// `image` (as decoded, to be turned by `orientation`) as a banner: the whole picture,
+/// upright, at most [`BANNER_WIDTH`] wide and high (never enlarged).
 fn banner(image: DynamicImage, orientation: Orientation) -> DynamicImage {
-    // Turned a quarter, its height now is its width once upright.
-    let turned = matches!(
-        orientation,
-        Orientation::Rotate90
-            | Orientation::Rotate270
-            | Orientation::Rotate90FlipH
-            | Orientation::Rotate270FlipH
-    );
-    let (most_wide, most_high) = if turned {
-        (MAX_IMAGE_SIDE, BANNER_WIDTH)
-    } else {
-        (BANNER_WIDTH, MAX_IMAGE_SIDE)
-    };
-    let mut small = if image.width() > most_wide || image.height() > most_high {
-        image.thumbnail(most_wide, most_high)
+    let mut small = if image.width() > BANNER_WIDTH || image.height() > BANNER_WIDTH {
+        image.thumbnail(BANNER_WIDTH, BANNER_WIDTH)
     } else {
         image
     };
     small.apply_orientation(orientation);
-    let (width, height) = (small.width(), small.height());
-    let highest = (width / 2).max(1);
-    if height > highest {
-        small.crop_imm(0, height.saturating_sub(highest) / 2, width, highest)
-    } else {
-        small
-    }
+    small
 }
 
 /// Writes `bytes` to a temporary file beside the content store and renames it to `path`. A
@@ -558,6 +540,9 @@ pub fn erase_thumbnail(store: &BlobStore, sha256: &[u8; 32]) -> std::io::Result<
     let mut paths = thumb_paths(store, sha256, ThumbSize::Small);
     paths.extend(thumb_paths(store, sha256, ThumbSize::Large));
     paths.extend(thumb_paths(store, sha256, ThumbSize::Banner));
+    // Banners kept before they were whole pictures.
+    paths.push(thumb_dir_of(store, sha256, "banner.jpg"));
+    paths.push(thumb_dir_of(store, sha256, "banner.png"));
     paths.push(thumb_dir_of(store, sha256, "png"));
     paths.push(no_thumb_path(store, sha256));
     paths.push(crate::photos::facts_path(store, sha256));
@@ -794,22 +779,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn banners_are_upright_at_most_2400_wide_and_half_as_high() {
+    fn banners_are_whole_upright_pictures_at_most_2400_on_a_side() {
         let size = |image: DynamicImage| (image.width(), image.height());
-        // A tall photo: shrunk to the width, the middle kept.
+        // A tall photo: shrunk to the height, nothing cut.
         let tall = DynamicImage::new_rgb8(3000, 4000);
-        assert_eq!(size(banner(tall, Orientation::NoTransforms)), (2400, 1200));
+        assert_eq!(size(banner(tall, Orientation::NoTransforms)), (1800, 2400));
         // Stored on its side, upright 3000 by 4000: the same.
         let turned = DynamicImage::new_rgb8(4000, 3000);
-        assert_eq!(size(banner(turned, Orientation::Rotate90)), (2400, 1200));
-        // Wide already: only shrunk.
+        assert_eq!(size(banner(turned, Orientation::Rotate90)), (1800, 2400));
+        // Wide: shrunk to the width.
         let wide = DynamicImage::new_rgb8(6000, 1000);
         assert_eq!(size(banner(wide, Orientation::NoTransforms)), (2400, 400));
-        // Small: never enlarged, still cut to 2:1.
+        // Small: never enlarged.
         let small = DynamicImage::new_rgb8(300, 300);
-        assert_eq!(size(banner(small, Orientation::NoTransforms)), (300, 150));
-        let strip = DynamicImage::new_rgb8(300, 100);
-        assert_eq!(size(banner(strip, Orientation::NoTransforms)), (300, 100));
+        assert_eq!(size(banner(small, Orientation::NoTransforms)), (300, 300));
     }
 
     #[test]

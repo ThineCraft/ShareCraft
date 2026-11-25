@@ -27,6 +27,7 @@ import {
   siteChrome,
   typeListText,
 } from './common.js';
+import { applyHeroFrame, heroFrame, heroWindow, HERO_FRAME_DEFAULT, HERO_ZOOM_MAX, HERO_ZOOM_MIN, moveHeroFrame, sameFrame } from './hero.js';
 import { pickImage } from './image-picker.js';
 import { studioLimits } from './look-studio.js';
 import {
@@ -68,13 +69,21 @@ if (self.kind !== 'library') {
 const first = await api('GET', `/libraries/${seg(libraryId)}`);
 await siteChrome(here.path[0].id, {
   currentId: libraryId,
-  hero: { library: libraryId, url: first.ok ? (first.data.hero_image?.url ?? null) : null },
+  hero: {
+    library: libraryId,
+    url: first.ok ? (first.data.hero_image?.url ?? null) : null,
+    frame: first.ok ? (first.data.hero_frame ?? null) : null,
+  },
 });
 if (!can(here.access, 'manage_site')) fail('Only the owners of this site can change the settings of its libraries.');
 if (!first.ok) fail(first.status === 404 ? MISSING : messageFor(first.error));
 let library = first.data;
 /** The brand centre (its images and limits), fetched once when the banner picture picker first opens. */
 let brand = null;
+/** The banner picture's framing as shown in the framer, and the saving of it (one at a time). */
+let framing = { ...HERO_FRAME_DEFAULT };
+let frameSaveTimer = 0;
+let frameSaving = Promise.resolve();
 show(library);
 $('settings').hidden = false;
 
@@ -112,6 +121,7 @@ function show(settings) {
   $('max-mb').value = megabytesText(settings.max_file_bytes);
   showEffective(settings);
   showHero(settings.hero_image ?? null);
+  showFramer(settings.hero_image ?? null, settings.hero_frame ?? null);
 }
 
 
@@ -163,9 +173,136 @@ async function saveHero(slot) {
   showMessage($('saved'), '');
   const result = await api('PATCH', `/libraries/${seg(libraryId)}`, { hero_image: slot });
   if (!result.ok) return showMessage(error, messageFor(result.error));
-  library = { ...library, hero_image: result.data.hero_image ?? null };
+  library = { ...library, hero_image: result.data.hero_image ?? null, hero_frame: result.data.hero_frame ?? null };
   showHero(library.hero_image);
+  showFramer(library.hero_image, library.hero_frame);
+  // The header at the top shows the new picture from the next page on; its framing at once.
+  applyHeroFrame(liveHero(), library.hero_frame);
   showMessage($('saved'), slot ? 'Banner picture saved.' : 'Banner picture removed.');
+}
+
+/** The library's banner picture drawn in the site header at the top of this page, if any. */
+function liveHero() {
+  return document.querySelector('.site-header .band-hero');
+}
+
+/**
+ * The size of the header the picture is framed for: the site header at the top of this page
+ * where it shows a banner picture, else a common desktop header (1200 by 160).
+ */
+function headerBox() {
+  const header = document.querySelector('.site-header');
+  const rect = header?.querySelector('.band-image') ? header.getBoundingClientRect() : null;
+  return rect && rect.width > 0 && rect.height > 0 ? { width: rect.width, height: rect.height } : { width: 1200, height: 160 };
+}
+
+/** The framer for `image` (hidden without one), framed by `frame`. */
+function showFramer(image, frame) {
+  const url = brandImageHref(image?.url) ? bannerSrc(image.url) : null;
+  $('hero-framer').hidden = url === null;
+  if (url === null) return;
+  framing = heroFrame(frame);
+  const picture = $('framer-picture');
+  if (picture.getAttribute('src') !== url) {
+    picture.src = url;
+    picture.addEventListener('load', drawFramer, { once: true });
+  }
+  drawFramer();
+}
+
+/** Draws the bright box and the size from `framing`, and frames the header's picture alike. */
+function drawFramer() {
+  const picture = $('framer-picture');
+  $('framer-zoom').value = String(framing.zoom);
+  $('framer-zoom-text').textContent = `${framing.zoom}%`;
+  applyHeroFrame(liveHero(), framing);
+  if (!picture.naturalWidth || !picture.naturalHeight) return;
+  // The stage takes the picture's own shape, at most 280 pixels high.
+  $('framer-stage').style.setProperty('--ratio', String(picture.naturalWidth / picture.naturalHeight));
+  const shown = heroWindow(framing, headerBox(), { width: picture.naturalWidth, height: picture.naturalHeight });
+  const box = $('framer-window').style;
+  box.left = `${shown.left * 100}%`;
+  box.top = `${shown.top * 100}%`;
+  box.width = `${shown.width * 100}%`;
+  box.height = `${shown.height * 100}%`;
+}
+
+/** Takes `frame` as the framing, draws it, and saves it shortly after the last change. */
+function setFraming(frame) {
+  const next = heroFrame(frame);
+  if (sameFrame(next, framing)) return;
+  framing = next;
+  drawFramer();
+  showMessage($('framer-saved'), '');
+  clearTimeout(frameSaveTimer);
+  frameSaveTimer = setTimeout(saveFraming, 400);
+}
+
+/** Sends the framing as it now is (after any save already on its way) and says when it is kept. */
+function saveFraming() {
+  frameSaving = frameSaving.then(async () => {
+    const frame = { ...framing };
+    if (sameFrame(frame, library.hero_frame)) return;
+    showMessage(error, '');
+    const result = await api('PATCH', `/libraries/${seg(libraryId)}`, { hero_frame: frame });
+    if (!result.ok) {
+      const text =
+        result.error === 'invalid_library_settings' ? libraryReasonText(result.data?.reason) : messageFor(result.error);
+      return showMessage(error, text);
+    }
+    library = { ...library, hero_frame: result.data.hero_frame ?? null };
+    if (sameFrame(framing, frame)) showMessage($('framer-saved'), 'Banner position saved.');
+  });
+}
+
+/** Moves the bright box by `dx` and `dy` (fractions of the picture). */
+function moveFraming(dx, dy) {
+  const picture = $('framer-picture');
+  if (!picture.naturalWidth || !picture.naturalHeight) return;
+  setFraming(moveHeroFrame(framing, dx, dy, headerBox(), { width: picture.naturalWidth, height: picture.naturalHeight }));
+}
+
+{
+  const stage = $('framer-stage');
+  let last = null;
+  stage.addEventListener('pointerdown', (event) => {
+    if (event.button !== 0) return;
+    last = { x: event.clientX, y: event.clientY };
+    stage.setPointerCapture(event.pointerId);
+    stage.classList.add('dragging');
+    event.preventDefault();
+    stage.focus({ preventScroll: true });
+  });
+  stage.addEventListener('pointermove', (event) => {
+    if (!last) return;
+    const rect = $('framer-picture').getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return;
+    moveFraming((event.clientX - last.x) / rect.width, (event.clientY - last.y) / rect.height);
+    last = { x: event.clientX, y: event.clientY };
+  });
+  const stop = () => {
+    last = null;
+    stage.classList.remove('dragging');
+  };
+  stage.addEventListener('pointerup', stop);
+  stage.addEventListener('pointercancel', stop);
+  stage.addEventListener('keydown', (event) => {
+    const step = event.shiftKey ? 0.1 : 0.02;
+    const moves = { ArrowLeft: [-step, 0], ArrowRight: [step, 0], ArrowUp: [0, -step], ArrowDown: [0, step] };
+    if (moves[event.key]) {
+      event.preventDefault();
+      moveFraming(...moves[event.key]);
+    } else if (event.key === '+' || event.key === '=' || event.key === '-') {
+      event.preventDefault();
+      const zoom = framing.zoom + (event.key === '-' ? -10 : 10);
+      setFraming({ ...framing, zoom: Math.min(HERO_ZOOM_MAX, Math.max(HERO_ZOOM_MIN, zoom)) });
+    }
+  });
+  $('framer-zoom').addEventListener('input', () => setFraming({ ...framing, zoom: Number($('framer-zoom').value) }));
+  $('framer-reset').addEventListener('click', () => setFraming(HERO_FRAME_DEFAULT));
+  addEventListener('resize', () => {
+    if (!$('hero-framer').hidden) drawFramer();
+  });
 }
 
 /** What the library takes in effect, one line each (the kind's own list included). */

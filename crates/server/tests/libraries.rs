@@ -307,6 +307,7 @@ async fn old_library_reads_defaults_and_writes_on_first_change() {
             "max_file_bytes": null,
             "effective_allowed_types": null,
             "hero_image": null,
+            "hero_frame": null,
         })
     );
 
@@ -331,6 +332,7 @@ async fn old_library_reads_defaults_and_writes_on_first_change() {
             blocked_types: Vec::new(),
             max_file_bytes: None,
             hero_image: None,
+            hero_frame: None,
         }
     );
     // One commit, moving the sites ref and not the tree ref.
