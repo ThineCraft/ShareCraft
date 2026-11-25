@@ -977,6 +977,23 @@ async fn plan_purge_site(
     })
 }
 
+/// Purges the recycle bin entry `id`, with everything deleted with it, as the server and at any
+/// stage: for something the server itself made and must take back (a copy between libraries
+/// that failed part way), so its bytes are freed and nothing the person did not delete stays
+/// in the bin.
+///
+/// # Errors
+/// `NotFound` unless `id` is in the bin; `OutOfStep` while the tree needs repair; otherwise the
+/// Git or database error.
+pub(crate) async fn purge_now(state: &AppState, id: NodeId) -> Result<(), AccessError> {
+    let _turn = state.tree_lock().lock().await;
+    ensure_in_step(state).await?;
+    let plan = plan_purge(state, None, id).await?;
+    let done = commit(state, None, plan).await?;
+    erase_released(state, done).await;
+    Ok(())
+}
+
 /// Purges, as the server, every deleted site whose purge a stop interrupted, then every site
 /// deleted [`records::BIN_DAYS`] days or more before `now` (see [`purge_site`]), one at a time.
 /// Answers how many it purged; a failure is logged and the site left for the next sweep.

@@ -19,7 +19,7 @@ use std::time::Duration;
 use collab_core::ids::NodeId;
 use common::fake_s3::{FakeS3, Stored};
 use common::{TestServer, TestUser, spawn_server_config_without_workers};
-use records::{Principal, S3_ENDPOINTS, WriteState};
+use records::{BinStage, Principal, S3_ENDPOINTS, WriteState};
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 use server::AppState;
@@ -831,4 +831,138 @@ async fn copying_out_over_the_site_quota_is_refused_before_anything_is_read() {
         .collect();
     assert!(!names.contains(&"a.txt".to_owned()), "{names:?}");
     assert!(!names.contains(&"docs".to_owned()), "{names:?}");
+}
+
+#[tokio::test]
+async fn copying_out_onto_a_taken_name_numbers_it_like_an_ordinary_copy() {
+    let env = Env::new().await;
+    env.fake.put(BUCKET, &key("docs/a.txt"), b"alpha");
+    let library = env.library("Numbered").await;
+    let docs = env.child(library, "docs").await;
+    let file = env.child(docs, "a.txt").await;
+
+    let (status, body) = env.copy(file, env.ordinary, None).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert!(body["renamed"].is_null(), "{body}");
+    // Taken now: numbered, and said so, as an ordinary copy is.
+    let (status, body) = env.copy(file, env.ordinary, None).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["node"]["name"], "a (2).txt", "{body}");
+    assert_eq!(
+        body["renamed"],
+        json!({ "from": "a.txt", "to": "a (2).txt" })
+    );
+    let second = id_of(&body["node"]);
+    assert_eq!(env.content(second).await, b"alpha");
+    // A folder too; and a name of its own, taken, is numbered the same way.
+    for _ in 0..2 {
+        let (status, body) = env.copy(docs, env.ordinary, None).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+    assert!(
+        env.children(env.ordinary)
+            .await
+            .iter()
+            .any(|(n, _)| n == "docs (2)")
+    );
+    let (status, body) = env.copy(file, env.ordinary, Some("a.txt")).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["node"]["name"], "a (3).txt", "{body}");
+    assert_eq!(body["renamed"]["from"], "a.txt", "{body}");
+    // The ordinary copy names it the same: the next free number.
+    let ordinary = env.upload(env.ordinary, "o.txt", b"o").await;
+    let (status, body) = env.copy(ordinary, env.ordinary, None).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["node"]["name"], "o (2).txt", "{body}");
+
+    // Into a bucket a taken name is still refused.
+    let other = env.library_at("Other", "team-two/", "read_write").await;
+    let (status, body) = env.copy(file, other, None).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let refused = env.copy(file, other, None).await;
+    assert_error(&refused, StatusCode::CONFLICT, "name_taken");
+}
+
+/// The entries of the site's recycle bin, both stages.
+async fn bin_entries(env: &Env) -> usize {
+    let mut count = 0;
+    for stage in [BinStage::First, BinStage::Second] {
+        let (entries, _) = env
+            .db()
+            .bin(env.owner.id, env.site, stage, None, 100)
+            .await
+            .unwrap();
+        count += entries.len();
+    }
+    count
+}
+
+#[tokio::test]
+async fn a_copy_out_that_fails_part_way_leaves_nothing_behind() {
+    let env = Env::new().await;
+    env.fake.put(BUCKET, &key("docs/a.txt"), b"alpha");
+    env.fake.put(BUCKET, &key("docs/b.txt"), b"bravo");
+    let library = env.library("Broken").await;
+    let docs = env.child(library, "docs").await;
+    // The second file's bytes stop part way.
+    env.fake.truncate_get(&key("docs/b.txt"), 2);
+    let usage = env.db().site_usage(env.site).await.unwrap();
+    let binned = bin_entries(&env).await;
+
+    let (status, body) = env.copy(docs, env.ordinary, None).await;
+    assert!(!status.is_success(), "{body}");
+    assert!(body["made"].is_null(), "{body}");
+    // What it made is gone, purged: not in the library, not in the bin, not counted.
+    assert!(
+        !env.children(env.ordinary)
+            .await
+            .iter()
+            .any(|(n, _)| n == "docs"),
+        "{:?}",
+        env.children(env.ordinary).await
+    );
+    assert_eq!(bin_entries(&env).await, binned);
+    let after = env.db().site_usage(env.site).await.unwrap();
+    assert_eq!((after.used, after.reserved), (usage.used, 0));
+}
+
+#[tokio::test]
+async fn a_copy_into_s3_that_fails_part_way_says_how_many_were_made() {
+    let env = Env::new().await;
+    env.fake.put(BUCKET, &key("docs/a.txt"), b"alpha");
+    env.fake.put(BUCKET, &key("docs/b.txt"), b"bravo");
+    let from = env.library("From").await;
+    let to = env.library_at("To", "team-two/", "read_write").await;
+    let docs = env.child(from, "docs").await;
+    env.fake.truncate_get(&key("docs/b.txt"), 2);
+
+    let (status, body) = env.copy(docs, to, None).await;
+    assert!(!status.is_success(), "{body}");
+    // The folder and its first file were made, and that file is an accepted save.
+    assert_eq!(body["made"], 2, "{body}");
+    assert_eq!(
+        body["message"],
+        "The copy stopped part way: 2 items were copied and are being saved to the storage; \
+         the rest were not copied.",
+        "{body}"
+    );
+    let top = env.child(to, "docs").await;
+    let a = env.child(top, "a.txt").await;
+    assert!(env.db().pending_write(a).await.unwrap().is_some());
+    assert_eq!(
+        env.children(top)
+            .await
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect::<Vec<_>>(),
+        ["a.txt"]
+    );
+    assert_eq!(env.write().await, 1);
+    assert_eq!(
+        env.fake
+            .object(BUCKET, "team-two/docs/a.txt")
+            .unwrap()
+            .bytes,
+        b"alpha"
+    );
 }

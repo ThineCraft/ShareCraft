@@ -938,20 +938,40 @@ pub(crate) async fn copy_checked(
     parent: NodeId,
     name: Option<String>,
 ) -> Result<Copied, ApiError> {
-    let copy = match copy_place(state.db(), actor.id, id, parent).await? {
+    let route = copy_place(state.db(), actor.id, id, parent).await?;
+    let copy = match route {
         CopyRoute::Ordinary => return copy_one(state, actor, id, parent, name).await,
         CopyRoute::Within => copy_within(state, actor, id, parent, name.as_deref()).await?,
         CopyRoute::Across => copy_across(state, actor, id, parent, name.as_deref()).await?,
     };
-    let node = state
-        .db()
+    let db = state.db();
+    let unavailable = |e: records::DbError| ApiError::unavailable(&e);
+    let node = db
         .node(copy)
         .await
-        .map_err(|e| ApiError::unavailable(&e))?
+        .map_err(unavailable)?
         .ok_or(ApiError::NotFound)?;
+    // A copy into an ordinary place is named as the ordinary copy names it: cleaned and
+    // numbered, and said so as it says so. Into a bucket the name is never changed.
+    let renamed = if route == CopyRoute::Across {
+        let asked = match name.as_deref() {
+            Some(name) => name.trim().to_owned(),
+            None => db
+                .node(id)
+                .await
+                .map_err(unavailable)?
+                .map_or_else(String::new, |original| original.name),
+        };
+        (asked != node.name).then(|| RenamedOut {
+            from: asked,
+            to: node.name.clone(),
+        })
+    } else {
+        None
+    };
     Ok(Copied {
         node: NodeOut::from(node),
-        renamed: None,
+        renamed,
     })
 }
 

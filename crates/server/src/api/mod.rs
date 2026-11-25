@@ -1035,10 +1035,7 @@ impl IntoResponse for ApiError {
             ApiError::SourceCopyIncomplete { made, .. } => json!({
                 "error": code,
                 "made": made,
-                "message": format!(
-                    "The copy stopped part way: {} items were copied and are being saved to the                      storage; the rest were not copied.",
-                    crate::source_write::thousands(made)
-                ),
+                "message": copy_incomplete_message(made),
             }),
             ApiError::S3NotWritable => json!({ "error": code, "message": S3_NOT_WRITABLE }),
             ApiError::ReadWriteAdminOnly => {
@@ -1076,6 +1073,20 @@ impl IntoResponse for ApiError {
         };
         (status, Json(body)).into_response()
     }
+}
+
+/// The plain sentence for a copy into S3 storage that stopped after `made` items.
+fn copy_incomplete_message(made: u64) -> String {
+    if made == 1 {
+        return "The copy stopped part way: 1 item was copied and is being saved to the storage; \
+                the rest were not copied."
+            .to_owned();
+    }
+    format!(
+        "The copy stopped part way: {} items were copied and are being saved to the storage; \
+         the rest were not copied.",
+        crate::source_write::thousands(made)
+    )
 }
 
 /// The plain sentence for a file over the limit of one write to S3 storage: `limit` is said

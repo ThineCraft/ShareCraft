@@ -2466,6 +2466,44 @@ fn across_paths(plan: &AcrossPlan, top: &str) -> Vec<String> {
     paths
 }
 
+/// The name a copy of `item` into the ordinary place `parent` takes, asked as `asked`: as the
+/// ordinary copy names it (see `tree::plan_copy`), cleaned (a file keeping its editor's
+/// extension, `422 invalid_name` otherwise) and numbered when taken there ignoring case.
+async fn ordinary_copy_name(
+    db: &Db,
+    item: &Node,
+    parent: NodeId,
+    asked: &str,
+) -> Result<String, ApiError> {
+    let unavailable = |e: records::DbError| ApiError::unavailable(&e);
+    let editor = if item.kind == NodeKind::Document {
+        db.document(DocId(item.id.0))
+            .await
+            .map_err(unavailable)?
+            .map(|document| document.editor)
+    } else {
+        None
+    };
+    let cleaned = match editor {
+        Some(editor) => {
+            let cleaned = tree::clean_name(asked, editor);
+            records::validate_document_name(&cleaned, editor).map_err(|e| match e {
+                AccessError::WrongExtension => ApiError::InvalidName,
+                e => e.into(),
+            })?;
+            cleaned
+        }
+        None => tree::clean_folder_name(asked),
+    };
+    let taken: HashSet<String> = db
+        .live_child_names(parent)
+        .await
+        .map_err(unavailable)?
+        .into_iter()
+        .collect();
+    Ok(tree::unique_node_name(&cleaned, editor, &taken))
+}
+
 /// Everything about copying `node` into `parent` of another library (as `name` or as it is)
 /// that is judged before a byte is read or anything is made:
 ///
@@ -2475,8 +2513,9 @@ fn across_paths(plan: &AcrossPlan, top: &str) -> Vec<String> {
 ///   source_unavailable {reason: archived}` for anything in archive storage;
 /// - where it goes: what [`writable_place`] says of `parent` (`409 source_read_only`, `409
 ///   source_write_blocked`), a library or folder, `add` there, the folders setting for a
-///   folder, a name free there ignoring case (`409 name_taken`: never numbered), and into a
-///   bucket a name the listing shows and the bucket takes for every item (`422 invalid_name`);
+///   folder; into a bucket a name free there ignoring case (`409 name_taken`: never numbered)
+///   and a name the listing shows and the bucket takes for every item (`422 invalid_name`),
+///   elsewhere the name the ordinary copy gives (see [`ordinary_copy_name`]);
 /// - the limits: at most [`crate::s3_write::MOVE_MAX_OBJECTS`] files and folders (`409
 ///   source_too_many_objects {count}`), and every file within the destination's largest file
 ///   (into a bucket [`write_limit`], `413 source_file_too_large {limit}`; elsewhere the
@@ -2519,9 +2558,12 @@ async fn across_allowed(
     }
     let into = bucket.map_or(AcrossInto::Tree { site: place.site }, AcrossInto::Bucket);
     let asked = name.map_or(item.name.as_str(), str::trim);
-    let new_name = match checked_name(db, &item, asked).await {
-        Err(ApiError::WrongExtension) => return Err(ApiError::InvalidName),
-        checked => checked?,
+    let new_name = match into {
+        AcrossInto::Bucket(_) => match checked_name(db, &item, asked).await {
+            Err(ApiError::WrongExtension) => return Err(ApiError::InvalidName),
+            checked => checked?,
+        },
+        AcrossInto::Tree { .. } => ordinary_copy_name(db, &item, parent, asked).await?,
     };
     let tracked: HashMap<NodeId, u64> = match from {
         AcrossFrom::Bucket(library) => {
@@ -2599,10 +2641,12 @@ async fn across_allowed(
     if folder && folders_off(db, parent).await? {
         return Err(AccessError::FoldersOff.into());
     }
-    if !db
-        .name_free(parent, &new_name, None)
-        .await
-        .map_err(unavailable)?
+    // Into a bucket a taken name is refused, never numbered; elsewhere it was numbered above.
+    if matches!(into, AcrossInto::Bucket(_))
+        && !db
+            .name_free(parent, &new_name, None)
+            .await
+            .map_err(unavailable)?
     {
         return Err(AccessError::NameTaken.into());
     }
@@ -2694,7 +2738,8 @@ async fn across_content(
 
 /// Makes the item `item` of `plan` in `parent`: a folder, or a file with its content (an
 /// ordinary file through the upload route's [`crate::api::content::create_uploaded`], a bucket
-/// file staged through [`create_staged`]). Answers the new node.
+/// file staged through [`create_staged`]). Answers the new node; on failure the error, and a
+/// file made whose content could not be stored (it stays, empty, for the caller to remove).
 async fn across_one(
     state: &AppState,
     actor: &User,
@@ -2702,33 +2747,72 @@ async fn across_one(
     item: &AcrossItem,
     parent: NodeId,
     limit: u64,
-) -> Result<NodeId, ApiError> {
+) -> Result<NodeId, (ApiError, Option<NodeId>)> {
+    let made = across_make(state, actor, plan, item, parent, limit)
+        .await
+        .map_err(|e| (e, None))?;
+    match made {
+        Created::Done { doc, .. } => Ok(NodeId(doc.0)),
+        Created::Failed(_) => {
+            // The upload route's answer names the empty file; it is found by its name, free
+            // (or numbered) where it was made.
+            let stray = state
+                .db()
+                .live_children(parent)
+                .await
+                .ok()
+                .and_then(|found| {
+                    found
+                        .into_iter()
+                        .find(|n| n.kind == NodeKind::Document && n.name == item.name)
+                        .map(|n| n.id)
+                });
+            Err((ApiError::Unavailable, stray))
+        }
+    }
+}
+
+/// [`across_one`]'s work: the folder made (as a finished creation) or the file's creation.
+async fn across_make(
+    state: &AppState,
+    actor: &User,
+    plan: &AcrossPlan,
+    item: &AcrossItem,
+    parent: NodeId,
+    limit: u64,
+) -> Result<Created, ApiError> {
+    let folder_made = |id: NodeId| Created::Done {
+        doc: DocId(id.0),
+        body: Value::Null,
+    };
     let Some(file) = &item.file else {
         return match plan.into {
-            AcrossInto::Bucket(library) => {
-                Ok(create_folder(state, actor, library, parent, &item.name)
+            AcrossInto::Bucket(library) => Ok(folder_made(
+                create_folder(state, actor, library, parent, &item.name)
                     .await?
-                    .id)
-            }
-            AcrossInto::Tree { .. } => Ok(tree::apply(
-                state,
-                actor,
-                TreeOp::Create {
-                    parent: Some(parent),
-                    kind: NodeKind::Folder,
-                    name: item.name.clone(),
-                    id: NodeId(Uuid::new_v4()),
-                },
-            )
-            .await?
-            .node
-            .id),
+                    .id,
+            )),
+            AcrossInto::Tree { .. } => Ok(folder_made(
+                tree::apply(
+                    state,
+                    actor,
+                    TreeOp::Create {
+                        parent: Some(parent),
+                        kind: NodeKind::Folder,
+                        name: item.name.clone(),
+                        id: NodeId(Uuid::new_v4()),
+                    },
+                )
+                .await?
+                .node
+                .id,
+            )),
         };
     };
     let held = across_content(state, plan, item, limit).await?;
-    let created = match plan.into {
+    match plan.into {
         AcrossInto::Bucket(_) => {
-            create_staged(state, actor, parent, &item.name, file.editor, held, false).await?
+            create_staged(state, actor, parent, &item.name, file.editor, held, false).await
         }
         AcrossInto::Tree { .. } => {
             crate::api::content::create_uploaded(
@@ -2740,12 +2824,8 @@ async fn across_one(
                 held,
                 false,
             )
-            .await?
+            .await
         }
-    };
-    match created {
-        Created::Done { doc, .. } => Ok(NodeId(doc.0)),
-        Created::Failed(_) => Err(ApiError::Unavailable),
     }
 }
 
@@ -2767,8 +2847,8 @@ async fn across_one(
 ///   just read, so the write worker writes them after the scan gate; nothing else is written
 ///   in the request.
 ///
-/// If a step fails part way, a copy out deletes what it made (best effort) and answers the
-/// error; a copy into a bucket leaves what it made (its files are accepted saves) and answers
+/// If a step fails part way, a copy out deletes and purges what it made (best effort, see
+/// [`remove_partial`]) and answers the error; a copy into a bucket leaves what it made (its files are accepted saves) and answers
 /// `SourceCopyIncomplete` with the error's status and code and how many items it made.
 pub(crate) async fn copy_across(
     state: &AppState,
@@ -2799,6 +2879,8 @@ pub(crate) async fn copy_across(
     // The node made of each item, in order; `None` for a file left out.
     let mut made: Vec<Option<NodeId>> = Vec::with_capacity(plan.items.len());
     let mut failed = None;
+    // A file made whose content could not be stored.
+    let mut stray = None;
     for item in &plan.items {
         if plan.from == AcrossFrom::Tree
             && item
@@ -2821,8 +2903,9 @@ pub(crate) async fn copy_across(
         };
         match across_one(state, actor, &plan, item, into, limit).await {
             Ok(new) => made.push(Some(new)),
-            Err(e) => {
+            Err((e, left)) => {
                 failed = Some(e);
+                stray = left;
                 break;
             }
         }
@@ -2838,10 +2921,10 @@ pub(crate) async fn copy_across(
     };
     match plan.into {
         AcrossInto::Tree { .. } => {
-            if let Some(top) = top
-                && let Err(e) = tree::apply(state, actor, TreeOp::Delete { id: top }).await
-            {
-                eprintln!("sharecraft-server: a copy that failed part way was not removed: {e}");
+            // Everything it made is below the top; a top file whose content could not be
+            // stored is the stray one.
+            if let Some(made) = top.or(stray) {
+                remove_partial(state, actor, made).await;
             }
             Err(error)
         }
@@ -2858,6 +2941,19 @@ pub(crate) async fn copy_across(
                 code,
             })
         }
+    }
+}
+
+/// Removes `made`, what a copy out made before it failed, with everything in it: deleted and
+/// purged at once, so its bytes are freed and nothing the person did not delete shows in the
+/// recycle bin. Best effort: a failure is logged.
+async fn remove_partial(state: &AppState, actor: &User, made: NodeId) {
+    if let Err(e) = tree::apply(state, actor, TreeOp::Delete { id: made }).await {
+        eprintln!("sharecraft-server: a copy that failed part way was not removed: {e}");
+        return;
+    }
+    if let Err(e) = tree::purge_now(state, made).await {
+        eprintln!("sharecraft-server: a copy that failed part way was not purged: {e}");
     }
 }
 
