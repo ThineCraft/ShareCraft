@@ -1424,3 +1424,33 @@ async fn the_sweep_removes_only_old_unnamed_objects_inside_the_holding_prefix() 
         assert!(fake.object(BUCKET, key).is_some(), "{key}");
     }
 }
+
+#[tokio::test]
+async fn moving_a_file_with_no_recorded_tag_is_a_change() {
+    let (fake, s3, t) = setup().await;
+    fake.put(BUCKET, "lib/a.txt", b"never recorded");
+    let other = known(&s3, &t, &["a.txt"]).await;
+    let other = [("b.txt".to_owned(), other[0].1.clone())];
+    for k in [&[][..], &other[..]] {
+        assert_eq!(
+            move_item(&s3, &t, "a.txt", "c.txt", false, k)
+                .await
+                .unwrap_err(),
+            WriteError::Changed
+        );
+        assert_eq!(
+            copy_item(&s3, &t, "a.txt", "c.txt", false, k)
+                .await
+                .unwrap_err(),
+            WriteError::Changed
+        );
+        assert_eq!(
+            hold(&s3, &t, "a.txt", false, &new_root(), k)
+                .await
+                .unwrap_err(),
+            WriteError::Changed
+        );
+    }
+    assert!(fake.writes().is_empty());
+    assert!(fake.object(BUCKET, "lib/a.txt").is_some());
+}

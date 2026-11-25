@@ -601,10 +601,10 @@ async fn relocate(
         }
         if let Some(known) = known {
             let path = relative(t, from_key).ok_or(WriteError::Failed)?;
-            if let Some((_, tag)) = known.iter().find(|(p, _)| p == path)
-                && *tag != tag_of(&head)
-            {
-                return Err(WriteError::Changed);
+            // A file the tree has no tag for was never seen as it is now: not moved blind.
+            match known.iter().find(|(p, _)| p == path) {
+                Some((_, tag)) if *tag == tag_of(&head) => {}
+                _ => return Err(WriteError::Changed),
             }
         }
         steps.push(Step {
