@@ -131,6 +131,8 @@ struct Model {
     error_in_200: bool,
     fail_parts: HashSet<u16>,
     min_part: u64,
+    claimed_sizes: HashMap<String, u64>,
+    fail_copies: HashMap<String, (u16, String)>,
 }
 
 impl Default for Model {
@@ -168,6 +170,8 @@ impl Default for Model {
             error_in_200: false,
             fail_parts: HashSet::new(),
             min_part: MIN_PART,
+            claimed_sizes: HashMap::new(),
+            fail_copies: HashMap::new(),
         }
     }
 }
@@ -406,6 +410,20 @@ impl FakeS3 {
     /// and changes nothing.
     pub fn error_in_200_next(&self) {
         self.model().error_in_200 = true;
+    }
+
+    /// Listings and `HEAD` say `key` holds `size` bytes, whatever it really holds: an object
+    /// too large to store in a test.
+    pub fn claim_size(&self, key: &str, size: u64) {
+        self.model().claimed_sizes.insert(key.to_owned(), size);
+    }
+
+    /// The next copy to `key` is answered with `status` and an error body carrying `code`, and
+    /// changes nothing. Other requests are answered as usual.
+    pub fn fail_copy_to(&self, key: &str, status: u16, code: &str) {
+        self.model()
+            .fail_copies
+            .insert(key.to_owned(), (status, code.to_owned()));
     }
 
     /// Every `PUT` of part number `n` is answered `500 InternalError`.
@@ -795,6 +813,9 @@ async fn handle(State(model): State<Arc<Mutex<Model>>>, request: Request) -> Res
         if let Some((status, code)) = m.fail_next.take() {
             return error(status, &code);
         }
+        if copying && let Some((status, code)) = m.fail_copies.remove(&key) {
+            return error(status, &code);
+        }
         if kind == "list"
             && has("continuation-token")
             && let Some((status, code)) = m.fail_continued.clone()
@@ -838,6 +859,7 @@ async fn handle(State(model): State<Arc<Mutex<Model>>>, request: Request) -> Res
         let repeat_token = m.repeat_token;
         let without_token = m.truncated_without_token;
         let stray = m.stray_key.clone();
+        let claimed = m.claimed_sizes.clone();
         let no_versioning = m.no_versioning_api;
         let replacement = if kind == "head" {
             m.change_before_get
@@ -919,6 +941,7 @@ async fn handle(State(model): State<Arc<Mutex<Model>>>, request: Request) -> Res
                 repeat_token,
                 without_token,
                 stray.as_deref(),
+                &claimed,
             ),
             _ => {
                 let Some(object) = b.objects.get(&key).cloned() else {
@@ -935,7 +958,17 @@ async fn handle(State(model): State<Arc<Mutex<Model>>>, request: Request) -> Res
                     };
                     store(b, &key, bytes, now_s(), opts);
                 }
-                object_answer(&object, kind == "head", &parts.headers, hung, truncated)
+                let claimed = (kind == "head")
+                    .then(|| claimed.get(&key).copied())
+                    .flatten();
+                object_answer(
+                    &object,
+                    kind == "head",
+                    &parts.headers,
+                    hung,
+                    truncated,
+                    claimed,
+                )
             }
         }
     };
@@ -1098,6 +1131,7 @@ fn list(
     repeat_token: bool,
     without_token: bool,
     stray: Option<&str>,
+    claimed: &HashMap<String, u64>,
 ) -> Response {
     if param("list-type").as_deref() != Some("2") {
         return error(400, "InvalidArgument");
@@ -1167,7 +1201,10 @@ fn list(
             url_listing_encode(key),
             iso_date(object.modified_s),
             s3_xml::escape(&object.etag),
-            object.bytes.len(),
+            claimed
+                .get(key)
+                .copied()
+                .unwrap_or(object.bytes.len() as u64),
             object.class.as_deref().unwrap_or("STANDARD"),
         ));
     }
@@ -1196,6 +1233,7 @@ fn object_answer(
     headers: &HeaderMap,
     hung: bool,
     truncated: Option<usize>,
+    claimed: Option<u64>,
 ) -> Response {
     let archived = matches!(object.class.as_deref(), Some("GLACIER" | "DEEP_ARCHIVE"))
         && object.restored != Some(true);
@@ -1229,9 +1267,10 @@ fn object_answer(
         Some((a, b)) => object.bytes[a..=b].to_vec(),
         None => object.bytes.clone(),
     };
+    let length = claimed.unwrap_or(bytes.len() as u64);
     let mut builder = Response::builder()
         .status(status)
-        .header(header::CONTENT_LENGTH, bytes.len().to_string())
+        .header(header::CONTENT_LENGTH, length.to_string())
         .header(header::ETAG, object.etag.clone())
         .header(header::LAST_MODIFIED, http_date(object.modified_s))
         .header(header::ACCEPT_RANGES, "bytes");

@@ -157,6 +157,13 @@ pub enum WriteError {
     TooLarge,
     /// Anything else.
     Failed,
+    /// A folder step would touch more objects than one step may (`MOVE_MAX_OBJECTS`); the
+    /// count is how many the folder holds.
+    TooMany(u64),
+    /// An object is larger than one copy can move.
+    TooLargeToMove,
+    /// What is in the bucket is not what ShareCraft recorded.
+    Changed,
 }
 
 /// What a write expects to find: the tag the file was last seen with (`None`: it must not
@@ -929,7 +936,7 @@ async fn write_locked(state: &AppState, row: &PendingWrite, now: OffsetDateTime)
             return true;
         }
         Err(_) => {
-            fail(state, row, now, sentence(WriteError::Offline)).await;
+            fail(state, row, now, &sentence(WriteError::Offline)).await;
             return true;
         }
     };
@@ -1145,8 +1152,43 @@ fn last_segment(path: &str) -> &str {
 }
 
 /// What a failed write says to the people who see it.
-fn sentence(error: WriteError) -> &'static str {
+fn sentence(error: WriteError) -> String {
     match error {
+        WriteError::TooMany(count) => format!(
+            "This folder holds {} objects in the bucket. ShareCraft renames, moves, copies or \
+             deletes at most 1,000 at a time.",
+            thousands(count)
+        ),
+        other => plain_sentence(other).to_owned(),
+    }
+}
+
+/// `n` with a comma between each group of three digits: `1,234,567`.
+#[must_use]
+pub fn thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, digit) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
+}
+
+/// The sentence for an error that carries no number.
+fn plain_sentence(error: WriteError) -> &'static str {
+    match error {
+        WriteError::TooMany(_) => "This folder holds too many objects in the bucket.",
+        WriteError::TooLargeToMove => {
+            "Files over 5 GiB in S3 storage cannot be renamed, moved, copied or deleted from \
+             ShareCraft yet."
+        }
+        WriteError::Changed => {
+            "This changed in the storage since ShareCraft last looked. ShareCraft is checking it \
+             again; try again in a minute."
+        }
         WriteError::Offline => "The storage could not be reached. Saving is tried again shortly.",
         WriteError::Gone => "The bucket could not be found. Saving is tried again later.",
         WriteError::TooLarge => "The file is too large to be written to the storage in one piece.",
@@ -1164,7 +1206,7 @@ async fn failed_write(
     error: WriteError,
     now: OffsetDateTime,
 ) {
-    fail(state, row, now, sentence(error)).await;
+    fail(state, row, now, &sentence(error)).await;
     if error == WriteError::Denied {
         block(state, row.library, Some(now)).await;
     }
