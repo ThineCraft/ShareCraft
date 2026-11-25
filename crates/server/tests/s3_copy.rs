@@ -766,7 +766,7 @@ async fn a_copy_over_the_limits_is_refused_before_anything_is_read() {
         assert_error(&refused, StatusCode::CONFLICT, "source_too_many_objects");
         assert_eq!(refused.1["count"], 1001);
     }
-    // The ordinary library takes files of at most 3 bytes; the bucket's one write as much.
+    // The ordinary library takes files of at most 3 bytes; the bucket as much (half the cache).
     let (status, body) = env
         .call(
             &env.admin,
@@ -776,7 +776,7 @@ async fn a_copy_over_the_limits_is_refused_before_anything_is_read() {
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    env.state.s3().set_single_put_max_for_tests(3);
+    env.state.shares().set_cache_max_bytes_for_tests(6);
     for item in [a, docs] {
         let refused = env.copy(item, env.ordinary, None).await;
         assert_error(&refused, StatusCode::PAYLOAD_TOO_LARGE, "file_too_large");

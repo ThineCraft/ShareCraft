@@ -41,11 +41,12 @@ use crate::api::ApiError;
 use crate::api::content::{Created, discard};
 use crate::blobs::Held;
 use crate::checkpoint::Checkpointer;
-use crate::s3::{PutBody, S3Error, S3Target};
+use crate::s3::{COPY_MAX, PutBody, S3Error, S3Target};
 use crate::s3_source::nameable_segment;
 use crate::s3_write::{
-    Moved, copy_item, delete_held, hold, holding_root, make_folder, move_item, object_key,
-    probe_writes, remove_copies, sweep_holding, unhold, write_beside, write_numbered, write_object,
+    Ledger, Moved, copy_item, delete_held, hold, holding_root, make_folder, move_item, object_key,
+    probe_writes, remove_copies, sweep_holding, unhold, write_beside_noted, write_numbered_noted,
+    write_object_noted,
 };
 use crate::tree::{self, TreeOp};
 
@@ -320,16 +321,13 @@ pub(crate) enum StageError {
     Failed,
 }
 
-/// The largest file a change to an external library may be: the smaller of one `PUT`, the
-/// server's largest file and half the external-content cache.
+/// The largest file a change to an external library may be: the smallest of 5 GiB (the most
+/// ShareCraft can move inside a bucket afterwards), the server's largest file and half the
+/// external-content cache. Files over one `PUT` are written in parts.
 pub(crate) async fn write_limit(state: &AppState) -> Result<u64, records::DbError> {
     let settings = state.db().share_settings().await?;
     let cache = state.shares().cache_max_bytes(settings.cache_max_bytes);
-    Ok(state
-        .s3()
-        .single_put_max()
-        .min(state.config().max_file_bytes)
-        .min(cache / 2))
+    Ok(COPY_MAX.min(state.config().max_file_bytes).min(cache / 2))
 }
 
 /// Stages `s`: the content is pinned in the external-content cache and a pending row names it,
@@ -977,13 +975,34 @@ async fn write_locked(state: &AppState, row: &PendingWrite, now: OffsetDateTime)
         tag: row.base_tag.clone(),
         sha256: None,
     };
-    match write_object(state.s3(), &target, &row.path, &body, &base, conditional).await {
+    let ledger = ledger_of(state, row, now);
+    let written = write_object_noted(
+        state.s3(),
+        &target,
+        &row.path,
+        &body,
+        &base,
+        conditional,
+        Some(&ledger),
+    )
+    .await;
+    match written {
         Ok(Written::Done(seen)) => finished(state, row, &row.path, &seen, conditional).await,
         Ok(Written::Conflict) => conflict(state, &target, row, &body, conditional, now).await,
         Err(error) => failed_write(state, row, error, now).await,
     }
     drop(held);
     true
+}
+
+/// Where a multipart upload of the row's content is recorded while it is open.
+fn ledger_of<'a>(state: &'a AppState, row: &PendingWrite, now: OffsetDateTime) -> Ledger<'a> {
+    Ledger {
+        db: state.db(),
+        library: row.library,
+        node: row.node,
+        now,
+    }
 }
 
 /// Records that the row's content is at `path` in the store, as `seen`.
@@ -1047,7 +1066,17 @@ async fn conflict(
         }
     };
     if !tracked {
-        match write_numbered(state.s3(), target, &row.path, body, conditional).await {
+        let ledger = ledger_of(state, row, now);
+        let written = write_numbered_noted(
+            state.s3(),
+            target,
+            &row.path,
+            body,
+            conditional,
+            Some(&ledger),
+        )
+        .await;
+        match written {
             Ok((path, seen)) => {
                 if let Some(author) = &author {
                     let name = last_segment(&path).to_owned();
@@ -1064,7 +1093,8 @@ async fn conflict(
         return;
     }
     let person = author.as_ref().map_or("", |author| author.name.as_str());
-    let written = write_beside(
+    let ledger = ledger_of(state, row, now);
+    let written = write_beside_noted(
         state.s3(),
         target,
         &row.path,
@@ -1072,6 +1102,7 @@ async fn conflict(
         person,
         now,
         conditional,
+        Some(&ledger),
     )
     .await;
     let (path, seen) = match written {
@@ -1213,7 +1244,7 @@ fn plain_sentence(error: WriteError) -> &'static str {
         }
         WriteError::Offline => "The storage could not be reached. Saving is tried again shortly.",
         WriteError::Gone => "The bucket could not be found. Saving is tried again later.",
-        WriteError::TooLarge => "The file is too large to be written to the storage in one piece.",
+        WriteError::TooLarge => "Files over 5 GiB cannot be saved to this S3 storage.",
         WriteError::Denied => "The storage refused this change with this access key.",
         WriteError::NameTaken | WriteError::NoSpace | WriteError::Failed => {
             "The storage did not take the change. Saving is tried again later."
@@ -1358,7 +1389,7 @@ pub(crate) async fn restored(
 }
 
 /// Records an event about `library`, and the file `node` when there is one.
-fn emit(
+pub(crate) fn emit(
     state: &AppState,
     kind: &'static str,
     library: NodeId,

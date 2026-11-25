@@ -126,6 +126,7 @@ struct Model {
     read_only: bool,
     deny_writes_after: Option<usize>,
     lose_answer: bool,
+    lose_complete_answer: bool,
     writes: Vec<(String, String, String)>,
     last_write_body_len: Option<usize>,
     error_in_200: bool,
@@ -165,6 +166,7 @@ impl Default for Model {
             read_only: false,
             deny_writes_after: None,
             lose_answer: false,
+            lose_complete_answer: false,
             writes: Vec::new(),
             last_write_body_len: None,
             error_in_200: false,
@@ -398,6 +400,11 @@ impl FakeS3 {
     /// The next write is stored (or removed), and then answered `503 SlowDown`.
     pub fn lose_answer_after_write(&self) {
         self.model().lose_answer = true;
+    }
+
+    /// The next multipart completion is carried out, and then answered `503 SlowDown`.
+    pub fn lose_complete_answer(&self) {
+        self.model().lose_complete_answer = true;
     }
 
     /// Every `PUT` and `DELETE` received, in order: method, key and a condition word (`none`,
@@ -889,7 +896,11 @@ async fn handle(State(model): State<Arc<Mutex<Model>>>, request: Request) -> Res
             && std::mem::take(&mut m.error_in_200);
         let write_flags = Flags {
             ignore_conditions: m.ignore_conditions,
-            lose_answer: kind == "write" && std::mem::take(&mut m.lose_answer),
+            lose_answer: kind == "write"
+                && (std::mem::take(&mut m.lose_answer)
+                    || (method == Method::POST
+                        && has("uploadId")
+                        && std::mem::take(&mut m.lose_complete_answer))),
             error_in_200: wants_200_error,
             fail_part: part_number
                 .as_deref()

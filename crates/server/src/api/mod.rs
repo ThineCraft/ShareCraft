@@ -1089,7 +1089,7 @@ fn copy_incomplete_message(made: u64) -> String {
     )
 }
 
-/// The plain sentence for a file over the limit of one write to S3 storage: `limit` is said
+/// The plain sentence for a file over the limit of a write to S3 storage: `limit` is said
 /// in the largest unit that holds it exactly (`512 MiB`, `2 KiB`, or bytes).
 fn source_file_too_large_message(limit: u64) -> String {
     const KIB: u64 = 1024;
@@ -1104,7 +1104,7 @@ fn source_file_too_large_message(limit: u64) -> String {
     } else {
         format!("{limit} bytes")
     };
-    format!("Files over {words} cannot be saved to S3 storage yet.")
+    format!("Files over {words} cannot be saved to this S3 storage.")
 }
 
 /// The plain sentence for a failed probe of a bucket. Never the store's own text.
@@ -1224,15 +1224,15 @@ mod tests {
         use super::source_file_too_large_message as words;
         assert_eq!(
             words(512 * 1024 * 1024),
-            "Files over 512 MiB cannot be saved to S3 storage yet."
+            "Files over 512 MiB cannot be saved to this S3 storage."
         );
         assert_eq!(
             words(2048),
-            "Files over 2 KiB cannot be saved to S3 storage yet."
+            "Files over 2 KiB cannot be saved to this S3 storage."
         );
         assert_eq!(
             words(10),
-            "Files over 10 bytes cannot be saved to S3 storage yet."
+            "Files over 10 bytes cannot be saved to this S3 storage."
         );
     }
 

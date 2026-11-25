@@ -9,16 +9,26 @@
 //! the content's SHA-256 in object metadata, so a write whose answer was lost is recognised as
 //! ours by the next attempt's `HEAD` rather than taken for a conflict. Nothing is retried here:
 //! the caller's back-off retries, and every retry starts with a `HEAD`.
+//!
+//! A file over [`S3::single_put_max`] is sent as a multipart upload after the same `HEAD` and the
+//! same choice of condition, which rides on the completion only. Each part is hashed from the
+//! staged file and then streamed from it. An upload the caller records (see [`Ledger`]) has a row
+//! from just after its start until it completes or is aborted; any failure after the start
+//! aborts it, and the row of one a crash left open is aborted by [`abort_stale`] a day later.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::Path;
 
 use collab_core::ids::NodeId;
-use records::{Tri, object_tag, reserved_name};
+use records::{SourceKind, SourceMode, Tri, object_tag, reserved_name};
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use time::{Date, Month, OffsetDateTime};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use uuid::Uuid;
 
-use crate::s3::{COPY_MAX, Cond, ObjectHead, PutBody, S3, S3Error, S3Target};
+use crate::AppState;
+use crate::s3::{COPY_MAX, Cond, MAX_PARTS, ObjectHead, PartBody, PutBody, S3, S3Error, S3Target};
 use crate::s3_sign;
 use crate::s3_source::{MAX_RELATIVE_CHARS, nameable_segment};
 use crate::s3_xml::ObjectEntry;
@@ -101,13 +111,30 @@ fn is_ours(head: &ObjectHead, body: &PutBody) -> bool {
     head.sha256.as_deref() == Some(s3_sign::hex(&body.sha256).as_str())
 }
 
-/// Refuses a body one `PUT` cannot send, before any request.
+/// Refuses a body that cannot be written, before any request: over [`COPY_MAX`] (what
+/// ShareCraft can still move afterwards), or over the most parts a multipart upload takes.
 fn check_size(s3: &S3, body: &PutBody) -> Result<(), WriteError> {
-    if body.size > s3.single_put_max() {
+    let parts = body.size.div_ceil(s3.part_bytes().max(1));
+    if body.size > COPY_MAX || (multipart(s3, body) && parts > MAX_PARTS) {
         Err(WriteError::TooLarge)
     } else {
         Ok(())
     }
+}
+
+/// Whether `body` goes as a multipart upload rather than one `PUT`.
+fn multipart(s3: &S3, body: &PutBody) -> bool {
+    body.size > s3.single_put_max() && body.size > 0
+}
+
+/// Where the worker records an open multipart upload, so one a crash leaves open is aborted by
+/// [`abort_stale`]: the library, the file's node and the time the worker runs at.
+#[derive(Clone, Copy)]
+pub struct Ledger<'a> {
+    pub db: &'a records::Db,
+    pub library: NodeId,
+    pub node: NodeId,
+    pub now: OffsetDateTime,
 }
 
 /// Puts `body` at `path`, replacing what the caller saw (`base.tag`) or creating a file that was
@@ -129,6 +156,22 @@ pub async fn write_object(
     base: &Base,
     conditional: Tri,
 ) -> Result<Written, WriteError> {
+    write_object_noted(s3, t, path, body, base, conditional, None).await
+}
+
+/// [`write_object`], with a multipart upload's row kept in `ledger` while it is open.
+///
+/// # Errors
+/// As [`write_object`].
+pub async fn write_object_noted(
+    s3: &S3,
+    t: &S3Target,
+    path: &str,
+    body: &PutBody,
+    base: &Base,
+    conditional: Tri,
+    ledger: Option<&Ledger<'_>>,
+) -> Result<Written, WriteError> {
     let key = object_key(t, path).ok_or(WriteError::Failed)?;
     check_size(s3, body)?;
     let conditions = conditional == Tri::Yes;
@@ -139,15 +182,15 @@ pub async fn write_object(
     };
     let put = match head {
         None => match base.tag {
-            None => put_checked(s3, t, &key, body, cond_if_absent(conditions)).await,
+            None => send(s3, t, &key, body, cond_if_absent(conditions), ledger).await,
             Some(_) => return Ok(Written::Conflict),
         },
         Some(head) => {
             if base.tag.as_deref() == Some(tag_of(&head).as_str()) {
                 if conditions {
-                    put_checked(s3, t, &key, body, Cond::IfMatch(&head.etag)).await
+                    send(s3, t, &key, body, Cond::IfMatch(&head.etag), ledger).await
                 } else {
-                    put_checked(s3, t, &key, body, Cond::None).await
+                    send(s3, t, &key, body, Cond::None, ledger).await
                 }
             } else if is_ours(&head, body) {
                 return Ok(Written::Done(seen_of(&head)));
@@ -190,6 +233,143 @@ async fn put_checked(
     s3.put(t, key, body, cond).await
 }
 
+/// Sends `body` to `key` under `cond`: one `PUT`, or a multipart upload above
+/// [`S3::single_put_max`]. Errors read as a `PUT`'s would.
+async fn send(
+    s3: &S3,
+    t: &S3Target,
+    key: &str,
+    body: &PutBody,
+    cond: Cond<'_>,
+    ledger: Option<&Ledger<'_>>,
+) -> Result<ObjectHead, S3Error> {
+    if multipart(s3, body) {
+        put_multipart(s3, t, key, body, cond, ledger).await
+    } else {
+        put_checked(s3, t, key, body, cond).await
+    }
+}
+
+/// A multipart upload of `body` to `key`, the condition on the completion.
+///
+/// Once the upload is started, every way out goes through the one `match` below: the parts and
+/// the completion run in [`parts_then_complete`], whose result is matched and never passed on
+/// with `?`, so any failure there aborts the upload and then forgets its row. A row is forgotten
+/// only once the store no longer holds the upload (completed, or aborted); an abort that fails
+/// keeps it for [`abort_stale`]. A worker dropped mid-way (a crash, a shutdown) leaves the row
+/// too, and the sweep aborts the upload a day later.
+async fn put_multipart(
+    s3: &S3,
+    t: &S3Target,
+    key: &str,
+    body: &PutBody,
+    cond: Cond<'_>,
+    ledger: Option<&Ledger<'_>>,
+) -> Result<ObjectHead, S3Error> {
+    let Some(path) = body.path.as_deref() else {
+        return Err(S3Error::Other);
+    };
+    let upload_id = s3.start_multipart(t, key, &body.sha256).await?;
+    let outcome = parts_then_complete(s3, t, key, &upload_id, path, body.size, cond, ledger).await;
+    match outcome {
+        Ok(head) => {
+            forget(ledger, &upload_id).await;
+            Ok(head)
+        }
+        Err(error) => {
+            match s3.abort_multipart(t, key, &upload_id).await {
+                Ok(()) => forget(ledger, &upload_id).await,
+                Err(abort) => eprintln!(
+                    "sharecraft-server: a multipart upload could not be aborted ({abort:?}); \
+                     the sweep aborts it later"
+                ),
+            }
+            Err(error)
+        }
+    }
+}
+
+/// Records the upload, sends each part (hashed from the staged file, then streamed from it),
+/// and completes the upload under `cond`.
+#[allow(clippy::too_many_arguments)]
+async fn parts_then_complete(
+    s3: &S3,
+    t: &S3Target,
+    key: &str,
+    upload_id: &str,
+    path: &Path,
+    size: u64,
+    cond: Cond<'_>,
+    ledger: Option<&Ledger<'_>>,
+) -> Result<ObjectHead, S3Error> {
+    if let Some(ledger) = ledger
+        && let Err(e) = ledger
+            .db
+            .note_multipart(ledger.library, ledger.node, key, upload_id, ledger.now)
+            .await
+    {
+        eprintln!("sharecraft-server: cannot record a multipart upload: {e}");
+        return Err(S3Error::Other);
+    }
+    let part_bytes = s3.part_bytes().max(1);
+    let mut parts: Vec<(u16, String)> = Vec::new();
+    let mut offset = 0;
+    while offset < size {
+        let len = part_bytes.min(size - offset);
+        let number = u16::try_from(parts.len() + 1).map_err(|_| S3Error::Other)?;
+        let sha256 = hash_range(path, offset, len).await?;
+        let part = PartBody {
+            path: path.to_owned(),
+            offset,
+            len,
+            sha256,
+        };
+        let etag = s3.put_part(t, key, upload_id, number, &part).await?;
+        parts.push((number, etag));
+        offset += len;
+    }
+    s3.complete_multipart(t, key, upload_id, &parts, cond).await
+}
+
+/// The SHA-256 of the `len` bytes of `path` from `offset`, read in pieces of 64 KiB, so a part
+/// is never held in memory. `Other` when the file cannot be read or ends early.
+async fn hash_range(path: &Path, offset: u64, len: u64) -> Result<[u8; 32], S3Error> {
+    let fail = |e: std::io::Error| {
+        eprintln!("sharecraft-server: cannot read a staged file: {e}");
+        S3Error::Other
+    };
+    let mut file = tokio::fs::File::open(path).await.map_err(fail)?;
+    file.seek(std::io::SeekFrom::Start(offset))
+        .await
+        .map_err(fail)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 64 * 1024];
+    let mut left = len;
+    while left > 0 {
+        let want = usize::try_from(left.min(64 * 1024)).unwrap_or(64 * 1024);
+        let Some(piece) = buffer.get_mut(..want) else {
+            return Err(S3Error::Other);
+        };
+        let read = file.read(piece).await.map_err(fail)?;
+        if read == 0 {
+            return Err(S3Error::Other);
+        }
+        hasher.update(piece.get(..read).unwrap_or_default());
+        left -= u64::try_from(read).unwrap_or(left);
+    }
+    Ok(hasher.finalize().into())
+}
+
+/// Forgets a multipart upload's row, if it has one.
+async fn forget(ledger: Option<&Ledger<'_>>, upload_id: &str) {
+    if let Some(ledger) = ledger
+        && let Err(e) = ledger.db.forget_multipart(ledger.library, upload_id).await
+    {
+        // The sweep aborts it a day later, which the store answers as already gone.
+        eprintln!("sharecraft-server: cannot forget a finished multipart upload: {e}");
+    }
+}
+
 /// `path` split into its folder (with the closing `/`, or empty) and its name.
 fn split_path(path: &str) -> (&str, &str) {
     match path.rfind('/') {
@@ -210,6 +390,7 @@ async fn put_first_free(
     names: &[String],
     body: &PutBody,
     conditional: Tri,
+    ledger: Option<&Ledger<'_>>,
 ) -> Result<(String, Seen), WriteError> {
     check_size(s3, body)?;
     let conditions = conditional == Tri::Yes;
@@ -225,7 +406,7 @@ async fn put_first_free(
                 Err(error) => return Err(write_error(error)),
             }
         }
-        match put_checked(s3, t, &key, body, cond_if_absent(conditions)).await {
+        match send(s3, t, &key, body, cond_if_absent(conditions), ledger).await {
             Ok(head) => return Ok((path, seen_of(&head))),
             Err(S3Error::Precondition) => match s3.head(t, &key).await {
                 Ok(head) if is_ours(&head, body) => return Ok((path, seen_of(&head))),
@@ -259,10 +440,37 @@ pub async fn write_beside(
     at: OffsetDateTime,
     conditional: Tri,
 ) -> Result<(String, Seen), WriteError> {
+    write_beside_noted(s3, t, path, body, person, at, conditional, None).await
+}
+
+/// [`write_beside`], with a multipart upload's row kept in `ledger` while it is open.
+///
+/// # Errors
+/// As [`write_beside`].
+#[allow(clippy::too_many_arguments)]
+pub async fn write_beside_noted(
+    s3: &S3,
+    t: &S3Target,
+    path: &str,
+    body: &PutBody,
+    person: &str,
+    at: OffsetDateTime,
+    conditional: Tri,
+    ledger: Option<&Ledger<'_>>,
+) -> Result<(String, Seen), WriteError> {
     object_key(t, path).ok_or(WriteError::Failed)?;
     let (folder, name) = split_path(path);
     let first = sibling_name(name, person, at);
-    put_first_free(s3, t, folder, &candidates(&first), body, conditional).await
+    put_first_free(
+        s3,
+        t,
+        folder,
+        &candidates(&first),
+        body,
+        conditional,
+        ledger,
+    )
+    .await
 }
 
 /// Writes a new file at `path`, or at `name (2).ext` and on if that key appeared meanwhile.
@@ -276,11 +484,26 @@ pub async fn write_numbered(
     body: &PutBody,
     conditional: Tri,
 ) -> Result<(String, Seen), WriteError> {
+    write_numbered_noted(s3, t, path, body, conditional, None).await
+}
+
+/// [`write_numbered`], with a multipart upload's row kept in `ledger` while it is open.
+///
+/// # Errors
+/// As [`write_numbered`].
+pub async fn write_numbered_noted(
+    s3: &S3,
+    t: &S3Target,
+    path: &str,
+    body: &PutBody,
+    conditional: Tri,
+    ledger: Option<&Ledger<'_>>,
+) -> Result<(String, Seen), WriteError> {
     object_key(t, path).ok_or(WriteError::Failed)?;
     let (folder, name) = split_path(path);
     let mut names = vec![];
     names.extend((2..=LAST_NUMBER).map(|n| numbered_name(name, n)));
-    put_first_free(s3, t, folder, &names, body, conditional).await
+    put_first_free(s3, t, folder, &names, body, conditional, ledger).await
 }
 
 /// The body of a zero-byte object.
@@ -498,10 +721,71 @@ pub fn is_held_path(path: &str) -> bool {
         .is_some_and(|rest| rest.starts_with('/'))
 }
 
-/// Aborts the multipart uploads a crash left open for more than a day before `now`. Answers how
-/// many it aborted. Nothing yet: multipart uploads come with a later step of this work.
-pub async fn abort_stale(_state: &crate::AppState, _now: OffsetDateTime) -> usize {
-    0
+/// Rows [`abort_stale`] looks at in one run.
+const STALE_BATCH: i64 = 100;
+
+/// Aborts the multipart uploads whose rows were written more than a day before `now`, which
+/// only a crash leaves behind, and forgets each row, recording `source.multipart_aborted`. The
+/// row of a library that is gone, read-only or no longer S3 is only forgotten: nothing is
+/// written there. An abort that fails keeps its row for the next run. Answers how many uploads
+/// it aborted.
+pub async fn abort_stale(state: &AppState, now: OffsetDateTime) -> usize {
+    let db = state.db();
+    let Some(before) = now.checked_sub(time::Duration::days(1)) else {
+        return 0;
+    };
+    let rows = match db.stale_multiparts(before, STALE_BATCH).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            eprintln!("sharecraft-server: database failure: {e}");
+            return 0;
+        }
+    };
+    let mut aborted = 0;
+    for row in rows {
+        let writable = match db.source_of(row.library).await {
+            Ok(Some((config, _))) => {
+                config.kind == SourceKind::S3 && config.mode == SourceMode::ReadWrite
+            }
+            Ok(None) => false,
+            Err(e) => {
+                eprintln!("sharecraft-server: database failure: {e}");
+                continue;
+            }
+        };
+        if writable {
+            let Ok(target) = state.s3().target(state, row.library).await else {
+                continue;
+            };
+            // Nothing outside the library's prefix is ever written.
+            if row.key.starts_with(target.prefix()) {
+                if let Err(error) = state
+                    .s3()
+                    .abort_multipart(&target, &row.key, &row.upload_id)
+                    .await
+                {
+                    eprintln!(
+                        "sharecraft-server: a left-over multipart upload of library {} could \
+                         not be aborted: {error:?}",
+                        row.library.0
+                    );
+                    continue;
+                }
+                aborted += 1;
+                crate::source_write::emit(
+                    state,
+                    "source.multipart_aborted",
+                    row.library,
+                    Some(row.node),
+                    json!({ "count": 1 }),
+                );
+            }
+        }
+        if let Err(e) = db.forget_multipart(row.library, &row.upload_id).await {
+            eprintln!("sharecraft-server: database failure: {e}");
+        }
+    }
+    aborted
 }
 
 /// Every object whose key starts with `prefix`, all pages. Keys a store names outside the

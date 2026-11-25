@@ -563,7 +563,7 @@ async fn a_chunked_upload_reserves_no_quota_in_a_full_site() {
 async fn a_file_over_the_limit_is_refused_in_plain_words_before_any_byte() {
     let env = Env::new().await;
     let library = env.library("Limit").await;
-    // Over the default limit: the plain 512 MiB sentence.
+    // Over the limit (here the server's largest file, 64 MiB), said in words.
     let (status, body) = env
         .call(
             &env.owner,
@@ -581,12 +581,12 @@ async fn a_file_over_the_limit_is_refused_in_plain_words_before_any_byte() {
     assert_eq!(body["error"], "source_file_too_large", "{body}");
     assert_eq!(body["limit"], 64u64 * 1024 * 1024, "{body}");
     assert_eq!(
-        body["message"], "Files over 64 MiB cannot be saved to S3 storage yet.",
+        body["message"], "Files over 64 MiB cannot be saved to this S3 storage.",
         "{body}"
     );
 
-    // A smaller limit is named in words too, and nothing is started.
-    env.state.s3().set_single_put_max_for_tests(2048);
+    // A smaller limit (half the content cache) is named in words too, and nothing is started.
+    env.state.shares().set_cache_max_bytes_for_tests(4096);
     let bytes = vec![7u8; 2049];
     let (status, body) = env
         .start(
@@ -599,7 +599,7 @@ async fn a_file_over_the_limit_is_refused_in_plain_words_before_any_byte() {
     assert_eq!(body["error"], "source_file_too_large", "{body}");
     assert_eq!(body["limit"], 2048, "{body}");
     assert_eq!(
-        body["message"], "Files over 2 KiB cannot be saved to S3 storage yet.",
+        body["message"], "Files over 2 KiB cannot be saved to this S3 storage.",
         "{body}"
     );
     let open: i64 = sqlx::query_scalar("select count(*) from upload_sessions")

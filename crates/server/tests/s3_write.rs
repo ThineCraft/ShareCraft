@@ -16,7 +16,7 @@ use collab_core::ids::NodeId;
 
 use common::fake_s3::FakeS3;
 use records::{S3Endpoint, Tri, object_tag, reserved_name, windows_safe_name};
-use server::s3::{PutBody, S3, S3Target};
+use server::s3::{COPY_MAX, PutBody, S3, S3Target};
 use server::s3_sign::{Credentials, sha256_hex};
 use server::s3_write::{
     MOVE_MAX_OBJECTS, Moved, copy_item, delete_held, hold, holding_root, make_folder, move_item,
@@ -626,11 +626,27 @@ async fn errors_map_to_plain_write_errors() {
             .unwrap_err(),
         WriteError::Failed
     );
-    // Over the single-PUT limit: refused before any request.
-    s3.set_single_put_max_for_tests(2);
+    // Over 5 GiB (what ShareCraft can move afterwards): refused before any request.
+    let huge = PutBody {
+        size: COPY_MAX + 1,
+        ..body.clone()
+    };
     let before = fake.requests().len();
     assert_eq!(
-        write_object(&s3, &t, "big.bin", &body, &base(None), Tri::Yes)
+        write_object(&s3, &t, "big.bin", &huge, &base(None), Tri::Yes)
+            .await
+            .unwrap_err(),
+        WriteError::TooLarge
+    );
+    // More parts than a multipart upload takes: refused before any request too.
+    s3.set_single_put_max_for_tests(2);
+    s3.set_part_bytes_for_tests(1);
+    let many = PutBody {
+        size: 10_001,
+        ..body.clone()
+    };
+    assert_eq!(
+        write_object(&s3, &t, "big.bin", &many, &base(None), Tri::Yes)
             .await
             .unwrap_err(),
         WriteError::TooLarge
