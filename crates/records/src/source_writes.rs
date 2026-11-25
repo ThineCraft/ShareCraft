@@ -691,6 +691,29 @@ impl Db {
         Ok(done.rows_affected() > 0)
     }
 
+    /// Records on the pending write of `node`, if it is still the one first staged at
+    /// `first_staged_at` (not withdrawn and staged again since), that the store now holds
+    /// `tag`: its content was written but the finish could not be recorded yet. The next
+    /// attempt recognises its own content whatever the base; a newer stage of the same row is
+    /// then based on what was written, as [`Db::finish_write`] would have made it. Whether the
+    /// row was found.
+    pub async fn rebase_write(
+        &self,
+        node: NodeId,
+        first_staged_at: OffsetDateTime,
+        tag: &str,
+    ) -> Result<bool, DbError> {
+        let done = sqlx::query(
+            "update source_writes set base_tag = $3 where node_id = $1 and first_staged_at = $2",
+        )
+        .bind(node.0)
+        .bind(first_staged_at)
+        .bind(tag)
+        .execute(self.pool())
+        .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
     /// Puts off the pending write of `node` holding the content `sha256` until `until`, without
     /// counting an attempt or recording an error (its content is still being scanned, or a
     /// listing holds its library). Whether the row still holds that content.

@@ -135,6 +135,8 @@ struct Model {
     claimed_sizes: HashMap<String, u64>,
     fail_copies: HashMap<String, (u16, String)>,
     pause_delete: Option<Paused>,
+    pause_put: Option<Paused>,
+    pause_put_answer: Option<Paused>,
 }
 
 /// A request held before it is answered (see [`FakeS3::pause_next_delete`]).
@@ -145,6 +147,13 @@ pub struct Paused {
 }
 
 impl Paused {
+    fn new() -> Paused {
+        Paused {
+            reached: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
     /// Waits until the request has arrived (and is held).
     pub async fn reached(&self) {
         self.reached.notified().await;
@@ -195,6 +204,8 @@ impl Default for Model {
             claimed_sizes: HashMap::new(),
             fail_copies: HashMap::new(),
             pause_delete: None,
+            pause_put: None,
+            pause_put_answer: None,
         }
     }
 }
@@ -463,6 +474,23 @@ impl FakeS3 {
             release: Arc::new(tokio::sync::Notify::new()),
         };
         self.model().pause_delete = Some(paused.clone());
+        paused
+    }
+
+    /// The next content `PUT` (an object's or a part's, not a copy) is held before anything is
+    /// done or logged, until the answer's [`Paused::release`]: a transfer under way.
+    pub fn pause_next_put(&self) -> Paused {
+        let paused = Paused::new();
+        self.model().pause_put = Some(paused.clone());
+        paused
+    }
+
+    /// The next content `PUT` (an object's or a part's, not a copy) is carried out and logged,
+    /// and its answer held until the answer's [`Paused::release`]: content that has landed
+    /// before the writer has heard so.
+    pub fn pause_after_next_put(&self) -> Paused {
+        let paused = Paused::new();
+        self.model().pause_put_answer = Some(paused.clone());
         paused
     }
 
@@ -753,7 +781,30 @@ fn address(model: &Model, host: &str, path: &str) -> Option<(String, String)> {
     }
 }
 
+/// [`answer`], with a content `PUT` held before it ([`FakeS3::pause_next_put`]) or its answer
+/// held after it ([`FakeS3::pause_after_next_put`]).
 async fn handle(State(model): State<Arc<Mutex<Model>>>, request: Request) -> Response {
+    let content_put =
+        request.method() == Method::PUT && !request.headers().contains_key("x-amz-copy-source");
+    let (before, after) = if content_put {
+        let mut m = model.lock().unwrap();
+        (m.pause_put.take(), m.pause_put_answer.take())
+    } else {
+        (None, None)
+    };
+    if let Some(paused) = before {
+        paused.reached.notify_one();
+        paused.release.notified().await;
+    }
+    let response = answer(State(model), request).await;
+    if let Some(paused) = after {
+        paused.reached.notify_one();
+        paused.release.notified().await;
+    }
+    response
+}
+
+async fn answer(State(model): State<Arc<Mutex<Model>>>, request: Request) -> Response {
     let (parts, body) = request.into_parts();
     let body = axum::body::to_bytes(body, 16 << 20)
         .await

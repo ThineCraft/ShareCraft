@@ -1111,9 +1111,12 @@ pub(crate) async fn retry_write(
 
 /// `DELETE /api/libraries/{id}/source/writes/{node}`: Discard of a change to the library's
 /// store that was accepted and not yet written, for the change's author and the library's
-/// owners. A file the store has shows the store's content again; a new file is deleted. `204`;
-/// `404` and `403` as for Retry; `409 source_busy` while a listing holds the library for more
-/// than ten seconds. Recorded as `source.write_discarded`.
+/// owners. A file the store has shows the store's content again; a new file is deleted. A
+/// change whose content is being sent at that moment is withdrawn too; if its bytes land, the
+/// next listing takes them as a change made in the store (see
+/// [`crate::source_write::discard_write`]). `204`; `404` and `403` as for Retry; `409
+/// source_busy` while a listing or a structure change holds the library for more than ten
+/// seconds. Recorded as `source.write_discarded`.
 pub(crate) async fn discard_write(
     State(state): State<AppState>,
     signed: Signed,

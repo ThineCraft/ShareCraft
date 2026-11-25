@@ -1059,7 +1059,7 @@ impl IntoResponse for ApiError {
             }),
             ApiError::SourceBusy => json!({
                 "error": code,
-                "message": "A sync is running; try again in a moment.",
+                "message": "ShareCraft is busy with this library's storage. Try again in a moment.",
             }),
             ApiError::BranchNotFound => json!({
                 "error": code,

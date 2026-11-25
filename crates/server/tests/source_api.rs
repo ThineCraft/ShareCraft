@@ -1365,7 +1365,7 @@ async fn disconnect_while_a_sync_runs_is_refused() {
     assert_eq!(answer["error"], "source_busy");
     assert_eq!(
         answer["message"],
-        "A sync is running; try again in a moment."
+        "ShareCraft is busy with this library's storage. Try again in a moment."
     );
     assert_eq!(env.count("select count(*) from library_sources").await, 1);
     drop(hold);

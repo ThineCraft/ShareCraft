@@ -37,7 +37,7 @@ use crate::source_write::{Base, Probe, Seen, WriteError, Written, numbered_name,
 /// The longest key S3 accepts, in bytes.
 const MAX_KEY_BYTES: usize = 1024;
 /// How many names a copy tries: the plain one, then `(2)` to `(20)`.
-const LAST_NUMBER: u32 = 20;
+pub(crate) const LAST_NUMBER: u32 = 20;
 
 /// The key for the library-relative `path`: the library's prefix and the path.
 ///
@@ -186,14 +186,16 @@ pub async fn write_object_noted(
             Some(_) => return Ok(Written::Conflict),
         },
         Some(head) => {
-            if base.tag.as_deref() == Some(tag_of(&head).as_str()) {
+            // Our own content already there (an earlier attempt whose finish was not recorded)
+            // is done, whatever the base: sending the same bytes again would change nothing.
+            if is_ours(&head, body) {
+                return Ok(Written::Done(seen_of(&head)));
+            } else if base.tag.as_deref() == Some(tag_of(&head).as_str()) {
                 if conditions {
                     send(s3, t, &key, body, Cond::IfMatch(&head.etag), ledger).await
                 } else {
                     send(s3, t, &key, body, Cond::None, ledger).await
                 }
-            } else if is_ours(&head, body) {
-                return Ok(Written::Done(seen_of(&head)));
             } else {
                 return Ok(Written::Conflict);
             }
@@ -376,7 +378,7 @@ async fn forget(ledger: Option<&Ledger<'_>>, upload_id: &str) {
 }
 
 /// `path` split into its folder (with the closing `/`, or empty) and its name.
-fn split_path(path: &str) -> (&str, &str) {
+pub(crate) fn split_path(path: &str) -> (&str, &str) {
     match path.rfind('/') {
         Some(at) => (
             path.get(..=at).unwrap_or(""),
@@ -509,6 +511,27 @@ pub async fn write_numbered_noted(
     let mut names = vec![];
     names.extend((2..=LAST_NUMBER).map(|n| numbered_name(name, n)));
     put_first_free(s3, t, folder, &names, body, conditional, ledger).await
+}
+
+/// Whether `path` is free for `body`: nothing is there, or our own earlier attempt with this
+/// content is. One `HEAD`; nothing is written. The write worker picks a conflict copy's or a
+/// numbered file's name with it before any byte is sent, and the write to that name is still
+/// conditional (or checked first), so a name taken meanwhile is never overwritten.
+///
+/// # Errors
+/// [`WriteError`] when the store could not be asked; `Failed` for a path that is not a key.
+pub async fn name_free(
+    s3: &S3,
+    t: &S3Target,
+    path: &str,
+    body: &PutBody,
+) -> Result<bool, WriteError> {
+    let key = object_key(t, path).ok_or(WriteError::Failed)?;
+    match s3.head(t, &key).await {
+        Ok(head) => Ok(is_ours(&head, body)),
+        Err(S3Error::NotFound) => Ok(true),
+        Err(error) => Err(write_error(error)),
+    }
 }
 
 /// The body of a zero-byte object.

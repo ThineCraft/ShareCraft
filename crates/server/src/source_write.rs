@@ -5,8 +5,10 @@
 //! A change accepted for an external library is staged: its content is pinned in the
 //! external-content cache and a pending row names it ([`stage`]). From then on it is the file's
 //! current revision, served from the cache. The write worker ([`write_due`]) writes each
-//! pending row to the store once its content has passed the malware scan, holding the library's
-//! source lock so no listing runs meanwhile. A file changed in the store since it was read is
+//! pending row to the store once its content has passed the malware scan. It holds the library's
+//! source lock to check the row and again to record what was written, never while the content
+//! travels (see [`attempt`]), so a long upload keeps no listing and no rename, move, delete or
+//! copy of another item of the library waiting. A file changed in the store since it was read is
 //! kept, and the change becomes a named copy beside it; a new file whose name was taken
 //! meanwhile is written under a numbered name. A failed write is tried again with a growing
 //! wait; a refused one blocks the library until a write probe passes again.
@@ -44,8 +46,8 @@ use crate::checkpoint::Checkpointer;
 use crate::s3::{COPY_MAX, PutBody, S3Error, S3Target};
 use crate::s3_source::nameable_segment;
 use crate::s3_write::{
-    Ledger, Moved, copy_item, delete_held, hold, holding_root, make_folder, move_item, object_key,
-    probe_writes, remove_copies, sweep_holding, unhold, write_beside_noted, write_numbered_noted,
+    LAST_NUMBER, Ledger, Moved, copy_item, delete_held, hold, holding_root, make_folder, move_item,
+    name_free, object_key, probe_writes, remove_copies, split_path, sweep_holding, unhold,
     write_object_noted,
 };
 use crate::tree::{self, TreeOp};
@@ -294,8 +296,15 @@ const READ_ONLY_NOW: &str =
 const CONTENT_MISSING: &str = "The content of this change is missing from this server.";
 const SCAN_TOO_LARGE: &str =
     "The file is too large for the malware scanner, so it is not written to the storage.";
+const COPY_FAILED: &str = "The file changed in the storage meanwhile, and the copy that keeps \
+                           this change could not be made. Saving is tried again later.";
 /// How long a change waits for its scan or a listing before it is looked at again.
 const HELD_SECONDS: i64 = 5;
+/// How long the write worker waits for the library's source lock to record what a transfer
+/// did (a listing pass or a structure change holds it meanwhile). Past it, the row stays
+/// pending and is looked at again after [`HELD_SECONDS`]: its content is found in the store and
+/// recorded then, never sent twice. Ten seconds, as a request waits for the lock.
+const FINISH_WAIT: Duration = Duration::from_secs(10);
 
 /// What [`stage`] stages: the content `blob` (already in the content store, held by the caller)
 /// as the new state of `node`, at the library-relative `path` of the S3 library `library`.
@@ -785,9 +794,27 @@ pub struct SourceWrites {
     paused: AtomicBool,
     /// [`is_bucket_file`] answers a failure, as a database outage would. For tests.
     bucket_lookup_fails: AtomicBool,
+    /// How long a finish waits for the source lock, when not [`FINISH_WAIT`]. For tests.
+    finish_wait: Mutex<Option<Duration>>,
 }
 
 impl SourceWrites {
+    /// Makes the worker wait `wait` (rather than [`FINISH_WAIT`]) for the library's source lock
+    /// to record what a transfer did. For tests.
+    pub fn set_finish_wait_for_tests(&self, wait: Duration) {
+        *self
+            .finish_wait
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(wait);
+    }
+
+    fn finish_wait(&self) -> Duration {
+        self.finish_wait
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .unwrap_or(FINISH_WAIT)
+    }
+
     /// Makes [`is_bucket_file`] fail (or work again), as it does when the database cannot be
     /// read. For tests.
     pub fn set_bucket_lookup_fails_for_tests(&self, fails: bool) {
@@ -875,7 +902,8 @@ pub(crate) fn start_writer(state: AppState) -> Writer {
 }
 
 /// Writes up to [`WRITES_AT_ONCE`] pending writes due at `now` (one per file), each once its
-/// content is available after the malware scan and while no listing holds its library; then
+/// content is available after the malware scan and when no listing holds its library as it
+/// starts (see [`attempt`]); then
 /// probes again the blocked libraries whose time has come. Answers how many rows were acted
 /// on: written, written as a copy, failed or withdrawn.
 pub async fn write_due(state: &AppState, now: OffsetDateTime) -> usize {
@@ -926,75 +954,86 @@ async fn write_one(state: &AppState, due: PendingWrite, now: OffsetDateTime) -> 
             return false;
         }
     }
-    // A listing holds the lock for its whole pass: the row is looked at again shortly.
+    // A conflict hands the content on to one more write in the same turn: the copy beside a
+    // file changed in the store, or a new file under its numbered name. A second conflict is
+    // left for the next turn (its row stays due).
+    let mut acted = false;
+    let mut next = Some(due);
+    for _ in 0..2 {
+        let Some(row) = next.take() else {
+            break;
+        };
+        match attempt(state, &row, now).await {
+            Attempt::Untouched => {}
+            Attempt::Acted => acted = true,
+            Attempt::Then(follow) => {
+                acted = true;
+                next = Some(*follow);
+            }
+        }
+    }
+    acted
+}
+
+/// What one [`attempt`] came to.
+enum Attempt {
+    /// Nothing was done (held back, withdrawn or changed meanwhile, or the records failed).
+    Untouched,
+    /// Written, written as a copy, failed or withdrawn.
+    Acted,
+    /// A conflict was settled and this row (the copy, or the file under its new name) is to be
+    /// written next.
+    Then(Box<PendingWrite>),
+}
+
+/// One write of `due`, in three steps, so that no byte travels while the library's source lock
+/// is held (a rename, move, delete, restore or copy of any other item of the library would wait
+/// for it, and give up with `409 source_busy`):
+///
+/// 1. Under the lock, briefly: the row is read again and the checks of [`ready`] are made. A
+///    listing or a structure change holding the lock holds the row back a few seconds.
+/// 2. Without the lock: the content is sent ([`write_object_noted`], a `PUT` or a multipart
+///    upload). The path cannot change meanwhile: a rename, move, delete or copy of the file, or
+///    of a folder with it inside, is refused with `409 source_item_saving` while its row is
+///    there, and a listing leaves a file with a row alone (a tracked one keeps its recorded
+///    entry; a new one's path is dropped from the listing).
+/// 3. Under the lock again, waiting for it up to [`FINISH_WAIT`]: what was sent is recorded
+///    ([`record_finish`]) or the conflict settled ([`conflict`]). A listing reads the recorded
+///    items and the pending rows inside one locked pass, so it never sees a row gone without its
+///    recorded tag. When the lock cannot be had, the row stays pending: the next attempt finds
+///    its content in the store and records it, with nothing sent twice.
+///
+/// One worker runs writes ([`start_writer`]), one row at a time, so a row is never sent twice
+/// at once though the lock is not held while it travels.
+async fn attempt(state: &AppState, due: &PendingWrite, now: OffsetDateTime) -> Attempt {
+    let db = state.db();
+    // A listing holds the lock for its whole pass, a structure change for its own steps: the
+    // row is looked at again shortly.
     let lock = match db.try_lock_source(due.library).await {
         Ok(Some(lock)) => lock,
         Ok(None) => {
-            defer(state, &due, now).await;
-            return false;
+            defer(state, due, now).await;
+            return Attempt::Untouched;
         }
         Err(e) => {
             eprintln!("sharecraft-server: cannot take a library's source lock: {e}");
-            return false;
+            return Attempt::Untouched;
         }
     };
     let row = match db.pending_write(due.node).await {
         Ok(Some(row)) if row.blob == due.blob => row,
         // Withdrawn, written, or changed meanwhile: the new row is looked at next time.
-        _ => return false,
+        _ => return Attempt::Untouched,
     };
-    let acted = write_locked(state, &row, now).await;
+    let checked = ready(state, &row, now).await;
     drop(lock);
-    acted
-}
-
-/// [`write_one`], once the library's source lock is held and the row read again.
-async fn write_locked(state: &AppState, row: &PendingWrite, now: OffsetDateTime) -> bool {
-    let db = state.db();
-    match db.source_of(row.library).await {
-        Ok(Some((config, _)))
-            if config.kind == SourceKind::S3 && config.mode == SourceMode::ReadWrite => {}
-        Ok(_) => {
-            fail(state, row, now, READ_ONLY_NOW).await;
-            return true;
-        }
-        Err(e) => {
-            eprintln!("sharecraft-server: cannot read a library's connection: {e}");
-            return false;
-        }
-    }
-    match db.write_state(row.library).await {
-        Ok(Some((WriteState::Blocked, _))) => {
-            state.writes().note_blocked(row.library, None);
-            return false;
-        }
-        Ok(_) => {}
-        Err(e) => {
-            eprintln!("sharecraft-server: cannot read a library's write state: {e}");
-            return false;
-        }
-    }
-    let target = match state.s3().target(state, row.library).await {
-        Ok(target) => target,
-        Err(S3Error::AddressRefused) => {
-            fail(state, row, now, NOT_APPROVED).await;
-            return true;
-        }
-        Err(_) => {
-            fail(state, row, now, &sentence(WriteError::Offline)).await;
-            return true;
-        }
-    };
-    let conditional = match db.s3_place(row.library).await {
-        Ok(place) => place.map_or(Tri::Unknown, |place| place.conditional),
-        Err(e) => {
-            eprintln!("sharecraft-server: cannot read a library's place: {e}");
-            return false;
-        }
-    };
-    let Some(held) = state.blobs().hold_stored(row.blob).await else {
-        fail(state, row, now, CONTENT_MISSING).await;
-        return true;
+    let Ready {
+        target,
+        conditional,
+        held,
+    } = match checked {
+        Ok(ready) => ready,
+        Err(outcome) => return outcome,
     };
     let body = PutBody {
         path: Some(state.blobs().store().path_of(&row.blob.sha256)),
@@ -1005,7 +1044,7 @@ async fn write_locked(state: &AppState, row: &PendingWrite, now: OffsetDateTime)
         tag: row.base_tag.clone(),
         sha256: None,
     };
-    let ledger = ledger_of(state, row, now);
+    let ledger = ledger_of(state, &row, now);
     let written = write_object_noted(
         state.s3(),
         &target,
@@ -1016,13 +1055,166 @@ async fn write_locked(state: &AppState, row: &PendingWrite, now: OffsetDateTime)
         Some(&ledger),
     )
     .await;
-    match written {
-        Ok(Written::Done(seen)) => finished(state, row, &row.path, &seen, conditional).await,
-        Ok(Written::Conflict) => conflict(state, &target, row, &body, conditional, now).await,
-        Err(error) => failed_write(state, row, error, now).await,
-    }
+    let outcome = match written {
+        Ok(Written::Done(seen)) => {
+            record_finish(state, &row, &seen, conditional, now).await;
+            Attempt::Acted
+        }
+        Ok(Written::Conflict) => conflict(state, &target, &row, &body, now).await,
+        Err(error) => {
+            // Only the row's own state and retry time change: no lock is needed.
+            failed_write(state, &row, error, now).await;
+            Attempt::Acted
+        }
+    };
     drop(held);
-    true
+    outcome
+}
+
+/// What a transfer needs, once [`ready`] has judged the row writable.
+struct Ready {
+    target: S3Target,
+    conditional: Tri,
+    /// Keeps the staged content in the store until the transfer is over.
+    held: Held,
+}
+
+/// The checks before a transfer, made under the library's source lock just before it is given
+/// up for the transfer: the connection is still S3 in read and write mode, its writes are not
+/// blocked, its endpoint still approved (the target), what the probe found about conditional
+/// writes, and the staged content is here.
+///
+/// They stay under the lock, though none of them sends a byte, because the lock is what proves
+/// that no structure change is half done at this moment: a rename or move that began before the
+/// row was staged may be copying objects, and it moves the row along when it is done; the row
+/// read again under the lock (in [`attempt`]) therefore has the path the file has now. From the
+/// moment the lock is given up, the row itself keeps every structure change away from the file
+/// (`409 source_item_saving`). The connection checks need no lock to stay true during the
+/// transfer: the mode cannot become read-only and the library cannot be disconnected while the
+/// row is there (both are refused with changes pending), and a block or a change of endpoint
+/// that comes during the transfer makes the transfer fail or is seen at the next attempt.
+///
+/// `Err` carries what the attempt came to when the row is not written now.
+async fn ready(
+    state: &AppState,
+    row: &PendingWrite,
+    now: OffsetDateTime,
+) -> Result<Ready, Attempt> {
+    let db = state.db();
+    match db.source_of(row.library).await {
+        Ok(Some((config, _)))
+            if config.kind == SourceKind::S3 && config.mode == SourceMode::ReadWrite => {}
+        Ok(_) => {
+            fail(state, row, now, READ_ONLY_NOW).await;
+            return Err(Attempt::Acted);
+        }
+        Err(e) => {
+            eprintln!("sharecraft-server: cannot read a library's connection: {e}");
+            return Err(Attempt::Untouched);
+        }
+    }
+    match db.write_state(row.library).await {
+        Ok(Some((WriteState::Blocked, _))) => {
+            state.writes().note_blocked(row.library, None);
+            return Err(Attempt::Untouched);
+        }
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("sharecraft-server: cannot read a library's write state: {e}");
+            return Err(Attempt::Untouched);
+        }
+    }
+    let target = match state.s3().target(state, row.library).await {
+        Ok(target) => target,
+        Err(S3Error::AddressRefused) => {
+            fail(state, row, now, NOT_APPROVED).await;
+            return Err(Attempt::Acted);
+        }
+        Err(_) => {
+            fail(state, row, now, &sentence(WriteError::Offline)).await;
+            return Err(Attempt::Acted);
+        }
+    };
+    let conditional = match db.s3_place(row.library).await {
+        Ok(place) => place.map_or(Tri::Unknown, |place| place.conditional),
+        Err(e) => {
+            eprintln!("sharecraft-server: cannot read a library's place: {e}");
+            return Err(Attempt::Untouched);
+        }
+    };
+    let Some(held) = state.blobs().hold_stored(row.blob).await else {
+        fail(state, row, now, CONTENT_MISSING).await;
+        return Err(Attempt::Acted);
+    };
+    Ok(Ready {
+        target,
+        conditional,
+        held,
+    })
+}
+
+/// The library's source lock for recording what a transfer did, waiting up to
+/// [`FINISH_WAIT`] (as set for tests) for a listing or a structure change to give it up; `None`
+/// after that, or when the records fail.
+async fn finish_lock(state: &AppState, library: NodeId) -> Option<SourceLock> {
+    let deadline = tokio::time::Instant::now() + state.writes().finish_wait();
+    loop {
+        match state.db().try_lock_source(library).await {
+            Ok(Some(lock)) => return Some(lock),
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("sharecraft-server: cannot take a library's source lock: {e}");
+                return None;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// Records that the row's content is in the store, as `seen`, under the library's source lock
+/// ([`finish_lock`]). The row is read again first: if it was withdrawn meanwhile (a discard
+/// during the transfer, perhaps followed by a new save, which is a new row with a new first
+/// staging time), nothing is recorded, and the next listing sees the object as a change made in
+/// the store, which is taken, never overwritten. A newer save of the same row is recorded as
+/// [`Db::finish_write`] does (the row stays, based on what was written).
+///
+/// Without the lock the row stays pending, held back a few seconds, and is noted as based on
+/// what was written ([`Db::rebase_write`]): the next attempt's first `HEAD` finds its own content
+/// and records the finish with nothing sent again, and a newer save of the row meanwhile is
+/// based on this content rather than taken for a conflict.
+async fn record_finish(
+    state: &AppState,
+    row: &PendingWrite,
+    seen: &Seen,
+    conditional: Tri,
+    now: OffsetDateTime,
+) {
+    let db = state.db();
+    let Some(lock) = finish_lock(state, row.library).await else {
+        if let Err(e) = db
+            .rebase_write(row.node, row.first_staged_at, &seen.tag)
+            .await
+        {
+            eprintln!("sharecraft-server: cannot note a write whose finish waits: {e}");
+        }
+        defer(state, row, now).await;
+        return;
+    };
+    match db.pending_write(row.node).await {
+        Ok(Some(current)) if current.first_staged_at == row.first_staged_at => {
+            finished(state, row, seen, conditional).await;
+        }
+        Ok(_) => eprintln!(
+            "sharecraft-server: a change was withdrawn while it was being written; the next \
+             listing finds what was written"
+        ),
+        // The next attempt's first look finds our content there and finishes it.
+        Err(e) => eprintln!("sharecraft-server: cannot read a written change again: {e}"),
+    }
+    drop(lock);
 }
 
 /// Where a multipart upload of the row's content is recorded while it is open.
@@ -1035,15 +1227,10 @@ fn ledger_of<'a>(state: &'a AppState, row: &PendingWrite, now: OffsetDateTime) -
     }
 }
 
-/// Records that the row's content is at `path` in the store, as `seen`.
-async fn finished(state: &AppState, row: &PendingWrite, path: &str, seen: &Seen, conditional: Tri) {
+/// Records that the row's content is at its path in the store, as `seen`; the source lock is
+/// held.
+async fn finished(state: &AppState, row: &PendingWrite, seen: &Seen, conditional: Tri) {
     let db = state.db();
-    if path != row.path
-        && let Err(e) = db.repath_write(row.node, &row.blob.sha256, path).await
-    {
-        eprintln!("sharecraft-server: cannot record the name a new file was written under: {e}");
-        return;
-    }
     if let Err(e) = db
         .finish_write(
             row.node,
@@ -1054,7 +1241,8 @@ async fn finished(state: &AppState, row: &PendingWrite, path: &str, seen: &Seen,
         )
         .await
     {
-        // The next attempt's first look finds our content there and finishes it.
+        // The next attempt's first look finds our content there and finishes it (a newer save
+        // of the row meanwhile is then taken for a conflict: the records were failing).
         eprintln!("sharecraft-server: cannot record a finished write: {e}");
         return;
     }
@@ -1070,17 +1258,47 @@ async fn finished(state: &AppState, row: &PendingWrite, path: &str, seen: &Seen,
 }
 
 /// The file changed in the store since it was read, or a new file's name was taken meanwhile:
-/// nothing is overwritten. A tracked file's change becomes a named copy beside it and the file
-/// takes the store's state; a new file is written under a numbered name.
+/// nothing is overwritten. The conflict is settled under the library's source lock
+/// ([`finish_lock`]) and sends no content itself: a tracked file's change becomes a new file
+/// beside it ([`beside`]), and a new file moves to a numbered name ([`numbered`]); either is
+/// then written as an ordinary new file, so its bytes travel without the lock and a listing
+/// meanwhile leaves its path alone. Without the lock the row is held back a few seconds and the
+/// next attempt meets the same conflict.
 async fn conflict(
     state: &AppState,
     target: &S3Target,
     row: &PendingWrite,
     body: &PutBody,
-    conditional: Tri,
     now: OffsetDateTime,
-) {
+) -> Attempt {
+    let Some(lock) = finish_lock(state, row.library).await else {
+        defer(state, row, now).await;
+        return Attempt::Acted;
+    };
+    let outcome = conflict_locked(state, target, row, body, now).await;
+    drop(lock);
+    outcome
+}
+
+/// [`conflict`], once the source lock is held.
+async fn conflict_locked(
+    state: &AppState,
+    target: &S3Target,
+    row: &PendingWrite,
+    body: &PutBody,
+    now: OffsetDateTime,
+) -> Attempt {
     let db = state.db();
+    // Read again: a newer save is looked at in its own turn, and a withdrawn one is gone.
+    match db.pending_write(row.node).await {
+        Ok(Some(current))
+            if current.blob == row.blob && current.first_staged_at == row.first_staged_at => {}
+        Ok(_) => return Attempt::Acted,
+        Err(e) => {
+            eprintln!("sharecraft-server: cannot read a change in conflict again: {e}");
+            return Attempt::Acted;
+        }
+    }
     let author = match db.user(row.by).await {
         Ok(author) => author,
         Err(e) => {
@@ -1092,64 +1310,177 @@ async fn conflict(
         Ok(item) => item.is_some(),
         Err(e) => {
             eprintln!("sharecraft-server: cannot read a file's tracking row: {e}");
-            return;
+            return Attempt::Acted;
         }
     };
-    if !tracked {
-        let ledger = ledger_of(state, row, now);
-        let written = write_numbered_noted(
-            state.s3(),
-            target,
-            &row.path,
-            body,
-            conditional,
-            Some(&ledger),
-        )
-        .await;
-        match written {
-            Ok((path, seen)) => {
-                if let Some(author) = &author {
-                    let name = last_segment(&path).to_owned();
-                    let renamed = TreeOp::Rename { id: row.node, name };
-                    if let Err(e) = tree::apply(state, author, renamed).await {
-                        // The listing moves it to the name it has in the store.
-                        eprintln!("sharecraft-server: a new file could not take its name: {e}");
-                    }
-                }
-                finished(state, row, &path, &seen, conditional).await;
+    if tracked {
+        beside(state, target, row, body, author.as_ref(), now).await
+    } else {
+        numbered(state, target, row, body, author.as_ref(), now).await
+    }
+}
+
+/// A new file whose name was taken in the store meanwhile takes the first numbered name
+/// (`name (2).ext` to `name (20).ext`) that is free in the store ([`name_free`]: nothing there,
+/// or our own earlier attempt) and in its folder, and its change moves there (the row's path),
+/// to be written next. A name that the store takes between this look and the write is a
+/// conflict again, settled the same way. When every name is taken the row fails.
+async fn numbered(
+    state: &AppState,
+    target: &S3Target,
+    row: &PendingWrite,
+    body: &PutBody,
+    author: Option<&User>,
+    now: OffsetDateTime,
+) -> Attempt {
+    let db = state.db();
+    let (folder, name) = split_path(&row.path);
+    for n in 2..=LAST_NUMBER {
+        let candidate = numbered_name(name, n);
+        let path = format!("{folder}{candidate}");
+        match name_free(state.s3(), target, &path, body).await {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(error) => {
+                failed_write(state, row, error, now).await;
+                return Attempt::Acted;
             }
-            Err(error) => failed_write(state, row, error, now).await,
         }
-        return;
+        if let Some(author) = author {
+            let renamed = TreeOp::Rename {
+                id: row.node,
+                name: candidate.clone(),
+            };
+            match tree::apply(state, author, renamed).await {
+                Ok(_) => {}
+                Err(AccessError::NameTaken) => continue,
+                // The listing moves it to the name it has in the store.
+                Err(e) => eprintln!("sharecraft-server: a new file could not take its name: {e}"),
+            }
+        }
+        match db.repath_write(row.node, &row.blob.sha256, &path).await {
+            Ok(true) => {}
+            Ok(false) => return Attempt::Acted,
+            Err(e) => {
+                eprintln!(
+                    "sharecraft-server: cannot record the name a new file is written under: {e}"
+                );
+                return Attempt::Acted;
+            }
+        }
+        return match db.pending_write(row.node).await {
+            Ok(Some(next)) if next.blob == row.blob => Attempt::Then(Box::new(next)),
+            _ => Attempt::Acted,
+        };
     }
-    let person = author.as_ref().map_or("", |author| author.name.as_str());
-    let ledger = ledger_of(state, row, now);
-    let written = write_beside_noted(
-        state.s3(),
-        target,
-        &row.path,
-        body,
-        person,
-        now,
-        conditional,
-        Some(&ledger),
-    )
-    .await;
-    let (path, seen) = match written {
-        Ok(written) => written,
-        Err(error) => {
-            failed_write(state, row, error, now).await;
-            return;
+    fail(state, row, now, &sentence(WriteError::Failed)).await;
+    Attempt::Acted
+}
+
+/// A tracked file changed in the store since the change was based on it: the store's state is
+/// kept, and the change becomes a new file beside it, credited to its author, named for the
+/// author and `now` ([`sibling_name`], numbered `(2)` to `(20)` if taken) with the first name
+/// free in the store ([`name_free`]) and in the folder. The copy's node is made and its content
+/// staged as a new file's (to be written next); then the file's own change is withdrawn and the
+/// file takes the store's state. Recorded as `source.conflict_copy {node, copy}`. When no copy
+/// can be made the row fails and keeps its content.
+async fn beside(
+    state: &AppState,
+    target: &S3Target,
+    row: &PendingWrite,
+    body: &PutBody,
+    author: Option<&User>,
+    now: OffsetDateTime,
+) -> Attempt {
+    let db = state.db();
+    let Some(author) = author else {
+        fail(state, row, now, COPY_FAILED).await;
+        return Attempt::Acted;
+    };
+    let parent = match db.node(row.node).await {
+        Ok(Some(node)) => node.parent,
+        Ok(None) => None,
+        Err(e) => {
+            eprintln!("sharecraft-server: cannot read the file a copy is made beside: {e}");
+            return Attempt::Acted;
         }
     };
-    let copy = match &author {
-        Some(author) => copy_node(state, author, row, &path, &seen, now).await,
-        None => None,
+    let Some(parent) = parent else {
+        fail(state, row, now, COPY_FAILED).await;
+        return Attempt::Acted;
     };
-    if let Err(e) = db.drop_write(row.node, &row.blob.sha256).await {
-        eprintln!("sharecraft-server: cannot withdraw a change written as a copy: {e}");
+    let (folder, name) = split_path(&row.path);
+    let first = sibling_name(name, &author.name, now);
+    let mut names = vec![first.clone()];
+    names.extend((2..=LAST_NUMBER).map(|n| numbered_name(&first, n)));
+    for candidate in names {
+        let path = format!("{folder}{candidate}");
+        match name_free(state.s3(), target, &path, body).await {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(error) => {
+                failed_write(state, row, error, now).await;
+                return Attempt::Acted;
+            }
+        }
+        let id = DocId(Uuid::new_v4());
+        let editor = Editor::for_file_name(&candidate);
+        let size = Some(row.blob.size);
+        match tree::create_document(state, author, parent, id, &candidate, editor, size).await {
+            Ok(_) => {}
+            Err(AccessError::NameTaken) => continue,
+            Err(e) => {
+                eprintln!("sharecraft-server: the node of a copy could not be made: {e}");
+                fail(state, row, now, COPY_FAILED).await;
+                return Attempt::Acted;
+            }
+        }
+        let copy = NodeId(id.0);
+        let request = StageRequest {
+            library: row.library,
+            node: copy,
+            path: &path,
+            blob: row.blob,
+            base_tag: None,
+            seen_revision: None,
+            by: row.by,
+            flush: true,
+        };
+        if let Err(e) = stage(state, &request).await {
+            eprintln!("sharecraft-server: the content of a copy could not be staged: {e:?}");
+            if let Err(removed) = tree::apply(state, author, TreeOp::Delete { id: copy }).await {
+                eprintln!(
+                    "sharecraft-server: a copy with no content could not be removed: {removed}"
+                );
+            }
+            fail(state, row, now, COPY_FAILED).await;
+            return Attempt::Acted;
+        }
+        // The copy's row holds the content now; the file's own change is withdrawn.
+        if let Err(e) = db.drop_write(row.node, &row.blob.sha256).await {
+            eprintln!("sharecraft-server: cannot withdraw a change made into a copy: {e}");
+        }
+        taken_from_store(state, target, row).await;
+        state.sources().wake(row.library);
+        emit(
+            state,
+            "source.conflict_copy",
+            row.library,
+            Some(row.node),
+            json!({ "node": row.node.0, "copy": copy.0 }),
+        );
+        return match db.pending_write(copy).await {
+            Ok(Some(next)) => Attempt::Then(Box::new(next)),
+            _ => Attempt::Acted,
+        };
     }
-    // The file is what the store holds now.
+    fail(state, row, now, &sentence(WriteError::Failed)).await;
+    Attempt::Acted
+}
+
+/// The file of `row` is what the store holds now: its tracking row takes the store's tag.
+async fn taken_from_store(state: &AppState, target: &S3Target, row: &PendingWrite) {
+    let db = state.db();
     if let Some(key) = object_key(target, &row.path)
         && let Ok(head) = state.s3().head(target, &key).await
         && let Ok(Some(item)) = db.external_item(row.node).await
@@ -1163,70 +1494,6 @@ async fn conflict(
             eprintln!("sharecraft-server: cannot record a file changed in the store: {e}");
         }
     }
-    state.sources().wake(row.library);
-    emit(
-        state,
-        "source.conflict_copy",
-        row.library,
-        Some(row.node),
-        json!({ "node": row.node.0, "copy": copy.map(|copy| copy.0) }),
-    );
-}
-
-/// The node of the copy written at `path` beside `row`'s file, credited to `author`, tracked as
-/// what the store holds (`seen`) with its content recorded. `None` if it could not be made:
-/// the next listing adds it.
-async fn copy_node(
-    state: &AppState,
-    author: &User,
-    row: &PendingWrite,
-    path: &str,
-    seen: &Seen,
-    now: OffsetDateTime,
-) -> Option<NodeId> {
-    let db = state.db();
-    let parent = match db.node(row.node).await {
-        Ok(Some(node)) => node.parent?,
-        Ok(None) => return None,
-        Err(e) => {
-            eprintln!("sharecraft-server: cannot read the file a copy was written beside: {e}");
-            return None;
-        }
-    };
-    let name = last_segment(path);
-    let id = DocId(Uuid::new_v4());
-    let editor = Editor::for_file_name(name);
-    let created =
-        tree::create_document(state, author, parent, id, name, editor, Some(seen.size)).await;
-    if let Err(e) = created {
-        eprintln!("sharecraft-server: the node of a copy could not be made: {e}");
-        return None;
-    }
-    let node = NodeId(id.0);
-    let entry = ExternalEntry {
-        node,
-        path: path.to_owned(),
-        repository_path: path.to_owned(),
-        size: seen.size,
-        mtime_ns: i64::try_from(seen.modified.unix_timestamp_nanos()).unwrap_or(0),
-        tag: Some(seen.tag.clone()),
-    };
-    if let Err(e) = db.record_external_item(row.library, &entry).await {
-        eprintln!("sharecraft-server: the copy could not be tracked: {e}");
-        return Some(node);
-    }
-    if let Err(e) = db
-        .set_external_content(node, &seen.tag, &row.blob.sha256, now)
-        .await
-    {
-        eprintln!("sharecraft-server: the content of a copy could not be recorded: {e}");
-    }
-    Some(node)
-}
-
-/// The last segment of a `/`-separated path.
-fn last_segment(path: &str) -> &str {
-    path.rsplit('/').next().unwrap_or(path)
 }
 
 /// What a failed write says to the people who see it.
@@ -1436,11 +1703,14 @@ pub(crate) fn emit(
     });
 }
 
-/// How long a request that must hold a library's source lock waits for a listing or a write.
+/// How long a request that must hold a library's source lock waits for a listing, another
+/// structure change or a write's checks or finish.
 const LOCK_WAIT: Duration = Duration::from_secs(10);
 
-/// The library's source lock, waiting up to [`LOCK_WAIT`] for a listing or a write to give it up
-/// (`409 source_busy` after that). Held, no listing and no write of the library runs.
+/// The library's source lock, waiting up to [`LOCK_WAIT`] for a listing, another structure
+/// change or the write worker (which holds it only to check a row and to record a finish, never
+/// while content travels) to give it up (`409 source_busy` after that). Held, no listing runs,
+/// no write starts and no write's finish is recorded in the library.
 async fn lock_source(db: &Db, library: NodeId) -> Result<SourceLock, ApiError> {
     let deadline = tokio::time::Instant::now() + LOCK_WAIT;
     loop {
@@ -3755,9 +4025,15 @@ pub(crate) async fn retry(
 /// A file the bucket has shows the bucket's content again, with a new revision; a new file
 /// never written is deleted (to the recycle bin, as the person, and in slice 1 it cannot be
 /// restored into this library). Nothing in the bucket is changed. The library's source lock is
-/// taken first (`409 source_busy` after ten seconds), so a write in progress finishes first: if
-/// it wrote the change meanwhile there is nothing left to discard (`404`). Records
-/// `source.write_discarded {node}`.
+/// taken first (`409 source_busy` after ten seconds), so a write whose finish is being recorded
+/// finishes first: if it was recorded meanwhile there is nothing left to discard (`404`).
+///
+/// The worker does not hold the lock while the content travels, so a discard can come during
+/// the transfer. The change is withdrawn all the same; if its bytes then land, the worker finds
+/// the row gone and records nothing, and the next listing sees the object as a change made in
+/// the store: a tracked file takes it as its content (it is the person's own content, and the
+/// file's history keeps what it had), a new file appears again from the store. Nothing is
+/// overwritten and nothing is left half recorded. Records `source.write_discarded {node}`.
 pub(crate) async fn discard_write(
     state: &AppState,
     actor: &User,
