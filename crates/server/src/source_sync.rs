@@ -745,6 +745,13 @@ impl Sources {
         self.wake.notify_one();
     }
 
+    /// Whether `library` was woken and not yet looked at, forgetting the wake. A test seam: the
+    /// servers of tests that run no workers keep every wake here.
+    #[doc(hidden)]
+    pub fn take_wake_for_tests(&self, library: NodeId) -> bool {
+        lock(&self.pending).remove(&library)
+    }
+
     /// Forgets the failures in a row of `library`: someone changed the connection.
     pub(crate) fn forget_failures(&self, library: NodeId) {
         lock(&self.failures).remove(&library);

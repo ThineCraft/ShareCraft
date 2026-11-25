@@ -725,8 +725,8 @@ enum Act {
 /// What a read-and-write S3 library does with a row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum S3rw {
-    /// Slice 1 lets it through and the change is staged for the bucket: it answers as in an
-    /// ordinary library.
+    /// Let through: the change is staged for the bucket (slice 1) or made in it during the
+    /// request (renames and moves, slice 2). It answers as in an ordinary library.
     Succeeds,
     /// Refused with this code (for a bulk request, its one item).
     Refused(&'static str),
@@ -772,8 +772,10 @@ const ROWS: &[Row] = &[
     row(Act::StartNewVersion, "POST /api/uploads", 201, Succeeds),
     row(Act::Chunk, "PUT /api/uploads/{id}", 200, Succeeds),
     row(Act::Finish, "POST /api/uploads/{id}/finish", 201, Succeeds),
-    row(Act::Rename, "PATCH /api/nodes/{id}", 200, UNAVAILABLE),
-    row(Act::MoveWithin, "PATCH /api/nodes/{id}", 200, UNAVAILABLE),
+    // Renames and moves inside the library go through the bucket (slice 2); moves into, out of
+    // or between libraries stay unavailable.
+    row(Act::Rename, "PATCH /api/nodes/{id}", 200, Succeeds),
+    row(Act::MoveWithin, "PATCH /api/nodes/{id}", 200, Succeeds),
     row(Act::MoveIn, "PATCH /api/nodes/{id}", 200, UNAVAILABLE),
     row(Act::MoveOut, "PATCH /api/nodes/{id}", 200, UNAVAILABLE),
     row(Act::CopyIn, "POST /api/nodes/{id}/copy", 201, UNAVAILABLE),
@@ -785,7 +787,7 @@ const ROWS: &[Row] = &[
     ),
     row(Act::Delete, "DELETE /api/nodes/{id}", 204, UNAVAILABLE),
     row(Act::Restore, "POST /api/bin/{id}/restore", 200, UNAVAILABLE),
-    row(Act::BulkMove, "POST /api/bulk", 200, UNAVAILABLE),
+    row(Act::BulkMove, "POST /api/bulk", 200, Succeeds),
     row(Act::BulkMoveIn, "POST /api/bulk", 200, UNAVAILABLE),
     row(Act::BulkMoveOut, "POST /api/bulk", 200, UNAVAILABLE),
     row(Act::BulkCopyIn, "POST /api/bulk", 200, UNAVAILABLE),
@@ -813,7 +815,14 @@ const ROWS: &[Row] = &[
         403,
         READ_ONLY,
     ),
-    row(Act::RenameFolder, "PATCH /api/nodes/{id}", 200, UNAVAILABLE),
+    // Through the bucket like a file's rename, but the uploads and the save above are still
+    // waiting to be written below it.
+    row(
+        Act::RenameFolder,
+        "PATCH /api/nodes/{id}",
+        200,
+        Refused("source_item_saving"),
+    ),
     row(Act::RenameLibrary, "PATCH /api/nodes/{id}", 200, READ_ONLY),
     row(
         Act::DeleteFolder,
@@ -1720,7 +1729,10 @@ async fn every_write_route_is_refused_in_an_s3_library() {
 }
 
 /// The `message` of `409 source_action_unavailable`, word for word.
-const UNAVAILABLE_MESSAGE: &str = "This cannot be done yet in a library stored in S3. Uploading files, saving and making folders work; renaming, moving, copying and deleting come later.";
+const UNAVAILABLE_MESSAGE: &str = "This cannot be done yet in a library stored in S3.";
+
+/// The `message` of `409 source_item_saving`, word for word.
+const ITEM_SAVING_MESSAGE: &str = "This is still being saved to the storage. Try again when saving has finished, or discard the save that failed.";
 
 /// The table against a read-and-write S3 library, for its owner and for an administrator: a
 /// `Refused` row answers its code (with its message), and a `Succeeds` row answers as in an
@@ -1762,17 +1774,41 @@ async fn every_guarded_route_follows_its_s3_read_write_decision() {
                 row.act
             );
             assert_eq!(body["error"], code, "{:?} as {who}: {body}", row.act);
-            let message = if code == "source_read_only" {
-                MESSAGE
-            } else {
-                UNAVAILABLE_MESSAGE
+            let message = match code {
+                "source_read_only" => MESSAGE,
+                "source_item_saving" => ITEM_SAVING_MESSAGE,
+                _ => UNAVAILABLE_MESSAGE,
             };
             assert_eq!(body["message"], message, "{:?} as {who}: {body}", row.act);
         }
     }
-    // Nothing but the uploads, new folders and saves reached the bucket (the finished sessions'
-    // files go to the library's top).
+    // Nothing but the uploads, new folders and saves, and the renames and moves inside the
+    // library, reached the bucket (the finished sessions' files go to the library's top).
     for (method, key, _) in env.s3.writes() {
+        if method == "COPY" {
+            assert!(
+                [
+                    "docs/renamed.txt",
+                    "other/move-me.txt",
+                    "other/bulk-move.txt"
+                ]
+                .contains(&key.as_str()),
+                "{key}"
+            );
+            continue;
+        }
+        if method == "DELETE" {
+            assert!(
+                [
+                    "docs/rename-me.txt",
+                    "docs/move-me.txt",
+                    "docs/bulk-move.txt"
+                ]
+                .contains(&key.as_str()),
+                "{key}"
+            );
+            continue;
+        }
         assert_eq!(method, "PUT", "{key}");
         assert!(
             key.starts_with("docs/uploaded-")

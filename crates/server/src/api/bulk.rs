@@ -5,7 +5,8 @@
 //! `POST /api/nodes/{id}/copy`, `DELETE /api/nodes/{id}`, `POST /api/bin/{id}/restore`), with
 //! its own result, in the order given: one failing does not stop the others. An item in, or
 //! going into, a library connected to a source is refused as the single-item route refuses it
-//! (`source_read_only`).
+//! (`source_read_only`). A move inside a read-and-write S3 library goes through the bucket, as
+//! the single-item route does, taking the library's source lock once for each item.
 
 use axum::Json;
 use axum::extract::State;
@@ -15,10 +16,12 @@ use serde::{Deserialize, Serialize};
 
 use super::nodes::{
     copy_one, delete_checked, move_one, node_id, require_not_connected_for, restore_checked,
+    restructure_place,
 };
 use super::{ApiError, JsonBody, to_completion};
 use crate::AppState;
 use crate::auth::Signed;
+use crate::source_write::rename_or_move;
 
 /// Most items one request may name.
 pub(crate) const MAX_ITEMS: usize = 500;
@@ -69,6 +72,9 @@ pub(crate) struct ItemResult {
     /// For a copy or a restore whose name had to change, the name before and after.
     #[serde(skip_serializing_if = "Option::is_none")]
     renamed: Option<Renamed>,
+    /// For a move in a bucket, the originals that could not be deleted. Absent when none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    left_behind: Option<u64>,
 }
 
 /// A name that had to change.
@@ -83,6 +89,7 @@ pub(crate) struct Renamed {
 struct Done {
     new_id: Option<String>,
     renamed: Option<Renamed>,
+    left_behind: Option<u64>,
 }
 
 /// `POST /api/bulk {op: "move" | "copy" | "delete" | "restore", items: [ids], parent?}`: each
@@ -132,6 +139,7 @@ pub(crate) async fn run(
                     scan: None,
                     new_id: done.new_id,
                     renamed: done.renamed,
+                    left_behind: done.left_behind,
                 },
                 Err(e) => ItemResult {
                     id: item,
@@ -151,6 +159,7 @@ pub(crate) async fn run(
                     },
                     new_id: None,
                     renamed: None,
+                    left_behind: None,
                 },
             });
         }
@@ -172,8 +181,18 @@ async fn one(
 ) -> Result<Done, ApiError> {
     match (op, parent) {
         (BulkOp::Move, Some(parent)) => {
-            // Out of a connected library: refused too.
-            require_not_connected_for(state.db(), actor.id, id).await?;
+            // Out of, into or between connected libraries: refused as the single-item route
+            // refuses it. Inside a read-and-write S3 library: through the bucket.
+            if restructure_place(state.db(), actor.id, id, Some(parent))
+                .await?
+                .is_some()
+            {
+                let done = rename_or_move(state, actor, id, None, Some(parent)).await?;
+                return Ok(Done {
+                    left_behind: (done.left_behind > 0).then_some(done.left_behind),
+                    ..Done::default()
+                });
+            }
             if let Some(refused) = into {
                 return Err(refused);
             }
@@ -189,6 +208,7 @@ async fn one(
             Ok(Done {
                 new_id: Some(copied.id().to_owned()),
                 renamed: copied.renamed().map(|(from, to)| Renamed { from, to }),
+                left_behind: None,
             })
         }
         (BulkOp::Delete, _) => delete_checked(state, actor, id)
@@ -211,6 +231,7 @@ async fn one(
             Ok(Done {
                 new_id: None,
                 renamed,
+                left_behind: None,
             })
         }
         (BulkOp::Move | BulkOp::Copy, None) => Err(ApiError::InvalidRequest),

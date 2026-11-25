@@ -1,0 +1,631 @@
+//! Renaming and moving inside a read-and-write S3 library: the bucket first (every object
+//! copied, then every original deleted), the tree second, under the library's source lock; the
+//! node keeps its id, permissions and links; the next listing sees nothing new; and what is
+//! refused before anything is written.
+//!
+//! The servers here run no workers; listings are driven with `sync_once`.
+
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+
+mod common;
+
+use std::time::Duration;
+
+use collab_core::ids::NodeId;
+use common::fake_s3::{FakeS3, Stored};
+use common::{TestServer, TestUser, spawn_server_config_without_workers};
+use records::{Principal, S3_ENDPOINTS};
+use reqwest::{Method, StatusCode};
+use serde_json::{Value, json};
+use server::AppState;
+use server::source_sync::sync_once;
+use time::OffsetDateTime;
+
+const BUCKET: &str = "structure-bucket-5e1";
+const ENDPOINT: &str = "structure-endpoint-2a7";
+const KEY_ID: &str = "AKIDSTRUCTUREEXAMPLE04";
+const SECRET: &str = "planted-structure-secret-8c1f-qq";
+const PREFIX: &str = "team-structure/";
+
+const ITEM_SAVING: &str = "This is still being saved to the storage. Try again when saving has finished, or discard the save that failed.";
+const CHANGED: &str = "This changed in the storage since ShareCraft last looked. ShareCraft is checking it again; try again in a minute.";
+const UNAVAILABLE: &str = "This cannot be done yet in a library stored in S3.";
+
+fn key(path: &str) -> String {
+    format!("{PREFIX}{path}")
+}
+
+fn id_of(answer: &Value) -> NodeId {
+    NodeId(answer["id"].as_str().unwrap().parse().unwrap())
+}
+
+async fn answer(response: reqwest::Response) -> (StatusCode, Value) {
+    let status = response.status();
+    let text = response.text().await.unwrap();
+    let body = if text.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_str(&text).unwrap_or(Value::String(text))
+    };
+    (status, body)
+}
+
+struct Env {
+    server: TestServer,
+    fake: FakeS3,
+    state: AppState,
+    admin: TestUser,
+    owner: TestUser,
+    site: NodeId,
+}
+
+impl Env {
+    async fn new() -> Env {
+        let fake = FakeS3::start().await;
+        fake.bucket(BUCKET);
+        fake.require_keys(KEY_ID, SECRET);
+        let server = spawn_server_config_without_workers(|_| {}).await;
+        let admin = server.admin("Structure admin").await;
+        let owner = server.user("Site owner").await;
+        let library = common::Site::library(&server).await;
+        let db = server.records_db();
+        let site = db.node(library).await.unwrap().unwrap().site;
+        db.set_node_access(admin.id, site, Principal::User(owner.id), Some("owner"))
+            .await
+            .unwrap();
+        let state = server.app_state().await;
+        state
+            .s3()
+            .set_retry_wait_for_tests(Duration::from_millis(5));
+        state
+            .s3()
+            .set_timeouts_for_tests(Duration::from_secs(2), Duration::from_secs(2));
+        sqlx::query(
+            "insert into settings (key, value, changed_at) values ($1, $2, now()) \
+             on conflict (key) do update set value = excluded.value",
+        )
+        .bind(S3_ENDPOINTS)
+        .bind(json!([{
+            "name": ENDPOINT,
+            "url": fake.origin(),
+            "region": "us-east-1",
+            "path_style": true,
+            "allow": ["127.0.0.0/8"],
+        }]))
+        .execute(db.test_pool())
+        .await
+        .unwrap();
+        Env {
+            server,
+            fake,
+            state,
+            admin,
+            owner,
+            site,
+        }
+    }
+
+    fn db(&self) -> records::Db {
+        self.server.records_db()
+    }
+
+    async fn call(
+        &self,
+        user: &TestUser,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+    ) -> (StatusCode, Value) {
+        let mut request = self
+            .server
+            .http(Some(user))
+            .request(method, self.server.url(path));
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        answer(request.send().await.unwrap()).await
+    }
+
+    /// A library over `prefix` connected by the administrator in `mode`, listed once, its
+    /// wakes forgotten.
+    async fn library_at(&self, name: &str, prefix: &str, mode: &str) -> NodeId {
+        let (status, answer) = self
+            .call(
+                &self.admin,
+                Method::POST,
+                &format!("/api/sites/{}/libraries/s3", self.site.0),
+                Some(json!({
+                    "name": name,
+                    "endpoint": ENDPOINT,
+                    "bucket": BUCKET,
+                    "prefix": prefix,
+                    "access_key_id": KEY_ID,
+                    "secret_access_key": SECRET,
+                    "mode": mode,
+                })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{answer}");
+        let library = id_of(&answer);
+        self.sync(library).await;
+        self.state.sources().take_wake_for_tests(library);
+        library
+    }
+
+    async fn library(&self, name: &str) -> NodeId {
+        self.library_at(name, PREFIX, "read_write").await
+    }
+
+    async fn sync(&self, library: NodeId) -> bool {
+        sync_once(&self.state, library, OffsetDateTime::now_utc())
+            .await
+            .unwrap()
+            .is_some()
+    }
+
+    async fn child(&self, parent: NodeId, name: &str) -> NodeId {
+        self.children(parent)
+            .await
+            .into_iter()
+            .find(|(child, _)| child == name)
+            .unwrap_or_else(|| panic!("{name} is not there"))
+            .1
+    }
+
+    async fn children(&self, parent: NodeId) -> Vec<(String, NodeId)> {
+        let mut found: Vec<(String, NodeId)> = self
+            .db()
+            .live_children(parent)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|node| (node.name, node.id))
+            .collect();
+        found.sort();
+        found
+    }
+
+    async fn change(&self, user: &TestUser, node: NodeId, body: Value) -> (StatusCode, Value) {
+        self.call(
+            user,
+            Method::PATCH,
+            &format!("/api/nodes/{}", node.0),
+            Some(body),
+        )
+        .await
+    }
+
+    async fn rename(&self, node: NodeId, name: &str) -> (StatusCode, Value) {
+        self.change(&self.owner, node, json!({ "name": name }))
+            .await
+    }
+
+    async fn move_to(&self, node: NodeId, parent: NodeId) -> (StatusCode, Value) {
+        self.change(&self.owner, node, json!({ "parent": parent.0.to_string() }))
+            .await
+    }
+
+    fn object(&self, path: &str) -> Option<Stored> {
+        self.fake.object(BUCKET, &key(path))
+    }
+
+    /// Every write the fake received, but the connect probe's own.
+    fn writes(&self) -> Vec<(String, String, String)> {
+        self.fake
+            .writes()
+            .into_iter()
+            .filter(|(_, k, _)| !k.contains(".sharecraft-tmp-probe-"))
+            .collect()
+    }
+
+    async fn repository_path(&self, node: NodeId) -> String {
+        self.db()
+            .source_item_of(node)
+            .await
+            .unwrap()
+            .expect("tracked")
+            .repository_path
+    }
+
+    async fn events_of(&self, kind: &str) -> Vec<Value> {
+        let deadline = tokio::time::Instant::now() + common::TIMEOUT;
+        loop {
+            let found = self.db().events_of_kind(kind).await.unwrap();
+            if !found.is_empty() {
+                return found.into_iter().map(|e| e.detail).collect();
+            }
+            assert!(tokio::time::Instant::now() < deadline, "no {kind} event");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    fn woken(&self, library: NodeId) -> bool {
+        self.state.sources().take_wake_for_tests(library)
+    }
+}
+
+fn assert_error(answer: &(StatusCode, Value), status: StatusCode, code: &str) {
+    assert_eq!(answer.0, status, "{}", answer.1);
+    assert_eq!(answer.1["error"], code, "{}", answer.1);
+}
+
+#[tokio::test]
+async fn renaming_a_file_renames_the_object_and_keeps_the_node() {
+    let env = Env::new().await;
+    env.fake.put(BUCKET, &key("docs/a.txt"), b"alpha");
+    let library = env.library("Renames").await;
+    let docs = env.child(library, "docs").await;
+    let file = env.child(docs, "a.txt").await;
+
+    let (status, body) = env.rename(file, "b.txt").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(id_of(&body), file);
+    assert_eq!(body["name"], "b.txt");
+    assert!(body.get("left_behind").is_none(), "{body}");
+
+    assert!(env.object("docs/a.txt").is_none());
+    assert_eq!(env.object("docs/b.txt").unwrap().bytes, b"alpha");
+    assert_eq!(env.child(docs, "b.txt").await, file);
+    assert_eq!(env.repository_path(file).await, "docs/b.txt");
+    let events = env.events_of("source.moved").await;
+    assert_eq!(events[0]["objects"], 1, "{events:?}");
+    assert_eq!(events[0]["left_behind"], 0, "{events:?}");
+
+    // The tag recorded is the copy's: the next listing finds nothing new.
+    assert!(!env.sync(library).await, "the listing changed something");
+    assert_eq!(env.child(docs, "b.txt").await, file);
+    let response = env
+        .server
+        .http(Some(&env.owner))
+        .get(env.server.url(&format!("/api/docs/{}/content", file.0)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.bytes().await.unwrap().as_ref(), b"alpha");
+}
+
+#[tokio::test]
+async fn moving_a_folder_moves_every_object_and_keeps_permissions_and_links() {
+    let env = Env::new().await;
+    env.fake.put(BUCKET, &key("docs/"), b"");
+    env.fake.put(BUCKET, &key("docs/a.txt"), b"a");
+    env.fake.put(BUCKET, &key("docs/sub/b.txt"), b"b");
+    env.fake.put(BUCKET, &key("archive/x.txt"), b"x");
+    let library = env.library("Moves").await;
+    let docs = env.child(library, "docs").await;
+    let archive = env.child(library, "archive").await;
+    let a = env.child(docs, "a.txt").await;
+    let sub = env.child(docs, "sub").await;
+    let b = env.child(sub, "b.txt").await;
+    let reader = env.server.user("Reader").await;
+    env.db()
+        .set_node_access(
+            env.admin.id,
+            docs,
+            Principal::User(reader.id),
+            Some("viewer"),
+        )
+        .await
+        .unwrap();
+    let (status, link) = env
+        .call(
+            &env.owner,
+            Method::POST,
+            &format!("/api/nodes/{}/links", docs.0),
+            Some(json!({ "kind": "signed_in", "role": "viewer" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{link}");
+
+    let (status, body) = env.move_to(docs, archive).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(id_of(&body), docs);
+
+    for path in ["docs/", "docs/a.txt", "docs/sub/b.txt"] {
+        assert!(env.object(path).is_none(), "{path} is still there");
+    }
+    assert!(env.object("archive/docs/").is_some());
+    assert_eq!(env.object("archive/docs/a.txt").unwrap().bytes, b"a");
+    assert_eq!(env.object("archive/docs/sub/b.txt").unwrap().bytes, b"b");
+    assert_eq!(env.child(archive, "docs").await, docs);
+    assert_eq!(env.child(docs, "a.txt").await, a);
+    assert_eq!(env.child(docs, "sub").await, sub);
+    assert_eq!(env.child(sub, "b.txt").await, b);
+    assert_eq!(env.repository_path(docs).await, "archive/docs/");
+    assert_eq!(env.repository_path(b).await, "archive/docs/sub/b.txt");
+    let events = env.events_of("source.moved").await;
+    assert_eq!(events[0]["objects"], 3, "{events:?}");
+
+    // The permission and the link stay with the node.
+    assert!(
+        env.db()
+            .effective_access(reader.id, b)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let (status, links) = env
+        .call(
+            &env.owner,
+            Method::GET,
+            &format!("/api/nodes/{}/links", docs.0),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{links}");
+    assert!(
+        links.to_string().contains(link["id"].as_str().unwrap()),
+        "{links}"
+    );
+}
+
+#[tokio::test]
+async fn after_a_folder_move_the_next_listing_changes_nothing() {
+    let env = Env::new().await;
+    env.fake.put(BUCKET, &key("docs/a.txt"), b"a");
+    env.fake.put(BUCKET, &key("docs/sub/b.txt"), b"b");
+    env.fake.put(BUCKET, &key("archive/x.txt"), b"x");
+    let library = env.library("Echo").await;
+    let docs = env.child(library, "docs").await;
+    let archive = env.child(library, "archive").await;
+    let sub = env.child(docs, "sub").await;
+
+    let (status, body) = env.move_to(docs, archive).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = env.rename(sub, "Inner").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(env.object("archive/docs/Inner/b.txt").unwrap().bytes, b"b");
+
+    let before = (
+        env.children(library).await,
+        env.children(archive).await,
+        env.children(docs).await,
+        env.children(sub).await,
+    );
+    assert!(!env.sync(library).await, "the listing changed something");
+    let after = (
+        env.children(library).await,
+        env.children(archive).await,
+        env.children(docs).await,
+        env.children(sub).await,
+    );
+    assert_eq!(before, after);
+}
+
+#[tokio::test]
+async fn a_name_taken_ignoring_case_is_refused() {
+    let env = Env::new().await;
+    env.fake.put(BUCKET, &key("docs/a.txt"), b"a");
+    env.fake.put(BUCKET, &key("docs/B.txt"), b"b");
+    env.fake.put(BUCKET, &key("other/b.TXT"), b"c");
+    let library = env.library("Names").await;
+    let docs = env.child(library, "docs").await;
+    let other = env.child(library, "other").await;
+    let a = env.child(docs, "a.txt").await;
+    let b = env.child(docs, "B.txt").await;
+
+    assert_error(
+        &env.rename(a, "b.txt").await,
+        StatusCode::CONFLICT,
+        "name_taken",
+    );
+    assert_error(
+        &env.move_to(b, other).await,
+        StatusCode::CONFLICT,
+        "name_taken",
+    );
+    assert!(env.writes().is_empty(), "{:?}", env.writes());
+    assert_eq!(env.child(docs, "a.txt").await, a);
+    // A change of case alone is not a clash with itself.
+    let (status, body) = env.rename(a, "A.txt").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(env.object("docs/A.txt").is_some());
+    assert!(env.object("docs/a.txt").is_none());
+}
+
+#[tokio::test]
+async fn a_file_with_a_pending_save_cannot_be_renamed() {
+    let env = Env::new().await;
+    env.fake.put(BUCKET, &key("docs/a.txt"), b"a");
+    let library = env.library("Saving").await;
+    let docs = env.child(library, "docs").await;
+    let file = env.child(docs, "a.txt").await;
+    let response = env
+        .server
+        .http(Some(&env.owner))
+        .post(env.server.url("/api/docs/upload"))
+        .query(&[
+            ("parent", docs.0.to_string()),
+            ("name", "a.txt".to_owned()),
+            ("on_conflict", "replace".to_owned()),
+        ])
+        .body(b"newer".to_vec())
+        .send()
+        .await
+        .unwrap();
+    let (status, body) = answer(response).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(env.db().pending_write(file).await.unwrap().is_some());
+
+    for refused in [
+        env.rename(file, "b.txt").await,
+        // The folder holding it too.
+        env.rename(docs, "papers").await,
+    ] {
+        assert_error(&refused, StatusCode::CONFLICT, "source_item_saving");
+        assert_eq!(refused.1["message"], ITEM_SAVING);
+    }
+    assert!(env.writes().is_empty(), "{:?}", env.writes());
+}
+
+#[tokio::test]
+async fn a_folder_over_the_cap_is_refused_with_its_count() {
+    let env = Env::new().await;
+    // A marker and a thousand files: 1,001 objects.
+    env.fake.put(BUCKET, &key("big/"), b"");
+    for i in 0..1000 {
+        env.fake.put(BUCKET, &key(&format!("big/{i:04}.txt")), b"x");
+    }
+    let library = env.library("Big").await;
+    let big = env.child(library, "big").await;
+
+    let refused = env.rename(big, "huge").await;
+    assert_error(&refused, StatusCode::CONFLICT, "source_too_many_objects");
+    assert_eq!(refused.1["count"], 1001);
+    assert_eq!(
+        refused.1["message"],
+        "This folder holds 1,001 objects in the bucket. ShareCraft renames, moves, copies or deletes at most 1,000 at a time."
+    );
+    assert!(env.writes().is_empty());
+    assert_eq!(env.child(library, "big").await, big);
+}
+
+#[tokio::test]
+async fn a_change_outside_since_the_listing_is_refused_and_the_listing_is_woken() {
+    let env = Env::new().await;
+    env.fake.put(BUCKET, &key("docs/a.txt"), b"a");
+    let library = env.library("Outside").await;
+    let docs = env.child(library, "docs").await;
+    let file = env.child(docs, "a.txt").await;
+    // Changed outside after the listing.
+    env.fake.put(BUCKET, &key("docs/a.txt"), b"changed outside");
+    assert!(!env.woken(library));
+
+    let refused = env.rename(file, "b.txt").await;
+    assert_error(&refused, StatusCode::CONFLICT, "source_changed");
+    assert_eq!(refused.1["message"], CHANGED);
+    assert!(env.woken(library), "the listing was not woken");
+    assert!(env.writes().is_empty(), "{:?}", env.writes());
+    assert_eq!(env.object("docs/a.txt").unwrap().bytes, b"changed outside");
+    assert_eq!(env.child(docs, "a.txt").await, file);
+
+    // A new file outside inside a folder refuses the folder's move too.
+    env.sync(library).await;
+    env.woken(library);
+    env.fake.put(BUCKET, &key("docs/new.txt"), b"new");
+    let refused = env.rename(docs, "papers").await;
+    assert_error(&refused, StatusCode::CONFLICT, "source_changed");
+    assert!(env.woken(library));
+    assert!(env.writes().is_empty(), "{:?}", env.writes());
+}
+
+#[tokio::test]
+async fn left_behind_originals_are_reported_and_the_listing_is_woken() {
+    let env = Env::new().await;
+    env.fake.put(BUCKET, &key("docs/a.txt"), b"a");
+    let library = env.library("Behind").await;
+    let docs = env.child(library, "docs").await;
+    let file = env.child(docs, "a.txt").await;
+    // The copy is accepted; the delete of the original is refused.
+    env.fake.deny_writes_after(env.fake.writes().len() + 1);
+
+    let (status, body) = env.rename(file, "b.txt").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["left_behind"], 1, "{body}");
+    assert_eq!(body["name"], "b.txt");
+    assert!(env.object("docs/a.txt").is_some());
+    assert!(env.object("docs/b.txt").is_some());
+    assert!(env.woken(library), "the listing was not woken");
+    let events = env.events_of("source.moved").await;
+    assert_eq!(events[0]["left_behind"], 1, "{events:?}");
+    env.fake.allow_writes();
+
+    // The original comes back as a new file; the moved one keeps its node.
+    assert!(env.sync(library).await);
+    assert_eq!(env.child(docs, "b.txt").await, file);
+    assert_ne!(env.child(docs, "a.txt").await, file);
+}
+
+#[tokio::test]
+async fn moving_into_another_library_is_still_refused() {
+    let env = Env::new().await;
+    env.fake.put(BUCKET, &key("docs/a.txt"), b"a");
+    env.fake.put(BUCKET, "elsewhere/inbox/x.txt", b"x");
+    let library = env.library("Here").await;
+    let other = env.library_at("There", "elsewhere/", "read_write").await;
+    let inbox = env.child(other, "inbox").await;
+    let ordinary = common::Site::library(&env.server).await;
+    let docs = env.child(library, "docs").await;
+    let file = env.child(docs, "a.txt").await;
+
+    for parent in [inbox, other, ordinary] {
+        let refused = env.move_to(file, parent).await;
+        assert_error(&refused, StatusCode::CONFLICT, "source_action_unavailable");
+        assert_eq!(refused.1["message"], UNAVAILABLE);
+    }
+    // And out of an ordinary library into this one.
+    let (status, body) = env
+        .call(
+            &env.owner,
+            Method::POST,
+            &format!("/api/nodes/{}/children", ordinary.0),
+            Some(json!({ "kind": "folder", "name": "Plain" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let plain = id_of(&body);
+    let refused = env.move_to(plain, docs).await;
+    assert_error(&refused, StatusCode::CONFLICT, "source_action_unavailable");
+    assert!(env.writes().is_empty(), "{:?}", env.writes());
+    assert_eq!(env.child(docs, "a.txt").await, file);
+}
+
+#[tokio::test]
+async fn a_read_only_library_still_refuses_renames() {
+    let env = Env::new().await;
+    env.fake.put(BUCKET, &key("docs/a.txt"), b"a");
+    let library = env.library_at("Read only", PREFIX, "read_only").await;
+    let docs = env.child(library, "docs").await;
+    let file = env.child(docs, "a.txt").await;
+
+    assert_error(
+        &env.rename(file, "b.txt").await,
+        StatusCode::CONFLICT,
+        "source_read_only",
+    );
+    assert!(env.writes().is_empty(), "{:?}", env.writes());
+}
+
+#[tokio::test]
+async fn a_bulk_move_of_two_files_moves_both() {
+    let env = Env::new().await;
+    // A marked folder, so it is still there once emptied.
+    env.fake.put(BUCKET, &key("docs/"), b"");
+    env.fake.put(BUCKET, &key("docs/a.txt"), b"a");
+    env.fake.put(BUCKET, &key("docs/b.txt"), b"b");
+    env.fake.put(BUCKET, &key("archive/x.txt"), b"x");
+    let library = env.library("Bulk").await;
+    let docs = env.child(library, "docs").await;
+    let archive = env.child(library, "archive").await;
+    let a = env.child(docs, "a.txt").await;
+    let b = env.child(docs, "b.txt").await;
+
+    let (status, body) = env
+        .call(
+            &env.owner,
+            Method::POST,
+            "/api/bulk",
+            Some(json!({
+                "op": "move",
+                "items": [a.0.to_string(), b.0.to_string()],
+                "parent": archive.0.to_string(),
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body[0]["ok"], true, "{body}");
+    assert_eq!(body[1]["ok"], true, "{body}");
+    assert_eq!(env.object("archive/a.txt").unwrap().bytes, b"a");
+    assert_eq!(env.object("archive/b.txt").unwrap().bytes, b"b");
+    assert!(env.object("docs/a.txt").is_none());
+    assert!(env.object("docs/b.txt").is_none());
+    assert_eq!(env.child(archive, "a.txt").await, a);
+    assert_eq!(env.child(archive, "b.txt").await, b);
+    assert!(!env.sync(library).await, "the listing changed something");
+}

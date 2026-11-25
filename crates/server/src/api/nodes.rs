@@ -28,7 +28,7 @@ use super::{ApiError, JsonBody, parse_id, recheck_below, to_completion};
 use crate::AppState;
 use crate::auth::Signed;
 use crate::room::AccessChange;
-use crate::source_write::{Place, Store, create_folder, writable_place};
+use crate::source_write::{Place, Store, create_folder, rename_or_move, writable_place};
 use crate::tree::{self, TreeOp};
 
 /// Children listed when the request names no limit.
@@ -90,8 +90,9 @@ pub(crate) async fn require_not_connected_for(
     }
 }
 
-/// [`require_not_connected_for`] for a route that acts on `node` itself (renames, moves or
-/// deletes it): a connected library node itself keeps `409 source_read_only` in every mode.
+/// [`require_not_connected_for`] for a route that acts on `node` itself (deletes it): a
+/// connected library node itself keeps `409 source_read_only` in every mode. Renames and moves
+/// are judged by [`restructure_place`].
 async fn require_item_not_connected_for(
     db: &Db,
     user: UserId,
@@ -111,6 +112,54 @@ async fn require_item_not_connected_for(
     } else {
         Err(ApiError::SourceActionUnavailable)
     }
+}
+
+/// Where a rename of `id`, or a move of it into `parent`, by `user` is made: `Ok(None)` in the
+/// ordinary tree (a `parent` in a connected library is refused as [`require_not_connected_for`]
+/// refuses it), `Ok(Some(library))` in the bucket of the read-and-write S3 library `id` is in
+/// (see [`rename_or_move`]). Refused inside a connected library: what [`writable_place`] tells
+/// someone who cannot see `id` (`404`) and a library that is not read and write (`409
+/// source_read_only`); `409 source_write_blocked` while its writes are blocked; a library node
+/// itself `409 source_read_only`; a `parent` anywhere but that same library `409
+/// source_action_unavailable` (moves between libraries stay refused).
+pub(crate) async fn restructure_place(
+    db: &Db,
+    user: UserId,
+    id: NodeId,
+    parent: Option<NodeId>,
+) -> Result<Option<NodeId>, ApiError> {
+    let library = match writable_place(db, user, id).await {
+        Ok(Place::Ordinary) => {
+            if let Some(parent) = parent {
+                require_not_connected_for(db, user, parent).await?;
+            }
+            return Ok(None);
+        }
+        Ok(Place::External(Store::S3(target))) => target.library,
+        Err(ApiError::SourceWriteBlocked) => {
+            let library = db
+                .source_library_of(id)
+                .await
+                .map_err(|e| ApiError::unavailable(&e))?;
+            return Err(if library == Some(id) {
+                ApiError::SourceReadOnly
+            } else {
+                ApiError::SourceWriteBlocked
+            });
+        }
+        Err(e) => return Err(e),
+    };
+    if library == id {
+        return Err(ApiError::SourceReadOnly);
+    }
+    if let Some(parent) = parent {
+        match writable_place(db, user, parent).await {
+            Ok(Place::External(Store::S3(target))) if target.library == library => {}
+            Err(ApiError::NotFound) => return Err(ApiError::NotFound),
+            _ => return Err(ApiError::SourceActionUnavailable),
+        }
+    }
+    Ok(Some(library))
 }
 
 /// `access` to a file of a connected library, as its editor's seat gets it: without `add`,
@@ -198,6 +247,10 @@ pub(crate) struct NodeOut {
     site: String,
     /// Whether the node takes its access from a scope above it.
     inherits: bool,
+    /// After a rename or move in a bucket: the originals that could not be deleted, which the
+    /// next listing shows as new files. Absent when none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    left_behind: Option<u64>,
 }
 
 impl From<Node> for NodeOut {
@@ -209,6 +262,7 @@ impl From<Node> for NodeOut {
             parent: node.parent.map(|p| p.0.to_string()),
             site: node.site.0.to_string(),
             inherits: !node.unique_scope,
+            left_behind: None,
         }
     }
 }
@@ -703,6 +757,11 @@ pub(crate) struct NodeChange {
 /// file's new name must keep its editor's extension, and a file no editor opens may not take
 /// one (`422 wrong_extension`); the file policies of the library it is in, or goes into, hold
 /// (`422 blocked_file_type {extension}`, `413 file_too_large {limit}`).
+///
+/// In a read-and-write S3 library the bucket is changed first and the tree second, under the
+/// library's source lock (see [`rename_or_move`]); the answer then carries `left_behind` when
+/// originals could not be deleted. Moves into, out of or between connected libraries stay
+/// refused (see [`restructure_place`]).
 pub(crate) async fn change(
     State(state): State<AppState>,
     signed: Signed,
@@ -716,11 +775,18 @@ pub(crate) async fn change(
     }
     let actor = signed.session.user;
     // Both the item and where it would go: nothing is renamed if the move would be refused.
-    require_item_not_connected_for(state.db(), actor.id, id).await?;
-    if let Some(parent) = parent {
-        require_not_connected_for(state.db(), actor.id, parent).await?;
-    }
-    let node = to_completion(async move {
+    let in_bucket = restructure_place(state.db(), actor.id, id, parent).await?;
+    let (node, left_behind) = to_completion(async move {
+        if in_bucket.is_some() {
+            let done = rename_or_move(&state, &actor, id, change.name.as_deref(), parent).await?;
+            let node = state
+                .db()
+                .node(done.node)
+                .await
+                .map_err(|e| ApiError::unavailable(&e))?
+                .ok_or(ApiError::NotFound)?;
+            return Ok((node, done.left_behind));
+        }
         let mut node = None;
         if let Some(name) = change.name {
             let renamed = tree::apply(&state, &actor, TreeOp::Rename { id, name })
@@ -738,10 +804,12 @@ pub(crate) async fn change(
         if let Some(parent) = parent {
             node = Some(move_one(&state, &actor, id, parent).await?);
         }
-        node.ok_or(ApiError::InvalidRequest)
+        Ok((node.ok_or(ApiError::InvalidRequest)?, 0))
     })
     .await?;
-    Ok(Json(NodeOut::from(node)))
+    let mut out = NodeOut::from(node);
+    out.left_behind = (left_behind > 0).then_some(left_behind);
+    Ok(Json(out))
 }
 
 /// Moves `id` into `parent` for `actor`, then rechecks the open documents below it whatever
