@@ -563,6 +563,14 @@ fn relative<'a>(t: &S3Target, key: &'a str) -> Option<&'a str> {
 /// Everything that can refuse the step is asked before the first write: the count, the sizes,
 /// the recorded tags and the destination names. No original is deleted before every copy has
 /// succeeded.
+/// Whether the library-relative `path` is left out by `skip`: a folder's entry (ending `/`)
+/// leaves out itself and everything under it, a file's only itself.
+pub(crate) fn skipped(path: &str, skip: &[String]) -> bool {
+    skip.iter()
+        .any(|s| path == s || (s.ends_with('/') && path.starts_with(s.as_str())))
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn relocate(
     s3: &S3,
     t: &S3Target,
@@ -570,14 +578,29 @@ async fn relocate(
     to_key: &str,
     folder: bool,
     known: Option<&[(String, String)]>,
+    skip: &[String],
     delete: bool,
 ) -> Result<Moved, WriteError> {
+    // What is skipped is not part of the step: not counted, sized, checked or copied.
+    let left_out = |path: &str| skipped(path, skip);
+    let kept_known: Option<Vec<(String, String)>> = known.map(|known| {
+        known
+            .iter()
+            .filter(|(path, _)| !left_out(path))
+            .cloned()
+            .collect()
+    });
+    let known = kept_known.as_deref();
     if from_key == to_key || (folder && to_key.starts_with(from_key)) {
         return Err(WriteError::Failed);
     }
     let mut steps: Vec<Step> = Vec::new();
     if folder {
-        let objects = list_all(s3, t, from_key).await?;
+        let objects: Vec<ObjectEntry> = list_all(s3, t, from_key)
+            .await?
+            .into_iter()
+            .filter(|o| relative(t, &o.key).is_none_or(|path| !left_out(path)))
+            .collect();
         let count = u64::try_from(objects.len()).unwrap_or(u64::MAX);
         if count > MOVE_MAX_OBJECTS {
             return Err(WriteError::TooMany(count));
@@ -774,10 +797,12 @@ pub async fn move_item(
 ) -> Result<Moved, WriteError> {
     let from_key = item_key(t, from, folder).ok_or(WriteError::Failed)?;
     let to_key = item_key(t, to, folder).ok_or(WriteError::Failed)?;
-    relocate(s3, t, &from_key, &to_key, folder, Some(known), true).await
+    relocate(s3, t, &from_key, &to_key, folder, Some(known), &[], true).await
 }
 
-/// Copies the item at `from` to `to`: [`move_item`] without the deletes.
+/// Copies the item at `from` to `to`: [`move_item`] without the deletes. `skip` names what is
+/// left out, as the copier may not see it: library-relative paths, a folder's ending `/` (it and
+/// everything under it). Skipped objects are neither copied, counted nor checked.
 ///
 /// # Errors
 /// As [`move_item`].
@@ -788,10 +813,11 @@ pub async fn copy_item(
     to: &str,
     folder: bool,
     known: &[(String, String)],
+    skip: &[String],
 ) -> Result<Moved, WriteError> {
     let from_key = item_key(t, from, folder).ok_or(WriteError::Failed)?;
     let to_key = item_key(t, to, folder).ok_or(WriteError::Failed)?;
-    relocate(s3, t, &from_key, &to_key, folder, Some(known), false).await
+    relocate(s3, t, &from_key, &to_key, folder, Some(known), skip, false).await
 }
 
 /// Moves the item at `from` into the holding folder, at `root` followed by `from`.
@@ -809,7 +835,7 @@ pub async fn hold(
 ) -> Result<Moved, WriteError> {
     let from_key = item_key(t, from, folder).ok_or(WriteError::Failed)?;
     let to_key = holding_key(t, root, from, folder).ok_or(WriteError::Failed)?;
-    relocate(s3, t, &from_key, &to_key, folder, Some(known), true).await
+    relocate(s3, t, &from_key, &to_key, folder, Some(known), &[], true).await
 }
 
 /// Moves the item held at `root` followed by `held` back to `to`. Tags are not checked, since
@@ -828,7 +854,7 @@ pub async fn unhold(
 ) -> Result<Moved, WriteError> {
     let from_key = holding_key(t, root, held, folder).ok_or(WriteError::Failed)?;
     let to_key = item_key(t, to, folder).ok_or(WriteError::Failed)?;
-    relocate(s3, t, &from_key, &to_key, folder, None, true).await
+    relocate(s3, t, &from_key, &to_key, folder, None, &[], true).await
 }
 
 /// Deletes every object under the holding root `root`. Answers how many were deleted.
@@ -920,4 +946,33 @@ pub async fn sweep_holding(
         })
         .collect();
     delete_keys(s3, t, &keys).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::skipped;
+
+    #[test]
+    fn a_folder_entry_leaves_out_everything_under_it_and_a_file_entry_only_itself() {
+        let skip = vec!["docs/hidden/".to_owned(), "docs/secret.txt".to_owned()];
+        for path in [
+            "docs/hidden/",
+            "docs/hidden/a.txt",
+            "docs/hidden/sub/b.txt",
+            "docs/secret.txt",
+        ] {
+            assert!(skipped(path, &skip), "{path}");
+        }
+        for path in [
+            "docs/",
+            "docs/a.txt",
+            "docs/hidden.txt",
+            "docs/hiddenx/a.txt",
+            "docs/secret.txt2",
+            "docs/sub/secret.txt",
+        ] {
+            assert!(!skipped(path, &skip), "{path}");
+        }
+        assert!(!skipped("docs/a.txt", &[]));
+    }
 }

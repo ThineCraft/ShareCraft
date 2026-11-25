@@ -433,3 +433,93 @@ async fn after_a_copy_the_next_listing_changes_nothing() {
     );
     assert_eq!(before, after);
 }
+
+#[tokio::test]
+async fn copying_a_folder_skips_what_the_copier_cannot_see() {
+    let env = Env::new().await;
+    env.fake.put(BUCKET, &key("docs/a.txt"), b"a");
+    env.fake.put(BUCKET, &key("docs/private.txt"), b"p");
+    env.fake.put(BUCKET, &key("docs/secret/s.txt"), b"s");
+    env.fake.put(BUCKET, &key("docs/secret/deep/d.txt"), b"d");
+    env.fake.put(BUCKET, &key("archive/x.txt"), b"x");
+    let library = env.library("Hidden").await;
+    let docs = env.child(library, "docs").await;
+    let archive = env.child(library, "archive").await;
+    let secret = env.child(docs, "secret").await;
+    let private = env.child(docs, "private.txt").await;
+    let copier = env.server.user("Copier").await;
+    let db = env.db();
+    db.set_node_access(
+        env.admin.id,
+        library,
+        Principal::User(copier.id),
+        Some("editor"),
+    )
+    .await
+    .unwrap();
+    for hidden in [secret, private] {
+        db.break_inheritance(env.admin.id, hidden).await.unwrap();
+        db.set_node_access(env.admin.id, hidden, Principal::User(copier.id), None)
+            .await
+            .unwrap();
+    }
+    assert!(
+        db.effective_access(copier.id, secret)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let gets = env.fake.count("get");
+
+    let (status, body) = env
+        .call(
+            &copier,
+            Method::POST,
+            &format!("/api/nodes/{}/copy", docs.0),
+            Some(json!({ "parent": archive.0.to_string() })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let top = id_of(&body["node"]);
+
+    // Only what the copier sees reached the destination.
+    assert_eq!(env.object("archive/docs/a.txt").unwrap().bytes, b"a");
+    for path in [
+        "archive/docs/private.txt",
+        "archive/docs/secret/s.txt",
+        "archive/docs/secret/deep/d.txt",
+        "archive/docs/secret/",
+    ] {
+        assert!(env.object(path).is_none(), "{path} was copied");
+    }
+    assert_eq!(env.fake.count("get"), gets);
+    assert_eq!(env.object("docs/secret/s.txt").unwrap().bytes, b"s");
+    let events = env.events_of("source.moved").await;
+    assert_eq!(events[0]["objects"], 1, "{events:?}");
+    let names: Vec<String> = env
+        .children(top)
+        .await
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    assert_eq!(names, ["a.txt"]);
+
+    // The next listing adds nothing: no new node for what was left out.
+    let report = sync_once(&env.state, library, OffsetDateTime::now_utc())
+        .await
+        .unwrap();
+    if let Some(report) = report {
+        assert_eq!(
+            (report.added, report.changed, report.removed, report.moved),
+            (0, 0, 0, 0),
+            "{report:?}"
+        );
+    }
+    let names: Vec<String> = env
+        .children(top)
+        .await
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    assert_eq!(names, ["a.txt"]);
+}

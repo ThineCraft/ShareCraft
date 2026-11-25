@@ -989,7 +989,7 @@ async fn moving_a_folder_over_the_cap_is_refused_before_any_write() {
         WriteError::TooMany(MOVE_MAX_OBJECTS + 1)
     );
     assert!(fake.writes().is_empty());
-    let result = copy_item(&s3, &t, "big/", "other/", true, &[]).await;
+    let result = copy_item(&s3, &t, "big/", "other/", true, &[], &[]).await;
     assert_eq!(result.unwrap_err(), WriteError::TooMany(1001));
     assert_eq!(server::source_write::thousands(1001), "1,001");
     assert_eq!(server::source_write::thousands(1_234_567), "1,234,567");
@@ -1021,7 +1021,9 @@ async fn moving_an_object_over_five_gib_is_refused_before_any_write() {
         WriteError::TooLargeToMove
     );
     assert_eq!(
-        copy_item(&s3, &t, "f/", "g/", true, &k).await.unwrap_err(),
+        copy_item(&s3, &t, "f/", "g/", true, &k, &[])
+            .await
+            .unwrap_err(),
         WriteError::TooLargeToMove
     );
     assert_eq!(
@@ -1209,12 +1211,12 @@ async fn copying_keeps_the_original() {
     fake.put(BUCKET, "lib/docs/b.txt", b"two");
     let k = known(&s3, &t, &["a.txt", "docs/", "docs/b.txt"]).await;
 
-    let copied = copy_item(&s3, &t, "a.txt", "a copy.txt", false, &k)
+    let copied = copy_item(&s3, &t, "a.txt", "a copy.txt", false, &k, &[])
         .await
         .unwrap();
     assert_eq!(copied.objects, 1);
     assert_eq!(seen_paths(&copied), ["a copy.txt"]);
-    let copied = copy_item(&s3, &t, "docs/", "docs copy/", true, &k)
+    let copied = copy_item(&s3, &t, "docs/", "docs copy/", true, &k, &[])
         .await
         .unwrap();
     assert_eq!(copied.objects, 2);
@@ -1227,6 +1229,57 @@ async fn copying_keeps_the_original() {
         fake.object(BUCKET, "lib/docs copy/b.txt").unwrap().bytes,
         b"two"
     );
+}
+
+#[tokio::test]
+async fn a_copy_leaves_out_what_it_is_told_to_skip_and_counts_and_checks_none_of_it() {
+    let (fake, s3, t) = setup().await;
+    fake.put(BUCKET, "lib/docs/", b"");
+    fake.put(BUCKET, "lib/docs/a.txt", b"one");
+    fake.put(BUCKET, "lib/docs/hidden.txt", b"two");
+    fake.put(BUCKET, "lib/docs/hid/", b"");
+    fake.put(BUCKET, "lib/docs/hid/b.txt", b"three");
+    fake.put(BUCKET, "lib/docs/hid/deep/c.txt", b"four");
+    fake.put(BUCKET, "lib/docs/hidden.txt.bak", b"five");
+    // The tree's record of the hidden file is stale: left out, it is not checked.
+    let mut k = known(
+        &s3,
+        &t,
+        &[
+            "docs/",
+            "docs/a.txt",
+            "docs/hidden.txt",
+            "docs/hid/",
+            "docs/hid/b.txt",
+            "docs/hid/deep/c.txt",
+            "docs/hidden.txt.bak",
+        ],
+    )
+    .await;
+    for entry in &mut k {
+        if entry.0 == "docs/hid/b.txt" {
+            entry.1 = "x0-0~stale".to_owned();
+        }
+    }
+    let skip = vec!["docs/hid/".to_owned(), "docs/hidden.txt".to_owned()];
+
+    let copied = copy_item(&s3, &t, "docs/", "docs copy/", true, &k, &skip)
+        .await
+        .unwrap();
+    assert_eq!(copied.objects, 3);
+    assert_eq!(
+        seen_paths(&copied),
+        ["docs copy/", "docs copy/a.txt", "docs copy/hidden.txt.bak"]
+    );
+    assert_eq!(kinds(&fake), ["COPY", "COPY", "COPY"]);
+    for gone in ["hidden.txt", "hid/", "hid/b.txt", "hid/deep/c.txt"] {
+        assert!(
+            fake.object(BUCKET, &format!("lib/docs copy/{gone}"))
+                .is_none(),
+            "{gone}"
+        );
+    }
+    assert!(fake.object(BUCKET, "lib/docs/hid/b.txt").is_some());
 }
 
 #[tokio::test]
@@ -1439,7 +1492,7 @@ async fn moving_a_file_with_no_recorded_tag_is_a_change() {
             WriteError::Changed
         );
         assert_eq!(
-            copy_item(&s3, &t, "a.txt", "c.txt", false, k)
+            copy_item(&s3, &t, "a.txt", "c.txt", false, k, &[])
                 .await
                 .unwrap_err(),
             WriteError::Changed

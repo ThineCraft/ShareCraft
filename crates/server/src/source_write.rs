@@ -2078,6 +2078,8 @@ struct CopyPlan {
     name: String,
     /// The bucket step: `from` the item, `to` its copy, and the tracking rows of the item.
     plan: Restructure,
+    /// Library-relative paths the copier may not view (a folder's ends `/`), left out.
+    hidden: Vec<String>,
 }
 
 /// Everything about copying `node` into `parent` (as `name` or as it is) inside its
@@ -2108,7 +2110,24 @@ async fn copy_allowed(
         Err(ApiError::WrongExtension) => return Err(ApiError::InvalidName),
         checked => checked?,
     };
-    let (tracked, items) = tracked_subtree(db, library, node).await?;
+    let (tracked, mut items) = tracked_subtree(db, library, node).await?;
+    // What the person may not view is left out of the copy, as the ordinary copy leaves it out:
+    // a hidden folder takes everything under it with it.
+    let mut hidden: Vec<String> = Vec::new();
+    for item in items.iter().filter(|i| i.node != node) {
+        if crate::s3_write::skipped(&item.repository_path, &hidden) {
+            continue;
+        }
+        let viewable = db
+            .effective_access(actor.id, item.node)
+            .await
+            .map_err(unavailable)?
+            .is_some_and(|a| a.perms.contains(Perms::VIEW));
+        if !viewable {
+            hidden.push(item.repository_path.clone());
+        }
+    }
+    items.retain(|i| !crate::s3_write::skipped(&i.repository_path, &hidden));
     let (_, path) = external_path(state, parent, &new_name).await?;
     if !db
         .name_free(parent, &new_name, None)
@@ -2122,6 +2141,7 @@ async fn copy_allowed(
     let shown_to = shown_in(db, library, parent, &new_name).await?;
     Ok(CopyPlan {
         name: new_name.clone(),
+        hidden,
         plan: Restructure {
             library,
             kind: item.kind,
@@ -2166,7 +2186,7 @@ pub(crate) async fn copy_within(
     let first = copy_allowed(state, actor, node, parent, name).await?;
     let lock = lock_source(db, first.plan.library).await?;
     // Judged again once the lock is held: a listing or a write may have run meanwhile.
-    let CopyPlan { name, plan } = copy_allowed(state, actor, node, parent, name).await?;
+    let CopyPlan { name, plan, hidden } = copy_allowed(state, actor, node, parent, name).await?;
     let target = bucket(state, plan.library).await?;
     let known = known_of(&plan.items);
     let copied = match copy_item(
@@ -2176,6 +2196,7 @@ pub(crate) async fn copy_within(
         &plan.to,
         plan.folder(),
         &known,
+        &hidden,
     )
     .await
     {
