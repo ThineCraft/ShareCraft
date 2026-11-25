@@ -2446,7 +2446,7 @@ const HELD_RETRY: time::Duration = time::Duration::hours(1);
 /// - no hold: `true`;
 /// - a read-and-write S3 library: the held objects are deleted, the hold forgotten,
 ///   `source.held_purged {node, objects}`, `true`;
-/// - a library read-only or disconnected by now: nothing is written, the hold is forgotten,
+/// - a library read-only, blocked or disconnected by now: nothing is written, the hold is forgotten,
 ///   `source.held_left {node, objects}` (the objects stay), `true`;
 /// - the bucket offline or failing: the hold waits an hour (`retry_at`), `false`.
 ///
@@ -2469,7 +2469,13 @@ pub(crate) async fn release_held(
         .is_some_and(|(config, _)| {
             config.kind == SourceKind::S3 && config.mode == SourceMode::ReadWrite
         });
-    if !writable {
+    // A library whose writes are blocked is not written either: the purge goes ahead as in a
+    // read-only one.
+    let blocked = matches!(
+        db.write_state(held.library).await.map_err(unavailable)?,
+        Some((WriteState::Blocked, _))
+    );
+    if !writable || blocked {
         db.forget_held(entry).await.map_err(unavailable)?;
         emit(
             state,

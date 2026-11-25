@@ -21,7 +21,7 @@ use std::time::Duration;
 use collab_core::ids::NodeId;
 use common::fake_s3::{FakeS3, Stored};
 use common::{TestServer, TestUser, spawn_server_config_without_workers};
-use records::{Principal, S3_ENDPOINTS, SourceMode};
+use records::{Principal, S3_ENDPOINTS, SourceMode, WriteState};
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 use server::AppState;
@@ -795,4 +795,92 @@ async fn the_daily_sweep_runs_once_a_day() {
     assert!(env.object(&format!("{another}late.txt")).is_some());
     sweep_holds(&env.state, now + time::Duration::hours(25)).await;
     assert!(env.object(&format!("{another}late.txt")).is_none());
+}
+
+#[tokio::test]
+async fn purging_in_a_blocked_library_leaves_the_objects_and_says_so() {
+    let env = Env::new().await;
+    env.fake.put(BUCKET, &key("docs/"), b"");
+    env.fake.put(BUCKET, &key("docs/a.txt"), b"a");
+    env.fake.put(BUCKET, &key("docs/b.txt"), b"b");
+    let library = env.library("Blocked later").await;
+    let docs = env.child(library, "docs").await;
+    let a = env.child(docs, "a.txt").await;
+    let b = env.child(docs, "b.txt").await;
+    for node in [a, b] {
+        let (status, body) = env.delete(node).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    }
+    env.db()
+        .set_write_state(
+            library,
+            WriteState::Blocked,
+            Some("The storage refused a change."),
+        )
+        .await
+        .unwrap();
+    let before = env.writes().len();
+
+    // Purged by hand: the entry goes, its objects stay.
+    for _ in 0..2 {
+        let (status, body) = env.remove(a).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    }
+    assert!(!env.in_bin(a).await);
+    assert!(env.db().held(a).await.unwrap().is_none());
+    assert_eq!(env.held(a, "docs/a.txt").unwrap().bytes, b"a");
+
+    // Purged after 93 days: the same.
+    let due = OffsetDateTime::now_utc() + time::Duration::days(94);
+    assert_eq!(server::tree::purge_due(&env.state, due).await, 1);
+    assert!(!env.in_bin(b).await);
+    assert!(env.db().held(b).await.unwrap().is_none());
+    assert_eq!(env.held(b, "docs/b.txt").unwrap().bytes, b"b");
+
+    assert_eq!(env.writes().len(), before, "{:?}", env.writes());
+    let left = env.events_of("source.held_left").await;
+    assert_eq!(left.len(), 2, "{left:?}");
+}
+
+#[tokio::test]
+async fn a_deleted_s3_file_is_not_found_by_search_or_counted() {
+    let env = Env::new().await;
+    env.fake.put(BUCKET, &key("docs/"), b"");
+    env.fake.put(BUCKET, &key("docs/a.txt"), b"alpha");
+    env.fake.put(BUCKET, &key("docs/b.txt"), b"beta");
+    let library = env.library("Counted").await;
+    let docs = env.child(library, "docs").await;
+    let a = env.child(docs, "a.txt").await;
+    let (status, body) = env.delete(a).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    env.sync(library).await;
+
+    // The library's counts are the listing's: the held object is not one of its files.
+    let (_, status) = env.db().source_of(library).await.unwrap().unwrap();
+    assert_eq!(status.files, 1);
+    assert_eq!(status.bytes, 4);
+    // Nothing that lists the library's items finds it (ShareCraft has no search route; the
+    // explorer's children are what people browse).
+    for parent in [library, docs] {
+        let (status, body) = env
+            .call(
+                &env.owner,
+                Method::GET,
+                &format!("/api/nodes/{}/children", parent.0),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let text = body.to_string();
+        assert!(!text.contains(&a.0.to_string()), "{text}");
+        assert!(!text.contains(".sharecraft-bin"), "{text}");
+    }
+    assert!(env.db().external_item(a).await.unwrap().is_none());
+    assert!(
+        !env.db()
+            .live_source_nodes(library)
+            .await
+            .unwrap()
+            .contains(&a)
+    );
 }
