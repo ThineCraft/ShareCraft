@@ -510,6 +510,37 @@ async fn moving_a_folder_rewrites_every_descendant_and_nothing_else() {
 }
 
 #[tokio::test]
+async fn a_retag_after_a_move_keeps_the_revision_and_the_content() {
+    let f = fixture().await;
+    let db = &f.test.db;
+    let node = track(&f, "a/x.txt", "a/x.txt").await;
+    let old = object_tag(4, 1_700_000_000, "\"etag\"", false);
+    db.set_external_content(node, &old, &[7; 32], t0())
+        .await
+        .unwrap();
+    let before = db.external_item(node).await.unwrap().unwrap();
+    let new = object_tag(4, 1_700_000_100, "\"copy\"", false);
+    let modified = OffsetDateTime::from_unix_timestamp(1_700_000_100).unwrap();
+
+    // Only from the tag still current.
+    assert!(
+        !db.retag_source_item(node, "x4-0~00", &new, 4, modified)
+            .await
+            .unwrap()
+    );
+    assert!(
+        db.retag_source_item(node, &old, &new, 4, modified)
+            .await
+            .unwrap()
+    );
+    let after = db.external_item(node).await.unwrap().unwrap();
+    assert_eq!(after.tag, new);
+    assert_eq!(after.revision, before.revision);
+    assert_eq!(after.sha256, Some([7; 32]));
+    assert_eq!(after.version, None);
+}
+
+#[tokio::test]
 async fn moving_onto_a_taken_path_changes_nothing() {
     let f = fixture().await;
     let db = &f.test.db;

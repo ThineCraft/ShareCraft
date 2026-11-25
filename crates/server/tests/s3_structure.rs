@@ -16,14 +16,15 @@ mod common;
 
 use std::time::Duration;
 
-use collab_core::ids::NodeId;
-use common::fake_s3::{FakeS3, Stored};
-use common::{TestServer, TestUser, spawn_server_config_without_workers};
+use collab_core::ids::{DocId, NodeId};
+use common::fake_s3::{FakeS3, Opts, Stored};
+use common::{FileClient, TestServer, TestUser, spawn_server_config_without_workers};
 use records::{Principal, S3_ENDPOINTS};
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 use server::AppState;
 use server::source_sync::sync_once;
+use server::source_write::write_due;
 use time::OffsetDateTime;
 
 const BUCKET: &str = "structure-bucket-5e1";
@@ -35,6 +36,7 @@ const PREFIX: &str = "team-structure/";
 const ITEM_SAVING: &str = "This is still being saved to the storage. Try again when saving has finished, or discard the save that failed.";
 const CHANGED: &str = "This changed in the storage since ShareCraft last looked. ShareCraft is checking it again; try again in a minute.";
 const UNAVAILABLE: &str = "This cannot be done yet in a library stored in S3.";
+const SEAT: &str = "x-sharecraft-seat";
 
 fn key(path: &str) -> String {
     format!("{PREFIX}{path}")
@@ -242,6 +244,16 @@ impl Env {
             assert!(tokio::time::Instant::now() < deadline, "no {kind} event");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    /// The revision the tracked file `node` is at.
+    async fn revision(&self, node: NodeId) -> String {
+        self.db()
+            .external_item(node)
+            .await
+            .unwrap()
+            .expect("tracked")
+            .revision
     }
 
     fn woken(&self, library: NodeId) -> bool {
@@ -628,4 +640,94 @@ async fn a_bulk_move_of_two_files_moves_both() {
     assert_eq!(env.child(archive, "a.txt").await, a);
     assert_eq!(env.child(archive, "b.txt").await, b);
     assert!(!env.sync(library).await, "the listing changed something");
+}
+
+#[tokio::test]
+async fn an_open_file_renamed_keeps_its_revision_and_its_editor_saves_on() {
+    let env = Env::new().await;
+    env.fake
+        .put(BUCKET, &key("docs/sheet.xlsx"), b"bucket sheet");
+    let library = env.library("Sessions").await;
+    let docs = env.child(library, "docs").await;
+    let file = env.child(docs, "sheet.xlsx").await;
+    let editor = FileClient::connect_as(&env.server, DocId(file.0), &env.owner).await;
+    let token = editor.token().expect("the editor holds the seat");
+    let base = env.revision(file).await;
+
+    let (status, body) = env.rename(file, "renamed.xlsx").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // The same content under a new tag: no new revision.
+    assert_eq!(env.revision(file).await, base);
+
+    let response = env
+        .server
+        .http(Some(&env.owner))
+        .put(env.server.url(&format!("/api/docs/{}/content", file.0)))
+        .header(SEAT, token)
+        .query(&[("base", base.as_str())])
+        .body(b"edited sheet".to_vec())
+        .send()
+        .await
+        .unwrap();
+    let (status, body) = answer(response).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["changed"], true, "{body}");
+    write_due(
+        &env.state,
+        OffsetDateTime::now_utc() + time::Duration::seconds(31),
+    )
+    .await;
+    assert_eq!(
+        env.object("docs/renamed.xlsx").unwrap().bytes,
+        b"edited sheet"
+    );
+    assert!(env.object("docs/sheet.xlsx").is_none());
+}
+
+#[tokio::test]
+async fn moving_a_folder_into_itself_is_refused() {
+    let env = Env::new().await;
+    env.fake.put(BUCKET, &key("docs/sub/a.txt"), b"a");
+    let library = env.library("Itself").await;
+    let docs = env.child(library, "docs").await;
+    let sub = env.child(docs, "sub").await;
+
+    for into in [docs, sub] {
+        assert_error(
+            &env.move_to(docs, into).await,
+            StatusCode::BAD_REQUEST,
+            "into_itself",
+        );
+    }
+    assert!(env.writes().is_empty(), "{:?}", env.writes());
+    assert_eq!(env.child(library, "docs").await, docs);
+    assert_eq!(env.repository_path(sub).await, "docs/sub/");
+}
+
+#[tokio::test]
+async fn an_archived_file_is_refused_plainly() {
+    let env = Env::new().await;
+    env.fake.put_with(
+        BUCKET,
+        &key("cold/frozen.bin"),
+        b"frozen",
+        Opts {
+            class: Some("GLACIER".to_owned()),
+            ..Opts::default()
+        },
+    );
+    let library = env.library("Archive").await;
+    let cold = env.child(library, "cold").await;
+    let file = env.child(cold, "frozen.bin").await;
+
+    // The file, and the folder holding it: not "try again", which would never help.
+    for refused in [
+        env.rename(file, "thawed.bin").await,
+        env.rename(cold, "warm").await,
+    ] {
+        assert_error(&refused, StatusCode::CONFLICT, "source_unavailable");
+        assert_eq!(refused.1["reason"], "archived", "{}", refused.1);
+    }
+    assert!(env.writes().is_empty(), "{:?}", env.writes());
+    assert!(!env.woken(library));
 }

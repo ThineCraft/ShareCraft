@@ -865,6 +865,34 @@ impl Db {
         Ok(u64::try_from(rows.len()).unwrap_or(0))
     }
 
+    /// Records what the store holds for the tracked `node` after ShareCraft moved it inside the
+    /// store: the copy's tag `new_tag`, `size` and modification time, only if `old_tag` is still
+    /// current. The content is the same, so the revision, the content read and its time are
+    /// kept (an editor's base stays valid); the object version read is forgotten, since the
+    /// copy is another object. Whether it changed.
+    pub async fn retag_source_item(
+        &self,
+        node: NodeId,
+        old_tag: &str,
+        new_tag: &str,
+        size: u64,
+        modified: OffsetDateTime,
+    ) -> Result<bool, DbError> {
+        let done = sqlx::query(
+            "update source_items set blob_sha = $3, size = $4, modified_at = $5, \
+                 version_id = null, missing_since = null \
+             where node_id = $1 and blob_sha = $2",
+        )
+        .bind(node.0)
+        .bind(old_tag)
+        .bind(new_tag)
+        .bind(column(size))
+        .bind(modified)
+        .execute(self.pool())
+        .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
     /// The tracking row of `node` in its connected library, if it has one.
     pub async fn source_item_of(&self, node: NodeId) -> Result<Option<SourceItem>, DbError> {
         let row = sqlx::query(

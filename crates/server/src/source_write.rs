@@ -1939,8 +1939,8 @@ async fn move_back(state: &AppState, target: &S3Target, plan: &Restructure, move
 
 /// Records a move made in the bucket and the tree: the tracking rows take the new paths, and
 /// each moved file the tag its copy was answered with (never one computed here: the next
-/// listing must find the same), keeping the content already read. A row that cannot be
-/// recorded is left to the listing, which is woken.
+/// listing must find the same), keeping its revision and the content already read. A row that
+/// cannot be recorded is left to the listing, which is woken.
 async fn record_moved(state: &AppState, plan: &Restructure, moved: &Moved) {
     let db = state.db();
     if let Err(e) = db
@@ -1975,7 +1975,6 @@ async fn record_moved(state: &AppState, plan: &Restructure, moved: &Moved) {
         .iter()
         .map(|item| (plan.rebased(&item.repository_path), item))
         .collect();
-    let now = OffsetDateTime::now_utc();
     for (path, seen) in &moved.seen {
         let Some(item) = before.get(path) else {
             continue;
@@ -1984,23 +1983,12 @@ async fn record_moved(state: &AppState, plan: &Restructure, moved: &Moved) {
             // A folder marker: a folder has no tag.
             continue;
         };
-        let content = match db.external_item(item.node).await {
-            Ok(found) => found.and_then(|found| found.sha256),
-            Err(_) => None,
-        };
+        // The same content under a new tag: no new revision, so an open editor's base holds.
         match db
-            .set_external_seen(item.node, old, &seen.tag, seen.size)
+            .retag_source_item(item.node, old, &seen.tag, seen.size, seen.modified)
             .await
         {
-            Ok(true) => {
-                if let Some(sha) = content
-                    && let Err(e) = db
-                        .set_external_content(item.node, &seen.tag, &sha, now)
-                        .await
-                {
-                    eprintln!("sharecraft-server: the content of a moved file was forgotten: {e}");
-                }
-            }
+            Ok(true) => {}
             Ok(false) => state.sources().wake(plan.library),
             Err(e) => {
                 eprintln!("sharecraft-server: the tag of a moved file could not be recorded: {e}");
