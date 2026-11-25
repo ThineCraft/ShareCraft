@@ -67,6 +67,10 @@ import {
   sourceActions,
   sourceControlsEnabled,
   sourceWriteErrorText,
+  overwriteNote,
+  leftBehindText,
+  moveStaysInLibrary,
+  moveAcrossLibrariesText,
   savingMark,
   mayResolve,
   discardQuestion,
@@ -117,8 +121,10 @@ if (libraryStep) {
 }
 const sourceControls = () => sourceControlsEnabled(sourceAccessState);
 // What the library's source leaves open: adding files and folders in a writable bucket, all of
-// it with no source, nothing otherwise. Rename, move, copy and delete stay hidden for a bucket.
+// it with no source, nothing otherwise. A writable bucket takes rename, move, copy and delete too.
 const sourceMay = () => sourceActions(sourceAccessState, source);
+// Rename, move, copy and delete: open with no source, and in a writable bucket (the server decides the rest).
+const structureOk = () => sourceControls() || sourceMay().rename;
 const errorText = (result) => sourceWriteErrorText(result.error, result.data) || messageFor(result.error);
 if (library?.description) {
   $('library-description').textContent = library.description;
@@ -191,9 +197,9 @@ const UNDO_KEYS = `${KEY_MOD.text}+Z`;
 const moveDialog = $('move-dialog');
 const renameDialog = $('rename-dialog');
 const movingIds = () => moving.map((item) => item.id);
-const mayRename = (item) => sourceControls() && itemActions(item).rename;
-const mayMove = (item) => sourceControls() && itemActions(item).move;
-const mayRemove = (item) => sourceControls() && itemActions(item).remove;
+const mayRename = (item) => structureOk() && itemActions(item).rename;
+const mayMove = (item) => structureOk() && itemActions(item).move;
+const mayRemove = (item) => structureOk() && itemActions(item).remove;
 
 // The details pane beside the table (a sheet on narrow screens): preview, facts and access of
 // the selected row, with the row actions. Only for the list; the grid of an image library has none.
@@ -212,7 +218,7 @@ const details = createDetails({
   },
   me,
   enabled: () => view === 'list',
-  readOnly: () => !sourceControls(),
+  readOnly: () => !structureOk(),
 });
 
 renderSource();
@@ -306,7 +312,9 @@ function renderSource() {
   $('source-headline').textContent = summary.headline;
   // "Saving 3 files…" and "2 files could not be saved." follow the banner's own sentence.
   const counts = source.kind === 's3' && source.mode === 'read_write' ? writeCountsText(source.writes) : '';
-  $('source-detail').textContent = counts ? `${summary.detail} ${counts}` : summary.detail;
+  // A storage that cannot refuse a conflicting save says so, for a library that takes changes.
+  const overwrite = source.kind === 's3' && source.mode === 'read_write' && source.conditional !== 'yes' ? overwriteNote(source.conditional) : '';
+  $('source-detail').textContent = [summary.detail, counts, overwrite].filter(Boolean).join(' ');
   // An S3 answer carries the bucket for owners only; its name is shown only when it is there.
   const s3Bucket = source.kind === 's3' && typeof source.bucket === 'string' && source.bucket !== '';
   $('source-name').textContent = s3Bucket ? sourceName(source) : '';
@@ -327,7 +335,7 @@ async function refreshSource() {
   if (!libraryStep) return;
   $('source-sync').disabled = true;
   const result = await api('GET', `/libraries/${seg(libraryStep.id)}/source`);
-  const controlsWereEnabled = sourceControls();
+  const controlsWereEnabled = structureOk();
   const previous = source;
   sourceAccessState = sourceAccess(result);
   source = sourceAccessState === 'connected' ? result.data : null;
@@ -340,7 +348,7 @@ async function refreshSource() {
   if (couldAdd !== canAdd) setupNewMenu();
   if (sourceAccessState === 'connected' && (shouldReload(previous, source) || writesSettled(previous, source))) {
     await reload({ preserve: true });
-  } else if (controlsWereEnabled !== sourceControls() || couldAdd !== canAdd) render();
+  } else if (controlsWereEnabled !== structureOk() || couldAdd !== canAdd) render();
   if (sourceAccessState === 'none') {
     await setupTemplates();
     setupNewMenu();
@@ -814,7 +822,7 @@ function showSelection() {
   $('select-note').hidden = !next;
   $('select-note').textContent = `Select all covers the ${choosable.length} items loaded so far. Use Show more to load the rest.`;
   const allowed = selectedItems().map(itemActions);
-  for (const id of ['bulk-move', 'bulk-cut', 'bulk-copy', 'bulk-delete']) $(id).hidden = !sourceControls();
+  for (const id of ['bulk-move', 'bulk-cut', 'bulk-copy', 'bulk-delete']) $(id).hidden = !structureOk();
   $('bulk-move').disabled = state.count === 0 || !allowed.every((a) => a.move);
   $('bulk-cut').disabled = $('bulk-move').disabled;
   $('bulk-copy').disabled = state.count === 0;
@@ -923,7 +931,7 @@ function sharingMarks(item) {
 function actionsMenu(item) {
   const entries = [
     'details',
-    ...rowMenu(item).filter((entry) => sourceControls() || !['rename', 'move', 'copy', 'delete'].includes(entry)),
+    ...rowMenu(item).filter((entry) => structureOk() || !['rename', 'move', 'copy', 'delete'].includes(entry)),
   ];
   const button = h(
     'button',
@@ -1229,11 +1237,12 @@ $('rename-form').addEventListener('submit', async (event) => {
   const name = $('rename-name').value.trim();
   const result = await api('PATCH', `/nodes/${seg(item.id)}`, { name });
   if (!result.ok) {
-    return showMessage($('rename-error'), policyRefusalText(result.error, result.data, name) ?? messageFor(result.error));
+    return showMessage($('rename-error'), policyRefusalText(result.error, result.data, name) ?? errorText(result));
   }
   renameDialog.close();
   await reload();
-  offerUndo(buildUndo({ op: 'rename', id: item.id, name: result.data.name }, { id: item.id, name: item.name }));
+  if (leftBehindText(result.data)) showToast(leftBehindText(result.data), { kind: 'ok' });
+  else offerUndo(buildUndo({ op: 'rename', id: item.id, name: result.data.name }, { id: item.id, name: item.name }));
 });
 
 // ---- bulk: delete, move and copy ----
@@ -1278,8 +1287,16 @@ async function runBulk(op, list, place, from = nodeId) {
   }
   const names = Object.fromEntries(list.map((item) => [item.id, item.name]));
   const summary = bulkSummary(op, results, names);
+  // A bucket's own words: the reason a change was refused, and objects left behind by a move or delete.
+  results.forEach((result, at) => {
+    const line = summary.lines[at];
+    if (!line) return;
+    if (!result.ok) line.text = sourceWriteErrorText(result.error, result) || line.text;
+    else if (leftBehindText(result)) line.text = `${line.text} ${leftBehindText(result)}`;
+  });
+  const behind = results.find((result) => result.ok && leftBehindText(result));
   const done = results.filter((result) => result.ok).map((result) => result.id);
-  const listed = (summary.failed > 0 && list.length > 1) || results.some((result) => result.ok && result.renamed);
+  const listed = (summary.failed > 0 && list.length > 1) || results.some((result) => result.ok && (result.renamed || result.left_behind > 0));
   if (listed) {
     $('bulk-headline').textContent = summary.headline;
     $('bulk-results-box').hidden = false;
@@ -1301,6 +1318,7 @@ async function runBulk(op, list, place, from = nodeId) {
     return;
   }
   if (done.length === 0) return;
+  if (behind) showToast(leftBehindText(behind), { kind: 'ok' });
   if (op === 'copy') {
     const what = done.length === 1 ? names[done[0]] : `${done.length} items`;
     showToast(`Copied ${what} to ${place.name}`);
@@ -1426,7 +1444,10 @@ function showTrail() {
   $('move-crumbs').replaceChildren(
     h('ol', {}, ...[top, ...steps].map((button) => h('li', {}, button))),
   );
-  $('move-here').disabled = !canPlaceHere(trail, movingIds(), nodeId, { copy: moveMode === 'copy' });
+  const stays = moveMode === 'copy' || moveStaysInLibrary(source, libraryStep?.id, trail);
+  $('move-here').disabled = !stays || !canPlaceHere(trail, movingIds(), nodeId, { copy: moveMode === 'copy' });
+  // Said in words, not only by the disabled button.
+  if (!stays && trail.length > 0) showMessage($('move-error'), moveAcrossLibrariesText());
 }
 
 $('move-here').addEventListener('click', async () => {
@@ -1434,6 +1455,7 @@ $('move-here').addEventListener('click', async () => {
   const mode = moveMode;
   const place = trail[trail.length - 1];
   if (!canPlaceHere(trail, movingIds(), nodeId, { copy: mode === 'copy' })) return;
+  if (mode === 'move' && !moveStaysInLibrary(source, libraryStep?.id, trail)) return;
   moveDialog.close();
   await runBulk(mode, list, place);
 });
@@ -1627,7 +1649,10 @@ function saveCut() {
 
 /** Whether the cut items may be pasted here, as `canDrop` answers. */
 function pasteVerdict() {
-  if (!sourceControls()) return { ok: false, reason: 'This library cannot be changed here.' };
+  if (!structureOk()) return { ok: false, reason: 'This library cannot be changed here.' };
+  if (cut.library && cut.library !== libraryStep?.id && (source?.kind === 's3' || cut.s3)) {
+    return { ok: false, reason: moveAcrossLibrariesText() };
+  }
   const place = { id: nodeId, name: self.name, kind: self.kind, access: here.access };
   return canDrop(cut.items, place, here.path.map((step) => step.id), { from: cut.from });
 }
@@ -1639,7 +1664,7 @@ function cutItems(list) {
     showToast(list.length === 1 ? `You cannot move ${list[0].name}.` : 'You cannot move these items.', { kind: 'error' });
     return;
   }
-  cut = { from: nodeId, fromName: self.name, items: movable.map(({ id, name }) => ({ id, name })) };
+  cut = { from: nodeId, library: libraryStep?.id ?? null, s3: source?.kind === 's3', fromName: self.name, items: movable.map(({ id, name }) => ({ id, name })) };
   saveCut();
   showCut();
   const left = list.length - movable.length;
@@ -1650,7 +1675,7 @@ function cutItems(list) {
 
 /** The bar that says what is cut, with Paste here and Cancel; the cut rows are dimmed. */
 function showCut() {
-  $('cut-bar').hidden = !cut || !sourceControls();
+  $('cut-bar').hidden = !cut || !structureOk();
   const ids = new Set(cut && cut.from === nodeId ? cut.items.map((item) => item.id) : []);
   for (const tr of $('file-rows').querySelectorAll('tr[data-id]')) tr.classList.toggle('cut', ids.has(tr.dataset.id));
   if (!cut) return;
@@ -1708,16 +1733,16 @@ addShortcut({
   keys: ['Mod+X'],
   label: 'Cut the selected items, to move them',
   scope: 'library',
-  shown: () => sourceControls(),
-  when: (event) => sourceControls() && clipboardKey(event) === 'cut' && cutList().length > 0,
+  shown: () => structureOk(),
+  when: (event) => structureOk() && clipboardKey(event) === 'cut' && cutList().length > 0,
   run: () => cutItems(cutList()),
 });
 addShortcut({
   keys: ['Mod+V'],
   label: 'Paste the cut items into this folder',
   scope: 'library',
-  shown: () => sourceControls(),
-  when: (event) => sourceControls() && clipboardKey(event) === 'paste' && Boolean(cut),
+  shown: () => structureOk(),
+  when: (event) => structureOk() && clipboardKey(event) === 'paste' && Boolean(cut),
   run: () => pasteCut(),
 });
 addShortcut({
@@ -1890,8 +1915,8 @@ addShortcut({
   keys: ['F2'],
   label: 'Rename the current row',
   scope: 'library',
-  shown: () => sourceControls() && listShown(),
-  when: (event) => sourceControls() && listShown() && inFiles(event) && Boolean(currentItem()),
+  shown: () => structureOk() && listShown(),
+  when: (event) => structureOk() && listShown() && inFiles(event) && Boolean(currentItem()),
   run: () => {
     const item = currentItem();
     if (!mayRename(item)) {
@@ -1906,8 +1931,8 @@ addShortcut({
   keys: ['Delete'],
   label: 'Move the selected items to the recycle bin (with Undo)',
   scope: 'library',
-  shown: () => sourceControls() && items.length > 0,
-  when: (event) => sourceControls() && inFiles(event) && (selected.size > 0 || (view === 'list' && Boolean(currentItem()))),
+  shown: () => structureOk() && items.length > 0,
+  when: (event) => structureOk() && inFiles(event) && (selected.size > 0 || (view === 'list' && Boolean(currentItem()))),
   run: () => keyDelete(),
 });
 addShortcut({
@@ -2028,7 +2053,7 @@ function renameInPlace(item, { back = 'row' } = {}) {
     input.removeAttribute('aria-busy');
     input.readOnly = false;
     if (!result.ok) {
-      showToast(policyRefusalText(result.error, result.data, name) ?? messageFor(result.error), { kind: 'error' });
+      showToast(policyRefusalText(result.error, result.data, name) ?? errorText(result), { kind: 'error' });
       // Focus that went elsewhere stays there, and the old name with it; otherwise try again.
       if (left || document.activeElement !== input) close();
       else if (input.isConnected) {
@@ -2041,7 +2066,8 @@ function renameInPlace(item, { back = 'row' } = {}) {
     if (back === 'row') actionsFor = null;
     await reload();
     focusBack();
-    offerUndo(buildUndo({ op: 'rename', id: item.id, name: result.data.name }, { id: item.id, name: item.name }));
+    if (leftBehindText(result.data)) showToast(leftBehindText(result.data), { kind: 'ok' });
+    else offerUndo(buildUndo({ op: 'rename', id: item.id, name: result.data.name }, { id: item.id, name: item.name }));
   };
 
   input.addEventListener('keydown', (event) => {

@@ -605,6 +605,9 @@ export class UploadQueue {
       case 'source_write_blocked':
       case 'source_action_unavailable':
       case 'source_writes_pending':
+      case 'source_item_saving':
+      case 'source_changed':
+      case 'source_too_large_to_move':
         return new Stop(sourceWriteErrorText(result.error, result.data));
       case 'blocked_file_type':
       case 'file_too_large':

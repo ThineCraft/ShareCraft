@@ -1,7 +1,5 @@
 // Pure wording and validation for libraries connected to a GitHub repository or an S3 bucket.
 
-import { formatSize } from './common.js';
-
 const READ_ONLY = 'This library cannot be changed here.';
 const LAST_UPDATE = `Files shown are from the last update. ${READ_ONLY}`;
 
@@ -32,12 +30,13 @@ export function s3Writable(source) {
 
 /**
  * What a person may do here, as far as the library's source goes: everything in a library with
- * no source; adding files and folders in a writable, unblocked S3 library; nothing otherwise.
+ * no source; everything a bucket can do in a writable, unblocked S3 library (moving stays inside
+ * the library, see moveStaysInLibrary); nothing otherwise.
  * (The server decides who may add; this only leaves out what it would refuse.)
  */
 export function sourceActions(access, source) {
   if (access === 'none') return { add: true, folder: true, rename: true, move: true, remove: true, copy: true };
-  if (access === 'connected' && s3Writable(source)) return { ...NO_ACTIONS, add: true, folder: true };
+  if (access === 'connected' && s3Writable(source)) return { add: true, folder: true, rename: true, move: true, remove: true, copy: true };
   return { ...NO_ACTIONS };
 }
 
@@ -88,6 +87,14 @@ function rateLimitTime(error) {
   return match?.[1] ?? '';
 }
 
+const NOT_KNOWN = 'Nothing more is known. Try again from the library settings.';
+const blockedDetail = (source) => sentence(source?.write_error) || NOT_KNOWN;
+
+/** The settings page's words for a blocked library: the headline once, then the stored reason. */
+export function blockedText(source) {
+  return `Read-only until fixed. ${blockedDetail(source)}`;
+}
+
 /** The S3 headline, supporting sentence and tone for an S3 library; the budget pause wins over the state. */
 function s3Summary(source, now) {
   const state = source.state;
@@ -105,8 +112,8 @@ function s3Summary(source, now) {
   }
   if (blocked) {
     return {
-      headline: 'Read-only until fixed: the storage refused a change.',
-      detail: sentence(source.write_error) || 'Nothing more is known. Try again from the library settings.',
+      headline: 'Read-only until fixed.',
+      detail: blockedDetail(source),
       tone: 'attention',
     };
   }
@@ -302,13 +309,23 @@ export function discardQuestion(isNew) {
 
 /** The sentence for a change this kind of library does not take yet. */
 export function sourceActionUnavailableText() {
-  return 'This change is not available in a library stored in S3 yet. You can add files and folders.';
+  return 'This cannot be done yet in a library stored in S3.';
+}
+
+/** A limit in the largest unit that holds it exactly, as the server says it: "5 GiB", "512 MiB". */
+function limitWords(limit) {
+  for (const [unit, size] of [['GiB', 1024 ** 3], ['MiB', 1024 ** 2], ['KiB', 1024]]) {
+    if (limit >= size && limit % size === 0) return `${limit / size} ${unit}`;
+  }
+  return `${limit} bytes`;
 }
 
 /** The sentence for a file over the single-upload limit; `limit` in bytes, when the server said. */
 export function sourceFileTooLargeText(limit) {
-  const size = typeof limit === 'number' && Number.isFinite(limit) && limit > 0 ? ` the ${formatSize(limit)}` : '';
-  return `This file is larger than${size} a library stored in S3 takes. Nothing was stored.`;
+  if (typeof limit !== 'number' || !Number.isFinite(limit) || limit <= 0) {
+    return 'This file is larger than a library stored in S3 takes. Nothing was stored.';
+  }
+  return `Files over ${limitWords(limit)} cannot be saved to this S3 storage.`;
 }
 
 /** The sentence for a change refused because the library is read-only until fixed. */
@@ -328,10 +345,51 @@ const WRITE_TEXTS = {
     'Some changes are still being saved to the bucket. Wait until they are saved or discarded, then try again.',
 };
 
+// Said when the server sent no message of its own; the server's message is shown when it did.
+const SERVER_WORDED = {
+  source_item_saving:
+    'This is still being saved to the storage. Try again when saving has finished, or discard the save that failed.',
+  source_too_large_to_move:
+    'Files over 5 GiB in S3 storage cannot be renamed, moved, copied or deleted from ShareCraft yet.',
+  source_changed:
+    'This changed in the storage since ShareCraft last looked. ShareCraft is checking it again; try again in a minute.',
+  source_copy_incomplete:
+    'The copy stopped part way: some items were copied and are being saved to the storage; the rest were not copied.',
+};
+
+const serverMessage = (data) => (typeof data?.message === 'string' ? data.message.trim() : '');
+
+/** "Done. 3 of the original objects could not be removed…" for an answer carrying `left_behind`, else ''. */
+export function leftBehindText(data) {
+  const n = Number(data?.left_behind);
+  if (!Number.isFinite(n) || n <= 0) return '';
+  return `Done. ${n.toLocaleString('en-GB')} of the original objects could not be removed from the bucket; they will show up as separate files until someone removes them.`;
+}
+
+/** Whether a move from this library's source stays in the library; a bucket cannot move between libraries. */
+export function moveStaysInLibrary(source, libraryId, trail) {
+  if (source?.kind !== 's3') return true;
+  return (trail ?? []).some((step) => step.id === libraryId);
+}
+
+/** Why a move out of a bucket library is not offered. */
+export function moveAcrossLibrariesText() {
+  return 'Items in a library stored in S3 cannot be moved between libraries yet. Copy them instead, or choose a folder in this library.';
+}
+
 /** The sentence for an error code of writing to a bucket, or '' for any other code. */
 export function sourceWriteErrorText(code, data) {
-  if (code === 'source_action_unavailable') return sourceActionUnavailableText();
-  if (code === 'source_file_too_large') return sourceFileTooLargeText(Number(data?.limit));
+  const message = serverMessage(data);
+  if (code === 'left_behind') return leftBehindText(data);
+  if (code === 'source_unavailable') return data?.reason === 'archived' ? message : '';
+  if (code === 'source_too_many_objects') {
+    if (message) return message;
+    const count = Number(data?.count);
+    return `This folder holds ${Number.isFinite(count) && count > 0 ? count.toLocaleString('en-GB') : 'more than 1,000'} objects in the bucket. ShareCraft renames, moves, copies or deletes at most 1,000 at a time.`;
+  }
+  if (Object.hasOwn(SERVER_WORDED, code)) return message || SERVER_WORDED[code];
+  if (code === 'source_action_unavailable') return message || sourceActionUnavailableText();
+  if (code === 'source_file_too_large') return message || sourceFileTooLargeText(Number(data?.limit));
   if (code === 'source_write_blocked') return sourceWriteBlockedText();
   if (code === 'read_write_admin_only') return readWriteAdminOnlyText();
   return Object.hasOwn(WRITE_TEXTS, code) ? WRITE_TEXTS[code] : '';
